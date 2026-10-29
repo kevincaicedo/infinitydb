@@ -20,10 +20,14 @@
 //! and WAL wiring arrive with the stories that own them (S07, S11).
 
 pub mod compact;
+pub mod promote;
+pub mod replay;
+pub mod shadow;
 
+#[allow(clippy::disallowed_types, reason = "container: R")]
 use std::collections::{HashMap, VecDeque};
 
-use inf_foundation::{LogicalAddr, hash64};
+use inf_foundation::{BuildIntHasher, KeyHasher, LogicalAddr};
 
 use inf_log::flush::{TierFileMeta, TierFlush, TierFlushError};
 use inf_log::fs::SegmentFs;
@@ -34,8 +38,15 @@ use crate::demote::DemotionConfig;
 use crate::index::{Index, TieredMode};
 use crate::live_set::LiveSet;
 use crate::record::{ExtentRef, RecordKind, RecordSpec, RecordView};
-use crate::store::{DiskFullCause, HASH_SEED, OpError};
+use crate::store::{DiskFullCause, OpError};
 use crate::write_accounting::WriteAccounting;
+
+mod extent;
+mod flush;
+
+pub use flush::StageFailed;
+
+// ---- shared data definitions (behaviour lives in the child modules) ----------
 
 /// Answer of a tiered lookup. `Cold` is a *candidate*: the 22-bit
 /// fingerprint matched but the key is on disk — the caller fetches,
@@ -85,7 +96,7 @@ impl<'a> RecordParts<'a> {
     pub fn extent_ref(&self) -> Option<ExtentRef> {
         match self.type_tag {
             crate::record::TypeTag::StringExtent => Some(ExtentRef::decode(self.value)),
-            _ => None,
+            crate::record::TypeTag::String | crate::record::TypeTag::JsonDoc => None,
         }
     }
 }
@@ -94,9 +105,20 @@ impl<'a> RecordParts<'a> {
 const NO_MARK_PAGE: u64 = u64::MAX;
 
 /// One durable-tiered namespace's record table on one cell (L1).
+#[allow(clippy::disallowed_types, reason = "container: R")]
 pub struct TieredTable {
+    /// The key hash's secret (ADR-0094) — the node's one value, injected.
+    hasher: KeyHasher,
     index: Index<TieredMode>,
     space: AddressSpace,
+    /// The id the latest checkpoint walk began under (F-L03-04 witness).
+    walk_ckpt_id: Option<u64>,
+    /// The addresses below its watermark that the pinned walk images
+    /// (ADR-0093 A12): the winners of the tickets open as the walk began,
+    /// ascending. Written by `begin_ckpt_walk` and emptied by
+    /// `end_ckpt_walk`; at most `SHADOW_TICKETS_CAP` addresses (32 KiB,
+    /// counted in the ticket registry's bytes).
+    walk_image_addrs: Vec<u64>,
     live_bytes: u64,
     demote: DemotionConfig,
     /// Record-start addresses the ro-boundary may seal to (ADR-0053 D2):
@@ -139,7 +161,10 @@ pub struct TieredTable {
     /// relocations. Bounded: [`RELOC_ORIGIN_CAP`] origins per record
     /// (the scan defers at cap); entries drop at covering swaps;
     /// per-life (boot starts it empty — no live relocation exists).
-    reloc_origins: HashMap<(u64, u64), Vec<(u64, u64)>>,
+    /// Hashed by `BuildIntHasher` (ADR-0093 A15): the key is a keyed
+    /// SipHash output and an allocator-issued address, and a
+    /// cell-resident map carries no per-process `RandomState` (L7).
+    reloc_origins: HashMap<(u64, u64), Vec<(u64, u64)>, BuildIntHasher>,
     /// Blob-extent reference map + refcounts + reclaim queue (M4-S17,
     /// ADR-0061 D4/D5): fed by the same `note_death` routing as the
     /// live set; the checkpoint 0x05 section and the replay appliers
@@ -169,6 +194,21 @@ pub struct TieredTable {
     /// dead byte — ADR-0059 D1's `nothing_compactable` verdict, counted
     /// (ADR-0063 D5: the honest "genuinely full of live data" alarm).
     compact_idle_pressure: u64,
+    /// Read-driven promotion admission (M4.5-S30, ADR-0085 D6): the
+    /// `tiered-promote-on-read` CONFIG key, pushed per cell. Disabled
+    /// is fully inert (no filter traffic — the pre-S30 read path).
+    promote_enabled: bool,
+    /// The second-touch admission filter (ADR-0085 D2): 64 KiB fixed,
+    /// direct-mapped, no per-record metadata — the bounded form of the
+    /// LRU machinery §9 refuses.
+    promote_filter: promote::PromoteFilter,
+    /// Promotion observability (ADR-0085 D6) — `INFO tiering` renders
+    /// these; the A/B and the DST oracles read them.
+    promote_stats: promote::PromotionCounters,
+    /// Shadow-slot tickets (M4.5-S37, ADR-0093): the open `(hash, cold,
+    /// winner)` pairs, the record pin's source, the reconciler's work
+    /// list — a projection of the index, rebuilt at recovery.
+    shadow: shadow::ShadowSet,
 }
 
 /// Cached disk-admission state (M4-S21, ADR-0063 D2). Two legs: the
@@ -200,11 +240,91 @@ struct DiskAdmission {
 
 /// Cap on remembered relocation origins per record (ADR-0059 D9): a
 /// record at cap defers further relocation until a covering swap
-/// drains its entry — deferral, never growth.
-pub(crate) const RELOC_ORIGIN_CAP: usize = 3;
+/// drains its entry — deferral, never growth. Public so the plane's
+/// marker budgets derive from it (ADR-0093 A11) instead of restating it.
+pub const RELOC_ORIGIN_CAP: usize = 3;
 
 /// Cap on retained unconfirmed flush-chunk ends (~32 KiB worst case).
 const FLUSH_ENDS_CAP: usize = 4096;
+
+/// Which length bound refused a placement — the typed length refusals of
+/// `append` and of boot replay's entries (ADR-0174 D1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LengthBound {
+    /// The key is longer than `MAX_KEY_LEN`.
+    Key,
+    /// The value is longer than `MAX_VAL_LEN`.
+    Value,
+    /// An inline value at or above `BLOB-THRESHOLD`: it takes the extent
+    /// path (ADR-0061 D1).
+    BlobThreshold,
+    /// The record is longer than half the ring (ADR-0102 D3).
+    InlineRecord,
+    /// The extent is longer than the blob maximum.
+    BlobMax,
+    /// The extent's disk admission cost is not representable.
+    AdmissionCost,
+}
+
+/// A length refusal: the bound, the length that crossed it and the
+/// bound's value, all in bytes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LengthRefusal {
+    pub bound: LengthBound,
+    pub len: u64,
+    pub limit: u64,
+}
+
+impl LengthRefusal {
+    fn new(bound: LengthBound, len: usize, limit: usize) -> LengthRefusal {
+        LengthRefusal { bound, len: len as u64, limit: limit as u64 }
+    }
+
+    /// Refuses `len` above `limit`.
+    fn check(bound: LengthBound, len: usize, limit: usize) -> Result<(), LengthRefusal> {
+        if len > limit {
+            return Err(LengthRefusal::new(bound, len, limit));
+        }
+        Ok(())
+    }
+}
+
+impl From<LengthRefusal> for OpError {
+    fn from(_: LengthRefusal) -> OpError {
+        OpError::TooLarge
+    }
+}
+
+impl core::fmt::Display for LengthRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (what, bound) = match self.bound {
+            LengthBound::Key => ("key", "the longest key"),
+            LengthBound::Value => ("value", "the longest value"),
+            LengthBound::BlobThreshold => ("inline value", "BLOB-THRESHOLD"),
+            LengthBound::InlineRecord => ("record", "half the ring"),
+            LengthBound::BlobMax => ("extent", "the blob maximum"),
+            LengthBound::AdmissionCost => ("extent", "the representable admission cost"),
+        };
+        write!(f, "a {}-byte {what} crosses {bound} ({} bytes)", self.len, self.limit)
+    }
+}
+
+/// An inline placement the length refusals admitted — `admit_inline`'s
+/// one product: the key and value with the record's encoded length, so
+/// a placement writes what was admitted and checks nothing twice.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct AdmittedInline<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+    len: usize,
+}
+
+impl AdmittedInline<'_> {
+    /// The record's encoded length.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
 
 /// What one [`TieredTable::flush_slice`] round did (observability; the
 /// storm/DST oracles assert against these).
@@ -223,10 +343,12 @@ pub struct FlushSliceOutcome {
 impl TieredTable {
     /// `None` when the ring reservation fails (namespace creation surfaces
     /// it typed).
+    #[allow(clippy::disallowed_types, reason = "container: R")]
     pub fn new(
         config: AddressSpaceConfig,
         demote: DemotionConfig,
         initial_keys: usize,
+        hasher: KeyHasher,
     ) -> Option<TieredTable> {
         let mut space = AddressSpace::new(config)?;
         // The budget admission bound (ADR-0053 D1): alloc refuses — and
@@ -238,8 +360,11 @@ impl TieredTable {
         }
         space.set_window_limit(window);
         Some(TieredTable {
+            hasher,
             index: Index::with_capacity(initial_keys.max(64)),
             space,
+            walk_ckpt_id: None,
+            walk_image_addrs: Vec::new(),
             live_bytes: 0,
             demote,
             seal_marks: VecDeque::new(),
@@ -250,21 +375,64 @@ impl TieredTable {
             live: LiveSet::new(config.life_origin.to_raw()),
             compact_cfg: compact::CompactionConfig::default(),
             compact: None,
-            reloc_origins: HashMap::new(),
+            reloc_origins: HashMap::default(),
             extents: crate::extents::ExtentRefs::new(),
-            blob: crate::extents::BlobConfig::default(),
+            blob: Self::clamp_blob_config(
+                config.reserve_bytes as u64,
+                crate::extents::BlobConfig::default(),
+            ),
             wal_epoch: 0,
             disk_budget_bytes: 0,
             disk_admit: DiskAdmission::default(),
             compact_idle_pressure: 0,
+            promote_enabled: true,
+            promote_filter: promote::PromoteFilter::new(),
+            promote_stats: promote::PromotionCounters::default(),
+            shadow: shadow::ShadowSet::new(),
         })
     }
 
-    /// Stable key hash — same seed as the memory-mode store, so batch
-    /// pipelines hash once regardless of table mode.
+    /// The key hash under this table's secret (ADR-0094) — the same
+    /// value as the node's memory-mode stores, so batch pipelines hash
+    /// once regardless of table mode. An instance method: a hash is
+    /// meaningful only to the table whose hasher computed it.
     #[inline]
-    pub fn hash_key(key: &[u8]) -> u64 {
-        hash64(key, HASH_SEED)
+    #[must_use]
+    pub fn hash_key(&self, key: &[u8]) -> u64 {
+        self.hasher.hash(key)
+    }
+
+    /// This table's key hasher.
+    #[inline]
+    #[must_use]
+    pub fn hasher(&self) -> KeyHasher {
+        self.hasher
+    }
+
+    /// Probe groups in the index (the SCAN cursor space; the rebuild's
+    /// walk) — tests that craft home-group collisions size by it.
+    #[must_use]
+    pub fn index_group_count(&self) -> usize {
+        self.index.group_count()
+    }
+
+    /// Read-only DST digest of every index entry and resident record (ADR-0137).
+    /// Cold bytes are covered by the simulator's separate disk-image digest.
+    pub fn simulation_digest(&self) -> crate::StateDigest {
+        let mut digest = crate::StateDigest::default();
+        for group in 0..self.index.group_count() {
+            self.index.scan_home_group_ext(group, |addr, hash| {
+                let mut entry = inf_foundation::hash64(&addr.to_raw().to_le_bytes(), hash);
+                if addr.to_raw() >= self.space.head().to_raw() {
+                    let parts = self.record(addr);
+                    entry =
+                        inf_foundation::hash64(self.record_bytes(addr, parts.encoded_len), entry);
+                }
+                digest.entries += 1;
+                digest.digest = digest.digest.wrapping_add(entry);
+            });
+        }
+        digest
     }
 
     /// Probe-line prefetch (the batch pipeline's phase 1 — L3).
@@ -293,7 +461,7 @@ impl TieredTable {
     /// (`exclude` carries fetched-and-mismatched addresses on retry — the
     /// false-positive path, ≈2⁻²² per candidate).
     pub fn lookup(&self, key: &[u8], hash: u64, exclude: &[LogicalAddr]) -> TieredLookup {
-        debug_assert_eq!(hash, Self::hash_key(key));
+        debug_assert_eq!(hash, self.hash_key(key));
         let mut cold_candidate = None;
         let ram_hit = self.index.find(hash, |addr| match self.space.resolve(addr) {
             AddrClass::Mutable | AddrClass::ReadOnly => self.record(addr).key == key,
@@ -309,6 +477,14 @@ impl TieredTable {
             (None, Some(addr)) => TieredLookup::Cold(addr),
             (None, None) => TieredLookup::Miss,
         }
+    }
+
+    /// Whether the exact `(hash, addr)` pair is slotted — the sidecar's
+    /// 64-bit hash, never the fingerprint (the oracles' and the DST's
+    /// probe; ADR-0093's tickets are defined on this relation).
+    #[must_use]
+    pub fn contains_pair(&self, hash: u64, addr: LogicalAddr) -> bool {
+        self.index.contains_pair(hash, addr)
     }
 
     /// Reads a RAM-resident record (header first, then the exact slice —
@@ -336,6 +512,23 @@ impl TieredTable {
     /// can size the full fetch).
     pub const RECORD_HEADER_LEN: usize = crate::record::HEADER_LEN;
 
+    /// Bytes from a record's start that always hold its key: the fixed
+    /// header, the TTL extension and the longest key (`key_from_prefix`'s
+    /// bound). The tier format's one key-window bound: the boot settle
+    /// read returns it and the cold-prefix readers ask for it.
+    pub const KEY_PREFIX_LEN: usize = inf_log::TIER_KEY_WINDOW_BYTES;
+
+    /// Decodes just the key from a record *prefix* (the SCAN cold-read
+    /// window): `Some` when the prefix covers the header, the TTL
+    /// extension when present, and the whole key — at most 268 bytes
+    /// from the record's start, so one cold window always holds it.
+    /// `None` means the prefix stops inside the key: naming a key must
+    /// never require the value's bytes.
+    #[must_use]
+    pub fn key_from_prefix(bytes: &[u8]) -> Option<&[u8]> {
+        crate::record::key_from_prefix(bytes)
+    }
+
     /// Sizes a full record from its fixed header alone (the cold-read
     /// two-round contract: a first aligned window covers at least the
     /// header; if the record overruns the window, the exact remainder is
@@ -355,17 +548,33 @@ impl TieredTable {
         // NOT presence — a 2⁻²² fingerprint collision with a cold slot
         // legally reports a candidate for an absent key, so asserting
         // `Miss` here would panic on legal input.
+        debug_assert_eq!(hash, self.hash_key(key));
         debug_assert!(
-            !matches!(self.lookup(key, hash, &[]), TieredLookup::Ram(_)),
+            self.index
+                .find(hash, |addr| {
+                    addr.to_raw() >= self.space.head().to_raw() && self.record(addr).key == key
+                })
+                .is_none(),
             "insert of a RAM-verified present key"
         );
+        let admitted = self.admit_inline(key, value)?;
+        self.insert_admitted(admitted, hash)
+    }
+
+    /// [`insert`](Self::insert) of a record the length refusals already
+    /// admitted (boot replay admits before it asks for room).
+    pub(super) fn insert_admitted(
+        &mut self,
+        admitted: AdmittedInline<'_>,
+        hash: u64,
+    ) -> Result<LogicalAddr, OpError> {
         if self.index.needs_grow() {
             // Sidecar-only re-placement: cold-addressed slots re-place
             // without a record read (§3.3 — the closure has no record
             // access, so this is structural, not reviewed-for).
             self.index.grow(|_, ext| ext);
         }
-        let addr = self.append(key, value, 0)?;
+        let addr = self.append(admitted, 0)?;
         self.index.insert(hash, addr);
         Ok(addr)
     }
@@ -393,7 +602,7 @@ impl TieredTable {
         old_len: usize,
         old_version: u32,
     ) -> Result<LogicalAddr, OpError> {
-        debug_assert_eq!(hash, Self::hash_key(key));
+        debug_assert_eq!(hash, self.hash_key(key));
         let spec = RecordSpec {
             key,
             value,
@@ -437,8 +646,23 @@ impl TieredTable {
         old_len: usize,
         old_version: u32,
     ) -> Result<LogicalAddr, OpError> {
-        let new_addr = self.append(key, value, old_version.wrapping_add(1))?;
+        let admitted = self.admit_inline(key, value)?;
+        self.overwrite_admitted(admitted, hash, old, old_len, old_version)
+    }
+
+    /// [`overwrite`](Self::overwrite) of a record the length refusals
+    /// already admitted.
+    pub(super) fn overwrite_admitted(
+        &mut self,
+        admitted: AdmittedInline<'_>,
+        hash: u64,
+        old: LogicalAddr,
+        old_len: usize,
+        old_version: u32,
+    ) -> Result<LogicalAddr, OpError> {
+        let new_addr = self.append(admitted, old_version.wrapping_add(1))?;
         self.index.replace(hash, old, new_addr);
+        self.shadow_note_moved(hash, old, new_addr);
         self.note_death(old, old_len as u64);
         Ok(new_addr)
     }
@@ -446,312 +670,27 @@ impl TieredTable {
     /// Deletes the record at `addr` (key-verified by the caller's lookup).
     /// For a cold record this touches the index and accounting only —
     /// never a cold read (§3.3).
+    ///
+    /// # Panics
+    /// Panics when an open shadow ticket names `addr` as its winner
+    /// (ADR-0093 D3/I7): the caller resolves the ticket first — a
+    /// deleted key must never resurface with its unverified twin's
+    /// value, and the plane's obligation is mechanical here.
     pub fn delete(&mut self, hash: u64, addr: LogicalAddr, len: usize) {
+        assert!(
+            self.shadow_of_winner(addr).is_none(),
+            "delete of a shadow winner before its ticket resolved"
+        );
         self.index.remove(hash, addr);
+        self.shadow_note_removed(addr);
         self.note_death(addr, len as u64);
     }
 
-    // ---- blob extents (M4-S17, ADR-0061) ----
-
-    /// Blob routing bounds — the caller (plane) reads the threshold to
-    /// decide the write path; the store refuses misrouted values typed.
-    #[inline]
-    pub fn blob_config(&self) -> crate::extents::BlobConfig {
-        self.blob
-    }
-
-    /// Replaces the blob bounds (tests and, later, S19's `INF.NS` keys).
-    ///
-    /// # Panics
-    /// Panics on nonsense bounds ([`BlobConfig::validate`]
-    /// (crate::extents::BlobConfig::validate)).
-    pub fn set_blob_config(&mut self, blob: crate::extents::BlobConfig) {
-        blob.validate();
-        self.blob = blob;
-    }
-
-    /// Allocates the next extent id (allocate-once — a failed extent
-    /// write quarantines it; the orphan sweep reclaims the file).
-    pub fn allocate_extent_id(&mut self) -> u64 {
-        self.extents.allocate_id()
-    }
-
-    /// Inserts an extent-referencing record for an absent key (ADR-0061
-    /// D2/D3): the value lives out of line, the record carries the
-    /// 24-byte reference, and the `SealedExtent` token proves the
-    /// extent's fdatasync already ran — an unfsynced extent is
-    /// unrepresentable here by construction.
-    ///
-    /// # Errors
-    /// Space refusals and bounds violations, typed.
-    pub fn insert_extent(
-        &mut self,
-        key: &[u8],
-        hash: u64,
-        sealed: &SealedExtent,
-    ) -> Result<LogicalAddr, OpError> {
-        debug_assert!(
-            !matches!(self.lookup(key, hash, &[]), TieredLookup::Ram(_)),
-            "insert of a RAM-verified present key"
-        );
-        if self.index.needs_grow() {
-            self.index.grow(|_, ext| ext);
-        }
-        let ext = ExtentRef { extent_id: sealed.extent_id().0, offset: 0, len: sealed.data_len() };
-        let addr = self.append_extent(key, ext, 0)?;
-        self.index.insert(hash, addr);
-        Ok(addr)
-    }
-
-    /// Overwrites the record at `old` with an extent reference — the
-    /// [`overwrite`](Self::overwrite) shape; the displaced record's
-    /// reference (extent or inline) releases through `note_death`.
-    ///
-    /// # Errors
-    /// Space refusals and bounds violations, typed.
-    pub fn update_extent(
-        &mut self,
-        key: &[u8],
-        hash: u64,
-        sealed: &SealedExtent,
-        old: LogicalAddr,
-        old_len: usize,
-        old_version: u32,
-    ) -> Result<LogicalAddr, OpError> {
-        let ext = ExtentRef { extent_id: sealed.extent_id().0, offset: 0, len: sealed.data_len() };
-        let new_addr = self.append_extent(key, ext, old_version.wrapping_add(1))?;
-        self.index.replace(hash, old, new_addr);
-        self.note_death(old, old_len as u64);
-        Ok(new_addr)
-    }
-
-    /// Places one extent-referencing record at the tail and registers
-    /// its reference. Charges split per ADR-0061 D8: the **record leg**
-    /// (key + 24-byte reference — what flows through WAL and flush)
-    /// into `user_bytes`; the **blob leg** (the value length) into
-    /// `blob_user_bytes`. The extent's device bytes arrive via
-    /// [`note_blob_bytes`](Self::note_blob_bytes).
-    fn append_extent(
-        &mut self,
-        key: &[u8],
-        ext: ExtentRef,
-        version: u32,
-    ) -> Result<LogicalAddr, OpError> {
-        if key.len() > crate::record::MAX_KEY_LEN || ext.len > self.blob.max_bytes {
-            return Err(OpError::TooLarge);
-        }
-        debug_assert!(ext.len > 0, "an extent reference names at least one byte");
-        let value = ext.encode();
-        let spec = RecordSpec {
-            key,
-            value: &value,
-            version,
-            expire_at_ms: None,
-            kind: RecordKind::StringExtent,
-        };
-        let len = spec.encoded_len();
-        // M4-S21 disk admission (ADR-0063 D1/D2): the reference record
-        // plus the extent's device bytes — the blob is already on disk
-        // (`SealedExtent`), so this is the budget catching up with it;
-        // the wiring-time gate consults [`disk_full`](Self::disk_full)
-        // *before* `ExtentWriter::create` so a full device is not
-        // probed with a doomed file per attempt.
-        let cost = len as u64 + inf_log::blob::extent_device_bytes(ext.len);
-        self.disk_admit_check(cost)?;
-        let addr = self.space.alloc(len).ok_or(OpError::OutOfMemory)?;
-        self.disk_admit_debit(cost);
-        self.note_seal_mark(addr);
-        spec.write(self.space.bytes_mut(addr, len));
-        self.live_bytes += len as u64;
-        self.write.user_bytes += (key.len() + crate::record::EXTENT_REF_LEN) as u64;
-        self.write.blob_user_bytes += ext.len;
-        self.extents.register(addr.to_raw(), ext.extent_id, ext.len);
-        Ok(addr)
-    }
-
-    /// Charges extent device bytes (the `blob_bytes` leg, ADR-0061 D8) —
-    /// the plane reads `ExtentWriter::device_bytes()` after `finish` and
-    /// folds it here, the `note_compaction_bytes` seam shape.
-    #[inline]
-    pub fn note_blob_bytes(&mut self, bytes: u64) {
-        self.write.blob_bytes += bytes;
-    }
-
-    /// Counts one blob read-modify-write rewrite (ADR-0061 D7 — the
-    /// reserved doc-path cost seam; extents are immutable, so RMW is
-    /// read → new extent → new reference → old reference dies).
-    #[inline]
-    pub fn note_blob_rmw(&mut self) {
-        self.extents.note_rmw();
-    }
-
-    /// Blob-extent observables (`INFO tiering`; the §3.3 zero-assert
-    /// lists — memory-mode namespaces have no table, hence all-zero).
-    #[must_use]
-    pub fn extent_stats(&self) -> crate::extents::ExtentStats {
-        self.extents.stats()
-    }
-
-    /// Live refcount of one extent (tests + the DST refcount oracle).
-    #[must_use]
-    pub fn extent_refcount(&self, extent_id: u64) -> u64 {
-        self.extents.refcount(extent_id)
-    }
-
-    /// The reference at `addr`, if that record stores out of line —
-    /// `(extent id, value len)`.
-    #[must_use]
-    pub fn extent_reference_at(&self, addr: LogicalAddr) -> Option<(u64, u64)> {
-        self.extents.reference_at(addr.to_raw())
-    }
-
-    /// Every live reference-map entry, ascending by address —
-    /// `(record addr, extent id, value len)`. Control-plane observability
-    /// (bounded by `disk_budget / threshold` entries — the L5 term); the
-    /// DST refcount oracle and tests read it.
-    pub fn extent_references(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
-        self.extents.entries_below(u64::MAX)
-    }
-
-    /// The staging epoch of the last successful [`stage_wal`]
-    /// (Self::stage_wal) — the durability coordinate the plane maps its
-    /// commit watermark onto for [`extent_reclaim_work`]
-    /// (Self::extent_reclaim_work).
-    #[must_use]
-    pub fn wal_epoch(&self) -> u64 {
-        self.wal_epoch
-    }
-
-    /// Unlink candidates whose killing record is durable (`stamp ≤
-    /// durable_epoch`), at most `max` (one MAINTAIN slice's budget —
-    /// ADR-0061 D5). The plane composes the in-flight read pin check and
-    /// answers each candidate with [`extent_reclaim_done`]
-    /// (Self::extent_reclaim_done) or [`extent_reclaim_deferred`]
-    /// (Self::extent_reclaim_deferred).
-    pub fn extent_reclaim_work(&mut self, durable_epoch: u64, max: usize) -> Vec<u64> {
-        self.extents.reclaim_work(durable_epoch, max)
-    }
-
-    /// Confirms one unlink completed (`statfs` sees the space).
-    pub fn extent_reclaim_done(&mut self, extent_id: u64) {
-        self.extents.reclaim_done(extent_id);
-    }
-
-    /// Returns one candidate after a non-fatal unlink failure
-    /// (`blob_unlink_fail` — counted, re-offered, boot-sweep-re-driven).
-    pub fn extent_reclaim_deferred(&mut self, extent_id: u64) {
-        self.extents.reclaim_deferred(extent_id);
-    }
-
-    /// Seeds the boot orphan sweep with the extent directory listing
-    /// (names only — ADR-0061 D6). Call after replay completes; parked
-    /// replay deaths stamp durable here (they were replayed *from* the
-    /// log) and every listed-but-unreferenced extent becomes a reclaim
-    /// candidate drained by ordinary MAINTAIN slices, never at boot.
-    pub fn extent_sweep_seed(&mut self, listed: &[u64]) {
-        self.extents.sweep_seed(listed);
-    }
-
-    /// Applies one checkpoint tag-9 image / tail `StringExtentRef`
-    /// record (ADR-0057 D4 rule 2 over the extent kind): blind
-    /// key-verified RAM upsert; a cold candidate is deliberately
-    /// ignored (no boot-path cold read).
-    ///
-    /// # Errors
-    /// Space refusals from the store (recovery fail-stop at the caller).
-    pub fn apply_extent_image(
-        &mut self,
-        key: &[u8],
-        hash: u64,
-        ext: ExtentRef,
-    ) -> Result<LogicalAddr, OpError> {
-        if let TieredLookup::Ram(addr) = self.lookup(key, hash, &[]) {
-            let parts = self.record(addr);
-            let (len, version) = (parts.encoded_len, parts.version);
-            let new_addr = self.append_extent(key, ext, version.wrapping_add(1))?;
-            self.index.replace(hash, addr, new_addr);
-            self.note_death(addr, len as u64);
-            return Ok(new_addr);
-        }
-        if self.index.needs_grow() {
-            self.index.grow(|_, ext| ext);
-        }
-        let addr = self.append_extent(key, ext, 0)?;
-        self.index.insert(hash, addr);
-        Ok(addr)
-    }
-
-    /// Restores one checkpoint 0x05 blob-reference entry (ADR-0061 D6):
-    /// the cold record at `addr` references `extent_id`. Pairs with the
-    /// 0x03 ref that restored the slot; the map entry is what lets the
-    /// replayed tail's displacements decrement the right extent.
-    ///
-    /// # Panics
-    /// Debug-panics when `addr` is not below this life's origin — 0x05
-    /// entries name cold (address-preserved) records only.
-    pub fn restore_extent_entry(&mut self, addr: u64, extent_id: u64, len: u64) {
-        debug_assert!(
-            LogicalAddr::from_raw(addr).is_some_and(|a| a < self.space.life_origin()),
-            "0x05 entries name pre-life addresses"
-        );
-        self.extents.register(addr, extent_id, len);
-    }
-
-    /// The checkpoint 0x05 emission set: reference-map entries strictly
-    /// below the pinned walk watermark, ascending — cold records only
-    /// (RAM-resident extent records ride tag-9 images; both would be a
-    /// double count at restore).
-    ///
-    /// # Panics
-    /// Panics when no walk is pinned ([`begin_ckpt_walk`]
-    /// (Self::begin_ckpt_walk) first).
-    pub fn extent_ckpt_entries(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
-        let w = self.space.walk_watermark().expect("walk not begun").to_raw();
-        self.extents.entries_below(w)
-    }
-
-    /// Takes the relocation origins of the record at `addr` (M4-S15,
-    /// ADR-0059 D9): the `(address, stamp)` pairs un-superseded
-    /// checkpoints may still reference this record by. A displacing
-    /// mutation or delete stages one `ColdDisplace` per returned
-    /// address **before** its ordinary marker, so whichever recovery
-    /// unit survives, replay kills exactly the ref that unit holds.
-    /// Empty — allocation-free — in the common (never-relocated) case.
-    /// Take only when the markers' staging is committed (the entry is
-    /// consumed; a taken-but-unstaged origin would reopen the D9
-    /// hazard — command wiring's recorded obligation).
-    pub fn take_displacement_origins(&mut self, hash: u64, addr: LogicalAddr) -> Vec<(u64, u64)> {
-        if self.reloc_origins.is_empty() {
-            return Vec::new();
-        }
-        self.reloc_origins.remove(&(hash, addr.to_raw())).unwrap_or_default()
-    }
-
-    /// Dead-byte attribution at the repoint/delete moment, keyed by the
-    /// dead record's own address (M4-S06 hook; M4-S14 routing, ADR-0058
-    /// D2). Pre-life addresses charge their recovered tier file only —
-    /// the space's `live + dead = allocated` identity and the table's
-    /// `live_bytes` are per-life (ADR-0057 D6: `live_bytes` boots
-    /// covering images + tail only), so a post-recovery cold overwrite
-    /// or delete must not touch either. S17's blob refcounts ride this
-    /// same site.
-    fn note_death(&mut self, addr: LogicalAddr, len: u64) {
-        if addr >= self.space.life_origin() {
-            self.space.note_dead_bytes(addr, len);
-            self.live_bytes -= len;
-        }
-        self.live.note_dead(addr.to_raw(), len);
-        // The blob refcount decrement (M4-S17, ADR-0061 D4) sits on the
-        // unconditional side: a post-recovery cold death skips the
-        // per-life aggregates above but must still release its extent
-        // reference — the map, not the record bytes, is the identity.
-        self.extents.note_death(addr.to_raw());
-    }
-
-    /// Live entries.
+    /// Live keys: the index minus the open shadow tickets (ADR-0093 D3
+    /// — each ticket is exactly one extra slot for one key).
     #[inline]
     pub fn len(&self) -> usize {
-        self.index.len()
+        self.index.len() - self.shadow_pending()
     }
 
     /// True when empty.
@@ -970,469 +909,72 @@ impl TieredTable {
             || self.space.flushed().to_raw() > self.space.head().to_raw()
     }
 
-    /// One seal step (ADR-0053 D2/D3): advances the ro-boundary toward
-    /// `tail − mutable_target`, landing only on a recorded record-start
-    /// mark. The advancement bound is `slice_bytes` plus the mark
-    /// granularity (marks are per commit page, so a step may overrun the
-    /// slice by under two pages); when the first mark past the boundary
-    /// lies beyond the window entirely (a record larger than the slice),
-    /// that one mark is taken anyway — minimum one record of progress, or
-    /// the pipeline deadlocks behind a single 16 MiB record. Returns the
-    /// bytes sealed.
-    pub fn seal_slice(&mut self) -> u64 {
-        let tail = self.space.tail().to_raw();
-        let ro = self.space.ro_boundary().to_raw();
-        let target_addr = tail - self.demote.mutable_target_bytes().min(tail - ro);
-        if target_addr <= ro {
-            return 0;
-        }
-        let slice_limit = ro.saturating_add(self.demote.slice_bytes).min(target_addr);
-        let mut chosen: Option<u64> = None;
-        while let Some(&mark) = self.seal_marks.front() {
-            let m = mark.to_raw();
-            if m <= ro {
-                self.seal_marks.pop_front(); // stale: the boundary passed it
-                continue;
-            }
-            if m > target_addr {
-                break;
-            }
-            // Within the slice window always; past it only as the
-            // minimum-progress first mark.
-            if m <= slice_limit || chosen.is_none() {
-                chosen = Some(m);
-                self.seal_marks.pop_front();
-                if m > slice_limit {
-                    break;
-                }
-                continue;
-            }
-            break;
-        }
-        let Some(to) = chosen else { return 0 };
-        self.space.advance_ro_boundary(LogicalAddr::from_raw(to).expect("marks are 48-bit"));
-        let sealed = to - ro;
-        self.space.note_demote_slice(sealed);
-        sealed
-    }
+    // ---- recovery replay arms (ADR-0057 D4 as ADR-0174 D3 states them) ----
+    //
+    // The entries are `replay::TieredTable::replay_*`, which hold the
+    // demote seam (ADR-0174 D1); these are their arms.
 
-    /// One release step (ADR-0053 D3): advances the head toward the
-    /// release ceiling — the flushed watermark, clamped to the walk
-    /// watermark while a hybrid checkpoint walk is pinned (M4-S12,
-    /// ADR-0057 D2) — at most `slice_bytes` per call, decommitting
-    /// whole pages beneath it (RSS returns to the OS, ADR-0052 D3). The
-    /// §3.1 order (`head ≤ flushed`) is structural in `advance_head`.
-    /// Returns the bytes released.
-    pub fn release_slice(&mut self) -> u64 {
-        let head = self.space.head().to_raw();
-        let flushed = self.space.release_ceiling();
-        let step = (flushed - head).min(self.demote.slice_bytes);
-        if step == 0 {
-            return 0;
-        }
-        self.space.advance_head(LogicalAddr::from_raw(head + step).expect("below flushed"));
-        step
-    }
-
-    /// One flush slice (M4-S11, ADR-0056 D3 — the leg between S07's seal
-    /// and release steps): pulls record-aligned chunks from
-    /// `[append-cursor, ro_boundary)` up to the pipeline's slice budget,
-    /// appends them through `flush` (which owns rotation, early-seal,
-    /// and gap seals), fdatasyncs once, and advances `flushed` to the
-    /// largest appended chunk end the barrier makes claimable (full,
-    /// final frames only until a file seals — the ADR-0056 D5 rewrite
-    /// rule). Ring-top gaps confirm immediately after the preceding
-    /// file's seal barrier (ADR-0052 D2). Drivers loop on
-    /// [`FlushSliceOutcome::appended_bytes`], never on `demote_due`.
+    /// Blind key-verified RAM upsert (R5) — checkpoint image and tail-SET
+    /// replay, after the entry made room: a RAM record of the key is
+    /// overwritten (copy to tail, slot repointed, the old record dead)
+    /// and its relocation origins move to the new record; none inserts at
+    /// the tail. A cold candidate is neither read nor
+    /// touched: a same-key cold slot settles at the record's seal or at
+    /// the end of replay (R7).
     ///
     /// # Errors
-    /// [`TierFlushError`] — on `Fsync` the watermark is frozen exactly
-    /// where the last good barrier left it (§8.4: the caller stops).
-    /// A `StorageFull`-class `Io` failure additionally latches the
-    /// disk-admission device leg (M4-S21, ADR-0063 D4): foreground
-    /// refuses `DISKFULL` while MAINTAIN retries the unflushed backlog
-    /// — the next successful barrier clears the latch, so recovery
-    /// after space frees is automatic.
-    pub fn flush_slice<F: SegmentFs>(
+    /// Space refusals from the store (the entry answered `Fits`, so a
+    /// window refusal here names a defect).
+    pub(super) fn apply_image(
         &mut self,
-        flush: &mut TierFlush<F>,
-    ) -> Result<FlushSliceOutcome, TierFlushError> {
-        let res = self.flush_slice_inner(flush);
-        if let Err(e) = &res
-            && e.is_storage_full()
-        {
-            self.disk_admit.device_full = true;
-        }
-        res
-    }
-
-    fn flush_slice_inner<F: SegmentFs>(
-        &mut self,
-        flush: &mut TierFlush<F>,
-    ) -> Result<FlushSliceOutcome, TierFlushError> {
-        let budget = flush.slice_bytes();
-        let flushed0 = self.space.flushed().to_raw();
-        let sealed0 = flush.sealed().len();
-        let mut outcome = FlushSliceOutcome::default();
-        // Resume where the pipeline's append cursor stands — bytes may be
-        // staged ahead of `flushed` (partial-frame holdback), and they
-        // must never be re-appended.
-        let mut cursor = flush.append_cursor().unwrap_or(flushed0);
-        assert!(cursor >= flushed0, "flush cursor behind the watermark");
-        let mut spent = 0u64;
-        let mut wrote = false;
-        while spent < budget {
-            let at = LogicalAddr::from_raw(cursor).expect("watermarks stay 48-bit");
-            let Some(chunk) = self.space.next_flush_chunk(at, budget - spent) else { break };
-            match chunk {
-                FlushChunk::Gap { at, len } => {
-                    debug_assert_eq!(at.to_raw(), cursor, "gap starts at the cursor");
-                    flush.seal_for_gap()?;
-                    let to = at.to_raw() + len;
-                    self.space.advance_flushed(
-                        LogicalAddr::from_raw(to).expect("watermarks stay 48-bit"),
-                    );
-                    while self.flush_ends.front().is_some_and(|&e| e <= to) {
-                        self.flush_ends.pop_front();
-                    }
-                    cursor = to;
-                    outcome.gaps_crossed += 1;
-                }
-                FlushChunk::Records { addr, len } => {
-                    let n = usize::try_from(len).expect("chunk fits usize");
-                    flush.append_range(addr, self.space.bytes(addr, n))?;
-                    // File the chunk (M4-S14): it landed in exactly one
-                    // file — `append_range` seals *before* an overflowing
-                    // range, so the post-call active file is the one that
-                    // took it — and pending dead spans it covers drain
-                    // into that file's counters at this moment.
-                    let (id, base, _, _, _) =
-                        flush.active().expect("append_range leaves a file active");
-                    self.live.note_filed(id, base.to_raw(), addr.to_raw(), len);
-                    cursor = addr.to_raw() + len;
-                    if self.flush_ends.len() == FLUSH_ENDS_CAP {
-                        self.flush_ends.pop_front(); // dominated candidate
-                    }
-                    self.flush_ends.push_back(cursor);
-                    spent += len;
-                    wrote = true;
-                }
-            }
-        }
-        outcome.appended_bytes = spent;
-        // The device latch's recovery probe (ADR-0063 D4). `wrote` alone
-        // is not enough: a sync-time failure leaves every appended byte
-        // *staged* (the writer retains its batch and its cursor — the
-        // append-atomicity rewind covers the mid-range case), so the
-        // retry round pulls no new chunk while the latch refuses the
-        // only source of new appends. The barrier therefore also runs
-        // whenever the latch is set and staged bytes await durability —
-        // it rewrites the retained frames at their own offsets and
-        // recovery cannot starve on its own refusal.
-        let pending_retry = self.disk_admit.device_full
-            && flush.active().is_some_and(|(_, _, data, durable, _)| data > durable);
-        if wrote || pending_retry {
-            flush.sync()?;
-            // A successful barrier is the probe's answer: the writes and
-            // the fdatasync both landed.
-            self.disk_admit.device_full = false;
-        }
-        if let Some(limit) = flush.confirmable_end() {
-            let confirm =
-                self.flush_ends.iter().copied().filter(|&e| e <= limit).max().unwrap_or(0);
-            if confirm > self.space.flushed().to_raw() {
-                self.space.advance_flushed(
-                    LogicalAddr::from_raw(confirm).expect("watermarks stay 48-bit"),
-                );
-            }
-            let now_flushed = self.space.flushed().to_raw();
-            while self.flush_ends.front().is_some_and(|&e| e <= now_flushed) {
-                self.flush_ends.pop_front();
-            }
-        }
-        outcome.files_sealed =
-            u32::try_from(flush.sealed().len() - sealed0).expect("seals per slice fit u32");
-        outcome.confirmed_bytes = self.space.flushed().to_raw() - flushed0;
-        if outcome.confirmed_bytes > 0 || outcome.appended_bytes > 0 {
-            self.space.note_flush_slice(outcome.confirmed_bytes);
-        }
-        self.charge_flush_device(flush);
-        Ok(outcome)
-    }
-
-    /// Drains the flush completely (shutdown, tests, DST quiesce): runs
-    /// slices until nothing appends, then seals the active file so the
-    /// partial tail frame becomes claimable, and confirms `flushed` up
-    /// to the sealed end (= `ro_boundary` when the space had no pending
-    /// gap at the very end).
-    ///
-    /// # Errors
-    /// As [`flush_slice`](Self::flush_slice).
-    pub fn flush_drain<F: SegmentFs>(
-        &mut self,
-        flush: &mut TierFlush<F>,
-    ) -> Result<(), TierFlushError> {
-        loop {
-            let outcome = self.flush_slice(flush)?;
-            if outcome.appended_bytes == 0 && outcome.gaps_crossed == 0 {
-                break;
-            }
-        }
-        flush.seal_shutdown()?;
-        if let Some(limit) = flush.confirmable_end() {
-            let before = self.space.flushed().to_raw();
-            if limit > before {
-                self.space
-                    .advance_flushed(LogicalAddr::from_raw(limit).expect("watermarks stay 48-bit"));
-                self.space.note_flush_slice(limit - before);
-            }
-            let now_flushed = self.space.flushed().to_raw();
-            while self.flush_ends.front().is_some_and(|&e| e <= now_flushed) {
-                self.flush_ends.pop_front();
-            }
-        }
-        self.charge_flush_device(flush);
-        Ok(())
-    }
-
-    /// Barrier seal under backpressure (M4-S11, ADR-0056 D8): call when
-    /// a tail-allocation stall is outstanding and the last
-    /// [`flush_slice`](Self::flush_slice) appended nothing — the
-    /// partial-frame holdback is all that separates `flushed` from the
-    /// stalled writer's wake target, and sealing makes it claimable.
-    /// Confirms `flushed` to the sealed end.
-    ///
-    /// # Errors
-    /// As [`flush_slice`](Self::flush_slice).
-    pub fn flush_barrier<F: SegmentFs>(
-        &mut self,
-        flush: &mut TierFlush<F>,
-    ) -> Result<(), TierFlushError> {
-        // The stall seal writes the footer + barrier — the same device
-        // surface as a slice, so the M4-S21 latch rides it identically.
-        // (With no active writer the seal is a no-op: no probe ran, so
-        // the latch must not clear on that Ok.)
-        let probed = flush.active().is_some();
-        match flush.seal_stall() {
-            Ok(()) if probed => self.disk_admit.device_full = false,
-            Ok(()) => {}
-            Err(e) => {
-                if e.is_storage_full() {
-                    self.disk_admit.device_full = true;
-                }
-                return Err(e);
-            }
-        }
-        if let Some(limit) = flush.confirmable_end() {
-            let before = self.space.flushed().to_raw();
-            if limit > before {
-                self.space
-                    .advance_flushed(LogicalAddr::from_raw(limit).expect("watermarks stay 48-bit"));
-                self.space.note_flush_slice(limit - before);
-            }
-            let now_flushed = self.space.flushed().to_raw();
-            while self.flush_ends.front().is_some_and(|&e| e <= now_flushed) {
-                self.flush_ends.pop_front();
-            }
-        }
-        self.charge_flush_device(flush);
-        Ok(())
-    }
-
-    // ---- hybrid checkpoint walk (M4-S12, ADR-0057 D1/D2) ----
-
-    /// Latches this walk's watermark `W` (= the current flushed
-    /// watermark) and pins page release beneath it — every entry below
-    /// `W` refs, every entry at or above it images, and the pin makes
-    /// the image half structurally RAM-resident for the whole walk.
-    /// One walk in flight per cell, ever. `ckpt_id` is the id the
-    /// publication this walk feeds will manifest — subsequent
-    /// slot-removals stamp their file with it, which is what lets a
-    /// later checkpoint prove it emitted no reference into an emptied
-    /// file (M4-S15, ADR-0059 D3).
-    pub fn begin_ckpt_walk(&mut self, ckpt_id: u64) -> LogicalAddr {
-        self.live.note_ckpt_begun(ckpt_id);
-        self.space.begin_walk()
-    }
-
-    /// Releases the walk pin; the held-back release debt drains in the
-    /// next MAINTAIN slices.
-    pub fn end_ckpt_walk(&mut self) {
-        self.space.end_walk();
-    }
-
-    /// One bounded slice of the hybrid walk (ADR-0057 D1): resize-stable
-    /// home-group enumeration **from the index sidecar** — the cold
-    /// majority emits `{hash, addr}` with zero record touches; entries
-    /// at or above the walk watermark emit full images from RAM
-    /// (structurally: `addr ≥ W ≥ head` while pinned — the walker never
-    /// resolves a cold address, so `cold_resolves` is flat across a
-    /// walk, asserted by the checkpoint-under-load storm). Inherits the
-    /// SCAN guarantee: every entry present for the whole walk is emitted
-    /// at least once; mid-walk mutations may re-emit (the WAL tail from
-    /// begin re-covers them — replay is exact, D4). Returns the next
-    /// cursor (0 = done).
-    ///
-    /// # Panics
-    /// Panics when no walk is pinned ([`begin_ckpt_walk`]
-    /// (Self::begin_ckpt_walk) first).
-    pub fn ckpt_walk_slice(
-        &self,
-        cursor: u64,
-        count: usize,
-        mut emit_ref: impl FnMut(u64, LogicalAddr),
-        mut emit_image: impl FnMut(RecordParts<'_>),
-    ) -> u64 {
-        let w = self.space.walk_watermark().expect("walk not begun").to_raw();
-        let mask = self.index.group_count() as u64 - 1;
-        let mut cursor = cursor & mask;
-        let mut emitted = 0usize;
-        loop {
-            let space = &self.space;
-            self.index.scan_home_group_ext(cursor as usize, |addr, hash| {
-                if addr.to_raw() < w {
-                    emit_ref(hash, addr);
-                } else {
-                    let head = space.bytes(addr, crate::record::HEADER_LEN);
-                    let full_len = crate::record::encoded_len_from_header(head);
-                    emit_image(RecordParts::of(RecordView::new(space.bytes(addr, full_len))));
-                }
-                emitted += 1;
-            });
-            cursor = crate::store::next_rev_cursor(cursor, mask);
-            if cursor == 0 || emitted >= count {
-                return cursor;
-            }
-        }
-    }
-
-    /// One bounded SCAN slice over the index (M4-S26): resize-stable
-    /// home-group enumeration emitting `{hash, addr}` — the plane
-    /// resolves keys (RAM slots directly; cold slots fetch + decode,
-    /// which is what a beyond-RAM enumeration inherently costs).
-    /// Inherits the SCAN guarantee: entries present the whole scan emit
-    /// at least once; mid-scan mutations may duplicate. Returns the
-    /// next cursor (0 = done).
-    pub fn scan_slots(
-        &self,
-        cursor: u64,
-        count: usize,
-        mut emit: impl FnMut(u64, LogicalAddr),
-    ) -> u64 {
-        let mask = self.index.group_count() as u64 - 1;
-        let mut cursor = cursor & mask;
-        let mut emitted = 0usize;
-        loop {
-            self.index.scan_home_group_ext(cursor as usize, |addr, hash| {
-                emit(hash, addr);
-                emitted += 1;
-            });
-            cursor = crate::store::next_rev_cursor(cursor, mask);
-            if cursor == 0 || emitted >= count {
-                return cursor;
-            }
-        }
-    }
-
-    // ---- recovery replay appliers (M4-S12, ADR-0057 D4) ----
-
-    /// Applies one checkpoint address reference — idempotent by the
-    /// exact `(hash, addr)` pair (the walker's at-least-once re-emission
-    /// may duplicate a ref; a duplicated slot would outlive the single
-    /// displacement removal and serve stale bytes after the key's next
-    /// flush). Live-byte accounting is deliberately untouched: ref
-    /// lengths are unknown without a record read — per-file counters
-    /// boot *unreconciled* and S14's lazy rebuild owns them.
-    ///
-    /// # Panics
-    /// Debug-panics when `addr` is not below this life's origin — refs
-    /// name pre-life (manifested) addresses only; the `.ick` reader
-    /// already refused anything at or above its section watermark.
-    pub fn apply_ref(&mut self, hash: u64, addr: LogicalAddr) {
-        debug_assert!(addr < self.space.life_origin(), "refs name pre-life addresses");
-        if self.index.contains_pair(hash, addr) {
-            return;
-        }
-        if self.index.needs_grow() {
-            self.index.grow(|_, ext| ext);
-        }
-        self.index.insert(hash, addr);
-        // Count the slot into its file (M4-S14, ADR-0058 D4): the
-        // idempotency guard above already collapsed the walker's
-        // at-least-once duplicates, so this is exactly once per
-        // surviving slot — the count-side reconciliation the plan's
-        // lazy walk was for, done for free where the fact is born.
-        self.live.note_ref(addr.to_raw());
-    }
-
-    /// Applies one `ColdDisplace` marker (D4 rule 1): removes exactly
-    /// the slot `(hash, old_addr)` if present. Absence is a legal
-    /// interleaving (the walk imaged the key after the mutation, so the
-    /// old-life slot was never recovered), never a desync.
-    pub fn apply_displace(&mut self, hash: u64, old_addr: LogicalAddr) -> bool {
-        if !self.index.remove_if_present(hash, old_addr) {
-            return false;
-        }
-        if old_addr < self.space.life_origin() {
-            // The counted case (M4-S14, ADR-0058 D4): a restored ref
-            // slot died to the tail's displacement — uncount it. The
-            // blob reference releases here too (M4-S17): the this-life
-            // branch routes through `note_death`, but this arm bypasses
-            // it, and a restored 0x05 entry must decrement its extent
-            // when the tail kills its record.
-            self.live.note_displaced(old_addr.to_raw());
-            self.extents.note_death(old_addr.to_raw());
-        } else {
-            // The numeric-collision case: the marker's crashed-life
-            // address coincided with a this-life re-append of the same
-            // key (both ranges start at the manifested watermark, so
-            // collisions are legal, not rare). The removed slot's
-            // record is RAM-resident this-life bytes that just became
-            // unreachable — attribute the death *now*, with the length
-            // read from RAM, or the per-file identity silently leaks
-            // exactly this record when its range files. The paired
-            // image/delete that follows the marker re-establishes the
-            // key (ADR-0057 D4 pairing), so removing the slot here is
-            // semantically the displacement it claims to be.
-            let head = self.space.bytes(old_addr, crate::record::HEADER_LEN);
-            let len = crate::record::encoded_len_from_header(head);
-            self.note_death(old_addr, len as u64);
-        }
-        true
-    }
-
-    /// Blind key-verified RAM upsert (D4 rule 2) — checkpoint image and
-    /// tail-SET replay. A cold candidate is deliberately **ignored**:
-    /// old-life slots die by exact address (rule 1 / checkpoint order),
-    /// never by key — verifying one here would be a cold read on the
-    /// boot path.
-    ///
-    /// # Errors
-    /// Space refusals from the store (recovery fail-stop at the caller).
-    pub fn apply_image(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
+        admitted: AdmittedInline<'_>,
         hash: u64,
     ) -> Result<LogicalAddr, OpError> {
-        if let TieredLookup::Ram(addr) = self.lookup(key, hash, &[]) {
+        if let TieredLookup::Ram(addr) = self.lookup(admitted.key, hash, &[]) {
             let parts = self.record(addr);
             let (len, version) = (parts.encoded_len, parts.version);
-            return self.overwrite(key, value, hash, addr, len, version);
+            let new_addr = self.overwrite_admitted(admitted, hash, addr, len, version)?;
+            self.move_origins(hash, addr, new_addr);
+            return Ok(new_addr);
         }
-        self.insert(key, value, hash)
+        self.insert_admitted(admitted, hash)
     }
 
-    /// Tail-`DEL` replay (D4 rule 2's delete half): RAM-verified removal
-    /// only — the paired displacement marker already killed any old-life
-    /// slot by address. Returns whether a RAM entry was removed.
-    pub fn apply_delete(&mut self, key: &[u8], hash: u64) -> bool {
+    /// Tail-`DEL` replay's RAM half (R6): the RAM record of the key is
+    /// removed with its relocation origins. Returns whether one was.
+    pub(super) fn apply_delete(&mut self, key: &[u8], hash: u64) -> bool {
         if let TieredLookup::Ram(addr) = self.lookup(key, hash, &[]) {
             let len = self.record(addr).encoded_len;
+            // ADR-0093 D5: a replayed `Delete` may find a re-formed pair
+            // whose twin the crashed life told apart as a *collision*
+            // (its `DEL` staged no marker for it — the twin is another
+            // key). The ticket ends and the twin stays slotted, which is
+            // exactly the crashed life's verdict; a same-key twin was
+            // killed by the `ColdDisplace(A)` the forced resolution's
+            // markers carried, before this record. Never the foreground
+            // `delete`'s assertion: replay cannot read.
+            self.shadow_drop_winner_tickets(addr);
             self.delete(hash, addr, len);
+            if !self.reloc_origins.is_empty() {
+                self.reloc_origins.remove(&(hash, addr.to_raw()));
+            }
             return true;
         }
         false
+    }
+
+    /// R5's origin move: the slot `(hash, old)` was repointed to `new`
+    /// by a replayed overwrite, and the addresses un-superseded
+    /// checkpoints may still name it by stay attached to the live record
+    /// (ADR-0059 D9; ADR-0174 R5).
+    pub(super) fn move_origins(&mut self, hash: u64, old: LogicalAddr, new: LogicalAddr) {
+        if self.reloc_origins.is_empty() {
+            return;
+        }
+        if let Some(origins) = self.reloc_origins.remove(&(hash, old.to_raw())) {
+            let prev = self.reloc_origins.insert((hash, new.to_raw()), origins);
+            debug_assert!(prev.is_none(), "a fresh address carries no origins");
+        }
     }
 
     /// This namespace's MANIFEST v2 tier section (ADR-0057 D5): the
@@ -1461,6 +1003,17 @@ impl TieredTable {
                 files.push(TierFileRange { id: meta.id, base, durable_len });
             }
         }
+        // Files whose seal is staged but not completion-committed
+        // (M4.5-S31, ADR-0084 D2) stay manifest-visible as unsealed
+        // ranges at their flushed prefix — recovery must never treat a
+        // mid-round file as dead-life garbage.
+        for pending in flush.pending_seals() {
+            let base = pending.base.to_raw();
+            let durable_len = (base + pending.data_len).min(flushed).saturating_sub(base);
+            if durable_len > 0 {
+                files.push(TierFileRange { id: pending.id, base, durable_len });
+            }
+        }
         if let Some((id, base, _, _, _)) = flush.active() {
             let base = base.to_raw();
             let durable_len = flushed.saturating_sub(base);
@@ -1483,9 +1036,45 @@ impl TieredTable {
             expire_at_ms: None,
             kind: RecordKind::String { raw: false },
         };
-        let target = self.space.stall_target(spec.encoded_len())?;
+        self.stall_target_for(spec.encoded_len())
+    }
+
+    /// [`write_stall_target`](Self::write_stall_target) for a refused
+    /// **blob** write (ADR-0102 D3, review of 2026-08-30 F-L06-05): the
+    /// record that was refused is the 24-byte extent reference, never
+    /// the value — sizing the probe from a 1 GiB value asserted above
+    /// `ring / 2` and parked on the wrong watermark below it.
+    pub fn extent_stall_target(&mut self, key: &[u8]) -> Option<LogicalAddr> {
+        let reference = [0u8; crate::record::EXTENT_REF_LEN];
+        let spec = RecordSpec {
+            key,
+            value: &reference,
+            version: 0,
+            expire_at_ms: None,
+            kind: RecordKind::StringExtent,
+        };
+        self.stall_target_for(spec.encoded_len())
+    }
+
+    /// A total stall probe: a record the ring can never hold answers
+    /// `None` ("no watermark progress can help") instead of reaching the
+    /// space's release assert; a fitting one counts the stall.
+    fn stall_target_for(&mut self, len: usize) -> Option<LogicalAddr> {
+        if len > self.inline_record_max() {
+            return None;
+        }
+        let target = self.space.stall_target(len)?;
         self.space.note_tail_alloc_stall();
         Some(target)
+    }
+
+    /// Counts one write replan (review of 2026-08-30, F-L06-03): the
+    /// plane resolved a key, suspended on an extent read, and found the
+    /// key's slot moved by the time it was ready to write — the write
+    /// re-resolves instead of mutating through a stale address. Always
+    /// on; rendered in `INFO tiering`.
+    pub fn note_write_replan(&mut self) {
+        self.space.note_write_replan();
     }
 
     /// The underlying address space (watermark advancement, counters,
@@ -1609,16 +1198,44 @@ impl TieredTable {
         self.write.compaction_bytes += bytes;
     }
 
-    fn append(&mut self, key: &[u8], value: &[u8], version: u32) -> Result<LogicalAddr, OpError> {
-        if key.len() > crate::record::MAX_KEY_LEN || value.len() > crate::record::MAX_VAL_LEN {
-            return Err(OpError::TooLarge);
+    /// The typed length refusals of an inline placement (the one copy —
+    /// `append` and boot replay's entry both ask), answering the record's
+    /// encoded length: the key and value bounds; values at or above the
+    /// blob threshold must take the extent path (M4-S17, ADR-0061 D1 —
+    /// the inline refusal is what makes the plane's routing a checked
+    /// contract); a record above half the ring can never be placed
+    /// (ADR-0102 D3) — refused typed before the space's release assert
+    /// can see it (the threshold clamp makes this unreachable through
+    /// the plane's routing; a direct caller gets the same typed answer).
+    pub(super) fn admit_inline<'a>(
+        &self,
+        key: &'a [u8],
+        value: &'a [u8],
+    ) -> Result<AdmittedInline<'a>, LengthRefusal> {
+        LengthRefusal::check(LengthBound::Key, key.len(), crate::record::MAX_KEY_LEN)?;
+        LengthRefusal::check(LengthBound::Value, value.len(), crate::record::MAX_VAL_LEN)?;
+        let threshold = self.blob.threshold_bytes as usize;
+        if value.len() >= threshold {
+            return Err(LengthRefusal::new(LengthBound::BlobThreshold, value.len(), threshold));
         }
-        // Values at or above the blob threshold must take the extent
-        // path (M4-S17, ADR-0061 D1) — the inline refusal is what makes
-        // the plane's routing a checked contract, not a convention.
-        if value.len() >= self.blob.threshold_bytes as usize {
-            return Err(OpError::TooLarge);
-        }
+        let spec = RecordSpec {
+            key,
+            value,
+            version: 0, // length-only: the version never changes encoded_len
+            expire_at_ms: None,
+            kind: RecordKind::String { raw: false },
+        };
+        let len = spec.encoded_len();
+        LengthRefusal::check(LengthBound::InlineRecord, len, self.inline_record_max())?;
+        Ok(AdmittedInline { key, value, len })
+    }
+
+    fn append(
+        &mut self,
+        admitted: AdmittedInline<'_>,
+        version: u32,
+    ) -> Result<LogicalAddr, OpError> {
+        let AdmittedInline { key, value, len } = admitted;
         let spec = RecordSpec {
             key,
             value,
@@ -1626,7 +1243,7 @@ impl TieredTable {
             expire_at_ms: None,
             kind: RecordKind::String { raw: false },
         };
-        let len = spec.encoded_len();
+        debug_assert_eq!(spec.encoded_len(), len, "the admitted length is the record's");
         // M4-S21 disk admission (ADR-0063 D1/D2): before the alloc, so
         // refusal mutates nothing; the debit follows the alloc, so a
         // memory refusal never leaks headroom. Recovery re-appends pass
@@ -1635,6 +1252,7 @@ impl TieredTable {
         self.disk_admit_check(len as u64)?;
         let addr = self.space.alloc(len).ok_or(OpError::OutOfMemory)?;
         self.disk_admit_debit(len as u64);
+        self.shadow_note_alloc();
         self.note_seal_mark(addr);
         spec.write(self.space.bytes_mut(addr, len));
         self.live_bytes += len as u64;
@@ -1690,6 +1308,7 @@ impl TieredTable {
             "relocation image is not exactly one record"
         );
         let addr = self.space.alloc(len)?;
+        self.shadow_note_alloc();
         self.note_seal_mark(addr);
         self.space.bytes_mut(addr, len).copy_from_slice(image);
         self.live_bytes += len as u64;
@@ -1700,7 +1319,7 @@ impl TieredTable {
     /// `flush_bytes` (M4-S13). Called at the end of every flush leg;
     /// charging the delta (rather than a per-write callback) keeps the
     /// flush hot path untouched and makes the fold idempotent.
-    fn charge_flush_device<F: SegmentFs>(&mut self, flush: &TierFlush<F>) {
+    fn charge_flush_device<P: inf_log::flush::SeamFlush>(&mut self, flush: &P) {
         let total = flush.device_bytes();
         debug_assert!(total >= self.flush_device_seen, "pipeline device bytes are monotone");
         self.write.flush_bytes += total.saturating_sub(self.flush_device_seen);
@@ -1722,6 +1341,90 @@ impl core::fmt::Debug for TieredTable {
 mod tests {
     use super::*;
 
+    #[test]
+    fn simulation_digest_observes_resident_changes_and_cold_index_without_mutation() {
+        let mut table = table();
+        let hash = table.hash_key(b"key");
+        let address = table.insert(b"key", b"one", hash).unwrap();
+        let before = table.simulation_digest();
+        assert_eq!(before.entries, 1);
+        assert_eq!(before, table.simulation_digest());
+        assert_eq!(table.walk_ckpt_id(), None);
+        let record = table.record(address);
+        let (len, version) = (record.encoded_len, record.version);
+        table.update(b"key", b"two", hash, address, len, version).unwrap();
+        assert_ne!(before, table.simulation_digest());
+        assert_eq!(table.walk_ckpt_id(), None);
+        let mut cold = cold_table();
+        let empty = cold.simulation_digest();
+        cold.replay_ref(17, LogicalAddr::ZERO);
+        assert_ne!(empty, cold.simulation_digest());
+        assert_eq!(cold.simulation_digest().entries, 1);
+        assert_eq!(cold.walk_ckpt_id(), None);
+    }
+
+    fn cold_table() -> TieredTable {
+        let mut cold = TieredTable::new(
+            AddressSpaceConfig {
+                reserve_bytes: 1 << 16,
+                page_bytes: 1 << 12,
+                life_origin: LogicalAddr::from_raw(1 << 12).unwrap(),
+            },
+            DemotionConfig::for_budget(1 << 16, 1 << 12),
+            64,
+            KeyHasher::default(),
+        )
+        .unwrap();
+        cold.seed_recovered_files(
+            &[TierFileMeta {
+                id: 0,
+                base: LogicalAddr::ZERO,
+                data_len: 1 << 12,
+                reason: inf_log::tier::SealReason::Capacity,
+                path: "tier-0.itier".into(),
+            }],
+            0,
+        );
+        cold
+    }
+
+    fn assert_insert_does_not_resolve_cold(blob: bool) {
+        let mut table = cold_table();
+        let hash = table.hash_key(b"absent");
+        table.replay_ref(hash, LogicalAddr::ZERO);
+        let before = table.space.counters().cold_resolves;
+        if blob {
+            use inf_log::blob::{ExtentId, ExtentWriter};
+            let fs = inf_log::fs::mem::MemFs::new();
+            let mut writer = ExtentWriter::create(
+                &fs,
+                std::path::Path::new("shard"),
+                ExtentId(0),
+                0,
+                inf_log::NsId(1),
+                3,
+                inf_log::TierIoMode::Buffered,
+            )
+            .unwrap();
+            writer.append_chunk(b"one").unwrap();
+            let sealed = writer.finish().unwrap();
+            table.insert_extent(b"absent", hash, &sealed).unwrap();
+        } else {
+            table.insert(b"absent", b"one", hash).unwrap();
+        }
+        assert_eq!(table.space.counters().cold_resolves, before);
+    }
+
+    #[test]
+    fn inline_insert_assertion_does_not_count_a_cold_lookup() {
+        assert_insert_does_not_resolve_cold(false);
+    }
+
+    #[test]
+    fn extent_insert_assertion_does_not_count_a_cold_lookup() {
+        assert_insert_does_not_resolve_cold(true);
+    }
+
     fn table() -> TieredTable {
         TieredTable::new(
             AddressSpaceConfig {
@@ -1731,12 +1434,13 @@ mod tests {
             },
             DemotionConfig::for_budget(1 << 16, 1 << 12),
             64,
+            KeyHasher::default(),
         )
         .expect("reservation")
     }
 
     fn find(table: &TieredTable, key: &[u8]) -> (LogicalAddr, usize, u32) {
-        let hash = TieredTable::hash_key(key);
+        let hash = table.hash_key(key);
         match table.lookup(key, hash, &[]) {
             TieredLookup::Ram(addr) => {
                 let parts = table.record(addr);
@@ -1751,7 +1455,7 @@ mod tests {
     #[test]
     fn update_in_place_when_mutable_and_exact_fit() {
         let mut t = table();
-        let hash = TieredTable::hash_key(b"k");
+        let hash = t.hash_key(b"k");
         let addr = t.insert(b"k", b"aaaa", hash).expect("fits");
         let (_, len, version) = find(&t, b"k");
         let dead_before = t.space().report().dead_bytes;
@@ -1768,7 +1472,7 @@ mod tests {
     #[test]
     fn update_relocates_on_size_change() {
         let mut t = table();
-        let hash = TieredTable::hash_key(b"k");
+        let hash = t.hash_key(b"k");
         let addr = t.insert(b"k", b"aaaa", hash).expect("fits");
         let (_, len, version) = find(&t, b"k");
         let dead_before = t.space().report().dead_bytes;
@@ -1786,7 +1490,7 @@ mod tests {
     #[test]
     fn update_of_sealed_record_copies_to_tail() {
         let mut t = table();
-        let hash = TieredTable::hash_key(b"k");
+        let hash = t.hash_key(b"k");
         let addr = t.insert(b"k", b"aaaa", hash).expect("fits");
         let (_, len, version) = find(&t, b"k");
         let tail = t.space().tail();
@@ -1813,14 +1517,14 @@ mod tests {
             },
             DemotionConfig::for_budget(1 << 14, 1 << 12),
             64,
+            KeyHasher::default(),
         )
         .expect("reservation");
         // ~40 records ≈ 2.5 pages of mutable bytes (record ≈ 260 B).
         let mut starts = Vec::new();
         for i in 0..40u32 {
             let key = format!("k:{i:04}");
-            let addr =
-                t.insert(key.as_bytes(), &[0xAB; 240], TieredTable::hash_key(key.as_bytes()));
+            let addr = t.insert(key.as_bytes(), &[0xAB; 240], t.hash_key(key.as_bytes()));
             starts.push(addr.expect("fits").to_raw());
         }
         let target = t.demotion().mutable_target_bytes();
@@ -1859,11 +1563,12 @@ mod tests {
             // Target 0 mutable bytes: everything is seal debt.
             DemotionConfig { mem_budget_bytes: 1 << 14, mutable_permille: 0, slice_bytes: 256 },
             64,
+            KeyHasher::default(),
         )
         .expect("reservation");
-        let hash = TieredTable::hash_key(b"wide");
+        let hash = t.hash_key(b"wide");
         let wide = t.insert(b"wide", &[0x77; 8 << 10], hash).expect("fits");
-        let hash2 = TieredTable::hash_key(b"next");
+        let hash2 = t.hash_key(b"next");
         let next = t.insert(b"next", &[0x11; 64], hash2).expect("fits");
         // First slice: the wide record exceeds 256 B but seals whole.
         assert!(t.seal_slice() > 256, "minimum one record of progress");
@@ -1881,16 +1586,16 @@ mod tests {
     fn stall_target_names_the_unblocking_flushed_watermark() {
         let mut t = table();
         let value = vec![0x5A; (1 << 14) - 32];
-        let hash = TieredTable::hash_key(b"a");
+        let hash = t.hash_key(b"a");
         t.insert(b"a", &value, hash).expect("fits");
-        let hash_b = TieredTable::hash_key(b"b");
+        let hash_b = t.hash_key(b"b");
         t.insert(b"b", &value, hash_b).expect("fits");
-        let hash_c = TieredTable::hash_key(b"c");
+        let hash_c = t.hash_key(b"c");
         t.insert(b"c", &value, hash_c).expect("fits");
-        let hash_d = TieredTable::hash_key(b"d");
+        let hash_d = t.hash_key(b"d");
         t.insert(b"d", &value, hash_d).expect("fits");
         // The ring (64 KiB) is full: the next write must stall.
-        assert!(t.insert(b"e", &value, TieredTable::hash_key(b"e")).is_err());
+        assert!(t.insert(b"e", &value, t.hash_key(b"e")).is_err());
         let target = t.write_stall_target(b"e", &value).expect("watermark progress can help");
         assert_eq!(t.space().counters().tail_alloc_stalls, 1, "the stall is tripwired");
         // MAINTAIN's job, played by the test: seal → flush → release to
@@ -1900,7 +1605,7 @@ mod tests {
         t.space_mut().advance_flushed(tail);
         assert!(tail >= target, "the sealed range covers the stall target");
         while t.release_slice() > 0 {}
-        t.insert(b"e", &value, TieredTable::hash_key(b"e")).expect("fits after release");
+        t.insert(b"e", &value, t.hash_key(b"e")).expect("fits after release");
     }
 
     /// M4-S07: release steps are slice-bounded and stop at `flushed`.
@@ -1909,8 +1614,7 @@ mod tests {
         let mut t = table();
         for i in 0..8u32 {
             let key = format!("r:{i}");
-            t.insert(key.as_bytes(), &[0x33; 4000], TieredTable::hash_key(key.as_bytes()))
-                .expect("fits");
+            t.insert(key.as_bytes(), &[0x33; 4000], t.hash_key(key.as_bytes())).expect("fits");
         }
         let tail = t.space().tail();
         t.space_mut().advance_ro_boundary(tail);
@@ -1939,7 +1643,7 @@ mod tests {
     #[test]
     fn doc_shape_in_place_patch_above_boundary() {
         let mut t = table();
-        let hash = TieredTable::hash_key(b"doc");
+        let hash = t.hash_key(b"doc");
         let addr = t.insert(b"doc", b"01234567", hash).expect("fits");
         let (_, len, version) = find(&t, b"doc");
         let record = t.space_mut().bytes_mut(addr, len);

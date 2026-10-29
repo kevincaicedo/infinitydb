@@ -80,6 +80,11 @@ pub(crate) fn dict_region_find(dict: &[u8], key: &[u8]) -> Option<u16> {
     None
 }
 
+/// The largest intern table the format can name: the table count field
+/// and every `0xA9 id:u16` ref are `u16`, so 65 535 entries is the last
+/// representable table (review of 2026-08-30, F-L10-05 / C12).
+pub const INTERN_TABLE_MAX: usize = u16::MAX as usize;
+
 /// Plain encoded cost of a key of `len` bytes (tag/length header + bytes).
 fn plain_cost(len: usize) -> usize {
     if len <= FIXSTR_MAX_LEN {
@@ -341,6 +346,14 @@ pub fn intern(plain: &[u8]) -> Option<Vec<u8>> {
     if winners.is_empty() {
         return None;
     }
+    // The table count field and every `0xA9 id:u16` ref are u16: a table
+    // above INTERN_TABLE_MAX entries has no representation, so the
+    // document stays plain (review of 2026-08-30, F-L10-05 / C12 — the
+    // narrowing below once wrapped the count to 0 and aliased ids past
+    // 65 535, storing a document no reader could open).
+    if winners.len() > INTERN_TABLE_MAX {
+        return None;
+    }
     // Ids in first-occurrence document order; membership via sorted probe.
     let mut table: Vec<&[u8]> = Vec::new();
     let mut id_of: Vec<(&[u8], u16)> = Vec::new(); // sorted by key bytes
@@ -348,13 +361,15 @@ pub fn intern(plain: &[u8]) -> Option<Vec<u8>> {
         if winners.binary_search(key).is_ok() {
             let probe = id_of.binary_search_by(|(k, _)| k.cmp(key));
             if let Err(pos) = probe {
-                id_of.insert(pos, (key, table.len() as u16));
+                let id = u16::try_from(table.len()).expect("table bounded by INTERN_TABLE_MAX");
+                id_of.insert(pos, (key, id));
                 table.push(key);
             }
         }
     }
+    let count = u16::try_from(table.len()).expect("table bounded by INTERN_TABLE_MAX");
     let mut tail = Vec::with_capacity(plain.len());
-    tail.extend_from_slice(&(table.len() as u16).to_le_bytes());
+    tail.extend_from_slice(&count.to_le_bytes());
     for key in &table {
         tail.extend_from_slice(&(key.len() as u16).to_le_bytes());
         tail.extend_from_slice(key);
@@ -573,6 +588,48 @@ mod tests {
         assert_eq!(
             TapeDoc::from_bytes(&doc).unwrap_err(),
             crate::DocError::NonCanonical("plain encoding of an interned key")
+        );
+    }
+    /// Review of 2026-08-30, F-L10-05 (report C12): the table count
+    /// field and the `0xA9 id:u16` ref are both `u16`, so a table above
+    /// [`INTERN_TABLE_MAX`] entries has no representation. 65 536
+    /// distinct winning keys once wrote `count = 0` (a document
+    /// `split_dict` refuses — a panic on the next read); the writer must
+    /// stay plain there, and the boundary table (65 535) must round-trip.
+    fn wide_keyed(distinct: usize) -> Vec<u8> {
+        // Four objects sharing `distinct` 4-byte keys: n = 4, c = 5, so
+        // the D2 rule reads 20 > 2 + 4 + 12 = 18 — every key wins.
+        let obj =
+            || Value::Obj((0..distinct).map(|i| (format!("{i:04x}"), Value::I64(0))).collect());
+        model::encode(&Value::Arr(vec![obj(), obj(), obj(), obj()])).expect("encodes")
+    }
+
+    #[test]
+    fn table_above_the_u16_count_field_stays_plain() {
+        let plain = wide_keyed(INTERN_TABLE_MAX + 1);
+        assert_eq!(intern(&plain), None, "65 536 winners have no u16 count — stay plain");
+    }
+
+    /// The boundary table (65 535 entries) is representable and splits
+    /// structurally. The full `unintern` round trip is covered at small
+    /// scale above: the reader's dict walk is O(id) per ref by design
+    /// ("dicts are small"), so a 65 535-entry round trip is quadratic —
+    /// minutes in the dev profile — and proves nothing the split does not.
+    #[test]
+    fn table_at_the_u16_count_field_is_representable() {
+        let plain = wide_keyed(INTERN_TABLE_MAX);
+        let interned = intern(&plain).expect("65 535 winners fit the count field");
+        assert!(interned.len() < plain.len());
+        let (dict, _body) = split_dict(&interned[HEADER_LEN..]).expect("boundary table splits");
+        assert_eq!(
+            u16::from_le_bytes([dict[0], dict[1]]) as usize,
+            INTERN_TABLE_MAX,
+            "count field carries the full table"
+        );
+        assert_eq!(
+            dict_region_find(dict, format!("{:04x}", INTERN_TABLE_MAX - 1).as_bytes()),
+            Some(u16::MAX - 1),
+            "the last key holds the last representable id"
         );
     }
 }

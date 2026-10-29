@@ -14,6 +14,19 @@ inf-fabric.workspace = true
 inf-runtime.workspace = true
 inf-store.workspace = true
 inf-server.workspace = true
+# M4.5-S42 (ADR-0091): the in-boot device probe (`--device-probe auto`).
+inf-probe.workspace = true
+
+[dev-dependencies]
+inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
+# Review F-L14-01 (batch 19): the boot test hand-places frames the
+# shipping writer never emits (a discarded life's residue behind a gap).
+inf-log.workspace = true
+
+[features]
+# M4.5-S37 step 1: the blind-overwrite ceiling instrument
+# (`--blind-overwrite-ceiling`); unsound, never a shipping build.
+bench-diagnostics = ["inf-server/bench-diagnostics"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 inf-runtime = { workspace = true, features = ["uring"] }

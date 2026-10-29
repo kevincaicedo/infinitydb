@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4-S12 recovery-gate bench (§4.1: ≥ 1 GB/s/cell replay, 10 GB node
 //! < 15 s, tiering on — the M2-gate regression re-proof, ADR-0057 D6).
 //!
@@ -7,11 +11,13 @@
 //! row joins the S22/S24 campaign per the dev-tier evidence rule):
 //!
 //! - **image row** — a v2 `.ick` of string post-images streamed through
-//!   `read_ick_hybrid` → `TieredTable::apply_image` (decode + CRC +
-//!   re-append + index insert): GB/s over file bytes, the M2 gate's
-//!   currency.
+//!   `read_ick_hybrid` → `Keyspace::apply_record` with the namespace's
+//!   boot machine lent, the shipped dispatch (ADR-0174 D1: decode + CRC +
+//!   the replay entry's room question + re-append + index insert): GB/s
+//!   over file bytes, the M2 gate's currency. The budget holds the whole
+//!   image set, so the boot fits and the machine never demotes.
 //! - **ref row** — addr-ref sections streamed through the same loader →
-//!   `apply_ref` (idempotency probe + insert, zero record bytes):
+//!   `replay_ref` (idempotency probe + insert, zero record bytes):
 //!   entries/s. The L4 hypothesis from the ledger: ≥ 20 M entries/s —
 //!   at 14 B/entry the cold *index* of a 10× RAM namespace recovers in
 //!   seconds without touching the cold tier.
@@ -23,14 +29,63 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
 
+use inf_foundation::time::Nanos;
 use inf_log::ckpt::{CkptConfig, IckReaderConfig, ick_file_name, read_ick_hybrid};
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
-use inf_log::{Lsn, NsId, RecordView, SegmentId, SyncIckWriter};
-use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, TieredTable};
+use inf_log::{BootFlush, Lsn, NsId, RecordView, SegmentId, SyncIckWriter, TierFlush};
+use inf_store::{
+    AddressSpaceConfig, DemotionConfig, FsyncClass, KeyHasher, Keyspace, LogicalAddr, NsMode,
+    NsSpec, ReplaySpill, StoreConfig, TierReplay, TierSpec, TieredTable, WallAnchor,
+};
 
 const NS: NsId = NsId(31);
 const PAGE: u64 = 1 << 20;
+
+/// The seam the recovery driver lends: the namespace's boot machine.
+struct Lent {
+    machine: TierReplay<MemFs>,
+}
+
+impl ReplaySpill for Lent {
+    type Fs = MemFs;
+
+    fn replay_mut(&mut self, ns: NsId) -> Option<&mut TierReplay<MemFs>> {
+        (ns == NS).then_some(&mut self.machine)
+    }
+}
+
+/// A keyspace holding the tiered namespace at `budget`, and its boot
+/// machine over an empty pipeline (no manifested file: a fitting boot).
+fn booting(fs: &MemFs, budget: u64, n: u64) -> (Keyspace, Lent) {
+    let mut ks = Keyspace::new(StoreConfig::default());
+    ks.ns_create(NsSpec {
+        id: NS,
+        name: b"tiered".to_vec(),
+        mode: NsMode::Durable,
+        fsync: Some(FsyncClass::Everysec),
+        policy: None,
+        maxmemory: None,
+        tier: Some(TierSpec::for_budget(budget)),
+    })
+    .expect("create the tiered namespace");
+    ks.reserve_ns(NS, n);
+    let flush = TierFlush::new(
+        fs.clone(),
+        inf_log::TierFlushConfig {
+            shard_dir: Path::new("shard-0").join(format!("ns-{}", NS.0)),
+            cell: 0,
+            ns: NS,
+            mode: inf_log::TierIoMode::Buffered,
+            file_capacity: inf_log::TIER_FILE_CAPACITY_DEFAULT,
+            slice_bytes: PAGE,
+        },
+        0,
+    );
+    let table = ks.tiered_store(NS).expect("materialized");
+    let machine = TierReplay::new(BootFlush::new(flush, Vec::new()), table);
+    (ks, Lent { machine })
+}
 
 /// Image row: `n` string records of `value_len` bytes each.
 fn bench_images(n: u64, value_len: usize) {
@@ -58,38 +113,28 @@ fn bench_images(n: u64, value_len: usize) {
     let path = Path::new("shard-0").join(ick_file_name(1));
 
     let budget = (n * (value_len as u64 + 64)).next_power_of_two().max(64 << 20);
-    let demote =
-        DemotionConfig { mem_budget_bytes: budget, mutable_permille: 1000, slice_bytes: PAGE };
+    let (now, anchor) = (Nanos::from_millis(1), WallAnchor { internal_ms: 0, unix_ms: 0 });
     let mut best_gbps = 0.0f64;
     for _ in 0..3 {
-        let mut table = TieredTable::new(
-            AddressSpaceConfig {
-                reserve_bytes: demote.ring_reserve_bytes().expect("ring"),
-                page_bytes: PAGE as usize,
-                life_origin: LogicalAddr::ZERO,
-            },
-            demote,
-            usize::try_from(n).expect("fits"),
-        )
-        .expect("ring");
+        let (mut ks, mut lent) = booting(&fs, budget, n);
         let t = Instant::now();
         read_ick_hybrid(
             &fs,
             &path,
             IckReaderConfig::default(),
             |record| {
-                if let RecordView::StringPostImage { key, value, .. } = record {
-                    table.apply_image(key, value, TieredTable::hash_key(key)).expect("fits");
-                }
+                ks.apply_record(&record, now, anchor, &mut lent).expect("fits");
                 Ok::<(), std::convert::Infallible>(())
             },
             |_| Ok(()),
             |_| Ok(()),
             |_| Ok(()),
+            |_| panic!("no index-sidecar sections in this image"),
         )
         .expect("load");
         let secs = t.elapsed().as_secs_f64();
-        black_box(table.len());
+        black_box(ks.tiered_store(NS).expect("materialized").len());
+        assert_eq!(lent.machine.counters().demote_steps, 0, "the image set fits the window");
         let gbps = summary.bytes as f64 / 1e9 / secs;
         if gbps > best_gbps {
             best_gbps = gbps;
@@ -145,9 +190,10 @@ fn bench_refs(n: u64) {
             },
             demote,
             usize::try_from(n).expect("fits"),
+            KeyHasher::default(),
         )
         .expect("ring");
-        // One manifested file covering every ref (M4-S14): `apply_ref`
+        // One manifested file covering every ref (M4-S14): `replay_ref`
         // counts each slot into its containing file, so the bench seeds
         // the catalog the way recovery does — the measured row includes
         // the live-set count maintenance, honestly.
@@ -169,12 +215,13 @@ fn bench_refs(n: u64) {
             |_| Ok::<(), std::convert::Infallible>(()),
             |section| {
                 for (hash, addr) in section.iter() {
-                    table.apply_ref(hash, LogicalAddr::from_raw(addr).expect("48-bit"));
+                    table.replay_ref(hash, LogicalAddr::from_raw(addr).expect("48-bit"));
                 }
                 Ok(())
             },
             |_| Ok(()),
             |_| Ok(()),
+            |_| panic!("no index-sidecar sections in this image"),
         )
         .expect("load");
         let secs = t.elapsed().as_secs_f64();

@@ -181,7 +181,7 @@ pub fn scan_log_dir_from<F: SegmentFs>(
         if curr == prev {
             return Err(ScanError::Duplicate { id: *curr, name: curr_name.clone() });
         }
-        if *curr >= floor && *prev >= floor && curr.0 != prev.0 + 1 {
+        if *curr >= floor && *prev >= floor && prev.0.checked_add(1) != Some(curr.0) {
             return Err(ScanError::Gap { expected: prev.next(), found: *curr });
         }
     }

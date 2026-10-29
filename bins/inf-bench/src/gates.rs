@@ -183,7 +183,7 @@ mod tests {
     fn parses_the_m1_gates_file() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/milestones/m1-gates.toml");
         let gates = load(path).expect("m1 gates file parses");
-        assert_eq!(gates.len(), 16, "all M1 §6 rows present (incl. informational pressure rows)");
+        assert_eq!(gates.len(), 20, "the M1 rows plus the four empty-node rows");
         let storm = gates.iter().find(|g| g.id == "expiry_storm_p999").expect("storm gate");
         assert!(storm.passes(1999.0) && !storm.passes(2000.0));
         let mem = gates.iter().find(|g| g.id == "memory_1x").expect("memory gate");
@@ -194,5 +194,21 @@ mod tests {
             gates.iter().filter(|g| g.source.starts_with("loadgen:")).count() >= 7,
             "gate-run m1 measures the pressure rows natively"
         );
+        // The empty-node rows: each threshold is the design's own bill, the
+        // row a measured baseline (`informational`), never an achieved target.
+        for (id, threshold, step, source) in [
+            ("empty_idle_rss", 100.5, 1.0 / 256.0, "loadgen:empty_idle_rss_mib"),
+            ("empty_data_dir_bytes", 128.0, 4.0, "loadgen:empty_data_dir_kib"),
+            ("empty_warm_boot", 20.0, 1.0, "loadgen:empty_warm_boot_ms"),
+            ("empty_idle_cpu", 5.0, 0.1, "loadgen:empty_idle_cpu_pct"),
+        ] {
+            let row = gates.iter().find(|g| g.id == id).unwrap_or_else(|| panic!("{id} row"));
+            assert!(row.informational, "{id} starts as a measured baseline");
+            assert_eq!(row.comparator, "<=", "{id}");
+            assert_eq!(row.tier, "linux-reference-box", "{id}");
+            assert_eq!(row.source, source, "{id}");
+            assert!(row.passes(threshold), "{id} passes at its bill");
+            assert!(!row.passes(threshold + step), "{id} fails one resolution step over");
+        }
     }
 }

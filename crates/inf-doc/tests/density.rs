@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! S02 density budgets (ADR-0036 D9): idoc ≤ 1.15× msgpack and ≤ 0.85×
 //! JSON text, asserted on the six seeded M3-S20 reference-corpus shapes.
 //!

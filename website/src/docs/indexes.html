@@ -1,0 +1,50 @@
+<!--
+title: Indexes & PartiQL
+section: Data models
+description: The status of InfinityDB's secondary indexes and planner-free PartiQL subset: what is built and tested, and what is not reachable from a client yet.
+lede: Secondary indexes over JSON documents and a planner-free PartiQL subset are being built now, in M4. The engine underneath is built and tested as a library. None of it is usable from a client yet.
+chips: In progress · M4
+-->
+<aside class="callout"><div class="callout-label">Not usable yet</div><p>The command table has no index DDL, no query command and no <code>EXPLAIN</code> today, and the server does not link the query crate, so a client has no way to declare an index or run a query. This page describes work in progress so you can follow it; nothing here is available in a build you run.</p></aside>
+
+<h2 id="built">What is built and tested</h2>
+<p>These parts exist in the code, with their own tests, oracles and fuzz targets:</p>
+<table class="doc-table"><thead><tr><th>Part</th><th>What it does</th></tr></thead><tbody>
+<tr><td>Ordered index</td><td>A per-cell B+-tree of (typed key, document reference) pairs in <code>memcmp</code> order. Numeric keys are 8-byte flat arrays; variable-length keys go up to 1 KiB; leaf search uses SIMD. Cursors never pin a node: they remember their last pair and seek again when the tree has changed.</td></tr>
+<tr><td>Typed keys</td><td>UTF-8 strings, 64-bit integers, doubles and booleans encode so that byte order equals value order. One coercion table decides what a document value becomes as a key, for maintenance and queries alike.</td></tr>
+<tr><td>Maintenance</td><td>A write to an indexed namespace evaluates the index paths on the old document, applies the mutation, evaluates them on the new one and applies the difference to the trees, in the same step on the same thread. No observer sees a document and its index disagree.</td></tr>
+<tr><td>Backfill</td><td>A new index fills by a budgeted background walk. It moves from declared, to backfilling, to ready only when every cell reports the same generation.</td></tr>
+<tr><td>Persistence</td><td>Converged trees are saved inside checkpoints. At boot an index is loaded or rebuilt, and a damaged saved index can never stop a boot.</td></tr>
+<tr><td>Predicate VM</td><td>An iterative bytecode interpreter for filters, with a fuel limit, that allocates nothing.</td></tr>
+<tr><td>Query compiler</td><td>Turns a PartiQL statement into exactly one access step, an optional filter and a page bound, or rejects it with a fixed message.</td></tr>
+</tbody></table>
+<p>Index bytes are counted in the memory domains (<code>used_memory_idx_tree</code>, <code>used_memory_idx_slack</code>) and in namespace budgets.</p>
+
+<h2 id="partiql">The PartiQL subset</h2>
+<p>The full contract, with every rejection message, is <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/partiql-subset.md"><code>docs/partiql-subset.md</code></a>. In summary:</p>
+<pre class="code" data-label="statement shape">SELECT ( * | COUNT(*) )
+FROM   ns | ns.index | ns.SCAN
+[WHERE condition]
+[LIMIT integer]</pre>
+<ul class="dots">
+<li><code>FROM ns</code> serves a primary-key get (<code>$key = 'k'</code>) or the one ready index whose path the conditions name. <code>FROM ns.index</code> names the index. <code>FROM ns.SCAN</code> is the explicit consent to read the whole namespace; an unindexed query is never quietly turned into a scan.</li>
+<li>Conditions use <code>=</code>, <code>!=</code>, <code>&lt;&gt;</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code>, <code>BETWEEN</code>, <code>IN</code> with 1 to 100 members, <code>begins_with(path, 'prefix')</code> and <code>exists(path)</code>, combined with <code>AND</code>, <code>OR</code>, <code>NOT</code> and parentheses, nested at most 32 deep.</li>
+<li>Paths are written without the <code>$.</code> root: <code>price</code>, <code>items[0].id</code>, <code>tags[*]</code>. Recursive descent, slices and unions are rejected.</li>
+<li>Statements are UTF-8, at most 8,192 bytes. <code>ORDER BY</code>, <code>GROUP BY</code>, <code>HAVING</code>, <code>JOIN</code>, <code>OFFSET</code>, <code>LIKE</code>, <code>IS NULL</code> and <code>INSERT</code>, <code>UPDATE</code> or <code>DELETE</code> are rejected, each with its own message.</li>
+</ul>
+
+<h2 id="planner-free">Planner-free by construction</h2>
+<p>There is no cost model and no plan search. The compiled form has room for exactly one access step: a primary-key get, one index range, or a consented scan. When the conditions match two ready indexes, the compiler refuses and asks you to name one, instead of choosing. When they match none, it refuses and points you to declaring an index or to <code>FROM ns.SCAN</code>. A reversed <code>BETWEEN</code> compiles to an empty range: zero rows, not an error.</p>
+<p>Results page through opaque cursors. A page is bounded by entries scanned, not entries matched, so a selective filter cannot make one page unbounded. <code>LIMIT</code> caps the total matches across pages, and <code>COUNT(*)</code> pages too: each page returns a partial count with the number of entries examined.</p>
+
+<h2 id="semantics">Evaluation rules</h2>
+<ul class="dots">
+<li><strong>Existential matching.</strong> A comparison on a path with several values is true if any value satisfies it. So on multi-valued paths <code>!=</code> is not <code>NOT(=)</code>: <code>[1, 2] != 1</code> is true, while <code>NOT([1, 2] = 1)</code> is false.</li>
+<li><strong>Two-valued verdicts.</strong> There is no SQL <code>UNKNOWN</code>. A missing path or a type mismatch is false and sets a flag; <code>NOT</code> flips the verdict only.</li>
+<li><strong>One numeric truth table.</strong> <code>3 = 3.0</code> is true, and comparisons across integers and doubles are exact, never lossy.</li>
+<li><strong>Fuel.</strong> Every statement runs under a fuel budget. Running out is a typed error, never a truncated or silently false result.</li>
+</ul>
+
+<h2 id="next">What comes next</h2>
+<p>Still to be reachable from the wire: index DDL, the query command, <code>EXPLAIN</code>, the cursor wire format, the fabric operation that carries a query to other cells, and JSONPath filter expressions (<code>?(@…)</code>) in <code>JSON.*</code> paths. The command surface lands after the work that bounds and reserves capacity across the engine. Indexes over documents in tiered namespaces, and queries that stay on one cell for a tenant's co-located keys, follow with documents beyond RAM, <a href="roadmap.html#m4">the last phase of M4</a>.</p>
+<p>The <a href="roadmap.html">roadmap</a> tracks the milestone, and the <a href="compat.html">compatibility matrix</a> will list these commands once a client can send them.</p>

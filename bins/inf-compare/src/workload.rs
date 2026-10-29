@@ -160,7 +160,8 @@ pub fn catalog() -> &'static [Workload] {
             requires_json: true,
             in_all: false, // opt-in via `json`
             redisbench_test: None,
-            about: "JSON.GET depth-4 path reads after a document preload (M3 read gate's cross-check)",
+            about: "JSON.GET depth-4 path reads after a document preload (M3 read gate's \
+                 cross-check)",
         },
     ]
 }
@@ -171,20 +172,22 @@ pub fn catalog() -> &'static [Workload] {
 pub fn select(spec: &str) -> Result<Vec<Workload>, String> {
     let mut out: Vec<Workload> = Vec::new();
     let push = |w: Workload, out: &mut Vec<Workload>| {
-        if !out.iter().any(|x| x.name == w.name) {
-            out.push(w);
+        if out.iter().any(|x| x.name == w.name) {
+            return Err(format!("duplicate workload selection `{}`", w.name));
         }
+        out.push(w);
+        Ok(())
     };
     for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if name == "all" {
             for w in catalog().iter().copied().filter(|w| w.in_all) {
-                push(w, &mut out);
+                push(w, &mut out)?;
             }
             continue;
         }
         if name == "json" {
             for w in catalog().iter().copied().filter(|w| w.requires_json) {
-                push(w, &mut out);
+                push(w, &mut out)?;
             }
             continue;
         }
@@ -192,7 +195,7 @@ pub fn select(spec: &str) -> Result<Vec<Workload>, String> {
             let known: Vec<&str> = catalog().iter().map(|w| w.name).collect();
             format!("unknown workload `{name}` (known: {}, all, json)", known.join(", "))
         })?;
-        push(w, &mut out);
+        push(w, &mut out)?;
     }
     if out.is_empty() {
         return Err("no workloads selected".into());

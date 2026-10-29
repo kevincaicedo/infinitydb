@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M3-S17 evidence generator: exact delta/full byte ratio for the named
 //! 1 KiB path-mutation mix, plus CPU-side replay over a configurable
 //! document cell with deep version histories.
@@ -10,13 +14,14 @@
 
 use std::time::Instant;
 
-use inf_doc::TapeDoc;
 use inf_doc::apply::{ApplyOp, Number, apply};
 use inf_doc::encode_apply_op;
 use inf_doc::model::{self, Value};
 use inf_doc::path::{EvalLimits, PathProgram, compile};
+use inf_doc::{CanonicalDoc, TapeDoc};
 use inf_foundation::time::Nanos;
 use inf_log::{DocLineage, FsyncClass, NsId, RecordView};
+use inf_store::NoSpill;
 use inf_store::{
     CellStore, JsonLogDecision, JsonScalarPatch, JsonSetOptions, Keyspace, NsMode, NsSpec,
     ReplayOutcome, StoreConfig, WallAnchor,
@@ -78,17 +83,17 @@ fn keyspace(documents: usize) -> Keyspace {
 fn apply_mutation(store: &mut CellStore, program: &PathProgram, op: &ApplyOp<'_>) {
     match store.json_patch_scalar(b"doc", program, op, NOW).expect("scalar probe") {
         Some(JsonScalarPatch::Number(_) | JsonScalarPatch::Toggled(_)) => return,
-        Some(JsonScalarPatch::Unsupported) => {}
+        Some(JsonScalarPatch::Unsupported(_)) => {}
         Some(JsonScalarPatch::Missing | JsonScalarPatch::Skipped) | None => {
             panic!("the fixed volume-mix mutation must apply")
         }
     }
     let frozen = store.json_freeze(b"doc", NOW).expect("freeze").expect("document");
     let doc = TapeDoc::from_validated_bytes(&frozen);
-    let outcome = apply(&doc, program, op, &EvalLimits::default(), store.doc_max_bytes())
+    let outcome = apply(&doc, program, op, &EvalLimits::default(), store.doc_limits())
         .expect("valid mutation");
-    let bytes = outcome.bytes.expect("the fixed volume-mix mutation changes bytes");
-    assert!(store.json_replace(b"doc", &bytes, NOW).expect("commit"));
+    let document = outcome.document.expect("the fixed volume-mix mutation changes bytes");
+    assert!(store.json_replace(b"doc", &document, NOW).expect("commit"));
 }
 
 fn volume_ratio(idoc: &[u8], histories: usize) -> (u64, u64, f64) {
@@ -101,7 +106,8 @@ fn volume_ratio(idoc: &[u8], histories: usize) -> (u64, u64, f64) {
     ];
     let array = model::encode_fragment(&Value::Arr(vec![Value::I64(1)])).expect("fragment");
     let mut store = CellStore::new(StoreConfig::default());
-    store.json_set(b"doc", idoc, JsonSetOptions::default(), NOW).expect("initial document");
+    let initial = CanonicalDoc::validate(idoc).expect("the fixture is canonical");
+    store.json_set(b"doc", &initial, JsonSetOptions::default(), NOW).expect("initial document");
     let mut actual = 0u64;
     let mut all_full = 0u64;
     for mutation in 0..histories {
@@ -163,6 +169,7 @@ fn replay_once(documents: usize, histories: usize, idoc: &[u8]) -> f64 {
                 &RecordView::DocFull { ns: NS, key: &key, lineage: LINEAGE, version: 1, idoc },
                 NOW,
                 ANCHOR,
+                &mut NoSpill,
             )
             .expect("initial full");
         assert_eq!(outcome, ReplayOutcome::Applied);
@@ -190,6 +197,7 @@ fn replay_once(documents: usize, histories: usize, idoc: &[u8]) -> f64 {
                     },
                     NOW,
                     ANCHOR,
+                    &mut NoSpill,
                 )
                 .expect("valid sequential delta");
             assert_eq!(outcome, ReplayOutcome::Applied);
@@ -208,14 +216,16 @@ fn main() {
     let idoc = gate_doc();
     let (delta_bytes, full_bytes, ratio) = volume_ratio(&idoc, histories);
     println!(
-        "volume documents=normalized-1KiB history={histories} delta_cadence_bytes={delta_bytes} full_every_mutation_bytes={full_bytes} ratio={ratio:.6}"
+        "volume documents=normalized-1KiB history={histories} delta_cadence_bytes={delta_bytes} \
+             full_every_mutation_bytes={full_bytes} ratio={ratio:.6}"
     );
     for rep in 1..=reps {
         let seconds = replay_once(documents, histories, &idoc);
         let mutations = documents as f64 * histories as f64;
         let equivalent_gbps = mutations * idoc.len() as f64 / seconds / 1_000_000_000.0;
         println!(
-            "replay rep={rep} documents={documents} history={histories} mutations={} seconds={seconds:.6} equivalent_gbps={equivalent_gbps:.6}",
+            "replay rep={rep} documents={documents} history={histories} mutations={} \
+                 seconds={seconds:.6} equivalent_gbps={equivalent_gbps:.6}",
             mutations as u64,
         );
     }

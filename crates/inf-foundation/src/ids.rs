@@ -1,4 +1,5 @@
 use core::fmt;
+use core::num::NonZeroU16;
 
 use crate::crc::{crc16, hashtag};
 
@@ -6,7 +7,65 @@ use crate::crc::{crc16, hashtag};
 /// client expectations carry over unchanged (master plan §4.1).
 pub const SLOT_COUNT: u16 = 16384;
 
-/// Identity of one shard cell (one pinned core — L1).
+/// The cells of one boot's topology, `1 <= N <= SLOT_COUNT` (ADR-0159
+/// A1.1): every cell owns at least one slot. [`CellCount::new`] is the one
+/// check; the binary, the embedded assembly and the simulator hand the type
+/// to every control-plane constructor, so a count past the bound is refused
+/// before any mesh, board or thread exists.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct CellCount(NonZeroU16);
+
+/// Why a cell count was refused.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CellCountError {
+    /// A topology has at least one cell.
+    Zero,
+    /// A cell with no slot to own: more cells than [`SLOT_COUNT`].
+    AboveSlotCount,
+}
+
+impl CellCount {
+    /// # Errors
+    /// [`CellCountError::Zero`] for 0, [`CellCountError::AboveSlotCount`]
+    /// past [`SLOT_COUNT`].
+    pub const fn new(cells: u16) -> Result<CellCount, CellCountError> {
+        if cells > SLOT_COUNT {
+            return Err(CellCountError::AboveSlotCount);
+        }
+        match NonZeroU16::new(cells) {
+            Some(cells) => Ok(CellCount(cells)),
+            None => Err(CellCountError::Zero),
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+
+    #[must_use]
+    pub const fn non_zero(self) -> NonZeroU16 {
+        self.0
+    }
+
+    #[must_use]
+    pub fn as_usize(self) -> usize {
+        usize::from(self.0.get())
+    }
+}
+
+impl fmt::Display for CellCountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CellCountError::Zero => write!(f, "must be >= 1"),
+            CellCountError::AboveSlotCount => write!(f, "must be <= {SLOT_COUNT}"),
+        }
+    }
+}
+
+impl std::error::Error for CellCountError {}
+
+/// Identity of one cell (one pinned core — L1).
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct CellId(pub u16);
 
@@ -67,6 +126,17 @@ mod tests {
         assert!(KeySlot::new(16383).is_some());
         assert!(KeySlot::new(16384).is_none());
         assert!(KeySlot::new(u16::MAX).is_none());
+    }
+
+    /// ADR-0159 A1.1: the bound's edges, and the integer maximum.
+    #[test]
+    fn cell_count_refuses_zero_and_past_the_slot_count() {
+        assert_eq!(CellCount::new(0), Err(CellCountError::Zero));
+        assert_eq!(CellCount::new(1).map(CellCount::get), Ok(1));
+        assert_eq!(CellCount::new(SLOT_COUNT).map(CellCount::get), Ok(16_384));
+        assert_eq!(CellCount::new(SLOT_COUNT + 1), Err(CellCountError::AboveSlotCount));
+        assert_eq!(CellCount::new(u16::MAX), Err(CellCountError::AboveSlotCount));
+        assert_eq!(CellCountError::AboveSlotCount.to_string(), "must be <= 16384");
     }
 
     #[test]

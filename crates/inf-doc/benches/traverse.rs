@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
 //! S02 traversal + morph criterion rows (dev-tier on this box; the S25
 //! campaign re-runs gate-grade on the reference box).
 //!

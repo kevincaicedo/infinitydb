@@ -5,8 +5,8 @@
 //! Three implementations, one contract:
 //! - x86-64: the SSE4.2 `crc32` instruction over 8-byte words, behind cached
 //!   runtime detection (same dispatch pattern as `crlf.rs`).
-//! - aarch64: the ARMv8 CRC extension (`__crc32cd`), behind runtime
-//!   detection.
+//! - aarch64: the ARMv8 CRC extension (`__crc32cd`), behind the same
+//!   cached runtime detection.
 //! - portable: slicing-by-8 with const-built tables — the sim/dev tier and
 //!   the property-test oracle for both hardware paths.
 //!
@@ -14,7 +14,7 @@
 //! checksummed header+body in place, and later consumers (checkpoint
 //! sections) stream. `crc32c(data) == crc32c_update(0, data)`.
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// CRC32C of `data` (state-in/state-out convention: `crc32c_update(0, data)`).
@@ -42,34 +42,55 @@ pub fn crc32c_update(crc: u32, data: &[u8]) -> u32 {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        if std::arch::is_aarch64_feature_detected!("crc") {
+        if armv8_crc_available() {
             // SAFETY: `crc32c_armv8` requires the CRC extension, proven
-            // present by the runtime probe above.
+            // present by the cached `is_aarch64_feature_detected!` probe
+            // above.
             return unsafe { crc32c_armv8(crc, data) };
         }
     }
     scalar_crc32c_update(crc, data)
 }
 
-#[cfg(target_arch = "x86_64")]
-const SSE42_UNKNOWN: u8 = 0;
-#[cfg(target_arch = "x86_64")]
-const SSE42_YES: u8 = 1;
-#[cfg(target_arch = "x86_64")]
-const SSE42_NO: u8 = 2;
+// One probe per process on both hardware arms (the aarch64 arm probed on
+// every call — L16 performance row, batch 47): a relaxed tri-state cache
+// of the feature detection.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const PROBE_UNKNOWN: u8 = 0;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const PROBE_YES: u8 = 1;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const PROBE_NO: u8 = 2;
 
 #[cfg(target_arch = "x86_64")]
-static SSE42_LEVEL: AtomicU8 = AtomicU8::new(SSE42_UNKNOWN);
+static SSE42_LEVEL: AtomicU8 = AtomicU8::new(PROBE_UNKNOWN);
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn sse42_available() -> bool {
     match SSE42_LEVEL.load(Ordering::Relaxed) {
-        SSE42_YES => true,
-        SSE42_NO => false,
+        PROBE_YES => true,
+        PROBE_NO => false,
         _ => {
             let detected = std::arch::is_x86_feature_detected!("sse4.2");
-            SSE42_LEVEL.store(if detected { SSE42_YES } else { SSE42_NO }, Ordering::Relaxed);
+            SSE42_LEVEL.store(if detected { PROBE_YES } else { PROBE_NO }, Ordering::Relaxed);
+            detected
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+static ARMV8_CRC_LEVEL: AtomicU8 = AtomicU8::new(PROBE_UNKNOWN);
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn armv8_crc_available() -> bool {
+    match ARMV8_CRC_LEVEL.load(Ordering::Relaxed) {
+        PROBE_YES => true,
+        PROBE_NO => false,
+        _ => {
+            let detected = std::arch::is_aarch64_feature_detected!("crc");
+            ARMV8_CRC_LEVEL.store(if detected { PROBE_YES } else { PROBE_NO }, Ordering::Relaxed);
             detected
         }
     }

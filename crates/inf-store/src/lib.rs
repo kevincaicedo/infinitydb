@@ -6,6 +6,11 @@
 //! effect/record vocabulary (ADR-0012 D1 / ADR-0015 D7) — it still never
 //! opens a file.
 #![forbid(unsafe_code)]
+// ADR-0144 D1: a production `match` names every variant of its enum.
+#![cfg_attr(
+    not(test),
+    deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
+)]
 
 mod address_space;
 mod catalog;
@@ -13,12 +18,24 @@ mod demote;
 mod doc;
 mod evict;
 mod extents;
+/// Named fault points (M4.5-S04): inventory consumed by
+/// `scripts/check-fault-points.sh` and armed by tests.
+pub mod fault;
 mod index;
+mod index_alias;
+mod index_backfill;
+mod index_key;
+mod index_maint;
+mod index_registry;
+mod index_sidecar;
 mod keyspace;
+pub mod limits;
 mod live_set;
 mod ns;
+mod ordered;
 mod record;
 mod router;
+mod schedule;
 mod store;
 mod tiered;
 mod tiered_recover;
@@ -27,9 +44,10 @@ mod wheel;
 mod write_accounting;
 
 pub use address_space::{
-    AddrClass, AddressSpace, AddressSpaceConfig, AddressSpaceReport, TieringCounters,
+    AddrClass, AddressSpace, AddressSpaceConfig, AddressSpaceReport, PadTarget, Room,
+    TieringCounters, WindowFull,
 };
-pub use catalog::{CatalogError, NsCatalog};
+pub use catalog::{CatalogError, IndexCatalog, NsCatalog};
 pub use demote::{DemoteStats, DemotionConfig, EvictionPressure, MUTABLE_PERMILLE_DEFAULT};
 pub use doc::DocDomain;
 #[cfg(feature = "doc")]
@@ -37,28 +55,80 @@ pub use doc::{JsonLogDecision, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSe
 pub use evict::{EvictStats, EvictionPolicy};
 pub use extents::{
     BLOB_MAX_BYTES_DEFAULT, BLOB_RECLAIM_PER_SLICE_DEFAULT, BLOB_THRESHOLD_DEFAULT, BlobConfig,
-    ExtentRefs, ExtentStats,
+    ExtentRefs, ExtentStats, ReclaimCandidate, ReclaimOrigin,
 };
-pub use index::{Index, MemoryMode, SlotMode, TieredMode};
+pub use index::{
+    ChainPos, HomeGroupCursor, Index, MemoryMode, ProbeEnd, SlotMode, TieredMode, WalkCursor,
+};
+pub use index_alias::{AliasLimit, AliasTally, AliasView, AliasWalk};
+pub use index_backfill::{
+    BackfillBudget, BackfillInfo, BackfillPhase, BackfillProgress, BackfillTickStats,
+};
+pub use index_key::{
+    DecodedIndexKey, INDEX_KEY_ENCODING_VERSION, IndexKeyBuf, IndexKeyDecodeError, IndexKeyType,
+    IndexScalar, KeySkip, compare_i64_f64, index_key_decode, index_key_encode,
+    index_key_escape_prefix, index_scalar_coerce,
+};
+pub use index_maint::{
+    BRACKET_ENTRY_CAP, IDX_MAINT_RULES, IDX_MAINT_RULES_VERSION, IdxCounters, IdxMaintRefusal,
+    MaintMode, SCRATCH_RETAIN_BYTES, SCRATCH_RETAIN_ENTRIES,
+};
+#[cfg(feature = "doc")]
+pub use index_registry::validate_index_program;
+pub use index_registry::{
+    FIRST_INDEX_GENERATION, FIRST_INDEX_ID, INDEX_PROGRAM_MAX, INDEXES_PER_NODE_MAX,
+    IndexBindError, IndexError, IndexId, IndexMemory, IndexRegistry, IndexSpec, IndexState,
+    IndexTree, SidecarBootDecision, SidecarRebuildReason,
+};
+#[cfg(feature = "doc")]
+pub use index_sidecar::SidecarLoader;
+pub use index_sidecar::{SidecarBootInfo, SidecarBootRow};
 pub use inf_alloc::ArenaConfig;
 // One import point for the shared store↔log vocabulary (ADR-0015 D2/D5).
 pub use inf_foundation::LogicalAddr;
+pub use inf_foundation::{KeyHashId, KeyHasher};
 pub use inf_log::{FsyncClass, NsId};
 pub use keyspace::{
-    DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig, ReplayError, ReplayOutcome, StateDigest,
-    TIERED_VA_LIMIT_DEFAULT, TieredCreateError, TieredUsage,
+    DEFAULT_DBS, DISPLACE_REGISTER_CAP, EvictBudget, Keyspace, PressureConfig, ReplayError,
+    ReplayOutcome, StateDigest, TIERED_VA_LIMIT_DEFAULT, TieredCreateError, TieredUsage,
 };
 pub use live_set::{FileLiveSet, LiveSet};
 pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, valid_ns_name};
-pub use record::{EXTENT_REF_LEN, ExtentRef, MAX_KEY_LEN, MAX_VAL_LEN, TypeTag};
+pub use ordered::{
+    AppendError, Fixed8, KeyScheme, ORDERED_KEY_MAX, OrderedCursor, OrderedMap, OrderedMapError,
+    OrderedMapMemory, PkRef, VarKey,
+};
+pub use record::{
+    ColdKey, ColdKeyError, EXTENT_REF_LEN, ExtentRef, InternalDeadline, MAX_EXPIRE_MS, MAX_KEY_LEN,
+    MAX_VAL_LEN, TypeTag, saturating_deadline,
+};
 pub use router::SlotRouter;
+#[cfg(feature = "test-support")]
+pub use store::ExpiryAudit;
 pub use store::{
     CellStore, CheckpointImage, CopyResult, DiskFullCause, Encoding, ExpireCond, ExpiryBudget,
     ExpiryStats, LogFullImage, MemoryReport, OpError, PostImage, SetCond, SetExpire, SetOptions,
-    SetOutcome, StoreConfig, StoreStats, Ttl, TtlUpdate,
+    SetOutcome, StoreConfig, StoreStats, SweepState, SweepStop, Ttl, TtlUpdate, WheelNodesMax,
+    WheelNodesMaxError,
 };
 pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
-pub use tiered::{RecordParts, TieredLookup, TieredTable};
+pub use tiered::promote::PromotionCounters;
+pub use tiered::replay::{
+    BootHandedOver, Displaced, NoSpill, ReplayCounters, ReplayPhase, ReplayRefusal, ReplaySpill,
+    ReplayWork, SettleProgress, TierReplay,
+};
+pub use tiered::shadow::{
+    COLLISION_KEY_PREFIX, KeyWindow, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT,
+    SHADOW_TICKETS_CAP, SettleError, SettleOutcome, SettleReason, SettleSlot, ShadowCounters,
+    ShadowProbe, ShadowRead, ShadowRebuild, ShadowRebuildError, ShadowRefusal, ShadowTicket,
+    ShadowVerdict,
+};
+#[cfg(feature = "collision-oracle")]
+pub use tiered::shadow::{forced_collision_pair, forced_collision_triple};
+pub use tiered::{
+    LengthBound, LengthRefusal, RELOC_ORIGIN_CAP, RecordParts, StageFailed, TieredLookup,
+    TieredTable,
+};
 pub use tiered_recover::{
     RecoveredTier, TierRecoverStats, apply_blob_ref_section, apply_live_set_section,
     apply_ref_section, recover_tiered_ns,

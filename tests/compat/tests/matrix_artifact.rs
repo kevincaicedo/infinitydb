@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M1-S13: the published compat matrix is generated, never hand-edited.
 //!
 //! `generated_matrix_is_current` fails whenever `docs/compat-matrix.md`
@@ -7,10 +11,13 @@
 
 use std::path::PathBuf;
 
-use compat::matrixgen::{Status, render, rows};
+use compat::candidate::Candidate;
+use compat::matrix::MATRIX;
+use compat::matrixgen::{Status, classify_corpus, render, rows};
+use inf_foundation::time::Nanos;
 
 fn artifact_path() -> PathBuf {
-    // tests/compat → tests → repo root → docs/compat-matrix.md.
+    // tests/compat → tests → Rust workspace → docs/compat-matrix.md.
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/compat-matrix.md")
 }
 
@@ -60,7 +67,7 @@ fn declared_statuses_are_mechanically_enforced() {
 
 /// M3-S22: the rendered artifact carries the whole JSON section — the
 /// RedisJSON oracle pin, per-command RedisJSON deviation entries, and the
-/// `JSON.RESP` absent row (deprecated upstream — M3 plan anti-goals). Byte
+/// `JSON.RESP` absent row (deprecated upstream, declared absent). Byte
 /// equality in `generated_matrix_is_current` then extends the release
 /// pipeline's staleness refusal to the JSON section as a whole.
 #[test]
@@ -71,10 +78,32 @@ fn rendered_matrix_covers_the_json_section() {
         "| `JSON.SET` |",
         "RedisJSON RESP2 `",
         "RedisJSON RESP3 `",
-        "| `JSON.RESP` | Never — deprecated upstream; declared absent per the M3 plan anti-goals |",
+        "| `JSON.RESP` | Never — deprecated upstream; declared absent |",
     ] {
         assert!(rendered.contains(needle), "rendered matrix lost the JSON section: {needle:?}");
     }
+}
+
+/// The rendered evidence cannot depend on how fast the corpus runs. The
+/// render's candidate reads the process's monotonic clock, so a case
+/// whose value-or-null turns on the millisecond the run reaches it
+/// would make `generated_matrix_is_current` red on an unchanged tree.
+/// Classified with the clock held inside its first millisecond and held
+/// a second later, every case agrees.
+#[test]
+fn corpus_evidence_does_not_depend_on_the_candidate_clock() {
+    let first_ms = classify_corpus(Candidate::with_clock_held_at(Nanos(1)));
+    let later = classify_corpus(Candidate::with_clock_held_at(Nanos::from_millis(1_000)));
+    let differing: Vec<String> = MATRIX
+        .iter()
+        .zip(first_ms.iter().zip(&later))
+        .enumerate()
+        .filter(|(_, (_, (first, then)))| first != then)
+        .map(|(index, (case, (first, then)))| {
+            format!("case {index} {:?}: evidence {first} in the first ms, {then} at 1 s", case.argv)
+        })
+        .collect();
+    assert!(differing.is_empty(), "clock-dependent corpus evidence: {differing:#?}");
 }
 
 #[test]

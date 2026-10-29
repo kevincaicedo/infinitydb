@@ -3,7 +3,7 @@
 //! power-cut reboots of populated dirs — with two oracles aimed at the
 //! ADR-0022 D7 wedge class:
 //!
-//! 1. **The ready path is fsync-free.** [`SimDisk::sync_dir_calls`] must
+//! 1. **The ready path is fsync-free.** [`inf_log::fs::sim::SimDisk::sync_dir_calls`] must
 //!    not move between boot start and `RecoveryBoard::all_ready`: a
 //!    blocking metadata sync on a reactor thread is exactly the mechanism
 //!    that wedged cell 2 for minutes behind entangled journal writeback.
@@ -26,10 +26,10 @@ use std::rc::Rc;
 
 use inf_foundation::hash64;
 use inf_foundation::rng::SplitMix64;
-use inf_foundation::time::{Nanos, VirtualClock};
-use inf_server::SimDisk;
+use inf_foundation::time::{Clock, Nanos, VirtualClock};
+use inf_log::fs::sim::StallConfig;
 
-use crate::durable::{DurableScenario, MiniClient, TraceObserver, boot};
+use crate::durable::{DurableScenario, MiniClient, TraceObserver, boot, build_disk};
 
 /// Scheduler-step budget for a node to reach all-ready: empty and
 /// small-log recoveries complete in a handful of steps; the budget only
@@ -58,11 +58,15 @@ impl BootStormScenario {
 #[derive(Debug)]
 pub struct BootStormReport {
     pub violations: Vec<String>,
+    /// Cap census rows read at the end of every life, summed over the
+    /// cells and lives (node sum): the census oracle's liveness.
+    pub cap_rows_checked: u64,
     pub boots: u64,
     pub ready_steps_max: u64,
     /// Determinism currency: chained hash over per-cycle
     /// (ready steps, blocking-sync delta) — same seed ⇒ same hash.
     pub trace_hash: u64,
+    pub state_hash: u64,
 }
 
 impl BootStormReport {
@@ -74,13 +78,21 @@ impl BootStormReport {
 
 /// Drives one seeded boot storm. See the module docs for the oracles.
 #[must_use]
-pub fn run_boot_storm_scenario(scenario: &BootStormScenario) -> BootStormReport {
+fn run_observed(scenario: &BootStormScenario, observer: TraceObserver) -> BootStormReport {
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
-    let disk = SimDisk::new();
-    let observer = TraceObserver::default();
+    // The reorder-only device (F-L04-06): plain writes land off the
+    // timeline, fsyncs stay instant — the ready-path oracle counts
+    // blocking dir barriers, which a stall model would not change.
+    let disk = build_disk(scenario.seed, Some(&StallConfig::write_reorder()));
     let mut rng = SplitMix64::new(scenario.seed ^ 0xB007_5708);
-    let mut report =
-        BootStormReport { violations: Vec::new(), boots: 0, ready_steps_max: 0, trace_hash: 0 };
+    let mut report = BootStormReport {
+        violations: Vec::new(),
+        cap_rows_checked: 0,
+        boots: 0,
+        ready_steps_max: 0,
+        trace_hash: 0,
+        state_hash: 0,
+    };
 
     let mut base = DurableScenario::m2_durable(scenario.seed);
     base.cells = scenario.cells;
@@ -212,9 +224,21 @@ pub fn run_boot_storm_scenario(scenario: &BootStormScenario) -> BootStormReport 
         drop(client);
         drop(node);
         if fresh {
-            disk.power_cut(scenario.seed ^ u64::from(cycle));
+            observer.power_cut(&disk, clock.now(), scenario.seed ^ u64::from(cycle));
         }
         cycle += 1;
     }
+    report
+}
+
+/// Runs the scenario and seals state evidence after every node has been dropped.
+#[must_use]
+pub fn run_boot_storm_scenario(scenario: &BootStormScenario) -> BootStormReport {
+    let observer = TraceObserver::default();
+    let mut report = run_observed(scenario, observer.clone());
+    let sealed = observer.seal();
+    report.state_hash = sealed.state_hash;
+    report.cap_rows_checked = sealed.census.rows_checked;
+    report.violations.extend(sealed.census.violations);
     report
 }

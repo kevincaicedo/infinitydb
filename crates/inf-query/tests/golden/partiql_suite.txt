@@ -1,0 +1,2443 @@
+### pk-point
+SELECT * FROM orders WHERE $key = 'user:1'
+---
+ns=1
+project=documents
+access=pk-get key="user:1"
+residual=none
+
+### pk-count
+SELECT COUNT(*) FROM orders WHERE $key = 'user:1'
+---
+ns=1
+project=count
+access=pk-get key="user:1"
+residual=none
+
+### pk-lowercase-keywords
+select * from orders where $key = 'a'
+---
+ns=1
+project=documents
+access=pk-get key="a"
+residual=none
+
+### pk-mixed-case-keywords
+SeLeCt * FrOm orders WhErE $key = 'a'
+---
+ns=1
+project=documents
+access=pk-get key="a"
+residual=none
+
+### pk-semicolon
+SELECT * FROM orders WHERE $key = 'a';
+---
+ns=1
+project=documents
+access=pk-get key="a"
+residual=none
+
+### pk-tabs
+SELECT	*	FROM	orders	WHERE	$key = 'a'
+---
+ns=1
+project=documents
+access=pk-get key="a"
+residual=none
+
+### pk-residual-one
+SELECT * FROM orders WHERE $key = 'u' AND price > 10
+---
+ns=1
+project=documents
+access=pk-get key="u"
+residual:
+  cmp op=gt path=$.price const=i64:10
+
+### pk-residual-two
+SELECT * FROM orders WHERE $key = 'u' AND price > 10 AND name = 'x'
+---
+ns=1
+project=documents
+access=pk-get key="u"
+residual:
+  and n=2
+    cmp op=gt path=$.price const=i64:10
+    cmp op=eq path=$.name const=utf8:"x"
+
+### pk-residual-not-first
+SELECT * FROM orders WHERE price > 10 AND $key = 'u'
+---
+ns=1
+project=documents
+access=pk-get key="u"
+residual:
+  cmp op=gt path=$.price const=i64:10
+
+### pk-limit
+SELECT * FROM orders WHERE $key = 'u' LIMIT 100
+---
+ns=1
+project=documents
+limit=100
+access=pk-get key="u"
+residual=none
+
+### pk-limit-max
+SELECT * FROM orders WHERE $key = 'u' LIMIT 4294967295
+---
+ns=1
+project=documents
+limit=4294967295
+access=pk-get key="u"
+residual=none
+
+### pk-limit-one
+SELECT * FROM orders WHERE $key = 'u' LIMIT 1
+---
+ns=1
+project=documents
+limit=1
+access=pk-get key="u"
+residual=none
+
+### pk-parenthesized
+SELECT * FROM orders WHERE ($key = 'a')
+---
+ns=1
+project=documents
+access=pk-get key="a"
+residual=none
+
+### pk-case-insensitive-pseudo
+SELECT * FROM orders WHERE $KEY = 'a'
+---
+ns=1
+project=documents
+access=pk-get key="a"
+residual=none
+
+### pk-quoted-escape
+SELECT * FROM orders WHERE $key = 'it''s'
+---
+ns=1
+project=documents
+access=pk-get key="it's"
+residual=none
+
+### i64-eq
+SELECT * FROM orders WHERE price = 10
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:10
+hi=incl i64:10
+residual=none
+
+### i64-lt
+SELECT * FROM orders WHERE price < 10
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=unbounded
+hi=excl i64:10
+residual=none
+
+### i64-le
+SELECT * FROM orders WHERE price <= 10
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=unbounded
+hi=incl i64:10
+residual=none
+
+### i64-gt
+SELECT * FROM orders WHERE price > 10
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=excl i64:10
+hi=unbounded
+residual=none
+
+### i64-ge
+SELECT * FROM orders WHERE price >= 10
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:10
+hi=unbounded
+residual=none
+
+### i64-between
+SELECT * FROM orders WHERE price BETWEEN 5 AND 10
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:10
+residual=none
+
+### i64-between-point
+SELECT * FROM orders WHERE price BETWEEN 7 AND 7
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:7
+hi=incl i64:7
+residual=none
+
+### i64-between-reversed
+SELECT * FROM orders WHERE price BETWEEN 10 AND 5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:10
+hi=incl i64:5
+residual=none
+
+### i64-intersect-range
+SELECT * FROM orders WHERE price >= 5 AND price < 10
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=excl i64:10
+residual=none
+
+### i64-intersect-tighter
+SELECT * FROM orders WHERE price > 10 AND price > 20
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=excl i64:20
+hi=unbounded
+residual=none
+
+### i64-intersect-le-lt-same
+SELECT * FROM orders WHERE price <= 10 AND price < 10
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=unbounded
+hi=excl i64:10
+residual=none
+
+### i64-intersect-eq-range
+SELECT * FROM orders WHERE price = 5 AND price < 10
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual=none
+
+### i64-intersect-contradiction
+SELECT * FROM orders WHERE price > 10 AND price < 5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=excl i64:10
+hi=excl i64:5
+residual=none
+
+### i64-intersect-two-eq
+SELECT * FROM orders WHERE price = 5 AND price = 7
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:7
+hi=incl i64:5
+residual=none
+
+### i64-negative
+SELECT * FROM orders WHERE price >= -3
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:-3
+hi=unbounded
+residual=none
+
+### i64-min
+SELECT * FROM orders WHERE price = -9223372036854775808
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:-9223372036854775808
+hi=incl i64:-9223372036854775808
+residual=none
+
+### i64-max
+SELECT * FROM orders WHERE price = 9223372036854775807
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:9223372036854775807
+hi=incl i64:9223372036854775807
+residual=none
+
+### i64-triple-fold
+SELECT * FROM orders WHERE price >= 1 AND price <= 9 AND price < 8
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:1
+hi=excl i64:8
+residual=none
+
+### i64-f64-eq-integral
+SELECT * FROM orders WHERE price = 10.0
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:10
+hi=incl i64:10
+residual=none
+
+### i64-f64-eq-fractional
+SELECT * FROM orders WHERE price = 10.5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:10
+hi=excl i64:10
+residual=none
+
+### i64-f64-gt-fractional
+SELECT * FROM orders WHERE price > 10.5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:11
+hi=unbounded
+residual=none
+
+### i64-f64-gt-integral
+SELECT * FROM orders WHERE price > 10.0
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=excl i64:10
+hi=unbounded
+residual=none
+
+### i64-f64-ge-fractional
+SELECT * FROM orders WHERE price >= 10.5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:11
+hi=unbounded
+residual=none
+
+### i64-f64-lt-fractional
+SELECT * FROM orders WHERE price < 10.5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=unbounded
+hi=incl i64:10
+residual=none
+
+### i64-f64-le-fractional
+SELECT * FROM orders WHERE price <= 10.5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=unbounded
+hi=incl i64:10
+residual=none
+
+### i64-f64-negative-fraction-gt
+SELECT * FROM orders WHERE price > -2.5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:-2
+hi=unbounded
+residual=none
+
+### i64-f64-negative-fraction-lt
+SELECT * FROM orders WHERE price < -2.5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=unbounded
+hi=incl i64:-3
+residual=none
+
+### i64-f64-huge-lt
+SELECT * FROM orders WHERE price < 1e20
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=unbounded
+hi=unbounded
+residual=none
+
+### i64-f64-huge-gt
+SELECT * FROM orders WHERE price > 1e20
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:-9223372036854775808
+hi=excl i64:-9223372036854775808
+residual=none
+
+### i64-f64-huge-eq
+SELECT * FROM orders WHERE price = 1e20
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:-9223372036854775808
+hi=excl i64:-9223372036854775808
+residual=none
+
+### i64-f64-negative-huge-gt
+SELECT * FROM orders WHERE price > -1e20
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=unbounded
+hi=unbounded
+residual=none
+
+### i64-f64-negative-huge-lt
+SELECT * FROM orders WHERE price < -1e20
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:-9223372036854775808
+hi=excl i64:-9223372036854775808
+residual=none
+
+### i64-f64-two-pow-63-eq
+SELECT * FROM orders WHERE price = 9.223372036854776e18
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:-9223372036854775808
+hi=excl i64:-9223372036854775808
+residual=none
+
+### i64-f64-below-two-pow-63-gt
+SELECT * FROM orders WHERE price > 9.223372036854775e18
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=excl i64:9223372036854774784
+hi=unbounded
+residual=none
+
+### i64-f64-neg-two-pow-63-eq
+SELECT * FROM orders WHERE price = -9.223372036854776e18
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:-9223372036854775808
+hi=incl i64:-9223372036854775808
+residual=none
+
+### i64-f64-neg-zero
+SELECT * FROM orders WHERE price = -0.0
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:0
+hi=incl i64:0
+residual=none
+
+### i64-f64-between-fractional
+SELECT * FROM orders WHERE price BETWEEN 1.5 AND 3.5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:2
+hi=incl i64:3
+residual=none
+
+### f64-eq
+SELECT * FROM orders WHERE score = 10.5
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:10.5
+hi=incl f64:10.5
+residual=none
+
+### f64-lt
+SELECT * FROM orders WHERE score < 10.5
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=unbounded
+hi=excl f64:10.5
+residual=none
+
+### f64-le
+SELECT * FROM orders WHERE score <= 10.5
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=unbounded
+hi=incl f64:10.5
+residual=none
+
+### f64-gt
+SELECT * FROM orders WHERE score > 10.5
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=excl f64:10.5
+hi=unbounded
+residual=none
+
+### f64-ge
+SELECT * FROM orders WHERE score >= 10.5
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:10.5
+hi=unbounded
+residual=none
+
+### f64-between
+SELECT * FROM orders WHERE score BETWEEN 0.5 AND 2.0
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:0.5
+hi=incl f64:2.0
+residual=none
+
+### f64-between-reversed
+SELECT * FROM orders WHERE score BETWEEN 5.0 AND 1.0
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:5.0
+hi=incl f64:1.0
+residual=none
+
+### f64-exponent
+SELECT * FROM orders WHERE score > 1e3
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=excl f64:1000.0
+hi=unbounded
+residual=none
+
+### f64-max-magnitude
+SELECT * FROM orders WHERE score <= 1e308
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=unbounded
+hi=incl f64:1e308
+residual=none
+
+### f64-denormal
+SELECT * FROM orders WHERE score > 5e-324
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=excl f64:5e-324
+hi=unbounded
+residual=none
+
+### f64-neg-zero
+SELECT * FROM orders WHERE score = -0.0
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:0.0
+hi=incl f64:0.0
+residual=none
+
+### f64-i64-eq-lossless
+SELECT * FROM orders WHERE score = 10
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:10.0
+hi=incl f64:10.0
+residual=none
+
+### f64-i64-gt-lossless
+SELECT * FROM orders WHERE score > 10
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=excl f64:10.0
+hi=unbounded
+residual=none
+
+### f64-i64-two-pow-53
+SELECT * FROM orders WHERE score = 9007199254740992
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:9007199254740992.0
+hi=incl f64:9007199254740992.0
+residual=none
+
+### f64-i64-eq-lossy
+SELECT * FROM orders WHERE score = 9007199254740993
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:9007199254740992.0
+hi=excl f64:9007199254740992.0
+residual=none
+
+### f64-i64-gt-lossy
+SELECT * FROM orders WHERE score > 9007199254740993
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:9007199254740994.0
+hi=unbounded
+residual=none
+
+### f64-i64-ge-lossy
+SELECT * FROM orders WHERE score >= 9007199254740993
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:9007199254740994.0
+hi=unbounded
+residual=none
+
+### f64-i64-lt-lossy
+SELECT * FROM orders WHERE score < 9007199254740993
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=unbounded
+hi=incl f64:9007199254740992.0
+residual=none
+
+### f64-i64-le-lossy
+SELECT * FROM orders WHERE score <= 9007199254740993
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=unbounded
+hi=incl f64:9007199254740992.0
+residual=none
+
+### f64-i64-neg-lossy-gt
+SELECT * FROM orders WHERE score > -9007199254740993
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:-9007199254740992.0
+hi=unbounded
+residual=none
+
+### f64-i64-max-lossy
+SELECT * FROM orders WHERE score < 9223372036854775807
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=unbounded
+hi=incl f64:9.223372036854775e18
+residual=none
+
+### f64-i64-between-mixed
+SELECT * FROM orders WHERE score BETWEEN 1 AND 2.5
+---
+ns=1
+project=documents
+access=index-range index=2 gen=3 type=f64
+lo=incl f64:1.0
+hi=incl f64:2.5
+residual=none
+
+### utf8-eq
+SELECT * FROM orders WHERE name = 'alice'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl utf8:"alice"
+hi=incl utf8:"alice"
+residual=none
+
+### utf8-eq-empty
+SELECT * FROM orders WHERE name = ''
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl utf8:""
+hi=incl utf8:""
+residual=none
+
+### utf8-lt
+SELECT * FROM orders WHERE name < 'bob'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=unbounded
+hi=excl utf8:"bob"
+residual=none
+
+### utf8-le
+SELECT * FROM orders WHERE name <= 'bob'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=unbounded
+hi=incl utf8:"bob"
+residual=none
+
+### utf8-gt
+SELECT * FROM orders WHERE name > 'alice'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=excl utf8:"alice"
+hi=unbounded
+residual=none
+
+### utf8-ge
+SELECT * FROM orders WHERE name >= 'alice'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl utf8:"alice"
+hi=unbounded
+residual=none
+
+### utf8-between
+SELECT * FROM orders WHERE name BETWEEN 'a' AND 'b'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl utf8:"a"
+hi=incl utf8:"b"
+residual=none
+
+### utf8-between-reversed
+SELECT * FROM orders WHERE name BETWEEN 'b' AND 'a'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl utf8:"b"
+hi=incl utf8:"a"
+residual=none
+
+### utf8-unicode
+SELECT * FROM orders WHERE name = 'café'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl utf8:"café"
+hi=incl utf8:"café"
+residual=none
+
+### utf8-quote-escape
+SELECT * FROM orders WHERE name = 'it''s'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl utf8:"it's"
+hi=incl utf8:"it's"
+residual=none
+
+### utf8-begins-with
+SELECT * FROM orders WHERE begins_with(name, 'al')
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl hex:616c
+hi=excl hex:616d
+residual=none
+
+### utf8-begins-with-empty
+SELECT * FROM orders WHERE begins_with(name, '')
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=unbounded
+hi=unbounded
+residual=none
+
+### utf8-begins-with-unicode
+SELECT * FROM orders WHERE begins_with(name, 'café')
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl hex:636166c3a9
+hi=excl hex:636166c3aa
+residual=none
+
+### utf8-begins-with-and-range
+SELECT * FROM orders WHERE begins_with(name, 'al') AND name < 'alz'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl hex:616c
+hi=excl utf8:"alz"
+residual=none
+
+### utf8-begins-with-case-fn
+SELECT * FROM orders WHERE BEGINS_WITH(name, 'al')
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl hex:616c
+hi=excl hex:616d
+residual=none
+
+### bool-eq-true
+SELECT * FROM orders WHERE active = TRUE
+---
+ns=1
+project=documents
+access=index-range index=4 gen=2 type=bool
+lo=incl bool:true
+hi=incl bool:true
+residual=none
+
+### bool-eq-false
+SELECT * FROM orders WHERE active = FALSE
+---
+ns=1
+project=documents
+access=index-range index=4 gen=2 type=bool
+lo=incl bool:false
+hi=incl bool:false
+residual=none
+
+### bool-eq-lowercase
+SELECT * FROM orders WHERE active = true
+---
+ns=1
+project=documents
+access=index-range index=4 gen=2 type=bool
+lo=incl bool:true
+hi=incl bool:true
+residual=none
+
+### bool-gt-false
+SELECT * FROM orders WHERE active > FALSE
+---
+ns=1
+project=documents
+access=index-range index=4 gen=2 type=bool
+lo=excl bool:false
+hi=unbounded
+residual=none
+
+### bool-between
+SELECT * FROM orders WHERE active BETWEEN FALSE AND TRUE
+---
+ns=1
+project=documents
+access=index-range index=4 gen=2 type=bool
+lo=incl bool:false
+hi=incl bool:true
+residual=none
+
+### bool-ne-not-servable
+SELECT * FROM orders WHERE active != TRUE
+---
+error: no key condition names the primary key or a ready index; declare one (INF.IDX CREATE) or scan with explicit consent (FROM ns.SCAN)
+
+### multi-eq
+SELECT * FROM orders WHERE tags[*] = 'x'
+---
+ns=1
+project=documents
+access=index-range index=5 gen=3 type=utf8
+lo=incl utf8:"x"
+hi=incl utf8:"x"
+residual=none
+
+### multi-eq-second-residual
+SELECT * FROM orders WHERE tags[*] = 'x' AND tags[*] = 'y'
+---
+ns=1
+project=documents
+access=index-range index=5 gen=3 type=utf8
+lo=incl utf8:"x"
+hi=incl utf8:"x"
+residual:
+  cmp op=eq path=$.tags.* const=utf8:"y"
+
+### multi-bare-array-node
+SELECT * FROM orders WHERE tags = 'x'
+---
+error: no key condition names the primary key or a ready index; declare one (INF.IDX CREATE) or scan with explicit consent (FROM ns.SCAN)
+
+### multi-range-not-candidate
+SELECT * FROM orders WHERE tags[*] > 'a'
+---
+error: no key condition names the primary key or a ready index; declare one (INF.IDX CREATE) or scan with explicit consent (FROM ns.SCAN)
+
+### multi-range-explicit
+SELECT * FROM orders.tags_idx WHERE tags[*] > 'a'
+---
+error: index 'tags_idx' is over a multi-valued path; only equality is servable (ranges would page duplicates)
+
+### multi-begins-with-explicit
+SELECT * FROM orders.tags_idx WHERE begins_with(tags[*], 'a')
+---
+error: index 'tags_idx' is over a multi-valued path; only equality is servable (ranges would page duplicates)
+
+### multi-eq-plus-range-explicit
+SELECT * FROM orders.tags_idx WHERE tags[*] = 'x' AND tags[*] > 'a'
+---
+error: index 'tags_idx' is over a multi-valued path; only equality is servable (ranges would page duplicates)
+
+### multi-eq-explicit
+SELECT * FROM orders.tags_idx WHERE tags[*] = 'x'
+---
+ns=1
+project=documents
+access=index-range index=5 gen=3 type=utf8
+lo=incl utf8:"x"
+hi=incl utf8:"x"
+residual=none
+
+### multi-numeric-eq
+SELECT * FROM orders WHERE nums[*] = 5
+---
+ns=1
+project=documents
+access=index-range index=10 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual=none
+
+### multi-numeric-range-explicit
+SELECT * FROM orders.nums_idx WHERE nums[*] BETWEEN 1 AND 5
+---
+error: index 'nums_idx' is over a multi-valued path; only equality is servable (ranges would page duplicates)
+
+### multi-anchor-plus-single
+SELECT * FROM orders WHERE tags[*] = 'x' AND price > 10
+---
+error: the WHERE clause matches more than one ready index ('price_idx', 'tags_idx'); name one: FROM ns."index"
+
+### resolve-two-indexes-ambiguous
+SELECT * FROM orders WHERE price > 10 AND region = 'eu'
+---
+error: the WHERE clause matches more than one ready index ('price_idx', 'region_idx'); name one: FROM ns."index"
+
+### resolve-explicit-disambiguation
+SELECT * FROM orders.price_idx WHERE price > 10 AND region = 'eu'
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=excl i64:10
+hi=unbounded
+residual:
+  cmp op=eq path=$.region const=utf8:"eu"
+
+### resolve-explicit-other-side
+SELECT * FROM orders.region_idx WHERE price > 10 AND region = 'eu'
+---
+ns=1
+project=documents
+access=index-range index=7 gen=2 type=utf8
+lo=incl utf8:"eu"
+hi=incl utf8:"eu"
+residual:
+  cmp op=gt path=$.price const=i64:10
+
+### resolve-explicit-quoted
+SELECT * FROM orders."region_idx" WHERE region = 'eu'
+---
+ns=1
+project=documents
+access=index-range index=7 gen=2 type=utf8
+lo=incl utf8:"eu"
+hi=incl utf8:"eu"
+residual=none
+
+### resolve-not-ready
+SELECT * FROM orders WHERE pending = 3
+---
+error: index 'pending_idx' is backfilling; only ready indexes serve queries
+
+### resolve-not-ready-explicit
+SELECT * FROM orders.pending_idx WHERE pending = 3
+---
+error: index 'pending_idx' is backfilling; only ready indexes serve queries
+
+### resolve-no-candidates
+SELECT * FROM orders WHERE qty = 3
+---
+error: no key condition names the primary key or a ready index; declare one (INF.IDX CREATE) or scan with explicit consent (FROM ns.SCAN)
+
+### resolve-no-where
+SELECT * FROM orders
+---
+error: no key condition names the primary key or a ready index; declare one (INF.IDX CREATE) or scan with explicit consent (FROM ns.SCAN)
+
+### resolve-nested-path
+SELECT * FROM orders WHERE meta.depth > 4
+---
+ns=1
+project=documents
+access=index-range index=8 gen=3 type=i64
+lo=excl i64:4
+hi=unbounded
+residual=none
+
+### resolve-array-index-path
+SELECT * FROM orders WHERE items[0].sku = 'a'
+---
+ns=1
+project=documents
+access=index-range index=9 gen=1 type=utf8
+lo=incl utf8:"a"
+hi=incl utf8:"a"
+residual=none
+
+### resolve-bracket-spelling-double
+SELECT * FROM orders WHERE ["price"] > 10
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=excl i64:10
+hi=unbounded
+residual=none
+
+### resolve-bracket-spelling-single
+SELECT * FROM orders WHERE ['price'] > 10
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=excl i64:10
+hi=unbounded
+residual=none
+
+### resolve-bracket-mixed
+SELECT * FROM orders WHERE ['meta'].depth = 2
+---
+ns=1
+project=documents
+access=index-range index=8 gen=3 type=i64
+lo=incl i64:2
+hi=incl i64:2
+residual=none
+
+### resolve-dup-path-ambiguous
+SELECT * FROM dup WHERE price = 1
+---
+error: the WHERE clause matches more than one ready index ('p1', 'p2'); name one: FROM ns."index"
+
+### resolve-dup-explicit
+SELECT * FROM dup.p1 WHERE price = 1
+---
+ns=2
+project=documents
+access=index-range index=20 gen=3 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual=none
+
+### resolve-unknown-ns
+SELECT * FROM nowhere WHERE price = 1
+---
+error: unknown namespace 'nowhere'
+
+### resolve-unknown-index
+SELECT * FROM orders.missing_idx WHERE price = 1
+---
+error: unknown index 'missing_idx'
+
+### resolve-unconstrained-index
+SELECT * FROM orders.price_idx WHERE region = 'eu'
+---
+error: no key condition constrains index 'price_idx'; walking a whole index needs FROM ns.SCAN consent
+
+### resolve-dotted-ns-quoted
+SELECT * FROM "my.ns" WHERE v = 1
+---
+ns=4
+project=documents
+access=index-range index=30 gen=1 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual=none
+
+### resolve-dotted-ns-unquoted
+SELECT * FROM my.ns WHERE v = 1
+---
+error: unknown namespace 'my'
+
+### resolve-dotted-index-quoted
+SELECT * FROM "my.ns"."dot.idx" WHERE w = 1
+---
+ns=4
+project=documents
+access=index-range index=31 gen=2 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual=none
+
+### resolve-three-part-target
+SELECT * FROM a.b.c WHERE v = 1
+---
+error: unexpected input after statement end at offset 17
+
+### resolve-or-not-servable
+SELECT * FROM orders WHERE (price > 10 OR price < 5)
+---
+error: no key condition names the primary key or a ready index; declare one (INF.IDX CREATE) or scan with explicit consent (FROM ns.SCAN)
+
+### resolve-ne-not-servable
+SELECT * FROM orders WHERE price != 10
+---
+error: no key condition names the primary key or a ready index; declare one (INF.IDX CREATE) or scan with explicit consent (FROM ns.SCAN)
+
+### resolve-in-not-servable
+SELECT * FROM orders WHERE price IN (1, 2)
+---
+error: no key condition names the primary key or a ready index; declare one (INF.IDX CREATE) or scan with explicit consent (FROM ns.SCAN)
+
+### resolve-exists-not-servable
+SELECT * FROM orders WHERE exists(price)
+---
+error: no key condition names the primary key or a ready index; declare one (INF.IDX CREATE) or scan with explicit consent (FROM ns.SCAN)
+
+### resolve-not-servable
+SELECT * FROM orders WHERE NOT price = 5
+---
+error: no key condition names the primary key or a ready index; declare one (INF.IDX CREATE) or scan with explicit consent (FROM ns.SCAN)
+
+### residual-or
+SELECT * FROM orders WHERE price = 5 AND (qty = 1 OR qty = 2)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  or n=2
+    cmp op=eq path=$.qty const=i64:1
+    cmp op=eq path=$.qty const=i64:2
+
+### residual-not-exists
+SELECT * FROM orders WHERE price = 5 AND NOT exists(deleted)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  not
+    exists path=$.deleted
+
+### residual-exists
+SELECT * FROM orders WHERE price = 5 AND exists(meta.flag)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  exists path=$.meta.flag
+
+### residual-in-i64
+SELECT * FROM orders WHERE price = 5 AND qty IN (1, 2, 3)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  in path=$.qty members=[i64:1, i64:2, i64:3]
+
+### residual-in-mixed-numeric
+SELECT * FROM orders WHERE price = 5 AND qty IN (1, 2.5)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  in path=$.qty members=[i64:1, f64:2.5]
+
+### residual-in-utf8
+SELECT * FROM orders WHERE price = 5 AND city IN ('a', 'b')
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  in path=$.city members=[utf8:"a", utf8:"b"]
+
+### residual-in-bool
+SELECT * FROM orders WHERE price = 5 AND flag IN (TRUE, FALSE)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  in path=$.flag members=[bool:true, bool:false]
+
+### residual-not-in
+SELECT * FROM orders WHERE price = 5 AND qty NOT IN (1, 2)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  not
+    in path=$.qty members=[i64:1, i64:2]
+
+### residual-not-between
+SELECT * FROM orders WHERE price = 5 AND qty NOT BETWEEN 1 AND 9
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  not
+    between path=$.qty lo=i64:1 hi=i64:9
+
+### residual-ne-on-indexed-path
+SELECT * FROM orders WHERE price = 5 AND name != 'x'
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  cmp op=ne path=$.name const=utf8:"x"
+
+### residual-in-on-indexed-path
+SELECT * FROM orders WHERE price = 5 AND price IN (1, 2)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  in path=$.price members=[i64:1, i64:2]
+
+### residual-exists-on-indexed-path
+SELECT * FROM orders WHERE price = 5 AND exists(name)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  exists path=$.name
+
+### residual-begins-with
+SELECT * FROM orders WHERE price = 5 AND begins_with(city, 'ab')
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  begins-with path=$.city prefix="ab"
+
+### residual-cross-family-cmp
+SELECT * FROM orders WHERE price = 5 AND city = 3
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  cmp op=eq path=$.city const=i64:3
+
+### residual-nested-parens
+SELECT * FROM orders WHERE price = 5 AND (a = 1 OR (b = 2 AND c = 3))
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  or n=2
+    cmp op=eq path=$.a const=i64:1
+    and n=2
+      cmp op=eq path=$.b const=i64:2
+      cmp op=eq path=$.c const=i64:3
+
+### residual-double-not
+SELECT * FROM orders WHERE price = 5 AND NOT NOT qty = 2
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  not
+    not
+      cmp op=eq path=$.qty const=i64:2
+
+### residual-not-parens
+SELECT * FROM orders WHERE price = 5 AND NOT (a = 1 OR b = 2)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  not
+    or n=2
+      cmp op=eq path=$.a const=i64:1
+      cmp op=eq path=$.b const=i64:2
+
+### residual-wildcard-path
+SELECT * FROM orders WHERE price = 5 AND items[*].qty > 2
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  cmp op=gt path=$.items.*.qty const=i64:2
+
+### residual-deep-path
+SELECT * FROM orders WHERE price = 5 AND a.b.c.d = 1
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  cmp op=eq path=$.a.b.c.d const=i64:1
+
+### residual-or-of-ands
+SELECT * FROM orders WHERE price = 5 AND (a = 1 AND b = 2 OR c = 3)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  or n=2
+    and n=2
+      cmp op=eq path=$.a const=i64:1
+      cmp op=eq path=$.b const=i64:2
+    cmp op=eq path=$.c const=i64:3
+
+### residual-between-utf8
+SELECT * FROM orders WHERE price = 5 AND city BETWEEN 'a' AND 'b'
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  between path=$.city lo=utf8:"a" hi=utf8:"b"
+
+### residual-keyword-attr-bracket
+SELECT * FROM orders WHERE price = 5 AND ['select'] = 1
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  cmp op=eq path=$.select const=i64:1
+
+### residual-attr-named-exists
+SELECT * FROM orders WHERE price = 5 AND exists = 1
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  cmp op=eq path=$.exists const=i64:1
+
+### residual-attr-named-count
+SELECT * FROM orders WHERE price = 5 AND count = 1
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  cmp op=eq path=$.count const=i64:1
+
+### pk-range-rejected
+SELECT * FROM orders WHERE $key > 'a'
+---
+error: the primary key supports equality only ($key = 'k'); ranges need a declared index
+
+### pk-between-rejected
+SELECT * FROM orders WHERE $key BETWEEN 'a' AND 'b'
+---
+error: the primary key supports equality only ($key = 'k'); ranges need a declared index
+
+### pk-in-rejected
+SELECT * FROM orders WHERE $key IN ('a')
+---
+error: the primary key supports equality only ($key = 'k'); ranges need a declared index
+
+### pk-numeric-literal
+SELECT * FROM orders WHERE $key = 3
+---
+error: $key compares to a string literal
+
+### pk-bool-literal
+SELECT * FROM orders WHERE $key = TRUE
+---
+error: $key compares to a string literal
+
+### pk-duplicate
+SELECT * FROM orders WHERE $key = 'a' AND $key = 'b'
+---
+error: more than one $key condition
+
+### pk-under-or
+SELECT * FROM orders WHERE $key = 'a' OR price > 3
+---
+error: $key is only valid as a top-level AND conjunct '$key = <string>'
+
+### pk-under-not
+SELECT * FROM orders WHERE NOT $key = 'a'
+---
+error: $key is only valid as a top-level AND conjunct '$key = <string>'
+
+### pk-empty-key
+SELECT * FROM orders WHERE $key = ''
+---
+error: primary key literals must be 1 to 255 bytes
+
+### pk-with-named-index
+SELECT * FROM orders.price_idx WHERE $key = 'a'
+---
+error: $key is only valid as a top-level AND conjunct '$key = <string>'
+
+### pk-with-scan
+SELECT * FROM orders.SCAN WHERE $key = 'a'
+---
+error: $key does not combine with FROM ns.SCAN (point lookups use FROM ns)
+
+### pk-unknown-pseudo
+SELECT * FROM orders WHERE $id = 'a'
+---
+error: unknown pseudo-path at offset 27 ($key is the only pseudo-path)
+
+### scan-bare
+SELECT * FROM orders.SCAN
+---
+ns=1
+project=documents
+access=scan
+residual=none
+
+### scan-filter
+SELECT * FROM orders.SCAN WHERE price > 10
+---
+ns=1
+project=documents
+access=scan
+residual:
+  cmp op=gt path=$.price const=i64:10
+
+### scan-count
+SELECT COUNT(*) FROM orders.SCAN WHERE exists(deleted)
+---
+ns=1
+project=count
+access=scan
+residual:
+  exists path=$.deleted
+
+### scan-limit
+SELECT * FROM orders.SCAN LIMIT 50
+---
+ns=1
+project=documents
+limit=50
+access=scan
+residual=none
+
+### scan-lowercase
+SELECT * FROM orders.scan WHERE a = 1
+---
+ns=1
+project=documents
+access=scan
+residual:
+  cmp op=eq path=$.a const=i64:1
+
+### scan-quoted-is-index
+SELECT * FROM orders."SCAN"
+---
+error: unknown index 'SCAN'
+
+### scan-empty-ns
+SELECT * FROM empty.SCAN
+---
+ns=3
+project=documents
+access=scan
+residual=none
+
+### scan-or-filter
+SELECT * FROM orders.SCAN WHERE a = 1 OR b = 2
+---
+ns=1
+project=documents
+access=scan
+residual:
+  or n=2
+    cmp op=eq path=$.a const=i64:1
+    cmp op=eq path=$.b const=i64:2
+
+### count-index-range
+SELECT COUNT(*) FROM orders WHERE price > 10
+---
+ns=1
+project=count
+access=index-range index=1 gen=2 type=i64
+lo=excl i64:10
+hi=unbounded
+residual=none
+
+### count-utf8
+SELECT COUNT(*) FROM orders WHERE begins_with(name, 'a')
+---
+ns=1
+project=count
+access=index-range index=3 gen=1 type=utf8
+lo=incl hex:61
+hi=excl hex:62
+residual=none
+
+### count-with-limit
+SELECT COUNT(*) FROM orders WHERE price > 10 LIMIT 5
+---
+error: LIMIT does not apply to COUNT(*) (each page is bounded by the page budget and returns a partial count)
+
+### count-spaced
+SELECT COUNT (*) FROM orders WHERE price = 1
+---
+ns=1
+project=count
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual=none
+
+### count-lower
+select count(*) from orders where price = 1
+---
+ns=1
+project=count
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual=none
+
+### family-utf8-index-numeric
+SELECT * FROM orders WHERE name = 3
+---
+error: key condition value does not match index 'name_idx' declared type utf8
+
+### family-utf8-index-bool
+SELECT * FROM orders WHERE name = TRUE
+---
+error: key condition value does not match index 'name_idx' declared type utf8
+
+### family-bool-index-numeric
+SELECT * FROM orders WHERE active = 1
+---
+error: key condition value does not match index 'active_idx' declared type bool
+
+### family-i64-index-string
+SELECT * FROM orders WHERE price = 'ten'
+---
+error: key condition value does not match index 'price_idx' declared type i64
+
+### family-i64-index-bool
+SELECT * FROM orders WHERE price = TRUE
+---
+error: key condition value does not match index 'price_idx' declared type i64
+
+### family-begins-with-i64-index
+SELECT * FROM orders WHERE begins_with(price, 'a')
+---
+error: key condition value does not match index 'price_idx' declared type i64
+
+### family-between-mixed-on-key
+SELECT * FROM orders WHERE price BETWEEN 1 AND 'a'
+---
+error: key condition value does not match index 'price_idx' declared type i64
+
+### family-between-mixed-utf8-key
+SELECT * FROM orders WHERE name BETWEEN 'a' AND 2
+---
+error: key condition value does not match index 'name_idx' declared type utf8
+
+### reject-order-by
+SELECT * FROM orders WHERE price = 1 ORDER BY price
+---
+error: unsupported: ORDER BY (results follow index-key order)
+
+### reject-order-by-no-where
+SELECT * FROM orders ORDER BY price
+---
+error: unsupported: ORDER BY (results follow index-key order)
+
+### reject-group-by
+SELECT * FROM orders WHERE price = 1 GROUP BY name
+---
+error: unsupported: GROUP BY
+
+### reject-having
+SELECT * FROM orders WHERE price = 1 HAVING price > 2
+---
+error: unsupported: HAVING
+
+### reject-offset
+SELECT * FROM orders WHERE price = 1 LIMIT 5 OFFSET 10
+---
+error: unsupported: OFFSET (pages resume from cursors)
+
+### reject-offset-no-limit
+SELECT * FROM orders WHERE price = 1 OFFSET 10
+---
+error: unsupported: OFFSET (pages resume from cursors)
+
+### reject-join-keyword
+SELECT * FROM orders JOIN other WHERE price = 1
+---
+error: unsupported: JOIN (statements read one namespace)
+
+### reject-comma-join
+SELECT * FROM orders, other WHERE price = 1
+---
+error: unsupported: JOIN (statements read one namespace)
+
+### reject-column-projection
+SELECT price FROM orders WHERE price = 1
+---
+error: unsupported projection: only * and COUNT(*) are in the subset
+
+### reject-column-list
+SELECT price, name FROM orders
+---
+error: unsupported projection: only * and COUNT(*) are in the subset
+
+### reject-star-plus-column
+SELECT *, name FROM orders
+---
+error: unsupported projection: only * and COUNT(*) are in the subset
+
+### reject-distinct
+SELECT DISTINCT * FROM orders
+---
+error: unsupported projection: only * and COUNT(*) are in the subset
+
+### reject-count-column
+SELECT COUNT(price) FROM orders
+---
+error: unsupported projection: only * and COUNT(*) are in the subset
+
+### reject-count-bare
+SELECT count FROM orders
+---
+error: unsupported projection: only * and COUNT(*) are in the subset
+
+### reject-insert
+INSERT INTO orders VALUE {'a': 1}
+---
+error: unsupported: INSERT/UPDATE/DELETE (mutations use the native command set)
+
+### reject-update
+UPDATE orders SET price = 1
+---
+error: unsupported: INSERT/UPDATE/DELETE (mutations use the native command set)
+
+### reject-delete
+DELETE FROM orders WHERE price = 1
+---
+error: unsupported: INSERT/UPDATE/DELETE (mutations use the native command set)
+
+### reject-is-null
+SELECT * FROM orders WHERE price = 1 AND name IS NULL
+---
+error: unsupported: IS NULL / IS MISSING (null is never indexed; exists(path) tests presence)
+
+### reject-is-not-null
+SELECT * FROM orders WHERE name IS NOT NULL
+---
+error: unsupported: IS NULL / IS MISSING (null is never indexed; exists(path) tests presence)
+
+### reject-is-missing
+SELECT * FROM orders WHERE name IS MISSING
+---
+error: unsupported: IS NULL / IS MISSING (null is never indexed; exists(path) tests presence)
+
+### reject-like
+SELECT * FROM orders WHERE name LIKE 'a%'
+---
+error: unsupported: LIKE (begins_with(path, 'prefix') is the indexed prefix test)
+
+### reject-not-like
+SELECT * FROM orders WHERE name NOT LIKE 'a%'
+---
+error: unsupported: LIKE (begins_with(path, 'prefix') is the indexed prefix test)
+
+### reject-eq-null
+SELECT * FROM orders WHERE name = NULL
+---
+error: unsupported: comparison to NULL (null is never indexed; exists(path) tests presence)
+
+### reject-ne-null
+SELECT * FROM orders WHERE name != NULL
+---
+error: unsupported: comparison to NULL (null is never indexed; exists(path) tests presence)
+
+### reject-null-in-list
+SELECT * FROM orders WHERE price = 1 AND a IN (1, NULL)
+---
+error: unsupported: comparison to NULL (null is never indexed; exists(path) tests presence)
+
+### reject-null-between
+SELECT * FROM orders WHERE price = 1 AND a BETWEEN NULL AND 2
+---
+error: unsupported: comparison to NULL (null is never indexed; exists(path) tests presence)
+
+### reject-mixed-in
+SELECT * FROM orders WHERE price = 1 AND a IN (1, 'x')
+---
+error: IN members must share one type family
+
+### reject-mixed-in-bool
+SELECT * FROM orders WHERE price = 1 AND a IN (TRUE, 1)
+---
+error: IN members must share one type family
+
+### reject-mixed-between-residual
+SELECT * FROM orders WHERE price = 1 AND a BETWEEN 1 AND 'z'
+---
+error: BETWEEN bounds must share one type family
+
+### reject-unknown-function
+SELECT * FROM orders WHERE contains(name, 'a')
+---
+error: unknown function at offset 27 (supported: begins_with, exists)
+
+### reject-attr-call
+SELECT * FROM orders WHERE price(3)
+---
+error: unknown function at offset 27 (supported: begins_with, exists)
+
+### lex-unterminated-string
+SELECT * FROM orders WHERE name = 'alice
+---
+error: unterminated string literal at offset 34
+
+### lex-unterminated-quoted
+SELECT * FROM "orders WHERE name = 'a'
+---
+error: unterminated string literal at offset 14
+
+### lex-bad-number-trailing-dot
+SELECT * FROM orders WHERE price = 1.
+---
+error: invalid number literal at offset 35
+
+### lex-bad-number-exponent
+SELECT * FROM orders WHERE price = 1e
+---
+error: invalid number literal at offset 35
+
+### lex-int-overflow
+SELECT * FROM orders WHERE price = 9223372036854775808
+---
+error: integer literal out of i64 range at offset 35
+
+### lex-int-underflow
+SELECT * FROM orders WHERE price = -9223372036854775809
+---
+error: integer literal out of i64 range at offset 35
+
+### lex-float-overflow
+SELECT * FROM orders WHERE score = 1e999
+---
+error: number literal overflows f64 at offset 35
+
+### lex-unexpected-hash
+SELECT * FROM orders WHERE price = 1 # comment
+---
+error: unexpected character at offset 37
+
+### lex-unexpected-question
+SELECT * FROM orders WHERE price = ?
+---
+error: unexpected character at offset 35
+
+### lex-bare-bang
+SELECT * FROM orders WHERE price ! 1
+---
+error: unexpected character at offset 33
+
+### lex-bare-dollar
+SELECT * FROM orders WHERE $ = 1
+---
+error: unexpected character at offset 27
+
+### lex-bare-minus
+SELECT * FROM orders WHERE price = -
+---
+error: unexpected character at offset 35
+
+### syntax-empty
+
+---
+error: expected SELECT at offset 0
+
+### syntax-just-select
+SELECT
+---
+error: expected * or COUNT(*) at offset 6
+
+### syntax-missing-from
+SELECT * WHERE price = 1
+---
+error: expected FROM at offset 9
+
+### syntax-missing-ns
+SELECT * FROM
+---
+error: expected a namespace at offset 13
+
+### syntax-missing-index
+SELECT * FROM orders.
+---
+error: expected an index name or SCAN at offset 21
+
+### syntax-where-empty
+SELECT * FROM orders WHERE
+---
+error: expected a condition at offset 26
+
+### syntax-where-and-only
+SELECT * FROM orders WHERE AND
+---
+error: expected a condition at offset 30
+
+### syntax-bare-path
+SELECT * FROM orders WHERE price
+---
+error: expected a condition at offset 32
+
+### syntax-missing-literal
+SELECT * FROM orders WHERE price >
+---
+error: expected a literal at offset 34
+
+### syntax-double-op
+SELECT * FROM orders WHERE price > < 1
+---
+error: expected a literal at offset 35
+
+### syntax-literal-first
+SELECT * FROM orders WHERE 1 = price
+---
+error: expected a condition at offset 27
+
+### syntax-between-missing-and
+SELECT * FROM orders WHERE price BETWEEN 1 2
+---
+error: expected AND at offset 43
+
+### syntax-in-missing-paren
+SELECT * FROM orders WHERE price IN 1, 2
+---
+error: expected '(' at offset 36
+
+### syntax-in-empty
+SELECT * FROM orders WHERE price IN ()
+---
+error: expected a literal at offset 37
+
+### syntax-in-unclosed
+SELECT * FROM orders WHERE price IN (1, 2
+---
+error: expected ',' or ')' at offset 41
+
+### syntax-in-semicolon
+SELECT * FROM orders WHERE price IN (1; 2)
+---
+error: expected ',' or ')' at offset 38
+
+### syntax-not-eq
+SELECT * FROM orders WHERE price NOT = 1
+---
+error: expected BETWEEN or IN at offset 37
+
+### syntax-unclosed-paren
+SELECT * FROM orders WHERE (price = 1
+---
+error: expected ')' at offset 37
+
+### syntax-unmatched-close
+SELECT * FROM orders WHERE price = 1)
+---
+error: unexpected input after statement end at offset 36
+
+### syntax-trailing-tokens
+SELECT * FROM orders WHERE price = 1 extra
+---
+error: unexpected input after statement end at offset 37
+
+### syntax-double-limit
+SELECT * FROM orders WHERE price = 1 LIMIT 5 LIMIT 6
+---
+error: unexpected input after statement end at offset 45
+
+### syntax-where-after-limit
+SELECT * FROM orders LIMIT 5 WHERE price = 1
+---
+error: unexpected input after statement end at offset 29
+
+### syntax-after-semicolon
+SELECT * FROM orders WHERE price = 1; SELECT
+---
+error: unexpected input after statement end at offset 38
+
+### syntax-limit-zero
+SELECT * FROM orders WHERE price = 1 LIMIT 0
+---
+error: LIMIT must be between 1 and 4294967295 at offset 43
+
+### syntax-limit-negative
+SELECT * FROM orders WHERE price = 1 LIMIT -1
+---
+error: LIMIT must be between 1 and 4294967295 at offset 43
+
+### syntax-limit-too-big
+SELECT * FROM orders WHERE price = 1 LIMIT 4294967296
+---
+error: LIMIT must be between 1 and 4294967295 at offset 43
+
+### syntax-limit-float
+SELECT * FROM orders WHERE price = 1 LIMIT 1.5
+---
+error: expected an integer at offset 43
+
+### syntax-limit-string
+SELECT * FROM orders WHERE price = 1 LIMIT 'a'
+---
+error: expected an integer at offset 43
+
+### path-descend
+SELECT * FROM orders WHERE items..price > 3
+---
+error: recursive descent ('..') is not allowed in statement paths at offset 32
+
+### path-slice
+SELECT * FROM orders WHERE items[1:2] = 3
+---
+error: slices and unions are not allowed in statement paths at offset 34
+
+### path-slice-open
+SELECT * FROM orders WHERE items[:2] = 3
+---
+error: slices and unions are not allowed in statement paths at offset 33
+
+### path-union
+SELECT * FROM orders WHERE items[1,2] = 3
+---
+error: slices and unions are not allowed in statement paths at offset 34
+
+### path-union-names
+SELECT * FROM orders WHERE a['x','y'] = 3
+---
+error: slices and unions are not allowed in statement paths at offset 32
+
+### path-empty-bracket
+SELECT * FROM orders WHERE a[] = 3
+---
+error: expected a document path at offset 29
+
+### path-bare-ident-bracket
+SELECT * FROM orders WHERE a[b] = 3
+---
+error: expected a document path at offset 29
+
+### path-float-index
+SELECT * FROM orders WHERE a[1.5] = 3
+---
+error: expected a document path at offset 29
+
+### path-trailing-dot
+SELECT * FROM orders WHERE a. = 3
+---
+error: expected a document path at offset 30
+
+### path-dot-star
+SELECT * FROM orders WHERE a.* = 3
+---
+error: expected a document path at offset 29
+
+### path-dash-attr
+SELECT * FROM orders WHERE a-b = 3
+---
+error: invalid document path at offset 27
+
+### fn-begins-with-one-arg
+SELECT * FROM orders WHERE begins_with(name)
+---
+error: begins_with takes (path, 'prefix') at offset 27
+
+### fn-begins-with-numeric
+SELECT * FROM orders WHERE begins_with(name, 3)
+---
+error: begins_with takes (path, 'prefix') at offset 27
+
+### fn-begins-with-unclosed
+SELECT * FROM orders WHERE begins_with(name, 'a'
+---
+error: begins_with takes (path, 'prefix') at offset 27
+
+### fn-exists-two-args
+SELECT * FROM orders WHERE exists(name, price)
+---
+error: exists takes (path) at offset 27
+
+### fn-exists-empty
+SELECT * FROM orders WHERE exists()
+---
+error: expected a document path at offset 34
+
+### fn-exists-literal
+SELECT * FROM orders WHERE exists('a')
+---
+error: expected a document path at offset 34
+
+### op-ne-bang
+SELECT * FROM orders WHERE price = 1 AND a != 2
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual:
+  cmp op=ne path=$.a const=i64:2
+
+### op-ne-angle
+SELECT * FROM orders WHERE price = 1 AND a <> 2
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual:
+  cmp op=ne path=$.a const=i64:2
+
+### op-chain-precedence
+SELECT * FROM orders.SCAN WHERE a = 1 OR b = 2 AND c = 3
+---
+ns=1
+project=documents
+access=scan
+residual:
+  or n=2
+    cmp op=eq path=$.a const=i64:1
+    and n=2
+      cmp op=eq path=$.b const=i64:2
+      cmp op=eq path=$.c const=i64:3
+
+### op-not-precedence
+SELECT * FROM orders WHERE NOT a = 1 AND price = 5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  not
+    cmp op=eq path=$.a const=i64:1
+
+### op-flat-and-chain
+SELECT * FROM orders WHERE price = 1 AND a = 2 AND b = 3 AND c = 4
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual:
+  and n=3
+    cmp op=eq path=$.a const=i64:2
+    cmp op=eq path=$.b const=i64:3
+    cmp op=eq path=$.c const=i64:4
+
+### op-flat-or-chain
+SELECT * FROM orders.SCAN WHERE a = 1 OR b = 2 OR c = 3
+---
+ns=1
+project=documents
+access=scan
+residual:
+  or n=3
+    cmp op=eq path=$.a const=i64:1
+    cmp op=eq path=$.b const=i64:2
+    cmp op=eq path=$.c const=i64:3
+
+### op-paren-nesting-kept
+SELECT * FROM orders WHERE price = 1 AND (a = 2 AND (b = 3 AND c = 4))
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual:
+  and n=2
+    cmp op=eq path=$.a const=i64:2
+    and n=2
+      cmp op=eq path=$.b const=i64:3
+      cmp op=eq path=$.c const=i64:4
+
+### op-or-group-with-anchor
+SELECT * FROM orders WHERE (a = 1 OR b = 2) AND price = 5
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:5
+hi=incl i64:5
+residual:
+  or n=2
+    cmp op=eq path=$.a const=i64:1
+    cmp op=eq path=$.b const=i64:2
+
+### count-multi-valued
+SELECT COUNT(*) FROM orders WHERE tags[*] = 'x'
+---
+ns=1
+project=count
+access=index-range index=5 gen=3 type=utf8
+lo=incl utf8:"x"
+hi=incl utf8:"x"
+residual=none
+
+### pk-limit-with-residual
+SELECT * FROM orders WHERE $key = 'u' AND price > 1 LIMIT 10
+---
+ns=1
+project=documents
+limit=10
+access=pk-get key="u"
+residual:
+  cmp op=gt path=$.price const=i64:1
+
+### scan-not-filter
+SELECT * FROM orders.SCAN WHERE NOT exists(a)
+---
+ns=1
+project=documents
+access=scan
+residual:
+  not
+    exists path=$.a
+
+### i64-f64-between-vacuous
+SELECT * FROM orders WHERE price BETWEEN -1e20 AND 1e20
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=unbounded
+hi=unbounded
+residual=none
+
+### gen-in-over-cap
+SELECT * FROM orders WHERE price = 1 AND a IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100)
+---
+error: IN list must hold 1 to 100 members at offset 41
+
+### gen-in-at-cap
+SELECT * FROM orders WHERE price = 1 AND a IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99)
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual:
+  in path=$.a members=[i64:0, i64:1, i64:2, i64:3, i64:4, i64:5, i64:6, i64:7, i64:8, i64:9, i64:10, i64:11, i64:12, i64:13, i64:14, i64:15, i64:16, i64:17, i64:18, i64:19, i64:20, i64:21, i64:22, i64:23, i64:24, i64:25, i64:26, i64:27, i64:28, i64:29, i64:30, i64:31, i64:32, i64:33, i64:34, i64:35, i64:36, i64:37, i64:38, i64:39, i64:40, i64:41, i64:42, i64:43, i64:44, i64:45, i64:46, i64:47, i64:48, i64:49, i64:50, i64:51, i64:52, i64:53, i64:54, i64:55, i64:56, i64:57, i64:58, i64:59, i64:60, i64:61, i64:62, i64:63, i64:64, i64:65, i64:66, i64:67, i64:68, i64:69, i64:70, i64:71, i64:72, i64:73, i64:74, i64:75, i64:76, i64:77, i64:78, i64:79, i64:80, i64:81, i64:82, i64:83, i64:84, i64:85, i64:86, i64:87, i64:88, i64:89, i64:90, i64:91, i64:92, i64:93, i64:94, i64:95, i64:96, i64:97, i64:98, i64:99]
+
+### gen-and-chain-nests
+SELECT * FROM orders WHERE price = 1 AND a = 0 AND a = 1 AND a = 2 AND a = 3 AND a = 4 AND a = 5 AND a = 6 AND a = 7 AND a = 8 AND a = 9 AND a = 10 AND a = 11 AND a = 12 AND a = 13 AND a = 14 AND a = 15 AND a = 16 AND a = 17 AND a = 18 AND a = 19 AND a = 20 AND a = 21 AND a = 22 AND a = 23 AND a = 24 AND a = 25 AND a = 26 AND a = 27 AND a = 28 AND a = 29 AND a = 30 AND a = 31 AND a = 32 AND a = 33 AND a = 34 AND a = 35 AND a = 36 AND a = 37 AND a = 38 AND a = 39 AND a = 40 AND a = 41 AND a = 42 AND a = 43 AND a = 44 AND a = 45 AND a = 46 AND a = 47 AND a = 48 AND a = 49 AND a = 50 AND a = 51 AND a = 52 AND a = 53 AND a = 54 AND a = 55 AND a = 56 AND a = 57 AND a = 58 AND a = 59 AND a = 60 AND a = 61 AND a = 62 AND a = 63 AND a = 64 AND a = 65 AND a = 66 AND a = 67 AND a = 68 AND a = 69
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual:
+  and n=7
+    cmp op=eq path=$.a const=i64:0
+    cmp op=eq path=$.a const=i64:1
+    cmp op=eq path=$.a const=i64:2
+    cmp op=eq path=$.a const=i64:3
+    cmp op=eq path=$.a const=i64:4
+    cmp op=eq path=$.a const=i64:5
+    and n=64
+      cmp op=eq path=$.a const=i64:6
+      cmp op=eq path=$.a const=i64:7
+      cmp op=eq path=$.a const=i64:8
+      cmp op=eq path=$.a const=i64:9
+      cmp op=eq path=$.a const=i64:10
+      cmp op=eq path=$.a const=i64:11
+      cmp op=eq path=$.a const=i64:12
+      cmp op=eq path=$.a const=i64:13
+      cmp op=eq path=$.a const=i64:14
+      cmp op=eq path=$.a const=i64:15
+      cmp op=eq path=$.a const=i64:16
+      cmp op=eq path=$.a const=i64:17
+      cmp op=eq path=$.a const=i64:18
+      cmp op=eq path=$.a const=i64:19
+      cmp op=eq path=$.a const=i64:20
+      cmp op=eq path=$.a const=i64:21
+      cmp op=eq path=$.a const=i64:22
+      cmp op=eq path=$.a const=i64:23
+      cmp op=eq path=$.a const=i64:24
+      cmp op=eq path=$.a const=i64:25
+      cmp op=eq path=$.a const=i64:26
+      cmp op=eq path=$.a const=i64:27
+      cmp op=eq path=$.a const=i64:28
+      cmp op=eq path=$.a const=i64:29
+      cmp op=eq path=$.a const=i64:30
+      cmp op=eq path=$.a const=i64:31
+      cmp op=eq path=$.a const=i64:32
+      cmp op=eq path=$.a const=i64:33
+      cmp op=eq path=$.a const=i64:34
+      cmp op=eq path=$.a const=i64:35
+      cmp op=eq path=$.a const=i64:36
+      cmp op=eq path=$.a const=i64:37
+      cmp op=eq path=$.a const=i64:38
+      cmp op=eq path=$.a const=i64:39
+      cmp op=eq path=$.a const=i64:40
+      cmp op=eq path=$.a const=i64:41
+      cmp op=eq path=$.a const=i64:42
+      cmp op=eq path=$.a const=i64:43
+      cmp op=eq path=$.a const=i64:44
+      cmp op=eq path=$.a const=i64:45
+      cmp op=eq path=$.a const=i64:46
+      cmp op=eq path=$.a const=i64:47
+      cmp op=eq path=$.a const=i64:48
+      cmp op=eq path=$.a const=i64:49
+      cmp op=eq path=$.a const=i64:50
+      cmp op=eq path=$.a const=i64:51
+      cmp op=eq path=$.a const=i64:52
+      cmp op=eq path=$.a const=i64:53
+      cmp op=eq path=$.a const=i64:54
+      cmp op=eq path=$.a const=i64:55
+      cmp op=eq path=$.a const=i64:56
+      cmp op=eq path=$.a const=i64:57
+      cmp op=eq path=$.a const=i64:58
+      cmp op=eq path=$.a const=i64:59
+      cmp op=eq path=$.a const=i64:60
+      cmp op=eq path=$.a const=i64:61
+      cmp op=eq path=$.a const=i64:62
+      cmp op=eq path=$.a const=i64:63
+      cmp op=eq path=$.a const=i64:64
+      cmp op=eq path=$.a const=i64:65
+      cmp op=eq path=$.a const=i64:66
+      cmp op=eq path=$.a const=i64:67
+      cmp op=eq path=$.a const=i64:68
+      cmp op=eq path=$.a const=i64:69
+
+### gen-depth-over
+SELECT * FROM orders WHERE (((((((((((((((((((((((((((((((((price = 1)))))))))))))))))))))))))))))))))
+---
+error: WHERE nesting exceeds depth 32 at offset 59
+
+### gen-depth-at
+SELECT * FROM orders WHERE (((((((((((((((((((((((((((((((price = 1)))))))))))))))))))))))))))))))
+---
+ns=1
+project=documents
+access=index-range index=1 gen=2 type=i64
+lo=incl i64:1
+hi=incl i64:1
+residual=none
+
+### gen-paths-over-cap
+SELECT * FROM orders WHERE price = 1 AND p0 = 1 AND p1 = 1 AND p2 = 1 AND p3 = 1 AND p4 = 1 AND p5 = 1 AND p6 = 1 AND p7 = 1 AND p8 = 1 AND p9 = 1 AND p10 = 1 AND p11 = 1 AND p12 = 1 AND p13 = 1 AND p14 = 1 AND p15 = 1 AND p16 = 1 AND p17 = 1 AND p18 = 1 AND p19 = 1 AND p20 = 1 AND p21 = 1 AND p22 = 1 AND p23 = 1 AND p24 = 1 AND p25 = 1 AND p26 = 1 AND p27 = 1 AND p28 = 1 AND p29 = 1 AND p30 = 1 AND p31 = 1 AND p32 = 1 AND p33 = 1 AND p34 = 1 AND p35 = 1 AND p36 = 1 AND p37 = 1 AND p38 = 1 AND p39 = 1 AND p40 = 1 AND p41 = 1 AND p42 = 1 AND p43 = 1 AND p44 = 1 AND p45 = 1 AND p46 = 1 AND p47 = 1 AND p48 = 1 AND p49 = 1 AND p50 = 1 AND p51 = 1 AND p52 = 1 AND p53 = 1 AND p54 = 1 AND p55 = 1 AND p56 = 1 AND p57 = 1 AND p58 = 1 AND p59 = 1 AND p60 = 1 AND p61 = 1 AND p62 = 1 AND p63 = 1 AND p64 = 1
+---
+error: the WHERE clause exceeds 64 distinct paths
+
+### gen-pk-over-cap
+SELECT * FROM orders WHERE $key = 'kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk'
+---
+error: primary key literals must be 1 to 255 bytes
+
+### gen-pk-at-cap
+SELECT * FROM orders WHERE $key = 'kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk'
+---
+ns=1
+project=documents
+access=pk-get key="kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+residual=none
+
+### gen-utf8-eq-over-cap
+SELECT * FROM orders WHERE name = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl hex:78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878
+hi=excl hex:78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878
+residual=none
+
+### gen-utf8-lt-over-cap
+SELECT * FROM orders WHERE name < 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=unbounded
+hi=incl hex:78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878
+residual=none
+
+### gen-utf8-gt-over-cap
+SELECT * FROM orders WHERE name > 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=excl hex:78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878
+hi=unbounded
+residual=none
+
+### gen-begins-with-over-cap
+SELECT * FROM orders WHERE begins_with(name, 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+---
+ns=1
+project=documents
+access=index-range index=3 gen=1 type=utf8
+lo=incl hex:78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878
+hi=excl hex:78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878
+residual=none
+
+### gen-statement-too-long
+SELECT * FROM orders WHERE $key = 'ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss'
+---
+error: statement exceeds the size limit
+

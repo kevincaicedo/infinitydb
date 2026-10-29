@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
 //! M2-S15 parallel cold-boot rehearsal — target root.
 //!
 //! The rehearsal boots a real N-cell node (`UringDriver` + SO_REUSEPORT

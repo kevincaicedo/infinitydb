@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M4-S15 — copy-forward compaction at the seam tier (ADR-0059): the
 //! scan/relocate/repoint slice, the trigger arms, refusal-aware
 //! admission, the retirement pipeline (stamp → manifest exclusion →
@@ -19,45 +23,20 @@ use inf_log::flush::unlink_tier_file;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
     CkptConfig, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TIER_FRAME_BYTES,
-    TierFlush, TierFlushConfig, TierIoMode, decode_record, read_ick_hybrid, read_manifest,
-    tier_extract, tier_frame_offset, tier_frame_span, write_manifest,
+    TierFlush, TierFlushConfig, read_manifest, tier_extract, tier_frame_offset, tier_frame_span,
+    write_manifest,
 };
+use inf_store::KeyHasher;
 use inf_store::{
-    AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, LogicalAddr,
-    TieredLookup, TieredTable, apply_live_set_section, apply_ref_section, recover_tiered_ns,
+    CompactionConfig, CompactionWork, DemotionConfig, LogicalAddr, TieredLookup, TieredTable,
+    recover_tiered_ns,
 };
+
+mod support;
+use support::*;
 
 const NS: NsId = NsId(47);
-const PAGE: u64 = 4 << 10;
-const BUDGET: u64 = 1 << 20;
 const FILE_CAPACITY: u64 = 48 << 10;
-const SHARD: &str = "shard-0";
-
-fn seeded(x: &mut u64) -> u64 {
-    *x ^= *x << 13;
-    *x ^= *x >> 7;
-    *x ^= *x << 17;
-    *x
-}
-
-fn flush_config() -> TierFlushConfig {
-    TierFlushConfig {
-        shard_dir: Path::new(SHARD).to_path_buf(),
-        cell: 0,
-        ns: NS,
-        mode: TierIoMode::Buffered,
-        file_capacity: FILE_CAPACITY,
-        slice_bytes: PAGE,
-    }
-}
-
-fn space_config(demote: DemotionConfig, origin: u64) -> AddressSpaceConfig {
-    AddressSpaceConfig {
-        reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
-        page_bytes: PAGE as usize,
-        life_origin: LogicalAddr::from_raw(origin).expect("48-bit"),
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Expect {
@@ -87,8 +66,9 @@ impl Rig {
     fn new() -> Rig {
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
         let fs = MemFs::new();
-        let table = TieredTable::new(space_config(demote, 0), demote, 2048).expect("ring");
-        let flush = TierFlush::new(fs.clone(), flush_config(), 0);
+        let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
+            .expect("ring");
+        let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
         Rig {
             table,
             fs,
@@ -102,40 +82,16 @@ impl Rig {
     }
 
     fn maintain(&mut self) {
-        loop {
-            let sealed = self.table.seal_slice();
-            let f = self.table.flush_slice(&mut self.flush).expect("flush slice");
-            let released = self.table.release_slice();
-            if sealed + released + f.appended_bytes + u64::from(f.gaps_crossed) == 0 {
-                break;
-            }
-        }
+        support::maintain(&mut self.table, &mut self.flush);
     }
 
     fn read_cold(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
-        let contains = |base: u64, flen: u64| addr >= base && addr + len as u64 <= base + flen;
-        let (base, path) = self
-            .flush
-            .sealed()
-            .iter()
-            .find(|m| contains(m.base.to_raw(), m.data_len))
-            .map(|m| (m.base.to_raw(), m.path.clone()))
-            .or_else(|| {
-                let (_, base, _, durable_len, path) = self.flush.active()?;
-                contains(base.to_raw(), durable_len).then(|| (base.to_raw(), path.to_path_buf()))
-            })?;
-        let image = self.fs.contents(&path)?;
-        let (first, count, skip) = tier_frame_span(addr - base, len);
-        let from = tier_frame_offset(first) as usize;
-        let to = from + count as usize * TIER_FRAME_BYTES;
-        let mut out = Vec::new();
-        tier_extract(image.get(from..to)?, skip, len, &mut out).ok()?;
-        Some(out)
+        support::read_cold(&self.flush, &self.fs, addr, len)
     }
 
     /// SET with the D4 marker discipline, D9 origin markers included.
     fn set(&mut self, key: &[u8], value: &[u8]) {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let displaced: Option<(LogicalAddr, usize, u32)> = match self.table.lookup(key, hash, &[]) {
             TieredLookup::Ram(addr) => {
                 let parts = self.table.record(addr);
@@ -187,7 +143,7 @@ impl Rig {
     }
 
     fn del(&mut self, key: &[u8]) {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let target = match self.table.lookup(key, hash, &[]) {
             TieredLookup::Ram(addr) => Some((addr, self.table.record(addr).encoded_len)),
             TieredLookup::Cold(addr) => {
@@ -270,7 +226,7 @@ impl Rig {
         let keys: Vec<(Vec<u8>, Expect)> =
             self.model.iter().map(|(k, e)| (k.clone(), e.clone())).collect();
         for (key, expect) in keys {
-            let hash = TieredTable::hash_key(&key);
+            let hash = KeyHasher::default().hash(&key);
             let mut exclude: Vec<LogicalAddr> = Vec::new();
             let (value, version) = loop {
                 match self.table.lookup(&key, hash, &exclude) {
@@ -317,7 +273,7 @@ impl Rig {
                     .model
                     .iter()
                     .filter_map(|(k, e)| {
-                        let hash = TieredTable::hash_key(k);
+                        let hash = KeyHasher::default().hash(k);
                         let addr = match self.table.lookup(k, hash, &[]) {
                             TieredLookup::Ram(addr) | TieredLookup::Cold(addr) => addr.to_raw(),
                             TieredLookup::Miss => return None,
@@ -337,7 +293,7 @@ fn keys_in_file(rig: &Rig, base: u64, len: u64) -> Vec<Vec<u8>> {
     rig.model
         .keys()
         .filter(|key| {
-            let hash = TieredTable::hash_key(key);
+            let hash = KeyHasher::default().hash(key);
             matches!(
                 rig.table.lookup(key, hash, &[]),
                 TieredLookup::Cold(addr) if addr.to_raw() >= base && addr.to_raw() < base + len
@@ -475,8 +431,9 @@ fn stalled_relocation_resumes_after_window_progress() {
     // A small budget so relocations hit the admission bound quickly.
     let demote = DemotionConfig::for_budget(192 << 10, PAGE);
     let fs = MemFs::new();
-    let table = TieredTable::new(space_config(demote, 0), demote, 2048).expect("ring");
-    let flush = TierFlush::new(fs.clone(), flush_config(), 0);
+    let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
+        .expect("ring");
+    let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
     let mut rig = Rig {
         table,
         fs,
@@ -508,7 +465,7 @@ fn stalled_relocation_resumes_after_window_progress() {
     let mut i = 0u64;
     loop {
         let key = format!("fill:{i:04}").into_bytes();
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         if rig.table.insert(&key, &[0x44; 96], hash).is_err() {
             break;
         }
@@ -569,7 +526,7 @@ fn oversized_record_scans_via_need() {
     // Kill enough small records around it to arm the trigger in the
     // big record's file, keeping the big record live.
     let files: Vec<_> = rig.table.live_set().files().to_vec();
-    let big_hash = TieredTable::hash_key(b"big:record");
+    let big_hash = KeyHasher::default().hash(b"big:record");
     let TieredLookup::Cold(big_addr) = rig.table.lookup(b"big:record", big_hash, &[]) else {
         panic!("the big record demoted cold");
     };
@@ -595,7 +552,7 @@ fn oversized_record_scans_via_need() {
     // verify content (the `need` path is exercised by any chunk smaller
     // than the record; compact_burst honors `need` by construction).
     let expect = rig.model.get(b"big:record".as_slice()).expect("live").clone();
-    let hash = TieredTable::hash_key(b"big:record");
+    let hash = KeyHasher::default().hash(b"big:record");
     match rig.table.lookup(b"big:record", hash, &[]) {
         TieredLookup::Ram(addr) => {
             assert_eq!(rig.table.record(addr).value, expect.value.as_slice());
@@ -678,19 +635,31 @@ fn d9_scenario(emit_origins: bool) -> (Rig, Vec<Vec<u8>>) {
         &[NS.0],
     )
     .expect("create ick");
+    // Refs first, then images (ADR-0174 R2), as the reactor writer walks.
     let mut cursor = 0u64;
     loop {
         let mut refs: Vec<(u64, u64)> = Vec::new();
-        let mut images: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         cursor = rig.table.ckpt_walk_slice(
             cursor,
             128,
             |hash, addr| refs.push((hash, addr.to_raw())),
-            |parts| images.push((parts.key.to_vec(), parts.value.to_vec())),
+            |_| {},
         );
         for (hash, addr) in refs {
             writer.append_ref(NS.0, w, hash, addr).expect("ref");
         }
+        if cursor == 0 {
+            break;
+        }
+    }
+    loop {
+        let mut images: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        cursor = rig.table.ckpt_walk_slice(
+            cursor,
+            128,
+            |_, _| {},
+            |parts| images.push((parts.key.to_vec(), parts.value.to_vec())),
+        );
         for (key, value) in images {
             writer
                 .append(&RecordView::StringPostImage { ns: NS, key: &key, value: &value })
@@ -714,6 +683,7 @@ fn d9_scenario(emit_origins: bool) -> (Rig, Vec<Vec<u8>>) {
             begin_lsn,
             segments: vec![begin_lsn.segment],
             tiers: vec![rig.table.tier_manifest(NS.0, &rig.flush)],
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect("swap");
@@ -758,80 +728,38 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
         fs.clone(),
         &tier,
         manifest.ckpt_id,
-        flush_config(),
+        flush_config(NS, FILE_CAPACITY),
         space_config(demote, 0),
         demote,
         2048,
+        KeyHasher::default(),
     )
     .expect("recovery");
-    let table = std::cell::RefCell::new(recovered.table);
+    let mut ks = keyspace_with(NS, recovered.table);
+    let mut spill = TestSpill::new(NS, recovered.replay);
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(manifest.ckpt_id));
-    read_ick_hybrid(
-        &fs,
-        &ick,
-        inf_log::ckpt::IckReaderConfig::default(),
-        |record| {
-            if let RecordView::StringPostImage { key, value, .. } = record {
-                table
-                    .borrow_mut()
-                    .apply_image(key, value, TieredTable::hash_key(key))
-                    .expect("fits");
-            }
-            Ok::<(), std::convert::Infallible>(())
-        },
-        |section| {
-            apply_ref_section(&mut table.borrow_mut(), &section, tier.flushed).expect("refs");
-            Ok(())
-        },
-        |section| {
-            apply_live_set_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-        |section| {
-            inf_store::apply_blob_ref_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-    )
-    .expect("hybrid load");
-    let mut table = table.into_inner();
-    // D4 replay with the D9 bounded displace register.
-    let mut rest: &[u8] = &tail;
-    let mut pending: Vec<u64> = Vec::new();
-    while !rest.is_empty() {
-        let (record, consumed) = decode_record(rest).expect("tail decodes");
-        match record {
-            RecordView::ColdDisplace { old_addr, .. } => {
-                pending.push(old_addr);
-                assert!(pending.len() <= 4, "register within the D9 bound");
-            }
-            RecordView::StringPostImage { key, value, .. } => {
-                let hash = TieredTable::hash_key(key);
-                for old in pending.drain(..) {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table.apply_image(key, value, hash).expect("fits");
-            }
-            RecordView::Delete { key, .. } => {
-                let hash = TieredTable::hash_key(key);
-                for old in pending.drain(..) {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table.apply_delete(key, hash);
-            }
-            other => panic!("modeled tail carries {other:?}"),
-        }
-        rest = &rest[consumed..];
-    }
+    load_checkpoint(&fs, &ick, &mut ks, &mut spill, NS, tier.flushed).expect("hybrid load");
+    replay_tail(&mut ks, &mut spill, &tail);
+    let (flush, _handles) = handed(finish_boot(&mut ks, &mut spill, NS));
+    let table = take_table(&mut ks, NS);
 
     if markers {
         assert_eq!(table.len(), model.len(), "exactly one slot per live key — no stale twins");
     } else {
+        // The pre-D9 hazard reconstructed: without origin markers every
+        // overwritten relocation leaves a stale cold twin slotted. Since
+        // M4.5-S37 (ADR-0093 D5) the shadow ticket set is rebuilt from
+        // the *finished* index at recovery-complete — this replay-only
+        // harness never calls `rebuild_shadow_tickets`, so the twins are
+        // plain slots here, counted in `len()` exactly as they were
+        // before S37 (the reconciler would kill them after a real boot).
         assert_eq!(
             table.len(),
             model.len() + overwritten.len(),
             "without origin markers every overwritten relocation leaves a stale twin \
              (the pre-D9 hazard, reconstructed)"
         );
+        assert_eq!(table.shadow_pending(), 0, "the replay harness does not rebuild tickets");
         return; // the duplicate world has nothing more to prove
     }
 
@@ -842,7 +770,7 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
     let mut rig = Rig {
         table,
         fs,
-        flush: recovered.flush,
+        flush,
         model,
         tail: Vec::new(),
         begun: false,
@@ -904,8 +832,9 @@ fn endurance_slice_disk_oscillates_and_statvfs_reclaims() {
     // A small budget so the 1500-key working set demotes cold and the
     // reclaim pipeline actually cycles.
     let demote = DemotionConfig::for_budget(256 << 10, PAGE);
-    let config = TierFlushConfig { shard_dir: shard.clone(), ..flush_config() };
-    let mut table = TieredTable::new(space_config(demote, 0), demote, 4096).expect("ring");
+    let config = TierFlushConfig { shard_dir: shard.clone(), ..flush_config(NS, FILE_CAPACITY) };
+    let mut table = TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default())
+        .expect("ring");
     table.set_compaction_config(CompactionConfig { dead_ratio_pct: 50, slice_bytes: 1 << 20 });
     let mut flush = TierFlush::new(StdSegmentFs, config, 0);
 
@@ -938,7 +867,7 @@ fn endurance_slice_disk_oscillates_and_statvfs_reclaims() {
         for i in 0..keys {
             let key = format!("e:{i:05}");
             let value = vec![(seeded(&mut seed) % 251) as u8; 96];
-            let hash = TieredTable::hash_key(key.as_bytes());
+            let hash = KeyHasher::default().hash(key.as_bytes());
             loop {
                 let done = match table.lookup(key.as_bytes(), hash, &[]) {
                     TieredLookup::Ram(addr) => {

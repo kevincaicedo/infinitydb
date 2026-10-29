@@ -333,9 +333,9 @@ fn server_version(bin: &str) -> String {
     )
 }
 
-fn leg_line(name: &str, r: &LoadReport) -> String {
+fn leg_line(name: &str, r: &LoadReport, histogram: &str) -> String {
     format!(
-        "| {name} | {:.0} | {} | {} | {} | {} | {} |",
+        "| {name} | {:.0} | {} | {} | {} | {} | {} | {histogram} |",
         r.ops_per_sec, r.p50_us, r.p99_us, r.p999_us, r.errors, r.nils
     )
 }
@@ -430,7 +430,8 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     // the divergence rule bind on the *growth* the workloads cause.
     #[allow(clippy::disallowed_methods)] // bench settle, not cell code
     std::thread::sleep(Duration::from_secs(1));
-    let rss_baseline = server.rss_bytes();
+    let rss_baseline =
+        server.proc_sample().map_err(|e| format!("mixed-audit: baseline VmRSS: {e}"))?.rss_bytes();
     let domains_baseline = sum_domains(&scrape_cells(port, cells)?);
 
     // The tiered dataset has to exist before anything can read it cold.
@@ -477,12 +478,14 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     let probe_delta = delta_pct(cache_solo.ops_per_sec, probe_report.ops_per_sec);
     let saturation = if probe_delta.abs() < 5.0 {
         format!(
-            "generator unsaturated at {CACHE_CONNS} conns (+50% conns moved ops/s {probe_delta:+.1}% — \
+            "generator unsaturated at {CACHE_CONNS} conns (+50% conns moved ops/s \
+            {probe_delta:+.1}% — \
              the solo number is server-set)"
         )
     } else {
         format!(
-            "GENERATOR-LIMITED at {CACHE_CONNS} conns (+50% conns moved ops/s {probe_delta:+.1}% — solo \
+            "GENERATOR-LIMITED at {CACHE_CONNS} conns (+50% conns moved ops/s {probe_delta:+.1}% — \
+            solo \
              absolutes understate the server; deltas remain valid at fixed generator config)"
         )
     };
@@ -492,10 +495,11 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     // RSS (100 ms) and the attribution domains (~1 s, all cells).
     println!("== mixed-audit: mixed run (cache + document, sampler on) ==");
     let stop = AtomicBool::new(false);
-    let rss_peak = AtomicU64::new(0);
+    // Failed reads fail the audit through `finish`, never folded into the
+    // peak or a divergence sample.
+    let rss_peak = crate::gaterun::PeakRssSampler::new(server.pid());
     let worst_div_milli = AtomicU64::new(0);
     let div_samples = AtomicU64::new(0);
-    let pid = server.pid();
     let tier_pre_mixed = scrape_cells(port, cells)?;
     let (cache_mixed, doc_mixed, tier_mixed) = std::thread::scope(|scope| {
         let sampler = scope.spawn(|| {
@@ -503,17 +507,14 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
                 for _ in 0..10 {
                     #[allow(clippy::disallowed_methods)] // bench sampler, not cell code
                     std::thread::sleep(Duration::from_millis(100));
-                    rss_peak.fetch_max(crate::gaterun::rss_bytes_of(pid), Ordering::Relaxed);
+                    rss_peak.record();
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
                 }
-                let rss_before = crate::gaterun::rss_bytes_of(pid);
+                let Ok(rss_before) = rss_peak.sample() else { continue };
                 let Ok(infos) = scrape_cells(port, cells) else { continue };
-                let rss_after = crate::gaterun::rss_bytes_of(pid);
-                if rss_before == 0 || rss_after == 0 {
-                    continue;
-                }
+                let Ok(rss_after) = rss_peak.sample() else { continue };
                 // Bracket the scrape with RSS reads: the domains are not
                 // an instant, so pair them with the midpoint.
                 let rss_now = (rss_before + rss_after) / 2;
@@ -585,7 +586,9 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
         .filter_map(|v| v.parse::<u64>().ok())
         .max()
         .unwrap_or(0);
-    let final_rss = server.rss_bytes();
+    let final_rss =
+        server.proc_sample().map_err(|e| format!("mixed-audit: final VmRSS: {e}"))?.rss_bytes();
+    let rss_peak = rss_peak.finish().map_err(|e| format!("mixed-audit: sampler {e}"))?;
     drop(server);
     drop(guard);
     if tier_tables != u64::from(cells) {
@@ -660,14 +663,16 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     push("");
     push("## Legs");
     push("");
-    push("| leg | ops/s | p50 µs | p99 µs | p99.9 µs | errors | nil replies |");
-    push("|---|---|---|---|---|---|---|");
-    push(&leg_line("cache solo", &cache_solo));
-    push(&leg_line("document solo", &doc_solo));
-    push(&leg_line("tiered solo", &tier_solo));
-    push(&leg_line("cache mixed", &cache_mixed));
-    push(&leg_line("document mixed", &doc_mixed));
-    push(&leg_line("tiered mixed", &tier_mixed));
+    push("| leg | ops/s | p50 µs | p99 µs | p99.9 µs | errors | nil replies | histogram |");
+    push("|---|---|---|---|---|---|---|---|");
+    let fine = "FineHistogram (256 sub-buckets/octave, <=0.391%)";
+    let coarse = "LogHistogram (32 sub-buckets/octave, <=3.125%)";
+    push(&leg_line("cache solo", &cache_solo, fine));
+    push(&leg_line("document solo", &doc_solo, fine));
+    push(&leg_line("tiered solo", &tier_solo, coarse));
+    push(&leg_line("cache mixed", &cache_mixed, fine));
+    push(&leg_line("document mixed", &doc_mixed, fine));
+    push(&leg_line("tiered mixed", &tier_mixed, coarse));
     push("");
     push(&format!(
         "Tiered fill: {} keys at {:.0} sets/s, {} error replies (typed durable admission \
@@ -723,8 +728,7 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     push(&format!(
         "- peak RSS {} B · final RSS {} B · standing tiered reservation {tier_reserved} B VA, \
          {tier_committed} B committed",
-        rss_peak.load(Ordering::Relaxed),
-        final_rss
+        rss_peak, final_rss
     ));
     push(&format!(
         "- page-cache disclosure: the tiered leg does real file I/O this run \

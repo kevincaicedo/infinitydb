@@ -1,0 +1,44 @@
+<!--
+title: Trust before the first tag
+dek: A safety review said no public tag. We agreed, and put the release behind the fixes.
+date: 2026-09-08
+topic: M4 · Release notes
+group: Release notes
+crumb: Release notes
+kicker: M4 · Trust and contracts
+excerpt: We moved the first public release back so every critical and high finding from the safety review could be closed red-first. Here is what changed, and why.
+-->
+<p class="lede">InfinityDB has never been tagged. The first public alpha was planned for the v0.4 train. On 7 September a security and safety review of the development tree returned a plain verdict: no public tag, binary, container image or non-isolated deployment at this revision. On 8 September we accepted it in full, including the no. The first public tag is now v0.4.6-alpha, cut at the end of a new phase of M4 that exists to close what the review found.</p>
+
+<h2 id="s1"><span class="num">1</span>Two critical findings: one in safe Rust, one in the default.</h2>
+<p>The review recorded two Critical, ten High and ten Medium confirmed findings, each backed by a bounded reproduction, a Miri run or a source invariant with an executable assertion. None described an exploited release: there was no release to exploit.</p>
+<p>The first Critical was in the executor. Its standard <code>Waker</code> was backed by state that is not thread-safe: <code>Rc</code>, <code>Cell</code>, <code>RefCell</code>. The standard library declares <code>Waker</code> as <code>Send</code> and <code>Sync</code>, so any future can clone its waker and hand it to another thread. The review did so in safe Rust, woke two clones on two threads, and Miri reported a data race. No wire path exported a waker yet. That limits exploitability; it does not make the API sound.</p>
+<p>The second Critical was the default. The server bound every IPv4 interface, with no bind option and no <code>AUTH</code>. Unauthenticated <code>SET</code>, <code>GET</code> and <code>FLUSHALL</code> all succeeded, and our own container example published the port on every host interface.</p>
+<aside class="law"><div class="law-label">Law derived · L9</div><p>A safe API is sound for every caller, not only today's. A comment that says "do not send this across threads" is not a contract the compiler can see.</p></aside>
+
+<h2 id="s2"><span class="num">2</span>Most of the Highs were limits the server only claimed.</h2>
+<p>Most Highs shared one shape: a setting accepted and not enforced. The normal-client output cap was parsed and never applied. The idle timeout was ignored, and <code>maxclients</code> was not an admission bound. The frame limit was checked per argument, not per frame. <code>DEBUG SLEEP</code> stalled a whole cell for as long as the client asked, and pub/sub did quadratic work on adversarial globs.</p>
+<p>One was a cross-protocol confusion: the inline parser kept a connection open after bytes that were plainly not RESP, where Redis closes it, so traffic meant for another protocol could reach the command executor. The fix is to fail closed. The remaining Highs sat in the unsafe leaves, where safe calls could reach invalid memory or skip a destructor, and in a release pipeline that ran mutable third-party actions with write permissions.</p>
+
+<h2 id="s3"><span class="num">3</span>Red first, with the review's own harness.</h2>
+<p>A finding closes only when two things are true. The review's own reproducer no longer reproduces against the repair. And an in-tree regression test is red on the reviewed revision and green on the fix, at the layer that owns the invariant, plus a client-level test when a client can reach the bug.</p>
+<p>The whole ladder stays green as well: <code>just check</code>, <code>cargo deny check</code>, the compatibility diff, the simulator, and Miri, Loom and fuzzing where they apply. Red first matters: a test written after a fix often tests the fix.</p>
+<aside class="law"><div class="law-label">Law derived · L10</div><p>Evidence that cannot go red is not evidence. A regression test proves something only after it has failed on the bug it guards.</p></aside>
+
+<h2 id="s4"><span class="num">4</span>Why a phase of its own, not a batch of fixes.</h2>
+<p>We considered fixing the findings inside the indexes phase and rejected it. A safe exposure boundary, and authentication pulled forward from M7, amend frozen things: the listener interface fixed at M0, and the recorded decisions that placed authentication at M7 and the first alpha in the v0.4 train. Frozen things change by decision first, then code.</p>
+<p>The waker repair changes the executor seam, so its decision record is amended before implementation too. The irony: M0 checked that the waker path contained no atomic instructions, and that property is exactly what made it unsound across threads. The repair may not be rejected for missing that old target. The target is revised first, and optimized after. Planned contracts that two architecture reviews found wrong as written, in replication, cross-cell locking and <code>WATCH</code>, needed the same home.</p>
+
+<h2 id="s5"><span class="num">5</span>What the trust phase owns, in order.</h2>
+<ul class="dots">
+<li>Soundness: a waker safe Rust cannot misuse, and the unsafe-leaf fixes, each with its Miri reproducer in CI.</li>
+<li>A safe exposure boundary: a loopback or protected default, a bind option, an explicit acknowledgement before exposing a node without a password, minimal <code>requirepass</code> and <code>AUTH</code>, HTTP fail-close, and no <code>DEBUG</code> in release builds.</li>
+<li>A bounded request envelope: output, partial input, frame size, admission, glob work and subscriptions, each with an enforced bound and a typed refusal.</li>
+<li>Boot validation before allocation, safe data-directory permissions, and a pinned release pipeline.</li>
+<li>Four contract decisions, modelled before code: acknowledgment classes and HA profiles, transaction publication and <code>WATCH</code> history, partition identity, and a retention registry.</li>
+<li>Capability truth: an inventory of every on-disk and wire format, and a generated support matrix that CI checks against the code.</li>
+</ul>
+<p>The release acts planned for v0.4.0 and v0.4.5 fold into this tag, and those version strings retire unused. The train also moves documents beyond RAM ahead of new data types, which makes an old roadmap sentence true: tiered namespaces hold string values today, not documents.</p>
+
+<h2 id="close">Until then.</h2>
+<p>Until the Critical and remotely reachable High findings close, the only defensible use of a development build is an isolated one: loopback only, a dedicated unprivileged user, a data directory created as <code>0700</code>. Those controls contain a build; they close nothing. The <a href="../docs/roadmap.html">roadmap</a> shows trust and safety as planned until every finding has gone red, then green. The first tag should be the first artifact strangers can run: safe to expose, honest about what it supports, correct in the contracts it has not built yet.</p>

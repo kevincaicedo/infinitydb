@@ -1,0 +1,99 @@
+<!--
+title: Configuration
+description: Run an InfinityDB node beyond a quick trial: Docker and the io_uring seccomp profile, systemd, the data directory, ports, server flags and upgrades.
+lede: How to run a node beyond a quick trial: Docker with the io_uring seccomp profile, a systemd unit, what the data directory holds, which ports exist, every server flag, and the upgrade rules for the on-disk format.
+chips: Available · alpha
+-->
+<aside class="callout"><div class="callout-label">Alpha exposure</div><p>There is no authentication and no TLS yet, and the server listens on every interface. <code>AUTH</code>, <code>requirepass</code> and bind-address control arrive later in M4, before the first public tag; TLS and multi-user ACLs with M7. Until then, run InfinityDB only on localhost or a trusted private network.</p></aside>
+
+<h2 id="docker">Docker</h2>
+<p>There are no published images until the first public tag. Build the image from the repository: the <code>Dockerfile</code> produces a static musl binary in a <code>scratch</code> image, with no shell and no libc.</p>
+<pre class="code" data-label="shell">$ docker build -t infinitydb:dev .
+$ docker run --rm -p 127.0.0.1:6379:6379 \
+    --security-opt seccomp=deploy/seccomp/infinitydb-seccomp.json \
+    -v infinitydb-data:/data \
+    infinitydb:dev --data-dir /data</pre>
+<p>The volume and <code>--data-dir /data</code> give the node durable storage; omit both to run memory-only, where nothing survives a restart. <code>-p 127.0.0.1:6379:6379</code> publishes the port on the host's loopback interface only.</p>
+<h3>The seccomp profile is required</h3>
+<p>Docker's default seccomp profile blocks the io_uring system calls (<code>io_uring_setup</code>, <code>io_uring_enter</code>, <code>io_uring_register</code>). Under it the node cannot create its reactor and exits at once with:</p>
+<pre class="code" data-label="stderr">infinityd: cell failed: Operation not permitted (os error 1)</pre>
+<ul class="dots">
+<li><strong>The bundled profile</strong>, recommended: <code>deploy/seccomp/infinitydb-seccomp.json</code> allows io_uring and still denies the container-escape calls such as <code>mount</code>, <code>pivot_root</code>, module loading, <code>kexec_load</code>, <code>bpf</code>, <code>ptrace</code> and <code>perf_event_open</code>.</li>
+<li><strong>A strict allow-list</strong>: take Docker's default profile and add the three io_uring calls to an allow entry.</li>
+<li><strong><code>seccomp=unconfined</code></strong>: development on a trusted machine only.</li>
+</ul>
+<p>A binary run directly on the host is not subject to Docker's profile. Kubernetes and CI runners differ; if a containerised node exits with the error above, seccomp is the cause.</p>
+
+<h2 id="systemd">systemd</h2>
+<p><code>infinityd</code> runs in the foreground, logs to stderr, and stops gracefully on <code>SIGTERM</code> or <code>SIGINT</code>, so <code>Type=simple</code> is correct.</p>
+<pre class="code" data-label="infinitydb.service">[Unit]
+Description=InfinityDB node
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/infinityd --port 6379 --data-dir /var/lib/infinitydb
+User=infinitydb
+Group=infinitydb
+StateDirectory=infinitydb
+# A refusal to boot or a failed fsync is evidence for an operator.
+# Do not turn it into a silent restart loop.
+Restart=no
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/infinitydb
+
+[Install]
+WantedBy=multi-user.target</pre>
+<ul class="dots">
+<li><strong><code>Restart=no</code> is a recommendation.</strong> The deliberate exits, a recovery refusal (exit 1), a durable fsync failure (exit 3) and a cell panic (exit 101), all mean the same thing: restarting will not help, and a loop hides the evidence. <a href="observability.html">Observability</a> explains each one.</li>
+<li><strong>A stop is graceful; a crash is still safe.</strong> On <code>SIGTERM</code> every cell stops admitting and drains, a durable cell publishes a stop checkpoint and its final sync, and the node exits 0: the next boot replays nothing. <code>--shutdown-timeout-ms</code> bounds the drain; when it expires the node exits 1 and names the phase. A second signal ends it at once.</li>
+</ul>
+
+<h2 id="data-dir">The data directory</h2>
+<p>With <code>--data-dir</code> set, the node owns this tree. Metadata files are checksummed and replaced atomically; log segments are checksummed frames, append-only.</p>
+<pre class="code" data-label="">&lt;data-dir&gt;/
+├─ LOCK                  # owner lock: a second process on the directory is refused
+├─ topology.toml         # the --cells count, stamped at first boot
+├─ io-properties.toml    # the device probe's result, bound to this device
+├─ key-hash.toml         # the key-hash secret: back it up with the directory
+├─ META                  # the namespace catalog
+├─ shard-0/              # one directory per cell, recovered independently
+│  ├─ MANIFEST           # the recovery unit: checkpoint, begin position, live segments
+│  ├─ log/seg-000000.ilog
+│  └─ ckpt/ckpt-000001.ick
+└─ shard-1/ …</pre>
+<ul class="dots">
+<li>Segments plus the checkpoint they truncate into are the complete durable state. Back up the whole directory; a consistent snapshot of it is a valid recovery unit.</li>
+<li>Do not edit, rename or delete files inside the tree. Recovery treats missing or altered named state as corruption and refuses to start, on purpose.</li>
+</ul>
+
+<h2 id="ports">Ports</h2>
+<p>Exactly one TCP port, <code>6379</code> by default. RESP2 and RESP3 (<code>HELLO 3</code>) are negotiated on it. There is no cluster bus, no gossip and no metrics port: observability rides <code>INFO</code> on the same connection.</p>
+
+<h2 id="flags">Server flags</h2>
+<p>Flags only, no config file. The ones an operator sets:</p>
+<table class="doc-table"><thead><tr><th>Flag</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--port</code></td><td><code>6379</code></td><td>TCP port to listen on.</td></tr>
+<tr><td><code>--cells</code></td><td><code>4</code></td><td>Shard cells: one thread and one <code>shard-k/</code> directory each. Fixed for the life of a data directory.</td></tr>
+<tr><td><code>--data-dir</code></td><td>unset</td><td>Durable-plane root. Without it the node is memory-only and the durable machinery is absent from the hot path.</td></tr>
+<tr><td><code>--conn-default-ns</code></td><td>unset</td><td>The namespace a new connection starts in, instead of database 0.</td></tr>
+<tr><td><code>--ckpt-interval-bytes</code></td><td><code>268435456</code></td><td>Bytes appended per cell before a checkpoint. <code>0</code> means manual only.</td></tr>
+<tr><td><code>--segment-bytes</code></td><td><code>268435456</code></td><td>Log segment size.</td></tr>
+<tr><td><code>--device-probe</code></td><td><code>auto</code></td><td>At the first boot of a data directory, measure the device and record the write model in <code>io-properties.toml</code>. <code>off</code> skips it and uses conservative write settings.</td></tr>
+<tr><td><code>--shutdown-timeout-ms</code></td><td><code>10000</code></td><td>Bound on the graceful stop's drain.</td></tr>
+<tr><td><code>--buffers</code>, <code>--buf-size</code></td><td><code>4096</code>, <code>4096</code></td><td>The io_uring provided-buffer pool: count and bytes per buffer.</td></tr>
+<tr><td><code>--pin-start</code>, <code>--pin-stride</code></td><td>unset, <code>2</code></td><td>Pin cell <em>i</em> to core <code>pin-start + i × pin-stride</code>. Unset means no pinning.</td></tr>
+<tr><td><code>--version</code></td><td></td><td>Print version, git SHA and build target, then exit.</td></tr>
+</tbody></table>
+<p>The remaining flags in <code>infinityd --help</code> tune the write path, the idle loop and the fabric, or select an experiment arm. Their defaults are the ones to run with. Runtime settings use the Redis <code>CONFIG</code> surface (<code>maxmemory</code>, <code>maxmemory-policy</code>); per-namespace settings are given to <code>INF.NS</code> (see <a href="memory.html">Memory &amp; eviction</a>).</p>
+
+<h2 id="upgrades">Upgrades</h2>
+<ul class="dots">
+<li><strong>Reading is forever.</strong> Every later build reads every earlier log frame format.</li>
+<li><strong>No downgrade after the first write.</strong> Once a newer binary has appended to a log, rolling the binary back means restoring the data directory from a backup taken before the upgrade.</li>
+<li><strong>Format changes are recorded design decisions.</strong> Each lands with fuzzing of both formats, a crash-matrix run and a fresh simulation sweep.</li>
+</ul>

@@ -1,3 +1,11 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M2-S13 replay-throughput rehearsal (dev tier): time `open_cell_log` —
 //! the real boot path: manifest → `.ick` load → tail replay → S14 slack
 //! scans → rotor reopen — over a synthetic durable-cell image on the real
@@ -24,6 +32,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use inf_foundation::KeyHasher;
 use inf_foundation::time::Nanos;
 use inf_log::ckpt::{SyncIckWriter, ick_file_name};
 use inf_log::fs::StdSegmentFs;
@@ -102,11 +111,15 @@ fn value_of(i: u64, buf: &mut [u8; VALUE_LEN]) {
 fn durable_config(root: &Path, segment_bytes: u32) -> DurableConfig {
     DurableConfig {
         data_dir: root.to_path_buf(),
-        staging: StagingConfig { capacity_bytes: 128 << 10 },
-        segment: SegmentConfig { segment_bytes, seal_after_ms: None },
+        staging: StagingConfig::with_capacity(128 << 10),
+        segment: SegmentConfig { segment_bytes, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
-        sync_pipeline: 1,
+        flush_bound: 1,
+        fua_p50_us_probed: 0,
+        device: Default::default(),
+        fill: Default::default(),
+        group: Default::default(),
     }
 }
 
@@ -207,7 +220,13 @@ fn build_image(root: &Path, cfg: &DurableConfig, records: u64, ckpt_at: Option<u
         write_manifest(
             &fs,
             &shard,
-            &Manifest { ckpt_id: 1, begin_lsn: begin, segments, tiers: Vec::new() },
+            &Manifest {
+                ckpt_id: 1,
+                begin_lsn: begin,
+                segments,
+                tiers: Vec::new(),
+                key_hash_id: KeyHasher::default().identity(),
+            },
         )
         .expect("manifest");
         // The truncation slice already ran: covered prefix segments gone.
@@ -251,13 +270,12 @@ fn recover_once(cfg: &DurableConfig) -> RepResult {
     let anchor = WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 };
     let now = Nanos::from_millis(1);
     // M2.5-S08 A/B: INF_BENCH_READAHEAD=0 is the lever-off arm (bare
-    // StdSegmentFs, serial read∘apply); default rides ReadAheadFs like
-    // infinityd does.
-    let (millis, stats) = if env_u64("INF_BENCH_READAHEAD", 1) != 0 {
-        timed_recover(inf_server::ReadAheadFs::new(StdSegmentFs, true), &mut ks, cfg, anchor, now)
-    } else {
-        timed_recover(StdSegmentFs, &mut ks, cfg, anchor, now)
-    };
+    // reads, serial read∘apply); default rides the boot-read prefetch
+    // like a single-cell infinityd does (`RecoverConfig::boot_prefetch`,
+    // ADR-0109 — the wrapper is Recovery-private now).
+    let mut cfg = cfg.clone();
+    cfg.recover.boot_prefetch = env_u64("INF_BENCH_READAHEAD", 1) != 0;
+    let (millis, stats) = timed_recover(StdSegmentFs, &mut ks, &cfg, anchor, now);
     let digest = ks.state_digest(now);
     RepResult {
         millis,

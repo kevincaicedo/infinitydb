@@ -14,12 +14,13 @@ pub struct SlotRouter {
 }
 
 impl SlotRouter {
-    /// A router over `cells` shard cells.
+    /// A router over `cells` cells.
     ///
     /// # Panics
     /// Panics if `cells` is 0 or exceeds the slot count.
     pub fn new_contiguous(cells: u16) -> SlotRouter {
-        assert!(cells > 0 && cells <= SLOT_COUNT, "cell count must be in 1..=16384");
+        assert!(cells > 0, "cell count must be at least 1");
+        assert!(cells <= SLOT_COUNT, "cell count must be at most 16384");
         SlotRouter { cells }
     }
 

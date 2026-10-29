@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M2-S08 ACs (ADR-0015 D3): the node META atomic-swap protocol round-trips
 //! over both fs tiers, rewrites replace cleanly, crash debris (`META.new`)
 //! never breaks a subsequent swap, corruption is a named `InvalidData`

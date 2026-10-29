@@ -38,8 +38,8 @@ use inf_log::{
 };
 use inf_runtime::{BackendDriver, CellExecutor, ColdReads, RawFd, TierFileId, TokenClass, Wait};
 use inf_store::{
-    AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig, TieredLookup,
-    TieredTable,
+    AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId, StoreConfig,
+    TieredLookup, TieredTable,
 };
 
 use crate::net::{CellNet, Plant, SimDriver};
@@ -100,6 +100,8 @@ pub struct ColdStormReport {
     pub unlink_deferrals: u64,
     pub unlinks: u64,
     pub trace_hash: u64,
+    pub state_hash: u64,
+    state: crate::state::StateHash,
 }
 
 impl ColdStormReport {
@@ -151,6 +153,10 @@ struct FleetFile {
     len: u64,
     frames: u64,
     fd: RawFd,
+    /// The open handle behind `fd` — held until the unlink, as the
+    /// plane's file table holds a sealed file (the sim disk closes an fd
+    /// whose handle drops and answers `EBADF`; batch 20, F-L01-02).
+    handle: Option<TierWriter<SimDisk>>,
     path: PathBuf,
     /// Keys whose current record lives in this file (repoints remove).
     live: Vec<Vec<u8>>,
@@ -247,7 +253,7 @@ fn plan_read(world: &Rc<RefCell<World>>, key: &[u8], hash: u64, exclude: &[Logic
                 now_us,
             ) {
                 Ok(wait) => Plan::Fetch { addr, wait, window_frames, skip },
-                Err(_) => Plan::Dry,
+                Err(refused) => refused_plan(refused),
             }
         }
     }
@@ -281,7 +287,20 @@ fn plan_chunk(world: &Rc<RefCell<World>>, addr: u64, done: usize, remaining: usi
             window_frames,
             skip,
         },
-        Err(_) => Plan::Dry,
+        Err(refused) => refused_plan(refused),
+    }
+}
+
+/// A refused enqueue's plan: a full queue is backpressure (retry next
+/// round); an unrepresentable read is permanent, and no generator here
+/// plans a position above 2^49, so it is a corruption the storm reports
+/// (ADR-0167 D3).
+fn refused_plan(refused: inf_runtime::ColdRefused) -> Plan {
+    match refused {
+        inf_runtime::ColdRefused::QueueFull => Plan::Dry,
+        inf_runtime::ColdRefused::Unrepresentable(read) => {
+            Plan::Corrupt(format!("enqueue refused an unrepresentable read: {read:?}"))
+        }
     }
 }
 
@@ -289,7 +308,7 @@ fn plan_chunk(world: &Rc<RefCell<World>>, addr: u64, done: usize, remaining: usi
 /// resume, bounded chunked staging for oversized records, and bounded
 /// restarts when relocation moves the record mid-read.
 async fn cold_get(world: Rc<RefCell<World>>, key: Vec<u8>, cancel_roll: u64) -> GetAnswer {
-    let hash = TieredTable::hash_key(&key);
+    let hash = world.borrow().ks.hasher().hash(&key);
     let from_seq = world.borrow().model.get(&key).map_or(0, |h| h.seq);
     let mut answer = GetAnswer {
         key: key.clone(),
@@ -531,7 +550,7 @@ fn mutate_round(world: &mut World, rng: &mut SplitMix64, ops: &mut u64, budget: 
         *ops += 1;
         let key = format!("k:{:04}", rng.next_u64() % KEYS).into_bytes();
         let roll = rng.next_u64() % 100;
-        let hash = TieredTable::hash_key(&key);
+        let hash = world.ks.hasher().hash(&key);
         let current = world.values.get(&key).cloned();
         match (roll, current) {
             // Delete: index + accounting only, even when cold.
@@ -688,7 +707,7 @@ fn flush_all_sealed(world: &mut World) {
             w.append(LogicalAddr::from_raw(addr).expect("fits"), &bytes).expect("append");
             // Only records still pointed at by the index are live here;
             // dead copies flush as raw bytes (the contiguous-range rule).
-            let hash = TieredTable::hash_key(&key);
+            let hash = world.ks.hasher().hash(&key);
             if lookup_addr(world, &key, hash).map(LogicalAddr::to_raw) == Some(addr) {
                 live.push(key);
             }
@@ -713,6 +732,7 @@ fn seal_file(world: &mut World, writer: Option<(TierWriter<SimDisk>, Vec<Vec<u8>
         frames: w.data_len().div_ceil(TIER_FRAME_DATA as u64),
         fd: w.raw_fd().expect("sim files carry fake fds"),
         path: w.path().to_owned(),
+        handle: Some(w),
         live,
         unlinked: false,
     });
@@ -738,7 +758,7 @@ fn relocation_wave(world: &mut World) {
     };
     let keys = world.files[index].live.clone();
     for key in keys {
-        let hash = TieredTable::hash_key(&key);
+        let hash = world.ks.hasher().hash(&key);
         let Some(value) = world.values.get(&key).cloned() else { continue };
         // Content-preserving relocation, modeled as an update (the real
         // S15 copy-forward preserves versions; this harness's oracle
@@ -766,6 +786,7 @@ fn unlink_drained(world: &mut World) {
         }
         world.disk.remove_file(&path).expect("sim unlink");
         world.files[i].unlinked = true;
+        world.files[i].handle = None; // close after the pins drained
         unlinks += 1;
     }
     world.report.unlink_deferrals += deferrals;
@@ -798,7 +819,10 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
         slice_bytes: 16 << 10,
     };
     let ring = demote.ring_reserve_bytes().expect("valid budget");
-    let mut ks = Keyspace::new(StoreConfig::default());
+    let mut ks = Keyspace::new(StoreConfig {
+        hasher: KeyHasher::from_seed(scenario.seed),
+        ..Default::default()
+    });
     assert!(
         ks.materialize_tiered(
             NS,
@@ -843,7 +867,12 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
     while ops < scenario.ops || ex.live_tasks() > 0 {
         round += 1;
         assert!(round < scenario.ops.max(1) * 4, "storm rounds exploded (liveness)");
-        world.borrow_mut().now_us = round * ROUND_US;
+        {
+            let mut world = world.borrow_mut();
+            world.now_us = round * ROUND_US;
+            let now = world.now_us;
+            world.report.state.number(b"round-time-us", now);
+        }
         // Foreground: new GETs (cold-heavy once files exist).
         if ops < scenario.ops {
             for _ in 0..GETS_PER_ROUND {
@@ -937,6 +966,10 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
         world.report.violations.push("no unlink deferral observed under flood".into());
     }
     let mut report = std::mem::take(&mut world.report);
+    report.state.number(b"finish-time-us", world.now_us);
+    report.state.keyspace(&world.ks, inf_foundation::time::Nanos(world.now_us * 1000));
+    report.state.disk(&world.disk);
+    report.state_hash = report.state.value();
     report.trace_hash = hash64(
         &counters.issued.to_le_bytes(),
         report.trace_hash ^ counters.completed ^ counters.unclaimed,

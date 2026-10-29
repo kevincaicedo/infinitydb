@@ -29,6 +29,8 @@ use inf_log::{
 use inf_server::{SimDisk, load_catalog_from};
 use inf_store::{CheckpointImage, Keyspace, NsId, StoreConfig, WallAnchor};
 
+use crate::harness::node_hasher;
+
 use crate::durable::{DurableScenario, Node, Pending, Writer, bulk, encode};
 
 // ---- the fuzz-derived document corpus (M3-S24) ------------------------------
@@ -324,7 +326,10 @@ fn replay_shadow(
     if let Some(manifest) = &manifest {
         let ick = shard.join("ckpt").join(ick_file_name(manifest.ckpt_id));
         read_ick(disk, &ick, IckReaderConfig::default(), |record| {
-            shadow.apply_record(&record, now, anchor).map(|_| ()).map_err(|e| format!("{e:?}"))
+            shadow
+                .apply_record(&record, now, anchor, &mut inf_store::NoSpill)
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
         })
         .map_err(|e| format!("cell {cell}: checkpoint: {e:?}"))?;
     }
@@ -353,7 +358,10 @@ fn replay_shadow(
                 return Ok(());
             }
         }
-        shadow.apply_record(record, now, anchor).map(|_| ()).map_err(|e| format!("apply: {e:?}"))
+        shadow
+            .apply_record(record, now, anchor, &mut inf_store::NoSpill)
+            .map(|_| ())
+            .map_err(|e| format!("apply: {e:?}"))
     })
     .map_err(|e| format!("cell {cell}: {e}"))?;
     Ok(())
@@ -493,7 +501,8 @@ pub(crate) fn equivalence_check(
     };
     let mut canary = scenario.replay_canary;
     for cell in 0..scenario.cells {
-        let mut shadow = Keyspace::new(StoreConfig::default());
+        let mut shadow =
+            Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
         if let Err(err) = shadow.seed_catalog(&catalog) {
             violations.push(format!(
                 "REPLAY EQUIVALENCE VIOLATION seed {:#x} [{label}]: seed_catalog: {err:?}",

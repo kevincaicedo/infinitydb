@@ -23,6 +23,19 @@
 //! the magic fail the CRC or the LSN. Only a frame written *for exactly
 //! this position* classifies as data.
 //!
+//! **Foreign-segment frames** (M4.5-S39b, ADR-0090 D2 as amended): a frame
+//! that decodes in full and sits at its stored *offset* but is stamped
+//! for *another segment id* is the residue a recycled file carries from
+//! its previous life. It is counted apart (`RegionEvidence::foreign_
+//! frames`, `max_foreign_epoch`), contributes no attestation, epoch or
+//! hole evidence (it attests another life's coverage in another file),
+//! and is skipped by its padded extent **only because its CRC passed**:
+//! a stale header over a body this life partly overwrote fails the CRC
+//! and is scanned byte-wise, so a same-segment validating frame can never
+//! hide behind a foreign length field. The recovery policy reads "no
+//! self-located frame, ≥ 1 foreign frame" as proven residue — never a
+//! hole, never torn.
+//!
 //! This module owns the facts ([`scan_region`], [`RegionScan`],
 //! [`scan_region_evidence`], [`RegionEvidence`]) and the fatal type; the
 //! recovery *policy* — which segments to scan, the attestation rule,
@@ -47,7 +60,7 @@ use std::path::Path;
 
 use crate::frame::{FrameStamp, decode_frame, frame_shape};
 use crate::fs::{SegmentFile, SegmentFs};
-use crate::lsn::{Lsn, SegmentId};
+use crate::lsn::{Lsn, SegmentId, check_segment_len};
 use crate::reader::ReaderConfig;
 use crate::segment::segment_file_name;
 
@@ -82,6 +95,19 @@ pub struct RegionEvidence {
     pub any_v1: bool,
     /// Lowest nonzero offset seen (garbage/remnant indicator).
     pub first_nonzero: Option<u32>,
+    /// Decoded, offset-located frames stamped for **another segment id**
+    /// (recycled-life residue, ADR-0090 D2 as amended). Never evidence
+    /// of this life; counted so the policy can prove a slack is residue.
+    pub foreign_frames: u64,
+    /// Highest epoch among foreign-segment frames — folded into the
+    /// resume-epoch derivation so "tops every epoch observed this boot"
+    /// (ADR-0031 D5) is literal.
+    pub max_foreign_epoch: u32,
+    /// Bytes the scan read from the file (M4.5-S39d): the audit's device
+    /// cost, so a boot's recovery time decomposes into phases with their
+    /// bytes beside them. Zero-run skipping consumes bytes it still had
+    /// to read, so this is the read extent, never the decoded one.
+    pub bytes_read: u64,
 }
 
 impl RegionEvidence {
@@ -105,6 +131,20 @@ impl RegionEvidence {
         self.max_covered_lsn = self.max_covered_lsn.max(other.max_covered_lsn);
         self.max_epoch = self.max_epoch.max(other.max_epoch);
         self.any_v1 |= other.any_v1;
+        self.foreign_frames += other.foreign_frames;
+        self.max_foreign_epoch = self.max_foreign_epoch.max(other.max_foreign_epoch);
+        self.bytes_read += other.bytes_read;
+    }
+
+    /// Proven recycled-life residue (ADR-0090 D2 as amended): no frame
+    /// of this segment validates in the region, at least one foreign-
+    /// segment frame does. Garbage beside it does not change the
+    /// verdict (a torn tail over residue is indistinguishable from
+    /// residue by construction, and nothing acked can sit past a data
+    /// end).
+    #[must_use]
+    pub fn is_recycled_residue(&self) -> bool {
+        self.valid_frames == 0 && self.foreign_frames > 0
     }
 }
 
@@ -129,7 +169,7 @@ impl fmt::Display for LogCorruption {
         write!(
             f,
             "log corruption in {} at {:#x}: {}; a validating frame follows at {} offset {:#x} — \
-             interior data would be lost by truncation, refusing to start (§8.4)",
+             interior data would be lost by truncation, refusing to start",
             self.segment, self.offset, self.detail, self.evidence_segment, self.evidence_offset
         )
     }
@@ -147,7 +187,7 @@ impl std::error::Error for LogCorruption {}
 /// speed (holes / unwritten extents never touch the device).
 ///
 /// # Errors
-/// Open/read failures on the segment file.
+/// Open/read failures or a segment end outside the u32 address range.
 pub fn scan_region<F: SegmentFs>(
     fs: &F,
     log_dir: &Path,
@@ -164,7 +204,7 @@ pub fn scan_region<F: SegmentFs>(
 /// bounded-memory contract as `scan_region`.
 ///
 /// # Errors
-/// Open/read failures on the segment file.
+/// Open/read failures or a segment end outside the u32 address range.
 pub fn scan_region_evidence<F: SegmentFs>(
     fs: &F,
     log_dir: &Path,
@@ -183,6 +223,7 @@ fn scanner<F: SegmentFs>(
     cfg: ReaderConfig,
 ) -> io::Result<RegionScanner<F::File>> {
     let file = fs.open_read(&log_dir.join(segment_file_name(segment)))?;
+    check_segment_len(segment, file.file_size()?)?;
     Ok(RegionScanner {
         file,
         segment,
@@ -213,11 +254,24 @@ fn zero_run(w: &[u8]) -> usize {
     i
 }
 
-/// A validating frame the scanner probed at the current offset: its total
-/// length (to skip) and its stamp facts.
+/// Where a decoded frame says it belongs relative to where it was found.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Placement {
+    /// Stored LSN == physical position: a validating frame of this file.
+    SelfLocated,
+    /// Stored offset == physical offset, stored segment ≠ this file:
+    /// recycled-life residue (ADR-0090 D2 as amended).
+    ForeignSegment,
+}
+
+/// A decoded frame the scanner probed at the current offset: its
+/// on-device length (to skip — the aligned extent for v3, ADR-0086 D3),
+/// its stamp facts, and its placement. A frame at a shifted offset is
+/// never probed as a frame at all (it is garbage at this position).
 struct ProbedFrame {
     frame_len: usize,
     stamp: Option<FrameStamp>,
+    placement: Placement,
 }
 
 struct RegionScanner<File: SegmentFile> {
@@ -241,6 +295,13 @@ impl<File: SegmentFile> RegionScanner<File> {
     /// (interior sub-frames of a validated frame are body payload, not
     /// writer output — they carry no independent evidence).
     fn run(&mut self, stop_at_first_valid: bool) -> io::Result<RegionEvidence> {
+        let from = self.file_pos;
+        let mut evidence = self.walk(stop_at_first_valid)?;
+        evidence.bytes_read = self.file_pos - from;
+        Ok(evidence)
+    }
+
+    fn walk(&mut self, stop_at_first_valid: bool) -> io::Result<RegionEvidence> {
         let mut evidence = RegionEvidence::default();
         loop {
             if self.window().is_empty() {
@@ -256,7 +317,7 @@ impl<File: SegmentFile> RegionScanner<File> {
                 // case is hundreds of MiB of preallocated zeros, and a
                 // byte-wise scan was the measured floor of the every-boot
                 // audit (S13 rehearsal `slack-floor` row, ADR-0018).
-                self.consume(zero_run(window));
+                self.consume(zero_run(window))?;
                 continue;
             }
             evidence.first_nonzero.get_or_insert(self.offset);
@@ -266,33 +327,50 @@ impl<File: SegmentFile> RegionScanner<File> {
                     .iter()
                     .position(|&b| b == 0 || is_magic_first_byte(b))
                     .unwrap_or(window.len());
-                self.consume(run);
+                self.consume(run)?;
                 continue;
             }
             if let Some(probed) = self.try_frame()? {
-                evidence.valid_frames += 1;
-                evidence.first_valid.get_or_insert(self.offset);
-                match probed.stamp {
-                    Some(stamp) => {
-                        evidence.max_covered_lsn = evidence.max_covered_lsn.max(stamp.covered_lsn);
-                        evidence.max_epoch = evidence.max_epoch.max(stamp.epoch);
+                match probed.placement {
+                    Placement::SelfLocated => {
+                        evidence.valid_frames += 1;
+                        evidence.first_valid.get_or_insert(self.offset);
+                        match probed.stamp {
+                            Some(stamp) => {
+                                evidence.max_covered_lsn =
+                                    evidence.max_covered_lsn.max(stamp.covered_lsn);
+                                evidence.max_epoch = evidence.max_epoch.max(stamp.epoch);
+                            }
+                            None => evidence.any_v1 = true,
+                        }
+                        if stop_at_first_valid {
+                            return Ok(evidence);
+                        }
                     }
-                    None => evidence.any_v1 = true,
+                    Placement::ForeignSegment => {
+                        // Residue of another life of this file: no
+                        // attestation, no hole, no v1 conservatism — only
+                        // the count and the epoch bound (module docs).
+                        evidence.foreign_frames += 1;
+                        if let Some(stamp) = probed.stamp {
+                            evidence.max_foreign_epoch =
+                                evidence.max_foreign_epoch.max(stamp.epoch);
+                        }
+                    }
                 }
-                if stop_at_first_valid {
-                    return Ok(evidence);
-                }
-                self.consume(probed.frame_len);
+                self.consume(probed.frame_len)?;
                 continue;
             }
-            self.consume(1);
+            self.consume(1)?;
         }
         Ok(evidence)
     }
 
-    /// Whether a validating, self-located frame (either format) starts at
-    /// the current offset. `None` is never terminal — the caller keeps
-    /// scanning.
+    /// Whether a fully decoding frame (either format) starts at the
+    /// current offset **at its stored offset** — self-located, or stamped
+    /// for another segment id (foreign). A frame at a shifted offset is
+    /// `None` like any garbage. `None` is never terminal — the caller
+    /// keeps scanning.
     fn try_frame(&mut self) -> io::Result<Option<ProbedFrame>> {
         const PROBE_HEADER: usize = crate::frame::FRAME_HEADER_LEN;
         if self.window().len() < PROBE_HEADER && !self.hit_eof {
@@ -324,9 +402,35 @@ impl<File: SegmentFile> RegionScanner<File> {
         }
         match decode_frame(self.window(), self.cfg.max_frame_len) {
             Ok((frame, _)) => {
-                let expected = Lsn::new(self.segment, self.offset + frame.header_len() as u32);
-                Ok((frame.first_lsn() == expected)
-                    .then_some(ProbedFrame { frame_len, stamp: frame.stamp() }))
+                let expected_offset = self
+                    .offset
+                    .checked_add(frame.header_len() as u32)
+                    .ok_or_else(segment_offset_overflow)?;
+                let expected = Lsn::new(self.segment, expected_offset);
+                let stored = frame.first_lsn();
+                let placement = if stored == expected {
+                    Placement::SelfLocated
+                } else if stored.offset == expected.offset {
+                    // Planted-bug canary (ADR-0090 D5): the segment-blind
+                    // scanner takes residue for this life's frames.
+                    #[cfg(inf_canary_foreign_segment)]
+                    {
+                        Placement::SelfLocated
+                    }
+                    #[cfg(not(inf_canary_foreign_segment))]
+                    {
+                        Placement::ForeignSegment
+                    }
+                } else {
+                    return Ok(None);
+                };
+                // Skip the padded extent: the padding is the frame's own
+                // write, never independent evidence. A window shorter
+                // than the padding is consumed like any other skip. The
+                // skip is sound only because `decode_frame` passed the
+                // CRC above (module docs) — never skip on a header alone.
+                let skip = (frame.padded_len() as usize).min(self.window().len());
+                Ok(Some(ProbedFrame { frame_len: skip, stamp: frame.stamp(), placement }))
             }
             Err(_) => Ok(None),
         }
@@ -336,9 +440,12 @@ impl<File: SegmentFile> RegionScanner<File> {
         &self.buf[self.start..self.valid]
     }
 
-    fn consume(&mut self, n: usize) {
+    fn consume(&mut self, n: usize) -> io::Result<()> {
+        let advance = u32::try_from(n).map_err(|_| segment_offset_overflow())?;
+        let offset = self.offset.checked_add(advance).ok_or_else(segment_offset_overflow)?;
         self.start += n;
-        self.offset += u32::try_from(n).expect("window fits u32");
+        self.offset = offset;
+        Ok(())
     }
 
     /// Ensure the window holds `needed` bytes from the current offset (or
@@ -367,4 +474,8 @@ impl<File: SegmentFile> RegionScanner<File> {
 /// Both frame magics start with `b'I'` — the garbage-skip probe byte.
 fn is_magic_first_byte(b: u8) -> bool {
     b == b'I'
+}
+
+fn segment_offset_overflow() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "tail scan exceeds u32 segment address limit")
 }
