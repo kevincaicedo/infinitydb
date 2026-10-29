@@ -1567,13 +1567,13 @@ mod tests {
         selection: Selection,
         bytes: &[u8],
     ) -> Result<(), TierFlushError> {
-        match flush.plan_round(selection) {
+        match flush.plan_round(Some(selection)) {
             Planned::Round(plan) => {
                 flush.stage_round(plan, bytes);
                 Ok(())
             }
             Planned::Refused(err) => Err(err),
-            Planned::Nothing => panic!("the pipeline never answers Nothing"),
+            Planned::Nothing => panic!("a selection plans a round or a refusal"),
         }
     }
 
@@ -1854,9 +1854,10 @@ mod tests {
         let before = (flush.append_cursor(), flush.active().map(|a| a.0), flush.next_file_id());
         let inodes = disk.inode_count();
         let planted = (i64::MAX as u64) + 1;
-        let planned = flush.plan_round_with(span(600, 5000, None), |index, writes, position| {
-            if index + 1 == writes { planted } else { position }
-        });
+        let planned =
+            flush.plan_round_with(Some(span(600, 5000, None)), |index, writes, position| {
+                if index + 1 == writes { planted } else { position }
+            });
         let Planned::Refused(err) = planned else { panic!("the plan was not refused") };
         assert!(
             matches!(
@@ -1920,7 +1921,14 @@ mod tests {
         }
         let gap_end = incoming + a + 4096;
         let selection = match (a, gap) {
-            (0, false) => return, // nothing at the cursor: no plan
+            (0, false) => {
+                // Nothing at the cursor: the plan answers so and changes
+                // nothing.
+                assert!(matches!(flush.plan_round(None), Planned::Nothing));
+                assert!(!flush.round_active());
+                assert_eq!(flush.pool_outstanding(), 0);
+                return;
+            }
             (0, true) => Selection::Gap { end: gap_end },
             (_, gap) => span(incoming, a as usize, gap.then_some(gap_end)),
         };
@@ -2008,10 +2016,10 @@ mod tests {
     fn a_plan_while_a_reservation_is_held_stops_the_cell() {
         let disk = SimDisk::new();
         let mut flush = sim_pipeline(&disk, 1 << 20);
-        let Planned::Round(_held) = flush.plan_round(span(0, 100, None)) else {
+        let Planned::Round(_held) = flush.plan_round(Some(span(0, 100, None))) else {
             panic!("the first plan is admitted")
         };
-        let _ = flush.plan_round(span(0, 100, None));
+        let _ = flush.plan_round(Some(span(0, 100, None)));
     }
 
     /// A reservation with a window out stops the cell: the windows a round
@@ -2036,7 +2044,7 @@ mod tests {
         let mut flush = sim_reactor(&disk, 1 << 30, 1 << 20, 0);
         let inodes = disk.inode_count();
         let over = 3 * crate::tier::TIER_BATCH_PAYLOAD_BYTES as usize;
-        let Planned::Refused(err) = flush.plan_round(span(0, over, None)) else {
+        let Planned::Refused(err) = flush.plan_round(Some(span(0, over, None))) else {
             panic!("a span above the pool is refused")
         };
         assert!(matches!(err, TierFlushError::SpanOverPool { .. }), "{err}");

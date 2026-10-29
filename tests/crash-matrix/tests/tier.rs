@@ -386,13 +386,13 @@ fn stage_span(
     gap_end: Option<u64>,
 ) -> Result<(), inf_log::TierFlushError> {
     let len = std::num::NonZeroU64::new(bytes.len() as u64).expect("a span holds a byte");
-    match flush.plan_round(inf_log::flush::Selection::Span { addr, len, gap_end }) {
+    match flush.plan_round(Some(inf_log::flush::Selection::Span { addr, len, gap_end })) {
         inf_log::flush::Planned::Round(plan) => {
             flush.stage_round(plan, bytes);
             Ok(())
         }
         inf_log::flush::Planned::Refused(err) => Err(err),
-        inf_log::flush::Planned::Nothing => panic!("the pipeline never answers Nothing"),
+        inf_log::flush::Planned::Nothing => panic!("a selection plans a round or a refusal"),
     }
 }
 

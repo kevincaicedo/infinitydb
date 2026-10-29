@@ -412,8 +412,7 @@ impl TieredTable {
         flush: &mut TierFlush<F>,
     ) -> Result<u64, TierFlushError> {
         let cursor = self.flush_start_cursor(flush);
-        let Some(selection) = self.select_span(cursor, flush.slice_bytes()) else { return Ok(0) };
-        let plan = match flush.plan_round(selection) {
+        let plan = match flush.plan_round(self.select_span(cursor, flush.slice_bytes())) {
             Planned::Round(plan) => plan,
             Planned::Nothing => return Ok(0),
             Planned::Refused(error) => {
@@ -424,7 +423,7 @@ impl TieredTable {
             }
         };
         let span_bytes = plan.span_bytes();
-        let Selection::Span { addr, len, .. } = selection else {
+        let Some((addr, len)) = plan.span() else {
             flush.stage_round(plan, &[]);
             return Ok(0);
         };

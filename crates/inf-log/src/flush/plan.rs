@@ -64,7 +64,8 @@ pub struct RoundPlan<F: SegmentFs> {
 }
 
 /// The round plan's answer (ADR-0155 D1/D2): a round to stage, nothing at the
-/// cursor, or a refusal that changed nothing.
+/// cursor (the store selected nothing there: the plan is the one owner of
+/// that answer), or a refusal that changed nothing.
 #[must_use = "a refused plan carries the reason; a round must be staged"]
 #[allow(
     clippy::large_enum_variant,
@@ -90,13 +91,20 @@ impl<F: SegmentFs> RoundPlan<F> {
         }
     }
 
+    /// The span the plan stages, `[addr, addr + len)` (`None` for a
+    /// gap-only plan): the store files and copies exactly these bytes.
+    #[must_use]
+    pub fn span(&self) -> Option<(LogicalAddr, NonZeroU64)> {
+        match self.shape {
+            PlanShape::Span { addr, len, .. } => Some((addr, len)),
+            PlanShape::Gap { .. } => None,
+        }
+    }
+
     /// The span's record bytes (0 for a gap-only plan).
     #[must_use]
     pub fn span_bytes(&self) -> u64 {
-        match self.shape {
-            PlanShape::Span { len, .. } => len.get(),
-            PlanShape::Gap { .. } => 0,
-        }
+        self.span().map_or(0, |(_, len)| len.get())
     }
 }
 
@@ -159,18 +167,19 @@ impl Layout {
 }
 
 impl<F: SegmentFs> TierFlush<F> {
-    /// Plans one reactor-drive round for `selection` (ADR-0155 D1–D3): at
-    /// most one capacity rotation, the span in one file, at most one
-    /// trailing gap. Parses every write position (ADR-0167 A1), reserves
-    /// the windows the round takes, then creates the next file if the span
-    /// needs one, its id checked first; any refusal releases what the plan
-    /// took and changes nothing else.
+    /// Plans one reactor-drive round for what the store selected at its
+    /// flush cursor (ADR-0155 D1–D3): `None` is `Planned::Nothing`, and
+    /// nothing changes. A selection plans at most one capacity rotation,
+    /// the span in one file, at most one trailing gap. Parses every write
+    /// position (ADR-0167 A1), reserves the windows the round takes, then
+    /// creates the next file if the span needs one, its id checked first;
+    /// any refusal releases what the plan took and changes nothing else.
     ///
     /// # Panics
     /// Panics on the seam drive, with a round staged, or with a plan's
     /// reservation still held: one round per pipeline, planned only when
     /// the last one finished.
-    pub fn plan_round(&mut self, selection: Selection) -> Planned<F> {
+    pub fn plan_round(&mut self, selection: Option<Selection>) -> Planned<F> {
         self.plan_round_with(selection, |_, _, position| position)
     }
 
@@ -180,11 +189,12 @@ impl<F: SegmentFs> TierFlush<F> {
     /// unaddressable position there, in the round plan, where ADR-0167 A1 parses.
     pub(crate) fn plan_round_with(
         &mut self,
-        selection: Selection,
+        selection: Option<Selection>,
         position_of: impl Fn(usize, usize, u64) -> u64,
     ) -> Planned<F> {
         assert_eq!(self.drive, TierDrive::Reactor, "a tier round planned on the seam drive");
         assert!(!self.round.is_staged(), "a tier round planned over a staged round");
+        let Some(selection) = selection else { return Planned::Nothing };
         let shape = self.shape_of(selection);
         let layout = self.layout_of(shape);
         if layout.writes > layout.positions.len() {
