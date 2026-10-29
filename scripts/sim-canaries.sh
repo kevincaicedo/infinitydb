@@ -528,6 +528,7 @@ sim_built=0
 # that share one share its run (three rows run m4-recovery
 # --replay-above-window at the lane seed, about 34 s each).
 plain_green="|"
+start=$SECONDS
 for row in "${rows[@]}"; do
   # shellcheck disable=SC2206
   parts=($row)
@@ -576,4 +577,4 @@ for row in "${rows[@]}"; do
   plain_green+="$leg|"
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi
-echo "sim-canaries: ${#rows[@]} canaries caught, plain builds green (seed $seed)"
+echo "sim-canaries: ${#rows[@]} canaries caught, plain builds green in $((SECONDS - start)) s (seed $seed)"
