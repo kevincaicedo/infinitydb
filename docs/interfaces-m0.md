@@ -159,7 +159,7 @@ impl Arena {
 > replaces `has_waiter(key)` in the cold-read note below, and the holder
 > returns at `release(hold)`. The cold gate is built with `ColdReads`,
 > not before the cell serves, until the cold-read host is built before
-> serving (a deviation, expiry 2026-11-30). `WaitList` and
+> serving (a deviation, expiry 2026-12-31). `WaitList` and
 > `WatermarkGate` take one wait node per parked task from a per-cell
 > pool; `WaitList`'s keys, FIFO, `wake_one`, `wake_all` and baton are
 > unchanged, and no type joins the suspension primitives sketched below.
