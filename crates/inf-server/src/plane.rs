@@ -1685,15 +1685,30 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// until `Closed`, and a second `close(2)` after the first has freed the
     /// number may close the socket or file the next accept or open holds.
     fn initiate_close(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
-        let fd = self.shared.with_conn(key, |conn| {
-            if conn.closing {
-                return None;
+        /// What the key's slot held when its close was asked for.
+        enum CloseStart {
+            /// Live and now closing: its fd's one `Close` goes out.
+            Started(RawFd),
+            /// Already closing: its `Close` is in flight until `Closed`.
+            AlreadyClosing,
+            /// A vacant slot or a stale generation: no connection to close.
+            Vacant,
+        }
+        let start = self
+            .shared
+            .with_conn(key, |conn| {
+                if conn.closing {
+                    return CloseStart::AlreadyClosing;
+                }
+                conn.closing = true;
+                CloseStart::Started(conn.fd)
+            })
+            .unwrap_or(CloseStart::Vacant);
+        match start {
+            CloseStart::Started(fd) => {
+                cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, key) });
             }
-            conn.closing = true;
-            Some(conn.fd)
-        });
-        if let Some(fd) = fd.flatten() {
-            cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, key) });
+            CloseStart::AlreadyClosing | CloseStart::Vacant => {}
         }
     }
 
