@@ -10,8 +10,10 @@
 //! live and stale handles; every handle read back against the model after
 //! every op, and the row's high water, crossings and capacity equal the
 //! model's at the end; the slab is built and retired one step per chunk or
-//! directory. A policy's last generation needs the slab's test hook, which
-//! no shipping-shaped build compiles: its unit and model tests reach it. The
+//! directory. No slot here nears its last generation (`SLAB_OPS_MAX` ops):
+//! reaching it takes the slab's test hook, which compiles only in the crate's
+//! own tests and under its test feature, never on this target's normal edge,
+//! so the crate's in-module model drives both policies' last value. The
 //! models share no code with `inf_foundation::bounded`.
 #![no_main]
 #![allow(
@@ -20,6 +22,7 @@
 )]
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Debug;
 use std::rc::Rc;
 
 use inf_foundation::CellId;
@@ -253,24 +256,43 @@ fn built<G: Generation, P: GenerationPolicy>(
     }
 }
 
-/// The slot generations a slab's model expects: the generation each index's
-/// next occupant takes (absent: never used, the first), and the indices
-/// retired at their last generation.
-struct Slots<G> {
-    next: BTreeMap<u32, G>,
-    retired: Vec<u32>,
+/// The model's own generation step, sharing no code with `Generation`. A
+/// slot is taken at most `SLAB_OPS_MAX` times in a run, so its generation
+/// stays far below either width's last value and both policies advance it
+/// by one.
+trait ModelGeneration: Copy + Ord + Debug {
+    const ZERO: Self;
+    fn successor(self) -> Self;
 }
 
-fn slab<G: Generation + Ord, P: GenerationPolicy>(head: u8, ops: &[u8]) {
+impl ModelGeneration for u32 {
+    const ZERO: u32 = 0;
+
+    fn successor(self) -> u32 {
+        self.checked_add(1).expect("a run's takes stay below the last generation")
+    }
+}
+
+impl ModelGeneration for u64 {
+    const ZERO: u64 = 0;
+
+    fn successor(self) -> u64 {
+        self.checked_add(1).expect("a run's takes stay below the last generation")
+    }
+}
+
+fn slab<G: Generation + ModelGeneration, P: GenerationPolicy>(head: u8, ops: &[u8]) {
     let cap = SLAB_CAPS[usize::from(head & 7)];
-    let retires = (head >> 3) & 3 == 2;
     let (census, _serve_mark) = CapCensus::new(CellId(u16::from(head)));
     let (mut slab, build_steps) = built::<G, P>(cap, &census);
     let mut model: BTreeMap<(u32, G), u16> = BTreeMap::new();
-    let mut slots = Slots { next: BTreeMap::new(), retired: Vec::new() };
+    // The generation each index's next occupant takes (absent: never used,
+    // the first).
+    let mut next: BTreeMap<u32, G> = BTreeMap::new();
     // Every handle minted, live or stale; bounded by the ops read.
     let mut handles: Vec<SlotId<G>> = Vec::new();
-    let mut capacity = cap.entries_max();
+    // No slot retires in a run, so the capacity stays the cap.
+    let capacity = cap.entries_max();
     let (mut high_water, mut crossings) = (0u32, 0u64);
     for &byte in ops.iter().take(SLAB_OPS_MAX) {
         let value = u16::from(byte >> 3);
@@ -282,8 +304,7 @@ fn slab<G: Generation + Ord, P: GenerationPolicy>(head: u8, ops: &[u8]) {
                     let id = slot.publish(value);
                     let (index, generation) = (id.index(), id.generation());
                     assert!(index < cap.entries_max(), "an index past the cap");
-                    assert!(!slots.retired.contains(&index), "a retired slot served again");
-                    let expected = slots.next.get(&index).copied().unwrap_or(G::FIRST);
+                    let expected = next.get(&index).copied().unwrap_or(G::ZERO);
                     assert_eq!(generation, expected, "the slot's next generation");
                     assert!(model.insert((index, generation), value).is_none(), "one occupant");
                     handles.push(id);
@@ -294,12 +315,12 @@ fn slab<G: Generation + Ord, P: GenerationPolicy>(head: u8, ops: &[u8]) {
                     assert_eq!(model.len() as u32, capacity, "Full below the capacity");
                     crossings += 1;
                 }
-                SlabReserved::Exhausted => assert_eq!(capacity, 0, "Exhausted with capacity"),
+                SlabReserved::Exhausted => panic!("Exhausted with no slot retired"),
             },
             2 => match slab.reserve() {
                 SlabReserved::Slot(slot) => drop(slot),
                 SlabReserved::Full => crossings += 1,
-                SlabReserved::Exhausted => assert_eq!(capacity, 0),
+                SlabReserved::Exhausted => panic!("Exhausted with no slot retired"),
             },
             3 | 4 if !handles.is_empty() => {
                 let id = handles[pick % handles.len()];
@@ -309,17 +330,7 @@ fn slab<G: Generation + Ord, P: GenerationPolicy>(head: u8, ops: &[u8]) {
                     continue;
                 };
                 assert_eq!(slab.take(id), Taken::Value(expected));
-                let next =
-                    if retires { generation.after() } else { Some(generation.after_wrapped()) };
-                match next {
-                    Some(next) => {
-                        slots.next.insert(index, next);
-                    }
-                    None => {
-                        slots.retired.push(index);
-                        capacity -= 1;
-                    }
-                }
+                next.insert(index, generation.successor());
             }
             6 if !handles.is_empty() => {
                 let id = handles[pick % handles.len()];
