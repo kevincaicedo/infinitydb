@@ -31,12 +31,13 @@ use super::census::{CapCensus, SlabInstance};
 use super::slab::Generation;
 use crate::limits::{
     MAP_BACKING_ALLOCATION_BYTES_MAX, MAP_CHUNK_SLOTS_MAX, MAP_DIRECTORY_CHILDREN_MAX,
-    directory_levels,
+    MAP_DIRECTORY_LEVELS_MAX, directory_levels,
 };
 
 /// log2 of the slots of one chunk, and of the children of one directory:
-/// both counts are powers of two (the tests hold that), so a slot index
-/// splits into a directory path and a chunk offset by shifts and masks.
+/// both counts are powers of two (const assertions in `limits` hold that),
+/// so a slot index splits into a directory path and a chunk offset by shifts
+/// and masks.
 const CHUNK_SLOTS_LOG2: u32 = MAP_CHUNK_SLOTS_MAX.trailing_zeros();
 const CHILDREN_LOG2: u32 = MAP_DIRECTORY_CHILDREN_MAX.trailing_zeros();
 const CHUNK_SLOTS: u32 = 1 << CHUNK_SLOTS_LOG2;
@@ -63,6 +64,11 @@ type One<T, G> = Directory<Chunk<T, G>>;
 type Two<T, G> = Directory<One<T, G>>;
 type Three<T, G> = Directory<Two<T, G>>;
 type Four<T, G> = Directory<Three<T, G>>;
+
+// The root's directory variants, `One` to `Four`, hold every level a `u32`
+// cap needs, so `Root::allocate`'s `Layout` arm is never reached.
+const _: () =
+    assert!(MAP_DIRECTORY_LEVELS_MAX == 4, "the root holds every directory level a u32 cap needs");
 
 /// The root, by its directory levels: the variant is the level count, so an
 /// access matches it once and then follows exactly that many links.

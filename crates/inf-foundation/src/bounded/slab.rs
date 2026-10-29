@@ -621,10 +621,7 @@ mod tests {
     use super::*;
     use crate::bounded::{CensusPhase, ServeMark};
     use crate::ids::CellId;
-    use crate::limits::{
-        CAP_CENSUS_SLABS_MAX, MAP_CHUNK_SLOTS_MAX, MAP_DIRECTORY_CHILDREN_MAX,
-        MAP_DIRECTORY_LEVELS_MAX,
-    };
+    use crate::limits::CAP_CENSUS_SLABS_MAX;
     use crate::rng::{Entropy, SplitMix64};
 
     const CELL: CellId = CellId(7);
@@ -680,11 +677,9 @@ mod tests {
             .expect("a panic message")
     }
 
+    /// The level thresholds: one chunk, then each directory level's span.
     #[test]
-    fn the_backing_constants_are_powers_of_two_covering_every_u32_index() {
-        assert!(MAP_CHUNK_SLOTS_MAX.is_power_of_two());
-        assert!(MAP_DIRECTORY_CHILDREN_MAX.is_power_of_two());
-        assert_eq!(MAP_DIRECTORY_LEVELS_MAX, 4);
+    fn directory_levels_cover_every_u32_index() {
         assert_eq!(crate::limits::directory_levels(64), 0);
         assert_eq!(crate::limits::directory_levels(65), 1);
         assert_eq!(crate::limits::directory_levels(16_384), 1);

@@ -90,13 +90,22 @@ pub const MAP_CHUNK_SLOTS_MAX: usize = 64;
 /// directory, or a directory level above, within `MAP_DIRECTORY_LEVELS_MAX`.
 pub const MAP_DIRECTORY_CHILDREN_MAX: usize = 256;
 
+// A slot index splits into a chunk offset and one child per directory level
+// by shifts and masks, which is exact only for powers of two.
+const _: () = assert!(MAP_CHUNK_SLOTS_MAX.is_power_of_two(), "a chunk's slots are a power of two");
+const _: () = assert!(
+    MAP_DIRECTORY_CHILDREN_MAX.is_power_of_two(),
+    "a directory's children are a power of two"
+);
+
 /// Directory levels above a store's chunks (ADR-0151 D5), derived from the
 /// slot range and the chunk and fan-out constants: the fewest levels whose
 /// chunks cover `MAP_SLOT_COUNT_MAX`, 4 (64 × 256⁴ slots). A store of
 /// `n` slots takes `directory_levels(n)`; a slot access follows that many
 /// links, one up to 16,384 slots. Owner: the storage. Crossing: a store
 /// needing more levels than its root can hold is `CapError::Layout`, which
-/// this derivation makes unreachable for any `u32` cap.
+/// this derivation and a const assertion beside the store's root (four
+/// directory levels) make unreachable for any `u32` cap.
 pub const MAP_DIRECTORY_LEVELS_MAX: u32 = directory_levels(MAP_SLOT_COUNT_MAX);
 
 /// The directory levels a store of `slots` slots needs: the fewest whose
