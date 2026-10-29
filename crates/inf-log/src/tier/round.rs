@@ -1,8 +1,9 @@
 //! A reactor-drive flush round's holders (ADR-0084 D2/D3, ADR-0155 D2/D3):
 //! the staged ops with their states and positions, the deferred effects,
 //! the window pool the round's writes take from, and the positions its
-//! plan parsed. Every holder is capped and built with the pipeline, so a
-//! round allocates nothing.
+//! plan parsed. Every holder is built with the pipeline — the pool whole,
+//! as fixed storage, the round's ops and effects as capped holders built
+//! empty — so a round allocates nothing.
 
 use std::rc::Rc;
 
@@ -11,9 +12,8 @@ use inf_foundation::bounded::{CapCensus, CapError, CappedDeque, Reserve, Reserve
 
 use super::{FrameStaging, TIER_BATCH_FRAMES, TIER_BATCH_PAYLOAD_BYTES, TIER_FRAME_BYTES};
 use crate::limits::{
-    TIER_POOL_BATCH_WINDOWS, TIER_POOL_BATCH_WINDOWS_MAX, TIER_POOL_SINGLE_WINDOWS,
-    TIER_POOL_SINGLE_WINDOWS_CAP, TIER_ROUND_BARRIERS, TIER_ROUND_EFFECTS, TIER_ROUND_EFFECTS_MAX,
-    TIER_ROUND_WRITES, TIER_ROUND_WRITES_MAX,
+    TIER_POOL_BATCH_WINDOWS_MAX, TIER_POOL_SINGLE_WINDOWS, TIER_ROUND_BARRIERS, TIER_ROUND_EFFECTS,
+    TIER_ROUND_EFFECTS_MAX, TIER_ROUND_WRITES, TIER_ROUND_WRITES_MAX,
 };
 
 /// One staged op of a reactor-drive flush round (M4.5-S31, ADR-0084):
@@ -314,16 +314,19 @@ pub(crate) enum WindowKind {
 /// The reactor drive's window pool (ADR-0155 D2/D3, L5): built with the
 /// pipeline, `⌈max(S, M)/Q⌉` batch windows and five single-block
 /// windows, `S` the slice, `M` the largest record the namespace admits
-/// and `Q` a batch's payload bytes. Each window's capacity is reserved at
-/// the build and written (zeroed) only at its first take, so a window
-/// never taken adds no resident page; the lists are taken LIFO from the
-/// front of each holder, so the windows ever written number the most out
-/// at once. A plan reserves the windows its round takes before any writer
-/// effect, and nothing is allocated between the pool's build and its
-/// drop. One round per pipeline, so the reservation is one value.
+/// and `Q` a batch's payload bytes. Each holder is a boxed slice built
+/// whole: a count the pool's owner fixes at the build is fixed storage
+/// with no census row, never a capped container the build would fill to
+/// its cap. Each window's capacity is reserved at the build and written
+/// (zeroed) only at its first take, so a window never taken adds no
+/// resident page; the windows are taken LIFO from the front of each
+/// holder, so the windows ever written number the most out at once. A
+/// plan reserves the windows its round takes before any writer effect,
+/// and nothing is allocated between the pool's build and its drop. One
+/// round per pipeline, so the reservation is one value.
 pub(crate) struct WindowPool {
-    batch: CappedDeque<FrameStaging, Reserve>,
-    single: CappedDeque<FrameStaging, Reserve>,
+    batch: Box<[FrameStaging]>,
+    single: Box<[FrameStaging]>,
     /// The windows of each holder out of the pool.
     batch_out: WindowsOut,
     single_out: WindowsOut,
@@ -378,31 +381,20 @@ pub(crate) struct PooledWindow {
 impl WindowPool {
     /// The pool of a pipeline whose span is at most `span_bytes_max`
     /// record bytes: `⌈span_bytes_max/Q⌉` batch windows and
-    /// `TIER_POOL_SINGLE_WINDOWS` single ones, each a census row's entry,
-    /// capacity reserved and nothing written. A span bound above the
-    /// pool's cap is `CapError::Layout`; nothing is built on a refusal.
-    pub(crate) fn new(span_bytes_max: u64, census: &Rc<CapCensus>) -> Result<WindowPool, CapError> {
+    /// `TIER_POOL_SINGLE_WINDOWS` single ones, each holder one allocation
+    /// of exactly its count, capacity reserved and nothing written. A span
+    /// bound above `TIER_POOL_BATCH_WINDOWS_MAX` windows is
+    /// `CapError::Layout`, a refused allocation `CapError::Alloc`; nothing
+    /// is built on a refusal.
+    pub(crate) fn new(span_bytes_max: u64) -> Result<WindowPool, CapError> {
         let batches = span_bytes_max.div_ceil(TIER_BATCH_PAYLOAD_BYTES);
         let batches = usize::try_from(batches).map_err(|_| CapError::Layout)?;
         if batches > TIER_POOL_BATCH_WINDOWS_MAX as usize {
             return Err(CapError::Layout);
         }
-        let mut batch = CappedDeque::new(TIER_POOL_BATCH_WINDOWS, census)?;
-        let mut single = CappedDeque::new(TIER_POOL_SINGLE_WINDOWS_CAP, census)?;
         let mut capacity_bytes = 0u64;
-        for (holder, count, frames) in [
-            (&mut batch, batches, TIER_BATCH_FRAMES),
-            (&mut single, TIER_POOL_SINGLE_WINDOWS as usize, 1),
-        ] {
-            for _ in 0..count {
-                let window = FrameStaging::reserved(frames)?;
-                capacity_bytes += window.capacity_bytes();
-                match holder.reserve() {
-                    Reserved::Slot(slot) => slot.publish(window),
-                    Reserved::Full => return Err(CapError::Layout),
-                }
-            }
-        }
+        let batch = reserved_windows(batches, TIER_BATCH_FRAMES, &mut capacity_bytes)?;
+        let single = reserved_windows(TIER_POOL_SINGLE_WINDOWS as usize, 1, &mut capacity_bytes)?;
         Ok(WindowPool {
             batch,
             single,
@@ -560,6 +552,25 @@ impl WindowPool {
     }
 }
 
+/// `count` windows of `frames` frames each, capacity reserved and nothing
+/// written, in one allocation of exactly `count` entries that the pushes
+/// fill without growing; each window's capacity is added to
+/// `capacity_bytes`, the pool's one sum.
+fn reserved_windows(
+    count: usize,
+    frames: usize,
+    capacity_bytes: &mut u64,
+) -> Result<Box<[FrameStaging]>, CapError> {
+    let mut windows = Vec::new();
+    windows.try_reserve_exact(count).map_err(|_| CapError::Alloc)?;
+    for _ in 0..count {
+        let window = FrameStaging::reserved(frames)?;
+        *capacity_bytes += window.capacity_bytes();
+        windows.push(window);
+    }
+    Ok(windows.into_boxed_slice())
+}
+
 /// The write positions a round's plan parsed (ADR-0167 A1), in the order
 /// its stage pushes the writes: each staged write takes the next, so a
 /// tier-round position is parsed once, in the round plan, and never again. At
@@ -661,14 +672,11 @@ impl FrameStaging {
 #[cfg(test)]
 mod tests {
     use inf_foundation::FileOffset;
-    use inf_foundation::bounded::CapCensus;
 
     use super::{PlannedWrites, Reservation, WindowKind, WindowNeeds, WindowPool};
 
     fn pool() -> WindowPool {
-        let (census, serve_mark) = CapCensus::new(inf_foundation::CellId(0));
-        drop(serve_mark);
-        WindowPool::new(4 << 20, &census).expect("a pool")
+        WindowPool::new(4 << 20).expect("a pool")
     }
 
     /// A round's end returns its windows in take order, oldest first, and

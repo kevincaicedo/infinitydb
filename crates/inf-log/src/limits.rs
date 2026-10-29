@@ -58,27 +58,23 @@ pub const TIER_SPAN_BYTES_MAX: u64 = 64 << 20;
 
 /// Batch windows one pipeline's pool holds at most: `⌈TIER_SPAN_BYTES_MAX
 /// / Q⌉`, `Q` a batch window's 1,047,552 record bytes (ADR-0155 D3's 65
-/// at 64 MiB). Owner: `TierFlush`'s window pool, built whole with the
-/// pipeline at `⌈max(S, M)/Q⌉`. Crossing: none at run time — a plan
-/// reserves its round's windows before any writer effect and one round is
-/// staged per pipeline, so no take finds the pool short.
+/// at 64 MiB). Owner: `TierFlush`'s window pool, whose batch windows are a
+/// boxed slice built whole with the pipeline, `⌈max(S, M)/Q⌉` entries: a
+/// count the owner fixes at the build is fixed storage, never a capped
+/// container the build would fill to its cap. Crossing: the build refuses
+/// a larger count as a layout error, which `TierSpec::validate`'s slice and
+/// record bounds rule out; none at run time — the slice's length, and a
+/// plan reserves its round's windows before any writer effect with one
+/// round staged per pipeline, so no take finds the pool short.
 pub const TIER_POOL_BATCH_WINDOWS_MAX: u32 = 65;
-
-/// The pool's batch windows: `TIER_POOL_BATCH_WINDOWS_MAX` entries under
-/// the census name `tier-pool-batch`, filled while the cell serves.
-pub const TIER_POOL_BATCH_WINDOWS: Cap =
-    Cap::entries::<TIER_POOL_BATCH_WINDOWS_MAX>("tier-pool-batch", CapFill::Serving);
 
 /// Single-block windows one pipeline's pool holds: a round writes at most
 /// five blocks outside its batches — the rotated file's tail and footer,
 /// the new file's header, the span's tail and a trailing gap's footer
-/// (ADR-0155 D3). Owner and crossing as the batch windows'.
+/// (ADR-0155 D3). Owner: the window pool, a boxed slice of exactly this
+/// many built with the pipeline. Crossing: none — the slice's length, and
+/// a plan reserves its windows as for the batch windows.
 pub const TIER_POOL_SINGLE_WINDOWS: u32 = 5;
-
-/// The pool's single-block windows under the census name
-/// `tier-pool-single`, filled while the cell serves.
-pub const TIER_POOL_SINGLE_WINDOWS_CAP: Cap =
-    Cap::entries::<TIER_POOL_SINGLE_WINDOWS>("tier-pool-single", CapFill::Serving);
 
 /// Write intents one tier round stages: `⌈A/Q⌉ + 5`, 70 at the widest span
 /// (ADR-0155 D3). Owner: `TierRound`, one holder per pipeline built with
@@ -122,13 +118,10 @@ pub const TIER_PENDING_SEALS: Cap =
 /// Directory handles one tier round holds for its dirent barriers: the
 /// namespace directory's and its `cold/` directory's, when the round
 /// creates a file (ADR-0084 D2's segment-create rule). Owner: `TierFlush`,
-/// one holder built with the pipeline. Crossing: none at run time — a plan
-/// creates at most one file.
+/// an array of exactly this many held as one value from the created
+/// file's stage to the round's end. Crossing: none — the array's length,
+/// and a plan creates at most one file.
 pub const TIER_ROUND_DIR_HOLDS_MAX: u32 = 2;
-
-/// The directory holds under the census name `tier-round-dir-holds`.
-pub const TIER_ROUND_DIR_HOLDS: Cap =
-    Cap::entries::<TIER_ROUND_DIR_HOLDS_MAX>("tier-round-dir-holds", CapFill::Serving);
 
 // ADR-0155 D3's envelope at the widest span: the batch windows cover it,
 // and the round's ops (70 writes and 4 barriers, 74) fit the 8-bit token op

@@ -16,6 +16,7 @@ use inf_foundation::{FileOffset, LogicalAddr};
 
 use super::{PendingSeal, TierDrive, TierFlush, TierFlushError};
 use crate::fs::{SegmentFile, SegmentFs};
+use crate::limits::TIER_ROUND_DIR_HOLDS_MAX;
 use crate::tier::{
     PlannedWrites, Reservation, RoundEffect, SealReason, TIER_BATCH_FRAMES, TIER_FOOTER_BYTES,
     TIER_FRAME_BYTES, TIER_FRAME_DATA, TIER_HEADER_BYTES, TierWriter, WindowNeeds, tier_file_name,
@@ -44,12 +45,13 @@ enum PlanShape {
 }
 
 /// A file the plan created for its span: the id it consumed, the file and
-/// the two directory handles its dirent barriers target.
+/// the two directory handles its dirent barriers target, one value the
+/// stage moves into the pipeline.
 struct CreatedFile<F: SegmentFs> {
     id: u32,
     path: PathBuf,
     file: F::File,
-    holds: [F::File; 2],
+    holds: [F::File; TIER_ROUND_DIR_HOLDS_MAX as usize],
 }
 
 /// A round's admitted plan: its shape, the file it created, and every
@@ -405,16 +407,16 @@ impl<F: SegmentFs> TierFlush<F> {
             &mut self.pool,
             writes,
         );
-        for handle in holds {
+        for handle in &holds {
             let fd = handle.raw_fd().expect("reactor drive requires fd-backed dirs (ADR-0084)");
             self.round.push_barrier(fd);
-            match self.round_dir_holds.reserve() {
-                Reserved::Slot(slot) => slot.publish(handle),
-                Reserved::Full => {
-                    panic!("a tier round's directory holds past the round plan's two")
-                }
-            }
         }
+        // A held pair names fds a staged barrier still targets, so moving a
+        // second pair over it would close them: a plan is made only over no
+        // staged round (asserted in release where the plan starts), and the
+        // round's end releases the pair.
+        debug_assert!(self.round_dir_holds.is_none(), "directory holds staged over a held pair");
+        self.round_dir_holds = Some(holds);
         self.active_id = id;
         self.writer = Some(writer);
     }

@@ -32,7 +32,7 @@ use inf_foundation::bounded::{CapCensus, CapError, CappedDeque, Reserve};
 use inf_foundation::limits::FILE_OFFSET_BYTES_MAX;
 
 use crate::fs::{SegmentFile, SegmentFs, TierIoMode};
-use crate::limits::{TIER_PENDING_SEALS, TIER_ROUND_DIR_HOLDS, TIER_SPAN_BYTES_MAX};
+use crate::limits::{TIER_PENDING_SEALS, TIER_ROUND_DIR_HOLDS_MAX, TIER_SPAN_BYTES_MAX};
 use crate::record::NsId;
 use crate::tier::{
     FrameStaging, OpState, RoundEffects, SealReason, TIER_KEY_WINDOW_BYTES, TierOpView, TierRound,
@@ -322,9 +322,11 @@ pub struct TierFlush<F: SegmentFs> {
     /// — the explicit bound: one per namespace). Its holders outlive each
     /// round; a round is staged while it holds an effect.
     round: TierRound,
-    /// Directory handles a round's dir-fsync barriers target — held
-    /// until the round finishes (the fd must outlive the op). At most two.
-    round_dir_holds: CappedDeque<F::File, Reserve>,
+    /// The created file's two directory handles, which the round's
+    /// dir-fsync barriers target: one value, held from the file's stage
+    /// until the round finishes (the fds must outlive the ops). `None`
+    /// while no round that created a file is staged.
+    round_dir_holds: Option<[F::File; TIER_ROUND_DIR_HOLDS_MAX as usize]>,
     /// Files whose seal is staged in the in-flight round: catalog
     /// commit happens at the barrier completion ([`RoundEffect::
     /// SealCommit`]); until then the open handle serves cold reads on
@@ -391,10 +393,12 @@ impl<F: SegmentFs> TierFlush<F> {
     /// # Panics
     /// Panics on a zero capacity/slice config, a catalog not strictly
     /// ascending by id and base, or `next_id` not above every seeded id;
-    /// and when the reactor holders' backing is refused — the allocation
-    /// fail-stop every window allocation took before the pool was built
-    /// whole (`max(S, M)` above `TIER_SPAN_BYTES_MAX` is the layout
-    /// refusal, which `TierSpec::validate` rules out).
+    /// and when an allocation of the reactor holders is refused — the
+    /// window pool's slices and windows, the round's capped holders and
+    /// seals, each built empty — the allocation fail-stop every `Vec`
+    /// growth takes. `max(S, M)` above `TIER_SPAN_BYTES_MAX` is the layout
+    /// refusal, which `TierSpec::validate` rules out, and the census
+    /// refuses only a cap name declared with a second value.
     pub fn with_catalog(
         fs: F,
         config: TierFlushConfig,
@@ -429,7 +433,7 @@ impl<F: SegmentFs> TierFlush<F> {
             drive: TierDrive::Seam,
             pool: holders.pool,
             round: holders.round,
-            round_dir_holds: holders.dir_holds,
+            round_dir_holds: None,
             pending_seals: holders.pending_seals,
             claim: ClaimRule::FullFrames,
         }
@@ -520,7 +524,10 @@ impl<F: SegmentFs> TierFlush<F> {
         let owned = |fd: std::os::fd::RawFd| {
             self.writer.as_ref().and_then(TierWriter::raw_fd) == Some(fd)
                 || self.pending_seals.iter().any(|s| s.file.raw_fd() == Some(fd))
-                || self.round_dir_holds.iter().any(|h| h.raw_fd() == Some(fd))
+                || self
+                    .round_dir_holds
+                    .as_ref()
+                    .is_some_and(|holds| holds.iter().any(|h| h.raw_fd() == Some(fd)))
         };
         (0..self.round.op_count())
             .all(|i| self.round.op(i, &self.pool).is_some_and(|op| owned(op.fd)))
@@ -584,7 +591,7 @@ impl<F: SegmentFs> TierFlush<F> {
     /// plane's custody obligation).
     #[must_use]
     pub fn finish_round(&mut self) -> RoundEffects {
-        while self.round_dir_holds.pop_front().is_some() {}
+        self.round_dir_holds = None;
         self.round.finish(&mut self.pool)
     }
 
@@ -936,12 +943,15 @@ impl<F: SegmentFs> TierFlush<F> {
     }
 }
 
-/// The reactor drive's capped holders, built together so a refusal of
-/// any one builds none (ADR-0155 D2: the reserve precedes serving).
+/// The reactor drive's holders, built together so a refusal of any one
+/// builds none (ADR-0155 D2: the reserve precedes serving): the window
+/// pool whole, as fixed storage; the round's capped holders and the
+/// staged seals empty, each a census row. The created file's directory
+/// handles need no holder built here: they are one value the round moves
+/// in.
 struct ReactorHolders<F: SegmentFs> {
     pool: WindowPool,
     round: TierRound,
-    dir_holds: CappedDeque<F::File, Reserve>,
     pending_seals: CappedDeque<PendingSeal<F>, Reserve>,
 }
 
@@ -951,9 +961,8 @@ impl<F: SegmentFs> ReactorHolders<F> {
             return Err(CapError::Layout);
         }
         Ok(ReactorHolders {
-            pool: WindowPool::new(span_bytes_max, census)?,
+            pool: WindowPool::new(span_bytes_max)?,
             round: TierRound::new(census)?,
-            dir_holds: CappedDeque::new(TIER_ROUND_DIR_HOLDS, census)?,
             pending_seals: CappedDeque::new(TIER_PENDING_SEALS, census)?,
         })
     }
@@ -1516,6 +1525,7 @@ mod tests {
 
     use crate::fs::sim::SimDisk;
     use crate::tier::RoundEffect;
+    use inf_foundation::bounded::CapRow;
     use inf_foundation::fault::FaultSpec;
 
     fn sim_config(capacity: u64, span_bytes_max: u64) -> TierFlushConfig {
@@ -1955,6 +1965,54 @@ mod tests {
 
     const ROUND_OPS_MAX_TEST: usize = crate::tier::ROUND_OPS_MAX;
 
+    /// No holder of a pipeline is filled at its build, and none sits at its
+    /// cap on a common round: a holder whose count its owner fixes (the
+    /// window pool, the created file's two directory handles) is fixed
+    /// storage with no census row, and a capped holder whose count a round
+    /// varies is built empty. A row filled at the build, or full on a round
+    /// with no rotation and no widest span, answers `Full` one entry early
+    /// under a plant that admits one fewer, before the census can judge.
+    /// Read from the census's rows on a marked census, at the widest slice
+    /// (65 batch windows) and at the 4 MiB ring floor (2 MiB records, 3),
+    /// over one round that creates its file and seals it at a gap.
+    #[test]
+    fn no_tier_holder_is_full_at_its_build_or_first_round() {
+        let mut found = Vec::new();
+        for (slice_bytes, record_len_max) in [(TIER_SPAN_BYTES_MAX, 2 << 20), (1 << 20, 2 << 20)] {
+            let (census, serve_mark) = CapCensus::new(inf_foundation::CellId(0));
+            serve_mark.take();
+            let disk = SimDisk::new();
+            let config = TierFlushConfig { slice_bytes, ..sim_config(1 << 30, record_len_max) };
+            let mut flush = TierFlush::new(disk.clone(), config, 0, &census);
+            flush.set_drive(TierDrive::Reactor);
+            let at = format!("slice {slice_bytes}");
+            rows_where(&census, &mut found, "filled-at-build", &at, |row| row.high_water > 0);
+            stage(&mut flush, span(0, 700, Some(90_000)), &[0x5B; 700]).expect("the round stages");
+            assert_eq!(flush.round_barrier_count(), 3, "two dirent barriers and the gap's seal");
+            let effects = run_round(&disk, &mut flush);
+            assert_eq!(effects, [RoundEffect::SealCommit, RoundEffect::GapCross { to: 90_000 }]);
+            assert_eq!(apply(&mut flush, &effects), [0], "the created file sealed at the gap");
+            let full = |row: &CapRow| row.high_water >= row.entries_max;
+            rows_where(&census, &mut found, "full-on-a-common-round", &at, full);
+            assert!(census.rows().count() >= 4, "the round's capped holders are census rows");
+        }
+        assert!(found.is_empty(), "a tier holder full at its build or round: {}", found.join("; "));
+    }
+
+    /// Appends `token`, the row and its fill for every census row `hit` reads.
+    fn rows_where(
+        census: &CapCensus,
+        found: &mut Vec<String>,
+        token: &str,
+        at: &str,
+        hit: impl Fn(&CapRow) -> bool,
+    ) {
+        for row in census.rows().filter(|row| hit(row)) {
+            let (name, high, cap) = (row.name, row.high_water, row.entries_max);
+            found.push(format!("{token}: `{name}` at {high} of {cap} ({at})"));
+        }
+    }
+
     /// A held completion reads the window its op was staged in until the
     /// round ends (ADR-0155 D5): the pool takes a window back only at the
     /// round's finish, never at a send, so the pool's next user writing
@@ -2029,7 +2087,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a tier window pool reserved with windows out")]
     fn a_reservation_with_windows_out_stops_the_cell() {
-        let mut pool = WindowPool::new(1 << 20, &census()).expect("a pool");
+        let mut pool = WindowPool::new(1 << 20).expect("a pool");
         let one = crate::tier::WindowNeeds { batch: 1, single: 0 };
         assert_eq!(pool.reserve(one), crate::tier::Reservation::Reserved);
         let _window = pool.take(crate::tier::WindowKind::Batch);
