@@ -620,6 +620,33 @@ impl CellFabric {
 }
 ```
 
+> **ADR-0192 (2026-10-29), implementation open:** deadlock freedom holds
+> under a condition on the server. A reply sent in the drain pass that read
+> its op cannot wait: `reply` is credit-free and the drain never blocks or
+> sends. A reply a cell defers past that drain may wait only on (a) its own
+> cell's loop — staging space, the durable watermark, a cold read, an extent
+> turn, a tail stall, an earlier op in the namespace queue — or on (b) data
+> ops sent from credits no deferrable op can hold, each answered in the
+> drain pass that reads it, and the earlier ops in the publish queue, whose
+> consumer waits only on such ops. No task holds a resource of (a) while it
+> waits on a general credit or on the reply to a general op. A reply to a
+> (b) op is sent in a drain, so holding a queue across it closes no cycle.
+> The server spends a cell's credits toward a peer through two paths only.
+> A general send stages only if at least one credit toward the peer stays
+> free after it; its op is a point op, never a `Batch`, so it costs one.
+> The owner's publish fan may take that last one, with at most one fan leg
+> in flight toward each peer (a fan settles before the next opens), so a
+> fan leg never waits. A cross-cell transaction's credits reserved at
+> admission come from the general window. `MeshConfig` gains
+> `has_reply_headroom`, the one statement of the ring relation above,
+> which construction asserts. The shipped binary and the simulator build
+> every mesh through one checked constructor, which refuses
+> `data_credits ≤ 1`, a ring that is not a power of two and a mesh
+> `has_reply_headroom` refuses; test meshes keep a debug assertion. `send`,
+> `reply`, `drain`, `SendError` and the relation's value are unchanged. Not
+> built; the block above states the mesh as implemented today (ADR-0192
+> D1, D2, D5).
+
 **Execution origin (ADR-0115 D2–D5).** `Apply` and `ApplyNs` carry
 `program: bool`: `false` for forwarded client argv, `true` for legs composed
 by a plane program. Codec v0 header bit 0 is `FLAG_PROGRAM = 1`, set iff
