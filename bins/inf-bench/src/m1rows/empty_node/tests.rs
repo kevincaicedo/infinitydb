@@ -86,6 +86,8 @@ fn the_row_table_names_every_checked_in_row() {
 }
 
 /// Another cell count is a declared withholding: a note, no spawn, no row.
+/// Off Linux the platform withholding comes first (see the test below).
+#[cfg(target_os = "linux")]
 #[test]
 fn another_topology_withholds_every_row_without_a_spawn() {
     let (bools, values) = crate::gaterun::GATE_RUN_FLAGS;
@@ -95,6 +97,21 @@ fn another_topology_withholds_every_row_without_a_spawn() {
     assert!(m.values.is_empty());
     assert!(Row::ALL.iter().all(|row| m.measured(row.key()).is_none()));
     assert!(m.notes.iter().any(|note| note.contains("withheld: --cells 8")), "{:?}", m.notes);
+}
+
+/// Off Linux the instruments (`/proc`, `st_blocks`) are absent: every row
+/// is withheld with that note, whatever the topology, and nothing spawns.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn off_linux_every_row_is_withheld_without_a_spawn() {
+    let (bools, values) = crate::gaterun::GATE_RUN_FLAGS;
+    let flags = Flags::parse(&[], bools, values).expect("flags");
+    let mut m = Measurements::new();
+    run(&flags, &[], &mut m, "/nonexistent/infinityd", EMPTY_NODE_CELLS, true)
+        .expect("withheld, not refused");
+    assert!(m.values.is_empty());
+    assert!(Row::ALL.iter().all(|row| m.measured(row.key()).is_none()));
+    assert!(m.notes.iter().any(|note| note.contains("read /proc and st_blocks")), "{:?}", m.notes);
 }
 
 /// The bills and the pin floor are written for infinityd's defaults, which
@@ -373,12 +390,13 @@ fn the_walk_needs_every_file_the_bill_names() {
 
 #[test]
 fn an_unreadable_directory_is_a_walk_error() {
-    let owner = std::fs::metadata("/proc/self").expect("/proc/self").uid();
+    let scratch = Scratch::new("walk-unreadable");
+    // A directory this process just made is owned by its uid (no /proc off Linux).
+    let owner = std::fs::metadata(&scratch.0).expect("scratch").uid();
     if owner == 0 {
         eprintln!("running as root: a mode-000 directory stays readable, the case cannot plant");
         return;
     }
-    let scratch = Scratch::new("walk-unreadable");
     let root = scratch.0.join("node");
     node_fixture(&root);
     let locked = root.join("shard-0/ckpt");

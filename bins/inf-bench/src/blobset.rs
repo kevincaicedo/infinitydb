@@ -1419,7 +1419,8 @@ mod tests {
     /// The leg directory goes on every exit of the leg — a drop, an error
     /// returned through `?` — and a stale one, which only a killed run
     /// leaves, goes before the first leg while a sibling that is not ours
-    /// stays.
+    /// stays. Owners are given as seen and empty so the removal arm runs
+    /// off Linux too, where the box shows none (`Owners::Unseen`).
     #[test]
     fn a_leg_directory_is_removed_on_every_exit_and_stale_ones_before_the_first_leg() {
         let root = std::env::temp_dir().join(format!("inf-bench-blobset-{}", std::process::id()));
@@ -1427,7 +1428,10 @@ mod tests {
         let stale = root.join("a-c1-r3");
         std::fs::create_dir_all(stale.join("shard-0")).unwrap();
         std::fs::create_dir_all(root.join("notes")).unwrap();
-        assert_eq!(LegDir::clear_stale(&root).unwrap(), vec![Swept::Removed("a-c1-r3".into())]);
+        assert_eq!(
+            LegDir::clear_stale_with(&root, &Owners::Seen(Vec::new())).unwrap(),
+            vec![Swept::Removed("a-c1-r3".into())]
+        );
         assert!(!stale.exists());
         assert!(root.join("notes").is_dir());
         let dir = LegDir::create(&root, "a", 1, 0).unwrap();

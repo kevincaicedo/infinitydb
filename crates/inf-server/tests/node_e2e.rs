@@ -9248,7 +9248,19 @@ fn client_output_buffer_limit_normal_kills_a_non_reading_client() {
     victim.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
     let get = cmd(&[b"GET", b"big"]);
     for _ in 0..512 {
-        victim.write_all(&get).expect("write");
+        match victim.write_all(&get) {
+            Ok(()) => {}
+            // The kill can land before the last GET is sent: that is the cap firing.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                break;
+            }
+            Err(e) => panic!("write: {e}"),
+        }
     }
     // The kill closes with GETs still unread, so the close may be a reset.
     let mut total = 0usize;
