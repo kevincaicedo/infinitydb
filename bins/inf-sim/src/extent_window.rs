@@ -16,7 +16,9 @@
 //!   (token `extent-handles-over`);
 //! - the extent files the sim disk saw created are at most the blob writes
 //!   acknowledged, and the writes of the clients that left: a parked writer
-//!   creates none (`extent-files-over-writes`);
+//!   creates none (`extent-files-over-writes`); on the burst they are
+//!   exactly that many, so a leaver's write lands
+//!   (`extent-files-under-writes`);
 //! - every reply is the exact `+OK` (`extent-reply-wrong`);
 //! - every writer whose extent file was created at the first step that
 //!   created one has its reply by the step that creates the 33rd file: a
@@ -186,7 +188,8 @@ pub struct ExtentWindowReport {
     pub files_created: usize,
     /// Blob `SET`s acknowledged `+OK`.
     pub sets_acked: u64,
-    /// Clients that disconnected with a write in flight.
+    /// Clients that disconnected with a blob write in flight, counted as
+    /// each leaves.
     pub writers_left: u64,
     /// Rows the census oracle read (node sum).
     pub cap_rows_checked: u64,
@@ -263,10 +266,12 @@ impl Writer {
         self.left || (self.setup_done && !self.inflight && self.sent >= self.quota)
     }
 
-    /// The client disconnects, its write in flight.
-    fn leave(&mut self, node: &mut Node) {
+    /// The client disconnects, its write in flight, and is counted as it
+    /// leaves: a run the stuck check ends early still owes its write.
+    fn leave(&mut self, node: &mut Node, report: &mut ExtentWindowReport) {
         node.nets[0].borrow_mut().client_close(self.fd);
         self.left = true;
+        report.writers_left += 1;
     }
 }
 
@@ -488,16 +493,17 @@ fn drive(
             return;
         }
         if run.scenario.leg == ExtentWindowLeg::Burst {
-            leavers.step(run.node, writers, creations);
+            leavers.step(run.node, writers, creations, report);
         }
     }
-    report.writers_left = writers.iter().filter(|w| w.left).count() as u64;
 }
 
 /// The burst's two disconnects, each with a write in flight: the highest
 /// writer outside the first cohort once the cohort's files exist (parked
 /// at the queue's tail), and the lowest outside it once the first handout
-/// has turns out (at the queue's head).
+/// has turns out (at the queue's head). A candidate's setup was answered
+/// and its blob `SET` sent, so each client that leaves owes exactly one
+/// extent file whatever the step it leaves at.
 #[derive(Default)]
 struct Leavers {
     parked: Option<usize>,
@@ -505,7 +511,13 @@ struct Leavers {
 }
 
 impl Leavers {
-    fn step(&mut self, node: &mut Node, writers: &mut [Writer], creations: &Creations) {
+    fn step(
+        &mut self,
+        node: &mut Node,
+        writers: &mut [Writer],
+        creations: &Creations,
+        report: &mut ExtentWindowReport,
+    ) {
         let Some(&(first, _)) = creations.log.first() else { return };
         let cohort: BTreeSet<usize> = creations
             .log
@@ -513,10 +525,11 @@ impl Leavers {
             .take_while(|&&(step, _)| step == first)
             .filter_map(|&(_, writer)| writer)
             .collect();
-        let candidate = |w: &&mut Writer| !cohort.contains(&w.id) && !w.left && w.inflight;
+        let candidate =
+            |w: &&mut Writer| !cohort.contains(&w.id) && !w.left && w.setup_done && w.inflight;
         if self.parked.is_none() {
             if let Some(writer) = writers.iter_mut().rev().find(candidate) {
-                writer.leave(node);
+                writer.leave(node, report);
                 self.parked = Some(writer.id);
             }
             return;
@@ -526,7 +539,7 @@ impl Leavers {
             && turns_out > 0
             && let Some(writer) = writers.iter_mut().find(candidate)
         {
-            writer.leave(node);
+            writer.leave(node, report);
             self.at_handout = Some(writer.id);
         }
     }
@@ -655,6 +668,22 @@ fn judge(
         report.violations.push(format!(
             "EXTENT WINDOW VIOLATION seed {seed:#x}: extent-files-over-writes — {} extent files \
              created for {} acknowledged blob writes and {} writes of clients that left",
+            creations.seen.len(),
+            report.sets_acked,
+            report.writers_left
+        ));
+    }
+    // On the burst every write is a fresh key's blob, so each acknowledged
+    // write and each leaver's write in flight creates one extent file: a
+    // disconnect cancels no parsed command, so a file short is a write that
+    // did not land.
+    if scenario.leg == ExtentWindowLeg::Burst
+        && (creations.seen.len() as u64) < report.sets_acked + report.writers_left
+    {
+        report.violations.push(format!(
+            "EXTENT WINDOW VIOLATION seed {seed:#x}: extent-files-under-writes — {} extent files \
+             created for {} acknowledged blob writes and {} writes of clients that left: a \
+             write that did not land",
             creations.seen.len(),
             report.sets_acked,
             report.writers_left

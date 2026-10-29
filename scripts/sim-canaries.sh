@@ -255,6 +255,12 @@ rows=(
   # handout skips its wakes: the writers parked behind the first window are
   # never woken, and the run stops with replies owed.
   "inf_canary_extent_window_no_wake m4-extent-window writer-left-parked --window-leg burst"
+  # The same plant reaches the burst's file count: the client that left
+  # while parked is never woken, so its write never lands, and the files
+  # created fall one short of the writes acknowledged and the writes of the
+  # clients that left (16 against 16 and 1 on 256 of 256 seeds from
+  # 0xC0FFEE, so one seed catches).
+  "inf_canary_extent_window_no_wake m4-extent-window extent-files-under-writes --window-leg burst"
   # The handout wakes every parked writer and each retries as an arrival:
   # some 50 cold resolves at once overflow a cold FIFO of 16 places, and a
   # writer reads `BUSY`.
