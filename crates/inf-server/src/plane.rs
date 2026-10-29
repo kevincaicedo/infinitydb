@@ -804,7 +804,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.boot = Some(BootRecovery {
             // Loop-resident boots defer boot-metadata fsyncs into driver
             // barriers (M2.5-S01): ready never blocks on the device.
-            rec: Recovery::new(fs.clone(), cell_id, cfg, anchor, now).deferred_boot_sync(),
+            rec: Recovery::new(fs.clone(), cell_id, cfg, anchor, now)
+                .deferred_boot_sync()
+                .with_census(Rc::clone(&self.shared.census)),
             fs,
             cfg: cfg.clone(),
             cell_id,
@@ -1118,10 +1120,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 (TierFlushGauge::PlanWaits, stats.plan_waits),
                 (TierFlushGauge::TurnContended, stats.turn_contended),
                 (TierFlushGauge::RoundsPlanned, stats.rounds_planned),
+                (TierFlushGauge::FileIdsExhausted, stats.file_ids_exhausted),
             ] {
                 gauges[slot as usize] = value;
             }
             self.shared.node.tier_flush.set(gauges);
+            let (capacity, written) = tier.window_bytes();
+            self.shared.node.tier_window_capacity_bytes.set(capacity);
+            self.shared.node.tier_window_written_bytes.set(written);
             tier.cold.clone()
         };
         // Reactor-drive flush ops (M4.5-S31): pushed outside the tier

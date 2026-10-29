@@ -79,8 +79,10 @@ fn booting(fs: &MemFs, budget: u64, n: u64) -> (Keyspace, Lent) {
             mode: inf_log::TierIoMode::Buffered,
             file_capacity: inf_log::TIER_FILE_CAPACITY_DEFAULT,
             slice_bytes: PAGE,
+            record_len_max: 16 << 20,
         },
         0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
     let table = ks.tiered_store(NS).expect("materialized");
     let machine = TierReplay::new(BootFlush::new(flush, Vec::new()), table);

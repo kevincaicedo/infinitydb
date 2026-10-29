@@ -121,8 +121,10 @@ impl Rig {
                 mode: TierIoMode::Buffered,
                 file_capacity: FILE_CAPACITY,
                 slice_bytes: FLUSH_SLICE,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         let rotor = SegmentRotor::create_fresh(
             fs.clone(),

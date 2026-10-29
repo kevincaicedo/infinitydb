@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::durable::ack_class::{AckClass, AckClasses};
+use inf_foundation::FileOffset;
 use inf_foundation::bounded::CapCensus;
 use inf_foundation::fault::FaultSpec;
 use inf_foundation::time::Nanos;
@@ -179,18 +180,6 @@ fn eight_mib_rounds() -> TierSpec {
         maintain_slice_bytes: 8 << 20,
         ..TierSpec::for_budget(16 << 20)
     }
-}
-
-/// A sealed keyspace staged into `cell`'s own `SimDisk` pipeline: a
-/// real reactor round, the new file's header write first (the
-/// `tiered_flush_reactor` recipe). `MemFs` cannot stage one — it has
-/// no fds.
-fn staged_round(cell: &mut TierCell<SimDisk>) -> Keyspace {
-    let mut ks = sealed_backlog(1);
-    let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
-    let flush = &mut cell.namespaces[0].flush;
-    table.stage_flush_round(flush).expect("stage");
-    ks
 }
 
 /// The tier class's budget as the plane wires it: a real
@@ -575,34 +564,55 @@ fn a_retry_group_is_offered_and_charged_like_any_group() {
     assert_eq!(offered_ops, pushed_ops, "every pushed op was offered");
 }
 
-/// A plan that fails after staging part of its round (the pipeline
-/// rotates at a 4 KiB file capacity and the second file's first
-/// directory hold is refused — `tier_dir_open_fail`'s third firing, two
-/// holds per creation) keeps the first chunk and its file's seal; those
-/// ops are offered and issued like any group, so the spend is exactly
-/// what the disk was handed, and the error is not fatal.
+/// A plan refused at its file's creation stages nothing (ADR-0155 D2,
+/// the record's before-state): the turn issues no op, no round opens, the
+/// active file stays as it was with its id unspent, the error is not
+/// fatal, and the namespace plans again at its next turn. (Before the
+/// plan, the stage kept and issued the part it staged ahead of the
+/// refused creation.)
 #[test]
-fn a_failed_plan_issues_what_it_staged() {
+fn a_refused_plan_stages_nothing_and_plans_again_next_turn() {
     let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 6 << 10, ..spec() });
     let config = flush_config(&cell, 4 << 10, 6 << 10);
     let fs = cell.fs.clone();
     let t = &mut cell.namespaces[0];
-    t.flush = TierFlush::new(fs, config, 0);
+    t.flush = TierFlush::new(fs, config, 0, &census());
     t.flush.set_drive(TierDrive::Reactor);
     let mut ks = sealed_backlog(3);
     let mut admission = Recording { inner: plane_budget(reference_model(), 1), offers: Vec::new() };
+    // The first plan opens two directory holds for file A; the third, the
+    // rotation's next file's, is refused.
     inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(3));
-    let mut ops = Vec::new();
-    let refused = cell.turn(&mut ks, 0, &mut ops, &mut admission);
+    let mut refused = None;
+    for turn in 0..64u64 {
+        for t in &mut cell.namespaces {
+            let table = ks.tiered_store_mut(t.ns).expect("materialized");
+            advance_round(table, t, &mut cell.flush_stats, turn).expect("no barrier failed");
+        }
+        let mut ops = Vec::new();
+        match cell.turn(&mut ks, turn, &mut ops, &mut admission) {
+            Ok(_) => {
+                complete_ops(&mut cell, ops);
+            }
+            Err(err) => {
+                assert!(ops.is_empty(), "a refused plan issues nothing");
+                refused = Some(err);
+                break;
+            }
+        }
+    }
     inf_foundation::fault::disarm_all();
-    let err = refused.expect_err("the second file's creation is refused");
+    let err = refused.expect("the rotation's creation is refused");
     assert!(!err.is_fatal(), "a refused creation retries next turn: {err}");
-    assert!(cell.namespaces[0].round.is_some(), "engagement: the partial round opened");
-    assert!(!ops.is_empty(), "the partial round's first group was issued");
-    let device_bytes = complete_ops(&mut cell, ops);
-    let counters = admission.inner.0.counters(IoClass::TierFlush);
-    assert_eq!(counters.spent_bytes, device_bytes, "the issued chunk's device bytes are spent");
+    let t = &cell.namespaces[0];
+    assert!(t.round.is_none(), "no round opened");
+    assert!(!t.flush.round_active(), "nothing staged");
+    assert_eq!(t.flush.active().map(|a| a.0), Some(0), "file A stays active");
+    assert_eq!(t.flush.next_file_id(), 1, "B's id is not spent");
+    let ops = pass(&mut cell, &mut ks, 100, &mut admission);
+    assert!(!ops.is_empty(), "the next turn plans again and issues");
+    assert_eq!(cell.namespaces[0].flush.next_file_id(), 2, "B is created");
 }
 
 /// The pipeline `create_ns` builds for `NsId(16)` on `cell`, at a file
@@ -615,6 +625,7 @@ fn flush_config(cell: &TierCell<SimDisk>, file_capacity: u64, slice_bytes: u64) 
         mode: spec().tier_io_mode,
         file_capacity,
         slice_bytes,
+        record_len_max: spec().record_len_max().expect("a representable ring"),
     }
 }
 
@@ -799,43 +810,6 @@ fn a_stalled_writer_is_woken_at_a_visit_whose_plan_is_refused() {
     assert_eq!(cell.namespaces[0].stall_waiters.waiting(), 0, "the parked writer was woken");
     drop(parked);
 }
-
-/// ADR-0167 D4: a refused write position opens nothing — no round, no
-/// round sequence spent — and the error is fatal, carrying the value.
-/// The refusal is planted on the last write, so a check that stopped at
-/// the first good position would already have opened the round. The same
-/// staged round, unplanted, opens with every op unsent.
-#[test]
-fn unaddressable_round_opens_nothing() {
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
-    cell.create_ns(NsId(16), &spec());
-    let _ks = staged_round(&mut cell);
-    let t = &mut cell.namespaces[0];
-    let writes = t.flush.round_write_count();
-    assert!(writes >= 2, "a header and at least one data write: {writes}");
-    let planted = i64::MAX.cast_unsigned() + 1;
-    let seq_before = t.round_seq;
-    let refused =
-        open_round(
-            t,
-            7,
-            |flush, index| {
-                if index + 1 == writes { planted } else { flush.round_op(index).offset }
-            },
-        );
-    let err = refused.expect_err("an unaddressable position refuses the round");
-    assert!(err.is_fatal(), "fail-stop, not a retry: {err}");
-    let TierFlushError::Unaddressable { offset_bytes, .. } = &err else { panic!("{err}") };
-    assert_eq!(*offset_bytes, planted, "the refusal carries the value");
-    assert!(t.round.is_none(), "no round opened");
-    assert_eq!(t.round_seq, seq_before, "no round sequence spent");
-    open_round(t, 7, |flush, index| flush.round_op(index).offset)
-        .expect("the unplanted round opens");
-    let round = t.round.as_ref().expect("the round is open");
-    assert!(round.states.iter().all(|s| *s == OpState::Unsent), "nothing is sent at the open");
-    assert_eq!(round.pending, 0);
-}
-
 /// A drained round returns its lane too (the `round_drain` path).
 #[test]
 fn drained_namespace_lane_recycles_at_maintain() {
@@ -843,7 +817,7 @@ fn drained_namespace_lane_recycles_at_maintain() {
     cell.create_ns(NsId(16), &spec());
     cell.namespaces[0].round_seq = 3;
     // Park a finished round on it so the drop routes through the drain.
-    cell.namespaces[0].round = Some(FlushRound::new(0, Vec::new(), 3, 0));
+    cell.namespaces[0].round = Some(FlushRound::new(3, 0));
     let ks = Keyspace::new(StoreConfig::default());
     let mut releases = vec![(NsId(16), 1)];
     cell.sync_namespaces(&ks, &mut releases);
@@ -907,13 +881,17 @@ fn a_retry_with_a_done_run_between_its_failed_writes_completes() {
         complete_ops(&mut cell, ops);
         if cell.namespaces[0].round.is_none() {
             assert_eq!(cell.flush_stats.write_retries, 1, "one retry of both failed writes");
-            assert_eq!(cell.flush_stats.rounds, 1, "the round completed");
+            // The span is the largest whole-record prefix within the slice,
+            // so the backlog's last records may follow as a small round.
+            assert!(cell.flush_stats.rounds >= 1, "the round completed");
             return;
         }
     }
-    let round = cell.namespaces[0].round.as_ref().expect("still open");
-    let unsent: Vec<usize> =
-        (0..round.states.len()).filter(|&index| round.states[index] == OpState::Unsent).collect();
+    let t = &cell.namespaces[0];
+    let round = t.round.as_ref().expect("still open");
+    let unsent: Vec<usize> = (0..t.flush.round_op_count())
+        .filter(|&index| t.flush.round_op_state(index) == Some(OpState::Unsent))
+        .collect();
     panic!(
         "the round never completed: retries {}, cursor {}, pending {}, unsent ops {unsent:?} of \
          {writes} writes",
@@ -1030,9 +1008,12 @@ fn a_dropped_namespace_drains_from_every_round_state() {
             }
         };
         let (lane, seq) = (cell.namespaces[0].lane, cell.namespaces[0].round_seq);
-        let round = cell.namespaces[0].round.as_ref().expect("the round is open");
+        let t = &cell.namespaces[0];
+        let round = t.round.as_ref().expect("the round is open");
         assert_eq!(round.pending as usize, in_flight.len(), "{state:?}: the in-flight count");
-        let unsent = round.states.iter().filter(|s| **s == OpState::Unsent).count();
+        let unsent = (0..t.flush.round_op_count())
+            .filter(|&index| t.flush.round_op_state(index) == Some(OpState::Unsent))
+            .count();
         assert_eq!(matches!(state, State::Barriers), unsent == 0, "{state:?}: unsent ops");
         // The drop: the keyspace no longer holds the namespace.
         let mut gone = Keyspace::new(StoreConfig::default());
@@ -1234,4 +1215,64 @@ fn seventeen_sealed_ticks_keep_the_cap_and_count_one_crossing() {
     assert!(marks <= 16, "{marks} reclaim marks after 17 sealed ticks with the watermark held");
     let row = cell.census.row("epoch-marks").expect("the marks' row");
     assert_eq!((row.high_water, row.crossings), (16, 1));
+}
+
+/// The op bound over a coarse cut history (the `coarse-ops` history,
+/// ADR-0155 D1/D3): 4,096 records of 64 B, each sealed with a cut, retain
+/// the address space's whole cut deque, so the 270 records of 1 MiB sealed
+/// behind them carry no cut at all. A round's span is chosen by its
+/// records' own headers — the largest whole-record prefix within the 1 MiB
+/// slice, or the first record alone — so it stays within `max(S, M)` bytes
+/// and 74 ops whatever the cuts say. A stage that ended its span at the
+/// next cut took the 270 MiB run whole and stopped at the round's 8-bit op
+/// index.
+#[test]
+fn a_round_over_a_coarse_cut_history_stays_within_the_op_bound() {
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    let spec = TierSpec { tier_io_mode: TierIoMode::Buffered, ..TierSpec::for_budget(512 << 20) };
+    spec.validate().expect("a valid namespace");
+    cell.create_ns(NsId(16), &spec);
+    let mut ks = Keyspace::new(StoreConfig::default());
+    let demote = spec.demotion_config();
+    let space = AddressSpaceConfig {
+        reserve_bytes: demote.ring_reserve_bytes().expect("validated geometry"),
+        page_bytes: 1 << 20,
+        life_origin: LogicalAddr::ZERO,
+    };
+    assert!(ks.materialize_tiered(NsId(16), space, demote, 8192).is_ok());
+    let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+    let hasher = KeyHasher::default();
+    let mut insert = |ordinal: u64, encoded: usize| {
+        let key = ordinal.to_le_bytes();
+        let value = vec![0x5A; encoded - TieredTable::RECORD_HEADER_LEN - key.len()];
+        let addr = table.insert(&key, &value, hasher.hash(&key)).expect("fits");
+        assert_eq!(table.record(addr).encoded_len, encoded);
+        let end = table.space().tail();
+        table.space_mut().advance_ro_boundary(end);
+    };
+    for ordinal in 0..4096 {
+        insert(ordinal, 64);
+    }
+    for ordinal in 4096..4096 + 270 {
+        insert(ordinal, 1 << 20);
+    }
+    let span_max = spec.maintain_slice_bytes.max(table.record_len_max());
+    let t = &mut cell.namespaces[0];
+    for round in 0..3 {
+        let staged = table.stage_flush_round(&mut t.flush).expect("the round stages");
+        assert!(staged <= span_max, "round {round}: the span is at most max(S, M): {staged} B");
+        let ops = t.flush.round_op_count();
+        assert!(ops <= 74, "round {round}: a round carries at most 74 ops: {ops}");
+        let disk = cell.fs.clone();
+        for index in 0..ops {
+            let op = t.flush.round_op(index);
+            if op.is_barrier {
+                disk.driver_fdatasync(op.fd).expect("sim barrier");
+            } else {
+                disk.driver_write_at(op.fd, op.offset, op.bytes).expect("sim write");
+            }
+        }
+        let (_, sealed) = table.complete_flush_round(&mut t.flush);
+        t.files.extend(sealed);
+    }
 }

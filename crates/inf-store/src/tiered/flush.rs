@@ -3,19 +3,38 @@
 
 use super::*;
 
-use inf_log::flush::SeamFlush;
+use std::num::NonZeroU64;
 
-/// A reactor-drive stage refused part-way (ADR-0084 D2): the round keeps
-/// what was staged before the refusal and is issued like any other, its
-/// groups offered to the device budget at their exact size (ADR-0178
-/// D3), so `staged_bytes` is what the round still holds.
-#[derive(Debug)]
-pub struct StageFailed {
-    /// Record bytes the round holds, all staged before the refusal.
-    pub staged_bytes: u64,
-    /// The refusal, classified as the seam drive's (`is_fatal`,
-    /// `is_storage_full`).
-    pub error: TierFlushError,
+use inf_log::flush::{Planned, SeamFlush, Selection};
+
+/// The sealed files one completed round hands back (ADR-0084 D2): at most
+/// two — a capacity rotation's and a trailing gap's — each with the open
+/// creation-mode handle its cold reads reuse (ADR-0054), held inline.
+pub struct SealedFiles<File> {
+    files: [Option<(u32, File)>; 2],
+}
+
+impl<File> SealedFiles<File> {
+    fn none() -> SealedFiles<File> {
+        SealedFiles { files: [None, None] }
+    }
+
+    fn push(&mut self, file: (u32, File)) {
+        let slot = self.files.iter_mut().find(|slot| slot.is_none());
+        debug_assert!(slot.is_some(), "a round seals at most two files");
+        if let Some(slot) = slot {
+            *slot = Some(file);
+        }
+    }
+}
+
+impl<File> IntoIterator for SealedFiles<File> {
+    type Item = (u32, File);
+    type IntoIter = core::iter::Flatten<core::array::IntoIter<Option<(u32, File)>, 2>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.files.into_iter().flatten()
+    }
 }
 
 /// How a pinned checkpoint walk names one index entry (ADR-0057 D1).
@@ -368,93 +387,96 @@ impl TieredTable {
         }
     }
 
-    // ---- reactor-drive flush rounds (M4.5-S31, ADR-0084) ----
+    // ---- reactor-drive flush rounds (M4.5-S31, ADR-0084; ADR-0155 D1–D3) ----
 
-    /// Stages one reactor-drive flush round — the queued twin of
-    /// [`flush_slice`](Self::flush_slice): the same chunk pull, the same
-    /// rotation/early-seal decisions, **no device I/O and no watermark
-    /// movement**. Device intents land on the pipeline's round for the
-    /// plane to ride (`IoOp::LogWrite`/`Fdatasync`); every durability
-    /// fact defers to a round effect that
-    /// [`complete_flush_round`](Self::complete_flush_round) applies at
-    /// the round's last barrier completion. Rounds end early at a
-    /// ring-top gap (effect-ordering simplicity; gaps are once per ring
-    /// wrap). Returns the staged record bytes, which may exceed the
-    /// slice: a chunk ends at the first seal cut past the slice's
-    /// remainder when none lies within it.
+    /// Plans and stages one reactor-drive flush round (ADR-0155 D1–D3): the
+    /// span at the flush cursor is selected by its records' headers — the
+    /// largest whole-record prefix within the slice, or the first record
+    /// alone, ending at a hole, the ro-boundary or the ring top, so at most
+    /// `max(S, M)` bytes; a cut is not consulted — or the hole at the cursor
+    /// alone. The pipeline plans it (positions parsed, windows reserved,
+    /// the next file created), then the span is filed once and staged.
+    /// **No device I/O and no watermark movement**: every durability fact
+    /// defers to a round effect that
+    /// [`complete_flush_round`](Self::complete_flush_round) applies at the
+    /// round's last barrier completion. Returns the span's record bytes (0
+    /// with nothing at the cursor, or for a gap alone).
     ///
     /// # Errors
-    /// File-creation metadata I/O only (the once-per-`TIER-FILE-BYTES`
-    /// open — ADR-0084 D2); a `StorageFull`-class refusal latches the
-    /// device leg exactly like the seam drive (ADR-0063 D4). The error
-    /// carries the record bytes staged before it, which the round still
-    /// holds.
+    /// The round plan's refusal, which staged nothing: file-creation I/O — a
+    /// `StorageFull`-class refusal latches the device leg exactly like the
+    /// seam drive (ADR-0063 D4) — exhausted file ids, or the fatal pair (an
+    /// unaddressable position, a span above the pool).
     pub fn stage_flush_round<F: SegmentFs>(
         &mut self,
         flush: &mut TierFlush<F>,
-    ) -> Result<u64, StageFailed> {
-        let res = self.stage_flush_round_inner(flush);
-        if let Err(failed) = &res {
-            if failed.error.is_storage_full() {
-                self.disk_admit.device_full = true;
+    ) -> Result<u64, TierFlushError> {
+        let cursor = self.flush_start_cursor(flush);
+        let Some(selection) = self.select_span(cursor, flush.slice_bytes()) else { return Ok(0) };
+        let plan = match flush.plan_round(selection) {
+            Planned::Round(plan) => plan,
+            Planned::Nothing => return Ok(0),
+            Planned::Refused(error) => {
+                if error.is_storage_full() {
+                    self.disk_admit.device_full = true;
+                }
+                return Err(error);
             }
-            // A failed stage leaves either no round or a round holding
-            // only what it staged before the failure — a sealed file's
-            // ops, each on a handle the pipeline owns (the writer's, a
-            // pending seal's, a directory hold's): creation touches the
-            // round only after every step that can fail (F-L01-02). The
-            // plane submits such a round as any other; the seal's own
-            // barrier covers it.
-            debug_assert!(flush.round_handles_owned(), "a staged op outlived its handle");
+        };
+        let span_bytes = plan.span_bytes();
+        let Selection::Span { addr, len, .. } = selection else {
+            flush.stage_round(plan, &[]);
+            return Ok(0);
+        };
+        // File the span once (M4-S14), at its plan: it lands whole in the
+        // one file the round plan names, and the pending dead spans it covers
+        // drain into that file's counters (durability is not the counters'
+        // input; the recovery appliers reconcile).
+        let (id, base) = plan.span_file(flush).expect("a span's plan names its file");
+        self.live.note_filed(id, base.to_raw(), addr.to_raw(), len.get());
+        let n = usize::try_from(len.get()).expect("a span fits usize");
+        flush.stage_round(plan, self.space.bytes(addr, n));
+        let end = addr.to_raw() + len.get();
+        if self.flush_ends.len() == FLUSH_ENDS_CAP {
+            self.flush_ends.pop_front(); // dominated candidate
         }
-        res
+        self.flush_ends.push_back(end);
+        Ok(span_bytes)
     }
 
-    fn stage_flush_round_inner<F: SegmentFs>(
-        &mut self,
-        flush: &mut TierFlush<F>,
-    ) -> Result<u64, StageFailed> {
-        debug_assert!(!flush.round_active(), "staging over an in-flight round");
-        let budget = flush.slice_bytes();
-        let flushed0 = self.space.flushed().to_raw();
-        let mut cursor = self.flush_start_cursor(flush);
-        assert!(cursor >= flushed0, "flush cursor behind the watermark");
-        let mut spent = 0u64;
-        let mut wrote = false;
-        while spent < budget {
-            let at = LogicalAddr::from_raw(cursor).expect("watermarks stay 48-bit");
-            let Some(chunk) = self.space.next_flush_chunk(at, budget - spent) else { break };
-            match chunk {
-                FlushChunk::Gap { at, len } => {
-                    debug_assert_eq!(at.to_raw(), cursor, "gap starts at the cursor");
-                    flush.seal_for_gap_queued(at.to_raw() + len);
-                    break;
-                }
-                FlushChunk::Records { addr, len } => {
-                    let n = usize::try_from(len).expect("chunk fits usize");
-                    flush
-                        .append_range_queued(addr, self.space.bytes(addr, n))
-                        .map_err(|error| StageFailed { staged_bytes: spent, error })?;
-                    // File the chunk (M4-S14) — stage-time, exactly like
-                    // the seam drive (durability is not the counters'
-                    // input; the recovery appliers reconcile).
-                    let (id, base, _, _, _) =
-                        flush.active().expect("append_range leaves a file active");
-                    self.live.note_filed(id, base.to_raw(), addr.to_raw(), len);
-                    cursor = addr.to_raw() + len;
-                    if self.flush_ends.len() == FLUSH_ENDS_CAP {
-                        self.flush_ends.pop_front(); // dominated candidate
-                    }
-                    self.flush_ends.push_back(cursor);
-                    spent += len;
-                    wrote = true;
-                }
-            }
+    /// The selection at `cursor` (ADR-0155 D1): `None` with nothing to
+    /// flush; the hole at the cursor alone; or the span of whole records
+    /// [`select_whole_records`](super::select::select_whole_records) picks,
+    /// with the hole it ends at when
+    /// it ends at one.
+    ///
+    /// # Panics
+    /// Panics when the bytes at the cursor are not whole records below
+    /// their bound — the ring's own invariant: records are allocated
+    /// whole, contiguous between holes, and the ro-boundary and the ring
+    /// top are record boundaries.
+    fn select_span(&self, cursor: u64, slice_bytes: u64) -> Option<Selection> {
+        if !self.space.flush_work_at(cursor) {
+            return None;
         }
-        if wrote {
-            flush.sync_queued();
+        let at = LogicalAddr::from_raw(cursor).expect("watermarks stay 48-bit");
+        if let Some(hole) = self.space.hole_at(at) {
+            return Some(Selection::Gap { end: cursor + hole });
         }
-        Ok(spent)
+        let hard_end = self.space.flush_span_bound(at);
+        let end = select::select_whole_records(cursor, hard_end, slice_bytes, |addr| {
+            let addr = LogicalAddr::from_raw(addr).expect("watermarks stay 48-bit");
+            crate::record::encoded_len_from_header(
+                self.space.bytes(addr, crate::record::HEADER_LEN),
+            ) as u64
+        })
+        .expect("the ring holds whole records below the flush bound");
+        let len = NonZeroU64::new(end - cursor).expect("a selection holds a record");
+        let end_at = LogicalAddr::from_raw(end).expect("watermarks stay 48-bit");
+        let gap_end = (end < self.space.ro_boundary().to_raw())
+            .then(|| self.space.hole_at(end_at).map(|hole| end + hole))
+            .flatten();
+        Some(Selection::Span { addr: at, len, gap_end })
     }
 
     /// Where the next flush stage starts, for the seam drive, the reactor
@@ -483,15 +505,16 @@ impl TieredTable {
     pub fn complete_flush_round<F: SegmentFs>(
         &mut self,
         flush: &mut TierFlush<F>,
-    ) -> FlushSliceOutcome {
+    ) -> (FlushSliceOutcome, SealedFiles<F::File>) {
         let flushed0 = self.space.flushed().to_raw();
         let sealed0 = flush.sealed().len();
         let probed = flush.round_barrier_count() > 0;
         let mut outcome = FlushSliceOutcome::default();
+        let mut sealed_files = SealedFiles::none();
         for effect in flush.finish_round() {
             match effect {
                 inf_log::RoundEffect::DurableTo { data_len } => flush.confirm_durable_to(data_len),
-                inf_log::RoundEffect::SealCommit => flush.commit_oldest_seal(),
+                inf_log::RoundEffect::SealCommit => sealed_files.push(flush.commit_oldest_seal()),
                 inf_log::RoundEffect::GapCross { to } => {
                     self.space.advance_flushed(
                         LogicalAddr::from_raw(to).expect("watermarks stay 48-bit"),
@@ -514,7 +537,7 @@ impl TieredTable {
         outcome.confirmed_bytes = self.space.flushed().to_raw() - flushed0;
         self.space.note_flush_slice(outcome.confirmed_bytes);
         self.charge_flush_device(flush);
-        outcome
+        (outcome, sealed_files)
     }
 
     /// Latches the ADR-0063 D4 device leg from a reactor-drive write

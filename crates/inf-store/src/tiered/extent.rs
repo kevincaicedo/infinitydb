@@ -37,6 +37,14 @@ impl TieredTable {
         (self.space.ring_bytes() / 2) as usize
     }
 
+    /// `M`: the largest encoded record this table admits — the format's
+    /// largest, at most [`inline_record_max`](Self::inline_record_max). A
+    /// tier round's span is at most `max(MAINTAIN-SLICE, M)` (ADR-0155 D1).
+    #[must_use]
+    pub fn record_len_max(&self) -> u64 {
+        (self.inline_record_max() as u64).min(crate::record::RECORD_ENCODED_LEN_MAX as u64)
+    }
+
     pub(super) fn clamp_blob_config(
         ring_bytes: u64,
         blob: crate::extents::BlobConfig,

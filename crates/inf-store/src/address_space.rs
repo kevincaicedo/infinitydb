@@ -792,6 +792,26 @@ impl AddressSpace {
         self.hole_marks.iter().find(|&&(start, _)| start == a).map(|&(_, len)| len)
     }
 
+    /// How far a span of records starting at `cursor` may reach: the first
+    /// hole's start at or past it, the ro-boundary, or the ring top,
+    /// whichever comes first — each a record boundary, and the last because
+    /// the span is read as one contiguous slice ([`bytes`](Self::bytes)).
+    /// The tier round's selector walks whole records up to it (ADR-0155 D1);
+    /// [`next_flush_chunk`](Self::next_flush_chunk)'s hard bound is the same.
+    ///
+    /// # Panics
+    /// Panics unless `flushed ≤ cursor ≤ ro_boundary`.
+    #[must_use]
+    pub fn flush_span_bound(&self, cursor: LogicalAddr) -> u64 {
+        let c = cursor.to_raw();
+        assert!(c >= self.flushed, "flush cursor below flushed");
+        assert!(c <= self.ro_boundary, "flush cursor above ro_boundary");
+        let ring = self.ring_mask + 1;
+        let ring_top = c + (ring - ((c - self.life_origin) & self.ring_mask));
+        let next_hole = self.hole_marks.iter().find(|&&(start, _)| start >= c);
+        next_hole.map_or(self.ro_boundary, |&(start, _)| start.min(self.ro_boundary)).min(ring_top)
+    }
+
     /// The next unit of flush work at `cursor`, bounded by `max_bytes` —
     /// a pure query; the pipeline appends/seals, fdatasyncs, then
     /// confirms via [`advance_flushed`](Self::advance_flushed). `cursor`

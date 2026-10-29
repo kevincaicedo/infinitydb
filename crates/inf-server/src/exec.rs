@@ -68,10 +68,12 @@ pub enum TierFlushGauge {
     TurnContended,
     /// Rounds the plan pass staged.
     RoundsPlanned,
+    /// Plans refused because a namespace's tier file ids are spent.
+    FileIdsExhausted,
 }
 
 /// The number of [`TierFlushGauge`] slots.
-pub const TIER_FLUSH_GAUGES: usize = TierFlushGauge::RoundsPlanned as usize + 1;
+pub const TIER_FLUSH_GAUGES: usize = TierFlushGauge::FileIdsExhausted as usize + 1;
 
 /// Default-initializable state surfaced through the command layer (M0-S19 + M1-S03):
 /// the frozen tripwire snapshot, the memory-attribution domains the store
@@ -121,6 +123,12 @@ pub struct NodeState {
     pub reply_pool_bytes: Cell<u64>,
     pub cmd_pool_bytes: Cell<u64>,
     pub cold_pool_bytes: Cell<u64>,
+    /// The tier flush pipelines' window pools on this cell: the capacity
+    /// reserved at their builds, and the bytes of the windows written at
+    /// least once — the LIFO high water of windows out (ADR-0155 D2/D3).
+    /// Render-only, like the pools above.
+    pub tier_window_capacity_bytes: Cell<u64>,
+    pub tier_window_written_bytes: Cell<u64>,
     pub connections: Cell<u64>,
     pub recv_dropped: Cell<u64>,
     pub fabric_rtt_p50_ns: Cell<u64>,

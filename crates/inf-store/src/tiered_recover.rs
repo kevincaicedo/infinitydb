@@ -98,7 +98,8 @@ pub struct RecoveredTier<F: SegmentFs> {
 /// I/O failures; `InvalidData` when a named file is missing, its header
 /// identity mismatches, or a sealed footer covers less than the
 /// manifested range; `OutOfMemory` when the ring reservation fails.
-// the recovery entry's seven inputs + the key hasher (ADR-0094)
+// the recovery entry's seven inputs, the key hasher (ADR-0094) and the
+// cell's cap census, which the recovered pipeline's holders register on
 #[allow(clippy::too_many_arguments)]
 pub fn recover_tiered_ns<F: SegmentFs>(
     fs: F,
@@ -109,6 +110,7 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     demote: DemotionConfig,
     initial_keys: usize,
     hasher: KeyHasher,
+    census: &std::rc::Rc<inf_foundation::bounded::CapCensus>,
 ) -> io::Result<RecoveredTier<F>> {
     assert_eq!(flush_config.ns.0, tier.ns, "manifest section vs pipeline namespace");
     // The directory is not created here: a namespace that never flushed
@@ -232,7 +234,7 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     // and tail replay run; byte counters restore when the `.ick` 0x04
     // section arrives ([`apply_live_set_section`]).
     table.seed_recovered_files(&catalog, boot_ckpt_id);
-    let flush = TierFlush::with_catalog(fs, flush_config, next_id, catalog);
+    let flush = TierFlush::with_catalog(fs, flush_config, next_id, catalog, census);
     let replay = TierReplay::new(BootFlush::new(flush, handles), &table);
     Ok(RecoveredTier { table, replay, extents_listed, extents_quarantined, stats })
 }

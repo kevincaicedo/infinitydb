@@ -110,8 +110,10 @@ fn pipeline_leg(dir: &Path, rep: usize, mode: TierIoMode) -> f64 {
             mode,
             file_capacity: TIER_FILE_CAPACITY_DEFAULT,
             slice_bytes: SYNC_EVERY,
+            record_len_max: SYNC_EVERY,
         },
         0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
     let payload = vec![0xC3u8; CHUNK];
     let started = Instant::now();

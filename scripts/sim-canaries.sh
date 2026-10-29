@@ -217,6 +217,14 @@ rows=(
   # read below the confirmable length reaches frames a held round has not
   # written, and the driver answers short.
   "inf_canary_cold_window_staged_len crate-test inf-server lib a_cold_read_below_the_confirmable_length_fills_its_window_while_a_round_is_held the window is filled"
+  # ADR-0155 D2/D3: the tier round's plan reserves one batch window fewer
+  # than its span takes — the round envelope test's stage must stop at the
+  # take past the reservation.
+  "inf_canary_tier_plan_window_short crate-test inf-log lib the_round_envelope_holds_over_its_two_hundred_cases past the round plan's reservation"
+  # ADR-0155 D5: the round's windows return to the pool at its last
+  # write's send — the custody test's held completion must read a
+  # recycled window.
+  "inf_canary_tier_window_early_put crate-test inf-log lib a_held_completion_reads_its_own_window_until_the_round_ends reads a recycled window"
   # ADR-0163 D2: the cell's loop never takes its serve mark, so the census
   # its containers registered with stays assembling — what a loop marking
   # another census leaves. The assembly rule's liveness, on every cell; no

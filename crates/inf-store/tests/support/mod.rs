@@ -43,6 +43,7 @@ pub fn flush_config(ns: NsId, file_capacity: u64) -> TierFlushConfig {
         mode: TierIoMode::Buffered,
         file_capacity,
         slice_bytes: PAGE,
+        record_len_max: 16 << 20,
     }
 }
 

@@ -68,7 +68,12 @@ impl Rig {
         let fs = MemFs::new();
         let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
             .expect("ring");
-        let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
+        let flush = TierFlush::new(
+            fs.clone(),
+            flush_config(NS, FILE_CAPACITY),
+            0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        );
         Rig {
             table,
             fs,
@@ -433,7 +438,12 @@ fn stalled_relocation_resumes_after_window_progress() {
     let fs = MemFs::new();
     let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
         .expect("ring");
-    let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
+    let flush = TierFlush::new(
+        fs.clone(),
+        flush_config(NS, FILE_CAPACITY),
+        0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+    );
     let mut rig = Rig {
         table,
         fs,
@@ -733,6 +743,7 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
         demote,
         2048,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery");
     let mut ks = keyspace_with(NS, recovered.table);
@@ -836,7 +847,12 @@ fn endurance_slice_disk_oscillates_and_statvfs_reclaims() {
     let mut table = TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default())
         .expect("ring");
     table.set_compaction_config(CompactionConfig { dead_ratio_pct: 50, slice_bytes: 1 << 20 });
-    let mut flush = TierFlush::new(StdSegmentFs, config, 0);
+    let mut flush = TierFlush::new(
+        StdSegmentFs,
+        config,
+        0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+    );
 
     let keys = 1500u64;
     let mut seed = 0x0E2D_5EED_u64;

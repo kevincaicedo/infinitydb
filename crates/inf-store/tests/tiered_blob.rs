@@ -119,8 +119,10 @@ impl Rig {
                 mode: TierIoMode::Buffered,
                 file_capacity: FILE_CAPACITY,
                 slice_bytes: PAGE,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         Rig {
             fs,
@@ -670,6 +672,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
             mode: TierIoMode::Buffered,
             file_capacity: FILE_CAPACITY,
             slice_bytes: PAGE,
+            record_len_max: 16 << 20,
         },
         AddressSpaceConfig {
             reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
@@ -679,6 +682,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
         demote,
         2048,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery");
     assert!(

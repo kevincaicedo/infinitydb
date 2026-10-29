@@ -51,10 +51,11 @@ pub(crate) fn ckpt_block(stream: &IckStream, lease: &SectionLease) -> StableByte
 /// Captures one tier-flush round op's window for a driver `LogWrite`
 /// (M4.5-S31, ADR-0084 D3).
 ///
-/// The round is the stability proof: windows are pool-owned `Box<[u8]>`
-/// blocks inside the namespace's `TierFlush` — heap storage that never
-/// moves when the owning structs move — staged once per round and never
-/// written again (error retries resubmit byte-identical). They return
+/// The round is the stability proof: windows are pool-owned buffers
+/// inside the namespace's `TierFlush`, each reserved whole at the
+/// pipeline's build and never reallocated — heap storage that never moves
+/// when the owning structs move — staged once per round and never written
+/// again (error retries resubmit byte-identical). They return
 /// to the pool only in `finish_round`, which the plane calls strictly
 /// after every op of the round reached a terminal completion (the
 /// `FlushRound::pending` count in `tier_cell`), and a namespace dropped

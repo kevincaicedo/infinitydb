@@ -187,8 +187,10 @@ fn workload(dir: &Path, user_mib: u64, leg: Leg) -> Run {
                 Leg::Churn => CHURN_FILE_CAPACITY,
             },
             slice_bytes: SLICE,
+            record_len_max: 16 << 20,
         },
         0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
     let mut rotor = SegmentRotor::create_fresh(
         StdSegmentFs,

@@ -63,8 +63,10 @@ fn flush_for(ns: NsId, fs: &MemFs) -> TierFlush<MemFs> {
             mode: TierIoMode::Buffered,
             file_capacity: 256 << 10,
             slice_bytes: 1 << 20,
+            record_len_max: 16 << 20,
         },
         0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
 }
 
@@ -387,8 +389,10 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
             mode: TierIoMode::Buffered,
             file_capacity: 256 << 10,
             slice_bytes: 1 << 20,
+            record_len_max: 16 << 20,
         },
         0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
     let avail_start = avail_bytes(&root);
 

@@ -646,6 +646,7 @@ fn flush_config(shard: &Path) -> TierFlushConfig {
         mode: TierIoMode::Buffered,
         file_capacity: FILE_CAPACITY,
         slice_bytes: PAGE,
+        record_len_max: 16 << 20,
     }
 }
 
@@ -1410,6 +1411,7 @@ impl Run {
             raised(),
             1024,
             hasher,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         )
         .map_err(|e| format!("tier recovery: {e}"))?;
         let mut node = Booting::new(recovered.table, recovered.replay, hasher, &self.spec);
@@ -2376,7 +2378,12 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
     };
     let mut life = Life {
         table: tiered_table(&spec, 0, hasher),
-        flush: TierFlush::new(disk.clone(), flush_config(&shard), 0),
+        flush: TierFlush::new(
+            disk.clone(),
+            flush_config(&shard),
+            0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        ),
         ring: StagingRing::new(StagingConfig::default()),
         flush_lag: false,
     };
@@ -2708,6 +2715,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             spec.boot,
             1024,
             hasher,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         ) {
             Ok(recovered) => recovered,
             Err(e) => {

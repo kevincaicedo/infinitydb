@@ -34,6 +34,12 @@ pub const MAX_VAL_LEN: usize = (1 << 24) - 1;
 
 pub(crate) const HEADER_LEN: usize = 8;
 pub(crate) const TTL_EXT_LEN: usize = 5;
+
+/// The format's largest encoded record: the header, the expiry extension,
+/// a 255-byte key and a `MAX_VAL_LEN` value, 16,777,483 B (ADR-0155 D3).
+/// A namespace admits at most this, and at most half its ring.
+pub const RECORD_ENCODED_LEN_MAX: usize = HEADER_LEN + TTL_EXT_LEN + MAX_KEY_LEN + MAX_VAL_LEN;
+const _: () = assert!(RECORD_ENCODED_LEN_MAX == 16_777_483, "the format's largest record");
 // The tier format's key window holds every record's key: the fixed
 // header, the TTL extension and the longest key end inside it.
 const _: () = assert!(HEADER_LEN + TTL_EXT_LEN + MAX_KEY_LEN <= inf_log::TIER_KEY_WINDOW_BYTES);

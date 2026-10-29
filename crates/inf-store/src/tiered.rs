@@ -43,8 +43,9 @@ use crate::write_accounting::WriteAccounting;
 
 mod extent;
 mod flush;
+pub mod select;
 
-pub use flush::StageFailed;
+pub use flush::SealedFiles;
 
 // ---- shared data definitions (behaviour lives in the child modules) ----------
 

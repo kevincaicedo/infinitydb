@@ -37,13 +37,13 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use inf_alloc::AlignedPool;
+use inf_foundation::LogHistogram;
 use inf_foundation::bounded::CapCensus;
-use inf_foundation::{FileOffset, LogHistogram};
 use inf_log::blob::ExtentId;
 use inf_log::flush::{PendingSealView, unlink_tier_file};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::limits::{TIER_GROUP_BYTES_MAX, TIER_GROUP_OPS_MAX};
-use inf_log::{NsId, TierDrive, TierFileMeta, TierFlush, TierFlushConfig, TierFlushError};
+use inf_log::{NsId, OpState, TierDrive, TierFileMeta, TierFlush, TierFlushConfig, TierFlushError};
 use inf_runtime::{
     ColdReadConfig, ColdReads, CompletionToken, IoOp, Issue, TierFileId, TokenClass, WaitList,
     WriteBarrier,
@@ -151,17 +151,12 @@ pub(crate) struct TierNs<F: SegmentFs> {
     release_epoch: u64,
 }
 
-/// Plane bookkeeping of one in-flight flush round (M4.5-S31): terminal
-/// op states parallel to `TierFlush::round_op`, the group cursor, the
-/// phase, and the identity its completion tokens carry.
+/// Plane bookkeeping of one in-flight flush round (M4.5-S31): the group
+/// cursor, the phase, and the identity its completion tokens carry. The
+/// ops' states and positions live in the staged ops themselves
+/// (`TierFlush::round_op`, ADR-0167 A1), so no second table beside them
+/// exists to keep in step.
 pub(crate) struct FlushRound {
-    states: Vec<OpState>,
-    /// Write positions checked when the round opened, indexed like
-    /// `round_op` (writes occupy `0..round_write_count()`, barriers
-    /// follow). Staged ops are immutable until `finish_round`, so a held
-    /// position stays the staged op's; every emit re-checks it in debug
-    /// builds (ADR-0167 D4).
-    write_positions: Vec<FileOffset>,
     /// Ops submitted, not yet terminal.
     pending: u32,
     /// Writes until every write is done, then barriers (ADR-0178 T4: the
@@ -191,30 +186,14 @@ pub(crate) struct FlushRound {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum OpState {
-    Unsent,
-    Sent,
-    Done,
-    Failed,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum RoundPhase {
     Writes,
     Barriers,
 }
 
 impl FlushRound {
-    fn new(
-        op_count: usize,
-        write_positions: Vec<FileOffset>,
-        round_seq: u32,
-        staged_at_us: u64,
-    ) -> FlushRound {
-        debug_assert!(write_positions.len() <= op_count, "writes lead the round's ops");
+    fn new(round_seq: u32, staged_at_us: u64) -> FlushRound {
         FlushRound {
-            states: vec![OpState::Unsent; op_count],
-            write_positions,
             pending: 0,
             phase: RoundPhase::Writes,
             next_unsent: 0,
@@ -238,9 +217,9 @@ impl FlushRound {
     /// The first unsent op of the current phase's range — the cursor, by
     /// the rule its writers keep — or `None` once the phase is spent.
     /// One primitive for "is a group ready" and "where does it start".
-    fn first_unsent(&self, writes: usize, op_count: usize) -> Option<usize> {
-        let range = self.phase_range(writes, op_count);
-        let first = range.clone().find(|&index| self.states[index] == OpState::Unsent);
+    fn first_unsent<F: SegmentFs>(&self, flush: &TierFlush<F>) -> Option<usize> {
+        let range = self.phase_range(flush.round_write_count(), flush.round_op_count());
+        let first = range.clone().find(|&index| unsent(flush, index));
         debug_assert_eq!(
             first.unwrap_or(range.end),
             range.start,
@@ -251,8 +230,8 @@ impl FlushRound {
 
     /// Whether an unsent op lies in the current phase's range: a group
     /// is ready to be built and offered.
-    fn has_ready_group(&self, writes: usize, op_count: usize) -> bool {
-        self.first_unsent(writes, op_count).is_some()
+    fn has_ready_group<F: SegmentFs>(&self, flush: &TierFlush<F>) -> bool {
+        self.first_unsent(flush).is_some()
     }
 
     /// Places the cursor at the first unsent op at or above `from` in the
@@ -261,12 +240,16 @@ impl FlushRound {
     /// write may lie below the old cursor), the barrier phase from the
     /// first barrier, an emit from its group's end — so a run of done
     /// ops is passed here, once, never charged to a turn's visits.
-    fn place_cursor(&mut self, from: usize, writes: usize, op_count: usize) {
+    fn place_cursor<F: SegmentFs>(&mut self, from: usize, flush: &TierFlush<F>) {
         self.next_unsent = from;
-        let range = self.phase_range(writes, op_count);
-        self.next_unsent =
-            range.clone().find(|&index| self.states[index] == OpState::Unsent).unwrap_or(range.end);
+        let range = self.phase_range(flush.round_write_count(), flush.round_op_count());
+        self.next_unsent = range.clone().find(|&index| unsent(flush, index)).unwrap_or(range.end);
     }
+}
+
+/// Whether round op `index` is unsent, read from the staged op itself.
+fn unsent<F: SegmentFs>(flush: &TierFlush<F>, index: usize) -> bool {
+    flush.round_op_state(index) == Some(OpState::Unsent)
 }
 
 /// Cell-scope reactor-drive flush observables (ADR-0084 D6 — the
@@ -296,6 +279,10 @@ pub(crate) struct TierFlushStats {
     /// Plans the pass made — a span, a gap or a refusal — one per turn at
     /// most.
     pub rounds_planned: u64,
+    /// Plans refused because a namespace's file ids are spent: its flush
+    /// stops for the lifetime, and each turn that would plan it again
+    /// counts one.
+    pub file_ids_exhausted: u64,
 }
 
 /// A tier file's readable length: the data bytes below which a cold-read
@@ -444,9 +431,7 @@ impl<F: SegmentFs> TierNs<F> {
 
     /// Whether this namespace's round holds a group it may offer.
     fn has_ready_group(&self) -> bool {
-        self.round.as_ref().is_some_and(|r| {
-            r.has_ready_group(self.flush.round_write_count(), self.flush.round_op_count())
-        })
+        self.round.as_ref().is_some_and(|r| r.has_ready_group(&self.flush))
     }
 }
 
@@ -720,8 +705,10 @@ impl<F: SegmentFs + Clone> TierCell<F> {
                 mode: spec.tier_io_mode,
                 file_capacity: inf_log::flush::TIER_FILE_CAPACITY_DEFAULT,
                 slice_bytes: spec.maintain_slice_bytes,
+                record_len_max: spec.record_len_max().unwrap_or(spec.maintain_slice_bytes),
             },
             0,
+            &self.census,
         );
         // The plane's filesystems are fd-backed (StdSegmentFs, SimDisk):
         // flush I/O rides the driver (M4.5-S31, ADR-0084 D1).
@@ -837,9 +824,6 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         // turn's, after every namespace was visited.
         let sealed = if table.demote_due() { table.seal_slice() } else { 0 };
         let advanced = advance_round(table, t, stats, now_us);
-        for (id, handle) in t.flush.take_sealed_handles() {
-            t.files.push((id, handle));
-        }
         let released = table.release_slice();
         if (sealed | released) > 0 {
             units += 1 + ((sealed + released) / 4096) as u32;
@@ -950,26 +934,31 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             planned = true;
             self.turn.planned_last = Some(t.ns);
             stats.rounds_planned += 1;
-            let stage = table.stage_flush_round(&mut t.flush);
-            staged = match &stage {
-                Ok(bytes) => *bytes,
-                Err(failed) => failed.staged_bytes,
-            };
-            if t.flush.round_active() {
-                if t.flush.round_op_count() == 0 {
-                    // Effects-only round (a gap at a file boundary): nothing
-                    // to wait on — the crossing applies now, as the seam
-                    // drive did.
-                    let _ = table.complete_flush_round(&mut t.flush);
-                    stats.rounds += 1;
-                } else if let Err(err) =
-                    open_round(t, now_us, |flush, index| flush.round_op(index).offset)
-                {
-                    return (staged, Err(err));
+            // The plan parses every position, reserves its windows and
+            // creates its file before it stages anything (ADR-0155 D2,
+            // ADR-0167 A1): a refusal leaves no round behind.
+            match table.stage_flush_round(&mut t.flush) {
+                Ok(bytes) => staged = bytes,
+                Err(err) => {
+                    debug_assert!(!t.flush.round_active(), "a refused plan staged nothing");
+                    if matches!(err, TierFlushError::FileIdsExhausted { .. }) {
+                        stats.file_ids_exhausted += 1;
+                    }
+                    if err.is_fatal() {
+                        return (staged, Err(err));
+                    }
+                    result = Err(err);
+                    continue;
                 }
             }
-            if let Err(failed) = stage {
-                result = Err(failed.error);
+            if t.flush.round_op_count() == 0 {
+                // Effects-only round (a gap at a file boundary): nothing to
+                // wait on — the crossing applies now, as the seam drive did.
+                let (_, sealed) = table.complete_flush_round(&mut t.flush);
+                t.files.extend(sealed);
+                stats.rounds += 1;
+            } else {
+                open_round(t, now_us);
             }
         }
         (staged, result)
@@ -1132,7 +1121,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             self.flush_stats.stale_completions += 1;
             return;
         };
-        if round.round_seq != token.generation() || round.states[index] != OpState::Sent {
+        let sent = t.flush.round_op_state(index) == Some(OpState::Sent);
+        if round.round_seq != token.generation() || !sent {
             self.flush_stats.stale_completions += 1;
             return;
         }
@@ -1153,20 +1143,25 @@ impl<F: SegmentFs + Clone> TierCell<F> {
                 inf_foundation::fault::fire(inf_log::fault::TIER_WRITE_NOSPACE).then_some(ENOSPC)
             }
         });
+        let completed = t.flush.complete_op(index, errno.is_some());
+        debug_assert!(completed, "a sent op completes");
         match errno {
-            None => round.states[index] = OpState::Done,
-            Some(e) if is_barrier => {
-                round.states[index] = OpState::Failed;
-                round.fatal = Some(e);
-            }
-            Some(e) => {
-                round.states[index] = OpState::Failed;
-                // ENOSPC dominates: it must reach the admission latch.
-                if e == ENOSPC || round.write_error.is_none() {
-                    round.write_error = Some(e);
-                }
-            }
+            None => {}
+            Some(e) if is_barrier => round.fatal = Some(e),
+            // ENOSPC dominates: it must reach the admission latch.
+            Some(e) if e == ENOSPC || round.write_error.is_none() => round.write_error = Some(e),
+            Some(_) => {}
         }
+    }
+
+    /// The cell's tier window pools, live and draining: the capacity
+    /// reserved at their builds and the bytes of the windows written at
+    /// least once (`tier_window_capacity_bytes`, `tier_window_written_bytes`).
+    pub(crate) fn window_bytes(&self) -> (u64, u64) {
+        let pipelines = self.namespaces.iter().chain(&self.round_drain).map(|t| &t.flush);
+        pipelines.fold((0, 0), |(capacity, written), flush| {
+            (capacity + flush.window_capacity_bytes(), written + flush.window_written_bytes())
+        })
     }
 
     /// Reactor-drive flush rounds currently in flight (INFO gauge).
@@ -1221,9 +1216,8 @@ fn visit_namespace<F: SegmentFs>(
     if let Some(since) = round.ready_since_us {
         stats.group_wait_us_max = stats.group_wait_us_max.max(now_us.saturating_sub(since));
     }
-    emit_group(&t.flush, round, t.lane, granted, ops);
-    let (writes, op_count) = (t.flush.round_write_count(), t.flush.round_op_count());
-    round.ready_since_us = round.has_ready_group(writes, op_count).then_some(now_us);
+    emit_group(&mut t.flush, round, t.lane, granted, ops);
+    round.ready_since_us = round.has_ready_group(&t.flush).then_some(now_us);
     turn.holder = None;
     turn.served_last = Some(t.ns);
     Visit::Issued { visits: group.visits }
@@ -1376,39 +1370,41 @@ fn advance_round<F: SegmentFs>(
                     table.note_flush_device_full();
                 }
                 stats.write_retries += 1;
-                for state in &mut round.states[..writes] {
-                    if *state == OpState::Failed {
-                        *state = OpState::Unsent;
-                    }
-                }
+                let requeued = t.flush.retry_failed_writes();
+                debug_assert!(requeued > 0, "a write error leaves a failed write");
                 // The failed writes lie below the old cursor: the cursor
                 // is placed from the round's start, at the first of them.
-                round.place_cursor(0, writes, op_count);
+                round.place_cursor(0, &t.flush);
                 round.ready_since_us = Some(now_us);
                 round.retry = true;
                 return Ok(());
             }
-            let all_done = round.states[..writes].iter().all(|s| *s == OpState::Done);
+            let state = |index| t.flush.round_op_state(index);
+            let all_done = (0..writes).all(|index| state(index) == Some(OpState::Done));
             // A planted canary: the barrier group is offered once every
             // write is sent, done or not — the write-then-barrier order
             // ADR-0178 T4 keeps (the cut's boot must refuse a tier frame
             // the device never held below the manifested watermark).
-            let all_sent = round.states[..writes].iter().all(|s| *s != OpState::Unsent);
+            let all_sent = (0..writes).all(|index| state(index) != Some(OpState::Unsent));
             if all_done || (cfg!(inf_canary_tier_barrier_early) && all_sent) {
                 round.phase = RoundPhase::Barriers;
-                round.place_cursor(writes, writes, op_count);
+                round.place_cursor(writes, &t.flush);
                 round.ready_since_us = Some(now_us);
                 round.retry = false;
             }
             Ok(())
         }
         RoundPhase::Barriers => {
-            let all_done = round.states[writes..op_count].iter().all(|s| *s == OpState::Done);
+            let all_done = (writes..op_count)
+                .all(|index| t.flush.round_op_state(index) == Some(OpState::Done));
             if round.pending > 0 || !all_done {
                 return Ok(());
             }
             let round = t.round.take().expect("matched above");
-            let _ = table.complete_flush_round(&mut t.flush);
+            // The completion hands back each file it sealed, with the
+            // creation-mode handle cold reads reuse (ADR-0054).
+            let (_, sealed) = table.complete_flush_round(&mut t.flush);
+            t.files.extend(sealed);
             stats.rounds += 1;
             stats.round_us.record(now_us.saturating_sub(round.staged_at_us));
             Ok(())
@@ -1416,34 +1412,13 @@ fn advance_round<F: SegmentFs>(
     }
 }
 
-/// Opens the staged round whole or not at all (ADR-0167 D4): every write
-/// position is checked before a [`FlushRound`] exists, so a refusal opens
-/// no round and advances no round sequence, and the round never checks a
-/// position again. Nothing is pushed: the round's groups are offered at
-/// the turn. `position_of(flush, index)` reads the staged write's
-/// position — the production source is `flush.round_op(index).offset`;
-/// tests plant through it. Fatal on a refusal: the check follows
-/// staging, and a retry would stage the same position.
-fn open_round<F: SegmentFs>(
-    t: &mut TierNs<F>,
-    now_us: u64,
-    position_of: impl Fn(&TierFlush<F>, usize) -> u64,
-) -> Result<(), TierFlushError> {
-    let writes = t.flush.round_write_count();
-    let mut write_positions = Vec::with_capacity(writes);
-    for index in 0..writes {
-        let position = FileOffset::new(position_of(&t.flush, index)).map_err(|refused| {
-            TierFlushError::Unaddressable {
-                path: t.dir.join("cold"),
-                offset_bytes: refused.offset_bytes(),
-            }
-        })?;
-        write_positions.push(position);
-    }
+/// Opens the staged round: its plan parsed every write position and
+/// reserved every window before the stage (ADR-0167 A1), so opening it
+/// cannot fail and checks nothing. Nothing is pushed: the round's groups
+/// are offered at the turn.
+fn open_round<F: SegmentFs>(t: &mut TierNs<F>, now_us: u64) {
     t.round_seq = t.round_seq.wrapping_add(1);
-    let op_count = t.flush.round_op_count();
-    t.round = Some(FlushRound::new(op_count, write_positions, t.round_seq, now_us));
-    Ok(())
+    t.round = Some(FlushRound::new(t.round_seq, now_us));
 }
 
 /// Builds the round's next group: the longest run of unsent ops from the
@@ -1465,10 +1440,10 @@ fn next_group<F: SegmentFs>(
     visits_left: NonZeroUsize,
 ) -> Option<Group> {
     let (writes, op_count) = (flush.round_write_count(), flush.round_op_count());
-    let first = round.first_unsent(writes, op_count)?;
+    let first = round.first_unsent(flush)?;
     let mut group = Group { first, end: first, ops: 0, bytes: 0, visits: 0 };
     for index in first..round.phase_range(writes, op_count).end {
-        if round.states[index] != OpState::Unsent {
+        if !unsent(flush, index) {
             continue;
         }
         if group.visits == visits_left.get() {
@@ -1515,7 +1490,7 @@ fn round_slot(lane: u32, index: usize) -> u32 {
 /// `finish_round` — the `StableBytes` custody argument lives in
 /// `log_bytes::tier_round_bytes`.
 fn emit_group<F: SegmentFs>(
-    flush: &TierFlush<F>,
+    flush: &mut TierFlush<F>,
     round: &mut FlushRound,
     lane: u32,
     group: GrantedGroup,
@@ -1523,7 +1498,7 @@ fn emit_group<F: SegmentFs>(
 ) {
     let mut emitted = 0usize;
     for index in group.first..group.end {
-        if round.states[index] != OpState::Unsent {
+        if !unsent(flush, index) {
             continue;
         }
         let view = flush.round_op(index);
@@ -1533,22 +1508,22 @@ fn emit_group<F: SegmentFs>(
             ops.push(IoOp::Fdatasync { fd: view.fd, token });
         } else {
             let token = CompletionToken::new(TokenClass::TierFlushWrite, slot, round.round_seq);
-            let position = round.write_positions[index];
-            debug_assert_eq!(position.bytes(), view.offset, "held position is the staged op's");
+            // The position is the round plan's, parsed once (ADR-0167 A1).
             ops.push(IoOp::LogWrite {
                 fd: view.fd,
-                offset: position,
+                offset: view.offset,
                 data: crate::log_bytes::tier_round_bytes(&view),
                 token,
                 barrier: WriteBarrier::None,
             });
         }
-        round.states[index] = OpState::Sent;
+        let sent = flush.mark_op_sent(index);
+        debug_assert!(sent, "an unsent op is sent once");
         round.pending += 1;
         emitted += 1;
     }
     debug_assert_eq!(emitted, group.ops, "the emit pushes exactly the granted group");
-    round.place_cursor(group.end, flush.round_write_count(), flush.round_op_count());
+    round.place_cursor(group.end, flush);
 }
 
 #[cfg(test)]

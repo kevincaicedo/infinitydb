@@ -429,6 +429,10 @@ fn tripwires_section(
     push(text, &format!("reply_pool_bytes:{}", node.reply_pool_bytes.get()));
     push(text, &format!("cmd_pool_bytes:{}", node.cmd_pool_bytes.get()));
     push(text, &format!("cold_pool_bytes:{}", node.cold_pool_bytes.get()));
+    // The tier window pools (cell scope): reserved at each pipeline's
+    // build, written only as rounds take windows.
+    push(text, &format!("tier_window_capacity_bytes:{}", node.tier_window_capacity_bytes.get()));
+    push(text, &format!("tier_window_written_bytes:{}", node.tier_window_written_bytes.get()));
     push(text, &format!("loop_snapshot_bytes:{}", node.loop_snapshot.reserved_bytes()));
     text.push_str("\r\n");
 }
@@ -872,6 +876,7 @@ fn tiering_flush_lines(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tier_plan_waits:{}", gauge(G::PlanWaits)));
     push(text, &format!("tier_turn_contended:{}", gauge(G::TurnContended)));
     push(text, &format!("tier_rounds_planned:{}", gauge(G::RoundsPlanned)));
+    push(text, &format!("tier_file_ids_exhausted:{}", gauge(G::FileIdsExhausted)));
     // M4-S15: copy-forward slices — same zero contract.
     push(text, &format!("tiering_compact_slices:{}", tiering.compact_slices));
 }

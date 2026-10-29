@@ -53,7 +53,12 @@ impl Rig {
             )
             .is_ok()
         );
-        let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
+        let flush = TierFlush::new(
+            fs.clone(),
+            flush_config(NS, FILE_CAPACITY),
+            0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        );
         Rig { ks, fs, flush }
     }
 

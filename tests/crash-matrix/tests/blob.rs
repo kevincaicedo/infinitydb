@@ -55,6 +55,7 @@ fn flush_config() -> TierFlushConfig {
         mode: TierIoMode::Buffered,
         file_capacity: 24 << 10,
         slice_bytes: PAGE,
+        record_len_max: 16 << 20,
     }
 }
 
@@ -367,7 +368,12 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     }
     writer.finish().expect("finish ick");
     t.end_ckpt_walk();
-    let flush = inf_log::TierFlush::new(fs.clone(), flush_config(), 0);
+    let flush = inf_log::TierFlush::new(
+        fs.clone(),
+        flush_config(),
+        0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+    );
     let manifest = Manifest {
         ckpt_id,
         begin_lsn,
@@ -401,6 +407,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
         demote(),
         256,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery");
     assert!(recovered.extents_listed.contains(&orphan_id), "the listing saw the orphan");

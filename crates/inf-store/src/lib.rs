@@ -117,6 +117,7 @@ pub use tiered::replay::{
     BootHandedOver, Displaced, NoSpill, ReplayCounters, ReplayPhase, ReplayRefusal, ReplaySpill,
     ReplayWork, SettleProgress, TierReplay,
 };
+pub use tiered::select::select_whole_records;
 pub use tiered::shadow::{
     COLLISION_KEY_PREFIX, KeyWindow, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT,
     SHADOW_TICKETS_CAP, SettleError, SettleOutcome, SettleReason, SettleSlot, ShadowCounters,
@@ -126,7 +127,7 @@ pub use tiered::shadow::{
 #[cfg(feature = "collision-oracle")]
 pub use tiered::shadow::{forced_collision_pair, forced_collision_triple};
 pub use tiered::{
-    LengthBound, LengthRefusal, RELOC_ORIGIN_CAP, RecordParts, StageFailed, TieredLookup,
+    LengthBound, LengthRefusal, RELOC_ORIGIN_CAP, RecordParts, SealedFiles, TieredLookup,
     TieredTable,
 };
 pub use tiered_recover::{

@@ -79,7 +79,12 @@ impl Life {
         fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
         let table = TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default())
             .expect("ring");
-        let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
+        let flush = TierFlush::new(
+            fs.clone(),
+            flush_config(NS, FILE_CAPACITY),
+            0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        );
         Life {
             fs,
             demote,
@@ -491,6 +496,7 @@ impl Durable {
                 demote,
                 4096,
                 KeyHasher::default(),
+                &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
             )
             .expect("tier recovery");
         let mut ks = keyspace_with(NS, table);
@@ -2629,6 +2635,7 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
         lowered(),
         4096,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("tier recovery");
     let ks = keyspace_with(NS, recovered.table);

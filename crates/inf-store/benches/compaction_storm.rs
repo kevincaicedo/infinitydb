@@ -179,8 +179,10 @@ fn run_storm<F: SegmentFs + Clone>(fs: F, shard_dir: PathBuf, mode: TierIoMode, 
             mode,
             file_capacity: FILE_CAPACITY,
             slice_bytes: PAGE,
+            record_len_max: 16 << 20,
         },
         0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
     let mut storm = Storm { ks, fs, flush, relocated: 0, retired: 0, unlinked: 0 };
 

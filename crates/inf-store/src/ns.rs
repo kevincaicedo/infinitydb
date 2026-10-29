@@ -128,6 +128,17 @@ impl TierSpec {
         .with_default_blob_threshold()
     }
 
+    /// `M`: the largest encoded record this spec's namespace admits in one
+    /// life — the format's largest, at most half its ring (ADR-0155 D1,
+    /// ADR-0052 D1). A tier round's span is at most `max(MAINTAIN-SLICE,
+    /// M)`, the bound its flush pipeline's window pool is sized by. `None`
+    /// when the spec has no representable ring.
+    #[must_use]
+    pub fn record_len_max(&self) -> Option<u64> {
+        let half = self.ring_bytes()? / 2;
+        Some(half.min(crate::record::RECORD_ENCODED_LEN_MAX as u64))
+    }
+
     /// The largest `BLOB-THRESHOLD` a ring of `ring_bytes` can honour
     /// (ADR-0102 D2): every inline record — header, a 255-byte key, and
     /// a value below the threshold — must fit half the ring (ADR-0052

@@ -17,7 +17,6 @@ mod receipt;
 
 use std::path::Path;
 
-use inf_foundation::FileOffset;
 use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::sim::SimDisk;
@@ -70,8 +69,10 @@ fn table_and_flush(fs: &MemFs) -> (Keyspace, TierFlush<MemFs>) {
             mode: TierIoMode::Buffered,
             file_capacity: 1 << 20,
             slice_bytes: PAGE,
+            record_len_max: 16 << 20,
         },
         0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
     (ks, flush)
 }
@@ -367,11 +368,32 @@ fn reactor_pipeline(disk: &SimDisk) -> TierFlush<SimDisk> {
             mode: TierIoMode::Buffered,
             file_capacity: 1 << 20,
             slice_bytes: PAGE,
+            record_len_max: 16 << 20,
         },
         0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
     flush.set_drive(TierDrive::Reactor);
     flush
+}
+
+/// Plans and stages one round of `bytes` at `addr` (a span, then the gap
+/// ending at `gap_end` when given), the store's way.
+fn stage_span(
+    flush: &mut TierFlush<SimDisk>,
+    addr: LogicalAddr,
+    bytes: &[u8],
+    gap_end: Option<u64>,
+) -> Result<(), inf_log::TierFlushError> {
+    let len = std::num::NonZeroU64::new(bytes.len() as u64).expect("a span holds a byte");
+    match flush.plan_round(inf_log::flush::Selection::Span { addr, len, gap_end }) {
+        inf_log::flush::Planned::Round(plan) => {
+            flush.stage_round(plan, bytes);
+            Ok(())
+        }
+        inf_log::flush::Planned::Refused(err) => Err(err),
+        inf_log::flush::Planned::Nothing => panic!("the pipeline never answers Nothing"),
+    }
 }
 
 /// Executes the staged round's writes; barriers only when `sync_too`.
@@ -379,8 +401,7 @@ fn run_reactor_round(disk: &SimDisk, flush: &mut TierFlush<SimDisk>, sync_too: b
     let writes = flush.round_write_count();
     for index in 0..writes {
         let op = flush.round_op(index);
-        let offset = FileOffset::new(op.offset).expect("staged positions are addressable");
-        disk.driver_write_at(op.fd, offset, op.bytes).expect("driver write");
+        disk.driver_write_at(op.fd, op.offset, op.bytes).expect("driver write");
     }
     if sync_too {
         for index in writes..flush.round_op_count() {
@@ -394,7 +415,7 @@ fn apply_effects(flush: &mut TierFlush<SimDisk>) {
     for effect in flush.finish_round() {
         match effect {
             inf_log::RoundEffect::DurableTo { data_len } => flush.confirm_durable_to(data_len),
-            inf_log::RoundEffect::SealCommit => flush.commit_oldest_seal(),
+            inf_log::RoundEffect::SealCommit => drop(flush.commit_oldest_seal()),
             inf_log::RoundEffect::GapCross { .. } => {}
         }
     }
@@ -429,8 +450,7 @@ fn reactor_seal_barrier_lost_reseals_at_the_manifested_watermark() {
         // Round 1 completes whole: two full frames + a partial tail are
         // durable; the manifested watermark is the full-frame floor.
         let round1 = vec![0x11u8; 2 * TIER_FRAME_DATA + 500];
-        flush.append_range_queued(LogicalAddr::ZERO, &round1).expect("stage");
-        flush.sync_queued();
+        stage_span(&mut flush, LogicalAddr::ZERO, &round1, None).expect("stage");
         run_reactor_round(&disk, &mut flush, true);
         apply_effects(&mut flush);
         let manifested = flush.confirmable_end().expect("round 1 confirmed");
@@ -438,8 +458,7 @@ fn reactor_seal_barrier_lost_reseals_at_the_manifested_watermark() {
         // Round 2 stages more bytes and a gap seal — footer included —
         // and the cut lands after the writes, before any barrier.
         let at = LogicalAddr::from_raw(round1.len() as u64).expect("fits");
-        flush.append_range_queued(at, &[0x22u8; 700]).expect("stage");
-        flush.seal_for_gap_queued(90_000);
+        stage_span(&mut flush, at, &[0x22u8; 700], Some(90_000)).expect("stage");
         assert_eq!(flush.pending_seal_count(), 1, "the seal is staged, not committed");
         run_reactor_round(&disk, &mut flush, false);
         disk.power_cut(0x51EA_1000 ^ seed);
@@ -467,14 +486,13 @@ fn reactor_seal_barrier_lost_reseals_at_the_manifested_watermark() {
     }
 }
 
-/// `tier_dir_open_fail` (`creation-retried-round-owned`, review of
-/// 2026-08-30 F-L01-02): file A seals at capacity, file B's creation is
-/// refused at its directory hold. The round must carry only A's seal —
-/// every op on a handle the pipeline owns (pre-fix it carried B's header
-/// write on the dropped writer's closed fd: the sim disk answers
-/// `EBADF`, the plane would retry it forever) — execute whole, and a
-/// power cut right after it recovers A sealed at its full length; the
-/// retry then creates B.
+/// `tier_dir_open_fail` (`creation-retried-round-owned`): the rotation from
+/// file A to file B is planned and
+/// B's creation is refused at its directory hold. The plan stages nothing
+/// (ADR-0155 D2): no op names a handle nobody owns, A stays active with
+/// every byte its own round made durable, and a power cut right after
+/// finds no B; the retry rotates, its round owns every op, and A seals at
+/// its full length.
 #[test]
 fn tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers() {
     for seed in 0..crash_matrix::seed_count(3) {
@@ -488,40 +506,39 @@ fn tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers() {
                 mode: TierIoMode::Buffered,
                 file_capacity: 1000,
                 slice_bytes: PAGE,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         flush.set_drive(TierDrive::Reactor);
-        flush.append_range_queued(LogicalAddr::ZERO, &[0xA0; 600]).expect("stage A");
-        let a1 = LogicalAddr::ZERO.advanced(600).expect("fits");
-        fault::arm("tier_dir_open_fail", FaultSpec::Nth(1));
-        let err = flush.append_range_queued(a1, &[0xA1; 600]).expect_err("B's hold is refused");
-        assert!(err.to_string().contains("tier_dir_open_fail"), "typed + named: {err}");
-        assert!(fault::fired("tier_dir_open_fail") >= 1, "the row is not vacuous");
-        assert!(
-            flush.round_handles_owned(),
-            "seed {seed}: the round carries an op on a handle nobody owns ({} ops)",
-            flush.round_op_count()
-        );
-        assert!(flush.active().is_none(), "B was never created");
-        assert_eq!(flush.pending_seal_count(), 1, "A's seal is the round");
+        stage_span(&mut flush, LogicalAddr::ZERO, &[0xA0; 600], None).expect("stage A");
         run_reactor_round(&disk, &mut flush, true);
         apply_effects(&mut flush);
-        assert_eq!(flush.sealed().len(), 1);
-        assert_eq!(flush.sealed()[0].data_len, 600);
-        let sealed_path = flush.sealed()[0].path.clone();
+        let a1 = LogicalAddr::ZERO.advanced(600).expect("fits");
+        fault::arm("tier_dir_open_fail", FaultSpec::Nth(1));
+        let err = stage_span(&mut flush, a1, &[0xA1; 600], None).expect_err("B's hold is refused");
+        assert!(err.to_string().contains("tier_dir_open_fail"), "typed + named: {err}");
+        assert!(fault::fired("tier_dir_open_fail") >= 1, "the row is not vacuous");
+        assert!(!flush.round_active(), "seed {seed}: the refused plan staged nothing");
+        assert_eq!(flush.pending_seal_count(), 0, "A's seal is not staged");
+        assert_eq!(flush.active().map(|(id, _, data, ..)| (id, data)), Some((0, 600)));
         disk.power_cut(0xD1F0_0000 ^ seed);
-        let image = sim_image(&disk, &sealed_path);
-        let summary = inspect_tier_bytes(&image).expect("A survives the cut sealed");
-        assert_eq!(summary.sealed.expect("footer").data_len, 600);
-        assert_eq!(summary.first_bad_frame, None);
         assert!(
             disk.open_read(&Path::new("shard-0").join("cold").join("tier-000001.itier")).is_err(),
             "B never existed on the device"
         );
-        // The retry creates B.
-        flush.append_range_queued(a1, &[0xA1; 600]).expect("the retry creates B");
+        // The retry rotates: its round owns every op, and A seals whole.
+        stage_span(&mut flush, a1, &[0xA1; 600], None).expect("the retry creates B");
         assert!(flush.round_handles_owned());
+        assert_eq!(flush.pending_seal_count(), 1, "A's seal rides the retry's round");
+        run_reactor_round(&disk, &mut flush, true);
+        apply_effects(&mut flush);
+        assert_eq!(flush.sealed()[0].data_len, 600);
+        let image = sim_image(&disk, &flush.sealed()[0].path);
+        let summary = inspect_tier_bytes(&image).expect("A is sealed");
+        assert_eq!(summary.sealed.expect("footer").data_len, 600);
+        assert_eq!(summary.first_bad_frame, None);
         assert_eq!(flush.active().map(|(id, ..)| id), Some(1));
         fault::disarm_all();
     }
@@ -542,8 +559,7 @@ fn reactor_sealed_file_beyond_the_manifest_is_clamped_inert() {
     // Round 1 completes; a checkpoint at this instant manifests the
     // full-frame floor of the round's bytes.
     let round1 = vec![0x33u8; 2 * TIER_FRAME_DATA + 400];
-    flush.append_range_queued(LogicalAddr::ZERO, &round1).expect("stage");
-    flush.sync_queued();
+    stage_span(&mut flush, LogicalAddr::ZERO, &round1, None).expect("stage");
     run_reactor_round(&disk, &mut flush, true);
     apply_effects(&mut flush);
     let manifested = flush.confirmable_end().expect("round 1 confirmed");
@@ -555,8 +571,7 @@ fn reactor_sealed_file_beyond_the_manifest_is_clamped_inert() {
     // Round 2 seals the file whole — durable on disk, committed to the
     // in-memory catalog — and the cut lands before any covering swap.
     let at = LogicalAddr::from_raw(round1.len() as u64).expect("fits");
-    flush.append_range_queued(at, &[0x44u8; 600]).expect("stage");
-    flush.seal_for_gap_queued(90_000);
+    stage_span(&mut flush, at, &[0x44u8; 600], Some(90_000)).expect("stage");
     run_reactor_round(&disk, &mut flush, true);
     apply_effects(&mut flush);
     let sealed_len = flush.sealed()[0].data_len;
@@ -574,6 +589,7 @@ fn reactor_sealed_file_beyond_the_manifest_is_clamped_inert() {
             mode: TierIoMode::Buffered,
             file_capacity: 1 << 20,
             slice_bytes: PAGE,
+            record_len_max: 16 << 20,
         },
         AddressSpaceConfig {
             reserve_bytes: DemotionConfig::for_budget(4 << 20, PAGE)
@@ -585,6 +601,7 @@ fn reactor_sealed_file_beyond_the_manifest_is_clamped_inert() {
         DemotionConfig::for_budget(4 << 20, PAGE),
         128,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery keeps the sealed file");
     let metas = recovered.replay.sealed();

@@ -112,8 +112,10 @@ impl Rig {
                 mode: TierIoMode::Buffered,
                 file_capacity: 256 << 10,
                 slice_bytes: 1 << 20,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         Rig {
             fs,

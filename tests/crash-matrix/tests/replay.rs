@@ -57,6 +57,7 @@ fn flush_config() -> TierFlushConfig {
         mode: TierIoMode::Buffered,
         file_capacity: 256 << 10,
         slice_bytes: PAGE,
+        record_len_max: 16 << 20,
     }
 }
 
@@ -90,7 +91,12 @@ fn crashed_life() -> (MemFs, Vec<u8>) {
     fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
     let mut table =
         TieredTable::new(space_config(0), demote(), 4096, KeyHasher::default()).expect("ring");
-    let mut flush = TierFlush::new(fs.clone(), flush_config(), 0);
+    let mut flush = TierFlush::new(
+        fs.clone(),
+        flush_config(),
+        0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+    );
     let hasher = KeyHasher::default();
     let writer = SyncIckWriter::create_v2(
         fs.clone(),
@@ -174,6 +180,7 @@ fn boot(fs: &MemFs) -> Node {
         demote(),
         4096,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("tier recovery");
     let table = std::cell::RefCell::new(boot_seam::keyspace_with(NS, table));

@@ -343,8 +343,10 @@ impl TierFleet {
                 // exercises capacity rotation (D2), not only gap seals.
                 file_capacity: 8 * PAGE,
                 slice_bytes: PAGE,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         TierFleet { disk, flush }
     }

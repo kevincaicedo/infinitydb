@@ -1163,8 +1163,10 @@ mod tests {
                 mode: TierIoMode::Buffered,
                 file_capacity: 1 << 20,
                 slice_bytes: PAGE,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         TierReplay::new(BootFlush::new(flush, Vec::new()), table)
     }

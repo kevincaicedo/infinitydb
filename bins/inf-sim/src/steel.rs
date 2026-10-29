@@ -331,8 +331,10 @@ fn run_life(
             mode: TierIoMode::Buffered,
             file_capacity: TIER_FILE_CAPACITY_DEFAULT,
             slice_bytes: PAGE as u64,
+            record_len_max: 16 << 20,
         },
         tier_file_id,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
     table.flush_drain(&mut flush).expect("flush drain");
     assert_eq!(table.space().flushed(), tail, "drain confirms the whole sealed range");

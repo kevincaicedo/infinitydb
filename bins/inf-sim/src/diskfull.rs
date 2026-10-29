@@ -136,8 +136,10 @@ impl World {
                 mode: TierIoMode::Buffered,
                 file_capacity: 16 * PAGE,
                 slice_bytes: PAGE,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         World {
             ks,

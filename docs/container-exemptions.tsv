@@ -14,8 +14,6 @@
 crates/inf-log/src/commit.rs	fn GroupCommit::with_flush_bound	2	T	2026-11-30
 crates/inf-log/src/commit.rs	struct GroupCommit	2	T	2026-11-30
 crates/inf-log/src/commit.rs	use std::collections::VecDeque	1	T	2026-11-30
-crates/inf-log/src/flush.rs	fn TierFlush::with_catalog	1	T	2026-11-30
-crates/inf-log/src/flush.rs	struct TierFlush	1	T	2026-11-30
 crates/inf-runtime/src/cold.rs	fn ColdReads::with_config	5	C	2026-12-31
 crates/inf-runtime/src/cold.rs	fn ColdState::unpin	1	C	2026-12-31
 crates/inf-runtime/src/cold.rs	struct ColdState	4	C	2026-12-31

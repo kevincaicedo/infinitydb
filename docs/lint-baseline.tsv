@@ -5,7 +5,7 @@
 arith	48	crates/inf-doc/src/arena.rs
 arith	11	crates/inf-doc/src/path/cache.rs
 arith	22	crates/inf-doc/src/path/eval.rs
-arith	67	crates/inf-log/src/tier.rs
+arith	64	crates/inf-log/src/tier.rs
 arith	17	crates/inf-query/src/predicate/vm.rs
 arith	23	crates/inf-wire/src/writer.rs
 fn_length	1	bins/inf-bench/src/bootstorm.rs

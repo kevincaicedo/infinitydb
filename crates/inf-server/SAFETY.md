@@ -59,22 +59,26 @@ Third `unsafe` block, same contract class: `StableBytes::new` over one
 tier-flush round op's aligned window for a driver `LogWrite` on a tier
 file fd. The proof is the round custody chain:
 
-1. Windows are pool-owned `Box<[u8]>` blocks inside the namespace's
-   `TierFlush` (`WindowPool`); heap storage never moves when the owning
-   structs move, and a window taken by a round is written exactly once
-   at stage time — error retries resubmit the same bytes, never rewrite
-   them.
+1. Windows are pool-owned `Vec<u8>` buffers inside the namespace's
+   `TierFlush` (`WindowPool`), each one allocation reserved whole when the
+   pipeline is built, zeroed once at its first take inside that capacity
+   and never reallocated or dropped before the pipeline: heap storage
+   never moves when the owning structs move, and a window taken by a round
+   is written exactly once at stage time — error retries resubmit the
+   same bytes, never rewrite them.
 2. Windows return to the pool only in `finish_round`, which the plane
    calls strictly after **every** op of the round reached a terminal
    completion (`FlushRound::pending == 0` in `tier_cell`, success and
-   error paths alike).
+   error paths alike); the inf-log custody test
+   (`a_held_completion_reads_its_own_window_until_the_round_ends`) holds
+   a completion while the pool's next user writes every free window.
 3. A namespace dropped mid-round parks whole in `TierCell::round_drain`
    under the same pending gate, so teardown can never free a window the
    driver may still read.
 
 Verified by: the inf-log reactor-round unit tests, the inf-store
-seam-vs-reactor equivalence storm (`tiered_flush_reactor.rs`,
-byte-identical file images), the crash-matrix cut-window tests, and the
+seam-vs-reactor equivalence storm (`tiered_flush_reactor.rs`, the same
+bytes in both drives' tier files), the crash-matrix cut-window tests, and the
 `m4-tiered` DST scenario (full plane over the sim driver, power cuts
 with rounds in flight).
 

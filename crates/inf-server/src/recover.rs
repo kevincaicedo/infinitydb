@@ -478,6 +478,11 @@ pub struct Recovery<F: SegmentFs> {
     /// upper bound; progress credits the slack when a segment completes).
     seg_sizes: Vec<u64>,
     ends: Vec<(u32, Option<ReadError>)>,
+    /// The cell's cap census (ADR-0163 D2): a recovered tier pipeline's
+    /// capped holders register their rows on it, so they stand on the
+    /// plane's census once the pipeline is installed. A standalone
+    /// recovery (tests, the offline open) builds its own.
+    census: std::rc::Rc<inf_foundation::bounded::CapCensus>,
     residue: Vec<bool>,
     /// Per segment: its slack's validating frames are discarded-life
     /// residue (ADR-0031 D5 as amended) — counted as remnants, excluded
@@ -666,6 +671,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             segments: Vec::new(),
             seg_sizes: Vec::new(),
             ends: Vec::new(),
+            census: inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(cell)).0,
             residue: Vec::new(),
             stale_slack: Vec::new(),
             bytes_total: 0,
@@ -699,6 +705,15 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     #[must_use]
     pub fn deferred_boot_sync(mut self) -> Self {
         self.defer_boot_sync = true;
+        self
+    }
+
+    /// Registers the recovered tier pipelines' capped holders on `census`,
+    /// the cell's own (ADR-0163 D2), in place of the standalone census a
+    /// recovery builds for itself.
+    #[must_use]
+    pub fn with_census(mut self, census: std::rc::Rc<inf_foundation::bounded::CapCensus>) -> Self {
+        self.census = census;
         self
     }
 
@@ -1134,6 +1149,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 mode: spec.tier_io_mode,
                 file_capacity: inf_log::flush::TIER_FILE_CAPACITY_DEFAULT,
                 slice_bytes: spec.maintain_slice_bytes,
+                record_len_max: spec.record_len_max().unwrap_or(spec.maintain_slice_bytes),
             },
             inf_store::AddressSpaceConfig {
                 reserve_bytes,
@@ -1143,6 +1159,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             demote,
             1024,
             ks.hasher(),
+            &self.census,
         )?;
         ks.install_recovered_tiered(ns, recovered.table);
         let removed = &mut self.stats.tier_replay.dead_life_files_removed;
