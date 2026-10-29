@@ -38,7 +38,8 @@ pub(crate) struct FlushRound {
     pub(super) staged_at_us: u64,
     /// Worst write error of the current attempt (ENOSPC dominates).
     pub(super) write_error: Option<i32>,
-    /// A barrier failed — fatal at the next MAINTAIN (§8.4).
+    /// A barrier failed — fatal at the next MAINTAIN (fsync failure is
+    /// fail-stop, ADR-0056 D4).
     pub(super) fatal: Option<i32>,
 }
 
