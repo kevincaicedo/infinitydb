@@ -6,13 +6,13 @@
 //! `high_water` and `crossings` equal the models' at the end; `len` never
 //! passes the cap; a layout past 64 KiB is refused. Slabs: a slab of either
 //! generation policy beside a `BTreeMap<(index, generation), value>`, with
-//! reserves, publishes, dropped reservations, reads, writes, takes of live
-//! and stale handles and slots placed at their last generation, so `Retire`
-//! shrinks the capacity to `Exhausted` and `WrapWithProof` wraps; every
-//! handle read back against the model after every op, and the row's high
-//! water, crossings and capacity equal the model's at the end; the slab is
-//! built and retired one step per chunk or directory. The models share no
-//! code with `inf_foundation::bounded`.
+//! reserves, publishes, dropped reservations, reads, writes and takes of
+//! live and stale handles; every handle read back against the model after
+//! every op, and the row's high water, crossings and capacity equal the
+//! model's at the end; the slab is built and retired one step per chunk or
+//! directory. A policy's last generation needs the slab's test hook, which
+//! no shipping-shaped build compiles: its unit and model tests reach it. The
+//! models share no code with `inf_foundation::bounded`.
 #![no_main]
 #![allow(
     clippy::disallowed_types,
@@ -319,21 +319,6 @@ fn slab<G: Generation + Ord, P: GenerationPolicy>(head: u8, ops: &[u8]) {
                         slots.retired.push(index);
                         capacity -= 1;
                     }
-                }
-            }
-            5 if !handles.is_empty() => {
-                let at = pick % handles.len();
-                let mut id = handles[at];
-                let (index, generation) = (id.index(), id.generation());
-                let placed = slab.place_generation_last(&mut id);
-                match model.remove(&(index, generation)) {
-                    Some(held) => {
-                        assert!(matches!(placed, LookupMut::Live(_)), "a live slot is placed");
-                        model.insert((index, G::LAST), held);
-                        assert_eq!(id.generation(), G::LAST);
-                        handles[at] = id;
-                    }
-                    None => assert!(matches!(placed, LookupMut::Stale), "a stale handle"),
                 }
             }
             6 if !handles.is_empty() => {
