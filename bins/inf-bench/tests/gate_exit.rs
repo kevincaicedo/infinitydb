@@ -225,6 +225,9 @@ fn missing_redis_exits_one_even_without_a_redis_gate() {
     fixture.assert_failed(&output, "Redis A/B startup failed");
 }
 
+/// The reason lies past infinityd's VmRSS read, which needs `/proc`: off
+/// Linux that read refuses first (the test below).
+#[cfg(target_os = "linux")]
 #[test]
 fn redis_rss_startup_failure_is_fatal_after_successful_ab_startup() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -232,6 +235,21 @@ fn redis_rss_startup_failure_is_fatal_after_successful_ab_startup() {
     let output = fixture.command().env("INF_GATE_TEST_DISABLE_REDIS", "1").output().unwrap();
     fixture.assert_failed(&output, "Redis RSS startup failed");
     assert!(!fixture.report().contains("Redis A/B startup failed"));
+}
+
+/// Off Linux there is no `/proc` to read VmRSS from: the fill's read
+/// refuses the run, never an RSS a `<=` gate could pass. The refusal ends
+/// the run before its report, so nothing is left to cite.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn off_linux_the_fill_rss_read_refuses_the_run() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("rss-off-linux", "tripwire:loop_iter_p999_us", false);
+    let output = fixture.command().output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("infinityd RSS after the fill:"), "{stderr}");
+    assert!(!fixture.0.join("out").exists(), "an aborted run wrote a report: {stderr}");
 }
 
 #[test]
@@ -338,6 +356,9 @@ fn m2_only_everysec_requires_both_namespace_probes() {
     }
 }
 
+/// The attribution row reads VmRSS through `/proc`, so off Linux the run
+/// refuses there, before the checkpoint-pressure rows.
+#[cfg(target_os = "linux")]
 #[test]
 fn m2_full_flow_disposes_memory_durable_and_checkpoint_arms() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
