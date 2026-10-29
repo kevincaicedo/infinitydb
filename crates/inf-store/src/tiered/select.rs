@@ -23,8 +23,9 @@
 /// `None` when the first record is empty or crosses `hard_end`: the bytes
 /// below the bound are not whole records. Total and iterative: each
 /// header visited advances by its nonzero length, so at most
-/// `slice_bytes / 8 + 1` headers are visited (a record is at least its
-/// 8-byte header).
+/// `slice_bytes / 8 + 2` headers are visited — the first record's, at most
+/// `slice_bytes / 8` records that fit the slice after it (a record is at
+/// least its 8-byte header), and the one that ends the walk.
 #[must_use]
 pub fn select_whole_records(
     start: u64,
@@ -123,7 +124,7 @@ mod tests {
 
     /// Seeded histories of large and tiny records, empty and crossing
     /// records included: the selector never visits more headers than the
-    /// slice's bound and agrees with the oracle.
+    /// slice's bound (`S/8 + 2`, the doc's) and agrees with the oracle.
     #[test]
     fn seeded_histories_agree_with_the_oracle_within_the_visit_bound() {
         let mut rng = SplitMix64::new(0x7135_5E1E);

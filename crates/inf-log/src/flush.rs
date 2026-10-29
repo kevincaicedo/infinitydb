@@ -158,11 +158,13 @@ pub struct TierFlushConfig {
     pub record_len_max: u64,
 }
 
-/// A flush-pipeline failure. Two causes are fatal (§8.4): `Fsync` — the
-/// caller must freeze the flushed watermark and stop; constructing this
-/// variant is audited by `check-fsync-fail-stop.sh` (ADR-0056 D4) — and
-/// `Unaddressable`, a staged write position outside the driver's range
-/// (ADR-0167 D4).
+/// A flush-pipeline failure. Three causes are fatal — the caller freezes
+/// the flushed watermark and stops the cell: `Fsync`, a failed barrier
+/// (constructing it is audited by `check-fsync-fail-stop.sh`, ADR-0056
+/// D4); `Unaddressable`, a planned write position outside the driver's
+/// range (ADR-0167 D4); and `SpanOverPool`, a selected span the
+/// pipeline's window pool cannot hold. A retry of either of the last two
+/// plans the same round.
 #[derive(Debug)]
 pub enum TierFlushError {
     /// An fdatasync-class barrier failed — non-recoverable by contract.
@@ -248,9 +250,9 @@ impl core::fmt::Display for TierFlushError {
 impl std::error::Error for TierFlushError {}
 
 impl TierFlushError {
-    /// True for the §8.4 fatal class — a failed fsync or an unaddressable
-    /// write position (ADR-0167 D4) — so callers route to the terminal
-    /// fail-stop handler without naming the variant.
+    /// True for the fatal class — a failed fsync, an unaddressable write
+    /// position (ADR-0167 D4) or a span above the window pool — so callers
+    /// route to the terminal fail-stop handler without naming the variant.
     #[must_use]
     pub fn is_fatal(&self) -> bool {
         match self {
