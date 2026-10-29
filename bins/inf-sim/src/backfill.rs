@@ -71,6 +71,9 @@ pub struct BackfillReport {
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     /// Boots driven (setup + one per phase cut).
     pub boots: u64,
     /// Power cuts in order, each with the walk progress it landed on.
@@ -657,6 +660,7 @@ pub fn run_backfill_scenario(scenario: &BackfillScenario) -> BackfillReport {
     let sealed = observer.seal();
     report.state_hash = sealed.state_hash;
     report.cap_rows_checked = sealed.census.rows_checked;
+    report.cap_rows_crossed = sealed.census.rows_crossed;
     report.violations.extend(sealed.census.violations);
     report
 }

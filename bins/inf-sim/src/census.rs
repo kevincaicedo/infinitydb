@@ -3,6 +3,11 @@
 //!
 //! - **The cap bound**, per row: `high_water ≤ entries_max` — no capped
 //!   container held more than its cap. Violation token `cap-high-water-over`.
+//! - **The crossing rule**, per row that crossed: `crossings > 0` implies
+//!   `capacity_now ≤ high_water` — a container answered `Full` (or merged)
+//!   only once full at the capacity it had then. Violation token
+//!   `cap-crossed-short`; the rows it judged are summed on the report line
+//!   (`cap_rows_crossed`), so a leg that never crossed is visible.
 //! - **The assembly rule**: `cap_assembly_violations = 0` (token
 //!   `cap-assembly-violated`), and the census left `Assembling`: a census
 //!   never marked means the cell's loop took no serve mark, or marked
@@ -45,6 +50,9 @@ pub(crate) struct CellFacts {
 pub(crate) struct CensusVerdict {
     /// Rows the cap bound read, summed over the cells and lives (node sum).
     pub(crate) rows_checked: u64,
+    /// Rows the crossing rule judged, those with `crossings > 0`, summed over
+    /// the cells and lives (node sum): the rule's engagement.
+    pub(crate) rows_crossed: u64,
     pub(crate) violations: Vec<String>,
 }
 
@@ -66,8 +74,7 @@ impl CensusVerdict {
             ));
         }
         for row in census.rows() {
-            self.rows_checked += 1;
-            self.violations.extend(over_cap(cell, &row));
+            self.judge_row(cell, &row);
         }
         let tiered_tables = facts.tiered_tables;
         if tiered_tables > 0 && census.row(EPOCH_MARKS_ROW).is_none() {
@@ -91,9 +98,21 @@ impl CensusVerdict {
         }
     }
 
+    /// One row's clauses: the cap bound, and the crossing rule on a row
+    /// that crossed.
+    fn judge_row(&mut self, cell: usize, row: &CapRow) {
+        self.rows_checked += 1;
+        self.violations.extend(over_cap(cell, row));
+        if row.crossings > 0 {
+            self.rows_crossed += 1;
+            self.violations.extend(crossed_short(cell, row));
+        }
+    }
+
     /// Folds another verdict into this one.
     pub(crate) fn absorb(&mut self, other: CensusVerdict) {
         self.rows_checked += other.rows_checked;
+        self.rows_crossed += other.rows_crossed;
         self.violations.extend(other.violations);
     }
 }
@@ -105,6 +124,21 @@ fn over_cap(cell: usize, row: &CapRow) -> Option<String> {
             "CAP CENSUS VIOLATION cell {cell}: cap-high-water-over — row `{}` held {} entries, \
              above its cap of {}",
             row.name, row.high_water, row.entries_max
+        )
+    })
+}
+
+/// The crossing rule on a row that crossed: a `Full` or a merge is
+/// answered only at a live count a publish raised the high water to, and a
+/// retirement lowers `capacity_now` before any `Full` at the new count, so
+/// `capacity_now` above the high water is a crossing short of the cap.
+/// `high_water <= entries_max` is the cap bound's, so no row reports twice.
+fn crossed_short(cell: usize, row: &CapRow) -> Option<String> {
+    (row.capacity_now > row.high_water).then(|| {
+        format!(
+            "CAP CENSUS VIOLATION cell {cell}: cap-crossed-short — row `{}` crossed {} time(s) \
+             at a high water of {}, below its capacity of {} now (cap {})",
+            row.name, row.crossings, row.high_water, row.capacity_now, row.entries_max
         )
     })
 }
@@ -206,9 +240,56 @@ mod tests {
             high_water: 3,
             crossings: 0,
             assembly_live: 0,
+            capacity_now: 2,
         };
         let text = over_cap(1, &over).expect("red past the cap");
         assert!(text.contains("cap-high-water-over"), "{text}");
         assert_eq!(over_cap(1, &CapRow { high_water: 2, ..over }), None, "at the cap is legal");
+    }
+
+    /// The crossing rule on planted rows: a row that crossed holds its high
+    /// water at or above the capacity it has now, whatever a retirement
+    /// lowered it to. Each row is `(entries_max, capacity_now, high_water,
+    /// crossings)` with the verdict's tokens and whether it counts as
+    /// crossed. The rule reads `capacity_now <= high_water` alone: a high
+    /// water past the cap is the cap bound's red, so no row reports twice.
+    #[test]
+    fn a_row_that_crossed_below_its_capacity_now_is_red() {
+        const SHORT: &str = "cap-crossed-short";
+        const OVER: &str = "cap-high-water-over";
+        type Shape = (u32, u32, u32, u64);
+        let planted: [(Shape, Option<&str>, u64); 7] = [
+            ((4, 4, 3, 1), Some(SHORT), 1),
+            ((4, 4, 4, 1), None, 1),
+            ((4, 2, 1, 1), Some(SHORT), 1),
+            ((4, 2, 2, 1), None, 1),
+            // The high water predates the shrink.
+            ((4, 2, 3, 1), None, 1),
+            ((4, 4, 3, 0), None, 0),
+            ((4, 4, 5, 1), Some(OVER), 1),
+        ];
+        for ((entries_max, capacity_now, high_water, crossings), token, crossed) in planted {
+            let row = CapRow {
+                name: "planted",
+                entries_max,
+                fill: CapFill::Serving,
+                high_water,
+                crossings,
+                assembly_live: 0,
+                capacity_now,
+            };
+            let mut verdict = CensusVerdict::default();
+            verdict.judge_row(5, &row);
+            let shape = (entries_max, capacity_now, high_water, crossings);
+            assert_eq!(verdict.rows_crossed, crossed, "{shape:?}");
+            match token {
+                Some(token) => {
+                    let found = &verdict.violations;
+                    assert_eq!(found.len(), 1, "{shape:?} reads {token}: {found:?}");
+                    assert!(found[0].contains(token), "{shape:?} reads {token}: {found:?}");
+                }
+                None => assert!(verdict.violations.is_empty(), "{shape:?}: {verdict:?}"),
+            }
+        }
     }
 }

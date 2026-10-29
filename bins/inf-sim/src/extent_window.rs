@@ -193,6 +193,9 @@ pub struct ExtentWindowReport {
     pub writers_left: u64,
     /// Rows the census oracle read (node sum).
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     /// The cell's `extent-window` census row at the end of the traffic.
     pub window_row: Option<CapRow>,
     /// The cell's durable counters at the end of the traffic: frames held
@@ -376,6 +379,7 @@ pub fn run_extent_window_scenario(scenario: &ExtentWindowScenario) -> ExtentWind
     let sealed = observer.seal();
     report.state_hash = sealed.state_hash;
     report.cap_rows_checked = sealed.census.rows_checked;
+    report.cap_rows_crossed = sealed.census.rows_crossed;
     report.violations.extend(sealed.census.violations);
     report.trace = observer.trace_bytes();
     report.trace_hash = hash64(&report.trace, 0xE57E);

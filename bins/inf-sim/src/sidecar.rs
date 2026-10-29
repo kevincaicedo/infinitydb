@@ -77,6 +77,9 @@ pub struct SidecarReport {
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     pub boots: u64,
     /// Cuts in order, each with its disclosed landing state.
     pub cuts: Vec<String>,
@@ -657,6 +660,7 @@ pub fn run_sidecar_scenario(scenario: &SidecarScenario) -> SidecarReport {
     let sealed = observer.seal();
     report.state_hash = sealed.state_hash;
     report.cap_rows_checked = sealed.census.rows_checked;
+    report.cap_rows_crossed = sealed.census.rows_crossed;
     report.violations.extend(sealed.census.violations);
     report
 }

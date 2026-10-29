@@ -61,6 +61,9 @@ pub struct BootStormReport {
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     pub boots: u64,
     pub ready_steps_max: u64,
     /// Determinism currency: chained hash over per-cycle
@@ -88,6 +91,7 @@ fn run_observed(scenario: &BootStormScenario, observer: TraceObserver) -> BootSt
     let mut report = BootStormReport {
         violations: Vec::new(),
         cap_rows_checked: 0,
+        cap_rows_crossed: 0,
         boots: 0,
         ready_steps_max: 0,
         trace_hash: 0,
@@ -239,6 +243,7 @@ pub fn run_boot_storm_scenario(scenario: &BootStormScenario) -> BootStormReport 
     let sealed = observer.seal();
     report.state_hash = sealed.state_hash;
     report.cap_rows_checked = sealed.census.rows_checked;
+    report.cap_rows_crossed = sealed.census.rows_crossed;
     report.violations.extend(sealed.census.violations);
     report
 }

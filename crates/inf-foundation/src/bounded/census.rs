@@ -49,7 +49,13 @@ pub enum CensusPhase {
 /// One row of the census, read as a copy. `high_water` and `crossings` are
 /// per cell, over every instance of the name; `assembly_live` is the live
 /// count of an `Assembly` row's one instance and stays 0 on a `Serving` row,
-/// which reports no publish.
+/// which reports no publish. `capacity_now` is the entries the row's
+/// containers admit now, the minimum over its instances: `entries_max` from
+/// registration, lowered only by a slab that retires a slot at its last
+/// generation. A `Full` is answered only at a live count that a publish
+/// has already raised the high water to, and a retirement lowers
+/// `capacity_now` before any `Full` at the new count, so on every row
+/// `crossings > 0` implies `capacity_now <= high_water`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CapRow {
     pub name: &'static str,
@@ -58,6 +64,7 @@ pub struct CapRow {
     pub high_water: u32,
     pub crossings: u64,
     pub assembly_live: u32,
+    pub capacity_now: u32,
 }
 
 /// The census of one cell's caps. Shared by `Rc` with every capped container
@@ -213,6 +220,7 @@ impl CapCensus {
                         high_water: 0,
                         crossings: 0,
                         assembly_live: 0,
+                        capacity_now: cap.entries_max(),
                     });
                     index
                 }
@@ -395,6 +403,7 @@ mod tests {
         assert_eq!(row.assembly_live, 0, "a Serving row keeps no live count");
         assert_eq!(row.entries_max, 16);
         assert_eq!(row.fill, CapFill::Serving);
+        assert_eq!(row.capacity_now, 16, "registration sets the capacity now to the cap");
     }
 
     #[test]

@@ -45,6 +45,9 @@ pub struct NsCreateWindowReport {
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     pub stalled: bool,
     pub commands_done: u64,
     pub scheduler_steps: u64,
@@ -130,6 +133,7 @@ fn run_observed(seed: u64, observer: TraceObserver) -> NsCreateWindowReport {
         state_hash: 0,
         violations: Vec::new(),
         cap_rows_checked: 0,
+        cap_rows_crossed: 0,
         stalled: false,
         commands_done: 0,
         scheduler_steps: 0,
@@ -428,6 +432,7 @@ pub fn run_ns_create_window_scenario(seed: u64) -> NsCreateWindowReport {
     let sealed = observer.seal();
     report.state_hash = sealed.state_hash;
     report.cap_rows_checked = sealed.census.rows_checked;
+    report.cap_rows_crossed = sealed.census.rows_crossed;
     report.violations.extend(sealed.census.violations);
     report
 }

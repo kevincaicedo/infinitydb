@@ -1508,6 +1508,9 @@ pub struct DurableReport {
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     pub stalled: bool,
     /// ADR-0124: scheduler steps the clean stop took to drain every cell
     /// (0 without `clean_stop`), and the reboot's tail records applied

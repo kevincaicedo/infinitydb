@@ -400,6 +400,9 @@ pub struct SimReport {
     /// Cap census rows read at the end of the run, summed over the cells
     /// (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     pub stalled: bool,
     pub scheduler_steps: u64,
     /// Virtual time the run covered (nightly-fleet budget accounting).
@@ -1438,6 +1441,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         commands_done: 0,
         oracle_violations: Vec::new(),
         cap_rows_checked: 0,
+        cap_rows_crossed: 0,
         stalled: false,
         scheduler_steps: 0,
         sim_seconds: 0.0,
@@ -1888,6 +1892,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         census.judge(index, plane.cap_census(), facts);
     }
     report.cap_rows_checked = census.rows_checked;
+    report.cap_rows_crossed = census.rows_crossed;
     violations.extend(census.violations);
 
     let oracle = oracle.0.borrow();

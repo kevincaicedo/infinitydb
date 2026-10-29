@@ -23,6 +23,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         state_hash: 0,
         violations: Vec::new(),
         cap_rows_checked: 0,
+        cap_rows_crossed: 0,
         stalled: false,
         clean_stop_steps: 0,
         clean_stop_replay_records: 0,
@@ -1869,6 +1870,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     let sealed = observer.seal();
     report.state_hash = sealed.state_hash;
     report.cap_rows_checked = sealed.census.rows_checked;
+    report.cap_rows_crossed = sealed.census.rows_crossed;
     report.violations.extend(sealed.census.violations);
     report
 }

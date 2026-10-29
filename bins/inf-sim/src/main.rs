@@ -342,7 +342,7 @@ fn main() {
             report.scheduler_steps,
             report.trace_hash
         );
-        print_census(report.cap_rows_checked);
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
         if verify {
             let second = inf_sim::run_backfill_scenario(&scenario);
             verify_hashes(
@@ -384,7 +384,7 @@ fn main() {
             report.scheduler_steps,
             report.trace_hash
         );
-        print_census(report.cap_rows_checked);
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
         if verify {
             let second = inf_sim::run_sidecar_scenario(&scenario);
             verify_hashes(
@@ -1094,7 +1094,7 @@ fn main() {
             report.scan_cold_pages,
             report.scan_cold_reads
         );
-        print_census(report.cap_rows_checked);
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
         if verify {
             let second = run_one(seed);
             verify_hashes(
@@ -1205,7 +1205,7 @@ fn main() {
             report.trace_hash
         );
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
-        print_census(report.cap_rows_checked);
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
         if verify {
             let second = run_one(seed);
             verify_hashes(
@@ -1310,7 +1310,7 @@ fn main() {
             report.trace_hash
         );
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
-        print_census(report.cap_rows_checked);
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
         if verify {
             let second = run_one(seed);
             verify_hashes(
@@ -1392,7 +1392,7 @@ fn main() {
              hash {:#018x}",
             report.boots, report.ready_steps_max, report.trace_hash
         );
-        print_census(report.cap_rows_checked);
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
         if verify {
             let second = inf_sim::run_boot_storm_scenario(&scenario);
             verify_hashes(
@@ -1486,7 +1486,7 @@ fn main() {
         report.shadow_checked,
         report.shadow_unmodeled
     );
-    print_census(report.cap_rows_checked);
+    print_census(report.cap_rows_checked, report.cap_rows_crossed);
     if let Some(path) = &trace_out
         && let Err(e) = std::fs::write(path, &report.trace)
     {
@@ -1528,9 +1528,10 @@ fn main() {
 /// workload differ only in scenario construction. Both write replayable
 /// per-seed results and a sweep manifest.
 /// The cap census oracle's liveness, on its own machine-readable line: the
-/// rows it read at the end of every life (node sum, ADR-0163 D2).
-fn print_census(rows_checked: u64) {
-    println!("inf-sim: cap_rows_checked={rows_checked}");
+/// rows it read at the end of every life, and of those the rows that
+/// crossed, which its crossing rule judged (node sums, ADR-0163 D2).
+fn print_census(rows_checked: u64, rows_crossed: u64) {
+    println!("inf-sim: cap_rows_checked={rows_checked} cap_rows_crossed={rows_crossed}");
 }
 
 /// The `--tier-leg` names, `|`-joined for a message.
@@ -1573,7 +1574,7 @@ fn run_extent_window(seed: u64, leg: ExtentWindowLeg, verify: bool) {
             row.high_water, row.entries_max, row.crossings
         );
     }
-    print_census(report.cap_rows_checked);
+    print_census(report.cap_rows_checked, report.cap_rows_crossed);
     if !report.ok() {
         for v in &report.violations {
             eprintln!("inf-sim: VIOLATION: {v}");
@@ -1680,7 +1681,7 @@ fn run_durable(
             report.trace_hash
         );
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
-        print_census(report.cap_rows_checked);
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
         for marks in &report.epoch_marks_cells {
             println!(
                 "inf-sim: epoch marks cell {}: high_water {} of {}, crossings {}",
@@ -2003,7 +2004,7 @@ fn run_m2_combined(
             "inf-sim: sim_seconds={:.6} published={} delivered={}",
             report.sim_seconds, report.published, report.delivered
         );
-        print_census(report.cap_rows_checked);
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
         for violation in report.violations.iter().take(5) {
             eprintln!("inf-sim: ORACLE VIOLATION: {violation}");
         }
