@@ -735,7 +735,7 @@ mod tests {
         writes
     }
 
-    /// A writer that reckons a position other than the plan's stops the
+    /// A writer that reckons a position other than the round plan's stops the
     /// cell at that write, in release builds too: the frame is never
     /// written at a position the plan laid out for another.
     #[test]
@@ -746,7 +746,7 @@ mod tests {
         let _ = writes.next(12288);
     }
 
-    /// A writer that pushes a write past the plan's list stops the cell.
+    /// A writer that pushes a write past the round plan's list stops the cell.
     #[test]
     #[should_panic(expected = "a staged tier write the plan did not list")]
     fn a_staged_write_past_the_plan_stops_the_cell() {
