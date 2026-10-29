@@ -895,7 +895,9 @@ fn a_retry_with_a_done_run_between_its_failed_writes_completes() {
     panic!(
         "the round never completed: retries {}, cursor {}, pending {}, unsent ops {unsent:?} of \
          {writes} writes",
-        cell.flush_stats.write_retries, round.next_unsent, round.pending
+        cell.flush_stats.write_retries,
+        round.cursor(),
+        round.pending
     );
 }
 
