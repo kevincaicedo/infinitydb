@@ -30,7 +30,12 @@
 #     paths and the ban's sentence; this gate reads both from it. Every
 #     `impl Lossy for` site of cell production code is printed on the OK
 #     line: a payload that may be merged or dropped at a cap opts in by
-#     name, and each opt-in is a reviewed line (ADR-0151 D2). A banned
+#     name, and each opt-in is a reviewed line (ADR-0151 D2). So is every
+#     `WrapWithProof` spelling of cell production code outside
+#     `inf_foundation::bounded`, which defines it: a slab whose generations
+#     wrap is legal only with its site's proof that no holder of an old
+#     handle exists when a slot frees, and each is a reviewed line
+#     (ADR-0171 D2). A banned
 #     name in cell production code outside every `container:` allow is red
 #     from the text too, so code this host's builds do not compile (another
 #     `target_os`, a feature neither build enables) is held the same. Test
@@ -200,6 +205,8 @@ errors, oks, deny_sites, api_sites = [], [], [], []
 container_sites = []
 lossy_sites = []  # `file:line: impl Lossy for T` in cell production code
 LOSSY = re.compile(r"^\s*impl(?:<[^>]*>)?\s+(?:[A-Za-z_][A-Za-z_0-9]*::)*Lossy\s+for\s+([^\s{]+)")
+wrap_sites = []  # `file:line: code` per `WrapWithProof` spelling outside bounded/
+WRAP = re.compile(r"\bWrapWithProof\b")
 production_of = {}  # cell file -> its production lines (test modules blanked)
 STRIPPER = str(Path(os.environ["INF_SCRIPT_DIR"]) / "strip-test-modules.awk")
 TEST_ATTR = re.compile(r"^\s*#\[cfg\((?:test|all\(test,.*\))\)\]\s*$")  # the stripper's test-only attributes
@@ -472,6 +479,10 @@ def audit(path, exempt_sites):
                 m = LOSSY.match(line)
                 if m:
                     lossy_sites.append(f"{path}:{n + 1}: impl Lossy for {m.group(1)}")
+        if not path.is_relative_to(BOUNDED_DIR) and "WrapWithProof" in "\n".join(production):
+            for n, line in enumerate(blanked(production)):
+                if WRAP.search(line):
+                    wrap_sites.append(f"{path}:{n + 1}: {line.strip()}")
         if path.is_relative_to(BOUNDED_DIR):
             for n, line in enumerate(blanked(production, literals=True)):
                 m = RESERVATION.match(line)
@@ -1139,7 +1150,7 @@ if errors:
         print(f"LINT-SCOPES violation: {e}")
     print(f"lint-scopes FAILED: {len(errors)} violation(s)")
     sys.exit(1)
-scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions, {len(targets)} fuzz targets scoped, {len(scopes_tbl.scopes)} scope(s): {denied_n} (scope, family) denied, {ratchet_n} ratcheted, {len(lossy_sites)} Lossy payload(s), {len(reservation_types)} reservation type(s) under the await ban"
+scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions, {len(targets)} fuzz targets scoped, {len(scopes_tbl.scopes)} scope(s): {denied_n} (scope, family) denied, {ratchet_n} ratcheted, {len(lossy_sites)} Lossy payload(s), {len(wrap_sites)} WrapWithProof site(s), {len(reservation_types)} reservation type(s) under the await ban"
 scope += (f"; container exemptions: {len(crows)} row(s), counts {csum}/{CONTAINER_MAX}, "
           f"{len(backing)}/{BACKING_SITES} capped-backing, "
           + ("counts judged against the census" if diagnostics else "counts judged in the ratchet's API pass")
@@ -1156,6 +1167,8 @@ for ok in oks:
     print(f"    allow: {ok}")
 for lossy in lossy_sites:
     print(f"    lossy: {lossy}")
+for wrap in wrap_sites:
+    print(f"    wrap: {wrap}")
 PY
 
 if [ "${INF_LINT_RULES:-0}" = 1 ] || [ -n "${INF_LINT_API_DIAGNOSTICS:-}" ]; then

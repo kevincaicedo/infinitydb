@@ -2145,6 +2145,23 @@ expect_output "lint-scopes: containers — a generic, path-qualified impl Lossy 
 expect_output "lint-scopes: containers — the OK line counts the production opt-ins only" \
     "2 Lossy payload(s)" lc_run "$root"
 lc_reset
+# ADR-0171 D2: every `WrapWithProof` spelling of cell production code outside
+# `bounded/` is printed on the OK line, so each wrapping slab's proof is a
+# reviewed line; one in a comment, a string or a test module is not
+# production code, and `bounded/`'s own definition is not a use (core reads 0).
+lc_append 'pub struct Ids { pub slab: Slab<WrapWithProof> }' 'pub fn ids() { build::<WrapWithProof>(); }' \
+    '// a Slab<WrapWithProof> in a comment' 'pub const NAME: &str = "WrapWithProof";' '#[cfg(test)]' \
+    'mod tests {' '    pub struct Planted(super::Slab<super::WrapWithProof>);' '}'
+mkdir -p "$root/crates/inf-foundation/src/bounded"
+printf '%s\n' 'pub struct WrapWithProof;' 'impl GenerationPolicy for WrapWithProof {}' \
+    >"$root/crates/inf-foundation/src/bounded/slab.rs"
+expect_output "lint-scopes: containers — a WrapWithProof field type is printed" \
+    "wrap: $LC_A:18: pub struct Ids { pub slab: Slab<WrapWithProof> }" lc_run "$root"
+expect_output "lint-scopes: containers — a WrapWithProof turbofish is printed" \
+    "wrap: $LC_A:19: pub fn ids() { build::<WrapWithProof>(); }" lc_run "$root"
+expect_output "lint-scopes: containers — the OK line counts the uses outside bounded/ only" \
+    "2 WrapWithProof site(s)" lc_run "$root"
+lc_reset
 # the fixture edits' canaries: an escape BSD sed misreads is refused, and an
 # edit that matches nothing is a harness error; neither changes the file
 lc_escape_canary() (lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n|' "$LC_A")
