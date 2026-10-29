@@ -9,7 +9,10 @@
 //! are up (the window's 16 and a margin of 8 for the files the node opens
 //! beside them, at any cell count). Every reply is `+OK`, and `INFO caps`
 //! reads the `extent-window` row at its cap on exactly one cell, whose
-//! `extent_parks` counts the 48 writers the full window parked. Linux: the
+//! `extent_parks` counts the 48 writers the full window parked. One writer
+//! closes its connection with its reply unread, once its `SET` is parsed:
+//! a disconnect cancels no parsed command, so its value is read back on
+//! another connection before the other replies are read. Linux: the
 //! descriptor limit is set with `prlimit` and the open descriptors are
 //! read from `/proc`.
 #![cfg(target_os = "linux")]
@@ -31,6 +34,11 @@ const WINDOW: u64 = 16;
 /// Descriptors the node may open past those it holds once every
 /// connection is up: the window's 16 and a margin of 8.
 const DESCRIPTOR_HEADROOM: usize = 24;
+/// How long the closed writer's value may take to become readable once its
+/// `SET` was parsed: it waits behind at most three of the window's
+/// turnovers, each a few fdatasyncs, so the bound is slack by orders of
+/// magnitude; past it the write did not land.
+const READ_BACK_DEADLINE: Duration = Duration::from_secs(30);
 
 struct Server {
     child: Child,
@@ -206,6 +214,28 @@ fn owning_cell(setup: &mut Client, cells: &mut BTreeMap<u64, Client>) -> u64 {
     owners[0]
 }
 
+/// Polls `GET key` on `reader` until it reads `value` or the read-back
+/// deadline passes; while the write is pending the key reads nil.
+fn read_back(reader: &mut Client, key: &[u8], value: &[u8]) {
+    let mut want = format!("${}\r\n", value.len()).into_bytes();
+    want.extend_from_slice(value);
+    want.extend_from_slice(b"\r\n");
+    let deadline = Instant::now() + READ_BACK_DEADLINE;
+    loop {
+        let reply = reader.call(&[b"GET", key]);
+        if reply == want {
+            return;
+        }
+        let key = String::from_utf8_lossy(key);
+        assert_eq!(reply, b"$-1\r\n", "GET {key} while its write is pending");
+        assert!(
+            Instant::now() < deadline,
+            "GET {key} read nil for {READ_BACK_DEADLINE:?}: the closed writer's write did not land"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// The `extent-window` row of an `INFO caps` text: `(high_water, crossings)`.
 fn window_row(caps: &str) -> (u64, u64) {
     let row = caps
@@ -250,10 +280,12 @@ fn a_burst_of_blob_writes_holds_at_most_the_window_of_extent_descriptors() {
     let owner = owning_cell(&mut setup, &mut cells);
     // Every writer on the owning cell: its 64 writes are read at one
     // iteration, none behind a fabric hop. A connection the hand-off put on
-    // the other cell stays open and idle.
+    // the other cell stays open and idle. One more connection there is the
+    // reader of the closed writer's value, opened now so the descriptor
+    // limit already counts it.
     let mut writers = Vec::new();
     let mut idle = Vec::new();
-    while writers.len() < WRITERS {
+    while writers.len() < WRITERS + 1 {
         let mut client = Client::connect(server.port);
         if field(&client.info("server"), "cell") == owner {
             client.ok(&[b"INF.NS", b"USE", b"ew"]);
@@ -263,6 +295,7 @@ fn a_burst_of_blob_writes_holds_at_most_the_window_of_extent_descriptors() {
         }
         assert!(idle.len() < 4 * WRITERS, "the hand-off never reached cell {owner}");
     }
+    let mut reader = writers.pop().expect("the reader");
     let limit = server.open_descriptors() + DESCRIPTOR_HEADROOM;
     let pid = server.child.id().to_string();
     let prlimit = Command::new("prlimit")
@@ -279,7 +312,19 @@ fn a_burst_of_blob_writes_holds_at_most_the_window_of_extent_descriptors() {
         writer.0.write_all(&Client::wire(&[b"SET", key.as_bytes(), &blob])).expect("write");
     }
     assert!(signal(server.child.id(), "-CONT"), "SIGCONT");
-    for (i, writer) in writers.iter_mut().enumerate() {
+    // A reply is written after its frame's barrier, an iteration after the
+    // one that read the 64 `SET`s, which parsed and executed them all: 16
+    // hold window entries and 48 park. So once writer 0's `+OK` is read,
+    // writer 63's close reaches the node after its `SET` was parsed, never
+    // in the same completion batch, where the node would drop the unparsed
+    // bytes with the connection. Closed earlier, the write could be lost
+    // that way, and the read-back would fail on a correct node.
+    let reply = writers[0].reply();
+    assert_eq!(reply, b"+OK\r\n", "writer 0: {}", String::from_utf8_lossy(&reply));
+    let closed = writers.pop().expect("writer 63");
+    drop(closed);
+    read_back(&mut reader, format!("{{ew}}k{}", WRITERS - 1).as_bytes(), &blob);
+    for (i, writer) in writers.iter_mut().enumerate().skip(1) {
         let reply = writer.reply();
         assert_eq!(reply, b"+OK\r\n", "writer {i}: {}", String::from_utf8_lossy(&reply));
     }
