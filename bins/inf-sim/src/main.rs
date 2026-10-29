@@ -1693,7 +1693,8 @@ fn run_durable(
                  io_budget_deferrals_tier_flush {} io_budget_bytes_tier_flush {} \
                  io_budget_ops_tier_flush {} io_budget_overrun_bytes_tier_flush {} \
                  driver tier-file bytes {} ops {} (queued at the cut {} B {} ops; one pass at \
-                 most {} B {} ops); turn: tier_flush_groups_deferred {} tier_group_wait_ns_max \
+                 most {} B {} ops, a round at most 74: a wiring read, vacuous for the bound); \
+                 turn: tier_flush_groups_deferred {} tier_group_wait_ns_max \
                  {} tier_turn_waits {} tier_turn_contended {} tier_plan_waits {} \
                  tier_rounds_planned {} tiering_flush_write_retries {}; (namespace, flushed, \
                  ro, tail) {:?}",

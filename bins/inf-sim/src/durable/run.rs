@@ -1446,6 +1446,21 @@ fn tier_budget_oracles(
             record.unattainable, record.overrun_bytes
         ));
     }
+    // The round's op bound (ADR-0155 D3: 70 writes and 4 barriers), read
+    // from the driver's own per-pass tier count: a wiring read of the op
+    // count on every seed. No leg's round comes near the bound (a 1 MiB
+    // slice stages a few ops), so the read is vacuous for the bound itself,
+    // whose evidence is the round plan's envelope test.
+    let round_ops_max = u64::from(
+        inf_log::limits::TIER_ROUND_WRITES_MAX + inf_log::limits::TIER_ROUND_BARRIERS_MAX,
+    );
+    if record.pass_ops_max > round_ops_max {
+        report.violations.push(format!(
+            "TIER-OPS VIOLATION seed {seed:#x} cell {cell}: one driver entry carried {} tier \
+             ops, past a round's {round_ops_max}",
+            record.pass_ops_max
+        ));
+    }
     if leg.model_absent() {
         tier_no_model_oracles(scenario, record, report);
     } else {
