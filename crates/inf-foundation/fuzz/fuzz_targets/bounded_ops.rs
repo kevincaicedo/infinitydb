@@ -1,6 +1,7 @@
 //! Capped-container op sequences against std models (ADR-0151 D6): a
 //! `Reserve` deque beside a `VecDeque` the target caps by hand, a `Coalesce`
-//! deque beside one the target merges by hand, equal after every op; the
+//! deque beside one the target merges by hand, equal after every op and at
+//! every place (`get`, and `get_mut` edits at a place or the back); the
 //! census row's `high_water` and `crossings` equal the models' at the end;
 //! `len` never passes the cap; a layout past 64 KiB is refused. The models
 //! share no code with `inf_foundation::bounded`.
@@ -129,12 +130,38 @@ fuzz_target!(|data: &[u8]| {
                 }
                 marks_model.entries = merged;
             }
+            // An edit in place: odd values name a place from the front
+            // (one past the last included: no entry there), even ones the
+            // back.
+            6 if value & 1 == 1 => {
+                let index = usize::from(value >> 1) % (reserve_model.entries.len() + 1);
+                assert_eq!(
+                    reserve.get_mut(index).is_some(),
+                    index < reserve_model.entries.len(),
+                    "a place exists exactly below the length"
+                );
+                if let Some(entry) = reserve.get_mut(index) {
+                    *entry = value;
+                }
+                if let Some(entry) = reserve_model.entries.get_mut(index) {
+                    *entry = value;
+                }
+            }
             6 => {
                 if let Some(back) = reserve.back_mut() {
                     *back = value;
                 }
                 if let Some(back) = reserve_model.entries.back_mut() {
                     *back = value;
+                }
+            }
+            _ if value & 1 == 1 => {
+                let index = usize::from(value >> 1) % (marks_model.entries.len() + 1);
+                if let Some(entry) = marks.get_mut(index) {
+                    *entry = Mark(value);
+                }
+                if let Some(entry) = marks_model.entries.get_mut(index) {
+                    *entry = Mark(value);
                 }
             }
             _ => {
@@ -150,6 +177,10 @@ fuzz_target!(|data: &[u8]| {
         assert!(marks.len() <= cap);
         assert!(reserve.iter().eq(reserve_model.entries.iter()));
         assert!(marks.iter().eq(marks_model.entries.iter()));
+        for index in 0..=cap {
+            assert_eq!(reserve.get(index), reserve_model.entries.get(index));
+            assert_eq!(marks.get(index), marks_model.entries.get(index));
+        }
         assert_eq!(
             (reserve.front(), reserve.back()),
             (reserve_model.entries.front(), reserve_model.entries.back())
