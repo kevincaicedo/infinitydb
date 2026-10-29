@@ -22,6 +22,9 @@
 #     distinct primary spans of the resolved diagnostics inside the allowed
 #     item. The table is generated from the tree (the census below), its
 #     counts per file and record only shrink against the approved copies,
+#     a row's expiry only moves earlier against them, or later up to its
+#     record's date on the CONTAINER_EXPIRY_MOVES line (ADR-0163 A1), whose
+#     own dates only move earlier and whose records only leave,
 #     and `container: capped-backing` is allowed exactly
 #     CAPPED_BACKING_SITES times, with no row. clippy.toml owns the banned
 #     paths and the ban's sentence; this gate reads both from it. Every
@@ -67,6 +70,13 @@ ADR0143_EXEMPTIONS_MAX=15
 # capped-backing allows are exact: 1, on `struct CappedDeque` (ADR-0151 D6).
 CONTAINER_EXEMPTIONS_MAX=101
 CAPPED_BACKING_SITES=1
+# ADR-0163 A1: the one later expiry each record's rows may move up to (a
+# ceiling). These dates only move earlier, and a record joins only by the
+# ADR that changes this rule, against HEAD, the base tip and the commit that
+# introduced the line; a record absent here admits no later date. The line
+# stays spelled `CONTAINER_EXPIRY_MOVES="<record>=<date> …"` alone, so every
+# copy reads it.
+CONTAINER_EXPIRY_MOVES="T=2026-11-30 E=2026-12-31 D=2026-12-31 A=2026-12-31 R=2026-12-31 C=2026-12-31"
 if [ "${INF_CONTAINER_CENSUS:-0}" = 1 ] && [ -z "${INF_LINT_API_DIAGNOSTICS:-}" ]; then
     # The census reads the ratchet's two passes; the ratchet calls back here.
     exec "$SCRIPT_DIR/check-lint-ratchet.sh"
@@ -83,6 +93,7 @@ done
 
 INF_CELL_DIRS="$CELL_DIRS" INF_SCOPES="${INF_LINT_SCOPES:-docs/lint-scopes.tsv}" INF_EXEMPTIONS="$EXEMPTIONS" INF_BASE_REF="$BASE_REF" INF_MAX="$ADR0143_EXEMPTIONS_MAX" \
     INF_CONTAINERS="$CONTAINERS" INF_CONTAINER_MAX="$CONTAINER_EXEMPTIONS_MAX" INF_BACKING_SITES="$CAPPED_BACKING_SITES" \
+    INF_CONTAINER_MOVES="$CONTAINER_EXPIRY_MOVES" \
     INF_SELF="scripts/check-lint-scopes.sh" INF_SCRIPT_DIR="$SCRIPT_DIR" python3 -B - <<'PY'
 import bisect
 import datetime
@@ -757,6 +768,42 @@ if own_max != [str(CONTAINER_MAX)]:
           f"the approved copies can read ({', '.join(own_max) or 'none'}), in use {CONTAINER_MAX}: keep it "
           "one line, `CONTAINER_EXEMPTIONS_MAX=<digits>` alone")
     sys.exit(1)
+# ADR-0163 A1: record -> the one later date its rows may move onto, read
+# from this gate's line and from each approved copy's, as GATE_MAX is.
+GATE_MOVES = re.compile(r'^CONTAINER_EXPIRY_MOVES="([^"\n]*)"[ \t]*$', re.M)
+
+
+def moves_in(source, label):
+    """The per-record dates a copy of this gate spells, or None when it spells no line."""
+    found = GATE_MOVES.findall(source)
+    if not found:
+        return None
+    if len(found) != 1:
+        print(f"LINT-SCOPES SCOPE ERROR: {label} spells CONTAINER_EXPIRY_MOVES on {len(found)} lines: "
+              "keep it one line, `CONTAINER_EXPIRY_MOVES=\"<record>=<date> …\"` alone")
+        sys.exit(1)
+    moves = {}
+    for entry in found[0].split():
+        record, _, date = entry.partition("=")
+        try:
+            due = datetime.date.fromisoformat(date) if DATE.match(date) else None
+        except ValueError:
+            due = None
+        if record not in RECORDS or due is None or record in moves:
+            print(f"LINT-SCOPES SCOPE ERROR: {label}: CONTAINER_EXPIRY_MOVES entry `{entry}` is not "
+                  f"`<record>=<YYYY-MM-DD>` for a site record ({' '.join(RECORDS)}), once")
+            sys.exit(1)
+        moves[record] = due
+    return moves
+
+
+MOVES = moves_in((Path(os.environ["INF_SCRIPT_DIR"]) / "check-lint-scopes.sh").read_text(), SELF)
+if MOVES is None:
+    print("LINT-SCOPES SCOPE ERROR: the gate spells no CONTAINER_EXPIRY_MOVES line")
+    sys.exit(1)
+if MOVES != moves_in(f'CONTAINER_EXPIRY_MOVES="{os.environ["INF_CONTAINER_MOVES"]}"', "INF_CONTAINER_MOVES"):
+    print("LINT-SCOPES SCOPE ERROR: the gate's CONTAINER_EXPIRY_MOVES line is not the one in use")
+    sys.exit(1)
 
 
 def container_rows(text, label):
@@ -834,8 +881,9 @@ TABLE_HEADER = """\
 # scripts/check-lint-scopes.sh >table.new`, then `mv table.new` over this file (the census reads
 # each expiry here, so never redirect onto it). A merge conflict, a renamed or split item and a
 # lowered count are resolved by regenerating. `count`: the distinct spans the allow covers.
-# `expiry`, the one hand edit, only moves earlier; the census carries it by (file, item), else
-# from the file and record's earliest date. Per file and record the counts only shrink against
+# `expiry`, the one hand edit, only moves earlier, or later up to its record's date on the
+# gate's CONTAINER_EXPIRY_MOVES line; the census carries it by (file, item), else from the file
+# and record's earliest date. Per file and record the counts only shrink against
 # the approved copies, and their sum is CONTAINER_EXEMPTIONS_MAX exactly."""
 if CENSUS:
     if not diagnostics:
@@ -1006,7 +1054,8 @@ elif csum < CONTAINER_MAX:
                   f"lower the maximum to {csum} in {SELF}")
 
 # approved copies: per file and record the counts only shrink, a pair the
-# copy lacks is red, a date only moves earlier, the maximum only falls. A
+# copy lacks is red, a date only moves earlier or later up to its record's
+# CONTAINER_EXPIRY_MOVES date (ADR-0163 A1), the maximum only falls. A
 # copy whose gate has no CONTAINER_EXEMPTIONS_MAX predates the container gate
 # (bootstrap); one whose gate has it and no table is red.
 cintro = git("log", "--diff-filter=A", "--format=%H", "--", CONTAINERS).stdout.split()
@@ -1053,9 +1102,35 @@ for label, ref in ccopies:
     for (f, key), (_, record, due) in sorted(crows.items()):
         old = renames.get(f, f)
         was = approved_dates.get((old, key, record), approved_dates.get((old, "", record)))
-        if was is not None and due > was:
+        onto = MOVES.get(record)
+        if was is not None and due > was and (onto is None or due > onto):
             errors.append(f"{CONTAINERS}: row {f} `{key}` expiry {due} is later than the {label}'s {was} — "
-                          "a date only moves earlier")
+                          "a date only moves earlier"
+                          + (f", or up to {record}'s {onto} (CONTAINER_EXPIRY_MOVES)" if onto else
+                             f"; record {record} has no CONTAINER_EXPIRY_MOVES date"))
+
+# ADR-0163 A1: the CONTAINER_EXPIRY_MOVES line's own ratchet, against HEAD,
+# the base tip and the commit that introduced the line (the table's
+# introducing commit predates it). A copy's line date only moves earlier,
+# and a record the copy's line lacks is red: a record joins the line only by
+# the ADR that changes this rule. A copy with no line is a bootstrap.
+lintro = git("log", "-S", 'CONTAINER_EXPIRY_MOVES="', "--format=%H", "--", SELF).stdout.split()
+lcopies = [("HEAD", "HEAD"), ("base tip", BASE_REF)] + ([("line's introducing commit", lintro[-1])] if lintro else [])
+for label, ref in lcopies:
+    if git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").returncode != 0:
+        continue  # an unresolvable base tip is already a scope error above
+    gate = git("show", f"{ref}:{SELF}")
+    copy_moves = moves_in(gate.stdout, f"{label} ({ref})") if gate.returncode == 0 else None
+    if copy_moves is None:
+        notes.append(f"{label} spells no CONTAINER_EXPIRY_MOVES (bootstrap)")
+        continue
+    for record, due in sorted(MOVES.items()):
+        if record not in copy_moves:
+            errors.append(f"CONTAINER_EXPIRY_MOVES: {record}={due} is absent from the {label}'s line — "
+                          "a record joins the line only by the ADR that changes this rule (ADR-0163 A1)")
+        elif due > copy_moves[record]:
+            errors.append(f"CONTAINER_EXPIRY_MOVES: {record}={due} is later than the {label}'s "
+                          f"{copy_moves[record]} — a move date only moves earlier (ADR-0163 A1)")
 
 if errors:
     for e in errors:
@@ -1066,7 +1141,8 @@ scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {l
 scope += (f"; container exemptions: {len(crows)} row(s), counts {csum}/{CONTAINER_MAX}, "
           f"{len(backing)}/{BACKING_SITES} capped-backing, "
           + ("counts judged against the census" if diagnostics else "counts judged in the ratchet's API pass")
-          + f", {backstop_files} cell file(s) read as text for a banned name outside an allow")
+          + f", {backstop_files} cell file(s) read as text for a banned name outside an allow"
+          + "; expiry moves " + (", ".join(f"{r}={d}" for r, d in sorted(MOVES.items())) or "none"))
 scope += "".join(f"; {f} counted from its text (compiled only on {os_name})" for f, os_name in sorted(text_counted.items()))
 if test_module_files:
     scope += ("; out-of-line test module file(s) outside the API audit and the backstop: "

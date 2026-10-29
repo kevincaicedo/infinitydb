@@ -2463,6 +2463,59 @@ lc_reset
 lc_row_set "$LC_A" 'struct Exempt' expiry 2099-01-01
 expect green "lint-scopes: containers — a date moved earlier (control)" lc_run "$root"
 lc_reset
+# ADR-0163 A1: a row moves later only up to its record's date on the gate's
+# CONTAINER_EXPIRY_MOVES line (a ceiling); the line's own dates only move
+# earlier, and a record joins it only by the ADR that changes the rule,
+# against HEAD, the base tip and the commit that introduced the line.
+# lc_moves edits the working gate's line, as ls_gate edits its maximum; the
+# fixture's rows sit at 2099-12-31 (struct Exempt is T, fn Owner::build E).
+lc_moves() { # <entries>
+    sed -i.bak "s/^CONTAINER_EXPIRY_MOVES=\".*\"\$/CONTAINER_EXPIRY_MOVES=\"$1\"/" "$LINTSCOPES"
+    rm -f "$LINTSCOPES.bak"
+    grep -q "^CONTAINER_EXPIRY_MOVES=\"$1\"\$" "$LINTSCOPES" ||
+        { echo "lc_moves: the gate's move line is not where the copy sets it" >&2; exit 2; }
+}
+LC_MOVES=$(sed -n 's/^CONTAINER_EXPIRY_MOVES="\(.*\)"$/\1/p' "$LINTSCOPES")
+[ -n "$LC_MOVES" ] || { echo "the gate spells no CONTAINER_EXPIRY_MOVES line" >&2; exit 2; }
+sed -i.bak 's/^\(CONTAINER_EXPIRY_MOVES=".*"\)$/\1 # note/' "$LINTSCOPES"
+rm -f "$LINTSCOPES.bak"
+expect_red_because "lint-scopes: containers — a move line spelled so no copy can read it" \
+    "the gate spells no CONTAINER_EXPIRY_MOVES line" lc_run "$root"
+sed -i.bak 's/^\(CONTAINER_EXPIRY_MOVES=".*"\) # note$/\1/' "$LINTSCOPES"
+rm -f "$LINTSCOPES.bak"
+lc_moves "T=2100-06-30"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-30
+expect green "lint-scopes: containers — a date moved later onto its record's move date (control)" \
+    lc_run "$root"
+expect_output "lint-scopes: containers — the OK line discloses the move dates" \
+    "expiry moves T=2100-06-30" lc_run "$root"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-03-01
+expect green "lint-scopes: containers — a date moved later, under its record's move date (control)" \
+    lc_run "$root"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-07-01
+expect_red_because "lint-scopes: containers — a date moved past its record's move date" \
+    "a date only moves earlier, or up to T's 2100-06-30" lc_run "$root"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-30
+lc_row_set "$LC_A" 'fn Owner::build' expiry 2100-06-30
+expect_red_because "lint-scopes: containers — a date moved onto another record's move date" \
+    "record E has no CONTAINER_EXPIRY_MOVES date" lc_run "$root"
+lc_reset
+printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\nCONTAINER_EXPIRY_MOVES="T=2100-05-31"\n' "$LC_MAX" \
+    >"$root/scripts/check-lint-scopes.sh"
+ls_commit "$root" "a move date"
+lc_moves "T=2100-06-30"
+expect_red_because "lint-scopes: containers — a move date later than the HEAD's" \
+    "a move date only moves earlier" lc_run "$root"
+lc_moves "T=2100-05-31 E=2100-05-31"
+expect_red_because "lint-scopes: containers — a record added to the line" \
+    "E=2100-05-31 is absent from the HEAD's line" lc_run "$root"
+lc_moves "T=2100-05-31"
+expect green "lint-scopes: containers — a move date equal to the HEAD's (control)" lc_run "$root"
+lc_moves "T=2100-05-30"
+expect green "lint-scopes: containers — a move date moved earlier (control)" lc_run "$root"
+lc_moves "$LC_MOVES"
+lc_reset HEAD~1
+lc_reset
 printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$((LC_MAX - 1))" >"$root/scripts/check-lint-scopes.sh"
 ls_commit "$root" "a lower maximum"
 expect_red_because "lint-scopes: containers — a raised maximum" \
