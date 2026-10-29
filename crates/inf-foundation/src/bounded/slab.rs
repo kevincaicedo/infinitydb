@@ -122,8 +122,10 @@ impl<G> SlotId<G> {
     }
 }
 
-/// The answer to `get`: the occupant, or why there is none. A handle whose
-/// generation or slab differs is `Stale`, never absence.
+/// The answer to `get`: the occupant, or why there is none. A handle that
+/// names a slot of this slab but not its occupant — another generation, a
+/// free or retired slot — or that another slab minted is `Stale`, never
+/// absence; `Vacant` is a handle naming no slot of this slab.
 #[must_use]
 #[derive(Debug)]
 pub enum Lookup<'a, T> {
@@ -310,7 +312,6 @@ impl<T, G: Generation, P: GenerationPolicy> CappedSlab<T, G, P> {
             Some(Slot::Live { generation, value }) if *generation == id.generation => {
                 Lookup::Live(value)
             }
-            Some(Slot::Free { generation, .. }) if *generation == id.generation => Lookup::Vacant,
             Some(Slot::Live { .. } | Slot::Free { .. } | Slot::Closed) => Lookup::Stale,
             None => Lookup::Vacant,
         }
@@ -348,9 +349,8 @@ impl<T, G: Generation, P: GenerationPolicy> CappedSlab<T, G, P> {
                 }
             }
             other @ (Slot::Live { .. } | Slot::Free { .. } | Slot::Closed) => {
-                let answer = vacant_or_stale(&other, id.generation);
                 *slot = other;
-                return answer;
+                return Taken::Stale;
             }
         };
         if retired {
@@ -385,9 +385,6 @@ impl<T, G: Generation, P: GenerationPolicy> CappedSlab<T, G, P> {
                 *generation = G::LAST;
                 id.generation = G::LAST;
                 LookupMut::Live(value)
-            }
-            Some(Slot::Free { generation, .. }) if *generation == id.generation => {
-                LookupMut::Vacant
             }
             Some(Slot::Live { .. } | Slot::Free { .. } | Slot::Closed) => LookupMut::Stale,
             None => LookupMut::Vacant,
@@ -514,18 +511,8 @@ impl<T, G: Generation, P> SlabRetiring<T, G, P> {
 fn lookup_mut<T, G: Generation>(slot: Option<&mut Slot<T, G>>, expected: G) -> LookupMut<'_, T> {
     match slot {
         Some(Slot::Live { generation, value }) if *generation == expected => LookupMut::Live(value),
-        Some(Slot::Free { generation, .. }) if *generation == expected => LookupMut::Vacant,
         Some(Slot::Live { .. } | Slot::Free { .. } | Slot::Closed) => LookupMut::Stale,
         None => LookupMut::Vacant,
-    }
-}
-
-/// A take that found no current occupant: `Vacant` for a free slot at the
-/// handle's generation, `Stale` for any other occupant or a retired slot.
-fn vacant_or_stale<T, G: Generation>(slot: &Slot<T, G>, expected: G) -> Taken<T> {
-    match slot {
-        Slot::Free { generation, .. } if *generation == expected => Taken::Vacant,
-        Slot::Live { .. } | Slot::Free { .. } | Slot::Closed => Taken::Stale,
     }
 }
 
@@ -866,6 +853,29 @@ mod tests {
         assert!(matches!(slab.get(stale), Lookup::Stale));
         assert_eq!(slab.take(stale), Taken::Stale);
         assert_eq!(slab.capacity_now(), 1, "a wrap never shrinks");
+    }
+
+    /// A wrap brings a free slot back to the first generation, the one its
+    /// first occupant's handle names: that handle names no occupant now, so
+    /// it is `Stale`, as every handle of this slab that is not its slot's
+    /// live occupant; once the slot is published again it names the new
+    /// occupant, the reuse a `WrapWithProof` site's proof rules out.
+    #[test]
+    fn a_handle_from_before_a_wrap_is_stale_while_its_slot_is_free() {
+        let (census, _mark) = census();
+        let cap = Cap::entries::<1>("wrapped", CapFill::Serving);
+        let (mut slab, _) = built::<u8, u32, WrapWithProof>(cap, &census);
+        let first = publish(&mut slab, 1).expect("room");
+        assert_eq!(slab.take(first), Taken::Value(1));
+        let mut second = publish(&mut slab, 2).expect("room");
+        assert!(matches!(slab.place_generation_last(&mut second), LookupMut::Live(2)));
+        assert_eq!(slab.take(second), Taken::Value(2));
+        assert!(matches!(slab.get(first), Lookup::Stale), "a free slot at its generation");
+        assert!(matches!(slab.get_mut(first), LookupMut::Stale));
+        assert_eq!(slab.take(first), Taken::Stale);
+        let third = publish(&mut slab, 3).expect("room");
+        assert_eq!(third, first, "the wrap reissues the first handle");
+        assert!(matches!(slab.get(first), Lookup::Live(3)));
     }
 
     #[test]
