@@ -237,6 +237,11 @@ rows=(
   # row holds 17 and the census's cap bound reads it over.
   "inf_canary_cap_minus_one m4-epoch-marks cap-row-unfilled --marks-leg wedge"
   "inf_canary_cap_admits_at_cap m4-epoch-marks cap-high-water-over --marks-leg wedge"
+  # The first plant read by the census's crossing rule on the same leg:
+  # the marks cross their cap on every seed, and one short the row answers
+  # `Full` at 15 live, below the 16 it admits now — a crossing short of
+  # the cap, which only that clause prints.
+  "inf_canary_cap_minus_one m4-epoch-marks cap-crossed-short --marks-leg wedge"
   # The first plant at the marks' cap edge, at both unit tiers: 15 and 16
   # ack classes held with the watermark held keep one mark each. One
   # short, the 16th class merges into the back, and the edge's count
@@ -266,6 +271,9 @@ rows=(
   "inf_canary_cap_minus_one m4-extent-window cap-row-unfilled --window-leg burst"
   "inf_canary_cap_admits_at_cap m4-extent-window cap-high-water-over --window-leg burst"
   "inf_canary_cap_admits_at_cap m4-extent-window extent-handles-over --window-leg burst"
+  # The first plant read by the crossing rule on the burst, which must
+  # cross the window: one short, it answers `Full` at 15 of its 16.
+  "inf_canary_cap_minus_one m4-extent-window cap-crossed-short --window-leg burst"
   # The first plant on the window's cap leg, whose 16 writers each hold at
   # most one entry, so at exactly the cap the window fills and never
   # crosses. One short, the row holds 15 of its 16 and the 16th arrival of
