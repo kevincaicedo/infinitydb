@@ -129,14 +129,17 @@ impl TierSpec {
     }
 
     /// `M`: the largest encoded record this spec's namespace admits in one
-    /// life — the format's largest, at most half its ring (ADR-0155 D1,
-    /// ADR-0052 D1). A tier round's span is at most `max(MAINTAIN-SLICE,
-    /// M)`, the bound its flush pipeline's window pool is sized by. `None`
-    /// when the spec has no representable ring.
+    /// life (the store's one formula, `record_len_max_in_ring`, over its
+    /// ring), the bound a pipeline's window pool is sized by with
+    /// the slice. A spec with no representable ring (one
+    /// [`validate`](Self::validate) refuses) answers the format's largest,
+    /// the limit of that formula as the ring grows: a pool sized by it holds
+    /// every span such a namespace could select.
     #[must_use]
-    pub fn record_len_max(&self) -> Option<u64> {
-        let half = self.ring_bytes()? / 2;
-        Some(half.min(crate::record::RECORD_ENCODED_LEN_MAX as u64))
+    pub fn record_len_max(&self) -> u64 {
+        self.ring_bytes().map_or(crate::record::RECORD_ENCODED_LEN_MAX as u64, |ring| {
+            crate::record::record_len_max_in_ring(ring)
+        })
     }
 
     /// The largest `BLOB-THRESHOLD` a ring of `ring_bytes` can honour
@@ -739,6 +742,33 @@ mod tests {
             "registration runs the same gauntlet"
         );
         assert_eq!(reg.iter().count(), 0);
+    }
+
+    /// `M` has one formula, read by the spec and the table alike: half the
+    /// ring up to the format's largest record. Below, at and above the
+    /// ring where the two cross; a spec with no representable ring answers
+    /// the formula's limit.
+    #[test]
+    fn the_largest_record_is_one_formula_over_the_ring() {
+        let format = crate::record::RECORD_ENCODED_LEN_MAX as u64;
+        for (ring, want) in [
+            (4u64 << 20, 2u64 << 20),
+            (32 << 20, 16 << 20),
+            (2 * format, format),
+            (2 * format + 2, format),
+            (64 << 20, format),
+            (u64::MAX, format),
+        ] {
+            assert_eq!(crate::record::record_len_max_in_ring(ring), want, "ring {ring}");
+        }
+        for budget in [3u64 << 20, 31 << 20, 63 << 20, 1 << 30] {
+            let spec = TierSpec::for_budget(budget);
+            let ring = spec.ring_bytes().expect("a representable ring");
+            assert_eq!(spec.record_len_max(), crate::record::record_len_max_in_ring(ring));
+        }
+        let unrepresentable = TierSpec { mem_budget_bytes: u64::MAX, ..TierSpec::for_budget(1) };
+        assert_eq!(unrepresentable.ring_bytes(), None);
+        assert_eq!(unrepresentable.record_len_max(), format);
     }
 
     /// ADR-0102 D2: the default threshold follows the ring — a quarter

@@ -1149,7 +1149,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 mode: spec.tier_io_mode,
                 file_capacity: inf_log::flush::TIER_FILE_CAPACITY_DEFAULT,
                 slice_bytes: spec.maintain_slice_bytes,
-                record_len_max: spec.record_len_max().unwrap_or(spec.maintain_slice_bytes),
+                record_len_max: spec.record_len_max(),
             },
             inf_store::AddressSpaceConfig {
                 reserve_bytes,

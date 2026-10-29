@@ -625,7 +625,7 @@ fn flush_config(cell: &TierCell<SimDisk>, file_capacity: u64, slice_bytes: u64) 
         mode: spec().tier_io_mode,
         file_capacity,
         slice_bytes,
-        record_len_max: spec().record_len_max().expect("a representable ring"),
+        record_len_max: spec().record_len_max(),
     }
 }
 

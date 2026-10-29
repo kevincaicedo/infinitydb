@@ -40,6 +40,19 @@ pub(crate) const TTL_EXT_LEN: usize = 5;
 /// A namespace admits at most this, and at most half its ring.
 pub const RECORD_ENCODED_LEN_MAX: usize = HEADER_LEN + TTL_EXT_LEN + MAX_KEY_LEN + MAX_VAL_LEN;
 const _: () = assert!(RECORD_ENCODED_LEN_MAX == 16_777_483, "the format's largest record");
+
+/// `M`, the largest encoded record a namespace whose ring reserves
+/// `ring_bytes` admits in one life: the format's largest, at most half the
+/// ring (ADR-0155 D1, ADR-0052 D1). The one formula: the spec's and the
+/// table's accessors both read it, and a tier round's span is at most
+/// `max(MAINTAIN-SLICE, M)`, the bound the flush pipeline's window pool is
+/// sized by.
+#[must_use]
+pub(crate) const fn record_len_max_in_ring(ring_bytes: u64) -> u64 {
+    let half = ring_bytes / 2;
+    let format = RECORD_ENCODED_LEN_MAX as u64;
+    if half < format { half } else { format }
+}
 // The tier format's key window holds every record's key: the fixed
 // header, the TTL extension and the longest key end inside it.
 const _: () = assert!(HEADER_LEN + TTL_EXT_LEN + MAX_KEY_LEN <= inf_log::TIER_KEY_WINDOW_BYTES);
