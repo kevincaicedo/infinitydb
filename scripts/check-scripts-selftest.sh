@@ -2148,7 +2148,7 @@ lc_reset
 # ADR-0171 D2: every `WrapWithProof` spelling of cell production code outside
 # `bounded/` is printed on the OK line, so each wrapping slab's proof is a
 # reviewed line; one in a comment, a string or a test module is not
-# production code, and `bounded/`'s own definition is not a use (core reads 0).
+# production code, and `bounded/`'s own definition and impls are not a use.
 lc_append 'pub struct Ids { pub slab: Slab<WrapWithProof> }' 'pub fn ids() { build::<WrapWithProof>(); }' \
     '// a Slab<WrapWithProof> in a comment' 'pub const NAME: &str = "WrapWithProof";' '#[cfg(test)]' \
     'mod tests {' '    pub struct Planted(super::Slab<super::WrapWithProof>);' '}'
