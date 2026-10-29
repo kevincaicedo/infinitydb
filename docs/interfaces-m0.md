@@ -534,6 +534,18 @@ pub struct GroupScheduler;  // deficit-weighted, burst-capped; refill/budget/cha
 > implemented shape: these additions are not built, and they bound no
 > retained reply's bytes.
 
+> **ADR-0190 (2026-10-29), implementation open:** `Outcome` gains
+> `ErrorReply(&'a [u8])`, outcome tag 7, encoded as `Bytes` is: a leg's
+> reply whose outcome is `Error`. `Bytes` keeps tag 1 and carries only a
+> reply whose outcome is `Success`. The tag is set from the reply's
+> outcome where the owner sends and read back into it where the origin
+> decodes, never from the bytes. `ErrCode` gains `EmptyReply`, wire value
+> 5: the origin's refusal of a zero-byte `Bytes` or `ErrorReply`, made
+> where the owned reply is built, never in the codec, which stays total
+> and decodes a zero-length reply. An unknown tag is still a decode error.
+> Tag 6 is `StreamReady` (ADR-0150, above). Not built; the sketch below
+> is the implemented shape (ADR-0190 D3).
+
 ```rust
 pub struct FabricToken(pub u64);           // {origin_cell:16, seq:48}; reply-routing key
 
@@ -633,6 +645,35 @@ between cells in one process, not authentication or an ACL capability
 > frames could outlive accumulator maintenance. The lending shape also
 > compiler-enforces the "frames never outlive EXECUTE unless copied"
 > retention rule.
+
+> **ADR-0190 (2026-10-29), implementation open:** a reply carries its
+> outcome beside its bytes. `ReplyOutcome::{Success, Error}` is one byte
+> the writer sets. `Reply<B>` wraps a reply's bytes (`ReplyBuf<'a>` over
+> a buffer that outlives the reply, `OpenReply` over a pool buffer) with
+> where the reply began and its outcome; `ReplyBuf::over` opens one at
+> the buffer's end, `OpenReply::new` clears its buffer and opens at 0.
+> `OpenReply::lend` runs a closure over a `ReplyBuf` view of the owned
+> reply, opened at its start with its current outcome, and writes the
+> view's outcome back. `OwnedReply` is the closed form, built only by
+> `OpenReply::finish`, by `ReplyBuf::detach` (a copy of the reply's
+> bytes with its outcome, the buffer left at the reply's start) or by
+> `OwnedReply::received(bytes, outcome) -> Result<OwnedReply, ZeroByteReply>`,
+> which refuses zero bytes and returns them; `OwnedReply::reopen` is the
+> inverse of `finish`, bytes and outcome kept. A reply is read through
+> `outcome()`, `is_error()`, `bytes()` and `into_bytes()`; a borrowed
+> reply's bytes are the buffer's from its start, read once the view has
+> dropped. `RespWriter::new` takes `&mut Reply<B>`, no longer
+> `&mut Vec<u8>`; the writer's type and its frame methods are unchanged,
+> and it gains `encoded(bytes)`, the one entry for bytes another writer
+> encoded (a nested element, a frame after the first), which leaves the
+> outcome alone — a whole reply is moved, never pasted. `error` and
+> `error_bytes` set `Error` only when they write the reply's first frame;
+> a nested error element leaves the outcome; `rollback` to the reply's
+> start, and `clear`, reset it to `Success` and leave every byte before
+> the reply's start. The outcome is `Error` iff
+> the reply's top-level frame is an error line, and no reader of a reply
+> decides from its bytes. Not built; the sketch below is the implemented
+> shape (ADR-0190 D1).
 
 ```rust
 // Parser: per-connection state over borrowed input; a frame that spans feeds
@@ -831,6 +872,28 @@ impl SlotRouter {
 > cancellation acknowledgement (ADR-0150 D1, D2, D4, D5). These
 > replacements are not built; the sketches below are the implemented
 > execution and observer interfaces.
+
+> **ADR-0190 (2026-10-29), implementation open:** `execute` and
+> `execute_slices` take `out: &mut ReplyBuf<'_>` in place of
+> `&mut Vec<u8>`, as does every reply parameter of the crate (none is
+> generic; an owned open reply is lent to them); a writer of several
+> replies, the parse stage's batch, holds the connection's buffer and
+> opens one `ReplyBuf` per reply. Every reply the
+> plane holds, forwards or gathers is
+> an `OwnedReply`: the caller reads `outcome()` after `execute` returns,
+> and no site of `inf-server` decides success or failure from a reply's
+> first byte, prefix or length. A write stages its durable effects only
+> when its reply's outcome is `Success`, or the command stages despite an
+> error, through one function. A fan's refused leg (`Err(code)`) is the
+> fan's failure, never `+OK`, rendered with one text. Every command
+> writes at least one top-level frame; its outcome is the frame at the
+> reply's start. Pub/sub confirmations are one frame per name and RESP3
+> pushes follow a reply (Redis's shapes); one frame per case is the
+> compat oracle's assertion, not a rule of this seam.
+> `scripts/check-reply-outcome.sh` refuses a first-byte or prefix
+> comparison in production `crates/inf-server/src`; a sanctioned site
+> carries `reply-outcome-allow: <reason>`. Not built; the sketch below is
+> the implemented shape (ADR-0190 D2, D4).
 
 ```rust
 pub struct ConnCx { pub proto: Protocol, pub id: u64 }   // HELLO state
