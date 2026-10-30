@@ -12,6 +12,8 @@ use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::KeySlot;
 use inf_store::{Keyspace, StoreConfig};
 
+#[cfg(feature = "doc")]
+use super::dispatch::gather_json_mget;
 use super::dispatch::{dispatch_scatter, program_mset, settle_reply};
 use super::publish::program_pubsub;
 use super::*;
@@ -133,6 +135,10 @@ fn drain(
 fn no_answer(_: &[&[u8]]) -> Option<Outcome<'static>> {
     None
 }
+
+/// A peer's error in RESP3's second encoding (`!`): a leg that reads its
+/// outcome from the first byte takes it for a success.
+const BLOB: &[u8] = b"!5\r\nERR x\r\n";
 
 /// An error as this build's writer encodes it, so a row reads the same
 /// under the blob-error plant as on the plain build.
@@ -327,9 +333,9 @@ fn reply_outcome_blob_error_leg_is_the_reply() {
                 program_mset(shared, ORIGIN, Protocol::Resp2, 0, 0, argv, &mut inflight).await;
             settle_reply(shared, KEY, pending, &mut inflight).await.into_bytes()
         },
-        |args| (args[0] == b"SET").then_some(Outcome::ErrorReply(b"!5\r\nERR x\r\n")),
+        |args| (args[0] == b"SET").then_some(Outcome::ErrorReply(BLOB)),
     );
-    assert_eq!(reply, b"!5\r\nERR x\r\n");
+    assert_eq!(reply, BLOB);
 }
 
 /// A `-` reply the wire tags a success is a success leg: the tag decides,
@@ -402,4 +408,104 @@ fn reply_outcome_read_of_an_empty_value_stages_zero_bytes() {
     );
     let [(_, _, reply)] = staged.as_slice() else { panic!("one staged reply: {}", staged.len()) };
     assert!(matches!(staged_outcome(&scratch, reply), Outcome::Bytes(b"")));
+}
+
+/// `MSETNX`'s `SET` fan: a leg's error reply is the client's reply, read by
+/// its outcome, whatever its first byte (ADR-0190 D2).
+#[test]
+fn reply_outcome_msetnx_set_leg_error_is_the_reply() {
+    let cells = Cells::new();
+    let remote = cells.key_on(1);
+    let shared = cells.origin();
+    let argv: &[&[u8]] = &[b"MSETNX", &remote, b"v"];
+    let reply = cells.drive(
+        async { program_msetnx(shared, ORIGIN, Protocol::Resp2, 0, 0, argv).await.into_bytes() },
+        |args| (args[0] == b"SET").then_some(Outcome::ErrorReply(BLOB)),
+    );
+    assert_eq!(reply, BLOB);
+}
+
+/// A move's read leg (`INF.PEEK`) that errs: the client reads that error,
+/// not a malformed-reply error.
+#[test]
+fn reply_outcome_copy_read_leg_error_is_the_reply() {
+    let cells = Cells::new();
+    let (source, target) = (cells.key_on(1), cells.key_on(0));
+    let shared = cells.origin();
+    let argv: &[&[u8]] = &[b"COPY", &source, &target];
+    let reply = cells.drive(
+        async {
+            program_move(shared, ORIGIN, Protocol::Resp2, 0, 0, CommandId::Copy, argv)
+                .await
+                .into_bytes()
+        },
+        |args| (args[0] == b"INF.PEEK").then_some(Outcome::ErrorReply(BLOB)),
+    );
+    assert_eq!(reply, BLOB);
+}
+
+/// A move's conditional remove (`INF.TAKE`) that errs after the put: the
+/// client reads that error, not a malformed-reply error.
+#[test]
+fn reply_outcome_rename_take_leg_error_is_the_reply() {
+    let cells = Cells::new();
+    let (source, target) = (cells.key_on(1), cells.key_on(0));
+    assert_eq!(cells.local(1, &[b"SET", &source, b"v"]), b"+OK\r\n");
+    let shared = cells.origin();
+    let argv: &[&[u8]] = &[b"RENAME", &source, &target];
+    let reply = cells.drive(
+        async {
+            program_move(shared, ORIGIN, Protocol::Resp2, 0, 0, CommandId::Rename, argv)
+                .await
+                .into_bytes()
+        },
+        |args| (args[0] == b"INF.TAKE").then_some(Outcome::ErrorReply(BLOB)),
+    );
+    assert_eq!(reply, BLOB);
+}
+
+/// `JSON.MGET` over one local and one remote key, the remote leg answered
+/// by `answer`; the client's reply.
+#[cfg(feature = "doc")]
+fn json_mget(
+    cells: &Cells,
+    answer: impl FnMut(&[&[u8]]) -> Option<Outcome<'static>>,
+) -> (Vec<u8>, Vec<u8>) {
+    let (local, remote) = (cells.key_on(0), cells.key_on(1));
+    let element = cells.local(0, &[b"JSON.MGET", &local, b"$.a"]);
+    let element = element.strip_prefix(b"*1\r\n").expect("a one-element sub-reply").to_vec();
+    let shared = cells.origin();
+    let argv: &[&[u8]] = &[b"JSON.MGET", &local, &remote, b"$.a"];
+    let reply = cells.drive(
+        async {
+            let mut inflight = 0;
+            let pending =
+                gather_json_mget(shared, ORIGIN, Protocol::Resp2, 0, 0, argv, &mut inflight).await;
+            settle_reply(shared, KEY, pending, &mut inflight).await.into_bytes()
+        },
+        answer,
+    );
+    (reply, element)
+}
+
+/// The `JSON.MGET` gather pastes an `Error` element whole, whatever its
+/// first byte: no shape is read from an error (ADR-0190 D2).
+#[cfg(feature = "doc")]
+#[test]
+fn reply_outcome_json_mget_error_element_is_pasted_whole() {
+    let cells = Cells::new();
+    let (reply, element) =
+        json_mget(&cells, |args| (args[0] == b"JSON.MGET").then_some(Outcome::ErrorReply(BLOB)));
+    assert_eq!(reply, [b"*2\r\n".as_slice(), &element, BLOB].concat());
+}
+
+/// Control: a `Success` element is stripped to the one value it carries.
+#[cfg(feature = "doc")]
+#[test]
+fn reply_outcome_json_mget_success_element_is_stripped() {
+    let cells = Cells::new();
+    let (reply, element) = json_mget(&cells, |args| {
+        (args[0] == b"JSON.MGET").then_some(Outcome::Bytes(b"*1\r\n$5\r\n[1,2]\r\n"))
+    });
+    assert_eq!(reply, [b"*2\r\n".as_slice(), &element, b"$5\r\n[1,2]\r\n"].concat());
 }

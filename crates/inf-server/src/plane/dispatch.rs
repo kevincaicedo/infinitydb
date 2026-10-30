@@ -920,7 +920,7 @@ async fn gather_mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
 /// `JSON.MGET` with a remote key (M3-S11; ADR-0041 D9): the `MGET` shape
 /// with single-key sub-ops, the path riding every one.
 #[cfg(feature = "doc")]
-async fn gather_json_mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+pub(super) async fn gather_json_mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     proto: Protocol,
