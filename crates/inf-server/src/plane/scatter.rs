@@ -762,7 +762,12 @@ pub(super) fn parse_publisher_tag(conn: &[u8], seq: &[u8]) -> Option<(ConnKey, u
 }
 
 /// `*N\r\n` array header → `(N, body offset)`. `None` for errors/nulls.
-/// Public for the fuzz target.
+/// Public for the fuzz target. A value decoder, not an outcome reader:
+/// `PUBSUB CHANNELS` reads its leg's outcome before calling it. `KEYS`
+/// does not yet: on its local and peer legs a reply this decoder refuses
+/// is answered whole, so a `Success` leg without a header reaches the
+/// client where the rule answers `ERR cross-cell program reply malformed`
+/// (ADR-0190 D2) — not built.
 #[doc(hidden)]
 #[cfg_attr(
     not(test),
@@ -774,7 +779,7 @@ pub(super) fn parse_publisher_tag(conn: &[u8], seq: &[u8]) -> Option<(ConnKey, u
     )
 )]
 pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
-    // reply-outcome-allow: a fuzzed value decoder of a leg whose outcome was read first
+    // reply-outcome-allow: a fuzzed value decoder; KEYS's two legs do not read their outcome first
     let rest = raw.strip_prefix(b"*")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let n: i64 = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
@@ -785,7 +790,11 @@ pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
 /// `*2\r\n$N\r\n<cursor>\r\n…` SCAN reply head → `(cursor, keys offset)`.
 /// Every bound is checked before it is indexed (F-L12-06): the cursor's
 /// trailing CRLF must exist, so the offset never lands past the buffer
-/// (`&raw[rest_at..]` at the caller). Public for the fuzz target.
+/// (`&raw[rest_at..]` at the caller). Public for the fuzz target. A value
+/// decoder, not an outcome reader; its one caller, `SCAN`, does not yet
+/// read its leg's outcome first: a reply this decoder refuses is answered
+/// whole, a `Success` leg without the head included (ADR-0190 D2 answers
+/// that `ERR cross-cell program reply malformed`) — not built.
 #[doc(hidden)]
 #[cfg_attr(
     not(test),
@@ -797,7 +806,7 @@ pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
     )
 )]
 pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
-    // reply-outcome-allow: a fuzzed value decoder of a leg whose outcome was read first
+    // reply-outcome-allow: a fuzzed value decoder; SCAN does not read its leg's outcome first
     let rest = raw.strip_prefix(b"*2\r\n$")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let len: usize = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
@@ -827,7 +836,7 @@ pub fn parse_take_reply(raw: &[u8]) -> Option<Option<(Vec<u8>, i64)>> {
     if raw == b"*-1\r\n" {
         return Some(None);
     }
-    // reply-outcome-allow: a fuzzed value decoder of a leg whose outcome was read first
+    // reply-outcome-allow: a fuzzed value decoder; its one caller reads the leg's outcome first
     let rest = raw.strip_prefix(b"*2\r\n$")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let len: usize = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;

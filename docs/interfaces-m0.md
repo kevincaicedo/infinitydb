@@ -700,7 +700,8 @@ between cells in one process, not authentication or an ACL capability
 > start, and `clear`, reset it to `Success` and leave every byte before
 > the reply's start. The outcome is `Error` iff
 > the reply's top-level frame is an error line, and no reader of a reply
-> decides from its bytes. The sketch below is the shape (ADR-0190 D1).
+> decides from its bytes, but for the `KEYS` and `SCAN` programs' legs
+> (§6b). The sketch below is the shape (ADR-0190 D1).
 
 ```rust
 // Parser: per-connection state over borrowed input; a frame that spans feeds
@@ -914,8 +915,13 @@ impl SlotRouter {
 > plane holds, forwards or gathers is
 > an `OwnedReply`: the caller reads `outcome()` after `execute` returns,
 > and no site of `inf-server` decides success or failure from a reply's
-> first byte, prefix or length. A write stages its durable effects only
-> when its reply's outcome is `Success`, or the command stages despite an
+> first byte, prefix or length, but the `KEYS` and `SCAN` programs: a leg
+> reply whose array header does not parse is answered whole, so a
+> `Success` leg without one reaches the client where the rule answers
+> `ERR cross-cell program reply malformed` (as `PUBSUB CHANNELS` does).
+> Reading those legs' outcome first is not built. A write stages its
+> durable effects only when its reply's outcome is `Success`, or the
+> command stages despite an
 > error, through one function. A fan's refused leg (`Err(code)`) is the
 > fan's failure, never `+OK`, rendered with one text. Every command
 > writes at least one top-level frame; its outcome is the frame at the
