@@ -2,10 +2,39 @@
 //! command mix) and dispatch cost (gate: ≤ 15 cycles ≈ ~4 ns at reference
 //! clocks). Gate artifacts come from the Linux reference box; local runs are
 //! dev-tier numbers.
+//!
+//! The binary also counts the writer rows of the reply-outcome A/B
+//! (ADR-0190 D1's cost row): one reply per op, at the `GET` shape (one
+//! 64 B bulk) and the `+OK` shape, written as a command's reply is — a
+//! reply opened over a long-lived buffer, a writer built over it, one frame.
+//! The verdict rule: B − A ≤ 3 instructions per reply on each shape. The
+//! instrument: exact user-space instructions per reply, `(I(n) − I(0)) / n`
+//! at `n` = 10⁷, read outside this binary (`perf stat -e instructions:u`)
+//! on one pinned core, legs A B B A twice per shape, A and B two builds of
+//! this file's legs. A run judges only when its controls hold:
+//!
+//! - the same binary against itself: A against A and B against B within
+//!   0.05 per reply, at a resolution of 0.01 per reply at `n` = 10⁷;
+//! - liveness: `<shape>-plus-one`, one `nop` per reply at the top of the
+//!   loop body, reads its build + 1.00, ± 0.05;
+//! - the rule's own red: `<shape>-plus-four` on B reads B − A + 4, over
+//!   the bound while B − A ≥ 0. A cheaper B leaves it at the bound or under,
+//!   and the run is invalid until the red is repaired.
+//!
+//! One leg, then one leg counted: `perf` wraps the binary that `--no-run`
+//! prints, never `cargo`, whose own instructions would join the count:
+//!
+//!   cargo bench -p inf-wire --bench wire --no-run
+//!   taskset -c <core> perf stat -e instructions:u -x, -- <binary> \
+//!       --variant <v> --ops <n>
+//!
+//! `v` is a leg of `LEGS`; `n` ≥ 0 (0 is the I(0) leg). Without
+//! `--variant` the binary runs the criterion groups below.
 
 use std::hint::black_box;
+use std::process::ExitCode;
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group};
 use inf_wire::{ConnParser, Parsed, ParserLimits, Protocol, ReplyBuf, RespWriter, lookup};
 
 /// Pipelined GET/SET mix, RESP-encoded — the regime the node throughput
@@ -213,4 +242,153 @@ fn bench_write(c: &mut Criterion) {
 }
 
 criterion_group!(benches, bench_parse, bench_dispatch, bench_write);
-criterion_main!(benches);
+
+fn main() -> ExitCode {
+    if std::env::args().any(|arg| arg == "--variant") {
+        return reply_cost::main();
+    }
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+    ExitCode::SUCCESS
+}
+
+/// The writer rows of the reply-outcome A/B, by instructions per reply.
+mod reply_cost {
+    use std::hint::black_box;
+    use std::process::ExitCode;
+
+    use inf_wire::{Protocol, ReplyBuf, RespWriter};
+
+    /// The reply a leg writes.
+    #[derive(Clone, Copy)]
+    enum Shape {
+        /// `GET`'s hit: one 64 B bulk.
+        Get,
+        /// `SET`'s answer: `+OK`.
+        Ok,
+    }
+
+    /// The one table of leg names: `--variant` is parsed against it; the
+    /// count is the `nop`s planted per reply.
+    const LEGS: [(&str, Shape, u8); 6] = [
+        ("get", Shape::Get, 0),
+        ("get-plus-one", Shape::Get, 1),
+        ("get-plus-four", Shape::Get, 4),
+        ("ok", Shape::Ok, 0),
+        ("ok-plus-one", Shape::Ok, 1),
+        ("ok-plus-four", Shape::Ok, 4),
+    ];
+
+    fn parse() -> Result<(&'static str, Shape, u8, u64), String> {
+        let mut leg = None;
+        let mut ops = None;
+        let mut args = std::env::args().skip(1);
+        while let Some(flag) = args.next() {
+            if flag == "--bench" {
+                continue; // cargo bench passes it to a harness-free binary
+            }
+            let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
+            match flag.as_str() {
+                "--variant" => {
+                    let Some(&found) = LEGS.iter().find(|(name, ..)| *name == value) else {
+                        let names: Vec<&str> = LEGS.iter().map(|(name, ..)| *name).collect();
+                        return Err(format!("--variant {value}: one of {}", names.join(", ")));
+                    };
+                    leg = Some(found);
+                }
+                "--ops" => ops = Some(value.parse::<u64>().map_err(|e| format!("--ops: {e}"))?),
+                other => return Err(format!("unknown flag {other}")),
+            }
+        }
+        let (name, shape, nops) = leg.ok_or("--variant is required")?;
+        Ok((name, shape, nops, ops.ok_or("--ops is required")?))
+    }
+
+    /// The plants: `NOPS` instructions per reply at the top of the loop
+    /// body, each a `nop` with no operand, so the count reads exactly
+    /// `NOPS` more.
+    #[inline(always)]
+    fn plant<const NOPS: u8>() {
+        // With no `nop` the leg emits no `asm!` at all.
+        if NOPS > 0 {
+            // SAFETY: a `nop` touches no register, memory or flag.
+            unsafe {
+                std::arch::asm!(
+                    ".rept {count}",
+                    "nop",
+                    ".endr",
+                    count = const NOPS,
+                    options(nomem, nostack, preserves_flags)
+                );
+            }
+        }
+    }
+
+    // One reply per call through `&mut`, as a connection's buffer is
+    // reached: the step is never inlined into the loop.
+    #[inline(never)]
+    fn reply_get(out: &mut Vec<u8>, value: &[u8]) -> usize {
+        out.clear();
+        RespWriter::new(&mut ReplyBuf::over(out), Protocol::Resp2).bulk(value);
+        out.len()
+    }
+
+    #[inline(never)]
+    fn reply_ok(out: &mut Vec<u8>) -> usize {
+        out.clear();
+        RespWriter::new(&mut ReplyBuf::over(out), Protocol::Resp2).simple("OK");
+        out.len()
+    }
+
+    fn drive<const NOPS: u8>(shape: Shape, ops: u64) -> u64 {
+        let value = [0xABu8; 64];
+        let mut out = Vec::with_capacity(256);
+        let mut bytes = 0u64;
+        match shape {
+            Shape::Get => {
+                for _ in 0..ops {
+                    plant::<NOPS>();
+                    let len = reply_get(black_box(&mut out), black_box(&value));
+                    bytes = bytes.wrapping_add(len as u64);
+                }
+            }
+            Shape::Ok => {
+                for _ in 0..ops {
+                    plant::<NOPS>();
+                    bytes = bytes.wrapping_add(reply_ok(black_box(&mut out)) as u64);
+                }
+            }
+        }
+        bytes
+    }
+
+    pub(super) fn main() -> ExitCode {
+        let (name, shape, nops, ops) = match parse() {
+            Ok(args) => args,
+            Err(error) => {
+                eprintln!("wire reply_cost: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        let bytes = match nops {
+            0 => drive::<0>(shape, ops),
+            1 => drive::<1>(shape, ops),
+            4 => drive::<4>(shape, ops),
+            other => {
+                eprintln!("wire reply_cost: {name}: no plant of {other} nops");
+                return ExitCode::from(2);
+            }
+        };
+        // `$64\r\n`, the value, `\r\n`; `+OK\r\n`.
+        let per_reply: u64 = match shape {
+            Shape::Get => 71,
+            Shape::Ok => 5,
+        };
+        // The oracle that every op wrote its whole reply: a leg that wrote
+        // nothing would count a cheaper loop, not a cheaper reply.
+        let expected = ops.wrapping_mul(per_reply);
+        assert_eq!(black_box(bytes), expected, "{name}: every op writes one reply");
+        println!("{name} ops={ops} bytes={bytes}");
+        ExitCode::SUCCESS
+    }
+}

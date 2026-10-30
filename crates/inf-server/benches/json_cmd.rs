@@ -10,9 +10,26 @@
 //! (registry → handlers → store → RESP bytes) on the 1 KiB gate shape —
 //! plus the S10 program-cache row. The S25 campaign re-runs the true
 //! wire-level gates on the reference box.
+//!
+//! The binary also counts the funnel row of the reply-outcome A/B
+//! (ADR-0190 D1's cost row): one `JSON.GET` of the depth-4 leaf path per
+//! op through `execute_slices`, the reply opened over the harness's
+//! long-lived buffer as a connection's is. The verdict rule, the
+//! instrument and its controls are the writer rows' (`inf-wire`'s `wire`
+//! bench): B − A ≤ 3 instructions per reply; `(I(n) − I(0)) / n` at
+//! `n` = 10⁷ by `perf stat -e instructions:u` on one pinned core, legs
+//! A B B A twice; A/A and B/B within 0.05; `json-get-plus-one` reads its
+//! build + 1.00 ± 0.05; `json-get-plus-four` on B is the rule's own red.
+//!
+//!   cargo bench -p inf-server --bench json_cmd --no-run
+//!   taskset -c <core> perf stat -e instructions:u -x, -- <binary> \
+//!       --variant <v> --ops <n>
+//!
+//! Without `--variant` the binary runs the criterion group below.
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group};
 use std::hint::black_box;
+use std::process::ExitCode;
 
 use inf_foundation::time::Nanos;
 use inf_server::{ConnCx, execute_slices};
@@ -200,4 +217,119 @@ fn bench_json_cmd(c: &mut Criterion) {
 }
 
 criterion_group!(benches, bench_json_cmd);
-criterion_main!(benches);
+
+fn main() -> ExitCode {
+    if std::env::args().any(|arg| arg == "--variant") {
+        return reply_cost::main();
+    }
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+    ExitCode::SUCCESS
+}
+
+/// The funnel row of the reply-outcome A/B, by instructions per reply.
+mod reply_cost {
+    use std::hint::black_box;
+    use std::process::ExitCode;
+
+    use super::{Harness, bulk, doc_corpus, fixture_id};
+
+    const PATH: &[u8] = b"$.child.child.child.child.id";
+
+    /// The one table of leg names: `--variant` is parsed against it; the
+    /// count is the `nop`s planted per reply.
+    const LEGS: [(&str, u8); 3] =
+        [("json-get", 0), ("json-get-plus-one", 1), ("json-get-plus-four", 4)];
+
+    fn parse() -> Result<(&'static str, u8, u64), String> {
+        let mut leg = None;
+        let mut ops = None;
+        let mut args = std::env::args().skip(1);
+        while let Some(flag) = args.next() {
+            if flag == "--bench" {
+                continue; // cargo bench passes it to a harness-free binary
+            }
+            let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
+            match flag.as_str() {
+                "--variant" => {
+                    let Some(&found) = LEGS.iter().find(|(name, _)| *name == value) else {
+                        let names: Vec<&str> = LEGS.iter().map(|(name, _)| *name).collect();
+                        return Err(format!("--variant {value}: one of {}", names.join(", ")));
+                    };
+                    leg = Some(found);
+                }
+                "--ops" => ops = Some(value.parse::<u64>().map_err(|e| format!("--ops: {e}"))?),
+                other => return Err(format!("unknown flag {other}")),
+            }
+        }
+        let (name, nops) = leg.ok_or("--variant is required")?;
+        Ok((name, nops, ops.ok_or("--ops is required")?))
+    }
+
+    /// The plants: `NOPS` instructions per reply at the top of the loop
+    /// body, each a `nop` with no operand, so the count reads exactly
+    /// `NOPS` more.
+    #[inline(always)]
+    fn plant<const NOPS: u8>() {
+        // With no `nop` the leg emits no `asm!` at all.
+        if NOPS > 0 {
+            // SAFETY: a `nop` touches no register, memory or flag.
+            unsafe {
+                std::arch::asm!(
+                    ".rept {count}",
+                    "nop",
+                    ".endr",
+                    count = const NOPS,
+                    options(nomem, nostack, preserves_flags)
+                );
+            }
+        }
+    }
+
+    // One command per call through `&mut`: the step is never inlined into
+    // the loop.
+    #[inline(never)]
+    fn json_get(h: &mut Harness, key: &[u8], path: &[u8]) -> usize {
+        h.run(&[b"JSON.GET", key, path]).len()
+    }
+
+    fn drive<const NOPS: u8>(h: &mut Harness, ops: u64) -> u64 {
+        let mut bytes = 0u64;
+        for _ in 0..ops {
+            plant::<NOPS>();
+            let len = json_get(black_box(&mut *h), black_box(b"k:doc"), black_box(PATH));
+            bytes = bytes.wrapping_add(len as u64);
+        }
+        bytes
+    }
+
+    pub(super) fn main() -> ExitCode {
+        let (name, nops, ops) = match parse() {
+            Ok(args) => args,
+            Err(error) => {
+                eprintln!("json_cmd reply_cost: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        let text = doc_corpus::shape(doc_corpus::CANONICAL_SEED, "gate-1KiB").json;
+        let mut h = Harness::new();
+        assert_eq!(h.run(&[b"JSON.SET", b"k:doc", b"$", text.as_bytes()]), b"+OK\r\n");
+        let expected = bulk(format!("[{}]", fixture_id(&text, true)).as_bytes());
+        assert_eq!(h.run(&[b"JSON.GET", b"k:doc", PATH]), expected.as_slice());
+        let bytes = match nops {
+            0 => drive::<0>(&mut h, ops),
+            1 => drive::<1>(&mut h, ops),
+            4 => drive::<4>(&mut h, ops),
+            other => {
+                eprintln!("json_cmd reply_cost: {name}: no plant of {other} nops");
+                return ExitCode::from(2);
+            }
+        };
+        // The oracle that every op answered the leaf: a leg that answered
+        // less would count a cheaper command, not a cheaper reply.
+        let want = ops.wrapping_mul(expected.len() as u64);
+        assert_eq!(black_box(bytes), want, "{name}: every op answers the leaf");
+        println!("{name} ops={ops} bytes={bytes}");
+        ExitCode::SUCCESS
+    }
+}
