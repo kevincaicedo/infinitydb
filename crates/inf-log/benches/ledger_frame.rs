@@ -84,8 +84,8 @@ use inf_foundation::bounded::CapCensus;
 use inf_foundation::time::Nanos;
 use inf_log::fs::mem::MemFile;
 use inf_log::{
-    FrameBarrier, FrameLayout, FramePlan, FsyncClass, GroupCommit, Lsn, MutationEffect, NsId,
-    SealPlan, SegmentId, StagingConfig, StagingRing,
+    FrameBarrier, FrameLayout, FramePlan, FrameQueued, FsyncClass, GroupCommit, Lsn,
+    MutationEffect, NsId, SegmentId, StagingConfig, StagingRing,
 };
 
 #[path = "ledger_frame/parent.rs"]
@@ -236,11 +236,10 @@ fn ledger_frame(
     };
     let (lease, end) = leg.staging.seal();
     let now = leg.staging.now;
-    let id = leg.ledger.note_frame_queued(end, lease, now);
-    let ticket = match plan {
-        SealPlan::WriteThrough => Some(leg.ledger.register_write_through(now)),
-        SealPlan::LinkedFsync => Some(leg.ledger.register_linked_fsync(now)),
-        SealPlan::Plain => None,
+    let FrameQueued { id, barrier } = leg.ledger.note_frame_queued(end, lease, plan, now);
+    let ticket = match barrier {
+        FrameBarrier::WriteThrough(ticket) | FrameBarrier::Linked(ticket) => Some(ticket),
+        FrameBarrier::None => None,
     };
     let written = leg.ledger.note_frame_written(id);
     leg.staging.ring.release(written.lease);
@@ -331,16 +330,7 @@ fn ledger_plane_frame(
     };
     let (lease, end) = leg.staging.seal();
     let now = leg.staging.now;
-    let id = leg.ledger.note_frame_queued(end, lease, now);
-    match plan {
-        SealPlan::WriteThrough => {
-            leg.ledger.register_write_through(now);
-        }
-        SealPlan::LinkedFsync => {
-            leg.ledger.register_linked_fsync(now);
-        }
-        SealPlan::Plain => {}
-    }
+    let id = leg.ledger.note_frame_queued(end, lease, plan, now).id;
     let frame = leg.ledger.note_frame_written(id);
     let stall = now.saturating_sub(frame.submitted_at).as_micros();
     leg.staging.ring.release(frame.lease);

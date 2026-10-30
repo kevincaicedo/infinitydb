@@ -57,8 +57,8 @@ pub use ckpt::{
     read_ick, read_ick_hybrid,
 };
 pub use commit::{
-    CommitStats, ExtentRegistration, ExtentSync, FrameBarrier, FrameId, FramePlan, FsyncClass,
-    FsyncTicket, GroupCommit, Hold, LedgerClass, SealPlan, SyncReason, WrittenFrame,
+    CommitStats, ExtentRegistration, ExtentSync, FrameBarrier, FrameId, FramePlan, FrameQueued,
+    FsyncClass, FsyncTicket, GroupCommit, Hold, LedgerClass, SealPlan, SyncReason, WrittenFrame,
 };
 pub use effect::MutationEffect;
 pub use flush::{

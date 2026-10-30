@@ -1315,8 +1315,8 @@ impl<F: SegmentFs> DurableCell<F> {
         }
     }
 
-    /// Seal the pending records into `slot`, register the planned barrier,
-    /// and hand the frame to the driver. The frame's on-device extent
+    /// Seal the pending records into `slot`, queue the frame with its
+    /// planned barrier, and hand the frame to the driver. The frame's on-device extent
     /// (padding included on aligned segments) is what the cursor, the
     /// ledger, and the barrier all advance by (ADR-0086 D3).
     fn queue_frame(&mut self, cx: &mut LoopCx<'_>, slot: inf_log::FrameSlot, plan: SealPlan) {
@@ -1335,20 +1335,16 @@ impl<F: SegmentFs> DurableCell<F> {
         point.publish(AckPoint { end, seq: self.last_seq });
         // The ledger's queue holds the lease until the write's `LogWritten`.
         let data = log_bytes::sealed_frame(&self.staging, &lease);
-        let id = self.commit.note_frame_queued(end, lease, cx.now);
         // Barrier class per frame (ADR-0086 D1, ADR-0087 D3): the plan
-        // decided before the seal, and a sealable plan holds no `Wait`. The
-        // ledger's queue entry settles the barrier at the frame's `LogWritten`.
-        let (barrier, linked) = match plan {
-            SealPlan::WriteThrough => {
-                self.commit.register_write_through(cx.now);
-                (WriteBarrier::WriteThrough, false)
-            }
-            SealPlan::LinkedFsync => {
-                let ticket = self.commit.register_linked_fsync(cx.now);
+        // decided before the seal; the queueing registers its barrier with
+        // the frame (ADR-0197 D2), and the frame's `LogWritten` settles it.
+        let queued = self.commit.note_frame_queued(end, lease, plan, cx.now);
+        let (barrier, linked) = match queued.barrier {
+            FrameBarrier::None => (WriteBarrier::None, false),
+            FrameBarrier::WriteThrough(_) => (WriteBarrier::WriteThrough, false),
+            FrameBarrier::Linked(ticket) => {
                 (WriteBarrier::LinkedFsync { fsync_token: fsync_token(ticket) }, true)
             }
-            SealPlan::Plain => (WriteBarrier::None, false),
         };
         // A `u32` segment cursor: always addressable (ADR-0167 D2).
         let offset = FileOffset::from_u32_bytes(slot.base().offset);
@@ -1359,7 +1355,7 @@ impl<F: SegmentFs> DurableCell<F> {
         self.budget.charge(IoClass::LogFrame, u64::from(slot.len()), ops);
         self.rotor.commit_frame_queued(slot);
         self.write_seq += 1;
-        debug_assert_eq!(self.write_seq, id.0, "write token sequence is the frame id");
+        debug_assert_eq!(self.write_seq, queued.id.0, "write token sequence is the frame id");
         debug_assert!(
             self.commit.frames_unwritten() <= usize::from(self.staging.frames_in_flight()),
             "the ledger's unwritten frames are the ring's in flight"

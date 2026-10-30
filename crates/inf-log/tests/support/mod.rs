@@ -559,19 +559,22 @@ impl CellPlane for DurablePlane {
             // (ADR-0013 D1) — the sealed buffer neither moves nor resets
             // while this op is in flight.
             let data = unsafe { StableBytes::new(bytes) };
-            let id = self.commit.note_frame_queued(end, lease, cx.now);
-            let barrier = if plan == inf_log::SealPlan::LinkedFsync {
-                let ticket = self.commit.register_linked_fsync(cx.now);
-                self.fsync_submits.push((SyncReason::Linked, cx.now));
-                WriteBarrier::LinkedFsync { fsync_token: fsync_token(ticket) }
-            } else {
-                WriteBarrier::None
+            let queued = self.commit.note_frame_queued(end, lease, plan, cx.now);
+            let barrier = match queued.barrier {
+                inf_log::FrameBarrier::None => WriteBarrier::None,
+                inf_log::FrameBarrier::Linked(ticket) => {
+                    self.fsync_submits.push((SyncReason::Linked, cx.now));
+                    WriteBarrier::LinkedFsync { fsync_token: fsync_token(ticket) }
+                }
+                // The scripted driver refuses it: this harness offers no
+                // write-through.
+                inf_log::FrameBarrier::WriteThrough(_) => WriteBarrier::WriteThrough,
             };
             let offset = FileOffset::from_u32_bytes(slot.base().offset);
             let fd = self.rotor.active_raw_fd().expect("std tier has fds");
             self.rotor.commit_frame_queued(slot);
             self.write_seq += 1;
-            assert_eq!(self.write_seq, id.0, "write token sequence is the frame id");
+            assert_eq!(self.write_seq, queued.id.0, "write token sequence is the frame id");
             self.writes_this_iter += 1;
             cx.push(IoOp::LogWrite {
                 fd,

@@ -67,7 +67,7 @@ use inf_log::{
     FRAME_ALIGN, FsyncClass, GroupCommit, MutationEffect, SegmentConfig, SegmentRotor,
     StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES, create_cell_dirs,
 };
-use inf_log::{FrameId, FramePlan, Lsn, SealPlan};
+use inf_log::{FrameBarrier, FrameId, FramePlan, Lsn};
 use inf_server::open_cell_log;
 
 const SEGMENT_BYTES: u32 = 64 << 10;
@@ -215,23 +215,14 @@ impl Rig {
         // The bytes are copied out for the rig's own execution; the
         // ledger's queue holds the lease until the write lands.
         let bytes = self.ring.leased_frame(&lease).to_vec();
-        let id = self.commit.note_frame_queued(end, lease, Nanos::ZERO);
+        let queued = self.commit.note_frame_queued(end, lease, plan, Nanos::ZERO);
         self.frame_keys.push((end.to_u64(), keys));
         let offset = FileOffset::from_u32_bytes(slot.base().offset);
-        let issued = match plan {
-            SealPlan::WriteThrough => Issued::Through {
-                id,
-                ticket: self.commit.register_write_through(Nanos::ZERO),
-                offset,
-                bytes,
-            },
-            SealPlan::LinkedFsync => Issued::Linked {
-                id,
-                ticket: self.commit.register_linked_fsync(Nanos::ZERO),
-                offset,
-                bytes,
-            },
-            SealPlan::Plain => Issued::Plain { id, offset, bytes },
+        let id = queued.id;
+        let issued = match queued.barrier {
+            FrameBarrier::WriteThrough(ticket) => Issued::Through { id, ticket, offset, bytes },
+            FrameBarrier::Linked(ticket) => Issued::Linked { id, ticket, offset, bytes },
+            FrameBarrier::None => Issued::Plain { id, offset, bytes },
         };
         self.rotor.commit_frame_queued(slot);
         (issued, seal)
