@@ -2157,19 +2157,17 @@ fn reply_outcome_refused_set_on_always_stages_nothing() {
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"GET", b"k"])).expect("write");
     read_exactly(&mut c, b"$1\r\nv\r\n");
-    // The gauge follows MAINTAIN: the largest count seen over a short window
-    // is the log's (each `always` ack follows its own fsync).
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut appended = 0u64;
-    while Instant::now() < deadline {
-        let info = info_text(&mut c, b"persistence");
-        let count = info
-            .lines()
-            .find_map(|line| line.strip_prefix("log_records_appended:"))
-            .and_then(|n| n.trim().parse::<u64>().ok())
-            .expect("INFO persistence reports log_records_appended");
-        appended = appended.max(count);
-    }
+    // One read, no window: the count rises when a record is staged, and the
+    // one cell's MAINTAIN publishes it in the iteration that executed the
+    // write, before any later command runs. Every record staged before the
+    // last acknowledged `SET` — a refusal's included — is in the gauge this
+    // `INFO` reads.
+    let info = info_text(&mut c, b"persistence");
+    let appended = info
+        .lines()
+        .find_map(|line| line.strip_prefix("log_records_appended:"))
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .expect("INFO persistence reports log_records_appended");
     assert_eq!(appended, 2, "the two acknowledged SETs and nothing for the refusal");
     drop(c);
     node.stop();
