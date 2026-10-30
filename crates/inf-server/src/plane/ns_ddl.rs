@@ -113,6 +113,23 @@ fn admit_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     }
 }
 
+/// One command on this cell's namespace `ns`, executed into a pool reply
+/// that carries its outcome (ADR-0190 D2); the flag is `QUIT`'s close.
+fn execute_ns_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    origin: ExecOrigin,
+    argv: &[&[u8]],
+    proto: Protocol,
+    id: u64,
+    db: u16,
+    ns: NsId,
+) -> (OwnedReply, bool) {
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    let close = reply
+        .lend(|out| shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), false, out));
+    (reply.finish(), close)
+}
+
 /// One named-namespace command on the pump (M2-S08). Returns `false` when
 /// the connection is gone.
 #[allow(clippy::too_many_arguments)] // the pump dispatch context
@@ -161,20 +178,8 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
                 for k in &argv[1..argv.len() - 1] {
                     let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
                     if shared.router.is_local(k, shared.cell) {
-                        let mut reply = OpenReply::new(shared.take_reply_buf());
-                        reply.lend(|out| {
-                            shared.execute_owned_into(
-                                origin,
-                                &sub,
-                                proto,
-                                id,
-                                db,
-                                Some(ns),
-                                false,
-                                out,
-                            )
-                        });
-                        parts.push(GatherPart::Done(reply.finish()));
+                        let (reply, _) = execute_ns_local(shared, origin, &sub, proto, id, db, ns);
+                        parts.push(GatherPart::Done(reply));
                     } else {
                         match send_apply_ns(
                             shared,
@@ -342,10 +347,7 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
         pending.push_back(PendingReply::Done(error_reply(shared, proto, refusal.message())));
         return true;
     }
-    let mut reply = OpenReply::new(shared.take_reply_buf());
-    let close = reply
-        .lend(|out| shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), false, out));
-    let reply = reply.finish();
+    let (reply, close) = execute_ns_local(shared, origin, argv, proto, id, db, ns);
     if close {
         close_after_reply(shared, key);
     }

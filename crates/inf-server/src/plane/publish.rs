@@ -107,11 +107,7 @@ pub(super) async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + C
                     }
                 }
                 pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal: None });
-                if self_frames.bytes().is_empty() {
-                    shared.recycle_reply_buf(self_frames.into_bytes());
-                } else {
-                    pending.push_back(PendingReply::Done(self_frames));
-                }
+                pending.extend(trailing_self_frames(shared, self_frames));
             } else {
                 // ADR-0101 D1: a subscribed publisher tags the forward
                 // with `(conn, seq)` so the owner's fan leg back to this
@@ -301,6 +297,20 @@ pub(super) async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Cl
     }
 }
 
+/// A publisher subscribed to its own channel reads its frames after its
+/// count reply (Redis order), as a trailing reply; an empty stash goes back
+/// to the pool and adds none.
+fn trailing_self_frames<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    self_frames: OwnedReply,
+) -> Option<PendingReply> {
+    if self_frames.bytes().is_empty() {
+        shared.recycle_reply_buf(self_frames.into_bytes());
+        return None;
+    }
+    Some(PendingReply::Done(self_frames))
+}
+
 /// PUBSUB introspection over the cell registries: CHANNELS merges the owner
 /// views (KEYS-style header arithmetic), NUMSUB asks each channel's owner,
 /// NUMPAT answers locally (the pattern index is replicated).
@@ -328,50 +338,7 @@ pub(super) async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Cl
                 }
             }
         }
-        let mut total = local.len();
-        let mut bodies: Vec<(OwnedReply, usize)> = Vec::new();
-        for waiter in waiters {
-            match waiter.await {
-                // A peer's error is the reply, decided by its outcome; a
-                // success without an array header is a malformed peer
-                // reply, never the client's whole answer (ADR-0190 D2).
-                OwnedOutcome::Reply(reply) if reply.is_error() => return reply,
-                OwnedOutcome::Reply(reply) => {
-                    let Some((n, off)) = parse_array_header(reply.bytes()) else {
-                        shared.recycle_reply_buf(reply.into_bytes());
-                        return error_reply(
-                            shared,
-                            proto,
-                            "ERR cross-cell program reply malformed",
-                        );
-                    };
-                    total += n;
-                    bodies.push((reply, off));
-                }
-                OwnedOutcome::Ok
-                | OwnedOutcome::Int(_)
-                | OwnedOutcome::Nil
-                | OwnedOutcome::Bool(_)
-                | OwnedOutcome::Err(_) => {
-                    return error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED);
-                }
-            }
-        }
-        let mut reply = OpenReply::new(shared.take_reply_buf());
-        {
-            let mut w = RespWriter::new(&mut reply, proto);
-            w.array_header(total);
-            for name in &local {
-                w.bulk(name);
-            }
-            for (body, off) in &bodies {
-                w.encoded(&body.bytes()[*off..]);
-            }
-        }
-        for (body, _) in bodies {
-            shared.recycle_reply_buf(body.into_bytes());
-        }
-        reply.finish()
+        merge_channels(shared, proto, &local, waiters).await
     } else if sub.eq_ignore_ascii_case(b"NUMSUB") {
         enum Count {
             Local(i64),
@@ -425,6 +392,55 @@ pub(super) async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Cl
         pubsub::pubsub_subcommand_error(sub, &mut RespWriter::new(&mut reply, proto));
         reply.finish()
     }
+}
+
+/// `PUBSUB CHANNELS`' merge: this cell's names, then each peer's array
+/// body, under one header (KEYS-style header arithmetic). A peer's error is
+/// the reply, decided by its outcome; a success without an array header is
+/// a malformed peer reply, never the client's whole answer (ADR-0190 D2).
+async fn merge_channels<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    proto: Protocol,
+    local: &[Vec<u8>],
+    waiters: Vec<GateWait<u64, OwnedOutcome>>,
+) -> OwnedReply {
+    let mut total = local.len();
+    let mut bodies: Vec<(OwnedReply, usize)> = Vec::new();
+    for waiter in waiters {
+        match waiter.await {
+            OwnedOutcome::Reply(reply) if reply.is_error() => return reply,
+            OwnedOutcome::Reply(reply) => {
+                let Some((n, off)) = parse_array_header(reply.bytes()) else {
+                    shared.recycle_reply_buf(reply.into_bytes());
+                    return error_reply(shared, proto, "ERR cross-cell program reply malformed");
+                };
+                total += n;
+                bodies.push((reply, off));
+            }
+            OwnedOutcome::Ok
+            | OwnedOutcome::Int(_)
+            | OwnedOutcome::Nil
+            | OwnedOutcome::Bool(_)
+            | OwnedOutcome::Err(_) => {
+                return error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED);
+            }
+        }
+    }
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    {
+        let mut w = RespWriter::new(&mut reply, proto);
+        w.array_header(total);
+        for name in local {
+            w.bulk(name);
+        }
+        for (body, off) in &bodies {
+            w.encoded(&body.bytes()[*off..]);
+        }
+    }
+    for (body, _) in bodies {
+        shared.recycle_reply_buf(body.into_bytes());
+    }
+    reply.finish()
 }
 
 /// Owner-side handling of the internal pub/sub Apply vocabulary. Returns

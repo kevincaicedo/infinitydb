@@ -107,19 +107,7 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // The drained reply already returned one data credit; wake one
             // sender blocked on that destination.
             shared.credit_waiters.wake_one(from);
-            // A reply owns its parked bytes via the reply pool — no
-            // per-reply heap traffic on the steady-state path — and its
-            // outcome from the wire's variant (ADR-0190 D3).
-            let owned = match outcome {
-                Outcome::Bytes(bytes) => received_reply(shared, bytes, ReplyOutcome::Success),
-                Outcome::ErrorReply(bytes) => received_reply(shared, bytes, ReplyOutcome::Error),
-                Outcome::Ok => OwnedOutcome::Ok,
-                Outcome::Int(n) => OwnedOutcome::Int(n),
-                Outcome::Nil => OwnedOutcome::Nil,
-                Outcome::Bool(b) => OwnedOutcome::Bool(b),
-                Outcome::Err(code) => OwnedOutcome::Err(code),
-            };
-            if !shared.gate.complete(token.0, owned) {
+            if !shared.gate.complete(token.0, owned_outcome(shared, outcome)) {
                 *orphans += 1;
             }
         }
@@ -713,6 +701,24 @@ pub(super) fn staged_outcome<'a>(scratch: &'a [u8], reply: &StagedReply) -> Outc
         StagedReply::Nil => Outcome::Nil,
         StagedReply::Ok => Outcome::Ok,
         StagedReply::Refused => Outcome::Err(ErrCode::Unknown(0)),
+    }
+}
+
+/// The origin's owned copy of a leg's outcome. A reply owns its parked
+/// bytes via the reply pool — no per-reply heap traffic on the steady-state
+/// path — and its outcome from the wire's variant (ADR-0190 D3).
+fn owned_outcome<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    outcome: Outcome<'_>,
+) -> OwnedOutcome {
+    match outcome {
+        Outcome::Bytes(bytes) => received_reply(shared, bytes, ReplyOutcome::Success),
+        Outcome::ErrorReply(bytes) => received_reply(shared, bytes, ReplyOutcome::Error),
+        Outcome::Ok => OwnedOutcome::Ok,
+        Outcome::Int(n) => OwnedOutcome::Int(n),
+        Outcome::Nil => OwnedOutcome::Nil,
+        Outcome::Bool(b) => OwnedOutcome::Bool(b),
+        Outcome::Err(code) => OwnedOutcome::Err(code),
     }
 }
 

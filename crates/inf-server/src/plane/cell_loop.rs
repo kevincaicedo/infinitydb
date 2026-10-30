@@ -616,11 +616,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 conn_cx,
                                 out,
                             );
-                            let mut reply = ReplyBuf::over(out);
-                            let mut w = RespWriter::new(&mut reply, conn_cx.proto);
                             // Display, not Debug (batch 45): the Redis
                             // phrasing the compat harness diffs.
-                            w.error(&format!("ERR Protocol error: {e}"));
+                            RespWriter::new(&mut ReplyBuf::over(out), conn_cx.proto)
+                                .error(&format!("ERR Protocol error: {e}"));
                             protocol_error = true;
                             break;
                         }

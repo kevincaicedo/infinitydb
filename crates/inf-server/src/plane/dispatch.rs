@@ -375,37 +375,48 @@ pub(super) async fn settle_reply<O: PlaneObserver + 'static, F: SegmentFs + Clon
             reply
         }
         PendingReply::AllOk { waiters, proto, refusal } => {
-            // A refusal (a leg never sent) outranks leg errors: the
-            // fan is known-incomplete, and `+OK` would be a lie.
-            let mut failure: Option<OwnedReply> = refusal;
-            for waiter in waiters {
-                let outcome = waiter.await;
-                *inflight -= 1;
-                // A leg failed by its outcome, never by its bytes: an
-                // error reply, or a fabric refusal (ADR-0190 D2).
-                let failed = match outcome {
-                    OwnedOutcome::Reply(reply) if reply.is_error() => Some(reply),
-                    OwnedOutcome::Reply(reply) => {
-                        shared.recycle_reply_buf(reply.into_bytes());
-                        None
-                    }
-                    refused @ OwnedOutcome::Err(_) => Some(render_outcome(shared, refused, proto)),
-                    OwnedOutcome::Ok
-                    | OwnedOutcome::Int(_)
-                    | OwnedOutcome::Nil
-                    | OwnedOutcome::Bool(_) => None,
-                };
-                match (failure.is_none(), failed) {
-                    (true, failed) => failure = failed,
-                    (false, Some(unused)) => shared.recycle_reply_buf(unused.into_bytes()),
-                    (false, None) => {}
-                }
-            }
-            match failure {
-                Some(error) => error,
-                None => simple_reply(shared, proto, "OK"),
-            }
+            settle_all_ok(shared, waiters, proto, refusal, inflight).await
         }
+    }
+}
+
+/// The all-or-first-error fan: every leg is awaited, so nothing is
+/// orphaned in flight, and the reply is the first failure or `+OK`.
+async fn settle_all_ok<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    waiters: Vec<GateWait<u64, OwnedOutcome>>,
+    proto: Protocol,
+    refusal: Option<OwnedReply>,
+    inflight: &mut usize,
+) -> OwnedReply {
+    // A refusal (a leg never sent) outranks leg errors: the fan is
+    // known-incomplete, and `+OK` would be a lie.
+    let mut failure: Option<OwnedReply> = refusal;
+    for waiter in waiters {
+        let outcome = waiter.await;
+        *inflight -= 1;
+        // A leg failed by its outcome, never by its bytes: an error
+        // reply, or a fabric refusal (ADR-0190 D2).
+        let failed = match outcome {
+            OwnedOutcome::Reply(reply) if reply.is_error() => Some(reply),
+            OwnedOutcome::Reply(reply) => {
+                shared.recycle_reply_buf(reply.into_bytes());
+                None
+            }
+            refused @ OwnedOutcome::Err(_) => Some(render_outcome(shared, refused, proto)),
+            OwnedOutcome::Ok | OwnedOutcome::Int(_) | OwnedOutcome::Nil | OwnedOutcome::Bool(_) => {
+                None
+            }
+        };
+        match (failure.is_none(), failed) {
+            (true, failed) => failure = failed,
+            (false, Some(unused)) => shared.recycle_reply_buf(unused.into_bytes()),
+            (false, None) => {}
+        }
+    }
+    match failure {
+        Some(error) => error,
+        None => simple_reply(shared, proto, "OK"),
     }
 }
 
