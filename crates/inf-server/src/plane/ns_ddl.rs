@@ -800,15 +800,16 @@ async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone
     let mut failure: Option<OwnedReply> = None;
     for cell in peer_cells(shared) {
         let leg = match send_apply(shared, cell, ApplyOrigin::Program, proto, 0, fan).await {
+            // A leg that is not a reply failed: the one refusal text every
+            // arm renders for a fabric refusal or a shape its fold cannot
+            // take (ADR-0190 D2).
             Ok(waiter) => match waiter.await {
                 OwnedOutcome::Reply(reply) => reply,
                 OwnedOutcome::Ok
                 | OwnedOutcome::Int(_)
                 | OwnedOutcome::Nil
                 | OwnedOutcome::Bool(_)
-                | OwnedOutcome::Err(_) => {
-                    error_reply(shared, proto, "ERR cross-cell DDL leg answered no reply bytes")
-                }
+                | OwnedOutcome::Err(_) => error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED),
             },
             Err(refusal) => refusal,
         };
