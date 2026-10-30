@@ -32,7 +32,7 @@ pub const EPOCH_MARKS: Cap = Cap::entries::<EPOCH_MARKS_MAX>("epoch-marks", CapF
 /// the cell's `DurableCell`, one map built with it. Crossing: pacing — the
 /// LOG step asks the map's admission before the frame's plan and holds the
 /// frame while it is full (derived never to occur; `frame_waits_ack_map`
-/// counts the episodes).
+/// counts it once per held frame).
 #[cfg(not(inf_canary_ack_map_window_only))]
 pub const ACK_MAP_ENTRIES: u32 =
     inf_log::limits::REORDER_WINDOW_FRAMES + inf_log::limits::FSYNC_LEDGER_ENTRIES + 1;

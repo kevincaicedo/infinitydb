@@ -334,9 +334,8 @@ pub struct NodeState {
     pub frame_waits_reorder: Cell<u64>,
     /// The fsync ledger's holds, cell scope, once per held frame: a frame
     /// held for the rotation's unfolded seal, and one held for a full ack
-    /// map; and
-    /// MAINTAIN ticks that skipped a prealloc or zero-fill barrier at its
-    /// class's budget. The last two are derived never to occur.
+    /// map; and MAINTAIN ticks that skipped a prealloc or zero-fill barrier
+    /// at its class's budget. The last two are derived never to occur.
     pub frame_waits_ledger: Cell<u64>,
     pub frame_waits_ack_map: Cell<u64>,
     pub ledger_prealloc_deferrals: Cell<u64>,

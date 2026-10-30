@@ -444,9 +444,8 @@ pub struct DurableStats {
     /// held it first: a staged frame held because it needs a rotation and
     /// the previous rotation's seal has not folded (the rotation class's
     /// seal budget), and one held because the ack map is full (derived
-    /// never to occur). Beside them,
-    /// MAINTAIN ticks that skipped a prealloc or zero-fill barrier at its
-    /// class's budget (derived never to occur).
+    /// never to occur). Beside them, MAINTAIN ticks that skipped a prealloc
+    /// or zero-fill barrier at its class's budget (derived never to occur).
     pub frame_waits_ledger: u64,
     pub frame_waits_ack_map: u64,
     pub ledger_prealloc_deferrals: u64,
@@ -1059,14 +1058,22 @@ impl<F: SegmentFs> DurableCell<F> {
     /// The LOG step (ADR-0013 D2, ADR-0087 D3/D4): seal at most one frame
     /// into one positional write carrying the barrier the ledger's plan
     /// allows, or issue a standalone fdatasync for a frameless everysec
-    /// tick. A frame waits — bounded, one write latency — when it needs
-    /// a rotation while frames are in flight, when a sync is due that
-    /// neither write-through nor a linked fdatasync may carry yet, or
-    /// when the ledger's reorder window is full behind a late front
-    /// write (ADR-0087 D2 as amended). A frame held for an extent barrier
-    /// closes the extent-seal window; the step that seals the frame, or
-    /// finds nothing staged, opens it and hands out its free units
-    /// (ADR-0163 D2).
+    /// tick. Beside the pacing and policy holds, a frame waits for
+    /// correctness, each such hold ending at a completion:
+    /// - one write latency, when it needs a rotation while frames are in
+    ///   flight, when a sync is due that neither write-through nor a
+    ///   linked fdatasync may carry yet, or when the ledger's frame queue
+    ///   is full behind a late front write (ADR-0087 D2 as amended);
+    /// - one seal fdatasync, when it needs a rotation while the previous
+    ///   rotation's seal is unfolded (`Wait(Hold::SealUnfolded)`: the
+    ///   rotation class holds one seal), until that seal folds;
+    /// - while the ack map is full, a hold derived never to occur (the map
+    ///   holds the frame queue, the ledger and one point), until a
+    ///   completion retires a point.
+    ///
+    /// A frame held for an extent barrier closes the extent-seal window;
+    /// the step that seals the frame, or finds nothing staged, opens it
+    /// and hands out its free units (ADR-0163 D2).
     pub fn seal_log(&mut self, cx: &mut LoopCx<'_>) {
         if self.failed {
             return;
