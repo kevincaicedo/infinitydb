@@ -23,9 +23,11 @@
 //!   reply has been emitted (a pipeline barrier).
 //! - **Cross-cell vocabulary** (M0-experimental `Apply`, reshaped by M4):
 //!   single-owner commands ship as `Op::Apply { cmd: protocol, args: argv }`
-//!   and return the owner's raw RESP reply (`Outcome::Bytes`) — byte-exact
-//!   by construction. `DEL`/`EXISTS` (the only multi-key M0 commands) split
-//!   per key and aggregate typed `Outcome::Int` replies.
+//!   and return the owner's raw RESP reply — byte-exact by construction —
+//!   as `Outcome::Bytes` or `Outcome::ErrorReply`, tagged from the reply's
+//!   outcome, never from its bytes (ADR-0190 D3). `DEL`/`EXISTS` (the
+//!   only multi-key M0 commands) split per key and aggregate typed
+//!   `Outcome::Int` replies.
 //! - **Observer seam**: every apply point (local execution, and the owner
 //!   side of a remote `Apply`) reports `(argv, reply, now)` — `inf-sim`'s
 //!   linearizability oracle hangs off this; [`NoopObserver`] monomorphizes

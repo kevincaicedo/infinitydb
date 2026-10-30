@@ -30,7 +30,8 @@ pub(super) async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clo
         // A scattered `DBSIZE` leg (the origin's `Counted` shape): this
         // cell's exact count as a typed integer — the tiered drain runs
         // here, on the pump, exactly as a local `DBSIZE` would — or the
-        // drain's error as bytes for the origin to relay.
+        // drain's error reply, tagged from its outcome (ADR-0190 D3), for
+        // the origin to relay.
         if argv.len() == 1 && argv[0].eq_ignore_ascii_case(b"DBSIZE") {
             let origin_cell = ExecOrigin::Fabric(CellId(origin));
             match ns_dbsize_local(&shared, origin_cell, item.ns, item.proto).await {
