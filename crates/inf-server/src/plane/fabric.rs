@@ -131,7 +131,11 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // M0 vocabulary: the typed Read has no db field; it serves db 0
             // (the M1 paths ship GETs as Apply with the packed db byte). A
             // hit stages the bare value, pasted through the writer's one
-            // entry for pre-encoded bytes.
+            // entry for pre-encoded bytes. The bare value is no frame, so a
+            // hit on an empty value stages zero bytes and the origin refuses
+            // it as `ErrCode::EmptyReply` (every reply is at least one frame,
+            // ADR-0190 D2). No production path sends this op; whichever
+            // first does owns giving the found value a frame.
             let mut reply = ReplyBuf::over(scratch);
             let hit = match shared.store.borrow_mut().db_mut(0).get(key, now) {
                 Some(value) => {

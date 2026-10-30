@@ -9,6 +9,7 @@ use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
 use inf_fabric::{Mesh, MeshConfig};
+use inf_foundation::KeySlot;
 use inf_store::{Keyspace, StoreConfig};
 
 use super::dispatch::{dispatch_scatter, program_mset, settle_reply};
@@ -372,4 +373,33 @@ fn reply_outcome_empty_leg_is_refused() {
         |args| (args[0] == b"GET").then_some(Outcome::Bytes(b"")),
     );
     assert_eq!(reply, written_error(CROSS_CELL_EXECUTION_FAILED));
+}
+
+/// `Op::Read` stages the bare value, no frame: a hit on an empty value is
+/// a zero-byte `Success` reply, which the origin refuses as every empty
+/// leg is (`reply_outcome_empty_leg_is_refused`). The op has no production
+/// sender; this pins the consequence until one gives the value a frame.
+#[test]
+fn reply_outcome_read_of_an_empty_value_stages_zero_bytes() {
+    let cells = Cells::new();
+    let key = cells.key_on(1);
+    assert_eq!(cells.local(1, &[b"SET", &key, b""]), b"+OK\r\n");
+    let shared = &cells.planes[1].shared;
+    let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0u64);
+    let read = Op::Read { token: FabricToken(1), slot: KeySlot::of_key(&key), key: &key };
+    let now = shared.now.get();
+    handle_fabric_op(
+        shared,
+        now,
+        CellId(0),
+        read,
+        &mut scratch,
+        &mut staged,
+        &mut pubs,
+        &mut gated,
+        &mut orphans,
+    );
+    let [(_, _, reply)] = staged.as_slice() else { panic!("one staged reply: {}", staged.len()) };
+    assert!(matches!(staged_outcome(&scratch, reply), Outcome::Bytes(b"")));
 }
