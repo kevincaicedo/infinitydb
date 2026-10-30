@@ -519,10 +519,10 @@ impl CellPlane for DurablePlane {
             if rotation_due && !self.staging.drained() {
                 return;
             }
-            let plan = self.commit.frame_plan(false, rotation_due);
-            if matches!(plan, inf_log::FramePlan::Wait(_)) {
-                return;
-            }
+            let plan = match self.commit.frame_plan(false, rotation_due) {
+                inf_log::FramePlan::Seal(plan) => plan,
+                inf_log::FramePlan::Wait(_) => return,
+            };
             let (slot, seal) =
                 self.rotor.begin_frame_deferred(frame_len, cx.now.as_millis()).expect("reserve");
             if let Some(handoff) = seal {
@@ -560,7 +560,7 @@ impl CellPlane for DurablePlane {
             // while this op is in flight.
             let data = unsafe { StableBytes::new(bytes) };
             let id = self.commit.note_frame_queued(end, lease, cx.now);
-            let barrier = if plan == inf_log::FramePlan::LinkedFsync {
+            let barrier = if plan == inf_log::SealPlan::LinkedFsync {
                 let ticket = self.commit.register_linked_fsync(cx.now);
                 self.fsync_submits.push((SyncReason::Linked, cx.now));
                 WriteBarrier::LinkedFsync { fsync_token: fsync_token(ticket) }

@@ -67,7 +67,7 @@ use inf_log::{
     FRAME_ALIGN, FsyncClass, GroupCommit, MutationEffect, SegmentConfig, SegmentRotor,
     StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES, create_cell_dirs,
 };
-use inf_log::{FrameId, FramePlan, Lsn};
+use inf_log::{FrameId, FramePlan, Lsn, SealPlan};
 use inf_server::open_cell_log;
 
 const SEGMENT_BYTES: u32 = 64 << 10;
@@ -199,8 +199,9 @@ impl Rig {
         // pipeline is always drained and `Wait` is unreachable.
         let rotation_due = self.rotor.rotation_due(frame_len);
         let write_through_ok = self.rotor.next_frame_write_through_ok(frame_len);
-        let plan = self.commit.frame_plan(write_through_ok, rotation_due);
-        assert!(!matches!(plan, FramePlan::Wait(_)), "drained rig never waits");
+        let FramePlan::Seal(plan) = self.commit.frame_plan(write_through_ok, rotation_due) else {
+            panic!("drained rig never waits");
+        };
         let (slot, handoff) = self.rotor.begin_frame_deferred(frame_len, 0).expect("reserve");
         assert_eq!(handoff.is_some(), rotation_due);
         assert_eq!(slot.write_through_ok(), write_through_ok);
@@ -218,20 +219,19 @@ impl Rig {
         self.frame_keys.push((end.to_u64(), keys));
         let offset = FileOffset::from_u32_bytes(slot.base().offset);
         let issued = match plan {
-            FramePlan::WriteThrough => Issued::Through {
+            SealPlan::WriteThrough => Issued::Through {
                 id,
                 ticket: self.commit.register_write_through(Nanos::ZERO),
                 offset,
                 bytes,
             },
-            FramePlan::LinkedFsync => Issued::Linked {
+            SealPlan::LinkedFsync => Issued::Linked {
                 id,
                 ticket: self.commit.register_linked_fsync(Nanos::ZERO),
                 offset,
                 bytes,
             },
-            FramePlan::Plain => Issued::Plain { id, offset, bytes },
-            FramePlan::Wait(_) => unreachable!("asserted above"),
+            SealPlan::Plain => Issued::Plain { id, offset, bytes },
         };
         self.rotor.commit_frame_queued(slot);
         (issued, seal)

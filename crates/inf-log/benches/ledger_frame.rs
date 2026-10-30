@@ -85,7 +85,7 @@ use inf_foundation::time::Nanos;
 use inf_log::fs::mem::MemFile;
 use inf_log::{
     FrameBarrier, FrameLayout, FramePlan, FsyncClass, GroupCommit, Lsn, MutationEffect, NsId,
-    SegmentId, StagingConfig, StagingRing,
+    SealPlan, SegmentId, StagingConfig, StagingRing,
 };
 
 #[path = "ledger_frame/parent.rs"]
@@ -231,15 +231,16 @@ fn ledger_frame(
 ) -> u64 {
     let class = if always { FsyncClass::Always } else { FsyncClass::Everysec };
     leg.ledger.note_staged(class);
-    let plan = leg.ledger.frame_plan(write_through_ok, seal_ahead);
+    let FramePlan::Seal(plan) = leg.ledger.frame_plan(write_through_ok, seal_ahead) else {
+        panic!("no leg's input holds its frame");
+    };
     let (lease, end) = leg.staging.seal();
     let now = leg.staging.now;
     let id = leg.ledger.note_frame_queued(end, lease, now);
     let ticket = match plan {
-        FramePlan::WriteThrough => Some(leg.ledger.register_write_through(now)),
-        FramePlan::LinkedFsync => Some(leg.ledger.register_linked_fsync(now)),
-        FramePlan::Plain => None,
-        FramePlan::Wait(_) => unreachable!("a waiting frame is never sealed"),
+        SealPlan::WriteThrough => Some(leg.ledger.register_write_through(now)),
+        SealPlan::LinkedFsync => Some(leg.ledger.register_linked_fsync(now)),
+        SealPlan::Plain => None,
     };
     let written = leg.ledger.note_frame_written(id);
     leg.staging.ring.release(written.lease);
@@ -325,19 +326,20 @@ fn ledger_plane_frame(
 ) -> u64 {
     let class = if always { FsyncClass::Always } else { FsyncClass::Everysec };
     leg.ledger.note_staged(class);
-    let plan = leg.ledger.frame_plan(write_through_ok, seal_ahead);
+    let FramePlan::Seal(plan) = leg.ledger.frame_plan(write_through_ok, seal_ahead) else {
+        panic!("no leg's input holds its frame");
+    };
     let (lease, end) = leg.staging.seal();
     let now = leg.staging.now;
     let id = leg.ledger.note_frame_queued(end, lease, now);
     match plan {
-        FramePlan::WriteThrough => {
+        SealPlan::WriteThrough => {
             leg.ledger.register_write_through(now);
         }
-        FramePlan::LinkedFsync => {
+        SealPlan::LinkedFsync => {
             leg.ledger.register_linked_fsync(now);
         }
-        FramePlan::Plain => {}
-        FramePlan::Wait(_) => unreachable!("a waiting frame is never sealed"),
+        SealPlan::Plain => {}
     }
     let frame = leg.ledger.note_frame_written(id);
     let stall = now.saturating_sub(frame.submitted_at).as_micros();

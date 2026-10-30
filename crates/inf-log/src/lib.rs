@@ -58,7 +58,7 @@ pub use ckpt::{
 };
 pub use commit::{
     CommitStats, ExtentRegistration, ExtentSync, FrameBarrier, FrameId, FramePlan, FsyncClass,
-    FsyncTicket, GroupCommit, Hold, LedgerClass, SyncReason, WrittenFrame,
+    FsyncTicket, GroupCommit, Hold, LedgerClass, SealPlan, SyncReason, WrittenFrame,
 };
 pub use effect::MutationEffect;
 pub use flush::{

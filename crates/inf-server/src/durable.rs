@@ -28,7 +28,7 @@ use inf_log::fs::SegmentFs;
 use inf_log::{
     BootDirs, FRAME_ALIGN, FillSource, FrameBarrier, FrameBuilder, FrameId, FramePlan, FsyncClass,
     FsyncTicket, GroupCommit, Hold, IdxSidecarMeta, LedgerClass, Lsn, MutationEffect, NsId,
-    RecordView, SealedDisposal, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
+    RecordView, SealPlan, SealedDisposal, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
     ZERO_FILL_SLICE_BYTES, build_recycle_sentinel,
 };
 use inf_runtime::{
@@ -172,7 +172,7 @@ impl FillConfig {
     #[must_use]
     pub fn decide(
         &self,
-        plan: FramePlan,
+        plan: SealPlan,
         layout: inf_log::FrameLayout,
         frame_len: u32,
         since: Option<Nanos>,
@@ -181,7 +181,7 @@ impl FillConfig {
         if !self.enabled() || layout != inf_log::FrameLayout::Aligned {
             return FillDecision::Seal;
         }
-        if plan != FramePlan::Plain || layout.padded_len(frame_len) >= self.target_bytes {
+        if plan != SealPlan::Plain || layout.padded_len(frame_len) >= self.target_bytes {
             return FillDecision::Seal;
         }
         match since {
@@ -256,7 +256,7 @@ impl GroupHoldConfig {
     #[must_use]
     pub fn decide(
         &self,
-        plan: FramePlan,
+        plan: SealPlan,
         layout: inf_log::FrameLayout,
         uncovered_records: u64,
         round_target: u64,
@@ -266,7 +266,7 @@ impl GroupHoldConfig {
         if !self.enabled() || layout != inf_log::FrameLayout::Packed {
             return GroupDecision::Seal;
         }
-        if plan != FramePlan::LinkedFsync || round_target < Self::MIN_GROUP {
+        if plan != SealPlan::LinkedFsync || round_target < Self::MIN_GROUP {
             return GroupDecision::Seal;
         }
         if uncovered_records >= round_target {
@@ -1109,23 +1109,27 @@ impl<F: SegmentFs> DurableCell<F> {
             }
             // Barrier plan before any state moves (ADR-0087 D3).
             let write_through_ok = self.rotor.next_frame_write_through_ok(frame_len);
-            let plan = self.commit.frame_plan(write_through_ok, rotation_due);
-            if let FramePlan::Wait(hold) = plan {
+            let plan = match self.commit.frame_plan(write_through_ok, rotation_due) {
+                FramePlan::Seal(plan) => plan,
                 // One counter per reason, each read from the plan: the
                 // frame queue is full (ADR-0087 D2 — a device row), the due
                 // barrier is inadmissible behind in-flight writes (D3), or
                 // the rotation's previous seal has not folded.
-                match hold {
-                    Hold::ReorderWindow => self.frame_waits_reorder += u64::from(!self.frame_held),
-                    Hold::Barrier => self.frame_waits_barrier += u64::from(!self.frame_held),
-                    Hold::SealUnfolded => {
-                        self.frame_waits_ledger += u64::from(!self.ledger_holds_counted.seal);
-                        self.ledger_holds_counted.seal = true;
+                FramePlan::Wait(hold) => {
+                    match hold {
+                        Hold::ReorderWindow => {
+                            self.frame_waits_reorder += u64::from(!self.frame_held);
+                        }
+                        Hold::Barrier => self.frame_waits_barrier += u64::from(!self.frame_held),
+                        Hold::SealUnfolded => {
+                            self.frame_waits_ledger += u64::from(!self.ledger_holds_counted.seal);
+                            self.ledger_holds_counted.seal = true;
+                        }
                     }
+                    self.frame_held = true;
+                    return;
                 }
-                self.frame_held = true;
-                return;
-            }
+            };
             // M4.5-S39a: the fill policy — the last hold, after every
             // correctness hold above, on aligned segments only.
             if self.fill_holds(cx, plan, frame_len, rotation_due) {
@@ -1184,7 +1188,7 @@ impl<F: SegmentFs> DurableCell<F> {
             // completing with nothing pending would issue a standalone
             // fdatasync for the plain frames at once — the same round the
             // linked-fsync frame waits for, so it waits by the same rule.
-            if self.group_holds(cx, FramePlan::LinkedFsync, false) {
+            if self.group_holds(cx, SealPlan::LinkedFsync, false) {
                 self.frame_waits_group += u64::from(!self.frame_held);
                 self.frame_held = true;
                 return;
@@ -1239,11 +1243,11 @@ impl<F: SegmentFs> DurableCell<F> {
     /// (`fill_since`, the instant the LOG step first saw the frame) and,
     /// at the first hold of an episode, arms the fill timer at the
     /// deadline so a parked loop wakes to seal. Asked last, after every
-    /// correctness hold — a frame the plan would `Wait` never gets here.
+    /// correctness hold, on a sealable plan: a waiting frame never gets here.
     fn fill_holds(
         &mut self,
         cx: &mut LoopCx<'_>,
-        plan: FramePlan,
+        plan: SealPlan,
         frame_len: u32,
         rotation_due: bool,
     ) -> bool {
@@ -1277,7 +1281,7 @@ impl<F: SegmentFs> DurableCell<F> {
     /// loop wakes to seal. Asked last — after the fill policy, which
     /// never holds a barrier-carrying frame, so the two holds never
     /// compete for one frame.
-    fn group_holds(&mut self, cx: &mut LoopCx<'_>, plan: FramePlan, rotation_due: bool) -> bool {
+    fn group_holds(&mut self, cx: &mut LoopCx<'_>, plan: SealPlan, rotation_due: bool) -> bool {
         if !self.group.enabled() {
             return false;
         }
@@ -1315,7 +1319,7 @@ impl<F: SegmentFs> DurableCell<F> {
     /// and hand the frame to the driver. The frame's on-device extent
     /// (padding included on aligned segments) is what the cursor, the
     /// ledger, and the barrier all advance by (ADR-0086 D3).
-    fn queue_frame(&mut self, cx: &mut LoopCx<'_>, slot: inf_log::FrameSlot, plan: FramePlan) {
+    fn queue_frame(&mut self, cx: &mut LoopCx<'_>, slot: inf_log::FrameSlot, plan: SealPlan) {
         self.note_issued();
         self.last_frame_records = self.staging.pending_records();
         let end = slot.base().advance(slot.len());
@@ -1333,19 +1337,18 @@ impl<F: SegmentFs> DurableCell<F> {
         let data = log_bytes::sealed_frame(&self.staging, &lease);
         let id = self.commit.note_frame_queued(end, lease, cx.now);
         // Barrier class per frame (ADR-0086 D1, ADR-0087 D3): the plan
-        // decided before the seal; `Wait` never reaches here. The ledger's
-        // queue entry settles the barrier at the frame's `LogWritten`.
+        // decided before the seal, and a sealable plan holds no `Wait`. The
+        // ledger's queue entry settles the barrier at the frame's `LogWritten`.
         let (barrier, linked) = match plan {
-            FramePlan::WriteThrough => {
+            SealPlan::WriteThrough => {
                 self.commit.register_write_through(cx.now);
                 (WriteBarrier::WriteThrough, false)
             }
-            FramePlan::LinkedFsync => {
+            SealPlan::LinkedFsync => {
                 let ticket = self.commit.register_linked_fsync(cx.now);
                 (WriteBarrier::LinkedFsync { fsync_token: fsync_token(ticket) }, true)
             }
-            FramePlan::Plain => (WriteBarrier::None, false),
-            FramePlan::Wait(_) => unreachable!("a waiting frame is never sealed"),
+            SealPlan::Plain => (WriteBarrier::None, false),
         };
         // A `u32` segment cursor: always addressable (ADR-0167 D2).
         let offset = FileOffset::from_u32_bytes(slot.base().offset);
@@ -1886,7 +1889,7 @@ mod fill_tests {
         let fill = FillConfig::DESIGN_POINT;
         let t0 = Nanos::from_micros(10);
         let d = |frame_len: u32, since: Option<Nanos>, now: Nanos| {
-            fill.decide(FramePlan::Plain, FrameLayout::Aligned, frame_len, since, now)
+            fill.decide(SealPlan::Plain, FrameLayout::Aligned, frame_len, since, now)
         };
         assert_eq!(d(2_400, None, t0), FillDecision::Hold, "first sight: the hold starts");
         assert_eq!(d(2_400, Some(t0), t0 + Nanos::from_micros(999)), FillDecision::Hold);
@@ -1896,25 +1899,24 @@ mod fill_tests {
         assert_eq!(d((8 << 10) + 1, None, t0), FillDecision::Hold, "padded to 12 KiB: below");
         assert_eq!(d((12 << 10) + 1, None, t0), FillDecision::Seal, "padded to 16 KiB: at");
         assert_eq!(
-            FillConfig::default().decide(FramePlan::Plain, FrameLayout::Aligned, 100, None, t0),
+            FillConfig::default().decide(SealPlan::Plain, FrameLayout::Aligned, 100, None, t0),
             FillDecision::Seal,
             "policy off"
         );
         assert_eq!(
-            fill.decide(FramePlan::Plain, FrameLayout::Packed, 100, None, t0),
+            fill.decide(SealPlan::Plain, FrameLayout::Packed, 100, None, t0),
             FillDecision::Seal,
             "no padding on a packed segment — nothing to fill against"
         );
     }
 
     /// A frame whose plan carries a barrier is never held (ADR-0089 D1;
-    /// the arm that held them was measured and `Rejected`), and a
-    /// waiting frame is the plan's hold, never the policy's.
+    /// the arm that held them was measured and `Rejected`). A waiting
+    /// frame never reaches the policy: it takes a sealable plan.
     #[test]
-    fn barrier_carrying_and_waiting_frames_are_never_held() {
+    fn barrier_carrying_frames_are_never_held() {
         let t0 = Nanos::from_micros(10);
-        let waits = [Hold::ReorderWindow, Hold::Barrier, Hold::SealUnfolded].map(FramePlan::Wait);
-        for plan in [FramePlan::WriteThrough, FramePlan::LinkedFsync].into_iter().chain(waits) {
+        for plan in [SealPlan::WriteThrough, SealPlan::LinkedFsync] {
             assert_eq!(
                 FillConfig::DESIGN_POINT.decide(plan, FrameLayout::Aligned, 100, None, t0),
                 FillDecision::Seal,
@@ -1941,10 +1943,10 @@ mod group_hold_tests {
         let off = GroupHoldConfig::default();
         assert!(!off.enabled());
         assert_eq!(
-            off.decide(FramePlan::LinkedFsync, FrameLayout::Packed, 1, 8, None, T0),
+            off.decide(SealPlan::LinkedFsync, FrameLayout::Packed, 1, 8, None, T0),
             GroupDecision::Seal
         );
-        for plan in [FramePlan::Plain, FramePlan::WriteThrough] {
+        for plan in [SealPlan::Plain, SealPlan::WriteThrough] {
             assert_eq!(
                 ARM.decide(plan, FrameLayout::Packed, 1, 8, None, T0),
                 GroupDecision::Seal,
@@ -1952,7 +1954,7 @@ mod group_hold_tests {
             );
         }
         assert_eq!(
-            ARM.decide(FramePlan::LinkedFsync, FrameLayout::Aligned, 1, 8, None, T0),
+            ARM.decide(SealPlan::LinkedFsync, FrameLayout::Aligned, 1, 8, None, T0),
             GroupDecision::Seal
         );
     }
@@ -1971,14 +1973,14 @@ mod group_hold_tests {
         // the uncovered count (the flaws) ⇒ seal — pinned so neither can
         // return.
         assert_eq!(
-            ARM.decide(FramePlan::LinkedFsync, FrameLayout::Packed, 4, 8, None, T0),
+            ARM.decide(SealPlan::LinkedFsync, FrameLayout::Packed, 4, 8, None, T0),
             GroupDecision::Hold
         );
         assert_eq!(
-            ARM.decide(FramePlan::LinkedFsync, FrameLayout::Packed, 4, 4, None, T0),
+            ARM.decide(SealPlan::LinkedFsync, FrameLayout::Packed, 4, 4, None, T0),
             GroupDecision::Seal
         );
-        let plan = FramePlan::LinkedFsync;
+        let plan = SealPlan::LinkedFsync;
         let packed = FrameLayout::Packed;
         assert_eq!(ARM.decide(plan, packed, 0, 1, None, T0), GroupDecision::Seal);
         assert_eq!(ARM.decide(plan, packed, 0, 0, None, T0), GroupDecision::Seal);

@@ -816,8 +816,10 @@ queued-frame FIFO. `note_frame_written` marks its frame written and
 advances `written_up_to`/`written_bytes` over the **completion-ordered
 written prefix** (a later frame landing first advances nothing — what an
 fdatasync can honestly cover). `frame_plan(write_through_ok, seal_ahead)
--> FramePlan::{Plain, WriteThrough, LinkedFsync, Wait(Hold)}` decides the
-next frame's barrier **before the seal**, its questions in this order:
+-> FramePlan::{Seal(SealPlan), Wait(Hold)}`, with `SealPlan::{Plain,
+WriteThrough, LinkedFsync}`, decides the next frame's barrier **before the
+seal**, and every sealing path takes the `SealPlan` alone; its questions in
+this order:
 `Wait(Hold::ReorderWindow)` while the queue's own admission refuses (a late
 front write and the frames that landed behind it fill the queue);
 `Wait(Hold::SealUnfolded)` for a `seal_ahead` frame while the previous
