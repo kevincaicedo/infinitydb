@@ -1558,6 +1558,15 @@ pub struct DurableReport {
     /// Reorder-window hold episodes (ADR-0087 D2 as amended), scraped at
     /// the cut — the `m2-reorder-window` oracle's observable.
     pub frame_waits_reorder: u64,
+    /// The fsync ledger's holds and skips, scraped at the cut and summed
+    /// over the cells: frames held for the rotation's unfolded seal, frames
+    /// held for a full ack map, and prealloc or zero-fill barriers skipped
+    /// at their class's budget. The last two are derived never to occur:
+    /// the cut reads them 0 on every seed (tokens `ack-map-held`,
+    /// `ledger-prealloc-deferred`).
+    pub frame_waits_ledger: u64,
+    pub frame_waits_ack_map: u64,
+    pub ledger_prealloc_deferrals: u64,
     /// Checkpoint `Direct` → `Buffered` in-band downgrades (ADR-0088 D3
     /// as amended), scraped at the cut — the `m2-ckpt-refused` oracle's
     /// coverage disclosure.

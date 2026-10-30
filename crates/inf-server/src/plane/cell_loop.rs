@@ -1215,6 +1215,9 @@ fn publish_durable_stats(node: &NodeInfo, stats: crate::durable::DurableStats) {
     node.frame_waits_barrier.set(stats.frame_waits_barrier);
     node.frame_waits_rotation.set(stats.frame_waits_rotation);
     node.frame_waits_reorder.set(stats.frame_waits_reorder);
+    node.frame_waits_ledger.set(stats.frame_waits_ledger);
+    node.frame_waits_ack_map.set(stats.frame_waits_ack_map);
+    node.ledger_prealloc_deferrals.set(stats.ledger_prealloc_deferrals);
     node.frame_waits_extent.set(stats.frame_waits_extent);
     node.extent_parks.set(stats.extent_parks);
     node.turn_refused.set(stats.turn_refused);

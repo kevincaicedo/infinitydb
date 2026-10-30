@@ -941,7 +941,10 @@ barrier covers more of them.
 These two are policy holds. A frame is also held for correctness: while a
 due barrier cannot be issued behind frames still in flight, while the
 reorder window is full, while a rotation waits for the old segment's writes
-to finish, or while the next segment is not ready. An optional frame-seal
+to finish, while a rotation waits for the previous rotation's seal to be
+folded into the durable prefix (the log registers one seal at a time, since
+a seal holds its segment's file and covers its end), while the ack map is
+full, or while the next segment is not ready. An optional frame-seal
 pacer (`--seal-pace`, off by default) can also hold a frame queued behind
 frames in flight for at most one barrier window at the device's measured
 barrier rate. Each hold is counted, and every held frame keeps collecting

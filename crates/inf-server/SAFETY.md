@@ -17,10 +17,12 @@ the staging `FrameLease` custody chain:
 2. `seal` hands the buffer out as a `FrameLease`; the buffer is not reset
    (and cannot be re-sealed — at most one lease exists) until
    `release(lease)`.
-3. The plane stores the lease in `DurableCell::in_flight` when it queues
-   the `LogWrite` and releases it **only** in the REAP arm for that op's
-   terminal completion (`LogWritten` or `Error`) — after the kernel is
-   done with the bytes.
+3. The plane hands the lease to the ledger's frame queue
+   (`GroupCommit::note_frame_queued`) when it queues the `LogWrite`; the
+   queue entry holds it until that op's `LogWritten`, where
+   `note_frame_written` hands it back and the REAP arm releases it — after
+   the kernel is done with the bytes. An `Error` fail-stops the cell with
+   the lease still held, so the bytes are never reused.
 
 Copying the frame into a pool buffer instead would cost a full-frame copy
 per iteration (rejected in ADR-0013: the zero-copy seal is the point of

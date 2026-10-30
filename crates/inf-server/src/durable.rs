@@ -16,21 +16,20 @@
 //! advances from `GroupCommit::on_fsync_complete`, which only fires on
 //! `Synced` completions (ADR-0013 D3).
 
-#[allow(clippy::disallowed_types, reason = "container: T")]
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use inf_alloc::AlignedBox;
 use inf_foundation::FileOffset;
-use inf_foundation::bounded::CapCensus;
+use inf_foundation::bounded::{CapCensus, CappedDeque, Lossy, Reserve, Reserved};
+use inf_foundation::limits::DEQUE_BACKING_BYTES_MAX;
 use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::{
-    FRAME_ALIGN, FillSource, FrameBuilder, FrameId, FramePlan, FsyncClass, FsyncTicket,
-    GroupCommit, IdxSidecarMeta, Lsn, MutationEffect, NsId, RecordView, SealedDisposal,
-    SegmentConfig, SegmentRotor, StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES,
-    build_recycle_sentinel,
+    BootDirs, FRAME_ALIGN, FillSource, FrameBarrier, FrameBuilder, FrameId, FramePlan, FsyncClass,
+    FsyncTicket, GroupCommit, Hold, IdxSidecarMeta, LedgerClass, Lsn, MutationEffect, NsId,
+    RecordView, SealedDisposal, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
+    ZERO_FILL_SLICE_BYTES, build_recycle_sentinel,
 };
 use inf_runtime::{
     ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass, IoOp, Issue,
@@ -441,6 +440,15 @@ pub struct DurableStats {
     /// episode like the other two; a non-zero value names a wedging
     /// device, never an engine regression.
     pub frame_waits_reorder: u64,
+    /// The fsync ledger's holds, cell scope, per episode: a staged frame
+    /// held because it needs a rotation and the previous rotation's seal
+    /// has not folded (the rotation class's seal budget), and one held
+    /// because the ack map is full (derived never to occur). Beside them,
+    /// MAINTAIN ticks that skipped a prealloc or zero-fill barrier at its
+    /// class's budget (derived never to occur).
+    pub frame_waits_ledger: u64,
+    pub frame_waits_ack_map: u64,
+    pub ledger_prealloc_deferrals: u64,
     /// The extent-seal window (ADR-0163 D2), cell scope: frames held for an
     /// outstanding extent barrier, per episode (the window closed at the
     /// hold); blob writers' park episodes; turns that found the window full,
@@ -585,29 +593,28 @@ pub struct DurableStats {
     pub write_stall_max_us: u64,
 }
 
-/// One sealed frame awaiting its `LogWritten` (ADR-0087 D2): the lease
-/// (the `StableBytes` custody point), the submit time for the write-stall
-/// sample, and the barrier ticket the completion settles — a linked
-/// sync's clock rebases at `LogWritten` (ADR-0083 D4), a write-through
-/// ticket completes there (ADR-0086 D5). Keyed by `FrameId` == the write
-/// token's sequence.
-struct InFlightFrame {
-    id: FrameId,
-    lease: inf_log::FrameLease,
-    submitted_at: Nanos,
-    barrier: FrameBarrier,
+/// One point of the ack map: a queued frame's exclusive end and the last
+/// durable seq it carries. When the fsync watermark covers `end`, every
+/// seq up to `seq` is durable. A point merges into a later written point
+/// only where no unfolded ledger entry covers up to it (`coalesce_ack_map`),
+/// so a merge delays no ack: the payload may coalesce.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct AckPoint {
+    end: Lsn,
+    seq: u64,
 }
 
-/// The ticket a frame's `LogWritten` must settle, if any.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum FrameBarrier {
-    None,
-    Linked(FsyncTicket),
-    WriteThrough(FsyncTicket),
-}
+impl Lossy for AckPoint {}
+
+// The ack map's one allocation fits a deque's backing bound, so its
+// construction never refuses on its layout.
+const _: () = assert!(
+    crate::limits::ACK_MAP_ENTRIES as usize * core::mem::size_of::<AckPoint>()
+        <= DEQUE_BACKING_BYTES_MAX,
+    "the ack map fits one deque allocation"
+);
 
 /// One cell's durable plane state (plane-owned; `inf-store` never sees it).
-#[allow(clippy::disallowed_types, reason = "container: T")]
 pub(crate) struct DurableCell<F: SegmentFs> {
     pub staging: StagingRing,
     pub rotor: SegmentRotor<F>,
@@ -625,9 +632,6 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     pub ckpt: CkptCell<F>,
     /// MANIFEST + truncation driver (M2-S11, ADR-0017).
     pub manifest: ManifestCell<F>,
-    /// Frames sealed and awaiting `LogWritten`, queue order; bounded by
-    /// the ring's `frames_in_flight` and allocated once (never grows).
-    in_flight: VecDeque<InFlightFrame>,
     /// The cell's zero window (ADR-0086 D4): `ZERO_FILL_SLICE_BYTES` (256
     /// KiB) of zeros, 4 KiB-aligned,
     /// never written — the source of every zero-fill `LogWrite`.
@@ -659,6 +663,12 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     frame_waits_barrier: u64,
     frame_waits_rotation: u64,
     frame_waits_reorder: u64,
+    /// Frames held for an unfolded seal (the rotation class) and for a full
+    /// ack map, per episode; MAINTAIN ticks that skipped a prealloc or
+    /// zero-fill barrier at its class's budget.
+    frame_waits_ledger: u64,
+    frame_waits_ack_map: u64,
+    ledger_prealloc_deferrals: u64,
     /// Frames held for an outstanding extent barrier, per episode: the
     /// holds that closed the extent-seal window.
     frame_waits_extent: u64,
@@ -699,14 +709,14 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     /// Records newly covered per durability-fsync completion (M2.5-S07):
     /// the group-formation distribution the ≥ 0.8× gate reads.
     group_hist_records: inf_foundation::LogHistogram,
-    /// Frames queued but not yet durable: (exclusive-end LSN, last seq).
-    /// Bounded (F-L01-03, batch 42): written entries across which no
-    /// ledger coverage point lies coalesce at every `LogWritten`
-    /// ([`coalesce_ack_map`]), so the map holds at most the frames behind
-    /// the written prefix (the reorder window), one entry per unfolded
+    /// The ack map: frames queued but not yet durable, one point each.
+    /// Written points across which no ledger coverage point lies coalesce
+    /// at every `LogWritten` ([`coalesce_ack_map`]), so the map holds at
+    /// most the frames behind the written prefix, one point per unfolded
     /// ledger entry, and one more — never one per frame sealed behind a
-    /// stalled barrier or between two ticks.
-    frame_seqs: VecDeque<(Lsn, u64)>,
+    /// stalled barrier or between two ticks. A capped deque of
+    /// `ACK_MAP_ENTRIES`, whose own admission the LOG step asks.
+    ack_map: CappedDeque<AckPoint, Reserve>,
     write_seq: u64,
     records_appended: u64,
     acks_gated: u64,
@@ -722,7 +732,11 @@ pub(crate) struct DurableCell<F: SegmentFs> {
 }
 
 impl<F: SegmentFs> DurableCell<F> {
-    #[allow(clippy::disallowed_types, reason = "container: T")]
+    /// # Panics
+    /// The ack map's backing refused by the allocator is the allocation
+    /// fail-stop every allocation of this constructor takes; its layout is
+    /// a const assertion, and the census refuses only a cap name declared
+    /// with a second value or fill, which any test's first boot shows.
     pub fn new(
         cfg: &DurableConfig,
         rotor: SegmentRotor<F>,
@@ -736,7 +750,8 @@ impl<F: SegmentFs> DurableCell<F> {
         // log life (1 on fresh logs).
         let mut staging = StagingRing::new(staging);
         staging.set_frame_epoch(rotor.resume_epoch());
-        let in_flight = VecDeque::with_capacity(usize::from(staging.frames_in_flight()));
+        let ack_map = CappedDeque::new(crate::limits::ACK_MAP, census)
+            .unwrap_or_else(|refused| panic!("the ack map refused: {refused}"));
         // ADR-0178 D2: each background class's declared slice — its cap
         // is never below one slice. The tier class's byte slice is the
         // group bound itself (ADR-0178 T1: one const, so a group can
@@ -769,7 +784,6 @@ impl<F: SegmentFs> DurableCell<F> {
             extent_waiters: ExtentWaiters::new(),
             ckpt,
             manifest,
-            in_flight,
             zero_window: AlignedBox::new(ZERO_FILL_SLICE_BYTES as usize),
             sentinel_window: AlignedBox::new(FRAME_ALIGN as usize),
             sentinel_builder: FrameBuilder::with_capacity(FRAME_ALIGN as usize),
@@ -783,6 +797,9 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_barrier: 0,
             frame_waits_rotation: 0,
             frame_waits_reorder: 0,
+            frame_waits_ledger: 0,
+            frame_waits_ack_map: 0,
+            ledger_prealloc_deferrals: 0,
             frame_waits_extent: 0,
             frame_held: false,
             fill,
@@ -800,7 +817,7 @@ impl<F: SegmentFs> DurableCell<F> {
             last_seq: 0,
             acked_seq: 0,
             group_hist_records: inf_foundation::LogHistogram::new(),
-            frame_seqs: VecDeque::new(),
+            ack_map,
             write_seq: 0,
             records_appended: 0,
             acks_gated: 0,
@@ -821,9 +838,9 @@ impl<F: SegmentFs> DurableCell<F> {
     /// dir-fsyncs could stall a reactor thread for minutes behind foreign
     /// journal writeback. Barrier failure surfaces as an fsync-error CQE
     /// → fail-stop (§8.4), same as any durability sync.
-    pub fn arm_boot_barriers(&mut self, cx: &mut LoopCx<'_>, dirs: Vec<F::File>) {
+    pub fn arm_boot_barriers(&mut self, cx: &mut LoopCx<'_>, dirs: Option<BootDirs<F::File>>) {
         let floor = self.rotor.append_cursor();
-        for handle in dirs {
+        for handle in dirs.into_iter().flat_map(BootDirs::into_handles) {
             // Fd-less tiers (MemFs) have process-KILL physics — completed
             // writes survive by construction, so they carry no barriers.
             let Some(fd) = inf_log::fs::SegmentFile::raw_fd(&handle) else { continue };
@@ -924,6 +941,13 @@ impl<F: SegmentFs> DurableCell<F> {
         // in a slice that makes no offer.
         self.ckpt.block_wait.observed(cx.now);
         self.write_through_wanted = write_through_wanted;
+        // The rotation class's prealloc budget, read before the file
+        // exists: at the budget the prealloc skips the tick.
+        if self.rotor.next_ready().is_none() && !self.commit.class_has_room(LedgerClass::Prealloc) {
+            self.ledger_prealloc_deferrals += 1;
+            self.zero_fill(cx);
+            return;
+        }
         match self.rotor.maintain_deferred(cx.now.as_millis()) {
             Ok((_report, Some(barrier))) => {
                 // Fd-less tiers (MemFs) have process-KILL physics — no
@@ -993,6 +1017,15 @@ impl<F: SegmentFs> DurableCell<F> {
                 }
             }
         }
+        // The rotation class's zero-fill budget, read before the barrier
+        // is taken: at the budget it skips the tick.
+        if self.zero_fill_ticket.is_none()
+            && self.rotor.zero_fill_barrier_owed()
+            && !self.commit.class_has_room(LedgerClass::ZeroFill)
+        {
+            self.ledger_prealloc_deferrals += 1;
+            return;
+        }
         if self.zero_fill_ticket.is_none()
             && let Some(fd) = self.rotor.take_zero_fill_barrier()
         {
@@ -1044,18 +1077,28 @@ impl<F: SegmentFs> DurableCell<F> {
                 self.frame_held = true;
                 return;
             }
+            // The ack map's own admission: the frame's point publishes in
+            // this step, so a full map holds the frame (derived never to
+            // occur: the map is at most the queue, the ledger and one).
+            if !self.ack_map_has_room() {
+                self.frame_waits_ack_map += u64::from(!self.frame_held);
+                self.frame_held = true;
+                return;
+            }
             // Barrier plan before any state moves (ADR-0087 D3).
             let write_through_ok = self.rotor.next_frame_write_through_ok(frame_len);
             let plan = self.commit.frame_plan(write_through_ok, rotation_due);
-            if plan == FramePlan::Wait {
-                // Two reasons, two counters: the reorder window is full
-                // (ADR-0087 D2 as amended — a device row), or the due
-                // barrier is inadmissible behind in-flight writes (D3).
-                if self.commit.reorder_window_full() {
-                    self.frame_waits_reorder += u64::from(!self.frame_held);
-                } else {
-                    self.frame_waits_barrier += u64::from(!self.frame_held);
-                }
+            if let FramePlan::Wait(hold) = plan {
+                // One counter per reason, each read from the plan: the
+                // frame queue is full (ADR-0087 D2 — a device row), the due
+                // barrier is inadmissible behind in-flight writes (D3), or
+                // the rotation's previous seal has not folded.
+                let waits = match hold {
+                    Hold::ReorderWindow => &mut self.frame_waits_reorder,
+                    Hold::Barrier => &mut self.frame_waits_barrier,
+                    Hold::SealUnfolded => &mut self.frame_waits_ledger,
+                };
+                *waits += u64::from(!self.frame_held);
                 self.frame_held = true;
                 return;
             }
@@ -1257,48 +1300,42 @@ impl<F: SegmentFs> DurableCell<F> {
         // A pending ckpt-begin marker rides this frame: its LSN is now
         // real (ADR-0016 D3).
         self.ckpt.on_frame_sealed(&lease);
-        self.frame_seqs.push_back((end, self.last_seq));
-        let id = self.commit.note_frame_queued(end, slot.len());
+        let Reserved::Slot(point) = self.ack_map.reserve() else {
+            panic!("an ack point into a full map: the LOG step holds the frame first");
+        };
+        point.publish(AckPoint { end, seq: self.last_seq });
+        // The ledger's queue holds the lease until the write's `LogWritten`.
+        let data = log_bytes::sealed_frame(&self.staging, &lease);
+        let id = self.commit.note_frame_queued(end, lease, cx.now);
         // Barrier class per frame (ADR-0086 D1, ADR-0087 D3): the plan
-        // decided before the seal; `Wait` never reaches here.
-        let (barrier, ticket) = match plan {
+        // decided before the seal; `Wait` never reaches here. The ledger's
+        // queue entry settles the barrier at the frame's `LogWritten`.
+        let (barrier, linked) = match plan {
             FramePlan::WriteThrough => {
-                let ticket = self.commit.register_write_through(cx.now);
-                (WriteBarrier::WriteThrough, FrameBarrier::WriteThrough(ticket))
+                self.commit.register_write_through(cx.now);
+                (WriteBarrier::WriteThrough, false)
             }
             FramePlan::LinkedFsync => {
                 let ticket = self.commit.register_linked_fsync(cx.now);
-                // The linked sync's clock rebases at `LogWritten`
-                // (ADR-0083 D4): its SQE starts only after the write.
-                (
-                    WriteBarrier::LinkedFsync { fsync_token: fsync_token(ticket) },
-                    FrameBarrier::Linked(ticket),
-                )
+                (WriteBarrier::LinkedFsync { fsync_token: fsync_token(ticket) }, true)
             }
-            FramePlan::Plain => (WriteBarrier::None, FrameBarrier::None),
-            FramePlan::Wait => unreachable!("a waiting frame is never sealed"),
+            FramePlan::Plain => (WriteBarrier::None, false),
+            FramePlan::Wait(_) => unreachable!("a waiting frame is never sealed"),
         };
         // A `u32` segment cursor: always addressable (ADR-0167 D2).
         let offset = FileOffset::from_u32_bytes(slot.base().offset);
         let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
         // ADR-0178 D2: the foreground is metered (one write, plus the
         // linked barrier when the plan carries one), never deferred.
-        let ops = 1 + u64::from(matches!(ticket, FrameBarrier::Linked(_)));
+        let ops = 1 + u64::from(linked);
         self.budget.charge(IoClass::LogFrame, u64::from(slot.len()), ops);
         self.rotor.commit_frame_queued(slot);
         self.write_seq += 1;
         debug_assert_eq!(self.write_seq, id.0, "write token sequence is the frame id");
-        let data = log_bytes::sealed_frame(&self.staging, &lease);
         debug_assert!(
-            self.in_flight.len() < usize::from(self.staging.frames_in_flight()),
-            "in-flight table sized to the ring"
+            self.commit.frames_unwritten() <= usize::from(self.staging.frames_in_flight()),
+            "the ledger's unwritten frames are the ring's in flight"
         );
-        self.in_flight.push_back(InFlightFrame {
-            id,
-            lease,
-            submitted_at: cx.now,
-            barrier: ticket,
-        });
         cx.push(IoOp::LogWrite { fd, offset, data, token: write_token(self.write_seq), barrier });
     }
 
@@ -1315,16 +1352,9 @@ impl<F: SegmentFs> DurableCell<F> {
     /// any earlier entry (ADR-0086 D5).
     pub fn on_log_written(&mut self, cx: &mut LoopCx<'_>, token: CompletionToken) {
         let now = cx.now;
-        let id = FrameId(write_seq_of(token));
-        let index = self
-            .in_flight
-            .iter()
-            .position(|frame| frame.id == id)
-            .expect("LogWritten for a frame not in flight");
-        let frame = self.in_flight.remove(index).expect("index from position");
+        let frame = self.commit.note_frame_written(FrameId(write_seq_of(token)));
         self.write_stall_hist.record(now.saturating_sub(frame.submitted_at).as_micros());
-        self.commit.note_frame_written(frame.id);
-        self.coalesce_frame_seqs();
+        self.coalesce_ack_points();
         self.staging.release(frame.lease);
         self.drained.wake_all(());
         match frame.barrier {
@@ -1334,22 +1364,27 @@ impl<F: SegmentFs> DurableCell<F> {
         }
     }
 
-    /// F-L01-03 (batch 42): coalesce the ack map over the written prefix
-    /// and release-assert its bound — the frames behind the prefix plus
-    /// one entry per unfolded ledger entry plus one, by construction of
-    /// [`coalesce_ack_map`]. Per `LogWritten`, over the entries the
-    /// prefix newly reached: O(coverage points) per call.
-    fn coalesce_frame_seqs(&mut self) {
+    /// Coalesce the ack map over the written prefix: the frames behind the
+    /// prefix plus one point per unfolded ledger entry plus one remain, by
+    /// construction of [`coalesce_ack_map`]. Per `LogWritten`, one pass of
+    /// at most `ACK_MAP_ENTRIES` steps, each at most `FSYNC_LEDGER_ENTRIES`
+    /// coverage compares.
+    fn coalesce_ack_points(&mut self) {
         let Some(written) = self.commit.written_up_to() else { return };
         let commit = &self.commit;
-        coalesce_ack_map(&mut self.frame_seqs, written, |lo, hi| {
-            commit.pending_covers_within(lo, hi)
-        });
-        assert!(
-            self.frame_seqs.len()
+        coalesce_ack_map(&mut self.ack_map, written, |lo, hi| commit.pending_covers_within(lo, hi));
+        debug_assert!(
+            self.ack_map.len()
                 <= self.commit.frames_behind_prefix() + self.commit.pending_entries() + 1,
-            "ack map outgrew the reorder window plus the ledger's coverage points"
+            "ack map outgrew the frame queue plus the ledger's coverage points"
         );
+    }
+
+    /// The ack map's own admission: a slot reserved here is dropped unused
+    /// (the frame's point publishes later in the same LOG step), and a
+    /// `Full` is the map's pacing crossing, reported to its census row.
+    fn ack_map_has_room(&mut self) -> bool {
+        matches!(self.ack_map.reserve(), Reserved::Slot(_))
     }
 
     /// One admission park episode began (local pump or fabric pump) —
@@ -1383,14 +1418,17 @@ impl<F: SegmentFs> DurableCell<F> {
         self.extent_waiters.hand_out(self.commit.extent_window_len());
         if let Some(end) = watermark {
             let mut last_covered = None;
-            while self.frame_seqs.front().is_some_and(|&(end_lsn, _)| end_lsn <= end) {
-                last_covered = self.frame_seqs.pop_front().map(|(_, seq)| seq);
+            while self.ack_map.front().is_some_and(|point| point.end <= end) {
+                last_covered = self.ack_map.pop_front().map(|point| point.seq);
             }
             if let Some(seq) = last_covered {
                 // Group formation (M2.5-S07): records newly covered by
                 // this completion — the distribution behind the
                 // ≥ 0.8× available-in-flight-writes gate.
-                debug_assert!(seq >= self.acked_seq, "ack seq regressed — frame_seqs FIFO broken");
+                debug_assert!(
+                    seq >= self.acked_seq,
+                    "ack seq regressed — the ack map's FIFO broken"
+                );
                 // Saturating like the round target below: a regressed seq
                 // is a wrong sample, never a wrapped one (F-L16-02).
                 self.group_hist_records.record(seq.saturating_sub(self.acked_seq));
@@ -1439,7 +1477,7 @@ impl<F: SegmentFs> DurableCell<F> {
     pub fn quiescent(&self) -> bool {
         self.staging.is_empty()
             && self.staging.drained()
-            && self.in_flight.is_empty()
+            && self.commit.frames_unwritten() == 0
             && self.commit.pending_fsyncs() == 0
             && !self.commit.sync_due()
             && self.ckpt_transition_idle()
@@ -1600,6 +1638,9 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_barrier: self.frame_waits_barrier,
             frame_waits_rotation: self.frame_waits_rotation,
             frame_waits_reorder: self.frame_waits_reorder,
+            frame_waits_ledger: self.frame_waits_ledger,
+            frame_waits_ack_map: self.frame_waits_ack_map,
+            ledger_prealloc_deferrals: self.ledger_prealloc_deferrals,
             frame_waits_extent: self.frame_waits_extent,
             extent_parks: self.extent_waiters.parks(),
             turn_refused: self.extent_waiters.turn_refused(),
@@ -1616,7 +1657,7 @@ impl<F: SegmentFs> DurableCell<F> {
             frames_in_flight_now: u64::from(self.staging.in_flight()),
             records_staged: u64::from(self.staging.pending_records()),
             everysec_idle_ticks: self.commit.stats().idle_ticks,
-            frames_awaiting_watermark: self.frame_seqs.len() as u64,
+            frames_awaiting_watermark: self.ack_map.len() as u64,
             fsync_entries: self.commit.pending_entries() as u64,
             write_through_entries: self.commit.write_through_entries() as u64,
             hold_open: u64::from(self.frame_held),
@@ -1695,85 +1736,114 @@ fn write_seq_of(token: CompletionToken) -> u64 {
     u64::from(token.slot()) | (u64::from(token.generation()) << 24)
 }
 
-/// The LSN→seq ack map's coalescing rule (F-L01-03, batch 42). The gate
-/// consumes only the *last* entry a watermark covers, so an entry `a`
-/// is redundant once its successor `b` is covered by every future
-/// watermark that covers `a`. That holds for two written frames with no
-/// ledger coverage point in `a.end..b.end`: every barrier registered
-/// after `b` landed covers `b` — a linked or write-through sync covers
-/// `queued_up_to ≥ b`, a standalone or completion sync covers
-/// `written_up_to ≥ b`, a rotation's seal covers the old segment's end
-/// (`≥ b` for a written `b` queued before it), and the ledger-only
-/// barriers reuse the coverage tail — and the ledger's coverage is
-/// monotone in submission order. A coverage point between them (the
-/// linked sync on `a` with plain `b` behind it) keeps `a`: `a`'s acks
-/// must not wait for `b`'s barrier. An unwritten `b` is never merged
-/// into — a standalone may still cover exactly `a`.
-#[allow(clippy::disallowed_types, reason = "container: T")]
-fn coalesce_ack_map(
-    map: &mut VecDeque<(Lsn, u64)>,
+/// The ack map's coalescing rule. The gate consumes only the *last*
+/// point a watermark covers, so a point `a` is redundant once its successor
+/// `b` is covered by every future watermark that covers `a`. That holds for
+/// two written frames with no ledger coverage point in `a.end..b.end`:
+/// every barrier registered after `b` landed covers `b` — a linked or
+/// write-through sync covers `queued_up_to ≥ b`, a standalone or completion
+/// sync covers `written_up_to ≥ b`, a rotation's seal covers the old
+/// segment's end (`≥ b` for a written `b` queued before it), and the
+/// ledger-only barriers reuse the coverage tail — and the ledger's coverage
+/// is monotone in submission order. A coverage point between them (the
+/// linked sync on `a` with plain `b` behind it) keeps `a`: `a`'s acks must
+/// not wait for `b`'s barrier. An unwritten `b` is never merged into — a
+/// standalone may still cover exactly `a`. One pass of the deque's
+/// `merge_adjacent`, each pair asked once.
+fn coalesce_ack_map<X>(
+    map: &mut CappedDeque<AckPoint, X>,
     written: Lsn,
     covers_within: impl Fn(Lsn, Lsn) -> bool,
 ) {
-    let mut i = 0;
-    while i + 1 < map.len() {
-        let (a, _) = map[i];
-        let (b, _) = map[i + 1];
-        if b > written {
-            break;
-        }
-        if covers_within(a, b) {
-            i += 1;
-        } else {
-            map.remove(i);
-        }
-    }
+    map.merge_adjacent(|a, b| b.end <= written && !covers_within(a.end, b.end));
 }
 
-#[allow(clippy::disallowed_types, reason = "test-only: std containers in test code (ADR-0163 D2)")]
 #[cfg(test)]
 mod ack_map_tests {
-    use std::collections::VecDeque;
+    use std::rc::Rc;
 
+    use inf_foundation::CellId;
+    use inf_foundation::bounded::{CapCensus, CappedDeque, Reserve, Reserved};
     use inf_log::{Lsn, SegmentId};
 
-    use super::coalesce_ack_map;
+    use super::{AckPoint, coalesce_ack_map};
+    use crate::limits::{ACK_MAP, ACK_MAP_ENTRIES};
 
     fn lsn(off: u32) -> Lsn {
         Lsn::new(SegmentId(1), off)
     }
 
-    fn map(ends: &[u32]) -> VecDeque<(Lsn, u64)> {
-        ends.iter().map(|&e| (lsn(e), u64::from(e))).collect()
+    fn census() -> Rc<CapCensus> {
+        let (census, serve_mark) = CapCensus::new(CellId(0));
+        serve_mark.take();
+        census
+    }
+
+    fn map(census: &Rc<CapCensus>, ends: &[u32]) -> CappedDeque<AckPoint, Reserve> {
+        let mut map = CappedDeque::new(ACK_MAP, census).expect("built");
+        for &end in ends {
+            let Reserved::Slot(slot) = map.reserve() else { panic!("room") };
+            slot.publish(AckPoint { end: lsn(end), seq: u64::from(end) });
+        }
+        map
+    }
+
+    fn ends(map: &CappedDeque<AckPoint, Reserve>) -> Vec<u32> {
+        map.iter().map(|point| point.end.offset).collect()
     }
 
     /// Plain frames landing between two barriers collapse to the last
     /// written one: the gate reads the same seq at the next watermark.
     #[test]
     fn written_plain_frames_without_a_coverage_point_collapse_to_one() {
-        let mut m = map(&[64, 128, 192, 256]);
+        let census = census();
+        let mut m = map(&census, &[64, 128, 192, 256]);
         coalesce_ack_map(&mut m, lsn(256), |_, _| false);
-        assert_eq!(m, map(&[256]));
+        assert_eq!(ends(&m), [256]);
+        assert_eq!(m.iter().map(|point| point.seq).collect::<Vec<_>>(), [256]);
     }
 
     /// A coverage point inside `a..b` (the linked sync on `a`, plain
     /// `b` behind it) keeps `a`: its acks release at `a`'s barrier.
     #[test]
     fn a_coverage_point_between_two_written_frames_keeps_the_earlier() {
-        let mut m = map(&[64, 128, 192]);
+        let census = census();
+        let mut m = map(&census, &[64, 128, 192]);
         coalesce_ack_map(&mut m, lsn(192), |lo, hi| lo <= lsn(64) && lsn(64) < hi);
-        assert_eq!(m, map(&[64, 192]));
+        assert_eq!(ends(&m), [64, 192]);
     }
 
     /// Entries behind the written prefix never merge — a standalone may
     /// still cover exactly the last written end.
     #[test]
     fn unwritten_frames_are_never_merged_into() {
-        let mut m = map(&[64, 128, 192]);
+        let census = census();
+        let mut m = map(&census, &[64, 128, 192]);
         coalesce_ack_map(&mut m, lsn(64), |_, _| false);
-        assert_eq!(m, map(&[64, 128, 192]));
+        assert_eq!(ends(&m), [64, 128, 192]);
         coalesce_ack_map(&mut m, lsn(128), |_, _| false);
-        assert_eq!(m, map(&[128, 192]));
+        assert_eq!(ends(&m), [128, 192]);
+    }
+
+    /// The map's cap admits what coalescing leaves at most: the frames
+    /// behind the written prefix, one point per unfolded ledger entry and
+    /// one more. A holder of its `Cap` takes the 60th and the 61st point
+    /// and refuses the 62nd. Under the cap-minus-one plant it refuses the
+    /// 61st, by this test's own token.
+    #[test]
+    fn the_ack_map_cap_admits_the_queue_the_ledger_and_one() {
+        let bound =
+            inf_log::limits::REORDER_WINDOW_FRAMES + inf_log::limits::FSYNC_LEDGER_ENTRIES + 1;
+        assert_eq!(bound, ACK_MAP_ENTRIES);
+        let census = census();
+        let mut m = map(&census, &[]);
+        for point in 1..=bound {
+            let Reserved::Slot(slot) = m.reserve() else {
+                panic!("ack-map-edge-short: the ack map refused point {point} of its {bound}");
+            };
+            slot.publish(AckPoint { end: lsn(point), seq: u64::from(point) });
+        }
+        assert!(matches!(m.reserve(), Reserved::Full), "the 62nd point is refused");
     }
 }
 
@@ -1817,7 +1887,8 @@ mod fill_tests {
     #[test]
     fn barrier_carrying_and_waiting_frames_are_never_held() {
         let t0 = Nanos::from_micros(10);
-        for plan in [FramePlan::WriteThrough, FramePlan::LinkedFsync, FramePlan::Wait] {
+        let waits = [Hold::ReorderWindow, Hold::Barrier, Hold::SealUnfolded].map(FramePlan::Wait);
+        for plan in [FramePlan::WriteThrough, FramePlan::LinkedFsync].into_iter().chain(waits) {
             assert_eq!(
                 FillConfig::DESIGN_POINT.decide(plan, FrameLayout::Aligned, 100, None, t0),
                 FillDecision::Seal,

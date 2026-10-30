@@ -236,8 +236,7 @@ mod tests {
         }
 
         fn ack_class(&self, seq: u64) -> AckClass {
-            let (front, back) = self.map.as_slices();
-            ack_class_of(front, back, self.watermark, seq)
+            ack_class_of(self.map.len(), |index| self.map[index].1, self.watermark, seq)
         }
     }
 

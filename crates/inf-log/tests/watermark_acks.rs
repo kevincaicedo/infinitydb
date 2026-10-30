@@ -84,7 +84,7 @@ fn run_schedule(seed: u64, dir: &Path) {
         assert!(iters < 200_000, "schedule {seed:#x} failed to quiesce");
         let quiesced = plane.jobs.is_empty()
             && plane.staging.is_empty()
-            && plane.in_flight.is_empty()
+            && plane.commit.frames_unwritten() == 0
             && plane.commit.pending_fsyncs() == 0;
         idle = if quiesced { idle + 1 } else { 0 };
     }

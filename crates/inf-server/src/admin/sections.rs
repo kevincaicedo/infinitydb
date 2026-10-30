@@ -549,6 +549,13 @@ fn barrier_gauge_lines(text: &mut String, node: &NodeInfo) {
     push(text, &format!("frame_waits_barrier:{}", node.frame_waits_barrier.get()));
     push(text, &format!("frame_waits_rotation:{}", node.frame_waits_rotation.get()));
     push(text, &format!("frame_waits_reorder:{}", node.frame_waits_reorder.get()));
+    // The fsync ledger's holds (cell scope): a frame held for the
+    // rotation's unfolded seal, and for a full ack map; prealloc or
+    // zero-fill barriers skipped at their class's budget. The last two
+    // are derived never to occur.
+    push(text, &format!("frame_waits_ledger:{}", node.frame_waits_ledger.get()));
+    push(text, &format!("frame_waits_ack_map:{}", node.frame_waits_ack_map.get()));
+    push(text, &format!("ledger_prealloc_deferrals:{}", node.ledger_prealloc_deferrals.get()));
     // ADR-0163 D2 (cell scope): frames held for an outstanding extent
     // barrier, per episode — each episode closes the extent-seal window.
     push(text, &format!("frame_waits_extent:{}", node.frame_waits_extent.get()));

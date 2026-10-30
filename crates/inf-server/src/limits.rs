@@ -23,6 +23,23 @@ pub const EPOCH_MARKS_MAX: u32 = 16;
 /// `epoch-marks`, filled while the cell serves.
 pub const EPOCH_MARKS: Cap = Cap::entries::<EPOCH_MARKS_MAX>("epoch-marks", CapFill::Serving);
 
+/// Ack points one cell's durable plane holds: a frame's exclusive end and
+/// the last durable seq it carries, for every frame queued and not yet
+/// covered by the fsync watermark. Coalescing keeps a written point only
+/// where an unfolded ledger entry covers up to it, so the map holds at most
+/// the frames behind the written prefix, one point per unfolded ledger entry
+/// and one more: `REORDER_WINDOW_FRAMES + FSYNC_LEDGER_ENTRIES + 1`. Owner:
+/// the cell's `DurableCell`, one map built with it. Crossing: pacing — the
+/// LOG step asks the map's admission before the frame's plan and holds the
+/// frame while it is full (derived never to occur; `frame_waits_ack_map`
+/// counts the episodes).
+pub const ACK_MAP_ENTRIES: u32 =
+    inf_log::limits::REORDER_WINDOW_FRAMES + inf_log::limits::FSYNC_LEDGER_ENTRIES + 1;
+
+/// The ack map's cap: `ACK_MAP_ENTRIES` entries under the census name
+/// `ack-map`, filled while the cell serves.
+pub const ACK_MAP: Cap = Cap::entries::<ACK_MAP_ENTRIES>("ack-map", CapFill::Serving);
+
 /// Checkpoint-board slots one cell's sweep visits per MAINTAIN turn
 /// (ADR-0159 D4, A1.4). Owner: the cell's `BoardSweep`, charged as one
 /// Maintenance unit per turn as MAINTAIN's first budgeted step. Crossing:

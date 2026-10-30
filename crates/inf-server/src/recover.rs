@@ -64,10 +64,10 @@ use inf_log::ckpt::{
 };
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    FrameStamp, LogCorruption, Lsn, Manifest, ReadError, ReadStep, ReaderConfig, RegionEvidence,
-    RegionScan, SegmentId, SegmentReader, SegmentRotor, SegmentScan, check_segment_len,
-    create_cell_dirs, create_cell_dirs_deferred, read_manifest, scan_log_dir_from,
-    scan_region_evidence, segment_file_name,
+    BootDirs, FrameStamp, LogCorruption, Lsn, Manifest, ReadError, ReadStep, ReaderConfig,
+    RegionEvidence, RegionScan, SegmentId, SegmentReader, SegmentRotor, SegmentScan,
+    check_segment_len, create_cell_dirs, create_cell_dirs_deferred, read_manifest,
+    scan_log_dir_from, scan_region_evidence, segment_file_name,
 };
 use inf_store::{Keyspace, ReplayOutcome, WallAnchor};
 
@@ -501,7 +501,7 @@ pub struct Recovery<F: SegmentFs> {
     /// synchronous tier ([`open_cell_log`]) keeps blocking syncs: it has
     /// no driver to ride.
     defer_boot_sync: bool,
-    barrier_dirs: Vec<F::File>,
+    barrier_dirs: Option<BootDirs<F::File>>,
     /// Checkpoint bytes already credited to `bytes_done` (section blocks);
     /// the header/footer remainder is credited when the footer validates.
     ick_credited: u64,
@@ -678,7 +678,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             bytes_done: 0,
             bytes_consumed: 0,
             defer_boot_sync: false,
-            barrier_dirs: Vec::new(),
+            barrier_dirs: None,
             ick_credited: 0,
             prev_stamp: None,
             saw_v2: false,
@@ -718,11 +718,11 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     }
 
     /// The boot directory handles whose driver-ridden fdatasyncs are the
-    /// boot barriers (empty unless
+    /// boot barriers (`None` unless
     /// [`deferred_boot_sync`](Self::deferred_boot_sync) was set). Take
     /// them after `Complete`, before [`finish`](Self::finish).
-    pub fn take_boot_barrier_dirs(&mut self) -> Vec<F::File> {
-        core::mem::take(&mut self.barrier_dirs)
+    pub fn take_boot_barrier_dirs(&mut self) -> Option<BootDirs<F::File>> {
+        self.barrier_dirs.take()
     }
 
     /// Code of the phase the next [`step`](Self::step) will run — the
@@ -889,7 +889,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // the device; the handles become ledger-fronted driver barriers.
         let dirs = if self.defer_boot_sync {
             let (dirs, handles) = create_cell_dirs_deferred(self.fs(), &self.shard_dir)?;
-            self.barrier_dirs = handles;
+            self.barrier_dirs = Some(handles);
             dirs
         } else {
             create_cell_dirs(self.fs(), &self.shard_dir)?

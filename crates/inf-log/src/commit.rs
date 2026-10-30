@@ -15,14 +15,16 @@
 //! EXECUTE   stage(effect) → note_staged(class)         (always ⇒ sync due)
 //! on_timer  note_everysec_tick()                       (injected wheel, L7)
 //! LOG       staging.can_seal()?
+//!             ├─ frame_plan(..) → Wait(hold)? hold the frame
 //!             ├─ rotor.begin_frame_deferred → (slot, seal?)
 //!             ├─ seal? → register_seal_fsync(handoff) → IoOp::Fdatasync
 //!             ├─ lease = staging.seal(slot.first_record_lsn())
-//!             ├─ note_frame_queued(end, len); frame_fsync_due()?
+//!             ├─ note_frame_queued(end, lease, now); a barrier planned?
 //!             │    └─ register_linked_fsync() → LogWrite{fsync_token}
 //!             └─ rotor.commit_frame_queued(slot)
 //!           else standalone_fsync_due()? → register_standalone_fsync()
-//! REAP      LogWritten → note_frame_written(id); staging.release(lease)
+//! REAP      LogWritten → note_frame_written(id) → lease, barrier;
+//!                        staging.release(lease)
 //!           Synced     → on_fsync_complete → Some(end) ⇒ gate.advance(end)
 //! ```
 //!
@@ -65,8 +67,7 @@
 //! FUA frame completing ahead of an earlier FLUSH-class entry advances
 //! nothing until that entry lands. Write-through tickets do **not** count
 //! toward the sync-pipeline bound (ADR-0022 D3 re-scoped): they never
-//! queue on the device's flush unit, and the one-frame staging lease
-//! already bounds them at one per cell.
+//! queue on the device's flush unit.
 //!
 //! **The prefix rule (load-bearing).** A FUA write persists *its own
 //! bytes*; an fdatasync persists the whole file. A write-through ticket
@@ -79,10 +80,19 @@
 //! `Direct` run (seed 0xd5ee00a7: an acked DEL replayed as its
 //! predecessor because the plain frame before it was lost to the cut).
 //!
-//! The pending set is bounded by construction: at most K writes (and so
-//! K write-through tickets, or one linked sync — a linked sync needs the
-//! pipeline drained) are in flight, standalone syncs dedupe against the
-//! ledger tail, and seal/zero-fill syncs arrive at segment cadence.
+//! **The ledger's classes.** Every entry's reason belongs to one
+//! [`LedgerClass`], and each class holds at most its budget unfolded
+//! (`crate::limits`): boot 5, the rotation's seal 1, prealloc barriers 2
+//! and zero-fill barriers 2, extent 16 (the extent-seal window, below, is
+//! that class's count), write-through 16 and discretionary 2 — 44 in all,
+//! the ledger's cap, so the ledger is never full on its own. A class is
+//! read before its entry exists: a rotation whose previous seal has not
+//! folded holds its frame ([`Hold::SealUnfolded`]: the seal holds the old
+//! segment's file and covers its end, so it can neither coalesce nor go
+//! plain), a write-through or discretionary barrier at its budget leaves
+//! the due to accumulate (`Plain`, not due), and MAINTAIN skips a prealloc
+//! or zero-fill barrier at its budget. A registration past its class's
+//! budget is a fail-stop: the plan skipped its check.
 //!
 //! **The reorder window (ADR-0087 D2).** The staging ring bounds
 //! *unwritten* frames at K, but a frame that landed behind an earlier one
@@ -90,14 +100,17 @@
 //! its released buffer lets the next frame in. One wedged plain write at
 //! the front with barrier-less frames landing behind it would therefore
 //! grow the queue without bound (costing memory, then a linear completion
-//! search, and eventually the cell).
-//! The queue is bounded at [`REORDER_WINDOW_FRAMES`] by construction:
-//! [`GroupCommit::frame_plan`] answers `Wait` while the window is full,
-//! so the next frame holds until the front lands (≤ one write latency —
-//! the same bound the barrier `Wait` already carries), the staging
-//! builder absorbs the hold, and the existing staging backpressure
-//! (admission parking, M4.5-S27) takes over from there. Release-asserted
-//! at the queue; frames are found by ordinal arithmetic, never a scan.
+//! search, and eventually the cell). The queue is a capped deque of
+//! [`REORDER_WINDOW_FRAMES`](crate::limits::REORDER_WINDOW_FRAMES) entries
+//! and [`GroupCommit::frame_plan`] asks the deque's own admission: while
+//! it is full the plan answers [`Hold::ReorderWindow`], so the next frame
+//! holds until the front lands (≤ one write latency — the same bound the
+//! barrier hold carries), the staging builder absorbs the hold, and the
+//! staging backpressure (admission parking, M4.5-S27) takes over from
+//! there. Each entry carries its frame's flight until `LogWritten` — the
+//! staging lease, the submit time and the barrier the write settles — so
+//! the plane keeps no second table; frames are found by ordinal
+//! arithmetic, never a scan.
 //!
 //! **The extent-seal window (ADR-0163 D2, ADR-0061 D3).** A blob extent's
 //! barrier holds the extent's open file until the barrier folds, so the
@@ -111,8 +124,6 @@
 //! unit, and in what order, is the plane's.
 
 use core::fmt;
-#[allow(clippy::disallowed_types, reason = "container: T")]
-use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::rc::Rc;
 
@@ -122,30 +133,15 @@ use inf_foundation::limits::DEQUE_BACKING_BYTES_MAX;
 use inf_foundation::time::Nanos;
 
 use crate::fs::SegmentFile;
-use crate::limits::{EXTENT_SEAL_WINDOW, EXTENT_SEAL_WINDOW_ENTRIES};
+use crate::limits::{
+    EXTENT_SEAL_WINDOW, EXTENT_SEAL_WINDOW_ENTRIES, FRAME_QUEUE, FSYNC_LEDGER,
+    FSYNC_LEDGER_ENTRIES, LEDGER_BOOT_ENTRIES, LEDGER_DISCRETIONARY_ENTRIES,
+    LEDGER_PREALLOC_ENTRIES, LEDGER_SEAL_ENTRIES, LEDGER_ZERO_FILL_ENTRIES, REORDER_WINDOW_FRAMES,
+    WRITE_THROUGH_WINDOW_ENTRIES,
+};
 use crate::lsn::Lsn;
 use crate::segment::SealHandoff;
-use crate::staging::MAX_FRAMES_IN_FLIGHT;
-
-/// The most frames the completion ledger holds behind the written prefix
-/// — unwritten ones plus those that landed ahead of an earlier one still
-/// in flight (ADR-0087 D2 as amended). Twice the ring's in-flight cap:
-/// one late write with a full pipeline landing behind it, twice over,
-/// reorders without a hold; beyond that the next frame waits for the
-/// front. Fixed, independent of the configured K, so the ledger's memory
-/// is a constant (16 × 32 B) and never a function of device behaviour.
-pub const REORDER_WINDOW_FRAMES: usize = 2 * MAX_FRAMES_IN_FLIGHT as usize;
-
-/// Write-through tickets the ledger holds unfolded at once (batch 44,
-/// ADR-0087 D2 third amendment). Behind a wedged FLUSH-class front entry
-/// (a seal, a dir barrier, a linked sync) every FUA frame still completes
-/// at `LogWritten` and its ticket sits in `pending` until the front
-/// folds — one per frame, bounded before only by the gated clients'
-/// outstanding commands. At the window `frame_plan` answers `Plain`: the
-/// due accumulates (§8.2) and the first barrier after the front covers
-/// it; its acks waited for the front anyway. Same width as the reorder
-/// window, above any configured K.
-pub const WRITE_THROUGH_WINDOW_ENTRIES: usize = REORDER_WINDOW_FRAMES;
+use crate::staging::{FrameLease, MAX_FRAMES_IN_FLIGHT};
 
 /// Durability class of a staged effect's namespace (§8.2). `memory`
 /// namespaces never reach the log, so they have no representation here —
@@ -200,6 +196,107 @@ pub enum SyncReason {
     /// in it. Coverage-neutral like the prealloc dir barrier.
     ZeroFill,
 }
+
+/// The fsync ledger's entry classes: every [`SyncReason`] belongs to one,
+/// and each class holds at most its [`budget`](Self::budget) of entries
+/// unfolded. The rotation's three reasons — its seal, the next segment's
+/// prealloc barrier and its zero-fill barrier — are three classes,
+/// budgets 1, 2 and 2, five in all: each paces on its own (the seal holds
+/// its frame, the other two skip a MAINTAIN tick).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum LedgerClass {
+    /// Boot-metadata barriers: the boot directories' and the fresh
+    /// segment's, all registered before the first frame.
+    Boot,
+    /// A rotation's seal: one unfolded at a time.
+    Seal,
+    /// The next segment's directory barrier.
+    Prealloc,
+    /// The next segment's zero-fill barrier.
+    ZeroFill,
+    /// Blob-extent barriers: the extent-seal window is the class's count.
+    Extent,
+    /// Write-through frame tickets.
+    WriteThrough,
+    /// Linked, standalone and completion syncs: the barriers the plane
+    /// may defer while the due accumulates.
+    Discretionary,
+}
+
+impl LedgerClass {
+    /// Every class, each once.
+    pub const ALL: [LedgerClass; 7] = [
+        LedgerClass::Boot,
+        LedgerClass::Seal,
+        LedgerClass::Prealloc,
+        LedgerClass::ZeroFill,
+        LedgerClass::Extent,
+        LedgerClass::WriteThrough,
+        LedgerClass::Discretionary,
+    ];
+
+    /// The class of an entry registered for `reason`: one exhaustive
+    /// match, so a reason with no class does not compile.
+    #[must_use]
+    pub const fn of(reason: SyncReason) -> LedgerClass {
+        match reason {
+            SyncReason::BootBarrier => LedgerClass::Boot,
+            SyncReason::Seal => LedgerClass::Seal,
+            SyncReason::PreallocBarrier => LedgerClass::Prealloc,
+            SyncReason::ZeroFill => LedgerClass::ZeroFill,
+            SyncReason::ExtentSeal => LedgerClass::Extent,
+            SyncReason::WriteThrough => LedgerClass::WriteThrough,
+            SyncReason::Linked | SyncReason::Standalone | SyncReason::Completion => {
+                LedgerClass::Discretionary
+            }
+        }
+    }
+
+    /// The entries the class may hold unfolded (`crate::limits`).
+    #[must_use]
+    pub const fn budget(self) -> u32 {
+        match self {
+            LedgerClass::Boot => LEDGER_BOOT_ENTRIES,
+            LedgerClass::Seal => LEDGER_SEAL_ENTRIES,
+            LedgerClass::Prealloc => LEDGER_PREALLOC_ENTRIES,
+            LedgerClass::ZeroFill => LEDGER_ZERO_FILL_ENTRIES,
+            LedgerClass::Extent => EXTENT_SEAL_WINDOW_ENTRIES,
+            LedgerClass::WriteThrough => WRITE_THROUGH_WINDOW_ENTRIES,
+            LedgerClass::Discretionary => LEDGER_DISCRETIONARY_ENTRIES,
+        }
+    }
+
+    /// The class's place among the ledger's counts. The extent class has
+    /// none: the extent-seal window mirrors its entries in ledger order and
+    /// is its one count (a second would be a second fact).
+    const fn counted(self) -> Option<usize> {
+        match self {
+            LedgerClass::Boot => Some(0),
+            LedgerClass::Seal => Some(1),
+            LedgerClass::Prealloc => Some(2),
+            LedgerClass::ZeroFill => Some(3),
+            LedgerClass::WriteThrough => Some(4),
+            LedgerClass::Discretionary => Some(5),
+            LedgerClass::Extent => None,
+        }
+    }
+}
+
+/// The classes the ledger counts itself: every class but the extent class.
+const COUNTED_CLASSES: usize = 6;
+
+// The class budgets are the ledger's cap, so a ledger whose every class is
+// within its budget is within its cap: a full ledger is no crossing of its
+// own.
+const _: () = {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < LedgerClass::ALL.len() {
+        sum += LedgerClass::ALL[i].budget();
+        i += 1;
+    }
+    assert!(sum == FSYNC_LEDGER_ENTRIES, "the ledger's class budgets sum to its cap");
+};
 
 /// Ledger key for one submitted fsync. The plane maps tickets onto
 /// completion tokens (`inf-log` never names the token type).
@@ -260,12 +357,14 @@ pub enum ExtentRegistration<T, E> {
 pub struct FrameId(pub u64);
 
 /// The barrier class the next frame may carry, or the instruction to hold
-/// it (ADR-0087 D3). Decided by [`GroupCommit::frame_plan`] before the
-/// seal, so a frame is never sealed into a barrier it cannot have.
+/// it and why (ADR-0087 D3). Decided by [`GroupCommit::frame_plan`]
+/// before the seal, so a frame is never sealed into a barrier it cannot
+/// have, and the plane counts a hold by its reason without asking again.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum FramePlan {
     /// Seal and write with no barrier (no sync due, or the FLUSH slot is
-    /// busy and the due accumulates — §8.2 batching).
+    /// busy, or the barrier's class is at its budget, and the due
+    /// accumulates into the next group commit).
     Plain,
     /// Seal and write `RWF_DSYNC`; register the ticket with
     /// [`GroupCommit::register_write_through`].
@@ -273,10 +372,48 @@ pub enum FramePlan {
     /// Seal and chain an fdatasync; register it with
     /// [`GroupCommit::register_linked_fsync`].
     LinkedFsync,
+    /// Hold the frame for the reason given.
+    Wait(Hold),
+}
+
+/// Why the next frame holds. Each wait ends on a completion, never on
+/// time alone, and the plane counts each reason in its own counter.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Hold {
+    /// The frame queue is full (ADR-0087 D2): its front write is late and
+    /// the frames that landed behind it fill the queue. Ends when the
+    /// front lands.
+    ReorderWindow,
     /// A sync is due, write-through is not admissible, and frames are
-    /// still in flight below this one: hold the frame until the pipeline
-    /// drains (≤ one write latency).
-    Wait,
+    /// still in flight below this one (ADR-0087 D3). Ends when the
+    /// pipeline drains (≤ one write latency).
+    Barrier,
+    /// The frame needs a rotation and the previous rotation's seal has not
+    /// folded: the rotation class registers one seal at a time. Ends at
+    /// the seal's fold.
+    SealUnfolded,
+}
+
+/// The ticket a frame's `LogWritten` settles: a linked sync's clock
+/// rebases there (ADR-0083 D4: its fdatasync starts only after the
+/// write), a write-through ticket completes there (ADR-0086 D5: the write
+/// is the barrier).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum FrameBarrier {
+    None,
+    Linked(FsyncTicket),
+    WriteThrough(FsyncTicket),
+}
+
+/// What [`GroupCommit::note_frame_written`] hands back: the frame's staging
+/// lease to release (the `StableBytes` custody point), its submit time (the
+/// write-stall sample) and the barrier its write settles.
+#[derive(Debug)]
+#[must_use = "a written frame's lease returns to staging and its barrier is settled"]
+pub struct WrittenFrame {
+    pub lease: FrameLease,
+    pub submitted_at: Nanos,
+    pub barrier: FrameBarrier,
 }
 
 /// Cumulative commit counters (cell-local, no atomics — L1). The frozen
@@ -321,14 +458,29 @@ enum HeldHandle<File> {
     Extent(File),
 }
 
-/// One frame handed to the driver and not yet known written (ADR-0087
-/// D2). `end_bytes` is the frame's exclusive end in ledger-byte space.
+/// One frame handed to the driver and not yet part of the written prefix
+/// (ADR-0087 D2). `end_bytes` is the frame's exclusive end in ledger-byte
+/// space.
 struct QueuedFrame {
     id: FrameId,
     end: Lsn,
     end_bytes: u64,
-    written: bool,
+    flight: Flight,
 }
+
+/// Whether a queued frame's write has landed. Until it has, the entry
+/// holds the frame's staging lease (the sealed bytes the driver reads must
+/// not move), its submit time and the barrier its completion settles.
+enum Flight {
+    Unwritten { lease: FrameLease, submitted_at: Nanos, barrier: FrameBarrier },
+    Written,
+}
+
+// The frame queue's one allocation fits a deque's backing bound.
+const _: () = assert!(
+    REORDER_WINDOW_FRAMES as usize * core::mem::size_of::<QueuedFrame>() <= DEQUE_BACKING_BYTES_MAX,
+    "the frame queue fits one deque allocation"
+);
 
 struct PendingFsync<File> {
     ticket: u64,
@@ -346,7 +498,6 @@ struct PendingFsync<File> {
 /// The group-commit engine of one cell. Single-threaded by design (L1);
 /// time is injected (`now` parameters — L7); generic over the segment-file
 /// tier only to hold [`SealHandoff`]s until their sync completes.
-#[allow(clippy::disallowed_types, reason = "container: T")]
 pub struct GroupCommit<File> {
     /// An fsync is due this iteration (everysec tick fired, or `always`
     /// traffic staged). Cleared by the registration that covers it.
@@ -371,21 +522,21 @@ pub struct GroupCommit<File> {
     flush_bound: usize,
     /// FLUSH-class entries registered and not yet completed or failed —
     /// `syncs_in_flight()` in O(1), maintained at push / complete / error
-    /// (batch 43; the scan it replaces is the debug oracle).
+    /// (the scan it replaces is the debug oracle).
     flush_in_flight: usize,
-    /// Write-through tickets registered and not yet folded into the
-    /// durable prefix — bounded at `WRITE_THROUGH_WINDOW_ENTRIES` by
-    /// `frame_plan`'s `Plain`, release-asserted at registration (batch 44).
-    write_through_pending: usize,
+    /// Unfolded entries of each class the ledger counts itself (every
+    /// class but the extent class, whose window counts it): raised at
+    /// registration, lowered at the fold.
+    unfolded: [u8; COUNTED_CLASSES],
     queued_up_to: Option<Lsn>,
     queued_bytes: u64,
     /// Frames queued and not yet part of the written prefix, in queue
-    /// order (ADR-0087 D2 as amended): the unwritten ones plus those that
-    /// landed ahead of an earlier one still in flight. Bounded at
-    /// `REORDER_WINDOW_FRAMES` by `frame_plan`'s `Wait`, release-asserted
-    /// at the queue; ids are consecutive ordinals, so a frame's index is
-    /// `id − front.id` (O(1) completion routing, never a scan).
-    queued: VecDeque<QueuedFrame>,
+    /// order (ADR-0087 D2): the unwritten ones plus those that landed
+    /// ahead of an earlier one still in flight. A capped deque whose own
+    /// admission `frame_plan` asks; ids are consecutive ordinals, so a
+    /// frame's index is `id − front.id` (O(1) completion routing, never a
+    /// scan).
+    queued: CappedDeque<QueuedFrame, Reserve>,
     /// Queued frames without their `LogWritten` yet — bounded by the
     /// staging ring's in-flight slots (`MAX_FRAMES_IN_FLIGHT`).
     unwritten: u8,
@@ -396,7 +547,9 @@ pub struct GroupCommit<File> {
     written_bytes: u64,
     durable_up_to: Option<Lsn>,
     durable_bytes: u64,
-    pending: VecDeque<PendingFsync<File>>,
+    /// The ledger: every registered barrier until it folds into the done
+    /// prefix, in submission order, at most `FSYNC_LEDGER_ENTRIES`.
+    pending: CappedDeque<PendingFsync<File>, Reserve>,
     next_ticket: u64,
     /// The extent-seal window (ADR-0163 D2): one entry per extent barrier
     /// in `pending`, in ledger order, published with the barrier and
@@ -429,7 +582,16 @@ impl<File> fmt::Debug for GroupCommit<File> {
 }
 
 impl<File: SegmentFile> GroupCommit<File> {
-    /// The ledger of one cell, its extent-seal window a row of `census`.
+    /// The ledger's one allocation fits a deque's backing bound for every
+    /// file type it is built with: evaluated when the constructor is, at
+    /// compile time.
+    const LEDGER_FITS: () = assert!(
+        FSYNC_LEDGER_ENTRIES as usize * core::mem::size_of::<PendingFsync<File>>()
+            <= DEQUE_BACKING_BYTES_MAX,
+        "the fsync ledger fits one deque allocation"
+    );
+
+    /// The ledger of one cell, its three capped holders rows of `census`.
     #[must_use]
     pub fn new(census: &Rc<CapCensus>) -> GroupCommit<File> {
         GroupCommit::with_flush_bound(1, census)
@@ -438,22 +600,27 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// `bound` FLUSH-class durability syncs may be in flight at once
     /// (ADR-0022 D3; the two-in-flight arm is M2.5-S07's measured shape,
     /// reachable by construction here — `--sync-pipeline` retired,
-    /// ADR-0087 D5). The extent-seal window is a row of `census`: one
-    /// allocation of `EXTENT_SEAL_WINDOW_ENTRIES` entries, never grown.
+    /// ADR-0087 D5). The extent-seal window, the frame queue and the
+    /// ledger are rows of `census`: one allocation each of
+    /// `EXTENT_SEAL_WINDOW_ENTRIES`, `REORDER_WINDOW_FRAMES` and
+    /// `FSYNC_LEDGER_ENTRIES` entries, never grown.
     ///
     /// # Panics
     /// Outside `1..=2` — the pipeline is bounded by construction, never a
-    /// queue. The window's backing refused by the allocator is the
-    /// allocation fail-stop every growth of this constructor takes; its
-    /// layout is a const assertion, and the census refuses only a cap name
-    /// declared with a second value or fill, which any test's first boot
-    /// shows.
+    /// queue. A holder's backing refused by the allocator is the allocation
+    /// fail-stop every allocation of this constructor takes; each layout is
+    /// a const assertion, and the census refuses only a cap name declared
+    /// with a second value or fill, which any test's first boot shows.
     #[must_use]
-    #[allow(clippy::disallowed_types, reason = "container: T")]
     pub fn with_flush_bound(bound: usize, census: &Rc<CapCensus>) -> GroupCommit<File> {
         assert!((1..=2).contains(&bound), "FLUSH-class bound is 1 or 2, never a queue");
+        let () = Self::LEDGER_FITS;
         let extent_window = CappedDeque::new(EXTENT_SEAL_WINDOW, census)
             .unwrap_or_else(|refused| panic!("the extent-seal window refused: {refused}"));
+        let queued = CappedDeque::new(FRAME_QUEUE, census)
+            .unwrap_or_else(|refused| panic!("the frame queue refused: {refused}"));
+        let pending = CappedDeque::new(FSYNC_LEDGER, census)
+            .unwrap_or_else(|refused| panic!("the fsync ledger refused: {refused}"));
         GroupCommit {
             sync_due: false,
             always_pending: false,
@@ -462,17 +629,17 @@ impl<File: SegmentFile> GroupCommit<File> {
             always_queued_up_to: None,
             flush_bound: bound,
             flush_in_flight: 0,
-            write_through_pending: 0,
+            unfolded: [0; COUNTED_CLASSES],
             queued_up_to: None,
             queued_bytes: 0,
-            queued: VecDeque::with_capacity(REORDER_WINDOW_FRAMES),
+            queued,
             unwritten: 0,
             next_frame_id: 0,
             written_up_to: None,
             written_bytes: 0,
             durable_up_to: None,
             durable_bytes: 0,
-            pending: VecDeque::new(),
+            pending,
             next_ticket: 0,
             extent_window,
             extent_unsent: 0,
@@ -552,40 +719,43 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.written_bytes == self.queued_bytes
     }
 
-    /// True while the ledger holds `REORDER_WINDOW_FRAMES` frames behind
-    /// the written prefix — the front write is late and the frames that
-    /// landed behind it have filled the window. [`frame_plan`](Self::frame_plan)
-    /// answers `Wait` in this state; the plane counts the episode
-    /// (`frame_waits_reorder`) so a wedging device is visible, never
-    /// absorbed.
+    /// Unfolded entries `class` holds now, at most its budget.
     #[must_use]
-    pub fn reorder_window_full(&self) -> bool {
-        self.queued.len() >= REORDER_WINDOW_FRAMES
+    pub fn class_unfolded(&self, class: LedgerClass) -> u32 {
+        match class.counted() {
+            Some(slot) => u32::from(self.unfolded[slot]),
+            // The window mirrors the extent class's entries in ledger
+            // order: it is the class's one count. A deque's length is at
+            // most its `u32` cap.
+            None => u32::try_from(self.extent_window.len()).unwrap_or(u32::MAX),
+        }
     }
 
-    /// True while `WRITE_THROUGH_WINDOW_ENTRIES` write-through tickets sit
-    /// unfolded behind a wedged front (batch 44): the next due frame
-    /// seals `Plain` instead of minting another ticket.
+    /// Whether `class` admits one more entry now: what every plan of a
+    /// class's barrier reads before the entry exists.
     #[must_use]
-    pub fn write_through_window_full(&self) -> bool {
-        self.write_through_pending >= WRITE_THROUGH_WINDOW_ENTRIES
+    pub fn class_has_room(&self, class: LedgerClass) -> bool {
+        self.class_unfolded(class) < class.budget()
     }
 
     /// Unfolded write-through tickets — the `write_through_entries` gauge.
     #[must_use]
     pub fn write_through_entries(&self) -> usize {
-        self.write_through_pending
+        self.class_unfolded(LedgerClass::WriteThrough) as usize
     }
 
     /// Should this iteration's frame write chain an fdatasync (the
-    /// FLUSH-class barrier, bounded by the FLUSH pipeline)? A linked
-    /// fdatasync is ordered after *its own* write only (`IO_LINK`), so it
-    /// may claim coverage up to its frame's end only when every earlier
-    /// write has completed — `drained()` (ADR-0087 D3; at K = 1 implied by
-    /// `can_seal`). Call before the seal.
+    /// FLUSH-class barrier, bounded by the FLUSH pipeline and the
+    /// discretionary class)? A linked fdatasync is ordered after *its own*
+    /// write only (`IO_LINK`), so it may claim coverage up to its frame's
+    /// end only when every earlier write has completed — `drained()`
+    /// (ADR-0087 D3; at K = 1 implied by `can_seal`). Call before the seal.
     #[must_use]
     pub fn frame_fsync_due(&self) -> bool {
-        self.sync_due && self.drained() && self.syncs_in_flight() < self.flush_bound
+        self.sync_due
+            && self.drained()
+            && self.syncs_in_flight() < self.flush_bound
+            && self.class_has_room(LedgerClass::Discretionary)
     }
 
     /// Should the next frame be written write-through (ADR-0086 D5)?
@@ -603,52 +773,70 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.sync_due && self.coverage_tail().1 == self.queued_bytes
     }
 
-    /// The barrier the next frame may carry, or `Wait` (ADR-0087 D3),
-    /// given whether the rotor allows write-through for it and whether a
-    /// rotation's seal fdatasync will be registered ahead of it
-    /// (`seal_ahead`: the seal covers every queued byte, so the frame
+    /// The barrier the next frame may carry, or the hold and its reason
+    /// (ADR-0087 D3), given whether the rotor allows write-through for it
+    /// and whether a rotation's seal fdatasync will be registered ahead of
+    /// it (`seal_ahead`: the seal covers every queued byte, so the frame
     /// extends the durable prefix by construction — and its fdatasync is
     /// FLUSH-class, so it takes a pipeline slot; the LOG step decides
     /// before rotating, so the ledger cannot show the entry yet and the
-    /// slot arm counts it here — F-L01-05, batch 43). The `Wait` arm is the rule that keeps a due
-    /// from starving behind
-    /// barrier-less frames: sealing with no barrier while writes are in
-    /// flight below would let every later frame find the same shape. The
-    /// FLUSH-slot arm keeps §8.2 batching byte-for-byte (the due
-    /// accumulates while the pipeline is drained but the slot is busy).
+    /// slot arm counts it here). The barrier hold keeps a due from
+    /// starving behind barrier-less frames: sealing with no barrier while
+    /// writes are in flight below would let every later frame find the
+    /// same shape. The FLUSH-slot arm keeps group-commit batching exact
+    /// (the due accumulates while the pipeline is drained but the slot is
+    /// busy), and a barrier class at its budget accumulates the due the
+    /// same way.
     #[must_use]
-    pub fn frame_plan(&self, write_through_ok: bool, seal_ahead: bool) -> FramePlan {
-        // The reorder window (ADR-0087 D2 as amended) bounds the queue
-        // before any barrier question: a frame sealed now could not be
-        // queued, whatever barrier it carried.
-        if self.reorder_window_full() {
-            return FramePlan::Wait;
+    pub fn frame_plan(&mut self, write_through_ok: bool, seal_ahead: bool) -> FramePlan {
+        // The queue's own admission (ADR-0087 D2) comes before any barrier
+        // question: a frame sealed now could not be queued, whatever
+        // barrier it carried.
+        if !self.queue_has_room() {
+            return FramePlan::Wait(Hold::ReorderWindow);
+        }
+        // The rotation class registers one seal at a time, whatever
+        // barrier the frame would carry: the rotation waits for the
+        // previous seal's fold.
+        if seal_ahead && !self.class_has_room(LedgerClass::Seal) {
+            return FramePlan::Wait(Hold::SealUnfolded);
         }
         if !self.sync_due {
             return FramePlan::Plain;
         }
         if write_through_ok
             && (seal_ahead || self.write_through_due())
-            && !self.write_through_window_full()
+            && self.class_has_room(LedgerClass::WriteThrough)
         {
             return FramePlan::WriteThrough;
         }
         if !self.drained() {
-            return FramePlan::Wait;
+            return FramePlan::Wait(Hold::Barrier);
         }
-        if self.syncs_in_flight() + usize::from(seal_ahead) < self.flush_bound {
+        if self.syncs_in_flight() + usize::from(seal_ahead) < self.flush_bound
+            && self.class_has_room(LedgerClass::Discretionary)
+        {
             return FramePlan::LinkedFsync;
         }
         FramePlan::Plain
     }
 
-    /// Is a standalone fdatasync due (sync owed, FLUSH slot free, no
-    /// frame to chain to, dirty *written* bytes not already covered by a
-    /// pending sync)?
+    /// The frame queue's own admission: a slot reserved here is dropped
+    /// unused (the frame queues in the same LOG step, with no suspension
+    /// between), and a `Full` is the queue's pacing crossing, reported to
+    /// its census row.
+    fn queue_has_room(&mut self) -> bool {
+        matches!(self.queued.reserve(), Reserved::Slot(_))
+    }
+
+    /// Is a standalone fdatasync due (sync owed, FLUSH slot free, the
+    /// discretionary class not at its budget, no frame to chain to, dirty
+    /// *written* bytes not already covered by a pending sync)?
     #[must_use]
     pub fn standalone_fsync_due(&self) -> bool {
         self.sync_due
             && self.syncs_in_flight() < self.flush_bound
+            && self.class_has_room(LedgerClass::Discretionary)
             && self.written_bytes > self.durable_bytes
             && self.pending.back().is_none_or(|p| p.covers_bytes < self.written_bytes)
     }
@@ -659,12 +847,14 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// bound 1 it is never true, preserving the ADR-0022 D3 discipline
     /// byte-for-byte. Requires full discharge: every owed `always` record
     /// must already sit in a written frame the sync will cover, or the
-    /// due stays for the LOG step's linked sync.
+    /// due stays for the LOG step's linked sync. The discretionary class
+    /// at its budget leaves the due for a later barrier.
     #[must_use]
     pub fn completion_fsync_due(&self) -> bool {
         self.sync_due
             && self.flush_bound > 1
             && self.syncs_in_flight() < self.flush_bound - 1
+            && self.class_has_room(LedgerClass::Discretionary)
             && self.written_bytes > self.durable_bytes
             && self.always_discharged_at_written()
             && self.pending.back().is_none_or(|p| p.covers_bytes < self.written_bytes)
@@ -710,7 +900,8 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// sealed segment's exclusive end — sound because rotation is a
     /// pipeline drain point (ADR-0087 D4; asserted: everything queued has
     /// completed, so the sync runs with every write into the segment in
-    /// the file).
+    /// the file). The plan held the rotation until the previous seal
+    /// folded, so this is the rotation class's one seal.
     pub fn register_seal_fsync(&mut self, handoff: SealHandoff<File>, now: Nanos) -> FsyncTicket {
         assert!(self.drained(), "deferred seal with a frame write in flight — rotation drains");
         let covers_up_to = Lsn::new(handoff.segment(), handoff.end_offset());
@@ -753,7 +944,9 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// segment's directory entry durable. **Coverage-neutral**: it enters
     /// the ledger at the current coverage tail (a dir sync promises no
     /// log-data coverage), so it fences later acks by ledger order
-    /// without ever advancing the watermark past real data syncs.
+    /// without ever advancing the watermark past real data syncs. The
+    /// caller read [`LedgerClass::Prealloc`]'s room before it created the
+    /// file.
     pub fn register_prealloc_barrier(&mut self, dir: File, now: Nanos) -> FsyncTicket {
         let (covers_up_to, covers_bytes) = self.coverage_tail();
         self.stats.fsyncs_prealloc_barrier += 1;
@@ -853,7 +1046,8 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// **Coverage-neutral** like the prealloc dir barrier — it enters at
     /// the current coverage tail and can never advance the watermark past
     /// a real data sync. The rotor keeps the fd open (the segment becomes
-    /// active later), so nothing is held here.
+    /// active later), so nothing is held here. The caller read
+    /// [`LedgerClass::ZeroFill`]'s room before it took the barrier.
     pub fn register_zero_fill_barrier(&mut self, now: Nanos) -> FsyncTicket {
         let (covers_up_to, covers_bytes) = self.coverage_tail();
         self.stats.fsyncs_zero_fill += 1;
@@ -876,41 +1070,43 @@ impl<File: SegmentFile> GroupCommit<File> {
 
     /// This iteration's frame was handed to the driver (`LogWrite` at the
     /// slot's base). `end` is the frame's exclusive end LSN (the
-    /// successor's base — padding included on aligned segments). Returns
-    /// the frame's id for [`note_frame_written`](Self::note_frame_written).
+    /// successor's base — padding included on aligned segments); `lease`
+    /// is the sealed frame's staging lease, which the queue entry holds
+    /// until [`note_frame_written`](Self::note_frame_written) hands it
+    /// back; `now` is the write's submit time. Returns the frame's id.
     ///
     /// # Panics
     /// If more than `MAX_FRAMES_IN_FLIGHT` frames are queued unwritten
-    /// (the staging ring bounds this) or the reorder window is full
-    /// (`frame_plan` answered `Wait`) — either is a plane bug.
-    pub fn note_frame_queued(&mut self, end: Lsn, frame_len: u32) -> FrameId {
+    /// (the staging ring bounds this) or the frame queue is full (the plan
+    /// answered `Wait(Hold::ReorderWindow)`) — either is a plane bug.
+    pub fn note_frame_queued(&mut self, end: Lsn, lease: FrameLease, now: Nanos) -> FrameId {
         // Release assert (M2.5-S13): out-of-order queue breaks the LSN↔seq
         // FIFO the ack gate and reader rely on. Per-batch, free.
         assert!(self.queued_up_to.is_none_or(|q| q < end), "frames queue in append order");
-        // Two bounds, both release-asserted, per frame, free. Unwritten
-        // frames: what the staging ring holds in flight. The whole queue:
-        // the reorder window (ADR-0087 D2 as amended) — frames that
-        // landed ahead of an earlier one still in flight stay queued
-        // until the prefix reaches them (the `m2-mode-transition` sweep
-        // found the first bound mis-scoped to the queue: seven `everysec`
-        // frames behind one late write crashed the cell; the review of
-        // that fix found the queue then unbounded).
+        // Unwritten frames: what the staging ring holds in flight. The
+        // whole queue is the capped deque's below: frames that landed
+        // ahead of an earlier one still in flight stay queued until the
+        // prefix reaches them.
         assert!(
             self.unwritten < MAX_FRAMES_IN_FLIGHT,
             "more frames in flight than the ring can hold"
         );
-        assert!(!self.reorder_window_full(), "frame queued into a full reorder window");
-        self.queued_up_to = Some(end);
-        self.queued_bytes += u64::from(frame_len);
-        self.next_frame_id += 1;
-        let id = FrameId(self.next_frame_id);
-        self.unwritten += 1;
-        self.queued.push_back(QueuedFrame {
+        let frame_len = lease.frame_len();
+        let end_bytes = self.queued_bytes + u64::from(frame_len);
+        let id = FrameId(self.next_frame_id + 1);
+        let Reserved::Slot(slot) = self.queued.reserve() else {
+            panic!("frame queued into a full reorder window");
+        };
+        slot.publish(QueuedFrame {
             id,
             end,
-            end_bytes: self.queued_bytes,
-            written: false,
+            end_bytes,
+            flight: Flight::Unwritten { lease, submitted_at: now, barrier: FrameBarrier::None },
         });
+        self.queued_up_to = Some(end);
+        self.queued_bytes = end_bytes;
+        self.next_frame_id = id.0;
+        self.unwritten += 1;
         self.stats.frames_queued += 1;
         self.stats.frame_bytes_queued += u64::from(frame_len);
         // The seal drains the whole staging builder, so every record
@@ -923,9 +1119,20 @@ impl<File: SegmentFile> GroupCommit<File> {
         id
     }
 
+    /// The frame just queued settles `barrier` at its `LogWritten`.
+    fn settle_at_written(&mut self, barrier: FrameBarrier) {
+        match self.queued.back_mut().map(|frame| &mut frame.flight) {
+            Some(Flight::Unwritten { barrier: settles, .. }) => *settles = barrier,
+            Some(Flight::Written) | None => {
+                panic!("a frame barrier registered with no unwritten frame queued")
+            }
+        }
+    }
+
     /// The queued frame chains an fdatasync (`always` traffic present or an
     /// everysec tick owed one). One linked sync covers every class due this
-    /// iteration — group commit (§8.2).
+    /// iteration — group commit. The frame's `LogWritten` rebases
+    /// its latency clock.
     ///
     /// # Panics
     /// If no frame was queued first — a linked sync without its write is a
@@ -943,19 +1150,22 @@ impl<File: SegmentFile> GroupCommit<File> {
         // would sit outside the sync's coverage. The one frame queued and
         // unwritten is this one.
         assert!(
-            self.queued.len() == 1 && !self.queued[0].written,
+            self.queued.len() == 1
+                && matches!(self.queued.front().map(|f| &f.flight), Some(Flight::Unwritten { .. })),
             "linked fsync with earlier frame writes still in flight"
         );
         self.sync_due = false;
         self.always_pending = false;
         self.stats.fsyncs_linked += 1;
-        self.push_pending(
+        let ticket = self.push_pending(
             covers_up_to,
             self.queued_bytes,
             now,
             SyncReason::Linked,
             HeldHandle::None,
-        )
+        );
+        self.settle_at_written(FrameBarrier::Linked(ticket));
+        ticket
     }
 
     /// The queued frame is written write-through (ADR-0086 D5): the write
@@ -973,7 +1183,12 @@ impl<File: SegmentFile> GroupCommit<File> {
         // claiming bytes it did not write is the ack-before-durable bug
         // the sweep caught; per-frame, free. The frame just queued is the
         // back of the FIFO; its base is the previous entry's end.
-        let base = self.queued.iter().rev().nth(1).map_or(self.written_bytes, |f| f.end_bytes);
+        let base = self
+            .queued
+            .len()
+            .checked_sub(2)
+            .and_then(|before| self.queued.get(before))
+            .map_or(self.written_bytes, |f| f.end_bytes);
         assert_eq!(
             self.coverage_tail().1,
             base,
@@ -982,13 +1197,15 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.sync_due = false;
         self.always_pending = false;
         self.stats.fsyncs_write_through += 1;
-        self.push_pending(
+        let ticket = self.push_pending(
             covers_up_to,
             self.queued_bytes,
             now,
             SyncReason::WriteThrough,
             HeldHandle::None,
-        )
+        );
+        self.settle_at_written(FrameBarrier::WriteThrough(ticket));
+        ticket
     }
 
     /// An everysec-owed fdatasync with no frame to chain to. Covers what
@@ -1034,6 +1251,23 @@ impl<File: SegmentFile> GroupCommit<File> {
         )
     }
 
+    /// An entry of `class` was registered: its count rises (the extent
+    /// class's window rose with its publish).
+    fn class_raised(&mut self, class: LedgerClass) {
+        if let Some(slot) = class.counted() {
+            self.unfolded[slot] += 1;
+        }
+    }
+
+    /// An entry of `class` folded: its count falls (the extent class's
+    /// window pops at the same fold).
+    fn class_folded(&mut self, class: LedgerClass) {
+        if let Some(slot) = class.counted() {
+            debug_assert!(self.unfolded[slot] > 0, "a class count fell below its entries");
+            self.unfolded[slot] -= 1;
+        }
+    }
+
     fn push_pending(
         &mut self,
         covers_up_to: Lsn,
@@ -1049,32 +1283,35 @@ impl<File: SegmentFile> GroupCommit<File> {
             self.pending.back().is_none_or(|p| p.covers_up_to <= covers_up_to),
             "fsync coverage must be monotone in submission order"
         );
-        // Release assert (batch 43, F-L01-05): the LOG step's own barriers
-        // enter only through a slot `frame_plan` / `*_fsync_due` found
-        // free — a seal registered between the plan and this call is
-        // counted by the plan. Seals, zero-fill, boot and extent barriers
-        // are not discretionary and bypass the bound by design.
+        // Release assert: the LOG step's own barriers enter only through a
+        // slot `frame_plan` / `*_fsync_due` found free — a seal registered
+        // between the plan and this call is counted by the plan. Seals,
+        // zero-fill, boot and extent barriers are not discretionary and
+        // bypass the FLUSH bound by design; their classes bound them.
         if matches!(reason, SyncReason::Linked | SyncReason::Standalone | SyncReason::Completion) {
             assert!(
                 self.flush_in_flight < self.flush_bound,
                 "FLUSH-class barrier into a full pipeline"
             );
         }
-        if reason == SyncReason::WriteThrough {
-            // Release assert (batch 44): a ticket enters only through a
-            // window `frame_plan` found open — the sibling of the reorder
-            // window's queue assert.
-            assert!(
-                self.write_through_pending < WRITE_THROUGH_WINDOW_ENTRIES,
-                "write-through ticket into a full window"
-            );
-            self.write_through_pending += 1;
-        } else {
+        let class = LedgerClass::of(reason);
+        self.class_raised(class);
+        // Release assert: a class holds at most its budget unfolded. The
+        // plan read the class's room in the same step with no suspension,
+        // so an entry past it is a plan that skipped its check. Per-batch,
+        // free; the budgets sum to the ledger's cap.
+        assert!(self.class_unfolded(class) <= class.budget(), "a ledger class past its budget");
+        if reason != SyncReason::WriteThrough {
             self.flush_in_flight += 1;
         }
         let ticket = self.next_ticket();
         self.next_ticket = ticket.0;
-        self.pending.push_back(PendingFsync {
+        let Reserved::Slot(slot) = self.pending.reserve() else {
+            // Every class is within its budget and the budgets sum to the
+            // cap, so the ledger has room.
+            panic!("a ledger entry past the ledger's cap");
+        };
+        slot.publish(PendingFsync {
             ticket: ticket.0,
             covers_up_to,
             covers_bytes,
@@ -1084,10 +1321,13 @@ impl<File: SegmentFile> GroupCommit<File> {
             failed: false,
             held,
         });
-        debug_assert_eq!(
-            self.write_through_pending,
-            self.pending.iter().filter(|p| p.reason == SyncReason::WriteThrough).count(),
-            "write-through count tracks the FIFO"
+        debug_assert!(
+            LedgerClass::ALL.iter().all(|&class| {
+                let entries =
+                    self.pending.iter().filter(|p| LedgerClass::of(p.reason) == class).count();
+                self.class_unfolded(class) as usize == entries
+            }),
+            "every class count tracks the ledger"
         );
         ticket
     }
@@ -1096,16 +1336,17 @@ impl<File: SegmentFile> GroupCommit<File> {
 
     /// Frame `id`'s `LogWritten` arrived: its bytes reached the file (NOT
     /// durable unless the frame was write-through — release the staging
-    /// lease, never ack from here). Advances the written prefix over
-    /// every leading frame now written (ADR-0087 D2); a later frame
+    /// lease, never ack from here). Hands back the lease, the submit time
+    /// and the barrier the write settles, and advances the written prefix
+    /// over every leading frame now written (ADR-0087 D2); a later frame
     /// completing first advances nothing.
     ///
     /// # Panics
     /// On an unknown or already-written id — completions are exactly-once.
-    pub fn note_frame_written(&mut self, id: FrameId) {
+    pub fn note_frame_written(&mut self, id: FrameId) -> WrittenFrame {
         // Ids are consecutive ordinals and the queue pops only at the
         // front, so the frame's index is its distance from the front —
-        // O(1) whatever the window holds (ADR-0087 D2 as amended).
+        // O(1) whatever the queue holds (ADR-0087 D2).
         let front = self.queued.front().expect("LogWritten with nothing queued").id;
         let index = id.0.checked_sub(front.0).expect("LogWritten for a frame already written");
         let frame = usize::try_from(index)
@@ -1113,17 +1354,21 @@ impl<File: SegmentFile> GroupCommit<File> {
             .and_then(|index| self.queued.get_mut(index))
             .expect("LogWritten for a frame that was not queued");
         debug_assert_eq!(frame.id, id, "queue ordinals are consecutive");
-        assert!(!frame.written, "frame written twice");
-        frame.written = true;
+        let Flight::Unwritten { lease, submitted_at, barrier } =
+            core::mem::replace(&mut frame.flight, Flight::Written)
+        else {
+            panic!("frame written twice");
+        };
         self.unwritten = self.unwritten.checked_sub(1).expect("LogWritten with no unwritten frame");
         while let Some(front) = self.queued.front() {
-            if !front.written {
+            if !matches!(front.flight, Flight::Written) {
                 break;
             }
             self.written_up_to = Some(front.end);
             self.written_bytes = front.end_bytes;
             self.queued.pop_front();
         }
+        WrittenFrame { lease, submitted_at, barrier }
     }
 
     /// Frames queued and not yet known written (`0..=frames_in_flight`) —
@@ -1144,9 +1389,8 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// The ledger entry for `ticket`, by ordinal arithmetic: tickets are
     /// consecutive and `pending` pops only at the front, so an entry's
     /// index is its distance from the front's ticket (O(1), never a
-    /// scan — batch 43; the `queued` FIFO's ADR-0087 D2 rule). `None`
-    /// for a ticket already folded into the durable prefix or never
-    /// minted.
+    /// scan — the `queued` FIFO's ADR-0087 D2 rule). `None` for a ticket
+    /// already folded into the durable prefix or never minted.
     fn pending_mut(&mut self, ticket: FsyncTicket) -> Option<&mut PendingFsync<File>> {
         let front = self.pending.front()?.ticket;
         let index = usize::try_from(ticket.0.checked_sub(front)?).ok()?;
@@ -1176,6 +1420,7 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// An fsync's `Synced` arrived. Returns the new watermark — the
     /// exclusive end of the durable range — when the done-prefix advanced;
     /// the plane feeds it to `WatermarkGate::advance(end.to_u64())` (S06).
+    /// Each entry the fold passes leaves its class.
     ///
     /// # Panics
     /// On an unknown or already-completed ticket — completions are
@@ -1206,10 +1451,8 @@ impl<File: SegmentFile> GroupCommit<File> {
             self.durable_up_to = Some(front.covers_up_to);
             self.durable_bytes = front.covers_bytes;
             let (reason, folded) = (front.reason, FsyncTicket(front.ticket));
-            if reason == SyncReason::WriteThrough {
-                self.write_through_pending -= 1;
-            }
             self.pending.pop_front();
+            self.class_folded(LedgerClass::of(reason));
             if reason == SyncReason::ExtentSeal {
                 self.fold_extent(folded);
             }
@@ -1260,7 +1503,10 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// fences only the *ack* (done-prefix); the device is free to
     /// complete the frame's linked fsync before the extent's fdatasync,
     /// and a cut in that window replays a dangling reference (caught by
-    /// the `m4-tiered` DST audit, seeds 0x5eed000c/0x5eed003a).
+    /// the `m4-tiered` DST audit, seeds 0x5eed000c/0x5eed003a). A scan
+    /// of the ledger, at most `FSYNC_LEDGER_ENTRIES` entries: the extent
+    /// class's count holds unfolded entries, and a completed one behind
+    /// an earlier undone entry no longer holds the frame.
     #[must_use]
     pub fn extent_barrier_pending(&self) -> bool {
         self.pending.iter().any(|p| p.reason == SyncReason::ExtentSeal && !p.done)
@@ -1350,6 +1596,18 @@ mod tests {
         census
     }
 
+    /// Queues a frame of `len` bytes ending at `end`: the plane's
+    /// `note_frame_queued` with a lease no ring sealed.
+    fn queue(gc: &mut GroupCommit<MemFile>, end: Lsn, len: u32) -> FrameId {
+        gc.note_frame_queued(end, FrameLease::for_test(len), Nanos::ZERO)
+    }
+
+    /// Frame `id` landed: the plane's `note_frame_written`, its lease and
+    /// barrier dropped (the ledger's tests settle tickets themselves).
+    fn write(gc: &mut GroupCommit<MemFile>, id: FrameId) -> FrameBarrier {
+        gc.note_frame_written(id).barrier
+    }
+
     /// One late plain write at the front with barrier-less frames landing
     /// behind it (the `m2-mode-transition` seed `0x7a4e01cb` shape): the
     /// queue grows past `MAX_FRAMES_IN_FLIGHT` while the in-flight count
@@ -1361,17 +1619,16 @@ mod tests {
     #[test]
     fn late_front_write_fills_the_reorder_window_then_the_plan_waits() {
         let mut gc = commit();
-        let window = u32::try_from(REORDER_WINDOW_FRAMES).expect("small constant");
+        let window = REORDER_WINDOW_FRAMES;
         assert!(window > u32::from(MAX_FRAMES_IN_FLIGHT), "the window admits a full pipeline");
         let mut ids = Vec::new();
         for i in 1..=window {
             gc.note_staged(FsyncClass::Everysec);
-            assert!(!gc.reorder_window_full(), "frame {i}");
             assert_eq!(gc.frame_plan(false, false), FramePlan::Plain, "frame {i}");
-            ids.push(gc.note_frame_queued(lsn(0, i * 64), 64));
+            ids.push(queue(&mut gc, lsn(0, i * 64), 64));
             // Every frame but the first lands at once: ≤ 2 in flight.
             if i > 1 {
-                gc.note_frame_written(ids[i as usize - 1]);
+                write(&mut gc, ids[i as usize - 1]);
             }
             assert!(gc.frames_unwritten() <= 1);
             assert_eq!(gc.frames_behind_prefix(), i as usize);
@@ -1379,18 +1636,17 @@ mod tests {
         }
         // The window is full: no barrier question is asked — plain,
         // write-through-eligible, or sync-due frames all wait.
-        assert!(gc.reorder_window_full());
-        assert_eq!(gc.frame_plan(false, false), FramePlan::Wait);
+        let reorder = FramePlan::Wait(Hold::ReorderWindow);
+        assert_eq!(gc.frame_plan(false, false), reorder);
         gc.note_staged(FsyncClass::Always);
-        assert_eq!(gc.frame_plan(true, false), FramePlan::Wait);
-        assert_eq!(gc.frame_plan(true, true), FramePlan::Wait, "even ahead of a seal");
+        assert_eq!(gc.frame_plan(true, false), reorder);
+        assert_eq!(gc.frame_plan(true, true), reorder, "even ahead of a seal");
         // The front lands: the prefix jumps past every frame, the window
         // reopens, and the due barrier is planned as before.
-        gc.note_frame_written(ids[0]);
+        write(&mut gc, ids[0]);
         assert_eq!(gc.frames_behind_prefix(), 0);
         assert_eq!(gc.frames_unwritten(), 0);
         assert_eq!(gc.written_up_to, Some(lsn(0, window * 64)));
-        assert!(!gc.reorder_window_full());
         assert_eq!(gc.frame_plan(false, false), FramePlan::LinkedFsync);
     }
 
@@ -1403,20 +1659,24 @@ mod tests {
     fn everysec_due_survives_a_standalone_that_leaves_a_frame_in_flight() {
         let mut gc = commit();
         gc.note_staged(FsyncClass::Everysec);
-        let a = gc.note_frame_queued(lsn(0, 64), 64);
+        let a = queue(&mut gc, lsn(0, 64), 64);
         gc.note_staged(FsyncClass::Everysec);
-        let b = gc.note_frame_queued(lsn(0, 128), 64);
-        gc.note_frame_written(a);
+        let b = queue(&mut gc, lsn(0, 128), 64);
+        write(&mut gc, a);
         // The tick fires with B in flight: the standalone covers A only.
         gc.note_everysec_tick();
         assert!(gc.standalone_fsync_due());
         let t1 = gc.register_standalone_fsync(Nanos::ZERO);
         assert!(gc.sync_due(), "B's bytes are queued outside the coverage — the due stays");
         assert!(!gc.standalone_fsync_due(), "nothing new written: no second standalone yet");
-        assert_eq!(gc.frame_plan(false, false), FramePlan::Wait, "a next frame drains first");
+        assert_eq!(
+            gc.frame_plan(false, false),
+            FramePlan::Wait(Hold::Barrier),
+            "a next frame drains first"
+        );
         assert_eq!(gc.on_fsync_complete(t1, Nanos::ZERO), Some(lsn(0, 64)));
         // B lands: the due is still owed and now coverable.
-        gc.note_frame_written(b);
+        write(&mut gc, b);
         assert!(gc.standalone_fsync_due());
         let t2 = gc.register_standalone_fsync(Nanos::ZERO);
         assert!(!gc.sync_due(), "everything queued is inside the coverage");
@@ -1429,15 +1689,15 @@ mod tests {
     #[should_panic(expected = "full reorder window")]
     fn queueing_into_a_full_reorder_window_panics() {
         let mut gc = commit();
-        let window = u32::try_from(REORDER_WINDOW_FRAMES).expect("small constant");
+        let window = REORDER_WINDOW_FRAMES;
         let mut ids = Vec::new();
         for i in 1..=window {
-            ids.push(gc.note_frame_queued(lsn(0, i * 64), 64));
+            ids.push(queue(&mut gc, lsn(0, i * 64), 64));
             if i > 1 {
-                gc.note_frame_written(ids[i as usize - 1]);
+                write(&mut gc, ids[i as usize - 1]);
             }
         }
-        gc.note_frame_queued(lsn(0, (window + 1) * 64), 64);
+        queue(&mut gc, lsn(0, (window + 1) * 64), 64);
     }
 
     /// Completion routing is ordinal arithmetic: the window's last frame
@@ -1446,10 +1706,10 @@ mod tests {
     #[should_panic(expected = "already written")]
     fn written_for_a_popped_frame_panics() {
         let mut gc = commit();
-        let a = gc.note_frame_queued(lsn(0, 64), 64);
-        let _b = gc.note_frame_queued(lsn(0, 128), 64);
-        gc.note_frame_written(a);
-        gc.note_frame_written(a);
+        let a = queue(&mut gc, lsn(0, 64), 64);
+        let _b = queue(&mut gc, lsn(0, 128), 64);
+        write(&mut gc, a);
+        write(&mut gc, a);
     }
 
     /// `LogWritten` for the oldest frame still unwritten — the K = 1
@@ -1457,7 +1717,7 @@ mod tests {
     /// from 1, so the oldest unwritten one is derivable from the counters.
     fn write_oldest(gc: &mut GroupCommit<MemFile>) {
         let oldest = gc.stats().frames_queued - gc.frames_unwritten() as u64 + 1;
-        gc.note_frame_written(FrameId(oldest));
+        write(gc, FrameId(oldest));
     }
 
     #[test]
@@ -1468,7 +1728,7 @@ mod tests {
         assert!(!gc.frame_fsync_due(), "everysec records ride the timer, not per-frame syncs");
         gc.note_staged(FsyncClass::Always);
         assert!(gc.frame_fsync_due());
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         gc.register_linked_fsync(Nanos::ZERO);
         assert!(!gc.frame_fsync_due(), "one linked sync covers everything due this iteration");
     }
@@ -1478,11 +1738,11 @@ mod tests {
         // Two linked syncs in flight: the measured bound-2 arm (at bound 1
         // the second registration is refused — batch 43).
         let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2, &census());
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         let t1 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         gc.note_staged(FsyncClass::Always);
-        gc.note_frame_queued(lsn(0, 200), 100);
+        queue(&mut gc, lsn(0, 200), 100);
         let t2 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         assert_eq!(gc.watermark(), None);
@@ -1506,7 +1766,7 @@ mod tests {
         // (a multi-second throttled write ahead of a millisecond sync).
         let mut gc = commit();
         gc.note_staged(FsyncClass::Always);
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         let t = gc.register_linked_fsync(Nanos::ZERO);
         // The covering write stalls 5 s in writeback throttling, then
         // completes; the device services the sync itself in 2 ms.
@@ -1524,7 +1784,7 @@ mod tests {
         // sync before the rebasing call lands — the rebase must no-op.
         let mut gc = commit();
         gc.note_staged(FsyncClass::Always);
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         let t = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         gc.on_fsync_complete(t, Nanos::from_millis(3));
@@ -1546,9 +1806,9 @@ mod tests {
         assert!(gc.sync_due(), "the staged record's due survives the tick");
         assert!(!gc.standalone_fsync_due(), "nothing written: the frame carries it");
         assert_eq!(gc.frame_plan(false, false), FramePlan::LinkedFsync);
-        let a = gc.note_frame_queued(lsn(0, 64), 64);
+        let a = queue(&mut gc, lsn(0, 64), 64);
         let t = gc.register_linked_fsync(Nanos::ZERO);
-        gc.note_frame_written(a);
+        write(&mut gc, a);
         assert_eq!(gc.on_fsync_complete(t, Nanos::ZERO), Some(lsn(0, 64)));
         // The seal drained the builder: a clean tick is idle again.
         gc.note_everysec_tick();
@@ -1563,7 +1823,7 @@ mod tests {
         assert!(!gc.standalone_fsync_due(), "nothing dirty: idle tick");
         assert_eq!(gc.stats().idle_ticks, 1);
 
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         write_oldest(&mut gc);
         gc.note_everysec_tick();
         assert!(gc.standalone_fsync_due());
@@ -1579,10 +1839,10 @@ mod tests {
     #[test]
     fn standalone_covers_written_not_queued() {
         let mut gc = commit();
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         write_oldest(&mut gc);
         // A second frame is queued but its write has not completed.
-        gc.note_frame_queued(lsn(0, 220), 120);
+        queue(&mut gc, lsn(0, 220), 120);
         gc.note_everysec_tick();
         assert!(gc.standalone_fsync_due());
         let t = gc.register_standalone_fsync(Nanos::ZERO);
@@ -1598,17 +1858,17 @@ mod tests {
         // queue). Completions drain in done-prefix order as ever.
         let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2, &census());
         gc.note_staged(FsyncClass::Always);
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         let t1 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         gc.note_staged(FsyncClass::Always);
         assert!(gc.frame_fsync_due(), "second slot free at bound 2");
-        gc.note_frame_queued(lsn(0, 200), 100);
+        queue(&mut gc, lsn(0, 200), 100);
         let t2 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         gc.note_staged(FsyncClass::Always);
         assert!(!gc.frame_fsync_due(), "third due accumulates — bounded at 2");
-        gc.note_frame_queued(lsn(0, 300), 100);
+        queue(&mut gc, lsn(0, 300), 100);
         write_oldest(&mut gc);
         assert_eq!(gc.on_fsync_complete(t1, Nanos::from_micros(10)), Some(lsn(0, 100)));
         assert!(gc.frame_fsync_due(), "slot freed at completion");
@@ -1623,24 +1883,24 @@ mod tests {
         // fully discharges the always due (every owed record written).
         let mut gc1 = commit();
         gc1.note_staged(FsyncClass::Always);
-        gc1.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc1, lsn(0, 100), 100);
         let t = gc1.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc1);
         gc1.note_staged(FsyncClass::Always);
-        gc1.note_frame_queued(lsn(0, 200), 100);
+        queue(&mut gc1, lsn(0, 200), 100);
         write_oldest(&mut gc1);
         gc1.on_fsync_complete(t, Nanos::from_micros(10));
         assert!(!gc1.completion_fsync_due(), "bound 1 never completion-issues");
 
         let mut gc2: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2, &census());
         gc2.note_staged(FsyncClass::Always);
-        gc2.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc2, lsn(0, 100), 100);
         let t1 = gc2.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc2);
         // Dues accumulate while the pipeline is at 1-in-flight; the frame
         // carrying them is written, so the due is fully dischargeable.
         gc2.note_staged(FsyncClass::Always);
-        gc2.note_frame_queued(lsn(0, 200), 100);
+        queue(&mut gc2, lsn(0, 200), 100);
         write_oldest(&mut gc2);
         assert!(!gc2.completion_fsync_due(), "linked slot reserved while one is in flight");
         gc2.on_fsync_complete(t1, Nanos::from_micros(10));
@@ -1669,7 +1929,7 @@ mod tests {
         assert!(!gc.frame_fsync_due(), "barriers count as in-flight syncs");
 
         gc.note_staged(FsyncClass::Always);
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         write_oldest(&mut gc);
         gc.note_everysec_tick();
         assert!(!gc.standalone_fsync_due(), "dues accumulate behind the barriers");
@@ -1689,7 +1949,7 @@ mod tests {
         // watermark past unfsynced frames — its covers is the boot floor.
         let mut gc = commit();
         let b = gc.register_boot_barrier(lsn(0, 0), None, Nanos::ZERO);
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         write_oldest(&mut gc);
         gc.note_everysec_tick();
         assert!(!gc.standalone_fsync_due(), "barrier in flight: due accumulates");
@@ -1707,7 +1967,7 @@ mod tests {
         fs.create_dir_all(std::path::Path::new("log")).expect("mem dir");
         let mut gc = commit();
         let dir = fs.open_dir(std::path::Path::new("log")).expect("mem dir handle");
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         let t1 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         let p = gc.register_prealloc_barrier(dir, Nanos::ZERO);
@@ -1722,7 +1982,7 @@ mod tests {
         let dir2 = fs.open_dir(std::path::Path::new("log")).expect("mem dir handle");
         let p2 = gc.register_prealloc_barrier(dir2, Nanos::ZERO);
         gc.note_staged(FsyncClass::Always);
-        gc.note_frame_queued(lsn(1, 80), 80);
+        queue(&mut gc, lsn(1, 80), 80);
         assert!(!gc.frame_fsync_due(), "barrier counts as in-flight");
         write_oldest(&mut gc);
         gc.note_everysec_tick();
@@ -1744,7 +2004,7 @@ mod tests {
         let mut gc = commit();
         gc.note_staged(FsyncClass::Always);
         assert!(gc.frame_fsync_due());
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         let t1 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
 
@@ -1754,7 +2014,7 @@ mod tests {
             gc.note_staged(FsyncClass::Always);
             assert!(!gc.frame_fsync_due(), "no second sync while one is in flight");
             assert_eq!(gc.frame_plan(false, false), FramePlan::Plain, "the frame still flows");
-            gc.note_frame_queued(lsn(0, 100 + i * 100), 100);
+            queue(&mut gc, lsn(0, 100 + i * 100), 100);
             assert!(!gc.standalone_fsync_due(), "no standalone either");
             write_oldest(&mut gc);
         }
@@ -1763,7 +2023,7 @@ mod tests {
         // accumulated frames in one fdatasync — the batch.
         gc.on_fsync_complete(t1, Nanos::from_micros(5_000));
         assert!(gc.frame_fsync_due(), "deferred due issues at completion");
-        gc.note_frame_queued(lsn(0, 1200), 100);
+        queue(&mut gc, lsn(0, 1200), 100);
         let t2 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         assert_eq!(
@@ -1788,7 +2048,7 @@ mod tests {
         assert!(!gc.frame_fsync_due(), "the FLUSH class is bounded behind the barrier");
         assert!(gc.write_through_due(), "the write-through class is not");
         assert_eq!(gc.frame_plan(true, false), FramePlan::WriteThrough);
-        gc.note_frame_queued(lsn(0, 4096), 4096);
+        queue(&mut gc, lsn(0, 4096), 4096);
         let t = gc.register_write_through(Nanos::ZERO);
         assert_eq!(gc.stats().fsyncs_write_through, 1);
         assert!(!gc.frame_fsync_due(), "the due is discharged");
@@ -1814,7 +2074,7 @@ mod tests {
         fs.create_dir_all(std::path::Path::new("log")).expect("mem dir");
         // The active segment's last frame, durable.
         gc.note_staged(FsyncClass::Always);
-        gc.note_frame_queued(lsn(2, 4096), 4096);
+        queue(&mut gc, lsn(2, 4096), 4096);
         let t0 = gc.register_write_through(Nanos::ZERO);
         write_oldest(&mut gc);
         assert_eq!(gc.on_fsync_complete(t0, Nanos::from_micros(300)), Some(lsn(2, 4096)));
@@ -1824,7 +2084,7 @@ mod tests {
         // LOG: rotation onto seg-3, its first frame write-through.
         gc.note_staged(FsyncClass::Always);
         assert_eq!(gc.frame_plan(true, false), FramePlan::WriteThrough);
-        gc.note_frame_queued(lsn(3, 4096), 4096);
+        queue(&mut gc, lsn(3, 4096), 4096);
         let t1 = gc.register_write_through(Nanos::ZERO);
         write_oldest(&mut gc);
         // The FUA frame lands before the directory barrier: no ack.
@@ -1844,7 +2104,7 @@ mod tests {
         // ticket outstanding, a standalone everysec sync may still issue.
         let mut gc = commit();
         gc.note_staged(FsyncClass::Always);
-        gc.note_frame_queued(lsn(0, 4096), 4096);
+        queue(&mut gc, lsn(0, 4096), 4096);
         let t = gc.register_write_through(Nanos::ZERO);
         assert_eq!(gc.write_through_in_flight(), 1);
         write_oldest(&mut gc);
@@ -1865,33 +2125,33 @@ mod tests {
         let mut gc = commit();
         gc.note_staged(FsyncClass::Everysec);
         assert!(!gc.write_through_due(), "no sync due");
-        gc.note_frame_queued(lsn(0, 4096), 4096);
+        queue(&mut gc, lsn(0, 4096), 4096);
         write_oldest(&mut gc);
         gc.note_staged(FsyncClass::Always);
         assert!(!gc.write_through_due(), "un-covered bytes below the frame: FLUSH class");
         assert!(gc.frame_fsync_due());
         assert_eq!(gc.frame_plan(true, false), FramePlan::LinkedFsync);
-        gc.note_frame_queued(lsn(0, 8192), 4096);
+        queue(&mut gc, lsn(0, 8192), 4096);
         let t = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         assert_eq!(gc.on_fsync_complete(t, Nanos::from_micros(900)), Some(lsn(0, 8192)));
         // Durable prefix restored: the next always frame is write-through.
         gc.note_staged(FsyncClass::Always);
         assert!(gc.write_through_due());
-        gc.note_frame_queued(lsn(0, 12288), 4096);
+        queue(&mut gc, lsn(0, 12288), 4096);
         let w = gc.register_write_through(Nanos::ZERO);
         write_oldest(&mut gc);
         assert_eq!(gc.on_fsync_complete(w, Nanos::from_micros(300)), Some(lsn(0, 12288)));
         // A pending FLUSH entry covering the gap also satisfies the rule.
         gc.note_staged(FsyncClass::Everysec);
-        gc.note_frame_queued(lsn(0, 16384), 4096);
+        queue(&mut gc, lsn(0, 16384), 4096);
         write_oldest(&mut gc);
         gc.note_everysec_tick();
         assert!(gc.standalone_fsync_due());
         let s = gc.register_standalone_fsync(Nanos::ZERO);
         gc.note_staged(FsyncClass::Always);
         assert!(gc.write_through_due(), "the standalone in flight covers the gap");
-        gc.note_frame_queued(lsn(0, 20480), 4096);
+        queue(&mut gc, lsn(0, 20480), 4096);
         let w2 = gc.register_write_through(Nanos::ZERO);
         write_oldest(&mut gc);
         assert_eq!(gc.on_fsync_complete(w2, Nanos::from_micros(300)), None, "prefix holds");
@@ -1911,21 +2171,21 @@ mod tests {
         for i in 1..=3u32 {
             gc.note_staged(FsyncClass::Always);
             assert_eq!(gc.frame_plan(true, false), FramePlan::WriteThrough, "frame {i}");
-            ids.push(gc.note_frame_queued(lsn(0, i * 4096), 4096));
+            ids.push(queue(&mut gc, lsn(0, i * 4096), 4096));
             tickets.push(gc.register_write_through(Nanos::ZERO));
         }
         assert_eq!(gc.write_through_in_flight(), 3);
         assert_eq!(gc.frames_unwritten(), 3);
         // Frame 3 lands first: written prefix and watermark stay put.
-        gc.note_frame_written(ids[2]);
+        write(&mut gc, ids[2]);
         assert_eq!(gc.on_fsync_complete(tickets[2], Nanos::from_micros(300)), None);
         assert_eq!(gc.watermark(), None);
         assert!(!gc.drained());
         // Frame 1 lands: the prefix advances to frame 1's end only.
-        gc.note_frame_written(ids[0]);
+        write(&mut gc, ids[0]);
         assert_eq!(gc.on_fsync_complete(tickets[0], Nanos::from_micros(310)), Some(lsn(0, 4096)));
         // Frame 2 lands: the done prefix runs through frame 3.
-        gc.note_frame_written(ids[1]);
+        write(&mut gc, ids[1]);
         assert_eq!(gc.on_fsync_complete(tickets[1], Nanos::from_micros(320)), Some(lsn(0, 12288)));
         assert!(gc.drained());
         assert_eq!(gc.stats().fsyncs_write_through, 3, "K frames, K barriers");
@@ -1944,26 +2204,26 @@ mod tests {
         // The wedged front: a coverage-neutral dir barrier that never lands.
         let dir = fs.open_dir(std::path::Path::new("log")).expect("mem dir handle");
         let wedge = gc.register_prealloc_barrier(dir, Nanos::ZERO);
-        let window = u32::try_from(WRITE_THROUGH_WINDOW_ENTRIES).expect("small constant");
+        let window = WRITE_THROUGH_WINDOW_ENTRIES;
         let mut tickets = Vec::new();
         for i in 1..=window {
             gc.note_staged(FsyncClass::Always);
             assert_eq!(gc.frame_plan(true, false), FramePlan::WriteThrough, "frame {i}");
-            gc.note_frame_queued(lsn(0, i * 4096), 4096);
+            queue(&mut gc, lsn(0, i * 4096), 4096);
             tickets.push(gc.register_write_through(Nanos::ZERO));
             write_oldest(&mut gc);
             assert_eq!(gc.on_fsync_complete(tickets[i as usize - 1], Nanos::from_micros(40)), None);
         }
-        assert!(gc.write_through_window_full());
-        assert_eq!(gc.write_through_entries(), WRITE_THROUGH_WINDOW_ENTRIES);
+        assert!(!gc.class_has_room(LedgerClass::WriteThrough));
+        assert_eq!(gc.write_through_entries(), WRITE_THROUGH_WINDOW_ENTRIES as usize);
         // The window is full: due frames flow plain, the ledger stays bounded.
         for i in window + 1..=3 * window {
             gc.note_staged(FsyncClass::Always);
             assert_eq!(gc.frame_plan(true, false), FramePlan::Plain, "frame {i}");
-            gc.note_frame_queued(lsn(0, i * 4096), 4096);
+            queue(&mut gc, lsn(0, i * 4096), 4096);
             write_oldest(&mut gc);
             assert!(gc.sync_due(), "the due accumulates behind the front");
-            assert_eq!(gc.pending_entries(), WRITE_THROUGH_WINDOW_ENTRIES + 1);
+            assert_eq!(gc.pending_entries(), WRITE_THROUGH_WINDOW_ENTRIES as usize + 1);
         }
         // The front folds: the prefix runs through every ticket, the
         // window reopens, and the uncovered plain frames take a linked
@@ -1972,7 +2232,7 @@ mod tests {
         assert_eq!(gc.write_through_entries(), 0);
         assert!(!gc.write_through_due(), "plain frames below: FLUSH class covers the gap");
         assert_eq!(gc.frame_plan(true, false), FramePlan::LinkedFsync);
-        gc.note_frame_queued(lsn(0, (3 * window + 1) * 4096), 4096);
+        queue(&mut gc, lsn(0, (3 * window + 1) * 4096), 4096);
         let t = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         assert_eq!(
@@ -1982,19 +2242,20 @@ mod tests {
         assert!(gc.drained());
     }
 
-    /// Registering past the window is a plane bug, release-asserted.
+    /// Registering past the write-through class's budget is a plan that
+    /// skipped its check: the class assertion stops it.
     #[test]
-    #[should_panic(expected = "full window")]
+    #[should_panic(expected = "a ledger class past its budget")]
     fn write_through_into_a_full_window_panics() {
         let fs = crate::fs::mem::MemFs::new();
         fs.create_dir_all(std::path::Path::new("log")).expect("mem dir");
         let mut gc = commit();
         let dir = fs.open_dir(std::path::Path::new("log")).expect("mem dir handle");
         let _wedge = gc.register_prealloc_barrier(dir, Nanos::ZERO);
-        let window = u32::try_from(WRITE_THROUGH_WINDOW_ENTRIES).expect("small constant");
+        let window = WRITE_THROUGH_WINDOW_ENTRIES;
         for i in 1..=window + 1 {
             gc.note_staged(FsyncClass::Always);
-            gc.note_frame_queued(lsn(0, i * 4096), 4096);
+            queue(&mut gc, lsn(0, i * 4096), 4096);
             let t = gc.register_write_through(Nanos::ZERO);
             write_oldest(&mut gc);
             gc.on_fsync_complete(t, Nanos::from_micros(40));
@@ -2006,14 +2267,14 @@ mod tests {
         // ADR-0087 D2: `written_up_to` is what an fdatasync can cover —
         // the longest run of queued frames whose writes have completed.
         let mut gc = commit();
-        let a = gc.note_frame_queued(lsn(0, 100), 100);
-        let b = gc.note_frame_queued(lsn(0, 250), 150);
-        let c = gc.note_frame_queued(lsn(0, 300), 50);
-        gc.note_frame_written(c);
-        gc.note_frame_written(b);
+        let a = queue(&mut gc, lsn(0, 100), 100);
+        let b = queue(&mut gc, lsn(0, 250), 150);
+        let c = queue(&mut gc, lsn(0, 300), 50);
+        write(&mut gc, c);
+        write(&mut gc, b);
         gc.note_everysec_tick();
         assert!(!gc.standalone_fsync_due(), "nothing is written as a prefix yet");
-        gc.note_frame_written(a);
+        write(&mut gc, a);
         assert!(gc.standalone_fsync_due());
         let t = gc.register_standalone_fsync(Nanos::ZERO);
         assert_eq!(gc.on_fsync_complete(t, Nanos::from_micros(900)), Some(lsn(0, 300)));
@@ -2029,13 +2290,17 @@ mod tests {
         let mut gc = commit();
         gc.note_staged(FsyncClass::Everysec);
         assert_eq!(gc.frame_plan(false, false), FramePlan::Plain);
-        let plain = gc.note_frame_queued(lsn(0, 4096), 4096);
+        let plain = queue(&mut gc, lsn(0, 4096), 4096);
         gc.note_staged(FsyncClass::Always);
-        assert_eq!(gc.frame_plan(false, false), FramePlan::Wait, "plain frame in flight below");
+        assert_eq!(
+            gc.frame_plan(false, false),
+            FramePlan::Wait(Hold::Barrier),
+            "plain frame in flight below"
+        );
         assert!(!gc.frame_fsync_due());
-        gc.note_frame_written(plain);
+        write(&mut gc, plain);
         assert_eq!(gc.frame_plan(false, false), FramePlan::LinkedFsync, "drained: link");
-        gc.note_frame_queued(lsn(0, 8192), 4096);
+        queue(&mut gc, lsn(0, 8192), 4096);
         let t = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         assert_eq!(gc.on_fsync_complete(t, Nanos::from_micros(900)), Some(lsn(0, 8192)));
@@ -2049,11 +2314,15 @@ mod tests {
         // the seal fdatasync registered ahead of it covers them.
         let mut gc = commit();
         gc.note_staged(FsyncClass::Everysec);
-        let plain = gc.note_frame_queued(lsn(0, 4096), 4096);
+        let plain = queue(&mut gc, lsn(0, 4096), 4096);
         gc.note_staged(FsyncClass::Always);
-        assert_eq!(gc.frame_plan(true, false), FramePlan::Wait, "prefix broken, not drained");
+        assert_eq!(
+            gc.frame_plan(true, false),
+            FramePlan::Wait(Hold::Barrier),
+            "prefix broken, not drained"
+        );
         assert_eq!(gc.frame_plan(true, true), FramePlan::WriteThrough, "a seal ahead covers it");
-        gc.note_frame_written(plain);
+        write(&mut gc, plain);
         assert_eq!(gc.frame_plan(true, false), FramePlan::LinkedFsync, "drained, prefix broken");
     }
 
@@ -2064,8 +2333,8 @@ mod tests {
         // seals plain and its due accumulates behind the seal (§8.2),
         // never a second FLUSH-class barrier in the same iteration.
         let mut gc = commit();
-        let a = gc.note_frame_queued(lsn(0, 4096), 4096);
-        gc.note_frame_written(a);
+        let a = queue(&mut gc, lsn(0, 4096), 4096);
+        write(&mut gc, a);
         gc.note_everysec_tick();
         let t = gc.register_standalone_fsync(Nanos::ZERO);
         assert_eq!(gc.on_fsync_complete(t, Nanos::from_micros(500)), Some(lsn(0, 4096)));
@@ -2091,15 +2360,15 @@ mod tests {
         // The registration asserts what `frame_plan` decided: a linked
         // sync registered behind a seal at bound 1 is the F-L01-05 shape.
         let mut gc = commit();
-        let a = gc.note_frame_queued(lsn(0, 4096), 4096);
-        gc.note_frame_written(a);
+        let a = queue(&mut gc, lsn(0, 4096), 4096);
+        write(&mut gc, a);
         gc.note_staged(FsyncClass::Always);
         let fs = crate::fs::mem::MemFs::new();
         fs.create_dir_all(std::path::Path::new("log")).expect("mem dir");
         let file = fs.open_dir(std::path::Path::new("log")).expect("mem handle");
         let handoff = crate::segment::SealHandoff::for_test(SegmentId(0), file, 4096);
         let _seal = gc.register_seal_fsync(handoff, Nanos::ZERO);
-        gc.note_frame_queued(lsn(1, 512), 512);
+        queue(&mut gc, lsn(1, 512), 512);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             gc.register_linked_fsync(Nanos::ZERO);
         }));
@@ -2226,7 +2495,7 @@ mod tests {
         // ADR-0086 D4: the zero-fill fdatasync enters at the coverage tail
         // and fences later data syncs without advancing anything itself.
         let mut gc = commit();
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         let t1 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         let z = gc.register_zero_fill_barrier(Nanos::ZERO);
@@ -2239,16 +2508,194 @@ mod tests {
     #[test]
     fn failed_fsync_freezes_the_watermark() {
         let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2, &census());
-        gc.note_frame_queued(lsn(0, 100), 100);
+        queue(&mut gc, lsn(0, 100), 100);
         let t1 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         gc.note_staged(FsyncClass::Always);
-        gc.note_frame_queued(lsn(0, 200), 100);
+        queue(&mut gc, lsn(0, 200), 100);
         let t2 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
         assert_eq!(gc.on_fsync_error(t1), SyncReason::Linked);
         // t2 completing can never advance past the failed t1.
         assert_eq!(gc.on_fsync_complete(t2, Nanos::ZERO), None);
         assert_eq!(gc.watermark(), None);
+    }
+
+    /// A directory handle for a barrier the tests register by hand.
+    fn dir_handle(fs: &crate::fs::mem::MemFs) -> MemFile {
+        fs.create_dir_all(std::path::Path::new("log")).expect("mem dir");
+        fs.open_dir(std::path::Path::new("log")).expect("mem handle")
+    }
+
+    /// The rotation class registers one seal at a time: while a seal is
+    /// unfolded the frame that needs the next rotation holds, whatever
+    /// barrier it would carry, and a frame that does not rotate is planned
+    /// as before. The seal's fold reopens the rotation.
+    #[test]
+    fn a_rotation_holds_until_the_previous_seal_folds() {
+        let fs = crate::fs::mem::MemFs::new();
+        let mut gc = commit();
+        let a = queue(&mut gc, lsn(0, 4096), 4096);
+        write(&mut gc, a);
+        let handoff = SealHandoff::for_test(SegmentId(0), dir_handle(&fs), 4096);
+        let seal = gc.register_seal_fsync(handoff, Nanos::ZERO);
+        assert_eq!(gc.class_unfolded(LedgerClass::Seal), 1);
+        let held = FramePlan::Wait(Hold::SealUnfolded);
+        assert_eq!(gc.frame_plan(false, true), held, "no due: the rotation still holds");
+        gc.note_staged(FsyncClass::Always);
+        assert_eq!(gc.frame_plan(true, true), held, "write-through cannot carry it past");
+        assert_eq!(gc.frame_plan(false, true), held);
+        assert_eq!(gc.frame_plan(true, false), FramePlan::WriteThrough, "no rotation, no hold");
+        assert_eq!(gc.frame_plan(false, false), FramePlan::Plain, "the seal takes the slot");
+        // The seal completes and folds: its class is empty, the rotation goes.
+        assert_eq!(gc.on_fsync_complete(seal, Nanos::from_micros(500)), Some(lsn(0, 4096)));
+        assert_eq!(gc.class_unfolded(LedgerClass::Seal), 0);
+        assert_eq!(gc.frame_plan(true, true), FramePlan::WriteThrough);
+        assert_eq!(gc.frame_plan(false, true), FramePlan::Plain, "the new seal takes the slot");
+    }
+
+    /// A seal that completes behind an undone earlier entry is unfolded:
+    /// the rotation waits for the fold, never for the completion alone.
+    #[test]
+    fn a_completed_seal_behind_an_undone_entry_still_holds_the_rotation() {
+        let fs = crate::fs::mem::MemFs::new();
+        let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2, &census());
+        let front = gc.register_prealloc_barrier(dir_handle(&fs), Nanos::ZERO);
+        let handoff = SealHandoff::for_test(SegmentId(0), dir_handle(&fs), 0);
+        let seal = gc.register_seal_fsync(handoff, Nanos::ZERO);
+        assert_eq!(gc.on_fsync_complete(seal, Nanos::ZERO), None, "behind the prealloc");
+        assert_eq!(gc.frame_plan(false, true), FramePlan::Wait(Hold::SealUnfolded));
+        assert_eq!(gc.on_fsync_complete(front, Nanos::ZERO), Some(lsn(0, 0)));
+        assert_ne!(gc.frame_plan(false, true), FramePlan::Wait(Hold::SealUnfolded));
+    }
+
+    /// A seal registered while another is unfolded is a plan that skipped
+    /// its check: the class assertion stops it before the entry exists.
+    #[test]
+    #[should_panic(expected = "a ledger class past its budget")]
+    fn a_seal_registered_past_its_class_budget_panics() {
+        let fs = crate::fs::mem::MemFs::new();
+        let mut gc = commit();
+        let first = SealHandoff::for_test(SegmentId(0), dir_handle(&fs), 0);
+        let _seal = gc.register_seal_fsync(first, Nanos::ZERO);
+        let second = SealHandoff::for_test(SegmentId(1), dir_handle(&fs), 0);
+        let _past = gc.register_seal_fsync(second, Nanos::ZERO);
+    }
+
+    /// Every class at its budget at once, through the registrations the
+    /// plane makes, behind one undone boot barrier at a FLUSH bound of 2:
+    /// 5 boot, 1 seal, 2 prealloc, 2 zero-fill, 16 extent, 16
+    /// write-through and 2 discretionary entries, 44 in all — the ledger's
+    /// cap, which then admits no more. The discretionary edge: the first
+    /// and second linked syncs are planned, the third is refused (`Plain`,
+    /// and no standalone is due).
+    #[test]
+    fn every_class_fills_to_its_budget_and_the_ledger_holds_them_all() {
+        let fs = crate::fs::mem::MemFs::new();
+        let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2, &census());
+        let floor = lsn(0, 0);
+        let front = gc.register_boot_barrier(floor, Some(dir_handle(&fs)), Nanos::ZERO);
+        for _ in 1..LEDGER_BOOT_ENTRIES {
+            let boot = gc.register_boot_barrier(floor, Some(dir_handle(&fs)), Nanos::ZERO);
+            assert_eq!(gc.on_fsync_complete(boot, Nanos::ZERO), None, "behind the front");
+        }
+        let handoff = SealHandoff::for_test(SegmentId(0), dir_handle(&fs), 0);
+        let seal = gc.register_seal_fsync(handoff, Nanos::ZERO);
+        assert_eq!(gc.on_fsync_complete(seal, Nanos::ZERO), None);
+        for _ in 0..LEDGER_PREALLOC_ENTRIES {
+            let prealloc = gc.register_prealloc_barrier(dir_handle(&fs), Nanos::ZERO);
+            assert_eq!(gc.on_fsync_complete(prealloc, Nanos::ZERO), None);
+        }
+        for _ in 0..LEDGER_ZERO_FILL_ENTRIES {
+            let zero_fill = gc.register_zero_fill_barrier(Nanos::ZERO);
+            assert_eq!(gc.on_fsync_complete(zero_fill, Nanos::ZERO), None);
+        }
+        for _ in 0..EXTENT_SEAL_WINDOW_ENTRIES {
+            let mut ran = false;
+            let ExtentRegistration::Registered(extent, ()) = register(&mut gc, &fs, &mut ran)
+            else {
+                panic!("the extent window refused below its cap");
+            };
+            assert_eq!(gc.on_fsync_complete(extent, Nanos::ZERO), None);
+        }
+        gc.issue_extent_syncs(|_| {});
+        let mut end = 0;
+        for _ in 0..WRITE_THROUGH_WINDOW_ENTRIES {
+            gc.note_staged(FsyncClass::Always);
+            assert_eq!(gc.frame_plan(true, false), FramePlan::WriteThrough);
+            end += 4096;
+            let id = queue(&mut gc, lsn(0, end), 4096);
+            let ticket = gc.register_write_through(Nanos::ZERO);
+            assert_eq!(write(&mut gc, id), FrameBarrier::WriteThrough(ticket));
+            assert_eq!(gc.on_fsync_complete(ticket, Nanos::ZERO), None);
+        }
+        for linked in 1..=LEDGER_DISCRETIONARY_ENTRIES {
+            gc.note_staged(FsyncClass::Always);
+            assert_eq!(gc.frame_plan(false, false), FramePlan::LinkedFsync, "linked {linked}");
+            end += 4096;
+            let id = queue(&mut gc, lsn(0, end), 4096);
+            let ticket = gc.register_linked_fsync(Nanos::ZERO);
+            assert_eq!(write(&mut gc, id), FrameBarrier::Linked(ticket));
+            assert_eq!(gc.on_fsync_complete(ticket, Nanos::ZERO), None);
+        }
+        for class in LedgerClass::ALL {
+            assert_eq!(gc.class_unfolded(class), class.budget(), "{class:?} at its budget");
+        }
+        assert_eq!(gc.pending_entries(), FSYNC_LEDGER_ENTRIES as usize);
+        // The third discretionary barrier is refused: the due accumulates.
+        gc.note_staged(FsyncClass::Always);
+        assert_eq!(gc.frame_plan(false, false), FramePlan::Plain, "the third linked sync");
+        assert!(!gc.standalone_fsync_due(), "nor a standalone");
+        assert!(!matches!(gc.pending.reserve(), Reserved::Slot(_)), "the ledger holds its cap");
+        // The front folds: every class empties at once.
+        assert!(gc.on_fsync_complete(front, Nanos::ZERO).is_some());
+        assert_eq!(gc.pending_entries(), 0);
+        for class in LedgerClass::ALL {
+            assert_eq!(gc.class_unfolded(class), 0, "{class:?} folded");
+        }
+    }
+
+    /// The ledger's cap admits the classes' budgets together: a holder of
+    /// its `Cap` takes the 43rd and the 44th entry (the budgets' sum, every
+    /// class at its budget) and refuses the 45th. Under the cap-minus-one
+    /// plant it refuses the 44th, by this test's own token.
+    #[test]
+    fn the_ledger_cap_admits_every_class_at_its_budget() {
+        let plans: u32 = LedgerClass::ALL.iter().map(|class| class.budget()).sum();
+        assert_eq!(plans, FSYNC_LEDGER_ENTRIES);
+        let census = census();
+        let mut ledger = CappedDeque::<u8, Reserve>::new(FSYNC_LEDGER, &census).expect("built");
+        for entry in 1..=plans {
+            let Reserved::Slot(slot) = ledger.reserve() else {
+                panic!(
+                    "ledger-edge-short: the ledger refused entry {entry} of the budgets' {plans}"
+                );
+            };
+            slot.publish(0);
+        }
+        assert!(matches!(ledger.reserve(), Reserved::Full), "the 45th entry is refused");
+    }
+
+    /// Every reason has a class in `ALL`, and the classes' order is the
+    /// counted slots' (the extent class alone has none).
+    #[test]
+    fn every_reason_maps_to_one_listed_class() {
+        let reasons = [
+            SyncReason::Linked,
+            SyncReason::Seal,
+            SyncReason::Standalone,
+            SyncReason::Completion,
+            SyncReason::BootBarrier,
+            SyncReason::PreallocBarrier,
+            SyncReason::ExtentSeal,
+            SyncReason::WriteThrough,
+            SyncReason::ZeroFill,
+        ];
+        for reason in reasons {
+            assert!(LedgerClass::ALL.contains(&LedgerClass::of(reason)), "{reason:?}");
+        }
+        let counted: Vec<usize> =
+            LedgerClass::ALL.iter().filter_map(|class| class.counted()).collect();
+        assert_eq!(counted, (0..COUNTED_CLASSES).collect::<Vec<_>>());
     }
 }

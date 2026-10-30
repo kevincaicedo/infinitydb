@@ -2,7 +2,82 @@
 
 use inf_foundation::bounded::{Cap, CapFill};
 
+use crate::staging::MAX_FRAMES_IN_FLIGHT;
 use crate::tier::{ROUND_OPS_MAX, TIER_BATCH_FRAMES, TIER_BATCH_PAYLOAD_BYTES, TIER_FRAME_BYTES};
+
+/// Frames one cell's completion ledger holds behind its written prefix: the
+/// unwritten ones plus those that landed ahead of an earlier one still in
+/// flight (ADR-0087 D2). Twice the ring's in-flight cap, so one late write
+/// with a full pipeline landing behind it, twice over, reorders without a
+/// hold. Fixed, independent of the configured pipeline depth, so the queue's
+/// memory is a constant. Owner: the cell's `GroupCommit`, one frame queue
+/// built with it. Crossing: pacing — the LOG step's plan asks the queue's
+/// own admission and holds the next frame while it is full (≤ one write
+/// latency), and staging admission parks writers behind the held frame.
+pub const REORDER_WINDOW_FRAMES: u32 = 2 * MAX_FRAMES_IN_FLIGHT as u32;
+
+/// The frame queue's cap: `REORDER_WINDOW_FRAMES` frames under the census
+/// name `frame-queue`, filled while the cell serves.
+pub const FRAME_QUEUE: Cap = Cap::entries::<REORDER_WINDOW_FRAMES>("frame-queue", CapFill::Serving);
+
+/// Write-through tickets one cell's fsync ledger holds unfolded: the ledger's
+/// write-through class (ADR-0087 D2). Behind a wedged FLUSH-class front entry
+/// every write-through frame still completes at its write and its ticket
+/// waits for the front's fold, one per frame. Owner: the ledger's
+/// write-through class count. Crossing: at the budget the plan answers
+/// `Plain` — the due accumulates and the first barrier after the front
+/// covers it; its acks waited for the front anyway.
+pub const WRITE_THROUGH_WINDOW_ENTRIES: u32 = REORDER_WINDOW_FRAMES;
+
+/// Directory handles one cell's boot barriers hold: the log, checkpoint and
+/// shard directories and the shard's parent (when it exists), each fsynced
+/// through the driver as a boot barrier. Owner: `BootDirs`, whose fields are
+/// these handles, so a fifth cannot be built. Crossing: none — a type.
+pub const BOOT_DIRS_MAX: u32 = 4;
+
+/// The fsync ledger's boot class: the boot directories' barriers and the
+/// fresh segment's, registered before the first frame. Owner: `BootDirs`.
+/// Crossing: none — the type holds at most `BOOT_DIRS_MAX` handles.
+pub const LEDGER_BOOT_ENTRIES: u32 = BOOT_DIRS_MAX + 1;
+
+/// The ledger's rotation class, its seal: a rotation registers its seal only
+/// once the previous seal has folded. Owner: the ledger's plan. Crossing:
+/// pacing — the frame that needs the rotation holds until the previous seal
+/// folds (`FramePlan::Wait(Hold::SealUnfolded)`); its writers park on
+/// staging.
+pub const LEDGER_SEAL_ENTRIES: u32 = 1;
+
+/// The ledger's rotation class, its prealloc barriers: one per next segment
+/// created, at most the two generations after an unfolded seal. Owner: the
+/// LOG plane's MAINTAIN, which asks the class before it creates the file.
+/// Crossing: pacing — the prealloc skips the tick (counted, derived never to
+/// occur).
+pub const LEDGER_PREALLOC_ENTRIES: u32 = 2;
+
+/// The ledger's rotation class, its zero-fill barriers: one per pre-zeroed
+/// next segment, at most the two generations after an unfolded seal. Owner
+/// and crossing as the prealloc barriers'.
+pub const LEDGER_ZERO_FILL_ENTRIES: u32 = 2;
+
+/// The ledger's discretionary class: linked, standalone and completion
+/// syncs unfolded at once. At a FLUSH bound of 1 a free slot implies every
+/// earlier entry folded, so one is held; at 2 a finished sync frees its slot
+/// while its entry waits for the fold. Owner: the ledger's plan and its two
+/// sync-due answers. Crossing: the due accumulates (`Plain`, not due), as a
+/// busy FLUSH slot does.
+pub const LEDGER_DISCRETIONARY_ENTRIES: u32 = 2;
+
+/// Entries one cell's fsync ledger holds unfolded: the classes' budgets,
+/// `5 + (1 + 2 + 2) + 16 + 16 + 2` — boot, rotation, extent, write-through,
+/// discretionary. Each class paces at its own budget, so the ledger is never
+/// full on its own. Owner: the cell's `GroupCommit`, one ledger built with
+/// it. Crossing: none of its own (a class at its budget never registers).
+pub const FSYNC_LEDGER_ENTRIES: u32 = 44;
+
+/// The ledger's cap: `FSYNC_LEDGER_ENTRIES` entries under the census name
+/// `fsync-ledger`, filled while the cell serves.
+pub const FSYNC_LEDGER: Cap =
+    Cap::entries::<FSYNC_LEDGER_ENTRIES>("fsync-ledger", CapFill::Serving);
 
 /// Device bytes one tier-flush offer carries (ADR-0178 D3's tier row,
 /// ADR-0155 D4): a group of a round's unsent writes, whole writes only,

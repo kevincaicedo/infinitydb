@@ -74,7 +74,7 @@ fn run_until_quiesced(
         iters += 1;
         let quiesced = plane.jobs.is_empty()
             && plane.staging.is_empty()
-            && plane.in_flight.is_empty()
+            && plane.commit.frames_unwritten() == 0
             && plane.commit.pending_fsyncs() == 0;
         if plane.cell_failed {
             break;
@@ -191,7 +191,10 @@ fn everysec_only_load_never_touches_the_gate() {
     let (mut lp, mut plane, clock) = cell(&dir, ScriptedDriver::new(IoMode::Real), 1 << 20);
     plane.push_jobs(200, FsyncClass::Everysec);
     let mut iters = 0;
-    while !(plane.jobs.is_empty() && plane.staging.is_empty() && plane.in_flight.is_empty()) {
+    while !(plane.jobs.is_empty()
+        && plane.staging.is_empty()
+        && plane.commit.frames_unwritten() == 0)
+    {
         lp.run_iteration(&mut plane).expect("iteration");
         // The fast path pays no gate registration for everysec (S06 AC).
         assert_eq!(plane.gate.waiting(), 0, "everysec must not register gate waiters");

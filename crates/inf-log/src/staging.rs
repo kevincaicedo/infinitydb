@@ -222,6 +222,18 @@ impl FrameLease {
         );
         self.first_record_lsn.advance(at.body_offset)
     }
+
+    /// A lease for a frame of `frame_len` bytes that no ring sealed: the
+    /// ledger's own tests queue frames without staging records.
+    #[cfg(test)]
+    pub(crate) fn for_test(frame_len: u32) -> FrameLease {
+        FrameLease {
+            generation: 0,
+            first_record_lsn: Lsn::new(crate::lsn::SegmentId(0), 0),
+            frame_len,
+            record_count: 1,
+        }
+    }
 }
 
 /// Cumulative staging counters (cell-local, no atomics — L1).

@@ -200,7 +200,7 @@ impl Rig {
         let rotation_due = self.rotor.rotation_due(frame_len);
         let write_through_ok = self.rotor.next_frame_write_through_ok(frame_len);
         let plan = self.commit.frame_plan(write_through_ok, rotation_due);
-        assert_ne!(plan, FramePlan::Wait, "drained rig never waits");
+        assert!(!matches!(plan, FramePlan::Wait(_)), "drained rig never waits");
         let (slot, handoff) = self.rotor.begin_frame_deferred(frame_len, 0).expect("reserve");
         assert_eq!(handoff.is_some(), rotation_due);
         assert_eq!(slot.write_through_ok(), write_through_ok);
@@ -211,10 +211,12 @@ impl Rig {
         let end = slot.base().advance(slot.len());
         let covered = self.commit.watermark().map_or(0, |l| l.to_u64());
         let lease = self.ring.seal(slot.first_record_lsn(), covered, slot.layout());
-        let id = self.commit.note_frame_queued(end, slot.len());
+        // The bytes are copied out for the rig's own execution; the
+        // ledger's queue holds the lease until the write lands.
+        let bytes = self.ring.leased_frame(&lease).to_vec();
+        let id = self.commit.note_frame_queued(end, lease, Nanos::ZERO);
         self.frame_keys.push((end.to_u64(), keys));
         let offset = FileOffset::from_u32_bytes(slot.base().offset);
-        let bytes = self.ring.leased_frame(&lease).to_vec();
         let issued = match plan {
             FramePlan::WriteThrough => Issued::Through {
                 id,
@@ -229,12 +231,9 @@ impl Rig {
                 bytes,
             },
             FramePlan::Plain => Issued::Plain { id, offset, bytes },
-            FramePlan::Wait => unreachable!("asserted above"),
+            FramePlan::Wait(_) => unreachable!("asserted above"),
         };
         self.rotor.commit_frame_queued(slot);
-        // The plane releases the lease at LogWritten; here the bytes are
-        // copied out, so the lease can go now.
-        self.ring.release(lease);
         (issued, seal)
     }
 
@@ -254,20 +253,27 @@ impl Rig {
         match issued {
             Issued::Through { id, ticket, offset, bytes } => {
                 self.disk.driver_write_through(fd, offset, &bytes).expect("through");
-                self.commit.note_frame_written(id);
+                self.landed(id);
                 self.complete(ticket);
             }
             Issued::Linked { id, ticket, offset, bytes } => {
                 self.disk.driver_write_at(fd, offset, &bytes).expect("write");
-                self.commit.note_frame_written(id);
+                self.landed(id);
                 self.disk.driver_fdatasync(fd).expect("fsync");
                 self.complete(ticket);
             }
             Issued::Plain { id, offset, bytes } => {
                 self.disk.driver_write_at(fd, offset, &bytes).expect("write");
-                self.commit.note_frame_written(id);
+                self.landed(id);
             }
         }
+    }
+
+    /// The frame's write landed: the ledger hands its lease back to the
+    /// ring.
+    fn landed(&mut self, id: inf_log::FrameId) {
+        let written = self.commit.note_frame_written(id);
+        self.ring.release(written.lease);
     }
 
     fn complete(&mut self, ticket: inf_log::FsyncTicket) {

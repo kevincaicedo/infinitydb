@@ -360,9 +360,6 @@ pub struct DurablePlane {
     pub rotor: SegmentRotor<StdSegmentFs>,
     pub commit: GroupCommit<<StdSegmentFs as SegmentFs>::File>,
     pub gate: WatermarkGate,
-    /// Frames sealed and awaiting `LogWritten` (ADR-0087 D2): any
-    /// completion order; keyed by the write token's sequence == `FrameId`.
-    pub in_flight: VecDeque<(u64, inf_log::FrameLease)>,
     /// Workload script: staged up to `jobs_per_iter` per EXECUTE.
     pub jobs: VecDeque<Job>,
     pub jobs_per_iter: usize,
@@ -399,7 +396,6 @@ impl DurablePlane {
                 &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
             ),
             gate: WatermarkGate::new(),
-            in_flight: VecDeque::new(),
             jobs: VecDeque::new(),
             jobs_per_iter: 8,
             staged_always: Vec::new(),
@@ -435,15 +431,11 @@ impl CellPlane for DurablePlane {
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion) {
         match (c.token.class(), c.result) {
             (TokenClass::LogWrite, CompletionResult::LogWritten) => {
+                // The ledger's queue holds each frame's lease until its
+                // `LogWritten` (ADR-0087 D2), in any completion order.
                 let seq = u64::from(c.token.slot()) | (u64::from(c.token.generation()) << 24);
-                let index = self
-                    .in_flight
-                    .iter()
-                    .position(|(id, _)| *id == seq)
-                    .expect("LogWritten with no in-flight lease");
-                let (_, lease) = self.in_flight.remove(index).expect("index from position");
-                self.commit.note_frame_written(inf_log::FrameId(seq));
-                self.staging.release(lease);
+                let written = self.commit.note_frame_written(inf_log::FrameId(seq));
+                self.staging.release(written.lease);
             }
             (TokenClass::Fsync, CompletionResult::Synced) => {
                 if let Some(end) = self.commit.on_fsync_complete(token_ticket(c.token), cx.now) {
@@ -457,15 +449,9 @@ impl CellPlane for DurablePlane {
                 // §8.4: fail-stop territory. The harness records and freezes.
                 if class == TokenClass::Fsync {
                     self.commit.on_fsync_error(token_ticket(c.token));
-                } else {
-                    // The write's lease is terminal — release so teardown
-                    // asserts stay meaningful; the cell is failed regardless.
-                    let seq = u64::from(c.token.slot()) | (u64::from(c.token.generation()) << 24);
-                    if let Some(index) = self.in_flight.iter().position(|(id, _)| *id == seq) {
-                        let (_, lease) = self.in_flight.remove(index).expect("index");
-                        self.staging.release(lease);
-                    }
                 }
+                // A failed write's lease stays in the ledger's queue: the
+                // cell is failed and serves nothing more.
                 self.io_errors.push((class, errno));
                 self.cell_failed = true;
             }
@@ -534,7 +520,7 @@ impl CellPlane for DurablePlane {
                 return;
             }
             let plan = self.commit.frame_plan(false, rotation_due);
-            if plan == inf_log::FramePlan::Wait {
+            if matches!(plan, inf_log::FramePlan::Wait(_)) {
                 return;
             }
             let (slot, seal) =
@@ -567,7 +553,13 @@ impl CellPlane for DurablePlane {
                     acks.borrow_mut().push((lsn, watermark));
                 });
             }
-            let id = self.commit.note_frame_queued(end, lease.frame_len());
+            let bytes = self.staging.leased_frame(&lease);
+            // SAFETY: the FrameLease is held in the ledger's frame queue
+            // until the LogWritten completion hands it back for release
+            // (ADR-0013 D1) — the sealed buffer neither moves nor resets
+            // while this op is in flight.
+            let data = unsafe { StableBytes::new(bytes) };
+            let id = self.commit.note_frame_queued(end, lease, cx.now);
             let barrier = if plan == inf_log::FramePlan::LinkedFsync {
                 let ticket = self.commit.register_linked_fsync(cx.now);
                 self.fsync_submits.push((SyncReason::Linked, cx.now));
@@ -581,12 +573,6 @@ impl CellPlane for DurablePlane {
             self.write_seq += 1;
             assert_eq!(self.write_seq, id.0, "write token sequence is the frame id");
             self.writes_this_iter += 1;
-            let bytes = self.staging.leased_frame(&lease);
-            // SAFETY: the FrameLease is held in `self.in_flight` until the
-            // LogWritten completion releases it (ADR-0013 D1) — the sealed
-            // buffer neither moves nor resets while this op is in flight.
-            let data = unsafe { StableBytes::new(bytes) };
-            self.in_flight.push_back((id.0, lease));
             cx.push(IoOp::LogWrite {
                 fd,
                 offset,
@@ -607,7 +593,7 @@ impl CellPlane for DurablePlane {
     fn fabric_out(&mut self, _cx: &mut LoopCx<'_>) -> bool {
         !self.jobs.is_empty()
             || !self.staging.is_empty()
-            || !self.in_flight.is_empty()
+            || self.commit.frames_unwritten() > 0
             || self.commit.pending_fsyncs() > 0
     }
 }

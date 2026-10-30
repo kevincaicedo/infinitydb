@@ -969,6 +969,16 @@ impl<F: SegmentFs> SegmentRotor<F> {
         };
     }
 
+    /// Whether the next segment's zero-fill barrier is owed now — a pure
+    /// peek of [`take_zero_fill_barrier`](Self::take_zero_fill_barrier),
+    /// for a plane that asks the ledger's class before it takes one.
+    #[must_use]
+    pub fn zero_fill_barrier_owed(&self) -> bool {
+        self.next.as_ref().is_some_and(|next| {
+            next.state == NextState::AwaitBarrier && next.file.raw_fd().is_some()
+        })
+    }
+
     /// The next segment's fd when its zero-fill barrier is owed (every
     /// zero byte landed, barrier not yet issued). Marks it in flight; the
     /// plane registers the ledger entry and issues the fdatasync.

@@ -3,7 +3,6 @@
 //! module is their whole read of the durable cell: the class, its search
 //! over the ack map, and the trait a MAINTAIN tick reads through.
 
-use inf_log::Lsn;
 use inf_log::fs::SegmentFs;
 
 use super::DurableCell;
@@ -46,21 +45,22 @@ impl<F: SegmentFs> AckClasses for DurableCell<F> {
         self.ack_gate.watermark()
     }
 
-    /// `Covered` at or below the watermark, else the ack-map entry that
+    /// `Covered` at or below the watermark, else the ack-map point that
     /// will release `seq`, else the staging builder: one binary search of
-    /// the map's two slices, no allocation.
+    /// the map by place, no allocation.
     fn ack_class(&self, seq: u64) -> AckClass {
-        let (front, back) = self.frame_seqs.as_slices();
-        ack_class_of(front, back, self.ack_gate.watermark(), seq)
+        // Every place below the map's length names a point.
+        let seq_at = |index: usize| self.ack_map.get(index).map_or(u64::MAX, |point| point.seq);
+        ack_class_of(self.ack_map.len(), seq_at, self.ack_gate.watermark(), seq)
     }
 }
 
-/// The class of `seq` over the ack map `(front, back)` (its two slices, in
-/// order) and the watermark: one binary search of the map, whose entries'
-/// seqs strictly increase.
+/// The class of `seq` over an ack map of `len` points, the point at each
+/// place read by `seq_at` (its last seq), and the watermark: one binary
+/// search of the map, whose points' seqs strictly increase.
 pub(crate) fn ack_class_of(
-    front: &[(Lsn, u64)],
-    back: &[(Lsn, u64)],
+    len: usize,
+    seq_at: impl Fn(usize) -> u64,
     watermark: u64,
     seq: u64,
 ) -> AckClass {
@@ -68,7 +68,7 @@ pub(crate) fn ack_class_of(
     // marks for one class and the back is replaced by every later pair.
     #[cfg(inf_canary_epoch_mark_class_blind)]
     {
-        let _ = (front, back, watermark, seq);
+        let _ = (len, seq_at, watermark, seq);
         AckClass::Builder
     }
     // Canary: every seq above the watermark reads as a class of its own, so
@@ -76,7 +76,7 @@ pub(crate) fn ack_class_of(
     // inside one barrier period the marks fill to their cap and cross it.
     #[cfg(inf_canary_epoch_mark_class_per_seq)]
     {
-        let _ = (front, back);
+        let _ = (len, seq_at);
         if seq <= watermark { AckClass::Covered } else { AckClass::Frame(seq) }
     }
     #[cfg(not(any(inf_canary_epoch_mark_class_blind, inf_canary_epoch_mark_class_per_seq)))]
@@ -84,12 +84,16 @@ pub(crate) fn ack_class_of(
         if seq <= watermark {
             return AckClass::Covered;
         }
-        let first_at_or_above = |entries: &[(Lsn, u64)]| {
-            entries.get(entries.partition_point(|&(_, last)| last < seq)).map(|&(_, last)| last)
-        };
-        match first_at_or_above(front).or_else(|| first_at_or_above(back)) {
-            Some(last) => AckClass::Frame(last),
-            None => AckClass::Builder,
+        // The first place whose last seq is at or above `seq`.
+        let (mut below, mut at_or_above) = (0, len);
+        while below < at_or_above {
+            let mid = below + (at_or_above - below) / 2;
+            if seq_at(mid) < seq {
+                below = mid + 1;
+            } else {
+                at_or_above = mid;
+            }
         }
+        if below < len { AckClass::Frame(seq_at(below)) } else { AckClass::Builder }
     }
 }

@@ -13,6 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::fs::SegmentFs;
+use crate::limits::BOOT_DIRS_MAX;
 use crate::lsn::SegmentId;
 use crate::segment::parse_segment_file_name;
 
@@ -44,6 +45,38 @@ pub fn create_cell_dirs<F: SegmentFs>(fs: &F, shard_dir: &Path) -> io::Result<Ce
     Ok(dirs)
 }
 
+/// The boot barriers' directory handles (M2.5-S01): the log, checkpoint
+/// and shard directories and the shard's parent when it exists — at most
+/// [`BOOT_DIRS_MAX`] by its fields, so these barriers and the fresh
+/// segment's own make the ledger's boot class at most its budget
+/// (`LEDGER_BOOT_ENTRIES`) by type.
+pub struct BootDirs<File> {
+    log: File,
+    ckpt: File,
+    shard: File,
+    parent: Option<File>,
+}
+
+impl<File> BootDirs<File> {
+    /// The handles in the order their barriers register: log, ckpt,
+    /// shard, parent.
+    pub fn into_handles(self) -> impl Iterator<Item = File> {
+        [Some(self.log), Some(self.ckpt), Some(self.shard), self.parent].into_iter().flatten()
+    }
+
+    /// Handles held: 3, or 4 with the parent's.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        3 + usize::from(self.parent.is_some())
+    }
+
+    /// Never empty: the log, checkpoint and shard handles are fields.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
 /// Deferred-barrier variant of [`create_cell_dirs`] (M2.5-S01): create the
 /// per-cell directories with **no blocking dir-fsyncs** and return open
 /// directory handles instead. The caller registers each handle's
@@ -52,22 +85,23 @@ pub fn create_cell_dirs<F: SegmentFs>(fs: &F, shard_dir: &Path) -> io::Result<Ce
 /// becoming durable while boot-ready never waits on the device. A blocking
 /// fsync here can stall the reactor for minutes behind foreign journal
 /// writeback — the captured cell-2 boot wedge (ADR-0022 D7).
-///
-/// Handle order: log, ckpt, shard, parent (when it exists).
 pub fn create_cell_dirs_deferred<F: SegmentFs>(
     fs: &F,
     shard_dir: &Path,
-) -> io::Result<(CellDirs, Vec<F::File>)> {
+) -> io::Result<(CellDirs, BootDirs<F::File>)> {
     let dirs = CellDirs { log: shard_dir.join("log"), ckpt: shard_dir.join("ckpt") };
     fs.create_dir_all(&dirs.log)?;
     fs.create_dir_all(&dirs.ckpt)?;
-    let mut handles = Vec::with_capacity(4);
-    handles.push(fs.open_dir(&dirs.log)?);
-    handles.push(fs.open_dir(&dirs.ckpt)?);
-    handles.push(fs.open_dir(shard_dir)?);
-    if let Some(parent) = shard_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-        handles.push(fs.open_dir(parent)?);
-    }
+    let handles = BootDirs {
+        log: fs.open_dir(&dirs.log)?,
+        ckpt: fs.open_dir(&dirs.ckpt)?,
+        shard: fs.open_dir(shard_dir)?,
+        parent: match shard_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(parent) => Some(fs.open_dir(parent)?),
+            None => None,
+        },
+    };
+    debug_assert!(handles.len() <= BOOT_DIRS_MAX as usize, "the boot class's directory handles");
     Ok((dirs, handles))
 }
 

@@ -43,6 +43,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         frame_waits_barrier: 0,
         frame_waits_rotation: 0,
         frame_waits_reorder: 0,
+        frame_waits_ledger: 0,
+        frame_waits_ack_map: 0,
+        ledger_prealloc_deferrals: 0,
         ckpt_downgrades: 0,
         ckpt_bound_splits: 0,
         plant_fired: false,
@@ -776,6 +779,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             report.frame_waits_barrier += stats.frame_waits_barrier;
             report.frame_waits_rotation += stats.frame_waits_rotation;
             report.frame_waits_reorder += stats.frame_waits_reorder;
+            report.frame_waits_ledger += stats.frame_waits_ledger;
+            report.frame_waits_ack_map += stats.frame_waits_ack_map;
+            report.ledger_prealloc_deferrals += stats.ledger_prealloc_deferrals;
             report.frame_waits_fill += stats.frame_waits_fill;
             report.frame_waits_group += stats.frame_waits_group;
             report.frame_waits_pace += stats.frame_waits_pace;
@@ -905,6 +911,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     if let Some(shape) = scenario.tier_budget {
         tier_budget_scrape(scenario, shape, &node, &disk, &mut report);
     }
+    derived_ledger_counters(scenario.seed, &mut report);
     engagement_checks(scenario, &node, &mut report);
     if scenario.budget_oracle {
         budget_oracles(scenario, &node, clock.now(), &mut report);
@@ -1285,6 +1292,31 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     }
 
     finish(report, &observer, &clock)
+}
+
+/// The fsync ledger's derived counters, read 0 on every seed: the ack map
+/// holds at most the frame queue, the ledger and one point, which is its
+/// cap, so no frame waits for it; and the rotation class holds at most two
+/// prealloc and two zero-fill barriers (a seal, then the barriers of the two
+/// generations after it), so no MAINTAIN skips one. A nonzero count is a
+/// derivation the run disproved.
+fn derived_ledger_counters(seed: u64, report: &mut DurableReport) {
+    if report.frame_waits_ack_map > 0 {
+        let what = format!(
+            "LEDGER DERIVATION VIOLATION seed {seed:#x}: ack-map-held — {} frame hold(s) on a \
+             full ack map",
+            report.frame_waits_ack_map
+        );
+        report.violations.push(what);
+    }
+    if report.ledger_prealloc_deferrals > 0 {
+        let what = format!(
+            "LEDGER DERIVATION VIOLATION seed {seed:#x}: ledger-prealloc-deferred — {} prealloc \
+             or zero-fill barrier(s) skipped at the rotation class's budget",
+            report.ledger_prealloc_deferrals
+        );
+        report.violations.push(what);
+    }
 }
 
 /// Preallocs that found the pool non-empty — neither a miss nor a space
