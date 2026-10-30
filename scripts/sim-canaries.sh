@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Planted-bug canaries (ADR-0090 D5; F-L19-03 addendum, F-L19-04): each
-# `--cfg inf_canary_*` disables one load-bearing rule in the product, and
-# the scenario whose oracle owns that rule must go red on the planted
-# build — and green on the plain build. A canary the fleet never plants
+# `--cfg inf_canary_*` disables one load-bearing rule in the product, or
+# removes from a harness leg what its engagement clause needs (a vacuity
+# plant, read in `bins/inf-sim` alone), and the scenario whose oracle owns
+# that rule or clause must go red on the planted build — and green on the
+# plain build. A canary the fleet never plants
 # proves nothing; `bins/inf-sim/tests/lanes.rs` fails when a cfg in the
 # workspace's `check-cfg` list has no row here.
 # Three row kinds:
@@ -242,6 +244,26 @@ rows=(
   # `Full` at 15 live, below the 16 it admits now — a crossing short of
   # the cap, which only that clause prints.
   "inf_canary_cap_minus_one m4-epoch-marks cap-crossed-short --marks-leg wedge"
+  # The same two plants on the fsync ledger's frame queue, on the reorder
+  # window's leg, whose wedged plain write fills the queue on every seed.
+  # One short, the frame's hold answers at 15 of its 16 and the leg's clause
+  # reads the queue's row below its cap on a cell that held a frame for it;
+  # at the cap the queue takes a 17th frame, which the census reads over
+  # its cap.
+  "inf_canary_cap_minus_one m2-reorder-window frame-queue-unfilled"
+  "inf_canary_cap_admits_at_cap m2-reorder-window cap-high-water-over"
+  # The leg's vacuity plant: no wedge, so the queue never fills and the
+  # leg's engagement reads it.
+  "inf_canary_reorder_wedge_zero m2-reorder-window frame-queue-unengaged"
+  # The first plant at the edges of the capped holders no leg fills to
+  # their cap, at the unit tier, each test's own token: the fsync ledger
+  # (44, the class budgets' sum), the ack map (61, the queue, the ledger
+  # and one) and a tier round's holders (70 writes, 4 barriers, 3 effects,
+  # 2 staged seals). Each test probes a holder of the cap before any push
+  # that would meet the product's fail-stop.
+  "inf_canary_cap_minus_one crate-test inf-log lib the_ledger_cap_admits_every_class_at_its_budget ledger-edge-short"
+  "inf_canary_cap_minus_one crate-test inf-server lib the_ack_map_cap_admits_the_queue_the_ledger_and_one ack-map-edge-short"
+  "inf_canary_cap_minus_one crate-test inf-log lib every_round_holder_admits_the_widest_round round-edge-short"
   # The first plant at the marks' cap edge, at both unit tiers: 15 and 16
   # ack classes held with the watermark held keep one mark each. One
   # short, the 16th class merges into the back, and the edge's count

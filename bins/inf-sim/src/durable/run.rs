@@ -779,6 +779,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             report.frame_waits_barrier += stats.frame_waits_barrier;
             report.frame_waits_rotation += stats.frame_waits_rotation;
             report.frame_waits_reorder += stats.frame_waits_reorder;
+            if scenario.reorder_oracle && stats.frame_waits_reorder > 0 {
+                frame_queue_filled(scenario.seed, cell, &node, &mut report);
+            }
             report.frame_waits_ledger += stats.frame_waits_ledger;
             report.frame_waits_ack_map += stats.frame_waits_ack_map;
             report.ledger_prealloc_deferrals += stats.ledger_prealloc_deferrals;
@@ -1023,8 +1026,8 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         fail(
             &mut report,
             format!(
-                "REORDER WINDOW NOT ENGAGED seed {:#x}: the wedged device never filled the \
-                 completion ledger's window (frames_in_flight_max {depth}) — the scenario \
+                "VACUOUS seed {:#x}: frame-queue-unengaged — the wedged device never filled the \
+                 completion ledger's frame queue (frames_in_flight_max {depth}): the scenario \
                  proves nothing about the bound",
                 scenario.seed
             ),
@@ -1292,6 +1295,31 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     }
 
     finish(report, &observer, &clock)
+}
+
+/// The frame queue's cap on a cell that held a frame for it: the hold
+/// answers only at the queue's own admission, so the queue's census row
+/// read its cap. A row short of it held the frame early (token
+/// `frame-queue-unfilled`).
+fn frame_queue_filled(seed: u64, cell: usize, node: &Node, report: &mut DurableReport) {
+    let name = inf_log::limits::FRAME_QUEUE.name();
+    let census = node.plane(cell).cap_census();
+    let Some(row) = census.row(name) else {
+        let what = format!(
+            "REORDER WINDOW VIOLATION seed {seed:#x} cell {cell}: frame-queue-unfilled — a frame \
+             held for the queue and no `{name}` row"
+        );
+        report.violations.push(what);
+        return;
+    };
+    if row.high_water < row.entries_max {
+        let what = format!(
+            "REORDER WINDOW VIOLATION seed {seed:#x} cell {cell}: frame-queue-unfilled — a frame \
+             held for the queue at a high water of {} of its {}",
+            row.high_water, row.entries_max
+        );
+        report.violations.push(what);
+    }
 }
 
 /// The fsync ledger's derived counters, read 0 on every seed: the ack map

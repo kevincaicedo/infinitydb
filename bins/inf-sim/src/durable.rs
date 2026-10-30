@@ -1063,6 +1063,12 @@ impl DurableScenario {
         let mut stall = m2_stall_config();
         stall.wedge_every_writes = 40;
         stall.wedge_ns = 150_000_000;
+        // Plant: no wedge, so the frame queue never fills and the
+        // scenario's engagement reads it.
+        #[cfg(inf_canary_reorder_wedge_zero)]
+        {
+            stall.wedge_ns = 0;
+        }
         scenario.stall = Some(stall);
         scenario.always_writers = 0;
         scenario.esec_writers = 6;
