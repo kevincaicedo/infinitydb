@@ -2155,8 +2155,8 @@ mod tests {
         use inf_store::DiskFullCause;
         for proto in [inf_wire::Protocol::Resp2, inf_wire::Protocol::Resp3] {
             let mut out = Vec::new();
-            let mut out_reply = ReplyBuf::over(&mut out);
-            let mut w = RespWriter::new(&mut out_reply, proto);
+            let mut view = ReplyBuf::over(&mut out);
+            let mut w = RespWriter::new(&mut view, proto);
             op_error(
                 OpError::DiskFull(DiskFullCause::Budget { used: 16_252_928, budget: 16_777_216 }),
                 &mut w,
@@ -2169,8 +2169,8 @@ mod tests {
                 "{proto:?}"
             );
             let mut out = Vec::new();
-            let mut out_reply = ReplyBuf::over(&mut out);
-            let mut w = RespWriter::new(&mut out_reply, proto);
+            let mut view = ReplyBuf::over(&mut out);
+            let mut w = RespWriter::new(&mut view, proto);
             op_error(OpError::DiskFull(DiskFullCause::Device), &mut w);
             assert_eq!(
                 out,
@@ -3223,8 +3223,8 @@ mod tests {
             // The cross-cell move's destination put carries a snapshot
             // deadline through the same seam.
             let mut out = Vec::new();
-            let mut out_reply = ReplyBuf::over(&mut out);
-            let mut w = RespWriter::new(&mut out_reply, Protocol::Resp2);
+            let mut view = ReplyBuf::over(&mut out);
+            let mut w = RespWriter::new(&mut view, Protocol::Resp2);
             let put: &[&[u8]] = &[b"INF.PUT", b"m", b"v", b"1"];
             inf_move_put(put, store.db_mut(0), &cx.node, now, &mut w);
             assert_eq!(out, b"+OK\r\n");

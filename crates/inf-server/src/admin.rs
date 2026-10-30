@@ -1639,8 +1639,8 @@ mod tests {
         let later = Nanos(5_000 * 1_000_000);
         assert_eq!(store.expiry_lag_ms(later), 5_000);
         let mut out = Vec::new();
-        let mut out_reply = ReplyBuf::over(&mut out);
-        let mut w = RespWriter::new(&mut out_reply, Protocol::Resp2);
+        let mut view = ReplyBuf::over(&mut out);
+        let mut w = RespWriter::new(&mut view, Protocol::Resp2);
         info(&[b"INFO".as_slice(), b"stats"][..], &store, &cx.node, later, &mut w);
         let text = String::from_utf8(out).expect("ascii");
         assert!(text.contains("expiry_debt_ms:5000\r\n"), "{text}");

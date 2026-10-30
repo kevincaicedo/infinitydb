@@ -2046,8 +2046,8 @@ mod tests {
             let cx = durable_cx(budget, record_max);
             let mut out = Vec::new();
             {
-                let mut out_reply = inf_wire::ReplyBuf::over(&mut out);
-                let mut writer = RespWriter::new(&mut out_reply, Protocol::Resp2);
+                let mut view = inf_wire::ReplyBuf::over(&mut out);
+                let mut writer = RespWriter::new(&mut view, Protocol::Resp2);
                 execute_json(CommandId::JsonSet, &argv[..], &mut store, &cx, now, &mut writer);
             }
             assert!(out.starts_with(prefix), "reply was {}", String::from_utf8_lossy(&out));
@@ -2064,8 +2064,8 @@ mod tests {
         let meta = inf_wire::lookup(argv[0]).expect("a registered JSON command");
         let mut out = Vec::new();
         {
-            let mut out_reply = inf_wire::ReplyBuf::over(&mut out);
-            let mut writer = RespWriter::new(&mut out_reply, Protocol::Resp2);
+            let mut view = inf_wire::ReplyBuf::over(&mut out);
+            let mut writer = RespWriter::new(&mut view, Protocol::Resp2);
             execute_json(meta.id, argv, store, cx, now, &mut writer);
         }
         out

@@ -46,8 +46,8 @@ fuzz_target!(|data: &[u8]| {
     let mut out = Vec::new();
     let mut written = 0usize;
     {
-        let mut out_reply = ReplyBuf::over(&mut out);
-        let mut w = RespWriter::new(&mut out_reply, proto);
+        let mut view = ReplyBuf::over(&mut out);
+        let mut w = RespWriter::new(&mut view, proto);
         for piece in data[1..].chunks(chunk) {
             w.error_bytes(piece);
             written += 1;
@@ -84,8 +84,8 @@ fuzz_target!(|data: &[u8]| {
         .bulk_patched(|out| out.extend_from_slice(payload));
     assert_eq!(plain, patched, "patched bulk diverged from plain bulk");
     let mut rolled = Vec::new();
-    let mut rolled_reply = ReplyBuf::over(&mut rolled);
-    let mut w = RespWriter::new(&mut rolled_reply, proto);
+    let mut rolled_view = ReplyBuf::over(&mut rolled);
+    let mut w = RespWriter::new(&mut rolled_view, proto);
     assert!(
         w.try_bulk_patched(|out| {
             out.extend_from_slice(payload);

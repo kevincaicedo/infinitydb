@@ -2484,8 +2484,8 @@ mod tests {
         let keyspace = Keyspace::new(StoreConfig::default());
         let argv: [&[u8]; 2] = [b"INFO", b"persistence"];
         let mut reply = Vec::new();
-        let mut reply_reply = inf_wire::ReplyBuf::over(&mut reply);
-        let mut writer = RespWriter::new(&mut reply_reply, Protocol::Resp2);
+        let mut view = inf_wire::ReplyBuf::over(&mut reply);
+        let mut writer = RespWriter::new(&mut view, Protocol::Resp2);
         crate::admin::info(&argv[..], &keyspace, node, Nanos(1), &mut writer);
         let text = String::from_utf8(reply).expect("INFO is text");
         text.lines()
