@@ -1733,6 +1733,53 @@ mod tests {
         write(&mut gc, a);
     }
 
+    /// A barrier registered apart from its frame settles on "the back of
+    /// the queue" by position, so the ledger's public calls reach the
+    /// settle's panic in another order: a write-through registered after
+    /// its frame's write landed finds the queue empty, past every other
+    /// check (the prefix rule reads the written end).
+    #[test]
+    #[should_panic(expected = "a frame barrier registered with no unwritten frame queued")]
+    fn a_write_through_after_its_frame_landed_reaches_the_settle_panic() {
+        let mut gc = commit();
+        let f1 = queue(&mut gc, lsn(0, 4096), 4096);
+        gc.register_linked_fsync(Nanos::ZERO);
+        write(&mut gc, f1);
+        assert_eq!(gc.frames_behind_prefix(), 0, "the frame's write popped it");
+        gc.register_write_through(Nanos::ZERO);
+    }
+
+    /// The same panic by another order: a later frame's write lands
+    /// ahead of the front, so the queue's back is written when a
+    /// write-through registers.
+    #[test]
+    #[should_panic(expected = "a frame barrier registered with no unwritten frame queued")]
+    fn a_write_through_after_a_later_frame_landed_reaches_the_settle_panic() {
+        let mut gc = commit();
+        let _f1 = queue(&mut gc, lsn(0, 4096), 4096);
+        gc.register_linked_fsync(Nanos::ZERO);
+        let f2 = queue(&mut gc, lsn(0, 8192), 4096);
+        write(&mut gc, f2);
+        assert_eq!(gc.frames_behind_prefix(), 2, "the back landed behind the front");
+        assert_eq!(gc.frames_unwritten(), 1, "the front is still in flight");
+        gc.register_write_through(Nanos::ZERO);
+    }
+
+    /// Nothing checks that the back frame has no barrier yet: a second
+    /// registration overwrites the first, the frame hands back the second,
+    /// the write-through ticket is never completed and the watermark stops
+    /// with no fail-stop.
+    #[test]
+    fn a_second_registration_overwrites_the_barrier_and_freezes_the_watermark() {
+        let mut gc = commit();
+        let f1 = queue(&mut gc, lsn(0, 4096), 4096);
+        let _w1 = gc.register_write_through(Nanos::ZERO);
+        let t2 = gc.register_linked_fsync(Nanos::ZERO);
+        assert_eq!(write(&mut gc, f1), FrameBarrier::Linked(t2), "barrier-overwritten");
+        assert_eq!(gc.on_fsync_complete(t2, Nanos::ZERO), None, "watermark-frozen behind w1");
+        assert_eq!(gc.watermark(), None, "watermark-frozen: w1 never completes");
+    }
+
     /// `LogWritten` for the oldest frame still unwritten — the K = 1
     /// completion order every pre-S35 test assumed. Ids are ordinals
     /// from 1, so the oldest unwritten one is derivable from the counters.
