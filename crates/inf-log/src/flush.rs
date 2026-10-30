@@ -1965,6 +1965,75 @@ mod tests {
         assert_eq!(flush.pool_outstanding(), 0, "{case}: every window came back");
     }
 
+    /// Each capped holder of a round admits the widest round's count, the
+    /// envelope of ADR-0155 D3: 70 writes, 4 barriers, 3 effects and 2
+    /// staged seals. A holder of each cap takes its count and refuses one
+    /// more, before any stage meets its holder's fail-stop, so under the
+    /// cap-minus-one plant a holder refuses its last entry by this test's
+    /// own token. Then the envelope's widest and rotation-and-gap rounds
+    /// reach every count on the round's own holders.
+    #[test]
+    fn every_round_holder_admits_the_widest_round() {
+        use crate::limits::{
+            TIER_PENDING_SEALS_MAX, TIER_ROUND_BARRIERS, TIER_ROUND_BARRIERS_MAX,
+            TIER_ROUND_EFFECTS, TIER_ROUND_EFFECTS_MAX, TIER_ROUND_WRITES, TIER_ROUND_WRITES_MAX,
+        };
+        use inf_foundation::bounded::Reserved;
+        let (census, serve_mark) = CapCensus::new(inf_foundation::CellId(0));
+        serve_mark.take();
+        let widest = [
+            (TIER_ROUND_WRITES, TIER_ROUND_WRITES_MAX),
+            (TIER_ROUND_BARRIERS, TIER_ROUND_BARRIERS_MAX),
+            (TIER_ROUND_EFFECTS, TIER_ROUND_EFFECTS_MAX),
+            (TIER_PENDING_SEALS, TIER_PENDING_SEALS_MAX),
+        ];
+        for (cap, count) in widest {
+            let mut holder = CappedDeque::<u8, Reserve>::new(cap, &census).expect("built");
+            for entry in 1..=count {
+                let Reserved::Slot(slot) = holder.reserve() else {
+                    panic!(
+                        "round-edge-short: `{}` refused entry {entry} of the widest round's \
+                         {count}",
+                        cap.name()
+                    );
+                };
+                slot.publish(0);
+            }
+            assert!(matches!(holder.reserve(), Reserved::Full), "`{}` past its count", cap.name());
+        }
+        let mut reached = [0; 4];
+        for file in [4 << 10, 1 << 20] {
+            for incoming in [file - 1, file, file + 1] {
+                let counts = round_reach(file, incoming, 64 << 20);
+                for (most, count) in reached.iter_mut().zip(counts) {
+                    *most = (*most).max(count);
+                }
+            }
+        }
+        let counts = widest.map(|(_, count)| count as usize);
+        assert_eq!(reached, counts, "the envelope reaches (writes, barriers, effects, seals)");
+    }
+
+    /// The writes, barriers, effects and staged seals of one round of `a`
+    /// bytes behind `incoming` bytes, with a trailing gap, on files of
+    /// `file` bytes.
+    fn round_reach(file: u64, incoming: u64, a: u64) -> [usize; 4] {
+        let disk = SimDisk::new();
+        let mut flush = sim_reactor(&disk, file, crate::limits::TIER_SPAN_BYTES_MAX, 0);
+        let bytes = vec![0x11; incoming as usize];
+        stage(&mut flush, span(0, bytes.len(), None), &bytes).expect("the priming round");
+        let effects = run_round(&disk, &mut flush);
+        apply(&mut flush, &effects);
+        let bytes = vec![0x22; a as usize];
+        let selection = span(incoming, a as usize, Some(incoming + a + 4096));
+        stage(&mut flush, selection, &bytes).expect("the round stages");
+        let (writes, barriers) = (flush.round_write_count(), flush.round_barrier_count());
+        let seals = flush.pending_seal_count();
+        let effects = run_round(&disk, &mut flush);
+        apply(&mut flush, &effects);
+        [writes, barriers, effects.len(), seals]
+    }
+
     const ROUND_OPS_MAX_TEST: usize = crate::tier::ROUND_OPS_MAX;
 
     /// No holder of a pipeline is filled at its build, and none sits at its
