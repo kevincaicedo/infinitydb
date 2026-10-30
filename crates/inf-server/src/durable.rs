@@ -1111,21 +1111,10 @@ impl<F: SegmentFs> DurableCell<F> {
             let write_through_ok = self.rotor.next_frame_write_through_ok(frame_len);
             let plan = match self.commit.frame_plan(write_through_ok, rotation_due) {
                 FramePlan::Seal(plan) => plan,
-                // One counter per reason, each read from the plan: the
-                // frame queue is full (ADR-0087 D2 — a device row), the due
-                // barrier is inadmissible behind in-flight writes (D3), or
-                // the rotation's previous seal has not folded.
                 FramePlan::Wait(hold) => {
-                    match hold {
-                        Hold::ReorderWindow => {
-                            self.frame_waits_reorder += u64::from(!self.frame_held);
-                        }
-                        Hold::Barrier => self.frame_waits_barrier += u64::from(!self.frame_held),
-                        Hold::SealUnfolded => {
-                            self.frame_waits_ledger += u64::from(!self.ledger_holds_counted.seal);
-                            self.ledger_holds_counted.seal = true;
-                        }
-                    }
+                    // Counted first: the episode counters read whether the
+                    // frame was already held.
+                    self.count_hold(hold);
                     self.frame_held = true;
                     return;
                 }
@@ -1198,6 +1187,23 @@ impl<F: SegmentFs> DurableCell<F> {
             let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
             self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
             cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
+        }
+    }
+
+    /// Counts a frame the plan holds, one counter per reason, each read
+    /// from the plan: the frame queue is full (ADR-0087 D2 — a device row),
+    /// the due barrier is inadmissible behind in-flight writes (D3), or the
+    /// rotation's previous seal has not folded. The first two count hold
+    /// episodes; the seal's counts a held frame once, whatever held it
+    /// first.
+    fn count_hold(&mut self, hold: Hold) {
+        match hold {
+            Hold::ReorderWindow => self.frame_waits_reorder += u64::from(!self.frame_held),
+            Hold::Barrier => self.frame_waits_barrier += u64::from(!self.frame_held),
+            Hold::SealUnfolded => {
+                self.frame_waits_ledger += u64::from(!self.ledger_holds_counted.seal);
+                self.ledger_holds_counted.seal = true;
+            }
         }
     }
 
