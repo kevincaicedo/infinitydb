@@ -1,62 +1,34 @@
-#![allow(
-    clippy::disallowed_types,
-    reason = "bench target: the A legs are the parent's fsync ledger and its plane's in-flight \
-              table over std containers"
-)]
-//! The fsync ledger's A/B by instructions (L4): one frame per op through the
-//! LOG step's ledger calls — staged, planned with its arguments at
+//! The fsync ledger's frame by instructions (L4): one frame per op through
+//! the LOG step's ledger calls — staged, planned with its arguments at
 //! runtime, sealed, queued with its barrier, written, and folded at the
-//! barrier's completion — on the ledger before its classes and capped
-//! holders (A, `parent`, whose LOG step registers the barrier by a match
-//! on the plan after the queueing) and on the ledger as built (B,
-//! `ledger`, whose one queueing call registers it), from one binary. Each
-//! version is one non-generic `#[inline(never)]` frame function called
-//! through `&mut`, the shape every frame of a cell takes; the ledger's
-//! entry points stay out of line. Both
-//! stage one record and seal it on a real staging ring at one frame in
-//! flight and release the lease after the write, so the staging work is
-//! common to both.
+//! barrier's completion — on the ledger as built (`ledger-<shape>`), from
+//! one non-generic `#[inline(never)]` frame function called through
+//! `&mut`, the shape every frame of a cell takes; the ledger's entry points
+//! stay out of line. It stages one record and seals it on a real staging
+//! ring at one frame in flight and releases the lease after the write.
+//! `ledger-plane-<shape>` runs the same frame with the plane's consumer of
+//! the flight its queue hands back: the stall sample, a linked barrier's
+//! clock rebased and completed, a write-through completion.
 //!
 //! Three shapes, the three the LOG step runs: write-through (`always`
 //! staged, the rotor answers yes), linked (`always` staged, the rotor
 //! answers no: a linked fdatasync) and plain (`everysec` staged: no sync
 //! due).
 //!
-//! The verdict rule, B − A per frame at each shape the LOG step runs: ≤ 4
-//! instructions for a write-through frame, ≤ 42 for a frame with a linked
-//! fdatasync, ≤ 53 for a plain frame where the queueing holds the ledger's
-//! registration, and ≤ 31, ≤ 68, ≤ 53 where it calls it; the rule's red is
-//! the parent leg with one instruction more than the bound. The queueing's
-//! disassembly says which column binds. Over at any shape, the change does
-//! not merge. The bounds are read on x86-64 at the pinned toolchain; on
-//! another target or toolchain each term is re-read before a verdict.
-//!
-//! The custody legs, the parent's ledger with its plane's in-flight table
-//! against B with the same consumer, are reported beside them, never
-//! judged: `parent-flight-<shape>` (A″) runs A with the table the parent's
-//! plane kept for each frame in flight — pushed after the registration,
-//! found by `position` and taken by `remove` at the write — and
-//! `ledger-plane-<shape>` (B″) runs B with the flight its queue hands back.
-//! Both consume the flight as the plane does: the stall sample, a linked
-//! barrier's clock rebased and completed, a write-through completion.
+//! A change to these calls is judged against its parent by the same frame
+//! functions: the parent's ledger, copied into a bench-only module beside
+//! these legs, is its A until the verdict is recorded, with the A/A
+//! control, a `-plus-one` plant on every leg and the rule's own red.
 //!
 //! The instrument: exact user-space instructions per op,
 //! `(I(n) − I(0)) / n` at `n` = 10⁷, read outside this binary
-//! (`perf stat -e instructions:u`) on one pinned core, legs A B B A twice
-//! and A″ B″ B″ A″ twice at each shape. A run judges only when its
-//! controls, each a leg of this binary, hold:
+//! (`perf stat -e instructions:u`) on one pinned core. Its controls, each a
+//! leg of this binary:
 //!
-//! - the same binary against itself: A against A, B against B, A″ against
-//!   A″ and B″ against B″ within 0.05 per op at each shape, at a
-//!   resolution of 0.01 per op at `n` = 10⁷;
-//! - liveness: the twelve `-plus-one` legs (`parent-`, `ledger-`,
-//!   `parent-flight-` and `ledger-plane-` at each shape), one `nop` per op,
-//!   read their leg + 1.00 ± 0.05;
-//! - the rule's own red at each shape: `parent-write-through-plus-5`,
-//!   `parent-linked-plus-43` and `parent-plain-plus-54`, A with the bound
-//!   where the queueing holds the registration plus one in `nop`s, read
-//!   over the bound: B reads below A at write-through, so a red planted on
-//!   B there would read under its bound;
+//! - the same binary against itself: each leg against itself within 0.05
+//!   per op, at a resolution of 0.01 per op at `n` = 10⁷;
+//! - liveness: the six `-plus-one` legs, one `nop` per op, read their
+//!   leg + 1.00 ± 0.05;
 //! - engagement: after each leg's loop, outside the counted function, the
 //!   ledger's stats read one frame queued and one barrier of the shape per
 //!   op (none at plain), or the leg panics.
@@ -77,7 +49,6 @@
 //!
 //! `v` is a leg of `LEGS`; `n` ≥ 0 (0 is the I(0) leg).
 
-use std::collections::VecDeque;
 use std::hint::black_box;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -91,9 +62,6 @@ use inf_log::{
     MutationEffect, NsId, SegmentId, StagingConfig, StagingRing,
 };
 
-#[path = "ledger_frame/parent.rs"]
-mod parent;
-
 /// The frame shapes the LOG step runs.
 #[derive(Copy, Clone)]
 enum Shape {
@@ -102,42 +70,25 @@ enum Shape {
     Plain,
 }
 
-/// A, B, A″ and B″.
+/// The ledger alone, or with the plane's consumer of its flight.
 #[derive(Copy, Clone)]
 enum Version {
-    Parent,
     Ledger,
-    ParentFlight,
     LedgerPlane,
 }
 
 /// Each leg: its name, its version, its shape and its plant in `nop`s.
-const LEGS: [(&str, Version, Shape, u8); 27] = [
-    ("parent-write-through", Version::Parent, Shape::WriteThrough, 0),
-    ("parent-write-through-plus-one", Version::Parent, Shape::WriteThrough, 1),
+const LEGS: [(&str, Version, Shape, u8); 12] = [
     ("ledger-write-through", Version::Ledger, Shape::WriteThrough, 0),
     ("ledger-write-through-plus-one", Version::Ledger, Shape::WriteThrough, 1),
-    ("parent-write-through-plus-5", Version::Parent, Shape::WriteThrough, 5),
-    ("parent-linked", Version::Parent, Shape::Linked, 0),
-    ("parent-linked-plus-one", Version::Parent, Shape::Linked, 1),
     ("ledger-linked", Version::Ledger, Shape::Linked, 0),
     ("ledger-linked-plus-one", Version::Ledger, Shape::Linked, 1),
-    ("parent-linked-plus-43", Version::Parent, Shape::Linked, 43),
-    ("parent-plain", Version::Parent, Shape::Plain, 0),
-    ("parent-plain-plus-one", Version::Parent, Shape::Plain, 1),
     ("ledger-plain", Version::Ledger, Shape::Plain, 0),
     ("ledger-plain-plus-one", Version::Ledger, Shape::Plain, 1),
-    ("parent-plain-plus-54", Version::Parent, Shape::Plain, 54),
-    ("parent-flight-write-through", Version::ParentFlight, Shape::WriteThrough, 0),
-    ("parent-flight-write-through-plus-one", Version::ParentFlight, Shape::WriteThrough, 1),
     ("ledger-plane-write-through", Version::LedgerPlane, Shape::WriteThrough, 0),
     ("ledger-plane-write-through-plus-one", Version::LedgerPlane, Shape::WriteThrough, 1),
-    ("parent-flight-linked", Version::ParentFlight, Shape::Linked, 0),
-    ("parent-flight-linked-plus-one", Version::ParentFlight, Shape::Linked, 1),
     ("ledger-plane-linked", Version::LedgerPlane, Shape::Linked, 0),
     ("ledger-plane-linked-plus-one", Version::LedgerPlane, Shape::Linked, 1),
-    ("parent-flight-plain", Version::ParentFlight, Shape::Plain, 0),
-    ("parent-flight-plain-plus-one", Version::ParentFlight, Shape::Plain, 1),
     ("ledger-plane-plain", Version::LedgerPlane, Shape::Plain, 0),
     ("ledger-plane-plain-plus-one", Version::LedgerPlane, Shape::Plain, 1),
 ];
@@ -187,43 +138,12 @@ impl Staging {
     }
 }
 
-struct ParentLeg {
-    staging: Staging,
-    ledger: parent::GroupCommit<MemFile>,
-}
-
 struct LedgerLeg {
     staging: Staging,
     ledger: GroupCommit<MemFile>,
 }
 
-/// A: the parent's ledger, the plan matched as the parent's LOG step did.
-#[inline(never)]
-fn parent_frame(
-    leg: &mut ParentLeg,
-    always: bool,
-    write_through_ok: bool,
-    seal_ahead: bool,
-) -> u64 {
-    let class = if always { parent::FsyncClass::Always } else { parent::FsyncClass::Everysec };
-    leg.ledger.note_staged(class);
-    let plan = leg.ledger.frame_plan(write_through_ok, seal_ahead);
-    let (lease, end) = leg.staging.seal();
-    let now = leg.staging.now;
-    let id = leg.ledger.note_frame_queued(end, lease.frame_len());
-    let ticket = match plan {
-        parent::FramePlan::WriteThrough => Some(leg.ledger.register_write_through(now)),
-        parent::FramePlan::LinkedFsync => Some(leg.ledger.register_linked_fsync(now)),
-        parent::FramePlan::Plain => None,
-        parent::FramePlan::Wait => unreachable!("a waiting frame is never sealed"),
-    };
-    leg.ledger.note_frame_written(id);
-    leg.staging.ring.release(lease);
-    let durable = ticket.and_then(|ticket| leg.ledger.on_fsync_complete(ticket, now));
-    durable.map_or(0, Lsn::to_u64)
-}
-
-/// B: the ledger as built, the same LOG step, the lease carried by its
+/// The ledger as built: the LOG step's calls, the lease carried by its
 /// frame queue.
 #[inline(never)]
 fn ledger_frame(
@@ -250,75 +170,8 @@ fn ledger_frame(
     durable.map_or(0, Lsn::to_u64)
 }
 
-/// The parent plane's entry for a frame in flight: the frame, its lease,
-/// its submit time and its barrier, keyed by the frame.
-struct ParentInFlight {
-    id: parent::FrameId,
-    lease: inf_log::FrameLease,
-    submitted_at: Nanos,
-    barrier: ParentBarrier,
-}
-
-/// The parent plane's barrier for a frame in flight.
-#[derive(Copy, Clone)]
-enum ParentBarrier {
-    None,
-    Linked(parent::FsyncTicket),
-    WriteThrough(parent::FsyncTicket),
-}
-
-struct ParentFlightLeg {
-    staging: Staging,
-    ledger: parent::GroupCommit<MemFile>,
-    in_flight: VecDeque<ParentInFlight>,
-}
-
-/// A″: A with the parent plane's in-flight table and the plane's consumer.
-#[inline(never)]
-fn parent_flight_frame(
-    leg: &mut ParentFlightLeg,
-    always: bool,
-    write_through_ok: bool,
-    seal_ahead: bool,
-) -> u64 {
-    let class = if always { parent::FsyncClass::Always } else { parent::FsyncClass::Everysec };
-    leg.ledger.note_staged(class);
-    let plan = leg.ledger.frame_plan(write_through_ok, seal_ahead);
-    let (lease, end) = leg.staging.seal();
-    let now = leg.staging.now;
-    let id = leg.ledger.note_frame_queued(end, lease.frame_len());
-    let barrier = match plan {
-        parent::FramePlan::WriteThrough => {
-            ParentBarrier::WriteThrough(leg.ledger.register_write_through(now))
-        }
-        parent::FramePlan::LinkedFsync => {
-            ParentBarrier::Linked(leg.ledger.register_linked_fsync(now))
-        }
-        parent::FramePlan::Plain => ParentBarrier::None,
-        parent::FramePlan::Wait => unreachable!("a waiting frame is never sealed"),
-    };
-    leg.in_flight.push_back(ParentInFlight { id, lease, submitted_at: now, barrier });
-    let index = leg
-        .in_flight
-        .iter()
-        .position(|frame| frame.id == id)
-        .expect("LogWritten for a frame not in flight");
-    let frame = leg.in_flight.remove(index).expect("index from position");
-    let stall = now.saturating_sub(frame.submitted_at).as_micros();
-    leg.ledger.note_frame_written(frame.id);
-    leg.staging.ring.release(frame.lease);
-    let durable = match frame.barrier {
-        ParentBarrier::None => None,
-        ParentBarrier::Linked(ticket) => {
-            leg.ledger.rebase_clock(ticket, now);
-            leg.ledger.on_fsync_complete(ticket, now)
-        }
-        ParentBarrier::WriteThrough(ticket) => leg.ledger.on_fsync_complete(ticket, now),
-    };
-    durable.map_or(0, Lsn::to_u64) ^ stall
-}
-
-/// B″: B with the same consumer, the flight handed back by the queue.
+/// The same frame with the plane's consumer of the flight the queue hands
+/// back.
 #[inline(never)]
 fn ledger_plane_frame(
     leg: &mut LedgerLeg,
@@ -370,9 +223,6 @@ macro_rules! drive {
         match $nops {
             0 => go!(0),
             1 => go!(1),
-            5 => go!(5),
-            43 => go!(43),
-            54 => go!(54),
             _ => unreachable!("a plant of LEGS"),
         }
         accumulator
@@ -405,41 +255,9 @@ fn engaged(shape: Shape, ops: u64, write_through: u64, linked: u64, queued: u64)
 fn run(version: Version, shape: Shape, nops: u8, ops: u64, census: &Rc<CapCensus>) -> u64 {
     let (always, write_through_ok) = inputs(shape);
     match version {
-        Version::Parent => {
-            let mut state =
-                ParentLeg { staging: Staging::new(), ledger: parent::GroupCommit::new(census) };
-            let accumulator = drive!(state, parent_frame, nops, ops, always, write_through_ok);
-            let stats = state.ledger.stats();
-            engaged(
-                shape,
-                ops,
-                stats.fsyncs_write_through,
-                stats.fsyncs_linked,
-                stats.frames_queued,
-            );
-            accumulator
-        }
         Version::Ledger => {
             let mut state = LedgerLeg { staging: Staging::new(), ledger: GroupCommit::new(census) };
             let accumulator = drive!(state, ledger_frame, nops, ops, always, write_through_ok);
-            let stats = state.ledger.stats();
-            engaged(
-                shape,
-                ops,
-                stats.fsyncs_write_through,
-                stats.fsyncs_linked,
-                stats.frames_queued,
-            );
-            accumulator
-        }
-        Version::ParentFlight => {
-            let mut state = ParentFlightLeg {
-                staging: Staging::new(),
-                ledger: parent::GroupCommit::new(census),
-                in_flight: VecDeque::with_capacity(1),
-            };
-            let accumulator =
-                drive!(state, parent_flight_frame, nops, ops, always, write_through_ok);
             let stats = state.ledger.stats();
             engaged(
                 shape,
