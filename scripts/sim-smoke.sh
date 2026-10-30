@@ -35,6 +35,10 @@ bin=target/release/inf-sim
 # where the 64 MiB round is more ops than one turn's visits and the
 # retry group is built behind a run of done writes: a leg is named,
 # never drawn from the seed.
+# m2-ledger-wedge runs its main leg (a seal held while 128 writers keep the
+# log rotating: at most one segment id appears inside the hold) and its
+# control (one writer: no rotation and no new segment inside the hold) on
+# their own rows.
 # m4-epoch-marks runs its two legs on their own rows: the everysec leg (no
 # wedge, every merge of the reclaim marks exact, no crossing) and the wedge
 # leg (a seal held at the ledger's front with write-through frames behind
@@ -55,6 +59,8 @@ rows=(
   "m2-fill-tick"
   "m2-group-hold"
   "m2-fua-pending"
+  "m2-ledger-wedge --wedge-leg main --verify-determinism"
+  "m2-ledger-wedge --wedge-leg control --verify-determinism"
   "m2-ckpt-refused"
   "m2-recycle"
   "m2-combined"

@@ -33,8 +33,13 @@ pub const EPOCH_MARKS: Cap = Cap::entries::<EPOCH_MARKS_MAX>("epoch-marks", CapF
 /// LOG step asks the map's admission before the frame's plan and holds the
 /// frame while it is full (derived never to occur; `frame_waits_ack_map`
 /// counts the episodes).
+#[cfg(not(inf_canary_ack_map_window_only))]
 pub const ACK_MAP_ENTRIES: u32 =
     inf_log::limits::REORDER_WINDOW_FRAMES + inf_log::limits::FSYNC_LEDGER_ENTRIES + 1;
+/// Canary: the ack map sized as the frame queue alone, so it fills while
+/// unfolded ledger entries keep their points.
+#[cfg(inf_canary_ack_map_window_only)]
+pub const ACK_MAP_ENTRIES: u32 = inf_log::limits::REORDER_WINDOW_FRAMES;
 
 /// The ack map's cap: `ACK_MAP_ENTRIES` entries under the census name
 /// `ack-map`, filled while the cell serves.

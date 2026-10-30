@@ -57,9 +57,11 @@ use crate::resp::reply_len;
 mod audit;
 #[cfg(test)]
 mod lastsave;
+mod ledger_wedge;
 #[cfg(test)]
 mod park;
 mod run;
+pub use ledger_wedge::{LedgerWedgeLeg, LedgerWedgeReport};
 pub use run::run_durable_scenario;
 
 pub(crate) use audit::survival_audit;
@@ -288,6 +290,13 @@ pub struct DurableScenario {
     /// the cut. `None` everywhere else: every other trace stays
     /// byte-identical.
     pub epoch_marks: Option<EpochMarksLeg>,
+    /// The ledger-wedge shape (`m2-ledger-wedge`): `Some` holds the first
+    /// pre-zeroed segment's fdatasyncs on the sim disk while the leg's
+    /// writers keep the log rotating, and judges the fsync ledger's
+    /// rotation class by the segment ids that appear inside the hold
+    /// ([`LedgerWedgeLeg`]). `None` everywhere else: every other trace
+    /// stays byte-identical.
+    pub ledger_wedge: Option<LedgerWedgeLeg>,
 }
 
 /// The epoch-marks shape's legs, chosen by name (`--marks-leg`), never by
@@ -946,6 +955,7 @@ impl DurableScenario {
             spin_iters: Self::SPIN_ITERS,
             tier_budget: None,
             epoch_marks: None,
+            ledger_wedge: None,
         }
     }
 
@@ -1092,10 +1102,14 @@ impl DurableScenario {
     /// seal (a FLUSH-class fdatasync on a device whose flush base is
     /// 10 ms while FUA writes complete in 40 µs), so on 64 KiB segments
     /// every rotation opens a window in which dozens of FUA frames land
-    /// and fold nowhere. 48 writers, one command in flight each: the
-    /// pre-fix peak is ~the writer count; the fixed ledger holds at
-    /// `WRITE_THROUGH_WINDOW_ENTRIES`. No stall episodes (the wedge is
-    /// the seal itself); the m2 durability oracle unchanged.
+    /// and fold nowhere. 48 writers, one command in flight each: an
+    /// unbounded ledger peaks at about the writer count. Here the unfolded
+    /// write-through tickets peak at 13–15, under the window of
+    /// `WRITE_THROUGH_WINDOW_ENTRIES` (16): a recycled file keeps one
+    /// sentinel block, leaving 15 frame blocks, and a rotation frame waits
+    /// behind the seal. `m2-ledger-wedge` reaches the window, holding a seal
+    /// while sixteen one-block frames land behind it. No stall episodes (the
+    /// wedge is the seal itself); the m2 durability oracle unchanged.
     #[must_use]
     pub fn m2_fua_pending(seed: u64) -> DurableScenario {
         let mut scenario = DurableScenario::m2_durable(seed);
@@ -1327,6 +1341,7 @@ impl DurableScenario {
             spin_iters: Self::SPIN_ITERS,
             tier_budget: None,
             epoch_marks: None,
+            ledger_wedge: None,
         }
     }
 
@@ -1494,6 +1509,7 @@ impl DurableScenario {
             spin_iters: Self::SPIN_ITERS,
             tier_budget: None,
             epoch_marks: None,
+            ledger_wedge: None,
         }
     }
 }
@@ -1679,6 +1695,8 @@ pub struct DurableReport {
     /// The epoch-marks shape's reclaim-marks row per cell at the cut (empty
     /// off the shape).
     pub epoch_marks_cells: Vec<EpochMarksCell>,
+    /// The ledger-wedge shape's readings at the cut (`None` off the shape).
+    pub ledger_wedge: Option<LedgerWedgeReport>,
 }
 
 /// One cell's reclaim-marks census row at the cut of an epoch-marks run.

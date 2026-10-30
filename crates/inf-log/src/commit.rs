@@ -1254,6 +1254,13 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// An entry of `class` was registered: its count rises (the extent
     /// class's window rose with its publish).
     fn class_raised(&mut self, class: LedgerClass) {
+        // Canary: the rotation's seals are left out of their class's
+        // count, here and at the fold, so the plan and the class assertion
+        // both pass and the rotations run unpaced.
+        #[cfg(inf_canary_ledger_rotation_unpaced)]
+        if class == LedgerClass::Seal {
+            return;
+        }
         if let Some(slot) = class.counted() {
             self.unfolded[slot] += 1;
         }
@@ -1262,6 +1269,10 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// An entry of `class` folded: its count falls (the extent class's
     /// window pops at the same fold).
     fn class_folded(&mut self, class: LedgerClass) {
+        #[cfg(inf_canary_ledger_rotation_unpaced)]
+        if class == LedgerClass::Seal {
+            return;
+        }
         if let Some(slot) = class.counted() {
             debug_assert!(self.unfolded[slot] > 0, "a class count fell below its entries");
             self.unfolded[slot] -= 1;
@@ -1321,6 +1332,8 @@ impl<File: SegmentFile> GroupCommit<File> {
             failed: false,
             held,
         });
+        // The plant leaves the seals out of their count on purpose.
+        #[cfg(not(inf_canary_ledger_rotation_unpaced))]
         debug_assert!(
             LedgerClass::ALL.iter().all(|&class| {
                 let entries =

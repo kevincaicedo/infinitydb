@@ -84,7 +84,8 @@ pub use coldstorm::{ColdStormReport, ColdStormScenario, run_cold_storm_scenario}
 pub use combined::{CombinedReport, CombinedScenario, run_combined_scenario};
 pub use diskfull::{DiskfullReport, DiskfullScenario, run_diskfull_scenario};
 pub use durable::{
-    DurableReport, DurableScenario, EpochMarksLeg, TierBudgetLeg, run_durable_scenario,
+    DurableReport, DurableScenario, EpochMarksLeg, LedgerWedgeLeg, TierBudgetLeg,
+    run_durable_scenario,
 };
 pub use extent_window::{
     ExtentWindowLeg, ExtentWindowReport, ExtentWindowScenario, run_extent_window_scenario,
@@ -119,6 +120,7 @@ pub const SCENARIOS: &[&str] = &[
     "m2-fill-tick",
     "m2-group-hold",
     "m2-fua-pending",
+    "m2-ledger-wedge",
     "m2-ckpt-refused",
     "m2-recycle",
     "m2-combined",

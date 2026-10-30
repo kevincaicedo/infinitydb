@@ -145,6 +145,7 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         spin_iters: DurableScenario::SPIN_ITERS,
         tier_budget: None,
         epoch_marks: None,
+        ledger_wedge: None,
     }
 }
 

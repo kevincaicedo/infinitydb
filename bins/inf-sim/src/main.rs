@@ -17,8 +17,8 @@
 
 use inf_sim::net::Plant;
 use inf_sim::{
-    CombinedScenario, DurableScenario, EpochMarksLeg, ExtentWindowLeg, Scenario, TierBudgetLeg,
-    run_combined_scenario, run_durable_scenario, run_scenario,
+    CombinedScenario, DurableScenario, EpochMarksLeg, ExtentWindowLeg, LedgerWedgeLeg, Scenario,
+    TierBudgetLeg, run_combined_scenario, run_durable_scenario, run_scenario,
 };
 use inf_sim::{RecoveryScenario, SeedClass, SpecVariant};
 
@@ -91,6 +91,8 @@ fn main() {
     let mut marks_leg: Option<EpochMarksLeg> = None;
     // m4-extent-window's leg, named the same way.
     let mut window_leg: Option<ExtentWindowLeg> = None;
+    // m2-ledger-wedge's leg, named the same way.
+    let mut wedge_leg: Option<LedgerWedgeLeg> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -153,6 +155,12 @@ fn main() {
                         format!("unknown marks leg {name}; the legs are {}", marks_leg_names())
                     })?);
                 }
+                "--wedge-leg" => {
+                    let name = take("--wedge-leg")?;
+                    wedge_leg = Some(LedgerWedgeLeg::parse(&name).ok_or_else(|| {
+                        format!("unknown wedge leg {name}; the legs are {}", wedge_leg_names())
+                    })?);
+                }
                 "--window-leg" => {
                     let name = take("--window-leg")?;
                     window_leg = Some(ExtentWindowLeg::parse(&name).ok_or_else(|| {
@@ -172,14 +180,15 @@ fn main() {
                          tier-write-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--replay-above-window] \
                          [--spec-variant ring-top|page] [--tier-leg {}] [--marks-leg {}] \
-                         [--window-leg {}] \
+                         [--window-leg {}] [--wedge-leg {}] \
                          [--cells N] [--connections N] [--commands N] [--wheel-nodes-max N] \
                          [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
                         inf_sim::SCENARIOS.join("|"),
                         tier_leg_names(),
                         marks_leg_names(),
-                        window_leg_names()
+                        window_leg_names(),
+                        wedge_leg_names()
                     );
                     std::process::exit(0);
                 }
@@ -236,6 +245,18 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // m2-ledger-wedge names its leg, and only it has one.
+    match (scenario_name.as_str(), wedge_leg) {
+        ("m2-ledger-wedge", None) => {
+            eprintln!("inf-sim: m2-ledger-wedge needs --wedge-leg {}", wedge_leg_names());
+            std::process::exit(2);
+        }
+        ("m2-ledger-wedge", Some(_)) | (_, None) => {}
+        (other, Some(_)) => {
+            eprintln!("inf-sim: --wedge-leg is m2-ledger-wedge's; {other} has no leg");
+            std::process::exit(2);
+        }
+    }
     // m4-extent-window names its leg, and only it has one.
     match (scenario_name.as_str(), window_leg) {
         ("m4-extent-window", None) => {
@@ -265,6 +286,7 @@ fn main() {
             | "m2-fill-tick"
             | "m2-group-hold"
             | "m2-fua-pending"
+            | "m2-ledger-wedge"
             | "m2-ckpt-refused"
             | "m2-recycle"
             | "m3-document"
@@ -279,6 +301,7 @@ fn main() {
             lift_regime,
             tier_leg,
             marks_leg,
+            wedge_leg,
             verify,
             sweep,
             shard,
@@ -1544,6 +1567,11 @@ fn marks_leg_names() -> String {
     EpochMarksLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
 }
 
+/// The `--wedge-leg` names, `|`-joined for a message.
+fn wedge_leg_names() -> String {
+    LedgerWedgeLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
+}
+
 /// The `--window-leg` names, `|`-joined for a message.
 fn window_leg_names() -> String {
     ExtentWindowLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
@@ -1601,6 +1629,7 @@ fn run_durable(
     lift_regime: bool,
     tier_leg: Option<TierBudgetLeg>,
     marks_leg: Option<EpochMarksLeg>,
+    wedge_leg: Option<LedgerWedgeLeg>,
     verify: bool,
     sweep: Option<u64>,
     (shard_i, shard_k): (u64, u64),
@@ -1616,6 +1645,10 @@ fn run_durable(
             "m2-fill-tick" => DurableScenario::m2_fill_tick(seed),
             "m2-group-hold" => DurableScenario::m2_group_hold(seed),
             "m2-fua-pending" => DurableScenario::m2_fua_pending(seed),
+            "m2-ledger-wedge" => DurableScenario::m2_ledger_wedge(
+                seed,
+                wedge_leg.expect("the caller refused m2-ledger-wedge without a leg"),
+            ),
             "m2-ckpt-refused" => DurableScenario::m2_ckpt_refused(seed),
             "m2-recycle" => DurableScenario::m2_recycle(seed),
             "m3-document" => DurableScenario::m3_document(seed),
@@ -1682,6 +1715,26 @@ fn run_durable(
         );
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
         print_census(report.cap_rows_checked, report.cap_rows_crossed);
+        if let Some(wedge) = &report.ledger_wedge {
+            println!(
+                "inf-sim: ledger wedge leg {}: armed at step {:?}, hold from step {:?} to {:?}, \
+                 seal folded at step {:?}, driver held at most {} fdatasync(s); segment ids \
+                 inside the hold {:?}; frame_waits_ledger {} frame_waits_ack_map {} \
+                 ledger_prealloc_deferrals {} fsync_entries_max {} write_through_entries_max {}",
+                wedge.leg.name(),
+                wedge.armed_at,
+                wedge.engaged_at,
+                wedge.lifted_at,
+                wedge.folded_at,
+                wedge.held_max,
+                wedge.ids_inside_hold,
+                wedge.frame_waits_ledger,
+                report.frame_waits_ack_map,
+                report.ledger_prealloc_deferrals,
+                report.fsync_entries_max,
+                report.write_through_entries_max
+            );
+        }
         for marks in &report.epoch_marks_cells {
             println!(
                 "inf-sim: epoch marks cell {}: high_water {} of {}, crossings {}",

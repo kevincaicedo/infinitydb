@@ -255,6 +255,24 @@ rows=(
   # The leg's vacuity plant: no wedge, so the queue never fills and the
   # leg's engagement reads it.
   "inf_canary_reorder_wedge_zero m2-reorder-window frame-queue-unengaged"
+  # The fsync ledger's rotation class on the ledger-wedge leg, whose sim
+  # disk holds a seal while the log keeps rotating. The seals left out of
+  # their class's count: the rotations run unpaced and three or more
+  # segment ids appear inside the hold, which the leg's disk clause reads
+  # from the sim disk's names, and the hold counter reads none.
+  "inf_canary_ledger_rotation_unpaced m2-ledger-wedge wedge-ids-over --wedge-leg main"
+  "inf_canary_ledger_rotation_unpaced m2-ledger-wedge wedge-hold-uncounted --wedge-leg main"
+  # The ack map sized as the frame queue alone: inside the hold sixteen
+  # write-through frames keep their points behind the held seal, and the
+  # seventeenth finds the map full, which the derived-counter clause reads.
+  "inf_canary_ack_map_window_only m2-ledger-wedge ack-map-held --wedge-leg main"
+  # The leg's three vacuity plants, one per clause: the log `Buffered` (no
+  # class-upgrade rotation, so no arming), the hold on the first segment
+  # (no fdatasync names it after the arming), and a 1 ms hold (too short
+  # for sixteen frames to land behind the seal).
+  "inf_canary_wedge_buffered m2-ledger-wedge wedge-arming-unreached --wedge-leg main"
+  "inf_canary_wedge_wrong_name m2-ledger-wedge wedge-hold-unengaged --wedge-leg main"
+  "inf_canary_wedge_short_hold m2-ledger-wedge wedge-window-unreached --wedge-leg main"
   # The first plant at the edges of the capped holders no leg fills to
   # their cap, at the unit tier, each test's own token: the fsync ledger
   # (44, the class budgets' sum), the ack map (61, the queue, the ledger

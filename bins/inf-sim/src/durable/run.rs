@@ -87,6 +87,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         lift_plant_sidecars: 0,
         tier_budget_cells: Vec::new(),
         epoch_marks_cells: Vec::new(),
+        ledger_wedge: None,
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -533,6 +534,11 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let total_ops: u64 = writers.iter().map(|w| w.quota).sum();
     let cut_step = 200 + rng.next_below(total_ops * 6);
     let cut_step = scenario.epoch_marks.map_or(cut_step, |leg| leg.cut_step(cut_step));
+    // The ledger-wedge leg cuts on its own reading (`LedgerWedge::cut_due`),
+    // at the seeded step or after the held seal's fold.
+    let seeded_cut = cut_step;
+    let mut ledger_wedge = scenario.ledger_wedge.map(ledger_wedge::LedgerWedge::new);
+    let cut_step = if ledger_wedge.is_some() { u64::MAX } else { cut_step };
     // M3-S23: two seeded mid-run equivalence instants. Each quiesces
     // (drain in-flight, send nothing new), compares live state against a
     // read-only shadow replay, then resumes. The cut itself is never
@@ -564,6 +570,12 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         }
         log_oracle.sample(&node, &mut report);
         tier_oracle.sample(&node, &disk, scenario, &mut report);
+        if let Some(wedge) = ledger_wedge.as_mut() {
+            wedge.observe(step, &node, &disk, clock.now());
+            if wedge.cut_due(step, seeded_cut) {
+                break;
+            }
+        }
         let quiesce = next_check < checks_at.len() && step >= checks_at[next_check];
         let mut progress = 0u64;
         for writer in &mut writers {
@@ -771,6 +783,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let cut_time = clock.now();
     if let Some(leg) = scenario.epoch_marks {
         epoch_marks_scrape(scenario, leg, &node, &mut report);
+    }
+    if let Some(wedge) = &ledger_wedge {
+        wedge.judge(scenario.seed, &node, &mut report);
     }
     for cell in 0..usize::from(scenario.cells) {
         if let Some(stats) = node.plane(cell).durable_stats() {

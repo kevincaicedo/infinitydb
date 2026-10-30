@@ -365,6 +365,13 @@ impl SimDriver {
     pub fn queued_tier_io(&self) -> (u64, u64) {
         tier_io_of(&self.ops)
     }
+
+    /// Fdatasyncs the disk holds now ([`SimDisk::hold_syncs`]): submitted
+    /// by the plane and kept from the device until the hold lifts — the
+    /// harness's own reading of a held barrier, no product counter.
+    pub fn held_syncs(&self) -> usize {
+        self.held_syncs.len()
+    }
 }
 
 /// Moves every held fdatasync whose hold has lifted to the front of `ops`,
