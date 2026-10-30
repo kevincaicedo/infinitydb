@@ -286,10 +286,11 @@ impl TierFlushError {
 }
 
 /// The per-namespace flush pipeline (one per (cell, tiered namespace) —
-/// L1: cell-local, single owner). Its reactor-drive holders — the window
-/// pool, the round's ops and effects, its staged seals and directory
-/// holds — are capped, built whole with the pipeline and rows of its
-/// cell's census, so a round allocates nothing.
+/// L1: cell-local, single owner). Its reactor-drive holders are built with
+/// the pipeline, so a round allocates nothing: the window pool whole, as
+/// fixed storage; the round's ops and effects and its staged seals as
+/// capped holders built empty, rows of its cell's census. The created
+/// file's two directory handles are one value the round moves in.
 pub struct TierFlush<F: SegmentFs> {
     fs: F,
     config: TierFlushConfig,
@@ -394,10 +395,11 @@ impl<F: SegmentFs> TierFlush<F> {
     /// Panics on a zero capacity/slice config, a catalog not strictly
     /// ascending by id and base, or `next_id` not above every seeded id;
     /// and when an allocation of the reactor holders is refused — the
-    /// window pool's slices and windows, the round's capped holders and
-    /// seals, each built empty — the allocation fail-stop every `Vec`
-    /// growth takes. `max(S, M)` above `TIER_SPAN_BYTES_MAX` is the layout
-    /// refusal, which `TierSpec::validate` rules out, and the census
+    /// window pool, built whole (its two boxed slices and each window's
+    /// reserved capacity, nothing written), and the round's capped holders
+    /// and its staged seals, built empty — the allocation fail-stop every
+    /// `Vec` growth takes. `max(S, M)` above `TIER_SPAN_BYTES_MAX` is the
+    /// layout refusal, which `TierSpec::validate` rules out, and the census
     /// refuses only a cap name declared with a second value.
     pub fn with_catalog(
         fs: F,

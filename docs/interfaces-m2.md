@@ -2150,8 +2150,10 @@ The reactor-drive flush state machine (`TierFlush` round state in
   built whole with the pipeline, `⌈max(S, M)/Q⌉` batch windows and 5
   single ones, capacity reserved at the build and each window zeroed at
   its first take (`tier_window_capacity_bytes`,
-  `tier_window_written_bytes` in INFO `# Tripwires`). No holder is filled
-  at the build. Staging cannot fail; the round allocates nothing.
+  `tier_window_written_bytes` in INFO `# Tripwires`). The windows and the
+  directory handles are fixed storage, not capped holders, and the capped
+  holders are built empty, so the build fills no capped holder. Staging
+  cannot fail; the round allocates nothing.
 - **One round in flight per namespace** — by-construction
   (`TierNs::round: Option<FlushRound>`; a plan asserts no round is
   staged, and the pool, on its own state, that no window is out and no
