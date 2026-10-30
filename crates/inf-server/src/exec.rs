@@ -2583,6 +2583,7 @@ mod tests {
                 let mut out = ReplyBuf::over(&mut reply);
                 execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut out);
                 cases += 1;
+                assert!(!out.bytes().is_empty(), "{name} {shape:?} wrote no frame");
                 if out.is_error() {
                     errors_seen += 1;
                     errors_for_this += 1;
@@ -2610,6 +2611,39 @@ mod tests {
         eprintln!("{} write rows, {cases} cases, {errors_seen} error replies", covered.len());
         let minimum_cases = if cfg!(feature = "doc") { 150 } else { 128 };
         assert!(cases >= minimum_cases && errors_seen >= 80, "{cases} cases, {errors_seen} errors");
+    }
+
+    /// Every command writes at least one top-level frame (ADR-0190 D2): a
+    /// reply opened past an earlier reply's bytes ends longer than it
+    /// began, for every registry row, at its arity's shapes (none, exact,
+    /// one over) and in both connection kinds. The origin refuses a
+    /// zero-byte leg, so an arm that writes nothing would turn a command
+    /// into a cross-cell refusal; this row names the arm instead.
+    #[test]
+    fn every_command_writes_at_least_one_frame() {
+        use inf_wire::COMMANDS;
+
+        const ARGS: [&[u8]; 8] = [b"k", b"1", b"v", b"0", b"x", b"2", b"y", b"3"];
+        for meta in &COMMANDS {
+            let exact = usize::from(meta.arity.unsigned_abs());
+            for program in [false, true] {
+                let mut cx = ConnCx { program, ..ConnCx::try_default().expect("fixture cache") };
+                let mut store = Keyspace::new(StoreConfig::default());
+                for argc in [1, exact, exact + 1] {
+                    let argv: Vec<&[u8]> = std::iter::once(meta.name.as_bytes())
+                        .chain(ARGS.iter().copied().cycle().take(argc.saturating_sub(1)))
+                        .collect();
+                    let mut buf = b"+earlier\r\n".to_vec();
+                    let mut out = ReplyBuf::over(&mut buf);
+                    execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut out);
+                    assert!(
+                        !out.bytes().is_empty(),
+                        "{} with {argc} args wrote no frame",
+                        meta.name
+                    );
+                }
+            }
+        }
     }
 
     /// Review of 2026-08-30 (H2 / F-L13-06, F-L17-11, ADR-0098): `MSET` is
