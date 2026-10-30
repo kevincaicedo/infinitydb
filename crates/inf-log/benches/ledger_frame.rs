@@ -5,12 +5,14 @@
 )]
 //! The fsync ledger's A/B by instructions (L4): one frame per op through the
 //! LOG step's ledger calls — staged, planned with its arguments at
-//! runtime, sealed, queued, its barrier registered by a match on the plan,
-//! written, and folded at the barrier's completion — on the ledger before
-//! its classes and capped holders (A, `parent`) and on the ledger as built
-//! (B, `ledger`), from one binary. Each version is one non-generic
-//! `#[inline(never)]` frame function called through `&mut`, the shape every
-//! frame of a cell takes; the ledger's entry points stay out of line. Both
+//! runtime, sealed, queued with its barrier, written, and folded at the
+//! barrier's completion — on the ledger before its classes and capped
+//! holders (A, `parent`, whose LOG step registers the barrier by a match
+//! on the plan after the queueing) and on the ledger as built (B,
+//! `ledger`, whose one queueing call registers it), from one binary. Each
+//! version is one non-generic `#[inline(never)]` frame function called
+//! through `&mut`, the shape every frame of a cell takes; the ledger's
+//! entry points stay out of line. Both
 //! stage one record and seal it on a real staging ring at one frame in
 //! flight and release the lease after the write, so the staging work is
 //! common to both.
@@ -20,15 +22,14 @@
 //! answers no: a linked fdatasync) and plain (`everysec` staged: no sync
 //! due).
 //!
-//! The verdict rule, B − A per frame at each shape the LOG step runs: ≤ 50
-//! instructions for a write-through frame, ≤ 90 for a frame with a linked
-//! fdatasync, ≤ 42 for a plain frame: the flight's custody the queue
-//! carries, `frame_plan`'s hold reason and its new questions, the frame
-//! queue's and the ledger's capped pairs, and the class counts, less the
-//! parent's iterator for the write-through base. Over at any shape, the
-//! change does not merge. The bounds are read on x86-64 at the pinned
-//! toolchain; on another target or toolchain each term is re-read before a
-//! verdict.
+//! The verdict rule, B − A per frame at each shape the LOG step runs: ≤ 4
+//! instructions for a write-through frame, ≤ 42 for a frame with a linked
+//! fdatasync, ≤ 53 for a plain frame where the queueing holds the ledger's
+//! registration, and ≤ 31, ≤ 68, ≤ 53 where it calls it; the rule's red is
+//! the parent leg with one instruction more than the bound. The queueing's
+//! disassembly says which column binds. Over at any shape, the change does
+//! not merge. The bounds are read on x86-64 at the pinned toolchain; on
+//! another target or toolchain each term is re-read before a verdict.
 //!
 //! The custody legs, the parent's ledger with its plane's in-flight table
 //! against B with the same consumer, are reported beside them, never
@@ -51,9 +52,11 @@
 //! - liveness: the twelve `-plus-one` legs (`parent-`, `ledger-`,
 //!   `parent-flight-` and `ledger-plane-` at each shape), one `nop` per op,
 //!   read their leg + 1.00 ± 0.05;
-//! - the rule's own red at each shape: `ledger-write-through-plus-51`,
-//!   `ledger-linked-plus-91` and `ledger-plain-plus-43`, the bound plus one
-//!   in `nop`s, read over the bound whenever B is not cheaper than A;
+//! - the rule's own red at each shape: `parent-write-through-plus-5`,
+//!   `parent-linked-plus-43` and `parent-plain-plus-54`, A with the bound
+//!   where the queueing holds the registration plus one in `nop`s, read
+//!   over the bound: B reads below A at write-through, so a red planted on
+//!   B there would read under its bound;
 //! - engagement: after each leg's loop, outside the counted function, the
 //!   ledger's stats read one frame queued and one barrier of the shape per
 //!   op (none at plain), or the leg panics.
@@ -114,17 +117,17 @@ const LEGS: [(&str, Version, Shape, u8); 27] = [
     ("parent-write-through-plus-one", Version::Parent, Shape::WriteThrough, 1),
     ("ledger-write-through", Version::Ledger, Shape::WriteThrough, 0),
     ("ledger-write-through-plus-one", Version::Ledger, Shape::WriteThrough, 1),
-    ("ledger-write-through-plus-51", Version::Ledger, Shape::WriteThrough, 51),
+    ("parent-write-through-plus-5", Version::Parent, Shape::WriteThrough, 5),
     ("parent-linked", Version::Parent, Shape::Linked, 0),
     ("parent-linked-plus-one", Version::Parent, Shape::Linked, 1),
     ("ledger-linked", Version::Ledger, Shape::Linked, 0),
     ("ledger-linked-plus-one", Version::Ledger, Shape::Linked, 1),
-    ("ledger-linked-plus-91", Version::Ledger, Shape::Linked, 91),
+    ("parent-linked-plus-43", Version::Parent, Shape::Linked, 43),
     ("parent-plain", Version::Parent, Shape::Plain, 0),
     ("parent-plain-plus-one", Version::Parent, Shape::Plain, 1),
     ("ledger-plain", Version::Ledger, Shape::Plain, 0),
     ("ledger-plain-plus-one", Version::Ledger, Shape::Plain, 1),
-    ("ledger-plain-plus-43", Version::Ledger, Shape::Plain, 43),
+    ("parent-plain-plus-54", Version::Parent, Shape::Plain, 54),
     ("parent-flight-write-through", Version::ParentFlight, Shape::WriteThrough, 0),
     ("parent-flight-write-through-plus-one", Version::ParentFlight, Shape::WriteThrough, 1),
     ("ledger-plane-write-through", Version::LedgerPlane, Shape::WriteThrough, 0),
@@ -367,9 +370,9 @@ macro_rules! drive {
         match $nops {
             0 => go!(0),
             1 => go!(1),
+            5 => go!(5),
             43 => go!(43),
-            51 => go!(51),
-            91 => go!(91),
+            54 => go!(54),
             _ => unreachable!("a plant of LEGS"),
         }
         accumulator
