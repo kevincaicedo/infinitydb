@@ -304,116 +304,126 @@ pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         let Some(front) = pending.pop_front() else {
             continue; // barrier held with pending drained: dispatch it now
         };
-        let reply: Vec<u8> = match front {
-            PendingReply::Done(bytes) => bytes,
-            PendingReply::Remote { waiter, proto } => {
-                let outcome = waiter.await;
-                inflight -= 1;
-                render_outcome(&shared, outcome, proto)
-            }
-            PendingReply::Publish { waiter, proto, seq } => {
-                let outcome = waiter.await;
-                inflight -= 1;
-                let mut reply = render_outcome(&shared, outcome, proto);
-                // The owner replied only after this cell acked its fan
-                // leg, so a self-frame stash for `seq` is either already
-                // here or never existed (the publisher was not subscribed
-                // at delivery) — ADR-0101 D4.
-                if let Some(frames) =
-                    shared.with_conn(key, |conn| conn.take_self_push(seq)).flatten()
-                {
-                    reply.extend_from_slice(&frames);
-                }
-                reply
-            }
-            PendingReply::Counted { waiters, acc, proto, refusal } => {
-                // Every leg is awaited so nothing is orphaned in flight;
-                // the fold decides the reply (a count, or the first
-                // error — a leg that is not a count is an error, never
-                // a partial sum: ADR-0093 A3′).
-                let mut fold = CountedFold::new(acc, refusal);
-                for waiter in waiters {
-                    if let Some(unused) = fold.leg(waiter.await, proto) {
-                        shared.recycle_reply_buf(unused);
-                    }
-                    inflight -= 1;
-                }
-                match fold.finish() {
-                    Err(error) => return_error(&shared, error, proto),
-                    Ok(total) => {
-                        let mut reply = shared.take_reply_buf();
-                        RespWriter::new(&mut reply, proto).int(total);
-                        reply
-                    }
-                }
-            }
-            PendingReply::Gather { parts, proto, unwrap_single } => {
-                let mut reply = shared.take_reply_buf();
-                RespWriter::new(&mut reply, proto).array_header(parts.len());
-                for part in parts {
-                    match part {
-                        GatherPart::Done(bytes) => {
-                            let element =
-                                if unwrap_single { strip_single_element(&bytes) } else { &bytes };
-                            reply.extend_from_slice(element);
-                            shared.recycle_reply_buf(bytes);
-                        }
-                        GatherPart::Wait(waiter) => {
-                            let outcome = waiter.await;
-                            inflight -= 1;
-                            match outcome {
-                                OwnedOutcome::Bytes(bytes) => {
-                                    let element = if unwrap_single {
-                                        strip_single_element(&bytes)
-                                    } else {
-                                        &bytes
-                                    };
-                                    reply.extend_from_slice(element);
-                                    shared.recycle_reply_buf(bytes);
-                                }
-                                OwnedOutcome::Ok
-                                | OwnedOutcome::Int(_)
-                                | OwnedOutcome::Nil
-                                | OwnedOutcome::Bool(_)
-                                | OwnedOutcome::Err(_) => RespWriter::new(&mut reply, proto).null(),
-                            }
-                        }
-                    }
-                }
-                reply
-            }
-            PendingReply::Durable { waiter, reply } => {
-                waiter.await;
-                reply
-            }
-            PendingReply::AllOk { waiters, proto, refusal } => {
-                // A refusal (a leg never sent) outranks leg errors: the
-                // fan is known-incomplete, and `+OK` would be a lie.
-                let mut failure: Option<Vec<u8>> = refusal;
-                for waiter in waiters {
-                    let outcome = waiter.await;
-                    inflight -= 1;
-                    if failure.is_none()
-                        && let OwnedOutcome::Bytes(bytes) = &outcome
-                        && bytes.first() == Some(&b'-')
-                    {
-                        failure = Some(bytes.clone());
-                    }
-                }
-                match failure {
-                    Some(error) => error,
-                    None => {
-                        let mut reply = shared.take_reply_buf();
-                        RespWriter::new(&mut reply, proto).simple("OK");
-                        reply
-                    }
-                }
-            }
-        };
+        let reply = settle_reply(&shared, key, front, &mut inflight).await;
         let written = shared.with_conn(key, |conn| conn.out.extend_from_slice(&reply));
         shared.recycle_reply_buf(reply);
         if written.is_none() {
             return;
+        }
+    }
+}
+
+/// Resolves one reply slot, in pipeline order, into the bytes the
+/// connection writes next: a parked remote outcome is awaited here, so
+/// only a genuinely outstanding front suspends the pump.
+async fn settle_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    key: ConnKey,
+    front: PendingReply,
+    inflight: &mut usize,
+) -> Vec<u8> {
+    match front {
+        PendingReply::Done(bytes) => bytes,
+        PendingReply::Remote { waiter, proto } => {
+            let outcome = waiter.await;
+            *inflight -= 1;
+            render_outcome(shared, outcome, proto)
+        }
+        PendingReply::Publish { waiter, proto, seq } => {
+            let outcome = waiter.await;
+            *inflight -= 1;
+            let mut reply = render_outcome(shared, outcome, proto);
+            // The owner replied only after this cell acked its fan
+            // leg, so a self-frame stash for `seq` is either already
+            // here or never existed (the publisher was not subscribed
+            // at delivery) — ADR-0101 D4.
+            if let Some(frames) = shared.with_conn(key, |conn| conn.take_self_push(seq)).flatten() {
+                reply.extend_from_slice(&frames);
+            }
+            reply
+        }
+        PendingReply::Counted { waiters, acc, proto, refusal } => {
+            // Every leg is awaited so nothing is orphaned in flight;
+            // the fold decides the reply (a count, or the first
+            // error — a leg that is not a count is an error, never
+            // a partial sum: ADR-0093 A3′).
+            let mut fold = CountedFold::new(acc, refusal);
+            for waiter in waiters {
+                if let Some(unused) = fold.leg(waiter.await, proto) {
+                    shared.recycle_reply_buf(unused);
+                }
+                *inflight -= 1;
+            }
+            match fold.finish() {
+                Err(error) => return_error(shared, error, proto),
+                Ok(total) => {
+                    let mut reply = shared.take_reply_buf();
+                    RespWriter::new(&mut reply, proto).int(total);
+                    reply
+                }
+            }
+        }
+        PendingReply::Gather { parts, proto, unwrap_single } => {
+            let mut reply = shared.take_reply_buf();
+            RespWriter::new(&mut reply, proto).array_header(parts.len());
+            for part in parts {
+                match part {
+                    GatherPart::Done(bytes) => {
+                        let element =
+                            if unwrap_single { strip_single_element(&bytes) } else { &bytes };
+                        reply.extend_from_slice(element);
+                        shared.recycle_reply_buf(bytes);
+                    }
+                    GatherPart::Wait(waiter) => {
+                        let outcome = waiter.await;
+                        *inflight -= 1;
+                        match outcome {
+                            OwnedOutcome::Bytes(bytes) => {
+                                let element = if unwrap_single {
+                                    strip_single_element(&bytes)
+                                } else {
+                                    &bytes
+                                };
+                                reply.extend_from_slice(element);
+                                shared.recycle_reply_buf(bytes);
+                            }
+                            OwnedOutcome::Ok
+                            | OwnedOutcome::Int(_)
+                            | OwnedOutcome::Nil
+                            | OwnedOutcome::Bool(_)
+                            | OwnedOutcome::Err(_) => RespWriter::new(&mut reply, proto).null(),
+                        }
+                    }
+                }
+            }
+            reply
+        }
+        PendingReply::Durable { waiter, reply } => {
+            waiter.await;
+            reply
+        }
+        PendingReply::AllOk { waiters, proto, refusal } => {
+            // A refusal (a leg never sent) outranks leg errors: the
+            // fan is known-incomplete, and `+OK` would be a lie.
+            let mut failure: Option<Vec<u8>> = refusal;
+            for waiter in waiters {
+                let outcome = waiter.await;
+                *inflight -= 1;
+                if failure.is_none()
+                    && let OwnedOutcome::Bytes(bytes) = &outcome
+                    && bytes.first() == Some(&b'-')
+                {
+                    failure = Some(bytes.clone());
+                }
+            }
+            match failure {
+                Some(error) => error,
+                None => {
+                    let mut reply = shared.take_reply_buf();
+                    RespWriter::new(&mut reply, proto).simple("OK");
+                    reply
+                }
+            }
         }
     }
 }
