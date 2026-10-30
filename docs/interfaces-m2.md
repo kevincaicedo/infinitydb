@@ -763,34 +763,38 @@ the plane's ack map are `CappedDeque`s of 16, 44 and 61 entries, rows
 `frame-queue`, `fsync-ledger` and `ack-map` of the cell's census; the plan
 asks the queue's own admission, and the LOG step asks the ack map's before
 the plan (`frame_waits_ack_map`, derived never to occur).
-`note_frame_queued(end, lease, now)` takes the sealed frame's staging lease
-into the queue entry, and `note_frame_written(FrameId) -> WrittenFrame {
-lease, submitted_at, barrier }` hands it back with the barrier the write
-settles (`FrameBarrier::{None, Linked, WriteThrough}`), so the plane keeps
-no second table of frames in flight.
+`note_frame_queued(end, lease, now) -> FrameId` takes the sealed frame's
+staging lease into the queue entry, and `note_frame_written(FrameId) ->
+WrittenFrame { lease, submitted_at, barrier }` hands it back with the
+barrier the write settles (`FrameBarrier::{None, Linked, WriteThrough}`),
+so the plane keeps no second table of frames in flight.
 
-**M4.5-S35 amendment (ADR-0087 D2/D3):** `note_frame_queued(end, len) ->
-FrameId` pushes a bounded queued-frame FIFO; `note_frame_written(FrameId)`
-marks that frame written and advances `written_up_to`/`written_bytes` over
-the **completion-ordered written prefix** (a later frame landing first
-advances nothing — what an fdatasync can honestly cover). `frame_plan(
-write_through_ok, seal_ahead) -> FramePlan::{Plain, WriteThrough,
-LinkedFsync, Wait}` decides the next frame's barrier **before the seal**:
-write-through under the prefix rule (pending write-through tickets of
-earlier in-flight frames count as coverage; `seal_ahead` = a rotation's
-seal entry will precede the frame and covers every queued byte) **and
-only while fewer than `WRITE_THROUGH_WINDOW_ENTRIES` (16) write-through
-tickets sit unfolded (ADR-0087 D2 third amendment) — behind a
-wedged FLUSH-class front the arm declines and the frame seals `Plain`,
-its due accumulating**;
-`LinkedFsync` only when `drained()` (every earlier write completed —
-`IO_LINK` orders the sync after *this* frame's write alone; release-
-asserted in `register_linked_fsync`) and the FLUSH slot is free — **the
-seal a `seal_ahead` rotation registers counts as occupying it (ADR-0087
-D3/D4 amendment): at bound 1 the rotation's frame seals `Plain`**; `Wait`
-when a sync is due, write-through is inadmissible, and frames are still in
-flight below (the frame is held ≤ one write latency — sealing it
-barrier-less would starve the due); `Plain` otherwise (FLUSH slot busy:
+**M4.5-S35 amendment (ADR-0087 D2/D3):** the frame queue above is the
+queued-frame FIFO. `note_frame_written` marks its frame written and
+advances `written_up_to`/`written_bytes` over the **completion-ordered
+written prefix** (a later frame landing first advances nothing — what an
+fdatasync can honestly cover). `frame_plan(write_through_ok, seal_ahead)
+-> FramePlan::{Plain, WriteThrough, LinkedFsync, Wait(Hold)}` decides the
+next frame's barrier **before the seal**, its questions in this order:
+`Wait(Hold::ReorderWindow)` while the queue's own admission refuses (a late
+front write and the frames that landed behind it fill the queue);
+`Wait(Hold::SealUnfolded)` for a `seal_ahead` frame while the previous
+rotation's seal is unfolded; `Plain` when no sync is due; write-through
+under the prefix rule (pending write-through tickets of earlier in-flight
+frames count as coverage; `seal_ahead` = a rotation's seal entry will
+precede the frame and covers every queued byte) **and only while fewer
+than `WRITE_THROUGH_WINDOW_ENTRIES` (16) write-through tickets sit
+unfolded (ADR-0087 D2 third amendment) — behind a wedged FLUSH-class front
+the arm declines and the frame seals `Plain`, its due accumulating**;
+`Wait(Hold::Barrier)` when write-through is inadmissible and frames are
+still in flight below (the frame is held ≤ one write latency — sealing it
+barrier-less would starve the due); `LinkedFsync` only when `drained()`
+(every earlier write completed — `IO_LINK` orders the sync after *this*
+frame's write alone; release-asserted in `register_linked_fsync`), the
+FLUSH slot is free and the discretionary class has room — **the seal a
+`seal_ahead` rotation registers counts as occupying the slot (ADR-0087
+D3/D4 amendment): at bound 1 the rotation's frame seals `Plain`**; `Plain`
+otherwise (the FLUSH slot busy or the discretionary class at its budget:
 the due accumulates for the next group commit). `write_through_due()` / `frame_fsync_due()`
 are now pre-seal predicates (the next base is `queued_bytes`).
 `register_seal_fsync` asserts `drained()` — rotation is a drain point

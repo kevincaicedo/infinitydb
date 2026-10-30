@@ -427,7 +427,7 @@ pub struct DurableStats {
     pub frames_in_flight: u64,
     pub frames_in_flight_max: u64,
     /// Wait episodes: a staged frame held behind in-flight writes because
-    /// its due barrier was inadmissible (`FramePlan::Wait`, ADR-0087 D3),
+    /// its due barrier was inadmissible (`Wait(Hold::Barrier)`, ADR-0087 D3),
     /// and a staged frame held for a rotation drain (ADR-0087 D4) — the
     /// two bounded waits the pipeline introduces, counted per episode
     /// (one per held frame, not per LOG step) so they are never invisible
