@@ -418,6 +418,30 @@ those driver ops against the same `SimDisk`.
   a following `sync_data`; the sim tier models the un-synced window
   honestly (a power cut may resurrect the old tail).
 
+### Namespace residue additions (ADR-0189 D8)
+
+> **ADR-0189 (2026-10-10):** the seam gains the two calls the run-time
+> residue sweep of a dropped durable namespace needs.
+> `list_dir_bounded(dir, names_max, bytes_max) -> io::Result<Listing>`,
+> `Listing::{Absent, Names(NameBatch)}`, returns at most `names_max` names
+> and `bytes_max` name bytes, in any order, each name the entry's own bytes
+> (`OsStr`), never converted lossily as `list_dir` converts them.
+> `remove_dir(dir) -> io::Result<DirRemoval>`, `DirRemoval::{Removed,
+> Absent}`, answers any other errno as an `Err`. On the simulated disk,
+> `remove_dir(d)` answers `ENOTEMPTY` while a name or a directory of the OS
+> view has parent `d`; otherwise `d` leaves the directory set at once, as a
+> pending `MetaOp::RemoveDir` that the parent's `sync_dir` commits to a
+> `durable_dirs` twin. Applying it, in a commit or in a cut's surviving
+> prefix, first applies `d`'s own pending operations in issue order; a cut
+> restores the directory set from `durable_dirs`. `create_dir_all` inserts
+> into both sets, so a directory is durable at creation; the residue sweep
+> creates none, since a namespace id is never reused. After each commit and
+> each cut the disk asserts that no durable name lies under an absent
+> durable directory. The simulator's restart reuses the node's disk, so a
+> restart without a power cut keeps every pending `MetaOp`. The fault
+> points `ns_dir_remove_fail` and `ns_dir_sync_fail` fire inside those two
+> calls, and the disk logs every call. Not built.
+
 ## `MutationEffect` → record seam (`inf-log::effect`, ADR-0012)
 
 ```rust
@@ -1737,8 +1761,9 @@ count the arrivals that found it full.
      → wait `persisted(epoch)` → read the `CreateVerdict` → apply
      locally → fan `INF.NSFAN CREATE` (unchanged 9 args) →
      `create_applied(id)` → `+OK`*. No cell names a namespace before
-     `META` does. `SET` keeps *apply → fan → persist → ack*. `DROP`'s
-     order is drawn once, at `INF.NSFAN DROP` below.
+     `META` does. `SET` keeps *apply → fan → persist → ack* (until
+     ADR-0189 builds its order, below). `DROP`'s order is drawn once, at
+     `INF.NSFAN DROP` below.
   2. **The writer's pending-create set** (`inf-server::control`,
      ADR-0103 D2): every `PersistReq` may carry `create: (NsSpec,
      CreateVerdict)`; the writer merges every pending spec the payload
@@ -1782,7 +1807,8 @@ count the arrivals that found it full.
      pending entry retires, a durable namespace gets its tombstone),
      waits the swap, fans `INF.NSFAN DROP name epoch` (a peer without
      the namespace answers "not found", accepted), stamps a durable
-     drop for retirement, and answers the leg's error. The order
+     drop for retirement, and answers the leg's error (until ADR-0189
+     builds its order, below). The order
      becomes *… → apply → fan → (all `+OK` → `create_applied` → `+OK` |
      any error → rollback → the error)*.
   4. **Fault point** `ns_create_fan_refused` (`plane::handle_ns_apply`,
@@ -1849,9 +1875,10 @@ count the arrivals that found it full.
      (ADR-0100 D5). `DROP` itself runs *apply → request persist → wait
      `persisted(epoch)` → fan → request a node checkpoint + `StampDrop` →
      `+OK`*: the persist is requested before the fan, and the fan carries
-     its epoch (ADR-0100 D4). `CREATE` persists before it serves (item 1
-     of the `CREATE` choreography above) and `SET` runs *apply → fan →
-     persist → ack* (ADR-0015 D3).
+     its epoch (ADR-0100 D4) (until ADR-0189 builds its order, below).
+     `CREATE` persists before it serves (item 1 of the `CREATE`
+     choreography above) and `SET` runs *apply → fan → persist → ack*
+     (ADR-0015 D3) (until ADR-0189 builds its order, below).
      `Keyspace::ns_drop` returns the dropped `NsSpec`;
      `ns_tombstoned`/`ns_tombstones` expose the boot snapshot to recovery.
   3. **Recovery rule** (`inf-server::recover`, ADR-0100 D6): a `MANIFEST`
@@ -1864,6 +1891,15 @@ count the arrivals that found it full.
      an untombstoned unknown id stays the fail-stop in both places. `INFO persistence`
      gains `ns_drop_tombstones`. Fault points `ns_drop_before_meta` /
      `ns_drop_after_meta` carry the two crash-matrix rows.
+
+> **ADR-0189 (2026-10-10):** the namespace DDL and drop contract once
+> accepted, restating ADR-0100 whole: the catalog writer answers each
+> request in queue order after its `META` write, and a refusal writes
+> nothing; every namespace DDL persists before any cell applies it; a
+> durable namespace's tombstone retires once every cell has published past
+> its stamp and reported its `ns-N/` gone; at 256 tombstones the writer
+> alone admits, paces once or refuses. Not built.
+
 - **M4-S19 amendment (ADR-0062) — namespace catalog v2 + the `INF.NS`
   tiering surface.**
   1. **Catalog v2** (`inf-store::catalog`): `CATALOG_VERSION = 2` — the
