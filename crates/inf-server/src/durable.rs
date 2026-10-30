@@ -440,10 +440,11 @@ pub struct DurableStats {
     /// episode like the other two; a non-zero value names a wedging
     /// device, never an engine regression.
     pub frame_waits_reorder: u64,
-    /// The fsync ledger's holds, cell scope, per episode: a staged frame
-    /// held because it needs a rotation and the previous rotation's seal
-    /// has not folded (the rotation class's seal budget), and one held
-    /// because the ack map is full (derived never to occur). Beside them,
+    /// The fsync ledger's holds, cell scope, once per held frame whatever
+    /// held it first: a staged frame held because it needs a rotation and
+    /// the previous rotation's seal has not folded (the rotation class's
+    /// seal budget), and one held because the ack map is full (derived
+    /// never to occur). Beside them,
     /// MAINTAIN ticks that skipped a prealloc or zero-fill barrier at its
     /// class's budget (derived never to occur).
     pub frame_waits_ledger: u64,
@@ -593,6 +594,16 @@ pub struct DurableStats {
     pub write_stall_max_us: u64,
 }
 
+/// The fsync ledger's two holds a held frame was counted for. Each counts
+/// once per held frame, whatever held the frame first: a frame that needs
+/// a rotation may wait for its drain, then for the previous seal's fold, in
+/// one episode, and the episode's first reason would hide the seal's.
+#[derive(Copy, Clone, Debug, Default)]
+struct LedgerHoldsCounted {
+    seal: bool,
+    ack_map: bool,
+}
+
 /// One point of the ack map: a queued frame's exclusive end and the last
 /// durable seq it carries. When the fsync watermark covers `end`, every
 /// seq up to `seq` is durable. A point merges into a later written point
@@ -664,11 +675,13 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     frame_waits_rotation: u64,
     frame_waits_reorder: u64,
     /// Frames held for an unfolded seal (the rotation class) and for a full
-    /// ack map, per episode; MAINTAIN ticks that skipped a prealloc or
-    /// zero-fill barrier at its class's budget.
+    /// ack map, each once per held frame (`ledger_holds_counted`); MAINTAIN
+    /// ticks that skipped a prealloc or zero-fill barrier at its class's
+    /// budget.
     frame_waits_ledger: u64,
     frame_waits_ack_map: u64,
     ledger_prealloc_deferrals: u64,
+    ledger_holds_counted: LedgerHoldsCounted,
     /// Frames held for an outstanding extent barrier, per episode: the
     /// holds that closed the extent-seal window.
     frame_waits_extent: u64,
@@ -800,6 +813,7 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_ledger: 0,
             frame_waits_ack_map: 0,
             ledger_prealloc_deferrals: 0,
+            ledger_holds_counted: LedgerHoldsCounted::default(),
             frame_waits_extent: 0,
             frame_held: false,
             fill,
@@ -1081,7 +1095,8 @@ impl<F: SegmentFs> DurableCell<F> {
             // this step, so a full map holds the frame (derived never to
             // occur: the map is at most the queue, the ledger and one).
             if !self.ack_map_has_room() {
-                self.frame_waits_ack_map += u64::from(!self.frame_held);
+                self.frame_waits_ack_map += u64::from(!self.ledger_holds_counted.ack_map);
+                self.ledger_holds_counted.ack_map = true;
                 self.frame_held = true;
                 return;
             }
@@ -1093,12 +1108,14 @@ impl<F: SegmentFs> DurableCell<F> {
                 // frame queue is full (ADR-0087 D2 — a device row), the due
                 // barrier is inadmissible behind in-flight writes (D3), or
                 // the rotation's previous seal has not folded.
-                let waits = match hold {
-                    Hold::ReorderWindow => &mut self.frame_waits_reorder,
-                    Hold::Barrier => &mut self.frame_waits_barrier,
-                    Hold::SealUnfolded => &mut self.frame_waits_ledger,
-                };
-                *waits += u64::from(!self.frame_held);
+                match hold {
+                    Hold::ReorderWindow => self.frame_waits_reorder += u64::from(!self.frame_held),
+                    Hold::Barrier => self.frame_waits_barrier += u64::from(!self.frame_held),
+                    Hold::SealUnfolded => {
+                        self.frame_waits_ledger += u64::from(!self.ledger_holds_counted.seal);
+                        self.ledger_holds_counted.seal = true;
+                    }
+                }
                 self.frame_held = true;
                 return;
             }
@@ -1205,6 +1222,7 @@ impl<F: SegmentFs> DurableCell<F> {
     /// `frame_waits_*`).
     fn note_issued(&mut self) {
         self.frame_held = false;
+        self.ledger_holds_counted = LedgerHoldsCounted::default();
         self.fill_since = None;
         self.group_since = None;
     }
