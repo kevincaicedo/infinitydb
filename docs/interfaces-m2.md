@@ -764,6 +764,24 @@ discipline:
 
 ## Group commit + durability watermark (`inf-log::commit`, M2-S05/S06)
 
+> **ADR-0197 D3 (2026-10-30):** a frame's flight (its staging lease, the write's submit time and
+> the barrier its write settles) is the frame queue's entry, and the plane keeps no table of
+> frames in flight. `note_frame_queued` takes the sealed frame's lease and the submit time in
+> place of the frame's length (`(end, len) -> FrameId` became `(end, lease, now) -> FrameId`), and
+> `note_frame_written(FrameId)` returns `WrittenFrame { lease, submitted_at, barrier }`, handing
+> the flight back at the frame's one `LogWritten`.
+>
+> **ADR-0197 D1–D2 (2026-10-30), implementation open:** `frame_plan(write_through_ok, seal_ahead)`
+> answers `FramePlan::Seal(SealPlan)` or `FramePlan::Wait(Hold)`, with
+> `SealPlan::{Plain, WriteThrough, LinkedFsync}`: a sealed frame's plan cannot hold `Wait`, and
+> every sealing path takes a `SealPlan`. `note_frame_queued(end, lease, plan, now) ->
+> FrameQueued { id, barrier }` queues the frame with the barrier its plan chose: the barrier's
+> ledger entry covers the frame's own end, and the queue entry is published once with its flight
+> whole. `register_linked_fsync` and `register_write_through` go, so no barrier is registered
+> apart from its frame and a frame takes its barrier once. A linked plan still needs `drained()`
+> and a write-through plan the prefix rule (the frame's base is `queued_bytes`), each a release
+> assertion in the queueing on a plan made in the same LOG step.
+
 **The ledger's classes (2026-10-29).** Every `SyncReason` belongs to one
 `LedgerClass`, and each class holds at most its budget of entries unfolded:
 boot 5 (`BootDirs`' at most four directory handles and the fresh
