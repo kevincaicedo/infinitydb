@@ -47,7 +47,13 @@ impl Harness {
     fn run(&mut self, argv: &[&[u8]]) -> &[u8] {
         self.clock += 1;
         self.out.clear();
-        execute_slices(argv, &mut self.ks, &mut self.cx, Nanos(self.clock), &mut self.out);
+        execute_slices(
+            argv,
+            &mut self.ks,
+            &mut self.cx,
+            Nanos(self.clock),
+            &mut inf_wire::ReplyBuf::over(&mut self.out),
+        );
         &self.out
     }
 }

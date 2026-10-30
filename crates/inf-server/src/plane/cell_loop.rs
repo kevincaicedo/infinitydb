@@ -372,17 +372,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         let mut had_replies = false;
         for (to, token, reply) in self.staged_replies.drain(..) {
             had_replies = true;
-            match reply {
-                StagedReply::Bytes(start, end) => {
-                    fabric.reply(to, token, &Outcome::Bytes(&self.reply_scratch[start..end]));
-                }
-                StagedReply::Int(n) => fabric.reply(to, token, &Outcome::Int(n)),
-                StagedReply::Nil => fabric.reply(to, token, &Outcome::Nil),
-                StagedReply::Ok => fabric.reply(to, token, &Outcome::Ok),
-                StagedReply::Refused => {
-                    fabric.reply(to, token, &Outcome::Err(ErrCode::Unknown(0)));
-                }
-            }
+            fabric.reply(to, token, &staged_outcome(&self.reply_scratch, &reply));
         }
         // Publish replies NOW instead of at FABRIC-OUT: the origin is
         // blocked on them, and waiting for step 8 adds most of an iteration
@@ -412,7 +402,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         .waiter(g.seq)
                 };
                 waiter.await;
-                shared.fabric.borrow_mut().reply(g.to, g.token, &Outcome::Bytes(&g.reply));
+                let outcome = wire_reply(g.reply.bytes(), g.reply.outcome());
+                shared.fabric.borrow_mut().reply(g.to, g.token, &outcome);
             });
         }
         // Tiered fabric applies (M4-S26): wake each origin's FIFO pump.
@@ -520,8 +511,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                         conn_cx,
                                         out,
                                     );
-                                    let mut w = RespWriter::new(out, conn_cx.proto);
-                                    w.error("LOADING Redis is loading the dataset in memory");
+                                    RespWriter::new(&mut ReplyBuf::over(out), conn_cx.proto)
+                                        .error("LOADING Redis is loading the dataset in memory");
                                     continue;
                                 }
                             }
@@ -592,7 +583,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                     &mut self.shared.store.borrow_mut(),
                                     conn_cx,
                                     now,
-                                    out,
+                                    &mut ReplyBuf::over(out),
                                 );
                                 self.shared.observer.borrow_mut().on_execute(
                                     self.shared.cell,
@@ -625,7 +616,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 conn_cx,
                                 out,
                             );
-                            let mut w = RespWriter::new(out, conn_cx.proto);
+                            let mut reply = ReplyBuf::over(out);
+                            let mut w = RespWriter::new(&mut reply, conn_cx.proto);
                             // Display, not Debug (batch 45): the Redis
                             // phrasing the compat harness diffs.
                             w.error(&format!("ERR Protocol error: {e}"));

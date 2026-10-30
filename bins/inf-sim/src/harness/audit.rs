@@ -380,7 +380,13 @@ pub(super) fn run_audit(
             let slices: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
             let mut cx = model_cx(auditor.scope.exec_scope());
             let mut oracle = oracle.0.borrow_mut();
-            execute_slices(&slices, &mut oracle.model, &mut cx, now, &mut expected);
+            execute_slices(
+                &slices,
+                &mut oracle.model,
+                &mut cx,
+                now,
+                &mut inf_wire::ReplyBuf::over(&mut expected),
+            );
             // The independent model follows an acknowledged flush only.
             if expected == b"+OK\r\n" {
                 if argv[0] == b"FLUSHALL" {

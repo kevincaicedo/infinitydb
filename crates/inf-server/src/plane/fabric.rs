@@ -107,19 +107,17 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // The drained reply already returned one data credit; wake one
             // sender blocked on that destination.
             shared.credit_waiters.wake_one(from);
-            // Bytes outcomes own their parked value via the reply pool —
-            // no per-reply heap traffic on the steady-state path.
-            let owned = match &outcome {
-                Outcome::Bytes(bytes) => {
-                    let mut buf = shared.take_reply_buf();
-                    buf.extend_from_slice(bytes);
-                    OwnedOutcome::Bytes(buf)
-                }
-                other @ (Outcome::Ok
-                | Outcome::Int(_)
-                | Outcome::Nil
-                | Outcome::Bool(_)
-                | Outcome::Err(_)) => OwnedOutcome::own(other),
+            // A reply owns its parked bytes via the reply pool — no
+            // per-reply heap traffic on the steady-state path — and its
+            // outcome from the wire's variant (ADR-0190 D3).
+            let owned = match outcome {
+                Outcome::Bytes(bytes) => received_reply(shared, bytes, ReplyOutcome::Success),
+                Outcome::ErrorReply(bytes) => received_reply(shared, bytes, ReplyOutcome::Error),
+                Outcome::Ok => OwnedOutcome::Ok,
+                Outcome::Int(n) => OwnedOutcome::Int(n),
+                Outcome::Nil => OwnedOutcome::Nil,
+                Outcome::Bool(b) => OwnedOutcome::Bool(b),
+                Outcome::Err(code) => OwnedOutcome::Err(code),
             };
             if !shared.gate.complete(token.0, owned) {
                 *orphans += 1;
@@ -131,16 +129,23 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         Op::Read { token, key, .. } => {
             let start = scratch.len();
             // M0 vocabulary: the typed Read has no db field; it serves db 0
-            // (the M1 paths ship GETs as Apply with the packed db byte).
+            // (the M1 paths ship GETs as Apply with the packed db byte). A
+            // hit stages the bare value, pasted through the writer's one
+            // entry for pre-encoded bytes.
+            let mut reply = ReplyBuf::over(scratch);
             let hit = match shared.store.borrow_mut().db_mut(0).get(key, now) {
                 Some(value) => {
-                    scratch.extend_from_slice(value);
+                    RespWriter::new(&mut reply, Protocol::Resp2).encoded(value);
                     true
                 }
                 None => false,
             };
-            let reply =
-                if hit { StagedReply::Bytes(start, scratch.len()) } else { StagedReply::Nil };
+            let outcome = reply.outcome();
+            let reply = if hit {
+                StagedReply::Bytes(start, scratch.len(), outcome)
+            } else {
+                StagedReply::Nil
+            };
             staged.push((from, token, reply));
         }
         Op::ApplyNs { token, cmd, ns, args, program, .. } => {
@@ -153,8 +158,10 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // decided here, before the pump can park it.
             if !program && lookup(argv[0]).is_some_and(|m| m.flags.contains(CmdFlags::INTERNAL)) {
                 let start = scratch.len();
-                crate::exec::unknown_command_reply(argv, proto, scratch);
-                staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+                let mut reply = ReplyBuf::over(scratch);
+                crate::exec::unknown_command_reply(argv, proto, &mut reply);
+                let outcome = reply.outcome();
+                staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
                 return;
             }
             // A tiered apply can suspend on a cold read — it always
@@ -195,34 +202,35 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 }
             {
                 let now = shared.now.get();
-                let mut reply = Vec::new();
+                let mut reply = OpenReply::new(Vec::new());
                 RespWriter::new(&mut reply, Protocol::Resp2).int(n);
                 shared.observer.borrow_mut().on_execute(
                     shared.cell,
                     ExecOrigin::Fabric(from),
                     ExecScope::Ns(NsId(ns)),
                     &[b"DBSIZE"],
-                    &reply,
+                    reply.bytes(),
                     now,
                 );
                 staged.push((from, token, StagedReply::Int(n)));
                 return;
             }
             let start = scratch.len();
-            match shared.execute_ns_owned(from, argv, proto, NsId(ns), program, scratch) {
+            let mut reply = ReplyBuf::over(scratch);
+            match shared.execute_ns_owned(from, argv, proto, NsId(ns), program, &mut reply) {
                 NsApplyOutcome::Reply => {
-                    staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+                    let outcome = reply.outcome();
+                    staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
                 }
                 NsApplyOutcome::Gated(seq) => {
-                    let reply = scratch[start..].to_vec();
-                    scratch.truncate(start);
+                    let reply = reply.detach();
                     gated.push(GatedReply { to: from, token, seq, reply });
                 }
                 // Staging pressure: nothing executed or staged — the
                 // apply parks on the pump and paces instead of refusing
                 // with `-BUSY` (M4.5-S27, ADR-0083 D1).
                 NsApplyOutcome::Park => {
-                    scratch.truncate(start);
+                    reply.clear();
                     shared.ns_applies.borrow_mut()[usize::from(from.0)].push_back(NsApply {
                         token,
                         ns: NsId(ns),
@@ -315,6 +323,7 @@ fn handle_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 staged.push((from, token, StagedReply::Int(n)));
             } else {
                 let start = scratch.len();
+                let mut reply = ReplyBuf::over(scratch);
                 shared.execute_owned_into(
                     ExecOrigin::Fabric(from),
                     argv,
@@ -323,9 +332,10 @@ fn handle_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     db,
                     None,
                     program,
-                    scratch,
+                    &mut reply,
                 );
-                staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+                let outcome = reply.outcome();
+                staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
             }
         }
     }
@@ -479,7 +489,9 @@ pub(super) fn flush_parse_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone
         // Staged commands are never conn-state, so the scope before and
         // after execution is the same one.
         let scope = ExecScope::of(conn_cx);
-        execute(argv, &mut shared.store.borrow_mut(), conn_cx, now, out);
+        // One reply per staged command, each opened at its own start, the
+        // view dropped before the observer reads the bytes (ADR-0190 D2).
+        execute(argv, &mut shared.store.borrow_mut(), conn_cx, now, &mut ReplyBuf::over(out));
         shared.observer.borrow_mut().on_execute(
             shared.cell,
             origin,
@@ -655,20 +667,68 @@ pub(super) fn flush_apply_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone
 
 /// One MGET position: rendered locally at dispatch, or one remote `GET`.
 pub(super) enum GatherPart {
-    Done(Vec<u8>),
+    Done(OwnedReply),
     Wait(GateWait<u64, OwnedOutcome>),
 }
 
-/// Strip the `*1\r\n` header off a single-key `JSON.MGET` sub-reply,
-/// leaving the bare element (M3-S11 gather; ADR-0041 D9). Error replies
-/// (fabric refusals) pass through untouched — an error is a legal RESP
-/// array element.
-pub(super) fn strip_single_element(bytes: &[u8]) -> &[u8] {
-    match bytes.strip_prefix(b"*1\r\n") {
+/// The element a single-key `JSON.MGET` sub-reply contributes to the
+/// gathered array (M3-S11 gather; ADR-0041 D9): an `Error` reply is pasted
+/// untouched (an error is a legal RESP array element); a `Success` reply
+/// is a one-element array, its `*1\r\n` header stripped. Which is decided
+/// by the reply's outcome, never by its bytes (ADR-0190 D2).
+pub(super) fn gather_element(reply: &OwnedReply) -> &[u8] {
+    if reply.is_error() {
+        return reply.bytes();
+    }
+    // reply-outcome-allow: the shape strip of a Success sub-reply, whose outcome was read above
+    match reply.bytes().strip_prefix(b"*1\r\n") {
         Some(element) => element,
         None => {
-            debug_assert_eq!(bytes.first(), Some(&b'-'), "sub-replies are *1 arrays or errors");
-            bytes
+            debug_assert!(false, "a Success JSON.MGET sub-reply is a one-element array");
+            reply.bytes()
+        }
+    }
+}
+
+/// The wire form of a staged reply (ADR-0190 D3): the tag is set from the
+/// reply's outcome, never from its bytes. Canary
+/// `inf_canary_fabric_error_as_bytes` sends an `Error` reply as `Bytes`.
+pub(super) fn wire_reply(bytes: &[u8], outcome: ReplyOutcome) -> Outcome<'_> {
+    match outcome {
+        ReplyOutcome::Success => Outcome::Bytes(bytes),
+        ReplyOutcome::Error if cfg!(inf_canary_fabric_error_as_bytes) => Outcome::Bytes(bytes),
+        ReplyOutcome::Error => Outcome::ErrorReply(bytes),
+    }
+}
+
+/// The outcome one staged reply ships as, its bytes in `scratch`.
+pub(super) fn staged_outcome<'a>(scratch: &'a [u8], reply: &StagedReply) -> Outcome<'a> {
+    match *reply {
+        StagedReply::Bytes(start, end, outcome) => wire_reply(&scratch[start..end], outcome),
+        StagedReply::Int(n) => Outcome::Int(n),
+        StagedReply::Nil => Outcome::Nil,
+        StagedReply::Ok => Outcome::Ok,
+        StagedReply::Refused => Outcome::Err(ErrCode::Unknown(0)),
+    }
+}
+
+/// The origin's copy of a leg's reply, its outcome from the wire's variant
+/// (ADR-0190 D3). A zero-byte reply is refused here, once, and the gate
+/// completes with the fabric refusal; the codec decodes it, so a decode
+/// error never strands the gate.
+fn received_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    bytes: &[u8],
+    outcome: ReplyOutcome,
+) -> OwnedOutcome {
+    let mut buf = shared.take_reply_buf();
+    buf.extend_from_slice(bytes);
+    // reply-outcome-allow: the one decode site, the outcome read from the wire's variant
+    match OwnedReply::received(buf, outcome) {
+        Ok(reply) => OwnedOutcome::Reply(reply),
+        Err(ZeroByteReply(buf)) => {
+            shared.recycle_reply_buf(buf);
+            OwnedOutcome::Err(ErrCode::EmptyReply)
         }
     }
 }

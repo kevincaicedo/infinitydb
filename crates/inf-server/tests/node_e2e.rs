@@ -2127,6 +2127,55 @@ fn durable_mset_bounds_failure_is_atomic_across_recovery() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A refused write on a durable `always` namespace stages nothing: the
+/// staging gate reads the reply's outcome, not its first byte (ADR-0190
+/// D2). `k` is seeded so a misread refusal would stage the key's unchanged
+/// value, a redundant record the log count shows. The refusal comes from
+/// the command itself (`EX 0`), after admission: an over-bound value is
+/// refused by the staging admission before the command runs.
+#[test]
+fn reply_outcome_refused_set_on_always_stages_nothing() {
+    let dir = temp_data_dir("reply-outcome");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"pay", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pay"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"other", b"EX", b"0"])).expect("write");
+    let refusal = read_line(&mut c);
+    if cfg!(inf_canary_resp3_blob_error) {
+        assert_eq!(refusal.first(), Some(&b'!'), "VACUOUS: the plant wrote no blob error");
+        let _text = read_line(&mut c);
+    } else {
+        assert_eq!(refusal, b"-ERR invalid expire time in 'set' command\r\n");
+    }
+    c.write_all(&cmd(&[b"SET", b"z", b"9"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"k"])).expect("write");
+    read_exactly(&mut c, b"$1\r\nv\r\n");
+    // The gauge follows MAINTAIN: the largest count seen over a short window
+    // is the log's (each `always` ack follows its own fsync).
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut appended = 0u64;
+    while Instant::now() < deadline {
+        let info = info_text(&mut c, b"persistence");
+        let count = info
+            .lines()
+            .find_map(|line| line.strip_prefix("log_records_appended:"))
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .expect("INFO persistence reports log_records_appended");
+        appended = appended.max(count);
+    }
+    assert_eq!(appended, 2, "the two acknowledged SETs and nothing for the refusal");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The `mset_midway_oom` crash-matrix row, local-pump site (review of
 /// 2026-08-30, H2 / F-L17-11, ADR-0098): when a multi-key write genuinely
 /// applies a prefix and then fails (arena OOM — bounds are pre-validated

@@ -1,6 +1,8 @@
 //! Fabric codec decode totality (M0-S10): arbitrary bytes must decode or
 //! fail with a typed `CodecError` — never panic, never UB. Frames that do
-//! decode must re-encode byte-exact (round-trip canonicality).
+//! decode must re-encode byte-exact (round-trip canonicality). The frames
+//! reach every outcome tag, `ErrorReply`'s 7 among them, and every error
+//! code, `EmptyReply`'s 5 among them (ADR-0190 D3).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

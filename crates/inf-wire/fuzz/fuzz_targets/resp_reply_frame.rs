@@ -7,7 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use inf_wire::{Protocol, RespWriter};
+use inf_wire::{Protocol, ReplyBuf, RespWriter};
 
 /// Walks a buffer of line-framed replies, returning how many it contains.
 /// Panics with the offending offset when the bytes are not exactly that —
@@ -46,7 +46,8 @@ fuzz_target!(|data: &[u8]| {
     let mut out = Vec::new();
     let mut written = 0usize;
     {
-        let mut w = RespWriter::new(&mut out, proto);
+        let mut out_reply = ReplyBuf::over(&mut out);
+        let mut w = RespWriter::new(&mut out_reply, proto);
         for piece in data[1..].chunks(chunk) {
             w.error_bytes(piece);
             written += 1;
@@ -64,10 +65,10 @@ fuzz_target!(|data: &[u8]| {
     // Sanitizing is idempotent: re-writing an already-sanitized body must
     // reproduce it byte for byte (no drift for a proxy that replays errors).
     let mut once = Vec::new();
-    RespWriter::new(&mut once, proto).error_bytes(&data[1..]);
+    RespWriter::new(&mut ReplyBuf::over(&mut once), proto).error_bytes(&data[1..]);
     let body = &once[1..once.len() - 2];
     let mut twice = Vec::new();
-    RespWriter::new(&mut twice, proto).error_bytes(body);
+    RespWriter::new(&mut ReplyBuf::over(&mut twice), proto).error_bytes(body);
     assert_eq!(once, twice, "sanitization is not idempotent");
 
     // ADR-0099 (review 2026-08-30, C9): a patched bulk must equal the
@@ -77,12 +78,14 @@ fuzz_target!(|data: &[u8]| {
     // the fuzzer without exploring anything new.)
     let payload = &data[1..];
     let mut plain = Vec::new();
-    RespWriter::new(&mut plain, proto).bulk(payload);
+    RespWriter::new(&mut ReplyBuf::over(&mut plain), proto).bulk(payload);
     let mut patched = Vec::new();
-    RespWriter::new(&mut patched, proto).bulk_patched(|out| out.extend_from_slice(payload));
+    RespWriter::new(&mut ReplyBuf::over(&mut patched), proto)
+        .bulk_patched(|out| out.extend_from_slice(payload));
     assert_eq!(plain, patched, "patched bulk diverged from plain bulk");
     let mut rolled = Vec::new();
-    let mut w = RespWriter::new(&mut rolled, proto);
+    let mut rolled_reply = ReplyBuf::over(&mut rolled);
+    let mut w = RespWriter::new(&mut rolled_reply, proto);
     assert!(
         w.try_bulk_patched(|out| {
             out.extend_from_slice(payload);

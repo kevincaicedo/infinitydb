@@ -18,7 +18,7 @@ const WHEEL_BYTES_MAX: u64 = 24 << 10;
 
 fn run(ks: &mut Keyspace, cx: &mut ConnCx, argv: &[&[u8]]) -> Vec<u8> {
     let mut reply = Vec::new();
-    execute_slices(argv, ks, cx, Nanos(1_000_000), &mut reply);
+    execute_slices(argv, ks, cx, Nanos(1_000_000), &mut inf_wire::ReplyBuf::over(&mut reply));
     reply
 }
 

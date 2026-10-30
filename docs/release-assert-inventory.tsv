@@ -517,7 +517,7 @@ I	1	crates/inf-server/src/plane/cell_loop.rs	expect	manifest completion without 
 I	1	crates/inf-server/src/plane/scatter.rs	expect	materialized, checked above	`ns_store(id).is_none()` continued the loop on the line above; `ns_store_mut` on a known namespace materializes
 I	1	crates/inf-server/src/plane.rs	expect	recovered namespace carries a tier block	`Recovery::recover_tiers` already refused a manifested tier section the catalog does not know (ADR-0100 D6), so every recovered namespace is catalogued tiered
 I	1	crates/inf-server/src/plane/scatter.rs	expect	scatter programs dispatch registered commands	`argv[0]` reached this program through a registry `lookup` in the dispatcher
-I	1	crates/inf-server/src/plane/scatter.rs	unreachable	the outer match took Int and Err	the outer match handled `Bytes`/`Err` (first site) and `Int`/`Err` (second site) before the `other` arm re-matches the remainder
+I	1	crates/inf-server/src/plane/scatter.rs	unreachable	the outer match took Int and Err	the outer match handled `Int`/`Err` before the `other` arm re-matches the remainder
 C	1	crates/inf-server/src/plane.rs	expect	set_control before begin_recovery	assembly order: `bins/infinityd/src/main.rs:main` and every harness call `set_control` first (`crates/inf-server/src/plane.rs:ServerPlane::begin_recovery` documents the panic)
 I	1	crates/inf-server/src/plane/ns_ddl.rs	expect	staged above	`stage_durable_effects` returned a seq on the line above, which requires the durable cell
 I	1	crates/inf-server/src/plane/shared.rs	expect	staged above	`stage_durable_effects` returned a seq on the line above, which requires the durable cell
@@ -532,7 +532,7 @@ I	1	crates/inf-server/src/plane/shared.rs	panic	captured delta key remains a liv
 I	1	crates/inf-server/src/plane/shared.rs	unreachable	full-image probe never returns a delta	`json_log_full` is the full-image probe; `Delta` is produced only by the delta probe (the store's own typestate)
 I	1	crates/inf-server/src/plane/publish.rs	unreachable	is_plane_pubsub covers exactly the arms above	the dispatcher enters this function only when `is_plane_pubsub(id)`, whose arms this match enumerates
 I	1	crates/inf-server/src/plane/dispatch.rs	unreachable	is_scatter covers exactly the arms above	the dispatcher enters this branch only when `is_scatter(id, sub)`, whose arms this match enumerates
-I	1	crates/inf-server/src/plane/dispatch.rs	unreachable	the outer match took Bytes and Err	the outer match handled `Bytes`/`Err` (first site) and `Int`/`Err` (second site) before the `other` arm re-matches the remainder
+I	1	crates/inf-server/src/plane/dispatch.rs	unreachable	the outer match took Reply and Err	the outer match handled `Reply`/`Err` before the `other` arm re-matches the remainder
 I	1	crates/inf-server/src/plane/shared.rs	unreachable	json_log_full always chooses a full image	`json_log_full` returns `JsonLogDecision::Full` by construction (the store's own probe)
 I	1	crates/inf-server/src/plane/tiered/write.rs	expect	caller resolved the table	`write_blob` is called from `try_write` after `ks.tiered_store_mut(ns)` resolved in the same synchronous stretch
 I	1	crates/inf-server/src/plane/tiered.rs	expect	continuation address is 48-bit	`at` is a raw address the same probe produced from `LogicalAddr::to_raw` on the first window

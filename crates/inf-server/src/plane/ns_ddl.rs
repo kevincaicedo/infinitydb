@@ -26,7 +26,7 @@ impl CkptRefusal {
         self,
         shared: &Rc<Shared<O, F>>,
         proto: Protocol,
-    ) -> Vec<u8> {
+    ) -> OwnedReply {
         match self {
             CkptRefusal::NoPlane => error_reply(shared, proto, CKPT_NO_PLANE),
             CkptRefusal::Exhausted => error_reply(shared, proto, CKPT_IDENTITY_EXHAUSTED),
@@ -102,7 +102,7 @@ fn admit_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     mode: NsMode,
-) -> Result<NsCleanup, Vec<u8>> {
+) -> Result<NsCleanup, OwnedReply> {
     if mode == NsMode::Durable && shared.durable.borrow().is_none() {
         let refusal = "ERR this node has no durable storage (start infinityd with a data dir)";
         return Err(error_reply(shared, proto, refusal));
@@ -161,18 +161,20 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
                 for k in &argv[1..argv.len() - 1] {
                     let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
                     if shared.router.is_local(k, shared.cell) {
-                        let mut buf = shared.take_reply_buf();
-                        shared.execute_owned_into(
-                            origin,
-                            &sub,
-                            proto,
-                            id,
-                            db,
-                            Some(ns),
-                            false,
-                            &mut buf,
-                        );
-                        parts.push(GatherPart::Done(buf));
+                        let mut reply = OpenReply::new(shared.take_reply_buf());
+                        reply.lend(|out| {
+                            shared.execute_owned_into(
+                                origin,
+                                &sub,
+                                proto,
+                                id,
+                                db,
+                                Some(ns),
+                                false,
+                                out,
+                            )
+                        });
+                        parts.push(GatherPart::Done(reply.finish()));
                     } else {
                         match send_apply_ns(
                             shared,
@@ -340,13 +342,15 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
         pending.push_back(PendingReply::Done(error_reply(shared, proto, refusal.message())));
         return true;
     }
-    let mut reply = shared.take_reply_buf();
-    let close = shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), false, &mut reply);
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    let close = reply
+        .lend(|out| shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), false, out));
+    let reply = reply.finish();
     if close {
         close_after_reply(shared, key);
     }
     let gated = if is_write
-        && (reply.first() != Some(&b'-') || stages_despite_error(meta.id))
+        && stages(reply.outcome(), meta.id)
         && let Some(class) = class
         && let Some(seq) = shared.stage_durable_effects(ns, meta, argv, class)
         && class == FsyncClass::Always
@@ -389,7 +393,7 @@ pub(super) async fn program_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clon
     proto: Protocol,
     id: CommandId,
     argv: &[&[u8]],
-) -> Vec<u8> {
+) -> OwnedReply {
     let control = shared.control.borrow().clone();
     let Some(control) = control else {
         return error_reply(shared, proto, CKPT_NO_PLANE);
@@ -496,7 +500,7 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
     id: u64,
     db: u16,
     argv: &[&[u8]],
-) -> Vec<u8> {
+) -> OwnedReply {
     let _ = (origin, id, db);
     let Some(control) = shared.control.borrow().clone() else {
         return error_reply(
@@ -544,9 +548,9 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
         // → persist) served the namespace on every cell for the whole
         // swap window and lost `always`-acked writes to a cut inside it.
         if let Err(e) = shared.store.borrow().ns_create_check(&spec) {
-            let mut reply = shared.take_reply_buf();
+            let mut reply = OpenReply::new(shared.take_reply_buf());
             crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
-            return reply;
+            return reply.finish();
         }
         if control.pending_creates() >= crate::control::PENDING_CREATE_MAX {
             return error_reply(
@@ -569,12 +573,12 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
         match verdict.get() {
             Some(crate::control::CreateOutcome::Accepted) => {}
             Some(crate::control::CreateOutcome::NameExists) => {
-                let mut reply = shared.take_reply_buf();
+                let mut reply = OpenReply::new(shared.take_reply_buf());
                 crate::admin::ns_error(
                     inf_store::NsError::Exists,
                     &mut RespWriter::new(&mut reply, proto),
                 );
-                return reply;
+                return reply.finish();
             }
             Some(crate::control::CreateOutcome::AtCapacity) => {
                 return error_reply(
@@ -600,9 +604,9 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
             // cannot run ahead): the pending entry retires and a later
             // persist drops the definition (recorded residual).
             control.create_applied(ns_id);
-            let mut reply = shared.take_reply_buf();
+            let mut reply = OpenReply::new(shared.take_reply_buf());
             crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
-            return reply;
+            return reply.finish();
         }
         created = Some((ns_id, spec.name.clone(), cleanup, spec.tier.is_some()));
         let fsync = spec.fsync.map_or("-", |f| match f {
@@ -642,9 +646,9 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
             ],
         };
         if let Err(e) = crate::admin::apply_ns_set(&mut shared.store.borrow_mut(), &name, update) {
-            let mut reply = shared.take_reply_buf();
+            let mut reply = OpenReply::new(shared.take_reply_buf());
             crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
-            return reply;
+            return reply.finish();
         }
         let mut fan = vec![b"INF.NSFAN".to_vec(), b"SET".to_vec(), name];
         fan.extend(fan_tail);
@@ -706,7 +710,7 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     control: &Arc<ControlHandle>,
     proto: Protocol,
     name: &[u8],
-) -> Vec<u8> {
+) -> OwnedReply {
     // ADR-0159 D2: a durable DROP reserves its two units under the ticket,
     // before pacing and any effect. An unknown name reserves none; `ns_drop`
     // refuses it below.
@@ -730,9 +734,9 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     let spec = match shared.store.borrow_mut().ns_drop(name) {
         Ok(spec) => spec,
         Err(e) => {
-            let mut reply = shared.take_reply_buf();
+            let mut reply = OpenReply::new(shared.take_reply_buf());
             crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
-            return reply;
+            return reply.finish();
         }
     };
     // Crash-matrix point: the on-disk state of a cut at this instant
@@ -784,17 +788,18 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
 
 /// Fans one DDL vector to every peer and returns the first error reply,
 /// or `None` when every leg answered a non-error. Every leg is awaited —
-/// a leg that could not be sent or answered no bytes is an error leg.
+/// a leg that could not be sent or answered no reply is an error leg. A
+/// leg failed by its reply's outcome, never by its bytes (ADR-0190 D2).
 async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     fan: &[&[u8]],
-) -> Option<Vec<u8>> {
-    let mut failure: Option<Vec<u8>> = None;
+) -> Option<OwnedReply> {
+    let mut failure: Option<OwnedReply> = None;
     for cell in peer_cells(shared) {
         let leg = match send_apply(shared, cell, ApplyOrigin::Program, proto, 0, fan).await {
             Ok(waiter) => match waiter.await {
-                OwnedOutcome::Bytes(bytes) => bytes,
+                OwnedOutcome::Reply(reply) => reply,
                 OwnedOutcome::Ok
                 | OwnedOutcome::Int(_)
                 | OwnedOutcome::Nil
@@ -805,8 +810,10 @@ async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone
             },
             Err(refusal) => refusal,
         };
-        if leg.first() == Some(&b'-') && failure.is_none() {
+        if leg.is_error() && failure.is_none() {
             failure = Some(leg);
+        } else {
+            shared.recycle_reply_buf(leg.into_bytes());
         }
     }
     failure
@@ -855,6 +862,13 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     cleanup.stamp(control, id);
 }
 
+/// The refusal of an argv wider than the codec's `MAX_APPLY_ARGS`.
+fn too_many_args_reply(proto: Protocol) -> OwnedReply {
+    let mut reply = OpenReply::new(Vec::new());
+    RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
+    reply.finish()
+}
+
 /// Ship `argv` to `to` as an `ApplyNs` (named-namespace op — ADR-0015 D1)
 /// and return the reply waiter. Mirrors [`send_apply`]; never RTT-recorded
 /// (`always` replies are owner-deferred and would mispair the queue).
@@ -865,12 +879,10 @@ pub(super) async fn send_apply_ns<O: PlaneObserver + 'static, F: SegmentFs + Clo
     proto: Protocol,
     ns: NsId,
     argv: &[&[u8]],
-) -> Result<GateWait<u64, OwnedOutcome>, Vec<u8>> {
+) -> Result<GateWait<u64, OwnedOutcome>, OwnedReply> {
     let program = origin == ApplyOrigin::Program;
     let Some(args) = ApplyArgs::new(argv) else {
-        let mut reply = Vec::new();
-        RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
-        return Err(reply);
+        return Err(too_many_args_reply(proto));
     };
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
     let (token, waiter) = {
@@ -899,7 +911,7 @@ pub(super) enum SendNow {
     /// Staged on the first attempt; the reply waiter is registered.
     Sent(GateWait<u64, OwnedOutcome>),
     /// The argv exceeds the codec's argument cap; carries the refusal.
-    Refused(Vec<u8>),
+    Refused(OwnedReply),
     /// No fabric credit on the first attempt — the caller falls back to
     /// the async path, which waits for credits. The drawn token is
     /// abandoned: a skipped monotonic value, never registered and never
@@ -922,9 +934,7 @@ pub(super) fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 
 ) -> SendNow {
     let program = origin == ApplyOrigin::Program;
     let Some(args) = ApplyArgs::new(argv) else {
-        let mut reply = Vec::new();
-        RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
-        return SendNow::Refused(reply);
+        return SendNow::Refused(too_many_args_reply(proto));
     };
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
     let proto_byte: u8 = match proto {
@@ -960,12 +970,10 @@ pub(super) async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone 
     proto: Protocol,
     db: u16,
     argv: &[&[u8]],
-) -> Result<GateWait<u64, OwnedOutcome>, Vec<u8>> {
+) -> Result<GateWait<u64, OwnedOutcome>, OwnedReply> {
     let program = origin == ApplyOrigin::Program;
     let Some(args) = ApplyArgs::new(argv) else {
-        let mut reply = Vec::new();
-        RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
-        return Err(reply);
+        return Err(too_many_args_reply(proto));
     };
     // Routing is the `to` cell; the slot field is advisory (keyless scatter
     // applies carry the empty-key slot).

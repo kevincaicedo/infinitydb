@@ -41,9 +41,9 @@ pub(super) async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clo
                     shared.fabric.borrow_mut().reply(
                         CellId(origin),
                         item.token,
-                        &Outcome::Bytes(&reply),
+                        &wire_reply(reply.bytes(), reply.outcome()),
                     );
-                    shared.recycle_reply_buf(reply);
+                    shared.recycle_reply_buf(reply.into_bytes());
                 }
             }
             continue;
@@ -66,9 +66,9 @@ pub(super) async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clo
                 shared.fabric.borrow_mut().reply(
                     CellId(origin),
                     item.token,
-                    &Outcome::Bytes(&reply),
+                    &wire_reply(reply.bytes(), reply.outcome()),
                 );
-                shared.recycle_reply_buf(reply);
+                shared.recycle_reply_buf(reply.into_bytes());
             }
             // M4.5-S29: the durability wait leaves the pump. Holding the
             // FIFO across it serialized each origin to one `always` write
@@ -113,10 +113,13 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     program: bool,
 ) {
     loop {
-        let mut buf = shared.take_reply_buf();
-        match shared.execute_ns_owned(CellId(origin), argv, proto, ns, program, &mut buf) {
+        let mut reply = OpenReply::new(shared.take_reply_buf());
+        let applied = reply
+            .lend(|out| shared.execute_ns_owned(CellId(origin), argv, proto, ns, program, out));
+        let reply = reply.finish();
+        match applied {
             NsApplyOutcome::Park => {
-                shared.recycle_reply_buf(buf);
+                shared.recycle_reply_buf(reply.into_bytes());
                 let wait = {
                     let mut durable = shared.durable.borrow_mut();
                     let cell = durable.as_mut().expect("durable admission parked");
@@ -126,8 +129,9 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 wait.await;
             }
             NsApplyOutcome::Reply => {
-                shared.fabric.borrow_mut().reply(CellId(origin), token, &Outcome::Bytes(&buf));
-                shared.recycle_reply_buf(buf);
+                let outcome = wire_reply(reply.bytes(), reply.outcome());
+                shared.fabric.borrow_mut().reply(CellId(origin), token, &outcome);
+                shared.recycle_reply_buf(reply.into_bytes());
                 return;
             }
             NsApplyOutcome::Gated(seq) => {
@@ -135,7 +139,7 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                     to: CellId(origin),
                     token,
                     seq,
-                    reply: buf,
+                    reply,
                 });
                 return;
             }

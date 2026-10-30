@@ -34,7 +34,13 @@ impl Db {
     fn run(&mut self, argv: &[&[u8]]) -> Vec<u8> {
         self.clock += 1;
         let mut out = Vec::new();
-        execute_slices(argv, &mut self.ks, &mut self.cx, Nanos(self.clock), &mut out);
+        execute_slices(
+            argv,
+            &mut self.ks,
+            &mut self.cx,
+            Nanos(self.clock),
+            &mut inf_wire::ReplyBuf::over(&mut out),
+        );
         out
     }
 
@@ -51,7 +57,13 @@ impl Db {
         self.clock += 1;
         let owned: Vec<&[u8]> = argv.iter().map(|s| s.as_bytes()).collect();
         let mut out = earlier.to_vec();
-        execute_slices(&owned, &mut self.ks, &mut self.cx, Nanos(self.clock), &mut out);
+        execute_slices(
+            &owned,
+            &mut self.ks,
+            &mut self.cx,
+            Nanos(self.clock),
+            &mut inf_wire::ReplyBuf::over(&mut out),
+        );
         assert!(out.starts_with(earlier), "{argv:?} changed an earlier pipelined reply");
         out.split_off(earlier.len())
     }

@@ -62,8 +62,8 @@ use inf_store::{
     WallAnchor,
 };
 use inf_wire::{
-    ArgvRef, CmdFlags, CommandId, ConnParser, Parsed, ParserLimits, Protocol, RespWriter, arity_ok,
-    extract_keys, lookup,
+    ArgvRef, CmdFlags, CommandId, ConnParser, OpenReply, OwnedReply, Parsed, ParserLimits,
+    Protocol, ReplyBuf, ReplyOutcome, RespWriter, ZeroByteReply, arity_ok, extract_keys, lookup,
 };
 
 #[cfg(test)]
@@ -84,8 +84,9 @@ pub use conn::OwnedOutcome;
 use conn::{ACCEPT_RETRY, ACCEPT_RETRY_TIMER_KEY, CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
 use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
 use fabric::{
-    GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op,
-    parse_stageable, stage_argv_block_argv, stage_or_handle, strip_single_element,
+    GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, gather_element,
+    handle_fabric_op, parse_stageable, stage_argv_block_argv, stage_or_handle, staged_outcome,
+    wire_reply,
 };
 use ns_ddl::{
     SendNow, dispatch_ns, program_ckpt, program_ns_ddl, send_apply, send_apply_ns, try_send_apply,
@@ -96,10 +97,10 @@ use publish::{
 };
 use pumps::{compact_pump, ns_apply_pump, shadow_pump};
 use scatter::{
-    CountedFold, ScatterScope, error_reply, extract_keys_iter, extract_keys_slices, int_reply,
-    keyspace_level, ns_dbsize_local, parse_publisher_tag, peer_cells, program_keys, program_move,
-    program_msetnx, program_randomkey, program_scan, return_error, run_local, simple_reply,
-    stages_despite_error, u64_decimal,
+    CROSS_CELL_EXECUTION_FAILED, CountedFold, ScatterScope, error_reply, extract_keys_iter,
+    extract_keys_slices, int_reply, keyspace_level, ns_dbsize_local, parse_publisher_tag,
+    peer_cells, program_keys, program_move, program_msetnx, program_randomkey, program_scan,
+    run_local, simple_reply, stages, u64_decimal,
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
 use shared::{DurableAdmission, NsApplyOutcome, handle_ns_apply, tier_to_fan};
@@ -220,7 +221,7 @@ pub(super) struct GatedReply {
     to: CellId,
     token: FabricToken,
     seq: u64,
-    reply: Vec<u8>,
+    reply: OwnedReply,
 }
 
 #[allow(clippy::disallowed_types, reason = "container: E")]
@@ -625,7 +626,9 @@ struct BootRecovery<F: SegmentFs> {
 /// An owner-side reply produced during the FABRIC-IN drain (ranges index
 /// into the reply scratch buffer).
 enum StagedReply {
-    Bytes(usize, usize),
+    /// A reply's bytes in the drain's scratch with its outcome, read from
+    /// the reply's writer, never chosen (ADR-0190 D2).
+    Bytes(usize, usize, ReplyOutcome),
     Int(i64),
     Nil,
     /// The adopt ack (ADR-0128): returns the origin's credit, nothing else.
@@ -1826,6 +1829,10 @@ mod conn_default_tests {
 #[cfg(test)]
 #[path = "move_tests.rs"]
 mod move_tests;
+
+#[cfg(test)]
+#[path = "reply_outcome_tests.rs"]
+mod reply_outcome_tests;
 
 #[cfg(test)]
 #[path = "close_tests.rs"]

@@ -12,7 +12,7 @@ use inf_foundation::time::Nanos;
 use inf_store::{
     CellStore, EvictionPolicy, Keyspace, NsError, NsMode, NsSpec, PressureConfig, TierSpec,
 };
-use inf_wire::{CmdFlags, Protocol, RespWriter};
+use inf_wire::{CmdFlags, Protocol, ReplyBuf, RespWriter};
 
 use crate::clients::{format_client_line, valid_client_name};
 use crate::config::{ConfigSetError, ValidatedSet};
@@ -26,7 +26,12 @@ pub(crate) use sections::info;
 
 // ---- shared data definitions (behaviour lives in the child modules) ----------
 
-pub(crate) fn hello(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, out: &mut Vec<u8>) {
+pub(crate) fn hello(
+    argv: &(impl Argv + ?Sized),
+    cx: &mut ConnCx,
+    now: Nanos,
+    out: &mut ReplyBuf<'_>,
+) {
     let mut requested = cx.proto;
     if argv.len() >= 2 {
         match parse_i64(argv.arg(1)) {
@@ -902,7 +907,12 @@ fn next_local_ns_id(ks: &Keyspace) -> u32 {
 
 // ---- CLIENT ------------------------------------------------------------------
 
-pub(crate) fn client(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, out: &mut Vec<u8>) {
+pub(crate) fn client(
+    argv: &(impl Argv + ?Sized),
+    cx: &mut ConnCx,
+    now: Nanos,
+    out: &mut ReplyBuf<'_>,
+) {
     let proto = cx.proto;
     let mut w = RespWriter::new(out, proto);
     let sub = argv.arg(1);
@@ -1061,7 +1071,7 @@ mod tests {
         let mut iter = parser.feed(&wire);
         let Some(Parsed::Command(argv)) = iter.next() else { panic!("one command") };
         let mut out = Vec::new();
-        execute(&argv, store, cx, Nanos(1), &mut out);
+        execute(&argv, store, cx, Nanos(1), &mut ReplyBuf::over(&mut out));
         out
     }
 
@@ -1629,7 +1639,8 @@ mod tests {
         let later = Nanos(5_000 * 1_000_000);
         assert_eq!(store.expiry_lag_ms(later), 5_000);
         let mut out = Vec::new();
-        let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+        let mut out_reply = ReplyBuf::over(&mut out);
+        let mut w = RespWriter::new(&mut out_reply, Protocol::Resp2);
         info(&[b"INFO".as_slice(), b"stats"][..], &store, &cx.node, later, &mut w);
         let text = String::from_utf8(out).expect("ascii");
         assert!(text.contains("expiry_debt_ms:5000\r\n"), "{text}");

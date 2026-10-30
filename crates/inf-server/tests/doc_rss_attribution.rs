@@ -34,7 +34,7 @@ fn snapshot(
     let mut out = Vec::new();
     // The domains are `# Tripwires`, `process_rss` is `# Memory` (ADR-0122
     // A1); every name renders once, so the flat map is exact.
-    execute_slices(&[b"INFO"], ks, cx, Nanos(*clock), &mut out);
+    execute_slices(&[b"INFO"], ks, cx, Nanos(*clock), &mut inf_wire::ReplyBuf::over(&mut out));
     String::from_utf8(out)
         .expect("INFO is UTF-8")
         .lines()
@@ -74,7 +74,7 @@ fn document_heavy_domains_track_incremental_rss_within_ten_percent() {
             &mut ks,
             &mut cx,
             Nanos(clock),
-            &mut out,
+            &mut inf_wire::ReplyBuf::over(&mut out),
         );
         assert_eq!(out, b"+OK\r\n");
     }

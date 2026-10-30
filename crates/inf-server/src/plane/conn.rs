@@ -5,28 +5,16 @@
 use super::*;
 
 /// Owned fabric outcome (decoded outcomes borrow ring slots; gate values
-/// must own their bytes).
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// must own their bytes). A leg's reply is an [`OwnedReply`], its outcome
+/// read from the wire's variant at the one decode (ADR-0190 D3).
+#[derive(PartialEq, Eq, Debug)]
 pub enum OwnedOutcome {
     Ok,
-    Bytes(Vec<u8>),
+    Reply(OwnedReply),
     Int(i64),
     Nil,
     Bool(bool),
     Err(ErrCode),
-}
-
-impl OwnedOutcome {
-    pub(super) fn own(outcome: &Outcome<'_>) -> OwnedOutcome {
-        match outcome {
-            Outcome::Ok => OwnedOutcome::Ok,
-            Outcome::Bytes(b) => OwnedOutcome::Bytes(b.to_vec()),
-            Outcome::Int(i) => OwnedOutcome::Int(*i),
-            Outcome::Nil => OwnedOutcome::Nil,
-            Outcome::Bool(b) => OwnedOutcome::Bool(*b),
-            Outcome::Err(e) => OwnedOutcome::Err(*e),
-        }
-    }
 }
 
 // ---- deferred commands --------------------------------------------------------

@@ -514,6 +514,17 @@ rows=(
   # until it ends. Pinned at the watermark alone, a winner whose ticket
   # ends under the walk loses the hold the moment its own pin lifts.
   "inf_canary_ckpt_pin_at_watermark crate-test inf-store test:tiered_replay a_ticket_that_ends_before_the_images_keeps_its_winner_imaged the walk holds release at its lowest image"
+  # ADR-0190: a reply's outcome travels beside its bytes. An error in
+  # RESP3's second encoding (`!`) turns red the oracle that owns "an error
+  # is `-` on the wire"; the plane rows are green under it once no site
+  # reads a first byte.
+  "inf_canary_resp3_blob_error crate-test inf-wire lib resp2_surface_is_byte_exact"
+  # The writer leaves an error's outcome `Success`: a refused remote pair
+  # reads as an applied one and the fan answers `+OK`.
+  "inf_canary_reply_outcome_untagged crate-test inf-server lib reply_outcome_mset_remote_error_leg_is_the_reply"
+  # The owner tags an error reply `Bytes` on the fabric: the counted fold
+  # takes the leg's error for a non-count success.
+  "inf_canary_fabric_error_as_bytes crate-test inf-server lib reply_outcome_dbsize_drain_error_is_the_reply"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

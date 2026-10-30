@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 
 use inf_foundation::time::Nanos;
-use inf_wire::{CommandId, Protocol, RespWriter};
+use inf_wire::{CommandId, Protocol, ReplyBuf, RespWriter};
 
 use crate::exec::ConnCx;
 use crate::glob::glob_match;
@@ -151,7 +151,7 @@ pub(crate) fn restricted_error(
 
 /// Subscriber-mode RESP2 PING reply: a 2-element `[pong, <arg|"">]` frame
 /// (Redis `pingCommand` under `CLIENT_PUBSUB`).
-pub(crate) fn subscriber_ping(arg: Option<&[u8]>, proto: Protocol, out: &mut Vec<u8>) {
+pub(crate) fn subscriber_ping(arg: Option<&[u8]>, proto: Protocol, out: &mut ReplyBuf<'_>) {
     let mut w = RespWriter::new(out, proto);
     w.push_header(2);
     w.bulk(b"pong");
@@ -173,7 +173,7 @@ pub(crate) fn apply_subscribe(
     kind: SubKind,
     cx: &mut ConnCx,
     now: Nanos,
-    out: &mut Vec<u8>,
+    out: &mut ReplyBuf<'_>,
 ) -> Vec<SubChange> {
     let mut changes = Vec::with_capacity(names.len());
     for &name in names {
@@ -208,7 +208,7 @@ pub(crate) fn apply_unsubscribe(
     kind: SubKind,
     cx: &mut ConnCx,
     now: Nanos,
-    out: &mut Vec<u8>,
+    out: &mut ReplyBuf<'_>,
 ) -> Vec<SubChange> {
     let targets: Vec<Vec<u8>> = match names {
         Some(names) => names.iter().map(|n| n.to_vec()).collect(),
@@ -254,7 +254,12 @@ pub(crate) fn apply_unsubscribe(
 // ---- message frames --------------------------------------------------------------
 
 /// `[message, channel, payload]` delivery frame (push in RESP3).
-pub(crate) fn write_message(out: &mut Vec<u8>, proto: Protocol, channel: &[u8], payload: &[u8]) {
+pub(crate) fn write_message(
+    out: &mut ReplyBuf<'_>,
+    proto: Protocol,
+    channel: &[u8],
+    payload: &[u8],
+) {
     let mut w = RespWriter::new(out, proto);
     w.push_header(3);
     w.bulk(b"message");
@@ -264,7 +269,7 @@ pub(crate) fn write_message(out: &mut Vec<u8>, proto: Protocol, channel: &[u8], 
 
 /// `[pmessage, pattern, channel, payload]` delivery frame (push in RESP3).
 pub(crate) fn write_pmessage(
-    out: &mut Vec<u8>,
+    out: &mut ReplyBuf<'_>,
     proto: Protocol,
     pattern: &[u8],
     channel: &[u8],
@@ -285,7 +290,12 @@ pub(crate) fn write_pmessage(
 /// receiver-count reply precedes the push frames, and channel delivery
 /// precedes pattern delivery — the Redis order, oracle-pinned (Redis
 /// delivers to the publishing client after its command reply).
-pub(crate) fn publish_fallback(channel: &[u8], payload: &[u8], cx: &mut ConnCx, out: &mut Vec<u8>) {
+pub(crate) fn publish_fallback(
+    channel: &[u8],
+    payload: &[u8],
+    cx: &mut ConnCx,
+    out: &mut ReplyBuf<'_>,
+) {
     let on_channel = cx.sub_channels.iter().any(|c| c == channel);
     let patterns: Vec<&Vec<u8>> =
         cx.sub_patterns.iter().filter(|p| glob_match(p, channel, false)).collect();
@@ -302,7 +312,7 @@ pub(crate) fn publish_fallback(channel: &[u8], payload: &[u8], cx: &mut ConnCx, 
 /// PUBSUB without a plane: the single-connection view (CHANNELS = own
 /// channels, NUMSUB = 0/1, NUMPAT = own pattern count) — byte-equal to a
 /// one-client Redis. The plane path answers from the cell registries.
-pub(crate) fn pubsub_fallback(args: &[&[u8]], cx: &mut ConnCx, out: &mut Vec<u8>) {
+pub(crate) fn pubsub_fallback(args: &[&[u8]], cx: &mut ConnCx, out: &mut ReplyBuf<'_>) {
     let mut w = RespWriter::new(out, cx.proto);
     // The registry arity (-2) guarantees a subcommand; a guard, not `args[0]`.
     let Some(&sub) = args.first() else {
@@ -536,7 +546,13 @@ mod tests {
     fn subscribe_frames_and_counts_are_redis_shaped() {
         let mut cx = cx(Protocol::Resp2);
         let mut out = Vec::new();
-        let changes = apply_subscribe(&[b"a", b"b"], SubKind::Channel, &mut cx, Nanos(1), &mut out);
+        let changes = apply_subscribe(
+            &[b"a", b"b"],
+            SubKind::Channel,
+            &mut cx,
+            Nanos(1),
+            &mut ReplyBuf::over(&mut out),
+        );
         assert_eq!(
             out,
             b"*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n*3\r\n$9\r\nsubscribe\r\n$1\r\nb\r\n:2\r\n"
@@ -544,12 +560,24 @@ mod tests {
         assert_eq!(changes, vec![(b"a".to_vec(), true), (b"b".to_vec(), true)]);
         // Re-subscribe: frame still emitted, no state change.
         let mut out = Vec::new();
-        let changes = apply_subscribe(&[b"a"], SubKind::Channel, &mut cx, Nanos(1), &mut out);
+        let changes = apply_subscribe(
+            &[b"a"],
+            SubKind::Channel,
+            &mut cx,
+            Nanos(1),
+            &mut ReplyBuf::over(&mut out),
+        );
         assert_eq!(out, b"*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:2\r\n");
         assert_eq!(changes, vec![(b"a".to_vec(), false)]);
         // Patterns join the same count.
         let mut out = Vec::new();
-        apply_subscribe(&[b"n.*"], SubKind::Pattern, &mut cx, Nanos(1), &mut out);
+        apply_subscribe(
+            &[b"n.*"],
+            SubKind::Pattern,
+            &mut cx,
+            Nanos(1),
+            &mut ReplyBuf::over(&mut out),
+        );
         assert_eq!(out, b"*3\r\n$10\r\npsubscribe\r\n$3\r\nn.*\r\n:3\r\n");
     }
 
@@ -557,7 +585,13 @@ mod tests {
     fn resp3_confirmations_are_push_frames() {
         let mut cx = cx(Protocol::Resp3);
         let mut out = Vec::new();
-        apply_subscribe(&[b"a"], SubKind::Channel, &mut cx, Nanos(1), &mut out);
+        apply_subscribe(
+            &[b"a"],
+            SubKind::Channel,
+            &mut cx,
+            Nanos(1),
+            &mut ReplyBuf::over(&mut out),
+        );
         assert_eq!(out, b">3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n");
     }
 
@@ -565,7 +599,13 @@ mod tests {
     fn unsubscribe_bare_with_nothing_emits_one_nil_frame() {
         let mut cx = cx(Protocol::Resp2);
         let mut out = Vec::new();
-        let changes = apply_unsubscribe(None, SubKind::Channel, &mut cx, Nanos(1), &mut out);
+        let changes = apply_unsubscribe(
+            None,
+            SubKind::Channel,
+            &mut cx,
+            Nanos(1),
+            &mut ReplyBuf::over(&mut out),
+        );
         assert!(changes.is_empty());
         assert_eq!(out, b"*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n");
     }
@@ -574,9 +614,21 @@ mod tests {
     fn unsubscribe_bare_drops_in_subscription_order() {
         let mut cx = cx(Protocol::Resp2);
         let mut out = Vec::new();
-        apply_subscribe(&[b"z", b"a"], SubKind::Channel, &mut cx, Nanos(1), &mut out);
+        apply_subscribe(
+            &[b"z", b"a"],
+            SubKind::Channel,
+            &mut cx,
+            Nanos(1),
+            &mut ReplyBuf::over(&mut out),
+        );
         let mut out = Vec::new();
-        let changes = apply_unsubscribe(None, SubKind::Channel, &mut cx, Nanos(1), &mut out);
+        let changes = apply_unsubscribe(
+            None,
+            SubKind::Channel,
+            &mut cx,
+            Nanos(1),
+            &mut ReplyBuf::over(&mut out),
+        );
         assert_eq!(changes, vec![(b"z".to_vec(), true), (b"a".to_vec(), true)]);
         assert!(cx.sub_channels.is_empty());
     }
@@ -585,10 +637,22 @@ mod tests {
     fn publish_fallback_replies_then_self_delivers_channel_before_pattern() {
         let mut cx = cx(Protocol::Resp3);
         let mut out = Vec::new();
-        apply_subscribe(&[b"news.tech"], SubKind::Channel, &mut cx, Nanos(1), &mut out);
-        apply_subscribe(&[b"news.*"], SubKind::Pattern, &mut cx, Nanos(1), &mut out);
+        apply_subscribe(
+            &[b"news.tech"],
+            SubKind::Channel,
+            &mut cx,
+            Nanos(1),
+            &mut ReplyBuf::over(&mut out),
+        );
+        apply_subscribe(
+            &[b"news.*"],
+            SubKind::Pattern,
+            &mut cx,
+            Nanos(1),
+            &mut ReplyBuf::over(&mut out),
+        );
         let mut out = Vec::new();
-        publish_fallback(b"news.tech", b"hi", &mut cx, &mut out);
+        publish_fallback(b"news.tech", b"hi", &mut cx, &mut ReplyBuf::over(&mut out));
         // Oracle-pinned order: the receiver count precedes the push frames.
         let want = b":2\r\n>3\r\n$7\r\nmessage\r\n$9\r\nnews.tech\r\n$2\r\nhi\r\n\
                      >4\r\n$8\r\npmessage\r\n$6\r\nnews.*\r\n$9\r\nnews.tech\r\n$2\r\nhi\r\n";

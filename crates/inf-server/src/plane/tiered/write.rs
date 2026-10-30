@@ -564,17 +564,17 @@ pub(super) fn error_bytes<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     message: &str,
-) -> Vec<u8> {
-    let mut reply = shared.take_reply_buf();
+) -> OwnedReply {
+    let mut reply = OpenReply::new(shared.take_reply_buf());
     RespWriter::new(&mut reply, proto).error(message);
-    reply
+    reply.finish()
 }
 
 fn diskfull_bytes<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     cause: inf_store::DiskFullCause,
-) -> Vec<u8> {
+) -> OwnedReply {
     let message = match cause {
         inf_store::DiskFullCause::Budget { used, budget } => {
             format!("DISKFULL tiered namespace disk budget exhausted (used={used} budget={budget})")
@@ -583,9 +583,9 @@ fn diskfull_bytes<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             "DISKFULL tier device out of space (ENOSPC)".to_string()
         }
     };
-    let mut reply = shared.take_reply_buf();
+    let mut reply = OpenReply::new(shared.take_reply_buf());
     RespWriter::new(&mut reply, proto).error(&message);
-    reply
+    reply.finish()
 }
 
 /// Drives one value write to completion: resolve → attempt → park loops
@@ -599,8 +599,8 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     class: Option<FsyncClass>,
     key: &[u8],
     proto: Protocol,
-    compute: impl Fn(Option<&[u8]>, Option<u32>) -> Result<Vec<u8>, Vec<u8>>,
-) -> Result<(u64, Option<Vec<u8>>), Vec<u8>> {
+    compute: impl Fn(Option<&[u8]>, Option<u32>) -> Result<Vec<u8>, OwnedReply>,
+) -> Result<(u64, Option<Vec<u8>>), OwnedReply> {
     let hash = shared.hasher.hash(key);
     let deadline = stall_deadline(shared, ns);
     let mut replans: u8 = 0;
@@ -666,7 +666,7 @@ async fn park_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     deadline: Nanos,
     turn: &mut Option<ExtentTurn>,
     proto: Protocol,
-) -> Result<(), Vec<u8>> {
+) -> Result<(), OwnedReply> {
     match park {
         Park::Staging => {
             drop(turn.take());
@@ -749,7 +749,7 @@ pub(super) async fn set_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + '
     // option is the shadow-eligible shape (ADR-0093 D1).
     let plain = !nx && !xx && !get_old;
     let outcome = write_conditional(shared, ns, class, key, proto, nx, xx, value, plain).await;
-    let mut reply = shared.take_reply_buf();
+    let mut reply = OpenReply::new(shared.take_reply_buf());
     let mut w = RespWriter::new(&mut reply, proto);
     match outcome {
         Ok((seq, old_value, applied)) => {
@@ -764,15 +764,16 @@ pub(super) async fn set_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + '
                 w.null();
             }
             if applied && class == Some(FsyncClass::Always) {
-                return TieredReply::Gated { reply, seq };
+                return TieredReply::Gated { reply: reply.finish(), seq };
             }
-            TieredReply::Done(reply)
+            TieredReply::Done(reply.finish())
         }
+        // The write's own error reply is the answer, moved; this
+        // reply's buffer recycles (ADR-0190 D1: a whole reply is never
+        // pasted).
         Err(err) => {
-            reply.clear();
-            reply.extend_from_slice(&err);
-            shared.recycle_reply_buf(err);
-            TieredReply::Done(reply)
+            shared.recycle_reply_buf(reply.finish().into_bytes());
+            TieredReply::Done(err)
         }
     }
 }
@@ -789,7 +790,7 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     xx: bool,
     value: &[u8],
     plain: bool,
-) -> Result<(u64, Option<Vec<u8>>, bool), Vec<u8>> {
+) -> Result<(u64, Option<Vec<u8>>, bool), OwnedReply> {
     let hash = shared.hasher.hash(key);
     let deadline = stall_deadline(shared, ns);
     let mut replans: u8 = 0;
@@ -897,12 +898,12 @@ pub(super) async fn setnx<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
         .await
     {
         Ok((seq, _, applied)) => {
-            let mut reply = shared.take_reply_buf();
+            let mut reply = OpenReply::new(shared.take_reply_buf());
             RespWriter::new(&mut reply, proto).int(i64::from(applied));
             if applied && class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply, seq }
+                TieredReply::Gated { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply)
+                TieredReply::Done(reply.finish())
             }
         }
         Err(err) => TieredReply::Done(err),
@@ -920,16 +921,16 @@ pub(super) async fn getset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
         .await
     {
         Ok((seq, old_value, _)) => {
-            let mut reply = shared.take_reply_buf();
+            let mut reply = OpenReply::new(shared.take_reply_buf());
             let mut w = RespWriter::new(&mut reply, proto);
             match &old_value {
                 Some(v) => w.bulk(v),
                 None => w.null(),
             }
             if class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply, seq }
+                TieredReply::Gated { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply)
+                TieredReply::Done(reply.finish())
             }
         }
         Err(err) => TieredReply::Done(err),
@@ -1065,12 +1066,12 @@ pub(super) async fn incr<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     };
     match outcome {
         Ok((seq, _)) => {
-            let mut reply = shared.take_reply_buf();
+            let mut reply = OpenReply::new(shared.take_reply_buf());
             RespWriter::new(&mut reply, proto).int(computed.get());
             if class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply, seq }
+                TieredReply::Gated { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply)
+                TieredReply::Done(reply.finish())
             }
         }
         Err(err) => TieredReply::Done(err),
@@ -1117,12 +1118,12 @@ pub(super) async fn incrbyfloat<O: PlaneObserver + 'static, F: SegmentFs + Clone
     };
     match outcome {
         Ok((seq, _)) => {
-            let mut reply = shared.take_reply_buf();
+            let mut reply = OpenReply::new(shared.take_reply_buf());
             RespWriter::new(&mut reply, proto).bulk(&rendered.borrow());
             if class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply, seq }
+                TieredReply::Gated { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply)
+                TieredReply::Done(reply.finish())
             }
         }
         Err(err) => TieredReply::Done(err),
@@ -1139,7 +1140,7 @@ pub(super) async fn getdel<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     let key = argv.arg(1);
     match delete_one(shared, ns, class, key, proto, true).await {
         Ok(deleted) => {
-            let mut reply = shared.take_reply_buf();
+            let mut reply = OpenReply::new(shared.take_reply_buf());
             let mut w = RespWriter::new(&mut reply, proto);
             match &deleted {
                 Some((_, Some(v))) => w.bulk(v),
@@ -1148,9 +1149,9 @@ pub(super) async fn getdel<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
             if let Some((seq, _)) = deleted
                 && class == Some(FsyncClass::Always)
             {
-                TieredReply::Gated { reply, seq }
+                TieredReply::Gated { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply)
+                TieredReply::Done(reply.finish())
             }
         }
         Err(err) => TieredReply::Done(err),
@@ -1176,12 +1177,12 @@ pub(super) async fn del<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             Err(err) => return TieredReply::Done(err),
         }
     }
-    let mut reply = shared.take_reply_buf();
+    let mut reply = OpenReply::new(shared.take_reply_buf());
     RespWriter::new(&mut reply, proto).int(removed);
     if removed > 0 && class == Some(FsyncClass::Always) {
-        TieredReply::Gated { reply, seq: last_seq }
+        TieredReply::Gated { reply: reply.finish(), seq: last_seq }
     } else {
-        TieredReply::Done(reply)
+        TieredReply::Done(reply.finish())
     }
 }
 
@@ -1199,7 +1200,7 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     key: &[u8],
     proto: Protocol,
     want_value: bool,
-) -> Result<Option<(u64, Option<Vec<u8>>)>, Vec<u8>> {
+) -> Result<Option<(u64, Option<Vec<u8>>)>, OwnedReply> {
     let hash = shared.hasher.hash(key);
     loop {
         let Some(target) = resolve_delete_target(shared, ns, key, hash, want_value, proto).await?
@@ -1329,7 +1330,7 @@ async fn resolve_delete_target<O: PlaneObserver + 'static, F: SegmentFs + Clone 
     hash: u64,
     want_value: bool,
     proto: Protocol,
-) -> Result<Option<DeleteTarget>, Vec<u8>> {
+) -> Result<Option<DeleteTarget>, OwnedReply> {
     let target = match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {
         Resolved::Miss => None,
         Resolved::Ram(addr) => {
@@ -1409,7 +1410,7 @@ fn stage_delete<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     target: &DeleteTarget,
     twins: &mut TwinScratch,
     proto: Protocol,
-) -> Result<Staged, Vec<u8>> {
+) -> Result<Staged, OwnedReply> {
     let mut ks = shared.store.borrow_mut();
     let mut durable = shared.durable.borrow_mut();
     let Some(cell) = durable.as_mut() else {
@@ -1538,11 +1539,11 @@ pub(super) async fn mset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         }
         i += 2;
     }
-    let mut reply = shared.take_reply_buf();
+    let mut reply = OpenReply::new(shared.take_reply_buf());
     RespWriter::new(&mut reply, proto).simple("OK");
     if class == Some(FsyncClass::Always) {
-        TieredReply::Gated { reply, seq: last_seq }
+        TieredReply::Gated { reply: reply.finish(), seq: last_seq }
     } else {
-        TieredReply::Done(reply)
+        TieredReply::Done(reply.finish())
     }
 }

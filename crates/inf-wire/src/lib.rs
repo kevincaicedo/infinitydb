@@ -15,6 +15,8 @@
 mod command;
 pub mod limits;
 mod parser;
+#[cfg(test)]
+mod reply_outcome;
 mod writer;
 
 pub use command::{
@@ -25,4 +27,7 @@ pub use parser::{
     ArgvRef, ConnParser, DEFAULT_MAX_BULK_BYTES, FRAME_HEADROOM_BYTES, FrameIter, INLINE_ARGS,
     Parsed, ParserLimits, WireError,
 };
-pub use writer::{Protocol, ReplyMark, RespWriter};
+pub use writer::{
+    OpenReply, OwnedReply, Protocol, Reply, ReplyBuf, ReplyMark, ReplyOutcome, RespWriter,
+    ZeroByteReply,
+};

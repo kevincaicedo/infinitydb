@@ -1,12 +1,17 @@
-//! RESP2/RESP3 reply serializer (M0-S11). Writes into a caller-provided
-//! `Vec<u8>` (a wire send buffer) — no internal allocation; integers format
-//! through a stack buffer (no `format!`). The protocol version is chosen per
-//! connection at `HELLO` and threaded through [`RespWriter::new`].
+//! RESP2/RESP3 reply serializer (M0-S11). Writes one reply into a
+//! [`Reply`] over a caller-provided `Vec<u8>` (a wire send buffer or a pool
+//! buffer) — no internal allocation; integers format through a stack buffer
+//! (no `format!`). The protocol version is chosen per connection at `HELLO`
+//! and threaded through [`RespWriter::new`]. A reply carries its outcome
+//! beside its bytes (ADR-0190 D1): the writer sets it where it writes an
+//! error line at the reply's start, and no reader decides from the bytes.
 // ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
 #![cfg_attr(
     not(test),
     deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
 )]
+
+use core::borrow::BorrowMut;
 
 /// Negotiated protocol for one connection.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -16,10 +21,157 @@ pub enum Protocol {
     Resp3,
 }
 
-/// Reply writer over one send buffer.
+/// What one reply answered (ADR-0190 D1): `Error` iff the reply's
+/// top-level frame is an error line. Two outcomes, one byte.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ReplyOutcome {
+    Success,
+    Error,
+}
+
+/// One reply's bytes with where the reply began and its outcome (ADR-0190
+/// D1), in two forms by `B`: [`ReplyBuf`] over a buffer that outlives the
+/// reply (earlier pipelined replies before `start` are not this reply's),
+/// [`OpenReply`] over an owned pool buffer. Neither exposes `&mut Vec<u8>`:
+/// bytes enter only through [`RespWriter`], so no caller can write past the
+/// writer or truncate without resetting the outcome.
+#[derive(Debug)]
+pub struct Reply<B: BorrowMut<Vec<u8>>> {
+    bytes: B,
+    start: usize,
+    outcome: ReplyOutcome,
+}
+
+/// A reply over a buffer that outlives it (a connection's output, an
+/// owner's reply scratch).
+pub type ReplyBuf<'a> = Reply<&'a mut Vec<u8>>;
+
+/// A reply over an owned pool buffer, closed by [`OpenReply::finish`].
+pub type OpenReply = Reply<Vec<u8>>;
+
+impl<B: BorrowMut<Vec<u8>>> Reply<B> {
+    /// The reply's outcome so far.
+    pub fn outcome(&self) -> ReplyOutcome {
+        self.outcome
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.outcome == ReplyOutcome::Error
+    }
+
+    /// The reply's bytes so far: the buffer from the reply's start.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes.borrow()[self.start..]
+    }
+
+    /// The rollback to the reply's start: the buffer truncated to it and the
+    /// outcome reset to `Success`; every byte before the start stays.
+    pub fn clear(&mut self) {
+        self.bytes.borrow_mut().truncate(self.start);
+        self.outcome = ReplyOutcome::Success;
+    }
+}
+
+impl<'a> Reply<&'a mut Vec<u8>> {
+    /// Opens a reply at the buffer's end, `Success`, nothing written.
+    pub fn over(out: &'a mut Vec<u8>) -> ReplyBuf<'a> {
+        let start = out.len();
+        Reply { bytes: out, start, outcome: ReplyOutcome::Success }
+    }
+
+    /// The borrowed form's close: the reply's bytes copied with its outcome;
+    /// the buffer is left at the reply's start, `Success`.
+    pub fn detach(&mut self) -> OwnedReply {
+        let bytes = self.bytes[self.start..].to_vec();
+        self.bytes.truncate(self.start);
+        let outcome = core::mem::replace(&mut self.outcome, ReplyOutcome::Success);
+        OwnedReply { bytes, outcome }
+    }
+}
+
+impl Reply<Vec<u8>> {
+    /// Opens a reply over `buf`, which is cleared first: the owned form
+    /// never carries a stale prefix.
+    pub fn new(mut buf: Vec<u8>) -> OpenReply {
+        buf.clear();
+        Reply { bytes: buf, start: 0, outcome: ReplyOutcome::Success }
+    }
+
+    /// Runs `f` over a [`ReplyBuf`] view of this reply, opened at its start
+    /// with its current outcome, and writes the view's outcome back when `f`
+    /// returns: the one bridge from the owned form to a function that takes
+    /// a borrowed reply. `f` is synchronous, so the view cannot cross an
+    /// `await`.
+    pub fn lend<R>(&mut self, f: impl FnOnce(&mut ReplyBuf<'_>) -> R) -> R {
+        let mut view = Reply { bytes: &mut self.bytes, start: self.start, outcome: self.outcome };
+        let result = f(&mut view);
+        self.outcome = view.outcome;
+        result
+    }
+
+    /// The writer's close: bytes and outcome move together, no copy.
+    pub fn finish(self) -> OwnedReply {
+        OwnedReply { bytes: self.bytes, outcome: self.outcome }
+    }
+}
+
+/// A closed reply: its bytes and its outcome, built only by
+/// [`OpenReply::finish`], [`ReplyBuf::detach`] and [`OwnedReply::received`]
+/// (ADR-0190 D1).
+#[derive(Debug, PartialEq, Eq)]
+pub struct OwnedReply {
+    bytes: Vec<u8>,
+    outcome: ReplyOutcome,
+}
+
+/// A zero-byte reply [`OwnedReply::received`] refused, with the buffer it
+/// was handed returned for recycling.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ZeroByteReply(pub Vec<u8>);
+
+impl OwnedReply {
+    /// A reply received from another cell, its outcome read from the wire's
+    /// variant, never from its bytes. Zero bytes are refused: every reply
+    /// writes at least one frame.
+    pub fn received(bytes: Vec<u8>, outcome: ReplyOutcome) -> Result<OwnedReply, ZeroByteReply> {
+        if bytes.is_empty() {
+            return Err(ZeroByteReply(bytes));
+        }
+        Ok(OwnedReply { bytes, outcome })
+    }
+
+    pub fn outcome(&self) -> ReplyOutcome {
+        self.outcome
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.outcome == ReplyOutcome::Error
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The bytes alone, for the pool's recycle.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// [`OpenReply::finish`]'s inverse: bytes and outcome kept, for frames
+    /// appended after the reply through [`RespWriter::encoded`].
+    pub fn reopen(self) -> OpenReply {
+        Reply { bytes: self.bytes, start: 0, outcome: self.outcome }
+    }
+}
+
+/// Reply writer over one [`Reply`]: it takes split borrows of the reply's
+/// buffer, start and outcome once, at [`RespWriter::new`], so every frame
+/// method touches the buffer as a bare `Vec<u8>` would.
 #[derive(Debug)]
 pub struct RespWriter<'b> {
     out: &'b mut Vec<u8>,
+    start: usize,
+    outcome: &'b mut ReplyOutcome,
     proto: Protocol,
 }
 
@@ -34,8 +186,12 @@ pub struct ReplyMark {
 }
 
 impl<'b> RespWriter<'b> {
-    pub fn new(out: &'b mut Vec<u8>, proto: Protocol) -> RespWriter<'b> {
-        RespWriter { out, proto }
+    /// The writer's only constructor: a writer over a bare buffer does not
+    /// exist, so no reply is written without its outcome.
+    #[inline]
+    pub fn new<B: BorrowMut<Vec<u8>>>(reply: &'b mut Reply<B>, proto: Protocol) -> RespWriter<'b> {
+        let Reply { bytes, start, outcome } = reply;
+        RespWriter { out: bytes.borrow_mut(), start: *start, outcome, proto }
     }
 
     pub fn protocol(&self) -> Protocol {
@@ -48,10 +204,24 @@ impl<'b> RespWriter<'b> {
     }
 
     /// Discards every byte written since `mark`; bytes before it (earlier
-    /// pipelined replies) are untouched.
+    /// pipelined replies) are untouched. A rollback to the reply's start
+    /// also resets its outcome; one past it discards a nested frame and
+    /// leaves the outcome (ADR-0190 D1).
     pub fn rollback(&mut self, mark: &ReplyMark) {
         debug_assert!(mark.offset_bytes <= self.out.len(), "a mark lies inside its buffer");
+        debug_assert!(mark.offset_bytes >= self.start, "a mark lies inside its own reply");
         self.out.truncate(mark.offset_bytes);
+        if mark.offset_bytes == self.start {
+            *self.outcome = ReplyOutcome::Success;
+        }
+    }
+
+    /// Bytes another writer already encoded — a nested element, a frame
+    /// after the reply's first — appended as written, the outcome untouched.
+    /// The one way pre-encoded bytes enter a reply; a whole reply is moved
+    /// as an [`OwnedReply`], never pasted (ADR-0190 D1).
+    pub fn encoded(&mut self, bytes: &[u8]) {
+        self.out.extend_from_slice(bytes);
     }
 
     /// Bytes buffered for the connection, every pending reply included.
@@ -94,8 +264,29 @@ impl<'b> RespWriter<'b> {
     /// bytes: argv contents need not be UTF-8, and a lossy conversion would
     /// both change the byte budget a caller bounds against and diverge from
     /// the oracle's bytes.
+    ///
+    /// Written at the reply's start, the error is the reply's top-level
+    /// frame and sets the outcome to `Error`; past it, it is a nested error
+    /// element and leaves the outcome (ADR-0190 D1).
     #[inline]
     pub fn error_bytes(&mut self, text: &[u8]) {
+        // Canary `inf_canary_reply_outcome_untagged`: the error leaves the
+        // outcome `Success`, so a consumer that reads the outcome takes it
+        // for a success (the oracle: the client's reply bytes).
+        if self.out.len() == self.start && !cfg!(inf_canary_reply_outcome_untagged) {
+            *self.outcome = ReplyOutcome::Error;
+        }
+        // Canary `inf_canary_resp3_blob_error`: the error in RESP3's second
+        // encoding, `!<len>`, so a consumer that reads the first byte takes
+        // it for a success.
+        if cfg!(inf_canary_resp3_blob_error) {
+            self.out.push(b'!');
+            self.raw_len(text.len());
+            self.out.extend_from_slice(b"\r\n");
+            self.out.extend_from_slice(text);
+            self.out.extend_from_slice(b"\r\n");
+            return;
+        }
         self.push_line(b'-', text);
     }
 
@@ -464,7 +655,8 @@ mod tests {
 
     fn render(proto: Protocol, f: impl FnOnce(&mut RespWriter<'_>)) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut writer = RespWriter::new(&mut out, proto);
+        let mut reply = ReplyBuf::over(&mut out);
+        let mut writer = RespWriter::new(&mut reply, proto);
         f(&mut writer);
         out
     }

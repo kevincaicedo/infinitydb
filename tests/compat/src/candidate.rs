@@ -82,7 +82,13 @@ impl Candidate {
         while let Some(parsed) = iter.next() {
             match parsed {
                 Parsed::Command(argv) | Parsed::Inline(argv) => {
-                    execute(&argv, &mut self.store, &mut self.cx, now, &mut out);
+                    execute(
+                        &argv,
+                        &mut self.store,
+                        &mut self.cx,
+                        now,
+                        &mut inf_wire::ReplyBuf::over(&mut out),
+                    );
                     executed += 1;
                 }
                 Parsed::Incomplete => break,

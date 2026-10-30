@@ -6,7 +6,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use inf_wire::{ConnParser, Parsed, ParserLimits, Protocol, RespWriter, lookup};
+use inf_wire::{ConnParser, Parsed, ParserLimits, Protocol, ReplyBuf, RespWriter, lookup};
 
 /// Pipelined GET/SET mix, RESP-encoded — the regime the node throughput
 /// gate runs (memtier P=16 shape).
@@ -153,7 +153,8 @@ fn bench_write(c: &mut Criterion) {
         let mut out = Vec::with_capacity(1024);
         b.iter(|| {
             out.clear();
-            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            let mut out_reply = ReplyBuf::over(&mut out);
+            let mut w = RespWriter::new(&mut out_reply, Protocol::Resp2);
             for _ in 0..64 {
                 w.simple("OK");
             }
@@ -164,7 +165,8 @@ fn bench_write(c: &mut Criterion) {
         let mut out = Vec::with_capacity(8192);
         b.iter(|| {
             out.clear();
-            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            let mut out_reply = ReplyBuf::over(&mut out);
+            let mut w = RespWriter::new(&mut out_reply, Protocol::Resp2);
             for _ in 0..64 {
                 w.error("ERR value is not an integer or out of range");
             }
@@ -175,7 +177,8 @@ fn bench_write(c: &mut Criterion) {
         let mut out = Vec::with_capacity(1024);
         b.iter(|| {
             out.clear();
-            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            let mut out_reply = ReplyBuf::over(&mut out);
+            let mut w = RespWriter::new(&mut out_reply, Protocol::Resp2);
             for _ in 0..64 {
                 w.simple(black_box("OK"));
             }
@@ -186,7 +189,8 @@ fn bench_write(c: &mut Criterion) {
         let mut out = Vec::with_capacity(64 * 1024);
         b.iter(|| {
             out.clear();
-            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            let mut out_reply = ReplyBuf::over(&mut out);
+            let mut w = RespWriter::new(&mut out_reply, Protocol::Resp2);
             for _ in 0..64 {
                 w.bulk(black_box(&value));
             }
@@ -197,7 +201,8 @@ fn bench_write(c: &mut Criterion) {
         let mut out = Vec::with_capacity(8192);
         b.iter(|| {
             out.clear();
-            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            let mut out_reply = ReplyBuf::over(&mut out);
+            let mut w = RespWriter::new(&mut out_reply, Protocol::Resp2);
             for _ in 0..64 {
                 w.error(black_box("ERR value is not an integer or out of range"));
             }

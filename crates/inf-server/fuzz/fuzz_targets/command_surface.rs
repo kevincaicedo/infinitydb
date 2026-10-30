@@ -32,7 +32,13 @@ fuzz_target!(|data: &[u8]| {
         &[b"INF.PUT".as_slice(), b"move", value, data, data],
     ] {
         snapshot_reply.clear();
-        execute_slices(argv, &mut store, &mut cx, Nanos(1), &mut snapshot_reply);
+        execute_slices(
+            argv,
+            &mut store,
+            &mut cx,
+            Nanos(1),
+            &mut inf_wire::ReplyBuf::over(&mut snapshot_reply),
+        );
     }
     let mut rest = data;
     let mut out = Vec::new();
@@ -62,6 +68,12 @@ fuzz_target!(|data: &[u8]| {
         }
         let argv: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
         out.clear();
-        execute_slices(&argv, &mut store, &mut cx, Nanos(1), &mut out);
+        execute_slices(
+            &argv,
+            &mut store,
+            &mut cx,
+            Nanos(1),
+            &mut inf_wire::ReplyBuf::over(&mut out),
+        );
     }
 });

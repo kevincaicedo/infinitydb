@@ -25,7 +25,7 @@ use inf_store::{
     CellStore, CopyResult, ExpireCond, InternalDeadline, Keyspace, MAX_KEY_LEN, MAX_VAL_LEN,
     OpError, SetCond, SetExpire, SetOptions, SetOutcome, Ttl, TtlUpdate,
 };
-use inf_wire::{ArgvRef, CmdFlags, CommandId, Protocol, RespWriter, arity_ok, lookup};
+use inf_wire::{ArgvRef, CmdFlags, CommandId, Protocol, ReplyBuf, RespWriter, arity_ok, lookup};
 
 use crate::admin;
 use crate::clients::ClientRegistry;
@@ -708,7 +708,7 @@ pub fn execute(
     ks: &mut Keyspace,
     cx: &mut ConnCx,
     now: Nanos,
-    out: &mut Vec<u8>,
+    out: &mut ReplyBuf<'_>,
 ) {
     let Some(meta) = lookup(argv.arg(0)) else {
         let mut w = RespWriter::new(out, cx.proto);
@@ -878,7 +878,7 @@ fn execute_db(
     store: &mut CellStore,
     cx: &mut ConnCx,
     now: Nanos,
-    out: &mut Vec<u8>,
+    out: &mut ReplyBuf<'_>,
 ) {
     let mut w = RespWriter::new(out, cx.proto);
     match meta.id {
@@ -1205,7 +1205,7 @@ pub fn execute_slices(
     ks: &mut Keyspace,
     cx: &mut ConnCx,
     now: Nanos,
-    out: &mut Vec<u8>,
+    out: &mut ReplyBuf<'_>,
 ) {
     debug_assert!(!argv.is_empty(), "empty argv is a caller bug");
     execute(argv, ks, cx, now, out);
@@ -1541,7 +1541,13 @@ fn flush(
 
 // ---- KEYS / SCAN ---------------------------------------------------------------
 
-fn keys(pattern: &[u8], store: &mut CellStore, now: Nanos, proto: Protocol, out: &mut Vec<u8>) {
+fn keys(
+    pattern: &[u8],
+    store: &mut CellStore,
+    now: Nanos,
+    proto: Protocol,
+    out: &mut ReplyBuf<'_>,
+) {
     // Bounded per-cell slice semantics arrive with the plane's scatter
     // (M1-S02); locally this is one full home-group sweep.
     let mut hits: Vec<Vec<u8>> = Vec::new();
@@ -1568,7 +1574,7 @@ fn scan(
     store: &mut CellStore,
     now: Nanos,
     proto: Protocol,
-    out: &mut Vec<u8>,
+    out: &mut ReplyBuf<'_>,
 ) {
     let mut w = RespWriter::new(out, proto);
     let Some(cursor) = parse_cursor(argv.arg(1)) else {
@@ -1952,7 +1958,7 @@ const UNKNOWN_ARGS_BUDGET: usize = 128;
 // (ADR-0097 — review finding C6, where these bytes forged a second reply).
 /// The unknown-command reply for a client-typed `INTERNAL` row, refused
 /// at the plane's dispatch funnels before any routing (ADR-0115).
-pub(crate) fn unknown_command_reply(argv: &[&[u8]], proto: Protocol, out: &mut Vec<u8>) {
+pub(crate) fn unknown_command_reply(argv: &[&[u8]], proto: Protocol, out: &mut ReplyBuf<'_>) {
     unknown_command(argv, &mut RespWriter::new(out, proto));
 }
 
@@ -2149,7 +2155,8 @@ mod tests {
         use inf_store::DiskFullCause;
         for proto in [inf_wire::Protocol::Resp2, inf_wire::Protocol::Resp3] {
             let mut out = Vec::new();
-            let mut w = RespWriter::new(&mut out, proto);
+            let mut out_reply = ReplyBuf::over(&mut out);
+            let mut w = RespWriter::new(&mut out_reply, proto);
             op_error(
                 OpError::DiskFull(DiskFullCause::Budget { used: 16_252_928, budget: 16_777_216 }),
                 &mut w,
@@ -2162,7 +2169,8 @@ mod tests {
                 "{proto:?}"
             );
             let mut out = Vec::new();
-            let mut w = RespWriter::new(&mut out, proto);
+            let mut out_reply = ReplyBuf::over(&mut out);
+            let mut w = RespWriter::new(&mut out_reply, proto);
             op_error(OpError::DiskFull(DiskFullCause::Device), &mut w);
             assert_eq!(
                 out,
@@ -2183,7 +2191,7 @@ mod tests {
         let mut iter = parser.feed(&wire);
         let Some(Parsed::Command(argv)) = iter.next() else { panic!("one command") };
         let mut out = Vec::new();
-        execute(&argv, store, cx, now, &mut out);
+        execute(&argv, store, cx, now, &mut ReplyBuf::over(&mut out));
         out
     }
 
@@ -2572,9 +2580,10 @@ mod tests {
                     .collect();
                 let argv: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
                 let mut reply = Vec::new();
-                execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut reply);
+                let mut out = ReplyBuf::over(&mut reply);
+                execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut out);
                 cases += 1;
-                if reply.first() == Some(&b'-') {
+                if out.is_error() {
                     errors_seen += 1;
                     errors_for_this += 1;
                     let after = digest(&mut cx, &mut store);
@@ -2627,7 +2636,7 @@ mod tests {
         let big_val = vec![b'v'; MAX_VAL_LEN + 1];
         let argv: Vec<&[u8]> = vec![b"MSET", b"fresh", b"x", b"b", &big_val];
         let mut reply = Vec::new();
-        execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut reply);
+        execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut ReplyBuf::over(&mut reply));
         assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
         assert_eq!(run(&mut cx, &mut store, &[b"GET", b"fresh"]), b"$-1\r\n");
     }
@@ -3180,7 +3189,8 @@ mod tests {
             // The cross-cell move's destination put carries a snapshot
             // deadline through the same seam.
             let mut out = Vec::new();
-            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            let mut out_reply = ReplyBuf::over(&mut out);
+            let mut w = RespWriter::new(&mut out_reply, Protocol::Resp2);
             let put: &[&[u8]] = &[b"INF.PUT", b"m", b"v", b"1"];
             inf_move_put(put, store.db_mut(0), &cx.node, now, &mut w);
             assert_eq!(out, b"+OK\r\n");

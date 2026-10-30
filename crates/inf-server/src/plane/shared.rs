@@ -50,9 +50,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         db: u16,
         ns: Option<NsId>,
         program: bool,
-        out: &mut Vec<u8>,
+        out: &mut ReplyBuf<'_>,
     ) -> bool {
-        let before = out.len();
         let mut cx = ConnCx {
             proto,
             id,
@@ -122,7 +121,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
                 origin,
                 ExecScope::of(&cx),
                 argv,
-                &out[before..],
+                out.bytes(),
                 now,
             );
             return false;
@@ -137,7 +136,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         }
         #[cfg(feature = "doc")]
         self.node.doc_log_admission.set(None);
-        self.observer.borrow_mut().on_execute(self.cell, origin, scope, argv, &out[before..], now);
+        self.observer.borrow_mut().on_execute(self.cell, origin, scope, argv, out.bytes(), now);
         cx.close_requested.get()
     }
 
@@ -238,7 +237,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             if del { store.del(key, now) } else { store.exists(key, now) }
         };
         let mut reply = Vec::new();
-        RespWriter::new(&mut reply, Protocol::Resp2).int(i64::from(hit));
+        RespWriter::new(&mut ReplyBuf::over(&mut reply), Protocol::Resp2).int(i64::from(hit));
         self.observer.borrow_mut().on_execute(
             self.cell,
             origin,
@@ -255,7 +254,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         let now = self.now.get();
         let len = self.store.borrow_mut().db_mut(usize::from(db)).len() as i64;
         let mut reply = Vec::new();
-        RespWriter::new(&mut reply, Protocol::Resp2).int(len);
+        RespWriter::new(&mut ReplyBuf::over(&mut reply), Protocol::Resp2).int(len);
         self.observer.borrow_mut().on_execute(
             self.cell,
             origin,
@@ -527,9 +526,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         proto: Protocol,
         ns: NsId,
         program: bool,
-        out: &mut Vec<u8>,
+        out: &mut ReplyBuf<'_>,
     ) -> NsApplyOutcome {
-        let before = out.len();
         let meta = lookup(argv[0]);
         let class = self.store.borrow().ns_fsync_class(ns);
         let is_write = meta.is_some_and(|m| m.flags.contains(CmdFlags::WRITE));
@@ -583,10 +581,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             program,
             out,
         );
+        // Every command writes at least one frame; its outcome is the frame
+        // at the reply's start (ADR-0190 D2) — a byte count, never a read
+        // of the encoding.
+        debug_assert!(!out.bytes().is_empty(), "every command writes at least one frame");
         let mut outcome = NsApplyOutcome::Reply;
         if is_write
             && let (Some(meta), Some(class)) = (meta, class)
-            && (out.get(before) != Some(&b'-') || stages_despite_error(meta.id))
+            && stages(out.outcome(), meta.id)
             && let Some(seq) = self.stage_durable_effects(ns, meta, argv, class)
             && class == FsyncClass::Always
         {
@@ -695,7 +697,8 @@ pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone +
         return false;
     }
     let start = scratch.len();
-    let mut w = RespWriter::new(scratch, Protocol::Resp2);
+    let mut reply = ReplyBuf::over(scratch);
+    let mut w = RespWriter::new(&mut reply, Protocol::Resp2);
     // Crash-matrix point (ADR-0108 D3): a peer refusing its `CREATE`
     // leg — the deterministic stand-in for the OS refusing the tier
     // ring reservation on this cell after the catalog swap.
@@ -704,14 +707,16 @@ pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone +
         && inf_foundation::fault::fire(crate::fault::NS_CREATE_FAN_REFUSED)
     {
         w.error("ERR fault: ns_create_fan_refused");
-        staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+        let outcome = reply.outcome();
+        staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
         return true;
     }
     match apply_nsfan(shared, argv) {
         Ok(()) => w.simple("OK"),
         Err(e) => crate::admin::ns_error(e, &mut w),
     }
-    staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+    let outcome = reply.outcome();
+    staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
     true
 }
 

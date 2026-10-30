@@ -608,7 +608,7 @@ impl PlaneObserver for SharedOracle {
         let mut expected = Vec::new();
         let mut cx = model_cx(scope);
         let Oracle { model, shadow, violations, .. } = &mut *oracle;
-        execute_slices(argv, model, &mut cx, now, &mut expected);
+        execute_slices(argv, model, &mut cx, now, &mut inf_wire::ReplyBuf::over(&mut expected));
         if expected != reply {
             let argv_text: Vec<String> =
                 argv.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();

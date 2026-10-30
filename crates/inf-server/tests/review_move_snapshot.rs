@@ -6,7 +6,7 @@ use inf_store::{Keyspace, StoreConfig};
 
 fn call(store: &mut Keyspace, cx: &mut ConnCx, argv: &[&[u8]]) -> Vec<u8> {
     let mut reply = Vec::new();
-    execute_slices(argv, store, cx, Nanos(1), &mut reply);
+    execute_slices(argv, store, cx, Nanos(1), &mut inf_wire::ReplyBuf::over(&mut reply));
     reply
 }
 
