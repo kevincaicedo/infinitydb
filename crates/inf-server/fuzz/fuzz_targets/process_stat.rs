@@ -1,8 +1,12 @@
 //! Totality and metric-width checks for the exact control-owner stat parser.
 #![no_main]
 
-#[path = "../../src/limits.rs"]
-mod limits;
+// The parser reads its bound as `crate::limits::PROCESS_STAT_BYTES_MAX`: the
+// same const, re-exported from the crate that owns it, so the target never
+// compiles the server's whole limits table outside its crate.
+mod limits {
+    pub(crate) use inf_server::limits::PROCESS_STAT_BYTES_MAX;
+}
 #[path = "../../src/process_info/stat.rs"]
 mod stat;
 
