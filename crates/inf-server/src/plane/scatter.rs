@@ -774,6 +774,7 @@ pub(super) fn parse_publisher_tag(conn: &[u8], seq: &[u8]) -> Option<(ConnKey, u
     )
 )]
 pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
+    // reply-outcome-allow: a fuzzed value decoder of a leg whose outcome was read first
     let rest = raw.strip_prefix(b"*")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let n: i64 = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
@@ -796,6 +797,7 @@ pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
     )
 )]
 pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
+    // reply-outcome-allow: a fuzzed value decoder of a leg whose outcome was read first
     let rest = raw.strip_prefix(b"*2\r\n$")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let len: usize = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
@@ -825,6 +827,7 @@ pub fn parse_take_reply(raw: &[u8]) -> Option<Option<(Vec<u8>, i64)>> {
     if raw == b"*-1\r\n" {
         return Some(None);
     }
+    // reply-outcome-allow: a fuzzed value decoder of a leg whose outcome was read first
     let rest = raw.strip_prefix(b"*2\r\n$")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let len: usize = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;

@@ -66,6 +66,9 @@ jobs:
         run: ./scripts/check-fsync-fail-stop.sh
       - name: panic-policy grep
         run: ./scripts/check-panic-policy.sh
+      # ADR-0190 D4: a reply's outcome is read beside its bytes, never from them.
+      - name: reply-outcome gate (ADR-0190 D4)
+        run: ./scripts/check-reply-outcome.sh
       # ADR-0107 D2 (review 2026-08-30, Theme 4): release asserts justified
       # by a claim about a caller are an inventory, gated.
       - name: release-assert inventory (ADR-0107 D2)

@@ -399,6 +399,123 @@ expect red "panic-policy: a bare marker without a reason fails" env INF_CHECK_RO
 
 expect red "panic-policy: no crates at all is a failure, not OK" env INF_CHECK_ROOT="$work/empty" $PANIC
 
+# ------------------------------------------------------------ reply outcome
+# ADR-0190 D4: no production site of crates/inf-server/src reads a reply's
+# outcome from its bytes. Each fixture is one inf-server lib.rs (and a
+# test-only modfile where the case needs one).
+REPLY=./scripts/check-reply-outcome.sh
+ro_fixture() {
+    local name=$1 root
+    [ -n "$name" ] && [ -n "$work" ] || { echo "ro_fixture: empty name or work dir" >&2; exit 2; }
+    root="$work/$name"
+    [ -e "$root" ] && rm -rf "$root"
+    mkdir -p "$root/crates/inf-server/src"
+    cat >"$root/crates/inf-server/src/lib.rs"
+    echo "$root"
+}
+
+IFS= read -r -d '' body <<'EOF' || true
+pub fn ok(bytes: &[u8], digits: &[u8], pattern: &[u8], c: u8) -> bool {
+    let sign = match c {
+        b'-' => -1,
+        b'*' => 0,
+        _ => 1,
+    };
+    sign == 0 && bytes == b"-" && digits[0] == b'0' && pattern.first() == Some(&b'^')
+}
+pub const N: &[u8] = b"-1";
+EOF
+root=$(printf '%s' "$body" | ro_fixture roclean)
+expect green "reply-outcome: the sign arm, an argument compare, a digit, a non-tag byte and b\"-1\" are clean" \
+    env INF_CHECK_ROOT="$root" $REPLY
+expect_output "reply-outcome: the scope line discloses the scan" "1 files, 9 lines scanned" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+for snippet in \
+    "pub fn t(r: &[u8]) -> bool { r.first() == Some(&b'-') }" \
+    "pub fn t(r: &[u8]) -> bool { r.first() == Some(&b'!') }" \
+    "pub fn t(r: &[u8]) -> bool { r.first() == Some(&b'+') }" \
+    "pub fn t(r: &[u8]) -> bool { matches!(r.first().copied(), Some(b'-')) }" \
+    "pub fn t(r: &[u8]) -> bool { matches!(r, [b'-', ..]) }" \
+    "pub fn t(r: &[u8]) -> bool { matches!(r.first().copied(), Some(b'-' | b'!')) }" \
+    "pub fn t(r: &[u8]) -> bool { matches!(r, [b'-' | b'!', ..]) }" \
+    "pub fn t(r: &[u8]) -> bool { b'-' == r[0] }" \
+    "pub fn t(r: &[u8]) -> bool { b'-' != r[0] }" \
+    "pub fn t(r: &[u8]) -> bool { r[0] == b'*' }" \
+    "pub fn t(r: &[u8]) -> bool { r[0] != b'-' }" \
+    "pub fn t(r: &[u8]) -> bool { r.starts_with(b\"-ERR\") }" \
+    "pub fn t(r: &[u8]) -> Option<&[u8]> { r.strip_prefix(b\"*1\") }" \
+    "pub const E: &[u8] = b\"-ERR planted\\r\\n\";" \
+    "pub fn t(out: &mut Vec<u8>) { out.push(b'-') }" \
+    "pub fn t(b: Vec<u8>) { let _ = inf_wire::OwnedReply::received(b, inf_wire::ReplyOutcome::Error); }"
+do
+    root=$(ro_fixture roplanted <<<"$snippet")
+    expect_red_because "reply-outcome: planted '$snippet'" "REPLY-OUTCOME violation (an outcome" \
+        env INF_CHECK_ROOT="$root" $REPLY
+done
+
+IFS= read -r -d '' body <<'EOF' || true
+pub fn t(r: &[u8]) -> bool {
+    // reply-outcome-allow: a fixture's sanctioned value decoder
+    r.first() == Some(&b'-')
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture roallow)
+expect green "reply-outcome: a marked site is green" env INF_CHECK_ROOT="$root" $REPLY
+expect_output "reply-outcome: a marked site is listed with its reason" \
+    "a fixture's sanctioned value decoder" env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+pub fn t(r: &[u8]) -> bool {
+    r.first() == Some(&b'-') // reply-outcome-allow
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture robare)
+expect_red_because "reply-outcome: a bare marker without a reason fails" "marker without a reason" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+pub fn t(r: &[u8]) -> bool {
+    // reply-outcome-allow: guards nothing below
+    r.is_empty()
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture rostale)
+expect_red_because "reply-outcome: a marker guarding no hit fails" "a marker guarding no hit" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+pub fn ok() {}
+
+#[cfg(test)]
+mod tests {
+    fn t(r: &[u8]) -> bool { r.first() == Some(&b'-') }
+}
+
+#[cfg(test)]
+#[path = "fixture_tests.rs"]
+mod fixture_tests;
+EOF
+root=$(printf '%s' "$body" | ro_fixture rotest)
+printf '%s\n' "pub fn t(r: &[u8]) -> bool { r.first() == Some(&b'-') }" \
+    >"$root/crates/inf-server/src/fixture_tests.rs"
+expect green "reply-outcome: a test module and a test-only modfile are out of scope" \
+    env INF_CHECK_ROOT="$root" $REPLY
+expect_output "reply-outcome: the excluded modfile is disclosed" "1 test-only files excluded" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+/// A doc line that says `r.first() == Some(&b'-')` is not code.
+pub fn ok() {}
+EOF
+root=$(printf '%s' "$body" | ro_fixture rodoc)
+expect green "reply-outcome: a comment naming a shape is not a site" env INF_CHECK_ROOT="$root" $REPLY
+
+mkdir -p "$work/roempty/crates/inf-server/src"
+expect_red_because "reply-outcome: an empty file set is a scope error" "REPLY-OUTCOME SCOPE ERROR" \
+    env INF_CHECK_ROOT="$work/roempty" $REPLY
+expect red "reply-outcome: a missing directory is a scope error" env INF_CHECK_ROOT="$work/empty" $REPLY
+
 # ---------------------------------------------------------------- run-sweep
 # A stub simulator driven by env: which shard exits non-zero, which shard
 # reports violations, which shard writes no manifest.
@@ -3232,4 +3349,4 @@ if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, parent-doc-gates, arith-spellings, lint-scopes each exiting non-zero on its planted case)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, reply-outcome, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, parent-doc-gates, arith-spellings, lint-scopes each exiting non-zero on its planted case)"

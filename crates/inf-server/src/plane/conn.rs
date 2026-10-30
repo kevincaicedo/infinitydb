@@ -120,6 +120,7 @@ impl Conn {
 pub(super) const CONN_SLOT_CAP: u32 = inf_runtime::MAX_SLOT;
 
 /// Redis's reply past `maxclients` (networking.c, measured 8.0.5).
+// reply-outcome-allow: a connection frame copied to a send buffer, no reply (ADR-0123 D1)
 pub(super) const MAXCLIENTS_REFUSAL: &[u8] = b"-ERR max number of clients reached\r\n";
 
 /// The accept-retry wheel key (F-L11-02): after the driver parks the
