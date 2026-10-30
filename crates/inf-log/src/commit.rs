@@ -1208,8 +1208,8 @@ impl<File: SegmentFile> GroupCommit<File> {
             }
             SealPlan::WriteThrough => {
                 // Release assert: the prefix rule (module docs). The frame's
-                // base is `queued_bytes`; a FUA ticket claiming bytes it did
-                // not write is the ack-before-durable bug the sweep caught.
+                // base is `queued_bytes`; a FUA ticket that claims bytes it
+                // did not write acks them before they are durable.
                 // Per-frame, free.
                 assert_eq!(
                     self.coverage_tail().1,
@@ -1815,9 +1815,9 @@ mod tests {
         }
     }
 
-    /// The overwrite's correct half: a frame takes its barrier once, so a
-    /// write-through frame's ticket completes at its write and the
-    /// watermark reaches the frame's end.
+    /// A frame takes its barrier once, so a write-through frame's ticket
+    /// completes at its own write and the watermark reaches the frame's
+    /// end.
     #[test]
     fn a_write_through_frame_completes_at_its_write() {
         let mut gc = commit();
