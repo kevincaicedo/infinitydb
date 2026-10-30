@@ -17,8 +17,11 @@
 #
 # A failure auto-files an issue carrying the exact scenario + seed + commit
 # (the determinism contract makes that a complete repro) and uploads the
-# trace bundle as an artifact. Fixes land WITH the seed appended to
-# bins/inf-sim/seeds/corpus.txt.
+# trace bundle as an artifact. A sweep shard is the exception: under
+# --verify-determinism a seed that fails an oracle fails its twin too, which
+# stops the shard before it writes its results, so the log names the shard
+# and its base seed, and rerunning that shard without the flag names the
+# seed. Fixes land WITH the seed appended to bins/inf-sim/seeds/corpus.txt.
 #
 # NOTE: the repo root is the Cargo workspace; jobs run from the root. Not yet
 # exercised against a live runner.
@@ -82,6 +85,13 @@ jobs:
 
   fleet:
     runs-on: ubuntu-24.04
+    # The four sweeps run every seed twice (--verify-determinism), which
+    # doubles their time: one shard of each, timed on one core of a 24-core
+    # x86-64 machine, took 77 s (m2-durable), 22 s (m3-document), 15 s
+    # (m2-combined) and 356 s (m4-tiered) with the flag. Eight shards on a
+    # 4-vCPU runner take about twice one shard: about 16 min for the four
+    # sweeps, 31 min if the runner's cores are half as fast, against this
+    # bound. An estimate: the job has not yet run on a live runner.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -97,11 +107,14 @@ jobs:
           echo "durable sweep seed base: $base (run id ${{ github.run_id }})" | tee -a /tmp/fleet.log
           # 12,000 m2-durable seeds across 8 shards (≥ 10k, S14 budget). The
           # stall device (on by default in m2_durable) adds ~5–15%/seed; the
-          # wider sharding offsets it. Determinism-verified per seed by the
-          # runner's replay contract; any failing seed replays via --seed.
+          # wider sharding offsets it. Determinism-verified per seed:
+          # --verify-determinism runs each seed twice, and the shard exits 1
+          # before it writes its manifest unless both runs' trace and state
+          # hashes match, so the manifest check below reads it red. Each of
+          # the four sweeps passes the flag. Any failing seed replays via --seed.
           for i in 0 1 2 3 4 5 6 7; do
             ./target/release/inf-sim --scenario m2-durable --sweep 12000 --seed "$base" \
-              --shard "$i/8" --out /tmp/durable-sweep >> /tmp/fleet.log 2>&1 &
+              --shard "$i/8" --verify-determinism --out /tmp/durable-sweep >> /tmp/fleet.log 2>&1 &
           done
           wait
           fail=0
@@ -124,7 +137,7 @@ jobs:
           # discloses the cut-class distribution (ADR-0045 D4).
           for i in 0 1 2 3 4 5 6 7; do
             ./target/release/inf-sim --scenario m3-document --sweep 4000 --seed "$base" \
-              --shard "$i/8" --out /tmp/document-sweep >> /tmp/fleet.log 2>&1 &
+              --shard "$i/8" --verify-determinism --out /tmp/document-sweep >> /tmp/fleet.log 2>&1 &
           done
           wait
           fail=0
@@ -144,7 +157,7 @@ jobs:
           echo "combined sweep seed base: $base" | tee -a /tmp/fleet.log
           for i in 0 1 2 3 4 5 6 7; do
             ./target/release/inf-sim --scenario m2-combined --sweep 4000 --seed "$base" \
-              --shard "$i/8" --out /tmp/combined-sweep >> /tmp/fleet.log 2>&1 &
+              --shard "$i/8" --verify-determinism --out /tmp/combined-sweep >> /tmp/fleet.log 2>&1 &
           done
           wait
           fail=0
@@ -168,7 +181,7 @@ jobs:
           # manifest discloses demotion/cold/blob/refusal coverage.
           for i in 0 1 2 3 4 5 6 7; do
             ./target/release/inf-sim --scenario m4-tiered --sweep 4000 --seed "$base" \
-              --shard "$i/8" --out /tmp/tiered-sweep >> /tmp/fleet.log 2>&1 &
+              --shard "$i/8" --verify-determinism --out /tmp/tiered-sweep >> /tmp/fleet.log 2>&1 &
           done
           wait
           fail=0
