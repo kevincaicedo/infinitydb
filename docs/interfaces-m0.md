@@ -534,17 +534,17 @@ pub struct GroupScheduler;  // deficit-weighted, burst-capped; refill/budget/cha
 > implemented shape: these additions are not built, and they bound no
 > retained reply's bytes.
 
-> **ADR-0190 (2026-10-29), implementation open:** `Outcome` gains
+> **ADR-0190 (2026-10-29):** `Outcome` has
 > `ErrorReply(&'a [u8])`, outcome tag 7, encoded as `Bytes` is: a leg's
 > reply whose outcome is `Error`. `Bytes` keeps tag 1 and carries only a
 > reply whose outcome is `Success`. The tag is set from the reply's
 > outcome where the owner sends and read back into it where the origin
-> decodes, never from the bytes. `ErrCode` gains `EmptyReply`, wire value
+> decodes, never from the bytes. `ErrCode` has `EmptyReply`, wire value
 > 5: the origin's refusal of a zero-byte `Bytes` or `ErrorReply`, made
 > where the owned reply is built, never in the codec, which stays total
 > and decodes a zero-length reply. An unknown tag is still a decode error.
-> Tag 6 is `StreamReady` (ADR-0150, above). Not built; the sketch below
-> is the implemented shape (ADR-0190 D3).
+> Tag 6 is `StreamReady` (ADR-0150, above). The sketch below is the
+> shape (ADR-0190 D3).
 
 ```rust
 pub struct FabricToken(pub u64);           // {origin_cell:16, seq:48}; reply-routing key
@@ -573,7 +573,8 @@ pub enum Op<'a> {
     /// incoming credit backs custody until then. This lifetime is unbuilt.
     AdoptConn { token: FabricToken, fd: u32 },
 }
-pub enum Outcome<'a> { Ok, Bytes(&'a [u8]), Int(i64), Nil, Bool(bool), Err(ErrCode) }
+pub enum Outcome<'a> { Ok, Bytes(&'a [u8]), ErrorReply(&'a [u8]), Int(i64), Nil, Bool(bool),
+                       Err(ErrCode) }   // ErrorReply: tag 7; ErrCode::EmptyReply: 5
 pub fn encode(op: &Op<'_>, out: &mut Vec<u8>);
 pub fn decode(frame: &[u8]) -> Result<Op<'_>, CodecError>;
 
@@ -673,7 +674,7 @@ between cells in one process, not authentication or an ACL capability
 > compiler-enforces the "frames never outlive EXECUTE unless copied"
 > retention rule.
 
-> **ADR-0190 (2026-10-29), implementation open:** a reply carries its
+> **ADR-0190 (2026-10-29):** a reply carries its
 > outcome beside its bytes. `ReplyOutcome::{Success, Error}` is one byte
 > the writer sets. `Reply<B>` wraps a reply's bytes (`ReplyBuf<'a>` over
 > a buffer that outlives the reply, `OpenReply` over a pool buffer) with
@@ -688,10 +689,10 @@ between cells in one process, not authentication or an ACL capability
 > which refuses zero bytes and returns them; `OwnedReply::reopen` is the
 > inverse of `finish`, bytes and outcome kept. A reply is read through
 > `outcome()`, `is_error()`, `bytes()` and `into_bytes()`; a borrowed
-> reply's bytes are the buffer's from its start, read once the view has
-> dropped. `RespWriter::new` takes `&mut Reply<B>`, no longer
-> `&mut Vec<u8>`; the writer's type and its frame methods are unchanged,
-> and it gains `encoded(bytes)`, the one entry for bytes another writer
+> reply's bytes are the buffer's from its start, read through the view's
+> `bytes()` or from the buffer once the view has dropped. `RespWriter::new`
+> takes `&mut Reply<B>`, not `&mut Vec<u8>`; the writer's type and its
+> frame methods are as before, and it has `encoded(bytes)`, the one entry for bytes another writer
 > encoded (a nested element, a frame after the first), which leaves the
 > outcome alone — a whole reply is moved, never pasted. `error` and
 > `error_bytes` set `Error` only when they write the reply's first frame;
@@ -699,8 +700,7 @@ between cells in one process, not authentication or an ACL capability
 > start, and `clear`, reset it to `Success` and leave every byte before
 > the reply's start. The outcome is `Error` iff
 > the reply's top-level frame is an error line, and no reader of a reply
-> decides from its bytes. Not built; the sketch below is the implemented
-> shape (ADR-0190 D1).
+> decides from its bytes. The sketch below is the shape (ADR-0190 D1).
 
 ```rust
 // Parser: per-connection state over borrowed input; a frame that spans feeds
@@ -732,7 +732,12 @@ pub struct ArgvRef<'a>;   // argv[i] -> &'a [u8]; offset-based over the frame;
 
 // Serializer: RESP2/RESP3 selected per connection (HELLO).
 pub enum Protocol { Resp2, Resp3 }
-pub struct RespWriter<'b>;                  // over &mut Vec<u8> (a wire buffer)
+pub enum ReplyOutcome { Success, Error }    // ADR-0190 D1: set by the writer
+pub struct Reply<B: BorrowMut<Vec<u8>>>;    // bytes, the reply's start, its outcome
+pub type ReplyBuf<'a> = Reply<&'a mut Vec<u8>>;  // over a buffer that outlives it
+pub type OpenReply = Reply<Vec<u8>>;        // over a pool buffer; lend / finish
+pub struct OwnedReply;                      // finish / detach / received(bytes, outcome)
+pub struct RespWriter<'b>;                  // over &mut Reply<B> (one reply)
   // simple / error / error_bytes / int / bulk / null / null_array /
   // array_header / map_header / bool / double / verbatim / big_number —
   // RESP2/3 variants selected by `Protocol`; stack-buffer itoa, no allocation.
@@ -900,7 +905,7 @@ impl SlotRouter {
 > replacements are not built; the sketches below are the implemented
 > execution and observer interfaces.
 
-> **ADR-0190 (2026-10-29), implementation open:** `execute` and
+> **ADR-0190 (2026-10-29):** `execute` and
 > `execute_slices` take `out: &mut ReplyBuf<'_>` in place of
 > `&mut Vec<u8>`, as does every reply parameter of the crate (none is
 > generic; an owned open reply is lent to them); a writer of several
@@ -919,15 +924,15 @@ impl SlotRouter {
 > compat oracle's assertion, not a rule of this seam.
 > `scripts/check-reply-outcome.sh` refuses a first-byte or prefix
 > comparison in production `crates/inf-server/src`; a sanctioned site
-> carries `reply-outcome-allow: <reason>`. Not built; the sketch below is
-> the implemented shape (ADR-0190 D2, D4).
+> carries `reply-outcome-allow: <reason>`. The sketch below is the shape
+> (ADR-0190 D2, D4).
 
 ```rust
 pub struct ConnCx { pub proto: Protocol, pub id: u64 }   // HELLO state
 /// One parsed command → store ops → RESP2/3 reply bytes. All commands
 /// enter through the inf-wire registry (lookup → arity → key spec).
 pub fn execute(argv: &ArgvRef<'_>, store: &mut CellStore, cx: &mut ConnCx,
-               now: Nanos, out: &mut Vec<u8>);
+               now: Nanos, out: &mut ReplyBuf<'_>);
 ```
 
 Reply bytes are oracle-pinned by the compat harness (`tests/compat`):
