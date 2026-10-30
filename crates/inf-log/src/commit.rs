@@ -792,7 +792,7 @@ impl<File: SegmentFile> GroupCommit<File> {
         // The queue's own admission (ADR-0087 D2) comes before any barrier
         // question: a frame sealed now could not be queued, whatever
         // barrier it carried.
-        if !self.queue_has_room() {
+        if !self.queue_admits() {
             return FramePlan::Wait(Hold::ReorderWindow);
         }
         // The rotation class registers one seal at a time, whatever
@@ -821,11 +821,12 @@ impl<File: SegmentFile> GroupCommit<File> {
         FramePlan::Plain
     }
 
-    /// The frame queue's own admission: a slot reserved here is dropped
-    /// unused (the frame queues in the same LOG step, with no suspension
-    /// between), and a `Full` is the queue's pacing crossing, reported to
-    /// its census row.
-    fn queue_has_room(&mut self) -> bool {
+    /// Asks the frame queue's own admission. A slot reserved here is
+    /// dropped unused (the frame queues in the same LOG step, with no
+    /// suspension between). A refusal is not a pure read: the reserve
+    /// answers `Full` and counts the queue's pacing crossing on its census
+    /// row, each time it refuses.
+    fn queue_admits(&mut self) -> bool {
         matches!(self.queued.reserve(), Reserved::Slot(_))
     }
 

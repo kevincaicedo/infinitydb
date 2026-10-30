@@ -1094,7 +1094,7 @@ impl<F: SegmentFs> DurableCell<F> {
             // The ack map's own admission: the frame's point publishes in
             // this step, so a full map holds the frame (derived never to
             // occur: the map is at most the queue, the ledger and one).
-            if !self.ack_map_has_room() {
+            if !self.ack_map_admits() {
                 self.frame_waits_ack_map += u64::from(!self.ledger_holds_counted.ack_map);
                 self.ledger_holds_counted.ack_map = true;
                 self.frame_held = true;
@@ -1398,10 +1398,11 @@ impl<F: SegmentFs> DurableCell<F> {
         );
     }
 
-    /// The ack map's own admission: a slot reserved here is dropped unused
-    /// (the frame's point publishes later in the same LOG step), and a
-    /// `Full` is the map's pacing crossing, reported to its census row.
-    fn ack_map_has_room(&mut self) -> bool {
+    /// Asks the ack map's own admission. A slot reserved here is dropped
+    /// unused (the frame's point publishes later in the same LOG step). A
+    /// refusal is not a pure read: the reserve answers `Full` and counts
+    /// the map's pacing crossing on its census row, each time it refuses.
+    fn ack_map_admits(&mut self) -> bool {
         matches!(self.ack_map.reserve(), Reserved::Slot(_))
     }
 
