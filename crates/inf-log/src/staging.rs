@@ -47,8 +47,11 @@ use crate::segment::{LogError, SegmentRotor};
 pub const DEFAULT_STAGING_BYTES: u32 = 4 << 20;
 
 /// Largest legal `frames_in_flight` (ADR-0087 D1): beyond ~4 the device
-/// queue, not the cell, is the bound, and the plane's in-flight table is
-/// sized from this at construction — never a growing queue.
+/// queue, not the cell, is the bound. The staging ring holds at most this
+/// many frames in flight (its construction refuses more), and the fsync
+/// ledger's frame queue asserts it at `note_frame_queued`, where each frame
+/// in flight carries its lease, submit time and barrier; the queue's own
+/// cap, `REORDER_WINDOW_FRAMES`, is twice this — never a growing queue.
 pub const MAX_FRAMES_IN_FLIGHT: u8 = 8;
 
 /// The pipeline depth the FUA (`Direct`) class defaults to (ADR-0087 D5 as
