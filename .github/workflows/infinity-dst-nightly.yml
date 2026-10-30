@@ -88,10 +88,13 @@ jobs:
     # The four sweeps run every seed twice (--verify-determinism), which
     # doubles their time: one shard of each, timed on one core of a 24-core
     # x86-64 machine, took 77 s (m2-durable), 22 s (m3-document), 15 s
-    # (m2-combined) and 356 s (m4-tiered) with the flag. Eight shards on a
-    # 4-vCPU runner take about twice one shard: about 16 min for the four
-    # sweeps, 31 min if the runner's cores are half as fast, against this
-    # bound. An estimate: the job has not yet run on a live runner.
+    # (m2-combined) and 356 s (m4-tiered) with the flag. An estimate, which
+    # rests on the runner's vCPU count: eight shards run in waves of one
+    # shard per vCPU. GitHub's standard ubuntu runner has 4 vCPUs for a
+    # public repository: two waves, about 16 min for the four sweeps, 31 min
+    # if its cores are half as fast. Otherwise it has 2: four waves, about
+    # 31 min, 62 min at half speed. Both fit this bound; the job has not yet
+    # run on a live runner.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -174,7 +177,8 @@ jobs:
         run: |
           base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
           echo "tiered sweep seed base: $base" | tee -a /tmp/fleet.log
-          # 4,000 m4-tiered seeds nightly (~0.2 s/seed): the command-driven
+          # 4,000 m4-tiered seeds nightly (about 0.35 s a seed, 0.7 s with the
+          # determinism twin, on one core of the machine timed above): the command-driven
           # tiered node — RESP through the sim net against the wired plane,
           # seeded cut → recovery → durability-class command audit → re-pressure flush
           # liveness → DISKFULL clamp/reopen → the S19 drop race. The
