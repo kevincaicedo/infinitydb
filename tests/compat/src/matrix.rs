@@ -726,6 +726,19 @@ pub static MATRIX: &[Case] = &[
     c(&["APPEND", "oomk", "x"]),
     c(&["GET", "oomprobe"]),
     c(&["DEL", "missing"]),
+    // A refused cross-cell MSET in RESP3: sixteen pairs span the node
+    // lane's four cells (the key hash is secret-seeded; all sixteen on one
+    // cell is about 4^-15 per boot), every pair's owner refuses under the
+    // one-byte budget, and the client reads an owner's error bytes, never
+    // `+OK`. Which owner answers is the node's (a pair on the connection's
+    // own cell refuses before the fan); the bytes are Redis's.
+    skip(&["HELLO", "3"], "identity fields differ; proto switch verified locally"),
+    c(&[
+        "MSET", "om:0", "v", "om:1", "v", "om:2", "v", "om:3", "v", "om:4", "v", "om:5", "v",
+        "om:6", "v", "om:7", "v", "om:8", "v", "om:9", "v", "om:10", "v", "om:11", "v", "om:12",
+        "v", "om:13", "v", "om:14", "v", "om:15", "v",
+    ]),
+    skip(&["HELLO", "2"], "identity fields differ; proto switch verified locally"),
     c(&["CONFIG", "SET", "maxmemory-policy", "volatile-lru"]),
     c(&["SET", "oomk", "v"]),
     c(&["GET", "oomprobe"]),
