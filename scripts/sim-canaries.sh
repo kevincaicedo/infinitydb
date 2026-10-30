@@ -262,6 +262,12 @@ rows=(
   # from the sim disk's names, and the hold counter reads none.
   "inf_canary_ledger_rotation_unpaced m2-ledger-wedge wedge-ids-over --wedge-leg main"
   "inf_canary_ledger_rotation_unpaced m2-ledger-wedge wedge-hold-uncounted --wedge-leg main"
+  # The same plant read by the derived-counter clause: each unpaced
+  # rotation owes a fresh segment's prealloc barrier, and behind the held
+  # seal those barriers stay unfolded until their class is at its budget,
+  # so MAINTAIN skips the next one, which the clause reads (0 on every
+  # durable scenario's plain build).
+  "inf_canary_ledger_rotation_unpaced m2-ledger-wedge ledger-prealloc-deferred --wedge-leg main"
   # The ack map sized as the frame queue alone: inside the hold sixteen
   # write-through frames keep their points behind the held seal, and the
   # seventeenth finds the map full, which the derived-counter clause reads.
