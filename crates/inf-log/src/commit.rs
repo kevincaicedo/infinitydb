@@ -1307,11 +1307,18 @@ impl<File: SegmentFile> GroupCommit<File> {
         }
         let class = LedgerClass::of(reason);
         self.class_raised(class);
-        // Release assert: a class holds at most its budget unfolded. The
-        // plan read the class's room in the same step with no suspension,
-        // so an entry past it is a plan that skipped its check. Per-batch,
-        // free; the budgets sum to the ledger's cap.
-        assert!(self.class_unfolded(class) <= class.budget(), "a ledger class past its budget");
+        // Release assert: a class the ledger counts holds at most its budget
+        // unfolded. The plan read the class's room in the same step with no
+        // suspension, so an entry past it is a plan that skipped its check.
+        // Per-batch, free; the budgets sum to the ledger's cap. The extent
+        // class is its window, whose own admission bounds it before the
+        // extent exists (`register_extent`), so a second check here would
+        // hide the window's crossing from the census and the disk that
+        // judge it.
+        assert!(
+            class.counted().is_none() || self.class_unfolded(class) <= class.budget(),
+            "a ledger class past its budget"
+        );
         if reason != SyncReason::WriteThrough {
             self.flush_in_flight += 1;
         }
