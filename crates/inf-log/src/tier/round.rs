@@ -510,9 +510,10 @@ impl WindowPool {
         holder.get_mut(window.index).expect("a pooled window names its pool's entry")
     }
 
-    /// The planted early return (`inf_canary_tier_window_early_put`): every
-    /// window goes back to the free lists while the round still holds its
-    /// tokens. Compiled into every build, reached only by the plant.
+    /// The planted early return (`inf_canary_tier_window_early_put`): both
+    /// holders' out ranges are reset while the round still holds its
+    /// tokens, so the pool reads every window as back. Compiled into every
+    /// build, reached only by the plant.
     pub(crate) fn recycle_early(&mut self) {
         self.batch_out = WindowsOut::default();
         self.single_out = WindowsOut::default();

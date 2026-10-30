@@ -486,7 +486,7 @@ impl<F: SegmentFs> TierFlush<F> {
     }
 
     /// The bytes of the pool's windows written at least once — the high
-    /// water of windows out, as the lists are taken LIFO (the cell's
+    /// water of windows out, as the windows are taken LIFO (the cell's
     /// `tier_window_written_bytes` sums them).
     #[must_use]
     pub fn window_written_bytes(&self) -> u64 {
