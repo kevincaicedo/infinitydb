@@ -28,7 +28,8 @@
 # Red: a census row; cargo exiting non-zero on a workspace (a compile error,
 # a warning, a stale lock), each compiler error printed under the workspace
 # and target that produced it, and cargo's own errors under the workspace
-# with their `Caused by:` and `help:` lines; the bins cargo reports compiled
+# with their `Caused by:` and `help:` lines (a lock cargo refuses names the
+# refresh that moves no pinned version); the bins cargo reports compiled
 # for a workspace differing from its [[bin]] rows, whatever cargo's status
 # (the count is printed for every workspace, green or red). Every row is
 # judged and printed before the gate exits; only an empty census stops it
@@ -176,10 +177,14 @@ class Report:
             elif reason == "compiler-message" and msg.get("message", {}).get("level") in ERROR_LEVELS:
                 self.errors.append(msg)
 
+    def refused_lock(self):
+        """cargo refused the committed lock: it would have to rewrite it."""
+        return any("because --locked was passed" in block[0] for block in self.cargo_errors)
+
     def errors_of(self, name):
         return [m["message"] for m in self.errors if m.get("target", {}).get("name") == name]
 
-    def print_errors(self):
+    def print_errors(self, refresh_hint=False):
         for m in self.errors:
             target, rendered = m.get("target", {}), m["message"].get("rendered") or m["message"].get("message", "")
             kind = ",".join(target.get("kind", [])) or "?"
@@ -193,6 +198,14 @@ class Report:
             print(f"{self.manifest} cargo: {block[0]}")
             for line in block[1:]:
                 print(f"    {line}" if line.strip() else "")
+        if refresh_hint and self.refused_lock():
+            # `cargo update --workspace` adds what a lock lacks and updates a
+            # pinned package only when the manifests no longer admit it; a
+            # bare `cargo update` would move every pin of the lock.
+            lock = os.path.join(os.path.dirname(self.manifest), "Cargo.lock")
+            print(f"{self.manifest} fix: cargo update --workspace --offline --manifest-path "
+                  f"{self.manifest} adds what the lock lacks and moves no pinned version (drop "
+                  f"--offline to fetch a crate the registry cache lacks); then commit {lock}")
 
 
 def e0433(message, crate, file_suffix=None):
@@ -246,7 +259,7 @@ if PROBE == "on":
         reds.append("P3 probe target control not compiled: the probe proves nothing")
     lock = Report(PROBE_LOCK)
     if (lock.status != 0 and "stale_lock" not in lock.bins
-            and any("because --locked was passed" in block[0] for block in lock.cargo_errors)):
+            and lock.refused_lock()):
         verdicts["P4"] = "stale_lock refused by --locked"
     else:
         reds.append("P4 probe target stale_lock compiled, or refused without cargo's "
@@ -274,7 +287,7 @@ for manifest in census.workspaces:
     if report.status != 0 or report.unread:
         reds.append(f"K1 {manifest}: cargo exited {report.status}"
                     + (f", {report.unread} report lines unread" if report.unread else ""))
-        report.print_errors()
+        report.print_errors(refresh_hint=True)
     if missing or unexpected:
         reds.append(f"K2 {manifest}: the bins cargo compiled are not its [[bin]] rows")
 
