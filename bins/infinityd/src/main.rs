@@ -413,11 +413,15 @@ fn parse_args() -> Result<Args, String> {
                 args.log_staging_mib = take("--log-staging-mib")?
                     .parse()
                     .map_err(|e| format!("--log-staging-mib: {e}"))?;
-                // 1 MiB holds any wire-legal command's record; 64 MiB is
-                // the frame decoder bound (every written frame must stay
-                // readable by a default-configured reader).
-                if !(1..=64).contains(&args.log_staging_mib) {
-                    return Err("--log-staging-mib is 1..=64 (the frame decoder bound)".into());
+                // 1 MiB holds any wire-legal command's record; the top is
+                // the frame decoder bound (every written frame stays
+                // readable by a default-configured reader), so `mib << 20`
+                // is exact in a u32.
+                let max_mib = inf_server::DEFAULT_MAX_FRAME_LEN >> 20;
+                if !(1..=max_mib).contains(&args.log_staging_mib) {
+                    return Err(format!(
+                        "--log-staging-mib is 1..={max_mib} (the frame decoder bound)"
+                    ));
                 }
             }
             "--shutdown-timeout-ms" => {

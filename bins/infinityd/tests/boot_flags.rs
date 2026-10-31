@@ -73,6 +73,10 @@ fn out_of_range_boot_flags_are_usage_errors_not_panics() {
             "--buf-size must be <= 2147483647",
         ),
         ("cells-over", &["--cells", "16385"], "--cells must be <= 16384"),
+        // The staging buffer's domain: one MiB up to the frame decoder
+        // bound, read from its constant (64 MiB).
+        ("staging-zero", &["--log-staging-mib", "0"], "--log-staging-mib is 1..=64"),
+        ("staging-over", &["--log-staging-mib", "65"], "--log-staging-mib is 1..=64"),
         ("cache-over", &["--doc-path-cache-size", "4097"], "path cache capacity 4097 exceeds 4096"),
         (
             "cache-u32-max",
