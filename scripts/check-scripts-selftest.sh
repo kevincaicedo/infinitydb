@@ -4138,6 +4138,290 @@ expect green "fuzz-targets: an empty census prints no deny matrix" fz_matrix_red
 expect_red_because "fuzz-targets: an unknown matrix" "usage: check-fuzz-targets.sh" \
     env INF_CHECK_ROOT="$root" "$FUZZ" --matrix weekly
 
+# The workflows and the local deny recipe read the census (ADR-0198 D3, D6):
+# every `cargo fuzz run` step and every cargo-deny step sits in a job whose
+# matrix is `${{ fromJSON(needs.<census job>.outputs.matrix) }}` alone, the
+# census job prints that matrix with `check-fuzz-targets.sh --matrix <mode>`
+# in the assignment shape (an inline `$(…)` in the echo drops its status) at
+# the commit the matrix job checks out, a fuzz run names the row's target,
+# seeds and directory, a cargo-deny step its manifest; the nightly, the full
+# smoke and PR CI's cargo-deny each read their mode; PR CI's one-target smoke,
+# `resp_parse`, is the one literal (D3); and the justfile runs cargo-deny only
+# in `deny`, over `--matrix deny`. A list kept by hand beside the census
+# would pass every other gate. Stdlib python, a line-and-indent reader of
+# these files' layout that fails closed, as legs_cover.
+census_matrices() { # <root holding .github/workflows and justfile>
+    python3 - "$1" <<'PY'
+import os, re, sys
+root, TOKEN = sys.argv[1], "CENSUS-MATRICES"
+wf_dir = os.path.join(root, ".github/workflows")
+files = sorted(f for f in os.listdir(wf_dir) if f.endswith((".yml", ".yaml"))) \
+    if os.path.isdir(wf_dir) else []
+if not files or not os.path.isfile(os.path.join(root, "justfile")):
+    sys.exit(f"{TOKEN} SCOPE ERROR: no workflow under {wf_dir}, or no justfile")
+FUZZ_RUN = re.compile(r"\bcargo\s+(?:\+\S+\s+)?fuzz\s+run\b")
+FUZZ_TARGET = re.compile(r"\bfuzz\s+run\s+(\S+)")
+DENY_RUN = re.compile(r"\bcargo[ -]deny\b")
+DENY_USES = "EmbarkStudios/cargo-deny-action"
+MATRIX = re.compile(r"\$\{\{ fromJSON\(needs\.([A-Za-z0-9_-]+)\.outputs\.matrix\) \}\}")
+CENSUS = re.compile(r"matrix=\$\(\./scripts/check-fuzz-targets\.sh --matrix (nightly|smoke|deny)\)")
+WRITE = 'echo "matrix=$matrix" >> "$GITHUB_OUTPUT"'
+PR_SMOKE = ("infinity-ci.yml", "fuzz-smoke", "resp_parse")
+EXPECTED = {("infinity-fuzz-nightly.yml", "nightly"), ("infinity-ci-full.yml", "smoke"),
+            ("infinity-ci.yml", "deny")}
+errors, read, found, pr_smoke = [], [], set(), 0
+
+
+def command(line):
+    """A shell line with its comment and quoted strings blanked: what it runs."""
+    line = re.sub(r"\"[^\"]*\"|'[^']*'", '""', line)
+    return re.sub(r"(^|\s)#.*", "", line)
+
+
+def jobs_of(lines):
+    if "jobs:" not in lines:
+        return None
+    out, job = {}, None
+    for line in lines[lines.index("jobs:") + 1:]:
+        if line[:1] not in ("", " ", "#"):
+            break
+        m = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*", line)
+        if m:
+            job = out.setdefault(m.group(1), [])
+        elif job is not None:
+            job.append(line)
+    return out
+
+
+def shape(body):
+    """(needs, strategy lines, outputs lines, steps), a step's lines without
+    their 8-column indent; a block form this reader does not parse reads as
+    absent, so the rules below fail closed."""
+    needs, strategy, outputs, steps, section, step = [], [], [], [], None, None
+    for line in body:
+        if re.match(r"    [A-Za-z]", line):
+            section, _, value = line.strip().partition(":")
+            step = None
+            if section == "needs":
+                needs = [n.strip() for n in value.strip().strip("[]").split(",") if n.strip()]
+        elif section == "strategy" and line.strip():
+            strategy.append(line.strip())
+        elif section == "outputs" and line.strip():
+            outputs.append(line.strip())
+        elif section == "steps" and line.strip().startswith("#"):
+            continue
+        elif section == "steps" and line.startswith("      - "):
+            step = [line[8:]]
+            steps.append(step)
+        elif section == "steps" and step is not None:
+            step.append(line[8:])
+    return needs, strategy, outputs, [fields(s) for s in steps]
+
+
+def fields(step):
+    f, i = {"run": [], "with": {}}, 0
+    while i < len(step):
+        m = re.fullmatch(r"([A-Za-z-]+):\s*(.*)", step[i])
+        i += 1
+        if not m:
+            continue
+        key, value = m.groups()
+        if key == "run" and value in ("|", "|-", ">", ">-"):
+            while i < len(step) and (step[i].startswith("  ") or not step[i].strip()):
+                f["run"].append(step[i].strip())
+                i += 1
+        elif key == "with":
+            while i < len(step) and step[i].startswith("  "):
+                k, _, v = step[i].strip().partition(":")
+                f["with"][k] = v.strip()
+                i += 1
+        elif key == "run":
+            f["run"].append(value)
+        else:
+            f[key] = value
+    return f
+
+
+def refs(steps):
+    return [s["with"].get("ref", "") for s in steps
+            if s.get("uses", "").startswith("actions/checkout")]
+
+
+def census_mode(shapes, job):
+    """The mode the census job prints, or why it prints none."""
+    if job not in shapes:
+        return None, f"no job `{job}`"
+    _, _, outputs, steps = shapes[job]
+    if "matrix: ${{ steps.census.outputs.matrix }}" not in outputs:
+        return None, f"`{job}` has no output `matrix: ${{{{ steps.census.outputs.matrix }}}}`"
+    census = [s for s in steps if s.get("id") == "census"]
+    run = [l for l in census[0]["run"] if l] if len(census) == 1 else []
+    m = CENSUS.fullmatch(run[0]) if len(run) == 2 and run[1] == WRITE else None
+    if m is None or census[0].get("shell") != "bash":
+        return None, (f"`{job}`'s census step is not one `id: census` step, `shell: bash`, running "
+                      "`matrix=$(./scripts/check-fuzz-targets.sh --matrix <mode>)` then "
+                      f"`{WRITE}`")
+    return m.group(1), None
+
+
+for wf in files:
+    jobs = jobs_of(open(os.path.join(wf_dir, wf), encoding="utf-8").read().split("\n"))
+    if jobs is None:
+        errors.append(f"{wf}: no top-level `jobs:` line")
+        continue
+    shapes = {job: shape(body) for job, body in jobs.items()}
+    for job, (needs, strategy, _, steps) in shapes.items():
+        for step in steps:
+            raw = " ".join(step["run"])
+            text = " ".join(command(l) for l in step["run"])
+            fuzz = FUZZ_RUN.search(text)
+            deny = step.get("uses", "").startswith(DENY_USES) or DENY_RUN.search(text)
+            if not fuzz and not deny:
+                continue
+            where, what = f"{wf} {job}", "a fuzz run" if fuzz else "a cargo-deny step"
+            if fuzz and (wf, job) == PR_SMOKE[:2]:
+                target = FUZZ_TARGET.search(raw)
+                if target and target.group(1) == PR_SMOKE[2]:
+                    pr_smoke += 1
+                else:
+                    errors.append(f"{where}: the PR smoke fuzzes "
+                                  f"`{target.group(1) if target else '?'}`, not {PR_SMOKE[2]}, "
+                                  "its one named target (ADR-0198 D3)")
+                continue
+            matrix = [l for l in strategy if l.startswith("matrix:")]
+            other = [l for l in strategy if not l.startswith(("matrix:", "#"))
+                     and not re.fullmatch(r"(fail-fast|max-parallel):\s*\S+", l)]
+            m = MATRIX.fullmatch(matrix[0][len("matrix:"):].strip()) if len(matrix) == 1 else None
+            if m is None or other:
+                errors.append(f"{where}: {what} not under a matrix read from a census job "
+                              "(`matrix: ${{ fromJSON(needs.<job>.outputs.matrix) }}` alone)")
+                continue
+            census = m.group(1)
+            mode, why = census_mode(shapes, census)
+            want = ("nightly", "smoke") if fuzz else ("deny",)
+            if census not in needs:
+                errors.append(f"{where}: its matrix is `{census}`'s, a job it does not need")
+            elif why:
+                errors.append(f"{where}: {why}")
+            elif mode not in want:
+                errors.append(f"{where}: {what} reads --matrix {mode}, not {' or '.join(want)}")
+            elif refs(steps) != refs(shapes[census][3]):
+                errors.append(f"{where}: checks out {refs(steps)}, and `{census}` read the census "
+                              f"at {refs(shapes[census][3])}: the matrix is another commit's")
+            elif fuzz and not (re.search(r"\bfuzz\s+run\s+\$\{\{ matrix\.target \}\}(\s|$)", raw)
+                               and "${{ matrix.seeds }}" in raw
+                               and step.get("working-directory") == "${{ matrix.dir }}"):
+                errors.append(f"{where}: a fuzz run that does not name its row's "
+                              "`${{ matrix.target }}`, `${{ matrix.seeds }}` and "
+                              "`working-directory: ${{ matrix.dir }}`")
+            elif not fuzz and "${{ matrix.manifest }}" not in (
+                    step["with"].get("manifest-path", "") if "uses" in step else raw):
+                errors.append(f"{where}: a cargo-deny step that does not name its row's "
+                              "`${{ matrix.manifest }}`")
+            else:
+                found.add((wf, mode))
+                read.append(f"{wf} {job} <- {census} (--matrix {mode})")
+for wf, mode in sorted(EXPECTED - found):
+    errors.append(f"{wf}: no job reads --matrix {mode} from a census job (ADR-0198 "
+                  f"{'D6' if mode == 'deny' else 'D3'})")
+if pr_smoke != 1:
+    errors.append(f"{PR_SMOKE[0]} {PR_SMOKE[1]}: {pr_smoke} runs of {PR_SMOKE[2]}, not one")
+recipes, body = {}, None
+for line in open(os.path.join(root, "justfile"), encoding="utf-8").read().split("\n"):
+    m = re.match(r"@?([A-Za-z_][\w-]*)(?:[ \t]+[^:\n]*)?:(?!=)", line)
+    if m:
+        body = recipes.setdefault(m.group(1), [])
+    elif line[:1] in (" ", "\t") and body is not None:
+        body.append(line)
+    elif line.strip() and not line.startswith("#"):
+        body = None
+for name, lines in sorted(recipes.items()):
+    calls = [l for l in lines if DENY_RUN.search(command(l))]
+    if name != "deny" and calls:
+        errors.append(f"justfile: recipe `{name}` runs cargo-deny outside `deny`: "
+                      f"{calls[0].strip()}")
+deny = recipes.get("deny", [])
+if not any(command(l).split() == ["rows=$(./scripts/check-fuzz-targets.sh", "--matrix", "deny)"]
+           for l in deny):
+    errors.append("justfile: the `deny` recipe does not read "
+                  "`rows=$(./scripts/check-fuzz-targets.sh --matrix deny)`")
+calls = [l for l in deny if DENY_RUN.search(command(l))]
+if not calls or not all('--manifest-path "$manifest"' in l for l in calls):
+    errors.append("justfile: the `deny` recipe runs cargo-deny on no census row "
+                  "(`--manifest-path \"$manifest\"`)")
+for e in errors:
+    print(f"{TOKEN}: {e}")
+if errors:
+    sys.exit(1)
+print(f"{TOKEN} OK: {'; '.join(read)}; {PR_SMOKE[0]} {PR_SMOKE[1]} {PR_SMOKE[2]}, the PR "
+      "smoke's one named target; justfile deny <- --matrix deny")
+PY
+}
+expect green "census-matrices: the workflows and the deny recipe read the census" census_matrices .
+expect_output "census-matrices: the OK line names what it read" \
+    "infinity-fuzz-nightly.yml fuzz-hour <- targets (--matrix nightly)" census_matrices .
+# cm_plant <name> <file> <text> <replacement>: a copy of the workflows and the
+# justfile with one exact edit; a plant whose text is not there once is a
+# failed case, never a vacuous red.
+cm_plant() {
+    local root="$work/cm-$1"
+    rm -rf "${root:?}"
+    mkdir -p "$root/.github"
+    cp -R .github/workflows "$root/.github/workflows"
+    cp justfile "$root/justfile"
+    if ! python3 - "$root/$2" "$3" "$4" <<'PY'
+import sys
+path, old, new = sys.argv[1:]
+text = open(path, encoding="utf-8").read()
+if text.count(old) != 1:
+    sys.exit(f"found {text.count(old)} times")
+open(path, "w", encoding="utf-8").write(text.replace(old, new))
+PY
+    then
+        fail=$((fail + 1))
+        echo "SELFTEST FAIL: census-matrices plant '$1' did not apply"
+    fi
+    CM_ROOT=$root
+}
+CM_NIGHTLY=.github/workflows/infinity-fuzz-nightly.yml
+CM_FULL=.github/workflows/infinity-ci-full.yml
+CM_PR=.github/workflows/infinity-ci.yml
+cm_red() { # <label> <pattern>: the last plant is red, naming its rule
+    expect_red_because "census-matrices: $1" "$2" census_matrices "$CM_ROOT"
+}
+cm_plant literal "$CM_NIGHTLY" '      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}' \
+    $'      matrix:\n        include:\n          - { dir: crates/inf-wire, target: resp_parse, seeds: "" }'
+cm_red "a literal nightly matrix" \
+    "infinity-fuzz-nightly.yml fuzz-hour: a fuzz run not under a matrix"
+cm_plant hand-step "$CM_FULL" '      - name: criterion benches compile (no run)' \
+    $'      - run: cargo +nightly fuzz run frame_decode -- -max_total_time=60\n      - name: criterion benches compile (no run)'
+cm_red "a hand-kept fuzz step" "infinity-ci-full.yml bench-build: a fuzz run not under a matrix"
+cm_plant target "$CM_FULL" 'fuzz run ${{ matrix.target }} fuzz/corpus' 'fuzz run resp_parse fuzz/corpus'
+cm_red "a matrix job fuzzing a literal target" "fuzz-smoke: a fuzz run that does not name its row's"
+cm_plant seeds "$CM_NIGHTLY" ' ${{ matrix.seeds }} -- ' ' -- '
+cm_red "a fuzz run without its row's seeds" "fuzz-hour: a fuzz run that does not name its row's"
+cm_plant inline "$CM_NIGHTLY" $'          matrix=$(./scripts/check-fuzz-targets.sh --matrix nightly)\n          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"' \
+    '          echo "matrix=$(./scripts/check-fuzz-targets.sh --matrix nightly)" >> "$GITHUB_OUTPUT"'
+cm_red "the census step's inline form" "\`targets\`'s census step is not one"
+cm_plant needs "$CM_NIGHTLY" '    needs: targets' '    needs: []'
+cm_red "a matrix job that does not need its census job" "a job it does not need"
+cm_plant ref "$CM_FULL" $'      - uses: actions/checkout@v5\n        with:\n          ref: ${{ needs.authorize.outputs.sha }}\n      - name: the fuzz targets, from the census' \
+    $'      - uses: actions/checkout@v5\n      - name: the fuzz targets, from the census'
+cm_red "a census read at another commit" "the matrix is another commit's"
+cm_plant build "$CM_NIGHTLY" 'cargo +nightly fuzz run ${{ matrix.target }}' 'cargo +nightly fuzz build ${{ matrix.target }}'
+cm_red "a nightly that fuzzes no census target" \
+    "infinity-fuzz-nightly.yml: no job reads --matrix nightly from a census job"
+cm_plant deny-path "$CM_PR" '          manifest-path: ${{ matrix.manifest }}' '          manifest-path: Cargo.toml'
+cm_red "a cargo-deny step on a literal manifest" "a cargo-deny step that does not name its row's"
+cm_plant deny-mode "$CM_PR" '--matrix deny)' '--matrix smoke)'
+cm_red "cargo-deny reading the fuzz matrix" "a cargo-deny step reads --matrix smoke, not deny"
+cm_plant pr-smoke "$CM_PR" 'fuzz run resp_parse --' 'fuzz run frame_decode --'
+cm_red "the PR smoke on another literal target" "the PR smoke fuzzes .frame_decode., not resp_parse"
+cm_plant recipe justfile '    rows=$(./scripts/check-fuzz-targets.sh --matrix deny)' '    rows=Cargo.toml'
+cm_red "the deny recipe off the census" "the .deny. recipe does not read"
+cm_plant second-recipe justfile $'\ntest:\n' $'\ndeny-root:\n    cargo deny check\n\ntest:\n'
+cm_red "a second recipe running cargo-deny" "recipe .deny-root. runs cargo-deny outside .deny."
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
