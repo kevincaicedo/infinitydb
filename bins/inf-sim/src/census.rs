@@ -147,8 +147,8 @@ fn crossed_short(cell: usize, row: &CapRow) -> Option<String> {
 mod tests {
     use inf_foundation::CellId;
     use inf_foundation::bounded::{
-        Built, Cap, CapFill, CappedDeque, CappedSlab, Coalesce, LookupMut, Lossy, Merge, Reserve,
-        Reserved, Retire, SlabReserved, Taken,
+        Admission, Built, Cap, CapFill, CappedDeque, CappedMap, CappedSlab, Coalesce, LookupMut,
+        Lossy, MapBuilt, Merge, Reserve, Reserved, Retire, SlabReserved, Taken,
     };
 
     use super::*;
@@ -284,6 +284,42 @@ mod tests {
         let row = census.row("retire-slab").expect("row");
         let shape = (row.entries_max, row.capacity_now, row.high_water, row.crossings);
         assert_eq!(shape, (4, 2, 2, 1));
+        assert_eq!(verdict.rows_crossed, 1);
+        census.mark_stopping();
+    }
+
+    /// The crossing rule on a real `CappedMap` of 4 filled while serving:
+    /// fresh keys admitted and published up to the first `Full`, nothing
+    /// asserted on the way. The verdict is the first assertion: a correct
+    /// map fills 4 and crosses at its cap (`(4, 4, 4, 1)`, green); one that
+    /// answers `Full` an entry short fills 3 and crosses at a high water of
+    /// 3 (`(4, 4, 3, 1)`), which only this rule reads. A map retires no
+    /// slot, so its capacity now is its cap. The row's values are asserted
+    /// after the verdict, the control.
+    #[test]
+    fn a_map_crossing_while_serving_reads_its_full_cap() {
+        const MAP: Cap = Cap::entries::<4>("crossing-map", CapFill::Serving);
+        let (census, serve_mark) = CapCensus::new(CellId(6));
+        let mut builder = CappedMap::<u64, u8>::builder(MAP, &census).expect("row");
+        let mut map = loop {
+            match builder.step() {
+                MapBuilt::More(next) => builder = next,
+                MapBuilt::Live(map) => break map,
+                MapBuilt::Refused(_, refused) => panic!("{refused}"),
+            }
+        };
+        serve_mark.take();
+        let mut key = 0u64;
+        while let Admission::Vacant(slot) = map.admit(key) {
+            slot.publish(1);
+            key += 1 << 40;
+        }
+        let mut verdict = CensusVerdict::default();
+        verdict.judge(6, &census, CellFacts::default());
+        assert!(verdict.violations.is_empty(), "{:?}", verdict.violations);
+        let row = census.row("crossing-map").expect("row");
+        let shape = (row.entries_max, row.capacity_now, row.high_water, row.crossings);
+        assert_eq!(shape, (4, 4, 4, 1));
         assert_eq!(verdict.rows_crossed, 1);
         census.mark_stopping();
     }

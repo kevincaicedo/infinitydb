@@ -436,10 +436,21 @@ impl<K: ExactKey, V> CappedMap<K, V> {
     }
 
     /// The admission compare, `live < N`: the slab's form, on the map's own
-    /// live count.
+    /// live count. The cap-minus-one canary admits one entry fewer on a
+    /// `Serving` row.
     #[inline]
     fn has_room(&self) -> bool {
-        self.live < self.leaves.capacity_now()
+        let capacity = self.leaves.capacity_now();
+        #[cfg(inf_canary_cap_minus_one)]
+        {
+            let serving = self.row.fill() == CapFill::Serving;
+            let short = capacity.checked_sub(1).unwrap_or_default();
+            self.live < if serving { short } else { capacity }
+        }
+        #[cfg(not(inf_canary_cap_minus_one))]
+        {
+            self.live < capacity
+        }
     }
 
     fn occupied(&mut self, nearest: u32, key: K) -> Admission<'_, K, V> {

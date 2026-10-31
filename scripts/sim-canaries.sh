@@ -302,6 +302,11 @@ rows=(
   # capacity now. Two slots live before the retirements would raise the
   # high water to 2 first, and the rule could not go red.
   "inf_canary_cap_minus_one crate-test inf-sim lib a_retire_slab_crossing_after_two_retirements_reads_its_capacity_now cap-crossed-short"
+  # The same plant on a map, whose admission compare admits one entry
+  # fewer than its cap on a serving row: the fill answers `Full` at 3 of
+  # 4 live, and the census's crossing rule reads the row crossed below its
+  # capacity now, which for a map is always its cap.
+  "inf_canary_cap_minus_one crate-test inf-sim lib a_map_crossing_while_serving_reads_its_full_cap cap-crossed-short"
   # ADR-0171 A2.2: the slab's access skips the instance compare, so another
   # slab's live handle, holding the same index and generation, reads and
   # takes this slab's occupant; the two-instance model test reads it.
