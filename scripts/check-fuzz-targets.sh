@@ -31,9 +31,15 @@
 # with their `Caused by:` and `help:` lines (a lock cargo refuses names the
 # refresh that adds what the lock lacks); the bins cargo reports compiled
 # for a workspace differing from its [[bin]] rows, whatever cargo's status
-# (the count is printed for every workspace, green or red). Every row is
-# judged and printed before the gate exits; only an empty census stops it
-# early.
+# (the count is printed for every workspace, green or red); a compiled
+# target whose dep-info, rustc's list of the files it read for the crate
+# (beside the crate's metadata, deps/<name>-<hash>.d), names a file that is
+# neither the target's own nor one the census read for it by #[path], or
+# that the gate cannot find or read. A target reaches production code
+# through its crate (ADR-0198 D4), so a file compiled into it by a shape the
+# census does not read, such as a dependency's macro that calls include!
+# from the target's call site, is red here. Every row is judged and printed
+# before the gate exits; only an empty census stops it early.
 #
 # The probe (scripts/fuzz-check-probe, ADR-0198 D2) is compiled first, with
 # the same call, on every run: plant_crate must be refused with E0433 naming
@@ -41,8 +47,10 @@
 # fuzz crate lacks), plant_warning for a denied warning, plant_cfg with
 # E0433 naming absent_cfg_crate (an arm only cfg(fuzzing) compiles),
 # stale-lock's stale_lock because --locked was passed, and control must
-# compile; any other outcome is red, because the gate could not see what it
-# guards. Its two workspaces hold exactly those five targets. stale-lock's
+# compile, its dep-info naming shared/ok.rs, the file it includes, as one
+# the gate was not told of (the dep-info read sees an included file); any
+# other outcome is red, because the gate could not see what it guards. Its
+# two workspaces hold exactly those five targets. stale-lock's
 # committed lock must still name its package at another version than the
 # manifest's: a cargo run without --locked rewrites it, and that red names
 # the git command that restores it.
@@ -99,6 +107,8 @@ RUSTFLAGS = "-D warnings --cfg fuzzing"
 PROBE_MAIN = "scripts/fuzz-check-probe/Cargo.toml"
 PROBE_LOCK = "scripts/fuzz-check-probe/stale-lock/Cargo.toml"
 PROBE_LOCK_FILE = "scripts/fuzz-check-probe/stale-lock/Cargo.lock"
+PROBE_CONTROL = "scripts/fuzz-check-probe/fuzz_targets/control.rs"
+PROBE_CONTROL_INCLUDE = "scripts/fuzz-check-probe/shared/ok.rs"
 PROBE_TARGETS = {PROBE_MAIN: ["plant_crate", "plant_warning", "plant_cfg", "control"],
                  PROBE_LOCK: ["stale_lock"]}
 ERROR_LEVELS = ("error", "error: internal compiler error")
@@ -156,6 +166,7 @@ class Report:
     def __init__(self, manifest):
         self.manifest, self.status, self.bins, self.errors, self.cargo_errors = manifest, 0, [], [], []
         self.unread = 0  # stdout lines that are not cargo's JSON
+        self.depinfo = {}  # bin -> the dep-info beside its metadata, or None
         own = os.path.realpath(manifest)
         try:
             run = subprocess.run([CARGO, CALL[0], "--manifest-path", manifest, *CALL[1:]], env=ENV,
@@ -178,6 +189,7 @@ class Report:
             if reason == "compiler-artifact":
                 if "bin" in target.get("kind", []) and os.path.realpath(msg.get("manifest_path", "")) == own:
                     self.bins.append(target.get("name"))
+                    self.depinfo[target.get("name")] = depinfo_path(msg.get("filenames"))
             elif reason == "compiler-message" and msg.get("message", {}).get("level") in ERROR_LEVELS:
                 self.errors.append(msg)
 
@@ -211,6 +223,44 @@ class Report:
                   f"{self.manifest} adds what the lock lacks and updates a pinned package only "
                   "when the manifests no longer admit it (drop --offline to fetch a crate the "
                   f"registry cache lacks); then commit {lock}")
+
+
+DEPINFO_TOKEN = re.compile(r"(?:\\.|[^\s\\])+")  # a path, `\ ` escaping a space
+
+
+def depinfo_path(filenames):
+    """rustc writes a crate's dep-info beside its metadata: `deps/lib<n>-<h>.rmeta`
+    has `deps/<n>-<h>.d`. None when the artifact names no metadata."""
+    for name in filenames if isinstance(filenames, list) else []:
+        base = os.path.basename(name) if isinstance(name, str) else ""
+        if base.startswith("lib") and base.endswith(".rmeta"):
+            return os.path.join(os.path.dirname(name), base[3:-len(".rmeta")] + ".d")
+    return None
+
+
+def unread_files(manifest, depinfo, own, reads):
+    """(why the dep-info cannot be read or None, the files it names beyond `own`
+    and `reads`), each relative to the tree's root: a relative path in it is the
+    manifest directory's, where cargo runs rustc for the fuzz workspace."""
+    if depinfo is None:
+        return "no dep-info (its artifact names no .rmeta)", set()
+    try:
+        with open(depinfo, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError) as err:
+        return f"no dep-info at {depinfo} ({type(err).__name__})", set()
+    home, top, files = os.path.dirname(manifest), os.path.realpath("."), set()
+    for line in text.split("\n"):
+        _, sep, deps = line.partition(": ")
+        if line.startswith("#") or not sep:
+            continue  # an env-dep comment, or a file's empty rule
+        for token in DEPINFO_TOKEN.findall(deps):
+            name = re.sub(r"\\(.)", r"\1", token)
+            name = os.path.realpath(name if os.path.isabs(name) else os.path.join(home, name))
+            files.add(os.path.relpath(name, top))
+    if own not in files:
+        return f"its dep-info at {depinfo} does not name {own}, its own file", set()
+    return None, files - {own} - set(reads)
 
 
 def e0433(message, crate, file_suffix=None):
@@ -277,7 +327,20 @@ if PROBE == "on":
     if refused(main, "plant_warning", denied_warning, "P2"):
         verdicts["P2"] = "plant_warning denied"
     if "control" in main.bins and not main.errors_of("control"):
-        verdicts["P3"] = "control compiled"
+        # The census never reads the probe, so shared/ok.rs, which control
+        # includes by #[path], is a file the gate was not told of: the dep-info
+        # read must report it, exactly, on the real toolchain.
+        why, extra = unread_files(PROBE_MAIN, main.depinfo.get("control"),
+                                  PROBE_CONTROL, ())
+        if why is not None:
+            reds.append(f"P3 probe target control: {why}: the gate cannot read the files rustc "
+                        "compiles")
+        elif extra != {PROBE_CONTROL_INCLUDE}:
+            reds.append(f"P3 probe target control's dep-info names {sorted(extra) or 'no file'} "
+                        f"beyond its own, not exactly {PROBE_CONTROL_INCLUDE}, the file it "
+                        "includes: the gate cannot read the files rustc compiles")
+        else:
+            verdicts["P3"] = "control compiled naming shared/ok.rs"
     else:
         reds.append("P3 probe target control not compiled: the probe proves nothing")
     rewritten = lock_rewritten()
@@ -302,7 +365,8 @@ if PROBE == "on":
     held = [verdicts[k] for k in ("P1", "P2", "P5", "P3", "P4") if k in verdicts]
     probe = ", ".join(held) if len(held) == 5 else f"{len(held)} of 5 verdicts held"
 
-compiled = total = 0
+compiled = total = depinfo_read = 0
+targets = {(t.workspace, t.name): t for t in census.targets}
 for manifest in census.workspaces:
     report = Report(manifest)
     rows = [n for n, _ in census.rows[manifest] if n is not None]
@@ -320,6 +384,19 @@ for manifest in census.workspaces:
         report.print_errors(refresh_hint=True)
     if missing or unexpected:
         reds.append(f"K2 {manifest}: the bins cargo compiled are not its [[bin]] rows")
+    for name in (n for n in rows if n in have and (manifest, n) in targets):
+        target = targets[(manifest, name)]  # a row C5 refused is no target: not read here
+        why, extra = unread_files(manifest, report.depinfo.get(name), target.path, target.reads)
+        if why is not None:
+            reds.append(f"K3 {manifest} {name}: {why}: the gate cannot read the files rustc "
+                        "compiled into it")
+            continue
+        depinfo_read += 1
+        for file in sorted(extra):
+            reds.append(f"K3 {manifest} {name}: rustc compiled {file} into it, a file the gate "
+                        "did not read: a target reaches production code through its crate, and "
+                        "a file reached by a shape the census does not read (a dependency's "
+                        "macro calling include!, a module the scan missed) is red (ADR-0198 D4)")
 
 rows_n = sum(len(r) for r in census.rows.values())
 scope = (f"{len(census.workspaces)} fuzz workspaces, {compiled} of {total} targets compiled "
@@ -328,12 +405,14 @@ scope = (f"{len(census.workspaces)} fuzz workspaces, {compiled} of {total} targe
          f"{'' if any(r.startswith('C4 ') for r in reds) else ', each run by its gate'}; "
          f"{len(census.seed_dirs)} seed directories (git-listed); {census.path_sites} #[path] "
          f"sites, {len(census.path_files)} files read")
+depinfo = f"dep-info of {depinfo_read} of {compiled} compiled targets read"
 if reds:
     for red in reds:
         print(f"{TOKEN}: {red}")
-    print(f"fuzz-targets FAILED: {len(reds)} red row(s) ({scope})")
+    print(f"fuzz-targets FAILED: {len(reds)} red row(s) ({scope}; {depinfo})")
     sys.exit(1)
 print(f"fuzz-targets OK: {scope}, none naming crate:: or super:: or aliasing either, declaring a "
       "module by file or calling include!; no target calls include!, and no including target defines macro_rules! "
-      "or carries #[macro_use]")
+      f"or carries #[macro_use]; {depinfo}, each naming only its target's file and the #[path] "
+      "files read")
 PY

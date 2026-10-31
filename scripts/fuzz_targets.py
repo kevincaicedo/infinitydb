@@ -37,7 +37,11 @@ target that includes a file defines no `macro_rules!` and carries no
 `#[macro_use]`: a macro the target supplies reaches the included file by
 textual scope, so the fuzz crate could give it a second definition of what
 production defines. Any other shape is red rather than followed, because
-rustc's rules for it would be a second implementation here.
+rustc's rules for it would be a second implementation here. The gate then
+reads rustc's own list of the files it compiled into each target (its
+dep-info) against the target's file and the files read here, so a shape this
+scan cannot see, such as a dependency's macro that calls `include!` from the
+target's call site, is red there.
 
 Python 3.11 or newer (`tomllib`), standard library only: the matrix jobs
 run this module on a bare runner before any toolchain is installed.
@@ -102,6 +106,7 @@ class Target:
     name: str
     path: str  # its file, relative to the root
     seeds: list = field(default_factory=list)  # relative to `member`
+    reads: set = field(default_factory=set)  # files it reaches by `#[path]`, read by the census
 
 
 @dataclass
@@ -299,6 +304,7 @@ class PathScan:
                 kind = "no package" if owner is None else f"`{owner}`, a package with a library target"
                 self.red("H1", f"{where}, from {kind}: call it through the crate (ADR-0198 D4)")
             self.census.path_files.add(file)
+            target.reads.add(file)
             self.included(target, file, depth, pending)
 
     def included(self, target, file, depth, pending):

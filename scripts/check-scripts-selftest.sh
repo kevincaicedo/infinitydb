@@ -3432,9 +3432,27 @@ fn main() {
 EOF
 fz_key() { printf '%s' "$1" | tr '/' '_'; }
 fz_sed() { sed "$1" "$2" >"$2.new" && mv "$2.new" "$2"; }  # <expression> <file>: an edit in place
-fz_artifact() { # <root> <manifest> <bin>
-    printf '{"reason":"compiler-artifact","manifest_path":"%s/%s","target":{"kind":["bin"],"name":"%s"},"fresh":false}\n' \
-        "$1" "$2" "$3"
+# fz_depinfo <root> <bin> <file>…: the dep-info rustc writes beside the bin's
+# metadata, naming the files it read for the crate (relative to its manifest).
+fz_depinfo() {
+    local root=$1 bin=$2 d rmeta
+    shift 2
+    d="$root.stub/deps/$bin-0.d"
+    rmeta="$root.stub/deps/lib$bin-0.rmeta"
+    mkdir -p "$root.stub/deps"
+    {
+        printf '%s:' "$d"
+        printf ' %s' "$@"
+        printf '\n%s:' "$rmeta"
+        printf ' %s' "$@"
+        printf '\n\n'
+        printf '%s:\n' "$@"
+    } >"$d"
+}
+fz_artifact() { # <root> <manifest> <bin>: its report line; its dep-info names its own file
+    fz_depinfo "$1" "$3" "fuzz_targets/$3.rs"
+    printf '{"reason":"compiler-artifact","manifest_path":"%s/%s","target":{"kind":["bin"],"name":"%s"},"filenames":["%s.stub/deps/lib%s-0.rmeta"],"fresh":false}\n' \
+        "$1" "$2" "$3" "$1" "$3"
 }
 fz_error() { # <root> <manifest> <bin> <code> <message> <primary file>
     printf '{"reason":"compiler-message","manifest_path":"%s/%s","target":{"kind":["bin"],"name":"%s"},"message":{"level":"error","code":{"code":"%s"},"message":"%s","rendered":"error[%s]: %s\\n","spans":[{"file_name":"%s","is_primary":true}]}}\n' \
@@ -3499,6 +3517,7 @@ fz_root() {
     git -C "$root" init -q
     fz_answer "$root" crates/a/fuzz/Cargo.toml t_one
     fz_answer "$root" bins/b/fuzz/Cargo.toml b_parse
+    fz_depinfo "$root" b_parse fuzz_targets/b_parse.rs fuzz_targets/../../src/parse.rs
     echo "$root"
 }
 fz_run() { # <root> [args…]: the gate on a fixture root, its probe off
@@ -3534,6 +3553,9 @@ expect_output "fuzz-targets: the OK line discloses the probe off in fixture mode
     fz_replay "$root.log"
 expect_output "fuzz-targets: the OK line counts the #[path] sites and files read" \
     "0 seed directories (git-listed); 1 #.path. sites, 1 files read" fz_replay "$root.log"
+expect_output "fuzz-targets: the OK line counts the dep-info read" \
+    "carries #.macro_use.; dep-info of 2 of 2 compiled targets read, each naming only its target's file and the #.path. files read" \
+    fz_replay "$root.log"
 expect_output "fuzz-targets: the count line is printed on a green run" \
     "fuzz-targets: bins/b/fuzz/Cargo.toml: compiled 1 of 1" fz_replay "$root.log"
 expect_red_because "fuzz-targets: the probe stays on outside a fixture root" \
@@ -3656,6 +3678,9 @@ fz_red "C5: a row whose file is missing" "names fuzz_targets/t_gone.rs, which is
 root=$(fz_root c5-path)
 printf '\n[[bin]]\nname = "t_src"\npath = "src/t_src.rs"\n' >>"$root/crates/a/fuzz/Cargo.toml"
 fz_red "C5: a row whose path is not fuzz_targets/<name>.rs" "at .src/t_src.rs., not fuzz_targets" "$root"
+fz_answer "$root" crates/a/fuzz/Cargo.toml t_one t_src
+fz_red "C5: a refused row cargo compiled is C5's alone, its dep-info unread" \
+    "at .src/t_src.rs., not fuzz_targets" "$root"
 root=$(fz_root c5-twice)
 fz_manifest "$root" bins/b b_parse t_one
 printf 'fn main() {}\n' >"$root/bins/b/fuzz/fuzz_targets/t_one.rs"
@@ -3849,6 +3874,31 @@ root=$(fz_root k2-extra)
 fz_answer "$root" crates/a/fuzz/Cargo.toml t_one t_extra
 fz_red "K2: a bin no row names" "(unexpected: t_extra)" "$root"
 
+# K3: rustc's dep-info of a compiled target names only the target's file and
+# the files the census read for it by `#[path]`; a file it reached another way
+# (a dependency's macro calling include! from the target's call site) is red,
+# and so is a compiled target whose dep-info the gate cannot find or read.
+root=$(fz_root k3)
+fz_depinfo "$root" t_one fuzz_targets/t_one.rs fuzz_targets/../../src/lib.rs
+fz_once "$root.log" fz_run "$root"
+expect_red_because "fuzz-targets: K3: a target compiles a file the gate did not read" \
+    "K3 crates/a/fuzz/Cargo.toml t_one: rustc compiled crates/a/src/lib.rs into it" \
+    fz_replay "$root.log"
+expect green "fuzz-targets: K3 counts a #[path] file the census read as read" \
+    fz_lacks "K3 bins/b/fuzz/Cargo.toml" "$root.log"
+root=$(fz_root k3-absolute)
+fz_depinfo "$root" t_one "$root/crates/a/fuzz/fuzz_targets/t_one.rs"
+expect green "fuzz-targets: K3 reads an absolute dep-info path" fz_run "$root"
+root=$(fz_root k3-missing)
+rm -f "${root:?}.stub/deps/t_one-0.d"
+fz_red "K3: a compiled target with no dep-info" \
+    "K3 crates/a/fuzz/Cargo.toml t_one: no dep-info at" "$root"
+root=$(fz_root k3-unnamed)
+printf '{"reason":"compiler-artifact","manifest_path":"%s/%s","target":{"kind":["bin"],"name":"t_one"},"fresh":false}\n' \
+    "$root" crates/a/fuzz/Cargo.toml >"$root.stub/$(fz_key crates/a/fuzz/Cargo.toml).out"
+fz_red "K3: an artifact that names no metadata" \
+    "K3 crates/a/fuzz/Cargo.toml t_one: no dep-info (its artifact names no .rmeta)" "$root"
+
 # P1–P5: the probe on, the stub answering its two manifests as the toolchain
 # does (fz_probe <root> [<plant>]: the true answer, or that plant's escape).
 FZ_PM=scripts/fuzz-check-probe/Cargo.toml
@@ -3881,6 +3931,8 @@ fz_probe() {
         'cannot find module or crate `absent_cfg_crate` in this scope' fuzz_targets/plant_cfg.rs >>"$out" ;;
     esac
     [ "$plant" = p3-missing ] || fz_artifact "$root" "$FZ_PM" control >>"$out"
+    [ "$plant" = p3-depinfo ] || [ "$plant" = p3-missing ] \
+        || fz_depinfo "$root" control fuzz_targets/control.rs fuzz_targets/../shared/ok.rs
     fz_status "$root" "$FZ_PM" 101
     case $plant in
     p4-compiled) fz_answer "$root" "$FZ_PL" stale_lock ;;
@@ -3897,7 +3949,7 @@ fz_probe() {
 root=$(fz_root probe)
 fz_probe "$root"
 expect_output "fuzz-targets: the probe's five verdicts on the OK line" \
-    "probe: plant_crate E0433 absent_crate, plant_warning denied, plant_cfg E0433 absent_cfg_crate, control compiled, stale_lock refused by --locked;" \
+    "probe: plant_crate E0433 absent_crate, plant_warning denied, plant_cfg E0433 absent_cfg_crate, control compiled naming shared/ok.rs, stale_lock refused by --locked;" \
     fz_probe_run "$root"
 FZ_PROOT=$root  # fz_probe rewrites both probe answers, so the plants share it
 fz_plant() { # <plant> <label> <pattern>
@@ -3910,6 +3962,8 @@ fz_plant p1-file "P1: plant_crate's E0433 outside shared/leaf.rs" "P1 probe targ
 fz_plant p2-compiled "P2: plant_warning compiled" "P2 probe target plant_warning compiled"
 fz_plant p2-code "P2: plant_warning refused for another reason" "P2 probe target plant_warning refused without"
 fz_plant p3-missing "P3: no control artifact" "P3 probe target control not compiled"
+fz_plant p3-depinfo "P3: control's dep-info without the file it includes" \
+    "P3 probe target control's dep-info names"
 fz_plant p4-compiled "P4: a stale lock compiled" "P4 probe target stale_lock compiled, or refused without"
 fz_plant p4-other "P4: stale_lock refused without --locked's message" \
     "P4 probe target stale_lock compiled, or refused without"
