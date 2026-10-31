@@ -79,6 +79,7 @@ MOD_ANY = re.compile(r"\bmod\s+(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*;")
 TEST_ATTR = re.compile(r"^\s*#\[cfg\((?:test|all\(test,.*\))\)\]\s*$")
 ATTR_OPEN = re.compile(r"#\s*!?\s*\[")
 PATH_KEY = re.compile(r"\bpath\s*=")
+WORD_PATH = re.compile(r"\bpath\b")
 NAMES_ROOT = re.compile(r"\b(crate|super)\s*::")
 # An alias names the same root without `::` after it; in a fuzz crate it is
 # the fuzz crate's root, so it is red as `crate::` is.
@@ -256,6 +257,16 @@ class PathScan:
         return None
 
     def target(self, target):
+        # Stripping test modules, comments and literals only blanks text, so
+        # a file naming neither `path` nor `include` holds no `#[path]` and
+        # no `include!`: the stripper's two awk runs a file are spent only
+        # where one could be (most targets name neither).
+        try:
+            raw = Path(target.path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as err:
+            raise CensusError(f"cannot read {target.path} ({err})") from err
+        if not WORD_PATH.search(raw) and not INCLUDE.search(raw):
+            return
         found = self.includes(target.path, target.name)
         if found is None:
             return
