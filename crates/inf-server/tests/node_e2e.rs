@@ -966,7 +966,8 @@ impl Node {
     /// `TAIL-STALL-TIMEOUT` default, unless that default is its subject: on
     /// the device this binary's tests share, a fill there can answer a legal
     /// `-STALLED`, so a tiered fixture states its bound through
-    /// [`tiered_ns_create`]. Runs after every thread is joined.
+    /// [`tiered_ns_create`]. Runs after every thread is joined, at every end
+    /// of a node: a drop that skips the stop fails on its own (`Drop`).
     fn assert_tail_stall_stated(&self) {
         if self.tail_stall_default_expected.get() {
             return;
@@ -978,6 +979,41 @@ impl Node {
                  the default is the test's subject"
             );
         }
+    }
+}
+
+/// A node ends through [`Node::stop`] (directly or through a graceful
+/// stop) or [`Node::kill_without_catalog_drain`]; each joins the cells and
+/// then runs the stop's checks. A node dropped with its cells running
+/// skipped those checks, and its cells would run on beside every later
+/// test of the binary, so the drop stops and joins them, then fails the
+/// test. A test already failing only signals its threads to exit (a join
+/// could wait on a wedged cell), so its first failure stays the one
+/// reported.
+impl Drop for Node {
+    fn drop(&mut self) {
+        if let Some(pump) = &self.catalog_pump {
+            pump.stop.store(true, Ordering::Relaxed);
+        }
+        if self.handles.is_empty() {
+            return;
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        if std::thread::panicking() {
+            return;
+        }
+        for handle in self.handles.drain(..) {
+            handle.join().expect("cell thread");
+        }
+        if let Some(pump) = self.catalog_pump.take() {
+            pump.handle.join().expect("catalog pump thread");
+        }
+        panic!(
+            "a {}-cell node on port {} was dropped without its stop: end it with stop, \
+             stop_gracefully, stop_synced or kill_without_catalog_drain, so the stop's \
+             checks run",
+            self.cells, self.port
+        );
     }
 }
 
@@ -1890,6 +1926,9 @@ fn namespace_bound_dbsize_counts_every_cell() {
         other.write_all(&cmd(&[b"DBSIZE"])).expect("write");
         read_exactly(&mut other, b":17\r\n");
     }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Reads one flat RESP array of bulk strings (the `KEYS` reply shape).
@@ -3153,6 +3192,33 @@ fn a_tiered_namespace_at_the_product_tail_stall_default_fails_the_stop() {
     let panic = stopped.expect_err("the stop fails on a namespace at the product default");
     let message = panic.downcast_ref::<String>().map_or("", String::as_str);
     assert!(message.contains("plain on cell 0"), "{message}");
+}
+
+/// The same namespace on a node the test drops without a stop, planted:
+/// the stop's checks never run there, so the drop itself fails the test —
+/// a tiered fixture that also skips its stop cannot stay green either.
+#[test]
+fn a_node_dropped_without_its_stop_fails_the_test() {
+    let dir = temp_data_dir("tail-stall-dropped");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"plain",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(node)));
+    std::fs::remove_dir_all(&dir).ok();
+    let panic = dropped.expect_err("a node dropped without its stop fails the test");
+    let message = panic.downcast_ref::<String>().map_or("", String::as_str);
+    assert!(message.contains("was dropped without its stop"), "{message}");
 }
 
 /// Reads one `SCAN` reply (`[next-cursor, [key…]]`) off the stream.
@@ -6667,6 +6733,9 @@ fn json_mget_gathers_across_cells() {
     client.write_all(&cmd(&[b"MGET", &k0, &k1])).expect("write");
     let line = read_line(&mut client);
     assert!(line.starts_with(b"-ERR multi-key commands"), "refusal stays: {line:?}");
+    drop(client);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// ADR-0099 A1 at the shipped topology and the default budget (128 MiB):
