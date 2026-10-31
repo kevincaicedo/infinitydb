@@ -3785,6 +3785,42 @@ FZ_KROOT=$root  # the K cases below rewrite its stub's answer, so they share it
 root=$(fz_root k1-unread)
 printf 'Compiling a-fuzz\n' >>"$root.stub/$(fz_key crates/a/fuzz/Cargo.toml).out"
 fz_red "K1: a report line that is not cargo's JSON" "1 report lines unread" "$root"
+# cargo's own error prints whole, its Caused by: chain and help: lines up to
+# the next status line, and a long block's middle is counted, not printed.
+fz_lacks() { ! grep -q -- "$1" "$2"; }  # <pattern> <log>: the log lacks it
+root=$(fz_root k1-block)
+fz_status "$root" crates/a/fuzz/Cargo.toml 101
+fz_stderr "$root" crates/a/fuzz/Cargo.toml "error: failed to run custom build command for \`libfuzzer-sys v0.4.13\`
+
+Caused by:
+  process didn't exit successfully: \`build-script-build\` (exit status: 1)
+  --- stderr
+  error occurred in cc-rs: failed to find tool \"c++\": No such file or directory (os error 2)
+
+    Checking a-fuzz v0.0.0
+warning: build failed, waiting for other jobs to finish..."
+fz_once "$root.log" fz_run "$root"
+expect_red_because "fuzz-targets: K1 prints cargo's Caused by: chain" "^    Caused by:$" \
+    fz_replay "$root.log"
+expect_output "fuzz-targets: K1 prints a build script's reason" \
+    "^      error occurred in cc-rs: failed to find tool" fz_replay "$root.log"
+expect green "fuzz-targets: cargo's block ends at its next status line" \
+    fz_lacks "Checking a-fuzz" "$root.log"
+root=$(fz_root k1-long)
+fz_status "$root" crates/a/fuzz/Cargo.toml 101
+long="error: failed to run custom build command for \`x\`"
+i=1
+while [ "$i" -le 40 ]; do
+    long="$long
+  line $i"
+    i=$((i + 1))
+done
+fz_stderr "$root" crates/a/fuzz/Cargo.toml "$long"
+fz_once "$root.log" fz_run "$root"
+expect_output "fuzz-targets: a long cargo block counts what it omits" "^    \.\.\. 17 lines omitted$" \
+    fz_replay "$root.log"
+expect_output "fuzz-targets: a long cargo block keeps its last line" "^      line 40$" fz_replay "$root.log"
+expect green "fuzz-targets: a long cargo block omits its middle" fz_lacks "line 20$" "$root.log"
 fz_answer "$FZ_KROOT" crates/a/fuzz/Cargo.toml t_one
 fz_once "$FZ_KROOT.log" fz_run "$FZ_KROOT"
 expect_red_because "fuzz-targets: K2: cargo exits 0 having compiled one of two bins" \

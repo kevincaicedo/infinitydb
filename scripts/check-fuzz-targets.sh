@@ -27,10 +27,12 @@
 #
 # Red: a census row; cargo exiting non-zero on a workspace (a compile error,
 # a warning, a stale lock), each compiler error printed under the workspace
-# and target that produced it; the bins cargo reports compiled for a
-# workspace differing from its [[bin]] rows, whatever cargo's status (the
-# count is printed for every workspace, green or red). Every row is judged
-# and printed before the gate exits; only an empty census stops it early.
+# and target that produced it, and cargo's own errors under the workspace
+# with their `Caused by:` and `help:` lines; the bins cargo reports compiled
+# for a workspace differing from its [[bin]] rows, whatever cargo's status
+# (the count is printed for every workspace, green or red). Every row is
+# judged and printed before the gate exits; only an empty census stops it
+# early.
 #
 # The probe (scripts/fuzz-check-probe, ADR-0198 D2) is compiled first, with
 # the same call, on every run: plant_crate must be refused with E0433 naming
@@ -77,6 +79,7 @@ INF_SCRIPT_DIR="$SCRIPT_DIR" INF_FUZZ_MODE="$mode" INF_FUZZ_PROBE="$probe" \
     INF_FUZZ_CARGO_BIN="${INF_FUZZ_CARGO:-cargo}" python3 -I -B - <<'PY'
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -94,6 +97,33 @@ PROBE_LOCK = "scripts/fuzz-check-probe/stale-lock/Cargo.toml"
 PROBE_TARGETS = {PROBE_MAIN: ["plant_crate", "plant_warning", "plant_cfg", "control"],
                  PROBE_LOCK: ["stale_lock"]}
 ERROR_LEVELS = ("error", "error: internal compiler error")
+# cargo's own error is a block: its `error` line, the `Caused by:` chain, the
+# `help:` and `note:` lines, up to the next `error` or `warning` line or a
+# status line (a verb right-aligned in cargo's 12 columns). A block over
+# CARGO_BLOCK_LINES_MAX lines prints its first and last half and the count
+# between: a build script's reason comes last, after its environment dump.
+# cargo prints one block a failing unit (a crate or a build script), so a
+# workspace's crate graph bounds how many it prints.
+CARGO_BLOCK_LINES_MAX = 24
+STATUS_LINE = re.compile(r"( *)([A-Z][a-z]+) ")
+
+
+def cargo_blocks(stderr):
+    """cargo's error blocks in its stderr, each a list of lines."""
+    blocks, block = [], None
+    for line in stderr.split("\n"):
+        status = STATUS_LINE.match(line)
+        if line.startswith("error"):
+            block = [line]
+            blocks.append(block)
+        elif line.startswith("warning") or (status and len(status[1] + status[2]) == 12):
+            block = None
+        elif block is not None:
+            block.append(line)
+    for block in blocks:
+        while not block[-1].strip():
+            block.pop()
+    return blocks
 
 census = fuzz_targets.census(".")
 if census.scope_error:
@@ -116,7 +146,7 @@ ENV["RUSTFLAGS"] = RUSTFLAGS
 
 class Report:
     """What cargo said about one workspace: its exit status, the bins it
-    reports compiled, its compiler errors and its own `error:` lines."""
+    reports compiled, its compiler errors and its own error blocks."""
 
     def __init__(self, manifest):
         self.manifest, self.status, self.bins, self.errors, self.cargo_errors = manifest, 0, [], [], []
@@ -126,10 +156,10 @@ class Report:
             run = subprocess.run([CARGO, CALL[0], "--manifest-path", manifest, *CALL[1:]], env=ENV,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except OSError as err:
-            self.status, self.cargo_errors = -1, [f"cannot run {CARGO} ({err})"]
+            self.status, self.cargo_errors = -1, [[f"cannot run {CARGO} ({err})"]]
             return
         self.status = run.returncode
-        self.cargo_errors = [l for l in run.stderr.split("\n") if l.startswith("error")]
+        self.cargo_errors = cargo_blocks(run.stderr)
         for line in run.stdout.split("\n"):
             if not line.strip():
                 continue
@@ -138,7 +168,7 @@ class Report:
                 reason, target = msg["reason"], msg.get("target", {})
             except (ValueError, KeyError, TypeError, AttributeError):
                 self.unread += 1
-                self.cargo_errors.append(f"a report line that is not cargo's JSON: {line[:120]}")
+                self.cargo_errors.append([f"a report line that is not cargo's JSON: {line[:120]}"])
                 continue
             if reason == "compiler-artifact":
                 if "bin" in target.get("kind", []) and os.path.realpath(msg.get("manifest_path", "")) == own:
@@ -155,8 +185,14 @@ class Report:
             kind = ",".join(target.get("kind", [])) or "?"
             body = "\n".join("    " + l for l in rendered.rstrip("\n").split("\n"))
             print(f"{self.manifest} {kind} {target.get('name')}:\n{body}")
-        for line in self.cargo_errors:
-            print(f"{self.manifest} cargo: {line}")
+        half = CARGO_BLOCK_LINES_MAX // 2
+        for block in self.cargo_errors:
+            if len(block) > CARGO_BLOCK_LINES_MAX:
+                omitted = f"... {len(block) - 2 * half} lines omitted"
+                block = block[:half] + [omitted] + block[-half:]
+            print(f"{self.manifest} cargo: {block[0]}")
+            for line in block[1:]:
+                print(f"    {line}" if line.strip() else "")
 
 
 def e0433(message, crate, file_suffix=None):
@@ -210,7 +246,7 @@ if PROBE == "on":
         reds.append("P3 probe target control not compiled: the probe proves nothing")
     lock = Report(PROBE_LOCK)
     if (lock.status != 0 and "stale_lock" not in lock.bins
-            and any("because --locked was passed" in l for l in lock.cargo_errors)):
+            and any("because --locked was passed" in block[0] for block in lock.cargo_errors)):
         verdicts["P4"] = "stale_lock refused by --locked"
     else:
         reds.append("P4 probe target stale_lock compiled, or refused without cargo's "
