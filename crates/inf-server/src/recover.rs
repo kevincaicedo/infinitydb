@@ -1007,10 +1007,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             self.finish_tier_replay(ks)?;
             let fs = self.fs.take().expect("fs present");
             let rotor = if self.defer_boot_sync {
-                SegmentRotor::create_fresh_deferred(fs, self.log_dir.clone(), self.cfg.segment)
+                SegmentRotor::create_fresh_deferred(fs, self.log_dir.clone(), self.cfg.geometry)
                     .map_err(io_invalid)?
             } else {
-                SegmentRotor::create_fresh(fs, self.log_dir.clone(), self.cfg.segment)
+                SegmentRotor::create_fresh(fs, self.log_dir.clone(), self.cfg.geometry)
                     .map_err(io_invalid)?
             };
             self.finished = Some((rotor, None));
@@ -2130,7 +2130,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         let mut rotor = SegmentRotor::open_existing(
             fs,
             self.log_dir.clone(),
-            self.cfg.segment,
+            self.cfg.geometry,
             scan,
             tail_offset,
         )

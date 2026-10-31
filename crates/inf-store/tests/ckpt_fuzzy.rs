@@ -16,8 +16,8 @@ use inf_foundation::time::Nanos;
 use inf_log::ckpt::{IckReaderConfig, SyncIckWriter, ick_file_name, read_ick};
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    CkptConfig, Lsn, MutationEffect, ReaderConfig, RecordView, SegmentConfig, SegmentReader,
-    SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir,
+    CkptConfig, LogGeometry, Lsn, MutationEffect, ReaderConfig, RecordView, SegmentConfig,
+    SegmentReader, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir,
 };
 use inf_store::InternalDeadline::At;
 use inf_store::NoSpill;
@@ -129,13 +129,15 @@ fn run_seed(seed: u64) {
     // The real log pipeline on the fault-injectable MemFs.
     let fs = MemFs::new();
     let dirs = create_cell_dirs(&fs, Path::new("/shard-0")).expect("dirs");
-    let mut rotor = SegmentRotor::create_fresh(
-        fs.clone(),
-        dirs.log.clone(),
+    // A staging ring of one segment's worth (the harness rule, ADR-0191).
+    let geometry = LogGeometry::new(
+        StagingConfig::with_capacity(32 << 10),
         SegmentConfig { segment_bytes: 32 << 10, ..Default::default() },
     )
-    .expect("rotor");
-    let mut staging = StagingRing::new(StagingConfig::default());
+    .expect("geometry");
+    let mut rotor =
+        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), geometry).expect("rotor");
+    let mut staging = StagingRing::new(geometry);
 
     // Pre-checkpoint history: writes that are ONLY covered by the walker
     // (their records precede ckpt-begin and tail replay never sees them).

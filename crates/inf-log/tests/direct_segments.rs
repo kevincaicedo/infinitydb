@@ -14,12 +14,20 @@ use inf_log::fs::mem::MemFs;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode, StdSegmentFs};
 use inf_log::{
-    DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_MAGIC_V3,
-    FrameBuilder, FrameIter, FrameLayout, FrameStamp, LogError, Lsn, MutationEffect, NsId, ReadEnd,
-    ReaderConfig, RecordView, RegionScan, SegmentConfig, SegmentId, SegmentReader, SegmentRotor,
-    StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES, align_up_frame, decode_frame, scan_region,
-    scan_region_evidence,
+    DEFAULT_MAX_FRAME_LEN, DEFAULT_STAGING_BYTES, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_MAGIC,
+    FRAME_MAGIC_V3, FrameBuilder, FrameIter, FrameLayout, FrameStamp, LogError, LogGeometry, Lsn,
+    MutationEffect, NsId, ReadEnd, ReaderConfig, RecordView, RegionScan, SegmentConfig, SegmentId,
+    SegmentReader, SegmentRotor, StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES, align_up_frame,
+    decode_frame, scan_region, scan_region_evidence,
 };
+
+/// The rotor's checked geometry: a staging ring no larger than one segment,
+/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
+/// rule, ADR-0191).
+fn geometry(segment: SegmentConfig) -> LogGeometry {
+    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
+    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
+}
 
 fn stamp(seq: u64) -> FrameStamp {
     FrameStamp { epoch: 1, seq, covered_lsn: 0 }
@@ -167,11 +175,12 @@ fn direct_rotor_on_memfs_writes_aligned_write_through_frames() {
     let fs = MemFs::new();
     let dir = PathBuf::from("log");
     fs.create_dir_all(&dir).expect("dir");
-    let mut rotor =
-        SegmentRotor::create_fresh(fs.clone(), dir.clone(), direct_cfg(16 << 10)).expect("fresh");
+    let geometry = LogGeometry::new(StagingConfig::with_capacity(8 << 10), direct_cfg(16 << 10))
+        .expect("an 8 KiB ring beside 16 KiB Direct segments");
+    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dir.clone(), geometry).expect("fresh");
     assert_eq!(rotor.active_io_mode(), SegmentIoMode::Direct);
     assert!(rotor.active_write_through(), "MemFs is fully allocated at birth");
-    let mut ring = StagingRing::new(StagingConfig::with_capacity(8 << 10));
+    let mut ring = StagingRing::new(geometry);
     let mut unpadded_total = 0u64;
     for i in 0..6u8 {
         let value = [i; 100];
@@ -211,7 +220,7 @@ fn frames_above_fua_max_are_not_write_through() {
     let dir = PathBuf::from("log");
     fs.create_dir_all(&dir).expect("dir");
     let cfg = SegmentConfig { fua_max_frame_bytes: 8192, ..direct_cfg(64 << 10) };
-    let mut rotor = SegmentRotor::create_fresh(fs, dir, cfg).expect("fresh");
+    let mut rotor = SegmentRotor::create_fresh(fs, dir, geometry(cfg)).expect("fresh");
     let small = rotor.begin_frame(8000, 0).expect("reserve");
     assert!(small.write_through_ok());
     rotor.commit_frame_queued(small);
@@ -254,9 +263,12 @@ fn zero_fill_then_class_upgrade_rotation() {
     let dir = PathBuf::from("log");
     disk.create_dir_all(&dir).expect("dir");
     let segment_bytes = 16 << 10;
-    let mut rotor =
-        SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), direct_cfg(segment_bytes))
-            .expect("fresh");
+    let mut rotor = SegmentRotor::create_fresh_deferred(
+        disk.clone(),
+        dir.clone(),
+        geometry(direct_cfg(segment_bytes)),
+    )
+    .expect("fresh");
     assert!(!rotor.active_write_through(), "segment 0 is sparse: FLUSH class");
     let slot = rotor.begin_frame_deferred(300, 0).expect("reserve").0;
     assert_eq!(slot.layout(), FrameLayout::Aligned, "aligned frames even before pre-zeroing");
@@ -303,9 +315,12 @@ fn not_ready_rotation_waits_for_the_slice_then_degrades_loudly() {
     let dir = PathBuf::from("log");
     disk.create_dir_all(&dir).expect("dir");
     let segment_bytes = 16 << 10;
-    let mut rotor =
-        SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), direct_cfg(segment_bytes))
-            .expect("fresh");
+    let mut rotor = SegmentRotor::create_fresh_deferred(
+        disk.clone(),
+        dir.clone(),
+        geometry(direct_cfg(segment_bytes)),
+    )
+    .expect("fresh");
     rotor.maintain_deferred(0).expect("maintain");
     // Fill segment 0 with four 4 KiB frames.
     for _ in 0..4 {
@@ -354,7 +369,7 @@ fn reopen_reads_the_prezeroed_fact_from_the_file() {
         let mut rotor = SegmentRotor::create_fresh_deferred(
             disk.clone(),
             dir.clone(),
-            direct_cfg(segment_bytes),
+            geometry(direct_cfg(segment_bytes)),
         )
         .expect("fresh");
         rotor.maintain_deferred(0).expect("maintain");
@@ -372,7 +387,7 @@ fn reopen_reads_the_prezeroed_fact_from_the_file() {
     let rotor = SegmentRotor::open_existing(
         disk.clone(),
         dir.clone(),
-        direct_cfg(segment_bytes),
+        geometry(direct_cfg(segment_bytes)),
         &scan(&disk),
         0,
     )
@@ -387,9 +402,14 @@ fn reopen_reads_the_prezeroed_fact_from_the_file() {
     file.write_at(0, &zeros).expect("zeros");
     file.sync_data().expect("barrier");
     let scanned = scan(&disk);
-    let rotor =
-        SegmentRotor::open_existing(disk.clone(), dir, direct_cfg(segment_bytes), &scanned, 0)
-            .expect("reopen");
+    let rotor = SegmentRotor::open_existing(
+        disk.clone(),
+        dir,
+        geometry(direct_cfg(segment_bytes)),
+        &scanned,
+        0,
+    )
+    .expect("reopen");
     assert!(rotor.active_write_through());
 }
 
@@ -410,7 +430,7 @@ fn reopen_after_a_torn_zero_fill_runs_flush_class() {
             let mut rotor = SegmentRotor::create_fresh_deferred(
                 disk.clone(),
                 dir.clone(),
-                direct_cfg(segment_bytes),
+                geometry(direct_cfg(segment_bytes)),
             )
             .expect("fresh");
             rotor.maintain_deferred(0).expect("maintain");
@@ -435,7 +455,7 @@ fn reopen_after_a_torn_zero_fill_runs_flush_class() {
         let rotor = SegmentRotor::open_existing(
             disk.clone(),
             dir.clone(),
-            direct_cfg(segment_bytes),
+            geometry(direct_cfg(segment_bytes)),
             &scanned,
             0,
         )
@@ -661,7 +681,8 @@ fn zero_fill_is_paced_by_the_active_segments_fill() {
     // wait.rs`).
     let cfg =
         SegmentConfig { prealloc: inf_log::PreallocPolicy::Immediate, ..direct_cfg(segment_bytes) };
-    let mut rotor = SegmentRotor::create_fresh_deferred(disk.clone(), dir, cfg).expect("fresh");
+    let mut rotor =
+        SegmentRotor::create_fresh_deferred(disk.clone(), dir, geometry(cfg)).expect("fresh");
     // Segment 0 is un-zeroed: segment 1 fills unpaced, end to end.
     rotor.maintain_deferred(0).expect("maintain");
     zero_fill_to_ready(&mut rotor, &disk, segment_bytes);
@@ -742,7 +763,8 @@ fn packed_tail_reopens_buffered_under_a_direct_rotor_and_upgrades_at_rotation() 
     // Life 1 (FLUSH class): one packed frame; its end is not aligned.
     let packed_end = {
         let mut rotor =
-            SegmentRotor::create_fresh(disk.clone(), dir.clone(), buffered_cfg).expect("fresh");
+            SegmentRotor::create_fresh(disk.clone(), dir.clone(), geometry(buffered_cfg))
+                .expect("fresh");
         let slot = rotor.begin_frame(frame_len(1), 0).expect("reserve");
         assert_eq!(slot.layout(), FrameLayout::Packed);
         let bytes = frame(1, slot.first_record_lsn(), FrameLayout::Packed);
@@ -756,7 +778,7 @@ fn packed_tail_reopens_buffered_under_a_direct_rotor_and_upgrades_at_rotation() 
     let mut rotor = SegmentRotor::open_existing(
         disk.clone(),
         dir.clone(),
-        direct_cfg(segment_bytes),
+        geometry(direct_cfg(segment_bytes)),
         &scan,
         packed_end,
     )
@@ -824,7 +846,7 @@ fn packed_tail_reopens_buffered_under_a_direct_rotor_and_upgrades_at_rotation() 
     let rotor = SegmentRotor::open_existing(
         disk.clone(),
         dir.clone(),
-        direct_cfg(segment_bytes),
+        geometry(direct_cfg(segment_bytes)),
         &scan,
         FRAME_ALIGN,
     )
@@ -849,8 +871,9 @@ fn sync_tier_torn_points_inject_on_a_direct_segment() {
         let disk = SimDisk::new();
         let dir = PathBuf::from("log");
         disk.create_dir_all(&dir).expect("dir");
-        let mut rotor = SegmentRotor::create_fresh(disk.clone(), dir.clone(), direct_cfg(64 << 10))
-            .expect("fresh");
+        let mut rotor =
+            SegmentRotor::create_fresh(disk.clone(), dir.clone(), geometry(direct_cfg(64 << 10)))
+                .expect("fresh");
         // A ~3 KiB record: the frame's CRC sits past every tear below, so
         // the torn block never decodes (a ~250-byte frame would survive
         // whole inside the first sector — honest, but vacuous here).

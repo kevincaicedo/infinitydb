@@ -21,7 +21,7 @@ use inf_alloc::BufferPool;
 use inf_foundation::CellId;
 use inf_foundation::bounded::CapCensus;
 use inf_foundation::time::{Nanos, VirtualClock};
-use inf_log::{FsyncClass, SegmentConfig, StagingConfig};
+use inf_log::{FsyncClass, LogGeometry, SegmentConfig, StagingConfig};
 use inf_runtime::{CellExecutor, CellLoop, LoopConfig, WatermarkGate};
 use support::{DurablePlane, IoMode, ScriptedDriver, test_dir};
 
@@ -57,11 +57,9 @@ fn run_schedule(seed: u64, dir: &Path) {
         serve_mark,
     );
     // Small segments: rotation + seal fsyncs interleave with linked ones.
-    let mut plane = DurablePlane::new(
-        dir,
-        StagingConfig::with_capacity(16 << 10),
-        SegmentConfig { segment_bytes: 16 << 10, ..Default::default() },
-    );
+    let staging = StagingConfig::with_capacity(16 << 10);
+    let segment = SegmentConfig { segment_bytes: 16 << 10, ..Default::default() };
+    let mut plane = DurablePlane::new(dir, LogGeometry::new(staging, segment).expect("geometry"));
     plane.jobs_per_iter = 1 + rng.below(24) as usize;
     let mut always = 0;
     for _ in 0..30 {

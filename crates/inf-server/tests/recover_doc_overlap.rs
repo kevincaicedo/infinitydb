@@ -14,8 +14,8 @@ use inf_foundation::time::Nanos;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    CkptConfig, DocLineage, FsyncClass, Manifest, MutationEffect, NsId, RecordView, SegmentConfig,
-    SegmentId, StagingConfig, StagingRing, create_cell_dirs, write_manifest,
+    CkptConfig, DocLineage, FsyncClass, LogGeometry, Manifest, MutationEffect, NsId, RecordView,
+    SegmentConfig, SegmentId, StagingConfig, StagingRing, create_cell_dirs, write_manifest,
 };
 use inf_server::{DurableConfig, open_cell_log};
 use inf_store::{Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
@@ -32,8 +32,12 @@ const LINEAGE_2: DocLineage = match DocLineage::new(2) {
 fn config() -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 1 << 16, ..Default::default() },
+        // A staging ring no larger than one segment (the harness rule).
+        geometry: LogGeometry::new(
+            StagingConfig::with_capacity(1 << 16),
+            SegmentConfig { segment_bytes: 1 << 16, ..Default::default() },
+        )
+        .expect("the fixture's log geometry"),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -65,8 +69,8 @@ fn fuzzy_checkpoint_overlap_counts_stale_and_missing_deltas() {
     let cfg = config();
     let dirs = create_cell_dirs(&fs, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
-        inf_log::SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg.segment).expect("rotor");
-    let mut ring = StagingRing::new(cfg.staging);
+        inf_log::SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg.geometry).expect("rotor");
+    let mut ring = StagingRing::new(cfg.geometry);
 
     let marker = ring.stage(&MutationEffect::CkptBegin { ckpt_id: 1 }).expect("marker");
     let lease = ring.flush_into(&mut rotor, 0).expect("flush").expect("marker frame");

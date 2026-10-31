@@ -15,10 +15,19 @@ use inf_log::FrameLayout;
 use inf_log::fs::mem::MemFs;
 use inf_log::meta::{read_meta, write_meta};
 use inf_log::{
-    DEFAULT_MAX_FRAME_LEN, FrameBuilder, FrameIter, FrameStamp, LogError, Lsn, Manifest, NsId,
-    RecordView, SegmentConfig, SegmentId, SegmentRotor, create_cell_dirs, read_manifest,
-    scan_log_dir, segment_file_name, write_manifest,
+    DEFAULT_MAX_FRAME_LEN, DEFAULT_STAGING_BYTES, FrameBuilder, FrameIter, FrameStamp, LogError,
+    LogGeometry, Lsn, Manifest, NsId, RecordView, SegmentConfig, SegmentId, SegmentRotor,
+    StagingConfig, create_cell_dirs, read_manifest, scan_log_dir, segment_file_name,
+    write_manifest,
 };
+
+/// The rotor's checked geometry: a staging ring no larger than one segment,
+/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
+/// rule, ADR-0191).
+fn geometry(segment: SegmentConfig) -> LogGeometry {
+    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
+    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
+}
 
 /// Canonical v2 stamp for hand-built test frames (epoch 1, covered 0 —
 /// attests nothing). `seq` matters only where a test builds sequential
@@ -35,7 +44,7 @@ fn cfg() -> SegmentConfig {
 
 fn mem_rotor(fs: &MemFs) -> SegmentRotor<MemFs> {
     let dirs = create_cell_dirs(fs, &PathBuf::from("data/shard-0")).expect("dirs");
-    SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg()).expect("fresh rotor")
+    SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry(cfg())).expect("fresh rotor")
 }
 
 fn append_frame(rotor: &mut SegmentRotor<MemFs>, filler: usize) -> Result<Lsn, LogError> {
@@ -75,7 +84,7 @@ fn prealloc_no_space_fires_the_enospc_discipline() {
     fault::arm(inf_log::fault::PREALLOC_NO_SPACE, FaultSpec::Nth(1));
     let fs = MemFs::new();
     let dirs = create_cell_dirs(&fs, &PathBuf::from("data/shard-0")).expect("dirs");
-    let err = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg())
+    let err = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), geometry(cfg()))
         .expect_err("prealloc refused");
     assert!(matches!(err, LogError::NoSpace { .. }), "{err:?}");
 
@@ -84,7 +93,8 @@ fn prealloc_no_space_fires_the_enospc_discipline() {
     // space returning clears it — the S02 discipline through the named
     // point instead of a MemFs capacity budget.
     fault::disarm_all();
-    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg()).expect("rotor");
+    let mut rotor =
+        SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry(cfg())).expect("rotor");
     fault::arm(inf_log::fault::PREALLOC_NO_SPACE, FaultSpec::FromNth(1));
     while !rotor.space_exhausted() {
         rotor.maintain(0).ok();
@@ -123,7 +133,7 @@ fn dir_fsync_fail_fires_at_the_recycle_rename_barrier() {
         prealloc: inf_log::PreallocPolicy::Immediate,
         ..Default::default()
     };
-    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg).expect("rotor");
+    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry(cfg)).expect("rotor");
     // Two rotations — one aligned frame fills a 4 KiB `Direct` segment
     // (MemFs segments are born allocated: every seal is a pool
     // candidate); pool seg 1.
@@ -159,7 +169,8 @@ fn dir_fsync_fail_fires_at_every_barrier_class() {
     fault::disarm_all();
     let dirs = create_cell_dirs(&fs, &PathBuf::from("data/shard-0")).expect("dirs");
     fault::arm(inf_log::fault::DIR_FSYNC_FAIL, FaultSpec::Nth(1));
-    let err = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg()).expect_err("barrier fails");
+    let err = SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry(cfg()))
+        .expect_err("barrier fails");
     assert!(matches!(err, LogError::Fsync(_)), "{err:?}");
     assert!(err.to_string().contains("injected fault: dir_fsync_fail"), "{err}");
 

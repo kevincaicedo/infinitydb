@@ -25,8 +25,8 @@ struct LogBuilder {
 impl LogBuilder {
     fn new(fs: &MemFs, cfg: &DurableConfig) -> LogBuilder {
         let dirs = create_cell_dirs(fs, &cfg.data_dir.join(format!("shard-{CELL}"))).expect("dirs");
-        let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg.segment).expect("rotor");
-        LogBuilder { rotor, ring: StagingRing::new(cfg.staging) }
+        let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg.geometry).expect("rotor");
+        LogBuilder { rotor, ring: StagingRing::new(cfg.geometry) }
     }
 
     /// One `SET key value` frame; returns its base LSN.
@@ -73,10 +73,7 @@ fn torn_frame_then_crash_recovers_minus_the_torn_frame() {
 fn power_cut_after_seal_recovers_at_the_seal_boundary() {
     fault::disarm_all();
     let fs = MemFs::new();
-    let config = DurableConfig {
-        segment: SegmentConfig { segment_bytes: 4096, ..Default::default() },
-        ..cfg()
-    };
+    let config = cfg_with(SegmentConfig { segment_bytes: 4096, ..Default::default() });
     let mut log = LogBuilder::new(&fs, &config);
     fault::arm(inf_log::fault::POWER_CUT_AFTER_SEAL, FaultSpec::Always);
     let mut keys: Vec<Vec<u8>> = Vec::new();

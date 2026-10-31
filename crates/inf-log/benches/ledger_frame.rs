@@ -58,7 +58,7 @@ use inf_foundation::bounded::CapCensus;
 use inf_foundation::time::Nanos;
 use inf_log::fs::mem::MemFile;
 use inf_log::{
-    FrameBarrier, FrameLayout, FramePlan, FrameQueued, FsyncClass, GroupCommit, Lsn,
+    FrameBarrier, FrameLayout, FramePlan, FrameQueued, FsyncClass, GroupCommit, LogGeometry, Lsn,
     MutationEffect, NsId, SegmentId, StagingConfig, StagingRing,
 };
 
@@ -120,8 +120,8 @@ struct Staging {
 
 impl Staging {
     fn new() -> Staging {
-        let ring =
-            StagingRing::new(StagingConfig { capacity_bytes: 64 << 10, frames_in_flight: 1 });
+        let staging = StagingConfig { capacity_bytes: 64 << 10, frames_in_flight: 1 };
+        let ring = StagingRing::new(LogGeometry::with_staging(staging).expect("a 64 KiB ring"));
         Staging { ring, end: 0, now: Nanos(0) }
     }
 

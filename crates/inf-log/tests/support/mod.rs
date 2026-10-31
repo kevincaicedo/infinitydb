@@ -22,8 +22,8 @@ use inf_foundation::FileOffset;
 use inf_foundation::time::Nanos;
 use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{
-    FsyncClass, FsyncTicket, GroupCommit, Lsn, MutationEffect, NsId, SegmentConfig, SegmentRotor,
-    StagedAt, StagingConfig, StagingRing, SyncReason, create_cell_dirs,
+    FsyncClass, FsyncTicket, GroupCommit, LogGeometry, Lsn, MutationEffect, NsId, SegmentRotor,
+    StagedAt, StagingRing, SyncReason, create_cell_dirs,
 };
 use inf_runtime::{
     BackendDriver, Capabilities, CellPlane, Completion, CompletionResult, CompletionToken, IoOp,
@@ -383,12 +383,12 @@ pub struct DurablePlane {
 }
 
 impl DurablePlane {
-    pub fn new(dir: &std::path::Path, staging: StagingConfig, segment: SegmentConfig) -> Self {
+    pub fn new(dir: &std::path::Path, geometry: LogGeometry) -> Self {
         let fs = StdSegmentFs;
         let dirs = create_cell_dirs(&fs, dir).expect("cell dirs");
-        let rotor = SegmentRotor::create_fresh(fs, dirs.log, segment).expect("rotor");
+        let rotor = SegmentRotor::create_fresh(fs, dirs.log, geometry).expect("rotor");
         DurablePlane {
-            staging: StagingRing::new(staging),
+            staging: StagingRing::new(geometry),
             rotor,
             // The harness's own census: the ledger's extent-seal window
             // registers its row there (no cell loop marks it).

@@ -21,8 +21,8 @@ use inf_foundation::bounded::CapCensus;
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
-    FsyncClass, Lsn, ReaderConfig, SegmentConfig, SegmentId, SegmentReader, StagingConfig,
-    SyncReason, scan_log_dir,
+    FsyncClass, LogGeometry, Lsn, ReaderConfig, SegmentConfig, SegmentId, SegmentReader,
+    StagingConfig, SyncReason, scan_log_dir,
 };
 use inf_runtime::{CellLoop, LoopConfig, TokenClass};
 use support::{DurablePlane, IoMode, ScriptedDriver, job_key, job_value, test_dir};
@@ -48,11 +48,11 @@ fn cell(
         },
         serve_mark,
     );
-    let plane = DurablePlane::new(
-        dir,
-        StagingConfig::with_capacity(64 << 10),
-        SegmentConfig { segment_bytes, ..Default::default() },
-    );
+    // A 64 KiB ring, or one segment's worth on smaller segments: a frame
+    // the ring seals always fits a segment (the harness rule, ADR-0191).
+    let staging = StagingConfig::with_capacity(segment_bytes.min(64 << 10));
+    let segment = SegmentConfig { segment_bytes, ..Default::default() };
+    let plane = DurablePlane::new(dir, LogGeometry::new(staging, segment).expect("geometry"));
     (lp, plane, clock)
 }
 
@@ -232,11 +232,10 @@ fn four_frames_in_flight_pipeline_rotates_drained_and_replays_identically() {
         },
         serve_mark,
     );
-    let mut plane = DurablePlane::new(
-        &dir,
-        StagingConfig { capacity_bytes: 64 << 10, frames_in_flight: 4 },
-        SegmentConfig { segment_bytes: 8 << 10, ..Default::default() },
-    );
+    // Four frames in flight, each buffer one 8 KiB segment's worth.
+    let staging = StagingConfig { capacity_bytes: 8 << 10, frames_in_flight: 4 };
+    let segment = SegmentConfig { segment_bytes: 8 << 10, ..Default::default() };
+    let mut plane = DurablePlane::new(&dir, LogGeometry::new(staging, segment).expect("geometry"));
     plane.jobs_per_iter = 8;
     for chunk in 0..60 {
         let class = if chunk % 3 == 0 { FsyncClass::Always } else { FsyncClass::Everysec };

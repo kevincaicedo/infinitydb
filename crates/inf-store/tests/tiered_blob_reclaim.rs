@@ -40,7 +40,7 @@ use inf_log::flush::unlink_tier_file;
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    MutationEffect, NsId, StagingConfig, StagingRing, TierFlush, TierFlushConfig, TierIoMode,
+    LogGeometry, MutationEffect, NsId, StagingRing, TierFlush, TierFlushConfig, TierIoMode,
 };
 use inf_store::KeyHasher;
 use inf_store::{
@@ -130,7 +130,7 @@ impl<F: SegmentFs + Clone> Rig<F> {
             shard: shard.to_path_buf(),
             table,
             flush,
-            ring: StagingRing::new(StagingConfig::default()),
+            ring: StagingRing::new(LogGeometry::default()),
             model: BTreeMap::new(),
             value_len,
             ckpt_id: 0,
@@ -143,7 +143,7 @@ impl<F: SegmentFs + Clone> Rig<F> {
 
     fn stage(&mut self, effect: &MutationEffect<'_>) {
         if self.table.stage_wal(&mut self.ring, effect).is_err() {
-            self.ring = StagingRing::new(StagingConfig::default());
+            self.ring = StagingRing::new(LogGeometry::default());
             self.table.stage_wal(&mut self.ring, effect).expect("a fresh ring has room");
         }
     }

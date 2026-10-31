@@ -14,10 +14,18 @@ use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode};
 use inf_log::{
-    FRAME_ALIGN, FrameBuilder, FrameLayout, FrameStamp, Lsn, NsId, PoolWaitBound, PreallocPolicy,
-    RecordView, SealedDisposal, SegmentConfig, SegmentId, SegmentRotor, ZERO_FILL_HEAD_START,
-    ZERO_FILL_SLICE_BYTES,
+    DEFAULT_STAGING_BYTES, FRAME_ALIGN, FrameBuilder, FrameLayout, FrameStamp, LogGeometry, Lsn,
+    NsId, PoolWaitBound, PreallocPolicy, RecordView, SealedDisposal, SegmentConfig, SegmentId,
+    SegmentRotor, StagingConfig, ZERO_FILL_HEAD_START, ZERO_FILL_SLICE_BYTES,
 };
+
+/// The rotor's checked geometry: a staging ring no larger than one segment,
+/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
+/// rule, ADR-0191).
+fn geometry(segment: SegmentConfig) -> LogGeometry {
+    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
+    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
+}
 
 /// 64 KiB segments: the quarter bound is four aligned frames, the eighth
 /// two — wide enough that a wait can end either way.
@@ -59,8 +67,9 @@ impl Lab {
         let disk = SimDisk::new();
         let dir = PathBuf::from("log");
         disk.create_dir_all(&dir).expect("dir");
-        let rotor = SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), cfg(prealloc))
-            .expect("fresh");
+        let rotor =
+            SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), geometry(cfg(prealloc)))
+                .expect("fresh");
         Lab { disk, dir, rotor, seq: 0 }
     }
 
@@ -255,7 +264,8 @@ fn the_fallbacks_zero_fill_is_paced_from_its_origin_and_completes_before_rotatio
     let dir = PathBuf::from("log");
     disk.create_dir_all(&dir).expect("dir");
     let cfg = SegmentConfig { segment_bytes, ..cfg(quarter()) };
-    let rotor = SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), cfg).expect("fresh");
+    let rotor = SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), geometry(cfg))
+        .expect("fresh");
     let mut lab = Lab { disk, dir, rotor, seq: 0 };
     assert!(lab.maintain());
     assert_eq!(lab.rotate(), SegmentId(1));
@@ -319,7 +329,7 @@ fn a_recovered_prezeroed_tail_preallocates_at_once_then_waits_from_its_second_ge
     let rotor = SegmentRotor::open_existing(
         lab.disk.clone(),
         lab.dir.clone(),
-        cfg(quarter()),
+        geometry(cfg(quarter())),
         &scan,
         tail_end,
     )
@@ -344,8 +354,8 @@ fn a_packed_tail_reopened_buffered_never_waits() {
     disk.create_dir_all(&dir).expect("dir");
     let buffered = SegmentConfig { io_mode: SegmentIoMode::Buffered, ..cfg(quarter()) };
     let packed_end = {
-        let mut rotor =
-            SegmentRotor::create_fresh(disk.clone(), dir.clone(), buffered).expect("fresh");
+        let mut rotor = SegmentRotor::create_fresh(disk.clone(), dir.clone(), geometry(buffered))
+            .expect("fresh");
         let mut b = FrameBuilder::new();
         b.append(&record());
         let slot = rotor.begin_frame(b.frame_len(), 0).expect("reserve");
@@ -355,9 +365,14 @@ fn a_packed_tail_reopened_buffered_never_waits() {
     };
     assert!(!packed_end.is_multiple_of(FRAME_ALIGN));
     let scan = inf_log::scan_log_dir(&disk, &dir).expect("scan");
-    let rotor =
-        SegmentRotor::open_existing(disk.clone(), dir.clone(), cfg(quarter()), &scan, packed_end)
-            .expect("reopen");
+    let rotor = SegmentRotor::open_existing(
+        disk.clone(),
+        dir.clone(),
+        geometry(cfg(quarter())),
+        &scan,
+        packed_end,
+    )
+    .expect("reopen");
     let mut lab = Lab { disk, dir, rotor, seq: 1 };
     assert_eq!(lab.rotor.active_io_mode(), SegmentIoMode::Buffered);
     assert!(lab.maintain(), "not pre-zeroed: the next segment is created at once");
@@ -387,8 +402,8 @@ fn time_sealing_rotors_never_wait() {
     let dir = PathBuf::from("log");
     disk.create_dir_all(&dir).expect("dir");
     let timed = SegmentConfig { seal_after_ms: Some(1_000), ..cfg(quarter()) };
-    let rotor =
-        SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), timed).expect("fresh");
+    let rotor = SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), geometry(timed))
+        .expect("fresh");
     let mut lab = Lab { disk, dir, rotor, seq: 0 };
     lab.warm();
     assert!(lab.maintain(), "time-sealed: immediate");

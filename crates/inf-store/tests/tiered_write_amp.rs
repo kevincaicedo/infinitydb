@@ -30,7 +30,7 @@
 use inf_log::flush::unlink_tier_file;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
+    LogGeometry, MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
     TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, create_cell_dirs, tier_extract,
     tier_frame_offset, tier_frame_span,
 };
@@ -126,18 +126,18 @@ impl Rig {
             0,
             &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
-        let rotor = SegmentRotor::create_fresh(
-            fs.clone(),
-            dirs.log,
+        let geometry = LogGeometry::new(
+            StagingConfig::default(),
             SegmentConfig { segment_bytes: 8 << 20, ..Default::default() },
         )
-        .expect("fresh log");
+        .expect("geometry");
+        let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry).expect("fresh log");
         Rig {
             table,
             fs,
             flush,
             rotor,
-            ring: StagingRing::new(StagingConfig::default()),
+            ring: StagingRing::new(geometry),
             relocated_bytes: 0,
             relocated_records: 0,
             frame_bytes: 0,

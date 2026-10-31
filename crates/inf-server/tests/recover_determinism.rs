@@ -68,8 +68,8 @@ fn build_crashed_image(fs: &MemFs, seed: u64, ops: usize, ckpts: u32, tear: bool
     let config = cfg();
     let dirs = create_cell_dirs(fs, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     let mut rng = Rng(seed | 1);
     let mut model: Model = BTreeMap::new();
     let mut pending: Vec<inf_log::StagedAt> = Vec::new();

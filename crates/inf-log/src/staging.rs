@@ -34,10 +34,10 @@ use core::fmt;
 
 use crate::effect::MutationEffect;
 use crate::frame::{
-    DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_TRAILER_LEN, FrameBuilder,
-    FrameLayout, FrameStamp,
+    FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_TRAILER_LEN, FrameBuilder, FrameLayout, FrameStamp,
 };
 use crate::fs::{SegmentFs, SegmentIoMode};
+use crate::geometry::LogGeometry;
 use crate::lsn::Lsn;
 use crate::segment::{LogError, SegmentRotor};
 
@@ -48,7 +48,7 @@ pub const DEFAULT_STAGING_BYTES: u32 = 4 << 20;
 
 /// Largest legal `frames_in_flight` (ADR-0087 D1): beyond ~4 the device
 /// queue, not the cell, is the bound. The staging ring holds at most this
-/// many frames in flight (its construction refuses more), and the fsync
+/// many frames in flight (its geometry refuses more), and the fsync
 /// ledger's frame queue asserts it at `note_frame_queued`, where each frame
 /// in flight carries its lease, submit time and barrier; the queue's own
 /// cap, `REORDER_WINDOW_FRAMES`, is twice this — never a growing queue.
@@ -122,11 +122,16 @@ pub struct StagingConfig {
 
 impl Default for StagingConfig {
     fn default() -> Self {
-        StagingConfig { capacity_bytes: DEFAULT_STAGING_BYTES, frames_in_flight: 1 }
+        StagingConfig::DEFAULT
     }
 }
 
 impl StagingConfig {
+    /// The shipped staging domain: 4 MiB buffers, one frame in flight (the
+    /// M2-S03 pair).
+    pub const DEFAULT: StagingConfig =
+        StagingConfig { capacity_bytes: DEFAULT_STAGING_BYTES, frames_in_flight: 1 };
+
     /// A configuration with `capacity_bytes` and the default pipeline
     /// depth of one frame in flight (the M2-S03 pair).
     #[must_use]
@@ -316,26 +321,14 @@ impl StagingRing {
     /// the log-staging domain — L5; the slack is what makes a sealed frame
     /// a legal `O_DIRECT` source, ADR-0086 D6). This is cell construction,
     /// the one allowed allocation point; the append path never allocates
-    /// again.
-    ///
-    /// # Panics
-    /// If `capacity_bytes` cannot hold a minimal frame or exceeds
-    /// [`DEFAULT_MAX_FRAME_LEN`] (every written frame must be readable by
-    /// a default-configured reader), or `frames_in_flight` is outside
-    /// `1..=MAX_FRAMES_IN_FLIGHT` — boot-configuration invariants.
+    /// again. The ring is built from a checked [`LogGeometry`] only, whose
+    /// constructor holds the capacity within one minimal frame and the
+    /// frame decoder's bound, and the depth within
+    /// `1..=MAX_FRAMES_IN_FLIGHT` (ADR-0191 D1, D3), so there is nothing
+    /// left to refuse here.
     #[must_use]
-    pub fn new(cfg: StagingConfig) -> StagingRing {
-        let min = (FRAME_HEADER_LEN + FRAME_TRAILER_LEN + 4) as u32;
-        assert!(cfg.capacity_bytes >= min, "staging capacity below one minimal frame");
-        assert!(
-            cfg.capacity_bytes <= DEFAULT_MAX_FRAME_LEN,
-            "staging capacity exceeds the frame decoder bound"
-        );
-        assert!(cfg.frames_in_flight >= 1, "at least one frame in flight");
-        assert!(
-            cfg.frames_in_flight <= MAX_FRAMES_IN_FLIGHT,
-            "frames in flight is bounded — never a queue"
-        );
+    pub fn new(geometry: LogGeometry) -> StagingRing {
+        let cfg = geometry.staging();
         let capacity = cfg.capacity_bytes as usize;
         let buffers = usize::from(cfg.frames_in_flight) + 1;
         let bufs = (0..buffers).map(|_| FrameBuilder::with_capacity(capacity)).collect();
@@ -644,6 +637,7 @@ mod frames_in_flight_tests {
             capacity_bytes: 64 << 10,
             frames_in_flight: FramesInFlight::Auto.resolve(SegmentIoMode::Direct),
         };
-        assert_eq!(StagingRing::new(cfg).frames_in_flight(), 3);
+        let geometry = LogGeometry::with_staging(cfg).expect("a 64 KiB ring of depth 3");
+        assert_eq!(StagingRing::new(geometry).frames_in_flight(), 3);
     }
 }

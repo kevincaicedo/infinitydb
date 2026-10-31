@@ -89,8 +89,8 @@ struct Log<F: SegmentFs> {
 impl<F: SegmentFs + Clone> Log<F> {
     fn new(fs: &F, cfg: &DurableConfig) -> Log<F> {
         let dirs = create_cell_dirs(fs, &cfg.data_dir.join(format!("shard-{CELL}"))).expect("dirs");
-        let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg.segment).expect("rotor");
-        Log { rotor, ring: StagingRing::new(cfg.staging) }
+        let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg.geometry).expect("rotor");
+        Log { rotor, ring: StagingRing::new(cfg.geometry) }
     }
 
     fn frame(&mut self, records: &[MutationEffect<'_>]) {

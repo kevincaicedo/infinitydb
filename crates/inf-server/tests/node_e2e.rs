@@ -741,12 +741,15 @@ impl Node {
                     }
                     let cfg = inf_server::DurableConfig {
                         data_dir: dir.clone(),
-                        staging: staging.unwrap_or_default(),
-                        segment: inf_log::SegmentConfig {
-                            segment_bytes: 8 << 20, // small: tests rotate
-                            io_mode,
-                            ..Default::default()
-                        },
+                        geometry: inf_log::LogGeometry::new(
+                            staging.unwrap_or_default(),
+                            inf_log::SegmentConfig {
+                                segment_bytes: 8 << 20, // small: tests rotate
+                                io_mode,
+                                ..Default::default()
+                            },
+                        )
+                        .expect("the node's log geometry"),
                         ckpt: ckpt.config(),
                         recover,
                         flush_bound: 1,

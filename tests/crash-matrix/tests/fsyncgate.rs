@@ -87,8 +87,7 @@ fn start_node(
         }
         let cfg = inf_server::DurableConfig {
             data_dir: dir,
-            staging: inf_log::StagingConfig::default(),
-            segment: inf_log::SegmentConfig::default(),
+            geometry: inf_log::LogGeometry::default(),
             ckpt: inf_log::CkptConfig { interval_bytes: 0, ..Default::default() },
             recover: Default::default(),
             flush_bound: 1,

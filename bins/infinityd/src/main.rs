@@ -137,6 +137,9 @@ struct Args {
     /// never refuses — it is a pacing point — so this is a latency/memory
     /// trade (resident = 2 × capacity × cells), and shrinking it is the
     /// deliberate way to provoke the pressure regime on a healthy device.
+    /// A segment holds at least one buffer's frame: `--segment-bytes` is at
+    /// least `--log-staging-mib` × 2²⁰ (and under the fua class a multiple
+    /// of 4096), or the node refuses to start before it listens (ADR-0191).
     log_staging_mib: u32,
     /// The graceful stop's bound per cell (ADR-0124 D3; Redis's
     /// `shutdown-timeout` is 10 s). Past it the node exits 1.
@@ -727,6 +730,35 @@ fn check_block_size(props: &inf_server::IoProperties) -> Result<(), String> {
     Ok(())
 }
 
+/// The boot's refusal of a log geometry (ADR-0191 D3): one stderr line
+/// naming both flags, the type's sentence and the move that makes the pair
+/// legal, then exit 2, the usage-error contract of the boot flags. It runs
+/// before any cell, pool or mesh exists and before the node listens.
+/// `floor` is the largest frame the staging ring seals under the class.
+fn refuse_log_geometry(refused: inf_server::LogGeometryError, floor: u32) -> ! {
+    use inf_server::LogGeometryError;
+    let fix = match refused {
+        LogGeometryError::SegmentBelowFrame { frame_bytes, .. } => {
+            format!("raise --segment-bytes to at least {frame_bytes}, or lower --log-staging-mib")
+        }
+        LogGeometryError::SegmentNotAligned { align, .. } => {
+            format!("make --segment-bytes a multiple of {align} of at least {floor}")
+        }
+        LogGeometryError::StagingBelowMinimalFrame { .. }
+        | LogGeometryError::StagingAboveDecoderBound { .. } => {
+            format!(
+                "give --log-staging-mib a value in 1..={}",
+                inf_server::DEFAULT_MAX_FRAME_LEN >> 20
+            )
+        }
+        LogGeometryError::FramesInFlightOutOfRange { max, .. } => {
+            format!("give --frames-in-flight auto or a value in 1..={max}")
+        }
+    };
+    eprintln!("infinityd: --segment-bytes/--log-staging-mib: {refused}; {fix}");
+    std::process::exit(2);
+}
+
 fn short_uuid(uuid: &str) -> String {
     if uuid.is_empty() {
         "(no uuid)".to_owned()
@@ -1046,17 +1078,29 @@ fn main() {
                 seal_barriers_per_s / u64::from(args.cells.get())
             );
         }
-        if args.segment_bytes % inf_server::FRAME_ALIGN != 0
-            && io.io_mode == inf_server::SegmentIoMode::Direct
-        {
-            eprintln!(
-                "infinityd: --segment-bytes {} is not a multiple of {} — required by the fua class",
-                args.segment_bytes,
-                inf_server::FRAME_ALIGN
-            );
-            std::process::exit(1);
-        }
-        let boot = (dir, catalog, control, io, seal_barriers_per_s, frames_in_flight, provenance);
+        // ADR-0191 D3: the log's geometry is judged here, where the class
+        // is known, before any cell, pool or mesh exists and before the
+        // node listens. Every cell's ring and rotor are built from it.
+        let staging = inf_server::StagingConfig {
+            capacity_bytes: args.log_staging_mib << 20,
+            frames_in_flight,
+        };
+        let segment = inf_server::SegmentConfig {
+            segment_bytes: args.segment_bytes,
+            io_mode: io.io_mode,
+            fua_max_frame_bytes: io.fua_max_frame_bytes,
+            recycle_slots: args.segment_recycle_slots,
+            prealloc: args.recycle_wait,
+            ..Default::default()
+        };
+        let geometry = match inf_server::LogGeometry::new(staging, segment) {
+            Ok(geometry) => geometry,
+            Err(refused) => refuse_log_geometry(
+                refused,
+                inf_server::max_sealed_frame_bytes(staging, io.io_mode),
+            ),
+        };
+        let boot = (dir, catalog, control, io, seal_barriers_per_s, geometry, provenance);
         (boot, ckpt_issuers)
     });
     // Each cell takes its own checkpoint allowance (ADR-0159 A1.2). The
@@ -1192,8 +1236,10 @@ type Boot = Option<(
     inf_server::IoProperties,
     // The seal pacer's device rate (ADR-0088 D2b arm; 0 = off).
     u64,
-    // K, resolved from the barrier class at boot (ADR-0087 D5 as amended).
-    u8,
+    // The log's checked geometry: the staging ring of K buffers, K resolved
+    // from the barrier class at boot (ADR-0087 D5 as amended), beside the
+    // segment (ADR-0191 D3).
+    inf_server::LogGeometry,
     inf_server::IoProvenance,
 )>;
 
@@ -1302,26 +1348,13 @@ fn cell_main(
     mark(14); // setup:keyspace
     let mut ks = Keyspace::new(StoreConfig { hasher, ..StoreConfig::default() });
     let mut durable = None;
-    if let Some((dir, catalog, control, io, seal_barriers_per_s, frames_in_flight, provenance)) =
-        &boot
-    {
+    if let Some((dir, catalog, control, io, seal_barriers_per_s, geometry, provenance)) = &boot {
         if let Some(catalog) = catalog {
             ks.seed_catalog(catalog).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         }
         let cfg = inf_server::DurableConfig {
             data_dir: dir.clone(),
-            staging: inf_server::StagingConfig {
-                capacity_bytes: args.log_staging_mib << 20,
-                frames_in_flight: *frames_in_flight,
-            },
-            segment: inf_server::SegmentConfig {
-                segment_bytes: args.segment_bytes,
-                io_mode: io.io_mode,
-                fua_max_frame_bytes: io.fua_max_frame_bytes,
-                recycle_slots: args.segment_recycle_slots,
-                prealloc: args.recycle_wait,
-                ..Default::default()
-            },
+            geometry: *geometry,
             // ADR-0088 D4 as amended twice (M4.5-S34 campaign M3; the
             // second amendment): the cap's replay term is `min(qd1, qd4 ÷
             // cells)` when the model carries both read rows, `qd4 ÷

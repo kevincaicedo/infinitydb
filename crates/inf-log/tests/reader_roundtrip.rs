@@ -11,8 +11,8 @@ use inf_log::FrameLayout;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    FRAME_HEADER_LEN, FrameBuilder, FrameDecodeError, FrameStamp, Lsn, MutationEffect, NsId,
-    ReadEnd, ReadError, ReaderConfig, RecordView, SegmentConfig, SegmentId, SegmentReader,
+    FRAME_HEADER_LEN, FrameBuilder, FrameDecodeError, FrameStamp, LogGeometry, Lsn, MutationEffect,
+    NsId, ReadEnd, ReadError, ReaderConfig, RecordView, SegmentConfig, SegmentId, SegmentReader,
     SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir, segment_file_name,
 };
 use proptest::prelude::*;
@@ -24,10 +24,22 @@ fn stamp(seq: u64) -> FrameStamp {
     FrameStamp { epoch: 1, seq, covered_lsn: 0 }
 }
 
-fn mem_rotor(fs: &MemFs, segment_bytes: u32) -> (SegmentRotor<MemFs>, PathBuf) {
-    let dirs = create_cell_dirs(fs, &PathBuf::from("data/shard-0")).expect("dirs");
+/// The log of `segment_bytes` segments a staging ring of `capacity_bytes`
+/// writes into, as one checked geometry.
+fn geometry(capacity_bytes: u32, segment_bytes: u32) -> LogGeometry {
     let cfg = SegmentConfig { segment_bytes, ..Default::default() };
-    let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg).expect("rotor");
+    LogGeometry::new(StagingConfig::with_capacity(capacity_bytes), cfg).expect("the log geometry")
+}
+
+/// A rotor of `segment_bytes` segments; a hand-built frame never passes
+/// one segment (a ring of the segment's size, the harness rule).
+fn mem_rotor(fs: &MemFs, segment_bytes: u32) -> (SegmentRotor<MemFs>, PathBuf) {
+    mem_log(fs, geometry(segment_bytes, segment_bytes))
+}
+
+fn mem_log(fs: &MemFs, geometry: LogGeometry) -> (SegmentRotor<MemFs>, PathBuf) {
+    let dirs = create_cell_dirs(fs, &PathBuf::from("data/shard-0")).expect("dirs");
+    let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), geometry).expect("rotor");
     (rotor, dirs.log)
 }
 
@@ -84,8 +96,9 @@ impl Rng {
 #[test]
 fn million_random_writes_replay_byte_identically() {
     let fs = MemFs::new();
-    let (mut rotor, log_dir) = mem_rotor(&fs, 1 << 20);
-    let mut ring = StagingRing::new(StagingConfig::with_capacity(64 << 10));
+    let geometry = geometry(64 << 10, 1 << 20);
+    let (mut rotor, log_dir) = mem_log(&fs, geometry);
+    let mut ring = StagingRing::new(geometry);
     let mut rng = Rng(0x1AF1_D8A5_0DB5_EED1);
 
     const TOTAL: usize = 1_000_000;
@@ -183,8 +196,9 @@ proptest! {
         chunk in 64usize..2048,
     ) {
         let fs = MemFs::new();
-        let (mut rotor, log_dir) = mem_rotor(&fs, segment_bytes.max(1024));
-        let mut ring = StagingRing::new(StagingConfig::with_capacity(512));
+        let geometry = geometry(512, segment_bytes.max(1024));
+        let (mut rotor, log_dir) = mem_log(&fs, geometry);
+        let mut ring = StagingRing::new(geometry);
 
         let mut expected: Vec<(Lsn, Vec<u8>)> = Vec::new();
         let mut pending = Vec::new();
@@ -403,7 +417,7 @@ fn read_end_feeds_open_existing_round_trip() {
     let fs = MemFs::new();
     let (mut rotor, log_dir) = mem_rotor(&fs, 4096);
     write_frame(&mut rotor, &[RecordView::Delete { ns: NsId(1), key: b"pre" }]);
-    let cfg = SegmentConfig { segment_bytes: 4096, ..Default::default() };
+    let cfg = geometry(4096, 4096);
     drop(rotor);
 
     let scan = scan_log_dir(&fs, &log_dir).expect("scan");

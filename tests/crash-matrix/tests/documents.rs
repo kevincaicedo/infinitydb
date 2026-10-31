@@ -16,8 +16,8 @@ use inf_log::fs::sim::{SimDisk, SimDiskConfig};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
     CkptConfig, DocLineage, FRAME_HEADER_LEN, Lsn, Manifest, MutationEffect, NsId, RecordView,
-    SegmentConfig, SegmentId, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs,
-    segment_file_name, write_manifest,
+    SegmentConfig, SegmentId, SegmentRotor, StagingRing, create_cell_dirs, segment_file_name,
+    write_manifest,
 };
 use inf_server::{DurableConfig, RecoverStats, open_cell_log};
 use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
@@ -37,8 +37,7 @@ fn matrix_path() -> PathBuf {
 fn config(segment_bytes: u32) -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes, ..Default::default() },
+        geometry: crash_matrix::geometry(SegmentConfig { segment_bytes, ..Default::default() }),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -130,8 +129,8 @@ impl<F: SegmentFs + Clone> LogBuilder<F> {
     fn new(fs: F, cfg: &DurableConfig) -> LogBuilder<F> {
         let dirs = create_cell_dirs(&fs, Path::new(SHARD_DIR)).expect("cell directories");
         let rotor =
-            SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.segment).expect("rotor");
-        LogBuilder { fs, rotor, ring: StagingRing::new(cfg.staging), log_dir: dirs.log }
+            SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.geometry).expect("rotor");
+        LogBuilder { fs, rotor, ring: StagingRing::new(cfg.geometry), log_dir: dirs.log }
     }
 
     /// Appends exactly one frame. `covered_lsn` is the preceding fsync

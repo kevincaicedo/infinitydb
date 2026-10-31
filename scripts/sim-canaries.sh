@@ -525,6 +525,11 @@ rows=(
   # The owner tags an error reply `Bytes` on the fabric: the counted fold
   # takes the leg's error for a non-count success.
   "inf_canary_fabric_error_as_bytes crate-test inf-server lib reply_outcome_dbsize_drain_error_is_the_reply"
+  # ADR-0191 D1: a segment holds the largest frame its staging ring can
+  # seal. Planted, the geometry skips that row: the pair the simulator
+  # first met (4 MiB of staging beside 64 KiB segments) is built, and the
+  # geometry's own oracle reads the missing refusal.
+  "inf_canary_log_geometry_unchecked crate-test inf-log test:geometry segment_below_the_largest_frame_is_refused expected SegmentBelowFrame"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

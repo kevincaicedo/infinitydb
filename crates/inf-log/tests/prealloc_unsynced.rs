@@ -11,9 +11,18 @@ use inf_foundation::FileOffset;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode};
 use inf_log::{
-    DEFAULT_MAX_FRAME_LEN, FrameBuilder, FrameIter, FrameLayout, FrameStamp, NsId, RecordView,
-    SegmentConfig, SegmentId, SegmentRotor, scan_log_dir,
+    DEFAULT_MAX_FRAME_LEN, DEFAULT_STAGING_BYTES, FrameBuilder, FrameIter, FrameLayout, FrameStamp,
+    LogGeometry, NsId, RecordView, SegmentConfig, SegmentId, SegmentRotor, StagingConfig,
+    scan_log_dir,
 };
+
+/// The rotor's checked geometry: a staging ring no larger than one segment,
+/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
+/// rule, ADR-0191).
+fn geometry(segment: SegmentConfig) -> LogGeometry {
+    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
+    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
+}
 
 const SEGMENT_BYTES: u32 = 64 << 10;
 
@@ -56,8 +65,8 @@ fn deferred_prealloc_reboots_short_and_reopens_as_the_empty_tail() {
     let disk = SimDisk::new();
     let dir = PathBuf::from("log");
     disk.create_dir_all(&dir).expect("dir");
-    let mut rotor =
-        SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), cfg()).expect("fresh");
+    let mut rotor = SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), geometry(cfg()))
+        .expect("fresh");
     frame(&mut rotor, &disk, 1);
     frame(&mut rotor, &disk, 2);
     let fd = rotor.active_raw_fd().expect("fd");
@@ -75,8 +84,9 @@ fn deferred_prealloc_reboots_short_and_reopens_as_the_empty_tail() {
 
     let scan = scan_log_dir(&disk, &dir).expect("scan");
     assert_eq!(scan.segments(), &[SegmentId(0), SegmentId(1)]);
-    let mut rotor = SegmentRotor::open_existing(disk.clone(), dir.clone(), cfg(), &scan, 0)
-        .expect("the short tail reopens");
+    let mut rotor =
+        SegmentRotor::open_existing(disk.clone(), dir.clone(), geometry(cfg()), &scan, 0)
+            .expect("the short tail reopens");
     assert_eq!(rotor.active_segment(), SegmentId(1));
     frame(&mut rotor, &disk, 3);
     let fd = rotor.active_raw_fd().expect("fd");

@@ -9,9 +9,17 @@ use inf_foundation::FileOffset;
 use inf_log::fs::sim::{DeviceFault, SimDisk};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    FrameBuilder, FrameLayout, FrameStamp, NsId, ReadError, ReaderConfig, RecordView,
-    SegmentConfig, SegmentId, SegmentReader, SegmentRotor,
+    DEFAULT_STAGING_BYTES, FrameBuilder, FrameLayout, FrameStamp, LogGeometry, NsId, ReadError,
+    ReaderConfig, RecordView, SegmentConfig, SegmentId, SegmentReader, SegmentRotor, StagingConfig,
 };
+
+/// The rotor's checked geometry: a staging ring no larger than one segment,
+/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
+/// rule, ADR-0191).
+fn geometry(segment: SegmentConfig) -> LogGeometry {
+    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
+    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
+}
 
 fn eio(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(libc::EIO)
@@ -85,7 +93,8 @@ fn recovery_read_eio_is_typed_never_a_torn_tail() {
     let dir = PathBuf::from("log");
     disk.create_dir_all(&dir).expect("dir");
     let cfg = SegmentConfig { segment_bytes: 64 << 10, ..Default::default() };
-    let mut rotor = SegmentRotor::create_fresh(disk.clone(), dir.clone(), cfg).expect("fresh");
+    let mut rotor =
+        SegmentRotor::create_fresh(disk.clone(), dir.clone(), geometry(cfg)).expect("fresh");
     for n in 0..8u8 {
         let mut builder = FrameBuilder::new();
         builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: &[n; 300] });

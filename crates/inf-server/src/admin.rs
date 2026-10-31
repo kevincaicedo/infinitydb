@@ -1861,12 +1861,12 @@ mod tests {
     /// averaged away.
     #[test]
     fn info_tiering_reports_write_amplification_per_namespace() {
-        use inf_log::{MutationEffect, StagingConfig, StagingRing};
+        use inf_log::{LogGeometry, MutationEffect, StagingRing};
         use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
-        let mut ring = StagingRing::new(StagingConfig::default());
+        let mut ring = StagingRing::new(LogGeometry::default());
         for id in [7u32, 9u32] {
             let ns = NsId(id);
             let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);

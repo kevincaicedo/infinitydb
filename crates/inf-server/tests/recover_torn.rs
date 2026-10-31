@@ -15,7 +15,8 @@ use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
     FRAME_HEADER_LEN, FrameBuilder, FrameStamp, Lsn, Manifest, MutationEffect, RecordView,
-    SegmentId, SegmentRotor, StagingRing, create_cell_dirs, segment_file_name, write_manifest,
+    SegmentConfig, SegmentId, SegmentRotor, StagingRing, create_cell_dirs, segment_file_name,
+    write_manifest,
 };
 use inf_server::{DurableConfig, open_cell_log};
 
@@ -67,7 +68,7 @@ fn resume_over_remnants_then_recover_again_is_clean() {
     // The cell keeps writing over the remnant region through the
     // recovered rotor (a smaller frame than the remnant), under the
     // recovery-derived life — the assembly wiring ADR-0031 D6 requires.
-    let mut ring = StagingRing::new(config.staging);
+    let mut ring = StagingRing::new(config.geometry);
     ring.set_frame_epoch(rotor.resume_epoch());
     let at = ring
         .stage(&MutationEffect::StringSet { ns: NS, key: b"post", value: b"torn" })
@@ -120,8 +121,8 @@ fn sealed_volume_with_a_corrupt_frame(
 ) -> (Lsn, Vec<Lsn>) {
     let dirs = create_cell_dirs(fs, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     let mut frame_bases: Vec<Lsn> = Vec::new();
     for i in 0..20u32 {
         let key = format!("k:{i}");
@@ -153,8 +154,7 @@ fn unattested_hole_in_a_sealed_segment_truncates_and_discards_later_segments() {
     // there, discards every later segment unreplayed, and resumes — the
     // availability refusal ADR-0086 recorded is gone.
     let fs = MemFs::new();
-    let mut config = cfg();
-    config.segment.segment_bytes = 256;
+    let config = cfg_with(SegmentConfig { segment_bytes: 256, ..Default::default() });
     let (victim, frame_bases) = sealed_volume_with_a_corrupt_frame(&fs, &config, 1);
     assert!(victim.offset > 0, "a mid-segment hole: the segment keeps its own prefix");
 
@@ -201,8 +201,7 @@ fn unattested_hole_at_a_sealed_segments_first_frame_resumes_in_the_previous_segm
     // hole's segment is removed like any trailing one (the pristine
     // prealloc invariant, as for a torn tail).
     let fs = MemFs::new();
-    let mut config = cfg();
-    config.segment.segment_bytes = 256;
+    let config = cfg_with(SegmentConfig { segment_bytes: 256, ..Default::default() });
     let (victim, frame_bases) = sealed_volume_with_a_corrupt_frame(&fs, &config, 0);
     assert_eq!(victim.offset, 0);
     let previous_end = data_end_of(
@@ -244,8 +243,7 @@ fn attested_hole_in_a_sealed_segment_refuses_to_start() {
     // in a later segment attests coverage past the corrupted one — the
     // device lost covered data, and boot refuses naming segment 1.
     let fs = MemFs::new();
-    let mut config = cfg();
-    config.segment.segment_bytes = 256;
+    let config = cfg_with(SegmentConfig { segment_bytes: 256, ..Default::default() });
     let mut log = LogBuilder::new(&fs, &config);
     let mut bases = Vec::new();
     for i in 0..20u32 {
@@ -413,12 +411,11 @@ fn garbage_in_sealed_slack_is_tolerated_and_counted() {
     // It must never fail-stop (that would poison every boot after a
     // benign torn tail) — but it is counted, never silent.
     let fs = MemFs::new();
-    let mut config = cfg();
-    config.segment.segment_bytes = 256;
+    let config = cfg_with(SegmentConfig { segment_bytes: 256, ..Default::default() });
     let dirs = create_cell_dirs(&fs, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     let mut seg0_end = 0u32;
     for i in 0..12u32 {
         let key = format!("k:{i}");

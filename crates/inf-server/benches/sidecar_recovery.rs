@@ -37,9 +37,9 @@ use inf_foundation::time::Nanos;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
-    CkptConfig, DocLineage, IdxSidecarMeta, Manifest, MutationEffect, NsId, RecordView,
-    SegmentConfig, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, segment_file_name,
-    write_manifest,
+    CkptConfig, DocLineage, IdxSidecarMeta, LogGeometry, Manifest, MutationEffect, NsId,
+    RecordView, SegmentConfig, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs,
+    segment_file_name, write_manifest,
 };
 use inf_server::{DurableConfig, open_cell_log};
 use inf_store::{
@@ -67,8 +67,11 @@ fn env_u64(name: &str, default: u64) -> u64 {
 fn cfg(data_dir: PathBuf) -> DurableConfig {
     DurableConfig {
         data_dir,
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 64 << 20, ..Default::default() },
+        geometry: LogGeometry::new(
+            StagingConfig::default(),
+            SegmentConfig { segment_bytes: 64 << 20, ..Default::default() },
+        )
+        .expect("the bench's log geometry"),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -135,8 +138,8 @@ fn build_shard(data_dir: &Path, docs: u64, sidecars: bool) -> u64 {
     let config = cfg(data_dir.to_path_buf());
     let dirs = create_cell_dirs(&fs, &shard).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(fs, dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(fs, dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     let mut parser = JsonParser::new();
     let pad = "x".repeat(PAD);
     ring.stage(&MutationEffect::CkptBegin { ckpt_id: 1 }).expect("stage");

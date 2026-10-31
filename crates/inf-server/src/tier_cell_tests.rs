@@ -1156,7 +1156,10 @@ fn marks_fixture() -> (TierCell<MemFs>, Keyspace) {
 /// WAL epoch moves), with the watermark held; returns the marks held.
 fn tick_marks(class_of: fn(u64, u64) -> AckClass, ticks: u64) -> (TierCell<MemFs>, usize) {
     let (mut cell, mut ks) = marks_fixture();
-    let mut ring = inf_log::StagingRing::new(inf_log::StagingConfig::with_capacity(1 << 20));
+    let geometry =
+        inf_log::LogGeometry::with_staging(inf_log::StagingConfig::with_capacity(1 << 20))
+            .expect("a 1 MiB ring");
+    let mut ring = inf_log::StagingRing::new(geometry);
     for staged in 1..=ticks {
         let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
         table

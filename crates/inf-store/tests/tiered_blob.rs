@@ -28,7 +28,7 @@ use inf_log::blob::{
 use inf_log::fs::mem::MemFs;
 use inf_log::tier::{TIER_FRAME_BYTES, tier_extract, tier_frame_offset, tier_frame_span};
 use inf_log::{
-    CkptConfig, Lsn, MutationEffect, NsId, RecordView, SegmentId, StagingConfig, StagingRing,
+    CkptConfig, LogGeometry, Lsn, MutationEffect, NsId, RecordView, SegmentId, StagingRing,
     SyncIckWriter, TierFlush, TierFlushConfig, TierIoMode, write_manifest,
 };
 use inf_store::KeyHasher;
@@ -128,7 +128,7 @@ impl Rig {
             fs,
             table,
             flush,
-            ring: StagingRing::new(StagingConfig::default()),
+            ring: StagingRing::new(LogGeometry::default()),
             tail: Vec::new(),
             model: BTreeMap::new(),
             ckpt_id: 0,
@@ -152,7 +152,7 @@ impl Rig {
         if self.table.stage_wal(&mut self.ring, effect).is_err() {
             // The modeled tail is the durable record; the ring is only
             // the staging admission — recycle it wholesale.
-            self.ring = StagingRing::new(StagingConfig::default());
+            self.ring = StagingRing::new(LogGeometry::default());
             self.table.stage_wal(&mut self.ring, effect).expect("a fresh ring has room");
         }
     }

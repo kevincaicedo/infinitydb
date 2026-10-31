@@ -64,7 +64,7 @@ use inf_foundation::time::Nanos;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFs, SegmentIoMode};
 use inf_log::{
-    FRAME_ALIGN, FsyncClass, GroupCommit, MutationEffect, SegmentConfig, SegmentRotor,
+    FRAME_ALIGN, FsyncClass, GroupCommit, LogGeometry, MutationEffect, SegmentConfig, SegmentRotor,
     StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES, create_cell_dirs,
 };
 use inf_log::{FrameBarrier, FrameId, FramePlan, Lsn};
@@ -95,6 +95,13 @@ struct Rig {
     seq: u32,
 }
 
+/// The rig's ring: 16 KiB buffers, four frames in flight, beside the
+/// rig's 64 KiB segments.
+fn rig_geometry(segment: SegmentConfig) -> LogGeometry {
+    let staging = StagingConfig { capacity_bytes: 16 << 10, frames_in_flight: 4 };
+    LogGeometry::new(staging, segment).expect("the rig's log geometry")
+}
+
 fn direct_cfg() -> SegmentConfig {
     SegmentConfig {
         segment_bytes: SEGMENT_BYTES,
@@ -116,12 +123,13 @@ impl Rig {
     fn new() -> Rig {
         let disk = SimDisk::new();
         let dirs = create_cell_dirs(&disk, Path::new("data/shard-0")).expect("dirs");
-        let rotor = SegmentRotor::create_fresh_deferred(disk.clone(), dirs.log, direct_cfg())
-            .expect("rotor");
+        let geometry = rig_geometry(direct_cfg());
+        let rotor =
+            SegmentRotor::create_fresh_deferred(disk.clone(), dirs.log, geometry).expect("rotor");
         let mut rig = Rig {
             disk,
             rotor,
-            ring: StagingRing::new(StagingConfig { capacity_bytes: 16 << 10, frames_in_flight: 4 }),
+            ring: StagingRing::new(geometry),
             commit: ledger(),
             model: BTreeMap::new(),
             frame_keys: Vec::new(),
@@ -140,8 +148,7 @@ impl Rig {
         model: BTreeMap<Vec<u8>, (Vec<u8>, bool)>,
         seq: u32,
     ) -> Rig {
-        let mut ring =
-            StagingRing::new(StagingConfig { capacity_bytes: 16 << 10, frames_in_flight: 4 });
+        let mut ring = StagingRing::new(rig_geometry(direct_cfg()));
         ring.set_frame_epoch(rotor.resume_epoch());
         Rig { disk, rotor, ring, commit: ledger(), model, frame_keys: Vec::new(), seq }
     }
@@ -307,8 +314,10 @@ fn recover_in(
     context: &str,
 ) -> (SegmentRotor<SimDisk>, inf_server::RecoverStats) {
     let mut ks = fresh_keyspace(FsyncClass::Always);
-    let mut cfg = config(SEGMENT_BYTES);
-    cfg.segment.io_mode = mode;
+    let segment =
+        SegmentConfig { segment_bytes: SEGMENT_BYTES, io_mode: mode, ..Default::default() };
+    let cfg =
+        inf_server::DurableConfig { geometry: rig_geometry(segment), ..config(SEGMENT_BYTES) };
     let (rotor, stats, _) =
         open_cell_log(disk.clone(), &mut ks, CELL, &cfg, anchor(), now()).expect("recovers");
     let store = ks.ns_store_mut(NS).expect("ns");
@@ -546,7 +555,8 @@ fn flush_to_fua_transition_keeps_every_acked_record() {
             let dirs = create_cell_dirs(&disk, Path::new("data/shard-0")).expect("dirs");
             let cfg = SegmentConfig { segment_bytes: SEGMENT_BYTES, ..Default::default() };
             let rotor =
-                SegmentRotor::create_fresh_deferred(disk.clone(), dirs.log, cfg).expect("rotor");
+                SegmentRotor::create_fresh_deferred(disk.clone(), dirs.log, rig_geometry(cfg))
+                    .expect("rotor");
             let mut rig = Rig::recovered(disk.clone(), rotor, BTreeMap::new(), 0);
             for _ in 0..1 + rng.next_below(3) {
                 let (op, h) = rig.seal_frame(1 + rng.next_below(3) as u32);

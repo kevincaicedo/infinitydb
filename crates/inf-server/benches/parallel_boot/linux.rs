@@ -41,9 +41,9 @@ use inf_foundation::time::{Clock, StdClock};
 use inf_log::ckpt::{SyncIckWriter, ick_file_name};
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
-    CkptConfig, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentConfig, SegmentId,
-    SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir, segment_file_name,
-    write_manifest,
+    CkptConfig, LogGeometry, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentConfig,
+    SegmentId, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir,
+    segment_file_name, write_manifest,
 };
 use inf_runtime::net::listen_reuseport;
 use inf_runtime::{BackendDriver, CellLoop, LoopConfig, UringDriver};
@@ -100,8 +100,11 @@ fn value_of(i: u64, buf: &mut [u8; VALUE_LEN]) {
 fn durable_config(root: &Path) -> DurableConfig {
     DurableConfig {
         data_dir: root.to_path_buf(),
-        staging: StagingConfig::with_capacity(128 << 10),
-        segment: SegmentConfig { segment_bytes: 256 << 20, ..Default::default() },
+        geometry: LogGeometry::new(
+            StagingConfig::with_capacity(128 << 10),
+            SegmentConfig { segment_bytes: 256 << 20, ..Default::default() },
+        )
+        .expect("the bench's log geometry"),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -119,8 +122,8 @@ fn build_cell_image(root: &Path, cfg: &DurableConfig, cell: u16, records: u64) -
     let fs = StdSegmentFs;
     let shard = root.join(format!("shard-{cell}"));
     let dirs = create_cell_dirs(&fs, &shard).expect("dirs");
-    let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), cfg.segment).expect("rotor");
-    let mut ring = StagingRing::new(cfg.staging);
+    let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), cfg.geometry).expect("rotor");
+    let mut ring = StagingRing::new(cfg.geometry);
     let mut value = [0u8; VALUE_LEN];
     let mut staged = 0u64;
     let mut begin: Option<Lsn> = None;

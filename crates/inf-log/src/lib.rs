@@ -30,6 +30,7 @@ pub mod fault;
 pub mod flush;
 mod frame;
 pub mod fs;
+mod geometry;
 pub mod limits;
 mod lsn;
 pub mod manifest;
@@ -73,6 +74,7 @@ pub use frame::{
     RecordIter, align_up_frame, decode_frame, frame_header_len,
 };
 pub use fs::{SegmentIoMode, TierIoMode, is_storage_exhausted};
+pub use geometry::{LogGeometry, LogGeometryError, max_sealed_frame_bytes};
 pub use limits::{REORDER_WINDOW_FRAMES, WRITE_THROUGH_WINDOW_ENTRIES};
 pub use lsn::{Lsn, MAX_SEGMENT_LEN, SegmentId, check_segment_len};
 pub use manifest::{

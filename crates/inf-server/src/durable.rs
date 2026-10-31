@@ -27,9 +27,9 @@ use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::{
     BootDirs, FRAME_ALIGN, FillSource, FrameBarrier, FrameBuilder, FrameId, FramePlan, FsyncClass,
-    FsyncTicket, GroupCommit, Hold, IdxSidecarMeta, LedgerClass, Lsn, MutationEffect, NsId,
-    RecordView, SealPlan, SealedDisposal, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
-    ZERO_FILL_SLICE_BYTES, build_recycle_sentinel,
+    FsyncTicket, GroupCommit, Hold, IdxSidecarMeta, LedgerClass, LogGeometry, Lsn, MutationEffect,
+    NsId, RecordView, SealPlan, SealedDisposal, SegmentRotor, StagingRing, ZERO_FILL_SLICE_BYTES,
+    build_recycle_sentinel,
 };
 use inf_runtime::{
     ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass, IoOp, Issue,
@@ -92,8 +92,10 @@ pub(crate) const STAGING_OVERSIZED_ERROR: &str = "ERR write exceeds durable log 
 pub struct DurableConfig {
     /// Node data directory; cell `k` owns `<data_dir>/shard-k/`.
     pub data_dir: PathBuf,
-    pub staging: StagingConfig,
-    pub segment: SegmentConfig,
+    /// The staging ring's and the segment rotor's configuration, checked as
+    /// one pair (ADR-0191 D3): a segment holds the largest frame the ring
+    /// can seal, so the LOG step never meets a frame no segment stores.
+    pub geometry: LogGeometry,
     /// Fuzzy-checkpoint policy (M2-S10, ADR-0016).
     pub ckpt: inf_log::CkptConfig,
     /// Boot-recovery stepping (M2-S15).
@@ -102,7 +104,7 @@ pub struct DurableConfig {
     /// D3): 1 = the shipped discipline; 2 = the M2.5-S07 measured arm
     /// (no flag since ADR-0087 D5 — tests and `inf-bench` arms construct
     /// it). Never more. Write-through frames (ADR-0086 D5) are bounded by
-    /// `StagingConfig::frames_in_flight` instead.
+    /// the geometry's `frames_in_flight` instead.
     pub flush_bound: u8,
     /// The device's probed write-through p50 at 4 KiB (µs) from
     /// `io-properties.toml` (ADR-0086 D7) — the `barrier_class_degraded`
@@ -756,11 +758,11 @@ impl<F: SegmentFs> DurableCell<F> {
         manifest: ManifestCell<F>,
         census: &Rc<CapCensus>,
     ) -> DurableCell<F> {
-        let (staging, flush_bound, fua_p50_us_probed, device, fill, group) =
-            (cfg.staging, cfg.flush_bound, cfg.fua_p50_us_probed, cfg.device, cfg.fill, cfg.group);
+        let (geometry, flush_bound, fua_p50_us_probed, device, fill, group) =
+            (cfg.geometry, cfg.flush_bound, cfg.fua_p50_us_probed, cfg.device, cfg.fill, cfg.group);
         // ADR-0031 D5/D6: frames sealed here stamp the recovery-derived
         // log life (1 on fresh logs).
-        let mut staging = StagingRing::new(staging);
+        let mut staging = StagingRing::new(geometry);
         staging.set_frame_epoch(rotor.resume_epoch());
         let ack_map = CappedDeque::new(crate::limits::ACK_MAP, census)
             .unwrap_or_else(|refused| panic!("the ack map refused: {refused}"));

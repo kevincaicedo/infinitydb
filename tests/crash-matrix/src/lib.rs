@@ -39,9 +39,9 @@ use inf_foundation::time::Nanos;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    CkptConfig, FRAME_HEADER_LEN, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentConfig,
-    SegmentId, SegmentReader, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs,
-    scan_log_dir, write_manifest,
+    CkptConfig, DEFAULT_STAGING_BYTES, FRAME_HEADER_LEN, LogGeometry, Lsn, Manifest,
+    MutationEffect, NsId, RecordView, SegmentConfig, SegmentId, SegmentReader, SegmentRotor,
+    StagingConfig, StagingRing, create_cell_dirs, scan_log_dir, write_manifest,
 };
 use inf_server::{DurableConfig, RecoverStats, RecoveredManifest, open_cell_log};
 use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StateDigest, StoreConfig, WallAnchor};
@@ -205,12 +205,24 @@ pub fn workload(name: &str) -> Workload {
     }
 }
 
+/// The matrix's geometry for `segment`: a staging ring no larger than one
+/// segment, `min(4 MiB, segment_bytes)`, so every frame it seals fits (the
+/// harness rule, ADR-0191). A row that needs a smaller ring names its own.
+///
+/// # Panics
+/// If the pair is not a legal log geometry — a wrong literal fails the row
+/// at construction.
+#[must_use]
+pub fn geometry(segment: SegmentConfig) -> LogGeometry {
+    let staging = StagingConfig::with_capacity(segment.segment_bytes.min(DEFAULT_STAGING_BYTES));
+    LogGeometry::new(staging, segment).expect("a crash-matrix log geometry")
+}
+
 #[must_use]
 pub fn config(segment_bytes: u32) -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes, ..Default::default() },
+        geometry: geometry(SegmentConfig { segment_bytes, ..Default::default() }),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -297,8 +309,8 @@ pub fn run_workload(
     let cfg = config(wl.segment_bytes);
     let dirs = create_cell_dirs(fs, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.segment).expect("rotor");
-    let mut ring = StagingRing::new(cfg.staging);
+        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.geometry).expect("rotor");
+    let mut ring = StagingRing::new(cfg.geometry);
     let mut rng = SplitMix64::new(seed | 1);
     let mut out = RunOutcome::default();
 

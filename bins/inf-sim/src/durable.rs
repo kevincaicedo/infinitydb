@@ -2240,23 +2240,30 @@ pub(crate) struct Node {
 
 /// One cell's durable configuration for `scenario` (every cell of a node
 /// gets the same one).
+///
+/// The staging ring is `min(4 MiB, segment_bytes)` per buffer, so every
+/// frame it can seal fits one of the scenario's segments (the harness rule,
+/// ADR-0191). A scenario's pair is harness data: a wrong literal fails the
+/// run here, at construction, never as a stop while serving.
 fn durable_config(
     scenario: &DurableScenario,
     data_dir: &std::path::Path,
 ) -> inf_server::DurableConfig {
+    let staging = inf_server::StagingConfig {
+        capacity_bytes: scenario.segment_bytes.min(inf_log::DEFAULT_STAGING_BYTES),
+        frames_in_flight: scenario.frames_in_flight,
+    };
+    let segment = inf_server::SegmentConfig {
+        segment_bytes: scenario.segment_bytes,
+        io_mode: scenario.io_mode,
+        recycle_slots: scenario.recycle_slots,
+        prealloc: scenario.prealloc,
+        ..Default::default()
+    };
     inf_server::DurableConfig {
         data_dir: data_dir.to_path_buf(),
-        staging: inf_server::StagingConfig {
-            frames_in_flight: scenario.frames_in_flight,
-            ..Default::default()
-        },
-        segment: inf_server::SegmentConfig {
-            segment_bytes: scenario.segment_bytes,
-            io_mode: scenario.io_mode,
-            recycle_slots: scenario.recycle_slots,
-            prealloc: scenario.prealloc,
-            ..Default::default()
-        },
+        geometry: inf_server::LogGeometry::new(staging, segment)
+            .expect("a scenario's log geometry"),
         ckpt: inf_server::CkptConfig {
             interval_bytes: scenario.ckpt_interval_bytes,
             stream_bytes_per_sec: scenario

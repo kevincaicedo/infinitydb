@@ -30,7 +30,7 @@ use inf_log::blob::{ExtentId, ExtentWriter, list_extent_ids, open_extent, unlink
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    CkptConfig, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentId, StagingConfig,
+    CkptConfig, LogGeometry, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentId,
     StagingRing, SyncIckWriter, TierFlushConfig, TierIoMode, decode_record, read_ick_hybrid,
     read_manifest, write_manifest,
 };
@@ -288,7 +288,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     let fs = MemFs::new();
     fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
     let mut t = table(0);
-    let mut ring = StagingRing::new(StagingConfig::default());
+    let mut ring = StagingRing::new(LogGeometry::default());
     let mut tail: Vec<u8> = Vec::new();
 
     // The referenced twin: extent → fdatasync → token → record + frame.
@@ -517,7 +517,7 @@ fn blob_unlink_failure_defers_nonfatally_and_the_retry_reclaims() {
     let fs = MemFs::new();
     fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
     let mut t = table(0);
-    let mut ring = StagingRing::new(StagingConfig::default());
+    let mut ring = StagingRing::new(LogGeometry::default());
     let bytes = value(2 << 10, 3);
     let id = t.allocate_extent_id();
     let sealed = write_extent(&fs, id, &bytes);

@@ -40,7 +40,7 @@ use inf_alloc::REGION_PAGE_BYTES;
 use inf_log::flush::unlink_tier_file;
 use inf_log::fs::{SegmentFile, SegmentFs, StdSegmentFs};
 use inf_log::{
-    MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
+    LogGeometry, MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
     TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, create_cell_dirs, tier_extract,
     tier_frame_offset, tier_frame_span,
 };
@@ -192,13 +192,14 @@ fn workload(dir: &Path, user_mib: u64, leg: Leg) -> Run {
         0,
         &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
-    let mut rotor = SegmentRotor::create_fresh(
-        StdSegmentFs,
-        dirs.log.clone(),
+    let geometry = LogGeometry::new(
+        StagingConfig::default(),
         SegmentConfig { segment_bytes: SEGMENT_BYTES, ..Default::default() },
     )
-    .expect("fresh log");
-    let mut ring = StagingRing::new(StagingConfig::default());
+    .expect("geometry");
+    let mut rotor =
+        SegmentRotor::create_fresh(StdSegmentFs, dirs.log.clone(), geometry).expect("fresh log");
+    let mut ring = StagingRing::new(geometry);
 
     let value = vec![0x77u8; VALUE_BYTES];
     let records = (user_mib << 20) / (8 + VALUE_BYTES as u64);

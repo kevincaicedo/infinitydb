@@ -13,8 +13,9 @@ use inf_foundation::time::Nanos;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    CkptConfig, FRAME_HEADER_LEN, FrameStamp, Lsn, MutationEffect, NsId, SegmentConfig, SegmentId,
-    SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, segment_file_name,
+    CkptConfig, DEFAULT_STAGING_BYTES, FRAME_HEADER_LEN, FrameStamp, LogGeometry, Lsn,
+    MutationEffect, NsId, SegmentConfig, SegmentId, SegmentRotor, StagingConfig, StagingRing,
+    create_cell_dirs, segment_file_name,
 };
 use inf_server::{DurableConfig, RecoverStats, open_cell_log};
 use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
@@ -36,11 +37,18 @@ pub fn cfg() -> DurableConfig {
     cfg_with(SegmentConfig { segment_bytes: 1 << 16, ..Default::default() })
 }
 
+/// The fixture's geometry for `segment`: a staging ring no larger than one
+/// segment, `min(4 MiB, segment_bytes)`, so every frame it seals fits (the
+/// harness rule, ADR-0191). A fixture that needs a smaller ring names its own.
+pub fn geometry(segment: SegmentConfig) -> LogGeometry {
+    let staging = StagingConfig::with_capacity(segment.segment_bytes.min(DEFAULT_STAGING_BYTES));
+    LogGeometry::new(staging, segment).expect("a fixture's log geometry")
+}
+
 pub fn cfg_with(segment: SegmentConfig) -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment,
+        geometry: geometry(segment),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -104,8 +112,13 @@ impl LogBuilder {
     pub fn new(fs: &MemFs, cfg: &DurableConfig) -> LogBuilder {
         let dirs = create_cell_dirs(fs, &cfg.data_dir.join(format!("shard-{CELL}"))).expect("dirs");
         let rotor =
-            SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.segment).expect("rotor");
-        LogBuilder { fs: fs.clone(), rotor, ring: StagingRing::new(cfg.staging), log_dir: dirs.log }
+            SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.geometry).expect("rotor");
+        LogBuilder {
+            fs: fs.clone(),
+            rotor,
+            ring: StagingRing::new(cfg.geometry),
+            log_dir: dirs.log,
+        }
     }
 
     /// Stage `records` as one frame, flush it, and return the frame's

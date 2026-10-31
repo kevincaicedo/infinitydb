@@ -31,7 +31,7 @@ use inf_log::blob::{ExtentId, ExtentWriter, list_extent_ids, unlink_extent_file}
 use inf_log::flush::unlink_tier_file;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    FsyncClass, MutationEffect, NsId, StagingConfig, StagingRing, TierFlush, TierFlushConfig,
+    FsyncClass, LogGeometry, MutationEffect, NsId, StagingRing, TierFlush, TierFlushConfig,
     TierIoMode,
 };
 use inf_store::KeyHasher;
@@ -284,7 +284,7 @@ fn disk_pressure_engages_before_the_cap() {
         w.append_chunk(&value).expect("chunk");
         let sealed = w.finish().expect("finish");
         table.note_blob_bytes(sealed.device_bytes());
-        let mut ring = StagingRing::new(StagingConfig::default());
+        let mut ring = StagingRing::new(LogGeometry::default());
         table
             .stage_wal(
                 &mut ring,

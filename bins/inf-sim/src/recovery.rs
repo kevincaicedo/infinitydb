@@ -50,8 +50,8 @@ use inf_log::fs::SegmentFs;
 use inf_log::fs::sim::SimDisk;
 use inf_log::manifest::TierNsManifest;
 use inf_log::{
-    CkptConfig, Lsn, Manifest, MutationEffect, NsId, RecordView, SealReason, SegmentId,
-    StagingConfig, StagingRing, SyncIckWriter, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
+    CkptConfig, LogGeometry, Lsn, Manifest, MutationEffect, NsId, RecordView, SealReason,
+    SegmentId, StagingRing, SyncIckWriter, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
     TierIoMode, decode_record, parse_tier_file_name, probe_tier_file, read_ick_hybrid,
     read_manifest, tier_extract, tier_frame_offset, tier_frame_span, write_manifest,
 };
@@ -894,7 +894,7 @@ impl Run {
     /// modeled tail is the durable record here, not the ring).
     fn stage(&mut self, life: &mut Life, effect: &MutationEffect<'_>) {
         if life.table.stage_wal(&mut life.ring, effect).is_err() {
-            life.ring = StagingRing::new(StagingConfig::default());
+            life.ring = StagingRing::new(LogGeometry::default());
             life.table.stage_wal(&mut life.ring, effect).expect("a fresh ring has room");
         }
     }
@@ -1367,7 +1367,7 @@ impl Run {
         let life = Life {
             table,
             flush: handed.flush,
-            ring: StagingRing::new(StagingConfig::default()),
+            ring: StagingRing::new(LogGeometry::default()),
             flush_lag: false,
         };
         for (key, hash, _) in &rows {
@@ -2384,7 +2384,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             0,
             &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         ),
-        ring: StagingRing::new(StagingConfig::default()),
+        ring: StagingRing::new(LogGeometry::default()),
         flush_lag: false,
     };
     let mut ckpt_id = 0u64;
@@ -2781,7 +2781,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         life = Life {
             table,
             flush: handed.flush,
-            ring: StagingRing::new(StagingConfig::default()),
+            ring: StagingRing::new(LogGeometry::default()),
             flush_lag: false,
         };
         // The D5 rebuild: every pair the checkpoint and the tail restored

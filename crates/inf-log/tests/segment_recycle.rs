@@ -20,10 +20,19 @@ use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode};
 use inf_log::{
-    FRAME_ALIGN, FillSource, FrameBuilder, FrameLayout, FrameStamp, NsId, ReadError, ReaderConfig,
-    RecordView, SealedDisposal, SegmentConfig, SegmentId, SegmentReader, SegmentRotor,
-    ZERO_FILL_SLICE_BYTES, build_recycle_sentinel, scan_region_evidence, segment_file_name,
+    DEFAULT_STAGING_BYTES, FRAME_ALIGN, FillSource, FrameBuilder, FrameLayout, FrameStamp,
+    LogGeometry, NsId, ReadError, ReaderConfig, RecordView, SealedDisposal, SegmentConfig,
+    SegmentId, SegmentReader, SegmentRotor, StagingConfig, ZERO_FILL_SLICE_BYTES,
+    build_recycle_sentinel, scan_region_evidence, segment_file_name,
 };
+
+/// The rotor's checked geometry: a staging ring no larger than one segment,
+/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
+/// rule, ADR-0191).
+fn geometry(segment: SegmentConfig) -> LogGeometry {
+    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
+    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
+}
 
 const SEGMENT_BYTES: u32 = 16 << 10;
 
@@ -57,9 +66,12 @@ impl Lab {
         let disk = SimDisk::new();
         let dir = PathBuf::from("log");
         disk.create_dir_all(&dir).expect("dir");
-        let rotor =
-            SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), cfg(recycle_slots))
-                .expect("fresh");
+        let rotor = SegmentRotor::create_fresh_deferred(
+            disk.clone(),
+            dir.clone(),
+            geometry(cfg(recycle_slots)),
+        )
+        .expect("fresh");
         Lab { disk, dir, rotor, seq: 0 }
     }
 
@@ -240,7 +252,8 @@ fn recycling_off_or_buffered_never_pools() {
         ..Default::default()
     };
     let mut rotor =
-        SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), buffered).expect("fresh");
+        SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), geometry(buffered))
+            .expect("fresh");
     rotor.maintain_deferred(0).expect("maintain");
     let mut b = FrameBuilder::new();
     b.append(&record(1));

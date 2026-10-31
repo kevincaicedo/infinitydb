@@ -47,8 +47,8 @@ fn build_and_cut(disk: &SimDisk, seed: u64) -> Lsn {
     let config = cfg();
     let dirs = create_cell_dirs(disk, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(disk.clone(), dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(disk.clone(), dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     let mut rng = SplitMix64::new(seed | 1);
     let mut synced_end = Lsn::new(rotor.active_segment(), 0);
     let ops = 120 + (rng.next_below(200)) as usize;

@@ -89,9 +89,10 @@ pub use process_info::{ProcessBoard, ProcessSample, ProcessSampler};
 // `inf-server` only (dep-DAG).
 pub use inf_log::fs::sim::{DeviceFault, SimDisk, SimDiskConfig, StallConfig};
 pub use inf_log::{
-    CkptConfig, DEFAULT_FUA_MAX_FRAME_BYTES, DEFAULT_RECYCLE_SLOTS, DEFAULT_SEGMENT_BYTES,
-    FRAME_ALIGN, FramesInFlight, MAX_FRAMES_IN_FLIGHT, PoolWaitBound, PreallocPolicy,
-    SegmentConfig, SegmentIoMode, StagingConfig,
+    CkptConfig, DEFAULT_FUA_MAX_FRAME_BYTES, DEFAULT_MAX_FRAME_LEN, DEFAULT_RECYCLE_SLOTS,
+    DEFAULT_SEGMENT_BYTES, FRAME_ALIGN, FramesInFlight, LogGeometry, LogGeometryError,
+    MAX_FRAMES_IN_FLIGHT, PoolWaitBound, PreallocPolicy, SegmentConfig, SegmentIoMode,
+    StagingConfig, max_sealed_frame_bytes,
 };
 pub use io_properties::{
     IO_PROPERTIES_FILE, IoProperties, IoPropertiesError, IoPropertiesSource, IoProvenance,
