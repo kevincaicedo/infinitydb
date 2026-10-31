@@ -26,12 +26,16 @@ include a file by `#[path]` only from a package with no library target. That
 file, and any file it includes by `#[path]`, names nothing through `crate::`
 or `super::`, declares no module by file without `#[path]` and calls no
 `include!`, outside its test modules as `strip-test-modules.awk` finds them.
-A target that includes a file defines no `macro_rules!`, carries no
-`#[macro_use]` and calls no `include!`: a macro the target supplies reaches
-the included file by textual scope, so the fuzz crate could give it a second
-definition of what production defines. Any other shape is red rather than
-followed, because rustc's rules for it would be a second implementation
-here.
+No target calls `include!`, whether or not it includes a file by `#[path]`:
+the gate does not follow it, and a library's file compiled that way
+resolves `crate::` to the fuzz crate, which could then define the bound
+that file names. `include!` is read by its name, so `include !(…)`,
+`core::include!` and an alias (`use core::include as x;`) are red alike. A
+target that includes a file defines no `macro_rules!` and carries no
+`#[macro_use]`: a macro the target supplies reaches the included file by
+textual scope, so the fuzz crate could give it a second definition of what
+production defines. Any other shape is red rather than followed, because
+rustc's rules for it would be a second implementation here.
 
 Python 3.11 or newer (`tomllib`), standard library only: the matrix jobs
 run this module on a bare runner before any toolchain is installed.
@@ -74,7 +78,9 @@ TEST_ATTR = re.compile(r"^\s*#\[cfg\((?:test|all\(test,.*\))\)\]\s*$")
 ATTR_OPEN = re.compile(r"#\s*!?\s*\[")
 PATH_KEY = re.compile(r"\bpath\s*=")
 NAMES_ROOT = re.compile(r"\b(crate|super)\s*::")
-INCLUDE = re.compile(r"\binclude!\s*[(\[{]")
+# The macro's name in code, so a space before `!`, a path and an alias
+# (`use core::include as x;`) are read as the call they make.
+INCLUDE = re.compile(r"\binclude\b")
 MACRO_RULES = re.compile(r"\bmacro_rules\s*!")
 MACRO_USE = re.compile(r"#\s*!?\s*\[\s*macro_use\b")
 
@@ -250,14 +256,18 @@ class PathScan:
             return
         edges, code, _ = found
         self.census.path_sites += len(edges)
-        if edges:
-            for i, line in enumerate(code):
-                for rule, shape in ((MACRO_RULES, "defines a `macro_rules!`"),
-                                    (MACRO_USE, "carries a `#[macro_use]`"),
-                                    (INCLUDE, "calls `include!`")):
-                    if rule.search(line):
-                        self.red("H3", f"{target.name}: {target.path}:{i + 1} {shape} and includes "
-                                 "a file by `#[path]`: a macro it supplies would reach that file")
+        for i, line in enumerate(code):
+            if INCLUDE.search(line):
+                self.red("H3", f"{target.name}: {target.path}:{i + 1} calls `include!` (or names "
+                         "it): a target reaches production code through its crate, and the gate "
+                         "does not follow `include!` (ADR-0198 D4)")
+            if not edges:
+                continue
+            for rule, shape in ((MACRO_RULES, "defines a `macro_rules!`"),
+                                (MACRO_USE, "carries a `#[macro_use]`")):
+                if rule.search(line):
+                    self.red("H3", f"{target.name}: {target.path}:{i + 1} {shape} and includes "
+                             "a file by `#[path]`: a macro it supplies would reach that file")
         pending = [(target.path, line, path, 1) for line, path in edges]
         while pending:
             source, line, file, depth = pending.pop(0)
@@ -286,7 +296,7 @@ class PathScan:
                 self.red("H2", f"{where} names `{NAMES_ROOT.search(line).group(1)}::`, which the "
                          "fuzz crate resolves to its own root, not the production crate's")
             if INCLUDE.search(line):
-                self.red("H2", f"{where} calls `include!`")
+                self.red("H2", f"{where} calls `include!` (or names it)")
             previous = next((code[k] for k in range(i - 1, -1, -1) if code[k].strip()), "")
             if MOD_ANY.search(line) and i not in mod_lines and not TEST_ATTR.match(previous):
                 self.red("H2", f"{where} declares a module by file without `#[path]`")

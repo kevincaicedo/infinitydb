@@ -3720,7 +3720,22 @@ printf '#[macro_use]\n%s' "$FZ_TARGET" >"$root/bins/b/fuzz/fuzz_targets/b_parse.
 fz_red "H3: an including target carrying #[macro_use]" "carries a .#.macro_use.. and includes" "$root"
 root=$(fz_root h3-include)
 printf '%s\ninclude!("../../src/parse.rs");\n' "$FZ_TARGET" >"$root/bins/b/fuzz/fuzz_targets/b_parse.rs"
-fz_red "H3: an including target calling include!" "calls .include!. and includes" "$root"
+fz_red "H3: an including target calling include!" "b_parse.rs:8 calls .include!. (or names it)" "$root"
+# include! is red in every target, not only in one that includes by #[path]:
+# a library's file compiled that way resolves crate:: to the fuzz crate.
+root=$(fz_root h3-include-alone)
+printf 'mod copied {\n    include!("../../src/lib.rs");\n}\n\nfn main() {}\n' \
+    >"$root/crates/a/fuzz/fuzz_targets/t_one.rs"
+fz_red "H3: a target with no #[path] calling include! of a library file" \
+    "t_one: crates/a/fuzz/fuzz_targets/t_one.rs:2 calls .include!." "$root"
+root=$(fz_root h3-include-spaced)
+printf 'mod copied {\n    core::include !("../../src/lib.rs");\n}\n\nfn main() {}\n' \
+    >"$root/crates/a/fuzz/fuzz_targets/t_one.rs"
+fz_red "H3: include! spelled with a path and a space" "t_one.rs:2 calls .include!." "$root"
+root=$(fz_root h3-include-alias)
+printf 'use core::include as copy;\n\nmod copied {\n    super::copy!("%s");\n}\n\nfn main() {}\n' \
+    ../../src/lib.rs >"$root/crates/a/fuzz/fuzz_targets/t_one.rs"
+fz_red "H3: include! called through an alias" "t_one.rs:1 calls .include!. (or names it)" "$root"
 
 # K1–K2: cargo's status and its report, against the [[bin]] rows.
 fz_k_root() { # <name>: the clean root with a second target t_two in crates/a
