@@ -11,8 +11,8 @@
 #   • push to main — verify the merged commit.
 #   • schedule — Mondays at 07:23 UTC, on the default branch.
 #   • pull_request labeled `ci-full` — add the label to a PR to run the suite.
-#     `pull_request` uses the workflow file from the PR branch, so this is the
-#     path that works for PR #1 (before this file is on `main`).
+#     `pull_request` uses the workflow file from the PR branch, so this path
+#     works before this file is on `main`.
 #   • issue_comment `/ci-full` on a PR, from a maintainer (author_association
 #     OWNER / MEMBER / COLLABORATOR). GitHub loads comment-triggered workflows
 #     from the DEFAULT branch, so `/ci-full` (and the "Run workflow" button)
@@ -98,7 +98,7 @@ jobs:
             }
 
   miri:
-    # Full M0-S02 gate: strict-provenance Miri on both unsafe leaves.
+    # The full strict-provenance Miri: inf-alloc and inf-fabric, every test.
     needs: authorize
     runs-on: ubuntu-24.04
     timeout-minutes: 90

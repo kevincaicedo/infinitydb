@@ -1,4 +1,4 @@
-# InfinityDB CI — pull-request lane (verification ladder, M0-S02).
+# InfinityDB CI — pull-request lane (the verification ladder).
 #
 # Layout: this repository's root IS the Cargo workspace (crates/, bins/,
 # tests/ at the top level). Jobs run from the repo root; there is no nested
@@ -70,17 +70,15 @@ jobs:
       # ADR-0190 D4: a reply's outcome is read beside its bytes, never from them.
       - name: reply-outcome gate (ADR-0190 D4)
         run: ./scripts/check-reply-outcome.sh
-      # ADR-0107 D2 (review 2026-08-30, Theme 4): release asserts justified
-      # by a claim about a caller are an inventory, gated.
+      # ADR-0107 D2: release asserts justified by a claim about a caller are
+      # an inventory, gated.
       - name: release-assert inventory (ADR-0107 D2)
         run: ./scripts/check-release-asserts.sh
       - name: SAFETY.md inventory
         run: ./scripts/check-safety-inventory.sh
-      # ADR-0106: the gates must go red on a planted violation, or their OK
-      # is a claim (review 2026-08-30 P1/P1c: two had been inert for months).
-      # ADR-0107 (review 2026-08-30, F-L16-01): the DST features never ride
-      # a normal dependency edge — `cargo build --workspace` linked infinityd
-      # against a colliding hasher until this fence existed.
+      # ADR-0107 D1: the DST features never ride a normal dependency edge,
+      # or `cargo build --workspace` would link infinityd against a
+      # colliding hasher.
       - name: shipping-feature fence (ADR-0107)
         run: ./scripts/check-shipping-features.sh
       # ADR-0198 D2: every fuzz target compiles, warnings denied, under its
@@ -88,24 +86,25 @@ jobs:
       # planted reds run first, so the gate proves it can see what it guards.
       - name: fuzz targets compile (ADR-0198)
         run: ./scripts/check-fuzz-targets.sh
+      # ADR-0106: the gates must go red on a planted violation, or their OK
+      # is a claim.
       - name: check scripts self-test (each gate exits non-zero on its planted case)
         run: ./scripts/check-scripts-selftest.sh
-      # ADR-0106 first amendment (review 2026-08-30 F-L18-05): the clock
-      # ban is type-resolved; the gate compiles a planted-bypass probe under
-      # the workspace clippy.toml and lists every sanctioned site.
+      # ADR-0106 D7: the clock ban is type-resolved; the gate compiles a
+      # planted-bypass probe under the workspace clippy.toml and lists every
+      # sanctioned site.
       - name: clock ban (type-resolved, planted-bypass probe)
         run: ./scripts/check-clock-ban.sh
-      # ADR-0106 second amendment (review 2026-08-30, F-L20-03): the M0-S06
-      # / ADR-0003 "no atomics in the waker path" AC. Its gate ran in no
-      # recipe and no workflow, and scanned 0 instruction lines per waker.
+      # ADR-0106 D8, ADR-0003: no atomics in the waker path, read from the
+      # bodies each waker's vtable reaches, against a planted-bypass probe.
       # Linux only: the Mach-O asm flavor is handled but unverified, and an
       # unverified red on one leg would be noise, not evidence.
       - name: waker-atomics (vtable-resolved, planted-bypass probe)
         if: runner.os == 'Linux'
         run: ./scripts/check-waker-atomics.sh
-      # ADR-0144 (architecture review 2026-09-17, W5): crate roots under the
-      # wildcard deny, the structural suppression audit, the frozen
-      # ADR-0143 exemptions, and the probe whose plants must draw their lint.
+      # ADR-0144: crate roots under the wildcard deny, the structural
+      # suppression audit, the frozen ADR-0143 exemptions, and the probe
+      # whose plants must draw their lint.
       - name: lint scopes (ADR-0144)
         run: ./scripts/check-lint-scopes.sh
       # Linux only: the baseline is recorded there (cfg-gated files).
@@ -126,7 +125,8 @@ jobs:
           INF_MEMLOCK_BOOT_REQUIRE: ${{ runner.os == 'Linux' && '1' || '0' }}
 
   slim-build:
-    # L11 / F-L20-09: workspace feature unification hides missing doc guards.
+    # L11: workspace feature unification hides missing doc guards, so the
+    # slim packages build alone, without their default features.
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -230,19 +230,15 @@ jobs:
 
   miri-canary:
     # REDUCED: strict-provenance Miri on the smallest unsafe leaf (inf-alloc)
-    # only. The FULL Miri (inf-alloc + inf-fabric, all tests) is the M0-S02
-    # acceptance gate and runs in infinity-ci-full — that is the job that was
-    # timing out at 45 min here.
+    # only, inside a PR job's timeout. The FULL Miri (inf-alloc + inf-fabric,
+    # all tests) runs longer than that, in infinity-ci-full.
     #
-    # 2026-08-05 (ADR-0065 D5): inf-alloc alone then blew this budget too —
-    # cancelled at 15 min with 14 of 31 tests done. Two causes, both fixed
-    # rather than papered over with a bigger timeout:
-    #   * the arena alloc/free storm verified every byte of every live range
-    #     through an interpreted loop, and its rare size tier is half a
-    #     megabyte — that ONE test measured > 7.4 min on the dev box. It now
-    #     probes range ends under Miri (full width still runs natively).
-    #   * the buffer-pool lease/release storm had no Miri guard at all
-    #     (100k interpreted iterations); it scales down like the others.
+    # ADR-0065 D5: the budget holds by scaling the storms under Miri, not by
+    # a bigger timeout. The arena alloc/free storm probes each live range's
+    # ends under Miri, where checking every byte through the interpreter
+    # would take minutes (its rare size tier is half a megabyte), and the
+    # full width still runs natively; the buffer-pool lease/release storm
+    # runs fewer iterations under Miri, as the others do.
     # `cargo miri setup` also rebuilds a Miri-instrumented std into
     # ~/.cache/miri on every cold run — cached below, since rust-cache does
     # not cover it by default.
@@ -288,10 +284,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: sim tests (determinism, oracle, planted lost-wakeup)
         run: cargo test -p inf-sim --features dst
-      # F-L19-03 (review of 2026-08-30): the job is named after the recipe
-      # it now runs — every scenario in `inf_sim::SCENARIOS` once at a fixed
-      # seed, determinism-verified (`scripts/sim-smoke.sh` is the one
-      # registry; `bins/inf-sim/tests/lanes.rs` keeps it complete).
+      # The job is named after the recipe it runs — every scenario in
+      # `inf_sim::SCENARIOS` once at a fixed seed, determinism-verified
+      # (`scripts/sim-smoke.sh` is the one registry;
+      # `bins/inf-sim/tests/lanes.rs` keeps it complete).
       - name: every scenario once (scripts/sim-smoke.sh)
         run: ./scripts/sim-smoke.sh
 
@@ -358,8 +354,8 @@ jobs:
           INF_COMPAT_REQUIRE_BINARY: '1'
 
   client-smoke:
-    # M1-S03/S14: major Redis client libraries work against infinityd out of
-    # the box. One server serves all four sequentially. Fast (~1-2 min).
+    # Major Redis client libraries work against infinityd out of the box.
+    # One server serves all four sequentially. Fast (~1-2 min).
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -421,7 +417,9 @@ jobs:
         working-directory: tests/client-smoke/java
 
   kernel-matrix:
-    # io_uring feature-probe fallback across kernels (M0-S02). Fast.
+    # The io_uring suite on the features the runner's kernel offers, then
+    # forced onto the degraded fallback an older kernel takes (oneshot recv,
+    # no provided buffers). Fast.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -438,15 +436,14 @@ jobs:
           INF_URING_FORCE_DEGRADED: "1"
 
   website-gates:
-    # M2.5-S05 gates, moved into the PR lane (2026-08-08).
+    # Gates that need no toolchain, on the PR: every workflow's YAML, and
+    # the committed site against a fresh build. `pages.yml` checks the site
+    # only on a push to main, where a site stale against its sources fails
+    # the deploy after the merge; here it fails the PR, where the fix is a
+    # one-line regeneration commit.
     #
-    # These checks previously ran ONLY in `pages.yml`, which triggers on
-    # push-to-main. A PR that regenerated docs/compat-matrix.md therefore
-    # passed review and merged green, and the drift only surfaced afterwards
-    # as a failed production deploy (PR #2 → website run #1). The same gates
-    # run here, on the PR, where the fix is a one-line regeneration commit.
-    #
-    # Cheap by construction: stdlib python3, no toolchain, no build.
+    # Cheap by construction: python3 and the runner image's PyYAML, no
+    # toolchain, no build.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -454,8 +451,7 @@ jobs:
 
       - name: workflow YAML lint
         # A syntactically invalid workflow is otherwise only discovered when
-        # its schedule fires (infinity-dst-nightly carried an unquoted colon
-        # in a step name for a full nightly cycle). Parse every workflow here.
+        # its schedule fires, so every workflow is parsed here.
         run: |
           python3 - <<'PY'
           import pathlib, sys, yaml
