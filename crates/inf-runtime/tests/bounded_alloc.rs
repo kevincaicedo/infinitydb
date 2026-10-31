@@ -1,9 +1,10 @@
 //! The capped containers' allocation census (ADR-0151 D6; ADR-0171 D5): zero
 //! allocator calls after `Live` across churn, on both of the deque's
-//! crossings and both of the slab's generation policies; a refusal planted
-//! at each constructor call, and at each of a slab's build steps, builds
-//! nothing that is not retired by steps; a slab's build and retirement
-//! allocate and free one chunk or directory per step. Counted here,
+//! crossings, both of the slab's generation policies and the map; a refusal
+//! planted at each constructor call, and at each of a slab's or a map's
+//! build steps, builds nothing that is not retired by steps; a slab's and a
+//! map's build and retirement allocate and free one chunk or directory per
+//! step, across both of a map's stores. Counted here,
 //! from an `inf-runtime` integration test, so `inf-foundation` stays
 //! dependency-free: the counting allocator is `inf-alloc`'s. Counts are per
 //! thread (a process-wide delta captures harness noise it cannot attribute).
@@ -17,9 +18,9 @@ use std::collections::VecDeque;
 use inf_alloc::CountingAllocator;
 use inf_foundation::CellId;
 use inf_foundation::bounded::{
-    Built, Cap, CapCensus, CapError, CapFill, CappedDeque, CappedSlab, Coalesce, Generation,
-    GenerationPolicy, Lookup, LookupMut, Lossy, Merge, Reserve, Reserved, Retire, Retiring,
-    SlabReserved, SlotId, Taken, WrapWithProof,
+    Admission, Built, Cap, CapCensus, CapError, CapFill, CappedDeque, CappedMap, CappedSlab,
+    Coalesce, Generation, GenerationPolicy, Lookup, LookupMut, Lossy, MapBuilt, MapRetired, Merge,
+    Reserve, Reserved, Retire, Retiring, SlabReserved, SlotId, Taken, WrapWithProof,
 };
 use inf_foundation::limits::MAP_BACKING_ALLOCATION_BYTES_MAX;
 
@@ -224,6 +225,138 @@ fn a_refused_slab_build_step_retires_its_prefix_by_steps() {
             match prefix.step() {
                 Retiring::More(next) => prefix = next,
                 Retiring::Done => break,
+            }
+        }
+        assert_eq!(steps, refused_at.max(1), "{refused_at}: one step per item built");
+    }
+    // The name keeps its row; every refused build shared it.
+    assert_eq!(census.rows().count(), 1);
+}
+
+const MAP: Cap = Cap::entries::<1024>("alloc-map", CapFill::Serving);
+/// 1,024 entries: in each store a directory and 16 chunks of 64 (the
+/// branch store's 1,023 slots fill its last chunk but one).
+const MAP_ITEMS: u64 = 34;
+
+/// A map of `MAP` built by steps, each step one allocation, across both
+/// stores.
+fn map(census: &std::rc::Rc<CapCensus>) -> CappedMap<u64, u64> {
+    let mut builder = CappedMap::<u64, u64>::builder(MAP, census).expect("registered");
+    let mut steps = 0;
+    loop {
+        let before = ALLOC.thread_allocations();
+        let step = builder.step();
+        assert_eq!(ALLOC.thread_allocations() - before, 1, "one allocation per build step");
+        steps += 1;
+        match step {
+            MapBuilt::More(next) => builder = next,
+            MapBuilt::Live(map) => {
+                assert_eq!(steps, MAP_ITEMS);
+                return map;
+            }
+            MapBuilt::Refused(_, refused) => panic!("{refused}"),
+        }
+    }
+}
+
+/// Admit and publish, replace, read, write and remove across 100,000 ops
+/// on sparse keys, reaching `Full` on every pass: no allocator call once
+/// the map is live.
+#[test]
+fn no_map_allocator_call_after_live_across_churn() {
+    let (census, _serve_mark) = CapCensus::new(CellId(5));
+    let mut map = map(&census);
+    let mut held: VecDeque<u64> = VecDeque::with_capacity(2048);
+    let before = ALLOC.thread_allocations();
+    let mut accumulator = 0u64;
+    for i in 0..CHURN {
+        // An odd multiple modulo 2^64 is a bijection: every key is fresh.
+        let key = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        match map.admit(key) {
+            Admission::Vacant(slot) => {
+                slot.publish(i);
+                held.push_back(key);
+            }
+            Admission::Occupied(_) => panic!("a fresh key is absent"),
+            Admission::Full => {}
+        }
+        if let Some(&newest) = held.back() {
+            if let Some(value) = map.get_mut(newest) {
+                *value ^= 1;
+            }
+            accumulator ^= map.get(newest).copied().unwrap_or(0);
+        }
+        if let Some(&oldest) = held.front()
+            && let Admission::Occupied(slot) = map.admit(oldest)
+        {
+            accumulator ^= slot.replace(i);
+        }
+        if i % 3 == 0
+            && let Some(key) = held.pop_front()
+        {
+            accumulator ^= map.remove(key).unwrap_or(0);
+            assert_eq!(map.remove(key), None, "a removed key is absent");
+        }
+    }
+    assert_eq!(ALLOC.thread_allocations(), before, "an allocator call after Live");
+    let row = census.row("alloc-map").expect("row");
+    assert_eq!(row.high_water, 1024);
+    assert!(row.crossings > 0, "the churn reached Full");
+    assert_ne!(accumulator, 0);
+}
+
+#[test]
+fn a_map_retires_one_backing_allocation_per_step() {
+    let (census, _serve_mark) = CapCensus::new(CellId(6));
+    let mut retiring = map(&census).retire();
+    let mut steps = 0;
+    loop {
+        let before = ALLOC.thread_freed_bytes();
+        let step = retiring.step();
+        let freed = ALLOC.thread_freed_bytes() - before;
+        assert!(freed > 0, "a step frees its item");
+        assert!(
+            freed <= MAP_BACKING_ALLOCATION_BYTES_MAX as u64,
+            "one backing allocation per step"
+        );
+        steps += 1;
+        match step {
+            MapRetired::More(next) => retiring = next,
+            MapRetired::Done => break,
+        }
+    }
+    assert_eq!(steps, MAP_ITEMS);
+    assert_eq!(census.unsliced_drops(), 0);
+}
+
+/// A refusal at each build step, in either store: the step answers
+/// `Refused` with `Alloc`, and both stores' prefix retires by steps, one
+/// per item built.
+#[test]
+fn a_refused_map_build_step_retires_its_prefix_by_steps() {
+    let (census, _serve_mark) = CapCensus::new(CellId(7));
+    for refused_at in 0..MAP_ITEMS {
+        let mut builder = CappedMap::<u64, u64>::builder(MAP, &census).expect("row");
+        for _ in 0..refused_at {
+            builder = match builder.step() {
+                MapBuilt::More(next) => next,
+                MapBuilt::Live(_) | MapBuilt::Refused(..) => panic!("{refused_at}: built early"),
+            };
+        }
+        let guard = ALLOC.refuse_after(0).expect("no refusal armed");
+        let step = builder.step();
+        assert!(guard.was_triggered(), "the step reached the allocator");
+        drop(guard);
+        let MapBuilt::Refused(mut prefix, refused) = step else {
+            panic!("{refused_at}: not refused")
+        };
+        assert_eq!(refused, CapError::Alloc);
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            match prefix.step() {
+                MapRetired::More(next) => prefix = next,
+                MapRetired::Done => break,
             }
         }
         assert_eq!(steps, refused_at.max(1), "{refused_at}: one step per item built");

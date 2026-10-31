@@ -13,7 +13,13 @@
 //! directory. No slot here nears its last generation (`SLAB_OPS_MAX` ops):
 //! reaching it takes the slab's test hook, which compiles only in the crate's
 //! own tests and under its test feature, never on this target's normal edge,
-//! so the crate's in-module model drives both policies' last value. The
+//! so the crate's in-module model drives both policies' last value. Maps: a
+//! map of a cap from one entry past a chunk edge, over `u64` keys or `u64`
+//! pairs that share prefixes and part at the first bit, the last, or either
+//! word of a pair, beside a `BTreeMap<K, V>`, with admissions that publish,
+//! replace or are dropped, removals and writes; every key named so far read
+//! back after every op, the row's high water, crossings and capacity equal
+//! the model's at the end, and the map retired one step per item built. The
 //! models share no code with `inf_foundation::bounded`.
 #![no_main]
 #![allow(
@@ -27,9 +33,10 @@ use std::rc::Rc;
 
 use inf_foundation::CellId;
 use inf_foundation::bounded::{
-    Built, Cap, CapCensus, CapError, CapFill, CappedDeque, CappedSlab, Coalesce, Generation,
-    GenerationPolicy, Lookup, LookupMut, Lossy, Merge, Reserve, Reserved, Retire, Retiring,
-    SlabReserved, SlotId, Taken, WrapWithProof,
+    Admission, Built, Cap, CapCensus, CapError, CapFill, CappedDeque, CappedMap, CappedSlab,
+    Coalesce, ExactKey, Generation, GenerationPolicy, Lookup, LookupMut, Lossy, MapBuilt,
+    MapRetired, Merge, Reserve, Reserved, Retire, Retiring, SlabReserved, SlotId, Taken,
+    WrapWithProof,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -93,10 +100,12 @@ impl<T> Model<T> {
 
 fuzz_target!(|data: &[u8]| {
     let Some((&head, ops)) = data.split_first() else { return };
-    match (head >> 3) & 3 {
+    match (head >> 3) & 7 {
         0 | 1 => deques(head, ops),
         2 => slab::<u32, Retire>(head, ops),
-        _ => slab::<u64, WrapWithProof>(head, ops),
+        3 => slab::<u64, WrapWithProof>(head, ops),
+        4 | 5 => map::<u64>(head, ops),
+        _ => map::<(u64, u64)>(head, ops),
     }
 });
 
@@ -369,6 +378,116 @@ fn slab<G: Generation + ModelGeneration, P: GenerationPolicy>(head: u8, ops: &[u
         match retiring.step() {
             Retiring::More(next) => retiring = next,
             Retiring::Done => break,
+        }
+    }
+    assert_eq!(steps, build_steps, "one retire step per item built");
+}
+
+// Maps: a map of a cap from one entry to past a chunk edge, over keys with
+// shared prefixes and neighbours one bit apart, beside a `BTreeMap`. Each
+// op is a pair of bytes, its kind and its key's index in a pool of 256.
+const MAP_OPS_MAX: usize = 256;
+const MAP_CAPS: [Cap; 8] = [
+    Cap::entries::<1>("fuzz-map", CapFill::Serving),
+    Cap::entries::<2>("fuzz-map", CapFill::Serving),
+    Cap::entries::<3>("fuzz-map", CapFill::Serving),
+    Cap::entries::<5>("fuzz-map", CapFill::Serving),
+    Cap::entries::<63>("fuzz-map", CapFill::Serving),
+    Cap::entries::<64>("fuzz-map", CapFill::Serving),
+    Cap::entries::<65>("fuzz-map", CapFill::Serving),
+    Cap::entries::<130>("fuzz-map", CapFill::Serving),
+];
+
+/// A pool of 256 keys of one type: its index's low half in the key's
+/// first bits and its high half in its last, so keys share prefixes, part
+/// at the first bit and at the last, and differ in either word of a pair.
+trait PoolKey: ExactKey + Ord {
+    fn pooled(index: u8) -> Self;
+}
+
+impl PoolKey for u64 {
+    fn pooled(index: u8) -> u64 {
+        u64::from(index).rotate_right(4)
+    }
+}
+
+impl PoolKey for (u64, u64) {
+    fn pooled(index: u8) -> (u64, u64) {
+        (u64::from(index & 0xF).rotate_right(4), u64::from(index >> 4))
+    }
+}
+
+fn map<K: PoolKey>(head: u8, ops: &[u8]) {
+    let cap = MAP_CAPS[usize::from(head & 7)];
+    let (census, _serve_mark) = CapCensus::new(CellId(u16::from(head)));
+    let mut builder = CappedMap::<K, u16>::builder(cap, &census).expect("fits");
+    let mut build_steps = 0;
+    let mut map = loop {
+        build_steps += 1;
+        match builder.step() {
+            MapBuilt::More(next) => builder = next,
+            MapBuilt::Live(map) => break map,
+            MapBuilt::Refused(_, refused) => panic!("{refused}"),
+        }
+    };
+    let mut model: BTreeMap<K, u16> = BTreeMap::new();
+    let mut named: Vec<K> = Vec::new();
+    let (mut high_water, mut crossings) = (0u32, 0u64);
+    let full = |model: &BTreeMap<K, u16>| model.len() as u32 == cap.entries_max();
+    for (op, pair) in ops.chunks_exact(2).take(MAP_OPS_MAX).enumerate() {
+        let key = K::pooled(pair[1]);
+        if !named.contains(&key) {
+            named.push(key);
+        }
+        let value = op as u16;
+        match pair[0] & 7 {
+            0..=2 => match map.admit(key) {
+                Admission::Occupied(slot) => {
+                    let before = model.insert(key, value).expect("Occupied names a present key");
+                    assert_eq!(slot.replace(value), before, "the replaced value");
+                }
+                Admission::Vacant(slot) => {
+                    assert!(!model.contains_key(&key) && !full(&model), "a vacant slot");
+                    slot.publish(value);
+                    model.insert(key, value);
+                    high_water = high_water.max(model.len() as u32);
+                }
+                Admission::Full => {
+                    assert!(!model.contains_key(&key) && full(&model), "Full below the cap");
+                    crossings += 1;
+                }
+            },
+            3 => match map.admit(key) {
+                Admission::Vacant(slot) => drop(slot),
+                Admission::Full => crossings += 1,
+                Admission::Occupied(_) => {}
+            },
+            4 | 5 => assert_eq!(map.remove(key), model.remove(&key), "remove"),
+            6 => match (map.get_mut(key), model.get_mut(&key)) {
+                (Some(found), Some(expected)) => {
+                    *found = value;
+                    *expected = value;
+                }
+                (None, None) => {}
+                (Some(_), None) | (None, Some(_)) => panic!("get_mut disagrees with the model"),
+            },
+            _ => {}
+        }
+        assert_eq!(map.len() as usize, model.len());
+        for key in &named {
+            assert_eq!(map.get(*key), model.get(key), "get disagrees with the model");
+        }
+    }
+    let row = census.row("fuzz-map").expect("row");
+    assert_eq!((row.high_water, row.crossings), (high_water, crossings));
+    assert_eq!(row.capacity_now, cap.entries_max());
+    let mut retiring = map.retire();
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        match retiring.step() {
+            MapRetired::More(next) => retiring = next,
+            MapRetired::Done => break,
         }
     }
     assert_eq!(steps, build_steps, "one retire step per item built");
