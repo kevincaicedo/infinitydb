@@ -3666,11 +3666,11 @@ printf 'fn main() {}\n' >"$root/crates/c/fuzz/fuzz_targets/y.rs"
 fz_red "C5: a fuzz_targets/ file beside no fuzz manifest" "beside no fuzz manifest" "$root"
 # C6: every seed directory names a target of its workspace; git's listing
 # decides what exists, so an ignored local corpus is never read.
-root=$(fz_root c6-json)
-mkdir -p "$root/crates/a/fuzz/corpora/json"
-printf 'x' >"$root/crates/a/fuzz/corpora/json/seed"
+root=$(fz_root c6-stray)
+mkdir -p "$root/crates/a/fuzz/corpora/no_such_target"
+printf 'x' >"$root/crates/a/fuzz/corpora/no_such_target/seed"
 fz_red "C6: corpora/<a name no target has>" \
-    "C6 crates/a/fuzz/corpora/json: a seed directory that names no target" "$root"
+    "C6 crates/a/fuzz/corpora/no_such_target: a seed directory that names no target" "$root"
 root=$(fz_root c6-seeds)
 mkdir -p "$root/bins/b/fuzz/seeds/gone"
 printf 'x' >"$root/bins/b/fuzz/seeds/gone/seed"
