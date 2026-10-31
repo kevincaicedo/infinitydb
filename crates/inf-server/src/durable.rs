@@ -1500,17 +1500,21 @@ impl<F: SegmentFs> DurableCell<F> {
         cx.timers.insert(cx.now + Nanos::from_secs(1), EVERYSEC_TIMER_KEY);
     }
 
-    /// The stop drain's final sync (ADR-0124 D2 step 4): the everysec
-    /// tick's ledger rule now, without waiting for the wheel — a dirty
-    /// ledger seals its frame and issues the barrier at the next LOG
-    /// step; a clean one is free (counted idle).
+    /// The stop drain's final sync (ADR-0199 D3): the everysec tick's
+    /// ledger rule now, without waiting for the wheel. Queued bytes above
+    /// the coverage tail, or a staged record, make a due the next LOG step
+    /// issues (the held frame's barrier or a standalone fdatasync); a ledger
+    /// whose every queued byte is under an entry in flight owes nothing new,
+    /// and that entry is the final sync; a clean one is free (counted idle).
     pub fn request_final_sync(&mut self) {
         self.commit.note_everysec_tick();
     }
 
-    /// Nothing durable is in motion: no record staged, no frame in
-    /// flight, no fsync pending, no sync owed, no checkpoint or MANIFEST
-    /// transition open. The stop drain's exit condition (ADR-0124 D2).
+    /// Nothing durable is in motion: nothing staged, no frame in flight, no
+    /// fsync pending, no barrier owed (the ledger's coverage target, ADR-0199
+    /// D1), no checkpoint or MANIFEST transition open. The stop drain's exit
+    /// condition (ADR-0199 D3): on a quiet cell these hold together once its
+    /// last entry completes.
     pub fn quiescent(&self) -> bool {
         self.staging.is_empty()
             && self.staging.drained()
