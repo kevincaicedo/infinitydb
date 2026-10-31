@@ -1,5 +1,7 @@
 # cargo-fuzz crate for inf-wire (M0-S11 AC: parser fuzz, CI smoke + nightly
-# hour). Standalone workspace — built only by `cargo +nightly fuzz`.
+# hour). A workspace of its own, outside the root's, so its fuzzing features
+# never unify into a shipping build; `just check` compiles its targets on the
+# pinned toolchain and `cargo +nightly fuzz` runs them.
 [package]
 name = "inf-wire-fuzz"
 version = "0.0.0"

@@ -4,7 +4,9 @@
 # M4.5-S03 adds `fuzz_catalog` with the v3 index section, ADR-0075 D2;
 # `tier_span_select`, the tier round's span selector against its
 # prefix-sum oracle, ADR-0155 D6).
-# Standalone workspace — built only by `cargo +nightly fuzz`.
+# A workspace of its own, outside the root's, so its fuzzing features never
+# unify into a shipping build; `just check` compiles its targets on the
+# pinned toolchain and `cargo +nightly fuzz` runs them.
 [package]
 name = "inf-store-fuzz"
 version = "0.0.0"

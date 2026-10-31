@@ -1,6 +1,8 @@
 # cargo-fuzz crate for inf-server (SCAN cursor decoder +
-# glob pattern matcher — the classic Redis CVE surface). Standalone
-# workspace — built only by `cargo +nightly fuzz`.
+# glob pattern matcher — the classic Redis CVE surface). A workspace of its
+# own, outside the root's, so its fuzzing features never unify into a
+# shipping build; `just check` compiles its targets on the pinned toolchain
+# and `cargo +nightly fuzz` runs them.
 [package]
 name = "inf-server-fuzz"
 version = "0.0.0"

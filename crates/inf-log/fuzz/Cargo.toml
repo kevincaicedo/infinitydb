@@ -1,5 +1,7 @@
 # cargo-fuzz crate for inf-log (M2-S01 AC: frame decoder fuzz, CI smoke +
-# nightly hour). Standalone workspace — built only by `cargo +nightly fuzz`.
+# nightly hour). A workspace of its own, outside the root's, so its fuzzing
+# features never unify into a shipping build; `just check` compiles its
+# targets on the pinned toolchain and `cargo +nightly fuzz` runs them.
 [package]
 name = "inf-log-fuzz"
 version = "0.0.0"
