@@ -48,6 +48,32 @@ const CHILD_MASK: u32 = (1 << CHILDREN_LOG2) - 1;
 /// most `MAP_SLOT_COUNT_MAX` = `u32::MAX` slots.
 const END: u32 = u32::MAX;
 
+/// What a store's slot carries as its generation: `FIRST` is the value a
+/// never-used slot takes, and the store copies it, nothing more. A slab's
+/// `Generation` (`u32`, `u64`) is one, by the blanket impl; so is `()`, the
+/// generation of a map's two stores, whose indices never leave the map, so
+/// no handle carries one to compare. `()` is no `Generation`, so no slab and
+/// no `SlotId` is built over a generation that cannot advance:
+///
+/// ```compile_fail
+/// # use inf_foundation::CellId;
+/// # use inf_foundation::bounded::{Cap, CapCensus, CapFill, CappedSlab, Retire};
+/// let (census, _serve_mark) = CapCensus::new(CellId(0));
+/// let cap = Cap::entries::<1>("unit", CapFill::Serving);
+/// let _builder = CappedSlab::<u8, (), Retire>::builder(cap, &census);
+/// ```
+pub(super) trait SlotGeneration: Copy {
+    const FIRST: Self;
+}
+
+impl<G: Generation> SlotGeneration for G {
+    const FIRST: Self = <G as Generation>::FIRST;
+}
+
+impl SlotGeneration for () {
+    const FIRST: Self = ();
+}
+
 /// One slot. `Free` is on the free chain with the generation its next
 /// occupant takes; `Live` holds its occupant; `Closed` never serves again:
 /// retired at its last generation, or past the store's capacity in its last
@@ -118,7 +144,7 @@ pub(super) enum RetireStep {
 /// below. A slot index names one chunk offset and one child per directory
 /// level; the generic levels are walked by nested calls of distinct types,
 /// so the walk is a fixed depth, never a run-time recursion.
-trait Level<T, G: Generation>: Sized {
+trait Level<T, G: SlotGeneration>: Sized {
     /// log2 of the slots one full item of this level covers.
     const SPAN_LOG2: u32;
 
@@ -144,7 +170,7 @@ trait Level<T, G: Generation>: Sized {
     fn retire(&mut self) -> Retired;
 }
 
-impl<T, G: Generation> Level<T, G> for Chunk<T, G> {
+impl<T, G: SlotGeneration> Level<T, G> for Chunk<T, G> {
     const SPAN_LOG2: u32 = CHUNK_SLOTS_LOG2;
 
     #[inline]
@@ -191,7 +217,7 @@ impl<T, G: Generation> Level<T, G> for Chunk<T, G> {
     }
 }
 
-impl<T, G: Generation, L: Level<T, G>> Level<T, G> for Directory<L> {
+impl<T, G: SlotGeneration, L: Level<T, G>> Level<T, G> for Directory<L> {
     const SPAN_LOG2: u32 = L::SPAN_LOG2 + CHILDREN_LOG2;
 
     #[inline]
@@ -270,7 +296,7 @@ fn covers(index: u32, span_log2: u32) -> bool {
     u64::from(index) >> span_log2 == 0
 }
 
-impl<T, G: Generation> Root<T, G> {
+impl<T, G: SlotGeneration> Root<T, G> {
     /// The root of a store of `capacity` slots, allocated empty, with what
     /// it grew; a capacity whose levels pass the root's is `Layout`.
     fn allocate(capacity: u32) -> Result<(Root<T, G>, Grown), CapError> {
@@ -296,7 +322,7 @@ pub(super) struct FreeSlot<'a, T, G> {
     next: u32,
 }
 
-impl<T, G: Generation> FreeSlot<'_, T, G> {
+impl<T, G: SlotGeneration> FreeSlot<'_, T, G> {
     /// The slot holds `value` at the generation it was free with; its index
     /// and that generation are returned. Cannot allocate or refuse.
     #[inline]
@@ -324,7 +350,7 @@ pub(super) struct SlotStore<T, G> {
     census: Rc<CapCensus>,
 }
 
-impl<T, G: Generation> SlotStore<T, G> {
+impl<T, G: SlotGeneration> SlotStore<T, G> {
     /// Whether a chunk and a directory of this store each fit one backing
     /// allocation. Checked before anything is registered or minted.
     pub(super) fn layout_fits() -> bool {
@@ -477,7 +503,10 @@ impl<T, G> Drop for SlotStore<T, G> {
 
 /// Slot `index` under `root`, mutably.
 #[inline]
-fn root_slot_mut<T, G: Generation>(root: &mut Root<T, G>, index: u32) -> Option<&mut Slot<T, G>> {
+fn root_slot_mut<T, G: SlotGeneration>(
+    root: &mut Root<T, G>,
+    index: u32,
+) -> Option<&mut Slot<T, G>> {
     match root {
         Root::Empty => None,
         Root::Chunk(level) => walk_mut(&mut **level, index),
@@ -491,12 +520,12 @@ fn root_slot_mut<T, G: Generation>(root: &mut Root<T, G>, index: u32) -> Option<
 /// Slot `index` under a root level, if the root covers it: an index past
 /// the root's span is never walked.
 #[inline]
-fn walk<T, G: Generation, L: Level<T, G>>(level: &L, index: u32) -> Option<&Slot<T, G>> {
+fn walk<T, G: SlotGeneration, L: Level<T, G>>(level: &L, index: u32) -> Option<&Slot<T, G>> {
     if covers(index, L::SPAN_LOG2) { level.slot(index) } else { None }
 }
 
 #[inline]
-fn walk_mut<T, G: Generation, L: Level<T, G>>(
+fn walk_mut<T, G: SlotGeneration, L: Level<T, G>>(
     level: &mut L,
     index: u32,
 ) -> Option<&mut Slot<T, G>> {
