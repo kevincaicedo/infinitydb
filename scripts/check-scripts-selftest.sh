@@ -3542,6 +3542,18 @@ fz_once() {
 }
 fz_replay() { cat "$1" && return "$(cat "$1.status")"; }
 fz_lacks() { ! grep -q -- "$1" "$2"; }  # <pattern> <log>: the log lacks it
+# The matrix mode's stdout is the whole matrix or nothing: fz_matrix_is reads
+# it, fz_matrix_red an exit 1 with nothing printed.
+fz_matrix_is() { # <root> <mode> <expected stdout>
+    local got
+    got=$(env INF_CHECK_ROOT="$1" "$FUZZ" --matrix "$2") || return 1
+    [ "$got" = "$3" ] || { echo "matrix: $got"; return 1; }
+}
+fz_matrix_red() { # <root> [<mode>]
+    local got status=0
+    got=$(env INF_CHECK_ROOT="$1" "$FUZZ" --matrix "${2:-nightly}" 2>/dev/null) || status=$?
+    [ "$status" -eq 1 ] && [ -z "$got" ]
+}
 
 root=$(fz_root clean)
 fz_once "$root.log" fz_run "$root"
@@ -3770,6 +3782,45 @@ done
 # shellcheck disable=SC2086
 fz_manifest "$root" crates/a $names
 fz_red "C7: 257 targets are past one matrix" "C7 257 targets: more than one matrix holds" "$root"
+# ...and the deny matrix, a row a fuzz manifest and the root's: 256 fuzz
+# workspaces of one target each hold 256 targets, the cap, and 257 deny rows,
+# one past it; 255 workspaces fill the deny matrix exactly.
+# The workspaces are written by shell builtins under one mkdir, and the gate
+# runs under a stub that answers nothing (a K2 red a workspace, beside C7),
+# so the 256 workspaces cost no process each but that stub's.
+root=$(fz_root c7-deny)
+dirs=()
+i=0
+while [ "$i" -lt 254 ]; do
+    dirs+=("$root/crates/m$i/fuzz/fuzz_targets")
+    i=$((i + 1))
+done
+mkdir -p "${dirs[@]}"
+i=0
+while [ "$i" -lt 254 ]; do
+    printf '[package]\nname = "m%s"\nversion = "0.0.0"\n' "$i" >"$root/crates/m$i/Cargo.toml"
+    printf '[package]\nname = "m%s-fuzz"\nversion = "0.0.0"\n\n[package.metadata]\ncargo-fuzz = true\n\n[workspace]\n\n[[bin]]\nname = "m%s_t"\npath = "fuzz_targets/m%s_t.rs"\n' \
+        "$i" "$i" "$i" >"$root/crates/m$i/fuzz/Cargo.toml"
+    printf 'fn main() {}\n' >"$root/crates/m$i/fuzz/fuzz_targets/m${i}_t.rs"
+    i=$((i + 1))
+done
+printf '#!/bin/sh\nexit 0\n' >"$work/fz-silent-cargo"
+chmod +x "$work/fz-silent-cargo"
+FZ_C7D="C7 257 cargo-deny manifests (the root and 256 fuzz manifests): more than one matrix holds"
+expect_red_because "fuzz-targets: C7: 257 deny rows are past one matrix, in the gate" "$FZ_C7D" \
+    env INF_CHECK_ROOT="$root" INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$work/fz-silent-cargo" "$FUZZ"
+expect_red_because "fuzz-targets: C7: 257 deny rows are past one matrix, in --matrix deny" "$FZ_C7D" \
+    env INF_CHECK_ROOT="$root" "$FUZZ" --matrix deny
+expect green "fuzz-targets: C7: no deny matrix past the cap" fz_matrix_red "$root" deny
+expect green "fuzz-targets: C7: a red census prints no fuzz matrix, its 256 targets fitting" \
+    fz_matrix_red "$root" nightly
+rm -rf "${root:?}/crates/m0"
+fz_deny_rows() { # <root> <rows>: --matrix deny is green with exactly that many rows
+    local got
+    got=$(env INF_CHECK_ROOT="$1" "$FUZZ" --matrix deny) || return 1
+    [ "$(printf '%s' "$got" | grep -o '"manifest"' | wc -l | tr -d ' ')" = "$2" ]
+}
+expect green "fuzz-targets: C7: 256 deny rows fill one matrix" fz_deny_rows "$root" 256
 
 # H1–H3: a target reaches production code through its crate (ADR-0198 D4).
 fz_h_root() { # <name> <parse.rs addition>: the clean root, parse.rs extended
@@ -4051,16 +4102,6 @@ expect_red_because "fuzz-targets: an edited-down probe" "an edited-down probe pr
 # The matrix mode: one row per target in census order with its seed
 # directories, or (deny) the root and every fuzz manifest; a red census
 # prints nothing on stdout and exits 1.
-fz_matrix_is() { # <root> <mode> <expected stdout>
-    local got
-    got=$(env INF_CHECK_ROOT="$1" "$FUZZ" --matrix "$2") || return 1
-    [ "$got" = "$3" ] || { echo "matrix: $got"; return 1; }
-}
-fz_matrix_red() { # <root> [<mode>]
-    local got status=0
-    got=$(env INF_CHECK_ROOT="$1" "$FUZZ" --matrix "${2:-nightly}" 2>/dev/null) || status=$?
-    [ "$status" -eq 1 ] && [ -z "$got" ]
-}
 root=$(fz_root matrix)
 for kind in corpora seeds; do
     mkdir -p "$root/crates/a/fuzz/$kind/t_one"

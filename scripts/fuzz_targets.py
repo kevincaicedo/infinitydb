@@ -68,8 +68,11 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lint_scope_table as lexer  # noqa: E402  (the gates' one Rust lexer)
 
-# GitHub runs at most 256 jobs from one matrix. Past it the targets split
-# into two matrices, by a decision that changes this module.
+# GitHub runs at most 256 jobs from one matrix. The fuzz matrices hold a row
+# a target and the deny matrix a row a fuzz manifest and one for the root, so
+# C7 judges both counts; a fuzz manifest holds a target at least (C5), so the
+# deny rows can pass the cap only when the targets nearly reach it. Past it
+# the rows split into two matrices, by a decision that changes this module.
 MATRIX_JOBS_MAX = 256
 # Probe manifests: each is compiled by the gate named here, which the `check`
 # recipe runs (a stale row, or a gate no recipe runs, is red).
@@ -494,6 +497,9 @@ def _census(c, root):
     if len(c.targets) > MATRIX_JOBS_MAX:
         c.errors.append(f"C7 {len(c.targets)} targets: more than one matrix holds "
                         f"({MATRIX_JOBS_MAX}, GitHub's cap)")
+    if 1 + len(fuzz) > MATRIX_JOBS_MAX:
+        c.errors.append(f"C7 {1 + len(fuzz)} cargo-deny manifests (the root and {len(fuzz)} fuzz "
+                        f"manifests): more than one matrix holds ({MATRIX_JOBS_MAX}, GitHub's cap)")
     scan = PathScan(c, packages, listed)
     for t in c.targets:
         if t.path in listed:

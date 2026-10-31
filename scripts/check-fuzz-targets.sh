@@ -66,7 +66,9 @@
 # [{"manifest"}, ...]}), each a workspace with a lock of its own (ADR-0198
 # D6). A red census prints no matrix and exits 1, its rows and a scope error
 # on stderr, so stdout holds the whole matrix or nothing, and a matrix is
-# never empty: an empty census is a scope error.
+# never empty: an empty census is a scope error. Each matrix holds at most
+# 256 rows, GitHub's cap on one matrix (C7 judges the targets and the deny
+# manifests, the root and one a fuzz manifest).
 #
 # Knobs: INF_CHECK_ROOT (a fixture root); INF_FUZZ_CARGO (the cargo binary,
 # the self-test's stub); INF_FUZZ_CHECK_PROBE=off skips the probe on a
