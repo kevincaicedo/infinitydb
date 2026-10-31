@@ -87,8 +87,33 @@ fmt:
 dag:
     ./scripts/check-dep-dag.sh
 
+# cargo-deny on every lock that holds a third-party crate, the root's and
+# each fuzz manifest's: the manifests the fuzz census lists (ADR-0198 D6),
+# with the features PR CI's cargo-deny jobs judge (--all-features, the
+# action's default). Every leg runs and its status is read; one red leg
+# fails the recipe. The first leg fetches the advisory database and the rest
+# read that copy, so every leg judges one snapshot.
 deny:
-    cargo deny check
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rows=$(./scripts/check-fuzz-targets.sh --matrix deny)
+    list='import json, sys; print("\n".join(r["manifest"] for r in json.load(sys.stdin)["include"]))'
+    manifests=$(python3 -I -c "$list" <<<"$rows")
+    n=0 red=0 fetch=check
+    while IFS= read -r manifest; do
+        n=$((n + 1))
+        if cargo deny --manifest-path "$manifest" --all-features $fetch; then
+            echo "deny: $manifest ok"
+        else
+            status=$?
+            echo "deny: $manifest red (cargo deny exited $status)"
+            red=$((red + 1))
+        fi
+        fetch="check --disable-fetch"
+    done <<<"$manifests"
+    [ "$n" -gt 0 ] || { echo "deny SCOPE ERROR: the fuzz census listed no manifest"; exit 1; }
+    [ "$red" -eq 0 ] || { echo "deny FAILED: $red of $n manifests red"; exit 1; }
+    echo "deny OK: $n manifests (the root and $((n - 1)) fuzz manifests), each rc 0"
 
 # Loom models: the SPSC ring and checkpoint issuance (PRs touching inf-fabric
 # or inf-foundation's `issue` module must run this).

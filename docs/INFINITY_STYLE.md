@@ -933,10 +933,11 @@ ADR-0106 D16). Internal dependencies are allowed.
 
 Review a dependency's transitive graph, features, unsafe code, allocation,
 blocking behavior, determinism, portability, build cost, and maintenance.
-`cargo deny check` gates licenses and advisories. Pin reproducible inputs
-and review updates as code changes. Disable unused features and keep
-optional engines absent from slim builds. A familiar API is not a reason
-to import a runtime or allocator into a cell.
+`just deny` gates licenses and advisories: `cargo deny` on every lock that
+holds a third-party crate, the workspace's and each fuzz workspace's. Pin
+reproducible inputs and review updates as code changes. Disable unused
+features and keep optional engines absent from slim builds. A familiar API
+is not a reason to import a runtime or allocator into a cell.
 
 ## Tools
 
@@ -947,8 +948,8 @@ script that works on exactly one machine. Keep shell for straightforward
 process composition; move complex state and parsing into typed, tested code.
 
 - Make the documented command the real entry point. Run from the workspace
-  root; use `just check` and `cargo deny check` for the required baseline,
-  then the affected layer's validation. Keep local and CI invocations aligned.
+  root; use `just check` and `just deny` for the required baseline, then
+  the affected layer's validation. Keep local and CI invocations aligned.
 - Scripts validate arguments, quote paths, use explicit working directories,
   preserve command failures through pipelines, and collect every child
   process's exit status. Give subprocesses a bounded lifetime and cleanup.

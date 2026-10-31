@@ -62,8 +62,8 @@ every change runs through:
    byte-diffed against Redis in the compatibility corpus. Unsafe code gets
    Miri/Loom coverage. Every new oracle has a canary: a planted bug that
    turns it red.
-5. **Validate.** `just check` and `cargo deny check` green, plus the layer
-   checks for what you touched (see [the validation ladder](#the-validation-ladder)).
+5. **Validate.** `just check` and `just deny` green, plus the layer checks
+   for what you touched (see [the validation ladder](#the-validation-ladder)).
 6. **Commit and open the PR.** One logical change per commit, a short
    one-line message stating the concrete change, and the
    [PR checklist](.github/PULL_REQUEST_TEMPLATE.md) filled in. The PR
@@ -72,7 +72,7 @@ every change runs through:
 
 A change is **done** when it is reachable from the wire at the shipped
 topology (the multi-cell `infinityd`, not only a library tier), its tests
-landed with it, `just check` and `cargo deny check` are green, and a fix
+landed with it, `just check` and `just deny` are green, and a fix
 answers its class question: which type, table or lint makes the sibling
 bug impossible — or why no such class exists.
 
@@ -169,12 +169,14 @@ bug in the docs: open an issue (or fix it in your first PR).
 ## The validation ladder
 
 Run these before opening a PR — CI runs the same checks. `just check` is
-the required baseline; `cargo deny check` checks dependency licenses and
-advisories:
+the required baseline; `just deny` checks dependency licenses, advisories,
+bans and sources in every lock that holds a third-party crate — the
+workspace's and each fuzz workspace's, as CI does, one `cargo deny` run
+each:
 
 ```bash
 just check
-cargo deny check
+just deny
 ```
 
 `just check` runs `cargo fmt --check`; every mechanical gate under

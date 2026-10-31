@@ -32,7 +32,7 @@ Run from the Rust repository root:
 
 ```bash
 just check
-cargo deny check
+just deny
 just compat
 just sim-smoke
 ```
