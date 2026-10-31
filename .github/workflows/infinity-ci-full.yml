@@ -148,7 +148,10 @@ jobs:
     # directory but refuses a named one that is missing, and a target's
     # working corpus, fuzz/corpus/<target>, is committed for some targets and
     # absent from a fresh checkout for the rest, so the job creates it before
-    # the run names it beside the target's seed directories.
+    # the run names it beside the target's seed directories. Each job is
+    # named by its target, unique across the tree, rather than by every
+    # matrix value.
+    name: fuzz-smoke ${{ matrix.target }}
     needs: [authorize, fuzz-targets]
     strategy:
       fail-fast: false

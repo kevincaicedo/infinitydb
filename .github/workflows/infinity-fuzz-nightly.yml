@@ -38,6 +38,9 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   fuzz-hour:
+    # Named by its target, unique across the tree, rather than by every
+    # matrix value.
+    name: fuzz-hour ${{ matrix.target }}
     needs: targets
     runs-on: ubuntu-24.04
     timeout-minutes: 355
