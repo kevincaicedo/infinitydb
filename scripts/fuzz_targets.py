@@ -24,8 +24,10 @@ holds a listed file, and one that names no target of its workspace is red.
 A target reaches production code through its crate (ADR-0198 D4). It may
 include a file by `#[path]` only from a package with no library target. That
 file, and any file it includes by `#[path]`, names nothing through `crate::`
-or `super::`, declares no module by file without `#[path]` and calls no
-`include!`, outside its test modules as `strip-test-modules.awk` finds them.
+or `super::` or an alias of either (`use crate as x;`, `use super as x;`,
+`extern crate self as x;`), declares no module by file without `#[path]` and
+calls no `include!`, outside its test modules as `strip-test-modules.awk`
+finds them.
 No target calls `include!`, whether or not it includes a file by `#[path]`:
 the gate does not follow it, and a library's file compiled that way
 resolves `crate::` to the fuzz crate, which could then define the bound
@@ -78,6 +80,9 @@ TEST_ATTR = re.compile(r"^\s*#\[cfg\((?:test|all\(test,.*\))\)\]\s*$")
 ATTR_OPEN = re.compile(r"#\s*!?\s*\[")
 PATH_KEY = re.compile(r"\bpath\s*=")
 NAMES_ROOT = re.compile(r"\b(crate|super)\s*::")
+# An alias names the same root without `::` after it; in a fuzz crate it is
+# the fuzz crate's root, so it is red as `crate::` is.
+ALIASES_ROOT = re.compile(r"\b(?:crate|super)\s+as\b|\bextern\s+crate\s+self\b")
 # The macro's name in code, so a space before `!`, a path and an alias
 # (`use core::include as x;`) are read as the call they make.
 INCLUDE = re.compile(r"\binclude\b")
@@ -295,6 +300,10 @@ class PathScan:
             if NAMES_ROOT.search(line):
                 self.red("H2", f"{where} names `{NAMES_ROOT.search(line).group(1)}::`, which the "
                          "fuzz crate resolves to its own root, not the production crate's")
+            if ALIASES_ROOT.search(line):
+                self.red("H2", f"{where} aliases `crate` or `super` "
+                         f"(`{ALIASES_ROOT.search(line).group(0)}`), which the fuzz crate resolves "
+                         "to its own root, not the production crate's")
             if INCLUDE.search(line):
                 self.red("H2", f"{where} calls `include!` (or names it)")
             previous = next((code[k] for k in range(i - 1, -1, -1) if code[k].strip()), "")

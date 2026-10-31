@@ -3698,6 +3698,15 @@ root=$(fz_h_root h2-crate 'pub fn g() -> u8 { crate::parse::f() }')
 fz_red "H2: an included file naming crate::" "bins/b/src/parse.rs:14 names .crate::." "$root"
 root=$(fz_h_root h2-super 'pub fn g() -> u8 { super::parse::f() }')
 fz_red "H2: an included file naming super::" "names .super::." "$root"
+# An alias names the root without `::` after the keyword; rustc accepts each.
+root=$(fz_h_root h2-crate-alias 'use crate as root;
+pub fn g() -> u8 { root::parse::f() }')
+fz_red "H2: an included file aliasing crate" "parse.rs:14 aliases .crate. or .super. (.crate as.)" "$root"
+root=$(fz_h_root h2-super-alias 'use super as up;')
+fz_red "H2: an included file aliasing super" "parse.rs:14 aliases .crate. or .super. (.super as.)" "$root"
+root=$(fz_h_root h2-extern-self 'extern crate self as root;')
+fz_red "H2: an included file naming the root by extern crate self" \
+    "parse.rs:14 aliases .crate. or .super. (.extern crate self.)" "$root"
 root=$(fz_h_root h2-mod 'mod helper;')
 fz_red "H2: an included file declaring a module by file" "declares a module by file without" "$root"
 root=$(fz_h_root h2-include 'include!("other.rs");')

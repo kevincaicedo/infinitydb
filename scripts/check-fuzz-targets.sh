@@ -249,7 +249,7 @@ if reds:
         print(f"{TOKEN}: {red}")
     print(f"fuzz-targets FAILED: {len(reds)} red row(s) ({scope})")
     sys.exit(1)
-print(f"fuzz-targets OK: {scope}, none naming crate:: or super::, declaring a module by file or "
-      "calling include!; no target calls include!, and no including target defines macro_rules! "
+print(f"fuzz-targets OK: {scope}, none naming crate:: or super:: or aliasing either, declaring a "
+      "module by file or calling include!; no target calls include!, and no including target defines macro_rules! "
       "or carries #[macro_use]")
 PY
