@@ -1,10 +1,9 @@
 # InfinityDB CI — heavy suite (main, weekly, and on demand).
 #
-# Runs the jobs that are too slow for every PR push and were the reason the
-# PR pipeline blew up: the full strict-provenance Miri (inf-alloc + inf-fabric,
-# the M0-S02 acceptance gate — was timing out at 45 min), the fuzz smoke
-# (every fuzz target for 300 s, one job a target), and benchmark
-# correctness/compile sanity. Everything else (3-OS
+# Runs the suites past a PR lane's budget: the full strict-provenance Miri
+# (inf-alloc + inf-fabric), longer than a PR job's timeout, and the fuzz smoke
+# (every fuzz target for 300 s, one job a target), more runners than a PR run
+# should hold; and benchmark correctness/compile sanity. Everything else (3-OS
 # build matrix, client-smoke, compat-diff, kernel-matrix, loom, sim-smoke)
 # stays on the fast PR lane in infinity-ci.yml, where it costs little.
 #
