@@ -57,8 +57,12 @@
 #
 # --matrix nightly|smoke judges the census only and prints the fuzz jobs'
 # matrix, one row per target in census order ({"include": [{"dir",
-# "target", "seeds"}, ...]}); a red census prints none and exits 1, its rows
-# and a scope error on stderr, so stdout holds the matrix or nothing.
+# "target", "seeds"}, ...]}); --matrix deny prints PR CI's cargo-deny
+# matrix, the root manifest and then every fuzz manifest ({"include":
+# [{"manifest"}, ...]}), each a workspace with a lock of its own (ADR-0198
+# D6). A red census prints no matrix and exits 1, its rows and a scope error
+# on stderr, so stdout holds the whole matrix or nothing, and a matrix is
+# never empty: an empty census is a scope error.
 #
 # Knobs: INF_CHECK_ROOT (a fixture root); INF_FUZZ_CARGO (the cargo binary,
 # the self-test's stub); INF_FUZZ_CHECK_PROBE=off skips the probe on a
@@ -72,9 +76,10 @@ cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 mode=gate
 case "$#:${1:-}:${2:-}" in
     0::) ;;
-    2:--matrix:nightly | 2:--matrix:smoke) mode=matrix ;;
-    *) echo "usage: check-fuzz-targets.sh [--matrix nightly|smoke]" >&2; exit 2 ;;
+    2:--matrix:nightly | 2:--matrix:smoke | 2:--matrix:deny) mode=matrix ;;
+    *) echo "usage: check-fuzz-targets.sh [--matrix nightly|smoke|deny]" >&2; exit 2 ;;
 esac
+matrix=${2:-}
 probe=${INF_FUZZ_CHECK_PROBE:-on}
 [ "$mode" = gate ] || probe=on
 case "$probe" in
@@ -87,7 +92,7 @@ case "$probe" in
     *) echo "FUZZ-TARGETS SCOPE ERROR: INF_FUZZ_CHECK_PROBE is '$probe', not on or off"; exit 1 ;;
 esac
 
-INF_SCRIPT_DIR="$SCRIPT_DIR" INF_FUZZ_MODE="$mode" INF_FUZZ_PROBE="$probe" \
+INF_SCRIPT_DIR="$SCRIPT_DIR" INF_FUZZ_MODE="$mode" INF_FUZZ_MATRIX="$matrix" INF_FUZZ_PROBE="$probe" \
     INF_FUZZ_CARGO_BIN="${INF_FUZZ_CARGO:-cargo}" python3 -I -B - <<'PY'
 import json
 import os
@@ -152,7 +157,9 @@ if MODE == "matrix":
         print(f"{TOKEN}: {red}", file=sys.stderr)
     if reds:
         sys.exit(1)
-    print(json.dumps(fuzz_targets.matrix(census), separators=(",", ":")))
+    rows = (fuzz_targets.deny_matrix if os.environ["INF_FUZZ_MATRIX"] == "deny"
+            else fuzz_targets.matrix)(census)
+    print(json.dumps(rows, separators=(",", ":")))
     sys.exit(0)
 
 ENV = {k: v for k, v in os.environ.items() if k != "CARGO_ENCODED_RUSTFLAGS"}

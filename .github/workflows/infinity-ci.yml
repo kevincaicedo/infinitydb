@@ -191,14 +191,41 @@ jobs:
       - name: criterion benches compile (no measurements)
         run: cargo bench --workspace --no-run
 
+  deny-manifests:
+    # The manifests cargo-deny reads, from the fuzz census (ADR-0198 D6): the
+    # root and every fuzz manifest, each a workspace with a lock of its own.
+    # The census runs before any toolchain is installed. A red census fails
+    # this step before its output is written, so no cargo-deny job runs on a
+    # partial list, and the census never prints an empty one.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.census.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: the manifests cargo-deny reads
+        id: census
+        shell: bash
+        run: |
+          matrix=$(./scripts/check-fuzz-targets.sh --matrix deny)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   cargo-deny:
+    # Licences, advisories, bans and sources of every lock in the tree, one
+    # job a manifest: build-test compiles every fuzz target, so a fuzz lock's
+    # crates (libfuzzer-sys, and the cc its build script runs) are built on
+    # every PR leg.
+    needs: deny-manifests
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.deny-manifests.outputs.matrix) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          manifest-path: Cargo.toml
+          manifest-path: ${{ matrix.manifest }}
 
   miri-canary:
     # REDUCED: strict-provenance Miri on the smallest unsafe leaf (inf-alloc)

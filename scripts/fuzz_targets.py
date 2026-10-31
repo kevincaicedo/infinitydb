@@ -2,7 +2,9 @@
 
 `check-fuzz-targets.sh` and the fuzz workflows read the targets through
 `census`, `check-lint-scopes.sh` through `bin_rows`; no other list of them
-exists, so a new target is in every one of them from its first commit.
+exists, so a new target is in every one of them from its first commit. PR
+CI's `cargo-deny` job reads the manifests through `deny_matrix`: the root
+and every fuzz manifest, each a workspace whose lock it judges.
 
 A manifest in the tree is one of four kinds: the root manifest; a member of
 the root workspace (its `members` globs); a fuzz manifest, at
@@ -460,3 +462,9 @@ def matrix(c):
     """One row per target, in census order (ADR-0198 D3)."""
     return {"include": [{"dir": t.member, "target": t.name, "seeds": " ".join(t.seeds)}
                         for t in c.targets]}
+
+
+def deny_matrix(c):
+    """The root manifest, then every fuzz manifest in census order: each is a
+    workspace with a lock of its own, so `cargo deny` reads each (ADR-0198 D6)."""
+    return {"include": [{"manifest": m} for m in ["Cargo.toml", *c.workspaces]]}

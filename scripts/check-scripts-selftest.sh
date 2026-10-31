@@ -4015,15 +4015,16 @@ fz_sed '/^name = "plant_cfg"$/,/^path = /d' "$root/$FZ_PM"
 expect_red_because "fuzz-targets: an edited-down probe" "an edited-down probe proves less" fz_probe_run "$root"
 
 # The matrix mode: one row per target in census order with its seed
-# directories; a red census prints nothing on stdout and exits 1.
+# directories, or (deny) the root and every fuzz manifest; a red census
+# prints nothing on stdout and exits 1.
 fz_matrix_is() { # <root> <mode> <expected stdout>
     local got
     got=$(env INF_CHECK_ROOT="$1" "$FUZZ" --matrix "$2") || return 1
     [ "$got" = "$3" ] || { echo "matrix: $got"; return 1; }
 }
-fz_matrix_red() { # <root>
+fz_matrix_red() { # <root> [<mode>]
     local got status=0
-    got=$(env INF_CHECK_ROOT="$1" "$FUZZ" --matrix nightly 2>/dev/null) || status=$?
+    got=$(env INF_CHECK_ROOT="$1" "$FUZZ" --matrix "${2:-nightly}" 2>/dev/null) || status=$?
     [ "$status" -eq 1 ] && [ -z "$got" ]
 }
 root=$(fz_root matrix)
@@ -4035,6 +4036,9 @@ FZ_ROWS='{"include":[{"dir":"bins/b","target":"b_parse","seeds":""},{"dir":"crat
 expect green "fuzz-targets: --matrix nightly prints every target with its seeds" \
     fz_matrix_is "$root" nightly "$FZ_ROWS"
 expect green "fuzz-targets: --matrix smoke prints the same rows" fz_matrix_is "$root" smoke "$FZ_ROWS"
+FZ_DENY='{"include":[{"manifest":"Cargo.toml"},{"manifest":"bins/b/fuzz/Cargo.toml"},{"manifest":"crates/a/fuzz/Cargo.toml"}]}'
+expect green "fuzz-targets: --matrix deny prints the root and every fuzz manifest" \
+    fz_matrix_is "$root" deny "$FZ_DENY"
 fz_matrix_knob() { # <root> <rows>: the matrix mode compiles nothing, so it reads no probe knob
     local got
     got=$(env INF_CHECK_ROOT="$1" INF_FUZZ_CHECK_PROBE=no "$FUZZ" --matrix nightly) || return 1
@@ -4044,6 +4048,7 @@ expect green "fuzz-targets: the matrix mode reads no probe knob" fz_matrix_knob 
 mkdir -p "$root/crates/a/fuzz/corpora/gone"
 printf 'x' >"$root/crates/a/fuzz/corpora/gone/seed"
 expect green "fuzz-targets: a red census prints no matrix and exits 1" fz_matrix_red "$root"
+expect green "fuzz-targets: a red census prints no deny matrix and exits 1" fz_matrix_red "$root" deny
 fz_matrix_scope() { # <root>: a scope error in matrix mode, its reason on stderr alone
     local got status=0
     got=$(env INF_CHECK_ROOT="$1" "$FUZZ" --matrix nightly 2>"$1.stderr") || status=$?
@@ -4054,6 +4059,7 @@ root=$(fz_root matrix-scope)
 rm -rf "${root:?}/crates/a/fuzz" "${root:?}/bins/b/fuzz"
 expect green "fuzz-targets: a matrix scope error prints no matrix, its reason on stderr" \
     fz_matrix_scope "$root"
+expect green "fuzz-targets: an empty census prints no deny matrix" fz_matrix_red "$root" deny
 expect_red_because "fuzz-targets: an unknown matrix" "usage: check-fuzz-targets.sh" \
     env INF_CHECK_ROOT="$root" "$FUZZ" --matrix weekly
 
