@@ -29,7 +29,7 @@
 # a warning, a stale lock), each compiler error printed under the workspace
 # and target that produced it, and cargo's own errors under the workspace
 # with their `Caused by:` and `help:` lines (a lock cargo refuses names the
-# refresh that moves no pinned version); the bins cargo reports compiled
+# refresh that adds what the lock lacks); the bins cargo reports compiled
 # for a workspace differing from its [[bin]] rows, whatever cargo's status
 # (the count is printed for every workspace, green or red). Every row is
 # judged and printed before the gate exits; only an empty census stops it
@@ -208,8 +208,9 @@ class Report:
             # bare `cargo update` would move every pin of the lock.
             lock = os.path.join(os.path.dirname(self.manifest), "Cargo.lock")
             print(f"{self.manifest} fix: cargo update --workspace --offline --manifest-path "
-                  f"{self.manifest} adds what the lock lacks and moves no pinned version (drop "
-                  f"--offline to fetch a crate the registry cache lacks); then commit {lock}")
+                  f"{self.manifest} adds what the lock lacks and updates a pinned package only "
+                  "when the manifests no longer admit it (drop --offline to fetch a crate the "
+                  f"registry cache lacks); then commit {lock}")
 
 
 def e0433(message, crate, file_suffix=None):

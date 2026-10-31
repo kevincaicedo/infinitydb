@@ -3821,7 +3821,7 @@ expect_output "fuzz-targets: a long cargo block counts what it omits" "^    \.\.
     fz_replay "$root.log"
 expect_output "fuzz-targets: a long cargo block keeps its last line" "^      line 40$" fz_replay "$root.log"
 expect green "fuzz-targets: a long cargo block omits its middle" fz_lacks "line 20$" "$root.log"
-# A lock cargo refuses: its help: line, and the refresh that moves no pin.
+# A lock cargo refuses: its help: line, and the refresh that adds what it lacks.
 root=$(fz_root k1-lock)
 fz_status "$root" crates/a/fuzz/Cargo.toml 101
 fz_stderr "$root" crates/a/fuzz/Cargo.toml "error: cannot update the lock file $root/crates/a/fuzz/Cargo.lock because --locked was passed to prevent this
@@ -3830,7 +3830,7 @@ fz_once "$root.log" fz_run "$root"
 expect_red_because "fuzz-targets: K1 prints cargo's help: line on a refused lock" \
     "^    help: to generate the lock file without accessing the network" fz_replay "$root.log"
 expect_output "fuzz-targets: K1 names the refresh of a refused lock" \
-    "^crates/a/fuzz/Cargo.toml fix: cargo update --workspace --offline --manifest-path crates/a/fuzz/Cargo.toml adds what the lock lacks and moves no pinned version" \
+    "^crates/a/fuzz/Cargo.toml fix: cargo update --workspace --offline --manifest-path crates/a/fuzz/Cargo.toml adds what the lock lacks and updates a pinned package only when the manifests no longer admit it" \
     fz_replay "$root.log"
 expect_output "fuzz-targets: K1 names the lock to commit" "then commit crates/a/fuzz/Cargo.lock$" \
     fz_replay "$root.log"
