@@ -163,6 +163,20 @@ pub fn parse_segment_file_name(name: &str) -> Option<SegmentId> {
     u32::try_from(digits.parse::<u64>().ok()?).ok().map(SegmentId)
 }
 
+impl SegmentIoMode {
+    /// How a frame sealed on a segment of this mode lies on the device
+    /// (ADR-0086 D3): a `Buffered` segment packs (v2), an `O_DIRECT` one
+    /// aligns (v3). The one place the mode picks the layout: the active
+    /// segment and the segment a rotation lands on both read it here.
+    #[must_use]
+    pub const fn layout(self) -> FrameLayout {
+        match self {
+            SegmentIoMode::Buffered => FrameLayout::Packed,
+            SegmentIoMode::Direct => FrameLayout::Aligned,
+        }
+    }
+}
+
 /// Lifecycle configuration. Values are per-cell config (M2 plan §4);
 /// time-based sealing ships default-off (the M2 cut line — size sealing is
 /// the load-bearing path).
@@ -494,10 +508,7 @@ struct ActiveSegment<File> {
 
 impl<File> ActiveSegment<File> {
     fn layout(&self) -> FrameLayout {
-        match self.io_mode {
-            SegmentIoMode::Buffered => FrameLayout::Packed,
-            SegmentIoMode::Direct => FrameLayout::Aligned,
-        }
+        self.io_mode.layout()
     }
 }
 
@@ -879,11 +890,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// (a fresh segment is created in the configured mode).
     #[must_use]
     pub fn next_layout(&self) -> FrameLayout {
-        let mode = self.next.as_ref().map_or(self.cfg.io_mode, |next| next.io_mode);
-        match mode {
-            SegmentIoMode::Buffered => FrameLayout::Packed,
-            SegmentIoMode::Direct => FrameLayout::Aligned,
-        }
+        self.next.as_ref().map_or(self.cfg.io_mode, |next| next.io_mode).layout()
     }
 
     /// True while the active segment writes write-through frames for
