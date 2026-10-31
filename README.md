@@ -173,7 +173,8 @@ You need Linux (x86-64 or aarch64) with `io_uring`, kernel 5.15 or newer
 only. `rust-toolchain.toml` pins Rust 1.95, which `rustup` installs for you.
 The development tasks use [`just`](https://github.com/casey/just), and the
 test suite needs Redis 8.0.5 on `PATH` (or `INF_COMPAT_ORACLE_ADDR` pointing at
-one) and Python 3.11 or newer.
+one) and Python 3.11 or newer. `just check` also needs a C++17 compiler: it
+compiles the fuzz targets, and their build compiles libFuzzer's C++ runtime.
 
 - `cargo build --release -p infinityd` builds the server
   (`infinityd --help` prints its usage).

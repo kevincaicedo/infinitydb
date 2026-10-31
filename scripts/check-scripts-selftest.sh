@@ -1782,9 +1782,22 @@ LS_DENY='#![cfg_attr(
         clippy::arithmetic_side_effects
     )
 )]'
+# ls_fuzz_rows <root> <target…>: the fixture crate's fuzz manifest, one
+# [[bin]] row a target — the gate reads the targets from these rows.
+ls_fuzz_rows() {
+    local root=$1 name
+    shift
+    printf '[package]\nname = "fake-fuzz"\n\n[package.metadata]\ncargo-fuzz = true\n\n[workspace]\n' \
+        >"$root/crates/fake/fuzz/Cargo.toml"
+    for name in "$@"; do
+        printf '\n[[bin]]\nname = "%s"\npath = "fuzz_targets/%s.rs"\n' "$name" "$name" \
+            >>"$root/crates/fake/fuzz/Cargo.toml"
+    done
+}
 ls_scopes() {
     mkdir -p "$1/crates/fake/fuzz/fuzz_targets" "$1/docs"
     printf '// fuzz\n' >"$1/crates/fake/fuzz/fuzz_targets/t.rs"
+    ls_fuzz_rows "$1" t
     printf 'fake/t\tnone: the fixture target enters no decoder\t-\t-\n' >"$1/docs/lint-scopes.tsv"
     printf '# file\titem\tcount\trecord\texpiry\n' >"$1/docs/container-exemptions.tsv"
 }
@@ -1941,8 +1954,11 @@ pub fn f() {}" >/dev/null
 # `deny` row's file carries the attribute
 root=$(ls_root ls-table)
 printf '// fuzz\n' >"$root/crates/fake/fuzz/fuzz_targets/new_decoder.rs"
-expect red "lint-scopes: a fuzz target no row names" ls_run "$root"
+ls_fuzz_rows "$root" t new_decoder
+expect_red_because "lint-scopes: a fuzz target no row names" \
+    'fuzz target `fake/new_decoder` is named by no row' ls_run "$root"
 rm "$root/crates/fake/fuzz/fuzz_targets/new_decoder.rs"
+ls_fuzz_rows "$root" t
 printf 'fake/gone\tcrates/fake/src/lib.rs\tcast,arith\tratchet\n' >>"$root/docs/lint-scopes.tsv"
 expect red "lint-scopes: a row naming a target that is gone" ls_run "$root"
 ls_scopes "$root"
@@ -2991,7 +3007,9 @@ expect_red_because "lint-scopes: allow-invalid, which silences an inert entry, i
 # leg, so each architecture of PROBE_LEG_ARCHES needs a build-test matrix leg
 # that runs every probe gate with no `if:` or `continue-on-error:`, and no
 # knob that retargets or skips their probes — else its entries are disclosed
-# everywhere and enforced nowhere. The waker gate runs on the Linux legs only
+# everywhere and enforced nowhere. The fuzz-target gate is held the same way
+# (ADR-0198 D2): each leg compiles the fuzz targets under its own `cfg`
+# (process_info.rs's Linux and non-Linux `read_cpu` arms among them). The waker gate runs on the Linux legs only
 # (ADR-0106 D8): its step may carry exactly `if: runner.os == 'Linux'`, and
 # because atomics are spelled per target, each of WAKER_LEG_TARGETS needs a
 # Linux leg of that triple — macOS shares aarch64 but not the spelling.
@@ -3008,7 +3026,8 @@ RUNNER = {"ubuntu-24.04": ("x86_64", "x86_64-unknown-linux-gnu", "Linux"),
           "macos-15": ("aarch64", "aarch64-apple-darwin", "macOS")}
 WAKER = "./scripts/check-waker-atomics.sh"
 WAKER_IF = "if: runner.os == 'Linux'"
-GATES = ("./scripts/check-clock-ban.sh", "./scripts/check-lint-scopes.sh", WAKER)
+GATES = ("./scripts/check-clock-ban.sh", "./scripts/check-lint-scopes.sh", WAKER,
+         "./scripts/check-fuzz-targets.sh")
 lines = open(wf, encoding="utf-8").read().split("\n")
 if "  build-test:" not in lines:
     sys.exit(f"LEG-COVERAGE: {wf} has no build-test job")
@@ -3019,7 +3038,8 @@ job, errors = lines[start:end], []
 # workflow's top-level env or anywhere in the job (a step can export through
 # $GITHUB_ENV), the probe gates inherit them; comments aside.
 KNOBS = re.compile(r"\b(CARGO_BUILD_TARGET|INF_LINT_RULES|INF_LINT_API_DIAGNOSTICS|INF_LINT_PROBE\w*"
-                   r"|INF_CHECK_ROOT|INF_CLOCK_BAN_PROBE|INF_WAKER_\w+)\b")
+                   r"|INF_CHECK_ROOT|INF_CLOCK_BAN_PROBE|INF_WAKER_\w+|INF_FUZZ_CARGO"
+                   r"|INF_FUZZ_CHECK_PROBE)\b")
 if "jobs:" not in lines:
     errors.append("no top-level `jobs:` line")
 for line in (lines[:lines.index("jobs:")] if "jobs:" in lines else []) + job:
@@ -3113,6 +3133,18 @@ awk -v a="        env:" -v b='          INF_LINT_RULES: "1"' \
     '{ print } $0 == "        run: ./scripts/check-lint-scopes.sh" { print a; print b }' "$LS_WF" >"$work/wf-rules.yml"
 expect_red_because "probe-target: a step env that ends lint-scopes before its probe is red" \
     "\`INF_LINT_RULES\` is set where the probe gates inherit it" legs_cover "$work/wf-rules.yml"
+awk -v row="        if: runner.os == 'Linux'" \
+    '{ print } $0 == "        run: ./scripts/check-fuzz-targets.sh" { print row }' "$LS_WF" >"$work/wf-fuzz-if.yml"
+expect_red_because "probe-target: the fuzz-target gate's step under an if: is red" \
+    'the step that runs ./scripts/check-fuzz-targets.sh carries `if:`' legs_cover "$work/wf-fuzz-if.yml"
+awk -v a="        env:" -v b='          INF_FUZZ_CHECK_PROBE: "off"' \
+    '{ print } $0 == "        run: ./scripts/check-fuzz-targets.sh" { print a; print b }' "$LS_WF" >"$work/wf-fuzz-off.yml"
+expect_red_because "probe-target: a step env that skips the fuzz-target probe is red" \
+    "\`INF_FUZZ_CHECK_PROBE\` is set where the probe gates inherit it" legs_cover "$work/wf-fuzz-off.yml"
+awk -v a="    env:" -v b="      INF_FUZZ_CARGO: /bin/true" \
+    '{ print } $0 == "    runs-on: ${{ matrix.os }}" { print a; print b }' "$LS_WF" >"$work/wf-fuzz-cargo.yml"
+expect_red_because "probe-target: a job env that replaces the fuzz-target gate's cargo is red" \
+    "\`INF_FUZZ_CARGO\` is set where the probe gates inherit it" legs_cover "$work/wf-fuzz-cargo.yml"
 
 # ADR-0144 A1: keep the unstable refusal distinct from Clippy witnesses.
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-stable"
@@ -3344,9 +3376,487 @@ expect green "arith-spellings: an item scope counts inside its fn" \
 as_root item-wide "$D::g" "saturating	2	$D::g"
 as_red item-wide "g: 1 .saturating_.. call(s), docs/arith-spellings.tsv says 2"
 
+# ------------------------------------------------- fuzz targets (ADR-0198)
+# check-fuzz-targets.sh on fixture roots, each its own git repository, with a
+# stub cargo (INF_FUZZ_CARGO) that records each call and answers from the
+# files a case writes beside the root: the census rows (C1–C7, H1–H3), cargo's
+# report (K1, K2), the probe (P1–P5, the probe on and the stub answering its
+# two manifests), the call itself, and the matrix mode.
+FUZZ=./scripts/check-fuzz-targets.sh
+FZ_CARGO="$work/fz-cargo"
+IFS= read -r -d '' body <<'EOF' || true
+#!/usr/bin/env bash
+# The stub cargo: records the call, then answers for the manifest it was
+# given from $FZ_STUB/<manifest, / as _>.{out,err,status}.
+set -eu
+manifest='' previous=''
+for arg in "$@"; do
+    [ "$previous" != --manifest-path ] || manifest=$arg
+    previous=$arg
+done
+key=$(printf '%s' "$manifest" | tr '/' '_')
+{
+    printf 'call:'
+    printf ' %s' "$@"
+    printf '\nRUSTFLAGS=%s\n' "${RUSTFLAGS-<unset>}"
+    printf 'CARGO_ENCODED_RUSTFLAGS=%s\n' "${CARGO_ENCODED_RUSTFLAGS-<unset>}"
+} >>"$FZ_STUB/calls"
+[ ! -f "$FZ_STUB/$key.out" ] || cat "$FZ_STUB/$key.out"
+[ ! -f "$FZ_STUB/$key.err" ] || cat "$FZ_STUB/$key.err" >&2
+exit "$(cat "$FZ_STUB/$key.status" 2>/dev/null || echo 0)"
+EOF
+printf '%s' "$body" >"$FZ_CARGO"
+chmod +x "$FZ_CARGO"
+IFS= read -r -d '' FZ_PARSE <<'EOF' || true
+pub fn f() -> u8 {
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one() {
+        assert_eq!(crate::parse::f(), f());
+    }
+}
+EOF
+IFS= read -r -d '' FZ_TARGET <<'EOF' || true
+#[path = "../../src/parse.rs"]
+mod parse;
+
+fn main() {
+    let _ = parse::f();
+}
+EOF
+fz_key() { printf '%s' "$1" | tr '/' '_'; }
+fz_sed() { sed "$1" "$2" >"$2.new" && mv "$2.new" "$2"; }  # <expression> <file>: an edit in place
+fz_artifact() { # <root> <manifest> <bin>
+    printf '{"reason":"compiler-artifact","manifest_path":"%s/%s","target":{"kind":["bin"],"name":"%s"},"fresh":false}\n' \
+        "$1" "$2" "$3"
+}
+fz_error() { # <root> <manifest> <bin> <code> <message> <primary file>
+    printf '{"reason":"compiler-message","manifest_path":"%s/%s","target":{"kind":["bin"],"name":"%s"},"message":{"level":"error","code":{"code":"%s"},"message":"%s","rendered":"error[%s]: %s\\n","spans":[{"file_name":"%s","is_primary":true}]}}\n' \
+        "$1" "$2" "$3" "$4" "$5" "$4" "$5" "$6"
+}
+# fz_answer <root> <manifest> [<bin>…]: the stub reports each bin compiled
+# and exits 0; fz_status and fz_stderr change its exit and stderr.
+fz_answer() {
+    local root=$1 manifest=$2 name out
+    shift 2
+    out="${root:?}.stub/$(fz_key "$manifest")"
+    : >"$out.out"
+    for name in "$@"; do
+        fz_artifact "$root" "$manifest" "$name" >>"$out.out"
+    done
+    : >"$out.err"
+    printf '0\n' >"$out.status"
+}
+fz_status() { printf '%s\n' "$3" >"$1.stub/$(fz_key "$2").status"; }
+fz_stderr() { printf '%s\n' "$3" >"$1.stub/$(fz_key "$2").err"; }
+# fz_manifest <root> <member> [<target>…]: the member's fuzz manifest, one
+# [[bin]] row a target.
+fz_manifest() {
+    local root=$1 member=$2 name
+    shift 2
+    mkdir -p "$root/$member/fuzz/fuzz_targets"
+    printf '[package]\nname = "%s-fuzz"\nversion = "0.0.0"\n\n[package.metadata]\ncargo-fuzz = true\n\n[workspace]\n' \
+        "${member##*/}" >"$root/$member/fuzz/Cargo.toml"
+    for name in "$@"; do
+        printf '\n[[bin]]\nname = "%s"\npath = "fuzz_targets/%s.rs"\n' "$name" "$name" \
+            >>"$root/$member/fuzz/Cargo.toml"
+    done
+}
+# fz_root <name>: members crates/a (a library) and bins/b (a binary), one fuzz
+# workspace each — t_one, and b_parse including bins/b/src/parse.rs by
+# `#[path]` —, the five probe manifests, a `check` recipe running their gates,
+# and the stub answering both workspaces green. Its stub files sit beside it.
+fz_root() {
+    local root probe
+    [ -n "$1" ] && [ -n "$work" ] || { echo "fz_root: empty name" >&2; exit 2; }
+    root="$work/fz-$1"
+    rm -rf "${root:?}" "${root:?}.stub"
+    mkdir -p "$root/crates/a/src" "$root/bins/b/src" "$root/scripts" "$root.stub"
+    printf '[workspace]\nmembers = ["crates/*", "bins/*"]\n' >"$root/Cargo.toml"
+    printf '[package]\nname = "a"\nversion = "0.0.0"\n' >"$root/crates/a/Cargo.toml"
+    printf 'pub fn f() {}\n' >"$root/crates/a/src/lib.rs"
+    printf '[package]\nname = "b"\nversion = "0.0.0"\n' >"$root/bins/b/Cargo.toml"
+    printf 'mod parse;\n\nfn main() {}\n' >"$root/bins/b/src/main.rs"
+    printf '%s' "$FZ_PARSE" >"$root/bins/b/src/parse.rs"
+    fz_manifest "$root" crates/a t_one
+    fz_manifest "$root" bins/b b_parse
+    printf 'fn main() {}\n' >"$root/crates/a/fuzz/fuzz_targets/t_one.rs"
+    printf '%s' "$FZ_TARGET" >"$root/bins/b/fuzz/fuzz_targets/b_parse.rs"
+    cp -R "$SCRIPT_DIR/fuzz-check-probe" "$root/scripts/fuzz-check-probe"
+    for probe in clock-ban-probe lint-scope-probe waker-atomics-probe; do
+        mkdir -p "$root/scripts/$probe"
+        printf '[package]\nname = "%s"\nversion = "0.0.0"\n\n[workspace]\n' "$probe" \
+            >"$root/scripts/$probe/Cargo.toml"
+    done
+    printf 'check:\n    ./scripts/check-clock-ban.sh\n    ./scripts/check-lint-scopes.sh\n' >"$root/justfile"
+    printf '    ./scripts/check-fuzz-targets.sh\n    ./scripts/check-waker-atomics.sh\n' >>"$root/justfile"
+    git -C "$root" init -q
+    fz_answer "$root" crates/a/fuzz/Cargo.toml t_one
+    fz_answer "$root" bins/b/fuzz/Cargo.toml b_parse
+    echo "$root"
+}
+fz_run() { # <root> [args…]: the gate on a fixture root, its probe off
+    env INF_CHECK_ROOT="$1" INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" FZ_STUB="$1.stub" \
+        "$FUZZ" "${@:2}"
+}
+fz_probe_run() { # <root>: the gate with its probe on
+    env INF_CHECK_ROOT="$1" INF_FUZZ_CARGO="$FZ_CARGO" FZ_STUB="$1.stub" "$FUZZ"
+}
+fz_red() { # <label> <pattern> <root>: red on the fixture, naming its row
+    expect_red_because "fuzz-targets: $1" "$2" fz_run "$3"
+}
+
+root=$(fz_root clean)
+expect green "fuzz-targets: a clean two-target root" fz_run "$root"
+expect_output "fuzz-targets: the OK line counts what it compiled and read" \
+    "fuzz-targets OK: 2 fuzz workspaces, 2 of 2 targets compiled (2 .*bin.* rows, 2 files)" fz_run "$root"
+expect_output "fuzz-targets: the OK line discloses the probe off in fixture mode" \
+    "probe: skipped (fixture mode, INF_FUZZ_CHECK_PROBE=off); 5 probe manifests, each run by its gate" \
+    fz_run "$root"
+expect_output "fuzz-targets: the OK line counts the #[path] sites and files read" \
+    "0 seed directories (git-listed); 1 #.path. sites, 1 files read" fz_run "$root"
+expect_output "fuzz-targets: the count line is printed on a green run" \
+    "fuzz-targets: bins/b/fuzz/Cargo.toml: compiled 1 of 1" fz_run "$root"
+expect_red_because "fuzz-targets: the probe stays on outside a fixture root" \
+    "honoured on a fixture root (INF_CHECK_ROOT) only" env -u INF_CHECK_ROOT INF_FUZZ_CHECK_PROBE=off "$FUZZ"
+expect_red_because "fuzz-targets: a probe knob that is neither on nor off" "is 'no', not on or off" \
+    env INF_CHECK_ROOT="$root" INF_FUZZ_CHECK_PROBE=no "$FUZZ"
+
+# The call: every workspace's cargo call carries the flags the verdict rests
+# on, with RUSTFLAGS replaced and CARGO_ENCODED_RUSTFLAGS unset whatever the
+# caller set.
+fz_calls_ok() { # <stub dir>
+    python3 - "$1/calls" <<'PY'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+calls = [lines[i:i + 3] for i in range(0, len(lines) - 1, 3)]
+want = {"bins/b/fuzz/Cargo.toml", "crates/a/fuzz/Cargo.toml"}
+rest = ["--bins", "--locked", "--keep-going", "--message-format", "json", "--color", "never",
+        "--target-dir", "target/fuzz-check"]
+seen, bad = set(), []
+for call, flags, encoded in calls:
+    argv = call.split(" ")[1:]
+    if len(argv) < 3 or argv[:2] != ["check", "--manifest-path"]:
+        bad.append(f"not a check call: {call}")
+        continue
+    seen.add(argv[2])
+    if argv[3:] != rest:
+        bad.append(f"{argv[2]}: {' '.join(argv[3:])}")
+    if flags != "RUSTFLAGS=-D warnings --cfg fuzzing":
+        bad.append(f"{argv[2]}: {flags}")
+    if encoded != "CARGO_ENCODED_RUSTFLAGS=<unset>":
+        bad.append(f"{argv[2]}: {encoded}")
+if seen != want:
+    bad.append(f"workspaces called: {sorted(seen)}")
+print("\n".join(bad))
+sys.exit(1 if bad else 0)
+PY
+}
+fz_argv_run() { # <gate> <root>: the gate under a caller's own RUSTFLAGS
+    env RUSTFLAGS=-Awarnings CARGO_ENCODED_RUSTFLAGS=-Awarnings INF_CHECK_ROOT="$2" \
+        INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" FZ_STUB="$2.stub" "$1"
+}
+root=$(fz_root argv)
+expect green "fuzz-targets: green under a caller's RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS" \
+    fz_argv_run "$FUZZ" "$root"
+expect green "fuzz-targets: each workspace's call carries the gate's flags and environment" \
+    fz_calls_ok "$root.stub"
+# The call's canaries: a copy of the gate with one part of its call dropped
+# turns the case red.
+fz_mutant() { # <name> <sed expression> <what the copy drops>
+    local dir mroot
+    dir="$work/fz-gate-$1"
+    rm -rf "${dir:?}"
+    mkdir -p "$dir"
+    cp "$SCRIPT_DIR/check-fuzz-targets.sh" "$SCRIPT_DIR/fuzz_targets.py" "$SCRIPT_DIR/lint_scope_table.py" \
+        "$SCRIPT_DIR/strip-test-modules.awk" "$dir/"
+    fz_sed "$2" "$dir/check-fuzz-targets.sh"
+    chmod +x "$dir/check-fuzz-targets.sh"
+    if cmp -s "$SCRIPT_DIR/check-fuzz-targets.sh" "$dir/check-fuzz-targets.sh"; then
+        echo "selftest: the fuzz-targets mutant '$1' changed nothing" >&2
+        exit 2
+    fi
+    mroot=$(fz_root "mutant-$1")
+    fz_argv_run "$dir/check-fuzz-targets.sh" "$mroot" >/dev/null 2>&1 || true
+    expect red "fuzz-targets: the call's check is red on a gate that $3" fz_calls_ok "$mroot.stub"
+}
+fz_mutant bins 's/"check", "--bins", /"check", /' "drops --bins"
+fz_mutant locked 's/"--locked", //' "drops --locked"
+fz_mutant keep-going 's/"--keep-going", //' "drops --keep-going"
+fz_mutant format 's/"--message-format", "json",/"--message-format", "short",/' "reads cargo's short format"
+fz_mutant color 's/"--color", "never", //' "drops --color never"
+fz_mutant target-dir 's|"--target-dir", "target/fuzz-check"|"--target-dir", "target"|' \
+    "shares the root's target directory"
+fz_mutant warnings 's/^RUSTFLAGS = "-D warnings --cfg fuzzing"$/RUSTFLAGS = "--cfg fuzzing"/' "drops -D warnings"
+fz_mutant cfg 's/^RUSTFLAGS = "-D warnings --cfg fuzzing"$/RUSTFLAGS = "-D warnings"/' "drops --cfg fuzzing"
+fz_mutant encoded 's/ if k != "CARGO_ENCODED_RUSTFLAGS"}/}/' "keeps the caller's CARGO_ENCODED_RUSTFLAGS"
+
+# C1: the scope.
+root=$(fz_root c1-none)
+rm -rf "${root:?}/crates/a/fuzz" "${root:?}/bins/b/fuzz"
+fz_red "C1: no fuzz manifest is a scope error" "SCOPE ERROR: no fuzz manifest in the tree" "$root"
+root=$(fz_root c1-rows)
+fz_manifest "$root" crates/a
+fz_manifest "$root" bins/b
+fz_red "C1: no [[bin]] row in any fuzz manifest is a scope error" \
+    "SCOPE ERROR: no .*bin.* row in any fuzz manifest" "$root"
+# C2: every manifest is the root, a member, a fuzz manifest or a probe.
+root=$(fz_root c2)
+mkdir -p "$root/tools/x"
+printf '[package]\nname = "x"\nversion = "0.0.0"\n' >"$root/tools/x/Cargo.toml"
+fz_red "C2: an untracked crate no gate compiles" "C2 tools/x/Cargo.toml: a crate no gate compiles" "$root"
+# C3: a fuzz manifest sits at <member>/fuzz with a workspace of its own.
+root=$(fz_root c3-place)
+mkdir -p "$root/crates/a/fuzz2"
+sed 's/name = "a-fuzz"/name = "a-fuzz2"/' "$root/crates/a/fuzz/Cargo.toml" >"$root/crates/a/fuzz2/Cargo.toml"
+fz_red "C3: a fuzz manifest outside <member>/fuzz" \
+    "C3 crates/a/fuzz2/Cargo.toml: a fuzz manifest outside" "$root"
+root=$(fz_root c3-workspace)
+fz_sed '/^\[workspace\]$/d' "$root/crates/a/fuzz/Cargo.toml"
+fz_red "C3: a fuzz manifest without its own [workspace]" \
+    "C3 crates/a/fuzz/Cargo.toml: a fuzz manifest without a .workspace. of its own" "$root"
+# C4: a probe row whose manifest is gone, or whose gate no recipe runs.
+root=$(fz_root c4-gone)
+rm "${root:?}/scripts/waker-atomics-probe/Cargo.toml"
+fz_red "C4: a probe row whose manifest is gone" \
+    "C4 scripts/waker-atomics-probe/Cargo.toml: a probe row whose manifest is gone" "$root"
+root=$(fz_root c4-recipe)
+fz_sed '/check-lint-scopes.sh/d' "$root/justfile"
+fz_red "C4: a probe whose gate the check recipe does not run" \
+    "C4 scripts/lint-scope-probe/Cargo.toml: its gate scripts/check-lint-scopes.sh is not run" "$root"
+# C5: one row a file, at fuzz_targets/<name>.rs, each name once.
+root=$(fz_root c5-file)
+printf 'fn main() {}\n' >"$root/crates/a/fuzz/fuzz_targets/x.rs"
+fz_red "C5: a file under fuzz_targets/ no row names" \
+    "C5 crates/a/fuzz/fuzz_targets/x.rs: a file under fuzz_targets/ that no" "$root"
+root=$(fz_root c5-row)
+fz_manifest "$root" crates/a t_one t_gone
+fz_red "C5: a row whose file is missing" "names fuzz_targets/t_gone.rs, which is not a listed file" "$root"
+root=$(fz_root c5-path)
+printf '\n[[bin]]\nname = "t_src"\npath = "src/t_src.rs"\n' >>"$root/crates/a/fuzz/Cargo.toml"
+fz_red "C5: a row whose path is not fuzz_targets/<name>.rs" "at .src/t_src.rs., not fuzz_targets" "$root"
+root=$(fz_root c5-twice)
+fz_manifest "$root" bins/b b_parse t_one
+printf 'fn main() {}\n' >"$root/bins/b/fuzz/fuzz_targets/t_one.rs"
+fz_red "C5: a target name in two workspaces" "target .t_one. is also a target of" "$root"
+root=$(fz_root c5-orphan)
+mkdir -p "$root/crates/c/fuzz/fuzz_targets"
+printf 'fn main() {}\n' >"$root/crates/c/fuzz/fuzz_targets/y.rs"
+fz_red "C5: a fuzz_targets/ file beside no fuzz manifest" "beside no fuzz manifest" "$root"
+# C6: every seed directory names a target of its workspace; git's listing
+# decides what exists, so an ignored local corpus is never read.
+root=$(fz_root c6-json)
+mkdir -p "$root/crates/a/fuzz/corpora/json"
+printf 'x' >"$root/crates/a/fuzz/corpora/json/seed"
+fz_red "C6: corpora/<a name no target has>" \
+    "C6 crates/a/fuzz/corpora/json: a seed directory that names no target" "$root"
+root=$(fz_root c6-seeds)
+mkdir -p "$root/bins/b/fuzz/seeds/gone"
+printf 'x' >"$root/bins/b/fuzz/seeds/gone/seed"
+fz_red "C6: seeds/gone" "C6 bins/b/fuzz/seeds/gone: a seed directory" "$root"
+root=$(fz_root c6-ignored)
+mkdir -p "$root/crates/a/fuzz/corpus/old" "$root/crates/a/fuzz/corpus/t_one"
+printf 'x' >"$root/crates/a/fuzz/corpus/old/seed"
+printf 'x' >"$root/crates/a/fuzz/corpus/t_one/seed"
+printf 'crates/a/fuzz/corpus/old/\n' >"$root/.gitignore"
+expect_output "fuzz-targets: an ignored local corpus is not read; a listed one is counted" \
+    "1 seed directories (git-listed)" fz_run "$root"
+# C7: GitHub's matrix cap.
+root=$(fz_root c7)
+names=t_one
+i=0
+while [ "$i" -lt 255 ]; do
+    names="$names t_$i"
+    printf 'fn main() {}\n' >"$root/crates/a/fuzz/fuzz_targets/t_$i.rs"
+    i=$((i + 1))
+done
+# shellcheck disable=SC2086
+fz_manifest "$root" crates/a $names
+fz_red "C7: 257 targets are past one matrix" "C7 257 targets: more than one matrix holds" "$root"
+
+# H1–H3: a target reaches production code through its crate (ADR-0198 D4).
+fz_h_root() { # <name> <parse.rs addition>: the clean root, parse.rs extended
+    local hroot
+    hroot=$(fz_root "$1")
+    printf '%s\n' "$2" >>"$hroot/bins/b/src/parse.rs"
+    echo "$hroot"
+}
+root=$(fz_root h1)
+printf '#[path = "../../src/lib.rs"]\nmod a;\n\nfn main() {}\n' >"$root/crates/a/fuzz/fuzz_targets/t_one.rs"
+fz_red "H1: a #[path] into a package with a library target" \
+    "from .crates/a., a package with a library target" "$root"
+root=$(fz_root h1-outside)
+printf '#[path = "../../../../outside.rs"]\nmod a;\n\nfn main() {}\n' >"$root/crates/a/fuzz/fuzz_targets/t_one.rs"
+fz_red "H1: a #[path] out of the tree" "which is not a file of this tree" "$root"
+root=$(fz_h_root h2-crate 'pub fn g() -> u8 { crate::parse::f() }')
+fz_red "H2: an included file naming crate::" "bins/b/src/parse.rs:14 names .crate::." "$root"
+root=$(fz_h_root h2-super 'pub fn g() -> u8 { super::parse::f() }')
+fz_red "H2: an included file naming super::" "names .super::." "$root"
+root=$(fz_h_root h2-mod 'mod helper;')
+fz_red "H2: an included file declaring a module by file" "declares a module by file without" "$root"
+root=$(fz_h_root h2-include 'include!("other.rs");')
+fz_red "H2: an included file calling include!" "parse.rs:14 calls .include!." "$root"
+root=$(fz_h_root h2-deep '#[path = "deep.rs"]
+mod deep;')
+printf '#[path = "deeper.rs"]\nmod deeper;\n' >"$root/bins/b/src/deep.rs"
+printf 'pub fn h() {}\n' >"$root/bins/b/src/deeper.rs"
+fz_red "H2: a third level of #[path]" "a third level of" "$root"
+root=$(fz_root h2-shape)
+printf '#[cfg_attr(fuzzing, path = "../../src/parse.rs")]\nmod parse;\n\nfn main() {}\n' \
+    >"$root/bins/b/fuzz/fuzz_targets/b_parse.rs"
+fz_red "H2: a #[path] shape the gate does not read" "the gate does not read" "$root"
+root=$(fz_root h3-macro)
+printf 'macro_rules! bound {\n    () => {\n        1\n    };\n}\n\n%s' "$FZ_TARGET" \
+    >"$root/bins/b/fuzz/fuzz_targets/b_parse.rs"
+fz_red "H3: an including target defining macro_rules!" "defines a .macro_rules!. and includes" "$root"
+root=$(fz_root h3-macro-use)
+printf '#[macro_use]\n%s' "$FZ_TARGET" >"$root/bins/b/fuzz/fuzz_targets/b_parse.rs"
+fz_red "H3: an including target carrying #[macro_use]" "carries a .#.macro_use.. and includes" "$root"
+root=$(fz_root h3-include)
+printf '%s\ninclude!("../../src/parse.rs");\n' "$FZ_TARGET" >"$root/bins/b/fuzz/fuzz_targets/b_parse.rs"
+fz_red "H3: an including target calling include!" "calls .include!. and includes" "$root"
+
+# K1–K2: cargo's status and its report, against the [[bin]] rows.
+fz_k_root() { # <name>: the clean root with a second target t_two in crates/a
+    local kroot
+    kroot=$(fz_root "$1")
+    fz_manifest "$kroot" crates/a t_one t_two
+    printf 'fn main() {}\n' >"$kroot/crates/a/fuzz/fuzz_targets/t_two.rs"
+    echo "$kroot"
+}
+root=$(fz_k_root k1)
+fz_answer "$root" crates/a/fuzz/Cargo.toml t_one
+fz_error "$root" crates/a/fuzz/Cargo.toml t_two E0433 'cannot find module or crate `gone`' \
+    fuzz_targets/t_two.rs >>"$root.stub/$(fz_key crates/a/fuzz/Cargo.toml).out"
+fz_status "$root" crates/a/fuzz/Cargo.toml 101
+fz_red "K1: cargo exits non-zero" "K1 crates/a/fuzz/Cargo.toml: cargo exited 101" "$root"
+expect_output "fuzz-targets: K1 prints the count line too" \
+    "crates/a/fuzz/Cargo.toml: compiled 1 of 2 (missing: t_two)" fz_run "$root"
+expect_output "fuzz-targets: K1 prints each error under its workspace and target" \
+    "crates/a/fuzz/Cargo.toml bin t_two:" fz_run "$root"
+root=$(fz_root k1-unread)
+printf 'Compiling a-fuzz\n' >>"$root.stub/$(fz_key crates/a/fuzz/Cargo.toml).out"
+fz_red "K1: a report line that is not cargo's JSON" "1 report lines unread" "$root"
+root=$(fz_k_root k2-one)
+fz_answer "$root" crates/a/fuzz/Cargo.toml t_one
+fz_red "K2: cargo exits 0 having compiled one of two bins" \
+    "K2 crates/a/fuzz/Cargo.toml: the bins cargo compiled are not its" "$root"
+expect_output "fuzz-targets: K2 names the missing bin" "compiled 1 of 2 (missing: t_two)" fz_run "$root"
+root=$(fz_k_root k2-none)
+fz_answer "$root" crates/a/fuzz/Cargo.toml
+fz_red "K2: cargo exits 0 printing no artifact" "compiled 0 of 2 (missing: t_one, t_two)" "$root"
+root=$(fz_root k2-extra)
+fz_answer "$root" crates/a/fuzz/Cargo.toml t_one t_extra
+fz_red "K2: a bin no row names" "(unexpected: t_extra)" "$root"
+
+# P1–P5: the probe on, the stub answering its two manifests as the toolchain
+# does (fz_probe <root> [<plant>]: the true answer, or that plant's escape).
+FZ_PM=scripts/fuzz-check-probe/Cargo.toml
+FZ_PL=scripts/fuzz-check-probe/stale-lock/Cargo.toml
+fz_probe() {
+    local root=$1 plant=${2:-none} out
+    out="$root.stub/$(fz_key "$FZ_PM").out"
+    : >"$out"
+    case $plant in
+    p1-compiled) fz_artifact "$root" "$FZ_PM" plant_crate >>"$out" ;;
+    p1-code) fz_error "$root" "$FZ_PM" plant_crate E0425 'cannot find value `BOUND`' \
+        fuzz_targets/../shared/leaf.rs >>"$out" ;;
+    p1-file) fz_error "$root" "$FZ_PM" plant_crate E0433 'cannot find module or crate `absent_crate`' \
+        fuzz_targets/plant_crate.rs >>"$out" ;;
+    *) fz_error "$root" "$FZ_PM" plant_crate E0433 \
+        'cannot find module or crate `absent_crate` in this scope' fuzz_targets/../shared/leaf.rs >>"$out" ;;
+    esac
+    case $plant in
+    p2-compiled) fz_artifact "$root" "$FZ_PM" plant_warning >>"$out" ;;
+    p2-code) fz_error "$root" "$FZ_PM" plant_warning E0308 'mismatched types' \
+        fuzz_targets/plant_warning.rs >>"$out" ;;
+    *) fz_error "$root" "$FZ_PM" plant_warning unused_imports \
+        'unused import: `std::collections::BTreeMap`' fuzz_targets/plant_warning.rs >>"$out" ;;
+    esac
+    case $plant in
+    p5-compiled) fz_artifact "$root" "$FZ_PM" plant_cfg >>"$out" ;;
+    p5-crate) fz_error "$root" "$FZ_PM" plant_cfg E0433 'cannot find module or crate `other_crate`' \
+        fuzz_targets/plant_cfg.rs >>"$out" ;;
+    *) fz_error "$root" "$FZ_PM" plant_cfg E0433 \
+        'cannot find module or crate `absent_cfg_crate` in this scope' fuzz_targets/plant_cfg.rs >>"$out" ;;
+    esac
+    [ "$plant" = p3-missing ] || fz_artifact "$root" "$FZ_PM" control >>"$out"
+    fz_status "$root" "$FZ_PM" 101
+    case $plant in
+    p4-compiled) fz_answer "$root" "$FZ_PL" stale_lock ;;
+    p4-other)
+        fz_answer "$root" "$FZ_PL"
+        fz_status "$root" "$FZ_PL" 101
+        fz_stderr "$root" "$FZ_PL" "error: failed to parse manifest at \`$root/$FZ_PL\`" ;;
+    *)
+        fz_answer "$root" "$FZ_PL"
+        fz_status "$root" "$FZ_PL" 101
+        fz_stderr "$root" "$FZ_PL" "error: cannot update the lock file $root/${FZ_PL%Cargo.toml}Cargo.lock because --locked was passed to prevent this" ;;
+    esac
+}
+root=$(fz_root probe)
+fz_probe "$root"
+expect_output "fuzz-targets: the probe's five verdicts on the OK line" \
+    "probe: plant_crate E0433 absent_crate, plant_warning denied, plant_cfg E0433 absent_cfg_crate, control compiled, stale_lock refused by --locked;" \
+    fz_probe_run "$root"
+fz_plant() { # <plant> <label> <pattern>
+    local proot
+    proot=$(fz_root "$1")
+    fz_probe "$proot" "$1"
+    expect_red_because "fuzz-targets: $2" "$3" fz_probe_run "$proot"
+}
+fz_plant p1-compiled "P1: plant_crate compiled" "P1 probe target plant_crate compiled"
+fz_plant p1-code "P1: plant_crate refused for another code" "P1 probe target plant_crate refused without"
+fz_plant p1-file "P1: plant_crate's E0433 outside shared/leaf.rs" "P1 probe target plant_crate refused without"
+fz_plant p2-compiled "P2: plant_warning compiled" "P2 probe target plant_warning compiled"
+fz_plant p2-code "P2: plant_warning refused for another reason" "P2 probe target plant_warning refused without"
+fz_plant p3-missing "P3: no control artifact" "P3 probe target control not compiled"
+fz_plant p4-compiled "P4: a stale lock compiled" "P4 probe target stale_lock compiled, or refused without"
+fz_plant p4-other "P4: stale_lock refused without --locked's message" \
+    "P4 probe target stale_lock compiled, or refused without"
+fz_plant p5-compiled "P5: plant_cfg compiled" "P5 probe target plant_cfg compiled"
+fz_plant p5-crate "P5: plant_cfg's E0433 naming another crate" "P5 probe target plant_cfg refused without"
+root=$(fz_root probe-short)
+fz_probe "$root"
+fz_sed '/^name = "plant_cfg"$/,/^path = /d' "$root/$FZ_PM"
+expect_red_because "fuzz-targets: an edited-down probe" "an edited-down probe proves less" fz_probe_run "$root"
+
+# The matrix mode: one row per target in census order with its seed
+# directories; a red census prints nothing on stdout and exits 1.
+fz_matrix_is() { # <root> <mode> <expected stdout>
+    local got
+    got=$(env INF_CHECK_ROOT="$1" "$FUZZ" --matrix "$2") || return 1
+    [ "$got" = "$3" ] || { echo "matrix: $got"; return 1; }
+}
+fz_matrix_red() { # <root>
+    local got status=0
+    got=$(env INF_CHECK_ROOT="$1" "$FUZZ" --matrix nightly 2>/dev/null) || status=$?
+    [ "$status" -eq 1 ] && [ -z "$got" ]
+}
+root=$(fz_root matrix)
+for kind in corpora seeds; do
+    mkdir -p "$root/crates/a/fuzz/$kind/t_one"
+    printf 'x' >"$root/crates/a/fuzz/$kind/t_one/seed"
+done
+FZ_ROWS='{"include":[{"dir":"bins/b","target":"b_parse","seeds":""},{"dir":"crates/a","target":"t_one","seeds":"fuzz/corpora/t_one fuzz/seeds/t_one"}]}'
+expect green "fuzz-targets: --matrix nightly prints every target with its seeds" \
+    fz_matrix_is "$root" nightly "$FZ_ROWS"
+expect green "fuzz-targets: --matrix smoke prints the same rows" fz_matrix_is "$root" smoke "$FZ_ROWS"
+mkdir -p "$root/crates/a/fuzz/corpora/gone"
+printf 'x' >"$root/crates/a/fuzz/corpora/gone/seed"
+expect green "fuzz-targets: a red census prints no matrix and exits 1" fz_matrix_red "$root"
+expect_red_because "fuzz-targets: an unknown matrix" "usage: check-fuzz-targets.sh" \
+    env INF_CHECK_ROOT="$root" "$FUZZ" --matrix weekly
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, reply-outcome, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, parent-doc-gates, arith-spellings, lint-scopes each exiting non-zero on its planted case)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, reply-outcome, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, parent-doc-gates, arith-spellings, lint-scopes, fuzz-targets each exiting non-zero on its planted case)"

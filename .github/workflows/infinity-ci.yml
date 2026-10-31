@@ -4,14 +4,15 @@
 # tests/ at the top level). Jobs run from the repo root; there is no nested
 # `infinitydb/` directory on the runner.
 #
-# Split (2026-07-17): only the two slow jobs were the problem — `miri`
-# (45-min timeout) and the 14-target `fuzz-smoke` (~70 min). Those are
-# REDUCED here (a strict-provenance canary on inf-alloc, and a single 60-s
-# fuzz smoke) and run in FULL in `infinity-ci-full.yml` (main pushes / weekly /
-# label `ci-full` / `/ci-full` comment / dispatch). Benchmark sanity also runs on every PR. Every
-# other job — the full 3-OS build matrix, client-smoke, compat-diff,
-# kernel-matrix, loom, sim-smoke — stays here: each runs in a few minutes and
-# they run in parallel, so they cost little wall-clock but keep PR coverage.
+# The two slow suites run REDUCED here and in FULL in `infinity-ci-full.yml`
+# (main pushes / weekly / label `ci-full` / `/ci-full` comment / dispatch):
+# Miri as a strict-provenance canary on inf-alloc, and the fuzz smoke as one
+# target, `resp_parse`, for 60 s, while `build-test` compiles every fuzz
+# target on each of its legs (ADR-0198 D2, D3). Benchmark sanity also runs on
+# every PR. Every other job — the full 3-OS build matrix, client-smoke,
+# compat-diff, kernel-matrix, loom, sim-smoke — stays here: each runs in a few
+# minutes and they run in parallel, so they cost little wall-clock but keep
+# PR coverage.
 name: infinity-ci
 
 on:
@@ -82,6 +83,11 @@ jobs:
       # against a colliding hasher until this fence existed.
       - name: shipping-feature fence (ADR-0107)
         run: ./scripts/check-shipping-features.sh
+      # ADR-0198 D2: every fuzz target compiles, warnings denied, under its
+      # committed lock and cfg(fuzzing), on each leg's own cfg; the probe's
+      # planted reds run first, so the gate proves it can see what it guards.
+      - name: fuzz targets compile (ADR-0198)
+        run: ./scripts/check-fuzz-targets.sh
       - name: check scripts self-test (each gate exits non-zero on its planted case)
         run: ./scripts/check-scripts-selftest.sh
       # ADR-0106 first amendment (review 2026-08-30 F-L18-05): the clock
@@ -262,9 +268,11 @@ jobs:
         run: ./scripts/sim-smoke.sh
 
   fuzz-smoke:
-    # REDUCED: one decoder, 60 s, to catch gross breakage fast. cargo-fuzz
-    # auto-creates fuzz/corpus/resp_parse, so no seed dir is needed here. The
-    # full 14-target smoke (300 s each) runs in infinity-ci-full.
+    # REDUCED (ADR-0198 D3): one target, `resp_parse`, for 60 s, the first
+    # decoder every client byte crosses; `build-test` compiles every target
+    # and the full smoke runs in infinity-ci-full. cargo-fuzz creates the
+    # default corpus directory, fuzz/corpus/resp_parse, so no seed directory
+    # is named here.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

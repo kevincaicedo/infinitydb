@@ -110,6 +110,10 @@ Requirements:
   against it, and an absent or different version fails rather than skips.
   The compat corpus raises `maxclients`, so raise the shell's file-descriptor
   limit if needed (`ulimit -n 65536`).
+- **Python 3.11 or newer**: the scripts `just check` runs read TOML with its
+  standard library.
+- **A C++17 compiler** (`c++`, `g++` or `clang++`): `just check` compiles every
+  fuzz target, and their build compiles libFuzzer's C++ runtime.
 - [`just`](https://github.com/casey/just) for the task runner, and
   `cargo-deny` for the dependency-policy check.
 

@@ -112,6 +112,7 @@ import tomllib
 from pathlib import Path
 
 sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
+import fuzz_targets
 import lint_scope_table as scope_table
 from lint_scope_table import FN, attribute_end
 
@@ -641,12 +642,20 @@ for top in ("crates", "bins", "tests"):
 # row's target and file exist, and the source reflects the table exactly:
 # a scope's `deny` families are denied on that scope (the file's own inner
 # attribute, or the outer attribute on the item), its `ratchet` families are
-# not, and no decoder deny sits where no row names it
+# not, and no decoder deny sits where no row names it. The targets are the
+# `crates/*/fuzz` manifests' [[bin]] rows, read by the fuzz-target census's
+# row reader (ADR-0198 D1), whose gate holds every file under fuzz_targets/ to
+# a row; this gate runs none of the census's other checks.
 targets = set()
 for crate in sorted(Path("crates").iterdir()):
-    fuzz = crate / "fuzz" / "fuzz_targets"
-    if fuzz.is_dir():
-        targets |= {f"{crate.name}/{t.stem}" for t in fuzz.glob("*.rs")}
+    manifest = crate / "fuzz" / "Cargo.toml"
+    if manifest.is_file():
+        try:
+            rows = fuzz_targets.bin_rows(str(manifest))
+        except fuzz_targets.CensusError as err:
+            print(f"LINT-SCOPES SCOPE ERROR: {err}")
+            sys.exit(1)
+        targets |= {f"{crate.name}/{name}" for name, _ in rows if name}
 if not Path(SCOPES).is_file():
     print(f"LINT-SCOPES SCOPE ERROR: {SCOPES} is missing")
     sys.exit(1)
@@ -657,7 +666,7 @@ for t in sorted(scopes_tbl.targets - targets):
 for t in sorted(targets - scopes_tbl.targets):
     errors.append(f"fuzz target `{t}` is named by no row of {SCOPES} — a decoder chooses its lint scope")
 if not targets:
-    print("LINT-SCOPES SCOPE ERROR: no fuzz target found under crates/*/fuzz/fuzz_targets")
+    print("LINT-SCOPES SCOPE ERROR: no fuzz target found in the crates/*/fuzz manifests' [[bin]] rows")
     sys.exit(1)
 reflected = set()  # (file, item) scopes whose source was read
 for (file, item), fams in sorted(scopes_tbl.scopes.items()):

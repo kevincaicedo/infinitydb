@@ -49,6 +49,10 @@ check:
     # request fault-points/collision-oracle — a workspace build would link
     # infinityd against a colliding hasher.
     ./scripts/check-shipping-features.sh
+    # ADR-0198: every fuzz target compiles, on the pinned toolchain with
+    # warnings denied, under its committed lock and cfg(fuzzing), and a probe
+    # of planted reds proves the gate sees each shape it guards.
+    ./scripts/check-fuzz-targets.sh
     # ADR-0106: the gates above must go red on a planted violation, or
     # their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
     ./scripts/check-scripts-selftest.sh
