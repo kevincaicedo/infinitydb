@@ -3512,17 +3512,30 @@ fz_red() { # <label> <pattern> <root>: red on the fixture, naming its row
     expect_red_because "fuzz-targets: $1" "$2" fz_run "$3"
 }
 
+# fz_once <log> <command…> runs a gate once and keeps its output and status;
+# fz_replay <log> gives both back, so the cases that read one unchanged run
+# share it (each gate run costs a Python start, two git calls and the stub).
+fz_once() {
+    local log=$1 status=0
+    shift
+    "$@" >"$log" 2>&1 || status=$?
+    printf '%s\n' "$status" >"$log.status"
+}
+fz_replay() { cat "$1" && return "$(cat "$1.status")"; }
+
 root=$(fz_root clean)
-expect green "fuzz-targets: a clean two-target root" fz_run "$root"
+fz_once "$root.log" fz_run "$root"
+expect green "fuzz-targets: a clean two-target root" fz_replay "$root.log"
 expect_output "fuzz-targets: the OK line counts what it compiled and read" \
-    "fuzz-targets OK: 2 fuzz workspaces, 2 of 2 targets compiled (2 .*bin.* rows, 2 files)" fz_run "$root"
+    "fuzz-targets OK: 2 fuzz workspaces, 2 of 2 targets compiled (2 .*bin.* rows, 2 files)" \
+    fz_replay "$root.log"
 expect_output "fuzz-targets: the OK line discloses the probe off in fixture mode" \
     "probe: skipped (fixture mode, INF_FUZZ_CHECK_PROBE=off); 5 probe manifests, each run by its gate" \
-    fz_run "$root"
+    fz_replay "$root.log"
 expect_output "fuzz-targets: the OK line counts the #[path] sites and files read" \
-    "0 seed directories (git-listed); 1 #.path. sites, 1 files read" fz_run "$root"
+    "0 seed directories (git-listed); 1 #.path. sites, 1 files read" fz_replay "$root.log"
 expect_output "fuzz-targets: the count line is printed on a green run" \
-    "fuzz-targets: bins/b/fuzz/Cargo.toml: compiled 1 of 1" fz_run "$root"
+    "fuzz-targets: bins/b/fuzz/Cargo.toml: compiled 1 of 1" fz_replay "$root.log"
 expect_red_because "fuzz-targets: the probe stays on outside a fixture root" \
     "honoured on a fixture root (INF_CHECK_ROOT) only" env -u INF_CHECK_ROOT INF_FUZZ_CHECK_PROBE=off "$FUZZ"
 expect_red_because "fuzz-targets: a probe knob that is neither on nor off" "is 'no', not on or off" \
@@ -3568,9 +3581,10 @@ expect green "fuzz-targets: green under a caller's RUSTFLAGS and CARGO_ENCODED_R
 expect green "fuzz-targets: each workspace's call carries the gate's flags and environment" \
     fz_calls_ok "$root.stub"
 # The call's canaries: a copy of the gate with one part of its call dropped
-# turns the case red.
+# turns the case red. Each copy runs on the argv root, its calls cleared.
+FZ_MROOT=$root
 fz_mutant() { # <name> <sed expression> <what the copy drops>
-    local dir mroot
+    local dir
     dir="$work/fz-gate-$1"
     rm -rf "${dir:?}"
     mkdir -p "$dir"
@@ -3582,9 +3596,10 @@ fz_mutant() { # <name> <sed expression> <what the copy drops>
         echo "selftest: the fuzz-targets mutant '$1' changed nothing" >&2
         exit 2
     fi
-    mroot=$(fz_root "mutant-$1")
-    fz_argv_run "$dir/check-fuzz-targets.sh" "$mroot" >/dev/null 2>&1 || true
-    expect red "fuzz-targets: the call's check is red on a gate that $3" fz_calls_ok "$mroot.stub"
+    rm -f "${FZ_MROOT:?}.stub/calls"
+    fz_argv_run "$dir/check-fuzz-targets.sh" "$FZ_MROOT" >/dev/null 2>&1 || true
+    expect red "fuzz-targets: the call's check is red on a gate that $3" \
+        fz_calls_ok "$FZ_MROOT.stub"
 }
 fz_mutant bins 's/"check", "--bins", /"check", /' "drops --bins"
 fz_mutant locked 's/"--locked", //' "drops --locked"
@@ -3759,22 +3774,26 @@ fz_answer "$root" crates/a/fuzz/Cargo.toml t_one
 fz_error "$root" crates/a/fuzz/Cargo.toml t_two E0433 'cannot find module or crate `gone`' \
     fuzz_targets/t_two.rs >>"$root.stub/$(fz_key crates/a/fuzz/Cargo.toml).out"
 fz_status "$root" crates/a/fuzz/Cargo.toml 101
-fz_red "K1: cargo exits non-zero" "K1 crates/a/fuzz/Cargo.toml: cargo exited 101" "$root"
+fz_once "$root.log" fz_run "$root"
+expect_red_because "fuzz-targets: K1: cargo exits non-zero" \
+    "K1 crates/a/fuzz/Cargo.toml: cargo exited 101" fz_replay "$root.log"
 expect_output "fuzz-targets: K1 prints the count line too" \
-    "crates/a/fuzz/Cargo.toml: compiled 1 of 2 (missing: t_two)" fz_run "$root"
+    "crates/a/fuzz/Cargo.toml: compiled 1 of 2 (missing: t_two)" fz_replay "$root.log"
 expect_output "fuzz-targets: K1 prints each error under its workspace and target" \
-    "crates/a/fuzz/Cargo.toml bin t_two:" fz_run "$root"
+    "crates/a/fuzz/Cargo.toml bin t_two:" fz_replay "$root.log"
+FZ_KROOT=$root  # the K cases below rewrite its stub's answer, so they share it
 root=$(fz_root k1-unread)
 printf 'Compiling a-fuzz\n' >>"$root.stub/$(fz_key crates/a/fuzz/Cargo.toml).out"
 fz_red "K1: a report line that is not cargo's JSON" "1 report lines unread" "$root"
-root=$(fz_k_root k2-one)
-fz_answer "$root" crates/a/fuzz/Cargo.toml t_one
-fz_red "K2: cargo exits 0 having compiled one of two bins" \
-    "K2 crates/a/fuzz/Cargo.toml: the bins cargo compiled are not its" "$root"
-expect_output "fuzz-targets: K2 names the missing bin" "compiled 1 of 2 (missing: t_two)" fz_run "$root"
-root=$(fz_k_root k2-none)
-fz_answer "$root" crates/a/fuzz/Cargo.toml
-fz_red "K2: cargo exits 0 printing no artifact" "compiled 0 of 2 (missing: t_one, t_two)" "$root"
+fz_answer "$FZ_KROOT" crates/a/fuzz/Cargo.toml t_one
+fz_once "$FZ_KROOT.log" fz_run "$FZ_KROOT"
+expect_red_because "fuzz-targets: K2: cargo exits 0 having compiled one of two bins" \
+    "K2 crates/a/fuzz/Cargo.toml: the bins cargo compiled are not its" fz_replay "$FZ_KROOT.log"
+expect_output "fuzz-targets: K2 names the missing bin" "compiled 1 of 2 (missing: t_two)" \
+    fz_replay "$FZ_KROOT.log"
+fz_answer "$FZ_KROOT" crates/a/fuzz/Cargo.toml
+fz_red "K2: cargo exits 0 printing no artifact" "compiled 0 of 2 (missing: t_one, t_two)" \
+    "$FZ_KROOT"
 root=$(fz_root k2-extra)
 fz_answer "$root" crates/a/fuzz/Cargo.toml t_one t_extra
 fz_red "K2: a bin no row names" "(unexpected: t_extra)" "$root"
@@ -3829,11 +3848,10 @@ fz_probe "$root"
 expect_output "fuzz-targets: the probe's five verdicts on the OK line" \
     "probe: plant_crate E0433 absent_crate, plant_warning denied, plant_cfg E0433 absent_cfg_crate, control compiled, stale_lock refused by --locked;" \
     fz_probe_run "$root"
+FZ_PROOT=$root  # fz_probe rewrites both probe answers, so the plants share it
 fz_plant() { # <plant> <label> <pattern>
-    local proot
-    proot=$(fz_root "$1")
-    fz_probe "$proot" "$1"
-    expect_red_because "fuzz-targets: $2" "$3" fz_probe_run "$proot"
+    fz_probe "$FZ_PROOT" "$1"
+    expect_red_because "fuzz-targets: $2" "$3" fz_probe_run "$FZ_PROOT"
 }
 fz_plant p1-compiled "P1: plant_crate compiled" "P1 probe target plant_crate compiled"
 fz_plant p1-code "P1: plant_crate refused for another code" "P1 probe target plant_crate refused without"
