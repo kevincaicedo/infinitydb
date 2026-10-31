@@ -4139,25 +4139,34 @@ expect_red_because "fuzz-targets: an unknown matrix" "usage: check-fuzz-targets.
     env INF_CHECK_ROOT="$root" "$FUZZ" --matrix weekly
 
 # The workflows and the local deny recipe read the census (ADR-0198 D3, D6):
-# every `cargo fuzz run` step and every cargo-deny step sits in a job whose
-# matrix is `${{ fromJSON(needs.<census job>.outputs.matrix) }}` alone, the
-# census job prints that matrix with `check-fuzz-targets.sh --matrix <mode>`
-# in the assignment shape (an inline `$(…)` in the echo drops its status) at
-# the commit the matrix job checks out, each fuzz call names the row's target
-# and its step the row's seeds and directory, each cargo-deny call the row's
+# every fuzz run step and every cargo-deny step sits in a job whose matrix is
+# `${{ fromJSON(needs.<census job>.outputs.matrix) }}` alone, the census job
+# prints that matrix with `check-fuzz-targets.sh --matrix <mode>` in the
+# assignment shape (an inline `$(…)` in the echo drops its status) at the
+# commit the matrix job checks out, each fuzz call names the row's target and
+# its step the row's seeds and directory, each cargo-deny call the row's
 # manifest; the nightly, the full smoke and PR CI's cargo-deny each read their
 # mode; PR CI's one-target smoke, `resp_parse`, is the one literal (D3); and
 # the justfile runs cargo-deny only in `deny`, over `--matrix deny`. A list
 # kept by hand beside the census would pass every other gate. Stdlib python, a
 # line-and-indent reader of these files' layout that fails closed, as
 # legs_cover: it judges a call written unquoted on one line of a step (jobs at
-# two columns, steps at `      - `) or of a recipe, and any other line of a
-# workflow or the justfile that spells a fuzz run (`cargo [+<toolchain>] fuzz
-# run`, `cargo-fuzz run`) or cargo-deny (`cargo deny`, `cargo-deny`, the
-# action), in any case or quoting, comments aside, folded or continued across
-# lines, is red: a call it cannot place. A job id or a `name:` runs nothing.
+# two columns, steps at `      - `) or of a recipe, and any other spelling of
+# a fuzz run or of cargo-deny (the reader's first comment lists them), in any
+# case or quoting, folded or continued across lines, is red: a call it cannot
+# place. It strips a comment only where YAML or just does: a block scalar's
+# content and a recipe's body are read whole, because a quote the line does
+# not show (open across lines, nested in `$(…)`) decides where a shell's
+# comment starts, so a call spelled in a script's comment is red too. A line
+# it cannot read is red as well: a YAML anchor, alias or tag (an alias moves a
+# call to a line judged as something else), an escape in a double-quoted
+# scalar, a quote left open at the line's end outside a block or a recipe
+# body, a block indentation indicator. A job id or a `name:` runs nothing.
 # Review holds what text cannot read: a call in another file a step or a
-# recipe runs (a script, a local action), or one a shell assembles.
+# recipe runs or loads (a script, an action, an imported justfile, a cargo
+# alias), and one a shell or an expression assembles at run time (a variable,
+# `${{ … }}` or `{{ … }}`, quoting or escaping inside a word); following
+# either would make this reader a second shell or expression engine.
 census_matrices() { # <root holding .github/workflows and justfile>
     python3 - "$1" <<'PY'
 import bisect, os, re, sys
@@ -4167,17 +4176,23 @@ files = sorted(f for f in os.listdir(wf_dir) if f.endswith((".yml", ".yaml"))) \
     if os.path.isdir(wf_dir) else []
 if not files or not os.path.isfile(os.path.join(root, "justfile")):
     sys.exit(f"{TOKEN} SCOPE ERROR: no workflow under {wf_dir}, or no justfile")
-# A call the reader judges: unquoted, on one line of the layout below.
-FUZZ_RUN = re.compile(r"\bcargo\s+(?:\+\S+\s+)?fuzz\s+run\b")
-FUZZ_CALL = re.compile(FUZZ_RUN.pattern + r"\s+(\S+)")
-ROW_CALL = re.compile(FUZZ_RUN.pattern + r"\s+\$\{\{ matrix\.target \}\}(?=\s|$)")
-DENY_RUN = re.compile(r"\bcargo[ -]deny\b")
+# One spelling of each call, however cargo is invoked and in any case: what the
+# reader counts on a line is what its rules judge. A fuzz run is `fuzz run` or
+# its alias `fuzz r`, after any cargo option or as the cargo-fuzz binary (a
+# YAML key `run:` after a line ending in `fuzz` is none). A cargo-deny call is
+# `cargo-deny` (the binary, the action's name) or `cargo`, its options (a word
+# led by `-` or `+`, each with at most one value word), then the word `deny`.
+VALUE = r"""(?:"[^"]*"|'[^']*'|[^\s;&|()<>"'`])+"""
+FUZZ = r"(?i:\bfuzz(?:\.exe)?\s+(?:run|r)\b)(?!:)"
+DENY = (r"(?i:\bcargo-deny\b|\bcargo(?:\.exe)?(?:\s+[-+][^\s;&|()<>]*(?:\s+(?![-+])"
+        + VALUE + r")?)*\s+deny(?=$|[\s;&|()<>\"'`]))")
+FUZZ_RUN, DENY_RUN = re.compile(FUZZ), re.compile(DENY)
+FUZZ_CALL = re.compile(FUZZ + r"\s+(\S+)")
+ROW_CALL = re.compile(FUZZ + r"\s+\$\{\{ matrix\.target \}\}(?=\s|$)")
 DENY_USES = "EmbarkStudios/cargo-deny-action"
-# The words the reader must place: in any case and quoting, the cargo-fuzz
-# binary run by itself, and the action's name (it holds `cargo-deny`).
-SPELLED = (("a fuzz run", re.compile(r"(?i)\bcargo(?:\s+\+\S+)?(?:\s+|-)fuzz\s+run\b")),
-           ("a cargo-deny call", re.compile(r"(?i)\bcargo[ -]deny\b")))
+SPELLED = (("a fuzz run", FUZZ_RUN), ("a cargo-deny call", DENY_RUN))
 NAME = {what: float("inf") for what, _ in SPELLED}  # a job id or a name runs nothing
+BLOCK = re.compile(r"(\s*)((?:-\s+)*)(?:(\S.*?):\s+)?[|>]([-+0-9]*)")
 MATRIX = re.compile(r"\$\{\{ fromJSON\(needs\.([A-Za-z0-9_-]+)\.outputs\.matrix\) \}\}")
 CENSUS = re.compile(r"matrix=\$\(\./scripts/check-fuzz-targets\.sh --matrix (nightly|smoke|deny)\)")
 WRITE = 'echo "matrix=$matrix" >> "$GITHUB_OUTPUT"'
@@ -4193,39 +4208,108 @@ def command(line):
     return re.sub(r"(^|\s)#.*", "", line)
 
 
-def uncommented(line):
-    """The line without its comment, a `#` at its start or after a blank and
-    outside quotes; the quotes and what they hold are kept."""
-    quote, previous, i = None, " ", 0
+def yaml_text(line):
+    """A workflow line outside a block scalar: its text without its YAML
+    comment, and what in it the reader cannot place. YAML opens a quoted
+    scalar only where a node starts (a line's start, after `- `, `? `, `: `,
+    `[`, `{` or `,`), so an apostrophe inside a plain scalar is text; a node
+    property (`&anchor`, `*alias`, `!tag`) can move a call where the reader
+    does not judge it; an escape can spell one the text does not show; and a
+    quoted scalar open at the line's end spans lines."""
+    quote, start, why, i = None, True, None, 0
+    while i < len(line):
+        c, after = line[i], line[i + 1:i + 2]
+        if quote == '"' and c == "\\":
+            why, i = why or "an escape in a double-quoted YAML scalar", i + 1
+        elif quote == "'" and c == "'" and after == "'":
+            i += 1
+        elif quote:
+            quote = None if c == quote else quote
+        elif c == "#" and (i == 0 or line[i - 1].isspace()):
+            return line[:i], why
+        elif c == "$" and line[i + 1:i + 3] == "{{":  # an expression is not a flow mapping
+            end = line.find("}}", i)
+            i, start = (len(line) if end < 0 else end + 1), False
+        elif start and c in "\"'":
+            quote, start = c, False
+        elif start and c in "&*!":
+            why, start = why or "a YAML anchor, alias or tag", False
+        elif c in "-?" and start and after in ("", " ", "\t"):
+            pass
+        elif c in ":[{," and (c != ":" or after in ("", " ", "\t")):
+            start = True
+        elif not c.isspace():
+            start = False
+        i += 1
+    return line, why or ("a quote left open at the line's end" if quote else None)
+
+
+def just_text(line):
+    """A justfile line outside a recipe body: its text without its comment,
+    and why the reader cannot place it: a string open at the line's end
+    spans lines."""
+    quote, i = None, 0
     while i < len(line):
         c = line[i]
-        if quote:
-            if c == "\\" and quote == '"':
-                i += 1
-            elif c == quote:
-                quote = None
-        elif c in "\"'":
+        if quote == '"' and c == "\\":
+            i += 1
+        elif quote:
+            quote = None if c == quote else quote
+        elif c in "\"'`":
             quote = c
-        elif c == "#" and previous.isspace():
-            return line[:i]
-        previous = c
+        elif c == "#":
+            return line[:i], None
         i += 1
-    return line
+    return line, "a quote left open at the line's end" if quote else None
 
 
-def unplaced(name, lines, judged):
-    """Every spelling in the comment-stripped text, read as one stream so a
-    call folded or continued across lines is seen, counted on the line it
-    starts on: a line may hold no more than the calls the reader judged
-    there. One it cannot place is red, so a layout it does not read fails
-    closed."""
-    stream, starts, offset = [], [], 0
-    for line in lines:
-        text = uncommented(line).rstrip()
+def workflow_texts(lines):
+    """Per line, the text the counter reads and why the reader cannot place
+    it. A block scalar's content (`|` or `>`) is read whole: YAML strips no
+    comment there, and a shell's comment is not this reader's to find, since
+    a quote open across lines or nested in `$(…)` decides where it starts."""
+    out, i = [], 0
+    while i < len(lines):
+        text, why = yaml_text(lines[i])
+        m = BLOCK.fullmatch(text.rstrip())
+        if m and m.group(4).strip("-+"):
+            why = why or "a block indentation indicator"
+        out.append((text, why))
+        i += 1
+        if not m:
+            continue
+        lead, dashes = len(m.group(1)), m.group(2)
+        parent = lead + len(dashes) if m.group(3) else lead + len(dashes.rstrip()) - 1
+        indent = None
+        while i < len(lines) and (not lines[i].strip() or indent is None
+                                  or len(lines[i]) - len(lines[i].lstrip(" ")) >= indent):
+            width = len(lines[i]) - len(lines[i].lstrip(" "))
+            if lines[i].strip() and indent is None:
+                if width <= parent:
+                    break
+                indent = width
+            out.append((lines[i], None))
+            i += 1
+    return out
+
+
+def unplaced(name, lines, judged, texts):
+    """Every spelling in the text as read (a comment stripped only where YAML
+    or just strips one), read as one stream so a call folded or continued
+    across lines is seen, counted on the line it starts on: a line may hold
+    no more than the calls the reader judged there. One it cannot place is
+    red, so a layout it does not read fails closed; so is a line it cannot
+    read."""
+    stream, starts, offset, out = [], [], 0, []
+    for number, (text, why) in enumerate(texts, 1):
+        if why:
+            out.append(f"{name}:{number}: {why} this reader cannot place: "
+                       f"{lines[number - 1].strip()}")
+        text = text.rstrip()
         stream.append(text[:-1] if text.endswith("\\") else text)
         starts.append(offset)
         offset += len(stream[-1]) + 1
-    stream, out = " ".join(stream), []
+    stream = " ".join(stream)
     for what, spelled in SPELLED:
         held = {}
         for m in spelled.finditer(stream):
@@ -4315,9 +4399,8 @@ def judge_lines(judged, step):
     """The calls the reader judges on each of a step's lines."""
     for number, text in step["run_lines"]:
         line = judged.setdefault(number, {})
-        line["a fuzz run"] = line.get("a fuzz run", 0) + len(FUZZ_RUN.findall(command(text)))
-        line["a cargo-deny call"] = line.get("a cargo-deny call", 0) \
-            + len(DENY_RUN.findall(command(text)))
+        for what, spelled in SPELLED:
+            line[what] = line.get(what, 0) + len(spelled.findall(command(text)))
     if step.get("uses", "").startswith(DENY_USES):
         judged.setdefault(step["at"]["uses"], {})["a cargo-deny call"] = 1
     if "name" in step["at"]:
@@ -4346,13 +4429,15 @@ def census_mode(shapes, job):
     return m.group(1), None
 
 
+
 for wf in files:
     lines = open(os.path.join(wf_dir, wf), encoding="utf-8").read().split("\n")
+    texts = workflow_texts(lines)
     jobs, ids = jobs_of(lines)
     judged = {number: NAME for number in ids}
     if jobs is None:
         errors.append(f"{wf}: no top-level `jobs:` line")
-        errors.extend(unplaced(wf, lines, judged))
+        errors.extend(unplaced(wf, lines, judged, texts))
         continue
     shapes = {job: shape(body) for job, body in jobs.items()}
     for job, (needs, strategy, _, steps, names) in shapes.items():
@@ -4411,7 +4496,7 @@ for wf in files:
             else:
                 found.add((wf, mode))
                 read.append(f"{wf} {job} <- {census} (--matrix {mode})")
-    errors.extend(unplaced(wf, lines, judged))
+    errors.extend(unplaced(wf, lines, judged, texts))
 for wf, mode in sorted(EXPECTED - found):
     errors.append(f"{wf}: no job reads --matrix {mode} from a census job (ADR-0198 "
                   f"{'D6' if mode == 'deny' else 'D3'})")
@@ -4443,7 +4528,10 @@ calls = [l for l in deny if DENY_RUN.search(command(l))]
 if not calls or not all('--manifest-path "$manifest"' in l for l in calls):
     errors.append("justfile: the `deny` recipe runs cargo-deny on no census row "
                   "(`--manifest-path \"$manifest\"`)")
-errors.extend(unplaced("justfile", just, judged))
+# A recipe's body is read whole, as a block scalar's content is.
+body_lines = {n for lines in recipes.values() for n, _ in lines}
+texts = [(l, None) if n in body_lines else just_text(l) for n, l in enumerate(just, 1)]
+errors.extend(unplaced("justfile", just, judged, texts))
 for e in errors:
     print(f"{TOKEN}: {e}")
 if errors:
@@ -4525,20 +4613,36 @@ cm_plant second-recipe justfile $'\ntest:\n' $'\ndeny-root:\n    cargo deny chec
 cm_red "a second recipe running cargo-deny" "recipe .deny-root. runs cargo-deny outside .deny."
 
 # The read fails closed. Each plant is valid YAML with its step intact; one in
-# a layout or a spelling the reader does not judge is red as a call it cannot
-# place, on the line it starts on, and the same step in the tree's layout is
-# placed, and red for its rule.
+# a layout, a quoting or a YAML form the reader does not judge is red as a
+# call or a line it cannot place, on the line it starts on, and a spelling it
+# judges, in the tree's layout, is placed and red for its rule.
 cm_places() { # <root>: the reader ran and placed every call
     census_matrices "$1" >"$work/cm-places.log" 2>&1 || :
     grep -q '^CENSUS-MATRICES' "$work/cm-places.log" \
         && ! grep -q 'this reader cannot place' "$work/cm-places.log"
 }
+cm_judged() { # <label> <pattern>: the last plant is placed, and red naming its rule
+    cm_red "$1" "$2"
+    expect green "census-matrices: $1, placed" cm_places "$CM_ROOT"
+}
 CM_HEAD=$'name: plant\non: push\njobs:\n'
 CM_JOB=$CM_HEAD$'  plant:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@v5\n'
 CM_FUZZ='cargo +nightly fuzz run frame_decode -- -max_total_time=60'
-cm_add tree-layout "$CM_JOB      - run: $CM_FUZZ"$'\n        working-directory: crates/inf-log'
-cm_red "a hand fuzz step in the tree's layout" "plant.yml plant: a fuzz run not under a matrix"
-expect green "census-matrices: a step in the tree's layout is placed" cm_places "$CM_ROOT"
+CM_WD=$'\n        working-directory: crates/inf-log'
+cm_add tree-layout "$CM_JOB      - run: $CM_FUZZ$CM_WD"
+cm_judged "a hand fuzz step in the tree's layout" "plant.yml plant: a fuzz run not under a matrix"
+# Every spelling cargo runs is judged as the tree's own calls are: an option
+# before the subcommand, its alias, the binary, a quoted option value.
+for CM_SPELLING in 'cargo --locked fuzz run' 'cargo +nightly --locked fuzz run' \
+    'cargo +nightly fuzz r' 'cargo-fuzz run' 'cargo-fuzz r'; do
+    cm_add spelling "$CM_JOB      - run: $CM_SPELLING frame_decode -- -max_total_time=60$CM_WD"
+    cm_judged "\`$CM_SPELLING\` in the tree's layout" "plant.yml plant: a fuzz run not under a matrix"
+done
+for CM_SPELLING in 'cargo -q deny' 'cargo --color never deny' 'cargo --config "net.retry = 2" deny'; do
+    cm_add spelling "$CM_JOB      - run: $CM_SPELLING --manifest-path Cargo.toml check$CM_WD"
+    cm_judged "\`$CM_SPELLING\` in the tree's layout" \
+        "plant.yml plant: a cargo-deny step not under a matrix"
+done
 cm_add compact "$CM_HEAD"$'  plant:\n    runs-on: ubuntu-24.04\n    steps:\n    - uses: actions/checkout@v5\n'"    - run: $CM_FUZZ"
 cm_red "a compact step sequence" "plant.yml:8: a fuzz run this reader cannot place"
 cm_add indent4 "$CM_HEAD"$'    plant:\n        runs-on: ubuntu-24.04\n        steps:\n            - uses: actions/checkout@v5\n'"            - run: $CM_FUZZ"
@@ -4549,14 +4653,43 @@ cm_add quoted "$CM_JOB"'      - run: "cargo deny --manifest-path Cargo.toml chec
 cm_red "a cargo-deny call in a quoted scalar" "plant.yml:8: a cargo-deny call this reader cannot place"
 cm_add action-case "$CM_JOB"$'      - uses: embarkstudios/cargo-deny-action@v2\n        with:\n          manifest-path: Cargo.toml'
 cm_red "the cargo-deny action in another case" "plant.yml:8: a cargo-deny call this reader cannot place"
-cm_add binary "$CM_JOB"'      - run: cargo-fuzz run frame_decode -- -max_total_time=60'
-cm_red "the cargo-fuzz binary run by itself" "plant.yml:8: a fuzz run this reader cannot place"
 cm_add folded "$CM_JOB"$'      - run: cargo +nightly fuzz\n          run frame_decode -- -max_total_time=60'
 cm_red "a fuzz run folded across lines" "plant.yml:8: a fuzz run this reader cannot place"
+# A YAML anchor, alias or tag is red wherever it sits: an alias carries the
+# anchored text, a call on a name line or on a judged run line, into a step
+# the reader judges as something else.
+cm_add alias-name "$CM_JOB      - name: &fz $CM_FUZZ"$'\n        run: *fz'"$CM_WD"
+cm_red "a call aliased out of a step's name" \
+    "plant.yml:8: a YAML anchor, alias or tag this reader cannot place"
+CM_HOUR='cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} ${{ matrix.seeds }} -- -max_total_time=19800'
+cm_plant alias-run "$CM_NIGHTLY" "        run: $CM_HOUR" "        run: &hour $CM_HOUR"
+printf '%s\n' '' '  plant:' '    runs-on: ubuntu-24.04' '    steps:' '      - uses: actions/checkout@v5' \
+    '      - run: *hour' >>"$CM_ROOT/$CM_NIGHTLY"
+cm_red "a matrix call aliased into another job" \
+    "infinity-fuzz-nightly.yml:[0-9]*: a YAML anchor, alias or tag this reader cannot place"
+cm_add tag "$CM_JOB      - run: !!str cargo deny --manifest-path Cargo.toml check$CM_WD"
+cm_red "a tagged run" "plant.yml:8: a YAML anchor, alias or tag this reader cannot place"
+cm_add escape "$CM_JOB"'      - run: "cargo\x20deny --manifest-path Cargo.toml check"'
+cm_red "an escape that spells a call" "plant.yml:8: an escape in a double-quoted YAML scalar"
+cm_add quote-lines "$CM_JOB"$'      - run: \'echo "\n          # "; cargo deny --manifest-path Cargo.toml check\''
+cm_red "a quoted scalar across lines" "plant.yml:8: a quote left open at the line's end"
+cm_add indicator "$CM_JOB"$'      - run: |2\n            echo a\n          cargo deny --manifest-path Cargo.toml check'
+cm_red "a block indentation indicator" "plant.yml:8: a block indentation indicator"
+# A block's content is read whole: a quote open across its lines, or nested
+# in `$(…)`, puts a call the shell runs after a `#`.
+cm_add open-quote "$CM_JOB"$'      - run: |\n          echo "\n          # "; '"$CM_FUZZ$CM_WD"
+cm_red "a call after a quote open across a block's lines" \
+    "plant.yml:10: a fuzz run this reader cannot place"
+cm_add nested-quote "$CM_JOB"$'      - run: |\n          x="$(echo "a # b")"; cargo deny --manifest-path Cargo.toml check'
+cm_red "a call after a quote nested in \$(…)" "plant.yml:9: a cargo-deny call this reader cannot place"
+cm_add script-comment "$CM_JOB"$'      - run: |\n          # '"$CM_FUZZ"$'\n          true'
+cm_red "a call spelled in a script's comment" "plant.yml:9: a fuzz run this reader cannot place"
+cm_add text "$CM_JOB"$'      - name: the census\'s targets\n        if: ${{ !cancelled() }}\n        run: |\n          python3 - <<\'PY\'\n          print("can\'t")\n          PY'
+expect green "census-matrices: an expression, an apostrophe and a heredoc read as text" \
+    census_matrices "$CM_ROOT"
 cm_plant second-quoted "$CM_NIGHTLY" ' -- -max_total_time=19800' " -- -max_total_time=19800 && bash -c \"$CM_FUZZ\""
 cm_red "a quoted second fuzz run on a judged line" \
     "infinity-fuzz-nightly.yml:[0-9]*: a fuzz run this reader cannot place"
-CM_HOUR='cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} ${{ matrix.seeds }} -- -max_total_time=19800'
 cm_plant second-call "$CM_NIGHTLY" "        run: $CM_HOUR" $'        run: |\n'"          $CM_HOUR"$'\n'"          $CM_FUZZ"
 cm_red "a second, literal fuzz run in a matrix step" "fuzz-hour: a fuzz run that does not name its row's"
 CM_DENY=$'      - uses: EmbarkStudios/cargo-deny-action@v2\n        with:\n          manifest-path: ${{ matrix.manifest }}'
@@ -4571,6 +4704,8 @@ cm_plant pr-smoke-second "$CM_PR" 'fuzz run resp_parse -- -max_total_time=60' \
 cm_red "a second target in the PR smoke's step" "the PR smoke fuzzes .frame_decode., not resp_parse"
 cm_plant recipe-quoted justfile $'\ntest:\n' $'\ndeny-root:\n    bash -c "cargo deny check"\n\ntest:\n'
 cm_red "a quoted cargo-deny call in a second recipe" "justfile:[0-9]*: a cargo-deny call this reader cannot place"
+cm_plant just-string justfile $'\ntest:\n' $'\nnote := """\n# """ + `cargo deny check`\n\ntest:\n'
+cm_red "a justfile string across lines" "justfile:[0-9]*: a quote left open at the line's end"
 
 # The deny recipe, run as just runs it (its body a bash script in the
 # justfile's directory) against a stub census and a stub cargo that reads its
