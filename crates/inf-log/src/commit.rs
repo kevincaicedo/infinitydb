@@ -485,6 +485,10 @@ pub struct CommitStats {
     pub fsyncs_completed: u64,
     /// everysec ticks that found nothing dirty (proves idle ticks are free).
     pub idle_ticks: u64,
+    /// everysec ticks over a dirty ledger whose every queued byte is already
+    /// under the coverage tail, with nothing staged: an entry in flight is
+    /// the tick's barrier (ADR-0199 D2.2). Per cell.
+    pub covered_ticks: u64,
 }
 
 /// A file handle the ledger keeps alive until its fsync completes.
@@ -722,6 +726,12 @@ impl<File: SegmentFile> GroupCommit<File> {
         {
             self.stats.idle_ticks += 1;
             return;
+        }
+        if self.queued_bytes <= self.coverage_tail().1
+            && !self.always_unqueued
+            && !self.everysec_unqueued
+        {
+            self.stats.covered_ticks += 1;
         }
         self.sync_due = true;
     }
@@ -1939,6 +1949,7 @@ mod tests {
         gc.note_staged(FsyncClass::Everysec);
         gc.note_everysec_tick();
         assert_eq!(gc.stats().idle_ticks, 0, "a tick over staged records is not idle");
+        assert_eq!(gc.stats().covered_ticks, 0, "a staged record is owed: the tick is not covered");
         assert!(gc.sync_due(), "the staged record's due survives the tick");
         assert!(!gc.standalone_fsync_due(), "nothing written: the frame carries it");
         assert_eq!(gc.frame_plan(false, false), LINKED);
@@ -1962,10 +1973,12 @@ mod tests {
         plain(&mut gc, lsn(0, 100), 100);
         write_oldest(&mut gc);
         gc.note_everysec_tick();
+        assert_eq!(gc.stats().covered_ticks, 0, "no entry covers the written frame yet");
         assert!(gc.standalone_fsync_due());
         let t = gc.register_standalone_fsync(Nanos::ZERO);
         gc.note_everysec_tick();
         assert!(!gc.standalone_fsync_due(), "pending sync already covers written bytes");
+        assert_eq!(gc.stats().covered_ticks, 1, "the pending standalone covers every queued byte");
         gc.on_fsync_complete(t, Nanos::ZERO);
         gc.note_everysec_tick();
         assert!(!gc.standalone_fsync_due(), "clean again");
