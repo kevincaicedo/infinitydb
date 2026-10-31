@@ -781,6 +781,22 @@ discipline:
 > and a write-through plan the prefix rule (the frame's base is `queued_bytes`), each a release
 > assertion in the queueing on a plan made in the same LOG step.
 
+> **ADR-0199 (2026-10-30), implementation open:** the sync due is a coverage target, not a
+> flag. The ledger keeps what a barrier owes: the queued bytes below a target, and whether the
+> frame that seals the staged records owes one, a fact that exists only while a record is
+> staged. `sync_due()` is true while that frame owes one or the target is above the coverage
+> tail (the newest unfolded entry's covers value, else the durable bytes); `due()` names the
+> target, the tail and the frame's owing while it is. An everysec tick over a dirty ledger sets
+> the target to every queued byte and makes the next frame owe a barrier when an `everysec`
+> record is staged. A tick whose every queued byte is already under the coverage tail, with
+> nothing staged, owes nothing: it is counted in `CommitStats::covered_ticks` and issues
+> nothing. While a due exists it extends over each frame queued and each record staged before
+> its barrier. A registration whose coverage reaches the target with no record owed discharges
+> it: a linked or write-through frame, a standalone, a completion-issued sync or a seal. A
+> coverage-neutral barrier and a completion change nothing. So no due outlives the barrier that
+> covers it, and `request_final_sync()`, which runs the tick's rule, leaves a quiet cell
+> quiescent once its last barrier completes.
+
 **The ledger's classes (2026-10-29).** Every `SyncReason` belongs to one
 `LedgerClass`, and each class holds at most its budget of entries unfolded:
 boot 5 (`BootDirs`' at most four directory handles and the fresh
