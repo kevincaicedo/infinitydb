@@ -204,6 +204,12 @@ struct Node {
     process_sampler: std::cell::RefCell<inf_server::ProcessSampler>,
     /// One per cell, open unless a test holds it (`drive_paced_ckpt_with_pump`).
     clock_gates: Vec<Arc<ClockGate>>,
+    /// The first tiered namespace a cell ran at the product's
+    /// `TAIL-STALL-TIMEOUT` default ([`note_product_tail_stall`]); the stop
+    /// fails on it ([`Node::assert_tail_stall_stated`]).
+    tail_stall_default: Arc<std::sync::OnceLock<String>>,
+    /// Set by a test whose subject is that default.
+    tail_stall_default_expected: std::cell::Cell<bool>,
 }
 
 struct CatalogPump {
@@ -253,6 +259,7 @@ impl Node {
         let pump = self.catalog_pump.take().expect("a held-catalog node");
         pump.stop.store(true, Ordering::Relaxed);
         pump.handle.join().expect("catalog pump thread");
+        self.assert_tail_stall_stated();
     }
 
     fn start(cells: u16) -> Node {
@@ -605,6 +612,7 @@ impl Node {
         let stop_checkpoint = Arc::new(AtomicBool::new(true));
         let quiet = Arc::new(std::sync::atomic::AtomicU16::new(0));
         let drained = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let tail_stall_default = Arc::new(std::sync::OnceLock::new());
         // The node identity (ADR-0124 D5): one value per node, every cell.
         let run_id = {
             let seed = u64::from(std::process::id()) << 32 | u64::from(port_seed());
@@ -688,6 +696,7 @@ impl Node {
             let stop_checkpoint = Arc::clone(&stop_checkpoint);
             let quiet = Arc::clone(&quiet);
             let drained = Arc::clone(&drained);
+            let tail_stall_default = Arc::clone(&tail_stall_default);
             let boot = boot.clone();
             let issuer = cell_issuers.get_mut(i).and_then(Option::take);
             let faults = faults.clone();
@@ -783,6 +792,7 @@ impl Node {
                     if let Some(err) = plane.take_boot_error() {
                         panic!("cell {i} recovery failed (fail-stop): {err}");
                     }
+                    note_product_tail_stall(&plane, i, &tail_stall_default);
                     if graceful.load(Ordering::Relaxed) {
                         plane.set_stop_checkpoint(stop_checkpoint.load(Ordering::Relaxed));
                         plane.request_stop();
@@ -824,6 +834,8 @@ impl Node {
             catalog_pump,
             process_sampler: std::cell::RefCell::new(process_sampler),
             clock_gates,
+            tail_stall_default,
+            tail_stall_default_expected: std::cell::Cell::new(false),
         };
         // Most tests speak data commands immediately after start: wait out
         // the -LOADING window unless the test throttled recovery to
@@ -941,6 +953,51 @@ impl Node {
             pump.stop.store(true, Ordering::Relaxed);
             pump.handle.join().expect("catalog pump thread");
         }
+        self.assert_tail_stall_stated();
+    }
+
+    /// The test's subject is the product's `TAIL-STALL-TIMEOUT` default: the
+    /// stop does not fail on a tiered namespace that runs at it.
+    fn expect_product_tail_stall(&self) {
+        self.tail_stall_default_expected.set(true);
+    }
+
+    /// Fails the test on a tiered namespace that ran at the product's
+    /// `TAIL-STALL-TIMEOUT` default, unless that default is its subject: on
+    /// the device this binary's tests share, a fill there can answer a legal
+    /// `-STALLED`, so a tiered fixture states its bound through
+    /// [`tiered_ns_create`]. Runs after every thread is joined.
+    fn assert_tail_stall_stated(&self) {
+        if self.tail_stall_default_expected.get() {
+            return;
+        }
+        if let Some(found) = self.tail_stall_default.get() {
+            panic!(
+                "tiered namespace {found} ran at the product's TAIL-STALL-TIMEOUT default: \
+                 create it with tiered_ns_create, or call expect_product_tail_stall when \
+                 the default is the test's subject"
+            );
+        }
+    }
+}
+
+/// Records the first tiered namespace on `plane`'s cell that runs at the
+/// product's `TAIL-STALL-TIMEOUT` default, by name and cell. The harness
+/// calls it after every iteration, so a namespace dropped before the stop
+/// is recorded too.
+fn note_product_tail_stall(plane: &ServerPlane, cell: usize, found: &std::sync::OnceLock<String>) {
+    if found.get().is_some() {
+        return;
+    }
+    let ks = plane.keyspace();
+    let at_default = ks.ns_iter().find(|spec| {
+        spec.tier.as_ref().is_some_and(|tier| {
+            let product = inf_store::TierSpec::for_budget(tier.mem_budget_bytes);
+            tier.tail_stall_timeout_ms == product.tail_stall_timeout_ms
+        })
+    });
+    if let Some(spec) = at_default {
+        let _ = found.set(format!("{} on cell {cell}", String::from_utf8_lossy(&spec.name)));
     }
 }
 
@@ -2985,15 +3042,34 @@ const PACED_ROUND_MODEL: inf_runtime::DeviceModel = inf_runtime::DeviceModel {
     read_ops_per_s: 40_000,
 };
 
+/// The tail-stall bound a paced fill runs its namespace at.
+#[derive(Copy, Clone)]
+enum PacedBound {
+    /// None stated: the product's default.
+    ProductDefault,
+    /// [`FIXTURE_TAIL_STALL_TIMEOUT_MS`], through [`tiered_ns_create`].
+    Fixture,
+}
+
 /// Writes up to 600 values of 8 KiB (4.8 MiB, past a `MEM-BUDGET 3mb`
-/// window) to `t`, created by `create`, on a node paced by
+/// window) to `t`, created at `bound`, on a node paced by
 /// [`PACED_ROUND_MODEL`]: `Ok(())` when every write is acknowledged, else
 /// the first other reply with the writes acknowledged before it.
-fn paced_tiered_fill(tag: &str, create: &[u8]) -> Result<(), (Vec<u8>, usize)> {
+fn paced_tiered_fill(tag: &str, bound: PacedBound) -> Result<(), (Vec<u8>, usize)> {
+    let options: &[&[u8]] = &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"];
     let dir = temp_data_dir(tag);
     let node = Node::start_durable_with_device_model(1, &dir, PACED_ROUND_MODEL);
+    let create = match bound {
+        PacedBound::ProductDefault => {
+            node.expect_product_tail_stall();
+            let mut parts: Vec<&[u8]> = vec![b"INF.NS", b"CREATE", b"t", b"MODE", b"durable"];
+            parts.extend_from_slice(options);
+            cmd(&parts)
+        }
+        PacedBound::Fixture => tiered_ns_create(b"t", options),
+    };
     let mut c = node.connect();
-    c.write_all(create).expect("write");
+    c.write_all(&create).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -3028,19 +3104,9 @@ fn paced_tiered_fill(tag: &str, create: &[u8]) -> Result<(), (Vec<u8>, usize)> {
 /// tiered fixture here states [`FIXTURE_TAIL_STALL_TIMEOUT_MS`].
 #[test]
 fn a_flush_round_past_the_default_tail_stall_timeout_answers_stalled() {
-    let create = cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"t",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"everysec",
-        b"MEM-BUDGET",
-        b"3mb",
-    ]);
-    let (reply, acknowledged) = paced_tiered_fill("paced-default-stall", &create)
-        .expect_err("a 2.5 s round answers a fill at the 1 s default");
+    let (reply, acknowledged) =
+        paced_tiered_fill("paced-default-stall", PacedBound::ProductDefault)
+            .expect_err("a 2.5 s round answers a fill at the 1 s default");
     assert_eq!(
         reply,
         b"-STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)\r\n",
@@ -3052,13 +3118,41 @@ fn a_flush_round_past_the_default_tail_stall_timeout_answers_stalled() {
 /// acknowledged, so the fixture bound outlasts a round the default cannot.
 #[test]
 fn the_fixture_tail_stall_bound_outlasts_a_paced_flush_round() {
-    let create = tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]);
-    if let Err((reply, acknowledged)) = paced_tiered_fill("paced-fixture-bound", &create) {
+    if let Err((reply, acknowledged)) =
+        paced_tiered_fill("paced-fixture-bound", PacedBound::Fixture)
+    {
         panic!(
             "write {acknowledged} answered {:?} at the fixture bound",
             String::from_utf8_lossy(&reply)
         );
     }
+}
+
+/// The stop's check, planted: a tiered namespace created with no stated
+/// bound runs at the product's default, and the stop names it — so a
+/// tiered fixture that skips [`tiered_ns_create`] cannot stay green.
+#[test]
+fn a_tiered_namespace_at_the_product_tail_stall_default_fails_the_stop() {
+    let dir = temp_data_dir("tail-stall-unstated");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"plain",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.stop()));
+    std::fs::remove_dir_all(&dir).ok();
+    let panic = stopped.expect_err("the stop fails on a namespace at the product default");
+    let message = panic.downcast_ref::<String>().map_or("", String::as_str);
+    assert!(message.contains("plain on cell 0"), "{message}");
 }
 
 /// Reads one `SCAN` reply (`[next-cursor, [key…]]`) off the stream.
