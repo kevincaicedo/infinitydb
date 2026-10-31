@@ -7,9 +7,13 @@
 #
 # The census (scripts/fuzz_targets.py, ADR-0198 D1) defines the targets and
 # judges the tree: every manifest is the root, a member, a fuzz manifest or a
-# listed probe; every target sits at fuzz_targets/<name>.rs and is named
-# once; every seed directory names a target; a target reaches production
-# code through its crate (D4). The gate then runs, for each fuzz workspace in
+# listed probe, and a probe names no third-party crate (each dependency by
+# path to a manifest of the tree, no registry or git source in a lock it
+# commits), so the locks cargo-deny reads (--matrix deny) hold every
+# third-party crate the manifests name; every target sits at
+# fuzz_targets/<name>.rs and is named once; every seed directory names a
+# target; a target reaches production code through its crate (D4). The
+# gate then runs, for each fuzz workspace in
 # census order,
 #   cargo check --manifest-path <m> --bins --locked --keep-going
 #               --message-format json --color never --target-dir target/fuzz-check
@@ -409,7 +413,7 @@ rows_n = sum(len(r) for r in census.rows.values())
 scope = (f"{len(census.workspaces)} fuzz workspaces, {compiled} of {total} targets compiled "
          f"({rows_n} [[bin]] rows, {census.target_files} files), warnings denied, locks locked, "
          f"cfg(fuzzing) set; probe: {probe}; {len(census.probes)} probe manifests"
-         f"{'' if any(r.startswith('C4 ') for r in reds) else ', each run by its gate'}; "
+         f"{'' if any(r.startswith('C4 ') for r in reds) else ', each run by its gate and naming no third-party crate'}; "
          f"{len(census.seed_dirs)} seed directories (git-listed); {census.path_sites} #[path] "
          f"sites, {len(census.path_files)} files read")
 depinfo = f"dep-info of {depinfo_read} of {compiled} compiled targets read"

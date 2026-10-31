@@ -3684,6 +3684,40 @@ root=$(fz_root c4-recipe)
 fz_sed '/check-lint-scopes.sh/d' "$root/justfile"
 fz_red "C4: a probe whose gate the check recipe does not run" \
     "C4 scripts/lint-scope-probe/Cargo.toml: its gate scripts/check-lint-scopes.sh is not run" "$root"
+# ...or that names a third-party crate, whose lock no cargo-deny leg reads: a
+# registry package in a lock it commits, a registry, git or workspace
+# dependency, a target's dependency, a path out of the tree; a path to a
+# manifest of the tree is the sanctioned shape.
+root=$(fz_root c4-third-party)
+printf '\n[[package]]\nname = "serde"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n' \
+    >>"$root/scripts/fuzz-check-probe/Cargo.lock"
+printf '\n[dependencies]\nserde = "1"\ngitdep = { git = "https://example.invalid/x" }\n' \
+    >>"$root/scripts/clock-ban-probe/Cargo.toml"
+printf "\n[target.'cfg(unix)'.dependencies]\nlibc = { version = \"0.2\" }\n" \
+    >>"$root/scripts/waker-atomics-probe/Cargo.toml"
+printf '\n[dependencies]\na = { path = "../../crates/a" }\nout = { path = "../../../out" }\n' \
+    >>"$root/scripts/lint-scope-probe/Cargo.toml"
+printf '\n[dev-dependencies]\nws = { workspace = true }\n' >>"$root/scripts/fuzz-check-probe/stale-lock/Cargo.toml"
+fz_once "$root.log" fz_run "$root"
+FZ_C4=": a probe that names"
+expect_red_because "fuzz-targets: C4: a registry package in a probe's lock" \
+    "C4 scripts/fuzz-check-probe/Cargo.toml$FZ_C4 .serde 1.0.0. from registry+https://github.com/rust-lang/crates.io-index in scripts/fuzz-check-probe/Cargo.lock" \
+    fz_replay "$root.log"
+expect_red_because "fuzz-targets: C4: a registry dependency of a probe" \
+    "C4 scripts/clock-ban-probe/Cargo.toml$FZ_C4 .serde., a dependency not by path" fz_replay "$root.log"
+expect_red_because "fuzz-targets: C4: a git dependency of a probe" \
+    "C4 scripts/clock-ban-probe/Cargo.toml$FZ_C4 .gitdep., a dependency not by path" fz_replay "$root.log"
+expect_red_because "fuzz-targets: C4: a target's dependency of a probe" \
+    "C4 scripts/waker-atomics-probe/Cargo.toml$FZ_C4 .libc., a dependency not by path" fz_replay "$root.log"
+expect_red_because "fuzz-targets: C4: a path dependency out of the tree" \
+    "C4 scripts/lint-scope-probe/Cargo.toml$FZ_C4 .out., a dependency not by path" fz_replay "$root.log"
+expect_red_because "fuzz-targets: C4: a workspace-inherited dependency of a probe" \
+    "C4 scripts/fuzz-check-probe/stale-lock/Cargo.toml$FZ_C4 .ws., a dependency not by path" \
+    fz_replay "$root.log"
+expect green "fuzz-targets: C4: a probe's path dependency on a manifest of the tree" \
+    fz_lacks "$FZ_C4 .a.," "$root.log"
+expect_output "fuzz-targets: the OK line says no probe names a third-party crate" \
+    "5 probe manifests, each run by its gate and naming no third-party crate" fz_replay "$work/fz-clean.log"
 # C5: one row a file, at fuzz_targets/<name>.rs, each name once.
 root=$(fz_root c5-file)
 printf 'fn main() {}\n' >"$root/crates/a/fuzz/fuzz_targets/x.rs"

@@ -3,8 +3,9 @@
 `check-fuzz-targets.sh` and the fuzz workflows read the targets through
 `census`, `check-lint-scopes.sh` through `bin_rows`; no other list of them
 exists, so a new target is in every one of them from its first commit. PR
-CI's `cargo-deny` job reads the manifests through `deny_matrix`: the root
-and every fuzz manifest, each a workspace whose lock it judges.
+CI's `cargo-deny` jobs and `just deny` read the manifests through
+`deny_matrix`: the root and every fuzz manifest, each a workspace whose
+lock they judge.
 
 A manifest in the tree is one of four kinds: the root manifest; a member of
 the root workspace (its `members` globs); a fuzz manifest, at
@@ -12,7 +13,11 @@ the root workspace (its `members` globs); a fuzz manifest, at
 `[workspace]` table of its own and the root's `license` (outside the root's
 workspace it cannot inherit it, so it states it, and `cargo deny` reads it,
 ADR-0198 D6); or a probe manifest that PROBES names with
-the gate that compiles it, which the `check` recipe must run. Any other
+the gate that compiles it, which the `check` recipe must run. A probe names
+no third-party crate of its own: each dependency is by `path` to a manifest
+of this tree, and a lock it commits names no package with a `source` (a
+registry or git crate), so the locks `deny_matrix` lists hold every
+third-party crate a manifest of the tree names. Any other
 manifest is a crate no gate compiles. The census reads the files git lists,
 tracked or untracked and not ignored, so a crate counts before its first
 commit and an ignored local corpus is never read.
@@ -76,6 +81,9 @@ PROBES = {
     "scripts/waker-atomics-probe/Cargo.toml": "check-waker-atomics.sh",
 }
 SEED_KINDS = ("corpus", "corpora", "seeds")
+# A manifest's dependency tables, cargo's older spellings among them.
+DEP_TABLES = ("dependencies", "dev-dependencies", "dev_dependencies", "build-dependencies",
+              "build_dependencies")
 # Files a target reaches through `#[path]`: its own file is depth 0, a file
 # it includes depth 1, a file that file includes depth 2. Deeper is red.
 PATH_DEPTH_MAX = 2
@@ -144,6 +152,36 @@ def bin_rows(manifest):
         raise CensusError(f"{manifest}: `bin` is not an array of tables")
     return [tuple(r.get(k) if isinstance(r.get(k), str) else None for k in ("name", "path"))
             for r in rows]
+
+
+def third_party(root, manifest, data, listed):
+    """What a probe names beyond the tree: a dependency in any of its tables (a
+    target's among them) that is not by `path` to a manifest git lists, and
+    each package with a `source` in the lock it commits. An unreadable table
+    is named too: the census reads what it can judge, never around it."""
+    home, found = os.path.dirname(manifest), []
+    tables = [data.get(t) for t in DEP_TABLES]
+    targets = data.get("target", {})
+    for spec in targets.values() if isinstance(targets, dict) else [None]:
+        tables += [spec.get(t) for t in DEP_TABLES] if isinstance(spec, dict) else [[]]
+    for table in (t for t in tables if t is not None):
+        if not isinstance(table, dict):
+            found.append("a dependency table it cannot read")
+            continue
+        for name, dep in table.items():
+            path = dep.get("path") if isinstance(dep, dict) else None
+            if not isinstance(path, str) or os.path.normpath(
+                    os.path.join(home, path, "Cargo.toml")) not in listed:
+                found.append(f"`{name}`, a dependency not by path to a manifest of this tree")
+    lock = os.path.join(home, "Cargo.lock")
+    if lock in listed:
+        packages = read_manifest(os.path.join(root, lock)).get("package", [])
+        for p in packages if isinstance(packages, list) else [None]:
+            if not isinstance(p, dict):
+                found.append(f"a package of {lock} it cannot read")
+            elif "source" in p:
+                found.append(f"`{p.get('name')} {p.get('version')}` from {p['source']} in {lock}")
+    return found
 
 
 def git_listing(root):
@@ -393,6 +431,10 @@ def _census(c, root):
             c.errors.append(f"C4 {m}: a probe row whose manifest is gone (a stale exclusion)")
         elif recipe is None or f"./scripts/{gate}" not in recipe:
             c.errors.append(f"C4 {m}: its gate scripts/{gate} is not run by the `check` recipe")
+    for m in c.probes:
+        for crate in third_party(root, m, parsed[m], listed):
+            c.errors.append(f"C4 {m}: a probe that names {crate}: its gate would compile a "
+                            "third-party crate whose lock no cargo-deny leg reads")
     c.workspaces = fuzz
     if not fuzz:
         raise CensusError("no fuzz manifest in the tree")

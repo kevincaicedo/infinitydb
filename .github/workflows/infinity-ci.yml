@@ -211,10 +211,11 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   cargo-deny:
-    # Licences, advisories, bans and sources of every lock in the tree, one
-    # job a manifest: build-test compiles every fuzz target, so a fuzz lock's
-    # crates (libfuzzer-sys, and the cc its build script runs) are built on
-    # every PR leg.
+    # Licences, advisories, bans and sources of every lock that holds a
+    # third-party crate, the root's and each fuzz manifest's, one job a
+    # manifest; a probe names none, which the census checks. build-test
+    # compiles every fuzz target, so a fuzz lock's crates (libfuzzer-sys,
+    # and the cc its build script runs) are built on every PR leg.
     needs: deny-manifests
     strategy:
       fail-fast: false
