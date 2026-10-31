@@ -6,8 +6,10 @@ exists, so a new target is in every one of them from its first commit.
 
 A manifest in the tree is one of four kinds: the root manifest; a member of
 the root workspace (its `members` globs); a fuzz manifest, at
-`<member>/fuzz/Cargo.toml`, with `[package.metadata] cargo-fuzz = true` and a
-`[workspace]` table of its own; or a probe manifest that PROBES names with
+`<member>/fuzz/Cargo.toml`, with `[package.metadata] cargo-fuzz = true`, a
+`[workspace]` table of its own and the root's `license` (outside the root's
+workspace it cannot inherit it, so it states it, and `cargo deny` reads it,
+ADR-0198 D6); or a probe manifest that PROBES names with
 the gate that compiles it, which the `check` recipe must run. Any other
 manifest is a crate no gate compiles. The census reads the files git lists,
 tracked or untracked and not ignored, so a crate counts before its first
@@ -347,6 +349,8 @@ def _census(c, root):
     parsed = {m: read_manifest(os.path.join(root, m)) for m in manifests}
     workspace = parsed["Cargo.toml"].get("workspace", {})
     globs, excluded = workspace.get("members", []), workspace.get("exclude", [])
+    inherited = workspace.get("package", {})
+    licence = inherited.get("license") if isinstance(inherited, dict) else None
     if not isinstance(globs, list) or not all(isinstance(g, str) for g in globs + excluded):
         raise CensusError("the root manifest's workspace members are not a list of globs")
     members = set()
@@ -368,6 +372,11 @@ def _census(c, root):
                 c.errors.append(f"C3 {m}: a fuzz manifest outside <member>/fuzz/Cargo.toml")
             elif "workspace" not in data:
                 c.errors.append(f"C3 {m}: a fuzz manifest without a [workspace] of its own")
+            if data["package"].get("license") != licence:
+                c.errors.append(f"C3 {m}: a fuzz manifest whose license "
+                                f"({data['package'].get('license') or 'none'}) is not the root's "
+                                f"({licence or 'none'}), which it cannot inherit from outside "
+                                "the root's workspace")
             fuzz.append(m)
         elif m == "Cargo.toml" or directory in members:
             continue

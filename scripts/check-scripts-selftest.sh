@@ -3541,6 +3541,7 @@ fz_once() {
     printf '%s\n' "$status" >"$log.status"
 }
 fz_replay() { cat "$1" && return "$(cat "$1.status")"; }
+fz_lacks() { ! grep -q -- "$1" "$2"; }  # <pattern> <log>: the log lacks it
 
 root=$(fz_root clean)
 fz_once "$root.log" fz_run "$root"
@@ -3658,6 +3659,22 @@ root=$(fz_root c3-workspace)
 fz_sed '/^\[workspace\]$/d' "$root/crates/a/fuzz/Cargo.toml"
 fz_red "C3: a fuzz manifest without its own [workspace]" \
     "C3 crates/a/fuzz/Cargo.toml: a fuzz manifest without a .workspace. of its own" "$root"
+# ...and the root's licence, which it cannot inherit from outside the root's
+# workspace (cargo deny reads it).
+root=$(fz_root c3-licence)
+printf '\n[workspace.package]\nlicense = "Apache-2.0"\n' >>"$root/Cargo.toml"
+fz_sed 's/^version = "0.0.0"$/version = "0.0.0"\nlicense = "Apache-2.0"/' "$root/crates/a/fuzz/Cargo.toml"
+fz_once "$root.log" fz_run "$root"
+expect_red_because "fuzz-targets: C3: a fuzz manifest that states no licence" \
+    "C3 bins/b/fuzz/Cargo.toml: a fuzz manifest whose license (none) is not the root's (Apache-2.0)" \
+    fz_replay "$root.log"
+expect green "fuzz-targets: C3: a fuzz manifest stating the root's licence" \
+    fz_lacks "C3 crates/a/fuzz/Cargo.toml" "$root.log"
+fz_sed 's/^version = "0.0.0"$/version = "0.0.0"\nlicense = "MIT"/' "$root/bins/b/fuzz/Cargo.toml"
+fz_red "C3: a fuzz manifest stating another licence" \
+    "C3 bins/b/fuzz/Cargo.toml: a fuzz manifest whose license (MIT) is not the root's" "$root"
+fz_sed 's/^license = "MIT"$/license = "Apache-2.0"/' "$root/bins/b/fuzz/Cargo.toml"
+expect green "fuzz-targets: every fuzz manifest stating the root's licence" fz_run "$root"
 # C4: a probe row whose manifest is gone, or whose gate no recipe runs.
 root=$(fz_root c4-gone)
 rm "${root:?}/scripts/waker-atomics-probe/Cargo.toml"
@@ -3812,7 +3829,6 @@ printf 'Compiling a-fuzz\n' >>"$root.stub/$(fz_key crates/a/fuzz/Cargo.toml).out
 fz_red "K1: a report line that is not cargo's JSON" "1 report lines unread" "$root"
 # cargo's own error prints whole, its Caused by: chain and help: lines up to
 # the next status line, and a long block's middle is counted, not printed.
-fz_lacks() { ! grep -q -- "$1" "$2"; }  # <pattern> <log>: the log lacks it
 root=$(fz_root k1-block)
 fz_status "$root" crates/a/fuzz/Cargo.toml 101
 fz_stderr "$root" crates/a/fuzz/Cargo.toml "error: failed to run custom build command for \`libfuzzer-sys v0.4.13\`
