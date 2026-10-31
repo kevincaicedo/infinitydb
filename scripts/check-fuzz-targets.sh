@@ -43,11 +43,13 @@
 #
 # --matrix nightly|smoke judges the census only and prints the fuzz jobs'
 # matrix, one row per target in census order ({"include": [{"dir",
-# "target", "seeds"}, ...]}); a red census prints none and exits 1.
+# "target", "seeds"}, ...]}); a red census prints none and exits 1, its rows
+# and a scope error on stderr, so stdout holds the matrix or nothing.
 #
 # Knobs: INF_CHECK_ROOT (a fixture root); INF_FUZZ_CARGO (the cargo binary,
 # the self-test's stub); INF_FUZZ_CHECK_PROBE=off skips the probe on a
-# fixture root only, and the OK line says so. Portable bash 3.2 over
+# fixture root only, and the OK line says so (the matrix mode, which
+# compiles nothing, does not read it). Portable bash 3.2 over
 # python3 3.11+ (tomllib), as check-dep-dag.sh.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -60,6 +62,7 @@ case "$#:${1:-}:${2:-}" in
     *) echo "usage: check-fuzz-targets.sh [--matrix nightly|smoke]" >&2; exit 2 ;;
 esac
 probe=${INF_FUZZ_CHECK_PROBE:-on}
+[ "$mode" = gate ] || probe=on
 case "$probe" in
     on) ;;
     off)
@@ -94,7 +97,9 @@ ERROR_LEVELS = ("error", "error: internal compiler error")
 
 census = fuzz_targets.census(".")
 if census.scope_error:
-    print(f"{TOKEN} SCOPE ERROR: {census.scope_error}")
+    # A matrix job captures stdout as its matrix, so its reasons go to stderr.
+    print(f"{TOKEN} SCOPE ERROR: {census.scope_error}",
+          file=sys.stderr if MODE == "matrix" else sys.stdout)
     sys.exit(1)
 reds = list(census.errors)
 if MODE == "matrix":
