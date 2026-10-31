@@ -363,9 +363,12 @@ impl FrameSlot {
 /// A frame reserved on a segment fits it (ADR-0191 D4): `len`, the frame's
 /// largest on-device length in its rotor (`padded_bound`), is at most the
 /// segment's `segment` bytes. The staging ring seals at most its capacity
-/// (`StagingRing::stage`), and the rotor's geometry holds a segment of at
-/// least the largest frame that capacity seals under the configured mode
-/// (`LogGeometry::new`, row 5), so no sealed frame reaches the other branch.
+/// (`StagingRing::stage`); the ring and the rotor are built from one
+/// geometry, by construction and not by type (the server builds a cell's
+/// rotor and its ring from one configuration); and that geometry holds a
+/// segment of at least the largest frame its capacity seals under the
+/// configured mode (`LogGeometry::new`, row 5), so no sealed frame reaches
+/// the other branch.
 /// Release, not debug: a frame reserved past the preallocation is written
 /// past it, and recovery's scan, the recycle sentinel's block and the
 /// reorder arithmetic no longer describe the file. The compare is the one

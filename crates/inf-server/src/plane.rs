@@ -961,7 +961,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// assembly runs recovery first (`recover::open_cell_log`) and hands
     /// the tail-opened rotor plus the recovered manifest here, before the
     /// loop starts. `cell_id` names the shard directory the checkpoint and
-    /// manifest drivers write under.
+    /// manifest drivers write under. `cfg` is the configuration `rotor` was
+    /// recovered under (`begin_recovery` stores that one value): the cell
+    /// builds its staging ring from `cfg.geometry`, and a frame the ring
+    /// seals fits the rotor's segment only because both come from that one
+    /// geometry (ADR-0191 D4).
     ///
     /// # Errors
     /// Checkpoint-directory scan failure (boot-time listing).
