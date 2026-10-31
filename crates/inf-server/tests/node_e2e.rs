@@ -1103,19 +1103,194 @@ fn reply_read_failed(stream: &TcpStream, what: &str, err: &std::io::Error) -> St
     }
 }
 
+/// The most bytes a mismatched reply's error line is read to so the
+/// message prints it whole: the product's error replies are one short
+/// line, and a line that never ends stops here or at the stream's read
+/// timeout.
+const ERROR_LINE_BYTES_MAX: usize = 1024;
+
 fn read_exactly(stream: &mut TcpStream, want: &[u8]) {
     let mut got = vec![0u8; want.len()];
     if let Err(err) = stream.read_exact(&mut got) {
         let what = format!("read reply {:?}", String::from_utf8_lossy(want));
         panic!("{}", reply_read_failed(stream, &what, &err));
     }
-    assert_eq!(
-        got,
-        want,
+    if got != want {
+        panic!("{}", reply_mismatch(stream, &got, want));
+    }
+}
+
+/// Names a reply that is not `want`. Where `got` first differs from
+/// `want` with an error reply (`-` that begins a reply line), the rest of
+/// that line is read, so the message carries the server's whole answer
+/// rather than the first `want.len()` bytes of it; a `-STALLED` adds the
+/// state that explains its wait.
+fn reply_mismatch(stream: &mut TcpStream, got: &[u8], want: &[u8]) -> String {
+    let mut message = format!(
         "reply mismatch: got {:?} want {:?}",
-        String::from_utf8_lossy(&got),
+        String::from_utf8_lossy(got),
         String::from_utf8_lossy(want)
     );
+    let Some(line) = diverging_error_line(stream, got, want) else {
+        return message;
+    };
+    message.push_str(&format!("; the error reply whole: {:?}", String::from_utf8_lossy(&line)));
+    if line.starts_with(b"-STALLED") {
+        message.push_str(&stalled_diagnosis(stream));
+    }
+    message
+}
+
+/// The error reply at the first byte where `got` differs from `want`,
+/// read to its line's end (at most [`ERROR_LINE_BYTES_MAX`] bytes, within
+/// the stream's read timeout); `None` when that byte is not a `-` that
+/// begins a reply line.
+fn diverging_error_line(stream: &mut TcpStream, got: &[u8], want: &[u8]) -> Option<Vec<u8>> {
+    let at = got.iter().zip(want).position(|(got, want)| got != want)?;
+    let begins_line = at == 0 || got[..at].ends_with(b"\r\n");
+    if !begins_line || got[at] != b'-' {
+        return None;
+    }
+    let mut line = got[at..].to_vec();
+    if let Some(end) = line.windows(2).position(|pair| pair == b"\r\n") {
+        line.truncate(end + 2);
+        return Some(line);
+    }
+    let mut byte = [0u8; 1];
+    while !line.ends_with(b"\r\n") && line.len() < ERROR_LINE_BYTES_MAX {
+        if stream.read_exact(&mut byte).is_err() {
+            break;
+        }
+        line.push(byte[0]);
+    }
+    Some(line)
+}
+
+/// The `INFO tiering` fields that place a stalled tiered write: the
+/// cell's flush rounds (completed, in flight, the slowest), and the
+/// waits that would show an engine budget, turn or plan holding one.
+const STALL_DIAGNOSIS_FIELDS: [&str; 7] = [
+    "tiering_flush_rounds",
+    "tiering_flush_rounds_inflight",
+    "tiering_flush_round_p99_us",
+    "tier_flush_groups_deferred",
+    "tier_group_wait_ns_max",
+    "tier_turn_waits",
+    "tier_plan_waits",
+];
+
+/// The fresh connections a stall diagnosis opens to reach every cell.
+const STALL_DIAGNOSIS_CONNECTS_MAX: usize = 64;
+
+/// How long one diagnosis connection may take to connect or answer.
+const STALL_DIAGNOSIS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The largest `INFO` body a diagnosis reads.
+const STALL_DIAGNOSIS_INFO_BYTES_MAX: usize = 1 << 20;
+
+/// What a `-STALLED` needs to be read without an instrument: the bound it
+/// waited out — a tiered write past its window parks for a flush round
+/// until its namespace's `TAIL-STALL-TIMEOUT` (ADR-0053 D4) — and each
+/// cell's flush-round state. The cells are read over fresh connections to
+/// the same port, because the failing one may still owe pipelined
+/// replies, and after the reply, so a round that landed since reads as
+/// landed.
+fn stalled_diagnosis(stream: &TcpStream) -> String {
+    let mut text = format!(
+        "\na tiered write waited out its namespace's TAIL-STALL-TIMEOUT for a flush round \
+         (the product's default unless the namespace states one: this binary's fixtures \
+         state FIXTURE_TAIL_STALL_TIMEOUT_MS = {FIXTURE_TAIL_STALL_TIMEOUT_MS} ms, a \
+         stall-subject test its own); INFO tiering after the reply:"
+    );
+    match stream.peer_addr() {
+        Ok(addr) => text.push_str(&cells_flush_state(addr)),
+        Err(err) => text.push_str(&format!(" unread ({err})")),
+    }
+    text
+}
+
+/// [`STALL_DIAGNOSIS_FIELDS`] and every tiered namespace's watermarks, one
+/// line per cell, read until each cell of the node answered once.
+fn cells_flush_state(addr: std::net::SocketAddr) -> String {
+    let mut read = std::collections::BTreeMap::new();
+    let mut cells = 1;
+    let mut text = String::new();
+    for _ in 0..STALL_DIAGNOSIS_CONNECTS_MAX {
+        if read.len() >= cells {
+            break;
+        }
+        match cell_flush_state(addr) {
+            Ok((cell, count, state)) => {
+                cells = count;
+                read.entry(cell).or_insert(state);
+            }
+            Err(err) => {
+                text.push_str(&format!("\n  a diagnosis connection failed: {err}"));
+                break;
+            }
+        }
+    }
+    for (cell, state) in &read {
+        text.push_str(&format!("\n  cell {cell}: {state}"));
+    }
+    if read.len() < cells {
+        text.push_str(&format!("\n  {} of {cells} cells answered", read.len()));
+    }
+    text
+}
+
+/// One fresh connection's cell, the node's cell count and that cell's
+/// flush-round state.
+fn cell_flush_state(addr: std::net::SocketAddr) -> std::io::Result<(u64, usize, String)> {
+    let mut conn = TcpStream::connect_timeout(&addr, STALL_DIAGNOSIS_TIMEOUT)?;
+    conn.set_read_timeout(Some(STALL_DIAGNOSIS_TIMEOUT))?;
+    let server = info_text_fallible(&mut conn, b"server")?;
+    let number = |name: &str| -> std::io::Result<u64> {
+        server
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+            .and_then(|value| value.trim().parse().ok())
+            .ok_or_else(|| std::io::Error::other(format!("INFO server has no {name}")))
+    };
+    let cell = number("cell")?;
+    let cells = usize::try_from(number("cells")?).map_err(std::io::Error::other)?;
+    let tiering = info_text_fallible(&mut conn, b"tiering")?;
+    let mut state = Vec::new();
+    for line in tiering.lines() {
+        let name = line.split(':').next().unwrap_or("");
+        if STALL_DIAGNOSIS_FIELDS.contains(&name) {
+            state.push(line.to_owned());
+        } else if name.starts_with("tiering_ns") {
+            // head, flushed, ro_boundary, tail and committed_bytes lead the line.
+            state.push(line.splitn(6, ',').take(5).collect::<Vec<_>>().join(","));
+        }
+    }
+    Ok((cell, cells, state.join(" ")))
+}
+
+/// [`info_text`] that returns an error instead of panicking, for a
+/// failure message under construction.
+fn info_text_fallible(conn: &mut TcpStream, section: &[u8]) -> std::io::Result<String> {
+    conn.write_all(&cmd(&[b"INFO", section]))?;
+    let mut header = Vec::new();
+    let mut byte = [0u8; 1];
+    while !header.ends_with(b"\r\n") {
+        if header.len() > 32 {
+            return Err(std::io::Error::other("INFO header past 32 bytes"));
+        }
+        conn.read_exact(&mut byte)?;
+        header.push(byte[0]);
+    }
+    let length = std::str::from_utf8(&header[..header.len() - 2])
+        .ok()
+        .and_then(|text| text.strip_prefix('$'))
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .filter(|&length| length <= STALL_DIAGNOSIS_INFO_BYTES_MAX)
+        .ok_or_else(|| std::io::Error::other(format!("INFO reply header {header:?}")))?;
+    let mut body = vec![0u8; length + 2];
+    conn.read_exact(&mut body)?;
+    body.truncate(length);
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// A key owned by `cell` under an N-cell contiguous router.
