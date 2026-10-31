@@ -857,6 +857,12 @@ are allocated once and the append path allocates nothing. At LOG, unless a
 hold applies, the current buffer seals into a frame and is leased to the
 in-flight write until its completion returns.
 
+A segment holds at least the largest frame one buffer can seal, so
+`--segment-bytes` is at least `--log-staging-mib` MiB and, under the FUA class
+described below, a multiple of 4 KiB. The node refuses any other pair before it
+listens, naming both flags, rather than stopping at the first frame no segment
+can hold.
+
 Up to K frames may be in flight at once, so the ring has K + 1 buffers. K is
 derived from the barrier class described below: 3 for FUA and 1 for FLUSH,
 at most 8 (`--frames-in-flight` overrides it). Completions can arrive in any
@@ -1354,6 +1360,7 @@ background I/O is not budgeted and checkpoints are paced at a fixed rate.
 | Expirations per slice | 4,096 | the rest next slice |
 | Memory | `maxmemory` share; namespace `MAXMEMORY` | `DENYOOM` commands get `-OOM`, after at most 512 inline evictions |
 | Log staging | (K + 1) × 4 MiB | durable writes wait; oversized records refused |
+| Segment size | 256 MiB | below the largest frame the staging ring can seal: the node refuses to start |
 | Log space | the device | segment creation failing with `ENOSPC`: durable writes refused (`NOSPACE`), memory namespaces unaffected; a failed frame or zero-fill write (the usual case, since segments are sparse): the node stops |
 | Output buffer | `client-output-buffer-limit`: normal clients unlimited (as in Redis); subscribers 32 MiB hard, or 8 MiB for 60 s | client disconnected |
 | Cold-read queue | `COLD-READ-QD` (64) and overflow cap | `BUSY` |

@@ -342,8 +342,8 @@ those driver ops against the same `SimDisk`.
 
 ### M4.5-S34 additions (ADR-0086 D4) — `Direct` log segments
 
-> **ADR-0191 (2026-10-29), implementation open:** `SegmentConfig::assert_valid`
-> goes. `Direct` still requires `segment_bytes % 4096 == 0`; the check is row 4
+> **ADR-0191 (2026-10-29):** `SegmentConfig::assert_valid` is gone.
+> `Direct` still requires `segment_bytes % 4096 == 0`; the check is row 4
 > of `LogGeometry::new`, the one constructor of the log's checked pair (the
 > log staging domain section, below), which also requires
 > `segment_bytes ≥ max_sealed_frame_bytes(staging, io_mode)`: a segment holds
@@ -355,19 +355,19 @@ those driver ops against the same `SimDisk`.
 > `SegmentConfig` and keep `geometry.segment()` as their configuration; no
 > other constructor takes a `SegmentConfig`. A refused pair is a
 > `LogGeometryError` at construction, never a panic and never a frame refused
-> while serving: `LogError::FrameTooLarge` goes, and `begin_frame` and
+> while serving: `LogError::FrameTooLarge` is gone, and `begin_frame` and
 > `begin_frame_deferred` keep the compare
 > `padded_bound(frame_len) ≤ segment_bytes` as a release assertion over an
 > invariant the geometry proves.
 > `SegmentIoMode::layout()` names the mode's `FrameLayout` once
-> (`Buffered → Packed`, `Direct → Aligned`). Not built; the bullets below
-> state the shape as implemented today (ADR-0191 D1, D3, D4).
+> (`Buffered → Packed`, `Direct → Aligned`). The bullets below state the
+> rest of the shape (ADR-0191 D1, D3, D4).
 
 - `SegmentIoMode::{Buffered, Direct}` on `SegmentConfig::io_mode`
   (default `Buffered` — the M2 path byte-for-byte) plus
   `fua_max_frame_bytes` (the probed write-through crossover, default
-  256 KiB). `Direct` requires `segment_bytes % 4096 == 0`
-  (`SegmentConfig::assert_valid`).
+  256 KiB). `Direct` requires `segment_bytes % 4096 == 0` (row 4 of
+  `LogGeometry::new`, above).
 - `SegmentFs::create_segment_direct(path, prealloc)` — `O_DIRECT`
   (verified), sparse, unsynced; `SegmentFs::open_segment_append(path,
   mode)` — the recovered tail reopens in the configured mode;
@@ -506,7 +506,7 @@ the observed high-water mark (`frames_in_flight_max`). Operator surface:
 3 --log-staging-mib 2` (4 × 2 MiB). `StagingConfig::with_capacity(bytes)`
 is the K = 1 constructor tests and tooling use.
 
-> **ADR-0191 (2026-10-29), implementation open:** a ring is built from a
+> **ADR-0191 (2026-10-29):** a ring is built from a
 > `LogGeometry`, the log's checked pair of a `StagingConfig` and a
 > `SegmentConfig`: `StagingRing::new(geometry: LogGeometry)` reads
 > `geometry.staging()`, and no other constructor takes a `StagingConfig`.
@@ -527,9 +527,8 @@ is the K = 1 constructor tests and tooling use.
 > check, not a value. `infinityd` builds the geometry once the device probe
 > has named the class and refuses a pair the type refuses before it listens,
 > naming `--segment-bytes` and `--log-staging-mib`; `--log-staging-mib`'s own
-> domain is `1..=DEFAULT_MAX_FRAME_LEN >> 20`, written from the constant. Not
-> built; the bullets below state the shape as implemented today (ADR-0191
-> D1, D3).
+> domain is `1..=DEFAULT_MAX_FRAME_LEN >> 20`, written from the constant.
+> The bullets below state the ring's steps (ADR-0191 D1, D3).
 
 - EXECUTE: `stage(&MutationEffect) -> Result<StagedAt, StagingFull>` —
   in-place encode, zero steady-state allocation (counting-allocator
@@ -2070,7 +2069,7 @@ idempotence affordance, documented, not a promotion target.
 
 ## 3. `StagingRing` custody — log-staging domain (`inf-log/src/staging.rs`)
 
-> **ADR-0191 (2026-10-29), implementation open:** rows 3.5 and 3.9 reverse
+> **ADR-0191 (2026-10-29):** rows 3.5 and 3.9 reversed
 > their "keep (per-boot)". The bounds they name —
 > `capacity_bytes ∈ [MIN_FRAME_LEN, DEFAULT_MAX_FRAME_LEN]` and
 > `frames_in_flight ∈ 1..=MAX_FRAMES_IN_FLIGHT` — are rows 1–3 of
@@ -2079,8 +2078,7 @@ idempotence affordance, documented, not a promotion target.
 > `LogGeometryError` at construction, never a panic. Row 3.9's allocation
 > facts — buffers = K + 1 allocated once, `resident_bytes` = (K + 1) ×
 > (capacity + 2 × FRAME_ALIGN) — hold by construction, as before. Rows 3.1–3.4
-> and 3.6–3.8 are unchanged. The rows below do not establish that the
-> replacement is built.
+> and 3.6–3.8 are unchanged; rows 3.5 and 3.9 below state the type.
 
 Double-buffered frame pair; the **generation token** is the custody
 mechanism (a stale `StagedAt`/`FrameLease` resolving to the wrong LSN would
@@ -2093,8 +2091,8 @@ mis-address a record → wrong data acked as durable).
 | 3.3 | `release`: `in_flight.generation == lease.generation` | Releasing the wrong buffer resurrects in-flight bytes | `assert_eq!` **release** staging.rs:357 | keep |
 | 3.4 | `seal`: `!is_empty()` and `in_flight.is_none()` — at most one frame in flight, no empty seal | A second seal while a lease is outstanding aliases the in-flight buffer (memory > 2×capacity, torn write) | two `assert!` **release** staging.rs:328, 329 | keep — **amended M4.5-S35 (ADR-0087 D1):** `!backlogged()` (a free buffer exists; ≤ `frames_in_flight` leases out); the seal takes a `Free` buffer, never one in `InFlight`/`Staging` (typestate per buffer) |
 | 3.8 | `leased_index`/`release` (M4.5-S35): exactly one buffer is `InFlight { generation }` for a live lease; release moves it to `Free` in any order | A stale or double-released lease would free a buffer still leased to a write | `expect` **release** (position by generation) | keep |
-| 3.9 | `new` (M4.5-S35): `frames_in_flight ∈ 1..=MAX_FRAMES_IN_FLIGHT`; buffers = K + 1 allocated once; `resident_bytes` = (K + 1) × (capacity + 2 × FRAME_ALIGN) | The ring is bounded and attributed (L5); no allocation after construction (pinned at K = 4 by `staging_alloc`) | two `assert!` **release** | keep (per-boot) |
-| 3.5 | `new`: `capacity_bytes ∈ [min_frame, DEFAULT_MAX_FRAME_LEN]` | A capacity below a minimal frame or above the reader bound writes frames no default reader can replay | two `assert!` **release** staging.rs:204, 206 | keep (per-boot) |
+| 3.9 | `new` (M4.5-S35): `frames_in_flight ∈ 1..=MAX_FRAMES_IN_FLIGHT`; buffers = K + 1 allocated once; `resident_bytes` = (K + 1) × (capacity + 2 × FRAME_ALIGN) | The ring is bounded and attributed (L5); no allocation after construction (pinned at K = 4 by `staging_alloc`) | type: row 3 of `LogGeometry::new`, the one constructor of the value `StagingRing::new` takes; the allocation facts by construction | reversed — **restated 2026-10-31:** the type in place of the two release asserts (ADR-0191 D1) |
+| 3.5 | `new`: `capacity_bytes ∈ [MIN_FRAME_LEN, DEFAULT_MAX_FRAME_LEN]` | A capacity below a minimal frame or above the reader bound writes frames no default reader can replay | type: rows 1–2 of `LogGeometry::new`, the one constructor of the value `StagingRing::new` takes | reversed — **restated 2026-10-31:** the type in place of the two release asserts (ADR-0191 D1) |
 | 3.6 | `stage`: record over remaining capacity → typed `StagingFull`, effect not partially staged | Backpressure is an operating condition, not an invariant (L: bounded queue) | checked-error staging.rs:227–230 | keep |
 | 3.7 | oversized record (`> max_record_len`) is admission's problem, never retried here | Retrying an un-stageable record is a livelock | by-construction + doc (admission checks `max_record_len` up front) staging.rs:254–260 | keep — verify S08 admission actually calls `max_record_len` (out of scope here; note for cross-check) |
 
