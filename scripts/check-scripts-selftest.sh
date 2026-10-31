@@ -4139,22 +4139,24 @@ expect_red_because "fuzz-targets: an unknown matrix" "usage: check-fuzz-targets.
     env INF_CHECK_ROOT="$root" "$FUZZ" --matrix weekly
 
 # The workflows and the local deny recipe read the census (ADR-0198 D3, D6):
-# every fuzz run step and every cargo-deny step sits in a job whose matrix is
+# every fuzz run and every cargo-deny call, each judged by its own rule
+# wherever it sits (a step holding both is red), is in a job whose matrix is
 # `${{ fromJSON(needs.<census job>.outputs.matrix) }}` alone, the census job
 # prints that matrix with `check-fuzz-targets.sh --matrix <mode>` in the
 # assignment shape (an inline `$(…)` in the echo drops its status) at the
 # commit the matrix job checks out, each fuzz call names the row's target and
 # its step the row's seeds and directory, each cargo-deny call the row's
 # manifest; the nightly, the full smoke and PR CI's cargo-deny each read their
-# mode; PR CI's one-target smoke, `resp_parse`, is the one literal (D3); and
-# the justfile runs cargo-deny only in `deny`, over `--matrix deny`. A list
-# kept by hand beside the census would pass every other gate. Stdlib python, a
-# line-and-indent reader of these files' layout that fails closed, as
-# legs_cover: it judges a call written unquoted on one line of a step (jobs at
-# two columns, steps at `      - `) or of a recipe, and any other spelling of
-# a fuzz run or of cargo-deny (the reader's first comment lists them), in any
-# case or quoting, folded or continued across lines, is red: a call it cannot
-# place. It strips a comment only where YAML or just does: a block scalar's
+# mode; PR CI's one-target smoke, `resp_parse`, is the one literal (D3), and
+# its step runs no cargo-deny; and the justfile runs cargo-deny only in
+# `deny`, each call over `--matrix deny`'s row. A list kept by hand beside the
+# census would pass every other gate. Stdlib python, a line-and-indent reader
+# of these files' layout that fails closed, as legs_cover: it judges a call
+# written unquoted on one line of a step (jobs at two columns, steps at
+# `      - `) or of a recipe, and any other spelling of a fuzz run or of
+# cargo-deny (the reader's first comment lists them), in any case or quoting,
+# folded or continued across lines, is red: a call it cannot place. It
+# strips a comment only where YAML or just does: a block scalar's
 # content and a recipe's body are read whole, because a quote the line does
 # not show (open across lines, nested in `$(…)`) decides where a shell's
 # comment starts, so a call spelled in a script's comment is red too. A line
@@ -4189,7 +4191,9 @@ DENY = (r"(?i:\bcargo-deny\b|\bcargo(?:\.exe)?(?:\s+[-+][^\s;&|()<>]*(?:\s+(?![-
 FUZZ_RUN, DENY_RUN = re.compile(FUZZ), re.compile(DENY)
 FUZZ_CALL = re.compile(FUZZ + r"\s+(\S+)")
 ROW_CALL = re.compile(FUZZ + r"\s+\$\{\{ matrix\.target \}\}(?=\s|$)")
-DENY_USES = "EmbarkStudios/cargo-deny-action"
+ROW_DENY = re.compile(DENY + r"\s+--manifest-path\s+\$\{\{ matrix\.manifest \}\}(?=\s|$)")
+RECIPE_DENY = re.compile(DENY + r'\s+--manifest-path\s+"\$manifest"(?=\s|$)')
+DENY_USES, ROW_MANIFEST = "EmbarkStudios/cargo-deny-action", "${{ matrix.manifest }}"
 SPELLED = (("a fuzz run", FUZZ_RUN), ("a cargo-deny call", DENY_RUN))
 NAME = {what: float("inf") for what, _ in SPELLED}  # a job id or a name runs nothing
 BLOCK = re.compile(r"(\s*)((?:-\s+)*)(?:(\S.*?):\s+)?[|>]([-+0-9]*)")
@@ -4429,6 +4433,34 @@ def census_mode(shapes, job):
     return m.group(1), None
 
 
+def under_census(where, what, want, job, shapes):
+    """The mode a matrix job's call reads from its census job, or None after
+    the reason it reads none of `want`."""
+    needs, strategy, _, steps, _ = shapes[job]
+    matrix = [l for l in strategy if l.startswith("matrix:")]
+    other = [l for l in strategy if not l.startswith(("matrix:", "#"))
+             and not re.fullmatch(r"(fail-fast|max-parallel):\s*\S+", l)]
+    m = MATRIX.fullmatch(matrix[0][len("matrix:"):].strip()) if len(matrix) == 1 else None
+    if m is None or other:
+        errors.append(f"{where}: {what} not under a matrix read from a census job "
+                      "(`matrix: ${{ fromJSON(needs.<job>.outputs.matrix) }}` alone)")
+        return None
+    census = m.group(1)
+    mode, why = census_mode(shapes, census)
+    if census not in needs:
+        errors.append(f"{where}: its matrix is `{census}`'s, a job it does not need")
+    elif why:
+        errors.append(f"{where}: {why}")
+    elif mode not in want:
+        errors.append(f"{where}: {what} reads --matrix {mode}, not {' or '.join(want)}")
+    elif refs(steps) != refs(shapes[census][3]):
+        errors.append(f"{where}: checks out {refs(steps)}, and `{census}` read the census "
+                      f"at {refs(shapes[census][3])}: the matrix is another commit's")
+    else:
+        read.append(f"{where} <- {census} (--matrix {mode})")
+        return mode
+    return None
+
 
 for wf in files:
     lines = open(os.path.join(wf_dir, wf), encoding="utf-8").read().split("\n")
@@ -4440,62 +4472,42 @@ for wf in files:
         errors.extend(unplaced(wf, lines, judged, texts))
         continue
     shapes = {job: shape(body) for job, body in jobs.items()}
-    for job, (needs, strategy, _, steps, names) in shapes.items():
+    for job, (_, _, _, steps, names) in shapes.items():
         judged.update({number: NAME for number in names})
         for step in steps:
             judge_lines(judged, step)
             raw = " ".join(step["run"])
             text = " ".join(command(l) for l in step["run"])
-            fuzz = FUZZ_RUN.search(text)
-            deny = step.get("uses", "").startswith(DENY_USES) or DENY_RUN.search(text)
-            if not fuzz and not deny:
-                continue
-            where, what = f"{wf} {job}", "a fuzz run" if fuzz else "a cargo-deny step"
+            fuzz, deny = len(FUZZ_RUN.findall(text)), len(DENY_RUN.findall(text))
+            action, where = step.get("uses", "").startswith(DENY_USES), f"{wf} {job}"
+            # Each call is judged by its own rule, wherever it sits: a step
+            # holding both meets both, which no one census mode allows.
             if fuzz and (wf, job) == PR_SMOKE[:2]:
                 targets = FUZZ_CALL.findall(text)
-                for target in targets + ["?"] * (len(FUZZ_RUN.findall(text)) - len(targets)):
+                for target in targets + ["?"] * (fuzz - len(targets)):
                     if target == PR_SMOKE[2]:
                         pr_smoke += 1
                     else:
                         errors.append(f"{where}: the PR smoke fuzzes `{target}`, not "
                                       f"{PR_SMOKE[2]}, its one named target (ADR-0198 D3)")
-                continue
-            matrix = [l for l in strategy if l.startswith("matrix:")]
-            other = [l for l in strategy if not l.startswith(("matrix:", "#"))
-                     and not re.fullmatch(r"(fail-fast|max-parallel):\s*\S+", l)]
-            m = MATRIX.fullmatch(matrix[0][len("matrix:"):].strip()) if len(matrix) == 1 else None
-            if m is None or other:
-                errors.append(f"{where}: {what} not under a matrix read from a census job "
-                              "(`matrix: ${{ fromJSON(needs.<job>.outputs.matrix) }}` alone)")
-                continue
-            census = m.group(1)
-            mode, why = census_mode(shapes, census)
-            want = ("nightly", "smoke") if fuzz else ("deny",)
-            deny_lines = [l for l in step["run"] if DENY_RUN.search(command(l))]
-            if census not in needs:
-                errors.append(f"{where}: its matrix is `{census}`'s, a job it does not need")
-            elif why:
-                errors.append(f"{where}: {why}")
-            elif mode not in want:
-                errors.append(f"{where}: {what} reads --matrix {mode}, not {' or '.join(want)}")
-            elif refs(steps) != refs(shapes[census][3]):
-                errors.append(f"{where}: checks out {refs(steps)}, and `{census}` read the census "
-                              f"at {refs(shapes[census][3])}: the matrix is another commit's")
-            elif fuzz and not (len(ROW_CALL.findall(text)) == len(FUZZ_RUN.findall(text))
-                               and "${{ matrix.seeds }}" in raw
-                               and step.get("working-directory") == "${{ matrix.dir }}"):
-                errors.append(f"{where}: a fuzz run that does not name its row's "
-                              "`${{ matrix.target }}`, `${{ matrix.seeds }}` and "
-                              "`working-directory: ${{ matrix.dir }}`")
-            elif not fuzz and not (
-                    "${{ matrix.manifest }}" in step["with"].get("manifest-path", "")
-                    if "uses" in step else
-                    all("${{ matrix.manifest }}" in l for l in deny_lines)):
-                errors.append(f"{where}: a cargo-deny step that does not name its row's "
-                              "`${{ matrix.manifest }}`")
-            else:
-                found.add((wf, mode))
-                read.append(f"{wf} {job} <- {census} (--matrix {mode})")
+            elif fuzz:
+                mode = under_census(where, "a fuzz run", ("nightly", "smoke"), job, shapes)
+                if mode and not (len(ROW_CALL.findall(text)) == fuzz
+                                 and "${{ matrix.seeds }}" in raw
+                                 and step.get("working-directory") == "${{ matrix.dir }}"):
+                    errors.append(f"{where}: a fuzz run that does not name its row's "
+                                  "`${{ matrix.target }}`, `${{ matrix.seeds }}` and "
+                                  "`working-directory: ${{ matrix.dir }}`")
+                elif mode:
+                    found.add((wf, mode))
+            if deny or action:
+                mode = under_census(where, "a cargo-deny call", ("deny",), job, shapes)
+                if mode and not (len(ROW_DENY.findall(text)) == deny and (
+                        not action or step["with"].get("manifest-path") == ROW_MANIFEST)):
+                    errors.append(f"{where}: a cargo-deny call that does not name its row's "
+                                  f"`{ROW_MANIFEST}`")
+                elif mode:
+                    found.add((wf, mode))
     errors.extend(unplaced(wf, lines, judged, texts))
 for wf, mode in sorted(EXPECTED - found):
     errors.append(f"{wf}: no job reads --matrix {mode} from a census job (ADR-0198 "
@@ -4519,16 +4531,20 @@ for name, lines in sorted(recipes.items()):
     if name != "deny" and calls:
         errors.append(f"justfile: recipe `{name}` runs cargo-deny outside `deny`: "
                       f"{calls[0][1].strip()}")
-deny = [l for _, l in recipes.get("deny", [])]
+deny = recipes.get("deny", [])
 if not any(command(l).split() == ["rows=$(./scripts/check-fuzz-targets.sh", "--matrix", "deny)"]
-           for l in deny):
+           for _, l in deny):
     errors.append("justfile: the `deny` recipe does not read "
                   "`rows=$(./scripts/check-fuzz-targets.sh --matrix deny)`")
-calls = [l for l in deny if DENY_RUN.search(command(l))]
-if not calls or not all('--manifest-path "$manifest"' in l for l in calls):
+calls = [(n, l) for n, l in deny if DENY_RUN.search(command(l))]
+if not calls:
     errors.append("justfile: the `deny` recipe runs cargo-deny on no census row "
                   "(`--manifest-path \"$manifest\"`)")
-# A recipe's body is read whole, as a block scalar's content is.
+for n, l in calls:  # per call: each one on the line names the row
+    if len(RECIPE_DENY.findall(l)) != len(DENY_RUN.findall(l)):
+        errors.append(f"justfile:{n}: a cargo-deny call in `deny` that does not name its census "
+                      f"row (`--manifest-path \"$manifest\"`): {l.strip()}")
+# A recipe's body is read whole, as a block scalar is.
 body_lines = {n for lines in recipes.values() for n, _ in lines}
 texts = [(l, None) if n in body_lines else just_text(l) for n, l in enumerate(just, 1)]
 errors.extend(unplaced("justfile", just, judged, texts))
@@ -4602,9 +4618,9 @@ cm_plant build "$CM_NIGHTLY" 'cargo +nightly fuzz run ${{ matrix.target }}' 'car
 cm_red "a nightly that fuzzes no census target" \
     "infinity-fuzz-nightly.yml: no job reads --matrix nightly from a census job"
 cm_plant deny-path "$CM_PR" '          manifest-path: ${{ matrix.manifest }}' '          manifest-path: Cargo.toml'
-cm_red "a cargo-deny step on a literal manifest" "a cargo-deny step that does not name its row's"
+cm_red "a cargo-deny step on a literal manifest" "a cargo-deny call that does not name its row's"
 cm_plant deny-mode "$CM_PR" '--matrix deny)' '--matrix smoke)'
-cm_red "cargo-deny reading the fuzz matrix" "a cargo-deny step reads --matrix smoke, not deny"
+cm_red "cargo-deny reading the fuzz matrix" "a cargo-deny call reads --matrix smoke, not deny"
 cm_plant pr-smoke "$CM_PR" 'fuzz run resp_parse --' 'fuzz run frame_decode --'
 cm_red "the PR smoke on another literal target" "the PR smoke fuzzes .frame_decode., not resp_parse"
 cm_plant recipe justfile '    rows=$(./scripts/check-fuzz-targets.sh --matrix deny)' '    rows=Cargo.toml'
@@ -4641,7 +4657,7 @@ done
 for CM_SPELLING in 'cargo -q deny' 'cargo --color never deny' 'cargo --config "net.retry = 2" deny'; do
     cm_add spelling "$CM_JOB      - run: $CM_SPELLING --manifest-path Cargo.toml check$CM_WD"
     cm_judged "\`$CM_SPELLING\` in the tree's layout" \
-        "plant.yml plant: a cargo-deny step not under a matrix"
+        "plant.yml plant: a cargo-deny call not under a matrix"
 done
 cm_add compact "$CM_HEAD"$'  plant:\n    runs-on: ubuntu-24.04\n    steps:\n    - uses: actions/checkout@v5\n'"    - run: $CM_FUZZ"
 cm_red "a compact step sequence" "plant.yml:8: a fuzz run this reader cannot place"
@@ -4698,10 +4714,38 @@ cm_plant deny-run "$CM_PR" "$CM_DENY" "      - run: $CM_DENY_ROW"
 expect green "census-matrices: a cargo-deny call naming its row is read" census_matrices "$CM_ROOT"
 cm_plant deny-run-second "$CM_PR" "$CM_DENY" $'      - run: |\n'"          $CM_DENY_ROW"$'\n          cargo deny --manifest-path Cargo.toml --all-features check'
 cm_red "a second, literal cargo-deny call in a matrix step" \
-    "cargo-deny: a cargo-deny step that does not name its row's"
+    "cargo-deny: a cargo-deny call that does not name its row's"
 cm_plant pr-smoke-second "$CM_PR" 'fuzz run resp_parse -- -max_total_time=60' \
     "fuzz run resp_parse -- -max_total_time=60 && $CM_FUZZ"
 cm_red "a second target in the PR smoke's step" "the PR smoke fuzzes .frame_decode., not resp_parse"
+# A cargo-deny call is judged by its own rule wherever it sits: in a fuzz step
+# (the PR smoke, the nightly, the full smoke), beside its row's call on one
+# line, or beside the deny recipe's call on its line.
+cm_plant pr-smoke-deny "$CM_PR" 'fuzz run resp_parse -- -max_total_time=60' \
+    'fuzz run resp_parse -- -max_total_time=60 && cargo deny --manifest-path Cargo.toml check'
+cm_red "a cargo-deny call in the PR smoke's step" \
+    "infinity-ci.yml fuzz-smoke: a cargo-deny call not under a matrix"
+cm_plant nightly-deny "$CM_NIGHTLY" ' -- -max_total_time=19800' \
+    ' -- -max_total_time=19800 && cargo deny --manifest-path crates/inf-log/fuzz/Cargo.toml check'
+cm_red "a cargo-deny call in the nightly's fuzz step" \
+    "fuzz-hour: a cargo-deny call reads --matrix nightly, not deny"
+CM_SMOKE='cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} ${{ matrix.seeds }} -- -max_total_time=300'
+cm_plant smoke-deny "$CM_FULL" "        run: $CM_SMOKE" \
+    $'        run: |\n'"          $CM_SMOKE"$'\n          cargo deny --manifest-path Cargo.toml check'
+cm_red "a cargo-deny line in the full smoke's fuzz step" \
+    "fuzz-smoke: a cargo-deny call reads --matrix smoke, not deny"
+cm_plant deny-one-line "$CM_PR" "$CM_DENY" \
+    "      - run: $CM_DENY_ROW && cargo deny --manifest-path Cargo.toml --all-features check"
+cm_red "a literal cargo-deny call on its row's line" \
+    "cargo-deny: a cargo-deny call that does not name its row's"
+cm_plant deny-path-prefix "$CM_PR" '          manifest-path: ${{ matrix.manifest }}' \
+    '          manifest-path: x/${{ matrix.manifest }}'
+cm_red "the action on a path built from its row" \
+    "cargo-deny: a cargo-deny call that does not name its row's"
+cm_plant recipe-second justfile '--all-features $fetch </dev/null; then' \
+    '--all-features $fetch </dev/null && cargo deny --manifest-path Cargo.toml check </dev/null; then'
+cm_red "a literal cargo-deny call beside the deny recipe's" \
+    "justfile:[0-9]*: a cargo-deny call in .deny. that does not name its census row"
 cm_plant recipe-quoted justfile $'\ntest:\n' $'\ndeny-root:\n    bash -c "cargo deny check"\n\ntest:\n'
 cm_red "a quoted cargo-deny call in a second recipe" "justfile:[0-9]*: a cargo-deny call this reader cannot place"
 cm_plant just-string justfile $'\ntest:\n' $'\nnote := """\n# """ + `cargo deny check`\n\ntest:\n'
