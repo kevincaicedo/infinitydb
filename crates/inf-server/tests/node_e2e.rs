@@ -187,6 +187,9 @@ struct Node {
     /// cleared by [`Node::stop_synced`].
     stop_checkpoint: Arc<AtomicBool>,
     drained: Arc<std::sync::atomic::AtomicU16>,
+    /// Each cell's stop phase as it last read it ([`stop_phase_byte`]), so a
+    /// drain that times out names where every cell stands.
+    stop_phases: Arc<Vec<std::sync::atomic::AtomicU8>>,
     handles: Vec<std::thread::JoinHandle<()>>,
     /// Control handle of a durable node (manual checkpoint trigger — the
     /// surface `INF.CKPT` rides at S20).
@@ -612,6 +615,8 @@ impl Node {
         let stop_checkpoint = Arc::new(AtomicBool::new(true));
         let quiet = Arc::new(std::sync::atomic::AtomicU16::new(0));
         let drained = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let stop_phases: Arc<Vec<std::sync::atomic::AtomicU8>> =
+            Arc::new((0..cells).map(|_| Default::default()).collect());
         let tail_stall_default = Arc::new(std::sync::OnceLock::new());
         // The node identity (ADR-0124 D5): one value per node, every cell.
         let run_id = {
@@ -696,6 +701,7 @@ impl Node {
             let stop_checkpoint = Arc::clone(&stop_checkpoint);
             let quiet = Arc::clone(&quiet);
             let drained = Arc::clone(&drained);
+            let stop_phases = Arc::clone(&stop_phases);
             let tail_stall_default = Arc::clone(&tail_stall_default);
             let boot = boot.clone();
             let issuer = cell_issuers.get_mut(i).and_then(Option::take);
@@ -797,6 +803,7 @@ impl Node {
                         plane.set_stop_checkpoint(stop_checkpoint.load(Ordering::Relaxed));
                         plane.request_stop();
                         let phase = plane.stop_phase();
+                        stop_phases[i].store(stop_phase_byte(phase), Ordering::Release);
                         if !counted_quiet
                             && matches!(
                                 phase,
@@ -828,6 +835,7 @@ impl Node {
             graceful,
             stop_checkpoint,
             drained,
+            stop_phases,
             handles,
             control,
             ckpt_host: std::cell::RefCell::new(ckpt_host),
@@ -890,11 +898,37 @@ impl Node {
         self.graceful.store(true, Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(30);
         while self.drained.load(Ordering::Acquire) < self.cells {
-            assert!(Instant::now() < deadline, "the node did not drain in 30 s");
+            assert!(Instant::now() < deadline, "{}", self.drain_timed_out());
             #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
             std::thread::sleep(Duration::from_millis(1));
         }
         self.stop();
+    }
+
+    /// The drain timeout's message: every cell's stop phase and how many
+    /// drained. A cell held at `Quiet` has no live connection left: it waits
+    /// on the stop checkpoint's publication (when the stop takes one) or on
+    /// the final sync.
+    fn drain_timed_out(&self) -> String {
+        let phases: Vec<String> = self
+            .stop_phases
+            .iter()
+            .enumerate()
+            .map(|(cell, byte)| {
+                let byte = byte.load(Ordering::Acquire);
+                match stop_phase_of_byte(byte) {
+                    Some(phase) => format!("cell {cell} {phase:?}"),
+                    None => format!("cell {cell} unread ({byte})"),
+                }
+            })
+            .collect();
+        format!(
+            "the node did not drain in 30 s: {} of {} cells drained; {}; stop checkpoint {}",
+            self.drained.load(Ordering::Acquire),
+            self.cells,
+            phases.join(", "),
+            if self.stop_checkpoint.load(Ordering::Relaxed) { "on" } else { "off" }
+        )
     }
 
     /// The durable stop without a checkpoint (`--shutdown-checkpoint
@@ -1015,6 +1049,26 @@ impl Drop for Node {
             self.cells, self.port
         );
     }
+}
+
+/// A cell's stop phase as one byte, so the cell publishes it without a
+/// lock; 0 is a cell that has not read its phase since the stop began.
+fn stop_phase_byte(phase: inf_server::StopPhase) -> u8 {
+    use inf_server::StopPhase as P;
+    match phase {
+        P::Serving => 1,
+        P::Draining => 2,
+        P::Quiet => 3,
+        P::Drained => 4,
+    }
+}
+
+/// The phase [`stop_phase_byte`] encoded as `byte`; `None` for 0.
+fn stop_phase_of_byte(byte: u8) -> Option<inf_server::StopPhase> {
+    use inf_server::StopPhase as P;
+    [P::Serving, P::Draining, P::Quiet, P::Drained]
+        .into_iter()
+        .find(|&phase| stop_phase_byte(phase) == byte)
 }
 
 /// Records the first tiered namespace on `plane`'s cell that runs at the
