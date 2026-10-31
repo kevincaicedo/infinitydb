@@ -963,6 +963,42 @@ fn cmd(parts: &[&[u8]]) -> Vec<u8> {
 /// device latency budget.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The `TAIL-STALL-TIMEOUT`, in milliseconds, of every tiered namespace
+/// this binary creates for a test whose subject is not the stall. A tiered
+/// write past its window parks until a flush round lands (ADR-0053 D4),
+/// and every test running here at once shares the device those rounds
+/// land on: at the default thread count it has held one round past the
+/// product's 1 s default, which answers a legal `-STALLED`, and one write
+/// for about 2.6 s. Like [`REPLY_TIMEOUT`] this bound turns a wedged flush
+/// into a failure; it is no device budget. It sits below that timeout, so
+/// a write that does stall answers typed before the client calls it a hang.
+const FIXTURE_TAIL_STALL_TIMEOUT_MS: u64 = 20_000;
+const _: () = assert!(
+    (FIXTURE_TAIL_STALL_TIMEOUT_MS as u128) < REPLY_TIMEOUT.as_millis(),
+    "a stalled fixture write answers before the client's hang bound"
+);
+
+/// `INF.NS CREATE name MODE durable options… TAIL-STALL-TIMEOUT` at
+/// [`FIXTURE_TAIL_STALL_TIMEOUT_MS`]: how this binary creates a tiered
+/// namespace whose test is not about the stall.
+fn tiered_ns_create(name: &[u8], options: &[&[u8]]) -> Vec<u8> {
+    tiered_ns_create_stalling_at(name, options, FIXTURE_TAIL_STALL_TIMEOUT_MS)
+}
+
+/// [`tiered_ns_create`] at the test's own `TAIL-STALL-TIMEOUT`, for a test
+/// whose subject is the stall. The constructor states the mode and the
+/// bound, so `options` names neither.
+fn tiered_ns_create_stalling_at(name: &[u8], options: &[&[u8]], timeout_ms: u64) -> Vec<u8> {
+    assert!(options.contains(&&b"MEM-BUDGET"[..]), "a tiered namespace names its MEM-BUDGET");
+    assert!(!options.contains(&&b"MODE"[..]), "the constructor states the mode");
+    assert!(!options.contains(&&b"TAIL-STALL-TIMEOUT"[..]), "the constructor states the bound");
+    let timeout = timeout_ms.to_string();
+    let mut parts: Vec<&[u8]> = vec![b"INF.NS", b"CREATE", name, b"MODE", b"durable"];
+    parts.extend_from_slice(options);
+    parts.extend_from_slice(&[b"TAIL-STALL-TIMEOUT", timeout.as_bytes()]);
+    cmd(&parts)
+}
+
 /// A failed reply read, named: a timeout is a missing reply.
 fn reply_read_failed(stream: &TcpStream, what: &str, err: &std::io::Error) -> String {
     match err.kind() {
@@ -1749,25 +1785,16 @@ fn namespace_bound_dbsize_counts_every_cell() {
     let dir = temp_data_dir("ns-dbsize");
     let node = Node::start_durable(2, &dir);
     let mut c = node.connect();
-    let namespaces: [&[&[u8]]; 3] = [
-        &[b"INF.NS", b"CREATE", b"cache", b"MODE", b"memory"],
-        &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"],
-        &[
-            b"INF.NS",
-            b"CREATE",
+    let namespaces = [
+        cmd(&[b"INF.NS", b"CREATE", b"cache", b"MODE", b"memory"]),
+        cmd(&[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"]),
+        tiered_ns_create(
             b"hot",
-            b"MODE",
-            b"durable",
-            b"MEM-BUDGET",
-            b"8mb",
-            b"DISK-BUDGET",
-            b"64mb",
-            b"MUTABLE-FRACTION",
-            b"100",
-        ],
+            &[b"MEM-BUDGET", b"8mb", b"DISK-BUDGET", b"64mb", b"MUTABLE-FRACTION", b"100"],
+        ),
     ];
     for create in namespaces {
-        c.write_all(&cmd(create)).expect("write");
+        c.write_all(&create).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
     }
     // Keys owned by each cell, ten per cell, so a per-cell answer would
@@ -1898,24 +1925,15 @@ fn namespace_bound_scan_covers_durable_and_tiered_namespaces() {
     let dir = temp_data_dir("ns-scan-sweep");
     let node = Node::start_durable(2, &dir);
     let mut c = node.connect();
-    let namespaces: [&[&[u8]]; 2] = [
-        &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"],
-        &[
-            b"INF.NS",
-            b"CREATE",
+    let namespaces = [
+        cmd(&[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"]),
+        tiered_ns_create(
             b"hot",
-            b"MODE",
-            b"durable",
-            b"MEM-BUDGET",
-            b"8mb",
-            b"DISK-BUDGET",
-            b"64mb",
-            b"MUTABLE-FRACTION",
-            b"100",
-        ],
+            &[b"MEM-BUDGET", b"8mb", b"DISK-BUDGET", b"64mb", b"MUTABLE-FRACTION", b"100"],
+        ),
     ];
     for create in namespaces {
-        c.write_all(&cmd(create)).expect("write");
+        c.write_all(&create).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
     }
     drop(c);
@@ -2668,19 +2686,10 @@ fn tiered_blob_get_spanning_multiple_cold_windows() {
     let dir = temp_data_dir("blob-multiwindow");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create(
         b"blobs",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"8mb",
-        b"DISK-BUDGET",
-        b"64mb",
-        b"BLOB-THRESHOLD",
-        b"4kb",
-    ]))
+        &[b"MEM-BUDGET", b"8mb", b"DISK-BUDGET", b"64mb", b"BLOB-THRESHOLD", b"4kb"],
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"blobs"])).expect("write");
@@ -2718,19 +2727,10 @@ fn tiered_namespace_lifecycle_survives_restart() {
     // Two cells so the NSFAN peer fan is real, not a no-op.
     let node = Node::start_durable(2, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create(
         b"hot",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"8mb",
-        b"DISK-BUDGET",
-        b"64mb",
-        b"MUTABLE-FRACTION",
-        b"100",
-    ]))
+        &[b"MEM-BUDGET", b"8mb", b"DISK-BUDGET", b"64mb", b"MUTABLE-FRACTION", b"100"],
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     // This connection's cell materialized its table; the +OK above is
@@ -2877,18 +2877,8 @@ fn tiered_data_plane_serves_and_survives_restart() {
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
-        c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
-            b"t",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
-            b"MEM-BUDGET",
-            b"3mb",
-        ]))
-        .expect("write");
+        c.write_all(&tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]))
+            .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
@@ -2983,6 +2973,94 @@ fn tiered_data_plane_serves_and_survives_restart() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A modeled device whose budget paces a tiered namespace's flush rounds
+/// past the product's 1 s `TAIL-STALL-TIMEOUT` default and well inside
+/// [`FIXTURE_TAIL_STALL_TIMEOUT_MS`]: at 1 MB/s of writes a fill against a
+/// `MEM-BUDGET 3mb` window waits about 2.5 s for its slowest round, on any
+/// device that is at least that fast.
+const PACED_ROUND_MODEL: inf_runtime::DeviceModel = inf_runtime::DeviceModel {
+    write_bytes_per_s: 1_000_000,
+    write_ops_per_s: 40_000,
+    read_bytes_per_s: 40_000_000,
+    read_ops_per_s: 40_000,
+};
+
+/// Writes up to 600 values of 8 KiB (4.8 MiB, past a `MEM-BUDGET 3mb`
+/// window) to `t`, created by `create`, on a node paced by
+/// [`PACED_ROUND_MODEL`]: `Ok(())` when every write is acknowledged, else
+/// the first other reply with the writes acknowledged before it.
+fn paced_tiered_fill(tag: &str, create: &[u8]) -> Result<(), (Vec<u8>, usize)> {
+    let dir = temp_data_dir(tag);
+    let node = Node::start_durable_with_device_model(1, &dir, PACED_ROUND_MODEL);
+    let mut c = node.connect();
+    c.write_all(create).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let mut outcome = Ok(());
+    for i in 0..600usize {
+        let key = format!("k:{i:04}").into_bytes();
+        let value = format!("g0:{i:04}:").into_bytes().repeat(1024);
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        let reply = read_line(&mut c);
+        if reply != b"+OK\r\n" {
+            // The refused write mutated nothing (ADR-0053 D4): its key is
+            // absent and the namespace holds exactly the acknowledged ones.
+            c.write_all(&cmd(&[b"GET", &key])).expect("write");
+            read_exactly(&mut c, b"$-1\r\n");
+            c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+            read_exactly(&mut c, format!(":{i}\r\n").as_bytes());
+            outcome = Err((reply, i));
+            break;
+        }
+    }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    outcome
+}
+
+/// The rule the fixture bound answers: a fill whose flush round outlasts
+/// the namespace's `TAIL-STALL-TIMEOUT` — here the product's 1 s default
+/// against a round the device model holds for about 2.5 s — answers the
+/// typed `-STALLED` and mutates nothing. A device every test of this
+/// binary shares can hold a round as long, which is why every other
+/// tiered fixture here states [`FIXTURE_TAIL_STALL_TIMEOUT_MS`].
+#[test]
+fn a_flush_round_past_the_default_tail_stall_timeout_answers_stalled() {
+    let create = cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"t",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]);
+    let (reply, acknowledged) = paced_tiered_fill("paced-default-stall", &create)
+        .expect_err("a 2.5 s round answers a fill at the 1 s default");
+    assert_eq!(
+        reply,
+        b"-STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)\r\n",
+        "after {acknowledged} acknowledged writes"
+    );
+}
+
+/// The same paced fill at [`FIXTURE_TAIL_STALL_TIMEOUT_MS`]: every write is
+/// acknowledged, so the fixture bound outlasts a round the default cannot.
+#[test]
+fn the_fixture_tail_stall_bound_outlasts_a_paced_flush_round() {
+    let create = tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]);
+    if let Err((reply, acknowledged)) = paced_tiered_fill("paced-fixture-bound", &create) {
+        panic!(
+            "write {acknowledged} answered {:?} at the fixture bound",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+}
+
 /// Reads one `SCAN` reply (`[next-cursor, [key…]]`) off the stream.
 fn read_scan_page(stream: &mut TcpStream) -> (u64, Vec<Vec<u8>>) {
     let header = read_line(stream);
@@ -3031,18 +3109,8 @@ fn tiered_scan_names_every_cold_key_across_the_window() {
     let small = 150usize; // 50 B values — the always-worked control band
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"t",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"everysec",
-        b"MEM-BUDGET",
-        b"3mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -3125,18 +3193,8 @@ fn tiered_scan_batches_its_cold_key_reads() {
     let dir = temp_data_dir("tiered-scan-batch");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"t",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"everysec",
-        b"MEM-BUDGET",
-        b"3mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -3224,19 +3282,10 @@ fn blob_values_round_trip_and_survive_restart() {
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
-        c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
+        c.write_all(&tiered_ns_create(
             b"b",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
-            b"MEM-BUDGET",
-            b"3mb",
-            b"BLOB-THRESHOLD",
-            b"4kb",
-        ]))
+            &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4kb"],
+        ))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
@@ -3291,19 +3340,10 @@ fn blob_write_at_disk_full_replies_diskfull() {
         vec![(inf_log::fault::BLOB_WRITE_NOSPACE, inf_foundation::fault::FaultSpec::Always)],
     );
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create(
         b"b",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"everysec",
-        b"MEM-BUDGET",
-        b"3mb",
-        b"BLOB-THRESHOLD",
-        b"4kb",
-    ]))
+        &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4kb"],
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
@@ -3339,19 +3379,10 @@ fn a_blob_write_refused_inside_the_window_gives_its_unit_back() {
         vec![(inf_log::fault::BLOB_WRITE_NOSPACE, inf_foundation::fault::FaultSpec::Always)],
     );
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create(
         b"b",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"always",
-        b"MEM-BUDGET",
-        b"3mb",
-        b"BLOB-THRESHOLD",
-        b"4kb",
-    ]))
+        &[b"FSYNC", b"always", b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4kb"],
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
@@ -3511,25 +3542,23 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
             CkptTrigger::Paced { slice_bytes, stream_bytes_per_sec },
         );
         let mut c = node.connect();
-        c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
+        c.write_all(&tiered_ns_create(
             b"b",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
-            b"MEM-BUDGET",
-            b"3mb",
-            b"BLOB-THRESHOLD",
-            b"4kb",
-            // Copy-forward off (a 100% dead-ratio trigger never fires):
-            // compaction would otherwise relocate the cold blob
-            // references to the RAM tail once the filler is deleted, and
-            // pass 3 would have nothing to walk.
-            b"COMPACTION-DEAD-RATIO",
-            b"100",
-        ]))
+            &[
+                b"FSYNC",
+                b"everysec",
+                b"MEM-BUDGET",
+                b"3mb",
+                b"BLOB-THRESHOLD",
+                b"4kb",
+                // Copy-forward off (a 100% dead-ratio trigger never fires):
+                // compaction would otherwise relocate the cold blob
+                // references to the RAM tail once the filler is deleted, and
+                // pass 3 would have nothing to walk.
+                b"COMPACTION-DEAD-RATIO",
+                b"100",
+            ],
+        ))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
@@ -3702,22 +3731,12 @@ fn a_checkpoint_names_a_ticketed_blob_winner_in_its_image_alone() {
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
-        ok(
-            &mut c,
-            &[
-                b"INF.NS",
-                b"CREATE",
-                b"t",
-                b"MODE",
-                b"durable",
-                b"MEM-BUDGET",
-                b"3mb",
-                b"BLOB-THRESHOLD",
-                b"4kb",
-                b"MUTABLE-FRACTION",
-                b"200",
-            ],
-        );
+        c.write_all(&tiered_ns_create(
+            b"t",
+            &[b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4kb", b"MUTABLE-FRACTION", b"200"],
+        ))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
         // Promotion off: the cold `GET` below is a witness, never a
         // relocation. The shadow path on, its reconciler paused.
         ok(&mut c, &[b"CONFIG", b"SET", b"tiered-promote-on-read", b"no"]);
@@ -3873,18 +3892,8 @@ fn tiered_cold_read_failure_is_typed_for_every_read_command() {
         vec![(inf_server::fault::COLD_ENQUEUE_FULL, inf_foundation::fault::FaultSpec::Always)],
     );
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"t",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"everysec",
-        b"MEM-BUDGET",
-        b"3mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -4060,18 +4069,8 @@ fn unaddressable_fixture(tag: &str) -> (Node, TcpStream, std::path::PathBuf) {
         )],
     );
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"t",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"everysec",
-        b"MEM-BUDGET",
-        b"3mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -4230,19 +4229,10 @@ fn blob_boot_orphan_quarantines_for_one_life_then_reclaims() {
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
-        c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
+        c.write_all(&tiered_ns_create(
             b"q",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"always",
-            b"MEM-BUDGET",
-            b"3mb",
-            b"BLOB-THRESHOLD",
-            b"4kb",
-        ]))
+            &[b"FSYNC", b"always", b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4kb"],
+        ))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         c.write_all(&cmd(&[b"INF.NS", b"USE", b"q"])).expect("write");
@@ -4346,18 +4336,8 @@ fn diskfull_admission_refuses_typed_over_tcp() {
     let dir = temp_data_dir("tiered-diskfull");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"d",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"3mb",
-        b"DISK-BUDGET",
-        b"1mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"d", &[b"MEM-BUDGET", b"3mb", b"DISK-BUDGET", b"1mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"d"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -4405,8 +4385,7 @@ fn drop_races_inflight_cold_reads() {
     let dir = temp_data_dir("tiered-drop-race");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"r", b"MODE", b"durable", b"MEM-BUDGET", b"3mb"]))
-        .expect("write");
+    c.write_all(&tiered_ns_create(b"r", &[b"MEM-BUDGET", b"3mb"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"r"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -5015,19 +4994,11 @@ fn overrun_tier_namespace(node: &Node) -> TcpStream {
 fn tier_namespace_with_slice(node: &Node, slice: &[u8], slice_bytes: u64) -> TcpStream {
     let timeout_ms = round_bound_ms(overrun_test_model(), 2, 1, slice_bytes);
     let mut c = conn_on_cell(node, 0);
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create_stalling_at(
         b"t",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"4mb",
-        b"MAINTAIN-SLICE",
-        slice,
-        b"TAIL-STALL-TIMEOUT",
-        timeout_ms.to_string().as_bytes(),
-    ]))
+        &[b"MEM-BUDGET", b"4mb", b"MAINTAIN-SLICE", slice],
+        timeout_ms,
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     drop(c);
@@ -5220,19 +5191,11 @@ fn reference_share_at_256_cells() -> inf_runtime::DeviceModel {
 fn create_tier_namespace(node: &Node, name: &[u8], slice: &[u8], timeout_ms: u64) {
     assert!((1..=60_000).contains(&timeout_ms), "TAIL-STALL-TIMEOUT {timeout_ms} is 1..=60000");
     let mut c = conn_on_cell(node, 0);
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create_stalling_at(
         name,
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"4mb",
-        b"MAINTAIN-SLICE",
-        slice,
-        b"TAIL-STALL-TIMEOUT",
-        timeout_ms.to_string().as_bytes(),
-    ]))
+        &[b"MEM-BUDGET", b"4mb", b"MAINTAIN-SLICE", slice],
+        timeout_ms,
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
 }
@@ -7719,21 +7682,19 @@ fn cold_value(i: u32) -> Vec<u8> {
 /// prove nothing.
 fn seed_tiered_namespace_with_checkpoint(node: &Node, dir: &std::path::Path, keys: u32) {
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create(
         b"cold",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"8mb",
-        b"DISK-BUDGET",
-        b"64mb",
-        b"MUTABLE-FRACTION",
-        b"100",
-        b"BLOB-THRESHOLD",
-        b"4kb",
-    ]))
+        &[
+            b"MEM-BUDGET",
+            b"8mb",
+            b"DISK-BUDGET",
+            b"64mb",
+            b"MUTABLE-FRACTION",
+            b"100",
+            b"BLOB-THRESHOLD",
+            b"4kb",
+        ],
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"cold"])).expect("write");
@@ -8005,8 +7966,7 @@ fn ns_create_sub_floor_budget_refuses_typed_and_node_survives() {
         read_exactly(&mut c, b"+PONG\r\n");
     }
     // 3mb + the 1 MiB default slice = exactly four commit pages.
-    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"tiny", b"MODE", b"durable", b"MEM-BUDGET", b"3mb"]))
-        .expect("write");
+    c.write_all(&tiered_ns_create(b"tiny", &[b"MEM-BUDGET", b"3mb"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"tiny"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -8033,18 +7993,8 @@ fn inline_value_above_half_ring_is_routed_out_of_line() {
     let dir = temp_data_dir("l06-01-half-ring");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"hot",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"3mb",
-        b"DISK-BUDGET",
-        b"64mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"hot", &[b"MEM-BUDGET", b"3mb", b"DISK-BUDGET", b"64mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"hot"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -8072,18 +8022,8 @@ fn inline_value_above_half_ring_is_routed_out_of_line() {
     );
     // The explicit face: a threshold the ring cannot honour is refused
     // at the gauntlet, never accepted and clamped in silence.
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"hot2",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"3mb",
-        b"BLOB-THRESHOLD",
-        b"4mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"hot2", &[b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4mb"]))
+        .expect("write");
     let reply = read_line(&mut c);
     assert!(
         reply.starts_with(b"-ERR BLOB-THRESHOLD"),
@@ -8168,19 +8108,10 @@ fn concurrent_writes_to_a_blob_key_never_desync_the_index() {
     let node = Node::start_durable(1, &dir);
     let mut a = node.connect();
     let mut b = node.connect();
-    a.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    a.write_all(&tiered_ns_create(
         b"hot",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"16mb",
-        b"DISK-BUDGET",
-        b"512mb",
-        b"BLOB-THRESHOLD",
-        b"4kb",
-    ]))
+        &[b"MEM-BUDGET", b"16mb", b"DISK-BUDGET", b"512mb", b"BLOB-THRESHOLD", b"4kb"],
+    ))
     .expect("write");
     read_exactly(&mut a, b"+OK\r\n");
     for c in [&mut a, &mut b] {
@@ -8463,22 +8394,12 @@ fn connection_level_commands_ignore_the_bound_namespace() {
     let dir = temp_data_dir("conn-level-ns");
     let node = Node::start_durable(4, &dir);
     let mut admin = node.connect();
-    for argv in [
-        &[&b"INF.NS"[..], b"CREATE", b"mem", b"MODE", b"memory"][..],
-        &[
-            &b"INF.NS"[..],
-            b"CREATE",
-            b"tier",
-            b"MODE",
-            b"durable",
-            b"MEM-BUDGET",
-            b"64mb",
-            b"DISK-BUDGET",
-            b"256mb",
-        ][..],
+    for create in [
+        cmd(&[b"INF.NS", b"CREATE", b"mem", b"MODE", b"memory"]),
+        tiered_ns_create(b"tier", &[b"MEM-BUDGET", b"64mb", b"DISK-BUDGET", b"256mb"]),
     ] {
-        admin.write_all(&cmd(argv)).expect("write");
-        assert_eq!(read_line(&mut admin), b"+OK\r\n", "{argv:?}");
+        admin.write_all(&create).expect("write");
+        assert_eq!(read_line(&mut admin), b"+OK\r\n", "{}", String::from_utf8_lossy(&create));
     }
     // One template per connection-level command. `QUIT` closes the
     // connection after its `+OK`; the subscribe family flips the
@@ -8798,18 +8719,8 @@ fn del_of_a_rebuilt_winner_carrying_two_tickets_drains_every_ticket() {
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
-        c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
-            b"t",
-            b"MODE",
-            b"durable",
-            b"MEM-BUDGET",
-            b"3mb",
-            b"MUTABLE-FRACTION",
-            b"200",
-        ]))
-        .expect("write");
+        c.write_all(&tiered_ns_create(b"t", &[b"MEM-BUDGET", b"3mb", b"MUTABLE-FRACTION", b"200"]))
+            .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         use_t(&mut c);
         for (k, v) in [(&k0, &v0), (&k2, &v2)] {
@@ -9453,18 +9364,8 @@ fn client_ids_are_node_unique_so_a_foreign_kill_reaches_nothing() {
 /// Creates a tiered namespace and binds `c` to it (the §5.5 regime: one
 /// cell, a namespace-bound connection).
 fn bind_tiered(c: &mut TcpStream, ns: &[u8]) {
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        ns,
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"8mb",
-        b"DISK-BUDGET",
-        b"64mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(ns, &[b"MEM-BUDGET", b"8mb", b"DISK-BUDGET", b"64mb"]))
+        .expect("write");
     read_exactly(c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
     read_exactly(c, b"+OK\r\n");
