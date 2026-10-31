@@ -369,12 +369,10 @@ impl FrameSlot {
 /// Release, not debug: a frame reserved past the preallocation is written
 /// past it, and recovery's scan, the recycle sentinel's block and the
 /// reorder arithmetic no longer describe the file. The compare is the one
-/// the reservation always made.
+/// the reservation always made, and the message carries no operands: a
+/// formatted message would keep both on the stack of every reservation.
 fn assert_frame_fits(len: u32, segment: u32) {
-    assert!(
-        len <= segment,
-        "frame exceeds the segment: the staging ring sealed past its geometry ({len} > {segment})"
-    );
+    assert!(len <= segment, "frame exceeds the segment: the staging ring sealed past its geometry");
 }
 
 /// A segment leaving the rotor under **deferred seal** (M2-S05, ADR-0013
