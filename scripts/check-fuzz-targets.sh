@@ -42,7 +42,10 @@
 # E0433 naming absent_cfg_crate (an arm only cfg(fuzzing) compiles),
 # stale-lock's stale_lock because --locked was passed, and control must
 # compile; any other outcome is red, because the gate could not see what it
-# guards. Its two workspaces hold exactly those five targets.
+# guards. Its two workspaces hold exactly those five targets. stale-lock's
+# committed lock must still name its package at another version than the
+# manifest's: a cargo run without --locked rewrites it, and that red names
+# the git command that restores it.
 #
 # --matrix nightly|smoke judges the census only and prints the fuzz jobs'
 # matrix, one row per target in census order ({"include": [{"dir",
@@ -95,6 +98,7 @@ CALL = ["check", "--bins", "--locked", "--keep-going", "--message-format", "json
 RUSTFLAGS = "-D warnings --cfg fuzzing"
 PROBE_MAIN = "scripts/fuzz-check-probe/Cargo.toml"
 PROBE_LOCK = "scripts/fuzz-check-probe/stale-lock/Cargo.toml"
+PROBE_LOCK_FILE = "scripts/fuzz-check-probe/stale-lock/Cargo.lock"
 PROBE_TARGETS = {PROBE_MAIN: ["plant_crate", "plant_warning", "plant_cfg", "control"],
                  PROBE_LOCK: ["stale_lock"]}
 ERROR_LEVELS = ("error", "error: internal compiler error")
@@ -236,6 +240,25 @@ def refused(report, name, test, label):
     return True
 
 
+def lock_rewritten():
+    """Why the stale-lock probe's committed lock plants nothing, or None. It
+    must name its package at a version the manifest does not; cargo rewrites
+    it to the manifest's version on any run without --locked (an editor's
+    `cargo metadata` among them), and then --locked has nothing to refuse."""
+    try:
+        package = fuzz_targets.read_manifest(PROBE_LOCK)["package"]
+        name, version = package["name"], package["version"]
+        locked = [p.get("version") for p in fuzz_targets.read_manifest(PROBE_LOCK_FILE)["package"]
+                  if p.get("name") == name]
+    except (fuzz_targets.CensusError, KeyError, TypeError, AttributeError) as err:
+        return f"cannot be read against its manifest ({type(err).__name__}: {err})"
+    if not locked:
+        return f"names no package {name}"
+    if version in locked:
+        return f"names {name} at {version}, the version its manifest says"
+    return None
+
+
 probe = "skipped (fixture mode, INF_FUZZ_CHECK_PROBE=off)"
 if PROBE == "on":
     verdicts = {}
@@ -247,7 +270,6 @@ if PROBE == "on":
         if rows != want:
             reds.append(f"P {manifest} holds targets {rows}, exactly {want} expected: an edited-down "
                         "probe proves less")
-    before = len(reds)
     main = Report(PROBE_MAIN)
     if refused(main, "plant_crate", lambda m: e0433(m, "absent_crate", "shared/leaf.rs"), "P1"):
         verdicts["P1"] = "plant_crate E0433 absent_crate"
@@ -257,17 +279,24 @@ if PROBE == "on":
         verdicts["P3"] = "control compiled"
     else:
         reds.append("P3 probe target control not compiled: the probe proves nothing")
-    lock = Report(PROBE_LOCK)
-    if (lock.status != 0 and "stale_lock" not in lock.bins
-            and lock.refused_lock()):
-        verdicts["P4"] = "stale_lock refused by --locked"
+    rewritten = lock_rewritten()
+    if rewritten:
+        reds.append(f"P4 {PROBE_LOCK_FILE} {rewritten}, so it plants no stale lock: a cargo "
+                    "run without --locked rewrote it; restore it with "
+                    f"`git checkout -- {PROBE_LOCK_FILE}`")
     else:
-        reds.append("P4 probe target stale_lock compiled, or refused without cargo's "
-                    "\"because --locked was passed\": the gate does not pass --locked")
-        lock.print_errors()
+        lock = Report(PROBE_LOCK)
+        if lock.status != 0 and "stale_lock" not in lock.bins and lock.refused_lock():
+            verdicts["P4"] = "stale_lock refused by --locked"
+        else:
+            reds.append("P4 probe target stale_lock compiled, or refused without cargo's "
+                        "\"because --locked was passed\": the gate does not pass --locked")
+            lock.print_errors()
     if refused(main, "plant_cfg", lambda m: e0433(m, "absent_cfg_crate"), "P5"):
         verdicts["P5"] = "plant_cfg E0433 absent_cfg_crate"
-    if len(reds) > before:
+    # The main probe's errors are its planted ones: printed only when one of
+    # its own verdicts failed.
+    if any(k not in verdicts for k in ("P1", "P2", "P3", "P5")):
         main.print_errors()
     held = [verdicts[k] for k in ("P1", "P2", "P5", "P3", "P4") if k in verdicts]
     probe = ", ".join(held) if len(held) == 5 else f"{len(held)} of 5 verdicts held"

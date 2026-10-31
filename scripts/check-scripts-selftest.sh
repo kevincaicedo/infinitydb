@@ -3915,6 +3915,30 @@ fz_plant p4-other "P4: stale_lock refused without --locked's message" \
     "P4 probe target stale_lock compiled, or refused without"
 fz_plant p5-compiled "P5: plant_cfg compiled" "P5 probe target plant_cfg compiled"
 fz_plant p5-crate "P5: plant_cfg's E0433 naming another crate" "P5 probe target plant_cfg refused without"
+# The main probe's errors are printed for its own red, not for P4's.
+fz_probe "$FZ_PROOT" p4-compiled
+fz_once "$FZ_PROOT.log" fz_probe_run "$FZ_PROOT"
+expect green "fuzz-targets: a P4 red prints none of the main probe's planted errors" \
+    fz_lacks "^scripts/fuzz-check-probe/Cargo.toml bin plant_crate:" "$FZ_PROOT.log"
+fz_probe "$FZ_PROOT" p1-compiled
+fz_once "$FZ_PROOT.log" fz_probe_run "$FZ_PROOT"
+expect_output "fuzz-targets: a P1 red prints the main probe's errors" \
+    "^scripts/fuzz-check-probe/Cargo.toml bin plant_warning:" fz_replay "$FZ_PROOT.log"
+# A run without --locked rewrites stale-lock's lock to the manifest's version:
+# that red names the restore, not the gate's flags, and compiles nothing.
+root=$(fz_root probe-lock-rewritten)
+fz_probe "$root"
+fz_sed 's/^version = "0.0.0"$/version = "0.1.0"/' "$root/${FZ_PL%Cargo.toml}Cargo.lock"
+fz_once "$root.log" fz_probe_run "$root"
+expect_red_because "fuzz-targets: P4: a rewritten stale lock names its restore" \
+    "names fuzz-check-stale-lock at 0.1.0, the version its manifest says, so it plants no stale lock: a cargo run without --locked rewrote it; restore it with .git checkout -- scripts/fuzz-check-probe/stale-lock/Cargo.lock." \
+    fz_replay "$root.log"
+expect green "fuzz-targets: a rewritten stale lock blames no flag" \
+    fz_lacks "the gate does not pass --locked" "$root.log"
+expect green "fuzz-targets: a rewritten stale lock prints no main probe error" \
+    fz_lacks "^scripts/fuzz-check-probe/Cargo.toml bin" "$root.log"
+expect green "fuzz-targets: a rewritten stale lock is not compiled" \
+    fz_lacks "manifest-path $FZ_PL" "$root.stub/calls"
 root=$(fz_root probe-short)
 fz_probe "$root"
 fz_sed '/^name = "plant_cfg"$/,/^path = /d' "$root/$FZ_PM"
