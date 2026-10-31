@@ -4572,6 +4572,63 @@ cm_red "a second target in the PR smoke's step" "the PR smoke fuzzes .frame_deco
 cm_plant recipe-quoted justfile $'\ntest:\n' $'\ndeny-root:\n    bash -c "cargo deny check"\n\ntest:\n'
 cm_red "a quoted cargo-deny call in a second recipe" "justfile:[0-9]*: a cargo-deny call this reader cannot place"
 
+# The deny recipe, run as just runs it (its body a bash script in the
+# justfile's directory) against a stub census and a stub cargo that reads its
+# stdin to the end: every census row is a leg, a red leg fails the recipe, and
+# so do an empty list and a leg count other than the census's rows. A leg that
+# read the list the loop reads would end the loop early, green; the copy whose
+# legs inherit the loop's stdin is red on the count.
+DR=$work/deny-recipe
+mkdir -p "$DR/scripts" "$DR/bin"
+awk '/^deny:/ { on = 1; next } on && /^[^ \t]/ { exit } on { sub(/^    /, ""); print }' justfile >"$DR/recipe.sh"
+sed 's| </dev/null||' "$DR/recipe.sh" >"$DR/recipe-stdin.sh"
+printf '%s\n' '#!/bin/sh' '[ "$*" = "--matrix deny" ] || exit 2' 'cat "$DR_ROWS"' \
+    'exit "$(cat "$DR_ROWS.status")"' >"$DR/scripts/check-fuzz-targets.sh"
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >>"$DR_LOG"' 'cat >/dev/null' \
+    'case " $* " in *" $DR_RED "*) exit 4 ;; esac' >"$DR/bin/cargo"
+chmod +x "$DR/scripts/check-fuzz-targets.sh" "$DR/bin/cargo"
+DR_ROWS3='{"include":[{"manifest":"Cargo.toml"},{"manifest":"bins/b/fuzz/Cargo.toml"},{"manifest":"crates/a/fuzz/Cargo.toml"}]}'
+dr_run() { # <recipe> <census stdout> <census status> <manifest cargo-deny refuses>
+    printf '%s' "$2" >"$DR/rows"
+    printf '%s\n' "$3" >"$DR/rows.status"
+    : >"$DR/cargo.log"
+    (cd "$DR" && env PATH="$DR/bin:$PATH" DR_ROWS="$DR/rows" DR_LOG="$DR/cargo.log" DR_RED="$4" \
+        bash "$1") >"$DR/out" 2>&1
+}
+dr_legs() { # <count>: cargo was called that many times
+    [ "$(grep -c . "$DR/cargo.log")" -eq "$1" ]
+}
+dr_every_leg() {
+    dr_run "$DR/recipe.sh" "$DR_ROWS3" 0 - || return 1
+    grep -qx 'deny OK: 3 manifests (the root and 2 fuzz manifests), each rc 0' "$DR/out" \
+        && [ "$(cat "$DR/cargo.log")" = "$(printf '%s\n' \
+            'deny --manifest-path Cargo.toml --all-features check' \
+            'deny --manifest-path bins/b/fuzz/Cargo.toml --all-features check --disable-fetch' \
+            'deny --manifest-path crates/a/fuzz/Cargo.toml --all-features check --disable-fetch')" ]
+}
+expect green "deny: every census row is a leg, the first one fetching" dr_every_leg
+dr_red_leg() {
+    ! dr_run "$DR/recipe.sh" "$DR_ROWS3" 0 bins/b/fuzz/Cargo.toml \
+        && grep -qx 'deny: bins/b/fuzz/Cargo.toml red (exit 4)' "$DR/out" \
+        && grep -qx 'deny FAILED: 1 of 3 manifests red' "$DR/out" && dr_legs 3
+}
+expect green "deny: a red leg fails the recipe, and every leg still runs" dr_red_leg
+dr_short_run() {
+    ! cmp -s "$DR/recipe.sh" "$DR/recipe-stdin.sh" \
+        && ! dr_run "$DR/recipe-stdin.sh" "$DR_ROWS3" 0 - \
+        && grep -qx 'deny FAILED: ran 1 of the 3 manifests the census listed' "$DR/out" && dr_legs 1
+}
+expect green "deny: a leg that reads the loop's list is red on the count (canary)" dr_short_run
+dr_empty() {
+    ! dr_run "$DR/recipe.sh" '{"include":[]}' 0 - \
+        && grep -qx 'deny SCOPE ERROR: the fuzz census listed no manifest' "$DR/out" && dr_legs 0
+}
+expect green "deny: an empty census list is a scope error, no leg run" dr_empty
+dr_red_census() {
+    ! dr_run "$DR/recipe.sh" '' 1 - && ! grep -q 'deny OK' "$DR/out" && dr_legs 0
+}
+expect green "deny: a red census runs no leg" dr_red_census
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
