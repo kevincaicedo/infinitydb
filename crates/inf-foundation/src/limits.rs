@@ -64,6 +64,14 @@ pub const MAP_BACKING_ALLOCATION_BYTES_MAX: usize = 64 * 1024;
 /// `CapError::Layout`; a site that needs more says so in its record.
 pub const DEQUE_BACKING_BYTES_MAX: usize = MAP_BACKING_ALLOCATION_BYTES_MAX;
 
+/// Bits of one `CappedMap` key (ADR-0151 D1, D5): 128, an integer word of
+/// up to 128 bits or a pair of `u64`s, compared whole and read bit by bit.
+/// A lookup visits at most this many branches. Owner:
+/// `inf_foundation::bounded::ExactKey`, a sealed set of key types. Crossing:
+/// unrepresentable — a wider or inexact key cannot implement the sealed
+/// trait, so no map over it is written.
+pub const MAP_KEY_BITS_MAX: u32 = 128;
+
 /// Slots one capped store holds at most (ADR-0151 D5): `u32::MAX`, so a
 /// slot index fits `SlotId`'s `u32` and stays below `u32::MAX`, which the
 /// free chain keeps as its end. Owner: the slab's and the map's storage.

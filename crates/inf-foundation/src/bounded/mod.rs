@@ -26,11 +26,16 @@ use core::num::NonZeroU32;
 
 mod census;
 mod deque;
+mod map;
 mod slab;
 mod store;
 
 pub use census::{CapCensus, CapRow, CensusPhase, ServeMark, SlabInstance};
 pub use deque::{CappedDeque, DequeSlot, Reserved};
+pub use map::{
+    Admission, CappedMap, ExactKey, MapBuilder, MapBuilt, MapRetired, MapRetiring, OccupiedSlot,
+    VacantSlot,
+};
 pub use slab::{
     Built, CappedSlab, Generation, GenerationPolicy, Lookup, LookupMut, Retire, Retiring,
     SlabBuilder, SlabReserved, SlabRetiring, SlotId, SlotReservation, Taken, WrapWithProof,

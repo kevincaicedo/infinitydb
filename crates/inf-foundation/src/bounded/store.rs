@@ -152,6 +152,11 @@ trait Level<T, G: SlotGeneration>: Sized {
 
     fn slot_mut(&mut self, index: u32) -> Option<&mut Slot<T, G>>;
 
+    /// Slots `first` and `second`, two distinct indices, both mutably: the
+    /// two paths are walked together while they share an item and apart
+    /// below it, so neither borrow covers the other's slot.
+    fn slot_pair_mut(&mut self, first: u32, second: u32) -> Option<[&mut Slot<T, G>; 2]>;
+
     /// The item whose slots start at `first`, in one allocation: a chunk
     /// with its slots below `capacity` free and chained in index order and
     /// the rest closed, or a directory with no child.
@@ -181,6 +186,12 @@ impl<T, G: SlotGeneration> Level<T, G> for Chunk<T, G> {
     #[inline]
     fn slot_mut(&mut self, index: u32) -> Option<&mut Slot<T, G>> {
         self.get_mut((index & OFFSET_MASK) as usize)
+    }
+
+    #[inline]
+    fn slot_pair_mut(&mut self, first: u32, second: u32) -> Option<[&mut Slot<T, G>; 2]> {
+        let offsets = [(first & OFFSET_MASK) as usize, (second & OFFSET_MASK) as usize];
+        self.get_disjoint_mut(offsets).ok()
     }
 
     fn allocate(first: u32, capacity: u32) -> Result<Box<Self>, CapError> {
@@ -228,6 +239,16 @@ impl<T, G: SlotGeneration, L: Level<T, G>> Level<T, G> for Directory<L> {
     #[inline]
     fn slot_mut(&mut self, index: u32) -> Option<&mut Slot<T, G>> {
         self.get_mut(child(index, L::SPAN_LOG2))?.as_deref_mut()?.slot_mut(index)
+    }
+
+    #[inline]
+    fn slot_pair_mut(&mut self, first: u32, second: u32) -> Option<[&mut Slot<T, G>; 2]> {
+        let children = [child(first, L::SPAN_LOG2), child(second, L::SPAN_LOG2)];
+        if children[0] == children[1] {
+            return self.get_mut(children[0])?.as_deref_mut()?.slot_pair_mut(first, second);
+        }
+        let [one, two] = self.get_disjoint_mut(children).ok()?;
+        Some([one.as_deref_mut()?.slot_mut(first)?, two.as_deref_mut()?.slot_mut(second)?])
     }
 
     fn allocate(_: u32, _: u32) -> Result<Box<Self>, CapError> {
@@ -332,6 +353,9 @@ impl<T, G: SlotGeneration> FreeSlot<'_, T, G> {
         (self.index, self.generation)
     }
 }
+
+/// A free slot borrowed with another slot of the same store, for one step.
+pub(super) type FreeBeside<'a, T, G> = (FreeSlot<'a, T, G>, &'a mut Slot<T, G>);
 
 /// The slot storage of one slab, or of one store of a map: hot fields
 /// first (the instance, the free head and the root, which every reserve,
@@ -442,6 +466,13 @@ impl<T, G: SlotGeneration> SlotStore<T, G> {
         self.capacity_now
     }
 
+    /// Chunks and directories held: a map retires its two stores one after
+    /// the other, so it asks which still holds an item.
+    #[inline]
+    pub(super) fn items_held(&self) -> u32 {
+        self.items_held
+    }
+
     /// The free slot at the head of the chain, if any, borrowed with the
     /// head for one step.
     #[inline]
@@ -451,6 +482,19 @@ impl<T, G: SlotGeneration> SlotStore<T, G> {
         let slot = root_slot_mut(root, index)?;
         let Slot::Free { generation, next } = *slot else { return None };
         Some(FreeSlot { slot, free_head, index, generation, next })
+    }
+
+    /// As `reserve`, with slot `other` borrowed beside the free one for the
+    /// same step: a map's split occupies a free branch slot and rewrites
+    /// the link its parent branch holds in one publish. `None` when the
+    /// chain is empty, or `other` is the head or no slot of this store.
+    #[inline]
+    pub(super) fn reserve_beside(&mut self, other: u32) -> Option<FreeBeside<'_, T, G>> {
+        let index = self.free_head;
+        let SlotStore { root, free_head, .. } = self;
+        let [slot, beside] = root_slot_pair_mut(root, index, other)?;
+        let Slot::Free { generation, next } = *slot else { return None };
+        Some((FreeSlot { slot, free_head, index, generation, next }, beside))
     }
 
     #[inline]
@@ -517,6 +561,23 @@ fn root_slot_mut<T, G: SlotGeneration>(
     }
 }
 
+/// Slots `first` and `second` under `root`, both mutably.
+#[inline]
+fn root_slot_pair_mut<T, G: SlotGeneration>(
+    root: &mut Root<T, G>,
+    first: u32,
+    second: u32,
+) -> Option<[&mut Slot<T, G>; 2]> {
+    match root {
+        Root::Empty => None,
+        Root::Chunk(level) => walk_pair_mut(&mut **level, first, second),
+        Root::One(level) => walk_pair_mut(&mut **level, first, second),
+        Root::Two(level) => walk_pair_mut(&mut **level, first, second),
+        Root::Three(level) => walk_pair_mut(&mut **level, first, second),
+        Root::Four(level) => walk_pair_mut(&mut **level, first, second),
+    }
+}
+
 /// Slot `index` under a root level, if the root covers it: an index past
 /// the root's span is never walked.
 #[inline]
@@ -530,6 +591,19 @@ fn walk_mut<T, G: SlotGeneration, L: Level<T, G>>(
     index: u32,
 ) -> Option<&mut Slot<T, G>> {
     if covers(index, L::SPAN_LOG2) { level.slot_mut(index) } else { None }
+}
+
+#[inline]
+fn walk_pair_mut<T, G: SlotGeneration, L: Level<T, G>>(
+    level: &mut L,
+    first: u32,
+    second: u32,
+) -> Option<[&mut Slot<T, G>; 2]> {
+    if covers(first, L::SPAN_LOG2) && covers(second, L::SPAN_LOG2) {
+        level.slot_pair_mut(first, second)
+    } else {
+        None
+    }
 }
 
 /// `items_held` after a build step allocated one item.
