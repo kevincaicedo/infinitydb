@@ -15,19 +15,14 @@ use inf_log::FrameLayout;
 use inf_log::fs::mem::MemFs;
 use inf_log::meta::{read_meta, write_meta};
 use inf_log::{
-    DEFAULT_MAX_FRAME_LEN, DEFAULT_STAGING_BYTES, FrameBuilder, FrameIter, FrameStamp, LogError,
-    LogGeometry, Lsn, Manifest, NsId, RecordView, SegmentConfig, SegmentId, SegmentRotor,
-    StagingConfig, create_cell_dirs, read_manifest, scan_log_dir, segment_file_name,
-    write_manifest,
+    DEFAULT_MAX_FRAME_LEN, FrameBuilder, FrameIter, FrameStamp, LogError, Lsn, Manifest, NsId,
+    RecordView, SegmentConfig, SegmentId, SegmentRotor, create_cell_dirs, read_manifest,
+    scan_log_dir, segment_file_name, write_manifest,
 };
 
-/// The rotor's checked geometry: a staging ring no larger than one segment,
-/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
-/// rule, ADR-0191).
-fn geometry(segment: SegmentConfig) -> LogGeometry {
-    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
-    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
-}
+#[path = "common/rotor_geometry.rs"]
+mod rotor_geometry;
+use rotor_geometry::geometry;
 
 /// Canonical v2 stamp for hand-built test frames (epoch 1, covered 0 —
 /// attests nothing). `seq` matters only where a test builds sequential

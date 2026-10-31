@@ -11,18 +11,13 @@ use inf_foundation::FileOffset;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode};
 use inf_log::{
-    DEFAULT_MAX_FRAME_LEN, DEFAULT_STAGING_BYTES, FrameBuilder, FrameIter, FrameLayout, FrameStamp,
-    LogGeometry, NsId, RecordView, SegmentConfig, SegmentId, SegmentRotor, StagingConfig,
-    scan_log_dir,
+    DEFAULT_MAX_FRAME_LEN, FrameBuilder, FrameIter, FrameLayout, FrameStamp, NsId, RecordView,
+    SegmentConfig, SegmentId, SegmentRotor, scan_log_dir,
 };
 
-/// The rotor's checked geometry: a staging ring no larger than one segment,
-/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
-/// rule, ADR-0191).
-fn geometry(segment: SegmentConfig) -> LogGeometry {
-    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
-    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
-}
+#[path = "common/rotor_geometry.rs"]
+mod rotor_geometry;
+use rotor_geometry::geometry;
 
 const SEGMENT_BYTES: u32 = 64 << 10;
 

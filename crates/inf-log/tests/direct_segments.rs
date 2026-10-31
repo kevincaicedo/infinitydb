@@ -14,20 +14,16 @@ use inf_log::fs::mem::MemFs;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode, StdSegmentFs};
 use inf_log::{
-    DEFAULT_MAX_FRAME_LEN, DEFAULT_STAGING_BYTES, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_MAGIC,
-    FRAME_MAGIC_V3, FrameBuilder, FrameIter, FrameLayout, FrameStamp, LogError, LogGeometry, Lsn,
-    MutationEffect, NsId, ReadEnd, ReaderConfig, RecordView, RegionScan, SegmentConfig, SegmentId,
-    SegmentReader, SegmentRotor, StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES, align_up_frame,
-    decode_frame, scan_region, scan_region_evidence,
+    DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_MAGIC_V3,
+    FrameBuilder, FrameIter, FrameLayout, FrameStamp, LogError, LogGeometry, Lsn, MutationEffect,
+    NsId, ReadEnd, ReaderConfig, RecordView, RegionScan, SegmentConfig, SegmentId, SegmentReader,
+    SegmentRotor, StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES, align_up_frame, decode_frame,
+    scan_region, scan_region_evidence,
 };
 
-/// The rotor's checked geometry: a staging ring no larger than one segment,
-/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
-/// rule, ADR-0191).
-fn geometry(segment: SegmentConfig) -> LogGeometry {
-    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
-    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
-}
+#[path = "common/rotor_geometry.rs"]
+mod rotor_geometry;
+use rotor_geometry::geometry;
 
 fn stamp(seq: u64) -> FrameStamp {
     FrameStamp { epoch: 1, seq, covered_lsn: 0 }

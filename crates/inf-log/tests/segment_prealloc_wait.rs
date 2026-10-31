@@ -14,18 +14,14 @@ use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode};
 use inf_log::{
-    DEFAULT_STAGING_BYTES, FRAME_ALIGN, FrameBuilder, FrameLayout, FrameStamp, LogGeometry, Lsn,
-    NsId, PoolWaitBound, PreallocPolicy, RecordView, SealedDisposal, SegmentConfig, SegmentId,
-    SegmentRotor, StagingConfig, ZERO_FILL_HEAD_START, ZERO_FILL_SLICE_BYTES,
+    FRAME_ALIGN, FrameBuilder, FrameLayout, FrameStamp, Lsn, NsId, PoolWaitBound, PreallocPolicy,
+    RecordView, SealedDisposal, SegmentConfig, SegmentId, SegmentRotor, ZERO_FILL_HEAD_START,
+    ZERO_FILL_SLICE_BYTES,
 };
 
-/// The rotor's checked geometry: a staging ring no larger than one segment,
-/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
-/// rule, ADR-0191).
-fn geometry(segment: SegmentConfig) -> LogGeometry {
-    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
-    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
-}
+#[path = "common/rotor_geometry.rs"]
+mod rotor_geometry;
+use rotor_geometry::geometry;
 
 /// 64 KiB segments: the quarter bound is four aligned frames, the eighth
 /// two — wide enough that a wait can end either way.

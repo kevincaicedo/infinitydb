@@ -9,17 +9,13 @@ use inf_foundation::FileOffset;
 use inf_log::fs::sim::{DeviceFault, SimDisk};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    DEFAULT_STAGING_BYTES, FrameBuilder, FrameLayout, FrameStamp, LogGeometry, NsId, ReadError,
-    ReaderConfig, RecordView, SegmentConfig, SegmentId, SegmentReader, SegmentRotor, StagingConfig,
+    FrameBuilder, FrameLayout, FrameStamp, NsId, ReadError, ReaderConfig, RecordView,
+    SegmentConfig, SegmentId, SegmentReader, SegmentRotor,
 };
 
-/// The rotor's checked geometry: a staging ring no larger than one segment,
-/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
-/// rule, ADR-0191).
-fn geometry(segment: SegmentConfig) -> LogGeometry {
-    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
-    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
-}
+#[path = "common/rotor_geometry.rs"]
+mod rotor_geometry;
+use rotor_geometry::geometry;
 
 fn eio(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(libc::EIO)

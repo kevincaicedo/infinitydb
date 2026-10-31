@@ -11,19 +11,14 @@ use inf_log::FrameLayout;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, StdSegmentFs};
 use inf_log::{
-    DEFAULT_MAX_FRAME_LEN, DEFAULT_STAGING_BYTES, FRAME_HEADER_LEN, FrameBuilder, FrameIter,
-    FrameStamp, LogError, LogGeometry, Lsn, NsId, RecordView, SegmentConfig, SegmentId,
-    SegmentRotor, StagingConfig, create_cell_dirs, scan_log_dir,
+    DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FrameBuilder, FrameIter, FrameStamp, LogError, Lsn,
+    NsId, RecordView, SegmentConfig, SegmentId, SegmentRotor, create_cell_dirs, scan_log_dir,
 };
 use std::path::PathBuf;
 
-/// The rotor's checked geometry: a staging ring no larger than one segment,
-/// `min(4 MiB, segment_bytes)`, so every frame it can seal fits (the harness
-/// rule, ADR-0191).
-fn geometry(segment: SegmentConfig) -> LogGeometry {
-    let capacity = segment.segment_bytes.min(DEFAULT_STAGING_BYTES);
-    LogGeometry::new(StagingConfig::with_capacity(capacity), segment).expect("the test's geometry")
-}
+#[path = "common/rotor_geometry.rs"]
+mod rotor_geometry;
+use rotor_geometry::geometry;
 
 const SEGMENT_BYTES: u32 = 4096;
 
