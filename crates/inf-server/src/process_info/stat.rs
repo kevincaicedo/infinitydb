@@ -11,7 +11,7 @@
 
 /// (system, user) CPU microseconds. Preserve INFO's Linux USER_HZ=100
 /// convention; scheduler tick frequency is not this exported unit.
-pub(super) fn cpu_microseconds(text: &str) -> Option<(u64, u64)> {
+pub fn cpu_microseconds(text: &str) -> Option<(u64, u64)> {
     if text.len() as u64 > crate::limits::PROCESS_STAT_BYTES_MAX {
         return None;
     }

@@ -83,6 +83,8 @@ pub use inf_log::fs::StdSegmentFs;
 pub use json::{JSON_REPLY_SHAPES, ReplyShape};
 #[doc(hidden)]
 pub use plane::{parse_array_header, parse_scan_head, parse_take_reply};
+#[doc(hidden)]
+pub use process_info::stat::cpu_microseconds as process_stat_cpu_microseconds;
 pub use process_info::{ProcessBoard, ProcessSample, ProcessSampler};
 // M2-S18 (ADR-0020 D6/D7): the sim tier's disk, re-exported for the
 // assembly/simulator tier exactly like `StdSegmentFs` above — bins name
