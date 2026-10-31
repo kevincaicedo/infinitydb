@@ -58,8 +58,8 @@ pub(crate) struct CorpusDoc {
 pub(crate) fn corpus_documents() -> &'static [CorpusDoc] {
     static CORPUS: OnceLock<Vec<CorpusDoc>> = OnceLock::new();
     CORPUS.get_or_init(|| {
-        let dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/inf-doc/fuzz/corpora/json");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/inf-doc/fuzz/corpora/json_parse");
         let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("fuzz corpus dir {}: {e}", dir.display()))
             .filter_map(|entry| entry.ok().map(|e| e.path()))

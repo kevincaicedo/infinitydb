@@ -68,7 +68,7 @@ jobs:
           - { dir: crates/inf-doc, target: idoc_decode }
           # json_parse seeds from the committed minimized corpus (M3-S07)
           # so nightly hours never restart coverage from zero.
-          - { dir: crates/inf-doc, target: json_parse, seeds: fuzz/corpora/json }
+          - { dir: crates/inf-doc, target: json_parse, seeds: fuzz/corpora/json_parse }
           # M3-S08/S09: path text parser + program-byte decoder (ADR-0040).
           # Seeds the pinned child-len-overflow regression (caught by this
           # target at 300 s, fixed same session).

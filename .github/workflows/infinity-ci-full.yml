@@ -173,7 +173,7 @@ jobs:
       - name: fuzz JSON parser (smoke, M3-S05; seeded from the committed minimized corpus, M3-S07)
         run: |
           mkdir -p fuzz/corpus/json_parse
-          cargo +nightly fuzz run json_parse fuzz/corpus/json_parse fuzz/corpora/json -- -max_total_time=300
+          cargo +nightly fuzz run json_parse fuzz/corpus/json_parse fuzz/corpora/json_parse -- -max_total_time=300
         working-directory: crates/inf-doc
       - name: fuzz path programs (smoke, M3-S08/S09; seeded from the pinned child-len-overflow regression)
         run: |
