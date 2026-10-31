@@ -1,7 +1,7 @@
-# cargo-fuzz crate for bins/inf: every parser in `bins/` has a
-# fuzz target. A workspace of its own, outside the root's, so its fuzzing
-# features never unify into a shipping build; `just check` compiles its
-# targets on the pinned toolchain and `cargo +nightly fuzz` runs them.
+# cargo-fuzz crate for bins/inf. A workspace of its own, outside the
+# root's, so its fuzzing features never unify into a shipping build;
+# `just check` compiles its targets on the pinned toolchain and
+# `cargo +nightly fuzz` runs them.
 [package]
 name = "inf-fuzz"
 version = "0.0.0"
