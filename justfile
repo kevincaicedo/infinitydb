@@ -175,21 +175,23 @@ durable-sweep seeds="10000" base="0xD5EE0000":
 budget-sweep seeds="1000" base="0xB0D6E700":
     ./scripts/run-sweep.sh m2-device-budget {{seeds}} {{base}}
 
-# Barrier-class transition sweep (ADR-0086 D4 / ADR-0031 D5 as amended,
-# 2026-08-21): two lives per seed — FLUSH → FUA on even seeds (a packed
-# tail reopened under a Direct rotor after a dirty cut), FUA → FLUSH on
-# odd — under the m2 durability oracle, with the stale-residue recovery
-# rule exercised by the no-checkpoint half. Usage:
+# Barrier-class transition sweep: two lives per seed under the m2
+# durability oracle. FLUSH → FUA on even seeds reopens a packed tail under
+# a Direct rotor after a dirty cut, which resumes Buffered at its own
+# offset, never padded to alignment (ADR-0086 D4); FUA → FLUSH runs on odd
+# seeds. The no-checkpoint half exercises the stale-residue rule: a
+# discarded life's frames in sealed slack are residue, never a hole
+# (ADR-0031 D5). Usage:
 #   just transition-sweep [seeds] [base]
 transition-sweep seeds="4000" base="0x7A4E0000":
     ./scripts/run-sweep.sh m2-mode-transition {{seeds}} {{base}}
 
-# Completion-ledger reorder-window sweep (ADR-0087 D2 as amended,
-# 2026-08-22): every 40th plain write wedged 150 ms on a K ≥ 2 pipeline
-# of everysec-only frames, so the ledger's reorder window fills and the
-# next frame holds — the window must engage on every seed (oracle), the
-# ledger's bound is release-asserted, the m2 durability oracle holds.
-# Usage:
+# Completion-ledger reorder-window sweep: the ledger queues at most a
+# reorder window of frames and holds the next one while it is full
+# (ADR-0087 D2). Every 40th plain write wedged 150 ms on a K ≥ 2 pipeline
+# of everysec-only frames, so the window fills and the next frame holds —
+# the window must engage on every seed (oracle), the ledger's bound is
+# release-asserted, the m2 durability oracle holds. Usage:
 #   just reorder-sweep [seeds] [base]
 reorder-sweep seeds="2000" base="0x2E0D0000":
     ./scripts/run-sweep.sh m2-reorder-window {{seeds}} {{base}}
