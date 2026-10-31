@@ -106,7 +106,7 @@ deny:
             echo "deny: $manifest ok"
         else
             status=$?
-            echo "deny: $manifest red (cargo deny exited $status)"
+            echo "deny: $manifest red (exit $status)"
             red=$((red + 1))
         fi
         fetch="check --disable-fetch"
