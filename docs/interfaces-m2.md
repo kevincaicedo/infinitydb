@@ -963,8 +963,8 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   `begin-LSN ≤ durability watermark` before publishing.
 - Loader `read_ick`: validate-then-yield per section, footer audit
   (counts + digest + no trailing bytes); every structural error is typed
-  and fail-stop for recovery. Fuzz target `ick_decode` (per-PR smoke +
-  nightly hour).
+  and fail-stop for recovery. Fuzz target `ick_decode`, fuzzed by the full
+  CI's smoke and the nightly, as every target is.
 - The document walker borrows tape images and freezes arena trees through
   per-store recycled output/walk/frame scratch. No per-entry allocation is
   introduced by a document-heavy checkpoint. The layout-independent state
@@ -1547,8 +1547,8 @@ count the arrivals that found it full.
   `log_writes_per_iter` tripwire numerator over `raw_iterations`) and
   `log_staging_bytes` (staging domain resident bytes, 2 × buffer capacity
   by construction — the L5 attribution term the S22 durable fill leg sums).
-- Fuzz: `manifest_decode` (envelope + payload, canonicality oracle) —
-  per-PR smoke + nightly hour alongside the other decoders.
+- Fuzz: `manifest_decode` (envelope + payload, canonicality oracle),
+  fuzzed by the full CI's smoke and the nightly, as every target is.
 - **M4-S12 amendment (ADR-0057 D5/D6) — epoch 2 tier sections.** The
   `epoch` field bumps to 2 when tier sections are present; tierless cells
   keep writing epoch-1 payloads byte-identically, and the v2 reader

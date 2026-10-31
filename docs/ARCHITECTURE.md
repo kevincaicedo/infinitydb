@@ -1499,13 +1499,11 @@ shape the image reproduces. Its rows are data files anyone can review.
 ### Fuzzing, Loom and Miri
 
 Every decoder has a cargo-fuzz target. CI runs a short fuzz of the RESP
-parser on every change. A nightly job fuzzes the wire, fabric, log frame,
-segment, checkpoint, MANIFEST, tier-file, blob-extent and document decoders
-for hours each. The catalog, query-program, index-key and index-sidecar
-targets, and a few server-side ones, exist but are not in the nightly set
-yet. Loom
-model-checks the fabric ring; Miri runs the allocator and fabric tests under
-strict provenance.
+parser on every change. The full CI fuzzes every target for five minutes,
+and a nightly job fuzzes every target for 5.5 hours, one job a target in
+each; both read the targets from the fuzz manifests when they run, so a new
+target is fuzzed from its first run. Loom model-checks the fabric ring; Miri
+runs the allocator and fabric tests under strict provenance.
 
 ### Mechanical checks
 
