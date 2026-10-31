@@ -438,9 +438,10 @@ jobs:
   website-gates:
     # Gates that need no toolchain, on the PR: every workflow's YAML, and
     # the committed site against a fresh build. `pages.yml` checks the site
-    # only on a push to main, where a site stale against its sources fails
-    # the deploy after the merge; here it fails the PR, where the fix is a
-    # one-line regeneration commit.
+    # on a push to main that matches its `paths:` filter (the site's sources
+    # and the workflow itself) or on a manual dispatch, never on a PR, so a
+    # site stale against its sources fails the deploy after the merge; here
+    # it fails the PR, where the fix is a one-line regeneration commit.
     #
     # Cheap by construction: python3 and the runner image's PyYAML, no
     # toolchain, no build.
