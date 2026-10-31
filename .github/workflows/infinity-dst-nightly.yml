@@ -101,7 +101,7 @@ jobs:
       - name: build (release)
         run: cargo build --release -p inf-sim --features dst --bin inf-sim
 
-      - name: durability sweep (M2-S19; M2.5-S14 raised to 12k on the stall device)
+      - name: durability sweep (12k seeds on the stall device)
         run: |
           base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
           echo "durable sweep seed base: $base (run id ${{ github.run_id }})" | tee -a /tmp/fleet.log
@@ -127,7 +127,7 @@ jobs:
           done
           exit $fail
 
-      - name: document sweep (M3-S23/S24 — power cuts + replay-equivalence oracle, ADR-0045)
+      - name: document sweep (power cuts + replay-equivalence oracle, ADR-0045)
         run: |
           base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
           echo "document sweep seed base: $base" | tee -a /tmp/fleet.log
@@ -151,7 +151,7 @@ jobs:
           cat /tmp/document-sweep/manifest-shard-*.txt | tee -a /tmp/fleet.log
           exit $fail
 
-      - name: combined sweep (M2.5-S14 — durable+memory+pub/sub+expiry, L2 oracles)
+      - name: combined sweep (durable+memory+pub/sub+expiry, L2 oracles)
         run: |
           base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
           echo "combined sweep seed base: $base" | tee -a /tmp/fleet.log
@@ -170,7 +170,7 @@ jobs:
           done
           exit $fail
 
-      - name: tiered command sweep (M4-S26 — the wired data plane under power cuts, drop races, DISKFULL)
+      - name: tiered command sweep (the wired data plane under power cuts, drop races, DISKFULL)
         run: |
           base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
           echo "tiered sweep seed base: $base" | tee -a /tmp/fleet.log
