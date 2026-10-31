@@ -95,7 +95,7 @@ pub const fn ick_align_up(len: usize) -> usize {
 
 /// The section-body bound shared by the writer and the default-configured
 /// loader (ADR-0117 D1): one maximal staging record (the frame bound —
-/// `StagingRing::new` asserts the capacity under it) plus
+/// row 2 of `LogGeometry::new` holds a staging ring's capacity under it) plus
 /// [`ICK_SECTION_SLACK`], so a record at the staging ceiling and its
 /// expiry companion always fit an empty section. `seal_section` asserts
 /// it; the walker seals before a record that would breach it.
