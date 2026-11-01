@@ -145,6 +145,101 @@ f=$(drv_fixture built 'fx_build_empty() { mkdir -p "$work/empty/crates"; }' \
     'group_one() {' 'fx_build_empty' 'expect red "one reads its own" test -e "$work/empty/nothing"' '}' \
     'group_two() {' 'fx_build_empty' 'expect red "two reads its own" test -e "$work/empty/nothing"' '}')
 expect green "driver: groups that each build what they read pass the lint (control)" drv_run "$f"
+# A helper making "$work/$name" makes the names its calls pass, never a word of a
+# label or a message: here the helper's own message holds "empty".
+f=$(drv_fixture named 'group_one() {' 'ro_fixture() {' 'local name=$1 root' \
+    '[ -n "$name" ] && [ -n "$work" ] ||' \
+    '{ echo "ro_fixture: empty name or work dir" >&2; exit 2; }' \
+    'root="$work/$name"' 'mkdir -p "$root/src"' 'echo "$root"' '}' \
+    'root=$(ro_fixture roclean)' 'expect green "one builds roclean" test -d "$root/src"' \
+    'expect red "one: a missing directory, empty, is red" test -e "$work/empty/src"' '}')
+expect_red_because "driver: a helper making \"\$work/\$name\" makes only what its calls pass" \
+    "group_one: reads \$work/empty, which it neither creates nor builds with fx_build_empty" \
+    drv_run "$f"
+# Every way the lint counts a name as made: each r_ group reads a name its form
+# does not make and is refused, each g_ group reads what its form made and runs
+# green. Quoted text and heredoc bodies make nothing; a read before the making
+# is red; a helper hands a name it was passed on to the helper it calls.
+f=$(drv_fixture forms 'mk_whole() { local name=$1; mkdir -p "$work/$name"; }' \
+    'mk_pre() { mkdir -p "$work/p-$1"; }' 'mk_suf() { : >"$work/$1.s"; }' \
+    'mk_via() { mk_pre "$1"; }' 'rd_pre() { test -e "$work/p-$1"; }' \
+    'fx_build_y() { mkdir -p "$work/y"; }' \
+    'group_r_whole() {' 'mk_whole other' \
+    'expect red "x, which mk_whole x would make" test -e "$work/x"' '}' \
+    'group_r_prefix() {' 'mk_pre x' 'expect red "mk_pre x made p-x" test -e "$work/x"' '}' \
+    'group_r_suffix() {' 'mk_suf x' 'expect red "mk_suf x made x.s" test -e "$work/x"' '}' \
+    'group_r_hand() {' 'mk_via other' 'expect red "mk_via z makes p-z" test -e "$work/p-z"' '}' \
+    'group_r_redirect() {' 'printf a >"$work/x.log"' 'expect red "x" test -e "$work/x"' '}' \
+    'group_r_mkdir() {' 'mkdir -p "$work/y" && expect red "x" test -e "$work/x"' '}' \
+    'group_r_touch() {' 'touch "$work/y" && expect red "x" test -e "$work/x"' '}' \
+    'group_r_mktemp() {' \
+    'mktemp "$work/x.XXXXXX" >/dev/null && expect red "x" test -e "$work/x"' '}' \
+    'group_r_git() {' 'git init -q "$work/y" && expect red "x" test -e "$work/x"' '}' \
+    'group_r_copy() {' 'cp -R "$work/x" "$work/y" 2>/dev/null || :' '}' \
+    'group_r_assign() {' 'INF_X="$work/x" true' '}' \
+    'group_r_builder() {' 'fx_build_y' 'expect red "fx_build_x" test -e "$work/x"' '}' \
+    'group_r_late() {' 'expect red "x" test -e "$work/x"' 'mkdir -p "$work/x"' '}' \
+    'group_r_reader() {' 'expect red "p-x" rd_pre x' '}' \
+    'group_r_glob() {' ': >"$work/o1"' 'expect red "q" ls "$work"/q[12]' '}' \
+    'group_r_loop() {' 'for v in a b; do : >"$work/d-$v"; done' \
+    'expect red "d-x" test -e "$work/d-x"' '}' \
+    'group_r_quoted() {' 'echo '"'"'mkdir -p "$work/x"'"'"' >/dev/null' \
+    'expect red "x" test -e "$work/x"' '}' \
+    'group_r_heredoc() {' 'cat >/dev/null <<'"'"'H'"'"'' 'mkdir -p "$work/x"' 'H' \
+    'expect red "x" test -e "$work/x"' '}' \
+    'group_g_whole() {' 'mk_whole x' 'expect green "mk_whole x made x" test -d "$work/x"' '}' \
+    'group_g_prefix() {' 'mk_pre x' 'expect green "mk_pre x made p-x" test -d "$work/p-x"' '}' \
+    'group_g_suffix() {' 'mk_suf x' 'expect green "mk_suf x made x.s" test -f "$work/x.s"' '}' \
+    'group_g_hand() {' 'mk_via z' 'expect green "mk_via z made p-z" test -d "$work/p-z"' '}' \
+    'group_g_nested() {' 'mk_in() { mkdir -p "$work/n-$1"; }' 'mk_in x' \
+    'expect green "mk_in x made n-x" test -d "$work/n-x"' '}' \
+    'group_g_redirect() {' 'printf a >"$work/x"' 'expect green "x" test -f "$work/x"' '}' \
+    'group_g_mkdir() {' 'mkdir -p "$work/x" && expect green "x" test -d "$work/x"' '}' \
+    'group_g_touch() {' 'touch "$work/x" && expect green "x" test -f "$work/x"' '}' \
+    'group_g_mktemp() {' 'mktemp -d "$work/m.XXXXXX" >/dev/null' \
+    'expect green "m.*" ls -d "$work"/m.*' '}' \
+    'group_g_git() {' 'git init -q "$work/x"' 'expect green "x" test -d "$work/x/.git"' '}' \
+    'group_g_copy() {' 'mkdir -p "$work/x"' 'cp -R "$work/x" "$work/y"' \
+    'expect green "y" test -d "$work/y"' '}' \
+    'group_g_assign() {' 'local d="$work/x"' 'mkdir -p "$d"' \
+    'expect green "x" test -d "$work/x"' '}' \
+    'group_g_builder() {' 'fx_build_y' 'expect green "fx_build_y made y" test -d "$work/y"' '}' \
+    'group_g_reader() {' 'mk_pre x' 'expect green "p-x" rd_pre x' '}' \
+    'group_g_glob() {' ': >"$work/o1"' ': >"$work/o2"' \
+    'expect green "o1, o2" ls "$work"/o[12]' '}' \
+    'group_g_loop() {' \
+    'for v in a b; do : >"$work/d-$v"; expect green "d-$v" test -f "$work/d-$v"; done' '}' \
+    'group_g_log() {' 'expect green "a case" true' 'expect green "its log" test -f "$work/log"' '}')
+drv_forms_red() { # the lint is red, naming each r_ group once and no g_ group
+    local out g n=0
+    out=$(drv_run "$1" --lint 2>&1) && { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out"
+    for g in $(sed -n 's/^group_\(r_[a-z_]*\)() {$/\1/p' "$1"); do
+        n=$((n + 1))
+        [ "$(grep -c "^SELFTEST LINT: group_$g: " <<<"$out")" -eq 1 ] || {
+            echo "group_$g is not named once"
+            return 1
+        }
+    done
+    [ "$n" -eq 18 ] && ! grep -q '^SELFTEST LINT: group_g_' <<<"$out" &&
+        grep -qx "selftest lint: .* calls followed, $n unbuilt fixture(s)" <<<"$out"
+}
+expect green "driver: the lint refuses the unbuilt read of each of 18 forms, naming its group" \
+    drv_forms_red "$f"
+drv_forms_green() { # each g_ group runs green: what the lint counts as made exists
+    local g n=0
+    for g in $(sed -n 's/^group_\(g_[a-z_]*\)() {$/\1/p' "$1"); do
+        n=$((n + 1))
+        drv_run "$1" --group "$g" >"$work/drv-forms-$g.log" 2>&1 &&
+            grep -q "^group $g: [1-9][0-9]* 0$" "$work/drv-forms-$g.log" || {
+            cat "$work/drv-forms-$g.log"
+            return 1
+        }
+    done
+    [ "$n" -eq 17 ]
+}
+expect green "driver: each of 17 forms the lint counts as making makes what it reads (controls)" \
+    drv_forms_green "$f"
 # Two groups at once: each waits until the other has started (so they overlap),
 # then finds its own fixture and not the other's, and its own case log only.
 f=$(drv_fixture overlap \

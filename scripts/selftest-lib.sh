@@ -171,63 +171,21 @@ selftest_declared() {
     declare -F | sed -n 's/^declare -f[a-z]* group_//p'
 }
 
-# The fixture lint: a group, or a helper the self-test defines, that reads a
-# literal `$work/<name>` it neither creates nor gets from an `fx_build_<name>`
-# call is red: an absent fixture passes a bare `expect red`, so a group must not
-# lean on one another group made. It reads bash's own text of each function
-# (`declare -f`, nested helpers included). A path is created where it is the
-# target of a redirection, an argument of mkdir, touch, mktemp or `git init`,
-# the last `$work` path of a cp, mv or ln, or the value a statement assigns to
-# a variable; any other mention reads it. A created path that a variable
-# completes (`"$work/as-$1"`) creates its family (`as-*`); one a variable names
-# whole (`"$work/$1"`) creates the names the function passes as words; a glob
-# reads its family. `log` is the case helpers' own.
+# The fixture lint: an absent fixture passes a bare `expect red`, so a function
+# the self-test defines is red when it reads a `$work/<name>` before it, or a
+# call it makes (an `fx_build_<name>` for a fixture several groups read), has
+# created it. selftest_lint.py reads bash's own text of each function
+# (`declare -f`, nested functions included) and states what creates a name: a
+# word inside quotes is never a call and quoted text never a creation, and a
+# helper creates a name its argument completes only for the word each call
+# passes there.
 selftest_lint() {
     local fn
     for fn in $(declare -F | sed -n 's/^declare -f[a-z]* //p'); do
         case " $SELFTEST_LIB_FUNCS " in *" $fn "*) continue ;; esac
         printf '\036%s\n' "$fn"
         declare -f "$fn"
-    done | python3 -I -c '
-import re, sys
-ref = re.compile(r"\$\{?work\}?\"?/([A-Za-z0-9._-]*)")
-name_eq = r"[A-Za-z_][A-Za-z0-9_]*="
-assign = re.compile(r"^\s*(?:local\s+|export\s+)?(?:" + name_eq + r"\S*\s+)*" + name_eq + r"\"?$")
-assign_end = re.compile(r"^[^\s;]*(?:\s+(?:" + name_eq + r"\S*|[A-Za-z_][A-Za-z0-9_]*))*\s*(?:;|&&|\|\||$)")
-makers = re.compile(r"(?:^|[\s;&|(])(?:mkdir|touch|mktemp|git\s+init)\s")
-movers = re.compile(r"(?:^|[\s;&|(])(?:cp|mv|ln)\s")
-errors, scanned = [], 0
-for block in sys.stdin.read().split("\x1e")[1:]:
-    name, _, body = block.partition("\n")
-    scanned += 1
-    builds = set(re.findall(r"\bfx_build_([A-Za-z0-9_]+)\b", body))
-    made, families, read = {"log"}, set(), {}
-    for line in body.split("\n"):
-        hits = list(ref.finditer(line))
-        for k, m in enumerate(hits):
-            pre, post, key = line[:m.start()], line[m.end():], m.group(1)
-            last = k == len(hits) - 1
-            assigned = assign.match(pre) and assign_end.match(post)
-            if (re.search(r">>?\s*\"?$", pre) or makers.search(pre) or assigned
-                    or (movers.search(pre) and last)):
-                made.add(key)
-                if post.startswith("$"):
-                    families.add(key)
-            elif key:
-                read.setdefault(key, (line.strip(), post[:1] in ("[", "*", "?")))
-    for key, (line, glob) in sorted(read.items()):
-        ident = re.sub(r"[^A-Za-z0-9_]", "_", key)
-        named = re.search(r"(?:^|\s)" + re.escape(key) + r"(?:\s|;|$)", body)
-        if (key in made or ident in builds or any(f and key.startswith(f) for f in families)
-                or ("" in families and named) or (glob and any(k.startswith(key) for k in made))):
-            continue
-        errors.append(f"{name}: reads $work/{key}, which it neither creates nor builds "
-                      f"with fx_build_{ident}: {line}")
-for e in errors:
-    print(f"SELFTEST LINT: {e}")
-print(f"selftest lint: {scanned} functions read, {len(errors)} unbuilt fixture(s)")
-sys.exit(1 if errors or not scanned else 0)
-'
+    done | python3 -B -I "$SELFTEST_LIB_DIR/selftest_lint.py"
 }
 
 # selftest_run_group <self> <name>: one group in its own work directory.
@@ -371,3 +329,4 @@ selftest_main() {
 }
 
 SELFTEST_LIB_FUNCS=$(declare -F | sed -n 's/^declare -f[a-z]* //p' | tr '\n' ' ')
+SELFTEST_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
