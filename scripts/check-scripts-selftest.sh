@@ -12,120 +12,25 @@
 # INF_CHECK_ROOT (the gates) and INF_SIM_BIN / INF_SWEEP_SHARDS (the sweep
 # runner, with a stub simulator). No cargo, except in the lint-scope probe
 # cases, which run `cargo clippy` on the pinned toolchain.
+#
+# The cases live in group functions, `group_<name>() {`, one a gate's
+# section or a part of one, each building every fixture it reads: the driver
+# in scripts/selftest-lib.sh runs every group in a process and a work
+# directory of its own, several at once, and folds their counts (`--group
+# <name>` runs one). A group's body is not indented: its heredocs and
+# multi-line strings are fixture bytes. INF_SELFTEST_CASE_LOG=<an empty
+# directory> writes one record a case (the lib's header says what it holds).
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR/.."
+# shellcheck source=selftest-lib.sh
+. "$SCRIPT_DIR/selftest-lib.sh"
 
-work=$(mktemp -d)
-[ -n "$work" ] && [ -d "$work" ] || { echo "selftest: mktemp failed" >&2; exit 2; }
-# Every rm below is guarded: a variable that came back empty would turn
-# `rm -rf "$x/…"` into a delete at the filesystem root.
-trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
-pass=0
-fail=0
-
-# A gate that never ran gives no verdict (ADR-0106 D1): counted as red, a
-# tool the runner lacked passed every planted red of the gate that needed it.
-# Each expect* refuses two shapes, failing the case with the cause.
-# not_runnable <label> <command>: a path that is no executable file, or a name
-# the shell cannot find, is refused before it runs — bash 3.2 under `set -e`
-# reports a failed exec of a path as exit 1, which reads as red.
-not_runnable() {
-    case $2 in
-    */*) [ -f "$2" ] && [ -x "$2" ] && return 1 ;;
-    *) command -v -- "$2" >/dev/null && return 1 ;;
-    esac
-    fail=$((fail + 1))
-    echo "SELFTEST FAIL: '$2' is not a runnable command, so it gives no verdict — $1"
-}
-# no_verdict <status> <label> <log>: a command that ran and exited 126 or 127
-# — env refusing a gate it cannot execute or find, or a gate that died on a
-# tool the runner lacks (both shells keep those codes) — is not a verdict.
-no_verdict() {
-    case $1 in 126 | 127) ;; *) return 1 ;; esac
-    fail=$((fail + 1))
-    echo "SELFTEST FAIL: exit $1 means a command could not be executed or found, not a gate verdict — $2"
-    sed 's/^/    | /' "$3"
-}
-
-# expect <red|green> <label> <command…>: runs the command with stdout+stderr
-# captured; a mismatch prints the captured output.
-expect() {
-    local want=$1 label=$2
-    shift 2
-    local log="$work/log" status=0
-    not_runnable "$label" "$1" && return 0
-    "$@" >"$log" 2>&1 || status=$?
-    no_verdict "$status" "$label" "$log" && return 0
-    if { [ "$want" = red ] && [ "$status" -ne 0 ]; } || { [ "$want" = green ] && [ "$status" -eq 0 ]; }; then
-        pass=$((pass + 1))
-    else
-        fail=$((fail + 1))
-        echo "SELFTEST FAIL: expected $want, got exit $status — $label"
-        sed 's/^/    | /' "$log"
-    fi
-}
-
-# expect_output <label> <pattern> <command…>: the command's output must
-# contain the pattern (a scope disclosure, an allowed-site line).
-expect_output() {
-    local label=$1 pattern=$2
-    shift 2
-    local log="$work/log" status=0
-    not_runnable "$label" "$1" && return 0
-    "$@" >"$log" 2>&1 || status=$?
-    no_verdict "$status" "$label" "$log" && return 0
-    if grep -q -- "$pattern" "$log"; then
-        pass=$((pass + 1))
-    else
-        fail=$((fail + 1))
-        echo "SELFTEST FAIL: output lacks '$pattern' — $label"
-        sed 's/^/    | /' "$log"
-    fi
-}
-
-# expect_red_because <label> <pattern> <command…>: red, and for its own
-# reason — a plant that is red for another reason is not evidence.
-expect_red_because() {
-    local label=$1 pattern=$2 status=0
-    shift 2
-    local log="$work/log"
-    not_runnable "$label" "$1" && return 0
-    "$@" >"$log" 2>&1 || status=$?
-    no_verdict "$status" "$label" "$log" && return 0
-    if [ "$status" -ne 0 ] && grep -q -- "$pattern" "$log"; then
-        pass=$((pass + 1))
-    else
-        fail=$((fail + 1))
-        echo "SELFTEST FAIL: expected red naming '$pattern', got exit $status — $label"
-        sed 's/^/    | /' "$log"
-    fi
-}
-
-# fx_git <root> <git args…>: git in a fixture repository only. `git -C ""`
-# runs in the current directory, and a root that is not its own repository
-# lets git walk up to an enclosing one, the developer's engine branch: a root
-# that is empty, outside $work or without its own `.git` is refused before
-# git runs (the rule every destructive command on a variable keeps). `init`
-# creates that `.git`, so it alone runs bare, on a root its guarded
-# constructor made.
-fx_git() {
-    local root=$1
-    shift
-    case $root in
-    "$work"/?*) ;;
-    *) echo "fx_git: '$root' is not a fixture directory under $work" >&2; exit 2 ;;
-    esac
-    [ -d "$root/.git" ] || { echo "fx_git: no repository of its own at '$root'" >&2; exit 2; }
-    git -C "$root" "$@"
-}
-# fx_only <file>: every `git -C` on a variable in <file> is fx_git's own or an
-# `init`; the canary is this file with a raw reset appended.
-fx_only() {
-    ! grep -n 'git -C "\$' "$1" | grep -v -e ' init -q$' -e '^[0-9]*:    git -C "\$root" "\$@"$'
-}
+group_self_test() {
 expect green "self-test: every git command on a fixture root goes through fx_git" \
     fx_only "$SCRIPT_DIR/check-scripts-selftest.sh"
+expect green "self-test: every git command in the lib goes through fx_git" \
+    fx_only "$SCRIPT_DIR/selftest-lib.sh"
 cp "$SCRIPT_DIR/check-scripts-selftest.sh" "$work/selftest-raw-git"
 printf 'git -C "%sroot" reset -q --hard HEAD~1\n' '$' >>"$work/selftest-raw-git"
 expect red "self-test: a raw git reset on a fixture root is refused (canary)" fx_only "$work/selftest-raw-git"
@@ -150,23 +55,211 @@ expect_red_because "self-test: fx_git refuses a fixture directory with no reposi
 # no_verdict). Its own log directory keeps the inner cases off the outer
 # case's log.
 nv_canary() (
+    unset INF_SELFTEST_CASE_LOG
     work="$work/nv" && mkdir -p "$work" && : >"$work/noexec" && pass=0 && fail=0
+    absent="$work/no-such-gate"
     printf '#!/usr/bin/env bash\nset -e\ninf-selftest-no-such-tool\n' >"$work/tool-missing"
     chmod +x "$work/tool-missing"
     expect red "a gate name the shell cannot find" inf-selftest-no-such-gate >"$work/o1"
-    expect_red_because "a gate path that does not exist" "" "$work/no-such-gate" >"$work/o2"
+    expect_red_because "a gate path that does not exist" "" "$absent" >"$work/o2"
     expect_output "a gate path that is not executable" "" "$work/noexec" >"$work/o3"
     expect red "a gate that dies on a missing tool" "$work/tool-missing" >"$work/o4"
     expect red "env refusing a gate it cannot execute" env "$work/noexec" >"$work/o5"
     cat "$work"/o[1-5]
     grep -qF "'inf-selftest-no-such-gate' is not a runnable command" "$work/o1" &&
-        grep -qF "'$work/no-such-gate' is not a runnable command" "$work/o2" &&
+        grep -qF "'$absent' is not a runnable command" "$work/o2" &&
         grep -qF "'$work/noexec' is not a runnable command" "$work/o3" &&
         grep -qF "exit 127 means a command could not be executed or found" "$work/o4" &&
         grep -qF "exit 126 means a command could not be executed or found" "$work/o5" &&
         [ "$pass" -eq 0 ] && [ "$fail" -eq 5 ]
 )
 expect green "self-test: a gate that never ran is never counted as a verdict (canary)" nv_canary
+}
+
+group_driver() {
+# The driver itself, on fixture scripts that source the lib: each shape it must
+# refuse is red naming its cause, and its control is green. A fixture's groups
+# run under the real driver, so a fixture is a small self-test of its own.
+# drv_fixture <name> <line…>: a script holding the body's lines, run as the
+# self-test runs, from its own path.
+drv_fixture() {
+    local file="$work/drv-$1.sh"
+    shift
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+        printf '. "%s"\n' "$SCRIPT_DIR/selftest-lib.sh"
+        printf '%s\n' "$@"
+        printf '%s\n' 'selftest_main "$0" "$@"'
+    } >"$file"
+    chmod +x "$file"
+    echo "$file"
+}
+drv_run() { env -u INF_SELFTEST_CASE_LOG CARGO_BUILD_JOBS=2 "$@"; }
+f=$(drv_fixture control 'group_one() {' 'expect green "one passes" true' '}' \
+    'group_two() {' 'expect red "two passes" false' '}')
+expect_output "driver: the control's OK line names its groups and counts" \
+    "check-scripts self-test OK (2 cases in 2 groups, each exiting non-zero on its planted case: one, two)" \
+    drv_run "$f"
+expect_output "driver: --group runs one group and prints its count line" "group two: 1 0" \
+    drv_run "$f" --group two
+expect_red_because "driver: --group refuses a name no definition line holds" "no group 'three'" \
+    drv_run "$f" --group three
+f=$(drv_fixture keyword 'group_one() {' 'expect green "one passes" true' '}' \
+    'function group_two {' 'expect green "two passes" true' '}')
+expect_red_because "driver: a group defined as \`function group_x {\` is red, named" \
+    "group two is in bash's function table only" drv_run "$f"
+f=$(drv_fixture twice 'group_one() {' 'expect green "one passes" true' '}' \
+    'group_one() {' 'expect green "one again" true' '}')
+expect_red_because "driver: a group defined twice is red, named" "group one is defined twice" drv_run "$f"
+f=$(drv_fixture toplevel 'group_one() {' 'expect green "one passes" true' '}' \
+    'expect green "a top-level case" true')
+expect_red_because "driver: a case outside any group is red, with its label" \
+    "the case 'a top-level case' runs outside any group" drv_run "$f"
+f=$(drv_fixture nocount 'group_one() {' 'expect green "one passes" true' 'exit 0' '}' \
+    'group_two() {' 'expect green "two passes" true' '}')
+expect_red_because "driver: a group that prints no count line is red, named" \
+    "group one printed 0 count lines" drv_run "$f"
+f=$(drv_fixture twocounts 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 0"' '}')
+expect_red_because "driver: a group that prints two count lines is red, named" \
+    "group one printed 2 count lines" drv_run "$f"
+f=$(drv_fixture contradicts 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 0"' \
+    'exit 1' '}')
+expect_red_because "driver: a count its exit status contradicts is red, named" \
+    "group one counted 0 failed case(s) but exited 1" drv_run "$f"
+f=$(drv_fixture malformed 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 x"' \
+    'exit 1' '}')
+expect_red_because "driver: a count line that is no pair of counts is red, named" \
+    "group one's count line is malformed: group one: 1 x" drv_run "$f"
+f=$(drv_fixture none 'group_one() {' ': no case' '}')
+expect_red_because "driver: a group of zero cases is red, named" "group one ran no case" drv_run "$f"
+f=$(drv_fixture failing 'group_one() {' 'expect green "one passes" true' '}' \
+    'group_two() {' 'expect green "a planted failing case" false' '}')
+expect_red_because "driver: one failing case is red, naming it" \
+    "expected green, got exit 1 — a planted failing case" drv_run "$f"
+f=$(drv_fixture unbuilt 'fx_build_empty() { mkdir -p "$work/empty/crates"; }' \
+    'group_one() {' 'fx_build_empty' 'expect red "one reads its own" test -e "$work/empty/nothing"' '}' \
+    'group_two() {' 'expect red "two reads another'"'"'s" test -e "$work/empty/nothing"' '}')
+expect_red_because "driver: a fixture a group reads but never builds is red, naming both" \
+    "group_two: reads \$work/empty, which it neither creates nor builds with fx_build_empty" drv_run "$f"
+f=$(drv_fixture built 'fx_build_empty() { mkdir -p "$work/empty/crates"; }' \
+    'group_one() {' 'fx_build_empty' 'expect red "one reads its own" test -e "$work/empty/nothing"' '}' \
+    'group_two() {' 'fx_build_empty' 'expect red "two reads its own" test -e "$work/empty/nothing"' '}')
+expect green "driver: groups that each build what they read pass the lint (control)" drv_run "$f"
+# A helper making "$work/$name" makes the names its calls pass, never a word of a
+# label or a message: here the helper's own message holds "empty".
+f=$(drv_fixture named 'group_one() {' 'ro_fixture() {' 'local name=$1 root' \
+    '[ -n "$name" ] && [ -n "$work" ] ||' \
+    '{ echo "ro_fixture: empty name or work dir" >&2; exit 2; }' \
+    'root="$work/$name"' 'mkdir -p "$root/src"' 'echo "$root"' '}' \
+    'root=$(ro_fixture roclean)' 'expect green "one builds roclean" test -d "$root/src"' \
+    'expect red "one: a missing directory, empty, is red" test -e "$work/empty/src"' '}')
+expect_red_because "driver: a helper making \"\$work/\$name\" makes only what its calls pass" \
+    "group_one: reads \$work/empty, which it neither creates nor builds with fx_build_empty" \
+    drv_run "$f"
+# Every way the lint counts a name as made: each r_ group reads a name its form
+# does not make and is refused, each g_ group reads what its form made and runs
+# green. Quoted text and heredoc bodies make nothing; a read before the making
+# is red; a helper hands a name it was passed on to the helper it calls.
+f=$(drv_fixture forms 'mk_whole() { local name=$1; mkdir -p "$work/$name"; }' \
+    'mk_pre() { mkdir -p "$work/p-$1"; }' 'mk_suf() { : >"$work/$1.s"; }' \
+    'mk_via() { mk_pre "$1"; }' 'rd_pre() { test -e "$work/p-$1"; }' \
+    'fx_build_y() { mkdir -p "$work/y"; }' \
+    'group_r_whole() {' 'mk_whole other' \
+    'expect red "x, which mk_whole x would make" test -e "$work/x"' '}' \
+    'group_r_prefix() {' 'mk_pre x' 'expect red "mk_pre x made p-x" test -e "$work/x"' '}' \
+    'group_r_suffix() {' 'mk_suf x' 'expect red "mk_suf x made x.s" test -e "$work/x"' '}' \
+    'group_r_hand() {' 'mk_via other' 'expect red "mk_via z makes p-z" test -e "$work/p-z"' '}' \
+    'group_r_redirect() {' 'printf a >"$work/x.log"' 'expect red "x" test -e "$work/x"' '}' \
+    'group_r_mkdir() {' 'mkdir -p "$work/y" && expect red "x" test -e "$work/x"' '}' \
+    'group_r_touch() {' 'touch "$work/y" && expect red "x" test -e "$work/x"' '}' \
+    'group_r_mktemp() {' \
+    'mktemp "$work/x.XXXXXX" >/dev/null && expect red "x" test -e "$work/x"' '}' \
+    'group_r_git() {' 'git init -q "$work/y" && expect red "x" test -e "$work/x"' '}' \
+    'group_r_copy() {' 'cp -R "$work/x" "$work/y" 2>/dev/null || :' '}' \
+    'group_r_assign() {' 'INF_X="$work/x" true' '}' \
+    'group_r_builder() {' 'fx_build_y' 'expect red "fx_build_x" test -e "$work/x"' '}' \
+    'group_r_late() {' 'expect red "x" test -e "$work/x"' 'mkdir -p "$work/x"' '}' \
+    'group_r_reader() {' 'expect red "p-x" rd_pre x' '}' \
+    'group_r_glob() {' ': >"$work/o1"' 'expect red "q" ls "$work"/q[12]' '}' \
+    'group_r_loop() {' 'for v in a b; do : >"$work/d-$v"; done' \
+    'expect red "d-x" test -e "$work/d-x"' '}' \
+    'group_r_quoted() {' 'echo '"'"'mkdir -p "$work/x"'"'"' >/dev/null' \
+    'expect red "x" test -e "$work/x"' '}' \
+    'group_r_heredoc() {' 'cat >/dev/null <<'"'"'H'"'"'' 'mkdir -p "$work/x"' 'H' \
+    'expect red "x" test -e "$work/x"' '}' \
+    'group_g_whole() {' 'mk_whole x' 'expect green "mk_whole x made x" test -d "$work/x"' '}' \
+    'group_g_prefix() {' 'mk_pre x' 'expect green "mk_pre x made p-x" test -d "$work/p-x"' '}' \
+    'group_g_suffix() {' 'mk_suf x' 'expect green "mk_suf x made x.s" test -f "$work/x.s"' '}' \
+    'group_g_hand() {' 'mk_via z' 'expect green "mk_via z made p-z" test -d "$work/p-z"' '}' \
+    'group_g_nested() {' 'mk_in() { mkdir -p "$work/n-$1"; }' 'mk_in x' \
+    'expect green "mk_in x made n-x" test -d "$work/n-x"' '}' \
+    'group_g_redirect() {' 'printf a >"$work/x"' 'expect green "x" test -f "$work/x"' '}' \
+    'group_g_mkdir() {' 'mkdir -p "$work/x" && expect green "x" test -d "$work/x"' '}' \
+    'group_g_touch() {' 'touch "$work/x" && expect green "x" test -f "$work/x"' '}' \
+    'group_g_mktemp() {' 'mktemp -d "$work/m.XXXXXX" >/dev/null' \
+    'expect green "m.*" ls -d "$work"/m.*' '}' \
+    'group_g_git() {' 'git init -q "$work/x"' 'expect green "x" test -d "$work/x/.git"' '}' \
+    'group_g_copy() {' 'mkdir -p "$work/x"' 'cp -R "$work/x" "$work/y"' \
+    'expect green "y" test -d "$work/y"' '}' \
+    'group_g_assign() {' 'local d="$work/x"' 'mkdir -p "$d"' \
+    'expect green "x" test -d "$work/x"' '}' \
+    'group_g_builder() {' 'fx_build_y' 'expect green "fx_build_y made y" test -d "$work/y"' '}' \
+    'group_g_reader() {' 'mk_pre x' 'expect green "p-x" rd_pre x' '}' \
+    'group_g_glob() {' ': >"$work/o1"' ': >"$work/o2"' \
+    'expect green "o1, o2" ls "$work"/o[12]' '}' \
+    'group_g_loop() {' \
+    'for v in a b; do : >"$work/d-$v"; expect green "d-$v" test -f "$work/d-$v"; done' '}' \
+    'group_g_log() {' 'expect green "a case" true' 'expect green "its log" test -f "$work/log"' '}')
+drv_forms_red() { # the lint is red, naming each r_ group once and no g_ group
+    local out g n=0
+    out=$(drv_run "$1" --lint 2>&1) && { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out"
+    for g in $(sed -n 's/^group_\(r_[a-z_]*\)() {$/\1/p' "$1"); do
+        n=$((n + 1))
+        [ "$(grep -c "^SELFTEST LINT: group_$g: " <<<"$out")" -eq 1 ] || {
+            echo "group_$g is not named once"
+            return 1
+        }
+    done
+    [ "$n" -eq 18 ] && ! grep -q '^SELFTEST LINT: group_g_' <<<"$out" &&
+        grep -qx "selftest lint: .* calls followed, $n unbuilt fixture(s)" <<<"$out"
+}
+expect green "driver: the lint refuses the unbuilt read of each of 18 forms, naming its group" \
+    drv_forms_red "$f"
+drv_forms_green() { # each g_ group runs green: what the lint counts as made exists
+    local g n=0
+    for g in $(sed -n 's/^group_\(g_[a-z_]*\)() {$/\1/p' "$1"); do
+        n=$((n + 1))
+        drv_run "$1" --group "$g" >"$work/drv-forms-$g.log" 2>&1 &&
+            grep -q "^group $g: [1-9][0-9]* 0$" "$work/drv-forms-$g.log" || {
+            cat "$work/drv-forms-$g.log"
+            return 1
+        }
+    done
+    [ "$n" -eq 17 ]
+}
+expect green "driver: each of 17 forms the lint counts as making makes what it reads (controls)" \
+    drv_forms_green "$f"
+# Two groups at once: each waits until the other has started (so they overlap),
+# then finds its own fixture and not the other's, and its own case log only.
+f=$(drv_fixture overlap \
+    'drv_meet() { : >"$DRV_SYNC/$1"; n=0; while [ ! -e "$DRV_SYNC/$2" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done; [ -e "$DRV_SYNC/$2" ]; }' \
+    'group_one() {' 'printf one >"$work/mine"' 'expect green "one overlaps two" drv_meet one two' \
+    'expect green "one sees its own fixture" grep -qx one "$work/mine"' '}' \
+    'group_two() {' 'printf two >"$work/mine"' 'expect green "two overlaps one" drv_meet two one' \
+    'expect green "two sees its own fixture" grep -qx two "$work/mine"' '}')
+mkdir -p "$work/drv-sync" "$work/drv-log"
+expect_output "driver: two groups at once each see only their own fixture" \
+    "check-scripts self-test OK (4 cases in 2 groups" \
+    env DRV_SYNC="$work/drv-sync" INF_SELFTEST_CASE_LOG="$work/drv-log" CARGO_BUILD_JOBS=2 "$f"
+drv_own_log() { # each group's records hold its own labels only
+    [ "$(cat "$work/drv-log/one/"* | grep -c '^label	one ')" -eq 2 ] &&
+        [ "$(cat "$work/drv-log/two/"* | grep -c '^label	two ')" -eq 2 ] &&
+        ! cat "$work/drv-log/one/"* | grep -q '^label	two ' &&
+        ! cat "$work/drv-log/two/"* | grep -q '^label	one '
+}
+expect green "driver: two groups at once each write only their own case log" drv_own_log
+}
 
 # The gates' crate set (scripts/cell-crates.sh) names exclusions that must
 # exist; a fixture root carries each of them as an empty `src/` so the
@@ -189,7 +282,12 @@ fixture() {
     echo "$root"
 }
 
+# fx_build_empty: an empty root with an empty crates/, the shape every gate's
+# scope assertion refuses; each group that reads it builds it.
+fx_build_empty() { mkdir -p "$work/empty/crates"; }
+
 # ---------------------------------------------------------------- deny-list
+group_deny_list() {
 DENY=./scripts/check-cell-denylist.sh
 
 IFS= read -r -d '' body <<'EOF' || true
@@ -200,7 +298,7 @@ expect green "deny-list: clean crate" env INF_CHECK_ROOT="$root" $DENY
 expect_output "deny-list: scope line discloses the scan" "1 crates, 1 files, 1 lines scanned" env INF_CHECK_ROOT="$root" $DENY
 
 # The P1 shape: the configured set resolves to nothing.
-mkdir -p "$work/empty/crates"
+fx_build_empty
 expect red "deny-list: no crates at all is a failure, not OK" env INF_CHECK_ROOT="$work/empty" $DENY
 
 # A stale exclusion (a path that evaporated) is a failure.
@@ -328,8 +426,10 @@ pub fn t() -> std::time::Instant { std::time::Instant::now() }
 EOF
 root=$(printf '%s' "$body" | fixture unterminated)
 expect red "deny-list: an unterminated test module is a scope error" env INF_CHECK_ROOT="$root" $DENY
+}
 
 # --------------------------------------------------------------- panic policy
+group_panic_policy() {
 PANIC=./scripts/check-panic-policy.sh
 
 IFS= read -r -d '' body <<'EOF' || true
@@ -397,9 +497,12 @@ EOF
 root=$(printf '%s' "$body" | fixture pbare)
 expect red "panic-policy: a bare marker without a reason fails" env INF_CHECK_ROOT="$root" $PANIC
 
+fx_build_empty
 expect red "panic-policy: no crates at all is a failure, not OK" env INF_CHECK_ROOT="$work/empty" $PANIC
+}
 
 # ------------------------------------------------------------ reply outcome
+group_reply_outcome() {
 # ADR-0190 D4: no production site of crates/inf-server/src reads a reply's
 # outcome from its bytes. Each fixture is one inf-server lib.rs (and a
 # test-only modfile where the case needs one).
@@ -514,9 +617,12 @@ expect green "reply-outcome: a comment naming a shape is not a site" env INF_CHE
 mkdir -p "$work/roempty/crates/inf-server/src"
 expect_red_because "reply-outcome: an empty file set is a scope error" "REPLY-OUTCOME SCOPE ERROR" \
     env INF_CHECK_ROOT="$work/roempty" $REPLY
+fx_build_empty
 expect red "reply-outcome: a missing directory is a scope error" env INF_CHECK_ROOT="$work/empty" $REPLY
+}
 
 # ---------------------------------------------------------------- run-sweep
+group_run_sweep() {
 # A stub simulator driven by env: which shard exits non-zero, which shard
 # reports violations, which shard writes no manifest.
 stub="$work/inf-sim-stub"
@@ -547,8 +653,10 @@ expect green "run-sweep: all shards clean" env INF_SIM_BIN="$stub" INF_SWEEP_SHA
 expect red "run-sweep: one shard exits non-zero (the bare-wait gap)" env INF_SIM_BIN="$stub" INF_SWEEP_SHARDS=4 STUB_EXIT_ONE=2 $SWEEP stub 8 0x1
 expect red "run-sweep: one shard reports violations" env INF_SIM_BIN="$stub" INF_SWEEP_SHARDS=4 STUB_VIOLATING=3 $SWEEP stub 8 0x1
 expect red "run-sweep: one shard writes no manifest" env INF_SIM_BIN="$stub" INF_SWEEP_SHARDS=4 STUB_NO_MANIFEST=0 $SWEEP stub 8 0x1
+}
 
 # ------------------------------------------------------ shipping features
+group_shipping_features() {
 # ADR-0107 (F-L16-01): the manifest scan runs on fixture roots (the
 # resolver half needs a real workspace and is skipped under INF_CHECK_ROOT).
 SHIP=./scripts/check-shipping-features.sh
@@ -666,8 +774,10 @@ inf-store = { workspace = true, features = ["test-support"] }
 EOF
 root=$(printf '%s' "$body" | manifest ship-test-support-dev)
 expect green "shipping: test-support declared, and requested on a dev edge only" env INF_CHECK_ROOT="$root" $SHIP
+}
 
 # ------------------------------------------------ planted-bug canary driver
+group_sim_canaries() {
 # ADR-0139: `sim-canaries.sh` judges a crate-test row by the named test's
 # own verdict line. A stub cargo prints a canned test log: with RUSTFLAGS
 # set it is the planted build, without it the plain one.
@@ -782,8 +892,10 @@ dir=$(loom_fixture loom-no-control "$witness_line" "$failed_line")
 expect red "canaries: a loom model red on the plain loom build is no control leg" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture loom fake the_row" >"$work/canary-short-loom-row"
 expect red "canaries: a loom row without its witness is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-short-loom-row" INF_CANARY_CARGO="$dir/cargo" $CANARY
+}
 
 # --------------------------------------------------- release-assert inventory
+group_release_asserts() {
 # ADR-0107 D2: a fixture crate with one release assert and one expect, and
 # the inventory that names them; each planted drift is red.
 RELEASE=./scripts/check-release-asserts.sh
@@ -956,8 +1068,10 @@ inventory "$root" <<'EOF'
 # nothing: debug asserts are not release sites
 EOF
 expect red "release-asserts: an inventory with no rows is a scope failure" env INF_CHECK_ROOT="$root" $RELEASE
+}
 
 # ---------------------------------------------------------------- clock ban
+group_clock_ban() {
 # ADR-0106 first amendment (review 2026-08-30 F-L18-05): the type-resolved
 # clock ban's gate. Steps 1–3 run on fixtures (the real clippy.toml copied
 # in); the cargo-driven probe (step 4) is fixture-skipped and disclosed,
@@ -987,8 +1101,10 @@ expect red "clock-ban: a shadow clippy.toml in a crate directory is red" env INF
 
 # Suppression plants moved to the generated lint-scopes matrix below, the
 # single owner of all classes and scopes (ADR-0144 I8).
+}
 
 # ------------------------------------------------------- waker atomics (D8)
+group_waker_atomics() {
 # ADR-0106 second amendment (review 2026-08-30 F-L20-03). The gate's three
 # defects were all in the scan, so the fixtures ARE synthetic asm: a
 # `.Lfunc_beginN:` on the body's first line (the old awk reset there and
@@ -1199,8 +1315,10 @@ expect_red_because "waker probe: an off-path atomic the scanner cannot see is a 
     env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 expect_red_because "waker probe: the probe-asm hook outside fixture mode is refused" \
     "INF_WAKER_PROBE_ASM without INF_WAKER_ASM" env INF_WAKER_PROBE_ASM="$pasm" $WAKER
+}
 
 # ------------------------------------------------------- fault points (D9)
+group_fault_points() {
 # ADR-0106 second amendment (review 2026-08-30 F-L20-04): "exercised" used
 # to mean any textual mention, so a `//!` doc line and an assert's message
 # string kept `shadow_twin_read_fail` green with zero arming sites.
@@ -1258,8 +1376,10 @@ mod tests {
     fn f() { inf_foundation::fault::fire(crate::fault::P_ONE); }
 }' 'fn t() { fault::arm(fake::fault::P_ONE, FaultSpec::Nth(1)); }')
 expect red "fault-points: a fire site that exists only in a test module is unwired" env INF_CHECK_ROOT="$root" $FAULTS
+}
 
 # ---------------------------------------------------- fsync fail-stop (D10)
+group_fsync_fail_stop() {
 # ADR-0106 second amendment (review 2026-08-30 F-L20-06): the allow-list was
 # per file, so a catch-and-continue inside a 1,722-line allow-listed file
 # passed; and the pattern set was five hand-listed names, blind to a raw
@@ -1380,11 +1500,14 @@ expect green "fsync: a test-only module is stripped" env INF_CHECK_ROOT="$root" 
 # shim, so they are a Python suite; its cases join this script's tally.
 inventory_dag_log="$work/inventory-dag.log"
 if python3 "$SCRIPT_DIR/check-inventory-dag-selftest.py" >"$inventory_dag_log" 2>&1; then
-    pass=$((pass + $(sed -n 's/^Ran \([0-9]*\) tests.*/\1/p' "$inventory_dag_log")))
+    inventory_dag_cases=$(sed -n 's/^Ran \([0-9]*\) tests.*/\1/p' "$inventory_dag_log")
+    pass=$((pass + $inventory_dag_cases))
+    case_log "inventory / dep-DAG fixtures" green 0 pass "$inventory_dag_log" "$inventory_dag_cases"
 else
     fail=$((fail + 1))
     echo "SELFTEST FAIL: inventory / dep-DAG fixtures"
     sed 's/^/    | /' "$inventory_dag_log"
+    case_log "inventory / dep-DAG fixtures" green 1 fail "$inventory_dag_log"
 fi
 
 # Batch 64 (the 100-column gate wraps long reasons): the marker heads the
@@ -1411,12 +1534,12 @@ impl Commit {
 RS
 )
 expect red "fsync-fail-stop: a marker separated from the site by code guards nothing" env INF_CHECK_ROOT="$root" $FSYNC
+}
 
 # ------------------------------------------------- unsafe roots (batch 44)
 # ADR-0121 (review 2026-08-30 F-L17-09): `inf-alloc` and `inf-runtime` — the
 # two named audited leaves — carried no root attribute at all, so a new
 # unsafe block anywhere in them produced no lint and no diff signal.
-ROOTS=./scripts/check-unsafe-roots.sh
 unsafe_fixture() { # <name> <crate> <lib.rs body> [module file] [module body]
     local root="$work/$1"
     [ -n "$1" ] && [ -n "$2" ] && [ -n "$work" ] || { echo "unsafe_fixture: empty name" >&2; exit 2; }
@@ -1427,6 +1550,8 @@ unsafe_fixture() { # <name> <crate> <lib.rs body> [module file] [module body]
     if [ -n "${4:-}" ]; then printf '%s\n' "$5" >"$root/crates/$2/src/$4"; fi
     echo "$root"
 }
+group_unsafe_roots() {
+ROOTS=./scripts/check-unsafe-roots.sh
 root=$(unsafe_fixture ur-forbid safe '#![forbid(unsafe_code)]
 pub fn f() {}')
 expect green "unsafe-roots: a forbid root outside the leaf list" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="" $ROOTS
@@ -1486,8 +1611,10 @@ expect red "unsafe-roots: a manifest with no crate root is a scope error" env IN
 mkdir -p "$work/ur-empty/crates" "$work/ur-empty/bins" "$work/ur-empty/tests"
 expect red "unsafe-roots: zero crate roots is a scope error" env INF_CHECK_ROOT="$work/ur-empty" INF_UNSAFE_LEAVES="" $ROOTS
 expect red "unsafe-roots: a missing top-level directory is a scope error" env INF_CHECK_ROOT="$work/ur-empty/crates" INF_UNSAFE_LEAVES="" $ROOTS
+}
 
 # ---------------------------------------------- safety inventory (batch 44)
+group_safety_inventory() {
 # The verdict line below had claimed this gate since ADR-0106 with no
 # case behind it (found while adding the unsafe-roots cases).
 INVENTORY=./scripts/check-safety-inventory.sh
@@ -1499,8 +1626,10 @@ printf '| `src/m.rs` | invariant | coverage |\n' >"$root/crates/leaf/SAFETY.md"
 expect green "safety-inventory: the file named by its exact path" env INF_CHECK_ROOT="$root" $INVENTORY
 printf '| `src/m.rs.old` | invariant | coverage |\n' >"$root/crates/leaf/SAFETY.md"
 expect red "safety-inventory: a path that only contains the file name is not naming it" env INF_CHECK_ROOT="$root" $INVENTORY
+}
 
 # --------------------------------------------- style limits (ADR-0125, batch 64)
+group_style_limits() {
 FILELEN=./scripts/check-file-length.sh
 LINEW=./scripts/check-line-width.sh
 # Batch 69 (ADR-0106 D2, macOS tier): a heredoc inside `$( )` whose body
@@ -1543,7 +1672,10 @@ printf '// %s\n' "$(printf 'z%.0s' $(seq 1 120))" >"$root/tests/t/t.rs"
 expect red "line-width: tests/ is in scope" env INF_CHECK_ROOT="$root" $LINEW
 [ -n "$root" ] && [ -d "$root/tests" ] && rm -rf "$root/tests"
 expect red "line-width: a missing tests/ is a scope error" env INF_CHECK_ROOT="$root" $LINEW
+}
+
 # ------------------------------------------------------------ lint-ratchet
+group_lint_ratchet() {
 # ADR-0144 D3 (absorbs ADR-0125's fn-length ratchet). Fixtures are captured
 # clippy JSON; the approved copies are real commits in a fixture repository.
 RATCHET="$SCRIPT_DIR/check-lint-ratchet.sh"
@@ -1657,8 +1789,93 @@ printf 't/x\t%s::gone\tcast,arith\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
 expect red "lint-ratchet: an item scope naming no function is a scope error" rt_run "$root"
 printf 't/x\t%s\tcast,bogus\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
 expect red "lint-ratchet: an unknown lint family is a scope error" rt_run "$root"
+# The calls: both clippy passes run in the gate's own target directory under
+# the caller's target root, `${CARGO_TARGET_DIR:-target}/lint-ratchet` (a pass
+# in the recipe's target would re-check every member at each switch of lint
+# arguments), with the lint set the backlog counts. A stub cargo first on PATH
+# records each call; a copy of the gate with one part of a call changed is red.
+RT_BIN="$work/rt-bin"
+mkdir -p "$RT_BIN"
+IFS= read -r -d '' body <<'EOF' || true
+#!/usr/bin/env bash
+# The stub cargo: records the call, then reports a finished build.
+set -eu
+{
+    printf 'call:'
+    printf ' %s' "$@"
+    printf '\n'
+} >>"$RT_CALLS"
+printf '{"reason":"build-finished","success":true}\n'
+EOF
+printf '%s' "$body" >"$RT_BIN/cargo"
+chmod +x "$RT_BIN/cargo"
+root=$(rt_root rt-call)
+printf '# no rows\n' >"$root/docs/lint-baseline.tsv"
+printf 'too-many-lines-threshold = 70\n' >"$root/clippy.toml"
+rt_call_run() { # <gate> <root> [CARGO_TARGET_DIR]: the gate's cargo passes, recorded
+    rm -f "$2.calls"
+    if [ -n "${3:-}" ]; then
+        env PATH="$RT_BIN:$PATH" RT_CALLS="$2.calls" CARGO_TARGET_DIR="$3" INF_CHECK_ROOT="$2" \
+            INF_LINT_BASE_REF=base-tip INF_LINT_RATCHET_HOST=Linux "$1"
+    else
+        env -u CARGO_TARGET_DIR PATH="$RT_BIN:$PATH" RT_CALLS="$2.calls" INF_CHECK_ROOT="$2" \
+            INF_LINT_BASE_REF=base-tip INF_LINT_RATCHET_HOST=Linux "$1"
+    fi
+}
+rt_calls_ok() { # <calls file> <the target directory both calls must name>
+    python3 - "$1" "$2" <<'PY'
+import sys
+calls = [line.split(" ")[1:] for line in open(sys.argv[1], encoding="utf-8").read().split("\n") if line]
+lints = ["-W", "clippy::too_many_lines", "-W", "clippy::cast_possible_truncation",
+         "-W", "clippy::cast_sign_loss", "-W", "clippy::cast_possible_wrap",
+         "-W", "clippy::arithmetic_side_effects", "--force-warn", "clippy::disallowed_methods",
+         "--force-warn", "clippy::disallowed_types"]
+tail = ["--lib", "--bins", "--message-format=json", "--target-dir", sys.argv[2], "--", *lints]
+want = [["clippy", "--workspace", "--exclude", "inf-sim", *tail],
+        ["clippy", "-p", "inf-sim", "--features", "dst", *tail]]
+if calls != want:
+    print("calls:", *(" ".join(c) for c in calls), sep="\n    ")
+    sys.exit(1)
+PY
+}
+# The verdict reads the passes' output (the scope audit the gate runs next needs
+# a real tree, so its status here is not the case's).
+expect_output "lint-ratchet: the verdict reads the recorded passes' report" \
+    "lint-ratchet OK: no backlog" rt_call_run "$RATCHET" "$root"
+expect green "lint-ratchet: both passes name target/lint-ratchet, CARGO_TARGET_DIR unset" \
+    rt_calls_ok "$root.calls" target/lint-ratchet
+rt_target="$work/rt-target"
+rt_call_run "$RATCHET" "$root" "$rt_target" >/dev/null 2>&1 || true
+expect green "lint-ratchet: both passes name \$CARGO_TARGET_DIR/lint-ratchet when it is set" \
+    rt_calls_ok "$root.calls" "$rt_target/lint-ratchet"
+rt_mutant() { # <name> <sed expression> <CARGO_TARGET_DIR or ''> <what the copy does>
+    local dir="$work/rt-gate-$1" want=target/lint-ratchet
+    rm -rf "${dir:?}"
+    mkdir -p "$dir"
+    cp "$SCRIPT_DIR/lint_scope_table.py" "$dir/"
+    sed "$2" "$RATCHET" >"$dir/check-lint-ratchet.sh"
+    chmod +x "$dir/check-lint-ratchet.sh"
+    if cmp -s "$RATCHET" "$dir/check-lint-ratchet.sh"; then
+        echo "selftest: the lint-ratchet mutant '$1' changed nothing" >&2
+        exit 2
+    fi
+    [ -z "$3" ] || want="$3/lint-ratchet"
+    rt_call_run "$dir/check-lint-ratchet.sh" "$root" "$3" >/dev/null 2>&1 || true
+    expect red "lint-ratchet: the calls' check is red on a gate that $4" rt_calls_ok "$root.calls" "$want"
+}
+rt_mutant shared 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/lint-ratchet"$|TARGET_DIR="${CARGO_TARGET_DIR:-target}"|' \
+    '' "shares the recipe's target directory"
+rt_mutant fixed 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/lint-ratchet"$|TARGET_DIR="target/lint-ratchet"|' \
+    "$rt_target" "ignores CARGO_TARGET_DIR"
+rt_mutant second 's|^            --target-dir "$TARGET_DIR" -- $LINTS$|            -- $LINTS|' \
+    '' "drops the simulator pass's --target-dir"
+rt_mutant first 's|^            --target-dir "$TARGET_DIR" -- $LINTS &&$|            -- $LINTS \&\&|' \
+    '' "drops the workspace pass's --target-dir"
+rt_mutant lint 's/^LINTS="-W clippy::too_many_lines /LINTS="/' '' "drops a lint the backlog counts"
+}
 
 # ---------------------------------------------------------- doc artifacts
+group_doc_artifacts() {
 DOCS=./scripts/check-doc-artifacts.sh
 doc_case="$work/doc-artifacts"
 doc_root="$doc_case/infinitydb"
@@ -1736,6 +1953,7 @@ for output in .artifacts/gate.log artifacts/claim.json tests/fuzz/artifacts/cras
     expect red "docs: tracked output is forbidden ($output)" env INF_CHECK_ROOT="$doc_root" $DOCS
     fx_git "$doc_root" rm -q --cached -f "$output"
 done
+}
 
 # ------------------------------------------------------------- lint-scopes
 # ADR-0144 D1/D2: the crate-root wildcard deny, the structural suppression
@@ -1748,6 +1966,9 @@ done
 # clippy.toml beside it as in the workspace: its code unchanged, its two
 # constants set to the fixture's own by ls_gate (a container table's sum is
 # its CONTAINER_EXEMPTIONS_MAX exactly, so an empty fixture table runs at 0).
+# ls_setup: the gate copy every lint-scopes group runs, built in its own work
+# directory, its two constants at 0.
+ls_setup() {
 LS_GATE="$work/gate"
 mkdir -p "$LS_GATE/crates"
 cp -R "$SCRIPT_DIR" "$LS_GATE/scripts"
@@ -1761,6 +1982,8 @@ sed 's|^members = .*|members = ["crates/*"]|' Cargo.toml >"$LS_GATE/Cargo.toml"
 grep -q '^members = \["crates/\*"\]$' "$LS_GATE/Cargo.toml" ||
     { echo "selftest: the gate copy's workspace members were not rewritten" >&2; exit 2; }
 LINTSCOPES="$LS_GATE/scripts/check-lint-scopes.sh"
+ls_gate 0 0
+}
 ls_gate() { # <maximum> <backing sites>
     sed -i.bak -e "s/^CONTAINER_EXEMPTIONS_MAX=[0-9][0-9]*\$/CONTAINER_EXEMPTIONS_MAX=$1/" \
         -e "s/^CAPPED_BACKING_SITES=[0-9][0-9]*\$/CAPPED_BACKING_SITES=$2/" "$LINTSCOPES"
@@ -1768,7 +1991,6 @@ ls_gate() { # <maximum> <backing sites>
     grep -q "^CONTAINER_EXEMPTIONS_MAX=$1\$" "$LINTSCOPES" && grep -q "^CAPPED_BACKING_SITES=$2\$" "$LINTSCOPES" ||
         { echo "ls_gate: the gate's constants are not where the copy sets them" >&2; exit 2; }
 }
-ls_gate 0 0
 LS_ATTR='#![cfg_attr(
     not(test),
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
@@ -1825,6 +2047,10 @@ ls_root() {
 }
 ls_run() { env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip "$LINTSCOPES"; }
 ls_commit() { fx_git "$1" add -A && fx_git "$1" -c user.name=t -c user.email=t@t commit -q -m "$2"; }
+ls_probe() { env INF_CHECK_ROOT="$root" INF_LINT_BASE_REF=base-tip INF_LINT_PROBE=on INF_LINT_PROBE_SRC="$1" "$LINTSCOPES"; }
+
+group_lint_scopes_audit() {
+ls_setup
 root=$(ls_root ls-clean)
 expect green "lint-scopes: clean roots, empty table" ls_run "$root"
 printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
@@ -1950,6 +2176,10 @@ expect_output "lint-scopes: every allow is listed on the OK line" "allow: crates
 pub fn f() {}" >/dev/null
     echo "$root"
 )"
+}
+
+group_lint_scopes_table() {
+ls_setup
 # the scope table (ADR-0144 D2): targets and rows name each other, and a
 # `deny` row's file carries the attribute
 root=$(ls_root ls-table)
@@ -2076,6 +2306,7 @@ fx_git "$root" checkout -q -b feature
 fx_git "$root" branch -q -f base-tip HEAD
 fx_git "$root" rm -q -f docs/lint-exemptions.tsv
 expect red "lint-scopes: a table deleted from under the gate is not a bootstrap" ls_run "$root"
+}
 
 # ADR-0163 D2: the container exemption table. The fixture's compiler output
 # is synthesized from its source (one `disallowed_types` span per banned
@@ -2253,6 +2484,8 @@ lc_reset() {
         mkdir -p "$root/${entry%%|*}"  # git keeps no empty directory
     done
 }
+# lc_setup: the container fixture at its committed table, the gate at its sum.
+lc_setup() {
 root=$(ls_root ls-containers)
 printf '%s\npub mod a;\n' "$LS_ATTR" >"$root/crates/fake/src/lib.rs"
 printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$LC_MAX" >"$root/scripts/check-lint-scopes.sh"
@@ -2261,6 +2494,11 @@ lc_table
 ls_commit "$root" containers
 fx_git "$root" branch -q -f base-tip HEAD
 ls_gate "$LC_MAX" 0
+}
+
+group_lint_scopes_containers() {
+ls_setup
+lc_setup
 expect green "lint-scopes: containers — the table equals the census (control)" lc_run "$root"
 expect_output "lint-scopes: containers — no Lossy opt-in reads 0 on the OK line" \
     "0 Lossy payload(s)" lc_run "$root"
@@ -2613,6 +2851,11 @@ lc_reset
 lc_row_set "$LC_A" 'struct Exempt' expiry 2099-01-01
 expect green "lint-scopes: containers — a date moved earlier (control)" lc_run "$root"
 lc_reset
+}
+
+group_lint_scopes_moves() {
+ls_setup
+lc_setup
 # ADR-0163 A1: a row moves later only up to its record's date on the gate's
 # CONTAINER_EXPIRY_MOVES line (a ceiling); the line's own dates only move
 # earlier, and a record joins it only by the ADR that changes the rule,
@@ -2905,12 +3148,14 @@ lc_row_set "$LC_A" 'struct Exempt' count 2
 ls_commit "$root" "a raise, committed"
 expect_red_because "lint-scopes: containers — a committed raise is red against the introducing commit" \
     "record T counts sum to 4, above the introducing commit's 3" lc_run "$root"
+}
 
+group_lint_scopes_probe() {
+ls_setup
 # the probe's judge: a plant that compiles clean, and a plant that fails
 # for an unrelated reason, are both red (ADR-0144 D5's probe rule).
 ls_gate 0 0
 root=$(ls_root ls-probe)
-ls_probe() { env INF_CHECK_ROOT="$root" INF_LINT_BASE_REF=base-tip INF_LINT_PROBE=on INF_LINT_PROBE_SRC="$1" "$LINTSCOPES"; }
 expect green "lint-scopes: stable plants draw their lints and the unstable call is refused" ls_probe "$SCRIPT_DIR/lint-scope-probe"
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-inert"
 sed -i.bak 's|Three::B \| Three::C => 0, // CONTROL|Three::B \| Three::C => 0, // PLANT clippy::wildcard_enum_match_arm|' "$work/probe-inert/src/lib.rs"
@@ -3003,6 +3248,11 @@ ls_arch_probe probe-allow-invalid \
     "path = \"core::arch::$LS_ARCH::_no_such_intrinsic\", reason = \"plant\", allow-invalid = true"
 expect_red_because "lint-scopes: allow-invalid, which silences an inert entry, is red" \
     "core::arch::$LS_ARCH::_no_such_intrinsic carries allow-invalid" ls_probe "$work/probe-allow-invalid"
+}
+
+group_lint_scopes_legs() {
+# shellcheck source=probe-target.sh
+. "$SCRIPT_DIR/probe-target.sh"
 # probe-target.sh defers an entry under another leg's `core::arch` to that
 # leg, so each architecture of PROBE_LEG_ARCHES needs a build-test matrix leg
 # that runs every probe gate with no `if:` or `continue-on-error:`, and no
@@ -3145,7 +3395,11 @@ awk -v a="    env:" -v b="      INF_FUZZ_CARGO: /bin/true" \
     '{ print } $0 == "    runs-on: ${{ matrix.os }}" { print a; print b }' "$LS_WF" >"$work/wf-fuzz-cargo.yml"
 expect_red_because "probe-target: a job env that replaces the fuzz-target gate's cargo is red" \
     "\`INF_FUZZ_CARGO\` is set where the probe gates inherit it" legs_cover "$work/wf-fuzz-cargo.yml"
+}
 
+group_lint_scopes_unstable() {
+ls_setup
+root=$(ls_root ls-probe)
 # ADR-0144 A1: keep the unstable refusal distinct from Clippy witnesses.
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-stable"
 sed -i.bak 's|std::fs::set_times(path, std::fs::FileTimes::new())|std::fs::metadata(path)|' "$work/probe-unstable-stable/unstable/set_times.rs"
@@ -3215,7 +3469,9 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-discard-published"
 sed -i.bak 's|        let _ = slot.publish(1); // PLANT clippy::let_unit_value|        slot.publish(1); // PLANT clippy::let_unit_value|' "$work/probe-discard-published/src/discards.rs"
 expect_red_because "lint-scopes: a publish that is not discarded draws no discard lint" \
     "did NOT draw clippy::let_unit_value" ls_probe "$work/probe-discard-published"
+}
 
+group_parent_doc_gates() {
 # ADR-0164: the parent doc gates state their scope — a standalone checkout
 # skips out loud; a parent whose gates are missing is red, not a skip.
 PARENT=$SCRIPT_DIR/check-parent-doc-gates.sh
@@ -3302,7 +3558,9 @@ for pd_gate in "${PD_GATES[@]}"; do
     expect red "parent-doc-gates: a runner that drops $pd_gate is red" \
         pd_ran "$work/pd-drop-$pd_gate" full "$pd_gate"
 done
+}
 
+group_arith_spellings() {
 # ADR-0165 D2: the spelling table equals the tree, both ways; comments, test
 # modules and code outside an item scope are not sites.
 SPELL=$SCRIPT_DIR/check-arith-spellings.sh
@@ -3375,8 +3633,10 @@ expect green "arith-spellings: an item scope counts inside its fn" \
     env INF_CHECK_ROOT="$work/as-item" "$SPELL"
 as_root item-wide "$D::g" "saturating	2	$D::g"
 as_red item-wide "g: 1 .saturating_.. call(s), docs/arith-spellings.tsv says 2"
+}
 
 # ------------------------------------------------- fuzz targets (ADR-0198)
+group_fuzz_targets() {
 # check-fuzz-targets.sh on fixture roots, each its own git repository, with a
 # stub cargo (INF_FUZZ_CARGO) that records each call and answers from the
 # files a case writes beside the root: the census rows (C1–C7, H1–H3), cargo's
@@ -3557,6 +3817,7 @@ fz_matrix_red() { # <root> [<mode>]
 
 root=$(fz_root clean)
 fz_once "$root.log" fz_run "$root"
+FZ_CLEAN_LOG=$root.log  # read again where the probe manifests are judged (C4)
 expect green "fuzz-targets: a clean two-target root" fz_replay "$root.log"
 expect_output "fuzz-targets: the OK line counts what it compiled and read" \
     "fuzz-targets OK: 2 fuzz workspaces, 2 of 2 targets compiled (2 .*bin.* rows, 2 files)" \
@@ -3729,7 +3990,7 @@ expect_red_because "fuzz-targets: C4: a workspace-inherited dependency of a prob
 expect green "fuzz-targets: C4: a probe's path dependency on a manifest of the tree" \
     fz_lacks "$FZ_C4 .a.," "$root.log"
 expect_output "fuzz-targets: the OK line says no probe names a third-party crate" \
-    "5 probe manifests, each run by its gate and naming no third-party crate" fz_replay "$work/fz-clean.log"
+    "5 probe manifests, each run by its gate and naming no third-party crate" fz_replay "$FZ_CLEAN_LOG"
 # C5: one row a file, at fuzz_targets/<name>.rs, each name once.
 root=$(fz_root c5-file)
 printf 'fn main() {}\n' >"$root/crates/a/fuzz/fuzz_targets/x.rs"
@@ -3926,6 +4187,7 @@ Caused by:
     Checking a-fuzz v0.0.0
 warning: build failed, waiting for other jobs to finish..."
 fz_once "$root.log" fz_run "$root"
+FZ_K1_BLOCK_LOG=$root.log  # read again after the refused-lock cases
 expect_red_because "fuzz-targets: K1 prints cargo's Caused by: chain" "^    Caused by:$" \
     fz_replay "$root.log"
 expect_output "fuzz-targets: K1 prints a build script's reason" \
@@ -3961,7 +4223,7 @@ expect_output "fuzz-targets: K1 names the refresh of a refused lock" \
 expect_output "fuzz-targets: K1 names the lock to commit" "then commit crates/a/fuzz/Cargo.lock$" \
     fz_replay "$root.log"
 expect green "fuzz-targets: no refresh is named for another cargo error" fz_lacks " fix: cargo update" \
-    "$work/fz-k1-block.log"
+    "$FZ_K1_BLOCK_LOG"
 fz_answer "$FZ_KROOT" crates/a/fuzz/Cargo.toml t_one
 fz_once "$FZ_KROOT.log" fz_run "$FZ_KROOT"
 expect_red_because "fuzz-targets: K2: cargo exits 0 having compiled one of two bins" \
@@ -4137,7 +4399,10 @@ expect green "fuzz-targets: a matrix scope error prints no matrix, its reason on
 expect green "fuzz-targets: an empty census prints no deny matrix" fz_matrix_red "$root" deny
 expect_red_because "fuzz-targets: an unknown matrix" "usage: check-fuzz-targets.sh" \
     env INF_CHECK_ROOT="$root" "$FUZZ" --matrix weekly
+}
 
+group_fuzz_matrices() {
+FUZZ=./scripts/check-fuzz-targets.sh
 # The workflows and the local deny recipe read the census (ADR-0198 D3, D6):
 # every fuzz run and every cargo-deny call, each judged by its own rule
 # wherever it sits (a step holding both is red), is in a job whose matrix is
@@ -4807,10 +5072,6 @@ dr_red_census() {
     ! dr_run "$DR/recipe.sh" '' 1 - && ! grep -q 'deny OK' "$DR/out" && dr_legs 0
 }
 expect green "deny: a red census runs no leg" dr_red_census
+}
 
-# ----------------------------------------------------------------- verdict
-if [ "$fail" -ne 0 ]; then
-    echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
-    exit 1
-fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, reply-outcome, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, parent-doc-gates, arith-spellings, lint-scopes, fuzz-targets each exiting non-zero on its planted case)"
+selftest_main "$SCRIPT_DIR/check-scripts-selftest.sh" "$@"

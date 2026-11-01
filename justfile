@@ -53,9 +53,6 @@ check:
     # warnings denied, under its committed lock and cfg(fuzzing), and a probe
     # of planted reds proves the gate sees each shape it guards.
     ./scripts/check-fuzz-targets.sh
-    # ADR-0106: the gates above must go red on a planted violation, or
-    # their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
-    ./scripts/check-scripts-selftest.sh
     # ADR-0106 first amendment (review 2026-08-30 F-L18-05): the ambient-
     # clock ban is clippy's type-resolved disallowed-methods; this gate
     # proves the config is in force on planted bypass spellings; the
@@ -65,6 +62,10 @@ check:
     # AC's own gate ran nowhere and scanned zero instructions per waker.
     ./scripts/check-waker-atomics.sh
     cargo clippy --workspace --all-targets -- -D warnings
+    # ADR-0106: the gates above must go red on a planted violation, or
+    # their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
+    # It runs after clippy, so a compile or lint red stops the run first.
+    ./scripts/check-scripts-selftest.sh
     cargo test --workspace
     cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings
     cargo test -p inf-doc -p inf-store --features doc-intern-keys
