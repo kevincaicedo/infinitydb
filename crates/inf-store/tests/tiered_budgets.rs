@@ -17,8 +17,9 @@
 //! - **aggregate VA** — creation past the cap fails typed before any
 //!   mmap and leaves nothing behind; drop returns exactly the ring;
 //! - **teardown** — drop removes the table (the `Region` unmaps —
-//!   reserved VA returns structurally), the plane's file half unlinks
-//!   `statvfs`-visibly, and accounting reads zero. The in-flight
+//!   reserved VA returns structurally), the plane's file half closes and
+//!   unlinks every file so that nothing holds its blocks (the shared
+//!   reclaim oracle, ADR-0200 D7), and accounting reads zero. The in-flight
 //!   cold-read half (pins defer unlinks; drained reads complete from
 //!   the still-open fd) is the S08 proof this teardown reuses —
 //!   `cold_hardened.rs::cancellation_and_unlink_discipline_on_uring`
@@ -36,6 +37,9 @@ use inf_log::{
 };
 use inf_store::KeyHasher;
 use inf_store::{Keyspace, NsError, NsMode, NsSpec, StoreConfig, TierSpec, TieredTable};
+
+#[cfg(unix)]
+mod reclaim;
 
 /// A tiered durable spec around `TierSpec::for_budget`, named fields
 /// overridable per test.
@@ -340,10 +344,13 @@ fn disk_pressure_engages_before_the_cap() {
 }
 
 /// The D7 teardown on the real filesystem: drop removes the table (the
-/// reserved VA returns structurally), the plane's file half unlinks
-/// `statvfs`-visibly, and every accounting term reads zero. New access
-/// has nothing to route to — the store answers `None`, which is the
-/// plane's typed refusal.
+/// reserved VA returns structurally), the plane's file half closes and
+/// unlinks every file, and every accounting term reads zero. After the
+/// last unlink this process holds nothing under the root: no regular file
+/// is left, and no descriptor or mapping names an unlinked one (the shared
+/// reclaim oracle, ADR-0200 D7; Linux only for those two halves, the walk
+/// elsewhere). New access has nothing to route to — the store answers
+/// `None`, which is the plane's typed refusal.
 #[cfg(unix)]
 #[test]
 fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
@@ -359,19 +366,6 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
         }
     }
     let _cleanup = Cleanup(root.clone());
-
-    fn avail_bytes(path: &Path) -> u64 {
-        use std::os::unix::ffi::OsStrExt;
-        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
-        // SAFETY: `statvfs` is plain-old-data; the all-zero pattern is a
-        // valid value for every field and the call overwrites it.
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        // SAFETY: `c` is a live NUL-terminated path and `stat` a valid
-        // exclusive out-pointer for the call's duration.
-        let rc = unsafe { libc::statvfs(c.as_ptr(), &mut stat) };
-        assert_eq!(rc, 0, "statvfs");
-        stat.f_bavail as u64 * stat.f_frsize as u64
-    }
 
     let mut ks = Keyspace::new(StoreConfig::default());
     let tier = TierSpec {
@@ -394,7 +388,6 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
         0,
         &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
-    let avail_start = avail_bytes(&root);
 
     // Real data: records to tier files, one value out of line.
     let value = vec![0x33u8; (4 << 10) - 1];
@@ -457,12 +450,16 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
     // The plane's file half (the rig playing the plane, §3.3): unlink
     // every tier file and extent — no pins exist here; the pinned case
     // is the S08 proof cited in the module docs.
+    // The namespace's flush goes with its table first, closing every tier
+    // file it holds (the sealed files' parked handles and the active
+    // writer): a handle still open past its file's unlink keeps its blocks.
     let sealed_metas: Vec<_> = flush.sealed().to_vec();
+    let active = flush.active().map(|(_, _, _, _, path)| path.to_path_buf());
+    drop(flush);
     for meta in &sealed_metas {
-        flush.detach_sealed(meta.id).expect("sealed");
         unlink_tier_file(&StdSegmentFs, meta).expect("unlink tier file");
     }
-    if let Some((_, _, _, _, path)) = flush.active() {
+    if let Some(path) = active {
         std::fs::remove_file(path).expect("unlink active file");
     }
     for id in list_extent_ids(&StdSegmentFs, &ns_dir).expect("listing") {
@@ -473,13 +470,9 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
         .map(|d| d.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();
     assert!(leftover.is_empty(), "the namespace directory emptied: {leftover:?}");
-    // statvfs: the blocks came back (generous slack for shared-box churn).
-    let avail_end = avail_bytes(&root);
-    let slack = 16u64 << 20;
-    assert!(
-        avail_end + slack >= avail_start,
-        "statvfs shows the teardown returned the space (start {avail_start}, end {avail_end})"
-    );
+    // The space returned: nothing is left under the root, and nothing
+    // unlinked is still held.
+    reclaim::assert_reclaimed(&root, &[]);
 }
 
 /// A namespace created without `TIER-IO-MODE` gets a tier file this host's
