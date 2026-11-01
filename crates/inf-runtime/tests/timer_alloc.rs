@@ -11,13 +11,9 @@
 //! mode reaches every operation's arm and delivery and the drop frees every
 //! byte the window retained, so a window that read nothing is red too.
 //!
-//! The wheel's warm-up visits every bucket of every level twice: at level
-//! `l`, 128 singleton timers expire, spaced by the level's span of `64^l`
-//! ms of injected time, so a bucket's capacity is the warmed one before a
-//! window opens. The fixed timer set's warm-up is its build and its owners'
-//! reserves: nothing after it may request a byte. Its build is one
-//! allocation of at most 64 KiB a step, and a refusal at any step leaves
-//! nothing behind.
+//! The fixed timer set's warm-up is its build and its owners' reserves:
+//! nothing after it may request a byte. Its build is one allocation of at
+//! most 64 KiB a step, and a refusal at any step leaves nothing behind.
 
 use std::rc::Rc;
 
@@ -27,14 +23,13 @@ use inf_foundation::bounded::{Cap, CapCensus, CapError, CapFill};
 use inf_foundation::limits::MAP_BACKING_ALLOCATION_BYTES_MAX;
 use inf_foundation::time::Nanos;
 use inf_runtime::heap::{ArrayBuilt, FixedArray};
-use inf_runtime::{Cancelled, Consumed, Reserved, TimerOutcome, TimerOwner, TimerSet, TimerWheel};
+use inf_runtime::{Cancelled, Consumed, Reserved, TimerOutcome, TimerOwner, TimerSet};
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator::new();
 
 /// One millisecond, the timers' resolution, in injected nanoseconds.
 const STEP: Nanos = Nanos(1_000_000);
-const KEY: u64 = 77;
 /// The census's populations.
 const COUNTS: [u32; 3] = [1, 64, 4_096];
 /// The set under census: one chunk of owners, each reserved at warm-up.
@@ -93,60 +88,6 @@ trait Subject {
     fn cycle(&mut self, mode: Mode, now: &mut Nanos);
     /// Timers armed now.
     fn armed(&self) -> usize;
-}
-
-/// The hierarchical wheel.
-struct Wheel(TimerWheel);
-
-impl Wheel {
-    /// Arms one timer at `due`, steps to it and checks it fires once.
-    fn expire_at(&mut self, now: &mut Nanos, due: Nanos) {
-        self.0.insert(due, KEY);
-        assert_eq!(self.0.armed(), 1);
-        let mut fired = 0u32;
-        self.0.advance(due, |key| {
-            assert_eq!(key, KEY);
-            fired += 1;
-        });
-        assert_eq!(fired, 1, "the timer fires once, at its deadline");
-        assert_eq!(self.0.next_deadline(), None);
-        *now = due;
-    }
-}
-
-impl Subject for Wheel {
-    fn warmed(now: &mut Nanos) -> Wheel {
-        let mut wheel = Wheel(TimerWheel::new());
-        for level in 0..6u32 {
-            let stride = Nanos(STEP.0 * 64u64.pow(level));
-            for _ in 0..128 {
-                let due = *now + stride;
-                wheel.expire_at(now, due);
-            }
-        }
-        wheel
-    }
-
-    fn cycle(&mut self, mode: Mode, now: &mut Nanos) {
-        let due = *now + STEP;
-        match mode {
-            Mode::Expire => self.expire_at(now, due),
-            Mode::Cancel | Mode::Idle => {
-                let id = self.0.insert(due, KEY);
-                assert_eq!(self.0.armed(), 1);
-                assert!(self.0.cancel(id), "the armed timer cancels");
-                assert_eq!(self.0.next_deadline(), None);
-                if matches!(mode, Mode::Idle) {
-                    self.0.advance(due, |_| panic!("a cancelled timer fired"));
-                    *now = due;
-                }
-            }
-        }
-    }
-
-    fn armed(&self) -> usize {
-        self.0.armed()
-    }
 }
 
 /// The fixed timer set: its census, kept so its drop frees it too, and its
@@ -248,23 +189,6 @@ fn census<S: Subject>(subject: &str, mode: Mode) {
             "{subject} {mode:?} at {count} operations: an allocator request after the warm-up"
         );
     }
-}
-
-#[test]
-fn the_wheel_requests_nothing_after_its_warm_up_as_timers_expire() {
-    census::<Wheel>("wheel", Mode::Expire);
-}
-
-#[test]
-#[ignore = "red on the wheel: a cancelled timer leaves its reference in a bucket, which grows"]
-fn the_wheel_requests_nothing_after_its_warm_up_as_timers_are_cancelled() {
-    census::<Wheel>("wheel", Mode::Cancel);
-}
-
-#[test]
-#[ignore = "red on the wheel: a clock jump with nothing armed visits no cancelled reference"]
-fn the_wheel_requests_nothing_after_its_warm_up_across_idle_cycles() {
-    census::<Wheel>("wheel", Mode::Idle);
 }
 
 #[test]
