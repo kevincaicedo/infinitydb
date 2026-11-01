@@ -334,6 +334,11 @@ rows=(
   # ADR-0154 D3: a due timer is ready work, which the park decision polls
   # on. Planted, the decision parks on it, at spin_iters 1 and 0.
   "inf_canary_timer_park_hides_due crate-test inf-runtime test:reactor sixty_five_due_timers_take_two_turns_and_no_park callbacks begun per iteration"
+  # ADR-0154 D4: the everysec tick arms its successor a second on. Planted,
+  # it ticks once, so the fill scenario's one everysec writer, with no
+  # always barrier to cover its frames, loses acked writes at the cut, and
+  # the audit's everysec bound reads them.
+  "inf_canary_everysec_no_successor m2-fill-tick DURABILITY"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.

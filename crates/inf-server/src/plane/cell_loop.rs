@@ -14,6 +14,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let Some(cell) = durable.as_mut() else { return TimerOutcome::Complete };
             cell.on_everysec_tick();
         }
+        // Canary: the tick hands back no successor, so it runs once.
+        if cfg!(inf_canary_everysec_no_successor) {
+            return TimerOutcome::Complete;
+        }
         let deadline = cx.now.saturating_add(Nanos::from_secs(1));
         let next = cx
             .timers()
