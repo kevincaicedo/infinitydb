@@ -1398,6 +1398,18 @@ count the arrivals that found it full.
   server's step tests and the sliced end-to-end tests.
   `IckReader` is the pull-based `.ick` loader (`read_ick` reimplemented
   on it; same audit, same fuzz target).
+- > **Accepted 2026-10-04, implementation open — ADR-0174 A1:** the bound
+  > above then reads: a checkpoint or replay step, and each step of the
+  > tiered boot, is bounded by its budget, counted in charged work (the
+  > bytes its cursor passed and its priced boot work: I/O and RAM units),
+  > plus one unit and the frame or section it entered and parked in. A
+  > unit is one record with its settle reads, one checkpoint entry, one
+  > frame's or one section's read and audit, an index-sidecar section's
+  > load, one demote step's flush, one seal or reseal with its barrier, or
+  > one priced read, RAM or file operation. Once its charge reaches the
+  > budget it yields at the next unit, inside a frame or a section. The
+  > log half of a start step, an audit or probe step, and the finish
+  > step's sidecar commit and log resume stay one unit each. Not built.
 - The node boots cells directly into their reactor loops:
   `ServerPlane::begin_recovery` (requires `set_control`) drives steps from
   MAINTAIN (`RecoverConfig{step_bytes: 8 MiB, throttle_bytes_per_sec:
