@@ -1,7 +1,7 @@
 //! `inf-runtime` — the shard-cell runtime (master plan §5, milestone M0-E2):
 //! backend drivers behind one typed contract, the single-threaded cell
-//! executor, typed suspension gates, the timer wheel, scheduler groups, and
-//! the 10-step reactor loop.
+//! executor, typed suspension gates, the timer wheel and the fixed timer
+//! set with its heap, scheduler groups, and the 10-step reactor loop.
 //!
 //! This is the only crate allowed to name io_uring/kqueue symbols (§3.3).
 //! `unsafe` is confined to three audited areas — backend FFI, the Rc waker
@@ -67,7 +67,10 @@ pub use executor::{CellExecutor, PollImmediate, TaskId};
 pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};
 pub use reactor::{CellLoop, CellPlane, IterStats, LoopConfig, LoopCx};
 pub use sched::{GroupClass, GroupScheduler};
-pub use timer::{TimerId, TimerWheel};
+pub use timer::{
+    ArmError, Cancelled, Closed, Consumed, OwnerPhase, Reserved, Successor, TimerArm, TimerId,
+    TimerNotice, TimerOutcome, TimerOwner, TimerSet, TimerWheel,
+};
 pub use token::{CompletionToken, MAX_SLOT, TokenClass};
 
 #[cfg(target_os = "macos")]

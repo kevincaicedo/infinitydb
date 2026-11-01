@@ -25,6 +25,10 @@ uring = ["dep:io-uring"]
 no-tripwires = []
 
 [dev-dependencies]
+# The timer set's last-generation tests reach the slab's test hook
+# (`place_generation_last`); `fault-points` stays off every normal edge
+# (scripts/check-shipping-features.sh).
+inf-foundation = { workspace = true, features = ["fault-points"] }
 proptest.workspace = true
 criterion.workspace = true
 # Conformance tests poke sockets (setsockopt) directly.
