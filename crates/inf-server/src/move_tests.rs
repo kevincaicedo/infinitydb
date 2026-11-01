@@ -22,7 +22,7 @@ fn malformed_snapshot_never_reaches_destination() {
             rig.seed();
             let mut snapshots = 0;
             let reply = rig.run(command, |args, _| {
-                assert_ne!(args[0], b"SET", "H3 follow-up: malformed snapshot reached destination");
+                assert_ne!(args[0], b"SET", "a malformed snapshot reached the destination");
                 (args[0] == b"INF.PEEK").then(|| {
                     snapshots += 1;
                     success(raw)
@@ -46,7 +46,7 @@ fn snapshot_parser_rejects_bad_delimiters_and_trailing_bytes() {
     ] {
         let reply = success(raw);
         let view = reply.success().expect("a Success leg has a view");
-        assert!(parse_take_reply(view).is_none(), "H3 follow-up: malformed snapshot accepted");
+        assert!(parse_take_reply(view).is_none(), "a malformed snapshot was accepted");
     }
 }
 
@@ -116,7 +116,7 @@ fn rename_does_not_count_internal_reads() {
             let before = stats();
             let _ = rig.run(command, |_, _| None);
             let after = stats();
-            assert_eq!(after.keyspace_hits, before.keyspace_hits, "H3 follow-up: internal hits");
+            assert_eq!(after.keyspace_hits, before.keyspace_hits, "a move's reads counted hits");
             assert_eq!(after.keyspace_misses, before.keyspace_misses);
         }
     }
@@ -150,7 +150,7 @@ fn a_client_typed_internal_command_is_unknown_on_the_plane() {
     let rig = Rig::new(0);
     let shared = &rig.planes[0].shared;
     let argv: &[&[u8]] = &[b"INF.PUT", &rig.source, b"v", b"-1"];
-    let mut reply = Vec::new();
+    let mut reply = OpenReply::new(Vec::new());
     shared.execute_owned_into(
         ExecOrigin::Conn(0, 0),
         argv,
@@ -159,8 +159,9 @@ fn a_client_typed_internal_command_is_unknown_on_the_plane() {
         0,
         None,
         false,
-        &mut ReplyBuf::over(&mut reply),
+        reply.reply(),
     );
+    let reply = reply.finish().into_bytes();
     assert!(reply.starts_with(b"-ERR unknown command 'INF.PUT'"), "{reply:?}");
     assert_eq!(rig.source(&[b"GET", &rig.source]), b"$-1\r\n", "nothing landed");
     assert_eq!(rig.local(0, argv), b"+OK\r\n", "the program leg runs");
@@ -187,7 +188,7 @@ fn an_unmarked_apply_carrying_an_internal_command_is_unknown() {
             program,
         };
         let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0u64);
+            (ReplyStream::new(Vec::new()), Vec::new(), Vec::new(), Vec::new(), 0u64);
         handle_fabric_op(
             shared,
             shared.now.get(),
@@ -201,7 +202,7 @@ fn an_unmarked_apply_carrying_an_internal_command_is_unknown() {
         );
         let (_, _, reply) = staged.pop().expect("one staged reply");
         let StagedReply::Bytes(start, end, _) = reply else { panic!("expected raw reply bytes") };
-        let bytes = scratch[start..end].to_vec();
+        let bytes = scratch.as_bytes()[start..end].to_vec();
         replies.push(bytes);
     }
     assert!(replies[0].starts_with(b"-ERR unknown command 'INF.PUT'"), "{:?}", replies[0]);
@@ -226,7 +227,7 @@ fn an_apply_without_arguments_is_refused_not_a_panic() {
             program,
         };
         let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0u64);
+            (ReplyStream::new(Vec::new()), Vec::new(), Vec::new(), Vec::new(), 0u64);
         handle_fabric_op(
             shared,
             shared.now.get(),

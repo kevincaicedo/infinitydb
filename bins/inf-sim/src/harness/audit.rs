@@ -375,20 +375,15 @@ pub(super) fn run_audit(
             vec![b"FLUSHDB".to_vec()]
         };
         let who = format!("{label}, auditor {}", auditor.scope.name());
-        let mut expected = Vec::new();
+        let mut expected = inf_wire::OpenReply::new(Vec::new());
         {
             let slices: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
             let mut cx = model_cx(auditor.scope.exec_scope());
             let mut oracle = oracle.0.borrow_mut();
-            execute_slices(
-                &slices,
-                &mut oracle.model,
-                &mut cx,
-                now,
-                &mut inf_wire::ReplyBuf::over(&mut expected),
-            );
-            // The independent model follows an acknowledged flush only.
-            if expected == b"+OK\r\n" {
+            execute_slices(&slices, &mut oracle.model, &mut cx, now, expected.reply());
+            // The independent model follows an acknowledged flush only: a
+            // flush is acknowledged exactly when the model's reply succeeds.
+            if expected.outcome() == inf_wire::ReplyOutcome::Success {
                 if argv[0] == b"FLUSHALL" {
                     oracle.shadow.flush_all();
                 } else {
@@ -396,6 +391,7 @@ pub(super) fn run_audit(
                 }
             }
         }
+        let expected = expected.finish().into_bytes();
         match audit_roundtrip(cells, nets, auditor, &encode(&argv)) {
             Ok(reply) if reply == expected => {}
             Ok(reply) => violations.push(format!(

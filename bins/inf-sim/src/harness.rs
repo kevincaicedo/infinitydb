@@ -605,10 +605,11 @@ impl PlaneObserver for SharedOracle {
         }
         // Model replay: same argv, same store, same injected time, RESP2
         // (the scenario mixes never switch protocols).
-        let mut expected = Vec::new();
+        let mut expected = inf_wire::OpenReply::new(Vec::new());
         let mut cx = model_cx(scope);
         let Oracle { model, shadow, violations, .. } = &mut *oracle;
-        execute_slices(argv, model, &mut cx, now, &mut inf_wire::ReplyBuf::over(&mut expected));
+        execute_slices(argv, model, &mut cx, now, expected.reply());
+        let expected = expected.finish().into_bytes();
         if expected != reply {
             let argv_text: Vec<String> =
                 argv.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();

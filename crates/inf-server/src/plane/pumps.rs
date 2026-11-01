@@ -115,8 +115,8 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
 ) {
     loop {
         let mut reply = OpenReply::new(shared.take_reply_buf());
-        let applied = reply
-            .lend(|out| shared.execute_ns_owned(CellId(origin), argv, proto, ns, program, out));
+        let applied =
+            shared.execute_ns_owned(CellId(origin), argv, proto, ns, program, reply.reply());
         let reply = reply.finish();
         match applied {
             NsApplyOutcome::Park => {

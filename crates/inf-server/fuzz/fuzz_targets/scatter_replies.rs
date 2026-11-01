@@ -2,7 +2,7 @@
 //! RESP replies to splice a cross-cell `SCAN`/`INF.PEEK` answer. Every
 //! byte string, truncated at every length, must parse totally — never a
 //! panic — and a `Some` from the SCAN head must name an offset inside
-//! the buffer (the caller slices `&raw[at..]` unchecked). Each decoder
+//! the buffer (`ScanLeg::rest` slices the reply at it unchecked). Each decoder
 //! takes a `SuccessView`, the bytes of a reply whose outcome was read, so
 //! every cut is read as a `Success` reply; a cut to zero bytes is a reply
 //! that wrote nothing, the one empty view a decoder meets.

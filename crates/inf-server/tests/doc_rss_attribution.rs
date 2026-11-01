@@ -31,11 +31,11 @@ fn snapshot(
     // The harness owns OS sampling; INFO must only format the published board.
     sampler.sample();
     *clock += 1;
-    let mut out = Vec::new();
+    let mut out = inf_wire::OpenReply::new(Vec::new());
     // The domains are `# Tripwires`, `process_rss` is `# Memory` (ADR-0122
     // A1); every name renders once, so the flat map is exact.
-    execute_slices(&[b"INFO"], ks, cx, Nanos(*clock), &mut inf_wire::ReplyBuf::over(&mut out));
-    String::from_utf8(out)
+    execute_slices(&[b"INFO"], ks, cx, Nanos(*clock), out.reply());
+    String::from_utf8(out.finish().into_bytes())
         .expect("INFO is UTF-8")
         .lines()
         .filter_map(|line| {
@@ -64,19 +64,19 @@ fn document_heavy_domains_track_incremental_rss_within_ten_percent() {
     let json = format!(r#"{{"pad":"{}"}}"#, "x".repeat(1_000));
     let before = snapshot(&mut ks, &mut cx, &mut clock, &mut sampler);
 
-    let mut out = Vec::with_capacity(8);
+    let mut out = inf_wire::ReplyStream::new(Vec::with_capacity(8));
     for index in 0..DOCUMENTS {
         let key = key_of(index);
-        out.clear();
+        out.discard();
         clock += 1;
         execute_slices(
             &[b"JSON.SET", &key, b"$", json.as_bytes()],
             &mut ks,
             &mut cx,
             Nanos(clock),
-            &mut inf_wire::ReplyBuf::over(&mut out),
+            out.open(),
         );
-        assert_eq!(out, b"+OK\r\n");
+        assert_eq!(out.as_bytes(), b"+OK\r\n");
     }
     let after = snapshot(&mut ks, &mut cx, &mut clock, &mut sampler);
 

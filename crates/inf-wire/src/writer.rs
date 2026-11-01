@@ -1,17 +1,17 @@
 //! RESP2/RESP3 reply serializer (M0-S11). Writes one reply into a
-//! [`Reply`] over a caller-provided `Vec<u8>` (a wire send buffer or a pool
-//! buffer) — no internal allocation; integers format through a stack buffer
-//! (no `format!`). The protocol version is chosen per connection at `HELLO`
-//! and threaded through [`RespWriter::new`]. A reply carries its outcome
-//! beside its bytes (ADR-0190 D1): the writer sets it where it writes an
-//! error line at the reply's start, and no reader decides from the bytes.
+//! [`ReplyBuf`], a buffer that lives beside its reply's start and outcome —
+//! a connection's send buffer or an owner's scratch held by a
+//! [`ReplyStream`], or a pool buffer held by an [`OpenReply`] — with no
+//! internal allocation; integers format through a stack buffer (no
+//! `format!`). The protocol version is chosen per connection at `HELLO` and
+//! threaded through [`RespWriter::new`]. A reply carries its outcome beside
+//! its bytes (ADR-0190 D1): the writer sets it where it writes an error line
+//! at the reply's start, and no reader decides from the bytes.
 // ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
 #![cfg_attr(
     not(test),
     deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
 )]
-
-use core::borrow::BorrowMut;
 
 /// Negotiated protocol for one connection.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -29,27 +29,28 @@ pub enum ReplyOutcome {
     Error,
 }
 
-/// One reply's bytes with where the reply began and its outcome (ADR-0190
-/// D1), in two forms by `B`: [`ReplyBuf`] over a buffer that outlives the
-/// reply (earlier pipelined replies before `start` are not this reply's),
-/// [`OpenReply`] over an owned pool buffer. Neither exposes `&mut Vec<u8>`:
-/// bytes enter only through [`RespWriter`], so no caller can write past the
-/// writer or truncate without resetting the outcome.
+/// One open reply over a buffer it owns, with where the reply began and its
+/// outcome (ADR-0190 A1.1). It has no public constructor, no `Default` and
+/// no `Clone`: a caller reaches it only as `&mut ReplyBuf`, from
+/// [`ReplyStream::open`] (the next reply at the buffer's end) or
+/// [`OpenReply::reply`] (an owned reply at 0), so a reply's start is set only
+/// where a reply opens. It exposes no `&mut Vec<u8>`: bytes enter only
+/// through [`RespWriter`], so no caller can write past the writer or
+/// truncate without resetting the outcome. No struct literal outside this
+/// crate builds one:
+///
+/// ```compile_fail,E0451
+/// let outcome = inf_wire::ReplyOutcome::Success;
+/// let reply = inf_wire::ReplyBuf { bytes: Vec::new(), start: 0, outcome };
+/// ```
 #[derive(Debug)]
-pub struct Reply<B: BorrowMut<Vec<u8>>> {
-    bytes: B,
+pub struct ReplyBuf {
+    bytes: Vec<u8>,
     start: usize,
     outcome: ReplyOutcome,
 }
 
-/// A reply over a buffer that outlives it (a connection's output, an
-/// owner's reply scratch).
-pub type ReplyBuf<'a> = Reply<&'a mut Vec<u8>>;
-
-/// A reply over an owned pool buffer, closed by [`OpenReply::finish`].
-pub type OpenReply = Reply<Vec<u8>>;
-
-impl<B: BorrowMut<Vec<u8>>> Reply<B> {
+impl ReplyBuf {
     /// The reply's outcome so far.
     pub fn outcome(&self) -> ReplyOutcome {
         self.outcome
@@ -61,26 +62,20 @@ impl<B: BorrowMut<Vec<u8>>> Reply<B> {
 
     /// The reply's bytes so far: the buffer from the reply's start.
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes.borrow()[self.start..]
+        &self.bytes[self.start..]
     }
 
     /// The rollback to the reply's start: the buffer truncated to it and the
-    /// outcome reset to `Success`; every byte before the start stays.
+    /// outcome reset to `Success`; every byte before the start (an earlier
+    /// pipelined reply) stays.
     pub fn clear(&mut self) {
-        self.bytes.borrow_mut().truncate(self.start);
+        self.bytes.truncate(self.start);
         self.outcome = ReplyOutcome::Success;
     }
-}
 
-impl<'a> Reply<&'a mut Vec<u8>> {
-    /// Opens a reply at the buffer's end, `Success`, nothing written.
-    pub fn over(out: &'a mut Vec<u8>) -> ReplyBuf<'a> {
-        let start = out.len();
-        Reply { bytes: out, start, outcome: ReplyOutcome::Success }
-    }
-
-    /// The borrowed form's close: the reply's bytes copied with its outcome;
-    /// the buffer is left at the reply's start, `Success`.
+    /// A reply's close over a buffer that outlives it: the reply's bytes
+    /// copied with its outcome; the buffer is left at the reply's start,
+    /// `Success`.
     pub fn detach(&mut self) -> OwnedReply {
         let bytes = self.bytes[self.start..].to_vec();
         self.bytes.truncate(self.start);
@@ -89,29 +84,123 @@ impl<'a> Reply<&'a mut Vec<u8>> {
     }
 }
 
-impl Reply<Vec<u8>> {
+/// A buffer of successive replies — a connection's output, an owner's reply
+/// scratch — holding the one [`ReplyBuf`] its replies are written through
+/// (ADR-0190 A1.1). [`ReplyStream::open`] starts each reply at the buffer's
+/// end; the buffer itself is read, sent, appended to and emptied only
+/// between replies, while no reply is borrowed, so a reply's start is its
+/// own.
+#[derive(Debug)]
+pub struct ReplyStream {
+    reply: ReplyBuf,
+}
+
+impl ReplyStream {
+    /// A stream over `buf`, which is cleared first.
+    pub fn new(mut buf: Vec<u8>) -> ReplyStream {
+        buf.clear();
+        ReplyStream { reply: ReplyBuf { bytes: buf, start: 0, outcome: ReplyOutcome::Success } }
+    }
+
+    /// Opens the next reply at the buffer's end, `Success`, nothing written:
+    /// two stores, whatever the previous reply left.
+    #[inline]
+    pub fn open(&mut self) -> &mut ReplyBuf {
+        self.reply.start = self.reply.bytes.len();
+        self.reply.outcome = ReplyOutcome::Success;
+        &mut self.reply
+    }
+
+    /// Every buffered byte, every reply written so far.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.reply.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.reply.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.reply.bytes.is_empty()
+    }
+
+    /// The buffer's allocation, for the connection's memory sum.
+    pub fn capacity(&self) -> usize {
+        self.reply.bytes.capacity()
+    }
+
+    /// The first `n` buffered bytes, sent: dropped, the rest moved to the
+    /// front. `n` is at most [`ReplyStream::len`], as the send path takes it.
+    pub fn consume(&mut self, n: usize) {
+        debug_assert!(n <= self.reply.bytes.len(), "a send takes buffered bytes only");
+        self.reply.bytes.drain(..n);
+    }
+
+    /// A closed reply's bytes queued to send after every buffered byte.
+    pub fn emit(&mut self, reply: &OwnedReply) {
+        self.reply.bytes.extend_from_slice(&reply.bytes);
+    }
+
+    /// Every buffered byte dropped: a scratch's reset between rounds.
+    pub fn discard(&mut self) {
+        self.reply.bytes.clear();
+    }
+
+    /// The buffer, every buffered byte kept.
+    pub fn into_vec(self) -> Vec<u8> {
+        self.reply.bytes
+    }
+}
+
+/// One reply over an owned pool buffer, opened at 0 and closed by
+/// [`OpenReply::finish`] (ADR-0190 A1.1). [`OpenReply::reply`] lends its
+/// [`ReplyBuf`] to a reply parameter: the outcome lives in one place, so
+/// nothing is written back.
+#[derive(Debug)]
+pub struct OpenReply {
+    reply: ReplyBuf,
+}
+
+impl OpenReply {
     /// Opens a reply over `buf`, which is cleared first: the owned form
     /// never carries a stale prefix.
     pub fn new(mut buf: Vec<u8>) -> OpenReply {
         buf.clear();
-        Reply { bytes: buf, start: 0, outcome: ReplyOutcome::Success }
+        OpenReply { reply: ReplyBuf { bytes: buf, start: 0, outcome: ReplyOutcome::Success } }
     }
 
-    /// Runs `f` over a [`ReplyBuf`] view of this reply, opened at its start
-    /// with its current outcome, and writes the view's outcome back when `f`
-    /// returns: the one bridge from the owned form to a function that takes
-    /// a borrowed reply. `f` is synchronous, so the view cannot cross an
-    /// `await`.
-    pub fn lend<R>(&mut self, f: impl FnOnce(&mut ReplyBuf<'_>) -> R) -> R {
-        let mut view = Reply { bytes: &mut self.bytes, start: self.start, outcome: self.outcome };
-        let result = f(&mut view);
-        self.outcome = view.outcome;
-        result
+    /// The reply, for a writer or a reply parameter.
+    #[inline]
+    pub fn reply(&mut self) -> &mut ReplyBuf {
+        &mut self.reply
     }
 
-    /// The writer's close: bytes and outcome move together, no copy.
+    /// The reply's outcome so far.
+    pub fn outcome(&self) -> ReplyOutcome {
+        self.reply.outcome
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.reply.is_error()
+    }
+
+    /// The reply's bytes so far.
+    pub fn bytes(&self) -> &[u8] {
+        self.reply.bytes()
+    }
+
+    /// Empties the reply and resets its outcome to `Success`.
+    pub fn clear(&mut self) {
+        self.reply.clear();
+    }
+
+    /// The writer's close: bytes and outcome move together, no copy. An
+    /// owned reply starts at 0 (`new`, `reopen`); one that does not holds a
+    /// reply swapped in from a stream (`mem::swap` of two replies, the one
+    /// move no type stops), whose prefix is another reply's, so it trips.
     pub fn finish(self) -> OwnedReply {
-        OwnedReply { bytes: self.bytes, outcome: self.outcome }
+        debug_assert_eq!(self.reply.start, 0, "an owned reply starts at 0");
+        OwnedReply { bytes: self.reply.bytes, outcome: self.reply.outcome }
     }
 }
 
@@ -160,7 +249,7 @@ impl OwnedReply {
     /// [`OpenReply::finish`]'s inverse: bytes and outcome kept, for frames
     /// appended after the reply through [`RespWriter::encoded`].
     pub fn reopen(self) -> OpenReply {
-        Reply { bytes: self.bytes, start: 0, outcome: self.outcome }
+        OpenReply { reply: ReplyBuf { bytes: self.bytes, start: 0, outcome: self.outcome } }
     }
 
     /// The reply's bytes as a [`SuccessView`] when its outcome is `Success`;
@@ -200,14 +289,12 @@ impl<'r> SuccessView<'r> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ErrorPassthrough;
 
-/// Reply writer over one [`Reply`]: it takes split borrows of the reply's
-/// buffer, start and outcome once, at [`RespWriter::new`], so every frame
-/// method touches the buffer as a bare `Vec<u8>` would.
+/// Reply writer over one [`ReplyBuf`]: the reply and the protocol, two
+/// fields, so every frame method reaches the buffer at one pointer's depth
+/// and nothing per reply is built beside it (ADR-0190 A1.1).
 #[derive(Debug)]
 pub struct RespWriter<'b> {
-    out: &'b mut Vec<u8>,
-    start: usize,
-    outcome: &'b mut ReplyOutcome,
+    r: &'b mut ReplyBuf,
     proto: Protocol,
 }
 
@@ -225,9 +312,8 @@ impl<'b> RespWriter<'b> {
     /// The writer's only constructor: a writer over a bare buffer does not
     /// exist, so no reply is written without its outcome.
     #[inline]
-    pub fn new<B: BorrowMut<Vec<u8>>>(reply: &'b mut Reply<B>, proto: Protocol) -> RespWriter<'b> {
-        let Reply { bytes, start, outcome } = reply;
-        RespWriter { out: bytes.borrow_mut(), start: *start, outcome, proto }
+    pub fn new(reply: &'b mut ReplyBuf, proto: Protocol) -> RespWriter<'b> {
+        RespWriter { r: reply, proto }
     }
 
     pub fn protocol(&self) -> Protocol {
@@ -236,7 +322,7 @@ impl<'b> RespWriter<'b> {
 
     /// Marks the current end of the buffer as the start of a reply.
     pub fn mark(&self) -> ReplyMark {
-        ReplyMark { offset_bytes: self.out.len() }
+        ReplyMark { offset_bytes: self.r.bytes.len() }
     }
 
     /// Discards every byte written since `mark`; bytes before it (earlier
@@ -244,11 +330,11 @@ impl<'b> RespWriter<'b> {
     /// also resets its outcome; one past it discards a nested frame and
     /// leaves the outcome (ADR-0190 D1).
     pub fn rollback(&mut self, mark: &ReplyMark) {
-        debug_assert!(mark.offset_bytes <= self.out.len(), "a mark lies inside its buffer");
-        debug_assert!(mark.offset_bytes >= self.start, "a mark lies inside its own reply");
-        self.out.truncate(mark.offset_bytes);
-        if mark.offset_bytes == self.start {
-            *self.outcome = ReplyOutcome::Success;
+        debug_assert!(mark.offset_bytes <= self.r.bytes.len(), "a mark lies inside its buffer");
+        debug_assert!(mark.offset_bytes >= self.r.start, "a mark lies inside its own reply");
+        self.r.bytes.truncate(mark.offset_bytes);
+        if mark.offset_bytes == self.r.start {
+            self.r.outcome = ReplyOutcome::Success;
         }
     }
 
@@ -257,12 +343,12 @@ impl<'b> RespWriter<'b> {
     /// The one way pre-encoded bytes enter a reply; a whole reply is moved
     /// as an [`OwnedReply`], never pasted (ADR-0190 D1).
     pub fn encoded(&mut self, bytes: &[u8]) {
-        self.out.extend_from_slice(bytes);
+        self.r.bytes.extend_from_slice(bytes);
     }
 
     /// Bytes buffered for the connection, every pending reply included.
     pub fn buffered_bytes(&self) -> usize {
-        self.out.len()
+        self.r.bytes.len()
     }
 
     /// `+OK\r\n`. The text is written as one protocol line — see
@@ -309,18 +395,18 @@ impl<'b> RespWriter<'b> {
         // Canary `inf_canary_reply_outcome_untagged`: the error leaves the
         // outcome `Success`, so a consumer that reads the outcome takes it
         // for a success (the oracle: the client's reply bytes).
-        if self.out.len() == self.start && !cfg!(inf_canary_reply_outcome_untagged) {
-            *self.outcome = ReplyOutcome::Error;
+        if self.r.bytes.len() == self.r.start && !cfg!(inf_canary_reply_outcome_untagged) {
+            self.r.outcome = ReplyOutcome::Error;
         }
         // Canary `inf_canary_resp3_blob_error`: the error in RESP3's second
         // encoding, `!<len>`, so a consumer that reads the first byte takes
         // it for a success.
         if cfg!(inf_canary_resp3_blob_error) {
-            self.out.push(b'!');
+            self.r.bytes.push(b'!');
             self.raw_len(text.len());
-            self.out.extend_from_slice(b"\r\n");
-            self.out.extend_from_slice(text);
-            self.out.extend_from_slice(b"\r\n");
+            self.r.bytes.extend_from_slice(b"\r\n");
+            self.r.bytes.extend_from_slice(text);
+            self.r.bytes.extend_from_slice(b"\r\n");
             return;
         }
         self.push_line(b'-', text);
@@ -328,18 +414,18 @@ impl<'b> RespWriter<'b> {
 
     /// `:N\r\n`.
     pub fn int(&mut self, value: i64) {
-        self.out.push(b':');
+        self.r.bytes.push(b':');
         self.raw_int(value);
-        self.out.extend_from_slice(b"\r\n");
+        self.r.bytes.extend_from_slice(b"\r\n");
     }
 
     /// `$len\r\n<bytes>\r\n`.
     pub fn bulk(&mut self, bytes: &[u8]) {
-        self.out.push(b'$');
+        self.r.bytes.push(b'$');
         self.raw_len(bytes.len());
-        self.out.extend_from_slice(b"\r\n");
-        self.out.extend_from_slice(bytes);
-        self.out.extend_from_slice(b"\r\n");
+        self.r.bytes.extend_from_slice(b"\r\n");
+        self.r.bytes.extend_from_slice(bytes);
+        self.r.bytes.extend_from_slice(b"\r\n");
     }
 
     /// Bulk string of unknown length (ADR-0039 D1's wire half, built at
@@ -374,54 +460,55 @@ impl<'b> RespWriter<'b> {
         &mut self,
         build: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
     ) -> Result<(), E> {
-        let frame_at = self.out.len();
-        self.out.push(b'$');
-        let digits_at = self.out.len();
-        self.out.extend_from_slice(b"00000000\r\n");
+        let frame_at = self.r.bytes.len();
+        self.r.bytes.push(b'$');
+        let digits_at = self.r.bytes.len();
+        self.r.bytes.extend_from_slice(b"00000000\r\n");
         let payload_at = digits_at + PATCHED_DIGITS + 2;
-        if let Err(e) = build(self.out) {
-            self.out.truncate(frame_at);
+        if let Err(e) = build(&mut self.r.bytes) {
+            self.r.bytes.truncate(frame_at);
             return Err(e);
         }
-        let len = self.out.len() - payload_at;
+        let len = self.r.bytes.len() - payload_at;
         let mut buf = [0u8; 20];
         let text = utoa(len as u64, false, &mut buf);
         if text.len() <= PATCHED_DIGITS {
             let gap = PATCHED_DIGITS - text.len();
-            self.out[digits_at..digits_at + text.len()].copy_from_slice(text);
-            self.out[digits_at + text.len()..digits_at + text.len() + 2].copy_from_slice(b"\r\n");
+            self.r.bytes[digits_at..digits_at + text.len()].copy_from_slice(text);
+            self.r.bytes[digits_at + text.len()..digits_at + text.len() + 2]
+                .copy_from_slice(b"\r\n");
             if gap > 0 {
-                self.out.copy_within(payload_at.., payload_at - gap);
-                self.out.truncate(self.out.len() - gap);
+                self.r.bytes.copy_within(payload_at.., payload_at - gap);
+                self.r.bytes.truncate(self.r.bytes.len() - gap);
             }
         } else {
-            widen_patched_header(self.out, digits_at, payload_at, text);
+            widen_patched_header(&mut self.r.bytes, digits_at, payload_at, text);
         }
-        self.out.extend_from_slice(b"\r\n");
+        self.r.bytes.extend_from_slice(b"\r\n");
         Ok(())
     }
 
     /// Null: `$-1\r\n` (RESP2) / `_\r\n` (RESP3).
     pub fn null(&mut self) {
         match self.proto {
-            Protocol::Resp2 => self.out.extend_from_slice(b"$-1\r\n"),
-            Protocol::Resp3 => self.out.extend_from_slice(b"_\r\n"),
+            Protocol::Resp2 => self.r.bytes.extend_from_slice(b"$-1\r\n"),
+            Protocol::Resp3 => self.r.bytes.extend_from_slice(b"_\r\n"),
         }
     }
 
     /// Null array reply (e.g. timed-out blocking ops): `*-1\r\n` / `_\r\n`.
     pub fn null_array(&mut self) {
         match self.proto {
-            Protocol::Resp2 => self.out.extend_from_slice(b"*-1\r\n"),
-            Protocol::Resp3 => self.out.extend_from_slice(b"_\r\n"),
+            Protocol::Resp2 => self.r.bytes.extend_from_slice(b"*-1\r\n"),
+            Protocol::Resp3 => self.r.bytes.extend_from_slice(b"_\r\n"),
         }
     }
 
     /// `*N\r\n` — N replies follow.
     pub fn array_header(&mut self, n: usize) {
-        self.out.push(b'*');
+        self.r.bytes.push(b'*');
         self.raw_len(n);
-        self.out.extend_from_slice(b"\r\n");
+        self.r.bytes.extend_from_slice(b"\r\n");
     }
 
     /// Push frame of N elements: `>N\r\n` (RESP3) or a flat array (RESP2) —
@@ -430,9 +517,9 @@ impl<'b> RespWriter<'b> {
         match self.proto {
             Protocol::Resp2 => self.array_header(n),
             Protocol::Resp3 => {
-                self.out.push(b'>');
+                self.r.bytes.push(b'>');
                 self.raw_len(n);
-                self.out.extend_from_slice(b"\r\n");
+                self.r.bytes.extend_from_slice(b"\r\n");
             }
         }
     }
@@ -443,9 +530,9 @@ impl<'b> RespWriter<'b> {
         match self.proto {
             Protocol::Resp2 => self.array_header(pairs * 2),
             Protocol::Resp3 => {
-                self.out.push(b'%');
+                self.r.bytes.push(b'%');
                 self.raw_len(pairs);
-                self.out.extend_from_slice(b"\r\n");
+                self.r.bytes.extend_from_slice(b"\r\n");
             }
         }
     }
@@ -455,7 +542,7 @@ impl<'b> RespWriter<'b> {
         match self.proto {
             Protocol::Resp2 => self.int(i64::from(value)),
             Protocol::Resp3 => {
-                self.out.extend_from_slice(if value { b"#t\r\n" } else { b"#f\r\n" });
+                self.r.bytes.extend_from_slice(if value { b"#t\r\n" } else { b"#f\r\n" });
             }
         }
     }
@@ -467,9 +554,9 @@ impl<'b> RespWriter<'b> {
         match self.proto {
             Protocol::Resp2 => self.bulk(text.as_bytes()),
             Protocol::Resp3 => {
-                self.out.push(b',');
-                self.out.extend_from_slice(text.as_bytes());
-                self.out.extend_from_slice(b"\r\n");
+                self.r.bytes.push(b',');
+                self.r.bytes.extend_from_slice(text.as_bytes());
+                self.r.bytes.extend_from_slice(b"\r\n");
             }
         }
     }
@@ -480,13 +567,13 @@ impl<'b> RespWriter<'b> {
         match self.proto {
             Protocol::Resp2 => self.bulk(text),
             Protocol::Resp3 => {
-                self.out.push(b'=');
+                self.r.bytes.push(b'=');
                 self.raw_len(text.len() + 4);
-                self.out.extend_from_slice(b"\r\n");
-                self.out.extend_from_slice(kind);
-                self.out.push(b':');
-                self.out.extend_from_slice(text);
-                self.out.extend_from_slice(b"\r\n");
+                self.r.bytes.extend_from_slice(b"\r\n");
+                self.r.bytes.extend_from_slice(kind);
+                self.r.bytes.push(b':');
+                self.r.bytes.extend_from_slice(text);
+                self.r.bytes.extend_from_slice(b"\r\n");
             }
         }
     }
@@ -497,9 +584,9 @@ impl<'b> RespWriter<'b> {
         match self.proto {
             Protocol::Resp2 => self.bulk(digits.as_bytes()),
             Protocol::Resp3 => {
-                self.out.push(b'(');
-                self.out.extend_from_slice(digits.as_bytes());
-                self.out.extend_from_slice(b"\r\n");
+                self.r.bytes.push(b'(');
+                self.r.bytes.extend_from_slice(digits.as_bytes());
+                self.r.bytes.extend_from_slice(b"\r\n");
             }
         }
     }
@@ -517,9 +604,9 @@ impl<'b> RespWriter<'b> {
             self.push_line_sanitized(tag, text);
             return;
         }
-        self.out.push(tag);
-        self.out.extend_from_slice(text);
-        self.out.extend_from_slice(b"\r\n");
+        self.r.bytes.push(tag);
+        self.r.bytes.extend_from_slice(text);
+        self.r.bytes.extend_from_slice(b"\r\n");
     }
 
     /// The CR/LF-carrying half of [`RespWriter::push_line`]: trim a
@@ -530,25 +617,25 @@ impl<'b> RespWriter<'b> {
     fn push_line_sanitized(&mut self, tag: u8, text: &[u8]) {
         let start = text.iter().position(|b| *b != b'\r' && *b != b'\n').unwrap_or(text.len());
         let end = text.iter().rposition(|b| *b != b'\r' && *b != b'\n').map_or(start, |i| i + 1);
-        self.out.push(tag);
-        let at = self.out.len();
-        self.out.extend_from_slice(&text[start..end]);
-        for byte in &mut self.out[at..] {
+        self.r.bytes.push(tag);
+        let at = self.r.bytes.len();
+        self.r.bytes.extend_from_slice(&text[start..end]);
+        for byte in &mut self.r.bytes[at..] {
             if *byte == b'\r' || *byte == b'\n' {
                 *byte = b' ';
             }
         }
         // Postcondition: the terminator below is the only CRLF in this
         // reply — the property the whole connection's framing rests on.
-        debug_assert!(!self.out[at..].iter().any(|b| *b == b'\r' || *b == b'\n'));
-        self.out.extend_from_slice(b"\r\n");
+        debug_assert!(!self.r.bytes[at..].iter().any(|b| *b == b'\r' || *b == b'\n'));
+        self.r.bytes.extend_from_slice(b"\r\n");
     }
 
     /// Integer → ASCII via a stack buffer (no allocation, no `format!`).
     fn raw_int(&mut self, value: i64) {
         let mut buf = [0u8; 20];
         let text = itoa(value, &mut buf);
-        self.out.extend_from_slice(text);
+        self.r.bytes.extend_from_slice(text);
     }
 
     /// A length or element count → ASCII. Formatted unsigned: `usize`
@@ -556,7 +643,7 @@ impl<'b> RespWriter<'b> {
     fn raw_len(&mut self, len: usize) {
         let mut buf = [0u8; 20];
         let text = utoa(len as u64, false, &mut buf);
-        self.out.extend_from_slice(text);
+        self.r.bytes.extend_from_slice(text);
     }
 }
 
@@ -690,11 +777,10 @@ mod tests {
     use super::*;
 
     fn render(proto: Protocol, f: impl FnOnce(&mut RespWriter<'_>)) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut reply = ReplyBuf::over(&mut out);
-        let mut writer = RespWriter::new(&mut reply, proto);
+        let mut out = ReplyStream::new(Vec::new());
+        let mut writer = RespWriter::new(out.open(), proto);
         f(&mut writer);
-        out
+        out.into_vec()
     }
 
     /// The bound behind `F64_DISPLAY_MAX`: every binary exponent (both

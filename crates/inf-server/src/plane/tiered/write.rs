@@ -566,7 +566,7 @@ pub(super) fn error_bytes<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
     message: &str,
 ) -> OwnedReply {
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(&mut reply, proto).error(message);
+    RespWriter::new(reply.reply(), proto).error(message);
     reply.finish()
 }
 
@@ -584,7 +584,7 @@ fn diskfull_bytes<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         }
     };
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(&mut reply, proto).error(&message);
+    RespWriter::new(reply.reply(), proto).error(&message);
     reply.finish()
 }
 
@@ -750,7 +750,7 @@ pub(super) async fn set_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + '
     let plain = !nx && !xx && !get_old;
     let outcome = write_conditional(shared, ns, class, key, proto, nx, xx, value, plain).await;
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut w = RespWriter::new(reply.reply(), proto);
     match outcome {
         Ok((seq, old_value, applied)) => {
             if get_old {
@@ -899,7 +899,7 @@ pub(super) async fn setnx<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
     {
         Ok((seq, _, applied)) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            RespWriter::new(&mut reply, proto).int(i64::from(applied));
+            RespWriter::new(reply.reply(), proto).int(i64::from(applied));
             if applied && class == Some(FsyncClass::Always) {
                 TieredReply::Gated { reply: reply.finish(), seq }
             } else {
@@ -922,7 +922,7 @@ pub(super) async fn getset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     {
         Ok((seq, old_value, _)) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            let mut w = RespWriter::new(&mut reply, proto);
+            let mut w = RespWriter::new(reply.reply(), proto);
             match &old_value {
                 Some(v) => w.bulk(v),
                 None => w.null(),
@@ -1067,7 +1067,7 @@ pub(super) async fn incr<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     match outcome {
         Ok((seq, _)) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            RespWriter::new(&mut reply, proto).int(computed.get());
+            RespWriter::new(reply.reply(), proto).int(computed.get());
             if class == Some(FsyncClass::Always) {
                 TieredReply::Gated { reply: reply.finish(), seq }
             } else {
@@ -1119,7 +1119,7 @@ pub(super) async fn incrbyfloat<O: PlaneObserver + 'static, F: SegmentFs + Clone
     match outcome {
         Ok((seq, _)) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            RespWriter::new(&mut reply, proto).bulk(&rendered.borrow());
+            RespWriter::new(reply.reply(), proto).bulk(&rendered.borrow());
             if class == Some(FsyncClass::Always) {
                 TieredReply::Gated { reply: reply.finish(), seq }
             } else {
@@ -1141,7 +1141,7 @@ pub(super) async fn getdel<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     match delete_one(shared, ns, class, key, proto, true).await {
         Ok(deleted) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            let mut w = RespWriter::new(&mut reply, proto);
+            let mut w = RespWriter::new(reply.reply(), proto);
             match &deleted {
                 Some((_, Some(v))) => w.bulk(v),
                 _ => w.null(),
@@ -1178,7 +1178,7 @@ pub(super) async fn del<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
         }
     }
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(&mut reply, proto).int(removed);
+    RespWriter::new(reply.reply(), proto).int(removed);
     if removed > 0 && class == Some(FsyncClass::Always) {
         TieredReply::Gated { reply: reply.finish(), seq: last_seq }
     } else {
@@ -1540,7 +1540,7 @@ pub(super) async fn mset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         i += 2;
     }
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(&mut reply, proto).simple("OK");
+    RespWriter::new(reply.reply(), proto).simple("OK");
     if class == Some(FsyncClass::Always) {
         TieredReply::Gated { reply: reply.finish(), seq: last_seq }
     } else {

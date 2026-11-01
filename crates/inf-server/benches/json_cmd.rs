@@ -12,17 +12,30 @@
 //! wire-level gates on the reference box.
 //!
 //! The binary also counts the funnel row of the reply-outcome A/B
-//! (ADR-0190 D1's cost row): one `JSON.GET` of the depth-4 leaf path per
-//! op through `execute_slices`, the reply opened over the harness's
-//! long-lived buffer as a connection's is. The verdict rule, the
-//! instrument and its controls are the writer rows' (`inf-wire`'s `wire`
-//! bench): B − A ≤ 3 instructions per reply; `(I(n) − I(0)) / n` at
-//! `n` = 10⁷ by `perf stat -e instructions:u` on one pinned core, legs
-//! A B B A twice; A/A and B/B within 0.05; `json-get-plus-one` reads its
-//! build + 1.00 ± 0.05; `json-get-plus-four` on B is the rule's own red.
+//! (ADR-0190 A1.4): one `JSON.GET` of the depth-4 leaf path per op through
+//! `execute_slices`, the reply opened on the harness's long-lived stream as
+//! a connection's is. The row has two verdicts, each B − A per reply, A and
+//! B two builds of this file's legs:
+//!
+//! - the reply design's own instructions, ≤ 3, by callgrind
+//!   (`--cache-sim=no`): `(X(n) − X(0)) / n` at `n` = 20,000, where X is
+//!   the inclusive count of the step `reply_cost::json_get` less that of
+//!   `inf_server::json::execute_json` — every instruction the step reaches
+//!   outside the JSON body, inlined or not. A run where either function has
+//!   no inclusive count is invalid, never a pass; the same binary profiled
+//!   twice reads 0;
+//! - the whole row, ≤ 8, by `perf stat -e instructions:u` on one pinned
+//!   core: `(I(n) − I(0)) / n` at `n` = 10⁷, legs A B B A twice, A/A and
+//!   B/B within 0.05.
+//!
+//! The plants sit in the step, inside both scopes: `json-get-plus-one`
+//! reads its build + 1 under each instrument, and `json-get-plus-four` on
+//! B is each verdict's own red.
 //!
 //!   cargo bench -p inf-server --bench json_cmd --no-run
 //!   taskset -c <core> perf stat -e instructions:u -x, -- <binary> \
+//!       --variant <v> --ops <n>
+//!   valgrind --tool=callgrind --cache-sim=no -- <binary> \
 //!       --variant <v> --ops <n>
 //!
 //! Without `--variant` the binary runs the criterion group below.
@@ -43,7 +56,7 @@ struct Harness {
     ks: Keyspace,
     cx: ConnCx,
     clock: u64,
-    out: Vec<u8>,
+    out: inf_wire::ReplyStream,
 }
 
 impl Harness {
@@ -56,22 +69,16 @@ impl Harness {
             ks: Keyspace::new(config),
             cx: ConnCx::try_default().expect("fixture cache allocation"),
             clock: 0,
-            out: Vec::with_capacity(4096),
+            out: inf_wire::ReplyStream::new(Vec::with_capacity(4096)),
         }
     }
 
     #[inline]
     fn run(&mut self, argv: &[&[u8]]) -> &[u8] {
         self.clock += 1;
-        self.out.clear();
-        execute_slices(
-            argv,
-            &mut self.ks,
-            &mut self.cx,
-            Nanos(self.clock),
-            &mut inf_wire::ReplyBuf::over(&mut self.out),
-        );
-        &self.out
+        self.out.discard();
+        execute_slices(argv, &mut self.ks, &mut self.cx, Nanos(self.clock), self.out.open());
+        self.out.as_bytes()
     }
 }
 
@@ -266,9 +273,9 @@ mod reply_cost {
         Ok((name, nops, ops.ok_or("--ops is required")?))
     }
 
-    /// The plants: `NOPS` instructions per reply at the top of the loop
-    /// body, each a `nop` with no operand, so the count reads exactly
-    /// `NOPS` more.
+    /// The plants: `NOPS` instructions per reply at the top of the step,
+    /// inside the callgrind verdict's scope as well as `perf`'s, each a
+    /// `nop` with no operand, so the count reads exactly `NOPS` more.
     #[inline(always)]
     fn plant<const NOPS: u8>() {
         // With no `nop` the leg emits no `asm!` at all.
@@ -287,17 +294,18 @@ mod reply_cost {
     }
 
     // One command per call through `&mut`: the step is never inlined into
-    // the loop.
+    // the loop, and its inclusive count is the callgrind verdict's outer
+    // boundary.
     #[inline(never)]
-    fn json_get(h: &mut Harness, key: &[u8], path: &[u8]) -> usize {
+    fn json_get<const NOPS: u8>(h: &mut Harness, key: &[u8], path: &[u8]) -> usize {
+        plant::<NOPS>();
         h.run(&[b"JSON.GET", key, path]).len()
     }
 
     fn drive<const NOPS: u8>(h: &mut Harness, ops: u64) -> u64 {
         let mut bytes = 0u64;
         for _ in 0..ops {
-            plant::<NOPS>();
-            let len = json_get(black_box(&mut *h), black_box(b"k:doc"), black_box(PATH));
+            let len = json_get::<NOPS>(black_box(&mut *h), black_box(b"k:doc"), black_box(PATH));
             bytes = bytes.wrapping_add(len as u64);
         }
         bytes

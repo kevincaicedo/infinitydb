@@ -26,12 +26,7 @@ pub(crate) use sections::info;
 
 // ---- shared data definitions (behaviour lives in the child modules) ----------
 
-pub(crate) fn hello(
-    argv: &(impl Argv + ?Sized),
-    cx: &mut ConnCx,
-    now: Nanos,
-    out: &mut ReplyBuf<'_>,
-) {
+pub(crate) fn hello(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, out: &mut ReplyBuf) {
     let mut requested = cx.proto;
     if argv.len() >= 2 {
         match parse_i64(argv.arg(1)) {
@@ -907,12 +902,7 @@ fn next_local_ns_id(ks: &Keyspace) -> u32 {
 
 // ---- CLIENT ------------------------------------------------------------------
 
-pub(crate) fn client(
-    argv: &(impl Argv + ?Sized),
-    cx: &mut ConnCx,
-    now: Nanos,
-    out: &mut ReplyBuf<'_>,
-) {
+pub(crate) fn client(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, out: &mut ReplyBuf) {
     let proto = cx.proto;
     let mut w = RespWriter::new(out, proto);
     let sub = argv.arg(1);
@@ -1058,7 +1048,7 @@ mod tests {
     use super::*;
     use crate::exec::execute;
     use inf_store::{EvictionPolicy, SetExpire, SetOptions, StoreConfig};
-    use inf_wire::{ConnParser, Parsed, ParserLimits};
+    use inf_wire::{ConnParser, Parsed, ParserLimits, ReplyStream};
 
     fn run(cx: &mut ConnCx, store: &mut Keyspace, parts: &[&[u8]]) -> Vec<u8> {
         let mut wire = format!("*{}\r\n", parts.len()).into_bytes();
@@ -1070,9 +1060,9 @@ mod tests {
         let mut parser = ConnParser::new(ParserLimits::default());
         let mut iter = parser.feed(&wire);
         let Some(Parsed::Command(argv)) = iter.next() else { panic!("one command") };
-        let mut out = Vec::new();
-        execute(&argv, store, cx, Nanos(1), &mut ReplyBuf::over(&mut out));
-        out
+        let mut out = ReplyStream::new(Vec::new());
+        execute(&argv, store, cx, Nanos(1), out.open());
+        out.into_vec()
     }
 
     /// Review 2026-09-01 (INFINITYD_BIN compat lane): the per-cell fan of
@@ -1638,11 +1628,10 @@ mod tests {
         store.db_mut(3).set(b"stale", b"v", opts, Nanos(0)).expect("set");
         let later = Nanos(5_000 * 1_000_000);
         assert_eq!(store.expiry_lag_ms(later), 5_000);
-        let mut out = Vec::new();
-        let mut view = ReplyBuf::over(&mut out);
-        let mut w = RespWriter::new(&mut view, Protocol::Resp2);
+        let mut out = ReplyStream::new(Vec::new());
+        let mut w = RespWriter::new(out.open(), Protocol::Resp2);
         info(&[b"INFO".as_slice(), b"stats"][..], &store, &cx.node, later, &mut w);
-        let text = String::from_utf8(out).expect("ascii");
+        let text = String::from_utf8(out.into_vec()).expect("ascii");
         assert!(text.contains("expiry_debt_ms:5000\r\n"), "{text}");
     }
 

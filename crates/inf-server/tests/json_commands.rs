@@ -33,15 +33,9 @@ impl Db {
 
     fn run(&mut self, argv: &[&[u8]]) -> Vec<u8> {
         self.clock += 1;
-        let mut out = Vec::new();
-        execute_slices(
-            argv,
-            &mut self.ks,
-            &mut self.cx,
-            Nanos(self.clock),
-            &mut inf_wire::ReplyBuf::over(&mut out),
-        );
-        out
+        let mut out = inf_wire::ReplyStream::new(Vec::new());
+        execute_slices(argv, &mut self.ks, &mut self.cx, Nanos(self.clock), out.open());
+        out.into_vec()
     }
 
     fn run_str(&mut self, argv: &[&str]) -> Vec<u8> {
@@ -56,14 +50,11 @@ impl Db {
     fn run_behind(&mut self, earlier: &[u8], argv: &[&str]) -> Vec<u8> {
         self.clock += 1;
         let owned: Vec<&[u8]> = argv.iter().map(|s| s.as_bytes()).collect();
-        let mut out = earlier.to_vec();
-        execute_slices(
-            &owned,
-            &mut self.ks,
-            &mut self.cx,
-            Nanos(self.clock),
-            &mut inf_wire::ReplyBuf::over(&mut out),
-        );
+        let mut out = inf_wire::ReplyStream::new(Vec::new());
+        // The earlier reply, as its own writer encoded it.
+        inf_wire::RespWriter::new(out.open(), inf_wire::Protocol::Resp2).encoded(earlier);
+        execute_slices(&owned, &mut self.ks, &mut self.cx, Nanos(self.clock), out.open());
+        let mut out = out.into_vec();
         assert!(out.starts_with(earlier), "{argv:?} changed an earlier pipelined reply");
         out.split_off(earlier.len())
     }

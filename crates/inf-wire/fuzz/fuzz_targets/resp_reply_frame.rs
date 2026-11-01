@@ -7,7 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use inf_wire::{Protocol, ReplyBuf, RespWriter};
+use inf_wire::{Protocol, ReplyStream, RespWriter};
 
 /// Walks a buffer of line-framed replies, returning how many it contains.
 /// Panics with the offending offset when the bytes are not exactly that —
@@ -43,11 +43,10 @@ fuzz_target!(|data: &[u8]| {
     let proto = if data[0] & 1 == 0 { Protocol::Resp2 } else { Protocol::Resp3 };
     let chunk = usize::from(data[0] >> 1).max(1);
 
-    let mut out = Vec::new();
+    let mut out = ReplyStream::new(Vec::new());
     let mut written = 0usize;
     {
-        let mut view = ReplyBuf::over(&mut out);
-        let mut w = RespWriter::new(&mut view, proto);
+        let mut w = RespWriter::new(out.open(), proto);
         for piece in data[1..].chunks(chunk) {
             w.error_bytes(piece);
             written += 1;
@@ -60,16 +59,21 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    assert_eq!(count_line_replies(&out), written, "reply count changed under the payload");
+    assert_eq!(
+        count_line_replies(out.as_bytes()),
+        written,
+        "reply count changed under the payload"
+    );
 
     // Sanitizing is idempotent: re-writing an already-sanitized body must
     // reproduce it byte for byte (no drift for a proxy that replays errors).
-    let mut once = Vec::new();
-    RespWriter::new(&mut ReplyBuf::over(&mut once), proto).error_bytes(&data[1..]);
+    let mut once = ReplyStream::new(Vec::new());
+    RespWriter::new(once.open(), proto).error_bytes(&data[1..]);
+    let once = once.into_vec();
     let body = &once[1..once.len() - 2];
-    let mut twice = Vec::new();
-    RespWriter::new(&mut ReplyBuf::over(&mut twice), proto).error_bytes(body);
-    assert_eq!(once, twice, "sanitization is not idempotent");
+    let mut twice = ReplyStream::new(Vec::new());
+    RespWriter::new(twice.open(), proto).error_bytes(body);
+    assert_eq!(once, twice.as_bytes(), "sanitization is not idempotent");
 
     // ADR-0099 (review 2026-08-30, C9): a patched bulk must equal the
     // plain bulk byte for byte whatever the payload, and a failing
@@ -77,15 +81,13 @@ fuzz_target!(|data: &[u8]| {
     // widening is unit-tested — per-exec payloads that size would stall
     // the fuzzer without exploring anything new.)
     let payload = &data[1..];
-    let mut plain = Vec::new();
-    RespWriter::new(&mut ReplyBuf::over(&mut plain), proto).bulk(payload);
-    let mut patched = Vec::new();
-    RespWriter::new(&mut ReplyBuf::over(&mut patched), proto)
-        .bulk_patched(|out| out.extend_from_slice(payload));
-    assert_eq!(plain, patched, "patched bulk diverged from plain bulk");
-    let mut rolled = Vec::new();
-    let mut rolled_view = ReplyBuf::over(&mut rolled);
-    let mut w = RespWriter::new(&mut rolled_view, proto);
+    let mut plain = ReplyStream::new(Vec::new());
+    RespWriter::new(plain.open(), proto).bulk(payload);
+    let mut patched = ReplyStream::new(Vec::new());
+    RespWriter::new(patched.open(), proto).bulk_patched(|out| out.extend_from_slice(payload));
+    assert_eq!(plain.as_bytes(), patched.as_bytes(), "patched bulk diverged from plain bulk");
+    let mut rolled = ReplyStream::new(Vec::new());
+    let mut w = RespWriter::new(rolled.open(), proto);
     assert!(
         w.try_bulk_patched(|out| {
             out.extend_from_slice(payload);
@@ -94,5 +96,5 @@ fuzz_target!(|data: &[u8]| {
         .is_err()
     );
     w.error("ERR reply too large");
-    assert_eq!(rolled, b"-ERR reply too large\r\n", "rollback left frame residue");
+    assert_eq!(rolled.as_bytes(), b"-ERR reply too large\r\n", "rollback left frame residue");
 });

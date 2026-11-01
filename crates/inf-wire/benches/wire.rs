@@ -6,7 +6,7 @@
 //! The binary also counts the writer rows of the reply-outcome A/B
 //! (ADR-0190 D1's cost row): one reply per op, at the `GET` shape (one
 //! 64 B bulk) and the `+OK` shape, written as a command's reply is — a
-//! reply opened over a long-lived buffer, a writer built over it, one frame.
+//! reply opened on a long-lived stream, a writer built over it, one frame.
 //! The verdict rule: B − A ≤ 3 instructions per reply on each shape. The
 //! instrument: exact user-space instructions per reply, `(I(n) − I(0)) / n`
 //! at `n` = 10⁷, read outside this binary (`perf stat -e instructions:u`)
@@ -35,7 +35,7 @@ use std::hint::black_box;
 use std::process::ExitCode;
 
 use criterion::{Criterion, Throughput, criterion_group};
-use inf_wire::{ConnParser, Parsed, ParserLimits, Protocol, ReplyBuf, RespWriter, lookup};
+use inf_wire::{ConnParser, Parsed, ParserLimits, Protocol, ReplyStream, RespWriter, lookup};
 
 /// Pipelined GET/SET mix, RESP-encoded — the regime the node throughput
 /// gate runs (memtier P=16 shape).
@@ -179,11 +179,10 @@ fn bench_write(c: &mut Criterion) {
     // line scan const-folds there; the `black_box`ed variants below are the
     // worst case, where the text is opaque to the compiler.
     group.bench_function("simple_ok_literal_x64", |b| {
-        let mut out = Vec::with_capacity(1024);
+        let mut out = ReplyStream::new(Vec::with_capacity(1024));
         b.iter(|| {
-            out.clear();
-            let mut view = ReplyBuf::over(&mut out);
-            let mut w = RespWriter::new(&mut view, Protocol::Resp2);
+            out.discard();
+            let mut w = RespWriter::new(out.open(), Protocol::Resp2);
             for _ in 0..64 {
                 w.simple("OK");
             }
@@ -191,11 +190,10 @@ fn bench_write(c: &mut Criterion) {
         });
     });
     group.bench_function("error_literal_x64", |b| {
-        let mut out = Vec::with_capacity(8192);
+        let mut out = ReplyStream::new(Vec::with_capacity(8192));
         b.iter(|| {
-            out.clear();
-            let mut view = ReplyBuf::over(&mut out);
-            let mut w = RespWriter::new(&mut view, Protocol::Resp2);
+            out.discard();
+            let mut w = RespWriter::new(out.open(), Protocol::Resp2);
             for _ in 0..64 {
                 w.error("ERR value is not an integer or out of range");
             }
@@ -203,11 +201,10 @@ fn bench_write(c: &mut Criterion) {
         });
     });
     group.bench_function("simple_ok_x64", |b| {
-        let mut out = Vec::with_capacity(1024);
+        let mut out = ReplyStream::new(Vec::with_capacity(1024));
         b.iter(|| {
-            out.clear();
-            let mut view = ReplyBuf::over(&mut out);
-            let mut w = RespWriter::new(&mut view, Protocol::Resp2);
+            out.discard();
+            let mut w = RespWriter::new(out.open(), Protocol::Resp2);
             for _ in 0..64 {
                 w.simple(black_box("OK"));
             }
@@ -215,11 +212,10 @@ fn bench_write(c: &mut Criterion) {
         });
     });
     group.bench_function("bulk_512b_x64", |b| {
-        let mut out = Vec::with_capacity(64 * 1024);
+        let mut out = ReplyStream::new(Vec::with_capacity(64 * 1024));
         b.iter(|| {
-            out.clear();
-            let mut view = ReplyBuf::over(&mut out);
-            let mut w = RespWriter::new(&mut view, Protocol::Resp2);
+            out.discard();
+            let mut w = RespWriter::new(out.open(), Protocol::Resp2);
             for _ in 0..64 {
                 w.bulk(black_box(&value));
             }
@@ -227,11 +223,10 @@ fn bench_write(c: &mut Criterion) {
         });
     });
     group.bench_function("error_x64", |b| {
-        let mut out = Vec::with_capacity(8192);
+        let mut out = ReplyStream::new(Vec::with_capacity(8192));
         b.iter(|| {
-            out.clear();
-            let mut view = ReplyBuf::over(&mut out);
-            let mut w = RespWriter::new(&mut view, Protocol::Resp2);
+            out.discard();
+            let mut w = RespWriter::new(out.open(), Protocol::Resp2);
             for _ in 0..64 {
                 w.error(black_box("ERR value is not an integer or out of range"));
             }
@@ -257,7 +252,7 @@ mod reply_cost {
     use std::hint::black_box;
     use std::process::ExitCode;
 
-    use inf_wire::{Protocol, ReplyBuf, RespWriter};
+    use inf_wire::{Protocol, ReplyStream, RespWriter};
 
     /// The reply a leg writes.
     #[derive(Clone, Copy)]
@@ -324,25 +319,25 @@ mod reply_cost {
         }
     }
 
-    // One reply per call through `&mut`, as a connection's buffer is
+    // One reply per call through `&mut`, as a connection's stream is
     // reached: the step is never inlined into the loop.
     #[inline(never)]
-    fn reply_get(out: &mut Vec<u8>, value: &[u8]) -> usize {
-        out.clear();
-        RespWriter::new(&mut ReplyBuf::over(out), Protocol::Resp2).bulk(value);
+    fn reply_get(out: &mut ReplyStream, value: &[u8]) -> usize {
+        out.discard();
+        RespWriter::new(out.open(), Protocol::Resp2).bulk(value);
         out.len()
     }
 
     #[inline(never)]
-    fn reply_ok(out: &mut Vec<u8>) -> usize {
-        out.clear();
-        RespWriter::new(&mut ReplyBuf::over(out), Protocol::Resp2).simple("OK");
+    fn reply_ok(out: &mut ReplyStream) -> usize {
+        out.discard();
+        RespWriter::new(out.open(), Protocol::Resp2).simple("OK");
         out.len()
     }
 
     fn drive<const NOPS: u8>(shape: Shape, ops: u64) -> u64 {
         let value = [0xABu8; 64];
-        let mut out = Vec::with_capacity(256);
+        let mut out = ReplyStream::new(Vec::with_capacity(256));
         let mut bytes = 0u64;
         match shape {
             Shape::Get => {

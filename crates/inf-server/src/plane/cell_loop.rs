@@ -311,7 +311,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // stage (one small copy) so the whole pack's store lines prefetch
         // before any op executes — the ADR-0005 pipeline on the batch the
         // fabric naturally provides; order per source pair is unchanged.
-        self.reply_scratch.clear();
+        self.reply_scratch.discard();
         self.staged_replies.clear();
         let apply_prefetch = self.shared.apply_prefetch.get();
         let shared = &self.shared;
@@ -372,7 +372,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         let mut had_replies = false;
         for (to, token, reply) in self.staged_replies.drain(..) {
             had_replies = true;
-            fabric.reply(to, token, &staged_outcome(&self.reply_scratch, &reply));
+            fabric.reply(to, token, &staged_outcome(self.reply_scratch.as_bytes(), &reply));
         }
         // Publish replies NOW instead of at FABRIC-OUT: the origin is
         // blocked on them, and waiting for step 8 adds most of an iteration
@@ -511,7 +511,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                         conn_cx,
                                         out,
                                     );
-                                    RespWriter::new(&mut ReplyBuf::over(out), conn_cx.proto)
+                                    RespWriter::new(out.open(), conn_cx.proto)
                                         .error("LOADING Redis is loading the dataset in memory");
                                     continue;
                                 }
@@ -575,22 +575,22 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                     out,
                                 );
                                 let argv_slices: Vec<&[u8]> = argv.iter().collect();
-                                let before = out.len();
                                 let now = self.shared.now.get();
                                 let scope = ExecScope::of(conn_cx);
+                                let reply = out.open();
                                 execute(
                                     &argv,
                                     &mut self.shared.store.borrow_mut(),
                                     conn_cx,
                                     now,
-                                    &mut ReplyBuf::over(out),
+                                    reply,
                                 );
                                 self.shared.observer.borrow_mut().on_execute(
                                     self.shared.cell,
                                     origin,
                                     scope,
                                     &argv_slices,
-                                    &out[before..],
+                                    reply.bytes(),
                                     now,
                                 );
                                 if let Some(dur) = stall_request(&argv_slices) {
@@ -618,7 +618,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                             );
                             // Display, not Debug (batch 45): the Redis
                             // phrasing the compat harness diffs.
-                            RespWriter::new(&mut ReplyBuf::over(out), conn_cx.proto)
+                            RespWriter::new(out.open(), conn_cx.proto)
                                 .error(&format!("ERR Protocol error: {e}"));
                             protocol_error = true;
                             break;
@@ -786,8 +786,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     && let Some(buf) = cx.pool.try_lease(LeaseKind::Send)
                 {
                     let n = conn.out.len().min(cx.pool.buf_size());
-                    cx.pool.bytes_mut(buf)[..n].copy_from_slice(&conn.out[..n]);
-                    conn.out.drain(..n);
+                    cx.pool.bytes_mut(buf)[..n].copy_from_slice(&conn.out.as_bytes()[..n]);
+                    conn.out.consume(n);
                     conn.send_inflight = true;
                     cx.push(IoOp::Send {
                         fd: conn.fd,

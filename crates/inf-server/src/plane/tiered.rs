@@ -293,7 +293,7 @@ fn done_error<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     message: &str,
 ) -> TieredReply {
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(&mut reply, proto).error(message);
+    RespWriter::new(reply.reply(), proto).error(message);
     TieredReply::Done(reply.finish())
 }
 
@@ -631,7 +631,7 @@ async fn read_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 ) -> TieredReply {
     let hash = shared.hasher.hash(key);
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut w = RespWriter::new(reply.reply(), proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Miss => w.null(),
         Resolved::Ram(addr) => {
@@ -663,10 +663,10 @@ async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     proto: Protocol,
 ) -> TieredReply {
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(&mut reply, proto).array_header(argv.len() - 1);
+    RespWriter::new(reply.reply(), proto).array_header(argv.len() - 1);
     for key in &argv[1..] {
         let hash = shared.hasher.hash(key);
-        let mut w = RespWriter::new(&mut reply, proto);
+        let mut w = RespWriter::new(reply.reply(), proto);
         match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
             Resolved::Ram(addr) => {
                 let ks = shared.store.borrow();
@@ -681,7 +681,7 @@ async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             // abandoned, exactly what GET answers for the same key.
             Resolved::Fail(message) => {
                 reply.clear();
-                RespWriter::new(&mut reply, proto).error(message);
+                RespWriter::new(reply.reply(), proto).error(message);
                 return TieredReply::Done(reply.finish());
             }
         }
@@ -709,7 +709,7 @@ async fn exists<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         }
     }
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(&mut reply, proto).int(count);
+    RespWriter::new(reply.reply(), proto).int(count);
     TieredReply::Done(reply.finish())
 }
 
@@ -721,7 +721,7 @@ async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 ) -> TieredReply {
     let hash = shared.hasher.hash(key);
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut w = RespWriter::new(reply.reply(), proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Miss => w.int(0),
         Resolved::Ram(addr) => {
@@ -745,7 +745,7 @@ async fn type_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 ) -> TieredReply {
     let hash = shared.hasher.hash(key);
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut w = RespWriter::new(reply.reply(), proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => w.simple("string"),
         Resolved::Miss => w.simple("none"),
@@ -762,7 +762,7 @@ async fn ttl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 ) -> TieredReply {
     let hash = shared.hasher.hash(key);
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut w = RespWriter::new(reply.reply(), proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         // No expiry on tiered namespaces in M4: live keys never expire.
         Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => w.int(-1),
@@ -784,7 +784,7 @@ async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let key = argv.arg(1);
     let hash = shared.hasher.hash(key);
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut w = RespWriter::new(reply.reply(), proto);
     let slice_of = |value: &[u8], w: &mut RespWriter<'_>| {
         let len = value.len() as i64;
         let from = if start < 0 { (len + start).max(0) } else { start.min(len) };
@@ -925,7 +925,7 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         }
     }
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut w = RespWriter::new(reply.reply(), proto);
     w.array_header(2);
     w.bulk(next.to_string().as_bytes());
     w.array_header(keys.len());
@@ -953,7 +953,7 @@ async fn dbsize<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     match dbsize_count(shared, ns, proto).await {
         Ok(len) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            RespWriter::new(&mut reply, proto).int(len as i64);
+            RespWriter::new(reply.reply(), proto).int(len as i64);
             TieredReply::Done(reply.finish())
         }
         Err(reply) => TieredReply::Done(reply),
@@ -1049,7 +1049,7 @@ async fn drain_shadow_tickets<O: PlaneObserver + 'static, F: SegmentFs + Clone +
                     table.shadow_read_failed(ticket.cold);
                     let addr = ticket.cold.to_raw();
                     let mut reply = OpenReply::new(shared.take_reply_buf());
-                    RespWriter::new(&mut reply, proto).error(&format!(
+                    RespWriter::new(reply.reply(), proto).error(&format!(
                         "ERR DBSIZE: shadow twin at {addr} unreadable ({cause}) — ADR-0093 A3"
                     ));
                     return Err(reply.finish());
@@ -1239,7 +1239,7 @@ fn int_write_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     match outcome {
         Ok((seq, old_value)) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            RespWriter::new(&mut reply, proto).int(int_of(old_value.as_deref()));
+            RespWriter::new(reply.reply(), proto).int(int_of(old_value.as_deref()));
             if class == Some(FsyncClass::Always) {
                 TieredReply::Gated { reply: reply.finish(), seq }
             } else {

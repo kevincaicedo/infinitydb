@@ -154,7 +154,7 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         && m.flags.contains(CmdFlags::INTERNAL)
     {
         let mut reply = OpenReply::new(shared.take_reply_buf());
-        reply.lend(|out| crate::exec::unknown_command_reply(argv, proto, out));
+        crate::exec::unknown_command_reply(argv, proto, reply.reply());
         pending.push_back(PendingReply::Done(reply.finish()));
         return FastDispatch::Handled;
     }
@@ -309,7 +309,7 @@ pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
             continue; // barrier held with pending drained: dispatch it now
         };
         let reply = settle_reply(&shared, key, front, &mut inflight).await;
-        let written = shared.with_conn(key, |conn| conn.out.extend_from_slice(reply.bytes()));
+        let written = shared.with_conn(key, |conn| conn.out.emit(&reply));
         shared.recycle_reply_buf(reply.into_bytes());
         if written.is_none() {
             return;
@@ -344,7 +344,7 @@ pub(super) async fn settle_reply<O: PlaneObserver + 'static, F: SegmentFs + Clon
             match shared.with_conn(key, |conn| conn.take_self_push(seq)).flatten() {
                 Some(frames) => {
                     let mut reply = reply.reopen();
-                    RespWriter::new(&mut reply, proto).encoded(&frames);
+                    RespWriter::new(reply.reply(), proto).encoded(&frames);
                     reply.finish()
                 }
                 None => reply,
@@ -431,7 +431,7 @@ async fn settle_gather<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
     inflight: &mut usize,
 ) -> OwnedReply {
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(&mut reply, proto).array_header(parts.len());
+    RespWriter::new(reply.reply(), proto).array_header(parts.len());
     for part in parts {
         let element = match part {
             GatherPart::Done(element) => Some(element),
@@ -448,7 +448,7 @@ async fn settle_gather<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
                 }
             }
         };
-        let mut w = RespWriter::new(&mut reply, proto);
+        let mut w = RespWriter::new(reply.reply(), proto);
         match element {
             Some(element) => {
                 w.encoded(if unwrap_single { gather_element(&element) } else { element.bytes() });
@@ -575,7 +575,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         && m.flags.contains(CmdFlags::INTERNAL)
     {
         let mut reply = OpenReply::new(shared.take_reply_buf());
-        reply.lend(|out| crate::exec::unknown_command_reply(argv, proto, out));
+        crate::exec::unknown_command_reply(argv, proto, reply.reply());
         pending.push_back(PendingReply::Done(reply.finish()));
         return true;
     }
@@ -891,9 +891,8 @@ async fn gather_mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     for k in &argv[1..] {
         if shared.router.is_local(k, shared.cell) {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            reply.lend(|out| {
-                shared.execute_owned_into(origin, &[b"GET", k], proto, id, db, None, false, out)
-            });
+            let get: [&[u8]; 2] = [b"GET", k];
+            shared.execute_owned_into(origin, &get, proto, id, db, None, false, reply.reply());
             parts.push(GatherPart::Done(reply.finish()));
         } else {
             match send_apply(
@@ -939,9 +938,7 @@ pub(super) async fn gather_json_mget<O: PlaneObserver + 'static, F: SegmentFs + 
         if shared.router.is_local(k, shared.cell) {
             let mut reply = OpenReply::new(shared.take_reply_buf());
             let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
-            reply.lend(|out| {
-                shared.execute_owned_into(origin, &sub, proto, id, db, None, false, out)
-            });
+            shared.execute_owned_into(origin, &sub, proto, id, db, None, false, reply.reply());
             parts.push(GatherPart::Done(reply.finish()));
         } else {
             let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
@@ -991,9 +988,7 @@ pub(super) async fn program_mset<O: PlaneObserver + 'static, F: SegmentFs + Clon
             if shared.router.is_local(argv[i], shared.cell) {
                 let mut reply = OpenReply::new(shared.take_reply_buf());
                 let pair: [&[u8]; 3] = [b"SET", argv[i], argv[i + 1]];
-                reply.lend(|out| {
-                    shared.execute_owned_into(origin, &pair, proto, id, db, None, false, out)
-                });
+                shared.execute_owned_into(origin, &pair, proto, id, db, None, false, reply.reply());
                 let reply = reply.finish();
                 if reply.is_error() && failure.is_none() {
                     failure = Some(reply);
@@ -1042,21 +1037,26 @@ fn restricted_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let mut reply = OpenReply::new(shared.take_reply_buf());
     if meta.id == CommandId::Ping {
         if argv.len() > 2 {
-            RespWriter::new(&mut reply, proto)
+            RespWriter::new(reply.reply(), proto)
                 .error("ERR wrong number of arguments for 'ping' command");
         } else {
-            reply.lend(|out| pubsub::subscriber_ping(argv.get(1).copied(), proto, out));
+            pubsub::subscriber_ping(argv.get(1).copied(), proto, reply.reply());
         }
     } else {
         let sub = argv.get(1).copied();
-        pubsub::restricted_error(meta.id, meta.name, sub, &mut RespWriter::new(&mut reply, proto));
+        pubsub::restricted_error(
+            meta.id,
+            meta.name,
+            sub,
+            &mut RespWriter::new(reply.reply(), proto),
+        );
     }
     reply.finish()
 }
 
 fn unavailable_default_reply(proto: Protocol) -> OwnedReply {
     let mut reply = OpenReply::new(Vec::new());
-    RespWriter::new(&mut reply, proto)
+    RespWriter::new(reply.reply(), proto)
         .error("ERR configured default namespace is unavailable; use SELECT or INF.NS USE");
     reply.finish()
 }
@@ -1107,7 +1107,7 @@ fn dispatch_mirror<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         // The scope a conn-state command executed *under* — SELECT / USE
         // change it for every later command, not for themselves.
         let scope = ExecScope::of(&live);
-        reply.lend(|out| execute_slices(argv, &mut shared.store.borrow_mut(), &mut live, now, out));
+        execute_slices(argv, &mut shared.store.borrow_mut(), &mut live, now, reply.reply());
         shared.observer.borrow_mut().on_execute(
             shared.cell,
             origin,
@@ -1122,9 +1122,8 @@ fn dispatch_mirror<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             c.cx.ns = live.ns;
         });
     } else {
-        let close = reply.lend(|out| {
-            shared.execute_owned_into(origin, argv, proto, id, db, conn_ns, false, out)
-        });
+        let close =
+            shared.execute_owned_into(origin, argv, proto, id, db, conn_ns, false, reply.reply());
         if let Some(dur) = stall_request(argv) {
             shared.stall_until.set(shared.now.get().saturating_add(dur));
         }
@@ -1171,7 +1170,7 @@ pub(super) fn render_outcome<O: PlaneObserver + 'static, F: SegmentFs + Clone + 
         | OwnedOutcome::Bool(_)) => {
             // Defensive: typed outcomes from a future peer.
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            let mut w = RespWriter::new(&mut reply, proto);
+            let mut w = RespWriter::new(reply.reply(), proto);
             match other {
                 OwnedOutcome::Ok => w.simple("OK"),
                 OwnedOutcome::Int(i) => w.int(i),

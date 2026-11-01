@@ -708,7 +708,7 @@ pub fn execute(
     ks: &mut Keyspace,
     cx: &mut ConnCx,
     now: Nanos,
-    out: &mut ReplyBuf<'_>,
+    out: &mut ReplyBuf,
 ) {
     let Some(meta) = lookup(argv.arg(0)) else {
         let mut w = RespWriter::new(out, cx.proto);
@@ -878,7 +878,7 @@ fn execute_db(
     store: &mut CellStore,
     cx: &mut ConnCx,
     now: Nanos,
-    out: &mut ReplyBuf<'_>,
+    out: &mut ReplyBuf,
 ) {
     let mut w = RespWriter::new(out, cx.proto);
     match meta.id {
@@ -1205,7 +1205,7 @@ pub fn execute_slices(
     ks: &mut Keyspace,
     cx: &mut ConnCx,
     now: Nanos,
-    out: &mut ReplyBuf<'_>,
+    out: &mut ReplyBuf,
 ) {
     debug_assert!(!argv.is_empty(), "empty argv is a caller bug");
     execute(argv, ks, cx, now, out);
@@ -1541,13 +1541,7 @@ fn flush(
 
 // ---- KEYS / SCAN ---------------------------------------------------------------
 
-fn keys(
-    pattern: &[u8],
-    store: &mut CellStore,
-    now: Nanos,
-    proto: Protocol,
-    out: &mut ReplyBuf<'_>,
-) {
+fn keys(pattern: &[u8], store: &mut CellStore, now: Nanos, proto: Protocol, out: &mut ReplyBuf) {
     // Bounded per-cell slice semantics arrive with the plane's scatter
     // (M1-S02); locally this is one full home-group sweep.
     let mut hits: Vec<Vec<u8>> = Vec::new();
@@ -1574,7 +1568,7 @@ fn scan(
     store: &mut CellStore,
     now: Nanos,
     proto: Protocol,
-    out: &mut ReplyBuf<'_>,
+    out: &mut ReplyBuf,
 ) {
     let mut w = RespWriter::new(out, proto);
     let Some(cursor) = parse_cursor(argv.arg(1)) else {
@@ -1958,7 +1952,7 @@ const UNKNOWN_ARGS_BUDGET: usize = 128;
 // (ADR-0097 — review finding C6, where these bytes forged a second reply).
 /// The unknown-command reply for a client-typed `INTERNAL` row, refused
 /// at the plane's dispatch funnels before any routing (ADR-0115).
-pub(crate) fn unknown_command_reply(argv: &[&[u8]], proto: Protocol, out: &mut ReplyBuf<'_>) {
+pub(crate) fn unknown_command_reply(argv: &[&[u8]], proto: Protocol, out: &mut ReplyBuf) {
     unknown_command(argv, &mut RespWriter::new(out, proto));
 }
 
@@ -2143,7 +2137,7 @@ pub fn stall_request(argv: &[&[u8]]) -> Option<Nanos> {
 mod tests {
     use super::*;
     use inf_store::StoreConfig;
-    use inf_wire::{ConnParser, Parsed, ParserLimits};
+    use inf_wire::{ConnParser, Parsed, ParserLimits, ReplyStream};
 
     /// M4-S21 (ADR-0063 D1): the `DISKFULL` extension error's wire
     /// shapes, byte-pinned — the compat register's shape source until
@@ -2154,26 +2148,24 @@ mod tests {
     fn diskfull_error_shapes() {
         use inf_store::DiskFullCause;
         for proto in [inf_wire::Protocol::Resp2, inf_wire::Protocol::Resp3] {
-            let mut out = Vec::new();
-            let mut view = ReplyBuf::over(&mut out);
-            let mut w = RespWriter::new(&mut view, proto);
+            let mut out = ReplyStream::new(Vec::new());
+            let mut w = RespWriter::new(out.open(), proto);
             op_error(
                 OpError::DiskFull(DiskFullCause::Budget { used: 16_252_928, budget: 16_777_216 }),
                 &mut w,
             );
             assert_eq!(
-                out,
+                out.as_bytes(),
                 b"-DISKFULL tiered namespace disk budget exhausted (used=16252928 \
                   budget=16777216)\r\n"
                     .to_vec(),
                 "{proto:?}"
             );
-            let mut out = Vec::new();
-            let mut view = ReplyBuf::over(&mut out);
-            let mut w = RespWriter::new(&mut view, proto);
+            let mut out = ReplyStream::new(Vec::new());
+            let mut w = RespWriter::new(out.open(), proto);
             op_error(OpError::DiskFull(DiskFullCause::Device), &mut w);
             assert_eq!(
-                out,
+                out.as_bytes(),
                 b"-DISKFULL tier device out of space (ENOSPC)\r\n".to_vec(),
                 "{proto:?}"
             );
@@ -2190,9 +2182,9 @@ mod tests {
         let mut parser = ConnParser::new(ParserLimits::default());
         let mut iter = parser.feed(&wire);
         let Some(Parsed::Command(argv)) = iter.next() else { panic!("one command") };
-        let mut out = Vec::new();
-        execute(&argv, store, cx, now, &mut ReplyBuf::over(&mut out));
-        out
+        let mut out = ReplyStream::new(Vec::new());
+        execute(&argv, store, cx, now, out.open());
+        out.into_vec()
     }
 
     fn run(cx: &mut ConnCx, store: &mut Keyspace, parts: &[&[u8]]) -> Vec<u8> {
@@ -2579,9 +2571,9 @@ mod tests {
                     .chain(shape.iter().map(|tok| fill(tok)))
                     .collect();
                 let argv: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-                let mut reply = Vec::new();
-                let mut out = ReplyBuf::over(&mut reply);
-                execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut out);
+                let mut reply = ReplyStream::new(Vec::new());
+                let out = reply.open();
+                execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), out);
                 cases += 1;
                 assert!(!out.bytes().is_empty(), "{name} {shape:?} wrote no frame");
                 if out.is_error() {
@@ -2593,7 +2585,7 @@ mod tests {
                         before,
                         "{name} {:?} replied {:?} and mutated the keyspace",
                         shape,
-                        String::from_utf8_lossy(&reply[..reply.len().min(80)])
+                        String::from_utf8_lossy(&out.bytes()[..out.bytes().len().min(80)])
                     );
                 }
             }
@@ -2633,9 +2625,10 @@ mod tests {
                     let argv: Vec<&[u8]> = std::iter::once(meta.name.as_bytes())
                         .chain(ARGS.iter().copied().cycle().take(argc.saturating_sub(1)))
                         .collect();
-                    let mut buf = b"+earlier\r\n".to_vec();
-                    let mut out = ReplyBuf::over(&mut buf);
-                    execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut out);
+                    let mut buf = ReplyStream::new(Vec::new());
+                    RespWriter::new(buf.open(), Protocol::Resp2).simple("earlier");
+                    let out = buf.open();
+                    execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), out);
                     assert!(
                         !out.bytes().is_empty(),
                         "{} with {argc} args wrote no frame",
@@ -2669,8 +2662,9 @@ mod tests {
         // frame cap, and the queued/remote paths execute slices anyway).
         let big_val = vec![b'v'; MAX_VAL_LEN + 1];
         let argv: Vec<&[u8]> = vec![b"MSET", b"fresh", b"x", b"b", &big_val];
-        let mut reply = Vec::new();
-        execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut ReplyBuf::over(&mut reply));
+        let mut reply = ReplyStream::new(Vec::new());
+        execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), reply.open());
+        let reply = reply.into_vec();
         assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
         assert_eq!(run(&mut cx, &mut store, &[b"GET", b"fresh"]), b"$-1\r\n");
     }
@@ -3222,12 +3216,11 @@ mod tests {
             assert_eq!(at(&[b"EXISTS", b"o"]), b":0\r\n", "PEXPIREAT 1 LT at {now}");
             // The cross-cell move's destination put carries a snapshot
             // deadline through the same seam.
-            let mut out = Vec::new();
-            let mut view = ReplyBuf::over(&mut out);
-            let mut w = RespWriter::new(&mut view, Protocol::Resp2);
+            let mut out = ReplyStream::new(Vec::new());
+            let mut w = RespWriter::new(out.open(), Protocol::Resp2);
             let put: &[&[u8]] = &[b"INF.PUT", b"m", b"v", b"1"];
             inf_move_put(put, store.db_mut(0), &cx.node, now, &mut w);
-            assert_eq!(out, b"+OK\r\n");
+            assert_eq!(out.as_bytes(), b"+OK\r\n");
             assert_eq!(run_at(&mut cx, &mut store, now, &[b"EXISTS", b"m"]), b":0\r\n", "{now}");
         }
     }

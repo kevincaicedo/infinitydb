@@ -38,11 +38,10 @@ pub(super) async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + C
             let now = shared.now.get();
             let Some(changes) = shared.with_conn(key, |conn| {
                 if adding {
-                    frames.lend(|out| pubsub::apply_subscribe(&names, kind, &mut conn.cx, now, out))
+                    pubsub::apply_subscribe(&names, kind, &mut conn.cx, now, frames.reply())
                 } else {
                     let names = (!names.is_empty()).then_some(names.as_slice());
-                    frames
-                        .lend(|out| pubsub::apply_unsubscribe(names, kind, &mut conn.cx, now, out))
+                    pubsub::apply_unsubscribe(names, kind, &mut conn.cx, now, frames.reply())
                 }
             }) else {
                 return false;
@@ -364,7 +363,7 @@ pub(super) async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Cl
             }
         }
         let mut reply = OpenReply::new(shared.take_reply_buf());
-        RespWriter::new(&mut reply, proto).array_header(parts.len() * 2);
+        RespWriter::new(reply.reply(), proto).array_header(parts.len() * 2);
         for (name, count) in parts {
             let count = match count {
                 Count::Local(n) => n,
@@ -380,7 +379,7 @@ pub(super) async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Cl
                     | OwnedOutcome::Err(_) => 0,
                 },
             };
-            let mut w = RespWriter::new(&mut reply, proto);
+            let mut w = RespWriter::new(reply.reply(), proto);
             w.bulk(name);
             w.int(count);
         }
@@ -389,7 +388,7 @@ pub(super) async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Cl
         int_reply(shared, proto, shared.pubsub.borrow().live_pattern_count() as i64)
     } else {
         let mut reply = OpenReply::new(shared.take_reply_buf());
-        pubsub::pubsub_subcommand_error(sub, &mut RespWriter::new(&mut reply, proto));
+        pubsub::pubsub_subcommand_error(sub, &mut RespWriter::new(reply.reply(), proto));
         reply.finish()
     }
 }
@@ -427,7 +426,7 @@ async fn merge_channels<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     }
     let mut reply = OpenReply::new(shared.take_reply_buf());
     {
-        let mut w = RespWriter::new(&mut reply, proto);
+        let mut w = RespWriter::new(reply.reply(), proto);
         w.array_header(total);
         for name in local {
             w.bulk(name);
@@ -450,7 +449,7 @@ pub(super) fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clo
     from: CellId,
     token: FabricToken,
     argv: &[&[u8]],
-    scratch: &mut Vec<u8>,
+    scratch: &mut ReplyStream,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
     pubs: &mut Vec<OwnerPub>,
 ) -> bool {
@@ -500,8 +499,8 @@ pub(super) fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clo
         } else if argv[1].eq_ignore_ascii_case(b"CHANNELS") && argv.len() <= 3 {
             let names = shared.pubsub.borrow().live_owned_channels(argv.get(2).copied());
             let start = scratch.len();
-            let mut reply = ReplyBuf::over(scratch);
-            let mut w = RespWriter::new(&mut reply, Protocol::Resp2);
+            let reply = scratch.open();
+            let mut w = RespWriter::new(reply, Protocol::Resp2);
             w.array_header(names.len());
             for name in &names {
                 w.bulk(name);
@@ -557,7 +556,7 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     key: ConnKey,
     defer: Option<ConnKey>,
     deferred: &mut OpenReply,
-    write: impl FnOnce(&mut ReplyBuf<'_>, Protocol),
+    write: impl FnOnce(&mut ReplyBuf, Protocol),
 ) -> bool {
     let now_ms = shared.now.get().as_millis();
     let caps = shared.knobs.get().cob_pubsub;
@@ -569,10 +568,10 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             if defer == Some(key) {
                 // The publisher's own frames ride the reply path instead
                 // (emitted right after the receiver count).
-                deferred.lend(|out| write(out, conn.cx.proto));
+                write(deferred.reply(), conn.cx.proto);
                 return true;
             }
-            write(&mut ReplyBuf::over(&mut conn.out), conn.cx.proto);
+            write(conn.out.open(), conn.cx.proto);
             enforce_output_cap(&shared.node, conn, now_ms, caps);
             true
         })

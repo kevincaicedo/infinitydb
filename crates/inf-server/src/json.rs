@@ -2044,12 +2044,12 @@ mod tests {
         ] {
             let mut store = CellStore::new(Default::default());
             let cx = durable_cx(budget, record_max);
-            let mut out = Vec::new();
+            let mut out = inf_wire::ReplyStream::new(Vec::new());
             {
-                let mut view = inf_wire::ReplyBuf::over(&mut out);
-                let mut writer = RespWriter::new(&mut view, Protocol::Resp2);
+                let mut writer = RespWriter::new(out.open(), Protocol::Resp2);
                 execute_json(CommandId::JsonSet, &argv[..], &mut store, &cx, now, &mut writer);
             }
+            let out = out.into_vec();
             assert!(out.starts_with(prefix), "reply was {}", String::from_utf8_lossy(&out));
             assert!(store.json_freeze(b"doc", now).unwrap().is_none(), "refusal committed state");
             // The BUSY refusal is the only one the `log_admission_busy`
@@ -2062,13 +2062,12 @@ mod tests {
 
     fn run(argv: &[&[u8]], store: &mut CellStore, cx: &ConnCx, now: Nanos) -> Vec<u8> {
         let meta = inf_wire::lookup(argv[0]).expect("a registered JSON command");
-        let mut out = Vec::new();
+        let mut out = inf_wire::ReplyStream::new(Vec::new());
         {
-            let mut view = inf_wire::ReplyBuf::over(&mut out);
-            let mut writer = RespWriter::new(&mut view, Protocol::Resp2);
+            let mut writer = RespWriter::new(out.open(), Protocol::Resp2);
             execute_json(meta.id, argv, store, cx, now, &mut writer);
         }
-        out
+        out.into_vec()
     }
 
     /// `[[["y"×40000]]]`, written through the handler under an unbounded

@@ -125,8 +125,8 @@ fn execute_ns_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
 ) -> (OwnedReply, bool) {
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    let close = reply
-        .lend(|out| shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), false, out));
+    let close =
+        shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), false, reply.reply());
     (reply.finish(), close)
 }
 
@@ -551,7 +551,7 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
         // swap window and lost `always`-acked writes to a cut inside it.
         if let Err(e) = shared.store.borrow().ns_create_check(&spec) {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
+            crate::admin::ns_error(e, &mut RespWriter::new(reply.reply(), proto));
             return reply.finish();
         }
         if control.pending_creates() >= crate::control::PENDING_CREATE_MAX {
@@ -578,7 +578,7 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
                 let mut reply = OpenReply::new(shared.take_reply_buf());
                 crate::admin::ns_error(
                     inf_store::NsError::Exists,
-                    &mut RespWriter::new(&mut reply, proto),
+                    &mut RespWriter::new(reply.reply(), proto),
                 );
                 return reply.finish();
             }
@@ -607,7 +607,7 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
             // persist drops the definition (recorded residual).
             control.create_applied(ns_id);
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
+            crate::admin::ns_error(e, &mut RespWriter::new(reply.reply(), proto));
             return reply.finish();
         }
         created = Some((ns_id, spec.name.clone(), cleanup, spec.tier.is_some()));
@@ -649,7 +649,7 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
         };
         if let Err(e) = crate::admin::apply_ns_set(&mut shared.store.borrow_mut(), &name, update) {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
+            crate::admin::ns_error(e, &mut RespWriter::new(reply.reply(), proto));
             return reply.finish();
         }
         let mut fan = vec![b"INF.NSFAN".to_vec(), b"SET".to_vec(), name];
@@ -737,7 +737,7 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         Ok(spec) => spec,
         Err(e) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
+            crate::admin::ns_error(e, &mut RespWriter::new(reply.reply(), proto));
             return reply.finish();
         }
     };
@@ -868,7 +868,7 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
 /// The refusal of an argv wider than the codec's `MAX_APPLY_ARGS`.
 fn too_many_args_reply(proto: Protocol) -> OwnedReply {
     let mut reply = OpenReply::new(Vec::new());
-    RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
+    RespWriter::new(reply.reply(), proto).error("ERR too many arguments for cross-cell execution");
     reply.finish()
 }
 

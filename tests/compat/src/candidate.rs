@@ -76,19 +76,13 @@ impl Candidate {
             CandidateClock::Monotonic(epoch) => Nanos(epoch.elapsed().as_nanos() as u64 + 1),
             CandidateClock::Held(now) => now,
         };
-        let mut out = Vec::new();
+        let mut out = inf_wire::ReplyStream::new(Vec::new());
         let mut iter = self.parser.feed(wire);
         let mut executed = 0;
         while let Some(parsed) = iter.next() {
             match parsed {
                 Parsed::Command(argv) | Parsed::Inline(argv) => {
-                    execute(
-                        &argv,
-                        &mut self.store,
-                        &mut self.cx,
-                        now,
-                        &mut inf_wire::ReplyBuf::over(&mut out),
-                    );
+                    execute(&argv, &mut self.store, &mut self.cx, now, out.open());
                     executed += 1;
                 }
                 Parsed::Incomplete => break,
@@ -96,6 +90,6 @@ impl Candidate {
             }
         }
         assert_eq!(executed, 1, "harness must send exactly one command per call");
-        out
+        out.into_vec()
     }
 }

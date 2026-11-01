@@ -50,7 +50,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         db: u16,
         ns: Option<NsId>,
         program: bool,
-        out: &mut ReplyBuf<'_>,
+        out: &mut ReplyBuf,
     ) -> bool {
         let mut cx = ConnCx {
             proto,
@@ -236,14 +236,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             let store = ks.db_mut(usize::from(db));
             if del { store.del(key, now) } else { store.exists(key, now) }
         };
-        let mut reply = Vec::new();
-        RespWriter::new(&mut ReplyBuf::over(&mut reply), Protocol::Resp2).int(i64::from(hit));
+        let mut reply = OpenReply::new(Vec::new());
+        RespWriter::new(reply.reply(), Protocol::Resp2).int(i64::from(hit));
         self.observer.borrow_mut().on_execute(
             self.cell,
             origin,
             ExecScope::Db(db),
             &[name, key],
-            &reply,
+            reply.bytes(),
             now,
         );
         i64::from(hit)
@@ -253,14 +253,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     pub(super) fn apply_dbsize(&self, origin: ExecOrigin, db: u16) -> i64 {
         let now = self.now.get();
         let len = self.store.borrow_mut().db_mut(usize::from(db)).len() as i64;
-        let mut reply = Vec::new();
-        RespWriter::new(&mut ReplyBuf::over(&mut reply), Protocol::Resp2).int(len);
+        let mut reply = OpenReply::new(Vec::new());
+        RespWriter::new(reply.reply(), Protocol::Resp2).int(len);
         self.observer.borrow_mut().on_execute(
             self.cell,
             origin,
             ExecScope::Db(db),
             &[b"DBSIZE"],
-            &reply,
+            reply.bytes(),
             now,
         );
         len
@@ -526,7 +526,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         proto: Protocol,
         ns: NsId,
         program: bool,
-        out: &mut ReplyBuf<'_>,
+        out: &mut ReplyBuf,
     ) -> NsApplyOutcome {
         let meta = lookup(argv[0]);
         let class = self.store.borrow().ns_fsync_class(ns);
@@ -690,15 +690,15 @@ pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone +
     from: CellId,
     token: FabricToken,
     argv: &[&[u8]],
-    scratch: &mut Vec<u8>,
+    scratch: &mut ReplyStream,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
 ) -> bool {
     if !argv[0].eq_ignore_ascii_case(b"INF.NSFAN") {
         return false;
     }
     let start = scratch.len();
-    let mut reply = ReplyBuf::over(scratch);
-    let mut w = RespWriter::new(&mut reply, Protocol::Resp2);
+    let reply = scratch.open();
+    let mut w = RespWriter::new(reply, Protocol::Resp2);
     // Crash-matrix point (ADR-0108 D3): a peer refusing its `CREATE`
     // leg — the deterministic stand-in for the OS refusing the tier
     // ring reservation on this cell after the catalog swap.

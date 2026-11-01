@@ -676,23 +676,19 @@ between cells in one process, not authentication or an ACL capability
 
 > **ADR-0190 (2026-10-29):** a reply carries its
 > outcome beside its bytes. `ReplyOutcome::{Success, Error}` is one byte
-> the writer sets. `Reply<B>` wraps a reply's bytes (`ReplyBuf<'a>` over
-> a buffer that outlives the reply, `OpenReply` over a pool buffer) with
-> where the reply began and its outcome; `ReplyBuf::over` opens one at
-> the buffer's end, `OpenReply::new` clears its buffer and opens at 0.
-> `OpenReply::lend` runs a closure over a `ReplyBuf` view of the owned
-> reply, opened at its start with its current outcome, and writes the
-> view's outcome back. `OwnedReply` is the closed form, built only by
+> the writer sets. A `ReplyBuf` holds a reply's bytes with where the reply
+> began and its outcome (the ADR-0190 A1 note below): a `ReplyStream`
+> opens one at its buffer's end, `OpenReply::new` clears its buffer and
+> opens one at 0. `OwnedReply` is the closed form, built only by
 > `OpenReply::finish`, by `ReplyBuf::detach` (a copy of the reply's
 > bytes with its outcome, the buffer left at the reply's start) or by
 > `OwnedReply::received(bytes, outcome) -> Result<OwnedReply, ZeroByteReply>`,
 > which refuses zero bytes and returns them; `OwnedReply::reopen` is the
 > inverse of `finish`, bytes and outcome kept. A reply is read through
-> `outcome()`, `is_error()`, `bytes()` and `into_bytes()`; a borrowed
-> reply's bytes are the buffer's from its start, read through the view's
-> `bytes()` or from the buffer once the view has dropped. `RespWriter::new`
-> takes `&mut Reply<B>`, not `&mut Vec<u8>`; the writer's type and its
-> frame methods are as before, and it has `encoded(bytes)`, the one entry for bytes another writer
+> `outcome()`, `is_error()`, `bytes()` and `into_bytes()`; an open
+> reply's bytes are its buffer's from its start, read through its
+> `bytes()`. `RespWriter::new` takes `&mut ReplyBuf`, not `&mut Vec<u8>`;
+> its frame methods are as before, and it has `encoded(bytes)`, the one entry for bytes another writer
 > encoded (a nested element, a frame after the first), which leaves the
 > outcome alone — a whole reply is moved, never pasted. `error` and
 > `error_bytes` set `Error` only when they write the reply's first frame;
@@ -702,7 +698,7 @@ between cells in one process, not authentication or an ACL capability
 > the reply's top-level frame is an error line, and no reader of a reply
 > decides from its bytes. The sketch below is the shape (ADR-0190 D1).
 
-> **ADR-0190 A1 (2026-10-30), implementation open:** the open reply
+> **ADR-0190 A1 (2026-10-30):** the open reply
 > lives beside its buffer. `ReplyBuf` owns its bytes with the reply's
 > start and outcome and has no public constructor: it is reached as
 > `&mut ReplyBuf` from a `ReplyStream` (a buffer of successive replies,
@@ -713,9 +709,8 @@ between cells in one process, not authentication or an ACL capability
 > `OpenReply::lend` go. `RespWriter::new` takes `&mut ReplyBuf`; the
 > writer holds the reply and the protocol, and its frame methods are as
 > before. A stream's buffer is read, sent, appended to and emptied only
-> between replies (`as_bytes`, `consume`, `emit`, `discard`). These
-> types are not built; until they are, the sketch below is ADR-0190
-> D1's shape. `OwnedReply::success()` answers a `SuccessView` of a
+> between replies (`as_bytes`, `consume`, `emit`, `discard`).
+> `OwnedReply::success()` answers a `SuccessView` of a
 > `Success` reply's bytes, or `ErrorPassthrough` for an `Error` reply;
 > a value decoder of a leg's bytes takes only a `SuccessView`, so no
 > decoder reads a reply whose outcome was not read.
@@ -751,11 +746,11 @@ pub struct ArgvRef<'a>;   // argv[i] -> &'a [u8]; offset-based over the frame;
 // Serializer: RESP2/RESP3 selected per connection (HELLO).
 pub enum Protocol { Resp2, Resp3 }
 pub enum ReplyOutcome { Success, Error }    // ADR-0190 D1: set by the writer
-pub struct Reply<B: BorrowMut<Vec<u8>>>;    // bytes, the reply's start, its outcome
-pub type ReplyBuf<'a> = Reply<&'a mut Vec<u8>>;  // over a buffer that outlives it
-pub type OpenReply = Reply<Vec<u8>>;        // over a pool buffer; lend / finish
+pub struct ReplyBuf;                        // one open reply: bytes, its start, its outcome
+pub struct ReplyStream;                     // successive replies: open / emit / consume
+pub struct OpenReply;                       // one reply over a pool buffer: reply / finish
 pub struct OwnedReply;                      // finish / detach / received(bytes, outcome)
-pub struct RespWriter<'b>;                  // over &mut Reply<B> (one reply)
+pub struct RespWriter<'b>;                  // over &mut ReplyBuf (one reply)
   // simple / error / error_bytes / int / bulk / null / null_array /
   // array_header / map_header / bool / double / verbatim / big_number —
   // RESP2/3 variants selected by `Protocol`; stack-buffer itoa, no allocation.
@@ -924,11 +919,11 @@ impl SlotRouter {
 > execution and observer interfaces.
 
 > **ADR-0190 (2026-10-29):** `execute` and
-> `execute_slices` take `out: &mut ReplyBuf<'_>` in place of
+> `execute_slices` take `out: &mut ReplyBuf` in place of
 > `&mut Vec<u8>`, as does every reply parameter of the crate (none is
-> generic; an owned open reply is lent to them); a writer of several
-> replies, the parse stage's batch, holds the connection's buffer and
-> opens one `ReplyBuf` per reply. Every reply the
+> generic; an owned open reply lends its `ReplyBuf` through `reply()`);
+> a writer of several replies, the parse stage's batch or the drain,
+> holds a `ReplyStream` and opens one reply per command. Every reply the
 > plane holds, forwards or gathers is
 > an `OwnedReply`: the caller reads `outcome()` after `execute` returns,
 > and no site of `inf-server` decides success or failure from a reply's
@@ -947,11 +942,11 @@ impl SlotRouter {
 > carries `reply-outcome-allow: <reason>`. The sketch below is the shape
 > (ADR-0190 D2, D4).
 
-> **ADR-0190 A1 (2026-10-30), implementation open:** `execute` and
+> **ADR-0190 A1 (2026-10-30):** `execute` and
 > every reply parameter take `out: &mut ReplyBuf`, with no lifetime;
 > the parse stage's batch holds the connection's `ReplyStream` and the
 > drain the owner's reply scratch, each opening one reply per command
-> it runs. These parameters are not built. The `KEYS` and `SCAN`
+> it runs. The `KEYS` and `SCAN`
 > programs read each leg's outcome first, as `PUBSUB CHANNELS` does: an
 > `Error` leg is the reply, untouched; a `Success` leg without its
 > header answers `ERR cross-cell program reply malformed`.
@@ -961,7 +956,7 @@ pub struct ConnCx { pub proto: Protocol, pub id: u64 }   // HELLO state
 /// One parsed command → store ops → RESP2/3 reply bytes. All commands
 /// enter through the inf-wire registry (lookup → arity → key spec).
 pub fn execute(argv: &ArgvRef<'_>, store: &mut CellStore, cx: &mut ConnCx,
-               now: Nanos, out: &mut ReplyBuf<'_>);
+               now: Nanos, out: &mut ReplyBuf);
 ```
 
 Reply bytes are oracle-pinned by the compat harness (`tests/compat`):

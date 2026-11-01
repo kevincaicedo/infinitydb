@@ -2130,7 +2130,7 @@ mod tests {
     use inf_foundation::time::Nanos;
     use inf_foundation::{CellCount, CellId, SLOT_COUNT};
     use inf_store::{Keyspace, StoreConfig};
-    use inf_wire::{Protocol, RespWriter};
+    use inf_wire::{Protocol, ReplyStream, RespWriter};
 
     use super::{
         BoardObservation, BoardSweep, CkptBoard, CkptSlot, CkptSpace, CkptTarget, ControlHandle,
@@ -2483,11 +2483,10 @@ mod tests {
     fn info_rdb_last_save_time(node: &NodeInfo) -> u64 {
         let keyspace = Keyspace::new(StoreConfig::default());
         let argv: [&[u8]; 2] = [b"INFO", b"persistence"];
-        let mut reply = Vec::new();
-        let mut view = inf_wire::ReplyBuf::over(&mut reply);
-        let mut writer = RespWriter::new(&mut view, Protocol::Resp2);
+        let mut reply = ReplyStream::new(Vec::new());
+        let mut writer = RespWriter::new(reply.open(), Protocol::Resp2);
         crate::admin::info(&argv[..], &keyspace, node, Nanos(1), &mut writer);
-        let text = String::from_utf8(reply).expect("INFO is text");
+        let text = String::from_utf8(reply.into_vec()).expect("INFO is text");
         text.lines()
             .find_map(|line| line.strip_prefix("rdb_last_save_time:"))
             .and_then(|value| value.trim().parse().ok())

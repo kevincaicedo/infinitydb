@@ -65,8 +65,8 @@ use inf_store::{
 };
 use inf_wire::{
     ArgvRef, CmdFlags, CommandId, ConnParser, ErrorPassthrough, OpenReply, OwnedReply, Parsed,
-    ParserLimits, Protocol, ReplyBuf, ReplyOutcome, RespWriter, SuccessView, ZeroByteReply,
-    arity_ok, extract_keys, lookup,
+    ParserLimits, Protocol, ReplyBuf, ReplyOutcome, ReplyStream, RespWriter, SuccessView,
+    ZeroByteReply, arity_ok, extract_keys, lookup,
 };
 
 #[cfg(test)]
@@ -179,8 +179,8 @@ pub(super) struct Conn {
     fd: RawFd,
     parser: ConnParser,
     cx: ConnCx,
-    /// Staged reply bytes awaiting RESPOND.
-    out: Vec<u8>,
+    /// Staged reply bytes awaiting RESPOND, one reply opened at a time.
+    out: ReplyStream,
     /// One in-flight Send max: two outstanding sends on one socket have no
     /// kernel ordering guarantee.
     send_inflight: bool,
@@ -548,8 +548,9 @@ pub struct ServerPlane<
     started: bool,
     /// Recv completions staged from step 1 for PARSE+EXECUTE (step 3+4).
     inbox: Vec<(ConnKey, BufferId, u32)>,
-    /// Reusable FABRIC-IN scratch: owner-side reply bytes for this drain.
-    reply_scratch: Vec<u8>,
+    /// Reusable FABRIC-IN scratch: owner-side reply bytes for this drain,
+    /// one reply opened per op it answers.
+    reply_scratch: ReplyStream,
     /// Fabric-apply prefetch batch (reused across FABRIC-IN steps).
     apply_stage: Vec<StagedApply>,
     apply_stage_bytes: Vec<u8>,
@@ -762,7 +763,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             listener,
             started: false,
             inbox: Vec::new(),
-            reply_scratch: Vec::new(),
+            reply_scratch: ReplyStream::new(Vec::new()),
             apply_stage: Vec::new(),
             apply_stage_bytes: Vec::new(),
             parse_stage: Vec::new(),
@@ -1387,7 +1388,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 node: Rc::clone(&self.shared.node),
                 close_requested: Cell::new(false),
             },
-            out: Vec::new(),
+            out: ReplyStream::new(Vec::new()),
             send_inflight: false,
             closing: false,
             close_after_flush: false,

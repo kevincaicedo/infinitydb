@@ -98,7 +98,7 @@ fn drain(
     answer: &mut impl FnMut(&[&[u8]]) -> Option<Outcome<'static>>,
 ) {
     let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0u64);
+        (ReplyStream::new(Vec::new()), Vec::new(), Vec::new(), Vec::new(), 0u64);
     let mut answered = Vec::new();
     let now = shared.now.get();
     shared.fabric.borrow_mut().drain(64, |from, op| {
@@ -125,7 +125,7 @@ fn drain(
     // reply's outcome).
     let mut fabric = shared.fabric.borrow_mut();
     for (to, token, reply) in staged {
-        fabric.reply(to, token, &staged_outcome(&scratch, &reply));
+        fabric.reply(to, token, &staged_outcome(scratch.as_bytes(), &reply));
     }
     for (to, token, outcome) in answered {
         fabric.reply(to, token, &outcome);
@@ -144,9 +144,9 @@ const BLOB: &[u8] = b"!5\r\nERR x\r\n";
 /// An error as this build's writer encodes it, so a row reads the same
 /// under the blob-error plant as on the plain build.
 fn written_error(text: &str) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    RespWriter::new(&mut ReplyBuf::over(&mut bytes), Protocol::Resp2).error(text);
-    bytes
+    let mut reply = OpenReply::new(Vec::new());
+    RespWriter::new(reply.reply(), Protocol::Resp2).error(text);
+    reply.finish().into_bytes()
 }
 
 /// Under `inf_canary_resp3_blob_error` the peer's error is written in the
@@ -489,7 +489,7 @@ fn reply_outcome_read_of_an_empty_value_stages_zero_bytes() {
     assert_eq!(cells.local(1, &[b"SET", &key, b""]), b"+OK\r\n");
     let shared = &cells.planes[1].shared;
     let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0u64);
+        (ReplyStream::new(Vec::new()), Vec::new(), Vec::new(), Vec::new(), 0u64);
     let read = Op::Read { token: FabricToken(1), slot: KeySlot::of_key(&key), key: &key };
     let now = shared.now.get();
     handle_fabric_op(
@@ -504,7 +504,7 @@ fn reply_outcome_read_of_an_empty_value_stages_zero_bytes() {
         &mut orphans,
     );
     let [(_, _, reply)] = staged.as_slice() else { panic!("one staged reply: {}", staged.len()) };
-    assert!(matches!(staged_outcome(&scratch, reply), Outcome::Bytes(b"")));
+    assert!(matches!(staged_outcome(scratch.as_bytes(), reply), Outcome::Bytes(b"")));
 }
 
 /// `MSETNX`'s `SET` fan: a leg's error reply is the client's reply, read by

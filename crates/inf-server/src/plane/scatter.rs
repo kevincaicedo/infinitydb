@@ -86,7 +86,7 @@ pub(super) const PROGRAM_REPLY_MALFORMED: &str = "ERR cross-cell program reply m
 /// outcome.
 fn owned_error(buf: Vec<u8>, proto: Protocol, text: &str) -> OwnedReply {
     let mut reply = OpenReply::new(buf);
-    RespWriter::new(&mut reply, proto).error(text);
+    RespWriter::new(reply.reply(), proto).error(text);
     reply.finish()
 }
 
@@ -120,7 +120,7 @@ pub(super) async fn ns_dbsize_local<O: PlaneObserver + 'static, F: SegmentFs + C
     };
     let now = shared.now.get();
     let mut reply = OpenReply::new(Vec::new());
-    RespWriter::new(&mut reply, Protocol::Resp2).int(n);
+    RespWriter::new(reply.reply(), Protocol::Resp2).int(n);
     shared.observer.borrow_mut().on_execute(
         shared.cell,
         origin,
@@ -152,7 +152,7 @@ pub(super) fn int_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     n: i64,
 ) -> OwnedReply {
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(&mut reply, proto).int(n);
+    RespWriter::new(reply.reply(), proto).int(n);
     reply.finish()
 }
 
@@ -162,7 +162,7 @@ pub(super) fn simple_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     text: &str,
 ) -> OwnedReply {
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(&mut reply, proto).simple(text);
+    RespWriter::new(reply.reply(), proto).simple(text);
     reply.finish()
 }
 
@@ -176,7 +176,7 @@ pub(super) fn run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
 ) -> OwnedReply {
     let mut reply = OpenReply::new(shared.take_reply_buf());
     // A program's local leg (ADR-0115 D2).
-    reply.lend(|out| shared.execute_owned_into(origin, argv, proto, id, db, None, true, out));
+    shared.execute_owned_into(origin, argv, proto, id, db, None, true, reply.reply());
     reply.finish()
 }
 
@@ -298,9 +298,7 @@ async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         }
     } else {
         let mut reply = OpenReply::new(shared.take_reply_buf());
-        reply.lend(|out| {
-            shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), true, out)
-        });
+        shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), true, reply.reply());
         reply.finish()
     }
 }
@@ -654,7 +652,7 @@ pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clon
     }
     let mut reply = OpenReply::new(shared.take_reply_buf());
     {
-        let mut w = RespWriter::new(&mut reply, proto);
+        let mut w = RespWriter::new(reply.reply(), proto);
         w.array_header(total);
         w.encoded(local.body());
         for body in &bodies {
@@ -706,7 +704,7 @@ pub(super) async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clon
     };
     let mut reply = OpenReply::new(shared.take_reply_buf());
     {
-        let mut w = RespWriter::new(&mut reply, proto);
+        let mut w = RespWriter::new(reply.reply(), proto);
         w.array_header(2);
         let mut next_buf = [0u8; 20];
         w.bulk(crate::exec::fmt_u64(&mut next_buf, next));
@@ -740,7 +738,7 @@ pub(super) async fn program_randomkey<
         shared.recycle_reply_buf(raw.into_bytes());
     }
     let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(&mut reply, proto).null();
+    RespWriter::new(reply.reply(), proto).null();
     reply.finish()
 }
 
@@ -896,7 +894,7 @@ pub fn parse_array_header(reply: SuccessView<'_>) -> Option<(usize, usize)> {
 /// `*2\r\n$N\r\n<cursor>\r\n…` SCAN reply head → `(cursor, keys offset)`.
 /// Every bound is checked before it is indexed (F-L12-06): the cursor's
 /// trailing CRLF must exist, so the offset never lands past the buffer
-/// (`&raw[rest_at..]` at the caller). A value decoder over a `SuccessView`:
+/// `ScanLeg::rest` slices. A value decoder over a `SuccessView`:
 /// its caller read the leg's outcome by type, so `None` means a malformed
 /// success, which `read_scan_leg` answers (ADR-0190 A1.2). Public for the
 /// fuzz target, and never over a reply's raw bytes:

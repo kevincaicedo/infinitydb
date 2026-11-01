@@ -20,7 +20,7 @@ pub(super) fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone 
     now: Nanos,
     from: CellId,
     op: Op<'_>,
-    scratch: &mut Vec<u8>,
+    scratch: &mut ReplyStream,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
     pubs: &mut Vec<OwnerPub>,
     gated: &mut Vec<GatedReply>,
@@ -75,7 +75,7 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     now: Nanos,
     from: CellId,
     op: Op<'_>,
-    scratch: &mut Vec<u8>,
+    scratch: &mut ReplyStream,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
     pubs: &mut Vec<OwnerPub>,
     gated: &mut Vec<GatedReply>,
@@ -124,10 +124,10 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // it as `ErrCode::EmptyReply` (every reply is at least one frame,
             // ADR-0190 D2). No production path sends this op; whichever
             // first does owns giving the found value a frame.
-            let mut reply = ReplyBuf::over(scratch);
+            let reply = scratch.open();
             let hit = match shared.store.borrow_mut().db_mut(0).get(key, now) {
                 Some(value) => {
-                    RespWriter::new(&mut reply, Protocol::Resp2).encoded(value);
+                    RespWriter::new(reply, Protocol::Resp2).encoded(value);
                     true
                 }
                 None => false,
@@ -150,8 +150,8 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // decided here, before the pump can park it.
             if !program && lookup(argv[0]).is_some_and(|m| m.flags.contains(CmdFlags::INTERNAL)) {
                 let start = scratch.len();
-                let mut reply = ReplyBuf::over(scratch);
-                crate::exec::unknown_command_reply(argv, proto, &mut reply);
+                let reply = scratch.open();
+                crate::exec::unknown_command_reply(argv, proto, reply);
                 let outcome = reply.outcome();
                 staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
                 return;
@@ -195,7 +195,7 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             {
                 let now = shared.now.get();
                 let mut reply = OpenReply::new(Vec::new());
-                RespWriter::new(&mut reply, Protocol::Resp2).int(n);
+                RespWriter::new(reply.reply(), Protocol::Resp2).int(n);
                 shared.observer.borrow_mut().on_execute(
                     shared.cell,
                     ExecOrigin::Fabric(from),
@@ -208,8 +208,8 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 return;
             }
             let start = scratch.len();
-            let mut reply = ReplyBuf::over(scratch);
-            match shared.execute_ns_owned(from, argv, proto, NsId(ns), program, &mut reply) {
+            let reply = scratch.open();
+            match shared.execute_ns_owned(from, argv, proto, NsId(ns), program, reply) {
                 NsApplyOutcome::Reply => {
                     let outcome = reply.outcome();
                     staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
@@ -264,7 +264,7 @@ fn handle_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     cmd: u8,
     program: bool,
     argv: &[&[u8]],
-    scratch: &mut Vec<u8>,
+    scratch: &mut ReplyStream,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
     pubs: &mut Vec<OwnerPub>,
 ) {
@@ -315,7 +315,7 @@ fn handle_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 staged.push((from, token, StagedReply::Int(n)));
             } else {
                 let start = scratch.len();
-                let mut reply = ReplyBuf::over(scratch);
+                let reply = scratch.open();
                 shared.execute_owned_into(
                     ExecOrigin::Fabric(from),
                     argv,
@@ -324,7 +324,7 @@ fn handle_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     db,
                     None,
                     program,
-                    &mut reply,
+                    reply,
                 );
                 let outcome = reply.outcome();
                 staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
@@ -456,7 +456,7 @@ pub(super) fn flush_parse_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone
     stage_bytes: &mut Vec<u8>,
     origin: ExecOrigin,
     conn_cx: &mut ConnCx,
-    out: &mut Vec<u8>,
+    out: &mut ReplyStream,
 ) {
     if stage.is_empty() {
         return;
@@ -477,19 +477,19 @@ pub(super) fn flush_parse_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone
     for e in stage.iter() {
         let argc = read_argv_block(stage_bytes, e.off, &mut argv_buf);
         let argv = &argv_buf[..argc];
-        let before = out.len();
         // Staged commands are never conn-state, so the scope before and
         // after execution is the same one.
         let scope = ExecScope::of(conn_cx);
-        // One reply per staged command, each opened at its own start, the
-        // view dropped before the observer reads the bytes (ADR-0190 D2).
-        execute(argv, &mut shared.store.borrow_mut(), conn_cx, now, &mut ReplyBuf::over(out));
+        // One reply per staged command, each opened at the stream's end, so
+        // its start and outcome are its own (ADR-0190 A1.3).
+        let reply = out.open();
+        execute(argv, &mut shared.store.borrow_mut(), conn_cx, now, reply);
         shared.observer.borrow_mut().on_execute(
             shared.cell,
             origin,
             scope,
             argv,
-            &out[before..],
+            reply.bytes(),
             now,
         );
         // QUIT and DEBUG are stage barriers; a staged command can neither
@@ -513,7 +513,7 @@ pub(super) fn stage_or_handle<O: PlaneObserver + 'static, F: SegmentFs + Clone +
     op: Op<'_>,
     stage: &mut Vec<StagedApply>,
     stage_bytes: &mut Vec<u8>,
-    scratch: &mut Vec<u8>,
+    scratch: &mut ReplyStream,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
     pubs: &mut Vec<OwnerPub>,
     gated: &mut Vec<GatedReply>,
@@ -567,7 +567,7 @@ fn stage_or_handle_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     op: Op<'_>,
     stage: &mut Vec<StagedApply>,
     stage_bytes: &mut Vec<u8>,
-    scratch: &mut Vec<u8>,
+    scratch: &mut ReplyStream,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
     pubs: &mut Vec<OwnerPub>,
     gated: &mut Vec<GatedReply>,
@@ -618,7 +618,7 @@ pub(super) fn flush_apply_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone
     shared: &Shared<O, F>,
     stage: &mut Vec<StagedApply>,
     stage_bytes: &mut Vec<u8>,
-    scratch: &mut Vec<u8>,
+    scratch: &mut ReplyStream,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
     pubs: &mut Vec<OwnerPub>,
 ) {
@@ -753,7 +753,8 @@ mod fabric_batch_depth {
     use inf_store::{Keyspace, StoreConfig};
 
     use super::{
-        CellId, Nanos, NodeInfo, NoopObserver, ServerPlane, handle_fabric_op, stage_or_handle,
+        CellId, Nanos, NodeInfo, NoopObserver, ReplyStream, ServerPlane, handle_fabric_op,
+        stage_or_handle,
     };
 
     /// F-L18-06 (review of 2026-08-30): the data plane never recurses on
@@ -790,7 +791,7 @@ mod fabric_batch_depth {
         };
         for prefetch in [false, true] {
             let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0u64);
+                (ReplyStream::new(Vec::new()), Vec::new(), Vec::new(), Vec::new(), 0u64);
             let (mut stage, mut stage_bytes) = (Vec::new(), Vec::new());
             let op = nested(DEPTH);
             if prefetch {
