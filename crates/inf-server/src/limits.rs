@@ -56,8 +56,14 @@ pub const ACK_MAP: Cap = Cap::entries::<ACK_MAP_ENTRIES>("ack-map", CapFill::Ser
 /// any in `cap_assembly_violations`). Crossing: a reserve refused at the
 /// assembly fails it before anything serves (`TimerAssemblyError`); derived
 /// never, as the cap is the role count.
+#[cfg(not(inf_canary_timer_owners_short))]
 pub const SERVER_TIMER_OWNERS: Cap =
     Cap::entries::<{ crate::TimerRole::COUNT }>("timer-owners", CapFill::Assembly);
+/// Canary: a cap one short of the roles, so every assembly's last reserve
+/// is refused.
+#[cfg(inf_canary_timer_owners_short)]
+pub const SERVER_TIMER_OWNERS: Cap =
+    Cap::entries::<{ crate::TimerRole::COUNT - 1 }>("timer-owners", CapFill::Assembly);
 
 /// Checkpoint-board slots one cell's sweep visits per MAINTAIN turn
 /// (ADR-0159 D4, A1.4). Owner: the cell's `BoardSweep`, charged as one

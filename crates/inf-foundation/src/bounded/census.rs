@@ -160,9 +160,15 @@ impl CapCensus {
     /// mark, which the cell's loop takes as its first iteration begins. The
     /// one allocation is the `Rc`, at the cell's assembly, before it serves.
     pub fn new(cell: CellId) -> (Rc<CapCensus>, ServeMark) {
+        // Canary: the census is born serving, so every `Assembly` row
+        // registers and fills after the mark.
+        #[cfg(inf_canary_serve_mark_first)]
+        let born = CensusPhase::Serving;
+        #[cfg(not(inf_canary_serve_mark_first))]
+        let born = CensusPhase::Assembling;
         let census = Rc::new(CapCensus {
             cell,
-            phase: Cell::new(CensusPhase::Assembling),
+            phase: Cell::new(born),
             rows: RefCell::new([None; CAP_CENSUS_ROWS_MAX]),
             cap_assembly_violations: Cell::new(0),
             unsliced_drops: Cell::new(0),

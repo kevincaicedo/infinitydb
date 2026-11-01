@@ -339,6 +339,14 @@ rows=(
   # always barrier to cover its frames, loses acked writes at the cut, and
   # the audit's everysec bound reads them.
   "inf_canary_everysec_no_successor m2-fill-tick DURABILITY"
+  # ADR-0154 D1: the server's timer cap is its role count, every position
+  # reserved at the assembly. Planted one short, every assembly's last
+  # reserve is refused before the cell's loop exists, by its own token.
+  "inf_canary_timer_owners_short m0-smoke timer-owners-full-at-assembly"
+  # ADR-0163 D2: the census is born serving, so the timer set's `Assembly`
+  # row registers and fills after the serve mark: the census counts each
+  # as an assembly violation, and the census verdict reads the count.
+  "inf_canary_serve_mark_first m0-smoke cap-assembly-violated"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.
