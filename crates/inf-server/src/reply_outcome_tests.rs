@@ -32,11 +32,14 @@ const ORIGIN: ExecOrigin = ExecOrigin::Conn(0, 0);
 
 struct Cells {
     planes: Vec<ServerPlane<NoopObserver>>,
+    /// Per cell, in cell order: the applies its ns-apply pumps took, which
+    /// a row that claims a pump arm reads as its engagement.
+    pumped: Vec<Cell<usize>>,
 }
 
 impl Cells {
     fn new() -> Self {
-        let planes = Mesh::new(2, MeshConfig::default())
+        let planes: Vec<_> = Mesh::new(2, MeshConfig::default())
             .into_iter()
             .enumerate()
             .map(|(cell, fabric)| {
@@ -53,7 +56,8 @@ impl Cells {
                 plane
             })
             .collect();
-        Cells { planes }
+        let pumped = planes.iter().map(|_| Cell::new(0)).collect();
+        Cells { planes, pumped }
     }
 
     fn origin(&self) -> &Rc<Shared<NoopObserver, StdSegmentFs>> {
@@ -90,9 +94,9 @@ impl Cells {
             for plane in &self.planes {
                 plane.shared.fabric.borrow_mut().flush();
             }
-            for plane in &self.planes {
+            for (plane, pumped) in self.planes.iter().zip(&self.pumped) {
                 drain(&plane.shared, &mut answer);
-                wake_ns_pumps(&plane.shared);
+                pumped.set(pumped.get() + wake_ns_pumps(&plane.shared));
             }
         }
         panic!("the program exceeded its bounded legs");
@@ -102,15 +106,18 @@ impl Cells {
 /// The cell loop's wake of each origin's ns-apply pump after a FABRIC-IN
 /// pass, where a tiered apply waits in its origin's FIFO. The harness runs
 /// no executor, so a pump must finish in one poll: no leg here suspends,
-/// since no cold read reaches a device.
-fn wake_ns_pumps(shared: &Rc<Shared<NoopObserver, StdSegmentFs>>) {
-    let origins: Vec<u16> = {
+/// since no cold read reaches a device. Returns the applies the woken
+/// pumps took: a pump that finished took its whole queue.
+fn wake_ns_pumps(shared: &Rc<Shared<NoopObserver, StdSegmentFs>>) -> usize {
+    let (origins, applies) = {
         let (queues, active) = (shared.ns_applies.borrow(), shared.ns_pump_active.borrow());
-        (0..shared.cells)
+        let origins: Vec<u16> = (0..shared.cells)
             .filter(|&origin| {
                 !queues[usize::from(origin)].is_empty() && !active[usize::from(origin)]
             })
-            .collect()
+            .collect();
+        let applies: usize = origins.iter().map(|&origin| queues[usize::from(origin)].len()).sum();
+        (origins, applies)
     };
     let mut cx = Context::from_waker(Waker::noop());
     for origin in origins {
@@ -118,6 +125,7 @@ fn wake_ns_pumps(shared: &Rc<Shared<NoopObserver, StdSegmentFs>>) {
         let pump = pin!(ns_apply_pump(Rc::clone(shared), origin));
         assert!(pump.poll(&mut cx).is_ready(), "the ns-apply pump suspended: no device here");
     }
+    applies
 }
 
 /// One FABRIC-IN pass of `shared`, then its staged replies shipped.
@@ -397,6 +405,41 @@ fn reply_outcome_tiered_dbsize_drain_error_is_the_reply() {
         out.emit(reply);
     }
     assert_eq!(out.as_bytes(), [b":0\r\n".as_slice(), expected.bytes(), b":1\r\n"].concat());
+}
+
+/// A tiered peer's `SCAN` refusal through its ns-apply pump's tiered arm:
+/// the cursor addresses cell 1, so the one leg runs on cell 1's pump,
+/// whose tiered `SCAN` refuses `MATCH` (the string family only), and the
+/// pump tags that reply from its outcome (ADR-0190 D3). The client reads
+/// the peer's own refusal, `Error` by its outcome, where a reply tagged a
+/// success would read as a scan leg without its head and earn the
+/// malformed-reply error. A client reaches it when its cursor has moved to
+/// the next cell and the call carries an option.
+#[test]
+fn reply_outcome_tiered_scan_refusal_is_the_reply() {
+    let cells = Cells::new();
+    tiered_namespace(&cells);
+    let peer = &cells.planes[1].shared;
+    let leg: &[&[u8]] = &[b"SCAN", b"0", b"MATCH", b"x"];
+    let meta = lookup(leg[0]).expect("a registered command");
+    let class = peer.store.borrow().ns_fsync_class(TIERED);
+    let origin = ExecOrigin::Fabric(CellId(0));
+    let own = tiered::dispatch_tiered(peer, origin, TIERED, meta, leg, Protocol::Resp2, class);
+    let tiered::TieredReply::Done(expected) = cells.drive(own, no_answer) else {
+        panic!("a read is never gated on a durable write");
+    };
+    assert!(expected.is_error(), "the peer's tiered SCAN refuses MATCH");
+    engaged(expected.bytes());
+    let cursor = (1u64 << SCAN_CELL_SHIFT).to_string();
+    let reply = tiered_command(&cells, &[b"SCAN", cursor.as_bytes(), b"MATCH", b"x"]);
+    assert_eq!(cells.pumped[1].get(), 1, "VACUOUS: no leg reached the peer's ns-apply pump");
+    assert_eq!(cells.pumped[0].get(), 0, "the origin's pumps took nothing");
+    assert_eq!(
+        String::from_utf8_lossy(reply.bytes()),
+        String::from_utf8_lossy(expected.bytes()),
+        "the client reads the peer's refusal"
+    );
+    assert_eq!(reply.outcome(), ReplyOutcome::Error);
 }
 
 /// An invalid `CONFIG SET`: the local leg's error is the reply and nothing
