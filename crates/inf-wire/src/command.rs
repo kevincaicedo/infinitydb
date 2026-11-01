@@ -4,15 +4,17 @@
 //! dispatch internals.
 //!
 //! Dispatch is a compile-time perfect hash: case-fold the name, one
-//! multiply-mix hash, one table probe, one short verify-compare — no
-//! branching scans, no allocation. The table is built in `const` context and
-//! the build **fails to compile** on any bucket collision, so adding a
-//! command can never silently degrade lookup into a collision chain.
+//! multiply-mix hash, one table probe, then a compare of the length and of
+//! the bytes with only the letters' case ignored — no branching scans, no
+//! allocation, and only a registry name resolves. The table is built in
+//! `const` context and the build **fails to compile** on any bucket
+//! collision, so adding a command can never silently degrade lookup into a
+//! collision chain.
 //!
-//! M1 surface growth (M1-E1): names now pack into **two** folded u64 words
-//! (≤ 16 bytes — `INCRBYFLOAT`/`PEXPIRETIME` are 11) and the table holds 256
-//! buckets. The lookup cost is unchanged in shape: two register loads, two
-//! multiplies, one xor, one probe, one two-word compare.
+//! A name packs into **two** little-endian u64 words (≤ 16 bytes —
+//! `INCRBYFLOAT`/`PEXPIRETIME` are 11), and the table holds `BUCKETS`
+//! entries. The lookup's shape: two register loads, two multiplies, one
+//! probe, then the length and the care-masked bytes.
 
 use crate::parser::ArgvRef;
 
@@ -393,60 +395,105 @@ const MAX_NAME_LEN: usize = 16;
 /// splitmix attempts).
 const HASH_MULTIPLIER_LO: u64 = 0x4C19_0974_F5FB_1CA9;
 const HASH_MULTIPLIER_HI: u64 = 0x0AD3_0175_CBB3_C0C5;
-/// Word-wide ASCII case fold (`a-z` → `A-Z`); zero padding stays zero.
-/// Non-letters map somewhere harmless — the verify word-compare against the
-/// canonical name rejects any non-command byte sequence.
+/// The hash's case fold: bit 5 cleared in every byte (`a-z` → `A-Z`), so
+/// every letter case of a name probes one bucket; zero padding stays zero.
+/// The fold is lossy by design (`.` and 0x0E fold equal, a space folds to
+/// zero): it only chooses the bucket, and the verify in [`lookup`] is exact.
 const FOLD_MASK: u64 = 0xDFDF_DFDF_DFDF_DFDF;
 
-/// Packs a name (≤ 16 bytes) into two folded little-endian words; the length
-/// mixes into the high word. Distinct names ⇒ distinct word pairs, so a
-/// collision-free multiplier pair always exists.
+/// Packs a name (≤ 16 bytes) into two little-endian words, zero-padded and
+/// not folded: the byte order `lookup` loads its input in.
 #[inline(always)]
-const fn pack_folded(name: &[u8]) -> (u64, u64) {
-    let mut w0 = 0u64;
-    let mut w1 = 0u64;
+const fn pack_raw(name: &[u8]) -> [u64; 2] {
+    let mut words = [0u64; 2];
     let mut i = 0;
     while i < name.len() {
-        if i < 8 {
-            w0 |= (name[i] as u64) << (i * 8);
-        } else {
-            w1 |= (name[i] as u64) << ((i - 8) * 8);
+        words[i / 8] |= (name[i] as u64) << ((i % 8) * 8);
+        i += 1;
+    }
+    words
+}
+
+/// The verify's mask over a name's raw words: every bit of every byte but
+/// bit 5 of a byte that is an ASCII letter, where its two cases differ. A
+/// non-letter byte and the zero padding are compared whole.
+#[inline(always)]
+const fn care_mask(name: &[u8]) -> [u64; 2] {
+    let mut care = [!0u64; 2];
+    let mut i = 0;
+    while i < name.len() {
+        if name[i].is_ascii_alphabetic() {
+            care[i / 8] &= !(0x20u64 << ((i % 8) * 8));
         }
         i += 1;
     }
-    (w0 & FOLD_MASK, (w1 & FOLD_MASK) ^ name.len() as u64)
+    care
+}
+
+/// The hash's input: the raw words with bit 5 cleared in every byte and the
+/// length XORed into the high word. Build and probe both reach the hash
+/// through this one function, so every letter case of a name lands in its
+/// bucket.
+#[inline(always)]
+const fn fold_for_hash(raw: [u64; 2], len: usize) -> [u64; 2] {
+    [raw[0] & FOLD_MASK, (raw[1] & FOLD_MASK) ^ len as u64]
+}
+
+/// A name's hash words. The registry's names pack to distinct pairs, which
+/// a collision-free multiplier pair needs and `build_table` checks; other
+/// inputs may share a name's pair, and the verify refuses them.
+#[inline(always)]
+const fn pack_folded(name: &[u8]) -> [u64; 2] {
+    fold_for_hash(pack_raw(name), name.len())
 }
 
 #[inline(always)]
-const fn hash_words(w0: u64, w1: u64) -> usize {
-    ((w0.wrapping_mul(HASH_MULTIPLIER_LO) ^ w1.wrapping_mul(HASH_MULTIPLIER_HI))
+const fn hash_words(words: [u64; 2]) -> usize {
+    ((words[0].wrapping_mul(HASH_MULTIPLIER_LO) ^ words[1].wrapping_mul(HASH_MULTIPLIER_HI))
         >> (64 - BUCKET_BITS)) as usize
 }
 
-/// `bucket → (canonical packed words, command index + 1)` (index 0 = empty).
-/// The packed words are precomputed so the lookup verify is two u64 compares
-/// against the probed entry — no per-lookup repack of the canonical name.
-/// Collisions fail the build.
-static TABLE: [(u64, u64, u8); BUCKETS] = build_table();
+/// One bucket of the table: a registry name's raw words, its care mask and
+/// its length, precomputed so the verify reads the probed entry alone, and
+/// its row. An empty bucket has length 0, which no probed input has, and
+/// no row.
+#[derive(Clone, Copy)]
+struct Bucket {
+    name: [u64; 2],
+    care: [u64; 2],
+    len: u8,
+    row: Option<&'static CommandMeta>,
+}
 
-const fn build_table() -> [(u64, u64, u8); BUCKETS] {
-    let mut table = [(0u64, 0u64, 0u8); BUCKETS];
+/// `bucket → Bucket`, built at compile time. Collisions fail the build.
+static TABLE: [Bucket; BUCKETS] = build_table();
+
+const fn build_table() -> [Bucket; BUCKETS] {
+    const EMPTY: Bucket = Bucket { name: [0; 2], care: [0; 2], len: 0, row: None };
+    let mut table = [EMPTY; BUCKETS];
     let mut i = 0;
     while i < COMMANDS.len() {
         let name = COMMANDS[i].name.as_bytes();
         assert!(name.len() <= MAX_NAME_LEN, "command name exceeds MAX_NAME_LEN");
-        let (w0, w1) = pack_folded(name);
-        let bucket = hash_words(w0, w1);
-        assert!(table[bucket].2 == 0, "perfect-hash collision — re-search the multipliers");
-        table[bucket] = (w0, w1, (i + 1) as u8);
+        let bucket = hash_words(pack_folded(name));
+        assert!(table[bucket].row.is_none(), "perfect-hash collision — re-search the multipliers");
+        table[bucket] = Bucket {
+            name: pack_raw(name),
+            care: care_mask(name),
+            // Exact: the assert above bounds the length by MAX_NAME_LEN.
+            len: name.len() as u8,
+            row: Some(&COMMANDS[i]),
+        };
         i += 1;
     }
     table
 }
 
-/// Case-insensitive O(1) command lookup: pack+fold (one ≤16-byte copy), two
-/// multiplies, one probe, one two-word compare. `None` for anything not in
-/// the registry.
+/// Case-insensitive O(1) command lookup: `Some(row)` exactly when `name`
+/// equals a registry name under ASCII case folding of letters — the same
+/// length, and byte for byte equal with `a`–`z` read as `A`–`Z`. `None` for
+/// anything not in the registry. One ≤ 16-byte copy, two multiplies, one
+/// probe, then the length and the care-masked bytes.
 #[inline]
 pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta> {
     let len = name.len();
@@ -476,17 +523,23 @@ pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta> {
         15 => padded[..15].copy_from_slice(name),
         _ => padded.copy_from_slice(name),
     }
-    let w0 = u64::from_le_bytes(padded[..8].try_into().expect("8 bytes")) & FOLD_MASK;
-    let w1 =
-        (u64::from_le_bytes(padded[8..].try_into().expect("8 bytes")) & FOLD_MASK) ^ len as u64;
-    let (c0, c1, slot) = TABLE[hash_words(w0, w1)];
-    // Two precomputed word compares verify name AND length (length is mixed
-    // into the high packed word; empty buckets hold (0, 0), which no name
-    // packs to because the length mix is non-zero).
-    if w0 != c0 || w1 != c1 || slot == 0 {
+    let raw = [
+        u64::from_le_bytes(padded[..8].try_into().expect("8 bytes")),
+        u64::from_le_bytes(padded[8..].try_into().expect("8 bytes")),
+    ];
+    let bucket = &TABLE[hash_words(fold_for_hash(raw, len))];
+    // The length first, then the bytes: where the name has a letter, the
+    // input's byte may differ from it in the case bit alone; every other
+    // byte, the zero padding included, must be equal. So nothing else that
+    // shares a name's hash words — a longer spelling whose added bytes fold
+    // away, a non-letter one bit 5 off — resolves, and an empty bucket
+    // (length 0) never does.
+    let differ =
+        ((raw[0] ^ bucket.name[0]) & bucket.care[0]) | ((raw[1] ^ bucket.name[1]) & bucket.care[1]);
+    if len != usize::from(bucket.len) || differ != 0 {
         return None;
     }
-    Some(&COMMANDS[(slot - 1) as usize])
+    bucket.row
 }
 
 // ---- Key extraction ----------------------------------------------------------
@@ -650,9 +703,132 @@ mod tests {
             b"PEXPIRETIMEX",
             b"INF.TAKEN",
             b"AAAAAAAAAAAAAAAAA", // 17 bytes — over MAX_NAME_LEN
+            // Each shares a registry name's hash words, so it probes that
+            // name's bucket and only the verify refuses it: added bytes that
+            // fold to zero with a ninth byte that cancels the length change,
+            // and a non-letter that differs from the name's byte in bit 5.
+            b"PING    -",
+            b"GET     *",
+            b"SUBSCRIBF ",
+            b"JSON\x0eGET",
+            b"inf\x0ens",
+            b"PING\0\0\0\0\r",
         ] {
             assert!(lookup(probe).is_none(), "{probe:?} must not resolve");
         }
+    }
+
+    /// The rule `lookup` serves, as the standard library states it: the
+    /// registry row whose name equals the input under ASCII case folding.
+    fn oracle(input: &[u8]) -> Option<CommandId> {
+        COMMANDS.iter().find(|m| m.name.as_bytes().eq_ignore_ascii_case(input)).map(|m| m.id)
+    }
+
+    /// The spelling one byte longer than `name` that packs to the name's
+    /// hash words. A name of at most 8 bytes is padded to 8 with `fill`
+    /// (a space or NUL: both fold to zero) and followed by the byte that
+    /// cancels the length change in the high word; a longer name changes
+    /// its ninth byte by the length change and gains a trailing `fill`.
+    fn length_twin(name: &[u8], fill: u8) -> Vec<u8> {
+        let len = name.len();
+        let mut twin = name.to_vec();
+        if len <= 8 {
+            twin.resize(8, fill);
+            // The high word held the length alone; a space keeps bit 5 set.
+            let cancel = u8::try_from(len ^ 9).expect("a short name") | (fill & 0x20);
+            twin.push(cancel);
+        } else {
+            twin[8] ^= u8::try_from(len ^ (len + 1)).expect("a name is at most 16 bytes");
+            twin.push(fill);
+        }
+        twin
+    }
+
+    /// `name` with each `.` replaced by 0x0E, which differs from it in bit 5
+    /// alone; `None` for a name with no `.`.
+    fn bit5_twin(name: &[u8]) -> Option<Vec<u8>> {
+        name.contains(&b'.')
+            .then(|| name.iter().map(|&b| if b == b'.' { 0x0E } else { b }).collect())
+    }
+
+    /// Upper, lower and alternating case, then each letter flipped alone.
+    fn case_spellings(name: &[u8]) -> Vec<Vec<u8>> {
+        let mut spellings = vec![
+            name.to_vec(),
+            name.to_ascii_lowercase(),
+            name.iter()
+                .enumerate()
+                .map(|(i, b)| if i % 2 == 0 { b.to_ascii_lowercase() } else { *b })
+                .collect(),
+        ];
+        for (i, b) in name.iter().enumerate().filter(|(_, b)| b.is_ascii_alphabetic()) {
+            let mut flipped = name.to_vec();
+            flipped[i] = b ^ 0x20;
+            spellings.push(flipped);
+        }
+        spellings
+    }
+
+    /// Each position replaced by each substitute; then the name one byte
+    /// shorter, and one byte longer by each fixed substitute.
+    fn substitutions_and_lengths(name: &[u8]) -> Vec<Vec<u8>> {
+        const FIXED: [u8; 5] = [0x00, 0x20, 0x0D, 0x0A, 0xFF];
+        let mut spellings = Vec::new();
+        for (i, &b) in name.iter().enumerate() {
+            for substitute in [b ^ 0x20, 0x80 | b, b ^ 0x01].into_iter().chain(FIXED) {
+                let mut changed = name.to_vec();
+                changed[i] = substitute;
+                spellings.push(changed);
+            }
+        }
+        spellings.push(name[..name.len() - 1].to_vec());
+        for extra in FIXED {
+            let mut longer = name.to_vec();
+            longer.push(extra);
+            spellings.push(longer);
+        }
+        spellings
+    }
+
+    /// Every spelling class a lossy verify confuses, judged against the
+    /// oracle: the case spellings resolve; the length twins (space and NUL
+    /// fill), the bit-5 twins, the substitutions, the lengths one off and
+    /// the bounds resolve only where the oracle says. Each twin is checked
+    /// to pack to its name's hash words first, so a drifted generator reads
+    /// red instead of proving nothing.
+    #[test]
+    fn lookup_agrees_with_case_insensitive_equality_on_every_spelling_class() {
+        assert_eq!(oracle(b"ping"), Some(CommandId::Ping));
+        assert_eq!(oracle(b"PING    -"), None);
+        let mut spellings = Vec::new();
+        for meta in &COMMANDS {
+            let name = meta.name.as_bytes();
+            let twins = [length_twin(name, b' '), length_twin(name, 0)];
+            for twin in twins.into_iter().chain(bit5_twin(name)) {
+                assert_eq!(pack_folded(&twin), pack_folded(name), "{twin:?} is no twin");
+                spellings.push(twin);
+            }
+            spellings.extend(case_spellings(name));
+            spellings.extend(substitutions_and_lengths(name));
+        }
+        // The bounds: empty; a name padded with spaces to the longest a name
+        // may be, and one byte past it; eight spaces and the byte that folds
+        // the length away, whose hash words are (0, 0).
+        let mut padded = b"PING".to_vec();
+        padded.resize(MAX_NAME_LEN, b' ');
+        let over = [padded.as_slice(), b"P"].concat();
+        spellings.extend([Vec::new(), padded, over, b"        \x09".to_vec()]);
+        let wrong: Vec<&Vec<u8>> =
+            spellings.iter().filter(|s| lookup(s).map(|m| m.id) != oracle(s)).collect();
+        let distinct: std::collections::HashSet<&Vec<u8>> = wrong.iter().copied().collect();
+        assert!(
+            wrong.is_empty(),
+            "{} of {} spellings disagree with the oracle ({} distinct), first {:?}",
+            wrong.len(),
+            spellings.len(),
+            distinct.len(),
+            &wrong[..wrong.len().min(4)]
+        );
     }
 
     #[test]

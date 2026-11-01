@@ -660,7 +660,9 @@ rows. Each row carries the command's name, arity, flags (`READONLY`,
 `WRITE`, `ADMIN`, `FAST`, `DENYOOM`, `LOADING`, `INTERNAL`) and a key
 specification in Redis's first/last/step form. Lookup is a perfect hash
 computed at compile time: fold the name into two words, two multiplies, one
-probe, one compare. A collision in the hash fails the build.
+probe, then a compare of the length and of the bytes with only the letters'
+case ignored, so only a registry name resolves. A collision in the hash fails
+the build.
 
 The table is the single source of truth: routing reads the key specification
 to find the owner, the executor reads the flags, `COMMAND` renders the table,

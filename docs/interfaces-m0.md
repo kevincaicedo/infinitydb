@@ -782,9 +782,13 @@ pub struct CommandMeta {
     pub flags: CmdFlags,                    // READONLY | WRITE | ADMIN | FAST
     pub keys: KeySpec,                      // { first: u8, last: i8, step: u8 }; 0 = no keys
 }
-pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta>;  // perfect hash: clear bit 5
-    // of every byte, pack two u64 words with the length XORed into the high one,
-    // two multiplies, one probe, two word compares
+pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta>;  // perfect hash over
+    // bit-5-cleared words with the length mixed in; the probed entry's length is
+    // compared, then its bytes with only the letters' case ignored
+    // 2026-10-31 note: lookup(x) is Some exactly when x equals a registry name under
+    // ASCII case folding of letters: the same length, and byte for byte equal with
+    // a-z read as A-Z. A longer spelling whose added bytes fold to zero, and a
+    // non-letter byte changed in bit 5 alone, are unknown commands.
 pub fn extract_keys<'v, 'a>(meta: &CommandMeta, argv: &'v ArgvRef<'a>) -> KeyIter<'v, 'a>;
 pub fn key_spec(meta: &CommandMeta, subcommand: Option<&[u8]>) -> KeySpec;
     // ADR-0104: the routing truth — `meta.keys`, or the subcommand-scoped row
