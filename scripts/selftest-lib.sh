@@ -1,0 +1,373 @@
+# The gates' self-test machinery (ADR-0106 D1), sourced first by
+# check-scripts-selftest.sh: the case helpers, the fixture git guard, the case
+# log, the fixture lint and the driver that runs the self-test's groups.
+#
+# A group is a function `group_<name>() {` of the self-test, its cases seeing
+# only what the group itself builds. The driver reads the group set from the
+# file twice, its definition lines and bash's own function table once the file
+# is loaded, and a name only one of them lists is red. With no argument it
+# lints the groups' fixtures, runs every group in a process of its own, at most
+# CARGO_BUILD_JOBS (default 4) at once and each at CARGO_BUILD_JOBS=1, prints
+# their output in file order and folds their counts. `--group <name>` runs one
+# group in a work directory of its own and prints `group <name>: <pass> <fail>`;
+# `--list-groups` prints bash's table; `--lint` runs the fixture lint alone.
+#
+# Portable bash 3.2 (ADR-0106 D18), as the macOS leg runs it: no mapfile, no
+# `wait -n`, no associative arrays, no `{fd}` redirection; BSD xargs, sed and
+# awk. Every rm on a variable is guarded: an empty one would turn
+# `rm -rf "$x/…"` into a delete at the filesystem root.
+
+pass=0
+fail=0
+work=''
+SELFTEST_GROUP=''
+SELFTEST_ROOT=''
+case_seq=0
+
+# A case outside a group would run in every process the driver starts, the
+# listing and the lint included: it turns each of them red with its label.
+selftest_outside() {
+    echo "selftest: the case '$1' runs outside any group; every case belongs to a group_<name> function" >&2
+    exit 2
+}
+
+# INF_SELFTEST_CASE_LOG=<an empty directory>: each case also writes one record,
+# under the directory of its group, in a file named by its place in the group:
+# the group, its label, the verdict it wants, the exit status, its own verdict,
+# the work root, the cases it stands for and the captured output; a suite that
+# counts its own cases (the inventory and dep-DAG fixtures) is one record of
+# that many. Two runs compare case by case on these records; a group whose
+# records and counted cases differ in number is red.
+# case_log <label> <want> <status> <pass|fail> [<output file> [<cases>]]
+case_log() {
+    [ -n "${INF_SELFTEST_CASE_LOG:-}" ] || return 0
+    case_seq=$((case_seq + 1))
+    {
+        printf 'section\t%s\nlabel\t%s\nwant\t%s\nstatus\t%s\nverdict\t%s\nwork\t%s\ncases\t%s\noutput\n' \
+            "$SELFTEST_GROUP" "$1" "$2" "$3" "$4" "$work" "${6:-1}"
+        [ -z "${5:-}" ] || [ ! -f "$5" ] || cat "$5"
+    } >"$INF_SELFTEST_CASE_LOG/$SELFTEST_GROUP/$(printf '%05d' "$case_seq")"
+}
+
+# A gate that never ran gives no verdict (ADR-0106 D1): counted as red, a
+# tool the runner lacked passed every planted red of the gate that needed it.
+# Each expect* refuses two shapes, failing the case with the cause.
+# not_runnable <label> <command> [<want>]: a path that is no executable file,
+# or a name the shell cannot find, is refused before it runs — bash 3.2 under
+# `set -e` reports a failed exec of a path as exit 1, which reads as red.
+not_runnable() {
+    case $2 in
+    */*) [ -f "$2" ] && [ -x "$2" ] && return 1 ;;
+    *) command -v -- "$2" >/dev/null && return 1 ;;
+    esac
+    fail=$((fail + 1))
+    echo "SELFTEST FAIL: '$2' is not a runnable command, so it gives no verdict — $1"
+    case_log "$1" "${3:-run}" - fail
+}
+# no_verdict <status> <label> <log> [<want>]: a command that ran and exited 126
+# or 127 — env refusing a gate it cannot execute or find, or a gate that died
+# on a tool the runner lacks (both shells keep those codes) — is not a verdict.
+no_verdict() {
+    case $1 in 126 | 127) ;; *) return 1 ;; esac
+    fail=$((fail + 1))
+    echo "SELFTEST FAIL: exit $1 means a command could not be executed or found, not a gate verdict — $2"
+    sed 's/^/    | /' "$3"
+    case_log "$2" "${4:-run}" "$1" fail "$3"
+}
+
+# expect <red|green> <label> <command…>: runs the command with stdout+stderr
+# captured; a mismatch prints the captured output.
+expect() {
+    local want=$1 label=$2
+    shift 2
+    [ -n "$SELFTEST_GROUP" ] || selftest_outside "$label"
+    local log="$work/log" status=0
+    not_runnable "$label" "$1" "$want" && return 0
+    "$@" >"$log" 2>&1 || status=$?
+    no_verdict "$status" "$label" "$log" "$want" && return 0
+    if { [ "$want" = red ] && [ "$status" -ne 0 ]; } || { [ "$want" = green ] && [ "$status" -eq 0 ]; }; then
+        pass=$((pass + 1))
+        case_log "$label" "$want" "$status" pass "$log"
+    else
+        fail=$((fail + 1))
+        echo "SELFTEST FAIL: expected $want, got exit $status — $label"
+        sed 's/^/    | /' "$log"
+        case_log "$label" "$want" "$status" fail "$log"
+    fi
+}
+
+# expect_output <label> <pattern> <command…>: the command's output must
+# contain the pattern (a scope disclosure, an allowed-site line).
+expect_output() {
+    local label=$1 pattern=$2
+    shift 2
+    [ -n "$SELFTEST_GROUP" ] || selftest_outside "$label"
+    local log="$work/log" status=0
+    not_runnable "$label" "$1" "output $pattern" && return 0
+    "$@" >"$log" 2>&1 || status=$?
+    no_verdict "$status" "$label" "$log" "output $pattern" && return 0
+    if grep -q -- "$pattern" "$log"; then
+        pass=$((pass + 1))
+        case_log "$label" "output $pattern" "$status" pass "$log"
+    else
+        fail=$((fail + 1))
+        echo "SELFTEST FAIL: output lacks '$pattern' — $label"
+        sed 's/^/    | /' "$log"
+        case_log "$label" "output $pattern" "$status" fail "$log"
+    fi
+}
+
+# expect_red_because <label> <pattern> <command…>: red, and for its own
+# reason — a plant that is red for another reason is not evidence.
+expect_red_because() {
+    local label=$1 pattern=$2 status=0
+    shift 2
+    [ -n "$SELFTEST_GROUP" ] || selftest_outside "$label"
+    local log="$work/log"
+    not_runnable "$label" "$1" "red $pattern" && return 0
+    "$@" >"$log" 2>&1 || status=$?
+    no_verdict "$status" "$label" "$log" "red $pattern" && return 0
+    if [ "$status" -ne 0 ] && grep -q -- "$pattern" "$log"; then
+        pass=$((pass + 1))
+        case_log "$label" "red $pattern" "$status" pass "$log"
+    else
+        fail=$((fail + 1))
+        echo "SELFTEST FAIL: expected red naming '$pattern', got exit $status — $label"
+        sed 's/^/    | /' "$log"
+        case_log "$label" "red $pattern" "$status" fail "$log"
+    fi
+}
+
+# fx_git <root> <git args…>: git in a fixture repository only. `git -C ""`
+# runs in the current directory, and a root that is not its own repository
+# lets git walk up to an enclosing one, the developer's engine branch: a root
+# that is empty, outside $work or without its own `.git` is refused before
+# git runs (the rule every destructive command on a variable keeps). `init`
+# creates that `.git`, so it alone runs bare, on a root its guarded
+# constructor made.
+fx_git() {
+    local root=$1
+    shift
+    case $root in
+    "$work"/?*) ;;
+    *) echo "fx_git: '$root' is not a fixture directory under $work" >&2; exit 2 ;;
+    esac
+    [ -d "$root/.git" ] || { echo "fx_git: no repository of its own at '$root'" >&2; exit 2; }
+    git -C "$root" "$@"
+}
+# fx_only <file>: every `git -C` on a variable in <file> is fx_git's own or an
+# `init`; the canary is the self-test with a raw reset appended.
+fx_only() {
+    ! grep -n 'git -C "\$' "$1" | grep -v -e ' init -q$' -e '^[0-9]*:    git -C "\$root" "\$@"$'
+}
+
+# ---------------------------------------------------------------- the driver
+# selftest_defined <file>: the groups its definition lines name, in file order.
+selftest_defined() {
+    sed -n 's/^group_\([a-z0-9_][a-z0-9_]*\)() {$/\1/p' "$1"
+}
+# selftest_declared: the groups bash's function table holds.
+selftest_declared() {
+    declare -F | sed -n 's/^declare -f[a-z]* group_//p'
+}
+
+# The fixture lint: a group, or a helper the self-test defines, that reads a
+# literal `$work/<name>` it neither creates nor gets from an `fx_build_<name>`
+# call is red: an absent fixture passes a bare `expect red`, so a group must not
+# lean on one another group made. It reads bash's own text of each function
+# (`declare -f`, nested helpers included). A path is created where it is the
+# target of a redirection, an argument of mkdir, touch, mktemp or `git init`,
+# the last `$work` path of a cp, mv or ln, or the value a statement assigns to
+# a variable; any other mention reads it. A created path that a variable
+# completes (`"$work/as-$1"`) creates its family (`as-*`); one a variable names
+# whole (`"$work/$1"`) creates the names the function passes as words; a glob
+# reads its family. `log` is the case helpers' own.
+selftest_lint() {
+    local fn
+    for fn in $(declare -F | sed -n 's/^declare -f[a-z]* //p'); do
+        case " $SELFTEST_LIB_FUNCS " in *" $fn "*) continue ;; esac
+        printf '\036%s\n' "$fn"
+        declare -f "$fn"
+    done | python3 -I -c '
+import re, sys
+ref = re.compile(r"\$\{?work\}?\"?/([A-Za-z0-9._-]*)")
+name_eq = r"[A-Za-z_][A-Za-z0-9_]*="
+assign = re.compile(r"^\s*(?:local\s+|export\s+)?(?:" + name_eq + r"\S*\s+)*" + name_eq + r"\"?$")
+assign_end = re.compile(r"^[^\s;]*(?:\s+(?:" + name_eq + r"\S*|[A-Za-z_][A-Za-z0-9_]*))*\s*(?:;|&&|\|\||$)")
+makers = re.compile(r"(?:^|[\s;&|(])(?:mkdir|touch|mktemp|git\s+init)\s")
+movers = re.compile(r"(?:^|[\s;&|(])(?:cp|mv|ln)\s")
+errors, scanned = [], 0
+for block in sys.stdin.read().split("\x1e")[1:]:
+    name, _, body = block.partition("\n")
+    scanned += 1
+    builds = set(re.findall(r"\bfx_build_([A-Za-z0-9_]+)\b", body))
+    made, families, read = {"log"}, set(), {}
+    for line in body.split("\n"):
+        hits = list(ref.finditer(line))
+        for k, m in enumerate(hits):
+            pre, post, key = line[:m.start()], line[m.end():], m.group(1)
+            last = k == len(hits) - 1
+            assigned = assign.match(pre) and assign_end.match(post)
+            if (re.search(r">>?\s*\"?$", pre) or makers.search(pre) or assigned
+                    or (movers.search(pre) and last)):
+                made.add(key)
+                if post.startswith("$"):
+                    families.add(key)
+            elif key:
+                read.setdefault(key, (line.strip(), post[:1] in ("[", "*", "?")))
+    for key, (line, glob) in sorted(read.items()):
+        ident = re.sub(r"[^A-Za-z0-9_]", "_", key)
+        named = re.search(r"(?:^|\s)" + re.escape(key) + r"(?:\s|;|$)", body)
+        if (key in made or ident in builds or any(f and key.startswith(f) for f in families)
+                or ("" in families and named) or (glob and any(k.startswith(key) for k in made))):
+            continue
+        errors.append(f"{name}: reads $work/{key}, which it neither creates nor builds "
+                      f"with fx_build_{ident}: {line}")
+for e in errors:
+    print(f"SELFTEST LINT: {e}")
+print(f"selftest lint: {scanned} functions read, {len(errors)} unbuilt fixture(s)")
+sys.exit(1 if errors or not scanned else 0)
+'
+}
+
+# selftest_run_group <self> <name>: one group in its own work directory.
+selftest_run_group() {
+    local self=$1 name=$2 logged
+    case " $(selftest_defined "$self" | tr '\n' ' ') " in
+    *" $name "*) ;;
+    *) echo "selftest: no group '$name' in $self" >&2; exit 2 ;;
+    esac
+    work=$(mktemp -d)
+    [ -n "$work" ] && [ -d "$work" ] || { echo "selftest: mktemp failed" >&2; exit 2; }
+    trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
+    SELFTEST_GROUP=$name
+    if [ -n "${INF_SELFTEST_CASE_LOG:-}" ]; then
+        mkdir "$INF_SELFTEST_CASE_LOG/$name" || exit 2
+    fi
+    "group_$name"
+    if [ -n "${INF_SELFTEST_CASE_LOG:-}" ]; then
+        logged=$(cat "$INF_SELFTEST_CASE_LOG/$name"/* 2>/dev/null |
+            awk -F '\t' '$1 == "cases" { n += $2 } END { print n + 0 }')
+        if [ "$logged" -ne $((pass + fail)) ]; then
+            echo "SELFTEST FAIL: group $name's records count $logged cases, the group $((pass + fail))"
+            fail=$((fail + 1))
+        fi
+    fi
+    echo "group $name: $pass $fail"
+    [ "$fail" -eq 0 ]
+}
+
+# selftest_drive <self>: every group, folded into one verdict.
+selftest_drive() {
+    local self=$1 jobs=${CARGO_BUILD_JOBS:-4} defined g n=0 red=0 groups_red=0 line
+    local status count names='' gp gf
+    case $jobs in
+    '' | 0* | *[!0-9]*) echo "selftest: CARGO_BUILD_JOBS '$jobs' is not a positive integer" >&2; exit 2 ;;
+    esac
+    if [ -n "${INF_SELFTEST_CASE_LOG:-}" ]; then
+        [ -d "$INF_SELFTEST_CASE_LOG" ] && [ -z "$(ls -A "$INF_SELFTEST_CASE_LOG")" ] || {
+            echo "selftest: INF_SELFTEST_CASE_LOG '$INF_SELFTEST_CASE_LOG' is not an empty directory" >&2
+            exit 2
+        }
+    fi
+    # The groups' logs and statuses; a global, since the EXIT trap runs after
+    # this function has returned.
+    SELFTEST_ROOT=$(mktemp -d)
+    local root=$SELFTEST_ROOT
+    [ -n "$root" ] && [ -d "$root" ] || { echo "selftest: mktemp failed" >&2; exit 2; }
+    trap '[ -n "$SELFTEST_ROOT" ] && [ -d "$SELFTEST_ROOT" ] && rm -rf "$SELFTEST_ROOT"' EXIT
+    selftest_defined "$self" >"$root/defined"
+    if ! "$self" --list-groups >"$root/declared" 2>"$root/declared.err"; then
+        echo "SELFTEST DRIVER: '$self --list-groups' failed:"
+        sed 's/^/    | /' "$root/declared.err"
+        red=$((red + 1))
+    fi
+    sort "$root/defined" >"$root/defined.sorted"
+    sort "$root/declared" >"$root/declared.sorted"
+    for g in $(uniq -d "$root/defined.sorted"); do
+        echo "SELFTEST DRIVER: group $g is defined twice"
+        red=$((red + 1))
+    done
+    for g in $(sort -u "$root/defined" | comm -23 - "$root/declared.sorted"); do
+        echo "SELFTEST DRIVER: group $g is in the definition lines only (bash's table lacks it)"
+        red=$((red + 1))
+    done
+    for g in $(comm -13 "$root/defined.sorted" "$root/declared.sorted"); do
+        echo "SELFTEST DRIVER: group $g is in bash's function table only (its definition is not \`group_$g() {\`)"
+        red=$((red + 1))
+    done
+    defined=$(cat "$root/defined")
+    if [ -z "$defined" ]; then
+        echo "SELFTEST DRIVER: no group is defined in $self"
+        red=$((red + 1))
+    fi
+    if ! "$self" --lint >"$root/lint" 2>&1; then
+        cat "$root/lint"
+        red=$((red + 1))
+    fi
+    if [ "$red" -eq 0 ]; then
+        printf '%s\n' $defined | xargs -n 1 -P "$jobs" sh -c \
+            'CARGO_BUILD_JOBS=1 "$0" --group "$2" >"$1/$2.log" 2>&1; echo $? >"$1/$2.status"' \
+            "$self" "$root"
+    fi
+    for g in $defined; do
+        [ "$red" -eq 0 ] || break
+        n=$((n + 1))
+        names="$names${names:+, }$g"
+        status=$(cat "$root/$g.status" 2>/dev/null || echo none)
+        sed "/^group $g: /d" "$root/$g.log" 2>/dev/null || true
+        count=$(grep -c "^group $g: " "$root/$g.log" 2>/dev/null || true)
+        if [ "${count:-0}" -ne 1 ]; then
+            echo "SELFTEST DRIVER: group $g printed ${count:-0} count lines (exit $status), not one"
+            groups_red=$((groups_red + 1))
+            continue
+        fi
+        line=$(grep "^group $g: " "$root/$g.log")
+        gp=$(echo "$line" | awk '{ print $3 }')
+        gf=$(echo "$line" | awk '{ print $4 }')
+        case $gp:$gf in
+        [1-9]*:[1-9]* | [1-9]*:0 | 0:[1-9]* | 0:0) ;;
+        *) gp=x ;;
+        esac
+        case $gp$gf in *[!0-9]*) gp=x ;; esac
+        if [ "$gp" = x ]; then
+            echo "SELFTEST DRIVER: group $g's count line is malformed: $line"
+            groups_red=$((groups_red + 1))
+            continue
+        fi
+        pass=$((pass + gp))
+        fail=$((fail + gf))
+        if [ $((gp + gf)) -eq 0 ]; then
+            echo "SELFTEST DRIVER: group $g ran no case"
+            groups_red=$((groups_red + 1))
+        elif { [ "$gf" -eq 0 ] && [ "$status" != 0 ]; } || { [ "$gf" -ne 0 ] && [ "$status" = 0 ]; }; then
+            echo "SELFTEST DRIVER: group $g counted $gf failed case(s) but exited $status"
+            groups_red=$((groups_red + 1))
+        elif [ "$gf" -ne 0 ]; then
+            groups_red=$((groups_red + 1))
+        fi
+    done
+    if [ "$red" -ne 0 ] || [ "$groups_red" -ne 0 ] || [ "$fail" -ne 0 ] || [ "$pass" -eq 0 ]; then
+        echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases failed;" \
+            "$groups_red of $n groups red; $red driver error(s)"
+        exit 1
+    fi
+    echo "check-scripts self-test OK ($pass cases in $n groups, each exiting non-zero on its" \
+        "planted case: $names)"
+}
+
+# selftest_main <self> [--group <name> | --list-groups | --lint]
+selftest_main() {
+    local self=$1
+    shift
+    case ${1:-} in
+    '') selftest_drive "$self" ;;
+    --group) [ "$#" -eq 2 ] || { echo "usage: $self [--group <name> | --list-groups | --lint]" >&2; exit 2; }
+        selftest_run_group "$self" "$2" ;;
+    --list-groups) selftest_declared ;;
+    --lint) selftest_lint ;;
+    *) echo "usage: $self [--group <name> | --list-groups | --lint]" >&2; exit 2 ;;
+    esac
+}
+
+SELFTEST_LIB_FUNCS=$(declare -F | sed -n 's/^declare -f[a-z]* //p' | tr '\n' ' ')
