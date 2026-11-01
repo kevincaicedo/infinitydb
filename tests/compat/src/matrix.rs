@@ -8,6 +8,11 @@
 //!   record-format bounds). The candidate must still produce a *parseable*
 //!   reply; the deviation list is the L8 honesty ledger, not an excuse pile.
 
+// nextest-stall-default: the `INF.NS CREATE hot … MEM-BUDGET 64mb` row makes a
+// tiered namespace that no case binds or writes (the planeless candidate
+// refuses it; a real node creates it empty): no write reaches its window
+// (ADR-0053 D4), so the stall bound is never read.
+
 /// Comparison mode for one case.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Check {

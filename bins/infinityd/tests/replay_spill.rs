@@ -32,9 +32,34 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+/// One arm at a time inside this process: macOS sets `CLOEXEC` after
+/// `socket(2)`, so a sibling thread's `posix_spawn` in that window inherits
+/// this arm's client socket or port probe. An arm spawns twice and opens
+/// sockets between, so it holds the lock throughout. Separate processes
+/// cannot race this way, so the lock binds the threads of one test process
+/// only.
+// nextest-in-process: a spawn race between the threads of one test process
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 const CELLS: &str = "4";
+/// How long the client waits on one reply before it calls the node hung.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// The `TAIL-STALL-TIMEOUT`, in milliseconds, of the load's namespace `t`,
+/// in every arm. A tiered write past its window parks until a flush round
+/// lands (ADR-0053 D4): the demote arms park, their 64 MiB fill running
+/// through 4 MiB windows, and the fit leg's windows never fill. The device
+/// those rounds land on is shared with every test process running beside
+/// the arm, so a slow flush there is no defect of it: on a device whose
+/// every flush waits 3 s a demote arm answered a legal `-STALLED` at the
+/// product's 1 s default. Like [`READ_TIMEOUT`] this bound turns a wedged
+/// flush into a failure; it is no device budget (ADR-0200 D7). It sits
+/// below that timeout, so a write that does stall answers typed before the
+/// client calls it a hang.
+const TAIL_STALL_TIMEOUT_MS: u64 = 20_000;
+const _: () = assert!(
+    (TAIL_STALL_TIMEOUT_MS as u128) < READ_TIMEOUT.as_millis(),
+    "a stalled write answers before the client's hang bound"
+);
 const TAGS: u64 = 64;
 /// 64 MiB of load: 16 MiB per cell on average, four windows each.
 const LOAD_BYTES: u64 = 64 << 20;
@@ -175,7 +200,7 @@ impl Client {
                 Err(e) => panic!("connect: {e:?}"),
             }
         };
-        c.set_read_timeout(Some(Duration::from_secs(120))).expect("timeout");
+        c.set_read_timeout(Some(READ_TIMEOUT)).expect("timeout");
         c.set_nodelay(true).expect("nodelay");
         Client(c)
     }
@@ -377,6 +402,7 @@ fn run_arm(fsync: &str, leg: Leg) {
     );
     let mut server = Server::spawn(&dir).expect("first boot");
     let mut c = Client::connect(server.port);
+    let stall = TAIL_STALL_TIMEOUT_MS.to_string();
     c.ok(&[
         b"INF.NS",
         b"CREATE",
@@ -390,6 +416,8 @@ fn run_arm(fsync: &str, leg: Leg) {
             Leg::Demote => b"3mb",
             Leg::Fit => b"64mb",
         },
+        b"TAIL-STALL-TIMEOUT",
+        stall.as_bytes(),
     ]);
     c.ok(&[b"INF.NS", b"USE", b"t"]);
     let (model, deleted) = load(&mut c);

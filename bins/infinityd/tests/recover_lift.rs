@@ -22,6 +22,10 @@
 //! being the record under test. Harness rules are the topology test's.
 #![cfg(target_os = "linux")]
 
+// nextest-stall-default: four short SETs put bytes in a tiered window of at
+// least its 8 MiB MEM-BUDGET; no write parks (ADR-0053 D4), so the stall
+// bound is never read.
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::FileExt;

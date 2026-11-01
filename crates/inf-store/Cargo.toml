@@ -33,7 +33,7 @@ test-support = []
 [dev-dependencies]
 proptest.workspace = true
 criterion.workspace = true
-# statvfs for the M4-S15 endurance test's real-filesystem reclaim assert.
+# The reclaim oracle's mapping plant maps a file (`tests/reclaim_oracle.rs`).
 libc.workspace = true
 # M4-S21: the `*_nospace` injection legs in `tiered_diskfull.rs` — the
 # same dev-dependency feature unification the inf-log tests ride.

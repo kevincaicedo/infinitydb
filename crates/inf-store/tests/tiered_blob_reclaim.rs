@@ -24,11 +24,12 @@
 //!   backlog standing, bounded per-round budgets drain both in bounded
 //!   rounds — the two MAINTAIN citizens share the round without either
 //!   starving the other.
-//! - **`statvfs` (the plan's statfs assert):** on the real filesystem,
-//!   reclaimed extents are unlinked at the VFS and the blocks return to
-//!   the OS — accounting that says "reclaimed" while the filesystem
-//!   still holds the bytes is the classic false pass this leg exists to
-//!   catch.
+//! - **the real filesystem:** reclaimed extents are unlinked, and once the
+//!   last one is, this process holds none of them — the leg's root holds
+//!   only its flush's tier files, and on Linux no descriptor or mapping
+//!   names an unlinked file (the shared reclaim oracle, ADR-0200 D7).
+//!   Accounting that says "reclaimed" while a file is still held is the
+//!   classic false pass this leg exists to catch.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -47,6 +48,9 @@ use inf_store::{
     AddressSpaceConfig, BLOB_RECLAIM_PER_SLICE_DEFAULT, BlobConfig, CompactionConfig,
     CompactionWork, DemotionConfig, LogicalAddr, TieredTable,
 };
+
+#[cfg(unix)]
+mod reclaim;
 
 const NS: NsId = NsId(53);
 const SHARD: &str = "shard-0";
@@ -77,7 +81,7 @@ struct Entry {
 }
 
 /// A blob-only churn rig (the `tiered_blob.rs` shape, generic over the
-/// filesystem so the `statvfs` leg runs the identical workload on
+/// filesystem so the real-filesystem leg runs the identical workload on
 /// `StdSegmentFs`). Values are always out of line — the record leg is
 /// key + 24-byte reference by construction.
 struct Rig<F: SegmentFs + Clone> {
@@ -89,6 +93,10 @@ struct Rig<F: SegmentFs + Clone> {
     model: BTreeMap<u64, Entry>,
     value_len: u64,
     ckpt_id: u64,
+    /// The plane's custody of the sealed tier files' handles (its cold-read
+    /// file table): parked as the flush hands them out, each dropped before
+    /// its file is unlinked, so a retired file's blocks return at the unlink.
+    parked: Vec<(u32, F::File)>,
 }
 
 impl<F: SegmentFs + Clone> Rig<F> {
@@ -134,6 +142,7 @@ impl<F: SegmentFs + Clone> Rig<F> {
             model: BTreeMap::new(),
             value_len,
             ckpt_id: 0,
+            parked: Vec::new(),
         }
     }
 
@@ -337,9 +346,11 @@ impl<F: SegmentFs + Clone> Rig<F> {
         self.table.end_ckpt_walk();
         self.table.retire_scan(self.ckpt_id, &self.flush);
         let _section = self.table.tier_manifest(NS.0, &self.flush);
+        self.parked.extend(self.flush.take_sealed_handles());
         let ids = self.table.commit_retirement();
         for &id in &ids {
             let meta = self.flush.detach_sealed(id).expect("retired files are sealed");
+            self.parked.retain(|(parked_id, _)| *parked_id != id);
             unlink_tier_file(&self.fs, &meta).expect("unlink");
         }
         ids.len()
@@ -704,14 +715,17 @@ fn reclaim_and_compaction_share_the_round_without_starvation() {
     rig.assert_refcounts();
 }
 
-/// The plan's statfs assert, on the real filesystem: reclaim is
-/// `statvfs`-visible — the unlinked extents are gone at the VFS and the
-/// blocks return to the OS. Reduced cycle count (stated, not hidden):
-/// the 10⁶-cycle exactness row runs on the mem filesystem above; this
-/// leg proves the filesystem half the mem rig cannot.
+/// Reclaim on the real filesystem returns the disk: the unlinked extents
+/// are gone, and after the last unlink this process holds none of them —
+/// the root's regular files are the flush's tier files alone, and no
+/// descriptor or mapping names an unlinked file (the shared reclaim
+/// oracle, ADR-0200 D7; Linux only for those two halves, the walk
+/// elsewhere). Reduced cycle count (stated, not hidden): the 10⁶-cycle
+/// exactness row runs on the mem filesystem above; this leg proves the
+/// filesystem half the mem rig cannot.
 #[cfg(unix)]
 #[test]
-fn statvfs_confirms_blob_reclaim_returns_disk_to_the_os() {
+fn blob_reclaim_returns_disk_to_the_os() {
     use inf_log::fs::StdSegmentFs;
 
     let root = std::env::temp_dir().join(format!("inf-s18-reclaim-{}", std::process::id()));
@@ -725,20 +739,6 @@ fn statvfs_confirms_blob_reclaim_returns_disk_to_the_os() {
     }
     let _cleanup = Cleanup(root.clone());
 
-    fn avail_bytes(path: &Path) -> u64 {
-        use std::os::unix::ffi::OsStrExt;
-        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
-        // SAFETY: `statvfs` is a plain-old-data C struct; the all-zero
-        // bit pattern is a valid (if meaningless) value for every field,
-        // and the FFI call below overwrites it before any read.
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        // SAFETY: `c` is a live NUL-terminated path and `stat` is a valid
-        // exclusive out-pointer for the duration of the call.
-        let rc = unsafe { libc::statvfs(c.as_ptr(), &mut stat) };
-        assert_eq!(rc, 0, "statvfs");
-        stat.f_bavail as u64 * stat.f_frsize as u64
-    }
-
     fn blob_dir_bytes(shard: &Path) -> u64 {
         let mut total = 0u64;
         let Ok(entries) = std::fs::read_dir(shard.join("cold")) else { return 0 };
@@ -751,7 +751,6 @@ fn statvfs_confirms_blob_reclaim_returns_disk_to_the_os() {
     }
 
     let cycles: u64 = if cfg!(debug_assertions) { 256 } else { 768 };
-    let avail_start = avail_bytes(&root);
     // ~24 KiB values: each extent is a header block plus ~6 frames, so
     // the run cycles real multi-frame files without hammering the box.
     let mut rig = Rig::new(StdSegmentFs, &shard, 24 << 10, 64 << 10, 16 << 10);
@@ -783,20 +782,18 @@ fn statvfs_confirms_blob_reclaim_returns_disk_to_the_os() {
     assert!(list_extent_ids(&rig.fs, &shard).expect("listing").is_empty());
     assert_eq!(blob_dir_bytes(&shard), 0, "no .iblob bytes linger at the VFS");
     assert!(peak_blob_bytes > 0, "the run held real extent bytes at its peak");
-    // statvfs: the blocks came back to the OS. Generous slack absorbs
-    // unrelated churn on a shared box; the direction is what the AC
-    // names — space returns, not merely accounting (a counter alone could
-    // pass while the blocks stay allocated).
-    let residual = blob_dir_bytes(&shard);
-    let avail_end = avail_bytes(&root);
-    let slack = 16u64 << 20;
-    assert!(
-        avail_end + slack >= avail_start.saturating_sub(residual),
-        "statvfs shows the reclaimed bytes returned (start {avail_start}, end {avail_end})"
-    );
+    // Space returns, not merely accounting (a counter alone could pass
+    // while a held file keeps its blocks): what this process still holds
+    // under the root is the flush's tier files, and nothing unlinked.
+    let mut residual: Vec<std::path::PathBuf> =
+        rig.flush.sealed().iter().map(|meta| meta.path.clone()).collect();
+    residual.extend(rig.flush.active().map(|(_, _, _, _, path)| path.to_path_buf()));
+    reclaim::assert_reclaimed(&root, &residual);
     println!(
-        "statvfs leg: cycles={cycles} created={} reclaimed={} peak_blob_bytes={peak_blob_bytes} \
-         avail_start={avail_start} avail_end={avail_end}",
-        stats.created, stats.reclaimed
+        "real-filesystem leg: cycles={cycles} created={} reclaimed={} \
+         peak_blob_bytes={peak_blob_bytes} tier_files={}",
+        stats.created,
+        stats.reclaimed,
+        residual.len()
     );
 }
