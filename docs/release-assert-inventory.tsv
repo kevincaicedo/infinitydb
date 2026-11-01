@@ -540,7 +540,6 @@ I	5	crates/inf-server/src/plane/tiered.rs	expect	resolved on this table	`resolve
 I	3	crates/inf-server/src/plane/tiered/write.rs	expect	resolved on this table	`resolve` returned `Ram(addr)` from this namespace's table and the borrow follows without a suspension point, so no `DROP` can interleave (drops apply between polls)
 I	1	crates/inf-server/src/plane/tiered/write.rs	expect	tiered namespace has plane state	the tier state materializes every catalogued tiered namespace at MAINTAIN (`sync_namespaces`) before writes are admitted to it
 C	3	crates/inf-server/src/plane/tiered/write.rs	expect	tiered namespaces always carry a durability class	a tiered namespace is a configuration of `MODE durable`, refused otherwise at creation (`crates/inf-store/src/keyspace.rs:Keyspace::ns_create_check` via the registry's spec check), and durable namespaces carry an fsync class
-I	1	crates/inf-server/src/recover.rs	expect	40	the frame header length is the constant `FRAME_HEADER_LEN` (40)
 I	1	crates/inf-server/src/recover.rs	expect	evidence anchor set with a valid frame	the anchor is set in the same loop whenever a scan reports `valid_frames > 0`
 I	2	crates/inf-server/src/recover.rs	expect	fs present	the machine's own phase order: `fs` is taken once, when the rotor is built at completion
 I	1	crates/inf-server/src/recover.rs	expect	fs present until finish	the machine's own phase order: `fs` is taken once, when the rotor is built at completion
@@ -550,7 +549,9 @@ I	1	crates/inf-server/src/recover.rs	expect	non-empty scan	the fresh-cell branch
 I	1	crates/inf-server/src/recover.rs	expect	recovery complete before finish()	documented panic: `finish` after `Complete` (callers loop on `step`)
 I	1	crates/inf-server/src/recover.rs	expect	scan set	`scan` is stored in the start phase before any later phase runs
 I	1	crates/inf-server/src/recover.rs	expect	scan set in start	`scan` is stored in the start phase before any later phase runs
-I	1	crates/inf-server/src/recover.rs	unreachable	Io and foreign-segment reads are handled above	those two error kinds returned earlier in the same match
+I	1	crates/inf-server/src/recover.rs	assert	each row sits at its phase's index	compile-time `const _: () = { … assert! … }` over the `RECOVERY_UNITS` table; a violation fails the build, never a runtime panic
+I	1	crates/inf-server/src/recover/frame_walk.rs	expect	40	the frame header length is the constant `FRAME_HEADER_LEN` (40)
+I	1	crates/inf-server/src/recover/frame_walk.rs	unreachable	Io and foreign-segment reads are handled above	those two error kinds returned earlier in the same match
 I	1	crates/inf-server/src/tier_cell.rs	assert	tier flush lanes exhausted	lanes recycle once their namespace has no op in flight, so the bound is on live-plus-draining tiered namespaces: 2^16 pipelines of MiBs each — memory exhausts first
 I	1	crates/inf-server/src/tier_cell.rs	expect	matched above	`t.round` was matched `Some` at the top of the same function
 F	1	crates/inf-server/src/tier_cell.rs	panic	tiered namespace reclaim marks refused: {refused}	the marks' one backing allocation (16 marks of 16 B) refused is process-abort, the same fail-stop the global allocator applies to every `Vec` growth of `TierCell::create_ns` (`std::alloc::handle_alloc_error`); a layout refusal is ruled out by the const assertion in `tier_cell/marks.rs`, and the census refuses only a cap name declared with a second value or fill, which the first boot of any test shows
