@@ -34,7 +34,7 @@ use inf_store::{
 };
 
 use crate::durable::{
-    DurableScenario, DurableWorkload, MiniClient, Node, TraceObserver, boot, build_disk,
+    DurableScenario, DurableWorkload, MiniClient, Node, TraceObserver, WakeLeg, boot, build_disk,
 };
 use crate::net::Plant;
 
@@ -148,6 +148,7 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         ledger_wedge: None,
         stop_tick: false,
         fill_dense: false,
+        wake: WakeLeg::OFF,
     }
 }
 

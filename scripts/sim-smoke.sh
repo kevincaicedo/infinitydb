@@ -26,6 +26,10 @@ bin=target/release/inf-sim
 # m2 fill/hold/pending scenarios ran in no automated lane.
 # m2-fill-dense is the fill scenario's dense leg: hundreds of hold
 # episodes inside one window, and a cell's timers stay its roles' owners.
+# The two --park-at-once rows run the wake oracle on the hold scenarios at
+# spin 0: a held frame's park asks no longer than its window. The fill leg
+# drops the twin (its trace is its base row's, which runs the twin); the
+# group leg keeps it, and its twin compares the wake readings too.
 # ADR-0174 D1: the replay-above-window seed class forced on the smoke
 # seed — a boot whose tiered replay exceeds the window demotes. D2 rule
 # 6: m4-recovery's spec-variant class, each case forced — a boot at a
@@ -59,8 +63,10 @@ rows=(
   "m2-mode-transition"
   "m2-reorder-window"
   "m2-fill-tick"
+  "m2-fill-tick --park-at-once"
   "m2-fill-dense"
   "m2-group-hold"
+  "m2-group-hold --park-at-once --verify-determinism"
   "m2-fua-pending"
   "m2-ledger-wedge --wedge-leg main --verify-determinism"
   "m2-ledger-wedge --wedge-leg control --verify-determinism"

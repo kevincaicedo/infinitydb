@@ -90,6 +90,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         ledger_wedge: None,
         stop_tick: None,
         timers: super::TimersReport::default(),
+        wake: super::WakeReport::default(),
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -564,6 +565,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let mut last_progress = 0u64;
     let mut log_oracle = LogOracle::new(scenario.cells);
     let mut timers_oracle = super::timers::TimersOracle::new(scenario);
+    let mut wake_oracle = super::timers::WakeOracle::new(scenario);
     let mut tier_oracle = TierTurnOracle::new(&node, scenario.cells, true);
     let no_model_leg = scenario.tier_budget.is_some_and(|shape| shape.leg.model_absent());
     if no_model_leg {
@@ -583,6 +585,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         }
         log_oracle.sample(&node, &mut report);
         timers_oracle.sample(&node, clock.now(), &mut report.timers);
+        wake_oracle.sample(&node, &mut report.wake);
         tier_oracle.sample(&node, &disk, scenario, &mut report);
         if let Some(wedge) = ledger_wedge.as_mut() {
             wedge.observe(step, &node, &disk, clock.now());
@@ -1013,6 +1016,11 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         for what in report.timers.dense_violations(scenario.seed) {
             fail(&mut report, what);
         }
+    }
+    // TM3: a held frame's park asks no longer than its window, and a run
+    // of the leg judges at least one.
+    for what in wake_oracle.violations(scenario.seed, &report.wake) {
+        fail(&mut report, what);
     }
     // Batch 42 (F-L01-01): a tick that fired over staged records and
     // counted itself idle dropped its due — the records wait a second.

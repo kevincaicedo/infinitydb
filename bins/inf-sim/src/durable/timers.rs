@@ -17,6 +17,16 @@
 //!   fill window; the run keeps the largest rise. A dense row that rose by
 //!   fewer than 8 inside one window opened too few episodes to say
 //!   anything about their timers.
+//! - **TM3, the wake oracle**, on a leg of `m2-fill-tick` and of
+//!   `m2-group-hold` (`--park-at-once`: the scenario at spin 0, so every
+//!   iteration after a hold decides with the hold in hand). A park is
+//!   judged when the cell's iteration before it left records staged with
+//!   no log-segment write or sync in flight on the device, and its own
+//!   submit carried none: its timeout, the kept `Wait`'s, is at most the
+//!   larger hold window + 1 ms, since a hold arms its window rounded up to
+//!   whole milliseconds. A run that judged no park is `VACUOUS`. It reads
+//!   the loop's decision and wait, one gauge (`records_staged`), the
+//!   driver's ops and the scenario's windows: no timer state.
 //! - **The dense leg** (`m2-fill-dense`, a `sim-smoke` row, whose run
 //!   judges the three readings above). `m2-fill-tick` at steps of at most
 //!   50 µs, with 300
@@ -27,8 +37,12 @@
 //!   `m2-fill-tick` as it stands, one writer thinking up to 3 s, whose peak
 //!   is the everysec timer and the few episodes one sparse writer opens.
 
-use inf_foundation::time::Nanos;
+use std::time::Duration;
 
+use inf_foundation::time::Nanos;
+use inf_runtime::Wait;
+
+use super::ledger_wedge::log_segment;
 use super::{DurableScenario, Node};
 
 /// Episodes the dense leg must begin inside one window, else the row is
@@ -141,7 +155,131 @@ impl TimersOracle {
     }
 }
 
+/// Where TM3 engages: off on every scenario but its leg, whose value only
+/// [`DurableScenario::park_at_once`] makes, and the loop reads its spin
+/// through it, so TM3 armed on a loop that spins cannot be built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeLeg {
+    armed: bool,
+}
+
+impl WakeLeg {
+    /// TM3 off, the scenario's own spin.
+    pub const OFF: WakeLeg = WakeLeg { armed: false };
+
+    /// The loop's spin: `spin_iters` off the leg, 0 on it.
+    #[must_use]
+    pub fn spin(self, spin_iters: u32) -> u32 {
+        if self.armed { 0 } else { spin_iters }
+    }
+}
+
+/// TM3's readings over one run, node sums.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WakeReport {
+    /// Every park the loops asked for over the traffic phase.
+    pub parks: u64,
+    /// Judged parks.
+    pub held_parks: u64,
+    /// Judged parks whose timeout passed the bound.
+    pub late_parks: u64,
+    /// Parks after a staged iteration whose own submit carried a
+    /// log-segment write or sync: not judged, as a completion wakes the
+    /// loop.
+    pub held_parks_submitting: u64,
+    /// The longest judged timeout, 0 for none.
+    pub timeout_ns_max: u64,
+}
+
+/// The state a cell's last iteration left, as TM3 reads it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    No,
+    Staged,
+}
+
+/// TM3 over one run: armed on the leg alone.
+pub(super) struct WakeOracle {
+    /// The larger hold window + 1 ms; `None` off the leg.
+    bound: Option<Nanos>,
+    held: Vec<Held>,
+}
+
+impl WakeOracle {
+    pub(super) fn new(scenario: &DurableScenario) -> WakeOracle {
+        let window = scenario.fill.window.max(scenario.group.window);
+        let bound = scenario.wake.armed.then(|| window + Nanos::from_millis(1));
+        WakeOracle { bound, held: vec![Held::No; usize::from(scenario.cells)] }
+    }
+
+    /// Reads every cell after one scheduler step: a park judged against
+    /// the state the cell's iteration before it left, then that state
+    /// again from what this step left. A frozen cell reads nothing.
+    pub(super) fn sample(&mut self, node: &Node, report: &mut WakeReport) {
+        let Some(bound) = self.bound else { return };
+        for (cell, held) in self.held.iter_mut().enumerate() {
+            let (cell_loop, plane) = &node.cells[cell];
+            let Some(stats) = node.iter_stats[cell] else { continue };
+            let driver = cell_loop.driver();
+            report.parks += u64::from(stats.parked);
+            if stats.parked && *held == Held::Staged {
+                if driver.submitted_named(log_segment) {
+                    report.held_parks_submitting += 1;
+                } else {
+                    let timeout_ns = match driver.last_wait() {
+                        Some(Wait::Park { timeout: Some(timeout) }) => duration_ns(timeout),
+                        Some(Wait::Park { timeout: None } | Wait::Poll) | None => u64::MAX,
+                    };
+                    report.held_parks += 1;
+                    report.late_parks += u64::from(timeout_ns > bound.0);
+                    report.timeout_ns_max = report.timeout_ns_max.max(timeout_ns);
+                }
+            }
+            *held = match plane.durable_stats() {
+                None => Held::No,
+                Some(_) if driver.io_in_flight_named(log_segment) => Held::No,
+                Some(stats) if stats.records_staged > 0 => Held::Staged,
+                Some(_) => Held::No,
+            };
+        }
+    }
+
+    /// The run's verdict: a late judged park, or none judged.
+    pub(super) fn violations(&self, seed: u64, report: &WakeReport) -> Vec<String> {
+        let Some(bound) = self.bound else { return Vec::new() };
+        let mut violations = Vec::new();
+        if report.late_parks > 0 {
+            violations.push(format!(
+                "HELD FRAME PARK OUTLIVES ITS WINDOW seed {seed:#x}: held-park-outlives-window — \
+                 {} of {} judged park(s) passed {} ns ({report:?})",
+                report.late_parks, report.held_parks, bound.0
+            ));
+        }
+        if report.held_parks == 0 {
+            violations.push(format!(
+                "VACUOUS seed {seed:#x}: held-park-unengaged — the wake oracle judged nothing \
+                 ({report:?})"
+            ));
+        }
+        violations
+    }
+}
+
+/// A timeout in ns; past `u64::MAX` it reads `u64::MAX`, which is late.
+fn duration_ns(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX)
+}
+
 impl DurableScenario {
+    /// TM3's leg: the scenario as it stands, its loops at spin 0, the wake
+    /// oracle armed. The CLI accepts it on `m2-fill-tick` and
+    /// `m2-group-hold` only.
+    #[must_use]
+    pub fn park_at_once(mut self) -> DurableScenario {
+        self.wake = WakeLeg { armed: true };
+        self
+    }
+
     /// `m2-fill-tick`'s dense leg: the scenario's 50 ms window and 64 KiB
     /// target, steps of at most 50 µs, and only closed-loop everysec
     /// writers, enough to fill the target in about two steps.
