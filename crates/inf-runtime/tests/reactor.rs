@@ -13,12 +13,13 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::rc::Rc;
 use std::time::Duration;
 
 use inf_alloc::BufferPool;
 use inf_foundation::CellId;
 use inf_foundation::bounded::{CapCensus, CensusPhase};
-use inf_foundation::time::StdClock;
+use inf_foundation::time::{Nanos, StdClock, VirtualClock};
 use inf_runtime::{
     BackendDriver, Capabilities, CellLoop, CellPlane, Completion, GroupClass, IoOp, LoopConfig,
     LoopCx, SubmitStats, Wait,
@@ -28,6 +29,8 @@ use inf_runtime::{
 #[derive(Debug, Default)]
 struct NullDriver {
     waits: Vec<&'static str>,
+    /// Each park's timeout, in the order the parks were asked for.
+    park_timeouts: Vec<Option<Duration>>,
     pushed: usize,
 }
 
@@ -43,7 +46,10 @@ impl BackendDriver for NullDriver {
     ) -> io::Result<usize> {
         self.waits.push(match wait {
             Wait::Poll => "poll",
-            Wait::Park { .. } => "park",
+            Wait::Park { timeout } => {
+                self.park_timeouts.push(timeout);
+                "park"
+            }
         });
         Ok(0)
     }
@@ -457,5 +463,81 @@ fn a_task_woken_in_maintain_is_polled_before_any_park() {
         );
         assert_eq!(next.polled, 1, "the woken task runs on the next iteration");
         assert_eq!(lp.executor().live_tasks(), 0, "and completes");
+    }
+}
+
+/// Arms `owners` timers one millisecond out in its first PARSE, then counts
+/// the callbacks each iteration begins. It reports no work, so the loop's
+/// idle policy alone decides each wait.
+struct DueCohort {
+    owners: u64,
+    armed: bool,
+    begun: u64,
+}
+
+impl CellPlane for DueCohort {
+    fn on_completion(&mut self, _cx: &mut LoopCx<'_>, _c: Completion) {}
+    fn on_timer(&mut self, _cx: &mut LoopCx<'_>, _key: u64) {
+        self.begun += 1;
+    }
+    fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
+        if !self.armed {
+            self.armed = true;
+            for key in 0..self.owners {
+                cx.timers.insert(cx.now + Nanos::from_millis(1), key);
+            }
+        }
+    }
+    fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+}
+
+/// Delivery and the park (ADR-0154 D3): 65 timers fall due at once. A turn
+/// begins at most 64 callbacks, the 65th waits for the next turn's step 1,
+/// and an iteration whose decision finds a timer due polls instead of
+/// parking, at `spin_iters` 1, where the idle count reaches the decision,
+/// and 0, where every idle iteration reaches it. The oracle is the virtual
+/// clock, the callbacks counted per iteration and the waits the driver was
+/// handed: iteration 1 arms all 65 and reports no work, the clock steps
+/// 2 ms, iteration 2 begins 64 callbacks, iteration 3 one, and iteration 4,
+/// with nothing armed, parks for `park_default`.
+#[test]
+#[ignore = "red on the wheel: due timers are collected without a bound and do not veto a park"]
+fn sixty_five_due_timers_take_two_turns_and_no_park() {
+    let park_default = Duration::from_millis(100);
+    let mut readings = Vec::new();
+    for spin_iters in [1, 0] {
+        let clock = Rc::new(VirtualClock::new(Nanos::from_millis(10)));
+        let (_census, serve_mark) = CapCensus::new(CellId(0));
+        let config =
+            LoopConfig { spin_iters, park_default: Some(park_default), ..LoopConfig::default() };
+        let mut lp = CellLoop::new(
+            NullDriver::default(),
+            Rc::clone(&clock),
+            BufferPool::new(4, 1024),
+            config,
+            serve_mark,
+        );
+        let mut plane = DueCohort { owners: 65, armed: false, begun: 0 };
+        let mut begun = Vec::new();
+        for iteration in 1..=4 {
+            let before = plane.begun;
+            lp.run_iteration(&mut plane).expect("iteration");
+            begun.push(plane.begun - before);
+            if iteration == 1 {
+                clock.advance(Nanos::from_millis(2));
+            }
+        }
+        let driver = lp.driver();
+        readings.push((spin_iters, begun, driver.waits.clone(), driver.park_timeouts.clone()));
+    }
+    for reading in &readings {
+        println!("delivery {reading:?}");
+    }
+    for (spin_iters, begun, waits, park_timeouts) in readings {
+        assert_eq!(
+            (begun, waits, park_timeouts),
+            (vec![0, 64, 1, 0], vec!["poll", "poll", "poll", "park"], vec![Some(park_default)]),
+            "spin_iters {spin_iters}: callbacks begun per iteration, the waits, the park timeouts"
+        );
     }
 }
