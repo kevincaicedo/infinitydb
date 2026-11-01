@@ -552,14 +552,13 @@ const _: () = assert!(size_of::<Option<SlotId<u64>>>() == 16, "a position's hand
 /// owner's callback runs.
 ///
 /// Nothing allocates once built: the heap and the handle array are fixed
-/// at the slab's cap and built in the same steps, each allocation at most
-/// 64 KiB.
+/// at the slab's cap and built with it, by steps of one allocation of at
+/// most 64 KiB.
 ///
 /// Delivery is one owner at a time: [`begin`](Self::begin) takes the due
 /// minimum and makes its notice, the callback runs, and
-/// [`consume`](Self::consume) settles it before the next. The set's holder
-/// owns that order: a host builds the set, reserves its owners and hands
-/// the set to its loop before the loop serves.
+/// [`consume`](Self::consume) settles it before the next. The set's one
+/// holder owns that order, and reserves its owners before it serves.
 pub struct TimerSet {
     slots: CappedSlab<OwnerSlot, u64, Retire>,
     heap: IndexedHeap<ArmEntry>,
