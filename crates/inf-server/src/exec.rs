@@ -348,6 +348,10 @@ pub struct NodeState {
     pub frame_waits_fill: Cell<u64>,
     pub fill_window_us: Cell<u64>,
     pub fill_target_bytes: Cell<u64>,
+    /// The most timers this cell has held armed at once since its loop was
+    /// built, cell scope: published by MAINTAIN on every cell, durable or
+    /// not, so a memory-only cell shows its accept retry too.
+    pub timers_armed_max: Cell<u64>,
     /// M4.5-S43 (ADR-0092): the FLUSH-class group hold — episodes, the
     /// window in force, the adaptive target.
     pub frame_waits_group: Cell<u64>,

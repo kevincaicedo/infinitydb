@@ -457,6 +457,12 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     pub fn executor(&self) -> &CellExecutor {
         &self.executor
     }
+
+    /// Timers armed on this cell now. A gauge: past `u32::MAX` it reads
+    /// `u32::MAX`.
+    pub fn armed_timers(&self) -> u32 {
+        u32::try_from(self.timers.armed()).unwrap_or(u32::MAX)
+    }
 }
 
 impl<D: BackendDriver, C: Clock> core::fmt::Debug for CellLoop<D, C> {

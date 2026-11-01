@@ -7,8 +7,8 @@
 //!   watches, any cell of the node. It is the reactor's own decision (spin
 //!   exhausted, no ready task, no `before_park` veto), made before the
 //!   driver call, so it reads the state the iteration before it left. The
-//!   sim driver ignores the wait, so a park is this flag and never elapsed
-//!   virtual time.
+//!   sim driver keeps the wait it is handed and never blocks on it, so a
+//!   park is this flag and never elapsed virtual time.
 //! - **Resolution:** one reactor iteration. The harness runs each cell
 //!   once per scheduler step, and the publishing iteration is the step in
 //!   which the cell's board slot moved. A step that skips the watched cell

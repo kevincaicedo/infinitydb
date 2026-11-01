@@ -62,9 +62,11 @@ mod ledger_wedge;
 mod park;
 mod run;
 mod stop_tick;
+mod timers;
 pub use ledger_wedge::{LedgerWedgeLeg, LedgerWedgeReport};
 pub use run::run_durable_scenario;
 pub use stop_tick::StopTickReport;
+pub use timers::TimersReport;
 
 pub(crate) use audit::survival_audit;
 use audit::{
@@ -305,6 +307,12 @@ pub struct DurableScenario {
     /// (`stop_tick.rs`). `false` everywhere else: every other trace stays
     /// byte-identical.
     pub stop_tick: bool,
+    /// `m2-fill-tick`'s dense leg (`durable/timers.rs`): every connection's
+    /// pending bytes reach the cell whole at each reap, and every everysec
+    /// `SET` value is padded to the leg's length, so closed-loop writers
+    /// fill the 64 KiB fill target in about two steps. `false` everywhere
+    /// else: every other trace stays byte-identical.
+    pub fill_dense: bool,
 }
 
 /// The epoch-marks shape's legs, chosen by name (`--marks-leg`), never by
@@ -965,6 +973,7 @@ impl DurableScenario {
             epoch_marks: None,
             ledger_wedge: None,
             stop_tick: false,
+            fill_dense: false,
         }
     }
 
@@ -1352,6 +1361,7 @@ impl DurableScenario {
             epoch_marks: None,
             ledger_wedge: None,
             stop_tick: false,
+            fill_dense: false,
         }
     }
 
@@ -1521,6 +1531,7 @@ impl DurableScenario {
             epoch_marks: None,
             ledger_wedge: None,
             stop_tick: false,
+            fill_dense: false,
         }
     }
 }
@@ -1711,6 +1722,8 @@ pub struct DurableReport {
     /// The stop-tick shape's readings at the end of its stop (`None` off
     /// the shape).
     pub stop_tick: Option<StopTickReport>,
+    /// The timers' readings over the traffic phase (`durable/timers.rs`).
+    pub timers: TimersReport,
 }
 
 /// One cell's reclaim-marks census row at the cut of an epoch-marks run.
@@ -2173,6 +2186,11 @@ impl Writer {
                     usize::try_from(self.rng.next_below(scenario.value_pad_max)).expect("fits");
                 value.extend(std::iter::repeat_n(b'p', pad));
             }
+            // The dense fill leg pads its everysec values instead: its
+            // writers must fill the fill target in about two steps.
+            if scenario.fill_dense && self.class == NsClass::Everysec {
+                value.resize(timers::DENSE_VALUE_BYTES, b'd');
+            }
             // ADR-0178's arm: a value whose checkpoint block only an
             // overrun can issue (`always` writers, the run's first quarter,
             // every 16th `SET` from the first — a fixed schedule, so no
@@ -2491,9 +2509,9 @@ impl Node {
     /// What `cell`'s reactor iteration reported in the last scheduler step,
     /// `None` when that step did not run the cell (frozen): a skipped cell
     /// has no iteration to read. `parked` is the reactor's own decision,
-    /// made before the driver call: the sim driver ignores the wait, so a
-    /// park shows as this flag and never as elapsed virtual time. Read
-    /// between scheduler steps.
+    /// made before the driver call: the sim driver keeps the wait and never
+    /// blocks on it, so a park shows as this flag and never as elapsed
+    /// virtual time. Read between scheduler steps.
     #[cfg(test)]
     pub(crate) fn iter_stats(&self, cell: usize) -> Option<IterStats> {
         self.iter_stats[cell]

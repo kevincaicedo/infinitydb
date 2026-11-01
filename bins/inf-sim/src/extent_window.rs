@@ -368,6 +368,7 @@ impl ExtentWindowScenario {
             epoch_marks: None,
             ledger_wedge: None,
             stop_tick: false,
+            fill_dense: false,
         }
     }
 }
