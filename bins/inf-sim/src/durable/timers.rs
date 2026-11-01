@@ -5,6 +5,12 @@
 //!   `CellLoop::armed_timers()`; the run keeps the largest, cell scope. A
 //!   cell's timers are bounded by its roles (`TimerRole::COUNT`) only if
 //!   every hold episode leaves at most one timer behind: its role's owner.
+//! - **An issue cancels its episode's arm.** At every step where a cell's
+//!   durable plane holds no open hold episode, the cell's armed timers:
+//!   the run keeps the largest, which is the everysec owner's one arm, or
+//!   none before the durable plane exists. A hold's arm left behind by the
+//!   issue that ended its episode reads two until its window passes. The
+//!   steps read are counted, so a run that read none is visible.
 //! - **Engagement.** The fill episodes that begin inside one hold window:
 //!   each cell's `frame_waits_fill` (the product's episode count) read at
 //!   every step and differenced over tumbling windows of the scenario's
@@ -30,6 +36,11 @@ pub struct TimersReport {
     pub armed_timers_max: u32,
     /// The most fill episodes one cell began inside one fill window.
     pub fill_episodes_window_max: u64,
+    /// The most timers a cell held armed at a step where its durable plane
+    /// held no open hold episode.
+    pub armed_unheld_max: u32,
+    /// The steps and cells read with a durable plane and no open episode.
+    pub unheld_reads: u64,
 }
 
 /// The rows' per-cell state over one life of a node.
@@ -52,10 +63,14 @@ impl TimersOracle {
     pub(super) fn sample(&mut self, node: &Node, now: Nanos, report: &mut TimersReport) {
         for (cell, window) in self.windows.iter_mut().enumerate() {
             let (cell_loop, plane) = &node.cells[cell];
-            report.armed_timers_max = report.armed_timers_max.max(cell_loop.armed_timers());
-            let Some(episodes) = plane.durable_stats().map(|stats| stats.frame_waits_fill) else {
-                continue;
-            };
+            let armed = cell_loop.armed_timers();
+            report.armed_timers_max = report.armed_timers_max.max(armed);
+            let Some(stats) = plane.durable_stats() else { continue };
+            if stats.fill_hold_open == 0 && stats.group_hold_open == 0 {
+                report.armed_unheld_max = report.armed_unheld_max.max(armed);
+                report.unheld_reads += 1;
+            }
+            let episodes = stats.frame_waits_fill;
             let (start, base) = match *window {
                 Some((start, base)) if now.saturating_sub(start) < self.window => (start, base),
                 Some(_) | None => (now, episodes),
@@ -112,6 +127,9 @@ mod tests {
     const ENGAGED_EPISODES_MIN: u64 = 8;
     /// The positions a server cell's timers fill, one per role.
     const SERVER_TIMER_ROLES: u32 = inf_server::TimerRole::COUNT;
+    /// A durable cell's timers armed between hold episodes: its everysec
+    /// owner's (no accept fails on these legs).
+    const UNHELD_ARMED_MAX: u32 = 1;
 
     /// The dense leg's population: episodes of a hold and a seal a LOG step
     /// or two apart. A timer that outlived its episode would grow the timers
@@ -135,6 +153,12 @@ mod tests {
             "{} timers armed on one cell at once, above its {SERVER_TIMER_ROLES} roles",
             timers.armed_timers_max
         );
+        assert!(timers.unheld_reads > 0, "VACUOUS: no step read a cell between hold episodes");
+        assert!(
+            timers.armed_unheld_max <= UNHELD_ARMED_MAX,
+            "{} timers armed on a cell with no hold episode open: an issue left its arm",
+            timers.armed_unheld_max
+        );
     }
 
     /// The control: `m2-fill-tick` as it stands, one writer thinking up to
@@ -152,6 +176,12 @@ mod tests {
             timers.armed_timers_max <= SERVER_TIMER_ROLES,
             "{} timers armed on one cell at once, above its {SERVER_TIMER_ROLES} roles",
             timers.armed_timers_max
+        );
+        assert!(timers.unheld_reads > 0, "VACUOUS: no step read a cell between hold episodes");
+        assert!(
+            timers.armed_unheld_max <= UNHELD_ARMED_MAX,
+            "{} timers armed on a cell with no hold episode open: an issue left its arm",
+            timers.armed_unheld_max
         );
     }
 }
