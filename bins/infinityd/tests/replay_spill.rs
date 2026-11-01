@@ -519,6 +519,7 @@ fn run_arm(fsync: &str, leg: Leg) {
             assert!(reads > 0, "VACUOUS (arm {fsync}): no settle read: {info}");
             let verified = field("recover_node_tier_deletes_verified");
             assert!(verified > 0, "VACUOUS (arm {fsync}): no delete verified: {info}");
+            assert_step_bound(fsync, &field, &info);
         }
         Leg::Fit => {
             // The control leg: a boot that fits every window demotes
@@ -531,6 +532,43 @@ fn run_arm(fsync: &str, leg: Leg) {
     drop(c);
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The step bound at the shipped default budget (ADR-0174 A1): no
+/// recovery step of any cell did more work than `step_bytes` and one unit
+/// (`U`, from the node's configuration and this load, never from the
+/// engine), and steps yielded inside a unit — else the gauge was read on a
+/// boot that never parked (`VACUOUS`). `U` is the largest frame the node
+/// can have written, `max_sealed_frame_bytes` of its staging capacity (the
+/// default 4 MiB) under `Direct` (the larger of the two layouts), plus the
+/// largest of a record, a record settled against its one cold twin, and a
+/// demote step's flush: a lead (`MAINTAIN-SLICE`, 1 MiB at `MEM-BUDGET 3mb`),
+/// a page and two records of tier bytes, with its barrier, one seal it may
+/// cross and the directory sync of the file that seal opens.
+fn assert_step_bound(fsync: &str, field: &dyn Fn(&str) -> u64, info: &str) {
+    let step_bytes = inf_server::RecoverConfig::default().step_bytes;
+    let staging = inf_log::StagingConfig::with_capacity(4 << 20);
+    let entry = u64::from(inf_log::max_sealed_frame_bytes(staging, inf_log::SegmentIoMode::Direct));
+    let record = (8 + key(TAGS - 1, u64::from(u32::MAX)).len() + VALUE_LEN) as u64;
+    let barrier = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES;
+    let flush = (1 << 20) + 4096 + 2 * record + 3 * barrier;
+    let settled = record + inf_store::limits::SETTLE_READ_CHARGE_BYTES;
+    let unit = entry + flush.max(settled).max(record);
+    let work = field("recover_node_step_work_bytes_max");
+    let yields = field("recover_node_yields_in_frame")
+        + field("recover_node_yields_in_section")
+        + field("recover_node_yields_in_demote_step");
+    eprintln!(
+        "replay_spill arm {fsync}: step work max {work} bytes against {step_bytes} + {unit}, \
+         {} steps, {yields} yields inside a unit",
+        field("recover_node_steps")
+    );
+    assert!(
+        work <= step_bytes + unit,
+        "STEP BOUND (arm {fsync}): a step did {work} bytes of work, over {step_bytes} + {unit}: \
+         {info}"
+    );
+    assert!(yields > 0, "VACUOUS (arm {fsync}): no step yielded inside a unit: {info}");
 }
 
 #[test]

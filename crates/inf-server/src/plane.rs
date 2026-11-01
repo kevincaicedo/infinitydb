@@ -959,6 +959,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         if let Some(board) = &self.loading_board {
                             let slot = board.slot(boot.cell_id);
                             slot.publish_tier_replay(stats.tier_replay);
+                            slot.publish_step_facts(stats.step);
                             slot.mark_ready(
                                 stats.ckpt_records + stats.records_applied,
                                 stats.torn_truncated_at,

@@ -713,6 +713,13 @@ fn recover_gauge_lines(text: &mut String, node: &NodeInfo) {
     for (field, value) in names.zip(tier.to_array()) {
         push(text, &format!("{field}:{value}"));
     }
+    // ADR-0174 A1.2, node scope: the largest work one step did on any cell
+    // and the steps and yields inside a unit, summed.
+    let step = node.recover_step_facts.get();
+    let names = crate::recover::StepFacts::FIELDS.iter().map(|(name, _)| name);
+    for (field, value) in names.zip(step.to_array()) {
+        push(text, &format!("{field}:{value}"));
+    }
 }
 
 /// `INFO` — the ckpt gauge lines.

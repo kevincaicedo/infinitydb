@@ -321,6 +321,10 @@ pub struct NodeState {
     /// (summed; the step-charge gauge the largest), taken once when every
     /// cell is ready — zero without a recovery board.
     pub recover_tier_replay: Cell<crate::recover::TierReplayStats>,
+    /// ADR-0174 A1.2: the node fold of every cell's step facts (the work
+    /// gauge the largest, the counters summed), taken with the tiered fold
+    /// — zero without a recovery board.
+    pub recover_step_facts: Cell<crate::recover::StepFacts>,
     /// M4.5-S37 step 1 (`bench-diagnostics` only): plain SETs the
     /// ceiling arm wrote blind over a cold candidate.
     #[cfg(feature = "bench-diagnostics")]
