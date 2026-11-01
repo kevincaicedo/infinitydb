@@ -86,10 +86,6 @@ jobs:
       # planted reds run first, so the gate proves it can see what it guards.
       - name: fuzz targets compile (ADR-0198)
         run: ./scripts/check-fuzz-targets.sh
-      # ADR-0106: the gates must go red on a planted violation, or their OK
-      # is a claim.
-      - name: check scripts self-test (each gate exits non-zero on its planted case)
-        run: ./scripts/check-scripts-selftest.sh
       # ADR-0106 D7: the clock ban is type-resolved; the gate compiles a
       # planted-bypass probe under the workspace clippy.toml and lists every
       # sanctioned site.
@@ -107,12 +103,20 @@ jobs:
       # whose plants must draw their lint.
       - name: lint scopes (ADR-0144)
         run: ./scripts/check-lint-scopes.sh
-      # Linux only: the baseline is recorded there (cfg-gated files).
+      # Linux only: the baseline is recorded there (cfg-gated files). Its two
+      # clippy passes keep their own target, target/lint-ratchet: in the
+      # target the clippy step uses, their lint arguments would re-check every
+      # member twice.
       - name: lint ratchet (ADR-0144 D3; absorbs the fn-length ratchet)
         if: runner.os == 'Linux'
         run: ./scripts/check-lint-ratchet.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # ADR-0106: the gates must go red on a planted violation, or their OK
+      # is a claim. It runs after clippy, so a compile or lint red stops the
+      # leg first.
+      - name: check scripts self-test (each gate exits non-zero on its planted case)
+        run: ./scripts/check-scripts-selftest.sh
       - name: build shipping packages
         run: cargo build --workspace --exclude inf-sim
       - name: build simulator (isolated DST features)
