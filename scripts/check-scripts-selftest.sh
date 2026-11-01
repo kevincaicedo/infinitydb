@@ -3722,6 +3722,7 @@ fz_matrix_red() { # <root> [<mode>]
 
 root=$(fz_root clean)
 fz_once "$root.log" fz_run "$root"
+FZ_CLEAN_LOG=$root.log  # read again where the probe manifests are judged (C4)
 expect green "fuzz-targets: a clean two-target root" fz_replay "$root.log"
 expect_output "fuzz-targets: the OK line counts what it compiled and read" \
     "fuzz-targets OK: 2 fuzz workspaces, 2 of 2 targets compiled (2 .*bin.* rows, 2 files)" \
@@ -3894,7 +3895,7 @@ expect_red_because "fuzz-targets: C4: a workspace-inherited dependency of a prob
 expect green "fuzz-targets: C4: a probe's path dependency on a manifest of the tree" \
     fz_lacks "$FZ_C4 .a.," "$root.log"
 expect_output "fuzz-targets: the OK line says no probe names a third-party crate" \
-    "5 probe manifests, each run by its gate and naming no third-party crate" fz_replay "$work/fz-clean.log"
+    "5 probe manifests, each run by its gate and naming no third-party crate" fz_replay "$FZ_CLEAN_LOG"
 # C5: one row a file, at fuzz_targets/<name>.rs, each name once.
 root=$(fz_root c5-file)
 printf 'fn main() {}\n' >"$root/crates/a/fuzz/fuzz_targets/x.rs"
@@ -4091,6 +4092,7 @@ Caused by:
     Checking a-fuzz v0.0.0
 warning: build failed, waiting for other jobs to finish..."
 fz_once "$root.log" fz_run "$root"
+FZ_K1_BLOCK_LOG=$root.log  # read again after the refused-lock cases
 expect_red_because "fuzz-targets: K1 prints cargo's Caused by: chain" "^    Caused by:$" \
     fz_replay "$root.log"
 expect_output "fuzz-targets: K1 prints a build script's reason" \
@@ -4126,7 +4128,7 @@ expect_output "fuzz-targets: K1 names the refresh of a refused lock" \
 expect_output "fuzz-targets: K1 names the lock to commit" "then commit crates/a/fuzz/Cargo.lock$" \
     fz_replay "$root.log"
 expect green "fuzz-targets: no refresh is named for another cargo error" fz_lacks " fix: cargo update" \
-    "$work/fz-k1-block.log"
+    "$FZ_K1_BLOCK_LOG"
 fz_answer "$FZ_KROOT" crates/a/fuzz/Cargo.toml t_one
 fz_once "$FZ_KROOT.log" fz_run "$FZ_KROOT"
 expect_red_because "fuzz-targets: K2: cargo exits 0 having compiled one of two bins" \
