@@ -29,6 +29,13 @@ use inf_runtime::{
 
 const ACCEPT_TOKEN: u32 = 1;
 const PARK: Duration = Duration::from_millis(20);
+/// How long the last close may take to settle before the test calls the
+/// driver hung: a hang bound, as `pump_until`'s, never a latency budget.
+/// The two closes and the cancelled send complete in the kernel within a
+/// few of [`PARK`]'s pumps; the window ends early once all three have
+/// ended, so the verdict reads which completions arrived, not how fast
+/// (ADR-0200 D7: the CPUs are shared with every test process beside it).
+const SETTLE_HANG_BOUND: Duration = Duration::from_secs(5);
 /// Sends are one pool buffer. Loopback's MSS is 64 KiB, so a locked
 /// receive window reopens only once half of it is read (SWS avoidance):
 /// the opening read below frees ~16 KiB, the resumed send writes that
@@ -252,15 +259,28 @@ fn a_reused_fd_number_keeps_both_closes_and_never_carries_the_predecessors_bytes
             .map(|c| c.token),
     );
 
-    // ---- close B; settle everything.
+    // ---- close B; settle until both closes and the blocked send have
+    // ended, or the hang bound passes (the asserts below then name what is
+    // missing). One poll after that collects a completion already posted,
+    // so a second `Closed` for either close still counts against it.
     driver.push(IoOp::Close { fd: fd_b, token: close_token(200) });
-    let settle_deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < settle_deadline {
-        let seen = pump(&mut driver, &mut pool, Wait::Park { timeout: Some(PARK) });
+    let settle_deadline = Instant::now() + SETTLE_HANG_BOUND;
+    loop {
+        let settled = [100, 200].iter().all(|slot| closed.iter().any(|t| t.slot() == *slot))
+            && ended.iter().any(|(t, _)| *t == blocked);
+        let wait = if settled || Instant::now() >= settle_deadline {
+            Wait::Poll
+        } else {
+            Wait::Park { timeout: Some(PARK) }
+        };
+        let seen = pump(&mut driver, &mut pool, wait);
         ended.extend(release_sends(&mut pool, &seen));
         closed.extend(
             seen.iter().filter(|c| matches!(c.result, CompletionResult::Closed)).map(|c| c.token),
         );
+        if matches!(wait, Wait::Poll) {
+            break;
+        }
     }
 
     // Regime oracle (tree-independent): A's peer saw the full sends plus
