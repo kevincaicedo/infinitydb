@@ -1,7 +1,8 @@
 //! The timers' A/B by instructions (L4): the cell's timer paths on the
 //! hierarchical wheel the cell ran before its fixed timer set (A, a
 //! bench-only copy in `timer_ab/wheel.rs`, so every A leg measures the same
-//! code after the engine's timer changes), from one binary.
+//! code after the engine's timer changes) and on the fixed timer set (B),
+//! from one binary.
 //!
 //! The A legs, one op each:
 //!
@@ -19,6 +20,14 @@
 //! - `wheel-cohort`: `--owners` 1,024 or 65,536 timers armed at one instant,
 //!   half cancelled, the rest delivered at their deadline; one op is the
 //!   whole cohort, reported per op and per timer, never judged.
+//!
+//! The B legs, one op each:
+//!
+//! - `set-cohort`: the same cohort on a set of `--owners` positions, each
+//!   reserved before the loop: every owner armed one millisecond out, half
+//!   cancelled, the clock stepped to the deadline, and the rest delivered
+//!   one notice at a time and consumed. Reported beside `wheel-cohort`,
+//!   never judged.
 //!
 //! The shape is the cell's: the loop and its timer are a long-lived owner,
 //! and each op is one `#[inline(never)]` step through `&mut`, so every op
@@ -51,7 +60,12 @@ mod wheel;
 use std::hint::black_box;
 use std::process::ExitCode;
 
+use std::rc::Rc;
+
+use inf_foundation::CellId;
+use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
+use inf_runtime::{Cancelled, Consumed, Reserved, TimerArm, TimerOutcome, TimerOwner, TimerSet};
 
 use wheel::TimerWheel;
 
@@ -71,6 +85,9 @@ const ACCEPT_KEY: u64 = 3;
 /// A cohort's keys start above the server's, so no cohort timer is taken
 /// for one of theirs.
 const COHORT_KEY_BASE: u64 = 1 << 32;
+/// The B cohorts' sets.
+const OWNERS_1024: Cap = Cap::entries::<1024>("bench-owners-1024", CapFill::Serving);
+const OWNERS_65536: Cap = Cap::entries::<65536>("bench-owners-65536", CapFill::Serving);
 
 /// A leg: the path it drives and the plant it carries.
 #[derive(Clone, Copy)]
@@ -80,10 +97,11 @@ enum Leg {
     Park,
     Hold,
     Cohort,
+    SetCohort,
 }
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 10] = [
+const LEGS: [(&str, Leg, u8); 12] = [
     ("wheel-idle", Leg::Idle, 0),
     ("wheel-idle-plus-one", Leg::Idle, 1),
     ("wheel-one-out", Leg::OneOut, 0),
@@ -94,6 +112,8 @@ const LEGS: [(&str, Leg, u8); 10] = [
     ("wheel-hold-plus-one", Leg::Hold, 1),
     ("wheel-cohort", Leg::Cohort, 0),
     ("wheel-cohort-plus-one", Leg::Cohort, 1),
+    ("set-cohort", Leg::SetCohort, 0),
+    ("set-cohort-plus-one", Leg::SetCohort, 1),
 ];
 
 struct Args {
@@ -134,8 +154,10 @@ fn parse() -> Result<Args, String> {
     }
     let (leg, nops) = leg.ok_or("--variant is required")?;
     let owners = match (leg, owners) {
-        (Leg::Cohort, Some(owners)) => owners,
-        (Leg::Cohort, None) => return Err("a cohort leg takes --owners 1024 or 65536".into()),
+        (Leg::Cohort | Leg::SetCohort, Some(owners)) => owners,
+        (Leg::Cohort | Leg::SetCohort, None) => {
+            return Err("a cohort leg takes --owners 1024 or 65536".into());
+        }
         (_, None) => 0,
         (_, Some(_)) => return Err("--owners is a cohort leg's alone".into()),
     };
@@ -242,6 +264,75 @@ fn step_cohort(cell: &mut WheelCell, owners: u32) -> u64 {
     cancelled.wrapping_add(deliver(cell, deadline))
 }
 
+/// The B side's cell: its set, the owners reserved before the loop, the
+/// arms of one cohort, and its injected clock.
+struct SetCell {
+    set: TimerSet,
+    owners: Vec<TimerOwner>,
+    arms: Vec<TimerArm>,
+    clock: VirtualClock,
+    _census: Rc<CapCensus>,
+}
+
+impl SetCell {
+    fn new(owners: u32) -> SetCell {
+        let (census, _mark) = CapCensus::new(CellId(0));
+        let cap = if owners == 1024 { OWNERS_1024 } else { OWNERS_65536 };
+        let mut set = TimerSet::build(cap, &census).expect("built");
+        let owners = (0..owners)
+            .map(|index| match set.reserve(COHORT_KEY_BASE + u64::from(index)) {
+                Reserved::Owner(owner) => owner,
+                other => panic!("a free position: {other:?}"),
+            })
+            .collect();
+        let arms = Vec::with_capacity(cap.entries_max() as usize);
+        SetCell { set, owners, arms, clock: VirtualClock::new(MILLI), _census: census }
+    }
+}
+
+#[inline(never)]
+fn step_set_cohort(cell: &mut SetCell) -> u64 {
+    let now = cell.clock.now();
+    cell.arms.clear();
+    for owner in &cell.owners {
+        cell.arms.push(cell.set.arm(owner, now + MILLI, now).expect("armed"));
+    }
+    let mut effect = 0u64;
+    for arm in cell.arms.iter().step_by(2) {
+        if cell.set.cancel(arm) == Cancelled::Removed {
+            effect += 1;
+        }
+    }
+    cell.clock.advance(MILLI);
+    let deadline = cell.clock.now();
+    while let Some(notice) = cell.set.begin(deadline) {
+        effect = effect.wrapping_add(on_timer(notice.route()));
+        if cell.set.consume(&notice, TimerOutcome::Complete) == Consumed::Idle {
+            effect += 1;
+        }
+    }
+    effect
+}
+
+/// Drives `ops` set-cohort ops with `NOPS` planted per op.
+#[inline(never)]
+fn drive_set<const NOPS: u8>(ops: u64, owners: u32) -> u64 {
+    let mut cell = SetCell::new(owners);
+    let cell = black_box(&mut cell);
+    let mut accumulator = 0u64;
+    for _ in 0..ops {
+        plant::<NOPS>();
+        accumulator = accumulator.wrapping_add(step_set_cohort(cell));
+    }
+    // Engagement, after the counted loop: every cohort armed every owner
+    // and left none armed.
+    assert_eq!(cell.set.armed(), 0, "the leg's timers armed after its ops");
+    if ops > 0 {
+        assert_eq!(cell.set.armed_max(), owners, "the leg armed its whole cohort");
+    }
+    accumulator.wrapping_add(u64::from(cell.set.armed_max()))
+}
+
 /// Drives `ops` ops of `leg` with `NOPS` planted per op.
 #[inline(never)]
 fn drive<const NOPS: u8>(leg: Leg, ops: u64, owners: u32) -> u64 {
@@ -259,6 +350,7 @@ fn drive<const NOPS: u8>(leg: Leg, ops: u64, owners: u32) -> u64 {
             Leg::Park => step_park(cell),
             Leg::Hold => step_hold(cell),
             Leg::Cohort => step_cohort(cell, owners),
+            Leg::SetCohort => unreachable!("the set cohort drives its own cell"),
         };
         accumulator = accumulator.wrapping_add(effect);
     }
@@ -266,7 +358,7 @@ fn drive<const NOPS: u8>(leg: Leg, ops: u64, owners: u32) -> u64 {
     // drove, so a leg that armed or delivered nothing reads red here.
     let armed = cell.wheel.armed();
     let expected = match leg {
-        Leg::Idle | Leg::Cohort => 0,
+        Leg::Idle | Leg::Cohort | Leg::SetCohort => 0,
         Leg::OneOut | Leg::Park | Leg::Hold => 1,
     };
     assert_eq!(armed, expected, "the leg's timers armed after its ops");
@@ -284,9 +376,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = match args.nops {
-        0 => drive::<0>(args.leg, args.ops, args.owners),
-        _ => drive::<1>(args.leg, args.ops, args.owners),
+    let result = match (args.leg, args.nops) {
+        (Leg::SetCohort, 0) => drive_set::<0>(args.ops, args.owners),
+        (Leg::SetCohort, _) => drive_set::<1>(args.ops, args.owners),
+        (_, 0) => drive::<0>(args.leg, args.ops, args.owners),
+        (_, _) => drive::<1>(args.leg, args.ops, args.owners),
     };
     println!("{}", black_box(result));
     ExitCode::SUCCESS
