@@ -42,6 +42,12 @@ name = "executor"
 harness = false
 test = false
 
+# The timers' A/B by instructions (ADR-0154 D5): the wheel's legs.
+[[bench]]
+name = "timer_ab"
+harness = false
+test = false
+
 # M0-S04 echo gate (Linux + uring only; skipped without the feature).
 [[bench]]
 name = "uring_echo"
