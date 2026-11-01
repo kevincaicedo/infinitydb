@@ -132,6 +132,38 @@ impl fmt::Display for CapError {
 
 impl std::error::Error for CapError {}
 
+/// A capped container its host fills whole at the cell's assembly answered
+/// `Full` there: the host's cap is short of its own demand. The one home of
+/// the refusal's text, `<row>-full-at-assembly`, with the census row's name
+/// (the cap's), so a log or a canary names the row that refused. Derived
+/// never on a correct build: an `Assembly` cap is its host's demand.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AssemblyFull {
+    row: &'static str,
+}
+
+impl AssemblyFull {
+    /// The refusal of `cap`'s container at its cell's assembly.
+    #[must_use]
+    pub const fn new(cap: Cap) -> AssemblyFull {
+        AssemblyFull { row: cap.name() }
+    }
+
+    /// The census row that refused.
+    #[must_use]
+    pub const fn row(self) -> &'static str {
+        self.row
+    }
+}
+
+impl fmt::Display for AssemblyFull {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-full-at-assembly", self.row)
+    }
+}
+
+impl std::error::Error for AssemblyFull {}
+
 /// A payload that may be merged or dropped at a cap (ADR-0151 D2's
 /// coalescing row). A type opts in by name, and a reply, a pin or a
 /// descriptor never does; the lint-scopes gate prints every `impl Lossy for`
@@ -172,5 +204,13 @@ mod tests {
         assert_eq!(CapError::Alloc.to_string(), "the allocator refused the backing");
         assert!(CapError::Layout.to_string().contains("byte bound"));
         assert!(CapError::Census.to_string().contains("census"));
+    }
+
+    #[test]
+    fn an_assembly_refusal_names_its_census_row() {
+        const OWNERS: Cap = Cap::entries::<4>("timer-owners", CapFill::Assembly);
+        let full = AssemblyFull::new(OWNERS);
+        assert_eq!(full.row(), "timer-owners");
+        assert_eq!(full.to_string(), "timer-owners-full-at-assembly");
     }
 }
