@@ -1657,6 +1657,88 @@ printf 't/x\t%s::gone\tcast,arith\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
 expect red "lint-ratchet: an item scope naming no function is a scope error" rt_run "$root"
 printf 't/x\t%s\tcast,bogus\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
 expect red "lint-ratchet: an unknown lint family is a scope error" rt_run "$root"
+# The calls: both clippy passes run in the gate's own target directory under
+# the caller's target root, `${CARGO_TARGET_DIR:-target}/lint-ratchet` (a pass
+# in the recipe's target would re-check every member at each switch of lint
+# arguments), with the lint set the backlog counts. A stub cargo first on PATH
+# records each call; a copy of the gate with one part of a call changed is red.
+RT_BIN="$work/rt-bin"
+mkdir -p "$RT_BIN"
+IFS= read -r -d '' body <<'EOF' || true
+#!/usr/bin/env bash
+# The stub cargo: records the call, then reports a finished build.
+set -eu
+{
+    printf 'call:'
+    printf ' %s' "$@"
+    printf '\n'
+} >>"$RT_CALLS"
+printf '{"reason":"build-finished","success":true}\n'
+EOF
+printf '%s' "$body" >"$RT_BIN/cargo"
+chmod +x "$RT_BIN/cargo"
+root=$(rt_root rt-call)
+printf '# no rows\n' >"$root/docs/lint-baseline.tsv"
+printf 'too-many-lines-threshold = 70\n' >"$root/clippy.toml"
+rt_call_run() { # <gate> <root> [CARGO_TARGET_DIR]: the gate's cargo passes, recorded
+    rm -f "$2.calls"
+    if [ -n "${3:-}" ]; then
+        env PATH="$RT_BIN:$PATH" RT_CALLS="$2.calls" CARGO_TARGET_DIR="$3" INF_CHECK_ROOT="$2" \
+            INF_LINT_BASE_REF=base-tip INF_LINT_RATCHET_HOST=Linux "$1"
+    else
+        env -u CARGO_TARGET_DIR PATH="$RT_BIN:$PATH" RT_CALLS="$2.calls" INF_CHECK_ROOT="$2" \
+            INF_LINT_BASE_REF=base-tip INF_LINT_RATCHET_HOST=Linux "$1"
+    fi
+}
+rt_calls_ok() { # <calls file> <the target directory both calls must name>
+    python3 - "$1" "$2" <<'PY'
+import sys
+calls = [line.split(" ")[1:] for line in open(sys.argv[1], encoding="utf-8").read().split("\n") if line]
+lints = ["-W", "clippy::too_many_lines", "-W", "clippy::cast_possible_truncation",
+         "-W", "clippy::cast_sign_loss", "-W", "clippy::cast_possible_wrap",
+         "-W", "clippy::arithmetic_side_effects", "--force-warn", "clippy::disallowed_methods",
+         "--force-warn", "clippy::disallowed_types"]
+tail = ["--lib", "--bins", "--message-format=json", "--target-dir", sys.argv[2], "--", *lints]
+want = [["clippy", "--workspace", "--exclude", "inf-sim", *tail],
+        ["clippy", "-p", "inf-sim", "--features", "dst", *tail]]
+if calls != want:
+    print("calls:", *(" ".join(c) for c in calls), sep="\n    ")
+    sys.exit(1)
+PY
+}
+# The verdict reads the passes' output (the scope audit the gate runs next needs
+# a real tree, so its status here is not the case's).
+expect_output "lint-ratchet: the verdict reads the recorded passes' report" \
+    "lint-ratchet OK: no backlog" rt_call_run "$RATCHET" "$root"
+expect green "lint-ratchet: both passes name target/lint-ratchet, CARGO_TARGET_DIR unset" \
+    rt_calls_ok "$root.calls" target/lint-ratchet
+rt_call_run "$RATCHET" "$root" "$work/rt-target" >/dev/null 2>&1 || true
+expect green "lint-ratchet: both passes name \$CARGO_TARGET_DIR/lint-ratchet when it is set" \
+    rt_calls_ok "$root.calls" "$work/rt-target/lint-ratchet"
+rt_mutant() { # <name> <sed expression> <CARGO_TARGET_DIR or ''> <what the copy does>
+    local dir="$work/rt-gate-$1" want=target/lint-ratchet
+    rm -rf "${dir:?}"
+    mkdir -p "$dir"
+    cp "$SCRIPT_DIR/lint_scope_table.py" "$dir/"
+    sed "$2" "$RATCHET" >"$dir/check-lint-ratchet.sh"
+    chmod +x "$dir/check-lint-ratchet.sh"
+    if cmp -s "$RATCHET" "$dir/check-lint-ratchet.sh"; then
+        echo "selftest: the lint-ratchet mutant '$1' changed nothing" >&2
+        exit 2
+    fi
+    [ -z "$3" ] || want="$3/lint-ratchet"
+    rt_call_run "$dir/check-lint-ratchet.sh" "$root" "$3" >/dev/null 2>&1 || true
+    expect red "lint-ratchet: the calls' check is red on a gate that $4" rt_calls_ok "$root.calls" "$want"
+}
+rt_mutant shared 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/lint-ratchet"$|TARGET_DIR="${CARGO_TARGET_DIR:-target}"|' \
+    '' "shares the recipe's target directory"
+rt_mutant fixed 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/lint-ratchet"$|TARGET_DIR="target/lint-ratchet"|' \
+    "$work/rt-target" "ignores CARGO_TARGET_DIR"
+rt_mutant second 's|^            --target-dir "$TARGET_DIR" -- $LINTS$|            -- $LINTS|' \
+    '' "drops the simulator pass's --target-dir"
+rt_mutant first 's|^            --target-dir "$TARGET_DIR" -- $LINTS &&$|            -- $LINTS \&\&|' \
+    '' "drops the workspace pass's --target-dir"
+rt_mutant lint 's/^LINTS="-W clippy::too_many_lines /LINTS="/' '' "drops a lint the backlog counts"
 
 # ---------------------------------------------------------- doc artifacts
 DOCS=./scripts/check-doc-artifacts.sh
