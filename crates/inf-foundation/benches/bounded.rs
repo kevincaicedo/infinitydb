@@ -11,6 +11,11 @@
 //! `CappedSlab<_, u32, Retire>` (B: its instance compare and fill test), at
 //! caps 1,024, 16,384 and 65,536 — one directory link up to 16,384 slots,
 //! two at 65,536 — with the oldest id from a `VecDeque` of ids in both legs.
+//! And the capped map's row, reported and not judged: one op admits and
+//! publishes one fresh key, reads it back and removes the oldest, on a
+//! `HashMap` of foreign keys under the integer hasher (A) and on a
+//! `CappedMap<u64, _>` (B: its admission compare and its fill test), at cap
+//! 15,360, with the oldest key from a `VecDeque` of keys in both legs.
 //!
 //! The verdict rule: B − A ≤ 10 instructions per push-and-pop pair at the
 //! `call` shape, for either crossing at either cap; the `loop` shape is
@@ -54,7 +59,8 @@
 //!       --variant <v> --cap <c> --ops <n> [--shape <s>]
 //!
 //! `v` is a leg of `LEGS`; `c` ∈ 16 | 1024 for a deque leg, 1024 | 16384 |
-//! 65536 for a slab leg; `n` ≥ 0 (0 is the I(0) leg); `s` ∈ call (the
+//! 65536 for a slab leg, 15360 for a map leg; `n` ≥ 0 (0 is the I(0) leg);
+//! `s` ∈ call (the
 //! default: one op per `#[inline(never)]` call through `&mut`) | loop, a
 //! deque leg's alone. The deque is half full throughout, so every op pays
 //! the cap compare and no op crosses it; the slab and its `HashMap` hold
@@ -63,7 +69,13 @@
 //! A against A and B against B within 0.05 per op; `hashmap-plus-one` and
 //! `slab-plus-one` read A + 1.00 and B + 1.00, ± 0.05; `ids-only-u64` and
 //! `ids-only-slot`, the id queue alone (push one, pop the oldest) at each
-//! handle width, attribute the queue's own cost.
+//! handle width, attribute the queue's own cost. The map and its `HashMap`
+//! hold `N / 2` entries throughout, 7,680 sparse 48-bit keys at `N` =
+//! 15,360, so no op crosses and every walk reads a tree of that population.
+//! The map row's controls: A against A and B against B within 0.05 per op;
+//! `hashmap-keys-plus-one` and `map-plus-one` read A + 1.00 and B + 1.00,
+//! ± 0.05; `keys-only`, the key queue and the keys' arithmetic alone,
+//! attributes their cost.
 
 use std::collections::{HashMap, VecDeque};
 use std::hint::black_box;
@@ -71,8 +83,8 @@ use std::process::ExitCode;
 use std::rc::Rc;
 
 use inf_foundation::bounded::{
-    Built, Cap, CapCensus, CapFill, CappedDeque, CappedSlab, Coalesce, Lookup, Lossy, Merge,
-    Reserve, Reserved, Retire, SlabReserved, SlotId, Taken,
+    Admission, Built, Cap, CapCensus, CapFill, CappedDeque, CappedMap, CappedSlab, Coalesce,
+    Lookup, Lossy, MapBuilt, Merge, Reserve, Reserved, Retire, SlabReserved, SlotId, Taken,
 };
 use inf_foundation::{BuildIntHasher, CellId};
 
@@ -80,6 +92,7 @@ const CAP_16: Cap = Cap::entries::<16>("bench-16", CapFill::Serving);
 const CAP_1024: Cap = Cap::entries::<1024>("bench-1024", CapFill::Serving);
 const CAP_16384: Cap = Cap::entries::<16384>("bench-16384", CapFill::Serving);
 const CAP_65536: Cap = Cap::entries::<65536>("bench-65536", CapFill::Serving);
+const CAP_15360: Cap = Cap::entries::<15360>("bench-15360", CapFill::Serving);
 
 #[derive(Clone, Copy)]
 struct Entry(u64);
@@ -123,10 +136,20 @@ enum Leg {
     IdsOnlyU64,
     /// The id queue alone, holding B's `SlotId<u32>` handles.
     IdsOnlySlot,
+    /// The map row's A: a `HashMap` of sparse 48-bit keys.
+    HashMapKeys,
+    /// A plus one `nop`: the liveness plant on the map row's A.
+    HashMapKeysPlusOne,
+    /// The map row's B: a `CappedMap<u64, _>`.
+    Map,
+    /// B plus one `nop`: the liveness plant on the map row's B.
+    MapPlusOne,
+    /// The key queue and the keys' arithmetic alone, both legs' share.
+    KeysOnly,
 }
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg); 13] = [
+const LEGS: [(&str, Leg); 18] = [
     ("vecdeque", Leg::VecDeque),
     ("vecdeque-bounded", Leg::VecDequeBounded),
     ("vecdeque-plus-one", Leg::VecDequePlusOne),
@@ -140,6 +163,11 @@ const LEGS: [(&str, Leg); 13] = [
     ("slab-plus-one", Leg::SlabPlusOne),
     ("ids-only-u64", Leg::IdsOnlyU64),
     ("ids-only-slot", Leg::IdsOnlySlot),
+    ("hashmap-keys", Leg::HashMapKeys),
+    ("hashmap-keys-plus-one", Leg::HashMapKeysPlusOne),
+    ("map", Leg::Map),
+    ("map-plus-one", Leg::MapPlusOne),
+    ("keys-only", Leg::KeysOnly),
 ];
 
 #[derive(Clone, Copy)]
@@ -183,7 +211,10 @@ fn parse() -> Result<Args, String> {
                     "1024" => CAP_1024,
                     "16384" => CAP_16384,
                     "65536" => CAP_65536,
-                    other => return Err(format!("--cap {other}: 16, 1024, 16384 or 65536")),
+                    "15360" => CAP_15360,
+                    other => {
+                        return Err(format!("--cap {other}: 16, 1024, 16384, 65536 or 15360"));
+                    }
                 });
             }
             "--ops" => ops = Some(value.parse::<u64>().map_err(|e| format!("--ops: {e}"))?),
@@ -209,15 +240,22 @@ fn parse() -> Result<Args, String> {
             | Leg::ReservePlusFour
             | Leg::Coalesce
     );
+    let map = matches!(
+        leg,
+        Leg::HashMapKeys | Leg::HashMapKeysPlusOne | Leg::Map | Leg::MapPlusOne | Leg::KeysOnly
+    );
+    let call = matches!(shape, Shape::Call);
     let fits = if deque {
         cap.entries_max() <= 1024
+    } else if map {
+        cap.entries_max() == 15360 && call
     } else {
-        cap.entries_max() >= 1024 && matches!(shape, Shape::Call)
+        cap.entries_max() >= 1024 && cap.entries_max() != 15360 && call
     };
     if !fits {
         return Err(format!(
             "{variant}: a deque leg takes --cap 16 or 1024; a slab leg 1024, 16384 or 65536, \
-             at the call shape"
+             a map leg 15360, at the call shape"
         ));
     }
     Ok(Args { variant, leg, cap, ops: ops.ok_or("--ops is required")?, shape })
@@ -510,6 +548,110 @@ fn calls_ids_slot(cap: Cap, census: &Rc<CapCensus>, ops: u64) -> u64 {
     accumulator
 }
 
+// The map row. One op admits and publishes one fresh key, reads it back
+// and removes the oldest, whose key the queue holds: `N / 2` entries
+// throughout. The keys are sparse 48-bit words, an odd multiple of the op's
+// count modulo 2^48, so no two live keys are equal.
+
+/// A table of foreign 48-bit keys under the integer hasher.
+type KeyTable = HashMap<u64, Entry, BuildIntHasher>;
+
+const KEY_MASK_48: u64 = (1 << 48) - 1;
+
+/// The `i`th key: a bijection of the 48-bit words, so every key is fresh.
+#[inline(always)]
+fn sparse_key(i: u64) -> u64 {
+    i.wrapping_mul(0x9E37_79B9_7F4A_7C15) & KEY_MASK_48
+}
+
+#[inline(never)]
+fn step_hashmap_keys(map: &mut KeyTable, keys: &mut VecDeque<u64>, key: u64) -> u64 {
+    map.insert(key, Entry(key));
+    keys.push_back(key);
+    let read = map.get(&key).map_or(0, |Entry(v)| *v);
+    let oldest = keys.pop_front().map_or(0, |old| map.remove(&old).map_or(0, |Entry(v)| v));
+    read ^ oldest
+}
+
+#[inline(never)]
+fn step_map(map: &mut CappedMap<u64, Entry>, keys: &mut VecDeque<u64>, key: u64) -> u64 {
+    if let Admission::Vacant(slot) = map.admit(key) {
+        slot.publish(Entry(key));
+        keys.push_back(key);
+    }
+    let read = map.get(key).map_or(0, |Entry(v)| *v);
+    let oldest = keys.pop_front().map_or(0, |old| map.remove(old).map_or(0, |Entry(v)| v));
+    read ^ oldest
+}
+
+#[inline(never)]
+fn calls_hashmap_keys<const NOPS: u8>(cap: Cap, ops: u64) -> u64 {
+    let entries_max = cap.entries_max() as usize;
+    let mut map = KeyTable::with_capacity_and_hasher(entries_max, BuildIntHasher);
+    let mut keys = VecDeque::with_capacity(entries_max);
+    let mut next = 0u64;
+    for _ in 0..half(cap) {
+        next += 1;
+        let key = sparse_key(next);
+        map.insert(key, Entry(key));
+        keys.push_back(key);
+    }
+    let mut accumulator = 0u64;
+    for _ in 0..ops {
+        plant::<NOPS>();
+        next += 1;
+        accumulator ^= step_hashmap_keys(&mut map, &mut keys, sparse_key(next));
+    }
+    accumulator
+}
+
+fn capped_map(cap: Cap, census: &Rc<CapCensus>) -> CappedMap<u64, Entry> {
+    let mut builder = CappedMap::builder(cap, census).expect("the bench cap fits");
+    loop {
+        builder = match builder.step() {
+            MapBuilt::More(next) => next,
+            MapBuilt::Live(map) => return map,
+            MapBuilt::Refused(_, refused) => panic!("the bench map: {refused}"),
+        };
+    }
+}
+
+#[inline(never)]
+fn calls_map<const NOPS: u8>(cap: Cap, census: &Rc<CapCensus>, ops: u64) -> u64 {
+    let mut map = capped_map(cap, census);
+    let mut keys = VecDeque::with_capacity(cap.entries_max() as usize);
+    let mut next = 0u64;
+    for _ in 0..half(cap) {
+        next += 1;
+        let key = sparse_key(next);
+        if let Admission::Vacant(slot) = map.admit(key) {
+            slot.publish(Entry(key));
+            keys.push_back(key);
+        }
+    }
+    let mut accumulator = 0u64;
+    for _ in 0..ops {
+        plant::<NOPS>();
+        next += 1;
+        accumulator ^= step_map(&mut map, &mut keys, sparse_key(next));
+    }
+    // Dropped whole here: the bench's census never serves, so the drop is
+    // an abandoned assembly, uncounted.
+    accumulator
+}
+
+#[inline(never)]
+fn calls_keys_only(cap: Cap, ops: u64) -> u64 {
+    let mut keys: VecDeque<u64> = (1..=half(cap)).map(sparse_key).collect();
+    let mut next = half(cap);
+    let mut accumulator = 0u64;
+    for _ in 0..ops {
+        next += 1;
+        accumulator ^= step_ids(&mut keys, sparse_key(next));
+    }
+    accumulator
+}
+
 fn run(args: &Args, census: &Rc<CapCensus>) -> u64 {
     let (cap, ops) = (args.cap, args.ops);
     match (args.leg, args.shape) {
@@ -533,6 +675,11 @@ fn run(args: &Args, census: &Rc<CapCensus>) -> u64 {
         (Leg::SlabPlusOne, _) => calls_slab::<1>(cap, census, ops),
         (Leg::IdsOnlyU64, _) => calls_ids_u64(cap, ops),
         (Leg::IdsOnlySlot, _) => calls_ids_slot(cap, census, ops),
+        (Leg::HashMapKeys, _) => calls_hashmap_keys::<0>(cap, ops),
+        (Leg::HashMapKeysPlusOne, _) => calls_hashmap_keys::<1>(cap, ops),
+        (Leg::Map, _) => calls_map::<0>(cap, census, ops),
+        (Leg::MapPlusOne, _) => calls_map::<1>(cap, census, ops),
+        (Leg::KeysOnly, _) => calls_keys_only(cap, ops),
     }
 }
 

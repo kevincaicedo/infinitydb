@@ -6,10 +6,12 @@
 //! live across the await, so the slot and the answer that carries it are two
 //! entries with a plant each; a wrapper of the caller's own (an `Option`, a
 //! tuple or a struct holding a slot) is not matched and stays review's. A
-//! slab's lookups borrow its occupant for one step, so they are listed too.
-//! Compile only; nothing here runs.
+//! slab's lookups borrow its occupant for one step, and a map's admission
+//! answer, its vacant slot and its present entry borrow the map, so they are
+//! listed too. Compile only; nothing here runs.
 use inf_foundation::bounded::{
-    CappedDeque, CappedSlab, Lookup, LookupMut, Reserve, Reserved, Retire, SlabReserved, SlotId,
+    Admission, CappedDeque, CappedMap, CappedSlab, Lookup, LookupMut, Reserve, Reserved, Retire,
+    SlabReserved, SlotId,
 };
 
 async fn yield_once() {}
@@ -123,4 +125,67 @@ fn write(found: LookupMut<'_, u8>) {
         LookupMut::Live(value) => *value = 1,
         LookupMut::Stale | LookupMut::Vacant => {}
     }
+}
+
+// A map's admission answer, its vacant slot and its present entry, each a
+// borrow of the map for one step, awaiting `settle` as the slab's plants do.
+
+pub async fn map_admission_across_await(map: &mut CappedMap<u32, u8>) {
+    let admitted = map.admit(7); // PLANT clippy::await_holding_invalid_type inf_foundation::bounded::Admission
+    settle().await;
+    place(admitted);
+}
+
+pub async fn map_admission_placed_before_await(map: &mut CappedMap<u32, u8>) {
+    let admitted = map.admit(7); // CONTROL
+    place(admitted); // CONTROL
+    settle().await; // CONTROL
+}
+
+fn place(admitted: Admission<'_, u32, u8>) {
+    match admitted {
+        Admission::Vacant(vacant) => vacant.publish(3),
+        Admission::Occupied(entry) => {
+            let _previous = entry.replace(3);
+        }
+        Admission::Full => {}
+    }
+}
+
+pub async fn map_vacant_across_await(map: &mut CappedMap<u32, u8>) {
+    match map.admit(8) {
+        Admission::Vacant(vacant) => { // PLANT clippy::await_holding_invalid_type inf_foundation::bounded::VacantSlot
+            settle().await;
+            vacant.publish(4);
+        }
+        Admission::Occupied(_) | Admission::Full => {}
+    }
+}
+
+pub async fn map_vacant_published_before_await(map: &mut CappedMap<u32, u8>) {
+    match map.admit(8) {
+        Admission::Vacant(vacant) => vacant.publish(4), // CONTROL
+        Admission::Occupied(_) | Admission::Full => {}
+    }
+    settle().await; // CONTROL
+}
+
+pub async fn map_occupied_across_await(map: &mut CappedMap<u32, u8>) {
+    match map.admit(9) {
+        Admission::Occupied(entry) => { // PLANT clippy::await_holding_invalid_type inf_foundation::bounded::OccupiedSlot
+            settle().await;
+            let _previous = entry.replace(5);
+        }
+        Admission::Vacant(_) | Admission::Full => {}
+    }
+}
+
+pub async fn map_occupied_replaced_before_await(map: &mut CappedMap<u32, u8>) {
+    match map.admit(9) {
+        Admission::Occupied(entry) => {
+            let _previous = entry.replace(5); // CONTROL
+        }
+        Admission::Vacant(_) | Admission::Full => {}
+    }
+    settle().await; // CONTROL
 }

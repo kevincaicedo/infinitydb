@@ -97,6 +97,9 @@ await-holding-invalid-types = [
     { path = "inf_foundation::bounded::SlabReserved", reason = "the answer to a slab's reserve() carries the slot: it is matched in the step that reserved, before any await (ADR-0144 A2)" },
     { path = "inf_foundation::bounded::Lookup", reason = "a slab lookup borrows its occupant for one step: a resumed step looks up its handle again (ADR-0144 A2)" },
     { path = "inf_foundation::bounded::LookupMut", reason = "a slab lookup borrows its occupant for one step: a resumed step looks up its handle again (ADR-0144 A2)" },
+    { path = "inf_foundation::bounded::Admission", reason = "the answer to a map's admit() carries its slot: it is matched in the step that admitted, before any await (ADR-0144 A2)" },
+    { path = "inf_foundation::bounded::OccupiedSlot", reason = "a map's present entry is borrowed for one step: a resumed step admits its key again (ADR-0144 A2)" },
+    { path = "inf_foundation::bounded::VacantSlot", reason = "a map's reservation is consumed before any await: a resumed step admits again (ADR-0144 A2)" },
 ]
 
 # INFINITY_STYLE "~70 lines per function" (review 2026-08-30 L18 R1; batch
