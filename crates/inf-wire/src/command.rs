@@ -465,6 +465,24 @@ struct Bucket {
     row: Option<&'static CommandMeta>,
 }
 
+impl Bucket {
+    /// The verify: `Some(row)` exactly when the input of `len` bytes, whose
+    /// zero-padded little-endian words are `raw`, is this bucket's name in
+    /// some letter case. The length first, then the bytes: where the name
+    /// has a letter, the input's byte may differ from it in the case bit
+    /// alone; every other byte, the zero padding included, must be equal.
+    /// An empty bucket has length 0, which no probed input has.
+    #[inline(always)]
+    fn resolve(&self, raw: [u64; 2], len: usize) -> Option<&'static CommandMeta> {
+        let differ =
+            ((raw[0] ^ self.name[0]) & self.care[0]) | ((raw[1] ^ self.name[1]) & self.care[1]);
+        if len != usize::from(self.len) || differ != 0 {
+            return None;
+        }
+        self.row
+    }
+}
+
 /// `bucket → Bucket`, built at compile time. Collisions fail the build.
 static TABLE: [Bucket; BUCKETS] = build_table();
 
@@ -527,19 +545,9 @@ pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta> {
         u64::from_le_bytes(padded[..8].try_into().expect("8 bytes")),
         u64::from_le_bytes(padded[8..].try_into().expect("8 bytes")),
     ];
-    let bucket = &TABLE[hash_words(fold_for_hash(raw, len))];
-    // The length first, then the bytes: where the name has a letter, the
-    // input's byte may differ from it in the case bit alone; every other
-    // byte, the zero padding included, must be equal. So nothing else that
-    // shares a name's hash words — a longer spelling whose added bytes fold
-    // away, a non-letter one bit 5 off — resolves, and an empty bucket
-    // (length 0) never does.
-    let differ =
-        ((raw[0] ^ bucket.name[0]) & bucket.care[0]) | ((raw[1] ^ bucket.name[1]) & bucket.care[1]);
-    if len != usize::from(bucket.len) || differ != 0 {
-        return None;
-    }
-    bucket.row
+    // Nothing else that shares a name's hash words — a longer spelling whose
+    // added bytes fold away, a non-letter one bit 5 off — resolves.
+    TABLE[hash_words(fold_for_hash(raw, len))].resolve(raw, len)
 }
 
 // ---- Key extraction ----------------------------------------------------------
@@ -818,6 +826,16 @@ mod tests {
         padded.resize(MAX_NAME_LEN, b' ');
         let over = [padded.as_slice(), b"P"].concat();
         spellings.extend([Vec::new(), padded, over, b"        \x09".to_vec()]);
+        // The NUL extensions: each name and 1 to `MAX_NAME_LEN - len` NUL
+        // bytes, which share the name's raw words.
+        for meta in &COMMANDS {
+            let name = meta.name.as_bytes();
+            for len in name.len() + 1..=MAX_NAME_LEN {
+                let mut extended = name.to_vec();
+                extended.resize(len, 0);
+                spellings.push(extended);
+            }
+        }
         let wrong: Vec<&Vec<u8>> =
             spellings.iter().filter(|s| lookup(s).map(|m| m.id) != oracle(s)).collect();
         let distinct: std::collections::HashSet<&Vec<u8>> = wrong.iter().copied().collect();
@@ -829,6 +847,26 @@ mod tests {
             distinct.len(),
             &wrong[..wrong.len().min(4)]
         );
+    }
+
+    /// A NUL extension of a name (the name and 1 to `MAX_NAME_LEN - len`
+    /// NUL bytes) has the name's raw words, so only the length tells them
+    /// apart. The length is mixed into the hash and no such input probes
+    /// its name's bucket in this table, so `lookup` cannot reach the case:
+    /// the probe is built here, on the name's own bucket, and the verify
+    /// must refuse it.
+    #[test]
+    fn the_verify_refuses_a_nul_extension_on_its_names_bucket() {
+        for meta in &COMMANDS {
+            let name = meta.name.as_bytes();
+            let bucket = &TABLE[hash_words(pack_folded(name))];
+            let row = bucket.resolve(pack_raw(name), name.len()).map(|m| m.id);
+            assert_eq!(row, Some(meta.id), "{} resolves on its bucket", meta.name);
+            for len in name.len() + 1..=MAX_NAME_LEN {
+                let extension = bucket.resolve(pack_raw(name), len);
+                assert!(extension.is_none(), "{} and {} NUL bytes", meta.name, len - name.len());
+            }
+        }
     }
 
     #[test]
