@@ -18,6 +18,11 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // harness process, not cell code
 
+// nextest-stall-default: 64 blob SETs on one cell put a few KiB of record legs
+// in a tiered window of at least its 3 MiB MEM-BUDGET; no write parks there
+// (ADR-0053 D4), so the stall bound is never read. The writers the test
+// parks wait on the extent-seal window, a park with no deadline.
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
