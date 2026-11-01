@@ -2,7 +2,10 @@
 //! (ADR-0190 D1): the transitions of the reply's state table, each read
 //! back through `outcome()`.
 
-use crate::{OpenReply, OwnedReply, Protocol, ReplyBuf, ReplyOutcome, RespWriter, ZeroByteReply};
+use crate::{
+    ErrorPassthrough, OpenReply, OwnedReply, Protocol, ReplyBuf, ReplyOutcome, RespWriter,
+    SuccessView, ZeroByteReply,
+};
 
 #[test]
 fn an_error_at_the_start_is_the_outcome() {
@@ -118,4 +121,19 @@ fn received_refuses_zero_bytes_and_returns_the_buffer() {
         .expect("a non-empty reply is received");
     assert!(owned.is_error());
     assert_eq!(owned.into_bytes(), b"-ERR x\r\n");
+}
+
+#[test]
+fn success_views_a_success_reply_and_passes_an_error_through() {
+    let leg = |bytes: &[u8], outcome| {
+        OwnedReply::received(bytes.to_vec(), outcome).expect("a non-empty reply")
+    };
+    let success = leg(b"-ERR a value\r\n", ReplyOutcome::Success);
+    let view = success.success().expect("a Success reply has a view");
+    assert_eq!(view.bytes(), b"-ERR a value\r\n", "the outcome decides, never the bytes");
+    let error = leg(b"*1\r\n$1\r\nk\r\n", ReplyOutcome::Error);
+    assert_eq!(error.success().map(SuccessView::bytes), Err(ErrorPassthrough));
+    let nothing = OpenReply::new(Vec::new()).finish();
+    let view = nothing.success().map(SuccessView::bytes);
+    assert_eq!(view, Ok(&b""[..]), "a reply that wrote nothing is an empty success");
 }

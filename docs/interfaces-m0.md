@@ -700,8 +700,25 @@ between cells in one process, not authentication or an ACL capability
 > start, and `clear`, reset it to `Success` and leave every byte before
 > the reply's start. The outcome is `Error` iff
 > the reply's top-level frame is an error line, and no reader of a reply
-> decides from its bytes, but for the `KEYS` and `SCAN` programs' legs
-> (§6b). The sketch below is the shape (ADR-0190 D1).
+> decides from its bytes. The sketch below is the shape (ADR-0190 D1).
+
+> **ADR-0190 A1 (2026-10-30), implementation open:** the open reply
+> lives beside its buffer. `ReplyBuf` owns its bytes with the reply's
+> start and outcome and has no public constructor: it is reached as
+> `&mut ReplyBuf` from a `ReplyStream` (a buffer of successive replies,
+> a connection's output or an owner's reply scratch), whose `open()`
+> starts the next reply at the buffer's end with outcome `Success`, or
+> from an `OpenReply` (one owned reply over a pool buffer, opened at 0),
+> whose `reply()` lends it. `Reply<B>`, `ReplyBuf::over` and
+> `OpenReply::lend` go. `RespWriter::new` takes `&mut ReplyBuf`; the
+> writer holds the reply and the protocol, and its frame methods are as
+> before. A stream's buffer is read, sent, appended to and emptied only
+> between replies (`as_bytes`, `consume`, `emit`, `discard`). These
+> types are not built; until they are, the sketch below is ADR-0190
+> D1's shape. `OwnedReply::success()` answers a `SuccessView` of a
+> `Success` reply's bytes, or `ErrorPassthrough` for an `Error` reply;
+> a value decoder of a leg's bytes takes only a `SuccessView`, so no
+> decoder reads a reply whose outcome was not read.
 
 ```rust
 // Parser: per-connection state over borrowed input; a frame that spans feeds
@@ -915,11 +932,8 @@ impl SlotRouter {
 > plane holds, forwards or gathers is
 > an `OwnedReply`: the caller reads `outcome()` after `execute` returns,
 > and no site of `inf-server` decides success or failure from a reply's
-> first byte, prefix or length, but the `KEYS` and `SCAN` programs: a leg
-> reply whose array header does not parse is answered whole, so a
-> `Success` leg without one reaches the client where the rule answers
-> `ERR cross-cell program reply malformed` (as `PUBSUB CHANNELS` does).
-> Reading those legs' outcome first is not built. A write stages its
+> first byte, prefix or length: the `KEYS` and `SCAN` programs read each
+> leg's outcome first, as `PUBSUB CHANNELS` does. A write stages its
 > durable effects only when its reply's outcome is `Success`, or the
 > command stages despite an
 > error, through one function. A fan's refused leg (`Err(code)`) is the
@@ -932,6 +946,15 @@ impl SlotRouter {
 > comparison in production `crates/inf-server/src`; a sanctioned site
 > carries `reply-outcome-allow: <reason>`. The sketch below is the shape
 > (ADR-0190 D2, D4).
+
+> **ADR-0190 A1 (2026-10-30), implementation open:** `execute` and
+> every reply parameter take `out: &mut ReplyBuf`, with no lifetime;
+> the parse stage's batch holds the connection's `ReplyStream` and the
+> drain the owner's reply scratch, each opening one reply per command
+> it runs. These parameters are not built. The `KEYS` and `SCAN`
+> programs read each leg's outcome first, as `PUBSUB CHANNELS` does: an
+> `Error` leg is the reply, untouched; a `Success` leg without its
+> header answers `ERR cross-cell program reply malformed`.
 
 ```rust
 pub struct ConnCx { pub proto: Protocol, pub id: u64 }   // HELLO state
