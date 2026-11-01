@@ -543,6 +543,16 @@ rows=(
   # Planted, the target reads covered while any entry is unfolded, so a
   # standalone that leaves a frame in flight outside it discharges the due.
   "inf_canary_due_covered_by_any_entry crate-test inf-log lib everysec_due_survives_a_standalone_that_leaves_a_frame_in_flight B's bytes are queued outside the coverage"
+  # ADR-0199 D3 at the stop: the first plant again, on the shape that holds
+  # every log fdatasync from the stop's arming. The quiet cell's stranded due
+  # holds its drain, and the clean-stop liveness verdict names the term.
+  "inf_canary_due_outlives_coverage m2-stop-tick BarrierOwed"
+  # The stop-tick shape's vacuity plants: the hold never armed, and a hold
+  # lifted 1 ms after it engages, before a tick can meet a held barrier (at
+  # a seed whose final-sync request does not itself land over a covering
+  # entry: there a 1 ms hold still counts a covered tick).
+  "inf_canary_stop_tick_unheld m2-stop-tick stop-tick-unheld"
+  "inf_canary_stop_tick_short_hold m2-stop-tick stop-tick-uncovered --seed 0xC0FFEE"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

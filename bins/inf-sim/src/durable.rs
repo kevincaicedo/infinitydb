@@ -61,8 +61,10 @@ mod ledger_wedge;
 #[cfg(test)]
 mod park;
 mod run;
+mod stop_tick;
 pub use ledger_wedge::{LedgerWedgeLeg, LedgerWedgeReport};
 pub use run::run_durable_scenario;
+pub use stop_tick::StopTickReport;
 
 pub(crate) use audit::survival_audit;
 use audit::{
@@ -297,6 +299,12 @@ pub struct DurableScenario {
     /// ([`LedgerWedgeLeg`]). `None` everywhere else: every other trace
     /// stays byte-identical.
     pub ledger_wedge: Option<LedgerWedgeLeg>,
+    /// The stop-tick shape (`m2-stop-tick`): the graceful stop with its
+    /// checkpoint off, every log fdatasync held from the first
+    /// `finish_stop` until each dirty cell counted a covered tick
+    /// (`stop_tick.rs`). `false` everywhere else: every other trace stays
+    /// byte-identical.
+    pub stop_tick: bool,
 }
 
 /// The epoch-marks shape's legs, chosen by name (`--marks-leg`), never by
@@ -956,6 +964,7 @@ impl DurableScenario {
             tier_budget: None,
             epoch_marks: None,
             ledger_wedge: None,
+            stop_tick: false,
         }
     }
 
@@ -1342,6 +1351,7 @@ impl DurableScenario {
             tier_budget: None,
             epoch_marks: None,
             ledger_wedge: None,
+            stop_tick: false,
         }
     }
 
@@ -1510,6 +1520,7 @@ impl DurableScenario {
             tier_budget: None,
             epoch_marks: None,
             ledger_wedge: None,
+            stop_tick: false,
         }
     }
 }
@@ -1697,6 +1708,9 @@ pub struct DurableReport {
     pub epoch_marks_cells: Vec<EpochMarksCell>,
     /// The ledger-wedge shape's readings at the cut (`None` off the shape).
     pub ledger_wedge: Option<LedgerWedgeReport>,
+    /// The stop-tick shape's readings at the end of its stop (`None` off
+    /// the shape).
+    pub stop_tick: Option<StopTickReport>,
 }
 
 /// One cell's reclaim-marks census row at the cut of an epoch-marks run.

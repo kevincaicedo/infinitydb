@@ -88,6 +88,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         tier_budget_cells: Vec::new(),
         epoch_marks_cells: Vec::new(),
         ledger_wedge: None,
+        stop_tick: None,
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -539,6 +540,10 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let seeded_cut = cut_step;
     let mut ledger_wedge = scenario.ledger_wedge.map(ledger_wedge::LedgerWedge::new);
     let cut_step = if ledger_wedge.is_some() { u64::MAX } else { cut_step };
+    // The stop-tick shape requests its stop on its own reading
+    // (`StopTick::stop_due`), never at the seeded cut.
+    let mut stop_tick = scenario.stop_tick.then(|| stop_tick::StopTick::new(scenario, &mut rng));
+    let cut_step = if stop_tick.is_some() { u64::MAX } else { cut_step };
     // M3-S23: two seeded mid-run equivalence instants. Each quiesces
     // (drain in-flight, send nothing new), compares live state against a
     // read-only shadow replay, then resumes. The cut itself is never
@@ -573,6 +578,12 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         if let Some(wedge) = ledger_wedge.as_mut() {
             wedge.observe(step, &node, &disk, clock.now());
             if wedge.cut_due(step, seeded_cut) {
+                break;
+            }
+        }
+        if let Some(arm) = &stop_tick {
+            let below_quota = writers.iter().any(|w| w.sent < w.quota);
+            if arm.stop_due(step, below_quota, &node, usize::from(scenario.cells)) {
                 break;
             }
         }
@@ -720,6 +731,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     if scenario.clean_stop && scenario.plant != Plant::StopKill {
         let cells = usize::from(scenario.cells);
         for cell in 0..cells {
+            if stop_tick.is_some() {
+                node.plane_mut(cell).set_stop_checkpoint(false);
+            }
             node.plane_mut(cell).request_stop();
         }
         let mut steps = 0u64;
@@ -736,12 +750,18 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                 for cell in 0..cells {
                     node.plane_mut(cell).finish_stop();
                 }
+                if let Some(arm) = stop_tick.as_mut() {
+                    arm.arm(steps, &node, &disk, clock.now(), cells);
+                }
             }
             steps += 1;
             report.scheduler_steps += 1;
             if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
                 fail(&mut report, format!("clean stop: {err}"));
                 return finish(report, &observer, &clock);
+            }
+            if let Some(arm) = stop_tick.as_mut() {
+                arm.observe(&node, &disk, clock.now(), cells);
             }
             for writer in &mut writers {
                 let bytes = node.nets[writer.cell].borrow_mut().client_recv(writer.fd);
@@ -756,11 +776,17 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                 // Each cell's phase beside the wait that holds it (ADR-0199 D3).
                 let holds: Vec<Option<inf_server::StopHold>> =
                     (0..cells).map(|c| node.plane(c).stop_hold()).collect();
+                let arm = stop_tick.as_ref().map_or_else(String::new, |arm| {
+                    let read = arm.report(&node, cells);
+                    let line = format!("; {}", read.describe());
+                    report.stop_tick = Some(read);
+                    line
+                });
                 fail(
                     &mut report,
                     format!(
                         "CLEAN STOP LIVENESS VIOLATION seed {:#x}: cells still {phases:?} after    \
-                                                   {steps} steps, held by {holds:?}",
+                                                   {steps} steps, held by {holds:?}{arm}",
                         scenario.seed
                     ),
                 );
@@ -768,6 +794,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             }
         }
         report.clean_stop_steps = steps;
+        if let Some(arm) = &stop_tick {
+            arm.judge(scenario.seed, &node, cells, &mut report);
+        }
         for writer in &writers {
             if !node.nets[writer.cell].borrow().closed(writer.fd) {
                 fail(
@@ -1161,7 +1190,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     }
     // ADR-0124 D4's observable: a boot after a clean stop replays no tail
     // record on any cell — the stop checkpoint covered everything.
-    if scenario.clean_stop && scenario.plant != Plant::StopKill {
+    if scenario.clean_stop && scenario.plant != Plant::StopKill && !scenario.stop_tick {
         for cell in 0..usize::from(scenario.cells) {
             let mut probe = MiniClient::connect(&mut node, cell);
             let reply = probe.call(
