@@ -1329,8 +1329,13 @@ impl<F: SegmentFs> DurableCell<F> {
             FillDecision::Seal => false,
             FillDecision::Hold if self.fill_episode.is_some() => true,
             FillDecision::Hold => {
-                self.fill_episode =
-                    Self::open_episode(cx, &self.timers.fill_hold, self.fill.window);
+                #[cfg(not(inf_canary_hold_arms_nothing))]
+                let episode = Self::open_episode(cx, &self.timers.fill_hold, self.fill.window);
+                // Canary: the hold arms nothing; its episode holds its
+                // owner's dead arm, which its issue's cancel reads NotArmed.
+                #[cfg(inf_canary_hold_arms_nothing)]
+                let episode = self.timers.dead_fill.map(|arm| HoldEpisode { since: cx.now, arm });
+                self.fill_episode = episode;
                 self.fill_episode.is_some()
             }
         }
@@ -1368,8 +1373,12 @@ impl<F: SegmentFs> DurableCell<F> {
             GroupDecision::Seal => false,
             GroupDecision::Hold if self.group_episode.is_some() => true,
             GroupDecision::Hold => {
-                self.group_episode =
-                    Self::open_episode(cx, &self.timers.group_hold, self.group.window);
+                #[cfg(not(inf_canary_hold_arms_nothing))]
+                let episode = Self::open_episode(cx, &self.timers.group_hold, self.group.window);
+                // Canary: the hold arms nothing (as the fill hold's).
+                #[cfg(inf_canary_hold_arms_nothing)]
+                let episode = self.timers.dead_group.map(|arm| HoldEpisode { since: cx.now, arm });
+                self.group_episode = episode;
                 self.group_episode.is_some()
             }
         }

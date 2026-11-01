@@ -241,6 +241,11 @@ impl WakeOracle {
                 Some(stats) if stats.records_staged > 0 => Held::Staged,
                 Some(_) => Held::No,
             };
+            // Vacuity plant: the oracle never reads a held state.
+            #[cfg(inf_canary_wake_never_held)]
+            {
+                *held = Held::No;
+            }
         }
     }
 

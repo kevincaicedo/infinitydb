@@ -10,6 +10,8 @@ use core::fmt;
 use std::rc::Rc;
 
 use inf_foundation::bounded::{AssemblyFull, CapCensus, CapError};
+#[cfg(inf_canary_hold_arms_nothing)]
+use inf_runtime::TimerArm;
 use inf_runtime::{Reserved, TimerOwner, TimerSet};
 
 use crate::limits::SERVER_TIMER_OWNERS;
@@ -104,6 +106,12 @@ pub(crate) struct DurableTimers {
     pub(crate) everysec: TimerOwner,
     pub(crate) fill_hold: TimerOwner,
     pub(crate) group_hold: TimerOwner,
+    /// Canary: each hold owner's arm, cancelled at the build, which its
+    /// episodes hold in place of an arm of their own.
+    #[cfg(inf_canary_hold_arms_nothing)]
+    pub(crate) dead_fill: Option<TimerArm>,
+    #[cfg(inf_canary_hold_arms_nothing)]
+    pub(crate) dead_group: Option<TimerArm>,
 }
 
 /// A server cell's timer owners, one per role. The plane keeps them; no
@@ -133,10 +141,34 @@ impl ServerTimers {
                 everysec: everysec?,
                 fill_hold: fill_hold?,
                 group_hold: group_hold?,
+                #[cfg(inf_canary_hold_arms_nothing)]
+                dead_fill: None,
+                #[cfg(inf_canary_hold_arms_nothing)]
+                dead_group: None,
             }),
+        };
+        // Canary: each hold owner is armed and at once cancelled, one after
+        // the other, before the loop exists; its episodes hold that dead arm.
+        #[cfg(inf_canary_hold_arms_nothing)]
+        let timers = {
+            let mut timers = timers;
+            if let Some(durable) = timers.durable.as_mut() {
+                durable.dead_fill = dead_arm(&mut set, &durable.fill_hold);
+                durable.dead_group = dead_arm(&mut set, &durable.group_hold);
+            }
+            timers
         };
         Ok((set, timers))
     }
+}
+
+/// Canary: `owner` armed a millisecond out and cancelled at once.
+#[cfg(inf_canary_hold_arms_nothing)]
+fn dead_arm(set: &mut TimerSet, owner: &TimerOwner) -> Option<TimerArm> {
+    use inf_foundation::time::Nanos;
+    let arm = set.arm(owner, Nanos::from_millis(1), Nanos(0)).ok()?;
+    let _ = set.cancel(&arm);
+    Some(arm)
 }
 
 /// `role`'s owner, reserved with its route.

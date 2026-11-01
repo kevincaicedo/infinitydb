@@ -347,6 +347,18 @@ rows=(
   # row registers and fills after the serve mark: the census counts each
   # as an assembly violation, and the census verdict reads the count.
   "inf_canary_serve_mark_first m0-smoke cap-assembly-violated"
+  # ADR-0089, ADR-0092 D1: a hold arms its window, so a parked loop wakes
+  # to seal it. Planted, each hold's episode holds its owner's arm cancelled
+  # at the build and arms nothing: TM3 reads a held frame's park outliving
+  # its window on both hold legs, and the binary's owning cell reads one
+  # timer armed at most, its everysec owner's.
+  "inf_canary_hold_arms_nothing m2-fill-tick held-park-outlives-window --park-at-once"
+  "inf_canary_hold_arms_nothing m2-group-hold held-park-outlives-window --park-at-once"
+  "inf_canary_hold_arms_nothing crate-test infinityd test:timer_owners a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell its everysec and fill owners"
+  # TM3's engagement: planted, the oracle reads no held state, so a leg's
+  # run judges nothing and is vacuous.
+  "inf_canary_wake_never_held m2-fill-tick held-park-unengaged --park-at-once"
+  "inf_canary_wake_never_held m2-group-hold held-park-unengaged --park-at-once"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.
