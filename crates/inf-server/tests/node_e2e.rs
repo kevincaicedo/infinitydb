@@ -2538,6 +2538,39 @@ fn reply_outcome_refused_set_on_always_stages_nothing() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A four-cell `MSET` under `maxmemory 1` whose pairs all live off the
+/// connection's cell: no local pair can refuse first, so every pair rides a
+/// fabric leg, each owner refuses, and the client reads an owner's own
+/// `-OOM` bytes through the fan's fold, never `+OK` (ADR-0190 D2). RESP3,
+/// as the four-cell compat case runs it. The connection's cell is read from
+/// `INFO server`, so every boot reaches the remote legs, whichever cell
+/// accepted the connection.
+#[test]
+fn reply_outcome_four_cell_mset_of_remote_pairs_is_the_owners_oom() {
+    let node = Node::start(4);
+    let mut c = node.connect();
+    let cell = info_field(&info_text(&mut c, b"server"), "cell");
+    let cell = u16::try_from(cell).expect("a cell index");
+    let mut argv: Vec<Vec<u8>> = vec![b"MSET".to_vec()];
+    for owner in (0..4).filter(|&owner| owner != cell) {
+        argv.push(key_for_cell(4, owner));
+        argv.push(b"v".to_vec());
+    }
+    hello3(&mut c);
+    let budget: &[&[u8]] =
+        &[b"CONFIG", b"SET", b"maxmemory", b"1", b"maxmemory-policy", b"noeviction"];
+    c.write_all(&cmd(budget)).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let mset: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+    c.write_all(&cmd(&mset)).expect("write");
+    let reply = String::from_utf8(read_line(&mut c)).expect("a line reply");
+    assert_eq!(reply, "-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    drop(c);
+    node.stop();
+}
+
 /// The `mset_midway_oom` crash-matrix row, local-pump site (review of
 /// 2026-08-30, H2 / F-L17-11, ADR-0098): when a multi-key write genuinely
 /// applies a prefix and then fails (arena OOM — bounds are pre-validated
