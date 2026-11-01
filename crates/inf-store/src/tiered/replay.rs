@@ -528,8 +528,8 @@ impl<F: SegmentFs> TierReplay<F> {
     // ---- the demote step (ADR-0174 D2) ----
 
     /// Step 0 of a demote step, at the room question that answered
-    /// `Demote(target)` (E1's order: after the length refusals, before the
-    /// marker drain): the record waits for room with `asks` asks made and
+    /// `Demote(target)` — after the length refusals and before the marker
+    /// drain (ADR-0174 D1): the record waits for room with `asks` asks made and
     /// has changed nothing; the machine enters `Spilling` and counts the
     /// step once, before its first read or write.
     fn begin_demote(&mut self, target: LogicalAddr, asks: u32, len: usize) {
