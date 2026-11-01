@@ -121,6 +121,7 @@ pub const SCENARIOS: &[&str] = &[
     "m2-group-hold",
     "m2-fua-pending",
     "m2-ledger-wedge",
+    "m2-stop-tick",
     "m2-ckpt-refused",
     "m2-recycle",
     "m2-combined",

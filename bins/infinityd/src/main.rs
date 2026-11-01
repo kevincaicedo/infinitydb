@@ -1510,14 +1510,21 @@ fn cell_main(
             if wiring.drained_cells.load(std::sync::atomic::Ordering::Acquire) == args.cells.get() {
                 return Ok(());
             }
+            // Only a cell still draining takes the deadline, so the line
+            // names a cell that holds the stop and the wait that holds it
+            // (ADR-0199 D3); a drained cell keeps iterating for its peers.
             #[allow(
                 clippy::disallowed_methods,
                 reason = "the operator's wall-clock stop bound, never oracle input"
             )]
             let now = std::time::Instant::now();
-            if now > due {
+            if phase != inf_server::StopPhase::Drained && now > due {
+                let hold = plane
+                    .stop_hold()
+                    .map_or_else(|| "no wait named yet".to_owned(), |hold| format!("{hold:?}"));
                 return Err(std::io::Error::other(format!(
-                    "stop drain timed out after {} ms in phase {:?} ({} of {} cells drained)",
+                    "stop drain timed out after {} ms in phase {:?}, held by {hold} ({} of {} \
+                     cells drained)",
                     args.shutdown_timeout_ms,
                     plane.stop_phase(),
                     wiring.drained_cells.load(std::sync::atomic::Ordering::Acquire),

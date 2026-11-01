@@ -2,6 +2,10 @@
     clippy::disallowed_methods,
     reason = "test target: harness deadlines and timings, not cell code"
 )]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: the drain message reads each cell's stop hold"
+)]
 //! End-to-end node assembly test (Linux + uring): two real cells on real
 //! threads behind one SO_REUSEPORT port, driven over TCP — local fast path,
 //! cross-cell Apply round-trips, multi-key aggregation, pipelined reply
@@ -190,6 +194,9 @@ struct Node {
     /// Each cell's stop phase as it last read it ([`stop_phase_byte`]), so a
     /// drain that times out names where every cell stands.
     stop_phases: Arc<Vec<std::sync::atomic::AtomicU8>>,
+    /// Each cell's stop hold as it last read it, beside its phase: the wait
+    /// a drain that times out names.
+    stop_holds: StopHolds,
     /// Each cell thread returns the tiered namespaces it ran at the
     /// product's `TAIL-STALL-TIMEOUT` default ([`note_product_tail_stall`]).
     handles: Vec<std::thread::JoinHandle<NsNames>>,
@@ -619,6 +626,7 @@ impl Node {
         let drained = Arc::new(std::sync::atomic::AtomicU16::new(0));
         let stop_phases: Arc<Vec<std::sync::atomic::AtomicU8>> =
             Arc::new((0..cells).map(|_| Default::default()).collect());
+        let stop_holds: StopHolds = Arc::new((0..cells).map(|_| Default::default()).collect());
         // The node identity (ADR-0124 D5): one value per node, every cell.
         let run_id = {
             let seed = u64::from(std::process::id()) << 32 | u64::from(port_seed());
@@ -703,6 +711,7 @@ impl Node {
             let quiet = Arc::clone(&quiet);
             let drained = Arc::clone(&drained);
             let stop_phases = Arc::clone(&stop_phases);
+            let stop_holds = Arc::clone(&stop_holds);
             let boot = boot.clone();
             let issuer = cell_issuers.get_mut(i).and_then(Option::take);
             let faults = faults.clone();
@@ -808,6 +817,8 @@ impl Node {
                         plane.request_stop();
                         let phase = plane.stop_phase();
                         stop_phases[i].store(stop_phase_byte(phase), Ordering::Release);
+                        *stop_holds[i].lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            plane.stop_hold();
                         if !counted_quiet
                             && matches!(
                                 phase,
@@ -841,6 +852,7 @@ impl Node {
             stop_checkpoint,
             drained,
             stop_phases,
+            stop_holds,
             handles,
             control,
             ckpt_host: std::cell::RefCell::new(ckpt_host),
@@ -909,19 +921,22 @@ impl Node {
         self.stop();
     }
 
-    /// The drain timeout's message: every cell's stop phase and how many
-    /// drained. A cell held at `Quiet` has no live connection left: it waits
-    /// on the stop checkpoint's publication (when the stop takes one) or on
-    /// the final sync.
+    /// The drain timeout's message: every cell's stop phase and the wait
+    /// that holds it, and how many drained. A cell held at `Quiet` has no
+    /// live connection left: it waits on the other cells, on the stop
+    /// checkpoint's publication (when the stop takes one) or on one of its
+    /// durable terms, which its hold names.
     fn drain_timed_out(&self) -> String {
         let phases: Vec<String> = self
             .stop_phases
             .iter()
+            .zip(self.stop_holds.iter())
             .enumerate()
-            .map(|(cell, byte)| {
+            .map(|(cell, (byte, hold))| {
                 let byte = byte.load(Ordering::Acquire);
+                let hold = *hold.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 match stop_phase_of_byte(byte) {
-                    Some(phase) => format!("cell {cell} {phase:?}"),
+                    Some(phase) => format!("cell {cell} {phase:?} held by {hold:?}"),
                     None => format!("cell {cell} unread ({byte})"),
                 }
             })
@@ -1060,6 +1075,10 @@ impl Drop for Node {
         );
     }
 }
+
+/// Each cell's stop hold, published by its thread beside its phase byte and
+/// read by the drain timeout's message.
+type StopHolds = Arc<Vec<std::sync::Mutex<Option<inf_server::StopHold>>>>;
 
 /// A cell's stop phase as one byte, so the cell publishes it without a
 /// lock; 0 is a cell that has not read its phase since the stop began.

@@ -61,6 +61,7 @@ rows=(
   "m2-fua-pending"
   "m2-ledger-wedge --wedge-leg main --verify-determinism"
   "m2-ledger-wedge --wedge-leg control --verify-determinism"
+  "m2-stop-tick --verify-determinism"
   "m2-ckpt-refused"
   "m2-recycle"
   "m2-combined"

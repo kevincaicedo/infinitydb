@@ -146,6 +146,7 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         tier_budget: None,
         epoch_marks: None,
         ledger_wedge: None,
+        stop_tick: false,
     }
 }
 

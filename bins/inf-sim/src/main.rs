@@ -287,6 +287,7 @@ fn main() {
             | "m2-group-hold"
             | "m2-fua-pending"
             | "m2-ledger-wedge"
+            | "m2-stop-tick"
             | "m2-ckpt-refused"
             | "m2-recycle"
             | "m3-document"
@@ -1650,6 +1651,7 @@ fn run_durable(
                 wedge_leg.expect("the caller refused m2-ledger-wedge without a leg"),
             ),
             "m2-ckpt-refused" => DurableScenario::m2_ckpt_refused(seed),
+            "m2-stop-tick" => DurableScenario::m2_stop_tick(seed),
             "m2-recycle" => DurableScenario::m2_recycle(seed),
             "m3-document" => DurableScenario::m3_document(seed),
             "m4-tier-budget" => DurableScenario::m4_tier_budget(
@@ -1715,6 +1717,9 @@ fn run_durable(
         );
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
         print_census(report.cap_rows_checked, report.cap_rows_crossed);
+        if let Some(stop) = &report.stop_tick {
+            println!("inf-sim: {}", stop.describe());
+        }
         if let Some(wedge) = &report.ledger_wedge {
             println!(
                 "inf-sim: ledger wedge leg {}: armed at step {:?}, hold from step {:?} to {:?}, \

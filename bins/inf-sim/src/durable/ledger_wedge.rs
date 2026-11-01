@@ -153,7 +153,7 @@ fn held_segment(path: &Path) -> bool {
 }
 
 /// A segment file in a cell's log directory.
-fn log_segment(path: &Path) -> bool {
+pub(super) fn log_segment(path: &Path) -> bool {
     path.parent().and_then(Path::file_name).is_some_and(|dir| dir == "log")
         && path
             .file_name()

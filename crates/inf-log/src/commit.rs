@@ -445,6 +445,19 @@ pub struct FrameQueued {
     pub barrier: FrameBarrier,
 }
 
+/// A barrier owed, by its values ([`GroupCommit::due`], ADR-0199 D1): what
+/// a stop that cannot drain prints for the ledger's term.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Due {
+    /// The target: every queued ledger byte below it is owed coverage.
+    pub through_bytes: u64,
+    /// The coverage tail: the newest unfolded entry's covers bytes, else
+    /// the durable bytes.
+    pub covered_bytes: u64,
+    /// The frame that seals the staged records owes a barrier.
+    pub frame_owes: bool,
+}
+
 /// The barrier class of a sealable plan that carries one, before its
 /// ticket exists: the reason its ledger entry takes and the variant the
 /// ticket rides in.
@@ -561,19 +574,21 @@ struct PendingFsync<File> {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct Owed {
     /// Ledger bytes, lifetime-cumulative like `queued_bytes` and never above
-    /// it: raised by a tick over a dirty ledger to every byte queued, and by
-    /// a frame queued while a due exists to the frame's end.
+    /// it: raised by a tick over a dirty ledger to every byte queued, and to
+    /// a queued frame's end by a due that stands once the frame's own
+    /// barrier registered.
     through: u64,
     unqueued: unqueued::Unqueued,
 }
 
 /// The records staged since the last frame queued, in one byte: an
-/// `everysec` record, an `always` record, and that the frame which seals
-/// them owes a barrier. The field is private to this module, so the owing
-/// exists only beside a staged record: staging an `always` record sets both,
-/// a due sets the owing only over a staged `everysec` record, and the one
-/// call that queues the frame clears all three. Staging an `everysec`
-/// record is one OR, the cost of the store it replaced.
+/// `everysec` record, an `always` record, and the owing a due sets over a
+/// staged `everysec` record. The frame that seals them owes a barrier while
+/// an `always` record or that owing is among them. The field is private to
+/// this module, so the owing exists only beside a staged record: staging
+/// sets the record's own fact, a due sets the owing only over a staged
+/// `everysec` record, and the one call that queues the frame clears all
+/// three. Staging a record is one OR, the cost of the store it replaced.
 mod unqueued {
     const EVERYSEC: u8 = 1 << 0;
     const ALWAYS: u8 = 1 << 1;
@@ -589,9 +604,10 @@ mod unqueued {
         }
 
         /// An `always` record staged: its acknowledgment waits on the
-        /// barrier of the frame that carries it.
+        /// barrier of the frame that carries it, so that frame owes one
+        /// ([`frame_owes`](Self::frame_owes) reads this fact).
         pub(super) fn stage_always(&mut self) {
-            self.0 |= ALWAYS | FRAME_OWES;
+            self.0 |= ALWAYS;
         }
 
         /// A due exists over the staged records: their frame owes its
@@ -603,11 +619,12 @@ mod unqueued {
         }
 
         /// The frame that absorbs every staged record was queued: all three
-        /// facts go with it. Whether an `always` record rode it.
-        pub(super) fn take(&mut self) -> bool {
-            let always = self.0 & ALWAYS != 0;
+        /// facts go with it, and the queueing reads the due over what it
+        /// took.
+        pub(super) fn take(&mut self) -> Unqueued {
+            let taken = *self;
             self.0 = 0;
-            always
+            taken
         }
 
         /// A record is staged.
@@ -620,9 +637,11 @@ mod unqueued {
             self.0 & ALWAYS != 0
         }
 
-        /// The frame that seals the staged records owes a barrier.
+        /// The frame that seals the staged records owes a barrier: an
+        /// `always` record is staged, or a due owes it over a staged
+        /// `everysec` record.
         pub(super) fn frame_owes(self) -> bool {
-            self.0 & FRAME_OWES != 0
+            self.0 & (ALWAYS | FRAME_OWES) != 0
         }
     }
 }
@@ -844,6 +863,26 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// tail: no due outlives the barrier that covers it.
     #[must_use]
     pub fn sync_due(&self) -> bool {
+        self.due_over(self.owed.unqueued)
+    }
+
+    /// The due by its values while one exists, `None` exactly when
+    /// [`sync_due`](Self::sync_due) is false: the target, the coverage tail
+    /// and the frame's owing. A cold read for a stop's diagnostic
+    /// (ADR-0199 D3); no LOG-step decision reads it.
+    #[must_use]
+    pub fn due(&self) -> Option<Due> {
+        self.sync_due().then(|| Due {
+            through_bytes: self.owed.through,
+            covered_bytes: self.coverage_tail().1,
+            frame_owes: self.owed.unqueued.frame_owes(),
+        })
+    }
+
+    /// The due over the staged facts `unqueued`: the one comparison every
+    /// reader makes, `sync_due()` over the facts staged now and the
+    /// queueing over the facts it took.
+    fn due_over(&self, unqueued: unqueued::Unqueued) -> bool {
         // The target is assigned from `queued_bytes` or a queued frame's end,
         // which becomes it. The plant owes one byte past the queue on purpose.
         #[cfg(not(inf_canary_due_outlives_coverage))]
@@ -852,9 +891,9 @@ impl<File: SegmentFile> GroupCommit<File> {
         // over-discharge a weaker fix makes.
         #[cfg(inf_canary_due_covered_by_any_entry)]
         if !self.pending.is_empty() {
-            return self.owed.unqueued.frame_owes();
+            return unqueued.frame_owes();
         }
-        self.owed.unqueued.frame_owes() || self.owed.through > self.coverage_tail().1
+        unqueued.frame_owes() || self.owed.through > self.coverage_tail().1
     }
 
     /// True when no queued frame is still awaiting `LogWritten` — the
@@ -1269,9 +1308,7 @@ impl<File: SegmentFile> GroupCommit<File> {
         let end_bytes = self.queued_bytes + u64::from(frame_len);
         // Every check of the ledger runs before either publication; only
         // the queue's `Full` arm follows, a fail-stop `frame_plan`'s
-        // admission keeps unreachable. The due is read before the barrier
-        // registers: a due that existed extends over this frame.
-        let outstanding = self.sync_due();
+        // admission keeps unreachable.
         let barrier = self.frame_barrier(plan, end, end_bytes, now);
         let id = FrameId(self.next_frame_id + 1);
         let Reserved::Slot(slot) = self.queued.reserve() else {
@@ -1291,12 +1328,17 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.stats.frame_bytes_queued += u64::from(frame_len);
         // The seal drains the whole staging builder, so every record
         // staged before this LOG step now rides this frame, and the frame's
-        // owing goes with them. A due that existed extends over the frame
-        // (ADR-0199 D2.3); its barrier, if any, covers the frame's end.
-        if self.owed.unqueued.take() {
+        // owing goes with them. The due is read once, over the facts taken,
+        // after the frame's own barrier registered (ADR-0199 D2.3): a frame
+        // with no barrier registered nothing, so a due standing now stood
+        // when the queueing began and extends over the frame; a frame with a
+        // barrier is covered to its end by its own entry, so its due is
+        // discharged either way.
+        let taken = self.owed.unqueued.take();
+        if taken.always() {
             self.always_queued_up_to = Some(end);
         }
-        if outstanding {
+        if self.due_over(taken) {
             self.owed.through = end_bytes;
         }
         FrameQueued { id, barrier }
@@ -2135,6 +2177,43 @@ mod tests {
         assert_eq!(gc.on_fsync_complete(t, Nanos::ZERO), Some(lsn(0, 4096)));
         assert_eq!(gc.pending_log_bytes(), 0, "everything queued is durable");
         assert!(!gc.sync_due(), "a due with nothing to cover outlives every barrier");
+    }
+
+    /// `due()` names a due exactly while `sync_due()` holds, by its values:
+    /// a staged `always` record's owing, a tick's target over bytes no entry
+    /// covers, a standalone that covers them, and a tick's owing over a
+    /// staged `everysec` record.
+    #[test]
+    fn due_names_the_target_the_tail_and_the_owing_exactly_while_owed() {
+        let mut gc = commit();
+        let named = |gc: &GroupCommit<MemFile>| {
+            assert_eq!(gc.due().is_some(), gc.sync_due(), "due() is the due");
+            gc.due()
+        };
+        assert_eq!(named(&gc), None, "nothing owed at birth");
+        gc.note_staged(FsyncClass::Always);
+        let owing = Due { through_bytes: 0, covered_bytes: 0, frame_owes: true };
+        assert_eq!(named(&gc), Some(owing), "an always record's frame owes");
+        // A plain frame (the FLUSH slot busy at its plan) takes the record
+        // and the due extends over it.
+        let id = plain(&mut gc, lsn(0, 100), 100);
+        let extended = Due { through_bytes: 100, covered_bytes: 0, frame_owes: false };
+        assert_eq!(named(&gc), Some(extended), "the due extends over the plain frame");
+        write(&mut gc, id);
+        let standalone = gc.register_standalone_fsync(Nanos::ZERO);
+        assert_eq!(named(&gc), None, "the standalone covers the target");
+        gc.note_staged(FsyncClass::Everysec);
+        gc.note_everysec_tick();
+        let staged = Due { through_bytes: 100, covered_bytes: 100, frame_owes: true };
+        assert_eq!(named(&gc), Some(staged), "the tick owes the staged record's frame");
+        gc.on_fsync_complete(standalone, Nanos::ZERO);
+        assert_eq!(named(&gc), Some(staged), "a completion changes neither value");
+        let queued = queue(&mut gc, lsn(0, 164), 64, SealPlan::LinkedFsync);
+        let (id, carried) = (queued.id, ticket(queued));
+        assert_eq!(named(&gc), None, "the frame's linked sync covers its end");
+        write(&mut gc, id);
+        assert_eq!(gc.on_fsync_complete(carried, Nanos::ZERO), Some(lsn(0, 164)));
+        assert_eq!(named(&gc), None, "nothing owed once it completes");
     }
 
     #[test]
