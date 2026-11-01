@@ -2477,9 +2477,9 @@ impl Node {
     /// What `cell`'s reactor iteration reported in the last scheduler step,
     /// `None` when that step did not run the cell (frozen): a skipped cell
     /// has no iteration to read. `parked` is the reactor's own decision,
-    /// made before the driver call: the sim driver ignores the wait, so a
-    /// park shows as this flag and never as elapsed virtual time. Read
-    /// between scheduler steps.
+    /// made before the driver call: the sim driver keeps the wait and never
+    /// blocks on it, so a park shows as this flag and never as elapsed
+    /// virtual time. Read between scheduler steps.
     #[cfg(test)]
     pub(crate) fn iter_stats(&self, cell: usize) -> Option<IterStats> {
         self.iter_stats[cell]

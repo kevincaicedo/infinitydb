@@ -227,6 +227,10 @@ pub struct SimDriver {
     stats: SubmitStats,
     /// Bytes/ops observed per class (ADR-0088 D8).
     observed: ObservedIo,
+    /// The wait the loop handed the last `submit_and_reap`. The driver never
+    /// blocks on it, since the scheduler owns virtual time, so this is what
+    /// a park asked for: its timeout, read by the oracles.
+    wait: Option<Wait>,
 }
 
 /// One deferred op: applied AND completed only once the virtual clock
@@ -306,7 +310,14 @@ impl SimDriver {
             ops: Vec::new(),
             stats: SubmitStats::default(),
             observed: ObservedIo::default(),
+            wait: None,
         }
+    }
+
+    /// The wait the loop handed the last `submit_and_reap`, `None` before
+    /// the first: a park's timeout as the loop asked for it.
+    pub fn last_wait(&self) -> Option<Wait> {
+        self.wait
     }
 
     /// A driver whose file ops execute against `disk` (M2-S18).
@@ -510,9 +521,10 @@ impl BackendDriver for SimDriver {
     fn submit_and_reap(
         &mut self,
         pool: &mut BufferPool,
-        _wait: Wait,
+        wait: Wait,
         out: &mut Vec<Completion>,
     ) -> io::Result<usize> {
+        self.wait = Some(wait);
         let before = out.len();
         let mut net = self.net.borrow_mut();
         let submitted = self.ops.len() as u64;
