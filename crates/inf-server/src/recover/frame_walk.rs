@@ -80,18 +80,18 @@ pub(super) mod cursor {
     /// is live at a time, and the iterator past the record. Each mover
     /// spends it; dropping it moves nothing.
     #[must_use = "a presented record moves the cursor only by advance or skip_below_begin"]
-    pub(super) struct Presented<'c, 'f> {
+    pub(super) struct PresentedRecord<'c, 'f> {
         cursor: &'c mut FrameCursor,
         after: RecordIter<'f>,
         lsn: Lsn,
     }
 
-    /// What [`Presented::skip_below_begin`] did.
+    /// What [`PresentedRecord::skip_below_begin`] did.
     pub(super) enum Skipped<'c, 'f> {
         /// The record lay below the begin LSN: the cursor passed it.
         Moved(Result<Moved, FrameRecordError>),
         /// The record is at or above it, handed back to be applied.
-        Kept(Presented<'c, 'f>),
+        Kept(PresentedRecord<'c, 'f>),
     }
 
     impl FrameCursor {
@@ -141,10 +141,10 @@ pub(super) mod cursor {
         pub(super) fn present<'c, 'f>(
             &'c mut self,
             frame: &FrameRef<'f>,
-        ) -> Result<(RecordView<'f>, Presented<'c, 'f>), PresentError> {
+        ) -> Result<(RecordView<'f>, PresentedRecord<'c, 'f>), PresentError> {
             let mut after = frame.records_from(&self.records).map_err(|_| PresentError::Lost)?;
             match after.next() {
-                Some(Ok((lsn, view))) => Ok((view, Presented { cursor: self, after, lsn })),
+                Some(Ok((lsn, view))) => Ok((view, PresentedRecord { cursor: self, after, lsn })),
                 Some(Err(error)) => Err(PresentError::Record(error)),
                 // A cursor that left no record moved to the frame's end,
                 // which no presentation follows.
@@ -153,7 +153,7 @@ pub(super) mod cursor {
         }
     }
 
-    impl<'c, 'f> Presented<'c, 'f> {
+    impl<'c, 'f> PresentedRecord<'c, 'f> {
         /// Moves past the record when it lies below the begin LSN copied at
         /// the frame's entry — the checkpoint holds its final state — and
         /// hands it back otherwise.
@@ -188,7 +188,7 @@ pub(super) mod cursor {
         /// record runs the iterator once more, its end check: `None` is the
         /// frame's end, bytes after the counted records its typed error.
         fn pass(self) -> Result<Moved, FrameRecordError> {
-            let Presented { cursor, mut after, .. } = self;
+            let PresentedRecord { cursor, mut after, .. } = self;
             cursor.records = after.cursor();
             if cursor.records.remaining() > 0 {
                 return Ok(Moved::Next);
