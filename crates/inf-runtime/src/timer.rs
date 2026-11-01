@@ -41,6 +41,10 @@ pub struct TimerWheel {
     now_tick: u64,
     next_generation: u64,
     live: usize,
+    /// The most timers armed at once since the wheel was built, raised at
+    /// each insert: a cell's timer population, which one live timer per
+    /// role would bound.
+    armed_max: usize,
     /// Refs sitting above level 0 (stale ones included — they leave at
     /// their cascade). Non-zero means a boundary crossing may surface a
     /// timer, so the park must not sleep past it (N17, batch 61).
@@ -67,6 +71,7 @@ impl TimerWheel {
             now_tick: 0,
             next_generation: 0,
             live: 0,
+            armed_max: 0,
             refs_above0: 0,
             scratch: Vec::new(),
             #[cfg(test)]
@@ -91,6 +96,7 @@ impl TimerWheel {
         };
         self.slab[idx as usize] = Some(TimerEntry { deadline_tick, key, generation });
         self.live += 1;
+        self.armed_max = self.armed_max.max(self.live);
         self.place((idx, generation), deadline_tick);
         TimerId { idx, generation }
     }
@@ -243,6 +249,11 @@ impl TimerWheel {
         self.live
     }
 
+    /// The most timers armed at once since the wheel was built.
+    pub fn armed_max(&self) -> usize {
+        self.armed_max
+    }
+
     fn live_entry(&self, (idx, generation): TimerRef) -> Option<&TimerEntry> {
         self.slab[idx as usize].as_ref().filter(|e| e.generation == generation)
     }
@@ -348,6 +359,19 @@ mod tests {
         wheel.advance(ms(10), |k| fired.push(k));
         assert!(fired.is_empty());
         assert_eq!(wheel.armed(), 0);
+    }
+
+    #[test]
+    fn armed_max_is_the_high_water_of_armed_timers() {
+        let mut wheel = TimerWheel::new();
+        let first = wheel.insert(ms(3), 1);
+        wheel.insert(ms(4), 2);
+        wheel.insert(ms(5), 3);
+        assert!(wheel.cancel(first));
+        assert_eq!((wheel.armed(), wheel.armed_max()), (2, 3));
+        wheel.advance(ms(10), |_| {});
+        wheel.insert(ms(20), 4);
+        assert_eq!((wheel.armed(), wheel.armed_max()), (1, 3), "a high water never falls");
     }
 
     #[test]
