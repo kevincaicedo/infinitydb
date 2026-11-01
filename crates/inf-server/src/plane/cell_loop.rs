@@ -1106,6 +1106,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let node = &self.shared.node;
         node.recv_dropped.set(self.shared.recv_dropped.get());
         node.accept_errors.set(self.shared.accept_errors.get());
+        node.timers_armed_max.set(cx.timers.armed_max() as u64);
         node.fabric_rtt_p50_ns.set(self.shared.rtt_ns.borrow().percentile(50.0));
         {
             let ps = self.shared.pubsub.borrow();
