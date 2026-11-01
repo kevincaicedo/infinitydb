@@ -563,6 +563,9 @@ fn barrier_gauge_lines(text: &mut String, node: &NodeInfo) {
     push(text, &format!("frame_waits_fill:{}", node.frame_waits_fill.get()));
     push(text, &format!("fill_window_us:{}", node.fill_window_us.get()));
     push(text, &format!("fill_target_bytes:{}", node.fill_target_bytes.get()));
+    // The most timers the cell has held armed at once (cell scope, every
+    // cell): the population a hold episode's timer adds to.
+    push(text, &format!("timers_armed_max:{}", node.timers_armed_max.get()));
     // M4.5-S43 (ADR-0092): the FLUSH-class group hold in force and
     // its hold episodes; the adaptive target beside them.
     push(text, &format!("frame_waits_group:{}", node.frame_waits_group.get()));
