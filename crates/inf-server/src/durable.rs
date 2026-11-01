@@ -26,10 +26,10 @@ use inf_foundation::limits::DEQUE_BACKING_BYTES_MAX;
 use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::{
-    BootDirs, FRAME_ALIGN, FillSource, FrameBarrier, FrameBuilder, FrameId, FramePlan, FsyncClass,
-    FsyncTicket, GroupCommit, Hold, IdxSidecarMeta, LedgerClass, LogGeometry, Lsn, MutationEffect,
-    NsId, RecordView, SealPlan, SealedDisposal, SegmentRotor, StagingRing, ZERO_FILL_SLICE_BYTES,
-    build_recycle_sentinel,
+    BootDirs, Due, FRAME_ALIGN, FillSource, FrameBarrier, FrameBuilder, FrameId, FramePlan,
+    FsyncClass, FsyncTicket, GroupCommit, Hold, IdxSidecarMeta, LedgerClass, LogGeometry, Lsn,
+    MutationEffect, NsId, RecordView, SealPlan, SealedDisposal, SegmentRotor, StagingRing,
+    ZERO_FILL_SLICE_BYTES, build_recycle_sentinel,
 };
 use inf_runtime::{
     ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass, IoOp, Issue,
@@ -286,6 +286,27 @@ impl GroupHoldConfig {
 pub enum GroupDecision {
     Seal,
     Hold,
+}
+
+/// What holds a cell's stop drain (ADR-0199 D3): the first term of
+/// [`DurableCell::quiescent`] that does not hold yet, in the drain's order.
+/// Integers and flags only, so a stop's timeout message prints it whole.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DrainHold {
+    /// Records staged and not yet sealed into a frame.
+    Staged { records: u32 },
+    /// Sealed staging buffers a frame write has not released yet.
+    LeasesOut { count: u8 },
+    /// Queued frames still awaiting their `LogWritten`.
+    FramesUnwritten { count: usize },
+    /// Registered fsyncs not yet completed.
+    FsyncsPending { count: usize },
+    /// A barrier is owed: the ledger's due by its values.
+    BarrierOwed(Due),
+    /// A checkpoint is in flight.
+    CheckpointOpen,
+    /// A MANIFEST transition is in flight.
+    ManifestOpen,
 }
 
 /// The per-cell device budget inputs (ADR-0088 D6), computed once at
@@ -1510,18 +1531,38 @@ impl<F: SegmentFs> DurableCell<F> {
         self.commit.note_everysec_tick();
     }
 
-    /// Nothing durable is in motion: nothing staged, no frame in flight, no
-    /// fsync pending, no barrier owed (the ledger's coverage target, ADR-0199
-    /// D1), no checkpoint or MANIFEST transition open. The stop drain's exit
-    /// condition (ADR-0199 D3): on a quiet cell these hold together once its
-    /// last entry completes.
-    pub fn quiescent(&self) -> bool {
-        self.staging.is_empty()
-            && self.staging.drained()
-            && self.commit.frames_unwritten() == 0
-            && self.commit.pending_fsyncs() == 0
-            && !self.commit.sync_due()
-            && self.ckpt_transition_idle()
+    /// `Ok` when nothing durable is in motion: nothing staged, no frame in
+    /// flight, no fsync pending, no barrier owed (the ledger's coverage
+    /// target, ADR-0199 D1), no checkpoint or MANIFEST transition open; else
+    /// the first of those terms that holds the cell, in that order. The stop
+    /// drain's exit condition (ADR-0199 D3): on a quiet cell the terms hold
+    /// together once its last entry completes, and a stop that cannot drain
+    /// names the term.
+    pub fn quiescent(&self) -> Result<(), DrainHold> {
+        if !self.staging.is_empty() {
+            return Err(DrainHold::Staged { records: self.staging.pending_records() });
+        }
+        if !self.staging.drained() {
+            return Err(DrainHold::LeasesOut { count: self.staging.in_flight() });
+        }
+        let frames = self.commit.frames_unwritten();
+        if frames > 0 {
+            return Err(DrainHold::FramesUnwritten { count: frames });
+        }
+        let fsyncs = self.commit.pending_fsyncs();
+        if fsyncs > 0 {
+            return Err(DrainHold::FsyncsPending { count: fsyncs });
+        }
+        if let Some(due) = self.commit.due() {
+            return Err(DrainHold::BarrierOwed(due));
+        }
+        if !matches!(self.ckpt.phase, CkptPhase::Idle) {
+            return Err(DrainHold::CheckpointOpen);
+        }
+        if !self.manifest.idle() {
+            return Err(DrainHold::ManifestOpen);
+        }
+        Ok(())
     }
 
     /// `barrier_class_degraded` (ADR-0086 D7): the window's mean

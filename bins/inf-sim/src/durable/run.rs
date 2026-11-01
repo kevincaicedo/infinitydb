@@ -753,11 +753,14 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             }
             if steps > STALL_STEPS {
                 report.stalled = true;
+                // Each cell's phase beside the wait that holds it (ADR-0199 D3).
+                let holds: Vec<Option<inf_server::StopHold>> =
+                    (0..cells).map(|c| node.plane(c).stop_hold()).collect();
                 fail(
                     &mut report,
                     format!(
                         "CLEAN STOP LIVENESS VIOLATION seed {:#x}: cells still {phases:?} after    \
-                                                   {steps} steps",
+                                                   {steps} steps, held by {holds:?}",
                         scenario.seed
                     ),
                 );

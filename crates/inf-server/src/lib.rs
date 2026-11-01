@@ -60,8 +60,8 @@ pub use control::{
 };
 pub use data_dir_lock::{DataDirLock, DataDirLockError, LOCK_FILE};
 pub use durable::{
-    DeviceConfig, DurableConfig, DurableStats, FillConfig, GroupDecision, GroupHoldConfig,
-    RecoverConfig,
+    DeviceConfig, DrainHold, DurableConfig, DurableStats, FillConfig, GroupDecision,
+    GroupHoldConfig, RecoverConfig,
 };
 // Durable-config vocabulary re-exported for the assembly tier: bins name
 // `inf-server` only (dep-DAG), and `DurableConfig`'s fields are these
@@ -106,8 +106,8 @@ pub use key_hash::{
 };
 pub use loop_snapshot::LoopSnapshot;
 pub use plane::{
-    ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane, StopPhase,
-    fold_live_entries,
+    ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane, StopHold,
+    StopPhase, fold_live_entries,
 };
 pub use readahead::boot_prefetch_threads_spawned;
 // Harness-facing (batch 61): the compat harness reserves ports with the

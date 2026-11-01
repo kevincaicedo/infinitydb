@@ -111,7 +111,7 @@ use crate::control::{
     BoardSweep, CellIssuer, CheckpointEpoch, CkptFinalCredit, CkptQuota, ControlHandle,
     IssuerRefused, RecoveryBoard,
 };
-use crate::durable::{DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
+use crate::durable::{DrainHold, DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
 #[cfg(feature = "doc")]
 use crate::exec::DocLogAdmission;
 use crate::exec::{
@@ -654,6 +654,26 @@ pub enum StopPhase {
     Drained,
 }
 
+/// What a cell's stop waits on (ADR-0199 D3): the wait the drain's last
+/// MAINTAIN step returned from. Every wait of the drive names its variant,
+/// so a stop that cannot end says why, beside its phase.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StopHold {
+    /// Connections still flushing and closing.
+    Connections { live: usize },
+    /// This cell is `Quiet`; the assembly has not yet seen every cell
+    /// `Quiet` ([`ServerPlane::finish_stop`]).
+    NodeQuiet,
+    /// The stop checkpoint of this epoch is not yet published on the
+    /// cell's board slot.
+    StopCheckpoint { epoch: u64 },
+    /// The final sync was requested in this step.
+    FinalSyncRequested,
+    /// The durable cell is not quiescent: the first of its terms that
+    /// holds it.
+    Durable(DrainHold),
+}
+
 /// The drain's own state (one `Option` check per MAINTAIN while serving).
 struct StopDrive {
     phase: StopPhase,
@@ -664,6 +684,9 @@ struct StopDrive {
     /// The stop checkpoint (ADR-0159 D3).
     checkpoint: StopCheckpoint,
     final_sync_requested: bool,
+    /// The wait the last step returned from; `None` before the first step
+    /// and once `Drained`.
+    hold: Option<StopHold>,
 }
 
 /// A stop's checkpoint (ADR-0159 D3): the cell's final credit until the
@@ -1482,6 +1505,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 finish: false,
                 checkpoint,
                 final_sync_requested: false,
+                hold: None,
             });
         }
     }
@@ -1502,6 +1526,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.stop.as_ref().map_or(StopPhase::Serving, |s| s.phase)
     }
 
+    /// What the cell's stop waits on, as its last drain step named it
+    /// (ADR-0199 D3); `None` while serving, before the first step and once
+    /// `Drained`.
+    #[must_use]
+    pub fn stop_hold(&self) -> Option<StopHold> {
+        self.stop.as_ref().and_then(|s| s.hold)
+    }
+
     /// Whether a stop takes a checkpoint before its final sync (on by
     /// default — the next boot then replays nothing; `infinityd
     /// --shutdown-checkpoint off`).
@@ -1510,36 +1542,52 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// One MAINTAIN step of the drain (ADR-0124 D2). Returns without
-    /// touching anything while serving.
+    /// touching anything while serving; records the wait a step returns
+    /// from, and `Drained` once none is left.
     fn drive_stop(&mut self) {
         let Some(stop) = self.stop.as_mut() else { return };
         if stop.phase == StopPhase::Drained {
             return;
         }
+        match Self::drain_step(stop, &self.shared, self.stop_checkpoint) {
+            Ok(()) => {
+                stop.phase = StopPhase::Drained;
+                stop.hold = None;
+            }
+            Err(hold) => stop.hold = Some(hold),
+        }
+    }
+
+    /// The drain's steps in order (ADR-0124 D2), each wait named by the
+    /// hold it returns (ADR-0199 D3); `Ok` once nothing is left to wait on.
+    fn drain_step(
+        stop: &mut StopDrive,
+        shared: &Shared<O, F>,
+        stop_checkpoint: bool,
+    ) -> Result<(), StopHold> {
         // Step 2: connections flush and close (QUIT's path — bytes read
         // after the mark are dropped; a command in flight finishes).
         if !stop.conns_marked {
             stop.conns_marked = true;
-            self.shared.conns.borrow_mut().for_each_mut(|conn| conn.close_after_flush = true);
+            shared.conns.borrow_mut().for_each_mut(|conn| conn.close_after_flush = true);
         }
-        if self.shared.conns.borrow().live > 0 {
-            return;
+        let live = shared.conns.borrow().live;
+        if live > 0 {
+            return Err(StopHold::Connections { live });
         }
         stop.phase = StopPhase::Quiet;
         if !stop.finish {
-            return;
+            return Err(StopHold::NodeQuiet);
         }
         // Steps 3–4: a durable cell publishes its stop checkpoint, then
         // its final sync lands. A cell still in boot recovery has no
         // durable plane yet: it acked nothing, and its disk is the
         // previous life's — Drained.
-        let mut durable = self.shared.durable.borrow_mut();
+        let mut durable = shared.durable.borrow_mut();
         if let Some(cell) = durable.as_mut() {
-            let control = self.shared.control.borrow();
-            if self.stop_checkpoint
-                && let Some(control) = control.as_ref()
-            {
-                let me = self.shared.cell.0;
+            let control = shared.control.borrow();
+            if stop_checkpoint && let Some(control) = control.as_ref() {
+                let me = shared.cell.0;
                 // ADR-0159 D3: the final credit issues once, after the
                 // all-cells-Quiet barrier, even past ordinary exhaustion.
                 // `set_control` accepted only this cell's credit, so it
@@ -1552,19 +1600,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 if let StopCheckpoint::Requested(epoch) = stop.checkpoint
                     && control.ckpt_board().slot(me).published() < epoch.get()
                 {
-                    return;
+                    return Err(StopHold::StopCheckpoint { epoch: epoch.get() });
                 }
             }
             if !stop.final_sync_requested {
                 stop.final_sync_requested = true;
                 cell.request_final_sync();
-                return;
+                return Err(StopHold::FinalSyncRequested);
             }
-            if !cell.quiescent() {
-                return;
-            }
+            cell.quiescent().map_err(StopHold::Durable)?;
         }
-        stop.phase = StopPhase::Drained;
+        Ok(())
     }
 
     pub fn connections(&self) -> usize {

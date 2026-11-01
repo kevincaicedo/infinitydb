@@ -445,6 +445,19 @@ pub struct FrameQueued {
     pub barrier: FrameBarrier,
 }
 
+/// A barrier owed, by its values ([`GroupCommit::due`], ADR-0199 D1): what
+/// a stop that cannot drain prints for the ledger's term.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Due {
+    /// The target: every queued ledger byte below it is owed coverage.
+    pub through_bytes: u64,
+    /// The coverage tail: the newest unfolded entry's covers bytes, else
+    /// the durable bytes.
+    pub covered_bytes: u64,
+    /// The frame that seals the staged records owes a barrier.
+    pub frame_owes: bool,
+}
+
 /// The barrier class of a sealable plan that carries one, before its
 /// ticket exists: the reason its ledger entry takes and the variant the
 /// ticket rides in.
@@ -851,6 +864,19 @@ impl<File: SegmentFile> GroupCommit<File> {
     #[must_use]
     pub fn sync_due(&self) -> bool {
         self.due_over(self.owed.unqueued)
+    }
+
+    /// The due by its values while one exists, `None` exactly when
+    /// [`sync_due`](Self::sync_due) is false: the target, the coverage tail
+    /// and the frame's owing. A cold read for a stop's diagnostic
+    /// (ADR-0199 D3); no LOG-step decision reads it.
+    #[must_use]
+    pub fn due(&self) -> Option<Due> {
+        self.sync_due().then(|| Due {
+            through_bytes: self.owed.through,
+            covered_bytes: self.coverage_tail().1,
+            frame_owes: self.owed.unqueued.frame_owes(),
+        })
     }
 
     /// The due over the staged facts `unqueued`: the one comparison every
@@ -2151,6 +2177,43 @@ mod tests {
         assert_eq!(gc.on_fsync_complete(t, Nanos::ZERO), Some(lsn(0, 4096)));
         assert_eq!(gc.pending_log_bytes(), 0, "everything queued is durable");
         assert!(!gc.sync_due(), "a due with nothing to cover outlives every barrier");
+    }
+
+    /// `due()` names a due exactly while `sync_due()` holds, by its values:
+    /// a staged `always` record's owing, a tick's target over bytes no entry
+    /// covers, a standalone that covers them, and a tick's owing over a
+    /// staged `everysec` record.
+    #[test]
+    fn due_names_the_target_the_tail_and_the_owing_exactly_while_owed() {
+        let mut gc = commit();
+        let named = |gc: &GroupCommit<MemFile>| {
+            assert_eq!(gc.due().is_some(), gc.sync_due(), "due() is the due");
+            gc.due()
+        };
+        assert_eq!(named(&gc), None, "nothing owed at birth");
+        gc.note_staged(FsyncClass::Always);
+        let owing = Due { through_bytes: 0, covered_bytes: 0, frame_owes: true };
+        assert_eq!(named(&gc), Some(owing), "an always record's frame owes");
+        // A plain frame (the FLUSH slot busy at its plan) takes the record
+        // and the due extends over it.
+        let id = plain(&mut gc, lsn(0, 100), 100);
+        let extended = Due { through_bytes: 100, covered_bytes: 0, frame_owes: false };
+        assert_eq!(named(&gc), Some(extended), "the due extends over the plain frame");
+        write(&mut gc, id);
+        let standalone = gc.register_standalone_fsync(Nanos::ZERO);
+        assert_eq!(named(&gc), None, "the standalone covers the target");
+        gc.note_staged(FsyncClass::Everysec);
+        gc.note_everysec_tick();
+        let staged = Due { through_bytes: 100, covered_bytes: 100, frame_owes: true };
+        assert_eq!(named(&gc), Some(staged), "the tick owes the staged record's frame");
+        gc.on_fsync_complete(standalone, Nanos::ZERO);
+        assert_eq!(named(&gc), Some(staged), "a completion changes neither value");
+        let queued = queue(&mut gc, lsn(0, 164), 64, SealPlan::LinkedFsync);
+        let (id, carried) = (queued.id, ticket(queued));
+        assert_eq!(named(&gc), None, "the frame's linked sync covers its end");
+        write(&mut gc, id);
+        assert_eq!(gc.on_fsync_complete(carried, Nanos::ZERO), Some(lsn(0, 164)));
+        assert_eq!(named(&gc), None, "nothing owed once it completes");
     }
 
     #[test]
