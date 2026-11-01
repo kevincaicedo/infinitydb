@@ -2369,7 +2369,7 @@ pub(crate) fn boot(
                 std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
             })?;
         }
-        let (mut plane, serve_mark) = SimPlane::new(
+        let (mut plane, serve_mark, timer_set) = SimPlane::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
@@ -2378,7 +2378,8 @@ pub(crate) fn boot(
             node_info,
             observer.clone(),
             false,
-        );
+        )
+        .map_err(std::io::Error::other)?;
         let cfg = durable_config(scenario, &data_dir);
         let issuer = cell_issuers.next().ok_or_else(|| {
             std::io::Error::other("the partition minted one checkpoint issuer per cell")
@@ -2388,7 +2389,8 @@ pub(crate) fn boot(
             .map_err(|refused| std::io::Error::other(refused.to_string()))?;
         plane.begin_recovery(disk.clone(), &cfg, i as u16, clock.now());
         let config = LoopConfig { spin_iters: scenario.spin_iters, ..Default::default() };
-        let cell_loop = CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark);
+        let cell_loop =
+            CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark, timer_set);
         nets.push(net);
         cells.push((cell_loop, plane));
     }

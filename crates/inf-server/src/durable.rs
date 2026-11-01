@@ -32,10 +32,13 @@ use inf_log::{
     ZERO_FILL_SLICE_BYTES, build_recycle_sentinel,
 };
 use inf_runtime::{
-    ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass, IoOp, Issue,
-    LoopCx, SealPace, TokenClass, WaitList, WatermarkGate, WriteBarrier,
+    Cancelled, ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass,
+    IoOp, Issue, LoopCx, OwnerPhase, SealPace, TimerArm, TimerOwner, TokenClass, WaitList,
+    WatermarkGate, WriteBarrier,
 };
 use inf_store::{CheckpointImage, IndexId, Keyspace, WallAnchor};
+
+use crate::plane::DurableTimers;
 
 use crate::ckpt::{
     CkptCell, CkptPhase, CkptStats, MAX_TRUNC_PER_SLICE_ADAPTIVE, MAX_UNLINKS_PER_SLICE,
@@ -52,17 +55,17 @@ pub(crate) use extent_window::{Arrival, ExtentTurn, ExtentWaiters};
 
 // ---- shared data definitions (behaviour lives in the child modules) ----------
 
-/// Timer-wheel key for the everysec tick (plane-armed, injected clock).
-pub(crate) const EVERYSEC_TIMER_KEY: u64 = 0xE5EC_0001;
-/// Timer-wheel key for the frame-fill window (M4.5-S39a): armed once per
-/// hold episode at the window's deadline so a parked loop wakes to seal
-/// the held frame; the handler is a no-op — the LOG step of that
-/// iteration does the sealing.
-pub(crate) const FILL_TIMER_KEY: u64 = 0xF111_0001;
-/// Timer-wheel key for the FLUSH-class group hold (M4.5-S43, ADR-0092):
-/// armed once per hold episode at the window's deadline, the same
-/// no-op-handler shape as the fill timer — the wake is the effect.
-pub(crate) const GROUP_TIMER_KEY: u64 = 0x6A0B_0001;
+/// One open hold episode of the fill or the group policy: the instant the
+/// LOG step first held the frame, and the arm of the policy's timer owner
+/// at the window's deadline, so a parked loop wakes to seal the held frame
+/// (the callback is the wake; the LOG step seals). The issue that ends the
+/// episode cancels the arm: `Removed`, or `NotArmed` once it was delivered.
+/// No episode exists without its arm (ADR-0154 D4).
+#[derive(Clone, Copy, Debug)]
+struct HoldEpisode {
+    since: Nanos,
+    arm: TimerArm,
+}
 
 /// POSIX `EIO` (this crate carries no libc dep): the errno the
 /// `durable_fsync_eio` fault point injects (M2-S17).
@@ -712,17 +715,19 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     /// holds that closed the extent-seal window.
     frame_waits_extent: u64,
     frame_held: bool,
-    /// M4.5-S39a: the fill policy and the hold it is in — `fill_since`
-    /// is the instant the LOG step first saw the pending frame (set at
-    /// the first hold decision, cleared at the seal).
+    /// The cell's durable timer owners (ADR-0154 D4): everysec, fill hold
+    /// and group hold, one each, taken from the plane at the build.
+    timers: DurableTimers,
+    /// M4.5-S39a: the fill policy and the hold episode it is in, opened at
+    /// the first hold decision and ended at the issue.
     fill: FillConfig,
-    fill_since: Option<Nanos>,
+    fill_episode: Option<HoldEpisode>,
     frame_waits_fill: u64,
-    /// M4.5-S43 (ADR-0092): the FLUSH-class group hold, its episode
-    /// clock, its episodes, and the adaptive target — the records the
-    /// last sealed frame carried.
+    /// M4.5-S43 (ADR-0092): the FLUSH-class group hold, its episode, its
+    /// episodes' count, and the adaptive target — the records the last
+    /// sealed frame carried.
     group: GroupHoldConfig,
-    group_since: Option<Nanos>,
+    group_episode: Option<HoldEpisode>,
     frame_waits_group: u64,
     last_frame_records: u32,
     /// The population the last barrier's completion measured: the records
@@ -776,12 +781,13 @@ impl<F: SegmentFs> DurableCell<F> {
     /// fail-stop every allocation of this constructor takes; its layout is
     /// a const assertion, and the census refuses only a cap name declared
     /// with a second value or fill, which any test's first boot shows.
-    pub fn new(
+    pub(crate) fn new(
         cfg: &DurableConfig,
         rotor: SegmentRotor<F>,
         ckpt: CkptCell<F>,
         manifest: ManifestCell<F>,
         census: &Rc<CapCensus>,
+        timers: DurableTimers,
     ) -> DurableCell<F> {
         let (geometry, flush_bound, fua_p50_us_probed, device, fill, group) =
             (cfg.geometry, cfg.flush_bound, cfg.fua_p50_us_probed, cfg.device, cfg.fill, cfg.group);
@@ -842,11 +848,12 @@ impl<F: SegmentFs> DurableCell<F> {
             ledger_holds_counted: LedgerHoldsCounted::default(),
             frame_waits_extent: 0,
             frame_held: false,
+            timers,
             fill,
-            fill_since: None,
+            fill_episode: None,
             frame_waits_fill: 0,
             group,
-            group_since: None,
+            group_episode: None,
             frame_waits_group: 0,
             last_frame_records: 0,
             group_round_target: 0,
@@ -1209,7 +1216,7 @@ impl<F: SegmentFs> DurableCell<F> {
                 self.frame_held = true;
                 return;
             }
-            self.note_issued();
+            self.note_issued(cx);
             let ticket = self.commit.register_standalone_fsync(cx.now);
             let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
             self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
@@ -1264,19 +1271,41 @@ impl<F: SegmentFs> DurableCell<F> {
     /// at the decision — a reservation that waits keeps its episode, and
     /// a hold that follows it is the same episode, never a second one in
     /// `frame_waits_*`).
-    fn note_issued(&mut self) {
+    ///
+    /// Each episode's arm is cancelled here: `Removed`, or `NotArmed` once
+    /// it was delivered, so no episode leaves a timer behind.
+    fn note_issued(&mut self, cx: &mut LoopCx<'_>) {
         self.frame_held = false;
         self.ledger_holds_counted = LedgerHoldsCounted::default();
-        self.fill_since = None;
-        self.group_since = None;
+        let ended = [self.fill_episode.take(), self.group_episode.take()];
+        let mut timers = cx.timers();
+        for episode in ended.into_iter().flatten() {
+            let cancelled = timers.cancel(&episode.arm);
+            debug_assert!(
+                matches!(cancelled, Cancelled::Removed | Cancelled::NotArmed),
+                "an episode's issue cancels its own arm: {cancelled:?}"
+            );
+        }
+    }
+
+    /// Opens a hold episode of the policy whose owner is `owner`, arming
+    /// it at `window` from now. A refused arm (`ClockRange`,
+    /// `SequenceExhausted`) opens no episode, so the caller seals the frame:
+    /// the policy's off arm, as if its window had elapsed.
+    fn open_episode(cx: &mut LoopCx<'_>, owner: &TimerOwner, window: Nanos) -> Option<HoldEpisode> {
+        let since = cx.now;
+        let mut timers = cx.timers();
+        debug_assert_eq!(timers.phase(owner), OwnerPhase::Idle, "an episode opens from Idle");
+        let arm = timers.arm(owner, since.saturating_add(window)).ok()?;
+        Some(HoldEpisode { since, arm })
     }
 
     /// M4.5-S39a: should the pending frame be held for fill? The pure
-    /// decision is [`FillConfig::decide`]; this adds the episode clock
-    /// (`fill_since`, the instant the LOG step first saw the frame) and,
-    /// at the first hold of an episode, arms the fill timer at the
-    /// deadline so a parked loop wakes to seal. Asked last, after every
-    /// correctness hold, on a sealable plan: a waiting frame never gets here.
+    /// decision is [`FillConfig::decide`]; this adds the episode (the
+    /// instant the LOG step first held the frame) and, at its first hold,
+    /// arms the fill owner at the deadline so a parked loop wakes to seal.
+    /// Asked last, after every correctness hold, on a sealable plan: a
+    /// waiting frame never gets here.
     fn fill_holds(
         &mut self,
         cx: &mut LoopCx<'_>,
@@ -1290,30 +1319,29 @@ impl<F: SegmentFs> DurableCell<F> {
         // Release assert (batch 43): an open episode clock is a held
         // frame — the clock is set by a hold and cleared by the issue.
         assert!(
-            self.fill_since.is_none() || self.frame_held,
+            self.fill_episode.is_none() || self.frame_held,
             "open fill episode without a held frame"
         );
         let layout =
             if rotation_due { self.rotor.next_layout() } else { self.rotor.active_layout() };
-        match self.fill.decide(plan, layout, frame_len, self.fill_since, cx.now) {
+        let since = self.fill_episode.map(|episode| episode.since);
+        match self.fill.decide(plan, layout, frame_len, since, cx.now) {
             FillDecision::Seal => false,
+            FillDecision::Hold if self.fill_episode.is_some() => true,
             FillDecision::Hold => {
-                if self.fill_since.is_none() {
-                    self.fill_since = Some(cx.now);
-                    cx.timers.insert(cx.now + self.fill.window, FILL_TIMER_KEY);
-                }
-                true
+                self.fill_episode =
+                    Self::open_episode(cx, &self.timers.fill_hold, self.fill.window);
+                self.fill_episode.is_some()
             }
         }
     }
 
     /// M4.5-S43 (ADR-0092 D1): should the pending frame wait for the
     /// round it just acked? The pure decision is
-    /// [`GroupHoldConfig::decide`]; this adds the episode clock and, at
-    /// the first hold of an episode, arms the group timer so a parked
-    /// loop wakes to seal. Asked last — after the fill policy, which
-    /// never holds a barrier-carrying frame, so the two holds never
-    /// compete for one frame.
+    /// [`GroupHoldConfig::decide`]; this adds the episode and, at its first
+    /// hold, arms the group owner so a parked loop wakes to seal. Asked
+    /// last — after the fill policy, which never holds a barrier-carrying
+    /// frame, so the two holds never compete for one frame.
     fn group_holds(&mut self, cx: &mut LoopCx<'_>, plan: SealPlan, rotation_due: bool) -> bool {
         if !self.group.enabled() {
             return false;
@@ -1322,7 +1350,7 @@ impl<F: SegmentFs> DurableCell<F> {
         // held frame or standalone — a stale clock reads as elapsed and
         // seals the next episode's first sight at once.
         assert!(
-            self.group_since.is_none() || self.frame_held,
+            self.group_episode.is_none() || self.frame_held,
             "open group-hold episode without a held frame"
         );
         let layout =
@@ -1333,17 +1361,16 @@ impl<F: SegmentFs> DurableCell<F> {
             layout,
             uncovered,
             self.group_round_target,
-            self.group_since,
+            self.group_episode.map(|episode| episode.since),
             cx.now,
         );
         match decision {
             GroupDecision::Seal => false,
+            GroupDecision::Hold if self.group_episode.is_some() => true,
             GroupDecision::Hold => {
-                if self.group_since.is_none() {
-                    self.group_since = Some(cx.now);
-                    cx.timers.insert(cx.now + self.group.window, GROUP_TIMER_KEY);
-                }
-                true
+                self.group_episode =
+                    Self::open_episode(cx, &self.timers.group_hold, self.group.window);
+                self.group_episode.is_some()
             }
         }
     }
@@ -1353,7 +1380,7 @@ impl<F: SegmentFs> DurableCell<F> {
     /// (padding included on aligned segments) is what the cursor, the
     /// ledger, and the barrier all advance by (ADR-0086 D3).
     fn queue_frame(&mut self, cx: &mut LoopCx<'_>, slot: inf_log::FrameSlot, plan: SealPlan) {
-        self.note_issued();
+        self.note_issued(cx);
         self.last_frame_records = self.staging.pending_records();
         let end = slot.base().advance(slot.len());
         let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
@@ -1508,8 +1535,19 @@ impl<F: SegmentFs> DurableCell<F> {
         }
     }
 
+    /// Arms the everysec owner a second out, once, where the cell's boot
+    /// recovery completes: the tick's first arm; each delivery's successor
+    /// arms the next (ADR-0154 D4).
+    pub fn arm_everysec(&mut self, cx: &mut LoopCx<'_>) {
+        let first = cx.now.saturating_add(Nanos::from_secs(1));
+        cx.timers()
+            .arm(&self.timers.everysec, first)
+            .expect("the everysec tick's first arm is inside the clock's range");
+    }
+
     /// Timer: the everysec tick (idle ticks are free — counted, no I/O).
-    pub fn on_everysec_tick(&mut self, cx: &mut LoopCx<'_>) {
+    /// The plane arms its successor.
+    pub fn on_everysec_tick(&mut self) {
         // M2-S21: the tick doubles as the 1 s rate window (injected clock).
         let fsyncs = self.commit.stats().fsyncs_completed;
         self.fsyncs_last_sec = fsyncs - self.tick_fsyncs_prev;
@@ -1518,11 +1556,10 @@ impl<F: SegmentFs> DurableCell<F> {
         self.tick_acks_prev = self.acks_gated;
         self.check_barrier_class_tripwire();
         self.commit.note_everysec_tick();
-        cx.timers.insert(cx.now + Nanos::from_secs(1), EVERYSEC_TIMER_KEY);
     }
 
     /// The stop drain's final sync (ADR-0199 D3): the everysec tick's
-    /// ledger rule now, without waiting for the wheel. Queued bytes above
+    /// ledger rule now, without waiting for the tick's timer. Queued bytes above
     /// the coverage tail, or a staged record, make a due the next LOG step
     /// issues (the held frame's barrier or a standalone fdatasync); a ledger
     /// whose every queued byte is under an entry in flight owes nothing new,
@@ -1744,8 +1781,8 @@ impl<F: SegmentFs> DurableCell<F> {
             fsync_entries: self.commit.pending_entries() as u64,
             write_through_entries: self.commit.write_through_entries() as u64,
             hold_open: u64::from(self.frame_held),
-            fill_hold_open: u64::from(self.fill_since.is_some()),
-            group_hold_open: u64::from(self.group_since.is_some()),
+            fill_hold_open: u64::from(self.fill_episode.is_some()),
+            group_hold_open: u64::from(self.group_episode.is_some()),
             io_budget_model_absent: u64::from(self.budget.model_absent()),
             io_budget_write_bytes_per_s: write_share,
             io_budget_read_bytes_per_s: read_share,

@@ -5,6 +5,23 @@
 use super::*;
 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
+    /// The everysec role's delivery: the durable plane's tick, then the
+    /// successor a second on from the delivery's time (the tick schedules
+    /// from the current injected time; no missed tick is caught up).
+    fn everysec_tick<'n>(&self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> {
+        {
+            let mut durable = self.shared.durable.borrow_mut();
+            let Some(cell) = durable.as_mut() else { return TimerOutcome::Complete };
+            cell.on_everysec_tick();
+        }
+        let deadline = cx.now.saturating_add(Nanos::from_secs(1));
+        let next = cx
+            .timers()
+            .successor(notice, deadline)
+            .expect("the everysec successor arms inside the clock's range");
+        TimerOutcome::Successor(next)
+    }
+
     fn arm_initial_listener(&mut self, cx: &mut LoopCx<'_>) -> bool {
         use crate::cache_boot::CacheBootStatus;
 
@@ -142,13 +159,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 }
                 // Accept-path failures (`EMFILE`/`ENFILE`) belong to the
                 // listener, never to a connection (F-L11-05): count them.
-                // The driver has PARKED the arm (F-L11-02); the retry
-                // wheel re-arms it at a bounded cadence.
+                // The driver has parked the arm; the accept-retry owner
+                // re-arms it a retry window later. Armed only from Idle:
+                // failures inside a window coalesce into its one arm.
                 if c.token.class() == TokenClass::Accept {
                     self.shared.accept_errors.set(self.shared.accept_errors.get() + 1);
-                    if !self.accept_retry_armed {
-                        self.accept_retry_armed = true;
-                        cx.timers.insert(cx.now + ACCEPT_RETRY, ACCEPT_RETRY_TIMER_KEY);
+                    let owner = &self.timers.accept_retry;
+                    let deadline = cx.now.saturating_add(ACCEPT_RETRY);
+                    let mut timers = cx.timers();
+                    if timers.phase(owner) == OwnerPhase::Idle {
+                        timers
+                            .arm(owner, deadline)
+                            .expect("the accept retry arms from Idle inside the clock's range");
                     }
                     return;
                 }
@@ -241,24 +263,29 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         }
     }
 
-    fn on_timer(&mut self, cx: &mut LoopCx<'_>, key: u64) {
-        if key == EVERYSEC_TIMER_KEY
-            && let Some(cell) = self.shared.durable.borrow_mut().as_mut()
-        {
-            cell.on_everysec_tick(cx);
+    fn on_timer<'n>(&mut self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> {
+        match TimerRole::from_route(notice.route()) {
+            Some(TimerRole::AcceptRetry) => {
+                if self.started {
+                    // Idempotent on an armed listener; resumes a parked
+                    // one. A still-exhausted accept fails again → one more
+                    // count and one more window (bounded by wall time).
+                    cx.push(IoOp::AcceptArm {
+                        listener: self.listener,
+                        token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
+                    });
+                }
+                TimerOutcome::Complete
+            }
+            Some(TimerRole::Everysec) => self.everysec_tick(cx, notice),
+            // The holds need no handler: the wake is the effect, and this
+            // iteration's LOG step seals the held frame.
+            Some(TimerRole::FillHold | TimerRole::GroupHold) => TimerOutcome::Complete,
+            None => {
+                debug_assert!(false, "a notice routed {} names no timer role", notice.route());
+                TimerOutcome::Complete
+            }
         }
-        if key == ACCEPT_RETRY_TIMER_KEY && self.started {
-            // Idempotent on an armed listener; resumes a parked one. A
-            // still-exhausted accept fails again → one more count and one
-            // more window (bounded by wall time, F-L11-02).
-            self.accept_retry_armed = false;
-            cx.push(IoOp::AcceptArm {
-                listener: self.listener,
-                token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
-            });
-        }
-        // `FILL_TIMER_KEY` (M4.5-S39a) needs no handler: the wake is the
-        // effect — this iteration's LOG step seals the held frame.
     }
 
     fn before_park(&mut self) -> bool {
@@ -436,10 +463,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
         if !self.started && !self.arm_initial_listener(cx) {
             return;
-        }
-        if !self.everysec_armed && self.shared.durable.borrow().is_some() {
-            self.everysec_armed = true;
-            cx.timers.insert(cx.now + Nanos::from_secs(1), EVERYSEC_TIMER_KEY);
         }
         self.shared.now.set(cx.now);
         // DEBUG SLEEP stall: connection processing pauses (inbox buffers
@@ -1106,7 +1129,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let node = &self.shared.node;
         node.recv_dropped.set(self.shared.recv_dropped.get());
         node.accept_errors.set(self.shared.accept_errors.get());
-        node.timers_armed_max.set(cx.timers.armed_max() as u64);
+        node.timers_armed_max.set(u64::from(cx.timers().armed_max()));
         node.fabric_rtt_p50_ns.set(self.shared.rtt_ns.borrow().percentile(50.0));
         {
             let ps = self.shared.pubsub.borrow();

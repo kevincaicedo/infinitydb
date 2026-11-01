@@ -123,13 +123,12 @@ pub(super) const CONN_SLOT_CAP: u32 = inf_runtime::MAX_SLOT;
 // reply-outcome-allow: a connection frame copied to a send buffer, no reply (ADR-0123 D1)
 pub(super) const MAXCLIENTS_REFUSAL: &[u8] = b"-ERR max number of clients reached\r\n";
 
-/// The accept-retry wheel key (F-L11-02): after the driver parks the
-/// accept arm on an exhaustion/broken failure, the plane re-arms it at this
-/// cadence — one `accept(2)` per window while the condition persists, never
-/// a spin — so descriptors freed outside the driver (segment files,
-/// checkpoint handles) let queued clients in without waiting for a
-/// connection to close.
-pub(super) const ACCEPT_RETRY_TIMER_KEY: u64 = 0xACCE_0001;
+/// The accept retry's window: after the driver parks the accept arm on an
+/// exhaustion/broken failure, the plane's accept-retry timer owner re-arms
+/// it this long after the failure — one `accept(2)` per window while the
+/// condition persists, never a spin — so descriptors freed outside the
+/// driver (segment files, checkpoint handles) let queued clients in without
+/// waiting for a connection to close.
 pub(super) const ACCEPT_RETRY: Nanos = Nanos::from_millis(100);
 
 impl<T> Default for ConnSlab<T> {

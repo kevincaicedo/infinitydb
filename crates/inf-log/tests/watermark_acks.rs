@@ -48,18 +48,24 @@ fn run_schedule(seed: u64, dir: &Path) {
         driver.delays.push_back(rng.below(4) as u32);
     }
     let clock = Rc::new(VirtualClock::new(Nanos::ZERO));
-    let (_census, serve_mark) = CapCensus::new(CellId(0));
+    let (census, serve_mark) = CapCensus::new(CellId(0));
+    let (timer_set, everysec_owner) = support::everysec_timers(&census);
     let mut lp = CellLoop::new(
         driver,
         Rc::clone(&clock),
         BufferPool::new(4, 1024),
         LoopConfig::default(),
         serve_mark,
+        timer_set,
     );
     // Small segments: rotation + seal fsyncs interleave with linked ones.
     let staging = StagingConfig::with_capacity(16 << 10);
     let segment = SegmentConfig { segment_bytes: 16 << 10, ..Default::default() };
-    let mut plane = DurablePlane::new(dir, LogGeometry::new(staging, segment).expect("geometry"));
+    let mut plane = DurablePlane::new(
+        dir,
+        LogGeometry::new(staging, segment).expect("geometry"),
+        everysec_owner,
+    );
     plane.jobs_per_iter = 1 + rng.below(24) as usize;
     let mut always = 0;
     for _ in 0..30 {

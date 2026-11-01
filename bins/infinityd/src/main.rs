@@ -1409,7 +1409,9 @@ fn cell_main(
         durable = Some((cfg, std::sync::Arc::clone(control)));
     }
     mark(15); // setup:plane
-    let (mut plane, serve_mark) = ServerPlane::new(
+    // A refused timer assembly ends the cell's setup before its loop
+    // exists, and the cell's thread ends the process with its text.
+    let (mut plane, serve_mark, timer_set) = ServerPlane::new(
         CellId(cell),
         args.cells.get(),
         listener.into_raw_fd(), // the driver owns the listener fd now
@@ -1418,7 +1420,8 @@ fn cell_main(
         Rc::clone(&node),
         NoopObserver,
         args.route_local_only,
-    );
+    )
+    .map_err(std::io::Error::other)?;
     if let Some((cfg, control)) = durable {
         let issuer = ckpt_issuer.ok_or_else(|| {
             std::io::Error::other("a durable boot minted no checkpoint issuer for this cell")
@@ -1459,7 +1462,7 @@ fn cell_main(
         remote_first_execute: args.remote_first_execute,
         ..Default::default()
     };
-    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark);
+    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set);
 
     mark(16); // setup:loop — the next publish is drive_recovery's phase 1
     let mut iterations: u64 = 0;

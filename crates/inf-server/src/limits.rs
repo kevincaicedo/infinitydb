@@ -45,6 +45,20 @@ pub const ACK_MAP_ENTRIES: u32 = inf_log::limits::REORDER_WINDOW_FRAMES;
 /// `ack-map`, filled while the cell serves.
 pub const ACK_MAP: Cap = Cap::entries::<ACK_MAP_ENTRIES>("ack-map", CapFill::Serving);
 
+/// Timer owner positions one server cell holds (ADR-0154 D1, D4): its roles'
+/// count, `TimerRole::COUNT` (one listener's accept retry, everysec, fill
+/// hold, group hold), so the cap is derived from the producers and a role
+/// added is a position added. Owner: `ServerTimers::build`, the cell's one
+/// constructor of its set and its owners, inside `ServerPlane::new`.
+/// `CapFill::Assembly`: the build reserves every position before the cell's
+/// loop exists, and no role closes its owner, so the `timer-owners` row is
+/// full at the serve mark and takes no publish after it (the census counts
+/// any in `cap_assembly_violations`). Crossing: a reserve refused at the
+/// assembly fails it before anything serves (`TimerAssemblyError`); derived
+/// never, as the cap is the role count.
+pub const SERVER_TIMER_OWNERS: Cap =
+    Cap::entries::<{ crate::TimerRole::COUNT }>("timer-owners", CapFill::Assembly);
+
 /// Checkpoint-board slots one cell's sweep visits per MAINTAIN turn
 /// (ADR-0159 D4, A1.4). Owner: the cell's `BoardSweep`, charged as one
 /// Maintenance unit per turn as MAINTAIN's first budgeted step. Crossing:

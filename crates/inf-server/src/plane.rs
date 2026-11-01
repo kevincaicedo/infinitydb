@@ -55,7 +55,7 @@ use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
 use inf_runtime::GroupClass;
 use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoClass, IoOp,
-    Issue, LoopCx, RawFd, TokenClass, WaitList,
+    Issue, LoopCx, OwnerPhase, RawFd, TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
@@ -82,9 +82,10 @@ mod pumps;
 mod scatter;
 mod shared;
 mod tiered;
+mod timers;
 
 pub use conn::OwnedOutcome;
-use conn::{ACCEPT_RETRY, ACCEPT_RETRY_TIMER_KEY, CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
+use conn::{ACCEPT_RETRY, CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
 use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
 use fabric::{
     GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, gather_element,
@@ -107,12 +108,15 @@ use scatter::{
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
 use shared::{DurableAdmission, NsApplyOutcome, handle_ns_apply, tier_to_fan};
+pub(crate) use timers::DurableTimers;
+use timers::ServerTimers;
+pub use timers::{TimerAssemblyError, TimerRole};
 
 use crate::control::{
     BoardSweep, CellIssuer, CheckpointEpoch, CkptFinalCredit, CkptQuota, ControlHandle,
     IssuerRefused, RecoveryBoard,
 };
-use crate::durable::{DrainHold, DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
+use crate::durable::{DrainHold, DurableCell, DurableConfig};
 #[cfg(feature = "doc")]
 use crate::exec::DocLogAdmission;
 use crate::exec::{
@@ -573,10 +577,10 @@ pub struct ServerPlane<
     /// Last CONFIG-store version pushed into the keyspace (M1-E3
     /// `hot-per-cell` sweep — one u64 compare per MAINTAIN, no re-parse).
     config_pushed: u64,
-    /// The everysec wheel key was armed (M2-S05; once per plane).
-    everysec_armed: bool,
-    /// An accept-retry wheel key is pending (F-L11-02: at most one).
-    accept_retry_armed: bool,
+    /// The cell's timer owners, one per role (ADR-0154 D4), reserved by
+    /// `new` before the loop exists: the accept retry's, and the durable
+    /// roles' until the durable plane takes them.
+    timers: ServerTimers,
     /// Accepted fds are TCP sockets (`infinityd`, the e2e harness): the
     /// plane sets `tcp-keepalive` on them (ADR-0123 D3). The DST models
     /// no TCP stack and leaves this off.
@@ -703,9 +707,18 @@ enum StopCheckpoint {
 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// `listener` must be a listening fd this plane's driver will own.
-    /// Returns the plane and its cell's serve mark: the cap census is built
-    /// here, once, with `cell`, and the host hands the mark to the cell's
-    /// loop, which takes it as its first iteration begins (ADR-0163 D2).
+    /// Returns the plane, its cell's serve mark and its cell's timer set:
+    /// the cap census is built here, once, with `cell`, then on it the set
+    /// and the server's timer owners (`ServerTimers::build`, their one
+    /// constructor), before anything is written to `node`; the plane keeps
+    /// the owners. The host hands the mark and the set to the cell's loop,
+    /// which takes the mark as its first iteration begins (ADR-0163 D2,
+    /// ADR-0154 D1).
+    ///
+    /// # Errors
+    /// The timer assembly's refusal: no plane, `node` unwritten, and what
+    /// was built dropped while the census assembles. Derived never on a
+    /// correct build but for the allocator's refusal.
     #[allow(clippy::too_many_arguments)] // construction-time wiring, not an API surface
     #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new(
@@ -717,10 +730,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         node: Rc<NodeInfo>,
         observer: O,
         route_local_only: bool,
-    ) -> (ServerPlane<O, F>, ServeMark) {
+    ) -> Result<(ServerPlane<O, F>, ServeMark, TimerSet), TimerAssemblyError> {
+        let (census, serve_mark) = CapCensus::new(cell);
+        let (timer_set, timers) = ServerTimers::build(&census)?;
         node.cell.set(cell.0);
         node.cells.set(cells);
-        let (census, serve_mark) = CapCensus::new(cell);
         node.cap_census.replace(Some(Rc::clone(&census)));
         // ADR-0123 D5: the connection knobs before the first accept.
         let knobs = crate::config::conn_knobs(&node.config.borrow(), cells);
@@ -796,8 +810,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             expiry_lag: 0,
             // MAX forces one push on the first MAINTAIN (boot-time config).
             config_pushed: u64::MAX,
-            everysec_armed: false,
-            accept_retry_armed: false,
+            timers,
             tcp_transport: false,
             ckpt_epoch_seen: 0,
             early_fabric_flush: false,
@@ -809,7 +822,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             stop: None,
             stop_checkpoint: true,
         };
-        (plane, serve_mark)
+        Ok((plane, serve_mark, timer_set))
     }
 
     /// Starts loop-resident boot recovery (M2-S15): the cell serves from
@@ -936,6 +949,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         // waiting on the device.
                         if let Some(cell) = self.shared.durable.borrow_mut().as_mut() {
                             cell.arm_boot_barriers(cx, barrier_dirs);
+                            // The durable plane exists from here: its tick
+                            // starts, once (ADR-0154 D4).
+                            cell.arm_everysec(cx);
                         }
                         self.shared
                             .node
@@ -992,8 +1008,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// seals fits the rotor's segment only because both come from that one
     /// geometry (ADR-0191 D4).
     ///
+    /// The durable plane takes the plane's three durable timer owners
+    /// (everysec, fill hold, group hold), which it holds for the cell's life.
+    ///
     /// # Errors
-    /// Checkpoint-directory scan failure (boot-time listing).
+    /// Checkpoint-directory scan failure (boot-time listing), with the
+    /// owners handed back to the plane; a second enable, which no caller
+    /// makes, finds them taken.
     pub fn enable_durable(
         &mut self,
         fs: F,
@@ -1002,9 +1023,19 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         rotor: SegmentRotor<F>,
         recovered: Option<crate::RecoveredManifest>,
     ) -> std::io::Result<()> {
+        let Some(owners) = self.timers.durable.take() else {
+            return Err(std::io::Error::other("the durable plane is enabled once"));
+        };
         let shard_dir = cfg.data_dir.join(format!("shard-{cell_id}"));
         let ckpt_dir = shard_dir.join("ckpt");
-        let ckpt = crate::ckpt::CkptCell::new(fs.clone(), ckpt_dir.clone(), cell_id, cfg.ckpt)?;
+        let ckpt = match crate::ckpt::CkptCell::new(fs.clone(), ckpt_dir.clone(), cell_id, cfg.ckpt)
+        {
+            Ok(ckpt) => ckpt,
+            Err(err) => {
+                self.timers.durable = Some(owners);
+                return Err(err);
+            }
+        };
         *self.shared.tier.borrow_mut() = Some(crate::tier_cell::TierCell::new(
             fs.clone(),
             u32::from(cell_id),
@@ -1023,7 +1054,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             }),
         );
         *self.shared.durable.borrow_mut() =
-            Some(DurableCell::new(cfg, rotor, ckpt, manifest, &self.shared.census));
+            Some(DurableCell::new(cfg, rotor, ckpt, manifest, &self.shared.census, owners));
         Ok(())
     }
 

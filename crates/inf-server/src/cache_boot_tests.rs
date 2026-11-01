@@ -7,6 +7,7 @@ use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::time::VirtualClock;
 use inf_runtime::{BackendDriver, Capabilities, CellLoop, LoopConfig, SubmitStats, Wait};
 use inf_store::StoreConfig;
+use std::rc::Rc;
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator::new();
@@ -54,7 +55,7 @@ impl BackendDriver for AcceptObserver {
     }
 }
 
-type TestLoop = CellLoop<AcceptObserver, VirtualClock>;
+type TestLoop = CellLoop<AcceptObserver, Rc<VirtualClock>>;
 
 fn submit_two_iterations(reactor: &mut TestLoop, plane: &mut impl CellPlane) {
     // Plane operations reach the driver on the following reactor iteration.
@@ -69,10 +70,15 @@ fn permits() -> (crate::CacheBootPermit, crate::CacheBootPermit) {
 }
 
 fn plane(permit: crate::CacheBootPermit) -> (TestLoop, ServerPlane) {
+    plane_on(permit, Rc::new(VirtualClock::default()))
+}
+
+/// The cell on `clock`, which the test steps.
+fn plane_on(permit: crate::CacheBootPermit, clock: Rc<VirtualClock>) -> (TestLoop, ServerPlane) {
     let node = NodeInfo::try_default().unwrap().into_boot_group(permit);
     let fabric =
         Mesh::new(2, MeshConfig { ring_capacity: 8, data_credits: 4 }).into_iter().next().unwrap();
-    let (plane, serve_mark) = ServerPlane::new(
+    let (plane, serve_mark, timer_set) = ServerPlane::new(
         CellId(0),
         2,
         7,
@@ -81,13 +87,15 @@ fn plane(permit: crate::CacheBootPermit) -> (TestLoop, ServerPlane) {
         node,
         NoopObserver,
         false,
-    );
+    )
+    .expect("the server's timer owners fit their cap");
     let reactor = CellLoop::new(
         AcceptObserver::default(),
-        VirtualClock::default(),
+        clock,
         BufferPool::new(4, 4096),
         LoopConfig::default(),
         serve_mark,
+        timer_set,
     );
     (reactor, plane)
 }
@@ -128,30 +136,61 @@ fn cache_refusal_never_arms_a_peer_listener() {
     }
 }
 
-struct RetryTimer<'a>(&'a mut ServerPlane);
+/// The plane, with a listener's accept failure fed to it at the next
+/// PARSE: the real path that arms the accept-retry owner. A notice cannot
+/// be forged, so the retry's delivery is the loop's, after the clock steps.
+struct RetryTimer<'a> {
+    plane: &'a mut ServerPlane,
+    fail_accept: bool,
+    delivered: u32,
+}
 
 impl CellPlane for RetryTimer<'_> {
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, completion: Completion) {
-        self.0.on_completion(cx, completion);
+        self.plane.on_completion(cx, completion);
+    }
+
+    fn on_timer<'n>(&mut self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> {
+        self.delivered += 1;
+        self.plane.on_timer(cx, notice)
     }
 
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
-        self.0.on_timer(cx, ACCEPT_RETRY_TIMER_KEY);
-        self.0.parse_execute(cx);
+        if core::mem::take(&mut self.fail_accept) {
+            // `EMFILE`: the accept arm parked on an exhaustion failure.
+            let token = CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0);
+            let failed = CompletionResult::Error { buf: None, errno: 24 };
+            self.plane.on_completion(cx, Completion { token, result: failed });
+        }
+        self.plane.parse_execute(cx);
     }
 
     fn respond(&mut self, cx: &mut LoopCx<'_>) {
-        self.0.respond(cx);
+        self.plane.respond(cx);
     }
+}
+
+/// An accept failure arms the retry, the clock steps past its window, and
+/// the loop delivers it: the retry pushes no accept arm while its group is
+/// pending, nor once a peer's cache construction failed.
+fn retry_admits_nothing(reactor: &mut TestLoop, plane: &mut ServerPlane, clock: &VirtualClock) {
+    let mut retry = RetryTimer { plane, fail_accept: true, delivered: 0 };
+    submit_two_iterations(reactor, &mut retry);
+    assert_eq!(reactor.armed_timers(), 1, "the accept failure armed the retry");
+    clock.advance(ACCEPT_RETRY + Nanos::from_millis(1));
+    submit_two_iterations(reactor, &mut retry);
+    assert_eq!(retry.delivered, 1, "the loop delivered the retry");
+    assert_eq!(reactor.armed_timers(), 0);
 }
 
 #[test]
 fn premature_retry_timer_cannot_bypass_cache_admission() {
     let (first, second) = permits();
-    let (mut reactor, mut plane) = plane(first);
-    submit_two_iterations(&mut reactor, &mut RetryTimer(&mut plane));
+    let clock = Rc::new(VirtualClock::default());
+    let (mut reactor, mut plane) = plane_on(first, Rc::clone(&clock));
+    retry_admits_nothing(&mut reactor, &mut plane, &clock);
     assert_eq!(reactor.driver().arms, 0, "retry timer cannot admit a pending group");
     drop(second);
-    submit_two_iterations(&mut reactor, &mut RetryTimer(&mut plane));
+    retry_admits_nothing(&mut reactor, &mut plane, &clock);
     assert_eq!(reactor.driver().arms, 0, "retry timer cannot admit a failed group");
 }

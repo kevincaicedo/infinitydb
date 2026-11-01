@@ -3,8 +3,8 @@
 //!
 //! - **The armed peak.** After every scheduler step, each cell's
 //!   `CellLoop::armed_timers()`; the run keeps the largest, cell scope. A
-//!   cell's timers are bounded by its owner positions only if every hold
-//!   episode leaves at most one timer behind: one per role.
+//!   cell's timers are bounded by its roles (`TimerRole::COUNT`) only if
+//!   every hold episode leaves at most one timer behind: its role's owner.
 //! - **Engagement.** The fill episodes that begin inside one hold window:
 //!   each cell's `frame_waits_fill` (the product's episode count) read at
 //!   every step and differenced over tumbling windows of the scenario's
@@ -110,16 +110,15 @@ mod tests {
     /// Episodes the dense leg must begin inside one window, else the row
     /// is vacuous.
     const ENGAGED_EPISODES_MIN: u64 = 8;
-    /// The positions a server cell's timers fill: accept retry, everysec,
-    /// fill hold, group hold.
-    const SERVER_TIMER_ROLES: u32 = 4;
+    /// The positions a server cell's timers fill, one per role.
+    const SERVER_TIMER_ROLES: u32 = inf_server::TimerRole::COUNT;
 
     /// The dense leg's population: episodes of a hold and a seal a LOG step
-    /// or two apart. On the wheel each arms a fill timer that nothing
-    /// cancels, so the timers armed at once grow with the episodes inside
-    /// one window; one owner per role holds the peak at the role count.
+    /// or two apart. A timer that outlived its episode would grow the timers
+    /// armed at once with the episodes inside one window; one owner per
+    /// role, its arm cancelled at the episode's issue, holds the peak at
+    /// the role count.
     #[test]
-    #[ignore = "red on the wheel: each fill hold episode arms a timer that lives its whole window"]
     fn dense_fill_episodes_keep_a_cells_timers_within_its_roles() {
         let scenario = DurableScenario::m2_fill_tick_dense(SEED);
         let report = run_durable_scenario(&scenario);

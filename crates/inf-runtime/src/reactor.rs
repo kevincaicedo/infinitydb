@@ -7,7 +7,8 @@
 //! ```text
 //!  9+1  SUBMIT+REAP   one driver entry per iteration: flush queued ops,
 //!                     harvest completions (Poll while spinning, Park idle)
-//!   1   dispatch      plane.on_completion per completion; timers fire
+//!   1   dispatch      plane.on_completion per completion, then due timers
+//!                     one notice at a time under the turn's allowance
 //!   2   FABRIC-IN     plane.fabric_in (bounded drain)
 //!  3+4  PARSE+EXECUTE plane.parse_execute under the foreground budget,
 //!                     then executor.run_ready for resumed futures
@@ -37,8 +38,9 @@ use inf_foundation::time::{Clock, Nanos};
 
 use crate::driver::{BackendDriver, Completion, IoOp, Wait};
 use crate::executor::CellExecutor;
+use crate::limits::TIMER_DELIVERIES_PER_TURN;
 use crate::sched::{GroupClass, GroupScheduler};
-use crate::timer::TimerWheel;
+use crate::timer::{Consumed, TimerNotice, TimerOutcome, TimerSet, Timers};
 
 /// Loop tuning. `Default` is the M0 reference shape.
 #[derive(Copy, Clone, Debug)]
@@ -95,7 +97,9 @@ pub struct LoopCx<'a> {
     pub now: Nanos,
     pub pool: &'a mut BufferPool,
     pub executor: &'a mut CellExecutor,
-    pub timers: &'a mut TimerWheel,
+    /// The loop's timer set: steps reach it through [`Self::timers`], which
+    /// cannot deliver, so step 1 alone begins and consumes notices.
+    timers: &'a mut TimerSet,
     ops: &'a mut Vec<IoOp>,
     sched: &'a mut GroupScheduler,
     commands: u64,
@@ -126,6 +130,12 @@ impl LoopCx<'_> {
     pub fn note_fabric(&mut self, msgs: u64) {
         self.fabric_msgs += msgs;
     }
+
+    /// The loop's timer set at this turn's time: arm, cancel, close, read,
+    /// and the successor of the notice being answered (ADR-0154 D3).
+    pub fn timers(&mut self) -> Timers<'_> {
+        Timers::new(self.timers, self.now)
+    }
 }
 
 impl core::fmt::Debug for LoopCx<'_> {
@@ -140,9 +150,13 @@ impl core::fmt::Debug for LoopCx<'_> {
 pub trait CellPlane {
     /// Step 1: one reaped completion (accept/recv/send/close result).
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion);
-    /// A timer armed via `cx.timers` fired with `key`.
-    fn on_timer(&mut self, cx: &mut LoopCx<'_>, key: u64) {
-        let _ = (cx, key);
+    /// Step 1, after the completions: one due arm of the loop's timer set,
+    /// as its notice. The answer is `Complete`, or the successor
+    /// `cx.timers().successor` made for this notice; the loop consumes the
+    /// notice before it begins the next (ADR-0154 D2, D3).
+    fn on_timer<'n>(&mut self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> {
+        let _ = (cx, notice);
+        TimerOutcome::Complete
     }
     /// Step 2: drain inbound fabric rings (bounded).
     fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {
@@ -192,13 +206,13 @@ pub struct CellLoop<D: BackendDriver, C: Clock> {
     clock: C,
     pool: BufferPool,
     executor: CellExecutor,
-    timers: TimerWheel,
+    /// The cell's fixed timer set, its owners reserved by the cell's hosts
+    /// before the loop exists; step 1 delivers its due arms.
+    timers: TimerSet,
     sched: GroupScheduler,
     config: LoopConfig,
     ops: Vec<IoOp>,
     completions: Vec<Completion>,
-    /// Due timer keys, collected then dispatched (reused across iterations).
-    due: Vec<u64>,
     iter_hist_us: LogHistogram,
     spin_left: u32,
     iterations: u64,
@@ -216,12 +230,16 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     /// The loop of one cell. `serve_mark` is that cell's census mark, minted
     /// beside the census its containers register with: the loop takes it as
     /// its first iteration begins, so the census serves from then on.
+    /// `timers` is the cell's timer set, built on that census with every
+    /// owner the cell's hosts hold already reserved (ADR-0154 D1): the loop
+    /// alone delivers its arms.
     pub fn new(
         driver: D,
         clock: C,
         pool: BufferPool,
         config: LoopConfig,
         serve_mark: ServeMark,
+        timers: TimerSet,
     ) -> CellLoop<D, C> {
         CellLoop {
             census: Rc::clone(serve_mark.census()),
@@ -230,12 +248,11 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             clock,
             pool,
             executor: CellExecutor::new(1024),
-            timers: TimerWheel::new(),
+            timers,
             sched: GroupScheduler::m0_default(),
             config,
             ops: Vec::with_capacity(256),
             completions: Vec::with_capacity(256),
-            due: Vec::new(),
             iter_hist_us: LogHistogram::new(),
             // The first iteration polls: the plane arms its accept in its
             // first PARSE, after the wait — a park there is a boot stall of
@@ -259,13 +276,8 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     pub fn run_iteration(&mut self, plane: &mut impl CellPlane) -> io::Result<IterStats> {
         self.take_serve_mark();
         // ---- steps 9 (prev iteration's ops) + 1 (reap): ONE driver entry.
-        // A queued task vetoes the park outright (F-L11-07; also what makes
-        // `spin_iters == 0` safe). `before_park` runs only when spin is
-        // exhausted: the plane publishes its parked flag and vetoes the
-        // park if a final doorbell check finds work (the lost-wakeup
-        // handshake, M0-R1).
-        let parked = self.spin_left == 0 && !self.executor.has_ready() && !plane.before_park();
-        let wait = if parked { Wait::Park { timeout: self.park_timeout() } } else { Wait::Poll };
+        let wait = self.idle_wait(plane);
+        let parked = matches!(wait, Wait::Park { .. });
         let submitted = self.ops.len() as u64;
         for op in self.ops.drain(..) {
             self.driver.push(op);
@@ -312,13 +324,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             for c in self.completions.drain(..) {
                 plane.on_completion(&mut cx, c);
             }
-            // Timers: collect-then-dispatch keeps `cx` exclusive.
-            let due = &mut self.due;
-            due.clear();
-            cx.timers.advance(start, |key| due.push(key));
-            for key in due.drain(..) {
-                plane.on_timer(&mut cx, key);
-            }
+            deliver_due(plane, &mut cx, start);
 
             // ---- step 2: FABRIC-IN.
             plane.fabric_in(&mut cx);
@@ -398,11 +404,36 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         }
     }
 
-    fn park_timeout(&self) -> Option<Duration> {
-        let to_next_timer = self
-            .timers
-            .next_deadline()
-            .map(|deadline| Duration::from_nanos(deadline.saturating_sub(self.clock.now()).0));
+    /// The next driver entry's wait, step 10's idle decision. It polls
+    /// while spinning; with a queued task, which vetoes the park outright,
+    /// so a task woken after `run_ready` is never parked on, at every
+    /// `spin_iters`, 0 included; and with a timer due at one read of the
+    /// clock, beside the task (ADR-0154 D3: a due timer is ready work even
+    /// when the turn's allowance is spent). Then `before_park`: the plane
+    /// publishes its parked flag and vetoes the park if a final doorbell
+    /// check finds work, the lost-wakeup handshake. A park ends by the
+    /// earliest arm, from the same read, or `park_default`. The clock is
+    /// read only with a timer armed.
+    fn idle_wait(&mut self, plane: &mut impl CellPlane) -> Wait {
+        if self.spin_left > 0 || self.executor.has_ready() {
+            return Wait::Poll;
+        }
+        let now = (self.timers.armed() > 0).then(|| self.clock.now());
+        let due = now.is_some_and(|now| self.timers.due(now));
+        if due || plane.before_park() {
+            return Wait::Poll;
+        }
+        Wait::Park { timeout: self.park_timeout(now) }
+    }
+
+    /// A park's timeout: until the earliest arm from `now`, the decision's
+    /// clock read (`None` with nothing armed), capped by `park_default`. Not
+    /// due at `now` means its deadline is past `now`, so the timer term is
+    /// positive and exact: the heap walks no tick boundaries.
+    fn park_timeout(&self, now: Option<Nanos>) -> Option<Duration> {
+        let to_next_timer = now
+            .zip(self.timers.next_deadline())
+            .map(|(now, deadline)| Duration::from_nanos(deadline.saturating_sub(now).0));
         match (to_next_timer, self.config.park_default) {
             (Some(t), Some(d)) => Some(t.min(d)),
             (Some(t), None) => Some(t),
@@ -458,10 +489,48 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         &self.executor
     }
 
-    /// Timers armed on this cell now. A gauge: past `u32::MAX` it reads
-    /// `u32::MAX`.
+    /// Timers armed on this cell now: at most the set's positions.
     pub fn armed_timers(&self) -> u32 {
-        u32::try_from(self.timers.armed()).unwrap_or(u32::MAX)
+        self.timers.armed()
+    }
+}
+
+/// Step 1's timer allowance (ADR-0154 D3): the callbacks the turn may
+/// still begin, the lesser of `TIMER_DELIVERIES_PER_TURN` and the
+/// Maintenance group's budget when step 1 begins. The loop's alone:
+/// private and neither `Copy` nor `Clone`, so no plane step can read, keep
+/// or reset it, and a cancel, a reserve or a successor refills nothing.
+struct Allowance {
+    left: u32,
+}
+
+impl Allowance {
+    fn for_turn(maintenance_budget: u32) -> Allowance {
+        Allowance { left: TIMER_DELIVERIES_PER_TURN.min(maintenance_budget) }
+    }
+
+    /// Spends one unit for a callback about to begin; `false` once spent.
+    fn take(&mut self) -> bool {
+        let Some(left) = self.left.checked_sub(1) else { return false };
+        self.left = left;
+        true
+    }
+}
+
+/// Step 1's timers (ADR-0154 D3): the due arms in (deadline, position)
+/// order, one notice at a time — begun, answered by the plane, consumed
+/// before the next — each charged one Maintenance unit, while the turn's
+/// allowance lasts. `due` is the gate: one compare of the minimum, which is
+/// all an iteration with nothing due pays. A timer still due waits for the
+/// next turn's step 1, and the park decision polls on it meanwhile.
+fn deliver_due(plane: &mut impl CellPlane, cx: &mut LoopCx<'_>, now: Nanos) {
+    let mut allowance = Allowance::for_turn(cx.budget(GroupClass::Maintenance));
+    while cx.timers.due(now) && allowance.take() {
+        let Some(notice) = cx.timers.begin(now) else { break };
+        cx.charge(GroupClass::Maintenance, 1);
+        let outcome = plane.on_timer(cx, &notice);
+        let consumed = cx.timers.consume(&notice, outcome);
+        debug_assert_ne!(consumed, Consumed::Stale, "the loop consumes the notice it began");
     }
 }
 

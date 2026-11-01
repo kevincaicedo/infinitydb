@@ -69,7 +69,7 @@ pub use reactor::{CellLoop, CellPlane, IterStats, LoopConfig, LoopCx};
 pub use sched::{GroupClass, GroupScheduler};
 pub use timer::{
     ArmError, Cancelled, Closed, Consumed, OwnerPhase, Reserved, Successor, TimerArm, TimerId,
-    TimerNotice, TimerOutcome, TimerOwner, TimerSet, TimerWheel,
+    TimerNotice, TimerOutcome, TimerOwner, TimerSet, TimerWheel, Timers,
 };
 pub use token::{CompletionToken, MAX_SLOT, TokenClass};
 

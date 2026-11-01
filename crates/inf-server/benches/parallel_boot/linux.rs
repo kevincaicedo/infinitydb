@@ -230,7 +230,7 @@ fn drive_cell(
         tier: None,
     })
     .expect("ns");
-    let (mut plane, serve_mark) = ServerPlane::new(
+    let (mut plane, serve_mark, timer_set) = ServerPlane::new(
         CellId(i as u16),
         cells,
         listener.into_raw_fd(),
@@ -239,7 +239,8 @@ fn drive_cell(
         node,
         NoopObserver,
         false,
-    );
+    )
+    .expect("the server's timer owners fit their cap");
     plane.set_control(control, issuer).expect("the issuer of this cell");
     // M2.5-S08 A/B arm on the config (ADR-0109): the prefetch wrapper is
     // Recovery-private; the plane's filesystem is the bare tier.
@@ -250,7 +251,7 @@ fn drive_cell(
         park_default: Some(std::time::Duration::from_micros(500)),
         ..Default::default()
     };
-    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark);
+    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set);
     while !stop.load(Ordering::Relaxed) {
         cell_loop.run_iteration(&mut plane).expect("iteration");
         if let Some(err) = plane.take_boot_error() {

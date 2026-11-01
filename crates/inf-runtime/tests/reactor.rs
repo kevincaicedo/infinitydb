@@ -18,12 +18,19 @@ use std::time::Duration;
 
 use inf_alloc::BufferPool;
 use inf_foundation::CellId;
-use inf_foundation::bounded::{CapCensus, CensusPhase};
+use inf_foundation::bounded::{Cap, CapCensus, CapFill, CensusPhase};
 use inf_foundation::time::{Nanos, StdClock, VirtualClock};
 use inf_runtime::{
     BackendDriver, Capabilities, CellLoop, CellPlane, Completion, GroupClass, IoOp, LoopConfig,
-    LoopCx, SubmitStats, Wait,
+    LoopCx, Reserved, SubmitStats, TimerNotice, TimerOutcome, TimerOwner, TimerSet, Wait,
 };
+
+/// The runtime fixture's timer positions: one, which the timer test
+/// reserves; the tests that arm no timer leave it unreserved, so it fills
+/// while serving (a test host's cap).
+const FIXTURE_OWNERS: Cap = Cap::entries::<1>("reactor-owners", CapFill::Serving);
+/// The delivery test's positions: one more than a turn's allowance.
+const COHORT_OWNERS: Cap = Cap::entries::<65>("delivery-owners", CapFill::Serving);
 
 /// Driver that records how it was waited on and completes nothing.
 #[derive(Debug, Default)]
@@ -74,14 +81,38 @@ impl BackendDriver for NullDriver {
 }
 
 fn test_loop(config: LoopConfig) -> CellLoop<NullDriver, StdClock> {
-    let (_census, serve_mark) = CapCensus::new(CellId(0));
-    CellLoop::new(
+    test_loop_owning(config, 0).0
+}
+
+/// The fixture's loop with `owners` of its timer positions reserved, each
+/// routed by its index, before the loop exists.
+fn test_loop_owning(
+    config: LoopConfig,
+    owners: u64,
+) -> (CellLoop<NullDriver, StdClock>, Vec<TimerOwner>) {
+    let (census, serve_mark) = CapCensus::new(CellId(0));
+    let (timers, owners) = timer_set(FIXTURE_OWNERS, &census, owners);
+    let lp = CellLoop::new(
         NullDriver::default(),
         StdClock::new(),
         BufferPool::new(4, 1024),
         config,
         serve_mark,
-    )
+        timers,
+    );
+    (lp, owners)
+}
+
+/// A set of `cap` positions on `census`, `owners` of them reserved.
+fn timer_set(cap: Cap, census: &Rc<CapCensus>, owners: u64) -> (TimerSet, Vec<TimerOwner>) {
+    let mut set = TimerSet::build(cap, census).expect("the fixture's timer set");
+    let owners = (0..owners)
+        .map(|route| match set.reserve(route) {
+            Reserved::Owner(owner) => owner,
+            other => panic!("a free position: {other:?}"),
+        })
+        .collect();
+    (set, owners)
 }
 
 /// Two synthetic connections: A holds a deep pipeline, B sends one PING per
@@ -192,12 +223,14 @@ fn the_first_iteration_polls_before_anything_is_armed() {
 #[test]
 fn the_first_iteration_takes_the_serve_mark() {
     let (census, serve_mark) = CapCensus::new(CellId(7));
+    let (timers, _) = timer_set(FIXTURE_OWNERS, &census, 0);
     let mut lp = CellLoop::new(
         NullDriver::default(),
         StdClock::new(),
         BufferPool::new(4, 1024),
         LoopConfig::default(),
         serve_mark,
+        timers,
     );
     assert_eq!(census.phase(), CensusPhase::Assembling, "constructing the loop is assembly");
     let mut plane = BusyThenIdle { busy_left: 1 };
@@ -229,20 +262,22 @@ fn idle_policy_spins_then_parks() {
 }
 
 struct TimerPlane {
+    owner: TimerOwner,
     fired: Vec<u64>,
     armed: bool,
 }
 
 impl CellPlane for TimerPlane {
     fn on_completion(&mut self, _cx: &mut LoopCx<'_>, _c: Completion) {}
-    fn on_timer(&mut self, _cx: &mut LoopCx<'_>, key: u64) {
-        self.fired.push(key);
+    fn on_timer<'n>(&mut self, _cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> {
+        self.fired.push(notice.route());
+        TimerOutcome::Complete
     }
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
         if !self.armed {
             self.armed = true;
-            let deadline = cx.now + inf_foundation::time::Nanos::from_millis(5);
-            cx.timers.insert(deadline, 99);
+            let deadline = cx.now + Nanos::from_millis(5);
+            cx.timers().arm(&self.owner, deadline).expect("armed");
         }
     }
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
@@ -250,18 +285,21 @@ impl CellPlane for TimerPlane {
 
 #[test]
 fn armed_timer_fires_through_the_loop() {
-    let mut lp = test_loop(LoopConfig {
+    let config = LoopConfig {
         spin_iters: 0,
         park_default: Some(Duration::from_millis(1)),
         ..LoopConfig::default()
-    });
-    let mut plane = TimerPlane { fired: Vec::new(), armed: false };
+    };
+    let (mut lp, owners) = test_loop_owning(config, 1);
+    let owner = owners.into_iter().next().expect("an owner");
+    let mut plane = TimerPlane { owner, fired: Vec::new(), armed: false };
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while plane.fired.is_empty() {
         lp.run_iteration(&mut plane).expect("iteration");
         assert!(std::time::Instant::now() < deadline, "timer never fired");
     }
-    assert_eq!(plane.fired, vec![99]);
+    assert_eq!(plane.fired, vec![0], "the owner's route");
+    assert_eq!(lp.armed_timers(), 0, "a completed arm leaves its owner idle");
 }
 
 #[test]
@@ -470,21 +508,24 @@ fn a_task_woken_in_maintain_is_polled_before_any_park() {
 /// the callbacks each iteration begins. It reports no work, so the loop's
 /// idle policy alone decides each wait.
 struct DueCohort {
-    owners: u64,
+    owners: Vec<TimerOwner>,
     armed: bool,
     begun: u64,
 }
 
 impl CellPlane for DueCohort {
     fn on_completion(&mut self, _cx: &mut LoopCx<'_>, _c: Completion) {}
-    fn on_timer(&mut self, _cx: &mut LoopCx<'_>, _key: u64) {
+    fn on_timer<'n>(&mut self, _cx: &mut LoopCx<'_>, _notice: &'n TimerNotice) -> TimerOutcome<'n> {
         self.begun += 1;
+        TimerOutcome::Complete
     }
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
         if !self.armed {
             self.armed = true;
-            for key in 0..self.owners {
-                cx.timers.insert(cx.now + Nanos::from_millis(1), key);
+            let deadline = cx.now + Nanos::from_millis(1);
+            let mut timers = cx.timers();
+            for owner in &self.owners {
+                timers.arm(owner, deadline).expect("armed");
             }
         }
     }
@@ -501,13 +542,13 @@ impl CellPlane for DueCohort {
 /// 2 ms, iteration 2 begins 64 callbacks, iteration 3 one, and iteration 4,
 /// with nothing armed, parks for `park_default`.
 #[test]
-#[ignore = "red on the wheel: due timers are collected without a bound and do not veto a park"]
 fn sixty_five_due_timers_take_two_turns_and_no_park() {
     let park_default = Duration::from_millis(100);
     let mut readings = Vec::new();
     for spin_iters in [1, 0] {
         let clock = Rc::new(VirtualClock::new(Nanos::from_millis(10)));
-        let (_census, serve_mark) = CapCensus::new(CellId(0));
+        let (census, serve_mark) = CapCensus::new(CellId(0));
+        let (timers, owners) = timer_set(COHORT_OWNERS, &census, 65);
         let config =
             LoopConfig { spin_iters, park_default: Some(park_default), ..LoopConfig::default() };
         let mut lp = CellLoop::new(
@@ -516,8 +557,9 @@ fn sixty_five_due_timers_take_two_turns_and_no_park() {
             BufferPool::new(4, 1024),
             config,
             serve_mark,
+            timers,
         );
-        let mut plane = DueCohort { owners: 65, armed: false, begun: 0 };
+        let mut plane = DueCohort { owners, armed: false, begun: 0 };
         let mut begun = Vec::new();
         for iteration in 1..=4 {
             let before = plane.begun;

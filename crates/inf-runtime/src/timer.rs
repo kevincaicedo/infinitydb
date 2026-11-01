@@ -854,6 +854,70 @@ impl TimerSet {
     }
 }
 
+/// A turn's hold on its loop's [`TimerSet`] (ADR-0154 D3): arm, cancel,
+/// close and read an owner, and make the successor of the notice the plane
+/// is answering, each against the turn's injected time. Delivery and its
+/// per-turn allowance are the loop's alone: nothing here begins, consumes
+/// or reserves, so no plane step can deliver a timer or hand out a position.
+pub struct Timers<'a> {
+    set: &'a mut TimerSet,
+    now: Nanos,
+}
+
+impl<'a> Timers<'a> {
+    /// The loop's set at the turn's time `now`.
+    pub(crate) fn new(set: &'a mut TimerSet, now: Nanos) -> Timers<'a> {
+        Timers { set, now }
+    }
+
+    /// Arms `owner` at `deadline`, rounded against the turn's time
+    /// ([`TimerSet::arm`]): replacing its arm if it holds one, `Busy` while
+    /// its callback runs, and a refusal changes nothing.
+    pub fn arm(&mut self, owner: &TimerOwner, deadline: Nanos) -> Result<TimerArm, ArmError> {
+        self.set.arm(owner, deadline, self.now)
+    }
+
+    /// Cancels exactly `arm` ([`TimerSet::cancel`]).
+    pub fn cancel(&mut self, arm: &TimerArm) -> Cancelled {
+        self.set.cancel(arm)
+    }
+
+    /// Closes `owner` ([`TimerSet::close`]); while its callback runs the
+    /// position frees when the loop consumes that notice.
+    pub fn close(&mut self, owner: TimerOwner) -> Closed {
+        self.set.close(owner)
+    }
+
+    /// `owner`'s phase ([`TimerSet::phase`]).
+    #[must_use]
+    pub fn phase(&self, owner: &TimerOwner) -> OwnerPhase {
+        self.set.phase(owner)
+    }
+
+    /// The successor of the arm `notice` delivers, at `deadline` rounded
+    /// against the turn's time and checked now ([`TimerSet::successor`]):
+    /// the plane returns it from the callback that answers `notice`.
+    pub fn successor<'n>(
+        &self,
+        notice: &'n TimerNotice,
+        deadline: Nanos,
+    ) -> Result<Successor<'n>, ArmError> {
+        self.set.successor(notice, deadline, self.now)
+    }
+
+    /// The most owners armed at once since the set was built.
+    #[must_use]
+    pub fn armed_max(&self) -> u32 {
+        self.set.armed_max()
+    }
+}
+
+impl core::fmt::Debug for Timers<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Timers {{ now: {}, armed: {} }}", self.now, self.set.armed())
+    }
+}
+
 /// A heap entry's index before its sift places it.
 const UNPLACED: u32 = u32::MAX;
 
