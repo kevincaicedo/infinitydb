@@ -420,6 +420,12 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         }
         let now = (self.timers.armed() > 0).then(|| self.clock.now());
         let due = now.is_some_and(|now| self.timers.due(now));
+        // Canary: the decision ignores a due timer and parks on it.
+        #[cfg(inf_canary_timer_park_hides_due)]
+        let due = {
+            let _ = due;
+            false
+        };
         if due || plane.before_park() {
             return Wait::Poll;
         }
@@ -512,7 +518,13 @@ impl Allowance {
     /// Spends one unit for a callback about to begin; `false` once spent.
     fn take(&mut self) -> bool {
         let Some(left) = self.left.checked_sub(1) else { return false };
-        self.left = left;
+        // Canary: a begun callback spends no unit.
+        #[cfg(not(inf_canary_timer_allowance_unspent))]
+        {
+            self.left = left;
+        }
+        #[cfg(inf_canary_timer_allowance_unspent)]
+        let _ = left;
         true
     }
 }

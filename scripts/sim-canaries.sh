@@ -327,6 +327,13 @@ rows=(
   # A heap entry stays fresh by order: a close removes an Armed owner's
   # entry before its position's take. Planted, the entry outlives the take.
   "inf_canary_timer_close_keeps_entry crate-test inf-runtime test:timer_model the_set_matches_the_model_on_two_sets_driven_alike the bijection"
+  # ADR-0154 D3: a turn begins at most 64 timer callbacks, each spending
+  # one unit of its allowance. Planted, a callback spends none, and the
+  # delivery test's turn begins all 65 due timers.
+  "inf_canary_timer_allowance_unspent crate-test inf-runtime test:reactor sixty_five_due_timers_take_two_turns_and_no_park callbacks begun per iteration"
+  # ADR-0154 D3: a due timer is ready work, which the park decision polls
+  # on. Planted, the decision parks on it, at spin_iters 1 and 0.
+  "inf_canary_timer_park_hides_due crate-test inf-runtime test:reactor sixty_five_due_timers_take_two_turns_and_no_park callbacks begun per iteration"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.
