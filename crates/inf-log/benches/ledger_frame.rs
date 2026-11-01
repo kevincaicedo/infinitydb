@@ -20,39 +20,18 @@
 //! these legs, is its A until the verdict is recorded, with the A/A
 //! control, a `-plus-one` plant on every leg and the rule's own red.
 //!
-//! The row open now, the sync due as a coverage target (ADR-0199): A is the
-//! ledger before it, whose due is a flag (`parent-<shape>`), and B the
-//! ledger as built (`ledger-<shape>`). A is compiled as B is: both ledgers
-//! are generic over the segment file, so both are instantiated in this
-//! crate, and each is called from two frame functions (the plain one and
-//! the plane's), as the LOG step reaches the shipped ledger from its plan
-//! and from its queueing, two functions; a ledger called from one frame
-//! function would be inlined into its one call site whole, which the
-//! shipped binary does not do. No leg derives the coverage tail from the
-//! ledger at each read: B's tail is the stored one, the only form built.
-//! The verdict rule: `ledger-<shape>` − `parent-<shape>` ≤ 16 instructions
-//! per frame at each shape; over at any shape, the change does not merge.
-//! The rule's own red at each shape is `parent-<shape>-plus-17`, A with the
-//! bound plus one in `nop`s, read over the bound. The plane legs
-//! (`parent-plane-<shape>`, `ledger-plane-<shape>`) are reported beside
-//! them, never judged. The bound is read on x86-64 at the pinned toolchain;
-//! on another target or toolchain each term is re-read before a verdict.
-//!
 //! The instrument: exact user-space instructions per op,
 //! `(I(n) − I(0)) / n` at `n` = 10⁷, read outside this binary
-//! (`perf stat -e instructions:u`) on one pinned core, each leg twice. A
-//! run judges only when its controls, each a leg of this binary but the
-//! last, hold:
+//! (`perf stat -e instructions:u`) on one pinned core. Its controls, each a
+//! leg of this binary:
 //!
 //! - the same binary against itself: each leg against itself within 0.05
 //!   per op, at a resolution of 0.01 per op at `n` = 10⁷;
-//! - liveness: the twelve `-plus-one` legs, one `nop` per op, read their
-//!   leg + 1.00 ± 0.05, and each `parent-<shape>-plus-17` reads A + 17.00;
+//! - liveness: the six `-plus-one` legs, one `nop` per op, read their
+//!   leg + 1.00 ± 0.05;
 //! - engagement: after each leg's loop, outside the counted function, the
 //!   ledger's stats read one frame queued and one barrier of the shape per
-//!   op (none at plain), or the leg panics;
-//! - A is the parent: `parent-<shape>` within 0.05 of the parent tree's
-//!   own `ledger-<shape>`, its bench built at the parent revision.
+//!   op (none at plain), or the leg panics.
 //!
 //! A plant sits at the top of the driving loop's body, outside the frame
 //! function: a planted copy of a frame function is compiled on its own, so
@@ -83,9 +62,6 @@ use inf_log::{
     MutationEffect, NsId, SegmentId, StagingConfig, StagingRing,
 };
 
-#[path = "ledger_frame/parent.rs"]
-mod parent;
-
 /// The frame shapes the LOG step runs.
 #[derive(Copy, Clone)]
 enum Shape {
@@ -94,33 +70,15 @@ enum Shape {
     Plain,
 }
 
-/// A ledger alone, or with the plane's consumer of its flight: the
-/// parent's (A) and the one built (B).
+/// The ledger alone, or with the plane's consumer of its flight.
 #[derive(Copy, Clone)]
 enum Version {
-    Parent,
-    ParentPlane,
     Ledger,
     LedgerPlane,
 }
 
 /// Each leg: its name, its version, its shape and its plant in `nop`s.
-const LEGS: [(&str, Version, Shape, u8); 27] = [
-    ("parent-write-through", Version::Parent, Shape::WriteThrough, 0),
-    ("parent-write-through-plus-one", Version::Parent, Shape::WriteThrough, 1),
-    ("parent-write-through-plus-17", Version::Parent, Shape::WriteThrough, 17),
-    ("parent-linked", Version::Parent, Shape::Linked, 0),
-    ("parent-linked-plus-one", Version::Parent, Shape::Linked, 1),
-    ("parent-linked-plus-17", Version::Parent, Shape::Linked, 17),
-    ("parent-plain", Version::Parent, Shape::Plain, 0),
-    ("parent-plain-plus-one", Version::Parent, Shape::Plain, 1),
-    ("parent-plain-plus-17", Version::Parent, Shape::Plain, 17),
-    ("parent-plane-write-through", Version::ParentPlane, Shape::WriteThrough, 0),
-    ("parent-plane-write-through-plus-one", Version::ParentPlane, Shape::WriteThrough, 1),
-    ("parent-plane-linked", Version::ParentPlane, Shape::Linked, 0),
-    ("parent-plane-linked-plus-one", Version::ParentPlane, Shape::Linked, 1),
-    ("parent-plane-plain", Version::ParentPlane, Shape::Plain, 0),
-    ("parent-plane-plain-plus-one", Version::ParentPlane, Shape::Plain, 1),
+const LEGS: [(&str, Version, Shape, u8); 12] = [
     ("ledger-write-through", Version::Ledger, Shape::WriteThrough, 0),
     ("ledger-write-through-plus-one", Version::Ledger, Shape::WriteThrough, 1),
     ("ledger-linked", Version::Ledger, Shape::Linked, 0),
@@ -180,75 +138,12 @@ impl Staging {
     }
 }
 
-struct ParentLeg {
-    staging: Staging,
-    ledger: parent::GroupCommit<MemFile>,
-}
-
 struct LedgerLeg {
     staging: Staging,
     ledger: GroupCommit<MemFile>,
 }
 
-/// A: the parent's ledger, the same LOG step as B's.
-#[inline(never)]
-fn parent_frame(
-    leg: &mut ParentLeg,
-    always: bool,
-    write_through_ok: bool,
-    seal_ahead: bool,
-) -> u64 {
-    let class = if always { parent::FsyncClass::Always } else { parent::FsyncClass::Everysec };
-    leg.ledger.note_staged(class);
-    let parent::FramePlan::Seal(plan) = leg.ledger.frame_plan(write_through_ok, seal_ahead) else {
-        panic!("no leg's input holds its frame");
-    };
-    let (lease, end) = leg.staging.seal();
-    let now = leg.staging.now;
-    let parent::FrameQueued { id, barrier } = leg.ledger.note_frame_queued(end, lease, plan, now);
-    let ticket = match barrier {
-        parent::FrameBarrier::WriteThrough(ticket) | parent::FrameBarrier::Linked(ticket) => {
-            Some(ticket)
-        }
-        parent::FrameBarrier::None => None,
-    };
-    let written = leg.ledger.note_frame_written(id);
-    leg.staging.ring.release(written.lease);
-    let durable = ticket.and_then(|ticket| leg.ledger.on_fsync_complete(ticket, now));
-    durable.map_or(0, Lsn::to_u64)
-}
-
-/// A with the plane's consumer of the flight the queue hands back.
-#[inline(never)]
-fn parent_plane_frame(
-    leg: &mut ParentLeg,
-    always: bool,
-    write_through_ok: bool,
-    seal_ahead: bool,
-) -> u64 {
-    let class = if always { parent::FsyncClass::Always } else { parent::FsyncClass::Everysec };
-    leg.ledger.note_staged(class);
-    let parent::FramePlan::Seal(plan) = leg.ledger.frame_plan(write_through_ok, seal_ahead) else {
-        panic!("no leg's input holds its frame");
-    };
-    let (lease, end) = leg.staging.seal();
-    let now = leg.staging.now;
-    let id = leg.ledger.note_frame_queued(end, lease, plan, now).id;
-    let frame = leg.ledger.note_frame_written(id);
-    let stall = now.saturating_sub(frame.submitted_at).as_micros();
-    leg.staging.ring.release(frame.lease);
-    let durable = match frame.barrier {
-        parent::FrameBarrier::None => None,
-        parent::FrameBarrier::Linked(ticket) => {
-            leg.ledger.rebase_clock(ticket, now);
-            leg.ledger.on_fsync_complete(ticket, now)
-        }
-        parent::FrameBarrier::WriteThrough(ticket) => leg.ledger.on_fsync_complete(ticket, now),
-    };
-    durable.map_or(0, Lsn::to_u64) ^ stall
-}
-
-/// B: the ledger as built, the LOG step's calls, the lease carried by its
+/// The ledger as built: the LOG step's calls, the lease carried by its
 /// frame queue.
 #[inline(never)]
 fn ledger_frame(
@@ -328,7 +223,6 @@ macro_rules! drive {
         match $nops {
             0 => go!(0),
             1 => go!(1),
-            17 => go!(17),
             _ => unreachable!("a plant of LEGS"),
         }
         accumulator
@@ -361,35 +255,6 @@ fn engaged(shape: Shape, ops: u64, write_through: u64, linked: u64, queued: u64)
 fn run(version: Version, shape: Shape, nops: u8, ops: u64, census: &Rc<CapCensus>) -> u64 {
     let (always, write_through_ok) = inputs(shape);
     match version {
-        Version::Parent => {
-            let mut state =
-                ParentLeg { staging: Staging::new(), ledger: parent::GroupCommit::new(census) };
-            let accumulator = drive!(state, parent_frame, nops, ops, always, write_through_ok);
-            let stats = state.ledger.stats();
-            engaged(
-                shape,
-                ops,
-                stats.fsyncs_write_through,
-                stats.fsyncs_linked,
-                stats.frames_queued,
-            );
-            accumulator
-        }
-        Version::ParentPlane => {
-            let mut state =
-                ParentLeg { staging: Staging::new(), ledger: parent::GroupCommit::new(census) };
-            let accumulator =
-                drive!(state, parent_plane_frame, nops, ops, always, write_through_ok);
-            let stats = state.ledger.stats();
-            engaged(
-                shape,
-                ops,
-                stats.fsyncs_write_through,
-                stats.fsyncs_linked,
-                stats.frames_queued,
-            );
-            accumulator
-        }
         Version::Ledger => {
             let mut state = LedgerLeg { staging: Staging::new(), ledger: GroupCommit::new(census) };
             let accumulator = drive!(state, ledger_frame, nops, ops, always, write_through_ok);
