@@ -10,7 +10,13 @@ use std::task::{Context, Poll, Waker};
 
 use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::KeySlot;
-use inf_store::{Keyspace, StoreConfig};
+use inf_foundation::fault::FaultSpec;
+use inf_store::{
+    AddrClass, Keyspace, LogicalAddr, NsSpec, ShadowProbe, ShadowVerdict, StoreConfig, TierSpec,
+    TieredTable,
+};
+
+use crate::fault::SHADOW_TWIN_READ_FAIL;
 
 #[cfg(feature = "doc")]
 use super::dispatch::gather_json_mget;
@@ -86,9 +92,31 @@ impl Cells {
             }
             for plane in &self.planes {
                 drain(&plane.shared, &mut answer);
+                wake_ns_pumps(&plane.shared);
             }
         }
         panic!("the program exceeded its bounded legs");
+    }
+}
+
+/// The cell loop's wake of each origin's ns-apply pump after a FABRIC-IN
+/// pass, where a tiered apply waits in its origin's FIFO. The harness runs
+/// no executor, so a pump must finish in one poll: no leg here suspends,
+/// since no cold read reaches a device.
+fn wake_ns_pumps(shared: &Rc<Shared<NoopObserver, StdSegmentFs>>) {
+    let origins: Vec<u16> = {
+        let (queues, active) = (shared.ns_applies.borrow(), shared.ns_pump_active.borrow());
+        (0..shared.cells)
+            .filter(|&origin| {
+                !queues[usize::from(origin)].is_empty() && !active[usize::from(origin)]
+            })
+            .collect()
+    };
+    let mut cx = Context::from_waker(Waker::noop());
+    for origin in origins {
+        shared.ns_pump_active.borrow_mut()[usize::from(origin)] = true;
+        let pump = pin!(ns_apply_pump(Rc::clone(shared), origin));
+        assert!(pump.poll(&mut cx).is_ready(), "the ns-apply pump suspended: no device here");
     }
 }
 
@@ -234,6 +262,141 @@ fn reply_outcome_dbsize_drain_error_is_the_reply() {
         no_answer,
     );
     assert_eq!(reply, expected);
+}
+
+/// The tiered namespace of the drain row, registered and materialized on
+/// both cells, as the catalog is on every cell of a node.
+const TIERED: NsId = NsId(16);
+
+fn tiered_namespace(cells: &Cells) {
+    for plane in &cells.planes {
+        let spec = NsSpec {
+            id: TIERED,
+            name: b"tiered".to_vec(),
+            mode: NsMode::Durable,
+            fsync: None,
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(64 << 20)),
+        };
+        plane.shared.store.borrow_mut().ns_create(spec).expect("a fresh tiered namespace");
+    }
+}
+
+/// Makes `key`'s record cold in `shared`'s tiered table, then overwrites
+/// it through the shadow path, the store's own sequence: the flush moves
+/// the watermarks past the record (no tier file exists, and none is read:
+/// the fault point fires first), and the write opens one ticket whose
+/// twin is unread. Returns the ticket's hash and cold address with the
+/// twin's image, which verifies the ticket as a twin read would.
+fn open_unread_twin(
+    shared: &Shared<NoopObserver, StdSegmentFs>,
+    key: &[u8],
+) -> (u64, LogicalAddr, Vec<u8>) {
+    let mut store = shared.store.borrow_mut();
+    let table = store.tiered_store_mut(TIERED).expect("materialized");
+    table.set_shadow_enabled(true);
+    let hash = table.hash_key(key);
+    let cold = table.insert(key, b"v1", hash).expect("fits");
+    let image = table.record_bytes(cold, table.record(cold).encoded_len).to_vec();
+    let tail = table.space().tail();
+    let space = table.space_mut();
+    space.advance_ro_boundary(tail);
+    space.advance_flushed(tail);
+    space.advance_head(tail);
+    assert_eq!(table.space().resolve(cold), AddrClass::Cold);
+    assert_eq!(table.shadow_probe(key, hash), ShadowProbe::One(cold));
+    let record_len = TieredTable::RECORD_HEADER_LEN + key.len() + 2;
+    table.shadow_admit(hash, cold, record_len).expect("admitted");
+    let winner = table.insert(key, b"v2", hash).expect("fits");
+    table.register_shadow(hash, cold, winner);
+    assert_eq!(table.shadow_unverified(), 1);
+    (hash, cold, image)
+}
+
+fn shadow_read_errors(shared: &Shared<NoopObserver, StdSegmentFs>) -> u64 {
+    let store = shared.store.borrow();
+    store.tiered_store(TIERED).expect("materialized").shadow_counters().read_errors
+}
+
+/// `argv` on a connection bound to the tiered namespace, dispatched and
+/// settled as the connection's pump does: the connection's next reply.
+#[allow(clippy::disallowed_types, reason = "test-only: the dispatcher's reply queue (ADR-0163 D2)")]
+fn tiered_command(cells: &Cells, argv: &[&[u8]]) -> OwnedReply {
+    let shared = cells.origin();
+    let meta = lookup(argv[0]).expect("a registered command");
+    cells.drive(
+        async {
+            let (mut pending, mut inflight) = (std::collections::VecDeque::new(), 0);
+            let proto = Protocol::Resp2;
+            let live = dispatch_ns(
+                shared,
+                KEY,
+                ORIGIN,
+                meta,
+                argv,
+                proto,
+                0,
+                0,
+                TIERED,
+                &mut pending,
+                &mut inflight,
+            )
+            .await;
+            assert!(live, "the connection stays");
+            let front = pending.pop_front().expect("one reply slot");
+            assert!(pending.is_empty(), "one command, one reply slot");
+            settle_reply(shared, KEY, front, &mut inflight).await
+        },
+        no_answer,
+    )
+}
+
+/// A tiered peer whose `DBSIZE` drain errors: its twin read fails at the
+/// fault point that stands in for a device error, and the peer's ns-apply
+/// pump sends the drain's error reply tagged from its outcome (ADR-0190
+/// D3). The client reads that error, `Error` by its outcome, where a
+/// reply tagged a success would earn the fold's fail-closed internal
+/// error. The connection's replies before and after it are exact counts.
+#[test]
+fn reply_outcome_tiered_dbsize_drain_error_is_the_reply() {
+    let cells = Cells::new();
+    tiered_namespace(&cells);
+    let peer = &cells.planes[1].shared;
+    let before = tiered_command(&cells, &[b"DBSIZE"]);
+    let (hash, cold, image) = open_unread_twin(peer, &cells.key_on(1));
+    inf_foundation::fault::arm(SHADOW_TWIN_READ_FAIL, FaultSpec::Always);
+    let own = ns_dbsize_local(peer, ExecOrigin::Fabric(CellId(0)), TIERED, Protocol::Resp2);
+    let expected = cells.drive(own, no_answer).expect_err("the peer's own drain fails its read");
+    let peer_errors = shadow_read_errors(peer);
+    let failed = tiered_command(&cells, &[b"DBSIZE"]);
+    inf_foundation::fault::disarm(SHADOW_TWIN_READ_FAIL);
+    assert_eq!(shadow_read_errors(peer) - peer_errors, 1, "VACUOUS: the peer's drain read no twin");
+    assert_eq!(shadow_read_errors(cells.origin()), 0, "the origin's own leg read no twin");
+    assert!(expected.is_error(), "the drain's reply is an error");
+    engaged(expected.bytes());
+    assert_eq!(
+        String::from_utf8_lossy(failed.bytes()),
+        String::from_utf8_lossy(expected.bytes()),
+        "the client reads the peer's drain error"
+    );
+    assert_eq!(failed.outcome(), ReplyOutcome::Error);
+    // Healed: the twin's image verifies the ticket, so the next drain
+    // reads nothing and counts the key once.
+    let verdict = {
+        let mut store = peer.store.borrow_mut();
+        let table = store.tiered_store_mut(TIERED).expect("materialized");
+        table.verify_shadow(hash, cold, &image)
+    };
+    assert_eq!(verdict, ShadowVerdict::SameKey);
+    let after = tiered_command(&cells, &[b"DBSIZE"]);
+    assert_eq!(before.outcome(), ReplyOutcome::Success);
+    assert_eq!(after.outcome(), ReplyOutcome::Success);
+    let mut out = ReplyStream::new(Vec::new());
+    for reply in [&before, &failed, &after] {
+        out.emit(reply);
+    }
+    assert_eq!(out.as_bytes(), [b":0\r\n".as_slice(), expected.bytes(), b":1\r\n"].concat());
 }
 
 /// An invalid `CONFIG SET`: the local leg's error is the reply and nothing
