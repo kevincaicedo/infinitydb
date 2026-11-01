@@ -88,6 +88,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         tier_budget_cells: Vec::new(),
         epoch_marks_cells: Vec::new(),
         ledger_wedge: None,
+        timers: super::TimersReport::default(),
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -255,6 +256,11 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     }
 
     // ---- writers -----------------------------------------------------
+    if scenario.fill_dense {
+        for net in &node.nets {
+            net.borrow_mut().deliver_whole();
+        }
+    }
     let mut writers = Vec::new();
     let classes = [
         (NsClass::Always, scenario.always_writers),
@@ -551,6 +557,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let mut idle_steps = 0u64;
     let mut last_progress = 0u64;
     let mut log_oracle = LogOracle::new(scenario.cells);
+    let mut timers_oracle = super::timers::TimersOracle::new(scenario);
     let mut tier_oracle = TierTurnOracle::new(&node, scenario.cells, true);
     let no_model_leg = scenario.tier_budget.is_some_and(|shape| shape.leg.model_absent());
     if no_model_leg {
@@ -569,6 +576,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             break;
         }
         log_oracle.sample(&node, &mut report);
+        timers_oracle.sample(&node, clock.now(), &mut report.timers);
         tier_oracle.sample(&node, &disk, scenario, &mut report);
         if let Some(wedge) = ledger_wedge.as_mut() {
             wedge.observe(step, &node, &disk, clock.now());
