@@ -23,8 +23,23 @@
 //!   deadline, so the wheel holds the whole cohort at once, as the set does.
 //!   One op is the whole cohort, reported per op and per timer, never judged.
 //!
-//! The B legs, one op each:
+//! The B legs, one op each, each the cell loop's own code for the path on
+//! a set of the server's four positions, every owner reserved before the
+//! loop (step 1 and the park decision as `reactor.rs` writes them, the hold
+//! as the durable cell opens and ends an episode):
 //!
+//! - `set-idle`: nothing armed; the clock steps 1 µs, then step 1: the
+//!   turn's allowance from the Maintenance budget and the empty heap's due
+//!   check.
+//! - `set-one-out`: the everysec owner 1 s out, its successor armed from
+//!   the delivery's time; the clock steps 1 µs, then step 1: the allowance,
+//!   the due check and, at each fire, the begin, the callback's route test,
+//!   the successor and the consume.
+//! - `set-park`: the park decision with the everysec owner armed: one
+//!   clock read, the due check from it, and the timeout from that read.
+//! - `set-hold`: one hold episode beside the everysec owner: the fill
+//!   owner's arm one window out (with the armed high water it raises), the
+//!   episode kept, then the issue's cancel of both policies' episodes.
 //! - `set-cohort`: the same cohort on a set of `--owners` positions, each
 //!   reserved before the loop: every owner armed one millisecond out, half
 //!   cancelled, the clock stepped to the deadline, and the rest delivered
@@ -73,7 +88,11 @@ use std::rc::Rc;
 use inf_foundation::CellId;
 use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
-use inf_runtime::{Cancelled, Consumed, Reserved, TimerArm, TimerOutcome, TimerOwner, TimerSet};
+use inf_runtime::limits::TIMER_DELIVERIES_PER_TURN;
+use inf_runtime::{
+    Cancelled, Consumed, GroupClass, GroupScheduler, Reserved, TimerArm, TimerOutcome, TimerOwner,
+    TimerSet,
+};
 
 use wheel::{TimerId, TimerWheel};
 
@@ -86,13 +105,16 @@ const SECOND: Nanos = Nanos(1_000_000_000);
 const PARK_DEFAULT: Nanos = Nanos(100_000_000);
 /// The fill hold's window at its design point.
 const HOLD_WINDOW: Nanos = MILLI;
-/// The callbacks' routing keys, the server's three.
+/// The callbacks' routing keys, the server's four.
 const EVERYSEC_KEY: u64 = 1;
 const FILL_KEY: u64 = 2;
 const ACCEPT_KEY: u64 = 3;
+const GROUP_KEY: u64 = 4;
 /// A cohort's keys start above the server's, so no cohort timer is taken
 /// for one of theirs.
 const COHORT_KEY_BASE: u64 = 1 << 32;
+/// The judged B legs' set: the server's four positions.
+const OWNERS_4: Cap = Cap::entries::<4>("bench-owners-4", CapFill::Serving);
 /// The B cohorts' sets.
 const OWNERS_1024: Cap = Cap::entries::<1024>("bench-owners-1024", CapFill::Serving);
 const OWNERS_65536: Cap = Cap::entries::<65536>("bench-owners-65536", CapFill::Serving);
@@ -105,11 +127,15 @@ enum Leg {
     Park,
     Hold,
     Cohort,
+    SetIdle,
+    SetOneOut,
+    SetPark,
+    SetHold,
     SetCohort,
 }
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 12] = [
+const LEGS: [(&str, Leg, u8); 20] = [
     ("wheel-idle", Leg::Idle, 0),
     ("wheel-idle-plus-one", Leg::Idle, 1),
     ("wheel-one-out", Leg::OneOut, 0),
@@ -120,6 +146,14 @@ const LEGS: [(&str, Leg, u8); 12] = [
     ("wheel-hold-plus-one", Leg::Hold, 1),
     ("wheel-cohort", Leg::Cohort, 0),
     ("wheel-cohort-plus-one", Leg::Cohort, 1),
+    ("set-idle", Leg::SetIdle, 0),
+    ("set-idle-plus-one", Leg::SetIdle, 1),
+    ("set-one-out", Leg::SetOneOut, 0),
+    ("set-one-out-plus-one", Leg::SetOneOut, 1),
+    ("set-park", Leg::SetPark, 0),
+    ("set-park-plus-one", Leg::SetPark, 1),
+    ("set-hold", Leg::SetHold, 0),
+    ("set-hold-plus-one", Leg::SetHold, 1),
     ("set-cohort", Leg::SetCohort, 0),
     ("set-cohort-plus-one", Leg::SetCohort, 1),
 ];
@@ -309,6 +343,164 @@ fn drive_cohort<const NOPS: u8>(ops: u64, owners: u32) -> u64 {
     accumulator.wrapping_add(wheel.armed_max() as u64)
 }
 
+/// One open hold episode, as the durable cell keeps it.
+#[derive(Clone, Copy)]
+struct Episode {
+    _since: Nanos,
+    arm: TimerArm,
+}
+
+/// The judged B legs' cell: the server's set of four, its owners reserved
+/// before the loop (routed as the A side's keys), the loop's scheduler,
+/// the durable cell's two episodes, its injected clock, and the
+/// deliveries the leg made.
+struct LoopSetCell {
+    set: TimerSet,
+    everysec: TimerOwner,
+    fill: TimerOwner,
+    sched: GroupScheduler,
+    fill_episode: Option<Episode>,
+    group_episode: Option<Episode>,
+    clock: VirtualClock,
+    delivered: u64,
+    _census: Rc<CapCensus>,
+}
+
+impl LoopSetCell {
+    fn new(everysec_armed: bool) -> LoopSetCell {
+        let (census, _mark) = CapCensus::new(CellId(0));
+        let mut set = TimerSet::build(OWNERS_4, &census).expect("built");
+        let mut owner = |route| match set.reserve(route) {
+            Reserved::Owner(owner) => owner,
+            other => panic!("a free position: {other:?}"),
+        };
+        let (_accept, everysec, fill, _group) =
+            (owner(ACCEPT_KEY), owner(EVERYSEC_KEY), owner(FILL_KEY), owner(GROUP_KEY));
+        let clock = VirtualClock::new(MILLI);
+        if everysec_armed {
+            let now = clock.now();
+            set.arm(&everysec, now + SECOND, now).expect("armed");
+        }
+        LoopSetCell {
+            set,
+            everysec,
+            fill,
+            sched: GroupScheduler::m0_default(),
+            fill_episode: None,
+            group_episode: None,
+            clock,
+            delivered: 0,
+            _census: census,
+        }
+    }
+}
+
+/// Step 1's timers on the set, as `reactor.rs` writes them: the allowance
+/// from the Maintenance budget, then each due arm begun, answered by the
+/// callback (the everysec route hands back its successor a second on, as
+/// the plane does) and consumed, while the allowance lasts.
+#[inline(always)]
+fn deliver_set(cell: &mut LoopSetCell, now: Nanos) -> u64 {
+    let mut left = TIMER_DELIVERIES_PER_TURN.min(cell.sched.budget(GroupClass::Maintenance));
+    let mut take = || match left.checked_sub(1) {
+        Some(rest) => {
+            left = rest;
+            true
+        }
+        None => false,
+    };
+    let mut effect = 0u64;
+    while cell.set.due(now) && take() {
+        let Some(notice) = cell.set.begin(now) else { break };
+        cell.sched.charge(GroupClass::Maintenance, 1);
+        effect = effect.wrapping_add(on_timer(notice.route()));
+        let outcome = if notice.route() == EVERYSEC_KEY {
+            TimerOutcome::Successor(cell.set.successor(&notice, now + SECOND, now).expect("next"))
+        } else {
+            TimerOutcome::Complete
+        };
+        if cell.set.consume(&notice, outcome) == Consumed::Stale {
+            effect += 1;
+        }
+        cell.delivered += 1;
+    }
+    effect
+}
+
+#[inline(never)]
+fn step_set_idle(cell: &mut LoopSetCell) -> u64 {
+    cell.clock.advance(MICRO);
+    let now = cell.clock.now();
+    deliver_set(cell, now)
+}
+
+/// The park decision's timer half, as `reactor.rs` writes it: one clock
+/// read with a timer armed, the due check from it, and the timeout from the
+/// same read.
+#[inline(never)]
+fn step_set_park(cell: &mut LoopSetCell) -> u64 {
+    let now = (cell.set.armed() > 0).then(|| cell.clock.now());
+    if now.is_some_and(|now| cell.set.due(now)) {
+        return 0;
+    }
+    let timeout = now.zip(cell.set.next_deadline()).map(|(now, d)| d.saturating_sub(now));
+    timeout.map_or(PARK_DEFAULT, |t| t.min(PARK_DEFAULT)).0
+}
+
+/// One hold episode, as the durable cell opens and ends it: the fill
+/// owner armed one window out, the episode kept; then the issue's cancel of
+/// both policies' episodes.
+#[inline(never)]
+fn step_set_hold(cell: &mut LoopSetCell) -> u64 {
+    let since = cell.clock.now();
+    let deadline = since.saturating_add(HOLD_WINDOW);
+    let arm = cell.set.arm(&cell.fill, deadline, since).ok();
+    cell.fill_episode = arm.map(|arm| Episode { _since: since, arm });
+    let ended = [cell.fill_episode.take(), cell.group_episode.take()];
+    let mut effect = 0u64;
+    for episode in ended.into_iter().flatten() {
+        effect += match cell.set.cancel(&episode.arm) {
+            Cancelled::Removed => 1,
+            Cancelled::NotArmed => 2,
+            Cancelled::InCallback | Cancelled::Stale => 3,
+        };
+    }
+    effect
+}
+
+/// Drives `ops` ops of a judged B leg with `NOPS` planted per op.
+#[inline(never)]
+fn drive_loop_set<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
+    let mut cell = LoopSetCell::new(!matches!(leg, Leg::SetIdle));
+    let cell = black_box(&mut cell);
+    let mut accumulator = 0u64;
+    for _ in 0..ops {
+        plant::<NOPS>();
+        let effect = match leg {
+            Leg::SetIdle | Leg::SetOneOut => step_set_idle(cell),
+            Leg::SetPark => step_set_park(cell),
+            Leg::SetHold => step_set_hold(cell),
+            Leg::Idle | Leg::OneOut | Leg::Park | Leg::Hold | Leg::Cohort | Leg::SetCohort => {
+                unreachable!("a judged B leg drives its own cell")
+            }
+        };
+        accumulator = accumulator.wrapping_add(effect);
+    }
+    // Engagement, after the counted loop: the everysec owner armed on every
+    // leg but the idle one, the one-out leg delivered its tick once a
+    // simulated second, and the hold leg armed its episodes.
+    let expected = u32::from(!matches!(leg, Leg::SetIdle));
+    assert_eq!(cell.set.armed(), expected, "the leg's timers armed after its ops");
+    assert_eq!(cell.set.phase(&cell.everysec) == inf_runtime::OwnerPhase::Armed, expected == 1);
+    if matches!(leg, Leg::SetOneOut) {
+        assert_eq!(cell.delivered, ops / 1_000_000, "the tick delivered once a second");
+    }
+    if ops > 0 && matches!(leg, Leg::SetHold) {
+        assert!(cell.set.armed_max() > expected, "the leg armed its episodes");
+    }
+    accumulator.wrapping_add(u64::from(cell.set.armed_max())).wrapping_add(cell.delivered)
+}
+
 /// The B side's cell: its set, the owners reserved before the loop, the
 /// arms of one cohort, and its injected clock.
 struct SetCell {
@@ -394,7 +586,12 @@ fn drive<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
             Leg::Idle | Leg::OneOut => step_idle(cell),
             Leg::Park => step_park(cell),
             Leg::Hold => step_hold(cell),
-            Leg::Cohort | Leg::SetCohort => unreachable!("a cohort leg drives its own cell"),
+            Leg::Cohort
+            | Leg::SetIdle
+            | Leg::SetOneOut
+            | Leg::SetPark
+            | Leg::SetHold
+            | Leg::SetCohort => unreachable!("a cohort or B leg drives its own cell"),
         };
         accumulator = accumulator.wrapping_add(effect);
     }
@@ -402,7 +599,13 @@ fn drive<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
     // drove, so a leg that armed or delivered nothing reads red here.
     let armed = cell.wheel.armed();
     let expected = match leg {
-        Leg::Idle | Leg::Cohort | Leg::SetCohort => 0,
+        Leg::Idle
+        | Leg::Cohort
+        | Leg::SetIdle
+        | Leg::SetOneOut
+        | Leg::SetPark
+        | Leg::SetHold
+        | Leg::SetCohort => 0,
         Leg::OneOut | Leg::Park | Leg::Hold => 1,
     };
     assert_eq!(armed, expected, "the leg's timers armed after its ops");
@@ -425,6 +628,12 @@ fn main() -> ExitCode {
         (Leg::Cohort, _) => drive_cohort::<1>(args.ops, args.owners),
         (Leg::SetCohort, 0) => drive_set::<0>(args.ops, args.owners),
         (Leg::SetCohort, _) => drive_set::<1>(args.ops, args.owners),
+        (Leg::SetIdle | Leg::SetOneOut | Leg::SetPark | Leg::SetHold, 0) => {
+            drive_loop_set::<0>(args.leg, args.ops)
+        }
+        (Leg::SetIdle | Leg::SetOneOut | Leg::SetPark | Leg::SetHold, _) => {
+            drive_loop_set::<1>(args.leg, args.ops)
+        }
         (_, 0) => drive::<0>(args.leg, args.ops),
         (_, _) => drive::<1>(args.leg, args.ops),
     };
