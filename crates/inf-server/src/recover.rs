@@ -1380,6 +1380,14 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             )));
         }
         for tier in &mut self.recovering_tiers.tiers {
+            // A record left waiting for room was passed unapplied: a typed
+            // refusal, a defect class no input reaches (ADR-0174 A1).
+            if tier.replay.waits_for_room() {
+                return Err(io_msg(format!(
+                    "tiered ns {}: RoomMoved: replay ended with a record waiting for room",
+                    tier.ns.0
+                )));
+            }
             if let Some(table) = ks.tiered_store(tier.ns) {
                 tier.replay.end_of_replay(table);
             }

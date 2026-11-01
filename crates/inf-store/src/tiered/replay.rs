@@ -471,6 +471,15 @@ impl<F: SegmentFs> TierReplay<F> {
         }
     }
 
+    /// Whether a record is waiting for room: a demote step is under way, or
+    /// made the room and the record is not placed yet. Never at the end of
+    /// replay — every record a walk presents is applied before the walk
+    /// moves on.
+    #[must_use]
+    pub fn waits_for_room(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// The machine's phase.
     #[must_use]
     pub fn phase(&self) -> ReplayPhase {
