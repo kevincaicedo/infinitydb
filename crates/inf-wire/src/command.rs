@@ -383,16 +383,13 @@ const BUCKET_BITS: u32 = 9;
 const BUCKETS: usize = 1 << BUCKET_BITS;
 /// Longest command name in the registry (verified in `build_table`).
 const MAX_NAME_LEN: usize = 16;
-/// Multiply-mix constants found offline over the packed name word pairs; the
-/// const builder below proves them collision-free at compile time, so a new
-/// command that breaks them fails the build (re-search the constants then —
-/// `(w0·M1 ^ w1·M2) >> (64 − BUCKET_BITS)` over random odd pairs; the M1-E5
-/// pub/sub growth to 64 names re-searched in ~1k attempts; the M2-S20 growth
-/// to 68 in ~9k; the M3-S11 `JSON.*` growth to 80 in ~936k at 256 buckets —
-/// exhausted, as that entry recorded; the M3-S13/S14 growth to 89 bumped
-/// `BUCKET_BITS` to 9 (ADR-0042 D7 — the table is cold 8 KiB; probe count
-/// unchanged); M3-S19's 90th row re-searched in 1,619 deterministic
-/// splitmix attempts).
+/// Multiply-mix constants found offline over the registry's hash words: a
+/// name's bucket is `(w0·M1 ^ w1·M2) >> (64 − BUCKET_BITS)`, and the const
+/// builder below proves the pair collision-free at compile time, so a new
+/// command that collides fails the build. Then re-search the pair over odd
+/// constants from a seeded generator, so the search repeats; when a search
+/// is exhausted, raise `BUCKET_BITS` (ADR-0042 D7), which doubles the table
+/// (`BUCKETS` entries of one `Bucket` each) and keeps one probe per lookup.
 const HASH_MULTIPLIER_LO: u64 = 0x4C19_0974_F5FB_1CA9;
 const HASH_MULTIPLIER_HI: u64 = 0x0AD3_0175_CBB3_C0C5;
 /// The hash's case fold: bit 5 cleared in every byte (`a-z` → `A-Z`), so
