@@ -486,6 +486,10 @@ pub struct DurableStats {
     /// Everysec ticks the ledger counted idle (nothing dirty, nothing
     /// staged): the DST's tick-contract oracle (F-L01-01, batch 42).
     pub everysec_idle_ticks: u64,
+    /// Everysec ticks the ledger counted covered, cell scope: every queued
+    /// byte already under an entry in flight, nothing staged (ADR-0199
+    /// D2.2). The DST reads it as the reach of a stop over such an entry.
+    pub everysec_covered_ticks: u64,
     /// Frames queued and not yet fsync-covered in the ack map, and the
     /// ledger's unfolded entries: the map is bounded by the reorder
     /// window plus the entries plus one (F-L01-03, batch 42).
@@ -1496,17 +1500,21 @@ impl<F: SegmentFs> DurableCell<F> {
         cx.timers.insert(cx.now + Nanos::from_secs(1), EVERYSEC_TIMER_KEY);
     }
 
-    /// The stop drain's final sync (ADR-0124 D2 step 4): the everysec
-    /// tick's ledger rule now, without waiting for the wheel — a dirty
-    /// ledger seals its frame and issues the barrier at the next LOG
-    /// step; a clean one is free (counted idle).
+    /// The stop drain's final sync (ADR-0199 D3): the everysec tick's
+    /// ledger rule now, without waiting for the wheel. Queued bytes above
+    /// the coverage tail, or a staged record, make a due the next LOG step
+    /// issues (the held frame's barrier or a standalone fdatasync); a ledger
+    /// whose every queued byte is under an entry in flight owes nothing new,
+    /// and that entry is the final sync; a clean one is free (counted idle).
     pub fn request_final_sync(&mut self) {
         self.commit.note_everysec_tick();
     }
 
-    /// Nothing durable is in motion: no record staged, no frame in
-    /// flight, no fsync pending, no sync owed, no checkpoint or MANIFEST
-    /// transition open. The stop drain's exit condition (ADR-0124 D2).
+    /// Nothing durable is in motion: nothing staged, no frame in flight, no
+    /// fsync pending, no barrier owed (the ledger's coverage target, ADR-0199
+    /// D1), no checkpoint or MANIFEST transition open. The stop drain's exit
+    /// condition (ADR-0199 D3): on a quiet cell these hold together once its
+    /// last entry completes.
     pub fn quiescent(&self) -> bool {
         self.staging.is_empty()
             && self.staging.drained()
@@ -1690,6 +1698,7 @@ impl<F: SegmentFs> DurableCell<F> {
             frames_in_flight_now: u64::from(self.staging.in_flight()),
             records_staged: u64::from(self.staging.pending_records()),
             everysec_idle_ticks: self.commit.stats().idle_ticks,
+            everysec_covered_ticks: self.commit.stats().covered_ticks,
             frames_awaiting_watermark: self.ack_map.len() as u64,
             fsync_entries: self.commit.pending_entries() as u64,
             write_through_entries: self.commit.write_through_entries() as u64,

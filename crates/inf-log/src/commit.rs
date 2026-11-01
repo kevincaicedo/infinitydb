@@ -12,7 +12,7 @@
 //! Choreography per iteration:
 //!
 //! ```text
-//! EXECUTE   stage(effect) → note_staged(class)         (always ⇒ sync due)
+//! EXECUTE   stage(effect) → note_staged(class)         (always ⇒ its frame owes a barrier)
 //! on_timer  note_everysec_tick()                       (injected wheel, L7)
 //! LOG       staging.can_seal()?
 //!             ├─ frame_plan(..) → Wait(hold)? hold the frame; else Seal(plan)
@@ -58,6 +58,16 @@
 //! segment vs linked fsync on the new); ledger entries are
 //! submission-ordered with monotone coverage, and the watermark advances to
 //! the covers value of the longest **done prefix**.
+//!
+//! **The due is a coverage target (ADR-0199).** What a barrier owes is a
+//! byte offset, `through`: every queued byte below it is owed coverage. A
+//! due exists while that offset is above the coverage tail (the newest
+//! unfolded entry's covers value, else the durable bytes) or while the frame
+//! that seals the staged records owes a barrier, a fact that exists only
+//! beside a staged record. Nothing stores "due", so no event has to clear
+//! it: the registration whose coverage reaches the target discharges it,
+//! and a tick over a ledger whose every queued byte is already under an
+//! entry in flight owes nothing (that entry is its barrier).
 //!
 //! **Write-through frames** (M4.5-S34, ADR-0086 D5): on a pre-zeroed
 //! `O_DIRECT` segment an `always`-due frame is written `RWF_DSYNC` and is
@@ -485,6 +495,10 @@ pub struct CommitStats {
     pub fsyncs_completed: u64,
     /// everysec ticks that found nothing dirty (proves idle ticks are free).
     pub idle_ticks: u64,
+    /// everysec ticks over a dirty ledger whose every queued byte is already
+    /// under the coverage tail, with nothing staged: an entry in flight is
+    /// the tick's barrier (ADR-0199 D2.2). Per cell.
+    pub covered_ticks: u64,
 }
 
 /// A file handle the ledger keeps alive until its fsync completes.
@@ -539,25 +553,96 @@ struct PendingFsync<File> {
     held: HeldHandle<File>,
 }
 
+/// What a barrier owes (ADR-0199 D1): every queued ledger byte below
+/// `through`, and whatever the staged records' frame owes. A due is this
+/// against the coverage tail ([`GroupCommit::sync_due`]); every combination
+/// of the two fields is legal, and nothing here says "due" for a clearer to
+/// forget.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct Owed {
+    /// Ledger bytes, lifetime-cumulative like `queued_bytes` and never above
+    /// it: raised by a tick over a dirty ledger to every byte queued, and by
+    /// a frame queued while a due exists to the frame's end.
+    through: u64,
+    unqueued: unqueued::Unqueued,
+}
+
+/// The records staged since the last frame queued, in one byte: an
+/// `everysec` record, an `always` record, and that the frame which seals
+/// them owes a barrier. The field is private to this module, so the owing
+/// exists only beside a staged record: staging an `always` record sets both,
+/// a due sets the owing only over a staged `everysec` record, and the one
+/// call that queues the frame clears all three. Staging an `everysec`
+/// record is one OR, the cost of the store it replaced.
+mod unqueued {
+    const EVERYSEC: u8 = 1 << 0;
+    const ALWAYS: u8 = 1 << 1;
+    const FRAME_OWES: u8 = 1 << 2;
+
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub(super) struct Unqueued(u8);
+
+    impl Unqueued {
+        /// An `everysec` record staged: it rides the tick.
+        pub(super) fn stage_everysec(&mut self) {
+            self.0 |= EVERYSEC;
+        }
+
+        /// An `always` record staged: its acknowledgment waits on the
+        /// barrier of the frame that carries it.
+        pub(super) fn stage_always(&mut self) {
+            self.0 |= ALWAYS | FRAME_OWES;
+        }
+
+        /// A due exists over the staged records: their frame owes its
+        /// barrier when an `everysec` record is among them.
+        pub(super) fn owe_frame(&mut self) {
+            if self.0 & EVERYSEC != 0 {
+                self.0 |= FRAME_OWES;
+            }
+        }
+
+        /// The frame that absorbs every staged record was queued: all three
+        /// facts go with it. Whether an `always` record rode it.
+        pub(super) fn take(&mut self) -> bool {
+            let always = self.0 & ALWAYS != 0;
+            self.0 = 0;
+            always
+        }
+
+        /// A record is staged.
+        pub(super) fn any(self) -> bool {
+            self.0 != 0
+        }
+
+        /// An `always` record is staged.
+        pub(super) fn always(self) -> bool {
+            self.0 & ALWAYS != 0
+        }
+
+        /// The frame that seals the staged records owes a barrier.
+        pub(super) fn frame_owes(self) -> bool {
+            self.0 & FRAME_OWES != 0
+        }
+    }
+}
+
 /// The group-commit engine of one cell. Single-threaded by design (L1);
 /// time is injected (`now` parameters — L7); generic over the segment-file
 /// tier only to hold [`SealHandoff`]s until their sync completes.
 pub struct GroupCommit<File> {
-    /// An fsync is due this iteration (everysec tick fired, or `always`
-    /// traffic staged). Cleared by the registration that covers it.
-    sync_due: bool,
-    always_pending: bool,
-    /// An `always` record was staged after the last frame queued — it
-    /// still sits in the staging ring, so no standalone sync can cover it
-    /// yet (M2.5-S07 completion-issue discharge check).
-    always_unqueued: bool,
-    /// An `everysec` record was staged after the last frame queued: the
-    /// ledger is byte-clean but the cell is not idle — a
-    /// tick over it owes the held frame its barrier, and a sync settling
-    /// at `written_up_to` cannot discharge it.
-    everysec_unqueued: bool,
+    /// What a barrier owes; [`sync_due`](Self::sync_due) compares it with
+    /// the coverage tail.
+    owed: Owed,
+    /// The coverage tail, the last pair a registration entered (or the
+    /// start): written only by `push_pending`, read by `coverage_tail()`,
+    /// which checks it against the ledger's back in debug builds. Covers
+    /// values are monotone and the fold leaves the folded entry's value in
+    /// the durable pair, so the stored value is the derived one.
+    tail: (Lsn, u64),
     /// Exclusive end of the last queued frame carrying `always` records:
-    /// a standalone covering ≥ this discharges `always_pending`.
+    /// an `always` record is still owed while it is above the coverage
+    /// tail.
     always_queued_up_to: Option<Lsn>,
     /// FLUSH-class durability syncs allowed in flight at once (ADR-0022
     /// D3): 1 = the shipped discipline; 2 = the measured two-in-flight
@@ -612,10 +697,8 @@ pub struct GroupCommit<File> {
 impl<File> fmt::Debug for GroupCommit<File> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GroupCommit")
-            .field("sync_due", &self.sync_due)
-            .field("always_pending", &self.always_pending)
-            .field("always_unqueued", &self.always_unqueued)
-            .field("everysec_unqueued", &self.everysec_unqueued)
+            .field("owed", &self.owed)
+            .field("tail", &self.tail)
             .field("queued_up_to", &self.queued_up_to)
             .field("written_up_to", &self.written_up_to)
             .field("durable_up_to", &self.durable_up_to)
@@ -666,10 +749,8 @@ impl<File: SegmentFile> GroupCommit<File> {
         let pending = CappedDeque::new(FSYNC_LEDGER, census)
             .unwrap_or_else(|refused| panic!("the fsync ledger refused: {refused}"));
         GroupCommit {
-            sync_due: false,
-            always_pending: false,
-            always_unqueued: false,
-            everysec_unqueued: false,
+            owed: Owed::default(),
+            tail: (Lsn::new(crate::lsn::SegmentId(0), 0), 0),
             always_queued_up_to: None,
             flush_bound: bound,
             flush_in_flight: 0,
@@ -695,35 +776,44 @@ impl<File: SegmentFile> GroupCommit<File> {
 
     // ---- EXECUTE / timer inputs --------------------------------------------
 
-    /// A durable effect was staged. `Always` traffic makes this iteration's
-    /// frame carry a linked fsync (the ack gates on it); `Everysec` records
-    /// ride the timer — the fast path pays nothing extra here.
+    /// A durable effect was staged. `Always` traffic makes the frame that
+    /// carries it owe a barrier (the ack gates on it); `Everysec` records
+    /// ride the timer — the fast path pays one OR here.
     pub fn note_staged(&mut self, class: FsyncClass) {
         match class {
-            FsyncClass::Always => {
-                self.always_pending = true;
-                self.always_unqueued = true;
-                self.sync_due = true;
-            }
-            FsyncClass::Everysec => self.everysec_unqueued = true,
+            FsyncClass::Always => self.owed.unqueued.stage_always(),
+            FsyncClass::Everysec => self.owed.unqueued.stage_everysec(),
         }
     }
 
-    /// The everysec timer fired (plane-armed on the injected wheel — L7).
-    /// Idle ticks (nothing dirty, nothing pending it, nothing staged) are
-    /// counted and cost nothing. Staged-but-unsealed records are dirty
-    /// (F-L01-01): the tick's promise is every record staged before it,
-    /// and a held frame (fill, group hold, extent barrier) leaves the
-    /// byte counters clean while acked records wait in the builder.
+    /// The everysec timer fired (plane-armed on the injected wheel — L7),
+    /// or the stop's final-sync request runs its rule (ADR-0199 D2.2, D3).
+    /// The tick's promise is every byte queued and every record staged
+    /// before it: a held frame (fill, group hold, extent barrier) leaves the
+    /// byte counters clean while acked records wait in the builder, so a
+    /// staged record is dirty. A clean tick (nothing dirty, nothing staged)
+    /// is idle and free. A dirty tick owes every queued byte; a tick whose
+    /// every queued byte is already under the coverage tail, with nothing
+    /// staged, owes nothing (the entry in flight is its barrier) and is
+    /// counted covered.
     pub fn note_everysec_tick(&mut self) {
-        if self.queued_bytes == self.durable_bytes
-            && !self.always_pending
-            && !self.everysec_unqueued
-        {
+        if self.queued_bytes == self.durable_bytes && !self.owed.unqueued.any() {
             self.stats.idle_ticks += 1;
             return;
         }
-        self.sync_due = true;
+        self.owed.through = self.queued_bytes;
+        self.owed.unqueued.owe_frame();
+        if !self.sync_due() {
+            // Counted before the plant strands the due, so the stop's reach
+            // reads the shape and the liveness oracle reads the red.
+            self.stats.covered_ticks += 1;
+            // Canary: a covered tick owes one byte past the queue, the
+            // stranded due only a later frame clears.
+            #[cfg(inf_canary_due_outlives_coverage)]
+            {
+                self.owed.through = self.queued_bytes + 1;
+            }
+        }
     }
 
     // ---- LOG-step decisions ------------------------------------------------
@@ -749,11 +839,22 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.flush_in_flight
     }
 
-    /// Is a sync owed right now (everysec tick fired or `always` traffic
-    /// staged and not yet discharged)?
+    /// Is a barrier owed right now (ADR-0199 D1)? While the frame that seals
+    /// the staged records owes one, or the target is above the coverage
+    /// tail: no due outlives the barrier that covers it.
     #[must_use]
     pub fn sync_due(&self) -> bool {
-        self.sync_due
+        // The target is assigned from `queued_bytes` or a queued frame's end,
+        // which becomes it. The plant owes one byte past the queue on purpose.
+        #[cfg(not(inf_canary_due_outlives_coverage))]
+        debug_assert!(self.owed.through <= self.queued_bytes, "the target is queued");
+        // Canary: the target read as covered while any entry is unfolded, the
+        // over-discharge a weaker fix makes.
+        #[cfg(inf_canary_due_covered_by_any_entry)]
+        if !self.pending.is_empty() {
+            return self.owed.unqueued.frame_owes();
+        }
+        self.owed.unqueued.frame_owes() || self.owed.through > self.coverage_tail().1
     }
 
     /// True when no queued frame is still awaiting `LogWritten` — the
@@ -796,7 +897,7 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// (ADR-0087 D3; at K = 1 implied by `can_seal`). Call before the seal.
     #[must_use]
     pub fn frame_fsync_due(&self) -> bool {
-        self.sync_due
+        self.sync_due()
             && self.drained()
             && self.syncs_in_flight() < self.flush_bound
             && self.class_has_room(LedgerClass::Discretionary)
@@ -814,7 +915,7 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// pure-`always` cell pipeline K deep. Call before the seal.
     #[must_use]
     pub fn write_through_due(&self) -> bool {
-        self.sync_due && self.coverage_tail().1 == self.queued_bytes
+        self.sync_due() && self.coverage_tail().1 == self.queued_bytes
     }
 
     /// The barrier the next frame may carry, or the hold and its reason
@@ -845,7 +946,7 @@ impl<File: SegmentFile> GroupCommit<File> {
         if seal_ahead && !self.class_has_room(LedgerClass::Seal) {
             return FramePlan::Wait(Hold::SealUnfolded);
         }
-        if !self.sync_due {
+        if !self.sync_due() {
             return FramePlan::Seal(SealPlan::Plain);
         }
         if write_through_ok
@@ -879,7 +980,7 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// *written* bytes not already covered by a pending sync)?
     #[must_use]
     pub fn standalone_fsync_due(&self) -> bool {
-        self.sync_due
+        self.sync_due()
             && self.syncs_in_flight() < self.flush_bound
             && self.class_has_room(LedgerClass::Discretionary)
             && self.written_bytes > self.durable_bytes
@@ -896,7 +997,7 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// at its budget leaves the due for a later barrier.
     #[must_use]
     pub fn completion_fsync_due(&self) -> bool {
-        self.sync_due
+        self.sync_due()
             && self.flush_bound > 1
             && self.syncs_in_flight() < self.flush_bound - 1
             && self.class_has_room(LedgerClass::Discretionary)
@@ -905,35 +1006,35 @@ impl<File: SegmentFile> GroupCommit<File> {
             && self.pending.back().is_none_or(|p| p.covers_bytes < self.written_bytes)
     }
 
-    /// A sync covering `written_up_to` is being registered: settle what
-    /// it discharges. The `always` half survives unless every owed record
-    /// is inside the covered range (M2.5-S07). The `everysec` half
-    /// survives while a queued frame is still in flight **outside** the
-    /// coverage (ADR-0013 D3 as amended, 2026-08-22): the tick's promise
-    /// is every record staged before it, and a frame landing after this
-    /// sync would otherwise wait for the *next* tick — a ~2 s loss window
-    /// the `m2-reorder-window` sweep found (seed `0x2e0d0179`: one plain
-    /// write in flight at the tick, its frame acked 1.11 s before the
-    /// cut, lost). Kept due, the next LOG step drains and covers it: a
-    /// linked sync on the next frame or another standalone once the
-    /// write lands — one write latency, once per tick, never a spin
-    /// (`standalone_fsync_due` needs new written bytes).
-    fn settle_due_at_written(&mut self) {
-        let always_owed = self.always_pending && !self.always_discharged_at_written();
-        let in_flight_uncovered = self.written_bytes < self.queued_bytes;
-        // Records still in the builder sit outside any written coverage
-        // (F-L01-01): the due stays for the frame that seals them.
-        self.sync_due = always_owed || in_flight_uncovered || self.everysec_unqueued;
-        self.always_pending = always_owed;
+    /// A standalone, completion-issued or seal registration was entered
+    /// with a due `outstanding` before it (ADR-0199 D2.3): the frame that
+    /// seals the staged records owes the barrier, since records in the
+    /// builder sit outside any coverage. The bytes need nothing here: a
+    /// registration covering less than the target (a queued frame still in
+    /// flight outside a standalone's written coverage) leaves the due owed,
+    /// and the next LOG step drains and covers it, a linked sync on the next
+    /// frame or another standalone once the write lands, one write latency
+    /// and never a spin (`standalone_fsync_due` needs new written bytes).
+    fn settle_after(&mut self, outstanding: bool) {
+        if outstanding {
+            self.owed.unqueued.owe_frame();
+        }
+    }
+
+    /// An `always` record is still owed: one is staged, or the last frame
+    /// carrying one ends above the coverage tail.
+    fn always_owed(&self) -> bool {
+        self.owed.unqueued.always()
+            || self.always_queued_up_to.is_some_and(|end| end > self.coverage_tail().0)
     }
 
     /// Every owed `always` record sits in a written frame — a standalone
     /// covering `written_up_to` fully discharges the due.
     fn always_discharged_at_written(&self) -> bool {
-        if !self.always_pending {
+        if !self.always_owed() {
             return true;
         }
-        !self.always_unqueued
+        !self.owed.unqueued.always()
             && self
                 .always_queued_up_to
                 .is_some_and(|end| self.written_up_to.is_some_and(|written| end <= written))
@@ -951,13 +1052,16 @@ impl<File: SegmentFile> GroupCommit<File> {
         assert!(self.drained(), "deferred seal with a frame write in flight — rotation drains");
         let covers_up_to = Lsn::new(handoff.segment(), handoff.end_offset());
         self.stats.fsyncs_seal += 1;
-        self.push_pending(
+        let outstanding = self.sync_due();
+        let ticket = self.push_pending(
             covers_up_to,
             self.queued_bytes,
             now,
             SyncReason::Seal,
             HeldHandle::Seal(handoff),
-        )
+        );
+        self.settle_after(outstanding);
+        ticket
     }
 
     /// Register one boot-metadata barrier (M2.5-S01): a driver-ridden
@@ -1100,8 +1204,19 @@ impl<File: SegmentFile> GroupCommit<File> {
     }
 
     /// The ledger's current coverage tail — what a coverage-neutral
-    /// barrier registers at.
+    /// barrier registers at, and what the due compares its target with.
     fn coverage_tail(&self) -> (Lsn, u64) {
+        debug_assert_eq!(
+            self.tail,
+            self.coverage_tail_derived(),
+            "the stored tail is the ledger's"
+        );
+        self.tail
+    }
+
+    /// The tail from the ledger itself: the newest unfolded entry's covers
+    /// pair, else the durable pair.
+    fn coverage_tail_derived(&self) -> (Lsn, u64) {
         self.pending.back().map_or_else(
             || {
                 (
@@ -1154,7 +1269,9 @@ impl<File: SegmentFile> GroupCommit<File> {
         let end_bytes = self.queued_bytes + u64::from(frame_len);
         // Every check of the ledger runs before either publication; only
         // the queue's `Full` arm follows, a fail-stop `frame_plan`'s
-        // admission keeps unreachable.
+        // admission keeps unreachable. The due is read before the barrier
+        // registers: a due that existed extends over this frame.
+        let outstanding = self.sync_due();
         let barrier = self.frame_barrier(plan, end, end_bytes, now);
         let id = FrameId(self.next_frame_id + 1);
         let Reserved::Slot(slot) = self.queued.reserve() else {
@@ -1173,19 +1290,22 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.stats.frames_queued += 1;
         self.stats.frame_bytes_queued += u64::from(frame_len);
         // The seal drains the whole staging builder, so every record
-        // staged before this LOG step now rides this frame.
-        if self.always_unqueued {
+        // staged before this LOG step now rides this frame, and the frame's
+        // owing goes with them. A due that existed extends over the frame
+        // (ADR-0199 D2.3); its barrier, if any, covers the frame's end.
+        if self.owed.unqueued.take() {
             self.always_queued_up_to = Some(end);
-            self.always_unqueued = false;
         }
-        self.everysec_unqueued = false;
+        if outstanding {
+            self.owed.through = end_bytes;
+        }
         FrameQueued { id, barrier }
     }
 
     /// The barrier `plan` gives the frame ending at `end`: its precondition
     /// read before anything moves, then its ledger entry, covering the
     /// frame's own end. The frame absorbs every staged record, so its
-    /// barrier discharges the whole due (group commit). The two
+    /// barrier covers the whole due (group commit). The two
     /// preconditions are claims about the plan: `frame_plan` answers a
     /// linked fdatasync only when `drained()` and write-through only under
     /// the prefix rule, in the same LOG step as the queueing.
@@ -1220,8 +1340,6 @@ impl<File: SegmentFile> GroupCommit<File> {
                 FrameSync::WriteThrough
             }
         };
-        self.sync_due = false;
-        self.always_pending = false;
         sync.barrier(self.push_pending(end, end_bytes, now, sync.reason(), HeldHandle::None))
     }
 
@@ -1233,18 +1351,19 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// [`standalone_fsync_due`](Self::standalone_fsync_due).
     pub fn register_standalone_fsync(&mut self, now: Nanos) -> FsyncTicket {
         let covers_up_to = self.written_up_to.expect("standalone fsync with nothing written");
-        // The always due survives unless everything owed is inside the
-        // covered range (M2.5-S07 made this exact; the pre-S07 shape kept
-        // the due whenever always traffic was pending).
-        self.settle_due_at_written();
+        // The due survives unless its target is inside the covered range and
+        // no staged record is owed (ADR-0199 D2.3, D2.4).
+        let outstanding = self.sync_due();
         self.stats.fsyncs_standalone += 1;
-        self.push_pending(
+        let ticket = self.push_pending(
             covers_up_to,
             self.written_bytes,
             now,
             SyncReason::Standalone,
             HeldHandle::None,
-        )
+        );
+        self.settle_after(outstanding);
+        ticket
     }
 
     /// The completion-CQE-issued sync (M2.5-S07): covers what has
@@ -1257,15 +1376,17 @@ impl<File: SegmentFile> GroupCommit<File> {
     pub fn register_completion_fsync(&mut self, now: Nanos) -> FsyncTicket {
         let covers_up_to = self.written_up_to.expect("completion fsync with nothing written");
         debug_assert!(self.always_discharged_at_written());
-        self.settle_due_at_written();
+        let outstanding = self.sync_due();
         self.stats.fsyncs_completion += 1;
-        self.push_pending(
+        let ticket = self.push_pending(
             covers_up_to,
             self.written_bytes,
             now,
             SyncReason::Completion,
             HeldHandle::None,
-        )
+        );
+        self.settle_after(outstanding);
+        ticket
     }
 
     /// An entry of `class` was registered: its count rises (the extent
@@ -1346,6 +1467,7 @@ impl<File: SegmentFile> GroupCommit<File> {
             // cap, so the ledger has room.
             panic!("a ledger entry past the ledger's cap");
         };
+        self.tail = (covers_up_to, covers_bytes);
         slot.publish(PendingFsync {
             ticket: ticket.0,
             covers_up_to,
@@ -1939,6 +2061,7 @@ mod tests {
         gc.note_staged(FsyncClass::Everysec);
         gc.note_everysec_tick();
         assert_eq!(gc.stats().idle_ticks, 0, "a tick over staged records is not idle");
+        assert_eq!(gc.stats().covered_ticks, 0, "a staged record is owed: the tick is not covered");
         assert!(gc.sync_due(), "the staged record's due survives the tick");
         assert!(!gc.standalone_fsync_due(), "nothing written: the frame carries it");
         assert_eq!(gc.frame_plan(false, false), LINKED);
@@ -1952,6 +2075,68 @@ mod tests {
         assert!(!gc.sync_due());
     }
 
+    /// ADR-0199 D2.2: a tick, or the stop's final-sync request (the same
+    /// rule), over a standalone fdatasync that already covers every queued
+    /// byte owes nothing. A due kept for it would outlive the standalone on
+    /// a quiet cell, where no frame comes to carry it, and a graceful stop's
+    /// `quiescent()` would never hold.
+    #[test]
+    fn a_tick_over_a_covering_standalone_owes_nothing() {
+        let mut gc = commit();
+        plain(&mut gc, lsn(0, 100), 100);
+        write_oldest(&mut gc);
+        gc.note_everysec_tick();
+        let t = gc.register_standalone_fsync(Nanos::ZERO);
+        assert!(!gc.sync_due(), "the standalone discharged the tick's due");
+        gc.note_everysec_tick();
+        assert_eq!(gc.stats().covered_ticks, 1);
+        assert!(!gc.sync_due(), "a due with nothing to cover outlives every barrier");
+        gc.on_fsync_complete(t, Nanos::ZERO);
+        assert_eq!(gc.pending_log_bytes(), 0, "everything queued is durable");
+        assert_eq!(gc.pending_fsyncs(), 0);
+        assert!(gc.drained());
+        assert!(!gc.standalone_fsync_due(), "nothing written past the watermark");
+        gc.note_everysec_tick();
+        assert!(!gc.sync_due(), "a clean tick owes nothing");
+        assert_eq!(gc.stats().idle_ticks, 1);
+    }
+
+    /// ADR-0199 D2.2: the same over a frame's own linked fdatasync.
+    #[test]
+    fn a_tick_over_a_covering_linked_sync_owes_nothing() {
+        let mut gc = commit();
+        gc.note_staged(FsyncClass::Everysec);
+        gc.note_everysec_tick();
+        assert_eq!(gc.frame_plan(false, false), LINKED);
+        let queued = queue(&mut gc, lsn(0, 64), 64, SealPlan::LinkedFsync);
+        let (a, t) = (queued.id, ticket(queued));
+        assert!(!gc.sync_due(), "the linked sync discharged the due");
+        gc.note_everysec_tick();
+        assert_eq!(gc.stats().covered_ticks, 1);
+        write(&mut gc, a);
+        assert_eq!(gc.on_fsync_complete(t, Nanos::ZERO), Some(lsn(0, 64)));
+        assert_eq!(gc.pending_log_bytes(), 0, "everything queued is durable");
+        assert!(!gc.standalone_fsync_due(), "nothing written past the watermark");
+        assert!(!gc.sync_due(), "a due with nothing to cover outlives every barrier");
+    }
+
+    /// ADR-0199 D2.2: the same over a write-through ticket in flight.
+    #[test]
+    fn a_tick_over_a_covering_write_through_ticket_owes_nothing() {
+        let mut gc = commit();
+        gc.note_staged(FsyncClass::Always);
+        let queued = queue(&mut gc, lsn(0, 4096), 4096, SealPlan::WriteThrough);
+        assert!(!gc.sync_due(), "the write-through ticket discharged the due");
+        gc.note_everysec_tick();
+        assert_eq!(gc.stats().covered_ticks, 1);
+        let FrameBarrier::WriteThrough(t) = write(&mut gc, queued.id) else {
+            panic!("a write-through frame carries its ticket");
+        };
+        assert_eq!(gc.on_fsync_complete(t, Nanos::ZERO), Some(lsn(0, 4096)));
+        assert_eq!(gc.pending_log_bytes(), 0, "everything queued is durable");
+        assert!(!gc.sync_due(), "a due with nothing to cover outlives every barrier");
+    }
+
     #[test]
     fn everysec_tick_is_free_when_clean_and_dedupes_against_pending() {
         let mut gc = commit();
@@ -1962,13 +2147,18 @@ mod tests {
         plain(&mut gc, lsn(0, 100), 100);
         write_oldest(&mut gc);
         gc.note_everysec_tick();
+        assert_eq!(gc.stats().covered_ticks, 0, "no entry covers the written frame yet");
         assert!(gc.standalone_fsync_due());
         let t = gc.register_standalone_fsync(Nanos::ZERO);
+        assert!(!gc.sync_due(), "the standalone covers the tick's due");
         gc.note_everysec_tick();
         assert!(!gc.standalone_fsync_due(), "pending sync already covers written bytes");
+        assert_eq!(gc.stats().covered_ticks, 1, "the pending standalone covers every queued byte");
+        assert!(!gc.sync_due(), "a tick over a covering standalone owes nothing");
         gc.on_fsync_complete(t, Nanos::ZERO);
         gc.note_everysec_tick();
         assert!(!gc.standalone_fsync_due(), "clean again");
+        assert!(!gc.sync_due(), "clean again: nothing owed");
         assert_eq!(gc.stats().idle_ticks, 2);
     }
 

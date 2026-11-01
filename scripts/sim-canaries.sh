@@ -535,6 +535,14 @@ rows=(
   # first met (4 MiB of staging beside 64 KiB segments) is built, and the
   # geometry's own oracle reads the missing refusal.
   "inf_canary_log_geometry_unchecked crate-test inf-log test:geometry segment_below_the_largest_frame_is_refused expected SegmentBelowFrame"
+  # ADR-0199 D1: the sync due is a coverage target. Planted, a tick over a
+  # covering entry, once counted covered, owes one byte past the queue: the
+  # due a flag kept, which no barrier on a quiet cell discharges.
+  "inf_canary_due_outlives_coverage crate-test inf-log lib a_tick_over_a_covering_standalone_owes_nothing a due with nothing to cover outlives every barrier"
+  # ADR-0199 D2.4: only coverage that reaches the target discharges it.
+  # Planted, the target reads covered while any entry is unfolded, so a
+  # standalone that leaves a frame in flight outside it discharges the due.
+  "inf_canary_due_covered_by_any_entry crate-test inf-log lib everysec_due_survives_a_standalone_that_leaves_a_frame_in_flight B's bytes are queued outside the coverage"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
