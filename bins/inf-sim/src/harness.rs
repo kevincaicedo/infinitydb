@@ -1891,6 +1891,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     let mut census = crate::census::CensusVerdict::default();
     for (index, (_, plane)) in cells.iter().enumerate() {
         let facts = crate::census::CellFacts {
+            server_plane: true,
             tiered_tables: plane.keyspace().tiered_tables(),
             turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
         };

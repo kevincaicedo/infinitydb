@@ -2427,7 +2427,8 @@ impl Drop for Node {
             let tiered_tables =
                 if durable.is_some() { plane.keyspace().tiered_tables() } else { 0 };
             let turn_refused = durable.map(|stats| stats.turn_refused);
-            let facts = crate::census::CellFacts { tiered_tables, turn_refused };
+            let facts =
+                crate::census::CellFacts { server_plane: true, tiered_tables, turn_refused };
             verdict.judge(index, plane.cap_census(), facts);
         }
         self.observer.2.borrow_mut().absorb(verdict);
