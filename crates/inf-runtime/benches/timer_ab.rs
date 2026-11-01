@@ -36,17 +36,23 @@
 //! loads and stores the owner's fields.
 //!
 //! The instrument: exact user-space instructions per op, `(I(n) − I(0)) / n`
-//! at `n` = 10⁷ (10² for a cohort leg), read outside this binary
-//! (`perf stat -e instructions:u`) on one pinned performance core. A run
-//! counts only when its controls, each a leg of this binary, hold:
+//! at `n` = 10⁷, read outside this binary (`perf stat -e instructions:u`) on
+//! one pinned performance core. A cohort leg is read per timer, `(I(n) −
+//! I(0)) / (n · R)` for `R` owners, at `n` = 10² for 1,024 and 20 for
+//! 65,536: two runs of a cohort leg differ by up to tens of instructions a
+//! cohort, so a plant of one a cohort is not resolved, while one a timer is,
+//! and the timer is the unit the row reports. A run counts only when its
+//! controls, each a leg of this binary, hold:
 //!
 //! - the same binary against itself: each leg run twice agrees within 0.05
-//!   per op, at a resolution of 0.01 per op at `n` = 10⁷;
-//! - liveness: each leg's `-plus-one` variant, one `nop` per op at the top
-//!   of the driving loop's body, outside the measured step, reads the leg
-//!   + 1.00, ± 0.05;
+//!   per op, or per timer for a cohort leg, at a resolution of 0.01;
+//! - liveness: each leg's `-plus-one` variant reads the leg + 1.00, ± 0.05:
+//!   one `nop` per op at the top of the driving loop's body, outside the
+//!   measured step, or for a cohort leg one per timer at the top of the
+//!   step's arm loop, which visits every owner once a cohort;
 //! - engagement: after its loop each leg asserts the timers it left armed
-//!   and, for the hold and cohort legs, that it armed its episodes.
+//!   and, for the hold and cohort legs, that it armed its episodes (a cohort
+//!   leg, its whole cohort at once).
 //!
 //! One leg, then one leg counted: `perf` wraps the binary that `--no-run`
 //! prints, never `cargo`, whose own instructions would join the count; on a
@@ -166,9 +172,9 @@ fn parse() -> Result<Args, String> {
     Ok(Args { leg, nops, ops: ops.ok_or("--ops is required")?, owners })
 }
 
-/// The plants: `NOPS` instructions per op at the top of the driving loop's
-/// body, each a `nop` with no operand, so the count must read exactly
-/// `NOPS` more.
+/// The plants: `NOPS` operand-free `nop`s at the top of a loop body that
+/// runs once per unit the leg reports (an op, or a cohort leg's timer), so
+/// the count must read exactly `NOPS` more a unit.
 #[inline(always)]
 fn plant<const NOPS: u8>() {
     // With no `nop` the leg emits no `asm!` at all.
@@ -265,11 +271,12 @@ impl CohortCell {
 }
 
 #[inline(never)]
-fn step_cohort(cohort: &mut CohortCell, owners: u32) -> u64 {
+fn step_cohort<const NOPS: u8>(cohort: &mut CohortCell, owners: u32) -> u64 {
     let cell = &mut cohort.cell;
     let now = cell.clock.now();
     cohort.ids.clear();
     for index in 0..u64::from(owners) {
+        plant::<NOPS>();
         cohort.ids.push(cell.wheel.insert(now + MILLI, COHORT_KEY_BASE + index));
     }
     let mut cancelled = 0u64;
@@ -283,15 +290,14 @@ fn step_cohort(cohort: &mut CohortCell, owners: u32) -> u64 {
     cancelled.wrapping_add(deliver(cell, deadline))
 }
 
-/// Drives `ops` wheel-cohort ops with `NOPS` planted per op.
+/// Drives `ops` wheel-cohort ops with `NOPS` planted per timer.
 #[inline(never)]
 fn drive_cohort<const NOPS: u8>(ops: u64, owners: u32) -> u64 {
     let mut cohort = CohortCell::new(owners);
     let cohort = black_box(&mut cohort);
     let mut accumulator = 0u64;
     for _ in 0..ops {
-        plant::<NOPS>();
-        accumulator = accumulator.wrapping_add(step_cohort(cohort, owners));
+        accumulator = accumulator.wrapping_add(step_cohort::<NOPS>(cohort, owners));
     }
     // Engagement, after the counted loop: every cohort held every owner
     // armed at once and left none armed.
@@ -330,10 +336,11 @@ impl SetCell {
 }
 
 #[inline(never)]
-fn step_set_cohort(cell: &mut SetCell) -> u64 {
+fn step_set_cohort<const NOPS: u8>(cell: &mut SetCell) -> u64 {
     let now = cell.clock.now();
     cell.arms.clear();
     for owner in &cell.owners {
+        plant::<NOPS>();
         cell.arms.push(cell.set.arm(owner, now + MILLI, now).expect("armed"));
     }
     let mut effect = 0u64;
@@ -353,15 +360,14 @@ fn step_set_cohort(cell: &mut SetCell) -> u64 {
     effect
 }
 
-/// Drives `ops` set-cohort ops with `NOPS` planted per op.
+/// Drives `ops` set-cohort ops with `NOPS` planted per timer.
 #[inline(never)]
 fn drive_set<const NOPS: u8>(ops: u64, owners: u32) -> u64 {
     let mut cell = SetCell::new(owners);
     let cell = black_box(&mut cell);
     let mut accumulator = 0u64;
     for _ in 0..ops {
-        plant::<NOPS>();
-        accumulator = accumulator.wrapping_add(step_set_cohort(cell));
+        accumulator = accumulator.wrapping_add(step_set_cohort::<NOPS>(cell));
     }
     // Engagement, after the counted loop: every cohort armed every owner
     // and left none armed.
