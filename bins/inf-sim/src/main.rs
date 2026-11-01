@@ -284,6 +284,7 @@ fn main() {
             | "m2-mode-transition"
             | "m2-reorder-window"
             | "m2-fill-tick"
+            | "m2-fill-dense"
             | "m2-group-hold"
             | "m2-fua-pending"
             | "m2-ledger-wedge"
@@ -1644,6 +1645,7 @@ fn run_durable(
             "m2-mode-transition" => DurableScenario::m2_mode_transition(seed),
             "m2-reorder-window" => DurableScenario::m2_reorder_window(seed),
             "m2-fill-tick" => DurableScenario::m2_fill_tick(seed),
+            "m2-fill-dense" => DurableScenario::m2_fill_tick_dense(seed),
             "m2-group-hold" => DurableScenario::m2_group_hold(seed),
             "m2-fua-pending" => DurableScenario::m2_fua_pending(seed),
             "m2-ledger-wedge" => DurableScenario::m2_ledger_wedge(
@@ -1719,6 +1721,9 @@ fn run_durable(
         print_census(report.cap_rows_checked, report.cap_rows_crossed);
         if let Some(stop) = &report.stop_tick {
             println!("inf-sim: {}", stop.describe());
+        }
+        if scenario_name == "m2-fill-dense" {
+            println!("inf-sim: {}", report.timers.describe());
         }
         if let Some(wedge) = &report.ledger_wedge {
             println!(

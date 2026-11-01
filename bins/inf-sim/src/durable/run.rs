@@ -94,6 +94,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
     };
+    let dense_leg = scenario.fill_dense;
 
     // ---- boot 1 + DDL ------------------------------------------------
     // With a prelude the first life runs in the prelude's barrier class
@@ -1004,6 +1005,13 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                     ),
                 );
             }
+        }
+    }
+    // The dense leg's timers rows: engaged, within the roles, and one
+    // armed timer between hold episodes.
+    if dense_leg {
+        for what in report.timers.dense_violations(scenario.seed) {
+            fail(&mut report, what);
         }
     }
     // Batch 42 (F-L01-01): a tick that fired over staged records and

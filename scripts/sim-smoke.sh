@@ -24,6 +24,8 @@ bin=target/release/inf-sim
 # F-L04-02 (ADR-0119): one EIO under a cold read is one typed reply.
 # F-L19-03: the m2 device/mode/window/recycle oracles and the three
 # m2 fill/hold/pending scenarios ran in no automated lane.
+# m2-fill-dense is the fill scenario's dense leg: hundreds of hold
+# episodes inside one window, and a cell's timers stay its roles' owners.
 # ADR-0174 D1: the replay-above-window seed class forced on the smoke
 # seed — a boot whose tiered replay exceeds the window demotes. D2 rule
 # 6: m4-recovery's spec-variant class, each case forced — a boot at a
@@ -57,6 +59,7 @@ rows=(
   "m2-mode-transition"
   "m2-reorder-window"
   "m2-fill-tick"
+  "m2-fill-dense"
   "m2-group-hold"
   "m2-fua-pending"
   "m2-ledger-wedge --wedge-leg main --verify-determinism"

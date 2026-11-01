@@ -17,7 +17,9 @@
 //!   fill window; the run keeps the largest rise. A dense row that rose by
 //!   fewer than 8 inside one window opened too few episodes to say
 //!   anything about their timers.
-//! - **The dense leg.** `m2-fill-tick` at steps of at most 50 µs, with 300
+//! - **The dense leg** (`m2-fill-dense`, a `sim-smoke` row, whose run
+//!   judges the three readings above). `m2-fill-tick` at steps of at most
+//!   50 µs, with 300
 //!   closed-loop everysec writers whose 700-byte values reach their cell
 //!   whole at each reap, on 4 MiB segments: they fill the 64 KiB target in
 //!   about two steps, so an episode is a hold and a seal a LOG step or two
@@ -28,6 +30,15 @@
 use inf_foundation::time::Nanos;
 
 use super::{DurableScenario, Node};
+
+/// Episodes the dense leg must begin inside one window, else the row is
+/// vacuous.
+const ENGAGED_EPISODES_MIN: u64 = 8;
+/// The positions a server cell's timers fill, one per role.
+const SERVER_TIMER_ROLES: u32 = inf_server::TimerRole::COUNT;
+/// A durable cell's timers armed between hold episodes: its everysec
+/// owner's (no accept fails on these legs).
+const UNHELD_ARMED_MAX: u32 = 1;
 
 /// What the timers' rows read over a run's traffic phase.
 #[derive(Clone, Copy, Debug, Default)]
@@ -49,6 +60,54 @@ pub(super) struct TimersOracle {
     window: Nanos,
     /// Per cell: the window's start and the cell's episode count then.
     windows: Vec<Option<(Nanos, u64)>>,
+}
+
+impl TimersReport {
+    /// The dense leg's verdict over its run: engaged, the armed peak within
+    /// the roles, and one armed timer between hold episodes.
+    pub(super) fn dense_violations(&self, seed: u64) -> Vec<String> {
+        let mut violations = Vec::new();
+        if self.fill_episodes_window_max < ENGAGED_EPISODES_MIN {
+            violations.push(format!(
+                "TIMERS VACUOUS seed {seed:#x}: {} fill episodes inside one window, want at \
+                 least {ENGAGED_EPISODES_MIN}",
+                self.fill_episodes_window_max
+            ));
+        }
+        if self.unheld_reads == 0 {
+            violations.push(format!(
+                "TIMERS VACUOUS seed {seed:#x}: no step read a cell between hold episodes"
+            ));
+        }
+        if self.armed_timers_max > SERVER_TIMER_ROLES {
+            violations.push(format!(
+                "TIMERS VIOLATION seed {seed:#x}: armed-over-roles — {} timers armed on one cell \
+                 at once, above its {SERVER_TIMER_ROLES} roles",
+                self.armed_timers_max
+            ));
+        }
+        if self.armed_unheld_max > UNHELD_ARMED_MAX {
+            violations.push(format!(
+                "TIMERS VIOLATION seed {seed:#x}: armed-unheld — {} timers armed on a cell with \
+                 no hold episode open: an issue left its arm",
+                self.armed_unheld_max
+            ));
+        }
+        violations
+    }
+
+    /// The readings, for the run's report line.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "timers: armed_timers_max {} fill_episodes_window_max {} armed_unheld_max {} \
+             unheld_reads {}",
+            self.armed_timers_max,
+            self.fill_episodes_window_max,
+            self.armed_unheld_max,
+            self.unheld_reads
+        )
+    }
 }
 
 impl TimersOracle {
@@ -121,15 +180,6 @@ mod tests {
     use super::*;
 
     const SEED: u64 = 0xC0FFEE;
-
-    /// Episodes the dense leg must begin inside one window, else the row
-    /// is vacuous.
-    const ENGAGED_EPISODES_MIN: u64 = 8;
-    /// The positions a server cell's timers fill, one per role.
-    const SERVER_TIMER_ROLES: u32 = inf_server::TimerRole::COUNT;
-    /// A durable cell's timers armed between hold episodes: its everysec
-    /// owner's (no accept fails on these legs).
-    const UNHELD_ARMED_MAX: u32 = 1;
 
     /// The dense leg's population: episodes of a hold and a seal a LOG step
     /// or two apart. A timer that outlived its episode would grow the timers

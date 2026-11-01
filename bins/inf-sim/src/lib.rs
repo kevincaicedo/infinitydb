@@ -118,6 +118,7 @@ pub const SCENARIOS: &[&str] = &[
     "m2-mode-transition",
     "m2-reorder-window",
     "m2-fill-tick",
+    "m2-fill-dense",
     "m2-group-hold",
     "m2-fua-pending",
     "m2-ledger-wedge",
