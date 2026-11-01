@@ -14,11 +14,20 @@
 //! The wheel's warm-up visits every bucket of every level twice: at level
 //! `l`, 128 singleton timers expire, spaced by the level's span of `64^l`
 //! ms of injected time, so a bucket's capacity is the warmed one before a
-//! window opens.
+//! window opens. The fixed timer set's warm-up is its build and its owners'
+//! reserves: nothing after it may request a byte. Its build is one
+//! allocation of at most 64 KiB a step, and a refusal at any step leaves
+//! nothing behind.
+
+use std::rc::Rc;
 
 use inf_alloc::CountingAllocator;
+use inf_foundation::CellId;
+use inf_foundation::bounded::{Cap, CapCensus, CapError, CapFill};
+use inf_foundation::limits::MAP_BACKING_ALLOCATION_BYTES_MAX;
 use inf_foundation::time::Nanos;
-use inf_runtime::TimerWheel;
+use inf_runtime::heap::{ArrayBuilt, FixedArray};
+use inf_runtime::{Cancelled, Consumed, Reserved, TimerOutcome, TimerOwner, TimerSet, TimerWheel};
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator::new();
@@ -28,6 +37,11 @@ const STEP: Nanos = Nanos(1_000_000);
 const KEY: u64 = 77;
 /// The census's populations.
 const COUNTS: [u32; 3] = [1, 64, 4_096];
+/// The set under census: one chunk of owners, each reserved at warm-up.
+const OWNERS: Cap = Cap::entries::<64>("census-owners", CapFill::Serving);
+/// The set whose build steps are counted: a directory of slab chunks, and
+/// heap and handle arrays of 16 chunks each.
+const BUILT: Cap = Cap::entries::<65_536>("census-built", CapFill::Serving);
 
 /// What one cycle of the census does.
 #[derive(Clone, Copy, Debug)]
@@ -135,6 +149,57 @@ impl Subject for Wheel {
     }
 }
 
+/// The fixed timer set: its census, kept so its drop frees it too, and its
+/// owners, cycled in turn.
+struct Set {
+    set: TimerSet,
+    owners: Vec<TimerOwner>,
+    next: usize,
+    _census: Rc<CapCensus>,
+}
+
+impl Subject for Set {
+    fn warmed(_now: &mut Nanos) -> Set {
+        let (census, _mark) = CapCensus::new(CellId(0));
+        let mut set = TimerSet::build(OWNERS, &census).expect("built");
+        let owners = (0..OWNERS.entries_max())
+            .map(|route| match set.reserve(u64::from(route)) {
+                Reserved::Owner(owner) => owner,
+                other => panic!("a free position: {other:?}"),
+            })
+            .collect();
+        Set { set, owners, next: 0, _census: census }
+    }
+
+    fn cycle(&mut self, mode: Mode, now: &mut Nanos) {
+        let owner = &self.owners[self.next];
+        self.next = (self.next + 1) % self.owners.len();
+        let due = *now + STEP;
+        let arm = self.set.arm(owner, due, *now).expect("armed");
+        assert_eq!(self.set.armed(), 1);
+        match mode {
+            Mode::Expire => {
+                *now = due;
+                let notice = self.set.begin(*now).expect("due at its deadline");
+                assert_eq!(notice.arm(), arm, "the timer fires once, at its deadline");
+                assert_eq!(self.set.consume(&notice, TimerOutcome::Complete), Consumed::Idle);
+            }
+            Mode::Cancel | Mode::Idle => {
+                assert_eq!(self.set.cancel(&arm), Cancelled::Removed, "the armed timer cancels");
+                if matches!(mode, Mode::Idle) {
+                    *now = due;
+                    assert!(self.set.begin(*now).is_none(), "a cancelled timer fired");
+                }
+            }
+        }
+        assert_eq!(self.set.next_deadline(), None);
+    }
+
+    fn armed(&self) -> usize {
+        self.set.armed() as usize
+    }
+}
+
 /// One census case: the warmed subject, `count` cycles of `mode` in the
 /// window, then its drop, which must free everything and request nothing.
 /// Returns the window's counters.
@@ -200,4 +265,85 @@ fn the_wheel_requests_nothing_after_its_warm_up_as_timers_are_cancelled() {
 #[ignore = "red on the wheel: a clock jump with nothing armed visits no cancelled reference"]
 fn the_wheel_requests_nothing_after_its_warm_up_across_idle_cycles() {
     census::<Wheel>("wheel", Mode::Idle);
+}
+
+#[test]
+fn the_set_requests_nothing_after_its_build_as_timers_expire() {
+    census::<Set>("set", Mode::Expire);
+}
+
+#[test]
+fn the_set_requests_nothing_after_its_build_as_timers_are_cancelled() {
+    census::<Set>("set", Mode::Cancel);
+}
+
+#[test]
+fn the_set_requests_nothing_after_its_build_across_idle_cycles() {
+    census::<Set>("set", Mode::Idle);
+}
+
+/// A 16-byte element, the heap entry's and the handle's width.
+#[derive(Clone, Copy)]
+struct Element([u64; 2]);
+
+/// The set's arrays build one allocation of at most one backing
+/// allocation's bytes a step: a directory, then its chunks.
+#[test]
+fn an_array_builds_one_allocation_of_at_most_64_kib_a_step() {
+    let mut builder = FixedArray::builder(65_536, Element([7, 9])).expect("a layout that fits");
+    let mut steps = 0u32;
+    loop {
+        let before = Counters::read();
+        let step = builder.step();
+        let grown = Counters::read().since(before);
+        steps += 1;
+        assert_eq!(grown.requests, 1, "step {steps}: one allocation");
+        assert!(
+            grown.requested_bytes <= MAP_BACKING_ALLOCATION_BYTES_MAX as u64,
+            "step {steps}: {} bytes in one allocation",
+            grown.requested_bytes
+        );
+        builder = match step {
+            ArrayBuilt::More(next) => next,
+            ArrayBuilt::Done(array) => {
+                assert_eq!(array.capacity(), 65_536);
+                assert_eq!(array.get(65_535).0, [7, 9], "every element holds the fill");
+                break;
+            }
+            ArrayBuilt::Refused(refused) => panic!("{refused}"),
+        };
+    }
+    assert_eq!(steps, 17, "a directory and 16 chunks of 4,096");
+}
+
+/// A refusal planted at each of a set's build allocations: the build
+/// answers `Alloc`, and every allocation before the refusal is freed. A
+/// refused request is counted as requested and never freed, so the window
+/// of the refusal at allocation `k + 1` frees exactly what the window of
+/// the refusal at `k` requested, the first frees nothing, and the chain
+/// closes on the whole build's request.
+#[test]
+fn a_set_refused_at_any_build_step_leaves_nothing_behind() {
+    let (census, _mark) = CapCensus::new(CellId(1));
+    let before = Counters::read();
+    let built = TimerSet::build(BUILT, &census).expect("built");
+    let build = Counters::read().since(before);
+    drop(built);
+    assert!(build.requests > 30, "the arrays' 34 steps and the slab's: {}", build.requests);
+    let mut requested_before = 0;
+    for refused_at in 0..build.requests {
+        let before = Counters::read();
+        let guard = ALLOC.refuse_after(refused_at).expect("no refusal armed");
+        let outcome = TimerSet::build(BUILT, &census).map(drop);
+        assert!(guard.was_triggered(), "allocation {refused_at} reached the allocator");
+        drop(guard);
+        assert_eq!(outcome, Err(CapError::Alloc), "refused at allocation {refused_at}");
+        let window = Counters::read().since(before);
+        assert_eq!(
+            window.freed_bytes, requested_before,
+            "refused at allocation {refused_at}: an allocation before the refusal was kept"
+        );
+        requested_before = window.requested_bytes;
+    }
+    assert_eq!(requested_before, build.requested_bytes, "the chain closes on the whole build");
 }
