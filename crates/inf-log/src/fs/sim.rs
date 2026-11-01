@@ -1003,8 +1003,16 @@ impl SimDisk {
     /// is armed and its predicate accepts a name of the fd's inode.
     #[must_use]
     pub fn sync_held(&self, fd: i32) -> bool {
+        let Some(named) = self.state.borrow().hold_syncs else { return false };
+        self.fd_named(fd, named)
+    }
+
+    /// Whether the driver file fd `fd` is open on an inode that has an OS
+    /// name `named` accepts: an op's file family, read from the model's own
+    /// descriptor table. A directory fd, or a closed one, names no file.
+    #[must_use]
+    pub fn fd_named(&self, fd: i32, named: fn(&Path) -> bool) -> bool {
         let state = self.state.borrow();
-        let Some(named) = state.hold_syncs else { return false };
         let Some(open) = file_fd_index(fd).ok().and_then(|index| state.open_files.get(&index))
         else {
             return false;
@@ -1917,6 +1925,9 @@ mod model_tests {
         assert_eq!(disk.open_files_named(is_blob), 1, "a closed handle leaves the count");
         disk.hold_syncs(None);
         assert!(!disk.sync_held(blob_fd), "the hold lifted");
+        assert!(disk.fd_named(blob_fd, is_blob), "an fd names its inode's family");
+        assert!(!disk.fd_named(seg_fd, is_blob), "and no other");
+        assert!(!disk.fd_named(-1, is_blob), "a fd the model never issued names nothing");
     }
 
     /// Perf row (L04): the determinism digest hashes the resident image
