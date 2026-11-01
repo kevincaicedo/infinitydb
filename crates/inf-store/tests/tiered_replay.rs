@@ -443,13 +443,11 @@ struct Boot {
     end_walk: EndWalk,
 }
 
-/// The span the end-of-replay settle (R10) walks, read from the table at
-/// the end of replay: `[ro, tail)` of a machine that demoted, empty for
-/// one that did not.
+/// What the end-of-replay settle (R10) walks, read from the table at the
+/// end of replay: the records of `[ro, tail)` of a machine that demoted,
+/// none for one that did not.
 #[derive(Copy, Clone, Default)]
 struct EndWalk {
-    /// `tail − ro`.
-    span: u64,
     /// The bytes of the records in the span, live or dead — a hole is
     /// passed by its mark, not walked.
     record_bytes: u64,
@@ -471,7 +469,7 @@ impl EndWalk {
             record_bytes += len;
             at += len;
         }
-        EndWalk { span: tail - ro, record_bytes }
+        EndWalk { record_bytes }
     }
 }
 
@@ -549,7 +547,9 @@ impl Boot {
     /// One record through the shipped dispatcher, the seam's owner
     /// draining after it.
     fn apply(&mut self, record: &RecordView<'_>) -> Result<(), ReplayError> {
-        let applied = self.ks.apply_record(record, NOW, ANCHOR, &mut self.spill).map(|_| ());
+        let applied =
+            inf_store::drive_record(&mut self.ks, record, NOW, ANCHOR, &mut self.spill, u64::MAX)
+                .map(|_| ());
         self.spill.drain();
         applied
     }
@@ -839,18 +839,14 @@ impl Ready {
         self.seal_reason_census();
         assert_eq!(self.handles.len(), self.flush.sealed().len(), "one handle per sealed file");
         assert!(self.flush.active().is_none(), "the hand-over sealed the active file");
-        // The step budget is charged the bytes the end-of-replay settle
-        // walked and no other walk's: a seal walk's bytes are charged once,
-        // as the tier bytes its flush appends (the boot I/O charge, R10).
-        assert!(
-            self.charged.walked_bytes <= self.end_walk.span,
-            "walked bytes {} exceed tail − ro {} at the end of replay",
-            self.charged.walked_bytes,
-            self.end_walk.span
-        );
+        // The step budget is charged every byte a settle walk passed, once
+        // (ADR-0174 A1.2): a demote step's seal walk passes exactly the
+        // records its flush then appends, and the end-of-replay settle the
+        // records of `[ro, tail)`.
         assert_eq!(
-            self.charged.walked_bytes, self.end_walk.record_bytes,
-            "walked bytes are the end settle's records, never a seal walk's"
+            self.charged.walked_bytes,
+            self.end_walk.record_bytes + self.counters.tier_bytes,
+            "walked bytes are the end settle's records and the sealed ones, each once"
         );
     }
 }
@@ -2651,7 +2647,7 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
             let mut guard = parts.borrow_mut();
             let (ks, spill) = &mut *guard;
             let ro = ks.tiered_store(NS).expect("materialized").space().ro_boundary();
-            match ks.apply_record(&record, NOW, ANCHOR, spill) {
+            match inf_store::drive_record(ks, &record, NOW, ANCHOR, spill, u64::MAX) {
                 Ok(_) => Ok(()),
                 Err(ReplayError::Replay { refusal: ReplayRefusal::SettleRead { .. }, .. }) => {
                     let after = ks.tiered_store(NS).expect("materialized").space().ro_boundary();

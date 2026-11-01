@@ -1398,8 +1398,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     // its namespace's boot machine, which demotes when the
                     // window is full.
                     |record| {
-                        ks.borrow_mut()
-                            .apply_record(&record, now, anchor, &mut self.recovering_tiers)
+                        let mut ks = ks.borrow_mut();
+                        let spill = &mut self.recovering_tiers;
+                        inf_store::drive_record(&mut ks, &record, now, anchor, spill, u64::MAX)
                             .map(|_| ())
                             .map_err(io_invalid)
                     },
@@ -1609,15 +1610,12 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                             self.stats.records_pre_begin += 1;
                             continue;
                         }
-                        let outcome = ks
-                            .apply_record(
-                                &record,
-                                self.now,
-                                self.anchor,
-                                &mut self.recovering_tiers,
-                            )
-                            .map_err(io_invalid)
-                            .map_err(|error| replay_apply_failed(at, &error))?;
+                        let spill = &mut self.recovering_tiers;
+                        let (now, anchor) = (self.now, self.anchor);
+                        let outcome =
+                            inf_store::drive_record(ks, &record, now, anchor, spill, u64::MAX)
+                                .map_err(io_invalid)
+                                .map_err(|error| replay_apply_failed(at, &error))?;
                         match outcome {
                             ReplayOutcome::Applied => self.stats.records_applied += 1,
                             ReplayOutcome::SkippedUnknownNs(ns) => {

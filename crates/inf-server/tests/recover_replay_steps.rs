@@ -330,8 +330,9 @@ fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
 ///   bytes read plus its charge reach it;
 /// - and passed it by at most one frame's non-yielding unit (OD-1) — the
 ///   frame's bytes, one demote step's tier bytes (a lead and a page past
-///   the need, plus a record), two barriers (the flush, one seal), and the
-///   settle reads the unit's rewrites and deletes can make;
+///   the need, plus a record) and the same records' bytes its seal walk
+///   passed, two barriers (the flush, one seal), and the settle reads the
+///   unit's rewrites and deletes can make;
 /// - an end-settle step that yields charged its budget, by at most one
 ///   record and its twins' reads;
 /// - the last one adds only the hand-over's drain (E13): one barrier, the
@@ -372,7 +373,7 @@ fn step_under_budget(budget: u64) {
     let unit = write_unit(&fs, &cfg, 4);
     // One frame's non-yielding unit before the last window's records
     // apply (no record has a cold twin yet), and after.
-    let frame_unit = FRAME_BYTES_MAX + lead + page + record + 2 * barrier;
+    let frame_unit = FRAME_BYTES_MAX + 2 * (lead + page + record) + 2 * barrier;
     let late_unit = frame_unit + unit.late_records * read_price;
     let settle_unit = record + 4 * read_price;
     let drain_unit = |rebuild_reads: u64| barrier + rebuild_reads * read_price;

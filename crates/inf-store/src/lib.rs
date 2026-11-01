@@ -89,8 +89,9 @@ pub use inf_foundation::LogicalAddr;
 pub use inf_foundation::{KeyHashId, KeyHasher};
 pub use inf_log::{FsyncClass, NsId};
 pub use keyspace::{
-    DEFAULT_DBS, DISPLACE_REGISTER_CAP, EvictBudget, Keyspace, PressureConfig, ReplayError,
-    ReplayOutcome, StateDigest, TIERED_VA_LIMIT_DEFAULT, TieredCreateError, TieredUsage,
+    ConsumedRecord, DEFAULT_DBS, DISPLACE_REGISTER_CAP, EvictBudget, Keyspace, PressureConfig,
+    ReplayError, ReplayOutcome, Replayed, StateDigest, TIERED_VA_LIMIT_DEFAULT, TieredCreateError,
+    TieredUsage, drive_record,
 };
 pub use live_set::{FileLiveSet, LiveSet};
 pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, valid_ns_name};
@@ -114,8 +115,8 @@ pub use store::{
 pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
 pub use tiered::promote::PromotionCounters;
 pub use tiered::replay::{
-    BootHandedOver, Displaced, NoSpill, ReplayCounters, ReplayPhase, ReplayRefusal, ReplaySpill,
-    ReplayWork, SettleProgress, TierReplay,
+    BootHandedOver, DemoteProgress, Displaced, NoSpill, ReplayCounters, ReplayPhase, ReplayRefusal,
+    ReplaySpill, ReplayWork, SettleProgress, TierReplay,
 };
 pub use tiered::select::select_whole_records;
 pub use tiered::shadow::{

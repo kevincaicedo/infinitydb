@@ -205,7 +205,7 @@ pub fn load_checkpoint(
         |record| {
             let mut guard = parts.borrow_mut();
             let (ks, spill) = &mut *guard;
-            let applied = ks.apply_record(&record, NOW, ANCHOR, &mut **spill);
+            let applied = inf_store::drive_record(ks, &record, NOW, ANCHOR, &mut **spill, u64::MAX);
             spill.drain();
             applied.map(|_| ())
         },
@@ -242,7 +242,7 @@ pub fn replay_tail(ks: &mut Keyspace, spill: &mut TestSpill, tail: &[u8]) {
     let mut rest = tail;
     while !rest.is_empty() {
         let (record, consumed) = decode_record(rest).expect("tail records decode");
-        ks.apply_record(&record, NOW, ANCHOR, spill).expect("replays");
+        inf_store::drive_record(ks, &record, NOW, ANCHOR, spill, u64::MAX).expect("replays");
         spill.drain();
         rest = &rest[consumed..];
     }

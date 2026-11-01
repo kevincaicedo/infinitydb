@@ -425,7 +425,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
         |record| {
             let mut guard = parts.borrow_mut();
             let (ks, spill) = &mut *guard;
-            ks.apply_record(&record, NOW, ANCHOR, &mut **spill).map(|_| ())
+            inf_store::drive_record(ks, &record, NOW, ANCHOR, &mut **spill, u64::MAX).map(|_| ())
         },
         |section| {
             let mut guard = parts.borrow_mut();
@@ -451,7 +451,8 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     let mut rest: &[u8] = &tail;
     while !rest.is_empty() {
         let (record, consumed) = decode_record(rest).expect("tail decodes");
-        ks.apply_record(&record, NOW, ANCHOR, &mut spill).expect("replays");
+        inf_store::drive_record(&mut ks, &record, NOW, ANCHOR, &mut spill, u64::MAX)
+            .expect("replays");
         rest = &rest[consumed..];
     }
     assert_eq!(ks.displace_register_len(), 0, "every marker met its mutation");

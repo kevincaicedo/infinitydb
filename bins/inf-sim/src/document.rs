@@ -326,8 +326,7 @@ fn replay_shadow(
     if let Some(manifest) = &manifest {
         let ick = shard.join("ckpt").join(ick_file_name(manifest.ckpt_id));
         read_ick(disk, &ick, IckReaderConfig::default(), |record| {
-            shadow
-                .apply_record(&record, now, anchor, &mut inf_store::NoSpill)
+            inf_store::drive_record(shadow, &record, now, anchor, &mut inf_store::NoSpill, u64::MAX)
                 .map(|_| ())
                 .map_err(|e| format!("{e:?}"))
         })
@@ -358,8 +357,7 @@ fn replay_shadow(
                 return Ok(());
             }
         }
-        shadow
-            .apply_record(record, now, anchor, &mut inf_store::NoSpill)
+        inf_store::drive_record(shadow, record, now, anchor, &mut inf_store::NoSpill, u64::MAX)
             .map(|_| ())
             .map_err(|e| format!("apply: {e:?}"))
     })

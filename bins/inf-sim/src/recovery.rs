@@ -517,13 +517,23 @@ impl Booting {
         Booting { ks, lent: Lent { machine }, longest_range: 0 }
     }
 
-    /// One record through the shipped dispatcher, measuring the span its
-    /// apply flushed ([`Booting::longest_range`]).
+    /// One record through the store's driver, measuring the span its
+    /// apply flushed ([`Booting::longest_range`]): the record presented,
+    /// its demote steps run, then presented again, so the span is the
+    /// whole of the room it made. Around one presentation that needs room
+    /// the span would read 0.
     fn apply(&mut self, record: &RecordView<'_>) -> Result<(), String> {
         let flushed =
             |ks: &Keyspace| ks.tiered_store(NS).expect("materialized").space().flushed().to_raw();
         let before = flushed(&self.ks);
-        let applied = self.ks.apply_record(record, BOOT_NOW, BOOT_ANCHOR, &mut self.lent);
+        let applied = inf_store::drive_record(
+            &mut self.ks,
+            record,
+            BOOT_NOW,
+            BOOT_ANCHOR,
+            &mut self.lent,
+            u64::MAX,
+        );
         let span = flushed(&self.ks) - before;
         self.longest_range = self.longest_range.max(span);
         applied.map(|_| ()).map_err(|e| format!("{e:?}"))
