@@ -12,6 +12,12 @@
 # INF_CHECK_ROOT (the gates) and INF_SIM_BIN / INF_SWEEP_SHARDS (the sweep
 # runner, with a stub simulator). No cargo, except in the lint-scope probe
 # cases, which run `cargo clippy` on the pinned toolchain.
+#
+# INF_SELFTEST_CASE_LOG=<an empty directory>: each case also writes one record
+# there, a file named by its place in the run: the section it belongs to, its
+# label, the verdict it wants, the exit status, its own verdict, the work root
+# and the captured output. Two runs compare case by case on these records; the
+# run is red when the records and the counted cases differ in number.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR/.."
@@ -23,6 +29,35 @@ work=$(mktemp -d)
 trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 pass=0
 fail=0
+if [ -n "${INF_SELFTEST_CASE_LOG:-}" ]; then
+    [ -d "$INF_SELFTEST_CASE_LOG" ] && [ -z "$(ls -A "$INF_SELFTEST_CASE_LOG")" ] || {
+        echo "selftest: INF_SELFTEST_CASE_LOG '$INF_SELFTEST_CASE_LOG' is not an empty directory" >&2
+        exit 2
+    }
+fi
+case_seq=0
+case_heads=''
+# case_log <label> <want> <status> <pass|fail> [<output file> [<cases>]]: the
+# case's record, when INF_SELFTEST_CASE_LOG is set; a suite that counts its own
+# cases (the inventory and dep-DAG fixtures) is one record of that many. Its
+# section is the last `# --- <name>` header above the top-level line the case
+# runs from.
+case_log() {
+    [ -n "${INF_SELFTEST_CASE_LOG:-}" ] || return 0
+    local depth=${#BASH_LINENO[@]} line head name section=prelude
+    line=${BASH_LINENO[$((depth - 2))]}
+    [ -n "$case_heads" ] || case_heads=$(awk '/^# -+ [a-z]/ { sub(/^# -+ /, ""); print NR "\t" $0 }' \
+        "$SCRIPT_DIR/check-scripts-selftest.sh")
+    while IFS=$'\t' read -r head name; do
+        [ "$head" -gt "$line" ] || section=$name
+    done <<<"$case_heads"
+    case_seq=$((case_seq + 1))
+    {
+        printf 'section\t%s\nlabel\t%s\nwant\t%s\nstatus\t%s\nverdict\t%s\nwork\t%s\ncases\t%s\noutput\n' \
+            "$section" "$1" "$2" "$3" "$4" "$work" "${6:-1}"
+        [ -z "${5:-}" ] || [ ! -f "$5" ] || cat "$5"
+    } >"$INF_SELFTEST_CASE_LOG/$(printf '%05d' "$case_seq")"
+}
 
 # A gate that never ran gives no verdict (ADR-0106 D1): counted as red, a
 # tool the runner lacked passed every planted red of the gate that needed it.
@@ -37,6 +72,7 @@ not_runnable() {
     esac
     fail=$((fail + 1))
     echo "SELFTEST FAIL: '$2' is not a runnable command, so it gives no verdict — $1"
+    case_log "$1" "${3:-run}" - fail
 }
 # no_verdict <status> <label> <log>: a command that ran and exited 126 or 127
 # — env refusing a gate it cannot execute or find, or a gate that died on a
@@ -46,6 +82,7 @@ no_verdict() {
     fail=$((fail + 1))
     echo "SELFTEST FAIL: exit $1 means a command could not be executed or found, not a gate verdict — $2"
     sed 's/^/    | /' "$3"
+    case_log "$2" "${4:-run}" "$1" fail "$3"
 }
 
 # expect <red|green> <label> <command…>: runs the command with stdout+stderr
@@ -54,15 +91,17 @@ expect() {
     local want=$1 label=$2
     shift 2
     local log="$work/log" status=0
-    not_runnable "$label" "$1" && return 0
+    not_runnable "$label" "$1" "$want" && return 0
     "$@" >"$log" 2>&1 || status=$?
-    no_verdict "$status" "$label" "$log" && return 0
+    no_verdict "$status" "$label" "$log" "$want" && return 0
     if { [ "$want" = red ] && [ "$status" -ne 0 ]; } || { [ "$want" = green ] && [ "$status" -eq 0 ]; }; then
         pass=$((pass + 1))
+        case_log "$label" "$want" "$status" pass "$log"
     else
         fail=$((fail + 1))
         echo "SELFTEST FAIL: expected $want, got exit $status — $label"
         sed 's/^/    | /' "$log"
+        case_log "$label" "$want" "$status" fail "$log"
     fi
 }
 
@@ -72,15 +111,17 @@ expect_output() {
     local label=$1 pattern=$2
     shift 2
     local log="$work/log" status=0
-    not_runnable "$label" "$1" && return 0
+    not_runnable "$label" "$1" "output $pattern" && return 0
     "$@" >"$log" 2>&1 || status=$?
-    no_verdict "$status" "$label" "$log" && return 0
+    no_verdict "$status" "$label" "$log" "output $pattern" && return 0
     if grep -q -- "$pattern" "$log"; then
         pass=$((pass + 1))
+        case_log "$label" "output $pattern" "$status" pass "$log"
     else
         fail=$((fail + 1))
         echo "SELFTEST FAIL: output lacks '$pattern' — $label"
         sed 's/^/    | /' "$log"
+        case_log "$label" "output $pattern" "$status" fail "$log"
     fi
 }
 
@@ -90,15 +131,17 @@ expect_red_because() {
     local label=$1 pattern=$2 status=0
     shift 2
     local log="$work/log"
-    not_runnable "$label" "$1" && return 0
+    not_runnable "$label" "$1" "red $pattern" && return 0
     "$@" >"$log" 2>&1 || status=$?
-    no_verdict "$status" "$label" "$log" && return 0
+    no_verdict "$status" "$label" "$log" "red $pattern" && return 0
     if [ "$status" -ne 0 ] && grep -q -- "$pattern" "$log"; then
         pass=$((pass + 1))
+        case_log "$label" "red $pattern" "$status" pass "$log"
     else
         fail=$((fail + 1))
         echo "SELFTEST FAIL: expected red naming '$pattern', got exit $status — $label"
         sed 's/^/    | /' "$log"
+        case_log "$label" "red $pattern" "$status" fail "$log"
     fi
 }
 
@@ -150,6 +193,7 @@ expect_red_because "self-test: fx_git refuses a fixture directory with no reposi
 # no_verdict). Its own log directory keeps the inner cases off the outer
 # case's log.
 nv_canary() (
+    unset INF_SELFTEST_CASE_LOG
     work="$work/nv" && mkdir -p "$work" && : >"$work/noexec" && pass=0 && fail=0
     printf '#!/usr/bin/env bash\nset -e\ninf-selftest-no-such-tool\n' >"$work/tool-missing"
     chmod +x "$work/tool-missing"
@@ -1380,11 +1424,14 @@ expect green "fsync: a test-only module is stripped" env INF_CHECK_ROOT="$root" 
 # shim, so they are a Python suite; its cases join this script's tally.
 inventory_dag_log="$work/inventory-dag.log"
 if python3 "$SCRIPT_DIR/check-inventory-dag-selftest.py" >"$inventory_dag_log" 2>&1; then
-    pass=$((pass + $(sed -n 's/^Ran \([0-9]*\) tests.*/\1/p' "$inventory_dag_log")))
+    inventory_dag_cases=$(sed -n 's/^Ran \([0-9]*\) tests.*/\1/p' "$inventory_dag_log")
+    pass=$((pass + $inventory_dag_cases))
+    case_log "inventory / dep-DAG fixtures" green 0 pass "$inventory_dag_log" "$inventory_dag_cases"
 else
     fail=$((fail + 1))
     echo "SELFTEST FAIL: inventory / dep-DAG fixtures"
     sed 's/^/    | /' "$inventory_dag_log"
+    case_log "inventory / dep-DAG fixtures" green 1 fail "$inventory_dag_log"
 fi
 
 # Batch 64 (the 100-column gate wraps long reasons): the marker heads the
@@ -4891,6 +4938,13 @@ dr_red_census() {
 expect green "deny: a red census runs no leg" dr_red_census
 
 # ----------------------------------------------------------------- verdict
+if [ -n "${INF_SELFTEST_CASE_LOG:-}" ]; then
+    logged=$(cat "$INF_SELFTEST_CASE_LOG"/* | awk -F '\t' '$1 == "cases" { n += $2 } END { print n + 0 }')
+    if [ "$logged" -ne $((pass + fail)) ]; then
+        fail=$((fail + 1))
+        echo "SELFTEST FAIL: the case log's records count $logged cases, the run $((pass + fail - 1))"
+    fi
+fi
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
