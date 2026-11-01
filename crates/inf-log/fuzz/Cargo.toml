@@ -67,3 +67,10 @@ path = "fuzz_targets/fuzz_index_sidecar.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_frame_resume"
+path = "fuzz_targets/fuzz_frame_resume.rs"
+test = false
+doc = false
+bench = false

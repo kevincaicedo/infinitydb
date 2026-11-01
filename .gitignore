@@ -11,6 +11,7 @@ crates/inf-fabric/fuzz/corpus/
 crates/inf-log/fuzz/corpus/frame_decode
 crates/inf-log/fuzz/corpus/segment_read
 crates/inf-log/fuzz/corpus/ick_decode
+crates/inf-log/fuzz/corpus/fuzz_frame_resume
 .claude/
 crates/inf-doc/fuzz/corpus/idoc_decode
 crates/inf-doc/fuzz/corpus/json_parse

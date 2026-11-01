@@ -468,11 +468,134 @@ impl<'a> FrameRef<'a> {
             offset: 0,
             declared: self.record_count,
             remaining: self.record_count,
+            first_lsn: self.first_lsn,
             next_lsn: self.first_lsn,
             failed: false,
         }
     }
+
+    /// The record walk again from `cursor`, a position this frame's own
+    /// iterator produced ([`RecordIter::cursor`]): the next record decodes
+    /// at the cursor's body offset with the LSN the unparked walk gives it,
+    /// so a walk parked after every record yields what one walk yields,
+    /// errors included (ADR-0174 A1: the segment reader re-issues the frame
+    /// it holds for a cursor its record iterator produced).
+    ///
+    /// # Errors
+    /// [`CursorMismatch`] for a cursor of another frame (its first LSN
+    /// differs) or one past this frame's body or record count — no input
+    /// reaches it from a cursor this frame's iterator made.
+    pub fn records_from(&self, cursor: &RecordCursor) -> Result<RecordIter<'a>, CursorMismatch> {
+        let offset = usize::try_from(cursor.offset).map_err(|_| CursorMismatch)?;
+        if cursor.first_lsn != self.first_lsn
+            || offset > self.body.len()
+            || cursor.remaining > self.record_count
+        {
+            return Err(CursorMismatch);
+        }
+        let next_offset = self.first_lsn.offset.checked_add(cursor.offset).ok_or(CursorMismatch)?;
+        Ok(RecordIter {
+            body: self.body,
+            offset,
+            declared: self.record_count,
+            remaining: cursor.remaining,
+            first_lsn: self.first_lsn,
+            next_lsn: Lsn::new(self.first_lsn.segment, next_offset),
+            failed: false,
+        })
+    }
+
+    /// The header facts the segment reader keeps to re-issue this frame
+    /// without a second CRC pass ([`FrameHead::reissue`]).
+    pub(crate) fn head(&self) -> FrameHead {
+        FrameHead {
+            first_lsn: self.first_lsn,
+            record_count: self.record_count,
+            stamp: self.stamp,
+            layout: self.layout,
+            frame_len: self.frame_len,
+        }
+    }
 }
+
+/// A decoded frame's header facts, without its bytes: what the segment
+/// reader keeps of the frame it last returned, so that frame can be handed
+/// out again over the same buffer bytes, which `decode_frame` already
+/// CRC-checked and nothing rewrites before the reader's next step.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct FrameHead {
+    first_lsn: Lsn,
+    record_count: u32,
+    stamp: Option<FrameStamp>,
+    layout: FrameLayout,
+    frame_len: u32,
+}
+
+impl FrameHead {
+    /// The frame over `frame`, the bytes from its base on that
+    /// [`decode_frame`] validated: `None` when they are shorter than the
+    /// frame, which no reader that keeps its buffer reaches.
+    pub(crate) fn reissue(self, frame: &[u8]) -> Option<FrameRef<'_>> {
+        let header_len = frame_header_len(self.stamp.is_some());
+        let body_end = usize::try_from(self.frame_len).ok()?.checked_sub(FRAME_TRAILER_LEN)?;
+        let body = frame.get(header_len..body_end)?;
+        Some(FrameRef {
+            first_lsn: self.first_lsn,
+            record_count: self.record_count,
+            stamp: self.stamp,
+            layout: self.layout,
+            frame_len: self.frame_len,
+            body,
+        })
+    }
+}
+
+/// Where one frame's record walk stands, made only by
+/// [`RecordIter::cursor`]: the frame's first LSN, the body offset of the
+/// next record and the records not yet yielded. Plain data, so it is held
+/// across a suspension where a borrow of the frame cannot be;
+/// [`FrameRef::records_from`] resumes from it on the same frame and refuses
+/// it on any other. Neither `Clone` nor `Copy`: a copy saved before a move
+/// and written back after it would rewind the walk.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecordCursor {
+    first_lsn: Lsn,
+    offset: u32,
+    remaining: u32,
+}
+
+impl RecordCursor {
+    /// The first LSN of the frame this cursor walks.
+    #[must_use]
+    pub fn first_lsn(&self) -> Lsn {
+        self.first_lsn
+    }
+
+    /// The body offset of the next record: the frame's body bytes the walk
+    /// has passed.
+    #[must_use]
+    pub fn body_offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// Records the walk has not yielded yet.
+    #[must_use]
+    pub fn remaining(&self) -> u32 {
+        self.remaining
+    }
+}
+
+/// A [`RecordCursor`] presented to a frame it does not belong to.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CursorMismatch;
+
+impl fmt::Display for CursorMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "a record cursor presented to a frame it does not walk")
+    }
+}
+
+impl std::error::Error for CursorMismatch {}
 
 /// Record-level errors surfaced while walking a CRC-valid frame.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -513,8 +636,25 @@ pub struct RecordIter<'a> {
     offset: usize,
     declared: u32,
     remaining: u32,
+    first_lsn: Lsn,
     next_lsn: Lsn,
     failed: bool,
+}
+
+impl RecordIter<'_> {
+    /// Where the walk stands: the next record's body offset and the records
+    /// left, for [`FrameRef::records_from`] to resume at.
+    #[must_use]
+    pub fn cursor(&self) -> RecordCursor {
+        RecordCursor {
+            first_lsn: self.first_lsn,
+            // The body is part of a frame whose length is a u32, so the
+            // offset fits; a value that did not would name no record and
+            // `records_from` would refuse it.
+            offset: u32::try_from(self.offset).unwrap_or(u32::MAX),
+            remaining: self.remaining,
+        }
+    }
 }
 
 impl<'a> Iterator for RecordIter<'a> {
@@ -759,6 +899,71 @@ impl<'a> Iterator for FrameIter<'a> {
 mod tests {
     use super::*;
     use crate::record::NsId;
+
+    /// A v2 frame of `count` records whose header declares `declared`,
+    /// its trailer repaired: CRC-valid, so only the record walk sees a
+    /// count that disagrees with the body.
+    fn frame_declaring(count: u32, declared: u32) -> Vec<u8> {
+        let mut builder = FrameBuilder::new();
+        for i in 0..count {
+            let key = format!("k{i}");
+            builder.append(&RecordView::StringPostImage {
+                ns: NsId(1),
+                key: key.as_bytes(),
+                value: b"v",
+            });
+        }
+        let stamp = FrameStamp { epoch: 1, seq: 1, covered_lsn: 0 };
+        let mut image = builder
+            .finalize(Lsn::new(SegmentId(0), FRAME_HEADER_LEN as u32), stamp, FrameLayout::Packed)
+            .to_vec();
+        image[8..12].copy_from_slice(&declared.to_le_bytes());
+        let end = image.len() - FRAME_TRAILER_LEN;
+        let crc = crc32c(&image[..end]);
+        image[end..].copy_from_slice(&crc.to_le_bytes());
+        image
+    }
+
+    /// A walk that stops after every record and resumes from its cursor
+    /// yields what one walk yields: every record with its LSN, then the
+    /// iterator's end — `None` on an honest frame, the same typed error on
+    /// one whose count is short or long.
+    #[test]
+    fn a_walk_resumed_at_every_record_yields_the_unparked_walk() {
+        for (count, declared) in [(1, 1), (5, 5), (5, 4), (5, 6), (3, 1)] {
+            let image = frame_declaring(count, declared);
+            let (frame, _) = decode_frame(&image, DEFAULT_MAX_FRAME_LEN).expect("decodes");
+            let whole: Vec<_> = frame.records().collect();
+            let mut parked = Vec::new();
+            let mut cursor = frame.records().cursor();
+            loop {
+                let mut walk = frame.records_from(&cursor).expect("its own cursor");
+                let Some(item) = walk.next() else { break };
+                let failed = item.is_err();
+                parked.push(item);
+                if failed {
+                    break;
+                }
+                cursor = walk.cursor();
+            }
+            assert_eq!(parked, whole, "{count} records declared as {declared}");
+        }
+    }
+
+    /// The cursor names its frame: another frame's walk, and a cursor past
+    /// this frame's body or count, are refused typed.
+    #[test]
+    fn a_cursor_is_refused_by_a_frame_it_does_not_walk() {
+        let image = frame_declaring(2, 2);
+        let (frame, _) = decode_frame(&image, DEFAULT_MAX_FRAME_LEN).expect("decodes");
+        let other = frame_with_first_offset(FRAME_HEADER_LEN as u32 + 64);
+        let (other, _) = decode_frame(&other, DEFAULT_MAX_FRAME_LEN).expect("decodes");
+        assert_eq!(other.records_from(&frame.records().cursor()).err(), Some(CursorMismatch));
+        let past = RecordCursor { first_lsn: frame.first_lsn(), offset: u32::MAX, remaining: 0 };
+        assert_eq!(frame.records_from(&past).err(), Some(CursorMismatch));
+        let more = RecordCursor { first_lsn: frame.first_lsn(), offset: 0, remaining: 3 };
+        assert_eq!(frame.records_from(&more).err(), Some(CursorMismatch));
+    }
 
     /// One honest single-record v2 frame, then `first_lsn.offset` rewritten
     /// to `offset` with the trailer repaired — the frame stays CRC-valid,
