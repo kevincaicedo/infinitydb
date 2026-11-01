@@ -191,14 +191,21 @@ fn a_fresh_data_directory_is_probed_once_and_the_model_is_identity_bound() {
         }
     }
 
-    // 3. The second boot reads the file — no probe.
+    // 3. The second boot reads the file — no probe. The file's bytes are
+    //    the witness: a probe rewrites it whole, its `probed_at_unix_s`
+    //    stamp included (`render` in `crates/inf-probe/src/lib.rs:684`),
+    //    and the probe runs before the cell listens, so the bytes are read
+    //    once the boot is up. A boot's duration is none: it reads a device
+    //    the test processes beside it share (ADR-0200 D7).
     {
-        let started = Instant::now();
+        let model = dir.join("io-properties.toml");
+        let probed = std::fs::read(&model).expect("the probed model");
         let server = spawn(&dir, &[]).expect("second boot");
+        let after = std::fs::read(&model).expect("the model after the boot");
+        assert!(after == probed, "the second boot must not probe: io-properties.toml changed");
         let info = info_when(server.port, "io_properties_source", "file");
         assert_eq!(field(&info, "io_properties_source"), "file");
         assert_eq!(field(&info, "io_properties_identity"), "verified");
-        assert!(started.elapsed() < Duration::from_secs(8), "the second boot must not probe");
     }
 
     // 4. A model that describes another device (a foreign uuid): `off`
