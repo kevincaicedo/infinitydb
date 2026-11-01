@@ -311,6 +311,22 @@ rows=(
   # slab's live handle, holding the same index and generation, reads and
   # takes this slab's occupant; the two-instance model test reads it.
   "inf_canary_slab_instance_blind crate-test inf-foundation lib another_slabs_live_handle_is_stale_and_changes_neither slab-instance-blind"
+  # The same plant on the timer set (ADR-0194 D6): two sets on one census,
+  # built and reserved alike, so another set's owner names a live owner of
+  # this set; its close must be Stale, and planted it releases that owner.
+  "inf_canary_slab_instance_blind crate-test inf-runtime test:timer_model another_sets_close_releases_nothing another set's close is Stale"
+  # ADR-0154 D2: a cancel removes its arm's entry. Planted, it leaves it,
+  # and the model reads the heap's entries off its Armed owners.
+  "inf_canary_timer_lazy_cancel crate-test inf-runtime test:timer_model the_set_matches_the_model_on_two_sets_driven_alike the bijection"
+  # ADR-0154 D3: nothing falls due before its rounded deadline. Planted,
+  # the minimum is due a millisecond early.
+  "inf_canary_timer_fires_early crate-test inf-runtime test:timer_model the_set_matches_the_model_on_two_sets_driven_alike the set's due is the model's"
+  # ADR-0154 D2: no position is handed out while its owner's callback
+  # runs. Planted, a close in the callback frees the position at once.
+  "inf_canary_timer_reuse_in_callback crate-test inf-runtime test:timer_model the_set_matches_the_model_on_two_sets_driven_alike D2's outcome for a close"
+  # A heap entry stays fresh by order: a close removes an Armed owner's
+  # entry before its position's take. Planted, the entry outlives the take.
+  "inf_canary_timer_close_keeps_entry crate-test inf-runtime test:timer_model the_set_matches_the_model_on_two_sets_driven_alike the bijection"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.

@@ -653,7 +653,11 @@ impl TimerSet {
             SlotPhase::Delivering | SlotPhase::Closing => Cancelled::InCallback,
             SlotPhase::Armed { heap_index } => {
                 slot.phase = SlotPhase::Idle;
+                // Canary: the cancel leaves its entry in the heap.
+                #[cfg(not(inf_canary_timer_lazy_cancel))]
                 self.remove_entry(heap_index);
+                #[cfg(inf_canary_timer_lazy_cancel)]
+                let _ = heap_index;
                 Cancelled::Removed
             }
         }
@@ -670,14 +674,28 @@ impl TimerSet {
         match slot.phase {
             SlotPhase::Delivering | SlotPhase::Closing => {
                 slot.phase = SlotPhase::Closing;
-                Closed::Draining
+                // Canary: a close while delivering frees the position at
+                // once, so a reserve in the callback can take it.
+                #[cfg(inf_canary_timer_reuse_in_callback)]
+                {
+                    self.release(owner.id);
+                    Closed::Released
+                }
+                #[cfg(not(inf_canary_timer_reuse_in_callback))]
+                {
+                    Closed::Draining
+                }
             }
             SlotPhase::Idle => {
                 self.release(owner.id);
                 Closed::Released
             }
             SlotPhase::Armed { heap_index } => {
+                // Canary: the close takes the position and leaves its entry.
+                #[cfg(not(inf_canary_timer_close_keeps_entry))]
                 self.remove_entry(heap_index);
+                #[cfg(inf_canary_timer_close_keeps_entry)]
+                let _ = heap_index;
                 self.release(owner.id);
                 Closed::Released
             }
@@ -885,7 +903,11 @@ fn normalized_ms(deadline: Nanos, now: Nanos) -> Result<u64, ArmError> {
 /// Whether a deadline of `deadline_ms` is due at `now`.
 #[inline]
 fn due_at(deadline_ms: u64, now: Nanos) -> bool {
-    deadline_ms <= now.0 / NANOS_PER_MS
+    let now_ms = now.0 / NANOS_PER_MS;
+    // Canary: due a millisecond early.
+    #[cfg(inf_canary_timer_fires_early)]
+    let now_ms = now_ms + 1;
+    deadline_ms <= now_ms
 }
 
 /// Steps an array's build to its end.
