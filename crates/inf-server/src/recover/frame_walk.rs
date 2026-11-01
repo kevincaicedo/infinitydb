@@ -27,7 +27,7 @@
 use std::io;
 
 use inf_log::fs::SegmentFs;
-use inf_log::{FrameRecordError, ReadError, ReadStep, SegmentReader};
+use inf_log::{FrameRecordError, FrameRef, ReadError, ReadStep, SegmentReader};
 use inf_store::{DemoteProgress, Keyspace, ReplaySpill, Replayed};
 
 use super::{
@@ -121,6 +121,20 @@ pub(super) mod cursor {
             self.records.body_offset()
         }
 
+        /// The planted canary of `twice_on_resume`: a resumed walk starts
+        /// one record back, so the last record consumed applies again.
+        #[cfg(inf_canary_recover_twice_on_resume)]
+        pub(super) fn rewind_planted(&mut self, frame: &FrameRef<'_>) {
+            let consumed = frame.record_count() - self.records.remaining();
+            let mut walk = frame.records();
+            for _ in 1..consumed {
+                let _ = walk.next();
+            }
+            if consumed > 0 {
+                self.records = walk.cursor();
+            }
+        }
+
         /// Decodes the record at the cursor through the record iterator
         /// (its length from the decoder; a body short of its count answers
         /// `MissingRecords` here) and presents it.
@@ -163,6 +177,13 @@ pub(super) mod cursor {
             self.pass()
         }
 
+        /// The planted canary of `skip_on_resume`: passes a record with no
+        /// token.
+        #[cfg(inf_canary_recover_skip_on_resume)]
+        pub(super) fn pass_planted(self) -> Result<Moved, FrameRecordError> {
+            self.pass()
+        }
+
         /// The cursor to the iterator's position; a move that leaves no
         /// record runs the iterator once more, its end check: `None` is the
         /// frame's end, bytes after the counted records its typed error.
@@ -171,6 +192,10 @@ pub(super) mod cursor {
             cursor.records = after.cursor();
             if cursor.records.remaining() > 0 {
                 return Ok(Moved::Next);
+            }
+            if cfg!(inf_canary_recover_frame_end_counted) {
+                // The planted canary ends the frame on its count alone.
+                return Ok(Moved::FrameEnd);
             }
             match after.next() {
                 None => Ok(Moved::FrameEnd),
@@ -199,11 +224,14 @@ pub(super) enum YieldKind {
     DemoteStep,
 }
 
-/// A walk's own state: metered or whole, and the body offset up to which
-/// the frame is charged.
+/// A walk's own state: metered or whole, the body offset up to which the
+/// frame is charged, the frame's extent, and whether an earlier step parked
+/// the cursor it started at.
 struct Walk {
     metered: bool,
     charged_to: u32,
+    padded: u64,
+    resumed: bool,
 }
 
 impl<F: SegmentFs + Clone> Recovery<F> {
@@ -233,62 +261,92 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         if resumed && ks.displace_register_len() != usize::from(cursor.parked_markers) {
             return Err(cursor_lost(base, "the register no longer holds the walk's markers"));
         }
-        let at = frame.first_lsn();
+        #[cfg(inf_canary_recover_twice_on_resume)]
+        if resumed {
+            cursor.rewind_planted(&frame);
+        }
         let padded = u64::from(frame.padded_len());
         let unpaid = padded.saturating_sub(u64::from(cursor.body_offset()));
-        let metered = unpaid >= budget.left();
-        let mut walk = Walk { metered, charged_to: cursor.body_offset() };
+        // The planted canary walks every frame whole, never asking.
+        let metered = !cfg!(inf_canary_recover_frame_whole) && unpaid >= budget.left();
+        let mut walk = Walk { metered, charged_to: cursor.body_offset(), padded, resumed };
         // Bound: one turn per record of the frame, plus one presentation
         // more per demote step that made room (four room asks a record).
         loop {
-            let (view, presented) = match cursor.present(&frame) {
-                Ok(presented) => presented,
-                Err(cursor::PresentError::Record(error)) => return Err(record_failed(at, error)),
-                Err(cursor::PresentError::Lost) => {
-                    return Err(cursor_lost(base, "the cursor names no record"));
-                }
-            };
-            let presented = match presented.skip_below_begin() {
-                cursor::Skipped::Moved(moved) => {
-                    self.stats.records_pre_begin += 1;
-                    let moved = moved.map_err(|error| record_failed(at, error))?;
-                    match self.after_move(&mut cursor, &mut walk, budget, moved, padded) {
-                        Some(end) => return Ok(end.into_walk_end(cursor, padded)),
-                        None => continue,
-                    }
-                }
-                cursor::Skipped::Kept(presented) => presented,
-            };
-            let lsn = presented.lsn();
-            let answer = ks
-                .apply_record(&view, self.now, self.anchor, &mut self.recovering_tiers)
-                .map_err(io_invalid)
-                .map_err(|error| replay_apply_failed(at, &error))?;
-            let (token, priced) = match answer {
-                Replayed::Consumed(token) => (token, false),
-                Replayed::ConsumedPriced(token) => (token, true),
-                Replayed::NeedsRoom(ns) => {
-                    drop(presented);
-                    match self.make_room(ks, ns, &mut cursor, &mut walk, budget, lsn)? {
-                        Some(kind) => {
-                            return Ok(AfterMove::Parked(kind).into_walk_end(cursor, padded));
-                        }
-                        None => continue,
-                    }
-                }
-            };
-            self.count_outcome(ks, token.outcome());
-            let moved = presented.advance(token).map_err(|error| record_failed(at, error))?;
-            cursor.parked_markers = parked_markers(ks);
-            if priced {
-                self.drain_frame(budget);
-                self.charge_passed(&cursor, &mut walk, budget);
-                walk.metered = true;
-            }
-            if let Some(end) = self.after_move(&mut cursor, &mut walk, budget, moved, padded) {
+            if let Some(end) = self.walk_record(ks, &frame, &mut cursor, &mut walk, budget)? {
                 return Ok(end.into_walk_end(cursor, padded));
             }
         }
+    }
+
+    /// One turn of a walk: the record at the cursor presented, then skipped
+    /// below the begin LSN, applied and moved past, or waiting for room.
+    /// `Some` ends the walk: the frame's end, or a yield inside it.
+    fn walk_record(
+        &mut self,
+        ks: &mut Keyspace,
+        frame: &FrameRef<'_>,
+        cursor: &mut FrameCursor,
+        walk: &mut Walk,
+        budget: &mut StepBudget,
+    ) -> io::Result<Option<AfterMove>> {
+        let at = frame.first_lsn();
+        let (view, presented) = match cursor.present(frame) {
+            Ok(presented) => presented,
+            Err(cursor::PresentError::Record(error)) => return Err(record_failed(at, error)),
+            Err(cursor::PresentError::Lost) => {
+                return Err(cursor_lost(cursor.frame_base(), "the cursor names no record"));
+            }
+        };
+        // The planted canary runs the begin test only on a walk that starts
+        // at a frame's entry.
+        let begin_test = !(cfg!(inf_canary_recover_begin_skip_entry_only) && walk.resumed);
+        let presented = if begin_test {
+            match presented.skip_below_begin() {
+                cursor::Skipped::Moved(moved) => {
+                    self.stats.records_pre_begin += 1;
+                    let moved = moved.map_err(|error| record_failed(at, error))?;
+                    return Ok(self.after_move(cursor, walk, budget, moved));
+                }
+                cursor::Skipped::Kept(presented) => presented,
+            }
+        } else {
+            presented
+        };
+        let lsn = presented.lsn();
+        let answer = ks
+            .apply_record(&view, self.now, self.anchor, &mut self.recovering_tiers)
+            .map_err(io_invalid)
+            .map_err(|error| replay_apply_failed(at, &error))?;
+        let (token, priced) = match answer {
+            Replayed::Consumed(token) => (token, false),
+            Replayed::ConsumedPriced(token) => (token, true),
+            Replayed::NeedsRoom(ns) => {
+                // The planted canary passes, on a resumed walk, a record
+                // that needs room.
+                #[cfg(inf_canary_recover_skip_on_resume)]
+                if walk.resumed {
+                    let moved = presented.pass_planted().map_err(|e| record_failed(at, e))?;
+                    return Ok(self.after_move(cursor, walk, budget, moved));
+                }
+                drop(presented);
+                let parked = self.make_room(ks, ns, cursor, walk, budget, lsn)?;
+                return Ok(parked.map(AfterMove::Parked));
+            }
+        };
+        self.count_outcome(ks, token.outcome());
+        let moved = presented.advance(token).map_err(|error| record_failed(at, error))?;
+        cursor.parked_markers = parked_markers(ks);
+        if priced {
+            self.drain_frame(budget);
+            self.charge_passed(cursor, walk, budget);
+            walk.metered = true;
+        }
+        if cfg!(inf_canary_recover_ask_per_record) && !walk.metered {
+            // The planted canary asks after every record of a whole walk.
+            let _ = budget.spent();
+        }
+        Ok(self.after_move(cursor, walk, budget, moved))
     }
 
     /// A frame's entry, one unit: the reader's next frame read whole and
@@ -392,14 +450,13 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         walk: &mut Walk,
         budget: &mut StepBudget,
         moved: Moved,
-        padded: u64,
     ) -> Option<AfterMove> {
         match moved {
             Moved::FrameEnd => {
                 // The frame's bytes not charged yet: all of them for a
                 // whole walk, the header, trailer and padding for a
                 // metered one; then the boot I/O its records did.
-                budget.charge(padded.saturating_sub(u64::from(walk.charged_to)));
+                budget.charge(walk.padded.saturating_sub(u64::from(walk.charged_to)));
                 walk.charged_to = cursor.body_offset();
                 self.drain_frame(budget);
                 Some(AfterMove::FrameEnd { ask_yield: walk.metered && budget.spent() })
@@ -439,11 +496,23 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 ns.0
             )));
         };
-        let progress = machine.demote_step(table, left).map_err(|refusal| refused(ns, &refusal))?;
+        // The planted canary runs the demote step whole inside the step, as
+        // it ran inside one record's apply.
+        let progress = if cfg!(inf_canary_recover_frame_whole) {
+            // Bound: each call walks a record at least, or completes.
+            while machine.demote_step(table, u64::MAX).map_err(|r| refused(ns, &r))?
+                == DemoteProgress::More
+            {}
+            DemoteProgress::Room
+        } else {
+            machine.demote_step(table, left).map_err(|refusal| refused(ns, &refusal))?
+        };
         self.drain_frame(budget);
         Ok(match progress {
             DemoteProgress::More => Some(YieldKind::DemoteStep),
-            DemoteProgress::Room if budget.spent() => Some(YieldKind::Frame),
+            DemoteProgress::Room if !cfg!(inf_canary_recover_frame_whole) && budget.spent() => {
+                Some(YieldKind::Frame)
+            }
             DemoteProgress::Room => None,
         })
     }

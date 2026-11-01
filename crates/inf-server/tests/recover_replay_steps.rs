@@ -361,12 +361,24 @@ fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
 /// whole settle is the last step, which only the drain's bound judges).
 #[test]
 fn every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget() {
+    // The upper bounds are asserted as each step runs, the yields under the
+    // budget once both budgets ran: a driver that leaves boot I/O out of its
+    // yield test also yields early, and the bound it passes is its red.
+    let mut early = Vec::new();
     for budget in [256 << 10, 8 << 20] {
-        step_under_budget(budget);
+        early.extend(step_under_budget(budget));
     }
+    assert!(
+        early.is_empty(),
+        "{} replay steps yielded under their budget: {:?}",
+        early.len(),
+        early.first()
+    );
 }
 
-fn step_under_budget(budget: u64) {
+/// One boot under `budget`, its upper bounds asserted; returns the replay
+/// steps that yielded under the budget.
+fn step_under_budget(budget: u64) -> Vec<String> {
     use inf_server::RecoverPhase;
     let barrier = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES;
     let read_price = inf_store::limits::SETTLE_READ_CHARGE_BYTES;
@@ -385,6 +397,7 @@ fn step_under_budget(budget: u64) {
     let mut ks = tiered_keyspace();
     let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
     let (mut largest, mut settle_steps, mut open_span) = (0u64, 0u64, None);
+    let mut early = Vec::new();
     loop {
         let phase = recovery.phase();
         let segments_before = recovery.segments_progress().0;
@@ -413,8 +426,9 @@ fn step_under_budget(budget: u64) {
                 let work = recovery.step_work_bytes();
                 if recovery.phase() == RecoverPhase::Replay
                     && recovery.segments_progress().0 == segments_before
+                    && work < budget
                 {
-                    assert!(work >= budget, "{at}: yielded at a work of {work}");
+                    early.push(format!("{at}: yielded at a work of {work}"));
                 }
             }
             // The lift decision: replay has ended, and the end settle's
@@ -482,6 +496,7 @@ fn step_under_budget(budget: u64) {
     let (served, ram, cold) = read_back(&fs, &cfg, &mut ks, &unit.model);
     assert!(ram > 0 && cold > 0, "VACUOUS: {ram} RAM and {cold} cold keys");
     assert_model(&served, &unit.model, &format!("after a boot at a {budget}-byte budget"));
+    early
 }
 
 /// Where a power cut lands in a demoting boot (ADR-0174 D5).
@@ -1118,7 +1133,15 @@ fn file_bytes(fs: &MemFs, path: &std::path::Path) -> Vec<u8> {
 fn recovered(fs: &CountingFs, cfg: &DurableConfig, budget: u64, model: &Model) -> Recovered {
     let mut ks = tiered_keyspace();
     let mut recovery = Recovery::new(fs.clone(), CELL, cfg, anchor(), now());
-    while recovery.step(&mut ks, budget).expect("a step") == RecoveryProgress::Working {}
+    // Bound: every step makes progress; a boot of this unit at a budget of
+    // 0 takes well under a million steps, so a walk that re-applies records
+    // without moving on is caught here, not as a hang.
+    let mut steps = 0u64;
+    let refused = |err| panic!("BUDGET INDEPENDENCE: the boot at {budget} refused: {err}");
+    while recovery.step(&mut ks, budget).unwrap_or_else(refused) == RecoveryProgress::Working {
+        steps += 1;
+        assert!(steps < 5_000_000, "BUDGET INDEPENDENCE: no progress at {budget}");
+    }
     let (_rotor, stats, _seed) = recovery.finish();
     let cold = cold_dir(cfg);
     let mut names = fs.list_dir(&cold).unwrap_or_default();

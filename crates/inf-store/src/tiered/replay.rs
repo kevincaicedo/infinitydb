@@ -583,7 +583,10 @@ impl<F: SegmentFs> TierReplay<F> {
                 None => WalkStart::At(table.space.ro_boundary()),
             };
             let stop = target.to_raw().saturating_add(self.lead);
-            let budget_bytes = left.max(1);
+            // The planted canary walks the whole seal in one call, as a
+            // demote step did inside one record's apply.
+            let budget_bytes =
+                if cfg!(inf_canary_recover_seal_unbudgeted) { u64::MAX } else { left.max(1) };
             // Bound: the charge left plus one record and its exact-hash
             // group's reads.
             let (span, end) =
@@ -1241,6 +1244,13 @@ impl TieredTable {
             if self.space.head() < pending.target {
                 if first != Room::Demote(pending.target) {
                     return Err(ReplayRefusal::RoomMoved { why: "room answers another target" });
+                }
+                if cfg!(inf_canary_recover_room_reask_counted) {
+                    // The planted canary counts the resumed ask as a new one.
+                    pending.asks += 1;
+                    if pending.asks > REPLAY_ROOM_ASKS_MAX {
+                        return Err(ReplayRefusal::RoomAsks { len, asks: pending.asks });
+                    }
                 }
                 return Ok(RoomVerdict::NeedsRoom);
             }

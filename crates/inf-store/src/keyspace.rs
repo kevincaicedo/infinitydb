@@ -1428,7 +1428,9 @@ impl Keyspace {
                     .replay_delete_lent(machine, entry.markers, key, entry.hash)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
-                let priced = reads == DeleteReads::Read;
+                // The planted canary answers a `DEL` that read as one that
+                // did not, so its walk asks nothing after the reads.
+                let priced = reads == DeleteReads::Read && !cfg!(inf_canary_recover_del_unasked);
                 Ok(Some(if priced {
                     ApplyAnswer::ConsumedPriced(ReplayOutcome::Applied)
                 } else {
