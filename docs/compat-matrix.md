@@ -20,7 +20,7 @@ both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
-**Corpus:** 678 compared executions · 74 documented deviations · 0 tolerated failures.
+**Corpus:** 683 compared executions · 74 documented deviations · 0 tolerated failures.
 **Surface:** 91 commands — 47 full · 39 partial · 0 stub · 2 extension · 3 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations

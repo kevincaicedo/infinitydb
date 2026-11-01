@@ -239,6 +239,15 @@ pub static MATRIX: &[Case] = &[
     c(&["TTL"]),
     c(&["NOSUCHCOMMAND"]),
     c(&["NOSUCHCOMMAND", "arg1", "arg2"]),
+    // Only a registry name resolves, in any letter case. Each of these
+    // shares a name's hash words and is still unknown: added bytes that
+    // fold to zero with a ninth byte that cancels the length change, and a
+    // non-letter that differs from the name's byte in bit 5 alone.
+    c(&["PING    -"]),
+    c(&["GET     *", "twin"]),
+    c(&["SUBSCRIBF "]),
+    c(&["JSON\x0eGET", "twin"]),
+    c(&["inf\x0ens"]),
     // --- C6 (review 2026-08-30): client bytes inside a line-framed reply ---
     // The unknown-command reply quotes the name and the arguments raw, so it
     // is where a client's own bytes can open a second RESP frame. Redis maps
