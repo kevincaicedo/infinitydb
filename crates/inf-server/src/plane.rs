@@ -64,8 +64,9 @@ use inf_store::{
     WallAnchor,
 };
 use inf_wire::{
-    ArgvRef, CmdFlags, CommandId, ConnParser, OpenReply, OwnedReply, Parsed, ParserLimits,
-    Protocol, ReplyBuf, ReplyOutcome, RespWriter, ZeroByteReply, arity_ok, extract_keys, lookup,
+    ArgvRef, CmdFlags, CommandId, ConnParser, ErrorPassthrough, OpenReply, OwnedReply, Parsed,
+    ParserLimits, Protocol, ReplyBuf, ReplyOutcome, RespWriter, SuccessView, ZeroByteReply,
+    arity_ok, extract_keys, lookup,
 };
 
 #[cfg(test)]
@@ -102,7 +103,7 @@ use scatter::{
     CROSS_CELL_EXECUTION_FAILED, CountedFold, ScatterScope, error_reply, extract_keys_iter,
     extract_keys_slices, int_reply, keyspace_level, ns_dbsize_local, parse_publisher_tag,
     peer_cells, program_keys, program_move, program_msetnx, program_randomkey, program_scan,
-    run_local, simple_reply, stages, u64_decimal,
+    read_array_leg, run_local, simple_reply, stages, u64_decimal,
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
 use shared::{DurableAdmission, NsApplyOutcome, handle_ns_apply, tier_to_fan};

@@ -669,15 +669,16 @@ pub(super) enum GatherPart {
 /// is a one-element array, its `*1\r\n` header stripped. Which is decided
 /// by the reply's outcome, never by its bytes (ADR-0190 D2).
 pub(super) fn gather_element(reply: &OwnedReply) -> &[u8] {
-    if reply.is_error() {
-        return reply.bytes();
-    }
-    // reply-outcome-allow: the shape strip of a Success sub-reply, whose outcome was read above
-    match reply.bytes().strip_prefix(b"*1\r\n") {
+    let view = match reply.success() {
+        Ok(view) => view,
+        Err(ErrorPassthrough) => return reply.bytes(),
+    };
+    // reply-outcome-allow: the shape strip of a SuccessView, whose outcome success() read
+    match view.bytes().strip_prefix(b"*1\r\n") {
         Some(element) => element,
         None => {
             debug_assert!(false, "a Success JSON.MGET sub-reply is a one-element array");
-            reply.bytes()
+            view.bytes()
         }
     }
 }

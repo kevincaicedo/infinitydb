@@ -28,6 +28,6 @@ pub use parser::{
     Parsed, ParserLimits, WireError,
 };
 pub use writer::{
-    OpenReply, OwnedReply, Protocol, Reply, ReplyBuf, ReplyMark, ReplyOutcome, RespWriter,
-    ZeroByteReply,
+    ErrorPassthrough, OpenReply, OwnedReply, Protocol, Reply, ReplyBuf, ReplyMark, ReplyOutcome,
+    RespWriter, SuccessView, ZeroByteReply,
 };

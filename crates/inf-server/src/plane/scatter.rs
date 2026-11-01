@@ -77,6 +77,11 @@ impl CountedFold {
 /// (ADR-0190 D2). One `const`, read by every writer of it.
 pub(super) const CROSS_CELL_EXECUTION_FAILED: &str = "ERR cross-cell execution failed";
 
+/// The one text of a program leg the program cannot read: a `Success` leg
+/// its decoder refuses, or a value of a shape the program never asked for
+/// (ADR-0190 A1.2). One `const`, read by every writer of it.
+pub(super) const PROGRAM_REPLY_MALFORMED: &str = "ERR cross-cell program reply malformed";
+
 /// An error reply written into `buf` (cleared first), closed with its
 /// outcome.
 fn owned_error(buf: Vec<u8>, proto: Protocol, text: &str) -> OwnedReply {
@@ -441,7 +446,7 @@ pub(super) async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clon
         None => return error_reply(shared, proto, "ERR no such key"),
     };
     if deadline < -1 {
-        return error_reply(shared, proto, "ERR cross-cell program reply malformed");
+        return error_reply(shared, proto, PROGRAM_REPLY_MALFORMED);
     }
     if cmd == CommandId::Renamenx {
         // Preserve the existing-target no-op even under OOM. SET NX below
@@ -466,7 +471,7 @@ pub(super) async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clon
         return int_reply(shared, proto, 0);
     }
     if !applied {
-        return error_reply(shared, proto, "ERR cross-cell program reply malformed");
+        return error_reply(shared, proto, PROGRAM_REPLY_MALFORMED);
     }
     if cmd == CommandId::Copy {
         return int_reply(shared, proto, 1);
@@ -525,14 +530,12 @@ async fn move_read<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         &[b"INF.PEEK", source, b"ABS", b"NOSTATS"]
     };
     let raw = run_on(shared, origin, owner, Protocol::Resp2, id, db, args).await;
-    if raw.is_error() {
-        return Err(raw);
-    }
-    let snapshot = parse_take_reply(raw.bytes());
+    let snapshot = match raw.success() {
+        Ok(view) => parse_take_reply(view),
+        Err(ErrorPassthrough) => return Err(raw),
+    };
     shared.recycle_reply_buf(raw.into_bytes());
-    snapshot.ok_or_else(|| {
-        error_reply(shared, Protocol::Resp2, "ERR cross-cell program reply malformed")
-    })
+    snapshot.ok_or_else(|| error_reply(shared, Protocol::Resp2, PROGRAM_REPLY_MALFORMED))
 }
 
 /// Only an exact match at the source authorizes removal after a successful
@@ -571,7 +574,7 @@ async fn move_remove<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         ));
     }
     if !removed {
-        return Err(error_reply(shared, Protocol::Resp2, "ERR cross-cell program reply malformed"));
+        return Err(error_reply(shared, Protocol::Resp2, PROGRAM_REPLY_MALFORMED));
     }
     Ok(())
 }
@@ -618,9 +621,11 @@ pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clon
         ScatterScope::Db => run_local(shared, origin, proto, id, db, argv),
         ScatterScope::Ns(ns) => ns_run_local(shared, origin, proto, id, db, ns, argv).await,
     };
-    let Some((mut total, local_off)) = parse_array_header(local.bytes()) else {
-        return local; // error passthrough
+    let local = match read_array_leg(shared, proto, local) {
+        Ok(leg) => leg,
+        Err(answer) => return answer,
     };
+    let mut total = local.count();
     let mut waiters = Vec::new();
     for cell in peer_cells(shared) {
         match scatter_send(shared, cell, proto, db, scope, argv).await {
@@ -628,16 +633,16 @@ pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clon
             Err(refusal) => return refusal,
         }
     }
-    let mut bodies: Vec<(OwnedReply, usize)> = Vec::new();
+    let mut bodies: Vec<ArrayLeg> = Vec::new();
     for waiter in waiters {
         match waiter.await {
-            OwnedOutcome::Reply(reply) => {
-                let Some((n, off)) = parse_array_header(reply.bytes()) else {
-                    return reply; // peer error passthrough
-                };
-                total += n;
-                bodies.push((reply, off));
-            }
+            OwnedOutcome::Reply(reply) => match read_array_leg(shared, proto, reply) {
+                Ok(leg) => {
+                    total += leg.count();
+                    bodies.push(leg);
+                }
+                Err(answer) => return answer,
+            },
             OwnedOutcome::Ok
             | OwnedOutcome::Int(_)
             | OwnedOutcome::Nil
@@ -651,14 +656,14 @@ pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clon
     {
         let mut w = RespWriter::new(&mut reply, proto);
         w.array_header(total);
-        w.encoded(&local.bytes()[local_off..]);
-        for (body, off) in &bodies {
-            w.encoded(&body.bytes()[*off..]);
+        w.encoded(local.body());
+        for body in &bodies {
+            w.encoded(body.body());
         }
     }
-    shared.recycle_reply_buf(local.into_bytes());
-    for (body, _) in bodies {
-        shared.recycle_reply_buf(body.into_bytes());
+    shared.recycle_reply_buf(local.into_reply().into_bytes());
+    for body in bodies {
+        shared.recycle_reply_buf(body.into_reply().into_bytes());
     }
     reply.finish()
 }
@@ -687,9 +692,11 @@ pub(super) async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clon
     let mut sub: Vec<&[u8]> = argv.to_vec();
     sub[1] = local_cursor;
     let raw = scatter_run_on(shared, origin, CellId(target), proto, id, db, scope, &sub).await;
-    let Some((inner, rest_at)) = parse_scan_head(raw.bytes()) else {
-        return raw; // error passthrough
+    let leg = match read_scan_leg(shared, proto, raw) {
+        Ok(leg) => leg,
+        Err(answer) => return answer,
     };
+    let inner = leg.cursor();
     let next = if inner != 0 {
         (u64::from(target) << SCAN_CELL_SHIFT) | inner
     } else if target + 1 < shared.cells {
@@ -703,9 +710,9 @@ pub(super) async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clon
         w.array_header(2);
         let mut next_buf = [0u8; 20];
         w.bulk(crate::exec::fmt_u64(&mut next_buf, next));
-        w.encoded(&raw.bytes()[rest_at..]);
+        w.encoded(leg.rest());
     }
-    shared.recycle_reply_buf(raw.into_bytes());
+    shared.recycle_reply_buf(leg.into_reply().into_bytes());
     reply.finish()
 }
 
@@ -761,13 +768,111 @@ pub(super) fn parse_publisher_tag(conn: &[u8], seq: &[u8]) -> Option<(ConnKey, u
     Some((ConnKey::unpack(conn), seq))
 }
 
-/// `*N\r\n` array header → `(N, body offset)`. `None` for errors/nulls.
-/// Public for the fuzz target. A value decoder, not an outcome reader:
-/// `PUBSUB CHANNELS` reads its leg's outcome before calling it. `KEYS`
-/// does not yet: on its local and peer legs a reply this decoder refuses
-/// is answered whole, so a `Success` leg without a header reaches the
-/// client where the rule answers `ERR cross-cell program reply malformed`
-/// (ADR-0190 D2) — not built.
+/// An array leg its reader accepted (`KEYS`, `PUBSUB CHANNELS`): the reply,
+/// its element count and where its body starts. Only `read_array_leg`
+/// builds one, so every leg a merge pastes had its outcome read.
+#[derive(Debug)]
+pub(super) struct ArrayLeg {
+    reply: OwnedReply,
+    count: usize,
+    body_at: usize,
+}
+
+impl ArrayLeg {
+    pub(super) fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The elements, as the merge pastes them under its own header.
+    pub(super) fn body(&self) -> &[u8] {
+        &self.reply.bytes()[self.body_at..]
+    }
+
+    /// The reply, for the pool's recycle once its body is pasted.
+    pub(super) fn into_reply(self) -> OwnedReply {
+        self.reply
+    }
+}
+
+/// A `SCAN` leg its reader accepted: the reply, the cell's next cursor and
+/// where the keys array starts. Only `read_scan_leg` builds one.
+#[derive(Debug)]
+pub(super) struct ScanLeg {
+    reply: OwnedReply,
+    cursor: u64,
+    rest_at: usize,
+}
+
+impl ScanLeg {
+    pub(super) fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// The keys array, as the program pastes it after its own cursor.
+    pub(super) fn rest(&self) -> &[u8] {
+        &self.reply.bytes()[self.rest_at..]
+    }
+
+    /// The reply, for the pool's recycle once its keys are pasted.
+    pub(super) fn into_reply(self) -> OwnedReply {
+        self.reply
+    }
+}
+
+/// An array leg's three answers (ADR-0190 A1.2): an `Error` leg is the
+/// reply, untouched; a `Success` leg without an array header answers
+/// `PROGRAM_REPLY_MALFORMED`; a well-formed leg is the leg.
+pub(super) fn read_array_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    proto: Protocol,
+    reply: OwnedReply,
+) -> Result<ArrayLeg, OwnedReply> {
+    let (reply, (count, body_at)) = read_leg(shared, proto, reply, parse_array_header)?;
+    Ok(ArrayLeg { reply, count, body_at })
+}
+
+/// A `SCAN` leg's three answers, as `read_array_leg`'s for its head.
+pub(super) fn read_scan_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    proto: Protocol,
+    reply: OwnedReply,
+) -> Result<ScanLeg, OwnedReply> {
+    let (reply, (cursor, rest_at)) = read_leg(shared, proto, reply, parse_scan_head)?;
+    Ok(ScanLeg { reply, cursor, rest_at })
+}
+
+/// The one rule behind every leg reader: the outcome is read first, by
+/// type, so an `Error` leg passes through whole and `decode` sees only a
+/// `Success` leg's bytes; one it refuses is a malformed peer reply, its
+/// buffer recycled and the refusal written into a fresh one.
+fn read_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static, T>(
+    shared: &Shared<O, F>,
+    proto: Protocol,
+    reply: OwnedReply,
+    decode: impl FnOnce(SuccessView<'_>) -> Option<T>,
+) -> Result<(OwnedReply, T), OwnedReply> {
+    let decoded = match reply.success() {
+        Ok(view) => decode(view),
+        Err(ErrorPassthrough) => return Err(reply),
+    };
+    match decoded {
+        Some(value) => Ok((reply, value)),
+        None => {
+            shared.recycle_reply_buf(reply.into_bytes());
+            Err(error_reply(shared, proto, PROGRAM_REPLY_MALFORMED))
+        }
+    }
+}
+
+/// `*N\r\n` array header → `(N, body offset)`. `None` for a null array or
+/// any other shape. A value decoder over a `SuccessView`: its caller read
+/// the leg's outcome by type, so `None` means a malformed success, which
+/// `read_array_leg` answers (ADR-0190 A1.2). Public for the fuzz target,
+/// and never over a reply's raw bytes:
+///
+/// ```compile_fail,E0308
+/// let _ = inf_server::parse_array_header(b"*0\r\n");
+/// ```
 #[doc(hidden)]
 #[cfg_attr(
     not(test),
@@ -778,8 +883,9 @@ pub(super) fn parse_publisher_tag(conn: &[u8], seq: &[u8]) -> Option<(ConnKey, u
         clippy::arithmetic_side_effects
     )
 )]
-pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
-    // reply-outcome-allow: a fuzzed value decoder; KEYS's two legs do not read their outcome first
+pub fn parse_array_header(reply: SuccessView<'_>) -> Option<(usize, usize)> {
+    let raw = reply.bytes();
+    // reply-outcome-allow: a value decoder over a SuccessView, whose outcome its caller read
     let rest = raw.strip_prefix(b"*")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let n: i64 = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
@@ -790,11 +896,14 @@ pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
 /// `*2\r\n$N\r\n<cursor>\r\n…` SCAN reply head → `(cursor, keys offset)`.
 /// Every bound is checked before it is indexed (F-L12-06): the cursor's
 /// trailing CRLF must exist, so the offset never lands past the buffer
-/// (`&raw[rest_at..]` at the caller). Public for the fuzz target. A value
-/// decoder, not an outcome reader; its one caller, `SCAN`, does not yet
-/// read its leg's outcome first: a reply this decoder refuses is answered
-/// whole, a `Success` leg without the head included (ADR-0190 D2 answers
-/// that `ERR cross-cell program reply malformed`) — not built.
+/// (`&raw[rest_at..]` at the caller). A value decoder over a `SuccessView`:
+/// its caller read the leg's outcome by type, so `None` means a malformed
+/// success, which `read_scan_leg` answers (ADR-0190 A1.2). Public for the
+/// fuzz target, and never over a reply's raw bytes:
+///
+/// ```compile_fail,E0308
+/// let _ = inf_server::parse_scan_head(b"*2\r\n$1\r\n0\r\n*0\r\n");
+/// ```
 #[doc(hidden)]
 #[cfg_attr(
     not(test),
@@ -805,8 +914,9 @@ pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
         clippy::arithmetic_side_effects
     )
 )]
-pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
-    // reply-outcome-allow: a fuzzed value decoder; SCAN does not read its leg's outcome first
+pub fn parse_scan_head(reply: SuccessView<'_>) -> Option<(u64, usize)> {
+    let raw = reply.bytes();
+    // reply-outcome-allow: a value decoder over a SuccessView, whose outcome its caller read
     let rest = raw.strip_prefix(b"*2\r\n$")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let len: usize = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
@@ -823,6 +933,13 @@ pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
 /// Two-field snapshot reply: `*-1` means missing; `*2 [$value][:time]`
 /// carries milliseconds (-1 means no expiry). Legacy forms return remaining
 /// TTL; the move program's `INF.PEEK key ABS` returns absolute Unix expiry.
+/// A value decoder over a `SuccessView`: its one caller, the move's read
+/// leg, read the outcome by type (ADR-0190 A1.2). Public for the fuzz
+/// targets, and never over a reply's raw bytes:
+///
+/// ```compile_fail,E0308
+/// let _ = inf_server::parse_take_reply(b"*-1\r\n");
+/// ```
 #[cfg_attr(
     not(test),
     deny(
@@ -832,11 +949,12 @@ pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
         clippy::arithmetic_side_effects
     )
 )]
-pub fn parse_take_reply(raw: &[u8]) -> Option<Option<(Vec<u8>, i64)>> {
+pub fn parse_take_reply(reply: SuccessView<'_>) -> Option<Option<(Vec<u8>, i64)>> {
+    let raw = reply.bytes();
     if raw == b"*-1\r\n" {
         return Some(None);
     }
-    // reply-outcome-allow: a fuzzed value decoder; its one caller reads the leg's outcome first
+    // reply-outcome-allow: a value decoder over a SuccessView, whose outcome its caller read
     let rest = raw.strip_prefix(b"*2\r\n$")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let len: usize = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
@@ -944,19 +1062,35 @@ pub(super) fn extract_keys_iter<'v, 'a>(
 
 #[cfg(test)]
 mod scatter_reply_parsers {
+    use super::{OpenReply, OwnedReply, ReplyOutcome, SuccessView};
     use super::{parse_array_header, parse_scan_head, parse_take_reply};
+
+    /// `raw` as a `Success` leg reply. An empty `raw` is a reply that wrote
+    /// nothing, the one empty view a decoder meets: `received` refuses zero
+    /// bytes, a finished empty reply does not.
+    fn leg(raw: &[u8]) -> OwnedReply {
+        match OwnedReply::received(raw.to_vec(), ReplyOutcome::Success) {
+            Ok(reply) => reply,
+            Err(_) => OpenReply::new(Vec::new()).finish(),
+        }
+    }
+
+    fn view(reply: &OwnedReply) -> SuccessView<'_> {
+        reply.success().expect("a Success reply has a view")
+    }
 
     /// F-L12-06: a SCAN head without its trailing CRLF must be refused,
     /// never answered with an offset past the buffer.
     #[test]
     fn scan_head_without_a_terminator_is_refused() {
-        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0\r\n"), Some((0, 11)));
-        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0"), None);
-        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0\r"), None);
-        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0\n\n"), None);
-        assert_eq!(parse_scan_head(b"*2\r\n$2\r\n0"), None);
+        let head = |raw: &[u8]| parse_scan_head(view(&leg(raw)));
+        assert_eq!(head(b"*2\r\n$1\r\n0\r\n"), Some((0, 11)));
+        assert_eq!(head(b"*2\r\n$1\r\n0"), None);
+        assert_eq!(head(b"*2\r\n$1\r\n0\r"), None);
+        assert_eq!(head(b"*2\r\n$1\r\n0\n\n"), None);
+        assert_eq!(head(b"*2\r\n$2\r\n0"), None);
         let ok = b"*2\r\n$3\r\n123\r\n*0\r\n";
-        let (cursor, at) = parse_scan_head(ok).expect("well formed");
+        let (cursor, at) = head(ok).expect("well formed");
         assert_eq!((cursor, &ok[at..]), (123, &b"*0\r\n"[..]));
     }
 
@@ -964,17 +1098,18 @@ mod scatter_reply_parsers {
     /// maximum, and one past it; the offset is always `*` + digits + CRLF.
     #[test]
     fn array_header_count_is_narrowed_never_wrapped() {
-        assert_eq!(parse_array_header(b"*0\r\n"), Some((0, 4)));
-        assert_eq!(parse_array_header(b"*1\r\nx"), Some((1, 4)));
-        assert_eq!(parse_array_header(b"*-1\r\n"), None, "a null array has no body");
-        assert_eq!(parse_array_header(b"*-9223372036854775808\r\n"), None);
+        let header = |raw: &[u8]| parse_array_header(view(&leg(raw)));
+        assert_eq!(header(b"*0\r\n"), Some((0, 4)));
+        assert_eq!(header(b"*1\r\nx"), Some((1, 4)));
+        assert_eq!(header(b"*-1\r\n"), None, "a null array has no body");
+        assert_eq!(header(b"*-9223372036854775808\r\n"), None);
         assert_eq!(
-            parse_array_header(b"*9223372036854775807\r\n"),
+            header(b"*9223372036854775807\r\n"),
             Some((i64::MAX as usize, 22)),
             "the largest count a peer can state"
         );
-        assert_eq!(parse_array_header(b"*9223372036854775808\r\n"), None, "past i64");
-        assert_eq!(parse_array_header(b"*\r\n"), None, "no digits");
+        assert_eq!(header(b"*9223372036854775808\r\n"), None, "past i64");
+        assert_eq!(header(b"*\r\n"), None, "no digits");
     }
 
     /// The keys offset is the head's exact length, at the smallest cursor
@@ -984,11 +1119,11 @@ mod scatter_reply_parsers {
         for cursor in ["0", "18446744073709551615"] {
             let head = format!("*2\r\n${}\r\n{cursor}\r\n", cursor.len());
             let raw = format!("{head}*0\r\n");
-            let parsed = parse_scan_head(raw.as_bytes()).expect("a well-formed head");
+            let parsed = parse_scan_head(view(&leg(raw.as_bytes()))).expect("a well-formed head");
             assert_eq!(parsed, (cursor.parse().expect("u64"), head.len()));
         }
         assert_eq!(
-            parse_scan_head(b"*2\r\n$18446744073709551615\r\n0\r\n"),
+            parse_scan_head(view(&leg(b"*2\r\n$18446744073709551615\r\n0\r\n"))),
             None,
             "length past the buffer"
         );
@@ -1011,11 +1146,16 @@ mod scatter_reply_parsers {
         ];
         for raw in samples {
             for n in 0..=raw.len() {
-                let _ = parse_scan_head(&raw[..n]);
-                let _ = parse_take_reply(&raw[..n]);
-                let _ = parse_array_header(&raw[..n]);
+                let reply = leg(&raw[..n]);
+                let _ = parse_scan_head(view(&reply));
+                let _ = parse_take_reply(view(&reply));
+                let _ = parse_array_header(view(&reply));
             }
         }
+        let nothing = leg(b"");
+        assert_eq!(parse_array_header(view(&nothing)), None, "an empty view is refused");
+        assert_eq!(parse_scan_head(view(&nothing)), None);
+        assert_eq!(parse_take_reply(view(&nothing)), None);
     }
 }
 

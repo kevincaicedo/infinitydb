@@ -162,7 +162,43 @@ impl OwnedReply {
     pub fn reopen(self) -> OpenReply {
         Reply { bytes: self.bytes, start: 0, outcome: self.outcome }
     }
+
+    /// The reply's bytes as a [`SuccessView`] when its outcome is `Success`;
+    /// an `Error` reply is [`ErrorPassthrough`]: its holder answers it whole.
+    /// The one way to a view, so a decoder that takes one never reads a
+    /// reply whose outcome was not read (ADR-0190 A1.2).
+    pub fn success(&self) -> Result<SuccessView<'_>, ErrorPassthrough> {
+        match self.outcome {
+            ReplyOutcome::Success => Ok(SuccessView { bytes: &self.bytes }),
+            ReplyOutcome::Error => Err(ErrorPassthrough),
+        }
+    }
 }
+
+/// A reply's bytes whose outcome was read as `Success` (ADR-0190 A1.2): a
+/// value decoder of another cell's reply takes one, never raw bytes, so its
+/// refusal means a malformed success and never a missed error. Built only
+/// by [`OwnedReply::success`]; no struct literal outside this crate does:
+///
+/// ```compile_fail,E0451
+/// let view = inf_wire::SuccessView { bytes: b"+OK\r\n" };
+/// ```
+#[derive(Copy, Clone, Debug)]
+pub struct SuccessView<'r> {
+    bytes: &'r [u8],
+}
+
+impl<'r> SuccessView<'r> {
+    /// The viewed reply's bytes, whole.
+    pub fn bytes(self) -> &'r [u8] {
+        self.bytes
+    }
+}
+
+/// [`OwnedReply::success`]'s answer for an `Error` reply: the reply is the
+/// answer, passed through whole by its holder.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ErrorPassthrough;
 
 /// Reply writer over one [`Reply`]: it takes split borrows of the reply's
 /// buffer, start and outcome once, at [`RespWriter::new`], so every frame

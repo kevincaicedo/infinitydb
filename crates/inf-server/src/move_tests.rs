@@ -44,7 +44,9 @@ fn snapshot_parser_rejects_bad_delimiters_and_trailing_bytes() {
         b"*2\r\n$1\r\nv\r\n:-1\r\n+OK\r\n",
         b"*-1\r\n+OK\r\n",
     ] {
-        assert!(parse_take_reply(raw).is_none(), "H3 follow-up: malformed snapshot accepted");
+        let reply = success(raw);
+        let view = reply.success().expect("a Success leg has a view");
+        assert!(parse_take_reply(view).is_none(), "H3 follow-up: malformed snapshot accepted");
     }
 }
 
@@ -52,8 +54,8 @@ fn snapshot_parser_rejects_bad_delimiters_and_trailing_bytes() {
 #[test]
 fn snapshot_length_overflow_is_rejected() {
     for len in [usize::MAX, usize::MAX - 1, usize::MAX - 20] {
-        let raw = format!("*2\r\n${len}\r\nx\r\n:-1\r\n");
-        assert!(parse_take_reply(raw.as_bytes()).is_none());
+        let reply = success(format!("*2\r\n${len}\r\nx\r\n:-1\r\n").as_bytes());
+        assert!(parse_take_reply(reply.success().expect("a Success leg has a view")).is_none());
     }
 }
 

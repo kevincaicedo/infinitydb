@@ -16,6 +16,7 @@ use inf_store::{Keyspace, StoreConfig};
 use super::dispatch::gather_json_mget;
 use super::dispatch::{dispatch_scatter, program_mset, settle_reply};
 use super::publish::program_pubsub;
+use super::scatter::{PROGRAM_REPLY_MALFORMED, read_scan_leg};
 use super::*;
 
 /// The client-side key every settled reply is written for (no connection
@@ -315,6 +316,102 @@ fn reply_outcome_channels_error_leg_is_the_reply() {
 
 async fn channels(cells: &Cells) -> Vec<u8> {
     program_pubsub(cells.origin(), Protocol::Resp2, &[b"PUBSUB", b"CHANNELS"]).await.into_bytes()
+}
+
+/// A `KEYS` peer leg that succeeded without an array header is a malformed
+/// peer reply, never the client's whole answer.
+#[test]
+fn reply_outcome_keys_success_leg_without_header_is_malformed() {
+    let cells = Cells::new();
+    let reply = cells
+        .drive(keys(&cells), |args| (args[0] == b"KEYS").then_some(Outcome::Bytes(b"+OK\r\n")));
+    assert_eq!(reply, written_error("ERR cross-cell program reply malformed"));
+}
+
+/// Control: a `KEYS` peer leg's error is the reply, untouched, whatever its
+/// first byte.
+#[test]
+fn reply_outcome_keys_error_leg_is_the_reply() {
+    let cells = Cells::new();
+    let reply =
+        cells.drive(keys(&cells), |args| (args[0] == b"KEYS").then_some(Outcome::ErrorReply(BLOB)));
+    assert_eq!(reply, BLOB);
+}
+
+/// A `SCAN` leg on the peer's cell that succeeded without its head is a
+/// malformed peer reply, never the client's whole answer.
+#[test]
+fn reply_outcome_scan_success_leg_without_head_is_malformed() {
+    let cells = Cells::new();
+    let reply = cells.drive(scan_on_peer(&cells), |args| {
+        (args[0] == b"SCAN").then_some(Outcome::Bytes(b"+OK\r\n"))
+    });
+    assert_eq!(reply, written_error("ERR cross-cell program reply malformed"));
+}
+
+/// Control: a `SCAN` leg's error is the reply, untouched, whatever its
+/// first byte.
+#[test]
+fn reply_outcome_scan_error_leg_is_the_reply() {
+    let cells = Cells::new();
+    let reply = cells.drive(scan_on_peer(&cells), |args| {
+        (args[0] == b"SCAN").then_some(Outcome::ErrorReply(BLOB))
+    });
+    assert_eq!(reply, BLOB);
+}
+
+/// A leg reply as the decode builds it, its outcome from the wire.
+fn leg(bytes: &[u8], outcome: ReplyOutcome) -> OwnedReply {
+    OwnedReply::received(bytes.to_vec(), outcome).expect("a non-empty leg")
+}
+
+/// An array leg's three answers, decided by its reader: an `Error` leg is
+/// the reply untouched, a `Success` leg without a header the malformed
+/// refusal, a well-formed one its count and body. No producer answers a
+/// `KEYS` local leg a headerless success, so this row is that leg's.
+#[test]
+fn reply_outcome_array_leg_reader_answers_each_outcome() {
+    let cells = Cells::new();
+    let shared = cells.origin();
+    let read = |reply| read_array_leg(shared, Protocol::Resp2, reply);
+    let passed = read(leg(BLOB, ReplyOutcome::Error)).expect_err("an error leg");
+    assert_eq!((passed.bytes(), passed.is_error()), (BLOB, true));
+    let refused = read(leg(b"+OK\r\n", ReplyOutcome::Success)).expect_err("a malformed success");
+    assert_eq!(refused.bytes(), written_error(PROGRAM_REPLY_MALFORMED));
+    assert!(refused.is_error());
+    let array = read(leg(b"*1\r\n$1\r\nk\r\n", ReplyOutcome::Success)).expect("a well-formed leg");
+    assert_eq!((array.count(), array.body()), (1, &b"$1\r\nk\r\n"[..]));
+}
+
+/// A scan leg's three answers, decided by its reader.
+#[test]
+fn reply_outcome_scan_leg_reader_answers_each_outcome() {
+    let cells = Cells::new();
+    let shared = cells.origin();
+    let read = |reply| read_scan_leg(shared, Protocol::Resp2, reply);
+    let passed = read(leg(BLOB, ReplyOutcome::Error)).expect_err("an error leg");
+    assert_eq!((passed.bytes(), passed.is_error()), (BLOB, true));
+    let refused = read(leg(b"*1\r\n", ReplyOutcome::Success)).expect_err("a malformed success");
+    assert_eq!(refused.bytes(), written_error(PROGRAM_REPLY_MALFORMED));
+    assert!(refused.is_error());
+    let head = read(leg(b"*2\r\n$1\r\n7\r\n*0\r\n", ReplyOutcome::Success)).expect("a well-formed");
+    assert_eq!((head.cursor(), head.rest()), (7, &b"*0\r\n"[..]));
+}
+
+async fn keys(cells: &Cells) -> Vec<u8> {
+    let argv: &[&[u8]] = &[b"KEYS", b"*"];
+    program_keys(cells.origin(), ORIGIN, Protocol::Resp2, 0, 0, ScatterScope::Db, argv)
+        .await
+        .into_bytes()
+}
+
+/// `SCAN` at the first cursor of cell 1, so the one leg crosses the fabric.
+async fn scan_on_peer(cells: &Cells) -> Vec<u8> {
+    let cursor = (1u64 << SCAN_CELL_SHIFT).to_string();
+    let argv: &[&[u8]] = &[b"SCAN", cursor.as_bytes()];
+    program_scan(cells.origin(), ORIGIN, Protocol::Resp2, 0, 0, ScatterScope::Db, argv)
+        .await
+        .into_bytes()
 }
 
 /// A peer's error in RESP3's second encoding (`!`), carried by the wire's

@@ -395,9 +395,10 @@ pub(super) async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Cl
 }
 
 /// `PUBSUB CHANNELS`' merge: this cell's names, then each peer's array
-/// body, under one header (KEYS-style header arithmetic). A peer's error is
-/// the reply, decided by its outcome; a success without an array header is
-/// a malformed peer reply, never the client's whole answer (ADR-0190 D2).
+/// body, under one header (KEYS-style header arithmetic). Each peer leg is
+/// read by `read_array_leg`, as `KEYS`'s are: its error is the reply, and a
+/// success without an array header is a malformed peer reply, never the
+/// client's whole answer (ADR-0190 D2, A1.2).
 async fn merge_channels<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
@@ -405,18 +406,16 @@ async fn merge_channels<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     waiters: Vec<GateWait<u64, OwnedOutcome>>,
 ) -> OwnedReply {
     let mut total = local.len();
-    let mut bodies: Vec<(OwnedReply, usize)> = Vec::new();
+    let mut bodies = Vec::new();
     for waiter in waiters {
         match waiter.await {
-            OwnedOutcome::Reply(reply) if reply.is_error() => return reply,
-            OwnedOutcome::Reply(reply) => {
-                let Some((n, off)) = parse_array_header(reply.bytes()) else {
-                    shared.recycle_reply_buf(reply.into_bytes());
-                    return error_reply(shared, proto, "ERR cross-cell program reply malformed");
-                };
-                total += n;
-                bodies.push((reply, off));
-            }
+            OwnedOutcome::Reply(reply) => match read_array_leg(shared, proto, reply) {
+                Ok(leg) => {
+                    total += leg.count();
+                    bodies.push(leg);
+                }
+                Err(answer) => return answer,
+            },
             OwnedOutcome::Ok
             | OwnedOutcome::Int(_)
             | OwnedOutcome::Nil
@@ -433,12 +432,12 @@ async fn merge_channels<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
         for name in local {
             w.bulk(name);
         }
-        for (body, off) in &bodies {
-            w.encoded(&body.bytes()[*off..]);
+        for body in &bodies {
+            w.encoded(body.body());
         }
     }
-    for (body, _) in bodies {
-        shared.recycle_reply_buf(body.into_bytes());
+    for body in bodies {
+        shared.recycle_reply_buf(body.into_reply().into_bytes());
     }
     reply.finish()
 }
