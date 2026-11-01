@@ -703,6 +703,25 @@ between cells in one process, not authentication or an ACL capability
 > decides from its bytes, but for the `KEYS` and `SCAN` programs' legs
 > (§6b). The sketch below is the shape (ADR-0190 D1).
 
+> **ADR-0190 A1 (2026-10-30), implementation open:** the open reply
+> lives beside its buffer. `ReplyBuf` owns its bytes with the reply's
+> start and outcome and has no public constructor: it is reached as
+> `&mut ReplyBuf` from a `ReplyStream` (a buffer of successive replies,
+> a connection's output or an owner's reply scratch), whose `open()`
+> starts the next reply at the buffer's end with outcome `Success`, or
+> from an `OpenReply` (one owned reply over a pool buffer, opened at 0),
+> whose `reply()` lends it. `Reply<B>`, `ReplyBuf::over` and
+> `OpenReply::lend` go. `RespWriter::new` takes `&mut ReplyBuf`; the
+> writer holds the reply and the protocol, and its frame methods are as
+> before. A stream's buffer is read, sent, appended to and emptied only
+> between replies (`as_bytes`, `consume`, `emit`, `discard`). These
+> types are not built; until they are, the sketch below is ADR-0190
+> D1's shape. `OwnedReply::success()` answers a `SuccessView` of a
+> `Success` reply's bytes, or `ErrorPassthrough` for an `Error` reply;
+> a value decoder of a leg's bytes takes only a `SuccessView`, so no
+> decoder reads a reply whose outcome was not read. The view is not
+> built.
+
 ```rust
 // Parser: per-connection state over borrowed input; a frame that spans feeds
 // accumulates (bounded: hard cap → typed error, the Vortex lesson), and each
@@ -932,6 +951,16 @@ impl SlotRouter {
 > comparison in production `crates/inf-server/src`; a sanctioned site
 > carries `reply-outcome-allow: <reason>`. The sketch below is the shape
 > (ADR-0190 D2, D4).
+
+> **ADR-0190 A1 (2026-10-30), implementation open:** `execute` and
+> every reply parameter take `out: &mut ReplyBuf`, with no lifetime;
+> the parse stage's batch holds the connection's `ReplyStream` and the
+> drain the owner's reply scratch, each opening one reply per command
+> it runs. These parameters are not built. The `KEYS` and `SCAN`
+> programs read each leg's outcome first, as `PUBSUB CHANNELS` does: an
+> `Error` leg is the reply, untouched; a `Success` leg without its
+> header answers `ERR cross-cell program reply malformed`. The legs'
+> reading is not built.
 
 ```rust
 pub struct ConnCx { pub proto: Protocol, pub id: u64 }   // HELLO state
