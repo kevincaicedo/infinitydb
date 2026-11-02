@@ -164,7 +164,8 @@ impl Node {
     }
 
     fn apply(&mut self, record: &RecordView<'_>) -> Result<(), ReplayError> {
-        self.ks.apply_record(record, NOW, ANCHOR, &mut self.spill).map(|_| ())
+        inf_store::drive_record(&mut self.ks, record, NOW, ANCHOR, &mut self.spill, u64::MAX)
+            .map(|_| ())
     }
 }
 

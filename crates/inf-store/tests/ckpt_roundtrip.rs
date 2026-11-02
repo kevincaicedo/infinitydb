@@ -155,8 +155,15 @@ proptest! {
             &dir.join(ick_file_name(1)),
             IckReaderConfig::default(),
             |view| {
-                let outcome =
-                    recovered.apply_record(&view, NOW, ANCHOR, &mut NoSpill).expect("apply");
+                let outcome = inf_store::drive_record(
+                    &mut recovered,
+                    &view,
+                    NOW,
+                    ANCHOR,
+                    &mut NoSpill,
+                    u64::MAX,
+                )
+                .expect("apply");
                 assert!(matches!(outcome, ReplayOutcome::Applied), "checkpoint records apply");
                 Ok::<(), ()>(())
             },

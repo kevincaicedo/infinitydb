@@ -567,9 +567,16 @@ pub(crate) fn survival_audit(
         if let Some(manifest) = &manifest {
             let ick = shard.join("ckpt").join(ick_file_name(manifest.ckpt_id));
             let loaded = read_ick(disk, &ick, IckReaderConfig::default(), |record| {
-                ks.apply_record(&record, now, anchor, &mut inf_store::NoSpill)
-                    .map(|_| ())
-                    .map_err(|e| format!("{e:?}"))
+                inf_store::drive_record(
+                    &mut ks,
+                    &record,
+                    now,
+                    anchor,
+                    &mut inf_store::NoSpill,
+                    u64::MAX,
+                )
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
             });
             if let Err(err) = loaded {
                 tally.violations.push(format!(
@@ -607,7 +614,14 @@ pub(crate) fn survival_audit(
                             if begin.is_some_and(|b| lsn < b) {
                                 continue;
                             }
-                            let _ = ks.apply_record(&record, now, anchor, &mut inf_store::NoSpill);
+                            let _ = inf_store::drive_record(
+                                &mut ks,
+                                &record,
+                                now,
+                                anchor,
+                                &mut inf_store::NoSpill,
+                                u64::MAX,
+                            );
                         }
                     }
                     Ok(None) => break,

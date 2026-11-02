@@ -535,11 +535,42 @@ rows=(
   # last step, so the hand-over's drain bound (one barrier and the
   # rebuild's reads) is what sees it.
   "inf_canary_replay_settle_doubled crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget SETTLE BUDGET VIOLATION"
-  # The same oracle's other two rules: a frame's yield that leaves the
-  # charge out (at 8 MiB a step spans several demote steps), and a driver
-  # that charges no boot I/O (a step wrote tier bytes uncharged).
-  "inf_canary_replay_yield_uncharged crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget passes the budget by more than one frame's unit"
+  # The same oracle's other two rules: a replay step's yield test that
+  # leaves the boot I/O out (at 8 MiB a step spans several demote steps),
+  # and a driver that charges no boot I/O (a step wrote tier bytes
+  # uncharged).
+  "inf_canary_replay_yield_uncharged crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget passes the budget by more than one record's unit"
   "inf_canary_replay_charge_dropped crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget tier files grew under a charge of 0"
+  # ADR-0174 A1, a replay step bounded by its budget and one unit: the
+  # step judge prices each step from what the filesystem saw. Planted, the
+  # frame walk never asks its budget and a demote step runs whole inside
+  # the step that enters the frame (the shape before the walk resumed
+  # inside a frame); or the seal walk ignores the budget left.
+  "inf_canary_recover_frame_whole crate-test inf-server test:recover_replay_steps a_frame_of_rewrites_of_demoted_keys_is_replayed_under_the_step_judge JUDGE"
+  "inf_canary_recover_seal_unbudgeted crate-test inf-server test:recover_replay_steps a_frame_of_rewrites_of_demoted_keys_is_replayed_under_the_step_judge JUDGE"
+  # A delete that read its demoted copy is a priced answer the walk asks
+  # after. Planted, it answers unpriced: a whole walk runs every read.
+  "inf_canary_recover_del_unasked crate-test inf-server test:recover_replay_steps a_frame_of_deletes_of_demoted_keys_asks_after_each_priced_delete JUDGE"
+  # Every record is applied once, in log order, at every budget: budget
+  # independence against the run that never parks. Planted, a resumed walk
+  # passes a record that needs room (a key absent), or applies its last
+  # consumed record again (the counters differ).
+  "inf_canary_recover_skip_on_resume crate-test inf-server test:recover_replay_steps every_budget_recovers_the_state_of_the_unparked_boot BUDGET INDEPENDENCE"
+  "inf_canary_recover_twice_on_resume crate-test inf-server test:recover_replay_steps every_budget_recovers_the_state_of_the_unparked_boot BUDGET INDEPENDENCE"
+  # The begin-LSN test runs on every walk. Planted, only on one that starts
+  # at a frame's entry: a resumed walk applies records older than the
+  # checkpoint.
+  "inf_canary_recover_begin_skip_entry_only crate-test inf-server test:recover_replay_steps a_parked_frame_across_the_begin_lsn_skips_below_and_applies_above_once BEGIN:"
+  # The move that leaves no record runs the record iterator's end check.
+  # Planted, the frame ends on its count alone and a short-count frame
+  # boots.
+  "inf_canary_recover_frame_end_counted crate-test inf-server test:recover_replay_steps a_frame_whose_count_is_short_refuses_the_boot_at_every_budget SHORT COUNT"
+  # A record's room asks count across suspensions (ADR-0174 D2 rule 1, A1.3).
+  # Planted, a resumed demote step's room question counts as a new ask.
+  "inf_canary_recover_room_reask_counted crate-test inf-server test:recover_replay_steps room_asks_count_across_suspensions_and_the_hostile_spec_boots RoomAsks"
+  # A walk that fits asks its budget once. Planted, a whole walk asks after
+  # every record.
+  "inf_canary_recover_ask_per_record crate-test inf-server test:recover_replay_steps a_unit_that_fits_asks_once_per_frame_and_per_section ASK COUNT"
   # ADR-0061 D6: the 0x05 pass lists the entry of a record the walk imaged
   # (a ticket winner below the watermark, ADR-0093 A12) — the boot
   # registers the extent at both addresses and its count stays one above

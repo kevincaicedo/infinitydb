@@ -69,10 +69,10 @@ pub use flush::{
     TierFlushError,
 };
 pub use frame::{
-    DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_HEADER_LEN_V1, FRAME_MAGIC,
-    FRAME_MAGIC_V1, FRAME_MAGIC_V3, FRAME_TRAILER_LEN, FrameBuilder, FrameDecodeError, FrameIter,
-    FrameLayout, FrameRecordError, FrameRef, FrameStamp, MIN_FRAME_LEN, MIN_FRAME_LEN_V1,
-    RecordIter, align_up_frame, decode_frame, frame_header_len,
+    CursorMismatch, DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_HEADER_LEN_V1,
+    FRAME_MAGIC, FRAME_MAGIC_V1, FRAME_MAGIC_V3, FRAME_TRAILER_LEN, FrameBuilder, FrameDecodeError,
+    FrameIter, FrameLayout, FrameRecordError, FrameRef, FrameStamp, MIN_FRAME_LEN,
+    MIN_FRAME_LEN_V1, RecordCursor, RecordIter, align_up_frame, decode_frame, frame_header_len,
 };
 pub use fs::{SegmentIoMode, TierIoMode, is_storage_exhausted};
 pub use geometry::{LogGeometry, LogGeometryError, max_sealed_frame_bytes};

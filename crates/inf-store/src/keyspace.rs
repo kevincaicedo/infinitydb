@@ -53,7 +53,7 @@ use crate::store::{
 };
 use crate::tiered::TieredTable;
 use crate::tiered::promote::PromotionCounters;
-use crate::tiered::replay::{ReplayRefusal, ReplaySpill};
+use crate::tiered::replay::{DeleteReads, DemoteProgress, Placement, ReplayRefusal, ReplaySpill};
 use crate::tiered::shadow::ShadowCounters;
 use crate::wall::WallAnchor;
 use crate::wheel::ExpiryBudget;
@@ -1187,6 +1187,15 @@ impl Keyspace {
     /// the maximum representable (never to `now` — clamping forward-lost
     /// deadlines to the past would expire keys that should live).
     ///
+    /// The answer is one of three (ADR-0174 A1.5): consumed; consumed
+    /// after priced boot work — a tiered `DEL` that read the cold slots
+    /// this boot demoted; or `NeedsRoom(ns)`: the record needs room in the
+    /// namespace's window and changed nothing — no marker drained, no slot
+    /// moved, the register as it found it — so its driver runs the
+    /// machine's [`demote_step`](crate::TierReplay::demote_step) under its
+    /// budget and presents it again. Only the two consumed answers carry
+    /// the advance token a walker moves its cursor with.
+    ///
     /// # Errors
     /// Arena/bounds failures from the store and the typed replay refusals
     /// of a tiered namespace (recovery fail-stop).
@@ -1196,15 +1205,27 @@ impl Keyspace {
         now: Nanos,
         anchor: WallAnchor,
         spill: &mut impl ReplaySpill,
-    ) -> Result<ReplayOutcome, ReplayError> {
+    ) -> Result<Replayed, ReplayError> {
         // Tiered namespaces own their records' replay (ADR-0057 D4,
         // routed by M4-S26) — intercepted before the CellStore arms
         // because a tiered namespace also materializes a named CellStore
         // shell, and applying a tiered record there would build state the
         // tiered index never serves (invisible until the first restart).
-        if let Some(outcome) = self.apply_record_tiered(rec, spill)? {
-            return Ok(outcome);
-        }
+        let answer = match self.apply_record_tiered(rec, spill)? {
+            Some(answer) => answer,
+            None => ApplyAnswer::Consumed(self.apply_record_memory(rec, now, anchor)?),
+        };
+        Ok(advance::answer(answer))
+    }
+
+    /// The memory namespaces' replay arms: every record the tiered arms do
+    /// not route.
+    fn apply_record_memory(
+        &mut self,
+        rec: &LogRecordView<'_>,
+        now: Nanos,
+        anchor: WallAnchor,
+    ) -> Result<ReplayOutcome, ReplayError> {
         match *rec {
             LogRecordView::StringPostImage { ns, key, value } => {
                 let Some(store) = self.replay_store(ns) else {
@@ -1352,7 +1373,9 @@ impl Keyspace {
     /// D9): each record enters the table's replay entry with its parked
     /// markers, so the room question and a `DEL`'s reads precede the
     /// marker drain (ADR-0174 D1, R6). Returns `None` when the
-    /// record is not tiered-routed — the caller's CellStore arms own it.
+    /// record is not tiered-routed — the caller's CellStore arms own it. A
+    /// record that needs room leaves the register armed, as a refused one
+    /// does, so it finds the keyspace as it left it when presented again.
     ///
     /// # Errors
     /// Register overflow, marker adjacency violations, and the replay
@@ -1361,7 +1384,7 @@ impl Keyspace {
         &mut self,
         rec: &LogRecordView<'_>,
         spill: &mut impl ReplaySpill,
-    ) -> Result<Option<ReplayOutcome>, ReplayError> {
+    ) -> Result<Option<ApplyAnswer>, ReplayError> {
         // Strict marker adjacency (ADR-0057 D4: markers stage in the same
         // frame immediately before their mutation): while the register is
         // armed, only further markers or the paired mutation — all in the
@@ -1378,7 +1401,7 @@ impl Keyspace {
                 if !self.is_tiered(ns) {
                     // Dropped namespace or a foreign log: the paired
                     // mutation skips the same way — no register entry.
-                    return Ok(Some(ReplayOutcome::SkippedUnknownNs(ns)));
+                    return Ok(Some(ApplyAnswer::Consumed(ReplayOutcome::SkippedUnknownNs(ns))));
                 }
                 if self.pending_displace.len() >= DISPLACE_REGISTER_CAP {
                     return Err(ReplayError::Displacement(
@@ -1386,38 +1409,43 @@ impl Keyspace {
                     ));
                 }
                 self.pending_displace.push((ns, old_addr));
-                Ok(Some(ReplayOutcome::Applied))
+                Ok(Some(ApplyAnswer::Consumed(ReplayOutcome::Applied)))
             }
             LogRecordView::StringPostImage { ns, key, value } => {
                 let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
                 let machine = spill.replay_mut(ns);
-                entry
+                let placed = entry
                     .table
                     .replay_upsert_lent(machine, entry.markers, key, value, entry.hash)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
-                self.pending_displace.clear();
-                Ok(Some(ReplayOutcome::Applied))
+                Ok(Some(self.placed(ns, placed)))
             }
             LogRecordView::Delete { ns, key } => {
                 let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
                 let machine = spill.replay_mut(ns);
-                entry
+                let (_removed, reads) = entry
                     .table
                     .replay_delete_lent(machine, entry.markers, key, entry.hash)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
-                Ok(Some(ReplayOutcome::Applied))
+                // The planted canary answers a `DEL` that read as one that
+                // did not, so its walk asks nothing after the reads.
+                let priced = reads == DeleteReads::Read && !cfg!(inf_canary_recover_del_unasked);
+                Ok(Some(if priced {
+                    ApplyAnswer::ConsumedPriced(ReplayOutcome::Applied)
+                } else {
+                    ApplyAnswer::Consumed(ReplayOutcome::Applied)
+                }))
             }
             LogRecordView::StringExtentRef { ns, key, extent_id, offset, len } => {
                 let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
                 let ext = ExtentRef { extent_id, offset, len };
                 let machine = spill.replay_mut(ns);
-                entry
+                let placed = entry
                     .table
                     .replay_upsert_extent_lent(machine, entry.markers, key, entry.hash, ext)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
-                self.pending_displace.clear();
-                Ok(Some(ReplayOutcome::Applied))
+                Ok(Some(self.placed(ns, placed)))
             }
             // Tiered namespaces carry no expiry and no documents in M4
             // (commands refuse; only a foreign log can contain these) —
@@ -1427,13 +1455,25 @@ impl Keyspace {
             | LogRecordView::DocDelta { ns, .. }
                 if self.is_tiered(ns) =>
             {
-                Ok(Some(ReplayOutcome::SkippedReserved))
+                Ok(Some(ApplyAnswer::Consumed(ReplayOutcome::SkippedReserved)))
             }
             LogRecordView::ExpireAt { .. }
             | LogRecordView::NsOp { .. }
             | LogRecordView::CkptBegin { .. }
             | LogRecordView::DocDelta { .. }
             | LogRecordView::DocFull { .. } => Ok(None),
+        }
+    }
+
+    /// An upsert's answer: placed — its markers drained, so the register
+    /// empties — or waiting for room with the register armed.
+    fn placed(&mut self, ns: NsId, placement: Placement) -> ApplyAnswer {
+        match placement {
+            Placement::Placed(_) => {
+                self.pending_displace.clear();
+                ApplyAnswer::Consumed(ReplayOutcome::Applied)
+            }
+            Placement::NeedsRoom => ApplyAnswer::NeedsRoom(ns),
         }
     }
 
@@ -1715,6 +1755,131 @@ fn fold_store(acc: &mut StateDigest, store: &CellStore, tag: u64, now: Nanos) {
         if cursor == 0 {
             break;
         }
+    }
+}
+
+/// What [`Keyspace::apply_record`] answers for one record (ADR-0174
+/// A1.5): three outcomes, one enum. A walker over a frame or a section
+/// moves past the record only on a consumed answer, with its
+/// [`ConsumedRecord`] token; `NeedsRoom` carries none.
+#[must_use = "a record that needs room was not applied"]
+#[derive(Debug)]
+pub enum Replayed {
+    /// The record was applied or skipped.
+    Consumed(ConsumedRecord),
+    /// As `Consumed`, after priced boot work: a tiered `DEL` that read the
+    /// cold slots this boot demoted, which its walker charges and asks its
+    /// budget after.
+    ConsumedPriced(ConsumedRecord),
+    /// The record needs room in this namespace's window and changed
+    /// nothing; its machine's demote step makes the room.
+    NeedsRoom(NsId),
+}
+
+pub use advance::ConsumedRecord;
+
+/// What the replay arms answer before the token is made.
+enum ApplyAnswer {
+    Consumed(ReplayOutcome),
+    ConsumedPriced(ReplayOutcome),
+    NeedsRoom(NsId),
+}
+
+/// The advance token, made in one place: [`answer`](advance::answer), which
+/// [`Keyspace::apply_record`] alone calls on its arms' answer, so a token
+/// exists only for a record `apply_record` consumed.
+mod advance {
+    use super::{ApplyAnswer, ReplayOutcome, Replayed};
+
+    /// The proof that `apply_record` consumed a record: what a walker
+    /// spends to move its cursor past it. Not `Clone`; its field is
+    /// private to this module, whose one maker is [`answer`].
+    #[must_use = "a consumed record's token moves the walker past it"]
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct ConsumedRecord {
+        outcome: ReplayOutcome,
+    }
+
+    impl ConsumedRecord {
+        /// What the record did, for the walker's counters.
+        #[must_use]
+        pub fn outcome(&self) -> ReplayOutcome {
+            self.outcome
+        }
+    }
+
+    /// The answer of `apply_record`, the token's one maker.
+    pub(super) fn answer(answer: ApplyAnswer) -> Replayed {
+        match answer {
+            ApplyAnswer::Consumed(outcome) => Replayed::Consumed(ConsumedRecord { outcome }),
+            ApplyAnswer::ConsumedPriced(outcome) => {
+                Replayed::ConsumedPriced(ConsumedRecord { outcome })
+            }
+            ApplyAnswer::NeedsRoom(ns) => Replayed::NeedsRoom(ns),
+        }
+    }
+}
+
+/// The store tier's driver of one record (ADR-0174 A1): presents `rec`
+/// and, while it answers `NeedsRoom`, runs its namespace's demote step at
+/// `budget_bytes` a call until the step answers `Room`, then presents it
+/// again; it returns what the consumed answer says. Store-tier tests,
+/// benches and the simulator replay through it and keep no loop of their
+/// own; the recovery driver of `inf-server` is the other loop, which adds
+/// the step budget, the cursor and the yield. Every decision is below
+/// both: `apply_record`, the demote step, the room-ask count.
+///
+/// # Errors
+/// `apply_record`'s and the demote step's, the namespace named; a record
+/// waiting for room with no machine to make it is `RoomMoved`.
+pub fn drive_record<S: ReplaySpill>(
+    ks: &mut Keyspace,
+    rec: &LogRecordView<'_>,
+    now: Nanos,
+    anchor: WallAnchor,
+    spill: &mut S,
+    budget_bytes: u64,
+) -> Result<ReplayOutcome, ReplayError> {
+    // A record that does not wait for room, nearly every one, is presented
+    // once with no loop around it: the loop form hoisted the presentation's
+    // invariants into every call (more instructions a record on the image
+    // replay bench), and the loop is the cold rest.
+    match ks.apply_record(rec, now, anchor, spill)? {
+        Replayed::Consumed(token) | Replayed::ConsumedPriced(token) => Ok(token.outcome()),
+        Replayed::NeedsRoom(ns) => drive_room(ks, rec, now, anchor, spill, budget_bytes, ns),
+    }
+}
+
+/// [`drive_record`] once its record answered `NeedsRoom` in `ns`: the
+/// demote step until it answers `Room`, then the record again.
+#[cold]
+#[inline(never)]
+fn drive_room<S: ReplaySpill>(
+    ks: &mut Keyspace,
+    rec: &LogRecordView<'_>,
+    now: Nanos,
+    anchor: WallAnchor,
+    spill: &mut S,
+    budget_bytes: u64,
+    mut ns: NsId,
+) -> Result<ReplayOutcome, ReplayError> {
+    // Bound: a presentation that needs room makes one room ask more, and a
+    // record makes at most four (D2 rule 1); each demote step call walks a
+    // record at least, or completes.
+    loop {
+        let (Some(machine), Some(table)) = (spill.replay_mut(ns), ks.tiered_store_mut(ns)) else {
+            let refusal =
+                ReplayRefusal::RoomMoved { why: "a record waits for room with no machine" };
+            return Err(ReplayError::Replay { ns, refusal });
+        };
+        let refused = |refusal| ReplayError::Replay { ns, refusal };
+        while machine.demote_step(table, budget_bytes).map_err(refused)? == DemoteProgress::More {}
+        ns = match ks.apply_record(rec, now, anchor, spill)? {
+            Replayed::Consumed(token) | Replayed::ConsumedPriced(token) => {
+                return Ok(token.outcome());
+            }
+            Replayed::NeedsRoom(ns) => ns,
+        };
     }
 }
 
@@ -2224,7 +2389,7 @@ mod tests {
         for _ in 0..2 {
             // Double apply: replay from an older checkpoint re-covers records.
             assert_eq!(
-                ks.apply_record(&set, now, anchor, &mut NoSpill).expect("apply"),
+                drive_record(&mut ks, &set, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
                 ReplayOutcome::Applied
             );
         }
@@ -2234,7 +2399,7 @@ mod tests {
         let future_unix = anchor.unix_from_internal(Nanos::from_millis(60_000));
         let exp = LogRecordView::ExpireAt { ns: NsId(16), at_unix_ms: future_unix, key: b"k" };
         assert_eq!(
-            ks.apply_record(&exp, now, anchor, &mut NoSpill).expect("apply"),
+            drive_record(&mut ks, &exp, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
             ReplayOutcome::Applied
         );
         assert_eq!(ks.ns_store_mut(NsId(16)).expect("live").get(b"k", now), Some(&b"v1"[..]));
@@ -2246,24 +2411,24 @@ mod tests {
 
         let del = LogRecordView::Delete { ns: NsId(16), key: b"gone" };
         assert_eq!(
-            ks.apply_record(&del, now, anchor, &mut NoSpill).expect("apply"),
+            drive_record(&mut ks, &del, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
             ReplayOutcome::Applied
         );
 
         // Unknown / reserved ids skip, never error (dropped-ns tolerance).
         let foreign = LogRecordView::StringPostImage { ns: NsId(99), key: b"x", value: b"y" };
         assert_eq!(
-            ks.apply_record(&foreign, now, anchor, &mut NoSpill).expect("apply"),
+            drive_record(&mut ks, &foreign, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
             ReplayOutcome::SkippedUnknownNs(NsId(99))
         );
         let reserved = LogRecordView::StringPostImage { ns: NsId(3), key: b"x", value: b"y" };
         assert_eq!(
-            ks.apply_record(&reserved, now, anchor, &mut NoSpill).expect("apply"),
+            drive_record(&mut ks, &reserved, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
             ReplayOutcome::SkippedUnknownNs(NsId(3))
         );
         let nsop = LogRecordView::NsOp { ns: NsId(16), payload: b"reserved" };
         assert_eq!(
-            ks.apply_record(&nsop, now, anchor, &mut NoSpill).expect("apply"),
+            drive_record(&mut ks, &nsop, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
             ReplayOutcome::SkippedReserved
         );
     }

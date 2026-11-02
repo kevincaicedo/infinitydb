@@ -64,14 +64,18 @@ use inf_log::ckpt::{
 };
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    BootDirs, FrameStamp, LogCorruption, Lsn, Manifest, ReadError, ReadStep, ReaderConfig,
-    RegionEvidence, RegionScan, SegmentId, SegmentReader, SegmentRotor, SegmentScan,
-    check_segment_len, create_cell_dirs, create_cell_dirs_deferred, read_manifest,
-    scan_log_dir_from, scan_region_evidence, segment_file_name,
+    BootDirs, FrameStamp, LogCorruption, Lsn, Manifest, ReadError, ReaderConfig, RegionEvidence,
+    RegionScan, SegmentId, SegmentReader, SegmentRotor, SegmentScan, check_segment_len,
+    create_cell_dirs, create_cell_dirs_deferred, read_manifest, scan_log_dir_from,
+    scan_region_evidence, segment_file_name,
 };
 use inf_store::{Keyspace, ReplayOutcome, WallAnchor};
 
 use crate::durable::DurableConfig;
+
+mod frame_walk;
+use frame_walk::cursor::FrameCursor;
+use frame_walk::{WalkEnd, YieldKind};
 
 /// The recovery pipeline's phases as the outside sees them (M4.5-S39d):
 /// what each [`Recovery::step`] is about to do, typed so the driver can
@@ -267,7 +271,252 @@ pub struct RecoverStats {
     pub recycled_residue_slacks: u64,
     /// Boot replay of the tiered namespaces (ADR-0174 D6), per cell.
     pub tier_replay: TierReplayStats,
+    /// The step facts (ADR-0174 A1.2), per cell: the largest work one step
+    /// did and the liveness counters `INFO persistence` folds.
+    pub step: StepFacts,
+    /// The budget asks the steps made, per cell (not in `INFO`): one per
+    /// call of `StepBudget::spent` or `StepBudget::left`. At `u64::MAX`, on
+    /// a unit that demotes nothing, the replay and checkpoint phases ask
+    /// once per frame and once per section they enter.
+    pub budget_asks: u64,
 }
+
+/// The step facts of one cell's recovery (ADR-0174 A1.2), outside D6's
+/// zero set: the gauge of the largest work one step did — what it charged
+/// (the bytes its cursor passed and its priced boot work) plus the bytes of
+/// the frame it entered and parked in, in budget bytes, never time and never
+/// memory — and the liveness counters, the steps taken and the yields
+/// inside a unit by kind. A fitting boot moves `steps` and can move the
+/// frame and section kinds; its demote-step kind reads zero.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct StepFacts {
+    /// The gauge: the largest work of one step, in budget bytes.
+    pub work_bytes_max: u64,
+    /// Steps that ran a phase.
+    pub steps: u64,
+    /// Steps that yielded inside a log frame.
+    pub yields_in_frame: u64,
+    /// Steps that yielded inside a checkpoint section.
+    pub yields_in_section: u64,
+    /// Steps that yielded inside a demote step's seal walk.
+    pub yields_in_demote_step: u64,
+}
+
+/// [`StepFacts`]' fields in `INFO` order, the one order the recovery board
+/// stores them in.
+pub const STEP_FACT_FIELDS: usize = 5;
+
+/// One `INFO persistence` line of the step facts' node fold: its name and
+/// the field it prints and the recovery board restores.
+pub type StepFactField = (&'static str, fn(&mut StepFacts) -> &mut u64);
+
+impl StepFacts {
+    /// The one table of the node fold's lines, in board order: the
+    /// `recover_node_` prefix names the population, every cell's recovery
+    /// folded — the gauge the largest over the cells, the counters summed.
+    pub const FIELDS: [StepFactField; STEP_FACT_FIELDS] = [
+        ("recover_node_step_work_bytes_max", |s| &mut s.work_bytes_max),
+        ("recover_node_steps", |s| &mut s.steps),
+        ("recover_node_yields_in_frame", |s| &mut s.yields_in_frame),
+        ("recover_node_yields_in_section", |s| &mut s.yields_in_section),
+        ("recover_node_yields_in_demote_step", |s| &mut s.yields_in_demote_step),
+    ];
+
+    /// The fields in [`FIELDS`](Self::FIELDS) order.
+    #[must_use]
+    pub fn to_array(self) -> [u64; STEP_FACT_FIELDS] {
+        let mut facts = self;
+        std::array::from_fn(|i| *(Self::FIELDS[i].1)(&mut facts))
+    }
+
+    /// The inverse of [`to_array`](Self::to_array).
+    #[must_use]
+    pub fn from_array(values: [u64; STEP_FACT_FIELDS]) -> StepFacts {
+        let mut facts = StepFacts::default();
+        for ((_, field), value) in Self::FIELDS.iter().zip(values) {
+            *field(&mut facts) = value;
+        }
+        facts
+    }
+
+    /// The fold of two cells: the gauge the larger, the counters summed.
+    #[must_use]
+    pub fn fold(self, other: StepFacts) -> StepFacts {
+        StepFacts {
+            work_bytes_max: self.work_bytes_max.max(other.work_bytes_max),
+            steps: self.steps.saturating_add(other.steps),
+            yields_in_frame: self.yields_in_frame.saturating_add(other.yields_in_frame),
+            yields_in_section: self.yields_in_section.saturating_add(other.yields_in_section),
+            yields_in_demote_step: self
+                .yields_in_demote_step
+                .saturating_add(other.yields_in_demote_step),
+        }
+    }
+}
+
+/// The recovery step budget (ADR-0174 A1), built by [`Recovery::step`] from
+/// its `budget_bytes` and lent to the phase it runs: the one holder of the
+/// budget and of what the step has charged, so every yield test of
+/// recovery is an ask of it, counted. A charge is budget bytes — the bytes
+/// a cursor passed and boot work at fixed prices — never elapsed time and
+/// never memory.
+#[derive(Debug)]
+pub struct StepBudget {
+    budget: u64,
+    charged: u64,
+    asks: u64,
+}
+
+impl StepBudget {
+    fn new(budget: u64) -> StepBudget {
+        StepBudget { budget, charged: 0, asks: 0 }
+    }
+
+    /// Adds `bytes` to the step's charge (saturating: a yield test, never
+    /// an account that balances).
+    fn charge(&mut self, bytes: u64) {
+        self.charged = self.charged.saturating_add(bytes);
+    }
+
+    /// An ask: whether the step is spent — its charge reached the budget
+    /// and something was charged, so a step with work to do completes a
+    /// unit at any budget, zero included.
+    fn spent(&mut self) -> bool {
+        self.asks = self.asks.saturating_add(1);
+        self.charged > 0 && self.charged >= self.budget
+    }
+
+    /// An ask: the budget less the charge.
+    fn left(&mut self) -> u64 {
+        self.asks = self.asks.saturating_add(1);
+        self.budget.saturating_sub(self.charged)
+    }
+
+    /// What the step has charged.
+    fn charged(&self) -> u64 {
+        self.charged
+    }
+}
+
+/// Which recovery phase a step ran, as [`RECOVERY_UNITS`] rows it — finer
+/// than the five board codes, which cannot tell the end settle from the
+/// finish step.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UnitPhase {
+    Start,
+    Ick,
+    Replay,
+    Audit,
+    Probe,
+    Finish,
+    Settle,
+    Complete,
+}
+
+/// The phases [`RECOVERY_UNITS`] rows.
+pub const UNIT_PHASES: usize = 8;
+
+impl UnitPhase {
+    /// The phase's row in [`RECOVERY_UNITS`].
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            UnitPhase::Start => 0,
+            UnitPhase::Ick => 1,
+            UnitPhase::Replay => 2,
+            UnitPhase::Audit => 3,
+            UnitPhase::Probe => 4,
+            UnitPhase::Finish => 5,
+            UnitPhase::Settle => 6,
+            UnitPhase::Complete => 7,
+        }
+    }
+}
+
+/// What a step of one phase runs between two asks of its budget.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UnitEntry {
+    /// A unit read and audited whole on entry: a log frame.
+    Frame,
+    /// A checkpoint section, read and audited whole on entry.
+    Section,
+    /// No entered unit.
+    None,
+}
+
+/// One phase's row: its unit, the entry it reads whole, and whether the
+/// step budget bounds it. A row that is not budgeted charges and parks
+/// nothing, so the work gauge never reads it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryUnit {
+    pub phase: UnitPhase,
+    pub entry: UnitEntry,
+    pub budgeted: bool,
+    pub unit: &'static str,
+}
+
+/// The recovery units (ADR-0174 A1), one row per [`UnitPhase`], in its
+/// order: the table the driver charges by and a step judge iterates. The
+/// array is sized by the phase count and each row is pinned to its phase's
+/// index, so a phase added without its row does not compile.
+pub const RECOVERY_UNITS: [RecoveryUnit; UNIT_PHASES] = [
+    RecoveryUnit {
+        phase: UnitPhase::Start,
+        entry: UnitEntry::None,
+        budgeted: false,
+        unit: "directories, MANIFEST, the segment scan and the tier map: one step",
+    },
+    RecoveryUnit {
+        phase: UnitPhase::Ick,
+        entry: UnitEntry::Section,
+        budgeted: true,
+        unit: "one checkpoint section, its images' demote steps run whole",
+    },
+    RecoveryUnit {
+        phase: UnitPhase::Replay,
+        entry: UnitEntry::Frame,
+        budgeted: true,
+        unit: "one record with its settle reads, or one demote step's flush",
+    },
+    RecoveryUnit {
+        phase: UnitPhase::Audit,
+        entry: UnitEntry::None,
+        budgeted: false,
+        unit: "one segment's slack scan",
+    },
+    RecoveryUnit {
+        phase: UnitPhase::Probe,
+        entry: UnitEntry::None,
+        budgeted: false,
+        unit: "one segment's evidence probe",
+    },
+    RecoveryUnit {
+        phase: UnitPhase::Finish,
+        entry: UnitEntry::None,
+        budgeted: false,
+        unit: "the lift decision and the unpaired-marker check",
+    },
+    RecoveryUnit {
+        phase: UnitPhase::Settle,
+        entry: UnitEntry::None,
+        budgeted: true,
+        unit: "one end-settled record with its exact-hash group's reads",
+    },
+    RecoveryUnit {
+        phase: UnitPhase::Complete,
+        entry: UnitEntry::None,
+        budgeted: false,
+        unit: "nothing",
+    },
+];
+
+const _: () = {
+    let mut i = 0;
+    while i < UNIT_PHASES {
+        assert!(RECOVERY_UNITS[i].phase.index() == i, "each row sits at its phase's index");
+        i += 1;
+    }
+};
 
 /// What boot replay of the tiered namespaces did on one cell (ADR-0174
 /// D6): the replay machines' counters summed over the cell's recovered
@@ -419,10 +668,12 @@ enum Phase<File: SegmentFile> {
     Ick {
         reader: Box<IckReader<File>>,
     },
-    /// Tail frames replayed under the step budget, one segment at a time.
+    /// Tail frames replayed under the step budget, one segment at a time,
+    /// a step yielding at the next record once its charge reaches the
+    /// budget (ADR-0174 A1).
     Replay {
         idx: usize,
-        reader: Option<Box<SegmentReader<File>>>,
+        reader: ReplayReader<File>,
     },
     /// M2-S14 slack audit of segment `idx`, right after its replay
     /// (ADR-0087 D6); one segment per step.
@@ -446,11 +697,29 @@ enum Phase<File: SegmentFile> {
     Complete,
 }
 
+/// A replay segment's reader: not opened yet, or open with where the walk
+/// stands in it — at a frame boundary, or inside the frame the reader holds,
+/// at a cursor (the cursor lives only beside the reader that holds its
+/// frame).
+enum ReplayReader<File: SegmentFile> {
+    Unopened,
+    Open { reader: Box<SegmentReader<File>>, at: FramePos },
+}
+
+/// Where a replay step resumes in an open segment.
+enum FramePos {
+    /// At the next frame's entry.
+    Boundary,
+    /// Inside the held frame, at the cursor.
+    InFrame(FrameCursor),
+}
+
 /// Boot recovery as a resumable state machine (M2-S15). Construction is
 /// cheap; every I/O happens inside [`step`](Self::step), each call bounded
-/// by `budget_bytes` (plus one frame/section overshoot). The phases and
-/// their semantics are exactly [`open_cell_log`]'s documented pipeline —
-/// that function *is* this machine run to completion.
+/// by `budget_bytes` in charged work plus one unit and the frame it entered
+/// and parked in (ADR-0174 A1). The phases and their semantics are exactly
+/// [`open_cell_log`]'s documented pipeline — that function *is* this
+/// machine run to completion.
 pub struct Recovery<F: SegmentFs> {
     /// The bare tier: dirs, the size probe, tier handles, the rotor —
     /// everything that outlives boot is opened here.
@@ -539,10 +808,17 @@ pub struct Recovery<F: SegmentFs> {
     /// The boot I/O the replay machines did inside the current step, in
     /// bytes of the recovery step budget (ADR-0174 R10; D6's gauge reads
     /// its largest): the barriers, the tier bytes, the settle reads, the
-    /// bytes the end settle walked. Drained per frame, per checkpoint
-    /// section and per settle step, and added to the bytes read when the
-    /// step decides whether to yield.
+    /// bytes the seal and end settle walks passed. Drained where the step
+    /// asks its budget — after a priced record, a demote step, a frame, a
+    /// checkpoint section and a settle step — and charged to it there.
     step_charge: u64,
+    /// The bytes of the frame the current step entered and parked in, not
+    /// charged yet: the rest of the step's work (ADR-0174 A1.2).
+    step_parked_bytes: u64,
+    /// The row of [`RECOVERY_UNITS`] the last step ran.
+    last_unit: UnitPhase,
+    /// The work the last step did ([`Recovery::step_work_bytes`]).
+    step_work: u64,
     /// Recovered tiered namespaces' plane half (M4-S26, ADR-0057 D6):
     /// flush pipeline + open sealed-file handles + the extent sweep
     /// seed — installed into the plane's tier state at completion.
@@ -690,6 +966,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             finished: None,
             recovering_tiers: RecoveringTiers { tiers: Vec::new(), lent: Vec::new() },
             step_charge: 0,
+            step_parked_bytes: 0,
+            last_unit: UnitPhase::Start,
+            step_work: 0,
             recovered_tiers: Vec::new(),
             tier_replay_checked: false,
             #[cfg(feature = "doc")]
@@ -818,6 +1097,14 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         self.step_charge
     }
 
+    /// The work the last [`step`](Self::step) did, in budget bytes
+    /// (ADR-0174 A1.2): what it charged plus the bytes of the frame it
+    /// entered and parked in. The step-facts gauge is the largest of these.
+    #[must_use]
+    pub fn step_work_bytes(&self) -> u64 {
+        self.step_work
+    }
+
     fn fs(&self) -> &F {
         self.fs.as_ref().expect("fs present until finish")
     }
@@ -832,20 +1119,26 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         phases.audit_foreign_frames += evidence.foreign_frames;
     }
 
-    /// Runs one bounded recovery step: at most ~`budget_bytes` of
-    /// checkpoint/replay input (one whole-frame/section overshoot), or one
-    /// audit/GC unit. Returns [`RecoveryProgress::Complete`] when
-    /// [`finish`](Self::finish) may be called.
+    /// Runs one bounded recovery step: at most `budget_bytes` of charged
+    /// work — the checkpoint and log bytes its cursor passed, boot I/O at
+    /// fixed prices — plus one unit and the frame it entered and parked in
+    /// (ADR-0174 A1), or one audit/GC unit. Returns
+    /// [`RecoveryProgress::Complete`] when [`finish`](Self::finish) may be
+    /// called.
     ///
     /// # Errors
     /// Exactly [`open_cell_log`]'s fail-stop taxonomy; a failed machine
     /// must not be stepped again.
     pub fn step(&mut self, ks: &mut Keyspace, budget_bytes: u64) -> io::Result<RecoveryProgress> {
         self.step_charge = 0;
+        self.step_parked_bytes = 0;
+        let mut budget = StepBudget::new(budget_bytes);
+        let unit = self.unit_phase();
+        let budget_ref = &mut budget;
         let progress = match core::mem::replace(&mut self.phase, Phase::Complete) {
             Phase::Start => self.step_start(ks),
-            Phase::Ick { reader } => self.step_ick(ks, reader, budget_bytes),
-            Phase::Replay { idx, reader } => self.step_replay(ks, idx, reader, budget_bytes),
+            Phase::Ick { reader } => self.step_ick(ks, reader, budget_ref),
+            Phase::Replay { idx, reader } => self.step_replay(ks, idx, reader, budget_ref),
             Phase::Audit { idx } => self.step_audit(idx),
             // Replay is not over while a hole can still be lifted: the
             // end-of-replay checks run inside the finish step, once the
@@ -857,19 +1150,59 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             // `Complete` (M4.5-S39d): the driver samples its clock around
             // every step, so its time is only attributable once a later
             // call exists — one extra polling iteration at boot.
-            Phase::Settle => self.step_settle(ks, budget_bytes).map(|_| RecoveryProgress::Working),
+            Phase::Settle => self.step_settle(ks, budget_ref).map(|_| RecoveryProgress::Working),
             Phase::Complete => Ok(RecoveryProgress::Complete),
         };
-        // ADR-0174 D6's gauge: the largest boot I/O charge one step took.
+        // ADR-0174 D6's gauge: the largest boot I/O charge one step took;
+        // A1.2's: the largest work, its charge and the frame it parked in.
         let gauge = &mut self.stats.tier_replay.step_charge_bytes_max;
         *gauge = (*gauge).max(self.step_charge);
+        let facts = &mut self.stats.step;
+        let work = budget.charged().saturating_add(self.step_parked_bytes);
+        facts.work_bytes_max = facts.work_bytes_max.max(work);
+        self.step_work = work;
+        if unit != UnitPhase::Complete {
+            facts.steps += 1;
+        }
+        self.stats.budget_asks = self.stats.budget_asks.saturating_add(budget.asks);
+        self.last_unit = unit;
         progress
+    }
+
+    /// The row of [`RECOVERY_UNITS`] the last [`step`](Self::step) ran —
+    /// finer than [`phase`](Self::phase): the end settle and the finish
+    /// step share a board code.
+    #[must_use]
+    pub fn unit_row(&self) -> &'static RecoveryUnit {
+        &RECOVERY_UNITS[self.last_unit.index()]
+    }
+
+    /// The unit phase of the phase the next step runs.
+    fn unit_phase(&self) -> UnitPhase {
+        match &self.phase {
+            Phase::Start => UnitPhase::Start,
+            Phase::Ick { .. } => UnitPhase::Ick,
+            Phase::Replay { .. } => UnitPhase::Replay,
+            Phase::Audit { .. } => UnitPhase::Audit,
+            Phase::Probe { .. } => UnitPhase::Probe,
+            Phase::Finish => UnitPhase::Finish,
+            Phase::Settle => UnitPhase::Settle,
+            Phase::Complete => UnitPhase::Complete,
+        }
     }
 
     /// Drains the replay machines' boot I/O into this step's charge.
     fn drain_boot_io(&mut self) {
         let charge = self.recovering_tiers.take_charge();
         self.step_charge = self.step_charge.saturating_add(charge);
+    }
+
+    /// Drains the replay machines' boot I/O into this step's charge and
+    /// into its budget.
+    fn drain_into(&mut self, budget: &mut StepBudget) {
+        let charge = self.recovering_tiers.take_charge();
+        self.step_charge = self.step_charge.saturating_add(charge);
+        budget.charge(charge);
     }
 
     /// The recovered rotor + stats + manifest seed.
@@ -1021,7 +1354,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             // No MANIFEST: the whole retained log replays, into tiered
             // namespaces recovered through the empty section (D4).
             self.recover_tiers(ks, None)?;
-            Phase::Replay { idx: 0, reader: None }
+            Phase::Replay { idx: 0, reader: ReplayReader::Unopened }
         };
         self.scan = Some(scan);
         self.phase = next;
@@ -1047,6 +1380,14 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             )));
         }
         for tier in &mut self.recovering_tiers.tiers {
+            // A record left waiting for room was passed unapplied: a typed
+            // refusal, a defect class no input reaches (ADR-0174 A1).
+            if tier.replay.waits_for_room() {
+                return Err(io_msg(format!(
+                    "tiered ns {}: RoomMoved: replay ended with a record waiting for room",
+                    tier.ns.0
+                )));
+            }
             if let Some(table) = ks.tiered_store(tier.ns) {
                 tier.replay.end_of_replay(table);
             }
@@ -1279,18 +1620,18 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     /// namespace that demoted, under what is left of the step budget once
     /// this step's charge is taken; at its end, once, the hand-over (E13),
     /// the sidecar commit, then the log's resume point and the rotor.
-    fn step_settle(&mut self, ks: &mut Keyspace, budget_bytes: u64) -> io::Result<()> {
+    fn step_settle(&mut self, ks: &mut Keyspace, budget: &mut StepBudget) -> io::Result<()> {
         // Bound: one settle step per namespace still settling, each under
         // the budget left; a machine that did not demote answers `Done`.
         // A step yields only once it charged something (L6: progress is
         // explicit): at a budget it never spent — a zero budget — the
         // first settle walks one record (`settle_step`'s floor).
         for i in 0..self.recovering_tiers.tiers.len() {
-            let left = budget_bytes.saturating_sub(self.step_charge);
-            if left == 0 && self.step_charge > 0 {
+            if budget.spent() {
                 self.phase = Phase::Settle;
                 return Ok(());
             }
+            let left = budget.left();
             // The planted canaries break R10's budget: the end settle walks
             // its whole open span in one step, or settles at twice its budget.
             let left = if cfg!(inf_canary_replay_settle_unbudgeted) { u64::MAX } else { left };
@@ -1307,12 +1648,15 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 .map_err(|refusal| replay_refused(ns, &refusal))?;
             let charge = boot_io_charge(tier.replay.take_work());
             self.step_charge = self.step_charge.saturating_add(charge);
+            budget.charge(charge);
             if progress == inf_store::SettleProgress::More {
                 self.phase = Phase::Settle;
                 return Ok(());
             }
         }
+        let before = self.step_charge;
         self.finish_tier_replay(ks)?;
+        budget.charge(self.step_charge.saturating_sub(before));
         self.finish_index_replay(ks);
         self.resume_log()
     }
@@ -1363,7 +1707,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         &mut self,
         ks: &mut Keyspace,
         mut reader: Box<IckReader<BootFile<F>>>,
-        budget_bytes: u64,
+        budget: &mut StepBudget,
     ) -> io::Result<RecoveryProgress> {
         let manifest = self.manifest.as_ref().expect("ick phase");
         let ick_path = self.ckpt_dir.join(ick_file_name(manifest.ckpt_id));
@@ -1378,7 +1722,6 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // see — a RefCell makes the exclusivity dynamic (single-threaded,
         // non-reentrant by construction).
         let ks = std::cell::RefCell::new(ks);
-        let mut spent = 0u64;
         loop {
             // ADR-0100 D6: a tiered section naming a tombstoned namespace
             // is the residue of an acked DROP — skipped and counted (the
@@ -1397,9 +1740,13 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     // The replay seam (ADR-0174 D1): a tiered image enters
                     // its namespace's boot machine, which demotes when the
                     // window is full.
+                    // Until the section walk resumes inside a section, an
+                    // image that needs room runs its demote step whole, the
+                    // section staying the unit, as it is today.
                     |record| {
-                        ks.borrow_mut()
-                            .apply_record(&record, now, anchor, &mut self.recovering_tiers)
+                        let mut ks = ks.borrow_mut();
+                        let spill = &mut self.recovering_tiers;
+                        inf_store::drive_record(&mut ks, &record, now, anchor, spill, u64::MAX)
                             .map(|_| ())
                             .map_err(io_invalid)
                     },
@@ -1487,15 +1834,16 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             self.stats.dropped_sections_skipped += dropped_sections.get();
             match step {
                 IckStep::Section { bytes } => {
-                    spent += bytes;
                     self.ick_credited += bytes;
                     self.bytes_done += bytes;
                     self.bytes_consumed += bytes;
-                    // The section's boot I/O is the step's too (ADR-0174
-                    // R10's step budget): it yields at the next section
-                    // boundary, a section being the non-yielding unit (OD-1).
-                    self.drain_boot_io();
-                    if spent.saturating_add(self.step_charge) >= budget_bytes {
+                    // The section's bytes and its boot I/O are the step's
+                    // charge (ADR-0174 R10's step budget): it yields at the
+                    // next section, which stays one unit until the section
+                    // walk resumes inside one; one ask a section.
+                    budget.charge(bytes);
+                    self.drain_into(budget);
+                    if budget.spent() {
                         self.phase = Phase::Ick { reader };
                         return Ok(RecoveryProgress::Working);
                     }
@@ -1519,7 +1867,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     self.bytes_done += rest;
                     self.bytes_consumed += rest;
                     self.stats.phases.ckpt_bytes = self.bytes_consumed;
-                    self.phase = Phase::Replay { idx: 0, reader: None };
+                    self.phase = Phase::Replay { idx: 0, reader: ReplayReader::Unopened };
                     return Ok(RecoveryProgress::Working);
                 }
             }
@@ -1530,8 +1878,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         &mut self,
         ks: &mut Keyspace,
         idx: usize,
-        reader: Option<Box<SegmentReader<BootFile<F>>>>,
-        budget_bytes: u64,
+        reader: ReplayReader<BootFile<F>>,
+        budget: &mut StepBudget,
     ) -> io::Result<RecoveryProgress> {
         // ADR-0031 D5: replay already ended at an epoch-regressed frame —
         // every later segment is discarded-life residue. Record an empty
@@ -1543,183 +1891,86 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             self.phase = Phase::Audit { idx };
             return Ok(RecoveryProgress::Working);
         }
-        let mut reader = match reader {
-            Some(reader) => reader,
-            None => Box::new(
-                SegmentReader::open(
+        let (mut reader, mut at) = match reader {
+            ReplayReader::Open { reader, at } => (reader, at),
+            ReplayReader::Unopened => {
+                let reader = SegmentReader::open(
                     &self.boot_reads,
                     &self.log_dir,
                     self.segments[idx],
                     ReaderConfig::default(),
                 )
-                .map_err(io_invalid)?,
-            ),
+                .map_err(io_invalid)?;
+                (Box::new(reader), FramePos::Boundary)
+            }
         };
+        // The throttle and progress count a frame whole at its entry, so a
+        // parked frame lies before the next step's start; the step budget
+        // charges bytes as the cursor passes them (ADR-0174 A1).
         let start_offset = u64::from(reader.offset());
-        // Replay this segment's frames, recording where its valid data
-        // ends. A frame-level failure marks the data end at the failed
-        // frame's base and replay continues with the next segment: whether
-        // those bytes were a torn tail, inert residue, or interior
-        // corruption is decided by the slack scans (Audit phase) — on
-        // evidence, not on which code path noticed them (M2-S14,
-        // ADR-0018). Store failures and read I/O errors fail-stop as-is.
-        // v2 stamp continuity (ADR-0031 D3) is checked before any record
-        // of the frame applies.
+        // Bound: the frames of one segment; a step leaves at its budget.
         loop {
-            match reader.next_step() {
-                Ok(ReadStep::Frame(frame)) => {
-                    let frame_base =
-                        frame.first_lsn().offset - u32::try_from(frame.header_len()).expect("40");
-                    let verdict = self.classify_stamp(
-                        frame.stamp(),
-                        self.segments[idx],
-                        frame_base,
-                        frame.first_lsn(),
-                    )?;
-                    match verdict {
-                        StampVerdict::Replay => {}
-                        StampVerdict::ResidueStop => {
-                            // The frame validates but belongs to a
-                            // discarded life: end this segment's data here
-                            // and stop replay — the audit scans the rest.
-                            self.residue_stop = true;
-                            self.stats.epoch_residue_stops += 1;
-                            self.stats.segments += 1;
-                            self.ends.push((frame_base, None));
-                            let consumed = u64::from(frame_base).saturating_sub(start_offset);
-                            self.bytes_done += consumed;
-                            self.bytes_consumed += consumed;
-                            self.bytes_done +=
-                                self.seg_sizes[idx].saturating_sub(u64::from(frame_base));
-                            self.phase = Phase::Audit { idx };
-                            return Ok(RecoveryProgress::Working);
-                        }
-                    }
-                    self.stats.frames += 1;
-                    let at = frame.first_lsn();
-                    for record in frame.records() {
-                        let (lsn, record) = record
-                            .map_err(io_invalid)
-                            .map_err(|error| replay_apply_failed(at, &error))?;
-                        // Floor-segment records below begin are superseded
-                        // by the checkpoint (module docs) — only the floor
-                        // segment can hold any (earlier segments were
-                        // truncated or are stale, never replayed).
-                        if self.begin_lsn.is_some_and(|begin| lsn < begin) {
-                            self.stats.records_pre_begin += 1;
-                            continue;
-                        }
-                        let outcome = ks
-                            .apply_record(
-                                &record,
-                                self.now,
-                                self.anchor,
-                                &mut self.recovering_tiers,
-                            )
-                            .map_err(io_invalid)
-                            .map_err(|error| replay_apply_failed(at, &error))?;
-                        match outcome {
-                            ReplayOutcome::Applied => self.stats.records_applied += 1,
-                            ReplayOutcome::SkippedUnknownNs(ns) => {
-                                self.stats.records_skipped += 1;
-                                // ADR-0103 D4: a tombstone explains a
-                                // dropped namespace's records; an id
-                                // nothing explains is a foreign log or
-                                // corruption — counted apart, asserted
-                                // zero by the DST, never silent.
-                                if !ks.ns_tombstoned(ns) {
-                                    self.stats.records_skipped_unknown_ns += 1;
-                                }
-                            }
-                            ReplayOutcome::SkippedReserved => self.stats.records_skipped += 1,
-                            ReplayOutcome::SkippedMarker => self.stats.markers += 1,
-                            ReplayOutcome::SkippedDocDeltaStale => {
-                                self.stats.doc_deltas_skipped_stale += 1;
-                            }
-                            ReplayOutcome::SkippedDocDeltaMissing => {
-                                self.stats.doc_deltas_skipped_missing += 1;
-                            }
-                        }
-                    }
-                    // The frame's boot I/O is the step's too (ADR-0174
-                    // R10's step budget): a step that demotes yields at the
-                    // next frame boundary, a frame being the non-yielding
-                    // unit (OD-1).
-                    self.drain_boot_io();
-                    let consumed = u64::from(reader.offset()) - start_offset;
-                    // The planted canary leaves the charge out of the yield.
-                    let charge =
-                        if cfg!(inf_canary_replay_yield_uncharged) { 0 } else { self.step_charge };
-                    if consumed.saturating_add(charge) >= budget_bytes {
-                        self.bytes_done += consumed;
-                        self.bytes_consumed += consumed;
-                        self.phase = Phase::Replay { idx, reader: Some(reader) };
+            let (cursor, resumed) = match at {
+                FramePos::InFrame(cursor) => (cursor, true),
+                FramePos::Boundary => match self.enter_frame(idx, &mut reader, start_offset)? {
+                    Some(cursor) => (cursor, false),
+                    None => return Ok(RecoveryProgress::Working),
+                },
+            };
+            match self.walk_frame(ks, &reader, cursor, budget, resumed)? {
+                WalkEnd::FrameEnd { ask_yield } => {
+                    at = FramePos::Boundary;
+                    if ask_yield {
+                        self.credit_replayed(&reader, start_offset);
+                        let reader = ReplayReader::Open { reader, at };
+                        self.phase = Phase::Replay { idx, reader };
                         return Ok(RecoveryProgress::Working);
                     }
                 }
-                Ok(ReadStep::End(end)) => {
-                    // Continuity never spans a segment boundary (ADR-0031
-                    // D3): a torn rotation-tail frame leaves the same
-                    // clean-end shape as ordinary prealloc slack, so a seq
-                    // step across segments is legal physics, not
-                    // malformation. Epoch monotonicity and the
-                    // cross-segment attestation check still span.
-                    self.prev_stamp = None;
-                    self.stats.segments += 1;
-                    self.ends.push((end.at(), None));
-                    // Credit the consumed bytes plus the segment's slack
-                    // (progress only — slack is skipped, not read).
-                    let consumed = u64::from(reader.offset()) - start_offset;
-                    self.bytes_done += consumed;
-                    self.bytes_consumed += consumed;
-                    self.bytes_done +=
-                        self.seg_sizes[idx].saturating_sub(u64::from(reader.offset()));
-                    self.phase = Phase::Audit { idx };
-                    return Ok(RecoveryProgress::Working);
-                }
-                Err(err @ ReadError::Io { .. }) => return Err(io_invalid(err)),
-                Err(ReadError::ForeignSegment { offset, .. }) => {
-                    // ADR-0090 D2 as amended: a decoded frame at its own
-                    // offset stamped for another segment id is recycled-
-                    // life residue — this segment's data ends here, as
-                    // cleanly as at a zero tail. Replay goes on in the
-                    // next segment (a foreign frame says nothing about
-                    // the segments after it); the audit proves the slack.
-                    self.prev_stamp = None;
-                    self.stats.segments += 1;
-                    self.stats.segment_residue_stops += 1;
-                    self.ends.push((offset, None));
-                    let consumed = u64::from(offset).saturating_sub(start_offset);
-                    self.bytes_done += consumed;
-                    self.bytes_consumed += consumed;
-                    self.bytes_done += self.seg_sizes[idx].saturating_sub(u64::from(offset));
-                    self.phase = Phase::Audit { idx };
-                    return Ok(RecoveryProgress::Working);
-                }
-                Err(err) => {
-                    let offset = match &err {
-                        ReadError::Frame { offset, .. } | ReadError::LsnMismatch { offset, .. } => {
-                            *offset
-                        }
-                        ReadError::Io { .. } | ReadError::ForeignSegment { .. } => {
-                            unreachable!("Io and foreign-segment reads are handled above")
-                        }
-                    };
-                    // The contiguity run breaks here (ADR-0031 D3): frames
-                    // in later segments are a fresh baseline — the audit
-                    // owns everything at and beyond this break. Epoch
-                    // monotonicity still spans breaks (`max_prefix_epoch`).
-                    self.prev_stamp = None;
-                    self.stats.segments += 1;
-                    self.ends.push((offset, Some(err)));
-                    let consumed = u64::from(reader.offset()) - start_offset;
-                    self.bytes_done += consumed;
-                    self.bytes_consumed += consumed;
-                    self.bytes_done += self.seg_sizes[idx].saturating_sub(u64::from(offset));
-                    self.phase = Phase::Audit { idx };
+                WalkEnd::Parked { cursor, kind, unpaid } => {
+                    if !resumed {
+                        self.step_parked_bytes = unpaid;
+                    }
+                    let facts = &mut self.stats.step;
+                    match kind {
+                        YieldKind::Frame => facts.yields_in_frame += 1,
+                        YieldKind::DemoteStep => facts.yields_in_demote_step += 1,
+                    }
+                    self.credit_replayed(&reader, start_offset);
+                    let at = FramePos::InFrame(cursor);
+                    self.phase = Phase::Replay { idx, reader: ReplayReader::Open { reader, at } };
                     return Ok(RecoveryProgress::Working);
                 }
             }
+        }
+    }
+
+    /// The bytes this step's reader consumed, credited to progress and the
+    /// throttle at the frame granularity they were read in.
+    fn credit_replayed(&mut self, reader: &SegmentReader<BootFile<F>>, start_offset: u64) {
+        let consumed = u64::from(reader.offset()) - start_offset;
+        self.bytes_done += consumed;
+        self.bytes_consumed += consumed;
+    }
+
+    /// Counts one consumed record's outcome.
+    fn count_outcome(&mut self, ks: &Keyspace, outcome: ReplayOutcome) {
+        match outcome {
+            ReplayOutcome::Applied => self.stats.records_applied += 1,
+            ReplayOutcome::SkippedUnknownNs(ns) => {
+                self.stats.records_skipped += 1;
+                // ADR-0103 D4: a tombstone explains a dropped namespace's
+                // records; an id nothing explains is a foreign log or
+                // corruption — counted apart, asserted zero by the DST,
+                // never silent.
+                if !ks.ns_tombstoned(ns) {
+                    self.stats.records_skipped_unknown_ns += 1;
+                }
+            }
+            ReplayOutcome::SkippedReserved => self.stats.records_skipped += 1,
+            ReplayOutcome::SkippedMarker => self.stats.markers += 1,
+            ReplayOutcome::SkippedDocDeltaStale => self.stats.doc_deltas_skipped_stale += 1,
+            ReplayOutcome::SkippedDocDeltaMissing => self.stats.doc_deltas_skipped_missing += 1,
         }
     }
 
@@ -1883,7 +2134,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         } else if next == self.segments.len() {
             Phase::Finish
         } else {
-            Phase::Replay { idx: next, reader: None }
+            Phase::Replay { idx: next, reader: ReplayReader::Unopened }
         };
         Ok(RecoveryProgress::Working)
     }
@@ -1944,7 +2195,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 self.residue.truncate(hole + 1);
                 self.stale_slack.truncate(hole + 1);
                 self.evidence.truncate(hole + 1);
-                self.phase = Phase::Replay { idx: hole + 1, reader: None };
+                self.phase = Phase::Replay { idx: hole + 1, reader: ReplayReader::Unopened };
                 return Ok(RecoveryProgress::Working);
             }
         }

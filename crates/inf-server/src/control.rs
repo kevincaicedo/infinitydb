@@ -99,6 +99,10 @@ pub struct CellRecoverySlot {
     /// [`TierReplayStats::FIELDS`](crate::recover::TierReplayStats::FIELDS)
     /// order — `INFO persistence` renders the node fold.
     tier_replay: [AtomicU64; crate::recover::TIER_REPLAY_FIELDS],
+    /// ADR-0174 A1.2: this cell's step facts — the largest work one step
+    /// did and the liveness counters — in
+    /// [`StepFacts::FIELDS`](crate::recover::StepFacts::FIELDS) order.
+    step_facts: [AtomicU64; crate::recover::STEP_FACT_FIELDS],
     /// Recovery phase about to run (M2.5-S01): published *before* each
     /// step so a step stalled inside the kernel names itself — the
     /// ADR-0022 D7 wedge was invisible precisely because nothing was
@@ -152,6 +156,21 @@ impl CellRecoverySlot {
         for (slot, value) in self.tier_replay.iter().zip(stats.to_array()) {
             slot.store(value, Ordering::Relaxed);
         }
+    }
+
+    /// Publishes this cell's step facts (owning cell, once, before
+    /// [`mark_ready`](Self::mark_ready), as the tiered facts are).
+    pub fn publish_step_facts(&self, facts: crate::recover::StepFacts) {
+        for (slot, value) in self.step_facts.iter().zip(facts.to_array()) {
+            slot.store(value, Ordering::Relaxed);
+        }
+    }
+
+    /// This cell's step facts, valid once ready.
+    pub fn step_facts(&self) -> crate::recover::StepFacts {
+        crate::recover::StepFacts::from_array(std::array::from_fn(|i| {
+            self.step_facts[i].load(Ordering::Relaxed)
+        }))
     }
 
     /// This cell's tiered boot replay facts, valid once ready.
@@ -302,6 +321,16 @@ impl RecoveryBoard {
         self.cells.iter().fold(crate::recover::TierReplayStats::default(), |total, slot| {
             total.fold(slot.tier_replay())
         })
+    }
+
+    /// The node fold of the cells' step facts (ADR-0174 A1.2): the work
+    /// gauge the largest, the counters summed — valid once
+    /// [`all_ready`](Self::all_ready). Bound: one pass over the cells.
+    #[must_use]
+    pub fn step_facts_totals(&self) -> crate::recover::StepFacts {
+        self.cells
+            .iter()
+            .fold(crate::recover::StepFacts::default(), |total, slot| total.fold(slot.step_facts()))
     }
 
     /// Aggregate (done, total) bytes across cells.

@@ -64,8 +64,7 @@ fuzz_target!(|data: &[u8]| {
         .map_or(fallback.as_slice(), |_| candidate);
 
     let mut ks = keyspace();
-    ks.apply_record(
-        &RecordView::DocFull {
+    inf_store::drive_record(&mut ks, &RecordView::DocFull {
             ns: NS,
             key: b"doc",
             lineage: DocLineage::FIRST,
@@ -74,14 +73,12 @@ fuzz_target!(|data: &[u8]| {
         },
         NOW,
         ANCHOR,
-        &mut inf_store::NoSpill,
-    )
+        &mut inf_store::NoSpill, u64::MAX)
     .expect("accepted/fallback document loads");
     let before_digest = ks.state_digest(NOW);
     let before_domain = ks.ns_store(NS).expect("materialized").doc_domain();
 
-    let result = ks.apply_record(
-        &RecordView::DocDelta {
+    let result = inf_store::drive_record(&mut ks, &RecordView::DocDelta {
             ns: NS,
             key: b"doc",
             lineage: DocLineage::FIRST,
@@ -94,8 +91,7 @@ fuzz_target!(|data: &[u8]| {
         },
         NOW,
         ANCHOR,
-        &mut inf_store::NoSpill,
-    );
+        &mut inf_store::NoSpill, u64::MAX);
     let (domain, applied_is_canonical) = {
         let store = ks.ns_store_mut(NS).expect("materialized");
         let domain = store.doc_domain();

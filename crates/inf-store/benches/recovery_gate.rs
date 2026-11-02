@@ -125,7 +125,8 @@ fn bench_images(n: u64, value_len: usize) {
             &path,
             IckReaderConfig::default(),
             |record| {
-                ks.apply_record(&record, now, anchor, &mut lent).expect("fits");
+                inf_store::drive_record(&mut ks, &record, now, anchor, &mut lent, u64::MAX)
+                    .expect("fits");
                 Ok::<(), std::convert::Infallible>(())
             },
             |_| Ok(()),

@@ -880,6 +880,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             if board.all_ready() {
                 // ADR-0174 D6's node fold, once: every cell has published.
                 node.recover_tier_replay.set(board.tier_replay_totals());
+                node.recover_step_facts.set(board.step_facts_totals());
                 node.loading.set(0);
                 self.shared.loading.set(false);
                 self.loading_board = None;

@@ -47,7 +47,10 @@ fn ram_addr(ks: &mut Keyspace, key: &[u8]) -> inf_store::LogicalAddr {
 fn tiered_records_route_to_the_table_not_the_shell() {
     let mut ks = tiered_keyspace();
     let rec = RecordView::StringPostImage { ns: NS, key: b"k", value: b"v1" };
-    assert!(matches!(ks.apply_record(&rec, NOW, ANCHOR, &mut NoSpill), Ok(ReplayOutcome::Applied)));
+    assert!(matches!(
+        inf_store::drive_record(&mut ks, &rec, NOW, ANCHOR, &mut NoSpill, u64::MAX),
+        Ok(ReplayOutcome::Applied)
+    ));
     let addr = ram_addr(&mut ks, b"k");
     let table = ks.tiered_store_mut(NS).expect("materialized");
     assert_eq!(table.record(addr).value, b"v1");
@@ -62,19 +65,19 @@ fn tiered_records_route_to_the_table_not_the_shell() {
 fn displace_drains_at_its_paired_mutation() {
     let mut ks = tiered_keyspace();
     let set = RecordView::StringPostImage { ns: NS, key: b"k", value: b"v1" };
-    ks.apply_record(&set, NOW, ANCHOR, &mut NoSpill).expect("seed");
+    inf_store::drive_record(&mut ks, &set, NOW, ANCHOR, &mut NoSpill, u64::MAX).expect("seed");
     let old = ram_addr(&mut ks, b"k").to_raw();
 
     let marker = RecordView::ColdDisplace { ns: NS, old_addr: old };
     assert!(matches!(
-        ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill),
+        inf_store::drive_record(&mut ks, &marker, NOW, ANCHOR, &mut NoSpill, u64::MAX),
         Ok(ReplayOutcome::Applied)
     ));
     assert_eq!(ks.displace_register_len(), 1, "the marker parks until its mutation");
 
     let set2 = RecordView::StringPostImage { ns: NS, key: b"k", value: b"v2" };
     assert!(matches!(
-        ks.apply_record(&set2, NOW, ANCHOR, &mut NoSpill),
+        inf_store::drive_record(&mut ks, &set2, NOW, ANCHOR, &mut NoSpill, u64::MAX),
         Ok(ReplayOutcome::Applied)
     ));
     assert_eq!(ks.displace_register_len(), 0, "the mutation drained the register");
@@ -89,13 +92,16 @@ fn displace_drains_at_its_paired_mutation() {
 fn displace_delete_pairing_removes_the_key() {
     let mut ks = tiered_keyspace();
     let set = RecordView::StringPostImage { ns: NS, key: b"k", value: b"v1" };
-    ks.apply_record(&set, NOW, ANCHOR, &mut NoSpill).expect("seed");
+    inf_store::drive_record(&mut ks, &set, NOW, ANCHOR, &mut NoSpill, u64::MAX).expect("seed");
     let old = ram_addr(&mut ks, b"k").to_raw();
 
     let marker = RecordView::ColdDisplace { ns: NS, old_addr: old };
-    ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill).expect("marker");
+    inf_store::drive_record(&mut ks, &marker, NOW, ANCHOR, &mut NoSpill, u64::MAX).expect("marker");
     let del = RecordView::Delete { ns: NS, key: b"k" };
-    assert!(matches!(ks.apply_record(&del, NOW, ANCHOR, &mut NoSpill), Ok(ReplayOutcome::Applied)));
+    assert!(matches!(
+        inf_store::drive_record(&mut ks, &del, NOW, ANCHOR, &mut NoSpill, u64::MAX),
+        Ok(ReplayOutcome::Applied)
+    ));
     assert_eq!(ks.displace_register_len(), 0);
     let table = ks.tiered_store_mut(NS).expect("materialized");
     let hash = KeyHasher::default().hash(b"k");
@@ -109,10 +115,11 @@ fn displace_delete_pairing_removes_the_key() {
 fn orphan_marker_is_a_decode_error() {
     let mut ks = tiered_keyspace();
     let marker = RecordView::ColdDisplace { ns: NS, old_addr: 4096 };
-    ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill).expect("marker parks");
+    inf_store::drive_record(&mut ks, &marker, NOW, ANCHOR, &mut NoSpill, u64::MAX)
+        .expect("marker parks");
     let foreign = RecordView::StringPostImage { ns: NsId(0), key: b"k", value: b"v" };
     assert!(matches!(
-        ks.apply_record(&foreign, NOW, ANCHOR, &mut NoSpill),
+        inf_store::drive_record(&mut ks, &foreign, NOW, ANCHOR, &mut NoSpill, u64::MAX),
         Err(ReplayError::Displacement(_))
     ));
 }
@@ -124,11 +131,12 @@ fn displace_register_overflow_is_a_decode_error() {
     let mut ks = tiered_keyspace();
     for i in 0..4u64 {
         let marker = RecordView::ColdDisplace { ns: NS, old_addr: 4096 + i * 64 };
-        ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill).expect("within the D9 bound");
+        inf_store::drive_record(&mut ks, &marker, NOW, ANCHOR, &mut NoSpill, u64::MAX)
+            .expect("within the D9 bound");
     }
     let fifth = RecordView::ColdDisplace { ns: NS, old_addr: 9999 };
     assert!(matches!(
-        ks.apply_record(&fifth, NOW, ANCHOR, &mut NoSpill),
+        inf_store::drive_record(&mut ks, &fifth, NOW, ANCHOR, &mut NoSpill, u64::MAX),
         Err(ReplayError::Displacement(_))
     ));
 }
@@ -146,10 +154,11 @@ fn a_refused_tiered_record_leaves_its_markers_parked() {
         // A crashed-life marker at or above the origin: a no-op when its
         // mutation applies (ADR-0174 R4).
         let marker = RecordView::ColdDisplace { ns: NS, old_addr: (1 << 40) + i };
-        ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill).expect("parks");
+        inf_store::drive_record(&mut ks, &marker, NOW, ANCHOR, &mut NoSpill, u64::MAX)
+            .expect("parks");
         let key = format!("k:{i:06}").into_bytes();
         let set = RecordView::StringPostImage { ns: NS, key: &key, value: &value };
-        match ks.apply_record(&set, NOW, ANCHOR, &mut NoSpill) {
+        match inf_store::drive_record(&mut ks, &set, NOW, ANCHOR, &mut NoSpill, u64::MAX) {
             Ok(_) => assert_eq!(ks.displace_register_len(), 0, "the mutation drained it"),
             Err(refusal) => break refusal,
         }
@@ -171,7 +180,7 @@ fn marker_for_unknown_namespace_skips() {
     let mut ks = tiered_keyspace();
     let marker = RecordView::ColdDisplace { ns: NsId(99), old_addr: 4096 };
     assert!(matches!(
-        ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill),
+        inf_store::drive_record(&mut ks, &marker, NOW, ANCHOR, &mut NoSpill, u64::MAX),
         Ok(ReplayOutcome::SkippedUnknownNs(_))
     ));
     assert_eq!(ks.displace_register_len(), 0);
@@ -185,7 +194,7 @@ fn expiry_on_tiered_namespace_skips_reserved() {
     let mut ks = tiered_keyspace();
     let rec = RecordView::ExpireAt { ns: NS, at_unix_ms: 1_750_000_000_000, key: b"k" };
     assert!(matches!(
-        ks.apply_record(&rec, NOW, ANCHOR, &mut NoSpill),
+        inf_store::drive_record(&mut ks, &rec, NOW, ANCHOR, &mut NoSpill, u64::MAX),
         Ok(ReplayOutcome::SkippedReserved)
     ));
 }
@@ -196,7 +205,10 @@ fn expiry_on_tiered_namespace_skips_reserved() {
 fn extent_ref_routes_to_the_extent_applier() {
     let mut ks = tiered_keyspace();
     let rec = RecordView::StringExtentRef { ns: NS, key: b"big", extent_id: 7, offset: 0, len: 64 };
-    assert!(matches!(ks.apply_record(&rec, NOW, ANCHOR, &mut NoSpill), Ok(ReplayOutcome::Applied)));
+    assert!(matches!(
+        inf_store::drive_record(&mut ks, &rec, NOW, ANCHOR, &mut NoSpill, u64::MAX),
+        Ok(ReplayOutcome::Applied)
+    ));
     let table = ks.tiered_store_mut(NS).expect("materialized");
     assert_eq!(table.extent_refcount(7), 1, "the reference map counts the replayed ref");
 }
@@ -213,7 +225,7 @@ fn in_place_set_replays_without_its_displacement_marker() {
     let mut ks = tiered_keyspace();
     let insert = RecordView::StringPostImage { ns: NS, key: b"k", value: b"aaaa" };
     assert!(matches!(
-        ks.apply_record(&insert, NOW, ANCHOR, &mut NoSpill),
+        inf_store::drive_record(&mut ks, &insert, NOW, ANCHOR, &mut NoSpill, u64::MAX),
         Ok(ReplayOutcome::Applied)
     ));
     // The live path rewrote in place and staged only the post-image;
@@ -222,7 +234,7 @@ fn in_place_set_replays_without_its_displacement_marker() {
     // (§3.1), only content and slot cardinality.
     let update = RecordView::StringPostImage { ns: NS, key: b"k", value: b"bbbb" };
     assert!(matches!(
-        ks.apply_record(&update, NOW, ANCHOR, &mut NoSpill),
+        inf_store::drive_record(&mut ks, &update, NOW, ANCHOR, &mut NoSpill, u64::MAX),
         Ok(ReplayOutcome::Applied)
     ));
     let addr_after = ram_addr(&mut ks, b"k");

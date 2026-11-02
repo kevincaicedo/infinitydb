@@ -115,7 +115,8 @@ pub use readahead::boot_prefetch_threads_spawned;
 // assembly, so no new dep-DAG edge.
 pub use inf_runtime::net::probe_addr_unowned;
 pub use recover::{
-    RecoverPhase, RecoverPhases, RecoverStats, RecoveredManifest, Recovery, RecoveryProgress,
+    RECOVERY_UNITS, RecoverPhase, RecoverPhases, RecoverStats, RecoveredManifest, Recovery,
+    RecoveryProgress, RecoveryUnit, STEP_FACT_FIELDS, StepBudget, StepFacts, UnitEntry, UnitPhase,
     open_cell_log,
 };
 pub use topology::{

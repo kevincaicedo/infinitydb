@@ -201,7 +201,8 @@ fn run_seed(seed: u64) {
     // ---- Recovery (the S13 shape): .ick + tail replay from begin. ----
     let mut recovered = durable_keyspace();
     read_ick(&fs, &ckpt_dir.join(ick_file_name(1)), IckReaderConfig::default(), |view| {
-        recovered.apply_record(&view, NOW, ANCHOR, &mut NoSpill).expect("apply ick");
+        inf_store::drive_record(&mut recovered, &view, NOW, ANCHOR, &mut NoSpill, u64::MAX)
+            .expect("apply ick");
         Ok::<(), ()>(())
     })
     .expect("load ick");
@@ -218,9 +219,15 @@ fn run_seed(seed: u64) {
                     if lsn.to_u64() < begin_lsn.to_u64() {
                         continue; // covered by the checkpoint
                     }
-                    match recovered
-                        .apply_record(&record, NOW, ANCHOR, &mut NoSpill)
-                        .expect("apply tail")
+                    match inf_store::drive_record(
+                        &mut recovered,
+                        &record,
+                        NOW,
+                        ANCHOR,
+                        &mut NoSpill,
+                        u64::MAX,
+                    )
+                    .expect("apply tail")
                     {
                         ReplayOutcome::SkippedMarker => markers += 1,
                         ReplayOutcome::Applied => {}

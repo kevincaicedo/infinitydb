@@ -384,7 +384,8 @@ fn rebooted_with(
     for (key, idoc) in corpus {
         let full =
             RecordView::DocFull { ns: NS, key, lineage: DocLineage::FIRST, version: 1, idoc };
-        ks.apply_record(&full, now, ANCHOR, &mut NoSpill).expect("phase-A replay");
+        inf_store::drive_record(&mut ks, &full, now, ANCHOR, &mut NoSpill, u64::MAX)
+            .expect("phase-A replay");
     }
     ks
 }
@@ -398,7 +399,8 @@ fn replay_tail(ks: &mut Keyspace, tail: &[TailOp], now: Nanos) {
             TailOp::Del(key) => RecordView::Delete { ns: NS, key },
             TailOp::Str(key, value) => RecordView::StringPostImage { ns: NS, key, value },
         };
-        ks.apply_record(&record, now, ANCHOR, &mut NoSpill).expect("tail replay");
+        inf_store::drive_record(ks, &record, now, ANCHOR, &mut NoSpill, u64::MAX)
+            .expect("tail replay");
     }
 }
 
