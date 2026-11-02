@@ -5,8 +5,9 @@
 //! - **Estimator and scope:** `IterStats::parked` of one cell's reactor
 //!   iteration, kept by [`Node::iter_stats`]: the cell a [`Quiet`] node
 //!   watches, any cell of the node. It is the reactor's own decision (spin
-//!   exhausted, no ready task, no `before_park` veto), made before the
-//!   driver call, so it reads the state the iteration before it left. The
+//!   exhausted, no ready task, no timer due at its clock read, no
+//!   `before_park` veto), made before the driver call, so it reads the
+//!   state the iteration before it left. The
 //!   sim driver keeps the wait it is handed and never blocks on it, so a
 //!   park is this flag and never elapsed virtual time.
 //! - **Resolution:** one reactor iteration. The harness runs each cell

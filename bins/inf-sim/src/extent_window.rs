@@ -61,7 +61,7 @@ use inf_log::fs::sim::SimDisk;
 use inf_server::StallConfig;
 
 use crate::durable::{
-    DurableScenario, DurableWorkload, MiniClient, Node, STALL_STEPS, TraceObserver, boot,
+    DurableScenario, DurableWorkload, MiniClient, Node, STALL_STEPS, TraceObserver, WakeLeg, boot,
     build_disk, encode,
 };
 use crate::net::Plant;
@@ -369,6 +369,7 @@ impl ExtentWindowScenario {
             ledger_wedge: None,
             stop_tick: false,
             fill_dense: false,
+            wake: WakeLeg::OFF,
         }
     }
 }

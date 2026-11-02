@@ -272,7 +272,7 @@ impl Rig {
             .into_iter()
             .enumerate()
             .map(|(cell, fabric)| {
-                let (plane, _serve_mark) = ServerPlane::new(
+                let (plane, _serve_mark, _timer_set) = ServerPlane::new(
                     CellId(cell as u16),
                     2,
                     -1,
@@ -281,7 +281,8 @@ impl Rig {
                     Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
                     NoopObserver,
                     false,
-                );
+                )
+                .expect("the server's timer owners fit their cap");
                 plane
             })
             .collect();

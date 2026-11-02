@@ -37,9 +37,8 @@ const VALUE_LEN: usize = 8 << 10;
 const FILL_WINDOW_US: u64 = 100_000;
 /// Fill episodes the burst must open on the owning cell.
 const EPISODES_MIN: u64 = 8;
-/// A server cell's timer roles: accept retry, everysec, fill hold, group
-/// hold.
-const ROLES: u64 = 4;
+/// A server cell's timer roles, and so its timer positions.
+const ROLES: u64 = inf_server::TimerRole::COUNT as u64;
 /// The owning cell's armed peak: its everysec owner and its fill owner.
 const OWNER_ARMED_MAX: u64 = 2;
 
@@ -204,7 +203,6 @@ fn timer_owners_row(caps: &str) -> (u64, u64) {
 }
 
 #[test]
-#[ignore = "red on the wheel: each fill hold episode leaves a timer armed for its whole window"]
 fn a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/e2e-timer-owners")

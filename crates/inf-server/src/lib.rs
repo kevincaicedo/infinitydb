@@ -107,7 +107,7 @@ pub use key_hash::{
 pub use loop_snapshot::LoopSnapshot;
 pub use plane::{
     ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane, StopHold,
-    StopPhase, fold_live_entries,
+    StopPhase, TimerAssemblyError, TimerRole, fold_live_entries,
 };
 pub use readahead::boot_prefetch_threads_spawned;
 // Harness-facing (batch 61): the compat harness reserves ports with the

@@ -19,6 +19,7 @@ use std::rc::Rc;
 
 use inf_alloc::BufferPool;
 use inf_foundation::FileOffset;
+use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::time::Nanos;
 use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{
@@ -27,7 +28,8 @@ use inf_log::{
 };
 use inf_runtime::{
     BackendDriver, Capabilities, CellPlane, Completion, CompletionResult, CompletionToken, IoOp,
-    LoopCx, RawFd, StableBytes, SubmitStats, TokenClass, Wait, WatermarkGate, WriteBarrier,
+    LoopCx, RawFd, Reserved, StableBytes, SubmitStats, TimerNotice, TimerOutcome, TimerOwner,
+    TimerSet, TokenClass, Wait, WatermarkGate, WriteBarrier,
 };
 
 /// Fresh per-test directory under the system temp dir (the pattern the S02
@@ -335,8 +337,18 @@ impl BackendDriver for ScriptedDriver {
 
 // ---- DurablePlane -----------------------------------------------------------
 
-pub const EVERYSEC_TIMER_KEY: u64 = 0xE5EC;
+/// The log fixture's timer positions: one, the everysec tick's (a test
+/// host's cap, filled while serving).
+const FIXTURE_OWNERS: Cap = Cap::entries::<1>("log-fixture-owners", CapFill::Serving);
 const NS: NsId = NsId(7);
+
+/// The fixture cell's timer set on `census` and its everysec owner,
+/// reserved before the loop exists; the plane takes the owner.
+pub fn everysec_timers(census: &Rc<CapCensus>) -> (TimerSet, TimerOwner) {
+    let mut set = TimerSet::build(FIXTURE_OWNERS, census).expect("the fixture's timer set");
+    let Reserved::Owner(owner) = set.reserve(0) else { panic!("the fixture's one position") };
+    (set, owner)
+}
 
 /// One queued mutation for the plane's workload script.
 pub struct Job {
@@ -375,6 +387,7 @@ pub struct DurablePlane {
     /// Terminal I/O errors observed (fail-stop territory; tests assert).
     pub io_errors: Vec<(TokenClass, i32)>,
     pub everysec: bool,
+    everysec_owner: TimerOwner,
     timer_armed: bool,
     write_seq: u64,
     /// LogWrite ops queued in the CURRENT iteration (tripwire: ≤ 1).
@@ -383,7 +396,7 @@ pub struct DurablePlane {
 }
 
 impl DurablePlane {
-    pub fn new(dir: &std::path::Path, geometry: LogGeometry) -> Self {
+    pub fn new(dir: &std::path::Path, geometry: LogGeometry, everysec_owner: TimerOwner) -> Self {
         let fs = StdSegmentFs;
         let dirs = create_cell_dirs(&fs, dir).expect("cell dirs");
         let rotor = SegmentRotor::create_fresh(fs, dirs.log, geometry).expect("rotor");
@@ -405,6 +418,7 @@ impl DurablePlane {
             fsync_submits: Vec::new(),
             io_errors: Vec::new(),
             everysec: true,
+            everysec_owner,
             timer_armed: false,
             write_seq: 0,
             writes_this_iter: 0,
@@ -459,16 +473,19 @@ impl CellPlane for DurablePlane {
         }
     }
 
-    fn on_timer(&mut self, cx: &mut LoopCx<'_>, key: u64) {
-        assert_eq!(key, EVERYSEC_TIMER_KEY);
+    fn on_timer<'n>(&mut self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> {
+        assert_eq!(notice.arm().position(), self.everysec_owner.position(), "the everysec owner");
         self.commit.note_everysec_tick();
-        cx.timers.insert(cx.now + Nanos::from_secs(1), EVERYSEC_TIMER_KEY);
+        let deadline = cx.now + Nanos::from_secs(1);
+        let next = cx.timers().successor(notice, deadline).expect("armed");
+        TimerOutcome::Successor(next)
     }
 
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
         self.writes_this_iter = 0;
         if self.everysec && !self.timer_armed {
-            cx.timers.insert(cx.now + Nanos::from_secs(1), EVERYSEC_TIMER_KEY);
+            let first = cx.now + Nanos::from_secs(1);
+            cx.timers().arm(&self.everysec_owner, first).expect("armed");
             self.timer_armed = true;
         }
         if self.cell_failed {

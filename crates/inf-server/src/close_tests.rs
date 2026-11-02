@@ -108,7 +108,7 @@ struct Rig {
 impl Rig {
     fn admitted() -> Rig {
         let fabric = Mesh::new(1, MeshConfig::default()).into_iter().next().expect("one cell");
-        let (mut plane, serve_mark) = ServerPlane::new(
+        let (mut plane, serve_mark, timer_set) = ServerPlane::new(
             CellId(0),
             1,
             -1,
@@ -117,13 +117,15 @@ impl Rig {
             Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
             NoopObserver,
             false,
-        );
+        )
+        .expect("the server's timer owners fit their cap");
         let mut reactor = CellLoop::new(
             RecordingDriver::default(),
             VirtualClock::default(),
             BufferPool::new(4, 4096),
             LoopConfig::default(),
             serve_mark,
+            timer_set,
         );
         reactor.driver().script.borrow_mut().deliver.push(Delivery::Accepted(FD));
         for _ in 0..2 {

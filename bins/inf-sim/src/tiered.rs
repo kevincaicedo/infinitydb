@@ -74,8 +74,8 @@ use inf_server::StallConfig;
 
 use crate::durable::{
     DurableScenario, DurableWorkload, MiniClient, Node, NsClass, OpRec, Pending, STALL_STEPS,
-    TraceObserver, Writer, admissible_states, boot, build_disk, bulk, encode, m2_stall_config,
-    required_index,
+    TraceObserver, WakeLeg, Writer, admissible_states, boot, build_disk, bulk, encode,
+    m2_stall_config, required_index,
 };
 use crate::net::Plant;
 use crate::resp::reply_len;
@@ -318,6 +318,7 @@ impl TieredScenario {
             ledger_wedge: None,
             stop_tick: false,
             fill_dense: false,
+            wake: WakeLeg::OFF,
         }
     }
 }

@@ -1018,13 +1018,21 @@ pub struct NodeInfo { /* Cells: tripwires, raw_counters, wire_buffers_bytes,
                          fabric_rtt_p50_ns, cell, cells */ }
 ```
 
-**Cap census extension note (ADR-0163 D2):** `ServerPlane::new(...)` builds
-the cell's cap census (`inf_foundation::bounded::CapCensus`) with its `cell`
-and returns `(ServerPlane, ServeMark)`; `CellLoop::new(driver, clock, pool,
-config, serve_mark)` takes that mark and consumes it as its first
-`run_iteration` begins, so every step before it is the cell's assembly. The
-mark is a token the census mints once, never `Clone`: a census is marked at
-most once. `NodeInfo::cap_census` holds the census for the cell's readers.
+**Cap census extension note (ADR-0163 D2, ADR-0154 D1):**
+`ServerPlane::new(...)` builds the cell's cap census
+(`inf_foundation::bounded::CapCensus`) with its `cell`, then, on that census
+and before it writes `node`, the cell's `TimerSet` and the server's timer
+owners (`ServerTimers::build`, their one constructor); the plane keeps the
+owners and returns the set. It returns `Result<(ServerPlane, ServeMark,
+TimerSet), TimerAssemblyError>`: a refused build returns the error and no
+plane, and what it built drops with it. `CellLoop::new(driver, clock, pool,
+config, serve_mark, timer_set)` takes that mark and set and consumes the mark
+as its first `run_iteration` begins, so every step before it is the cell's
+assembly. The mark is a token the census mints once, never `Clone`: a census
+is marked at most once. `NodeInfo::cap_census` holds the census for the
+cell's readers. The timer set is unbuilt: until it is, `ServerPlane::new`
+returns `(ServerPlane, ServeMark)` and cannot fail, and `CellLoop::new` takes
+no set.
 
 `inf-runtime::net` (assembly helpers, keeps bins `forbid(unsafe_code)`):
 `listen_reuseport(port) -> TcpListener` · `bound_port` ·

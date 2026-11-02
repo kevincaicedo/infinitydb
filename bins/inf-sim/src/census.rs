@@ -15,11 +15,12 @@
 //! - **The window's turn rule**: a cell's durable plane counts no turn
 //!   that found the extent-seal window full (`turn_refused = 0`, the
 //!   release form of `len + w ≤ 16`; token `turn-refused`).
-//! - Liveness: a cell holding a tiered namespace has the reclaim marks'
-//!   row, and a cell whose durable plane is built has the extent-seal
-//!   window's row (token `cap-row-missing`); the rows checked are summed on
-//!   the report line (`cap_rows_checked`), so a run whose census read
-//!   nothing is visible.
+//! - Liveness: a server cell has its timer owners' row, which its plane
+//!   builds before its loop exists; a cell holding a tiered namespace has
+//!   the reclaim marks' row; and a cell whose durable plane is built has
+//!   the extent-seal window's row (token `cap-row-missing`); the rows
+//!   checked are summed on the report line (`cap_rows_checked`), so a run
+//!   whose census read nothing is visible.
 //!
 //! The rules read the product's own counts: wiring checks. The independent
 //! evidence is each site's model test and the DST rows' disk-side oracles.
@@ -33,10 +34,15 @@ const EPOCH_MARKS_ROW: &str = "epoch-marks";
 /// The extent-seal window's census row, which every cell's durable plane
 /// registers when it is built.
 const EXTENT_WINDOW_ROW: &str = "extent-window";
+/// The timer owners' census row, which every server plane registers.
+const TIMER_OWNERS_ROW: &str = inf_server::limits::SERVER_TIMER_OWNERS.name();
 
 /// What a cell's planes hold at the end of a life, beside its census.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CellFacts {
+    /// The cell is a server plane, which builds its timer set and its
+    /// owners before its loop exists.
+    pub(crate) server_plane: bool,
     /// Tiered namespaces the cell's tier plane serves (none before the
     /// cell's recovery has built that plane).
     pub(crate) tiered_tables: usize,
@@ -75,6 +81,12 @@ impl CensusVerdict {
         }
         for row in census.rows() {
             self.judge_row(cell, &row);
+        }
+        if facts.server_plane && census.row(TIMER_OWNERS_ROW).is_none() {
+            self.violations.push(format!(
+                "CAP CENSUS VIOLATION cell {cell}: cap-row-missing — a server plane and no \
+                 `{TIMER_OWNERS_ROW}` row"
+            ));
         }
         let tiered_tables = facts.tiered_tables;
         if tiered_tables > 0 && census.row(EPOCH_MARKS_ROW).is_none() {
@@ -160,17 +172,46 @@ mod tests {
         let (census, serve_mark) = CapCensus::new(CellId(0));
         serve_mark.take();
         let mut verdict = CensusVerdict::default();
-        verdict.judge(0, &census, CellFacts { tiered_tables: 1, turn_refused: None });
+        verdict.judge(
+            0,
+            &census,
+            CellFacts { tiered_tables: 1, turn_refused: None, ..CellFacts::default() },
+        );
         assert_eq!(verdict.rows_checked, 0);
         assert_eq!(verdict.violations.len(), 1, "{:?}", verdict.violations);
         assert!(verdict.violations[0].contains("cap-row-missing"), "{:?}", verdict.violations);
         let mut durable = CensusVerdict::default();
-        durable.judge(0, &census, CellFacts { tiered_tables: 0, turn_refused: Some(0) });
+        durable.judge(
+            0,
+            &census,
+            CellFacts { tiered_tables: 0, turn_refused: Some(0), ..CellFacts::default() },
+        );
         assert_eq!(durable.violations.len(), 1, "{:?}", durable.violations);
         assert!(durable.violations[0].contains("extent-window"), "{:?}", durable.violations);
         let mut control = CensusVerdict::default();
         control.judge(0, &census, CellFacts::default());
         assert!(control.violations.is_empty(), "no tiered namespace, no row owed");
+    }
+
+    /// The timer owners' liveness: a server plane's census without the
+    /// `timer-owners` row is red; with the row its assembly builds, green.
+    #[test]
+    fn a_server_cell_without_its_timer_owners_row_is_red() {
+        let facts = CellFacts { server_plane: true, ..CellFacts::default() };
+        let (bare, serve_mark) = CapCensus::new(CellId(1));
+        serve_mark.take();
+        let mut red = CensusVerdict::default();
+        red.judge(1, &bare, facts);
+        assert_eq!(red.violations.len(), 1, "{:?}", red.violations);
+        assert!(red.violations[0].contains("cap-row-missing"), "{:?}", red.violations);
+        assert!(red.violations[0].contains(TIMER_OWNERS_ROW), "{:?}", red.violations);
+        const OWNERS: Cap = Cap::entries::<1>("timer-owners", CapFill::Serving);
+        let (census, serve_mark) = CapCensus::new(CellId(1));
+        serve_mark.take();
+        let _owners = CappedSlab::<u8, u64, Retire>::builder(OWNERS, &census).expect("built");
+        let mut green = CensusVerdict::default();
+        green.judge(1, &census, facts);
+        assert!(green.violations.is_empty(), "{:?}", green.violations);
     }
 
     /// The window's turn rule: a refused turn is red by its token; none is
@@ -182,11 +223,19 @@ mod tests {
         serve_mark.take();
         let _window = CappedDeque::<u64, Reserve>::new(WINDOW, &census).expect("built");
         let mut red = CensusVerdict::default();
-        red.judge(3, &census, CellFacts { tiered_tables: 0, turn_refused: Some(1) });
+        red.judge(
+            3,
+            &census,
+            CellFacts { tiered_tables: 0, turn_refused: Some(1), ..CellFacts::default() },
+        );
         assert_eq!(red.violations.len(), 1, "{:?}", red.violations);
         assert!(red.violations[0].contains("turn-refused"), "{:?}", red.violations);
         let mut green = CensusVerdict::default();
-        green.judge(3, &census, CellFacts { tiered_tables: 0, turn_refused: Some(0) });
+        green.judge(
+            3,
+            &census,
+            CellFacts { tiered_tables: 0, turn_refused: Some(0), ..CellFacts::default() },
+        );
         assert!(green.violations.is_empty(), "{:?}", green.violations);
     }
 
@@ -229,7 +278,11 @@ mod tests {
             }
         }
         let mut verdict = CensusVerdict::default();
-        verdict.judge(1, &census, CellFacts { tiered_tables: 1, turn_refused: None });
+        verdict.judge(
+            1,
+            &census,
+            CellFacts { tiered_tables: 1, turn_refused: None, ..CellFacts::default() },
+        );
         assert_eq!(verdict.rows_checked, 2);
         assert!(verdict.violations.is_empty(), "full rows are within their caps: {verdict:?}");
         // A row past its cap: no correct container writes one, so a row

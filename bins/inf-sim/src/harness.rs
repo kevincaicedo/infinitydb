@@ -1328,7 +1328,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             ..Default::default()
         });
         seed_namespaces(&mut keyspace, scenario.namespaces);
-        let (plane, serve_mark) = ServerPlane::<_, inf_server::StdSegmentFs>::new(
+        // A refused timer assembly ends the run with its text, never a
+        // derived `Debug`: the text carries the refusal's token.
+        let (plane, serve_mark, timer_set) = ServerPlane::<_, inf_server::StdSegmentFs>::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
@@ -1337,9 +1339,11 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             node,
             oracle.clone(),
             false,
-        );
+        )
+        .unwrap_or_else(|refused| panic!("cell {i}'s assembly refused: {refused}"));
         let config = LoopConfig { spin_iters: 4, ..Default::default() };
-        let cell_loop = CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark);
+        let cell_loop =
+            CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark, timer_set);
         nets.push(net);
         cells.push((cell_loop, plane));
     }
@@ -1814,8 +1818,8 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     report.accept_resumes = nets.iter().map(|net| net.borrow().accept_resumes()).sum();
     if scenario.plant == Plant::AcceptError && report.plant_fired && report.accept_resumes == 0 {
         report.oracle_violations.push(
-            "accept-error plant: the parked accept arm was never resumed (F-L11-02: the plane \
-             must re-arm on its retry wheel)"
+            "accept-error plant: accept-never-resumed — the parked accept arm was never \
+             resumed (the plane re-arms it from its accept-retry timer)"
                 .to_string(),
         );
     }
@@ -1887,6 +1891,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     let mut census = crate::census::CensusVerdict::default();
     for (index, (_, plane)) in cells.iter().enumerate() {
         let facts = crate::census::CellFacts {
+            server_plane: true,
             tiered_tables: plane.keyspace().tiered_tables(),
             turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
         };

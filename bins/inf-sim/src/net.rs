@@ -223,6 +223,10 @@ pub struct SimDriver {
     /// order: each is submitted at the first driver entry after its hold
     /// lifts, ahead of that entry's own ops.
     held_syncs: Vec<(RawFd, CompletionToken)>,
+    /// The fds of the writes and syncs the last `submit_and_reap` carried
+    /// from the loop: the device's reading of a park's own submit. One
+    /// list, cleared at each submit, its capacity the largest submit's.
+    submitted_io: Vec<RawFd>,
     ops: Vec<IoOp>,
     stats: SubmitStats,
     /// Bytes/ops observed per class (ADR-0088 D8).
@@ -307,6 +311,7 @@ impl SimDriver {
             clock: None,
             pending_syncs: Vec::new(),
             held_syncs: Vec::new(),
+            submitted_io: Vec::new(),
             ops: Vec::new(),
             stats: SubmitStats::default(),
             observed: ObservedIo::default(),
@@ -382,6 +387,30 @@ impl SimDriver {
     /// harness's own reading of a held barrier, no product counter.
     pub fn held_syncs(&self) -> usize {
         self.held_syncs.len()
+    }
+
+    /// Whether a write or a sync on a file `named` accepts is submitted
+    /// and not completed: deferred on the device's timeline, or held by
+    /// the disk. Reads do not count. The device's own reading, no product
+    /// counter.
+    pub fn io_in_flight_named(&self, named: fn(&std::path::Path) -> bool) -> bool {
+        let Some(disk) = self.disk.as_ref() else { return false };
+        let pending = self.pending_syncs.iter().filter(|pending| match pending.kind {
+            PendingKind::Fsync | PendingKind::WriteThrough { .. } | PendingKind::Write { .. } => {
+                true
+            }
+            PendingKind::Read { .. } => false,
+        });
+        let mut fds = pending.map(|pending| pending.fd).chain(self.held_syncs.iter().map(|h| h.0));
+        fds.any(|fd| disk.fd_named(fd, named))
+    }
+
+    /// Whether the last `submit_and_reap` carried a write or a sync on a
+    /// file `named` accepts, from the loop's own ops; a held sync it
+    /// released was in flight already and is not counted.
+    pub fn submitted_named(&self, named: fn(&std::path::Path) -> bool) -> bool {
+        let Some(disk) = self.disk.as_ref() else { return false };
+        self.submitted_io.iter().any(|&fd| disk.fd_named(fd, named))
     }
 }
 
@@ -525,6 +554,12 @@ impl BackendDriver for SimDriver {
         out: &mut Vec<Completion>,
     ) -> io::Result<usize> {
         self.wait = Some(wait);
+        self.submitted_io.clear();
+        for op in &self.ops {
+            if let IoOp::LogWrite { fd, .. } | IoOp::Fdatasync { fd, .. } = op {
+                self.submitted_io.push(*fd);
+            }
+        }
         let before = out.len();
         let mut net = self.net.borrow_mut();
         let submitted = self.ops.len() as u64;

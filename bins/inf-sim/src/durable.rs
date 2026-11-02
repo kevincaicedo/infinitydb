@@ -66,7 +66,7 @@ mod timers;
 pub use ledger_wedge::{LedgerWedgeLeg, LedgerWedgeReport};
 pub use run::run_durable_scenario;
 pub use stop_tick::StopTickReport;
-pub use timers::TimersReport;
+pub use timers::{TimersReport, WakeLeg, WakeReport};
 
 pub(crate) use audit::survival_audit;
 use audit::{
@@ -313,6 +313,10 @@ pub struct DurableScenario {
     /// fill the 64 KiB fill target in about two steps. `false` everywhere
     /// else: every other trace stays byte-identical.
     pub fill_dense: bool,
+    /// TM3, the wake oracle (`durable/timers.rs`): armed only on the leg
+    /// `park_at_once` makes, whose loops run at spin 0. `OFF` everywhere
+    /// else.
+    pub wake: WakeLeg,
 }
 
 /// The epoch-marks shape's legs, chosen by name (`--marks-leg`), never by
@@ -974,6 +978,7 @@ impl DurableScenario {
             ledger_wedge: None,
             stop_tick: false,
             fill_dense: false,
+            wake: WakeLeg::OFF,
         }
     }
 
@@ -1362,6 +1367,7 @@ impl DurableScenario {
             ledger_wedge: None,
             stop_tick: false,
             fill_dense: false,
+            wake: WakeLeg::OFF,
         }
     }
 
@@ -1532,6 +1538,7 @@ impl DurableScenario {
             ledger_wedge: None,
             stop_tick: false,
             fill_dense: false,
+            wake: WakeLeg::OFF,
         }
     }
 }
@@ -1724,6 +1731,8 @@ pub struct DurableReport {
     pub stop_tick: Option<StopTickReport>,
     /// The timers' readings over the traffic phase (`durable/timers.rs`).
     pub timers: TimersReport,
+    /// TM3's readings over the traffic phase (zeros off its leg).
+    pub wake: WakeReport,
 }
 
 /// One cell's reclaim-marks census row at the cut of an epoch-marks run.
@@ -2249,7 +2258,6 @@ pub(crate) struct Node {
     /// What each cell's reactor iteration reported in the last scheduler
     /// step, as `run_iteration` returned it: `None` for a cell that step
     /// did not run (frozen), and before the first step.
-    #[allow(dead_code, reason = "read by the loop-tier tests, through `Node::iter_stats`")]
     iter_stats: Vec<Option<IterStats>>,
     pub(crate) nets: Vec<Rc<RefCell<CellNet>>>,
     pub(crate) control: std::sync::Arc<inf_server::ControlHandle>,
@@ -2369,7 +2377,7 @@ pub(crate) fn boot(
                 std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
             })?;
         }
-        let (mut plane, serve_mark) = SimPlane::new(
+        let (mut plane, serve_mark, timer_set) = SimPlane::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
@@ -2378,7 +2386,8 @@ pub(crate) fn boot(
             node_info,
             observer.clone(),
             false,
-        );
+        )
+        .map_err(std::io::Error::other)?;
         let cfg = durable_config(scenario, &data_dir);
         let issuer = cell_issuers.next().ok_or_else(|| {
             std::io::Error::other("the partition minted one checkpoint issuer per cell")
@@ -2387,8 +2396,10 @@ pub(crate) fn boot(
             .set_control(std::sync::Arc::clone(&control), issuer)
             .map_err(|refused| std::io::Error::other(refused.to_string()))?;
         plane.begin_recovery(disk.clone(), &cfg, i as u16, clock.now());
-        let config = LoopConfig { spin_iters: scenario.spin_iters, ..Default::default() };
-        let cell_loop = CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark);
+        let spin_iters = scenario.wake.spin(scenario.spin_iters);
+        let config = LoopConfig { spin_iters, ..Default::default() };
+        let cell_loop =
+            CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark, timer_set);
         nets.push(net);
         cells.push((cell_loop, plane));
     }
@@ -2425,7 +2436,8 @@ impl Drop for Node {
             let tiered_tables =
                 if durable.is_some() { plane.keyspace().tiered_tables() } else { 0 };
             let turn_refused = durable.map(|stats| stats.turn_refused);
-            let facts = crate::census::CellFacts { tiered_tables, turn_refused };
+            let facts =
+                crate::census::CellFacts { server_plane: true, tiered_tables, turn_refused };
             verdict.judge(index, plane.cap_census(), facts);
         }
         self.observer.2.borrow_mut().absorb(verdict);

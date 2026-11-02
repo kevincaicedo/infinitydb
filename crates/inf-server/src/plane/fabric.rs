@@ -770,7 +770,7 @@ mod fabric_batch_depth {
         const DEPTH: usize = 100_000;
         let mut fabrics = Mesh::new(2, MeshConfig::default());
         let fabric = fabrics.remove(0);
-        let (plane, _serve_mark) = ServerPlane::<_, crate::StdSegmentFs>::new(
+        let (plane, _serve_mark, _timer_set) = ServerPlane::<_, crate::StdSegmentFs>::new(
             CellId(0),
             2,
             -1,
@@ -779,7 +779,8 @@ mod fabric_batch_depth {
             Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
             NoopObserver,
             false,
-        );
+        )
+        .expect("the server's timer owners fit their cap");
         let shared = &plane.shared;
         let key: &[u8] = b"k";
         let nested = |depth: usize| {

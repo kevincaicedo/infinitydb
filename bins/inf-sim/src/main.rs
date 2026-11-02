@@ -93,6 +93,8 @@ fn main() {
     let mut window_leg: Option<ExtentWindowLeg> = None;
     // m2-ledger-wedge's leg, named the same way.
     let mut wedge_leg: Option<LedgerWedgeLeg> = None;
+    // TM3's leg of m2-fill-tick and m2-group-hold: the loops at spin 0.
+    let mut park_at_once = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -136,6 +138,7 @@ fn main() {
                 "--replay-canary" => replay_canary = true,
                 "--lift-regime" => lift_regime = true,
                 "--replay-above-window" => replay_above_window = true,
+                "--park-at-once" => park_at_once = true,
                 "--spec-variant" => {
                     spec_variant = Some(match take("--spec-variant")?.as_str() {
                         "ring-top" => SpecVariant::RingTop,
@@ -180,7 +183,7 @@ fn main() {
                          tier-write-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--replay-above-window] \
                          [--spec-variant ring-top|page] [--tier-leg {}] [--marks-leg {}] \
-                         [--window-leg {}] [--wedge-leg {}] \
+                         [--window-leg {}] [--wedge-leg {}] [--park-at-once] \
                          [--cells N] [--connections N] [--commands N] [--wheel-nodes-max N] \
                          [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
@@ -274,6 +277,11 @@ fn main() {
         }
     }
 
+    // TM3's leg is m2-fill-tick's and m2-group-hold's, and only theirs.
+    if park_at_once && !matches!(scenario_name.as_str(), "m2-fill-tick" | "m2-group-hold") {
+        eprintln!("inf-sim: --park-at-once is m2-fill-tick's and m2-group-hold's");
+        std::process::exit(2);
+    }
     // The M2-S19 durable scenario has its own runner (power cuts, the
     // durability oracle, the sweep mode).
     if matches!(
@@ -284,6 +292,7 @@ fn main() {
             | "m2-mode-transition"
             | "m2-reorder-window"
             | "m2-fill-tick"
+            | "m2-fill-dense"
             | "m2-group-hold"
             | "m2-fua-pending"
             | "m2-ledger-wedge"
@@ -303,6 +312,7 @@ fn main() {
             tier_leg,
             marks_leg,
             wedge_leg,
+            park_at_once,
             verify,
             sweep,
             shard,
@@ -1631,6 +1641,7 @@ fn run_durable(
     tier_leg: Option<TierBudgetLeg>,
     marks_leg: Option<EpochMarksLeg>,
     wedge_leg: Option<LedgerWedgeLeg>,
+    park_at_once: bool,
     verify: bool,
     sweep: Option<u64>,
     (shard_i, shard_k): (u64, u64),
@@ -1644,6 +1655,7 @@ fn run_durable(
             "m2-mode-transition" => DurableScenario::m2_mode_transition(seed),
             "m2-reorder-window" => DurableScenario::m2_reorder_window(seed),
             "m2-fill-tick" => DurableScenario::m2_fill_tick(seed),
+            "m2-fill-dense" => DurableScenario::m2_fill_tick_dense(seed),
             "m2-group-hold" => DurableScenario::m2_group_hold(seed),
             "m2-fua-pending" => DurableScenario::m2_fua_pending(seed),
             "m2-ledger-wedge" => DurableScenario::m2_ledger_wedge(
@@ -1667,6 +1679,9 @@ fn run_durable(
         scenario.plant = plant;
         scenario.replay_canary = replay_canary;
         scenario.lift_regime |= lift_regime;
+        if park_at_once {
+            scenario = scenario.park_at_once();
+        }
         run_durable_scenario(&scenario)
     };
 
@@ -1719,6 +1734,12 @@ fn run_durable(
         print_census(report.cap_rows_checked, report.cap_rows_crossed);
         if let Some(stop) = &report.stop_tick {
             println!("inf-sim: {}", stop.describe());
+        }
+        if scenario_name == "m2-fill-dense" {
+            println!("inf-sim: {}", report.timers.describe());
+        }
+        if park_at_once {
+            println!("inf-sim: wake {:?}", report.wake);
         }
         if let Some(wedge) = &report.ledger_wedge {
             println!(
@@ -1795,6 +1816,7 @@ fn run_durable(
                 (second.trace_hash, second.state_hash),
             );
             assert!(second.ok(), "second run failed its oracles");
+            verify_wake(&report.wake, &second.wake);
             if second.trace != report.trace {
                 eprintln!(
                     "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes)",
@@ -2156,6 +2178,16 @@ fn verify_hashes(first: (u64, u64), second: (u64, u64)) {
     println!("inf-sim: state_hash={:#018x}; state hash identical", first.1);
 }
 
+/// The twin's TM3 readings equal the first run's, or the run is red.
+fn verify_wake(first: &inf_sim::WakeReport, second: &inf_sim::WakeReport) {
+    if first != second {
+        eprintln!(
+            "inf-sim: DETERMINISM VIOLATION — wake readings differ ({first:?} vs {second:?})"
+        );
+        std::process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod determinism_exit {
     #[test]
@@ -2177,6 +2209,30 @@ mod determinism_exit {
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("state_hash differs"),
+            "{output:?}"
+        );
+    }
+    #[test]
+    fn differing_wake_readings_exit_one_with_a_named_reason() {
+        const CHILD: &str = "INF_SIM_WAKE_VERIFY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let first = inf_sim::WakeReport { held_parks: 3, ..Default::default() };
+            let second = inf_sim::WakeReport { held_parks: 4, ..Default::default() };
+            super::verify_wake(&first, &second);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "determinism_exit::differing_wake_readings_exit_one_with_a_named_reason",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("wake readings differ"),
             "{output:?}"
         );
     }

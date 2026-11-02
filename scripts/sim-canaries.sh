@@ -327,6 +327,38 @@ rows=(
   # A heap entry stays fresh by order: a close removes an Armed owner's
   # entry before its position's take. Planted, the entry outlives the take.
   "inf_canary_timer_close_keeps_entry crate-test inf-runtime test:timer_model the_set_matches_the_model_on_two_sets_driven_alike the bijection"
+  # ADR-0154 D3: a turn begins at most 64 timer callbacks, each spending
+  # one unit of its allowance. Planted, a callback spends none, and the
+  # delivery test's turn begins all 65 due timers.
+  "inf_canary_timer_allowance_unspent crate-test inf-runtime test:reactor sixty_five_due_timers_take_two_turns_and_no_park callbacks begun per iteration"
+  # ADR-0154 D3: a due timer is ready work, which the park decision polls
+  # on. Planted, the decision parks on it, at spin_iters 1 and 0.
+  "inf_canary_timer_park_hides_due crate-test inf-runtime test:reactor sixty_five_due_timers_take_two_turns_and_no_park callbacks begun per iteration"
+  # ADR-0154 D4: the everysec tick arms its successor a second on. Planted,
+  # it ticks once, so the fill scenario's one everysec writer, with no
+  # always barrier to cover its frames, loses acked writes at the cut, and
+  # the audit's everysec bound reads them.
+  "inf_canary_everysec_no_successor m2-fill-tick DURABILITY"
+  # ADR-0154 D1: the server's timer cap is its role count, every position
+  # reserved at the assembly. Planted one short, every assembly's last
+  # reserve is refused before the cell's loop exists, by its own token.
+  "inf_canary_timer_owners_short m0-smoke timer-owners-full-at-assembly"
+  # ADR-0163 D2: the census is born serving, so the timer set's `Assembly`
+  # row registers and fills after the serve mark: the census counts each
+  # as an assembly violation, and the census verdict reads the count.
+  "inf_canary_serve_mark_first m0-smoke cap-assembly-violated"
+  # ADR-0089, ADR-0092 D1: a hold arms its window, so a parked loop wakes
+  # to seal it. Planted, each hold's episode holds its owner's arm cancelled
+  # at the build and arms nothing: TM3 reads a held frame's park outliving
+  # its window on both hold legs, and the binary's owning cell reads one
+  # timer armed at most, its everysec owner's.
+  "inf_canary_hold_arms_nothing m2-fill-tick held-park-outlives-window --park-at-once"
+  "inf_canary_hold_arms_nothing m2-group-hold held-park-outlives-window --park-at-once"
+  "inf_canary_hold_arms_nothing crate-test infinityd test:timer_owners a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell its everysec and fill owners"
+  # TM3's engagement: planted, the oracle reads no held state, so a leg's
+  # run judges nothing and is vacuous.
+  "inf_canary_wake_never_held m2-fill-tick held-park-unengaged --park-at-once"
+  "inf_canary_wake_never_held m2-group-hold held-park-unengaged --park-at-once"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.
