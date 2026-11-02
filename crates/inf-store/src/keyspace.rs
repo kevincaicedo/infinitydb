@@ -1840,16 +1840,33 @@ pub fn drive_record<S: ReplaySpill>(
     spill: &mut S,
     budget_bytes: u64,
 ) -> Result<ReplayOutcome, ReplayError> {
+    // A record that does not wait for room, nearly every one, is presented
+    // once with no loop around it: the loop form hoisted the presentation's
+    // invariants into every call (more instructions a record on the image
+    // replay bench), and the loop is the cold rest.
+    match ks.apply_record(rec, now, anchor, spill)? {
+        Replayed::Consumed(token) | Replayed::ConsumedPriced(token) => Ok(token.outcome()),
+        Replayed::NeedsRoom(ns) => drive_room(ks, rec, now, anchor, spill, budget_bytes, ns),
+    }
+}
+
+/// [`drive_record`] once its record answered `NeedsRoom` in `ns`: the
+/// demote step until it answers `Room`, then the record again.
+#[cold]
+#[inline(never)]
+fn drive_room<S: ReplaySpill>(
+    ks: &mut Keyspace,
+    rec: &LogRecordView<'_>,
+    now: Nanos,
+    anchor: WallAnchor,
+    spill: &mut S,
+    budget_bytes: u64,
+    mut ns: NsId,
+) -> Result<ReplayOutcome, ReplayError> {
     // Bound: a presentation that needs room makes one room ask more, and a
     // record makes at most four (D2 rule 1); each demote step call walks a
     // record at least, or completes.
     loop {
-        let ns = match ks.apply_record(rec, now, anchor, spill)? {
-            Replayed::Consumed(token) | Replayed::ConsumedPriced(token) => {
-                return Ok(token.outcome());
-            }
-            Replayed::NeedsRoom(ns) => ns,
-        };
         let (Some(machine), Some(table)) = (spill.replay_mut(ns), ks.tiered_store_mut(ns)) else {
             let refusal =
                 ReplayRefusal::RoomMoved { why: "a record waits for room with no machine" };
@@ -1857,6 +1874,12 @@ pub fn drive_record<S: ReplaySpill>(
         };
         let refused = |refusal| ReplayError::Replay { ns, refusal };
         while machine.demote_step(table, budget_bytes).map_err(refused)? == DemoteProgress::More {}
+        ns = match ks.apply_record(rec, now, anchor, spill)? {
+            Replayed::Consumed(token) | Replayed::ConsumedPriced(token) => {
+                return Ok(token.outcome());
+            }
+            Replayed::NeedsRoom(ns) => ns,
+        };
     }
 }
 
