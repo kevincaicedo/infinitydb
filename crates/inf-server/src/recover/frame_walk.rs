@@ -16,24 +16,27 @@
 //! whole walk at the frame's end, a metered walk record by record and its
 //! header, trailer and padding at the end.
 //!
-//! Every move of the cursor lives in [`cursor`]: the cursor, the one record
-//! a walk presents and the two movers, each of which spends the presented
-//! record — on a consumed answer's token, or on the cursor's own test of
-//! the begin LSN — and runs the record iterator's end check when it leaves
-//! no record, so no walk ends a frame on a count alone. Outside it nothing
-//! can move the cursor, build a presentation or mint the token (the store
-//! does that), so a move on a `NeedsRoom` answer does not compile.
+//! Every move of the cursor lives in [`cursor`]: the cursor, its walk over
+//! the frame, the one record a walk presents and the two movers, each of
+//! which spends the presented record — on a consumed answer's token, or on
+//! the cursor's own test of the begin LSN — and runs the record iterator's
+//! end check when it leaves no record, so no walk ends a frame on a count
+//! alone. Outside it nothing can move the cursor, build a presentation or
+//! mint the token (the store does that), so a move on a `NeedsRoom` answer
+//! does not compile. A walk holds one record iterator from its start to
+//! its stop and checks the cursor against the frame once, at its start, so
+//! a record costs what one iterator step costs.
 
 use std::io;
 
 use inf_log::fs::SegmentFs;
-use inf_log::{FrameRecordError, FrameRef, ReadError, ReadStep, SegmentReader};
+use inf_log::{FrameRecordError, Lsn, NsId, ReadError, ReadStep, SegmentReader};
 use inf_store::{DemoteProgress, Keyspace, ReplaySpill, Replayed};
 
 use super::{
     BootFile, Phase, Recovery, StampVerdict, StepBudget, io_invalid, io_msg, replay_apply_failed,
 };
-use cursor::{FrameCursor, Moved};
+use cursor::{CursorWalk, FrameCursor, Moved};
 
 /// The cursor of a replay step inside one frame, and the only code that
 /// moves it (ADR-0174 A1). Its fields are private here: outside this module
@@ -58,38 +61,52 @@ pub(super) mod cursor {
         pub(super) parked_markers: u8,
     }
 
-    /// What the cursor's movers answer: a record follows, or the frame
-    /// ended (its end check passed).
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub(super) enum Moved {
-        Next,
+    /// What the cursor's movers answer: a record follows, the walk handed
+    /// back to present it, or the frame ended (its end check passed).
+    pub(super) enum Moved<'c, 'f> {
+        Next(CursorWalk<'c, 'f>),
         FrameEnd,
     }
 
-    /// Why a presentation failed: the record at the cursor did not decode
-    /// (corrupt input, as at a frame's first walk), or the frame given is
-    /// not the cursor's.
+    /// Why a walk or a presentation failed: the record at the cursor did
+    /// not decode (corrupt input, as at a frame's first walk), or the
+    /// frame given is not the cursor's.
     #[derive(Debug)]
     pub(super) enum PresentError {
         Record(FrameRecordError),
         Lost,
     }
 
+    /// One walk of a frame from the cursor: the cursor, held for the walk,
+    /// and the frame's record iterator at the cursor's position, made only
+    /// by [`FrameCursor::walk`], whose check that the frame is the cursor's
+    /// is the walk's one, so a presented record pays none of its own.
+    /// Presenting a record consumes the walk and a move hands it back: a
+    /// dropped presentation drops the walk, the cursor still at the record
+    /// it presented, and only a new walk from the cursor presents it again.
+    /// A value, not a borrow, so the iterator stays in registers across the
+    /// records' applies (the in-place form, a borrowed walk, measured
+    /// slower on the replay bench).
+    pub(super) struct CursorWalk<'c, 'f> {
+        cursor: &'c mut FrameCursor,
+        records: RecordIter<'f>,
+    }
+
     /// The one record a walk presents, made only by
-    /// [`FrameCursor::present`]: it holds the cursor, so one presentation
-    /// is live at a time, and the iterator past the record. Each mover
-    /// spends it; dropping it moves nothing.
+    /// [`CursorWalk::present`]: it holds the walk — the cursor, so one
+    /// presentation is live at a time, and the iterator past the record —
+    /// and the record's LSN. Each mover spends it; dropping it moves
+    /// nothing.
     #[must_use = "a presented record moves the cursor only by advance or skip_below_begin"]
     pub(super) struct PresentedRecord<'c, 'f> {
-        cursor: &'c mut FrameCursor,
-        after: RecordIter<'f>,
+        walk: CursorWalk<'c, 'f>,
         lsn: Lsn,
     }
 
     /// What [`PresentedRecord::skip_below_begin`] did.
     pub(super) enum Skipped<'c, 'f> {
         /// The record lay below the begin LSN: the cursor passed it.
-        Moved(Result<Moved, FrameRecordError>),
+        Moved(Result<Moved<'c, 'f>, FrameRecordError>),
         /// The record is at or above it, handed back to be applied.
         Kept(PresentedRecord<'c, 'f>),
     }
@@ -135,19 +152,38 @@ pub(super) mod cursor {
             }
         }
 
+        /// The walk from the cursor over `frame`, the frame the reader holds
+        /// for it: `Lost` when the cursor is another frame's, or past this
+        /// one's body or count.
+        pub(super) fn walk<'c, 'f>(
+            &'c mut self,
+            frame: &FrameRef<'f>,
+        ) -> Result<CursorWalk<'c, 'f>, PresentError> {
+            let records = frame.records_from(&self.records).map_err(|_| PresentError::Lost)?;
+            Ok(CursorWalk { cursor: self, records })
+        }
+    }
+
+    impl<'c, 'f> CursorWalk<'c, 'f> {
+        /// The cursor the walk holds, to read.
+        #[inline]
+        pub(super) fn cursor(&self) -> &FrameCursor {
+            self.cursor
+        }
+
         /// Decodes the record at the cursor through the record iterator
         /// (its length from the decoder; a body short of its count answers
         /// `MissingRecords` here) and presents it.
-        pub(super) fn present<'c, 'f>(
-            &'c mut self,
-            frame: &FrameRef<'f>,
+        #[inline]
+        pub(super) fn present(
+            mut self,
         ) -> Result<(RecordView<'f>, PresentedRecord<'c, 'f>), PresentError> {
-            let mut after = frame.records_from(&self.records).map_err(|_| PresentError::Lost)?;
-            match after.next() {
-                Some(Ok((lsn, view))) => Ok((view, PresentedRecord { cursor: self, after, lsn })),
+            match self.records.next() {
+                Some(Ok((lsn, view))) => Ok((view, PresentedRecord { walk: self, lsn })),
                 Some(Err(error)) => Err(PresentError::Record(error)),
-                // A cursor that left no record moved to the frame's end,
-                // which no presentation follows.
+                // A walk starts at a record of a frame that has one and is
+                // handed back only while one follows, so this names a
+                // cursor at the frame's end, which no presentation follows.
                 None => Err(PresentError::Lost),
             }
         }
@@ -157,8 +193,9 @@ pub(super) mod cursor {
         /// Moves past the record when it lies below the begin LSN copied at
         /// the frame's entry — the checkpoint holds its final state — and
         /// hands it back otherwise.
+        #[inline]
         pub(super) fn skip_below_begin(self) -> Skipped<'c, 'f> {
-            if self.cursor.begin.is_some_and(|begin| self.lsn < begin) {
+            if self.walk.cursor.begin.is_some_and(|begin| self.lsn < begin) {
                 Skipped::Moved(self.pass())
             } else {
                 Skipped::Kept(self)
@@ -172,7 +209,11 @@ pub(super) mod cursor {
         }
 
         /// Moves past the record on its consumed answer's token.
-        pub(super) fn advance(self, token: ConsumedRecord) -> Result<Moved, FrameRecordError> {
+        #[inline]
+        pub(super) fn advance(
+            self,
+            token: ConsumedRecord,
+        ) -> Result<Moved<'c, 'f>, FrameRecordError> {
             drop(token);
             self.pass()
         }
@@ -180,24 +221,25 @@ pub(super) mod cursor {
         /// The planted canary of `skip_on_resume`: passes a record with no
         /// token.
         #[cfg(inf_canary_recover_skip_on_resume)]
-        pub(super) fn pass_planted(self) -> Result<Moved, FrameRecordError> {
+        pub(super) fn pass_planted(self) -> Result<Moved<'c, 'f>, FrameRecordError> {
             self.pass()
         }
 
         /// The cursor to the iterator's position; a move that leaves no
         /// record runs the iterator once more, its end check: `None` is the
         /// frame's end, bytes after the counted records its typed error.
-        fn pass(self) -> Result<Moved, FrameRecordError> {
-            let PresentedRecord { cursor, mut after, .. } = self;
-            cursor.records = after.cursor();
-            if cursor.records.remaining() > 0 {
-                return Ok(Moved::Next);
+        #[inline]
+        fn pass(self) -> Result<Moved<'c, 'f>, FrameRecordError> {
+            let PresentedRecord { mut walk, .. } = self;
+            walk.cursor.records = walk.records.cursor();
+            if walk.cursor.records.remaining() > 0 {
+                return Ok(Moved::Next(walk));
             }
             if cfg!(inf_canary_recover_frame_end_counted) {
                 // The planted canary ends the frame on its count alone.
                 return Ok(Moved::FrameEnd);
             }
-            match after.next() {
+            match walk.records.next() {
                 None => Ok(Moved::FrameEnd),
                 Some(Err(error)) => Err(error),
                 // The iterator yields no record once its count is spent.
@@ -225,13 +267,33 @@ pub(super) enum YieldKind {
 }
 
 /// A walk's own state: metered or whole, the body offset up to which the
-/// frame is charged, the frame's extent, and whether an earlier step parked
-/// the cursor it started at.
+/// frame is charged, the frame's extent, base and first LSN (a record
+/// error names the frame by it), and whether an earlier step parked the
+/// cursor it started at.
 struct Walk {
     metered: bool,
     charged_to: u32,
     padded: u64,
+    frame_base: u32,
+    at: Lsn,
     resumed: bool,
+}
+
+/// One turn's answer: the next record, its walk handed back, or the walk
+/// stopped.
+enum Turn<'c, 'f> {
+    Next(CursorWalk<'c, 'f>),
+    Stop(Stop),
+}
+
+/// Why a walk stopped: the frame's end (`ask_yield` when the walk was
+/// metered and its budget is spent, so the step yields at the boundary);
+/// a yield inside the frame; or a record that needs room in `ns`, its
+/// presentation dropped, so the cursor is at it.
+enum Stop {
+    FrameEnd { ask_yield: bool },
+    Parked(YieldKind),
+    NeedsRoom(NsId, Lsn),
 }
 
 impl<F: SegmentFs + Clone> Recovery<F> {
@@ -269,33 +331,68 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         let unpaid = padded.saturating_sub(u64::from(cursor.body_offset()));
         // The planted canary walks every frame whole, never asking.
         let metered = !cfg!(inf_canary_recover_frame_whole) && unpaid >= budget.left();
-        let mut walk = Walk { metered, charged_to: cursor.body_offset(), padded, resumed };
-        // Bound: one turn per record of the frame, plus one presentation
-        // more per demote step that made room (four room asks a record).
+        let charged_to = cursor.body_offset();
+        let at = frame.first_lsn();
+        let mut walk = Walk { metered, charged_to, padded, frame_base: base, at, resumed };
+        // Bound: one walk, plus one more per demote step that made room (a
+        // record asks for room at most four times).
         loop {
-            if let Some(end) = self.walk_record(ks, &frame, &mut cursor, &mut walk, budget)? {
-                return Ok(end.into_walk_end(cursor, padded));
-            }
+            let live = cursor
+                .walk(&frame)
+                .map_err(|_| cursor_lost(base, "the cursor is past the frame's body or count"))?;
+            let kind = match self.walk_records(ks, live, &mut walk, budget)? {
+                Stop::FrameEnd { ask_yield } => return Ok(WalkEnd::FrameEnd { ask_yield }),
+                Stop::Parked(kind) => {
+                    // The markers the register holds at the yield, which
+                    // the resumed walk re-validates.
+                    cursor.parked_markers = parked_markers(ks);
+                    kind
+                }
+                Stop::NeedsRoom(ns, lsn) => {
+                    match self.make_room(ks, ns, &mut cursor, &mut walk, budget, lsn)? {
+                        Some(kind) => kind,
+                        // The room is made: a new walk presents the record.
+                        None => continue,
+                    }
+                }
+            };
+            let unpaid = padded.saturating_sub(u64::from(cursor.body_offset()));
+            return Ok(WalkEnd::Parked { cursor, kind, unpaid });
+        }
+    }
+
+    /// The records of one walk from `live` on, until the walk stops.
+    fn walk_records<'c, 'f>(
+        &mut self,
+        ks: &mut Keyspace,
+        mut live: CursorWalk<'c, 'f>,
+        walk: &mut Walk,
+        budget: &mut StepBudget,
+    ) -> io::Result<Stop> {
+        // Bound: one turn per record the frame has left.
+        loop {
+            live = match self.walk_record(ks, live, walk, budget)? {
+                Turn::Next(next) => next,
+                Turn::Stop(stop) => return Ok(stop),
+            };
         }
     }
 
     /// One turn of a walk: the record at the cursor presented, then skipped
     /// below the begin LSN, applied and moved past, or waiting for room.
-    /// `Some` ends the walk: the frame's end, or a yield inside it.
-    fn walk_record(
+    fn walk_record<'c, 'f>(
         &mut self,
         ks: &mut Keyspace,
-        frame: &FrameRef<'_>,
-        cursor: &mut FrameCursor,
+        live: CursorWalk<'c, 'f>,
         walk: &mut Walk,
         budget: &mut StepBudget,
-    ) -> io::Result<Option<AfterMove>> {
-        let at = frame.first_lsn();
-        let (view, presented) = match cursor.present(frame) {
+    ) -> io::Result<Turn<'c, 'f>> {
+        let at = walk.at;
+        let (view, presented) = match live.present() {
             Ok(presented) => presented,
             Err(cursor::PresentError::Record(error)) => return Err(record_failed(at, error)),
             Err(cursor::PresentError::Lost) => {
-                return Err(cursor_lost(cursor.frame_base(), "the cursor names no record"));
+                return Err(cursor_lost(walk.frame_base, "the cursor names no record"));
             }
         };
         // The planted canary runs the begin test only on a walk that starts
@@ -306,7 +403,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 cursor::Skipped::Moved(moved) => {
                     self.stats.records_pre_begin += 1;
                     let moved = moved.map_err(|error| record_failed(at, error))?;
-                    return Ok(self.after_move(cursor, walk, budget, moved));
+                    return Ok(self.after_move(walk, budget, moved));
                 }
                 cursor::Skipped::Kept(presented) => presented,
             }
@@ -327,26 +424,28 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 #[cfg(inf_canary_recover_skip_on_resume)]
                 if walk.resumed {
                     let moved = presented.pass_planted().map_err(|e| record_failed(at, e))?;
-                    return Ok(self.after_move(cursor, walk, budget, moved));
+                    return Ok(self.after_move(walk, budget, moved));
                 }
                 drop(presented);
-                let parked = self.make_room(ks, ns, cursor, walk, budget, lsn)?;
-                return Ok(parked.map(AfterMove::Parked));
+                return Ok(Turn::Stop(Stop::NeedsRoom(ns, lsn)));
             }
         };
         self.count_outcome(ks, token.outcome());
         let moved = presented.advance(token).map_err(|error| record_failed(at, error))?;
-        cursor.parked_markers = parked_markers(ks);
         if priced {
+            // Its reads are charged with the bytes passed, and the rest of
+            // the walk is metered; the frame's end charges what is left.
             self.drain_frame(budget);
-            self.charge_passed(cursor, walk, budget);
+            if let Moved::Next(next) = &moved {
+                self.charge_passed(next.cursor(), walk, budget);
+            }
             walk.metered = true;
         }
         if cfg!(inf_canary_recover_ask_per_record) && !walk.metered {
             // The planted canary asks after every record of a whole walk.
             let _ = budget.spent();
         }
-        Ok(self.after_move(cursor, walk, budget, moved))
+        Ok(self.after_move(walk, budget, moved))
     }
 
     /// A frame's entry, one unit: the reader's next frame read whole and
@@ -443,29 +542,32 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     }
 
     /// After a move: the frame's end, charged; a yield inside it, for a
-    /// metered walk whose budget is spent; else `None`, the next record.
-    fn after_move(
+    /// metered walk whose budget is spent; else the next record.
+    fn after_move<'c, 'f>(
         &mut self,
-        cursor: &mut FrameCursor,
         walk: &mut Walk,
         budget: &mut StepBudget,
-        moved: Moved,
-    ) -> Option<AfterMove> {
+        moved: Moved<'c, 'f>,
+    ) -> Turn<'c, 'f> {
         match moved {
             Moved::FrameEnd => {
                 // The frame's bytes not charged yet: all of them for a
                 // whole walk, the header, trailer and padding for a
-                // metered one; then the boot I/O its records did.
+                // metered one (and the last record's bytes after a priced
+                // one); then the boot I/O its records did.
                 budget.charge(walk.padded.saturating_sub(u64::from(walk.charged_to)));
-                walk.charged_to = cursor.body_offset();
                 self.drain_frame(budget);
-                Some(AfterMove::FrameEnd { ask_yield: walk.metered && budget.spent() })
+                Turn::Stop(Stop::FrameEnd { ask_yield: walk.metered && budget.spent() })
             }
-            Moved::Next if walk.metered => {
-                self.charge_passed(cursor, walk, budget);
-                budget.spent().then_some(AfterMove::Parked(YieldKind::Frame))
+            Moved::Next(next) if walk.metered => {
+                self.charge_passed(next.cursor(), walk, budget);
+                if budget.spent() {
+                    Turn::Stop(Stop::Parked(YieldKind::Frame))
+                } else {
+                    Turn::Next(next)
+                }
             }
-            Moved::Next => None,
+            Moved::Next(next) => Turn::Next(next),
         }
     }
 
@@ -478,11 +580,11 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     fn make_room(
         &mut self,
         ks: &mut Keyspace,
-        ns: inf_log::NsId,
+        ns: NsId,
         cursor: &mut FrameCursor,
         walk: &mut Walk,
         budget: &mut StepBudget,
-        lsn: inf_log::Lsn,
+        lsn: Lsn,
     ) -> io::Result<Option<YieldKind>> {
         walk.metered = true;
         self.charge_passed(cursor, walk, budget);
@@ -536,24 +638,6 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     }
 }
 
-/// [`Recovery::after_move`]'s answer before it owns the cursor.
-enum AfterMove {
-    FrameEnd { ask_yield: bool },
-    Parked(YieldKind),
-}
-
-impl AfterMove {
-    fn into_walk_end(self, cursor: FrameCursor, padded: u64) -> WalkEnd {
-        match self {
-            AfterMove::FrameEnd { ask_yield } => WalkEnd::FrameEnd { ask_yield },
-            AfterMove::Parked(kind) => {
-                let unpaid = padded.saturating_sub(u64::from(cursor.body_offset()));
-                WalkEnd::Parked { cursor, kind, unpaid }
-            }
-        }
-    }
-}
-
 /// The register's markers, at most the displacement register's cap.
 fn parked_markers(ks: &Keyspace) -> u8 {
     u8::try_from(ks.displace_register_len()).unwrap_or(u8::MAX)
@@ -561,7 +645,7 @@ fn parked_markers(ks: &Keyspace) -> u8 {
 
 /// A record error inside a CRC-valid frame: the boot's refusal, as the
 /// frame's first walk reports it.
-fn record_failed(at: inf_log::Lsn, error: FrameRecordError) -> io::Error {
+fn record_failed(at: Lsn, error: FrameRecordError) -> io::Error {
     replay_apply_failed(at, &io_invalid(error))
 }
 
@@ -571,6 +655,6 @@ fn cursor_lost(frame_base: u32, why: &str) -> io::Error {
     io_msg(format!("replay: CursorLost at the frame based at {frame_base:#x}: {why}"))
 }
 
-fn refused(ns: inf_log::NsId, refusal: &inf_store::ReplayRefusal) -> io::Error {
+fn refused(ns: NsId, refusal: &inf_store::ReplayRefusal) -> io::Error {
     super::replay_refused(ns, refusal)
 }
