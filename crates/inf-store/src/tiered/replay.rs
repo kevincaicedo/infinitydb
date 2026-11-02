@@ -398,6 +398,17 @@ enum RoomVerdict {
     NeedsRoom,
 }
 
+/// What a placement changes on the machine once its record is placed: no
+/// more, the first record's `Seeded` → `Fitting`, or the waiting record's
+/// pending room cleared — read once, from the state, before the room
+/// question.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PlaceEntry {
+    Plain,
+    Seeded,
+    Waiting,
+}
+
 /// What a replayed upsert did: placed at an address, or waiting for room
 /// with nothing of it applied.
 #[must_use = "a record that needs room was not placed"]
@@ -443,7 +454,10 @@ pub struct TierReplay<F: SegmentFs> {
     /// Scratch: the key of the record being settled (its RAM bytes may
     /// move under the settle).
     key: Vec<u8>,
-    /// The record waiting for room, while a demote step is under way.
+    /// The record waiting for room, while a demote step is under way. Set
+    /// only by [`begin_demote`](Self::begin_demote), which enters
+    /// `Spilling`, so a machine in any other state holds none and its
+    /// replay entries read it only in `Spilling`.
     pending: Option<PendingRoom>,
 }
 
@@ -1060,7 +1074,8 @@ impl TieredTable {
     /// question, the parked markers, the arm, and `Seeded` → `Fitting` —
     /// one read of the state, one ask of `room` for a record that fits. A
     /// record waiting for room is the one presented again, of its length;
-    /// it keeps its asks until it is placed.
+    /// it keeps its asks until it is placed. Only `Spilling` can hold one,
+    /// so a fitting boot reads no pending record and clears none.
     fn replay_place<F: SegmentFs>(
         &mut self,
         mut replay: Option<&mut TierReplay<F>>,
@@ -1069,15 +1084,27 @@ impl TieredTable {
         len: usize,
         arm: impl FnOnce(&mut TieredTable) -> Result<LogicalAddr, OpError>,
     ) -> Result<Placement, ReplayRefusal> {
-        let seeded = match replay.as_deref() {
-            Some(r) if matches!(r.state, ReplayState::Settling { .. }) => {
-                return Err(ReplayRefusal::ReplayEnded);
+        let entry = match replay.as_deref() {
+            None => PlaceEntry::Plain,
+            Some(r) => {
+                debug_assert!(
+                    r.pending.is_none() || r.state == ReplayState::Spilling,
+                    "a record waits for room only while the machine spills"
+                );
+                match r.state {
+                    ReplayState::Settling { .. } => return Err(ReplayRefusal::ReplayEnded),
+                    ReplayState::Seeded => PlaceEntry::Seeded,
+                    ReplayState::Fitting => PlaceEntry::Plain,
+                    ReplayState::Spilling => match &r.pending {
+                        None => PlaceEntry::Plain,
+                        Some(pending) if pending.len == len => PlaceEntry::Waiting,
+                        Some(_) => {
+                            let why = "another record presented";
+                            return Err(ReplayRefusal::RoomMoved { why });
+                        }
+                    },
+                }
             }
-            Some(r) if r.pending.as_ref().is_some_and(|pending| pending.len != len) => {
-                return Err(ReplayRefusal::RoomMoved { why: "another record presented" });
-            }
-            Some(r) => r.state == ReplayState::Seeded,
-            None => false,
         };
         match self.make_room(replay.as_deref_mut(), len)? {
             RoomVerdict::Fits => {}
@@ -1086,14 +1113,17 @@ impl TieredTable {
         self.drain_markers(replay.as_deref_mut(), markers, hash);
         let placed = arm(self).map_err(ReplayRefusal::Store)?;
         if let Some(r) = replay {
-            r.pending = None;
-            if seeded {
-                debug_assert_eq!(
-                    r.state,
-                    ReplayState::Seeded,
-                    "a seeded table's first record fits"
-                );
-                r.state = ReplayState::Fitting;
+            match entry {
+                PlaceEntry::Plain => {}
+                PlaceEntry::Seeded => {
+                    debug_assert_eq!(
+                        r.state,
+                        ReplayState::Seeded,
+                        "a seeded table's first record fits"
+                    );
+                    r.state = ReplayState::Fitting;
+                }
+                PlaceEntry::Waiting => r.pending = None,
             }
         }
         Ok(Placement::Placed(placed))
@@ -1118,11 +1148,12 @@ impl TieredTable {
         hash: u64,
     ) -> Result<(bool, DeleteReads), ReplayRefusal> {
         if let Some(r) = replay.as_deref_mut() {
-            if r.pending.is_some() {
-                return Err(ReplayRefusal::RoomMoved { why: "a delete presented" });
-            }
             match r.state {
                 ReplayState::Settling { .. } => return Err(ReplayRefusal::ReplayEnded),
+                // Only `Spilling` can hold a record waiting for room.
+                ReplayState::Spilling if r.pending.is_some() => {
+                    return Err(ReplayRefusal::RoomMoved { why: "a delete presented" });
+                }
                 ReplayState::Spilling => return self.replay_delete_spilling(r, markers, key, hash),
                 ReplayState::Seeded | ReplayState::Fitting => {}
             }
