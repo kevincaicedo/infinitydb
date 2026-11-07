@@ -441,8 +441,8 @@ pub struct SimReport {
     /// The `--plant` canary reached its arming point (engagement check —
     /// a plant that never fired proves nothing).
     pub plant_fired: bool,
-    /// Parked accept arms resumed (F-L11-02): the plane's retry wheel or
-    /// a `Close`. `--plant accept-error` needs ≥ 1 or the queued clients
+    /// Parked accept arms resumed, by the plane's retry timer or by a
+    /// `Close`. `--plant accept-error` needs ≥ 1 or the queued clients
     /// were never let in (and the run stalls).
     pub accept_resumes: u64,
     /// Longest run of budget-exhausted drains that skipped a peer with
