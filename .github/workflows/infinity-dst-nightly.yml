@@ -63,6 +63,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
+      # The node rows' runner (`tests/crash-matrix/run_node_rows.py`) builds
+      # its carrier packages' tests `--offline`, and `-p crash-matrix` alone
+      # downloads only crash-matrix's own graph: without the whole lock
+      # fetched first, a carrier's dev-dependency is missing and the row
+      # reads red for a download, not a verdict.
+      - name: fetch every locked crate
+        run: cargo fetch --locked
       - name: crash matrix (expanded seeds)
         run: CRASH_MATRIX_SEEDS=256 cargo test -p crash-matrix -- --nocapture
 
