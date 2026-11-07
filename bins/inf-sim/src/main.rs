@@ -1525,6 +1525,9 @@ fn main() {
         report.shadow_unmodeled
     );
     print_census(report.cap_rows_checked, report.cap_rows_crossed);
+    if let Some(accept_retry) = &report.accept_retry {
+        print_accept_retry(accept_retry);
+    }
     if let Some(path) = &trace_out
         && let Err(e) = std::fs::write(path, &report.trace)
     {
@@ -1570,6 +1573,13 @@ fn main() {
 /// crossed, which its crossing rule judged (node sums, ADR-0163 D2).
 fn print_census(rows_checked: u64, rows_crossed: u64) {
     println!("inf-sim: cap_rows_checked={rows_checked} cap_rows_crossed={rows_crossed}");
+}
+
+/// The accept-retry oracle's reading on its leg (`--plant accept-broken`):
+/// the broken-class parks, how each ended, and the first `AcceptArm`'s
+/// timing against the park's retry deadline (node sums, ns).
+fn print_accept_retry(report: &inf_sim::harness::accept_retry::RetryReport) {
+    println!("inf-sim: accept_retry {report}");
 }
 
 /// The `--tier-leg` names, `|`-joined for a message.

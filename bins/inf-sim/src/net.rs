@@ -116,6 +116,23 @@ impl AcceptPark {
 }
 
 impl Plant {
+    /// Whether this plant is the accept-retry oracle's leg: a listener that
+    /// only the plane's retry resumes. It alone builds the oracle's watch;
+    /// the match names every plant, so a plant added is classified here.
+    #[must_use]
+    pub fn is_accept_retry_leg(self) -> bool {
+        match self {
+            Plant::AcceptBroken => true,
+            Plant::None
+            | Plant::LostWakeup
+            | Plant::FsyncLies
+            | Plant::StopKill
+            | Plant::AcceptError
+            | Plant::TierReadEio
+            | Plant::TierWriteEio => false,
+        }
+    }
+
     /// The errno an accept plant delivers, `None` for every other plant.
     fn accept_errno(self) -> Option<i32> {
         match self {

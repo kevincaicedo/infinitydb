@@ -72,6 +72,7 @@ use inf_wire::{CommandId, Protocol, lookup};
 use crate::net::{CellNet, Plant, SimDriver, listener_fd};
 use crate::resp::{Reply, SubFrame, parse_reply, parse_sub_frame, reply_len};
 
+pub mod accept_retry;
 mod audit;
 mod idle;
 pub mod shadow;
@@ -445,6 +446,10 @@ pub struct SimReport {
     /// `Close`. `--plant accept-error` needs ≥ 1 or the queued clients
     /// were never let in (and the run stalls).
     pub accept_resumes: u64,
+    /// The accept-retry oracle's reading, on its leg alone (`--plant
+    /// accept-broken`): each broken-parked accept arm and the plane's retry
+    /// that resumed it.
+    pub accept_retry: Option<accept_retry::RetryReport>,
     /// Longest run of budget-exhausted drains that skipped a peer with
     /// frames waiting, over every cell (F-L12-02; bound `cells − 2`).
     /// Disclosed so a fairness run that never exhausted a budget cannot
@@ -1474,6 +1479,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         shadow_unmodeled: BTreeMap::new(),
         plant_fired: false,
         accept_resumes: 0,
+        accept_retry: None,
         fabric_skip_streak_max: 0,
         refused_clients: 0,
         idle_closed: 0,
@@ -1485,6 +1491,12 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     let mut idle_steps = 0u64;
     let mut idle: IdlePhase = IdlePhase::new(scenario.idle_clients);
     let mut order: VecDeque<usize> = (0..cells.len()).collect();
+    // The accept-retry oracle, on its leg alone: it reads the drivers and
+    // changes nothing a run does.
+    let mut retry_watch = scenario
+        .plant
+        .is_accept_retry_leg()
+        .then(|| accept_retry::RetryWatch::new(cells.len(), scenario.step_ns_bound()));
 
     loop {
         report.scheduler_steps += 1;
@@ -1500,6 +1512,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         for &i in &order {
             let (cell_loop, plane) = &mut cells[i];
             cell_loop.run_iteration(plane).expect("sim iteration");
+        }
+        if let Some(watch) = &mut retry_watch {
+            watch.sample(clock.now(), &nets);
         }
 
         // Subscriber pump: drain frames, classify, verify deliveries.
@@ -1837,6 +1852,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                 .to_string(),
         );
     }
+    // The accept-retry oracle writes the report's list, as the resume check
+    // does: the run's end keeps both lines by appending to it.
+    report.accept_retry = retry_watch.map(|watch| watch.finish(&mut report.oracle_violations));
 
     // Accounting reconciliation oracle (M1-S15): equalize active-vs-lazy
     // expiry at one instant, then live records must reconcile exactly; every
