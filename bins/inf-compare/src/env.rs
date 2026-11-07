@@ -34,8 +34,37 @@ pub fn gather(reference_box: bool, unsafe_env: bool) -> Env {
         reference_box,
         unsafe_env,
         Path::new("/sys/devices/system/cpu"),
-        &[PathBuf::from("target/release/inf-bench"), PathBuf::from("target/debug/inf-bench")],
+        &built_binaries("inf-bench"),
     )
+}
+
+/// Where a binary of this workspace sits in the target root that built the
+/// running one, release before debug. The root is the build's, not the
+/// working directory's `target/`: under `CARGO_TARGET_DIR` that directory
+/// holds a stale binary or none, and a benchmark or an environment verdict
+/// would come from it (ADR-0198 A2). Empty when the running binary's path is
+/// unknown.
+pub fn built_binaries(name: &str) -> Vec<PathBuf> {
+    std::env::current_exe().map(|exe| binaries_beside(&exe, name)).unwrap_or_default()
+}
+
+/// Cargo puts a binary at `<root>/[<target triple>/]<profile>/<name>` and a
+/// test binary one level down, in `deps/`, so the profile directories are
+/// the siblings of the one holding `exe` (or holding its `deps/`).
+fn binaries_beside(exe: &Path, name: &str) -> Vec<PathBuf> {
+    let Some(mut profile) = exe.parent() else {
+        return Vec::new();
+    };
+    if profile.file_name().is_some_and(|leaf| leaf == "deps") {
+        let Some(up) = profile.parent() else {
+            return Vec::new();
+        };
+        profile = up;
+    }
+    let Some(base) = profile.parent() else {
+        return Vec::new();
+    };
+    ["release", "debug"].iter().map(|kind| base.join(kind).join(name)).collect()
 }
 
 fn gather_from(
