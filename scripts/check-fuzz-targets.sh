@@ -56,8 +56,12 @@
 # from the target's call site, is red here. Every row is judged and printed
 # before the gate exits; only an empty census stops it early.
 #
-# The probe (scripts/fuzz-check-probe, ADR-0198 D2) is compiled first, with
-# the same call, on every run: plant_crate must be refused with E0433 naming
+# The probe (scripts/fuzz-check-probe, ADR-0198 D2) is compiled first, on
+# every run, with the same call but cold, in a directory of its own made by
+# `mktemp -d` under the kept one and removed at exit (ADR-0198 A2): its
+# package has no dependency, so cargo would key its units alike wherever they
+# were written, and no earlier run's output may stand for a verdict (about
+# 0.1 s). plant_crate must be refused with E0433 naming
 # absent_crate in shared/leaf.rs (a production file that names a crate the
 # fuzz crate lacks), plant_warning for a denied warning, plant_cfg with
 # E0433 naming absent_cfg_crate (an arm only cfg(fuzzing) compiles),
@@ -115,6 +119,14 @@ if [ "$mode" = gate ]; then
         { echo "FUZZ-TARGETS SCOPE ERROR: scripts/target-root.sh gave no target root"; exit 1; }
     INF_FUZZ_TARGET_DIR=$(target_root_kept fuzz-check)
     export INF_FUZZ_TARGET_DIR
+    if [ "$probe" = on ]; then
+        mkdir -p "$INF_FUZZ_TARGET_DIR"
+        INF_FUZZ_PROBE_DIR=$(mktemp -d "$INF_FUZZ_TARGET_DIR/probe.XXXXXX")
+        [ -n "$INF_FUZZ_PROBE_DIR" ] && [ -d "$INF_FUZZ_PROBE_DIR" ] ||
+            { echo "FUZZ-TARGETS SCOPE ERROR: mktemp failed under $INF_FUZZ_TARGET_DIR"; exit 1; }
+        export INF_FUZZ_PROBE_DIR
+        trap '[ -n "$INF_FUZZ_PROBE_DIR" ] && [ -d "$INF_FUZZ_PROBE_DIR" ] && rm -rf "$INF_FUZZ_PROBE_DIR"' EXIT
+    fi
 fi
 
 INF_SCRIPT_DIR="$SCRIPT_DIR" INF_FUZZ_MODE="$mode" INF_FUZZ_MATRIX="$matrix" INF_FUZZ_PROBE="$probe" \
@@ -347,6 +359,7 @@ def lock_rewritten():
 probe = "skipped (fixture mode, INF_FUZZ_CHECK_PROBE=off)"
 if PROBE == "on":
     verdicts = {}
+    PROBE_TARGET = ["--target-dir", os.environ["INF_FUZZ_PROBE_DIR"]]
     for manifest, want in PROBE_TARGETS.items():
         try:
             rows = [n for n, _ in fuzz_targets.bin_rows(manifest)]
@@ -355,7 +368,7 @@ if PROBE == "on":
         if rows != want:
             reds.append(f"P {manifest} holds targets {rows}, exactly {want} expected: an edited-down "
                         "probe proves less")
-    main = Report(PROBE_MAIN, KEPT)
+    main = Report(PROBE_MAIN, PROBE_TARGET)
     if refused(main, "plant_crate", lambda m: e0433(m, "absent_crate", "shared/leaf.rs"), "P1"):
         verdicts["P1"] = "plant_crate E0433 absent_crate"
     if refused(main, "plant_warning", denied_warning, "P2"):
@@ -383,7 +396,7 @@ if PROBE == "on":
                     "run without --locked rewrote it; restore it with "
                     f"`git checkout -- {PROBE_LOCK_FILE}`")
     else:
-        lock = Report(PROBE_LOCK, KEPT)
+        lock = Report(PROBE_LOCK, PROBE_TARGET)
         if lock.status != 0 and "stale_lock" not in lock.bins and lock.refused_lock():
             verdicts["P4"] = "stale_lock refused by --locked"
         else:

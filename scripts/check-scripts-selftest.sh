@@ -4376,6 +4376,65 @@ fz_probe "$root"
 expect_output "fuzz-targets: the probe's five verdicts on the OK line" \
     "probe: plant_crate E0433 absent_crate, plant_warning denied, plant_cfg E0433 absent_cfg_crate, control compiled naming shared/ok.rs, stale_lock refused by --locked;" \
     fz_probe_run "$root"
+# The probe's directory: one a run, made by mktemp -d under the kept directory
+# and gone at exit, while the census workspaces build in the kept one.
+FZ_PKEPT="$(cd "$root" && pwd -P)/target/fuzz-check-$(fx_root_key "$root")"
+fz_probe_dirs() { # <root> <kept>: prints one run's probe directory; red unless it is per run
+    rm -f "$1.stub/calls"
+    fz_probe_run "$1" >/dev/null 2>&1 || return 1
+    python3 - "$1.stub/calls" "$2" <<'PY'
+import os
+import re
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+calls = [lines[i].split(" ")[1:] for i in range(0, len(lines) - 1, 3)]
+probe = {"scripts/fuzz-check-probe/Cargo.toml", "scripts/fuzz-check-probe/stale-lock/Cargo.toml"}
+dirs, bad, called = set(), [], set()
+for argv in calls:
+    where = argv[argv.index("--target-dir") + 1] if "--target-dir" in argv else None
+    called.add(argv[2])
+    if argv[2] in probe:
+        dirs.add(where)
+    elif where != sys.argv[2]:
+        bad.append(f"{argv[2]} builds in {where}, not the kept {sys.argv[2]}")
+pattern = re.compile(re.escape(sys.argv[2]) + r"/probe\.[A-Za-z0-9]{6}")
+if not probe <= called:
+    bad.append(f"the probe's manifests were not both called: {sorted(called)}")
+if len(dirs) != 1 or not all(d and pattern.fullmatch(d) for d in dirs):
+    bad.append(f"the probe builds in {sorted(map(str, dirs))}, not one mktemp directory under the kept one")
+bad += [f"the probe's directory {d} outlived the run" for d in dirs if d and os.path.exists(d)]
+print("\n".join(bad) if bad else dirs.pop())
+sys.exit(1 if bad else 0)
+PY
+}
+fz_probe_per_run() { # <root> <kept>: two runs, two probe directories
+    local first second
+    first=$(fz_probe_dirs "$1" "$2") || { echo "$first"; return 1; }
+    second=$(fz_probe_dirs "$1" "$2") || { echo "$second"; return 1; }
+    [ "$first" != "$second" ] || { echo "both runs built the probe in $first"; return 1; }
+}
+expect green "fuzz-targets: the probe builds in a directory of its own each run, gone at exit" \
+    fz_probe_per_run "$root" "$FZ_PKEPT"
+fz_probe_mutant() { # <name> <sed expression> <what the copy does>
+    local dir="$work/fz-probe-gate-$1" FUZZ
+    rm -rf "${dir:?}"
+    mkdir -p "$dir"
+    cp "$SCRIPT_DIR/check-fuzz-targets.sh" "$SCRIPT_DIR/fuzz_targets.py" "$SCRIPT_DIR/lint_scope_table.py" \
+        "$SCRIPT_DIR/strip-test-modules.awk" "$SCRIPT_DIR/target-root.sh" "$dir/"
+    fz_sed "$2" "$dir/check-fuzz-targets.sh"
+    chmod +x "$dir/check-fuzz-targets.sh"
+    if cmp -s "$SCRIPT_DIR/check-fuzz-targets.sh" "$dir/check-fuzz-targets.sh"; then
+        echo "selftest: the fuzz-targets probe mutant '$1' changed nothing" >&2
+        exit 2
+    fi
+    FUZZ="$dir/check-fuzz-targets.sh"
+    expect red "fuzz-targets: the probe's directory check is red on a gate that $3" \
+        fz_probe_per_run "$root" "$FZ_PKEPT"
+}
+fz_probe_mutant fixed 's|^\(        INF_FUZZ_PROBE_DIR=\)$(mktemp -d "$INF_FUZZ_TARGET_DIR/probe.XXXXXX")$|\1"$INF_FUZZ_TARGET_DIR/probe.fixed1"; mkdir -p "$INF_FUZZ_PROBE_DIR"|' \
+    "builds the probe in a fixed directory"
+fz_probe_mutant kept 's|^    PROBE_TARGET = \["--target-dir", os.environ\["INF_FUZZ_PROBE_DIR"\]\]$|    PROBE_TARGET = KEPT|' \
+    "builds the probe in the kept directory"
 FZ_PROOT=$root  # fz_probe rewrites both probe answers, so the plants share it
 fz_plant() { # <plant> <label> <pattern>
     fz_probe "$FZ_PROOT" "$1"
