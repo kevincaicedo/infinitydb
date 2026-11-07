@@ -23,9 +23,10 @@
 #     item. The table is generated from the tree (the census below), its
 #     counts per file and record only shrink against the approved copies,
 #     a row's expiry only moves earlier against them, or later up to its
-#     record's date on the CONTAINER_EXPIRY_MOVES line (ADR-0163 A1), whose
-#     own dates only move earlier and whose records only leave,
-#     and `container: capped-backing` is allowed exactly
+#     record's date on the gate's CONTAINER_EXPIRY_MOVES line, or on its
+#     CONTAINER_EXPIRY_MOVES_2 line where the record has one (ADR-0201 D1),
+#     two lines whose own dates only move earlier and whose records only
+#     leave, and `container: capped-backing` is allowed exactly
 #     CAPPED_BACKING_SITES times, with no row. clippy.toml owns the banned
 #     paths and the ban's sentence; this gate reads both from it. Every
 #     `impl Lossy for` site of cell production code is printed on the OK
@@ -75,13 +76,21 @@ ADR0143_EXEMPTIONS_MAX=15
 # capped-backing allows are exact: 1, on `struct CappedDeque` (ADR-0151 D6).
 CONTAINER_EXEMPTIONS_MAX=88
 CAPPED_BACKING_SITES=1
-# ADR-0163 A1: the one later expiry each record's rows may move up to (a
-# ceiling). These dates only move earlier, and a record joins only by the
-# ADR that changes this rule, against HEAD, the base tip and the commit that
-# introduced the line; a record absent here admits no later date. The line
+# ADR-0201 D1: the first move line, the later expiry each record's rows may
+# move up to (a ceiling) where the second line below names no date for it.
+# These dates only move earlier and a record only leaves, against HEAD, the
+# base tip and the line's introducing commit; a record absent here admits no
+# later date on either line. The line
 # stays spelled `CONTAINER_EXPIRY_MOVES="<record>=<date> …"` alone, so every
 # copy reads it.
 CONTAINER_EXPIRY_MOVES="T=2026-11-30 E=2026-12-31 D=2026-12-31 A=2026-12-31 R=2026-12-31 C=2026-12-31"
+# ADR-0201 D1: the second move line, keyed to the first. A record on the first
+# line may move its rows up to its later date here, which must follow its
+# first-line date. This line only loses records or moves earlier, against
+# HEAD, the base tip and its own introducing commit, and a later move is the
+# ADR that supersedes ADR-0201; empty, it moves nothing. It stays spelled once
+# and alone, as the first line is, and no third move line exists.
+CONTAINER_EXPIRY_MOVES_2="R=2027-01-31 C=2027-01-31 A=2027-01-31 D=2027-01-31"
 if [ "${INF_CONTAINER_CENSUS:-0}" = 1 ] && [ -z "${INF_LINT_API_DIAGNOSTICS:-}" ]; then
     # The census reads the ratchet's two passes; the ratchet calls back here.
     exec "$SCRIPT_DIR/check-lint-ratchet.sh"
@@ -98,7 +107,7 @@ done
 
 INF_CELL_DIRS="$CELL_DIRS" INF_SCOPES="${INF_LINT_SCOPES:-docs/lint-scopes.tsv}" INF_EXEMPTIONS="$EXEMPTIONS" INF_BASE_REF="$BASE_REF" INF_MAX="$ADR0143_EXEMPTIONS_MAX" \
     INF_CONTAINERS="$CONTAINERS" INF_CONTAINER_MAX="$CONTAINER_EXEMPTIONS_MAX" INF_BACKING_SITES="$CAPPED_BACKING_SITES" \
-    INF_CONTAINER_MOVES="$CONTAINER_EXPIRY_MOVES" \
+    INF_CONTAINER_MOVES="$CONTAINER_EXPIRY_MOVES" INF_CONTAINER_MOVES_2="$CONTAINER_EXPIRY_MOVES_2" \
     INF_SELF="scripts/check-lint-scopes.sh" INF_SCRIPT_DIR="$SCRIPT_DIR" python3 -B - <<'PY'
 import bisect
 import datetime
@@ -788,19 +797,29 @@ if own_max != [str(CONTAINER_MAX)]:
           f"the approved copies can read ({', '.join(own_max) or 'none'}), in use {CONTAINER_MAX}: keep it "
           "one line, `CONTAINER_EXEMPTIONS_MAX=<digits>` alone")
     sys.exit(1)
-# ADR-0163 A1: record -> the one later date its rows may move onto, read
-# from this gate's line and from each approved copy's, as GATE_MAX is.
+# ADR-0201 D1: record -> the later date its rows may move onto, read from each
+# of the gate's two move lines, in this gate and in each approved copy, as
+# GATE_MAX is. Each line is spelled once and alone, so every copy reads it.
 GATE_MOVES = re.compile(r'^CONTAINER_EXPIRY_MOVES="([^"\n]*)"[ \t]*$', re.M)
+FIRST_MOVES, SECOND_MOVES = "CONTAINER_EXPIRY_MOVES", "CONTAINER_EXPIRY_MOVES_2"
+MOVE_LINES = {FIRST_MOVES: GATE_MOVES,
+              SECOND_MOVES: re.compile(r'^CONTAINER_EXPIRY_MOVES_2="([^"\n]*)"[ \t]*$', re.M)}
+# Every gate line that assigns a CONTAINER_EXPIRY_MOVES<suffix> name, whatever
+# its suffix, indentation or declaring keyword: one not in MOVE_LINES is a
+# third move line.
+ANY_MOVES = re.compile(r"^[ \t]*(?:(?:export|readonly|declare|typeset)(?:[ \t]+-[A-Za-z]+)*[ \t]+)?"
+                       r"(CONTAINER_EXPIRY_MOVES\w*)\+?=", re.M)
 
 
-def moves_in(source, label):
-    """The per-record dates a copy of this gate spells, or None when it spells no line."""
-    found = GATE_MOVES.findall(source)
+def moves_in(source, label, name=FIRST_MOVES):
+    """The per-record dates a copy of this gate spells on its move line `name`, or None
+    when it spells no such line."""
+    found = MOVE_LINES[name].findall(source)
     if not found:
         return None
     if len(found) != 1:
-        print(f"LINT-SCOPES SCOPE ERROR: {label} spells CONTAINER_EXPIRY_MOVES on {len(found)} lines: "
-              "keep it one line, `CONTAINER_EXPIRY_MOVES=\"<record>=<date> …\"` alone")
+        print(f"LINT-SCOPES SCOPE ERROR: {label} spells {name} on {len(found)} lines: "
+              f"keep it one line, `{name}=\"<record>=<date> …\"` alone")
         sys.exit(1)
     moves = {}
     for entry in found[0].split():
@@ -810,20 +829,46 @@ def moves_in(source, label):
         except ValueError:
             due = None
         if record not in RECORDS or due is None or record in moves:
-            print(f"LINT-SCOPES SCOPE ERROR: {label}: CONTAINER_EXPIRY_MOVES entry `{entry}` is not "
+            print(f"LINT-SCOPES SCOPE ERROR: {label}: {name} entry `{entry}` is not "
                   f"`<record>=<YYYY-MM-DD>` for a site record ({' '.join(RECORDS)}), once")
             sys.exit(1)
         moves[record] = due
     return moves
 
 
-MOVES = moves_in((Path(os.environ["INF_SCRIPT_DIR"]) / "check-lint-scopes.sh").read_text(), SELF)
+GATE_TEXT = (Path(os.environ["INF_SCRIPT_DIR"]) / "check-lint-scopes.sh").read_text()
+MOVES = moves_in(GATE_TEXT, SELF)
 if MOVES is None:
     print("LINT-SCOPES SCOPE ERROR: the gate spells no CONTAINER_EXPIRY_MOVES line")
     sys.exit(1)
 if MOVES != moves_in(f'CONTAINER_EXPIRY_MOVES="{os.environ["INF_CONTAINER_MOVES"]}"', "INF_CONTAINER_MOVES"):
     print("LINT-SCOPES SCOPE ERROR: the gate's CONTAINER_EXPIRY_MOVES line is not the one in use")
     sys.exit(1)
+# ADR-0201 D1: the second line is read as the first is, and is the one in use;
+# empty, it moves nothing (its end state once its last record leaves).
+MOVES_2 = moves_in(GATE_TEXT, SELF, SECOND_MOVES)
+if MOVES_2 is None:
+    print(f"LINT-SCOPES SCOPE ERROR: the gate spells no {SECOND_MOVES} line: keep it one line, "
+          f"`{SECOND_MOVES}=\"\"` once its last record leaves")
+    sys.exit(1)
+if MOVES_2 != moves_in(f'CONTAINER_EXPIRY_MOVES_2="{os.environ["INF_CONTAINER_MOVES_2"]}"',
+                       "INF_CONTAINER_MOVES_2", SECOND_MOVES):
+    print(f"LINT-SCOPES SCOPE ERROR: the gate's {SECOND_MOVES} line is not the one in use")
+    sys.exit(1)
+third = sorted(set(ANY_MOVES.findall(GATE_TEXT)) - set(MOVE_LINES))
+if third:
+    print(f"LINT-SCOPES SCOPE ERROR: the gate spells {', '.join(third)}: a third expiry move is the ADR "
+          f"that supersedes ADR-0201 (STOP rule 2), never a move line beside {FIRST_MOVES} and {SECOND_MOVES}")
+    sys.exit(1)
+# ADR-0201 D1: the second line is keyed to the first line in use: each of its
+# entries raises a record the first line moves, past its first-line date.
+for record, due in sorted(MOVES_2.items()):
+    if record not in MOVES:
+        errors.append(f"{SECOND_MOVES}: {record}={due} names a record the {FIRST_MOVES} line in use lacks "
+                      "— the second line only raises a first-line record's date (ADR-0201 D1)")
+    elif due <= MOVES[record]:
+        errors.append(f"{SECOND_MOVES}: {record}={due} is not after its {FIRST_MOVES} date {MOVES[record]} "
+                      "— the second line only raises a first-line record's date (ADR-0201 D1)")
 
 
 def container_rows(text, label):
@@ -902,9 +947,10 @@ TABLE_HEADER = """\
 # each expiry here, so never redirect onto it). A merge conflict, a renamed or split item and a
 # lowered count are resolved by regenerating. `count`: the distinct spans the allow covers.
 # `expiry`, the one hand edit, only moves earlier, or later up to its record's date on the
-# gate's CONTAINER_EXPIRY_MOVES line; the census carries it by (file, item), else from the file
-# and record's earliest date. Per file and record the counts only shrink against
-# the approved copies, and their sum is CONTAINER_EXEMPTIONS_MAX exactly."""
+# gate's CONTAINER_EXPIRY_MOVES line, or on its CONTAINER_EXPIRY_MOVES_2 line where the record
+# has one; the census carries it by (file, item), else from the file and record's earliest
+# date. Per file and record the counts only shrink against the approved copies, and their sum
+# is CONTAINER_EXEMPTIONS_MAX exactly."""
 if CENSUS:
     if not diagnostics:
         print("LINT-SCOPES SCOPE ERROR: the container census needs the ratchet's passes")
@@ -1075,7 +1121,8 @@ elif csum < CONTAINER_MAX:
 
 # approved copies: per file and record the counts only shrink, a pair the
 # copy lacks is red, a date only moves earlier or later up to its record's
-# CONTAINER_EXPIRY_MOVES date (ADR-0163 A1), the maximum only falls. A
+# date on the CONTAINER_EXPIRY_MOVES_2 line where it has one, else on the
+# CONTAINER_EXPIRY_MOVES line (ADR-0201 D1), the maximum only falls. A
 # copy whose gate has no CONTAINER_EXEMPTIONS_MAX predates the container gate
 # (bootstrap); one whose gate has it and no table is red.
 cintro = git("log", "--diff-filter=A", "--format=%H", "--", CONTAINERS).stdout.split()
@@ -1122,37 +1169,48 @@ for label, ref in ccopies:
     for (f, key), (_, record, due) in sorted(crows.items()):
         old = renames.get(f, f)
         was = approved_dates.get((old, key, record), approved_dates.get((old, "", record)))
-        onto = MOVES.get(record)
+        # The ceiling is the record's second-line date where it has one, else
+        # its first-line date, and the red names the line it read.
+        onto_line = SECOND_MOVES if record in MOVES_2 else FIRST_MOVES
+        onto = MOVES_2.get(record, MOVES.get(record))
         if was is not None and due > was and (onto is None or due > onto):
             errors.append(f"{CONTAINERS}: row {f} `{key}` expiry {due} is later than the {label}'s {was} — "
                           "a date only moves earlier"
-                          + (f", or up to {record}'s {onto} (CONTAINER_EXPIRY_MOVES, ADR-0163 A1)"
+                          + (f", or up to {record}'s {onto} ({onto_line}, ADR-0201 D1)"
                              if onto else
                              f"; record {record} has no CONTAINER_EXPIRY_MOVES date — a record "
-                             "joins the line only by the ADR that changes this rule (ADR-0163 A1)"))
+                             "joins the line only by the ADR that changes this rule (ADR-0201 D1)"))
 
-# ADR-0163 A1: the CONTAINER_EXPIRY_MOVES line's own ratchet, against HEAD,
-# the base tip and the commit that introduced the line (the table's
-# introducing commit predates it). A copy's line date only moves earlier,
-# and a record the copy's line lacks is red: a record joins the line only by
-# the ADR that changes this rule. A copy with no line is a bootstrap.
+# ADR-0201 D1: each move line's own ratchet, against HEAD, the base tip and
+# the commit that introduced the line, the oldest that `git log -S'<name>="'`
+# lists for the gate (the table's introducing commit predates both lines). A
+# copy's line date only moves earlier, and a record the copy's line lacks is
+# red, so each line only loses records or moves earlier, forever: a record
+# joins a line only by the ADR that changes this rule. A copy with no line is
+# a bootstrap, disclosed on the OK line.
+def line_ratchet(name, moves, intro):
+    copies = [("HEAD", "HEAD"), ("base tip", BASE_REF)] + ([("line's introducing commit", intro[-1])] if intro else [])
+    for label, ref in copies:
+        if git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").returncode != 0:
+            continue  # an unresolvable base tip is already a scope error above
+        gate = git("show", f"{ref}:{SELF}")
+        copy_moves = moves_in(gate.stdout, f"{label} ({ref})", name) if gate.returncode == 0 else None
+        if copy_moves is None:
+            notes.append(f"{label} spells no {name} (bootstrap)")
+            continue
+        for record, due in sorted(moves.items()):
+            if record not in copy_moves:
+                errors.append(f"{name}: {record}={due} is absent from the {label}'s line — "
+                              "a record joins the line only by the ADR that changes this rule (ADR-0201 D1)")
+            elif due > copy_moves[record]:
+                errors.append(f"{name}: {record}={due} is later than the {label}'s "
+                              f"{copy_moves[record]} — a move date only moves earlier (ADR-0201 D1)")
+
+
 lintro = git("log", "-S", 'CONTAINER_EXPIRY_MOVES="', "--format=%H", "--", SELF).stdout.split()
-lcopies = [("HEAD", "HEAD"), ("base tip", BASE_REF)] + ([("line's introducing commit", lintro[-1])] if lintro else [])
-for label, ref in lcopies:
-    if git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").returncode != 0:
-        continue  # an unresolvable base tip is already a scope error above
-    gate = git("show", f"{ref}:{SELF}")
-    copy_moves = moves_in(gate.stdout, f"{label} ({ref})") if gate.returncode == 0 else None
-    if copy_moves is None:
-        notes.append(f"{label} spells no CONTAINER_EXPIRY_MOVES (bootstrap)")
-        continue
-    for record, due in sorted(MOVES.items()):
-        if record not in copy_moves:
-            errors.append(f"CONTAINER_EXPIRY_MOVES: {record}={due} is absent from the {label}'s line — "
-                          "a record joins the line only by the ADR that changes this rule (ADR-0163 A1)")
-        elif due > copy_moves[record]:
-            errors.append(f"CONTAINER_EXPIRY_MOVES: {record}={due} is later than the {label}'s "
-                          f"{copy_moves[record]} — a move date only moves earlier (ADR-0163 A1)")
+line_ratchet(FIRST_MOVES, MOVES, lintro)
+lintro_2 = git("log", "-S", 'CONTAINER_EXPIRY_MOVES_2="', "--format=%H", "--", SELF).stdout.split()
+line_ratchet(SECOND_MOVES, MOVES_2, lintro_2)
 
 if errors:
     for e in errors:
@@ -1164,7 +1222,8 @@ scope += (f"; container exemptions: {len(crows)} row(s), counts {csum}/{CONTAINE
           f"{len(backing)}/{BACKING_SITES} capped-backing, "
           + ("counts judged against the census" if diagnostics else "counts judged in the ratchet's API pass")
           + f", {backstop_files} cell file(s) read as text for a banned name outside an allow"
-          + "; expiry moves " + (", ".join(f"{r}={d}" for r, d in sorted(MOVES.items())) or "none"))
+          + "; expiry moves " + (", ".join(f"{r}={d}" for r, d in sorted(MOVES.items())) or "none")
+          + "; second move " + (", ".join(f"{r}={d}" for r, d in sorted(MOVES_2.items())) or "none"))
 scope += "".join(f"; {f} counted from its text (compiled only on {os_name})" for f, os_name in sorted(text_counted.items()))
 if test_module_files:
     scope += ("; out-of-line test module file(s) outside the API audit and the backstop: "

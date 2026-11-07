@@ -2867,20 +2867,67 @@ lc_reset
 group_lint_scopes_moves() {
 ls_setup
 lc_setup
-# ADR-0163 A1: a row moves later only up to its record's date on the gate's
-# CONTAINER_EXPIRY_MOVES line (a ceiling); the line's own dates only move
-# earlier, and a record joins it only by the ADR that changes the rule,
-# against HEAD, the base tip and the commit that introduced the line.
-# lc_moves edits the working gate's line, as ls_gate edits its maximum; the
-# fixture's rows sit at 2099-12-31 (struct Exempt is T, fn Owner::build E).
+# ADR-0201 D1: a row moves later only up to its record's date on the gate's
+# CONTAINER_EXPIRY_MOVES line, or on its CONTAINER_EXPIRY_MOVES_2 line where
+# the record has one (a ceiling). The second line is keyed to the first: each
+# entry raises a first-line record past its date there. Each line's own dates
+# only move earlier, and a record joins one only by the ADR that changes the
+# rule, against HEAD, the base tip and the commit that introduced the line; a
+# third move line is red. lc_moves and lc_moves_2 edit the working gate's
+# lines, as ls_gate edits its maximum; the fixture's rows sit at 2099-12-31
+# (struct Exempt is T, fn Owner::build E).
 lc_moves() { # <entries>
     sed -i.bak "s/^CONTAINER_EXPIRY_MOVES=\".*\"\$/CONTAINER_EXPIRY_MOVES=\"$1\"/" "$LINTSCOPES"
     rm -f "$LINTSCOPES.bak"
     grep -q "^CONTAINER_EXPIRY_MOVES=\"$1\"\$" "$LINTSCOPES" ||
         { echo "lc_moves: the gate's move line is not where the copy sets it" >&2; exit 2; }
 }
+lc_moves_2() { # <entries>
+    sed -i.bak "s/^CONTAINER_EXPIRY_MOVES_2=\".*\"\$/CONTAINER_EXPIRY_MOVES_2=\"$1\"/" "$LINTSCOPES"
+    rm -f "$LINTSCOPES.bak"
+    grep -q "^CONTAINER_EXPIRY_MOVES_2=\"$1\"\$" "$LINTSCOPES" ||
+        { echo "lc_moves_2: the gate's second move line is not where the copy sets it" >&2; exit 2; }
+}
+# lc_stub <first> <second> [<name>]: the fixture's committed gate copy, its
+# maximum and each move line given (`-` leaves that line out), and with
+# <name> a comment that spells that line's search string once more.
+lc_stub() {
+    {
+        printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$LC_MAX"
+        [ "$1" = - ] || printf 'CONTAINER_EXPIRY_MOVES="%s"\n' "$1"
+        [ "$2" = - ] || printf 'CONTAINER_EXPIRY_MOVES_2="%s"\n' "$2"
+        [ -z "${3:-}" ] || printf '# the line stays spelled %s="<record>=<date> …" alone\n' "$3"
+    } >"$root/scripts/check-lint-scopes.sh"
+}
+# lc_intro_leg <first> <second> <later first> <later second> <name>: a stub
+# commit that introduces the lines, then a later one that changes them and
+# spells <name>'s search string again in a comment, so `git log -S` lists
+# both; the base tip moves to the later commit. HEAD and the base tip then
+# agree with a working gate that spells the later lines, so only the line's
+# introducing commit can be red: a gate that reads the newest commit the
+# search lists, misspells the search string or drops the third copy turns
+# the plant green. lc_intro_undo drops both commits and puts the base tip back.
+lc_intro_leg() {
+    lc_stub "$1" "$2"
+    ls_commit "$root" "the move lines' introducing commit"
+    lc_stub "$3" "$4" "$5"
+    ls_commit "$root" "the move lines later, a search string in a comment"
+    fx_git "$root" branch -q -f base-tip HEAD
+}
+lc_intro_undo() {
+    lc_reset HEAD~2
+    fx_git "$root" branch -q -f base-tip HEAD
+}
 LC_MOVES=$(sed -n 's/^CONTAINER_EXPIRY_MOVES="\(.*\)"$/\1/p' "$LINTSCOPES")
 [ -n "$LC_MOVES" ] || { echo "the gate spells no CONTAINER_EXPIRY_MOVES line" >&2; exit 2; }
+grep -q '^CONTAINER_EXPIRY_MOVES_2="[^"]*"$' "$LINTSCOPES" ||
+    { echo "the gate spells no CONTAINER_EXPIRY_MOVES_2 line" >&2; exit 2; }
+LC_MOVES_2=$(sed -n 's/^CONTAINER_EXPIRY_MOVES_2="\(.*\)"$/\1/p' "$LINTSCOPES")
+# The first line's twelve cases run on an empty second line, its legal end
+# state: each sets the first line, and the keyed rule would read the second
+# line's records as records that line lacks, so a planted red would have two
+# causes. The line is restored after them.
+lc_moves_2 ""
 sed -i.bak 's/^\(CONTAINER_EXPIRY_MOVES=".*"\)$/\1 # note/' "$LINTSCOPES"
 rm -f "$LINTSCOPES.bak"
 expect_red_because "lint-scopes: containers — a move line spelled so no copy can read it" \
@@ -2917,8 +2964,98 @@ lc_moves "T=2100-05-31"
 expect green "lint-scopes: containers — a move date equal to the HEAD's (control)" lc_run "$root"
 lc_moves "T=2100-05-30"
 expect green "lint-scopes: containers — a move date moved earlier (control)" lc_run "$root"
-lc_moves "$LC_MOVES"
 lc_reset HEAD~1
+# The first line's introducing-commit leg, which the cases above plant only
+# at HEAD (the stub that introduces the line is HEAD there).
+lc_moves "T=2100-06-30"
+lc_intro_leg "T=2100-05-31" - "T=2100-06-30" - CONTAINER_EXPIRY_MOVES
+expect_red_because "lint-scopes: containers — a move date later than its introducing commit's, HEAD and the base tip agreeing" \
+    "CONTAINER_EXPIRY_MOVES: T=2100-06-30 is later than the line's introducing commit's 2100-05-31" lc_run "$root"
+lc_intro_undo
+lc_moves "T=2100-05-31 E=2100-05-31"
+lc_intro_leg "T=2100-05-31" - "T=2100-05-31 E=2100-05-31" - CONTAINER_EXPIRY_MOVES
+expect_red_because "lint-scopes: containers — a record on the move line in HEAD, the base tip and the gate, absent from its introducing commit" \
+    "CONTAINER_EXPIRY_MOVES: E=2100-05-31 is absent from the line's introducing commit's line" lc_run "$root"
+lc_intro_undo
+# The second line, keyed to a first line that moves T and E to 2100-05-31.
+lc_moves "T=2100-05-31 E=2100-05-31"
+lc_moves_2 "T=2100-06-30"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-30
+expect green "lint-scopes: containers — a date moved later onto its record's second-line date (control)" \
+    lc_run "$root"
+lc_moves_2 "T=2100-06-30 E=2100-06-15"
+expect_output "lint-scopes: containers — the OK line discloses the second line after the first, records sorted" \
+    "expiry moves E=2100-05-31, T=2100-05-31; second move E=2100-06-15, T=2100-06-30" lc_run "$root"
+lc_moves_2 "T=2100-06-30"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-15
+expect green "lint-scopes: containers — a date between its record's two move dates (control)" lc_run "$root"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-07-01
+expect_red_because "lint-scopes: containers — a date moved past its record's second-line date" \
+    "or up to T's 2100-06-30 (CONTAINER_EXPIRY_MOVES_2, ADR-0201 D1)" lc_run "$root"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-30
+lc_row_set "$LC_A" 'fn Owner::build' expiry 2100-06-30
+expect_red_because "lint-scopes: containers — a record with no second-line date, moved onto another record's" \
+    "or up to E's 2100-05-31 (CONTAINER_EXPIRY_MOVES, ADR-0201 D1)" lc_run "$root"
+lc_reset
+lc_moves "T=2100-05-31"
+lc_moves_2 "T=2100-06-30 E=2100-06-30"
+expect_red_because "lint-scopes: containers — a second-line entry for a record the first line lacks" \
+    "CONTAINER_EXPIRY_MOVES_2: E=2100-06-30 names a record the CONTAINER_EXPIRY_MOVES line in use lacks" \
+    lc_run "$root"
+lc_moves "T=2100-05-31 E=2100-05-31"
+lc_moves_2 "T=2100-05-31"
+expect_red_because "lint-scopes: containers — a second-line entry at its first-line date" \
+    "CONTAINER_EXPIRY_MOVES_2: T=2100-05-31 is not after its CONTAINER_EXPIRY_MOVES date 2100-05-31" lc_run "$root"
+lc_moves_2 "T=2100-06-30"
+sed -i.bak 's/^\(CONTAINER_EXPIRY_MOVES_2=".*"\)$/\1 # note/' "$LINTSCOPES"
+rm -f "$LINTSCOPES.bak"
+expect_red_because "lint-scopes: containers — a second move line spelled so no copy can read it" \
+    "the gate spells no CONTAINER_EXPIRY_MOVES_2 line" lc_run "$root"
+sed -i.bak 's/^\(CONTAINER_EXPIRY_MOVES_2=".*"\) # note$/\1/' "$LINTSCOPES"
+rm -f "$LINTSCOPES.bak"
+printf 'CONTAINER_EXPIRY_MOVES_3="T=2100-07-31"\n' >>"$LINTSCOPES"
+expect_red_because "lint-scopes: containers — a third move line" \
+    "a third expiry move is the ADR that supersedes ADR-0201" lc_run "$root"
+sed -i.bak '$d' "$LINTSCOPES"
+rm -f "$LINTSCOPES.bak"
+! grep -q '^CONTAINER_EXPIRY_MOVES_3=' "$LINTSCOPES" ||
+    { echo "the third move line plant is still in the gate copy" >&2; exit 2; }
+# HEAD's gate spells both lines and its table T's row at its second-line date.
+lc_stub "T=2100-05-31 E=2100-05-31" "T=2100-06-30"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-30
+ls_commit "$root" "a second move date"
+expect green "lint-scopes: containers — a second-line date equal to the HEAD's (control)" lc_run "$root"
+lc_moves_2 "T=2100-07-31"
+expect_red_because "lint-scopes: containers — a second-line date later than the HEAD's" \
+    "CONTAINER_EXPIRY_MOVES_2: T=2100-07-31 is later than the HEAD's 2100-06-30" lc_run "$root"
+lc_moves_2 "T=2100-06-30 E=2100-06-30"
+expect_red_because "lint-scopes: containers — a record added to the HEAD's second line" \
+    "CONTAINER_EXPIRY_MOVES_2: E=2100-06-30 is absent from the HEAD's line" lc_run "$root"
+lc_moves_2 "T=2100-06-15"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-15
+expect green "lint-scopes: containers — a second-line date moved earlier, still after its first (control)" \
+    lc_run "$root"
+lc_moves_2 ""
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-05-31
+expect green "lint-scopes: containers — a record leaves the second line, its row back at its first date (control)" \
+    lc_run "$root"
+lc_reset HEAD~1
+# The second line's introducing-commit leg.
+lc_moves "T=2100-05-31"
+lc_moves_2 "T=2100-06-30"
+lc_intro_leg "T=2100-05-31" "T=2100-06-15" "T=2100-05-31" "T=2100-06-30" CONTAINER_EXPIRY_MOVES_2
+expect_red_because "lint-scopes: containers — a second-line date later than its introducing commit's, HEAD and the base tip agreeing" \
+    "CONTAINER_EXPIRY_MOVES_2: T=2100-06-30 is later than the line's introducing commit's 2100-06-15" lc_run "$root"
+lc_intro_undo
+lc_moves "T=2100-05-31 E=2100-05-31"
+lc_moves_2 "T=2100-06-30 E=2100-06-30"
+lc_intro_leg "T=2100-05-31 E=2100-05-31" "T=2100-06-30" "T=2100-05-31 E=2100-05-31" "T=2100-06-30 E=2100-06-30" \
+    CONTAINER_EXPIRY_MOVES_2
+expect_red_because "lint-scopes: containers — a record on the second line in HEAD, the base tip and the gate, absent from its introducing commit" \
+    "CONTAINER_EXPIRY_MOVES_2: E=2100-06-30 is absent from the line's introducing commit's line" lc_run "$root"
+lc_intro_undo
+lc_moves "$LC_MOVES"
+lc_moves_2 "$LC_MOVES_2"
 lc_reset
 printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$((LC_MAX - 1))" >"$root/scripts/check-lint-scopes.sh"
 ls_commit "$root" "a lower maximum"
