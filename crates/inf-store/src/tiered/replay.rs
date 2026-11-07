@@ -1629,39 +1629,47 @@ mod tests {
 
     /// The end of the checkpoint releases the settled refs' blob references
     /// in the order the settles listed them, whatever order the origin map
-    /// holds them in, and a release stepped one address at a time releases
-    /// in the same order: the reclaim queue takes the deaths in one order at
-    /// every step budget.
+    /// holds them in, and a release stepped in batches — of one address, and
+    /// of two, so that calls resume inside the list (`at` 2 and 4) and walk
+    /// more than one address there — releases in the same order: the
+    /// reclaim queue takes the deaths in one order at every step budget.
     #[test]
     fn the_end_of_the_checkpoint_releases_blob_references_in_settle_order() {
         let fs = MemFs::new();
-        let order_of = |stepped: bool| {
+        // Five refs settled during image load, in descending address order;
+        // each names its own extent.
+        let refs = [(5 << 12, 50), (4 << 12, 40), (3 << 12, 30), (2 << 12, 20), (1 << 12, 10)];
+        let settled: Vec<u64> = refs.iter().map(|&(_, extent_id)| extent_id).collect();
+        // `None` releases the list whole; `Some(max)` at most `max` a call.
+        let order_of = |batch: Option<usize>| {
             let mut table = table();
             let mut replay = machine(&fs, &table);
-            // Three refs settled during image load, in descending address
-            // order; each names its own extent.
-            let refs = [(3 << 12, 30), (2 << 12, 20), (1 << 12, 10)];
             for &(addr, extent_id) in &refs {
                 table.extents.register(addr, extent_id, 4096);
             }
             replay.releases = ReleaseList::Loading(refs.iter().map(|&(addr, _)| addr).collect());
-            if stepped {
+            let mut calls = 0;
+            if let Some(max) = batch {
                 let listed = replay.close_checkpoint();
                 let mut at = 0;
+                // Bound: ⌈listed ÷ max⌉ calls, each walking at least one.
                 while at < listed {
-                    at += replay.release_from(&mut table, at, 1);
+                    at += replay.release_from(&mut table, at, max);
+                    calls += 1;
                 }
                 replay.end_releases();
             } else {
                 replay.end_of_checkpoint(&mut table);
             }
-            assert_eq!(replay.counters().blob_releases, 3);
+            assert_eq!(calls, batch.map_or(0, |max| refs.len().div_ceil(max)));
+            assert_eq!(replay.counters().blob_releases, 5);
             let seeded = table.extents.sweep_seed(&[], &[]);
             assert!(seeded.is_empty());
             table.extents.reclaim_work(0, 8).iter().map(|c| c.extent_id).collect::<Vec<u64>>()
         };
-        assert_eq!(order_of(false), vec![30, 20, 10], "released in settle order");
-        assert_eq!(order_of(true), vec![30, 20, 10], "and so a step at a time");
+        assert_eq!(order_of(None), settled, "released in settle order");
+        assert_eq!(order_of(Some(1)), settled, "and so an address a call");
+        assert_eq!(order_of(Some(2)), settled, "and so two a call, resumed at 2 and 4");
     }
 
     /// A fresh table in a fresh directory of the same `MemFs` (the file
