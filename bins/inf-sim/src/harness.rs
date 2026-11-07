@@ -121,9 +121,10 @@ pub struct Scenario {
     pub channels: u64,
     /// PUBLISH share of the regular-client mix, percent. 0 = M0 mix.
     pub publish_percent: u64,
-    /// Max virtual nanoseconds per scheduler step (advance is seeded in
-    /// `1µs..=1µs+step_ns_max`). The m1 scenario uses bigger steps so its
-    /// PEXPIRE deadlines genuinely fire mid-run (wheel slices under load).
+    /// The seeded part of a scheduler step's advance, exclusive: a step
+    /// advances `STEP_NS_FLOOR` plus a draw in `0..step_ns_max`
+    /// ([`Scenario::step_ns_bound`]). The m1 scenario uses bigger steps so
+    /// its PEXPIRE deadlines genuinely fire mid-run (wheel slices under load).
     pub step_ns_max: u64,
     /// Adversarial-length share of the mix, percent (review of
     /// 2026-08-30, §5.5 Group 0 item 3: the frozen mixes are 9-byte keys
@@ -386,7 +387,20 @@ impl Scenario {
             wheel_nodes_max: None,
         }
     }
+
+    /// The exclusive bound of one scheduler step's advance, in ns: every
+    /// step advances at least `STEP_NS_FLOOR` and less than this. An oracle
+    /// that bounds a delivery in steps reads it here, never a copy.
+    #[must_use]
+    pub fn step_ns_bound(&self) -> u64 {
+        STEP_NS_FLOOR.saturating_add(self.step_ns_max)
+    }
 }
+
+/// The floor of every scheduler step's advance: 1 µs of virtual time, added
+/// to the seeded draw below `Scenario::step_ns_max`, so injected time moves
+/// on every step.
+const STEP_NS_FLOOR: u64 = 1_000;
 
 /// What a run produces. `trace` is the determinism artifact.
 #[derive(Debug)]
@@ -1705,7 +1719,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         );
 
         // Virtual time per scheduler step, seeded (m0: 1–16 µs).
-        clock.advance(Nanos(1_000 + rng.next_u64() % scenario.step_ns_max));
+        clock.advance(Nanos(STEP_NS_FLOOR + rng.next_u64() % scenario.step_ns_max));
 
         let all_done = clients.iter().all(|c| c.closed)
             && subs.iter().all(|s| s.state == SubState::Closed)
