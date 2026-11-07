@@ -1281,3 +1281,120 @@ fn a_round_over_a_coarse_cut_history_stays_within_the_op_bound() {
         t.files.extend(sealed);
     }
 }
+
+// ---- Lifetime and retirement rules the cell does not yet keep: each test
+// below states one, is ignored with the defect it shows, and is enabled by
+// the change that makes the rule hold.
+
+/// A cell holds at most 64 tiered namespace lifetimes, a dropped one
+/// counted until every runtime owner of it is gone. Sixty-five namespaces
+/// are created and dropped in turn, each with its round's groups in flight
+/// (flush completions the device has not returned), so each drop parks its
+/// whole pipeline until those ops are terminal.
+#[test]
+#[ignore = "a dropped tiered namespace keeps its runtime owners on the cell outside any bound, so \
+            create and drop under a held flush completion grow them without limit; red until a \
+            cell holds at most 64 tiered lifetimes, a dropped one counted until its owners end"]
+fn sixty_five_drops_with_held_rounds_stay_within_sixty_four_lifetimes() {
+    const LIFETIMES: u32 = 65;
+    let tier = TierSpec { maintain_slice_bytes: 64 << 10, ..spec() };
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    let mut ks = Keyspace::new(StoreConfig::default());
+    let gone = Keyspace::new(StoreConfig::default());
+    let mut held = Vec::new();
+    for at in 0..LIFETIMES {
+        let ns = NsId(16 + at);
+        sealed_backlog_on(&mut ks, ns, 1 << 20, 64 << 10);
+        cell.create_ns(ns, &tier);
+        let ops = pass(&mut cell, &mut ks, u64::from(at), &mut NoBudget);
+        assert!(!ops.is_empty(), "engagement: namespace {} has its round in flight", ns.0);
+        held.extend(ops);
+        // The drop: the keyspace no longer names the namespace, and its
+        // release is durable at once, so only the held ops keep it.
+        cell.sync_namespaces(&gone, &mut vec![(ns, 1)]);
+        cell.maintain_teardown(|_| true);
+    }
+    let owners = cell.namespaces.len() + cell.round_drain.len() + cell.teardown.len();
+    let (live, parked, teardown) =
+        (cell.namespaces.len(), cell.round_drain.len(), cell.teardown.len());
+    drop(held);
+    assert!(
+        owners <= 64,
+        "{owners} tiered lifetimes on one cell after {LIFETIMES} drops with held flush \
+         completions ({live} live, {parked} parked with a round in flight, {teardown} in \
+         teardown): a cell holds at most 64"
+    );
+}
+
+/// Namespace 16 on a sim-disk cell in `Buffered` mode with round 1 flushed
+/// to completion (writes, barriers, effects), so its active file holds a
+/// readable prefix; returns the cell, the keyspace and every record's
+/// address.
+fn flushed_namespace() -> (TierCell<SimDisk>, Keyspace, Vec<LogicalAddr>) {
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    let tier =
+        TierSpec { maintain_slice_bytes: 64 << 10, tier_io_mode: TierIoMode::Buffered, ..spec() };
+    cell.create_ns(NsId(16), &tier);
+    let mut ks = Keyspace::new(StoreConfig::default());
+    let addrs = sealed_backlog_on(&mut ks, NsId(16), 1 << 20, 64 << 10);
+    for turn in 0..2 {
+        let ops = pass(&mut cell, &mut ks, turn, &mut NoBudget);
+        complete_ops(&mut cell, ops);
+    }
+    let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+    let stats = &mut cell.flush_stats;
+    advance_round(table, &mut cell.namespaces[0], stats, 2).expect("no barrier failed");
+    assert_eq!(cell.flush_stats.rounds, 1, "engagement: round 1 completed");
+    assert!(cell.namespaces[0].round.is_none(), "engagement: no round is out");
+    (cell, ks, addrs)
+}
+
+/// A dropped namespace's files stay open under the cold reads queued on
+/// them: a read planned on the active file and queued before the drop is
+/// issued after it, against its own file. The sim disk answers a read on a
+/// closed descriptor `EBADF`; on Linux the freed number is the lowest free
+/// one, which the next open or accept takes, so the read would land there.
+#[test]
+#[ignore = "dropping a tiered namespace closes its file handles while cold reads queued on them \
+            still hold the raw descriptors; red until a dropped namespace keeps every handle \
+            open until no read is pinned on its file"]
+fn a_cold_read_queued_before_a_drop_reads_its_own_file() {
+    let (mut cell, ks, addrs) = flushed_namespace();
+    let table = ks.tiered_store(NsId(16)).expect("materialized");
+    let t = &cell.namespaces[0];
+    let (fd, file, offset, frames, _) = addrs
+        .iter()
+        .find_map(|&addr| t.plan_cold_read(addr, table.record(addr).encoded_len))
+        .expect("a record below the active file's readable length");
+    let cold = cell.cold.clone().expect("the cell's cold engine");
+    let bytes = frames as usize * inf_log::TIER_FRAME_BYTES;
+    let wait = cold
+        .enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, 0)
+        .expect("the read is queued");
+    assert_eq!(cold.inflight_on(file), 1, "engagement: the queued read pins its file");
+    cell.sync_namespaces(&Keyspace::new(StoreConfig::default()), &mut vec![(NsId(16), 1)]);
+    assert!(cell.namespaces.is_empty(), "engagement: dropped with the read queued");
+    let mut ops = Vec::new();
+    cold.drain(|op| ops.push(op));
+    assert_eq!(ops.len(), 1, "the queued read is issued");
+    let Some(IoOp::TierRead { fd: issued, offset: at, buf, token }) = ops.pop() else {
+        panic!("a cold read drains as a tier read")
+    };
+    assert_eq!(issued, fd, "the read carries the descriptor it was planned on");
+    let mut scratch = vec![0u8; buf.len() as usize];
+    let read = cell.fs.driver_read_at(issued, at, &mut scratch);
+    let result = match &read {
+        Ok(_) => inf_runtime::CompletionResult::TierRead,
+        Err(err) => inf_runtime::CompletionResult::Error {
+            errno: err.raw_os_error().unwrap_or(EIO),
+            buf: None,
+        },
+    };
+    cold.on_completion(token, result, 0);
+    drop(wait);
+    assert!(
+        read.is_ok(),
+        "the read queued before the drop was issued on fd {fd} after the drop closed it: {:?}",
+        read.err()
+    );
+}
