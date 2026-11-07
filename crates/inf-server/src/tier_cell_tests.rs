@@ -1469,14 +1469,20 @@ fn a_failed_unlink_is_retried_until_the_file_is_gone() {
 }
 
 /// A turn's retirement work is bounded and charged whatever the pins: a
-/// pinned file's visit counts against the turn's 64 visits and is charged
-/// as Maintenance. 128 retired files are pinned by queued cold reads; a
-/// 129th, the last on the list, is not.
+/// turn visits at most 64 owners, and each visit, a pinned file's included,
+/// is charged one Maintenance unit. 64 retired files are pinned by queued
+/// cold reads; a 65th, the last on the list, is not, so a turn that visits
+/// more than 64 owners reaches it. The table holds no record, so no other
+/// leg of the turn charges a unit. Both halves are read: the bound, here
+/// as the 65th file's unlink in the turn (a walk that hands files to the
+/// control thread reads it as its count of owners examined), and the
+/// charge, as the turn's units.
 #[test]
 #[ignore = "pinned retired files are passed with no charge and no bound, so one turn's work grows \
-            with the files pinned; red until each visit is charged and a turn makes at most 64"]
+            with the files pinned; red until a turn visits at most 64 owners and charges each"]
 fn a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four() {
-    const PINNED: u32 = 128;
+    const VISITS_PER_TURN_MAX: u32 = 64;
+    const PINNED: u32 = VISITS_PER_TURN_MAX;
     let (mut cell, mut ks, paths) = retired_files(PINNED + 1);
     let cold = cell.cold.clone().expect("the cell's cold engine");
     let class = inf_runtime::ReadClass::Foreground;
@@ -1492,10 +1498,14 @@ fn a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four() {
     drop(waits);
     assert_eq!(pinned_left, PINNED as usize, "engagement: no pinned file was unlinked");
     assert!(
-        units >= 64,
-        "one MAINTAIN over {PINNED} pinned retired files charged {units} unit(s), and the unpinned \
-         file after them was unlinked in it: {last_unlinked}; each visit is charged and a turn \
-         makes at most 64"
+        !last_unlinked,
+        "one MAINTAIN over {PINNED} pinned retired files reached the unpinned file after them and \
+         unlinked it: the turn visited more than {VISITS_PER_TURN_MAX} owners"
+    );
+    assert_eq!(
+        units, VISITS_PER_TURN_MAX,
+        "one MAINTAIN over {PINNED} pinned retired files charged {units} unit(s): each of its \
+         {VISITS_PER_TURN_MAX} visits is one Maintenance unit, and no other leg charges here"
     );
 }
 
