@@ -39,14 +39,19 @@ pub enum Plant {
     /// acked `everysec` op required — must go red.
     StopKill,
     /// One accept-path error (`EMFILE`) on the listener token while
-    /// connections are queued — the F-L11-05 canary (review 2026-08-30):
-    /// an accept failure is a counter, never connection housekeeping;
-    /// the first client (`ConnKey {0, 0}`) must keep being served. Since
-    /// batch 37 (F-L11-02) the model also PARKS the arm the way the real
-    /// backends do: the queued connections stay in the backlog until the
-    /// plane re-arms (its retry timer) or a `Close` returns an fd — a
-    /// plane that never re-arms strands every later client (`STALL`).
+    /// connections are queued: an accept failure is a counter, never
+    /// connection housekeeping, and the first client (`ConnKey {0, 0}`)
+    /// keeps being served. The arm parks as the real backends park an
+    /// exhaustion failure: the queued connections stay in the backlog until
+    /// the plane's retry timer re-arms it or a `Close` returns an fd, so here
+    /// a close may let them in before the retry does. `AcceptBroken` is the
+    /// plant on which only the retry lets them in.
     AcceptError,
+    /// The same accept-path error, of the `Broken` class (`EINVAL`): by the
+    /// driver contract only an `AcceptArm` resumes a broken-parked arm,
+    /// never a `Close`, so the plane's retry timer is the queued clients'
+    /// one way in.
+    AcceptBroken,
     /// One `EIO` on the next read of every tier file, armed on the sim
     /// disk before the cold re-read sweep (`m4-tiered` phase 7; review
     /// 2026-08-30, F-L04-02 / ADR-0119 D2): a device error under a cold
@@ -115,6 +120,7 @@ impl Plant {
     fn accept_errno(self) -> Option<i32> {
         match self {
             Plant::AcceptError => Some(libc::EMFILE),
+            Plant::AcceptBroken => Some(libc::EINVAL),
             Plant::None
             | Plant::LostWakeup
             | Plant::FsyncLies
