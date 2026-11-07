@@ -1,10 +1,14 @@
 //! Namespace DDL and checkpoint programs: `INF.NS CREATE/DROP/SET`, the
 //! catalog fan to every cell (`CREATE` and `DROP` persist before they
 //! fan, ADR-0103 and ADR-0186 D1; `SET` fans first, ADR-0015 D3),
-//! rollback, and the apply-send path with its credit wait.
+//! rollback, and the apply-send path with its credit wait. Each DDL reads
+//! the catalog writer's answer through its own token and owes the writer
+//! a notice once its fan is done (ADR-0189 D2, D5).
+
+use inf_store::ddl::{Answer, CreatePersisted, DdlRefusal, DropPersisted, Receipt, Requested};
 
 use super::*;
-use crate::control::{CkptCredit, CkptTarget};
+use crate::control::{CkptCredit, CkptTarget, DdlNotice};
 
 /// The reply of every checkpoint producer whose cell's quota cannot cover
 /// its reservation (ADR-0159 A1.2): the `IdentityExhausted(Checkpoint)`
@@ -65,14 +69,14 @@ impl NsCleanup {
         }
     }
 
-    /// Every cell applied the drop: a checkpoint requested now publishes
-    /// MANIFESTs without the namespace, and retires its tombstone.
-    fn stamp(self, control: &ControlHandle, id: u32) {
+    /// Every cell applied the drop: the checkpoint requested now
+    /// publishes MANIFESTs without the namespace and retires its
+    /// tombstone; its epoch rides the drop's notice. `None` with no
+    /// tombstone.
+    fn stamp_epoch(self) -> Option<u64> {
         match self {
-            NsCleanup::NoTombstone => {}
-            NsCleanup::Tombstone(credit) => {
-                control.stamp_drop(id, credit.issue(CkptTarget::All).get());
-            }
+            NsCleanup::NoTombstone => None,
+            NsCleanup::Tombstone(credit) => Some(credit.issue(CkptTarget::All).get()),
         }
     }
 }
@@ -489,12 +493,10 @@ async fn wait_for_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
     }
 }
 
-/// The namespace-DDL program (M2-S08), one per node at a time (ADR-0108 D1). `SET`: apply
-/// locally → fan `INF.NSFAN` to every peer (AllOk) → persist the catalog through the control
-/// thread → `+OK` once the swap is durable (ADR-0015 D3). `CREATE`: persist the catalog that
-/// names it → wait for the swap → apply locally → fan → `+OK`, so no cell serves a namespace
-/// the catalog does not hold (ADR-0103); a failed leg rolls it back. `DROP` runs in
-/// `program_ns_drop`.
+/// The namespace-DDL program (M2-S08), one per node at a time (ADR-0108
+/// D1): `CREATE` in `program_ns_create`, `SET` in `program_ns_set`, `DROP`
+/// in `program_ns_drop`. Each asks the catalog writer for its `META` and
+/// reads the writer's answer through its own token (ADR-0189 D2).
 pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
@@ -516,215 +518,254 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
     // (a `DROP` landing between two `CREATE` legs — the `m2-ns-ddl-race`
     // DST's phantom); the ticket serializes them from before the first
     // effect to after the reply, on every exit path (it is a guard).
-    // Parked programs wake on the release edge MAINTAIN detects.
+    // Parked programs wake on the release edge MAINTAIN detects. A
+    // program's notice is bound after it, so it is posted first.
     let _ticket = loop {
         if let Some(ticket) = control.ddl_try_acquire(shared.cell.0) {
             break ticket;
         }
         shared.ddl_waiters.wait(0).await;
     };
-    let create = argv[1].eq_ignore_ascii_case(b"CREATE");
-    // ADR-0103: a CREATE persisted before the fan; its pending entry
-    // retires once the fan is done (either way), and it needs no
-    // trailing persist. `created` carries what a rollback needs
-    // (ADR-0108 D3): the id, the name, its cleanup (a durable namespace's
-    // tombstone stamp, ADR-0159 D2) and whether it is tiered (teardown
-    // hold).
-    let mut created: Option<(u32, Vec<u8>, NsCleanup, bool)> = None;
-    let fan: Vec<Vec<u8>> = if create {
-        let draft = match crate::admin::parse_ns_create(argv) {
-            Ok(draft) => draft,
-            Err(msg) => return error_reply(shared, proto, &msg),
-        };
-        let cleanup = match admit_ns_create(shared, proto, draft.mode) {
-            Ok(cleanup) => cleanup,
-            Err(refusal) => return refusal,
-        };
-        let ns_id = control.alloc_ns_id();
-        let spec = draft.with_id(ns_id);
-        // ADR-0103 D1 (review of 2026-08-30, C14): persist before
-        // serving. Validate without applying (D3), swap `META` with the
-        // spec in it, read the writer's verdict, and only then make the
-        // namespace exist anywhere — a namespace any cell can name is
-        // one the catalog already names. The pre-ADR order (apply → fan
-        // → persist) served the namespace on every cell for the whole
-        // swap window and lost `always`-acked writes to a cut inside it.
-        if let Err(e) = shared.store.borrow().ns_create_check(&spec) {
-            let mut reply = OpenReply::new(shared.take_reply_buf());
-            crate::admin::ns_error(e, &mut RespWriter::new(reply.reply(), proto));
-            return reply.finish();
-        }
-        if control.pending_creates() >= crate::control::PENDING_CREATE_MAX {
-            return error_reply(
-                shared,
-                proto,
-                "BUSY too many namespace creations in flight — retry (ADR-0103 D2)",
-            );
-        }
-        let (epoch, verdict) = control.request_persist_create(
-            shared.store.borrow().export_catalog(
-                control.next_ns_id(),
-                control.next_index_id(),
-                control.next_index_generation(),
-            ),
-            spec.clone(),
-        );
-        while !control.persisted(epoch) {
-            shared.ddl_waiters.wait(0).await;
-        }
-        match verdict.get() {
-            Some(crate::control::CreateOutcome::Accepted) => {}
-            Some(crate::control::CreateOutcome::NameExists) => {
-                let mut reply = OpenReply::new(shared.take_reply_buf());
-                crate::admin::ns_error(
-                    inf_store::NsError::Exists,
-                    &mut RespWriter::new(reply.reply(), proto),
-                );
-                return reply.finish();
-            }
-            Some(crate::control::CreateOutcome::AtCapacity) => {
-                return error_reply(
-                    shared,
-                    proto,
-                    "BUSY too many namespace creations in flight — retry (ADR-0103 D2)",
-                );
-            }
-            None => {
-                debug_assert!(false, "the writer sets the verdict before the epoch");
-                control.create_applied(ns_id);
-                return error_reply(shared, proto, "ERR internal: catalog verdict missing");
-            }
-        }
-        // Crash-matrix point (ADR-0103 D5): the on-disk state of a cut
-        // after the swap — META names a namespace no cell serves.
-        if inf_foundation::fault::fire(crate::fault::NS_CREATE_AFTER_META) {
-            control.create_applied(ns_id);
-            return error_reply(shared, proto, "ERR fault: ns_create_after_meta");
-        }
-        if let Err(e) = shared.store.borrow_mut().ns_create(spec.clone()) {
-            // The OS refused the ring reservation (the one check D3
-            // cannot run ahead): the pending entry retires and a later
-            // persist drops the definition (recorded residual).
-            control.create_applied(ns_id);
-            let mut reply = OpenReply::new(shared.take_reply_buf());
-            crate::admin::ns_error(e, &mut RespWriter::new(reply.reply(), proto));
-            return reply.finish();
-        }
-        created = Some((ns_id, spec.name.clone(), cleanup, spec.tier.is_some()));
-        let fsync = spec.fsync.map_or("-", |f| match f {
-            FsyncClass::Everysec => "everysec",
-            FsyncClass::Always => "always",
-        });
-        let policy = spec.policy.map_or("-", inf_store::EvictionPolicy::name);
-        let maxmemory = spec.maxmemory.map_or_else(|| "-".to_string(), |b| b.to_string());
-        vec![
-            b"INF.NSFAN".to_vec(),
-            b"CREATE".to_vec(),
-            spec.name.clone(),
-            spec.mode.name().as_bytes().to_vec(),
-            fsync.as_bytes().to_vec(),
-            policy.as_bytes().to_vec(),
-            maxmemory.into_bytes(),
-            ns_id.to_string().into_bytes(),
-            tier_to_fan(spec.tier.as_ref()),
-        ]
-    } else if argv[1].eq_ignore_ascii_case(b"SET") {
-        // M4-S19 (ADR-0062 D3) / M4-S27 (ADR-0068 D3): hot-reload is DDL
-        // — registry + store update locally, fan to peers, catalog
-        // persist-then-ack.
-        let (name, update) = {
-            let store = shared.store.borrow();
-            match crate::admin::parse_ns_set(argv, &store) {
-                Ok(parsed) => parsed,
-                Err(msg) => return error_reply(shared, proto, &msg),
-            }
-        };
-        let fan_tail = match &update {
-            crate::admin::NsSetUpdate::Tier(tier) => vec![tier_to_fan(Some(tier))],
-            crate::admin::NsSetUpdate::MemoryPressure { policy, maxmemory } => vec![
-                b"MEMCFG".to_vec(),
-                policy.map_or_else(|| b"-".to_vec(), |p| p.name().as_bytes().to_vec()),
-                maxmemory.map_or_else(|| b"-".to_vec(), |b| b.to_string().into_bytes()),
-            ],
-        };
-        if let Err(e) = crate::admin::apply_ns_set(&mut shared.store.borrow_mut(), &name, update) {
-            let mut reply = OpenReply::new(shared.take_reply_buf());
-            crate::admin::ns_error(e, &mut RespWriter::new(reply.reply(), proto));
-            return reply.finish();
-        }
-        let mut fan = vec![b"INF.NSFAN".to_vec(), b"SET".to_vec(), name];
-        fan.extend(fan_tail);
-        fan
-    } else {
-        if argv.len() != 3 {
-            return error_reply(shared, proto, "ERR wrong number of arguments for 'INF.NS|DROP'");
-        }
-        return program_ns_drop(shared, &control, proto, argv[2]).await;
-    };
-    // Fan to peers (AllOk — partial failure surfaces as the first error
-    // leg, the recorded M1 scatter semantics). Every leg answers: a leg
-    // that cannot be sent is a failed leg, never a skipped one (the H1
-    // shape — `if let Ok` silently dropped the cell).
-    let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();
-    let failure = fan_all_or_first_error(shared, proto, &fan_argv).await;
-    if let Some((id, name, cleanup, tiered)) = created {
-        if let Some(error) = failure {
-            // ADR-0108 D3: a `CREATE` whose fan failed on any peer rolls
-            // back — the origin drops its copy, persists the drop and
-            // waits for the swap, then fans `DROP` (ADR-0186 D1) — so the
-            // namespace's existence is exactly what the reply says. Before
-            // this the peers that accepted their leg (and the origin)
-            // served it while the client held an error, and `META` kept
-            // naming it until the next persist.
-            rollback_create(shared, &control, proto, id, &name, cleanup, tiered).await;
-            return error;
-        }
-        // Every leg answered `+OK`: each cell's export carries the
-        // namespace from here on (ADR-0103 D2).
-        control.create_applied(id);
-        return simple_reply(shared, proto, "OK");
+    if argv[1].eq_ignore_ascii_case(b"CREATE") {
+        return program_ns_create(shared, &control, proto, argv).await;
     }
-    if let Some(error) = failure {
-        return error;
+    if argv[1].eq_ignore_ascii_case(b"SET") {
+        return program_ns_set(shared, &control, proto, argv).await;
     }
-    // Persist the catalog; ack only once the swap is durable (a DDL whose
-    // definition can vanish after +OK would be a §8.2 violation).
-    let epoch = control.request_persist(shared.store.borrow().export_catalog(
-        control.next_ns_id(),
-        control.next_index_id(),
-        control.next_index_generation(),
-    ));
-    while !control.persisted(epoch) {
-        shared.ddl_waiters.wait(0).await;
+    if argv.len() != 3 {
+        return error_reply(shared, proto, "ERR wrong number of arguments for 'INF.NS|DROP'");
     }
-    simple_reply(shared, proto, "OK")
+    program_ns_drop(shared, &control, proto, argv[2]).await
 }
 
-/// `INF.NS DROP` (ADR-0186 D1; ADR-0100 D3/D5): apply locally → request the catalog persist
-/// that carries the drop (a durable namespace's tombstone joins the payload) → wait for the
-/// swap → fan `INF.NSFAN DROP name epoch`, so no peer drops a namespace the catalog still
-/// lists and every peer parks its tier-file teardown on that epoch → request the node-wide
-/// checkpoint that retires the tombstone and stamp it → `+OK`. At the tombstone cap the drop
-/// first waits for a node-wide checkpoint (the `INF.CKPT WAIT` machinery) so the persist
-/// retires everything stamped — bounded backpressure, never an unbounded set.
-async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+/// The reply of a namespace error.
+fn ns_error_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    proto: Protocol,
+    e: inf_store::NsError,
+) -> OwnedReply {
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    crate::admin::ns_error(e, &mut RespWriter::new(reply.reply(), proto));
+    reply.finish()
+}
+
+/// The `INF.NSFAN CREATE` leg of `spec`: its fields as the peer parses
+/// them (`-` = none).
+fn create_fan(spec: &inf_store::NsSpec) -> Vec<Vec<u8>> {
+    let fsync = spec.fsync.map_or("-", |f| match f {
+        FsyncClass::Everysec => "everysec",
+        FsyncClass::Always => "always",
+    });
+    let policy = spec.policy.map_or("-", inf_store::EvictionPolicy::name);
+    let maxmemory = spec.maxmemory.map_or_else(|| "-".to_string(), |b| b.to_string());
+    vec![
+        b"INF.NSFAN".to_vec(),
+        b"CREATE".to_vec(),
+        spec.name.clone(),
+        spec.mode.name().as_bytes().to_vec(),
+        fsync.as_bytes().to_vec(),
+        policy.as_bytes().to_vec(),
+        maxmemory.into_bytes(),
+        spec.id.0.to_string().into_bytes(),
+        tier_to_fan(spec.tier.as_ref()),
+    ]
+}
+
+/// Lowers a dropped tiered namespace's hold on this cell to the drop's
+/// epoch, once the writer's answer carries it (ADR-0100 D5): the origin
+/// holds the files at `u64::MAX` from its local apply, before the writer
+/// numbers the request. A hold the next MAINTAIN has not yet taken is
+/// lowered in place; one the tier cell holds is lowered there.
+fn lower_drop_release<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    ns: NsId,
+    epoch: u64,
+) {
+    let mut releases = shared.ns_drop_releases.borrow_mut();
+    if let Some(release) = releases.iter_mut().find(|(id, _)| *id == ns) {
+        release.1 = epoch;
+        return;
+    }
+    if let Some(tier) = shared.tier.borrow_mut().as_mut() {
+        tier.lower_release(ns, epoch);
+    }
+}
+
+/// The notice a DDL owes the catalog writer once its fan is done
+/// (ADR-0189 D5): the writer keeps the DDL's effect in every payload until
+/// it arrives. Built only from an accepted answer's receipt or by
+/// [`NoticeDue::roll_back`]; [`NoticeDue::post`] sends it, and on every
+/// other exit dropping the value sends it with no stamp, a blocking send
+/// like every catalog request. Bound after the DDL ticket, it drops first,
+/// so the notice reaches the writer before the next DDL's request.
+#[must_use = "a dropped notice posts at once, with no stamp"]
+struct NoticeDue {
+    control: Arc<ControlHandle>,
+    id: u32,
+    /// `None` once posted or rolled back.
+    kind: Option<NoticeKind>,
+}
+
+/// Which notice a [`NoticeDue`] posts.
+#[derive(Copy, Clone, Debug)]
+enum NoticeKind {
+    CreateApplied,
+    DropFanned,
+}
+
+impl NoticeDue {
+    /// The notice an accepted `CREATE` owes.
+    fn created(control: &Arc<ControlHandle>, receipt: &CreatePersisted) -> NoticeDue {
+        let (control, id) = (Arc::clone(control), receipt.id().0);
+        NoticeDue { control, id, kind: Some(NoticeKind::CreateApplied) }
+    }
+
+    /// The notice an accepted `DROP` owes.
+    fn dropped(control: &Arc<ControlHandle>, receipt: &DropPersisted) -> NoticeDue {
+        let (control, id) = (Arc::clone(control), receipt.id().0);
+        NoticeDue { control, id, kind: Some(NoticeKind::DropFanned) }
+    }
+
+    /// The rollback's send consumes the `CREATE`'s notice, posting nothing
+    /// (the rollback's `DROP` replaces its pending `CREATE`), and returns
+    /// the notice the rollback owes.
+    fn roll_back(mut self) -> NoticeDue {
+        self.kind = None;
+        let (control, id) = (Arc::clone(&self.control), self.id);
+        NoticeDue { control, id, kind: Some(NoticeKind::DropFanned) }
+    }
+
+    /// Posts the notice; `stamp` is the epoch of the checkpoint that
+    /// retires a durable drop's tombstone, `None` for any other.
+    fn post(mut self, stamp: Option<u64>) {
+        self.send(stamp);
+    }
+
+    fn send(&mut self, stamp: Option<u64>) {
+        let id = self.id;
+        let notice = match self.kind.take() {
+            None => return,
+            Some(NoticeKind::CreateApplied) => DdlNotice::CreateApplied { id },
+            Some(NoticeKind::DropFanned) => DdlNotice::DropFanned { id, stamp },
+        };
+        self.control.post_notice(notice);
+    }
+}
+
+impl Drop for NoticeDue {
+    fn drop(&mut self) {
+        self.send(None);
+    }
+}
+
+/// The reply a DDL renders for the writer's refusal: `NameExists` as the
+/// namespace error every `CREATE` path answers; `PendingConflict`, which
+/// the ticket makes unreachable, as an internal error.
+fn ddl_refusal_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    proto: Protocol,
+    refusal: DdlRefusal,
+) -> OwnedReply {
+    match refusal {
+        DdlRefusal::NameExists => ns_error_reply(shared, proto, inf_store::NsError::Exists),
+        DdlRefusal::PendingConflict => error_reply(shared, proto, DDL_PENDING_CONFLICT),
+    }
+}
+
+/// The internal error of a DDL the writer found another pending for.
+const DDL_PENDING_CONFLICT: &str = "ERR internal: another namespace DDL is pending";
+
+/// Parks until the writer answers `requested` through its own slot
+/// (ADR-0189 D2): the word's edge wakes the DDL waitlist.
+async fn await_answer<R: Receipt, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    control: &ControlHandle,
+    mut requested: Requested<R>,
+) -> Result<R, DdlRefusal> {
+    loop {
+        match requested.answer(control.catalog_word()) {
+            Answer::Pending(again) => requested = again,
+            Answer::Refused(refusal) => return Err(refusal),
+            Answer::Accepted(receipt) => return Ok(receipt),
+        }
+        shared.ddl_waiters.wait(0).await;
+    }
+}
+
+/// `INF.NS CREATE` (ADR-0103, ADR-0189 D5): validate without applying,
+/// ask the writer for the `META` that names the namespace and wait for
+/// its answer, then apply locally and fan, so no cell serves a namespace
+/// the catalog does not hold. A failed leg rolls it back. Every exit
+/// after the answer posts the `CREATE`'s notice.
+async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     control: &Arc<ControlHandle>,
     proto: Protocol,
-    name: &[u8],
+    argv: &[&[u8]],
 ) -> OwnedReply {
-    // ADR-0159 D2: a durable DROP reserves its two units under the ticket,
-    // before pacing and any effect. An unknown name reserves none; `ns_drop`
-    // refuses it below.
+    let draft = match crate::admin::parse_ns_create(argv) {
+        Ok(draft) => draft,
+        Err(msg) => return error_reply(shared, proto, &msg),
+    };
+    let cleanup = match admit_ns_create(shared, proto, draft.mode) {
+        Ok(cleanup) => cleanup,
+        Err(refusal) => return refusal,
+    };
+    let spec = draft.with_id(control.alloc_ns_id());
+    if let Err(e) = shared.store.borrow().ns_create_check(&spec) {
+        return ns_error_reply(shared, proto, e);
+    }
+    let export = shared.store.borrow().export_catalog(
+        control.next_ns_id(),
+        control.next_index_id(),
+        control.next_index_generation(),
+    );
+    let requested = control.request_create(export, spec.clone());
+    let receipt = match await_answer(shared, control, requested).await {
+        Ok(receipt) => receipt,
+        Err(refusal) => return ddl_refusal_reply(shared, proto, refusal),
+    };
+    let notice = NoticeDue::created(control, &receipt);
+    // Crash-matrix point (ADR-0103 D5): the on-disk state of a cut
+    // after the swap — META names a namespace no cell serves.
+    if inf_foundation::fault::fire(crate::fault::NS_CREATE_AFTER_META) {
+        return error_reply(shared, proto, "ERR fault: ns_create_after_meta");
+    }
+    if let Err(e) = shared.store.borrow_mut().ns_create(spec.clone()) {
+        // The OS refused the ring reservation (the one check validation
+        // cannot run ahead): the notice retires the pending entry and a
+        // later persist drops the definition (recorded residual).
+        return ns_error_reply(shared, proto, e);
+    }
+    let fan = create_fan(&spec);
+    let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();
+    if let Some(error) = fan_all_or_first_error(shared, proto, &fan_argv).await {
+        let rollback =
+            Rollback { id: spec.id.0, name: &spec.name, cleanup, tiered: spec.tier.is_some() };
+        rollback_create(shared, control, proto, rollback, notice).await;
+        return error;
+    }
+    notice.post(None);
+    simple_reply(shared, proto, "OK")
+}
+
+/// A `DROP`'s admission, before any effect (ADR-0159 D2): a durable
+/// namespace reserves its two units under the ticket, and at the tombstone
+/// cap the drop first waits for a node-wide checkpoint (the `INF.CKPT
+/// WAIT` machinery), so the writer's next accepted request retires every
+/// tombstone stamped. An unknown name reserves none; `ns_drop` refuses it.
+async fn admit_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    control: &ControlHandle,
+    proto: Protocol,
+    name: &[u8],
+) -> Result<NsCleanup, OwnedReply> {
     let mode = shared.store.borrow().ns_get(name).map(|spec| spec.mode);
     let reserved = match mode {
         Some(mode) => reserve_ns_units(shared, mode),
         None => Ok((None, NsCleanup::NoTombstone)),
     };
-    let (pacing, cleanup) = match reserved {
-        Ok(units) => units,
-        Err(refusal) => return refusal.reply(shared, proto),
-    };
+    let (pacing, cleanup) = reserved.map_err(|refusal| refusal.reply(shared, proto))?;
     if let Some(pacing) = pacing
         && control.drop_tombstones() >= crate::control::DROPPED_NS_MAX
     {
@@ -733,14 +774,36 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
             shared.ckpt_waiters.wait(0).await;
         }
     }
+    Ok(cleanup)
+}
+
+/// `INF.NS DROP` (ADR-0186's order; ADR-0189 D2): apply locally → ask the
+/// writer for the `META` that drops the namespace (a durable one's
+/// tombstone in its place) and wait for its answer → fan `INF.NSFAN DROP
+/// name epoch` with the answer's epoch, so no peer drops a namespace the
+/// catalog still lists and every peer holds its tier files until that
+/// epoch is durable → request the checkpoint that retires the tombstone
+/// and post the notice with its epoch → `+OK`.
+async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    control: &Arc<ControlHandle>,
+    proto: Protocol,
+    name: &[u8],
+) -> OwnedReply {
+    let cleanup = match admit_ns_drop(shared, control, proto, name).await {
+        Ok(cleanup) => cleanup,
+        Err(refusal) => return refusal,
+    };
     let spec = match shared.store.borrow_mut().ns_drop(name) {
         Ok(spec) => spec,
-        Err(e) => {
-            let mut reply = OpenReply::new(shared.take_reply_buf());
-            crate::admin::ns_error(e, &mut RespWriter::new(reply.reply(), proto));
-            return reply.finish();
-        }
+        Err(e) => return ns_error_reply(shared, proto, e),
     };
+    // The tier files hold from the apply: their release epoch is the
+    // answer's, known only once the writer numbers the request.
+    let tiered = spec.tier.is_some();
+    if tiered {
+        shared.ns_drop_releases.borrow_mut().push((spec.id, u64::MAX));
+    }
     // Crash-matrix point: the on-disk state of a cut at this instant
     // (nothing durable changed; the origin alone lacks the namespace).
     // No persist will ever carry this drop, so the tier files hold
@@ -748,31 +811,27 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     // whole while this cell publishes no checkpoint before the node
     // stops: one would omit the namespace (ADR-0186 D2).
     if inf_foundation::fault::fire(crate::fault::NS_DROP_BEFORE_META) {
-        if spec.tier.is_some() {
-            shared.ns_drop_releases.borrow_mut().push((spec.id, u64::MAX));
-        }
         return error_reply(shared, proto, "ERR fault: ns_drop_before_meta");
     }
     // A namespace's mode is fixed at its CREATE: the reservation read it.
     debug_assert_eq!(spec.mode == NsMode::Durable, cleanup.has_tombstone(), "the reserved mode");
-    let epoch = control.request_persist_drop(
-        shared.store.borrow().export_catalog(
-            control.next_ns_id(),
-            control.next_index_id(),
-            control.next_index_generation(),
-        ),
-        spec.id.0,
-        cleanup.has_tombstone(),
+    let export = shared.store.borrow().export_catalog(
+        control.next_ns_id(),
+        control.next_index_id(),
+        control.next_index_generation(),
     );
-    if spec.tier.is_some() {
-        shared.ns_drop_releases.borrow_mut().push((spec.id, epoch));
-    }
-    // The fan carries the epoch (ADR-0100 D4): peers park their teardown
-    // on it — no second fan, no derived epoch.
-    let epoch_text = epoch.to_string();
-    let fan: [&[u8]; 4] = [b"INF.NSFAN", b"DROP", name, epoch_text.as_bytes()];
-    while !control.persisted(epoch) {
-        shared.ddl_waiters.wait(0).await;
+    let requested = control.request_drop(export, spec.id.0, cleanup.has_tombstone());
+    let receipt = match await_answer(shared, control, requested).await {
+        Ok(receipt) => receipt,
+        // The ticket admits one DDL, so no pending DDL can conflict: the
+        // namespace stays dropped on this cell and held on disk, as at
+        // `ns_drop_before_meta`, and the next boot restores it from META.
+        Err(refusal) => return ddl_refusal_reply(shared, proto, refusal),
+    };
+    let notice = NoticeDue::dropped(control, &receipt);
+    let epoch = receipt.fan_epoch();
+    if tiered {
+        lower_drop_release(shared, spec.id, epoch);
     }
     // Crash-matrix point: the on-disk state of a cut after the swap
     // (META lacks the namespace and carries its tombstone; each peer's
@@ -781,11 +840,126 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     if inf_foundation::fault::fire(crate::fault::NS_DROP_AFTER_META) {
         return error_reply(shared, proto, "ERR fault: ns_drop_after_meta");
     }
+    // The fan carries the answer's epoch: peers hold their teardown on
+    // it — no second fan, no derived epoch.
+    let epoch_text = epoch.to_string();
+    let fan: [&[u8]; 4] = [b"INF.NSFAN", b"DROP", name, epoch_text.as_bytes()];
     if let Some(error) = fan_all_or_first_error(shared, proto, &fan).await {
+        // A leg that errored leaves the tombstone unstamped: the next
+        // boot stamps it.
+        notice.post(None);
         return error;
     }
-    cleanup.stamp(control, spec.id.0);
+    notice.post(cleanup.stamp_epoch());
     simple_reply(shared, proto, "OK")
+}
+
+/// What a `CREATE`'s rollback undoes.
+struct Rollback<'a> {
+    id: u32,
+    name: &'a [u8],
+    /// A durable namespace's tombstone stamp, reserved by its `CREATE`
+    /// (ADR-0159 D2).
+    cleanup: NsCleanup,
+    /// Whether its tier files wait for the drop's swap.
+    tiered: bool,
+}
+
+/// ADR-0108 D3: undoes a `CREATE` whose fan failed — the mirror of
+/// `program_ns_drop` for a namespace nothing has been promised about.
+/// The origin drops its copy, asks the writer for the `META` that drops
+/// it (the writer replaces the pending `CREATE` with the drop; a durable
+/// namespace gets its tombstone) and waits for the answer, every peer gets
+/// `INF.NSFAN DROP name epoch` (a peer that never applied its leg answers
+/// "not found" — accepted), and the notice posts with the stamp of the
+/// cleanup credit the `CREATE` reserved (ADR-0159 D2). Runs under the DDL
+/// ticket.
+async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    control: &Arc<ControlHandle>,
+    proto: Protocol,
+    rollback: Rollback<'_>,
+    notice: NoticeDue,
+) {
+    let Rollback { id, name, cleanup, tiered } = rollback;
+    // The origin's own copy (`Unknown` here would mean the fan's local
+    // apply never happened — nothing to undo).
+    let _ = shared.store.borrow_mut().ns_drop(name);
+    if tiered {
+        shared.ns_drop_releases.borrow_mut().push((NsId(id), u64::MAX));
+    }
+    let export = shared.store.borrow().export_catalog(
+        control.next_ns_id(),
+        control.next_index_id(),
+        control.next_index_generation(),
+    );
+    let requested = control.request_drop(export, id, cleanup.has_tombstone());
+    let notice = notice.roll_back();
+    let Ok(receipt) = await_answer(shared, control, requested).await else {
+        unreachable!("the writer accepts a rollback's drop of its own pending CREATE");
+    };
+    let epoch = receipt.fan_epoch();
+    if tiered {
+        lower_drop_release(shared, NsId(id), epoch);
+    }
+    let epoch_text = epoch.to_string();
+    let fan: [&[u8]; 4] = [b"INF.NSFAN", b"DROP", name, epoch_text.as_bytes()];
+    // Peers that refused or never received their CREATE leg answer
+    // "namespace not found" — the rollback is idempotent per cell.
+    let _ = fan_all_or_first_error(shared, proto, &fan).await;
+    notice.post(cleanup.stamp_epoch());
+}
+
+/// `INF.NS SET` (M4-S19, ADR-0062 D3; M4-S27, ADR-0068 D3): hot-reload is
+/// DDL — apply locally → fan `INF.NSFAN SET` to every peer → ask the
+/// writer for the `META` that carries the new configuration and wait for
+/// its answer → `+OK` (ADR-0015 D3's order). The request names no change:
+/// every cell's export already carries the new configuration.
+async fn program_ns_set<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    control: &Arc<ControlHandle>,
+    proto: Protocol,
+    argv: &[&[u8]],
+) -> OwnedReply {
+    let (name, update, id) = {
+        let store = shared.store.borrow();
+        let (name, update) = match crate::admin::parse_ns_set(argv, &store) {
+            Ok(parsed) => parsed,
+            Err(msg) => return error_reply(shared, proto, &msg),
+        };
+        // The parse resolved the name; the ticket keeps it until the reply.
+        let Some(id) = store.ns_get(&name).map(|spec| spec.id) else {
+            return ns_error_reply(shared, proto, inf_store::NsError::Unknown);
+        };
+        (name, update, id)
+    };
+    let fan_tail = match &update {
+        crate::admin::NsSetUpdate::Tier(tier) => vec![tier_to_fan(Some(tier))],
+        crate::admin::NsSetUpdate::MemoryPressure { policy, maxmemory } => vec![
+            b"MEMCFG".to_vec(),
+            policy.map_or_else(|| b"-".to_vec(), |p| p.name().as_bytes().to_vec()),
+            maxmemory.map_or_else(|| b"-".to_vec(), |b| b.to_string().into_bytes()),
+        ],
+    };
+    if let Err(e) = crate::admin::apply_ns_set(&mut shared.store.borrow_mut(), &name, update) {
+        return ns_error_reply(shared, proto, e);
+    }
+    let mut fan = vec![b"INF.NSFAN".to_vec(), b"SET".to_vec(), name];
+    fan.extend(fan_tail);
+    let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();
+    if let Some(error) = fan_all_or_first_error(shared, proto, &fan_argv).await {
+        return error;
+    }
+    let export = shared.store.borrow().export_catalog(
+        control.next_ns_id(),
+        control.next_index_id(),
+        control.next_index_generation(),
+    );
+    let requested = control.request_set(export, id);
+    match await_answer(shared, control, requested).await {
+        Ok(_receipt) => simple_reply(shared, proto, "OK"),
+        Err(refusal) => ddl_refusal_reply(shared, proto, refusal),
+    }
 }
 
 /// Fans one DDL vector to every peer and returns the first error reply,
@@ -820,49 +994,6 @@ async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone
         }
     }
     failure
-}
-
-/// ADR-0108 D3: undoes a `CREATE` whose fan failed — the mirror of
-/// `program_ns_drop` for a namespace nothing has been promised about.
-/// The origin drops its copy, the catalog persists the drop (the
-/// pending entry retires with it; a durable namespace gets its
-/// tombstone), every peer gets `INF.NSFAN DROP name epoch` (a peer that
-/// never applied its leg answers "not found" — accepted), and a durable
-/// drop is stamped for retirement with the cleanup credit its CREATE
-/// reserved (ADR-0159 D2). Runs under the DDL ticket.
-async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
-    control: &Arc<ControlHandle>,
-    proto: Protocol,
-    id: u32,
-    name: &[u8],
-    cleanup: NsCleanup,
-    tiered: bool,
-) {
-    // The origin's own copy (`Unknown` here would mean the fan's local
-    // apply never happened — nothing to undo).
-    let _ = shared.store.borrow_mut().ns_drop(name);
-    let epoch = control.request_persist_drop(
-        shared.store.borrow().export_catalog(
-            control.next_ns_id(),
-            control.next_index_id(),
-            control.next_index_generation(),
-        ),
-        id,
-        cleanup.has_tombstone(),
-    );
-    if tiered {
-        shared.ns_drop_releases.borrow_mut().push((NsId(id), epoch));
-    }
-    while !control.persisted(epoch) {
-        shared.ddl_waiters.wait(0).await;
-    }
-    let epoch_text = epoch.to_string();
-    let fan: [&[u8]; 4] = [b"INF.NSFAN", b"DROP", name, epoch_text.as_bytes()];
-    // Peers that refused or never received their CREATE leg answer
-    // "namespace not found" — the rollback is idempotent per cell.
-    let _ = fan_all_or_first_error(shared, proto, &fan).await;
-    cleanup.stamp(control, id);
 }
 
 /// The refusal of an argv wider than the codec's `MAX_APPLY_ARGS`.

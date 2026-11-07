@@ -152,12 +152,15 @@ directed pair of cells. The fabric is the only way cells talk to each other.
 
 **The control thread.** With a data directory, one extra thread persists the
 node catalog (namespace and index definitions). Catalog changes are rare and
-slow, so the file writes and fsyncs live off the data plane. Namespace and
-index ids come from shared atomic counters that the cell issuing the DDL
-bumps. The control thread also deletes truncated log segments and stale
-checkpoint files on behalf of the cells, because freeing a large file's
-pages is slow in the kernel. The main thread samples process gauges (RSS,
-CPU) and waits for the cells to exit.
+slow, so the file writes and fsyncs live off the data plane. The thread
+numbers each catalog request as it takes it from its queue and answers the
+request through that request's own slot once the write carrying it has
+returned (a refused request writes nothing), so a DDL acts only on its own
+durable write. Namespace and index ids come from shared atomic counters that
+the cell issuing the DDL bumps. The control thread also deletes truncated log
+segments and stale checkpoint files on behalf of the cells, because freeing a
+large file's pages is slow in the kernel. The main thread samples process
+gauges (RSS, CPU) and waits for the cells to exit.
 
 **Boot.** `main` parses flags (there is no config file), takes the data
 directory's `LOCK`, loads or creates the key-hash secret, checks the
@@ -220,8 +223,10 @@ A few things do cross threads, and each is small and off the per-key path:
   `-LOADING` progress, checkpoint publications, index readiness), each
   written by its own cell and read by the others, plus the process gauges
   the main thread publishes;
+- the catalog word, the highest catalog request the control thread has
+  answered, which that thread alone stores and every cell reads;
 - a few multi-writer control counters that any cell may bump: the namespace
-  id, index id and catalog epoch allocators (`fetch_add`), each cell's
+  id and index id allocators (`fetch_add`), each cell's
   checkpoint request slot (`fetch_max`), the boot countdown every cell
   decrements once its caches are reserved, and the node-wide stop and
   quiesce counters;

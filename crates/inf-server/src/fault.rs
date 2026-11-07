@@ -63,11 +63,11 @@
 //!   of 2026-08-30, H2/F-L17-11, ADR-0098): the reply is the error, and the durable emission gate
 //!   stages the applied prefix anyway — recovery replays exactly the live store, never a silent
 //!   rollback of read-visible keys
-//! - `ddl_request_held` — `control::ControlHandle::send_persist` (a catalog request numbered and
-//!   not yet sent) — the requesting thread waits at the point until the test releases the
+//! - `ddl_request_held` — `control::ControlHandle::send_request` (a catalog request built and not
+//!   yet sent) — the requesting thread waits at the point until the test releases the
 //!   [`HoldGate`](inf_foundation::fault::HoldGate) it armed: the stand-in for a sender descheduled
-//!   between numbering its request and enqueuing it, so a test decides the order of two senders on
-//!   real threads
+//!   between building its request and enqueuing it, so a test decides the order of two senders on
+//!   real threads (the writer numbers requests as it dequeues them)
 //! - `ns_create_leg_held` — `plane::handle_ns_apply` (a peer's `INF.NSFAN CREATE` leg, before it is
 //!   read) — the peer waits there until released: a `CREATE` whose fan is in flight, so a write the
 //!   origin acknowledges in the new namespace lands inside the fan

@@ -10719,3 +10719,51 @@ fn a_checkpoint_inside_a_rolled_back_create_wait_keeps_every_acked_key() {
 fn a_cut_inside_a_rolled_back_create_wait_keeps_every_acked_key() {
     rollback_wait_scenario(false, "rw-cut");
 }
+
+// ---- every exit after the catalog writer's answer posts its notice ----
+
+/// The catalog writer holds one pending DDL until the DDL's notice
+/// arrives (ADR-0189 D3), and every exit of a DDL after its answer posts
+/// that notice (D5): a fault point that stops a DDL after its answer, a
+/// `CREATE` rolled back after a refused leg, and a normal end each leave
+/// the next DDL admitted (`+OK`), never refused as conflicting with a DDL
+/// still pending. Every DDL runs from cell 0, whose fault plan counts its
+/// own occurrences; the refused leg is cell 1's third `CREATE` leg.
+#[test]
+fn a_ddl_stopped_after_its_answer_leaves_no_ddl_pending() {
+    use inf_foundation::fault::FaultSpec;
+    use inf_server::fault::{NS_CREATE_AFTER_META, NS_CREATE_FAN_REFUSED, NS_DROP_AFTER_META};
+    let dir = temp_data_dir("ddl-after-answer");
+    let node = Node::start_durable_with_faults(
+        2,
+        &dir,
+        vec![
+            (NS_CREATE_AFTER_META, FaultSpec::Nth(1)),
+            (NS_DROP_AFTER_META, FaultSpec::Nth(1)),
+            (NS_CREATE_FAN_REFUSED, FaultSpec::Nth(3)),
+        ],
+    );
+    let mut c = conn_on_cell(&node, 0);
+    let steps: [(&[&[u8]], &[u8]); 6] = [
+        (&[b"CREATE", b"a", b"MODE", b"durable"], b"-ERR fault: ns_create_after_meta\r\n"),
+        (&[b"CREATE", b"b", b"MODE", b"durable"], b"+OK\r\n"),
+        (&[b"DROP", b"b"], b"-ERR fault: ns_drop_after_meta\r\n"),
+        (&[b"CREATE", b"c", b"MODE", b"durable"], b"+OK\r\n"),
+        (&[b"CREATE", b"d", b"MODE", b"durable"], b"-ERR fault: ns_create_fan_refused\r\n"),
+        (&[b"CREATE", b"e", b"MODE", b"durable"], b"+OK\r\n"),
+    ];
+    for (step, (args, want)) in steps.iter().enumerate() {
+        let argv: Vec<&[u8]> = [&b"INF.NS"[..]].into_iter().chain(args.iter().copied()).collect();
+        c.write_all(&cmd(&argv)).expect("write");
+        let reply = read_line(&mut c);
+        assert_eq!(
+            String::from_utf8_lossy(&reply),
+            String::from_utf8_lossy(want),
+            "step {step} ({}): the DDL after one stopped past its answer",
+            String::from_utf8_lossy(&args.join(&b' '))
+        );
+    }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
