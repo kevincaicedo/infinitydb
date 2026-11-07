@@ -1554,7 +1554,8 @@ fn assert_same_ns(state: &NsRecovered, control: &NsRecovered, at: &str) {
     let differs = first_difference(&state.extents, &control.extents);
     assert!(differs.is_none(), "{at}: the extent references differ from entry {differs:?}");
     let differs = first_difference(&state.reclaim, &control.reclaim);
-    assert!(differs.is_none(), "{at}: the reclaim queue differs from candidate {differs:?}");
+    let order = "the reclaim queue's order (ids and origins)";
+    assert!(differs.is_none(), "{at}: {order} differs from candidate {differs:?}");
     assert_eq!(state.shadow, control.shadow, "{at}: the ticket rebuild's counters");
     assert_eq!(state.next_extent_id, control.next_extent_id, "{at}: the extent id cursor");
 }
