@@ -3850,15 +3850,18 @@ expect_red_because "fuzz-targets: a probe knob that is neither on nor off" "is '
 
 # The call: every workspace's cargo call carries the flags the verdict rests
 # on, with RUSTFLAGS replaced and CARGO_ENCODED_RUSTFLAGS unset whatever the
-# caller set.
-fz_calls_ok() { # <stub dir>
-    python3 - "$1/calls" <<'PY'
+# caller set, and the gate's own target directory under the caller's target
+# root, `${CARGO_TARGET_DIR:-target}/fuzz-check`, read with the variable unset
+# and set: never the root's target itself, whose RUSTFLAGS differ, and never
+# under the tree when the caller has moved its target elsewhere.
+fz_calls_ok() { # <stub dir> <the target directory every call must name>
+    python3 - "$1/calls" "$2" <<'PY'
 import sys
 lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
 calls = [lines[i:i + 3] for i in range(0, len(lines) - 1, 3)]
 want = {"bins/b/fuzz/Cargo.toml", "crates/a/fuzz/Cargo.toml"}
 rest = ["--bins", "--locked", "--keep-going", "--message-format", "json", "--color", "never",
-        "--target-dir", "target/fuzz-check"]
+        "--target-dir", sys.argv[2]]
 seen, bad = set(), []
 for call, flags, encoded in calls:
     argv = call.split(" ")[1:]
@@ -3878,20 +3881,38 @@ print("\n".join(bad))
 sys.exit(1 if bad else 0)
 PY
 }
-fz_argv_run() { # <gate> <root>: the gate under a caller's own RUSTFLAGS
-    env RUSTFLAGS=-Awarnings CARGO_ENCODED_RUSTFLAGS=-Awarnings INF_CHECK_ROOT="$2" \
-        INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" FZ_STUB="$2.stub" "$1"
+# fz_argv_run <gate> <root> [<CARGO_TARGET_DIR>]: the gate under a caller's
+# own RUSTFLAGS, with CARGO_TARGET_DIR set to the third argument, or unset.
+fz_argv_run() {
+    if [ -n "${3:-}" ]; then
+        env CARGO_TARGET_DIR="$3" RUSTFLAGS=-Awarnings CARGO_ENCODED_RUSTFLAGS=-Awarnings \
+            INF_CHECK_ROOT="$2" INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" \
+            FZ_STUB="$2.stub" "$1"
+    else
+        env -u CARGO_TARGET_DIR RUSTFLAGS=-Awarnings CARGO_ENCODED_RUSTFLAGS=-Awarnings \
+            INF_CHECK_ROOT="$2" INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" \
+            FZ_STUB="$2.stub" "$1"
+    fi
 }
 root=$(fz_root argv)
 expect green "fuzz-targets: green under a caller's RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS" \
     fz_argv_run "$FUZZ" "$root"
 expect green "fuzz-targets: each workspace's call carries the gate's flags and environment" \
-    fz_calls_ok "$root.stub"
-# The call's canaries: a copy of the gate with one part of its call dropped
-# turns the case red. Each copy runs on the argv root, its calls cleared.
+    fz_calls_ok "$root.stub" target/fuzz-check
+# A caller's target root outside the tree, as a second worktree building into
+# the first checkout's target has: the gate builds under it, not in the tree.
+FZ_CALLER_TARGET="$work/fz-caller-target"
+rm -f "${root:?}.stub/calls"
+expect green "fuzz-targets: green with CARGO_TARGET_DIR set" \
+    fz_argv_run "$FUZZ" "$root" "$FZ_CALLER_TARGET"
+expect green "fuzz-targets: each call names \$CARGO_TARGET_DIR/fuzz-check when it is set" \
+    fz_calls_ok "$root.stub" "$FZ_CALLER_TARGET/fuzz-check"
+# The call's canaries: a copy of the gate with one part of its call changed
+# turns the case red. Each copy runs on the argv root, its calls cleared,
+# with CARGO_TARGET_DIR unset or set to the fourth argument.
 FZ_MROOT=$root
-fz_mutant() { # <name> <sed expression> <what the copy drops>
-    local dir
+fz_mutant() { # <name> <sed expression> <what the copy does> [<CARGO_TARGET_DIR>]
+    local dir want=target/fuzz-check
     dir="$work/fz-gate-$1"
     rm -rf "${dir:?}"
     mkdir -p "$dir"
@@ -3904,17 +3925,20 @@ fz_mutant() { # <name> <sed expression> <what the copy drops>
         exit 2
     fi
     rm -f "${FZ_MROOT:?}.stub/calls"
-    fz_argv_run "$dir/check-fuzz-targets.sh" "$FZ_MROOT" >/dev/null 2>&1 || true
+    [ -z "${4:-}" ] || want="$4/fuzz-check"
+    fz_argv_run "$dir/check-fuzz-targets.sh" "$FZ_MROOT" "${4:-}" >/dev/null 2>&1 || true
     expect red "fuzz-targets: the call's check is red on a gate that $3" \
-        fz_calls_ok "$FZ_MROOT.stub"
+        fz_calls_ok "$FZ_MROOT.stub" "$want"
 }
 fz_mutant bins 's/"check", "--bins", /"check", /' "drops --bins"
 fz_mutant locked 's/"--locked", //' "drops --locked"
 fz_mutant keep-going 's/"--keep-going", //' "drops --keep-going"
 fz_mutant format 's/"--message-format", "json",/"--message-format", "short",/' "reads cargo's short format"
 fz_mutant color 's/"--color", "never", //' "drops --color never"
-fz_mutant target-dir 's|"--target-dir", "target/fuzz-check"|"--target-dir", "target"|' \
+fz_mutant target-dir 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/fuzz-check"$|TARGET_DIR="${CARGO_TARGET_DIR:-target}"|' \
     "shares the root's target directory"
+fz_mutant fixed 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/fuzz-check"$|TARGET_DIR="target/fuzz-check"|' \
+    "ignores CARGO_TARGET_DIR" "$FZ_CALLER_TARGET"
 fz_mutant warnings 's/^RUSTFLAGS = "-D warnings --cfg fuzzing"$/RUSTFLAGS = "--cfg fuzzing"/' "drops -D warnings"
 fz_mutant cfg 's/^RUSTFLAGS = "-D warnings --cfg fuzzing"$/RUSTFLAGS = "-D warnings"/' "drops --cfg fuzzing"
 fz_mutant encoded 's/ if k != "CARGO_ENCODED_RUSTFLAGS"}/}/' "keeps the caller's CARGO_ENCODED_RUSTFLAGS"

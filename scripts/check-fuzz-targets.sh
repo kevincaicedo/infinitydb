@@ -16,12 +16,21 @@
 # gate then runs, for each fuzz workspace in
 # census order,
 #   cargo check --manifest-path <m> --bins --locked --keep-going
-#               --message-format json --color never --target-dir target/fuzz-check
+#               --message-format json --color never
+#               --target-dir "${CARGO_TARGET_DIR:-target}/fuzz-check"
 # with RUSTFLAGS="-D warnings --cfg fuzzing" in place of the caller's and
 # CARGO_ENCODED_RUSTFLAGS unset (cargo ranks it above RUSTFLAGS), on the
-# toolchain rust-toolchain.toml pins. cargo-fuzz sets cfg(fuzzing) by
-# default, so every arm a fuzz build compiles is compiled here; the root
-# workspace compiles the other arm. No build-script knob is set, so
+# toolchain rust-toolchain.toml pins. The target directory is the gate's
+# own under the caller's target root, resolved from the root as cargo
+# resolves the variable. It is never the root workspace's target itself:
+# the gate's RUSTFLAGS differ, so a shared target would rebuild every shared
+# unit at each switch. A caller that keeps its target elsewhere, such as a
+# second worktree building into the first checkout's target, builds nothing
+# under the tree.
+# CARGO_TARGET_DIR says only where outputs land; it selects no target and
+# skips no probe. cargo-fuzz sets cfg(fuzzing) by default, so every arm a
+# fuzz build compiles is compiled here; the root workspace compiles the
+# other arm. No build-script knob is set, so
 # libfuzzer-sys's build script compiles libFuzzer's C++ runtime: the gate
 # needs a C++17 compiler where it runs, as the fuzz jobs do, and a host
 # without one is red there. `cargo check` stops before monomorphization and
@@ -86,6 +95,7 @@ case "$#:${1:-}:${2:-}" in
     *) echo "usage: check-fuzz-targets.sh [--matrix nightly|smoke|deny]" >&2; exit 2 ;;
 esac
 matrix=${2:-}
+TARGET_DIR="${CARGO_TARGET_DIR:-target}/fuzz-check"
 probe=${INF_FUZZ_CHECK_PROBE:-on}
 [ "$mode" = gate ] || probe=on
 case "$probe" in
@@ -99,7 +109,8 @@ case "$probe" in
 esac
 
 INF_SCRIPT_DIR="$SCRIPT_DIR" INF_FUZZ_MODE="$mode" INF_FUZZ_MATRIX="$matrix" INF_FUZZ_PROBE="$probe" \
-    INF_FUZZ_CARGO_BIN="${INF_FUZZ_CARGO:-cargo}" python3 -I -B - <<'PY'
+    INF_FUZZ_CARGO_BIN="${INF_FUZZ_CARGO:-cargo}" INF_FUZZ_TARGET_DIR="$TARGET_DIR" \
+    python3 -I -B - <<'PY'
 import json
 import os
 import re
@@ -113,7 +124,7 @@ TOKEN = "FUZZ-TARGETS"
 MODE, PROBE, CARGO = (os.environ[k] for k in ("INF_FUZZ_MODE", "INF_FUZZ_PROBE", "INF_FUZZ_CARGO_BIN"))
 # The call is the verdict: every flag is one the probe or the self-test reads.
 CALL = ["check", "--bins", "--locked", "--keep-going", "--message-format", "json",
-        "--color", "never", "--target-dir", "target/fuzz-check"]
+        "--color", "never", "--target-dir", os.environ["INF_FUZZ_TARGET_DIR"]]
 RUSTFLAGS = "-D warnings --cfg fuzzing"
 PROBE_MAIN = "scripts/fuzz-check-probe/Cargo.toml"
 PROBE_LOCK = "scripts/fuzz-check-probe/stale-lock/Cargo.toml"
