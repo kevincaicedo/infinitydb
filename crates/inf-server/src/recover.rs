@@ -851,7 +851,8 @@ pub struct Recovery<F: SegmentFs> {
     /// checkpoint section and a settle step — and charged to it there.
     step_charge: u64,
     /// The bytes of the frame or section the current step entered and parked
-    /// in, not charged yet: the rest of the step's work (ADR-0174 A1.2).
+    /// in, not charged yet: the rest of the step's work (ADR-0174 A1.2). A
+    /// unit whose price is not its bytes parks its bytes, never its price.
     step_parked_bytes: u64,
     /// The row of [`RECOVERY_UNITS`] the last step ran.
     last_unit: UnitPhase,

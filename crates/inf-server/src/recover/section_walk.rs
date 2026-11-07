@@ -19,7 +19,9 @@
 //! charged, and the rest of the walk is metered. An index-sidecar section is
 //! applied whole and asked after. A section's items are charged once, as
 //! the walk passes them, and its header, meta, trailer and padding when it
-//! ends.
+//! ends. A step that parks inside the section it entered adds the bytes the
+//! walk has not passed to its work (ADR-0174 A1.2) — bytes, never the RAM
+//! price of the entries left, which is work no step did yet.
 //!
 //! The reader moves the cursor on these answers alone. It lies below the
 //! store, so no type proves that a move followed a consumed answer: budget
@@ -46,16 +48,20 @@ use super::{
 };
 
 /// One walk of the section the reader announced: its kind, metered or
-/// whole, an item's RAM price and an entry's bytes, the section's price in
-/// budget bytes, the price of the items the walk passed and of what the
-/// section has charged (across the steps that walked it), whether a record
-/// was presented in this step, and whether an earlier step parked in it.
+/// whole, an item's RAM price and an entry's bytes; two ledgers — the
+/// section's block bytes and the item bytes the walk passed, and the
+/// section's price in budget bytes, the price of the items the walk passed
+/// and of what the section has charged (across the steps that walked it) —
+/// whether a record was presented in this step, and whether an earlier step
+/// parked in it.
 #[derive(Copy, Clone, Debug)]
 struct Walk {
     kind: IckSectionKind,
     metered: bool,
     item_price: u64,
     entry_bytes: u64,
+    block_bytes: u64,
+    bytes_passed: u64,
     price: u64,
     passed: u64,
     charged: u64,
@@ -70,6 +76,8 @@ impl Walk {
         metered: false,
         item_price: 0,
         entry_bytes: 0,
+        block_bytes: 0,
+        bytes_passed: 0,
         price: 0,
         passed: 0,
         charged: 0,
@@ -77,9 +85,16 @@ impl Walk {
         resumed: false,
     };
 
-    /// What the section has not charged yet.
+    /// What the section has not charged yet, at its price.
     fn unpaid(&self) -> u64 {
         self.price.saturating_sub(self.charged)
+    }
+
+    /// The section's bytes the walk has not passed: what a step that parks
+    /// in it adds to its work (ADR-0174 A1.2). Bytes, never their price —
+    /// an entry's RAM price is work the step did not do.
+    fn unwalked_bytes(&self) -> u64 {
+        self.block_bytes.saturating_sub(self.bytes_passed)
     }
 }
 
@@ -116,10 +131,13 @@ impl<F: SegmentFs + Clone> IckWalker<'_, F> {
         self.walk.charged = self.walk.passed;
     }
 
-    /// A consumed record's or applied entries' price: passed, and charged at
-    /// once by a metered walk (a whole walk's are charged at the section's
-    /// end).
-    fn pass(&mut self, price: u64) {
+    /// A consumed record or `items` applied entries, of `bytes` together:
+    /// passed in both ledgers, at their bytes and at their price (the bytes
+    /// and an item's RAM price each), and charged at once by a metered walk
+    /// (a whole walk's are charged at the section's end).
+    fn pass(&mut self, bytes: u64, items: u64) {
+        let price = bytes.saturating_add(items.saturating_mul(self.walk.item_price));
+        self.walk.bytes_passed = self.walk.bytes_passed.saturating_add(bytes);
         self.walk.passed = self.walk.passed.saturating_add(price);
         if self.walk.metered {
             self.charge_passed();
@@ -151,8 +169,7 @@ impl<F: SegmentFs + Clone> IckWalker<'_, F> {
         let count = u64::try_from(applied).unwrap_or(u64::MAX);
         let units = &mut self.rec.stats.units.ckpt_entries;
         *units = units.saturating_add(count);
-        let each = self.walk.entry_bytes.saturating_add(self.walk.item_price);
-        self.pass(count.saturating_mul(each));
+        self.pass(count.saturating_mul(self.walk.entry_bytes), count);
         if applied < len {
             self.stop = Some(Stop::Section);
         }
@@ -219,6 +236,8 @@ impl<F: SegmentFs + Clone> IckWalk<io::Error> for IckWalker<'_, F> {
             metered: false,
             item_price,
             entry_bytes,
+            block_bytes: entry.block_bytes,
+            bytes_passed: entry.item_bytes_done,
             price,
             passed: done,
             charged: done,
@@ -261,7 +280,7 @@ impl<F: SegmentFs + Clone> IckWalk<io::Error> for IckWalker<'_, F> {
                     // The planted canary passes, on a resumed walk, a record
                     // that needs room.
                     if cfg!(inf_canary_recover_skip_on_resume) && self.walk.resumed {
-                        self.pass(u64::from(bytes));
+                        self.pass(u64::from(bytes), 1);
                         return Ok(SectionFlow::Next);
                     }
                     match self.make_room(ns)? {
@@ -280,7 +299,7 @@ impl<F: SegmentFs + Clone> IckWalk<io::Error> for IckWalker<'_, F> {
                     }
                 }
             }
-            self.pass(u64::from(bytes));
+            self.pass(u64::from(bytes), 1);
             return Ok(SectionFlow::Next);
         }
     }
@@ -417,8 +436,11 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 }
                 IckStep::Parked => {
                     self.drain_into(budget);
+                    // A walk parks metered, every item it passed charged: the
+                    // step's work is its charge and the bytes it left.
+                    debug_assert_eq!(walk.charged, walk.passed, "a parked walk is metered");
                     if !walk.resumed {
-                        self.step_parked_bytes = walk.unpaid();
+                        self.step_parked_bytes = walk.unwalked_bytes();
                     }
                     let facts = &mut self.stats.step;
                     match stop {

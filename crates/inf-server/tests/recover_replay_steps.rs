@@ -970,7 +970,8 @@ fn replay_record_unit(record: u64) -> u64 {
 /// of `RECOVERY_UNITS` (`Recovery::unit_row`), its observed work — priced
 /// from the counting filesystem — is at most the budget, the row's unit `U`
 /// from `unit_of` (computed by the test, never by the engine) and the
-/// reader's one read chunk on a frame row. The end settle's last step runs
+/// reader's one read chunk on a frame row; and its work gauge reads within
+/// what the step did ([`gauge_over`]). The end settle's last step runs
 /// the hand-over and the log resume, which the hand-over phase's own steps
 /// will cut, and is not judged here. Returns the steps over the bound, the
 /// recovery's stats and the recovered keyspace; a step that refuses is the
@@ -1026,7 +1027,8 @@ fn judged_boot_logged(
         if row.budgeted && !last_settle {
             let chunk =
                 if row.entry == UnitEntry::Frame { inf_log::DEFAULT_READ_CHUNK as u64 } else { 0 };
-            let bound = budget.saturating_add(unit_of(row.phase)).saturating_add(chunk);
+            let unit = unit_of(row.phase);
+            let bound = budget.saturating_add(unit).saturating_add(chunk);
             if work.priced() > bound {
                 over.push(format!(
                     "step {step} ({:?}): {} budget bytes of work over the bound {bound} \
@@ -1035,6 +1037,14 @@ fn judged_boot_logged(
                     work.priced()
                 ));
             }
+            let gauge = Gauge {
+                work: recovery.step_work_bytes(),
+                boot_charge: recovery.step_charge_bytes(),
+                reader_bytes: work.reader_bytes,
+            };
+            if let Some(reading) = gauge_over(row.entry, budget, unit, gauge) {
+                over.push(format!("step {step} ({:?}): {reading}", row.phase));
+            }
         }
         if progress == RecoveryProgress::Complete {
             break;
@@ -1042,6 +1052,48 @@ fn judged_boot_logged(
     }
     let (_rotor, stats, _seed) = recovery.finish();
     (over, Ok(stats), ks, log)
+}
+
+/// One step's work gauge (`Recovery::step_work_bytes`), its boot I/O charge
+/// (`Recovery::step_charge_bytes`) and the reader bytes its filesystem
+/// returned.
+#[derive(Copy, Clone, Debug)]
+struct Gauge {
+    work: u64,
+    boot_charge: u64,
+    reader_bytes: u64,
+}
+
+/// The slack of a step with no boot I/O on a row with no frame, in bytes:
+/// one item that crosses the budget (every unit judged here holds items
+/// under a block: 80-byte records, entries of at most 22 bytes at the
+/// 64-byte RAM price), the framing a finished section charges at its end
+/// (its header, CRC and padding) and the padding of the section the step
+/// parked in, which the walk reads when it hops past it.
+const GAUGE_SLACK: u64 = 3 * inf_log::ckpt::ICK_BLOCK_ALIGN as u64;
+
+/// The work gauge against what the step did (ADR-0174 A1.2): a step's work
+/// is what it charged plus the bytes of the frame or section it entered and
+/// parked in, never their price. On a frame row the gauge is within `B + U`
+/// (B1). Off it, a step parks only in a section it entered, whose block it
+/// read at its entry, so the gauge is within `B`, the bytes the step read
+/// and [`GAUGE_SLACK`] where the step charged no boot I/O, or `U` in its
+/// place where it did. `Some` names the over-read.
+fn gauge_over(
+    entry: inf_server::UnitEntry,
+    budget: u64,
+    unit: u64,
+    gauge: Gauge,
+) -> Option<String> {
+    let bound = match entry {
+        inf_server::UnitEntry::Frame => budget.saturating_add(unit),
+        inf_server::UnitEntry::Section | inf_server::UnitEntry::None => {
+            let slack = if gauge.boot_charge == 0 { GAUGE_SLACK } else { unit };
+            budget.saturating_add(gauge.reader_bytes).saturating_add(slack)
+        }
+    };
+    (gauge.work > bound)
+        .then(|| format!("GAUGE: a work gauge of {} over {bound} ({gauge:?})", gauge.work))
 }
 
 /// The yields inside a unit a boot made (ADR-0174 A1.2's liveness
@@ -1791,7 +1843,9 @@ fn a_records_section_of_rewrites_of_cold_keys_is_loaded_under_the_step_judge() {
 /// the RAM unit price), and the end of the checkpoint's list of the refs
 /// the image load settled, released a batch a step at the RAM price, in
 /// settle order. Every judged step's work — its reader bytes, its I/O and
-/// its RAM units at their prices — is within `B + U`; the checkpoint's
+/// its RAM units at their prices — is within `B + U`, and the work gauge of
+/// a step that parks in an entry section adds the section's bytes it left,
+/// never their price (the judge's `GAUGE`); the checkpoint's
 /// entries are all applied, the boot yields inside a section, and the list
 /// it walks is longer than one step buys; and no step applies or releases
 /// more than its budget buys at their price, plus one. Red where an entry
