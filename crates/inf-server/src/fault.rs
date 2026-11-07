@@ -58,6 +58,11 @@
 //!   ahead): the origin rolls the `CREATE` back (ADR-0108 D3) — drops its own copy, persists the
 //!   drop and waits for the swap, then fans `DROP` to every peer (ADR-0186 D1) — and answers the
 //!   leg's error; no cell serves the namespace and `META` never names it after the reply
+//! - `ns_create_origin_refused` — `plane::ns_ddl::program_ns_create` (after the catalog writer
+//!   accepted the `CREATE` and its `META` swap returned, in place of the origin's own
+//!   `ns_create`) — the origin's store refuses the apply: the deterministic stand-in for any
+//!   refusal of that apply after the swap (ADR-0148 D5), answered as the program answers the
+//!   store's (crash-matrix row `origin-refusal-answered`)
 //! - `mset_midway_oom` — `exec::mset` + `exec::msetnx` (the apply loops, pairs ≥ 2) — a multi-key
 //!   write fails mid-way after applying a prefix (the deterministic stand-in for arena OOM — review
 //!   of 2026-08-30, H2/F-L17-11, ADR-0098): the reply is the error, and the durable emission gate
@@ -89,6 +94,7 @@ pub const NS_DROP_BEFORE_META: &str = "ns_drop_before_meta";
 pub const NS_DROP_AFTER_META: &str = "ns_drop_after_meta";
 pub const NS_CREATE_AFTER_META: &str = "ns_create_after_meta";
 pub const NS_CREATE_FAN_REFUSED: &str = "ns_create_fan_refused";
+pub const NS_CREATE_ORIGIN_REFUSED: &str = "ns_create_origin_refused";
 pub const DDL_REQUEST_HELD: &str = "ddl_request_held";
 pub const NS_CREATE_LEG_HELD: &str = "ns_create_leg_held";
 
@@ -104,6 +110,7 @@ pub const ALL: &[&str] = &[
     NS_DROP_AFTER_META,
     NS_CREATE_AFTER_META,
     NS_CREATE_FAN_REFUSED,
+    NS_CREATE_ORIGIN_REFUSED,
     DDL_REQUEST_HELD,
     NS_CREATE_LEG_HELD,
 ];

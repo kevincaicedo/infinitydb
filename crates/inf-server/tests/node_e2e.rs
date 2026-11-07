@@ -10852,3 +10852,7 @@ fn a_tiered_drop_frees_its_origins_tier_files_without_a_restart() {
 /// Namespace ids at the node, in a file of their own.
 #[path = "node_e2e/ns_ids.rs"]
 mod ns_ids;
+
+/// A `CREATE` its origin refuses after the catalog swap, in a file of its own.
+#[path = "node_e2e/ns_create_refused.rs"]
+mod ns_create_refused;

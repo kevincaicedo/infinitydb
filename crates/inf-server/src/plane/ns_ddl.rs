@@ -731,11 +731,19 @@ async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     if inf_foundation::fault::fire(crate::fault::NS_CREATE_AFTER_META) {
         return error_reply(shared, proto, "ERR fault: ns_create_after_meta");
     }
-    if let Err(e) = shared.store.borrow_mut().ns_create(spec.clone()) {
+    // Crash-matrix point (ADR-0148 D5): the origin's own store refuses
+    // the apply after the swap, in place of `ns_create` (test builds only).
+    let refused = if inf_foundation::fault::fire(crate::fault::NS_CREATE_ORIGIN_REFUSED) {
+        Some(error_reply(shared, proto, "ERR fault: ns_create_origin_refused"))
+    } else {
+        let created = shared.store.borrow_mut().ns_create(spec.clone());
+        created.err().map(|e| ns_error_reply(shared, proto, e))
+    };
+    if let Some(refusal) = refused {
         // The OS refused the ring reservation (the one check validation
         // cannot run ahead): the notice retires the pending entry and a
         // later persist drops the definition (recorded residual).
-        return ns_error_reply(shared, proto, e);
+        return refusal;
     }
     let fan = create_fan(&spec);
     let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();

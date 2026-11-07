@@ -247,6 +247,17 @@ tier = "node"
 platform = "linux"
 test = "inf-server::node_e2e::create_with_a_refused_fan_leg_rolls_back_on_every_cell"
 expect = "create-rolled-back"
+# ADR-0148 D5: the origin's own store refuses its `CREATE` after the catalog
+# swap (`ns_create_origin_refused`, in place of the origin's `ns_create`).
+#   origin-refusal-answered — the refusal is the reply; no cell serves the
+#                         refused definition in that life; the name's next
+#                         `CREATE` is acked, and a restart serves that one
+[[row]]
+point = "ns_create_origin_refused"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::ns_create_refused::an_origin_refused_create_answers_and_its_name_creates_again"
+expect = "origin-refusal-answered"
 
 [[row]]
 point = "mset_midway_oom"
