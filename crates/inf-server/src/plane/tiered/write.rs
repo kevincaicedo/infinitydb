@@ -612,7 +612,8 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         let guard = WriteGuard::of(&resolved);
         let (old, old_value): (Displaced, Option<Vec<u8>>) = match resolved {
             Resolved::Miss => (None, None),
-            Resolved::Ram(addr) => {
+            Resolved::Ram(inline) => {
+                let addr = inline.addr();
                 let ks = shared.store.borrow();
                 let table = ks.tiered_store(ns).expect("resolved on this table");
                 let parts = table.record(addr);
@@ -847,7 +848,8 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
             let guard = WriteGuard::of(&resolved);
             match resolved {
                 Resolved::Miss => (None, None, guard),
-                Resolved::Ram(addr) => {
+                Resolved::Ram(inline) => {
+                    let addr = inline.addr();
                     let ks = shared.store.borrow();
                     let table = ks.tiered_store(ns).expect("resolved on this table");
                     let parts = table.record(addr);
@@ -1333,7 +1335,8 @@ async fn resolve_delete_target<O: PlaneObserver + 'static, F: SegmentFs + Clone 
 ) -> Result<Option<DeleteTarget>, OwnedReply> {
     let target = match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {
         Resolved::Miss => None,
-        Resolved::Ram(addr) => {
+        Resolved::Ram(inline) => {
+            let addr = inline.addr();
             let ks = shared.store.borrow();
             let table = ks.tiered_store(ns).expect("resolved on this table");
             let parts = table.record(addr);

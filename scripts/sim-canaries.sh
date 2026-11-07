@@ -55,6 +55,10 @@ rows=(
   # (`plane/tiered.rs::read_value`), so both rows prove those teeth.
   "inf_canary_reply_lie m2-durable REPLY"
   "inf_canary_reply_lie m4-tiered REPLY"
+  # Issue #11: the re-resolve after a cold wait takes a RAM record as
+  # inline without reading its type, so a GET beside a read that promoted
+  # a blob's 24-byte reference serves the reference (phase 7d's pair).
+  "inf_canary_promoted_extent_inline m4-tiered PROMOTED-EXTENT"
   # ADR-0139 D2 rule 2 at the wire tier: the alias view is always empty,
   # so `DEL` of one alias takes the shared entry from the survivor — the
   # `m45-backfill` alias leg's from-scratch truth must see it.

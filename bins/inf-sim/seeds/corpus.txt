@@ -53,3 +53,8 @@ m4-recovery 0xC10073
 m4-recovery 0xC10093
 m4-recovery 0xC103D7
 m4-recovery 0xC11D7E
+# Issue #11 (nightly of 2026-11-06, run 42199911373): a re-pressure
+# writer's GET re-resolved after its cold wait onto a blob's 24-byte
+# reference a concurrent read had promoted, and served the reference.
+# Red at main's d727e18d; phase 7d plants the shape on every seed.
+m4-tiered 0xd34f8c9b

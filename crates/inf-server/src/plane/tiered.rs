@@ -79,12 +79,42 @@ pub(super) enum TieredReply {
     },
 }
 
+/// A RAM record whose bytes are its value. A `StringExtent` record's RAM
+/// bytes are its 24-byte extent reference (ADR-0061 D1), so the one
+/// constructor reads the type tag first: a [`Resolved::Ram`] cannot name
+/// a reference (issue #11, a promoted reference served as the value).
+mod inline {
+    use inf_store::{LogicalAddr, TieredTable, TypeTag};
+
+    #[derive(Copy, Clone)]
+    pub(super) struct InlineAddr(LogicalAddr);
+
+    impl InlineAddr {
+        /// `None` for a `StringExtent` record: its value is in the extent.
+        pub(super) fn of(table: &TieredTable, addr: LogicalAddr) -> Option<InlineAddr> {
+            (table.record(addr).type_tag != TypeTag::StringExtent).then_some(InlineAddr(addr))
+        }
+
+        /// Planted-bug canary (`scripts/sim-canaries.sh`): the post-wait
+        /// re-resolve takes its RAM record as inline without the tag.
+        #[cfg(inf_canary_promoted_extent_inline)]
+        pub(super) fn unchecked(addr: LogicalAddr) -> InlineAddr {
+            InlineAddr(addr)
+        }
+
+        pub(super) fn addr(self) -> LogicalAddr {
+            self.0
+        }
+    }
+}
+use inline::InlineAddr;
+
 /// One resolved key.
 enum Resolved {
     Miss,
-    /// RAM-resident; the caller re-reads parts inside its own borrow
-    /// (no await separates resolution from use on the Ram arm).
-    Ram(LogicalAddr),
+    /// RAM-resident inline record; the caller re-reads parts inside its own
+    /// borrow (no await separates resolution from use on the Ram arm).
+    Ram(InlineAddr),
     /// Cold record fetched and key-verified (owned copy).
     Cold {
         addr: LogicalAddr,
@@ -446,6 +476,32 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     resolved
 }
 
+/// Serves a RAM-resident record by its type: an inline record as itself,
+/// a `StringExtent` record's value from its extent (chunked async reads).
+/// The probe's RAM arm and the re-resolve after a cold wait both come
+/// here — a reference a concurrent read promoted into RAM while this one
+/// waited is the second's case (issue #11). No await separates the
+/// caller's lookup from this borrow, so the table and the record stand.
+async fn resolve_ram<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    addr: LogicalAddr,
+) -> Resolved {
+    let (ext, version, encoded_len) = {
+        let ks = shared.store.borrow();
+        let table = ks.tiered_store(ns).expect("resolved on this table");
+        if let Some(inline) = InlineAddr::of(table, addr) {
+            return Resolved::Ram(inline);
+        }
+        let parts = table.record(addr);
+        (inf_store::ExtentRef::decode(parts.value), parts.version, parts.encoded_len)
+    };
+    match fetch_extent(shared, ns, ext).await {
+        Some(value) => Resolved::Extent { addr, value, version, encoded_len },
+        None => Resolved::Fail(ERR_BLOB_READ),
+    }
+}
+
 async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
@@ -457,29 +513,7 @@ async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
     let mut replans: u8 = 0;
     'attempt: loop {
         let plan = match probe(shared, ns, key, hash, &exclude, 0, TieredTable::RECORD_HEADER_LEN) {
-            Probe::Ram(addr) => {
-                // Blob-resident RAM records carry a 24-byte reference —
-                // fetch the value from the extent (chunked async reads).
-                let ext = {
-                    let ks = shared.store.borrow();
-                    let table = ks.tiered_store(ns).expect("resolved on this table");
-                    let parts = table.record(addr);
-                    (parts.type_tag == inf_store::TypeTag::StringExtent).then(|| {
-                        (
-                            inf_store::ExtentRef::decode(parts.value),
-                            parts.version,
-                            parts.encoded_len,
-                        )
-                    })
-                };
-                let Some((ext, version, encoded_len)) = ext else {
-                    return Resolved::Ram(addr);
-                };
-                return match fetch_extent(shared, ns, ext).await {
-                    Some(value) => Resolved::Extent { addr, value, version, encoded_len },
-                    None => Resolved::Fail(ERR_BLOB_READ),
-                };
-            }
+            Probe::Ram(addr) => return resolve_ram(shared, ns, addr).await,
             Probe::Miss => return Resolved::Miss,
             Probe::Fail("__replan") => {
                 replans += 1;
@@ -500,6 +534,9 @@ async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
         // Re-resolve after the resume; decode inside the borrow.
         enum After {
             Serve(Resolved),
+            /// The key is RAM-resident after the wait (a promotion or a
+            /// write moved it): served by its type outside the borrow.
+            ServeRam(LogicalAddr),
             /// Key-verified single-window fetch: the verbatim image
             /// serves (and may promote) outside the borrow.
             ServeCold {
@@ -517,7 +554,10 @@ async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
                 return Resolved::Fail("ERR the selected namespace was dropped (INF.NS USE again)");
             };
             match table.lookup(key, hash, &exclude) {
-                TieredLookup::Ram(promoted) => After::Serve(Resolved::Ram(promoted)),
+                #[cfg(not(inf_canary_promoted_extent_inline))]
+                TieredLookup::Ram(now) => After::ServeRam(now),
+                #[cfg(inf_canary_promoted_extent_inline)]
+                TieredLookup::Ram(now) => After::Serve(Resolved::Ram(InlineAddr::unchecked(now))),
                 TieredLookup::Miss => After::Serve(Resolved::Miss),
                 TieredLookup::Cold(now) if now != addr => After::Retry,
                 TieredLookup::Cold(_) => done.bytes(|window| {
@@ -560,6 +600,7 @@ async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
             After::ServeCold { image } => {
                 return serve_cold_image(shared, ns, hash, addr, image, promote).await;
             }
+            After::ServeRam(now) => return resolve_ram(shared, ns, now).await,
             After::Serve(resolved) => return resolved,
             After::Retry => {
                 if !exclude.contains(&addr) {
@@ -634,7 +675,8 @@ async fn read_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let mut w = RespWriter::new(reply.reply(), proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Miss => w.null(),
-        Resolved::Ram(addr) => {
+        Resolved::Ram(inline) => {
+            let addr = inline.addr();
             let ks = shared.store.borrow();
             let table = ks.tiered_store(ns).expect("resolved on this table");
             // Planted-bug canary (ADR-0129 A1, `scripts/sim-canaries.sh`):
@@ -668,7 +710,8 @@ async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         let hash = shared.hasher.hash(key);
         let mut w = RespWriter::new(reply.reply(), proto);
         match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
-            Resolved::Ram(addr) => {
+            Resolved::Ram(inline) => {
+                let addr = inline.addr();
                 let ks = shared.store.borrow();
                 let table = ks.tiered_store(ns).expect("resolved on this table");
                 w.bulk(table.record(addr).value);
@@ -724,7 +767,8 @@ async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let mut w = RespWriter::new(reply.reply(), proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Miss => w.int(0),
-        Resolved::Ram(addr) => {
+        Resolved::Ram(inline) => {
+            let addr = inline.addr();
             let ks = shared.store.borrow();
             let table = ks.tiered_store(ns).expect("resolved on this table");
             w.int(table.record(addr).value.len() as i64);
@@ -797,7 +841,8 @@ async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     };
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Miss => w.bulk(b""),
-        Resolved::Ram(addr) => {
+        Resolved::Ram(inline) => {
+            let addr = inline.addr();
             let ks = shared.store.borrow();
             let table = ks.tiered_store(ns).expect("resolved on this table");
             slice_of(table.record(addr).value, &mut w);

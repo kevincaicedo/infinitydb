@@ -486,6 +486,11 @@ pub struct TieredNodeReport {
     pub rebuilt_same_key_twins: u64,
     pub rebuilt_fill_sets: u64,
     pub rebuilt_reboots: u64,
+    /// Phase 7d (issue #11): pairs of GETs of one cold blob key in flight
+    /// together where both reads went cold and the pair promoted the
+    /// record — the pairs whose second read re-resolved onto the promoted
+    /// extent reference.
+    pub promoted_extent_pairs: u64,
 }
 
 impl TieredNodeReport {

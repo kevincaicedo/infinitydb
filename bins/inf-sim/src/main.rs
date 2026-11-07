@@ -874,6 +874,7 @@ fn main() {
             let mut rebuilt_same_key_twins = 0u64;
             let mut rebuilt_fill_sets = 0u64;
             let mut rebuilt_reboots = 0u64;
+            let mut promoted_extent_pairs = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
@@ -892,6 +893,7 @@ fn main() {
                 rebuilt_same_key_twins += report.rebuilt_same_key_twins;
                 rebuilt_fill_sets += report.rebuilt_fill_sets;
                 rebuilt_reboots += report.rebuilt_reboots;
+                promoted_extent_pairs += report.promoted_extent_pairs;
                 open_seeds += u64::from(report.open_rows);
                 open_tickets += report.open_tickets;
                 open_drains += report.open_dbsize_drains;
@@ -986,7 +988,8 @@ fn main() {
                  read after resume; rebuilt multi-ticket rows on {rebuilt_seeds} seeds: \
                  {rebuilt_tickets} tickets rebuilt, {rebuilt_multi_dels} DELs draining several, \
                  {rebuilt_same_key_twins} same-key twins among them, {rebuilt_fill_sets} filler \
-                 writes, {rebuilt_reboots} reboots"
+                 writes, {rebuilt_reboots} reboots; {promoted_extent_pairs} cold blob GET pairs \
+                 re-resolved onto a promoted reference"
             );
             println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
             if let Some(dir) = out_dir {
@@ -1023,7 +1026,8 @@ fn main() {
                      rebuilt_seeds={rebuilt_seeds} rebuilt_tickets={rebuilt_tickets} \
                      rebuilt_multi_dels={rebuilt_multi_dels} \
                      rebuilt_same_key_twins={rebuilt_same_key_twins} \
-                     rebuilt_fill_sets={rebuilt_fill_sets} rebuilt_reboots={rebuilt_reboots}\n"
+                     rebuilt_fill_sets={rebuilt_fill_sets} rebuilt_reboots={rebuilt_reboots} \
+                     promoted_extent_pairs={promoted_extent_pairs}\n"
                 );
                 std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
                     .expect("manifest");

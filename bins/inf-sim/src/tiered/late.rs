@@ -1,5 +1,6 @@
 //! The tiered scenario's late phases — 7c (a rebuilt winner carrying
-//! several tickets, ADR-0093 A10), 8 (DISKFULL clamp → typed refusal →
+//! several tickets, ADR-0093 A10), 7d (two GETs of one cold blob key in
+//! flight together, issue #11), 8 (DISKFULL clamp → typed refusal →
 //! reopen, ADR-0063), 9 (the S19 drop race through the wire), 10 and 10b
 //! (reboots after a DROP and a cut inside one, ADR-0100). Each phase is a
 //! straight-line script over [`Late`]; `Err(())` means "finish now" — the
@@ -51,6 +52,7 @@ pub(super) fn run(cx: &mut Late<'_>, node: Node, audit: MiniClient, total_keys: 
     } else {
         phase_7c(cx, node, audit, total_keys)?
     };
+    phase_7d(cx, &mut node, &mut audit)?;
     phase_8(cx, &mut node, &mut audit)?;
     phase_9(cx, &mut node, &mut audit)?;
     phase_10(cx, node)
@@ -405,6 +407,206 @@ fn phase_7c(
     let _ = s0_v1;
 
     Ok((node, audit))
+}
+
+/// Phase 7d's steps share these: a failure is on the report and `Err`
+/// ends the script.
+macro_rules! bail7d {
+    ($cx:expr, $($arg:tt)*) => {{
+        $cx.fail(format!($($arg)*));
+        return Err(());
+    }};
+}
+macro_rules! scrape7d {
+    ($cx:expr, $node:expr, $keys:expr) => {
+        match info_sum($node, $cx.rng, $cx.clock, $cx.disk, $cx.scenario, $keys) {
+            Ok(v) => v,
+            Err(err) => bail7d!($cx, "phase-7d scrape: {err}"),
+        }
+    };
+}
+macro_rules! call7d {
+    ($cx:expr, $node:expr, $client:expr, $cmd:expr, $want:expr, $what:expr) => {{
+        let want: &[u8] = $want;
+        match $client.call($node, $cx.rng, $cx.clock, $cx.disk, $cx.scenario.step_ns_max, $cmd) {
+            Ok(Some(reply)) if reply == want => {}
+            other => bail7d!(
+                $cx,
+                "PROMOTED-EXTENT VIOLATION seed {:#x}: {} answered {}, wanted {}",
+                $cx.scenario.seed,
+                $what,
+                other.map_or_else(
+                    |e| e.to_string(),
+                    |r| r.map_or("nothing".to_owned(), |r| preview(&r))
+                ),
+                preview(want)
+            ),
+        }
+        $cx.report.commands_done += 1;
+    }};
+}
+
+/// Phase 7d (issue #11, the nightly of 2026-11-06): two GETs of one cold
+/// blob key in flight together. The first read to resume is the key's
+/// second touch and promotes the record (ADR-0085 D2), a `StringExtent`
+/// whose RAM bytes are its 24-byte extent reference; the other read
+/// re-resolves after its own wait onto that RAM copy and must still serve
+/// the value from the extent, never the reference. A pair counts when
+/// both reads resolved cold and it promoted; a seed with no counted pair
+/// is a vacuous row.
+fn phase_7d(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
+    // A pair that finds its key in RAM (compaction's copy-forward moved it
+    // after its first touch) fills once more and asks again; the filter's
+    // tag survives a relocation, so the next cold pair is the second touch.
+    const PAIR_ATTEMPTS: u32 = 8;
+    // One hashtag: the keys and the filler share one owning cell, so the
+    // fill presses the cell whose head must pass the keys.
+    let keys: Vec<Vec<u8>> = (0..4).map(|i| format!("{{p7d}}promo:{i}").into_bytes()).collect();
+    // ≥ 6 KiB: above the namespace's 4 KiB `BLOB-THRESHOLD`, so each
+    // value lives in an extent and its record is the reference.
+    let values: Vec<Vec<u8>> =
+        (0..keys.len()).map(|i| value_bytes(b'q', 997, i as u64, (6 << 10) + 512 * i)).collect();
+    let wants: Vec<Vec<u8>> = values.iter().map(|value| bulk(value)).collect();
+    for (key, value) in keys.iter().zip(&values) {
+        call7d!(cx, node, audit, &[b"SET", key, value], b"+OK\r\n", "SET of a blob key");
+    }
+    let mut batches = cool_to_first_touch(cx, node, audit, &keys, &wants)?;
+    let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
+    let mut pair = [
+        MiniClient::connect(node, 0),
+        MiniClient::connect(node, usize::from(cx.scenario.cells) - 1),
+    ];
+    for client in &mut pair {
+        call7d!(cx, node, client, use_ns, b"+OK\r\n", "USE of a pair client");
+    }
+    let mut engaged = 0u64;
+    for (key, want) in keys.iter().zip(&wants) {
+        for _ in 0..PAIR_ATTEMPTS {
+            if promoting_pair(cx, node, &mut pair, key, want)? {
+                engaged += 1;
+                break;
+            }
+            fill_batch(cx, node, audit, batches)?;
+            batches += 1;
+        }
+    }
+    if engaged == 0 {
+        let seed = cx.scenario.seed;
+        bail7d!(
+            cx,
+            "PROMOTED-PAIR ROW VACUOUS seed {seed:#x}: none of {} keys' pairs both read cold and \
+             promoted in {PAIR_ATTEMPTS} attempts each",
+            keys.len()
+        );
+    }
+    cx.report.promoted_extent_pairs += engaged;
+    Ok(())
+}
+
+/// Phase 7d's filler: 32 inline writes on the keys' cell, then a few
+/// scheduler steps for MAINTAIN to demote and release.
+fn fill_batch(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient, batch: u64) -> Verdict {
+    const FILL_KEYS: u64 = 32;
+    for i in 0..FILL_KEYS {
+        let key = format!("{{p7d}}fill:{batch}:{i}").into_bytes();
+        let value = value_bytes(b'f', 997, batch * FILL_KEYS + i, 2048);
+        call7d!(cx, node, audit, &[b"SET", &key, &value], b"+OK\r\n", "filler SET");
+    }
+    for _ in 0..8 {
+        if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
+            bail7d!(cx, "phase-7d fill: {err}");
+        }
+    }
+    Ok(())
+}
+
+/// Phase 7d's cooling: filler batches until each key's GET is a verified
+/// cold read, its first touch (ADR-0085 D2). Bounded; a key still in RAM
+/// at the bound is a vacuous row. Returns the batches written.
+fn cool_to_first_touch(
+    cx: &mut Late<'_>,
+    node: &mut Node,
+    audit: &mut MiniClient,
+    keys: &[Vec<u8>],
+    wants: &[Vec<u8>],
+) -> Verdict<u64> {
+    const FILL_BATCHES_MAX: u64 = 64;
+    let seed = cx.scenario.seed;
+    let mut touched = vec![false; keys.len()];
+    let mut batches = 0u64;
+    while touched.iter().any(|t| !t) {
+        if batches == FILL_BATCHES_MAX {
+            let ram = touched.iter().filter(|t| !**t).count();
+            bail7d!(
+                cx,
+                "PROMOTED-PAIR ROW VACUOUS seed {seed:#x}: {batches} filler batches left {ram} \
+                 of {} blob keys without a cold first read",
+                keys.len()
+            );
+        }
+        fill_batch(cx, node, audit, batches)?;
+        batches += 1;
+        for (i, key) in keys.iter().enumerate() {
+            if touched[i] {
+                continue;
+            }
+            let before = scrape7d!(cx, node, &["tiering_promote_first_touch"])[0];
+            call7d!(cx, node, audit, &[b"GET", key], &wants[i], "a blob key's first GET");
+            touched[i] = scrape7d!(cx, node, &["tiering_promote_first_touch"])[0] > before;
+        }
+    }
+    Ok(batches)
+}
+
+/// Phase 7d's pair: two GETs of `key` from two connections in flight
+/// together; both must answer the value. `true` when both reads resolved
+/// cold and the pair promoted — the second read re-resolved onto the
+/// promoted reference.
+fn promoting_pair(
+    cx: &mut Late<'_>,
+    node: &mut Node,
+    pair: &mut [MiniClient; 2],
+    key: &[u8],
+    want: &[u8],
+) -> Verdict<bool> {
+    let seed = cx.scenario.seed;
+    let before = scrape7d!(cx, node, &["tiering_promotions", "tiering_cold_resolves"]);
+    for client in pair.iter_mut() {
+        client.send(node, &[b"GET", key]);
+    }
+    let mut replies: [Option<Vec<u8>>; 2] = [None, None];
+    let mut steps = 0u64;
+    while replies.iter().any(Option::is_none) {
+        if steps == STALL_STEPS {
+            cx.report.stalled = true;
+            bail7d!(cx, "PROMOTED-PAIR STALL seed {seed:#x}: the pair's GETs never both answered");
+        }
+        steps += 1;
+        cx.report.scheduler_steps += 1;
+        if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
+            bail7d!(cx, "phase-7d pair step: {err}");
+        }
+        for (client, reply) in pair.iter_mut().zip(&mut replies) {
+            if reply.is_none() {
+                *reply = client.recv(node);
+            }
+        }
+    }
+    cx.report.commands_done += 2;
+    for (side, reply) in replies.iter().flatten().enumerate() {
+        if reply != want {
+            bail7d!(
+                cx,
+                "PROMOTED-EXTENT VIOLATION seed {seed:#x}: GET {} in flight beside a promoting \
+                 read answered {} on pair client {side}, wanted {}",
+                preview(key),
+                preview(reply),
+                preview(want)
+            );
+        }
+    }
+    let after = scrape7d!(cx, node, &["tiering_promotions", "tiering_cold_resolves"]);
+    Ok(after[0] > before[0] && after[1] >= before[1] + 2)
 }
 
 /// Phase 8: DISKFULL clamp → typed refusal → reopen (ADR-0063).
