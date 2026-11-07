@@ -134,6 +134,14 @@ impl<F: SegmentFs + Clone> Log<F> {
 /// the end of replay, E12) and a delete verifies a demoted copy (E5).
 fn write_unit<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig, windows: u64) -> Unit {
     let mut log = Log::new(fs, cfg);
+    let model = write_unit_records(&mut log, windows);
+    drop(log);
+    make_durable(fs, cfg);
+    Unit { model }
+}
+
+/// [`write_unit`]'s records, into `log`; the model.
+fn write_unit_records<F: SegmentFs + Clone>(log: &mut Log<F>, windows: u64) -> Model {
     let mut model = Model::new();
     let mut bytes = 0u64;
     let mut next = 0u64;
@@ -171,9 +179,7 @@ fn write_unit<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig, windows: u64) -
     for (key, value) in late {
         model.insert(key, value);
     }
-    drop(log);
-    make_durable(fs, cfg);
-    Unit { model }
+    model
 }
 
 /// Every log file's bytes and name under a barrier (the sim disk tears
@@ -1027,8 +1033,9 @@ fn judged_boot(
 }
 
 /// One step's row of `RECOVERY_UNITS`, the RAM units and probe groups it
-/// ran and the renames its filesystem saw.
-#[derive(Copy, Clone, Debug)]
+/// ran, the renames and barriers its filesystem saw, and the tiered
+/// namespaces whose extent table it moved ([`extent_marks`]).
+#[derive(Clone, Debug)]
 struct StepUnits {
     phase: inf_server::UnitPhase,
     entries: u64,
@@ -1037,6 +1044,23 @@ struct StepUnits {
     seeded: u64,
     groups: u64,
     renames: u64,
+    barriers: u64,
+    moved: Vec<NsId>,
+}
+
+/// Each tiered namespace's extent table as the sweep seed moves it: its
+/// parked deaths not stamped yet and its extent observables (the queue, the
+/// quarantine revivals), in id order. A stamp, a seed and a revival each
+/// change it; the judge reads which namespace a step's units ran in.
+fn extent_marks(ks: &Keyspace) -> Vec<(NsId, usize, inf_store::ExtentStats)> {
+    let mut marks: Vec<_> = ks
+        .ns_iter()
+        .filter(|spec| spec.tier.is_some())
+        .filter_map(|spec| ks.tiered_store(spec.id).map(|table| (spec.id, table)))
+        .map(|(ns, table)| (ns, table.extent_parked_unstamped(), table.extent_stats()))
+        .collect();
+    marks.sort_unstable_by_key(|&(ns, _, _)| ns);
+    marks
 }
 
 /// [`judged_boot`], with every step's row and RAM units.
@@ -1053,6 +1077,7 @@ fn judged_boot_logged(
     // Bound: every step makes progress (the zero-budget row).
     for step in 0u64.. {
         let (before, units) = (fs.tally(), recovery.stats().units);
+        let marks = extent_marks(&ks);
         let yields_before = yields_in_unit(recovery.stats());
         let progress = match recovery.step(&mut ks, budget) {
             Ok(progress) => progress,
@@ -1070,6 +1095,12 @@ fn judged_boot_logged(
             seeded: after.sweep_seeded - units.sweep_seeded,
             groups: after.rebuild_groups - units.rebuild_groups,
             renames: work.renames,
+            barriers: work.barriers(),
+            moved: extent_marks(&ks)
+                .into_iter()
+                .filter(|mark| !marks.contains(mark))
+                .map(|(ns, _, _)| ns)
+                .collect(),
         });
         if row.budgeted {
             let chunk =
@@ -1367,8 +1398,13 @@ struct Recovered {
 impl Recovered {
     /// The state of [`TIER_NS`], the namespace every unit writes.
     fn tier(&self) -> &NsRecovered {
-        let found = self.namespaces.iter().find(|(ns, _)| *ns == TIER_NS);
-        &found.expect("the unit's tiered namespace").1
+        self.ns(TIER_NS)
+    }
+
+    /// The state of tiered namespace `ns`.
+    fn ns(&self, ns: NsId) -> &NsRecovered {
+        let found = self.namespaces.iter().find(|(id, _)| *id == ns);
+        &found.expect("a tiered namespace of the unit").1
     }
 }
 
@@ -2255,6 +2291,99 @@ const END_ORPHANS: u64 = 12_000;
 /// Live extent references whose files are quarantined (renamed back), and
 /// as many quarantined files no record names (second verdicts).
 const END_REVIVED: u64 = 64;
+/// The end unit's extents.
+const END_EXTENTS: Extents =
+    Extents { ns: TIER_NS, parked: END_PARKED, revived: END_REVIVED, orphans: END_ORPHANS };
+
+/// A tiered namespace's extents for the hand-over's sweep seed: `parked`
+/// extent references written and then deleted (replay deaths the seed
+/// stamps), `revived` live ones whose files are quarantined (renamed back),
+/// and in the namespace's directory a file for every dead extent, `orphans`
+/// more no record names (listed ids the seed queues), a quarantine twin for
+/// every live extent and `revived` more no record names (second verdicts).
+/// The ids: the dead from 1, then the live, the orphans and the
+/// unreferenced twins.
+#[derive(Copy, Clone)]
+struct Extents {
+    ns: NsId,
+    parked: u64,
+    revived: u64,
+    orphans: u64,
+}
+
+impl Extents {
+    /// The references' frames into `log`: every reference, dead and live,
+    /// then the dead ones deleted.
+    fn write_records<F: SegmentFs + Clone>(self, log: &mut Log<F>) {
+        let dead: Vec<(Vec<u8>, u64)> =
+            (1..=self.parked).map(|id| (format!("x:{id:06}").into_bytes(), id)).collect();
+        let live: Vec<(Vec<u8>, u64)> = (1..=self.revived)
+            .map(|j| (format!("q:{j:04}").into_bytes(), self.parked + j))
+            .collect();
+        for chunk in dead.chunks(512).chain(live.chunks(512)) {
+            let effects: Vec<MutationEffect<'_>> = chunk
+                .iter()
+                .map(|(key, id)| MutationEffect::StringSetExtent {
+                    ns: self.ns,
+                    key,
+                    extent_id: *id,
+                    offset: 0,
+                    len: 4096,
+                })
+                .collect();
+            log.frame(&effects);
+        }
+        for chunk in dead.chunks(512) {
+            let effects: Vec<MutationEffect<'_>> =
+                chunk.iter().map(|(key, _)| MutationEffect::Delete { ns: self.ns, key }).collect();
+            log.frame(&effects);
+        }
+    }
+
+    /// The files in the namespace's directory, under its barrier.
+    fn write_files<F: SegmentFs>(self, fs: &F, cfg: &DurableConfig) {
+        let cold = cold_dir_of(cfg, self.ns);
+        fs.create_dir_all(&cold).expect("the namespace's directory");
+        let file = |name: String| {
+            let mut file = fs.create_meta(&cold.join(name)).expect("an extent file");
+            file.write_at(0, b"extent").expect("its bytes");
+            file.sync_data().expect("its barrier");
+        };
+        let orphans = self.parked + self.revived;
+        let (plain, quarantined) = (inf_log::extent_file_name, inf_log::quarantined_file_name);
+        for id in (1..=self.parked).chain(orphans + 1..=orphans + self.orphans) {
+            file(plain(inf_log::ExtentId(id)));
+        }
+        let unreferenced = orphans + self.orphans;
+        for id in (self.parked + 1..=orphans).chain(unreferenced + 1..=unreferenced + self.revived)
+        {
+            file(quarantined(inf_log::ExtentId(id)));
+        }
+        fs.sync_dir(&cold).expect("the directory's barrier");
+    }
+
+    /// The listed ids: the dead extents' files and the orphans.
+    fn listed(self) -> u64 {
+        self.parked + self.orphans
+    }
+
+    /// The quarantined ids: the live extents' twins and the unreferenced
+    /// ones.
+    fn quarantined(self) -> u64 {
+        2 * self.revived
+    }
+
+    /// The reclaim queue after the hand-over: the stamped deaths, the
+    /// orphans and the second verdicts.
+    fn queued(self) -> u64 {
+        self.parked + self.orphans + self.revived
+    }
+
+    /// The largest id the directory lists, the last unreferenced twin's.
+    fn listed_max(self) -> u64 {
+        self.parked + self.revived + self.orphans + self.revived
+    }
+}
 
 /// The end phases' recovery unit: a first life of [`END_KEYS`] records and a
 /// checkpoint of its refs and live set, with no image; then a tail that
@@ -2298,48 +2427,12 @@ fn write_end_unit<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig) -> EndUnit 
         log.frame(&effects);
     }
     model.extend(rewrites.into_iter().map(|(key, value)| (key, Some(value))));
-    let dead: Vec<(Vec<u8>, u64)> =
-        (1..=END_PARKED).map(|id| (format!("x:{id:06}").into_bytes(), id)).collect();
-    let live: Vec<(Vec<u8>, u64)> =
-        (1..=END_REVIVED).map(|j| (format!("q:{j:04}").into_bytes(), END_PARKED + j)).collect();
-    for chunk in dead.chunks(512).chain(live.chunks(512)) {
-        let effects: Vec<MutationEffect<'_>> = chunk
-            .iter()
-            .map(|(key, id)| MutationEffect::StringSetExtent {
-                ns: TIER_NS,
-                key,
-                extent_id: *id,
-                offset: 0,
-                len: 4096,
-            })
-            .collect();
-        log.frame(&effects);
-    }
-    for chunk in dead.chunks(512) {
-        let effects: Vec<MutationEffect<'_>> =
-            chunk.iter().map(|(key, _)| MutationEffect::Delete { ns: TIER_NS, key }).collect();
-        log.frame(&effects);
-    }
+    END_EXTENTS.write_records(&mut log);
     drop(log);
     make_durable(fs, cfg);
     publish_tiered_checkpoint(fs, cfg, life, begin, &[], false);
-    let cold_dir = cold_dir(cfg);
-    let file = |name: String| {
-        let mut file = fs.create_meta(&cold_dir.join(name)).expect("an extent file");
-        file.write_at(0, b"extent").expect("its bytes");
-        file.sync_data().expect("its barrier");
-    };
-    let orphans = END_PARKED + END_REVIVED;
-    let (plain, quarantined) = (inf_log::extent_file_name, inf_log::quarantined_file_name);
-    for id in (1..=END_PARKED).chain(orphans + 1..=orphans + END_ORPHANS) {
-        file(plain(inf_log::ExtentId(id)));
-    }
-    let unreferenced = orphans + END_ORPHANS;
-    for id in (END_PARKED + 1..=orphans).chain(unreferenced + 1..=unreferenced + END_REVIVED) {
-        file(quarantined(inf_log::ExtentId(id)));
-    }
-    fs.sync_dir(&cold_dir).expect("the directory's barrier");
-    EndUnit { model, listed: END_PARKED + END_ORPHANS, quarantined: 2 * END_REVIVED }
+    END_EXTENTS.write_files(fs, cfg);
+    EndUnit { model, listed: END_EXTENTS.listed(), quarantined: END_EXTENTS.quarantined() }
 }
 
 /// `U` for the end unit: a frame's entry and one record's unit on the
@@ -2453,13 +2546,167 @@ fn every_budget_recovers_the_end_of_the_unparked_boot() {
     let (model, control) = boot(u64::MAX);
     assert_model(&control.served, &model, "the control boot");
     let queued = control.tier().reclaim.len() as u64;
-    assert_eq!(queued, END_PARKED + END_ORPHANS + END_REVIVED, "VACUOUS: {queued} queued");
+    assert_eq!(queued, END_EXTENTS.queued(), "VACUOUS: {queued} queued");
     assert_eq!(control.blob_revived, END_REVIVED, "VACUOUS: no revive rename");
     assert!(control.shadow_settle_reads > 0, "VACUOUS: no slot past the ticket cap");
-    // The largest listed id is the last unreferenced quarantined one.
-    let listed_max = END_PARKED + END_REVIVED + END_ORPHANS + END_REVIVED;
     let cursor = control.tier().next_extent_id;
-    assert_eq!(cursor, listed_max + 1, "the extent id cursor passes every listed id");
+    assert_eq!(cursor, END_EXTENTS.listed_max() + 1, "the extent id cursor passes every listed id");
+    for budget in [8 << 20, 256 << 10, 4 << 10, 1, 0] {
+        let (model, state) = boot(budget);
+        assert_model(&state.served, &model, &format!("BUDGET INDEPENDENCE at {budget}"));
+        assert_same(&state, &control, budget);
+    }
+}
+
+// ---- two tiered namespaces: the hand-over takes them in turn ----
+
+/// The second tiered namespace of the two-namespace unit, handed over after
+/// [`TIER_NS`].
+const SECOND_NS: NsId = NsId(18);
+/// Its extents: at 256 KiB its stamps, its seeds and its renames each
+/// outgrow a step.
+const SECOND_EXTENTS: Extents =
+    Extents { ns: SECOND_NS, parked: 6_000, revived: 8, orphans: 6_000 };
+
+/// [`tiered_keyspace`] plus [`SECOND_NS`] at the same smallest window.
+fn two_tier_keyspace() -> Keyspace {
+    let mut ks = tiered_keyspace();
+    ks.ns_create(NsSpec {
+        id: SECOND_NS,
+        name: b"warm".to_vec(),
+        mode: NsMode::Durable,
+        fsync: Some(FsyncClass::Always),
+        policy: None,
+        maxmemory: None,
+        tier: Some(TierSpec::for_budget(MEM_BUDGET)),
+    })
+    .expect("the second tiered ns");
+    ks
+}
+
+/// The two-namespace unit: in [`TIER_NS`], [`write_unit`]'s records over
+/// three windows, so its boot demotes and its machine holds an open boot
+/// file, which its hand-over seals under a barrier; in [`SECOND_NS`],
+/// [`SECOND_EXTENTS`]. No MANIFEST: both recover through the empty section.
+/// Returns [`TIER_NS`]'s model.
+fn write_two_ns_unit<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig) -> Model {
+    let mut log = Log::new(fs, cfg);
+    let model = write_unit_records(&mut log, 3);
+    SECOND_EXTENTS.write_records(&mut log);
+    drop(log);
+    make_durable(fs, cfg);
+    SECOND_EXTENTS.write_files(fs, cfg);
+    model
+}
+
+/// `U` for the two-namespace unit: a frame's entry and one record's unit on
+/// the replay row — its largest record a 4 KiB value's — and a record
+/// settled against its twin on the end settle's.
+fn two_ns_unit_of() -> impl Fn(inf_server::UnitPhase) -> u64 {
+    let record = (TieredTable::RECORD_HEADER_LEN + key(0).len() + VALUE_LEN) as u64;
+    move |phase| match phase {
+        inf_server::UnitPhase::Replay => FRAME_BYTES_MAX + replay_record_unit(record),
+        inf_server::UnitPhase::Settle => record + inf_store::limits::SETTLE_READ_CHARGE_BYTES,
+        other => panic!("the two-namespace unit judges no {other:?} step"),
+    }
+}
+
+/// Two tiered namespaces handed over in turn, at a 256 KiB budget under the
+/// step judge: [`TIER_NS`]'s boot demotes, so its hand-over ends at the seal
+/// of its open boot file, priced at a barrier past the budget; then every
+/// stage of [`SECOND_NS`]'s from its first — its sweep seed stamps, seeds
+/// and renames back what its extents hold, a batch a step. Every judged
+/// step's work is within `B + U`. The hand-over takes the namespaces in id
+/// order, so no step moves [`SECOND_NS`]'s extent table before the step
+/// that seals [`TIER_NS`] (`ORDER` otherwise); and at a budget under the
+/// barrier's price the seal spends its step, so the sealing step moves none
+/// of it (`SEAL` otherwise). The second machine starts at its stamps, so its
+/// counts are its extents' whole; the model reads back.
+#[test]
+fn two_tiered_namespaces_are_handed_over_in_turn_under_the_step_judge() {
+    const BUDGET: u64 = 256 << 10;
+    // A seal spends the step: its barrier's price passes the budget.
+    const _: () = assert!(BUDGET < inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES);
+    let fs = CountingFs::new();
+    let cfg = step_cfg();
+    let model = write_two_ns_unit(&fs, &cfg);
+    let (mut over, stats, mut ks, log) =
+        judged_boot_logged(&fs, &cfg, two_tier_keyspace(), BUDGET, &two_ns_unit_of());
+    let stats = stats.expect("the two-namespace unit boots");
+    let hand_over: Vec<(usize, &StepUnits)> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.phase == inf_server::UnitPhase::HandOver)
+        .collect();
+    let seals: Vec<usize> =
+        hand_over.iter().filter(|(_, row)| row.barriers > 0).map(|&(step, _)| step).collect();
+    assert_eq!(seals.len(), 1, "VACUOUS: one sealing step, the first namespace's: {seals:?}");
+    let seal = seals[0];
+    let (first, second) = (TIER_NS.0, SECOND_NS.0);
+    let mut second_steps = 0u64;
+    for &(step, row) in &hand_over {
+        if !row.moved.contains(&SECOND_NS) {
+            continue;
+        }
+        second_steps += 1;
+        if step < seal {
+            over.push(format!("ORDER: step {step} ran ns {second} before ns {first}'s seal"));
+        }
+        if step == seal {
+            over.push(format!("SEAL: step {step} sealed ns {first} and ran ns {second}"));
+        }
+    }
+    let units = stats.units;
+    eprintln!(
+        "two namespaces at {BUDGET}: {} over, {} hand-over steps, the seal at step {seal}, {} \
+         moving ns {second}, {units:?}, {} revived",
+        over.len(),
+        hand_over.len(),
+        second_steps,
+        stats.blob_revived
+    );
+    assert!(over.is_empty(), "JUDGE: {} steps over: {over:?}", over.len());
+    assert!(second_steps > 1, "VACUOUS: the second namespace's units fit one step");
+    let extents = SECOND_EXTENTS;
+    assert_eq!(units.sweep_stamped, extents.parked, "every parked death stamped once");
+    assert_eq!(units.sweep_seeded, extents.listed() + extents.quarantined(), "every id seeded");
+    assert_eq!(stats.blob_revived, extents.revived, "every referenced quarantined extent revived");
+    let table = ks.tiered_store_mut(SECOND_NS).expect("the second tiered ns");
+    let queued = table.extent_reclaim_work(u64::MAX, usize::MAX).len() as u64;
+    assert_eq!(queued, extents.queued(), "the second namespace's reclaim queue");
+    assert_eq!(table.extent_stats().live, extents.revived, "its live extents' references stand");
+    let (served, _, _) = read_back(&fs, &cfg, &mut ks, &model);
+    assert_model(&served, &model, "after the two-namespace unit");
+}
+
+/// Budget independence over two tiered namespaces: the two-namespace unit
+/// recovered at `u64::MAX` (the control, which hands both machines over in
+/// one step) and at 8 MiB, 256 KiB, 4 KiB, 1 and 0 recovers the same state
+/// in each namespace — table digest, directory byte for byte, extent
+/// references, reclaim queue in hand-out order with its origins, ticket
+/// rebuild counters and extent id cursor — and the same served values, D6
+/// counters and record counts.
+#[test]
+fn every_budget_recovers_two_tiered_namespaces_of_the_unparked_boot() {
+    let cfg = step_cfg();
+    // Each boot recovers its own copy of the unit, written the same way: a
+    // boot's tier files are the next boot's dead-life files (D4).
+    let boot = |budget: u64| {
+        let fs = CountingFs::new();
+        let model = write_two_ns_unit(&fs, &cfg);
+        let (state, stats) = boot_recovered(&fs, &cfg, two_tier_keyspace(), budget, &model);
+        if budget != u64::MAX && budget <= 256 << 10 {
+            engagement(&stats).expect("a small budget yields inside a unit");
+        }
+        (model, state)
+    };
+    let (model, control) = boot(u64::MAX);
+    assert_model(&control.served, &model, "the control boot");
+    assert!(control.counters.demote_steps > 0, "VACUOUS: {:?}", control.counters);
+    let second = control.ns(SECOND_NS);
+    assert_eq!(second.reclaim.len() as u64, SECOND_EXTENTS.queued(), "VACUOUS: its queue");
+    let cursor = second.next_extent_id;
+    assert_eq!(cursor, SECOND_EXTENTS.listed_max() + 1, "its cursor passes every listed id");
     for budget in [8 << 20, 256 << 10, 4 << 10, 1, 0] {
         let (model, state) = boot(budget);
         assert_model(&state.served, &model, &format!("BUDGET INDEPENDENCE at {budget}"));
