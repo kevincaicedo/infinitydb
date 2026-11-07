@@ -696,6 +696,14 @@ pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone +
     if !argv[0].eq_ignore_ascii_case(b"INF.NSFAN") {
         return false;
     }
+    // Test builds only: a test holds a `CREATE` leg here, so a write the
+    // origin acknowledges lands while the fan is in flight.
+    if argv.len() == 9
+        && argv[1].eq_ignore_ascii_case(b"CREATE")
+        && inf_foundation::fault::fire(crate::fault::NS_CREATE_LEG_HELD)
+    {
+        inf_foundation::fault::hold(crate::fault::NS_CREATE_LEG_HELD);
+    }
     let start = scratch.len();
     let reply = scratch.open();
     let mut w = RespWriter::new(reply, Protocol::Resp2);

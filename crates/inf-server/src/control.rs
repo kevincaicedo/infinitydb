@@ -1645,6 +1645,9 @@ pub struct ControlInbox {
     tombstones: DropTombstones,
     /// The writer's pending-create set (ADR-0103 D2) — inline too.
     pending: PendingCreates,
+    /// A persist [`ControlInbox::drain_persists`] took past its bound:
+    /// first in line for the next drain, so queue order holds.
+    next: Option<ControlMsg>,
 }
 
 impl std::fmt::Debug for ControlInbox {
@@ -1674,7 +1677,37 @@ impl ControlInbox {
         fs: &F,
         data_dir: &Path,
     ) -> std::io::Result<()> {
-        while let Ok(msg) = self.rx.try_recv() {
+        // Unbounded in persists; bounded by what the queue holds (256
+        // messages: senders block on a full queue).
+        self.drain_persists(fs, data_dir, u32::MAX).map(|_| ())
+    }
+
+    /// [`drain`](Self::drain), writing at most `persists_max` catalog
+    /// persists: a persist past the bound stays queued, first in line for
+    /// the next drain. Returns the persists written. Tests: a harness lets
+    /// one swap land and holds the next.
+    ///
+    /// # Errors
+    /// As [`drain`](Self::drain).
+    pub fn drain_persists<F: inf_log::fs::SegmentFs>(
+        &mut self,
+        fs: &F,
+        data_dir: &Path,
+        persists_max: u32,
+    ) -> std::io::Result<u32> {
+        let mut written = 0u32;
+        while let Some(msg) = self.next.take().or_else(|| self.rx.try_recv().ok()) {
+            let is_persist = match &msg {
+                ControlMsg::Persist(_) => true,
+                ControlMsg::StampDrop { .. }
+                | ControlMsg::CreateApplied { .. }
+                | ControlMsg::Unlink(_) => false,
+            };
+            if is_persist && written == persists_max {
+                self.next = Some(msg);
+                break;
+            }
+            written += u32::from(is_persist);
             match msg {
                 ControlMsg::Persist(req) => {
                     let (payload, epoch) =
@@ -1694,7 +1727,7 @@ impl ControlInbox {
                 }
             }
         }
-        Ok(())
+        Ok(written)
     }
 }
 
@@ -1738,6 +1771,7 @@ impl ControlHandle {
             handle: Arc::clone(&handle),
             tombstones,
             pending: PendingCreates::default(),
+            next: None,
         };
         (handle, inbox, issuers)
     }

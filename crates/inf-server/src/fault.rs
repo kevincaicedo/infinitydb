@@ -68,6 +68,9 @@
 //!   [`HoldGate`](inf_foundation::fault::HoldGate) it armed: the stand-in for a sender descheduled
 //!   between numbering its request and enqueuing it, so a test decides the order of two senders on
 //!   real threads
+//! - `ns_create_leg_held` — `plane::handle_ns_apply` (a peer's `INF.NSFAN CREATE` leg, before it is
+//!   read) — the peer waits there until released: a `CREATE` whose fan is in flight, so a write the
+//!   origin acknowledges in the new namespace lands inside the fan
 //!
 //! The sync-tier seal fsync has its own point (`inf_log::fault::FSYNC_ERR`);
 //! this one exists because the reactor tier defers the seal fsync through
@@ -85,6 +88,7 @@ pub const NS_DROP_AFTER_META: &str = "ns_drop_after_meta";
 pub const NS_CREATE_AFTER_META: &str = "ns_create_after_meta";
 pub const NS_CREATE_FAN_REFUSED: &str = "ns_create_fan_refused";
 pub const DDL_REQUEST_HELD: &str = "ddl_request_held";
+pub const NS_CREATE_LEG_HELD: &str = "ns_create_leg_held";
 
 /// Inventory for the CI coverage check.
 pub const ALL: &[&str] = &[
@@ -99,4 +103,5 @@ pub const ALL: &[&str] = &[
     NS_CREATE_AFTER_META,
     NS_CREATE_FAN_REFUSED,
     DDL_REQUEST_HELD,
+    NS_CREATE_LEG_HELD,
 ];

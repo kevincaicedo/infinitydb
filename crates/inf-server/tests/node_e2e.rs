@@ -228,6 +228,9 @@ type NsNames = std::collections::BTreeSet<Vec<u8>>;
 
 struct CatalogPump {
     hold: Arc<AtomicBool>,
+    /// Swaps the pump may still land while `hold` is set
+    /// ([`Node::land_held_persists`]): one lands, the next stays queued.
+    allow: Arc<std::sync::atomic::AtomicU32>,
     stop: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<()>,
 }
@@ -259,7 +262,15 @@ impl Node {
             Some(hold),
             None,
             None,
+            Vec::new(),
         )
+    }
+
+    /// Lets the held catalog writer land `n` more swaps while `hold`
+    /// stays set: a swap past them stays queued, first in line.
+    fn land_held_persists(&self, n: u32) {
+        let pump = self.catalog_pump.as_ref().expect("a held-catalog node");
+        pump.allow.fetch_add(n, Ordering::AcqRel);
     }
 
     /// Ends the node the way a power cut inside a held swap would: cell
@@ -297,6 +308,7 @@ impl Node {
             None,
             None,
             Some(held),
+            Vec::new(),
         )
     }
 
@@ -371,6 +383,7 @@ impl Node {
             None,
             None,
             None,
+            Vec::new(),
         )
     }
 
@@ -402,6 +415,7 @@ impl Node {
             None,
             None,
             None,
+            Vec::new(),
         )
     }
 
@@ -429,6 +443,7 @@ impl Node {
             None,
             Some(std::num::NonZeroU64::new(units).expect("headroom >= 1")),
             None,
+            Vec::new(),
         )
     }
 
@@ -638,6 +653,7 @@ impl Node {
             None,
             None,
             None,
+            Vec::new(),
         )
     }
 
@@ -658,6 +674,7 @@ impl Node {
         held_catalog: Option<Arc<AtomicBool>>,
         ckpt_headroom: Option<std::num::NonZeroU64>,
         held_clock: Option<HeldClock>,
+        holds: Vec<(u16, &'static str, inf_foundation::fault::HoldGate)>,
     ) -> Node {
         assert!(held_clock.is_none() || data_dir.is_none(), "a held clock boots a volatile node");
         let stop = Arc::new(AtomicBool::new(false));
@@ -713,24 +730,30 @@ impl Node {
                         boot_unix_ms,
                     );
                     let hold = Arc::clone(hold);
+                    let allow = Arc::new(std::sync::atomic::AtomicU32::new(0));
                     let pump_stop = Arc::new(AtomicBool::new(false));
                     let pump_dir = dir.clone();
                     let handle = {
                         let hold = Arc::clone(&hold);
+                        let allow = Arc::clone(&allow);
                         let pump_stop = Arc::clone(&pump_stop);
                         std::thread::spawn(move || {
                             while !pump_stop.load(Ordering::Relaxed) {
+                                let fs = inf_server::StdSegmentFs;
                                 if !hold.load(Ordering::Relaxed) {
-                                    inbox
-                                        .drain(&inf_server::StdSegmentFs, &pump_dir)
+                                    inbox.drain(&fs, &pump_dir).expect("held-catalog META swap");
+                                } else if let n @ 1.. = allow.load(Ordering::Acquire) {
+                                    let landed = inbox
+                                        .drain_persists(&fs, &pump_dir, n)
                                         .expect("held-catalog META swap");
+                                    allow.fetch_sub(landed, Ordering::AcqRel);
                                 }
                                 #[allow(clippy::disallowed_methods)] // harness thread
                                 std::thread::sleep(Duration::from_millis(1));
                             }
                         })
                     };
-                    catalog_pump = Some(CatalogPump { hold, stop: pump_stop, handle });
+                    catalog_pump = Some(CatalogPump { hold, allow, stop: pump_stop, handle });
                     (control, issuers)
                 }
             };
@@ -758,12 +781,18 @@ impl Node {
             let boot = boot.clone();
             let issuer = cell_issuers.get_mut(i).and_then(Option::take);
             let faults = faults.clone();
+            let holds = holds.clone();
             let default_ns = default_ns.clone();
             handles.push(std::thread::spawn(move || {
                 // M2-S16: arm this cell's fault plan before recovery — the
                 // registry is thread-local (cells are single-threaded, L1).
                 for &(point, spec) in &faults {
                     inf_foundation::fault::arm(point, spec);
+                }
+                // A hold is armed on the one cell it names: a gate no thread
+                // will reach keeps no handle alive on another cell.
+                for (_, point, gate) in holds.iter().filter(|(cell, ..)| usize::from(*cell) == i) {
+                    inf_foundation::fault::arm_hold(point, gate);
                 }
                 let pool = BufferPool::new(256, 4096);
                 // No fixed-buffer registration: it is a capability probe no
@@ -10556,4 +10585,137 @@ fn a_cut_inside_a_tiered_drop_wait_keeps_every_acked_key() {
             (ADR-0189 D5)"]
 fn a_walk_across_a_tiered_drop_wait_keeps_every_acked_key() {
     drop_wait_scenario(DropWaitNs::Tiered, DropWaitCheckpoint::WalksAcross, "dw-tiered-walk");
+}
+
+// ---- a cut inside a rolled-back CREATE's catalog wait ----
+//
+// A `CREATE` whose fan a peer refuses rolls back: it asks the catalog
+// writer for the swap that drops the namespace again and waits for its
+// answer. The `CREATE`'s own swap is durable by then, and the origin
+// served the namespace while its fan was in flight, so a write acknowledged
+// there is the client's to keep: a cut before the rollback's answer must
+// boot the catalog that names the namespace and serve that write (ADR-0189
+// D5, the rollback in the `DROP`'s order). The scenario lets the
+// `CREATE`'s swap land and holds the rollback's, holds the peer's `CREATE`
+// leg until a write on the origin is acknowledged, lets every cell publish
+// a checkpoint inside the rollback's wait or not, cuts, and reads the
+// write back. The control leg cuts at the same instant with no checkpoint.
+
+/// Keys the rolled-back scenario writes on the origin, and each value's
+/// length.
+const ROLLBACK_WAIT_KEYS: usize = 64;
+const ROLLBACK_WAIT_VALUE_BYTES: usize = 1 << 10;
+
+/// The rolled-back `CREATE`'s scenario: `checkpoint` publishes one on
+/// every cell inside the rollback's wait.
+fn rollback_wait_scenario(checkpoint: bool, tag: &str) {
+    let dir = temp_data_dir(tag);
+    let leg = inf_foundation::fault::HoldGate::new();
+    let hold = Arc::new(AtomicBool::new(true));
+    // A peer's first `CREATE` leg waits on `leg`, then is refused.
+    let node = Node::start_cfg_default(
+        2,
+        Some(dir.clone()),
+        CkptTrigger::Manual,
+        Default::default(),
+        vec![
+            (inf_server::fault::NS_CREATE_LEG_HELD, inf_foundation::fault::FaultSpec::Nth(1)),
+            (inf_server::fault::NS_CREATE_FAN_REFUSED, inf_foundation::fault::FaultSpec::Nth(1)),
+        ],
+        false,
+        false,
+        false,
+        None,
+        inf_log::SegmentIoMode::Buffered,
+        None,
+        Default::default(),
+        Some(hold),
+        None,
+        None,
+        vec![(1, inf_server::fault::NS_CREATE_LEG_HELD, leg.clone())],
+    );
+    let control = Arc::clone(node.control.as_ref().expect("a durable node"));
+    // The `CREATE`'s swap lands; the rollback's stays queued.
+    node.land_held_persists(1);
+    // Both connections land on cell 0 before the peer holds its leg: a
+    // connection that lands on the held peer is not answered.
+    let mut creator = conn_on_cell(&node, 0);
+    let mut writer = conn_on_cell(&node, 0);
+    creator
+        .write_all(&cmd(&[
+            b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"always",
+        ]))
+        .expect("write");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !leg.is_held() {
+        assert!(Instant::now() < deadline, "the CREATE never fanned its leg");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The fan is in flight: the origin serves the namespace, and every
+    // write here follows its fsync (`FSYNC always`).
+    writer.write_all(&cmd(&[b"INF.NS", b"USE", b"ledger"])).expect("write");
+    read_exactly(&mut writer, b"+OK\r\n");
+    let mut acked = Vec::new();
+    for key in keys_for_cell(2, 0, ROLLBACK_WAIT_KEYS) {
+        let mut value = [b"acked:".as_slice(), &key].concat();
+        value.resize(ROLLBACK_WAIT_VALUE_BYTES, b'.');
+        writer.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(&mut writer, b"+OK\r\n");
+        acked.push(AckedWrite { key, value, cell: 0 });
+    }
+    drop(writer);
+    // The peer refuses its leg; the origin rolls back and requests the
+    // swap that drops the namespace, which the held writer never lands.
+    let requested = control.persist_requests_sent();
+    leg.release();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while control.persist_requests_sent() == requested {
+        assert!(Instant::now() < deadline, "the rollback never requested its catalog swap");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let published_before = drop_wait_min_published(&node);
+    if checkpoint {
+        let epoch = node.request_ckpt_all();
+        drop_wait_published(&node, epoch);
+    } else {
+        assert_eq!(drop_wait_min_published(&node), published_before, "no checkpoint in the wait");
+    }
+    let origin_use = drop_wait_use_on(&node, 0, b"ledger");
+    drop(creator);
+    node.kill_without_catalog_drain();
+    let mut context = format!(
+        "a CREATE of 'ledger' rolled back after a refused leg, its rollback's swap never \
+         durable, checkpoint in the wait {checkpoint}; cell 0 answered USE in the wait: \
+         {origin_use:?}"
+    );
+    let misses = drop_wait_restart(&dir, DropWaitNs::Durable, &acked, &mut context);
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        misses.is_empty(),
+        "{} of {} writes acknowledged inside the CREATE's fan are not served after the restart \
+         (cell 0: {} of {} lost); first: {:?}\n  {context}",
+        misses.len(),
+        acked.len(),
+        misses.len(),
+        acked.len(),
+        &misses[..misses.len().min(4)]
+    );
+}
+
+/// A checkpoint of every cell that publishes while a rolled-back
+/// `CREATE` waits for the swap that drops it keeps every write the origin
+/// acknowledged inside the fan.
+#[test]
+#[ignore = "red until a CREATE rollback applies on its origin only after its catalog swap is \
+            durable (ADR-0189 D5)"]
+fn a_checkpoint_inside_a_rolled_back_create_wait_keeps_every_acked_key() {
+    rollback_wait_scenario(true, "rw-ckpt");
+}
+
+/// The control leg: the same cut, no checkpoint.
+#[test]
+fn a_cut_inside_a_rolled_back_create_wait_keeps_every_acked_key() {
+    rollback_wait_scenario(false, "rw-cut");
 }
