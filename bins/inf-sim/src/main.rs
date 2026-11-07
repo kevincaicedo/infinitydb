@@ -109,6 +109,7 @@ fn main() {
                         "lost-wakeup" => Plant::LostWakeup,
                         "fsync-lies" => Plant::FsyncLies,
                         "accept-error" => Plant::AcceptError,
+                        "accept-broken" => Plant::AcceptBroken,
                         "tier-read-eio" => Plant::TierReadEio,
                         "tier-write-eio" => Plant::TierWriteEio,
                         "stop-kill" => Plant::StopKill,
@@ -179,8 +180,8 @@ fn main() {
                     println!(
                         "inf-sim --scenario <name> (one of: {}) \
                          [--seed N|0xN] [--verify-determinism] \
-                         [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|\
-                         tier-write-eio|stop-kill] \
+                         [--plant lost-wakeup|fsync-lies|accept-error|accept-broken|\
+                         tier-read-eio|tier-write-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--replay-above-window] \
                          [--spec-variant ring-top|page] [--tier-leg {}] [--marks-leg {}] \
                          [--window-leg {}] [--wedge-leg {}] [--park-at-once] \
@@ -209,6 +210,12 @@ fn main() {
             eprintln!("inf-sim: {e}");
             std::process::exit(2);
         }
+    }
+    // The accept-broken plant is the accept-retry oracle's leg, m0-smoke's
+    // alone: refused on any other scenario before a runner starts.
+    if plant.is_accept_retry_leg() && scenario_name != "m0-smoke" {
+        eprintln!("inf-sim: --plant accept-broken is m0-smoke's");
+        std::process::exit(2);
     }
     // The two flags each force one of m4-recovery's seed classes, which a
     // seed runs one of: together they are refused, never one dropped.
