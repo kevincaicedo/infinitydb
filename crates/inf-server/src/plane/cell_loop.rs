@@ -166,9 +166,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 // it parks the arm, on an exhaustion or a broken-listener
                 // errno (`classify_accept_errno`); a transient one never
                 // surfaces. The accept-retry owner re-arms the listener a
-                // retry window later, the only way back for a broken one.
-                // Armed only from Idle: failures inside a window coalesce
-                // into its one arm.
+                // retry window later, the only way back for a broken one
+                // (ADR-0118 D2). Armed only from Idle: failures inside a
+                // window coalesce into its one arm.
                 if c.token.class() == TokenClass::Accept {
                     self.shared.accept_errors.set(self.shared.accept_errors.get() + 1);
                     // Canary: the failure re-arms the listener at once, the
