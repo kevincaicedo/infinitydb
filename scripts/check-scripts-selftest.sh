@@ -287,6 +287,19 @@ fixture() {
 # scope assertion refuses; each group that reads it builds it.
 fx_build_empty() { mkdir -p "$work/empty/crates"; }
 
+# fx_root_key <dir>: the target-root key of a checkout at <dir>, the first 16
+# hex digits of SHA-256 of its physical path, read by coreutils' sha256sum or
+# perl's shasum: an oracle that shares no code with scripts/target-root.sh.
+fx_root_key() {
+    local phys
+    phys=$(cd "$1" && pwd -P) || return 1
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$phys" | sha256sum | cut -c1-16
+    else
+        printf '%s' "$phys" | shasum -a 256 | cut -c1-16
+    fi
+}
+
 # ---------------------------------------------------------------- deny-list
 group_deny_list() {
 DENY=./scripts/check-cell-denylist.sh
@@ -1801,11 +1814,12 @@ printf 't/x\t%s::gone\tcast,arith\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
 expect red "lint-ratchet: an item scope naming no function is a scope error" rt_run "$root"
 printf 't/x\t%s\tcast,bogus\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
 expect red "lint-ratchet: an unknown lint family is a scope error" rt_run "$root"
-# The calls: both clippy passes run in the gate's own target directory under
-# the caller's target root, `${CARGO_TARGET_DIR:-target}/lint-ratchet` (a pass
-# in the recipe's target would re-check every member at each switch of lint
-# arguments), with the lint set the backlog counts. A stub cargo first on PATH
-# records each call; a copy of the gate with one part of a call changed is red.
+# The calls: both clippy passes run in the gate's own target directory,
+# `lint-ratchet-<key>` under the checkout's target root (a pass in the recipe's
+# target would re-check every member at each switch of lint arguments; the key
+# keeps a copied checkout's passes off the original's), with the lint set the
+# backlog counts. A stub cargo first on PATH records each call; a copy of the
+# gate with one part of a call changed is red.
 RT_BIN="$work/rt-bin"
 mkdir -p "$RT_BIN"
 IFS= read -r -d '' body <<'EOF' || true
@@ -1854,31 +1868,36 @@ PY
 # a real tree, so its status here is not the case's).
 expect_output "lint-ratchet: the verdict reads the recorded passes' report" \
     "lint-ratchet OK: no backlog" rt_call_run "$RATCHET" "$root"
-expect green "lint-ratchet: both passes name target/lint-ratchet, CARGO_TARGET_DIR unset" \
-    rt_calls_ok "$root.calls" target/lint-ratchet
+rt_key=$(fx_root_key "$root")
+rt_own="$(cd "$root" && pwd -P)/target/lint-ratchet-$rt_key"
+expect green "lint-ratchet: both passes name <root>/target/lint-ratchet-<key>, CARGO_TARGET_DIR unset" \
+    rt_calls_ok "$root.calls" "$rt_own"
 rt_target="$work/rt-target"
 rt_call_run "$RATCHET" "$root" "$rt_target" >/dev/null 2>&1 || true
-expect green "lint-ratchet: both passes name \$CARGO_TARGET_DIR/lint-ratchet when it is set" \
-    rt_calls_ok "$root.calls" "$rt_target/lint-ratchet"
+expect green "lint-ratchet: set, both passes name \$CARGO_TARGET_DIR/checkout-<key>/lint-ratchet-<key>" \
+    rt_calls_ok "$root.calls" "$rt_target/checkout-$rt_key/lint-ratchet-$rt_key"
 rt_mutant() { # <name> <sed expression> <CARGO_TARGET_DIR or ''> <what the copy does>
-    local dir="$work/rt-gate-$1" want=target/lint-ratchet
+    local dir="$work/rt-gate-$1" want=$rt_own
     rm -rf "${dir:?}"
     mkdir -p "$dir"
-    cp "$SCRIPT_DIR/lint_scope_table.py" "$dir/"
+    cp "$SCRIPT_DIR/lint_scope_table.py" "$SCRIPT_DIR/target-root.sh" "$dir/"
     sed "$2" "$RATCHET" >"$dir/check-lint-ratchet.sh"
     chmod +x "$dir/check-lint-ratchet.sh"
     if cmp -s "$RATCHET" "$dir/check-lint-ratchet.sh"; then
         echo "selftest: the lint-ratchet mutant '$1' changed nothing" >&2
         exit 2
     fi
-    [ -z "$3" ] || want="$3/lint-ratchet"
+    [ -z "$3" ] || want="$3/checkout-$rt_key/lint-ratchet-$rt_key"
     rt_call_run "$dir/check-lint-ratchet.sh" "$root" "$3" >/dev/null 2>&1 || true
     expect red "lint-ratchet: the calls' check is red on a gate that $4" rt_calls_ok "$root.calls" "$want"
 }
-rt_mutant shared 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/lint-ratchet"$|TARGET_DIR="${CARGO_TARGET_DIR:-target}"|' \
-    '' "shares the recipe's target directory"
-rt_mutant fixed 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/lint-ratchet"$|TARGET_DIR="target/lint-ratchet"|' \
-    "$rt_target" "ignores CARGO_TARGET_DIR"
+RT_KEPT='^    TARGET_DIR=$(target_root_kept lint-ratchet)$'
+rt_mutant shared "s|$RT_KEPT|    TARGET_DIR=\$TARGET_ROOT|" '' "shares the recipe's target directory"
+rt_mutant raw "s|$RT_KEPT|    TARGET_DIR=\"\${CARGO_TARGET_DIR:-target}/lint-ratchet-\$TARGET_ROOT_KEY\"|" \
+    "$rt_target" "reads CARGO_TARGET_DIR itself"
+rt_mutant unkeyed "s|$RT_KEPT|    TARGET_DIR=\"\$TARGET_ROOT/lint-ratchet\"|" '' "keeps an unkeyed directory"
+rt_mutant fixed "s|$RT_KEPT|    TARGET_DIR=\"target/lint-ratchet-\$TARGET_ROOT_KEY\"|" "$rt_target" \
+    "ignores CARGO_TARGET_DIR"
 rt_mutant second 's|^            --target-dir "$TARGET_DIR" -- $LINTS$|            -- $LINTS|' \
     '' "drops the simulator pass's --target-dir"
 rt_mutant first 's|^            --target-dir "$TARGET_DIR" -- $LINTS &&$|            -- $LINTS \&\&|' \
@@ -5116,9 +5135,8 @@ group_target_root() {
 # copy of the helper under scripts/. A stub cargo first on PATH records each
 # call and answers `cargo metadata` as TR_META says (its `clean` removes the
 # one directory it names, under the work root only); the config case runs the
-# pinned cargo itself. The key's oracle is sha256sum (or shasum) on `pwd -P`,
-# not the helper's Python. Paths hold a space, so a printed command that
-# splits a path is red.
+# pinned cargo itself. The key's oracle is fx_root_key. Paths hold a space, so
+# a printed command that splits a path is red.
 TRW="$work/tr"
 TR_BIN="$TRW/bin"
 TR_ARGV="$TRW/argv-bin"
@@ -5161,14 +5179,7 @@ tr_checkout() { # <dir>: a fixture checkout holding the helper
     cp "$SCRIPT_DIR/target-root.sh" "$1/scripts/target-root.sh"
 }
 tr_phys() { (cd "$1" && pwd -P); }
-tr_sha16() { # <text>: the first 16 hex digits of its SHA-256
-    if command -v sha256sum >/dev/null 2>&1; then
-        printf '%s' "$1" | sha256sum | cut -c1-16
-    else
-        printf '%s' "$1" | shasum -a 256 | cut -c1-16
-    fi
-}
-tr_key() { tr_sha16 "$(tr_phys "$1")"; }
+tr_key() { fx_root_key "$1"; }
 # tr_print <checkout> <CARGO_TARGET_DIR, or - for unset>: the export, stdout
 # to $TRW/out, stderr to $TRW/err, the stub's calls to $TRW/calls.
 tr_print() {

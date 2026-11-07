@@ -104,9 +104,9 @@ jobs:
       - name: lint scopes (ADR-0144)
         run: ./scripts/check-lint-scopes.sh
       # Linux only: the baseline is recorded there (cfg-gated files). Its two
-      # clippy passes keep their own target, target/lint-ratchet: in the
-      # target the clippy step uses, their lint arguments would re-check every
-      # member twice.
+      # clippy passes keep their own target, target/lint-ratchet-<key>, the key
+      # this checkout's (scripts/target-root.sh): in the target the clippy step
+      # uses, their lint arguments would re-check every member twice.
       - name: lint ratchet (ADR-0144 D3; absorbs the fn-length ratchet)
         if: runner.os == 'Linux'
         run: ./scripts/check-lint-ratchet.sh
