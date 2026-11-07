@@ -161,15 +161,30 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     );
                     return;
                 }
-                // Accept-path failures (`EMFILE`/`ENFILE`) belong to the
-                // listener, never to a connection (F-L11-05): count them.
-                // The driver has parked the arm; the accept-retry owner
-                // re-arms it a retry window later. Armed only from Idle:
-                // failures inside a window coalesce into its one arm.
+                // Accept-path failures belong to the listener, never to a
+                // connection: count them. The driver delivers one only when
+                // it parks the arm, on an exhaustion or a broken-listener
+                // errno (`classify_accept_errno`); a transient one never
+                // surfaces. The accept-retry owner re-arms the listener a
+                // retry window later, the only way back for a broken one.
+                // Armed only from Idle: failures inside a window coalesce
+                // into its one arm.
                 if c.token.class() == TokenClass::Accept {
                     self.shared.accept_errors.set(self.shared.accept_errors.get() + 1);
+                    // Canary: the failure re-arms the listener at once, the
+                    // spin into a persistent failure the window prevents.
+                    #[cfg(inf_canary_accept_retry_at_once)]
+                    cx.push(IoOp::AcceptArm {
+                        listener: self.listener,
+                        token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
+                    });
                     let owner = &self.timers.accept_retry;
+                    #[cfg(not(inf_canary_accept_retry_late))]
                     let deadline = cx.now.saturating_add(ACCEPT_RETRY);
+                    // Canary: the retry falls due 2 ms past its window.
+                    #[cfg(inf_canary_accept_retry_late)]
+                    let deadline =
+                        cx.now.saturating_add(ACCEPT_RETRY).saturating_add(Nanos::from_millis(2));
                     let mut timers = cx.timers();
                     if timers.phase(owner) == OwnerPhase::Idle {
                         timers
@@ -270,10 +285,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
     fn on_timer<'n>(&mut self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> {
         match TimerRole::from_route(notice.route()) {
             Some(TimerRole::AcceptRetry) => {
+                // Canary: the retry pushes no accept arm, so a listener the
+                // driver parked as broken never accepts again.
+                #[cfg(not(inf_canary_accept_retry_no_rearm))]
                 if self.started {
                     // Idempotent on an armed listener; resumes a parked
-                    // one. A still-exhausted accept fails again → one more
-                    // count and one more window (bounded by wall time).
+                    // one of either class. An exhausted or broken listener
+                    // whose failure persists fails again: one more count
+                    // and one more window, one `accept(2)` a window.
                     cx.push(IoOp::AcceptArm {
                         listener: self.listener,
                         token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),

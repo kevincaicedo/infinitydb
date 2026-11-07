@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Planted-bug canaries (ADR-0090 D5; F-L19-03 addendum, F-L19-04): each
-# `--cfg inf_canary_*` disables one load-bearing rule in the product, or
+# `--cfg inf_canary_*` disables one load-bearing rule in the product,
 # removes from a harness leg what its engagement clause needs (a vacuity
-# plant, read in `bins/inf-sim` alone), and the scenario whose oracle owns
-# that rule or clause must go red on the planted build — and green on the
-# plain build. A canary the fleet never plants
+# plant), or breaks the simulator's model of a contract that a leg's oracle
+# takes as its premise (a premise plant); the last two are read in
+# `bins/inf-sim` alone. The scenario whose oracle owns that rule, clause or
+# premise must go red on the planted build — and green on the plain build.
+# A canary the fleet never plants
 # proves nothing; `bins/inf-sim/tests/lanes.rs` fails when a cfg in the
 # workspace's `check-cfg` list has no row here.
 # Three row kinds:
@@ -367,6 +369,32 @@ rows=(
   # run judges nothing and is vacuous.
   "inf_canary_wake_never_held m2-fill-tick held-park-unengaged --park-at-once"
   "inf_canary_wake_never_held m2-group-hold held-park-unengaged --park-at-once"
+  # ADR-0118 D2: the accept retry re-arms a parked listener one window
+  # after its failure. Planted, its callback pushes no accept arm: on the
+  # broken-listener leg, which no `Close` resumes, the accept-retry oracle
+  # reads every parked arm still open at the run's end, and the queued
+  # clients stall.
+  "inf_canary_accept_retry_no_rearm m0-smoke accept-retry-missing --plant accept-broken"
+  # The accept-retry oracle's engagement: planted, it reads no park, so the
+  # leg's run judges nothing and is vacuous.
+  "inf_canary_accept_retry_park_unread m0-smoke accept-retry-unengaged --plant accept-broken"
+  # The accept-retry leg rests on the driver contract: a `Close` resumes an
+  # exhaustion park only. Planted in the simulator's driver, a `Close`
+  # resumes the broken park too, and the oracle reads each park resumed with
+  # no retry.
+  "inf_canary_accept_close_resumes_any m0-smoke accept-retry-by-close --plant accept-broken"
+  # The retry waits its window, so a persistent failure costs one accept a
+  # window, never a spin (ADR-0118 D2). Planted, the failure re-arms the
+  # listener at once, and the oracle reads each retry before its deadline.
+  "inf_canary_accept_retry_at_once m0-smoke accept-retry-early --plant accept-broken"
+  # The retry falls due within its rounding millisecond of the window
+  # (ADR-0154 D3). Planted, it falls due 2 ms past the window, and the
+  # oracle reads each retry past its bound.
+  "inf_canary_accept_retry_late m0-smoke accept-retry-late --plant accept-broken"
+  # The oracle judges each park against its own deadline, so a retry one
+  # rounding millisecond early is red as well: the timer set's due test
+  # planted a millisecond early (the model's row above), on this leg.
+  "inf_canary_timer_fires_early m0-smoke accept-retry-early --plant accept-broken"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.
