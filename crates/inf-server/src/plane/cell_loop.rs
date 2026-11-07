@@ -1124,7 +1124,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 self.shared.ddl_gen_seen.set(generation);
                 self.shared.ddl_waiters.wake_all(0);
             }
-            self.shared.node.ns_drop_tombstones.set(control.drop_tombstones() as u64);
+            let node = &self.shared.node;
+            node.ns_drop_tombstones.set(control.drop_tombstones() as u64);
+            node.catalog_epoch.set(epoch);
+            node.ns_ddl_pending.set(control.ddl_pending());
+            node.ns_ddl_notices_stale.set(control.ddl_notices_stale());
         }
     }
 

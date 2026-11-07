@@ -10763,6 +10763,10 @@ fn a_ddl_stopped_after_its_answer_leaves_no_ddl_pending() {
             String::from_utf8_lossy(&args.join(&b' '))
         );
     }
+    let text = wait_persistence_field(&mut c, "ns_ddl_pending", "0");
+    assert!(text.contains("ns_ddl_pending:0\r\n"), "no DDL is left pending: {text}");
+    assert!(text.contains("ns_ddl_notices_stale:0\r\n"), "every notice retired its DDL: {text}");
+    assert!(!text.contains("catalog_epoch:0\r\n"), "the writer answered requests: {text}");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();

@@ -1835,7 +1835,9 @@ count the arrivals that found it full.
      `DropFanned { id, stamp }`), which every exit after the answer
      posts; any other notice changes nothing and is counted. Empty at
      boot — `META` already holds every answered DDL. The sim's inline
-     inbox runs the same writer.
+     inbox runs the same writer. `INFO persistence` carries the writer's
+     node gauges `catalog_epoch` (the word), `ns_ddl_pending` (0 or 1)
+     and `ns_ddl_notices_stale` (zero by design).
   3. **Recovery verifier** (`inf-store::keyspace`,
      `inf-server::recover`, ADR-0103 D4):
      `ReplayOutcome::SkippedUnknownNs(NsId)` carries the id;
