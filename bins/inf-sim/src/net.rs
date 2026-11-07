@@ -13,8 +13,9 @@ use inf_foundation::FileOffset;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_runtime::{
-    BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken, IoClass, IoOp,
-    RawFd, StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier,
+    AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken,
+    IoClass, IoOp, RawFd, StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier,
+    classify_accept_errno,
 };
 use inf_server::SimDisk;
 
@@ -75,6 +76,55 @@ struct SimConn {
     suppressed: bool,
 }
 
+/// A parked accept arm's class: the two failures the driver contract parks
+/// on. A transient failure delivers nothing and never parks, so it has no
+/// variant here (ADR-0118 D1).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum AcceptPark {
+    /// Descriptor or memory exhaustion: an `AcceptArm`, or any `Close` that
+    /// returns an fd, resumes it.
+    Exhausted,
+    /// A broken listener: only an `AcceptArm` resumes it.
+    Broken,
+}
+
+impl AcceptPark {
+    /// The park the contract's table gives `errno`; `None` for a transient
+    /// failure, which never parks.
+    #[must_use]
+    pub fn of(errno: i32) -> Option<AcceptPark> {
+        match classify_accept_errno(errno) {
+            AcceptFailure::Exhausted => Some(AcceptPark::Exhausted),
+            AcceptFailure::Broken => Some(AcceptPark::Broken),
+            AcceptFailure::Transient => None,
+        }
+    }
+
+    /// Whether a `Close` that returns an fd resumes this park: an exhaustion
+    /// park only, as both real backends do (ADR-0118 D2).
+    fn resumes_on_close(self) -> bool {
+        match self {
+            AcceptPark::Exhausted => true,
+            AcceptPark::Broken => false,
+        }
+    }
+}
+
+impl Plant {
+    /// The errno an accept plant delivers, `None` for every other plant.
+    fn accept_errno(self) -> Option<i32> {
+        match self {
+            Plant::AcceptError => Some(libc::EMFILE),
+            Plant::None
+            | Plant::LostWakeup
+            | Plant::FsyncLies
+            | Plant::StopKill
+            | Plant::TierReadEio
+            | Plant::TierWriteEio => None,
+        }
+    }
+}
+
 /// One cell's network endpoint: the listener plus every connection accepted
 /// by this cell. The harness holds the same handle to play the client side.
 #[derive(Debug)]
@@ -82,9 +132,10 @@ pub struct CellNet {
     cell: u16,
     accept_armed: bool,
     accept_token: Option<CompletionToken>,
-    /// Parked after the plant fired: no accepts until `AcceptArm`/`Close`.
-    accept_parked: bool,
-    /// `AcceptArm` ops that resumed a parked arm (the plane's retry witness).
+    /// Parked after the plant fired, with the park's class: no accepts until
+    /// an `AcceptArm`, or a `Close` when the class is `Exhausted`.
+    accept_parked: Option<AcceptPark>,
+    /// Parked arms resumed, by an `AcceptArm` or a `Close`.
     accept_resumes: u64,
     backlog: VecDeque<RawFd>,
     conns: BTreeMap<RawFd, SimConn>,
@@ -119,12 +170,18 @@ impl CellNet {
         self.accept_resumes
     }
 
+    /// The parked arm's class, `None` while the arm is up.
+    #[must_use]
+    pub fn accept_parked(&self) -> Option<AcceptPark> {
+        self.accept_parked
+    }
+
     pub fn new(cell: u16, seed: u64, plant: Plant) -> Rc<RefCell<CellNet>> {
         Rc::new(RefCell::new(CellNet {
             cell,
             accept_armed: false,
             accept_token: None,
-            accept_parked: false,
+            accept_parked: None,
             accept_resumes: 0,
             backlog: VecDeque::new(),
             conns: BTreeMap::new(),
@@ -632,8 +689,7 @@ impl BackendDriver for SimDriver {
         for op in ops.drain(..) {
             match op {
                 IoOp::AcceptArm { token, .. } => {
-                    if net.accept_parked {
-                        net.accept_parked = false;
+                    if net.accept_parked.take().is_some() {
                         net.accept_resumes += 1;
                     }
                     net.accept_armed = true;
@@ -667,9 +723,10 @@ impl BackendDriver for SimDriver {
                     }
                     out.push(Completion { token, result: CompletionResult::Closed });
                     // An fd returned: an exhaustion-parked arm resumes
-                    // (the driver contract's own resume path).
-                    if net.accept_parked {
-                        net.accept_parked = false;
+                    // (the driver contract's own resume path); a broken
+                    // listener waits for the consumer's `AcceptArm`.
+                    if net.accept_parked.is_some_and(AcceptPark::resumes_on_close) {
+                        net.accept_parked = None;
                         net.accept_resumes += 1;
                     }
                 }
@@ -828,23 +885,33 @@ impl BackendDriver for SimDriver {
         self.ops = ops;
 
         // Accept everything queued (multishot semantics) — unless parked.
-        if net.accept_armed && !net.accept_parked {
+        if net.accept_armed && net.accept_parked.is_none() {
             let token = net.accept_token.expect("armed implies token");
-            // The accept-error plant: the kernel refused a QUEUED accept
-            // (fd limit). The error rides the listener token (the plane
-            // must not route it to a connection, F-L11-05) and the arm
-            // parks with the backlog intact (F-L11-02): only the plane's
-            // re-arm or a `Close` lets the queued clients in.
-            if net.plant == Plant::AcceptError && !net.plant_fired && net.backlog.len() >= 2 {
-                // The limit lands mid-batch: one client is let in first
-                // (F-L11-05's live `{0, 0}`), the rest stay queued.
+            // The accept plants: the kernel refused a QUEUED accept. The
+            // error rides the listener token, never a connection's, and the
+            // arm parks with the backlog intact under the contract's class
+            // for the errno: only the plane's re-arm, or for an exhaustion
+            // park a `Close`, lets the queued clients in. A transient errno
+            // parks nothing, as the contract surfaces none, so a plant of
+            // one never fires.
+            let planted = net
+                .plant
+                .accept_errno()
+                .and_then(|errno| AcceptPark::of(errno).map(|park| (errno, park)));
+            if let Some((errno, park)) = planted
+                && !net.plant_fired
+                && net.backlog.len() >= 2
+            {
+                // The failure lands mid-batch: one client is let in first
+                // (the live `{0, 0}` the error must not tear down), the rest
+                // stay queued.
                 let fd = net.backlog.pop_front().expect("two queued");
                 out.push(Completion { token, result: CompletionResult::Accepted { fd } });
                 net.plant_fired = true;
-                net.accept_parked = true;
+                net.accept_parked = Some(park);
                 out.push(Completion {
                     token,
-                    result: CompletionResult::Error { errno: libc::EMFILE, buf: None },
+                    result: CompletionResult::Error { errno, buf: None },
                 });
             } else {
                 while let Some(fd) = net.backlog.pop_front() {
