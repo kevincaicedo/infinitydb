@@ -1398,3 +1398,130 @@ fn a_cold_read_queued_before_a_drop_reads_its_own_file() {
         read.err()
     );
 }
+
+/// Namespace 16 on a sim-disk cell, its table holding no record (so
+/// MAINTAIN's seal, release, reclaim and compaction legs do nothing), and
+/// `files` tier files on the disk that a covering swap retired: each named
+/// by the namespace's retirement list, its handle already closed. Returns
+/// the cell, the keyspace and the files' paths in id order.
+fn retired_files(files: u32) -> (TierCell<SimDisk>, Keyspace, Vec<PathBuf>) {
+    const PAGE: u64 = 4 << 10;
+    let demote = DemotionConfig::for_budget(1 << 20, PAGE);
+    let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
+    let space = AddressSpaceConfig {
+        reserve_bytes,
+        page_bytes: PAGE as usize,
+        life_origin: LogicalAddr::ZERO,
+    };
+    let mut ks = Keyspace::new(StoreConfig::default());
+    assert!(ks.materialize_tiered(NsId(16), space, demote, 64).is_ok());
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    cell.create_ns(NsId(16), &spec());
+    let cold = cell.namespaces[0].dir.join("cold");
+    cell.fs.create_dir_all(&cold).expect("the cold directory");
+    let mut paths = Vec::new();
+    for id in 0..files {
+        let path = cold.join(inf_log::tier_file_name(id));
+        drop(cell.fs.create_tier(&path, TierIoMode::Buffered).expect("a tier file"));
+        cell.namespaces[0].note_retired(TierFileMeta {
+            id,
+            base: LogicalAddr::from_raw(u64::from(id) << 20).expect("fits"),
+            data_len: 1 << 20,
+            reason: inf_log::SealReason::Capacity,
+            path: path.clone(),
+        });
+        paths.push(path);
+    }
+    (cell, ks, paths)
+}
+
+fn on_disk(cell: &TierCell<SimDisk>, path: &std::path::Path) -> bool {
+    cell.fs.open_read(path).is_ok()
+}
+
+/// A tier file whose unlink fails keeps an owner and is unlinked again:
+/// the error is not fatal, so the file's record stays until an unlink of it
+/// answers. `tier_unlink_fail` fires once on the retired file's unlink;
+/// eight MAINTAINs follow with nothing armed.
+#[test]
+#[ignore = "a failed tier-file unlink is discarded after the file's record was removed, so the \
+            file stays on the disk with no owner and nothing retries it; red until a failed \
+            unlink returns its owner for a paced retry and only a removal or absence ends it"]
+fn a_failed_unlink_is_retried_until_the_file_is_gone() {
+    let (mut cell, mut ks, paths) = retired_files(1);
+    inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
+    let first = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0).map(|_| ());
+    let fired = inf_foundation::fault::fired(inf_log::fault::TIER_UNLINK_FAIL);
+    inf_foundation::fault::disarm_all();
+    assert!(first.is_ok(), "a failed unlink is not fatal");
+    assert_eq!(fired, 1, "engagement: the unlink failed once");
+    assert!(on_disk(&cell, &paths[0]), "engagement: the failed unlink left the file");
+    for turn in 1..=8u64 {
+        cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, turn * 2_000).expect("MAINTAIN");
+    }
+    assert!(
+        !on_disk(&cell, &paths[0]),
+        "{} is still on the disk after tier_unlink_fail once and 8 more MAINTAINs, and {} \
+         retiring record(s) name a file",
+        paths[0].display(),
+        cell.namespaces[0].retired.len()
+    );
+}
+
+/// A turn's retirement work is bounded and charged whatever the pins: a
+/// pinned file's visit counts against the turn's 64 visits and is charged
+/// as Maintenance. 128 retired files are pinned by queued cold reads; a
+/// 129th, the last on the list, is not.
+#[test]
+#[ignore = "pinned retired files are passed with no charge and no bound, so one turn's work grows \
+            with the files pinned; red until each visit is charged and a turn makes at most 64"]
+fn a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four() {
+    const PINNED: u32 = 128;
+    let (mut cell, mut ks, paths) = retired_files(PINNED + 1);
+    let cold = cell.cold.clone().expect("the cell's cold engine");
+    let class = inf_runtime::ReadClass::Foreground;
+    let waits: Vec<_> = (0..PINNED)
+        .map(|id| {
+            let file = TierFileId::new(id);
+            cold.enqueue(-1, file, 0, inf_log::TIER_FRAME_BYTES, class, 0).expect("queued")
+        })
+        .collect();
+    let (units, _) = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0).expect("MAINTAIN");
+    let pinned_left = paths[..PINNED as usize].iter().filter(|path| on_disk(&cell, path)).count();
+    let last_unlinked = !on_disk(&cell, &paths[PINNED as usize]);
+    drop(waits);
+    assert_eq!(pinned_left, PINNED as usize, "engagement: no pinned file was unlinked");
+    assert!(
+        units >= 64,
+        "one MAINTAIN over {PINNED} pinned retired files charged {units} unit(s), and the unpinned \
+         file after them was unlinked in it: {last_unlinked}; each visit is charged and a turn \
+         makes at most 64"
+    );
+}
+
+/// The cell neither closes nor unlinks a tier file on its own loop:
+/// unlinking a large file frees its extents in the kernel, the multi-ms
+/// class the control thread runs. A retired file's MAINTAIN and a dropped
+/// namespace's teardown each leave the file on the disk for that thread.
+#[test]
+#[ignore = "the cell unlinks retired and dropped tier files on its own loop, the blocking \
+            multi-ms class; red until the cell hands each file to the control thread, which \
+            closes and unlinks it"]
+fn the_cell_leaves_tier_file_unlinks_to_the_control_thread() {
+    let (mut cell, mut ks, paths) = retired_files(1);
+    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0).expect("MAINTAIN");
+    let retired_unlinked = !on_disk(&cell, &paths[0]);
+    let (mut cell, _ks, _) = flushed_namespace();
+    let active = cell.namespaces[0].flush.active().map(|(.., path)| path.to_path_buf());
+    let active = active.expect("engagement: the namespace has an active file");
+    cell.sync_namespaces(&Keyspace::new(StoreConfig::default()), &mut vec![(NsId(16), 1)]);
+    cell.maintain_teardown(|_| true);
+    let dropped_unlinked = !on_disk(&cell, &active);
+    assert!(
+        !retired_unlinked && !dropped_unlinked,
+        "the cell's own loop unlinked tier files: the retired file {} ({retired_unlinked}), the \
+         dropped namespace's active file {} ({dropped_unlinked})",
+        paths[0].display(),
+        active.display()
+    );
+}
