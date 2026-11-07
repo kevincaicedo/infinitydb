@@ -9977,3 +9977,7 @@ fn tiered_namespace_parses_arguments_like_the_numbered_db() {
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Namespace ids at the node, in a file of their own.
+#[path = "node_e2e/ns_ids.rs"]
+mod ns_ids;
