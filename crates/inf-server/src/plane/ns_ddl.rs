@@ -962,10 +962,17 @@ async fn program_ns_set<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     }
 }
 
-/// Fans one DDL vector to every peer and returns the first error reply,
-/// or `None` when every leg answered a non-error. Every leg is awaited —
-/// a leg that could not be sent or answered no reply is an error leg. A
-/// leg failed by its reply's outcome, never by its bytes (ADR-0190 D2).
+/// How one DDL leg ended (ADR-0189 D5), read from its reply's variant and
+/// never from its bytes: an applied leg answers `Ok`; any other variant,
+/// an error reply or a success where none belongs, is `Refused`.
+enum LegOutcome {
+    Applied,
+    Refused(OwnedReply),
+}
+
+/// Fans one DDL vector to every peer and returns the first refused leg's
+/// reply, or `None` when every leg applied. Every leg is awaited, one at a
+/// time (ADR-0108 D2); a leg that could not be sent is a refused leg.
 async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
@@ -973,27 +980,41 @@ async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone
 ) -> Option<OwnedReply> {
     let mut failure: Option<OwnedReply> = None;
     for cell in peer_cells(shared) {
-        let leg = match send_apply(shared, cell, ApplyOrigin::Program, proto, 0, fan).await {
-            // A leg that is not a reply failed: the one refusal text every
-            // arm renders for a fabric refusal or a shape its fold cannot
-            // take (ADR-0190 D2).
-            Ok(waiter) => match waiter.await {
-                OwnedOutcome::Reply(reply) => reply,
-                OwnedOutcome::Ok
-                | OwnedOutcome::Int(_)
-                | OwnedOutcome::Nil
-                | OwnedOutcome::Bool(_)
-                | OwnedOutcome::Err(_) => error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED),
-            },
-            Err(refusal) => refusal,
-        };
-        if leg.is_error() && failure.is_none() {
-            failure = Some(leg);
-        } else {
-            shared.recycle_reply_buf(leg.into_bytes());
+        match fan_leg(shared, proto, cell, fan).await {
+            LegOutcome::Applied => {}
+            LegOutcome::Refused(reply) if failure.is_none() => failure = Some(reply),
+            LegOutcome::Refused(reply) => shared.recycle_reply_buf(reply.into_bytes()),
         }
     }
     failure
+}
+
+/// One DDL leg to `cell` and how it ended, read from its reply's variant
+/// (ADR-0189 D5): `Ok` is `Applied`; an error reply is `Refused` with its
+/// bytes; any other variant, a success reply where an applied leg answers
+/// `Ok` included, is `Refused` and internal, rendered with the one text
+/// every arm renders for a shape its fold cannot take (ADR-0190 D2).
+async fn fan_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    proto: Protocol,
+    cell: CellId,
+    fan: &[&[u8]],
+) -> LegOutcome {
+    let waiter = match send_apply(shared, cell, ApplyOrigin::Program, proto, 0, fan).await {
+        Ok(waiter) => waiter,
+        Err(refusal) => return LegOutcome::Refused(refusal),
+    };
+    match waiter.await {
+        OwnedOutcome::Ok => LegOutcome::Applied,
+        OwnedOutcome::Reply(reply) if reply.is_error() => LegOutcome::Refused(reply),
+        OwnedOutcome::Reply(reply) => {
+            shared.recycle_reply_buf(reply.into_bytes());
+            LegOutcome::Refused(error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED))
+        }
+        OwnedOutcome::Int(_) | OwnedOutcome::Nil | OwnedOutcome::Bool(_) | OwnedOutcome::Err(_) => {
+            LegOutcome::Refused(error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED))
+        }
+    }
 }
 
 /// The refusal of an argv wider than the codec's `MAX_APPLY_ARGS`.

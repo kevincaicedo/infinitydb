@@ -641,7 +641,9 @@ enum StagedReply {
     Bytes(usize, usize, ReplyOutcome),
     Int(i64),
     Nil,
-    /// The adopt ack (ADR-0128): returns the origin's credit, nothing else.
+    /// The adopt ack (ADR-0128), or an applied namespace DDL leg
+    /// (ADR-0189 D5): its variant is all it carries, and it returns the
+    /// origin's credit.
     Ok,
     /// Typed refusal for an op the M0 plane does not speak.
     Refused,

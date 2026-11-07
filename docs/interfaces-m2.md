@@ -1858,8 +1858,10 @@ count the arrivals that found it full.
      persisted-epoch pattern). Fan legs of one program never cross
      another's.
   2. **Every fan leg answers** (`plane::fan_all_or_first_error`): a
-     `CREATE`/`SET`/`DROP` fan awaits every peer; a leg that cannot be
-     sent or answers no bytes is an error leg.
+     `CREATE`/`SET`/`DROP` fan awaits every peer; a leg is applied only
+     when its reply's variant is `Ok`, which an applied leg answers
+     (ADR-0189 D5), and a leg that cannot be sent, or answers anything
+     else, is an error leg.
   3. **`CREATE` rollback** (`plane::rollback_create`, under the same
      ticket): on any error leg the origin drops its copy, requests the
      `META` that drops the id (`request_drop`: the writer replaces the
