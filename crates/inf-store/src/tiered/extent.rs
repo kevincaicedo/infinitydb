@@ -322,6 +322,33 @@ impl TieredTable {
         self.extents.sweep_seed(listed, quarantined)
     }
 
+    /// The sweep seed's first stage, a batch (ADR-0174 A1.3: the seed runs
+    /// under the step budget): stamps at most `max` parked replay deaths
+    /// durable, in park order, from the table's own stamp cursor; answers
+    /// how many. [`extent_sweep_seed`](Self::extent_sweep_seed) is the three
+    /// stages whole.
+    pub fn extent_stamp_parked(&mut self, max: usize) -> usize {
+        self.extents.stamp_parked(max)
+    }
+
+    /// Parked replay deaths the sweep seed has not stamped yet.
+    #[must_use]
+    pub fn extent_parked_unstamped(&self) -> usize {
+        self.extents.parked_unstamped()
+    }
+
+    /// The sweep seed's second stage over a batch of the boot listing.
+    pub fn extent_seed_listed(&mut self, listed: &[u64]) {
+        self.extents.seed_listed(listed);
+    }
+
+    /// The sweep seed's third stage over a batch of the `.quarantine`
+    /// listing: the ids the replayed map references are appended to
+    /// `revive`, for the caller to rename back before serving (ADR-0096 D3).
+    pub fn extent_seed_quarantined(&mut self, quarantined: &[u64], revive: &mut Vec<u64>) {
+        self.extents.seed_quarantined(quarantined, revive);
+    }
+
     /// Applies one checkpoint tag-9 image / tail `StringExtentRef`
     /// record (ADR-0174 R5 over the extent kind — the arm of
     /// `replay_upsert_extent`, after the entry made room): blind
