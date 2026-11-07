@@ -65,8 +65,13 @@ fn units_left(budget: &mut StepBudget, price: u64) -> usize {
     usize::try_from(buys).unwrap_or(usize::MAX)
 }
 
-/// Charges `count` units of `price` to the step's budget.
+/// Charges `count` units of `price` to the step's budget. The planted canary
+/// charges the sweep seed's stamps and seeds, the revive renames and the
+/// rebuild's probe groups nothing.
 fn charge_units(budget: &mut StepBudget, count: usize, price: u64) {
+    if cfg!(inf_canary_recover_probe_uncharged) {
+        return;
+    }
     let count = u64::try_from(count).unwrap_or(u64::MAX);
     budget.charge(count.saturating_mul(price));
 }

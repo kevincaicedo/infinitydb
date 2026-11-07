@@ -663,6 +663,14 @@ rows=(
   # entry: there a 1 ms hold still counts a covered tick).
   "inf_canary_stop_tick_unheld m2-stop-tick stop-tick-unheld"
   "inf_canary_stop_tick_short_hold m2-stop-tick stop-tick-uncovered --seed 0xC0FFEE"
+  # The hand-over's units are priced (ADR-0174 A1.3): a parked death stamped
+  # or an extent id seeded at the RAM unit price, a revive rename at the
+  # file-operation price, a probe group the ticket rebuild scans at its
+  # bytes. Planted, they charge nothing: one step runs every stage.
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge STAMPS"
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge SEEDS"
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge RENAMES"
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge GROUPS"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
