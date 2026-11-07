@@ -1516,6 +1516,13 @@ impl ControlHandle {
         epoch
     }
 
+    /// Catalog persist requests numbered this boot, sent or about to be
+    /// (tests: a DDL parked on its swap has requested it, durable or not).
+    #[must_use]
+    pub fn persist_requests_sent(&self) -> u64 {
+        self.next_epoch.load(Ordering::Relaxed)
+    }
+
     /// Delegates one blocking unlink to the control thread (M2-S11/S12).
     /// Non-blocking: `false` = queue full — the caller keeps the path and
     /// retries next MAINTAIN slice (bounded local queue, never a stall).
