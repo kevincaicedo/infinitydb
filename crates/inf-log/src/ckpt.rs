@@ -2045,6 +2045,71 @@ mod tests {
         assert_eq!(refs.item_bytes_done, 4 * 14, "four entries of fourteen bytes walked before");
     }
 
+    /// A walk whose entry handlers answer the same count for every view, and
+    /// that consumes every record.
+    struct AnswersEntries(usize);
+
+    impl IckWalk<()> for AnswersEntries {
+        fn hybrid(&self) -> bool {
+            true
+        }
+
+        fn enter(&mut self, _: IckSectionEntry) {}
+
+        fn record(&mut self, _: RecordView<'_>, _: u32) -> Result<SectionFlow, ()> {
+            Ok(SectionFlow::Next)
+        }
+
+        fn refs(&mut self, _: IckRefSection<'_>) -> Result<usize, ()> {
+            Ok(self.0)
+        }
+
+        fn live_set(&mut self, _: IckLiveSetSection<'_>) -> Result<usize, ()> {
+            Ok(self.0)
+        }
+
+        fn blob_refs(&mut self, _: IckBlobRefSection<'_>) -> Result<usize, ()> {
+            Ok(self.0)
+        }
+
+        fn idx_sidecar(&mut self, _: IckIdxSidecarStep<'_>) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    /// Walks the multi-item checkpoint with `walk`, for at most 64 steps.
+    fn walk_multi_item_sections(mut walk: AnswersEntries) {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let (_, path) = write_multi_item_sections(&fs, dir);
+        let mut reader = IckReader::open(&fs, &path, IckReaderConfig::default()).expect("open");
+        for _ in 0..64 {
+            if let IckStep::Done(_) = reader.next_step_walk(&mut walk).expect("a step") {
+                return;
+            }
+        }
+        panic!("the walk made no progress in 64 steps");
+    }
+
+    /// An entry handler's answer is paired with its contract (`IckWalk`):
+    /// none of a view that holds entries would re-park at the same cursor
+    /// with no progress, and one above the view would end the section
+    /// unapplied; each is a handler's defect the debug build stops at.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "an entry handler applied none of its view")]
+    fn an_entry_handler_that_applies_none_of_its_view_is_stopped() {
+        walk_multi_item_sections(AnswersEntries(0));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "an entry handler applied more than its view")]
+    fn an_entry_handler_that_applies_more_than_its_view_is_stopped() {
+        walk_multi_item_sections(AnswersEntries(usize::MAX));
+    }
+
     /// Review L03 style row 3: the loader bound is one check in one place.
     /// A section header of every class whose body length exceeds the
     /// configured bound is refused before any body byte is read — the

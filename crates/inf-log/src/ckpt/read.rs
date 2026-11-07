@@ -659,10 +659,11 @@ pub struct IckSectionEntry {
 /// (ADR-0174 A1.5). The reader announces each section it enters or
 /// resumes, presents its records one at a time — a handler answers
 /// [`SectionFlow::Next`] or parks — and hands an entry section's handler
-/// the entries from the cursor on, to apply as many as it chooses: it
-/// answers how many it applied, and fewer than it was given parks the walk
-/// after them. An index-sidecar section is applied whole. The reader moves
-/// the cursor on these answers alone, and no answer re-reads a block.
+/// the entries from the cursor on, to apply as many as it chooses, at least
+/// one of a view that holds any: it answers how many it applied, never more
+/// than it was given, and fewer than it was given parks the walk after them.
+/// An index-sidecar section is applied whole. The reader moves the cursor on
+/// these answers alone, and no answer re-reads a block.
 pub trait IckWalk<E> {
     /// Whether the v2 section classes have handlers; a records-only walk
     /// refuses them typed, never skipping the cold majority.
@@ -674,18 +675,21 @@ pub trait IckWalk<E> {
     /// # Errors
     /// The handler's own; the load stops at it.
     fn record(&mut self, view: RecordView<'_>, bytes: u32) -> Result<SectionFlow, E>;
-    /// A ref section's entries from the cursor on; answers how many applied.
+    /// A ref section's entries from the cursor on; answers how many it
+    /// applied, at least one of a view that holds any and at most the view.
     ///
     /// # Errors
     /// As [`record`](Self::record).
     fn refs(&mut self, section: IckRefSection<'_>) -> Result<usize, E>;
-    /// A live-set section's entries from the cursor on; answers how many applied.
+    /// A live-set section's entries from the cursor on; answers how many it
+    /// applied, at least one of a view that holds any and at most the view.
     ///
     /// # Errors
     /// As [`record`](Self::record).
     fn live_set(&mut self, section: IckLiveSetSection<'_>) -> Result<usize, E>;
     /// A blob-reference section's entries from the cursor on; answers how
-    /// many applied.
+    /// many it applied, at least one of a view that holds any and at most the
+    /// view.
     ///
     /// # Errors
     /// As [`record`](Self::record).
@@ -1466,6 +1470,12 @@ impl<File: SegmentFile> IckReader<File> {
         }
         .map_err(|error| IckApplyError::Apply { section, error })?;
         let left = frame.record_count.checked_sub(cursor.at).ok_or_else(truncated)?;
+        // The handler's contract (`IckWalk`): at least one entry of a view
+        // that holds any — none re-parks at the same cursor with no progress
+        // — and never more than the view.
+        let answered = u64::try_from(applied).unwrap_or(u64::MAX);
+        debug_assert!(answered <= u64::from(left), "an entry handler applied more than its view");
+        debug_assert!(answered > 0 || left == 0, "an entry handler applied none of its view");
         let applied = u32::try_from(applied).unwrap_or(u32::MAX).min(left);
         if applied < left {
             cursor.at = cursor.at.checked_add(applied).ok_or_else(truncated)?;
