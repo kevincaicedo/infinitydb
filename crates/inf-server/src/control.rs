@@ -1505,6 +1505,11 @@ impl ControlHandle {
         create: Option<(NsSpec, CreateVerdict)>,
     ) -> u64 {
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        // Test builds only: a test holds this sender here to order it
+        // after another (the point's row in `crate::fault`).
+        if inf_foundation::fault::fire(crate::fault::DDL_REQUEST_HELD) {
+            inf_foundation::fault::hold(crate::fault::DDL_REQUEST_HELD);
+        }
         self.tx
             .send(ControlMsg::Persist(PersistReq { catalog, epoch, drop, dropped, create }))
             .expect("control thread alive (fail-stop)");

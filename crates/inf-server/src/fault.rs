@@ -63,6 +63,11 @@
 //!   of 2026-08-30, H2/F-L17-11, ADR-0098): the reply is the error, and the durable emission gate
 //!   stages the applied prefix anyway — recovery replays exactly the live store, never a silent
 //!   rollback of read-visible keys
+//! - `ddl_request_held` — `control::ControlHandle::send_persist` (a catalog request numbered and
+//!   not yet sent) — the requesting thread waits at the point until the test releases the
+//!   [`HoldGate`](inf_foundation::fault::HoldGate) it armed: the stand-in for a sender descheduled
+//!   between numbering its request and enqueuing it, so a test decides the order of two senders on
+//!   real threads
 //!
 //! The sync-tier seal fsync has its own point (`inf_log::fault::FSYNC_ERR`);
 //! this one exists because the reactor tier defers the seal fsync through
@@ -79,6 +84,7 @@ pub const NS_DROP_BEFORE_META: &str = "ns_drop_before_meta";
 pub const NS_DROP_AFTER_META: &str = "ns_drop_after_meta";
 pub const NS_CREATE_AFTER_META: &str = "ns_create_after_meta";
 pub const NS_CREATE_FAN_REFUSED: &str = "ns_create_fan_refused";
+pub const DDL_REQUEST_HELD: &str = "ddl_request_held";
 
 /// Inventory for the CI coverage check.
 pub const ALL: &[&str] = &[
@@ -92,4 +98,5 @@ pub const ALL: &[&str] = &[
     NS_DROP_AFTER_META,
     NS_CREATE_AFTER_META,
     NS_CREATE_FAN_REFUSED,
+    DDL_REQUEST_HELD,
 ];
