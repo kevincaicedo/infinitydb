@@ -6,22 +6,19 @@
 //! a notice once its fan is done (ADR-0189 D2, D5).
 
 use inf_store::ddl::{Answer, CreatePersisted, DdlRefusal, DropPersisted, Receipt, Requested};
+use inf_wire::{Domain, Refusal};
 
 use super::*;
 use crate::control::{CkptCredit, CkptTarget, DdlNotice};
-
-/// The reply of every checkpoint producer whose cell's quota cannot cover
-/// its reservation (ADR-0159 A1.2): the `IdentityExhausted(Checkpoint)`
-/// refusal (ADR-0163 D5.3), returned before any effect. One const holds
-/// the bytes; the refusal class's type, when built, renders the same ones.
-pub(crate) const CKPT_IDENTITY_EXHAUSTED: &str = "ERR checkpoint identity space exhausted";
 
 /// Why a checkpoint producer could not reserve its units.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum CkptRefusal {
     /// No control plane is wired: a node without a data dir.
     NoPlane,
-    /// This cell's quota cannot cover the reservation (ADR-0159 D1).
+    /// This cell's quota cannot cover the reservation (ADR-0159 D1): every
+    /// checkpoint producer answers `IdentityExhausted(Checkpoint)`
+    /// (ADR-0159 A1.2, ADR-0163 D5.3) before any effect.
     Exhausted,
 }
 
@@ -33,7 +30,9 @@ impl CkptRefusal {
     ) -> OwnedReply {
         match self {
             CkptRefusal::NoPlane => error_reply(shared, proto, CKPT_NO_PLANE),
-            CkptRefusal::Exhausted => error_reply(shared, proto, CKPT_IDENTITY_EXHAUSTED),
+            CkptRefusal::Exhausted => {
+                error_reply(shared, proto, Refusal::IdentityExhausted(Domain::Checkpoint).render())
+            }
         }
     }
 }
