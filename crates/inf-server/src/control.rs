@@ -1148,11 +1148,21 @@ struct CatalogRequest {
     /// The requester's catalog export, before the writer's state applies.
     export: NsCatalog,
     slot: Option<AnswerSlot>,
+    /// The planted canary's epoch, taken at send (the shape the writer's
+    /// numbering at dequeue replaces).
+    #[cfg(inf_canary_ns_epoch_at_send)]
+    numbered: u64,
 }
 
 impl CatalogRequest {
     fn new(intent: Option<DdlIntent>, export: NsCatalog, slot: Option<AnswerSlot>) -> Self {
-        CatalogRequest { intent, export, slot }
+        CatalogRequest {
+            intent,
+            export,
+            slot,
+            #[cfg(inf_canary_ns_epoch_at_send)]
+            numbered: 0,
+        }
     }
 }
 
@@ -1283,6 +1293,9 @@ pub struct ControlHandle {
     /// has sent its request). Not an epoch: the writer numbers requests
     /// at dequeue.
     requests_sent: AtomicU64,
+    /// The planted canary's send-time numbering.
+    #[cfg(inf_canary_ns_epoch_at_send)]
+    numbered: AtomicU64,
     /// The catalog word (ADR-0189 D2), stored by the writer alone.
     word: Arc<CatalogWord>,
     /// The boot's checkpoint clock and the board it owns (ADR-0159 A1):
@@ -1455,6 +1468,9 @@ impl ControlHandle {
     /// bounded channel, counted once sent. No epoch is taken here: the
     /// writer numbers requests as it dequeues them (ADR-0189 D2).
     fn send_request(&self, req: CatalogRequest) {
+        #[cfg(inf_canary_ns_epoch_at_send)]
+        let req =
+            CatalogRequest { numbered: self.numbered.fetch_add(1, Ordering::Relaxed) + 1, ..req };
         // Test builds only: a test holds this sender here to order it
         // after another (the point's row in `crate::fault`).
         if inf_foundation::fault::fire(crate::fault::DDL_REQUEST_HELD) {
@@ -1578,20 +1594,37 @@ impl CatalogWriter {
         fs: &F,
         data_dir: &Path,
     ) -> std::io::Result<()> {
+        #[cfg(not(inf_canary_ns_epoch_at_send))]
         let taken = self.epochs.take();
+        #[cfg(inf_canary_ns_epoch_at_send)]
+        let taken = self.epochs.take_numbered(req.numbered);
         let min_published = self.handle.ckpt_board().min_published();
-        let CatalogRequest { intent, export, slot } = req;
+        let CatalogRequest { intent, export, slot, .. } = req;
         let verdict = self.decide(intent.as_ref(), &export);
         match verdict {
             DdlVerdict::Accepted => {}
             DdlVerdict::Refused(_) => {
+                if cfg!(inf_canary_ns_refusal_writes_meta) {
+                    write_meta(fs, data_dir, &self.shape(export).encode())?;
+                }
                 self.epochs.answer(taken, slot, verdict);
                 return Ok(());
             }
         }
         self.tombstones.retire(min_published);
-        self.accept(intent);
-        let payload = self.shape(export).encode();
+        let payload = if cfg!(inf_canary_ns_intent_after_shape) {
+            let payload = self.shape(export).encode();
+            self.accept(intent);
+            payload
+        } else {
+            self.accept(intent);
+            self.shape(export).encode()
+        };
+        if cfg!(inf_canary_ns_answer_before_swap) {
+            self.publish_gauges();
+            self.epochs.answer(taken, slot, DdlVerdict::Accepted);
+            return write_meta(fs, data_dir, &payload);
+        }
         write_meta(fs, data_dir, &payload)?;
         self.publish_gauges();
         self.epochs.answer(taken, slot, DdlVerdict::Accepted);
@@ -1668,7 +1701,9 @@ impl CatalogWriter {
         };
         let gone = |id: u32| pending_drop == Some(id) || self.tombstones.contains(id);
         catalog.entries.retain(|e| !gone(e.id.0));
-        catalog.index.entries.retain(|r| !gone(r.ns.0));
+        if !cfg!(inf_canary_ns_index_record_kept) {
+            catalog.index.entries.retain(|r| !gone(r.ns.0));
+        }
         catalog.dropped = self.tombstones.ids();
         catalog
     }
@@ -1853,6 +1888,8 @@ impl ControlHandle {
             next_index_id: AtomicU32::new(next_index_id),
             next_index_generation: AtomicU64::new(next_index_generation),
             requests_sent: AtomicU64::new(0),
+            #[cfg(inf_canary_ns_epoch_at_send)]
+            numbered: AtomicU64::new(0),
             word,
             ckpt_clock: clock,
             recovery: Arc::new(RecoveryBoard::new(cells, start_unix_ms)),

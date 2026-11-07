@@ -663,6 +663,26 @@ rows=(
   # entry: there a 1 ms hold still counts a covered tick).
   "inf_canary_stop_tick_unheld m2-stop-tick stop-tick-unheld"
   "inf_canary_stop_tick_short_hold m2-stop-tick stop-tick-uncovered --seed 0xC0FFEE"
+  # ADR-0189 D2, D3, D5: the catalog writer and the DDL notice, one plant
+  # per rule, each oracle reading the disk or the wire. The slot and the
+  # word published before the META write: a requester reads its answer
+  # while the writer is held inside that write.
+  "inf_canary_ns_answer_before_swap crate-test inf-server test:catalog_requests an_answer_waits_for_its_own_meta_write answered before its META write returned"
+  # The epoch taken at send: the second sender's swap answers first, and
+  # the word decreases when the held DDL's own swap lands.
+  "inf_canary_ns_epoch_at_send crate-test inf-server test:catalog_requests a_create_held_before_its_send_is_answered_after_its_own_meta the published word decreased"
+  "inf_canary_ns_epoch_at_send crate-test inf-server test:catalog_requests a_drop_held_before_its_send_is_answered_after_its_own_meta the published word decreased"
+  # The payload shaped before the state moves: a DDL's own META lacks its
+  # change.
+  "inf_canary_ns_intent_after_shape crate-test inf-server test:catalog_requests every_payload_carries_the_ddl_in_flight own META names the namespace"
+  # The strip keeps a dropped namespace's index records: the written META
+  # does not decode.
+  "inf_canary_ns_index_record_kept crate-test inf-server test:catalog_requests an_index_on_the_dropped_namespace_leaves_meta_with_it IndexUnknownNamespace"
+  # A refusal writes META: the recording file system sees it.
+  "inf_canary_ns_refusal_writes_meta crate-test inf-server test:catalog_requests a_refused_request_writes_nothing the refusal touched the disk"
+  # The `ns_drop_after_meta` exit forgets its notice: the next DDL meets a
+  # pending one.
+  "inf_canary_ns_notice_forgotten crate-test inf-server test:node_e2e a_ddl_stopped_after_its_answer_leaves_no_ddl_pending another namespace DDL is pending"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

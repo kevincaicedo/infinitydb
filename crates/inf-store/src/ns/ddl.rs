@@ -136,6 +136,13 @@ impl CatalogEpochs {
         TakenEpoch(next)
     }
 
+    /// The planted canary: the epoch its sender took at send.
+    #[cfg(inf_canary_ns_epoch_at_send)]
+    pub fn take_numbered(&mut self, epoch: u64) -> TakenEpoch {
+        self.last = epoch;
+        TakenEpoch(epoch)
+    }
+
     /// Answers the request `taken` numbered: its slot first, when it has
     /// one, then the word, each with Release, so a reader woken by the
     /// word's edge reads its slot. An `Accepted` answer is given only after

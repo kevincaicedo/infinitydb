@@ -838,6 +838,9 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     // MANIFEST still names it, and this cell's unless it published a
     // checkpoint during the wait).
     if inf_foundation::fault::fire(crate::fault::NS_DROP_AFTER_META) {
+        if cfg!(inf_canary_ns_notice_forgotten) {
+            std::mem::forget(notice);
+        }
         return error_reply(shared, proto, "ERR fault: ns_drop_after_meta");
     }
     // The fan carries the answer's epoch: peers hold their teardown on
