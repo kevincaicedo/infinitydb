@@ -15,9 +15,22 @@
 //!
 //! Engagement: the owning cell's `frame_waits_fill` rose by at least 8 and
 //! the burst took less than the fill window, so every episode's timer was
-//! still due when the last one began; else the run is `VACUOUS`. The data
-//! directory is under the workspace `target/`, a disk filesystem, since the
-//! fua class writes through `O_DIRECT`.
+//! still due when the last one began; else the run is `VACUOUS`.
+//!
+//! The medium. An episode needs a sealable frame, and none seals while the
+//! cell's K frames are in flight, so a device that other workloads share can
+//! keep the ring full past the burst. The data directory is therefore a
+//! fresh directory on `/dev/shm`, a tmpfs, where a frame's write is a copy
+//! into memory whatever else writes to the host's disks. The fua class opens
+//! its segments `O_DIRECT` (ADR-0086 D1), which tmpfs takes from Linux 6.6:
+//! before any node starts, a `/dev/shm` that is missing, is not a tmpfs, or
+//! refuses the engine's own `O_DIRECT` open fails the run as `MEDIUM`, with
+//! no fallback to a disk directory. The node owns the directory and is
+//! reaped before it goes; a red after the node's spawn prints its exit
+//! status and the last lines of its stderr, which lives on the medium. The
+//! directory is removed on every exit but a kill, and a killed run's by the
+//! next run, which reads a run's liveness from `/proc`: its scope is one
+//! PID namespace per `/dev/shm`.
 #![cfg(target_os = "linux")]
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // harness process, not cell code
 
@@ -27,6 +40,9 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use inf_log::fs::SegmentFs;
+use inf_server::StdSegmentFs;
 
 const CELLS: u16 = 2;
 const SETS: usize = 64;
@@ -41,25 +57,136 @@ const EPISODES_MIN: u64 = 8;
 const ROLES: u64 = inf_server::TimerRole::COUNT as u64;
 /// The owning cell's armed peak: its everysec owner and its fill owner.
 const OWNER_ARMED_MAX: u64 = 2;
+/// The medium: a tmpfs, so no device's latency reaches the frame ring.
+const MEDIUM: &str = "/dev/shm";
+/// A run's data directory on the medium: this prefix, then the run's pid.
+const RUN_PREFIX: &str = "infinityd-timer-owners-";
+/// The lines of the node's stderr a red prints, its last ones.
+const STDERR_TAIL_LINES: usize = 40;
 
+/// The run's data directory on the medium, removed when it drops: a tmpfs
+/// holds its bytes in memory, and in the user's quota, until then.
+struct DataDir(PathBuf);
+
+impl DataDir {
+    /// Checks the medium, removes killed runs' directories and makes this
+    /// run's, fresh. Each refusal is red before any node starts.
+    fn create() -> DataDir {
+        let medium = Path::new(MEDIUM);
+        if let Err(e) = std::fs::canonicalize(medium) {
+            // `identity_of` reads nothing of a path it cannot resolve, its
+            // kernel release included.
+            let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+            panic!("MEDIUM: {MEDIUM} is missing ({e}) (kernel {})", kernel.trim());
+        }
+        // The node's own reader of a directory's filesystem.
+        let identity = inf_probe::identity_of(medium);
+        let kernel = identity.kernel_release.as_str();
+        let kind = if identity.fs_type.is_empty() { "unknown" } else { identity.fs_type.as_str() };
+        assert!(kind == "tmpfs", "MEDIUM: {MEDIUM} is {kind}, not a tmpfs (kernel {kernel})");
+        sweep_killed_runs();
+        let dir = DataDir(medium.join(format!("{RUN_PREFIX}{}", std::process::id())));
+        // A directory of this pid is a killed run's from an earlier boot.
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir(&dir.0).expect("data dir");
+        // The engine's own open, `O_DIRECT` verified in the fd's flags; no
+        // bytes, since the open is the probe.
+        let probe = dir.0.join("o-direct-probe");
+        if let Err(e) = StdSegmentFs.create_segment_direct(&probe, 0) {
+            panic!(
+                "MEDIUM: {MEDIUM} refuses O_DIRECT ({e}); tmpfs takes it from Linux 6.6, \
+                 this kernel is {kernel}"
+            );
+        }
+        std::fs::remove_file(&probe).expect("probe removed");
+        dir
+    }
+
+    /// The bytes the medium holds for the run: its files' allocated blocks.
+    fn footprint_bytes(&self) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        let mut total = 0;
+        let mut pending = vec![self.0.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir") {
+                let entry = entry.expect("entry");
+                let meta = entry.metadata().expect("metadata");
+                total += meta.blocks() * 512;
+                if meta.is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        total
+    }
+}
+
+impl Drop for DataDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("timer_owners: {} not removed: {e}", self.0.display());
+        }
+    }
+}
+
+/// Removes the data directories of runs whose process is gone (a killed
+/// run's): a name of `RUN_PREFIX` and a pid with no `/proc` entry, nothing
+/// else. A run's pid has its entry before its directory exists, so inside
+/// one PID namespace no run removes a live run's directory.
+fn sweep_killed_runs() {
+    for entry in std::fs::read_dir(MEDIUM).expect("the medium lists") {
+        let name = entry.expect("a medium entry").file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix(RUN_PREFIX)).and_then(run_pid)
+        else {
+            continue;
+        };
+        if !Path::new("/proc").join(pid.to_string()).exists() {
+            let _ = std::fs::remove_dir_all(Path::new(MEDIUM).join(&name));
+        }
+    }
+}
+
+/// A pid as a run writes it: ASCII digits with no leading zero, in a
+/// `u32`. A name no run makes (`+1`, `01`) is never read as a pid.
+fn run_pid(text: &str) -> Option<u32> {
+    let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    if digits && !text.starts_with('0') { text.parse().ok() } else { None }
+}
+
+/// The node, which owns its data directory: a struct's fields drop after
+/// its `drop` body returns, so the node is reaped before the directory goes.
 struct Server {
     child: Child,
     port: u16,
     stderr: PathBuf,
+    dir: DataDir,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let status = self.child.wait();
+        if std::thread::panicking() {
+            // The red's reason. The exit status lives off the medium, so a
+            // full medium still shows the node's fail-stop.
+            match status {
+                Ok(status) => eprintln!("infinityd: {status}"),
+                Err(e) => eprintln!("infinityd: not reaped ({e})"),
+            }
+            let text = self.text();
+            let lines: Vec<&str> = text.lines().collect();
+            for line in &lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..] {
+                eprintln!("infinityd stderr: {line}");
+            }
+        }
     }
 }
 
 impl Server {
     /// Two cells on the fua class with the fill window at its maximum;
     /// every cell reachable through the accept hand-off.
-    fn spawn(dir: &Path) -> Server {
-        let stderr = dir.join("stderr");
+    fn spawn(dir: DataDir) -> Server {
+        let stderr = dir.0.join("stderr");
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .expect("probe bind")
             .local_addr()
@@ -71,12 +198,12 @@ impl Server {
             .args(["--accept-handoff", "on", "--device-probe", "off"])
             .args(["--barrier-class", "fua", "--fill-window-us", &FILL_WINDOW_US.to_string()])
             .arg("--data-dir")
-            .arg(dir)
+            .arg(&dir.0)
             .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(&stderr).expect("stderr file")))
             .spawn()
             .expect("spawn infinityd");
-        let mut server = Server { child, port: 0, stderr };
+        let mut server = Server { child, port: 0, stderr, dir };
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(status) = server.child.try_wait().expect("try_wait") {
@@ -204,12 +331,7 @@ fn timer_owners_row(caps: &str) -> (u64, u64) {
 
 #[test]
 fn a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/e2e-timer-owners")
-        .join(std::process::id().to_string());
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("data dir");
-    let server = Server::spawn(&dir);
+    let server = Server::spawn(DataDir::create());
     let mut writer = Client::connect(server.port);
     writer.ok(&[b"INF.NS", b"CREATE", b"tm", b"MODE", b"durable", b"FSYNC", b"everysec"]);
     writer.ok(&[b"INF.NS", b"USE", b"tm"]);
@@ -237,6 +359,7 @@ fn a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell() {
         cells.iter_mut().map(|(cell, conn)| (*cell, conn.info("persistence"))).collect();
     let episodes = field(&persistence[&owner], "frame_waits_fill") - waits_before;
     println!("owner cell {owner}: {episodes} fill episodes in {burst:?}");
+    println!("medium {MEDIUM}: {} KiB held", server.dir.footprint_bytes() >> 10);
     for (cell, info) in &persistence {
         println!("cell {cell}: timers_armed_max {}", field(info, "timers_armed_max"));
     }
@@ -259,5 +382,4 @@ fn a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell() {
         assert_eq!((high_water, crossings), (ROLES, 0), "cell {cell}'s timer-owners row");
     }
     drop(server);
-    let _ = std::fs::remove_dir_all(&dir);
 }
