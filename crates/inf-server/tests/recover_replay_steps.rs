@@ -187,7 +187,12 @@ fn make_durable<F: SegmentFs>(fs: &F, cfg: &DurableConfig) {
 }
 
 fn cold_dir(cfg: &DurableConfig) -> PathBuf {
-    cfg.data_dir.join(format!("shard-{CELL}")).join(format!("ns-{}", TIER_NS.0)).join("cold")
+    cold_dir_of(cfg, TIER_NS)
+}
+
+/// The directory of tiered namespace `ns`: its tier and extent files.
+fn cold_dir_of(cfg: &DurableConfig, ns: NsId) -> PathBuf {
+    cfg.data_dir.join(format!("shard-{CELL}")).join(format!("ns-{}", ns.0)).join("cold")
 }
 
 /// The namespace's tier files: (base, readable bytes, path), each probed
@@ -1326,20 +1331,31 @@ fn a_frame_of_deletes_of_demoted_keys_asks_after_each_priced_delete() {
     }
 }
 
-/// One boot's recovered state for budget independence: the
-/// table digest, every tier file byte for byte, what every key serves, the
-/// extent reference map, the reclaim queue in its hand-out order (the
-/// order the boot's deaths reached it), the ticket rebuild's counters, the
-/// D6 counters (the gauges and the step facts excepted), the record counts
+/// One tiered namespace's recovered state for budget independence: the
+/// table digest; the files of its directory byte for byte — tier files,
+/// extent files and their quarantine twins; the extent reference map; the
+/// reclaim queue in its hand-out order (the order the boot's deaths and the
+/// listings reached it), each candidate with its origin; the ticket
+/// rebuild's counters; and the extent id cursor, the next id the table hands
+/// out, which a sweep seed that missed a listed id would hand out again.
+#[derive(Debug, PartialEq, Eq)]
+struct NsRecovered {
+    table: inf_store::StateDigest,
+    files: Vec<(String, Vec<u8>)>,
+    extents: Vec<(u64, u64, u64)>,
+    reclaim: Vec<inf_store::ReclaimCandidate>,
+    shadow: inf_store::ShadowCounters,
+    next_extent_id: u64,
+}
+
+/// One boot's recovered state for budget independence: every tiered
+/// namespace's, in id order; what every key of the model serves; the D6
+/// counters (the gauges and the step facts excepted); the record counts;
 /// and the hand-over's rebuild reads and revive renames.
 #[derive(Debug, PartialEq, Eq)]
 struct Recovered {
-    table: inf_store::StateDigest,
-    files: Vec<(String, Vec<u8>)>,
+    namespaces: Vec<(NsId, NsRecovered)>,
     served: Model,
-    extents: Vec<(u64, u64, u64)>,
-    reclaim_order: Vec<u64>,
-    shadow: inf_store::ShadowCounters,
     counters: inf_store::ReplayCounters,
     dead_life_files_removed: u64,
     records_applied: u64,
@@ -1348,7 +1364,15 @@ struct Recovered {
     blob_revived: u64,
 }
 
-fn file_bytes(fs: &MemFs, path: &std::path::Path) -> Vec<u8> {
+impl Recovered {
+    /// The state of [`TIER_NS`], the namespace every unit writes.
+    fn tier(&self) -> &NsRecovered {
+        let found = self.namespaces.iter().find(|(ns, _)| *ns == TIER_NS);
+        &found.expect("the unit's tiered namespace").1
+    }
+}
+
+fn file_bytes<F: SegmentFs>(fs: &F, path: &std::path::Path) -> Vec<u8> {
     let file = fs.open_read(path).expect("open");
     let mut bytes = vec![0u8; file.file_size().expect("size") as usize];
     let mut done = 0usize;
@@ -1360,10 +1384,27 @@ fn file_bytes(fs: &MemFs, path: &std::path::Path) -> Vec<u8> {
     bytes
 }
 
+/// [`boot_recovered`] over [`tiered_keyspace`], asserting that a small
+/// budget yields inside a unit.
 fn recovered(fs: &CountingFs, cfg: &DurableConfig, budget: u64, model: &Model) -> Recovered {
-    let mut ks = tiered_keyspace();
+    let (state, stats) = boot_recovered(fs, cfg, tiered_keyspace(), budget, model);
+    if budget != u64::MAX && budget <= 256 << 10 {
+        engagement(&stats).expect("a small budget yields inside a unit");
+    }
+    state
+}
+
+/// Boots the cell on `fs` into `ks` at `budget` and reads its recovered
+/// state, with the boot's stats.
+fn boot_recovered<F: SegmentFs + Clone>(
+    fs: &F,
+    cfg: &DurableConfig,
+    mut ks: Keyspace,
+    budget: u64,
+    model: &Model,
+) -> (Recovered, inf_server::RecoverStats) {
     let mut recovery = Recovery::new(fs.clone(), CELL, cfg, anchor(), now());
-    // Bound: every step makes progress; a boot of this unit at a budget of
+    // Bound: every step makes progress; a boot of these units at a budget of
     // 0 takes well under a million steps, so a walk that re-applies records
     // without moving on is caught here, not as a hang.
     let mut steps = 0u64;
@@ -1373,37 +1414,48 @@ fn recovered(fs: &CountingFs, cfg: &DurableConfig, budget: u64, model: &Model) -
         assert!(steps < 5_000_000, "BUDGET INDEPENDENCE: no progress at {budget}");
     }
     let (_rotor, stats, _seed) = recovery.finish();
-    let cold = cold_dir(cfg);
-    let mut names = fs.list_dir(&cold).unwrap_or_default();
-    names.sort();
-    let files = names
-        .into_iter()
-        .map(|name| (name.clone(), file_bytes(&fs.inner, &cold.join(name))))
-        .collect();
     let (served, _, _) = read_back(fs, cfg, &mut ks, model);
-    if budget != u64::MAX && budget <= 256 << 10 {
-        engagement(&stats).expect("a small budget yields inside a unit");
-    }
-    let table = ks.tiered_store_mut(TIER_NS).expect("tiered");
-    let digest = table.simulation_digest();
-    let extents = table.extent_references().collect();
-    let shadow = table.shadow_counters();
-    // Read last: handing the queue out moves its candidates into reclaim.
-    let queue = table.extent_reclaim_work(u64::MAX, usize::MAX);
-    Recovered {
-        table: digest,
-        files,
+    let mut tiered: Vec<NsId> =
+        ks.ns_iter().filter(|spec| spec.tier.is_some()).map(|spec| spec.id).collect();
+    tiered.sort_unstable();
+    let namespaces = tiered
+        .into_iter()
+        .map(|ns| {
+            let table = ks.tiered_store_mut(ns).expect("tiered");
+            (ns, ns_recovered(fs, &cold_dir_of(cfg, ns), table))
+        })
+        .collect();
+    let state = Recovered {
+        namespaces,
         served,
-        extents,
-        reclaim_order: queue.iter().map(|candidate| candidate.extent_id).collect(),
-        shadow,
         counters: stats.tier_replay.counters,
         dead_life_files_removed: stats.tier_replay.dead_life_files_removed,
         records_applied: stats.records_applied,
         records_pre_begin: stats.records_pre_begin,
         shadow_settle_reads: stats.shadow_settle_reads,
         blob_revived: stats.blob_revived,
-    }
+    };
+    (state, stats)
+}
+
+/// One namespace's [`NsRecovered`]: its directory `cold` and its table.
+fn ns_recovered<F: SegmentFs>(
+    fs: &F,
+    cold: &std::path::Path,
+    table: &mut TieredTable,
+) -> NsRecovered {
+    let mut names = fs.list_dir(cold).unwrap_or_default();
+    names.sort();
+    let files =
+        names.into_iter().map(|name| (name.clone(), file_bytes(fs, &cold.join(name)))).collect();
+    let digest = table.simulation_digest();
+    let extents = table.extent_references().collect();
+    let shadow = table.shadow_counters();
+    // Read last: handing the queue out moves its candidates into reclaim,
+    // and the cursor's read allocates the id it answers.
+    let reclaim = table.extent_reclaim_work(u64::MAX, usize::MAX);
+    let next_extent_id = table.allocate_extent_id();
+    NsRecovered { table: digest, files, extents, reclaim, shadow, next_extent_id }
 }
 
 /// Budget independence: the same recovery unit — a 1 MiB frame
@@ -1438,26 +1490,36 @@ fn every_budget_recovers_the_state_of_the_unparked_boot() {
 /// Budget independence's comparison, naming the first field that differs.
 fn assert_same(state: &Recovered, control: &Recovered, budget: u64) {
     let at = format!("BUDGET INDEPENDENCE: budget {budget}");
-    assert_eq!(state.table, control.table, "{at}: the table digest");
-    let names =
-        |r: &Recovered| r.files.iter().map(|(n, b)| (n.clone(), b.len())).collect::<Vec<_>>();
-    assert_eq!(names(state), names(control), "{at}: the tier files' names and sizes");
-    for ((name, bytes), (_, want)) in state.files.iter().zip(&control.files) {
-        let differs = bytes.iter().zip(want).position(|(a, b)| a != b);
-        assert!(differs.is_none(), "{at}: {name} differs from byte {differs:?}");
+    let ids = |r: &Recovered| r.namespaces.iter().map(|(ns, _)| *ns).collect::<Vec<_>>();
+    assert_eq!(ids(state), ids(control), "{at}: the tiered namespaces");
+    for ((ns, state), (_, control)) in state.namespaces.iter().zip(&control.namespaces) {
+        assert_same_ns(state, control, &format!("{at}, ns {}", ns.0));
     }
     assert!(state.served == control.served, "{at}: the served values");
-    let differs = first_difference(&state.extents, &control.extents);
-    assert!(differs.is_none(), "{at}: the extent references differ from entry {differs:?}");
-    let differs = first_difference(&state.reclaim_order, &control.reclaim_order);
-    assert!(differs.is_none(), "{at}: the reclaim queue's order differs from {differs:?}");
-    assert_eq!(state.shadow, control.shadow, "{at}: the ticket rebuild's counters");
     assert_eq!(state.counters, control.counters, "{at}: the D6 counters");
     assert_eq!(state.shadow_settle_reads, control.shadow_settle_reads, "{at}: rebuild reads");
     assert_eq!(state.blob_revived, control.blob_revived, "{at}: revive renames");
     assert_eq!(state.dead_life_files_removed, control.dead_life_files_removed, "{at}");
     assert_eq!(state.records_applied, control.records_applied, "{at}: records applied");
     assert_eq!(state.records_pre_begin, control.records_pre_begin, "{at}: records below begin");
+}
+
+/// One namespace's half of [`assert_same`].
+fn assert_same_ns(state: &NsRecovered, control: &NsRecovered, at: &str) {
+    assert_eq!(state.table, control.table, "{at}: the table digest");
+    let names =
+        |r: &NsRecovered| r.files.iter().map(|(n, b)| (n.clone(), b.len())).collect::<Vec<_>>();
+    assert_eq!(names(state), names(control), "{at}: the directory's names and sizes");
+    for ((name, bytes), (_, want)) in state.files.iter().zip(&control.files) {
+        let differs = bytes.iter().zip(want).position(|(a, b)| a != b);
+        assert!(differs.is_none(), "{at}: {name} differs from byte {differs:?}");
+    }
+    let differs = first_difference(&state.extents, &control.extents);
+    assert!(differs.is_none(), "{at}: the extent references differ from entry {differs:?}");
+    let differs = first_difference(&state.reclaim, &control.reclaim);
+    assert!(differs.is_none(), "{at}: the reclaim queue differs from candidate {differs:?}");
+    assert_eq!(state.shadow, control.shadow, "{at}: the ticket rebuild's counters");
+    assert_eq!(state.next_extent_id, control.next_extent_id, "{at}: the extent id cursor");
 }
 
 /// The first index at which two lists differ (the shorter one's length
@@ -2127,10 +2189,10 @@ fn every_budget_recovers_the_checkpoint_of_the_unparked_boot() {
     // The order is observable where budgets differ: more deaths queued than
     // one 4 KiB step releases, so that leg's batches resume inside the list.
     let batch = (4 << 10) / inf_store::limits::RECOVER_PROBE_CHARGE_BYTES;
-    let deaths = control.reclaim_order.len() as u64;
+    let deaths = control.tier().reclaim.len() as u64;
     eprintln!(
         "checkpoint control: {deaths} deaths queued, {} extent references, {:?}",
-        control.extents.len(),
+        control.tier().extents.len(),
         control.counters
     );
     assert!(deaths > 2 * batch, "VACUOUS: {deaths} deaths in the reclaim queue");
@@ -2374,7 +2436,8 @@ fn the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge() {
 /// byte for byte (the revived names among them), served values, extent
 /// reference map, reclaim queue in hand-out order (the stamped deaths, then
 /// the orphans and the second verdicts, in the listings' order, which the
-/// small budgets queue a batch a step), ticket rebuild counters, D6 counters
+/// small budgets queue a batch a step) with each candidate's origin, extent
+/// id cursor (past every listed id), ticket rebuild counters, D6 counters
 /// and record counts.
 #[test]
 fn every_budget_recovers_the_end_of_the_unparked_boot() {
@@ -2389,10 +2452,14 @@ fn every_budget_recovers_the_end_of_the_unparked_boot() {
     };
     let (model, control) = boot(u64::MAX);
     assert_model(&control.served, &model, "the control boot");
-    let queued = control.reclaim_order.len() as u64;
+    let queued = control.tier().reclaim.len() as u64;
     assert_eq!(queued, END_PARKED + END_ORPHANS + END_REVIVED, "VACUOUS: {queued} queued");
     assert_eq!(control.blob_revived, END_REVIVED, "VACUOUS: no revive rename");
     assert!(control.shadow_settle_reads > 0, "VACUOUS: no slot past the ticket cap");
+    // The largest listed id is the last unreferenced quarantined one.
+    let listed_max = END_PARKED + END_REVIVED + END_ORPHANS + END_REVIVED;
+    let cursor = control.tier().next_extent_id;
+    assert_eq!(cursor, listed_max + 1, "the extent id cursor passes every listed id");
     for budget in [8 << 20, 256 << 10, 4 << 10, 1, 0] {
         let (model, state) = boot(budget);
         assert_model(&state.served, &model, &format!("BUDGET INDEPENDENCE at {budget}"));
