@@ -2264,8 +2264,10 @@ mod drop_tombstone_tests {
     }
 
     /// A refused request writes nothing and moves nothing but the epoch
-    /// and the word; its token reads the refusal, and an accepted
-    /// request's token reads its receipt only after its write.
+    /// and the word: the tombstone set keeps a tombstone every cell has
+    /// published past, and the token reads the refusal. The next accepted
+    /// request retires that tombstone, writes `META`, and its token reads
+    /// its receipt.
     #[test]
     #[allow(clippy::disallowed_methods, reason = "test-only: the writer's scratch directory")]
     fn a_refusal_moves_nothing_but_the_epoch_and_the_word() {
@@ -2273,6 +2275,13 @@ mod drop_tombstone_tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let mut w = writer();
         let handle = std::sync::Arc::clone(&w.handle);
+        // A stamped tombstone the board's fold covers: any accepted request
+        // retires it.
+        w.tombstones.add(18);
+        w.tombstones.stamp(18, 3);
+        let board = handle.ckpt_board();
+        (0..2).for_each(|cell| board.slot(cell).publish(3, 1, 1));
+        assert_eq!(board.min_published(), 3, "every cell published past the stamp");
         let (slot, requested) =
             inf_store::ddl::answer_slot::<inf_store::ddl::CreatePersisted>(entry(40).id);
         let mut taken = entry(40);
@@ -2285,11 +2294,30 @@ mod drop_tombstone_tests {
         w.answer(req, &inf_log::fs::StdSegmentFs, &dir).expect("a refusal writes nothing");
         assert!(!dir.join("META").exists() && !dir.join("META.new").exists(), "no META write");
         assert!(w.pending.is_none());
+        assert_eq!(w.tombstones.entries, vec![(18, Some(3))], "the refusal retired nothing");
         assert_eq!(handle.persisted_epoch(), 1, "the word moved");
         assert!(matches!(
             requested.answer(handle.catalog_word()),
             Answer::Refused(DdlRefusal::NameExists)
         ));
+        let (slot, requested) =
+            inf_store::ddl::answer_slot::<inf_store::ddl::CreatePersisted>(entry(41).id);
+        let req = CatalogRequest::new(
+            Some(DdlIntent::Create(entry(41))),
+            catalog(vec![entry(16)]),
+            Some(slot),
+        );
+        w.answer(req, &inf_log::fs::StdSegmentFs, &dir).expect("the META write");
+        assert!(dir.join("META").exists(), "an acceptance writes META");
+        assert!(w.tombstones.entries.is_empty(), "the acceptance retired the covered tombstone");
+        assert_eq!(handle.persisted_epoch(), 2);
+        match requested.answer(handle.catalog_word()) {
+            Answer::Accepted(receipt) => {
+                assert_eq!(receipt.id(), entry(41).id);
+                assert_eq!(receipt.fan_epoch(), 2, "the receipt carries its own epoch");
+            }
+            Answer::Pending(_) | Answer::Refused(_) => panic!("an accepted request's receipt"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
