@@ -1528,10 +1528,13 @@ fn the_cell_leaves_tier_file_unlinks_to_the_control_thread() {
     cell.maintain_teardown(|_| true);
     let dropped_unlinked = !on_disk(&cell, &active);
     assert!(
-        !retired_unlinked && !dropped_unlinked,
-        "the cell's own loop unlinked tier files: the retired file {} ({retired_unlinked}), the \
-         dropped namespace's active file {} ({dropped_unlinked})",
-        paths[0].display(),
+        !retired_unlinked,
+        "the cell's own loop unlinked the retired file {} in its MAINTAIN",
+        paths[0].display()
+    );
+    assert!(
+        !dropped_unlinked,
+        "the cell's own loop unlinked the dropped namespace's active file {} in its teardown",
         active.display()
     );
 }
