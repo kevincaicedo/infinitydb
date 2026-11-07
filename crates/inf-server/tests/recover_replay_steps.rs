@@ -353,12 +353,13 @@ fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
 /// - a replay step still inside its segment yielded at its budget: its
 ///   work (`Recovery::step_work_bytes`) reaches it;
 /// - an end-settle step that yields charged its budget, by at most one
-///   record and its twins' reads;
-/// - the last one adds only the hand-over's drain (E13): one barrier, the
-///   active file's seal, and the settle reads of ADR-0093's rebuild, read
-///   from the stats. The drain appends nothing: every demote step appends
-///   up to its cut, and the end settle seals nothing (`ro` does not move),
-///   which `TierReplay::hand_over` asserts;
+///   record and its twins' reads, and the last one stays within its budget
+///   and the same unit: the hand-over is a phase of its own;
+/// - a hand-over step's boot I/O stays within its budget and one unit, a
+///   rebuild's settle read or the drain's seal of the active file (one
+///   barrier). The drain appends nothing: every demote step appends up to
+///   its cut, and the end settle seals nothing (`ro` does not move), which
+///   `TierReplay::hand_over` asserts;
 /// - the end settle walks its open span `[ro, tail)` at one budget byte a
 ///   byte and a step charges at most its budget and one record's unit, so
 ///   it takes at least ⌈span ÷ (budget + unit)⌉ steps;
@@ -372,7 +373,7 @@ fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
 /// `inf_canary_replay_charge_dropped`), on one that settles without a
 /// budget (`inf_canary_replay_settle_unbudgeted`), and on one that settles
 /// at twice its budget (`inf_canary_replay_settle_doubled`: at 8 MiB the
-/// whole settle is the last step, which only the drain's bound judges).
+/// whole settle is the last step, which only its bound of one unit judges).
 #[test]
 fn every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget() {
     // The upper bounds are asserted as each step runs, the yields under the
@@ -393,7 +394,7 @@ fn every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_
 /// One boot under `budget`, its upper bounds asserted; returns the replay
 /// steps that yielded under the budget.
 fn step_under_budget(budget: u64) -> Vec<String> {
-    use inf_server::RecoverPhase;
+    use inf_server::{RecoverPhase, UnitPhase};
     let barrier = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES;
     let read_price = inf_store::limits::SETTLE_READ_CHARGE_BYTES;
     let page = inf_alloc::REGION_PAGE_BYTES as u64;
@@ -406,7 +407,7 @@ fn step_under_budget(budget: u64) -> Vec<String> {
     let flush_unit = lead + page + 2 * record + 2 * barrier;
     let record_unit = FRAME_BYTES_MAX + flush_unit.max(record + read_price);
     let settle_unit = record + 4 * read_price;
-    let drain_unit = |rebuild_reads: u64| barrier + rebuild_reads * read_price;
+    let hand_over_unit = barrier.max(read_price);
 
     let mut ks = tiered_keyspace();
     let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
@@ -416,7 +417,6 @@ fn step_under_budget(budget: u64) -> Vec<String> {
         let phase = recovery.phase();
         let segments_before = recovery.segments_progress().0;
         let consumed_before = recovery.bytes_consumed();
-        let rebuild_reads_before = recovery.stats().shadow_settle_reads;
         let tier_before = tier_bytes_on_disk(&fs, &cfg);
         let progress = recovery.step(&mut ks, budget).expect("a step");
         if progress == RecoveryProgress::Complete {
@@ -430,8 +430,8 @@ fn step_under_budget(budget: u64) -> Vec<String> {
         if tier_bytes_on_disk(&fs, &cfg) > tier_before {
             assert!(charge >= barrier, "{at}: tier files grew under a charge of {charge}");
         }
-        match phase {
-            RecoverPhase::Replay => {
+        match recovery.unit_row().phase {
+            UnitPhase::Replay => {
                 assert!(
                     read + charge < budget + record_unit,
                     "{at}: {read} read + {charge} charged passes the budget by more than one \
@@ -447,36 +447,42 @@ fn step_under_budget(budget: u64) -> Vec<String> {
             }
             // The lift decision: replay has ended, and the end settle's
             // cursor starts at `ro`.
-            RecoverPhase::Finish if open_span.is_none() => {
+            UnitPhase::Finish if open_span.is_none() => {
                 let space = ks.tiered_store(TIER_NS).expect("tiered").space();
                 open_span = Some(space.tail().to_raw() - space.ro_boundary().to_raw());
             }
-            RecoverPhase::Finish => {
+            UnitPhase::Settle => {
                 settle_steps += 1;
                 let violation = format!("{at}: SETTLE BUDGET VIOLATION");
-                if recovery.phase() == RecoverPhase::Finish {
+                if recovery.next_unit_row().phase == UnitPhase::Settle {
                     assert!(
                         charge >= budget,
                         "{violation}: a step yielded at a charge of {charge}"
                     );
-                    let bound = budget + settle_unit;
-                    assert!(charge < bound, "{violation}: a step charged {charge}, over {bound}");
-                } else {
-                    let rebuild_reads = recovery.stats().shadow_settle_reads - rebuild_reads_before;
-                    let drain = drain_unit(rebuild_reads);
-                    let bound = budget + settle_unit + drain;
-                    assert!(
-                        charge < bound,
-                        "{violation}: the last step charged {charge}, over its budget, one \
-                         record's unit ({settle_unit}) and the hand-over's drain ({drain})"
-                    );
                 }
+                let bound = budget + settle_unit;
+                assert!(charge < bound, "{violation}: a step charged {charge}, over {bound}");
             }
-            RecoverPhase::Start
-            | RecoverPhase::Ckpt
-            | RecoverPhase::Audit
-            | RecoverPhase::Complete => {
-                assert_eq!(charge, 0, "{at}: no boot I/O outside replay and the settle");
+            UnitPhase::HandOver => {
+                let bound = budget + hand_over_unit;
+                assert!(
+                    charge <= bound,
+                    "{at}: a hand-over step's boot I/O of {charge} passes its budget and one \
+                     unit ({bound})"
+                );
+            }
+            UnitPhase::Finish
+            | UnitPhase::Start
+            | UnitPhase::Ick
+            | UnitPhase::CkptEnd
+            | UnitPhase::Audit
+            | UnitPhase::Probe
+            | UnitPhase::Resume
+            | UnitPhase::Complete => {
+                assert_eq!(
+                    charge, 0,
+                    "{at}: no boot I/O outside replay, the settle and the hand-over"
+                );
             }
         }
     }
@@ -520,7 +526,9 @@ enum Cut {
     AfterFirstDemote,
     /// Inside the end settle with records unsettled: a settle step yielded.
     InsideSettle,
-    /// After E13's hand-over, before the cell serves: the boot completed.
+    /// After the last machine's hand-over, before the log resumes.
+    BeforeResume,
+    /// After the resume, before the cell serves: the boot completed.
     AfterHandOver,
 }
 
@@ -539,10 +547,10 @@ struct BootState {
 /// it landed there, and drops every handle — the process dies; the
 /// caller cuts the power.
 fn boot_cut(disk: &inf_server::SimDisk, cfg: &DurableConfig, budget: u64, cut: Cut) {
-    use inf_server::RecoverPhase;
+    use inf_server::{RecoverPhase, UnitPhase};
     let mut ks = tiered_keyspace();
     let mut recovery = Recovery::new(disk.clone(), CELL, cfg, anchor(), now());
-    let mut finish_steps = 0u64;
+    let mut settle_steps = 0u64;
     let cold = cold_dir(cfg);
     // Bound: the boot's own steps — every step progresses (above).
     for _ in 0..1_000_000u64 {
@@ -556,9 +564,11 @@ fn boot_cut(disk: &inf_server::SimDisk, cfg: &DurableConfig, budget: u64, cut: C
                     && recovery.phase() == RecoverPhase::Replay
             }
             Cut::InsideSettle => {
-                finish_steps += u64::from(phase == RecoverPhase::Finish);
-                finish_steps >= 3 && recovery.phase() == RecoverPhase::Finish
+                let settled = recovery.unit_row().phase == UnitPhase::Settle;
+                settle_steps += u64::from(settled);
+                settle_steps >= 2 && recovery.next_unit_row().phase == UnitPhase::Settle
             }
+            Cut::BeforeResume => recovery.next_unit_row().phase == UnitPhase::Resume,
             Cut::AfterHandOver => progress == RecoveryProgress::Complete,
         };
         if landed {
@@ -600,9 +610,10 @@ fn boot_whole(
 }
 
 /// A demoting boot cut by a power loss — after its first demote step,
-/// inside its end settle, or after its hand-over before the cell serves —
-/// once, or twice in a row, leaves unmanifested tier files the next boot
-/// removes before any flush (ADR-0174 D4, D5); the boot that completes
+/// inside its end settle, between its hand-over and its log's resume, or
+/// after the resume before the cell serves — once, or twice in a row,
+/// leaves unmanifested tier files the next boot removes before any flush
+/// (ADR-0174 D4, D5); the boot that completes
 /// reproduces the uncut boot of the same unit exactly: the table's digest,
 /// the tier files byte for byte, and every key of the model. Each cut
 /// asserts it landed where it says (`VACUOUS` otherwise), on the
@@ -616,12 +627,14 @@ fn a_demoting_boot_cut_at_each_point_once_or_twice_recovers_the_uncut_boot() {
     let uncut = boot_whole(&disk, &cfg, BUDGET, &unit.model).expect("the uncut boot");
     assert_model(&uncut.served, &unit.model, "the uncut boot");
     assert!(!uncut.files.is_empty(), "VACUOUS: the uncut boot sealed no tier file");
-    let rows: [&[Cut]; 6] = [
+    let rows: [&[Cut]; 8] = [
         &[Cut::AfterFirstDemote],
         &[Cut::InsideSettle],
+        &[Cut::BeforeResume],
         &[Cut::AfterHandOver],
         &[Cut::AfterFirstDemote, Cut::InsideSettle],
         &[Cut::InsideSettle, Cut::AfterHandOver],
+        &[Cut::BeforeResume, Cut::InsideSettle],
         &[Cut::AfterHandOver, Cut::AfterFirstDemote],
     ];
     for (row, cuts) in rows.iter().enumerate() {
@@ -689,11 +702,19 @@ struct Tally {
     /// The units with no I/O of their own a step ran (the engine's unit
     /// counters, apart from its charge), each at the RAM price.
     ram_units: u64,
+    /// The probe groups the ticket rebuild scanned (its unit counter), each
+    /// at its bytes.
+    group_units: u64,
 }
 
-/// The RAM units counted between two readings of a cell's stats.
-fn units_since(now: inf_server::RecoverUnits, before: inf_server::RecoverUnits) -> u64 {
-    (now.ckpt_entries - before.ckpt_entries) + (now.ckpt_end_releases - before.ckpt_end_releases)
+/// The RAM units and the rebuild's probe groups counted between two
+/// readings of a cell's stats.
+fn units_since(now: inf_server::RecoverUnits, before: inf_server::RecoverUnits) -> (u64, u64) {
+    let ram = (now.ckpt_entries - before.ckpt_entries)
+        + (now.ckpt_end_releases - before.ckpt_end_releases)
+        + (now.sweep_stamped - before.sweep_stamped)
+        + (now.sweep_seeded - before.sweep_seeded);
+    (ram, now.rebuild_groups - before.rebuild_groups)
 }
 
 impl Tally {
@@ -709,20 +730,24 @@ impl Tally {
             renames: self.renames - before.renames,
             lists: self.lists - before.lists,
             ram_units: self.ram_units,
+            group_units: self.group_units,
         }
     }
 
     /// The work at the `limits` prices: a reader byte and a tier byte one
     /// budget byte each, a settle read at the store's read price, a
-    /// barrier — a file's or a directory's — at the server's, a RAM unit
-    /// at the store's probe price.
+    /// barrier — a file's or a directory's — at the server's, a rename at
+    /// the server's file-operation price, a RAM unit at the store's probe
+    /// price and a probe group at the store's group price.
     fn priced(self) -> u64 {
         let barrier = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES;
         self.reader_bytes
             + self.tier_bytes_written * inf_server::limits::REPLAY_TIER_BYTE_CHARGE
             + self.tier_reads * inf_store::limits::SETTLE_READ_CHARGE_BYTES
             + (self.tier_syncs + self.dir_syncs) * barrier
+            + self.renames * inf_server::limits::BOOT_FILE_OP_CHARGE_BYTES
             + self.ram_units * inf_store::limits::RECOVER_PROBE_CHARGE_BYTES
+            + self.group_units * inf_store::limits::REBUILD_GROUP_CHARGE_BYTES
     }
 }
 
@@ -971,11 +996,11 @@ fn replay_record_unit(record: u64) -> u64 {
 /// from the counting filesystem — is at most the budget, the row's unit `U`
 /// from `unit_of` (computed by the test, never by the engine) and the
 /// reader's one read chunk on a frame row; and its work gauge reads within
-/// what the step did ([`gauge_over`]). The end settle's last step runs
-/// the hand-over and the log resume, which the hand-over phase's own steps
-/// will cut, and is not judged here. Returns the steps over the bound, the
-/// recovery's stats and the recovered keyspace; a step that refuses is the
-/// caller's `Err`.
+/// what the step did ([`gauge_over`]). The end settle's last step is judged
+/// as every settle step is, at one unit: the hand-over and the resume are
+/// steps of their own. Returns the steps over the bound, the recovery's
+/// stats and the recovered keyspace; a step that refuses is the caller's
+/// `Err`.
 fn judged_boot(
     fs: &CountingFs,
     cfg: &DurableConfig,
@@ -987,12 +1012,17 @@ fn judged_boot(
     (over, stats, ks)
 }
 
-/// One step's row of `RECOVERY_UNITS` and the RAM units it ran.
+/// One step's row of `RECOVERY_UNITS`, the RAM units and probe groups it
+/// ran and the renames its filesystem saw.
 #[derive(Copy, Clone, Debug)]
 struct StepUnits {
     phase: inf_server::UnitPhase,
     entries: u64,
     releases: u64,
+    stamped: u64,
+    seeded: u64,
+    groups: u64,
+    renames: u64,
 }
 
 /// [`judged_boot`], with every step's row and RAM units.
@@ -1003,7 +1033,7 @@ fn judged_boot_logged(
     budget: u64,
     unit_of: &dyn Fn(inf_server::UnitPhase) -> u64,
 ) -> (Vec<String>, std::io::Result<inf_server::RecoverStats>, Keyspace, Vec<StepUnits>) {
-    use inf_server::{RecoverPhase, UnitEntry};
+    use inf_server::UnitEntry;
     let mut recovery = Recovery::new(fs.clone(), CELL, cfg, anchor(), now());
     let (mut over, mut log) = (Vec::new(), Vec::new());
     // Bound: every step makes progress (the zero-budget row).
@@ -1015,16 +1045,18 @@ fn judged_boot_logged(
         };
         let mut work = fs.tally().since(before);
         let after = recovery.stats().units;
-        work.ram_units = units_since(after, units);
+        (work.ram_units, work.group_units) = units_since(after, units);
         let row = recovery.unit_row();
         log.push(StepUnits {
             phase: row.phase,
             entries: after.ckpt_entries - units.ckpt_entries,
             releases: after.ckpt_end_releases - units.ckpt_end_releases,
+            stamped: after.sweep_stamped - units.sweep_stamped,
+            seeded: after.sweep_seeded - units.sweep_seeded,
+            groups: after.rebuild_groups - units.rebuild_groups,
+            renames: work.renames,
         });
-        let last_settle = row.phase == inf_server::UnitPhase::Settle
-            && recovery.phase() == RecoverPhase::Complete;
-        if row.budgeted && !last_settle {
+        if row.budgeted {
             let chunk =
                 if row.entry == UnitEntry::Frame { inf_log::DEFAULT_READ_CHUNK as u64 } else { 0 };
             let unit = unit_of(row.phase);
@@ -1075,11 +1107,13 @@ const GAUGE_SLACK: u64 = 3 * inf_log::ckpt::ICK_BLOCK_ALIGN as u64;
 /// The work gauge against what the step did (ADR-0174 A1.2): a step's work
 /// is what it charged plus the bytes of the frame or section it entered and
 /// parked in, never their price. On a frame row the gauge is within `B + U`
-/// (B1). Off it, a step parks only in a section it entered, whose block it
-/// read at its entry, so the gauge is within `B`, the bytes the step read
-/// and [`GAUGE_SLACK`] where the step charged no boot I/O, or `U` in its
-/// place where it did. `Some` names the over-read. Red where a walk parks an
-/// entry section's price (`inf_canary_recover_parked_priced`).
+/// (B1), and on a row that enters no unit — nothing parks there — it is the
+/// step's charge, within the same. On a section row a step parks only in a
+/// section it entered, whose block it read at its entry, so the gauge is
+/// within `B`, the bytes the step read and [`GAUGE_SLACK`] where the step
+/// charged no boot I/O, or `U` in its place where it did. `Some` names the
+/// over-read. Red where a walk parks an entry section's price
+/// (`inf_canary_recover_parked_priced`).
 fn gauge_over(
     entry: inf_server::UnitEntry,
     budget: u64,
@@ -1087,8 +1121,8 @@ fn gauge_over(
     gauge: Gauge,
 ) -> Option<String> {
     let bound = match entry {
-        inf_server::UnitEntry::Frame => budget.saturating_add(unit),
-        inf_server::UnitEntry::Section | inf_server::UnitEntry::None => {
+        inf_server::UnitEntry::Frame | inf_server::UnitEntry::None => budget.saturating_add(unit),
+        inf_server::UnitEntry::Section => {
             let slack = if gauge.boot_charge == 0 { GAUGE_SLACK } else { unit };
             budget.saturating_add(gauge.reader_bytes).saturating_add(slack)
         }
@@ -1109,13 +1143,35 @@ fn engagement(stats: &inf_server::RecoverStats) -> Result<u64, String> {
     Ok(yields)
 }
 
+/// `U` of a hand-over step, from the `limits` and never from the engine:
+/// the largest of a parked death stamped or an extent id seeded (the RAM
+/// unit price), a revive rename (the file-operation price), a probe group
+/// the rebuild scans (its bytes), a slot it returns (its settle read), and
+/// one machine's hand-over — its drain's seal of the active file, a barrier,
+/// with the footer block it writes.
+fn hand_over_unit() -> u64 {
+    let seal = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES + (64 << 10);
+    [
+        inf_store::limits::RECOVER_PROBE_CHARGE_BYTES,
+        inf_server::limits::BOOT_FILE_OP_CHARGE_BYTES,
+        inf_store::limits::REBUILD_GROUP_CHARGE_BYTES,
+        inf_store::limits::SETTLE_READ_CHARGE_BYTES,
+        seal,
+    ]
+    .into_iter()
+    .max()
+    .expect("five units")
+}
+
 /// `U` for the hostile units: a frame's entry plus one record's unit on the
-/// replay row, a record settled against its twin on the end settle's.
+/// replay row, a record settled against its twin on the end settle's, one
+/// hand-over unit on the hand-over's.
 fn hostile_unit(frame_entry: u64) -> impl Fn(inf_server::UnitPhase) -> u64 {
     let record = (TieredTable::RECORD_HEADER_LEN + key(0).len() + SMALL_VALUE_LEN) as u64;
     move |phase| match phase {
         inf_server::UnitPhase::Replay => frame_entry + replay_record_unit(record),
         inf_server::UnitPhase::Settle => record + inf_store::limits::SETTLE_READ_CHARGE_BYTES,
+        inf_server::UnitPhase::HandOver => hand_over_unit(),
         other => panic!("the hostile units judge no {other:?} step"),
     }
 }
@@ -1211,8 +1267,9 @@ fn a_frame_of_deletes_of_demoted_keys_asks_after_each_priced_delete() {
 /// One boot's recovered state for budget independence: the
 /// table digest, every tier file byte for byte, what every key serves, the
 /// extent reference map, the reclaim queue in its hand-out order (the
-/// order the boot's deaths reached it), the D6 counters (the gauges and
-/// the step facts excepted) and the record counts.
+/// order the boot's deaths reached it), the ticket rebuild's counters, the
+/// D6 counters (the gauges and the step facts excepted), the record counts
+/// and the hand-over's rebuild reads and revive renames.
 #[derive(Debug, PartialEq, Eq)]
 struct Recovered {
     table: inf_store::StateDigest,
@@ -1220,10 +1277,13 @@ struct Recovered {
     served: Model,
     extents: Vec<(u64, u64, u64)>,
     reclaim_order: Vec<u64>,
+    shadow: inf_store::ShadowCounters,
     counters: inf_store::ReplayCounters,
     dead_life_files_removed: u64,
     records_applied: u64,
     records_pre_begin: u64,
+    shadow_settle_reads: u64,
+    blob_revived: u64,
 }
 
 fn file_bytes(fs: &MemFs, path: &std::path::Path) -> Vec<u8> {
@@ -1265,6 +1325,7 @@ fn recovered(fs: &CountingFs, cfg: &DurableConfig, budget: u64, model: &Model) -
     let table = ks.tiered_store_mut(TIER_NS).expect("tiered");
     let digest = table.simulation_digest();
     let extents = table.extent_references().collect();
+    let shadow = table.shadow_counters();
     // Read last: handing the queue out moves its candidates into reclaim.
     let queue = table.extent_reclaim_work(u64::MAX, usize::MAX);
     Recovered {
@@ -1273,10 +1334,13 @@ fn recovered(fs: &CountingFs, cfg: &DurableConfig, budget: u64, model: &Model) -
         served,
         extents,
         reclaim_order: queue.iter().map(|candidate| candidate.extent_id).collect(),
+        shadow,
         counters: stats.tier_replay.counters,
         dead_life_files_removed: stats.tier_replay.dead_life_files_removed,
         records_applied: stats.records_applied,
         records_pre_begin: stats.records_pre_begin,
+        shadow_settle_reads: stats.shadow_settle_reads,
+        blob_revived: stats.blob_revived,
     }
 }
 
@@ -1325,7 +1389,10 @@ fn assert_same(state: &Recovered, control: &Recovered, budget: u64) {
     assert!(differs.is_none(), "{at}: the extent references differ from entry {differs:?}");
     let differs = first_difference(&state.reclaim_order, &control.reclaim_order);
     assert!(differs.is_none(), "{at}: the reclaim queue's order differs from {differs:?}");
+    assert_eq!(state.shadow, control.shadow, "{at}: the ticket rebuild's counters");
     assert_eq!(state.counters, control.counters, "{at}: the D6 counters");
+    assert_eq!(state.shadow_settle_reads, control.shadow_settle_reads, "{at}: rebuild reads");
+    assert_eq!(state.blob_revived, control.blob_revived, "{at}: revive renames");
     assert_eq!(state.dead_life_files_removed, control.dead_life_files_removed, "{at}");
     assert_eq!(state.records_applied, control.records_applied, "{at}: records applied");
     assert_eq!(state.records_pre_begin, control.records_pre_begin, "{at}: records below begin");
@@ -1682,11 +1749,32 @@ fn write_ckpt_unit<F: SegmentFs + Clone>(
     keys: u64,
     blob_refs: bool,
 ) -> CkptUnit {
-    use inf_log::ckpt::SyncIckWriter;
     let mut log = Log::new(fs, cfg);
     let begin = log.begin_marker(1);
     drop(log);
     make_durable(fs, cfg);
+    let life = first_life(fs, cfg, keys);
+    let refs = life.refs.len() as u64;
+    let images: Vec<(Vec<u8>, Vec<u8>)> = (0..keys).map(|i| (key(i), small_value(i, 1))).collect();
+    let model = images.iter().map(|(key, value)| (key.clone(), Some(value.clone()))).collect();
+    let ick = publish_tiered_checkpoint(fs, cfg, life, begin, &images, blob_refs);
+    CkptUnit { model, refs, section_bytes_max: largest_section(fs, &ick) }
+}
+
+/// A first life at the smallest window: `keys` distinct 80-byte records
+/// written through the live table and its flush pipeline, so all but about
+/// its last window are cold in manifested tier files, and a checkpoint walk
+/// begun over it — its watermark and the refs it emitted, `(hash, address)`
+/// of each cold slot.
+struct FirstLife<F: SegmentFs> {
+    table: TieredTable,
+    flush: inf_log::TierFlush<F>,
+    hasher: inf_store::KeyHasher,
+    walk: u64,
+    refs: Vec<(u64, u64)>,
+}
+
+fn first_life<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig, keys: u64) -> FirstLife<F> {
     let shard = cfg.data_dir.join(format!("shard-{CELL}"));
     let spec = TierSpec::for_budget(MEM_BUDGET);
     let demote = spec.demotion_config();
@@ -1739,6 +1827,23 @@ fn write_ckpt_unit<F: SegmentFs + Clone>(
             break;
         }
     }
+    FirstLife { table, flush, hasher, walk, refs }
+}
+
+/// Publishes the checkpoint of `life`'s walk at `begin` — one section a
+/// class: its refs, then `images`, its live set and, with `blob_refs`, a
+/// blob-reference entry at every ref's address — and the MANIFEST that names
+/// it and the namespace's tier section; returns the checkpoint's path.
+fn publish_tiered_checkpoint<F: SegmentFs + Clone>(
+    fs: &F,
+    cfg: &DurableConfig,
+    mut life: FirstLife<F>,
+    begin: inf_log::Lsn,
+    images: &[(Vec<u8>, Vec<u8>)],
+    blob_refs: bool,
+) -> PathBuf {
+    use inf_log::ckpt::SyncIckWriter;
+    let shard = cfg.data_dir.join(format!("shard-{CELL}"));
     let ckpt = inf_log::CkptConfig { section_bytes: 32 << 20, ..cfg.ckpt };
     let mut writer = SyncIckWriter::create_v3(
         fs.clone(),
@@ -1750,40 +1855,36 @@ fn write_ckpt_unit<F: SegmentFs + Clone>(
         &[TIER_NS.0],
     )
     .expect("ick create");
-    for &(hash, at) in &refs {
-        writer.append_ref(TIER_NS.0, walk, hash, at).expect("ref");
+    for &(hash, at) in &life.refs {
+        writer.append_ref(TIER_NS.0, life.walk, hash, at).expect("ref");
     }
-    let mut model = Model::new();
-    for i in 0..keys {
-        let (key, value) = (key(i), small_value(i, 1));
-        let image = inf_log::RecordView::StringPostImage { ns: TIER_NS, key: &key, value: &value };
+    for (key, value) in images {
+        let image = inf_log::RecordView::StringPostImage { ns: TIER_NS, key, value };
         writer.append(&image).expect("image");
-        model.insert(key, Some(value));
     }
-    for file in table.live_set().files().to_vec() {
+    for file in life.table.live_set().files().to_vec() {
         let (id, len, dead, exact) = (file.id, file.data_len, file.dead_bytes, file.byte_exact);
         writer.append_live_set(TIER_NS.0, id, len, dead, exact).expect("live set");
     }
     if blob_refs {
-        let mut addrs: Vec<u64> = refs.iter().map(|&(_, at)| at).collect();
+        let mut addrs: Vec<u64> = life.refs.iter().map(|&(_, at)| at).collect();
         addrs.sort_unstable();
         for (extent_id, at) in (1u64..).zip(addrs) {
             writer.append_blob_ref(TIER_NS.0, at, extent_id, 4096).expect("blob ref");
         }
     }
     writer.finish().expect("ick publish");
-    table.end_ckpt_walk();
-    let section = table.tier_manifest(TIER_NS.0, &flush);
+    life.table.end_ckpt_walk();
+    let section = life.table.tier_manifest(TIER_NS.0, &life.flush);
     let manifest = inf_log::Manifest {
         ckpt_id: 1,
         begin_lsn: begin,
         segments: vec![begin.segment],
         tiers: vec![section],
-        key_hash_id: hasher.identity(),
+        key_hash_id: life.hasher.identity(),
     };
     inf_log::write_manifest(fs, &shard, &manifest).expect("manifest");
-    let ick = shard.join("ckpt").join(inf_log::ckpt::ick_file_name(1));
-    CkptUnit { model, refs: refs.len() as u64, section_bytes_max: largest_section(fs, &ick) }
+    shard.join("ckpt").join(inf_log::ckpt::ick_file_name(1))
 }
 
 /// The largest section of the checkpoint at `ick`, in block bytes, by its
@@ -1809,7 +1910,7 @@ fn largest_section<F: SegmentFs>(fs: &F, ick: &std::path::Path) -> u64 {
 /// plus one record's unit; one listed address at the RAM price on the end
 /// of the checkpoint's; a frame's entry (the begin marker's) and one
 /// record's unit on the replay row; a record settled against its twin on
-/// the end settle's.
+/// the end settle's; one hand-over unit on the hand-over's.
 fn ckpt_unit(section_bytes_max: u64) -> impl Fn(inf_server::UnitPhase) -> u64 {
     let record = (TieredTable::RECORD_HEADER_LEN + key(0).len() + SMALL_VALUE_LEN) as u64;
     move |phase| match phase {
@@ -1817,6 +1918,7 @@ fn ckpt_unit(section_bytes_max: u64) -> impl Fn(inf_server::UnitPhase) -> u64 {
         inf_server::UnitPhase::CkptEnd => inf_store::limits::RECOVER_PROBE_CHARGE_BYTES,
         inf_server::UnitPhase::Replay => (64 << 10) + replay_record_unit(record),
         inf_server::UnitPhase::Settle => record + inf_store::limits::SETTLE_READ_CHARGE_BYTES,
+        inf_server::UnitPhase::HandOver => hand_over_unit(),
         other => panic!("the checkpoint units judge no {other:?} step"),
     }
 }
@@ -1997,9 +2099,11 @@ fn a_run_of_index_sidecar_sections_yields_after_each_section() {
     let (sections, sidecar_sections) = ick_sections(&fs.inner, &ick);
     assert!(sidecar_sections >= 16, "VACUOUS: {sidecar_sections} sidecar sections");
     let section_max = largest_section(&fs.inner, &ick);
+    // A memory namespace's boot settles and hands over nothing.
     let unit = move |phase| match phase {
         inf_server::UnitPhase::Ick => section_max,
         inf_server::UnitPhase::Replay => 64 << 10,
+        inf_server::UnitPhase::Settle | inf_server::UnitPhase::HandOver => 0,
         other => panic!("the sidecar unit judges no {other:?} step"),
     };
     let (over, stats, _ks) = judged_boot(&fs, &cfg, fresh_keyspace(), BUDGET, &unit);
@@ -2009,4 +2113,228 @@ fn a_run_of_index_sidecar_sections_yields_after_each_section() {
     assert!(over.is_empty(), "JUDGE: {} steps over B + U: {:?}", over.len(), over.first());
     let run = sidecar_sections * section_max;
     assert!(steps > run / (BUDGET + section_max), "VACUOUS: {steps} steps for a {run}-byte run");
+}
+
+// ---- the end of a boot: the hand-over's sweep seed, renames and rebuild ----
+
+/// Keys of the end unit's first life; about two-thirds of them go cold.
+const END_KEYS: u64 = 60_000;
+/// Cold keys the end unit's tail rewrites: pairs the ticket rebuild forms,
+/// the ones past its cap returned to settle.
+const END_REWRITES: usize = 6_000;
+/// Extent references the tail writes and deletes: replay deaths parked
+/// until the sweep seed stamps them.
+const END_PARKED: u64 = 12_000;
+/// Listed extent files no record names: orphans the seed queues.
+const END_ORPHANS: u64 = 12_000;
+/// Live extent references whose files are quarantined (renamed back), and
+/// as many quarantined files no record names (second verdicts).
+const END_REVIVED: u64 = 64;
+
+/// The end phases' recovery unit: a first life of [`END_KEYS`] records and a
+/// checkpoint of its refs and live set, with no image; then a tail that
+/// rewrites [`END_REWRITES`] of the cold keys — each a RAM record beside its
+/// cold twin, a pair the ticket rebuild forms, and past its cap one it hands
+/// back to read and settle — writes [`END_PARKED`] extent references and
+/// deletes them (replay deaths the sweep seed stamps), and writes
+/// [`END_REVIVED`] live ones; and in the namespace's directory a blob file for
+/// every dead extent and [`END_ORPHANS`] more no record names (listed ids the
+/// seed queues), a quarantine twin for every live extent (renamed back) and
+/// [`END_REVIVED`] more no record names. The tail fits the window, so the boot
+/// demotes nothing and its end settle walks nothing: every unit of the end of
+/// the boot is the hand-over's.
+struct EndUnit {
+    /// The cold keys' values; the first life's RAM keys have no image.
+    model: Model,
+    /// The extent ids the boot lists, plain and quarantined.
+    listed: u64,
+    quarantined: u64,
+}
+
+fn write_end_unit<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig) -> EndUnit {
+    let mut log = Log::new(fs, cfg);
+    let begin = log.begin_marker(1);
+    let life = first_life(fs, cfg, END_KEYS);
+    let cold: Vec<u64> = (0..END_KEYS)
+        .filter(|&i| {
+            let key = key(i);
+            matches!(life.table.lookup(&key, life.hasher.hash(&key), &[]), TieredLookup::Cold(_))
+        })
+        .collect();
+    assert!(cold.len() > 2 * END_REWRITES, "VACUOUS: {} cold keys", cold.len());
+    let mut model: Model = cold.iter().map(|&i| (key(i), Some(small_value(i, 0)))).collect();
+    let rewrites: Vec<(Vec<u8>, Vec<u8>)> =
+        cold[..END_REWRITES].iter().map(|&i| (key(i), small_value(i, 1))).collect();
+    for chunk in rewrites.chunks(512) {
+        let effects: Vec<MutationEffect<'_>> = chunk
+            .iter()
+            .map(|(key, value)| MutationEffect::StringSet { ns: TIER_NS, key, value })
+            .collect();
+        log.frame(&effects);
+    }
+    model.extend(rewrites.into_iter().map(|(key, value)| (key, Some(value))));
+    let dead: Vec<(Vec<u8>, u64)> =
+        (1..=END_PARKED).map(|id| (format!("x:{id:06}").into_bytes(), id)).collect();
+    let live: Vec<(Vec<u8>, u64)> =
+        (1..=END_REVIVED).map(|j| (format!("q:{j:04}").into_bytes(), END_PARKED + j)).collect();
+    for chunk in dead.chunks(512).chain(live.chunks(512)) {
+        let effects: Vec<MutationEffect<'_>> = chunk
+            .iter()
+            .map(|(key, id)| MutationEffect::StringSetExtent {
+                ns: TIER_NS,
+                key,
+                extent_id: *id,
+                offset: 0,
+                len: 4096,
+            })
+            .collect();
+        log.frame(&effects);
+    }
+    for chunk in dead.chunks(512) {
+        let effects: Vec<MutationEffect<'_>> =
+            chunk.iter().map(|(key, _)| MutationEffect::Delete { ns: TIER_NS, key }).collect();
+        log.frame(&effects);
+    }
+    drop(log);
+    make_durable(fs, cfg);
+    publish_tiered_checkpoint(fs, cfg, life, begin, &[], false);
+    let cold_dir = cold_dir(cfg);
+    let file = |name: String| {
+        let mut file = fs.create_meta(&cold_dir.join(name)).expect("an extent file");
+        file.write_at(0, b"extent").expect("its bytes");
+        file.sync_data().expect("its barrier");
+    };
+    let orphans = END_PARKED + END_REVIVED;
+    let (plain, quarantined) = (inf_log::extent_file_name, inf_log::quarantined_file_name);
+    for id in (1..=END_PARKED).chain(orphans + 1..=orphans + END_ORPHANS) {
+        file(plain(inf_log::ExtentId(id)));
+    }
+    let unreferenced = orphans + END_ORPHANS;
+    for id in (END_PARKED + 1..=orphans).chain(unreferenced + 1..=unreferenced + END_REVIVED) {
+        file(quarantined(inf_log::ExtentId(id)));
+    }
+    fs.sync_dir(&cold_dir).expect("the directory's barrier");
+    EndUnit { model, listed: END_PARKED + END_ORPHANS, quarantined: 2 * END_REVIVED }
+}
+
+/// `U` for the end unit: a frame's entry and one record's unit on the
+/// replay row, the checkpoint's largest section and one record's unit on its
+/// row, a record settled against its twin on the end settle's, one hand-over
+/// unit on the hand-over's.
+fn end_unit_of(section_bytes_max: u64) -> impl Fn(inf_server::UnitPhase) -> u64 {
+    let record = (TieredTable::RECORD_HEADER_LEN + key(0).len() + SMALL_VALUE_LEN) as u64;
+    move |phase| match phase {
+        inf_server::UnitPhase::Replay => FRAME_BYTES_MAX + replay_record_unit(record),
+        inf_server::UnitPhase::Ick => section_bytes_max + replay_record_unit(record),
+        inf_server::UnitPhase::Settle => record + inf_store::limits::SETTLE_READ_CHARGE_BYTES,
+        inf_server::UnitPhase::HandOver => hand_over_unit(),
+        other => panic!("the end unit judges no {other:?} step"),
+    }
+}
+
+/// The units a hand-over step ran past what its budget buys at their
+/// prices, plus one: `None` when within. `kind` names the oracle that sees
+/// it, the witness of its planted red.
+fn over_price(kind: &str, step: usize, units: u64, price: u64, budget: u64) -> Option<String> {
+    (units * price > budget + price).then(|| format!("{kind}: step {step} ran {units} at {price}"))
+}
+
+/// The end of a boot at size (the end-phase row, at a size the suite runs),
+/// at a 256 KiB budget under the step judge (`U` one hand-over unit): the
+/// hand-over's sweep seed stamps 12 000 parked replay deaths and seeds
+/// 12 000 listed ids, 12 000 orphans among them, and 128 quarantined ones; 64
+/// quarantined extents are renamed back; the ticket rebuild scans every probe
+/// group of the index and hands back the 1 904 pairs past its cap, each read
+/// and settled. Every judged step's work is within `B + U`, read before the
+/// engagement clause; no hand-over step stamps or seeds more ids than its
+/// budget buys at the RAM price, renames more extents than it buys at the
+/// file-operation price, or scans more probe groups than it buys at their
+/// bytes, plus one (each reported, the oracle's name first); and the boot
+/// recovers the model and the live extents. Red where the hand-over's units
+/// charge nothing (`inf_canary_recover_probe_uncharged`: `STAMPS`, `SEEDS`,
+/// `RENAMES`, `GROUPS`).
+#[test]
+fn the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge() {
+    const BUDGET: u64 = 256 << 10;
+    let fs = CountingFs::new();
+    let cfg = step_cfg();
+    let unit = write_end_unit(&fs, &cfg);
+    let ick = cfg.data_dir.join(format!("shard-{CELL}/ckpt")).join(inf_log::ckpt::ick_file_name(1));
+    let section_bytes_max = largest_section(&fs, &ick);
+    let (mut over, stats, mut ks, log) =
+        judged_boot_logged(&fs, &cfg, tiered_keyspace(), BUDGET, &end_unit_of(section_bytes_max));
+    let stats = stats.expect("the end unit boots");
+    let (ram, rename, group) = (
+        inf_store::limits::RECOVER_PROBE_CHARGE_BYTES,
+        inf_server::limits::BOOT_FILE_OP_CHARGE_BYTES,
+        inf_store::limits::REBUILD_GROUP_CHARGE_BYTES,
+    );
+    let mut hand_over_steps = 0u64;
+    for (step, row) in log.iter().enumerate() {
+        if row.phase != inf_server::UnitPhase::HandOver {
+            continue;
+        }
+        hand_over_steps += 1;
+        over.extend(over_price("STAMPS", step, row.stamped, ram, BUDGET));
+        over.extend(over_price("SEEDS", step, row.seeded, ram, BUDGET));
+        over.extend(over_price("RENAMES", step, row.renames, rename, BUDGET));
+        over.extend(over_price("GROUPS", step, row.groups, group, BUDGET));
+    }
+    let units = stats.units;
+    eprintln!(
+        "end unit at {BUDGET}: {} over, {hand_over_steps} hand-over steps, {units:?}, {} rebuild \
+         reads, {} revived, {:?}",
+        over.len(),
+        stats.shadow_settle_reads,
+        stats.blob_revived,
+        stats.step
+    );
+    assert!(over.is_empty(), "JUDGE: {} steps over: {over:?}", over.len());
+    assert_eq!(units.sweep_stamped, END_PARKED, "every parked death stamped once");
+    assert_eq!(units.sweep_seeded, unit.listed + unit.quarantined, "every listed id seeded once");
+    assert_eq!(stats.blob_revived, END_REVIVED, "every referenced quarantined extent revived");
+    let over_cap = (END_REWRITES - inf_store::SHADOW_TICKETS_CAP) as u64;
+    assert_eq!(stats.shadow_settle_reads, over_cap, "every pair past the cap read and settled");
+    // Each stage outgrows a step, so its cursor resumes inside it.
+    assert!(units.sweep_stamped * ram > 2 * BUDGET, "VACUOUS: the stamps fit a step");
+    assert!(units.sweep_seeded * ram > 2 * BUDGET, "VACUOUS: the seeds fit a step");
+    assert!(stats.blob_revived * rename > 2 * BUDGET, "VACUOUS: the renames fit a step");
+    assert!(units.rebuild_groups * group > 2 * BUDGET, "VACUOUS: the rebuild fits a step");
+    let table = ks.tiered_store_mut(TIER_NS).expect("tiered");
+    let live = table.extent_stats().live;
+    assert_eq!(live, END_REVIVED, "the live extents' references stand");
+    let (served, _, _) = read_back(&fs, &cfg, &mut ks, &unit.model);
+    assert_model(&served, &unit.model, "after the end unit");
+}
+
+/// Budget independence over the end of a boot: the end unit recovered at
+/// `u64::MAX` (the control, which runs each stage whole) and at 8 MiB,
+/// 256 KiB, 4 KiB, 1 and 0 recovers the same table, tier and extent files
+/// byte for byte (the revived names among them), served values, extent
+/// reference map, reclaim queue in hand-out order (the stamped deaths, then
+/// the orphans and the second verdicts, in the listings' order, which the
+/// small budgets queue a batch a step), ticket rebuild counters, D6 counters
+/// and record counts.
+#[test]
+fn every_budget_recovers_the_end_of_the_unparked_boot() {
+    let cfg = step_cfg();
+    // Each boot recovers its own copy of the unit, written the same way: a
+    // boot's tier files are the next boot's dead-life files (D4).
+    let boot = |budget: u64| {
+        let fs = CountingFs::new();
+        let unit = write_end_unit(&fs, &cfg);
+        let state = recovered(&fs, &cfg, budget, &unit.model);
+        (unit.model, state)
+    };
+    let (model, control) = boot(u64::MAX);
+    assert_model(&control.served, &model, "the control boot");
+    let queued = control.reclaim_order.len() as u64;
+    assert_eq!(queued, END_PARKED + END_ORPHANS + END_REVIVED, "VACUOUS: {queued} queued");
+    assert_eq!(control.blob_revived, END_REVIVED, "VACUOUS: no revive rename");
+    assert!(control.shadow_settle_reads > 0, "VACUOUS: no slot past the ticket cap");
+    for budget in [8 << 20, 256 << 10, 4 << 10, 1, 0] {
+        let (model, state) = boot(budget);
+        assert_model(&state.served, &model, &format!("BUDGET INDEPENDENCE at {budget}"));
+        assert_same(&state, &control, budget);
+    }
 }

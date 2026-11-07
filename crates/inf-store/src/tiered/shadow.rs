@@ -1371,9 +1371,10 @@ impl TieredTable {
     /// Drives a whole rebuild: every slot the walk hands back is read by
     /// `read` (its key window and `left`), parsed into a [`ColdKey`]
     /// under the slot's hash and this table's keyed hash, and settled by
-    /// its full key; the first failure ends it. The server's
-    /// `finish_tier_replay` and the simulators call this; its memory is
-    /// the cursor's — no list of slots exists at any point.
+    /// its full key; the first failure ends it. The simulators and the
+    /// store's tests call this, and the boot's recovery driver runs the same
+    /// step and settle under its budget; its memory is the cursor's — no
+    /// list of slots exists at any point.
     ///
     /// # Errors
     /// An unreadable slot (`read`'s error), bytes that are not a verified

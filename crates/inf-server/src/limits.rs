@@ -80,9 +80,10 @@ pub const CKPT_BOARD_VISITS_PER_TURN: usize = 64;
 /// budget it charges). Crossing: a step whose charge — the bytes its cursor
 /// passed and its priced boot work — reaches the budget yields at the next
 /// record or entry, inside a log frame or a checkpoint section (ADR-0174
-/// A1), after an index-sidecar section, or after the settle step that
-/// reached it. The bytes a demote step's seal walk and the end settle pass,
-/// and their reads, are priced by the store, whose walks yield on them
+/// A1), after an index-sidecar section, after the settle step that reached
+/// it, or at the hand-over's next unit. The bytes a demote step's seal walk
+/// and the end settle pass, and their reads, are priced by the store, whose
+/// walks yield on them
 /// ([`ReplayWork::settle_charge_bytes`](inf_store::ReplayWork::settle_charge_bytes)).
 pub const REPLAY_TIER_BYTE_CHARGE: u64 = 1;
 
@@ -197,3 +198,14 @@ const _: () = {
     }
     assert!(JSON_FIXED_REPLY_BYTES_MAX == 348, "the fixed column's maximum is 348 bytes");
 };
+
+/// The recovery step budget's price (ADR-0174 A1) of one boot file
+/// operation outside replay — at the hand-over, the rename that brings a
+/// quarantined extent the replayed map references back under its name
+/// (ADR-0096 D3): 128 KiB, about 100 µs of a device that moves 1 GiB/s, as
+/// a settle read is priced. An estimate the reference-box run calibrates,
+/// never a measurement. Owner: the recovery driver, which charges it per
+/// operation and runs as many a turn as its budget left buys, at least one.
+/// Crossing: the step yields once its charge reaches the budget, at the next
+/// unit, and the next step resumes at the hand-over's cursor.
+pub const BOOT_FILE_OP_CHARGE_BYTES: u64 = 128 << 10;
