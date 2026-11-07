@@ -45,3 +45,40 @@ fn a_refused_create_spends_no_namespace_id() {
         "the CREATE after {REFUSED} refused ones got id {next}; the last accepted was {accepted}"
     );
 }
+
+/// Boot's counter check (ADR-0148 D4): a data directory whose catalog
+/// counter is not past a live id would issue that id again, so its catalog
+/// is refused at the load every boot runs before any cell, with the typed
+/// error naming both; a counter past it loads.
+#[test]
+fn a_catalog_counter_not_past_a_live_id_refuses_the_boot() {
+    let dir = temp_data_dir("create-ids-low-counter");
+    let ahead = inf_store::NsSpec {
+        id: inf_store::NsId(20),
+        name: b"ahead".to_vec(),
+        mode: inf_store::NsMode::Memory,
+        fsync: None,
+        policy: None,
+        maxmemory: None,
+        tier: None,
+    };
+    let mut seed = inf_store::NsCatalog {
+        next_id: 18,
+        entries: vec![ahead],
+        index: inf_store::IndexCatalog::default(),
+        dropped: Vec::new(),
+    };
+    let fs = inf_log::fs::StdSegmentFs;
+    inf_log::meta::write_meta(&fs, &dir, &seed.encode()).expect("seed META");
+    let refused = inf_server::load_catalog(&dir).expect_err("the boot refuses the catalog");
+    assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        refused.to_string().contains("namespace id 20 is at or above the catalog's next id 18"),
+        "the refusal names the id and the counter: {refused}"
+    );
+    seed.next_id = 21;
+    inf_log::meta::write_meta(&fs, &dir, &seed.encode()).expect("seed META");
+    let loaded = inf_server::load_catalog(&dir).expect("a counter past the id loads");
+    assert_eq!(loaded.map(|c| c.next_id), Some(21));
+    std::fs::remove_dir_all(&dir).ok();
+}
