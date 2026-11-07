@@ -137,6 +137,9 @@ pub struct CellNet {
     accept_parked: Option<AcceptPark>,
     /// Parked arms resumed, by an `AcceptArm` or a `Close`.
     accept_resumes: u64,
+    /// Every `AcceptArm` op this driver received, the first arm included:
+    /// the driver's side of the plane's accept retry.
+    accept_arms: u64,
     backlog: VecDeque<RawFd>,
     conns: BTreeMap<RawFd, SimConn>,
     next_fd: RawFd,
@@ -176,6 +179,12 @@ impl CellNet {
         self.accept_parked
     }
 
+    /// Every `AcceptArm` op the driver received, the first arm included.
+    #[must_use]
+    pub fn accept_arms(&self) -> u64 {
+        self.accept_arms
+    }
+
     pub fn new(cell: u16, seed: u64, plant: Plant) -> Rc<RefCell<CellNet>> {
         Rc::new(RefCell::new(CellNet {
             cell,
@@ -183,6 +192,7 @@ impl CellNet {
             accept_token: None,
             accept_parked: None,
             accept_resumes: 0,
+            accept_arms: 0,
             backlog: VecDeque::new(),
             conns: BTreeMap::new(),
             next_fd: 0,
@@ -689,6 +699,7 @@ impl BackendDriver for SimDriver {
         for op in ops.drain(..) {
             match op {
                 IoOp::AcceptArm { token, .. } => {
+                    net.accept_arms += 1;
                     if net.accept_parked.take().is_some() {
                         net.accept_resumes += 1;
                     }
