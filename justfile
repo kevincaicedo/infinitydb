@@ -18,6 +18,9 @@ check:
     # ADR-0190 D4: no production site of inf-server decides a reply's
     # outcome from its bytes; the outcome travels beside them.
     ./scripts/check-reply-outcome.sh
+    # ADR-0172 D2: a pre-effect refusal's text is inf_wire::Refusal's alone,
+    # so no production line of inf-server spells a refusal class suffix.
+    ./scripts/check-refusal-text.sh
     # ADR-0107 D2 (review 2026-08-30, Theme 4): every release assert/expect/
     # panic/unreachable in cell code is a classified inventory row.
     ./scripts/check-release-asserts.sh

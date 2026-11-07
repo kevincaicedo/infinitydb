@@ -621,6 +621,69 @@ fx_build_empty
 expect red "reply-outcome: a missing directory is a scope error" env INF_CHECK_ROOT="$work/empty" $REPLY
 }
 
+# ------------------------------------------------------------ refusal text
+group_refusal_text() {
+# ADR-0172 D2: no production line of crates/inf-server/src spells a refusal
+# class suffix; inf_wire::Refusal renders every one. One plant a suffix, each
+# fixture one inf-server lib.rs (and a test-only modfile where the case needs one).
+REFUSAL=./scripts/check-refusal-text.sh
+rt_fixture() {
+    local name=$1 root
+    [ -n "$name" ] && [ -n "$work" ] || { echo "rt_fixture: empty name or work dir" >&2; exit 2; }
+    root="$work/$name"
+    [ -e "$root" ] && rm -rf "$root"
+    mkdir -p "$root/crates/inf-server/src"
+    cat >"$root/crates/inf-server/src/lib.rs"
+    echo "$root"
+}
+
+IFS= read -r -d '' body <<'EOF' || true
+pub const BUSY: &str = "BUSY a script is running";
+pub const OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
+pub fn reply(refusal: inf_wire::Refusal) -> &'static str { refusal.render() }
+/// A doc line naming the `limit reached` suffix is not a site.
+pub fn ok() {}
+EOF
+root=$(printf '%s' "$body" | rt_fixture rtclean)
+expect green "refusal-text: prefixes, Redis's OOM reply, a render call and a doc line are clean" \
+    env INF_CHECK_ROOT="$root" $REFUSAL
+expect_output "refusal-text: the scope line discloses the scan" "1 files, 5 lines scanned" \
+    env INF_CHECK_ROOT="$root" $REFUSAL
+
+for suffix in "capacity in use" "limit reached" "reservation refused" "identity space exhausted" \
+    "Identity Space Exhausted"; do
+    root=$(rt_fixture rtplanted <<<"pub const E: &str = \"ERR planted $suffix\";")
+    expect_red_because "refusal-text: planted '$suffix'" "REFUSAL-TEXT violation" \
+        env INF_CHECK_ROOT="$root" $REFUSAL
+done
+
+IFS= read -r -d '' body <<'EOF' || true
+pub fn ok() {}
+
+#[cfg(test)]
+mod tests {
+    const E: &str = "ERR namespace identity space exhausted";
+}
+
+#[cfg(test)]
+#[path = "fixture_tests.rs"]
+mod fixture_tests;
+EOF
+root=$(printf '%s' "$body" | rt_fixture rttest)
+printf '%s\n' 'pub const E: &str = "ERR tiered namespace limit reached";' \
+    >"$root/crates/inf-server/src/fixture_tests.rs"
+expect green "refusal-text: a test module and a test-only modfile are out of scope" \
+    env INF_CHECK_ROOT="$root" $REFUSAL
+expect_output "refusal-text: the excluded modfile is disclosed" "1 test-only files excluded" \
+    env INF_CHECK_ROOT="$root" $REFUSAL
+
+mkdir -p "$work/rtempty/crates/inf-server/src"
+expect_red_because "refusal-text: an empty file set is a scope error" "REFUSAL-TEXT SCOPE ERROR" \
+    env INF_CHECK_ROOT="$work/rtempty" $REFUSAL
+fx_build_empty
+expect red "refusal-text: a missing directory is a scope error" env INF_CHECK_ROOT="$work/empty" $REFUSAL
+}
+
 # ---------------------------------------------------------------- run-sweep
 group_run_sweep() {
 # A stub simulator driven by env: which shard exits non-zero, which shard
