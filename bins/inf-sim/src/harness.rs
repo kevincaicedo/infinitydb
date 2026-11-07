@@ -1916,7 +1916,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         state.keyspace(&plane.keyspace(), clock.now());
     }
     report.state_hash = state.value();
-    report.oracle_violations = oracle.violations.clone();
+    // Appended, never assigned: a check that wrote the report's list before
+    // this point keeps its line.
+    report.oracle_violations.extend(oracle.violations.iter().cloned());
     report.oracle_violations.extend(violations);
     report.sim_seconds = clock.now().0.saturating_sub(1) as f64 / 1e9;
     report
