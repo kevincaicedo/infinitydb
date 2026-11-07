@@ -197,7 +197,11 @@ jobs:
           test "$(redis-cli -p 6399 GET k)" = "v"
           docker rm -f inf
       - name: image scan (release-blocking)
-        uses: aquasecurity/trivy-action@0.28.0
+        # Pinned by commit, never by tag: GHSA-69fq-xp46-6x23 force-pushed
+        # 76 of this action's 77 tags to an infostealer. 0.35.0 is the
+        # immutable release the advisory names safe; it installs trivy
+        # v0.69.3 through a SHA-pinned setup-trivy.
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           image-ref: ${{ env.IMAGE }}:${{ needs.meta.outputs.version }}
           format: table
