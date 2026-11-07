@@ -179,7 +179,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
                     });
                     let owner = &self.timers.accept_retry;
+                    #[cfg(not(inf_canary_accept_retry_late))]
                     let deadline = cx.now.saturating_add(ACCEPT_RETRY);
+                    // Canary: the retry falls due 2 ms past its window.
+                    #[cfg(inf_canary_accept_retry_late)]
+                    let deadline =
+                        cx.now.saturating_add(ACCEPT_RETRY).saturating_add(Nanos::from_millis(2));
                     let mut timers = cx.timers();
                     if timers.phase(owner) == OwnerPhase::Idle {
                         timers

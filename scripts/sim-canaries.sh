@@ -387,6 +387,10 @@ rows=(
   # window, never a spin (ADR-0118 D2). Planted, the failure re-arms the
   # listener at once, and the oracle reads each retry before its deadline.
   "inf_canary_accept_retry_at_once m0-smoke accept-retry-early --plant accept-broken"
+  # The retry falls due within its rounding millisecond of the window
+  # (ADR-0154 D3). Planted, it falls due 2 ms past the window, and the
+  # oracle reads each retry past its bound.
+  "inf_canary_accept_retry_late m0-smoke accept-retry-late --plant accept-broken"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.
