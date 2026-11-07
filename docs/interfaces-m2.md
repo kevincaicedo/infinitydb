@@ -1811,26 +1811,33 @@ count the arrivals that found it full.
   1. **Order** (`inf-server::plane::program_ns_ddl`): *parse → durable-
      plane check → allocate the id → `Keyspace::ns_create_check`
      (registry rules + tier gauntlet + reserved-VA arithmetic, applies
-     nothing) → `ControlHandle::request_persist_create(export ∪ spec)`
-     → wait `persisted(epoch)` → read the `CreateVerdict` → apply
-     locally → fan `INF.NSFAN CREATE` (unchanged 9 args) →
-     `create_applied(id)` → `+OK`*. No cell names a namespace before
+     nothing) → `ControlHandle::request_create(export, spec)` → wait
+     for the request's own answer (`Requested::answer`) → apply locally
+     → fan `INF.NSFAN CREATE` (unchanged 9 args) → the `CreateApplied`
+     notice → `+OK`*. No cell names a namespace before
      `META` does. `SET` keeps *apply → fan → persist → ack* (until
      ADR-0189 builds its order, below). `DROP`'s order is drawn once, at
      `INF.NSFAN DROP` below.
-  2. **The writer's pending-create set** (`inf-server::control`,
-     ADR-0103 D2): every `PersistReq` may carry `create: (NsSpec,
-     CreateVerdict)`; the writer merges every pending spec the payload
-     lacks (by id) *before* the tombstone reconciliation, decides the
-     create against the merged view (`Accepted | NameExists |
-     AtCapacity`, written to the request's `Arc<AtomicU8>` before
-     `persisted_epoch` publishes), and retires an entry on
-     `CreateApplied { id }` or on any `DROP` of the id
-     (`request_persist_drop(catalog, id, tombstone)`). Bound
-     `PENDING_CREATE_MAX = 256` (gauge
-     `ControlHandle::pending_creates`; the origin answers `BUSY` at the cap). Empty at boot —
-     `META` already holds every accepted create. The sim's inline
-     inbox runs the same state.
+  2. **The writer's one pending DDL** (`inf-server::control`,
+     ADR-0103 D2 as ADR-0189 D3 changes it): the catalog writer numbers
+     each request as it dequeues it and holds at most one accepted
+     `CREATE` or `DROP` whose fan may not have reached every cell. A
+     pending `CREATE` joins every payload whose export lacks its id; a
+     pending `DROP`'s id, like every tombstoned id, leaves every payload
+     with every index record naming it. A `CREATE` is refused
+     `NameExists` when the export holds its name and `PendingConflict`
+     while a DDL is pending (an internal error: the DDL ticket admits one
+     program); a refusal writes nothing. The verdict reaches the origin
+     through the request's own answer slot (`inf-store::ddl`), stored
+     (for an accepted request, after its `META` write returned) before
+     the catalog word, the highest answered epoch. The pending DDL retires on the
+     origin's notice of its own kind and id (`CreateApplied { id }`,
+     `DropFanned { id, stamp }`), which every exit after the answer
+     posts; any other notice changes nothing and is counted. Empty at
+     boot — `META` already holds every answered DDL. The sim's inline
+     inbox runs the same writer. `INFO persistence` carries the writer's
+     node gauges `catalog_epoch` (the word), `ns_ddl_pending` (0 or 1)
+     and `ns_ddl_notices_stale` (zero by design).
   3. **Recovery verifier** (`inf-store::keyspace`,
      `inf-server::recover`, ADR-0103 D4):
      `ReplayOutcome::SkippedUnknownNs(NsId)` carries the id;
@@ -1853,18 +1860,21 @@ count the arrivals that found it full.
      persisted-epoch pattern). Fan legs of one program never cross
      another's.
   2. **Every fan leg answers** (`plane::fan_all_or_first_error`): a
-     `CREATE`/`SET`/`DROP` fan awaits every peer; a leg that cannot be
-     sent or answers no bytes is an error leg.
+     `CREATE`/`SET`/`DROP` fan awaits every peer; a leg is applied only
+     when its reply's variant is `Ok`, which an applied leg answers
+     (ADR-0189 D5), and a leg that cannot be sent, or answers anything
+     else, is an error leg.
   3. **`CREATE` rollback** (`plane::rollback_create`, under the same
      ticket): on any error leg the origin drops its copy, requests the
-     catalog persist that drops the id (`request_persist_drop` — the
-     pending entry retires, a durable namespace gets its tombstone),
-     waits the swap, fans `INF.NSFAN DROP name epoch` (a peer without
-     the namespace answers "not found", accepted), stamps a durable
-     drop for retirement, and answers the leg's error (until ADR-0189
-     builds its order, below). The order
-     becomes *… → apply → fan → (all `+OK` → `create_applied` → `+OK` |
-     any error → rollback → the error)*.
+     `META` that drops the id (`request_drop`: the writer replaces the
+     pending `CREATE` with the drop, a durable namespace gets its
+     tombstone), waits for the answer, fans `INF.NSFAN DROP name epoch`
+     with the answer's epoch (a peer without the namespace answers "not
+     found", accepted), posts the drop's notice with the stamp of a
+     durable drop's retirement, and answers the leg's error (until
+     ADR-0189 builds its order, below). The order becomes *… → apply →
+     fan → (every leg applied → the `CreateApplied` notice → `+OK` | any
+     error → rollback → the error)*.
   4. **Fault point** `ns_create_fan_refused` (`plane::handle_ns_apply`,
      a peer's `CREATE` leg before its local apply; crash-matrix row
      `create-rolled-back`): no cell serves the namespace before or
@@ -1918,18 +1928,20 @@ count the arrivals that found it full.
      lag from a concurrent DDL — ids never reuse). A tombstone is added
      by a durable namespace's `DROP`, stamped with the node-wide
      checkpoint epoch the origin requests after the fan (the cleanup unit
-     the `DROP` reserved before any effect, ADR-0159 D2), and retired at
-     the next persist once every cell's published epoch covers it; boot
+     the `DROP` reserved before any effect, ADR-0159 D2) and posts with
+     its `DropFanned` notice, and retired at the next accepted request
+     once every cell's published epoch covers it; boot
      re-stamps survivors with one fresh request on the control writer's
      quota. Bound `DROPPED_NS_MAX
      = 256` — at the cap the `DROP` waits for its checkpoint first.
   2. **`INF.NSFAN DROP name epoch`** (4 positional args): the fan carries
      the persist epoch of the swap that drops the namespace; peers park
      their tier-file teardown until `ControlHandle::persisted(epoch)`
-     (ADR-0100 D5). `DROP` itself runs *apply → request persist → wait
-     `persisted(epoch)` → fan → request a node checkpoint + `StampDrop` →
-     `+OK`*: the persist is requested before the fan, and the fan carries
-     its epoch (ADR-0100 D4) (until ADR-0189 builds its order, below).
+     (ADR-0100 D5). `DROP` itself runs *apply → request the `META` that
+     drops it → wait for the answer → fan → request a node checkpoint +
+     the `DropFanned` notice with its epoch → `+OK`*: the persist is
+     requested before the fan, and the fan carries the answer's epoch
+     (ADR-0100 D4) (until ADR-0189 builds its order, below).
      `CREATE` persists before it serves (item 1 of the `CREATE`
      choreography above) and `SET` runs *apply → fan → persist → ack*
      (ADR-0015 D3) (until ADR-0189 builds its order, below).
@@ -1952,7 +1964,10 @@ count the arrivals that found it full.
 > nothing; every namespace DDL persists before any cell applies it; a
 > durable namespace's tombstone retires once every cell has published past
 > its stamp and reported its `ns-N/` gone; at 256 tombstones the writer
-> alone admits, paces once or refuses. Not built.
+> alone admits, paces once or refuses. The first clause is built: the
+> writer numbers each request at dequeue and answers it through its own
+> slot after its `META` write, and a refusal writes nothing. The rest is
+> not built.
 
 - **M4-S19 amendment (ADR-0062) — namespace catalog v2 + the `INF.NS`
   tiering surface.**

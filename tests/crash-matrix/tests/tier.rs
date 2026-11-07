@@ -545,6 +545,83 @@ fn tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers() {
     receipt::verified("tier_dir_open_fail", "creation-retried-round-owned");
 }
 
+/// A tier-file creation that fails after its file exists (the create made
+/// and named the file, then a later step of the same call failed): the
+/// refused rotation stages nothing and spends no file id, and the file it
+/// left is named by no MANIFEST. Once a later dirent barrier in the same
+/// directory (a blob extent's create syncs it) makes its name durable, a
+/// cut keeps it on the device, and the boot's sweep of unnamed tier files
+/// removes it before the namespace serves; the manifested file recovers.
+#[test]
+fn tier_create_post_fail_leaves_an_unnamed_file_the_boot_sweep_removes() {
+    let full = 2 * TIER_FRAME_DATA + 400;
+    let config = TierFlushConfig {
+        shard_dir: Path::new("shard-0").to_path_buf(),
+        cell: 0,
+        ns: NS,
+        mode: TierIoMode::Buffered,
+        file_capacity: full as u64,
+        slice_bytes: PAGE,
+        record_len_max: 16 << 20,
+    };
+    let cold = Path::new("shard-0").join("cold");
+    let residue = cold.join("tier-000001.itier");
+    for seed in 0..crash_matrix::seed_count(3) {
+        let disk = SimDisk::new();
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        let mut flush = TierFlush::new(disk.clone(), config.clone(), 0, &census);
+        flush.set_drive(TierDrive::Reactor);
+        stage_span(&mut flush, LogicalAddr::ZERO, &vec![0xC0; full], None).expect("stage A");
+        run_reactor_round(&disk, &mut flush, true);
+        apply_effects(&mut flush);
+        let manifested = flush.confirmable_end().expect("A's full frames are confirmed");
+        let manifest = TierNsManifest {
+            ns: NS.0,
+            flushed: manifested,
+            files: vec![TierFileRange { id: 0, base: 0, durable_len: manifested }],
+        };
+        // The rotation's create of B fails after B exists.
+        fault::arm("tier_create_post_fail", FaultSpec::Nth(1));
+        let at = LogicalAddr::from_raw(full as u64).expect("fits");
+        let err = stage_span(&mut flush, at, &[0xC1; 600], None).expect_err("B's create fails");
+        assert!(err.to_string().contains("tier_create_post_fail"), "typed + named: {err}");
+        assert!(fault::fired("tier_create_post_fail") >= 1, "the row is not vacuous");
+        assert!(!flush.round_active(), "seed {seed}: the refused plan staged nothing");
+        assert_eq!(flush.pending_seal_count(), 0, "A's seal is not staged");
+        assert_eq!(flush.next_file_id(), 1, "seed {seed}: no file id is spent");
+        assert_eq!(flush.active().map(|(id, _, data, ..)| (id, data)), Some((0, full as u64)));
+        assert!(disk.open_read(&residue).is_ok(), "the failed create left its file");
+        disk.sync_dir(&cold).expect("a later dirent barrier in the directory");
+        disk.power_cut(0xC4EA_7E00 ^ seed);
+        assert!(disk.open_read(&residue).is_ok(), "seed {seed}: the cut kept the file's name");
+        drop(flush); // the dead life's pipeline
+        let recovered = inf_store::recover_tiered_ns(
+            disk.clone(),
+            &manifest,
+            1,
+            config.clone(),
+            AddressSpaceConfig {
+                reserve_bytes: DemotionConfig::for_budget(4 << 20, PAGE)
+                    .ring_reserve_bytes()
+                    .expect("valid budget"),
+                page_bytes: PAGE as usize,
+                life_origin: LogicalAddr::from_raw(manifested).expect("fits"),
+            },
+            DemotionConfig::for_budget(4 << 20, PAGE),
+            128,
+            KeyHasher::default(),
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        )
+        .expect("recovery");
+        assert_eq!(recovered.stats.files_removed, 1, "seed {seed}: the sweep removed the file");
+        assert!(disk.open_read(&residue).is_err(), "seed {seed}: no file of the failed create");
+        assert_eq!(recovered.stats.files_resealed, 1, "A recovers at its manifested length");
+        assert_eq!(recovered.replay.sealed()[0].data_len, manifested);
+        fault::disarm_all();
+    }
+    receipt::verified("tier_create_post_fail", "residue-swept-at-boot");
+}
+
 /// Window 2: the seal **completed** (footer durable, catalog committed)
 /// but no MANIFEST ever named it — the cut lands between the round's
 /// completion and the next checkpoint. Recovery takes the older

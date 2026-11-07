@@ -24,6 +24,8 @@ use crate::evict::EvictionPolicy;
 use crate::extents::{BLOB_THRESHOLD_DEFAULT, BlobConfig};
 use crate::tiered::compact::CompactionConfig;
 
+pub mod ddl;
+
 /// First id available to named namespaces. Ids `0..16` are the implicit
 /// default namespaces (`db0`..`db15`, always `memory`) and never appear in
 /// the registry or the catalog (ADR-0015 D2).

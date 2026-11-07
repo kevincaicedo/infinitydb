@@ -85,7 +85,7 @@ mod tiered;
 mod timers;
 
 pub use conn::OwnedOutcome;
-use conn::{ACCEPT_RETRY, CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
+use conn::{CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
 use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
 use fabric::{
     GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, gather_element,
@@ -123,6 +123,7 @@ use crate::exec::{
     ConnCx, ConnNamespace, NodeInfo, TIER_FLUSH_GAUGES, TierFlushGauge, execute, execute_slices,
     stall_request, unavailable_default_allows,
 };
+use crate::limits::ACCEPT_RETRY;
 use crate::pubsub::{self, PubSubCell, SubKind};
 use crate::recover::{RecoverPhase, Recovery, RecoveryProgress};
 
@@ -322,13 +323,15 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     tier: RefCell<Option<crate::tier_cell::TierCell<F>>>,
     /// Dropped tiered namespaces whose tier files wait for the catalog
     /// swap that drops them (ADR-0100 D5): `(ns, epoch)` recorded on the
-    /// origin, before that swap, by the DROP program or a `CREATE`
-    /// rollback, and on a peer, after it, by the `INF.NSFAN DROP` apply
-    /// (ADR-0186 D1). A fault-injected stop at `ns_drop_before_meta`
-    /// records `u64::MAX`, an epoch no swap reaches, so those files hold
-    /// until the restart. Consumed by `TierCell::sync_namespaces`, which
-    /// parks the tier files on the entry's epoch. Bounded by DDL rate —
-    /// one entry per drop, consumed at the next MAINTAIN.
+    /// origin by the DROP program or a `CREATE` rollback at its local
+    /// apply as `u64::MAX`, an epoch no swap reaches, and lowered to the
+    /// writer's answer once it arrives (`lower_drop_release`), and on a
+    /// peer, after the swap, by the `INF.NSFAN DROP` apply (ADR-0186 D1).
+    /// A fault-injected stop at `ns_drop_before_meta` is never lowered, so
+    /// those files hold until the restart. Consumed by
+    /// `TierCell::sync_namespaces`, which parks the tier files on the
+    /// entry's epoch. Bounded by DDL rate — one entry per drop, consumed
+    /// at the next MAINTAIN.
     ns_drop_releases: RefCell<Vec<(NsId, u64)>>,
     /// Fabric-origin tiered applies (M4-S26): per-origin FIFO queues. A
     /// tiered apply can suspend on a cold read, so it cannot run inside
@@ -639,7 +642,9 @@ enum StagedReply {
     Bytes(usize, usize, ReplyOutcome),
     Int(i64),
     Nil,
-    /// The adopt ack (ADR-0128): returns the origin's credit, nothing else.
+    /// The adopt ack (ADR-0128), or an applied namespace DDL leg
+    /// (ADR-0189 D5): its variant is all it carries, and it returns the
+    /// origin's credit.
     Ok,
     /// Typed refusal for an op the M0 plane does not speak.
     Refused,

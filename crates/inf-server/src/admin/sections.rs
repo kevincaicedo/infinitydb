@@ -274,6 +274,11 @@ fn persistence_section(text: &mut String, node: &NodeInfo, now: Nanos) {
     // ADR-0100 D7: durable namespaces dropped since every cell last
     // published a MANIFEST past the drop (node scope).
     push(text, &format!("ns_drop_tombstones:{}", node.ns_drop_tombstones.get()));
+    // ADR-0189 D11: the catalog writer's word, its pending DDL and the
+    // notices that retired none (node scope).
+    push(text, &format!("catalog_epoch:{}", node.catalog_epoch.get()));
+    push(text, &format!("ns_ddl_pending:{}", node.ns_ddl_pending.get()));
+    push(text, &format!("ns_ddl_notices_stale:{}", node.ns_ddl_notices_stale.get()));
     push(text, "aof_enabled:0");
     push(text, "aof_rewrite_in_progress:0");
     log_gauge_lines(text, node);

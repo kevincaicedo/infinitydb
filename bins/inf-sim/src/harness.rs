@@ -72,6 +72,7 @@ use inf_wire::{CommandId, Protocol, lookup};
 use crate::net::{CellNet, Plant, SimDriver, listener_fd};
 use crate::resp::{Reply, SubFrame, parse_reply, parse_sub_frame, reply_len};
 
+pub mod accept_retry;
 mod audit;
 mod idle;
 pub mod shadow;
@@ -121,9 +122,10 @@ pub struct Scenario {
     pub channels: u64,
     /// PUBLISH share of the regular-client mix, percent. 0 = M0 mix.
     pub publish_percent: u64,
-    /// Max virtual nanoseconds per scheduler step (advance is seeded in
-    /// `1µs..=1µs+step_ns_max`). The m1 scenario uses bigger steps so its
-    /// PEXPIRE deadlines genuinely fire mid-run (wheel slices under load).
+    /// The seeded part of a scheduler step's advance, exclusive: a step
+    /// advances `STEP_NS_FLOOR` plus a draw in `0..step_ns_max`
+    /// ([`Scenario::step_ns_bound`]). The m1 scenario uses bigger steps so
+    /// its PEXPIRE deadlines genuinely fire mid-run (wheel slices under load).
     pub step_ns_max: u64,
     /// Adversarial-length share of the mix, percent (review of
     /// 2026-08-30, §5.5 Group 0 item 3: the frozen mixes are 9-byte keys
@@ -386,7 +388,20 @@ impl Scenario {
             wheel_nodes_max: None,
         }
     }
+
+    /// The exclusive bound of one scheduler step's advance, in ns: every
+    /// step advances at least `STEP_NS_FLOOR` and less than this. An oracle
+    /// that bounds a delivery in steps reads it here, never a copy.
+    #[must_use]
+    pub fn step_ns_bound(&self) -> u64 {
+        STEP_NS_FLOOR.saturating_add(self.step_ns_max)
+    }
 }
+
+/// The floor of every scheduler step's advance: 1 µs of virtual time, added
+/// to the seeded draw below `Scenario::step_ns_max`, so injected time moves
+/// on every step.
+const STEP_NS_FLOOR: u64 = 1_000;
 
 /// What a run produces. `trace` is the determinism artifact.
 #[derive(Debug)]
@@ -427,10 +442,14 @@ pub struct SimReport {
     /// The `--plant` canary reached its arming point (engagement check —
     /// a plant that never fired proves nothing).
     pub plant_fired: bool,
-    /// Parked accept arms resumed (F-L11-02): the plane's retry wheel or
-    /// a `Close`. `--plant accept-error` needs ≥ 1 or the queued clients
+    /// Parked accept arms resumed, by the plane's retry timer or by a
+    /// `Close`. `--plant accept-error` needs ≥ 1 or the queued clients
     /// were never let in (and the run stalls).
     pub accept_resumes: u64,
+    /// The accept-retry oracle's reading, on its leg alone (`--plant
+    /// accept-broken`): each broken-parked accept arm and the plane's retry
+    /// that resumed it.
+    pub accept_retry: Option<accept_retry::RetryReport>,
     /// Longest run of budget-exhausted drains that skipped a peer with
     /// frames waiting, over every cell (F-L12-02; bound `cells − 2`).
     /// Disclosed so a fairness run that never exhausted a budget cannot
@@ -1460,6 +1479,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         shadow_unmodeled: BTreeMap::new(),
         plant_fired: false,
         accept_resumes: 0,
+        accept_retry: None,
         fabric_skip_streak_max: 0,
         refused_clients: 0,
         idle_closed: 0,
@@ -1471,6 +1491,12 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     let mut idle_steps = 0u64;
     let mut idle: IdlePhase = IdlePhase::new(scenario.idle_clients);
     let mut order: VecDeque<usize> = (0..cells.len()).collect();
+    // The accept-retry oracle, on its leg alone: it reads the drivers and
+    // changes nothing a run does.
+    let mut retry_watch = scenario
+        .plant
+        .is_accept_retry_leg()
+        .then(|| accept_retry::RetryWatch::new(cells.len(), scenario.step_ns_bound()));
 
     loop {
         report.scheduler_steps += 1;
@@ -1486,6 +1512,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         for &i in &order {
             let (cell_loop, plane) = &mut cells[i];
             cell_loop.run_iteration(plane).expect("sim iteration");
+        }
+        if let Some(watch) = &mut retry_watch {
+            watch.sample(clock.now(), &nets);
         }
 
         // Subscriber pump: drain frames, classify, verify deliveries.
@@ -1705,7 +1734,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         );
 
         // Virtual time per scheduler step, seeded (m0: 1–16 µs).
-        clock.advance(Nanos(1_000 + rng.next_u64() % scenario.step_ns_max));
+        clock.advance(Nanos(STEP_NS_FLOOR + rng.next_u64() % scenario.step_ns_max));
 
         let all_done = clients.iter().all(|c| c.closed)
             && subs.iter().all(|s| s.state == SubState::Closed)
@@ -1823,6 +1852,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                 .to_string(),
         );
     }
+    // The accept-retry oracle writes the report's list, as the resume check
+    // does: the run's end keeps both lines by appending to it.
+    report.accept_retry = retry_watch.map(|watch| watch.finish(&mut report.oracle_violations));
 
     // Accounting reconciliation oracle (M1-S15): equalize active-vs-lazy
     // expiry at one instant, then live records must reconcile exactly; every
@@ -1916,7 +1948,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         state.keyspace(&plane.keyspace(), clock.now());
     }
     report.state_hash = state.value();
-    report.oracle_violations = oracle.violations.clone();
+    // Appended, never assigned: a check that wrote the report's list before
+    // this point keeps its line.
+    report.oracle_violations.extend(oracle.violations.iter().cloned());
     report.oracle_violations.extend(violations);
     report.sim_seconds = clock.now().0.saturating_sub(1) as f64 / 1e9;
     report

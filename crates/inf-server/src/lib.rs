@@ -53,10 +53,9 @@ pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
 pub use control::{
     BoardObservation, BoardSweep, CellIssuer, CellRecoverySlot, CheckpointEpoch, CkptBoard,
     CkptCredit, CkptFinalCredit, CkptIssuers, CkptQuota, CkptSpace, CkptTarget, ControlHandle,
-    ControlInbox, CreateOutcome, CreateVerdict, DROPPED_NS_MAX, DdlTicket, DetachedControl,
-    INDEX_SLOTS, IndexBoard, IssuerMismatch, IssuerRefused, LastSave, PENDING_CREATE_MAX,
-    RecoveryBoard, SweepStep, load_catalog, load_catalog_from, spawn as spawn_control,
-    spawn_in as spawn_control_in,
+    ControlInbox, DROPPED_NS_MAX, DdlTicket, DetachedControl, INDEX_SLOTS, IndexBoard,
+    IssuerMismatch, IssuerRefused, LastSave, RecoveryBoard, SweepStep, load_catalog,
+    load_catalog_from, spawn as spawn_control, spawn_in as spawn_control_in,
 };
 pub use data_dir_lock::{DataDirLock, DataDirLockError, LOCK_FILE};
 pub use durable::{
@@ -115,9 +114,9 @@ pub use readahead::boot_prefetch_threads_spawned;
 // assembly, so no new dep-DAG edge.
 pub use inf_runtime::net::probe_addr_unowned;
 pub use recover::{
-    RECOVERY_UNITS, RecoverPhase, RecoverPhases, RecoverStats, RecoveredManifest, Recovery,
-    RecoveryProgress, RecoveryUnit, STEP_FACT_FIELDS, StepBudget, StepFacts, UnitEntry, UnitPhase,
-    open_cell_log,
+    RECOVERY_UNITS, RecoverPhase, RecoverPhases, RecoverStats, RecoverUnits, RecoveredManifest,
+    Recovery, RecoveryProgress, RecoveryUnit, STEP_FACT_FIELDS, StepBudget, StepFacts, UnitEntry,
+    UnitPhase, open_cell_log,
 };
 pub use topology::{
     TOPOLOGY_FILE, TopologyError, TopologySource, create_topology, load_topology, parse_topology,

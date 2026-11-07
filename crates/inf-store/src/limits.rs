@@ -56,6 +56,33 @@ pub const SETTLE_READ_CHARGE_BYTES: u64 = 128 << 10;
 /// the walk passes. Owner and crossing: as [`SETTLE_READ_CHARGE_BYTES`].
 pub const SETTLE_WALK_BYTE_CHARGE: u64 = 1;
 
+/// The recovery step budget's price (ADR-0174 A1) of one RAM unit of boot
+/// work outside the record walk: one checkpoint entry's apply beside its
+/// bytes (a ref's pair probe, insert and live-set probe), or one listed
+/// address the end of the checkpoint releases (a probe and a death) — at
+/// most five ordered-map or index operations and no scan. 64 budget bytes,
+/// a few cache misses' worth beside the byte prices: an estimate the
+/// reference-box run calibrates, never a measurement. Owner: the recovery
+/// driver, which charges it per unit and hands a unit's handler the number
+/// its budget left buys, at least one. Crossing: the step yields once its
+/// charge reaches the budget, at the next unit, and the next step resumes
+/// at its cursor.
+pub const RECOVER_PROBE_CHARGE_BYTES: u64 = 64;
+
+/// The recovery step budget's price (ADR-0174 A1) of one probe group the
+/// boot's ticket rebuild scans (ADR-0093 A4′): the group's bytes — sixteen
+/// control bytes, sixteen 8-byte slots and their 8-byte hashes, 272 — at the
+/// walked-byte price, beside the classification of its cold slots, a probe
+/// chain each and no scan. Owner: the recovery driver, which charges it per
+/// group and hands the rebuild the number its budget left buys, at least
+/// one. Crossing: the step yields once its charge reaches the budget, at the
+/// next group or returned slot, and the next step resumes at the rebuild's
+/// own cursor.
+pub const REBUILD_GROUP_CHARGE_BYTES: u64 =
+    crate::index::Index::<crate::index::TieredMode>::GROUP_BYTES as u64 * SETTLE_WALK_BYTE_CHARGE;
+
+const _: () = assert!(REBUILD_GROUP_CHARGE_BYTES == 272, "a tiered probe group is 272 bytes");
+
 /// Wheel nodes one store may hold (ADR-0008 A1 rule 7): the node's
 /// `next` link is 24 bits and `NIL` (2²⁴ − 1) is reserved, so node indices
 /// are `0..NIL` — a count of 2²⁴ − 1. This is the width bound, not a byte

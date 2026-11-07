@@ -389,6 +389,13 @@ pub struct NodeState {
     /// ADR-0100 D7: live drop tombstones in the catalog writer (node
     /// scope, refreshed at MAINTAIN from the control handle).
     pub ns_drop_tombstones: Cell<u64>,
+    /// ADR-0189 D11, node scope, refreshed with the tombstones: the
+    /// catalog word (the highest request the writer answered), whether
+    /// the writer holds a pending DDL (0 or 1), and the DDL notices that
+    /// retired none (zero by design).
+    pub catalog_epoch: Cell<u64>,
+    pub ns_ddl_pending: Cell<u64>,
+    pub ns_ddl_notices_stale: Cell<u64>,
     /// M2-S21: windowed rates (previous everysec-tick window) + fsync
     /// latency percentiles (µs) + checkpoint age (s).
     pub fsyncs_per_sec: Cell<u64>,

@@ -94,7 +94,7 @@ pub use keyspace::{
     TieredUsage, drive_record,
 };
 pub use live_set::{FileLiveSet, LiveSet};
-pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, valid_ns_name};
+pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, ddl, valid_ns_name};
 pub use ordered::{
     AppendError, Fixed8, KeyScheme, ORDERED_KEY_MAX, OrderedCursor, OrderedMap, OrderedMapError,
     OrderedMapMemory, PkRef, VarKey,
@@ -120,7 +120,7 @@ pub use tiered::replay::{
 };
 pub use tiered::select::select_whole_records;
 pub use tiered::shadow::{
-    COLLISION_KEY_PREFIX, KeyWindow, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT,
+    COLLISION_KEY_PREFIX, KeyWindow, RebuildStep, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT,
     SHADOW_TICKETS_CAP, SettleError, SettleOutcome, SettleReason, SettleSlot, ShadowCounters,
     ShadowProbe, ShadowRead, ShadowRebuild, ShadowRebuildError, ShadowRefusal, ShadowTicket,
     ShadowVerdict,
@@ -132,8 +132,9 @@ pub use tiered::{
     TieredTable,
 };
 pub use tiered_recover::{
-    RecoveredTier, TierRecoverStats, apply_blob_ref_section, apply_live_set_section,
-    apply_ref_section, recover_tiered_ns,
+    RecoveredTier, TierRecoverStats, apply_blob_ref_entries, apply_blob_ref_section,
+    apply_live_set_entries, apply_live_set_section, apply_ref_entries, apply_ref_section,
+    recover_tiered_ns,
 };
 pub use wall::WallAnchor;
 pub use write_accounting::{

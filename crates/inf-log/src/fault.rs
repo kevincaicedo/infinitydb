@@ -44,6 +44,11 @@
 //!   round keeps only ops whose handles the pipeline owns and the creation retries next slice; on
 //!   the seam drive the create refuses with no file left behind — at boot, the demote step's typed
 //!   refusal (ADR-0174 D5)
+//! - `tier_create_post_fail` — `SimDisk::create_tier`, after the file is made and named — typed
+//!   I/O error with the file left on the disk and its handle closed: the shape of a real create
+//!   whose `create_new` succeeded and whose `set_len`, `O_DIRECT` probe (a `/proc` open, so
+//!   `EMFILE` reaches it) or `sync_all` failed. It fires in the simulated disk only, so every
+//!   create path running on that disk meets it, and no other filesystem carries it
 //! - `tier_unlink_fail` — `flush::unlink_tier_file` — typed I/O error, **non-fatal and counted**
 //!   (M4-S15, ADR-0059 D3): the durable truth already excludes the file — space is deferred, never
 //!   durability; the retry and the boot GC both re-drive it
@@ -100,6 +105,7 @@ pub const TIER_FSYNC_ERR: &str = "tier_fsync_err";
 pub const TIER_FOOTER_TORN: &str = "tier_footer_torn";
 pub const TIER_UNLINK_FAIL: &str = "tier_unlink_fail";
 pub const TIER_DIR_OPEN_FAIL: &str = "tier_dir_open_fail";
+pub const TIER_CREATE_POST_FAIL: &str = "tier_create_post_fail";
 pub const BLOB_SHORT_WRITE: &str = "blob_short_write";
 pub const BLOB_FSYNC_ERR: &str = "blob_fsync_err";
 pub const BLOB_UNLINK_FAIL: &str = "blob_unlink_fail";
@@ -123,6 +129,7 @@ pub const ALL: &[&str] = &[
     TIER_FOOTER_TORN,
     TIER_UNLINK_FAIL,
     TIER_DIR_OPEN_FAIL,
+    TIER_CREATE_POST_FAIL,
     BLOB_SHORT_WRITE,
     BLOB_FSYNC_ERR,
     BLOB_UNLINK_FAIL,

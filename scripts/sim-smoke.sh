@@ -14,6 +14,10 @@ cargo build --release -p inf-sim --features dst --bin inf-sim
 bin=target/release/inf-sim
 
 # F-L11-05: an accept-path error is a counter, never connection teardown.
+# The accept-broken row parks each listener as broken, which no close
+# resumes: the plane's accept retry is the queued clients' one way in, and
+# its oracle times each re-arm against the retry's deadline. Its twin runs,
+# as its trace is its own.
 # Adversarial key/value lengths at 4 cells.
 # F-L19-05/06: namespace-bound + SELECTed clients, the served surface and
 # the stored content under audit at 4 cells.
@@ -52,6 +56,7 @@ bin=target/release/inf-sim
 rows=(
   "m0-smoke"
   "m0-smoke --plant accept-error"
+  "m0-smoke --plant accept-broken --verify-determinism"
   "m0-adversarial --cells 4 --verify-determinism"
   "m0-surface --cells 4 --verify-determinism"
   "m0-fabric-fairness"

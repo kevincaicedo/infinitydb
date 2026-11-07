@@ -265,6 +265,24 @@ fn run_observed(scenario: &CombinedScenario, observer: TraceObserver) -> Combine
             return finish(report, &observer, &clock);
         }
     };
+    // A node serves once every cell's recovery is ready: a cell whose
+    // catalog holds a tiered namespace hands its machines over in steps
+    // first, and answers a command before that -LOADING. The reboot below
+    // waits the same way.
+    let mut steps = 0u64;
+    while !node.ready() {
+        steps += 1;
+        report.scheduler_steps += 1;
+        if let Err(err) = node.step(&mut rng, &clock, &disk, dur.step_ns_max) {
+            fail(&mut report, format!("boot 1 recovery failed: {err}"));
+            return finish(report, &observer, &clock);
+        }
+        if steps > STALL_STEPS {
+            report.stalled = true;
+            fail(&mut report, "recovery stalled on boot 1".to_owned());
+            return finish(report, &observer, &clock);
+        }
+    }
     let mut setup = MiniClient::connect(&mut node, 0);
     let ddl: [&[&[u8]]; 3] = [
         &[b"INF.NS", b"CREATE", b"alw", b"MODE", b"durable", b"FSYNC", b"always"],

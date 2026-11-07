@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Planted-bug canaries (ADR-0090 D5; F-L19-03 addendum, F-L19-04): each
-# `--cfg inf_canary_*` disables one load-bearing rule in the product, or
+# `--cfg inf_canary_*` disables one load-bearing rule in the product,
 # removes from a harness leg what its engagement clause needs (a vacuity
-# plant, read in `bins/inf-sim` alone), and the scenario whose oracle owns
-# that rule or clause must go red on the planted build — and green on the
-# plain build. A canary the fleet never plants
+# plant), or breaks the simulator's model of a contract that a leg's oracle
+# takes as its premise (a premise plant); the last two are read in
+# `bins/inf-sim` alone. The scenario whose oracle owns that rule, clause or
+# premise must go red on the planted build — and green on the plain build.
+# A canary the fleet never plants
 # proves nothing; `bins/inf-sim/tests/lanes.rs` fails when a cfg in the
 # workspace's `check-cfg` list has no row here.
 # Three row kinds:
@@ -367,6 +369,32 @@ rows=(
   # run judges nothing and is vacuous.
   "inf_canary_wake_never_held m2-fill-tick held-park-unengaged --park-at-once"
   "inf_canary_wake_never_held m2-group-hold held-park-unengaged --park-at-once"
+  # ADR-0118 D2: the accept retry re-arms a parked listener one window
+  # after its failure. Planted, its callback pushes no accept arm: on the
+  # broken-listener leg, which no `Close` resumes, the accept-retry oracle
+  # reads every parked arm still open at the run's end, and the queued
+  # clients stall.
+  "inf_canary_accept_retry_no_rearm m0-smoke accept-retry-missing --plant accept-broken"
+  # The accept-retry oracle's engagement: planted, it reads no park, so the
+  # leg's run judges nothing and is vacuous.
+  "inf_canary_accept_retry_park_unread m0-smoke accept-retry-unengaged --plant accept-broken"
+  # The accept-retry leg rests on the driver contract: a `Close` resumes an
+  # exhaustion park only. Planted in the simulator's driver, a `Close`
+  # resumes the broken park too, and the oracle reads each park resumed with
+  # no retry.
+  "inf_canary_accept_close_resumes_any m0-smoke accept-retry-by-close --plant accept-broken"
+  # The retry waits its window, so a persistent failure costs one accept a
+  # window, never a spin (ADR-0118 D2). Planted, the failure re-arms the
+  # listener at once, and the oracle reads each retry before its deadline.
+  "inf_canary_accept_retry_at_once m0-smoke accept-retry-early --plant accept-broken"
+  # The retry falls due within its rounding millisecond of the window
+  # (ADR-0154 D3). Planted, it falls due 2 ms past the window, and the
+  # oracle reads each retry past its bound.
+  "inf_canary_accept_retry_late m0-smoke accept-retry-late --plant accept-broken"
+  # The oracle judges each park against its own deadline, so a retry one
+  # rounding millisecond early is red as well: the timer set's due test
+  # planted a millisecond early (the model's row above), on this leg.
+  "inf_canary_timer_fires_early m0-smoke accept-retry-early --plant accept-broken"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.
@@ -579,6 +607,29 @@ rows=(
   # A walk that fits asks its budget once. Planted, a whole walk asks after
   # every record.
   "inf_canary_recover_ask_per_record crate-test inf-server test:recover_replay_steps a_unit_that_fits_asks_once_per_frame_and_per_section ASK COUNT"
+  # A checkpoint step yields at the next record or entry inside a section,
+  # and asks after each index-sidecar section. Planted, a section's walk
+  # never parks: a records section's demote steps run inside the step that
+  # enters it, an entry section applies every entry, and a run of sidecar
+  # sections loads in one step.
+  "inf_canary_recover_section_whole crate-test inf-server test:recover_replay_steps a_records_section_of_rewrites_of_cold_keys_is_loaded_under_the_step_judge (Ick)"
+  "inf_canary_recover_section_whole crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge ENTRIES"
+  "inf_canary_recover_section_whole crate-test inf-server test:recover_replay_steps a_run_of_index_sidecar_sections_yields_after_each_section JUDGE"
+  # The end of the checkpoint's releases are RAM units at their price.
+  # Planted, they charge nothing: one step walks the whole list.
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge RELEASES"
+  # A resumed section walk passes no record unapplied. Planted, it passes
+  # a record that needs room (the boot refuses, or a key is absent).
+  "inf_canary_recover_skip_on_resume crate-test inf-server test:recover_replay_steps every_budget_recovers_the_checkpoint_of_the_unparked_boot BUDGET INDEPENDENCE"
+  # A step that parks inside the section it entered adds to its work gauge
+  # the section's bytes it left. Planted, it adds their price: the RAM price
+  # of every entry no step has applied yet.
+  "inf_canary_recover_parked_priced crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge GAUGE"
+  # The end of the checkpoint releases its listed addresses in settle order
+  # at every step budget. Planted, a call that resumes inside the list
+  # releases its batch in reverse.
+  "inf_canary_replay_release_reordered crate-test inf-store lib the_end_of_the_checkpoint_releases_blob_references_in_settle_order two a call"
+  "inf_canary_replay_release_reordered crate-test inf-server test:recover_replay_steps every_budget_recovers_the_checkpoint_of_the_unparked_boot reclaim queue's order"
   # ADR-0061 D6: the 0x05 pass lists the entry of a record the walk imaged
   # (a ticket winner below the watermark, ADR-0093 A12) — the boot
   # registers the extent at both addresses and its count stays one above
@@ -640,6 +691,39 @@ rows=(
   # entry: there a 1 ms hold still counts a covered tick).
   "inf_canary_stop_tick_unheld m2-stop-tick stop-tick-unheld"
   "inf_canary_stop_tick_short_hold m2-stop-tick stop-tick-uncovered --seed 0xC0FFEE"
+  # The hand-over's units are priced (ADR-0174 A1.3): a parked death stamped
+  # or an extent id seeded at the RAM unit price, a revive rename at the
+  # file-operation price, a probe group the ticket rebuild scans at its
+  # bytes. Planted, they charge nothing: one step runs every stage.
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge STAMPS"
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge SEEDS"
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge RENAMES"
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge GROUPS"
+  # A step that parks inside the section or the frame it read adds the bytes
+  # it left to its work gauge, so the gauge reads at least what the step
+  # read. Planted, a park adds nothing of its unit: the gauge reads under.
+  "inf_canary_recover_parked_dropped crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge under the step's reads"
+  "inf_canary_recover_parked_dropped crate-test inf-server test:recover_replay_steps a_frame_of_rewrites_of_demoted_keys_is_replayed_under_the_step_judge under the step's reads"
+  # ADR-0189 D2, D3, D5: the catalog writer and the DDL notice, one plant
+  # per rule, each oracle reading the disk or the wire. The slot and the
+  # word published before the META write: a requester reads its answer
+  # while the writer is held inside that write.
+  "inf_canary_ns_answer_before_swap crate-test inf-server test:catalog_requests an_answer_waits_for_its_own_meta_write answered before its META write returned"
+  # The epoch taken at send: the second sender's swap answers first, and
+  # the word decreases when the held DDL's own swap lands.
+  "inf_canary_ns_epoch_at_send crate-test inf-server test:catalog_requests a_create_held_before_its_send_is_answered_after_its_own_meta the published word decreased"
+  "inf_canary_ns_epoch_at_send crate-test inf-server test:catalog_requests a_drop_held_before_its_send_is_answered_after_its_own_meta the published word decreased"
+  # The payload shaped before the state moves: a DDL's own META lacks its
+  # change.
+  "inf_canary_ns_intent_after_shape crate-test inf-server test:catalog_requests every_payload_carries_the_ddl_in_flight own META names the namespace"
+  # The strip keeps a dropped namespace's index records: the written META
+  # does not decode.
+  "inf_canary_ns_index_record_kept crate-test inf-server test:catalog_requests an_index_on_the_dropped_namespace_leaves_meta_with_it IndexUnknownNamespace"
+  # A refusal writes META: the recording file system sees it.
+  "inf_canary_ns_refusal_writes_meta crate-test inf-server test:catalog_requests a_refused_request_writes_nothing the refusal touched the disk"
+  # The `ns_drop_after_meta` exit forgets its notice: the next DDL meets a
+  # pending one.
+  "inf_canary_ns_notice_forgotten crate-test inf-server test:node_e2e a_ddl_stopped_after_its_answer_leaves_no_ddl_pending another namespace DDL is pending"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

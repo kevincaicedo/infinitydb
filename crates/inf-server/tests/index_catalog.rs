@@ -171,13 +171,13 @@ fn declarations_survive_restart_through_the_meta_swap() {
     reg.set_catalog_state(dropping_id, IndexState::Dropping).expect("edge");
     // Persist exactly like the DDL program: export + counters, swap
     // through the (detached) control plane, epoch published.
-    let epoch = control.request_persist(origin.export_catalog(
+    control.request_persist(origin.export_catalog(
         control.next_ns_id(),
         control.next_index_id(),
         control.next_index_generation(),
     ));
     inbox.drain(&StdSegmentFs, &dir).expect("META swap");
-    assert!(control.persisted(epoch), "epoch published after the swap");
+    assert_eq!(control.persisted_epoch(), 1, "the swap answered: the word covers its request");
 
     // "Reboot": load the catalog, re-seed control plane + a fresh cell.
     let loaded = load_catalog(&dir).expect("readable").expect("present");

@@ -1,6 +1,7 @@
 //! Runtime bounds owned by the server. Every crossing names its behavior here.
 
 use inf_foundation::bounded::{Cap, CapFill};
+use inf_foundation::time::Nanos;
 
 /// Reclaim marks one tiered namespace holds on its cell: ADR-0061 D5's
 /// `(seq, epoch)` marks, one per ack class (ADR-0163 D2). After MAINTAIN
@@ -79,10 +80,11 @@ pub const CKPT_BOARD_VISITS_PER_TURN: usize = 64;
 /// moved. Owner: the recovery driver (`RecoverConfig::step_bytes` is the
 /// budget it charges). Crossing: a step whose charge — the bytes its cursor
 /// passed and its priced boot work — reaches the budget yields at the next
-/// record, inside a log frame (ADR-0174 A1), at the next checkpoint section,
-/// which stays one unit, or after the settle step that reached it. The
-/// bytes a demote step's seal walk and the end settle pass, and their
-/// reads, are priced by the store, whose walks yield on them
+/// record or entry, inside a log frame or a checkpoint section (ADR-0174
+/// A1), after an index-sidecar section, after the settle step that reached
+/// it, or at the hand-over's next unit. The bytes a demote step's seal walk
+/// and the end settle pass, and their reads, are priced by the store, whose
+/// walks yield on them
 /// ([`ReplayWork::settle_charge_bytes`](inf_store::ReplayWork::settle_charge_bytes)).
 pub const REPLAY_TIER_BYTE_CHARGE: u64 = 1;
 
@@ -197,3 +199,29 @@ const _: () = {
     }
     assert!(JSON_FIXED_REPLY_BYTES_MAX == 348, "the fixed column's maximum is 348 bytes");
 };
+
+/// The recovery step budget's price (ADR-0174 A1) of one boot file
+/// operation outside replay — at the hand-over, the rename that brings a
+/// quarantined extent the replayed map references back under its name
+/// (ADR-0096 D3): 128 KiB, about 100 µs of a device that moves 1 GiB/s, as
+/// a settle read is priced. An estimate the reference-box run calibrates,
+/// never a measurement. Owner: the recovery driver, which charges it per
+/// operation and runs as many a turn as its budget left buys, at least one.
+/// Crossing: the step yields once its charge reaches the budget, at the next
+/// unit, and the next step resumes at the hand-over's cursor.
+pub const BOOT_FILE_OP_CHARGE_BYTES: u64 = 128 << 10;
+
+/// The accept retry's window, in injected time: after the driver parks a
+/// listener's accept arm on an exhaustion or a broken-listener failure, the
+/// plane's accept-retry timer owner re-arms it this long after the failure.
+/// Descriptors freed outside the driver (segment files, checkpoint handles),
+/// and a listener parked as broken, which no `Close` resumes, let queued
+/// clients in by this retry alone. Owner: the plane's accept-retry owner,
+/// armed from Idle by a window's first failure. Crossing: pacing. Failures
+/// inside a window coalesce into its one arm, which falls due at most one
+/// window and the deadline's rounding millisecond after the window's first
+/// failure (ADR-0154 D3). While the failure persists, each retry fails
+/// again, counts one error and arms one more window: one `accept(2)` a
+/// window, never a spin, and a queued client waits one more window for each
+/// failed retry.
+pub const ACCEPT_RETRY: Nanos = Nanos::from_millis(100);

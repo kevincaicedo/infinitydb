@@ -254,3 +254,27 @@ tier = "node"
 platform = "linux"
 test = "inf-server::node_e2e::durable_mset_midway_failure_stages_on_the_fabric_path"
 expect = "staged-prefix"
+# ADR-0189 D2 (`a_create_held_before_its_send_is_answered_after_its_own_meta`):
+# a `CREATE`'s sender held between building and sending its catalog request
+# while a second request is sent, answered and published.
+#   answered-after-own-meta — the held DDL's answer follows its own META
+#                         write (META decoded at the answer names the
+#                         namespace) and the published word never decreases
+[[row]]
+point = "ddl_request_held"
+tier = "node"
+platform = "all"
+test = "inf-server::catalog_requests::a_create_held_before_its_send_is_answered_after_its_own_meta"
+expect = "answered-after-own-meta"
+# ADR-0189 D5 (`a_cut_inside_a_rolled_back_create_wait_keeps_every_acked_key`):
+# a peer's `CREATE` leg held while the origin acknowledges writes in the new
+# namespace, then refused; the origin rolls back and a cut lands before the
+# rollback's swap, with no checkpoint in its wait.
+#   rolled-back-create-keeps-acked-writes — the restart serves every write
+#                         acknowledged inside the fan
+[[row]]
+point = "ns_create_leg_held"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::a_cut_inside_a_rolled_back_create_wait_keeps_every_acked_key"
+expect = "rolled-back-create-keeps-acked-writes"
