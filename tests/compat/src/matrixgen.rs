@@ -384,7 +384,11 @@ pub static DECLARED: &[Declared] = &[
          budget-less namespaces (ADR-0068 A1); durable and tiered namespaces refuse both keys \
          typed (tiered budgets belong to `MEM-BUDGET`). A durable `CREATE`/`DROP` reserves two \
          checkpoint units of its cell's quota before any effect; an exhausted quota answers \
-         `-ERR checkpoint identity space exhausted` and changes nothing (ADR-0159 A1.2)",
+         `-ERR checkpoint identity space exhausted` and changes nothing (ADR-0159 A1.2). A \
+         `CREATE` spends a namespace id only when the catalog accepts it, so a refused one \
+         leaves the next id unchanged; once the last id (4294967294) is issued, every `CREATE` \
+         answers `-ERR namespace identity space exhausted` before any effect, for the data \
+         directory's life (ADR-0148 D4, ADR-0172 `IdentityExhausted`)",
     ),
     d(
         "INF.CKPT",
