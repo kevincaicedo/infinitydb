@@ -217,6 +217,13 @@ fn main() {
         eprintln!("inf-sim: --plant accept-broken is m0-smoke's");
         std::process::exit(2);
     }
+    // The park-at-once leg is the wake oracle's, m2-fill-tick's and
+    // m2-group-hold's alone: refused here, before any scenario dispatches,
+    // since a leg that dispatches early would run with the flag ignored.
+    if park_at_once && !matches!(scenario_name.as_str(), "m2-fill-tick" | "m2-group-hold") {
+        eprintln!("inf-sim: --park-at-once is m2-fill-tick's and m2-group-hold's");
+        std::process::exit(2);
+    }
     // The two flags each force one of m4-recovery's seed classes, which a
     // seed runs one of: together they are refused, never one dropped.
     let forced_class = match (replay_above_window, spec_variant) {
@@ -284,11 +291,6 @@ fn main() {
         }
     }
 
-    // TM3's leg is m2-fill-tick's and m2-group-hold's, and only theirs.
-    if park_at_once && !matches!(scenario_name.as_str(), "m2-fill-tick" | "m2-group-hold") {
-        eprintln!("inf-sim: --park-at-once is m2-fill-tick's and m2-group-hold's");
-        std::process::exit(2);
-    }
     // The M2-S19 durable scenario has its own runner (power cuts, the
     // durability oracle, the sweep mode).
     if matches!(
