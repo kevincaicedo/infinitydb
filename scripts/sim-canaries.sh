@@ -752,6 +752,13 @@ if [ -n "${INF_CANARY_SHARD:-}" ]; then
   rows=("${picked[@]}")
 fi
 
+# Every build lands in this checkout's target root, each planted cfg in a
+# directory of its own there (its RUSTFLAGS differ), and every leg runs the
+# binary its own build made, whatever CARGO_TARGET_DIR holds (ADR-0198 A2).
+# shellcheck source=target-root.sh
+. scripts/target-root.sh
+target_root_setup "$(pwd -P)"
+
 fail=0
 log=$(mktemp)
 [ -n "$log" ] && [ -f "$log" ] || { echo "sim-canaries: mktemp failed"; exit 2; }
@@ -769,7 +776,7 @@ crate_test() {
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
   echo "== canary $cfg: $package $target $name on the planted build must go red"
   if RUSTFLAGS="--cfg $cfg" "$CARGO" test -p "$package" "${target_args[@]}" \
-      --target-dir "target/canary-crate" -- "$name" > "$log" 2>&1; then
+      --target-dir "$TARGET_ROOT/canary-crate" -- "$name" > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
@@ -790,7 +797,8 @@ crate_test() {
     echo "   caught: $(grep -E -m1 -- "${verdict}FAILED" "$log")"
   fi
   echo "== canary $cfg: $package $target $name on the plain build must stay green"
-  if ! "$CARGO" test -p "$package" "${target_args[@]}" -- "$name" > "$log" 2>&1 \
+  if ! "$CARGO" test -p "$package" "${target_args[@]}" --target-dir "$TARGET_ROOT" -- "$name" \
+      > "$log" 2>&1 \
       || ! grep -Eq -- "${verdict}ok" "$log"; then
     echo "   the plain build does not pass '$name' (a canary needs a green control):"
     tail -5 "$log"
@@ -806,7 +814,7 @@ loom_test() {
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
   echo "== canary $cfg: $package loom $name on the planted build must go red"
   if RUSTFLAGS="--cfg loom --cfg $cfg" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" \
-      --release --lib --target-dir "target/canary-loom" -- "$name" > "$log" 2>&1; then
+      --release --lib --target-dir "$TARGET_ROOT/canary-loom" -- "$name" > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the model has no teeth)"
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
@@ -822,7 +830,7 @@ loom_test() {
   fi
   echo "== canary $cfg: $package loom $name on the plain loom build must stay green"
   if ! RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" --release \
-      --lib --target-dir "target/loom" -- "$name" > "$log" 2>&1 \
+      --lib --target-dir "$TARGET_ROOT/loom" -- "$name" > "$log" 2>&1 \
       || ! grep -Eq -- "${verdict}ok" "$log"; then
     echo "   the plain loom build does not pass '$name' (a canary needs a green control):"
     tail -5 "$log"
@@ -852,11 +860,11 @@ for row in "${rows[@]}"; do
   fi
   name=${parts[1]}; expect=${parts[2]}; flags=("${parts[@]:3}")
   if [ "$sim_built" -eq 0 ]; then
-    "$CARGO" build --release -p inf-sim --features dst --bin inf-sim
+    "$CARGO" build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT"
     sim_built=1
   fi
-  plain=target/release/inf-sim
-  target="target/canary-$cfg"
+  plain="$TARGET_ROOT/release/inf-sim"
+  target="$TARGET_ROOT/canary-$cfg"
   echo "== canary $cfg: building inf-sim with --cfg $cfg into $target"
   RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
     --target-dir "$target"
