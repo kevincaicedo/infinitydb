@@ -367,6 +367,12 @@ rows=(
   # run judges nothing and is vacuous.
   "inf_canary_wake_never_held m2-fill-tick held-park-unengaged --park-at-once"
   "inf_canary_wake_never_held m2-group-hold held-park-unengaged --park-at-once"
+  # ADR-0118 D2: the accept retry re-arms a parked listener one window
+  # after its failure. Planted, its callback pushes no accept arm: on the
+  # broken-listener leg, which no `Close` resumes, the accept-retry oracle
+  # reads every parked arm still open at the run's end, and the queued
+  # clients stall.
+  "inf_canary_accept_retry_no_rearm m0-smoke accept-retry-missing --plant accept-broken"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.

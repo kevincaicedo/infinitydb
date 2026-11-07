@@ -273,6 +273,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
     fn on_timer<'n>(&mut self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> {
         match TimerRole::from_route(notice.route()) {
             Some(TimerRole::AcceptRetry) => {
+                // Canary: the retry pushes no accept arm, so a listener the
+                // driver parked as broken never accepts again.
+                #[cfg(not(inf_canary_accept_retry_no_rearm))]
                 if self.started {
                     // Idempotent on an armed listener; resumes a parked
                     // one of either class. An exhausted or broken listener
