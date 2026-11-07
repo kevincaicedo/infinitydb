@@ -10772,3 +10772,79 @@ fn a_ddl_stopped_after_its_answer_leaves_no_ddl_pending() {
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- a tiered DROP frees its origin's tier files on the running node ----
+
+/// What cell `conn`'s tier cell counted at its last MAINTAIN: the sealed
+/// and active files of its tiered namespaces, and its flush rounds live
+/// or draining.
+fn tier_cell_files_and_rounds(conn: &mut TcpStream) -> (u64, u64) {
+    let files = scrape_u64(conn, b"tiering", "tiering_files_sealed:")
+        + scrape_u64(conn, b"tiering", "tiering_files_active:");
+    (files, scrape_u64(conn, b"tiering", "tiering_flush_rounds_inflight:"))
+}
+
+/// A tiered `DROP` frees its origin's tier files on the running node once
+/// the catalog swap that carries it is durable (ADR-0100 D5): no restart
+/// is needed for the space. The origin holds the files from its local
+/// apply, before the writer numbers the request, and the answer lowers
+/// the hold to the drop's epoch. The swap is held until cell 0's MAINTAIN
+/// has taken the namespace off its tier cell with no flush round left, so
+/// the hold the answer lowers is the one in the teardown queue. Oracle:
+/// the shard directories. Cell 0 keeps every tier file of ns 16 while the
+/// swap is held, and once it lands, every cell's are gone within the
+/// deadline (cell 1's are held by the fan's epoch).
+#[test]
+fn a_tiered_drop_frees_its_origins_tier_files_without_a_restart() {
+    let dir = temp_data_dir("drop-frees-origin");
+    seed_drop_wait_namespace(DropWaitNs::Tiered, &dir);
+    let hold = Arc::new(AtomicBool::new(true));
+    let node = Node::start_durable_with_held_catalog(2, &dir, hold, CkptTrigger::Manual);
+    let control = Arc::clone(node.control.as_ref().expect("a durable node"));
+    let before = drop_wait_cold_files(&dir);
+    assert!(before[0].0 > 0, "VACUOUS: cell 0 has no tier file of ns 16: {before:?}");
+    let mut gauges = conn_on_cell(&node, 0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while tier_cell_files_and_rounds(&mut gauges).0 == 0 {
+        assert!(Instant::now() < deadline, "VACUOUS: cell 0's tier cell never counted a file");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let requested = control.persist_requests_sent();
+    let mut dropper = conn_on_cell(&node, 0);
+    dropper.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
+    while control.persist_requests_sent() == requested {
+        assert!(Instant::now() < deadline, "the drop never requested its catalog swap");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // MAINTAIN takes the dropped namespace off the tier cell while the
+    // swap is held: its files wait in the teardown queue, held.
+    while tier_cell_files_and_rounds(&mut gauges) != (0, 0) {
+        assert!(Instant::now() < deadline, "cell 0's MAINTAIN never queued the teardown");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let held = drop_wait_cold_files(&dir);
+    assert_eq!(held[0].0, before[0].0, "cell 0 unlinked a tier file before its swap was durable");
+    node.land_held_persists(1);
+    read_exactly(&mut dropper, b"+OK\r\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = drop_wait_cold_files(&dir);
+        if now.iter().all(|&(tier, _)| tier == 0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tier files of the dropped namespace are still on disk 10 s after its swap, \
+             (tier files, extents) per cell {now:?}; at the hold {held:?}"
+        );
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(dropper);
+    drop(gauges);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
