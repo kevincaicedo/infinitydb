@@ -1442,7 +1442,10 @@ fn on_disk(cell: &TierCell<SimDisk>, path: &std::path::Path) -> bool {
 /// A tier file whose unlink fails keeps an owner and is unlinked again:
 /// the error is not fatal, so the file's record stays until an unlink of it
 /// answers. `tier_unlink_fail` fires once on the retired file's unlink;
-/// eight MAINTAINs follow with nothing armed.
+/// eight MAINTAINs follow with nothing armed. The driver steps the cell's
+/// MAINTAIN alone, where the unlink runs at this shape; once a cell never
+/// unlinks a tier file (`the_cell_leaves_tier_file_unlinks_to_the_control_thread`),
+/// the retry runs on the control thread, and the driver steps its pass too.
 #[test]
 #[ignore = "a failed tier-file unlink is discarded after the file's record was removed, so the \
             file stays on the disk with no owner and nothing retries it; red until a failed \

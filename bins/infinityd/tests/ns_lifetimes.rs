@@ -16,13 +16,15 @@
 //! durably before the refusal is answered (ADR-0148 D5), so no boot after
 //! a cut serves it.
 //!
-//! Shape: a two-cell durable node, each namespace's ring at the 4 MiB floor
-//! (`MEM-BUDGET 3mb` beside the default 1 MiB `MAINTAIN-SLICE`: a ring is
-//! their sum rounded up to a power of two), so 65 rings reserve 260 MiB of
-//! addresses on a cell and the node's reserved-address admission (256 GiB
-//! by default, a share per cell) is not what refuses. Harness rules are the
-//! topology test's: `--port 0`, readiness is a `DBSIZE` answer, a refusal
-//! is the exit.
+//! Shapes: the limit test runs a two-cell durable node, each namespace's
+//! ring at the 4 MiB floor (`MEM-BUDGET 3mb` beside the default 1 MiB
+//! `MAINTAIN-SLICE`: a ring is their sum rounded up to a power of two), so
+//! 65 rings reserve 260 MiB of addresses on a cell and the node's
+//! reserved-address admission (256 GiB by default, a share per cell) is not
+//! what refuses. The refusal-after-swap test runs a two-cell node under a
+//! 4 GiB address-space cap, so a 4 GiB ring passes that admission and
+//! cannot be mapped. Harness rules are the topology test's: `--port 0`,
+//! readiness is a `DBSIZE` answer, a refusal is the exit.
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
@@ -220,7 +222,10 @@ fn the_sixty_fifth_tiered_create_is_refused_at_the_limit() {
 /// killed with no later DDL, so no later catalog write drops the
 /// definition, and rebooted uncapped. There the same `CREATE` of another
 /// name answers `+OK`: the capped refusal was the reservation's, after the
-/// swap, not a check's before it.
+/// swap, not a check's before it. The test reads the order's consequence
+/// after a cut; the order itself, the withdrawal durable before the answer,
+/// is read without timing by `inf-server`'s `node_e2e`
+/// `an_origin_refused_create_leaves_no_meta_naming_it_once_answered`.
 #[test]
 #[ignore = "a tiered CREATE its origin's store refuses after the catalog swap is answered while \
             META still names the namespace, so a boot after a cut serves it; red until such a \
