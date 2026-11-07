@@ -1366,8 +1366,17 @@ impl DdlTicket {
     /// issued: before any effect, for the data directory's life.
     pub fn reserve_ns_id(&self) -> Result<NsIdReservation, Refusal> {
         let next = self.handle.next_ns_id.load(Ordering::Acquire);
-        if next == NS_IDS_EXHAUSTED {
+        // Canary `inf_canary_ns_id_wraps`: the exhaustion check is off, so a
+        // spent counter issues `u32::MAX` and the commit wraps (the wire's
+        // ids oracle sees an id with no successor).
+        if next == NS_IDS_EXHAUSTED && !cfg!(inf_canary_ns_id_wraps) {
             return Err(Refusal::IdentityExhausted(Domain::Namespace));
+        }
+        // Canary `inf_canary_ns_id_spent_on_refusal`: the reservation commits
+        // when made, as an allocator would, so every refusal after it spends
+        // the id (the wire's ids oracle sees the next id skip).
+        if cfg!(inf_canary_ns_id_spent_on_refusal) {
+            self.handle.next_ns_id.store(next.wrapping_add(1), Ordering::Release);
         }
         Ok(NsIdReservation { id: NsId(next) })
     }
@@ -1690,7 +1699,11 @@ impl CatalogWriter {
         match intent {
             DdlIntent::Create { spec, reserved } => {
                 let next = self.handle.next_ns_id();
-                if *reserved != spec.id || reserved.0 != next || next == NS_IDS_EXHAUSTED {
+                // The canaries' reservation moved the counter or issued its
+                // spent value (`reserve_ns_id`): their writer commits as it.
+                let not_next = reserved.0 != next && !cfg!(inf_canary_ns_id_spent_on_refusal);
+                let spent = next == NS_IDS_EXHAUSTED && !cfg!(inf_canary_ns_id_wraps);
+                if *reserved != spec.id || not_next || spent {
                     return DdlVerdict::Refused(DdlRefusal::IdNotNext);
                 }
                 if self.pending.is_some() {
@@ -1742,7 +1755,11 @@ impl CatalogWriter {
     /// that is not the counter's next or a counter with none left, so
     /// `id < u32::MAX` and the successor is representable.
     fn commit_ns_id(&self, id: NsId) {
-        self.handle.next_ns_id.store(id.0 + 1, Ordering::Release);
+        if cfg!(inf_canary_ns_id_spent_on_refusal) {
+            return;
+        }
+        let next = if cfg!(inf_canary_ns_id_wraps) { id.0.wrapping_add(1) } else { id.0 + 1 };
+        self.handle.next_ns_id.store(next, Ordering::Release);
     }
 
     /// The payload, from an export and the writer's state (ADR-0189 D3

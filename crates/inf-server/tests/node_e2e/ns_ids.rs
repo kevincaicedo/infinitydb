@@ -82,3 +82,143 @@ fn a_catalog_counter_not_past_a_live_id_refuses_the_boot() {
     assert_eq!(loaded.map(|c| c.next_id), Some(21));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The ids oracle, from the wire alone: every `+OK` `CREATE`'s id (its
+/// `INF.NS INFO` field) is the last committed id's successor, across
+/// refusals and restarts. A `CREATE` commits one id when the catalog
+/// writer accepts it: answered `+OK`, or refused after that by a plant the
+/// test armed to fire on it (counted by the arming, never read from the
+/// reply). Ids are issued up to `u32::MAX − 1`; `u32::MAX` means none is
+/// left, so no id follows `u32::MAX − 1`.
+struct IdsOracle {
+    last_committed: u32,
+}
+
+impl IdsOracle {
+    /// An oracle whose last committed id is `last` (a fresh data directory:
+    /// one below the first named id).
+    fn after(last: u32) -> IdsOracle {
+        IdsOracle { last_committed: last }
+    }
+
+    /// A `CREATE` of `name` answered `+OK` with `id`.
+    fn accepted(&mut self, name: &str, id: u32) {
+        let last = self.last_committed;
+        match last.checked_add(1).filter(|&next| next < u32::MAX) {
+            Some(next) => assert_eq!(
+                id, next,
+                "CREATE {name} answered +OK with id {id} after the last committed {last}: the id \
+                 is not its successor"
+            ),
+            None => panic!(
+                "CREATE {name} answered +OK with id {id} after the last committed {last}: no id \
+                 follows the last issuable one, so its successor is not an id"
+            ),
+        }
+        self.last_committed = id;
+    }
+
+    /// A `CREATE` the writer accepted and a plant refused after: it
+    /// committed the next id.
+    fn committed_unanswered(&mut self) {
+        self.last_committed += 1;
+    }
+}
+
+/// `INF.NS CREATE name MODE durable` and its reply line.
+fn create_durable(c: &mut TcpStream, name: &[u8]) -> Vec<u8> {
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", name, b"MODE", b"durable"])).expect("write");
+    read_line(c)
+}
+
+/// The ids oracle across every refusal the origin and the writer answer
+/// before `Accepted` (parse, a taken name, the reserved-address admission),
+/// two refused after it (the origin's store, a peer's leg: each commits one
+/// id), and a restart: each `+OK`'s id is the last committed id's
+/// successor. On two cells; every refusal's own reply is its engagement.
+#[test]
+fn every_accepted_create_takes_the_last_committed_id_plus_one() {
+    use inf_foundation::fault::FaultSpec;
+    use inf_server::fault::{NS_CREATE_FAN_REFUSED, NS_CREATE_ORIGIN_REFUSED};
+    let dir = temp_data_dir("create-ids-oracle");
+    // The origin's second `CREATE` apply (`p1`) and the peer's second
+    // `CREATE` leg (`p2`'s; `p1` sends none) are refused.
+    let faults = vec![
+        (NS_CREATE_ORIGIN_REFUSED, FaultSpec::Nth(2)),
+        (NS_CREATE_FAN_REFUSED, FaultSpec::Nth(2)),
+    ];
+    let node = Node::start_durable_with_faults(2, &dir, faults);
+    let mut oracle = IdsOracle::after(inf_store::FIRST_NAMED_NS_ID - 1);
+    let mut c = node.connect();
+    assert_eq!(create_durable(&mut c, b"a"), b"+OK\r\n");
+    oracle.accepted("a", ns_id(&mut c, b"a"));
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"b", b"MODE", b"bogus"])).expect("write");
+    let parse = read_line(&mut c);
+    assert!(parse.starts_with(b"-ERR"), "the parse refusal: {:?}", String::from_utf8_lossy(&parse));
+    assert_eq!(create_durable(&mut c, b"a"), b"-ERR namespace already exists\r\n");
+    let big = [&b"INF.NS"[..], b"CREATE", b"big", b"MODE", b"durable", b"MEM-BUDGET", b"200gb"];
+    c.write_all(&cmd(&big)).expect("write");
+    let va = read_line(&mut c);
+    assert!(
+        va.starts_with(b"-ERR tiered namespace would exceed the node's reserved-VA limit"),
+        "the reserved-address admission: {:?}",
+        String::from_utf8_lossy(&va)
+    );
+    assert_eq!(create_durable(&mut c, b"p1"), b"-ERR fault: ns_create_origin_refused\r\n");
+    oracle.committed_unanswered();
+    assert_eq!(create_durable(&mut c, b"p2"), b"-ERR fault: ns_create_fan_refused\r\n");
+    oracle.committed_unanswered();
+    assert_eq!(create_durable(&mut c, b"c1"), b"+OK\r\n");
+    oracle.accepted("c1", ns_id(&mut c, b"c1"));
+    drop(c);
+    node.stop();
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    assert_eq!(create_durable(&mut c, b"c2"), b"+OK\r\n");
+    oracle.accepted("c2", ns_id(&mut c, b"c2"));
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The id space's last ids, from a catalog whose counter is `u32::MAX − 2`:
+/// two `CREATE`s take `u32::MAX − 2` and `u32::MAX − 1` (a restart between),
+/// then every `CREATE` answers `-ERR namespace identity space exhausted`
+/// before any effect, also after a restart; no id repeats or wraps.
+#[test]
+fn the_last_namespace_id_is_issued_once_and_then_the_space_refuses() {
+    let dir = temp_data_dir("create-ids-exhausted");
+    let seed = inf_store::NsCatalog {
+        next_id: u32::MAX - 2,
+        entries: Vec::new(),
+        index: inf_store::IndexCatalog::default(),
+        dropped: Vec::new(),
+    };
+    inf_log::meta::write_meta(&inf_log::fs::StdSegmentFs, &dir, &seed.encode()).expect("seed META");
+    let mut oracle = IdsOracle::after(u32::MAX - 3);
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    assert_eq!(create_durable(&mut c, b"x"), b"+OK\r\n");
+    oracle.accepted("x", ns_id(&mut c, b"x"));
+    drop(c);
+    node.stop();
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    assert_eq!(create_durable(&mut c, b"y"), b"+OK\r\n");
+    oracle.accepted("y", ns_id(&mut c, b"y"));
+    for name in [&b"z"[..], b"z"] {
+        let reply = create_durable(&mut c, name);
+        if reply == b"+OK\r\n" {
+            oracle.accepted("z", ns_id(&mut c, name));
+        }
+        assert_eq!(reply, b"-ERR namespace identity space exhausted\r\n", "the spent space");
+    }
+    drop(c);
+    node.stop();
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    assert_eq!(create_durable(&mut c, b"w"), b"-ERR namespace identity space exhausted\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
