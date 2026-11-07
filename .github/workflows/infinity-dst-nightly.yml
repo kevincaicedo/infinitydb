@@ -76,15 +76,27 @@ jobs:
   # ADR-0129: every planted-bug canary the workspace admits is built, run
   # red, and its plain build run green — a canary nobody plants proves
   # nothing. `bins/inf-sim/tests/lanes.rs` keeps the driver's rows complete.
+  # The whole lane (one planted release build per cfg, 176 rows) ran
+  # 68.9 min on a 24-core box with 10 build jobs (2026-11-01, the M
+  # ticket), hours on a 4-vCPU runner: past one job's limit. Eight shards
+  # split it by cfg, so a cfg's planted build is made in one shard and the
+  # eight together run every row once (`INF_CANARY_SHARD`, self-tested in
+  # check-scripts-selftest.sh). Not yet timed on a live runner.
   canaries:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
-      - name: planted-bug canaries (scripts/sim-canaries.sh)
+      - name: planted-bug canaries (scripts/sim-canaries.sh, shard ${{ matrix.shard }}/8)
+        env:
+          INF_CANARY_SHARD: ${{ matrix.shard }}/8
         run: ./scripts/sim-canaries.sh
 
   fleet:

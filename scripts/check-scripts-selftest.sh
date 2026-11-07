@@ -817,6 +817,17 @@ expect red "canaries: a plain run that never ran the named test is not green" en
 expect red "canaries: an empty row table is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-empty-rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture crate-test fake test:suite" >"$work/canary-short-row"
 expect red "canaries: a malformed crate-test row is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-short-row" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# The nightly matrix shards the lane by cfg (INF_CANARY_SHARD=I/K): a
+# cfg's rows stay in one shard, and the shards together run every row.
+dir=$(canary_fixture canary-shard "$failed_line" "$ok_line")
+printf 'inf_canary_%s crate-test fake test:suite the_row\n' a b a c >"$dir/rows"
+expect_output "canaries: shard 0/2 runs the first and third cfg, a cfg's rows together" "shard 0/2: 3 of 4 rows (3 cfgs)" env INF_CANARY_SHARD=0/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: shard 1/2 runs the second cfg alone" "shard 1/2: 1 of 4 rows (3 cfgs)" env INF_CANARY_SHARD=1/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: the shard's rows are the ones judged" "== canary inf_canary_b:" env INF_CANARY_SHARD=1/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect green "canaries: a shard's caught rows are green" env INF_CANARY_SHARD=1/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect red "canaries: a shard index at its count is a scope failure" env INF_CANARY_SHARD=2/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect red "canaries: a malformed shard is a scope failure" env INF_CANARY_SHARD=1/02 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect red "canaries: a shard past the last cfg holds no row" env INF_CANARY_SHARD=3/4 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 # ADR-0107 D1: the simulator's tests compile only with its `dst` feature,
 # so a crate-test row on `inf-sim` passes it and no other package's row
 # does — the stub answers only when it sees the feature.

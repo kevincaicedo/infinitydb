@@ -33,6 +33,10 @@
 #     model's VACUOUS check or an `expect` also fail the test, and none of
 #     them is the oracle seeing the stale effect.
 # Usage: scripts/sim-canaries.sh [seed]
+# Sharding: INF_CANARY_SHARD=I/K runs the rows of every K-th cfg from the
+# I-th, cfgs counted by their first row in the table, so a cfg's planted
+# build is made in one shard and the K shards run every row exactly once
+# (the nightly's matrix: the whole lane outlasts one runner's job limit).
 # Fixture mode (scripts/check-scripts-selftest.sh): INF_CANARY_ROWS_FILE
 # replaces the row table and INF_CANARY_CARGO the cargo binary.
 set -euo pipefail
@@ -643,6 +647,26 @@ if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   while IFS= read -r line; do [ -n "$line" ] && rows+=("$line"); done < "$INF_CANARY_ROWS_FILE"
 fi
 [ "${#rows[@]}" -gt 0 ] || { echo "sim-canaries: SCOPE ERROR — no canary rows"; exit 1; }
+if [ -n "${INF_CANARY_SHARD:-}" ]; then
+  if ! [[ "$INF_CANARY_SHARD" =~ ^(0|[1-9][0-9]*)/([1-9][0-9]*)$ ]] \
+      || [ "${BASH_REMATCH[1]}" -ge "${BASH_REMATCH[2]}" ]; then
+    echo "sim-canaries: SCOPE ERROR — INF_CANARY_SHARD wants I/K with 0 <= I < K, got '$INF_CANARY_SHARD'"
+    exit 1
+  fi
+  shard_i=${BASH_REMATCH[1]} shard_k=${BASH_REMATCH[2]}
+  cfgs=() picked=()
+  for row in "${rows[@]}"; do
+    row_cfg=${row%% *} index=-1
+    for j in "${!cfgs[@]}"; do
+      if [ "${cfgs[$j]}" = "$row_cfg" ]; then index=$j; break; fi
+    done
+    if [ "$index" -lt 0 ]; then index=${#cfgs[@]}; cfgs+=("$row_cfg"); fi
+    if [ $((index % shard_k)) -eq "$shard_i" ]; then picked+=("$row"); fi
+  done
+  echo "sim-canaries: shard $shard_i/$shard_k: ${#picked[@]} of ${#rows[@]} rows (${#cfgs[@]} cfgs)"
+  [ "${#picked[@]}" -gt 0 ] || { echo "sim-canaries: SCOPE ERROR — shard $shard_i/$shard_k holds no cfg"; exit 1; }
+  rows=("${picked[@]}")
+fi
 
 fail=0
 log=$(mktemp)
