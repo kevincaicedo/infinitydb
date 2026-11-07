@@ -56,6 +56,19 @@ pub const SETTLE_READ_CHARGE_BYTES: u64 = 128 << 10;
 /// the walk passes. Owner and crossing: as [`SETTLE_READ_CHARGE_BYTES`].
 pub const SETTLE_WALK_BYTE_CHARGE: u64 = 1;
 
+/// The recovery step budget's price (ADR-0174 A1) of one RAM unit of boot
+/// work outside the record walk: one checkpoint entry's apply beside its
+/// bytes (a ref's pair probe, insert and live-set probe), or one listed
+/// address the end of the checkpoint releases (a probe and a death) — at
+/// most five ordered-map or index operations and no scan. 64 budget bytes,
+/// a few cache misses' worth beside the byte prices: an estimate the
+/// reference-box run calibrates, never a measurement. Owner: the recovery
+/// driver, which charges it per unit and hands a unit's handler the number
+/// its budget left buys, at least one. Crossing: the step yields once its
+/// charge reaches the budget, at the next unit, and the next step resumes
+/// at its cursor.
+pub const RECOVER_PROBE_CHARGE_BYTES: u64 = 64;
+
 /// Wheel nodes one store may hold (ADR-0008 A1 rule 7): the node's
 /// `next` link is 24 bits and `NIL` (2²⁴ − 1) is reserved, so node indices
 /// are `0..NIL` — a count of 2²⁴ − 1. This is the width bound, not a byte

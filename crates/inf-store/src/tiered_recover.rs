@@ -239,33 +239,65 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     Ok(RecoveredTier { table, replay, extents_listed, extents_quarantined, stats })
 }
 
-/// Applies one validated `.ick` address-reference section (ADR-0057 D6
-/// step 3): cross-checks the section's walk watermark against the
-/// manifested flushed watermark — the §3.1 corollary's recovery half — a
-/// section claiming refs above it means the checkpoint and manifest are
-/// not one recovery unit (fail-stop); refuses a section for a namespace
-/// whose table already holds a record of this life (ADR-0174 R2: within
-/// a namespace every ref section precedes every image section, so a ref
-/// can never name a key a replayed record of this life already settled
-/// against); then applies every entry idempotently.
+/// Applies at most `max` entries of one validated `.ick` address-reference
+/// section view, from its first (ADR-0057 D6 step 3), and answers how many.
+/// At the section's entry (`first_index` 0) it first cross-checks the
+/// section's walk watermark against the manifested flushed watermark — a
+/// section claiming refs above it means the checkpoint and the manifest
+/// are not one recovery unit (fail-stop) — and refuses a section for a
+/// namespace whose table already holds a record of this life (ADR-0174 R2:
+/// within a namespace every ref section precedes every image section, so a
+/// ref can never name a key a replayed record of this life already settled
+/// against). A resumed view skips both: refs append nothing, and between
+/// two recovery steps nothing else changes the table. Each entry applies
+/// idempotently.
 ///
 /// # Errors
 /// `InvalidData` on the watermark cross-check and on the section order.
+pub fn apply_ref_entries(
+    table: &mut TieredTable,
+    section: &IckRefSection<'_>,
+    manifested_flushed: u64,
+    max: usize,
+) -> io::Result<usize> {
+    if section.first_index == 0 {
+        check_ref_section(table, section.ns, section.walk_watermark, manifested_flushed)?;
+    }
+    Ok(replay_refs(table, section.iter().take(max)))
+}
+
+/// [`apply_ref_entries`] run to completion over a whole section.
+///
+/// # Errors
+/// As [`apply_ref_entries`].
 pub fn apply_ref_section(
     table: &mut TieredTable,
     section: &IckRefSection<'_>,
     manifested_flushed: u64,
 ) -> io::Result<()> {
-    apply_refs(table, section.ns, section.walk_watermark, section.iter(), manifested_flushed)
+    apply_ref_entries(table, section, manifested_flushed, usize::MAX).map(|_| ())
 }
 
-/// [`apply_ref_section`]'s body over the section's facts — the one place
-/// of both checks (reachable by a test without a decoded section).
+/// A ref section's checks and every entry over the section's facts
+/// (reachable by a test without a decoded section).
+#[cfg(test)]
 fn apply_refs(
     table: &mut TieredTable,
     ns: u32,
     walk_watermark: u64,
     refs: impl Iterator<Item = (u64, u64)>,
+    manifested_flushed: u64,
+) -> io::Result<()> {
+    check_ref_section(table, ns, walk_watermark, manifested_flushed)?;
+    replay_refs(table, refs);
+    Ok(())
+}
+
+/// The one place of a ref section's two checks.
+fn check_ref_section(
+    table: &TieredTable,
+    ns: u32,
+    walk_watermark: u64,
     manifested_flushed: u64,
 ) -> io::Result<()> {
     if walk_watermark > manifested_flushed {
@@ -283,34 +315,66 @@ fn apply_refs(
             origin.to_raw()
         )));
     }
-    for (hash, addr) in refs {
-        table.replay_ref(hash, LogicalAddr::from_raw(addr).expect("reader checked 48 bits"));
-    }
     Ok(())
 }
 
-/// Applies one validated `.ick` live-set section (M4-S14, ADR-0058 D4/
-/// D5): every entry restores under the D5 clamp rules — a length
-/// mismatch or an unmanifested file id restores nothing, so the byte
-/// counters can only ever under-count dead. Infallible by construction;
-/// the decoder already audited shape, flags, and `dead ≤ len`.
-pub fn apply_live_set_section(table: &mut TieredTable, section: &IckLiveSetSection<'_>) {
-    for entry in section.iter() {
-        table.restore_live_entry(&entry);
+/// Replays each ref; answers how many.
+fn replay_refs(table: &mut TieredTable, refs: impl Iterator<Item = (u64, u64)>) -> usize {
+    let mut applied = 0usize;
+    for (hash, addr) in refs {
+        table.replay_ref(hash, LogicalAddr::from_raw(addr).expect("reader checked 48 bits"));
+        applied += 1;
     }
+    applied
 }
 
-/// Applies one validated `.ick` blob-reference section (M4-S17,
-/// ADR-0061 D6): restores the reference map's cold entries so the
-/// replayed tail's displacements decrement the right extent, and
-/// advances the allocate-once id cursor past every restored id. Pairs
-/// with [`apply_ref_section`] (the slots) — this section is
-/// bookkeeping, not index content. Infallible by construction; the
-/// decoder already audited shape, order, and lengths.
-pub fn apply_blob_ref_section(table: &mut TieredTable, section: &IckBlobRefSection<'_>) {
-    for entry in section.iter() {
-        table.restore_extent_entry(entry.addr, entry.extent_id, entry.len);
+/// Applies at most `max` entries of one validated `.ick` live-set section
+/// view, from its first (M4-S14, ADR-0058 D4/D5), and answers how many:
+/// every entry restores under the D5 clamp rules — a length mismatch or an
+/// unmanifested file id restores nothing, so the byte counters can only
+/// ever under-count dead. Infallible by construction; the decoder already
+/// audited shape, flags, and `dead ≤ len`.
+pub fn apply_live_set_entries(
+    table: &mut TieredTable,
+    section: &IckLiveSetSection<'_>,
+    max: usize,
+) -> usize {
+    let mut applied = 0usize;
+    for entry in section.iter().take(max) {
+        table.restore_live_entry(&entry);
+        applied += 1;
     }
+    applied
+}
+
+/// [`apply_live_set_entries`] run to completion over a whole section.
+pub fn apply_live_set_section(table: &mut TieredTable, section: &IckLiveSetSection<'_>) {
+    apply_live_set_entries(table, section, usize::MAX);
+}
+
+/// Applies at most `max` entries of one validated `.ick` blob-reference
+/// section view, from its first (M4-S17, ADR-0061 D6), and answers how
+/// many: each restores a reference-map cold entry, so the replayed tail's
+/// displacements decrement the right extent, and advances the
+/// allocate-once id cursor past its id. Pairs with the ref section (the
+/// slots) — this section is bookkeeping, not index content. Infallible by
+/// construction; the decoder already audited shape, order, and lengths.
+pub fn apply_blob_ref_entries(
+    table: &mut TieredTable,
+    section: &IckBlobRefSection<'_>,
+    max: usize,
+) -> usize {
+    let mut applied = 0usize;
+    for entry in section.iter().take(max) {
+        table.restore_extent_entry(entry.addr, entry.extent_id, entry.len);
+        applied += 1;
+    }
+    applied
+}
+
+/// [`apply_blob_ref_entries`] run to completion over a whole section.
+pub fn apply_blob_ref_section(table: &mut TieredTable, section: &IckBlobRefSection<'_>) {
+    apply_blob_ref_entries(table, section, usize::MAX);
 }
 
 fn invalid(message: String) -> io::Error {
