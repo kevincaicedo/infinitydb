@@ -3811,12 +3811,14 @@ fz_root() {
     fz_depinfo "$root" b_parse fuzz_targets/b_parse.rs fuzz_targets/../../src/parse.rs
     echo "$root"
 }
+# Each run unsets CARGO_TARGET_DIR, so a fixture's kept directory sits in its
+# own target, under the work directory, whatever the caller exports.
 fz_run() { # <root> [args…]: the gate on a fixture root, its probe off
-    env INF_CHECK_ROOT="$1" INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" FZ_STUB="$1.stub" \
-        "$FUZZ" "${@:2}"
+    env -u CARGO_TARGET_DIR INF_CHECK_ROOT="$1" INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" \
+        FZ_STUB="$1.stub" "$FUZZ" "${@:2}"
 }
 fz_probe_run() { # <root>: the gate with its probe on
-    env INF_CHECK_ROOT="$1" INF_FUZZ_CARGO="$FZ_CARGO" FZ_STUB="$1.stub" "$FUZZ"
+    env -u CARGO_TARGET_DIR INF_CHECK_ROOT="$1" INF_FUZZ_CARGO="$FZ_CARGO" FZ_STUB="$1.stub" "$FUZZ"
 }
 fz_red() { # <label> <pattern> <root>: red on the fixture, naming its row
     expect_red_because "fuzz-targets: $1" "$2" fz_run "$3"
@@ -3870,10 +3872,10 @@ expect_red_because "fuzz-targets: a probe knob that is neither on nor off" "is '
 
 # The call: every workspace's cargo call carries the flags the verdict rests
 # on, with RUSTFLAGS replaced and CARGO_ENCODED_RUSTFLAGS unset whatever the
-# caller set, and the gate's own target directory under the caller's target
-# root, `${CARGO_TARGET_DIR:-target}/fuzz-check`, read with the variable unset
-# and set: never the root's target itself, whose RUSTFLAGS differ, and never
-# under the tree when the caller has moved its target elsewhere.
+# caller set, and the gate's own target directory, `fuzz-check-<key>` under
+# the checkout's target root, read with the variable unset and set: never the
+# root's target itself, whose RUSTFLAGS differ, never another checkout's, and
+# never under the tree when the caller has moved its target elsewhere.
 fz_calls_ok() { # <stub dir> <the target directory every call must name>
     python3 - "$1/calls" "$2" <<'PY'
 import sys
@@ -3915,29 +3917,31 @@ fz_argv_run() {
     fi
 }
 root=$(fz_root argv)
+FZ_KEY=$(fx_root_key "$root")
+FZ_OWN="$(cd "$root" && pwd -P)/target/fuzz-check-$FZ_KEY"
 expect green "fuzz-targets: green under a caller's RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS" \
     fz_argv_run "$FUZZ" "$root"
 expect green "fuzz-targets: each workspace's call carries the gate's flags and environment" \
-    fz_calls_ok "$root.stub" target/fuzz-check
+    fz_calls_ok "$root.stub" "$FZ_OWN"
 # A caller's target root outside the tree, as a second worktree building into
 # the first checkout's target has: the gate builds under it, not in the tree.
 FZ_CALLER_TARGET="$work/fz-caller-target"
 rm -f "${root:?}.stub/calls"
 expect green "fuzz-targets: green with CARGO_TARGET_DIR set" \
     fz_argv_run "$FUZZ" "$root" "$FZ_CALLER_TARGET"
-expect green "fuzz-targets: each call names \$CARGO_TARGET_DIR/fuzz-check when it is set" \
-    fz_calls_ok "$root.stub" "$FZ_CALLER_TARGET/fuzz-check"
+expect green "fuzz-targets: set, each call names \$CARGO_TARGET_DIR/checkout-<key>/fuzz-check-<key>" \
+    fz_calls_ok "$root.stub" "$FZ_CALLER_TARGET/checkout-$FZ_KEY/fuzz-check-$FZ_KEY"
 # The call's canaries: a copy of the gate with one part of its call changed
 # turns the case red. Each copy runs on the argv root, its calls cleared,
 # with CARGO_TARGET_DIR unset or set to the fourth argument.
 FZ_MROOT=$root
 fz_mutant() { # <name> <sed expression> <what the copy does> [<CARGO_TARGET_DIR>]
-    local dir want=target/fuzz-check
+    local dir want=$FZ_OWN
     dir="$work/fz-gate-$1"
     rm -rf "${dir:?}"
     mkdir -p "$dir"
     cp "$SCRIPT_DIR/check-fuzz-targets.sh" "$SCRIPT_DIR/fuzz_targets.py" "$SCRIPT_DIR/lint_scope_table.py" \
-        "$SCRIPT_DIR/strip-test-modules.awk" "$dir/"
+        "$SCRIPT_DIR/strip-test-modules.awk" "$SCRIPT_DIR/target-root.sh" "$dir/"
     fz_sed "$2" "$dir/check-fuzz-targets.sh"
     chmod +x "$dir/check-fuzz-targets.sh"
     if cmp -s "$SCRIPT_DIR/check-fuzz-targets.sh" "$dir/check-fuzz-targets.sh"; then
@@ -3945,7 +3949,7 @@ fz_mutant() { # <name> <sed expression> <what the copy does> [<CARGO_TARGET_DIR>
         exit 2
     fi
     rm -f "${FZ_MROOT:?}.stub/calls"
-    [ -z "${4:-}" ] || want="$4/fuzz-check"
+    [ -z "${4:-}" ] || want="$4/checkout-$FZ_KEY/fuzz-check-$FZ_KEY"
     fz_argv_run "$dir/check-fuzz-targets.sh" "$FZ_MROOT" "${4:-}" >/dev/null 2>&1 || true
     expect red "fuzz-targets: the call's check is red on a gate that $3" \
         fz_calls_ok "$FZ_MROOT.stub" "$want"
@@ -3954,10 +3958,13 @@ fz_mutant bins 's/"check", "--bins", /"check", /' "drops --bins"
 fz_mutant locked 's/"--locked", //' "drops --locked"
 fz_mutant keep-going 's/"--keep-going", //' "drops --keep-going"
 fz_mutant format 's/"--message-format", "json",/"--message-format", "short",/' "reads cargo's short format"
-fz_mutant color 's/"--color", "never", //' "drops --color never"
-fz_mutant target-dir 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/fuzz-check"$|TARGET_DIR="${CARGO_TARGET_DIR:-target}"|' \
-    "shares the root's target directory"
-fz_mutant fixed 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/fuzz-check"$|TARGET_DIR="target/fuzz-check"|' \
+fz_mutant color 's/^        "--color", "never"\]$/        ]/' "drops --color never"
+FZ_KEPT='^    INF_FUZZ_TARGET_DIR=$(target_root_kept fuzz-check)$'
+fz_mutant target-dir "s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\$TARGET_ROOT|" "shares the root's target directory"
+fz_mutant raw "s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\"\${CARGO_TARGET_DIR:-target}/fuzz-check-\$TARGET_ROOT_KEY\"|" \
+    "reads CARGO_TARGET_DIR itself" "$FZ_CALLER_TARGET"
+fz_mutant unkeyed "s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\"\$TARGET_ROOT/fuzz-check\"|" "keeps an unkeyed directory"
+fz_mutant fixed "s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\"target/fuzz-check-\$TARGET_ROOT_KEY\"|" \
     "ignores CARGO_TARGET_DIR" "$FZ_CALLER_TARGET"
 fz_mutant warnings 's/^RUSTFLAGS = "-D warnings --cfg fuzzing"$/RUSTFLAGS = "--cfg fuzzing"/' "drops -D warnings"
 fz_mutant cfg 's/^RUSTFLAGS = "-D warnings --cfg fuzzing"$/RUSTFLAGS = "-D warnings"/' "drops --cfg fuzzing"

@@ -17,20 +17,22 @@
 # census order,
 #   cargo check --manifest-path <m> --bins --locked --keep-going
 #               --message-format json --color never
-#               --target-dir "${CARGO_TARGET_DIR:-target}/fuzz-check"
+#               --target-dir <root>/fuzz-check-<key>
 # with RUSTFLAGS="-D warnings --cfg fuzzing" in place of the caller's and
 # CARGO_ENCODED_RUSTFLAGS unset (cargo ranks it above RUSTFLAGS), on the
 # toolchain rust-toolchain.toml pins. The target directory is the gate's
-# own under the caller's target root, resolved from the root as cargo
-# resolves the variable. It is never the root workspace's target itself:
-# the gate's RUSTFLAGS differ, so a shared target would rebuild every shared
-# unit at each switch. A caller that keeps its target elsewhere, such as a
-# second worktree building into the first checkout's target, builds nothing
-# under the tree.
-# CARGO_TARGET_DIR says only where outputs land; it selects no target and
-# skips no probe. cargo-fuzz sets cfg(fuzzing) by default, so every arm a
-# fuzz build compiles is compiled here; the root workspace compiles the
-# other arm. No build-script knob is set, so
+# own, kept warm, under this checkout's target root: scripts/target-root.sh
+# computes both from the checkout's path and CARGO_TARGET_DIR (ADR-0198 A2),
+# and the gate reads the variable only through it. It is never the root
+# workspace's target: the gate's RUSTFLAGS differ, so a shared target would
+# rebuild every shared unit at each switch. It is never another checkout's:
+# cargo reads a unit another checkout wrote as fresh, and three targets reach
+# production code only by #[path], whose included files cargo names by the
+# writer's path, so a shared or copied directory would pass a target that
+# does not compile. CARGO_TARGET_DIR says only where outputs land; it
+# selects no target and skips no probe. cargo-fuzz sets cfg(fuzzing) by
+# default, so every arm a fuzz build compiles is compiled here; the root
+# workspace compiles the other arm. No build-script knob is set, so
 # libfuzzer-sys's build script compiles libFuzzer's C++ runtime: the gate
 # needs a C++17 compiler where it runs, as the fuzz jobs do, and a host
 # without one is red there. `cargo check` stops before monomorphization and
@@ -95,7 +97,6 @@ case "$#:${1:-}:${2:-}" in
     *) echo "usage: check-fuzz-targets.sh [--matrix nightly|smoke|deny]" >&2; exit 2 ;;
 esac
 matrix=${2:-}
-TARGET_DIR="${CARGO_TARGET_DIR:-target}/fuzz-check"
 probe=${INF_FUZZ_CHECK_PROBE:-on}
 [ "$mode" = gate ] || probe=on
 case "$probe" in
@@ -107,10 +108,17 @@ case "$probe" in
         fi ;;
     *) echo "FUZZ-TARGETS SCOPE ERROR: INF_FUZZ_CHECK_PROBE is '$probe', not on or off"; exit 1 ;;
 esac
+if [ "$mode" = gate ]; then
+    # shellcheck source=target-root.sh
+    . "$SCRIPT_DIR/target-root.sh"
+    target_root_setup "$(pwd -P)" ||
+        { echo "FUZZ-TARGETS SCOPE ERROR: scripts/target-root.sh gave no target root"; exit 1; }
+    INF_FUZZ_TARGET_DIR=$(target_root_kept fuzz-check)
+    export INF_FUZZ_TARGET_DIR
+fi
 
 INF_SCRIPT_DIR="$SCRIPT_DIR" INF_FUZZ_MODE="$mode" INF_FUZZ_MATRIX="$matrix" INF_FUZZ_PROBE="$probe" \
-    INF_FUZZ_CARGO_BIN="${INF_FUZZ_CARGO:-cargo}" INF_FUZZ_TARGET_DIR="$TARGET_DIR" \
-    python3 -I -B - <<'PY'
+    INF_FUZZ_CARGO_BIN="${INF_FUZZ_CARGO:-cargo}" python3 -I -B - <<'PY'
 import json
 import os
 import re
@@ -122,9 +130,10 @@ import fuzz_targets  # noqa: E402
 
 TOKEN = "FUZZ-TARGETS"
 MODE, PROBE, CARGO = (os.environ[k] for k in ("INF_FUZZ_MODE", "INF_FUZZ_PROBE", "INF_FUZZ_CARGO_BIN"))
-# The call is the verdict: every flag is one the probe or the self-test reads.
+# The call is the verdict: every flag is one the probe or the self-test reads;
+# its target directory, a run's last flag, is the kept one (KEPT, gate mode).
 CALL = ["check", "--bins", "--locked", "--keep-going", "--message-format", "json",
-        "--color", "never", "--target-dir", os.environ["INF_FUZZ_TARGET_DIR"]]
+        "--color", "never"]
 RUSTFLAGS = "-D warnings --cfg fuzzing"
 PROBE_MAIN = "scripts/fuzz-check-probe/Cargo.toml"
 PROBE_LOCK = "scripts/fuzz-check-probe/stale-lock/Cargo.toml"
@@ -181,20 +190,21 @@ if MODE == "matrix":
 
 ENV = {k: v for k, v in os.environ.items() if k != "CARGO_ENCODED_RUSTFLAGS"}
 ENV["RUSTFLAGS"] = RUSTFLAGS
+KEPT = ["--target-dir", os.environ["INF_FUZZ_TARGET_DIR"]]
 
 
 class Report:
     """What cargo said about one workspace: its exit status, the bins it
     reports compiled, its compiler errors and its own error blocks."""
 
-    def __init__(self, manifest):
+    def __init__(self, manifest, target_dir):
         self.manifest, self.status, self.bins, self.errors, self.cargo_errors = manifest, 0, [], [], []
         self.unread = 0  # stdout lines that are not cargo's JSON
         self.depinfo = {}  # bin -> the dep-info beside its metadata, or None
         own = os.path.realpath(manifest)
         try:
-            run = subprocess.run([CARGO, CALL[0], "--manifest-path", manifest, *CALL[1:]], env=ENV,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            run = subprocess.run([CARGO, CALL[0], "--manifest-path", manifest, *CALL[1:], *target_dir],
+                                 env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except OSError as err:
             self.status, self.cargo_errors = -1, [[f"cannot run {CARGO} ({err})"]]
             return
@@ -345,7 +355,7 @@ if PROBE == "on":
         if rows != want:
             reds.append(f"P {manifest} holds targets {rows}, exactly {want} expected: an edited-down "
                         "probe proves less")
-    main = Report(PROBE_MAIN)
+    main = Report(PROBE_MAIN, KEPT)
     if refused(main, "plant_crate", lambda m: e0433(m, "absent_crate", "shared/leaf.rs"), "P1"):
         verdicts["P1"] = "plant_crate E0433 absent_crate"
     if refused(main, "plant_warning", denied_warning, "P2"):
@@ -373,7 +383,7 @@ if PROBE == "on":
                     "run without --locked rewrote it; restore it with "
                     f"`git checkout -- {PROBE_LOCK_FILE}`")
     else:
-        lock = Report(PROBE_LOCK)
+        lock = Report(PROBE_LOCK, KEPT)
         if lock.status != 0 and "stale_lock" not in lock.bins and lock.refused_lock():
             verdicts["P4"] = "stale_lock refused by --locked"
         else:
@@ -392,7 +402,7 @@ if PROBE == "on":
 compiled = total = depinfo_read = 0
 targets = {(t.workspace, t.name): t for t in census.targets}
 for manifest in census.workspaces:
-    report = Report(manifest)
+    report = Report(manifest, KEPT)
     rows = [n for n, _ in census.rows[manifest] if n is not None]
     have = set(report.bins)
     missing = [n for n in rows if n not in have]
