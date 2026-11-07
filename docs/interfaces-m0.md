@@ -1033,9 +1033,7 @@ config, serve_mark, timer_set)` takes that mark and set and consumes the mark
 as its first `run_iteration` begins, so every step before it is the cell's
 assembly. The mark is a token the census mints once, never `Clone`: a census
 is marked at most once. `NodeInfo::cap_census` holds the census for the
-cell's readers. The timer set is unbuilt: until it is, `ServerPlane::new`
-returns `(ServerPlane, ServeMark)` and cannot fail, and `CellLoop::new` takes
-no set.
+cell's readers.
 
 `inf-runtime::net` (assembly helpers, keeps bins `forbid(unsafe_code)`):
 `listen_reuseport(port) -> TcpListener` · `bound_port` ·
