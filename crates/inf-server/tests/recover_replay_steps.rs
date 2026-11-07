@@ -2467,29 +2467,47 @@ fn every_budget_recovers_the_end_of_the_unparked_boot() {
     }
 }
 
+/// Listed orphan extents of the fresh-cell unit, and the unreferenced
+/// quarantined ones after them.
+const FRESH_ORPHANS: u64 = 64;
+const FRESH_QUARANTINED: u64 = 8;
+
+/// A fresh cell's unit — no log, no MANIFEST: in the tiered namespace's
+/// directory [`FRESH_ORPHANS`] extent files, then [`FRESH_QUARANTINED`]
+/// quarantine twins, no record naming any.
+fn write_fresh_cell<F: SegmentFs>(fs: &F, cfg: &DurableConfig) {
+    let cold = cold_dir(cfg);
+    fs.create_dir_all(&cold).expect("the namespace's directory");
+    let orphans = (1..=FRESH_ORPHANS).map(|id| inf_log::extent_file_name(inf_log::ExtentId(id)));
+    let twins = (FRESH_ORPHANS + 1..=FRESH_ORPHANS + FRESH_QUARANTINED)
+        .map(|id| inf_log::quarantined_file_name(inf_log::ExtentId(id)));
+    for name in orphans.chain(twins) {
+        let mut file = fs.create_meta(&cold.join(name)).expect("an extent file");
+        file.write_at(0, b"extent").expect("its bytes");
+    }
+}
+
 /// A fresh cell — no log, no MANIFEST — hands its tiered machines over under
 /// the step budget before it creates its first segment: a namespace whose
-/// directory lists 64 orphan extents seeds them at a 256-byte budget, four
-/// a step at the RAM unit price, in steps of the hand-over row, then the
-/// resume; every orphan is queued, in the listing's order. A fresh cell with
-/// no tiered namespace has nothing to hand over and completes in its first
-/// step.
+/// directory lists 64 orphan extents and 8 unreferenced quarantined ones
+/// seeds them at a 256-byte budget, four a step at the RAM unit price, in
+/// steps of the hand-over row, then the resume; the orphans are queued in
+/// the listing's order, then the second verdicts. Recovered at 8 MiB,
+/// 256 KiB, 4 KiB, 1 and 0, the fresh cell equals its `u64::MAX` control,
+/// which seeds every id in one step: the directory, the queue with each
+/// candidate's origin, and the extent id cursor past every listed id. A
+/// fresh cell with no tiered namespace has nothing to hand over and
+/// completes in its first step.
 #[test]
 fn a_fresh_cell_hands_its_tiered_machines_over_under_the_step_budget() {
     const BUDGET: u64 = 256;
     let cfg = step_cfg();
     let fs = MemFs::new();
-    let cold = cold_dir(&cfg);
-    fs.create_dir_all(&cold).expect("the namespace's directory");
-    for id in 1..=64u64 {
-        let name = inf_log::extent_file_name(inf_log::ExtentId(id));
-        let mut file = fs.create_meta(&cold.join(name)).expect("an orphan");
-        file.write_at(0, b"extent").expect("its bytes");
-    }
+    write_fresh_cell(&fs, &cfg);
     let mut ks = tiered_keyspace();
     let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
     let mut hand_over_steps = 0u64;
-    // Bound: a step a unit batch, 64 seeds at four a step.
+    // Bound: a step a unit batch, 72 seeds at four a step.
     for _ in 0..1_000 {
         let progress = recovery.step(&mut ks, BUDGET).expect("a fresh cell's step");
         if recovery.unit_row().phase == inf_server::UnitPhase::HandOver {
@@ -2502,13 +2520,30 @@ fn a_fresh_cell_hands_its_tiered_machines_over_under_the_step_budget() {
     let (_rotor, stats, _seed) = recovery.finish();
     let seeded = stats.units.sweep_seeded;
     eprintln!("fresh cell at {BUDGET}: {hand_over_steps} hand-over steps, {:?}", stats.units);
-    assert_eq!(seeded, 64, "every listed orphan seeded once");
+    let ids = FRESH_ORPHANS + FRESH_QUARANTINED;
+    assert_eq!(seeded, ids, "every listed id seeded once");
     let price = inf_store::limits::RECOVER_PROBE_CHARGE_BYTES;
-    assert!(hand_over_steps >= 64 / (BUDGET / price), "{hand_over_steps} hand-over steps");
+    assert!(hand_over_steps >= ids / (BUDGET / price), "{hand_over_steps} hand-over steps");
     let table = ks.tiered_store_mut(TIER_NS).expect("tiered");
     let queue = table.extent_reclaim_work(u64::MAX, usize::MAX);
-    let order: Vec<u64> = queue.iter().map(|candidate| candidate.extent_id).collect();
-    assert_eq!(order, (1..=64).collect::<Vec<u64>>(), "the orphans, in the listing's order");
+    let candidate = |extent_id, origin| inf_store::ReclaimCandidate { extent_id, origin };
+    let orphans = (1..=FRESH_ORPHANS).map(|id| candidate(id, inf_store::ReclaimOrigin::BootOrphan));
+    let twins =
+        (FRESH_ORPHANS + 1..=ids).map(|id| candidate(id, inf_store::ReclaimOrigin::Quarantined));
+    let want: Vec<inf_store::ReclaimCandidate> = orphans.chain(twins).collect();
+    assert_eq!(queue, want, "the orphans in the listing's order, then the second verdicts");
+
+    let boot = |budget: u64| {
+        let fs = MemFs::new();
+        write_fresh_cell(&fs, &cfg);
+        boot_recovered(&fs, &cfg, tiered_keyspace(), budget, &Model::new()).0
+    };
+    let control = boot(u64::MAX);
+    assert_eq!(control.tier().reclaim, want, "the control's queue");
+    assert_eq!(control.tier().next_extent_id, ids + 1, "the cursor passes every listed id");
+    for budget in [8 << 20, 256 << 10, 4 << 10, 1, 0] {
+        assert_same(&boot(budget), &control, budget);
+    }
 
     let mut ks = fresh_keyspace();
     let mut recovery = Recovery::new(MemFs::new(), CELL, &cfg, anchor(), now());
