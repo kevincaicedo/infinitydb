@@ -1078,7 +1078,8 @@ const GAUGE_SLACK: u64 = 3 * inf_log::ckpt::ICK_BLOCK_ALIGN as u64;
 /// (B1). Off it, a step parks only in a section it entered, whose block it
 /// read at its entry, so the gauge is within `B`, the bytes the step read
 /// and [`GAUGE_SLACK`] where the step charged no boot I/O, or `U` in its
-/// place where it did. `Some` names the over-read.
+/// place where it did. `Some` names the over-read. Red where a walk parks an
+/// entry section's price (`inf_canary_recover_parked_priced`).
 fn gauge_over(
     entry: inf_server::UnitEntry,
     budget: u64,
@@ -1871,9 +1872,10 @@ fn a_records_section_of_rewrites_of_cold_keys_is_loaded_under_the_step_judge() {
 /// it walks is longer than one step buys; and no step applies or releases
 /// more than its budget buys at their price, plus one. Red where an entry
 /// section applies every entry in the step that enters it
-/// (`inf_canary_recover_section_whole`: `ENTRIES`) and where the end of the
+/// (`inf_canary_recover_section_whole`: `ENTRIES`), where the end of the
 /// checkpoint's releases charge nothing (`inf_canary_recover_probe_uncharged`:
-/// `RELEASES`).
+/// `RELEASES`) and where a parked walk adds the price of the entries it left
+/// to the gauge (`inf_canary_recover_parked_priced`: `GAUGE`).
 #[test]
 fn entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge() {
     const BUDGET: u64 = 256 << 10;
@@ -1939,7 +1941,9 @@ fn entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge
 /// resume inside the list — D6 counters (the blob references released among
 /// them) and record counts. Red where a resumed section walk passes a
 /// record that needs room (`inf_canary_recover_skip_on_resume`'s section
-/// arm).
+/// arm) and where a release call that resumes inside the list releases its
+/// batch in reverse (`inf_canary_replay_release_reordered`: the reclaim
+/// queue's order).
 #[test]
 fn every_budget_recovers_the_checkpoint_of_the_unparked_boot() {
     let cfg = step_cfg();

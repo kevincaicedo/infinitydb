@@ -440,7 +440,12 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     // step's work is its charge and the bytes it left.
                     debug_assert_eq!(walk.charged, walk.passed, "a parked walk is metered");
                     if !walk.resumed {
-                        self.step_parked_bytes = walk.unwalked_bytes();
+                        // The planted canary parks the section's price.
+                        self.step_parked_bytes = if cfg!(inf_canary_recover_parked_priced) {
+                            walk.unpaid()
+                        } else {
+                            walk.unwalked_bytes()
+                        };
                     }
                     let facts = &mut self.stats.step;
                     match stop {

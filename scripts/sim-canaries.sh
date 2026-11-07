@@ -593,6 +593,15 @@ rows=(
   # A resumed section walk passes no record unapplied. Planted, it passes
   # a record that needs room (the boot refuses, or a key is absent).
   "inf_canary_recover_skip_on_resume crate-test inf-server test:recover_replay_steps every_budget_recovers_the_checkpoint_of_the_unparked_boot BUDGET INDEPENDENCE"
+  # A step that parks inside the section it entered adds to its work gauge
+  # the section's bytes it left. Planted, it adds their price: the RAM price
+  # of every entry no step has applied yet.
+  "inf_canary_recover_parked_priced crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge GAUGE"
+  # The end of the checkpoint releases its listed addresses in settle order
+  # at every step budget. Planted, a call that resumes inside the list
+  # releases its batch in reverse.
+  "inf_canary_replay_release_reordered crate-test inf-store lib the_end_of_the_checkpoint_releases_blob_references_in_settle_order two a call"
+  "inf_canary_replay_release_reordered crate-test inf-server test:recover_replay_steps every_budget_recovers_the_checkpoint_of_the_unparked_boot reclaim queue's order"
   # ADR-0061 D6: the 0x05 pass lists the entry of a record the walk imaged
   # (a ticket winner below the watermark, ADR-0093 A12) — the boot
   # registers the extent at both addresses and its count stays one above

@@ -919,6 +919,17 @@ impl<F: SegmentFs> TierReplay<F> {
             // reference stays with no slot.
             return walked;
         }
+        if cfg!(inf_canary_replay_release_reordered) && at > 0 {
+            // The planted canary breaks the settle order: a call that
+            // resumes inside the list releases its batch in reverse.
+            for &addr in listed[..walked].iter().rev() {
+                if table.extents.reference_at(addr).is_some() {
+                    table.extents.note_death(addr);
+                    self.counters.blob_releases += 1;
+                }
+            }
+            return walked;
+        }
         // Bound: `max` listed addresses, each a map probe and a death.
         let mut released = 0u64;
         for &addr in &listed[..walked] {
@@ -1633,6 +1644,8 @@ mod tests {
     /// of two, so that calls resume inside the list (`at` 2 and 4) and walk
     /// more than one address there — releases in the same order: the
     /// reclaim queue takes the deaths in one order at every step budget.
+    /// Red where a call that resumes inside the list releases its batch in
+    /// reverse (`inf_canary_replay_release_reordered`).
     #[test]
     fn the_end_of_the_checkpoint_releases_blob_references_in_settle_order() {
         let fs = MemFs::new();
