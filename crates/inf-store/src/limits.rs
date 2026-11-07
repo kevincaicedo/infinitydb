@@ -69,6 +69,20 @@ pub const SETTLE_WALK_BYTE_CHARGE: u64 = 1;
 /// at its cursor.
 pub const RECOVER_PROBE_CHARGE_BYTES: u64 = 64;
 
+/// The recovery step budget's price (ADR-0174 A1) of one probe group the
+/// boot's ticket rebuild scans (ADR-0093 A4′): the group's bytes — sixteen
+/// control bytes, sixteen 8-byte slots and their 8-byte hashes, 272 — at the
+/// walked-byte price, beside the classification of its cold slots, a probe
+/// chain each and no scan. Owner: the recovery driver, which charges it per
+/// group and hands the rebuild the number its budget left buys, at least
+/// one. Crossing: the step yields once its charge reaches the budget, at the
+/// next group or returned slot, and the next step resumes at the rebuild's
+/// own cursor.
+pub const REBUILD_GROUP_CHARGE_BYTES: u64 =
+    crate::index::Index::<crate::index::TieredMode>::GROUP_BYTES as u64 * SETTLE_WALK_BYTE_CHARGE;
+
+const _: () = assert!(REBUILD_GROUP_CHARGE_BYTES == 272, "a tiered probe group is 272 bytes");
+
 /// Wheel nodes one store may hold (ADR-0008 A1 rule 7): the node's
 /// `next` link is 24 bits and `NIL` (2²⁴ − 1) is reserved, so node indices
 /// are `0..NIL` — a count of 2²⁴ − 1. This is the width bound, not a byte

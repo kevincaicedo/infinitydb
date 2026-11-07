@@ -349,6 +349,20 @@ impl<E: fmt::Debug + fmt::Display> std::error::Error for ShadowRebuildError<E> {
 /// and the cold slots of the probe group it last stepped, not yet
 /// classified. Fixed size — one probe group of scratch; the walk resumes
 /// after every settle slot the caller is handed.
+/// What one [`TieredTable::shadow_rebuild_step`] call did: the probe groups
+/// it scanned, and where the rebuild stands after them.
+#[must_use = "a slot the rebuild returns must be read and settled before the cell serves"]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RebuildStep {
+    /// A slot the boot must read and settle, after `groups` probe groups;
+    /// the walk resumes after it.
+    Settle { slot: SettleSlot, groups: usize },
+    /// `groups` probe groups scanned, the call's bound: call again.
+    More { groups: usize },
+    /// The index is fully walked, after `groups` probe groups.
+    Done { groups: usize },
+}
+
 #[must_use = "a rebuild must be driven to completion before the cell serves"]
 pub struct ShadowRebuild {
     /// The next home group to open once the current chain ends.
@@ -1237,54 +1251,67 @@ impl TieredTable {
 
     /// Advances the rebuild to the next slot the boot must **read and
     /// settle** before the cell serves, registering the tickets it can
-    /// form on the way; `None` once the index is fully walked. One
-    /// home-group chain at a time, one 16-slot probe group per step
-    /// (`Index::scan_home_group_step`): for each **cold** slot the
-    /// probe chain (`each_exact`) names its RAM siblings — no map of the
-    /// index, no vector of cold slots, no settle list (O(1) scratch, the
-    /// ticket maps ≤ the cap). Exactly one RAM sibling under the cap ⇒ a
-    /// ticket (unverified: the twin may still be a collision key, and the
-    /// verdict is the reconciler's ordinary read). Two or more RAM
-    /// siblings (two live keys with one hash — which one, if any, the
-    /// twin belongs to is a full-key question the review found answered
-    /// by a guess), or the cap reached ⇒ the slot is returned for
+    /// form on the way; `None` once the index is fully walked: the
+    /// rebuild's step ([`shadow_rebuild_step`](Self::shadow_rebuild_step))
+    /// with no bound on the probe groups it scans.
+    pub fn shadow_rebuild_next(&mut self, rebuild: &mut ShadowRebuild) -> Option<SettleSlot> {
+        // Bound: no call is bounded by `usize::MAX` groups, so the walk ends
+        // at a slot or at the index's end.
+        loop {
+            match self.shadow_rebuild_step(rebuild, usize::MAX) {
+                RebuildStep::Settle { slot, .. } => return Some(slot),
+                RebuildStep::Done { .. } => return None,
+                RebuildStep::More { .. } => {}
+            }
+        }
+    }
+
+    /// One bounded step of the rebuild (ADR-0174 A1.3: the rebuild runs
+    /// under the step budget; its cursor and rules are ADR-0093 A4′'s): at
+    /// most `max_groups` probe groups scanned, at least one. One home-group
+    /// chain at a time, one 16-slot probe group per scan
+    /// (`Index::scan_home_group_step`): for each **cold** slot the probe
+    /// chain (`each_exact`) names its RAM siblings — no map of the index, no
+    /// vector of cold slots, no settle list (O(1) scratch, the ticket maps ≤
+    /// the cap). Exactly one RAM sibling under the cap ⇒ a ticket
+    /// (unverified: the twin may still be a collision key, and the verdict
+    /// is the reconciler's ordinary read). Two or more RAM siblings (two
+    /// live keys with one hash — which one, if any, the twin belongs to is a
+    /// full-key question no count of siblings answers), or the cap
+    /// reached ⇒ the slot is returned for
     /// [`settle_rebuilt_slot`](Self::settle_rebuilt_slot), and the walk
     /// resumes after it (a settle removes a slot of a group already
     /// stepped; the chain's end never moves — `Index::remove` writes
-    /// EMPTY only into groups that already hold one).
+    /// EMPTY only into groups that already hold one). The groups a step
+    /// scanned are counted in its answer, a slot returned or not.
     ///
     /// Time is O(cold slots × the probe chain's length) — under the keyed
     /// hash (ADR-0094) the chain is the ordinary open-addressing bound at
     /// the table's load, not a value a client can grow.
-    pub fn shadow_rebuild_next(&mut self, rebuild: &mut ShadowRebuild) -> Option<SettleSlot> {
+    pub fn shadow_rebuild_step(
+        &mut self,
+        rebuild: &mut ShadowRebuild,
+        max_groups: usize,
+    ) -> RebuildStep {
+        let max_groups = max_groups.max(1);
+        let mut groups = 0usize;
+        // Bound: `max_groups` probe groups, the cold slots of each at most
+        // one group's scratch.
         loop {
             // Classify the last stepped group's cold slots first.
             while rebuild.scratch_len > 0 {
                 rebuild.scratch_len -= 1;
                 let (hash, c) = rebuild.scratch[rebuild.scratch_len];
                 let cold = LogicalAddr::from_raw(c).expect("slot addresses are 48-bit");
-                let mut siblings = 0usize;
-                let mut lowest: Option<LogicalAddr> = None;
-                self.index.each_exact(hash, |sib| {
-                    if self.space.resolve(sib) != AddrClass::Cold {
-                        siblings += 1;
-                        lowest = Some(lowest.map_or(sib, |l| l.min(sib)));
-                    }
-                });
-                match (siblings, lowest) {
-                    (0, _) => {}
-                    (1, Some(winner)) if self.shadow.by_winner.len() < SHADOW_TICKETS_CAP => {
-                        self.register_shadow(hash, cold, winner);
-                    }
-                    (1, Some(_)) => {
-                        self.shadow.counters.rebuild_over_cap += 1;
-                        return Some(SettleSlot { hash, cold, reason: SettleReason::OverCap });
-                    }
-                    _ => return Some(SettleSlot { hash, cold, reason: SettleReason::Ambiguous }),
+                if let Some(slot) = self.classify_rebuilt(hash, cold) {
+                    return RebuildStep::Settle { slot, groups };
                 }
             }
             if rebuild.done {
-                return None;
+                return RebuildStep::Done { groups };
+            }
+            if groups == max_groups {
+                return RebuildStep::More { groups };
             }
             // Step one probe group of the open chain (or open the next).
             let mut cursor = match rebuild.cursor {
@@ -1292,7 +1319,7 @@ impl TieredTable {
                 None => {
                     if rebuild.group >= self.index.group_count() {
                         rebuild.done = true;
-                        return None;
+                        return RebuildStep::Done { groups };
                     }
                     self.index.home_group_cursor(rebuild.group)
                 }
@@ -1305,12 +1332,39 @@ impl TieredTable {
                     *len += 1;
                 }
             });
+            groups += 1;
             if more {
                 rebuild.cursor = Some(cursor);
             } else {
                 rebuild.cursor = None;
                 rebuild.group += 1;
             }
+        }
+    }
+
+    /// One cold slot of a stepped group: a ticket when it has exactly one
+    /// RAM sibling under the cap, nothing with none, else the slot to read
+    /// and settle.
+    fn classify_rebuilt(&mut self, hash: u64, cold: LogicalAddr) -> Option<SettleSlot> {
+        let mut siblings = 0usize;
+        let mut lowest: Option<LogicalAddr> = None;
+        self.index.each_exact(hash, |sib| {
+            if self.space.resolve(sib) != AddrClass::Cold {
+                siblings += 1;
+                lowest = Some(lowest.map_or(sib, |l| l.min(sib)));
+            }
+        });
+        match (siblings, lowest) {
+            (0, _) => None,
+            (1, Some(winner)) if self.shadow.by_winner.len() < SHADOW_TICKETS_CAP => {
+                self.register_shadow(hash, cold, winner);
+                None
+            }
+            (1, Some(_)) => {
+                self.shadow.counters.rebuild_over_cap += 1;
+                Some(SettleSlot { hash, cold, reason: SettleReason::OverCap })
+            }
+            _ => Some(SettleSlot { hash, cold, reason: SettleReason::Ambiguous }),
         }
     }
 
@@ -1331,15 +1385,32 @@ impl TieredTable {
     ) -> Result<(), ShadowRebuildError<E>> {
         let mut rebuild = self.begin_shadow_rebuild();
         while let Some(slot) = self.shadow_rebuild_next(&mut rebuild) {
-            let window = read(&slot).map_err(|cause| ShadowRebuildError::Read { slot, cause })?;
-            let key = ColdKey::from_window(&window.bytes, window.left, slot.hash, |key| {
-                self.hash_key(key)
-            })
-            .map_err(|cause| ShadowRebuildError::Identity { slot, cause })?;
-            self.settle_rebuilt_slot(slot.cold, key)
-                .map_err(|cause| ShadowRebuildError::Settle { slot, cause })?;
+            let window = read(&slot);
+            self.settle_rebuilt_window(slot, window)?;
         }
         Ok(())
+    }
+
+    /// Settles one slot the rebuild returned from what its read gave:
+    /// `window` parsed into a [`ColdKey`] under the slot's hash and this
+    /// table's keyed hash, then settled by its full key
+    /// ([`settle_rebuilt_slot`](Self::settle_rebuilt_slot)). The whole
+    /// rebuild and the boot's stepped one settle through it.
+    ///
+    /// # Errors
+    /// The read's error, bytes that are not a verified record of the slot's
+    /// hash, or an unsettleable slot — the recovery's fail-stop class.
+    pub fn settle_rebuilt_window<E>(
+        &mut self,
+        slot: SettleSlot,
+        window: Result<KeyWindow, E>,
+    ) -> Result<SettleOutcome, ShadowRebuildError<E>> {
+        let window = window.map_err(|cause| ShadowRebuildError::Read { slot, cause })?;
+        let key =
+            ColdKey::from_window(&window.bytes, window.left, slot.hash, |key| self.hash_key(key))
+                .map_err(|cause| ShadowRebuildError::Identity { slot, cause })?;
+        self.settle_rebuilt_slot(slot.cold, key)
+            .map_err(|cause| ShadowRebuildError::Settle { slot, cause })
     }
 
     /// Settles one slot the rebuild returned (A4′), by the twin's **full
