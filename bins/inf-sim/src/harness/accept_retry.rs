@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use inf_foundation::time::Nanos;
 
-use crate::net::{AcceptPark, CellNet};
+use crate::net::CellNet;
 
 /// What the oracle read over one run (node sums; times in ns).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -242,8 +242,15 @@ fn past_deadline_ns(arm: Nanos, deadline: Nanos) -> i64 {
 }
 
 /// The driver's park, as the oracle reads it.
+#[cfg(not(inf_canary_accept_retry_park_unread))]
 fn parked_broken(net: &CellNet) -> bool {
-    net.accept_parked() == Some(AcceptPark::Broken)
+    net.accept_parked() == Some(crate::net::AcceptPark::Broken)
+}
+
+/// Canary: the park is never read, so the leg judges nothing.
+#[cfg(inf_canary_accept_retry_park_unread)]
+fn parked_broken(_net: &CellNet) -> bool {
+    false
 }
 
 #[cfg(test)]

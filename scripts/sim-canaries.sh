@@ -373,6 +373,9 @@ rows=(
   # reads every parked arm still open at the run's end, and the queued
   # clients stall.
   "inf_canary_accept_retry_no_rearm m0-smoke accept-retry-missing --plant accept-broken"
+  # The accept-retry oracle's engagement: planted, it reads no park, so the
+  # leg's run judges nothing and is vacuous.
+  "inf_canary_accept_retry_park_unread m0-smoke accept-retry-unengaged --plant accept-broken"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.
