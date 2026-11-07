@@ -1804,14 +1804,22 @@ count the arrivals that found it full.
   withdrawal, a `DROP` fan, the grant held to terminal cleanup), and a
   disconnect after the persist request cannot abandon the create (ADR-0148
   D1, D4, D5, A1; ADR-0172 D3). The existing nine-argument fan and durable
-  formats remain. These changes are not built; the descriptions below are
-  the implemented contract.
+  formats remain. These changes are not built but the identity clause,
+  which is: a `CREATE` reserves its id under the DDL ticket, the catalog
+  writer commits it only when it accepts that `CREATE` (a refusal spends
+  none), past the last id every `CREATE` answers `-ERR namespace identity
+  space exhausted` before any effect, and boot refuses a catalog whose
+  counter is not past a live id. The descriptions below are the
+  implemented contract.
 - **ADR-0103 amendment (2026-09-01) — the `CREATE` choreography:
   persist-then-serve.**
   1. **Order** (`inf-server::plane::program_ns_ddl`): *parse → durable-
-     plane check → allocate the id → `Keyspace::ns_create_check`
-     (registry rules + tier gauntlet + reserved-VA arithmetic, applies
-     nothing) → `ControlHandle::request_create(export, spec)` → wait
+     plane check → allocate the id (reserved under the DDL ticket and
+     committed with the writer's `Accepted` verdict, so a refused
+     `CREATE` leaves `next_id` unchanged; ADR-0148 D4) →
+     `Keyspace::ns_create_check` (registry rules + tier gauntlet +
+     reserved-VA arithmetic, applies nothing) →
+     `ControlHandle::request_create(export, spec, reservation)` → wait
      for the request's own answer (`Requested::answer`) → apply locally
      → fan `INF.NSFAN CREATE` (unchanged 9 args) → the `CreateApplied`
      notice → `+OK`*. No cell names a namespace before
@@ -1825,9 +1833,12 @@ count the arrivals that found it full.
      pending `CREATE` joins every payload whose export lacks its id; a
      pending `DROP`'s id, like every tombstoned id, leaves every payload
      with every index record naming it. A `CREATE` is refused
-     `NameExists` when the export holds its name and `PendingConflict`
+     `NameExists` when the export holds its name, `PendingConflict`
      while a DDL is pending (an internal error: the DDL ticket admits one
-     program); a refusal writes nothing. The verdict reaches the origin
+     program) and `IdNotNext` when its reserved id is not the counter's
+     next or no id is left (an internal error too: each `CREATE` reserves
+     its id under the ticket and only an accepted one moves the counter);
+     a refusal writes nothing. The verdict reaches the origin
      through the request's own answer slot (`inf-store::ddl`), stored
      (for an accepted request, after its `META` write returned) before
      the catalog word, the highest answered epoch. The pending DDL retires on the
