@@ -9,7 +9,7 @@ use inf_store::ddl::{Answer, CreatePersisted, DdlRefusal, DropPersisted, Receipt
 use inf_wire::{Domain, Refusal};
 
 use super::*;
-use crate::control::{CkptCredit, CkptTarget, DdlNotice};
+use crate::control::{CkptCredit, CkptTarget, DdlNotice, DdlTicket};
 
 /// Why a checkpoint producer could not reserve its units.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -519,14 +519,14 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
     // effect to after the reply, on every exit path (it is a guard).
     // Parked programs wake on the release edge MAINTAIN detects. A
     // program's notice is bound after it, so it is posted first.
-    let _ticket = loop {
+    let ticket = loop {
         if let Some(ticket) = control.ddl_try_acquire(shared.cell.0) {
             break ticket;
         }
         shared.ddl_waiters.wait(0).await;
     };
     if argv[1].eq_ignore_ascii_case(b"CREATE") {
-        return program_ns_create(shared, &control, proto, argv).await;
+        return program_ns_create(shared, &control, &ticket, proto, argv).await;
     }
     if argv[1].eq_ignore_ascii_case(b"SET") {
         return program_ns_set(shared, &control, proto, argv).await;
@@ -658,8 +658,8 @@ impl Drop for NoticeDue {
 }
 
 /// The reply a DDL renders for the writer's refusal: `NameExists` as the
-/// namespace error every `CREATE` path answers; `PendingConflict`, which
-/// the ticket makes unreachable, as an internal error.
+/// namespace error every `CREATE` path answers; `PendingConflict` and
+/// `IdNotNext`, which the ticket makes unreachable, as internal errors.
 fn ddl_refusal_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
@@ -668,11 +668,16 @@ fn ddl_refusal_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     match refusal {
         DdlRefusal::NameExists => ns_error_reply(shared, proto, inf_store::NsError::Exists),
         DdlRefusal::PendingConflict => error_reply(shared, proto, DDL_PENDING_CONFLICT),
+        DdlRefusal::IdNotNext => error_reply(shared, proto, DDL_ID_NOT_NEXT),
     }
 }
 
 /// The internal error of a DDL the writer found another pending for.
 const DDL_PENDING_CONFLICT: &str = "ERR internal: another namespace DDL is pending";
+
+/// The internal error of a `CREATE` whose reserved id the writer found was
+/// not the counter's next: its id is never committed.
+const DDL_ID_NOT_NEXT: &str = "ERR internal: the namespace id is not the catalog's next";
 
 /// Parks until the writer answers `requested` through its own slot
 /// (ADR-0189 D2): the word's edge wakes the DDL waitlist.
@@ -695,10 +700,12 @@ async fn await_answer<R: Receipt, O: PlaneObserver + 'static, F: SegmentFs + Clo
 /// ask the writer for the `META` that names the namespace and wait for
 /// its answer, then apply locally and fan, so no cell serves a namespace
 /// the catalog does not hold. A failed leg rolls it back. Every exit
-/// after the answer posts the `CREATE`'s notice.
+/// after the answer posts the `CREATE`'s notice. The id is reserved under
+/// the ticket and spent only by the writer's acceptance (ADR-0148 D4).
 async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     control: &Arc<ControlHandle>,
+    ticket: &DdlTicket,
     proto: Protocol,
     argv: &[&[u8]],
 ) -> OwnedReply {
@@ -710,7 +717,11 @@ async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
         Ok(cleanup) => cleanup,
         Err(refusal) => return refusal,
     };
-    let spec = draft.with_id(control.alloc_ns_id());
+    let reservation = match ticket.reserve_ns_id() {
+        Ok(reservation) => reservation,
+        Err(refusal) => return error_reply(shared, proto, refusal.render()),
+    };
+    let spec = draft.with_id(reservation.id().0);
     if let Err(e) = shared.store.borrow().ns_create_check(&spec) {
         return ns_error_reply(shared, proto, e);
     }
@@ -719,7 +730,7 @@ async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
         control.next_index_id(),
         control.next_index_generation(),
     );
-    let requested = control.request_create(export, spec.clone());
+    let requested = control.request_create(export, spec.clone(), reservation);
     let receipt = match await_answer(shared, control, requested).await {
         Ok(receipt) => receipt,
         Err(refusal) => return ddl_refusal_reply(shared, proto, refusal),

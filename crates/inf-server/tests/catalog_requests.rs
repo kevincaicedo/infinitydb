@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use inf_foundation::fault::{self, FaultSpec, HoldGate};
 use inf_log::fs::{SegmentFs, StdSegmentFile, StdSegmentFs, TierIoMode};
 use inf_server::{CkptSpace, ControlHandle, ControlInbox, load_catalog};
-use inf_store::ddl::{Answer, DdlRefusal, Receipt, Requested};
+use inf_store::ddl::{Answer, CreatePersisted, DdlRefusal, Receipt, Requested};
 use inf_store::{FsyncClass, IndexCatalog, NsCatalog, NsId, NsMode, NsSpec};
 
 /// The namespace the DDL creates or drops.
@@ -66,6 +66,21 @@ fn writer(dir: &Path, seed: Option<&NsCatalog>) -> (Arc<ControlHandle>, ControlI
     let cells = inf_foundation::CellCount::new(2).expect("two cells");
     let (control, inbox, _issuers) = ControlHandle::detached_in(seed, CkptSpace::full(cells), 0);
     (control, inbox)
+}
+
+/// A `CREATE` of `name`, its id reserved under the DDL ticket as a program
+/// reserves it (the ticket released once the request is sent): the spec
+/// and the request's token.
+fn reserved_create(
+    control: &Arc<ControlHandle>,
+    export: NsCatalog,
+    name: &[u8],
+    mode: NsMode,
+) -> (NsSpec, Requested<CreatePersisted>) {
+    let ticket = control.ddl_try_acquire(0).expect("the DDL ticket is free");
+    let reservation = ticket.reserve_ns_id().expect("an id is left");
+    let spec = spec(reservation.id().0, name, mode);
+    (spec.clone(), control.request_create(export, spec, reservation))
 }
 
 /// `META` as the disk holds it.
@@ -211,8 +226,8 @@ fn held_ddl(
         let durable = NsMode::Durable;
         let accepted = match ddl {
             Ddl::Create => {
-                let requested =
-                    control.request_create(catalog(Vec::new()), spec(DDL_NS, b"fresh", durable));
+                let (_, requested) =
+                    reserved_create(&control, catalog(Vec::new()), b"fresh", durable);
                 answered(&control, requested).map(|_| ())
             }
             Ddl::Drop => {
@@ -295,8 +310,7 @@ fn a_drop_held_before_its_send_is_answered_after_its_own_meta() {
 fn an_answer_waits_for_its_own_meta_write() {
     let dir = temp_dir("held-write");
     let (control, inbox) = writer(&dir, None);
-    let requested =
-        control.request_create(catalog(Vec::new()), spec(DDL_NS, b"fresh", NsMode::Durable));
+    let (_, requested) = reserved_create(&control, catalog(Vec::new()), b"fresh", NsMode::Durable);
     let gate = HoldGate::new();
     let armed = gate.clone();
     let drainer = {
@@ -331,9 +345,10 @@ fn an_answer_waits_for_its_own_meta_write() {
 
 // ---- refusals write nothing ----
 
-/// A refused request writes no `META` (no `META.new` is created) and
-/// leaves `META`'s bytes as they were: a `CREATE` whose name the export
-/// holds, and a `CREATE` while another is pending.
+/// A refused request writes no `META` (no `META.new` is created), leaves
+/// `META`'s bytes as they were and spends no namespace id (ADR-0148 D4): a
+/// `CREATE` whose name the export holds, then a `CREATE` that takes the
+/// same id, and a `CREATE` while another is pending.
 #[test]
 fn a_refused_request_writes_nothing() {
     let dir = temp_dir("refusal");
@@ -341,25 +356,59 @@ fn a_refused_request_writes_nothing() {
     let (control, mut inbox) = writer(&dir, Some(&seed));
     let fs = RecordingFs::default();
     let before = std::fs::read(dir.join("META")).expect("META");
+    let next = control.next_ns_id();
     let export = catalog(seed.entries.clone());
-    let requested =
-        control.request_create(export.clone(), spec(DDL_NS + 1, b"ledger", NsMode::Memory));
+    let (_, requested) = reserved_create(&control, export.clone(), b"ledger", NsMode::Memory);
     inbox.drain(&fs, &dir).expect("the drain");
     assert_eq!(answered(&control, requested).map(|r| r.id()), Err(DdlRefusal::NameExists));
     assert!(fs.ops().is_empty(), "the refusal touched the disk: {:?}", fs.ops());
     assert_eq!(std::fs::read(dir.join("META")).expect("META"), before, "META's bytes moved");
-    // An accepted CREATE is pending until its notice; a second is refused.
-    let first = control.request_create(export.clone(), spec(DDL_NS + 2, b"first", NsMode::Memory));
+    assert_eq!(control.next_ns_id(), next, "the refusal spent a namespace id");
+    // An accepted CREATE takes the id the refused one did not spend, and is
+    // pending until its notice; a second is refused.
+    let (_, first) = reserved_create(&control, export.clone(), b"first", NsMode::Memory);
     inbox.drain(&fs, &dir).expect("the drain");
-    assert!(answered(&control, first).is_ok(), "the first CREATE is accepted");
+    assert_eq!(answered(&control, first).map(|r| r.id()), Ok(NsId(next)), "the unspent id");
+    assert_eq!(control.next_ns_id(), next + 1, "the acceptance commits its id");
     let written = fs.ops().len();
     let after_first = std::fs::read(dir.join("META")).expect("META");
-    let second = control.request_create(export, spec(DDL_NS + 3, b"second", NsMode::Memory));
+    let (_, second) = reserved_create(&control, export, b"second", NsMode::Memory);
     inbox.drain(&fs, &dir).expect("the drain");
     assert_eq!(answered(&control, second).map(|r| r.id()), Err(DdlRefusal::PendingConflict));
+    assert_eq!(control.next_ns_id(), next + 1, "the refusal spent a namespace id");
     assert_eq!(fs.ops().len(), written, "the refusal touched the disk: {:?}", &fs.ops()[written..]);
     assert_eq!(std::fs::read(dir.join("META")).expect("META"), after_first, "META's bytes moved");
     assert_eq!(control.persisted_epoch(), 3, "every request moved the word");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A `CREATE` sent on a reservation the counter has moved past (two
+/// `CREATE`s on one ticket's one reservation) is refused before any other
+/// verdict, writes nothing and commits nothing (ADR-0148 D4).
+#[test]
+fn a_create_on_a_spent_reservation_is_refused_and_writes_nothing() {
+    let dir = temp_dir("spent-reservation");
+    let (control, mut inbox) = writer(&dir, None);
+    let fs = RecordingFs::default();
+    let ticket = control.ddl_try_acquire(0).expect("the DDL ticket is free");
+    let first = ticket.reserve_ns_id().expect("an id is left");
+    let again = ticket.reserve_ns_id().expect("an id is left");
+    assert_eq!(first.id(), again.id(), "a reservation moves nothing");
+    let id = first.id().0;
+    let accepted =
+        control.request_create(catalog(Vec::new()), spec(id, b"first", NsMode::Memory), first);
+    inbox.drain(&fs, &dir).expect("the drain");
+    assert_eq!(answered(&control, accepted).map(|r| r.id()), Ok(NsId(id)));
+    let written = fs.ops().len();
+    let after = std::fs::read(dir.join("META")).expect("META");
+    let spent =
+        control.request_create(catalog(Vec::new()), spec(id, b"again", NsMode::Memory), again);
+    inbox.drain(&fs, &dir).expect("the drain");
+    assert_eq!(answered(&control, spent).map(|r| r.id()), Err(DdlRefusal::IdNotNext));
+    assert_eq!(fs.ops().len(), written, "the refusal touched the disk: {:?}", &fs.ops()[written..]);
+    assert_eq!(std::fs::read(dir.join("META")).expect("META"), after, "META's bytes moved");
+    assert_eq!(control.next_ns_id(), id + 1, "the refusal committed nothing");
+    drop(ticket);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -389,8 +438,7 @@ fn every_payload_carries_the_ddl_in_flight() {
     // whose export still names it.
     let dir = temp_dir("own-payload-create");
     let (control, mut inbox) = writer(&dir, None);
-    let fresh = spec(DDL_NS + 1, b"fresh", NsMode::Memory);
-    let created = control.request_create(catalog(Vec::new()), fresh.clone());
+    let (fresh, created) = reserved_create(&control, catalog(Vec::new()), b"fresh", NsMode::Memory);
     inbox.drain(&fs, &dir).expect("the drain");
     assert!(answered(&control, created).is_ok());
     control.request_persist(catalog(Vec::new()));

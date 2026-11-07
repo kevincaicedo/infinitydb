@@ -20,9 +20,6 @@ fn ns_id(c: &mut TcpStream, name: &[u8]) -> u32 {
 /// successor. On two cells: `a` is created, `CREATE a` is refused twice
 /// (the name exists), then `b` is created.
 #[test]
-#[ignore = "a refused INF.NS CREATE spends a namespace id, so ids skip and a client repeating a \
-            refused CREATE spends the id space; red until an id moves only when the catalog \
-            writer accepts the CREATE"]
 fn a_refused_create_spends_no_namespace_id() {
     const REFUSED: u32 = 2;
     let dir = temp_data_dir("create-refused-id");

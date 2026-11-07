@@ -39,12 +39,19 @@ pub enum DdlRefusal {
     /// Another DDL is pending: unreachable while the DDL ticket admits one
     /// program at a time, so the program answers it as an internal error.
     PendingConflict,
+    /// A `CREATE` whose id is not the namespace-id counter's next, or a
+    /// counter with no id left: unreachable while each `CREATE` reserves
+    /// its id under the DDL ticket and nothing else moves the counter, so
+    /// the program answers it as an internal error. Its id is never
+    /// committed (ADR-0148 D4).
+    IdNotNext,
 }
 
 /// A slot's verdict code: 0 is reserved for "unanswered".
 const VERDICT_ACCEPTED: u8 = 1;
 const VERDICT_NAME_EXISTS: u8 = 2;
 const VERDICT_PENDING_CONFLICT: u8 = 3;
+const VERDICT_ID_NOT_NEXT: u8 = 4;
 
 impl DdlVerdict {
     fn code(self) -> u8 {
@@ -52,6 +59,7 @@ impl DdlVerdict {
             DdlVerdict::Accepted => VERDICT_ACCEPTED,
             DdlVerdict::Refused(DdlRefusal::NameExists) => VERDICT_NAME_EXISTS,
             DdlVerdict::Refused(DdlRefusal::PendingConflict) => VERDICT_PENDING_CONFLICT,
+            DdlVerdict::Refused(DdlRefusal::IdNotNext) => VERDICT_ID_NOT_NEXT,
         }
     }
 
@@ -61,6 +69,7 @@ impl DdlVerdict {
             VERDICT_ACCEPTED => DdlVerdict::Accepted,
             VERDICT_NAME_EXISTS => DdlVerdict::Refused(DdlRefusal::NameExists),
             VERDICT_PENDING_CONFLICT => DdlVerdict::Refused(DdlRefusal::PendingConflict),
+            VERDICT_ID_NOT_NEXT => DdlVerdict::Refused(DdlRefusal::IdNotNext),
             other => unreachable!("an answered slot holds verdict code {other}"),
         }
     }
@@ -312,6 +321,7 @@ mod tests {
             DdlVerdict::Accepted,
             DdlVerdict::Refused(DdlRefusal::NameExists),
             DdlVerdict::Refused(DdlRefusal::PendingConflict),
+            DdlVerdict::Refused(DdlRefusal::IdNotNext),
         ] {
             assert_eq!(DdlVerdict::from_code(verdict.code()), verdict);
         }

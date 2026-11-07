@@ -74,6 +74,14 @@ pub const SERVER_TIMER_OWNERS: Cap =
 /// publication is observed within two completed sweeps.
 pub const CKPT_BOARD_VISITS_PER_TURN: usize = 64;
 
+/// The namespace-id counter's spent value (ADR-0148 D4). Unit: namespace
+/// ids per data directory, issued from `FIRST_NAMED_NS_ID` up to
+/// `u32::MAX − 1`, once each (ADR-0015 D2). Owner: the catalog writer, the
+/// counter's one mover. Crossing: a counter at this value issues none, so
+/// every `INF.NS CREATE` answers `IdentityExhausted(Namespace)` before any
+/// effect, for the data directory's life.
+pub const NS_IDS_EXHAUSTED: u32 = u32::MAX;
+
 /// The recovery step budget's price of one byte a tiered boot replay
 /// machine wrote to a tier file (ADR-0174 R10; D6's gauge reads the
 /// largest step's charge): one budget byte, the device bytes the step

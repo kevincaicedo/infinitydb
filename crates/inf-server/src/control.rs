@@ -10,9 +10,13 @@
 //! highest answered epoch (ADR-0189 D2); every cell's MAINTAIN observes the
 //! word and wakes its parked pumps, and each pump reads its own answer.
 //!
-//! The thread also owns namespace-id allocation (ids are node-unique,
-//! allocated once, never reused — ADR-0015 D2): a shared `AtomicU32`
-//! seeded from the catalog's `next_id` at boot. One `fetch_add` per DDL is
+//! The writer also moves the namespace-id counter (ids are node-unique,
+//! issued once, never reused — ADR-0015 D2): a shared `AtomicU32` seeded
+//! from the catalog's `next_id` at boot. A `CREATE` reserves the counter's
+//! value under the DDL ticket without moving it, and only the writer's
+//! acceptance of that `CREATE` moves it, by one, in the persist that names
+//! the id (ADR-0148 D4): a refused `CREATE` leaves it where it was, and a
+//! counter at `u32::MAX` issues no id. One load and one store per DDL are
 //! control-plane traffic; L1's no-shared-atomics rule binds the data plane.
 //!
 //! The writer also owns the **drop-tombstone set** (ADR-0100 D2): a
@@ -55,8 +59,9 @@ use inf_store::ddl::{
 use inf_store::{
     FIRST_INDEX_GENERATION, FIRST_INDEX_ID, FIRST_NAMED_NS_ID, NsCatalog, NsId, NsSpec,
 };
+use inf_wire::{Domain, Refusal};
 
-use crate::limits::CKPT_BOARD_VISITS_PER_TURN;
+use crate::limits::{CKPT_BOARD_VISITS_PER_TURN, NS_IDS_EXHAUSTED};
 
 /// Recycled-life residue recovery proved at boot (M4.5-S39b, ADR-0090
 /// D2/D4 as amended): how many segments ended their data at a foreign-
@@ -1168,8 +1173,9 @@ impl CatalogRequest {
 
 /// The change a DDL request asks the writer for.
 enum DdlIntent {
-    /// A new namespace, its id allocated by the requester.
-    Create(NsSpec),
+    /// A new namespace, its id the requester reserved: committed only if
+    /// the writer accepts it, and only when it is the counter's next.
+    Create { spec: NsSpec, reserved: NsId },
     /// Namespace `id` goes; `tombstone` for a durable one.
     Drop { id: u32, tombstone: bool },
 }
@@ -1284,6 +1290,9 @@ enum ControlMsg {
 /// Shared handle the assembly wires into every cell's plane.
 pub struct ControlHandle {
     tx: mpsc::SyncSender<ControlMsg>,
+    /// The next namespace id (ADR-0148 D4): stored only by the catalog
+    /// writer, when it accepts the `CREATE` that reserved it;
+    /// [`NS_IDS_EXHAUSTED`] once the last id is issued.
     next_ns_id: AtomicU32,
     /// Index-id + generation allocators (M4.5-S03, ADR-0075 D1): both
     /// node-unique, allocated once, never reused — the ns-id discipline.
@@ -1344,6 +1353,44 @@ impl Drop for DdlTicket {
     }
 }
 
+impl DdlTicket {
+    /// Reserves the next namespace id for this program's `CREATE`, moving
+    /// nothing (ADR-0148 D4): the writer moves the counter past it only
+    /// when it accepts that `CREATE`. One program holds the ticket, so the
+    /// value it reads is the next one the writer will commit; the previous
+    /// program's commit is ordered before it by that program's read of its
+    /// answer and its ticket's release.
+    ///
+    /// # Errors
+    /// `IdentityExhausted(Namespace)` once the last id, `u32::MAX − 1`, is
+    /// issued: before any effect, for the data directory's life.
+    pub fn reserve_ns_id(&self) -> Result<NsIdReservation, Refusal> {
+        let next = self.handle.next_ns_id.load(Ordering::Acquire);
+        if next == NS_IDS_EXHAUSTED {
+            return Err(Refusal::IdentityExhausted(Domain::Namespace));
+        }
+        Ok(NsIdReservation { id: NsId(next) })
+    }
+}
+
+/// A namespace id one `CREATE` reserved under the DDL ticket (ADR-0148
+/// D4): the counter's next value, not moved. Made only by
+/// [`DdlTicket::reserve_ns_id`] and consumed by
+/// [`ControlHandle::request_create`]; dropped, it changes nothing, so a
+/// `CREATE` refused before its request spends no id. Not `Clone`.
+#[derive(Debug)]
+pub struct NsIdReservation {
+    id: NsId,
+}
+
+impl NsIdReservation {
+    /// The reserved id.
+    #[must_use]
+    pub fn id(&self) -> NsId {
+        self.id
+    }
+}
+
 impl ControlHandle {
     /// Live drop tombstones in the catalog writer (ADR-0100 D3/D7).
     pub fn drop_tombstones(&self) -> usize {
@@ -1385,14 +1432,10 @@ impl ControlHandle {
     pub(crate) fn post_notice(&self, notice: DdlNotice) {
         self.tx.send(ControlMsg::Notice(notice)).expect("control thread alive (fail-stop)");
     }
-    /// Allocates one namespace id (never reused — ADR-0015 D2).
-    pub fn alloc_ns_id(&self) -> u32 {
-        self.next_ns_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// The id the allocator would hand out next (catalog `next_id`).
+    /// The next namespace id (the catalog's `next_id`): the id a
+    /// `CREATE` reserves, [`NS_IDS_EXHAUSTED`] once none is left.
     pub fn next_ns_id(&self) -> u32 {
-        self.next_ns_id.load(Ordering::Relaxed)
+        self.next_ns_id.load(Ordering::Acquire)
     }
 
     /// Allocates one index id (never reused — ADR-0075 D1).
@@ -1422,11 +1465,18 @@ impl ControlHandle {
     }
 
     /// Asks the writer for the `META` that names `spec` (ADR-0103 D1,
-    /// ADR-0189 D2); the token reads the answer.
+    /// ADR-0189 D2), its id the one `reservation` holds; the token reads
+    /// the answer. The writer commits the id only if it accepts.
     #[must_use]
-    pub fn request_create(&self, export: NsCatalog, spec: NsSpec) -> Requested<CreatePersisted> {
+    pub fn request_create(
+        &self,
+        export: NsCatalog,
+        spec: NsSpec,
+        reservation: NsIdReservation,
+    ) -> Requested<CreatePersisted> {
         let (slot, requested) = ddl::answer_slot(spec.id);
-        self.send_request(CatalogRequest::new(Some(DdlIntent::Create(spec)), export, Some(slot)));
+        let intent = Some(DdlIntent::Create { spec, reserved: reservation.id });
+        self.send_request(CatalogRequest::new(intent, export, Some(slot)));
         requested
     }
 
@@ -1633,11 +1683,16 @@ impl CatalogWriter {
 
     /// The verdict, pure on the writer's state and the request: the first
     /// row of ADR-0189 D3's table that holds, without the tombstone cap's
-    /// rows.
+    /// rows, after a `CREATE`'s own check that its reserved id is the
+    /// counter's next (ADR-0148 D4).
     fn decide(&self, intent: Option<&DdlIntent>, export: &NsCatalog) -> DdlVerdict {
         let Some(intent) = intent else { return DdlVerdict::Accepted };
         match intent {
-            DdlIntent::Create(spec) => {
+            DdlIntent::Create { spec, reserved } => {
+                let next = self.handle.next_ns_id();
+                if *reserved != spec.id || reserved.0 != next || next == NS_IDS_EXHAUSTED {
+                    return DdlVerdict::Refused(DdlRefusal::IdNotNext);
+                }
                 if self.pending.is_some() {
                     return DdlVerdict::Refused(DdlRefusal::PendingConflict);
                 }
@@ -1661,13 +1716,17 @@ impl CatalogWriter {
         }
     }
 
-    /// An accepted request's state change (infallible): a `CREATE` or a
-    /// `DROP` becomes the pending DDL (a rollback's `DROP` replaces its
-    /// `CREATE`), and a durable drop's tombstone joins the set, unstamped.
+    /// An accepted request's state change (infallible): a `CREATE` commits
+    /// its id and becomes the pending DDL, a `DROP` becomes it (a rollback's
+    /// `DROP` replaces its `CREATE`), and a durable drop's tombstone joins
+    /// the set, unstamped.
     fn accept(&mut self, intent: Option<DdlIntent>) {
         match intent {
             None => {}
-            Some(DdlIntent::Create(spec)) => self.pending = Some(PendingDdl::Create(spec)),
+            Some(DdlIntent::Create { spec, .. }) => {
+                self.commit_ns_id(spec.id);
+                self.pending = Some(PendingDdl::Create(spec));
+            }
             Some(DdlIntent::Drop { id, tombstone }) => {
                 self.pending = Some(PendingDdl::Drop(id));
                 if tombstone {
@@ -1675,6 +1734,15 @@ impl CatalogWriter {
                 }
             }
         }
+    }
+
+    /// Moves the namespace-id counter past `id`, the `CREATE` just
+    /// accepted (ADR-0148 D4), before the payload is shaped, so the `META`
+    /// that names `id` carries `next_id = id + 1`. `decide` refused any id
+    /// that is not the counter's next or a counter with none left, so
+    /// `id < u32::MAX` and the successor is representable.
+    fn commit_ns_id(&self, id: NsId) {
+        self.handle.next_ns_id.store(id.0 + 1, Ordering::Release);
     }
 
     /// The payload, from an export and the writer's state (ADR-0189 D3
@@ -2173,6 +2241,13 @@ mod drop_tombstone_tests {
         writer
     }
 
+    /// `spec`'s `CREATE`, its id reserved: the counter is set to it first,
+    /// as the ticket's reservation finds it.
+    fn create(w: &CatalogWriter, spec: NsSpec) -> DdlIntent {
+        w.handle.next_ns_id.store(spec.id.0, std::sync::atomic::Ordering::Relaxed);
+        DdlIntent::Create { reserved: spec.id, spec }
+    }
+
     /// ADR-0100 D2/D3: add → stamp → retire once every cell published the
     /// stamped epoch; unstamped tombstones never retire; the set answers
     /// membership and its ascending ids.
@@ -2212,24 +2287,25 @@ mod drop_tombstone_tests {
     #[test]
     fn the_writer_decides_each_row_of_its_table() {
         let mut w = writer();
-        let create = |spec: NsSpec| DdlIntent::Create(spec);
         let drop_of = |id: u32| DdlIntent::Drop { id, tombstone: true };
         let export = catalog(vec![entry(16)]);
         assert_eq!(w.decide(None, &export), super::DdlVerdict::Accepted);
         let mut taken = entry(40);
         taken.name = b"ns16".to_vec();
         let name_exists = super::DdlVerdict::Refused(DdlRefusal::NameExists);
-        assert_eq!(w.decide(Some(&create(taken.clone())), &export), name_exists);
+        assert_eq!(w.decide(Some(&create(&w, taken.clone())), &export), name_exists);
         w.tombstones.add(16);
         assert_eq!(
-            w.decide(Some(&create(taken)), &export),
+            w.decide(Some(&create(&w, taken)), &export),
             super::DdlVerdict::Accepted,
             "a tombstoned id's lagging entry holds no name"
         );
-        assert_eq!(w.decide(Some(&create(entry(41))), &export), super::DdlVerdict::Accepted);
-        w.accept(Some(create(entry(41))));
+        assert_eq!(w.decide(Some(&create(&w, entry(41))), &export), super::DdlVerdict::Accepted);
+        let intent = create(&w, entry(41));
+        w.accept(Some(intent));
+        assert_eq!(w.handle.next_ns_id(), 42, "the acceptance commits the id");
         let conflict = super::DdlVerdict::Refused(DdlRefusal::PendingConflict);
-        assert_eq!(w.decide(Some(&create(entry(42))), &export), conflict);
+        assert_eq!(w.decide(Some(&create(&w, entry(42))), &export), conflict);
         assert_eq!(w.decide(Some(&drop_of(42)), &export), conflict);
         assert_eq!(
             w.decide(Some(&drop_of(41)), &export),
@@ -2242,12 +2318,34 @@ mod drop_tombstone_tests {
         assert_eq!(w.decide(Some(&drop_of(41)), &export), conflict);
     }
 
+    /// ADR-0148 D4 at the writer: a `CREATE` whose reserved id is not the
+    /// counter's next (a second `CREATE` on one reservation, a reservation
+    /// whose spec names another id), or a counter with no id left, is
+    /// refused before any other row, and commits nothing.
+    #[test]
+    fn a_create_whose_id_is_not_the_counter_next_is_refused() {
+        let w = writer();
+        let export = catalog(Vec::new());
+        let not_next = super::DdlVerdict::Refused(DdlRefusal::IdNotNext);
+        let next = w.handle.next_ns_id();
+        let stale = DdlIntent::Create { reserved: entry(next - 1).id, spec: entry(next - 1) };
+        assert_eq!(w.decide(Some(&stale), &export), not_next, "an id below the counter");
+        let ahead = DdlIntent::Create { reserved: entry(next + 1).id, spec: entry(next + 1) };
+        assert_eq!(w.decide(Some(&ahead), &export), not_next, "an id past the counter");
+        let mismatched = DdlIntent::Create { reserved: entry(next).id, spec: entry(next + 1) };
+        assert_eq!(w.decide(Some(&mismatched), &export), not_next, "a spec of another id");
+        let exhausted = create(&w, entry(super::NS_IDS_EXHAUSTED));
+        assert_eq!(w.decide(Some(&exhausted), &export), not_next, "a counter with none left");
+        assert_eq!(w.handle.next_ns_id(), super::NS_IDS_EXHAUSTED, "nothing committed");
+    }
+
     /// A notice retires the pending DDL of its own kind and id and nothing
     /// else: a stale one changes nothing and is counted.
     #[test]
     fn a_notice_retires_only_its_own_kind_and_id() {
         let mut w = writer();
-        w.accept(Some(DdlIntent::Create(entry(40))));
+        let intent = create(&w, entry(40));
+        w.accept(Some(intent));
         w.notice(DdlNotice::DropFanned { id: 40, stamp: Some(7) });
         w.notice(DdlNotice::CreateApplied { id: 41 });
         assert_eq!(w.handle.ddl_notices_stale(), 2);
@@ -2286,14 +2384,12 @@ mod drop_tombstone_tests {
             inf_store::ddl::answer_slot::<inf_store::ddl::CreatePersisted>(entry(40).id);
         let mut taken = entry(40);
         taken.name = b"ns16".to_vec();
-        let req = CatalogRequest::new(
-            Some(DdlIntent::Create(taken)),
-            catalog(vec![entry(16)]),
-            Some(slot),
-        );
+        let req =
+            CatalogRequest::new(Some(create(&w, taken)), catalog(vec![entry(16)]), Some(slot));
         w.answer(req, &inf_log::fs::StdSegmentFs, &dir).expect("a refusal writes nothing");
         assert!(!dir.join("META").exists() && !dir.join("META.new").exists(), "no META write");
         assert!(w.pending.is_none());
+        assert_eq!(handle.next_ns_id(), 40, "the refusal committed no id");
         assert_eq!(w.tombstones.entries, vec![(18, Some(3))], "the refusal retired nothing");
         assert_eq!(handle.persisted_epoch(), 1, "the word moved");
         assert!(matches!(
@@ -2302,13 +2398,15 @@ mod drop_tombstone_tests {
         ));
         let (slot, requested) =
             inf_store::ddl::answer_slot::<inf_store::ddl::CreatePersisted>(entry(41).id);
-        let req = CatalogRequest::new(
-            Some(DdlIntent::Create(entry(41))),
-            catalog(vec![entry(16)]),
-            Some(slot),
-        );
+        // The export a program sends carries the counter it reserved from.
+        let mut export = catalog(vec![entry(16)]);
+        export.next_id = 41;
+        let req = CatalogRequest::new(Some(create(&w, entry(41))), export, Some(slot));
         w.answer(req, &inf_log::fs::StdSegmentFs, &dir).expect("the META write");
         assert!(dir.join("META").exists(), "an acceptance writes META");
+        assert_eq!(handle.next_ns_id(), 42, "the acceptance committed its id");
+        let written = super::load_catalog(&dir).expect("META decodes").expect("META");
+        assert_eq!(written.next_id, 42, "the META that names id 41 carries its successor");
         assert!(w.tombstones.entries.is_empty(), "the acceptance retired the covered tombstone");
         assert_eq!(handle.persisted_epoch(), 2);
         match requested.answer(handle.catalog_word()) {
