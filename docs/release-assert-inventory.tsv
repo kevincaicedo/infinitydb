@@ -544,8 +544,8 @@ C	3	crates/inf-server/src/plane/tiered/write.rs	expect	tiered namespaces always 
 I	1	crates/inf-server/src/recover.rs	expect	evidence anchor set with a valid frame	the anchor is set in the same loop whenever a scan reports `valid_frames > 0`
 I	2	crates/inf-server/src/recover.rs	expect	fs present	the machine's own phase order: `fs` is taken once, when the rotor is built at completion
 I	1	crates/inf-server/src/recover.rs	expect	fs present until finish	the machine's own phase order: `fs` is taken once, when the rotor is built at completion
-I	1	crates/inf-server/src/recover.rs	expect	ick phase	`Phase::Ick` is entered only after the manifest is stored
-I	1	crates/inf-server/src/recover.rs	expect	loader present until the audit	the sidecar loader is taken once, by the end-of-replay checks in the finish step (after any lift), long after the ick phase that uses it
+I	1	crates/inf-server/src/recover/section_walk.rs	expect	ick phase	`Phase::Ick` is entered only after the manifest is stored
+I	1	crates/inf-server/src/recover/section_walk.rs	expect	loader present until the audit	the sidecar loader is taken once, by the end-of-replay checks in the finish step (after any lift), long after the ick phase that uses it
 I	1	crates/inf-server/src/recover.rs	expect	non-empty scan	the fresh-cell branch (empty scan) completed earlier; the finish phase runs only over a non-empty scan
 I	1	crates/inf-server/src/recover.rs	expect	recovery complete before finish()	documented panic: `finish` after `Complete` (callers loop on `step`)
 I	1	crates/inf-server/src/recover.rs	expect	scan set	`scan` is stored in the start phase before any later phase runs

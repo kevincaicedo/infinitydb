@@ -79,10 +79,10 @@ pub const CKPT_BOARD_VISITS_PER_TURN: usize = 64;
 /// moved. Owner: the recovery driver (`RecoverConfig::step_bytes` is the
 /// budget it charges). Crossing: a step whose charge — the bytes its cursor
 /// passed and its priced boot work — reaches the budget yields at the next
-/// record, inside a log frame (ADR-0174 A1), at the next checkpoint section,
-/// which stays one unit, or after the settle step that reached it. The
-/// bytes a demote step's seal walk and the end settle pass, and their
-/// reads, are priced by the store, whose walks yield on them
+/// record or entry, inside a log frame or a checkpoint section (ADR-0174
+/// A1), after an index-sidecar section, or after the settle step that
+/// reached it. The bytes a demote step's seal walk and the end settle pass,
+/// and their reads, are priced by the store, whose walks yield on them
 /// ([`ReplayWork::settle_charge_bytes`](inf_store::ReplayWork::settle_charge_bytes)).
 pub const REPLAY_TIER_BYTE_CHARGE: u64 = 1;
 

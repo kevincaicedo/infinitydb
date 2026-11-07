@@ -99,6 +99,20 @@ impl<F: SegmentFs + Clone> Log<F> {
         self.seal_frame();
     }
 
+    /// One frame holding a checkpoint's begin marker; the marker's LSN.
+    fn begin_marker(&mut self, ckpt_id: u64) -> inf_log::Lsn {
+        let at = self.ring.stage(&MutationEffect::CkptBegin { ckpt_id }).expect("stage");
+        self.rotor.maintain(0).expect("maintain");
+        let slot = self.rotor.begin_frame(self.ring.pending_frame_len(), 0).expect("reserve");
+        let covered = slot.base().to_u64();
+        let lease = self.ring.seal(slot.first_record_lsn(), covered, slot.layout());
+        let frame = self.ring.leased_frame(&lease).to_vec();
+        self.rotor.commit_frame(slot, &frame).expect("commit");
+        let lsn = lease.lsn_of(at);
+        self.ring.release(lease);
+        lsn
+    }
+
     /// Seals and commits the records staged so far as one frame.
     fn seal_frame(&mut self) {
         self.rotor.maintain(0).expect("maintain");
@@ -672,6 +686,14 @@ struct Tally {
     removes: u64,
     renames: u64,
     lists: u64,
+    /// The units with no I/O of their own a step ran (the engine's unit
+    /// counters, apart from its charge), each at the RAM price.
+    ram_units: u64,
+}
+
+/// The RAM units counted between two readings of a cell's stats.
+fn units_since(now: inf_server::RecoverUnits, before: inf_server::RecoverUnits) -> u64 {
+    (now.ckpt_entries - before.ckpt_entries) + (now.ckpt_end_releases - before.ckpt_end_releases)
 }
 
 impl Tally {
@@ -686,18 +708,21 @@ impl Tally {
             removes: self.removes - before.removes,
             renames: self.renames - before.renames,
             lists: self.lists - before.lists,
+            ram_units: self.ram_units,
         }
     }
 
     /// The work at the `limits` prices: a reader byte and a tier byte one
     /// budget byte each, a settle read at the store's read price, a
-    /// barrier — a file's or a directory's — at the server's.
+    /// barrier — a file's or a directory's — at the server's, a RAM unit
+    /// at the store's probe price.
     fn priced(self) -> u64 {
         let barrier = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES;
         self.reader_bytes
             + self.tier_bytes_written * inf_server::limits::REPLAY_TIER_BYTE_CHARGE
             + self.tier_reads * inf_store::limits::SETTLE_READ_CHARGE_BYTES
             + (self.tier_syncs + self.dir_syncs) * barrier
+            + self.ram_units * inf_store::limits::RECOVER_PROBE_CHARGE_BYTES
     }
 }
 
@@ -953,22 +978,49 @@ fn replay_record_unit(record: u64) -> u64 {
 fn judged_boot(
     fs: &CountingFs,
     cfg: &DurableConfig,
-    mut ks: Keyspace,
+    ks: Keyspace,
     budget: u64,
     unit_of: &dyn Fn(inf_server::UnitPhase) -> u64,
 ) -> (Vec<String>, std::io::Result<inf_server::RecoverStats>, Keyspace) {
+    let (over, stats, ks, _) = judged_boot_logged(fs, cfg, ks, budget, unit_of);
+    (over, stats, ks)
+}
+
+/// One step's row of `RECOVERY_UNITS` and the RAM units it ran.
+#[derive(Copy, Clone, Debug)]
+struct StepUnits {
+    phase: inf_server::UnitPhase,
+    entries: u64,
+    releases: u64,
+}
+
+/// [`judged_boot`], with every step's row and RAM units.
+fn judged_boot_logged(
+    fs: &CountingFs,
+    cfg: &DurableConfig,
+    mut ks: Keyspace,
+    budget: u64,
+    unit_of: &dyn Fn(inf_server::UnitPhase) -> u64,
+) -> (Vec<String>, std::io::Result<inf_server::RecoverStats>, Keyspace, Vec<StepUnits>) {
     use inf_server::{RecoverPhase, UnitEntry};
     let mut recovery = Recovery::new(fs.clone(), CELL, cfg, anchor(), now());
-    let mut over = Vec::new();
+    let (mut over, mut log) = (Vec::new(), Vec::new());
     // Bound: every step makes progress (the zero-budget row).
     for step in 0u64.. {
-        let before = fs.tally();
+        let (before, units) = (fs.tally(), recovery.stats().units);
         let progress = match recovery.step(&mut ks, budget) {
             Ok(progress) => progress,
-            Err(err) => return (over, Err(err), ks),
+            Err(err) => return (over, Err(err), ks, log),
         };
-        let work = fs.tally().since(before);
+        let mut work = fs.tally().since(before);
+        let after = recovery.stats().units;
+        work.ram_units = units_since(after, units);
         let row = recovery.unit_row();
+        log.push(StepUnits {
+            phase: row.phase,
+            entries: after.ckpt_entries - units.ckpt_entries,
+            releases: after.ckpt_end_releases - units.ckpt_end_releases,
+        });
         let last_settle = row.phase == inf_server::UnitPhase::Settle
             && recovery.phase() == RecoverPhase::Complete;
         if row.budgeted && !last_settle {
@@ -989,7 +1041,7 @@ fn judged_boot(
         }
     }
     let (_rotor, stats, _seed) = recovery.finish();
-    (over, Ok(stats), ks)
+    (over, Ok(stats), ks, log)
 }
 
 /// The yields inside a unit a boot made (ADR-0174 A1.2's liveness
@@ -1527,4 +1579,342 @@ fn room_asks_count_across_suspensions_and_the_hostile_spec_boots() {
     assert!(stats.step.yields_in_demote_step > 0, "VACUOUS: no demote step suspended");
     let (served, _, _) = read_back(&fs, &cfg, &mut ks, &model);
     assert_model(&served, &model, "after the hostile spec");
+}
+
+/// A tiered checkpoint unit at size: a first life writes `keys` distinct
+/// 80-byte records through the live table and its flush pipeline at the
+/// smallest window, so all but about its last window are cold in
+/// manifested tier files; then a checkpoint — one section a class — whose
+/// ref section names every cold key, whose records section re-images every
+/// key with a new value (what a walk writes when every cold key is
+/// overwritten between its two passes, ADR-0174 R8's shape) and, with
+/// `blob_refs`, whose blob-reference section names an extent at every
+/// ref's address. Its images fill the window, so the boot demotes inside
+/// the records section and each sealed image settles against its key's ref
+/// (one settle read each), listing the ref for the end of the checkpoint's
+/// releases (R9). The MANIFEST names the checkpoint and the tier section
+/// over a log holding its begin marker.
+struct CkptUnit {
+    model: Model,
+    /// The refs the checkpoint holds: the first life's cold keys.
+    refs: u64,
+    /// The checkpoint's largest section, in block bytes.
+    section_bytes_max: u64,
+}
+
+fn write_ckpt_unit<F: SegmentFs + Clone>(
+    fs: &F,
+    cfg: &DurableConfig,
+    keys: u64,
+    blob_refs: bool,
+) -> CkptUnit {
+    use inf_log::ckpt::SyncIckWriter;
+    let mut log = Log::new(fs, cfg);
+    let begin = log.begin_marker(1);
+    drop(log);
+    make_durable(fs, cfg);
+    let shard = cfg.data_dir.join(format!("shard-{CELL}"));
+    let spec = TierSpec::for_budget(MEM_BUDGET);
+    let demote = spec.demotion_config();
+    let space = inf_store::AddressSpaceConfig {
+        reserve_bytes: demote.ring_reserve_bytes().expect("the ring"),
+        page_bytes: inf_alloc::REGION_PAGE_BYTES,
+        life_origin: inf_store::LogicalAddr::ZERO,
+    };
+    let hasher = inf_store::KeyHasher::default();
+    let mut table = TieredTable::new(space, demote, 4096, hasher).expect("the table");
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(CELL)).0;
+    let flush_cfg = inf_log::TierFlushConfig {
+        shard_dir: shard.join(format!("ns-{}", TIER_NS.0)),
+        cell: u32::from(CELL),
+        ns: TIER_NS,
+        mode: spec.tier_io_mode,
+        file_capacity: inf_log::TIER_FILE_CAPACITY_DEFAULT,
+        slice_bytes: spec.maintain_slice_bytes,
+        record_len_max: spec.record_len_max(),
+    };
+    let mut flush = inf_log::TierFlush::new(fs.clone(), flush_cfg, 0, &census);
+    let maintain = |table: &mut TieredTable, flush: &mut inf_log::TierFlush<F>| loop {
+        let sealed = table.seal_slice();
+        let flushed = table.flush_slice(flush).expect("flush slice");
+        let released = table.release_slice();
+        if sealed + released + flushed.appended_bytes + u64::from(flushed.gaps_crossed) == 0 {
+            break;
+        }
+    };
+    for i in 0..keys {
+        let (key, value) = (key(i), small_value(i, 0));
+        let hash = hasher.hash(&key);
+        let mut rounds = 0;
+        // Bound: the live writer parks until MAINTAIN frees the window.
+        while table.insert(&key, &value, hash).is_err() {
+            maintain(&mut table, &mut flush);
+            rounds += 1;
+            assert!(rounds < 64, "MAINTAIN frees the window");
+        }
+    }
+    maintain(&mut table, &mut flush);
+    let walk = table.begin_ckpt_walk(1).to_raw();
+    let mut refs: Vec<(u64, u64)> = Vec::new();
+    let mut cursor = 0u64;
+    // Bound: the walk's slices over the index.
+    loop {
+        cursor =
+            table.ckpt_walk_slice(cursor, 4096, |hash, at| refs.push((hash, at.to_raw())), |_| {});
+        if cursor == 0 {
+            break;
+        }
+    }
+    let ckpt = inf_log::CkptConfig { section_bytes: 32 << 20, ..cfg.ckpt };
+    let mut writer = SyncIckWriter::create_v3(
+        fs.clone(),
+        &shard.join("ckpt"),
+        &ckpt,
+        CELL,
+        1,
+        begin,
+        &[TIER_NS.0],
+    )
+    .expect("ick create");
+    for &(hash, at) in &refs {
+        writer.append_ref(TIER_NS.0, walk, hash, at).expect("ref");
+    }
+    let mut model = Model::new();
+    for i in 0..keys {
+        let (key, value) = (key(i), small_value(i, 1));
+        let image = inf_log::RecordView::StringPostImage { ns: TIER_NS, key: &key, value: &value };
+        writer.append(&image).expect("image");
+        model.insert(key, Some(value));
+    }
+    for file in table.live_set().files().to_vec() {
+        let (id, len, dead, exact) = (file.id, file.data_len, file.dead_bytes, file.byte_exact);
+        writer.append_live_set(TIER_NS.0, id, len, dead, exact).expect("live set");
+    }
+    if blob_refs {
+        let mut addrs: Vec<u64> = refs.iter().map(|&(_, at)| at).collect();
+        addrs.sort_unstable();
+        for (extent_id, at) in (1u64..).zip(addrs) {
+            writer.append_blob_ref(TIER_NS.0, at, extent_id, 4096).expect("blob ref");
+        }
+    }
+    writer.finish().expect("ick publish");
+    table.end_ckpt_walk();
+    let section = table.tier_manifest(TIER_NS.0, &flush);
+    let manifest = inf_log::Manifest {
+        ckpt_id: 1,
+        begin_lsn: begin,
+        segments: vec![begin.segment],
+        tiers: vec![section],
+        key_hash_id: hasher.identity(),
+    };
+    inf_log::write_manifest(fs, &shard, &manifest).expect("manifest");
+    let ick = shard.join("ckpt").join(inf_log::ckpt::ick_file_name(1));
+    CkptUnit { model, refs: refs.len() as u64, section_bytes_max: largest_section(fs, &ick) }
+}
+
+/// The largest section of the checkpoint at `ick`, in block bytes, by its
+/// reader.
+fn largest_section<F: SegmentFs>(fs: &F, ick: &std::path::Path) -> u64 {
+    use inf_log::ckpt::{IckReader, IckReaderConfig, IckStep};
+    let mut reader = IckReader::open(fs, ick, IckReaderConfig::default()).expect("open the ick");
+    let mut largest = 0u64;
+    // Bound: the checkpoint's sections.
+    loop {
+        let step = reader
+            .next_step_hybrid(|_| Ok::<(), ()>(()), |_| Ok(()), |_| Ok(()), |_| Ok(()), |_| Ok(()))
+            .expect("a section");
+        match step {
+            IckStep::Section { bytes } => largest = largest.max(bytes),
+            IckStep::Parked => panic!("a walk that consumes every item never parks"),
+            IckStep::Done(_) => return largest,
+        }
+    }
+}
+
+/// `U` for the checkpoint units: on the checkpoint row its largest section
+/// plus one record's unit; one listed address at the RAM price on the end
+/// of the checkpoint's; a frame's entry (the begin marker's) and one
+/// record's unit on the replay row; a record settled against its twin on
+/// the end settle's.
+fn ckpt_unit(section_bytes_max: u64) -> impl Fn(inf_server::UnitPhase) -> u64 {
+    let record = (TieredTable::RECORD_HEADER_LEN + key(0).len() + SMALL_VALUE_LEN) as u64;
+    move |phase| match phase {
+        inf_server::UnitPhase::Ick => section_bytes_max + replay_record_unit(record),
+        inf_server::UnitPhase::CkptEnd => inf_store::limits::RECOVER_PROBE_CHARGE_BYTES,
+        inf_server::UnitPhase::Replay => (64 << 10) + replay_record_unit(record),
+        inf_server::UnitPhase::Settle => record + inf_store::limits::SETTLE_READ_CHARGE_BYTES,
+        other => panic!("the checkpoint units judge no {other:?} step"),
+    }
+}
+
+/// One records section of 8.4 MiB of 80-byte images, each of a key the
+/// checkpoint also holds a ref for, loaded at a 256 KiB budget under the
+/// step judge (`U` the section's entry plus one record's unit): the
+/// section's demote steps settle every sealed image against its ref. Every
+/// judged step's work is within `B + U`, read before the engagement clause;
+/// the boot yields inside the section and inside its demote steps and
+/// recovers the model. Red where a section's walk never parks and its
+/// demote steps run to their end inside the step that enters it
+/// (`inf_canary_recover_section_whole`).
+#[test]
+fn a_records_section_of_rewrites_of_cold_keys_is_loaded_under_the_step_judge() {
+    const BUDGET: u64 = 256 << 10;
+    let fs = CountingFs::new();
+    let cfg = step_cfg();
+    let unit = write_ckpt_unit(&fs, &cfg, 105_000, false);
+    let (over, stats, mut ks) =
+        judged_boot(&fs, &cfg, tiered_keyspace(), BUDGET, &ckpt_unit(unit.section_bytes_max));
+    let stats = stats.expect("the checkpoint boots");
+    let replay = stats.tier_replay.counters;
+    eprintln!(
+        "records section {} bytes at {BUDGET}: {} steps over the judge, {} refs, {} demote \
+         steps, {} settle reads, {:?}, {:?}",
+        unit.section_bytes_max,
+        over.len(),
+        unit.refs,
+        replay.demote_steps,
+        replay.settle_reads,
+        stats.step,
+        stats.units
+    );
+    assert!(over.is_empty(), "JUDGE: {} steps over B + U: {:?}", over.len(), over.first());
+    assert!(stats.step.yields_in_section > 0, "VACUOUS: no yield in a section ({:?})", stats.step);
+    assert!(stats.step.yields_in_demote_step > 0, "VACUOUS: no demote step yielded");
+    assert!(replay.settle_reads > 10_000, "VACUOUS: {} settle reads", replay.settle_reads);
+    let (served, _, _) = read_back(&fs, &cfg, &mut ks, &unit.model);
+    assert_model(&served, &unit.model, "after the records section");
+}
+
+/// The entry sections and the end of the checkpoint at size, at a 256 KiB
+/// budget: a ref section and a blob-reference section of one entry per
+/// cold key, applied a batch a step at their price (an entry's bytes and
+/// the RAM unit price), and the end of the checkpoint's list of the refs
+/// the image load settled, released a batch a step at the RAM price, in
+/// settle order. Every judged step's work — its reader bytes, its I/O and
+/// its RAM units at their prices — is within `B + U`; the checkpoint's
+/// entries are all applied, the boot yields inside a section, and the list
+/// it walks is longer than one step buys; and no step applies or releases
+/// more than its budget buys at their price, plus one. Red where an entry
+/// section applies every entry in the step that enters it
+/// (`inf_canary_recover_section_whole`: `ENTRIES`) and where the end of the
+/// checkpoint's releases charge nothing (`inf_canary_recover_probe_uncharged`:
+/// `RELEASES`).
+#[test]
+fn entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge() {
+    const BUDGET: u64 = 256 << 10;
+    let fs = CountingFs::new();
+    let cfg = step_cfg();
+    let unit = write_ckpt_unit(&fs, &cfg, 105_000, true);
+    let (over, stats, mut ks, log) = judged_boot_logged(
+        &fs,
+        &cfg,
+        tiered_keyspace(),
+        BUDGET,
+        &ckpt_unit(unit.section_bytes_max),
+    );
+    let stats = stats.expect("the checkpoint boots");
+    let units = stats.units;
+    // Entries and releases a step within the price bound: what its budget
+    // buys at their price, plus one (a ref is 14 bytes, a blob-reference
+    // entry 22, each with the RAM unit price).
+    let price = inf_store::limits::RECOVER_PROBE_CHARGE_BYTES;
+    for (step, row) in log.iter().enumerate() {
+        assert!(
+            row.entries * (14 + price) <= BUDGET + 22 + price,
+            "ENTRIES: step {step} ({:?}) applied {} entries",
+            row.phase,
+            row.entries
+        );
+        assert!(
+            row.releases * price <= BUDGET + price,
+            "RELEASES: step {step} ({:?}) released {} listed addresses",
+            row.phase,
+            row.releases
+        );
+    }
+    eprintln!(
+        "entry sections at {BUDGET}: {} steps over the judge, {} refs, {units:?}, {:?}, {:?}",
+        over.len(),
+        unit.refs,
+        stats.step,
+        stats.tier_replay.counters
+    );
+    assert!(over.is_empty(), "JUDGE: {} steps over B + U: {:?}", over.len(), over.first());
+    assert!(unit.refs > 4 * BUDGET / 14, "VACUOUS: {} refs, one step's worth", unit.refs);
+    assert!(units.ckpt_entries >= 2 * unit.refs, "every ref and blob entry applied: {units:?}");
+    assert!(
+        units.ckpt_end_releases > BUDGET / inf_store::limits::RECOVER_PROBE_CHARGE_BYTES + 1,
+        "VACUOUS: {} listed addresses, one step's worth",
+        units.ckpt_end_releases
+    );
+    assert!(stats.step.yields_in_section > 0, "VACUOUS: no yield in a section ({:?})", stats.step);
+    let released = stats.tier_replay.counters.blob_releases;
+    assert!(released >= units.ckpt_end_releases, "each listed entry released: {released}");
+    let (served, _, _) = read_back(&fs, &cfg, &mut ks, &unit.model);
+    assert_model(&served, &unit.model, "after the entry sections");
+}
+
+/// Budget independence over the checkpoint: the same unit — a records
+/// section over the window of rewrites of cold keys, its refs, and a
+/// blob-reference entry at each ref — recovered at `u64::MAX` (the
+/// control, which never parks) and at 8 MiB, 256 KiB, 4 KiB, 1 and 0
+/// recovers the same table, tier files, served values, D6 counters (the
+/// blob references released among them) and record counts. Red where a
+/// resumed section walk passes a record that needs room
+/// (`inf_canary_recover_skip_on_resume`'s section arm).
+#[test]
+fn every_budget_recovers_the_checkpoint_of_the_unparked_boot() {
+    let cfg = step_cfg();
+    // Each boot recovers its own copy of the unit, written the same way: a
+    // boot's tier files are the next boot's dead-life files (D4).
+    let boot = |budget: u64| {
+        let fs = CountingFs::new();
+        let unit = write_ckpt_unit(&fs, &cfg, 60_000, true);
+        let state = recovered(&fs, &cfg, budget, &unit.model);
+        (unit.model, state)
+    };
+    let (model, control) = boot(u64::MAX);
+    assert_model(&control.served, &model, "the control boot");
+    assert!(control.counters.demote_steps > 0, "VACUOUS: {:?}", control.counters);
+    assert!(control.counters.blob_releases > 0, "VACUOUS: {:?}", control.counters);
+    for budget in [8 << 20, 256 << 10, 4 << 10, 1, 0] {
+        let (model, state) = boot(budget);
+        assert_model(&state.served, &model, &format!("BUDGET INDEPENDENCE at {budget}"));
+        assert_same(&state, &control, budget);
+    }
+}
+
+/// An index sidecar of more sections than one step's budget, at the tail
+/// of a checkpoint (the writer streams derived data last), loaded at a
+/// 1 MiB budget under the step judge: each sidecar section is applied whole
+/// and the step asks its budget after it, so every step's work is within
+/// its budget and one section, and the run takes about its bytes over the
+/// budget in steps. Red where a sidecar section is not asked after
+/// (`inf_canary_recover_section_whole`: the whole run in one step).
+#[cfg(feature = "doc")]
+#[test]
+fn a_run_of_index_sidecar_sections_yields_after_each_section() {
+    const BUDGET: u64 = 1 << 20;
+    let fs = CountingFs::new();
+    let cfg = cfg();
+    let mut log = LogBuilder::new(&fs.inner, &cfg);
+    let (_, lsns) = log.frame(&[MutationEffect::CkptBegin { ckpt_id: 1 }]);
+    drop(log);
+    publish_checkpoint(&fs.inner, &cfg, lsns[0], &[], 400_000);
+    let ick = cfg.data_dir.join(format!("shard-{CELL}/ckpt")).join(inf_log::ckpt::ick_file_name(1));
+    let (sections, sidecar_sections) = ick_sections(&fs.inner, &ick);
+    assert!(sidecar_sections >= 16, "VACUOUS: {sidecar_sections} sidecar sections");
+    let section_max = largest_section(&fs.inner, &ick);
+    let unit = move |phase| match phase {
+        inf_server::UnitPhase::Ick => section_max,
+        inf_server::UnitPhase::Replay => 64 << 10,
+        other => panic!("the sidecar unit judges no {other:?} step"),
+    };
+    let (over, stats, _ks) = judged_boot(&fs, &cfg, fresh_keyspace(), BUDGET, &unit);
+    let stats = stats.expect("the sidecar boots");
+    let steps = stats.step.steps;
+    eprintln!("sidecar run: {sidecar_sections} of {sections} sections, {steps} steps");
+    assert!(over.is_empty(), "JUDGE: {} steps over B + U: {:?}", over.len(), over.first());
+    let run = sidecar_sections * section_max;
+    assert!(steps > run / (BUDGET + section_max), "VACUOUS: {steps} steps for a {run}-byte run");
 }

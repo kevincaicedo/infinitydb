@@ -60,7 +60,7 @@ use std::path::PathBuf;
 
 use inf_foundation::time::Nanos;
 use inf_log::ckpt::{
-    IckReader, IckReaderConfig, IckStep, ick_file_name, parse_ick_file_name, read_ick_counts_probed,
+    IckReader, IckReaderConfig, ick_file_name, parse_ick_file_name, read_ick_counts_probed,
 };
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
@@ -74,6 +74,7 @@ use inf_store::{Keyspace, ReplayOutcome, WallAnchor};
 use crate::durable::DurableConfig;
 
 mod frame_walk;
+mod section_walk;
 use frame_walk::cursor::FrameCursor;
 use frame_walk::{WalkEnd, YieldKind};
 
@@ -277,16 +278,34 @@ pub struct RecoverStats {
     /// The budget asks the steps made, per cell (not in `INFO`): one per
     /// call of `StepBudget::spent` or `StepBudget::left`. At `u64::MAX`, on
     /// a unit that demotes nothing, the replay and checkpoint phases ask
-    /// once per frame and once per section they enter.
+    /// once per frame and once per section they enter (an index-sidecar
+    /// section's ask comes after it).
     pub budget_asks: u64,
+    /// The units of work with no I/O of their own the steps ran, per cell
+    /// (not in `INFO`).
+    pub units: RecoverUnits,
+}
+
+/// The recovery units a cell's steps ran that do no I/O of their own,
+/// counted by the engine as it does them and kept apart from the charge
+/// (ADR-0174 A1): what a step judge prices at their `limits` price. Per
+/// cell, as [`RecoverStats`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoverUnits {
+    /// Checkpoint entries applied: refs, live-set and blob-reference
+    /// entries (a tombstoned namespace's skipped ones are not).
+    pub ckpt_entries: u64,
+    /// Listed addresses the end of the checkpoint walked, each released or
+    /// found with no blob-reference entry (ADR-0174 R9).
+    pub ckpt_end_releases: u64,
 }
 
 /// The step facts of one cell's recovery (ADR-0174 A1.2), outside D6's
 /// zero set: the gauge of the largest work one step did — what it charged
 /// (the bytes its cursor passed and its priced boot work) plus the bytes of
-/// the frame it entered and parked in, in budget bytes, never time and never
-/// memory — and the liveness counters, the steps taken and the yields
-/// inside a unit by kind. A fitting boot moves `steps` and can move the
+/// the frame or section it entered and parked in, in budget bytes, never
+/// time and never memory — and the liveness counters, the steps taken and
+/// the yields inside a unit by kind. A fitting boot moves `steps` and can move the
 /// frame and section kinds; its demote-step kind reads zero.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct StepFacts {
@@ -405,6 +424,7 @@ impl StepBudget {
 pub enum UnitPhase {
     Start,
     Ick,
+    CkptEnd,
     Replay,
     Audit,
     Probe,
@@ -414,7 +434,7 @@ pub enum UnitPhase {
 }
 
 /// The phases [`RECOVERY_UNITS`] rows.
-pub const UNIT_PHASES: usize = 8;
+pub const UNIT_PHASES: usize = 9;
 
 impl UnitPhase {
     /// The phase's row in [`RECOVERY_UNITS`].
@@ -423,12 +443,13 @@ impl UnitPhase {
         match self {
             UnitPhase::Start => 0,
             UnitPhase::Ick => 1,
-            UnitPhase::Replay => 2,
-            UnitPhase::Audit => 3,
-            UnitPhase::Probe => 4,
-            UnitPhase::Finish => 5,
-            UnitPhase::Settle => 6,
-            UnitPhase::Complete => 7,
+            UnitPhase::CkptEnd => 2,
+            UnitPhase::Replay => 3,
+            UnitPhase::Audit => 4,
+            UnitPhase::Probe => 5,
+            UnitPhase::Finish => 6,
+            UnitPhase::Settle => 7,
+            UnitPhase::Complete => 8,
         }
     }
 }
@@ -470,7 +491,14 @@ pub const RECOVERY_UNITS: [RecoveryUnit; UNIT_PHASES] = [
         phase: UnitPhase::Ick,
         entry: UnitEntry::Section,
         budgeted: true,
-        unit: "one checkpoint section, its images' demote steps run whole",
+        unit: "one record with its settle reads, one checkpoint entry, one demote step's flush, \
+               or one index-sidecar section whole",
+    },
+    RecoveryUnit {
+        phase: UnitPhase::CkptEnd,
+        entry: UnitEntry::None,
+        budgeted: true,
+        unit: "one listed address the end of the checkpoint releases",
     },
     RecoveryUnit {
         phase: UnitPhase::Replay,
@@ -664,9 +692,19 @@ enum Phase<File: SegmentFile> {
     /// Dirs, MANIFEST, scan, floor checks, checkpoint open + presize —
     /// bounded by directory-entry counts, one step.
     Start,
-    /// Checkpoint sections streamed under the step budget.
+    /// Checkpoint sections streamed under the step budget, a step yielding
+    /// at the next record or entry once its charge reaches the budget, inside
+    /// a section the reader holds (ADR-0174 A1).
     Ick {
         reader: Box<IckReader<File>>,
+    },
+    /// The end of the checkpoint's releases (ADR-0174 R9), under the step
+    /// budget: `at` the next listed address of the machine at index `tier`
+    /// of the recovered tiered namespaces, whose lists closed with the
+    /// checkpoint, so an index into one names one address.
+    CkptEnd {
+        tier: usize,
+        at: usize,
     },
     /// Tail frames replayed under the step budget, one segment at a time,
     /// a step yielding at the next record once its charge reaches the
@@ -716,8 +754,8 @@ enum FramePos {
 
 /// Boot recovery as a resumable state machine (M2-S15). Construction is
 /// cheap; every I/O happens inside [`step`](Self::step), each call bounded
-/// by `budget_bytes` in charged work plus one unit and the frame it entered
-/// and parked in (ADR-0174 A1). The phases and their semantics are exactly
+/// by `budget_bytes` in charged work plus one unit and the frame or section
+/// it entered and parked in (ADR-0174 A1). The phases and their semantics are exactly
 /// [`open_cell_log`]'s documented pipeline — that function *is* this
 /// machine run to completion.
 pub struct Recovery<F: SegmentFs> {
@@ -812,8 +850,8 @@ pub struct Recovery<F: SegmentFs> {
     /// asks its budget — after a priced record, a demote step, a frame, a
     /// checkpoint section and a settle step — and charged to it there.
     step_charge: u64,
-    /// The bytes of the frame the current step entered and parked in, not
-    /// charged yet: the rest of the step's work (ADR-0174 A1.2).
+    /// The bytes of the frame or section the current step entered and parked
+    /// in, not charged yet: the rest of the step's work (ADR-0174 A1.2).
     step_parked_bytes: u64,
     /// The row of [`RECOVERY_UNITS`] the last step ran.
     last_unit: UnitPhase,
@@ -1019,7 +1057,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     pub fn phase(&self) -> RecoverPhase {
         match &self.phase {
             Phase::Start => RecoverPhase::Start,
-            Phase::Ick { .. } => RecoverPhase::Ckpt,
+            Phase::Ick { .. } | Phase::CkptEnd { .. } => RecoverPhase::Ckpt,
             Phase::Replay { .. } => RecoverPhase::Replay,
             Phase::Audit { .. } | Phase::Probe { .. } => RecoverPhase::Audit,
             // The end settle finishes replay's state: its time is the
@@ -1073,7 +1111,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     #[must_use]
     pub fn segments_progress(&self) -> (u64, u64) {
         let done = match &self.phase {
-            Phase::Start | Phase::Ick { .. } => 0,
+            Phase::Start | Phase::Ick { .. } | Phase::CkptEnd { .. } => 0,
             Phase::Replay { idx, .. } | Phase::Probe { idx } => *idx as u64,
             Phase::Audit { idx } => *idx as u64 + 1,
             Phase::Finish | Phase::Settle | Phase::Complete => self.segments.len() as u64,
@@ -1098,8 +1136,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     }
 
     /// The work the last [`step`](Self::step) did, in budget bytes
-    /// (ADR-0174 A1.2): what it charged plus the bytes of the frame it
-    /// entered and parked in. The step-facts gauge is the largest of these.
+    /// (ADR-0174 A1.2): what it charged plus the bytes of the frame or
+    /// section it entered and parked in. The step-facts gauge is the largest
+    /// of these.
     #[must_use]
     pub fn step_work_bytes(&self) -> u64 {
         self.step_work
@@ -1120,9 +1159,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     }
 
     /// Runs one bounded recovery step: at most `budget_bytes` of charged
-    /// work — the checkpoint and log bytes its cursor passed, boot I/O at
-    /// fixed prices — plus one unit and the frame it entered and parked in
-    /// (ADR-0174 A1), or one audit/GC unit. Returns
+    /// work — the checkpoint and log bytes its cursor passed, boot I/O and
+    /// RAM units at fixed prices — plus one unit and the frame or section it
+    /// entered and parked in (ADR-0174 A1), or one audit/GC unit. Returns
     /// [`RecoveryProgress::Complete`] when [`finish`](Self::finish) may be
     /// called.
     ///
@@ -1138,6 +1177,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         let progress = match core::mem::replace(&mut self.phase, Phase::Complete) {
             Phase::Start => self.step_start(ks),
             Phase::Ick { reader } => self.step_ick(ks, reader, budget_ref),
+            Phase::CkptEnd { tier, at } => self.step_ckpt_end(ks, tier, at, budget_ref),
             Phase::Replay { idx, reader } => self.step_replay(ks, idx, reader, budget_ref),
             Phase::Audit { idx } => self.step_audit(idx),
             // Replay is not over while a hole can still be lifted: the
@@ -1182,6 +1222,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         match &self.phase {
             Phase::Start => UnitPhase::Start,
             Phase::Ick { .. } => UnitPhase::Ick,
+            Phase::CkptEnd { .. } => UnitPhase::CkptEnd,
             Phase::Replay { .. } => UnitPhase::Replay,
             Phase::Audit { .. } => UnitPhase::Audit,
             Phase::Probe { .. } => UnitPhase::Probe,
@@ -1393,17 +1434,6 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             }
         }
         Ok(())
-    }
-
-    /// R9 at the end of the checkpoint, before the tail: every address a
-    /// boot settle chained during image load releases its blob reference,
-    /// now that the blob-reference sections have registered them.
-    fn end_of_checkpoint(&mut self, ks: &mut Keyspace) {
-        for tier in &mut self.recovering_tiers.tiers {
-            if let Some(table) = ks.tiered_store_mut(tier.ns) {
-                tier.replay.end_of_checkpoint(table);
-            }
-        }
     }
 
     /// Recovers every tiered namespace the catalog holds (ADR-0174 D4):
@@ -1701,183 +1731,6 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     pub(crate) fn take_recovered_tiers(&mut self) -> Vec<RecoveredTierNs<F>> {
         debug_assert!(self.recovering_tiers.tiers.is_empty(), "every boot machine handed over");
         std::mem::take(&mut self.recovered_tiers)
-    }
-
-    fn step_ick(
-        &mut self,
-        ks: &mut Keyspace,
-        mut reader: Box<IckReader<BootFile<F>>>,
-        budget: &mut StepBudget,
-    ) -> io::Result<RecoveryProgress> {
-        let manifest = self.manifest.as_ref().expect("ick phase");
-        let ick_path = self.ckpt_dir.join(ick_file_name(manifest.ckpt_id));
-        // Tiered section routing (M4-S26; ADR-0057 D3/D6): the per-ns
-        // manifested flushed watermark cross-checks every ref section.
-        let tier_flushed: Vec<(u32, u64)> =
-            manifest.tiers.iter().map(|t| (t.ns, t.flushed)).collect();
-        let flushed_of = |ns: u32| tier_flushed.iter().find(|(id, _)| *id == ns).map(|(_, f)| *f);
-        let (now, anchor) = (self.now, self.anchor);
-        // One mutable keyspace, four exclusive callbacks: the reader
-        // invokes exactly one at a time, which the borrow checker cannot
-        // see — a RefCell makes the exclusivity dynamic (single-threaded,
-        // non-reentrant by construction).
-        let ks = std::cell::RefCell::new(ks);
-        loop {
-            // ADR-0100 D6: a tiered section naming a tombstoned namespace
-            // is the residue of an acked DROP — skipped and counted (the
-            // m4-tiered DST found this class on the fix's first seed);
-            // an untombstoned unknown id stays the fail-stop below.
-            let dropped_sections = core::cell::Cell::new(0u64);
-            let tombstoned = |ns: u32| {
-                let skip = ks.borrow().ns_tombstoned(inf_log::NsId(ns));
-                if skip {
-                    dropped_sections.set(dropped_sections.get() + 1);
-                }
-                skip
-            };
-            let step = reader
-                .next_step_hybrid(
-                    // The replay seam (ADR-0174 D1): a tiered image enters
-                    // its namespace's boot machine, which demotes when the
-                    // window is full.
-                    // Until the section walk resumes inside a section, an
-                    // image that needs room runs its demote step whole, the
-                    // section staying the unit, as it is today.
-                    |record| {
-                        let mut ks = ks.borrow_mut();
-                        let spill = &mut self.recovering_tiers;
-                        inf_store::drive_record(&mut ks, &record, now, anchor, spill, u64::MAX)
-                            .map(|_| ())
-                            .map_err(io_invalid)
-                    },
-                    |refs| {
-                        if tombstoned(refs.ns) {
-                            return Ok(());
-                        }
-                        let flushed = flushed_of(refs.ns).ok_or_else(|| {
-                            io_msg(format!("ref section for unmanifested tier ns {}", refs.ns))
-                        })?;
-                        let mut ks = ks.borrow_mut();
-                        let table =
-                            ks.tiered_store_mut(inf_log::NsId(refs.ns)).ok_or_else(|| {
-                                io_msg(format!("ref section for unknown tier ns {}", refs.ns))
-                            })?;
-                        inf_store::apply_ref_section(table, &refs, flushed)
-                    },
-                    |live| {
-                        if tombstoned(live.ns) {
-                            return Ok(());
-                        }
-                        let mut ks = ks.borrow_mut();
-                        let table =
-                            ks.tiered_store_mut(inf_log::NsId(live.ns)).ok_or_else(|| {
-                                io_msg(format!("live-set section for unknown ns {}", live.ns))
-                            })?;
-                        inf_store::apply_live_set_section(table, &live);
-                        Ok(())
-                    },
-                    |blob| {
-                        if tombstoned(blob.ns) {
-                            return Ok(());
-                        }
-                        let mut ks = ks.borrow_mut();
-                        let table =
-                            ks.tiered_store_mut(inf_log::NsId(blob.ns)).ok_or_else(|| {
-                                io_msg(format!("blob-ref section for unknown ns {}", blob.ns))
-                            })?;
-                        inf_store::apply_blob_ref_section(table, &blob);
-                        Ok(())
-                    },
-                    // Index sidecars (M4.5-S06, ADR-0078 D4/D6): every
-                    // verdict is a loader-state transition — body damage
-                    // is counted and the read continues; a boot is never
-                    // refused past the file's framing audit.
-                    |step| {
-                        #[cfg(feature = "doc")]
-                        {
-                            let sidecar =
-                                self.sidecar.as_mut().expect("loader present until the audit");
-                            match step {
-                                inf_log::IckIdxSidecarStep::Section(section) => {
-                                    let mut guard = ks.borrow_mut();
-                                    sidecar.apply_section(&mut guard, &section);
-                                }
-                                inf_log::IckIdxSidecarStep::Damaged { at } => {
-                                    eprintln!(
-                                        "cell {}: damaged index-sidecar section at offset {at} — \
-                                         unattributed; affected streams resolve as incomplete \
-                                         (ADR-0078 D4)",
-                                        self.cell
-                                    );
-                                    sidecar.note_damaged();
-                                }
-                            }
-                            Ok(())
-                        }
-                        // A slim build refuses index-bearing catalogs at
-                        // seed (ADR-0075 D2.5), so this arm is typed,
-                        // never reached on a healthy node.
-                        #[cfg(not(feature = "doc"))]
-                        {
-                            let at = match step {
-                                inf_log::IckIdxSidecarStep::Section(ref s) => u64::from(s.ns),
-                                inf_log::IckIdxSidecarStep::Damaged { at } => at,
-                            };
-                            Err(io_msg(format!(
-                                "index-sidecar section (near {at}) but this build carries no \
-                                 document support"
-                            )))
-                        }
-                    },
-                )
-                .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
-            self.stats.dropped_sections_skipped += dropped_sections.get();
-            match step {
-                IckStep::Section { bytes } => {
-                    self.ick_credited += bytes;
-                    self.bytes_done += bytes;
-                    self.bytes_consumed += bytes;
-                    // The section's bytes and its boot I/O are the step's
-                    // charge (ADR-0174 R10's step budget): it yields at the
-                    // next section, which stays one unit until the section
-                    // walk resumes inside one; one ask a section.
-                    budget.charge(bytes);
-                    self.drain_into(budget);
-                    if budget.spent() {
-                        self.phase = Phase::Ick { reader };
-                        return Ok(RecoveryProgress::Working);
-                    }
-                }
-                // A walk that consumes every item never parks; were one to,
-                // the next step resumes the section the reader holds.
-                IckStep::Parked => {
-                    self.phase = Phase::Ick { reader };
-                    return Ok(RecoveryProgress::Working);
-                }
-                IckStep::Done(summary) => {
-                    self.stats.ckpt_records = summary.records;
-                    // ADR-0174 R9: the end of the checkpoint, before the tail.
-                    self.end_of_checkpoint(&mut ks.borrow_mut());
-                    self.drain_boot_io();
-                    // Sidecar streams close with the checkpoint: open
-                    // ones discard as incomplete, and `CatchUp` arms on
-                    // every loaded namespace *before* the first tail
-                    // record applies (ADR-0078 D6).
-                    #[cfg(feature = "doc")]
-                    if let Some(sidecar) = self.sidecar.as_mut() {
-                        let mut guard = ks.borrow_mut();
-                        sidecar.finish_load(&mut guard);
-                    }
-                    // Header + footer bytes complete the file's credit.
-                    let rest = reader.file_size().saturating_sub(self.ick_credited);
-                    self.bytes_done += rest;
-                    self.bytes_consumed += rest;
-                    self.stats.phases.ckpt_bytes = self.bytes_consumed;
-                    self.phase = Phase::Replay { idx: 0, reader: ReplayReader::Unopened };
-                    return Ok(RecoveryProgress::Working);
-                }
-            }
-        }
     }
 
     fn step_replay(
