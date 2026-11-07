@@ -805,9 +805,16 @@ impl<F: SegmentFs> TierReplay<F> {
                 return Err(ReplayRefusal::OriginRoom { winner, cold });
             }
             // A ref settled while the checkpoint loads precedes the 0x05
-            // entry that would release its blob reference (R9's list).
+            // entry that would release its blob reference (R9's list). The
+            // list names each address once: a settle collects only a slotted
+            // pair and removes it, and no later ref slots it again (R2) — one
+            // probe of the index, not a walk of the list.
             if let (SettleCase::RefAtBoot, ReleaseList::Loading(list)) = (case, &mut self.releases)
             {
+                debug_assert!(
+                    !table.index.contains_pair(hash, cold),
+                    "a listed ref left the index"
+                );
                 list.push(cold.to_raw());
             }
             self.counters.settled_same_key += 1;
