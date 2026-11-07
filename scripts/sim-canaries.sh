@@ -391,6 +391,10 @@ rows=(
   # (ADR-0154 D3). Planted, it falls due 2 ms past the window, and the
   # oracle reads each retry past its bound.
   "inf_canary_accept_retry_late m0-smoke accept-retry-late --plant accept-broken"
+  # The oracle judges each park against its own deadline, so a retry one
+  # rounding millisecond early is red as well: the timer set's due test
+  # planted a millisecond early (the model's row above), on this leg.
+  "inf_canary_timer_fires_early m0-smoke accept-retry-early --plant accept-broken"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.
