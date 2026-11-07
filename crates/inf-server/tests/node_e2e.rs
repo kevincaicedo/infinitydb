@@ -10718,6 +10718,7 @@ fn a_checkpoint_inside_a_rolled_back_create_wait_keeps_every_acked_key() {
 #[test]
 fn a_cut_inside_a_rolled_back_create_wait_keeps_every_acked_key() {
     rollback_wait_scenario(false, "rw-cut");
+    receipt::verified("ns_create_leg_held", "rolled-back-create-keeps-acked-writes");
 }
 
 // ---- every exit after the catalog writer's answer posts its notice ----

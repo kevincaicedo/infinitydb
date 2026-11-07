@@ -18,6 +18,9 @@
 //! word's samples after every step, and the operations a recording file
 //! system saw (`META.new` is created only to be renamed onto `META`).
 
+#[path = "../../../tests/crash-matrix/receipt.rs"]
+mod receipt;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -273,6 +276,7 @@ fn two_senders(ddl: Ddl, tag: &str) {
 #[test]
 fn a_create_held_before_its_send_is_answered_after_its_own_meta() {
     two_senders(Ddl::Create, "create");
+    receipt::verified("ddl_request_held", "answered-after-own-meta");
 }
 
 /// The same for a `DROP`: its answer must follow a `META` without the
