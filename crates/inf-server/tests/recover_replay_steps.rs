@@ -14,8 +14,8 @@ use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::tier::{parse_tier_file_name, probe_tier_file};
 use inf_log::{
-    MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingRing, TIER_FRAME_BYTES,
-    create_cell_dirs, tier_extract, tier_frame_offset, tier_frame_span,
+    MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingRing, TIER_FOOTER_BYTES,
+    TIER_FRAME_BYTES, create_cell_dirs, tier_extract, tier_frame_offset, tier_frame_span,
 };
 use inf_server::{DurableConfig, Recovery, RecoveryProgress};
 use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, TierSpec, TieredLookup, TieredTable};
@@ -355,10 +355,11 @@ fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
 /// - an end-settle step that yields charged its budget, by at most one
 ///   record and its twins' reads, and the last one stays within its budget
 ///   and the same unit: the hand-over is a phase of its own;
-/// - a hand-over step's boot I/O stays within its budget and one unit, a
-///   rebuild's settle read or the drain's seal of the active file (one
-///   barrier). The drain appends nothing: every demote step appends up to
-///   its cut, and the end settle seals nothing (`ro` does not move), which
+/// - a hand-over step's boot I/O stays within its budget and one hand-over
+///   unit ([`hand_over_unit`]): a rebuild's probe group and settle read
+///   where the step's filesystem saw no barrier, the drain's seal of the
+///   active file where it saw one. The drain appends nothing: every demote step appends up to its
+///   cut, and the end settle seals nothing (`ro` does not move), which
 ///   `TierReplay::hand_over` asserts;
 /// - the end settle walks its open span `[ro, tail)` at one budget byte a
 ///   byte and a step charges at most its budget and one record's unit, so
@@ -400,14 +401,13 @@ fn step_under_budget(budget: u64) -> Vec<String> {
     let page = inf_alloc::REGION_PAGE_BYTES as u64;
     let lead = 1u64 << 20; // `MAINTAIN-SLICE` at this budget, a whole page
     let record = (TieredTable::RECORD_HEADER_LEN + key(0).len() + VALUE_LEN) as u64;
-    let fs = MemFs::new();
+    let fs = CountingFs::new();
     let cfg = step_cfg();
     let unit = write_unit(&fs, &cfg, 4);
     // One record's unit, with the frame entry a step may park in.
     let flush_unit = lead + page + 2 * record + 2 * barrier;
     let record_unit = FRAME_BYTES_MAX + flush_unit.max(record + read_price);
     let settle_unit = record + 4 * read_price;
-    let hand_over_unit = barrier.max(read_price);
 
     let mut ks = tiered_keyspace();
     let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
@@ -418,10 +418,12 @@ fn step_under_budget(budget: u64) -> Vec<String> {
         let segments_before = recovery.segments_progress().0;
         let consumed_before = recovery.bytes_consumed();
         let tier_before = tier_bytes_on_disk(&fs, &cfg);
+        let tally_before = fs.tally();
         let progress = recovery.step(&mut ks, budget).expect("a step");
         if progress == RecoveryProgress::Complete {
             break;
         }
+        let barriers = fs.tally().since(tally_before).barriers();
         let read = recovery.bytes_consumed() - consumed_before;
         let charge = recovery.step_charge_bytes();
         let applied = recovery.stats().records_applied;
@@ -464,7 +466,7 @@ fn step_under_budget(budget: u64) -> Vec<String> {
                 assert!(charge < bound, "{violation}: a step charged {charge}, over {bound}");
             }
             UnitPhase::HandOver => {
-                let bound = budget + hand_over_unit;
+                let bound = budget + hand_over_unit(barriers);
                 assert!(
                     charge <= bound,
                     "{at}: a hand-over step's boot I/O of {charge} passes its budget and one \
@@ -734,6 +736,11 @@ impl Tally {
         }
     }
 
+    /// The barriers the filesystem saw, a file's or a directory's.
+    fn barriers(self) -> u64 {
+        self.tier_syncs + self.dir_syncs
+    }
+
     /// The work at the `limits` prices: a reader byte and a tier byte one
     /// budget byte each, a settle read at the store's read price, a
     /// barrier — a file's or a directory's — at the server's, a rename at
@@ -744,7 +751,7 @@ impl Tally {
         self.reader_bytes
             + self.tier_bytes_written * inf_server::limits::REPLAY_TIER_BYTE_CHARGE
             + self.tier_reads * inf_store::limits::SETTLE_READ_CHARGE_BYTES
-            + (self.tier_syncs + self.dir_syncs) * barrier
+            + self.barriers() * barrier
             + self.renames * inf_server::limits::BOOT_FILE_OP_CHARGE_BYTES
             + self.ram_units * inf_store::limits::RECOVER_PROBE_CHARGE_BYTES
             + self.group_units * inf_store::limits::REBUILD_GROUP_CHARGE_BYTES
@@ -994,13 +1001,15 @@ fn replay_record_unit(record: u64) -> u64 {
 /// A boot judged step by step: for every step of a budgeted row
 /// of `RECOVERY_UNITS` (`Recovery::unit_row`), its observed work — priced
 /// from the counting filesystem — is at most the budget, the row's unit `U`
-/// from `unit_of` (computed by the test, never by the engine) and the
-/// reader's one read chunk on a frame row; and its work gauge reads within
-/// what the step did ([`gauge_over`]). The end settle's last step is judged
-/// as every settle step is, at one unit: the hand-over and the resume are
-/// steps of their own. Returns the steps over the bound, the recovery's
-/// stats and the recovered keyspace; a step that refuses is the caller's
-/// `Err`.
+/// and the reader's one read chunk on a frame row; and its work gauge reads
+/// within what the step did ([`gauge_over`]). `U` is computed by the test,
+/// never by the engine: `unit_of` names it for every row but the
+/// hand-over's, whose units are the `limits` prices alone and whose `U`
+/// follows from the barriers the step's filesystem saw
+/// ([`hand_over_unit`]). The end settle's last step is judged as every
+/// settle step is, at one unit: the hand-over and the resume are steps of
+/// their own. Returns the steps over the bound, the recovery's stats and
+/// the recovered keyspace; a step that refuses is the caller's `Err`.
 fn judged_boot(
     fs: &CountingFs,
     cfg: &DurableConfig,
@@ -1060,7 +1069,10 @@ fn judged_boot_logged(
         if row.budgeted {
             let chunk =
                 if row.entry == UnitEntry::Frame { inf_log::DEFAULT_READ_CHUNK as u64 } else { 0 };
-            let unit = unit_of(row.phase);
+            let unit = match row.phase {
+                inf_server::UnitPhase::HandOver => hand_over_unit(work.barriers()),
+                phase => unit_of(phase),
+            };
             let bound = budget.saturating_add(unit).saturating_add(chunk);
             if work.priced() > bound {
                 over.push(format!(
@@ -1181,35 +1193,45 @@ fn engagement(stats: &inf_server::RecoverStats) -> Result<u64, String> {
     Ok(yields)
 }
 
-/// `U` of a hand-over step, from the `limits` and never from the engine:
-/// the largest of a parked death stamped or an extent id seeded (the RAM
-/// unit price), a revive rename (the file-operation price), a probe group
-/// the rebuild scans (its bytes), a slot it returns (its settle read), and
-/// one machine's hand-over — its drain's seal of the active file, a barrier,
-/// with the footer block it writes.
-fn hand_over_unit() -> u64 {
-    let seal = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES + (64 << 10);
-    [
-        inf_store::limits::RECOVER_PROBE_CHARGE_BYTES,
-        inf_server::limits::BOOT_FILE_OP_CHARGE_BYTES,
-        inf_store::limits::REBUILD_GROUP_CHARGE_BYTES,
-        inf_store::limits::SETTLE_READ_CHARGE_BYTES,
-        seal,
-    ]
-    .into_iter()
-    .max()
-    .expect("five units")
+/// The tier bytes a seal writes beside its barrier, at the tier byte price:
+/// the file's partial last frame, rewritten in place, and its footer block
+/// (the tier file format's sizes).
+const SEAL_TIER_BYTES: u64 =
+    (TIER_FRAME_BYTES + TIER_FOOTER_BYTES) as u64 * inf_server::limits::REPLAY_TIER_BYTE_CHARGE;
+
+/// `U` of a hand-over step whose filesystem saw `barriers` barriers, from
+/// the `limits` and the tier file format, never from the engine. A step
+/// asks its budget before every batch, and a batch runs what the budget
+/// left buys at its unit's price, at least one unit, so the step passes its
+/// budget by at most the batch that crosses it: a parked death stamped or an
+/// extent id seeded (the RAM unit price), a revive rename (the
+/// file-operation price), or the probe group the rebuild scans with the slot
+/// it hands back there (its bytes and one settle read). Only a machine's
+/// seal makes a barrier: a step that saw one may cross at the seal, priced
+/// at its barrier, and each seal it ran also wrote [`SEAL_TIER_BYTES`] that
+/// its barrier's price stands for. A step that saw none is judged at the
+/// largest of the other units alone.
+fn hand_over_unit(barriers: u64) -> u64 {
+    use inf_store::limits::{
+        REBUILD_GROUP_CHARGE_BYTES, RECOVER_PROBE_CHARGE_BYTES, SETTLE_READ_CHARGE_BYTES,
+    };
+    let rename = inf_server::limits::BOOT_FILE_OP_CHARGE_BYTES;
+    let returned_slot = REBUILD_GROUP_CHARGE_BYTES + SETTLE_READ_CHARGE_BYTES;
+    let unsealed = RECOVER_PROBE_CHARGE_BYTES.max(rename).max(returned_slot);
+    if barriers == 0 {
+        return unsealed;
+    }
+    let seal = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES;
+    unsealed.max(seal) + barriers * SEAL_TIER_BYTES
 }
 
 /// `U` for the hostile units: a frame's entry plus one record's unit on the
-/// replay row, a record settled against its twin on the end settle's, one
-/// hand-over unit on the hand-over's.
+/// replay row and a record settled against its twin on the end settle's.
 fn hostile_unit(frame_entry: u64) -> impl Fn(inf_server::UnitPhase) -> u64 {
     let record = (TieredTable::RECORD_HEADER_LEN + key(0).len() + SMALL_VALUE_LEN) as u64;
     move |phase| match phase {
         inf_server::UnitPhase::Replay => frame_entry + replay_record_unit(record),
         inf_server::UnitPhase::Settle => record + inf_store::limits::SETTLE_READ_CHARGE_BYTES,
-        inf_server::UnitPhase::HandOver => hand_over_unit(),
         other => panic!("the hostile units judge no {other:?} step"),
     }
 }
@@ -1950,7 +1972,7 @@ fn largest_section<F: SegmentFs>(fs: &F, ick: &std::path::Path) -> u64 {
 /// plus one record's unit; one listed address at the RAM price on the end
 /// of the checkpoint's; a frame's entry (the begin marker's) and one
 /// record's unit on the replay row; a record settled against its twin on
-/// the end settle's; one hand-over unit on the hand-over's.
+/// the end settle's.
 fn ckpt_unit(section_bytes_max: u64) -> impl Fn(inf_server::UnitPhase) -> u64 {
     let record = (TieredTable::RECORD_HEADER_LEN + key(0).len() + SMALL_VALUE_LEN) as u64;
     move |phase| match phase {
@@ -1958,7 +1980,6 @@ fn ckpt_unit(section_bytes_max: u64) -> impl Fn(inf_server::UnitPhase) -> u64 {
         inf_server::UnitPhase::CkptEnd => inf_store::limits::RECOVER_PROBE_CHARGE_BYTES,
         inf_server::UnitPhase::Replay => (64 << 10) + replay_record_unit(record),
         inf_server::UnitPhase::Settle => record + inf_store::limits::SETTLE_READ_CHARGE_BYTES,
-        inf_server::UnitPhase::HandOver => hand_over_unit(),
         other => panic!("the checkpoint units judge no {other:?} step"),
     }
 }
@@ -2145,7 +2166,7 @@ fn a_run_of_index_sidecar_sections_yields_after_each_section() {
     let unit = move |phase| match phase {
         inf_server::UnitPhase::Ick => section_max,
         inf_server::UnitPhase::Replay => 64 << 10,
-        inf_server::UnitPhase::Settle | inf_server::UnitPhase::HandOver => 0,
+        inf_server::UnitPhase::Settle => 0,
         other => panic!("the sidecar unit judges no {other:?} step"),
     };
     let (over, stats, _ks) = judged_boot(&fs, &cfg, fresh_keyspace(), BUDGET, &unit);
@@ -2261,15 +2282,13 @@ fn write_end_unit<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig) -> EndUnit 
 
 /// `U` for the end unit: a frame's entry and one record's unit on the
 /// replay row, the checkpoint's largest section and one record's unit on its
-/// row, a record settled against its twin on the end settle's, one hand-over
-/// unit on the hand-over's.
+/// row, a record settled against its twin on the end settle's.
 fn end_unit_of(section_bytes_max: u64) -> impl Fn(inf_server::UnitPhase) -> u64 {
     let record = (TieredTable::RECORD_HEADER_LEN + key(0).len() + SMALL_VALUE_LEN) as u64;
     move |phase| match phase {
         inf_server::UnitPhase::Replay => FRAME_BYTES_MAX + replay_record_unit(record),
         inf_server::UnitPhase::Ick => section_bytes_max + replay_record_unit(record),
         inf_server::UnitPhase::Settle => record + inf_store::limits::SETTLE_READ_CHARGE_BYTES,
-        inf_server::UnitPhase::HandOver => hand_over_unit(),
         other => panic!("the end unit judges no {other:?} step"),
     }
 }
