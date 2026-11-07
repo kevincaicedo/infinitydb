@@ -26,8 +26,8 @@ use inf_store::limits::{REBUILD_GROUP_CHARGE_BYTES, RECOVER_PROBE_CHARGE_BYTES};
 use inf_store::{Keyspace, RebuildStep, ShadowRebuild, TieredTable};
 
 use super::{
-    Phase, RecoverStats, RecoveredTierNs, RecoveringTierNs, Recovery, RecoveryProgress, StepBudget,
-    boot_io_charge, io_invalid, io_msg, replay_refused,
+    BootFile, Phase, RecoverStats, RecoveredTierNs, RecoveringTierNs, Recovery, RecoveryProgress,
+    StepBudget, boot_io_charge, io_invalid, io_msg, replay_refused,
 };
 use crate::limits::BOOT_FILE_OP_CHARGE_BYTES;
 
@@ -83,12 +83,18 @@ fn count_units(counter: &mut u64, count: usize) {
 
 impl<F: SegmentFs + Clone> Recovery<F> {
     /// Replay has ended: the machines leave the replay seam for the
-    /// hand-over, the next one last.
-    pub(super) fn begin_hand_over(&mut self) {
+    /// hand-over, the next one last. Answers the phase that follows: the
+    /// hand-over, or with no machine the resume `then` names.
+    pub(super) fn begin_hand_over(&mut self, then: ResumeFrom) -> Phase<BootFile<F>> {
         debug_assert!(self.recovering_tiers.lent.is_empty(), "every lent machine drained");
         let mut machines = std::mem::take(&mut self.recovering_tiers.tiers);
         machines.reverse();
         self.handing_over = machines;
+        if self.handing_over.is_empty() {
+            Phase::Resume { from: then }
+        } else {
+            Phase::HandOver { stage: HandOverStage::Stamp, then }
+        }
     }
 
     /// One hand-over step: units of the next machine's stage under

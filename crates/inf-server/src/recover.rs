@@ -1444,10 +1444,14 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             // namespaces still recover through the empty section (ADR-0174
             // D4: a dead life's tier files go before any flush) and hand
             // their machines over, under the step budget, before its first
-            // segment is created.
+            // segment is created; with none to hand over, it is created now.
             self.recover_tiers(ks, None)?;
-            self.begin_hand_over();
-            Phase::HandOver { stage: HandOverStage::Stamp, then: ResumeFrom::FreshCell }
+            if self.recovering_tiers.tiers.is_empty() {
+                self.scan = Some(scan);
+                self.step_resume(ks, ResumeFrom::FreshCell)?;
+                return Ok(RecoveryProgress::Complete);
+            }
+            self.begin_hand_over(ResumeFrom::FreshCell)
         } else {
             // No MANIFEST: the whole retained log replays, into tiered
             // namespaces recovered through the empty section (D4).
@@ -1673,8 +1677,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 return Ok(());
             }
         }
-        self.begin_hand_over();
-        self.phase = Phase::HandOver { stage: HandOverStage::Stamp, then: ResumeFrom::Log };
+        self.phase = self.begin_hand_over(ResumeFrom::Log);
         Ok(())
     }
 

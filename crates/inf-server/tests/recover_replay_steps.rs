@@ -2380,3 +2380,52 @@ fn every_budget_recovers_the_end_of_the_unparked_boot() {
         assert_same(&state, &control, budget);
     }
 }
+
+/// A fresh cell — no log, no MANIFEST — hands its tiered machines over under
+/// the step budget before it creates its first segment: a namespace whose
+/// directory lists 64 orphan extents seeds them at a 256-byte budget, four
+/// a step at the RAM unit price, in steps of the hand-over row, then the
+/// resume; every orphan is queued, in the listing's order. A fresh cell with
+/// no tiered namespace has nothing to hand over and completes in its first
+/// step.
+#[test]
+fn a_fresh_cell_hands_its_tiered_machines_over_under_the_step_budget() {
+    const BUDGET: u64 = 256;
+    let cfg = step_cfg();
+    let fs = MemFs::new();
+    let cold = cold_dir(&cfg);
+    fs.create_dir_all(&cold).expect("the namespace's directory");
+    for id in 1..=64u64 {
+        let name = inf_log::extent_file_name(inf_log::ExtentId(id));
+        let mut file = fs.create_meta(&cold.join(name)).expect("an orphan");
+        file.write_at(0, b"extent").expect("its bytes");
+    }
+    let mut ks = tiered_keyspace();
+    let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
+    let mut hand_over_steps = 0u64;
+    // Bound: a step a unit batch, 64 seeds at four a step.
+    for _ in 0..1_000 {
+        let progress = recovery.step(&mut ks, BUDGET).expect("a fresh cell's step");
+        if recovery.unit_row().phase == inf_server::UnitPhase::HandOver {
+            hand_over_steps += 1;
+        }
+        if progress == RecoveryProgress::Complete {
+            break;
+        }
+    }
+    let (_rotor, stats, _seed) = recovery.finish();
+    let seeded = stats.units.sweep_seeded;
+    eprintln!("fresh cell at {BUDGET}: {hand_over_steps} hand-over steps, {:?}", stats.units);
+    assert_eq!(seeded, 64, "every listed orphan seeded once");
+    let price = inf_store::limits::RECOVER_PROBE_CHARGE_BYTES;
+    assert!(hand_over_steps >= 64 / (BUDGET / price), "{hand_over_steps} hand-over steps");
+    let table = ks.tiered_store_mut(TIER_NS).expect("tiered");
+    let queue = table.extent_reclaim_work(u64::MAX, usize::MAX);
+    let order: Vec<u64> = queue.iter().map(|candidate| candidate.extent_id).collect();
+    assert_eq!(order, (1..=64).collect::<Vec<u64>>(), "the orphans, in the listing's order");
+
+    let mut ks = fresh_keyspace();
+    let mut recovery = Recovery::new(MemFs::new(), CELL, &cfg, anchor(), now());
+    let first = recovery.step(&mut ks, BUDGET).expect("a fresh memory cell's step");
+    assert_eq!(first, RecoveryProgress::Complete, "nothing to hand over: one step");
+}
