@@ -189,7 +189,16 @@ impl<F: SegmentFs + Clone> IckWalker<'_, F> {
                 ns.0
             )));
         };
-        let progress = machine.demote_step(table, left).map_err(|refusal| refused(ns, &refusal))?;
+        // The planted canary runs the demote step whole inside the section.
+        let progress = if cfg!(inf_canary_recover_section_whole) {
+            // Bound: each call walks a record at least, or completes.
+            while machine.demote_step(table, u64::MAX).map_err(|r| refused(ns, &r))?
+                == DemoteProgress::More
+            {}
+            DemoteProgress::Room
+        } else {
+            machine.demote_step(table, left).map_err(|refusal| refused(ns, &refusal))?
+        };
         self.rec.drain_into(self.budget);
         Ok(progress)
     }
@@ -217,8 +226,9 @@ impl<F: SegmentFs + Clone> IckWalk<io::Error> for IckWalker<'_, F> {
             resumed: entry.resumed,
         };
         // An index-sidecar section is applied whole and asked after; every
-        // other walk asks once, at its start.
-        if entry.kind != IckSectionKind::IdxSidecar {
+        // other walk asks once, at its start. The planted canary walks every
+        // section whole.
+        if entry.kind != IckSectionKind::IdxSidecar && !cfg!(inf_canary_recover_section_whole) {
             walk.metered = walk.unpaid() >= self.budget.left();
         }
         self.walk = walk;
@@ -248,12 +258,20 @@ impl<F: SegmentFs + Clone> IckWalk<io::Error> for IckWalker<'_, F> {
                     self.meter();
                 }
                 Replayed::NeedsRoom(ns) => {
+                    // The planted canary passes, on a resumed walk, a record
+                    // that needs room.
+                    if cfg!(inf_canary_recover_skip_on_resume) && self.walk.resumed {
+                        self.pass(u64::from(bytes));
+                        return Ok(SectionFlow::Next);
+                    }
                     match self.make_room(ns)? {
                         DemoteProgress::More => {
                             self.stop = Some(Stop::DemoteStep);
                             return Ok(SectionFlow::Park);
                         }
-                        DemoteProgress::Room if self.budget.spent() => {
+                        DemoteProgress::Room
+                            if !cfg!(inf_canary_recover_section_whole) && self.budget.spent() =>
+                        {
                             self.stop = Some(Stop::Section);
                             return Ok(SectionFlow::Park);
                         }
@@ -389,7 +407,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     // metered one — and its boot I/O.
                     budget.charge(walk.unpaid());
                     self.drain_into(budget);
-                    let sidecar = walk.kind == IckSectionKind::IdxSidecar;
+                    // The planted canary asks nothing after a sidecar section.
+                    let sidecar = walk.kind == IckSectionKind::IdxSidecar
+                        && !cfg!(inf_canary_recover_section_whole);
                     if (walk.metered || sidecar) && budget.spent() {
                         self.phase = Phase::Ick { reader };
                         return Ok(RecoveryProgress::Working);
@@ -485,7 +505,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             let count = u64::try_from(walked).unwrap_or(u64::MAX);
             let units = &mut self.stats.units.ckpt_end_releases;
             *units = units.saturating_add(count);
-            budget.charge(count.saturating_mul(RECOVER_PROBE_CHARGE_BYTES));
+            // The planted canary charges the releases nothing.
+            if !cfg!(inf_canary_recover_probe_uncharged) {
+                budget.charge(count.saturating_mul(RECOVER_PROBE_CHARGE_BYTES));
+            }
         }
         self.phase = Phase::Replay { idx: 0, reader: ReplayReader::Unopened };
         Ok(RecoveryProgress::Working)

@@ -579,6 +579,20 @@ rows=(
   # A walk that fits asks its budget once. Planted, a whole walk asks after
   # every record.
   "inf_canary_recover_ask_per_record crate-test inf-server test:recover_replay_steps a_unit_that_fits_asks_once_per_frame_and_per_section ASK COUNT"
+  # A checkpoint step yields at the next record or entry inside a section,
+  # and asks after each index-sidecar section. Planted, a section's walk
+  # never parks: a records section's demote steps run inside the step that
+  # enters it, an entry section applies every entry, and a run of sidecar
+  # sections loads in one step.
+  "inf_canary_recover_section_whole crate-test inf-server test:recover_replay_steps a_records_section_of_rewrites_of_cold_keys_is_loaded_under_the_step_judge (Ick)"
+  "inf_canary_recover_section_whole crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge ENTRIES"
+  "inf_canary_recover_section_whole crate-test inf-server test:recover_replay_steps a_run_of_index_sidecar_sections_yields_after_each_section JUDGE"
+  # The end of the checkpoint's releases are RAM units at their price.
+  # Planted, they charge nothing: one step walks the whole list.
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge RELEASES"
+  # A resumed section walk passes no record unapplied. Planted, it passes
+  # a record that needs room (the boot refuses, or a key is absent).
+  "inf_canary_recover_skip_on_resume crate-test inf-server test:recover_replay_steps every_budget_recovers_the_checkpoint_of_the_unparked_boot BUDGET INDEPENDENCE"
   # ADR-0061 D6: the 0x05 pass lists the entry of a record the walk imaged
   # (a ticket winner below the watermark, ADR-0093 A12) — the boot
   # registers the extent at both addresses and its count stays one above
