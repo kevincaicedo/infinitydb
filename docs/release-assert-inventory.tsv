@@ -664,6 +664,8 @@ I	1	crates/inf-store/src/live_set.rs	expect	finalize of unknown file	live-set ac
 I	1	crates/inf-store/src/live_set.rs	assert	seed with files present	live-set accounting invariants (ADR-0058 D4): coverage_end, file order, dead ≤ data are the set's own state
 I	1	crates/inf-store/src/live_set.rs	assert	seed with pending files	live-set accounting invariants (ADR-0058 D4): coverage_end, file order, dead ≤ data are the set's own state
 I	2	crates/inf-store/src/ns.rs	expect	bounded above	min with a u32 const before the conversion
+I	1	crates/inf-store/src/ns/ddl.rs	expect	catalog epochs exhausted in one boot	an invariant on the writer's own counter: `CatalogEpochs::take` numbers one dequeued request at a time from 1 each boot with `checked_add`; 2^64 − 1 requests is ≈ 5.8 × 10^5 years at 10^6 a second, past which the node stops (the catalog epoch's limit row)
+I	1	crates/inf-store/src/ns/ddl.rs	unreachable	an answered slot holds verdict code {other}	the slot's own state: its one store is `DdlVerdict::code`, written before the epoch that makes the slot readable, so an answered slot holds one of the three codes
 C	1	crates/inf-store/src/ordered.rs	assert	Fixed8 keys are exactly 8 bytes	`crates/inf-store/src/index_key.rs:index_scalar_coerce` refuses utf8 keys above ORDERED_KEY_MAX and `index_key_encode` emits exactly 8 bytes for fixed8 types
 I	1	crates/inf-store/src/ordered.rs	assert	get2_mut requires distinct ids	B+ tree structural invariants (height bound, distinct ids, InsertPlan sequencing)
 C	1	crates/inf-store/src/ordered.rs	assert	key exceeds ORDERED_KEY_MAX	`crates/inf-store/src/index_key.rs:index_scalar_coerce` refuses utf8 keys above ORDERED_KEY_MAX and `index_key_encode` emits exactly 8 bytes for fixed8 types

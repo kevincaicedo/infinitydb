@@ -94,7 +94,7 @@ pub use keyspace::{
     TieredUsage, drive_record,
 };
 pub use live_set::{FileLiveSet, LiveSet};
-pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, valid_ns_name};
+pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, ddl, valid_ns_name};
 pub use ordered::{
     AppendError, Fixed8, KeyScheme, ORDERED_KEY_MAX, OrderedCursor, OrderedMap, OrderedMapError,
     OrderedMapMemory, PkRef, VarKey,
