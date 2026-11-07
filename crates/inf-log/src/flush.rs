@@ -1790,7 +1790,10 @@ mod tests {
     /// namespace: the file the failed attempt made has an owner, and the
     /// create runs again only once that file is gone, so no retry meets the
     /// name it left. The rotation to B fails once after B is made and named;
-    /// eight more plans follow, as eight MAINTAINs would run them.
+    /// eight more plans follow, as eight MAINTAINs would run them. Each
+    /// clause is read: no retry answers EEXIST, one of them makes the file,
+    /// and that file is the one the failed create named, so no file id is
+    /// spent.
     #[test]
     #[ignore = "a create that fails after its file exists leaves that file with no owner, and \
                 every later create of the same name answers EEXIST; red until a failed create's \
@@ -1812,6 +1815,7 @@ mod tests {
         assert_eq!(flush.next_file_id(), 1, "the failure spent no file id");
         let mut eexist = 0;
         let mut created = false;
+        let mut refusal_last = None;
         for _ in 0..RETRIES {
             match stage(&mut flush, span(600, 600, None), &[0xA1; 600]) {
                 Ok(()) => {
@@ -1823,7 +1827,7 @@ mod tests {
                 {
                     eexist += 1;
                 }
-                Err(_) => {}
+                Err(err) => refusal_last = Some(err.to_string()),
             }
         }
         inf_foundation::fault::disarm_all();
@@ -1834,6 +1838,17 @@ mod tests {
              the failed attempt left, next file id still {}); B created: {created}",
             b.display(),
             flush.next_file_id()
+        );
+        assert!(
+            created,
+            "none of {RETRIES} creates after the failed one made a file; the last refusal: \
+             {refusal_last:?}"
+        );
+        let active = flush.active().map(|(.., path)| path.to_path_buf());
+        assert_eq!(
+            active,
+            Some(b),
+            "the create after the failed one names the path that one named: no file id is spent"
         );
     }
 
