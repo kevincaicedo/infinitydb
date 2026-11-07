@@ -230,6 +230,6 @@ pub const BOOT_FILE_OP_CHARGE_BYTES: u64 = 128 << 10;
 /// window and the deadline's rounding millisecond after the window's first
 /// failure (ADR-0154 D3). While the failure persists, each retry fails
 /// again, counts one error and arms one more window: one `accept(2)` a
-/// window, never a spin, and a queued client waits one more window for each
-/// failed retry.
+/// window, never a spin (ADR-0118 D2), and a queued client waits one more
+/// window for each failed retry.
 pub const ACCEPT_RETRY: Nanos = Nanos::from_millis(100);

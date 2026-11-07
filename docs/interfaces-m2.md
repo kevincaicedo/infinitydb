@@ -1324,7 +1324,7 @@ begins (the census goes `Assembling` → `Serving`). On that census, before it
 writes the cell's `NodeInfo`, it builds the cell's timer set, whose
 `timer-owners` row is an `Assembly` row it fills whole; a refused build
 returns no plane, and the census is dropped while `Assembling`, an abandoned
-assembly that counts nothing. The timer set is unbuilt. At the mark an
+assembly that counts nothing. At the mark an
 `Assembly` row whose live count is below its cap is a violation, and so
 is any publish, crossing or registration on an `Assembly` row after it:
 each counts in `cap_assembly_violations` (cell scope) and is a debug
