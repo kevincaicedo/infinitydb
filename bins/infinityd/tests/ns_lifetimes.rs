@@ -10,7 +10,11 @@
 //! tiered namespace lifetimes (ADR-0148 D1, one node-wide grant being one
 //! position on every cell), and the 65th tiered `INF.NS CREATE` is refused
 //! with `-ERR tiered namespace limit reached` while no grant is retiring
-//! (ADR-0172 D3), before any effect.
+//! (ADR-0172 D3), before any effect. A tiered `CREATE` refused after its
+//! catalog swap leaves no namespace behind: once `META` names the
+//! definition, an origin whose store refuses it withdraws the definition
+//! durably before the refusal is answered (ADR-0148 D5), so no boot after
+//! a cut serves it.
 //!
 //! Shape: a two-cell durable node, each namespace's ring at the 4 MiB floor
 //! (`MEM-BUDGET 3mb` beside the default 1 MiB `MAINTAIN-SLICE`: a ring is
@@ -30,6 +34,10 @@ use std::time::{Duration, Instant};
 
 /// Tiered namespace lifetimes a node holds (ADR-0148 A1.1's limit).
 const LIFETIMES_MAX: usize = 64;
+
+/// A child's address-space cap (`ulimit -v`, KiB), 4 GiB: a ring of 4 GiB
+/// cannot be mapped beside the process's own mappings under it.
+const CHILD_AS_CAP_KIB: u64 = 4 * 1024 * 1024;
 
 fn unique() -> u32 {
     static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -76,13 +84,35 @@ impl Server {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+
+    /// `SIGKILL`, a power cut's stand-in: nothing of the node runs after
+    /// the signal, so no shutdown path persists anything.
+    fn cut(&mut self) {
+        self.child.kill().expect("SIGKILL");
+        self.child.wait().expect("wait");
+    }
 }
 
 /// A two-cell durable node on `dir`, up: listening and out of `-LOADING`.
 fn start(dir: &Path) -> Server {
+    spawn(dir, Command::new(env!("CARGO_BIN_EXE_infinityd")))
+}
+
+/// [`start`] under an address-space cap of `cap_kib` KiB, so the OS
+/// refuses a mapping the cap cannot hold.
+fn start_capped(dir: &Path, cap_kib: u64) -> Server {
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(format!("ulimit -v {cap_kib} && exec \"$0\" \"$@\""))
+        .arg(env!("CARGO_BIN_EXE_infinityd"));
+    spawn(dir, command)
+}
+
+fn spawn(dir: &Path, mut command: Command) -> Server {
     std::fs::create_dir_all(dir).expect("data dir");
     let stderr = dir.join(format!("stderr-{}-{}", std::process::id(), unique()));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+    let mut child = command
         .args(["--port", "0", "--cells", "2", "--data-dir"])
         .arg(dir)
         .args(["--device-probe", "off"])
@@ -179,4 +209,50 @@ fn the_sixty_fifth_tiered_create_is_refused_at_the_limit() {
         replies[LIFETIMES_MAX], "-ERR tiered namespace limit reached\r\n",
         "the 65th tiered CREATE on a two-cell node, rings at the 4 MiB floor"
     );
+}
+
+/// A tiered `CREATE` refused after its catalog swap is not served after a
+/// cut. Under the 4 GiB cap, `MEM-BUDGET 3gb` passes every check before
+/// the swap (the reserved-address admission is arithmetic: 4 GiB of a
+/// cell's 128 GiB share), the catalog writer accepts it and `META` names
+/// it, and the origin's ring (3 GiB plus the 1 MiB slice, rounded up to
+/// 4 GiB) cannot be mapped, so the origin's store refuses it. The node is
+/// killed with no later DDL, so no later catalog write drops the
+/// definition, and rebooted uncapped. There the same `CREATE` of another
+/// name answers `+OK`: the capped refusal was the reservation's, after the
+/// swap, not a check's before it.
+#[test]
+#[ignore = "a tiered CREATE its origin's store refuses after the catalog swap is answered while \
+            META still names the namespace, so a boot after a cut serves it; red until such a \
+            refusal withdraws the definition durably before its error is answered"]
+fn a_tiered_create_refused_after_its_catalog_swap_is_not_served_after_a_cut() {
+    const NOT_FOUND: &str = "-ERR namespace 'refused' not found\r\n";
+    let create = |name: &'static [u8]| -> [&'static [u8]; 7] {
+        [b"INF.NS", b"CREATE", name, b"MODE", b"durable", b"MEM-BUDGET", b"3gb"]
+    };
+    let dir = data_root("refused");
+    let mut capped = start_capped(&dir, CHILD_AS_CAP_KIB);
+    let mut c = TcpStream::connect(("127.0.0.1", capped.port)).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    let refusal = line(&mut c, &create(b"refused"));
+    let before_cut = line(&mut c, &[b"INF.NS", b"USE", b"refused"]);
+    drop(c);
+    capped.cut();
+    drop(capped);
+    let mut server = start(&dir);
+    let mut c = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    let after_cut = line(&mut c, &[b"INF.NS", b"USE", b"refused"]);
+    let uncapped = line(&mut c, &create(b"uncapped"));
+    drop(c);
+    let status = server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(status.success(), "the rebooted node stopped gracefully: {status}");
+    assert_eq!(
+        refusal, "-ERR MEM-BUDGET + MAINTAIN-SLICE has no representable ring reservation\r\n",
+        "engagement: the capped node refused the CREATE at its ring reservation"
+    );
+    assert_eq!(uncapped, "+OK\r\n", "engagement: the same CREATE passes every check uncapped");
+    assert_eq!(before_cut, NOT_FOUND, "the refused namespace is served before the cut");
+    assert_eq!(after_cut, NOT_FOUND, "the refused namespace is served after a cut and a reboot");
 }
