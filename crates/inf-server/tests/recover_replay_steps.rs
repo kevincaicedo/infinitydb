@@ -1209,13 +1209,16 @@ fn a_frame_of_deletes_of_demoted_keys_asks_after_each_priced_delete() {
 
 /// One boot's recovered state for budget independence: the
 /// table digest, every tier file byte for byte, what every key serves, the
-/// D6 counters (the gauges and the step facts excepted) and the record
-/// counts.
+/// extent reference map, the reclaim queue in its hand-out order (the
+/// order the boot's deaths reached it), the D6 counters (the gauges and
+/// the step facts excepted) and the record counts.
 #[derive(Debug, PartialEq, Eq)]
 struct Recovered {
     table: inf_store::StateDigest,
     files: Vec<(String, Vec<u8>)>,
     served: Model,
+    extents: Vec<(u64, u64, u64)>,
+    reclaim_order: Vec<u64>,
     counters: inf_store::ReplayCounters,
     dead_life_files_removed: u64,
     records_applied: u64,
@@ -1258,10 +1261,17 @@ fn recovered(fs: &CountingFs, cfg: &DurableConfig, budget: u64, model: &Model) -
     if budget != u64::MAX && budget <= 256 << 10 {
         engagement(&stats).expect("a small budget yields inside a unit");
     }
+    let table = ks.tiered_store_mut(TIER_NS).expect("tiered");
+    let digest = table.simulation_digest();
+    let extents = table.extent_references().collect();
+    // Read last: handing the queue out moves its candidates into reclaim.
+    let queue = table.extent_reclaim_work(u64::MAX, usize::MAX);
     Recovered {
-        table: ks.tiered_store(TIER_NS).expect("tiered").simulation_digest(),
+        table: digest,
         files,
         served,
+        extents,
+        reclaim_order: queue.iter().map(|candidate| candidate.extent_id).collect(),
         counters: stats.tier_replay.counters,
         dead_life_files_removed: stats.tier_replay.dead_life_files_removed,
         records_applied: stats.records_applied,
@@ -1310,10 +1320,21 @@ fn assert_same(state: &Recovered, control: &Recovered, budget: u64) {
         assert!(differs.is_none(), "{at}: {name} differs from byte {differs:?}");
     }
     assert!(state.served == control.served, "{at}: the served values");
+    let differs = first_difference(&state.extents, &control.extents);
+    assert!(differs.is_none(), "{at}: the extent references differ from entry {differs:?}");
+    let differs = first_difference(&state.reclaim_order, &control.reclaim_order);
+    assert!(differs.is_none(), "{at}: the reclaim queue's order differs from {differs:?}");
     assert_eq!(state.counters, control.counters, "{at}: the D6 counters");
     assert_eq!(state.dead_life_files_removed, control.dead_life_files_removed, "{at}");
     assert_eq!(state.records_applied, control.records_applied, "{at}: records applied");
     assert_eq!(state.records_pre_begin, control.records_pre_begin, "{at}: records below begin");
+}
+
+/// The first index at which two lists differ (the shorter one's length
+/// where one is the other's prefix), `None` when they are equal.
+fn first_difference<T: PartialEq>(state: &[T], control: &[T]) -> Option<usize> {
+    let differs = state.iter().zip(control).position(|(a, b)| a != b);
+    differs.or_else(|| (state.len() != control.len()).then(|| state.len().min(control.len())))
 }
 
 /// A boot of the memory namespace's unit on `fs` at `budget`: its stats and
@@ -1912,10 +1933,13 @@ fn entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge
 /// section over the window of rewrites of cold keys, its refs, and a
 /// blob-reference entry at each ref — recovered at `u64::MAX` (the
 /// control, which never parks) and at 8 MiB, 256 KiB, 4 KiB, 1 and 0
-/// recovers the same table, tier files, served values, D6 counters (the
-/// blob references released among them) and record counts. Red where a
-/// resumed section walk passes a record that needs room
-/// (`inf_canary_recover_skip_on_resume`'s section arm).
+/// recovers the same table, tier files, served values, extent reference
+/// map, reclaim queue order — the end of the checkpoint's deaths in their
+/// settle order, which the 256 KiB and 4 KiB legs release in batches that
+/// resume inside the list — D6 counters (the blob references released among
+/// them) and record counts. Red where a resumed section walk passes a
+/// record that needs room (`inf_canary_recover_skip_on_resume`'s section
+/// arm).
 #[test]
 fn every_budget_recovers_the_checkpoint_of_the_unparked_boot() {
     let cfg = step_cfg();
@@ -1931,6 +1955,16 @@ fn every_budget_recovers_the_checkpoint_of_the_unparked_boot() {
     assert_model(&control.served, &model, "the control boot");
     assert!(control.counters.demote_steps > 0, "VACUOUS: {:?}", control.counters);
     assert!(control.counters.blob_releases > 0, "VACUOUS: {:?}", control.counters);
+    // The order is observable where budgets differ: more deaths queued than
+    // one 4 KiB step releases, so that leg's batches resume inside the list.
+    let batch = (4 << 10) / inf_store::limits::RECOVER_PROBE_CHARGE_BYTES;
+    let deaths = control.reclaim_order.len() as u64;
+    eprintln!(
+        "checkpoint control: {deaths} deaths queued, {} extent references, {:?}",
+        control.extents.len(),
+        control.counters
+    );
+    assert!(deaths > 2 * batch, "VACUOUS: {deaths} deaths in the reclaim queue");
     for budget in [8 << 20, 256 << 10, 4 << 10, 1, 0] {
         let (model, state) = boot(budget);
         assert_model(&state.served, &model, &format!("BUDGET INDEPENDENCE at {budget}"));
