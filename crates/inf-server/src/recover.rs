@@ -1799,7 +1799,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 }
                 WalkEnd::Parked { cursor, kind, unpaid } => {
                     if !resumed {
-                        self.step_parked_bytes = unpaid;
+                        // The planted canary parks nothing of the frame.
+                        let dropped = cfg!(inf_canary_recover_parked_dropped);
+                        self.step_parked_bytes = if dropped { 0 } else { unpaid };
                     }
                     let facts = &mut self.stats.step;
                     match kind {

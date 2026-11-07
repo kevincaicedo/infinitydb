@@ -671,6 +671,11 @@ rows=(
   "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge SEEDS"
   "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge RENAMES"
   "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge GROUPS"
+  # A step that parks inside the section or the frame it read adds the bytes
+  # it left to its work gauge, so the gauge reads at least what the step
+  # read. Planted, a park adds nothing of its unit: the gauge reads under.
+  "inf_canary_recover_parked_dropped crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge under the step's reads"
+  "inf_canary_recover_parked_dropped crate-test inf-server test:recover_replay_steps a_frame_of_rewrites_of_demoted_keys_is_replayed_under_the_step_judge under the step's reads"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

@@ -1039,6 +1039,7 @@ fn judged_boot_logged(
     // Bound: every step makes progress (the zero-budget row).
     for step in 0u64.. {
         let (before, units) = (fs.tally(), recovery.stats().units);
+        let yields_before = yields_in_unit(recovery.stats());
         let progress = match recovery.step(&mut ks, budget) {
             Ok(progress) => progress,
             Err(err) => return (over, Err(err), ks, log),
@@ -1073,6 +1074,8 @@ fn judged_boot_logged(
                 work: recovery.step_work_bytes(),
                 boot_charge: recovery.step_charge_bytes(),
                 reader_bytes: work.reader_bytes,
+                ram_bytes: work.ram_units * inf_store::limits::RECOVER_PROBE_CHARGE_BYTES,
+                parked: yields_in_unit(recovery.stats()) > yields_before,
             };
             if let Some(reading) = gauge_over(row.entry, budget, unit, gauge) {
                 over.push(format!("step {step} ({:?}): {reading}", row.phase));
@@ -1087,13 +1090,22 @@ fn judged_boot_logged(
 }
 
 /// One step's work gauge (`Recovery::step_work_bytes`), its boot I/O charge
-/// (`Recovery::step_charge_bytes`) and the reader bytes its filesystem
-/// returned.
+/// (`Recovery::step_charge_bytes`), the reader bytes its filesystem
+/// returned, its RAM units at their price, and whether it yielded inside a
+/// unit.
 #[derive(Copy, Clone, Debug)]
 struct Gauge {
     work: u64,
     boot_charge: u64,
     reader_bytes: u64,
+    ram_bytes: u64,
+    parked: bool,
+}
+
+/// The yields inside a unit a cell's steps made so far, every kind.
+fn yields_in_unit(stats: &inf_server::RecoverStats) -> u64 {
+    let step = stats.step;
+    step.yields_in_frame + step.yields_in_section + step.yields_in_demote_step
 }
 
 /// The slack of a step with no boot I/O on a row with no frame, in bytes:
@@ -1114,12 +1126,24 @@ const GAUGE_SLACK: u64 = 3 * inf_log::ckpt::ICK_BLOCK_ALIGN as u64;
 /// charged no boot I/O, or `U` in its place where it did. `Some` names the
 /// over-read. Red where a walk parks an entry section's price
 /// (`inf_canary_recover_parked_priced`).
+///
+/// The lower side: a step that read a frame or a section and yielded inside
+/// it adds the bytes it left to its charge, so its gauge is at least what it
+/// read and its RAM units at their price, less [`GAUGE_SLACK`] on a section
+/// row (the parked section's padding, read when its walk hops past it) or
+/// the reader's one read chunk on a frame row (a refill may read past the
+/// frame). Tier I/O stays out of the floor: the engine prices a barrier per
+/// seal, not each directory sync its filesystem saw. Red where a park adds
+/// nothing of its unit (`inf_canary_recover_parked_dropped`).
 fn gauge_over(
     entry: inf_server::UnitEntry,
     budget: u64,
     unit: u64,
     gauge: Gauge,
 ) -> Option<String> {
+    if let Some(reading) = gauge_under(entry, gauge) {
+        return Some(reading);
+    }
     let bound = match entry {
         inf_server::UnitEntry::Frame | inf_server::UnitEntry::None => budget.saturating_add(unit),
         inf_server::UnitEntry::Section => {
@@ -1129,6 +1153,20 @@ fn gauge_over(
     };
     (gauge.work > bound)
         .then(|| format!("GAUGE: a work gauge of {} over {bound} ({gauge:?})", gauge.work))
+}
+
+/// [`gauge_over`]'s lower side: `Some` names a step that read a unit it
+/// yielded inside and whose gauge reads under what it did.
+fn gauge_under(entry: inf_server::UnitEntry, gauge: Gauge) -> Option<String> {
+    let slack = match entry {
+        inf_server::UnitEntry::Frame => inf_log::DEFAULT_READ_CHUNK as u64,
+        inf_server::UnitEntry::Section => GAUGE_SLACK,
+        inf_server::UnitEntry::None => return None,
+    };
+    let floor = (gauge.reader_bytes + gauge.ram_bytes).saturating_sub(slack);
+    (gauge.parked && gauge.reader_bytes > 0 && gauge.work < floor).then(|| {
+        format!("GAUGE: a work gauge of {} under the step's reads, {floor} ({gauge:?})", gauge.work)
+    })
 }
 
 /// The yields inside a unit a boot made (ADR-0174 A1.2's liveness
@@ -1181,9 +1219,11 @@ fn hostile_unit(frame_entry: u64) -> impl Fn(inf_server::UnitPhase) -> u64 {
 /// (`U` the frame's entry plus one record's unit). Every judged
 /// step's work is within `B + U + C`, read before the engagement clause,
 /// and the boot recovers the model. Red where the frame's demote steps run
-/// inside the step that enters it (`inf_canary_recover_frame_whole`) and
+/// inside the step that enters it (`inf_canary_recover_frame_whole`),
 /// where a demote step's seal walk ignores the budget left
-/// (`inf_canary_recover_seal_unbudgeted`).
+/// (`inf_canary_recover_seal_unbudgeted`), and where the step that parks in
+/// the frame adds nothing of it to its work gauge
+/// (`inf_canary_recover_parked_dropped`: the gauge under the step's reads).
 #[test]
 fn a_frame_of_rewrites_of_demoted_keys_is_replayed_under_the_step_judge() {
     const BUDGET: u64 = 256 << 10;
@@ -1976,8 +2016,10 @@ fn a_records_section_of_rewrites_of_cold_keys_is_loaded_under_the_step_judge() {
 /// section applies every entry in the step that enters it
 /// (`inf_canary_recover_section_whole`: `ENTRIES`), where the end of the
 /// checkpoint's releases charge nothing (`inf_canary_recover_probe_uncharged`:
-/// `RELEASES`) and where a parked walk adds the price of the entries it left
-/// to the gauge (`inf_canary_recover_parked_priced`: `GAUGE`).
+/// `RELEASES`), where a parked walk adds the price of the entries it left
+/// to the gauge (`inf_canary_recover_parked_priced`: `GAUGE`), and where it
+/// adds nothing of the section (`inf_canary_recover_parked_dropped`: the
+/// gauge under the step's reads).
 #[test]
 fn entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge() {
     const BUDGET: u64 = 256 << 10;
