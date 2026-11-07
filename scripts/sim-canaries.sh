@@ -383,6 +383,10 @@ rows=(
   # resumes the broken park too, and the oracle reads each park resumed with
   # no retry.
   "inf_canary_accept_close_resumes_any m0-smoke accept-retry-by-close --plant accept-broken"
+  # The retry waits its window, so a persistent failure costs one accept a
+  # window, never a spin (ADR-0118 D2). Planted, the failure re-arms the
+  # listener at once, and the oracle reads each retry before its deadline.
+  "inf_canary_accept_retry_at_once m0-smoke accept-retry-early --plant accept-broken"
   # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
   # path every site uses. On a serving cell the census counts the unsliced
   # drop, and this debug build asserts it with its token.

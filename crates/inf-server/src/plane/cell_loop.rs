@@ -171,6 +171,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 // into its one arm.
                 if c.token.class() == TokenClass::Accept {
                     self.shared.accept_errors.set(self.shared.accept_errors.get() + 1);
+                    // Canary: the failure re-arms the listener at once, the
+                    // spin into a persistent failure the window prevents.
+                    #[cfg(inf_canary_accept_retry_at_once)]
+                    cx.push(IoOp::AcceptArm {
+                        listener: self.listener,
+                        token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
+                    });
                     let owner = &self.timers.accept_retry;
                     let deadline = cx.now.saturating_add(ACCEPT_RETRY);
                     let mut timers = cx.timers();
