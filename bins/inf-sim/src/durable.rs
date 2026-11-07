@@ -48,7 +48,7 @@ use inf_store::{
     IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, NsId, StoreConfig, WallAnchor,
 };
 
-use crate::harness::node_hasher;
+use crate::harness::{STEP_NS_FLOOR, node_hasher};
 use crate::lift::LiftNs;
 
 use crate::net::{CellNet, Plant, SimDriver, listener_fd};
@@ -133,8 +133,9 @@ pub struct DurableScenario {
     /// frames; `everysec` values stay small so the deferral oracle
     /// measures the ack, not the pad.
     pub value_pad_max: u64,
-    /// Max virtual nanoseconds per scheduler step. Sized so runs span
-    /// several simulated seconds — the everysec window is real.
+    /// The seeded part of a scheduler step's advance, exclusive: a step
+    /// advances `STEP_NS_FLOOR` plus a draw in `0..step_ns_max`. Sized so
+    /// runs span several simulated seconds — the everysec window is real.
     pub step_ns_max: u64,
     /// A second power cut lands *during* recovery (interrupted-recovery
     /// idempotence, in-sim).
@@ -2496,7 +2497,7 @@ impl Node {
         if !self.hold_inbox {
             self.inbox.drain(disk, &self.data_dir)?;
         }
-        clock.advance(Nanos(1_000 + rng.next_u64() % step_ns_max));
+        clock.advance(Nanos(STEP_NS_FLOOR + rng.next_u64() % step_ns_max));
         if !self.observed_ready && self.ready() {
             self.observe_state(b"recovered");
             self.observed_ready = true;
