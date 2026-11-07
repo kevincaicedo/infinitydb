@@ -228,6 +228,9 @@ type NsNames = std::collections::BTreeSet<Vec<u8>>;
 
 struct CatalogPump {
     hold: Arc<AtomicBool>,
+    /// Swaps the pump may still land while `hold` is set
+    /// ([`Node::land_held_persists`]): one lands, the next stays queued.
+    allow: Arc<std::sync::atomic::AtomicU32>,
     stop: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<()>,
 }
@@ -241,11 +244,12 @@ impl Node {
         cells: u16,
         data_dir: &std::path::Path,
         hold: Arc<AtomicBool>,
+        trigger: CkptTrigger,
     ) -> Node {
         Node::start_cfg_default(
             cells,
             Some(data_dir.to_path_buf()),
-            CkptTrigger::Manual,
+            trigger,
             Default::default(),
             Vec::new(),
             false,
@@ -258,7 +262,15 @@ impl Node {
             Some(hold),
             None,
             None,
+            Vec::new(),
         )
+    }
+
+    /// Lets the held catalog writer land `n` more swaps while `hold`
+    /// stays set: a swap past them stays queued, first in line.
+    fn land_held_persists(&self, n: u32) {
+        let pump = self.catalog_pump.as_ref().expect("a held-catalog node");
+        pump.allow.fetch_add(n, Ordering::AcqRel);
     }
 
     /// Ends the node the way a power cut inside a held swap would: cell
@@ -296,6 +308,7 @@ impl Node {
             None,
             None,
             Some(held),
+            Vec::new(),
         )
     }
 
@@ -305,6 +318,48 @@ impl Node {
     /// Automatic checkpoints stay off (tests own the trigger).
     fn start_durable(cells: u16, data_dir: &std::path::Path) -> Node {
         Node::start_with(cells, Some(data_dir.to_path_buf()), CkptTrigger::Manual)
+    }
+
+    /// Boots a durable node on `dir` and returns recovery's verdict instead
+    /// of panicking on it: `Err` carries the refusing cell's fail-stop
+    /// message, after the cells that did recover are stopped. The throttle
+    /// at the full rate only turns off `start_cfg`'s own wait: its delay is
+    /// 0 ns a step, and the cells park between recovery steps (the
+    /// throttled cadence), which changes when a step runs, not what it does.
+    fn start_durable_or_refusal(cells: u16, dir: &std::path::Path) -> Result<Node, String> {
+        let recover = inf_server::RecoverConfig {
+            throttle_bytes_per_sec: Some(u64::MAX),
+            ..Default::default()
+        };
+        let mut node = Node::start_full(
+            cells,
+            Some(dir.to_path_buf()),
+            CkptTrigger::Manual,
+            recover,
+            Vec::new(),
+        );
+        let control = Arc::clone(node.control.as_ref().expect("a durable node"));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if control.recovery_board().all_ready() {
+                return Ok(node);
+            }
+            if let Some(at) = node.handles.iter().position(std::thread::JoinHandle::is_finished) {
+                let refusal = match node.handles.remove(at).join() {
+                    Ok(_) => "a cell thread exited during recovery".to_owned(),
+                    Err(payload) => payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                        .unwrap_or_else(|| "a cell thread panicked".to_owned()),
+                };
+                node.stop();
+                return Err(refusal);
+            }
+            assert!(Instant::now() < deadline, "recovery did not finish in 60 s");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn start_durable_with_default_ns(
@@ -328,6 +383,7 @@ impl Node {
             None,
             None,
             None,
+            Vec::new(),
         )
     }
 
@@ -359,6 +415,7 @@ impl Node {
             None,
             None,
             None,
+            Vec::new(),
         )
     }
 
@@ -386,6 +443,7 @@ impl Node {
             None,
             Some(std::num::NonZeroU64::new(units).expect("headroom >= 1")),
             None,
+            Vec::new(),
         )
     }
 
@@ -595,6 +653,7 @@ impl Node {
             None,
             None,
             None,
+            Vec::new(),
         )
     }
 
@@ -615,6 +674,7 @@ impl Node {
         held_catalog: Option<Arc<AtomicBool>>,
         ckpt_headroom: Option<std::num::NonZeroU64>,
         held_clock: Option<HeldClock>,
+        holds: Vec<(u16, &'static str, inf_foundation::fault::HoldGate)>,
     ) -> Node {
         assert!(held_clock.is_none() || data_dir.is_none(), "a held clock boots a volatile node");
         let stop = Arc::new(AtomicBool::new(false));
@@ -670,24 +730,30 @@ impl Node {
                         boot_unix_ms,
                     );
                     let hold = Arc::clone(hold);
+                    let allow = Arc::new(std::sync::atomic::AtomicU32::new(0));
                     let pump_stop = Arc::new(AtomicBool::new(false));
                     let pump_dir = dir.clone();
                     let handle = {
                         let hold = Arc::clone(&hold);
+                        let allow = Arc::clone(&allow);
                         let pump_stop = Arc::clone(&pump_stop);
                         std::thread::spawn(move || {
                             while !pump_stop.load(Ordering::Relaxed) {
+                                let fs = inf_server::StdSegmentFs;
                                 if !hold.load(Ordering::Relaxed) {
-                                    inbox
-                                        .drain(&inf_server::StdSegmentFs, &pump_dir)
+                                    inbox.drain(&fs, &pump_dir).expect("held-catalog META swap");
+                                } else if let n @ 1.. = allow.load(Ordering::Acquire) {
+                                    let landed = inbox
+                                        .drain_persists(&fs, &pump_dir, n)
                                         .expect("held-catalog META swap");
+                                    allow.fetch_sub(landed, Ordering::AcqRel);
                                 }
                                 #[allow(clippy::disallowed_methods)] // harness thread
                                 std::thread::sleep(Duration::from_millis(1));
                             }
                         })
                     };
-                    catalog_pump = Some(CatalogPump { hold, stop: pump_stop, handle });
+                    catalog_pump = Some(CatalogPump { hold, allow, stop: pump_stop, handle });
                     (control, issuers)
                 }
             };
@@ -715,12 +781,18 @@ impl Node {
             let boot = boot.clone();
             let issuer = cell_issuers.get_mut(i).and_then(Option::take);
             let faults = faults.clone();
+            let holds = holds.clone();
             let default_ns = default_ns.clone();
             handles.push(std::thread::spawn(move || {
                 // M2-S16: arm this cell's fault plan before recovery — the
                 // registry is thread-local (cells are single-threaded, L1).
                 for &(point, spec) in &faults {
                     inf_foundation::fault::arm(point, spec);
+                }
+                // A hold is armed on the one cell it names: a gate no thread
+                // will reach keeps no handle alive on another cell.
+                for (_, point, gate) in holds.iter().filter(|(cell, ..)| usize::from(*cell) == i) {
+                    inf_foundation::fault::arm_hold(point, gate);
                 }
                 let pool = BufferPool::new(256, 4096);
                 // No fixed-buffer registration: it is a capability probe no
@@ -8662,7 +8734,8 @@ fn concurrent_writes_to_a_blob_key_never_desync_the_index() {
 fn namespace_is_unusable_until_its_definition_is_durable() {
     let dir = temp_data_dir("c14-create-window");
     let hold = Arc::new(AtomicBool::new(true));
-    let node = Node::start_durable_with_held_catalog(2, &dir, Arc::clone(&hold));
+    let node =
+        Node::start_durable_with_held_catalog(2, &dir, Arc::clone(&hold), CkptTrigger::Manual);
     let mut creator = node.connect();
     creator
         .write_all(&cmd(&[
@@ -8732,7 +8805,7 @@ fn namespace_is_unusable_until_its_definition_is_durable() {
     // The released half: the swap lands, the CREATE acks, the namespace
     // serves on every cell, and an acked write survives a restart.
     let hold = Arc::new(AtomicBool::new(false));
-    let node = Node::start_durable_with_held_catalog(2, &dir, hold);
+    let node = Node::start_durable_with_held_catalog(2, &dir, hold, CkptTrigger::Manual);
     let mut c = node.connect();
     c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"fresh2", b"MODE", b"durable", b"FSYNC", b"always"]))
         .expect("write");
@@ -9974,6 +10047,804 @@ fn tiered_namespace_parses_arguments_like_the_numbered_db() {
         );
     }
     drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- a cut inside a namespace DROP's catalog wait ----
+//
+// `INF.NS DROP` asks the catalog writer for the swap that drops the
+// namespace and waits for its answer before it fans the drop or replies.
+// Until that answer the drop is un-acked, and a cut must boot the old
+// catalog with every acknowledged key served on every cell: every cell
+// serves the old definition through the wait, the origin included, so a
+// checkpoint published in it still names the namespace (ADR-0189 D5).
+// These scenarios hold the swap (the harness-driven catalog writer never
+// drains), let every cell publish a checkpoint inside the wait or not,
+// cut, and read back every key the seed recorded. The checkpoint either
+// opens inside the wait or is already walking the namespace when the drop
+// requests its swap. The oracle is the client's own record of acknowledged
+// writes, compared with what the restarted node serves per owning cell; it
+// reads no server counter. A restart that refuses to boot is its other red.
+// The control leg cuts at the same instant with no checkpoint in the wait.
+
+/// Keys the durable seed writes on each cell, and each value's length:
+/// 128 KiB a cell, several slices of the walk even when one slice stages a
+/// whole scan chunk of entries (about 35 KB of these), so the drop, sent
+/// after the first slice, finds most of the share still ahead of the walk.
+const DROP_WAIT_DURABLE_KEYS_PER_CELL: usize = 128;
+const DROP_WAIT_DURABLE_VALUE_BYTES: usize = 1 << 10;
+
+/// The namespace a drop-wait scenario drops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DropWaitNs {
+    /// `ledger`: durable, `FSYNC always`, so each `+OK` follows its fsync.
+    Durable,
+    /// `cold` (id 16): tiered, its values demoted to tier files that a
+    /// checkpoint published on every cell names before the drop.
+    Tiered,
+}
+
+impl DropWaitNs {
+    fn name(self) -> &'static [u8] {
+        match self {
+            DropWaitNs::Durable => b"ledger",
+            DropWaitNs::Tiered => b"cold",
+        }
+    }
+}
+
+/// What the cells' checkpoints do while the drop waits for its swap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DropWaitCheckpoint {
+    /// None is requested: the control leg.
+    NotRequested,
+    /// One is requested once the drop has requested its swap, and it
+    /// publishes on every cell before the cut.
+    OpensInside,
+    /// A paced one opens before the drop, and cell 0's walk has written
+    /// its first section of the namespace before the drop requests its
+    /// swap; it publishes on every cell before the cut.
+    WalksAcross,
+}
+
+/// One recorded write: the key, the value its `+OK` acknowledged and the
+/// cell that owns the key.
+struct AckedWrite {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    cell: u16,
+}
+
+/// A drop parked on its held swap: its connection, whose reply never
+/// comes, and what a `USE` on cell 0 answered once the swap was requested.
+struct DropInFlight {
+    _dropper: TcpStream,
+    origin_use: String,
+}
+
+/// The cell that owns `key` under a two-cell contiguous router.
+fn drop_wait_owner(key: &[u8]) -> u16 {
+    let router = SlotRouter::new_contiguous(2);
+    let owner = router.cell_of(SlotRouter::slot_of(key));
+    (0..2u16).find(|&cell| owner == CellId(cell)).expect("a two-cell router names cell 0 or 1")
+}
+
+/// Seeds `kind` on a fresh two-cell node, stops it, and returns the
+/// scenario's named keys, which are every key the oracle reads back (at
+/// least one owned by each cell): each durable key, or the tiered seed's
+/// `k0..k31`. The tiered seed's ring-fill writes (`fill{batch}:{i}`) are
+/// acknowledged too, but the helper does not say how many it wrote, so
+/// they are neither recorded nor read back.
+fn seed_drop_wait_namespace(kind: DropWaitNs, dir: &std::path::Path) -> Vec<AckedWrite> {
+    let node = Node::start_durable(2, dir);
+    let acked: Vec<AckedWrite> = match kind {
+        DropWaitNs::Durable => {
+            let mut c = node.connect();
+            c.write_all(&cmd(&[
+                b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"always",
+            ]))
+            .expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+            let mut c = connect_use(&node, b"ledger");
+            let mut acked = Vec::new();
+            for cell in 0..2u16 {
+                for key in keys_for_cell(2, cell, DROP_WAIT_DURABLE_KEYS_PER_CELL) {
+                    let mut value = [b"acked:".as_slice(), &key].concat();
+                    value.resize(DROP_WAIT_DURABLE_VALUE_BYTES, b'.');
+                    c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+                    read_exactly(&mut c, b"+OK\r\n");
+                    acked.push(AckedWrite { key, value, cell });
+                }
+            }
+            acked
+        }
+        // The helper's `INF.CKPT WAIT` publishes a checkpoint covering
+        // every key below on both cells, so each is durable.
+        DropWaitNs::Tiered => {
+            seed_tiered_namespace_with_checkpoint(&node, dir, 32);
+            (0..32u32)
+                .map(|i| {
+                    let key = format!("k{i}").into_bytes();
+                    AckedWrite { cell: drop_wait_owner(&key), key, value: cold_value(i) }
+                })
+                .collect()
+        }
+    };
+    node.stop();
+    for cell in 0..2u16 {
+        assert!(acked.iter().any(|w| w.cell == cell), "VACUOUS: no acked key on cell {cell}");
+    }
+    acked
+}
+
+/// Reads every recorded write back through `ns` and returns one line per
+/// write the node does not serve as acknowledged.
+fn drop_wait_misses(node: &Node, ns: &[u8], acked: &[AckedWrite]) -> Vec<String> {
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+    let used = read_line(&mut c);
+    if used != b"+OK\r\n" {
+        return vec![format!(
+            "namespace '{}' not served: {:?}",
+            String::from_utf8_lossy(ns),
+            String::from_utf8_lossy(&used)
+        )];
+    }
+    let mut misses = Vec::new();
+    for w in acked {
+        c.write_all(&cmd(&[b"GET", &w.key])).expect("write");
+        let key = String::from_utf8_lossy(&w.key);
+        match read_get(&mut c) {
+            Ok(body) if body == w.value => {}
+            Ok(body) if body.is_empty() => misses.push(format!("cell {}: {key} is nil", w.cell)),
+            Ok(body) => misses.push(format!("cell {}: {key} served {} bytes", w.cell, body.len())),
+            Err(err) => misses.push(format!("cell {}: {key} answered {err}", w.cell)),
+        }
+    }
+    misses
+}
+
+/// One `INF.NS USE ns` on a connection of `cell`; the reply line.
+fn drop_wait_use_on(node: &Node, cell: u16, ns: &[u8]) -> String {
+    let mut c = conn_on_cell(node, cell);
+    c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+    String::from_utf8_lossy(&read_line(&mut c)).trim_end().to_owned()
+}
+
+/// Sends `INF.NS DROP ns` on a connection of cell 0 and returns once the
+/// drop has requested its catalog swap, which the held writer never makes
+/// durable. The cell runs the drop's steps up to that request without
+/// yielding, so a checkpoint requested after this returns opens while the
+/// drop waits, whatever the origin's keyspace holds by then. Cell 1 still
+/// serves the namespace: no peer is told before the swap.
+fn drop_on_origin(node: &Node, ns: &[u8]) -> DropInFlight {
+    let control = node.control.as_ref().expect("a durable node");
+    let requested = control.persist_requests_sent();
+    let mut dropper = conn_on_cell(node, 0);
+    dropper.write_all(&cmd(&[b"INF.NS", b"DROP", ns])).expect("write");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while control.persist_requests_sent() == requested {
+        assert!(Instant::now() < deadline, "the drop never requested its catalog swap");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(control.persist_requests_sent(), requested + 1, "one swap: the drop's");
+    assert_eq!(drop_wait_use_on(node, 1, ns), "+OK", "cell 1 serves it until the swap");
+    DropInFlight { _dropper: dropper, origin_use: drop_wait_use_on(node, 0, ns) }
+}
+
+/// The highest checkpoint epoch every cell has published.
+fn drop_wait_min_published(node: &Node) -> u64 {
+    let board = node.control.as_ref().expect("a durable node").ckpt_board();
+    (0..node.cells).map(|cell| board.slot(cell).published()).min().unwrap_or(0)
+}
+
+/// Waits until checkpoint `epoch` reached a durable `MANIFEST` on every cell.
+fn drop_wait_published(node: &Node, epoch: u64) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while drop_wait_min_published(node) < epoch {
+        assert!(Instant::now() < deadline, "checkpoint {epoch} never published on every cell");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// What cell 0's staging image held when the drop was sent.
+struct WalkAtDrop {
+    /// Post-images outside the default database in its written sections.
+    written: usize,
+    /// Their keys' and values' bytes: a floor under what the walk streamed.
+    written_kv_bytes: u64,
+    /// The most the pace let the walk stream on the held clock.
+    allowance_bytes: u64,
+}
+
+/// The post-images outside the default database that the written sections
+/// of cell 0's staging image hold, and their keys' and values' bytes. The
+/// image has no footer yet, so the read ends in an error after the last
+/// written section; each section counted here passed its checksum.
+fn drop_wait_staged_images(dir: &std::path::Path) -> (usize, u64) {
+    let staging = dir.join("shard-0").join("ckpt");
+    let image = std::fs::read_dir(&staging)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".ick.new"));
+    let Some(image) = image else {
+        return (0, 0);
+    };
+    let (mut written, mut written_kv_bytes) = (0usize, 0u64);
+    let _ = inf_log::ckpt::read_ick_hybrid(
+        &inf_log::fs::StdSegmentFs,
+        &image,
+        inf_log::ckpt::IckReaderConfig::default(),
+        |record| {
+            if let inf_log::RecordView::StringPostImage { ns, key, value } = record
+                && ns.0 != 0
+            {
+                written += 1;
+                written_kv_bytes += (key.len() + value.len()) as u64;
+            }
+            Ok::<(), ()>(())
+        },
+        |_| Ok(()),
+        |_| Ok(()),
+        |_| Ok(()),
+        |_| Ok(()),
+    );
+    (written, written_kv_bytes)
+}
+
+/// The paced pass of [`DropWaitCheckpoint::WalksAcross`]. The clocks are
+/// held, and a round trip to cell 0 follows before the request, so the
+/// iteration that opens the checkpoint reads the held clock. The pace lets
+/// the walk stream `stream_bytes_per_sec` times the time since it opened,
+/// so the clocks step 1 ms per round trip until cell 0's staging image
+/// holds a section past its header, and stay put from there to the drop.
+/// The default database holds nothing, so that section is the
+/// namespace's: a tiered namespace's address references, which its walk
+/// emits first, or a durable namespace's first post-images. Then the drop
+/// requests its swap, and the walk runs out on every cell with the pace
+/// lifted.
+fn walk_across_the_drop(
+    node: &Node,
+    dir: &std::path::Path,
+    ns: &[u8],
+    stream_bytes_per_sec: u32,
+) -> (DropInFlight, WalkAtDrop) {
+    let staging = dir.join("shard-0").join("ckpt");
+    let past_header = || {
+        std::fs::read_dir(&staging).into_iter().flatten().flatten().any(|entry| {
+            entry.file_name().to_string_lossy().ends_with(".ick.new")
+                && entry
+                    .metadata()
+                    .is_ok_and(|meta| meta.len() > inf_log::ckpt::ICK_BLOCK_ALIGN as u64)
+        })
+    };
+    let board = node.control.as_ref().expect("a durable node").ckpt_board();
+    let mut probe = conn_on_cell(node, 0);
+    node.clock_gates.iter().for_each(|gate| gate.hold());
+    let _ = info_text(&mut probe, b"persistence");
+    let epoch = node.request_ckpt_all();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut stepped_ms = 0u64;
+    while !past_header() {
+        assert!(Instant::now() < deadline, "cell 0's walk never wrote a section");
+        node.clock_gates.iter().for_each(|gate| gate.step(Duration::from_millis(1)));
+        stepped_ms += 1;
+        // A round trip gives the cell an iteration on the stepped clock.
+        let _ = info_text(&mut probe, b"persistence");
+    }
+    assert!(board.slot(0).published() < epoch, "VACUOUS: cell 0's walk published already");
+    let (written, written_kv_bytes) = drop_wait_staged_images(dir);
+    let allowance_bytes = (u64::from(stream_bytes_per_sec) * stepped_ms.max(1)).div_ceil(1000);
+    let at_drop = WalkAtDrop { written, written_kv_bytes, allowance_bytes };
+    let in_flight = drop_on_origin(node, ns);
+    while drop_wait_min_published(node) < epoch {
+        assert!(Instant::now() < deadline, "checkpoint {epoch} never published on every cell");
+        node.clock_gates.iter().for_each(|gate| gate.step(Duration::from_secs(1)));
+        let _ = info_text(&mut probe, b"persistence");
+    }
+    node.clock_gates.iter().for_each(|gate| gate.open());
+    (in_flight, at_drop)
+}
+
+/// The durable walk leg's engagement, read from cell 0's staging image
+/// when the drop was sent: the walk had written some of the namespace and
+/// fewer keys than cell 0 owns. What it had written outweighs the pace's
+/// allowance on the held clock, so no slice could start after those
+/// sections (one starts only while the streamed bytes are under the
+/// allowance), and none was in flight or staged: every key not written was
+/// still ahead of the walk, which a checkpoint that opens in the wait
+/// cannot show.
+fn drop_wait_assert_walk_mid_share(acked: &[AckedWrite], at_drop: &WalkAtDrop) {
+    let owned = acked.iter().filter(|w| w.cell == 0).count();
+    let WalkAtDrop { written, written_kv_bytes, allowance_bytes } = *at_drop;
+    assert!(written > 0, "VACUOUS: cell 0's walk had written none of the namespace at the drop");
+    assert!(written < owned, "VACUOUS: cell 0's walk had written all {owned} of its keys");
+    assert!(
+        written_kv_bytes >= allowance_bytes,
+        "VACUOUS: cell 0's walk was not held by its pace at the drop ({written_kv_bytes} B \
+         written, {allowance_bytes} B allowed)"
+    );
+}
+
+/// What cell 0's published checkpoint says about namespace 16: whether
+/// its `MANIFEST` has the tier section, and the address references its
+/// image holds.
+fn drop_wait_origin_tier_witness(dir: &std::path::Path) -> (bool, usize) {
+    let shard = dir.join("shard-0");
+    let manifest = inf_log::read_manifest(&inf_log::fs::StdSegmentFs, &shard)
+        .expect("manifest reads")
+        .expect("checkpoint published");
+    let ick = shard.join("ckpt").join(inf_log::ckpt::ick_file_name(manifest.ckpt_id));
+    let mut refs = 0usize;
+    let _ = inf_log::ckpt::read_ick_hybrid(
+        &inf_log::fs::StdSegmentFs,
+        &ick,
+        inf_log::ckpt::IckReaderConfig::default(),
+        |_| Ok::<(), ()>(()),
+        |section| {
+            if section.ns == 16 {
+                refs += section.len();
+            }
+            Ok(())
+        },
+        |_| Ok(()),
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .expect("published checkpoint validates");
+    (manifest.tier_ns(16).is_some(), refs)
+}
+
+/// Files under `shard-k/ns-16/cold` per cell: (tier files, blob extents
+/// live or quarantined).
+fn drop_wait_cold_files(dir: &std::path::Path) -> Vec<(usize, usize)> {
+    (0..2u16)
+        .map(|cell| {
+            let cold = dir.join(format!("shard-{cell}")).join("ns-16").join("cold");
+            let names: Vec<String> = std::fs::read_dir(&cold)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            let tier = names.iter().filter(|n| inf_log::parse_tier_file_name(n).is_some());
+            let extents = names.iter().filter(|n| {
+                inf_log::parse_extent_file_name(n).is_some()
+                    || inf_log::parse_quarantined_file_name(n).is_some()
+            });
+            (tier.count(), extents.count())
+        })
+        .collect()
+}
+
+/// Restarts on `dir` with the real control thread, reads every recorded
+/// write back, stops the node and returns the misses; a refused boot
+/// panics with the refusal. The tiered file count is taken after the
+/// stop, which drains the control thread's queued unlinks, so it is the
+/// restart's settled state rather than a sample of that queue.
+fn drop_wait_restart(
+    dir: &std::path::Path,
+    kind: DropWaitNs,
+    acked: &[AckedWrite],
+    context: &mut String,
+) -> Vec<String> {
+    let served = Node::start_durable_or_refusal(2, dir).map(|node| {
+        let misses = drop_wait_misses(&node, kind.name(), acked);
+        node.stop();
+        misses
+    });
+    if kind == DropWaitNs::Tiered {
+        let cold_after = drop_wait_cold_files(dir);
+        context.push_str(&format!(", after the restart and its stop {cold_after:?}"));
+    }
+    match served {
+        Ok(misses) => misses,
+        Err(refusal) => {
+            std::fs::remove_dir_all(dir).ok();
+            panic!("the restart refused to boot: {refusal}\n  {context}");
+        }
+    }
+}
+
+/// The scenario: seed, restart with the swap held, drop on cell 0, the
+/// checkpoint `checkpoint` names, cut, restart, and the oracle.
+fn drop_wait_scenario(kind: DropWaitNs, checkpoint: DropWaitCheckpoint, tag: &str) {
+    let dir = temp_data_dir(tag);
+    let acked = seed_drop_wait_namespace(kind, &dir);
+    let ns = kind.name();
+    let (slice_bytes, stream_bytes_per_sec) = (4u32 << 10, 256u32 << 10);
+    let trigger = match checkpoint {
+        DropWaitCheckpoint::WalksAcross => CkptTrigger::Paced { slice_bytes, stream_bytes_per_sec },
+        DropWaitCheckpoint::NotRequested | DropWaitCheckpoint::OpensInside => CkptTrigger::Manual,
+    };
+    // The catalog writer never drains on this node: every swap requested
+    // from here on stays un-durable, and the cut below loses it.
+    let hold = Arc::new(AtomicBool::new(true));
+    let node = Node::start_durable_with_held_catalog(2, &dir, hold, trigger);
+    let before = drop_wait_misses(&node, ns, &acked);
+    assert!(before.is_empty(), "acked writes missing before the drop: {before:?}");
+    let control = Arc::clone(node.control.as_ref().expect("a durable node"));
+    let persisted_before = control.persisted_epoch();
+    let published_before = drop_wait_min_published(&node);
+    let (in_flight, at_drop) = match checkpoint {
+        DropWaitCheckpoint::NotRequested => (drop_on_origin(&node, ns), None),
+        DropWaitCheckpoint::OpensInside => {
+            let in_flight = drop_on_origin(&node, ns);
+            let epoch = node.request_ckpt_all();
+            drop_wait_published(&node, epoch);
+            (in_flight, None)
+        }
+        DropWaitCheckpoint::WalksAcross => {
+            let (in_flight, at_drop) = walk_across_the_drop(&node, &dir, ns, stream_bytes_per_sec);
+            (in_flight, Some(at_drop))
+        }
+    };
+    assert_eq!(control.persisted_epoch(), persisted_before, "the drop's swap stayed held");
+    if checkpoint == DropWaitCheckpoint::NotRequested {
+        assert_eq!(drop_wait_min_published(&node), published_before, "no checkpoint in the wait");
+    }
+    let origin_use = in_flight.origin_use.clone();
+    drop(in_flight);
+    node.kill_without_catalog_drain();
+    let mut context = format!(
+        "namespace '{}' ({kind:?}), un-acked DROP from cell 0, its catalog swap never durable, \
+         checkpoint {checkpoint:?}; cell 0 answered USE in the wait: {origin_use:?}",
+        String::from_utf8_lossy(ns)
+    );
+    if let Some(at_drop) = &at_drop {
+        context.push_str(&format!(
+            "; cell 0's staging image when the drop was sent: {} post-images ({} B of keys and \
+             values), pace allowance {} B",
+            at_drop.written, at_drop.written_kv_bytes, at_drop.allowance_bytes
+        ));
+        if kind == DropWaitNs::Durable {
+            drop_wait_assert_walk_mid_share(&acked, at_drop);
+        }
+    }
+    if kind == DropWaitNs::Tiered {
+        let cold_at_cut = drop_wait_cold_files(&dir);
+        let (named, refs) = drop_wait_origin_tier_witness(&dir);
+        if checkpoint == DropWaitCheckpoint::WalksAcross {
+            assert!(refs > 0, "VACUOUS: cell 0's walk staged no address reference");
+        }
+        context.push_str(&format!(
+            "; cell 0's last checkpoint: MANIFEST tier section for ns 16 {named}, address \
+             refs for ns 16 in its image {refs}; (tier files, extents) per cell at the cut \
+             {cold_at_cut:?}"
+        ));
+    }
+    let misses = drop_wait_restart(&dir, kind, &acked, &mut context);
+    std::fs::remove_dir_all(&dir).ok();
+    let lost =
+        |cell: u16| misses.iter().filter(|m| m.starts_with(&format!("cell {cell}:"))).count();
+    let owned = |cell: u16| acked.iter().filter(|w| w.cell == cell).count();
+    assert!(
+        misses.is_empty(),
+        "{} of {} writes acknowledged before the drop are not served after the restart \
+         (cell 0: {} of {} lost, cell 1: {} of {} lost); first: {:?}\n  {context}",
+        misses.len(),
+        acked.len(),
+        lost(0),
+        owned(0),
+        lost(1),
+        owned(1),
+        &misses[..misses.len().min(4)]
+    );
+}
+
+/// A checkpoint of every cell that opens while a durable namespace's drop
+/// waits for its swap keeps every key a cut there restores.
+#[test]
+#[ignore = "red until a DROP applies on its origin only after its catalog swap is durable \
+            (ADR-0189 D5)"]
+fn a_checkpoint_inside_a_durable_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Durable, DropWaitCheckpoint::OpensInside, "dw-durable-ckpt");
+}
+
+/// The control leg of the durable tests: the same cut, no checkpoint.
+#[test]
+fn a_cut_inside_a_durable_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Durable, DropWaitCheckpoint::NotRequested, "dw-durable-cut");
+}
+
+/// A checkpoint already part-way through a durable namespace when the
+/// drop requests its swap: the keys its walk had not reached must still be
+/// served after a cut there.
+#[test]
+#[ignore = "red until a DROP applies on its origin only after its catalog swap is durable \
+            (ADR-0189 D5)"]
+fn a_walk_across_a_durable_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Durable, DropWaitCheckpoint::WalksAcross, "dw-durable-walk");
+}
+
+/// The same for a tiered namespace, whose keys live in tier files the
+/// origin's `MANIFEST` must keep naming.
+#[test]
+#[ignore = "red until a DROP applies on its origin only after its catalog swap is durable \
+            (ADR-0189 D5)"]
+fn a_checkpoint_inside_a_tiered_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Tiered, DropWaitCheckpoint::OpensInside, "dw-tiered-ckpt");
+}
+
+/// The control leg of the tiered tests: the same cut, no checkpoint.
+#[test]
+fn a_cut_inside_a_tiered_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Tiered, DropWaitCheckpoint::NotRequested, "dw-tiered-cut");
+}
+
+/// A checkpoint already walking the tiered namespace when the drop
+/// requests its swap: the image's address references and the `MANIFEST`'s
+/// tier section must agree, so the restart boots and serves every key.
+#[test]
+#[ignore = "red until a DROP applies on its origin only after its catalog swap is durable \
+            (ADR-0189 D5)"]
+fn a_walk_across_a_tiered_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Tiered, DropWaitCheckpoint::WalksAcross, "dw-tiered-walk");
+}
+
+// ---- a cut inside a rolled-back CREATE's catalog wait ----
+//
+// A `CREATE` whose fan a peer refuses rolls back: it asks the catalog
+// writer for the swap that drops the namespace again and waits for its
+// answer. The `CREATE`'s own swap is durable by then, and the origin
+// served the namespace while its fan was in flight, so a write acknowledged
+// there is the client's to keep: a cut before the rollback's answer must
+// boot the catalog that names the namespace and serve that write (ADR-0189
+// D5, the rollback in the `DROP`'s order). The scenario lets the
+// `CREATE`'s swap land and holds the rollback's, holds the peer's `CREATE`
+// leg until a write on the origin is acknowledged, lets every cell publish
+// a checkpoint inside the rollback's wait or not, cuts, and reads the
+// write back. The control leg cuts at the same instant with no checkpoint.
+
+/// Keys the rolled-back scenario writes on the origin, and each value's
+/// length.
+const ROLLBACK_WAIT_KEYS: usize = 64;
+const ROLLBACK_WAIT_VALUE_BYTES: usize = 1 << 10;
+
+/// The rolled-back `CREATE`'s scenario: `checkpoint` publishes one on
+/// every cell inside the rollback's wait.
+fn rollback_wait_scenario(checkpoint: bool, tag: &str) {
+    let dir = temp_data_dir(tag);
+    let leg = inf_foundation::fault::HoldGate::new();
+    let hold = Arc::new(AtomicBool::new(true));
+    // A peer's first `CREATE` leg waits on `leg`, then is refused.
+    let node = Node::start_cfg_default(
+        2,
+        Some(dir.clone()),
+        CkptTrigger::Manual,
+        Default::default(),
+        vec![
+            (inf_server::fault::NS_CREATE_LEG_HELD, inf_foundation::fault::FaultSpec::Nth(1)),
+            (inf_server::fault::NS_CREATE_FAN_REFUSED, inf_foundation::fault::FaultSpec::Nth(1)),
+        ],
+        false,
+        false,
+        false,
+        None,
+        inf_log::SegmentIoMode::Buffered,
+        None,
+        Default::default(),
+        Some(hold),
+        None,
+        None,
+        vec![(1, inf_server::fault::NS_CREATE_LEG_HELD, leg.clone())],
+    );
+    let control = Arc::clone(node.control.as_ref().expect("a durable node"));
+    // The `CREATE`'s swap lands; the rollback's stays queued.
+    node.land_held_persists(1);
+    // Both connections land on cell 0 before the peer holds its leg: a
+    // connection that lands on the held peer is not answered.
+    let mut creator = conn_on_cell(&node, 0);
+    let mut writer = conn_on_cell(&node, 0);
+    creator
+        .write_all(&cmd(&[
+            b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"always",
+        ]))
+        .expect("write");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !leg.is_held() {
+        assert!(Instant::now() < deadline, "the CREATE never fanned its leg");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The fan is in flight: the origin serves the namespace, and every
+    // write here follows its fsync (`FSYNC always`).
+    writer.write_all(&cmd(&[b"INF.NS", b"USE", b"ledger"])).expect("write");
+    read_exactly(&mut writer, b"+OK\r\n");
+    let mut acked = Vec::new();
+    for key in keys_for_cell(2, 0, ROLLBACK_WAIT_KEYS) {
+        let mut value = [b"acked:".as_slice(), &key].concat();
+        value.resize(ROLLBACK_WAIT_VALUE_BYTES, b'.');
+        writer.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(&mut writer, b"+OK\r\n");
+        acked.push(AckedWrite { key, value, cell: 0 });
+    }
+    drop(writer);
+    // The peer refuses its leg; the origin rolls back and requests the
+    // swap that drops the namespace, which the held writer never lands.
+    let requested = control.persist_requests_sent();
+    leg.release();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while control.persist_requests_sent() == requested {
+        assert!(Instant::now() < deadline, "the rollback never requested its catalog swap");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let published_before = drop_wait_min_published(&node);
+    if checkpoint {
+        let epoch = node.request_ckpt_all();
+        drop_wait_published(&node, epoch);
+    } else {
+        assert_eq!(drop_wait_min_published(&node), published_before, "no checkpoint in the wait");
+    }
+    let origin_use = drop_wait_use_on(&node, 0, b"ledger");
+    drop(creator);
+    node.kill_without_catalog_drain();
+    let mut context = format!(
+        "a CREATE of 'ledger' rolled back after a refused leg, its rollback's swap never \
+         durable, checkpoint in the wait {checkpoint}; cell 0 answered USE in the wait: \
+         {origin_use:?}"
+    );
+    let misses = drop_wait_restart(&dir, DropWaitNs::Durable, &acked, &mut context);
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        misses.is_empty(),
+        "{} of {} writes acknowledged inside the CREATE's fan are not served after the restart \
+         (cell 0: {} of {} lost); first: {:?}\n  {context}",
+        misses.len(),
+        acked.len(),
+        misses.len(),
+        acked.len(),
+        &misses[..misses.len().min(4)]
+    );
+}
+
+/// A checkpoint of every cell that publishes while a rolled-back
+/// `CREATE` waits for the swap that drops it keeps every write the origin
+/// acknowledged inside the fan.
+#[test]
+#[ignore = "red until a CREATE rollback applies on its origin only after its catalog swap is \
+            durable (ADR-0189 D5)"]
+fn a_checkpoint_inside_a_rolled_back_create_wait_keeps_every_acked_key() {
+    rollback_wait_scenario(true, "rw-ckpt");
+}
+
+/// The control leg: the same cut, no checkpoint.
+#[test]
+fn a_cut_inside_a_rolled_back_create_wait_keeps_every_acked_key() {
+    rollback_wait_scenario(false, "rw-cut");
+    receipt::verified("ns_create_leg_held", "rolled-back-create-keeps-acked-writes");
+}
+
+// ---- every exit after the catalog writer's answer posts its notice ----
+
+/// The catalog writer holds one pending DDL until the DDL's notice
+/// arrives (ADR-0189 D3), and every exit of a DDL after its answer posts
+/// that notice (D5): a fault point that stops a DDL after its answer, a
+/// `CREATE` rolled back after a refused leg, and a normal end each leave
+/// the next DDL admitted (`+OK`), never refused as conflicting with a DDL
+/// still pending. Every DDL runs from cell 0, whose fault plan counts its
+/// own occurrences; the refused leg is cell 1's third `CREATE` leg.
+#[test]
+fn a_ddl_stopped_after_its_answer_leaves_no_ddl_pending() {
+    use inf_foundation::fault::FaultSpec;
+    use inf_server::fault::{NS_CREATE_AFTER_META, NS_CREATE_FAN_REFUSED, NS_DROP_AFTER_META};
+    let dir = temp_data_dir("ddl-after-answer");
+    let node = Node::start_durable_with_faults(
+        2,
+        &dir,
+        vec![
+            (NS_CREATE_AFTER_META, FaultSpec::Nth(1)),
+            (NS_DROP_AFTER_META, FaultSpec::Nth(1)),
+            (NS_CREATE_FAN_REFUSED, FaultSpec::Nth(3)),
+        ],
+    );
+    let mut c = conn_on_cell(&node, 0);
+    let steps: [(&[&[u8]], &[u8]); 6] = [
+        (&[b"CREATE", b"a", b"MODE", b"durable"], b"-ERR fault: ns_create_after_meta\r\n"),
+        (&[b"CREATE", b"b", b"MODE", b"durable"], b"+OK\r\n"),
+        (&[b"DROP", b"b"], b"-ERR fault: ns_drop_after_meta\r\n"),
+        (&[b"CREATE", b"c", b"MODE", b"durable"], b"+OK\r\n"),
+        (&[b"CREATE", b"d", b"MODE", b"durable"], b"-ERR fault: ns_create_fan_refused\r\n"),
+        (&[b"CREATE", b"e", b"MODE", b"durable"], b"+OK\r\n"),
+    ];
+    for (step, (args, want)) in steps.iter().enumerate() {
+        let argv: Vec<&[u8]> = [&b"INF.NS"[..]].into_iter().chain(args.iter().copied()).collect();
+        c.write_all(&cmd(&argv)).expect("write");
+        let reply = read_line(&mut c);
+        assert_eq!(
+            String::from_utf8_lossy(&reply),
+            String::from_utf8_lossy(want),
+            "step {step} ({}): the DDL after one stopped past its answer",
+            String::from_utf8_lossy(&args.join(&b' '))
+        );
+    }
+    let text = wait_persistence_field(&mut c, "ns_ddl_pending", "0");
+    assert!(text.contains("ns_ddl_pending:0\r\n"), "no DDL is left pending: {text}");
+    assert!(text.contains("ns_ddl_notices_stale:0\r\n"), "every notice retired its DDL: {text}");
+    assert!(!text.contains("catalog_epoch:0\r\n"), "the writer answered requests: {text}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- a tiered DROP frees its origin's tier files on the running node ----
+
+/// What cell `conn`'s tier cell counted at its last MAINTAIN: the sealed
+/// and active files of its tiered namespaces, and its flush rounds live
+/// or draining.
+fn tier_cell_files_and_rounds(conn: &mut TcpStream) -> (u64, u64) {
+    let files = scrape_u64(conn, b"tiering", "tiering_files_sealed:")
+        + scrape_u64(conn, b"tiering", "tiering_files_active:");
+    (files, scrape_u64(conn, b"tiering", "tiering_flush_rounds_inflight:"))
+}
+
+/// A tiered `DROP` frees its origin's tier files on the running node once
+/// the catalog swap that carries it is durable (ADR-0100 D5): no restart
+/// is needed for the space. The origin holds the files from its local
+/// apply, before the writer numbers the request, and the answer lowers
+/// the hold to the drop's epoch. The swap is held until cell 0's MAINTAIN
+/// has taken the namespace off its tier cell with no flush round left, so
+/// the hold the answer lowers is the one in the teardown queue. Oracle:
+/// the shard directories. Cell 0 keeps every tier file of ns 16 while the
+/// swap is held, and once it lands, every cell's are gone within the
+/// deadline (cell 1's are held by the fan's epoch).
+#[test]
+fn a_tiered_drop_frees_its_origins_tier_files_without_a_restart() {
+    let dir = temp_data_dir("drop-frees-origin");
+    seed_drop_wait_namespace(DropWaitNs::Tiered, &dir);
+    let hold = Arc::new(AtomicBool::new(true));
+    let node = Node::start_durable_with_held_catalog(2, &dir, hold, CkptTrigger::Manual);
+    let control = Arc::clone(node.control.as_ref().expect("a durable node"));
+    let before = drop_wait_cold_files(&dir);
+    assert!(before[0].0 > 0, "VACUOUS: cell 0 has no tier file of ns 16: {before:?}");
+    let mut gauges = conn_on_cell(&node, 0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while tier_cell_files_and_rounds(&mut gauges).0 == 0 {
+        assert!(Instant::now() < deadline, "VACUOUS: cell 0's tier cell never counted a file");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let requested = control.persist_requests_sent();
+    let mut dropper = conn_on_cell(&node, 0);
+    dropper.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
+    while control.persist_requests_sent() == requested {
+        assert!(Instant::now() < deadline, "the drop never requested its catalog swap");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // MAINTAIN takes the dropped namespace off the tier cell while the
+    // swap is held: its files wait in the teardown queue, held.
+    while tier_cell_files_and_rounds(&mut gauges) != (0, 0) {
+        assert!(Instant::now() < deadline, "cell 0's MAINTAIN never queued the teardown");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let held = drop_wait_cold_files(&dir);
+    assert_eq!(held[0].0, before[0].0, "cell 0 unlinked a tier file before its swap was durable");
+    node.land_held_persists(1);
+    read_exactly(&mut dropper, b"+OK\r\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = drop_wait_cold_files(&dir);
+        if now.iter().all(|&(tier, _)| tier == 0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tier files of the dropped namespace are still on disk 10 s after its swap, \
+             (tier files, extents) per cell {now:?}; at the hold {held:?}"
+        );
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(dropper);
+    drop(gauges);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
 }

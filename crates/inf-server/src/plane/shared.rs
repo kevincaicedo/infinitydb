@@ -696,9 +696,14 @@ pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone +
     if !argv[0].eq_ignore_ascii_case(b"INF.NSFAN") {
         return false;
     }
-    let start = scratch.len();
-    let reply = scratch.open();
-    let mut w = RespWriter::new(reply, Protocol::Resp2);
+    // Test builds only: a test holds a `CREATE` leg here, so a write the
+    // origin acknowledges lands while the fan is in flight.
+    if argv.len() == 9
+        && argv[1].eq_ignore_ascii_case(b"CREATE")
+        && inf_foundation::fault::fire(crate::fault::NS_CREATE_LEG_HELD)
+    {
+        inf_foundation::fault::hold(crate::fault::NS_CREATE_LEG_HELD);
+    }
     // Crash-matrix point (ADR-0108 D3): a peer refusing its `CREATE`
     // leg — the deterministic stand-in for the OS refusing the tier
     // ring reservation on this cell after the catalog swap.
@@ -706,18 +711,34 @@ pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone +
         && argv[1].eq_ignore_ascii_case(b"CREATE")
         && inf_foundation::fault::fire(crate::fault::NS_CREATE_FAN_REFUSED)
     {
-        w.error("ERR fault: ns_create_fan_refused");
-        let outcome = reply.outcome();
-        staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
+        let refusal = |w: &mut RespWriter<'_>| w.error("ERR fault: ns_create_fan_refused");
+        stage_leg_refusal(scratch, staged, (from, token), refusal);
         return true;
     }
     match apply_nsfan(shared, argv) {
-        Ok(()) => w.simple("OK"),
-        Err(e) => crate::admin::ns_error(e, &mut w),
+        // An applied leg answers its variant alone (ADR-0189 D5): the
+        // origin reads `Ok` as applied, never a reply's bytes.
+        Ok(()) => staged.push((from, token, StagedReply::Ok)),
+        Err(e) => {
+            stage_leg_refusal(scratch, staged, (from, token), |w| crate::admin::ns_error(e, w))
+        }
     }
+    true
+}
+
+/// Stages a refused DDL leg's error reply in the drain's scratch, its
+/// outcome read from the reply's writer (ADR-0190 D2).
+fn stage_leg_refusal(
+    scratch: &mut ReplyStream,
+    staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
+    (from, token): (CellId, FabricToken),
+    write: impl FnOnce(&mut RespWriter<'_>),
+) {
+    let start = scratch.len();
+    let reply = scratch.open();
+    write(&mut RespWriter::new(reply, Protocol::Resp2));
     let outcome = reply.outcome();
     staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
-    true
 }
 
 fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(

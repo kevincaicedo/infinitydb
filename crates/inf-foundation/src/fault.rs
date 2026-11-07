@@ -7,8 +7,10 @@
 //!
 //! **Threading model:** the registry is thread-local. Cells are
 //! single-threaded (L1); arming happens on the thread that will fire —
-//! test bodies for the sync tier, cell-boot plans for node tests. No
-//! shared state, no atomics, nothing for the cell denylist to see.
+//! test bodies for the sync tier, cell-boot plans for node tests. The one
+//! value two threads share is a [`HoldGate`]: the thread that waits arms
+//! it on itself, and the test that releases it keeps a clone. With the
+//! feature off nothing is shared, and nothing for the cell denylist to see.
 //!
 //! **Cost model:** compiled out entirely unless the `fault-points`
 //! feature is on (test builds enable it through dev-dependency feature
@@ -133,6 +135,80 @@ mod imp {
     pub fn fired(point: &'static str) -> u64 {
         ARMED.with(|armed| armed.borrow().iter().find(|a| a.point == point).map_or(0, |a| a.fired))
     }
+
+    /// No thread has reached the gate's point yet.
+    const GATE_ARMED: u8 = 0;
+    /// A thread waits at the gate's point.
+    const GATE_HELD: u8 = 1;
+    /// The holder released the gate: a thread at its point proceeds.
+    const GATE_RELEASED: u8 = 2;
+
+    /// One cross-thread hold: the order of two threads a test needs
+    /// decided, where no injected clock reaches (the catalog writer's
+    /// senders, a peer's fan leg). The thread that will wait arms the gate
+    /// on itself ([`arm_hold`]), as every point is armed on the thread
+    /// that fires it; the test keeps a clone and releases it. A thread
+    /// whose point fires with no gate armed does not wait.
+    #[derive(Clone, Debug, Default)]
+    pub struct HoldGate(std::sync::Arc<core::sync::atomic::AtomicU8>);
+
+    impl HoldGate {
+        /// A gate no thread has reached.
+        #[must_use]
+        pub fn new() -> HoldGate {
+            HoldGate::default()
+        }
+
+        /// A thread waits at the gate's point now.
+        #[must_use]
+        pub fn is_held(&self) -> bool {
+            self.0.load(core::sync::atomic::Ordering::Acquire) == GATE_HELD
+        }
+
+        /// The waiting thread, or the next one to reach the point, goes on.
+        pub fn release(&self) {
+            self.0.store(GATE_RELEASED, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    thread_local! {
+        static HOLDS: RefCell<Vec<(&'static str, HoldGate)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Arms `gate` for this thread's next [`hold`] of `point` (one use;
+    /// re-arming replaces the gate). Arm the point itself with [`arm`].
+    pub fn arm_hold(point: &'static str, gate: &HoldGate) {
+        HOLDS.with(|holds| {
+            let mut holds = holds.borrow_mut();
+            holds.retain(|(p, _)| *p != point);
+            holds.push((point, gate.clone()));
+        });
+    }
+
+    /// Waits at `point` until this thread's armed gate is released, or
+    /// until no other handle of it lives (a test that ended without
+    /// releasing it); returns at once with no gate armed. The site calls
+    /// it only when its point fired, so an unarmed build never waits.
+    pub fn hold(point: &'static str) {
+        let gate = HOLDS.with(|holds| {
+            let mut holds = holds.borrow_mut();
+            let at = holds.iter().position(|(p, _)| *p == point)?;
+            Some(holds.swap_remove(at).1)
+        });
+        let Some(HoldGate(state)) = gate else { return };
+        let _ = state.compare_exchange(
+            GATE_ARMED,
+            GATE_HELD,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        );
+        while state.load(core::sync::atomic::Ordering::Acquire) != GATE_RELEASED
+            && std::sync::Arc::strong_count(&state) > 1
+        {
+            core::hint::spin_loop();
+            std::thread::yield_now();
+        }
+    }
 }
 
 #[cfg(not(feature = "fault-points"))]
@@ -166,9 +242,34 @@ mod imp {
     pub fn fired(_point: &'static str) -> u64 {
         0
     }
+
+    /// Compiled out: a gate no thread can wait on.
+    #[derive(Clone, Debug, Default)]
+    pub struct HoldGate;
+
+    impl HoldGate {
+        #[must_use]
+        pub fn new() -> HoldGate {
+            HoldGate
+        }
+
+        #[must_use]
+        pub fn is_held(&self) -> bool {
+            false
+        }
+
+        pub fn release(&self) {}
+    }
+
+    #[inline(always)]
+    pub fn arm_hold(_point: &'static str, _gate: &HoldGate) {}
+
+    /// Compiled out: never waits (no site reaches it: `fire` is false).
+    #[inline(always)]
+    pub fn hold(_point: &'static str) {}
 }
 
-pub use imp::{arm, disarm, disarm_all, fire, fired, occurrences};
+pub use imp::{HoldGate, arm, arm_hold, disarm, disarm_all, fire, fired, hold, occurrences};
 
 #[cfg(all(test, feature = "fault-points"))]
 mod tests {
@@ -201,6 +302,48 @@ mod tests {
         let b: Vec<bool> = (0..64).map(|_| fire("p")).collect();
         assert_eq!(a, b, "same seed, same firing schedule (L7)");
         assert!(a.iter().any(|&h| h) && !a.iter().all(|&h| h), "p=1/4 over 64 draws");
+    }
+
+    /// A thread that armed a gate waits at its point until the holder
+    /// releases it; an unarmed thread, a second reach and a gate whose
+    /// holder is gone never wait.
+    #[test]
+    fn a_hold_waits_until_released_and_only_where_armed() {
+        disarm_all();
+        hold("h");
+        let gate = HoldGate::new();
+        let waiter = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                arm("h", FaultSpec::Always);
+                arm_hold("h", &gate);
+                if fire("h") {
+                    hold("h");
+                }
+                hold("h");
+            })
+        };
+        while !gate.is_held() {
+            std::thread::yield_now();
+        }
+        assert!(!waiter.is_finished(), "the armed thread waits at its point");
+        gate.release();
+        waiter.join().expect("the released thread finishes");
+        assert!(!gate.is_held());
+        let orphan = HoldGate::new();
+        let abandoned = {
+            let orphan = orphan.clone();
+            std::thread::spawn(move || {
+                arm_hold("h", &orphan);
+                drop(orphan);
+                hold("h");
+            })
+        };
+        while !orphan.is_held() {
+            std::thread::yield_now();
+        }
+        drop(orphan);
+        abandoned.join().expect("a gate with no holder left releases its thread");
     }
 
     #[test]
