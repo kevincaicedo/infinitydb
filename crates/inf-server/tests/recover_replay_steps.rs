@@ -1166,9 +1166,10 @@ const GAUGE_SLACK: u64 = 3 * inf_log::ckpt::ICK_BLOCK_ALIGN as u64;
 
 /// The work gauge against what the step did (ADR-0174 A1.2): a step's work
 /// is what it charged plus the bytes of the frame or section it entered and
-/// parked in, never their price. On a frame row the gauge is within `B + U`
-/// (B1), and on a row that enters no unit — nothing parks there — it is the
-/// step's charge, within the same. On a section row a step parks only in a
+/// parked in, never their price. On a frame row the gauge is within `B + U`,
+/// as a step's work is at most its budget and one unit; on a row that enters
+/// no unit (nothing parks there) it is the step's charge, within the same.
+/// On a section row a step parks only in a
 /// section it entered, whose block it read at its entry, so the gauge is
 /// within `B`, the bytes the step read and [`GAUGE_SLACK`] where the step
 /// charged no boot I/O, or `U` in its place where it did. `Some` names the
@@ -2455,9 +2456,9 @@ fn over_price(kind: &str, step: usize, units: u64, price: u64, budget: u64) -> O
     (units * price > budget + price).then(|| format!("{kind}: step {step} ran {units} at {price}"))
 }
 
-/// The end of a boot at size (the end-phase row, at a size the suite runs),
-/// at a 256 KiB budget under the step judge (`U` one hand-over unit): the
-/// hand-over's sweep seed stamps 12 000 parked replay deaths and seeds
+/// The end of a boot at the size the suite runs, at a 256 KiB budget under
+/// the step judge (`U` one hand-over unit): the hand-over's sweep seed
+/// stamps 12 000 parked replay deaths and seeds
 /// 12 000 listed ids, 12 000 orphans among them, and 128 quarantined ones; 64
 /// quarantined extents are renamed back; the ticket rebuild scans every probe
 /// group of the index and hands back the 1 904 pairs past its cap, each read
