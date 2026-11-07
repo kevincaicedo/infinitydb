@@ -1786,6 +1786,57 @@ mod tests {
         inf_foundation::fault::disarm_all();
     }
 
+    /// A create that fails after its file exists must not wedge the
+    /// namespace: the file the failed attempt made has an owner, and the
+    /// create runs again only once that file is gone, so no retry meets the
+    /// name it left. The rotation to B fails once after B is made and named;
+    /// eight more plans follow, as eight MAINTAINs would run them.
+    #[test]
+    #[ignore = "a create that fails after its file exists leaves that file with no owner, and \
+                every later create of the same name answers EEXIST; red until a failed create's \
+                file is owned from before the create and removed before its name is made again"]
+    fn a_create_that_fails_after_its_file_exists_does_not_wedge_the_namespace() {
+        const RETRIES: usize = 8;
+        let disk = SimDisk::new();
+        let mut flush = sim_pipeline(&disk, 1000);
+        stage(&mut flush, span(0, 600, None), &[0xA0; 600]).expect("file A");
+        let effects = run_round(&disk, &mut flush);
+        apply(&mut flush, &effects);
+        inf_foundation::fault::arm(crate::fault::TIER_CREATE_POST_FAIL, FaultSpec::Nth(1));
+        let err = stage(&mut flush, span(600, 600, None), &[0xA1; 600])
+            .expect_err("B's create fails after B exists");
+        assert_eq!(inf_foundation::fault::fired(crate::fault::TIER_CREATE_POST_FAIL), 1);
+        assert!(err.to_string().contains("tier_create_post_fail"), "engagement: {err}");
+        let b = Path::new("shard-0").join("cold").join(crate::tier::tier_file_name(1));
+        assert!(disk.open_read(&b).is_ok(), "engagement: the failed create left B on the disk");
+        assert_eq!(flush.next_file_id(), 1, "the failure spent no file id");
+        let mut eexist = 0;
+        let mut created = false;
+        for _ in 0..RETRIES {
+            match stage(&mut flush, span(600, 600, None), &[0xA1; 600]) {
+                Ok(()) => {
+                    created = true;
+                    break;
+                }
+                Err(TierFlushError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    eexist += 1;
+                }
+                Err(_) => {}
+            }
+        }
+        inf_foundation::fault::disarm_all();
+        assert_eq!(
+            eexist,
+            0,
+            "{eexist} of {RETRIES} creates after the failed one answered EEXIST on {} (the name \
+             the failed attempt left, next file id still {}); B created: {created}",
+            b.display(),
+            flush.next_file_id()
+        );
+    }
+
     /// A round stages at most two seals (ADR-0155 D3): a span far above a
     /// small file target rotates once and stays whole in one oversized
     /// file, and a trailing gap seals that file — never a seal per target.
