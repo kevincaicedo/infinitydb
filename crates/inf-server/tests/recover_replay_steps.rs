@@ -1459,6 +1459,7 @@ fn ick_sections(fs: &MemFs, ick: &std::path::Path) -> (u64, u64) {
             .expect("a section");
         match step {
             IckStep::Section { .. } => sections += 1,
+            IckStep::Parked => panic!("a walk that consumes every item never parks"),
             IckStep::Done(_) => return (sections, sidecar.get()),
         }
     }

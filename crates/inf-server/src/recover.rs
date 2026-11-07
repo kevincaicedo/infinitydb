@@ -1848,6 +1848,12 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                         return Ok(RecoveryProgress::Working);
                     }
                 }
+                // A walk that consumes every item never parks; were one to,
+                // the next step resumes the section the reader holds.
+                IckStep::Parked => {
+                    self.phase = Phase::Ick { reader };
+                    return Ok(RecoveryProgress::Working);
+                }
                 IckStep::Done(summary) => {
                     self.stats.ckpt_records = summary.records;
                     // ADR-0174 R9: the end of the checkpoint, before the tail.

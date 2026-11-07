@@ -600,11 +600,183 @@ impl IckIdxSidecarSection<'_> {
 /// One [`IckReader::next_step`] outcome.
 #[derive(Debug)]
 pub enum IckStep {
-    /// One section validated and applied; `bytes` = on-disk block bytes
-    /// consumed (the M2-S15 progress currency).
+    /// One section validated and walked to its end; `bytes` = on-disk block
+    /// bytes consumed (the M2-S15 progress currency).
     Section { bytes: u64 },
+    /// A handler parked the walk inside a section (ADR-0174 A1): the reader
+    /// keeps the section and its cursor at the item not consumed, and the
+    /// next call presents that item again, with no second read or audit.
+    Parked,
     /// Footer validated — the load is complete and fully audited.
     Done(IckSummary),
+}
+
+/// What a section walk's record handler answers (ADR-0174 A1): the record
+/// is consumed and the walk moves past it, or the walk parks at it — the
+/// record changed nothing, and the next step presents it again.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SectionFlow {
+    Next,
+    Park,
+}
+
+/// A section's class, by its block tag.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IckSectionKind {
+    /// Tag 0x01: records.
+    Records,
+    /// Tag 0x03: address references.
+    Refs,
+    /// Tag 0x04: live-set entries.
+    LiveSet,
+    /// Tag 0x05: blob-reference entries.
+    BlobRefs,
+    /// Tag 0x06: an index sidecar, walked whole.
+    IdxSidecar,
+}
+
+/// The section a step entered or resumes, announced to the walk before its
+/// first item is presented (ADR-0174 A1.5): its kind, its bytes, its items
+/// and how far an earlier step walked it. The section's read and audit
+/// happened once, at its entry; a resumed walk reads and audits nothing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IckSectionEntry {
+    pub kind: IckSectionKind,
+    /// The block's bytes, its padding included — what [`IckStep::Section`]
+    /// credits once the walk reaches the section's end.
+    pub block_bytes: u64,
+    /// The items the section holds: records, or fixed-width entries.
+    pub items: u32,
+    /// The items walked before this step (0 at the section's entry).
+    pub items_done: u32,
+    /// Their bytes: the records' encoded bytes, or the entries' widths.
+    pub item_bytes_done: u64,
+    /// An earlier step parked in this section.
+    pub resumed: bool,
+}
+
+/// The handlers a stepped checkpoint load drives, one per section class
+/// (ADR-0174 A1.5). The reader announces each section it enters or
+/// resumes, presents its records one at a time — a handler answers
+/// [`SectionFlow::Next`] or parks — and hands an entry section's handler
+/// the entries from the cursor on, to apply as many as it chooses: it
+/// answers how many it applied, and fewer than it was given parks the walk
+/// after them. An index-sidecar section is applied whole. The reader moves
+/// the cursor on these answers alone, and no answer re-reads a block.
+pub trait IckWalk<E> {
+    /// Whether the v2 section classes have handlers; a records-only walk
+    /// refuses them typed, never skipping the cold majority.
+    fn hybrid(&self) -> bool;
+    /// The section the next items belong to.
+    fn enter(&mut self, entry: IckSectionEntry);
+    /// One record of a records section and its encoded bytes.
+    ///
+    /// # Errors
+    /// The handler's own; the load stops at it.
+    fn record(&mut self, view: RecordView<'_>, bytes: u32) -> Result<SectionFlow, E>;
+    /// A ref section's entries from the cursor on; answers how many applied.
+    ///
+    /// # Errors
+    /// As [`record`](Self::record).
+    fn refs(&mut self, section: IckRefSection<'_>) -> Result<usize, E>;
+    /// A live-set section's entries from the cursor on; answers how many applied.
+    ///
+    /// # Errors
+    /// As [`record`](Self::record).
+    fn live_set(&mut self, section: IckLiveSetSection<'_>) -> Result<usize, E>;
+    /// A blob-reference section's entries from the cursor on; answers how
+    /// many applied.
+    ///
+    /// # Errors
+    /// As [`record`](Self::record).
+    fn blob_refs(&mut self, section: IckBlobRefSection<'_>) -> Result<usize, E>;
+    /// One index-sidecar section, whole (validated or damaged-soft).
+    ///
+    /// # Errors
+    /// As [`record`](Self::record).
+    fn idx_sidecar(&mut self, step: IckIdxSidecarStep<'_>) -> Result<(), E>;
+}
+
+/// The run-to-completion walk of [`IckReader::next_step`]: records only,
+/// each consumed.
+struct RecordsOnly<'h, E> {
+    apply: &'h mut dyn FnMut(RecordView<'_>) -> Result<(), E>,
+}
+
+impl<E> IckWalk<E> for RecordsOnly<'_, E> {
+    fn hybrid(&self) -> bool {
+        false
+    }
+
+    fn enter(&mut self, _: IckSectionEntry) {}
+
+    fn record(&mut self, view: RecordView<'_>, _: u32) -> Result<SectionFlow, E> {
+        (self.apply)(view)?;
+        Ok(SectionFlow::Next)
+    }
+
+    // The reader refuses a v2 class typed before it presents one to a walk
+    // that is not hybrid, so these four apply nothing.
+    fn refs(&mut self, _: IckRefSection<'_>) -> Result<usize, E> {
+        Ok(0)
+    }
+
+    fn live_set(&mut self, _: IckLiveSetSection<'_>) -> Result<usize, E> {
+        Ok(0)
+    }
+
+    fn blob_refs(&mut self, _: IckBlobRefSection<'_>) -> Result<usize, E> {
+        Ok(0)
+    }
+
+    fn idx_sidecar(&mut self, _: IckIdxSidecarStep<'_>) -> Result<(), E> {
+        Ok(())
+    }
+}
+
+/// The run-to-completion walk of [`IckReader::next_step_hybrid`]: every
+/// record consumed, every section's entries applied in one handler call.
+struct WholeSections<'h, E> {
+    apply: &'h mut dyn FnMut(RecordView<'_>) -> Result<(), E>,
+    refs: RefHandler<'h, E>,
+    live_set: LiveSetHandler<'h, E>,
+    blob_refs: BlobRefHandler<'h, E>,
+    idx_sidecar: IdxSidecarHandler<'h, E>,
+}
+
+impl<E> IckWalk<E> for WholeSections<'_, E> {
+    fn hybrid(&self) -> bool {
+        true
+    }
+
+    fn enter(&mut self, _: IckSectionEntry) {}
+
+    fn record(&mut self, view: RecordView<'_>, _: u32) -> Result<SectionFlow, E> {
+        (self.apply)(view)?;
+        Ok(SectionFlow::Next)
+    }
+
+    fn refs(&mut self, section: IckRefSection<'_>) -> Result<usize, E> {
+        let entries = section.len();
+        (self.refs)(section)?;
+        Ok(entries)
+    }
+
+    fn live_set(&mut self, section: IckLiveSetSection<'_>) -> Result<usize, E> {
+        let entries = section.len();
+        (self.live_set)(section)?;
+        Ok(entries)
+    }
+
+    fn blob_refs(&mut self, section: IckBlobRefSection<'_>) -> Result<usize, E> {
+        let entries = section.len();
+        (self.blob_refs)(section)?;
+        Ok(entries)
+    }
+
+    fn idx_sidecar(&mut self, step: IckIdxSidecarStep<'_>) -> Result<(), E> {
+        (self.idx_sidecar)(step)
+    }
 }
 
 /// One validated address-reference section (v2, ADR-0057 D3): every
@@ -618,6 +790,9 @@ pub struct IckRefSection<'a> {
     /// The walk watermark every entry sits under — recovery additionally
     /// asserts it at or below the manifested flushed watermark (D6).
     pub walk_watermark: u64,
+    /// The index in its section of this view's first entry: 0 at the
+    /// section's entry, the cursor's on a resumed walk.
+    pub first_index: u32,
     entries: &'a [u8],
 }
 
@@ -683,6 +858,8 @@ pub struct BlobRefEntry {
 pub struct IckBlobRefSection<'a> {
     /// Owning namespace.
     pub ns: u32,
+    /// As [`IckRefSection::first_index`].
+    pub first_index: u32,
     entries: &'a [u8],
 }
 
@@ -720,6 +897,8 @@ impl IckBlobRefSection<'_> {
 pub struct IckLiveSetSection<'a> {
     /// Owning namespace.
     pub ns: u32,
+    /// As [`IckRefSection::first_index`].
+    pub first_index: u32,
     entries: &'a [u8],
 }
 
@@ -819,6 +998,8 @@ pub struct IckReader<File: SegmentFile> {
     entries_seen: Vec<(u32, u64)>,
     digest: u64,
     block: Vec<u8>,
+    /// The section a walk parked in: its block is the one `block` holds.
+    parked: Option<ParkedSection>,
     done: bool,
 }
 
@@ -884,6 +1065,7 @@ impl<File: SegmentFile> IckReader<File> {
             entries_seen: Vec::new(),
             digest: fold_digest(DIGEST_SEED, stored_header_crc),
             block: Vec::new(),
+            parked: None,
             done: false,
         })
     }
@@ -940,7 +1122,7 @@ impl<File: SegmentFile> IckReader<File> {
         &mut self,
         mut apply: impl FnMut(RecordView<'_>) -> Result<(), E>,
     ) -> Result<IckStep, IckApplyError<E>> {
-        self.step_inner(&mut apply, None, None, None, None)
+        self.step_inner(&mut RecordsOnly { apply: &mut apply })
     }
 
     /// [`next_step`](Self::next_step) with the v2 arms: ref, live-set,
@@ -959,24 +1141,41 @@ impl<File: SegmentFile> IckReader<File> {
         mut on_blob_refs: impl FnMut(IckBlobRefSection<'_>) -> Result<(), E>,
         mut on_idx_sidecar: impl FnMut(IckIdxSidecarStep<'_>) -> Result<(), E>,
     ) -> Result<IckStep, IckApplyError<E>> {
-        self.step_inner(
-            &mut apply,
-            Some(&mut on_refs),
-            Some(&mut on_live_set),
-            Some(&mut on_blob_refs),
-            Some(&mut on_idx_sidecar),
-        )
+        self.step_inner(&mut WholeSections {
+            apply: &mut apply,
+            refs: &mut on_refs,
+            live_set: &mut on_live_set,
+            blob_refs: &mut on_blob_refs,
+            idx_sidecar: &mut on_idx_sidecar,
+        })
     }
 
-    fn step_inner<E>(
+    /// [`next_step_hybrid`](Self::next_step_hybrid) under a walk that may
+    /// park inside a section (ADR-0174 A1): the step that enters a section
+    /// reads and audits it whole, announces it, and presents its items
+    /// until a handler parks or the section ends; [`IckStep::Parked`] keeps
+    /// the cursor at the item not consumed, and the next call announces the
+    /// section again and presents that item first. A parked section is never
+    /// read, audited or folded into the digest again, and an item counts
+    /// into the footer's audit once, when it is consumed.
+    ///
+    /// # Errors
+    /// As [`next_step`](Self::next_step).
+    pub fn next_step_walk<E>(
         &mut self,
-        apply: &mut dyn FnMut(RecordView<'_>) -> Result<(), E>,
-        refs: Option<RefHandler<'_, E>>,
-        live_set: Option<LiveSetHandler<'_, E>>,
-        blob_refs: Option<BlobRefHandler<'_, E>>,
-        idx_sidecar: Option<IdxSidecarHandler<'_, E>>,
+        walk: &mut impl IckWalk<E>,
+    ) -> Result<IckStep, IckApplyError<E>> {
+        self.step_inner(walk)
+    }
+
+    fn step_inner<E, W: IckWalk<E> + ?Sized>(
+        &mut self,
+        walk: &mut W,
     ) -> Result<IckStep, IckApplyError<E>> {
         assert!(!self.done, "IckReader stepped past its footer");
+        if let Some(parked) = self.parked.take() {
+            return self.walk_section(parked.frame, parked.cursor, true, walk);
+        }
         if self.offset == self.file_size {
             return Err(IckReadError::MissingFooter.into());
         }
@@ -984,17 +1183,12 @@ impl<File: SegmentFile> IckReader<File> {
         // (review L03, batch 34): a footer's tag sits in the same bytes.
         let mut head = [0u8; SECTION_HEADER_LEN];
         read_exact_at(&self.file, self.offset, &mut head)?;
-        let BlockTag::Section(class) = self.classify(head[0])? else {
+        let BlockTag::Section(kind) = self.classify(head[0])? else {
             return self.step_footer().map_err(IckApplyError::Read);
         };
         let frame = self.read_block(head)?;
-        match class {
-            SectionTag::Records => self.step_records(frame, apply),
-            SectionTag::Refs => self.step_refs(frame, refs),
-            SectionTag::LiveSet => self.step_live_set(frame, live_set),
-            SectionTag::BlobRefs => self.step_blob_refs(frame, blob_refs),
-            SectionTag::IdxSidecar => self.step_idx_sidecar(frame, idx_sidecar),
-        }
+        let cursor = self.audit_section(kind, frame, walk.hybrid())?;
+        self.walk_section(frame, cursor, false, walk)
     }
 
     /// The block class a tag names under the file's version: the v2
@@ -1004,12 +1198,12 @@ impl<File: SegmentFile> IckReader<File> {
     fn classify(&self, tag: u8) -> Result<BlockTag, IckReadError> {
         let v2 = self.info.version >= ICK_VERSION_V2;
         Ok(match tag {
-            BLOCK_SECTION => BlockTag::Section(SectionTag::Records),
+            BLOCK_SECTION => BlockTag::Section(IckSectionKind::Records),
             BLOCK_FOOTER => BlockTag::Footer,
-            BLOCK_ADDR_SECTION if v2 => BlockTag::Section(SectionTag::Refs),
-            BLOCK_LIVESET if v2 => BlockTag::Section(SectionTag::LiveSet),
-            BLOCK_BLOBREF if v2 => BlockTag::Section(SectionTag::BlobRefs),
-            BLOCK_IDXSIDECAR if v2 => BlockTag::Section(SectionTag::IdxSidecar),
+            BLOCK_ADDR_SECTION if v2 => BlockTag::Section(IckSectionKind::Refs),
+            BLOCK_LIVESET if v2 => BlockTag::Section(IckSectionKind::LiveSet),
+            BLOCK_BLOBREF if v2 => BlockTag::Section(IckSectionKind::BlobRefs),
+            BLOCK_IDXSIDECAR if v2 => BlockTag::Section(IckSectionKind::IdxSidecar),
             tag => return Err(IckReadError::UnknownBlock { tag, at: self.offset }),
         })
     }
@@ -1049,14 +1243,115 @@ impl<File: SegmentFile> IckReader<File> {
         Ok(SectionFrame { record_count, block_len, body_len, stored_crc })
     }
 
-    /// The hard CRC audit: a mismatch is fail-stop, a match folds into
-    /// the footer digest.
-    fn audit_crc(&mut self, frame: SectionFrame) -> Result<(), IckReadError> {
-        if !frame.crc_ok(&self.block) {
-            return Err(IckReadError::SectionCrc { index: self.sections, at: self.offset });
+    /// A section's entry audit, once: its CRC (folded into the digest), its
+    /// class's shape and per-entry invariants, whether the walk can apply
+    /// the class, and a ref section's presize count — before the walk is
+    /// given a single item. Answers the cursor at the section's first item.
+    fn audit_section(
+        &mut self,
+        kind: IckSectionKind,
+        frame: SectionFrame,
+        hybrid: bool,
+    ) -> Result<SectionCursor, IckReadError> {
+        let (index, at) = (self.sections, self.offset);
+        // A hard CRC audit for every class but tag 0x06 (the soft class): a
+        // mismatch is fail-stop.
+        if kind != IckSectionKind::IdxSidecar && !frame.crc_ok(&self.block) {
+            return Err(IckReadError::SectionCrc { index, at });
         }
+        let body = frame.body(&self.block);
+        match kind {
+            IckSectionKind::Records => {}
+            IckSectionKind::Refs => {
+                let malformed = IckReadError::RefSectionMalformed { index, at };
+                let (ns, walk_watermark, entries) =
+                    audit_ref_body(body, frame.record_count).ok_or(malformed)?;
+                // Every reference names an address below its walk watermark,
+                // checked before the applier sees a single entry.
+                let beyond = |e: &[u8]| ref_addr(&e[8..]) >= walk_watermark;
+                if entries.chunks_exact(ADDR_REF_ENTRY_LEN).any(beyond) {
+                    return Err(IckReadError::RefBeyondWatermark { index, at });
+                }
+                if !hybrid {
+                    return Err(IckReadError::RefSectionUnsupported { at });
+                }
+                count_entries(&mut self.entries_seen, ns, u64::from(frame.record_count));
+            }
+            IckSectionKind::LiveSet => {
+                let malformed = IckReadError::LiveSetSectionMalformed { index, at };
+                audit_live_set_body(body, frame.record_count).ok_or(malformed)?;
+                if !hybrid {
+                    return Err(IckReadError::LiveSetSectionUnsupported { at });
+                }
+                // Deliberately NOT entries_seen: the per-ns counts presize the
+                // index at recovery, and a file entry is not an index entry
+                // (mirrors the writer).
+            }
+            IckSectionKind::BlobRefs => {
+                let malformed = IckReadError::BlobRefSectionMalformed { index, at };
+                audit_blob_ref_body(body, frame.record_count).ok_or(malformed)?;
+                if !hybrid {
+                    return Err(IckReadError::BlobRefSectionUnsupported { at });
+                }
+                // Deliberately NOT entries_seen: a cold blob record's index slot
+                // was already counted by its 0x03 ref entry — this section is
+                // bookkeeping, not index content (mirrors the writer).
+            }
+            IckSectionKind::IdxSidecar => {
+                if !hybrid {
+                    return Err(IckReadError::IdxSidecarSectionUnsupported { at });
+                }
+            }
+        }
+        // The digest folds every section's stored CRC once, here. Tag
+        // 0x06's folds before its verification (ADR-0073 D3.3/D6): the
+        // file-level audit and the body verdict are independent — that is
+        // what makes 0x06 the file's only soft body class. Damage to the CRC
+        // *field* itself fails the footer digest audit ⇒ fail-stop,
+        // conservatively (the D6 asymmetry).
         self.digest = fold_digest(self.digest, frame.stored_crc);
-        Ok(())
+        Ok(SectionCursor { kind, at: 0, decoded: 0 })
+    }
+
+    /// Announces the section the reader holds and walks it from `cursor`.
+    fn walk_section<E, W: IckWalk<E> + ?Sized>(
+        &mut self,
+        frame: SectionFrame,
+        cursor: SectionCursor,
+        resumed: bool,
+        walk: &mut W,
+    ) -> Result<IckStep, IckApplyError<E>> {
+        let offset = self.offset;
+        let truncated = || IckReadError::Truncated { at: offset };
+        let item_bytes_done = match EntryKind::of(cursor.kind) {
+            Some(kind) => span_len(0, cursor.at as usize, kind.width()).ok_or_else(truncated)?,
+            None => cursor.at as usize,
+        };
+        walk.enter(IckSectionEntry {
+            kind: cursor.kind,
+            block_bytes: self.block_bytes(frame.block_len),
+            items: frame.record_count,
+            items_done: cursor.decoded,
+            item_bytes_done: item_bytes_done as u64,
+            resumed,
+        });
+        match cursor.kind {
+            IckSectionKind::Records => self.walk_records(frame, cursor, walk),
+            IckSectionKind::Refs => self.walk_entries(frame, cursor, EntryKind::Refs, walk),
+            IckSectionKind::LiveSet => self.walk_entries(frame, cursor, EntryKind::LiveSet, walk),
+            IckSectionKind::BlobRefs => self.walk_entries(frame, cursor, EntryKind::BlobRefs, walk),
+            IckSectionKind::IdxSidecar => self.walk_idx_sidecar(frame, walk),
+        }
+    }
+
+    /// A block's bytes on disk: its length, aligned on v3 (the padding is
+    /// read and checked when the walk hops past it).
+    fn block_bytes(&self, block_len: usize) -> u64 {
+        if self.info.version < ICK_VERSION_V3 {
+            block_len as u64
+        } else {
+            ick_align_up(block_len) as u64
+        }
     }
 
     /// Accounts one validated section and hops to the next block.
@@ -1082,124 +1377,119 @@ impl<File: SegmentFile> IckReader<File> {
         Ok(IckStep::Section { bytes: hop })
     }
 
-    fn apply_err<E>(&self, error: E) -> IckApplyError<E> {
-        IckApplyError::Apply { section: self.sections, error }
+    /// Parks the walk at `cursor` in the section the reader holds.
+    fn park(&mut self, frame: SectionFrame, cursor: SectionCursor) -> IckStep {
+        debug_assert!(self.parked.is_none(), "one parked section at a time");
+        self.parked = Some(ParkedSection { frame, cursor });
+        IckStep::Parked
     }
 
-    fn step_records<E>(
+    /// A records section's records from `cursor` on, each decoded from the
+    /// held block and presented; a record counts into the presize fold once,
+    /// when it is consumed.
+    fn walk_records<E, W: IckWalk<E> + ?Sized>(
         &mut self,
         frame: SectionFrame,
-        apply: &mut dyn FnMut(RecordView<'_>) -> Result<(), E>,
+        mut cursor: SectionCursor,
+        walk: &mut W,
     ) -> Result<IckStep, IckApplyError<E>> {
-        self.audit_crc(frame)?;
         let section = self.sections;
-        let mut body = frame.body(&self.block);
-        let mut decoded = 0u32;
-        while !body.is_empty() {
+        let offset = self.offset;
+        let truncated = || IckReadError::Truncated { at: offset };
+        // Bound: the records of one section, each at least one byte.
+        loop {
+            let body = frame.body(&self.block);
+            let rest = body.get(cursor.at as usize..).ok_or_else(truncated)?;
+            if rest.is_empty() {
+                break;
+            }
             let (view, consumed) =
-                decode_record(body).map_err(|error| IckReadError::Record { section, error })?;
-            if let RecordView::StringPostImage { ns, .. } | RecordView::DocFull { ns, .. } = view {
+                decode_record(rest).map_err(|error| IckReadError::Record { section, error })?;
+            let consumed = u32::try_from(consumed).map_err(|_| truncated())?;
+            let image_ns = if let RecordView::StringPostImage { ns, .. }
+            | RecordView::DocFull { ns, .. } = view
+            {
+                Some(ns)
+            } else {
+                None
+            };
+            match walk
+                .record(view, consumed)
+                .map_err(|error| IckApplyError::Apply { section, error })?
+            {
+                SectionFlow::Park => return Ok(self.park(frame, cursor)),
+                SectionFlow::Next => {}
+            }
+            if let Some(ns) = image_ns {
                 count_entries(&mut self.entries_seen, ns.0, 1);
             }
-            apply(view).map_err(|error| IckApplyError::Apply { section, error })?;
-            decoded = decoded
+            cursor.decoded = cursor
+                .decoded
                 .checked_add(1)
                 .ok_or(IckReadError::FooterMismatch { field: "section record_count" })?;
-            body = &body[consumed..];
+            cursor.at = cursor.at.checked_add(consumed).ok_or_else(truncated)?;
         }
-        if decoded != frame.record_count {
+        if cursor.decoded != frame.record_count {
             return Err(IckReadError::FooterMismatch { field: "section record_count" }.into());
         }
         Ok(self.finish_section(frame, u64::from(frame.record_count))?)
     }
 
-    fn step_refs<E>(
+    /// An entry section's entries from `cursor` on, handed to its handler in
+    /// one view; fewer applied than given parks the walk after them. The
+    /// shape and per-entry audits ran at the section's entry, over the same
+    /// block, so a view is sliced here and never audited again.
+    fn walk_entries<E, W: IckWalk<E> + ?Sized>(
         &mut self,
         frame: SectionFrame,
-        refs: Option<RefHandler<'_, E>>,
+        mut cursor: SectionCursor,
+        kind: EntryKind,
+        walk: &mut W,
     ) -> Result<IckStep, IckApplyError<E>> {
-        self.audit_crc(frame)?;
-        let malformed = IckReadError::RefSectionMalformed { index: self.sections, at: self.offset };
-        let (ns, walk_watermark, entries) =
-            audit_ref_body(frame.body(&self.block), frame.record_count).ok_or(malformed)?;
-        // Watermark audit (the §3.1 corollary's decode half) before the
-        // applier sees a single entry.
-        if entries.chunks_exact(ADDR_REF_ENTRY_LEN).any(|e| ref_addr(&e[8..]) >= walk_watermark) {
-            return Err(
-                IckReadError::RefBeyondWatermark { index: self.sections, at: self.offset }.into()
-            );
+        let section = self.sections;
+        let offset = self.offset;
+        let truncated = || IckReadError::Truncated { at: offset };
+        let body = frame.body(&self.block);
+        let from =
+            span_len(kind.meta_len(), cursor.at as usize, kind.width()).ok_or_else(truncated)?;
+        let entries = body.get(from..).ok_or_else(truncated)?;
+        let (ns, first_index) = (le_u32(&body[0..4]), cursor.at);
+        let applied = match kind {
+            EntryKind::Refs => walk.refs(IckRefSection {
+                ns,
+                walk_watermark: le_u64(&body[4..12]),
+                first_index,
+                entries,
+            }),
+            EntryKind::LiveSet => walk.live_set(IckLiveSetSection { ns, first_index, entries }),
+            EntryKind::BlobRefs => walk.blob_refs(IckBlobRefSection { ns, first_index, entries }),
         }
-        let Some(on_refs) = refs else {
-            return Err(IckReadError::RefSectionUnsupported { at: self.offset }.into());
-        };
-        count_entries(&mut self.entries_seen, ns, u64::from(frame.record_count));
-        on_refs(IckRefSection { ns, walk_watermark, entries }).map_err(|e| self.apply_err(e))?;
+        .map_err(|error| IckApplyError::Apply { section, error })?;
+        let left = frame.record_count.checked_sub(cursor.at).ok_or_else(truncated)?;
+        let applied = u32::try_from(applied).unwrap_or(u32::MAX).min(left);
+        if applied < left {
+            cursor.at = cursor.at.checked_add(applied).ok_or_else(truncated)?;
+            cursor.decoded = cursor.at;
+            return Ok(self.park(frame, cursor));
+        }
         Ok(self.finish_section(frame, u64::from(frame.record_count))?)
     }
 
-    fn step_live_set<E>(
+    fn walk_idx_sidecar<E, W: IckWalk<E> + ?Sized>(
         &mut self,
         frame: SectionFrame,
-        live_set: Option<LiveSetHandler<'_, E>>,
+        walk: &mut W,
     ) -> Result<IckStep, IckApplyError<E>> {
-        self.audit_crc(frame)?;
-        let malformed =
-            IckReadError::LiveSetSectionMalformed { index: self.sections, at: self.offset };
-        let (ns, entries) =
-            audit_live_set_body(frame.body(&self.block), frame.record_count).ok_or(malformed)?;
-        let Some(on_live_set) = live_set else {
-            return Err(IckReadError::LiveSetSectionUnsupported { at: self.offset }.into());
-        };
-        // Deliberately NOT entries_seen: the per-ns counts presize the
-        // index at recovery, and a file entry is not an index entry
-        // (mirrors the writer).
-        on_live_set(IckLiveSetSection { ns, entries }).map_err(|e| self.apply_err(e))?;
-        Ok(self.finish_section(frame, u64::from(frame.record_count))?)
-    }
-
-    fn step_blob_refs<E>(
-        &mut self,
-        frame: SectionFrame,
-        blob_refs: Option<BlobRefHandler<'_, E>>,
-    ) -> Result<IckStep, IckApplyError<E>> {
-        self.audit_crc(frame)?;
-        let malformed =
-            IckReadError::BlobRefSectionMalformed { index: self.sections, at: self.offset };
-        let (ns, entries) =
-            audit_blob_ref_body(frame.body(&self.block), frame.record_count).ok_or(malformed)?;
-        let Some(on_blob_refs) = blob_refs else {
-            return Err(IckReadError::BlobRefSectionUnsupported { at: self.offset }.into());
-        };
-        // Deliberately NOT entries_seen: a cold blob record's index slot
-        // was already counted by its 0x03 ref entry — this section is
-        // bookkeeping, not index content (mirrors the writer).
-        on_blob_refs(IckBlobRefSection { ns, entries }).map_err(|e| self.apply_err(e))?;
-        Ok(self.finish_section(frame, u64::from(frame.record_count))?)
-    }
-
-    fn step_idx_sidecar<E>(
-        &mut self,
-        frame: SectionFrame,
-        idx_sidecar: Option<IdxSidecarHandler<'_, E>>,
-    ) -> Result<IckStep, IckApplyError<E>> {
-        let Some(on_idx_sidecar) = idx_sidecar else {
-            return Err(IckReadError::IdxSidecarSectionUnsupported { at: self.offset }.into());
-        };
-        // The stored CRC folds into the digest BEFORE verification
-        // (ADR-0073 D3.3/D6): the file-level audit and the body verdict
-        // are independent — that is what makes 0x06 the file's only soft
-        // body class. Damage to the CRC *field* itself fails the footer
-        // digest audit ⇒ fail-stop, conservatively (the D6 asymmetry).
-        self.digest = fold_digest(self.digest, frame.stored_crc);
+        let section = self.sections;
         let step = if frame.crc_ok(&self.block) {
             match parse_idx_sidecar_body(frame.body(&self.block), frame.record_count) {
-                Some(section) => IckIdxSidecarStep::Section(section),
+                Some(body) => IckIdxSidecarStep::Section(body),
                 None => IckIdxSidecarStep::Damaged { at: self.offset },
             }
         } else {
             IckIdxSidecarStep::Damaged { at: self.offset }
         };
-        on_idx_sidecar(step).map_err(|e| self.apply_err(e))?;
+        walk.idx_sidecar(step).map_err(|error| IckApplyError::Apply { section, error })?;
         // Sidecar entries join neither `records_total` nor the per-ns
         // counts (ADR-0078 D2, mirroring the writer): no soft-class body
         // byte may be load-bearing for the footer audit.
@@ -1268,18 +1558,72 @@ impl<File: SegmentFile> IckReader<File> {
 /// staged namespace, this carries only the tag.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum BlockTag {
-    Section(SectionTag),
+    Section(IckSectionKind),
     Footer,
 }
 
-/// The five section classes `seal_section` emits, by tag.
+/// The fixed-width entry classes: their meta and entry bytes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum SectionTag {
-    Records,
+enum EntryKind {
     Refs,
     LiveSet,
     BlobRefs,
-    IdxSidecar,
+}
+
+impl EntryKind {
+    fn of(kind: IckSectionKind) -> Option<EntryKind> {
+        match kind {
+            IckSectionKind::Records | IckSectionKind::IdxSidecar => None,
+            IckSectionKind::Refs => Some(EntryKind::Refs),
+            IckSectionKind::LiveSet => Some(EntryKind::LiveSet),
+            IckSectionKind::BlobRefs => Some(EntryKind::BlobRefs),
+        }
+    }
+
+    fn meta_len(self) -> usize {
+        match self {
+            EntryKind::Refs => ADDR_SECTION_META_LEN,
+            EntryKind::LiveSet => LIVESET_META_LEN,
+            EntryKind::BlobRefs => BLOBREF_META_LEN,
+        }
+    }
+
+    fn width(self) -> usize {
+        match self {
+            EntryKind::Refs => ADDR_REF_ENTRY_LEN,
+            EntryKind::LiveSet => LIVESET_ENTRY_LEN,
+            EntryKind::BlobRefs => BLOBREF_ENTRY_LEN,
+        }
+    }
+}
+
+impl IckSectionKind {
+    /// The bytes of one entry of a fixed-width entry class; `None` for a
+    /// records or an index-sidecar section, whose items vary in length.
+    #[must_use]
+    pub fn entry_width(self) -> Option<usize> {
+        EntryKind::of(self).map(EntryKind::width)
+    }
+}
+
+/// A section a walk parked in: its frame — the block is still the reader's
+/// buffer, audited once and its CRC folded into the digest once — and the
+/// cursor at the item not consumed.
+#[derive(Copy, Clone, Debug)]
+struct ParkedSection {
+    frame: SectionFrame,
+    cursor: SectionCursor,
+}
+
+/// Where a walk stands in the held section: its kind; `at` the next item —
+/// a record's body offset, or an entry's index; `decoded` the items
+/// consumed before it. Plain data held across a step, never a borrow of the
+/// block.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct SectionCursor {
+    kind: IckSectionKind,
+    at: u32,
+    decoded: u32,
 }
 
 /// One section block read into `IckReader::block`: the header's counts and
@@ -1398,7 +1742,8 @@ pub fn read_ick<F: SegmentFs, E>(
     let mut reader = IckReader::open(fs, path, cfg)?;
     loop {
         match reader.next_step(&mut apply)? {
-            IckStep::Section { .. } => {}
+            // A walk that consumes every item never parks.
+            IckStep::Section { .. } | IckStep::Parked => {}
             IckStep::Done(summary) => return Ok((reader.info, summary)),
         }
     }
@@ -1434,7 +1779,8 @@ pub fn read_ick_hybrid<F: SegmentFs, E>(
             &mut on_blob_refs,
             &mut on_idx_sidecar,
         )? {
-            IckStep::Section { .. } => {}
+            // A walk that consumes every item never parks.
+            IckStep::Section { .. } | IckStep::Parked => {}
             IckStep::Done(summary) => return Ok((reader.info, summary)),
         }
     }
@@ -1481,6 +1827,7 @@ mod tests {
             entries_seen: Vec::new(),
             digest: 0,
             block: Vec::new(),
+            parked: None,
             done: false,
         };
         let frame = SectionFrame { record_count: 1, block_len: 8, body_len: 0, stored_crc: 0 };

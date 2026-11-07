@@ -34,15 +34,104 @@
 //!    alignment, and every padding byte the reader hopped was zero (the
 //!    reader refuses otherwise — asserted by the clean-load branch); the
 //!    hint path's padded footer probe agrees with the audit.
+//! 9. Park points (ADR-0174 A1): the same image walked by a walk that
+//!    parks at every record and after every entry yields the items and the
+//!    outcome — the summary, or the error — of the walk that never parks: a
+//!    resumed section is never read, audited, folded into the digest or
+//!    counted into the presize fold again.
 #![no_main]
 
+use std::cell::RefCell;
 use std::path::Path;
 
-use inf_log::ckpt::{IckReaderConfig, read_ick, read_ick_counts, read_ick_hybrid};
+use inf_log::ckpt::{
+    IckApplyError, IckReader, IckReaderConfig, IckSectionEntry, IckStep, IckWalk, SectionFlow,
+    read_ick, read_ick_counts, read_ick_hybrid,
+};
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
-use inf_log::IckIdxSidecarStep;
+use inf_log::{
+    BlobRefEntry, IckBlobRefSection, IckIdxSidecarStep, IckLiveSetSection, IckRefSection,
+    IckSummary, LiveSetFileEntry, RecordView,
+};
 use libfuzzer_sys::fuzz_target;
+
+/// One item a walk consumed, in file order.
+#[derive(Debug, PartialEq, Eq)]
+enum Item {
+    Record(Vec<u8>),
+    Ref(u64, u64),
+    Live(LiveSetFileEntry),
+    Blob(BlobRefEntry),
+    Sidecar(String),
+}
+
+/// The walk that parks wherever it can: at each record the first time it
+/// is presented, and after one entry of every entry-section view.
+#[derive(Default)]
+struct ParkEverywhere {
+    items: Vec<Item>,
+    parked: bool,
+}
+
+impl IckWalk<()> for ParkEverywhere {
+    fn hybrid(&self) -> bool {
+        true
+    }
+
+    fn enter(&mut self, _: IckSectionEntry) {}
+
+    fn record(&mut self, view: RecordView<'_>, bytes: u32) -> Result<SectionFlow, ()> {
+        self.parked = !self.parked;
+        if self.parked {
+            return Ok(SectionFlow::Park);
+        }
+        let mut buf = Vec::new();
+        view.encode_into(&mut buf);
+        assert_eq!(buf.len(), bytes as usize, "a record's announced bytes are its encoding's");
+        self.items.push(Item::Record(buf));
+        Ok(SectionFlow::Next)
+    }
+
+    fn refs(&mut self, section: IckRefSection<'_>) -> Result<usize, ()> {
+        let (hash, addr) = section.iter().next().expect("a view holds an entry");
+        self.items.push(Item::Ref(hash, addr));
+        Ok(1)
+    }
+
+    fn live_set(&mut self, section: IckLiveSetSection<'_>) -> Result<usize, ()> {
+        self.items.push(Item::Live(section.iter().next().expect("a view holds an entry")));
+        Ok(1)
+    }
+
+    fn blob_refs(&mut self, section: IckBlobRefSection<'_>) -> Result<usize, ()> {
+        self.items.push(Item::Blob(section.iter().next().expect("a view holds an entry")));
+        Ok(1)
+    }
+
+    fn idx_sidecar(&mut self, step: IckIdxSidecarStep<'_>) -> Result<(), ()> {
+        self.items.push(Item::Sidecar(format!("{step:?}")));
+        Ok(())
+    }
+}
+
+/// The image at `path` under [`ParkEverywhere`]: its items and outcome.
+fn parked_load(fs: &MemFs, path: &Path) -> (Vec<Item>, Result<IckSummary, IckApplyError<()>>) {
+    let mut walk = ParkEverywhere::default();
+    let mut reader = match IckReader::open(fs, path, IckReaderConfig::default()) {
+        Ok(reader) => reader,
+        Err(err) => return (walk.items, Err(IckApplyError::Read(err))),
+    };
+    // Bound: every step consumes an item, ends a section or parks at an
+    // item it consumes the next time; the image is finite.
+    loop {
+        match reader.next_step_walk(&mut walk) {
+            Ok(IckStep::Section { .. } | IckStep::Parked) => {}
+            Ok(IckStep::Done(summary)) => return (walk.items, Ok(summary)),
+            Err(err) => return (walk.items, Err(err)),
+        }
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
     let fs = MemFs::new();
@@ -59,6 +148,7 @@ fuzz_target!(|data: &[u8]| {
     let mut blob_refs = 0u64;
     let mut idx_sections = 0u64;
     let mut idx_damaged = 0u64;
+    let items = RefCell::new(Vec::new());
     let result = read_ick_hybrid(
         &fs,
         &path,
@@ -68,14 +158,16 @@ fuzz_target!(|data: &[u8]| {
             let mut buf = Vec::new();
             view.encode_into(&mut buf);
             assert!(!buf.is_empty());
+            items.borrow_mut().push(Item::Record(buf));
             records += 1;
             Ok::<(), ()>(())
         },
         |section| {
             assert!(!section.is_empty(), "the writer only seals non-empty ref sections");
-            for (_, addr) in section.iter() {
+            for (hash, addr) in section.iter() {
                 assert!(addr < section.walk_watermark, "refs sit below their watermark");
                 assert!(addr < (1 << 48), "addresses are 48-bit");
+                items.borrow_mut().push(Item::Ref(hash, addr));
             }
             refs += section.len() as u64;
             Ok(())
@@ -84,6 +176,7 @@ fuzz_target!(|data: &[u8]| {
             assert!(!section.is_empty(), "the writer only seals non-empty live-set sections");
             for entry in section.iter() {
                 assert!(entry.dead_bytes <= entry.data_len, "dead never exceeds file bytes");
+                items.borrow_mut().push(Item::Live(entry));
             }
             live_entries += section.len() as u64;
             Ok(())
@@ -96,11 +189,13 @@ fuzz_target!(|data: &[u8]| {
                 assert!(entry.addr < (1 << 48), "addresses are 48-bit");
                 assert!(prev.is_none_or(|p| entry.addr > p), "addresses ascend strictly");
                 prev = Some(entry.addr);
+                items.borrow_mut().push(Item::Blob(entry));
             }
             blob_refs += section.len() as u64;
             Ok(())
         },
         |step| {
+            items.borrow_mut().push(Item::Sidecar(format!("{step:?}")));
             match step {
                 IckIdxSidecarStep::Section(section) => {
                     // Delivered ⇒ the ADR-0078 D3 canon held at decode.
@@ -130,6 +225,15 @@ fuzz_target!(|data: &[u8]| {
             Ok(())
         },
     );
+    let (parked_items, parked) = parked_load(&fs, &path);
+    assert_eq!(parked_items, items.into_inner(), "a parked walk consumes what the whole load does");
+    match (&result, &parked) {
+        (Ok((_, summary)), Ok(parked)) => assert_eq!(summary, parked, "one audited summary"),
+        (Err(whole), Err(parked)) => {
+            assert_eq!(format!("{whole:?}"), format!("{parked:?}"), "one refusal");
+        }
+        (whole, parked) => panic!("the walks disagree: {whole:?} against {parked:?}"),
+    }
     // The presize-hint path (M2.5-S08: direct footer probe + hop fallback)
     // must never panic, and on a cleanly-loading image must agree with the
     // audited footer entries.
