@@ -1597,7 +1597,24 @@ impl SegmentFs for SimDisk {
         // flags the inode so every tier write is alignment-asserted — the
         // `O_DIRECT` contract the fault points broke unseen while the sim
         // took the mode-blind default (F-L04-14, ADR-0119 A1).
-        self.create_inode_full(path, Vec::new(), Vec::new(), 0, mode == TierIoMode::Direct, false)
+        let file = self.create_inode_full(
+            path,
+            Vec::new(),
+            Vec::new(),
+            0,
+            mode == TierIoMode::Direct,
+            false,
+        )?;
+        // A real create can fail after its file exists: `create_new`
+        // made and named it, then `set_len`, the `O_DIRECT` probe's
+        // `/proc` open or `sync_all` failed. The point fires inside the
+        // call that made the file, so every create path on this disk
+        // meets the same shape: the handle closes, the file stays.
+        if inf_foundation::fault::fire(crate::fault::TIER_CREATE_POST_FAIL) {
+            drop(file);
+            return Err(crate::fault::injected(crate::fault::TIER_CREATE_POST_FAIL));
+        }
+        Ok(file)
     }
 
     /// The mode of *this* open, as [`open_segment_append`](Self::open_segment_append).
