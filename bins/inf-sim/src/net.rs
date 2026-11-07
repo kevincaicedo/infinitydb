@@ -107,11 +107,19 @@ impl AcceptPark {
 
     /// Whether a `Close` that returns an fd resumes this park: an exhaustion
     /// park only, as both real backends do (ADR-0118 D2).
+    #[cfg(not(inf_canary_accept_close_resumes_any))]
     fn resumes_on_close(self) -> bool {
         match self {
             AcceptPark::Exhausted => true,
             AcceptPark::Broken => false,
         }
+    }
+
+    /// Canary: a `Close` resumes a park of either class, so a broken
+    /// listener comes back with no retry.
+    #[cfg(inf_canary_accept_close_resumes_any)]
+    fn resumes_on_close(self) -> bool {
+        true
     }
 }
 
