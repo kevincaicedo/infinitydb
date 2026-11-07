@@ -64,6 +64,13 @@
 #                         step, zero corruption (the retained-batch +
 #                         append-rewind discipline: nothing claimable
 #                         was dropped, nothing misaligned)
+#   residue-swept-at-boot — a tier-file create that failed after its
+#                         file existed staged nothing and spent no file
+#                         id; the file is named by no MANIFEST, so a cut
+#                         that keeps its name leaves it to the boot's
+#                         sweep of unnamed tier files, which removes it
+#                         before the namespace serves, and the manifested
+#                         file recovers at its manifested length
 #   boot-refuses-typed-then-recovers — a boot settle read that fails
 #                         (ADR-0174 D3: a settle that cannot read or
 #                         verify its slot refuses the boot) is the
@@ -194,6 +201,16 @@ point = "tier_dir_open_fail"
 tier = "node"
 test = "crash-matrix::tier::tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers"
 expect = "creation-retried-round-owned"
+
+# A tier-file creation that fails after the create made and named its
+# file (the simulated disk's stand-in for a failed `set_len`, `O_DIRECT`
+# probe or `sync_all`) stages nothing and spends no file id; the file it
+# left is named by no MANIFEST, and the boot's sweep removes it.
+[[row]]
+point = "tier_create_post_fail"
+tier = "node"
+test = "crash-matrix::tier::tier_create_post_fail_leaves_an_unnamed_file_the_boot_sweep_removes"
+expect = "residue-swept-at-boot"
 
 # ADR-0174 D3: the boot settle read's one fault point — a cold twin's
 # key window unreadable at a replayed DEL.

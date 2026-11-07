@@ -10848,3 +10848,7 @@ fn a_tiered_drop_frees_its_origins_tier_files_without_a_restart() {
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Namespace ids at the node, in a file of their own.
+#[path = "node_e2e/ns_ids.rs"]
+mod ns_ids;
