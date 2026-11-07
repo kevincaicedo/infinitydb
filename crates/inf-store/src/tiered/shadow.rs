@@ -345,10 +345,6 @@ impl<E: fmt::Display> fmt::Display for ShadowRebuildError<E> {
 
 impl<E: fmt::Debug + fmt::Display> std::error::Error for ShadowRebuildError<E> {}
 
-/// The recovery rebuild's cursor (A4′): where the home-group walk stands
-/// and the cold slots of the probe group it last stepped, not yet
-/// classified. Fixed size — one probe group of scratch; the walk resumes
-/// after every settle slot the caller is handed.
 /// What one [`TieredTable::shadow_rebuild_step`] call did: the probe groups
 /// it scanned, and where the rebuild stands after them.
 #[must_use = "a slot the rebuild returns must be read and settled before the cell serves"]
@@ -363,6 +359,10 @@ pub enum RebuildStep {
     Done { groups: usize },
 }
 
+/// The recovery rebuild's cursor (A4′): where the home-group walk stands
+/// and the cold slots of the probe group it last stepped, not yet
+/// classified. Fixed size — one probe group of scratch; the walk resumes
+/// after every settle slot the caller is handed.
 #[must_use = "a rebuild must be driven to completion before the cell serves"]
 pub struct ShadowRebuild {
     /// The next home group to open once the current chain ends.

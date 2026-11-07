@@ -890,7 +890,8 @@ pub struct Recovery<F: SegmentFs> {
     /// its largest): the barriers, the tier bytes, the settle reads, the
     /// bytes the seal and end settle walks passed. Drained where the step
     /// asks its budget — after a priced record, a demote step, a frame, a
-    /// checkpoint section and a settle step — and charged to it there.
+    /// checkpoint section, a settle step and a hand-over unit (a rebuild
+    /// settle read, a machine's seal) — and charged to it there.
     step_charge: u64,
     /// The bytes of the frame or section the current step entered and parked
     /// in, not charged yet: the rest of the step's work (ADR-0174 A1.2). A
