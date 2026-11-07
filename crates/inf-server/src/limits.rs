@@ -1,6 +1,7 @@
 //! Runtime bounds owned by the server. Every crossing names its behavior here.
 
 use inf_foundation::bounded::{Cap, CapFill};
+use inf_foundation::time::Nanos;
 
 /// Reclaim marks one tiered namespace holds on its cell: ADR-0061 D5's
 /// `(seq, epoch)` marks, one per ack class (ADR-0163 D2). After MAINTAIN
@@ -197,3 +198,18 @@ const _: () = {
     }
     assert!(JSON_FIXED_REPLY_BYTES_MAX == 348, "the fixed column's maximum is 348 bytes");
 };
+
+/// The accept retry's window, in injected time: after the driver parks a
+/// listener's accept arm on an exhaustion or a broken-listener failure, the
+/// plane's accept-retry timer owner re-arms it this long after the failure.
+/// Descriptors freed outside the driver (segment files, checkpoint handles),
+/// and a listener parked as broken, which no `Close` resumes, let queued
+/// clients in by this retry alone. Owner: the plane's accept-retry owner,
+/// armed from Idle by a window's first failure. Crossing: pacing. Failures
+/// inside a window coalesce into its one arm, which falls due at most one
+/// window and the deadline's rounding millisecond after the window's first
+/// failure (ADR-0154 D3). While the failure persists, each retry fails
+/// again, counts one error and arms one more window: one `accept(2)` a
+/// window, never a spin, and a queued client waits one more window for each
+/// failed retry.
+pub const ACCEPT_RETRY: Nanos = Nanos::from_millis(100);

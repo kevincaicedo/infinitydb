@@ -85,7 +85,7 @@ mod tiered;
 mod timers;
 
 pub use conn::OwnedOutcome;
-use conn::{ACCEPT_RETRY, CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
+use conn::{CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
 use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
 use fabric::{
     GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, gather_element,
@@ -123,6 +123,7 @@ use crate::exec::{
     ConnCx, ConnNamespace, NodeInfo, TIER_FLUSH_GAUGES, TierFlushGauge, execute, execute_slices,
     stall_request, unavailable_default_allows,
 };
+use crate::limits::ACCEPT_RETRY;
 use crate::pubsub::{self, PubSubCell, SubKind};
 use crate::recover::{RecoverPhase, Recovery, RecoveryProgress};
 
