@@ -706,8 +706,9 @@ pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone +
         inf_foundation::fault::hold(crate::fault::NS_CREATE_LEG_HELD);
     }
     // Crash-matrix point (ADR-0108 D3): a peer refusing its `CREATE`
-    // leg — the deterministic stand-in for the OS refusing the tier
-    // ring reservation on this cell after the catalog swap.
+    // leg — the deterministic stand-in for any refusal of the apply on
+    // this cell after the catalog swap: the OS refusing the tier ring
+    // reservation, or an admission bound lowered here during the wait.
     if argv.len() == 9
         && argv[1].eq_ignore_ascii_case(b"CREATE")
         && inf_foundation::fault::fire(crate::fault::NS_CREATE_FAN_REFUSED)
