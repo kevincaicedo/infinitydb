@@ -722,7 +722,8 @@ impl Node {
                 }
                 Some(hold) => {
                     // The sim's detached writer, driven by a harness
-                    // thread that honours `hold` — same `prepare_persist`,
+                    // thread that honours `hold` — the same
+                    // `CatalogWriter::answer`,
                     // same on-disk swap, no control thread.
                     let (control, mut inbox, issuers) = inf_server::ControlHandle::detached_in(
                         catalog.as_ref(),
@@ -789,8 +790,11 @@ impl Node {
                 for &(point, spec) in &faults {
                     inf_foundation::fault::arm(point, spec);
                 }
-                // A hold is armed on the one cell it names: a gate no thread
-                // will reach keeps no handle alive on another cell.
+                // A hold is armed on the one cell it names. Every cell's
+                // closure keeps its clone of the plan for the thread's
+                // life, so a gate a test abandons is never released here:
+                // a test that panics before its release leaves the held
+                // cell waiting until the test process exits.
                 for (_, point, gate) in holds.iter().filter(|(cell, ..)| usize::from(*cell) == i) {
                     inf_foundation::fault::arm_hold(point, gate);
                 }

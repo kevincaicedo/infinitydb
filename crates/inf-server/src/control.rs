@@ -16,16 +16,18 @@
 //! value under the DDL ticket without moving it, and only the writer's
 //! acceptance of that `CREATE` moves it, by one, in the persist that names
 //! the id (ADR-0148 D4): a refused `CREATE` leaves it where it was, and a
-//! counter at `u32::MAX` issues no id. One load and one store per DDL are
-//! control-plane traffic; L1's no-shared-atomics rule binds the data plane.
+//! counter at `u32::MAX` issues no id. A `CREATE` costs one store and a few
+//! loads of the counter, all on the control plane; L1's no-shared-atomics
+//! rule binds the data plane.
 //!
-//! The writer also owns the **drop-tombstone set** (ADR-0100 D2): a
-//! durable namespace's `DROP` adds its id to every payload the writer
-//! emits until every cell has published a `MANIFEST` past the drop (the
-//! origin requests that checkpoint and posts its epoch with the drop's
-//! notice; the writer retires stamped tombstones at the next accepted
-//! request once every cell's published epoch covers them). Recovery reads
-//! the set to tell dropped residue from corruption. And it owns the **one
+//! The writer also owns the **tombstone book** (ADR-0189 D6): a durable
+//! namespace's `DROP` adds its id to every payload the writer emits until
+//! every cell has published a `MANIFEST` past the drop (the origin requests
+//! that checkpoint and posts its epoch with the drop's notice; the writer
+//! retires stamped tombstones at the next accepted request once every
+//! cell's published epoch covers them), and at 256 tombstones the writer
+//! alone admits, refuses, or answers the one pace a durable DDL may take.
+//! Recovery reads the set to tell dropped residue from corruption. And it owns the **one
 //! pending DDL** (ADR-0189 D3): an accepted `CREATE` or `DROP` whose fan
 //! may not have reached every cell, kept in every payload until the
 //! origin's notice retires it.
@@ -1862,8 +1864,12 @@ pub fn load_catalog_from<F: inf_log::fs::SegmentFs>(
 }
 
 /// The catalog writer (ADR-0189 D3): `META`'s single writer and the
-/// catalog epoch's single owner, with the tombstone set and the one
-/// pending DDL. Both hosts (the control thread, the simulator's inline
+/// catalog epoch's single owner, with the tombstone book and the one
+/// pending DDL. Its work per request is at DDL rate under one ticket:
+/// the book's fold is one pass over at most its ceiling's entries, and the
+/// verdict and the payload walk the export's E entries and I index
+/// records, each with a binary search over the T tombstones,
+/// `O((E + I)·log T)`. Both hosts (the control thread, the simulator's inline
 /// inbox) drive this one value, so the simulator runs the writer the node
 /// runs.
 struct CatalogWriter {

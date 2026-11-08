@@ -47,7 +47,8 @@ fn cell_count() -> inf_foundation::CellCount {
 }
 
 /// Eight cells' registries plus the control handle — the DDL fan's
-/// destination set, driven directly (S10 wires the wire-level verbs). The
+/// destination set, driven directly (the wire-level verbs are not driven
+/// here). The
 /// control plane boots from a catalog naming `ledger`, so its counter is
 /// past `ledger`'s id as every `META` it writes must be.
 fn fleet() -> (Vec<Keyspace>, std::sync::Arc<ControlHandle>, inf_server::ControlInbox) {

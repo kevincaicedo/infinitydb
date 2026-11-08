@@ -117,8 +117,8 @@ mod tests {
     use super::*;
 
     /// The bytes the tree already answers keep their spelling: the
-    /// checkpoint quota's exhaustion, and the namespace identity space's
-    /// (the owner's ruling of the namespace domain's token).
+    /// checkpoint quota's exhaustion, and the namespace identity space's,
+    /// whose domain token is `namespace` (ADR-0172).
     #[test]
     fn the_rendered_lines_keep_the_tree_bytes() {
         let checkpoint = Refusal::IdentityExhausted(Domain::Checkpoint);

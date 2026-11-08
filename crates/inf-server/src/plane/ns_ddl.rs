@@ -548,7 +548,7 @@ async fn wait_for_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
     }
 }
 
-/// The namespace-DDL program (M2-S08), one per node at a time (ADR-0108
+/// The namespace-DDL program, one per node at a time (ADR-0108
 /// D1): `CREATE` in `program_ns_create`, `SET` in `program_ns_set`, `DROP`
 /// in `program_ns_drop`. Each asks the catalog writer for its `META` and
 /// reads the writer's answer through its own token (ADR-0189 D2).
@@ -1027,7 +1027,7 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     notice.post(cleanup.stamp_epoch());
 }
 
-/// `INF.NS SET` (M4-S19, ADR-0062 D3; M4-S27, ADR-0068 D3): hot-reload is
+/// `INF.NS SET` (ADR-0062 D3, ADR-0068 D3): hot-reload is
 /// DDL — apply locally → fan `INF.NSFAN SET` to every peer → ask the
 /// writer for the `META` that carries the new configuration and wait for
 /// its answer → `+OK` (ADR-0015 D3's order). The request names no change:

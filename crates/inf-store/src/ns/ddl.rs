@@ -13,6 +13,17 @@
 //! is answered, each accepted one durable, and it never decreases. A token
 //! reads its own slot and nothing else, so no other request's swap can
 //! answer it.
+//!
+//! What the types prove and what rests on review: a receipt is minted only
+//! by an accepted answer read through its own token (`Requested::answer`)
+//! or by a leg's epoch read against a word that covers it
+//! (`DropPersisted::from_leg`); its fields are private and no other code
+//! builds one. That the word read is the node's own — one writer a node,
+//! its `CatalogEpochs` made by the control plane at boot, and every token
+//! and leg read against `ControlHandle::catalog_word` — and that an
+//! `Accepted` answer follows its `META` write (one function, the writer's
+//! `answer`, and its planted canary) rest on review: this crate cannot name
+//! the control plane, so no type here can tie a word to it.
 
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};

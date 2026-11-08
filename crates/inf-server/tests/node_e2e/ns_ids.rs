@@ -1,7 +1,7 @@
 //! Namespace ids at the node: an id moves only when the catalog writer
 //! accepts a `CREATE`. Ids are never reused within a data directory, so an
-//! id a refusal spent is lost, and a client repeating a refused `CREATE`
-//! spends the id space at the DDL's pace.
+//! id a refusal spent would be lost, and a client repeating a refused
+//! `CREATE` would spend the id space at the DDL's pace.
 
 use super::*;
 
