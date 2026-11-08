@@ -49,6 +49,25 @@ images; see [CONTRIBUTING](../CONTRIBUTING.md). A local prerequisite failure
 is not a passing gate. Workloads and required sweep sizes remain those of the
 owning gate; a smoke run does not discharge a full campaign.
 
+Every recipe builds in this checkout's own target root (ADR-0198 A2), which
+`scripts/target-root.sh` computes and the justfile exports as
+`CARGO_TARGET_DIR`: `target/` when the variable is unset, else
+`$CARGO_TARGET_DIR/checkout-<key>`, keyed by the checkout's physical path.
+Cargo reads another checkout's outputs as fresh, so before any recipe runs the
+export refuses a configured build directory and a root holding outputs no
+marker of this checkout names (cargo or an editor first, a copied or moved
+checkout, a root from before the rule) with exit 2, printing `cd <checkout> &&
+cargo clean --target-dir <root> && ./scripts/target-root.sh --print`; the
+next run builds cold. The gates that keep a target beside the recipe's (the
+lint ratchet, the fuzz-target gate) keep `<name>-<key>` under that root, and
+the fuzz gate's probe builds in a directory of its own each run. The recipes
+that run what they build (`sim-smoke`, `sim-canaries`, the sweeps, `compat`,
+`client-smoke`) and `inf-compare` run the binaries their own root built. Dead
+roots on a shared variable are listed on stderr until removed. Two hosts that
+share one variable with checkouts at one path share a key, and a cargo
+config's `build-dir` or `build.target-dir` that a gate run alone, a command
+outside the recipes or a cargo call from another directory reads goes unseen.
+
 `cargo test -p crash-matrix` requires Python 3.11+ and runs every node row
 in `m2.toml`, `m4.toml` and `m45.toml` by exact package/target/function.
 Each invocation must pass one non-ignored test and emit its point/verdict

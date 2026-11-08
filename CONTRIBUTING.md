@@ -110,12 +110,35 @@ Requirements:
   against it, and an absent or different version fails rather than skips.
   The compat corpus raises `maxclients`, so raise the shell's file-descriptor
   limit if needed (`ulimit -n 65536`).
-- **Python 3.11 or newer**: the scripts `just check` runs read TOML with its
-  standard library.
+- **Python 3.11 or newer**: every `just` recipe, `just fmt` too, first asks
+  `scripts/target-root.sh` for this checkout's target root (below), and the
+  scripts `just check` runs read TOML with its standard library.
 - **A C++17 compiler** (`c++`, `g++` or `clang++`): `just check` compiles every
   fuzz target, and their build compiles libFuzzer's C++ runtime.
 - [`just`](https://github.com/casey/just) for the task runner, and
   `cargo-deny` for the dependency-policy check.
+
+**One target root a checkout.** Cargo reads outputs that another checkout
+wrote as fresh, so code that does not compile can pass. Each checkout
+therefore builds in a root of its own: `target/` when `CARGO_TARGET_DIR` is
+unset, else `$CARGO_TARGET_DIR/checkout-<key>`, the key 16 hex digits of
+SHA-256 of the checkout's physical path, so several checkouts can share one
+variable. The justfile exports that root as `CARGO_TARGET_DIR`, which outranks
+a cargo config's `build.target-dir` (set the variable instead), and before any
+recipe runs it refuses a configured build directory (`build-dir` in a cargo
+config, or `CARGO_BUILD_BUILD_DIR`) and a root holding outputs that no marker
+of this checkout names: a `target/` that cargo or an editor wrote before the
+first recipe, one copied or moved with its checkout, or one from before this
+rule. The refusal prints the one command that clears that root alone,
+`cd <checkout> && cargo clean --target-dir <root> && ./scripts/target-root.sh
+--print`, never a bare `cargo clean`, which under a shared variable removes
+every checkout's root; the next build is cold. Under a shared variable each
+recipe lists on stderr the roots whose checkout is gone, or that hold no
+marker, with the commands that size and remove them, until they are removed.
+Two hosts that share one variable with checkouts at one path share a key, and
+a cargo config's `build-dir` or `build.target-dir` that a gate run alone, a
+command outside the recipes or a cargo call from another directory reads goes
+unseen.
 
 Clone, run the full local ladder (`just check`, described below) and start
 a server:
