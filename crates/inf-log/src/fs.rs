@@ -252,7 +252,14 @@ pub enum Removal {
 pub fn remove_listed<F: SegmentFs>(fs: &F, path: &Path) -> io::Result<Removal> {
     match fs.remove_file(path) {
         Ok(()) => Ok(Removal::Removed),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Removal::Gone),
+        // The planted canary refuses a listed name's second removal, as a
+        // bare `remove_file` would.
+        Err(err)
+            if err.kind() == io::ErrorKind::NotFound
+                && !cfg!(inf_canary_recover_listing_repeat_refused) =>
+        {
+            Ok(Removal::Gone)
+        }
         Err(err) => Err(err),
     }
 }

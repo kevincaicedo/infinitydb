@@ -2,16 +2,19 @@
 //! (ADR-0174 D1, R10, D6): `Recovery::step` under a byte budget
 //! over a tiered tail of several RAM windows, whose last window rewrites
 //! and deletes keys the boot has demoted by then — so the boot demotes,
-//! settles at the seal and at the end of replay (E10, E12) and verifies
-//! its deletes against demoted copies (E5). Every row reads every key of
-//! the model back after the boot: RAM through the record, cold through
-//! the tier file's CRC-verified frames.
+//! settles each rewritten record against its cold twin where a demote step
+//! seals it and at the end of replay, and has each delete read its key's
+//! demoted copies to verify them. Every test reads every key of the model
+//! back after the boot: RAM through the record, cold through the tier
+//! file's CRC-verified frames. The start step's tier map is judged at its
+//! own size (ADR-0202): the sweeps, the maps and their listings.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use inf_log::fs::mem::MemFs;
-use inf_log::fs::{SegmentFile, SegmentFs};
+use inf_log::fs::{BatchEnd, DirStream, NameBatch, OpenedDir, SegmentFile, SegmentFs};
 use inf_log::tier::{parse_tier_file_name, probe_tier_file};
 use inf_log::{
     MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingRing, TIER_FOOTER_BYTES,
@@ -130,8 +133,9 @@ impl<F: SegmentFs + Clone> Log<F> {
 /// the records fill `windows` RAM windows, then — inside the last window —
 /// a rewrite of every 7th of the first 420 keys and a delete of every
 /// 11th of the rest of them. Their first copies are demoted by then, so a
-/// rewrite is a record with a cold twin (settled at its seal, E10, or at
-/// the end of replay, E12) and a delete verifies a demoted copy (E5).
+/// rewrite is a record with a cold twin (settled where the demote step
+/// seals it, or at the end of replay) and a delete reads and verifies a
+/// demoted copy.
 fn write_unit<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig, windows: u64) -> Unit {
     let mut log = Log::new(fs, cfg);
     let model = write_unit_records(&mut log, windows);
@@ -484,8 +488,11 @@ fn step_under_budget(budget: u64) -> Vec<String> {
                      unit ({bound})"
                 );
             }
+            // The tier map charges its units to the budget, never to the
+            // replay machines' boot I/O.
             UnitPhase::Finish
             | UnitPhase::Start
+            | UnitPhase::TierMap
             | UnitPhase::Ick
             | UnitPhase::CkptEnd
             | UnitPhase::Audit
@@ -700,7 +707,9 @@ fn file_kind(path: &std::path::Path) -> FileKind {
 
 /// What the filesystem saw: the bytes reads returned on the log and the
 /// checkpoint, and the tier's reads, bytes written and barriers, with every
-/// metadata operation.
+/// metadata operation — the opens of existing tier files (a create is its
+/// barrier's) and their truncates, the listings' opens, their batches and
+/// the names those returned.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct Tally {
     reader_bytes: u64,
@@ -709,9 +718,13 @@ struct Tally {
     tier_syncs: u64,
     dir_syncs: u64,
     opens: u64,
+    tier_opens: u64,
+    truncates: u64,
     removes: u64,
     renames: u64,
-    lists: u64,
+    listing_opens: u64,
+    listing_batches: u64,
+    listed_names: u64,
     /// The units with no I/O of their own a step ran (the engine's unit
     /// counters, apart from its charge), each at the RAM price.
     ram_units: u64,
@@ -726,7 +739,8 @@ fn units_since(now: inf_server::RecoverUnits, before: inf_server::RecoverUnits) 
     let ram = (now.ckpt_entries - before.ckpt_entries)
         + (now.ckpt_end_releases - before.ckpt_end_releases)
         + (now.sweep_stamped - before.sweep_stamped)
-        + (now.sweep_seeded - before.sweep_seeded);
+        + (now.sweep_seeded - before.sweep_seeded)
+        + (now.tier_map_built - before.tier_map_built);
     (ram, now.rebuild_groups - before.rebuild_groups)
 }
 
@@ -739,9 +753,13 @@ impl Tally {
             tier_syncs: self.tier_syncs - before.tier_syncs,
             dir_syncs: self.dir_syncs - before.dir_syncs,
             opens: self.opens - before.opens,
+            tier_opens: self.tier_opens - before.tier_opens,
+            truncates: self.truncates - before.truncates,
             removes: self.removes - before.removes,
             renames: self.renames - before.renames,
-            lists: self.lists - before.lists,
+            listing_opens: self.listing_opens - before.listing_opens,
+            listing_batches: self.listing_batches - before.listing_batches,
+            listed_names: self.listed_names - before.listed_names,
             ram_units: self.ram_units,
             group_units: self.group_units,
         }
@@ -752,19 +770,33 @@ impl Tally {
         self.tier_syncs + self.dir_syncs
     }
 
+    /// The boot file operations the filesystem saw: a tier file's open or
+    /// truncate, a removal, a rename, a listing's open and each batch it
+    /// read.
+    fn file_ops(self) -> u64 {
+        self.tier_opens
+            + self.truncates
+            + self.removes
+            + self.renames
+            + self.listing_opens
+            + self.listing_batches
+    }
+
     /// The work at the `limits` prices: a reader byte and a tier byte one
     /// budget byte each, a settle read at the store's read price, a
-    /// barrier — a file's or a directory's — at the server's, a rename at
-    /// the server's file-operation price, a RAM unit at the store's probe
-    /// price and a probe group at the store's group price.
+    /// barrier — a file's or a directory's — at the server's, a boot file
+    /// operation at the server's file-operation price, a RAM unit — a
+    /// listed name among them — at the store's probe price and a probe group
+    /// at the store's group price.
     fn priced(self) -> u64 {
         let barrier = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES;
+        let ram = inf_store::limits::RECOVER_PROBE_CHARGE_BYTES;
         self.reader_bytes
             + self.tier_bytes_written * inf_server::limits::REPLAY_TIER_BYTE_CHARGE
             + self.tier_reads * inf_store::limits::SETTLE_READ_CHARGE_BYTES
             + self.barriers() * barrier
-            + self.renames * inf_server::limits::BOOT_FILE_OP_CHARGE_BYTES
-            + self.ram_units * inf_store::limits::RECOVER_PROBE_CHARGE_BYTES
+            + self.file_ops() * inf_server::limits::BOOT_FILE_OP_CHARGE_BYTES
+            + (self.ram_units + self.listed_names) * ram
             + self.group_units * inf_store::limits::REBUILD_GROUP_CHARGE_BYTES
     }
 }
@@ -794,6 +826,32 @@ impl CountingFs {
     fn wrap(&self, path: &std::path::Path, file: inf_log::fs::mem::MemFile) -> CountingFile {
         self.count(|t| t.opens += 1);
         CountingFile { inner: file, kind: file_kind(path), tally: self.tally.clone() }
+    }
+
+    /// [`wrap`](Self::wrap) for an open of an existing file, a boot file
+    /// operation on a tier path.
+    fn wrap_open(&self, path: &std::path::Path, file: inf_log::fs::mem::MemFile) -> CountingFile {
+        if file_kind(path) == FileKind::Tier {
+            self.count(|t| t.tier_opens += 1);
+        }
+        self.wrap(path, file)
+    }
+}
+
+/// A listing the judge counts: each batch and the names it returned.
+struct CountingDirStream {
+    inner: <MemFs as SegmentFs>::DirStream,
+    tally: std::rc::Rc<std::cell::Cell<Tally>>,
+}
+
+impl DirStream for CountingDirStream {
+    fn next_batch(&mut self, batch: &mut NameBatch) -> std::io::Result<BatchEnd> {
+        let end = self.inner.next_batch(batch)?;
+        let mut tally = self.tally.get();
+        tally.listing_batches += 1;
+        tally.listed_names += batch.len() as u64;
+        self.tally.set(tally);
+        Ok(end)
     }
 }
 
@@ -834,6 +892,9 @@ impl SegmentFile for CountingFile {
     }
 
     fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        if self.kind == FileKind::Tier {
+            self.count(|t| t.truncates += 1);
+        }
         self.inner.truncate(len)
     }
 
@@ -855,14 +916,16 @@ impl SegmentFile for CountingFile {
 
 impl SegmentFs for CountingFs {
     type File = CountingFile;
-    type DirStream = <MemFs as SegmentFs>::DirStream;
+    type DirStream = CountingDirStream;
 
-    fn open_listing(
-        &self,
-        dir: &std::path::Path,
-    ) -> std::io::Result<inf_log::fs::OpenedDir<Self::DirStream>> {
-        self.count(|t| t.lists += 1);
-        self.inner.open_listing(dir)
+    fn open_listing(&self, dir: &std::path::Path) -> std::io::Result<OpenedDir<CountingDirStream>> {
+        self.count(|t| t.listing_opens += 1);
+        Ok(match self.inner.open_listing(dir)? {
+            OpenedDir::Absent => OpenedDir::Absent,
+            OpenedDir::Open(inner) => {
+                OpenedDir::Open(CountingDirStream { inner, tally: self.tally.clone() })
+            }
+        })
     }
 
     fn create_dir_all(&self, dir: &std::path::Path) -> std::io::Result<()> {
@@ -900,12 +963,12 @@ impl SegmentFs for CountingFs {
 
     fn open_write(&self, path: &std::path::Path) -> std::io::Result<CountingFile> {
         let file = self.inner.open_write(path)?;
-        Ok(self.wrap(path, file))
+        Ok(self.wrap_open(path, file))
     }
 
     fn open_read(&self, path: &std::path::Path) -> std::io::Result<CountingFile> {
         let file = self.inner.open_read(path)?;
-        Ok(self.wrap(path, file))
+        Ok(self.wrap_open(path, file))
     }
 
     fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
@@ -1049,6 +1112,8 @@ struct StepUnits {
     groups: u64,
     renames: u64,
     barriers: u64,
+    tier_reads: u64,
+    listed_names: u64,
     moved: Vec<NsId>,
 }
 
@@ -1076,6 +1141,7 @@ fn judged_boot_logged(
     unit_of: &dyn Fn(inf_server::UnitPhase) -> u64,
 ) -> (Vec<String>, std::io::Result<inf_server::RecoverStats>, Keyspace, Vec<StepUnits>) {
     use inf_server::UnitEntry;
+    let files_max = manifested_files_max(fs, cfg);
     let mut recovery = Recovery::new(fs.clone(), CELL, cfg, anchor(), now());
     let (mut over, mut log) = (Vec::new(), Vec::new());
     // Bound: every step makes progress (the zero-budget row).
@@ -1100,6 +1166,8 @@ fn judged_boot_logged(
             groups: after.rebuild_groups - units.rebuild_groups,
             renames: work.renames,
             barriers: work.barriers(),
+            tier_reads: work.tier_reads,
+            listed_names: work.listed_names,
             moved: extent_marks(&ks)
                 .into_iter()
                 .filter(|mark| !marks.contains(mark))
@@ -1111,6 +1179,7 @@ fn judged_boot_logged(
                 if row.entry == UnitEntry::Frame { inf_log::DEFAULT_READ_CHUNK as u64 } else { 0 };
             let unit = match row.phase {
                 inf_server::UnitPhase::HandOver => hand_over_unit(work.barriers()),
+                inf_server::UnitPhase::TierMap => tier_map_unit(files_max),
                 phase => unit_of(phase),
             };
             let bound = budget.saturating_add(unit).saturating_add(chunk);
@@ -1264,6 +1333,39 @@ fn hand_over_unit(barriers: u64) -> u64 {
     }
     let seal = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES;
     unsealed.max(seal) + barriers * SEAL_TIER_BYTES
+}
+
+/// The most files a tier section of the unit's MANIFEST names: the test's
+/// own read of what it wrote, which sizes the tier map's build.
+fn manifested_files_max<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
+    let shard = cfg.data_dir.join(format!("shard-{CELL}"));
+    let manifest = inf_log::read_manifest(fs, &shard).expect("the unit's MANIFEST reads");
+    let files = manifest.iter().flat_map(|m| &m.tiers).map(|tier| tier.files.len());
+    files.max().unwrap_or(0) as u64
+}
+
+/// `U` of a tier-map step, from the `limits` and the unit the test wrote,
+/// never from the engine: a step asks its budget before every unit, so it
+/// passes its budget by at most the unit that crosses it — a boot file
+/// operation (a listing's open, a batch, a held handle's open), a listed
+/// name handled with its removal, a manifested file's probe (an open and
+/// two block reads), a reseal's open (an open, a truncate and its header's
+/// read), one frame read past what the budget left bought, a barrier with
+/// the footer block it covers (a reseal's seal, a swept directory's sync),
+/// or a namespace's build, one RAM unit a catalog file of the largest
+/// section, `files_max`.
+fn tier_map_unit(files_max: u64) -> u64 {
+    use inf_server::limits::{BOOT_FILE_OP_CHARGE_BYTES, REPLAY_BARRIER_CHARGE_BYTES};
+    use inf_store::limits::{RECOVER_PROBE_CHARGE_BYTES, SETTLE_READ_CHARGE_BYTES};
+    let file_op = BOOT_FILE_OP_CHARGE_BYTES;
+    let read = SETTLE_READ_CHARGE_BYTES;
+    let name = RECOVER_PROBE_CHARGE_BYTES + file_op;
+    let probe = file_op + 2 * read;
+    let reseal_open = 2 * file_op + read;
+    let seal = REPLAY_BARRIER_CHARGE_BYTES
+        + TIER_FOOTER_BYTES as u64 * inf_server::limits::REPLAY_TIER_BYTE_CHARGE;
+    let build = files_max.max(1) * RECOVER_PROBE_CHARGE_BYTES;
+    [file_op, name, probe, reseal_open, read, seal, build].into_iter().max().unwrap_or(seal)
 }
 
 /// `U` for the hostile units: a frame's entry plus one record's unit on the
@@ -1479,16 +1581,36 @@ fn boot_recovered<F: SegmentFs + Clone>(
     (state, stats)
 }
 
+/// The names of `dir`, each its own bytes, every batch of its listing;
+/// none for an absent directory.
+fn listed_names<F: SegmentFs>(fs: &F, dir: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let OpenedDir::Open(mut stream) = fs.open_listing(dir).expect("the listing opens") else {
+        return Vec::new();
+    };
+    let mut batch = NameBatch::new();
+    let mut names = Vec::new();
+    // Bound: the directory's names; each `More` batch holds one at least.
+    loop {
+        let end = stream.next_batch(&mut batch).expect("a batch");
+        names.extend(batch.iter().map(std::ffi::OsStr::to_os_string));
+        if end == BatchEnd::End {
+            return names;
+        }
+    }
+}
+
 /// One namespace's [`NsRecovered`]: its directory `cold` and its table.
 fn ns_recovered<F: SegmentFs>(
     fs: &F,
     cold: &std::path::Path,
     table: &mut TieredTable,
 ) -> NsRecovered {
-    let mut names = fs.list_dir(cold).unwrap_or_default();
+    let mut names = listed_names(fs, cold);
     names.sort();
-    let files =
-        names.into_iter().map(|name| (name.clone(), file_bytes(fs, &cold.join(name)))).collect();
+    let files = names
+        .into_iter()
+        .map(|name| (name.to_string_lossy().into_owned(), file_bytes(fs, &cold.join(&name))))
+        .collect();
     let digest = table.simulation_digest();
     let extents = table.extent_references().collect();
     let shadow = table.shadow_counters();
@@ -2802,4 +2924,403 @@ fn a_fresh_cell_hands_its_tiered_machines_over_under_the_step_budget() {
     let mut recovery = Recovery::new(MemFs::new(), CELL, &cfg, anchor(), now());
     let first = recovery.step(&mut ks, BUDGET).expect("a fresh memory cell's step");
     assert_eq!(first, RecoveryProgress::Complete, "nothing to hand over: one step");
+}
+
+// ---- the start of a boot: the tier map's sweeps, maps and listings ----
+
+/// A tombstoned namespace whose leftover directory the start step sweeps.
+const DROPPED_NS: NsId = NsId(19);
+/// The start unit's manifested tier files: all but the last sealed, one
+/// frame each; the last unsealed.
+const START_FILES: u32 = 1024;
+/// Frames of the start unit's last manifested file, synced and never
+/// sealed: its reseal reads each.
+const START_UNSEALED_FRAMES: u64 = 1024;
+/// Unmanifested tier files a cut boot left: dead-life garbage the map
+/// removes before any flush.
+const START_DEAD_FILES: u32 = 4096;
+/// Extent files the boot lists, none referenced: orphans the hand-over
+/// queues.
+const START_EXTENTS: u64 = 1_000_000;
+/// Quarantine twins the boot lists, none referenced: second verdicts.
+const START_QUARANTINED: u64 = 64;
+/// Names in the tombstoned namespace's directory.
+const START_DROPPED_NAMES: u64 = 100_000;
+
+/// The sizes of one start unit.
+#[derive(Copy, Clone)]
+struct StartSizes {
+    extents: u64,
+    dropped_names: u64,
+}
+
+/// The start unit at the size the suite runs.
+const START: StartSizes = StartSizes { extents: START_EXTENTS, dropped_names: START_DROPPED_NAMES };
+
+/// [`tiered_keyspace`] with a tombstone for [`DROPPED_NS`]: its directory
+/// is an acked `DROP`'s leftover, the start step's to sweep.
+fn start_keyspace() -> Keyspace {
+    let entries = tiered_keyspace().ns_iter().cloned().collect();
+    let mut ks = Keyspace::new(inf_store::StoreConfig::default());
+    let catalog = inf_store::NsCatalog {
+        next_id: DROPPED_NS.0 + 1,
+        entries,
+        index: inf_store::IndexCatalog::default(),
+        dropped: vec![DROPPED_NS.0],
+    };
+    ks.seed_catalog(&catalog).expect("the catalog");
+    ks
+}
+
+/// What the start unit wrote: every name of the tiered namespace's
+/// directory, the unmanifested tier names among them, and the test's own
+/// parse of its extent and quarantine names — the control, which shares no
+/// code with a stream.
+struct StartUnit {
+    names: BTreeSet<Vec<u8>>,
+    dead: BTreeSet<Vec<u8>>,
+    extents: BTreeSet<u64>,
+    quarantined: BTreeSet<u64>,
+    unsealed: PathBuf,
+    /// The names in the tombstoned namespace's directory.
+    dropped_names: u64,
+}
+
+/// The start unit, at the size the suite runs: a log
+/// holding a checkpoint's begin marker, an empty checkpoint, and a MANIFEST
+/// whose tier section names [`START_FILES`] files — every one sealed and of
+/// one frame but the last, of [`START_UNSEALED_FRAMES`] frames, unsealed —
+/// and in the namespace's directory beside them [`START_DEAD_FILES`]
+/// unmanifested tier files (a cut boot's), `sizes.extents` extent files and
+/// [`START_QUARANTINED`] quarantine twins no record names, a non-canonical
+/// alias of extent 1 (`blob-0000001.iblob`: one id from two names), and two
+/// names that are not UTF-8; and the tombstoned namespace's directory of
+/// `sizes.dropped_names` names, one of them not UTF-8.
+fn write_start_unit<F: SegmentFs + Clone>(
+    fs: &F,
+    cfg: &DurableConfig,
+    sizes: StartSizes,
+) -> StartUnit {
+    use inf_log::tier::{SealReason, TIER_FRAME_DATA, TierWriter};
+    let mut log = Log::new(fs, cfg);
+    let begin = log.begin_marker(1);
+    drop(log);
+    make_durable(fs, cfg);
+    let shard = cfg.data_dir.join(format!("shard-{CELL}"));
+    let ns_dir = shard.join(format!("ns-{}", TIER_NS.0));
+    let mut files = Vec::new();
+    let mut base = 0u64;
+    for id in 0..START_FILES {
+        let last = id + 1 == START_FILES;
+        let frames = if last { START_UNSEALED_FRAMES } else { 1 };
+        let len = frames * TIER_FRAME_DATA as u64;
+        let at = inf_store::LogicalAddr::from_raw(base).expect("48 bits");
+        let mode = inf_log::TierIoMode::Buffered;
+        let mut writer = TierWriter::create(fs, &ns_dir, id, u32::from(CELL), TIER_NS, at, mode)
+            .expect("a manifested file");
+        writer.append(at, &vec![(id % 251) as u8; len as usize]).expect("its frames");
+        writer.sync().expect("its barrier");
+        if !last {
+            writer.seal(SealReason::Capacity).expect("its seal");
+        }
+        files.push(inf_log::manifest::TierFileRange { id, base, durable_len: len });
+        base += len;
+    }
+    let cold = cold_dir(cfg);
+    let mut names = BTreeSet::new();
+    for id in 0..START_FILES {
+        names.insert(tier_name(id));
+    }
+    let create = |name: &[u8]| {
+        fs.create_meta(&cold.join(std::ffi::OsStr::from_bytes(name))).expect("a name");
+    };
+    let mut dead = BTreeSet::new();
+    for id in START_FILES..START_FILES + START_DEAD_FILES {
+        let name = tier_name(id);
+        create(&name);
+        dead.insert(name.clone());
+        names.insert(name);
+    }
+    let mut extents = BTreeSet::new();
+    for id in 1..=sizes.extents {
+        let name = inf_log::extent_file_name(inf_log::ExtentId(id)).into_bytes();
+        create(&name);
+        names.insert(name);
+        extents.insert(id);
+    }
+    let mut quarantined = BTreeSet::new();
+    for id in sizes.extents + 1..=sizes.extents + START_QUARANTINED {
+        let name = inf_log::quarantined_file_name(inf_log::ExtentId(id)).into_bytes();
+        create(&name);
+        names.insert(name);
+        quarantined.insert(id);
+    }
+    for name in [&b"blob-0000001.iblob"[..], b"blob-00000\xff.iblob", b"tier-\xc3\x28.itier"] {
+        create(name);
+        names.insert(name.to_vec());
+    }
+    fs.sync_dir(&cold).expect("the directory's barrier");
+    let dropped = cold_dir_of(cfg, DROPPED_NS);
+    fs.create_dir_all(&dropped).expect("the dropped namespace's directory");
+    for id in 1..=sizes.dropped_names {
+        let name = inf_log::extent_file_name(inf_log::ExtentId(id));
+        fs.create_meta(&dropped.join(name)).expect("a dropped name");
+    }
+    fs.create_meta(&dropped.join(std::ffi::OsStr::from_bytes(b"blob-\xfe.iblob"))).expect("one");
+    fs.sync_dir(&dropped).expect("its barrier");
+    let ckpt = inf_log::CkptConfig { section_bytes: 32 << 20, ..cfg.ckpt };
+    let writer = inf_log::ckpt::SyncIckWriter::create_v3(
+        fs.clone(),
+        &shard.join("ckpt"),
+        &ckpt,
+        CELL,
+        1,
+        begin,
+        &[TIER_NS.0],
+    )
+    .expect("ick create");
+    writer.finish().expect("ick publish");
+    let section = inf_log::manifest::TierNsManifest { ns: TIER_NS.0, flushed: base, files };
+    let manifest = inf_log::Manifest {
+        ckpt_id: 1,
+        begin_lsn: begin,
+        segments: vec![begin.segment],
+        tiers: vec![section],
+        key_hash_id: inf_store::KeyHasher::default().identity(),
+    };
+    inf_log::write_manifest(fs, &shard, &manifest).expect("manifest");
+    let unsealed = cold.join(inf_log::tier::tier_file_name(START_FILES - 1));
+    let dropped_names = sizes.dropped_names + 1;
+    StartUnit { names, dead, extents, quarantined, unsealed, dropped_names }
+}
+
+fn tier_name(id: u32) -> Vec<u8> {
+    inf_log::tier::tier_file_name(id).into_bytes()
+}
+
+/// The start unit's oracles over a booted namespace's recovered state: its
+/// directory holds every name written but the unmanifested tier files; the
+/// tombstoned namespace's directory holds none; the unsealed file is sealed
+/// `Recovered`; the reclaim queue holds each listed extent id once as a boot
+/// orphan and each quarantined one as a second verdict — the test's own
+/// parse of the names it wrote, the alias's id once; the id cursor is past
+/// the largest; and the counters count each removal once. `Err` names the
+/// first that fails.
+fn check_start<F: SegmentFs>(
+    fs: &F,
+    cfg: &DurableConfig,
+    ns: &NsRecovered,
+    unit: &StartUnit,
+    stats: &inf_server::RecoverStats,
+) -> Result<(), String> {
+    let listed: BTreeSet<&str> = ns.files.iter().map(|(name, _)| name.as_str()).collect();
+    let kept: Vec<String> = unit
+        .names
+        .difference(&unit.dead)
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect();
+    let kept: BTreeSet<&str> = kept.iter().map(String::as_str).collect();
+    if listed != kept {
+        let gone = kept.difference(&listed).count();
+        let left = listed.difference(&kept).count();
+        return Err(format!("NAMES: {gone} kept names gone, {left} dead names left"));
+    }
+    if let OpenedDir::Open(mut stream) =
+        fs.open_listing(&cold_dir_of(cfg, DROPPED_NS)).map_err(|e| e.to_string())?
+    {
+        let mut batch = NameBatch::new();
+        let _ = stream.next_batch(&mut batch).map_err(|e| e.to_string())?;
+        if !batch.is_empty() {
+            return Err("DROPPED: the tombstoned namespace's directory holds names".into());
+        }
+    }
+    let (_, footer) = probe_tier_file(fs, &unit.unsealed).map_err(|e| e.to_string())?;
+    if footer.map(|f| f.reason) != Some(inf_log::tier::SealReason::Recovered) {
+        return Err(format!("RESEAL: the unsealed file reads {footer:?}"));
+    }
+    let origin = |of: inf_store::ReclaimOrigin| -> BTreeSet<u64> {
+        ns.reclaim.iter().filter(|c| c.origin == of).map(|c| c.extent_id).collect()
+    };
+    let (orphans, second) = (
+        origin(inf_store::ReclaimOrigin::BootOrphan),
+        origin(inf_store::ReclaimOrigin::Quarantined),
+    );
+    if ns.reclaim.len() != orphans.len() + second.len() {
+        return Err(format!("QUEUE: {} candidates, an id queued twice", ns.reclaim.len()));
+    }
+    if orphans != unit.extents || second != unit.quarantined {
+        return Err(format!(
+            "QUEUE: {} orphans and {} second verdicts, {} and {} listed",
+            orphans.len(),
+            second.len(),
+            unit.extents.len(),
+            unit.quarantined.len()
+        ));
+    }
+    let largest = unit.quarantined.iter().chain(&unit.extents).max().copied().unwrap_or(0);
+    if ns.next_extent_id != largest + 1 {
+        return Err(format!("CURSOR: the id cursor {} is not past {largest}", ns.next_extent_id));
+    }
+    let removed = stats.tier_replay.dead_life_files_removed;
+    if removed != u64::from(START_DEAD_FILES) {
+        return Err(format!("REMOVED: {removed} dead-life files counted, {START_DEAD_FILES} left"));
+    }
+    if (stats.dropped_ns_swept, stats.dropped_files_swept) != (1, unit.dropped_names) {
+        return Err(format!(
+            "SWEPT: {} namespaces and {} files swept",
+            stats.dropped_ns_swept, stats.dropped_files_swept
+        ));
+    }
+    Ok(())
+}
+
+/// The start unit's `U` on the rows a boot of it steps through: a frame's
+/// entry and one record's unit on the replay row (its log holds the begin
+/// marker alone), the checkpoint's one section on its row, and a record
+/// settled against its twin on the end settle's.
+fn start_unit_of(phase: inf_server::UnitPhase) -> u64 {
+    let record = (TieredTable::RECORD_HEADER_LEN + key(0).len() + SMALL_VALUE_LEN) as u64;
+    match phase {
+        inf_server::UnitPhase::Replay => FRAME_BYTES_MAX + replay_record_unit(record),
+        inf_server::UnitPhase::Ick => 64 << 10,
+        inf_server::UnitPhase::CkptEnd => inf_store::limits::RECOVER_PROBE_CHARGE_BYTES,
+        inf_server::UnitPhase::Settle => record + inf_store::limits::SETTLE_READ_CHARGE_BYTES,
+        other => panic!("the start unit judges no {other:?} step"),
+    }
+}
+
+/// The start of a boot at the size the suite runs, at a 256 KiB budget under
+/// the step judge (`U` the tier map's largest unit): the tombstoned
+/// namespace's 100 001 names removed, 1 024 manifested files probed, the
+/// unsealed one's 1 024 frames verified and resealed, every handle held, and
+/// 1 005 2xx names of the tiered namespace's `cold/` listed a batch at a
+/// time, 4 096 dead-life files among them removed. Every judged step's work
+/// is within `B + U`, read before the engagement clause — the reseal and the
+/// listing each span steps — and the boot keeps every name but the dead
+/// ones, reseals the file, and queues each listed extent once. Red where the
+/// map runs a namespace's files and its whole listing in one step
+/// (`inf_canary_recover_map_whole`), and where a reseal verifies every frame
+/// in one unit (`inf_canary_recover_reseal_whole`).
+#[test]
+fn the_start_of_a_boot_at_size_is_mapped_under_the_step_judge() {
+    const BUDGET: u64 = 256 << 10;
+    let fs = CountingFs::new();
+    let cfg = step_cfg();
+    let unit = write_start_unit(&fs, &cfg, START);
+    let (over, stats, mut ks, log) =
+        judged_boot_logged(&fs, &cfg, start_keyspace(), BUDGET, &start_unit_of);
+    let stats = stats.expect("the start unit boots");
+    assert!(over.is_empty(), "JUDGE: {} steps over: {:?}", over.len(), &over[..over.len().min(4)]);
+    let mapping: Vec<&StepUnits> =
+        log.iter().filter(|s| s.phase == inf_server::UnitPhase::TierMap).collect();
+    let most_reads = mapping.iter().map(|s| s.tier_reads).max().unwrap_or(0);
+    let most_names = mapping.iter().map(|s| s.listed_names).max().unwrap_or(0);
+    let listing = mapping.iter().filter(|s| s.listed_names > 0).count();
+    eprintln!(
+        "the start unit at {BUDGET}: {} steps, {} of them the tier map's, at most {most_reads} \
+         tier reads and {most_names} listed names in one, {listing} steps listing; {} \
+         dead-life files removed, {} dropped names swept",
+        log.len(),
+        mapping.len(),
+        stats.tier_replay.dead_life_files_removed,
+        stats.dropped_files_swept
+    );
+    assert!(
+        most_reads < START_UNSEALED_FRAMES && listing > 1 && most_names < START.extents,
+        "VACUOUS: {} tier-map steps, at most {most_reads} tier reads and {most_names} listed \
+         names in one, {listing} steps listing",
+        mapping.len()
+    );
+    let table = ks.tiered_store_mut(TIER_NS).expect("the tiered table");
+    let ns = ns_recovered(&fs, &cold_dir(&cfg), table);
+    check_start(&fs, &cfg, &ns, &unit, &stats).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Budget independence over the start unit: recovered at `u64::MAX` (the
+/// control, whose map runs whole in one step), at 256 KiB and at 1, the
+/// tiered namespace's state is the same — its directory byte for byte (the
+/// resealed file among it), the reclaim queue in its hand-out order with
+/// its origins, the id cursor — and so are the counters, and every boot
+/// meets the start unit's oracles.
+#[test]
+fn every_budget_recovers_the_start_of_the_unparked_boot() {
+    let cfg = step_cfg();
+    let boot = |budget: u64| {
+        let fs = CountingFs::new();
+        let unit = write_start_unit(&fs, &cfg, START);
+        let (state, stats) = boot_recovered(&fs, &cfg, start_keyspace(), budget, &Model::new());
+        check_start(&fs, &cfg, state.tier(), &unit, &stats)
+            .unwrap_or_else(|e| panic!("BUDGET INDEPENDENCE at {budget}: {e}"));
+        (state, stats)
+    };
+    let (control, control_stats) = boot(u64::MAX);
+    for budget in [256 << 10, 1] {
+        let (state, stats) = boot(budget);
+        assert_same(&state, &control, budget);
+        let swept = |s: &inf_server::RecoverStats| (s.dropped_ns_swept, s.dropped_files_swept);
+        assert_eq!(swept(&stats), swept(&control_stats), "BUDGET INDEPENDENCE: the sweep");
+    }
+}
+
+/// The start of a boot under the simulated disk's repeat mode (ADR-0202 D5):
+/// a listing returns once more each name of its last batch the boot removed
+/// since, so the tier map and the sweep each meet a name they already
+/// removed. The boot takes each as that name's earlier removal — it
+/// completes, counts every removal once and meets the start unit's oracles
+/// — and the repeats were served (else `VACUOUS`). Red where a repeated
+/// name refuses the boot (`inf_canary_recover_listing_repeat_refused`).
+#[test]
+fn the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal() {
+    let disk = inf_server::SimDisk::with_config(inf_log::fs::sim::SimDiskConfig {
+        listing_repeats_removed: true,
+        ..inf_log::fs::sim::SimDiskConfig::default()
+    });
+    let cfg = step_cfg();
+    let sizes = StartSizes { extents: 20_000, dropped_names: 2_000 };
+    let unit = write_start_unit(&disk, &cfg, sizes);
+    let mut ks = start_keyspace();
+    let mut recovery = Recovery::new(disk.clone(), CELL, &cfg, anchor(), now());
+    // Bound: every step makes progress.
+    for steps in 0u64.. {
+        let refused = |err| panic!("REPEAT: the boot refused a repeated name: {err}");
+        if recovery.step(&mut ks, 256 << 10).unwrap_or_else(refused) == RecoveryProgress::Complete {
+            break;
+        }
+        assert!(steps < 5_000_000, "REPEAT: no progress");
+    }
+    let (_rotor, stats, _seed) = recovery.finish();
+    let repeats = disk.listing_repeats_served();
+    assert!(repeats > 0, "VACUOUS: no listing repeated a removed name");
+    let table = ks.tiered_store_mut(TIER_NS).expect("the tiered table");
+    let ns = ns_recovered(&disk, &cold_dir(&cfg), table);
+    check_start(&disk, &cfg, &ns, &unit, &stats).unwrap_or_else(|e| panic!("REPEAT: {e}"));
+}
+
+/// ADR-0202 D5: a listing fault point fired inside the tier map — at the
+/// sweep's listing open, or at its first batch — refuses the boot typed,
+/// naming the point; the next boot, the fault cleared, recovers the unit.
+#[test]
+fn a_listing_fault_refuses_the_tier_map_typed() {
+    use inf_foundation::fault::{self, FaultSpec};
+    let cfg = step_cfg();
+    let sizes = StartSizes { extents: 100, dropped_names: 10 };
+    for point in [inf_log::fault::DIR_LISTING_OPEN_FAIL, inf_log::fault::DIR_LISTING_NEXT_FAIL] {
+        let fs = MemFs::new();
+        let unit = write_start_unit(&fs, &cfg, sizes);
+        let mut ks = start_keyspace();
+        let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
+        assert_eq!(
+            recovery.step(&mut ks, 256 << 10).expect("the log's half"),
+            RecoveryProgress::Working
+        );
+        assert_eq!(recovery.next_unit_row().phase, inf_server::UnitPhase::TierMap);
+        fault::arm(point, FaultSpec::Nth(1));
+        let err = recovery.step(&mut ks, 256 << 10).map(|_| ()).expect_err("the fault refuses");
+        assert!(err.to_string().contains(point), "typed and named: {err}");
+        assert!(fault::fired(point) >= 1, "VACUOUS: the point did not fire");
+        fault::disarm_all();
+        let (state, stats) = boot_recovered(&fs, &cfg, start_keyspace(), 256 << 10, &Model::new());
+        check_start(&fs, &cfg, state.tier(), &unit, &stats)
+            .unwrap_or_else(|e| panic!("{point}: {e}"));
+    }
 }

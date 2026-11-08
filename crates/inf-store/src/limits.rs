@@ -58,8 +58,11 @@ pub const SETTLE_WALK_BYTE_CHARGE: u64 = 1;
 
 /// The recovery step budget's price (ADR-0174 A1) of one RAM unit of boot
 /// work outside the record walk: one checkpoint entry's apply beside its
-/// bytes (a ref's pair probe, insert and live-set probe), or one listed
-/// address the end of the checkpoint releases (a probe and a death) — at
+/// bytes (a ref's pair probe, insert and live-set probe), one listed
+/// address the end of the checkpoint releases (a probe and a death), one
+/// parked death the hand-over stamps or extent id it seeds, one listed name
+/// the start step's tier map handles (its manifest search, an append), or
+/// one catalog file its build adds to the table and the pipeline — at
 /// most five ordered-map or index operations and no scan. 64 budget bytes,
 /// a few cache misses' worth beside the byte prices: an estimate the
 /// reference-box run calibrates, never a measurement. Owner: the recovery

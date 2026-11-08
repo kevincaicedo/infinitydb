@@ -209,14 +209,18 @@ const _: () = {
 };
 
 /// The recovery step budget's price (ADR-0174 A1) of one boot file
-/// operation outside replay — at the hand-over, the rename that brings a
-/// quarantined extent the replayed map references back under its name
-/// (ADR-0096 D3): 128 KiB, about 100 µs of a device that moves 1 GiB/s, as
-/// a settle read is priced. An estimate the reference-box run calibrates,
-/// never a measurement. Owner: the recovery driver, which charges it per
-/// operation and runs as many a turn as its budget left buys, at least one.
-/// Crossing: the step yields once its charge reaches the budget, at the next
-/// unit, and the next step resumes at the hand-over's cursor.
+/// operation outside replay — in the start step's tier map, an open of an
+/// existing tier file, a truncate, a removal, a directory listing's open
+/// and each batch it reads (at most 256 names and 8 KiB, ADR-0202 D2); at
+/// the hand-over, the rename that brings a quarantined extent the replayed
+/// map references back under its name (ADR-0096 D3): 128 KiB, about 100 µs
+/// of a device that moves 1 GiB/s, as a settle read is priced; a cold
+/// listing batch reads a few directory blocks. An estimate the
+/// reference-box run calibrates, never a measurement. Owner: the recovery
+/// driver, which charges it per operation and, at the hand-over, runs as
+/// many a turn as its budget left buys, at least one. Crossing: the step
+/// yields once its charge reaches the budget, at the next unit, and the
+/// next step resumes at its phase's cursor.
 pub const BOOT_FILE_OP_CHARGE_BYTES: u64 = 128 << 10;
 
 /// The accept retry's window, in injected time: after the driver parks a
