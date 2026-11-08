@@ -447,8 +447,8 @@ those driver ops against the same `SimDisk`.
 
 ### Directory listing additions (ADR-0202)
 
-> **ADR-0202 (2026-11-07), not built:** the seam lists a directory one bounded batch at
-> a time. `open_listing(dir) -> io::Result<OpenedDir<DirStream>>`, `OpenedDir::{Absent, Open}`,
+> **ADR-0202 (2026-11-07), built 2026-11-08 by FCR-STTIER-N12's S3:** the seam lists a
+> directory one bounded batch at a time. `open_listing(dir) -> io::Result<OpenedDir<DirStream>>`, `OpenedDir::{Absent, Open}`,
 > opens it; `Absent` is the directory's own `ENOENT`, and any other errno is an `Err`.
 > `DirStream::next_batch(&mut NameBatch) -> io::Result<BatchEnd>`, `BatchEnd::{More, End}`,
 > fills a caller-owned batch of at most 256 names and 8 KiB of name bytes, each name the entry's
