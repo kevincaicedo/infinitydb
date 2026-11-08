@@ -585,19 +585,38 @@ fn drop_fan(name: &[u8], receipt: &DropPersisted, mode: NsMode) -> [Vec<u8>; 6] 
     ]
 }
 
-/// Fans an accepted drop's leg to every peer (ADR-0189 D5): `true` when
-/// every leg applied (`Removed` and `Absent` alike), else the first
-/// refused leg's reply.
+/// Fans an accepted drop's leg to every peer, one at a time, every leg
+/// awaited (ADR-0189 D5, ADR-0108 D2), and returns once every leg applied
+/// (`Removed` and `Absent` alike). A leg read as refused is D4's fail-stop:
+/// `META` already drops the namespace, and a peer left serving it would
+/// export it, so the node stops rather than answer.
 async fn fan_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     name: &[u8],
     receipt: &DropPersisted,
     mode: NsMode,
-) -> Option<OwnedReply> {
+) {
     let fan = drop_fan(name, receipt, mode);
     let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();
-    fan_all_or_first_error(shared, proto, &fan_argv).await
+    for cell in peer_cells(shared) {
+        let mut outcome = fan_leg(shared, proto, cell, &fan_argv).await;
+        // Crash-matrix point: the origin reads an applied leg as refused
+        // (test builds only).
+        if inf_foundation::fault::fire(crate::fault::NS_LEG_READ_REFUSED) {
+            outcome = LegOutcome::Refused(error_reply(shared, proto, "ERR fault: leg read"));
+        }
+        if let LegOutcome::Refused(reply) = outcome {
+            let detail = format!(
+                "cell {}'s leg of namespace {} at epoch {} answered {}",
+                cell.0,
+                receipt.id().0,
+                receipt.fan_epoch(),
+                String::from_utf8_lossy(reply.bytes()).trim_end()
+            );
+            super::ddl_fail_stop("DROP leg read", &detail);
+        }
+    }
 }
 
 /// The notice a DDL owes the catalog writer once its fan is done
@@ -857,12 +876,14 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     if let Err(e) = apply_drop(shared, &receipt) {
         return ns_error_reply(shared, proto, e);
     }
-    if let Some(error) = fan_drop(shared, proto, name, &receipt, spec.mode).await {
-        // A leg that did not apply leaves the tombstone unstamped: the
-        // next boot stamps it.
-        notice.post(None);
-        return error;
+    // Crash-matrix point: the on-disk state of a cut after the origin's
+    // apply and before its first leg (`META` lacks the namespace, the
+    // origin applied, every peer still serves it); the node runs on and
+    // the tombstone stays unstamped until the next boot re-stamps it.
+    if inf_foundation::fault::fire(crate::fault::NS_DROP_AFTER_APPLY) {
+        return error_reply(shared, proto, "ERR fault: ns_drop_after_apply");
     }
+    fan_drop(shared, proto, name, &receipt, spec.mode).await;
     notice.post(cleanup.stamp_epoch());
     simple_reply(shared, proto, "OK")
 }
@@ -907,15 +928,13 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     let Ok(receipt) = await_answer(shared, control, requested).await else {
         unreachable!("the writer accepts a rollback's drop of its own pending CREATE");
     };
-    // `Absent` here is an origin whose own apply was refused.
+    // `Absent` here is an origin whose own apply was refused; an error is
+    // a keyspace no catalog writer answers, which a node's never is.
     if apply_drop(shared, &receipt).is_err() {
         notice.post(None);
         return;
     }
-    if fan_drop(shared, proto, name, &receipt, mode).await.is_some() {
-        notice.post(None);
-        return;
-    }
+    fan_drop(shared, proto, name, &receipt, mode).await;
     notice.post(cleanup.stamp_epoch());
 }
 

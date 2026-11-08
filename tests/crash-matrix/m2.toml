@@ -220,6 +220,39 @@ tier = "node"
 platform = "linux"
 test = "inf-server::node_e2e::dropped_tiered_namespace_survives_a_cut_after_its_swap"
 expect = "residue-swept"
+# ADR-0189 D5 (`ns_fail_stop::a_drop_stopped_after_its_origin_applied_is_gone_after_a_restart`):
+# the DDL stops after the origin's apply and before its first leg, the
+# node running on.
+#   namespace-gone-after-restart — the next DDL answers (the notice was
+#                         posted), the tombstone stays unstamped while the
+#                         node runs, and the restart re-stamps it and
+#                         serves the namespace on no cell
+[[row]]
+point = "ns_drop_after_apply"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::ns_fail_stop::a_drop_stopped_after_its_origin_applied_is_gone_after_a_restart"
+expect = "namespace-gone-after-restart"
+# ADR-0189 D4 (`ns_fail_stop::a_drop_leg_a_peer_cannot_apply_stops_the_node` /
+# `…_read_as_refused_stops_the_node`): a `DROP` leg the peer cannot apply,
+# or that the origin reads as refused, after `META` dropped the namespace.
+#   drop-leg-fail-stop  — the node exits EXIT_DURABLE_FAILSTOP, the stderr
+#                         line names the arm, and the boot serves META's
+#                         state: the namespace absent on every cell
+#   leg-read-fail-stop  — the same, the origin's arm
+[[row]]
+point = "ns_drop_leg_refused"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::ns_fail_stop::a_drop_leg_a_peer_cannot_apply_stops_the_node"
+expect = "drop-leg-fail-stop"
+
+[[row]]
+point = "ns_leg_read_refused"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::ns_fail_stop::a_drop_leg_read_as_refused_stops_the_node"
+expect = "leg-read-fail-stop"
 
 # ADR-0103 D5 (`created_namespace_survives_a_cut_after_its_swap`): the
 # CREATE DDL stops once the catalog swap is durable and before the local

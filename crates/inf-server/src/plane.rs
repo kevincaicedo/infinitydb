@@ -108,6 +108,16 @@ use scatter::{
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
 use shared::{DurableAdmission, NsApplyOutcome, apply_drop, handle_ns_apply, tier_to_fan};
+
+/// ADR-0189 D4's fail-stop: a namespace change `META` holds that this cell
+/// cannot apply, or a leg the origin reads as refused. A cell left on the
+/// old value would serve and export it, so the node stops with
+/// [`EXIT_DURABLE_FAILSTOP`](crate::EXIT_DURABLE_FAILSTOP), the stderr line
+/// naming the arm; the boot serves `META`'s value on every cell.
+fn ddl_fail_stop(arm: &str, detail: &str) -> ! {
+    eprintln!("namespace DDL {arm} failed (fail-stop): {detail}");
+    std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
+}
 pub(crate) use timers::DurableTimers;
 use timers::ServerTimers;
 pub use timers::{TimerAssemblyError, TimerRole};

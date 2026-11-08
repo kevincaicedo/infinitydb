@@ -39,11 +39,13 @@ mod recover;
 mod tier_cell;
 mod topology;
 
-/// Process exit code for a durable-path fail-stop (§8.4, the fsyncgate
-/// rule): an fsync/log-write error freezes the watermark — no ack for the
-/// affected batch ever fires — and the process exits with this code
-/// (M2-S17, ADR-0020 D3). Boot-recovery failure keeps exit code 1
-/// (`infinityd`'s `take_boot_error` path).
+/// Process exit code for a durable fail-stop: an fsync or log-write error
+/// freezes the watermark — no ack for the affected batch ever fires — and
+/// the process exits with this code (the fsyncgate rule, ADR-0020 D3); so
+/// does durable state this node cannot serve, a namespace change `META`
+/// holds that a cell cannot apply (ADR-0189 D4). The stderr line names the
+/// arm. Boot-recovery failure keeps exit code 1 (`infinityd`'s
+/// `take_boot_error` path).
 pub const EXIT_DURABLE_FAILSTOP: i32 = 3;
 
 pub use cache_boot::{CacheBootGroup, CacheBootPermit};

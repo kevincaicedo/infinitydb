@@ -10849,3 +10849,8 @@ mod ns_create_refused;
 /// The tombstone cap at the node, in a file of its own.
 #[path = "node_e2e/ns_cap.rs"]
 mod ns_cap;
+
+/// The DDL fail-stops and the stop after the origin's apply, in a file of
+/// their own.
+#[path = "node_e2e/ns_fail_stop.rs"]
+mod ns_fail_stop;

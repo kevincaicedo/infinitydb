@@ -45,6 +45,19 @@
 //!   carrying its tombstone while every cell still serves it — the on-disk state of a power
 //!   cut after the answer (ADR-0189 D5): a restart boots, sweeps the residue, and the
 //!   namespace is gone
+//! - `ns_drop_after_apply` — `plane::ns_ddl::program_ns_drop` (after the origin's apply,
+//!   before its first `DROP` leg) — the DDL stops with `META` lacking the namespace, the origin
+//!   applied and every peer still serving it, and the node runs on: the drop's notice posts with
+//!   no stamp, so its tombstone stays unstamped until the next boot re-stamps it, and a restart
+//!   serves the namespace on no cell (crash-matrix row `namespace-gone-after-restart`)
+//! - `ns_drop_leg_refused` — `plane::handle_ns_apply` (a peer's `INF.NSFAN DROP` leg, in place
+//!   of its apply) — the peer cannot apply a drop `META` holds, so it stops the node with
+//!   [`EXIT_DURABLE_FAILSTOP`](crate::EXIT_DURABLE_FAILSTOP) and a stderr line naming the arm
+//!   (ADR-0189 D4): a cell left serving the namespace would export it; the restart serves
+//!   `META`'s state, the namespace absent on every cell (crash-matrix row `drop-leg-fail-stop`)
+//! - `ns_leg_read_refused` — `plane::ns_ddl::fan_drop` (the origin's read of an applied `DROP`
+//!   leg) — the origin reads the leg as refused and stops the node the same way (crash-matrix row
+//!   `leg-read-fail-stop`)
 //! - `ns_create_after_meta` — `plane::program_ns_ddl` (the CREATE branch, after the catalog swap is
 //!   durable, before the local apply) — the DDL stops with `META` naming a namespace no cell serves
 //!   —
@@ -93,6 +106,9 @@ pub const COLD_ENQUEUE_UNADDRESSABLE: &str = "cold_enqueue_unaddressable";
 pub const MSET_MIDWAY_OOM: &str = "mset_midway_oom";
 pub const NS_DROP_BEFORE_META: &str = "ns_drop_before_meta";
 pub const NS_DROP_AFTER_META: &str = "ns_drop_after_meta";
+pub const NS_DROP_AFTER_APPLY: &str = "ns_drop_after_apply";
+pub const NS_DROP_LEG_REFUSED: &str = "ns_drop_leg_refused";
+pub const NS_LEG_READ_REFUSED: &str = "ns_leg_read_refused";
 pub const NS_CREATE_AFTER_META: &str = "ns_create_after_meta";
 pub const NS_CREATE_FAN_REFUSED: &str = "ns_create_fan_refused";
 pub const NS_CREATE_ORIGIN_REFUSED: &str = "ns_create_origin_refused";
@@ -109,6 +125,9 @@ pub const ALL: &[&str] = &[
     MSET_MIDWAY_OOM,
     NS_DROP_BEFORE_META,
     NS_DROP_AFTER_META,
+    NS_DROP_AFTER_APPLY,
+    NS_DROP_LEG_REFUSED,
+    NS_LEG_READ_REFUSED,
     NS_CREATE_AFTER_META,
     NS_CREATE_FAN_REFUSED,
     NS_CREATE_ORIGIN_REFUSED,

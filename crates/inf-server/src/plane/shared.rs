@@ -716,6 +716,22 @@ pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone +
         stage_leg_refusal(scratch, staged, (from, token), refusal);
         return true;
     }
+    if argv.len() == 6 && argv[1].eq_ignore_ascii_case(b"DROP") {
+        // Crash-matrix point: this peer cannot apply the drop (test builds
+        // only); in its place, every refusal below is the same fail-stop.
+        let refused = if inf_foundation::fault::fire(crate::fault::NS_DROP_LEG_REFUSED) {
+            Err("the injected refusal".to_owned())
+        } else {
+            apply_drop_leg(shared, argv)
+        };
+        if let Err(why) = refused {
+            let name = String::from_utf8_lossy(argv[2]);
+            let detail = format!("cell {} cannot apply the drop of '{name}': {why}", shared.cell.0);
+            super::ddl_fail_stop("DROP leg apply", &detail);
+        }
+        staged.push((from, token, StagedReply::Ok));
+        return true;
+    }
     match apply_nsfan(shared, argv) {
         // An applied leg answers its variant alone (ADR-0189 D5): the
         // origin reads `Ok` as applied, never a reply's bytes.
@@ -748,9 +764,6 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 ) -> Result<(), inf_store::NsError> {
     use inf_store::NsError;
     let malformed = NsError::InvalidName; // internal vocabulary; never client-visible
-    if argv.len() == 6 && argv[1].eq_ignore_ascii_case(b"DROP") {
-        return apply_drop_leg(shared, argv).map(|_| ());
-    }
     if argv.len() == 4 && argv[1].eq_ignore_ascii_case(b"SET") {
         let tier = tier_from_fan(argv[3])?.ok_or(malformed)?;
         return shared.store.borrow_mut().ns_set_tier(argv[2], tier);
@@ -819,26 +832,29 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 /// which the origin's own receipt already covered; the namespace the name
 /// holds here, if any, must carry the leg's id and mode; then the drop
 /// applies, `Removed` or `Absent` (a peer that refused or never received
-/// the `CREATE` leg), either an applied leg.
+/// the `CREATE` leg), either an applied leg. `Err` says why this cell
+/// cannot apply it: each is unreachable while the origin fans an accepted
+/// drop's own leg, and each is the caller's fail-stop.
 fn apply_drop_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     argv: &[&[u8]],
-) -> Result<inf_store::ddl::DropApplied, inf_store::NsError> {
-    use inf_store::NsError;
-    let malformed = NsError::InvalidName; // internal vocabulary; never client-visible
-    let text = |b: &[u8]| core::str::from_utf8(b).ok().map(str::to_owned);
-    let epoch: u64 = text(argv[3]).and_then(|s| s.parse().ok()).ok_or(malformed.clone())?;
-    let id: u32 = text(argv[4]).and_then(|s| s.parse().ok()).ok_or(malformed.clone())?;
-    let mode = text(argv[5]).and_then(|s| NsMode::parse(&s)).ok_or(malformed.clone())?;
-    let Some(control) = shared.control.borrow().clone() else { return Err(malformed) };
+) -> Result<inf_store::ddl::DropApplied, String> {
+    let field = |at: usize| core::str::from_utf8(argv[at]).ok();
+    let epoch: u64 = field(3).and_then(|s| s.parse().ok()).ok_or("a malformed epoch")?;
+    let id: u32 = field(4).and_then(|s| s.parse().ok()).ok_or("a malformed id")?;
+    let mode = field(5).and_then(NsMode::parse).ok_or("a malformed mode")?;
+    let Some(control) = shared.control.borrow().clone() else {
+        return Err("no catalog writer on this node".to_owned());
+    };
     let receipt = inf_store::ddl::DropPersisted::from_leg(NsId(id), epoch, control.catalog_word())
-        .map_err(|_| malformed.clone())?;
+        .map_err(|e| format!("epoch {} is not durable (the word is {})", e.epoch, e.word))?;
     if let Some(spec) = shared.store.borrow().ns_get(argv[2])
         && (spec.id != receipt.id() || spec.mode != mode)
     {
-        return Err(malformed);
+        let held = format!("{} {}", spec.id.0, spec.mode.name());
+        return Err(format!("the leg names {id} {}, this cell holds {held}", mode.name()));
     }
-    apply_drop(shared, &receipt)
+    apply_drop(shared, &receipt).map_err(|e| format!("{e:?}"))
 }
 
 /// Applies an accepted `DROP` to this cell's keyspace with its receipt
