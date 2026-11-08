@@ -230,6 +230,8 @@ const PLANT_COUNT_AFTER_PUSH: bool = cfg!(inf_canary_wake_count_after_push);
 const PLANT_WAKE_WITHOUT_QUEUE: bool = cfg!(inf_canary_wake_without_queue);
 /// A closed header's last drop frees it with `Q` set.
 const PLANT_CLOSED_FREE_IGNORES_QUEUE: bool = cfg!(inf_canary_closed_free_ignores_queue);
+/// The foreign lane and `close` compare no count with `LANE_COUNT_MAX`.
+const PLANT_COUNT_UNBOUNDED: bool = cfg!(inf_canary_wake_count_unbounded);
 
 // ---- The tomb: a Loom model's view of a free ------------------------------------------------
 
@@ -437,7 +439,7 @@ impl WakeBridge {
         count_before(stack);
         self.swap_lane(LANE_ORDERING, |lane| {
             let count = lane.count();
-            if count >= LANE_COUNT_MAX {
+            if !PLANT_COUNT_UNBOUNDED && count >= LANE_COUNT_MAX {
                 std::process::abort();
             }
             lane.with_count(count + 1)
@@ -524,7 +526,7 @@ impl WakeBridge {
             debug_assert!(!lane.has(CLOSED), "a header is closed once");
             // Each lane's count is within ±LANE_COUNT_MAX, so the sum fits an `i64`.
             let folded = lane.count() + owner_count;
-            if folded > LANE_COUNT_MAX {
+            if !PLANT_COUNT_UNBOUNDED && folded > LANE_COUNT_MAX {
                 std::process::abort();
             }
             lane.with_count(folded).with(CLOSED)
@@ -785,6 +787,13 @@ mod tests {
 
     const RELAXED: Ordering = Ordering::Relaxed;
 
+    /// A live header's bridge on `stack`, its foreign count set to `count`.
+    fn bridge_with_count(stack: &RemoteStack, count: i64) -> WakeBridge {
+        let bridge = WakeBridge::new(stack, ThreadMark::claim());
+        bridge.lane.store(Lane(0).with_count(count).0, RELAXED);
+        bridge
+    }
+
     /// Settles a live executor's take: the deliveries, in stack order.
     fn deliveries(stack: &RemoteStack, bridge: &WakeBridge) -> Vec<Delivery> {
         let mut drained = stack.take();
@@ -934,6 +943,56 @@ mod tests {
         assert_eq!(bridge.foreign_drop(&stack), Released::Kept);
         assert!(!Lane(bridge.lane.load(RELAXED)).has(QUEUED), "the pusher cleared its own Q");
         assert_eq!(bridge.foreign_wake_by_ref(&stack), Pushed::Closed);
+    }
+
+    /// A foreign clone at `LANE_COUNT_MAX`, or a `close` folding 1 into a count there, aborts
+    /// the process before the count is written; one below the bound, each reaches it. The test
+    /// runs its own binary on itself, one child an aborting leg, and requires each child to die by
+    /// `SIGABRT`.
+    #[test]
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore = "the test spawns a process, which Miri does not")]
+    fn a_foreign_lane_clone_at_the_bound_aborts() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "INF_WAKE_BOUND_CHILD";
+        const NAME: &str = "wake::tests::a_foreign_lane_clone_at_the_bound_aborts";
+        /// `SIGABRT`'s number on every supported host.
+        const SIGABRT: i32 = 6;
+        match std::env::var(CHILD).as_deref() {
+            Ok("clone") => {
+                let stack = RemoteStack::new();
+                bridge_with_count(&stack, LANE_COUNT_MAX).foreign_clone(&stack);
+                return;
+            }
+            Ok("close") => {
+                let stack = RemoteStack::new();
+                let _ = bridge_with_count(&stack, LANE_COUNT_MAX).close(1);
+                return;
+            }
+            Ok(_) | Err(_) => {}
+        }
+        // One below the bound, either growth reaches it and nothing aborts.
+        let stack = RemoteStack::new();
+        let cloned = bridge_with_count(&stack, LANE_COUNT_MAX - 1);
+        cloned.foreign_clone(&stack);
+        assert_eq!(Lane(cloned.lane.load(RELAXED)).count(), LANE_COUNT_MAX);
+        let folded = bridge_with_count(&stack, LANE_COUNT_MAX - 1);
+        assert_eq!(folded.close(1), Closing::Retain, "a waker names the header");
+        assert_eq!(Lane(folded.lane.load(RELAXED)).count(), LANE_COUNT_MAX);
+        for leg in ["clone", "close"] {
+            let exe = std::env::current_exe().expect("the test binary's path");
+            let output = std::process::Command::new(exe)
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, leg)
+                .output()
+                .expect("the child test runs");
+            assert_eq!(
+                output.status.signal(),
+                Some(SIGABRT),
+                "the {leg} leg's child exited {:?}, not by SIGABRT",
+                output.status
+            );
+        }
     }
 }
 

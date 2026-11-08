@@ -768,6 +768,9 @@ rows=(
   # The drain clears Q before it reads the link: a push between them
   # rewrites it.
   "inf_canary_wake_clear_before_link loom inf-foundation loom_pushes_and_drains_lose_no_bridge drained-once"
+  # Neither the foreign lane nor a close compares its count with
+  # LANE_COUNT_MAX: the count wraps, and the child exits instead of aborting.
+  "inf_canary_wake_count_unbounded crate-test inf-foundation lib a_foreign_lane_clone_at_the_bound_aborts not by SIGABRT"
   # A foreign call adds to waker_foreign_ops after its push: the
   # executor's drop can free the stack first.
   "inf_canary_wake_count_after_push loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
