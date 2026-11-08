@@ -52,6 +52,12 @@ name = "timer_ab"
 harness = false
 test = false
 
+# The waker's A/B by instructions (ADR-0003 A1.5): legs A, B and P, chosen by argument.
+[[bench]]
+name = "waker_ab"
+harness = false
+test = false
+
 # M0-S04 echo gate (Linux + uring only; skipped without the feature).
 [[bench]]
 name = "uring_echo"
