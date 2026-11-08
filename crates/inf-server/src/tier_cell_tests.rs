@@ -1711,17 +1711,17 @@ fn same_numbered_retired_files(id: u32) -> (TierCell<SimDisk>, Keyspace, [PathBu
         life_origin: LogicalAddr::ZERO,
     };
     let mut ks = Keyspace::new(StoreConfig::default());
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    let mut cell = TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     for ns in [NsId(16), NsId(17)] {
         assert!(ks.materialize_tiered(ns, space, demote, 64).is_ok());
         cell.create_ns(ns, &spec());
     }
     let paths = [0, 1].map(|index| {
-        let cold = cell.namespaces[index].dir.join("cold");
+        let cold = cell.nth(index).dir.join("cold");
         cell.fs.create_dir_all(&cold).expect("the cold directory");
         let path = cold.join(inf_log::tier_file_name(id));
         drop(cell.fs.create_tier(&path, TierIoMode::Buffered).expect("a tier file"));
-        cell.namespaces[index].note_retired(TierFileMeta {
+        cell.nth_mut(index).note_retired(TierFileMeta {
             id,
             base: LogicalAddr::from_raw(u64::from(id) << 20).expect("fits"),
             data_len: 1 << 20,
@@ -1747,16 +1747,16 @@ fn a_cold_read_defers_only_its_own_namespaces_file() {
     const FILE: u32 = 3;
     let (mut cell, mut ks, _) = same_numbered_retired_files(FILE);
     cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0).expect("MAINTAIN");
-    assert!(cell.namespaces[1].retired.is_empty(), "the control: 17's file 3 retires unread");
+    assert!(cell.nth(1).retired.is_empty(), "the control: 17's file 3 retires unread");
     let (mut cell, mut ks, paths) = same_numbered_retired_files(FILE);
     let cold = cell.cold.clone().expect("the cell's cold engine");
     let class = inf_runtime::ReadClass::Foreground;
     let file = TierFileId::new(FILE);
     let wait = cold.enqueue(-1, file, 0, TIER_FRAME_BYTES, class, 0).expect("the read queued");
     cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0).expect("MAINTAIN");
-    let own_kept = cell.namespaces[0].retired.len();
+    let own_kept = cell.nth(0).retired.len();
     cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0).expect("MAINTAIN");
-    let other_kept = cell.namespaces[1].retired.len();
+    let other_kept = cell.nth(1).retired.len();
     drop(wait);
     assert_eq!(own_kept, 1, "engagement: the read keeps namespace 16's file 3 retiring");
     assert!(on_disk(&cell, &paths[0]), "engagement: 16's file 3 is still on the disk");
