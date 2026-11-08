@@ -329,7 +329,13 @@ impl ReceiptBoard {
     /// cell.
     #[must_use]
     pub fn all_name(&self, pos: GrantPos, id: u32) -> bool {
-        (0..self.cells()).all(|cell| self.at(cell, pos).load(Ordering::Acquire) == id)
+        (0..self.cells()).all(|cell| {
+            let receipt = self.at(cell, pos).load(Ordering::Acquire);
+            // Canary `inf_canary_receipt_id_blind`: any receipt reclaims, so
+            // one left from an earlier grant of the position returns a
+            // grant whose owners have not ended.
+            if cfg!(inf_canary_receipt_id_blind) { receipt != 0 } else { receipt == id }
+        })
     }
 }
 

@@ -1523,6 +1523,16 @@ impl TierNamespaceGrants {
         }
     }
 
+    /// The canary's early return of `id`'s grant (see `notice`).
+    fn release_planted(&mut self, id: NsId) {
+        let held =
+            self.directory.positions().find(|pos| self.book[pos.index()] == Grant::Declared(id));
+        if let Some(pos) = held {
+            self.book[pos.index()] = Grant::Vacant;
+            self.directory.vacate(pos);
+        }
+    }
+
     /// Step 7: the Reserved grant becomes Declared, and the directory makes
     /// every staged store, then bumps its generation, before the epoch.
     fn publish(&mut self) -> DirectoryPublished {
@@ -2355,6 +2365,14 @@ impl CatalogWriter {
             return;
         }
         self.pending = None;
+        // Canary `inf_canary_grant_return_at_create_applied`: the grant
+        // returns at the CREATE's notice, while every cell holds its owner,
+        // so the next tiered CREATE is granted a position a cell holds.
+        if cfg!(inf_canary_grant_return_at_create_applied)
+            && let DdlNotice::CreateApplied { id } = notice
+        {
+            self.grants.release_planted(id);
+        }
         match notice {
             DdlNotice::DropFanned { id, stamp: Some(epoch) } => self.tombstones.stamp(id.0, epoch),
             DdlNotice::DropFanned { stamp: None, .. } | DdlNotice::CreateApplied { .. } => {}

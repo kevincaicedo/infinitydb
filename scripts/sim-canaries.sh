@@ -762,6 +762,14 @@ rows=(
   # the Retiring grant's receipt is never written.
   "inf_canary_grants_generation_relaxed loom inf-foundation loom_a_pass_that_sees_the_generation_sees_the_retiring F9:"
   "inf_canary_grants_generation_first loom inf-foundation loom_a_pass_that_sees_the_generation_sees_the_retiring F9:"
+  # ADR-0148 D2: the writer returns a tiered grant at its CREATE's notice,
+  # while every cell holds the owner: the next tiered CREATE's apply finds
+  # its position held and answers an internal error.
+  "inf_canary_grant_return_at_create_applied m4-ns-lifetimes REPLY:"
+  # ADR-0148 D4: the reclaim accepts any receipt, so one left from an
+  # earlier grant of the position returns a grant whose owners still hold
+  # it on a cell: the CREATE granted it finds the position held.
+  "inf_canary_receipt_id_blind m4-ns-lifetimes REPLY:"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
