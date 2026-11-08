@@ -412,7 +412,7 @@ pub(crate) fn inf_ns(
         if argv.len() != 3 {
             return arity_error("INF.NS|DROP", w);
         }
-        match ks.ns_drop(argv.arg(2)) {
+        match ks.ns_drop_uncataloged(argv.arg(2)) {
             Ok(_) => w.simple("OK"),
             Err(e) => ns_error(e, w),
         }
@@ -706,6 +706,12 @@ pub(crate) fn ns_error(e: NsError, w: &mut RespWriter<'_>) {
             "ERR not a tiered namespace — tiering is set at CREATE with MEM-BUDGET \
              (drop and recreate to add it, ADR-0062 D3)",
         ),
+        NsError::Cataloged => {
+            w.error("ERR internal: the node's namespaces change only through the catalog writer")
+        }
+        NsError::Uncataloged => {
+            w.error("ERR internal: this keyspace has no catalog writer to answer a namespace DDL")
+        }
     }
 }
 

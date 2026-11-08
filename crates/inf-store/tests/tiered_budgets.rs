@@ -121,7 +121,7 @@ fn aggregate_va_bounds_creation_and_drop_returns_capacity() {
     assert_eq!(ks.tiering_usage().reserved_bytes, 2 * ring);
 
     // Drop returns exactly the ring; the freed capacity admits again.
-    ks.ns_drop(b"t-two").expect("drop");
+    ks.ns_drop_uncataloged(b"t-two").expect("drop");
     assert_eq!(ks.tiering_usage().reserved_bytes, ring, "exactly one ring returned");
     assert_eq!(ks.tiered_tables(), 1);
     ks.ns_create(tiered_spec(18, b"t-three", tier)).expect("freed capacity admits");
@@ -434,7 +434,7 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
     assert!(!flush.sealed().is_empty() || flush.active().is_some(), "files exist to tear down");
 
     // The drop: registry + table go together; the Region unmaps.
-    ks.ns_drop(b"doomed").expect("drop");
+    ks.ns_drop_uncataloged(b"doomed").expect("drop");
     assert_eq!(ks.tiered_tables(), 0);
     assert_eq!(ks.tiering_usage().reserved_bytes, 0, "the ring returned structurally");
     assert_eq!(ks.tiering_usage().committed_bytes, 0);

@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use inf_log::NsId;
 
+use crate::ns::NsSpec;
+
 /// What the writer decided on one request (ADR-0189 D3).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DdlVerdict {
@@ -228,6 +230,45 @@ receipt!(
     SetPersisted
 );
 
+/// A leg whose epoch the catalog word does not cover: the writer has not
+/// answered it, so no cell may apply it (ADR-0189 D4). Unreachable while
+/// the origin fans only after its own receipt, read against the same word.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NotDurable {
+    /// The epoch the leg carried.
+    pub epoch: u64,
+    /// The word when the leg was read.
+    pub word: u64,
+}
+
+impl DropPersisted {
+    /// A peer's receipt for the `DROP` leg of namespace `id` the origin
+    /// fanned at `epoch` (ADR-0189 D4): the word covers the epoch, so the
+    /// writer accepted that drop after its `META` write returned. Epoch 0 is
+    /// never answered (epochs count from 1).
+    ///
+    /// # Errors
+    /// [`NotDurable`] when the word is below `epoch`, or `epoch` is 0.
+    pub fn from_leg(id: NsId, epoch: u64, word: &CatalogWord) -> Result<DropPersisted, NotDurable> {
+        if epoch == 0 || !word.covers(epoch) {
+            return Err(NotDurable { epoch, word: word.load() });
+        }
+        Ok(DropPersisted { id, epoch })
+    }
+}
+
+/// What a cell's keyspace held when it applied a `DROP` (ADR-0189 D4,
+/// D5): the namespace it removed, or nothing, which is a peer that never
+/// applied its `CREATE` leg or a rollback whose origin never applied its
+/// own. Either is an applied drop.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DropApplied {
+    /// The namespace was here and is gone; its spec as it was.
+    Removed(NsSpec),
+    /// The namespace was not here.
+    Absent,
+}
+
 /// One sent request's reader half: not `Clone`, so one requester holds
 /// it, and [`Requested::answer`] consumes it, so it yields one receipt.
 #[derive(Debug)]
@@ -312,6 +353,21 @@ mod tests {
         epochs.answer(taken, Some(first_slot), DdlVerdict::Refused(DdlRefusal::NameExists));
         assert!(matches!(first.answer(&word), Answer::Refused(DdlRefusal::NameExists)));
         assert_eq!(word.load(), 3, "the word is the highest answered epoch");
+    }
+
+    /// A peer's `DROP` receipt needs the word to cover its leg's epoch.
+    #[test]
+    fn a_leg_receipt_needs_the_word_to_cover_its_epoch() {
+        let (mut epochs, word) = CatalogEpochs::new();
+        let ns = NsId(16);
+        let early = DropPersisted::from_leg(ns, 1, &word).err();
+        assert_eq!(early, Some(NotDurable { epoch: 1, word: 0 }), "the word is below the epoch");
+        let taken = epochs.take();
+        epochs.answer(taken, None, DdlVerdict::Accepted);
+        let receipt = DropPersisted::from_leg(ns, 1, &word).expect("the word covers epoch 1");
+        assert_eq!((receipt.id(), receipt.fan_epoch()), (ns, 1));
+        assert!(DropPersisted::from_leg(ns, 2, &word).is_err(), "an epoch past the word");
+        assert!(DropPersisted::from_leg(ns, 0, &word).is_err(), "epoch 0 is never answered");
     }
 
     /// Every verdict survives its slot's code.

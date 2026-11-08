@@ -45,6 +45,7 @@ use crate::demote::{DemoteStats, DemotionConfig, EvictionPressure};
 use crate::evict::{EvictStats, EvictionPolicy};
 use crate::index_backfill::{BackfillInfo, BackfillJob, BackfillTickStats};
 use crate::index_registry::{IndexError, IndexId, IndexRegistry, IndexSpec, IndexState};
+use crate::ns::ddl::{DropApplied, DropPersisted};
 use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
 use crate::record::{ExtentRef, InternalDeadline};
 use crate::store::{
@@ -230,6 +231,22 @@ pub struct Keyspace {
     /// written before the rule); reported on the boot line, never
     /// silent.
     seed_normalized_thresholds: u32,
+    /// Whether this is the node's keyspace, whose namespace entries change
+    /// only with the catalog writer's receipt (ADR-0189 D4).
+    cataloging: Cataloging,
+}
+
+/// Whether a keyspace answers to a catalog writer (ADR-0189 D4).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Cataloging {
+    /// The node's keyspace, built from its boot catalog: a namespace entry
+    /// changes only with the catalog writer's receipt, and every mutator
+    /// that takes none answers [`NsError::Cataloged`].
+    Cataloged,
+    /// A model's, a planeless tier's or a test's keyspace: no catalog
+    /// writer answers it, so its mutators take no receipt, and every one
+    /// that takes one answers [`NsError::Uncataloged`].
+    Uncataloged,
 }
 
 /// Whether `rec` may follow an armed displacement marker of `pending_ns`:
@@ -262,6 +279,8 @@ struct TieredEntry<'a> {
 impl Keyspace {
     /// `cfg.evict_seed` seeds the per-db eviction streams (vary it per cell
     /// — L7: all randomness is injected).
+    /// An uncataloged keyspace (ADR-0189 D4): a model's, a planeless
+    /// tier's or a test's, whose namespace mutators take no receipt.
     pub fn new(cfg: StoreConfig) -> Keyspace {
         let mut ks = Keyspace {
             dbs: Default::default(),
@@ -287,10 +306,29 @@ impl Keyspace {
             backfill_docs_total: 0,
             backfill_inserted_total: 0,
             sidecar_info: Default::default(),
+            cataloging: Cataloging::Uncataloged,
         };
         // db0 is eager: it serves every connection that never SELECTs.
         let _ = ks.db_mut(0);
         ks
+    }
+
+    /// The node's keyspace (ADR-0189 D4), seeded from its boot catalog:
+    /// `META`'s decode, or the empty catalog of a fresh data directory. It
+    /// is cataloged, so a namespace entry changes only with the catalog
+    /// writer's receipt, and the uncataloged family,
+    /// [`seed_catalog`](Self::seed_catalog) included, answers
+    /// [`NsError::Cataloged`]. That `catalog` is durable rests on review:
+    /// each boot site passes the decode of the `META` on disk.
+    ///
+    /// # Errors
+    /// As [`seed_catalog`](Self::seed_catalog): the first registry-rule or
+    /// admission violation, a boot fail-stop.
+    pub fn cataloged(cfg: StoreConfig, catalog: &NsCatalog) -> Result<Keyspace, NsError> {
+        let mut ks = Keyspace::new(cfg);
+        ks.seed_from_catalog(catalog)?;
+        ks.cataloging = Cataloging::Cataloged;
+        Ok(ks)
     }
 
     /// The store behind database `db`, materializing it on first touch.
@@ -930,19 +968,43 @@ impl Keyspace {
         Ok(())
     }
 
-    /// Drops the registry entry **and** its store (with all its data). The
-    /// id is never reused; log records naming it are skipped on replay.
-    /// A tiered namespace's table drops with it (M4-S19, ADR-0062 D7):
-    /// the `Region` unmaps on drop, returning exactly its ring to the D4
-    /// admitted sum — structurally, not by bookkeeping. The plane owns
-    /// the file half of the teardown (tier + blob unlinks after pin
-    /// drain — `inf-store` never does I/O, §3.3).
-    /// Drops a named namespace, returning the spec it had (the DDL
-    /// program reads the mode and id off it — ADR-0100 D3/D4).
+    /// Applies an accepted `DROP` on the node's keyspace (ADR-0189 D4):
+    /// the namespace the receipt names leaves the registry **and** its
+    /// store, with all its data, or was never here. The id is never
+    /// reused; log records naming it are skipped on replay. A tiered
+    /// namespace's table drops with it (ADR-0062 D7): the `Region` unmaps,
+    /// returning exactly its ring to the D4 admitted sum. The plane owns
+    /// the file half of the teardown: `inf-store` does no I/O.
     ///
     /// # Errors
-    /// `Unknown` / `DefaultImmutable` from the registry.
-    pub fn ns_drop(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
+    /// [`NsError::Uncataloged`] on a keyspace no catalog writer answers.
+    pub fn ns_drop(&mut self, receipt: &DropPersisted) -> Result<DropApplied, NsError> {
+        if self.cataloging == Cataloging::Uncataloged {
+            return Err(NsError::Uncataloged);
+        }
+        let Some(name) = self.named.get_by_id(receipt.id()).map(|spec| spec.name.clone()) else {
+            return Ok(DropApplied::Absent);
+        };
+        self.drop_named(&name).map(DropApplied::Removed)
+    }
+
+    /// Drops a named namespace on a keyspace no catalog writer answers (a
+    /// model's, a planeless tier's or a test's), returning the spec it had.
+    ///
+    /// # Errors
+    /// `Unknown` / `DefaultImmutable` from the registry;
+    /// [`NsError::Cataloged`] on the node's keyspace, which drops only with
+    /// a receipt ([`ns_drop`](Self::ns_drop)).
+    pub fn ns_drop_uncataloged(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
+        if self.cataloging == Cataloging::Cataloged {
+            return Err(NsError::Cataloged);
+        }
+        self.drop_named(name)
+    }
+
+    /// The one drop body: the registry entry, its store, its tiered table
+    /// and its index declarations go together.
+    fn drop_named(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
         let spec = self.named.drop_ns(name)?;
         let id = spec.id;
         self.named_stores.retain(|e| e.id != id);
@@ -1089,8 +1151,19 @@ impl Keyspace {
     ///
     /// # Errors
     /// The first registry-rule or admission violation — a failing catalog
-    /// is a fail-stop at boot, never a partial seed.
+    /// is a fail-stop at boot, never a partial seed; [`NsError::Cataloged`]
+    /// on the node's keyspace, which [`cataloged`](Self::cataloged) seeded
+    /// once, from its boot catalog.
     pub fn seed_catalog(&mut self, cat: &NsCatalog) -> Result<(), NsError> {
+        if self.cataloging == Cataloging::Cataloged {
+            return Err(NsError::Cataloged);
+        }
+        self.seed_from_catalog(cat)
+    }
+
+    /// The one seeding body of [`seed_catalog`](Self::seed_catalog) and
+    /// [`cataloged`](Self::cataloged).
+    fn seed_from_catalog(&mut self, cat: &NsCatalog) -> Result<(), NsError> {
         self.named = NsRegistry::default();
         self.named_stores.clear();
         self.tiered_stores.clear();
@@ -2109,7 +2182,7 @@ mod tests {
         assert_eq!(ks.ns_store_mut(NsId(16)).expect("live").get(b"k", now), Some(&b"ledger"[..]));
         assert_eq!(ks.ns_fsync_class(NsId(16)), Some(FsyncClass::Always));
         assert_eq!(ks.ns_fsync_class(NsId(0)), None, "defaults are memory");
-        ks.ns_drop(b"ledger").expect("drop");
+        ks.ns_drop_uncataloged(b"ledger").expect("drop");
         assert!(ks.ns_store_mut(NsId(16)).is_none(), "dropped ids resolve to no store");
     }
 
@@ -2122,6 +2195,34 @@ mod tests {
         fresh.seed_catalog(&cat).expect("seed");
         assert_eq!(fresh.export_catalog(17, 1, 1), cat);
         assert!(fresh.ns_store_mut(NsId(16)).is_some());
+    }
+
+    /// ADR-0189 D4: the node's keyspace answers the uncataloged family
+    /// with `Cataloged` and drops only with a receipt, which removes the
+    /// namespace and then finds it absent; a model's keyspace answers the
+    /// receipt mutator with `Uncataloged`. Every refusal changes nothing.
+    #[test]
+    fn a_cataloged_keyspace_drops_only_with_a_receipt() {
+        let mut model = Keyspace::new(StoreConfig::default());
+        model.ns_create(durable_spec(16, b"ledger")).expect("create");
+        let cat = model.export_catalog(17, 1, 1);
+        let mut node = Keyspace::cataloged(StoreConfig::default(), &cat).expect("the boot seed");
+        assert_eq!(node.export_catalog(17, 1, 1), cat, "seeded from the boot catalog");
+        assert_eq!(node.seed_catalog(&cat), Err(NsError::Cataloged));
+        assert_eq!(node.ns_drop_uncataloged(b"ledger"), Err(NsError::Cataloged));
+        assert!(node.ns_get(b"ledger").is_some(), "a refused mutator changed nothing");
+        let (mut epochs, word) = crate::ns::ddl::CatalogEpochs::new();
+        let taken = epochs.take();
+        epochs.answer(taken, None, crate::ns::ddl::DdlVerdict::Accepted);
+        let receipt = DropPersisted::from_leg(NsId(16), 1, &word).expect("the word covers it");
+        assert_eq!(model.ns_drop(&receipt), Err(NsError::Uncataloged));
+        assert!(model.ns_get(b"ledger").is_some(), "a refused mutator changed nothing");
+        match node.ns_drop(&receipt) {
+            Ok(DropApplied::Removed(spec)) => assert_eq!(spec.name, b"ledger".to_vec()),
+            other => panic!("the receipt's namespace is removed: {other:?}"),
+        }
+        assert!(node.ns_store_mut(NsId(16)).is_none(), "its store went with it");
+        assert_eq!(node.ns_drop(&receipt), Ok(DropApplied::Absent), "a second apply finds none");
     }
 
     // ---- M4.5-S03 (ADR-0075): index registry + catalog + accounting ----
@@ -2277,7 +2378,7 @@ mod tests {
         ks.ns_create(durable_spec(16, b"ledger")).expect("create");
         ks.idx_create(idx_spec(1, 1, 16, b"by-price", IndexState::Declared)).expect("create");
         assert!(ks.ns_has_indexes(NsId(16)));
-        ks.ns_drop(b"ledger").expect("drop");
+        ks.ns_drop_uncataloged(b"ledger").expect("drop");
         assert!(!ks.ns_has_indexes(NsId(16)));
         assert!(ks.idx_registry().get_by_id(IndexId(1)).is_none());
     }

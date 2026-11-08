@@ -812,7 +812,7 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         Ok(cleanup) => cleanup,
         Err(refusal) => return refusal,
     };
-    let spec = match shared.store.borrow_mut().ns_drop(name) {
+    let spec = match shared.store.borrow_mut().ns_drop_uncataloged(name) {
         Ok(spec) => spec,
         Err(e) => return ns_error_reply(shared, proto, e),
     };
@@ -905,7 +905,7 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     let Rollback { id, name, cleanup, tiered } = rollback;
     // The origin's own copy (`Unknown` here would mean the fan's local
     // apply never happened — nothing to undo).
-    let _ = shared.store.borrow_mut().ns_drop(name);
+    let _ = shared.store.borrow_mut().ns_drop_uncataloged(name);
     if tiered {
         shared.ns_drop_releases.borrow_mut().push((id, u64::MAX));
     }

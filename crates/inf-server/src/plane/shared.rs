@@ -753,7 +753,7 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         // until that epoch is durable (D5).
         let epoch: u64 =
             core::str::from_utf8(argv[3]).ok().and_then(|s| s.parse().ok()).ok_or(malformed)?;
-        let spec = shared.store.borrow_mut().ns_drop(argv[2])?;
+        let spec = shared.store.borrow_mut().ns_drop_uncataloged(argv[2])?;
         if spec.tier.is_some() {
             shared.ns_drop_releases.borrow_mut().push((spec.id, epoch));
         }

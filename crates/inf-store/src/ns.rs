@@ -352,6 +352,13 @@ pub enum NsError {
     /// `MEM-BUDGET` — adding tiering post-hoc is a create-time decision
     /// (drop + recreate), not a reload.
     NotTiered,
+    /// A mutator that takes no receipt, called on the node's cataloged
+    /// keyspace, whose entries change only with the catalog writer's
+    /// receipt (ADR-0189 D4): an internal error.
+    Cataloged,
+    /// A receipt mutator called on an uncataloged keyspace (a model or a
+    /// planeless tier, which no catalog writer answers): an internal error.
+    Uncataloged,
 }
 
 /// Valid namespace names: 1..=128 bytes of `[a-zA-Z0-9_.-]`, not colliding
