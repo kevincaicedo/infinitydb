@@ -377,7 +377,13 @@ pub static DECLARED: &[Declared] = &[
          `STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)` \
          (ADR-0053 D4 — retryable). Deviations on tiered namespaces: no expiry (the `EXPIRE` \
          family + `SET` expiry options refuse typed; `TTL` = -1 for live keys), non-string \
-         families refuse typed, multi-key ops resolve sequentially. M4-S27 (ADR-0068): \
+         families refuse typed, multi-key ops resolve sequentially, and a data directory whose \
+         catalog names more than 64 live tiered namespaces is refused at boot, with no \
+         migration (ADR-0148 D5, A1.2). A node holds at most 64 tiered namespace lifetimes, a \
+         dropped one counted until its runtime owners have ended on every cell: past that a \
+         tiered `CREATE` answers `-TRYAGAIN tiered namespace capacity in use` while a dropped \
+         one's owners are still ending, else `-ERR tiered namespace limit reached`, before any \
+         effect (ADR-0148 D1, ADR-0172 D3). M4-S27 (ADR-0068): \
          `MAXMEMORY`/`EVICTION` on named *memory* namespaces are enforced and Hot via `SET` \
          (`inherit`/`0` reset them); a namespace with its own budget answers the Redis-exact \
          OOM error scoped to that namespace, reclaims only its own keys, and its bytes leave \

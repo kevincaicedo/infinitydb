@@ -35,18 +35,40 @@ fn every_refusal_line_is_the_error_line_redis_emits() {
     assert_eq!(lines, 4 * Domain::ALL.len(), "VACUOUS: the table rendered {lines} lines");
 }
 
-/// The matrix's `INF.NS` row quotes the namespace identity space's and the
-/// catalog limit's bytes as the table renders them.
+/// The class suffixes a refusal line ends in (ADR-0172 D1).
+const CLASS_SUFFIXES: [&str; 4] =
+    ["capacity in use", "limit reached", "reservation refused", "identity space exhausted"];
+
+/// Every refusal line the matrix quotes is a line the table renders: each
+/// row's backquoted `-…` text that ends in a class suffix is one of
+/// `Refusal::every()`'s, so a mistyped line in any row is red and no row
+/// joins a list to be checked. The rows that answer a refusal quote it:
+/// `INF.NS` the namespace identity space's, the catalog limit's and both
+/// tiered lifetime lines, and the three checkpoint rows the checkpoint
+/// identity space's.
 #[test]
 fn the_matrix_quotes_the_rendered_refusal_bytes() {
-    let row = compat::matrixgen::DECLARED.iter().find(|d| d.name == "INF.NS").expect("INF.NS row");
-    let text = Refusal::IdentityExhausted(Domain::Namespace).render();
-    assert!(row.note.contains(&format!("`-{text}`")), "INF.NS's row does not quote `-{text}`");
-    let limit = Refusal::LimitReached(Domain::Catalog).render();
-    assert!(row.note.contains(&format!("`-{limit}`")), "INF.NS's row does not quote `-{limit}`");
-    let checkpoint = Refusal::IdentityExhausted(Domain::Checkpoint).render();
-    for name in ["INF.NS", "INF.CKPT", "BGSAVE"] {
+    let rendered: Vec<String> = Refusal::every().map(|r| format!("-{}", r.render())).collect();
+    let mut quoted = 0;
+    for row in compat::matrixgen::DECLARED {
+        for quote in row.note.split('`').skip(1).step_by(2) {
+            if quote.starts_with('-') && CLASS_SUFFIXES.iter().any(|s| quote.ends_with(s)) {
+                assert!(rendered.iter().any(|line| line == quote), "{}: `{quote}`", row.name);
+                quoted += 1;
+            }
+        }
+    }
+    assert!(quoted >= 7, "VACUOUS: the matrix quotes {quoted} refusal lines");
+    let quotes = |name: &str, refusal: Refusal| {
         let row = compat::matrixgen::DECLARED.iter().find(|d| d.name == name).expect("a row");
-        assert!(row.note.contains(&format!("`-{checkpoint}`")), "{name} does not quote it");
+        let text = format!("`-{}`", refusal.render());
+        assert!(row.note.contains(&text), "{name}'s row does not quote {text}");
+    };
+    quotes("INF.NS", Refusal::IdentityExhausted(Domain::Namespace));
+    quotes("INF.NS", Refusal::LimitReached(Domain::Catalog));
+    quotes("INF.NS", Refusal::CapacityBusy(Domain::TieredNamespace));
+    quotes("INF.NS", Refusal::LimitReached(Domain::TieredNamespace));
+    for name in ["INF.NS", "INF.CKPT", "BGSAVE"] {
+        quotes(name, Refusal::IdentityExhausted(Domain::Checkpoint));
     }
 }
