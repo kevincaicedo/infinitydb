@@ -60,9 +60,6 @@ fn an_origin_refused_create_answers_and_its_name_creates_again() {
 /// itself is read from the disk (`META`'s counter past the refused id), so
 /// a refusal that fired before the swap reads as `VACUOUS`, never green.
 #[test]
-#[ignore = "a CREATE its origin's store refuses after the catalog swap is answered while META \
-            still names the namespace, so a cut serves it; red until the origin withdraws the \
-            definition durably before it answers"]
 fn an_origin_refused_create_leaves_no_meta_naming_it_once_answered() {
     use inf_foundation::fault::FaultSpec;
     let dir = temp_data_dir("create-origin-refused-meta");

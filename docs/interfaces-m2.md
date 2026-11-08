@@ -1876,15 +1876,17 @@ count the arrivals that found it full.
      (ADR-0189 D5), and a leg that cannot be sent, or answers anything
      else, is an error leg.
   3. **`CREATE` rollback** (`plane::rollback_create`, under the same
-     ticket): on any error leg the origin drops its copy, requests the
-     `META` that drops the id (`request_drop`: the writer replaces the
-     pending `CREATE` with the drop, a durable namespace gets its
-     tombstone), waits for the answer, fans `INF.NSFAN DROP name epoch`
-     with the answer's epoch (a peer without the namespace answers "not
-     found", accepted), posts the drop's notice with the stamp of a
-     durable drop's retirement, and answers the leg's error (until
-     ADR-0189 builds its order, below). The order becomes *… → apply →
-     fan → (every leg applied → the `CreateApplied` notice → `+OK` | any
+     ticket, ADR-0189 D5): on any error leg, or the origin's own apply
+     refused after the answer, the origin requests the `META` that drops
+     the id (`request_drop`: the writer replaces the pending `CREATE`
+     with the drop, a durable namespace gets its tombstone; the send
+     consumes the `CREATE`'s notice), waits for the answer while every
+     cell that applied the `CREATE` serves it, applies the drop with its
+     receipt, fans `INF.NSFAN DROP name epoch id mode` (a cell without
+     the namespace finds it absent, an applied leg), posts the drop's
+     notice, stamped with a durable drop's retirement when every leg
+     applied, and answers the error. The order becomes *… → apply → fan
+     → (every leg applied → the `CreateApplied` notice → `+OK` | any
      error → rollback → the error)*.
   4. **Fault point** `ns_create_fan_refused` (`plane::handle_ns_apply`,
      a peer's `CREATE` leg before its local apply; crash-matrix row
@@ -1945,18 +1947,29 @@ count the arrivals that found it full.
      re-stamps survivors with one fresh request on the control writer's
      quota. Bound `DROPPED_NS_MAX
      = 256` — at the cap the `DROP` waits for its checkpoint first.
-  2. **`INF.NSFAN DROP name epoch`** (4 positional args): the fan carries
-     the persist epoch of the swap that drops the namespace; peers park
-     their tier-file teardown until `ControlHandle::persisted(epoch)`
-     (ADR-0100 D5). `DROP` itself runs *apply → request the `META` that
-     drops it → wait for the answer → fan → request a node checkpoint +
-     the `DropFanned` notice with its epoch → `+OK`*: the persist is
-     requested before the fan, and the fan carries the answer's epoch
-     (ADR-0100 D4) (until ADR-0189 builds its order, below).
-     `CREATE` persists before it serves (item 1 of the `CREATE`
-     choreography above) and `SET` runs *apply → fan → persist → ack*
-     (ADR-0015 D3) (until ADR-0189 builds its order, below).
-     `Keyspace::ns_drop` returns the dropped `NsSpec`;
+  2. **`INF.NSFAN DROP name epoch id mode`** (6 positional args,
+     ADR-0189 D5): the fan carries the epoch of the answer that drops the
+     namespace, its id and its mode. Each peer builds its own receipt
+     from the epoch read against the catalog word
+     (`DropPersisted::from_leg`), checks the id and the mode against the
+     namespace the name holds there, applies (`Removed` or `Absent`, each
+     an applied leg answering `Ok`) and parks a tiered namespace's
+     tier-file teardown on the epoch, which the word already covers.
+     `DROP` itself runs *resolve the name and reserve its units →
+     request the `META` that drops it → wait for the answer, every cell,
+     the origin included, serving the namespace meanwhile → apply
+     locally with the receipt → fan → the `DropFanned` notice, stamped
+     with the cleanup checkpoint's epoch when the drop is durable and
+     every leg applied → `+OK`*. `CREATE` persists before it serves
+     (item 1 of the `CREATE` choreography above) and `SET` runs *apply
+     → fan → persist → ack* (ADR-0015 D3) (until ADR-0189 builds its
+     order, below). The node's keyspace is cataloged
+     (`Keyspace::cataloged`, from the boot catalog): `Keyspace::ns_drop`
+     takes the `DropPersisted` receipt and returns
+     `DropApplied::{Removed(NsSpec), Absent}`, while
+     `ns_drop_uncataloged` and `seed_catalog` serve the keyspaces no
+     catalog writer answers (models, the planeless tier, tests) and
+     answer `NsError::Cataloged` on the node's;
      `ns_tombstoned`/`ns_tombstones` expose the boot snapshot to recovery.
   3. **Recovery rule** (`inf-server::recover`, ADR-0100 D6): a `MANIFEST`
      tier section naming an id the catalog does not know is skipped and
@@ -1977,8 +1990,9 @@ count the arrivals that found it full.
 > its stamp and reported its `ns-N/` gone; at 256 tombstones the writer
 > alone admits, paces once or refuses. The first clause is built: the
 > writer numbers each request at dequeue and answers it through its own
-> slot after its `META` write, and a refusal writes nothing. The rest is
-> not built.
+> slot after its `META` write, and a refusal writes nothing. So is the
+> second for `CREATE`, `DROP` and the `CREATE` rollback. The rest is not
+> built.
 
 - **M4-S19 amendment (ADR-0062) — namespace catalog v2 + the `INF.NS`
   tiering surface.**

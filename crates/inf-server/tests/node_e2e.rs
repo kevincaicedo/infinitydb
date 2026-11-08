@@ -814,12 +814,17 @@ impl Node {
                         .unwrap_or(0),
                 };
                 node.wall_anchor.set((0, unix_ms));
-                let mut ks = Keyspace::new(StoreConfig::default());
-                let mut durable = None;
-                if let Some((dir, catalog, control)) = &boot {
-                    if let Some(catalog) = catalog {
-                        ks.seed_catalog(catalog).expect("seed catalog");
+                // A durable node's keyspace is cataloged, as `infinityd`'s.
+                let ks = match &boot {
+                    Some((_, catalog, _)) => {
+                        let empty = inf_store::NsCatalog::empty();
+                        let catalog = catalog.as_ref().unwrap_or(&empty);
+                        Keyspace::cataloged(StoreConfig::default(), catalog).expect("seed catalog")
                     }
+                    None => Keyspace::new(StoreConfig::default()),
+                };
+                let mut durable = None;
+                if let Some((dir, _catalog, control)) = &boot {
                     let cfg = inf_server::DurableConfig {
                         data_dir: dir.clone(),
                         geometry: inf_log::LogGeometry::new(
@@ -8403,16 +8408,12 @@ fn assert_cold_keys_served(conn: &mut TcpStream, keys: u32) {
     read_exactly(conn, b"+OK\r\n");
 }
 
-/// Crash-matrix row `ns_drop_before_meta` (ADR-0100 D5): the DDL stops
-/// after the local apply and before the catalog persist request — the
-/// on-disk state of a cut at that instant. Nothing durable changed, the
-/// node's checkpoints are manual and none is requested after the drop,
-/// before the crash-equivalent stop, and the teardown hold kept every
-/// tier file (the origin cell's registry alone lacks the namespace, so
-/// the origin's own files are the ones that would have been unlinked
-/// pre-ADR). A restart serves the namespace with every key. A checkpoint
-/// of the origin cell published after the drop would omit the namespace
-/// (ADR-0186 D2); no row covers it.
+/// Crash-matrix row `ns_drop_before_meta` (ADR-0189 D5): the DDL stops
+/// just before its catalog request — the on-disk state of a cut before the
+/// answer. Nothing was applied anywhere and nothing durable changed, so
+/// the checkpoint every cell, the origin included, publishes before the
+/// crash-equivalent stop still names the namespace, and every tier file
+/// stays. A restart serves the namespace with every key.
 #[test]
 fn dropped_tiered_namespace_survives_a_cut_before_its_swap() {
     let dir = temp_data_dir("drop-cut-before");
@@ -8426,6 +8427,10 @@ fn dropped_tiered_namespace_survives_a_cut_before_its_swap() {
     let mut c = node.connect();
     c.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
     read_exactly(&mut c, b"-ERR fault: ns_drop_before_meta\r\n");
+    // Every cell, the origin included, publishes a checkpoint before the
+    // stop: no cell applied the drop, so each still names the namespace.
+    let epoch = node.request_ckpt_all();
+    drop_wait_published(&node, epoch);
     // Give MAINTAIN time to run its teardown slices: the hold must keep
     // every file since no catalog swap carried the drop.
     #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
@@ -8453,12 +8458,11 @@ fn dropped_tiered_namespace_survives_a_cut_before_its_swap() {
     receipt::verified("ns_drop_before_meta", "namespace-restored-whole");
 }
 
-/// Crash-matrix row `ns_drop_after_meta` (ADR-0100 D6): the DDL stops
-/// once the catalog swap is durable and before the fan — the on-disk
-/// state of a cut after the swap. `META` lacks the namespace and carries
-/// its tombstone while each peer's `MANIFEST` still names it. The restart
-/// boots (the pre-ADR fail-stop refused exactly this state), sweeps the
-/// residue on every cell, and the namespace is gone.
+/// Crash-matrix row `ns_drop_after_meta` (ADR-0189 D5): the DDL stops
+/// after the writer's answer and before the origin's apply — the on-disk
+/// state of a cut after the answer. `META` lacks the namespace and carries
+/// its tombstone while every cell's `MANIFEST` still names it. The restart
+/// boots, sweeps the residue on every cell, and the namespace is gone.
 #[test]
 fn dropped_tiered_namespace_survives_a_cut_after_its_swap() {
     let dir = temp_data_dir("drop-cut-after");
@@ -10540,8 +10544,6 @@ fn drop_wait_scenario(kind: DropWaitNs, checkpoint: DropWaitCheckpoint, tag: &st
 /// A checkpoint of every cell that opens while a durable namespace's drop
 /// waits for its swap keeps every key a cut there restores.
 #[test]
-#[ignore = "red until a DROP applies on its origin only after its catalog swap is durable \
-            (ADR-0189 D5)"]
 fn a_checkpoint_inside_a_durable_drop_wait_keeps_every_acked_key() {
     drop_wait_scenario(DropWaitNs::Durable, DropWaitCheckpoint::OpensInside, "dw-durable-ckpt");
 }
@@ -10556,8 +10558,6 @@ fn a_cut_inside_a_durable_drop_wait_keeps_every_acked_key() {
 /// drop requests its swap: the keys its walk had not reached must still be
 /// served after a cut there.
 #[test]
-#[ignore = "red until a DROP applies on its origin only after its catalog swap is durable \
-            (ADR-0189 D5)"]
 fn a_walk_across_a_durable_drop_wait_keeps_every_acked_key() {
     drop_wait_scenario(DropWaitNs::Durable, DropWaitCheckpoint::WalksAcross, "dw-durable-walk");
 }
@@ -10565,8 +10565,6 @@ fn a_walk_across_a_durable_drop_wait_keeps_every_acked_key() {
 /// The same for a tiered namespace, whose keys live in tier files the
 /// origin's `MANIFEST` must keep naming.
 #[test]
-#[ignore = "red until a DROP applies on its origin only after its catalog swap is durable \
-            (ADR-0189 D5)"]
 fn a_checkpoint_inside_a_tiered_drop_wait_keeps_every_acked_key() {
     drop_wait_scenario(DropWaitNs::Tiered, DropWaitCheckpoint::OpensInside, "dw-tiered-ckpt");
 }
@@ -10581,8 +10579,6 @@ fn a_cut_inside_a_tiered_drop_wait_keeps_every_acked_key() {
 /// requests its swap: the image's address references and the `MANIFEST`'s
 /// tier section must agree, so the restart boots and serves every key.
 #[test]
-#[ignore = "red until a DROP applies on its origin only after its catalog swap is durable \
-            (ADR-0189 D5)"]
 fn a_walk_across_a_tiered_drop_wait_keeps_every_acked_key() {
     drop_wait_scenario(DropWaitNs::Tiered, DropWaitCheckpoint::WalksAcross, "dw-tiered-walk");
 }
@@ -10708,8 +10704,6 @@ fn rollback_wait_scenario(checkpoint: bool, tag: &str) {
 /// `CREATE` waits for the swap that drops it keeps every write the origin
 /// acknowledged inside the fan.
 #[test]
-#[ignore = "red until a CREATE rollback applies on its origin only after its catalog swap is \
-            durable (ADR-0189 D5)"]
 fn a_checkpoint_inside_a_rolled_back_create_wait_keeps_every_acked_key() {
     rollback_wait_scenario(true, "rw-ckpt");
 }
@@ -10785,15 +10779,13 @@ fn tier_cell_files_and_rounds(conn: &mut TcpStream) -> (u64, u64) {
 }
 
 /// A tiered `DROP` frees its origin's tier files on the running node once
-/// the catalog swap that carries it is durable (ADR-0100 D5): no restart
-/// is needed for the space. The origin holds the files from its local
-/// apply, before the writer numbers the request, and the answer lowers
-/// the hold to the drop's epoch. The swap is held until cell 0's MAINTAIN
-/// has taken the namespace off its tier cell with no flush round left, so
-/// the hold the answer lowers is the one in the teardown queue. Oracle:
-/// the shard directories. Cell 0 keeps every tier file of ns 16 while the
-/// swap is held, and once it lands, every cell's are gone within the
-/// deadline (cell 1's are held by the fan's epoch).
+/// the catalog swap that carries it is durable (ADR-0189 D9): the origin
+/// applies the drop only after the writer's answer, so while the swap is
+/// held it serves the namespace and keeps every tier file; once the swap
+/// lands it applies, and every cell's tier files of ns 16 leave with no
+/// restart (each cell holds them until the drop's epoch is durable, which
+/// the answer already is). The namespace's other residue waits for the
+/// residue sweep. Oracle: the shard directories and the wire.
 #[test]
 fn a_tiered_drop_frees_its_origins_tier_files_without_a_restart() {
     let dir = temp_data_dir("drop-frees-origin");
@@ -10818,13 +10810,10 @@ fn a_tiered_drop_frees_its_origins_tier_files_without_a_restart() {
         #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
         std::thread::sleep(Duration::from_millis(1));
     }
-    // MAINTAIN takes the dropped namespace off the tier cell while the
-    // swap is held: its files wait in the teardown queue, held.
-    while tier_cell_files_and_rounds(&mut gauges) != (0, 0) {
-        assert!(Instant::now() < deadline, "cell 0's MAINTAIN never queued the teardown");
-        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    // While the swap is held, the origin serves the namespace and its
+    // tier cell keeps every file.
+    assert_eq!(drop_wait_use_on(&node, 0, b"cold"), "+OK", "the origin serves it until its swap");
+    assert!(tier_cell_files_and_rounds(&mut gauges).0 > 0, "cell 0's tier cell let go its files");
     let held = drop_wait_cold_files(&dir);
     assert_eq!(held[0].0, before[0].0, "cell 0 unlinked a tier file before its swap was durable");
     node.land_held_persists(1);

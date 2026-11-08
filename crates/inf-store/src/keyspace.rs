@@ -878,9 +878,11 @@ impl Keyspace {
 
     /// Everything [`ns_create`](Self::ns_create) would refuse, without
     /// applying anything (ADR-0103 D3): the registry rules, the tier
-    /// gauntlet, and the reserved-VA admission arithmetic. The one
-    /// apply-time failure it cannot foresee is the OS refusing the ring
-    /// reservation itself.
+    /// gauntlet, and the reserved-VA admission arithmetic. The apply-time
+    /// failures it cannot foresee are the OS refusing the ring reservation
+    /// itself and an admission bound lowered between the check and the
+    /// apply; a node's `CREATE` whose apply is refused after its answer
+    /// rolls back.
     ///
     /// # Errors
     /// The refusal `ns_create` would answer.
@@ -966,6 +968,19 @@ impl Keyspace {
         }
         self.refresh_pressure();
         Ok(())
+    }
+
+    /// Everything [`ns_drop`](Self::ns_drop) of the namespace `name`
+    /// holds would need, without applying anything (ADR-0189 D5): the
+    /// default databases are immutable and the name must be registered.
+    ///
+    /// # Errors
+    /// `DefaultImmutable` / `Unknown`, as the registry answers a drop.
+    pub fn ns_drop_check(&self, name: &[u8]) -> Result<&NsSpec, NsError> {
+        if crate::ns::is_default_name(name) {
+            return Err(NsError::DefaultImmutable);
+        }
+        self.named.get(name).ok_or(NsError::Unknown)
     }
 
     /// Applies an accepted `DROP` on the node's keyspace (ADR-0189 D4):

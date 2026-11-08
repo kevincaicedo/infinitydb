@@ -34,18 +34,17 @@
 //!   so the real refusal runs: `enqueue` answers the permanent `Unrepresentable` (ADR-0167 D3),
 //!   and a cold `GET` and a `SCAN` page over cold keys answer the cold I/O error once, never
 //!   `BUSY`; the refused read changes no cold-read state
-//! - `ns_drop_before_meta` — `plane::ns_ddl::program_ns_drop` (after the local apply,
-//!   before the catalog persist request) — the DDL stops with the origin's registry
-//!   already lacking the namespace and nothing durable changed — the on-disk state of a
-//!   power cut at that instant (ADR-0100 D5): a restart restores the namespace whole, its
-//!   tier files intact on every cell (the teardown hold never released), while the origin
-//!   cell publishes no checkpoint before the node stops; one would omit the namespace
-//!   (ADR-0186 D2)
-//! - `ns_drop_after_meta` — `plane::ns_ddl::program_ns_drop` (after the catalog swap is
-//!   durable, before the fan) — the DDL stops with `META` lacking the namespace and carrying
-//!   its tombstone while each peer's `MANIFEST` still names it (the origin's too, unless it
-//!   published a checkpoint during the wait) — the on-disk state of a power cut after the
-//!   swap (ADR-0100 D6): a restart boots, sweeps the residue, and the namespace is gone
+//! - `ns_drop_before_meta` — `plane::ns_ddl::program_ns_drop` (after the name resolves and
+//!   the units are reserved, just before the catalog request) — the DDL stops with nothing
+//!   applied and nothing durable changed: every cell, the origin included, still serves the
+//!   namespace, so a checkpoint any cell publishes before the node stops names it — the
+//!   on-disk state of a power cut before the answer (ADR-0189 D5): a restart restores the
+//!   namespace whole, its tier files intact on every cell
+//! - `ns_drop_after_meta` — `plane::ns_ddl::program_ns_drop` (after the writer's answer,
+//!   before the origin's apply) — the DDL stops with `META` lacking the namespace and
+//!   carrying its tombstone while every cell still serves it — the on-disk state of a power
+//!   cut after the answer (ADR-0189 D5): a restart boots, sweeps the residue, and the
+//!   namespace is gone
 //! - `ns_create_after_meta` — `plane::program_ns_ddl` (the CREATE branch, after the catalog swap is
 //!   durable, before the local apply) — the DDL stops with `META` naming a namespace no cell serves
 //!   —
@@ -53,16 +52,18 @@
 //!   namespace
 //!   from `META` and serves it on every cell; nothing was acked, so nothing was promised
 //! - `ns_create_fan_refused` — `plane::handle_ns_apply` (a peer's `INF.NSFAN CREATE` leg, before
-//!   its local apply) — the peer refuses the leg with a typed error — the stand-in for the OS
-//!   refusing the tier ring reservation on that cell (ADR-0103 D3's one check the origin cannot run
-//!   ahead): the origin rolls the `CREATE` back (ADR-0108 D3) — drops its own copy, persists the
-//!   drop and waits for the swap, then fans `DROP` to every peer (ADR-0186 D1) — and answers the
-//!   leg's error; no cell serves the namespace and `META` never names it after the reply
+//!   its local apply) — the peer refuses the leg with a typed error — the stand-in for any
+//!   apply-time refusal on that cell after the swap (the OS refusing the tier ring reservation,
+//!   or an admission bound lowered there during the wait): the origin rolls the `CREATE` back
+//!   (ADR-0108 D3 in ADR-0189 D5's order) — requests the drop and waits for its answer, then
+//!   applies it and fans `DROP` to every peer — and answers the leg's error; no cell serves the
+//!   namespace and `META` never names it after the reply
 //! - `ns_create_origin_refused` — `plane::ns_ddl::program_ns_create` (after the catalog writer
 //!   accepted the `CREATE` and its `META` swap returned, in place of the origin's own
 //!   `ns_create`) — the origin's store refuses the apply: the deterministic stand-in for any
-//!   refusal of that apply after the swap (ADR-0148 D5), answered as the program answers the
-//!   store's (crash-matrix row `origin-refusal-answered`)
+//!   refusal of that apply after the swap (ADR-0148 D5); the origin rolls the `CREATE` back as
+//!   for a refused peer and answers the store's refusal (crash-matrix row
+//!   `origin-refusal-answered`)
 //! - `mset_midway_oom` — `exec::mset` + `exec::msetnx` (the apply loops, pairs ≥ 2) — a multi-key
 //!   write fails mid-way after applying a prefix (the deterministic stand-in for arena OOM — review
 //!   of 2026-08-30, H2/F-L17-11, ADR-0098): the reply is the error, and the durable emission gate

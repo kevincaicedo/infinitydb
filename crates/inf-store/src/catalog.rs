@@ -292,6 +292,18 @@ impl fmt::Display for CatalogError {
 impl std::error::Error for CatalogError {}
 
 impl NsCatalog {
+    /// The catalog of a data directory no DDL has written (no `META`): no
+    /// namespace, no index and no tombstone.
+    #[must_use]
+    pub fn empty() -> NsCatalog {
+        NsCatalog {
+            next_id: FIRST_NAMED_NS_ID,
+            entries: Vec::new(),
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        }
+    }
+
     /// Encodes the catalog (see module docs): v4 when a drop tombstone is
     /// live, v3 when the index feature has been used, v2 byte-identically
     /// otherwise (ADR-0075 D2.2, ADR-0100 D1). Durable entries always

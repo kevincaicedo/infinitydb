@@ -683,8 +683,9 @@ pub(super) enum NsApplyOutcome {
 }
 
 /// Applies the internal `INF.NSFAN` DDL fan on a peer cell (M2-S08):
-/// `CREATE name mode fsync policy maxmemory id` / `DROP name`, fields as
-/// the origin serialized them (`-` = none). Returns false for non-NSFAN.
+/// `CREATE name mode fsync policy maxmemory id tier` / `DROP name epoch id
+/// mode` / `SET name …`, fields as the origin serialized them (`-` =
+/// none). Returns false for non-NSFAN.
 pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     from: CellId,
@@ -747,17 +748,8 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 ) -> Result<(), inf_store::NsError> {
     use inf_store::NsError;
     let malformed = NsError::InvalidName; // internal vocabulary; never client-visible
-    if argv.len() == 4 && argv[1].eq_ignore_ascii_case(b"DROP") {
-        // ADR-0100 D4: the leg carries the persist epoch of the catalog
-        // swap that drops the namespace; this cell's tier teardown holds
-        // until that epoch is durable (D5).
-        let epoch: u64 =
-            core::str::from_utf8(argv[3]).ok().and_then(|s| s.parse().ok()).ok_or(malformed)?;
-        let spec = shared.store.borrow_mut().ns_drop_uncataloged(argv[2])?;
-        if spec.tier.is_some() {
-            shared.ns_drop_releases.borrow_mut().push((spec.id, epoch));
-        }
-        return Ok(());
+    if argv.len() == 6 && argv[1].eq_ignore_ascii_case(b"DROP") {
+        return apply_drop_leg(shared, argv).map(|_| ());
     }
     if argv.len() == 4 && argv[1].eq_ignore_ascii_case(b"SET") {
         let tier = tier_from_fan(argv[3])?.ok_or(malformed)?;
@@ -820,6 +812,51 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         maxmemory,
         tier,
     })
+}
+
+/// A peer's `INF.NSFAN DROP name epoch id mode` leg (ADR-0189 D4, D5):
+/// its receipt is built from the leg's epoch read against the catalog word,
+/// which the origin's own receipt already covered; the namespace the name
+/// holds here, if any, must carry the leg's id and mode; then the drop
+/// applies, `Removed` or `Absent` (a peer that refused or never received
+/// the `CREATE` leg), either an applied leg.
+fn apply_drop_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    argv: &[&[u8]],
+) -> Result<inf_store::ddl::DropApplied, inf_store::NsError> {
+    use inf_store::NsError;
+    let malformed = NsError::InvalidName; // internal vocabulary; never client-visible
+    let text = |b: &[u8]| core::str::from_utf8(b).ok().map(str::to_owned);
+    let epoch: u64 = text(argv[3]).and_then(|s| s.parse().ok()).ok_or(malformed.clone())?;
+    let id: u32 = text(argv[4]).and_then(|s| s.parse().ok()).ok_or(malformed.clone())?;
+    let mode = text(argv[5]).and_then(|s| NsMode::parse(&s)).ok_or(malformed.clone())?;
+    let Some(control) = shared.control.borrow().clone() else { return Err(malformed) };
+    let receipt = inf_store::ddl::DropPersisted::from_leg(NsId(id), epoch, control.catalog_word())
+        .map_err(|_| malformed.clone())?;
+    if let Some(spec) = shared.store.borrow().ns_get(argv[2])
+        && (spec.id != receipt.id() || spec.mode != mode)
+    {
+        return Err(malformed);
+    }
+    apply_drop(shared, &receipt)
+}
+
+/// Applies an accepted `DROP` to this cell's keyspace with its receipt
+/// (ADR-0189 D4, D5): the origin's, a rollback's and a peer's leg alike. A
+/// removed tiered namespace's tier files wait on the receipt's epoch
+/// (ADR-0189 D9), which the catalog word already covers, so they leave at
+/// the next MAINTAIN's teardown slices.
+pub(super) fn apply_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    receipt: &inf_store::ddl::DropPersisted,
+) -> Result<inf_store::ddl::DropApplied, inf_store::NsError> {
+    let applied = shared.store.borrow_mut().ns_drop(receipt)?;
+    if let inf_store::ddl::DropApplied::Removed(spec) = &applied
+        && spec.tier.is_some()
+    {
+        shared.ns_drop_releases.borrow_mut().push((spec.id, receipt.fan_epoch()));
+    }
+    Ok(applied)
 }
 
 /// Serializes a tier spec for the `INF.NSFAN` vector (M4-S19): `-` for

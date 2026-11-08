@@ -81,10 +81,10 @@ fn start_node(
         let mut pool = BufferPool::new(256, 4096);
         let mut driver = UringDriver::new(256).expect("uring");
         driver.register_pool(&mut pool).expect("register");
-        let mut ks = Keyspace::new(StoreConfig::default());
-        if let Some(catalog) = &catalog {
-            ks.seed_catalog(catalog).expect("seed catalog");
-        }
+        // The node's keyspace is cataloged, as `infinityd`'s (ADR-0189 D4).
+        let empty = inf_store::NsCatalog::empty();
+        let ks = Keyspace::cataloged(StoreConfig::default(), catalog.as_ref().unwrap_or(&empty))
+            .expect("seed catalog");
         let cfg = inf_server::DurableConfig {
             data_dir: dir,
             geometry: inf_log::LogGeometry::default(),

@@ -2371,13 +2371,13 @@ pub(crate) fn boot(
         let pool = BufferPool::new(128, 1024);
         let node_info = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
-        let mut ks =
-            Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
-        if let Some(catalog) = &catalog {
-            ks.seed_catalog(catalog).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
-            })?;
-        }
+        // The node's keyspace is cataloged (ADR-0189 D4), as `infinityd`'s.
+        let empty = inf_store::NsCatalog::empty();
+        let ks = Keyspace::cataloged(
+            StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() },
+            catalog.as_ref().unwrap_or(&empty),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
         let (mut plane, serve_mark, timer_set) = SimPlane::new(
             CellId(i as u16),
             scenario.cells,

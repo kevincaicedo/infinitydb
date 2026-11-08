@@ -107,7 +107,7 @@ use scatter::{
     read_array_leg, run_local, simple_reply, stages, u64_decimal,
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
-use shared::{DurableAdmission, NsApplyOutcome, handle_ns_apply, tier_to_fan};
+use shared::{DurableAdmission, NsApplyOutcome, apply_drop, handle_ns_apply, tier_to_fan};
 pub(crate) use timers::DurableTimers;
 use timers::ServerTimers;
 pub use timers::{TimerAssemblyError, TimerRole};
@@ -322,16 +322,14 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// ADR-0062 D1); inner state stays empty until one materializes.
     tier: RefCell<Option<crate::tier_cell::TierCell<F>>>,
     /// Dropped tiered namespaces whose tier files wait for the catalog
-    /// swap that drops them (ADR-0100 D5): `(ns, epoch)` recorded on the
-    /// origin by the DROP program or a `CREATE` rollback at its local
-    /// apply as `u64::MAX`, an epoch no swap reaches, and lowered to the
-    /// writer's answer once it arrives (`lower_drop_release`), and on a
-    /// peer, after the swap, by the `INF.NSFAN DROP` apply (ADR-0186 D1).
-    /// A fault-injected stop at `ns_drop_before_meta` is never lowered, so
-    /// those files hold until the restart. Consumed by
-    /// `TierCell::sync_namespaces`, which parks the tier files on the
-    /// entry's epoch. Bounded by DDL rate — one entry per drop, consumed
-    /// at the next MAINTAIN.
+    /// swap that drops them (ADR-0189 D9): `(ns, epoch)` recorded by every
+    /// cell's apply of an accepted `DROP` or `CREATE` rollback, the
+    /// origin's and each peer's `INF.NSFAN DROP` leg alike, with the
+    /// receipt's epoch, which the catalog word already covers. No cell
+    /// applies a drop before its answer, so a stop before it leaves every
+    /// file in place. Consumed by `TierCell::sync_namespaces`, which parks
+    /// the tier files on the entry's epoch. Bounded by DDL rate — one entry
+    /// per drop under the DDL ticket, consumed at the next MAINTAIN.
     ns_drop_releases: RefCell<Vec<(NsId, u64)>>,
     /// Fabric-origin tiered applies (M4-S26): per-origin FIFO queues. A
     /// tiered apply can suspend on a cold read, so it cannot run inside

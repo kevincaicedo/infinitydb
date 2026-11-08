@@ -1350,12 +1350,21 @@ fn cell_main(
     // blocking exception, now sliced). Progress/summary lines come from
     // the control thread's recovery board.
     mark(14); // setup:keyspace
-    let mut ks = Keyspace::new(StoreConfig { hasher, ..StoreConfig::default() });
-    let mut durable = None;
-    if let Some((dir, catalog, control, io, seal_barriers_per_s, geometry, provenance)) = &boot {
-        if let Some(catalog) = catalog {
-            ks.seed_catalog(catalog).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+    // The node's keyspace is cataloged (ADR-0189 D4): seeded from `META`'s
+    // decode, or the empty catalog of a fresh data directory, so a
+    // namespace entry changes only with the catalog writer's receipt. A
+    // node with no data directory has no catalog writer and answers no DDL.
+    let store_cfg = StoreConfig { hasher, ..StoreConfig::default() };
+    let ks = match &boot {
+        Some((_, catalog, ..)) => {
+            let empty = inf_store::NsCatalog::empty();
+            Keyspace::cataloged(store_cfg, catalog.as_ref().unwrap_or(&empty))
+                .map_err(|e| std::io::Error::other(format!("{e:?}")))?
         }
+        None => Keyspace::new(store_cfg),
+    };
+    let mut durable = None;
+    if let Some((dir, _catalog, control, io, seal_barriers_per_s, geometry, provenance)) = &boot {
         let cfg = inf_server::DurableConfig {
             data_dir: dir.clone(),
             geometry: *geometry,

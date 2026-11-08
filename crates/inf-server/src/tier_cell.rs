@@ -437,8 +437,6 @@ pub(crate) struct TierCell<F: SegmentFs> {
 /// that carries the drop is durable (ADR-0100 D5: `release_epoch` is
 /// that persist's epoch; a crash before it must find every file).
 struct TeardownNs {
-    /// The dropped namespace (ids never recur within a boot).
-    ns: NsId,
     files: Vec<TierFileMeta>,
     release_epoch: u64,
 }
@@ -578,7 +576,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             // sequence carried forward.
             self.free_lanes.push((gone.lane, gone.round_seq));
             let files = teardown_files(&gone);
-            self.teardown.push(TeardownNs { ns: gone.ns, files, release_epoch });
+            self.teardown.push(TeardownNs { files, release_epoch });
         }
         for (id, spec) in live {
             if self.namespaces.iter().any(|t| t.ns == id) {
@@ -950,20 +948,6 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         }
     }
 
-    /// Lowers the hold on dropped namespace `ns`'s files to `epoch`: the
-    /// origin of a `DROP` or a rollback holds them from its local apply
-    /// and learns the drop's epoch from the catalog writer's answer
-    /// (ADR-0100 D5). A namespace this cell holds no files of has nothing
-    /// to lower.
-    pub fn lower_release(&mut self, ns: NsId, epoch: u64) {
-        for t in self.round_drain.iter_mut().filter(|t| t.ns == ns) {
-            t.release_epoch = epoch;
-        }
-        for tn in self.teardown.iter_mut().filter(|tn| tn.ns == ns) {
-            tn.release_epoch = epoch;
-        }
-    }
-
     /// Bounded teardown slices for dropped namespaces (ADR-0062 D7).
     /// Unlinks route through the injected fs (L7) and failure only
     /// defers disk space — the boot orphan sweep re-drives it.
@@ -992,7 +976,6 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             // drop then frees.
             let _ = gone.flush.finish_round();
             self.teardown.push(TeardownNs {
-                ns: gone.ns,
                 files: teardown_files(&gone),
                 release_epoch: gone.release_epoch,
             });
