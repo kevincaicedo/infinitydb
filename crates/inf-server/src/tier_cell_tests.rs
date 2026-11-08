@@ -1554,6 +1554,30 @@ fn a_cold_read_queued_before_a_drop_reads_its_own_file() {
     assert_eq!(cell.receipt_for(0), 16, "the receipt follows the last file's unlink");
 }
 
+/// A dropped namespace's failed unlink keeps its file and its record (the
+/// drain's `Err` arm, which `tier_unlink_fail` reaches): the file stays on
+/// the disk, the position stays Draining and no receipt names the id; the
+/// next MAINTAIN, nothing armed, unlinks it and the receipt follows.
+#[test]
+fn a_dropped_namespaces_failed_unlink_keeps_its_file_and_its_position() {
+    let (mut cell, _ks, _) = flushed_namespace();
+    let active = cell.nth(0).flush.active().map(|(.., path)| path.to_path_buf());
+    let active = active.expect("engagement: the namespace has an active file");
+    cell.drop_ns(NsId(16));
+    inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
+    cell.maintain_draining(|_| true, |_| true);
+    let fired = inf_foundation::fault::fired(inf_log::fault::TIER_UNLINK_FAIL);
+    inf_foundation::fault::disarm_all();
+    assert_eq!(fired, 1, "engagement: the drained file's unlink failed once");
+    assert!(on_disk(&cell, &active), "a failed unlink left {} on the disk", active.display());
+    assert_eq!(cell.draining(), (1, 0), "the position stays Draining while its file is kept");
+    assert_eq!(cell.receipt_for(0), 0, "no receipt while a file of the owner is on the disk");
+    cell.maintain_draining(|_| true, |_| true);
+    assert!(!on_disk(&cell, &active), "the next MAINTAIN unlinks {}", active.display());
+    assert_eq!(cell.draining(), (0, 0), "the position drains once its file is gone");
+    assert_eq!(cell.receipt_for(0), 16, "the receipt names the id after the file's unlink");
+}
+
 /// Namespace 16 on a sim-disk cell, its table holding no record (so
 /// MAINTAIN's seal, release, reclaim and compaction legs do nothing), and
 /// `files` tier files on the disk that a covering swap retired: each named

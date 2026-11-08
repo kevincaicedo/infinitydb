@@ -1469,6 +1469,8 @@ fn drain_files<F: SegmentFs>(
         match unlink_tier_file(fs, &meta) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            // `tier_unlink_fail` reaches this arm: the file stays its
+            // owner's, so the position holds and no receipt is published.
             Err(_) => {
                 t.retired.push(meta);
                 break;
