@@ -756,6 +756,40 @@ rows=(
   # The same post at replacement, kind and id matching kept: the stale
   # notice is counted, and the DST's zero assertion goes red.
   "inf_canary_ns_notice_posted_at_replacement m2-ns-drop-window NOTICE-STALE"
+  # ADR-0003 A1.7 — the wake bridge's lane, one plant per load-bearing
+  # ordering and per protocol rule, each red on the Loom model that holds
+  # it (`Causality` is Loom's report on a tomb: a free not ordered after an
+  # access, or an access after a free).
+  # A foreign drop decrements in one read-modify-write and sets Q in a
+  # second: the owner's reuse lands between them.
+  "inf_canary_wake_drop_notify_split loom inf-foundation loom_a_foreign_last_drop_never_races_the_owners_reuse Causality"
+  # The push's compare-and-swap is Relaxed: a take reads a stale link.
+  "inf_canary_wake_push_relaxed loom inf-foundation loom_pushes_and_drains_lose_no_bridge drained-once"
+  # The drain clears Q before it reads the link: a push between them
+  # rewrites it.
+  "inf_canary_wake_clear_before_link loom inf-foundation loom_pushes_and_drains_lose_no_bridge drained-once"
+  # A foreign call adds to waker_foreign_ops after its push: the
+  # executor's drop can free the stack first.
+  "inf_canary_wake_count_after_push loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
+  # A foreign wake sets W and not Q, so it pushes nothing: the wake is lost.
+  "inf_canary_wake_without_queue loom inf-foundation loom_two_foreign_wakes_against_a_drain_are_delivered_once delivered-at-least-once"
+  # The foreign swap of the lane word is Relaxed: a drop that pushes
+  # nothing is not ordered before the last drop's free.
+  "inf_canary_wake_lane_relaxed loom inf-foundation loom_a_closed_headers_last_drops_free_it_once Causality"
+  # The drain's take is Relaxed: it reads a stale link.
+  "inf_canary_wake_take_relaxed loom inf-foundation loom_pushes_and_drains_lose_no_bridge drained-once"
+  # The drain's clear is Relaxed: a last drop that found Q set is not
+  # ordered before the owner's reuse.
+  "inf_canary_wake_clear_relaxed loom inf-foundation loom_a_foreign_last_drop_never_races_the_owners_reuse Causality"
+  # A close's swap is Relaxed: the owner part's drop is not ordered before
+  # another thread's free.
+  "inf_canary_wake_close_relaxed loom inf-foundation loom_a_closed_headers_last_drops_free_it_once Causality"
+  # The release of a stack count is Relaxed: the stack's freer does not
+  # follow the other count's release.
+  "inf_canary_wake_retain_relaxed loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
+  # A closed header's last drop frees it with Q set: the last take then
+  # reaches the freed bridge.
+  "inf_canary_closed_free_ignores_queue loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

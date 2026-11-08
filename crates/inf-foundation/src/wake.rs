@@ -37,8 +37,9 @@
 //! thread then releases the stack's count of it, and the release that takes the count to zero
 //! frees the stack ([`Freed::Stack`]), `Arc`'s protocol.
 //!
-//! **Orderings.** Each load-bearing ordering is a named const, which the Loom models check
-//! (`RUSTFLAGS="--cfg loom"`). Every other access is `Relaxed`, with its reason at its use.
+//! **Orderings.** Each load-bearing ordering is a named const whose `cfg` plants it `Relaxed`, and
+//! a Loom model below turns red on the plant (`RUSTFLAGS="--cfg loom"`). Every other access is
+//! `Relaxed`, with its reason at its use.
 
 use core::cell::Cell;
 use core::ptr::{self, NonNull};
@@ -158,36 +159,77 @@ impl Lane {
     }
 }
 
-// ---- Orderings: each load-bearing one a named const -----------------------------------------
+// ---- Orderings: each load-bearing one a const with its plant -------------------------------
 
 /// The foreign lane's swap of the lane word (ADR-0003 A1.7). Its release orders a call's last
 /// access, when the call pushes nothing (`Q` already set, or the header closed), before the free
 /// a later swap decides; its acquire makes a freeing swap follow every earlier one.
+#[cfg(not(inf_canary_wake_lane_relaxed))]
 const LANE_ORDERING: Ordering = Ordering::AcqRel;
+/// Canary: the foreign swap without its ordering.
+#[cfg(inf_canary_wake_lane_relaxed)]
+const LANE_ORDERING: Ordering = Ordering::Relaxed;
 
 /// The push's compare-and-swap of the stack's head: its release publishes the bridge's link
 /// to the take that acquires it.
+#[cfg(not(inf_canary_wake_push_relaxed))]
 const PUSH_ORDERING: Ordering = Ordering::Release;
+/// Canary: the push without its release.
+#[cfg(inf_canary_wake_push_relaxed)]
+const PUSH_ORDERING: Ordering = Ordering::Relaxed;
 
 /// The drain's swap of the stack's head: its acquire makes every link it then reads the one its
 /// push wrote.
+#[cfg(not(inf_canary_wake_take_relaxed))]
 const TAKE_ORDERING: Ordering = Ordering::Acquire;
+/// Canary: the take without its acquire.
+#[cfg(inf_canary_wake_take_relaxed)]
+const TAKE_ORDERING: Ordering = Ordering::Relaxed;
 
 /// The drain's clear of `Q` and `W`. Its acquire orders the foreign accesses before it (the swap
 /// of a last drop that found `Q` set and pushed nothing) before the owner's free or reuse; its
 /// release orders the drain's read of the link before the next push's write of it.
+#[cfg(not(inf_canary_wake_clear_relaxed))]
 const CLEAR_ORDERING: Ordering = Ordering::AcqRel;
+/// Canary: the clear without its ordering.
+#[cfg(inf_canary_wake_clear_relaxed)]
+const CLEAR_ORDERING: Ordering = Ordering::Relaxed;
 
 /// `close`'s swap: its release orders the owner part's drop in place before the free another
 /// thread's swap decides.
+#[cfg(not(inf_canary_wake_close_relaxed))]
 const CLOSE_ORDERING: Ordering = Ordering::AcqRel;
+/// Canary: the close without its ordering.
+#[cfg(inf_canary_wake_close_relaxed)]
+const CLOSE_ORDERING: Ordering = Ordering::Relaxed;
 
 /// The release of a stack count, `Arc`'s protocol: a `Release` decrement, so every access the
 /// releasing thread made to the stack happens before the free; and, where the count reaches
-/// zero, an `Acquire` load, so the freer follows every other release.
+/// zero, an `Acquire` load, so the freer follows every other release. One rule, one plant.
+#[cfg(not(inf_canary_wake_retain_relaxed))]
 const RETAIN_ORDERING: Ordering = Ordering::Release;
 /// The acquire half of the release rule above, at zero.
+#[cfg(not(inf_canary_wake_retain_relaxed))]
 const RETAIN_ZERO_ORDERING: Ordering = Ordering::Acquire;
+/// Canary: the release of a stack count without its ordering, both halves.
+#[cfg(inf_canary_wake_retain_relaxed)]
+const RETAIN_ORDERING: Ordering = Ordering::Relaxed;
+/// Canary: the acquire half, relaxed with the release half.
+#[cfg(inf_canary_wake_retain_relaxed)]
+const RETAIN_ZERO_ORDERING: Ordering = Ordering::Relaxed;
+
+// ---- Planted protocol violations (canaries; each a `cfg`, never a feature) ----------------
+
+/// A foreign drop decrements in one read-modify-write and sets `Q` in a second.
+const PLANT_DROP_NOTIFY_SPLIT: bool = cfg!(inf_canary_wake_drop_notify_split);
+/// The drain clears `Q` before it reads the link.
+const PLANT_CLEAR_BEFORE_LINK: bool = cfg!(inf_canary_wake_clear_before_link);
+/// A foreign call adds to `waker_foreign_ops` after its swap and its push.
+const PLANT_COUNT_AFTER_PUSH: bool = cfg!(inf_canary_wake_count_after_push);
+/// A foreign wake sets `W` and not `Q`, so it pushes nothing.
+const PLANT_WAKE_WITHOUT_QUEUE: bool = cfg!(inf_canary_wake_without_queue);
+/// A closed header's last drop frees it with `Q` set.
+const PLANT_CLOSED_FREE_IGNORES_QUEUE: bool = cfg!(inf_canary_closed_free_ignores_queue);
 
 // ---- The tomb: a Loom model's view of a free ------------------------------------------------
 
@@ -392,7 +434,7 @@ impl WakeBridge {
     /// A foreign clone: `c + 1`, under the bound's compare. `stack` is the bridge's own.
     pub fn foreign_clone(&self, stack: &RemoteStack) {
         debug_assert!(ptr::eq(stack, self.stack()), "a bridge's calls name its own stack");
-        stack.count_foreign();
+        count_before(stack);
         self.swap_lane(LANE_ORDERING, |lane| {
             let count = lane.count();
             if count >= LANE_COUNT_MAX {
@@ -400,24 +442,27 @@ impl WakeBridge {
             }
             lane.with_count(count + 1)
         });
+        count_after(stack);
     }
 
     /// A foreign `wake_by_ref`: `W` and `Q` set unless the header is closed, and the bridge
     /// pushed if `Q` was clear. `stack` is the bridge's own.
     pub fn foreign_wake_by_ref(&self, stack: &RemoteStack) -> Pushed {
         debug_assert!(ptr::eq(stack, self.stack()), "a bridge's calls name its own stack");
-        stack.count_foreign();
+        count_before(stack);
+        let raise = if PLANT_WAKE_WITHOUT_QUEUE { WOKEN } else { WOKEN | QUEUED };
         self.tomb.visit();
         let mut word = self.lane.load(Ordering::Relaxed);
         let old = loop {
             let lane = Lane(word);
             if lane.has(CLOSED) {
+                count_after(stack);
                 return Pushed::Closed;
             }
             self.tomb.visit();
             match self.lane.compare_exchange(
                 word,
-                lane.with(WOKEN | QUEUED).0,
+                lane.with(raise).0,
                 LANE_ORDERING,
                 Ordering::Relaxed,
             ) {
@@ -425,7 +470,7 @@ impl WakeBridge {
                 Err(now) => word = now,
             }
         };
-        if old.has(QUEUED) {
+        let pushed = if PLANT_WAKE_WITHOUT_QUEUE || old.has(QUEUED) {
             Pushed::Already
         } else {
             match self.queue(stack) {
@@ -437,13 +482,16 @@ impl WakeBridge {
                     Pushed::Closed
                 }
             }
-        }
+        };
+        count_after(stack);
+        pushed
     }
 
     /// A foreign `wake`, which consumes its waker: `c − 1` with `W` and `Q` set unless the header
     /// is closed. `stack` is the bridge's own.
     pub fn foreign_wake(&self, stack: &RemoteStack) -> Released {
-        self.release_waker(stack, WOKEN | QUEUED)
+        let raise = if PLANT_WAKE_WITHOUT_QUEUE { WOKEN } else { WOKEN | QUEUED };
+        self.release_waker(stack, raise)
     }
 
     /// A foreign drop: `c − 1` with `Q` set unless the header is closed. `stack` is the bridge's
@@ -491,14 +539,22 @@ impl WakeBridge {
     /// `c − 1` with `raise` set unless closed, then the push or the free that follows.
     fn release_waker(&self, stack: &RemoteStack, raise: u64) -> Released {
         debug_assert!(ptr::eq(stack, self.stack()), "a bridge's calls name its own stack");
-        stack.count_foreign();
-        let before = self.swap_lane(LANE_ORDERING, |lane| {
-            raise_unless_closed(lane.with_count(lane.count() - 1), raise)
-        });
-        let count = before.count() - 1;
-        if before.has(CLOSED) {
-            if count == 0 && !before.has(QUEUED) { Released::Last } else { Released::Kept }
-        } else if before.has(QUEUED) {
+        count_before(stack);
+        // The word before the swap that set (or skipped) `raise`, and the count after the drop.
+        let (before, count) = if PLANT_DROP_NOTIFY_SPLIT && raise == QUEUED {
+            self.swap_lane(LANE_ORDERING, |lane| lane.with_count(lane.count() - 1));
+            let before = self.swap_lane(LANE_ORDERING, |lane| raise_unless_closed(lane, raise));
+            (before, before.count())
+        } else {
+            let before = self.swap_lane(LANE_ORDERING, |lane| {
+                raise_unless_closed(lane.with_count(lane.count() - 1), raise)
+            });
+            (before, before.count() - 1)
+        };
+        let released = if before.has(CLOSED) {
+            let queued = !PLANT_CLOSED_FREE_IGNORES_QUEUE && before.has(QUEUED);
+            if count == 0 && !queued { Released::Last } else { Released::Kept }
+        } else if (PLANT_WAKE_WITHOUT_QUEUE && raise != QUEUED) || before.has(QUEUED) {
             Released::Kept
         } else {
             match self.queue(stack) {
@@ -508,7 +564,9 @@ impl WakeBridge {
                     Settled::Last => Released::Last,
                 },
             }
-        }
+        };
+        count_after(stack);
+        released
     }
 
     /// One compare-and-swap of the lane word to `next(old)`, retried with the word it read when
@@ -549,6 +607,21 @@ impl WakeBridge {
 /// `lane` with `raise` set, unless the header is closed.
 fn raise_unless_closed(lane: Lane, raise: u64) -> Lane {
     if lane.has(CLOSED) { lane } else { lane.with(raise) }
+}
+
+/// A foreign call's add to `waker_foreign_ops`, made first: the call's waker then still keeps
+/// the header, and so the stack, allocated (ADR-0003 A1.2.5).
+fn count_before(stack: &RemoteStack) {
+    if !PLANT_COUNT_AFTER_PUSH {
+        stack.count_foreign();
+    }
+}
+
+/// The add's planted place: after the swap and the push.
+fn count_after(stack: &RemoteStack) {
+    if PLANT_COUNT_AFTER_PUSH {
+        stack.count_foreign();
+    }
 }
 
 impl RemoteStack {
@@ -609,9 +682,7 @@ impl RemoteStack {
         Freed::Stack
     }
 
-    /// Adds one to `waker_foreign_ops`, first in each foreign call: the call's waker then still
-    /// keeps the header, and so the stack, allocated (ADR-0003 A1.2.5). `Relaxed`: that place
-    /// orders it (ADR-0003 A1.7).
+    /// `Relaxed`: its place, first in each foreign call, orders it (ADR-0003 A1.7).
     fn count_foreign(&self) {
         self.tomb.visit();
         self.foreign_ops.fetch_add(1, Ordering::Relaxed);
@@ -691,9 +762,15 @@ impl Drained {
         let bridge = resolve(at);
         debug_assert!(ptr::eq(bridge, at.as_ptr()), "resolve returns the bridge at its address");
         bridge.tomb.visit();
-        // Relaxed: the take's acquire made the push's write visible.
-        self.next = bridge.link.load(Ordering::Relaxed);
-        bridge.clear()
+        if PLANT_CLEAR_BEFORE_LINK {
+            let old = bridge.clear();
+            self.next = bridge.link.load(Ordering::Relaxed);
+            old
+        } else {
+            // Relaxed: the take's acquire made the push's write visible.
+            self.next = bridge.link.load(Ordering::Relaxed);
+            bridge.clear()
+        }
     }
 }
 
