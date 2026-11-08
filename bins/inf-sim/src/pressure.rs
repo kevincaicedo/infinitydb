@@ -113,10 +113,10 @@ enum StallOutcome {
     TimedOut,
 }
 
-/// Waits for flushed-watermark progress or the virtual deadline — the
-/// select the production command layer performs against its timer wheel.
-/// Round wakes re-run the deadline check; the gate wake delivers
-/// progress.
+/// Waits for flushed-watermark progress or the virtual deadline, as the
+/// production write path does: it compares the loop's clock with the
+/// deadline each time a flush round wakes its stalled writers. Round wakes
+/// re-run the deadline check; the gate wake delivers progress.
 struct StallWait {
     gate: WatermarkWait,
     now: Rc<Cell<u64>>,

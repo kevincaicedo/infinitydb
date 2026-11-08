@@ -175,6 +175,10 @@ The development tasks use [`just`](https://github.com/casey/just), and the
 test suite needs Redis 8.0.5 on `PATH` (or `INF_COMPAT_ORACLE_ADDR` pointing at
 one) and Python 3.11 or newer. `just check` also needs a C++17 compiler: it
 compiles the fuzz targets, and their build compiles libFuzzer's C++ runtime.
+`just check` and the test suite need Linux 6.6 or newer, with `/dev/shm` on
+a tmpfs that takes `O_DIRECT`: the `timer_owners` test keeps its node's data
+there, and without it the test fails rather than skips. The server itself
+runs on 5.15.
 
 - `cargo build --release -p infinityd` builds the server
   (`infinityd --help` prints its usage).
