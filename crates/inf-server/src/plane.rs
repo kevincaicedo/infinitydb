@@ -1195,9 +1195,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // ADR-0100 D5: a dropped namespace's files unlink only once
             // the catalog swap carrying the drop is durable.
             let control = self.shared.control.borrow().clone();
-            units += tier.maintain_draining(|epoch| {
-                control.as_ref().is_none_or(|control| control.persisted(epoch))
-            });
+            let durable = self.shared.durable.borrow();
+            units += tier.maintain_draining(
+                |epoch| control.as_ref().is_none_or(|control| control.persisted(epoch)),
+                |fence| durable.as_ref().is_none_or(|cell| cell.commit.settled_through(fence)),
+            );
+            drop(durable);
             if units > 0 {
                 cx.charge(GroupClass::Maintenance, units);
             }

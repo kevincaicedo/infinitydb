@@ -159,7 +159,7 @@ fn a_position_carries_its_round_sequence_to_its_next_owner() {
     cell.nth_mut(0).round_seq = 7;
     cell.drop_ns(NsId(16));
     assert_eq!(cell.live_count(), 0, "dropped");
-    assert_eq!(cell.maintain_draining(|_| true), 0, "no file to unlink");
+    assert_eq!(cell.maintain_draining(|_| true, |_| true), 0, "no file to unlink");
     assert_eq!(cell.draining(), (0, 0), "no round out: drained in one MAINTAIN");
     assert_eq!(cell.receipt_for(lane as usize), 16, "the receipt names the dropped id");
     assert_eq!(cell.reclaim_receipted(), 1, "the writer returns the position");
@@ -912,6 +912,28 @@ fn a_stalled_writer_is_woken_at_a_visit_whose_plan_is_refused() {
     assert_eq!(cell.nth(0).stall_waiters.waiting(), 0, "the parked writer was woken");
     drop(parked);
 }
+/// A dropped namespace's owner is not freed, nor its receipt published,
+/// while a blob `GET`'s extent reader holds its lifetime or the commit
+/// ledger has not settled a blob `SET`'s extent barrier it registered
+/// (ADR-0148 D3); each end lets the drain finish.
+#[test]
+fn a_held_extent_read_or_an_unsettled_barrier_holds_the_drain() {
+    let mut cell = TierCell::standalone(MemFs::new(), 0, PathBuf::from("/shard-0"), census());
+    cell.create_ns(NsId(16), &spec());
+    let hold = LifetimeHold(Rc::clone(&cell.nth(0).holds));
+    cell.nth(0).note_extent_barrier(7);
+    cell.drop_ns(NsId(16));
+    cell.maintain_draining(|_| true, |_| true);
+    assert_eq!(cell.draining(), (1, 0), "held by the extent reader's hold");
+    drop(hold);
+    cell.maintain_draining(|_| true, |fence| fence < 7);
+    assert_eq!(cell.draining(), (1, 0), "held by the unsettled extent barrier");
+    assert_eq!(cell.receipt_for(0), 0, "no receipt while held");
+    cell.maintain_draining(|_| true, |fence| fence <= 7);
+    assert_eq!(cell.draining(), (0, 0), "both ended: drained");
+    assert_eq!(cell.receipt_for(0), 16);
+}
+
 /// A dropped namespace whose round has an op in flight holds its position
 /// until the op is terminal: no receipt meanwhile, then the position
 /// returns with its round sequence.
@@ -924,12 +946,12 @@ fn a_draining_round_holds_its_position_until_terminal() {
     round.pending = 1;
     cell.nth_mut(0).round = Some(round);
     cell.drop_ns(NsId(16));
-    cell.maintain_draining(|_| true);
+    cell.maintain_draining(|_| true, |_| true);
     assert_eq!(cell.draining(), (1, 1), "held while an op is in flight");
     assert_eq!(cell.receipt_for(0), 0, "no receipt while it is held");
     let Position::Draining { ns, .. } = &mut cell.positions[0] else { panic!("Draining") };
     ns.round.as_mut().expect("the parked round").pending = 0;
-    cell.maintain_draining(|_| true);
+    cell.maintain_draining(|_| true, |_| true);
     assert_eq!(cell.draining(), (0, 0), "drained once its op is terminal");
     assert_eq!(cell.receipt_for(0), 16);
     assert_eq!(cell.reclaim_receipted(), 1);
@@ -1132,7 +1154,7 @@ fn a_dropped_namespace_drains_from_every_round_state() {
         let mut ops = Vec::new();
         cell.turn(&mut gone, 2, &mut ops, &mut NoBudget).expect("nothing to plan");
         assert!(ops.is_empty(), "{state:?}: no group of a parked round is pushed");
-        cell.maintain_draining(|_| true);
+        cell.maintain_draining(|_| true, |_| true);
         let parked = usize::from(!in_flight.is_empty());
         assert_eq!(cell.draining().1, parked, "{state:?}: parked while an op is in flight");
         for op in in_flight {
@@ -1142,7 +1164,7 @@ fn a_dropped_namespace_drains_from_every_round_state() {
             cell.on_flush_completion(token, None);
         }
         assert_eq!(cell.flush_stats.stale_completions, 0, "{state:?}: applied to the parked round");
-        cell.maintain_draining(|_| true);
+        cell.maintain_draining(|_| true, |_| true);
         assert_eq!(cell.draining(), (0, 0), "{state:?}: drained once every op is terminal");
         assert_eq!(cell.receipt_for(lane as usize), 16, "{state:?}: the receipt, files unlinked");
         assert_eq!(cell.reclaim_receipted(), 1, "{state:?}: the position returns");
@@ -1425,7 +1447,7 @@ fn sixty_five_drops_with_held_rounds_stay_within_sixty_four_lifetimes() {
         // The drop: Retiring published, its release durable at once, so
         // only the held ops keep it.
         cell.drop_ns(ns);
-        cell.maintain_draining(|_| true);
+        cell.maintain_draining(|_| true, |_| true);
     }
     let (draining, parked) = cell.draining();
     let owners = cell.live_count() + draining;
@@ -1444,7 +1466,7 @@ fn sixty_five_drops_with_held_rounds_stay_within_sixty_four_lifetimes() {
         cell.on_flush_completion(token, None);
     }
     for _ in 0..64 {
-        cell.maintain_draining(|_| true);
+        cell.maintain_draining(|_| true, |_| true);
     }
     assert_eq!(cell.draining(), (0, 0), "every owner drained once its round is terminal");
     assert_eq!(cell.reclaim_receipted(), 64, "every position's receipt names its dropped id");
@@ -1497,7 +1519,7 @@ fn a_cold_read_queued_before_a_drop_reads_its_own_file() {
         .expect("the read is queued");
     assert_eq!(cold.inflight_on(file), 1, "engagement: the queued read pins its file");
     cell.drop_ns(NsId(16));
-    cell.maintain_draining(|_| true);
+    cell.maintain_draining(|_| true, |_| true);
     assert_eq!(cell.live_count(), 0, "engagement: dropped with the read queued");
     let mut ops = Vec::new();
     cold.drain(|op| ops.push(op));
@@ -1526,7 +1548,7 @@ fn a_cold_read_queued_before_a_drop_reads_its_own_file() {
     // is published.
     assert_eq!(cell.draining(), (1, 0), "held Draining while the read was pinned");
     for _ in 0..4 {
-        cell.maintain_draining(|_| true);
+        cell.maintain_draining(|_| true, |_| true);
     }
     assert_eq!(cell.draining(), (0, 0), "drained once no read is pinned");
     assert_eq!(cell.receipt_for(0), 16, "the receipt follows the last file's unlink");
@@ -1661,7 +1683,7 @@ fn the_cell_leaves_tier_file_unlinks_to_the_control_thread() {
     let active = cell.nth(0).flush.active().map(|(.., path)| path.to_path_buf());
     let active = active.expect("engagement: the namespace has an active file");
     cell.drop_ns(NsId(16));
-    cell.maintain_draining(|_| true);
+    cell.maintain_draining(|_| true, |_| true);
     let dropped_unlinked = !on_disk(&cell, &active);
     assert!(
         !retired_unlinked,

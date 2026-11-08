@@ -42,6 +42,7 @@
 //! `IoOp::TierRead`, and complete through the custody table, each
 //! window planned below its file's [`ReadableLen`].
 
+use std::cell::Cell;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -148,6 +149,15 @@ pub(crate) struct TierNs<F: SegmentFs> {
     epoch_marks: EpochMarks,
     /// One compaction read chain in flight at a time (bounded).
     pub compact_inflight: bool,
+    /// The token every [`LifetimeHold`] clones: a blob `GET`'s extent
+    /// reader holds one across its awaits, and a Draining owner's terminal
+    /// step waits until no clone is left (ADR-0148 D3).
+    holds: Rc<()>,
+    /// The highest commit-ledger ticket of a blob `SET`'s extent barrier
+    /// this namespace registered, 0 for none: the ledger holds the extent's
+    /// handle until that barrier is synced, and a Draining owner's terminal
+    /// step waits until the ledger has settled through it (ADR-0148 D3).
+    extent_fence: Cell<u64>,
     /// Namespace directory (teardown unlink root).
     pub dir: PathBuf,
     /// The grant position the namespace holds (ADR-0148 D2), which is its
@@ -345,6 +355,12 @@ impl<F: SegmentFs> TierNs<F> {
         self.round.as_ref().is_some_and(|r| r.has_ready_group(&self.flush))
     }
 
+    /// Records a blob `SET`'s extent barrier, registered in the commit
+    /// ledger under `ticket`: the namespace's terminal step waits for it.
+    pub fn note_extent_barrier(&self, ticket: u64) {
+        self.extent_fence.set(self.extent_fence.get().max(ticket));
+    }
+
     /// The completion-token lane: the grant position's index, below 64.
     fn lane(&self) -> u32 {
         // A position's index is below `POSITIONS` (64), so it fits.
@@ -487,6 +503,13 @@ impl CellGrants {
     }
 }
 
+/// A child owner's hold on a tiered namespace's lifetime (ADR-0148 D3): a
+/// clone of a token the owner holds, so its drop borrows nothing. A blob
+/// `GET`'s extent reader carries one across its awaits; a dropped
+/// namespace's owner is not freed, nor its receipt published, while any is
+/// outstanding.
+pub(crate) struct LifetimeHold(#[allow(dead_code, reason = "held for its drop")] Rc<()>);
+
 /// Why a cell refused to install a tiered namespace's owner (ADR-0148 D2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InstallRefused {
@@ -604,9 +627,12 @@ impl<F: SegmentFs> TierCell<F> {
         self.position_conflicts
     }
 
-    /// Opens a blob extent for reading in the namespace's creation
-    /// I/O mode (M4-S26 blob reads; the §3.3 open is metadata-cheap and
-    /// the returned reader owns the fd across the chunked reads).
+    /// Opens a blob extent of a Live namespace for reading in its
+    /// creation I/O mode (M4-S26 blob reads; the open is metadata-cheap
+    /// and the returned reader owns the fd across the chunked reads),
+    /// with the [`LifetimeHold`] the reader's holder keeps
+    /// beside it: a drop meanwhile holds the namespace's owner until the
+    /// hold is dropped (ADR-0148 D3).
     ///
     /// # Errors
     /// Open/probe failures — the command layer answers typed.
@@ -614,9 +640,10 @@ impl<F: SegmentFs> TierCell<F> {
         &self,
         ns: NsId,
         extent_id: u64,
-    ) -> std::io::Result<inf_log::blob::ExtentReader<F::File>> {
+    ) -> std::io::Result<(inf_log::blob::ExtentReader<F::File>, LifetimeHold)> {
         let t = self.ns(ns).ok_or_else(|| std::io::Error::other("namespace dropped"))?;
-        inf_log::blob::open_extent(&self.fs, &t.dir, ExtentId(extent_id), t.io_mode)
+        let reader = inf_log::blob::open_extent(&self.fs, &t.dir, ExtentId(extent_id), t.io_mode)?;
+        Ok((reader, LifetimeHold(Rc::clone(&t.holds))))
     }
 
     /// The owning cell index (extent headers carry it).
@@ -848,6 +875,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             stall_waiters: WaitList::new(),
             epoch_marks,
             compact_inflight: false,
+            holds: Rc::new(()),
+            extent_fence: Cell::new(0),
             dir,
             pos: permit.pos,
             round_seq: permit.round_seq,
@@ -1159,10 +1188,16 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     /// active file, its staged seals, its sealed files last first; each only
     /// once no cold read is pinned on it, its handle closed before its
     /// unlink, and a failed unlink kept for the next MAINTAIN. Its terminal
-    /// step, once no file is left and its compaction chain is back, frees
-    /// the position (the box's drop: T's pool and its holders) and then
-    /// publishes this cell's receipt for the id. Returns the units.
-    pub fn maintain_draining(&mut self, persisted: impl Fn(u64) -> bool) -> u32 {
+    /// step, once no file is left, its compaction chain is back, no
+    /// [`LifetimeHold`] is outstanding and the commit ledger has settled
+    /// through its extent fence (`settled`), frees the position (the box's
+    /// drop: T's pool and its holders) and then publishes this cell's
+    /// receipt for the id. Returns the units.
+    pub fn maintain_draining(
+        &mut self,
+        persisted: impl Fn(u64) -> bool,
+        settled: impl Fn(u64) -> bool,
+    ) -> u32 {
         let mut units = 0u32;
         for index in 0..POSITIONS {
             let Position::Draining { ns: t, release, phase } = &mut self.positions[index] else {
@@ -1182,7 +1217,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             }
             let left = (UNLINKS_PER_SLICE as u32).saturating_sub(units);
             units += drain_files(&self.fs, self.cold.as_ref(), t, left);
-            if !drained(t) {
+            if !drained(t, &settled) {
                 continue;
             }
             let (pos, id, round_seq) = (t.pos, t.ns, t.round_seq);
@@ -1444,9 +1479,14 @@ fn drain_files<F: SegmentFs>(
 }
 
 /// Whether a Files-phase owner's every child owner has ended: no file in
-/// its catalog or its retirement list, and its compaction chain back.
-fn drained<F: SegmentFs>(t: &TierNs<F>) -> bool {
-    t.flush.catalog_end_id().is_none() && t.retired.is_empty() && !t.compact_inflight
+/// its catalog or its retirement list, its compaction chain back, no
+/// extent reader's hold outstanding, and every blob `SET`'s extent barrier
+/// it registered settled in the commit ledger (`settled(fence)`).
+fn drained<F: SegmentFs>(t: &TierNs<F>, settled: impl Fn(u64) -> bool) -> bool {
+    let files = t.flush.catalog_end_id().is_none() && t.retired.is_empty();
+    let fence = t.extent_fence.get();
+    let held = Rc::strong_count(&t.holds) > 1 || (fence != 0 && !settled(fence));
+    files && !t.compact_inflight && !held
 }
 
 /// Advances one namespace's round on the completions REAP recorded

@@ -407,7 +407,12 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     // deferred; charged on every arm that wrote, once the window's
     // reservation has ended.
     let sealed = match registered {
-        ExtentRegistration::Registered(_, sealed) => sealed,
+        ExtentRegistration::Registered(ticket, sealed) => {
+            // The ledger holds the extent's handle until this barrier is
+            // synced: the namespace's drain waits for it (ADR-0148 D3).
+            t.note_extent_barrier(ticket.as_u64());
+            sealed
+        }
         ExtentRegistration::Full => return Err(park_at_full(cell, turn)),
         ExtentRegistration::Refused(refusal) => {
             cell.charge_foreground(inf_runtime::IoClass::BlobWrite, write.value.len() as u64, 1);

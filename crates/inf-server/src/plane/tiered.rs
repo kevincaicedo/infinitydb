@@ -1212,7 +1212,9 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     ext: inf_store::ExtentRef,
 ) -> Option<Vec<u8>> {
     debug_assert_eq!(ext.offset, 0, "v1 extent references start at 0");
-    let reader = {
+    // The hold lives as long as the reader: a drop meanwhile holds the
+    // namespace's owner (ADR-0148 D3).
+    let (reader, _hold) = {
         let tier = shared.tier.borrow();
         tier.as_ref()?.open_extent_reader(ns, ext.extent_id).ok()?
     };

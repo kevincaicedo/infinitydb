@@ -1186,6 +1186,16 @@ impl<File: SegmentFile> GroupCommit<File> {
         ExtentRegistration::Registered(ticket, made)
     }
 
+    /// Whether every ledger entry up to `ticket` has settled: the FIFO's
+    /// front, the oldest entry not yet folded, is above it, or the ledger
+    /// is empty. Entries fold in ticket order, and an extent barrier's
+    /// handle is released at its fold, so a `true` says every such handle
+    /// at or below `ticket` is closed. O(1).
+    #[must_use]
+    pub fn settled_through(&self, ticket: u64) -> bool {
+        self.pending.front().is_none_or(|entry| entry.ticket > ticket)
+    }
+
     /// Hands each window entry whose fdatasync is not issued yet to
     /// `issue`, oldest first, once: MAINTAIN's driver ops for the extent
     /// barriers, at most the window's `EXTENT_SEAL_WINDOW_ENTRIES` a tick.
