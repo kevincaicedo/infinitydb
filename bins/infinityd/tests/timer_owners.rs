@@ -13,9 +13,16 @@
 //! any cell; `INFO caps` reads the `timer-owners` row at its cap with no
 //! crossing.
 //!
-//! Engagement: the owning cell's `frame_waits_fill` rose by at least 8 and
-//! the burst took less than the fill window, so every episode's timer was
-//! still due when the last one began; else the run is `VACUOUS`.
+//! Engagement: after each `SET` the test reads the owning cell's
+//! `frame_waits_fill`. The run is engaged when 8 or more episodes began
+//! inside one fill window, so that a fill timer kept per episode would have
+//! all eight armed at the eighth's start; else it is `VACUOUS`. A window is
+//! read between two readings, from the instant before the first's `SET` is
+//! written to the instant the second's `INFO` reply is read. A reading
+//! counts every episode begun before its `SET` was written and none begun
+//! after its reply, so each episode the second counts and the first does
+//! not began inside that span, which can overstate, never understate, the
+//! time they took.
 //!
 //! The medium. An episode needs a sealable frame, and none seals while the
 //! cell's K frames are in flight, so a device that other workloads share can
@@ -329,6 +336,35 @@ fn timer_owners_row(caps: &str) -> (u64, u64) {
     (number("high_water"), number("crossings"))
 }
 
+/// One reading of the owning cell's `frame_waits_fill`: an episode it does
+/// not count began after `from`, the instant before its `SET` was written;
+/// one it counts began before `read`, the instant its `INFO` reply was read.
+#[derive(Clone, Copy)]
+struct Reading {
+    from: Instant,
+    read: Instant,
+    waits: u64,
+}
+
+/// The most episodes counted between two readings whose span, from the
+/// first's `from` to the second's `read`, is under `window`, so that each
+/// began inside it; and that span. Every pair of the burst's 65 readings:
+/// 2,080 compares.
+fn densest_window(readings: &[Reading], window: Duration) -> (u64, Duration) {
+    let mut densest = (0, Duration::ZERO);
+    for (index, first) in readings.iter().enumerate() {
+        for second in &readings[index + 1..] {
+            let span = second.read.duration_since(first.from);
+            let counted =
+                second.waits.checked_sub(first.waits).expect("frame_waits_fill only rises");
+            if span < window && counted > densest.0 {
+                densest = (counted, span);
+            }
+        }
+    }
+    densest
+}
+
 #[test]
 fn a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell() {
     let server = Server::spawn(DataDir::create());
@@ -351,22 +387,32 @@ fn a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell() {
         field(&cells.get_mut(&owner).expect("owner").info("persistence"), "frame_waits_fill");
     let value = vec![b'v'; VALUE_LEN];
     let start = Instant::now();
+    // Reading 0 counts the probe's episode: the owning cell answered
+    // another `INFO` between the probe's `+OK` and `waits_before`.
+    let mut readings = Vec::with_capacity(SETS + 1);
+    readings.push(Reading { from: start, read: start, waits: waits_before });
     for i in 0..SETS {
+        let from = Instant::now();
         writer.ok(&[b"SET", format!("{{tm}}k{i}").as_bytes(), &value]);
+        let owner_conn = cells.get_mut(&owner).expect("owner");
+        let waits = field(&owner_conn.info("persistence"), "frame_waits_fill");
+        readings.push(Reading { from, read: Instant::now(), waits });
     }
     let burst = start.elapsed();
+    let (densest, span) = densest_window(&readings, Duration::from_micros(FILL_WINDOW_US));
     let persistence: BTreeMap<u64, String> =
         cells.iter_mut().map(|(cell, conn)| (*cell, conn.info("persistence"))).collect();
     let episodes = field(&persistence[&owner], "frame_waits_fill") - waits_before;
     println!("owner cell {owner}: {episodes} fill episodes in {burst:?}");
+    println!("densest window: {densest} episodes in {span:?}");
     println!("medium {MEDIUM}: {} KiB held", server.dir.footprint_bytes() >> 10);
     for (cell, info) in &persistence {
         println!("cell {cell}: timers_armed_max {}", field(info, "timers_armed_max"));
     }
     assert!(
-        episodes >= EPISODES_MIN && burst < Duration::from_micros(FILL_WINDOW_US),
-        "VACUOUS: {episodes} fill episodes on cell {owner} (want {EPISODES_MIN}) in {burst:?} \
-         (want under {FILL_WINDOW_US} µs)"
+        densest >= EPISODES_MIN,
+        "VACUOUS: {densest} fill episodes on cell {owner} inside one {FILL_WINDOW_US} µs window \
+         (want {EPISODES_MIN}); {episodes} in the {burst:?} burst"
     );
     let owner_armed = field(&persistence[&owner], "timers_armed_max");
     assert_eq!(
@@ -382,4 +428,25 @@ fn a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell() {
         assert_eq!((high_water, crossings), (ROLES, 0), "cell {cell}'s timer-owners row");
     }
     drop(server);
+}
+
+/// The estimator on planted readings: eight episodes 10 ms apart lie inside
+/// one window and read 8; the same eight 13 ms apart fit no window and read
+/// 7, the red an estimator that reads every run engaged would miss; and a
+/// span of exactly the window lies outside it.
+#[test]
+fn the_densest_window_counts_only_episodes_begun_inside_it() {
+    let window = Duration::from_micros(FILL_WINDOW_US);
+    let start = Instant::now();
+    let at = |from_ms: u64, waits: u64| Reading {
+        from: start + Duration::from_millis(from_ms),
+        read: start + Duration::from_millis(from_ms + 1),
+        waits,
+    };
+    let dense: Vec<Reading> = (0..=EPISODES_MIN).map(|k| at(10 * k, k)).collect();
+    assert_eq!(densest_window(&dense, window), (EPISODES_MIN, Duration::from_millis(81)));
+    let spread: Vec<Reading> = (0..=EPISODES_MIN).map(|k| at(13 * k, k)).collect();
+    assert_eq!(densest_window(&spread, window), (EPISODES_MIN - 1, Duration::from_millis(92)));
+    let edge = [at(0, 0), Reading { read: start + window, ..at(99, EPISODES_MIN) }];
+    assert_eq!(densest_window(&edge, window), (0, Duration::ZERO));
 }
