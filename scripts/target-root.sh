@@ -49,6 +49,18 @@
 #                                 the root, each read-only; exit status 2 and
 #                                 the reason on stderr on a refusal
 #   target_root_kept <name>       prints <root>/<name>-<key>
+#   target_root_cargo_fresh <dir> <command> [args…]
+#                                 a per-run build, cold: `env
+#                                 CARGO_TARGET_DIR=<dir> <command> [args…]`
+#                                 when <dir> is absent or an empty directory
+#                                 and no argument names --target-dir,
+#                                 --config or CARGO_TARGET_DIR (each outranks
+#                                 or undoes the directory); else exit 2,
+#                                 nothing run. It needs no setup: a probe
+#                                 keeps its own --target and prefixes (`env
+#                                 -u …`, `env RUSTFLAGS=…`) inside the argv,
+#                                 and env, a program, sets the variable
+#                                 whatever the calling shell holds read-only.
 # Setup runs no cargo, so a script run alone under a cargo config's build-dir
 # puts its intermediate outputs there; the export below refuses one.
 #
@@ -414,6 +426,31 @@ target_root_kept() {
     done
     echo "target-root: '$1' is not a kept directory of scripts/target-root.sh ($TARGET_ROOT_KEPT)" >&2
     return 2
+}
+
+target_root_cargo_fresh() {
+    local dir=${1:-} arg
+    [ "$#" -ge 2 ] && [ -n "$dir" ] ||
+        { echo "target-root: usage: target_root_cargo_fresh <dir> <command> [args…]" >&2; return 2; }
+    shift
+    for arg in "$@"; do
+        case "$arg" in
+            --target-dir | --target-dir=* | --config | --config=* | *CARGO_TARGET_DIR*)
+                echo "target-root: the per-run build of $dir names '$arg', which outranks or undoes" \
+                    "its directory; nothing ran" >&2
+                return 2 ;;
+        esac
+    done
+    if [ -L "$dir" ] || { [ -e "$dir" ] && [ ! -d "$dir" ]; }; then
+        echo "target-root: the per-run directory $dir is not a directory; nothing ran" >&2
+        return 2
+    fi
+    if [ -d "$dir" ] && [ -n "$(ls -A "$dir")" ]; then
+        echo "target-root: the per-run directory $dir holds an earlier run's entries, which a" \
+            "build would read as fresh; nothing ran" >&2
+        return 2
+    fi
+    env CARGO_TARGET_DIR="$dir" "$@"
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

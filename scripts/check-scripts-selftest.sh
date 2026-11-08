@@ -6328,6 +6328,52 @@ tr_real_plain() {
     tr_real 0 && [ "$(cat "$TRW/out")" = "$(tr_phys "$TR_CF")/target" ]
 }
 expect green "target-root: on the pinned cargo, nothing set, the root is printed (the control)" tr_real_plain
+# target_root_cargo_fresh: a per-run build, cold. The recorder prints the
+# variable and its arguments; "ran" says the command ran.
+printf '%s\n' '#!/bin/sh' 'printf "ran CARGO_TARGET_DIR=%s FOO=%s argv=%s\n" "$CARGO_TARGET_DIR" "${FOO-<unset>}" "$*"' \
+    >"$TR_BIN/recorder"
+chmod +x "$TR_BIN/recorder"
+TR_FR="$TRW/fresh"
+mkdir -p "$TR_FR"
+tr_fresh() { # <dir> <args…>: the function in a shell of its own, FOO=1 and a read-only variable
+    env FOO=1 CARGO_TARGET_DIR="$TRW/caller" bash -c '. "$1/scripts/target-root.sh"; readonly CARGO_TARGET_DIR
+shift; target_root_cargo_fresh "$@"' sh "$TR_A" "$@"
+}
+expect green "target-root: a fresh build on an absent directory runs there, under a read-only variable" \
+    tr_is "ran CARGO_TARGET_DIR=$TR_FR/absent FOO=1 argv=a b" tr_fresh "$TR_FR/absent" "$TR_BIN/recorder" a b
+mkdir -p "$TR_FR/empty"
+expect green "target-root: a fresh build on an empty directory runs there" \
+    tr_is "ran CARGO_TARGET_DIR=$TR_FR/empty FOO=1 argv=" tr_fresh "$TR_FR/empty" "$TR_BIN/recorder"
+expect green "target-root: an env -u prefix stays in the argv, the variable set beside it" \
+    tr_is "ran CARGO_TARGET_DIR=$TR_FR/absent FOO=<unset> argv=x" \
+    tr_fresh "$TR_FR/absent" env -u FOO "$TR_BIN/recorder" x
+mkdir -p "$TR_FR/full"
+: >"$TR_FR/full/earlier"
+tr_fresh_refused() { # <pattern> <dir> <args…>: exit 2, nothing ran
+    local pattern=$1 status=0
+    shift
+    tr_fresh "$@" >"$TRW/out" 2>"$TRW/err" || status=$?
+    [ "$status" -eq 2 ] && ! grep -q '^ran' "$TRW/out" && grep -q -- "$pattern" "$TRW/err" && return 0
+    echo "exit $status, want 2 naming '$pattern':"
+    cat "$TRW/out" "$TRW/err"
+    return 1
+}
+expect green "target-root: a fresh build refuses a directory an earlier run filled, running nothing" \
+    tr_fresh_refused "holds an earlier run's entries" "$TR_FR/full" "$TR_BIN/recorder"
+: >"$TR_FR/file"
+expect green "target-root: a fresh build refuses a file at its directory" \
+    tr_fresh_refused "is not a directory" "$TR_FR/file" "$TR_BIN/recorder"
+ln -s "$TR_FR/empty" "$TR_FR/link"
+expect green "target-root: a fresh build refuses a link at its directory" \
+    tr_fresh_refused "is not a directory" "$TR_FR/link" "$TR_BIN/recorder"
+for tr_arg in --target-dir --target-dir=x --config --config=build.target-dir=x CARGO_TARGET_DIR=x; do
+    expect green "target-root: a fresh build refuses an argv naming $tr_arg, which outranks its directory" \
+        tr_fresh_refused "names '$tr_arg'" "$TR_FR/absent" "$TR_BIN/recorder" "$tr_arg"
+done
+expect green "target-root: a fresh build refuses an env -u CARGO_TARGET_DIR, which undoes its directory" \
+    tr_fresh_refused "names 'CARGO_TARGET_DIR'" "$TR_FR/absent" env -u CARGO_TARGET_DIR "$TR_BIN/recorder"
+expect green "target-root: a fresh build with no command is refused" \
+    tr_fresh_refused "usage: target_root_cargo_fresh" "$TR_FR/absent"
 # The helper's canaries: a copy with one rule removed fails its case.
 tr_mutant() { # <name> <sed expression> <case function> <what the copy does>
     local dir="$TRW/mutant-$1"
@@ -6368,6 +6414,15 @@ tr_walk_mutant_case() { # <helper dir>: --clean refuses a root holding a work tr
     tr_clean_refused "$1" - "a work tree or a repository" && [ -e "$1/target/debug/wt/.git" ]
 }
 tr_control walk tr_walk_mutant_case
+tr_fresh_case() { # <helper dir>: its fresh build refuses a directory an earlier run filled
+    local status=0
+    env bash -c '. "$1/scripts/target-root.sh"; target_root_cargo_fresh "$2" "$3"' sh "$1" "$TR_FR/full" \
+        "$TR_BIN/recorder" >"$TRW/out" 2>&1 || status=$?
+    [ "$status" -eq 2 ] && ! grep -q '^ran' "$TRW/out"
+}
+tr_control fresh tr_fresh_case
+tr_mutant fresh 's/^    if \[ -d "\$dir" \] && \[ -n "\$(ls -A "\$dir")" \]; then$/    if false; then/' tr_fresh_case \
+    "builds in a directory an earlier run filled"
 tr_mutant marker 's/^if writer is not None and writer != phys + "\\n":$/if False:/' tr_copy_case \
     "skips the marker's checkout"
 tr_mutant walk 's/^            if name == ".git" or (name == MARKER and here != root):$/            if False:/' \

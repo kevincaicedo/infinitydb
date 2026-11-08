@@ -207,9 +207,12 @@ else
         probe_for=$target
         cp -R "$PROBE_SRC/." "$work/probe"
         # Built from this directory, not the copy's: the same toolchain and
-        # target as the tree, so the probe proves the scan of that codegen.
-        RUSTFLAGS="--emit asm=$PASM" cargo build --release --quiet --target "$target" \
-            --manifest-path "$work/probe/Cargo.toml" --target-dir "$work/ptarget" >"$work/probe.log" 2>&1 || {
+        # target as the tree, so the probe proves the scan of that codegen. It
+        # builds cold, in a directory no earlier run wrote (ADR-0204 D4).
+        # shellcheck source=target-root.sh
+        . "$SCRIPT_DIR/target-root.sh"
+        target_root_cargo_fresh "$work/ptarget" env RUSTFLAGS="--emit asm=$PASM" cargo build --release --quiet --target "$target" \
+            --manifest-path "$work/probe/Cargo.toml" >"$work/probe.log" 2>&1 || {
             echo "WAKER SCOPE ERROR: the probe did not build:"; sed 's/^/    | /' "$work/probe.log"; exit 2
         }
     fi
