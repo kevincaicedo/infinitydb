@@ -2312,7 +2312,12 @@ impl CatalogWriter {
         if cfg!(inf_canary_ns_id_spent_on_refusal) {
             return;
         }
-        debug_assert!(id.0 < NS_IDS_EXHAUSTED, "decide refused a spent counter");
+        // The wrap canary's writer commits the spent value, as an unchecked
+        // allocator would: its oracle, not this check, must see it.
+        debug_assert!(
+            cfg!(inf_canary_ns_id_wraps) || id.0 < NS_IDS_EXHAUSTED,
+            "decide refused a spent counter"
+        );
         let next = if cfg!(inf_canary_ns_id_wraps) { id.0.wrapping_add(1) } else { id.0 + 1 };
         self.handle.next_ns_id.store(next, Ordering::Release);
     }
