@@ -37,15 +37,27 @@
 //! thread then releases the stack's count of it, and the release that takes the count to zero
 //! frees the stack ([`Freed::Stack`]), `Arc`'s protocol.
 //!
-//! **Orderings.** Each load-bearing ordering is a named const; every other access is `Relaxed`,
-//! with its reason at its use.
+//! **Orderings.** Each load-bearing ordering is a named const, which the Loom models check
+//! (`RUSTFLAGS="--cfg loom"`). Every other access is `Relaxed`, with its reason at its use.
 
 use core::cell::Cell;
 use core::ptr::{self, NonNull};
 
 use crate::limits::LANE_COUNT_MAX;
 
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+/// Atomics swapped for Loom's model-checked versions under `--cfg loom` (the pattern of the
+/// `issue` module; ADR-0159 A1.7). The thread-mark counter is not among them ([`ThreadMark`]).
+#[cfg(loom)]
+mod sync {
+    pub(super) use loom::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+}
+
+#[cfg(not(loom))]
+mod sync {
+    pub(super) use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+}
+
+use sync::{AtomicPtr, AtomicU64, Ordering};
 
 // ---- Thread marks --------------------------------------------------------------------------
 
@@ -177,6 +189,55 @@ const RETAIN_ORDERING: Ordering = Ordering::Release;
 /// The acquire half of the release rule above, at zero.
 const RETAIN_ZERO_ORDERING: Ordering = Ordering::Acquire;
 
+// ---- The tomb: a Loom model's view of a free ------------------------------------------------
+
+#[cfg(not(all(test, loom)))]
+mod tomb {
+    /// Zero-sized outside the Loom models: a visit compiles to nothing.
+    #[derive(Debug)]
+    pub(super) struct Tomb;
+
+    impl Tomb {
+        pub(super) fn new() -> Tomb {
+            Tomb
+        }
+
+        #[inline(always)]
+        pub(super) fn visit(&self) {}
+    }
+}
+
+#[cfg(all(test, loom))]
+#[allow(clippy::disallowed_types, reason = "test-only: the Loom models' tomb is shared by a Mutex")]
+mod tomb {
+    use std::sync::{Mutex, PoisonError};
+
+    /// In the Loom models, a cell that a free writes ([`Tomb::bury`]) and that each access to
+    /// what it frees reads first ([`Tomb::visit`]): a free not ordered after an access, or an
+    /// access after a free, is a causality violation Loom reports. The `Mutex` makes the cell
+    /// `Sync` with no `unsafe`; it never contends, since Loom runs a model's threads as coroutines
+    /// of one OS thread and a cell access does not yield, and Loom does not model it, so it adds
+    /// no happens-before edge.
+    #[derive(Debug)]
+    pub(super) struct Tomb(Mutex<loom::cell::UnsafeCell<()>>);
+
+    impl Tomb {
+        pub(super) fn new() -> Tomb {
+            Tomb(Mutex::new(loom::cell::UnsafeCell::new(())))
+        }
+
+        pub(super) fn visit(&self) {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).with(|_| ());
+        }
+
+        pub(super) fn bury(&self) {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).with_mut(|_| ());
+        }
+    }
+}
+
+use tomb::Tomb;
+
 // ---- The bridge and the stack --------------------------------------------------------------
 
 /// What another thread may touch of a wake header: atomics only, so `Sync` by its fields alone.
@@ -190,6 +251,7 @@ pub struct WakeBridge {
     stack: AtomicPtr<RemoteStack>,
     /// The executor's thread mark, then [`MARK_CLOSED`] from `close` on.
     mark: AtomicU64,
+    tomb: Tomb,
 }
 
 /// The executor's remote stack: an intrusive lock-free stack of bridges, pushed by any thread and
@@ -205,6 +267,7 @@ pub struct RemoteStack {
     /// The executor's own count, held to its last take, and one per closed header the stack still
     /// keeps; never above the headers alive plus one, which memory bounds.
     counted: AtomicU64,
+    tomb: Tomb,
 }
 
 /// The head the last take leaves: an address no bridge has (a bridge is aligned to 8).
@@ -220,8 +283,10 @@ const _: () = {
 };
 
 // The bridge's lane word, link, stack address and mark; the stack's head, count of foreign
-// operations and count of what keeps it.
+// operations and count of what keeps it. Loom's atomics are larger.
+#[cfg(not(loom))]
 const _: () = assert!(size_of::<WakeBridge>() == 32, "a bridge is four words");
+#[cfg(not(loom))]
 const _: () = assert!(size_of::<RemoteStack>() == 24, "a remote stack is three words");
 
 /// What a foreign `wake_by_ref` did.
@@ -305,6 +370,7 @@ impl WakeBridge {
             link: AtomicPtr::new(ptr::null_mut()),
             stack: AtomicPtr::new(ptr::from_ref(stack).cast_mut()),
             mark: AtomicU64::new(owner.get()),
+            tomb: Tomb::new(),
         }
     }
 
@@ -341,12 +407,14 @@ impl WakeBridge {
     pub fn foreign_wake_by_ref(&self, stack: &RemoteStack) -> Pushed {
         debug_assert!(ptr::eq(stack, self.stack()), "a bridge's calls name its own stack");
         stack.count_foreign();
+        self.tomb.visit();
         let mut word = self.lane.load(Ordering::Relaxed);
         let old = loop {
             let lane = Lane(word);
             if lane.has(CLOSED) {
                 return Pushed::Closed;
             }
+            self.tomb.visit();
             match self.lane.compare_exchange(
                 word,
                 lane.with(WOKEN | QUEUED).0,
@@ -446,9 +514,11 @@ impl WakeBridge {
     /// One compare-and-swap of the lane word to `next(old)`, retried with the word it read when
     /// another thread's swap succeeded first; returns the word it replaced.
     fn swap_lane(&self, ordering: Ordering, next: impl Fn(Lane) -> Lane) -> Lane {
+        self.tomb.visit();
         let mut word = self.lane.load(Ordering::Relaxed);
         loop {
             let new = next(Lane(word));
+            self.tomb.visit();
             match self.lane.compare_exchange(word, new.0, ordering, Ordering::Relaxed) {
                 Ok(old) => return Lane(old),
                 Err(now) => word = now,
@@ -471,6 +541,7 @@ impl WakeBridge {
     }
 
     fn clear(&self) -> Lane {
+        self.tomb.visit();
         Lane(self.lane.fetch_and(!(QUEUED | WOKEN), CLEAR_ORDERING))
     }
 }
@@ -489,6 +560,7 @@ impl RemoteStack {
             head: AtomicPtr::new(ptr::null_mut()),
             foreign_ops: AtomicU64::new(0),
             counted: AtomicU64::new(1),
+            tomb: Tomb::new(),
         }
     }
 
@@ -528,6 +600,7 @@ impl RemoteStack {
 
     /// Releases one count: a freed closed header's, or the executor's own after its last take.
     pub fn release(&self) -> Freed {
+        self.tomb.visit();
         if self.counted.fetch_sub(1, RETAIN_ORDERING) != 1 {
             return Freed::No;
         }
@@ -540,6 +613,7 @@ impl RemoteStack {
     /// keeps the header, and so the stack, allocated (ADR-0003 A1.2.5). `Relaxed`: that place
     /// orders it (ADR-0003 A1.7).
     fn count_foreign(&self) {
+        self.tomb.visit();
         self.foreign_ops.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -547,13 +621,16 @@ impl RemoteStack {
     /// take changed the head first (lock-free).
     fn push(&self, bridge: &WakeBridge) -> Landed {
         let node = ptr::from_ref(bridge).cast_mut();
+        self.tomb.visit();
         let mut head = self.head.load(Ordering::Relaxed);
         loop {
             if head == CLOSED_HEAD {
                 return Landed::Closed;
             }
+            bridge.tomb.visit();
             // Relaxed: the head's release publishes it.
             bridge.link.store(head, Ordering::Relaxed);
+            self.tomb.visit();
             match self.head.compare_exchange(head, node, PUSH_ORDERING, Ordering::Relaxed) {
                 Ok(_) => return Landed::Yes,
                 Err(now) => head = now,
@@ -613,13 +690,14 @@ impl Drained {
     ) -> Lane {
         let bridge = resolve(at);
         debug_assert!(ptr::eq(bridge, at.as_ptr()), "resolve returns the bridge at its address");
+        bridge.tomb.visit();
         // Relaxed: the take's acquire made the push's write visible.
         self.next = bridge.link.load(Ordering::Relaxed);
         bridge.clear()
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     //! The bridge's contract on one thread at a time, its marks, and the bound's fail-stop. The
     //! interleavings are the Loom models' (`loom_tests.rs`).
@@ -779,5 +857,333 @@ mod tests {
         assert_eq!(bridge.foreign_drop(&stack), Released::Kept);
         assert!(!Lane(bridge.lane.load(RELAXED)).has(QUEUED), "the pusher cleared its own Q");
         assert_eq!(bridge.foreign_wake_by_ref(&stack), Pushed::Closed);
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    //! The Loom models of the wake bridge's lane (ADR-0003 A1.7), on this module's own types, every
+    //! interleaving within `just loom`'s preemption bound. A model's executor is the owner thread's
+    //! code; its frees are tombs: a free buries the freed thing's tombs, and every access to a
+    //! bridge or a stack visits its tomb first (`Tomb`), so a free not ordered after an access, or
+    //! an access after a free, is Loom's causality violation. Each model counts its own frees too.
+
+    use loom::sync::Arc;
+    use loom::sync::atomic::AtomicUsize;
+    use loom::thread;
+
+    use super::*;
+
+    const RELAXED: Ordering = Ordering::Relaxed;
+
+    /// A model header: the bridge, the owner part's tomb and the header's frees.
+    struct Header {
+        bridge: WakeBridge,
+        owner_part: Tomb,
+        frees: AtomicUsize,
+    }
+
+    /// A model executor's stack and headers, shared with the model's other threads.
+    #[derive(Clone)]
+    struct Model {
+        stack: Arc<RemoteStack>,
+        headers: Arc<Vec<Header>>,
+        /// The stack's frees, and the header frees counted when the stack was freed.
+        stack_frees: Arc<AtomicUsize>,
+        headers_freed_before_the_stack: Arc<AtomicUsize>,
+    }
+
+    impl Model {
+        fn new(headers: usize) -> Model {
+            let stack = Arc::new(RemoteStack::new());
+            let mark = ThreadMark::claim();
+            let headers = (0..headers)
+                .map(|_| Header {
+                    bridge: WakeBridge::new(&stack, mark),
+                    owner_part: Tomb::new(),
+                    frees: AtomicUsize::new(0),
+                })
+                .collect();
+            Model {
+                stack,
+                headers: Arc::new(headers),
+                stack_frees: Arc::new(AtomicUsize::new(0)),
+                headers_freed_before_the_stack: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn bridge(&self, index: usize) -> &WakeBridge {
+            &self.headers[index].bridge
+        }
+
+        /// The header whose bridge is at `at`; a link to anything else is a stale link.
+        fn index(&self, at: NonNull<WakeBridge>) -> usize {
+            self.headers
+                .iter()
+                .position(|header| ptr::eq(&header.bridge, at.as_ptr()))
+                .expect("drained-once: a link names no bridge of the model")
+        }
+
+        fn resolve(&self, at: NonNull<WakeBridge>) -> &WakeBridge {
+            self.bridge(self.index(at))
+        }
+
+        /// Frees header `index`: both parts.
+        fn free_header(&self, index: usize) {
+            let header = &self.headers[index];
+            header.bridge.tomb.bury();
+            header.owner_part.bury();
+            header.frees.fetch_add(1, RELAXED);
+        }
+
+        /// Frees closed header `index`, then releases the stack's count of it.
+        fn free_closed(&self, index: usize) {
+            self.free_header(index);
+            self.release_stack();
+        }
+
+        fn release_stack(&self) {
+            match self.stack.release() {
+                Freed::No => {}
+                Freed::Stack => {
+                    self.stack.tomb.bury();
+                    self.stack_frees.fetch_add(1, RELAXED);
+                    let freed = self.headers.iter().map(|header| header.frees.load(RELAXED)).sum();
+                    self.headers_freed_before_the_stack.store(freed, RELAXED);
+                }
+            }
+        }
+
+        /// One live drain: each taken bridge settled once, at most one entry per header (`Q`). Adds
+        /// each header's settles to `drained` and returns the wakes delivered. The executor gates
+        /// its take with `pending`, whose relaxed load only defers a drain; the model takes every
+        /// time, since Loom explores no schedule in which that load reads a push.
+        fn drain(&self, drained: &mut [u32]) -> u32 {
+            let mut taken = self.stack.take();
+            let mut seen = vec![false; self.headers.len()];
+            let mut woken = 0;
+            while let Some((at, delivery)) = taken.deliver_next(|at| self.resolve(at)) {
+                let index = self.index(at);
+                assert!(
+                    !seen[index],
+                    "drained-once: bridge {index} twice in one take (a stale link)"
+                );
+                seen[index] = true;
+                drained[index] += 1;
+                match delivery {
+                    Delivery::Wake => woken += 1,
+                    Delivery::NoWake => {}
+                }
+            }
+            woken
+        }
+
+        /// The executor's drop from its close on: every header not yet freed is counted on the
+        /// stack, its owner part dropped in place and closed (`owner` holds each one's `o`), then
+        /// the last take, then the executor's own count.
+        fn close_and_take_last(&self, owner: &[i64], freed: &[bool]) {
+            for (index, header) in self.headers.iter().enumerate() {
+                if freed[index] {
+                    continue;
+                }
+                self.stack.retain();
+                header.owner_part.bury();
+                match header.bridge.close(owner[index]) {
+                    Closing::Free => self.free_closed(index),
+                    Closing::Retain => {}
+                }
+            }
+            let mut last = self.stack.take_last();
+            while let Some((at, settled)) = last.settle_next(|at| self.resolve(at)) {
+                match settled {
+                    Settled::Last => self.free_closed(self.index(at)),
+                    Settled::Kept => {}
+                }
+            }
+            self.release_stack();
+        }
+
+        /// A foreign thread's drop of its waker of header `index`, freeing it if it was the last.
+        fn foreign_drop(&self, index: usize) -> Released {
+            let released = self.bridge(index).foreign_drop(&self.stack);
+            match released {
+                Released::Last => self.free_closed(index),
+                Released::Queued | Released::Kept => {}
+            }
+            released
+        }
+
+        /// After every thread is joined: each header freed once, then the stack once, after them.
+        fn assert_freed_once(&self) {
+            for (index, header) in self.headers.iter().enumerate() {
+                assert_eq!(header.frees.load(RELAXED), 1, "header {index} freed once");
+            }
+            assert_eq!(self.stack_frees.load(RELAXED), 1, "the stack freed once");
+            assert_eq!(
+                self.headers_freed_before_the_stack.load(RELAXED),
+                self.headers.len(),
+                "the stack freed after every header it counts"
+            );
+        }
+    }
+
+    /// Two foreign wakes of one header against a drain: never two entries in one take, and the
+    /// wake delivered at least once. A wake that sets `W` without `Q` pushes nothing and is lost.
+    #[test]
+    fn loom_two_foreign_wakes_against_a_drain_are_delivered_once() {
+        loom::model(|| {
+            let model = Model::new(1);
+            let wakers: Vec<_> = (0..2)
+                .map(|_| {
+                    let model = model.clone();
+                    thread::spawn(move || model.bridge(0).foreign_wake_by_ref(&model.stack))
+                })
+                .collect();
+            let mut drained = [0];
+            let mut woken = model.drain(&mut drained);
+            for waker in wakers {
+                let _ = waker.join().expect("a waking thread");
+            }
+            woken += model.drain(&mut drained);
+            assert!(
+                woken >= 1,
+                "delivered-at-least-once: two foreign wakes were delivered {woken} times"
+            );
+            assert!(!model.stack.pending(), "the drains left nothing queued");
+            assert!(model.bridge(0).quiet(0), "nothing counted, nothing queued");
+        });
+    }
+
+    /// A foreign `wake_by_ref`, which pushes, then the thread's last drop of the waker the
+    /// owner lane counted (`o = 1`), which finds `Q` set and pushes nothing, against the owner's
+    /// drain and reuse: the owner reuses the header once, and only after the last foreign access.
+    #[test]
+    fn loom_a_foreign_last_drop_never_races_the_owners_reuse() {
+        loom::model(|| {
+            let model = Model::new(1);
+            let foreign = {
+                let model = model.clone();
+                thread::spawn(move || {
+                    let _ = model.bridge(0).foreign_wake_by_ref(&model.stack);
+                    model.bridge(0).foreign_drop(&model.stack)
+                })
+            };
+            let reuse = |model: &Model| {
+                let quiet = model.bridge(0).quiet(1);
+                if quiet {
+                    model.free_header(0);
+                }
+                quiet
+            };
+            let mut drained = [0];
+            model.drain(&mut drained);
+            let mut reused = reuse(&model);
+            let released = foreign.join().expect("the foreign thread");
+            assert_ne!(released, Released::Last, "a live header's drop frees nothing itself");
+            model.drain(&mut drained);
+            if !reused {
+                reused = reuse(&model);
+            }
+            assert!(
+                reused,
+                "the header is quiet once its last waker dropped and its queue drained"
+            );
+            assert_eq!(model.headers[0].frees.load(RELAXED), 1, "reused once");
+        });
+    }
+
+    /// Three pushers, two of one bridge and one of another, against two drains and a final one:
+    /// every bridge drained once per `Q` episode (each push that set `Q`), no stale link.
+    #[test]
+    fn loom_pushes_and_drains_lose_no_bridge() {
+        loom::model(|| {
+            let model = Model::new(2);
+            let pushers: Vec<_> = [0, 0, 1]
+                .into_iter()
+                .map(|index| {
+                    let model = model.clone();
+                    thread::spawn(move || {
+                        (index, model.bridge(index).foreign_wake_by_ref(&model.stack))
+                    })
+                })
+                .collect();
+            let mut drained = [0, 0];
+            model.drain(&mut drained);
+            model.drain(&mut drained);
+            let mut pushed = [0, 0];
+            for pusher in pushers {
+                let (index, outcome) = pusher.join().expect("a pusher");
+                match outcome {
+                    Pushed::Now => pushed[index] += 1,
+                    Pushed::Already | Pushed::Closed => {}
+                }
+            }
+            model.drain(&mut drained);
+            for index in 0..2 {
+                assert_eq!(
+                    drained[index], pushed[index],
+                    "drained-once: bridge {index} was pushed {} times and drained {}",
+                    pushed[index], drained[index]
+                );
+            }
+        });
+    }
+
+    /// The executor's drop (its drain, the close, the last take, their frees and the release of its
+    /// own count) against a foreign thread, spawned first, holding the one waker the owner lane
+    /// counted (`o = 1`) of a finished task's header: its `wake_by_ref`, whose push is decided
+    /// before `X` and lands before or after the last take, then its last drop, before or after `X`.
+    /// The header is freed once, the stack once and after it, and nothing is touched after its
+    /// free.
+    #[test]
+    fn loom_the_executors_drop_never_races_a_foreign_call() {
+        loom::model(|| {
+            let model = Model::new(1);
+            let foreign = {
+                let model = model.clone();
+                thread::spawn(move || {
+                    let _ = model.bridge(0).foreign_wake_by_ref(&model.stack);
+                    let _ = model.foreign_drop(0);
+                })
+            };
+            // The drain: the header is Held (its task finished), so a quiet one is freed now.
+            let mut taken = model.stack.take();
+            let mut freed = [false];
+            while let Some((at, _)) = taken.deliver_next(|at| model.resolve(at)) {
+                let index = model.index(at);
+                if model.bridge(index).quiet(1) {
+                    model.free_header(index);
+                    freed[index] = true;
+                }
+            }
+            model.close_and_take_last(&[1], &freed);
+            foreign.join().expect("the foreign thread");
+            model.assert_freed_once();
+        });
+    }
+
+    /// A header named by two wakers the owner lane counted (`o = 2`), which two threads hold. The
+    /// threads are spawned first; then the owner runs the close and the last take against their
+    /// drops, so no spawn orders the owner part's drop before a free, and each drop lands before
+    /// `X` (it queues the bridge) or after it. The header is freed once, the stack once and after
+    /// it.
+    #[test]
+    fn loom_a_closed_headers_last_drops_free_it_once() {
+        loom::model(|| {
+            let model = Model::new(1);
+            let droppers: Vec<_> = (0..2)
+                .map(|_| {
+                    let model = model.clone();
+                    thread::spawn(move || {
+                        let _ = model.foreign_drop(0);
+                    })
+                })
+                .collect();
+            model.close_and_take_last(&[2], &[false]);
+            for dropper in droppers {
+                dropper.join().expect("a dropping thread");
+            }
+            model.assert_freed_once();
+        });
     }
 }
