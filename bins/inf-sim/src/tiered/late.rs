@@ -4,7 +4,9 @@
 //! reopen, ADR-0063), 9 (the S19 drop race through the wire), 10 and 10b
 //! (reboots after a DROP and a cut inside one, ADR-0100). Each phase is a
 //! straight-line script over [`Late`]; `Err(())` means "finish now" — the
-//! violation is already on the report.
+//! violation is already on the report. The listing-repeat class (ADR-0202
+//! D5) writes its residue between phases 8 and 9 and reads its engagement
+//! after phase 10's reboot.
 
 use super::*;
 
@@ -54,6 +56,7 @@ pub(super) fn run(cx: &mut Late<'_>, node: Node, audit: MiniClient, total_keys: 
     };
     phase_7d(cx, &mut node, &mut audit)?;
     phase_8(cx, &mut node, &mut audit)?;
+    listing_residue(cx, &mut node, &mut audit)?;
     phase_9(cx, &mut node, &mut audit)?;
     phase_10(cx, node)
 }
@@ -712,6 +715,70 @@ fn phase_8(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdic
     Ok(())
 }
 
+/// The listing-repeat class's residue, after phase 8 and before phase 9's
+/// `DROP`: [`LISTING_RESIDUE_EXTENTS_PER_CELL`] fresh keys owned by each
+/// cell, each `SET` to a value at the blob threshold, so each is one extent
+/// file in the namespace's `cold/`, durable before its `+OK` (`always`).
+/// A key's cell is its slot's, so the keys are found, not chosen: one is
+/// written only while its cell has fewer, and the search stops at eight
+/// times the keys the cells need (each cell's share is about one in
+/// `cells`). A refused `SET`, or a cell left short, is a violation.
+fn listing_residue(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
+    if !cx.scenario.listing_repeats {
+        return Ok(());
+    }
+    let cells = cx.scenario.cells;
+    let want = LISTING_RESIDUE_EXTENTS_PER_CELL;
+    let mut owned = vec![0usize; usize::from(cells)];
+    let keys_max = 8 * want * usize::from(cells);
+    for key_index in 0..keys_max {
+        if owned.iter().all(|&count| count >= want) {
+            break;
+        }
+        let key = format!("lr:{key_index}").into_bytes();
+        let cell = support::owner_cell(cells, &key);
+        if owned[cell] >= want {
+            continue;
+        }
+        let value = value_bytes(b'l', key_index, 0, BLOB_THRESHOLD_BYTES);
+        let set: &[&[u8]] = &[b"SET", &key, &value];
+        match audit.call(node, cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {
+                owned[cell] += 1;
+                cx.report.commands_done += 1;
+            }
+            other => {
+                cx.fail(format!("listing residue SET {key_index} answered {other:?}"));
+                return Err(());
+            }
+        }
+    }
+    if owned.iter().any(|&count| count < want) {
+        cx.fail(format!("listing residue: {keys_max} keys filled {owned:?} of {want} a cell"));
+        return Err(());
+    }
+    Ok(())
+}
+
+/// The listing-repeat draw's engagement (ADR-0117 A1.2), read after the
+/// post-drop reboot from the disk's own count: a drawn run whose sweep was
+/// returned no removed name again ran no `Gone` arm, so it is
+/// `listing-repeats-unengaged`, never a green result.
+fn check_listing_repeats(cx: &mut Late<'_>) {
+    if !cx.scenario.listing_repeats {
+        return;
+    }
+    let served = cx.disk.listing_repeats_served();
+    cx.report.listing_repeats_served = served;
+    if served == 0 {
+        cx.fail(
+            "listing-repeats-unengaged: LISTING-REPEAT DRAW VACUOUS: the post-drop reboot's sweep \
+             was returned no removed name again"
+                .to_string(),
+        );
+    }
+}
+
 /// Phase 9: the S19 drop race through the wire.
 fn phase_9(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
     let racer_cell = 0usize;
@@ -867,6 +934,7 @@ fn phase_10(cx: &mut Late<'_>, node: Node) -> Verdict {
     if residue > 0 {
         cx.fail(format!("{residue} tier files survived the drop's boot sweep (ADR-0100 D6)"));
     }
+    check_listing_repeats(cx);
 
     // ---- phase 10b: a power cut inside a second DROP (ADR-0100 D5) -------
     // A fresh tiered namespace with a checkpointed tier section; its DROP

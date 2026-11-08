@@ -69,12 +69,12 @@ use inf_foundation::fault::FaultSpec;
 use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
-use inf_log::fs::sim::SimDisk;
+use inf_log::fs::sim::{SimDisk, SimDiskConfig};
 use inf_server::StallConfig;
 
 use crate::durable::{
     DurableScenario, DurableWorkload, MiniClient, Node, NsClass, OpRec, Pending, STALL_STEPS,
-    TraceObserver, WakeLeg, Writer, admissible_states, boot, build_disk, bulk, encode,
+    TraceObserver, WakeLeg, Writer, admissible_states, boot, build_disk_with, bulk, encode,
     m2_stall_config, required_index,
 };
 use crate::net::Plant;
@@ -208,7 +208,25 @@ pub struct TieredScenario {
     /// acknowledged no aged delete or whose reboot verified none, is
     /// VACUOUS.
     pub replay_above_window: bool,
+    /// The listing-repeat seed class (ADR-0202 D5), seeds ≡ 4 or 13
+    /// (mod 16): the disk returns once more each name removed from a
+    /// listing's last batch (`listing_repeats_removed`), and after phase 8
+    /// each cell writes [`LISTING_RESIDUE_EXTENTS_PER_CELL`] extents to the
+    /// namespace phase 9 drops, so the post-drop reboot's sweep reads its
+    /// `cold/` past one batch and takes each repeat as that name's earlier
+    /// removal. `--listing-repeats` forces it on any seed; a run in it whose
+    /// post-drop reboot served no repeat is `listing-repeats-unengaged`
+    /// (VACUOUS).
+    pub listing_repeats: bool,
 }
+
+/// The listing-repeat class's residue, extents a cell: three listing
+/// batches, derived from the listing's one name bound so it follows that
+/// bound, never a batch size of the simulator's own. A repeat is served
+/// only at the batch after one that answered `More`, so each cell's
+/// post-drop sweep reads three full batches, each followed by a batch of
+/// its repeats.
+const LISTING_RESIDUE_EXTENTS_PER_CELL: usize = 3 * inf_log::limits::LISTING_BATCH_NAMES;
 
 impl TieredScenario {
     #[must_use]
@@ -243,8 +261,24 @@ impl TieredScenario {
             ckpt_direct_refused_after: (seed % 8 == 6).then_some(2),
             tier_read_fault: seed % 8 == 7,
             replay_above_window: false,
+            listing_repeats: false,
         };
-        if matches!(seed % 16, 2 | 11) { scenario.with_replay_above_window() } else { scenario }
+        // Two disjoint seed classes of sixteen: replay above the window (2,
+        // 11) and the listing repeats (4, 13).
+        match seed % 16 {
+            2 | 11 => scenario.with_replay_above_window(),
+            4 | 13 => scenario.with_listing_repeats(),
+            _ => scenario,
+        }
+    }
+
+    /// The listing-repeat class's knob: the disk's repeat mode, and with it
+    /// the late phases' residue. Applied by the seed class and by the
+    /// binary's flag.
+    #[must_use]
+    pub fn with_listing_repeats(mut self) -> TieredScenario {
+        self.listing_repeats = true;
+        self
     }
 
     /// The replay-above-window class's knobs: the interval above any run
@@ -491,6 +525,11 @@ pub struct TieredNodeReport {
     /// record — the pairs whose second read re-resolved onto the promoted
     /// extent reference.
     pub promoted_extent_pairs: u64,
+    /// The listing-repeat draw this seed ran, and the removed names the
+    /// disk returned again by the end of the post-drop reboot: its
+    /// engagement, read from the disk's own count.
+    pub listing_repeats: bool,
+    pub listing_repeats_served: u64,
 }
 
 impl TieredNodeReport {
@@ -511,7 +550,11 @@ impl TieredNodeReport {
 fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNodeReport {
     let harness = scenario.harness();
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
-    let disk = build_disk(scenario.seed, scenario.stall.as_ref());
+    let config = SimDiskConfig {
+        listing_repeats_removed: scenario.listing_repeats,
+        ..SimDiskConfig::default()
+    };
+    let disk = build_disk_with(scenario.seed, scenario.stall.as_ref(), config);
     if let Some(allowed) = scenario.ckpt_direct_refused_after {
         disk.refuse_direct_writes_after(allowed);
     }
@@ -564,6 +607,9 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     if scenario.dir_open_fault {
         inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
     }
+    // The listing-repeat draw, disclosed as the other arms are: the disk
+    // already carries its mode, and the late phases write its residue.
+    report.listing_repeats = scenario.listing_repeats;
     // The shadow arm (M4.5-S37, ADR-0093 D8): a CONFIG key, fanned to
     // every cell like `tiered-promote-on-read`.
     report.shadow_arm = scenario.shadow;

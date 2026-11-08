@@ -866,9 +866,16 @@ fn device_budget_arm(
 /// Builds the scenario's disk: stall-modeled when armed, instant
 /// otherwise. The stall seed derives from the scenario seed (L7).
 pub fn build_disk(seed: u64, stall: Option<&StallConfig>) -> SimDisk {
+    build_disk_with(seed, stall, SimDiskConfig::default())
+}
+
+/// [`build_disk`] over a disk config of the caller's: the one place the
+/// stall seed is mixed, and both arms take `config`, so a mode the caller
+/// asks for reaches the disk with or without a stall model.
+pub fn build_disk_with(seed: u64, stall: Option<&StallConfig>, config: SimDiskConfig) -> SimDisk {
     match stall {
-        Some(cfg) => SimDisk::with_stall(SimDiskConfig::default(), cfg.clone(), seed ^ 0x57A1_1ED0),
-        None => SimDisk::new(),
+        Some(cfg) => SimDisk::with_stall(config, cfg.clone(), seed ^ 0x57A1_1ED0),
+        None => SimDisk::with_config(config),
     }
 }
 
