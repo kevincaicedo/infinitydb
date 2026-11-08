@@ -25,6 +25,14 @@
   containerd) — see [below](#the-io_uring--seccomp-requirement).
 - macOS builds for development and correctness testing (via `kqueue`) but is
   not a performance target and is not recommended for deployment.
+- A **local filesystem** for the data directory that keeps POSIX `readdir`'s
+  rule within one open directory: a name present for the whole of a listing
+  is returned exactly once, even while other names are removed from it. Boot
+  recovery lists a directory a bounded batch at a time and removes names
+  between batches. ext4 and tmpfs are tested; xfs keeps the rule by design.
+  NFS and FUSE mounts are outside it: under concurrent change their directory
+  cookies may repeat or skip a name. No other process may write the data
+  directory.
 
 ## Running with Docker
 
