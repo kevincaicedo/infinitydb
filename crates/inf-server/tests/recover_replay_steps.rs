@@ -2961,6 +2961,13 @@ struct StartSizes {
 /// The start unit at the size the suite runs.
 const START: StartSizes = StartSizes { extents: START_EXTENTS, dropped_names: START_DROPPED_NAMES };
 
+/// The start unit the judge reads at a budget of 1. Each judged step reads
+/// every extent's statistics, O(extents), and a step at 1 runs one unit,
+/// so the hand-over's one seed a step costs O(extents²): at this size the
+/// listing and the sweep still span batches, and the reseal its 1 024
+/// frames.
+const START_AT_ONE: StartSizes = StartSizes { extents: 20_000, dropped_names: 2_000 };
+
 /// [`tiered_keyspace`] with a tombstone for [`DROPPED_NS`]: its directory
 /// is an acked `DROP`'s leftover, the start step's to sweep.
 fn start_keyspace() -> Keyspace {
@@ -3194,7 +3201,8 @@ fn start_unit_of(phase: inf_server::UnitPhase) -> u64 {
 }
 
 /// The start of a boot at the size the suite runs, at a 256 KiB budget under
-/// the step judge (`U` the tier map's largest unit): the tombstoned
+/// the step judge (`U` the tier map's largest unit), and at a budget of 1
+/// over [`START_AT_ONE`]: the tombstoned
 /// namespace's 100 001 names removed, 1 024 manifested files probed, the
 /// unsealed one's 1 024 frames verified and resealed, every handle held, and
 /// 1 005 2xx names of the tiered namespace's `cold/` listed a batch at a
@@ -3207,21 +3215,33 @@ fn start_unit_of(phase: inf_server::UnitPhase) -> u64 {
 /// in one unit (`inf_canary_recover_reseal_whole`).
 #[test]
 fn the_start_of_a_boot_at_size_is_mapped_under_the_step_judge() {
-    const BUDGET: u64 = 256 << 10;
+    for (budget, sizes) in [(256 << 10, START), (1, START_AT_ONE)] {
+        start_mapped_under_the_judge(budget, sizes);
+    }
+}
+
+/// [`the_start_of_a_boot_at_size_is_mapped_under_the_step_judge`] at one
+/// budget and size.
+fn start_mapped_under_the_judge(budget: u64, sizes: StartSizes) {
     let fs = CountingFs::new();
     let cfg = step_cfg();
-    let unit = write_start_unit(&fs, &cfg, START);
+    let unit = write_start_unit(&fs, &cfg, sizes);
     let (over, stats, mut ks, log) =
-        judged_boot_logged(&fs, &cfg, start_keyspace(), BUDGET, &start_unit_of);
+        judged_boot_logged(&fs, &cfg, start_keyspace(), budget, &start_unit_of);
     let stats = stats.expect("the start unit boots");
-    assert!(over.is_empty(), "JUDGE: {} steps over: {:?}", over.len(), &over[..over.len().min(4)]);
+    assert!(
+        over.is_empty(),
+        "JUDGE at {budget}: {} steps over: {:?}",
+        over.len(),
+        &over[..over.len().min(4)]
+    );
     let mapping: Vec<&StepUnits> =
         log.iter().filter(|s| s.phase == inf_server::UnitPhase::TierMap).collect();
     let most_reads = mapping.iter().map(|s| s.tier_reads).max().unwrap_or(0);
     let most_names = mapping.iter().map(|s| s.listed_names).max().unwrap_or(0);
     let listing = mapping.iter().filter(|s| s.listed_names > 0).count();
     eprintln!(
-        "the start unit at {BUDGET}: {} steps, {} of them the tier map's, at most {most_reads} \
+        "the start unit at {budget}: {} steps, {} of them the tier map's, at most {most_reads} \
          tier reads and {most_names} listed names in one, {listing} steps listing; {} \
          dead-life files removed, {} dropped names swept",
         log.len(),
@@ -3230,9 +3250,9 @@ fn the_start_of_a_boot_at_size_is_mapped_under_the_step_judge() {
         stats.dropped_files_swept
     );
     assert!(
-        most_reads < START_UNSEALED_FRAMES && listing > 1 && most_names < START.extents,
-        "VACUOUS: {} tier-map steps, at most {most_reads} tier reads and {most_names} listed \
-         names in one, {listing} steps listing",
+        most_reads < START_UNSEALED_FRAMES && listing > 1 && most_names < sizes.extents,
+        "VACUOUS at {budget}: {} tier-map steps, at most {most_reads} tier reads and \
+         {most_names} listed names in one, {listing} steps listing",
         mapping.len()
     );
     let table = ks.tiered_store_mut(TIER_NS).expect("the tiered table");
