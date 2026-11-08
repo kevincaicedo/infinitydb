@@ -227,9 +227,6 @@ fn the_sixty_fifth_tiered_create_is_refused_at_the_limit() {
 /// is read without timing by `inf-server`'s `node_e2e`
 /// `an_origin_refused_create_leaves_no_meta_naming_it_once_answered`.
 #[test]
-#[ignore = "a tiered CREATE its origin's store refuses after the catalog swap is answered while \
-            META still names the namespace, so a boot after a cut serves it; red until such a \
-            refusal withdraws the definition durably before its error is answered"]
 fn a_tiered_create_refused_after_its_catalog_swap_is_not_served_after_a_cut() {
     const NOT_FOUND: &str = "-ERR namespace 'refused' not found\r\n";
     let create = |name: &'static [u8]| -> [&'static [u8]; 7] {
