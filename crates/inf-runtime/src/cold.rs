@@ -1601,4 +1601,159 @@ mod tests {
             Poll::Pending => panic!("value was parked; first poll must be Ready"),
         }
     }
+
+    /// Counts the wakes its tasks receive: the delivery oracle reads this
+    /// waker, never the host's counters.
+    #[derive(Default)]
+    struct WakeCount(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for WakeCount {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// One device read of `members` identical requests, each polled to
+    /// `Pending` under a counting waker, then its one receipt: returns the
+    /// wakes that receipt made. Every value is then polled, read as the
+    /// receipt's error and dropped, and custody reconciles.
+    fn wakes_of_one_receipt(members: usize) -> usize {
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+        let config =
+            ColdReadConfig { qd_cap: 1, overflow_cap: members, ..ColdReadConfig::default() };
+        let cold = shaped(1, config);
+        let file = TierFileId::new(77);
+        let count = std::sync::Arc::new(WakeCount::default());
+        let waker = Waker::from(std::sync::Arc::clone(&count));
+        let mut cx = Context::from_waker(&waker);
+        let mut waits: Vec<ColdWait> = (0..members).map(|_| ask(&cold, 99, file, 0, 8)).collect();
+        for wait in &mut waits {
+            assert!(core::pin::Pin::new(wait).poll(&mut cx).is_pending(), "nothing delivered yet");
+        }
+        let ops = drain_ops(&cold);
+        assert_eq!(ops.len(), 1, "the {members} identical requests merge into one device read");
+        let IoOp::TierRead { token, .. } = ops[0] else { panic!("drain builds TierRead") };
+        let result = CompletionResult::Error { errno: libc::EIO, buf: None };
+        let delivered = cold.on_completion(token, result, 1);
+        let wakes = count.0.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(delivered as usize, members, "engagement: every member was delivered");
+        for mut wait in waits {
+            let Poll::Ready(done) = core::pin::Pin::new(&mut wait).poll(&mut cx) else {
+                panic!("a delivered member is ready");
+            };
+            assert_eq!(done.outcome(), Err(libc::EIO), "each member carries the receipt's error");
+        }
+        drop(ops);
+        assert_eq!(cold.reconcile(), Ok(()), "every value dropped: custody is back");
+        wakes
+    }
+
+    /// A turn delivers at most 64 members (`COLD_DELIVERIES_PER_TURN`,
+    /// ADR-0181 R1) and a device receipt delivers none: it marks its window
+    /// ready for the turn's delivery. Here 65 identical requests merge into
+    /// one device read whose one receipt is routed. The oracle is the
+    /// waker's count, independent of the host; the one-member read engages
+    /// it, one receipt and one wake.
+    #[test]
+    #[ignore = "one device receipt builds and delivers its whole cohort before it returns, so a \
+                65-member read wakes 65 tasks in one call; red until a receipt delivers no member \
+                and a turn delivers at most 64"]
+    fn one_receipt_delivers_at_most_a_turns_allowance() {
+        const DELIVERIES_PER_TURN: usize = 64;
+        assert_eq!(wakes_of_one_receipt(1), 1, "engagement: one member, one wake");
+        let members = DELIVERIES_PER_TURN + 1;
+        let wakes = wakes_of_one_receipt(members);
+        assert!(
+            wakes <= DELIVERIES_PER_TURN,
+            "one receipt of a {members}-member read woke {wakes} tasks in one call; a turn \
+             delivers at most {DELIVERIES_PER_TURN}"
+        );
+    }
+
+    /// A drain call's preparation is bounded: it spends at most 64 work
+    /// units (`COLD_PREPARATION_WORK_PER_TURN`, ADR-0181 R3), a seed's head
+    /// inspection and finish cost 3, so a call issues at most 21 reads when
+    /// no request can join another; and a seed inspects only the requests
+    /// queued in its own and its two neighbouring buckets of its file. The
+    /// fixture: 64 live requests on 64 files, which the device cap and the
+    /// pool admit whole, then a 65th on a 65th file, cancelled, at the tail.
+    /// One call at HEAD issues all 64, its seeds visiting 63 + 62 + … + 0 =
+    /// 2,016 candidates, and its first seed's scan reaches the tail and
+    /// purges the cancelled request, on a file no seed can join.
+    #[test]
+    #[ignore = "a drain call issues to the device cap and each seed rescans every queued request \
+                of its class, so one call's work grows with the queue; red until a call spends at \
+                most 64 work units and a seed inspects only requests in its own buckets"]
+    fn a_drain_call_spends_a_bounded_preparation_allowance() {
+        const QD: usize = 64;
+        const ISSUES_PER_CALL_MAX: usize = 21;
+        const STRIDE: u64 = 16;
+        let config =
+            ColdReadConfig { qd_cap: QD, overflow_cap: 4 * QD, ..ColdReadConfig::default() };
+        let cold = shaped(QD, config);
+        let file = |rank: u64| TierFileId::new(u32::try_from(rank + 1).expect("fixture rank"));
+        let ranks = u64::try_from(QD).expect("fixture depth");
+        let live: Vec<ColdWait> =
+            (0..ranks).map(|rank| ask(&cold, 3, file(rank), rank * STRIDE, 8)).collect();
+        drop(ask(&cold, 3, file(ranks), ranks * STRIDE, 8));
+        let ops = drain_ops(&cold);
+        for (rank, op) in (0u64..).zip(&ops) {
+            let IoOp::TierRead { offset, buf, .. } = op else { panic!("drain builds TierRead") };
+            assert_eq!(offset.bytes(), rank * STRIDE, "engagement: FIFO admission order");
+            assert_eq!(buf.len(), 8, "engagement: an unmerged window");
+        }
+        let purged = cold.counters().cancelled_queued;
+        assert!(
+            ops.len() <= ISSUES_PER_CALL_MAX,
+            "one drain call issued {} reads over {QD} requests no seed can join, and a seed's \
+             scan reached the cancelled request at the tail ({purged} purged); a call spends at \
+             most 64 work units, 3 a seed",
+            ops.len()
+        );
+        assert_eq!(purged, 0, "a seed's scan reached a request on another file");
+        drop((live, ops));
+    }
+
+    /// The read counter never repeats a live identity. A token packs a
+    /// lifetime counter into 56 bits, so the mint after 2^56 − 1 carries id
+    /// 0's bits. The first read, id 0, stays queued; the counter is set to
+    /// its last value, which a second read takes; the third must be refused
+    /// for good with nothing changed, or carry a fresh identity, and the two
+    /// admitted reads still issue. HEAD mints id 0's token again, and the
+    /// gate's duplicate-key assert ends the cell.
+    #[test]
+    #[ignore = "the read counter packs 56 bits with no exhaustion test, so the mint after 2^56 - 1 \
+                repeats the first token and a live first read ends the cell at the gate's \
+                duplicate-key assert; red until the issuer refuses for good, changing nothing, \
+                before it repeats an identity"]
+    fn the_read_counter_never_repeats_a_live_identity() {
+        let cold = path(2);
+        let file = TierFileId::new(21);
+        let first = ask(&cold, 3, file, 0, 64);
+        cold.state.borrow_mut().next_read = (1 << 56) - 1;
+        let last = ask(&cold, 3, file, FRAME, 64);
+        let before = footprint(&cold, file);
+        match cold.enqueue(3, file, 2 * FRAME, 64, ReadClass::Foreground, 0) {
+            Ok(next) => {
+                let state = cold.state.borrow();
+                let live: std::collections::BTreeSet<u64> =
+                    state.pending[0].iter().map(|intent| intent.token.as_u64()).collect();
+                assert_eq!(live.len(), 3, "three live requests carry three identities");
+                drop(state);
+                drop(next);
+            }
+            Err(refused) => {
+                assert_ne!(refused, ColdRefused::QueueFull, "exhaustion is permanent, not a wait");
+                assert_eq!(footprint(&cold, file), before, "a refusal changes nothing");
+            }
+        }
+        let ops = drain_ops(&cold);
+        assert_eq!(ops.len(), 2, "the admitted reads issue after the refusal");
+        drop((first, last, ops));
+    }
 }
