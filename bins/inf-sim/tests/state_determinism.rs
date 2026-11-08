@@ -1,7 +1,9 @@
 use std::process::Command;
 
+/// A single run under the flag runs the twin and prints its one agreement
+/// line, which names both hashes.
 #[test]
-fn cli_verifies_and_reports_the_second_state_hash() {
+fn a_single_run_under_the_flag_prints_the_twin_agreement_line() {
     let output = Command::new(env!("CARGO_BIN_EXE_inf-sim"))
         .args([
             "--scenario",
@@ -16,8 +18,11 @@ fn cli_verifies_and_reports_the_second_state_hash() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("state_hash="), "state omitted: {stdout}");
-    assert!(stdout.contains("state hash identical"), "state not verified: {stdout}");
+    assert!(
+        stdout.contains("inf-sim: determinism: agreed (state_hash=0x"),
+        "no agreement line: {stdout}"
+    );
+    assert!(stdout.contains(", trace_hash=0x"), "the trace hash is not named: {stdout}");
 }
 
 #[test]

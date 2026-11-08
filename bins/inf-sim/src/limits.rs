@@ -13,3 +13,10 @@ pub const VIOLATION_TEXT_BYTES_MAX: usize = 2_048;
 /// later entry is printed only as the first of its check, and one line
 /// counts the rest by check. The run's list keeps every entry.
 pub const VIOLATIONS_PRINTED_FIRST: usize = 5;
+
+/// Bytes of one report's readings, the values beyond its hashes and its
+/// verdict that a twin compares. Owner: the twin, whose const assertion
+/// holds every report's readings type to it, so a sweep holds one run, two
+/// hashes, a verdict and these bytes at a time. Crossing: none — a larger
+/// readings type does not build.
+pub const READINGS_BYTES_MAX: usize = 64;

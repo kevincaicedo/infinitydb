@@ -15,6 +15,7 @@
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
 )]
 
+use inf_sim::driver::{self, Exit, Verify};
 use inf_sim::net::Plant;
 use inf_sim::{
     CombinedScenario, DurableScenario, EpochMarksLeg, ExtentWindowLeg, LedgerWedgeLeg, Scenario,
@@ -224,6 +225,7 @@ fn main() {
         eprintln!("inf-sim: --park-at-once is m2-fill-tick's and m2-group-hold's");
         std::process::exit(2);
     }
+    let determinism = if verify { Verify::Twin } else { Verify::Off };
     // The two flags each force one of m4-recovery's seed classes, which a
     // seed runs one of: together they are refused, never one dropped.
     let forced_class = match (replay_above_window, spec_variant) {
@@ -281,8 +283,7 @@ fn main() {
             std::process::exit(2);
         }
         ("m4-extent-window", Some(leg)) => {
-            run_extent_window(seed, leg, verify);
-            return;
+            std::process::exit(run_extent_window(seed, leg, determinism).code());
         }
         (_, None) => {}
         (other, Some(_)) => {
@@ -340,187 +341,106 @@ fn main() {
     // The M4-S04 steel-thread scenario (tiered lifecycle + cold reads
     // through suspension + the S06 crash/replay content oracle).
     if scenario_name == "m4-steel" {
-        let scenario = inf_sim::SteelScenario::m4_steel(seed);
-        let report = inf_sim::run_steel_scenario(&scenario);
-        println!(
-            "inf-sim: scenario m4-steel seed {seed:#x}: {} cold reads, {} promotions, \
-             hash {:#018x}",
-            report.cold_reads, report.promotions, report.trace_hash
-        );
-        if verify {
-            let second = inf_sim::run_steel_scenario(&scenario);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+        let run_one = |seed| inf_sim::run_steel_scenario(&inf_sim::SteelScenario::m4_steel(seed));
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: scenario m4-steel seed {seed:#x}: {} cold reads, {} promotions, \
+                 hash {:#018x}",
+                report.cold_reads, report.promotions, report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            assert_eq!(
-                report.trace_hash, second.trace_hash,
-                "m4-steel determinism: second run diverged"
-            );
-            println!("inf-sim: determinism verified — second run hash-identical");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
     // The M4.5-S05 backfill scenario (crash at every backfill phase;
     // ready only with oracle-verified contents — ADR-0077).
     if scenario_name == "m45-backfill" {
-        let scenario = inf_sim::BackfillScenario::m45_backfill(seed);
-        let report = inf_sim::run_backfill_scenario(&scenario);
-        println!(
-            "inf-sim: scenario m45-backfill seed {seed:#x}: {} boots, cuts {:?}, \
-             {} ready checks, {} refused bindings, {} raced mutations, {} steps, \
-             hash {:#018x}",
-            report.boots,
-            report.cuts,
-            report.ready_checks,
-            report.refused_bindings,
-            report.raced_mutations,
-            report.scheduler_steps,
-            report.trace_hash
-        );
-        print_census(report.cap_rows_checked, report.cap_rows_crossed);
-        if verify {
-            let second = inf_sim::run_backfill_scenario(&scenario);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+        let run_one =
+            |seed| inf_sim::run_backfill_scenario(&inf_sim::BackfillScenario::m45_backfill(seed));
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: scenario m45-backfill seed {seed:#x}: {} boots, cuts {:?}, \
+                 {} ready checks, {} refused bindings, {} raced mutations, {} steps, \
+                 hash {:#018x}",
+                report.boots,
+                report.cuts,
+                report.ready_checks,
+                report.refused_bindings,
+                report.raced_mutations,
+                report.scheduler_steps,
+                report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            assert_eq!(
-                report.trace_hash, second.trace_hash,
-                "m45-backfill determinism: second run diverged"
-            );
-            println!("inf-sim: determinism verified — second run hash-identical");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            print_census(report.cap_rows_checked, report.cap_rows_crossed);
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
     // The M4.5-S06 sidecar scenario (checkpoint under mutation storm,
     // cut, boot with sidecar load + tail catch-up ⇒ oracle green;
     // mid-write cut ⇒ rebuild — ADR-0078).
     if scenario_name == "m45-sidecar" {
-        let scenario = inf_sim::SidecarScenario::m45_sidecar(seed);
-        let report = inf_sim::run_sidecar_scenario(&scenario);
-        println!(
-            "inf-sim: scenario m45-sidecar seed {seed:#x}: {} boots, cuts {:?}, \
-             {} loaded, {} storm-during-stream, {} ready checks, {} refused bindings, \
-             {} degraded-tail rebuilds, {} steps, hash {:#018x}",
-            report.boots,
-            report.cuts,
-            report.loaded,
-            report.storm_during_stream,
-            report.ready_checks,
-            report.refused_bindings,
-            report.degraded_rebuilds,
-            report.scheduler_steps,
-            report.trace_hash
-        );
-        print_census(report.cap_rows_checked, report.cap_rows_crossed);
-        if verify {
-            let second = inf_sim::run_sidecar_scenario(&scenario);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+        let run_one =
+            |seed| inf_sim::run_sidecar_scenario(&inf_sim::SidecarScenario::m45_sidecar(seed));
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: scenario m45-sidecar seed {seed:#x}: {} boots, cuts {:?}, \
+                 {} loaded, {} storm-during-stream, {} ready checks, {} refused bindings, \
+                 {} degraded-tail rebuilds, {} steps, hash {:#018x}",
+                report.boots,
+                report.cuts,
+                report.loaded,
+                report.storm_during_stream,
+                report.ready_checks,
+                report.refused_bindings,
+                report.degraded_rebuilds,
+                report.scheduler_steps,
+                report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            assert_eq!(
-                report.trace_hash, second.trace_hash,
-                "m45-sidecar determinism: second run diverged"
-            );
-            println!("inf-sim: determinism verified — second run hash-identical");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            print_census(report.cap_rows_checked, report.cap_rows_crossed);
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
     // The M4-S21 disk-budget admission scenario (typed DISKFULL, refusal
     // purity, the compaction reserve, automatic recovery — ADR-0063).
     if scenario_name == "m4-diskfull" {
-        let scenario = inf_sim::DiskfullScenario::m4_diskfull(seed);
-        let report = inf_sim::run_diskfull_scenario(&scenario);
-        println!(
-            "inf-sim: scenario m4-diskfull seed {seed:#x}: {} refusals, {} reopens, \
-             {} B relocated, {} files retired, peak disk {} B, {} keys verified, hash {:#018x}",
-            report.refusals,
-            report.reopens,
-            report.relocated_bytes,
-            report.retired_files,
-            report.peak_disk_used,
-            report.keys_verified,
-            report.trace_hash
-        );
-        if verify {
-            let second = inf_sim::run_diskfull_scenario(&scenario);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+        let run_one =
+            |seed| inf_sim::run_diskfull_scenario(&inf_sim::DiskfullScenario::m4_diskfull(seed));
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: scenario m4-diskfull seed {seed:#x}: {} refusals, {} reopens, \
+                 {} B relocated, {} files retired, peak disk {} B, {} keys verified, hash {:#018x}",
+                report.refusals,
+                report.reopens,
+                report.relocated_bytes,
+                report.retired_files,
+                report.peak_disk_used,
+                report.keys_verified,
+                report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            assert_eq!(
-                report.trace_hash, second.trace_hash,
-                "m4-diskfull determinism: second run diverged"
-            );
-            println!("inf-sim: determinism verified — second run hash-identical");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
     // The M4-S07 throttled-device backpressure scenario (budget bound,
     // typed stall timeouts, deadlock freedom — ADR-0053).
     if scenario_name == "m4-pressure" {
-        let scenario = inf_sim::PressureScenario::m4_pressure(seed);
-        let report = inf_sim::run_pressure_scenario(&scenario);
-        println!(
-            "inf-sim: scenario m4-pressure seed {seed:#x}: {} stalls (p50 {} µs, p99 {} µs), \
-             {} timeouts, peak committed {} B, hash {:#018x}",
-            report.stalls,
-            report.stall_p50_ns / 1_000,
-            report.stall_p99_ns / 1_000,
-            report.stall_timeouts,
-            report.peak_committed_bytes,
-            report.trace_hash
-        );
-        if verify {
-            let second = inf_sim::run_pressure_scenario(&scenario);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+        let run_one =
+            |seed| inf_sim::run_pressure_scenario(&inf_sim::PressureScenario::m4_pressure(seed));
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: scenario m4-pressure seed {seed:#x}: {} stalls (p50 {} µs, p99 {} µs), \
+                 {} timeouts, peak committed {} B, hash {:#018x}",
+                report.stalls,
+                report.stall_p50_ns / 1_000,
+                report.stall_p99_ns / 1_000,
+                report.stall_timeouts,
+                report.peak_committed_bytes,
+                report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            assert_eq!(
-                report.trace_hash, second.trace_hash,
-                "m4-pressure determinism: second run diverged"
-            );
-            println!("inf-sim: determinism verified — second run hash-identical");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
     // The M4-S08 cold-read storm (placement, relocation races, chunked
     // staging, cancellation, pin-deferred unlinks).
@@ -712,101 +632,89 @@ fn main() {
             }
             std::process::exit(if violations > 0 { 1 } else { 0 });
         }
-        let report = run_one(seed);
-        println!(
-            "inf-sim: m4-recovery seed {seed:#x}: {} lives, {} refs, {} images, {} tail \
-             records, {} cut-before-publish, {} flush-lag, {} keys audited, {} live-set \
-             entries, {} relocations, {} retired, {} unlinked, {} left-to-boot-gc, \
-             {} blobs, {} orphans-planted, {} blob-reclaims, shadow {} opened / {} open at a \
-             cut / {} re-formed / {} same-key / {} collision, {} collide-ops, {} settled-at-boot, \
-             {} drain-checks, {} multi-ticket winners / {} DELs, {} twin-origin rows / {} \
-             origins covered, {} held rows / {} re-formed / {} not restored, {} lives above the \
-             window (largest unit {} windows), boots {} demoting / {} fitting checked, boot \
-             replay {} demote steps / {} tier bytes / {} settle reads / {} same-key / {} \
-             deletes verified / {} markers skipped, {} writer parks ({} past a walk, {} held \
-             released), {} boot files censused, two-crash rows {} opened / {} settled / {} \
-             refs removed by a marker ({} skipped: unit past the raised window), spec \
-             variant {:?}: {} pads placed, {} long records written ({} written short), boot \
-             files censused {} (capacity {} / gap {} / shutdown {} seals), {} page pads \
-             crossed, against a summed bound of {} (closest boot: {}), trace {:#x}",
-            report.lives,
-            report.refs_emitted,
-            report.images_emitted,
-            report.tail_records,
-            report.cut_before_publish,
-            report.flush_lag_lives,
-            report.keys_audited,
-            report.live_entries_emitted,
-            report.relocations,
-            report.files_retired,
-            report.files_unlinked,
-            report.unlinks_left_to_boot_gc,
-            report.blobs_written,
-            report.blob_orphans_planted,
-            report.blob_extents_reclaimed,
-            report.shadow_opened,
-            report.shadow_open_at_cut,
-            report.shadow_reformed,
-            report.shadow_same_key,
-            report.shadow_collision,
-            report.shadow_collide_ops,
-            report.shadow_settled_at_boot,
-            report.shadow_drain_checks,
-            report.shadow_multi_ticket_winners,
-            report.shadow_multi_ticket_dels,
-            report.shadow_twin_origin_rows,
-            report.shadow_twin_origins_covered,
-            report.shadow_held_rows,
-            report.shadow_held_reformed,
-            report.shadow_held_not_restored,
-            report.replay_above_window_lives,
-            report.replay_unit_windows_max,
-            report.demoting_boots,
-            report.fitting_boots_checked,
-            report.boot_replay.demote_steps,
-            report.boot_replay.tier_bytes,
-            report.boot_replay.settle_reads,
-            report.boot_replay.settled_same_key,
-            report.boot_replay.deletes_verified,
-            report.boot_replay.markers_skipped,
-            report.writer_parks,
-            report.writes_parked_past_a_walk,
-            report.held_released_by_park,
-            report.boot_files_censused,
-            report.two_crash_rows_opened,
-            report.two_crash_rows_settled,
-            report.two_crash_markers_removed,
-            report.two_crash_unit_past_window,
-            report.spec_variant,
-            report.boot_replay.pads_placed,
-            report.long_records_written,
-            report.long_records_shortened,
-            report.seal_census.files,
-            report.seal_census.capacity_seals,
-            report.seal_census.gap_seals,
-            report.seal_census.shutdown_seals,
-            report.seal_census.page_pads,
-            report.seal_census.bound,
-            closest_boot(report.seal_census.closest),
-            report.trace_hash
-        );
-        if verify {
-            let twin = run_one(seed);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (twin.trace_hash, twin.state_hash),
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: m4-recovery seed {seed:#x}: {} lives, {} refs, {} images, {} tail \
+                 records, {} cut-before-publish, {} flush-lag, {} keys audited, {} live-set \
+                 entries, {} relocations, {} retired, {} unlinked, {} left-to-boot-gc, \
+                 {} blobs, {} orphans-planted, {} blob-reclaims, shadow {} opened / {} open at a \
+                 cut / {} re-formed / {} same-key / {} collision, {} collide-ops, {} \
+                 settled-at-boot, \
+                 {} drain-checks, {} multi-ticket winners / {} DELs, {} twin-origin rows / {} \
+                 origins covered, {} held rows / {} re-formed / {} not restored, {} lives above \
+                 the \
+                 window (largest unit {} windows), boots {} demoting / {} fitting checked, boot \
+                 replay {} demote steps / {} tier bytes / {} settle reads / {} same-key / {} \
+                 deletes verified / {} markers skipped, {} writer parks ({} past a walk, {} held \
+                 released), {} boot files censused, two-crash rows {} opened / {} settled / {} \
+                 refs removed by a marker ({} skipped: unit past the raised window), spec \
+                 variant {:?}: {} pads placed, {} long records written ({} written short), boot \
+                 files censused {} (capacity {} / gap {} / shutdown {} seals), {} page pads \
+                 crossed, against a summed bound of {} (closest boot: {}), trace {:#x}",
+                report.lives,
+                report.refs_emitted,
+                report.images_emitted,
+                report.tail_records,
+                report.cut_before_publish,
+                report.flush_lag_lives,
+                report.keys_audited,
+                report.live_entries_emitted,
+                report.relocations,
+                report.files_retired,
+                report.files_unlinked,
+                report.unlinks_left_to_boot_gc,
+                report.blobs_written,
+                report.blob_orphans_planted,
+                report.blob_extents_reclaimed,
+                report.shadow_opened,
+                report.shadow_open_at_cut,
+                report.shadow_reformed,
+                report.shadow_same_key,
+                report.shadow_collision,
+                report.shadow_collide_ops,
+                report.shadow_settled_at_boot,
+                report.shadow_drain_checks,
+                report.shadow_multi_ticket_winners,
+                report.shadow_multi_ticket_dels,
+                report.shadow_twin_origin_rows,
+                report.shadow_twin_origins_covered,
+                report.shadow_held_rows,
+                report.shadow_held_reformed,
+                report.shadow_held_not_restored,
+                report.replay_above_window_lives,
+                report.replay_unit_windows_max,
+                report.demoting_boots,
+                report.fitting_boots_checked,
+                report.boot_replay.demote_steps,
+                report.boot_replay.tier_bytes,
+                report.boot_replay.settle_reads,
+                report.boot_replay.settled_same_key,
+                report.boot_replay.deletes_verified,
+                report.boot_replay.markers_skipped,
+                report.writer_parks,
+                report.writes_parked_past_a_walk,
+                report.held_released_by_park,
+                report.boot_files_censused,
+                report.two_crash_rows_opened,
+                report.two_crash_rows_settled,
+                report.two_crash_markers_removed,
+                report.two_crash_unit_past_window,
+                report.spec_variant,
+                report.boot_replay.pads_placed,
+                report.long_records_written,
+                report.long_records_shortened,
+                report.seal_census.files,
+                report.seal_census.capacity_seals,
+                report.seal_census.gap_seals,
+                report.seal_census.shutdown_seals,
+                report.seal_census.page_pads,
+                report.seal_census.bound,
+                closest_boot(report.seal_census.closest),
+                report.trace_hash
             );
-            assert!(twin.ok(), "second run failed its oracles");
-            assert_eq!(report.trace_hash, twin.trace_hash, "determinism violated (L7)");
-            println!("inf-sim: determinism verified (two runs, identical traces)");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
 
     // The M4-S26 command-driven tiered node (RESP over the sim net
@@ -1057,118 +965,103 @@ fn main() {
             }
             std::process::exit(if violations > 0 { 1 } else { 0 });
         }
-        let mut report = run_one(seed);
-        // The forced arm is a positive control: it must fire on this seed.
-        if plant == Plant::TierReadEio && report.tier_read_faults_fired == 0 {
-            report.violations.push(format!(
-                "TIER-READ FAULT ARM VACUOUS seed {seed:#x}: --plant tier-read-eio forced the \
-                 arm and the audit consumed no fault (pick a seed whose flush confirmed before \
-                 the cut)"
-            ));
-        }
-        println!(
-            "inf-sim: m4-tiered seed {seed:#x}: {} commands, {} steps, {} keys audited, {} \
-             required ops, {} allowed-lost, {} B flushed pre-cut, {} B flushed final, {} cold \
-             resolves, {} blob sets, {} DISKFULL refusals (reopened: {}), drop-race {} values / \
-             {} typed-other, post-drop reboot {} (MANIFEST residue {}), cut inside DROP after {} \
-             steps: {:?}, refused-boot {}, shadow arm {} ({} tickets, {} open at the cut, \
-             {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}; \
-             phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
-             DBSIZE drains, {} SCAN twins), blob-key race {} replans, dir-open fault arm {} \
-             (fired {}), tier-read EIO arm {} (fired {}, {} typed replies), ckpt downgrades {} \
-             / bound splits {}, SCAN batching oracle on {} cold pages ({} cold intents), replay \
-             unit above the window on {} cell(s) (acked record bytes per cell {:?}), boot \
-             tier replay {:?} (demote steps, bytes, barriers, files sealed, settle reads, \
-             deletes verified, step charge max), {} aged deletes acked, trace {} bytes, hash \
-             {:#018x}",
-            report.commands_done,
-            report.scheduler_steps,
-            report.audited_keys,
-            report.required_ops,
-            report.allowed_lost_ops,
-            report.flushed_pre_cut_bytes,
-            report.flushed_final_bytes,
-            report.cold_resolves,
-            report.blob_sets,
-            report.diskfull_refusals,
-            report.diskfull_reopened,
-            report.drop_replies_value,
-            report.drop_replies_other,
-            report.drop_reboot_ok,
-            report.drop_reboot_manifest_residue,
-            report.drop_cut_steps,
-            report.drop_cut_outcome,
-            report.refused_boot,
-            report.shadow_arm,
-            report.shadow_created,
-            report.shadow_pending_at_cut,
-            report.shadow_resolved_same_key,
-            report.shadow_resolved_collision,
-            report.shadow_stale,
-            report.shadow_fallbacks,
-            report.phase6b_cold_resolves,
-            report.collide_pairs,
-            report.collide_tickets,
-            report.collide_verdicts,
-            report.collide_ticketed_fallbacks,
-            report.collide_dbsize_drains,
-            report.collide_scan_twins,
-            report.race_replans,
-            report.dir_open_fault_arm,
-            report.dir_open_faults_fired,
-            report.tier_read_fault_arm,
-            report.tier_read_faults_fired,
-            report.tier_read_error_replies,
-            report.ckpt_downgrades,
-            report.ckpt_bound_splits,
-            report.scan_cold_pages,
-            report.scan_cold_reads,
-            report.replay_above_window_cells,
-            report.acked_record_bytes_per_cell,
-            report.boot_tier,
-            report.aged_deletes_acked,
-            report.trace.len(),
-            report.trace_hash
-        );
-        println!(
-            "inf-sim: sim_seconds={:.6} published=0 delivered=0 tier_read_fault_arm={} \
-             tier_read_faults_fired={} tier_read_error_replies={} scan_cold_pages={} \
-             scan_cold_reads={}",
-            report.sim_seconds,
-            report.tier_read_fault_arm,
-            report.tier_read_faults_fired,
-            report.tier_read_error_replies,
-            report.scan_cold_pages,
-            report.scan_cold_reads
-        );
-        print_census(report.cap_rows_checked, report.cap_rows_crossed);
-        if verify {
-            let second = run_one(seed);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+        // The forced arm is a positive control: it must fire on the seed a
+        // single run names. The check is part of the run, so the twin judges
+        // it too; a sweep holds the arm to its shard-scope check instead.
+        let forced = |seed: u64| {
+            let mut report = run_one(seed);
+            if plant == Plant::TierReadEio && report.tier_read_faults_fired == 0 {
+                report.violations.push(format!(
+                    "TIER-READ FAULT ARM VACUOUS seed {seed:#x}: --plant tier-read-eio forced \
+                     the arm and the audit consumed no fault (pick a seed whose flush confirmed \
+                     before the cut)"
+                ));
+            }
+            report
+        };
+        let exit = driver::run_single(seed, determinism, forced, |report| {
+            println!(
+                "inf-sim: m4-tiered seed {seed:#x}: {} commands, {} steps, {} keys audited, {} \
+                 required ops, {} allowed-lost, {} B flushed pre-cut, {} B flushed final, {} cold \
+                 resolves, {} blob sets, {} DISKFULL refusals (reopened: {}), drop-race {} values \
+                 / \
+                 {} typed-other, post-drop reboot {} (MANIFEST residue {}), cut inside DROP after \
+                 {} \
+                 steps: {:?}, refused-boot {}, shadow arm {} ({} tickets, {} open at the cut, \
+                 {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}; \
+                 phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
+                 DBSIZE drains, {} SCAN twins), blob-key race {} replans, dir-open fault arm {} \
+                 (fired {}), tier-read EIO arm {} (fired {}, {} typed replies), ckpt downgrades {} \
+                 / bound splits {}, SCAN batching oracle on {} cold pages ({} cold intents), \
+                 replay \
+                 unit above the window on {} cell(s) (acked record bytes per cell {:?}), boot \
+                 tier replay {:?} (demote steps, bytes, barriers, files sealed, settle reads, \
+                 deletes verified, step charge max), {} aged deletes acked, trace {} bytes, hash \
+                 {:#018x}",
+                report.commands_done,
+                report.scheduler_steps,
+                report.audited_keys,
+                report.required_ops,
+                report.allowed_lost_ops,
+                report.flushed_pre_cut_bytes,
+                report.flushed_final_bytes,
+                report.cold_resolves,
+                report.blob_sets,
+                report.diskfull_refusals,
+                report.diskfull_reopened,
+                report.drop_replies_value,
+                report.drop_replies_other,
+                report.drop_reboot_ok,
+                report.drop_reboot_manifest_residue,
+                report.drop_cut_steps,
+                report.drop_cut_outcome,
+                report.refused_boot,
+                report.shadow_arm,
+                report.shadow_created,
+                report.shadow_pending_at_cut,
+                report.shadow_resolved_same_key,
+                report.shadow_resolved_collision,
+                report.shadow_stale,
+                report.shadow_fallbacks,
+                report.phase6b_cold_resolves,
+                report.collide_pairs,
+                report.collide_tickets,
+                report.collide_verdicts,
+                report.collide_ticketed_fallbacks,
+                report.collide_dbsize_drains,
+                report.collide_scan_twins,
+                report.race_replans,
+                report.dir_open_fault_arm,
+                report.dir_open_faults_fired,
+                report.tier_read_fault_arm,
+                report.tier_read_faults_fired,
+                report.tier_read_error_replies,
+                report.ckpt_downgrades,
+                report.ckpt_bound_splits,
+                report.scan_cold_pages,
+                report.scan_cold_reads,
+                report.replay_above_window_cells,
+                report.acked_record_bytes_per_cell,
+                report.boot_tier,
+                report.aged_deletes_acked,
+                report.trace.len(),
+                report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            if second.trace != report.trace {
-                eprintln!(
-                    "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
-                     {:#x})",
-                    report.trace.len(),
-                    second.trace.len(),
-                    report.trace_hash,
-                    second.trace_hash
-                );
-                std::process::exit(1);
-            }
-            println!("inf-sim: determinism verified — second run trace byte-identical");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            println!(
+                "inf-sim: sim_seconds={:.6} published=0 delivered=0 tier_read_fault_arm={} \
+                 tier_read_faults_fired={} tier_read_error_replies={} scan_cold_pages={} \
+                 scan_cold_reads={}",
+                report.sim_seconds,
+                report.tier_read_fault_arm,
+                report.tier_read_faults_fired,
+                report.tier_read_error_replies,
+                report.scan_cold_pages,
+                report.scan_cold_reads
+            );
+            print_census(report.cap_rows_checked, report.cap_rows_crossed);
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
 
     // ADR-0108 (review of 2026-08-30, the batch-8 residual): concurrent
@@ -1231,55 +1124,33 @@ fn main() {
             }
             std::process::exit(if violations > 0 { 1 } else { 0 });
         }
-        let report = run_one(seed);
-        println!(
-            "inf-sim: scenario m2-ns-ddl-race seed {seed:#x}: {} commands, {} steps, DROP after \
-             {} steps ({}, origin frozen {} steps), 'x' served on {} cells before the cut / {} \
-             after, refused leg {} left {} cells serving 'y', {} untombstoned unknown-ns skips, {} \
-             released keys found, trace {} bytes, hash {:#018x}",
-            report.commands_done,
-            report.scheduler_steps,
-            report.drop_delay,
-            if report.drop_found { "found" } else { "not found" },
-            report.freeze_steps,
-            report.served_before_cut,
-            report.served_after_cut,
-            report.refused_leg,
-            report.partial_served,
-            report.skipped_unknown_ns,
-            report.released_keys_found,
-            report.trace.len(),
-            report.trace_hash
-        );
-        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
-        print_census(report.cap_rows_checked, report.cap_rows_crossed);
-        if verify {
-            let second = run_one(seed);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: scenario m2-ns-ddl-race seed {seed:#x}: {} commands, {} steps, DROP \
+                 after \
+                 {} steps ({}, origin frozen {} steps), 'x' served on {} cells before the cut / {} \
+                 after, refused leg {} left {} cells serving 'y', {} untombstoned unknown-ns \
+                 skips, {} \
+                 released keys found, trace {} bytes, hash {:#018x}",
+                report.commands_done,
+                report.scheduler_steps,
+                report.drop_delay,
+                if report.drop_found { "found" } else { "not found" },
+                report.freeze_steps,
+                report.served_before_cut,
+                report.served_after_cut,
+                report.refused_leg,
+                report.partial_served,
+                report.skipped_unknown_ns,
+                report.released_keys_found,
+                report.trace.len(),
+                report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            if second.trace != report.trace {
-                eprintln!(
-                    "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
-                     {:#x})",
-                    report.trace.len(),
-                    second.trace.len(),
-                    report.trace_hash,
-                    second.trace_hash
-                );
-                std::process::exit(1);
-            }
-            println!("inf-sim: determinism verified (second run identical)");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+            print_census(report.cap_rows_checked, report.cap_rows_crossed);
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
 
     // ADR-0189 D5: the namespace-drop window — the stale fold at the cap,
@@ -1329,46 +1200,30 @@ fn main() {
             }
             std::process::exit(if violations > 0 { 1 } else { 0 });
         }
-        let report = run_one(seed);
-        println!(
-            "inf-sim: scenario m2-ns-drop-window seed {seed:#x}: cut {:?}, {} commands, {} steps, \
-             stale fold {} epoch(s), {} lagging exports, {} held steps, checkpoint in the wait \
-             {}, {} acked keys served, {} untombstoned unknown-ns skips, trace {} bytes, hash \
-             {:#018x}",
-            report.cut,
-            report.commands_done,
-            report.scheduler_steps,
-            report.stale_fold_epochs,
-            report.lagging_exports,
-            report.held_steps,
-            report.checkpoint_in_wait,
-            report.keys_served,
-            report.skipped_unknown_ns,
-            report.trace.len(),
-            report.trace_hash
-        );
-        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
-        print_census(report.cap_rows_checked, report.cap_rows_crossed);
-        if verify {
-            let second = run_one(seed);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: scenario m2-ns-drop-window seed {seed:#x}: cut {:?}, {} commands, {} \
+                 steps, \
+                 stale fold {} epoch(s), {} lagging exports, {} held steps, checkpoint in the wait \
+                 {}, {} acked keys served, {} untombstoned unknown-ns skips, trace {} bytes, hash \
+                 {:#018x}",
+                report.cut,
+                report.commands_done,
+                report.scheduler_steps,
+                report.stale_fold_epochs,
+                report.lagging_exports,
+                report.held_steps,
+                report.checkpoint_in_wait,
+                report.keys_served,
+                report.skipped_unknown_ns,
+                report.trace.len(),
+                report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            if second.trace != report.trace {
-                eprintln!("inf-sim: DETERMINISM VIOLATION — traces differ");
-                std::process::exit(1);
-            }
-            println!("inf-sim: determinism verified — second run trace byte-identical");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+            print_census(report.cap_rows_checked, report.cap_rows_crossed);
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
 
     // ADR-0103 (review of 2026-08-30, C14): the namespace-creation window
@@ -1429,126 +1284,74 @@ fn main() {
             }
             std::process::exit(if violations > 0 { 1 } else { 0 });
         }
-        let report = run_one(seed);
-        println!(
-            "inf-sim: scenario m2-ns-create-window seed {seed:#x}: {} commands, {} steps, swap \
-             held {} steps, {} USE attempts ({} refused, {} writes acked in the window), {} \
-             untombstoned unknown-ns skips, {} released keys found, trace {} bytes, hash {:#018x}",
-            report.commands_done,
-            report.scheduler_steps,
-            report.held_steps,
-            report.use_attempts,
-            report.use_refused,
-            report.acked_in_window,
-            report.skipped_unknown_ns,
-            report.released_keys_found,
-            report.trace.len(),
-            report.trace_hash
-        );
-        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
-        print_census(report.cap_rows_checked, report.cap_rows_crossed);
-        if verify {
-            let second = run_one(seed);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: scenario m2-ns-create-window seed {seed:#x}: {} commands, {} steps, swap \
+                 held {} steps, {} USE attempts ({} refused, {} writes acked in the window), {} \
+                 untombstoned unknown-ns skips, {} released keys found, trace {} bytes, hash \
+                 {:#018x}",
+                report.commands_done,
+                report.scheduler_steps,
+                report.held_steps,
+                report.use_attempts,
+                report.use_refused,
+                report.acked_in_window,
+                report.skipped_unknown_ns,
+                report.released_keys_found,
+                report.trace.len(),
+                report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            if second.trace != report.trace {
-                eprintln!(
-                    "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
-                     {:#x})",
-                    report.trace.len(),
-                    second.trace.len(),
-                    report.trace_hash,
-                    second.trace_hash
-                );
-                std::process::exit(1);
-            }
-            println!("inf-sim: determinism verified — second run trace byte-identical");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+            print_census(report.cap_rows_checked, report.cap_rows_crossed);
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
     if scenario_name == "m4-cold" {
-        let mut scenario = inf_sim::ColdStormScenario::m4_cold(seed);
-        if let Some(ops) = ops_override {
-            scenario.ops = ops;
-        }
-        let report = inf_sim::run_cold_storm_scenario(&scenario);
-        println!(
-            "inf-sim: scenario m4-cold seed {seed:#x}: {} gets ({} cold, {} chunked, {} \
+        let run_one = |seed| {
+            let mut scenario = inf_sim::ColdStormScenario::m4_cold(seed);
+            if let Some(ops) = ops_override {
+                scenario.ops = ops;
+            }
+            inf_sim::run_cold_storm_scenario(&scenario)
+        };
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: scenario m4-cold seed {seed:#x}: {} gets ({} cold, {} chunked, {} \
              restarts, {} cancelled [{} early / {} late]), {} merged waiters (queue hw {}), \
              {} unlinks ({} deferrals), hash {:#018x}",
-            report.gets,
-            report.cold_served,
-            report.chunked_reads,
-            report.restarts,
-            report.cancelled,
-            report.cancelled_early,
-            report.cancelled_late,
-            report.merged_waiters,
-            report.queue_high_water,
-            report.unlinks,
-            report.unlink_deferrals,
-            report.trace_hash
-        );
-        if verify {
-            let second = inf_sim::run_cold_storm_scenario(&scenario);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+                report.gets,
+                report.cold_served,
+                report.chunked_reads,
+                report.restarts,
+                report.cancelled,
+                report.cancelled_early,
+                report.cancelled_late,
+                report.merged_waiters,
+                report.queue_high_water,
+                report.unlinks,
+                report.unlink_deferrals,
+                report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            assert_eq!(
-                report.trace_hash, second.trace_hash,
-                "m4-cold determinism: second run diverged"
-            );
-            println!("inf-sim: determinism verified — second run hash-identical");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
     // The M2.5-S01 boot-storm scenario (wedge-class oracle).
     if scenario_name == "boot-storm" {
-        let scenario = inf_sim::BootStormScenario::m2_boot_storm(seed);
-        let report = inf_sim::run_boot_storm_scenario(&scenario);
-        println!(
-            "inf-sim: scenario boot-storm seed {seed:#x}: {} boots, ready-steps max {}, \
-             hash {:#018x}",
-            report.boots, report.ready_steps_max, report.trace_hash
-        );
-        print_census(report.cap_rows_checked, report.cap_rows_crossed);
-        if verify {
-            let second = inf_sim::run_boot_storm_scenario(&scenario);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+        let run_one = |seed| {
+            inf_sim::run_boot_storm_scenario(&inf_sim::BootStormScenario::m2_boot_storm(seed))
+        };
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: scenario boot-storm seed {seed:#x}: {} boots, ready-steps max {}, \
+                 hash {:#018x}",
+                report.boots, report.ready_steps_max, report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            assert_eq!(
-                report.trace_hash, second.trace_hash,
-                "boot-storm determinism: second run diverged"
-            );
-            println!("inf-sim: determinism verified — second run hash-identical");
-        }
-        if !report.ok() {
-            for v in report.violations.iter() {
-                eprintln!("inf-sim: VIOLATION: {v}");
-            }
-            std::process::exit(1);
-        }
-        return;
+            print_census(report.cap_rows_checked, report.cap_rows_crossed);
+            Ok(())
+        });
+        std::process::exit(exit.code());
     }
     if sweep.is_some() {
         eprintln!("inf-sim: --sweep is an m2-durable / m3-document / m2-combined mode");
@@ -1590,77 +1393,55 @@ fn main() {
         }
     }
 
-    let report = run_scenario(&scenario);
-    println!(
-        "inf-sim: scenario {scenario_name} seed {seed:#x}: {} commands, {} apply events, \
-         {} steps, trace {} bytes, hash {:#018x}",
-        report.commands_done,
-        report.events,
-        report.scheduler_steps,
-        report.trace.len(),
-        report.trace_hash
-    );
-    // Machine-readable line for the nightly fleet (sim-seconds budget sum).
-    println!(
-        "inf-sim: sim_seconds={:.6} published={} delivered={} audits={} flushes={} \
-         scan_walks={} replays_skipped={} plant_fired={} accept_resumes={} \
-         fabric_skip_streak_max={} refused_clients={} idle_closed={} idle_survived={} \
-         shadow_checked={} shadow_unmodeled={:?}",
-        report.sim_seconds,
-        report.published,
-        report.delivered,
-        report.audits,
-        report.flushes,
-        report.scan_walks,
-        report.replays_skipped,
-        report.plant_fired,
-        report.accept_resumes,
-        report.fabric_skip_streak_max,
-        report.refused_clients,
-        report.idle_closed,
-        report.idle_survived,
-        report.shadow_checked,
-        report.shadow_unmodeled
-    );
-    print_census(report.cap_rows_checked, report.cap_rows_crossed);
-    if let Some(accept_retry) = &report.accept_retry {
-        print_accept_retry(accept_retry);
-    }
-    if let Some(path) = &trace_out
-        && let Err(e) = std::fs::write(path, &report.trace)
-    {
-        eprintln!("inf-sim: --trace-out {path}: {e}");
-        std::process::exit(2);
-    }
-    for violation in report.oracle_violations.iter().take(5) {
-        eprintln!("inf-sim: ORACLE VIOLATION: {violation}");
-    }
-    if report.stalled {
-        eprintln!("inf-sim: STALL — no progress for the detector window (seed {seed:#x})");
-    }
-    if !report.ok() {
-        std::process::exit(1);
-    }
-
-    if verify {
-        let second = run_scenario(&scenario);
-        verify_hashes(
-            (report.trace_hash, report.state_hash),
-            (second.trace_hash, second.state_hash),
+    // The overrides are the scenario's; the twin runs the same scenario.
+    let run_one = |_seed| run_scenario(&scenario);
+    let exit = driver::run_single(seed, determinism, run_one, |report| {
+        println!(
+            "inf-sim: scenario {scenario_name} seed {seed:#x}: {} commands, {} apply events, \
+             {} steps, trace {} bytes, hash {:#018x}",
+            report.commands_done,
+            report.events,
+            report.scheduler_steps,
+            report.trace.len(),
+            report.trace_hash
         );
-        assert!(second.ok(), "second run failed its oracles");
-        if second.trace != report.trace {
-            eprintln!(
-                "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs {:#x})",
-                report.trace.len(),
-                second.trace.len(),
-                report.trace_hash,
-                second.trace_hash
-            );
-            std::process::exit(1);
+        // Machine-readable line for the nightly fleet (sim-seconds budget sum).
+        println!(
+            "inf-sim: sim_seconds={:.6} published={} delivered={} audits={} flushes={} \
+             scan_walks={} replays_skipped={} plant_fired={} accept_resumes={} \
+             fabric_skip_streak_max={} refused_clients={} idle_closed={} idle_survived={} \
+             shadow_checked={} shadow_unmodeled={:?}",
+            report.sim_seconds,
+            report.published,
+            report.delivered,
+            report.audits,
+            report.flushes,
+            report.scan_walks,
+            report.replays_skipped,
+            report.plant_fired,
+            report.accept_resumes,
+            report.fabric_skip_streak_max,
+            report.refused_clients,
+            report.idle_closed,
+            report.idle_survived,
+            report.shadow_checked,
+            report.shadow_unmodeled
+        );
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
+        if let Some(accept_retry) = &report.accept_retry {
+            print_accept_retry(accept_retry);
         }
-        println!("inf-sim: determinism verified — second run trace byte-identical");
-    }
+        if let Some(path) = &trace_out
+            && let Err(e) = std::fs::write(path, &report.trace)
+        {
+            return Err(format!("--trace-out {path}: {e}"));
+        }
+        if report.stalled {
+            eprintln!("inf-sim: STALL — no progress for the detector window (seed {seed:#x})");
+        }
+        Ok(())
+    });
+    std::process::exit(exit.code());
 }
 
 /// Shared durable runner: M2's key/value workload and M3's document
@@ -1700,47 +1481,36 @@ fn window_leg_names() -> String {
     ExtentWindowLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
 }
 
-/// `m4-extent-window`: one seeded leg, its disk-side counts, its verdict,
-/// and with `--verify-determinism` a second run that must be identical.
-fn run_extent_window(seed: u64, leg: ExtentWindowLeg, verify: bool) {
-    let scenario = inf_sim::ExtentWindowScenario::m4_extent_window(seed, leg);
-    let report = inf_sim::run_extent_window_scenario(&scenario);
-    println!(
-        "inf-sim: scenario m4-extent-window leg {} seed {seed:#x}: {} blob writes acked, {} \
+/// `m4-extent-window`: one seeded leg, its disk-side counts and its verdict.
+fn run_extent_window(seed: u64, leg: ExtentWindowLeg, verify: Verify) -> Exit {
+    let run_one = |seed| {
+        let scenario = inf_sim::ExtentWindowScenario::m4_extent_window(seed, leg);
+        inf_sim::run_extent_window_scenario(&scenario)
+    };
+    driver::run_single(seed, verify, run_one, |report| {
+        println!(
+            "inf-sim: scenario m4-extent-window leg {} seed {seed:#x}: {} blob writes acked, {} \
          clients left, {} extent files created, peak {} open, {} frame holds, {} parks, {} \
          steps, hash {:#018x}",
-        leg.name(),
-        report.sets_acked,
-        report.writers_left,
-        report.files_created,
-        report.handles_peak,
-        report.frame_waits_extent,
-        report.extent_parks,
-        report.scheduler_steps,
-        report.trace_hash
-    );
-    if let Some(row) = report.window_row {
-        println!(
-            "inf-sim: extent window cell 0: high_water {} of {}, crossings {}",
-            row.high_water, row.entries_max, row.crossings
+            leg.name(),
+            report.sets_acked,
+            report.writers_left,
+            report.files_created,
+            report.handles_peak,
+            report.frame_waits_extent,
+            report.extent_parks,
+            report.scheduler_steps,
+            report.trace_hash
         );
-    }
-    print_census(report.cap_rows_checked, report.cap_rows_crossed);
-    if !report.ok() {
-        for v in report.violations.iter() {
-            eprintln!("inf-sim: VIOLATION: {v}");
+        if let Some(row) = report.window_row {
+            println!(
+                "inf-sim: extent window cell 0: high_water {} of {}, crossings {}",
+                row.high_water, row.entries_max, row.crossings
+            );
         }
-        std::process::exit(1);
-    }
-    if verify {
-        let second = inf_sim::run_extent_window_scenario(&scenario);
-        verify_hashes(
-            (report.trace_hash, report.state_hash),
-            (second.trace_hash, second.state_hash),
-        );
-        assert!(second.ok(), "second run failed its oracles");
-        println!("inf-sim: determinism verified — second run hash-identical");
-    }
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
+        Ok(())
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // one linear CLI dispatch, like main
@@ -1798,148 +1568,130 @@ fn run_durable(
     };
 
     let Some(sweep) = sweep else {
-        let report = run_one(seed);
-        println!(
-            "inf-sim: scenario {scenario_name} seed {seed:#x}: {} commands, {} steps, {} keys \
-             audited, {} required ops, {} allowed-lost, {} equivalence checks, {} documents \
-             compared, {} corpus docs, cut classes {:?}, lift regime {} (tiered ops {}, indexed \
-             ops {}, sidecars loaded {}, stale slacks lifted {}; plant: cells {}, lifts {}, \
-             sidecars {}; torn plants {}), arms [ckpt_downgrades {} bound_splits {} waits_fill \
-             {} waits_group {} plant_fired {}], log oracles [idle_tick_violations {} \
-             frames_awaiting_max {} fsync_entries_max {} write_through_entries_max {} \
-             hold_episode_violations {}], clean stop [steps {} replay_records {}], trace {} \
-             bytes, hash {:#018x}",
-            report.commands_done,
-            report.scheduler_steps,
-            report.audited_keys,
-            report.required_ops,
-            report.allowed_lost_ops,
-            report.equivalence_checks,
-            report.documents_compared,
-            report.corpus_documents_used,
-            report.cut_classes,
-            report.lift_regime,
-            report.lift_tiered_ops,
-            report.lift_indexed_ops,
-            report.lift_sidecars_loaded,
-            report.stale_residue_slacks,
-            report.lift_plants,
-            report.lift_plant_lifts,
-            report.lift_plant_sidecars,
-            report.torn_plants,
-            report.ckpt_downgrades,
-            report.ckpt_bound_splits,
-            report.frame_waits_fill,
-            report.frame_waits_group,
-            report.plant_fired,
-            report.idle_tick_violations,
-            report.frames_awaiting_max,
-            report.fsync_entries_max,
-            report.write_through_entries_max,
-            report.hold_episode_violations,
-            report.clean_stop_steps,
-            report.clean_stop_replay_records,
-            report.trace.len(),
-            report.trace_hash
-        );
-        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
-        print_census(report.cap_rows_checked, report.cap_rows_crossed);
-        if let Some(stop) = &report.stop_tick {
-            println!("inf-sim: {}", stop.describe());
-        }
-        if scenario_name == "m2-fill-dense" {
-            println!("inf-sim: {}", report.timers.describe());
-        }
-        if park_at_once {
-            println!("inf-sim: wake {:?}", report.wake);
-        }
-        if let Some(wedge) = &report.ledger_wedge {
+        let determinism = if verify { Verify::Twin } else { Verify::Off };
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
             println!(
-                "inf-sim: ledger wedge leg {}: armed at step {:?}, hold from step {:?} to {:?}, \
-                 seal folded at step {:?}, driver held at most {} fdatasync(s); segment ids \
-                 inside the hold {:?}; frame_waits_ledger {} frame_waits_ack_map {} \
-                 ledger_prealloc_deferrals {} fsync_entries_max {} write_through_entries_max {}",
-                wedge.leg.name(),
-                wedge.armed_at,
-                wedge.engaged_at,
-                wedge.lifted_at,
-                wedge.folded_at,
-                wedge.held_max,
-                wedge.ids_inside_hold,
-                wedge.frame_waits_ledger,
-                report.frame_waits_ack_map,
-                report.ledger_prealloc_deferrals,
+                "inf-sim: scenario {scenario_name} seed {seed:#x}: {} commands, {} steps, {} keys \
+                 audited, {} required ops, {} allowed-lost, {} equivalence checks, {} documents \
+                 compared, {} corpus docs, cut classes {:?}, lift regime {} (tiered ops {}, \
+                 indexed \
+                 ops {}, sidecars loaded {}, stale slacks lifted {}; plant: cells {}, lifts {}, \
+                 sidecars {}; torn plants {}), arms [ckpt_downgrades {} bound_splits {} waits_fill \
+                 {} waits_group {} plant_fired {}], log oracles [idle_tick_violations {} \
+                 frames_awaiting_max {} fsync_entries_max {} write_through_entries_max {} \
+                 hold_episode_violations {}], clean stop [steps {} replay_records {}], trace {} \
+                 bytes, hash {:#018x}",
+                report.commands_done,
+                report.scheduler_steps,
+                report.audited_keys,
+                report.required_ops,
+                report.allowed_lost_ops,
+                report.equivalence_checks,
+                report.documents_compared,
+                report.corpus_documents_used,
+                report.cut_classes,
+                report.lift_regime,
+                report.lift_tiered_ops,
+                report.lift_indexed_ops,
+                report.lift_sidecars_loaded,
+                report.stale_residue_slacks,
+                report.lift_plants,
+                report.lift_plant_lifts,
+                report.lift_plant_sidecars,
+                report.torn_plants,
+                report.ckpt_downgrades,
+                report.ckpt_bound_splits,
+                report.frame_waits_fill,
+                report.frame_waits_group,
+                report.plant_fired,
+                report.idle_tick_violations,
+                report.frames_awaiting_max,
                 report.fsync_entries_max,
-                report.write_through_entries_max
+                report.write_through_entries_max,
+                report.hold_episode_violations,
+                report.clean_stop_steps,
+                report.clean_stop_replay_records,
+                report.trace.len(),
+                report.trace_hash
             );
-        }
-        for marks in &report.epoch_marks_cells {
-            println!(
-                "inf-sim: epoch marks cell {}: high_water {} of {}, crossings {}",
-                marks.cell, marks.row.high_water, marks.row.entries_max, marks.row.crossings
-            );
-        }
-        for cell in &report.tier_budget_cells {
-            println!(
-                "inf-sim: tier class cell {}: io_budget_unattainable_tier_flush {} \
-                 io_budget_deferrals_tier_flush {} io_budget_bytes_tier_flush {} \
-                 io_budget_ops_tier_flush {} io_budget_overrun_bytes_tier_flush {} \
-                 driver tier-file bytes {} ops {} (queued at the cut {} B {} ops; one pass at \
-                 most {} B {} ops, a round at most 74: a wiring read, vacuous for the bound); \
-                 turn: tier_flush_groups_deferred {} tier_group_wait_ns_max \
-                 {} tier_turn_waits {} tier_turn_contended {} tier_plan_waits {} \
-                 tier_rounds_planned {} tiering_flush_write_retries {}; (namespace, flushed, \
-                 ro, tail) {:?}",
-                cell.cell,
-                cell.unattainable,
-                cell.deferrals,
-                cell.spent_bytes,
-                cell.spent_ops,
-                cell.overrun_bytes,
-                cell.driver_bytes,
-                cell.driver_ops,
-                cell.queued_bytes,
-                cell.queued_ops,
-                cell.pass_bytes_max,
-                cell.pass_ops_max,
-                cell.groups_deferred,
-                cell.group_wait_ns_max,
-                cell.turn_waits,
-                cell.turn_contended,
-                cell.plan_waits,
-                cell.rounds_planned,
-                cell.write_retries,
-                cell.flushed
-            );
-        }
-        for violation in report.violations.iter().take(5) {
-            eprintln!("inf-sim: ORACLE VIOLATION: {violation}");
-        }
-        if report.stalled {
-            eprintln!("inf-sim: STALL (seed {seed:#x})");
-        }
-        if !report.ok() {
-            std::process::exit(1);
-        }
-        if verify {
-            let second = run_one(seed);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
-            );
-            assert!(second.ok(), "second run failed its oracles");
-            verify_wake(&report.wake, &second.wake);
-            if second.trace != report.trace {
-                eprintln!(
-                    "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes)",
-                    report.trace.len(),
-                    second.trace.len()
-                );
-                std::process::exit(1);
+            println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+            print_census(report.cap_rows_checked, report.cap_rows_crossed);
+            if let Some(stop) = &report.stop_tick {
+                println!("inf-sim: {}", stop.describe());
             }
-            println!("inf-sim: determinism verified — second run trace byte-identical");
-        }
-        return;
+            if scenario_name == "m2-fill-dense" {
+                println!("inf-sim: {}", report.timers.describe());
+            }
+            if park_at_once {
+                println!("inf-sim: wake {:?}", report.wake);
+            }
+            if let Some(wedge) = &report.ledger_wedge {
+                println!(
+                    "inf-sim: ledger wedge leg {}: armed at step {:?}, hold from step {:?} to \
+                     {:?}, \
+                     seal folded at step {:?}, driver held at most {} fdatasync(s); segment ids \
+                     inside the hold {:?}; frame_waits_ledger {} frame_waits_ack_map {} \
+                     ledger_prealloc_deferrals {} fsync_entries_max {} write_through_entries_max \
+                     {}",
+                    wedge.leg.name(),
+                    wedge.armed_at,
+                    wedge.engaged_at,
+                    wedge.lifted_at,
+                    wedge.folded_at,
+                    wedge.held_max,
+                    wedge.ids_inside_hold,
+                    wedge.frame_waits_ledger,
+                    report.frame_waits_ack_map,
+                    report.ledger_prealloc_deferrals,
+                    report.fsync_entries_max,
+                    report.write_through_entries_max
+                );
+            }
+            for marks in &report.epoch_marks_cells {
+                println!(
+                    "inf-sim: epoch marks cell {}: high_water {} of {}, crossings {}",
+                    marks.cell, marks.row.high_water, marks.row.entries_max, marks.row.crossings
+                );
+            }
+            for cell in &report.tier_budget_cells {
+                println!(
+                    "inf-sim: tier class cell {}: io_budget_unattainable_tier_flush {} \
+                     io_budget_deferrals_tier_flush {} io_budget_bytes_tier_flush {} \
+                     io_budget_ops_tier_flush {} io_budget_overrun_bytes_tier_flush {} \
+                     driver tier-file bytes {} ops {} (queued at the cut {} B {} ops; one pass at \
+                     most {} B {} ops, a round at most 74: a wiring read, vacuous for the bound); \
+                     turn: tier_flush_groups_deferred {} tier_group_wait_ns_max \
+                     {} tier_turn_waits {} tier_turn_contended {} tier_plan_waits {} \
+                     tier_rounds_planned {} tiering_flush_write_retries {}; (namespace, flushed, \
+                     ro, tail) {:?}",
+                    cell.cell,
+                    cell.unattainable,
+                    cell.deferrals,
+                    cell.spent_bytes,
+                    cell.spent_ops,
+                    cell.overrun_bytes,
+                    cell.driver_bytes,
+                    cell.driver_ops,
+                    cell.queued_bytes,
+                    cell.queued_ops,
+                    cell.pass_bytes_max,
+                    cell.pass_ops_max,
+                    cell.groups_deferred,
+                    cell.group_wait_ns_max,
+                    cell.turn_waits,
+                    cell.turn_contended,
+                    cell.plan_waits,
+                    cell.rounds_planned,
+                    cell.write_retries,
+                    cell.flushed
+                );
+            }
+            if report.stalled {
+                eprintln!("inf-sim: STALL (seed {seed:#x})");
+            }
+            Ok(())
+        });
+        std::process::exit(exit.code());
     };
 
     // Sweep mode: seeds base+i for i ≡ shard_i (mod shard_k).
@@ -2175,55 +1927,35 @@ fn run_m2_combined(
     };
 
     let Some(sweep) = sweep else {
-        let report = run_one(seed);
-        println!(
-            "inf-sim: scenario m2-combined seed {seed:#x}: {} commands, {} steps, {} keys \
-             audited, {} memory keys audited, {} required ops, {} allowed-lost, {} published, \
-             {} delivered, stall-max-always {} ms, trace {} bytes, hash {:#018x}",
-            report.commands_done,
-            report.scheduler_steps,
-            report.audited_keys,
-            report.memory_keys_audited,
-            report.required_ops,
-            report.allowed_lost_ops,
-            report.published,
-            report.delivered,
-            report.always_ack_latency_ms_max,
-            report.trace.len(),
-            report.trace_hash
-        );
-        println!(
-            "inf-sim: sim_seconds={:.6} published={} delivered={}",
-            report.sim_seconds, report.published, report.delivered
-        );
-        print_census(report.cap_rows_checked, report.cap_rows_crossed);
-        for violation in report.violations.iter().take(5) {
-            eprintln!("inf-sim: ORACLE VIOLATION: {violation}");
-        }
-        if report.stalled {
-            eprintln!("inf-sim: STALL (seed {seed:#x})");
-        }
-        if !report.ok() {
-            std::process::exit(1);
-        }
-        if verify {
-            let second = run_one(seed);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (second.trace_hash, second.state_hash),
+        let determinism = if verify { Verify::Twin } else { Verify::Off };
+        let exit = driver::run_single(seed, determinism, run_one, |report| {
+            println!(
+                "inf-sim: scenario m2-combined seed {seed:#x}: {} commands, {} steps, {} keys \
+                 audited, {} memory keys audited, {} required ops, {} allowed-lost, {} published, \
+                 {} delivered, stall-max-always {} ms, trace {} bytes, hash {:#018x}",
+                report.commands_done,
+                report.scheduler_steps,
+                report.audited_keys,
+                report.memory_keys_audited,
+                report.required_ops,
+                report.allowed_lost_ops,
+                report.published,
+                report.delivered,
+                report.always_ack_latency_ms_max,
+                report.trace.len(),
+                report.trace_hash
             );
-            assert!(second.ok(), "second run failed its oracles");
-            if second.trace != report.trace {
-                eprintln!(
-                    "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes)",
-                    report.trace.len(),
-                    second.trace.len()
-                );
-                std::process::exit(1);
+            println!(
+                "inf-sim: sim_seconds={:.6} published={} delivered={}",
+                report.sim_seconds, report.published, report.delivered
+            );
+            print_census(report.cap_rows_checked, report.cap_rows_crossed);
+            if report.stalled {
+                eprintln!("inf-sim: STALL (seed {seed:#x})");
             }
-            println!("inf-sim: determinism verified — second run trace byte-identical");
-        }
-        return;
+            Ok(())
+        });
+        std::process::exit(exit.code());
     };
 
     assert!(shard_k > 0, "--shard I/K wants K > 0");
@@ -2290,16 +2022,6 @@ fn verify_hashes(first: (u64, u64), second: (u64, u64)) {
     println!("inf-sim: state_hash={:#018x}; state hash identical", first.1);
 }
 
-/// The twin's TM3 readings equal the first run's, or the run is red.
-fn verify_wake(first: &inf_sim::WakeReport, second: &inf_sim::WakeReport) {
-    if first != second {
-        eprintln!(
-            "inf-sim: DETERMINISM VIOLATION — wake readings differ ({first:?} vs {second:?})"
-        );
-        std::process::exit(1);
-    }
-}
-
 #[cfg(test)]
 mod determinism_exit {
     #[test]
@@ -2321,30 +2043,6 @@ mod determinism_exit {
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("state_hash differs"),
-            "{output:?}"
-        );
-    }
-    #[test]
-    fn differing_wake_readings_exit_one_with_a_named_reason() {
-        const CHILD: &str = "INF_SIM_WAKE_VERIFY_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            let first = inf_sim::WakeReport { held_parks: 3, ..Default::default() };
-            let second = inf_sim::WakeReport { held_parks: 4, ..Default::default() };
-            super::verify_wake(&first, &second);
-            return;
-        }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "determinism_exit::differing_wake_readings_exit_one_with_a_named_reason",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(1), "{output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("wake readings differ"),
             "{output:?}"
         );
     }
