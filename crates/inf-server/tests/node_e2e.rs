@@ -10856,3 +10856,7 @@ mod ns_ids;
 /// A `CREATE` its origin refuses after the catalog swap, in a file of its own.
 #[path = "node_e2e/ns_create_refused.rs"]
 mod ns_create_refused;
+
+/// The tombstone cap at the node, in a file of its own.
+#[path = "node_e2e/ns_cap.rs"]
+mod ns_cap;

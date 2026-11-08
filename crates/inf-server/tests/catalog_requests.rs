@@ -495,3 +495,48 @@ fn an_index_on_the_dropped_namespace_leaves_meta_with_it() {
     assert!(decoded.index.entries.is_empty(), "an index on the dropped namespace is in META");
     assert_eq!(decoded.dropped, vec![DDL_NS], "its tombstone is");
 }
+
+// ---- the tombstone cap ----
+
+/// A catalog with `count` tombstones, ids 16 up, its counter past them.
+fn tombstoned(count: u32) -> NsCatalog {
+    let dropped: Vec<u32> = (DDL_NS..DDL_NS + count).collect();
+    NsCatalog {
+        next_id: DDL_NS + count,
+        entries: Vec::new(),
+        index: IndexCatalog::default(),
+        dropped,
+    }
+}
+
+/// A boot whose `META` holds 256, 257 or 4,096 tombstones (the last two a
+/// directory written before the cap was the writer's verdict) seeds every
+/// one and re-stamps them with one checkpoint no cell has yet published,
+/// so none is ready. A durable `CREATE` is then not admitted: it would hold
+/// a tombstone slot past the cap of 256 live and reserved (ADR-0189 D6,
+/// D7). Red while the writer admits every durable `CREATE`.
+#[test]
+#[ignore = "red until the catalog writer decides the tombstone cap at its verdict (ADR-0189 D6)"]
+fn a_durable_create_over_the_tombstone_cap_is_not_admitted_while_none_is_ready() {
+    for count in [256u32, 257, 4096] {
+        let dir = temp_dir(&format!("over-cap-{count}"));
+        let seed = tombstoned(count);
+        let (control, mut inbox) = writer(&dir, Some(&seed));
+        let fs = RecordingFs::default();
+        let before = std::fs::read(dir.join("META")).expect("META");
+        let export = catalog(Vec::new());
+        let (_, requested) = reserved_create(&control, export, b"fresh", NsMode::Durable);
+        inbox.drain(&fs, &dir).expect("the drain");
+        let answer = answered(&control, requested);
+        let held = meta(&dir).dropped.len();
+        let after = std::fs::read(dir.join("META")).expect("META");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            answer.is_err(),
+            "a durable CREATE was admitted at {count} tombstones with none ready: META holds \
+             {held} tombstones beside its reservation"
+        );
+        assert!(fs.ops().is_empty(), "the refusal touched the disk: {:?}", fs.ops());
+        assert_eq!(after, before, "META's bytes moved");
+    }
+}
