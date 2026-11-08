@@ -132,9 +132,9 @@ pub use tiered::{
     TieredTable,
 };
 pub use tiered_recover::{
-    MapEnded, MapStep, MapWork, NsTierMap, RecoveredTier, TierRecoverStats, apply_blob_ref_entries,
-    apply_blob_ref_section, apply_live_set_entries, apply_live_set_section, apply_ref_entries,
-    apply_ref_section, recover_tiered_ns,
+    IdChunks, MapEnded, MapStep, MapWork, NsTierMap, RecoveredTier, TierRecoverStats,
+    apply_blob_ref_entries, apply_blob_ref_section, apply_live_set_entries, apply_live_set_section,
+    apply_ref_entries, apply_ref_section, recover_tiered_ns,
 };
 pub use wall::WallAnchor;
 pub use write_accounting::{

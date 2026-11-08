@@ -50,8 +50,99 @@ use inf_log::tier::{
 
 use crate::address_space::AddressSpaceConfig;
 use crate::demote::DemotionConfig;
+use crate::limits::ID_CHUNK_IDS;
 use crate::tiered::TieredTable;
 use crate::tiered::replay::TierReplay;
+
+/// A boot list of `u64` ids in fixed chunks of [`ID_CHUNK_IDS`] (ADR-0174
+/// A1): a push fills the last chunk or starts a new one, so no push copies
+/// the list — an O(n) copy inside one unit, at a doubling, would be a unit
+/// no budget bounds. Read by index: an index into a list nothing appends to
+/// any more names one id across recovery steps.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdChunks {
+    /// Every chunk but the last is full.
+    chunks: Vec<Vec<u64>>,
+    len: usize,
+}
+
+impl IdChunks {
+    /// An empty list.
+    #[must_use]
+    pub fn new() -> IdChunks {
+        IdChunks::default()
+    }
+
+    /// Appends `id`.
+    pub fn push(&mut self, id: u64) {
+        match self.chunks.last_mut() {
+            Some(chunk) if chunk.len() < ID_CHUNK_IDS => chunk.push(id),
+            Some(_) | None => {
+                let mut chunk = Vec::with_capacity(ID_CHUNK_IDS);
+                chunk.push(id);
+                self.chunks.push(chunk);
+            }
+        }
+        self.len += 1;
+    }
+
+    /// The ids listed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no id is listed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The ids from index `at` to the end of its chunk, in list order:
+    /// empty at or past `len()`, non-empty below it.
+    #[must_use]
+    pub fn run_from(&self, at: usize) -> &[u64] {
+        let (chunk, offset) = (at / ID_CHUNK_IDS, at % ID_CHUNK_IDS);
+        self.chunks.get(chunk).and_then(|ids| ids.get(offset..)).unwrap_or_default()
+    }
+
+    /// The ids from index `at` on, in list order.
+    pub fn iter_from(&self, at: usize) -> impl Iterator<Item = u64> + '_ {
+        let (chunk, offset) = (at / ID_CHUNK_IDS, at % ID_CHUNK_IDS);
+        self.chunks.iter().skip(chunk).enumerate().flat_map(move |(i, ids)| {
+            let from = if i == 0 { offset } else { 0 };
+            ids.get(from..).unwrap_or_default().iter().copied()
+        })
+    }
+
+    /// The ids in list order.
+    pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        self.iter_from(0)
+    }
+
+    /// Whether `id` is listed: a scan, for tests and oracles.
+    #[must_use]
+    pub fn contains(&self, id: &u64) -> bool {
+        self.iter().any(|listed| listed == *id)
+    }
+
+    /// The ids as one vector, for tests and oracles: a copy.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<u64> {
+        self.iter().collect()
+    }
+}
+
+impl FromIterator<u64> for IdChunks {
+    fn from_iter<I: IntoIterator<Item = u64>>(ids: I) -> IdChunks {
+        let mut list = IdChunks::new();
+        // Bound: the iterator's ids, one push each.
+        for id in ids {
+            list.push(id);
+        }
+        list
+    }
+}
 
 /// Boot facts for the log line and the ledger (counts, not policy).
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
@@ -87,12 +178,12 @@ pub struct RecoveredTier<F: SegmentFs> {
     /// replay complete: liveness is decided by the post-replay
     /// refcounts, never by the manifest — the tier-file "unmanifested ⇒
     /// garbage" rule deliberately does not extend to extents.
-    pub extents_listed: Vec<u64>,
+    pub extents_listed: IdChunks,
     /// `.quarantine`-named extent ids (ADR-0096 D3), in the listing's order
     /// — boot orphans a previous life renamed instead of unlinking. Handed
     /// to the same sweep seed; ids the replayed map references come back
     /// for revival, the rest await their second-verdict unlink.
-    pub extents_quarantined: Vec<u64>,
+    pub extents_quarantined: IdChunks,
     /// Boot facts.
     pub stats: TierRecoverStats,
 }
@@ -178,8 +269,8 @@ pub struct NsTierMap<F: SegmentFs> {
     cold_dir: PathBuf,
     catalog: Vec<TierFileMeta>,
     handles: Vec<(u32, F::File)>,
-    extents_listed: Vec<u64>,
-    extents_quarantined: Vec<u64>,
+    extents_listed: IdChunks,
+    extents_quarantined: IdChunks,
     stats: TierRecoverStats,
     stage: MapStage<F>,
 }
@@ -224,8 +315,8 @@ impl<F: SegmentFs> NsTierMap<F> {
             cold_dir,
             catalog: Vec::with_capacity(tier.files.len()),
             handles: Vec::with_capacity(tier.files.len()),
-            extents_listed: Vec::new(),
-            extents_quarantined: Vec::new(),
+            extents_listed: IdChunks::new(),
+            extents_quarantined: IdChunks::new(),
             stats: TierRecoverStats::default(),
             stage: MapStage::Probe { at: 0 },
         }
@@ -760,6 +851,29 @@ mod tests {
             1,
         );
         table
+    }
+
+    /// The chunked id list (ADR-0174 A1): a push past a full chunk starts
+    /// the next, an index names one id in list order across the chunk
+    /// edge, a run ends at its chunk's end and is empty past the list, and
+    /// the list reads back whole.
+    #[test]
+    fn an_id_list_reads_back_by_index_across_its_chunks() {
+        let n = 2 * ID_CHUNK_IDS + 3;
+        let list: IdChunks = (0..n as u64).map(|i| i * 7).collect();
+        assert_eq!(list.len(), n);
+        assert_eq!(list.to_vec(), (0..n as u64).map(|i| i * 7).collect::<Vec<_>>());
+        assert_eq!(list.run_from(0).len(), ID_CHUNK_IDS, "a run ends at its chunk's end");
+        assert_eq!(list.run_from(ID_CHUNK_IDS - 1), &[(ID_CHUNK_IDS as u64 - 1) * 7]);
+        assert_eq!(list.run_from(ID_CHUNK_IDS)[0], ID_CHUNK_IDS as u64 * 7, "the next chunk");
+        assert_eq!(list.run_from(n - 1), &[(n as u64 - 1) * 7], "the last id");
+        assert!(list.run_from(n).is_empty() && list.run_from(usize::MAX).is_empty());
+        let from: Vec<u64> = list.iter_from(ID_CHUNK_IDS - 2).take(4).collect();
+        let want: Vec<u64> =
+            (ID_CHUNK_IDS as u64 - 2..ID_CHUNK_IDS as u64 + 2).map(|i| i * 7).collect();
+        assert_eq!(from, want, "a walk from an index crosses the chunk edge");
+        assert!(list.contains(&(7 * 7)) && !list.contains(&1));
+        assert!(IdChunks::new().is_empty() && IdChunks::new().run_from(0).is_empty());
     }
 
     /// A namespace's cold directory on `fs`: two sealed manifested files,

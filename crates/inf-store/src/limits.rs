@@ -155,3 +155,11 @@ const _: () = assert!(DOC_IDOC_BYTES_MAX <= inf_log::DOC_VERSION_MASK as usize);
 // The record clamp only ever lowers the format ceiling.
 #[cfg(feature = "doc")]
 const _: () = assert!(DOC_BODY_BYTES_MAX <= inf_doc::limits::DOC_BYTES_MAX);
+
+/// Ids one chunk of a boot id list holds (ADR-0174 A1): the tier map's two
+/// extent-id lists, the hand-over's revive list and the end of the
+/// checkpoint's release list, 32 KiB a chunk. Owner: `IdChunks`, whose
+/// chunk table grows by doubling at 24 B a chunk. Crossing: a full chunk
+/// ends and the next push starts a new one, so no push copies the ids
+/// already listed (INF: the table is 59 KiB at 10⁷ ids).
+pub const ID_CHUNK_IDS: usize = 4096;

@@ -923,12 +923,12 @@ pub struct Recovery<F: SegmentFs> {
 struct RecoveringTierNs<F: SegmentFs> {
     ns: inf_log::NsId,
     replay: inf_store::TierReplay<F>,
-    extents_listed: Vec<u64>,
-    extents_quarantined: Vec<u64>,
+    extents_listed: inf_store::IdChunks,
+    extents_quarantined: inf_store::IdChunks,
     /// The quarantined ids the replayed map references, in the listing's
     /// order: the hand-over's sweep seed appends them, its revive stage
     /// renames them back (ADR-0096 D3).
-    revive: Vec<u64>,
+    revive: inf_store::IdChunks,
     /// Lent through the seam since the last drain (its index is in
     /// [`RecoveringTiers::lent`] once).
     lent: bool,
@@ -1605,7 +1605,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             replay: recovered.replay,
             extents_listed: recovered.extents_listed,
             extents_quarantined: recovered.extents_quarantined,
-            revive: Vec::new(),
+            revive: inf_store::IdChunks::new(),
             lent: false,
         });
         Ok(())

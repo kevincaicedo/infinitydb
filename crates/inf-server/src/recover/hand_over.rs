@@ -156,7 +156,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 }
             }
             HandOverStage::SeedListed { at } => {
-                let listed = tier.extents_listed.get(at..).unwrap_or_default();
+                let listed = tier.extents_listed.run_from(at);
                 if listed.is_empty() {
                     return Ok(HandOverStage::SeedQuarantined { at: 0 });
                 }
@@ -167,7 +167,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 HandOverStage::SeedListed { at: at + batch }
             }
             HandOverStage::SeedQuarantined { at } => {
-                let quarantined = tier.extents_quarantined.get(at..).unwrap_or_default();
+                let quarantined = tier.extents_quarantined.run_from(at);
                 if quarantined.is_empty() {
                     return Ok(HandOverStage::Revive { at: 0 });
                 }
@@ -178,9 +178,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 HandOverStage::SeedQuarantined { at: at + batch }
             }
             HandOverStage::Revive { at } => {
-                let Some(revive) = tier.revive.get(at..).filter(|rest| !rest.is_empty()) else {
+                let revive = tier.revive.run_from(at);
+                if revive.is_empty() {
                     return Ok(HandOverStage::Rebuild(Box::new(table.begin_shadow_rebuild())));
-                };
+                }
                 let fs =
                     fs.as_ref().ok_or_else(|| io_msg("a hand-over with no filesystem".into()))?;
                 let batch = units_left(budget, BOOT_FILE_OP_CHARGE_BYTES).min(revive.len());

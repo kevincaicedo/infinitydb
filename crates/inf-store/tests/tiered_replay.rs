@@ -507,8 +507,8 @@ impl Durable {
             fs: self.fs.clone(),
             ks,
             spill,
-            extents_listed,
-            extents_quarantined,
+            extents_listed: extents_listed.to_vec(),
+            extents_quarantined: extents_quarantined.to_vec(),
             tier,
             end_walk: EndWalk::default(),
         }

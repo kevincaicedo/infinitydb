@@ -20,6 +20,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::tiered_recover::IdChunks;
+
 /// Default out-of-line threshold: exactly the u24 inline ceiling, so the
 /// default changes no existing value's path (ADR-0061 D1). Values at or
 /// above it must take the extent path.
@@ -352,9 +354,9 @@ impl ExtentRefs {
     pub fn sweep_seed(&mut self, listed: &[u64], quarantined: &[u64]) -> Vec<u64> {
         self.stamp_parked(usize::MAX);
         self.seed_listed(listed);
-        let mut revive = Vec::new();
+        let mut revive = IdChunks::new();
         self.seed_quarantined(quarantined, &mut revive);
-        revive
+        revive.to_vec()
     }
 
     /// The boot sweep seed's first stage, a batch (ADR-0061 D5, D6): stamps
@@ -418,7 +420,7 @@ impl ExtentRefs {
     /// unlinks its twin); one the replayed map *does* reference is counted
     /// and appended to `revive`, for the caller to rename back
     /// (ADR-0096 D3). Advances the id cursor past everything listed.
-    pub fn seed_quarantined(&mut self, quarantined: &[u64], revive: &mut Vec<u64>) {
+    pub fn seed_quarantined(&mut self, quarantined: &[u64], revive: &mut IdChunks) {
         // Bound: one map probe and one candidacy probe per listed id.
         for &extent_id in quarantined {
             self.note_observed_id(extent_id);
@@ -755,12 +757,12 @@ mod tests {
         for batch in listed.chunks(9) {
             stepped.seed_listed(batch);
         }
-        let mut revive = Vec::new();
+        let mut revive = IdChunks::new();
         for batch in quarantined.chunks(1) {
             stepped.seed_quarantined(batch, &mut revive);
         }
-        assert_eq!(revive, revive_whole, "the revive list is the whole seed's");
-        assert_eq!(revive, vec![35, 36]);
+        assert_eq!(revive.to_vec(), revive_whole, "the revive list is the whole seed's");
+        assert_eq!(revive.to_vec(), vec![35, 36]);
         let order = |x: &mut ExtentRefs| x.reclaim_work(0, usize::MAX);
         let (stepped_order, whole_order) = (order(&mut stepped), order(&mut whole));
         assert_eq!(stepped_order.len(), 30 + 20 + 2, "deaths, orphans and second verdicts");

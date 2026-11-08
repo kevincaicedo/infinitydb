@@ -701,7 +701,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
     // the header-valid orphan quarantines (rename, bytes survive the
     // life), and only the next boot's second verdict unlinks; nothing
     // live is ever handed out.
-    let revive = table.extent_sweep_seed(&recovered.extents_listed, &[]);
+    let revive = table.extent_sweep_seed(&recovered.extents_listed.to_vec(), &[]);
     assert!(revive.is_empty(), "nothing was quarantined before this boot");
     let mut quarantined: Vec<u64> = Vec::new();
     loop {

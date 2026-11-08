@@ -484,7 +484,8 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     // quarantines the header-valid file on this boot (the bytes leave
     // the listing but survive the life) and unlinks the twin only on
     // the next boot's second verdict.
-    assert!(t.extent_sweep_seed(&recovered.extents_listed, &[]).is_empty(), "nothing to revive");
+    let listed = recovered.extents_listed.to_vec();
+    assert!(t.extent_sweep_seed(&listed, &[]).is_empty(), "nothing to revive");
     let work = t.extent_reclaim_work(0, 8);
     assert_eq!(
         work,
