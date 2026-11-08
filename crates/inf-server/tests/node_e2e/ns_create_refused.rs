@@ -85,3 +85,72 @@ fn an_origin_refused_create_leaves_no_meta_naming_it_once_answered() {
     );
     assert!(!named, "META still names the namespace its origin refused after its refusal");
 }
+
+/// The client-reachable route to the origin's refusal after the swap: a
+/// `CONFIG SET tiered-reserved-va-limit` on the origin's cell, made while
+/// its tiered `CREATE` waits for the catalog writer, lowers the
+/// reserved-address admission the store's apply runs again. The writer
+/// accepts (the limit is the cell's, not the writer's); the origin's apply
+/// is refused; the `CREATE` rolls back before it answers, so `META` names
+/// nothing of it and no cell serves it; and its grant returns: with the
+/// limit restored, the same tiered `CREATE` is accepted (ADR-0148 D2, D5).
+#[test]
+fn a_reserved_address_limit_lowered_during_the_wait_rolls_the_create_back() {
+    let dir = temp_data_dir("create-va-lowered");
+    let hold = Arc::new(AtomicBool::new(true));
+    let node =
+        Node::start_durable_with_held_catalog(2, &dir, Arc::clone(&hold), CkptTrigger::Manual);
+    let create = tiered_ns_create(b"lowered", &[b"MEM-BUDGET", b"3mb"]);
+    let control = node.control.as_ref().expect("a durable node");
+    let sent = control.persist_requests_sent();
+    let mut creator = conn_on_cell(&node, 0);
+    creator.write_all(&create).expect("write");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while control.persist_requests_sent() == sent {
+        assert!(std::time::Instant::now() < deadline, "the CREATE never sent its request");
+        std::thread::yield_now();
+    }
+    let mut admin = conn_on_cell(&node, 0);
+    let lower = cmd(&[b"CONFIG", b"SET", b"tiered-reserved-va-limit", b"1048576"]);
+    admin.write_all(&lower).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    hold.store(false, Ordering::Release);
+    let refusal = read_line(&mut creator);
+    assert!(
+        refusal.starts_with(b"-ERR tiered namespace would exceed the node's reserved-VA limit"),
+        "engagement: the origin's apply refused at the lowered limit: {:?}",
+        String::from_utf8_lossy(&refusal)
+    );
+    let (named, _) = meta_names(&dir, b"lowered");
+    assert!(!named, "META names the namespace its origin refused once the refusal is answered");
+    for cell in 0..2u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"lowered"])).expect("write");
+        let reply = read_line(&mut c);
+        assert!(reply.starts_with(b"-ERR namespace 'lowered' not found"), "cell {cell}: {reply:?}");
+    }
+    let restore = cmd(&[b"CONFIG", b"SET", b"tiered-reserved-va-limit", b"274877906944"]);
+    admin.write_all(&restore).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    // The grant returns once every cell's receipt names the refused id.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        creator.write_all(&create).expect("write");
+        let reply = read_line(&mut creator);
+        if reply == b"+OK\r\n" {
+            break;
+        }
+        assert_eq!(
+            reply,
+            b"-TRYAGAIN tiered namespace capacity in use\r\n".to_vec(),
+            "only a Retiring grant refuses it meanwhile"
+        );
+        assert!(std::time::Instant::now() < deadline, "the refused CREATE's grant never returned");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(creator);
+    drop(admin);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
