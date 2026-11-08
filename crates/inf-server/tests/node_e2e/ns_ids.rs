@@ -49,9 +49,10 @@ fn a_refused_create_spends_no_namespace_id() {
 /// Boot's counter check (ADR-0148 D4): a data directory whose catalog
 /// counter is not past a live id would issue that id again, so its catalog
 /// is refused at the load every boot runs before any cell, with the typed
-/// error naming both; a counter past it loads.
+/// error naming both; a counter past it loads. The boot itself, refused
+/// with no cell, is `infinityd`'s `ns_lifetimes` boot test.
 #[test]
-fn a_catalog_counter_not_past_a_live_id_refuses_the_boot() {
+fn a_catalog_counter_not_past_a_live_id_is_refused_at_load() {
     let dir = temp_data_dir("create-ids-low-counter");
     let ahead = inf_store::NsSpec {
         id: inf_store::NsId(20),
@@ -206,12 +207,22 @@ fn the_last_namespace_id_is_issued_once_and_then_the_space_refuses() {
     let mut c = node.connect();
     assert_eq!(create_durable(&mut c, b"y"), b"+OK\r\n");
     oracle.accepted("y", ns_id(&mut c, b"y"));
+    let before = std::fs::read(dir.join("META")).expect("META");
     for name in [&b"z"[..], b"z"] {
         let reply = create_durable(&mut c, name);
         if reply == b"+OK\r\n" {
             oracle.accepted("z", ns_id(&mut c, name));
         }
         assert_eq!(reply, b"-ERR namespace identity space exhausted\r\n", "the spent space");
+    }
+    // The refusal is before any effect: META's bytes as they were, and no
+    // cell knows the name.
+    assert_eq!(std::fs::read(dir.join("META")).expect("META"), before, "the refusal wrote META");
+    for cell in 0..2u16 {
+        let mut probe = conn_on_cell(&node, cell);
+        probe.write_all(&cmd(&[b"INF.NS", b"INFO", b"z"])).expect("write");
+        let reply = read_line(&mut probe);
+        assert!(reply.starts_with(b"-ERR namespace 'z' not found"), "cell {cell}: {reply:?}");
     }
     // The refusals are the node's counter, read from any cell's INFO.
     let refused = info_field(&info_persistence(&mut c), "ns_id_refused_exhausted");

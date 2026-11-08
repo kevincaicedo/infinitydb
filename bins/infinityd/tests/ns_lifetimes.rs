@@ -262,6 +262,54 @@ fn a_tiered_create_refused_after_its_catalog_swap_is_not_served_after_a_cut() {
     assert_eq!(after_cut, NOT_FOUND, "the refused namespace is served after a cut and a reboot");
 }
 
+/// `INF.NS INFO name`'s `id` on `c`: the reply read whole, up to a `PING`'s
+/// answer sent behind it.
+fn ns_id(c: &mut TcpStream, name: &[u8]) -> u32 {
+    c.write_all(&resp(&[b"INF.NS", b"INFO", name])).expect("write");
+    c.write_all(&resp(&[b"PING"])).expect("write");
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    while !raw.ends_with(b"+PONG\r\n") {
+        c.read_exact(&mut byte).expect("read");
+        raw.push(byte[0]);
+        assert!(raw.len() < 1 << 16, "an INF.NS INFO reply of bounded size");
+    }
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let lines: Vec<&str> = text.split("\r\n").collect();
+    let at = lines.iter().position(|line| *line == "id").expect("an id field");
+    lines[at + 2].parse().unwrap_or_else(|_| panic!("a numeric id in {text:?}"))
+}
+
+/// D5 at the binary (two cells): a `CREATE` of a taken name is refused and
+/// spends no namespace id, so the next accepted `CREATE`'s id is the last
+/// accepted one's successor.
+#[test]
+fn a_refused_create_spends_no_namespace_id_at_the_binary() {
+    let dir = data_root("ids");
+    let mut server = start(&dir);
+    let mut c = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    let create = |name: &'static [u8]| -> [&'static [u8]; 5] {
+        [b"INF.NS", b"CREATE", name, b"MODE", b"durable"]
+    };
+    assert_eq!(line(&mut c, &create(b"a")), "+OK\r\n");
+    let accepted = ns_id(&mut c, b"a");
+    for _ in 0..2 {
+        assert_eq!(line(&mut c, &create(b"a")), "-ERR namespace already exists\r\n");
+    }
+    assert_eq!(line(&mut c, &create(b"b")), "+OK\r\n");
+    let next = ns_id(&mut c, b"b");
+    drop(c);
+    let status = server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(status.success(), "the node stopped gracefully: {status}");
+    assert_eq!(
+        next,
+        accepted + 1,
+        "the CREATE after two refused ones took {next}; last {accepted}"
+    );
+}
+
 /// A durable tiered definition of `id` at the ring floor, as `INF.NS
 /// CREATE tiered-<id> MODE durable MEM-BUDGET 3mb` writes it.
 fn tiered_definition(id: u32) -> inf_store::NsSpec {
