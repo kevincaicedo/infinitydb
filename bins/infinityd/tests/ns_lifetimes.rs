@@ -335,9 +335,6 @@ fn boot_refused(dir: &Path) -> (std::process::ExitStatus, String) {
 /// count and the limit. A catalog whose counter is not past a live id is
 /// refused the same way (the counter check every boot's load runs).
 #[test]
-#[ignore = "a boot admits every live tiered definition its catalog names, so a data directory \
-            with 65 serves; red until a catalog above the node's 64 tiered lifetimes is refused \
-            before any cell with a typed error"]
 fn a_boot_serves_at_most_sixty_four_live_tiered_definitions() {
     let dir = data_root("boot-boundary");
     let mut fresh = start(&dir);

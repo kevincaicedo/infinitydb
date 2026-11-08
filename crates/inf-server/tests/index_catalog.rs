@@ -59,7 +59,8 @@ fn fleet() -> (Vec<Keyspace>, std::sync::Arc<ControlHandle>, inf_server::Control
         dropped: Vec::new(),
     };
     let (control, inbox, _issuers) =
-        ControlHandle::detached_with_catalog(Some(&seed), cell_count(), 0);
+        ControlHandle::detached_with_catalog(Some(&seed), cell_count(), 0)
+            .expect("the catalog boots");
     let mut cells = Vec::new();
     for _ in 0..CELLS {
         let mut ks = Keyspace::new(StoreConfig::default());
@@ -192,7 +193,8 @@ fn declarations_survive_restart_through_the_meta_swap() {
     // "Reboot": load the catalog, re-seed control plane + a fresh cell.
     let loaded = load_catalog(&dir).expect("readable").expect("present");
     let (control2, _inbox2, _issuers2) =
-        ControlHandle::detached_with_catalog(Some(&loaded), cell_count(), 0);
+        ControlHandle::detached_with_catalog(Some(&loaded), cell_count(), 0)
+            .expect("the catalog boots");
     assert!(control2.next_index_id() > dropping_id.0, "ids never regress");
     assert!(control2.next_index_generation() > dropping_generation, "generations never regress");
     let mut fresh = Keyspace::new(StoreConfig::default());

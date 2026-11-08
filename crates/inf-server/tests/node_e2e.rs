@@ -719,6 +719,7 @@ impl Node {
             let (control, issuers) = match &held_catalog {
                 None => {
                     inf_server::spawn_control_in(dir.clone(), catalog.as_ref(), space, boot_unix_ms)
+                        .expect("the catalog boots")
                 }
                 Some(hold) => {
                     // The sim's detached writer, driven by a harness
@@ -729,7 +730,8 @@ impl Node {
                         catalog.as_ref(),
                         space,
                         boot_unix_ms,
-                    );
+                    )
+                    .expect("the catalog boots");
                     let hold = Arc::clone(hold);
                     let allow = Arc::new(std::sync::atomic::AtomicU32::new(0));
                     let pump_stop = Arc::new(AtomicBool::new(false));
@@ -6909,7 +6911,8 @@ fn ckpt_one_cell_exhausted_while_the_other_still_reserves() {
 #[test]
 fn set_control_refuses_the_checkpoint_issuer_of_another_cell() {
     let two = inf_foundation::CellCount::new(2).expect("two cells");
-    let (control, _inbox, issuers) = inf_server::ControlHandle::detached(two, 0);
+    let (control, _inbox, issuers) =
+        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
     let mut fabrics = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
     let mut plane = |cell: u16| unwired_plane(cell, 2, fabrics.next().expect("a fabric per cell"));
     let (mut first, mut second) = (plane(0), plane(1));
@@ -6956,8 +6959,10 @@ fn unwired_plane(
 #[test]
 fn set_control_refuses_an_issuer_of_another_boot() {
     let two = inf_foundation::CellCount::new(2).expect("two cells");
-    let (control, _inbox, _issuers) = inf_server::ControlHandle::detached(two, 0);
-    let (other, _other_inbox, other_issuers) = inf_server::ControlHandle::detached(two, 0);
+    let (control, _inbox, _issuers) =
+        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
+    let (other, _other_inbox, other_issuers) =
+        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
     let mut fabrics = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
     let mut plane = unwired_plane(0, 2, fabrics.next().expect("cell 0's fabric"));
     let foreign = other_issuers.cells.into_iter().next().expect("the other boot's cell 0");
@@ -6974,7 +6979,8 @@ fn set_control_refuses_an_issuer_of_another_boot() {
 #[test]
 fn set_control_refuses_a_board_of_another_cell_count() {
     let two = inf_foundation::CellCount::new(2).expect("two cells");
-    let (control, _inbox, issuers) = inf_server::ControlHandle::detached(two, 0);
+    let (control, _inbox, issuers) =
+        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
     let mut fabrics = Mesh::new(4, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
     let mut plane = unwired_plane(0, 4, fabrics.next().expect("cell 0's fabric"));
     let zero = issuers.cells.into_iter().next().expect("cell 0's issuer");

@@ -74,6 +74,13 @@ pub const SERVER_TIMER_OWNERS: Cap =
 /// publication is observed within two completed sweeps.
 pub const CKPT_BOARD_VISITS_PER_TURN: usize = 64;
 
+/// Tiered namespace lifetimes a node holds at once (ADR-0148 D1, A1.1), the
+/// one value `inf_foundation::limits` declares with its unit and crossing:
+/// the catalog writer's grant book refuses a tiered `CREATE` past it, and a
+/// boot whose catalog names more live tiered definitions is refused before
+/// any cell.
+pub use inf_foundation::limits::TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX;
+
 /// The namespace-id counter's spent value (ADR-0148 D4). Unit: namespace
 /// ids per data directory, issued from `FIRST_NAMED_NS_ID` up to
 /// `u32::MAX − 1`, once each (ADR-0015 D2). Owner: the catalog writer, the

@@ -54,11 +54,11 @@ pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
 pub use control::{
     BoardObservation, BoardSweep, CellIssuer, CellRecoverySlot, CheckpointEpoch, CkptBoard,
-    CkptCredit, CkptFinalCredit, CkptIssuers, CkptQuota, CkptSpace, CkptTarget, ControlHandle,
-    ControlInbox, DROPPED_NS_MAX, DdlGauges, DdlTicket, DetachedControl, INDEX_SLOTS, IndexBoard,
-    IssuerMismatch, IssuerRefused, LastSave, NsIdReservation, RecoveryBoard, SweepStep,
-    TombstoneGauges, load_catalog, load_catalog_from, spawn as spawn_control,
-    spawn_in as spawn_control_in,
+    CkptCredit, CkptFinalCredit, CkptIssuers, CkptQuota, CkptSpace, CkptTarget, ControlBootRefused,
+    ControlHandle, ControlInbox, DROPPED_NS_MAX, DdlGauges, DdlTicket, DetachedControl,
+    INDEX_SLOTS, IndexBoard, IssuerMismatch, IssuerRefused, LastSave, NsIdReservation,
+    RecoveryBoard, SweepStep, TombstoneGauges, load_catalog, load_catalog_from,
+    spawn as spawn_control, spawn_in as spawn_control_in,
 };
 pub use data_dir_lock::{DataDirLock, DataDirLockError, LOCK_FILE};
 pub use durable::{

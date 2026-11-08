@@ -967,8 +967,20 @@ fn main() {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let (control, ckpt_issuers) =
-            inf_server::spawn_control(dir.clone(), catalog.as_ref(), args.cells, boot_unix_ms);
+        // A catalog over the node's tiered namespace lifetimes is refused
+        // here, before any cell (ADR-0148 D5): nothing of it is served.
+        let (control, ckpt_issuers) = match inf_server::spawn_control(
+            dir.clone(),
+            catalog.as_ref(),
+            args.cells,
+            boot_unix_ms,
+        ) {
+            Ok(started) => started,
+            Err(refused) => {
+                eprintln!("infinityd: boot refused: {refused}");
+                std::process::exit(1);
+            }
+        };
         // Device-model lifecycle (M4.5-S42, ADR-0091 D1): the file, the
         // device's identity, and — under `auto` — the probe, before any
         // cell starts. A malformed or foreign file is a refusal, never a

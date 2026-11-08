@@ -2352,12 +2352,15 @@ pub(crate) fn boot(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("--cells {e}"))
     })?;
     let catalog = load_catalog_from(disk, &data_dir)?;
+    // A catalog the control plane refuses (ADR-0148 D5) is the boot's typed
+    // error, before any cell exists.
     let (control, inbox, issuers) = inf_server::ControlHandle::detached_with_catalog(
         catalog.as_ref(),
         cell_count,
         // Virtual boot instant (ms): control-plane display only.
         clock.now().as_millis(),
-    );
+    )
+    .map_err(|refused| std::io::Error::new(std::io::ErrorKind::InvalidData, refused.to_string()))?;
     let inf_server::CkptIssuers { host: ckpt_host, cells: cell_issuers } = issuers;
     let mut cell_issuers = cell_issuers.into_iter();
     let fabrics = Mesh::new(scenario.cells, MeshConfig { ring_capacity: 1024, data_credits: 256 });

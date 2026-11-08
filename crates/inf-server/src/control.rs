@@ -63,7 +63,9 @@ use inf_store::{
 };
 use inf_wire::{Domain, Refusal};
 
-use crate::limits::{CKPT_BOARD_VISITS_PER_TURN, NS_IDS_EXHAUSTED};
+use crate::limits::{
+    CKPT_BOARD_VISITS_PER_TURN, NS_IDS_EXHAUSTED, TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX,
+};
 
 /// Recycled-life residue recovery proved at boot (M4.5-S39b, ADR-0090
 /// D2/D4 as amended): how many segments ended their data at a foreign-
@@ -2259,38 +2261,86 @@ impl ControlInbox {
 /// host drains inline, and the boot's checkpoint issuers (ADR-0159 A1.2).
 pub type DetachedControl = (Arc<ControlHandle>, ControlInbox, CkptIssuers);
 
+/// Why the control plane refuses a data directory at boot, before any cell
+/// exists: nothing of the catalog is truncated, deleted, rewritten or
+/// served.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ControlBootRefused {
+    /// The catalog names `live` live tiered namespace definitions, more
+    /// than the node's [`TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX`] lifetimes
+    /// (ADR-0148 D5, A1.2): a data directory with more is refused, with no
+    /// migration. Drop tombstones and their residue take no lifetime.
+    TieredLifetimes { live: usize },
+}
+
+impl std::fmt::Display for ControlBootRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlBootRefused::TieredLifetimes { live } => write!(
+                f,
+                "the catalog names {live} live tiered namespaces, more than the \
+                 {TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX} tiered namespace lifetimes a node \
+                 holds: a data directory with more is refused at boot, with no migration"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ControlBootRefused {}
+
+/// The boot's count of live tiered definitions (ADR-0148 D5): at most the
+/// node's lifetimes, else the typed refusal. One pass over the catalog's
+/// entries, before any cell.
+fn check_tiered_lifetimes(seed: Option<&NsCatalog>) -> Result<(), ControlBootRefused> {
+    let live = seed.map_or(0, |c| c.entries.iter().filter(|e| e.tier.is_some()).count());
+    if live > TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX {
+        return Err(ControlBootRefused::TieredLifetimes { live });
+    }
+    Ok(())
+}
+
 impl ControlHandle {
     /// A control plane without the thread (M2-S19): the caller drains the
     /// returned [`ControlInbox`] inline. Production nodes use
     /// [`spawn`]; the sim's determinism forbids the thread.
-    #[must_use]
-    pub fn detached(cells: CellCount, start_unix_ms: u64) -> DetachedControl {
+    ///
+    /// # Errors
+    /// None in practice: an empty catalog names no tiered namespace. The
+    /// signature is the seeded constructors'.
+    pub fn detached(
+        cells: CellCount,
+        start_unix_ms: u64,
+    ) -> Result<DetachedControl, ControlBootRefused> {
         ControlHandle::detached_in(None, CkptSpace::full(cells), start_unix_ms)
     }
 
     /// A detached control plane seeded from a recovered catalog (the
     /// reboot path: ids never regress across restart — ADR-0015 D2;
     /// index counters follow the same rule, ADR-0075 D1).
-    #[must_use]
+    ///
+    /// # Errors
+    /// [`ControlBootRefused`]: the catalog is refused before any cell.
     pub fn detached_with_catalog(
         seed: Option<&NsCatalog>,
         cells: CellCount,
         start_unix_ms: u64,
-    ) -> DetachedControl {
+    ) -> Result<DetachedControl, ControlBootRefused> {
         ControlHandle::detached_in(seed, CkptSpace::full(cells), start_unix_ms)
     }
 
     /// [`detached_with_catalog`](Self::detached_with_catalog) over an
     /// explicit issuance space — the A1.5 headroom seam for tests.
-    #[must_use]
+    ///
+    /// # Errors
+    /// [`ControlBootRefused`]: the catalog is refused before any cell.
     pub fn detached_in(
         seed: Option<&NsCatalog>,
         space: CkptSpace,
         start_unix_ms: u64,
-    ) -> DetachedControl {
-        let (handle, rx, writer, issuers) = ControlHandle::new_parts(seed, space, start_unix_ms);
+    ) -> Result<DetachedControl, ControlBootRefused> {
+        let (handle, rx, writer, issuers) = ControlHandle::new_parts(seed, space, start_unix_ms)?;
         let inbox = ControlInbox { rx, handle: Arc::clone(&handle), writer, next: None };
-        (handle, inbox, issuers)
+        Ok((handle, inbox, issuers))
     }
 
     /// The handle, the writer's inbox, the writer with its tombstone set
@@ -2298,12 +2348,14 @@ impl ControlHandle {
     /// surviving tombstone is re-stamped with one fresh all-cell request
     /// (ADR-0100 D3: cells edge-detect it after recovery, and the next
     /// persist retires what they cover), paid by the control writer's
-    /// quota before any cell serves (ADR-0159 A1.2).
+    /// quota before any cell serves (ADR-0159 A1.2). A catalog over the
+    /// node's tiered lifetimes is refused first, with nothing built.
     fn new_parts(
         seed: Option<&NsCatalog>,
         space: CkptSpace,
         start_unix_ms: u64,
-    ) -> (Arc<ControlHandle>, mpsc::Receiver<ControlMsg>, CatalogWriter, CkptIssuers) {
+    ) -> Result<ControlParts, ControlBootRefused> {
+        check_tiered_lifetimes(seed)?;
         let cells = space.cells.get();
         let Partition { clock, owner, participants } =
             issue::partition(CkptBoard::new(space.cells), space.space);
@@ -2358,9 +2410,13 @@ impl ControlHandle {
         let writer =
             CatalogWriter { handle: Arc::clone(&handle), epochs, tombstones, pending: None };
         writer.publish_gauges();
-        (handle, rx, writer, CkptIssuers { host, cells: cell_issuers })
+        Ok((handle, rx, writer, CkptIssuers { host, cells: cell_issuers }))
     }
 }
+
+/// What [`ControlHandle::new_parts`] builds: the handle, the writer's
+/// inbox, the writer, and the boot's checkpoint issuers.
+type ControlParts = (Arc<ControlHandle>, mpsc::Receiver<ControlMsg>, CatalogWriter, CkptIssuers);
 
 /// Spawns the control thread. `seed` is the boot-loaded catalog (its
 /// `next_id` seeds the allocator; a fresh node starts at the named floor).
@@ -2368,25 +2424,32 @@ impl ControlHandle {
 /// The thread fail-stops the process on a failed swap: the catalog is
 /// durability metadata and a lost DDL after its `+OK` would be a §8.2
 /// violation — same rule class as fsync failure.
+///
+/// # Errors
+/// [`ControlBootRefused`]: the catalog is refused before any cell, and no
+/// thread is spawned.
 pub fn spawn(
     data_dir: PathBuf,
     seed: Option<&NsCatalog>,
     cells: CellCount,
     start_unix_ms: u64,
-) -> (Arc<ControlHandle>, CkptIssuers) {
+) -> Result<(Arc<ControlHandle>, CkptIssuers), ControlBootRefused> {
     spawn_in(data_dir, seed, CkptSpace::full(cells), start_unix_ms)
 }
 
 /// [`spawn`] over an explicit issuance space — the A1.5 headroom seam for
 /// tests. Returns the handle and the boot's checkpoint issuers.
+///
+/// # Errors
+/// As [`spawn`].
 pub fn spawn_in(
     data_dir: PathBuf,
     seed: Option<&NsCatalog>,
     space: CkptSpace,
     start_unix_ms: u64,
-) -> (Arc<ControlHandle>, CkptIssuers) {
+) -> Result<(Arc<ControlHandle>, CkptIssuers), ControlBootRefused> {
     let cells = space.cells.get();
-    let (handle, rx, writer, issuers) = ControlHandle::new_parts(seed, space, start_unix_ms);
+    let (handle, rx, writer, issuers) = ControlHandle::new_parts(seed, space, start_unix_ms)?;
     let booked = writer.tombstones.len();
     if booked > DROPPED_NS_MAX {
         eprintln!(
@@ -2414,7 +2477,7 @@ pub fn spawn_in(
             }
         })
         .expect("spawn control thread");
-    (handle, issuers)
+    Ok((handle, issuers))
 }
 
 /// The control thread's message loop + boot narration (M2-S15/M2.5-S01),
@@ -2612,8 +2675,30 @@ mod drop_tombstone_tests {
     fn writer() -> CatalogWriter {
         let cells = inf_foundation::CellCount::new(2).expect("two cells");
         let (_handle, _rx, writer, _issuers) =
-            ControlHandle::new_parts(None, CkptSpace::full(cells), 0);
+            ControlHandle::new_parts(None, CkptSpace::full(cells), 0).expect("the catalog boots");
         writer
+    }
+
+    /// A durable tiered definition of `id`.
+    fn tiered(id: u32) -> NsSpec {
+        NsSpec { tier: Some(inf_store::TierSpec::for_budget(3 << 20)), ..entry(id) }
+    }
+
+    /// The boot's count (ADR-0148 D5): 64 live tiered definitions boot, with
+    /// any number of memory and plain durable ones and of tombstones beside
+    /// them; 65 are refused with the count, before anything is built.
+    #[test]
+    fn a_boot_holds_at_most_sixty_four_live_tiered_definitions() {
+        let cells = inf_foundation::CellCount::new(2).expect("two cells");
+        let boot = |live: u32| {
+            let mut seed = catalog((16..16 + live).map(tiered).collect());
+            seed.entries.extend((200..203).map(entry));
+            seed.next_id = 300;
+            seed.dropped = vec![250, 251];
+            ControlHandle::new_parts(Some(&seed), CkptSpace::full(cells), 0).map(|_| ())
+        };
+        assert_eq!(boot(64), Ok(()), "64 live tiered definitions and two tombstones boot");
+        assert_eq!(boot(65), Err(super::ControlBootRefused::TieredLifetimes { live: 65 }));
     }
 
     /// `spec`'s `CREATE`, its id reserved: the counter is set to it first,
@@ -2763,7 +2848,8 @@ mod drop_tombstone_tests {
         seed.next_id = 16 + 300;
         seed.dropped = (16..16 + 300).collect();
         let (handle, _rx, mut w, _issuers) =
-            ControlHandle::new_parts(Some(&seed), CkptSpace::full(cells), 0);
+            ControlHandle::new_parts(Some(&seed), CkptSpace::full(cells), 0)
+                .expect("the catalog boots");
         let stamp = handle.ckpt_last_issued();
         (0..2).for_each(|cell| handle.ckpt_board().slot(cell).publish(stamp, 1, 1));
         w.tombstones.retire(handle.ckpt_board().min_published());
@@ -2787,7 +2873,8 @@ mod drop_tombstone_tests {
             seed.next_id = 16 + count;
             seed.dropped = (16..16 + count).collect();
             let (handle, _rx, w, _issuers) =
-                ControlHandle::new_parts(Some(&seed), CkptSpace::full(cells), 0);
+                ControlHandle::new_parts(Some(&seed), CkptSpace::full(cells), 0)
+                    .expect("the catalog boots");
             let count = usize::try_from(count).expect("fits");
             assert_eq!(w.tombstones.len(), count);
             assert_eq!(w.tombstones.ceiling, count.max(DROPPED_NS_MAX));
@@ -3013,7 +3100,8 @@ mod tests {
     #[test]
     fn ckpt_issue_at_u64_max_never_repeats() {
         let space = CkptSpace::with_headroom(cells(2), headroom(2)).expect("fits");
-        let (handle, _inbox, issuers) = ControlHandle::detached_in(None, space, 0);
+        let (handle, _inbox, issuers) =
+            ControlHandle::detached_in(None, space, 0).expect("the catalog boots");
         assert_eq!(handle.ckpt_last_issued(), u64::MAX - (3 * 2 + 2), "(N + 1)·h + N below");
         let mut ledger = BTreeSet::new();
         let mut previous = handle.ckpt_last_issued();
@@ -3051,7 +3139,8 @@ mod tests {
     /// observation, so the wake fires.
     #[test]
     fn published_sum_at_2_pow_63_is_not_the_initial_state() {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(2), 0);
+        let (handle, _inbox, _issuers) =
+            ControlHandle::detached(cells(2), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         board.slot(0).publish(1 << 63, 1, 1);
         board.slot(1).publish(1 << 63, 1, 1);
@@ -3069,7 +3158,8 @@ mod tests {
     /// 2^63 + 2^63, and the alias oracle sees it.
     #[test]
     fn canary_the_u64_fold_aliases_the_initial_state() {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(2), 0);
+        let (handle, _inbox, _issuers) =
+            ControlHandle::detached(cells(2), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         board.slot(0).publish(1 << 63, 1, 1);
         board.slot(1).publish(1 << 63, 1, 1);
@@ -3081,7 +3171,8 @@ mod tests {
     #[test]
     fn one_exhausted_quota_leaves_the_others_reserving() {
         let space = CkptSpace::with_headroom(cells(2), headroom(1)).expect("fits");
-        let (_handle, _inbox, issuers) = ControlHandle::detached_in(None, space, 0);
+        let (_handle, _inbox, issuers) =
+            ControlHandle::detached_in(None, space, 0).expect("the catalog boots");
         let mut quotas = issuers.cells.into_iter().map(|issuer| issuer.quota);
         let (mut first, mut second) = (quotas.next().expect("cell 0"), quotas.next().expect("1"));
         assert!(first.request(CkptTarget::All).is_ok());
@@ -3094,7 +3185,8 @@ mod tests {
     /// any point is observed within two completed sweeps.
     #[test]
     fn a_full_board_sweeps_in_256_bounded_turns_and_sees_an_advance_within_two() {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(SLOT_COUNT), 0);
+        let (handle, _inbox, _issuers) =
+            ControlHandle::detached(cells(SLOT_COUNT), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let mut sweep = BoardSweep::new(CellId(0));
         let mut turns = 0u32;
@@ -3125,7 +3217,8 @@ mod tests {
     /// the two-sweep oracle goes red.
     #[test]
     fn canary_a_stalled_sweep_is_caught() {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(SLOT_COUNT), 0);
+        let (handle, _inbox, _issuers) =
+            ControlHandle::detached(cells(SLOT_COUNT), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let mut sweep = BoardSweep::new(CellId(0));
         board.slot(3).publish(7, 1, 1_000);
@@ -3154,7 +3247,8 @@ mod tests {
     #[test]
     fn at_64_cells_or_fewer_one_step_equals_the_old_fold() {
         for count in [1u16, 2, 7, 64] {
-            let (handle, _inbox, _issuers) = ControlHandle::detached(cells(count), 0);
+            let (handle, _inbox, _issuers) =
+                ControlHandle::detached(cells(count), 0).expect("the catalog boots");
             let board = handle.ckpt_board();
             for cell in 0..count {
                 let epoch = u64::from(cell) * 7 + 3;
@@ -3225,7 +3319,8 @@ mod tests {
     /// progress already read (any other slot when the sweep is at its
     /// start): the observation that ends the term must carry both.
     fn turns_until_an_own_publication_is_observed(count: u16, me: u16, steps_in: u32) -> u32 {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(count), 0);
+        let (handle, _inbox, _issuers) =
+            ControlHandle::detached(cells(count), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let lastsave = LastSave::default();
         let mut sweep = BoardSweep::new(CellId(me));
@@ -3267,7 +3362,8 @@ mod tests {
     /// wire such a pair).
     #[test]
     fn a_sweep_of_a_cell_off_the_board_has_no_own_slot_term() {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(2), 0);
+        let (handle, _inbox, _issuers) =
+            ControlHandle::detached(cells(2), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let mut sweep = BoardSweep::new(CellId(2));
         board.slot(0).publish(3, 1, 1_000);
@@ -3287,7 +3383,8 @@ mod tests {
     /// raise) must fail this test.
     #[test]
     fn lastsave_after_wait_cell_covers_the_fenced_checkpoint() {
-        let (handle, _inbox, issuers) = ControlHandle::detached(cells(2), 0);
+        let (handle, _inbox, issuers) =
+            ControlHandle::detached(cells(2), 0).expect("the catalog boots");
         let mut quota = issuers.cells.into_iter().next().expect("cell 0").quota;
         let epoch = quota.request(CkptTarget::Cell(CellId(1))).expect("a unit");
         let board = handle.ckpt_board();
@@ -3335,7 +3432,8 @@ mod tests {
     /// the sweep's term alone (`inf_canary_info_lastsave_from_observation`).
     #[test]
     fn lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell() {
-        let (handle, _inbox, issuers) = ControlHandle::detached(cells(2), 0);
+        let (handle, _inbox, issuers) =
+            ControlHandle::detached(cells(2), 0).expect("the catalog boots");
         let mut quota = issuers.cells.into_iter().next().expect("cell 0").quota;
         let board = handle.ckpt_board();
         let node = NodeInfo::try_default().expect("fixture cache allocation");
@@ -3371,7 +3469,8 @@ mod tests {
     #[test]
     fn control_constructors_take_a_cell_count_up_to_the_slot_count() {
         assert!(CellCount::new(SLOT_COUNT + 1).is_err());
-        let (handle, _inbox, issuers) = ControlHandle::detached(cells(SLOT_COUNT), 0);
+        let (handle, _inbox, issuers) =
+            ControlHandle::detached(cells(SLOT_COUNT), 0).expect("the catalog boots");
         assert_eq!(handle.ckpt_board().cell_count(), usize::from(SLOT_COUNT));
         assert_eq!(issuers.cells.len(), usize::from(SLOT_COUNT));
         assert!(issuers.host.remaining() >= 1 << 49, "Q >= 2^49 at 16,384 cells (A1.2)");

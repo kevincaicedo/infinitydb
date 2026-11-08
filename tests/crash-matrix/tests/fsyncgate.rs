@@ -66,7 +66,8 @@ fn start_node(
         .unwrap_or(0);
     let one_cell = inf_foundation::CellCount::new(1).expect("one cell");
     let (control, issuers) =
-        inf_server::spawn_control(data_dir.to_path_buf(), catalog.as_ref(), one_cell, boot_unix_ms);
+        inf_server::spawn_control(data_dir.to_path_buf(), catalog.as_ref(), one_cell, boot_unix_ms)
+            .expect("the catalog boots");
     let issuer = issuers.cells.into_iter().next().expect("one cell's issuer");
     let dir = data_dir.to_path_buf();
     let fabric = Mesh::new(1, MeshConfig { ring_capacity: 1024, data_credits: 256 })

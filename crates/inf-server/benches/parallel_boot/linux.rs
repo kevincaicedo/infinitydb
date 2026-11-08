@@ -277,7 +277,8 @@ fn boot_once(root: &Path, cells: u16) -> f64 {
     let catalog = inf_server::load_catalog(root).expect("catalog");
     let cell_count = inf_foundation::CellCount::new(cells).expect("a valid bench topology");
     let (control, issuers) =
-        inf_server::spawn_control(root.to_path_buf(), catalog.as_ref(), cell_count, boot_unix_ms);
+        inf_server::spawn_control(root.to_path_buf(), catalog.as_ref(), cell_count, boot_unix_ms)
+            .expect("the catalog boots");
     let mut cell_issuers = issuers.cells.into_iter();
     let board = Arc::clone(control.recovery_board());
 
