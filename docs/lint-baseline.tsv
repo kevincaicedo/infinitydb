@@ -81,7 +81,6 @@ fn_length	1	crates/inf-store/src/evict.rs
 fn_length	1	crates/inf-store/src/keyspace.rs
 fn_length	1	crates/inf-store/src/store.rs
 fn_length	1	crates/inf-store/src/tiered/compact.rs
-fn_length	1	crates/inf-store/src/tiered_recover.rs
 fn_length	1	tests/compat/src/harness.rs
 fn_length	2	tests/compat/src/matrixgen.rs
 fn_length	1	tests/crash-matrix/src/lib.rs
