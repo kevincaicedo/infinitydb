@@ -41,7 +41,7 @@ use inf_foundation::{KeyHasher, LogicalAddr};
 use inf_log::blob::{parse_extent_file_name, parse_quarantined_file_name};
 use inf_log::ckpt::{IckBlobRefSection, IckLiveSetSection, IckRefSection};
 use inf_log::flush::{BootFlush, TierFileMeta, TierFlush, TierFlushConfig};
-use inf_log::fs::{BatchEnd, DirStream, NameBatch, OpenedDir, SegmentFs};
+use inf_log::fs::{BatchEnd, DirStream, NameBatch, OpenedDir, Removal, SegmentFs, remove_listed};
 use inf_log::manifest::{TierFileRange, TierNsManifest};
 use inf_log::tier::{
     SealReason, TIER_FOOTER_BYTES, TierIdentity, TierReseal, VerifiedTier, Verify,
@@ -525,7 +525,9 @@ impl<F: SegmentFs> NsTierMap<F> {
     /// post-replay refcounts', so the tier-file rule never reaches an
     /// extent), and an unmanifested tier file — dead-life garbage —
     /// removed before any new flush references its address space (the S11
-    /// recovery pre-flush rule with the manifest as the authority). A name
+    /// recovery pre-flush rule with the manifest as the authority), through
+    /// [`remove_listed`]: a name the stream returns again after its removal
+    /// is `Gone`, that earlier removal, and only a `Removed` counts. A name
     /// that is not UTF-8 is foreign and kept, as its lossy form never
     /// parses (ADR-0202 D9); so is every other foreign name.
     fn list_name(
@@ -554,8 +556,9 @@ impl<F: SegmentFs> NsTierMap<F> {
         // name's manifest search is a binary search.
         if tier.files.binary_search_by_key(&id, |file| file.id).is_err() {
             work.file_ops += 1;
-            self.fs.remove_file(&self.cold_dir.join(name))?;
-            self.stats.files_removed += 1;
+            if remove_listed(&self.fs, &self.cold_dir.join(name))? == Removal::Removed {
+                self.stats.files_removed += 1;
+            }
         }
         Ok(())
     }
@@ -820,6 +823,7 @@ fn invalid(message: String) -> io::Error {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: a whole listing of a fixture directory")]
 mod tests {
     use inf_foundation::KeyHasher;
 
@@ -990,6 +994,55 @@ mod tests {
                 .map(|name| fs.contents(&std::path::Path::new("shard-0/ns-17/cold").join(name)))
         };
         assert_eq!(left(&fs), left(&whole_fs), "the directory left, byte for byte");
+    }
+
+    /// ADR-0202 D3: under the simulated disk's repeat mode a listing
+    /// returns a dead-life tier file the map removed after its batch; the
+    /// map takes it as that file's earlier removal, removes every dead-life
+    /// file and counts each once. Red where a repeated name refuses.
+    #[test]
+    fn a_repeated_dead_life_name_is_its_earlier_removal() {
+        use inf_log::fs::sim::{SimDisk, SimDiskConfig};
+        let disk = SimDisk::with_config(SimDiskConfig {
+            listing_repeats_removed: true,
+            ..SimDiskConfig::default()
+        });
+        let shard = std::path::PathBuf::from("shard-0/ns-17");
+        let cold = shard.join("cold");
+        disk.create_dir_all(&cold).expect("cold");
+        for id in 0..600 {
+            disk.create_meta(&cold.join(tier_file_name(id))).expect("a dead-life file");
+        }
+        let empty = TierNsManifest { ns: 17, flushed: 0, files: Vec::new() };
+        let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        let recovered = recover_tiered_ns(
+            disk.clone(),
+            &empty,
+            0,
+            TierFlushConfig {
+                shard_dir: shard,
+                cell: 0,
+                ns: inf_log::NsId(17),
+                mode: inf_log::TierIoMode::Buffered,
+                file_capacity: 1 << 20,
+                slice_bytes: 4 << 10,
+                record_len_max: 16 << 20,
+            },
+            AddressSpaceConfig {
+                reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
+                page_bytes: 4 << 10,
+                life_origin: LogicalAddr::ZERO,
+            },
+            demote,
+            64,
+            KeyHasher::default(),
+            &census,
+        )
+        .expect("a repeated name is its earlier removal");
+        assert!(disk.listing_repeats_served() > 0, "VACUOUS: no name was repeated");
+        assert_eq!(recovered.stats.files_removed, 600, "each removal counted once");
+        assert!(disk.list_dir(&cold).expect("cold").is_empty(), "every dead-life file gone");
     }
 
     /// ADR-0174 R2, the reader half: a ref section for a namespace

@@ -229,6 +229,34 @@ pub trait DirStream {
     fn next_batch(&mut self, batch: &mut NameBatch) -> io::Result<BatchEnd>;
 }
 
+/// What removing a listed name found (ADR-0202 D3).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum Removal {
+    /// The name was removed.
+    Removed,
+    /// The name was gone: its own earlier removal, which a stream may
+    /// return again, never a refusal.
+    Gone,
+}
+
+/// Removes a name a listing returned (ADR-0202 D3), the one home of the
+/// repeat rule: within one open stream a name removed after it was
+/// returned may be returned again, so `remove_file`'s `NotFound` is
+/// `Gone` — that name's earlier removal — and every other error an `Err`.
+/// A boot consumer of a listing removes a listed name through this alone
+/// and counts `Removed` only.
+///
+/// # Errors
+/// Every `remove_file` error but `NotFound`.
+pub fn remove_listed<F: SegmentFs>(fs: &F, path: &Path) -> io::Result<Removal> {
+    match fs.remove_file(path) {
+        Ok(()) => Ok(Removal::Removed),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Removal::Gone),
+        Err(err) => Err(err),
+    }
+}
+
 /// The one refusal of a name over the listing's bound, naming the
 /// directory (ADR-0202 D2).
 fn check_name_len(dir: &Path, name: &[u8]) -> io::Result<()> {

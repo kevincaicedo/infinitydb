@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::sim::{SimDisk, SimDiskConfig};
-use inf_log::fs::{BatchEnd, DirStream, NameBatch, OpenedDir, SegmentFs, StdSegmentFs};
+use inf_log::fs::{
+    BatchEnd, DirStream, NameBatch, OpenedDir, Removal, SegmentFs, StdSegmentFs, remove_listed,
+};
 use inf_log::limits::{LISTING_BATCH_BYTES, LISTING_BATCH_NAMES, LISTING_NAME_BYTES_MAX};
 use proptest::prelude::*;
 
@@ -335,4 +337,21 @@ fn the_repeat_mode_returns_removed_names_again_and_moves_no_key() {
     assert_eq!(twice - walked.removed.len(), repeated, "each repeat is a removed name, once");
     assert_eq!(sim.listings_opened(), 1);
     assert_eq!(sim.listing_batches(), 4, "600 names and the repeats in four batches");
+}
+
+/// `remove_listed` holds the repeat rule once (ADR-0202 D3): a present
+/// name is `Removed`, the same name again is `Gone` — that earlier
+/// removal, never a refusal — and every other error is an `Err`.
+#[test]
+fn a_listed_name_removed_twice_is_gone() {
+    let mem = MemFs::new();
+    let dir = Path::new(DIR);
+    create_all(&mem, dir, &BTreeSet::from([b"tier-000001.itier".to_vec(), b"x".to_vec()]));
+    let path = dir.join("tier-000001.itier");
+    assert_eq!(remove_listed(&mem, &path).expect("present"), Removal::Removed);
+    assert_eq!(remove_listed(&mem, &path).expect("its earlier removal"), Removal::Gone);
+    mem.fail_after_ops(0);
+    let err = remove_listed(&mem, &dir.join("x")).expect_err("a dead filesystem's error");
+    assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "an error of its own: {err}");
+    mem.clear_op_fault();
 }
