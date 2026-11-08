@@ -1,7 +1,8 @@
 #![allow(
     clippy::disallowed_types,
-    reason = "bench target: leg A is the cold-read host with its std tables, and the deep legs \
-              keep their waits in a deque reserved before the loop"
+    reason = "bench target: leg A is the cold-read host with its std tables, the deep legs \
+              keep their waits in a deque reserved before the loop, and the rate legs measure \
+              leg A's tables"
 )]
 //! The cold-read path's A/B by instructions (L4): the cell's cold-read
 //! operations on the host as it stood before its fixed stores (A, a
@@ -35,13 +36,12 @@
 //! - `reactor-iteration`: one iteration of the cell loop over a plane that
 //!   holds no cold host and does nothing at its steps.
 //!
-//! Beside them, the rate legs of the fixed stores' one walk, on the capped
-//! map B builds on, reported and never judged: `map-get-6`, `map-get-9`,
-//! `map-get-14` look one live key up in a map of 2^d even keys, a perfect
-//! tree of depth d; `map-admit-remove-6`, `-9`, `-14` admit a vacant odd key
-//! between two live ones (the split at its neighbour's leaf), publish it
-//! and remove it. Their differences across depths are the instructions a
-//! branch visit costs, the rate B's bounds are evaluated at.
+//! Beside them, the rate legs (`cold_path/rates.rs`), reported and never
+//! judged: one container operation a step, on the capped map and slab B
+//! builds on and on leg A's hashed tables and queues, beside a `harness`
+//! leg that runs their loop alone. A rate leg's reading less the harness's
+//! is its operation's instructions, and the map legs' differences across
+//! depths are a branch visit's: the rates each row's bound is evaluated at.
 //!
 //! The instrument: exact user-space instructions per op, `(I(n) − I(0)) /
 //! n`, read outside this binary (`perf stat -e instructions:u`) on one
@@ -68,6 +68,8 @@
 #[path = "cold_path/cold.rs"]
 #[allow(dead_code, reason = "the host is copied whole; each leg drives part of it")]
 mod cold;
+#[path = "cold_path/rates.rs"]
+mod rates;
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -79,7 +81,7 @@ use std::task::{Context, Poll, Waker};
 
 use inf_alloc::{AlignedPool, BufferPool};
 use inf_foundation::CellId;
-use inf_foundation::bounded::{Admission, Cap, CapCensus, CapFill, CappedMap, MapBuilt};
+use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::time::{Nanos, VirtualClock};
 use inf_runtime::{
     BackendDriver, Capabilities, CellLoop, CellPlane, Completion, CompletionResult, IoOp, Issue,
@@ -87,6 +89,7 @@ use inf_runtime::{
 };
 
 use cold::{ColdReadConfig, ColdReads, ColdWait, ReadClass, TierFileId};
+use rates::RateLeg;
 
 /// One pool buffer, the server's cold window: four 4 KiB frames.
 const BUFFER_BYTES: usize = 4 * inf_alloc::TIER_READ_ALIGN;
@@ -112,12 +115,11 @@ enum Leg {
     Cohort { depth: usize, background: usize },
     Deep { stride: bool },
     ReactorIteration,
-    MapGet { depth: u32 },
-    MapAdmitRemove { depth: u32 },
+    Rate(RateLeg),
 }
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 34] = [
+const LEGS: [(&str, Leg, u8); 60] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -140,18 +142,44 @@ const LEGS: [(&str, Leg, u8); 34] = [
     ("deep-stride-plus-one", Leg::Deep { stride: true }, 1),
     ("reactor-iteration", Leg::ReactorIteration, 0),
     ("reactor-iteration-plus-one", Leg::ReactorIteration, 1),
-    ("map-get-6", Leg::MapGet { depth: 6 }, 0),
-    ("map-get-6-plus-one", Leg::MapGet { depth: 6 }, 1),
-    ("map-get-9", Leg::MapGet { depth: 9 }, 0),
-    ("map-get-9-plus-one", Leg::MapGet { depth: 9 }, 1),
-    ("map-get-14", Leg::MapGet { depth: 14 }, 0),
-    ("map-get-14-plus-one", Leg::MapGet { depth: 14 }, 1),
-    ("map-admit-remove-6", Leg::MapAdmitRemove { depth: 6 }, 0),
-    ("map-admit-remove-6-plus-one", Leg::MapAdmitRemove { depth: 6 }, 1),
-    ("map-admit-remove-9", Leg::MapAdmitRemove { depth: 9 }, 0),
-    ("map-admit-remove-9-plus-one", Leg::MapAdmitRemove { depth: 9 }, 1),
-    ("map-admit-remove-14", Leg::MapAdmitRemove { depth: 14 }, 0),
-    ("map-admit-remove-14-plus-one", Leg::MapAdmitRemove { depth: 14 }, 1),
+    ("harness", Leg::Rate(RateLeg::Harness), 0),
+    ("harness-plus-one", Leg::Rate(RateLeg::Harness), 1),
+    ("map-get-0", Leg::Rate(RateLeg::MapGet { depth: 0 }), 0),
+    ("map-get-0-plus-one", Leg::Rate(RateLeg::MapGet { depth: 0 }), 1),
+    ("map-get-6", Leg::Rate(RateLeg::MapGet { depth: 6 }), 0),
+    ("map-get-6-plus-one", Leg::Rate(RateLeg::MapGet { depth: 6 }), 1),
+    ("map-get-9", Leg::Rate(RateLeg::MapGet { depth: 9 }), 0),
+    ("map-get-9-plus-one", Leg::Rate(RateLeg::MapGet { depth: 9 }), 1),
+    ("map-get-14", Leg::Rate(RateLeg::MapGet { depth: 14 }), 0),
+    ("map-get-14-plus-one", Leg::Rate(RateLeg::MapGet { depth: 14 }), 1),
+    ("map-admit-remove-empty", Leg::Rate(RateLeg::MapAdmitRemoveEmpty), 0),
+    ("map-admit-remove-empty-plus-one", Leg::Rate(RateLeg::MapAdmitRemoveEmpty), 1),
+    ("map-admit-remove-6", Leg::Rate(RateLeg::MapAdmitRemove { depth: 6 }), 0),
+    ("map-admit-remove-6-plus-one", Leg::Rate(RateLeg::MapAdmitRemove { depth: 6 }), 1),
+    ("map-admit-remove-9", Leg::Rate(RateLeg::MapAdmitRemove { depth: 9 }), 0),
+    ("map-admit-remove-9-plus-one", Leg::Rate(RateLeg::MapAdmitRemove { depth: 9 }), 1),
+    ("map-admit-remove-14", Leg::Rate(RateLeg::MapAdmitRemove { depth: 14 }), 0),
+    ("map-admit-remove-14-plus-one", Leg::Rate(RateLeg::MapAdmitRemove { depth: 14 }), 1),
+    ("slab-cycle", Leg::Rate(RateLeg::SlabCycle), 0),
+    ("slab-cycle-plus-one", Leg::Rate(RateLeg::SlabCycle), 1),
+    ("slab-get", Leg::Rate(RateLeg::SlabGet), 0),
+    ("slab-get-plus-one", Leg::Rate(RateLeg::SlabGet), 1),
+    ("hash-get-6", Leg::Rate(RateLeg::HashGet { depth: 6 }), 0),
+    ("hash-get-6-plus-one", Leg::Rate(RateLeg::HashGet { depth: 6 }), 1),
+    ("hash-get-9", Leg::Rate(RateLeg::HashGet { depth: 9 }), 0),
+    ("hash-get-9-plus-one", Leg::Rate(RateLeg::HashGet { depth: 9 }), 1),
+    ("hash-get-14", Leg::Rate(RateLeg::HashGet { depth: 14 }), 0),
+    ("hash-get-14-plus-one", Leg::Rate(RateLeg::HashGet { depth: 14 }), 1),
+    ("hash-insert-remove-6", Leg::Rate(RateLeg::HashInsertRemove { depth: 6 }), 0),
+    ("hash-insert-remove-6-plus-one", Leg::Rate(RateLeg::HashInsertRemove { depth: 6 }), 1),
+    ("hash-insert-remove-9", Leg::Rate(RateLeg::HashInsertRemove { depth: 9 }), 0),
+    ("hash-insert-remove-9-plus-one", Leg::Rate(RateLeg::HashInsertRemove { depth: 9 }), 1),
+    ("hash-insert-remove-14", Leg::Rate(RateLeg::HashInsertRemove { depth: 14 }), 0),
+    ("hash-insert-remove-14-plus-one", Leg::Rate(RateLeg::HashInsertRemove { depth: 14 }), 1),
+    ("deque-push-or-pop", Leg::Rate(RateLeg::DequePushOrPop), 0),
+    ("deque-push-or-pop-plus-one", Leg::Rate(RateLeg::DequePushOrPop), 1),
+    ("vec-push-or-pop", Leg::Rate(RateLeg::VecPushOrPop), 0),
+    ("vec-push-or-pop-plus-one", Leg::Rate(RateLeg::VecPushOrPop), 1),
 ];
 
 struct Args {
@@ -345,8 +373,8 @@ fn drive_host<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
         | Leg::Singleton { depth, background }
         | Leg::Cohort { depth, background } => (depth, background),
         Leg::Deep { .. } => (1, 0),
-        Leg::ReactorIteration | Leg::MapGet { .. } | Leg::MapAdmitRemove { .. } => {
-            unreachable!("a reactor or map leg drives its own state")
+        Leg::ReactorIteration | Leg::Rate(_) => {
+            unreachable!("a reactor or rate leg drives its own state")
         }
     };
     // The class queue: four times the depth, as the server sizes it, or the
@@ -370,8 +398,8 @@ fn drive_host<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
             Leg::Singleton { .. } => step_singleton(cell),
             Leg::Cohort { .. } => step_cohort(cell),
             Leg::Deep { stride } => step_deep(cell, stride, op),
-            Leg::ReactorIteration | Leg::MapGet { .. } | Leg::MapAdmitRemove { .. } => {
-                unreachable!("a reactor or map leg drives its own state")
+            Leg::ReactorIteration | Leg::Rate(_) => {
+                unreachable!("a reactor or rate leg drives its own state")
             }
         };
         accumulator = accumulator.wrapping_add(effect);
@@ -393,8 +421,8 @@ fn engaged(leg: Leg, cell: &HostCell, ops: u64) {
             (ops, ops * members, ops * (members - 1), 0, ops * u64::from(background > 0))
         }
         Leg::Deep { .. } => (ops, ops, 0, 0, 0),
-        Leg::ReactorIteration | Leg::MapGet { .. } | Leg::MapAdmitRemove { .. } => {
-            unreachable!("a reactor or map leg drives its own state")
+        Leg::ReactorIteration | Leg::Rate(_) => {
+            unreachable!("a reactor or rate leg drives its own state")
         }
     };
     assert_eq!(counts.issued, issued, "the leg's reads issued");
@@ -477,82 +505,6 @@ fn drive_loop<const NOPS: u8>(ops: u64) -> u64 {
     accumulator.wrapping_add(lp.executor().live_tasks() as u64)
 }
 
-/// The map legs' caps: 2^d live keys and the one the admit leg adds.
-const MAP_6: Cap = Cap::entries::<65>("bench-map-6", CapFill::Serving);
-const MAP_9: Cap = Cap::entries::<513>("bench-map-9", CapFill::Serving);
-const MAP_14: Cap = Cap::entries::<16_385>("bench-map-14", CapFill::Serving);
-
-/// A map of the 2^`depth` even keys below 2^(`depth` + 1): a perfect tree of
-/// depth `depth`, built by steps before the loop.
-fn even_keys(depth: u32) -> (CappedMap<u64, u32>, std::rc::Rc<CapCensus>) {
-    let cap = match depth {
-        6 => MAP_6,
-        9 => MAP_9,
-        14 => MAP_14,
-        other => unreachable!("no map leg at depth {other}"),
-    };
-    let (census, _serve_mark) = CapCensus::new(CellId(0));
-    let mut builder = CappedMap::<u64, u32>::builder(cap, &census).expect("registered");
-    let mut map = loop {
-        match builder.step() {
-            MapBuilt::More(next) => builder = next,
-            MapBuilt::Live(map) => break map,
-            MapBuilt::Refused(_, refused) => panic!("{refused}"),
-        }
-    };
-    for key in (0..1u64 << (depth + 1)).step_by(2) {
-        let Admission::Vacant(slot) = map.admit(key) else { panic!("a fresh key") };
-        slot.publish(1);
-    }
-    (map, census)
-}
-
-#[inline(never)]
-fn step_map_get(map: &mut CappedMap<u64, u32>, key: u64) -> u64 {
-    map.get(key).copied().map_or(0, u64::from)
-}
-
-#[inline(never)]
-fn step_map_admit_remove(map: &mut CappedMap<u64, u32>, key: u64) -> u64 {
-    let Admission::Vacant(slot) = map.admit(key) else { panic!("a vacant key") };
-    slot.publish(2);
-    map.remove(key).map_or(0, u64::from)
-}
-
-/// Drives `ops` map ops with `NOPS` planted per op: a get of a live even
-/// key, or an admit, publish and remove of the odd key beside one, the
-/// keys walked in turn.
-#[inline(never)]
-fn drive_map<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
-    let (depth, admit) = match leg {
-        Leg::MapGet { depth } => (depth, false),
-        Leg::MapAdmitRemove { depth } => (depth, true),
-        Leg::EnqueueCancel { .. }
-        | Leg::Singleton { .. }
-        | Leg::Cohort { .. }
-        | Leg::Deep { .. }
-        | Leg::ReactorIteration => unreachable!("a host or reactor leg drives its own state"),
-    };
-    let (mut map, _census) = even_keys(depth);
-    let live = map.len();
-    let mask = (1u64 << depth) - 1;
-    let map = black_box(&mut map);
-    let mut accumulator = 0u64;
-    for op in 0..ops {
-        plant::<NOPS>();
-        let key = 2 * (op & mask);
-        let effect =
-            if admit { step_map_admit_remove(map, key + 1) } else { step_map_get(map, key) };
-        accumulator = accumulator.wrapping_add(effect);
-    }
-    // Engagement, after the counted loop: every op found or placed its key
-    // and the map holds its live keys alone.
-    let per_op = if admit { 2 } else { 1 };
-    assert_eq!(accumulator, ops * per_op, "every op reached its key");
-    assert_eq!(map.len(), live, "the map holds its live keys");
-    accumulator
-}
-
 fn main() -> ExitCode {
     let args = match parse() {
         Ok(args) => args,
@@ -564,8 +516,8 @@ fn main() -> ExitCode {
     let result = match (args.leg, args.nops) {
         (Leg::ReactorIteration, 0) => drive_loop::<0>(args.ops),
         (Leg::ReactorIteration, _) => drive_loop::<1>(args.ops),
-        (Leg::MapGet { .. } | Leg::MapAdmitRemove { .. }, 0) => drive_map::<0>(args.leg, args.ops),
-        (Leg::MapGet { .. } | Leg::MapAdmitRemove { .. }, _) => drive_map::<1>(args.leg, args.ops),
+        (Leg::Rate(leg), 0) => rates::drive::<0>(leg, args.ops),
+        (Leg::Rate(leg), _) => rates::drive::<1>(leg, args.ops),
         (leg, 0) => drive_host::<0>(leg, args.ops),
         (leg, _) => drive_host::<1>(leg, args.ops),
     };
