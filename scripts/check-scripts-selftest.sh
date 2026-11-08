@@ -5884,7 +5884,7 @@ expect green "deny: a red census runs no leg" dr_red_census
 
 # ------------------------------------------------------------- target root
 group_target_root() {
-# ADR-0204 D1: scripts/target-root.sh on fixture checkouts, each holding a
+# ADR-0204 D1, D2, D5: scripts/target-root.sh on fixture checkouts, each with a
 # copy of the helper under scripts/. A stub cargo first on PATH records each
 # call and answers `cargo metadata` as TR_META says, from the directory it
 # runs in (its `clean` removes the one directory it names, under the work
@@ -5948,6 +5948,19 @@ tr_entry() {
     fi
 }
 tr_print() { local dir=$1 var=$2; shift 2; tr_entry "$dir" "$var" --print "$@"; }
+tr_clean() { local dir=$1 var=$2; shift 2; tr_entry "$dir" "$var" --clean "$@"; }
+# tr_clean_refused <checkout> <var or -> <pattern> [<VAR=value>…]: --clean
+# exits 2, nothing on stdout, nothing removed, no cargo clean called.
+tr_clean_refused() {
+    local dir=$1 var=$2 pattern=$3 status=0
+    shift 3
+    tr_clean "$dir" "$var" "$@" || status=$?
+    [ "$status" -eq 2 ] && [ ! -s "$TRW/out" ] && grep -q -- "$pattern" "$TRW/err" &&
+        ! grep -q "$(printf 'call\tclean')" "$TRW/calls" && return 0
+    echo "--clean exit $status, want 2 naming '$pattern':"
+    cat "$TRW/out" "$TRW/err" "$TRW/calls"
+    return 1
+}
 tr_prints() { # <checkout> <var or -> <root>: exit 0, stdout exactly the root
     local status=0
     tr_print "$1" "$2" || status=$?
@@ -6116,8 +6129,8 @@ printf '%s\n' "$TRW/gone" >"$TR_MK/.checkout-path"
 tr_checkout "$TR_MK/co"
 expect green "target-root: a checkout inside a directory holding a marker is refused" \
     tr_setup_refused "$TR_MK/co" - "lies at or under $TR_MK, a target root (it holds .checkout-path)"
-expect_red_because "target-root: --print alone is the command" "usage: scripts/target-root.sh --print" \
-    "$TR_A/scripts/target-root.sh"
+expect_red_because "target-root: --print or --clean alone is the command" \
+    "usage: scripts/target-root.sh --print | --clean" "$TR_A/scripts/target-root.sh"
 # --print: the marker.
 tr_first() { # an absent root is made, marked, tagged and printed; cargo asked once, unset
     tr_prints "$TR_A" - "$TR_PA/target" || return 1
@@ -6146,27 +6159,33 @@ tr_kept_only() {
 }
 expect green "target-root: a root holding only this checkout's kept directories and a temporary is marked" \
     tr_kept_only
-TR_OUT="$TRW/outputs"
+TR_OUT="$TRW/the outputs"
 tr_checkout "$TR_OUT"
 mkdir -p "$TR_OUT/target/debug"
-expect green "target-root: outputs with no marker are refused, naming the root's own clean" \
-    tr_refused "$TR_OUT" - "cargo clean --target-dir $TR_OUT/target && ./scripts/target-root.sh --print"
+expect green "target-root: outputs with no marker are refused, printing the one --clean command, quoted" \
+    tr_refused "$TR_OUT" - "^    cd '$TR_OUT' && ./scripts/target-root.sh --clean$"
 expect green "target-root: a refused root gets no marker" test ! -e "$TR_OUT/target/.checkout-path"
+tr_one_command() { # <stderr file>: the refusal prints one command, its own checkout's --clean
+    [ "$(grep -c '^    ' "$1")" -eq 1 ] && grep -q '^    cd .* && ./scripts/target-root.sh --clean$' "$1" &&
+        ! grep -q 'cargo clean\|rm -rf' "$1" || { cat "$1"; return 1; }
+}
+expect green "target-root: that refusal prints no other command and no path to remove" \
+    tr_one_command "$TRW/err"
 tr_clean_line() { # the refusal's printed command, run as printed: one path to cargo, then marked
     local line
     tr_print "$TR_OUT" - && return 1
-    line=$(sed -n 's/^    \(cd .* && cargo clean .*\)$/\1/p' "$TRW/err")
-    [ -n "$line" ] || { echo "no printed clean line"; cat "$TRW/err"; return 1; }
+    line=$(sed -n 's/^    \(cd .* && \.\/scripts\/target-root\.sh --clean\)$/\1/p' "$TRW/err")
+    [ -n "$line" ] || { echo "no printed --clean line"; cat "$TRW/err"; return 1; }
     : >"$TRW/calls"
     env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET PATH="$TR_BIN:$PATH" \
         TR_CALLS="$TRW/calls" TR_WORK="$TRW" bash -c "$line" >"$TRW/out" 2>"$TRW/err" ||
         { cat "$TRW/err"; return 1; }
-    [ "$(sed -n 1p "$TRW/calls")" = "$(printf 'call\tclean\t--target-dir\t%s\tCARGO_TARGET_DIR=<unset>' "$TR_OUT/target")" ] ||
-        { echo "cargo's argv:"; cat "$TRW/calls"; return 1; }
+    [ "$(sed -n 2p "$TRW/calls")" = "$(printf 'call\tclean\t--target-dir\t%s\tCARGO_TARGET_DIR=<unset>' "$TR_OUT/target")" ] ||
+        { echo "cargo's argv (metadata, then the clean):"; cat "$TRW/calls"; return 1; }
     [ "$(cat "$TRW/out")" = "$TR_OUT/target" ] && [ ! -e "$TR_OUT/target/debug" ] &&
         [ "$(cat "$TR_OUT/target/.checkout-path")" = "$(tr_phys "$TR_OUT")" ]
 }
-expect green "target-root: the printed clean gets one path, its root, and the next --print marks it" \
+expect green "target-root: the printed --clean gives cargo one path, its root, and marks it" \
     tr_clean_line
 TR_OK="$TRW/other-key"
 tr_checkout "$TR_OK"
@@ -6176,9 +6195,89 @@ expect green "target-root: another checkout's kept directory is output no marker
 cp -a "$TR_A" "$TRW/copy"
 expect green "target-root: a checkout copied with its target is refused, naming both paths" \
     tr_refused "$TRW/copy" - "holds the outputs of the checkout at $TR_PA, not of this one at $(tr_phys "$TRW/copy")"
+expect green "target-root: the copy's refusal prints its own --clean alone" tr_one_command "$TRW/err"
 mv "$TRW/copy" "$TRW/moved"
 expect green "target-root: a checkout moved with its target is refused" \
     tr_refused "$TRW/moved" - "a checkout copied or moved with its target"
+# --clean: checks 1-5 first, then the walk and the marker, then cargo's clean.
+TR_CL="$TRW/clean me"
+tr_checkout "$TR_CL"
+TR_PCL=$(tr_phys "$TR_CL")
+expect green "target-root: --clean refuses a CARGO_TARGET_DIR naming another directory" \
+    tr_clean_refused "$TR_CL" "$TR_V" "CARGO_TARGET_DIR is"
+expect green "target-root: --clean refuses a set CARGO_BUILD_TARGET" \
+    tr_clean_refused "$TR_CL" - "CARGO_BUILD_TARGET is set" CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu
+expect green "target-root: --clean refuses cargo's build directory apart from the root" \
+    tr_clean_refused "$TR_CL" - "cargo's build directory is" TR_META=split
+tr_clean_absent() { # an absent root: nothing to remove, marked and printed
+    local status=0
+    tr_clean "$TR_CL" - || status=$?
+    [ "$status" -eq 0 ] && [ "$(cat "$TRW/out")" = "$TR_PCL/target" ] &&
+        [ "$(cat "$TR_CL/target/.checkout-path")" = "$TR_PCL" ] &&
+        ! grep -q "$(printf 'call\tclean')" "$TRW/calls" || { cat "$TRW/out" "$TRW/err" "$TRW/calls"; return 1; }
+}
+expect green "target-root: --clean on an absent root marks it, removing nothing" tr_clean_absent
+tr_clean_outputs() { # a marked root with outputs: cleaned by cargo, then marked again
+    local status=0
+    mkdir -p "$TR_CL/target/debug/deps"
+    tr_clean "$TR_CL" - || status=$?
+    [ "$status" -eq 0 ] && [ "$(cat "$TRW/out")" = "$TR_PCL/target" ] && [ ! -e "$TR_CL/target/debug" ] &&
+        [ "$(ls -A "$TR_CL/target" | tr '\n' ' ')" = ".checkout-path CACHEDIR.TAG " ] &&
+        [ "$(sed -n 2p "$TRW/calls")" = "$(printf 'call\tclean\t--target-dir\t%s\tCARGO_TARGET_DIR=<unset>' "$TR_PCL/target")" ] ||
+        { cat "$TRW/out" "$TRW/err" "$TRW/calls"; ls -A "$TR_CL/target"; return 1; }
+}
+expect green "target-root: --clean removes the root through cargo's clean, then marks it" tr_clean_outputs
+tr_walk_case() { # <name> <path under the root> <pattern>: --print names it, --clean refuses it
+    local dir="$TRW/walk-$1"
+    tr_checkout "$dir"
+    mkdir -p "$dir/target/debug" "$(dirname "$dir/target/$2")"
+    : >"$dir/target/$2"
+    : >"$dir/target/debug/kept"
+    tr_refused "$dir" - "$3" || return 1
+    ! grep -q '^    ' "$TRW/err" || { echo "a command was printed:"; cat "$TRW/err"; return 1; }
+    tr_clean_refused "$dir" - "$3" || return 1
+    [ -e "$dir/target/$2" ] && [ -e "$dir/target/debug/kept" ]
+}
+expect green "target-root: a .git below the root is named, no command printed; --clean refuses it" \
+    tr_walk_case below-git "debug/wt/.git" "holds $TRW/walk-below-git/target/debug/wt/.git, a work tree or a repository"
+expect green "target-root: a .git at the root's top is refused too" \
+    tr_walk_case top-git ".git" "holds $TRW/walk-top-git/target/.git, a work tree or a repository"
+expect green "target-root: another root's marker below the root is named; --clean refuses it" \
+    tr_walk_case below-marker "debug/x/.checkout-path" "another checkout's target root"
+tr_clean_walk_marked() { # a marked root: --clean still walks before removing
+    local dir="$TRW/walk-marked"
+    tr_checkout "$dir"
+    tr_prints "$dir" - "$(tr_phys "$dir")/target" || return 1
+    mkdir -p "$dir/target/debug/b"
+    : >"$dir/target/debug/b/.git"
+    tr_clean_refused "$dir" - "a work tree or a repository" && [ -e "$dir/target/debug/b/.git" ]
+}
+expect green "target-root: --clean on a marked root refuses a .git below it" tr_clean_walk_marked
+tr_sharer() { # W's target is a link to R, R's marker names W: --print names W, no command; --clean refuses
+    local dir="$TRW/shared-r" other="$TRW/sharer w"
+    tr_checkout "$dir"
+    tr_checkout "$other"
+    mkdir -p "$dir/target/debug"
+    tr_phys "$other" >"$dir/target/.checkout-path"
+    ln -s "$dir/target" "$other/target"
+    tr_refused "$dir" - "is also the target of the checkout at $(tr_phys "$other")" || return 1
+    ! grep -q '^    ' "$TRW/err" || { echo "a command was printed:"; cat "$TRW/err"; return 1; }
+    tr_clean_refused "$dir" - "is also the target of the checkout at" || return 1
+    [ -d "$dir/target/debug" ]
+}
+expect green "target-root: a root that a live checkout's linked target shares is named; --clean refuses" \
+    tr_sharer
+tr_gone_writer() { # the marker names a checkout that is gone: a copy's root, cleaned by --clean
+    local dir="$TRW/gone-writer"
+    tr_checkout "$dir"
+    mkdir -p "$dir/target/debug"
+    printf '%s\n' "$TRW/no-such-checkout" >"$dir/target/.checkout-path"
+    tr_refused "$dir" - "holds the outputs of the checkout at $TRW/no-such-checkout" || return 1
+    tr_one_command "$TRW/err" || return 1
+    tr_clean "$dir" - && [ ! -e "$dir/target/debug" ] && [ "$(cat "$dir/target/.checkout-path")" = "$(tr_phys "$dir")" ]
+}
+expect green "target-root: a root a gone checkout marked prints --clean, which cleans and marks it" \
+    tr_gone_writer
 # --print: where cargo says the builds land, the variable removed.
 TR_M="$TRW/meta"
 tr_checkout "$TR_M"
@@ -6263,7 +6362,16 @@ tr_control outputs tr_outputs_case
 tr_control build-dir tr_split_case
 tr_control unkeyed tr_kept_case
 tr_control variable tr_variable_case
-tr_mutant marker 's/if writer != phys + "\\n":/if False:/' tr_copy_case "skips the marker's checkout"
+tr_walk_mutant_case() { # <helper dir>: --clean refuses a root holding a work tree
+    mkdir -p "$1/target/debug/wt"
+    : >"$1/target/debug/wt/.git"
+    tr_clean_refused "$1" - "a work tree or a repository" && [ -e "$1/target/debug/wt/.git" ]
+}
+tr_control walk tr_walk_mutant_case
+tr_mutant marker 's/^if writer is not None and writer != phys + "\\n":$/if False:/' tr_copy_case \
+    "skips the marker's checkout"
+tr_mutant walk 's/^            if name == ".git" or (name == MARKER and here != root):$/            if False:/' \
+    tr_walk_mutant_case "removes a root that holds a work tree"
 tr_mutant outputs 's/^        if others:$/        if False:/' tr_outputs_case "stamps a root holding outputs"
 tr_mutant build-dir 's/^    if os.path.realpath(path) != os.path.realpath(root):$/    if False:/' tr_split_case \
     "skips the build directory"

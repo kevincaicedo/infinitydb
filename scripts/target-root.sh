@@ -64,16 +64,31 @@
 # `[build] target-dir = "target"`). Then it reads the root's marker,
 # .checkout-path, the physical path of the checkout it was made for:
 #   - this checkout: it prints the root;
+#   - another checkout W that exists and whose target is this directory
+#     (the same device and inode: a link or a mount): exit 2, naming W;
 #   - another (a checkout copied or moved with its target): exit 2;
 #   - none, and the root absent or holding only this checkout's kept
 #     directories and the marker's rename temporaries: it writes the marker
 #     (a temporary, then a rename), then a CACHEDIR.TAG, and prints the root;
-#   - none, and any other entry (outputs that cargo or an editor wrote
-#     before the first recipe, a copy of a checkout that never ran one, a
-#     root from before this rule): exit 2.
-# The last two refusals print the command that removes this checkout's root
-# and marks it again, its paths shell-quoted: one cold build. Gates never
-# read the marker: CI runs them alone on a restored target.
+#   - none, and any other entry: it walks the root without following links,
+#     and a .git (a work tree or a repository) or a .checkout-path (another
+#     root) there is named, exit 2; else (outputs that cargo or an editor
+#     wrote before the first recipe, a copy of a checkout that never ran
+#     one, a root from before this rule) exit 2, naming its first entries.
+# A refusal prints at most one command, `cd <checkout> &&
+# ./scripts/target-root.sh --clean` (the copy's and the unmarked outputs'),
+# and never a path to remove: the tree can change between a print and its
+# run. Gates never read the marker: CI runs them alone on a restored target.
+#
+# Run as `scripts/target-root.sh --clean`, it runs the export's checks, then
+# walks the root without following links and refuses, removing nothing, when
+# the root or a directory below it holds a .git, or a directory below its top
+# holds a .checkout-path, and when its marker names a live checkout whose
+# target is this directory. Otherwise it runs `cargo clean --target-dir
+# <root>`, then marks the empty root as --print does and prints it: one cold
+# build. The checks and the removal run in one process, so nothing changes
+# between them, and no command it prints or runs removes another checkout or
+# another root.
 
 TARGET_ROOT_KEPT="lint-ratchet fuzz-check"
 
@@ -207,7 +222,7 @@ if mode == "setup":
     print(root)
     sys.exit(0)
 
-# --print: where cargo says this checkout's builds land.
+# --print and --clean: where cargo says this checkout's builds land.
 env = {k: v for k, v in os.environ.items() if k != "CARGO_TARGET_DIR"}
 try:
     run = subprocess.run(["cargo", "metadata", "--no-deps", "--offline", "--format-version", "1"],
@@ -238,48 +253,128 @@ for what, path in (("target", target), ("build", build)):
                f"{os.path.join(phys, '.cargo', 'config.toml')} holding "
                "[build] target-dir = \"target\"")
 
-# The marker.
-clean = (f"    cd {quoted(phys)} && cargo clean --target-dir {quoted(root)} && "
-         "./scripts/target-root.sh --print")
+# The marker, and what a removal of the root would also remove.
+CLEAN = f"    cd {quoted(phys)} && ./scripts/target-root.sh --clean"
 marker = os.path.join(root, MARKER)
-stamp = True
-if os.path.isdir(root):
+
+
+def written_for():
+    """The marker's checkout, or None when the root or its marker is absent."""
+    if not os.path.isdir(root):
+        return None
     try:
         with open(marker, encoding="utf-8", errors="surrogateescape") as f:
-            writer = f.read()
+            return f.read()
     except FileNotFoundError:
-        writer = None
+        return None
     except OSError as err:
         refuse(f"target-root: cannot read {marker} ({err})")
-    if writer is not None:
-        if writer != phys + "\n":
-            refuse(f"target-root: {root} holds the outputs of the checkout at "
-                   f"{writer.rstrip(chr(10))}, not of this one at {phys}: a checkout copied or "
-                   "moved with its target. Cargo would read them as fresh here, so no recipe "
-                   "runs until this root is removed and marked again (one cold build):", clean)
-        stamp = False
-    else:
-        allowed = {f"{name}-{key}" for name in kept}
-        others = sorted(e for e in os.listdir(root)
-                        if e not in allowed and not e.startswith(TEMPORARY))
-        if others:
-            shown = ", ".join(others[:5]) + (f" and {len(others) - 5} more" if len(others) > 5
-                                              else "")
-            refuse(f"target-root: {root} holds {shown} but no marker naming this checkout: "
-                   "outputs that cargo or an editor wrote before the first recipe, a copy of a "
-                   "checkout that never ran one, or a root from before this rule. Cargo would "
-                   "read them as fresh, so no recipe runs until this root is removed and "
-                   "marked (one cold build):", clean)
-if stamp:
+
+
+def shares_root(writer):
+    """The marker names a live checkout whose target is this directory."""
+    other = writer.rstrip("\n")
+    try:
+        mine, theirs = os.stat(root), os.stat(os.path.join(other, "target"))
+    except OSError:
+        return None
+    if os.path.isdir(other) and (mine.st_dev, mine.st_ino) == (theirs.st_dev, theirs.st_ino):
+        return other
+    return None
+
+
+def walk_hit():
+    """The first .git at or below the root, or .checkout-path below its top."""
+    def unreadable(err):
+        refuse(f"target-root: cannot read {err.filename} while walking {root} ({err.strerror}), "
+               "so what removing the root would remove is unknown")
+    if not os.path.isdir(root):
+        return None
+    for here, dirs, files in os.walk(root, onerror=unreadable):
+        for name in dirs + files:
+            if name == ".git" or (name == MARKER and here != root):
+                return os.path.join(here, name)
+    return None
+
+
+def hit_refusal(hit, after):
+    what = ("a work tree or a repository" if os.path.basename(hit) == ".git"
+            else "another checkout's target root")
+    refuse(f"target-root: {root} holds {hit}, {what}: removing this root would remove it. Move "
+           f"it out of the root (a work tree: git worktree move <it> <a directory outside "
+           f"{root}>), then {after}")
+
+
+def sharer_refusal(other):
+    refuse(f"target-root: {root} is also the target of the checkout at {other} (its target is a "
+           "link or a mount to this directory, the same device and inode): removing it would "
+           f"remove that checkout's root. Remove {os.path.join(other, 'target')} (that "
+           "checkout's own recipes refuse a linked target), then run the recipe again")
+
+
+def stamp():
     os.makedirs(root, exist_ok=True)
     temporary = os.path.join(root, f"{TEMPORARY}{os.getpid()}")
     with open(temporary, "w", encoding="utf-8", errors="surrogateescape") as f:
         f.write(phys + "\n")
     os.replace(temporary, marker)
-tag = os.path.join(root, "CACHEDIR.TAG")
-if not os.path.exists(tag):
-    with open(tag, "w", encoding="utf-8") as f:
-        f.write(TAG)
+
+
+def tag():
+    path = os.path.join(root, "CACHEDIR.TAG")
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(TAG)
+
+
+if mode == "clean":
+    hit = walk_hit()
+    if hit:
+        hit_refusal(hit, "run this command again")
+    writer = written_for()
+    if writer is not None and writer != phys + "\n" and shares_root(writer):
+        sharer_refusal(shares_root(writer))
+    if os.path.lexists(root):
+        run = subprocess.run(["cargo", "clean", "--target-dir", root], cwd=phys,
+                             capture_output=True, text=True)
+        if run.returncode != 0:
+            refuse(f"target-root: cargo clean --target-dir {root} exited {run.returncode}; run "
+                   "this command again:",
+                   *("    " + line for line in run.stderr.strip("\n").split("\n")[-20:]))
+        if os.path.lexists(root):
+            refuse(f"target-root: cargo clean --target-dir {root} left the root in place; "
+                   "nothing was marked")
+    stamp()
+    tag()
+    print(root)
+    sys.exit(0)
+
+writer = written_for()
+if writer is not None and writer != phys + "\n":
+    if shares_root(writer):
+        sharer_refusal(shares_root(writer))
+    refuse(f"target-root: {root} holds the outputs of the checkout at "
+           f"{writer.rstrip(chr(10))}, not of this one at {phys}: a checkout copied or moved with "
+           "its target. Cargo would read them as fresh here, so no recipe runs until this root "
+           "is cleaned (one cold build):", CLEAN)
+if writer is None:
+    if os.path.isdir(root):
+        allowed = {f"{name}-{key}" for name in kept}
+        others = sorted(e for e in os.listdir(root)
+                        if e not in allowed and not e.startswith(TEMPORARY))
+        if others:
+            hit = walk_hit()
+            if hit:
+                hit_refusal(hit, "run the recipe again, which prints the command that cleans it")
+            shown = ", ".join(others[:5]) + (f" and {len(others) - 5} more" if len(others) > 5
+                                              else "")
+            refuse(f"target-root: {root} holds {shown} but no marker naming this checkout: "
+                   "outputs that cargo or an editor wrote before the first recipe, a copy of a "
+                   "checkout that never ran one, or a root from before this rule. Cargo would "
+                   "read them as fresh, so no recipe runs until this root is cleaned (one cold "
+                   "build):", CLEAN)
+    stamp()
+tag()
 print(root)
 PY
 }
@@ -324,8 +419,9 @@ target_root_kept() {
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     set -euo pipefail
     case "$#:${1:-}" in
-        1:--print) ;;
-        *) echo "usage: scripts/target-root.sh --print (or source it)" >&2; exit 2 ;;
+        1:--print) mode=print ;;
+        1:--clean) mode=clean ;;
+        *) echo "usage: scripts/target-root.sh --print | --clean (or source it)" >&2; exit 2 ;;
     esac
-    target_root_py print "$(cd "$(dirname "$0")/.." && pwd -P)" "$TARGET_ROOT_KEPT"
+    target_root_py "$mode" "$(cd "$(dirname "$0")/.." && pwd -P)" "$TARGET_ROOT_KEPT"
 fi
