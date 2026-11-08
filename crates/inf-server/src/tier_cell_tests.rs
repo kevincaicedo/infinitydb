@@ -1074,7 +1074,7 @@ fn a_dropped_holder_releases_the_turn_to_the_namespace_after_the_one_served_last
     assert_eq!(cell.turn.served_last, Some(NsId(16)));
     // 17 gets work; 18 is dropped while it holds the turn.
     fill_sealed(ks.tiered_store_mut(NsId(17)).expect("materialized"), 8 << 20);
-    ks.ns_drop(b"t18").expect("registered");
+    ks.ns_drop_uncataloged(b"t18").expect("registered");
     cell.sync_namespaces(&ks, &mut vec![(NsId(18), 1)]);
     assert_eq!(cell.round_drain.len(), 1, "18's prepared round parks");
     assert_eq!(cell.turn.holder, None, "a dropped holder releases the turn");
@@ -1103,7 +1103,7 @@ fn a_dropped_planned_last_passes_the_plan_to_the_first_id_above_it() {
     pass(&mut cell, &mut ks, 1, &mut refuse);
     assert_eq!(planned(&cell), vec![16, 17]);
     assert_eq!(cell.turn.planned_last, Some(NsId(17)));
-    ks.ns_drop(b"t17").expect("registered");
+    ks.ns_drop_uncataloged(b"t17").expect("registered");
     cell.sync_namespaces(&ks, &mut vec![(NsId(17), 1)]);
     assert_eq!(cell.round_drain.len(), 1, "17's prepared round parks");
     pass(&mut cell, &mut ks, 2, &mut refuse);
@@ -1442,7 +1442,10 @@ fn on_disk(cell: &TierCell<SimDisk>, path: &std::path::Path) -> bool {
 /// A tier file whose unlink fails keeps an owner and is unlinked again:
 /// the error is not fatal, so the file's record stays until an unlink of it
 /// answers. `tier_unlink_fail` fires once on the retired file's unlink;
-/// eight MAINTAINs follow with nothing armed.
+/// eight MAINTAINs follow with nothing armed. The driver steps the cell's
+/// MAINTAIN alone, where the unlink runs at this shape; once a cell never
+/// unlinks a tier file (`the_cell_leaves_tier_file_unlinks_to_the_control_thread`),
+/// the retry runs on the control thread, and the driver steps its pass too.
 #[test]
 #[ignore = "a failed tier-file unlink is discarded after the file's record was removed, so the \
             file stays on the disk with no owner and nothing retries it; red until a failed \

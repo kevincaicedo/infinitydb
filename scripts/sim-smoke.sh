@@ -85,6 +85,7 @@ rows=(
   "m2-recycle"
   "m2-combined"
   "m2-ns-create-window"
+  "m2-ns-drop-window"
   "m2-ns-ddl-race"
   "m3-document"
   "boot-storm"

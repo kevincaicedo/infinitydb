@@ -48,7 +48,7 @@ use inf_store::{
     IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, NsId, StoreConfig, WallAnchor,
 };
 
-use crate::harness::node_hasher;
+use crate::harness::{STEP_NS_FLOOR, node_hasher};
 use crate::lift::LiftNs;
 
 use crate::net::{CellNet, Plant, SimDriver, listener_fd};
@@ -133,8 +133,9 @@ pub struct DurableScenario {
     /// frames; `everysec` values stay small so the deferral oracle
     /// measures the ack, not the pad.
     pub value_pad_max: u64,
-    /// Max virtual nanoseconds per scheduler step. Sized so runs span
-    /// several simulated seconds — the everysec window is real.
+    /// The seeded part of a scheduler step's advance, exclusive: a step
+    /// advances `STEP_NS_FLOOR` plus a draw in `0..step_ns_max`. Sized so
+    /// runs span several simulated seconds — the everysec window is real.
     pub step_ns_max: u64,
     /// A second power cut lands *during* recovery (interrupted-recovery
     /// idempotence, in-sim).
@@ -2370,13 +2371,13 @@ pub(crate) fn boot(
         let pool = BufferPool::new(128, 1024);
         let node_info = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
-        let mut ks =
-            Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
-        if let Some(catalog) = &catalog {
-            ks.seed_catalog(catalog).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
-            })?;
-        }
+        // The node's keyspace is cataloged (ADR-0189 D4), as `infinityd`'s.
+        let empty = inf_store::NsCatalog::empty();
+        let ks = Keyspace::cataloged(
+            StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() },
+            catalog.as_ref().unwrap_or(&empty),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
         let (mut plane, serve_mark, timer_set) = SimPlane::new(
             CellId(i as u16),
             scenario.cells,
@@ -2496,7 +2497,7 @@ impl Node {
         if !self.hold_inbox {
             self.inbox.drain(disk, &self.data_dir)?;
         }
-        clock.advance(Nanos(1_000 + rng.next_u64() % step_ns_max));
+        clock.advance(Nanos(STEP_NS_FLOOR + rng.next_u64() % step_ns_max));
         if !self.observed_ready && self.ready() {
             self.observe_state(b"recovered");
             self.observed_ready = true;
@@ -2506,6 +2507,13 @@ impl Node {
 
     pub(crate) fn ready(&self) -> bool {
         self.control.recovery_board().all_ready()
+    }
+
+    /// Answers at most `requests` queued catalog requests now, whatever
+    /// `hold_inbox` says (the `m2-ns-drop-window` scenario): the writer
+    /// answers the first and holds the next, first in line.
+    pub(crate) fn drain_inbox_requests(&mut self, requests: u32) -> std::io::Result<u32> {
+        self.inbox.drain_requests(&self.disk, &self.data_dir, Some(requests))
     }
 
     /// Read-only plane access for the M3-S23 equivalence oracle — used

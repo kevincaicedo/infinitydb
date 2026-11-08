@@ -105,6 +105,10 @@ Requirements:
 - **Linux with `io_uring`** to run the server (kernel 5.15+, 6.1+ recommended).
   macOS builds and tests via `kqueue` for development/correctness, but is not
   a performance target.
+- **`/dev/shm` on a tmpfs that takes `O_DIRECT`** (Linux 6.6 or newer) for
+  `just check` and the workspace tests: the `timer_owners` test keeps its
+  node's data there, and without it the test fails rather than skips. The
+  server itself runs on 5.15.
 - **`redis-server` 8.0.5** on `PATH` (or `INF_COMPAT_ORACLE_ADDR` pointing at
   one): `just check`, the workspace tests and `just compat` byte-diff
   against it, and an absent or different version fails rather than skips.

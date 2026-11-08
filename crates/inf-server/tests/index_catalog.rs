@@ -47,9 +47,19 @@ fn cell_count() -> inf_foundation::CellCount {
 }
 
 /// Eight cells' registries plus the control handle — the DDL fan's
-/// destination set, driven directly (S10 wires the wire-level verbs).
+/// destination set, driven directly (the wire-level verbs are not driven
+/// here). The
+/// control plane boots from a catalog naming `ledger`, so its counter is
+/// past `ledger`'s id as every `META` it writes must be.
 fn fleet() -> (Vec<Keyspace>, std::sync::Arc<ControlHandle>, inf_server::ControlInbox) {
-    let (control, inbox, _issuers) = ControlHandle::detached(cell_count(), 0);
+    let seed = inf_store::NsCatalog {
+        next_id: ledger_spec().id.0 + 1,
+        entries: vec![ledger_spec()],
+        index: inf_store::IndexCatalog::default(),
+        dropped: Vec::new(),
+    };
+    let (control, inbox, _issuers) =
+        ControlHandle::detached_with_catalog(Some(&seed), cell_count(), 0);
     let mut cells = Vec::new();
     for _ in 0..CELLS {
         let mut ks = Keyspace::new(StoreConfig::default());

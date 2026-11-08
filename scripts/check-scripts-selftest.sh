@@ -517,9 +517,10 @@ expect red "panic-policy: no crates at all is a failure, not OK" env INF_CHECK_R
 
 # ------------------------------------------------------------ reply outcome
 group_reply_outcome() {
-# ADR-0190 D4: no production site of crates/inf-server/src reads a reply's
-# outcome from its bytes. Each fixture is one inf-server lib.rs (and a
-# test-only modfile where the case needs one).
+# ADR-0190 D4, A2: no production site of crates/inf-server/src reads a
+# reply's outcome from its bytes, or names a fabric reply tag outside the
+# functions that set and read it. Each fixture is one inf-server lib.rs, with
+# a test-only modfile or a row's file beside it where the case needs one.
 REPLY=./scripts/check-reply-outcome.sh
 ro_fixture() {
     local name=$1 root
@@ -529,6 +530,19 @@ ro_fixture() {
     mkdir -p "$root/crates/inf-server/src"
     cat >"$root/crates/inf-server/src/lib.rs"
     echo "$root"
+}
+# ro_put <root> <path>: one more file of a fixture ro_fixture made, at <path>
+# under its crates/inf-server/src, from stdin; it removes nothing.
+ro_put() {
+    local root=$1 path=$2
+    case $root in
+    "$work"/?*) ;;
+    *) echo "ro_put: '$root' is not a fixture directory under $work" >&2; exit 2 ;;
+    esac
+    [ -n "$path" ] && [ -d "$root/crates/inf-server/src" ] ||
+        { echo "ro_put: no path or no fixture at '$root'" >&2; exit 2; }
+    mkdir -p "$(dirname "$root/crates/inf-server/src/$path")"
+    cat >"$root/crates/inf-server/src/$path"
 }
 
 IFS= read -r -d '' body <<'EOF' || true
@@ -633,6 +647,515 @@ expect_red_because "reply-outcome: an empty file set is a scope error" "REPLY-OU
     env INF_CHECK_ROOT="$work/roempty" $REPLY
 fx_build_empty
 expect red "reply-outcome: a missing directory is a scope error" env INF_CHECK_ROOT="$work/empty" $REPLY
+
+# ADR-0190 A2: the fabric's reply tag meets a reply's bytes only in the
+# functions that set and read it. R1 is a path through `Outcome` to anything
+# but a non-reply variant, R2 a path through `ReplyOutcome`, R3 another name
+# for either enum; no marker sanctions one. Each red case names its message.
+RO_TAG="REPLY-OUTCOME violation (a reply tag outside its functions)"
+RO_NAME="REPLY-OUTCOME violation (another name for a reply tag's enum)"
+for snippet in \
+    "pub fn t(b: &[u8]) -> inf_fabric::Outcome<'_> { inf_fabric::Outcome::Bytes(b) }" \
+    "pub fn t(b: Option<&[u8]>) -> Option<Outcome<'_>> { b.map(Outcome::ErrorReply) }" \
+    "pub fn t(o: &Outcome<'_>) -> bool { matches!(o, Outcome::ErrorReply(_)) }" \
+    "pub fn t(b: &[u8]) -> Outcome<'_> { Outcome :: Bytes (b) }" \
+    "pub fn t(b: &[u8]) -> Outcome<'_> { Outcome::r#Bytes(b) }" \
+    "pub fn t(b: &[u8]) -> Outcome<'_> { Outcome::<'_>::Bytes(b) }" \
+    "use inf_fabric::Outcome::*;" \
+    "use inf_fabric::Outcome::{Bytes};" \
+    "use inf_fabric::Outcome::Bytes as Tag;" \
+    "pub fn t(b: &[u8]) -> inf_fabric::Outcome<'_> { inf_fabric::Outcome::from_reply(b) }" \
+    "pub fn t(b: &[u8]) -> Outcome<'_> { wire_reply(b, ReplyOutcome::Success) }" \
+    "pub fn t(n: usize) -> StagedReply { StagedReply::Bytes(0, n, ReplyOutcome::Error) }" \
+    "use inf_wire::ReplyOutcome::*;" \
+    "pub fn t(b: &[u8]) -> inf_wire::ReplyOutcome { inf_wire::ReplyOutcome::from_byte(b[0]) }" \
+    "pub fn t(ok: bool) { debug_assert!(ok, \"an Outcome::Bytes leg\"); }"
+do
+    root=$(ro_fixture rotag <<<"$snippet")
+    expect_red_because "reply-outcome: a reply tag, planted '$snippet'" "$RO_TAG" \
+        env INF_CHECK_ROOT="$root" $REPLY
+done
+for snippet in \
+    "pub fn t(b: &'static [u8]) -> Outcome<'static> { <inf_fabric::Outcome<'_> as From<&[u8]>>::from(b) }" \
+    "type Wire<'a> = inf_fabric::Outcome<'a>;" \
+    "pub fn t(b: &[u8]) -> inf_fabric::Outcome<'_> { <inf_fabric::Outcome<'_>>::Bytes(b) }" \
+    "use inf_wire::ReplyOutcome as Tag;" \
+    "type Tag = inf_wire::ReplyOutcome;"
+do
+    root=$(ro_fixture roname <<<"$snippet")
+    expect_red_because "reply-outcome: another name, planted '$snippet'" "$RO_NAME" \
+        env INF_CHECK_ROOT="$root" $REPLY
+done
+
+IFS= read -r -d '' body <<'EOF' || true
+use inf_fabric::Outcome;
+pub fn t(b: &[u8]) -> Outcome<'_> {
+    Outcome::ErrorReply(b)
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture roimported)
+expect_red_because "reply-outcome: a hand-built ErrorReply after the enum's import" "$RO_TAG" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+macro_rules! tag {
+    ($v:ident, $b:expr) => {
+        inf_fabric::Outcome::$v($b)
+    };
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture ropaste)
+expect_red_because "reply-outcome: a macro pasting a variant after the enum's path" "$RO_TAG" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+pub fn t(b: &[u8]) -> inf_fabric::Outcome<'_> {
+    inf_fabric::Outcome::
+        Bytes(b)
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture rosplit)
+expect_red_because "reply-outcome: a path split after the enum's ::" "$RO_TAG" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+pub fn ok() {}
+
+#[cfg(test)]
+fn t(b: &[u8]) -> inf_fabric::Outcome<'_> {
+    inf_fabric::Outcome::Bytes(b)
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture roinline)
+expect_red_because "reply-outcome: an inline #[cfg(test)] function is production" "$RO_TAG" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+use inf_fabric::{Op, Outcome as Wire};
+pub fn t(b: &[u8]) -> Wire<'_> {
+    Wire::Bytes(b)
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture rorename)
+expect_red_because "reply-outcome: a rename of the enum" "$RO_NAME" env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+trait Tag {
+    fn tag(b: &'static [u8]) -> Self;
+}
+impl Tag for inf_fabric::Outcome<'static> {
+    fn tag(b: &'static [u8]) -> Self {
+        Self::Bytes(b)
+    }
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture roimpl)
+expect_red_because "reply-outcome: an impl of a local trait for the enum" "$RO_NAME" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+# rustfmt splits an impl header past 100 columns: `for E` on its own line.
+IFS= read -r -d '' body <<'EOF' || true
+trait AVeryLongTraitNameThatTagsAFabricReplyFromItsOwnBytesByHand<'a> {
+    fn tag(b: &'a [u8]) -> Self;
+}
+impl<'a> AVeryLongTraitNameThatTagsAFabricReplyFromItsOwnBytesByHand<'a>
+    for inf_fabric::Outcome<'a>
+{
+    fn tag(b: &'a [u8]) -> Self {
+        Self::Bytes(b)
+    }
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture roimplsplit)
+expect_red_because "reply-outcome: an impl for the enum, its header split by rustfmt" "$RO_NAME" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+macro_rules! tag {
+    ($e:ident, $b:expr) => {
+        $e::Bytes($b)
+    };
+}
+pub fn t(b: &[u8]) -> inf_fabric::Outcome<'_> {
+    use inf_fabric::Outcome;
+    tag!(Outcome, b)
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture rofragment)
+expect_red_because "reply-outcome: a fragment pasted before a reply variant's name" "$RO_NAME" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+macro_rules! tag {
+    ($e:ident, $v:ident, $b:expr) => {
+        $e::$v($b)
+    };
+}
+pub fn t(b: &[u8]) -> inf_fabric::Outcome<'_> {
+    use inf_fabric::Outcome;
+    tag!(Outcome, Bytes, b)
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture rofragments)
+expect_red_because "reply-outcome: a fragment pasted before another fragment" "$RO_NAME" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+# ro_a2_only <root>: red on reply-tag lines alone: A2's two trailer lines, and
+# neither D4's marker sentence nor a stale-marker line.
+ro_a2_only() {
+    local status=0
+    env INF_CHECK_ROOT="$1" $REPLY >"$work/ro-a2.log" 2>&1 || status=$?
+    if [ "$status" -ne 0 ] &&
+        grep -qF "Tag a reply with wire_reply(bytes, reply.outcome()); read an outcome with is_error()." \
+            "$work/ro-a2.log" &&
+        grep -qF "A new site that names a reply tag changes ADR-0190 D3 and A2; no marker sanctions it." \
+            "$work/ro-a2.log" &&
+        ! grep -qF "a sanctioned site carries" "$work/ro-a2.log" &&
+        ! grep -qF "a marker guarding no hit" "$work/ro-a2.log"; then
+        return 0
+    fi
+    echo "exit $status"
+    cat "$work/ro-a2.log"
+    return 1
+}
+IFS= read -r -d '' body <<'EOF' || true
+pub fn t(b: &[u8]) -> inf_fabric::Outcome<'_> {
+    // reply-outcome-allow: a fixture's reason
+    inf_fabric::Outcome::Bytes(b)
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture romarked)
+expect_red_because "reply-outcome: a marker above a reply tag leaves it red" \
+    "a marker does not sanction a reply tag" env INF_CHECK_ROOT="$root" $REPLY
+expect green "reply-outcome: a marker above a reply tag is not stale and sends no one to a marker" \
+    ro_a2_only "$root"
+root=$(ro_fixture rotrailer <<<"pub fn t(b: &[u8]) -> inf_fabric::Outcome<'_> { inf_fabric::Outcome::Bytes(b) }")
+expect green "reply-outcome: a reply tag alone prints A2's trailer and not D4's marker sentence" \
+    ro_a2_only "$root"
+
+# ro_both <root>: a line that is both a byte shape and a reply tag prints both
+# violations and both trailers.
+ro_both() {
+    local status=0
+    env INF_CHECK_ROOT="$1" $REPLY >"$work/ro-both.log" 2>&1 || status=$?
+    if [ "$status" -ne 0 ] &&
+        grep -qF "REPLY-OUTCOME violation (an outcome read from a reply's bytes)" "$work/ro-both.log" &&
+        grep -qF "$RO_TAG" "$work/ro-both.log" &&
+        grep -qF "a sanctioned site carries" "$work/ro-both.log" &&
+        grep -qF "no marker sanctions it" "$work/ro-both.log"; then
+        return 0
+    fi
+    echo "exit $status"
+    cat "$work/ro-both.log"
+    return 1
+}
+root=$(ro_fixture roboth <<<"pub fn t(b: Vec<u8>) { let _ = inf_wire::OwnedReply::received(b, inf_wire::ReplyOutcome::Error); }")
+expect green "reply-outcome: a received( line with a chosen outcome prints both rules' messages" \
+    ro_both "$root"
+
+# The rows: plane/fabric.rs's wire_reply and owned_outcome, plane/scatter.rs's
+# stages, each from its declaration at column 0 to the next line that begins
+# with `}`. The bodies below are the tree's.
+IFS= read -r -d '' RO_WIRE <<'EOF' || true
+pub(super) fn wire_reply(bytes: &[u8], outcome: ReplyOutcome) -> Outcome<'_> {
+    match outcome {
+        ReplyOutcome::Success => Outcome::Bytes(bytes),
+        ReplyOutcome::Error if cfg!(inf_canary_fabric_error_as_bytes) => Outcome::Bytes(bytes),
+        ReplyOutcome::Error => Outcome::ErrorReply(bytes),
+    }
+}
+EOF
+IFS= read -r -d '' RO_STAGED <<'EOF' || true
+pub(super) fn staged_outcome<'a>(scratch: &'a [u8], reply: &StagedReply) -> Outcome<'a> {
+    match *reply {
+        StagedReply::Bytes(start, end, outcome) => wire_reply(&scratch[start..end], outcome),
+        StagedReply::Int(n) => Outcome::Int(n),
+        StagedReply::Nil => Outcome::Nil,
+        StagedReply::Ok => Outcome::Ok,
+        StagedReply::Refused => Outcome::Err(ErrCode::Unknown(0)),
+    }
+}
+EOF
+IFS= read -r -d '' RO_OWNED <<'EOF' || true
+fn owned_outcome<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    outcome: Outcome<'_>,
+) -> OwnedOutcome {
+    match outcome {
+        Outcome::Bytes(bytes) => received_reply(shared, bytes, ReplyOutcome::Success),
+        Outcome::ErrorReply(bytes) => received_reply(shared, bytes, ReplyOutcome::Error),
+        Outcome::Ok => OwnedOutcome::Ok,
+        Outcome::Int(n) => OwnedOutcome::Int(n),
+        Outcome::Nil => OwnedOutcome::Nil,
+        Outcome::Bool(b) => OwnedOutcome::Bool(b),
+        Outcome::Err(code) => OwnedOutcome::Err(code),
+    }
+}
+EOF
+IFS= read -r -d '' RO_STAGES <<'EOF' || true
+pub(super) fn stages_despite_error(id: CommandId) -> bool {
+    matches!(id, CommandId::Mset | CommandId::Msetnx)
+}
+
+pub(super) fn stages(outcome: ReplyOutcome, id: CommandId) -> bool {
+    outcome == ReplyOutcome::Success || stages_despite_error(id)
+}
+EOF
+# The staged drain tagging its span by hand: the function after wire_reply.
+IFS= read -r -d '' RO_LIE <<'EOF' || true
+pub(super) fn staged_outcome<'a>(scratch: &'a [u8], reply: &StagedReply) -> Outcome<'a> {
+    match *reply {
+        StagedReply::Bytes(start, end, _) => Outcome::Bytes(&scratch[start..end]),
+        StagedReply::Ok => Outcome::Ok,
+    }
+}
+EOF
+
+root=$(printf '%s\n' 'mod plane;' | ro_fixture roelsewhere)
+printf '%s' "$RO_WIRE" | ro_put "$root" plane/dispatch.rs
+expect_red_because "reply-outcome: a row's name in another file allows nothing" "$RO_TAG" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+root=$(printf '%s\n' 'mod plane;' | ro_fixture ronext)
+printf '%s\n' "$RO_WIRE" "$RO_LIE" "$RO_OWNED" | ro_put "$root" plane/fabric.rs
+expect_red_because "reply-outcome: the function after wire_reply is outside its row" "$RO_TAG" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+# A row's close with a trailing comment ends its range as rustfmt's `}` does.
+root=$(printf '%s\n' 'mod plane;' | ro_fixture roclosenote)
+{
+    printf '%s' "$RO_WIRE" | sed 's|^}$|} // the owner side sets the tag here|'
+    printf '\n%s\n%s' "$RO_LIE" "$RO_OWNED"
+} | ro_put "$root" plane/fabric.rs
+expect_red_because "reply-outcome: a commented close of wire_reply allows nothing after it" "$RO_TAG" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+impl Fabric {
+    pub(super) fn wire_reply(bytes: &[u8], outcome: ReplyOutcome) -> Outcome<'_> {
+        match outcome {
+            ReplyOutcome::Success => Outcome::Bytes(bytes),
+            ReplyOutcome::Error => Outcome::ErrorReply(bytes),
+        }
+    }
+}
+EOF
+root=$(printf '%s\n' 'mod plane;' | ro_fixture roindented)
+printf '%s\n' "$body" "$RO_OWNED" | ro_put "$root" plane/fabric.rs
+expect_red_because "reply-outcome: an indented wire_reply gives no allowance" "$RO_TAG" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+pub(super) fn stages_despite_error(id: CommandId, outcome: ReplyOutcome) -> bool {
+    outcome == ReplyOutcome::Error && matches!(id, CommandId::Mset | CommandId::Msetnx)
+}
+
+pub(super) fn stages(outcome: ReplyOutcome, id: CommandId) -> bool {
+    outcome == ReplyOutcome::Success || stages_despite_error(id)
+}
+EOF
+root=$(printf '%s\n' 'mod plane;' | ro_fixture roneighbour)
+printf '%s' "$body" | ro_put "$root" plane/scatter.rs
+expect_red_because "reply-outcome: stages_despite_error is not the row stages" "$RO_TAG" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+pub(super) fn stages(outcome: ReplyOutcome, id: CommandId) -> bool {
+    let _ = Outcome::Bytes(b"");
+    outcome == ReplyOutcome::Success || stages_despite_error(id)
+}
+EOF
+root=$(printf '%s\n' 'mod plane;' | ro_fixture rostagesr1)
+printf '%s' "$body" | ro_put "$root" plane/scatter.rs
+expect_red_because "reply-outcome: the row stages allows R2 only" "$RO_TAG" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+root=$(printf '%s\n' 'mod plane;' | ro_fixture rorowgone)
+printf '%s\n' "$RO_WIRE" "$RO_STAGED" | ro_put "$root" plane/fabric.rs
+expect_red_because "reply-outcome: a scanned row whose function is gone is a scope error" \
+    "REPLY-OUTCOME SCOPE ERROR: crates/inf-server/src/plane/fabric.rs:owned_outcome is not found" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+pub(super) fn stages(outcome: ReplyOutcome, id: CommandId) -> bool {
+    outcome.is_success() || stages_despite_error(id)
+}
+EOF
+root=$(printf '%s\n' 'mod plane;' | ro_fixture rorowstale)
+printf '%s' "$body" | ro_put "$root" plane/scatter.rs
+expect_red_because "reply-outcome: a row whose range names none of its tokens is stale" \
+    "REPLY-OUTCOME violation (a row with no reply tag): crates/inf-server/src/plane/scatter.rs:stages" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+# ro_rows_listed <root>: green, each row listed with the lines it allows and
+# its reason, and none left unjudged.
+ro_rows_listed() {
+    local status=0 src=crates/inf-server/src/plane
+    env INF_CHECK_ROOT="$1" $REPLY >"$work/ro-rows.log" 2>&1 || status=$?
+    if [ "$status" -eq 0 ] &&
+        grep -qF "  row $src/fabric.rs:wire_reply (lines 3, 4, 5): the owner side's one tag, set from the reply's outcome; the canary's arm" \
+            "$work/ro-rows.log" &&
+        grep -qF "  row $src/fabric.rs:owned_outcome (lines 24, 25): the origin's one decode: the variant read, the outcome set from it" \
+            "$work/ro-rows.log" &&
+        grep -qF "  row $src/scatter.rs:stages (line 6): the staging gate compares the reply's outcome" \
+            "$work/ro-rows.log" &&
+        grep -qF "3 rows judged allowing 6 lines; rows not judged, file not in the scan: none)" \
+            "$work/ro-rows.log"; then
+        return 0
+    fi
+    echo "exit $status"
+    cat "$work/ro-rows.log"
+    return 1
+}
+root=$(printf '%s\n' 'mod plane;' | ro_fixture rorows)
+printf '%s\n' "$RO_WIRE" "$RO_STAGED" "$RO_OWNED" | ro_put "$root" plane/fabric.rs
+printf '%s' "$RO_STAGES" | ro_put "$root" plane/scatter.rs
+expect green "reply-outcome: the three rows as the tree holds them are green" \
+    env INF_CHECK_ROOT="$root" $REPLY
+expect green "reply-outcome: the OK line lists each row with its lines and reason" ro_rows_listed "$root"
+
+IFS= read -r -d '' body <<'EOF' || true
+pub fn ok() {}
+
+#[cfg(test)]
+mod tests {
+    fn t(b: &[u8]) -> inf_fabric::Outcome<'_> {
+        let _ = wire_reply(b, inf_wire::ReplyOutcome::Error);
+        inf_fabric::Outcome::Bytes(b)
+    }
+}
+
+#[cfg(test)]
+#[path = "fixture_tests.rs"]
+mod fixture_tests;
+EOF
+root=$(printf '%s' "$body" | ro_fixture rotesttag)
+printf '%s\n' "pub fn t(b: &[u8]) -> Outcome<'_> { wire_reply(b, ReplyOutcome::Error); Outcome::Bytes(b) }" |
+    ro_put "$root" fixture_tests.rs
+expect green "reply-outcome: a lying peer in a test module or a test-only modfile is out of scope" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+/// The tag ships as `Outcome::Bytes` from `wire_reply`, never by hand.
+pub fn ok() {}
+EOF
+root=$(printf '%s' "$body" | ro_fixture rotagdoc)
+expect green "reply-outcome: a doc comment naming a reply tag is not a site" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+IFS= read -r -d '' body <<'EOF' || true
+use inf_fabric::{Op, Outcome};
+
+type R<'a> = Option<Outcome<'a>>;
+
+pub fn values(n: i64, b: bool, code: ErrCode) -> [Outcome<'static>; 5] {
+    [Outcome::Int(n), Outcome::Ok, Outcome::Nil, Outcome::Bool(b), Outcome::Err(code)]
+}
+
+pub fn others(v: Vec<u8>, start: usize, end: usize, outcome: ReplyOutcome) -> bool {
+    let _ = OwnedOutcome::Bytes(v);
+    let _ = StagedReply::Bytes(start, end, outcome);
+    let _ = NsApplyOutcome::Reply;
+    let _ = <Vec<u8>>::new();
+    let _ = Vec::<ReplyOutcome>::new();
+    let _ = Option::<Outcome<'_>>::None;
+    reply.is_error()
+}
+
+pub fn ship(op: &Op) -> Outcome<'_> {
+    op.outcome()
+}
+
+impl From<u8> for OwnedOutcome {
+    fn from(_: u8) -> Self {
+        Self::Nil
+    }
+}
+
+impl TryFrom<i64> for StagedReply {
+    type Error = i64;
+    fn try_from(v: i64) -> Result<Self, Self::Error> {
+        Err(v)
+    }
+}
+
+macro_rules! make {
+    ($t:ty) => {
+        $t::new()
+    };
+}
+EOF
+root=$(printf '%s' "$body" | ro_fixture rotagclean)
+expect green "reply-outcome: non-reply variants, other enums' paths and the enum held, not renamed, are clean" \
+    env INF_CHECK_ROOT="$root" $REPLY
+
+root=$(ro_fixture rolibonly <<<"pub fn ok() {}")
+expect_output "reply-outcome: the OK line names each row whose file is not in the scan" \
+    "rows not judged, file not in the scan: crates/inf-server/src/plane/fabric.rs:wire_reply, crates/inf-server/src/plane/fabric.rs:owned_outcome, crates/inf-server/src/plane/scatter.rs:stages)" \
+    env INF_CHECK_ROOT="$root" $REPLY
+}
+
+# ------------------------------------------------------------ refusal text
+group_refusal_text() {
+# ADR-0172 D2: no production line of crates/inf-server/src spells a refusal
+# class suffix; inf_wire::Refusal renders every one. One plant a suffix, each
+# fixture one inf-server lib.rs (and a test-only modfile where the case needs one).
+REFUSAL=./scripts/check-refusal-text.sh
+rt_fixture() {
+    local name=$1 root
+    [ -n "$name" ] && [ -n "$work" ] || { echo "rt_fixture: empty name or work dir" >&2; exit 2; }
+    root="$work/$name"
+    [ -e "$root" ] && rm -rf "$root"
+    mkdir -p "$root/crates/inf-server/src"
+    cat >"$root/crates/inf-server/src/lib.rs"
+    echo "$root"
+}
+
+IFS= read -r -d '' body <<'EOF' || true
+pub const BUSY: &str = "BUSY a script is running";
+pub const OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
+pub fn reply(refusal: inf_wire::Refusal) -> &'static str { refusal.render() }
+/// A doc line naming the `limit reached` suffix is not a site.
+pub fn ok() {}
+EOF
+root=$(printf '%s' "$body" | rt_fixture rtclean)
+expect green "refusal-text: prefixes, Redis's OOM reply, a render call and a doc line are clean" \
+    env INF_CHECK_ROOT="$root" $REFUSAL
+expect_output "refusal-text: the scope line discloses the scan" "1 files, 5 lines scanned" \
+    env INF_CHECK_ROOT="$root" $REFUSAL
+
+for suffix in "capacity in use" "limit reached" "reservation refused" "identity space exhausted" \
+    "Identity Space Exhausted"; do
+    root=$(rt_fixture rtplanted <<<"pub const E: &str = \"ERR planted $suffix\";")
+    expect_red_because "refusal-text: planted '$suffix'" "REFUSAL-TEXT violation" \
+        env INF_CHECK_ROOT="$root" $REFUSAL
+done
+
+IFS= read -r -d '' body <<'EOF' || true
+pub fn ok() {}
+
+#[cfg(test)]
+mod tests {
+    const E: &str = "ERR namespace identity space exhausted";
+}
+
+#[cfg(test)]
+#[path = "fixture_tests.rs"]
+mod fixture_tests;
+EOF
+root=$(printf '%s' "$body" | rt_fixture rttest)
+printf '%s\n' 'pub const E: &str = "ERR tiered namespace limit reached";' \
+    >"$root/crates/inf-server/src/fixture_tests.rs"
+expect green "refusal-text: a test module and a test-only modfile are out of scope" \
+    env INF_CHECK_ROOT="$root" $REFUSAL
+expect_output "refusal-text: the excluded modfile is disclosed" "1 test-only files excluded" \
+    env INF_CHECK_ROOT="$root" $REFUSAL
+
+mkdir -p "$work/rtempty/crates/inf-server/src"
+expect_red_because "refusal-text: an empty file set is a scope error" "REFUSAL-TEXT SCOPE ERROR" \
+    env INF_CHECK_ROOT="$work/rtempty" $REFUSAL
+fx_build_empty
+expect red "refusal-text: a missing directory is a scope error" env INF_CHECK_ROOT="$work/empty" $REFUSAL
 }
 
 # ---------------------------------------------------------------- run-sweep
@@ -2887,20 +3410,67 @@ lc_reset
 group_lint_scopes_moves() {
 ls_setup
 lc_setup
-# ADR-0163 A1: a row moves later only up to its record's date on the gate's
-# CONTAINER_EXPIRY_MOVES line (a ceiling); the line's own dates only move
-# earlier, and a record joins it only by the ADR that changes the rule,
-# against HEAD, the base tip and the commit that introduced the line.
-# lc_moves edits the working gate's line, as ls_gate edits its maximum; the
-# fixture's rows sit at 2099-12-31 (struct Exempt is T, fn Owner::build E).
+# ADR-0201 D1: a row moves later only up to its record's date on the gate's
+# CONTAINER_EXPIRY_MOVES line, or on its CONTAINER_EXPIRY_MOVES_2 line where
+# the record has one (a ceiling). The second line is keyed to the first: each
+# entry raises a first-line record past its date there. Each line's own dates
+# only move earlier, and a record joins one only by the ADR that changes the
+# rule, against HEAD, the base tip and the commit that introduced the line; a
+# third move line is red. lc_moves and lc_moves_2 edit the working gate's
+# lines, as ls_gate edits its maximum; the fixture's rows sit at 2099-12-31
+# (struct Exempt is T, fn Owner::build E).
 lc_moves() { # <entries>
     sed -i.bak "s/^CONTAINER_EXPIRY_MOVES=\".*\"\$/CONTAINER_EXPIRY_MOVES=\"$1\"/" "$LINTSCOPES"
     rm -f "$LINTSCOPES.bak"
     grep -q "^CONTAINER_EXPIRY_MOVES=\"$1\"\$" "$LINTSCOPES" ||
         { echo "lc_moves: the gate's move line is not where the copy sets it" >&2; exit 2; }
 }
+lc_moves_2() { # <entries>
+    sed -i.bak "s/^CONTAINER_EXPIRY_MOVES_2=\".*\"\$/CONTAINER_EXPIRY_MOVES_2=\"$1\"/" "$LINTSCOPES"
+    rm -f "$LINTSCOPES.bak"
+    grep -q "^CONTAINER_EXPIRY_MOVES_2=\"$1\"\$" "$LINTSCOPES" ||
+        { echo "lc_moves_2: the gate's second move line is not where the copy sets it" >&2; exit 2; }
+}
+# lc_stub <first> <second> [<name>]: the fixture's committed gate copy, its
+# maximum and each move line given (`-` leaves that line out), and with
+# <name> a comment that spells that line's search string once more.
+lc_stub() {
+    {
+        printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$LC_MAX"
+        [ "$1" = - ] || printf 'CONTAINER_EXPIRY_MOVES="%s"\n' "$1"
+        [ "$2" = - ] || printf 'CONTAINER_EXPIRY_MOVES_2="%s"\n' "$2"
+        [ -z "${3:-}" ] || printf '# the line stays spelled %s="<record>=<date> …" alone\n' "$3"
+    } >"$root/scripts/check-lint-scopes.sh"
+}
+# lc_intro_leg <first> <second> <later first> <later second> <name>: a stub
+# commit that introduces the lines, then a later one that changes them and
+# spells <name>'s search string again in a comment, so `git log -S` lists
+# both; the base tip moves to the later commit. HEAD and the base tip then
+# agree with a working gate that spells the later lines, so only the line's
+# introducing commit can be red: a gate that reads the newest commit the
+# search lists, misspells the search string or drops the third copy turns
+# the plant green. lc_intro_undo drops both commits and puts the base tip back.
+lc_intro_leg() {
+    lc_stub "$1" "$2"
+    ls_commit "$root" "the move lines' introducing commit"
+    lc_stub "$3" "$4" "$5"
+    ls_commit "$root" "the move lines later, a search string in a comment"
+    fx_git "$root" branch -q -f base-tip HEAD
+}
+lc_intro_undo() {
+    lc_reset HEAD~2
+    fx_git "$root" branch -q -f base-tip HEAD
+}
 LC_MOVES=$(sed -n 's/^CONTAINER_EXPIRY_MOVES="\(.*\)"$/\1/p' "$LINTSCOPES")
 [ -n "$LC_MOVES" ] || { echo "the gate spells no CONTAINER_EXPIRY_MOVES line" >&2; exit 2; }
+grep -q '^CONTAINER_EXPIRY_MOVES_2="[^"]*"$' "$LINTSCOPES" ||
+    { echo "the gate spells no CONTAINER_EXPIRY_MOVES_2 line" >&2; exit 2; }
+LC_MOVES_2=$(sed -n 's/^CONTAINER_EXPIRY_MOVES_2="\(.*\)"$/\1/p' "$LINTSCOPES")
+# The first line's twelve cases run on an empty second line, its legal end
+# state: each sets the first line, and the keyed rule would read the second
+# line's records as records that line lacks, so a planted red would have two
+# causes. The line is restored after them.
+lc_moves_2 ""
 sed -i.bak 's/^\(CONTAINER_EXPIRY_MOVES=".*"\)$/\1 # note/' "$LINTSCOPES"
 rm -f "$LINTSCOPES.bak"
 expect_red_because "lint-scopes: containers — a move line spelled so no copy can read it" \
@@ -2937,8 +3507,98 @@ lc_moves "T=2100-05-31"
 expect green "lint-scopes: containers — a move date equal to the HEAD's (control)" lc_run "$root"
 lc_moves "T=2100-05-30"
 expect green "lint-scopes: containers — a move date moved earlier (control)" lc_run "$root"
-lc_moves "$LC_MOVES"
 lc_reset HEAD~1
+# The first line's introducing-commit leg, which the cases above plant only
+# at HEAD (the stub that introduces the line is HEAD there).
+lc_moves "T=2100-06-30"
+lc_intro_leg "T=2100-05-31" - "T=2100-06-30" - CONTAINER_EXPIRY_MOVES
+expect_red_because "lint-scopes: containers — a move date later than its introducing commit's, HEAD and the base tip agreeing" \
+    "CONTAINER_EXPIRY_MOVES: T=2100-06-30 is later than the line's introducing commit's 2100-05-31" lc_run "$root"
+lc_intro_undo
+lc_moves "T=2100-05-31 E=2100-05-31"
+lc_intro_leg "T=2100-05-31" - "T=2100-05-31 E=2100-05-31" - CONTAINER_EXPIRY_MOVES
+expect_red_because "lint-scopes: containers — a record on the move line in HEAD, the base tip and the gate, absent from its introducing commit" \
+    "CONTAINER_EXPIRY_MOVES: E=2100-05-31 is absent from the line's introducing commit's line" lc_run "$root"
+lc_intro_undo
+# The second line, keyed to a first line that moves T and E to 2100-05-31.
+lc_moves "T=2100-05-31 E=2100-05-31"
+lc_moves_2 "T=2100-06-30"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-30
+expect green "lint-scopes: containers — a date moved later onto its record's second-line date (control)" \
+    lc_run "$root"
+lc_moves_2 "T=2100-06-30 E=2100-06-15"
+expect_output "lint-scopes: containers — the OK line discloses the second line after the first, records sorted" \
+    "expiry moves E=2100-05-31, T=2100-05-31; second move E=2100-06-15, T=2100-06-30" lc_run "$root"
+lc_moves_2 "T=2100-06-30"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-15
+expect green "lint-scopes: containers — a date between its record's two move dates (control)" lc_run "$root"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-07-01
+expect_red_because "lint-scopes: containers — a date moved past its record's second-line date" \
+    "or up to T's 2100-06-30 (CONTAINER_EXPIRY_MOVES_2, ADR-0201 D1)" lc_run "$root"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-30
+lc_row_set "$LC_A" 'fn Owner::build' expiry 2100-06-30
+expect_red_because "lint-scopes: containers — a record with no second-line date, moved onto another record's" \
+    "or up to E's 2100-05-31 (CONTAINER_EXPIRY_MOVES, ADR-0201 D1)" lc_run "$root"
+lc_reset
+lc_moves "T=2100-05-31"
+lc_moves_2 "T=2100-06-30 E=2100-06-30"
+expect_red_because "lint-scopes: containers — a second-line entry for a record the first line lacks" \
+    "CONTAINER_EXPIRY_MOVES_2: E=2100-06-30 names a record the CONTAINER_EXPIRY_MOVES line in use lacks" \
+    lc_run "$root"
+lc_moves "T=2100-05-31 E=2100-05-31"
+lc_moves_2 "T=2100-05-31"
+expect_red_because "lint-scopes: containers — a second-line entry at its first-line date" \
+    "CONTAINER_EXPIRY_MOVES_2: T=2100-05-31 is not after its CONTAINER_EXPIRY_MOVES date 2100-05-31" lc_run "$root"
+lc_moves_2 "T=2100-06-30"
+sed -i.bak 's/^\(CONTAINER_EXPIRY_MOVES_2=".*"\)$/\1 # note/' "$LINTSCOPES"
+rm -f "$LINTSCOPES.bak"
+expect_red_because "lint-scopes: containers — a second move line spelled so no copy can read it" \
+    "the gate spells no CONTAINER_EXPIRY_MOVES_2 line" lc_run "$root"
+sed -i.bak 's/^\(CONTAINER_EXPIRY_MOVES_2=".*"\) # note$/\1/' "$LINTSCOPES"
+rm -f "$LINTSCOPES.bak"
+printf 'CONTAINER_EXPIRY_MOVES_3="T=2100-07-31"\n' >>"$LINTSCOPES"
+expect_red_because "lint-scopes: containers — a third move line" \
+    "a third expiry move is the ADR that supersedes ADR-0201" lc_run "$root"
+sed -i.bak '$d' "$LINTSCOPES"
+rm -f "$LINTSCOPES.bak"
+! grep -q '^CONTAINER_EXPIRY_MOVES_3=' "$LINTSCOPES" ||
+    { echo "the third move line plant is still in the gate copy" >&2; exit 2; }
+# HEAD's gate spells both lines and its table T's row at its second-line date.
+lc_stub "T=2100-05-31 E=2100-05-31" "T=2100-06-30"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-30
+ls_commit "$root" "a second move date"
+expect green "lint-scopes: containers — a second-line date equal to the HEAD's (control)" lc_run "$root"
+lc_moves_2 "T=2100-07-31"
+expect_red_because "lint-scopes: containers — a second-line date later than the HEAD's" \
+    "CONTAINER_EXPIRY_MOVES_2: T=2100-07-31 is later than the HEAD's 2100-06-30" lc_run "$root"
+lc_moves_2 "T=2100-06-30 E=2100-06-30"
+expect_red_because "lint-scopes: containers — a record added to the HEAD's second line" \
+    "CONTAINER_EXPIRY_MOVES_2: E=2100-06-30 is absent from the HEAD's line" lc_run "$root"
+lc_moves_2 "T=2100-06-15"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-06-15
+expect green "lint-scopes: containers — a second-line date moved earlier, still after its first (control)" \
+    lc_run "$root"
+lc_moves_2 ""
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-05-31
+expect green "lint-scopes: containers — a record leaves the second line, its row back at its first date (control)" \
+    lc_run "$root"
+lc_reset HEAD~1
+# The second line's introducing-commit leg.
+lc_moves "T=2100-05-31"
+lc_moves_2 "T=2100-06-30"
+lc_intro_leg "T=2100-05-31" "T=2100-06-15" "T=2100-05-31" "T=2100-06-30" CONTAINER_EXPIRY_MOVES_2
+expect_red_because "lint-scopes: containers — a second-line date later than its introducing commit's, HEAD and the base tip agreeing" \
+    "CONTAINER_EXPIRY_MOVES_2: T=2100-06-30 is later than the line's introducing commit's 2100-06-15" lc_run "$root"
+lc_intro_undo
+lc_moves "T=2100-05-31 E=2100-05-31"
+lc_moves_2 "T=2100-06-30 E=2100-06-30"
+lc_intro_leg "T=2100-05-31 E=2100-05-31" "T=2100-06-30" "T=2100-05-31 E=2100-05-31" "T=2100-06-30 E=2100-06-30" \
+    CONTAINER_EXPIRY_MOVES_2
+expect_red_because "lint-scopes: containers — a record on the second line in HEAD, the base tip and the gate, absent from its introducing commit" \
+    "CONTAINER_EXPIRY_MOVES_2: E=2100-06-30 is absent from the line's introducing commit's line" lc_run "$root"
+lc_intro_undo
+lc_moves "$LC_MOVES"
+lc_moves_2 "$LC_MOVES_2"
 lc_reset
 printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$((LC_MAX - 1))" >"$root/scripts/check-lint-scopes.sh"
 ls_commit "$root" "a lower maximum"

@@ -172,10 +172,13 @@ You need Linux (x86-64 or aarch64) with `io_uring`, kernel 5.15 or newer
 (6.1 or newer recommended); macOS builds through `kqueue` for development
 only. `rust-toolchain.toml` pins Rust 1.95, which `rustup` installs for you.
 The development tasks use [`just`](https://github.com/casey/just), and every
-`just` recipe needs Python 3.11 or newer. The test suite needs Redis 8.0.5 on
-`PATH` (or `INF_COMPAT_ORACLE_ADDR` pointing at one). `just check` also needs
-a C++17 compiler: it compiles the fuzz targets, and their build compiles
-libFuzzer's C++ runtime.
+`just` recipe and the test suite need Python 3.11 or newer. The test suite
+needs Redis 8.0.5 on `PATH` (or `INF_COMPAT_ORACLE_ADDR` pointing at one).
+`just check` also needs a C++17 compiler: it compiles the fuzz targets, and
+their build compiles libFuzzer's C++ runtime. `just check` and the test suite
+need Linux 6.6 or newer, with `/dev/shm` on a tmpfs that takes `O_DIRECT`: the
+`timer_owners` test keeps its node's data there, and without it the test fails
+rather than skips. The server itself runs on 5.15.
 
 Each checkout builds in a target directory of its own, which the first `just`
 recipe marks as this checkout's. A `target/` that a plain `cargo` command or

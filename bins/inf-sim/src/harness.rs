@@ -399,9 +399,10 @@ impl Scenario {
 }
 
 /// The floor of every scheduler step's advance: 1 µs of virtual time, added
-/// to the seeded draw below `Scenario::step_ns_max`, so injected time moves
-/// on every step.
-const STEP_NS_FLOOR: u64 = 1_000;
+/// to the seeded draw below the step bound (`Scenario::step_ns_max` here,
+/// `DurableScenario::step_ns_max` in the durable runner's `Node::step`), so
+/// injected time moves on every step.
+pub(crate) const STEP_NS_FLOOR: u64 = 1_000;
 
 /// What a run produces. `trace` is the determinism artifact.
 #[derive(Debug)]

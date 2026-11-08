@@ -166,9 +166,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 // it parks the arm, on an exhaustion or a broken-listener
                 // errno (`classify_accept_errno`); a transient one never
                 // surfaces. The accept-retry owner re-arms the listener a
-                // retry window later, the only way back for a broken one.
-                // Armed only from Idle: failures inside a window coalesce
-                // into its one arm.
+                // retry window later, the only way back for a broken one
+                // (ADR-0118 D2). Armed only from Idle: failures inside a
+                // window coalesce into its one arm.
                 if c.token.class() == TokenClass::Accept {
                     self.shared.accept_errors.set(self.shared.accept_errors.get() + 1);
                     // Canary: the failure re-arms the listener at once, the
@@ -792,8 +792,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // ---- tiered plane half (M4-S26): namespace sync, the four
         // drivers, the cold-read drain (once per iteration — S10).
         self.tier_maintain(cx);
-        // ---- DDL persist wakes (ADR-0015 D3): one relaxed load per
-        // MAINTAIN; parked DDL pumps wake on epoch edges.
+        // ---- DDL wakes (ADR-0015 D3): two loads per MAINTAIN, the
+        // catalog word and the ticket's generation; parked DDL pumps wake
+        // on either's edge.
         self.maintain_control_wakes();
         // ---- stats flush
         self.maintain_conn_sweep(cx);
@@ -1127,8 +1128,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// One MAINTAIN concern of `maintain`, in phase order:
-    ///  DDL persist wakes (ADR-0015 D3): one relaxed load per
-    /// MAINTAIN; parked DDL pumps wake on epoch edges.
+    ///  DDL wakes (ADR-0015 D3): two Acquire loads per MAINTAIN, the
+    /// catalog word and the ticket's generation; parked DDL pumps wake on
+    /// either's edge. `INFO` reads the writer's gauges itself.
     fn maintain_control_wakes(&mut self) {
         if let Some(control) = self.shared.control.borrow().as_ref() {
             let epoch = control.persisted_epoch();
@@ -1143,11 +1145,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 self.shared.ddl_gen_seen.set(generation);
                 self.shared.ddl_waiters.wake_all(0);
             }
-            let node = &self.shared.node;
-            node.ns_drop_tombstones.set(control.drop_tombstones() as u64);
-            node.catalog_epoch.set(epoch);
-            node.ns_ddl_pending.set(control.ddl_pending());
-            node.ns_ddl_notices_stale.set(control.ddl_notices_stale());
         }
     }
 

@@ -217,6 +217,13 @@ fn main() {
         eprintln!("inf-sim: --plant accept-broken is m0-smoke's");
         std::process::exit(2);
     }
+    // The park-at-once leg is the wake oracle's, m2-fill-tick's and
+    // m2-group-hold's alone: refused here, before any scenario dispatches,
+    // since a leg that dispatches early would run with the flag ignored.
+    if park_at_once && !matches!(scenario_name.as_str(), "m2-fill-tick" | "m2-group-hold") {
+        eprintln!("inf-sim: --park-at-once is m2-fill-tick's and m2-group-hold's");
+        std::process::exit(2);
+    }
     // The two flags each force one of m4-recovery's seed classes, which a
     // seed runs one of: together they are refused, never one dropped.
     let forced_class = match (replay_above_window, spec_variant) {
@@ -284,11 +291,6 @@ fn main() {
         }
     }
 
-    // TM3's leg is m2-fill-tick's and m2-group-hold's, and only theirs.
-    if park_at_once && !matches!(scenario_name.as_str(), "m2-fill-tick" | "m2-group-hold") {
-        eprintln!("inf-sim: --park-at-once is m2-fill-tick's and m2-group-hold's");
-        std::process::exit(2);
-    }
     // The M2-S19 durable scenario has its own runner (power cuts, the
     // durability oracle, the sweep mode).
     if matches!(
@@ -1270,6 +1272,95 @@ fn main() {
                 std::process::exit(1);
             }
             println!("inf-sim: determinism verified (second run identical)");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // ADR-0189 D5: the namespace-drop window — the stale fold at the cap,
+    // lagging exports inside a DROP's and a rollback's window, and the cut
+    // class the seed picks, each with its reboot audit.
+    if scenario_name == "m2-ns-drop-window" {
+        let run_one = |seed: u64| inf_sim::run_ns_drop_window_scenario(seed);
+        if let Some(sweep) = sweep {
+            let (shard_i, shard_k) = shard;
+            assert!(shard_k > 0, "--shard I/K wants K > 0");
+            assert!(shard_i < shard_k, "--shard I/K wants I < K");
+            let (mut violations, mut ran, mut keys) = (0u64, 0u64, 0u64);
+            let mut lines = Vec::new();
+            for i in (shard_i..sweep).step_by(shard_k as usize) {
+                let seed = seed.wrapping_add(i);
+                let report = run_one(seed);
+                if verify {
+                    let twin = run_one(seed);
+                    verify_hashes(
+                        (report.trace_hash, report.state_hash),
+                        (twin.trace_hash, twin.state_hash),
+                    );
+                    assert!(twin.ok(), "second run failed its oracles");
+                }
+                ran += 1;
+                keys += report.keys_served;
+                if report.ok() {
+                    lines.push(format!("{seed:#x} ok {:?}", report.cut));
+                } else {
+                    violations += 1;
+                    let first = report.violations.first().map_or("stall", |v| v.as_str());
+                    lines.push(format!("{seed:#x} VIOLATION {first}"));
+                    eprintln!("inf-sim: seed {seed:#x}: {first}");
+                }
+            }
+            println!(
+                "inf-sim: m2-ns-drop-window sweep shard {shard_i}/{shard_k}: {ran} seeds, \
+                 {violations} violations, {keys} acked keys served after a cut before the answer"
+            );
+            if let Some(dir) = out_dir.as_deref() {
+                std::fs::create_dir_all(dir).expect("out dir");
+                std::fs::write(
+                    format!("{dir}/results-shard-{shard_i}.txt"),
+                    lines.join("\n") + "\n",
+                )
+                .expect("results");
+            }
+            std::process::exit(if violations > 0 { 1 } else { 0 });
+        }
+        let report = run_one(seed);
+        println!(
+            "inf-sim: scenario m2-ns-drop-window seed {seed:#x}: cut {:?}, {} commands, {} steps, \
+             stale fold {} epoch(s), {} lagging exports, {} held steps, checkpoint in the wait \
+             {}, {} acked keys served, {} untombstoned unknown-ns skips, trace {} bytes, hash \
+             {:#018x}",
+            report.cut,
+            report.commands_done,
+            report.scheduler_steps,
+            report.stale_fold_epochs,
+            report.lagging_exports,
+            report.held_steps,
+            report.checkpoint_in_wait,
+            report.keys_served,
+            report.skipped_unknown_ns,
+            report.trace.len(),
+            report.trace_hash
+        );
+        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
+        if verify {
+            let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
+            if second.trace != report.trace {
+                eprintln!("inf-sim: DETERMINISM VIOLATION — traces differ");
+                std::process::exit(1);
+            }
+            println!("inf-sim: determinism verified — second run trace byte-identical");
         }
         if !report.ok() {
             for v in &report.violations {

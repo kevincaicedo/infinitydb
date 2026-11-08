@@ -683,8 +683,9 @@ pub(super) enum NsApplyOutcome {
 }
 
 /// Applies the internal `INF.NSFAN` DDL fan on a peer cell (M2-S08):
-/// `CREATE name mode fsync policy maxmemory id` / `DROP name`, fields as
-/// the origin serialized them (`-` = none). Returns false for non-NSFAN.
+/// `CREATE name mode fsync policy maxmemory id tier` / `DROP name epoch id
+/// mode` / `SET name …`, fields as the origin serialized them (`-` =
+/// none). Returns false for non-NSFAN.
 pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     from: CellId,
@@ -713,6 +714,22 @@ pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone +
     {
         let refusal = |w: &mut RespWriter<'_>| w.error("ERR fault: ns_create_fan_refused");
         stage_leg_refusal(scratch, staged, (from, token), refusal);
+        return true;
+    }
+    if argv.len() == 6 && argv[1].eq_ignore_ascii_case(b"DROP") {
+        // Crash-matrix point: this peer cannot apply the drop (test builds
+        // only); in its place, every refusal below is the same fail-stop.
+        let refused = if inf_foundation::fault::fire(crate::fault::NS_DROP_LEG_REFUSED) {
+            Err("the injected refusal".to_owned())
+        } else {
+            apply_drop_leg(shared, argv)
+        };
+        if let Err(why) = refused {
+            let name = String::from_utf8_lossy(argv[2]);
+            let detail = format!("cell {} cannot apply the drop of '{name}': {why}", shared.cell.0);
+            super::ddl_fail_stop("DROP leg apply", &detail);
+        }
+        staged.push((from, token, StagedReply::Ok));
         return true;
     }
     match apply_nsfan(shared, argv) {
@@ -747,18 +764,6 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 ) -> Result<(), inf_store::NsError> {
     use inf_store::NsError;
     let malformed = NsError::InvalidName; // internal vocabulary; never client-visible
-    if argv.len() == 4 && argv[1].eq_ignore_ascii_case(b"DROP") {
-        // ADR-0100 D4: the leg carries the persist epoch of the catalog
-        // swap that drops the namespace; this cell's tier teardown holds
-        // until that epoch is durable (D5).
-        let epoch: u64 =
-            core::str::from_utf8(argv[3]).ok().and_then(|s| s.parse().ok()).ok_or(malformed)?;
-        let spec = shared.store.borrow_mut().ns_drop(argv[2])?;
-        if spec.tier.is_some() {
-            shared.ns_drop_releases.borrow_mut().push((spec.id, epoch));
-        }
-        return Ok(());
-    }
     if argv.len() == 4 && argv[1].eq_ignore_ascii_case(b"SET") {
         let tier = tier_from_fan(argv[3])?.ok_or(malformed)?;
         return shared.store.borrow_mut().ns_set_tier(argv[2], tier);
@@ -820,6 +825,54 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         maxmemory,
         tier,
     })
+}
+
+/// A peer's `INF.NSFAN DROP name epoch id mode` leg (ADR-0189 D4, D5):
+/// its receipt is built from the leg's epoch read against the catalog word,
+/// which the origin's own receipt already covered; the namespace the name
+/// holds here, if any, must carry the leg's id and mode; then the drop
+/// applies, `Removed` or `Absent` (a peer that refused or never received
+/// the `CREATE` leg), either an applied leg. `Err` says why this cell
+/// cannot apply it: each is unreachable while the origin fans an accepted
+/// drop's own leg, and each is the caller's fail-stop.
+fn apply_drop_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    argv: &[&[u8]],
+) -> Result<inf_store::ddl::DropApplied, String> {
+    let field = |at: usize| core::str::from_utf8(argv[at]).ok();
+    let epoch: u64 = field(3).and_then(|s| s.parse().ok()).ok_or("a malformed epoch")?;
+    let id: u32 = field(4).and_then(|s| s.parse().ok()).ok_or("a malformed id")?;
+    let mode = field(5).and_then(NsMode::parse).ok_or("a malformed mode")?;
+    let Some(control) = shared.control.borrow().clone() else {
+        return Err("no catalog writer on this node".to_owned());
+    };
+    let receipt = inf_store::ddl::DropPersisted::from_leg(NsId(id), epoch, control.catalog_word())
+        .map_err(|e| format!("epoch {} is not durable (the word is {})", e.epoch, e.word))?;
+    if let Some(spec) = shared.store.borrow().ns_get(argv[2])
+        && (spec.id != receipt.id() || spec.mode != mode)
+    {
+        let held = format!("{} {}", spec.id.0, spec.mode.name());
+        return Err(format!("the leg names {id} {}, this cell holds {held}", mode.name()));
+    }
+    apply_drop(shared, &receipt).map_err(|e| format!("{e:?}"))
+}
+
+/// Applies an accepted `DROP` to this cell's keyspace with its receipt
+/// (ADR-0189 D4, D5): the origin's, a rollback's and a peer's leg alike. A
+/// removed tiered namespace's tier files wait on the receipt's epoch
+/// (ADR-0189 D9), which the catalog word already covers, so they leave at
+/// the next MAINTAIN's teardown slices.
+pub(super) fn apply_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    receipt: &inf_store::ddl::DropPersisted,
+) -> Result<inf_store::ddl::DropApplied, inf_store::NsError> {
+    let applied = shared.store.borrow_mut().ns_drop(receipt)?;
+    if let inf_store::ddl::DropApplied::Removed(spec) = &applied
+        && spec.tier.is_some()
+    {
+        shared.ns_drop_releases.borrow_mut().push((spec.id, receipt.fan_epoch()));
+    }
+    Ok(applied)
 }
 
 /// Serializes a tier spec for the `INF.NSFAN` vector (M4-S19): `-` for

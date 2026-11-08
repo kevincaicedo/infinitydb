@@ -49,6 +49,13 @@ images; see [CONTRIBUTING](../CONTRIBUTING.md). A local prerequisite failure
 is not a passing gate. Workloads and required sweep sizes remain those of the
 owning gate; a smoke run does not discharge a full campaign.
 
+`just check` and workspace tests also require `/dev/shm` on a tmpfs that
+takes `O_DIRECT`, which is Linux 6.6 or newer: the `timer_owners` test keeps
+its node's data directory there, where no other workload's device latency
+reaches the frames it counts. A missing `/dev/shm`, another filesystem or an
+older kernel fails the test as `MEDIUM`; there is no successful skip. The
+server itself runs on Linux 5.15 or newer.
+
 Every recipe builds in this checkout's own target root (ADR-0198 A2), which
 `scripts/target-root.sh` computes and the justfile exports as
 `CARGO_TARGET_DIR`: `target/` when the variable is unset, else

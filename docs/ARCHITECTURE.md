@@ -155,9 +155,11 @@ node catalog (namespace and index definitions). Catalog changes are rare and
 slow, so the file writes and fsyncs live off the data plane. The thread
 numbers each catalog request as it takes it from its queue and answers the
 request through that request's own slot once the write carrying it has
-returned (a refused request writes nothing), so a DDL acts only on its own
-durable write. Namespace and index ids come from shared atomic counters that
-the cell issuing the DDL bumps. The control thread also deletes truncated log
+returned (a refused request writes nothing), so a DDL reads only its own
+request's answer, never another's; `CREATE`, `DROP` and a `CREATE`'s
+rollback apply on any cell only after that answer. A namespace id is
+reserved under the DDL ticket and committed by the writer when it accepts
+the `CREATE`; index ids come from shared atomic counters. The control thread also deletes truncated log
 segments and stale checkpoint files on behalf of the cells, because freeing a
 large file's pages is slow in the kernel. The main thread samples process
 gauges (RSS, CPU) and waits for the cells to exit.

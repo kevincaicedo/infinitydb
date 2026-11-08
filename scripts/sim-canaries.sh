@@ -724,6 +724,38 @@ rows=(
   # The `ns_drop_after_meta` exit forgets its notice: the next DDL meets a
   # pending one.
   "inf_canary_ns_notice_forgotten crate-test inf-server test:node_e2e a_ddl_stopped_after_its_answer_leaves_no_ddl_pending another namespace DDL is pending"
+  # ADR-0148 D4: a namespace id moves only when the catalog writer accepts
+  # its CREATE, by one, never past u32::MAX - 1; the wire's ids oracle reads
+  # each +OK's id. The reservation committed when made: every refusal after
+  # it spends the id, and the next +OK's id skips.
+  "inf_canary_ns_id_spent_on_refusal crate-test inf-server test:node_e2e every_accepted_create_takes_the_last_committed_id_plus_one the id is not its successor"
+  # The exhaustion check off: the spent counter issues u32::MAX, and wraps.
+  "inf_canary_ns_id_wraps crate-test inf-server test:node_e2e the_last_namespace_id_is_issued_once_and_then_the_space_refuses no id follows the last issuable one"
+  # ADR-0189 D6, N7: the cap counts the slot its own admission takes. The
+  # verdict forgets it and (I) is off: a durable DROP at 256 tombstones,
+  # none ready, is admitted and META holds a 257th.
+  "inf_canary_ns_cap_unreserved crate-test inf-server test:catalog_requests a_durable_drop_at_the_cap_writes_no_257th_tombstone the cap admitted a 257th"
+  # ADR-0189 D6, N14: the cap is the writer's verdict alone. The program
+  # paces on the gauge word's ready count before it asks, a count the
+  # writer folded before the cells published: the stale fold paces.
+  "inf_canary_ns_cap_from_gauges crate-test inf-server test:node_e2e a_drop_at_the_cap_with_every_tombstone_ready_issues_no_pacing_checkpoint a pacing checkpoint beside its cleanup"
+  "inf_canary_ns_cap_from_gauges m2-ns-drop-window STALE-FOLD"
+  # ADR-0189 D5: the origin applies a DROP before its request, the order
+  # the receipt replaces: a checkpoint the origin publishes in the wait
+  # omits the namespace, and a cut before the answer loses its share.
+  "inf_canary_ns_apply_before_swap crate-test inf-server test:node_e2e a_checkpoint_inside_a_durable_drop_wait_keeps_every_acked_key writes acknowledged before the drop are not served"
+  "inf_canary_ns_apply_before_swap m2-ns-drop-window DROP-WINDOW-LOSS --seed 0xd0a50002"
+  # ADR-0189 D3 step 5: a pending drop is not stripped from a payload, so
+  # a lagging export inside the DROP's window keeps the namespace in META.
+  "inf_canary_ns_pending_drop_kept m2-ns-drop-window LAGGING-EXPORT-DROP"
+  # ADR-0189 D5: the rollback keeps the CREATE's notice, which posts as the
+  # rollback replaces it, and the writer matches notices by id alone: the
+  # CREATE's notice retires the rollback's drop, and a lagging export
+  # brings the namespace back.
+  "inf_canary_ns_notice_at_replacement m2-ns-drop-window LAGGING-EXPORT-ROLLBACK"
+  # The same post at replacement, kind and id matching kept: the stale
+  # notice is counted, and the DST's zero assertion goes red.
+  "inf_canary_ns_notice_posted_at_replacement m2-ns-drop-window NOTICE-STALE"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

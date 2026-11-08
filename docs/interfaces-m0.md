@@ -159,7 +159,7 @@ impl Arena {
 > replaces `has_waiter(key)` in the cold-read note below, and the holder
 > returns at `release(hold)`. The cold gate is built with `ColdReads`,
 > not before the cell serves, until the cold-read host is built before
-> serving (a deviation, expiry 2026-12-31). `WaitList` and
+> serving (a deviation, expiry 2027-01-31). `WaitList` and
 > `WatermarkGate` take one wait node per parked task from a per-cell
 > pool; `WaitList`'s keys, FIFO, `wake_one`, `wake_all` and baton are
 > unchanged, and no type joins the suspension primitives sketched below.
@@ -180,9 +180,9 @@ impl Arena {
 > "bridge wakers (no atomics on the owner lane)". No signature in this
 > document changes.
 
-> **Accepted 2026-09-22, implementation open — ADR-0154:** fixed timer
-> ownership and bounded callback delivery replaces TimerWheel/TimerId and
-> the raw-key on_timer contract below. Fallible boot construction admits
+> **Accepted 2026-09-22, built for D1–D3 — ADR-0154:** fixed timer ownership and
+> bounded callback delivery: a typed `on_timer` notice from owners the
+> host reserved, never a raw key. Fallible boot construction admits
 > fixed TimerSet owner positions and an indexed minimum heap.
 > Cancel/replace physically removes the prior entry; owner/arm identities
 > are checked and do not wrap. Delivery keeps the position through
@@ -196,9 +196,9 @@ impl Arena {
 > stale result; and close wins over a successor. A deadline is normalized
 > to no earlier than the next millisecond after the current turn, and
 > clock-range exhaustion is a typed error before arming (ADR-0154 D1–D3).
-> The sketch below is the implemented shape; the replacement above is not
-> built. The ten phases, one backend entry and existing gates remain
-> unchanged.
+> The sketch below is the built shape. The ten phases, one backend entry
+> and existing gates remain unchanged. D4's cold-host role and A1's
+> retirement role are not yet built.
 
 > **Accepted 2026-09-22, implementation open — ADR-0147:** bounded accept
 > admission and terminal parking replaces native multishot accept with
@@ -478,7 +478,7 @@ pub struct WatermarkGate;          // LSN-keyed; advance(lsn) wakes all ≤ lsn
 // Reactor loop skeleton: the 10 steps with budgets + always-on iteration histogram.
 pub trait CellPlane {
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion);   // 1 REAP dispatch
-    fn on_timer(&mut self, cx: &mut LoopCx<'_>, key: u64) {}           // timer fired
+    fn on_timer<'n>(&mut self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> { TimerOutcome::Complete } // one due arm
     fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {}                    // 2
     fn before_execute(&mut self, cx: &mut LoopCx<'_>) {}               // execute prelude, ADR-0152 A1
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>);                  // 3+4
@@ -490,7 +490,7 @@ pub trait CellPlane {
 pub struct LoopCx<'a> {            // ops pushed here ride the NEXT single submit (L3)
     pub now: Nanos,
     pub pool: &'a mut BufferPool, pub executor: &'a mut CellExecutor,
-    pub timers: &'a mut TimerWheel,
+    // timers(&mut self) -> Timers<'_>: arm, cancel, close, phase, successor, armed_max
     // push(IoOp) · budget(GroupClass) · charge(GroupClass, units) · note_fabric(msgs)
     // Private delivery and preparation budgets initialized once per native iteration.
 }
@@ -508,9 +508,13 @@ impl CellLoop {
     pub fn tripwires(&self) -> [(&'static str, u64); 5];   // frozen names, M0-S19 scrape
 }
 
-// Timer wheel v0 + scheduler groups v0 (E2 scope):
-pub struct TimerWheel;  // 6×64 hierarchical, 1 ms tick; insert/cancel/advance/next_deadline
-pub struct TimerId;     // generation-checked (stale cancels rejected)
+// Timer set (ADR-0154) + scheduler groups v0 (E2 scope):
+pub struct TimerSet;       // build(Cap, &census) -> Result<_, CapError>; reserve(route) -> Reserved
+pub struct TimerOwner;     // a reserved position: slot, generation, the set's identity; not Clone
+pub struct TimerArm;       // an owner and its arm sequence (Copy): cancel acts on this arm only
+pub struct TimerNotice;    // the delivered arm and its route; only TimerSet::begin makes one
+pub struct Successor<'n>;  // the notice's next deadline, checked when made; borrows it, not Clone
+pub enum TimerOutcome<'n> { Complete, Successor(Successor<'n>) }
 pub enum GroupClass { Foreground, Maintenance }
 pub struct GroupScheduler;  // deficit-weighted, burst-capped; refill/budget/charge
 ```
@@ -943,8 +947,12 @@ impl SlotRouter {
 > compat oracle's assertion, not a rule of this seam.
 > `scripts/check-reply-outcome.sh` refuses a first-byte or prefix
 > comparison in production `crates/inf-server/src`; a sanctioned site
-> carries `reply-outcome-allow: <reason>`. The sketch below is the shape
-> (ADR-0190 D2, D4).
+> carries `reply-outcome-allow: <reason>`. Outside the functions that
+> set and read a reply's tag, it also refuses a path through `Outcome`
+> to anything but a non-reply variant (`Ok`, `Int`, `Nil`, `Bool`,
+> `Err`), a path through `ReplyOutcome`, and another name for either
+> enum; no marker sanctions one. The sketch below is the shape
+> (ADR-0190 D2, D4, A2).
 
 > **ADR-0190 A1 (2026-10-30):** `execute` and
 > every reply parameter take `out: &mut ReplyBuf`, with no lifetime;
@@ -1030,9 +1038,7 @@ config, serve_mark, timer_set)` takes that mark and set and consumes the mark
 as its first `run_iteration` begins, so every step before it is the cell's
 assembly. The mark is a token the census mints once, never `Clone`: a census
 is marked at most once. `NodeInfo::cap_census` holds the census for the
-cell's readers. The timer set is unbuilt: until it is, `ServerPlane::new`
-returns `(ServerPlane, ServeMark)` and cannot fail, and `CellLoop::new` takes
-no set.
+cell's readers.
 
 `inf-runtime::net` (assembly helpers, keeps bins `forbid(unsafe_code)`):
 `listen_reuseport(port) -> TcpListener` · `bound_port` ·
