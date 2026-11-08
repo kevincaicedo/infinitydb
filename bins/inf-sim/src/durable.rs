@@ -2529,6 +2529,12 @@ impl Node {
         &mut self.cells[cell].1
     }
 
+    /// `cell`'s sim driver, read between scheduler steps: the harness's own
+    /// reading of the ops its device holds.
+    pub(crate) fn driver(&self, cell: usize) -> &SimDriver {
+        self.cells[cell].0.driver()
+    }
+
     /// What `cell`'s reactor iteration reported in the last scheduler step,
     /// `None` when that step did not run the cell (frozen): a skipped cell
     /// has no iteration to read. `parked` is the reactor's own decision,

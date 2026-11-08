@@ -420,6 +420,9 @@ pub struct TieredNodeReport {
     pub drop_replies_value: u64,
     /// Drop-race replies that answered typed errors/nils (drop won).
     pub drop_replies_other: u64,
+    /// Drop-race `DROP`s answered while a cold read of the namespace's tier
+    /// files was held at the device: the custody oracle's engagement.
+    pub drop_reads_held: u64,
     /// Phase 10 (ADR-0100 D6): the post-drop reboot succeeded; whether a
     /// MANIFEST still named the dropped namespace (the row is inert on a
     /// seed where a checkpoint raced the drop — disclosed).
@@ -2036,6 +2039,9 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     let closed = disk.closed_fd_ops();
     if closed > 0 {
         fail(&mut report, format!("CUSTODY: {closed} driver ops named a closed descriptor"));
+    }
+    if report.drop_reads_held == 0 {
+        fail(&mut report, "VACUOUS: no DROP met a cold read held on its tier files".to_string());
     }
     finish(report, &observer, &clock)
 }

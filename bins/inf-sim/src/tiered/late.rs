@@ -712,7 +712,18 @@ fn phase_8(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdic
     Ok(())
 }
 
-/// Phase 9: the S19 drop race through the wire.
+/// A tier file, by its name.
+fn is_tier_file(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "itier")
+}
+
+/// Steps a drop race waits for its first cold read to reach the device.
+const RACE_READ_WAIT_STEPS: u64 = 512;
+
+/// Phase 9: the S19 drop race through the wire. Its cold reads are held at
+/// the device until the DROP is answered, so the drop is applied while a
+/// read of the namespace's tier files is queued: the dropped owner keeps
+/// each file open until its read ends (the custody oracle).
 fn phase_9(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
     let racer_cell = 0usize;
     let racer_fd = node.nets[racer_cell].borrow_mut().connect();
@@ -749,10 +760,28 @@ fn phase_9(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdic
     for key in &race_keys {
         batch.extend_from_slice(&encode(&[b"GET", key]));
     }
+    cx.disk.hold_reads(Some(is_tier_file));
     node.nets[racer_cell].borrow_mut().client_send(racer_fd, &batch);
+    let cells = usize::from(cx.scenario.cells);
+    let reads_held = |node: &Node| (0..cells).any(|cell| node.driver(cell).held_reads() > 0);
+    for _ in 0..RACE_READ_WAIT_STEPS {
+        if reads_held(node) {
+            break;
+        }
+        if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
+            cx.fail(format!("drop-race read wait: {err}"));
+            return Err(());
+        }
+        cx.report.scheduler_steps += 1;
+    }
     // DROP races the pipelined reads from a second connection.
     let drop_ns: &[&[u8]] = &[b"INF.NS", b"DROP", NS_NAME];
-    match audit.call(node, cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max, drop_ns) {
+    let dropped = audit.call(node, cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max, drop_ns);
+    if reads_held(node) {
+        cx.report.drop_reads_held += 1;
+    }
+    cx.disk.hold_reads(None);
+    match dropped {
         Ok(Some(ok)) if ok == b"+OK\r\n" => {}
         other => {
             cx.fail(format!("racing DROP answered {other:?}"));
