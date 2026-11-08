@@ -180,13 +180,17 @@ need Linux 6.6 or newer, with `/dev/shm` on a tmpfs that takes `O_DIRECT`: the
 `timer_owners` test keeps its node's data there, and without it the test fails
 rather than skips. The server itself runs on 5.15.
 
-Each checkout builds in a target directory of its own, which the first `just`
-recipe marks as this checkout's. A `target/` that a plain `cargo` command or
-an editor wrote before that is refused once: the recipe stops and prints the
-command that clears it, and the next build is cold, the release server
-included. So run any recipe, or `./scripts/target-root.sh --print`, before
-the first plain `cargo build` and before opening the clone in an editor that
-runs cargo; or run the printed command when the refusal comes.
+Each checkout builds in its own `target/`, which the first `just` recipe
+marks as this checkout's. Every recipe refuses a `CARGO_TARGET_DIR` that names
+another directory, a `CARGO_BUILD_TARGET`, or a cargo config that moves the
+build, and says what clears it (unset it or remove the key; to keep the
+outputs on another volume, clone the checkout there). A `target/` that a plain
+`cargo` command or an editor wrote before the first recipe is refused once: the
+recipe stops and prints `./scripts/target-root.sh --clean`, which clears it,
+and the next build is cold, the release server included. So run any recipe, or
+`./scripts/target-root.sh --print`, before the first plain `cargo build` and
+before opening the clone in an editor that runs cargo; or run the printed
+command when the refusal comes.
 
 - `cargo build --release -p infinityd` builds the server
   (`infinityd --help` prints its usage).
