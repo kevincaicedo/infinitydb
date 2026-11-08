@@ -106,48 +106,233 @@ pub use sidecar::{SidecarReport, SidecarScenario, run_sidecar_scenario};
 pub use steel::{SteelReport, SteelScenario, run_steel_scenario};
 pub use tiered::{TieredNodeReport, TieredScenario, run_tiered_scenario};
 
-/// Every scenario name the `inf-sim` binary accepts: the registry
+/// Every scenario the `inf-sim` binary accepts, one row each: the registry
 /// `scripts/sim-smoke.sh` runs once per merge and `tests/lanes.rs` checks
 /// against the CLI dispatch, so a scenario cannot be born unrun. Add a
 /// scenario here, in `main.rs`, and in the smoke script together.
-pub const SCENARIOS: &[&str] = &[
-    "m0-smoke",
-    "m0-adversarial",
-    "m0-surface",
-    "m0-fabric-fairness",
-    "m0-admission",
-    "m1-cache",
-    "m2-durable",
-    "m2-clean-stop",
-    "m2-device-budget",
-    "m2-mode-transition",
-    "m2-reorder-window",
-    "m2-fill-tick",
-    "m2-fill-dense",
-    "m2-group-hold",
-    "m2-fua-pending",
-    "m2-ledger-wedge",
-    "m2-stop-tick",
-    "m2-ckpt-refused",
-    "m2-recycle",
-    "m2-combined",
-    "m2-ns-create-window",
-    "m2-ns-drop-window",
-    "m2-ns-ddl-race",
-    "m3-document",
-    "boot-storm",
-    "m4-steel",
-    "m4-pressure",
-    "m4-cold",
-    "m4-recovery",
-    "m4-diskfull",
-    "m4-tiered",
-    "m4-tier-budget",
-    "m4-epoch-marks",
-    "m4-extent-window",
-    "m45-backfill",
-    "m45-sidecar",
+///
+/// The sweep column says whether the scenario takes `--sweep`; the binary
+/// refuses it on every other row before any run. The leg column names the
+/// leg flag a legged scenario requires and no other row takes.
+pub const SCENARIOS: &[ScenarioRow] = &[
+    ScenarioRow::single("m0-smoke"),
+    ScenarioRow::single("m0-adversarial"),
+    ScenarioRow::single("m0-surface"),
+    ScenarioRow::single("m0-fabric-fairness"),
+    ScenarioRow::single("m0-admission"),
+    ScenarioRow::single("m1-cache"),
+    ScenarioRow::sweeps("m2-durable"),
+    ScenarioRow::sweeps("m2-clean-stop"),
+    ScenarioRow::sweeps("m2-device-budget"),
+    ScenarioRow::sweeps("m2-mode-transition"),
+    ScenarioRow::sweeps("m2-reorder-window"),
+    ScenarioRow::sweeps("m2-fill-tick"),
+    ScenarioRow::sweeps("m2-fill-dense"),
+    ScenarioRow::sweeps("m2-group-hold"),
+    ScenarioRow::sweeps("m2-fua-pending"),
+    ScenarioRow::sweeps("m2-ledger-wedge").with_leg(Leg::LedgerWedge),
+    ScenarioRow::sweeps("m2-stop-tick"),
+    ScenarioRow::sweeps("m2-ckpt-refused"),
+    ScenarioRow::sweeps("m2-recycle"),
+    ScenarioRow::sweeps("m2-combined"),
+    ScenarioRow::sweeps("m2-ns-create-window"),
+    ScenarioRow::sweeps("m2-ns-drop-window"),
+    ScenarioRow::sweeps("m2-ns-ddl-race"),
+    ScenarioRow::sweeps("m3-document"),
+    ScenarioRow::single("boot-storm"),
+    ScenarioRow::single("m4-steel"),
+    ScenarioRow::single("m4-pressure"),
+    ScenarioRow::single("m4-cold"),
+    ScenarioRow::sweeps("m4-recovery"),
+    ScenarioRow::single("m4-diskfull"),
+    ScenarioRow::sweeps("m4-tiered"),
+    ScenarioRow::sweeps("m4-tier-budget").with_leg(Leg::TierBudget),
+    ScenarioRow::sweeps("m4-epoch-marks").with_leg(Leg::EpochMarks),
+    ScenarioRow::single("m4-extent-window").with_leg(Leg::ExtentWindow),
+    ScenarioRow::single("m45-backfill"),
+    ScenarioRow::single("m45-sidecar"),
 ];
+
+/// One registry row: a scenario's name and its two columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScenarioRow {
+    pub name: &'static str,
+    pub sweeps: Sweeps,
+    pub leg: Option<Leg>,
+}
+
+/// The sweep column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sweeps {
+    /// `--sweep N` runs N seeds through the sweep driver, each twice.
+    Yes,
+    /// One seed a run; `--sweep` is refused.
+    No,
+}
+
+impl ScenarioRow {
+    const fn sweeps(name: &'static str) -> ScenarioRow {
+        ScenarioRow { name, sweeps: Sweeps::Yes, leg: None }
+    }
+
+    const fn single(name: &'static str) -> ScenarioRow {
+        ScenarioRow { name, sweeps: Sweeps::No, leg: None }
+    }
+
+    const fn with_leg(self, leg: Leg) -> ScenarioRow {
+        ScenarioRow { leg: Some(leg), ..self }
+    }
+
+    /// The row whose name is `name`.
+    #[must_use]
+    pub fn named(name: &str) -> Option<&'static ScenarioRow> {
+        SCENARIOS.iter().find(|row| row.name == name)
+    }
+
+    /// The leg this row runs, out of the leg flags the command line gave:
+    /// its own leg when it has one, else none. A missing leg, or a leg flag
+    /// that is another row's, is the refusal's text.
+    pub fn leg_of(&self, given: &[LegValue]) -> Result<Option<LegValue>, String> {
+        if let Some(other) = given.iter().find(|value| Some(value.leg()) != self.leg) {
+            let owner = SCENARIOS
+                .iter()
+                .find(|row| row.leg == Some(other.leg()))
+                .map_or("no scenario", |row| row.name);
+            let flag = other.leg().flag();
+            return Err(match self.leg {
+                Some(own) => format!("{flag} is {owner}'s; {}'s leg is {}", self.name, own.flag()),
+                None => format!("{flag} is {owner}'s; {} has no leg", self.name),
+            });
+        }
+        let Some(leg) = self.leg else {
+            return Ok(None);
+        };
+        match given.last() {
+            Some(value) => Ok(Some(*value)),
+            None => Err(format!("{} needs {} {}", self.name, leg.flag(), leg.names().join("|"))),
+        }
+    }
+}
+
+/// The leg column: the four legged scenarios' leg kinds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leg {
+    TierBudget,
+    EpochMarks,
+    LedgerWedge,
+    ExtentWindow,
+}
+
+impl Leg {
+    /// Every leg kind, in the order the help text lists their flags.
+    pub const ALL: [Leg; 4] =
+        [Leg::TierBudget, Leg::EpochMarks, Leg::ExtentWindow, Leg::LedgerWedge];
+
+    /// The leg kind whose flag `flag` is.
+    #[must_use]
+    pub fn of_flag(flag: &str) -> Option<Leg> {
+        Leg::ALL.into_iter().find(|leg| leg.flag() == flag)
+    }
+
+    /// Parses one of the leg's names; any other text is the refusal's.
+    pub fn parse(self, name: &str) -> Result<LegValue, String> {
+        let value = match self {
+            Leg::TierBudget => TierBudgetLeg::parse(name).map(LegValue::TierBudget),
+            Leg::EpochMarks => EpochMarksLeg::parse(name).map(LegValue::EpochMarks),
+            Leg::LedgerWedge => LedgerWedgeLeg::parse(name).map(LegValue::LedgerWedge),
+            Leg::ExtentWindow => ExtentWindowLeg::parse(name).map(LegValue::ExtentWindow),
+        };
+        value.ok_or_else(|| {
+            format!("unknown {} {name}; the legs are {}", self.flag(), self.names().join("|"))
+        })
+    }
+
+    /// The flag that names the leg.
+    #[must_use]
+    pub const fn flag(self) -> &'static str {
+        match self {
+            Leg::TierBudget => "--tier-leg",
+            Leg::EpochMarks => "--marks-leg",
+            Leg::LedgerWedge => "--wedge-leg",
+            Leg::ExtentWindow => "--window-leg",
+        }
+    }
+
+    /// The leg's names, in its enum's order: the first is the one a
+    /// one-seed sweep of the row runs.
+    #[must_use]
+    pub fn names(self) -> Vec<&'static str> {
+        match self {
+            Leg::TierBudget => TierBudgetLeg::ALL.iter().map(|leg| leg.name()).collect(),
+            Leg::EpochMarks => EpochMarksLeg::ALL.iter().map(|leg| leg.name()).collect(),
+            Leg::LedgerWedge => LedgerWedgeLeg::ALL.iter().map(|leg| leg.name()).collect(),
+            Leg::ExtentWindow => ExtentWindowLeg::ALL.iter().map(|leg| leg.name()).collect(),
+        }
+    }
+}
+
+/// A leg flag's value, parsed: the leg kind and its typed leg, which the
+/// scenario's constructor takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegValue {
+    TierBudget(TierBudgetLeg),
+    EpochMarks(EpochMarksLeg),
+    LedgerWedge(LedgerWedgeLeg),
+    ExtentWindow(ExtentWindowLeg),
+}
+
+impl LegValue {
+    #[must_use]
+    pub fn leg(self) -> Leg {
+        match self {
+            LegValue::TierBudget(_) => Leg::TierBudget,
+            LegValue::EpochMarks(_) => Leg::EpochMarks,
+            LegValue::LedgerWedge(_) => Leg::LedgerWedge,
+            LegValue::ExtentWindow(_) => Leg::ExtentWindow,
+        }
+    }
+}
+
+/// The registry's columns: every name on one row, every legged row's leg
+/// kind on that row alone and in the kinds the flag parse reads.
+#[cfg(test)]
+mod registry {
+    use super::{Leg, SCENARIOS, ScenarioRow};
+
+    #[test]
+    fn every_name_and_every_leg_kind_is_on_one_row() {
+        for row in SCENARIOS {
+            let same = SCENARIOS.iter().filter(|other| other.name == row.name).count();
+            assert_eq!(same, 1, "{} is on {same} rows", row.name);
+            let Some(leg) = row.leg else { continue };
+            let owners = SCENARIOS.iter().filter(|other| other.leg == Some(leg)).count();
+            assert_eq!(owners, 1, "{} is the leg of {owners} rows", leg.flag());
+            assert_eq!(Leg::of_flag(leg.flag()), Some(leg), "{} is not parsed", leg.flag());
+            let first = leg.names()[0];
+            assert_eq!(leg.parse(first).map(|value| value.leg()), Ok(leg));
+        }
+        assert!(Leg::TierBudget.parse("no-such-leg").unwrap_err().contains("the legs are"));
+        assert_eq!(ScenarioRow::named("no-such-scenario"), None);
+    }
+
+    #[test]
+    fn a_leg_is_its_row_alone() {
+        let budget = ScenarioRow::named("m4-tier-budget").unwrap();
+        let durable = ScenarioRow::named("m2-durable").unwrap();
+        let tier = Leg::TierBudget.parse("two-8mb").unwrap();
+        let marks = Leg::EpochMarks.parse("wedge").unwrap();
+        assert_eq!(budget.leg_of(&[tier]), Ok(Some(tier)));
+        assert_eq!(durable.leg_of(&[]), Ok(None));
+        assert!(budget.leg_of(&[]).unwrap_err().contains("m4-tier-budget needs --tier-leg"));
+        let refusal = durable.leg_of(&[tier]).unwrap_err();
+        assert!(refusal.contains("--tier-leg is m4-tier-budget's; m2-durable has no leg"));
+        let refusal = budget.leg_of(&[tier, marks]).unwrap_err();
+        assert!(
+            refusal.contains("--marks-leg is m4-epoch-marks's; m4-tier-budget's leg is --tier-leg"),
+            "{refusal}"
+        );
+    }
+}
 
 /// ADR-0107: the simulator's tests arm fault points and build forced
 /// collisions; without the `dst` feature both are compiled to no-ops and

@@ -1,4 +1,13 @@
+//! The determinism twin at the binary, and the sweep arguments' refusals,
+//! read off the scenario registry. A single run under the flag prints the
+//! twin's agreement line; a row outside the sweep column refuses `--sweep`;
+//! a sweep-capable row refuses a bad seed count or shard at the parse, the
+//! flag beside `--sweep`, and `--shard` or `--out` without it. No test here
+//! runs a sweep: the release build sweeps every sweep-capable row.
+
 use std::process::Command;
+
+use inf_sim::{SCENARIOS, ScenarioRow, Sweeps};
 
 /// A single run under the flag runs the twin and prints its one agreement
 /// line, which names both hashes.
@@ -36,57 +45,79 @@ fn assert_refused(args: &[&str], message: &str) {
     assert!(output.stdout.is_empty(), "{args:?}: a run started: {output:?}");
 }
 
-/// A sweep's arguments are checked where they are parsed: a zero seed
-/// count, a shard outside its count, and `--shard` or `--out` without
-/// `--sweep` each exit 2 with their own message before any run starts.
+/// A row's first leg flag and name, which the row cannot run without.
+fn leg_args(row: &ScenarioRow) -> Vec<&'static str> {
+    row.leg.map(|leg| vec![leg.flag(), leg.names()[0]]).unwrap_or_default()
+}
+
+/// The command line `--scenario <row> [its first leg] <extra>`.
+fn row_args<'a>(row: &'static ScenarioRow, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["--scenario", row.name];
+    args.extend(leg_args(row));
+    args.extend(extra);
+    args
+}
+
+fn rows(sweeps: Sweeps) -> Vec<&'static ScenarioRow> {
+    let rows: Vec<_> = SCENARIOS.iter().filter(|row| row.sweeps == sweeps).collect();
+    assert!(!rows.is_empty(), "the registry has no {sweeps:?} row");
+    rows
+}
+
+/// Every sweep-capable row's arguments are checked where they are parsed:
+/// a zero seed count, a shard outside its count, and `--shard` or `--out`
+/// without `--sweep` each exit 2 with their own message before any run
+/// starts. Each row runs with its first leg, so a leg column that named the
+/// wrong flag would read its leg refusal here instead.
 #[test]
 fn a_bad_sweep_argument_is_refused_at_the_parse() {
     let unused = std::env::temp_dir().join("inf-sim-out-never-created");
     let unused = unused.to_str().unwrap();
-    for (extra, message) in [
-        (&["--sweep", "0"][..], "a sweep runs at least 1 seed"),
-        (&["--sweep", "2", "--shard", "2/2"], "I is a shard index, below K"),
-        (&["--sweep", "2", "--shard", "0/0"], "K is the shard count, at least 1"),
-        (&["--shard", "0/2"], "--shard needs --sweep"),
-        (&["--out", unused], "--out needs --sweep"),
-    ] {
-        let mut args = vec!["--scenario", "m2-durable"];
-        args.extend(extra);
-        assert_refused(&args, message);
+    for row in rows(Sweeps::Yes) {
+        for (extra, message) in [
+            (&["--sweep", "0"][..], "a sweep runs at least 1 seed"),
+            (&["--sweep", "2", "--shard", "2/2"], "I is a shard index, below K"),
+            (&["--sweep", "2", "--shard", "0/0"], "K is the shard count, at least 1"),
+            (&["--shard", "0/2"], "--shard needs --sweep"),
+            (&["--out", unused], "--out needs --sweep"),
+        ] {
+            assert_refused(&row_args(row, extra), message);
+        }
     }
 }
 
 /// A sweep runs every seed twice, so `--verify-determinism` beside
-/// `--sweep` is a usage error: its absence would read as once.
+/// `--sweep` is a usage error on every sweep-capable row: its absence would
+/// read as once.
 #[test]
 fn a_sweep_refuses_the_flag() {
-    assert_refused(
-        &["--scenario", "m2-durable", "--sweep", "1", "--verify-determinism"],
-        "--verify-determinism is a single run's: a sweep runs every seed twice",
-    );
+    for row in rows(Sweeps::Yes) {
+        assert_refused(
+            &row_args(row, &["--sweep", "1", "--verify-determinism"]),
+            "--verify-determinism is a single run's: a sweep runs every seed twice",
+        );
+    }
 }
 
-/// A scenario that cannot sweep refuses `--sweep` before any run, and the
-/// message names the scenarios that can.
+/// Every row outside the sweep column refuses `--sweep` before any run, and
+/// the message names the column.
 #[test]
-#[ignore = "eight scenarios run one seed under --sweep N and exit 0, and the refusal names \
-            three of the scenarios that sweep; red until --sweep is refused off the registry's \
-            sweep column"]
 fn a_scenario_that_cannot_sweep_refuses_a_sweep() {
-    for scenario in [
-        &["--scenario", "m4-steel"][..],
-        &["--scenario", "m45-backfill"],
-        &["--scenario", "m45-sidecar"],
-        &["--scenario", "m4-diskfull"],
-        &["--scenario", "m4-pressure"],
-        &["--scenario", "m4-cold"],
-        &["--scenario", "boot-storm"],
-        &["--scenario", "m4-extent-window", "--window-leg", "burst"],
-        &["--scenario", "m0-smoke"],
-    ] {
-        let mut args = scenario.to_vec();
-        args.extend(["--sweep", "1"]);
-        let refusal = format!("--sweep is not {}'s: the scenarios that sweep are", scenario[1]);
-        assert_refused(&args, &refusal);
+    for row in rows(Sweeps::No) {
+        let refusal =
+            format!("--sweep is not {}'s: the scenarios that sweep are m2-durable", row.name);
+        assert_refused(&row_args(row, &["--sweep", "1"]), &refusal);
     }
+}
+
+/// `--list-sweeps` prints the sweep column, one line a row: its name and,
+/// for a legged row, its leg flag and first leg.
+#[test]
+fn the_sweep_listing_is_the_sweep_column() {
+    let output = Command::new(env!("CARGO_BIN_EXE_inf-sim")).arg("--list-sweeps").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let listed = String::from_utf8_lossy(&output.stdout);
+    let column: Vec<String> =
+        rows(Sweeps::Yes).into_iter().map(|row| row_args(row, &[])[1..].join(" ")).collect();
+    assert_eq!(listed.lines().collect::<Vec<_>>(), column);
 }

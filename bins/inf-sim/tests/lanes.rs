@@ -63,7 +63,8 @@ fn smoke_rows() -> Vec<String> {
 
 #[test]
 fn the_registry_is_the_cli_dispatch() {
-    let registry: BTreeSet<String> = inf_sim::SCENARIOS.iter().map(|s| (*s).to_string()).collect();
+    let registry: BTreeSet<String> =
+        inf_sim::SCENARIOS.iter().map(|row| row.name.to_string()).collect();
     let dispatched = dispatched_in_main();
     assert_eq!(
         registry,
@@ -79,7 +80,7 @@ fn the_registry_is_the_cli_dispatch() {
 #[test]
 fn every_scenario_has_a_smoke_row_and_every_row_names_a_scenario() {
     let rows = smoke_rows();
-    let registry: BTreeSet<&str> = inf_sim::SCENARIOS.iter().copied().collect();
+    let registry: BTreeSet<&str> = inf_sim::SCENARIOS.iter().map(|row| row.name).collect();
     let in_rows: BTreeSet<&str> = rows.iter().map(String::as_str).collect();
     let unrun: Vec<&&str> = registry.iter().filter(|s| !in_rows.contains(**s)).collect();
     assert!(unrun.is_empty(), "scenarios with no row in scripts/sim-smoke.sh: {unrun:?}");

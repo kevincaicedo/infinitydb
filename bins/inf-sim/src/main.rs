@@ -21,7 +21,7 @@ use inf_sim::{
     CombinedScenario, DurableScenario, EpochMarksLeg, ExtentWindowLeg, LedgerWedgeLeg, Scenario,
     TierBudgetLeg, run_combined_scenario, run_durable_scenario, run_scenario,
 };
-use inf_sim::{RecoveryScenario, SeedClass, SpecVariant};
+use inf_sim::{Leg, LegValue, RecoveryScenario, ScenarioRow, SeedClass, SpecVariant, Sweeps};
 
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -89,14 +89,9 @@ fn main() {
     // up to the inline maximum; a run that placed no pad is VACUOUS.
     let mut spec_variant: Option<SpecVariant> = None;
     let mut ops_override: Option<u64> = None;
-    // m4-tier-budget's leg, named on every run so a sweep is one shape.
-    let mut tier_leg: Option<TierBudgetLeg> = None;
-    // m4-epoch-marks's leg, named the same way.
-    let mut marks_leg: Option<EpochMarksLeg> = None;
-    // m4-extent-window's leg, named the same way.
-    let mut window_leg: Option<ExtentWindowLeg> = None;
-    // m2-ledger-wedge's leg, named the same way.
-    let mut wedge_leg: Option<LedgerWedgeLeg> = None;
+    // A legged scenario's leg, named on every run so a sweep is one shape;
+    // the registry's leg column says which flag is whose.
+    let mut legs: Vec<LegValue> = Vec::new();
     // TM3's leg of m2-fill-tick and m2-group-hold: the loops at spin 0.
     let mut park_at_once = false;
 
@@ -104,6 +99,10 @@ fn main() {
     while let Some(flag) = it.next() {
         let mut take = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
         let result: Result<(), String> = (|| {
+            if let Some(leg) = Leg::of_flag(&flag) {
+                legs.push(leg.parse(&take(leg.flag())?)?);
+                return Ok(());
+            }
             match flag.as_str() {
                 "--scenario" => scenario_name = take("--scenario")?,
                 "--seed" => seed = parse_seed(&take("--seed")?)?,
@@ -140,30 +139,6 @@ fn main() {
                         other => return Err(format!("unknown spec variant {other}")),
                     });
                 }
-                "--tier-leg" => {
-                    let name = take("--tier-leg")?;
-                    tier_leg = Some(TierBudgetLeg::parse(&name).ok_or_else(|| {
-                        format!("unknown tier leg {name}; the legs are {}", tier_leg_names())
-                    })?);
-                }
-                "--marks-leg" => {
-                    let name = take("--marks-leg")?;
-                    marks_leg = Some(EpochMarksLeg::parse(&name).ok_or_else(|| {
-                        format!("unknown marks leg {name}; the legs are {}", marks_leg_names())
-                    })?);
-                }
-                "--wedge-leg" => {
-                    let name = take("--wedge-leg")?;
-                    wedge_leg = Some(LedgerWedgeLeg::parse(&name).ok_or_else(|| {
-                        format!("unknown wedge leg {name}; the legs are {}", wedge_leg_names())
-                    })?);
-                }
-                "--window-leg" => {
-                    let name = take("--window-leg")?;
-                    window_leg = Some(ExtentWindowLeg::parse(&name).ok_or_else(|| {
-                        format!("unknown window leg {name}; the legs are {}", window_leg_names())
-                    })?);
-                }
                 // m4-cold: total op count (the AC's 10⁶ run sets it; the
                 // smoke default is lighter).
                 "--ops" => {
@@ -176,23 +151,24 @@ fn main() {
                          [--plant lost-wakeup|fsync-lies|accept-error|accept-broken|\
                          tier-read-eio|tier-write-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--replay-above-window] \
-                         [--spec-variant ring-top|page] [--tier-leg {}] [--marks-leg {}] \
-                         [--window-leg {}] [--wedge-leg {}] [--park-at-once] \
+                         [--spec-variant ring-top|page] {} [--park-at-once] \
                          [--cells N] [--connections N] [--commands N] [--wheel-nodes-max N] \
                          [--trace-out FILE] \
-                         [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
-                        inf_sim::SCENARIOS.join("|"),
-                        tier_leg_names(),
-                        marks_leg_names(),
-                        window_leg_names(),
-                        wedge_leg_names()
+                         [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios] \
+                         [--list-sweeps]",
+                        scenario_names().join("|"),
+                        leg_flags_help()
                     );
                     std::process::exit(0);
                 }
                 "--list-scenarios" => {
-                    for name in inf_sim::SCENARIOS {
+                    for name in scenario_names() {
                         println!("{name}");
                     }
+                    std::process::exit(0);
+                }
+                "--list-sweeps" => {
+                    list_sweeps();
                     std::process::exit(0);
                 }
                 other => return Err(format!("unknown flag {other}")),
@@ -204,6 +180,19 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // Every scenario is a registry row. A legged one names its leg, and only
+    // it takes that leg's flag: one check over the registry's leg column.
+    let Some(row) = ScenarioRow::named(&scenario_name) else {
+        eprintln!(
+            "inf-sim: unknown scenario {scenario_name} (have: {})",
+            scenario_names().join(", ")
+        );
+        std::process::exit(2);
+    };
+    let leg = row.leg_of(&legs).unwrap_or_else(|refusal| {
+        eprintln!("inf-sim: {refusal}");
+        std::process::exit(2);
+    });
     // The accept-broken plant is the accept-retry oracle's leg, m0-smoke's
     // alone: refused on any other scenario before a runner starts.
     if plant.is_accept_retry_leg() && scenario_name != "m0-smoke" {
@@ -218,7 +207,7 @@ fn main() {
         std::process::exit(2);
     }
     let determinism = if verify { Verify::Twin } else { Verify::Off };
-    let sweep = sweep_of(verify, seed, sweep, shard, out_dir).unwrap_or_else(|refusal| {
+    let sweep = sweep_of(row, verify, seed, sweep, shard, out_dir).unwrap_or_else(|refusal| {
         eprintln!("inf-sim: {refusal}");
         std::process::exit(2);
     });
@@ -236,88 +225,21 @@ fn main() {
         (false, variant) => variant.map(SeedClass::SpecVariant),
     };
 
-    // m4-tier-budget names its leg, and only it has one.
-    match (scenario_name.as_str(), tier_leg) {
-        ("m4-tier-budget", None) => {
-            eprintln!("inf-sim: m4-tier-budget needs --tier-leg {}", tier_leg_names());
-            std::process::exit(2);
-        }
-        ("m4-tier-budget", Some(_)) | (_, None) => {}
-        (other, Some(_)) => {
-            eprintln!("inf-sim: --tier-leg is m4-tier-budget's; {other} has no leg");
-            std::process::exit(2);
-        }
-    }
-    // m4-epoch-marks names its leg, and only it has one.
-    match (scenario_name.as_str(), marks_leg) {
-        ("m4-epoch-marks", None) => {
-            eprintln!("inf-sim: m4-epoch-marks needs --marks-leg {}", marks_leg_names());
-            std::process::exit(2);
-        }
-        ("m4-epoch-marks", Some(_)) | (_, None) => {}
-        (other, Some(_)) => {
-            eprintln!("inf-sim: --marks-leg is m4-epoch-marks's; {other} has no leg");
-            std::process::exit(2);
-        }
-    }
-    // m2-ledger-wedge names its leg, and only it has one.
-    match (scenario_name.as_str(), wedge_leg) {
-        ("m2-ledger-wedge", None) => {
-            eprintln!("inf-sim: m2-ledger-wedge needs --wedge-leg {}", wedge_leg_names());
-            std::process::exit(2);
-        }
-        ("m2-ledger-wedge", Some(_)) | (_, None) => {}
-        (other, Some(_)) => {
-            eprintln!("inf-sim: --wedge-leg is m2-ledger-wedge's; {other} has no leg");
-            std::process::exit(2);
-        }
-    }
-    // m4-extent-window names its leg, and only it has one.
-    match (scenario_name.as_str(), window_leg) {
-        ("m4-extent-window", None) => {
-            eprintln!("inf-sim: m4-extent-window needs --window-leg {}", window_leg_names());
-            std::process::exit(2);
-        }
-        ("m4-extent-window", Some(leg)) => {
-            std::process::exit(run_extent_window(seed, leg, determinism).code());
-        }
-        (_, None) => {}
-        (other, Some(_)) => {
-            eprintln!("inf-sim: --window-leg is m4-extent-window's; {other} has no leg");
-            std::process::exit(2);
-        }
+    // m4-extent-window's leg arrives as its type from the leg check.
+    if let ("m4-extent-window", Some(LegValue::ExtentWindow(leg))) = (scenario_name.as_str(), leg) {
+        std::process::exit(run_extent_window(seed, leg, determinism).code());
     }
 
     // The M2-S19 durable scenario has its own runner (power cuts, the
     // durability oracle, the sweep mode).
-    if matches!(
-        scenario_name.as_str(),
-        "m2-durable"
-            | "m2-clean-stop"
-            | "m2-device-budget"
-            | "m2-mode-transition"
-            | "m2-reorder-window"
-            | "m2-fill-tick"
-            | "m2-fill-dense"
-            | "m2-group-hold"
-            | "m2-fua-pending"
-            | "m2-ledger-wedge"
-            | "m2-stop-tick"
-            | "m2-ckpt-refused"
-            | "m2-recycle"
-            | "m3-document"
-            | "m4-tier-budget"
-            | "m4-epoch-marks"
-    ) {
+    if let Some(kind) = DurableKind::resolve(&scenario_name, leg) {
         run_durable(
             &scenario_name,
+            kind,
             seed,
             plant,
             replay_canary,
             lift_regime,
-            tier_leg,
-            marks_leg,
-            wedge_leg,
             park_at_once,
             determinism,
             sweep.as_ref(),
@@ -812,10 +734,6 @@ fn main() {
         });
         std::process::exit(exit.code());
     }
-    if sweep.is_some() {
-        eprintln!("inf-sim: --sweep is an m2-durable / m3-document / m2-combined mode");
-        std::process::exit(2);
-    }
     let mut scenario = match scenario_name.as_str() {
         "m0-smoke" => Scenario::m0_smoke(seed),
         "m0-adversarial" => Scenario::m0_adversarial(seed),
@@ -824,10 +742,7 @@ fn main() {
         "m0-admission" => Scenario::m0_admission(seed),
         "m1-cache" => Scenario::m1_cache(seed),
         other => {
-            eprintln!(
-                "inf-sim: unknown scenario {other} (have: {})",
-                inf_sim::SCENARIOS.join(", ")
-            );
+            eprintln!("inf-sim: unknown scenario {other} (have: {})", scenario_names().join(", "));
             std::process::exit(2);
         }
     };
@@ -904,10 +819,13 @@ fn main() {
 }
 
 /// The sweep arguments as one checked type, or the refusal. `--shard` and
-/// `--out` need `--sweep`; `--verify-determinism` is a single run's, since
+/// `--out` need `--sweep`; `--sweep` is refused on a row outside the
+/// registry's sweep column, and the message names the column;
+/// `--verify-determinism` is a single run's, since
 /// a sweep runs every seed twice and a flag beside it would teach that its
 /// absence meant once.
 fn sweep_of(
+    row: &ScenarioRow,
     verify: bool,
     base_seed: u64,
     seeds: Option<NonZeroU64>,
@@ -926,8 +844,98 @@ fn sweep_of(
             "--verify-determinism is a single run's: a sweep runs every seed twice".to_owned()
         );
     }
-    let shard = shard.unwrap_or(Shard::WHOLE);
-    Ok(Some(Sweep::new(base_seed, seeds, shard, out.map(PathBuf::from))))
+    match row.sweeps {
+        Sweeps::Yes => {
+            let shard = shard.unwrap_or(Shard::WHOLE);
+            Ok(Some(Sweep::new(base_seed, seeds, shard, out.map(PathBuf::from))))
+        }
+        Sweeps::No => Err(format!(
+            "--sweep is not {}'s: the scenarios that sweep are {}",
+            row.name,
+            sweep_rows().map(|row| row.name).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// Every registry name, in the registry's order.
+fn scenario_names() -> Vec<&'static str> {
+    inf_sim::SCENARIOS.iter().map(|row| row.name).collect()
+}
+
+/// The leg flags and their names, as the help text lists them.
+fn leg_flags_help() -> String {
+    let flags: Vec<String> =
+        Leg::ALL.iter().map(|leg| format!("[{} {}]", leg.flag(), leg.names().join("|"))).collect();
+    flags.join(" ")
+}
+
+/// The registry's sweep column.
+fn sweep_rows() -> impl Iterator<Item = &'static ScenarioRow> {
+    inf_sim::SCENARIOS.iter().filter(|row| row.sweeps == Sweeps::Yes)
+}
+
+/// `--list-sweeps`: one line per sweep-capable row, its name and, for a
+/// legged row, its leg flag and first leg: the arguments a one-seed sweep
+/// of the row needs.
+fn list_sweeps() {
+    for row in sweep_rows() {
+        match row.leg {
+            Some(leg) => println!("{} {} {}", row.name, leg.flag(), leg.names()[0]),
+            None => println!("{}", row.name),
+        }
+    }
+}
+
+/// The durable runner's scenarios, each with its leg where it has one: the
+/// leg arrives as its type, so no constructor asks whether it was given.
+#[derive(Clone, Copy)]
+enum DurableKind {
+    Plain(fn(u64) -> DurableScenario),
+    LedgerWedge(LedgerWedgeLeg),
+    TierBudget(TierBudgetLeg),
+    EpochMarks(EpochMarksLeg),
+}
+
+impl DurableKind {
+    /// The durable scenario `name` and `leg` name, or `None` when the
+    /// durable runner runs no such scenario.
+    fn resolve(name: &str, leg: Option<LegValue>) -> Option<DurableKind> {
+        let plain: fn(u64) -> DurableScenario = match (name, leg) {
+            ("m2-ledger-wedge", Some(LegValue::LedgerWedge(leg))) => {
+                return Some(DurableKind::LedgerWedge(leg));
+            }
+            ("m4-tier-budget", Some(LegValue::TierBudget(leg))) => {
+                return Some(DurableKind::TierBudget(leg));
+            }
+            ("m4-epoch-marks", Some(LegValue::EpochMarks(leg))) => {
+                return Some(DurableKind::EpochMarks(leg));
+            }
+            ("m2-durable", None) => DurableScenario::m2_durable,
+            ("m2-clean-stop", None) => DurableScenario::m2_clean_stop,
+            ("m2-device-budget", None) => DurableScenario::m2_device_budget,
+            ("m2-mode-transition", None) => DurableScenario::m2_mode_transition,
+            ("m2-reorder-window", None) => DurableScenario::m2_reorder_window,
+            ("m2-fill-tick", None) => DurableScenario::m2_fill_tick,
+            ("m2-fill-dense", None) => DurableScenario::m2_fill_tick_dense,
+            ("m2-group-hold", None) => DurableScenario::m2_group_hold,
+            ("m2-fua-pending", None) => DurableScenario::m2_fua_pending,
+            ("m2-ckpt-refused", None) => DurableScenario::m2_ckpt_refused,
+            ("m2-stop-tick", None) => DurableScenario::m2_stop_tick,
+            ("m2-recycle", None) => DurableScenario::m2_recycle,
+            ("m3-document", None) => DurableScenario::m3_document,
+            _ => return None,
+        };
+        Some(DurableKind::Plain(plain))
+    }
+
+    fn scenario(self, seed: u64) -> DurableScenario {
+        match self {
+            DurableKind::Plain(make) => make(seed),
+            DurableKind::LedgerWedge(leg) => DurableScenario::m2_ledger_wedge(seed, leg),
+            DurableKind::TierBudget(leg) => DurableScenario::m4_tier_budget(seed, leg),
+            DurableKind::EpochMarks(leg) => DurableScenario::m4_epoch_marks(seed, leg),
+        }
+    }
 }
 
 /// Shared durable runner: M2's key/value workload and M3's document
@@ -945,26 +953,6 @@ fn print_census(rows_checked: u64, rows_crossed: u64) {
 /// timing against the park's retry deadline (node sums, ns).
 fn print_accept_retry(report: &inf_sim::harness::accept_retry::RetryReport) {
     println!("inf-sim: accept_retry {report}");
-}
-
-/// The `--tier-leg` names, `|`-joined for a message.
-fn tier_leg_names() -> String {
-    TierBudgetLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
-}
-
-/// The `--marks-leg` names, `|`-joined for a message.
-fn marks_leg_names() -> String {
-    EpochMarksLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
-}
-
-/// The `--wedge-leg` names, `|`-joined for a message.
-fn wedge_leg_names() -> String {
-    LedgerWedgeLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
-}
-
-/// The `--window-leg` names, `|`-joined for a message.
-fn window_leg_names() -> String {
-    ExtentWindowLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
 }
 
 /// `m4-extent-window`: one seeded leg, its disk-side counts and its verdict.
@@ -1002,46 +990,17 @@ fn run_extent_window(seed: u64, leg: ExtentWindowLeg, verify: Verify) -> Exit {
 #[allow(clippy::too_many_arguments)] // one linear CLI dispatch, like main
 fn run_durable(
     scenario_name: &str,
+    kind: DurableKind,
     seed: u64,
     plant: Plant,
     replay_canary: bool,
     lift_regime: bool,
-    tier_leg: Option<TierBudgetLeg>,
-    marks_leg: Option<EpochMarksLeg>,
-    wedge_leg: Option<LedgerWedgeLeg>,
     park_at_once: bool,
     determinism: Verify,
     sweep: Option<&Sweep>,
 ) {
     let run_one = |seed: u64| -> inf_sim::DurableReport {
-        let mut scenario = match scenario_name {
-            "m2-durable" => DurableScenario::m2_durable(seed),
-            "m2-clean-stop" => DurableScenario::m2_clean_stop(seed),
-            "m2-device-budget" => DurableScenario::m2_device_budget(seed),
-            "m2-mode-transition" => DurableScenario::m2_mode_transition(seed),
-            "m2-reorder-window" => DurableScenario::m2_reorder_window(seed),
-            "m2-fill-tick" => DurableScenario::m2_fill_tick(seed),
-            "m2-fill-dense" => DurableScenario::m2_fill_tick_dense(seed),
-            "m2-group-hold" => DurableScenario::m2_group_hold(seed),
-            "m2-fua-pending" => DurableScenario::m2_fua_pending(seed),
-            "m2-ledger-wedge" => DurableScenario::m2_ledger_wedge(
-                seed,
-                wedge_leg.expect("the caller refused m2-ledger-wedge without a leg"),
-            ),
-            "m2-ckpt-refused" => DurableScenario::m2_ckpt_refused(seed),
-            "m2-stop-tick" => DurableScenario::m2_stop_tick(seed),
-            "m2-recycle" => DurableScenario::m2_recycle(seed),
-            "m3-document" => DurableScenario::m3_document(seed),
-            "m4-tier-budget" => DurableScenario::m4_tier_budget(
-                seed,
-                tier_leg.expect("the caller refused m4-tier-budget without a leg"),
-            ),
-            "m4-epoch-marks" => DurableScenario::m4_epoch_marks(
-                seed,
-                marks_leg.expect("the caller refused m4-epoch-marks without a leg"),
-            ),
-            _ => unreachable!("the caller filters durable scenario names"),
-        };
+        let mut scenario = kind.scenario(seed);
         scenario.plant = plant;
         scenario.replay_canary = replay_canary;
         scenario.lift_regime |= lift_regime;
