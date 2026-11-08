@@ -16,6 +16,12 @@
 //! durably before the refusal is answered (ADR-0148 D5), so no boot after
 //! a cut serves it.
 //!
+//! A boot whose catalog names more live tiered definitions than the node
+//! holds lifetimes is refused before any cell, with a typed error and no
+//! migration (ADR-0148 D5); at or below the limit it serves, and drop
+//! tombstones with their residue take no lifetime. A catalog whose
+//! counter is not past a live id is refused the same way.
+//!
 //! Shapes: the limit test runs a two-cell durable node, each namespace's
 //! ring at the 4 MiB floor (`MEM-BUDGET 3mb` beside the default 1 MiB
 //! `MAINTAIN-SLICE`: a ring is their sum rounded up to a power of two), so
@@ -257,4 +263,115 @@ fn a_tiered_create_refused_after_its_catalog_swap_is_not_served_after_a_cut() {
     assert_eq!(uncapped, "+OK\r\n", "engagement: the same CREATE passes every check uncapped");
     assert_eq!(before_cut, NOT_FOUND, "the refused namespace is served before the cut");
     assert_eq!(after_cut, NOT_FOUND, "the refused namespace is served after a cut and a reboot");
+}
+
+/// A durable tiered definition of `id` at the ring floor, as `INF.NS
+/// CREATE tiered-<id> MODE durable MEM-BUDGET 3mb` writes it.
+fn tiered_definition(id: u32) -> inf_store::NsSpec {
+    inf_store::NsSpec {
+        id: inf_store::NsId(id),
+        name: format!("tiered-{id}").into_bytes(),
+        mode: inf_store::NsMode::Durable,
+        fsync: None,
+        policy: None,
+        maxmemory: None,
+        tier: Some(inf_store::TierSpec::for_budget(3 << 20)),
+    }
+}
+
+/// Replaces `dir`'s `META` with a catalog of `live` live tiered definitions
+/// (ids from 16) and two drop tombstones above them, each tombstone's
+/// directory holding a tier file's residue. Returns the last live name.
+fn seed_tiered_catalog(dir: &Path, live: u32) -> String {
+    let first = inf_store::FIRST_NAMED_NS_ID;
+    let dropped = vec![first + live, first + live + 1];
+    for id in &dropped {
+        let cold = dir.join(format!("shard-0/ns-{id}/cold"));
+        std::fs::create_dir_all(&cold).expect("residue directory");
+        std::fs::write(cold.join("tier-000000.itier"), b"residue").expect("residue file");
+    }
+    let catalog = inf_store::NsCatalog {
+        next_id: first + live + 2,
+        entries: (first..first + live).map(tiered_definition).collect(),
+        index: inf_store::IndexCatalog::default(),
+        dropped,
+    };
+    let fs = inf_log::fs::StdSegmentFs;
+    inf_log::meta::write_meta(&fs, dir, &catalog.encode()).expect("seed META");
+    format!("tiered-{}", first + live - 1)
+}
+
+/// Starts infinityd on `dir` and waits for it to exit before it listens:
+/// its status and stderr. A node that comes up is a failure.
+fn boot_refused(dir: &Path) -> (std::process::ExitStatus, String) {
+    let stderr = dir.join(format!("stderr-refused-{}", unique()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+        .args(["--port", "0", "--cells", "2", "--data-dir"])
+        .arg(dir)
+        .args(["--device-probe", "off"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&stderr).expect("stderr file")))
+        .spawn()
+        .expect("spawn infinityd");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let text = std::fs::read_to_string(&stderr).unwrap_or_default();
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return (status, text);
+        }
+        if announced_port(&text).is_some() || Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("infinityd came up, or never exited, on a catalog it must refuse: {text}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The boot boundary (ADR-0148 D5, A1.2) at 63, 64 and 65 live tiered
+/// definitions, each catalog with two drop tombstones and their residue on
+/// disk: 63 and 64 boot and serve every definition, the tombstones taking
+/// no lifetime; 65 is refused before any cell, exit 1, the error naming the
+/// count and the limit. A catalog whose counter is not past a live id is
+/// refused the same way (the counter check every boot's load runs).
+#[test]
+#[ignore = "a boot admits every live tiered definition its catalog names, so a data directory \
+            with 65 serves; red until a catalog above the node's 64 tiered lifetimes is refused \
+            before any cell with a typed error"]
+fn a_boot_serves_at_most_sixty_four_live_tiered_definitions() {
+    let dir = data_root("boot-boundary");
+    let mut fresh = start(&dir);
+    assert!(fresh.stop().success(), "the fresh node stopped gracefully");
+    for live in [63, LIFETIMES_MAX as u32] {
+        let last = seed_tiered_catalog(&dir, live);
+        let mut server = start(&dir);
+        let mut c = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+        c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+        let used = line(&mut c, &[b"INF.NS", b"USE", last.as_bytes()]);
+        drop(c);
+        let status = server.stop();
+        assert_eq!(used, "+OK\r\n", "{live} live tiered definitions serve their last, {last}");
+        assert!(status.success(), "the node of {live} stopped gracefully: {status}");
+    }
+    seed_tiered_catalog(&dir, LIFETIMES_MAX as u32 + 1);
+    let (status, stderr) = boot_refused(&dir);
+    assert_eq!(status.code(), Some(1), "65 live tiered definitions are refused at boot: {stderr}");
+    assert!(
+        stderr.contains("the catalog names 65 live tiered namespaces, more than the 64 tiered"),
+        "the refusal names the count and the limit: {stderr}"
+    );
+    let low = inf_store::NsCatalog {
+        next_id: 18,
+        entries: vec![tiered_definition(20)],
+        index: inf_store::IndexCatalog::default(),
+        dropped: Vec::new(),
+    };
+    inf_log::meta::write_meta(&inf_log::fs::StdSegmentFs, &dir, &low.encode()).expect("META");
+    let (status, stderr) = boot_refused(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(status.code(), Some(1), "a counter not past a live id is refused: {stderr}");
+    assert!(
+        stderr.contains("namespace id 20 is at or above the catalog's next id 18"),
+        "the refusal names the id and the counter: {stderr}"
+    );
 }
