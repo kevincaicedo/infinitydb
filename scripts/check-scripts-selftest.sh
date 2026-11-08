@@ -5624,43 +5624,124 @@ PY"
 ts_red "a heredoc's os.environ the file never binds" '$X, assigned nowhere in this file' "python3 - <<'PY'
 CALL = [\"check\", \"--target-dir\", os.environ[\"X\"]]
 PY"
-# A built binary under a target/ that no run made: a literal, a parameter's
-# default, or beneath any prefix that is not a per-run directory.
-ts_red "bin=target/release/inf-sim" "target/release/inf-sim names a built binary" 'bin=target/release/inf-sim'
-ts_red "./target/release/infinityd run" "./target/release/infinityd names a built binary" \
+# A path into a profile directory under a target/ that no run made: a literal,
+# a parameter's default, or beneath any prefix that is not a per-run directory;
+# whatever follows the profile, and as written or through a variable's value.
+ts_red "bin=target/release/inf-sim" "target/release/inf-sim reaches a profile directory" 'bin=target/release/inf-sim'
+ts_red "./target/release/infinityd run" "./target/release/infinityd reaches a profile directory" \
     './target/release/infinityd --port 1'
-ts_red "a cross-compiled binary under target/" "target/x86_64-unknown-linux-gnu/release/inf" \
+ts_red "a cross-compiled binary under target/" "target/x86_64-unknown-linux-gnu/release/inf reaches" \
     'strip target/x86_64-unknown-linux-gnu/release/inf'
 ts_red "a recipe's {{justfile_directory()}}/target/debug/infinityd" \
-    "justfile:5: {{justfile_directory()}}/target/debug/infinityd names a built binary" ':' \
+    "justfile:5: {{justfile_directory()}}/target/debug/infinityd reaches a profile directory" ':' \
     '    INFINITYD_BIN={{justfile_directory()}}/target/debug/infinityd cargo test -p compat'
 ts_red "a parameter's default, \${BIN:-./target/release/infinityd}" \
-    '${BIN:-./target/release/infinityd} names a built binary under a target/ in a parameter' \
+    '${BIN:-./target/release/infinityd} reaches a profile directory under a target/ in a parameter' \
     'BIN="${BIN:-./target/release/infinityd}"'
 ts_red "a parameter's default with no colon, \${X-target/release/inf-sim}" \
-    '${INF_SIM_BIN-target/release/inf-sim} names a built binary under a target/ in a parameter' \
+    '${INF_SIM_BIN-target/release/inf-sim} reaches a profile directory under a target/ in a parameter' \
     'sim=${INF_SIM_BIN-target/release/inf-sim}'
+ts_red "a positional parameter's default, \${1:-target/release/infinityd}" \
+    '${1:-target/release/infinityd} reaches a profile directory under a target/ in a parameter' \
+    'bin=${1:-target/release/infinityd}'
 ts_red "\$root/target/release/inf-sim, root the checkout by cd and pwd" \
-    '$root/target/release/inf-sim names a built binary beneath $root, assigned at line 2' \
+    '$root/target/release/inf-sim reaches a profile directory beneath $root, assigned at line 2' \
     'root=$(cd "$(dirname "$0")/.." && pwd)
 tree_bin="$root/target/release/inf-sim"'
 ts_red "\$SCRIPT_DIR/../target/release/inf-sim" \
-    '$SCRIPT_DIR/../target/release/inf-sim names a built binary beneath a path that climbs out' \
+    '$SCRIPT_DIR/../target/release/inf-sim reaches a profile directory beneath a path that climbs out' \
     'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 "$SCRIPT_DIR/../target/release/inf-sim" --help'
 ts_red "\$(pwd)/target/release/inf-sim" \
-    '$(pwd)/target/release/inf-sim names a built binary beneath a value the scan cannot follow' \
+    '$(pwd)/target/release/inf-sim reaches a profile directory beneath a value the scan cannot follow' \
     '"$(pwd)/target/release/inf-sim" --help'
 ts_red "a per-run directory's parent, \$work/../target/release/x" \
-    '$work/../target/release/x names a built binary beneath a path that climbs out of $work' \
+    '$work/../target/release/x reaches a profile directory beneath a path that climbs out of $work' \
     'work=$(mktemp -d)
 "$work/../target/release/x" --help'
 ts_red "the helper's root, \$TARGET_ROOT/target/release/x" \
-    'names a built binary beneath the root scripts/target-root.sh computes' \
+    'reaches a profile directory beneath the root scripts/target-root.sh computes' \
     '. scripts/target-root.sh
 target_root_setup "$(pwd -P)"
 "$TARGET_ROOT/target/release/x" --help'
-# The forms that pass: per run, the root's, and literals that name no binary.
+# What follows the profile directory is not read: a variable, a quote, a
+# justfile's interpolation, or nothing.
+ts_red "bin=target/release/\$name" 'plant.sh:2: target/release/$name reaches a profile directory under a literal' \
+    'bin=target/release/$name'
+ts_red "a loop's \"\$root/target/release/\$b\"" \
+    'plant.sh:3: $root/target/release/$b reaches a profile directory beneath $root, assigned at line 2' \
+    'root=$(cd "$(dirname "$0")/.." && pwd)
+for b in inf-sim inf-bench; do "$root/target/release/$b" --help; done'
+ts_red "\"\${SCRIPT_DIR}/../target/release/\${BIN}\"" \
+    '${SCRIPT_DIR}/../target/release/${BIN} reaches a profile directory beneath a path that climbs out' \
+    'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+"${SCRIPT_DIR}/../target/release/${BIN}" --help'
+ts_red "a recipe parameter's ./target/release/{{bin}}" \
+    'justfile:7: ./target/release/{{bin}} reaches a profile directory under a literal target/' ':' '
+run bin:
+    ./target/release/{{bin}} --help'
+ts_red "./target/debug/\"\$name\"" 'plant.sh:2: ./target/debug/$name reaches a profile directory under a literal' \
+    './target/debug/"$name" --help'
+ts_red "BIN_DIR=\"\$root/target/release\", the profile directory itself, then \"\$BIN_DIR/infinityd\"" \
+    'plant.sh:3: $root/target/release reaches a profile directory beneath $root' \
+    'root=$(cd "$(dirname "$0")/.." && pwd)
+BIN_DIR="$root/target/release"
+"$BIN_DIR/infinityd" --port 1'
+# The other components an expansion, a glob or a brace list can make a profile
+# directory, a quote inside the path, and a target/ a variable holds.
+ts_red "a triple from a variable, target/\$TRIPLE/release/inf" \
+    'target/$TRIPLE/release/inf reaches a profile directory under a literal' 'strip "target/$TRIPLE/release/inf"'
+ts_red "the profile from a variable, \$root/target/\$PROFILE/infinityd" \
+    '$root/target/$PROFILE/infinityd reaches a profile directory beneath $root' \
+    'root=$(cd "$(dirname "$0")/.." && pwd)
+"$root/target/$PROFILE/infinityd" --help'
+ts_red "a recipe parameter's profile, ./target/{{profile}}/infinityd" \
+    'justfile:7: ./target/{{profile}}/infinityd reaches a profile directory' ':' '
+run profile:
+    ./target/{{profile}}/infinityd --help'
+ts_red "an unquoted glob, target/*/infinityd" 'target/[*]/infinityd reaches a profile directory' \
+    'ls target/*/infinityd'
+ts_red "a brace list, target/{debug,release}/inf-sim" 'target/{debug,release}/inf-sim reaches a profile' \
+    'ls target/{debug,release}/inf-sim'
+ts_red "a quote inside the path, \"\$root/target\"/release/inf-sim" \
+    '$root/target/release/inf-sim reaches a profile directory beneath $root' \
+    'root=$(cd "$(dirname "$0")/.." && pwd)
+"$root/target"/release/inf-sim --help'
+ts_red "a deeper directory, target/fuzz-check/<triple>/release/fuzz_x" \
+    'target/fuzz-check/x86_64-unknown-linux-gnu/release/fuzz_x reaches a profile' \
+    'f=target/fuzz-check/x86_64-unknown-linux-gnu/release/fuzz_x'
+ts_tree './target/profiling/infinityd --help'
+printf '%s\n' '[profile.profiling]' 'inherits = "release"' >"$TS_DIR/Cargo.toml"
+expect_red_because "target-root scan: a custom profile of the root Cargo.toml, ./target/profiling/infinityd" \
+    './target/profiling/infinityd reaches a profile directory under a literal' ts_scan "$TS_DIR"
+printf '#!/usr/bin/env bash\ntrue\n' >"$TS_DIR/scripts/plant.sh"
+expect_output "target-root scan: the OK line names the profile directories it judges" \
+    "a component that is debug, release, profiling or that an expansion" ts_scan "$TS_DIR"
+ts_green "target/profiling where the root Cargo.toml defines no such profile" './target/profiling/infinityd --help'
+ts_red "a PATH entry, \"\$root/target/release:\$PATH\"" \
+    'plant.sh:3: $root/target/release reaches a profile directory beneath $root' \
+    'root=$(cd "$(dirname "$0")/.." && pwd)
+PATH="$root/target/release:$PATH"'
+ts_red "a command substitution's \$(ls target/release)" 'target/release reaches a profile directory under a literal' \
+    'n=$(ls target/release | wc -l)'
+ts_red "TARGET_DIR=\"\$root/target\", then \"\$TARGET_DIR/release/infinityd\"" \
+    'through $TARGET_DIR as line 3 assigns it, is $root/target/release/infinityd, which reaches' \
+    'root=$(cd "$(dirname "$0")/.." && pwd)
+TARGET_DIR="$root/target"
+"$TARGET_DIR/release/infinityd" --help'
+ts_red "two variables deep, B=\"\$A\" after A=\"\$root/target\"" \
+    'through $B as line 4 assigns it, then $A as line 3 assigns it, is $root/target/release/x' \
+    'root=$(cd "$(dirname "$0")/.." && pwd)
+A="$root/target"
+B="$A"
+"$B/release/x" --help'
+ts_red "a loop over target directories" "through \$d as line 3's loop gives it, is \$root/target/release/x" \
+    'root=$(cd "$(dirname "$0")/.." && pwd)
+for d in "$root/target"; do "$d/release/x" --help; done'
+ts_red "a default holding the target/, \"\${OUT:-target}/release/inf-sim\"" \
+    "through \${OUT:-target}'s default, is target/release/inf-sim, which reaches" \
+    'sim="${OUT:-target}/release/inf-sim"'
+# The forms that pass: per run, the root's, and literals that name no profile directory.
 ts_green "d=\$(mktemp -d target/x.XXXXXX), then --target-dir \"\$d/target\"" 'mkdir -p target
 d=$(mktemp -d target/x.XXXXXX)
 cargo check --target-dir "$d/target"'
@@ -5673,11 +5754,24 @@ ts_green "the helper's root and a path beneath it" '. "$SCRIPT_DIR/target-root.s
 target_root_setup "$(pwd -P)"
 cargo build --target-dir "$TARGET_ROOT"
 canary="$TARGET_ROOT/canary-$cfg"
-cargo build --target-dir "$canary"'
+cargo build --target-dir "$canary"
+"$TARGET_ROOT/release/infinityd" --help'
 ts_tree 'work=$(mktemp -d)
 "$work/target/release/x" --help'
 expect_output "target-root scan: \$work/target/release/x after work=\$(mktemp -d) is green and counted" \
-    "target-root scan OK: .* 1 built-binary paths under a target/, each beneath a directory made" \
+    "target-root scan OK: .* 1 paths into a profile directory under a target/, each beneath a directory made" \
+    ts_scan "$TS_DIR"
+ts_tree 'work=$(mktemp -d)
+for b in inf-sim inf-bench; do "$work/target/release/$b" --help; done'
+expect_output "target-root scan: a loop's \"\$work/target/release/\$b\" after work=\$(mktemp -d) is counted" \
+    "target-root scan OK: .* 1 paths into a profile directory under a target/, each beneath a directory made" \
+    ts_scan "$TS_DIR"
+ts_tree 'work=$(mktemp -d)
+T="$work/target"
+"$T/release/x" --help
+PATH=$PATH:$work/target/release'
+expect_output "target-root scan: \$T/release/x after T=\"\$work/target\", and a PATH entry, are counted" \
+    "target-root scan OK: .* 2 paths into a profile directory under a target/, each beneath a directory made" \
     ts_scan "$TS_DIR"
 ts_green "a heredoc's os.environ bound to the kept directory and a per-run one beneath it" \
     "K=\$(target_root_kept fuzz-check)
@@ -5688,9 +5782,13 @@ python3 - <<'PY'
 KEPT = [\"--target-dir\", os.environ[\"K\"]]
 PROBE = [\"--target-dir\", os.environ[\"P\"]]
 PY"
-ts_green "literals that name no binary, and comments" "# \$CARGO_TARGET_DIR and target/release/x in a comment
+ts_green "literals that name no profile directory, and comments" "# \$CARGO_TARGET_DIR and target/release/x in a comment
 find . -name Cargo.toml -not -path '*/target/*'
-inf-sim --out target/canary-out" '    INFINITYD_BIN={{quote(CARGO_TARGET_DIR + "/debug/infinityd")}} cargo test'
+inf-sim --out target/canary-out
+mkdir -p target
+d=\$(mktemp -d \"target/\$name.XXXXXX\")
+echo done # target/release/x after a comment's start
+cat target/release-notes.md target/debug.log" '    INFINITYD_BIN={{quote(CARGO_TARGET_DIR + "/debug/infinityd")}} cargo test'
 mkdir -p "$TSW/empty"
 printf 'check:\n    true\n' >"$TSW/empty/justfile"
 ts_scope() { # a tree with no script is a scope error, exit 2
