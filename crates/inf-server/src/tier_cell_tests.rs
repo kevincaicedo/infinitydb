@@ -1541,3 +1541,76 @@ fn the_cell_leaves_tier_file_unlinks_to_the_control_thread() {
         active.display()
     );
 }
+
+/// Namespaces 16 and 17 on one sim-disk cell, their tables empty, each with
+/// a retired tier file numbered `id` on the disk (its handle closed), as
+/// `retired_files` builds one. Returns the cell, the keyspace and the two
+/// files' paths, namespace 16's first.
+fn same_numbered_retired_files(id: u32) -> (TierCell<SimDisk>, Keyspace, [PathBuf; 2]) {
+    const PAGE: u64 = 4 << 10;
+    let demote = DemotionConfig::for_budget(1 << 20, PAGE);
+    let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
+    let space = AddressSpaceConfig {
+        reserve_bytes,
+        page_bytes: PAGE as usize,
+        life_origin: LogicalAddr::ZERO,
+    };
+    let mut ks = Keyspace::new(StoreConfig::default());
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    for ns in [NsId(16), NsId(17)] {
+        assert!(ks.materialize_tiered(ns, space, demote, 64).is_ok());
+        cell.create_ns(ns, &spec());
+    }
+    let paths = [0, 1].map(|index| {
+        let cold = cell.namespaces[index].dir.join("cold");
+        cell.fs.create_dir_all(&cold).expect("the cold directory");
+        let path = cold.join(inf_log::tier_file_name(id));
+        drop(cell.fs.create_tier(&path, TierIoMode::Buffered).expect("a tier file"));
+        cell.namespaces[index].note_retired(TierFileMeta {
+            id,
+            base: LogicalAddr::from_raw(u64::from(id) << 20).expect("fits"),
+            data_len: 1 << 20,
+            reason: inf_log::SealReason::Capacity,
+            path: path.clone(),
+        });
+        path
+    });
+    (cell, ks, paths)
+}
+
+/// A cold read pins its own namespace's file alone. Every tiered namespace
+/// numbers its tier files from 0, so namespace 16's file 3 and namespace
+/// 17's file 3 are two files. A read queued on 16's file 3 defers that
+/// file's retirement and no other: one MAINTAIN of namespace 17 retires its
+/// own file 3, as it does with no read queued anywhere (the control), while
+/// one MAINTAIN of namespace 16 keeps 16's file 3 for the read.
+#[test]
+#[ignore = "cold-read pins are keyed by the file number alone, which every tiered namespace \
+            numbers from 0, so a read of one namespace's file defers another namespace's file of \
+            the same number; red until a pin names the namespace's lifetime with its file"]
+fn a_cold_read_defers_only_its_own_namespaces_file() {
+    const FILE: u32 = 3;
+    let (mut cell, mut ks, _) = same_numbered_retired_files(FILE);
+    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0).expect("MAINTAIN");
+    assert!(cell.namespaces[1].retired.is_empty(), "the control: 17's file 3 retires unread");
+    let (mut cell, mut ks, paths) = same_numbered_retired_files(FILE);
+    let cold = cell.cold.clone().expect("the cell's cold engine");
+    let class = inf_runtime::ReadClass::Foreground;
+    let file = TierFileId::new(FILE);
+    let wait = cold.enqueue(-1, file, 0, TIER_FRAME_BYTES, class, 0).expect("the read queued");
+    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0).expect("MAINTAIN");
+    let own_kept = cell.namespaces[0].retired.len();
+    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0).expect("MAINTAIN");
+    let other_kept = cell.namespaces[1].retired.len();
+    drop(wait);
+    assert_eq!(own_kept, 1, "engagement: the read keeps namespace 16's file 3 retiring");
+    assert!(on_disk(&cell, &paths[0]), "engagement: 16's file 3 is still on the disk");
+    assert_eq!(
+        other_kept,
+        0,
+        "a read queued on namespace 16's file 3 deferred namespace 17's retired file 3 ({} \
+         still on the disk: {})",
+        paths[1].display(),
+        on_disk(&cell, &paths[1])
+    );
+}
