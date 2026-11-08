@@ -693,3 +693,63 @@ fn reactor_sealed_file_beyond_the_manifest_is_clamped_inert() {
         "the new life starts at the manifested watermark"
     );
 }
+
+/// ADR-0202 D5: a listing fault point fired at the boot's listing of a
+/// tiered namespace's `cold/` — at its open, or at a batch — refuses the
+/// boot typed, naming the point; the next boot, the fault cleared, recovers
+/// the unit: its manifested file sealed, its unmanifested one removed.
+#[test]
+fn a_listing_fault_refuses_the_boot_typed_and_the_next_boot_recovers() {
+    let recover = |fs: &MemFs, manifest: &TierNsManifest| {
+        inf_store::recover_tiered_ns(
+            fs.clone(),
+            manifest,
+            1,
+            TierFlushConfig {
+                shard_dir: Path::new("shard-0").to_path_buf(),
+                cell: 0,
+                ns: NS,
+                mode: TierIoMode::Buffered,
+                file_capacity: 1 << 20,
+                slice_bytes: PAGE,
+                record_len_max: 16 << 20,
+            },
+            AddressSpaceConfig {
+                reserve_bytes: DemotionConfig::for_budget(4 << 20, PAGE)
+                    .ring_reserve_bytes()
+                    .expect("valid budget"),
+                page_bytes: PAGE as usize,
+                life_origin: LogicalAddr::ZERO,
+            },
+            DemotionConfig::for_budget(4 << 20, PAGE),
+            128,
+            KeyHasher::default(),
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        )
+    };
+    for point in [inf_log::fault::DIR_LISTING_OPEN_FAIL, inf_log::fault::DIR_LISTING_NEXT_FAIL] {
+        let fs = MemFs::new();
+        let mut file = writer(&fs, 0);
+        file.append(LogicalAddr::ZERO, &[0x5A; 900]).expect("append");
+        file.sync().expect("sync");
+        file.seal(SealReason::Capacity).expect("seal");
+        let dead = Path::new("shard-0").join("cold").join("tier-000001.itier");
+        fs.create_meta(&dead).expect("a dead life's file");
+        let manifest = TierNsManifest {
+            ns: NS.0,
+            flushed: 900,
+            files: vec![TierFileRange { id: 0, base: 0, durable_len: 900 }],
+        };
+        fault::arm(point, FaultSpec::Nth(1));
+        let err = recover(&fs, &manifest).map(|_| ()).expect_err("the listing fault refuses");
+        assert!(err.to_string().contains(point), "typed and named: {err}");
+        assert!(fault::fired(point) >= 1, "the row is not vacuous");
+        assert!(fs.open_read(&dead).is_ok(), "the refused boot removed nothing past the fault");
+        fault::disarm_all();
+        let recovered = recover(&fs, &manifest).expect("the next boot recovers");
+        assert_eq!(recovered.stats.files_removed, 1, "the dead life's file is removed");
+        assert_eq!(recovered.stats.files_sealed, 1, "the manifested file recovers");
+        assert!(fs.open_read(&dead).is_err(), "no dead-life file left");
+        receipt::verified(point, "boot-refuses-typed-then-recovers");
+    }
+}

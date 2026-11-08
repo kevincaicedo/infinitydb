@@ -1048,6 +1048,9 @@ pub mod mem {
     impl DirStream for MemDirStream {
         fn next_batch(&mut self, batch: &mut NameBatch) -> io::Result<BatchEnd> {
             batch.clear();
+            if inf_foundation::fault::fire(crate::fault::DIR_LISTING_NEXT_FAIL) {
+                return Err(crate::fault::injected(crate::fault::DIR_LISTING_NEXT_FAIL));
+            }
             let state = self.state.borrow();
             let filled = super::fill_after(&state.files, &self.dir, &mut self.key, batch);
             if filled.is_err() {
@@ -1133,6 +1136,9 @@ pub mod mem {
         type DirStream = MemDirStream;
 
         fn open_listing(&self, dir: &Path) -> io::Result<OpenedDir<MemDirStream>> {
+            if inf_foundation::fault::fire(crate::fault::DIR_LISTING_OPEN_FAIL) {
+                return Err(crate::fault::injected(crate::fault::DIR_LISTING_OPEN_FAIL));
+            }
             if !self.state.borrow().dirs.contains(dir) {
                 return Ok(OpenedDir::Absent);
             }

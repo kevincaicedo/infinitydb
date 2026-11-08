@@ -98,6 +98,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -123,11 +124,19 @@ pub const DEFAULT_SECTOR_BYTES: u32 = 512;
 pub struct SimDiskConfig {
     /// Tear granularity: pending writes survive per-sector on this grid.
     pub sector_bytes: u32,
+    /// ADR-0202 D5, drawn per seed by the DST: at its next batch, a listing
+    /// returns once more, before any new name, each name of its last batch
+    /// removed since — clause (b)'s repeat, which a stream may make, so
+    /// every consumer's `Gone` arm runs under the simulator. A repeat moves
+    /// no resume key, counts toward the batch's two bounds and is not
+    /// repeated again; [`SimDisk::listing_repeats_served`] is its
+    /// engagement counter.
+    pub listing_repeats_removed: bool,
 }
 
 impl Default for SimDiskConfig {
     fn default() -> Self {
-        SimDiskConfig { sector_bytes: DEFAULT_SECTOR_BYTES }
+        SimDiskConfig { sector_bytes: DEFAULT_SECTOR_BYTES, listing_repeats_removed: false }
     }
 }
 
@@ -771,6 +780,13 @@ struct DiskState {
     /// `Some`: fdatasyncs on files whose name the predicate accepts are
     /// held by the driver until the hold lifts ([`SimDisk::hold_syncs`]).
     hold_syncs: Option<fn(&Path) -> bool>,
+    /// Listings opened on a present directory (ADR-0202 D5).
+    listings_opened: u64,
+    /// `next_batch` calls served.
+    listing_batches: u64,
+    /// Removed names a listing returned again (the repeat mode's
+    /// engagement witness).
+    listing_repeats_served: u64,
 }
 
 impl DiskState {
@@ -1062,6 +1078,26 @@ impl SimDisk {
             DeviceFault::WriteEio => inode.write_faults_left += count,
         }
         Ok(())
+    }
+
+    /// Listings opened on a present directory so far (ADR-0202 D5).
+    #[must_use]
+    pub fn listings_opened(&self) -> u64 {
+        self.state.borrow().listings_opened
+    }
+
+    /// `next_batch` calls served so far, every listing's.
+    #[must_use]
+    pub fn listing_batches(&self) -> u64 {
+        self.state.borrow().listing_batches
+    }
+
+    /// Removed names the repeat mode returned again so far: a run that
+    /// draws the mode and reads 0 here never ran a consumer's `Gone` arm
+    /// (`VACUOUS`).
+    #[must_use]
+    pub fn listing_repeats_served(&self) -> u64 {
+        self.state.borrow().listing_repeats_served
     }
 
     /// Injected faults consumed so far (an armed fault that never fired
@@ -1539,19 +1575,54 @@ pub struct SimDirStream {
     state: Rc<RefCell<DiskState>>,
     dir: PathBuf,
     key: ResumeKey,
+    /// Under the repeat mode, the new names of the last batch, by path:
+    /// the ones removed since are returned once more at the next batch.
+    last: Vec<PathBuf>,
 }
 
 impl DirStream for SimDirStream {
     fn next_batch(&mut self, batch: &mut NameBatch) -> io::Result<BatchEnd> {
         batch.clear();
-        let state = self.state.borrow();
-        let filled = state
-            .dead_check()
-            .and_then(|()| super::fill_after(&state.os_names, &self.dir, &mut self.key, batch));
+        let filled = self.fill(batch);
         if filled.is_err() {
             batch.clear();
         }
         filled
+    }
+}
+
+impl SimDirStream {
+    fn fill(&mut self, batch: &mut NameBatch) -> io::Result<BatchEnd> {
+        let mut state = self.state.borrow_mut();
+        state.dead_check()?;
+        if inf_foundation::fault::fire(crate::fault::DIR_LISTING_NEXT_FAIL) {
+            return Err(crate::fault::injected(crate::fault::DIR_LISTING_NEXT_FAIL));
+        }
+        state.listing_batches += 1;
+        let repeat = state.cfg.listing_repeats_removed;
+        let mut repeats = 0u64;
+        if repeat {
+            // Bound: the last batch's names, each taken again at most once;
+            // a subset of a batch fits an empty one.
+            for path in self.last.drain(..) {
+                if state.os_names.contains_key(&path)
+                    || !path.file_name().is_some_and(|name| batch.push(name.as_bytes()))
+                {
+                    continue;
+                }
+                repeats += 1;
+            }
+        }
+        state.listing_repeats_served += repeats;
+        let repeated = batch.len();
+        let end = super::fill_after(&state.os_names, &self.dir, &mut self.key, batch)?;
+        // After `End` every call answers an empty `End`: the stream repeats
+        // nothing past it.
+        if repeat && end == BatchEnd::More {
+            let names = (repeated..batch.len()).filter_map(|i| batch.name(i));
+            self.last.extend(names.map(|name| self.dir.join(name)));
+        }
+        Ok(end)
     }
 }
 
@@ -1560,15 +1631,20 @@ impl SegmentFs for SimDisk {
     type DirStream = SimDirStream;
 
     fn open_listing(&self, dir: &Path) -> io::Result<OpenedDir<SimDirStream>> {
-        let state = self.state.borrow();
+        let mut state = self.state.borrow_mut();
         state.dead_check()?;
+        if inf_foundation::fault::fire(crate::fault::DIR_LISTING_OPEN_FAIL) {
+            return Err(crate::fault::injected(crate::fault::DIR_LISTING_OPEN_FAIL));
+        }
         if !state.dirs.contains(dir) {
             return Ok(OpenedDir::Absent);
         }
+        state.listings_opened += 1;
         Ok(OpenedDir::Open(SimDirStream {
             state: Rc::clone(&self.state),
             dir: dir.to_path_buf(),
             key: ResumeKey::First,
+            last: Vec::new(),
         }))
     }
 

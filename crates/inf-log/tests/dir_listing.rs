@@ -17,7 +17,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use inf_log::fs::mem::MemFs;
-use inf_log::fs::sim::SimDisk;
+use inf_log::fs::sim::{SimDisk, SimDiskConfig};
 use inf_log::fs::{BatchEnd, DirStream, NameBatch, OpenedDir, SegmentFs, StdSegmentFs};
 use inf_log::limits::{LISTING_BATCH_BYTES, LISTING_BATCH_NAMES, LISTING_NAME_BYTES_MAX};
 use proptest::prelude::*;
@@ -309,4 +309,30 @@ fn the_simulated_stream_resumes_after_its_greatest_name() {
     assert!(!rest.contains(&b"00000000a".to_vec()), "a name behind the key is not returned");
     assert!(rest.contains(&b"zzz".to_vec()), "a name ahead of the key is returned");
     assert_eq!(rest.len(), 300 - LISTING_BATCH_NAMES + 1);
+}
+
+/// The simulated disk's repeat mode (ADR-0202 D5): at its next batch a
+/// stream returns once more, before any new name, each name of its last
+/// batch removed since. Every untouched name is still returned exactly
+/// once — a repeat moves no key — every removed name of a `More` batch
+/// comes back once, and the disk counts the repeats, its opens and its
+/// batches.
+#[test]
+fn the_repeat_mode_returns_removed_names_again_and_moves_no_key() {
+    let sim = SimDisk::with_config(SimDiskConfig {
+        listing_repeats_removed: true,
+        ..SimDiskConfig::default()
+    });
+    let dir = Path::new(DIR);
+    let names = names_of(8, 600);
+    create_all(&sim, dir, &names);
+    let walked = walk(&sim, dir, &[true, false, false]).expect("the walk");
+    assert_eq!(judge(&names, &walked), Ok(()));
+    let repeated = walked.returned.len() - names.len();
+    assert!(repeated > 0, "VACUOUS: the mode repeated no removed name");
+    assert_eq!(sim.listing_repeats_served(), repeated as u64, "the engagement counter");
+    let twice = walked.returned.iter().filter(|name| walked.removed.contains(*name)).count();
+    assert_eq!(twice - walked.removed.len(), repeated, "each repeat is a removed name, once");
+    assert_eq!(sim.listings_opened(), 1);
+    assert_eq!(sim.listing_batches(), 4, "600 names and the repeats in four batches");
 }
