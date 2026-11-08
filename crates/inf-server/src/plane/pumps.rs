@@ -324,9 +324,9 @@ pub(super) async fn compact_pump<O: PlaneObserver + 'static, F: SegmentFs + Clon
             break 'chain;
         }
     }
-    if let Some(tier) = shared.tier.borrow_mut().as_mut()
-        && let Some(t) = tier.ns_mut(read.ns)
-    {
-        t.compact_inflight = false;
+    // The chain's end resolves its owner by position and id, Live or
+    // Draining, so a dropped namespace's drain sees its chain back.
+    if let Some(tier) = shared.tier.borrow_mut().as_mut() {
+        tier.chain_back(read.pos, read.ns);
     }
 }

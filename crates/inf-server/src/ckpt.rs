@@ -955,7 +955,7 @@ impl<F: SegmentFs> ManifestCell<F> {
                 // them). Encoding stays epoch 1 when the set is empty.
                 let mut tiers = Vec::new();
                 if let Some(tc) = tier.as_deref_mut() {
-                    for t in &tc.namespaces {
+                    for t in tc.live() {
                         if let Some(table) = ks.tiered_store(t.ns) {
                             tiers.push(table.tier_manifest(t.ns.0, &t.flush));
                         }
@@ -1042,14 +1042,14 @@ impl<F: SegmentFs> ManifestCell<F> {
                 // pin-gated unlink runs in the tiered MAINTAIN (M4-S26,
                 // ADR-0059 D3 phases 2-3).
                 if let Some(tc) = tier {
-                    for t in &mut tc.namespaces {
-                        let Some(table) = ks.tiered_store_mut(t.ns) else { continue };
+                    tc.for_each_live_mut(|t| {
+                        let Some(table) = ks.tiered_store_mut(t.ns) else { return };
                         for id in table.commit_retirement() {
                             if let Some(meta) = t.flush.detach_sealed(id) {
                                 t.note_retired(meta);
                             }
                         }
-                    }
+                    });
                 }
                 self.floor = Some(manifest.floor());
                 self.named_ckpt = Some(manifest.ckpt_id);

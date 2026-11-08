@@ -630,6 +630,48 @@ impl<F: SegmentFs> TierFlush<F> {
         handle
     }
 
+    /// The id of the catalog's last file, the next
+    /// [`pop_catalog_end`](Self::pop_catalog_end) takes: the active file,
+    /// else a staged seal, else the last sealed file; `None` once
+    /// the catalog is empty.
+    #[must_use]
+    pub fn catalog_end_id(&self) -> Option<u32> {
+        if self.writer.is_some() {
+            return Some(self.active_id);
+        }
+        if let Some(seal) = self.pending_seals.front() {
+            return Some(seal.id);
+        }
+        self.sealed.last().map(|meta| meta.id)
+    }
+
+    /// Takes the catalog's last file out of a dropped namespace's pipeline
+    /// (ADR-0148 D3), one at a time from its end: the active file, then the
+    /// staged seals, then the sealed files, last first. The
+    /// active file's and a staged seal's handles close as they leave; a
+    /// sealed file's handle is its owner's. Only once no round is staged,
+    /// whose ops may name these files. O(1) a file, no clone.
+    pub fn pop_catalog_end(&mut self) -> Option<TierFileMeta> {
+        debug_assert!(!self.round_active(), "a dropped pipeline's round is finished first");
+        if let Some(writer) = self.writer.take() {
+            let meta = TierFileMeta {
+                id: self.active_id,
+                base: writer.base(),
+                data_len: writer.data_len(),
+                reason: SealReason::Shutdown,
+                path: writer.path().to_path_buf(),
+            };
+            drop(writer);
+            return Some(meta);
+        }
+        if let Some(seal) = self.pending_seals.pop_front() {
+            let PendingSeal { id, base, data_len, path, file, .. } = seal;
+            drop(file);
+            return Some(TierFileMeta { id, base, data_len, reason: SealReason::Shutdown, path });
+        }
+        self.sealed.pop()
+    }
+
     /// Seals staged in the in-flight round, not yet committed — the
     /// manifest names them as unsealed ranges, cold reads may target
     /// their confirmed prefix, disk usage counts them. Empty whenever no

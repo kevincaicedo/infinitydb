@@ -486,6 +486,10 @@ fn tripwires_section(
     // build, written only as rounds take windows.
     push(text, &format!("tier_window_capacity_bytes:{}", node.tier_window_capacity_bytes.get()));
     push(text, &format!("tier_window_written_bytes:{}", node.tier_window_written_bytes.get()));
+    // The cell's tiered lifetimes (ADR-0148 D3): positions held, and the
+    // conflicts the grant rules make unreachable.
+    push(text, &format!("tier_ns_positions:{}", node.tier_ns_positions.get()));
+    push(text, &format!("tier_position_conflicts:{}", node.tier_position_conflicts.get()));
     push(text, &format!("loop_snapshot_bytes:{}", node.loop_snapshot.reserved_bytes()));
     text.push_str("\r\n");
 }

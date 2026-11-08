@@ -736,9 +736,7 @@ pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone +
         // An applied leg answers its variant alone (ADR-0189 D5): the
         // origin reads `Ok` as applied, never a reply's bytes.
         Ok(()) => staged.push((from, token, StagedReply::Ok)),
-        Err(e) => {
-            stage_leg_refusal(scratch, staged, (from, token), |w| crate::admin::ns_error(e, w))
-        }
+        Err(refused) => stage_leg_refusal(scratch, staged, (from, token), |w| refused.write(w)),
     }
     true
 }
@@ -761,12 +759,12 @@ fn stage_leg_refusal(
 fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     argv: &[&[u8]],
-) -> Result<(), inf_store::NsError> {
+) -> Result<(), CreateRefused> {
     use inf_store::NsError;
     let malformed = NsError::InvalidName; // internal vocabulary; never client-visible
     if argv.len() == 4 && argv[1].eq_ignore_ascii_case(b"SET") {
         let tier = tier_from_fan(argv[3])?.ok_or(malformed)?;
-        return shared.store.borrow_mut().ns_set_tier(argv[2], tier);
+        return Ok(shared.store.borrow_mut().ns_set_tier(argv[2], tier)?);
     }
     // Memory-namespace pressure keys (M4-S27, ADR-0068 D3): the MEMCFG
     // tag disambiguates from the tier-SET arm above.
@@ -789,10 +787,10 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     .ok_or_else(|| malformed.clone())?,
             ),
         };
-        return shared.store.borrow_mut().ns_set_memory(argv[2], policy, maxmemory);
+        return Ok(shared.store.borrow_mut().ns_set_memory(argv[2], policy, maxmemory)?);
     }
     if argv.len() != 9 || !argv[1].eq_ignore_ascii_case(b"CREATE") {
-        return Err(malformed);
+        return Err(malformed.into());
     }
     fn parse_str(b: &[u8]) -> Result<&str, inf_store::NsError> {
         core::str::from_utf8(b).map_err(|_| inf_store::NsError::InvalidName)
@@ -802,7 +800,7 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         b"-" => None,
         b"everysec" => Some(FsyncClass::Everysec),
         b"always" => Some(FsyncClass::Always),
-        _ => return Err(malformed),
+        _ => return Err(malformed.into()),
     };
     let policy = match argv[5] {
         b"-" => None,
@@ -816,7 +814,7 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     };
     let id: u32 = parse_str(argv[7])?.parse().map_err(|_| malformed.clone())?;
     let tier = tier_from_fan(argv[8])?;
-    shared.store.borrow_mut().ns_create(inf_store::NsSpec {
+    let spec = inf_store::NsSpec {
         id: NsId(id),
         name: argv[2].to_vec(),
         mode,
@@ -824,7 +822,8 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         policy,
         maxmemory,
         tier,
-    })
+    };
+    apply_create(shared, spec)
 }
 
 /// A peer's `INF.NSFAN DROP name epoch id mode` leg (ADR-0189 D4, D5):
@@ -869,10 +868,72 @@ pub(super) fn apply_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     let applied = shared.store.borrow_mut().ns_drop(receipt)?;
     if let inf_store::ddl::DropApplied::Removed(spec) = &applied
         && spec.tier.is_some()
+        && let Some(tier) = shared.tier.borrow_mut().as_mut()
     {
-        shared.ns_drop_releases.borrow_mut().push((spec.id, receipt.fan_epoch()));
+        // The same step moves the owner to Draining (ADR-0148 D3); a cell
+        // with no Live owner of it counts the conflict (F3).
+        tier.drain(spec.id, receipt.fan_epoch());
     }
     Ok(applied)
+}
+
+/// Why a cell's apply of a `CREATE` refused (ADR-0148 D2): the store's
+/// own refusal, or the grant's.
+#[derive(Debug)]
+pub(super) enum CreateRefused {
+    /// The store refused the namespace: a validation it re-ran, or its
+    /// reservation.
+    Store(inf_store::NsError),
+    /// The directory names no grant this cell can install it at.
+    Grant(crate::tier_cell::InstallRefused),
+}
+
+impl From<inf_store::NsError> for CreateRefused {
+    fn from(e: inf_store::NsError) -> CreateRefused {
+        CreateRefused::Store(e)
+    }
+}
+
+impl CreateRefused {
+    /// The refusal's reply: the store's error as every `CREATE` path
+    /// renders it; a grant the directory does not name as the store's
+    /// unknown-namespace error; an occupied position as an internal error.
+    pub(super) fn write(self, w: &mut RespWriter<'_>) {
+        match self {
+            CreateRefused::Store(e) => crate::admin::ns_error(e, w),
+            CreateRefused::Grant(crate::tier_cell::InstallRefused::NotDeclared) => {
+                crate::admin::ns_error(inf_store::NsError::Unknown, w);
+            }
+            CreateRefused::Grant(crate::tier_cell::InstallRefused::Occupied) => {
+                w.error("ERR internal: the namespace's grant position holds an owner on this cell");
+            }
+        }
+    }
+}
+
+/// Applies an accepted `CREATE` to this cell's store and tiered plane
+/// (ADR-0148 D2, D3): the origin's and every peer's leg alike. A tiered
+/// namespace's owner is installed at the position the node's directory
+/// names Declared for it, in one nonsuspending step with the store's
+/// `ns_create`: the grant admitted first (it moves nothing), the store's
+/// fallible reservation next, the pipeline last. A grant the directory
+/// does not name, or a position this cell holds, refuses before any effect.
+pub(super) fn apply_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    spec: inf_store::NsSpec,
+) -> Result<(), CreateRefused> {
+    let Some(tier) = spec.tier else {
+        return Ok(shared.store.borrow_mut().ns_create(spec)?);
+    };
+    let permit = match shared.tier.borrow_mut().as_mut() {
+        Some(cell) => cell.admit_install(spec.id).map_err(CreateRefused::Grant)?,
+        None => return Err(CreateRefused::Grant(crate::tier_cell::InstallRefused::NotDeclared)),
+    };
+    shared.store.borrow_mut().ns_create(spec)?;
+    if let Some(cell) = shared.tier.borrow_mut().as_mut() {
+        cell.install(permit, &tier);
+    }
+    Ok(())
 }
 
 /// Serializes a tier spec for the `INF.NSFAN` vector (M4-S19): `-` for

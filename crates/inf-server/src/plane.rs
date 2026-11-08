@@ -331,16 +331,6 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// (a tiered namespace is a configuration of `MODE durable` —
     /// ADR-0062 D1); inner state stays empty until one materializes.
     tier: RefCell<Option<crate::tier_cell::TierCell<F>>>,
-    /// Dropped tiered namespaces whose tier files wait for the catalog
-    /// swap that drops them (ADR-0189 D9): `(ns, epoch)` recorded by every
-    /// cell's apply of an accepted `DROP` or `CREATE` rollback, the
-    /// origin's and each peer's `INF.NSFAN DROP` leg alike, with the
-    /// receipt's epoch, which the catalog word already covers. No cell
-    /// applies a drop before its answer, so a stop before it leaves every
-    /// file in place. Consumed by `TierCell::sync_namespaces`, which parks
-    /// the tier files on the entry's epoch. Bounded by DDL rate — one entry
-    /// per drop under the DDL ticket, consumed at the next MAINTAIN.
-    ns_drop_releases: RefCell<Vec<(NsId, u64)>>,
     /// Fabric-origin tiered applies (M4-S26): per-origin FIFO queues. A
     /// tiered apply can suspend on a cold read, so it cannot run inside
     /// the synchronous FABRIC-IN drain — each origin's applies run on
@@ -788,7 +778,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 durable: RefCell::new(None),
                 census,
                 tier: RefCell::new(None),
-                ns_drop_releases: RefCell::new(Vec::new()),
                 ns_applies: RefCell::new((0..cells).map(|_| VecDeque::new()).collect::<Vec<_>>()),
                 ns_pump_active: RefCell::new(vec![false; usize::from(cells)]),
                 pump_gated: RefCell::new(VecDeque::new()),
@@ -943,17 +932,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         // (M4-S26; ADR-0057 D6): the flush pipeline
                         // resumes with the manifested catalog and the
                         // cold-read table inherits the boot-opened fds.
-                        if !recovered_tiers.is_empty() {
-                            let ks = self.shared.store.borrow();
-                            let mut tier = self.shared.tier.borrow_mut();
-                            let tier = tier.as_mut().expect("enable_durable built tier state");
-                            for rt in recovered_tiers {
-                                let spec = ks
-                                    .ns_get_by_id(rt.ns)
-                                    .and_then(|spec| spec.tier)
-                                    .expect("recovered namespace carries a tier block");
-                                tier.install_recovered(rt.ns, &spec, rt.flush, rt.files);
-                            }
+                        if let Err(err) = self.install_recovered_tiers(recovered_tiers) {
+                            self.boot_error = Some(err);
+                            return;
                         }
                         // Boot-metadata durability rides driver barriers at
                         // the head of the commit ledger (M2.5-S01): every
@@ -1012,6 +993,37 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
     }
 
+    /// Installs every recovered tiered namespace's owner at the position the
+    /// node's directory names Declared for it (ADR-0148 D2, D5), before the
+    /// cell serves. The writer seeded the directory from the same catalog
+    /// the store recovered, so a refusal is a boot error, never a guess.
+    fn install_recovered_tiers(
+        &mut self,
+        recovered: Vec<crate::recover::RecoveredTierNs<F>>,
+    ) -> std::io::Result<()> {
+        if recovered.is_empty() {
+            return Ok(());
+        }
+        let ks = self.shared.store.borrow();
+        let mut tier = self.shared.tier.borrow_mut();
+        let tier = tier.as_mut().expect("enable_durable built tier state");
+        for rt in recovered {
+            let spec = ks
+                .ns_get_by_id(rt.ns)
+                .and_then(|spec| spec.tier)
+                .expect("recovered namespace carries a tier block");
+            let permit = tier.admit_install(rt.ns).map_err(|refused| {
+                std::io::Error::other(format!(
+                    "the recovered tiered namespace {} has no grant this cell can install \
+                     ({refused:?})",
+                    rt.ns.0
+                ))
+            })?;
+            tier.install_recovered(permit, &spec, rt.flush, rt.files);
+        }
+        Ok(())
+    }
+
     /// Enables the durable plane for this cell (M2-S08/S10/S11): the
     /// assembly runs recovery first (`recover::open_cell_log`) and hands
     /// the tail-opened rotor plus the recovered manifest here, before the
@@ -1050,11 +1062,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 return Err(err);
             }
         };
+        // The cell's tiered grants (ADR-0148 D2): the node's directory and
+        // this cell's receipts, from the catalog writer's control plane; a
+        // cell with none installs no tiered owner.
+        let grants = self.shared.control.borrow().as_ref().and_then(|control| {
+            let receipts = control.take_tier_receipts(cell_id)?;
+            let directory = Arc::clone(control.tier_directory());
+            Some(crate::tier_cell::CellGrants::new(directory, receipts))
+        });
         *self.shared.tier.borrow_mut() = Some(crate::tier_cell::TierCell::new(
             fs.clone(),
             u32::from(cell_id),
             shard_dir.clone(),
             Rc::clone(&self.shared.census),
+            grants,
         ));
         let manifest = crate::ckpt::ManifestCell::new(
             fs,
@@ -1072,13 +1093,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         Ok(())
     }
 
-    /// The tiered MAINTAIN half (M4-S26): reconcile the namespace set,
-    /// run the per-namespace drivers (demote → the round's advance →
-    /// release, admission cadence, extent reclaim, retirement unlink),
-    /// then the cell's one turn (the plan pass and the issue pass, which
-    /// offer the round's groups to the device budget — ADR-0178 D3's
-    /// tier row), spawn compaction read chains, tear down dropped
-    /// namespaces, and drain queued cold-read intents into
+    /// The tiered MAINTAIN half (M4-S26): the directory pass (a receipt
+    /// for each grant Retiring that this cell never held, ADR-0148 D3), the
+    /// per-namespace drivers of every Live owner (demote → the round's
+    /// advance → release, admission cadence, extent reclaim, retirement
+    /// unlink), then the cell's one turn (the plan pass and the issue pass,
+    /// which offer the round's groups to the device budget — ADR-0178 D3's
+    /// tier row), spawn compaction read chains, drain the dropped
+    /// namespaces' owners, and drain queued cold-read intents into
     /// `IoOp::TierRead`s — once per reactor iteration (the S10 admission
     /// rule). Zero-cost when no tiered namespace was ever created: one
     /// `None` check.
@@ -1105,13 +1127,21 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let cold = {
             let mut tier_slot = self.shared.tier.borrow_mut();
             let Some(tier) = tier_slot.as_mut() else { return };
-            tier.sync_namespaces(
-                &self.shared.store.borrow(),
-                &mut self.shared.ns_drop_releases.borrow_mut(),
-            );
-            if tier.namespaces.is_empty() && tier.cold.is_none() {
+            tier.directory_pass();
+            if tier.positions_held() == 0 && tier.cold.is_none() {
                 return;
             }
+            // F3: a cell's store holds a tiered table iff its position is
+            // Live with that id; both change in one step of each apply.
+            debug_assert!(
+                {
+                    let ks = self.shared.store.borrow();
+                    let tables = ks.ns_iter().filter(|spec| spec.tier.is_some()).count();
+                    tables == tier.live_count()
+                        && tier.live().all(|t| ks.tiered_store(t.ns).is_some())
+                },
+                "a tiered table without its Live owner, or an owner without its table"
+            );
             // The durable plane is read, never borrowed mutably, while the
             // namespaces' drivers run: each tick of the reclaim marks reads
             // its staged seq, its watermark and ack classes in this step.
@@ -1121,7 +1151,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let mut units = 0u32;
             let mut fatal: Option<String> = None;
             let now_us = cx.now.as_micros();
-            for at in 0..tier.namespaces.len() {
+            for at in 0..tier.live_count() {
                 match tier.maintain_ns(&mut ks, at, durable.as_ref(), transition_idle, now_us) {
                     Ok((used, work)) => {
                         units += used;
@@ -1156,7 +1186,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // M4.5-S37 (ADR-0093 D4): the shadow reconciler's reads —
             // oldest winner first, bounded per table, Foreground once
             // the pinned suffix crosses half its cap.
-            for t in &tier.namespaces {
+            for t in tier.live() {
                 if let Some(table) = ks.tiered_store_mut(t.ns) {
                     let reads = table.shadow_work(inf_store::SHADOW_READS_IN_FLIGHT);
                     shadow_reads.extend(reads.into_iter().map(|read| (t.ns, read)));
@@ -1165,7 +1195,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // ADR-0100 D5: a dropped namespace's files unlink only once
             // the catalog swap carrying the drop is durable.
             let control = self.shared.control.borrow().clone();
-            units += tier.maintain_teardown(|epoch| {
+            units += tier.maintain_draining(|epoch| {
                 control.as_ref().is_none_or(|control| control.persisted(epoch))
             });
             if units > 0 {
@@ -1179,11 +1209,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             }
             // Reactor-drive flush observables (M4.5-S31, ADR-0084 D6).
             let stats = &tier.flush_stats;
-            let files_sealed: u64 =
-                tier.namespaces.iter().map(|t| t.flush.sealed().len() as u64).sum();
+            let files_sealed: u64 = tier.live().map(|t| t.flush.sealed().len() as u64).sum();
             let mut gauges = [0u64; TIER_FLUSH_GAUGES];
-            let files_active =
-                tier.namespaces.iter().filter(|t| t.flush.active().is_some()).count() as u64;
+            let files_active = tier.live().filter(|t| t.flush.active().is_some()).count() as u64;
             for (slot, value) in [
                 (TierFlushGauge::Rounds, stats.rounds),
                 (TierFlushGauge::WriteRetries, stats.write_retries),
@@ -1207,6 +1235,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let (capacity, written) = tier.window_bytes();
             self.shared.node.tier_window_capacity_bytes.set(capacity);
             self.shared.node.tier_window_written_bytes.set(written);
+            self.shared.node.tier_ns_positions.set(tier.positions_held());
+            self.shared.node.tier_position_conflicts.set(tier.position_conflicts());
             tier.cold.clone()
         };
         // Reactor-drive flush ops (M4.5-S31): pushed outside the tier

@@ -129,6 +129,12 @@ pub struct NodeState {
     /// Render-only, like the pools above.
     pub tier_window_capacity_bytes: Cell<u64>,
     pub tier_window_written_bytes: Cell<u64>,
+    /// The cell's grant positions holding a tiered namespace owner, Live or
+    /// Draining (ADR-0148 D3: at most 64), and the installs and drops that
+    /// met a position in a state its grant rules out (zero by design).
+    /// Render-only, cell scope.
+    pub tier_ns_positions: Cell<u64>,
+    pub tier_position_conflicts: Cell<u64>,
     pub connections: Cell<u64>,
     pub recv_dropped: Cell<u64>,
     pub fabric_rtt_p50_ns: Cell<u64>,

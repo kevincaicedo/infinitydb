@@ -876,8 +876,12 @@ async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     let refused = if inf_foundation::fault::fire(crate::fault::NS_CREATE_ORIGIN_REFUSED) {
         Some(error_reply(shared, proto, "ERR fault: ns_create_origin_refused"))
     } else {
-        let created = shared.store.borrow_mut().ns_create(spec.clone());
-        created.err().map(|e| ns_error_reply(shared, proto, e))
+        let created = super::shared::apply_create(shared, spec.clone());
+        created.err().map(|refused| {
+            let mut reply = OpenReply::new(shared.take_reply_buf());
+            refused.write(&mut RespWriter::new(reply.reply(), proto));
+            reply.finish()
+        })
     };
     let rollback = Rollback { id: spec.id, name: &spec.name, mode: spec.mode, cleanup };
     if let Some(refusal) = refused {
