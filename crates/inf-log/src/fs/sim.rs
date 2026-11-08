@@ -735,6 +735,11 @@ struct DiskState {
     /// an index below `next_file_fd` and absent here is a closed fd.
     open_files: BTreeMap<u64, OpenFile>,
     next_file_fd: u64,
+    /// Driver ops that named a closed file descriptor (the `EBADF` arm of
+    /// `open_file_mut`): on Linux the number would be reused, so each is an
+    /// op landing on another file. The custody oracle reads it, and a
+    /// correct node keeps it at zero.
+    closed_fd_ops: u64,
     /// Dir-handle fd → directory (driver dir-fsync routing).
     dir_fds: BTreeMap<i64, PathBuf>,
     next_dir_fd: i64,
@@ -799,6 +804,7 @@ impl DiskState {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")));
         }
         let Some(open) = self.open_files.get(&index).copied() else {
+            self.closed_fd_ops += 1;
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         };
         let inode = self
@@ -958,6 +964,47 @@ impl SimDisk {
     #[must_use]
     pub fn write_reorder_armed(&self) -> bool {
         self.state.borrow().stall.as_ref().is_some_and(|m| m.cfg.opens_write_reorder_window())
+    }
+
+    /// Driver ops that named a closed file descriptor (the state's
+    /// `closed_fd_ops`): zero on a correct node.
+    #[must_use]
+    pub fn closed_fd_ops(&self) -> u64 {
+        self.state.borrow().closed_fd_ops
+    }
+
+    /// Under each `shard-N` directory, the distinct `ns-<id>` directories
+    /// holding a file an open description names (a tier file, an extent):
+    /// the lifetime oracle's count, read from the disk's own tables, never
+    /// from a cell. One pass over the names and one over the open
+    /// descriptions; a file no name reaches counts under no directory.
+    #[must_use]
+    pub fn open_ns_dirs(&self) -> BTreeMap<String, usize> {
+        let state = self.state.borrow();
+        let open: BTreeSet<u64> = state.open_files.values().map(|f| f.ino).collect();
+        let mut dirs: BTreeSet<(String, String)> = BTreeSet::new();
+        for (path, ino) in &state.os_names {
+            if !open.contains(ino) {
+                continue;
+            }
+            let mut shard = None;
+            for part in path.components() {
+                let part = part.as_os_str().to_string_lossy();
+                if part.starts_with("shard-") {
+                    shard = Some(part.into_owned());
+                } else if part.starts_with("ns-")
+                    && let Some(shard) = shard.take()
+                {
+                    dirs.insert((shard, part.into_owned()));
+                    break;
+                }
+            }
+        }
+        let mut counts = BTreeMap::new();
+        for (shard, _) in dirs {
+            *counts.entry(shard).or_insert(0) += 1;
+        }
+        counts
     }
 
     /// Inodes resident in the model (F-L04-04): a removed or clobbered

@@ -1282,6 +1282,93 @@ fn main() {
         return;
     }
 
+    // ADR-0148: tiered namespace lifetimes — the limit, the Retiring
+    // refusal and its return, the disconnect and the peer refusal, a cut.
+    if scenario_name == "m4-ns-lifetimes" {
+        let run_one = |seed: u64| inf_sim::run_ns_lifetimes_scenario(seed);
+        if let Some(sweep) = sweep {
+            let (shard_i, shard_k) = shard;
+            assert!(shard_k > 0, "--shard I/K wants K > 0");
+            assert!(shard_i < shard_k, "--shard I/K wants I < K");
+            let (mut ran, mut violations, mut busy) = (0u64, 0u64, 0u64);
+            let mut lines = Vec::new();
+            for i in (shard_i..sweep).step_by(shard_k as usize) {
+                let seed = seed.wrapping_add(i);
+                let report = run_one(seed);
+                if verify {
+                    let twin = run_one(seed);
+                    verify_hashes(
+                        (report.trace_hash, report.state_hash),
+                        (twin.trace_hash, twin.state_hash),
+                    );
+                    assert!(twin.ok(), "second run failed its oracles");
+                }
+                ran += 1;
+                busy += report.refused_busy;
+                if report.ok() {
+                    lines.push(format!("{seed:#x} ok"));
+                } else {
+                    violations += 1;
+                    let first = report.violations.first().map_or("stall", |v| v.as_str());
+                    lines.push(format!("{seed:#x} VIOLATION {first}"));
+                    eprintln!("inf-sim: seed {seed:#x}: {first}");
+                }
+            }
+            println!(
+                "inf-sim: m4-ns-lifetimes sweep shard {shard_i}/{shard_k}: {ran} seeds, \
+                 {violations} violations, {busy} CREATEs refused while a grant was Retiring"
+            );
+            if let Some(dir) = out_dir.as_deref() {
+                std::fs::create_dir_all(dir).expect("out dir");
+                std::fs::write(
+                    format!("{dir}/results-shard-{shard_i}.txt"),
+                    lines.join("\n") + "\n",
+                )
+                .expect("results");
+            }
+            std::process::exit(if violations > 0 { 1 } else { 0 });
+        }
+        let report = run_one(seed);
+        println!(
+            "inf-sim: scenario m4-ns-lifetimes seed {seed:#x}: {} cells, {} commands, {} steps, \
+             {} CREATEs accepted, {} refused while a grant was Retiring, {} at the limit, at \
+             most {} ns directories holding open files under a shard, refused leg {}, trace {} \
+             bytes, hash {:#018x}",
+            report.cells,
+            report.commands_done,
+            report.scheduler_steps,
+            report.creates_ok,
+            report.refused_busy,
+            report.refused_limit,
+            report.open_dirs_max,
+            report.refused_leg,
+            report.trace.len(),
+            report.trace_hash
+        );
+        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        print_census(report.cap_rows_checked, report.cap_rows_crossed);
+        if verify {
+            let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
+            if second.trace != report.trace {
+                eprintln!("inf-sim: DETERMINISM VIOLATION — traces differ");
+                std::process::exit(1);
+            }
+            println!("inf-sim: determinism verified (second run identical)");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // ADR-0189 D5: the namespace-drop window — the stale fold at the cap,
     // lagging exports inside a DROP's and a rollback's window, and the cut
     // class the seed picks, each with its reboot audit.

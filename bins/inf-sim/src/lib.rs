@@ -70,6 +70,7 @@ pub mod net;
 pub mod nscreate;
 pub mod nsddl;
 pub mod nsdrop;
+pub mod nslifetimes;
 pub mod pressure;
 pub mod recovery;
 pub mod resp;
@@ -96,6 +97,7 @@ pub use harness::{Scenario, SimReport, run_scenario};
 pub use nscreate::{NsCreateWindowReport, run_ns_create_window_scenario};
 pub use nsddl::{NsDdlRaceReport, run_ns_ddl_race_scenario};
 pub use nsdrop::{DropCut, NsDropWindowReport, run_ns_drop_window_scenario};
+pub use nslifetimes::{NsLifetimesReport, run_ns_lifetimes_scenario};
 pub use pressure::{PressureReport, PressureScenario, run_pressure_scenario};
 pub use recovery::{
     RecoveryReport, RecoveryScenario, SealCensus, SeedClass, SpecVariant, run_recovery_scenario,
@@ -140,6 +142,7 @@ pub const SCENARIOS: &[&str] = &[
     "m4-recovery",
     "m4-diskfull",
     "m4-tiered",
+    "m4-ns-lifetimes",
     "m4-tier-budget",
     "m4-epoch-marks",
     "m4-extent-window",

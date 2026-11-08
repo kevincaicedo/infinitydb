@@ -2598,6 +2598,11 @@ impl MiniClient {
         node.nets[self.cell].borrow_mut().client_send(self.fd, &encode(argv));
     }
 
+    /// Closes the client's socket with any reply unread: a disconnect.
+    pub(crate) fn close(self, node: &mut Node) {
+        node.nets[self.cell].borrow_mut().client_close(self.fd);
+    }
+
     /// One framed reply if it has arrived (no stepping).
     pub(crate) fn recv(&mut self, node: &mut Node) -> Option<Vec<u8>> {
         let bytes = node.nets[self.cell].borrow_mut().client_recv(self.fd);

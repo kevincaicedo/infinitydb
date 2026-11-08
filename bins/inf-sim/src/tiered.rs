@@ -2030,6 +2030,13 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     };
     // Every verdict ends the same way: the report carries the violations.
     let _verdict = late::run(&mut cx, node, audit, total_keys);
+    // O2 (ADR-0148 D3): the drop race's cold reads, and every other driver
+    // op, ran on open descriptors: a dropped namespace's owner keeps its
+    // handles while a read is pinned on its files.
+    let closed = disk.closed_fd_ops();
+    if closed > 0 {
+        fail(&mut report, format!("CUSTODY: {closed} driver ops named a closed descriptor"));
+    }
     finish(report, &observer, &clock)
 }
 
