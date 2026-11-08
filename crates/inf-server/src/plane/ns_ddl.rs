@@ -963,7 +963,7 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         return error_reply(shared, proto, "ERR fault: ns_drop_after_meta");
     }
     if let Err(e) = apply_drop(shared, &receipt) {
-        return ns_error_reply(shared, proto, e);
+        drop_apply_fail_stop(shared, &receipt, &e);
     }
     // Crash-matrix point: the on-disk state of a cut after the origin's
     // apply and before its first leg (`META` lacks the namespace, the
@@ -975,6 +975,24 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     fan_drop(shared, proto, name, &receipt, spec.mode).await;
     notice.post(cleanup.stamp_epoch());
     simple_reply(shared, proto, "OK")
+}
+
+/// D4's fail-stop for the origin's own apply of an accepted drop: `META`
+/// already drops the namespace, and this cell would keep serving it. The
+/// node's keyspace is cataloged at both boot sites, so no error reaches
+/// here but a defect.
+fn drop_apply_fail_stop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    receipt: &DropPersisted,
+    error: &inf_store::NsError,
+) -> ! {
+    let detail = format!(
+        "cell {} cannot apply the drop of namespace {} at epoch {}: {error:?}",
+        shared.cell.0,
+        receipt.id().0,
+        receipt.fan_epoch()
+    );
+    super::ddl_fail_stop("DROP apply", &detail)
 }
 
 /// What a `CREATE`'s rollback undoes.
@@ -1017,11 +1035,9 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     let Ok(receipt) = await_answer(shared, control, requested).await else {
         unreachable!("the writer accepts a rollback's drop of its own pending CREATE");
     };
-    // `Absent` here is an origin whose own apply was refused; an error is
-    // a keyspace no catalog writer answers, which a node's never is.
-    if apply_drop(shared, &receipt).is_err() {
-        notice.post(None);
-        return;
+    // `Absent` here is an origin whose own apply was refused.
+    if let Err(e) = apply_drop(shared, &receipt) {
+        drop_apply_fail_stop(shared, &receipt, &e);
     }
     fan_drop(shared, proto, name, &receipt, mode).await;
     notice.post(cleanup.stamp_epoch());
