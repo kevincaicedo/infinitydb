@@ -180,7 +180,7 @@ impl Arena {
 > "bridge wakers (no atomics on the owner lane)". No signature in this
 > document changes.
 
-> **Accepted 2026-09-22, built — ADR-0154:** fixed timer ownership and
+> **Accepted 2026-09-22, built for D1–D3 — ADR-0154:** fixed timer ownership and
 > bounded callback delivery: a typed `on_timer` notice from owners the
 > host reserved, never a raw key. Fallible boot construction admits
 > fixed TimerSet owner positions and an indexed minimum heap.
@@ -197,7 +197,8 @@ impl Arena {
 > to no earlier than the next millisecond after the current turn, and
 > clock-range exhaustion is a typed error before arming (ADR-0154 D1–D3).
 > The sketch below is the built shape. The ten phases, one backend entry
-> and existing gates remain unchanged.
+> and existing gates remain unchanged. D4's cold-host role and A1's
+> retirement role are not yet built.
 
 > **Accepted 2026-09-22, implementation open — ADR-0147:** bounded accept
 > admission and terminal parking replaces native multishot accept with
