@@ -1811,7 +1811,7 @@ count the arrivals that found it full.
      re-registration** (`ExtentRefs::register`) — the ADR-0057 D4
      at-least-once physics applied to the reclaim queue (found by the
      DST sweep; ADR-0061 D5).
-- **Accepted 2026-09-22, implementation open — ADR-0148:** bounded tiered
+- **Accepted 2026-09-22, built — ADR-0148:** bounded tiered
   namespace lifetimes amends the namespace DDL contract below. The catalog
   writer reserves a tiered lifetime grant before publication;
   `CreateApplied` does not return it. Durable removal plus every cell's
@@ -1828,13 +1828,26 @@ count the arrivals that found it full.
   withdrawal, a `DROP` fan, the grant held to terminal cleanup), and a
   disconnect after the persist request cannot abandon the create (ADR-0148
   D1, D4, D5, A1; ADR-0172 D3). The existing nine-argument fan and durable
-  formats remain. These changes are not built but the identity clause,
-  which is: a `CREATE` reserves its id under the DDL ticket, the catalog
-  writer commits it only when it accepts that `CREATE` (a refusal spends
-  none), past the last id every `CREATE` answers `-ERR namespace identity
-  space exhausted` before any effect, and boot refuses a catalog whose
-  counter is not past a live id. The descriptions below are the
-  implemented contract.
+  formats remain. As built: the writer's grant book (`inf-server::control`)
+  holds one grant a position, moves only on an accepted answer and
+  publishes Declared and Retiring grants through the node's tiered
+  directory (`inf_foundation::grants`) after the `META` write and before
+  the epoch, so a cell that reads the epoch reads the grant; a cell
+  installs a tiered namespace's owner only at a Declared grant, and a
+  `DROP` moves the owner to Draining at its position in the apply's step.
+  A Draining owner waits for its flush round's completions, then closes
+  and unlinks its tier files one at a time once no cold read is pinned on
+  each (a failed unlink keeps the file and the position), and frees the
+  position only once no blob extent reader holds it and every extent
+  barrier it registered has settled; only then does it publish the cell's
+  receipt, and the writer returns the position at the next tiered
+  `CREATE` once every cell's receipt names the exact id. A `CREATE` reserves
+  its id under the DDL ticket, the catalog writer commits it only when it
+  accepts that `CREATE` (a refusal spends none), past the last id every
+  `CREATE` answers `-ERR namespace identity space exhausted` before any
+  effect, and boot refuses a catalog whose counter is not past a live id
+  or that holds more than 64 live tiered definitions. The descriptions
+  below are the implemented contract.
 - **ADR-0103 amendment (2026-09-01) — the `CREATE` choreography:
   persist-then-serve.**
   1. **Order** (`inf-server::plane::program_ns_ddl`): *parse → durable-
@@ -1862,8 +1875,12 @@ count the arrivals that found it full.
      program) and `IdNotNext` when its reserved id is not the counter's
      next or no id is left (an internal error too: each `CREATE` reserves
      its id under the ticket and only an accepted one moves the counter);
-     a refusal writes nothing. The verdict reaches the origin
-     through the request's own answer slot (`inf-store::ddl`), stored
+     a tiered `CREATE` is refused `TieredCapacity` after `NameExists` and
+     before the tombstone cap below when its grant book holds every
+     position: `Busy` while one is Retiring (`-TRYAGAIN tiered namespace
+     capacity in use`), `Limit` when every one names a live namespace
+     (`-ERR tiered namespace limit reached`); a refusal writes nothing.
+     The verdict reaches the origin through the request's own answer slot (`inf-store::ddl`), stored
      (for an accepted request, after its `META` write returned) before
      the catalog word, the highest answered epoch. The pending DDL retires on the
      origin's notice of its own kind and id (`CreateApplied { id }`,
