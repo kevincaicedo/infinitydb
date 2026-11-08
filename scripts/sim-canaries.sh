@@ -756,6 +756,12 @@ rows=(
   # The same post at replacement, kind and id matching kept: the stale
   # notice is counted, and the DST's zero assertion goes red.
   "inf_canary_ns_notice_posted_at_replacement m2-ns-drop-window NOTICE-STALE"
+  # ADR-0148 D4 (F9): the directory's generation is bumped `Relaxed`, or
+  # before the publish's slot stores; either way a cell's pass can record
+  # the new generation and read the old slot, so it never passes again and
+  # the Retiring grant's receipt is never written.
+  "inf_canary_grants_generation_relaxed loom inf-foundation loom_a_pass_that_sees_the_generation_sees_the_retiring F9:"
+  "inf_canary_grants_generation_first loom inf-foundation loom_a_pass_that_sees_the_generation_sees_the_retiring F9:"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

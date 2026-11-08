@@ -128,3 +128,19 @@ pub const fn directory_levels(slots: u64) -> u32 {
     }
     levels
 }
+
+/// Tiered namespace lifetimes one node holds at once (ADR-0148 D1, A1.1):
+/// 64, counting every grant the catalog writer has Reserved, Declared or
+/// still Retiring. One grant is one position on every cell, so a cell holds
+/// at most 64 tiered runtime owners, a dropped one counted until each of its
+/// owners ends. Owner: the catalog writer's grant book (`inf-server`'s
+/// `limits` re-exports this one value). Crossing: a tiered `INF.NS CREATE`
+/// is refused before any effect, `-TRYAGAIN tiered namespace capacity in
+/// use` while a grant is Retiring, else `-ERR tiered namespace limit
+/// reached`; a boot whose catalog names more live tiered definitions stops
+/// before any cell with a typed error.
+pub const TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX: usize = 64;
+
+// A position is a `u8`, and the lane a position carries leaves a flush
+// token's slot room for its 8-bit op index.
+const _: () = assert!(TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX <= 256, "a position fits a u8");
