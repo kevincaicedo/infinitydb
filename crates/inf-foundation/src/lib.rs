@@ -3,9 +3,9 @@
 //! Types, ids, time/randomness injection seams (L7), stable hashing, CRC16
 //! slot math, varints, the always-on latency histogram, the frozen tripwire
 //! counter names, lifetime identity issuance, the capped containers cell
-//! code grows through (`bounded`), and the thread marks of the cell
-//! executor's wake bridge (`wake`). This crate is dependency-free (Loom
-//! replaces `issue`'s atomics under `--cfg loom` only) and fully safe.
+//! code grows through (`bounded`), and the cell executor's wake bridge
+//! (`wake`). This crate is dependency-free (Loom replaces `issue`'s atomics
+//! under `--cfg loom` only) and fully safe.
 #![forbid(unsafe_code)]
 // ADR-0144 D1: a production `match` names every variant of its enum.
 #![cfg_attr(

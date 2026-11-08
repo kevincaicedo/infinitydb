@@ -31,6 +31,19 @@ const _: () = assert!(
 const _: () =
     assert!(DRIVER_OP_BYTES_MAX <= FILE_OFFSET_BYTES_MAX, "every u32 position is addressable");
 
+/// Live wakers one lane of one wake header counts (ADR-0003 A1.2.6): 2⁶⁰ − 1. A header's wakers
+/// are `w = o + c`, the owner lane's count `o` and the foreign lane's `c`; a lane falls below 0
+/// only by drops of wakers the other lane counted, so neither passes ±2⁶⁰ − 1, `c` fits the lane
+/// word's 61-bit field and `w` an `i64`. Owner: the wake header's lanes, each of which compares
+/// its count with this one const before the count grows (the foreign lane's in
+/// `inf_foundation::wake`). Crossing: fail-stop — a clone, or a `close` folding `o` into `c`, that
+/// would pass it aborts the process before the count is written (`std::process::abort`, as `Rc`
+/// and `Arc` do at theirs). Memory bounds no count here (`mem::forget` of a waker is safe and
+/// holds none), and a header's reuse resets neither, so only code that forgets 2⁶⁰ clones, or
+/// moves 2⁶⁰ net clones between the lanes over one header's life, reaches it: INF 36 years of one
+/// core at 10⁹ a second.
+pub const LANE_COUNT_MAX: i64 = (1 << 60) - 1;
+
 /// Distinct cap names one cell's census holds (ADR-0163 D2): the rows of
 /// `CapCensus`, one per capped-container name registered on that cell, about
 /// 3 KiB. Owner: `inf_foundation::bounded::CapCensus`. Crossing: the 65th
