@@ -731,6 +731,15 @@ rows=(
   "inf_canary_ns_id_spent_on_refusal crate-test inf-server test:node_e2e every_accepted_create_takes_the_last_committed_id_plus_one the id is not its successor"
   # The exhaustion check off: the spent counter issues u32::MAX, and wraps.
   "inf_canary_ns_id_wraps crate-test inf-server test:node_e2e the_last_namespace_id_is_issued_once_and_then_the_space_refuses no id follows the last issuable one"
+  # ADR-0202 D1, D2, D5: a directory listing resumes one bounded batch at a
+  # time, and every name present from the open to its end is returned once.
+  # Planted, the std stream drops the name a full batch could not take.
+  "inf_canary_listing_carry_dropped crate-test inf-log test:dir_listing a_listing_ends_its_batches_at_both_bounds returned 0 times"
+  # The in-memory streams resume at their batch's first name, not its
+  # greatest: the next batch returns that batch's names again.
+  "inf_canary_listing_resume_rewinds crate-test inf-log test:dir_listing a_listing_ends_its_batches_at_both_bounds mem: ONCE:"
+  # A stream answers More with an empty batch before its End.
+  "inf_canary_listing_more_empty crate-test inf-log test:dir_listing a_listing_ends_its_batches_at_both_bounds MORE EMPTY"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

@@ -19,8 +19,12 @@
 //! best-effort and the discipline is proven against [`mem::MemFs`] fault
 //! injection. Recorded limitation (see the M2 ledger).
 
+use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+
+use crate::limits::{LISTING_BATCH_BYTES, LISTING_BATCH_NAMES, LISTING_NAME_BYTES_MAX};
 
 pub mod sim;
 
@@ -97,6 +101,219 @@ pub(crate) fn advance_read(done: usize, n: usize, cap: usize) -> io::Result<usiz
     })
 }
 
+/// A caller-owned batch of one directory's entry names (ADR-0202 D1, D2):
+/// at most [`LISTING_BATCH_NAMES`] names and [`LISTING_BATCH_BYTES`] name
+/// bytes, its storage allocated once by [`NameBatch::new`] at that fixed
+/// capacity and reused across calls, never grown. Each name is the entry's
+/// own bytes, never converted. A stream's `next_batch` clears it, then
+/// fills it; the batch changes only on that call, so an index into it
+/// names one name until the caller lists again.
+#[derive(Debug)]
+pub struct NameBatch {
+    /// The names' bytes, back to back.
+    bytes: Vec<u8>,
+    /// Each name's end offset in `bytes`, in listing order.
+    ends: Vec<u16>,
+}
+
+impl Default for NameBatch {
+    fn default() -> Self {
+        NameBatch::new()
+    }
+}
+
+impl NameBatch {
+    /// An empty batch at its fixed capacity.
+    #[must_use]
+    pub fn new() -> NameBatch {
+        NameBatch {
+            bytes: Vec::with_capacity(LISTING_BATCH_BYTES),
+            ends: Vec::with_capacity(LISTING_BATCH_NAMES),
+        }
+    }
+
+    /// The names the batch holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Whether the batch holds no name.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The name at `index`, in listing order; `None` at or past `len()`.
+    #[must_use]
+    pub fn name(&self, index: usize) -> Option<&OsStr> {
+        let end = usize::from(*self.ends.get(index)?);
+        let begin = match index.checked_sub(1) {
+            Some(before) => usize::from(*self.ends.get(before)?),
+            None => 0,
+        };
+        self.bytes.get(begin..end).map(OsStr::from_bytes)
+    }
+
+    /// The names in listing order.
+    pub fn iter(&self) -> impl Iterator<Item = &OsStr> + '_ {
+        (0..self.len()).filter_map(|index| self.name(index))
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.ends.clear();
+    }
+
+    /// Appends `name` when both bounds take it; `false` when the batch is
+    /// full for it. An empty batch takes every name a listing accepts
+    /// (`LISTING_NAME_BYTES_MAX ≤ LISTING_BATCH_BYTES`, asserted in
+    /// `limits`), so a full batch is never empty.
+    fn push(&mut self, name: &[u8]) -> bool {
+        if self.ends.len() >= LISTING_BATCH_NAMES {
+            return false;
+        }
+        let Some(end) = self.bytes.len().checked_add(name.len()) else { return false };
+        let Ok(end_offset) = u16::try_from(end) else { return false };
+        if end > LISTING_BATCH_BYTES {
+            return false;
+        }
+        self.bytes.extend_from_slice(name);
+        self.ends.push(end_offset);
+        true
+    }
+}
+
+/// How a `next_batch` call ended (ADR-0202 D1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum BatchEnd {
+    /// The batch holds at least one name and the stream may hold more.
+    More,
+    /// The batch holds every name left, perhaps none; every later call
+    /// answers `End` with an empty batch.
+    End,
+}
+
+/// What opening a directory's listing found (ADR-0202 D1).
+#[derive(Debug)]
+#[must_use]
+pub enum OpenedDir<S> {
+    /// The directory does not exist: its own `ENOENT`.
+    Absent,
+    /// The directory's listing, open.
+    Open(S),
+}
+
+/// An open listing of one directory: the typed cursor of a listing in
+/// progress (ADR-0202 D1). It owns its directory handle, holds no borrow,
+/// is neither `Clone` nor `Copy`, and closes the directory on drop, so an
+/// error path releases it. Its position is the filesystem's. Within one
+/// open stream a name present in the directory from the open to `End` is
+/// returned exactly once; a name created, removed or renamed while it is
+/// open may be returned or not, and a name removed after it was returned
+/// may be returned again, so a consumer removes a listed name through
+/// [`remove_listed`] and takes its `Gone` as that earlier removal (D3).
+/// `.` and `..` are never returned. No consumer may depend on the order:
+/// the filesystem's on [`StdSegmentFs`], ascending bytes on the in-memory
+/// and simulated tiers (deterministic, L7).
+pub trait DirStream {
+    /// Clears `batch`, then fills it with the next names, at most the
+    /// batch's two bounds; a name that does not fit waits whole for the
+    /// next call.
+    ///
+    /// # Errors
+    /// I/O failures, and `InvalidData` naming the directory for a name
+    /// over [`LISTING_NAME_BYTES_MAX`] bytes: the listing refuses, never
+    /// skips. After an `Err` the batch holds no name.
+    fn next_batch(&mut self, batch: &mut NameBatch) -> io::Result<BatchEnd>;
+}
+
+/// The one refusal of a name over the listing's bound, naming the
+/// directory (ADR-0202 D2).
+fn check_name_len(dir: &Path, name: &[u8]) -> io::Result<()> {
+    if name.len() > LISTING_NAME_BYTES_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: a {}-byte name passes the listing's {LISTING_NAME_BYTES_MAX}-byte bound",
+                dir.display(),
+                name.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Where an in-memory tier's stream resumes (ADR-0202 D5): a key by
+/// identity — the greatest name it returned — never an ordinal, so a name
+/// removed behind it moves nothing and one created ahead of it is
+/// returned.
+#[derive(Debug)]
+enum ResumeKey {
+    /// No batch yet: the directory's first name.
+    First,
+    /// After this path, the greatest the stream returned.
+    After(PathBuf),
+    /// `End` was answered.
+    Ended,
+}
+
+/// Fills `batch` from `names`, an in-memory tier's ascending path map, with
+/// the entries of `dir` after `key`, and moves `key` to the greatest name
+/// taken (ADR-0202 D5). The range starts at the key, O(log n), and stops at
+/// the first path outside `dir` (the paths under one directory sort
+/// together); a deeper path is passed. Bound: the names of `dir` after the
+/// key, at most one batch taken.
+fn fill_after<V>(
+    names: &std::collections::BTreeMap<PathBuf, V>,
+    dir: &Path,
+    key: &mut ResumeKey,
+    batch: &mut NameBatch,
+) -> io::Result<BatchEnd> {
+    use std::ops::Bound;
+    let from = match key {
+        ResumeKey::First => dir,
+        ResumeKey::After(path) => path.as_path(),
+        ResumeKey::Ended => return Ok(BatchEnd::End),
+    };
+    let mut first: Option<&PathBuf> = None;
+    let mut last: Option<&PathBuf> = None;
+    let mut full = false;
+    for (path, _) in names.range::<Path, _>((Bound::Excluded(from), Bound::Unbounded)) {
+        if !path.starts_with(dir) {
+            break;
+        }
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { continue };
+        if parent != dir {
+            continue;
+        }
+        check_name_len(dir, name.as_bytes())?;
+        if !batch.push(name.as_bytes()) {
+            full = true;
+            break;
+        }
+        first.get_or_insert(path);
+        last = Some(path);
+    }
+    // The planted canary resumes at the batch's first name, not its
+    // greatest: every later batch returns that batch's names again.
+    let resume = if cfg!(inf_canary_listing_resume_rewinds) { first } else { last };
+    if let Some(path) = resume {
+        *key = ResumeKey::After(path.clone());
+    }
+    if full {
+        return Ok(BatchEnd::More);
+    }
+    *key = ResumeKey::Ended;
+    // The planted canary answers `More` with an empty batch where the walk
+    // ends right after a full one.
+    if cfg!(inf_canary_listing_more_empty) && batch.is_empty() && first.is_none() {
+        return Ok(BatchEnd::More);
+    }
+    Ok(BatchEnd::End)
+}
+
 /// One open segment file. Offsets are absolute; the caller (the rotor)
 /// owns position bookkeeping.
 pub trait SegmentFile {
@@ -156,9 +373,48 @@ pub trait SegmentFs {
     /// Durably persist a directory's entries (dir-fsync). Required after
     /// segment create and before a MANIFEST rename counts (M2-S11).
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
-    /// File names (not paths) in `dir`. Non-UTF-8 names are surfaced
-    /// lossily so the boot scan can reject them by name — never skipped.
-    fn list_dir(&self, dir: &Path) -> io::Result<Vec<String>>;
+    /// The tier's open directory listing (ADR-0202 D1). Required, so a
+    /// wrapper names its inner tier's stream and forwards
+    /// [`open_listing`](Self::open_listing): a defaulted one would drop the
+    /// wrapper silently.
+    type DirStream: DirStream;
+
+    /// Opens `dir`'s listing: `Absent` is the directory's own `ENOENT`.
+    ///
+    /// # Errors
+    /// Any other errno, `ENOTDIR` included.
+    fn open_listing(&self, dir: &Path) -> io::Result<OpenedDir<Self::DirStream>>;
+
+    /// File names (not paths) in `dir`, every batch of its listing
+    /// collected, in the listing's order: a whole listing, so a call names
+    /// its directory's bound beside it. Non-UTF-8 names are surfaced
+    /// lossily so the boot scan can reject them by name — never skipped. A
+    /// missing directory is `NotFound`.
+    ///
+    /// # Errors
+    /// `NotFound` for an absent `dir`, and the listing's own errors.
+    fn list_dir(&self, dir: &Path) -> io::Result<Vec<String>> {
+        let mut stream = match self.open_listing(dir)? {
+            OpenedDir::Absent => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no dir {}", dir.display()),
+                ));
+            }
+            OpenedDir::Open(stream) => stream,
+        };
+        let mut batch = NameBatch::new();
+        let mut names = Vec::new();
+        // Bound: the directory's names; each `More` batch holds one at least.
+        loop {
+            let end = stream.next_batch(&mut batch)?;
+            names.extend(batch.iter().map(|name| name.to_string_lossy().into_owned()));
+            match end {
+                BatchEnd::More => {}
+                BatchEnd::End => return Ok(names),
+            }
+        }
+    }
     /// Create a new segment (create-new semantics: existing file is an
     /// error) preallocated to `prealloc_bytes`. `StorageFull` here is the
     /// ENOSPC discipline seam: it must surface *before* any write needs
@@ -305,8 +561,79 @@ impl SegmentFile for StdSegmentFile {
     }
 }
 
+/// The std tier's open listing (ADR-0202 D4): one directory fd and libc's
+/// `DIR` buffer (32 KiB on glibc), held for the listing's life — the same
+/// code on macOS, where std's `ReadDir` is `opendir` and `readdir`.
+/// `next_batch` reads entries until the batch is full, so it costs a
+/// `getdents64` only when libc's buffer is empty, and carries the one name
+/// that did not fit to the next call. The handle closes at `End` or on drop.
+#[derive(Debug)]
+#[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
+pub struct StdDirStream {
+    /// The open directory; `None` once `End` was answered.
+    dir: Option<std::fs::ReadDir>,
+    /// The directory's path, for the overlong-name refusal.
+    path: PathBuf,
+    /// The name the last batch could not take, returned first next.
+    carried: Option<OsString>,
+}
+
+impl DirStream for StdDirStream {
+    fn next_batch(&mut self, batch: &mut NameBatch) -> io::Result<BatchEnd> {
+        batch.clear();
+        let filled = self.fill(batch);
+        if filled.is_err() {
+            batch.clear();
+        }
+        filled
+    }
+}
+
+impl StdDirStream {
+    fn fill(&mut self, batch: &mut NameBatch) -> io::Result<BatchEnd> {
+        if let Some(name) = self.carried.take() {
+            // Length-checked by the call that met it; an empty batch takes
+            // every name the listing accepts.
+            let taken = batch.push(name.as_bytes());
+            debug_assert!(taken, "an empty batch takes the carried name");
+        }
+        let Some(dir) = self.dir.as_mut() else { return Ok(BatchEnd::End) };
+        // Bound: one batch of names, then the one that did not fit.
+        loop {
+            let Some(entry) = dir.next() else {
+                self.dir = None;
+                return Ok(BatchEnd::End);
+            };
+            let name = entry?.file_name();
+            check_name_len(&self.path, name.as_bytes())?;
+            if !batch.push(name.as_bytes()) {
+                // The planted canary drops the name that did not fit.
+                if !cfg!(inf_canary_listing_carry_dropped) {
+                    self.carried = Some(name);
+                }
+                return Ok(BatchEnd::More);
+            }
+        }
+    }
+}
+
 impl SegmentFs for StdSegmentFs {
     type File = StdSegmentFile;
+    type DirStream = StdDirStream;
+
+    fn open_listing(&self, dir: &Path) -> io::Result<OpenedDir<StdDirStream>> {
+        #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
+        let listing = std::fs::read_dir(dir);
+        match listing {
+            Ok(read) => Ok(OpenedDir::Open(StdDirStream {
+                dir: Some(read),
+                path: dir.to_path_buf(),
+                carried: None,
+            })),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(OpenedDir::Absent),
+            Err(err) => Err(err),
+        }
+    }
 
     fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
         #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
@@ -316,15 +643,6 @@ impl SegmentFs for StdSegmentFs {
     #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         std::fs::File::open(dir)?.sync_all()
-    }
-
-    fn list_dir(&self, dir: &Path) -> io::Result<Vec<String>> {
-        let mut names = Vec::new();
-        #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
-        for entry in std::fs::read_dir(dir)? {
-            names.push(entry?.file_name().to_string_lossy().into_owned());
-        }
-        Ok(names)
     }
 
     #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
@@ -557,7 +875,7 @@ pub mod mem {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
 
-    use super::{SegmentFile, SegmentFs};
+    use super::{BatchEnd, DirStream, NameBatch, OpenedDir, ResumeKey, SegmentFile, SegmentFs};
 
     /// One file: its bytes and the preallocation the budget was debited
     /// for at create (credited back on remove / rename-clobber).
@@ -716,6 +1034,29 @@ pub mod mem {
         }
     }
 
+    /// The memory tier's open listing (ADR-0202 D5): the tier's own handle
+    /// (it borrows the state only inside a call), the directory's path and
+    /// the greatest name returned, so each batch takes the names after it
+    /// in ascending byte order.
+    #[derive(Debug)]
+    pub struct MemDirStream {
+        state: Rc<RefCell<State>>,
+        dir: PathBuf,
+        key: ResumeKey,
+    }
+
+    impl DirStream for MemDirStream {
+        fn next_batch(&mut self, batch: &mut NameBatch) -> io::Result<BatchEnd> {
+            batch.clear();
+            let state = self.state.borrow();
+            let filled = super::fill_after(&state.files, &self.dir, &mut self.key, batch);
+            if filled.is_err() {
+                batch.clear();
+            }
+            filled
+        }
+    }
+
     /// Handle onto one in-memory file.
     #[derive(Debug)]
     pub struct MemFile {
@@ -789,6 +1130,18 @@ pub mod mem {
 
     impl SegmentFs for MemFs {
         type File = MemFile;
+        type DirStream = MemDirStream;
+
+        fn open_listing(&self, dir: &Path) -> io::Result<OpenedDir<MemDirStream>> {
+            if !self.state.borrow().dirs.contains(dir) {
+                return Ok(OpenedDir::Absent);
+            }
+            Ok(OpenedDir::Open(MemDirStream {
+                state: Rc::clone(&self.state),
+                dir: dir.to_path_buf(),
+                key: ResumeKey::First,
+            }))
+        }
 
         fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
             let mut state = self.state.borrow_mut();
@@ -816,23 +1169,6 @@ pub mod mem {
             } else {
                 Err(io::Error::new(io::ErrorKind::NotFound, format!("no dir {}", dir.display())))
             }
-        }
-
-        fn list_dir(&self, dir: &Path) -> io::Result<Vec<String>> {
-            let state = self.state.borrow();
-            if !state.dirs.contains(dir) {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no dir {}", dir.display()),
-                ));
-            }
-            Ok(state
-                .files
-                .keys()
-                .filter(|path| path.parent() == Some(dir))
-                .filter_map(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .collect())
         }
 
         fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {

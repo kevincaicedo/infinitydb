@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use inf_foundation::fault::{self, FaultSpec, HoldGate};
-use inf_log::fs::{SegmentFs, StdSegmentFile, StdSegmentFs, TierIoMode};
+use inf_log::fs::{OpenedDir, SegmentFs, StdSegmentFile, StdSegmentFs, TierIoMode};
 use inf_server::{CkptSpace, ControlHandle, ControlInbox, load_catalog};
 use inf_store::ddl::{Answer, CreatePersisted, DdlRefusal, Receipt, Requested};
 use inf_store::{FsyncClass, IndexCatalog, NsCatalog, NsId, NsMode, NsSpec};
@@ -135,6 +135,11 @@ impl RecordingFs {
 
 impl SegmentFs for RecordingFs {
     type File = StdSegmentFile;
+    type DirStream = <StdSegmentFs as SegmentFs>::DirStream;
+
+    fn open_listing(&self, dir: &Path) -> std::io::Result<OpenedDir<Self::DirStream>> {
+        StdSegmentFs.open_listing(dir)
+    }
 
     fn create_dir_all(&self, dir: &Path) -> std::io::Result<()> {
         StdSegmentFs.create_dir_all(dir)
@@ -142,9 +147,6 @@ impl SegmentFs for RecordingFs {
     fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
         self.note("sync_dir", dir);
         StdSegmentFs.sync_dir(dir)
-    }
-    fn list_dir(&self, dir: &Path) -> std::io::Result<Vec<String>> {
-        StdSegmentFs.list_dir(dir)
     }
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> std::io::Result<StdSegmentFile> {
         self.note("create", path);

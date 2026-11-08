@@ -257,6 +257,8 @@ F	1	crates/inf-log/src/flush.rs	panic	tier flush pipeline holders refused: {refu
 I	1	crates/inf-log/src/limits.rs	assert	one staged write fits one tier group	const assertion — evaluated at compile time, never at run time; a full batch window (`TIER_BATCH_FRAMES` frames) is the largest write a round stages, so the group builder always fits the next unsent write (ADR-0178 D3)
 I	1	crates/inf-log/src/limits.rs	assert	a round's ops fit the token op index	compile-time const assertion (ADR-0155 D3: 70 writes and 4 barriers under the 8-bit op index); a violation fails the build
 I	1	crates/inf-log/src/limits.rs	assert	the pool's batch windows cover the widest span	compile-time const assertion (⌈64 MiB/Q⌉ = 65 batch windows); a violation fails the build
+I	1	crates/inf-log/src/limits.rs	assert	a name end fits 16 bits	compile-time const assertion (ADR-0202 D2: the 8 KiB batch's name ends are 16-bit offsets); a violation fails the build
+I	1	crates/inf-log/src/limits.rs	assert	a name fits an empty batch	compile-time const assertion (ADR-0202 D2: a 1,024-byte name fits the 8 KiB batch, so a carried name always fits the next call); a violation fails the build
 I	1	crates/inf-log/src/frame.rs	assert	append on a sealed frame (missing reset)	FrameBuilder seal state machine (append → finalize → sealed_frame; reset between frames)
 C	1	crates/inf-log/src/frame.rs	assert	covered watermark leads the frame's own records	`crates/inf-server/src/durable.rs:DurableCell::queue_frame` stamps `covered` = the commit watermark, which the FIFO keeps below every unqueued record's LSN
 I	1	crates/inf-log/src/frame.rs	assert	double finalize (missing reset)	FrameBuilder seal state machine (append → finalize → sealed_frame; reset between frames)

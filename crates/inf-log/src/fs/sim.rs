@@ -104,7 +104,10 @@ use std::rc::Rc;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::{FileOffset, hash64};
 
-use super::{SegmentFile, SegmentFs, SegmentIoMode, TierIoMode};
+use super::{
+    BatchEnd, DirStream, NameBatch, OpenedDir, ResumeKey, SegmentFile, SegmentFs, SegmentIoMode,
+    TierIoMode,
+};
 
 /// Fake-fd base for file handles (dir handles sit above it). High
 /// enough that no simulated socket fd space collides. One fd per
@@ -1526,8 +1529,48 @@ impl SegmentFile for SimFile {
     }
 }
 
+/// The simulated disk's open listing (ADR-0202 D5): the disk's own handle
+/// (it borrows the state only inside a call), the directory's path and the
+/// greatest name returned, so each batch takes the OS view's names after it
+/// in ascending byte order. Both calls answer the dead switch as every read
+/// does.
+#[derive(Debug)]
+pub struct SimDirStream {
+    state: Rc<RefCell<DiskState>>,
+    dir: PathBuf,
+    key: ResumeKey,
+}
+
+impl DirStream for SimDirStream {
+    fn next_batch(&mut self, batch: &mut NameBatch) -> io::Result<BatchEnd> {
+        batch.clear();
+        let state = self.state.borrow();
+        let filled = state
+            .dead_check()
+            .and_then(|()| super::fill_after(&state.os_names, &self.dir, &mut self.key, batch));
+        if filled.is_err() {
+            batch.clear();
+        }
+        filled
+    }
+}
+
 impl SegmentFs for SimDisk {
     type File = SimFile;
+    type DirStream = SimDirStream;
+
+    fn open_listing(&self, dir: &Path) -> io::Result<OpenedDir<SimDirStream>> {
+        let state = self.state.borrow();
+        state.dead_check()?;
+        if !state.dirs.contains(dir) {
+            return Ok(OpenedDir::Absent);
+        }
+        Ok(OpenedDir::Open(SimDirStream {
+            state: Rc::clone(&self.state),
+            dir: dir.to_path_buf(),
+            key: ResumeKey::First,
+        }))
+    }
 
     fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
@@ -1554,24 +1597,6 @@ impl SegmentFs for SimDisk {
         state.sync_dir_calls += 1;
         state.commit_dir(dir);
         Ok(())
-    }
-
-    fn list_dir(&self, dir: &Path) -> io::Result<Vec<String>> {
-        let state = self.state.borrow();
-        state.dead_check()?;
-        if !state.dirs.contains(dir) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no dir {}", dir.display()),
-            ));
-        }
-        Ok(state
-            .os_names
-            .keys()
-            .filter(|path| path.parent() == Some(dir))
-            .filter_map(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .collect())
     }
 
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {

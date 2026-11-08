@@ -855,6 +855,15 @@ impl SegmentFile for CountingFile {
 
 impl SegmentFs for CountingFs {
     type File = CountingFile;
+    type DirStream = <MemFs as SegmentFs>::DirStream;
+
+    fn open_listing(
+        &self,
+        dir: &std::path::Path,
+    ) -> std::io::Result<inf_log::fs::OpenedDir<Self::DirStream>> {
+        self.count(|t| t.lists += 1);
+        self.inner.open_listing(dir)
+    }
 
     fn create_dir_all(&self, dir: &std::path::Path) -> std::io::Result<()> {
         self.inner.create_dir_all(dir)
@@ -863,11 +872,6 @@ impl SegmentFs for CountingFs {
     fn sync_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
         self.count(|t| t.dir_syncs += 1);
         self.inner.sync_dir(dir)
-    }
-
-    fn list_dir(&self, dir: &std::path::Path) -> std::io::Result<Vec<String>> {
-        self.count(|t| t.lists += 1);
-        self.inner.list_dir(dir)
     }
 
     fn create_segment(
