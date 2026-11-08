@@ -80,29 +80,6 @@ fn data_root(tag: &str) -> PathBuf {
     root
 }
 
-/// The filesystem type under `path`, from `/proc/self/mountinfo` (the
-/// longest mount point that prefixes the canonical path).
-fn fs_type(path: &Path) -> String {
-    let canonical = std::fs::canonicalize(path).expect("canonical data root");
-    let canonical = canonical.to_string_lossy().into_owned();
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    let mut best: Option<(usize, String)> = None;
-    for line in mounts.lines() {
-        let mut halves = line.splitn(2, " - ");
-        let (Some(head), Some(tail)) = (halves.next(), halves.next()) else { continue };
-        let fields: Vec<&str> = head.split(' ').collect();
-        let Some(point) = fields.get(4) else { continue };
-        let Some(kind) = tail.split(' ').next() else { continue };
-        let point = point.replace("\\040", " ");
-        let covers = canonical == point
-            || canonical.starts_with(&format!("{}/", point.trim_end_matches('/')));
-        if covers && best.as_ref().is_none_or(|(len, _)| point.len() > *len) {
-            best = Some((point.len(), kind.to_owned()));
-        }
-    }
-    best.map_or_else(String::new, |(_, kind)| kind)
-}
-
 struct Server {
     child: Child,
     port: u16,
@@ -394,7 +371,8 @@ const ZERO_SET: [&str; 10] = [
 fn run_arm(fsync: &str, leg: Leg) {
     let _one_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = data_root(&format!("spill-{fsync}-{leg:?}"));
-    let kind = fs_type(&dir);
+    // The node's own reader of a directory's filesystem.
+    let kind = inf_probe::identity_of(&dir).fs_type;
     assert!(
         kind != "tmpfs",
         "VACUOUS: the data root {} is on tmpfs; direct mode needs a disk filesystem",
