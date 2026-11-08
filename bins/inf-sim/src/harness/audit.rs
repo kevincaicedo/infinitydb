@@ -2,6 +2,7 @@
 //! equalization, the round-trip audit, and the planted canary.
 
 use super::*;
+use crate::driver::Violations;
 
 // ---- quiescent audits + content reconciliation (review of 2026-08-30) ---------------
 
@@ -22,11 +23,7 @@ type Cells = Vec<(CellLoop<SimDriver, Rc<VirtualClock>>, Plane)>;
 
 /// Every cell's live entries at `now`. A key present on two cells breaks
 /// slot ownership and is reported as such rather than folded away.
-pub(super) fn fold_node_entries(
-    cells: &Cells,
-    now: Nanos,
-    violations: &mut Vec<String>,
-) -> Entries {
+pub(super) fn fold_node_entries(cells: &Cells, now: Nanos, violations: &mut Violations) -> Entries {
     let mut node: Entries = BTreeMap::new();
     for (i, (_, plane)) in cells.iter().enumerate() {
         plane.fold_live_entries(now, |scope, key, value, deadline| {
@@ -107,40 +104,48 @@ pub(super) fn expired_retained(
     live: u64,
     plane: &Plane,
     now: Nanos,
-) -> Option<String> {
+    violations: &mut Violations,
+) {
     let mut emitted = 0u64;
     let skipped = plane.fold_live_entries(now, |_, _, _, _| emitted += 1);
     if skipped > 0 {
-        return Some(format!(
+        violations.push(format!(
             "VACUOUS: cell {cell}: the expired-retained check cannot run: the fold skipped \
              {skipped} tiered namespaces"
         ));
+        return;
     }
-    (live != emitted).then(|| {
-        format!(
+    if live != emitted {
+        violations.push(format!(
             "EXPIRED RETAINED: cell {cell}: {live} live records vs {emitted} live entries \
              after the expiry drain (a record outlived its deadline without a reap)"
-        )
-    })
+        ));
+    }
 }
 
 /// The small-cap run's engagement (ADR-0008 A1 O3): a run under
 /// `--wheel-nodes-max` must have refused a placement and reaped through
 /// the sweep node-wide, or it proved nothing — `VACUOUS`, never green.
-pub(super) fn small_cap_engagement(scenario: &Scenario, cells: &Cells) -> Option<String> {
-    scenario.wheel_nodes_max?;
+pub(super) fn small_cap_engagement(
+    scenario: &Scenario,
+    cells: &Cells,
+    violations: &mut Violations,
+) {
+    if scenario.wheel_nodes_max.is_none() {
+        return;
+    }
     let (mut refused, mut swept) = (0u64, 0u64);
     for (_, plane) in cells {
         let stats = plane.keyspace().stats();
         refused += stats.wheel_fallback;
         swept += stats.expired_swept;
     }
-    (refused == 0 || swept == 0).then(|| {
-        format!(
+    if refused == 0 || swept == 0 {
+        violations.push(format!(
             "VACUOUS: the small-cap expiry run refused {refused} placements and swept \
              {swept} records node-wide (both must be > 0)"
-        )
-    })
+        ));
+    }
 }
 
 /// Reaps every already-expired entry on both sides at `now` (active vs lazy
@@ -224,7 +229,7 @@ pub(super) fn run_audit(
     auditors: &mut [Auditor],
     label: &str,
     report: &mut SimReport,
-    violations: &mut Vec<String>,
+    violations: &mut Violations,
 ) {
     let now = clock.now();
     report.audits += 1;

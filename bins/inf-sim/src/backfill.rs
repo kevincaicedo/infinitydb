@@ -19,6 +19,7 @@
 //! cell × index the same way. `--verify-determinism` runs the scenario
 //! twice and requires `trace_hash` identity (L7).
 
+use crate::driver::Violations;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -67,7 +68,7 @@ impl BackfillScenario {
 
 #[derive(Debug, Default)]
 pub struct BackfillReport {
-    pub violations: Vec<String>,
+    pub violations: Violations,
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,

@@ -29,6 +29,7 @@
 //! 5. the released half: a plain `CREATE z`, one key per cell, a cut, and
 //!    every key found — DDL still works after the races.
 
+use crate::driver::Violations;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -51,7 +52,7 @@ pub struct NsDdlRaceReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
     pub state_hash: u64,
-    pub violations: Vec<String>,
+    pub violations: Violations,
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
@@ -93,6 +94,7 @@ impl NsDdlRaceReport {
     }
 }
 
+#[track_caller]
 fn fail(report: &mut NsDdlRaceReport, message: String) {
     report.violations.push(message);
 }
@@ -191,7 +193,7 @@ fn run_observed(seed: u64, observer: TraceObserver) -> NsDdlRaceReport {
         trace: Vec::new(),
         trace_hash: 0,
         state_hash: 0,
-        violations: Vec::new(),
+        violations: Violations::new(),
         cap_rows_checked: 0,
         cap_rows_crossed: 0,
         stalled: false,

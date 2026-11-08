@@ -26,6 +26,7 @@
 //! evidence is each site's model test and the DST rows' disk-side oracles.
 //! Each violation's token is whitespace-free, so a canary row can expect it.
 
+use crate::driver::Violations;
 use inf_foundation::bounded::{CapCensus, CapRow, CensusPhase};
 
 /// The reclaim marks' census row, which every cell with a tiered namespace
@@ -59,7 +60,7 @@ pub(crate) struct CensusVerdict {
     /// Rows the crossing rule judged, those with `crossings > 0`, summed over
     /// the cells and lives (node sum): the rule's engagement.
     pub(crate) rows_crossed: u64,
-    pub(crate) violations: Vec<String>,
+    pub(crate) violations: Violations,
 }
 
 impl CensusVerdict {
@@ -114,10 +115,10 @@ impl CensusVerdict {
     /// that crossed.
     fn judge_row(&mut self, cell: usize, row: &CapRow) {
         self.rows_checked += 1;
-        self.violations.extend(over_cap(cell, row));
+        over_cap(cell, row, &mut self.violations);
         if row.crossings > 0 {
             self.rows_crossed += 1;
-            self.violations.extend(crossed_short(cell, row));
+            crossed_short(cell, row, &mut self.violations);
         }
     }
 
@@ -130,14 +131,14 @@ impl CensusVerdict {
 }
 
 /// The cap bound on one row: its high water above its cap is red.
-fn over_cap(cell: usize, row: &CapRow) -> Option<String> {
-    (row.high_water > row.entries_max).then(|| {
-        format!(
+fn over_cap(cell: usize, row: &CapRow, violations: &mut Violations) {
+    if row.high_water > row.entries_max {
+        violations.push(format!(
             "CAP CENSUS VIOLATION cell {cell}: cap-high-water-over — row `{}` held {} entries, \
              above its cap of {}",
             row.name, row.high_water, row.entries_max
-        )
-    })
+        ));
+    }
 }
 
 /// The crossing rule on a row that crossed: a `Full` or a merge is
@@ -145,14 +146,14 @@ fn over_cap(cell: usize, row: &CapRow) -> Option<String> {
 /// retirement lowers `capacity_now` before any `Full` at the new count, so
 /// `capacity_now` above the high water is a crossing short of the cap.
 /// `high_water <= entries_max` is the cap bound's, so no row reports twice.
-fn crossed_short(cell: usize, row: &CapRow) -> Option<String> {
-    (row.capacity_now > row.high_water).then(|| {
-        format!(
+fn crossed_short(cell: usize, row: &CapRow, violations: &mut Violations) {
+    if row.capacity_now > row.high_water {
+        violations.push(format!(
             "CAP CENSUS VIOLATION cell {cell}: cap-crossed-short — row `{}` crossed {} time(s) \
              at a high water of {}, below its capacity of {} now (cap {})",
             row.name, row.crossings, row.high_water, row.capacity_now, row.entries_max
-        )
-    })
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -296,9 +297,13 @@ mod tests {
             assembly_live: 0,
             capacity_now: 2,
         };
-        let text = over_cap(1, &over).expect("red past the cap");
-        assert!(text.contains("cap-high-water-over"), "{text}");
-        assert_eq!(over_cap(1, &CapRow { high_water: 2, ..over }), None, "at the cap is legal");
+        let mut red = Violations::new();
+        over_cap(1, &over, &mut red);
+        assert_eq!(red.len(), 1, "red past the cap: {red:?}");
+        assert!(red[0].contains("cap-high-water-over"), "{red:?}");
+        let mut green = Violations::new();
+        over_cap(1, &CapRow { high_water: 2, ..over }, &mut green);
+        assert!(green.is_empty(), "at the cap is legal: {green:?}");
     }
 
     /// The crossing rule on a real `Retire` slab of 4: two slots retire one

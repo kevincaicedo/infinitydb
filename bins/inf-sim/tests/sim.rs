@@ -56,7 +56,7 @@ fn m0_smoke_oracle_green() {
     scenario.commands = if cfg!(debug_assertions) { 20_000 } else { 100_000 };
     let report = run_scenario(&scenario);
     assert!(!report.stalled, "smoke stalled");
-    assert_eq!(report.oracle_violations, Vec::<String>::new());
+    assert!(report.oracle_violations.is_empty(), "{:?}", report.oracle_violations);
     assert_eq!(report.commands_done, scenario.commands);
     assert!(report.events >= scenario.commands, "apply events cover every command");
     assert_shadow_covered(&report, "m0-smoke");
@@ -72,7 +72,7 @@ fn m0_adversarial_agrees_with_the_independent_model() {
     scenario.commands = if cfg!(debug_assertions) { 12_000 } else { 60_000 };
     let report = run_scenario(&scenario);
     assert!(!report.stalled, "adversarial stalled");
-    assert_eq!(report.oracle_violations, Vec::<String>::new());
+    assert!(report.oracle_violations.is_empty(), "{:?}", report.oracle_violations);
     assert_eq!(report.commands_done, scenario.commands);
     assert_shadow_covered(&report, "m0-adversarial");
 }
@@ -118,7 +118,7 @@ fn deadlock_battery_all_to_all_saturation() {
     };
     let report = run_scenario(&scenario);
     assert!(!report.stalled, "deadlock battery stalled");
-    assert_eq!(report.oracle_violations, Vec::<String>::new());
+    assert!(report.oracle_violations.is_empty(), "{:?}", report.oracle_violations);
     assert_eq!(report.commands_done, scenario.commands);
 }
 
@@ -150,7 +150,7 @@ fn m1_cache_oracle_green() {
     scenario.commands = if cfg!(debug_assertions) { 12_000 } else { 60_000 };
     let report = run_scenario(&scenario);
     assert!(!report.stalled, "m1-cache stalled (delivery loss parks phase C)");
-    assert_eq!(report.oracle_violations, Vec::<String>::new());
+    assert!(report.oracle_violations.is_empty(), "{:?}", report.oracle_violations);
     assert_eq!(report.commands_done, scenario.commands);
     assert!(report.published > 0, "mix produced no PUBLISH traffic");
     // Every channel has ≥ 2 watchers (subscription plan), so deliveries
@@ -185,7 +185,7 @@ fn m0_surface_oracle_green() {
     scenario.audit_every = 2_000;
     let report = run_scenario(&scenario);
     assert!(!report.stalled, "surface scenario stalled");
-    assert_eq!(report.oracle_violations, Vec::<String>::new());
+    assert!(report.oracle_violations.is_empty(), "{:?}", report.oracle_violations);
     assert_eq!(report.commands_done, scenario.commands);
     assert!(report.audits >= 3, "audits ran: {}", report.audits);
     assert!(report.scan_walks >= 1, "a concurrent SCAN walk completed");

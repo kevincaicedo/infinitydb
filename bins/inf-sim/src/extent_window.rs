@@ -49,6 +49,7 @@
 
 mod cold;
 
+use crate::driver::Violations;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -180,7 +181,7 @@ pub struct ExtentWindowReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
     pub state_hash: u64,
-    pub violations: Vec<String>,
+    pub violations: Violations,
     pub scheduler_steps: u64,
     /// The most extent files open at once, by the sim disk's descriptors.
     pub handles_peak: usize,

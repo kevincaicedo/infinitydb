@@ -36,6 +36,7 @@
 //! Every event folds into `trace_hash`; `--verify-determinism` runs the
 //! scenario twice and requires hash identity (L7).
 
+use crate::driver::Violations;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -315,7 +316,7 @@ impl RecoveryScenario {
 
 #[derive(Debug, Default)]
 pub struct RecoveryReport {
-    pub violations: Vec<String>,
+    pub violations: Violations,
     pub lives: u64,
     pub refs_emitted: u64,
     pub images_emitted: u64,

@@ -361,7 +361,7 @@ fn main() {
             println!("inf-sim: determinism verified — second run hash-identical");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -400,7 +400,7 @@ fn main() {
             println!("inf-sim: determinism verified — second run hash-identical");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -442,7 +442,7 @@ fn main() {
             println!("inf-sim: determinism verified — second run hash-identical");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -479,7 +479,7 @@ fn main() {
             println!("inf-sim: determinism verified — second run hash-identical");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -515,7 +515,7 @@ fn main() {
             println!("inf-sim: determinism verified — second run hash-identical");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -631,7 +631,7 @@ fn main() {
                     lines.push(format!("{seed:#x} ok"));
                 } else {
                     violations += 1;
-                    let first = report.violations.first().map_or("?", |v| v.as_str());
+                    let first = report.violations.first().unwrap_or("?");
                     lines.push(format!("{seed:#x} VIOLATION {first}"));
                     eprintln!("inf-sim: seed {seed:#x}: {first}");
                 }
@@ -801,7 +801,7 @@ fn main() {
             println!("inf-sim: determinism verified (two runs, identical traces)");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -960,7 +960,7 @@ fn main() {
                     lines.push(format!("{seed:#x} ok"));
                 } else {
                     violations += 1;
-                    let first = report.violations.first().map_or("stall", |v| v.as_str());
+                    let first = report.violations.first().unwrap_or("stall");
                     lines.push(format!("{seed:#x} VIOLATION {first}"));
                     eprintln!("inf-sim: seed {seed:#x}: {first}");
                 }
@@ -1163,7 +1163,7 @@ fn main() {
             println!("inf-sim: determinism verified — second run trace byte-identical");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -1210,7 +1210,7 @@ fn main() {
                     lines.push(format!("{seed:#x} ok"));
                 } else {
                     violations += 1;
-                    let first = report.violations.first().map_or("stall", |v| v.as_str());
+                    let first = report.violations.first().unwrap_or("stall");
                     lines.push(format!("{seed:#x} VIOLATION {first}"));
                     eprintln!("inf-sim: seed {seed:#x}: {first}");
                 }
@@ -1274,7 +1274,7 @@ fn main() {
             println!("inf-sim: determinism verified (second run identical)");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -1310,7 +1310,7 @@ fn main() {
                     lines.push(format!("{seed:#x} ok {:?}", report.cut));
                 } else {
                     violations += 1;
-                    let first = report.violations.first().map_or("stall", |v| v.as_str());
+                    let first = report.violations.first().unwrap_or("stall");
                     lines.push(format!("{seed:#x} VIOLATION {first}"));
                     eprintln!("inf-sim: seed {seed:#x}: {first}");
                 }
@@ -1363,7 +1363,7 @@ fn main() {
             println!("inf-sim: determinism verified — second run trace byte-identical");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -1408,7 +1408,7 @@ fn main() {
                     lines.push(format!("{seed:#x} ok"));
                 } else {
                     violations += 1;
-                    let first = report.violations.first().map_or("stall", |v| v.as_str());
+                    let first = report.violations.first().unwrap_or("stall");
                     lines.push(format!("{seed:#x} VIOLATION {first}"));
                     eprintln!("inf-sim: seed {seed:#x}: {first}");
                 }
@@ -1468,7 +1468,7 @@ fn main() {
             println!("inf-sim: determinism verified — second run trace byte-identical");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -1512,7 +1512,7 @@ fn main() {
             println!("inf-sim: determinism verified — second run hash-identical");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -1543,7 +1543,7 @@ fn main() {
             println!("inf-sim: determinism verified — second run hash-identical");
         }
         if !report.ok() {
-            for v in &report.violations {
+            for v in report.violations.iter() {
                 eprintln!("inf-sim: VIOLATION: {v}");
             }
             std::process::exit(1);
@@ -1727,7 +1727,7 @@ fn run_extent_window(seed: u64, leg: ExtentWindowLeg, verify: bool) {
     }
     print_census(report.cap_rows_checked, report.cap_rows_crossed);
     if !report.ok() {
-        for v in &report.violations {
+        for v in report.violations.iter() {
             eprintln!("inf-sim: VIOLATION: {v}");
         }
         std::process::exit(1);
@@ -2081,7 +2081,7 @@ fn run_durable(
             lines.push(format!("{seed:#x} ok"));
         } else {
             violations += 1;
-            let first = report.violations.first().map_or("stall", |v| v.as_str());
+            let first = report.violations.first().unwrap_or("stall");
             lines.push(format!("{seed:#x} VIOLATION {first}"));
             eprintln!("inf-sim: seed {seed:#x}: {first}");
         }
@@ -2257,7 +2257,7 @@ fn run_m2_combined(
             lines.push(format!("{seed:#x} ok"));
         } else {
             violations += 1;
-            let first = report.violations.first().map_or("stall", |v| v.as_str());
+            let first = report.violations.first().unwrap_or("stall");
             lines.push(format!("{seed:#x} VIOLATION {first}"));
             eprintln!("inf-sim: seed {seed:#x}: {first}");
         }

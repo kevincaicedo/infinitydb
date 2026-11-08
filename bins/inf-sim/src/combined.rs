@@ -38,6 +38,7 @@
 //! live-record reconciliation is not rerun here (it needs the model
 //! keyspace) — the registry-drain and delivery-ledger checks are.
 
+use crate::driver::Violations;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -97,7 +98,7 @@ pub struct CombinedReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
     pub state_hash: u64,
-    pub violations: Vec<String>,
+    pub violations: Violations,
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
@@ -237,7 +238,7 @@ fn run_observed(scenario: &CombinedScenario, observer: TraceObserver) -> Combine
         trace: Vec::new(),
         trace_hash: 0,
         state_hash: 0,
-        violations: Vec::new(),
+        violations: Violations::new(),
         cap_rows_checked: 0,
         cap_rows_crossed: 0,
         stalled: false,
@@ -253,9 +254,10 @@ fn run_observed(scenario: &CombinedScenario, observer: TraceObserver) -> Combine
         delivered: 0,
         always_ack_latency_ms_max: 0,
     };
-    let fail = |report: &mut CombinedReport, what: String| {
+    #[track_caller]
+    fn fail(report: &mut CombinedReport, what: String) {
         report.violations.push(what);
-    };
+    }
 
     // ---- boot 1 + DDL: two durable namespaces + one memory-mode -------
     let mut node = match boot(dur, PathBuf::from("node"), &disk, &clock, &observer) {
@@ -786,7 +788,7 @@ fn run_observed(scenario: &CombinedScenario, observer: TraceObserver) -> Combine
 /// exempt). Catches "memory namespaces never touch the log" violations
 /// at the mechanism, independent of the volatility audit. One bounded
 /// violation per cell (first lsn + count), never a flood.
-fn l2_log_scan(scenario: &CombinedScenario, disk: &SimDisk, violations: &mut Vec<String>) {
+fn l2_log_scan(scenario: &CombinedScenario, disk: &SimDisk, violations: &mut Violations) {
     let data_dir = PathBuf::from("node");
     let durable_ns: BTreeSet<u32> = match load_catalog_from(disk, &data_dir) {
         Ok(Some(catalog)) => catalog

@@ -22,6 +22,7 @@
 //! event folds into `trace_hash`; `--verify-determinism` requires
 //! two-run identity (L7).
 
+use crate::driver::Violations;
 use core::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -84,7 +85,7 @@ impl ColdStormScenario {
 
 #[derive(Debug, Default)]
 pub struct ColdStormReport {
-    pub violations: Vec<String>,
+    pub violations: Violations,
     pub gets: u64,
     pub cold_served: u64,
     pub chunked_reads: u64,
@@ -193,6 +194,7 @@ impl World {
         self.files.iter().find(|f| addr >= f.base && addr < f.base + f.len)
     }
 
+    #[track_caller]
     fn violation(&mut self, message: String) {
         self.report.violations.push(message);
     }

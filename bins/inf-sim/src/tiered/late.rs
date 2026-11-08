@@ -28,6 +28,7 @@ pub(super) struct Late<'a> {
 pub(super) type Verdict<T = ()> = Result<T, ()>;
 
 impl Late<'_> {
+    #[track_caller]
     fn fail(&mut self, what: String) {
         let seed = self.scenario.seed;
         self.report.violations.push(format!("seed {seed:#x}: {what}"));

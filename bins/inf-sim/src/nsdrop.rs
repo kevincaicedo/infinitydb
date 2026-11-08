@@ -29,6 +29,7 @@
 //! Each class counts its own engagement (`held_steps`, `checkpoint_in_wait`),
 //! and a cut that did not land where its class says is a violation.
 
+use crate::driver::Violations;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -80,7 +81,7 @@ pub struct NsDropWindowReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
     pub state_hash: u64,
-    pub violations: Vec<String>,
+    pub violations: Violations,
     /// Cap census rows read at the end of every life, summed (node sum).
     pub cap_rows_checked: u64,
     /// Census rows the crossing rule judged.
@@ -598,7 +599,7 @@ fn run_observed(seed: u64, observer: &TraceObserver) -> NsDropWindowReport {
         trace: Vec::new(),
         trace_hash: 0,
         state_hash: 0,
-        violations: Vec::new(),
+        violations: Violations::new(),
         cap_rows_checked: 0,
         cap_rows_crossed: 0,
         stalled: false,
