@@ -946,8 +946,12 @@ impl SlotRouter {
 > compat oracle's assertion, not a rule of this seam.
 > `scripts/check-reply-outcome.sh` refuses a first-byte or prefix
 > comparison in production `crates/inf-server/src`; a sanctioned site
-> carries `reply-outcome-allow: <reason>`. The sketch below is the shape
-> (ADR-0190 D2, D4).
+> carries `reply-outcome-allow: <reason>`. Outside the functions that
+> set and read a reply's tag, it also refuses a path through `Outcome`
+> to anything but a non-reply variant (`Ok`, `Int`, `Nil`, `Bool`,
+> `Err`), a path through `ReplyOutcome`, and another name for either
+> enum; no marker sanctions one. The sketch below is the shape
+> (ADR-0190 D2, D4, A2).
 
 > **ADR-0190 A1 (2026-10-30):** `execute` and
 > every reply parameter take `out: &mut ReplyBuf`, with no lifetime;
