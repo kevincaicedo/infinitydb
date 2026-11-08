@@ -49,7 +49,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use inf_foundation::grants::{
-    DirectoryPublished, DirectoryWriter, GrantDirectory, POSITIONS, ReceiptBoard, ReceiptWriter,
+    DirectoryPublished, DirectoryWriter, GrantDirectory, GrantPos, POSITIONS, ReceiptBoard,
+    ReceiptWriter,
 };
 use inf_foundation::issue::{
     self, FinalCredit, IssueClock, IssueCredit, IssueExhausted, IssueQuota, IssueSpace, Issued,
@@ -1425,6 +1426,18 @@ struct Reclaimable(u64);
 // One bit a position.
 const _: () = assert!(POSITIONS <= 64, "a position's bit fits a Reclaimable word");
 
+/// Where an admitted tiered `CREATE`'s grant lands (ADR-0148 D2, D4): the
+/// lowest position that is Vacant once the reclaimable positions return.
+/// Made only by [`TierNamespaceGrants::room`] and consumed by
+/// [`TierNamespaceGrants::grant`]: an accepted tiered `CREATE` holds the
+/// position its own verdict found, and one the book had no room for is
+/// refused before it can be accepted.
+#[derive(Debug)]
+struct GrantPermit {
+    pos: GrantPos,
+    reclaimable: Reclaimable,
+}
+
 /// The writer's tiered grant book (ADR-0148 D2, D4): one grant a position,
 /// [`TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX`] positions, each one position
 /// on every cell. It moves only on an accepted answer (step 4: a grant, a
@@ -1463,10 +1476,14 @@ impl TierNamespaceGrants {
         TierNamespaceGrants { book, directory, receipts: ReceiptBoard::new(cells) }
     }
 
-    /// Step 1 for a tiered `CREATE` (ADR-0148 D4): each Retiring position
-    /// whose every cell's receipt names its exact id. At most `Retiring ×
-    /// cells` receipt loads, at DDL rate, on the writer.
-    fn reclaimable(&self) -> Reclaimable {
+    /// Step 1 for a tiered `CREATE` (ADR-0148 D1, D4; ADR-0172 D3): the
+    /// reclaim scan, each Retiring position whose every cell's receipt
+    /// names its exact id (at most `Retiring × cells` receipt loads, at DDL
+    /// rate, on the writer), then the permit for the lowest position Vacant
+    /// or reclaimable; else why every position is held, step 2's tiered
+    /// row: `Busy` while one is Retiring (it returns with no operator),
+    /// `Limit` when every one names a live namespace.
+    fn room(&self) -> Result<GrantPermit, TieredHeld> {
         let mut bits = 0u64;
         for pos in self.directory.positions() {
             if let Grant::Retiring(id) = self.book[pos.index()]
@@ -1475,38 +1492,30 @@ impl TierNamespaceGrants {
                 bits |= 1 << pos.index();
             }
         }
-        Reclaimable(bits)
-    }
-
-    /// Step 2's tiered row (ADR-0148 D1, ADR-0172 D3): `None` when a
-    /// position is Vacant or reclaimable, else why every position is held:
-    /// `Busy` while one is Retiring (it returns with no operator), `Limit`
-    /// when every one names a live namespace.
-    fn held(&self, reclaimable: Reclaimable) -> Option<TieredHeld> {
-        if reclaimable.0 != 0 || self.book.contains(&Grant::Vacant) {
-            return None;
+        let free = |pos: &GrantPos| {
+            self.book[pos.index()] == Grant::Vacant || bits & 1 << pos.index() != 0
+        };
+        if let Some(pos) = self.directory.positions().find(free) {
+            return Ok(GrantPermit { pos, reclaimable: Reclaimable(bits) });
         }
         if self.book.iter().any(|grant| matches!(grant, Grant::Retiring(_))) {
-            return Some(TieredHeld::Busy);
+            return Err(TieredHeld::Busy);
         }
-        Some(TieredHeld::Limit)
+        Err(TieredHeld::Limit)
     }
 
     /// Step 4 for an accepted tiered `CREATE` of `id`: the reclaimed
-    /// positions return to Vacant, then the lowest Vacant one is Reserved,
-    /// its Declared staged for step 7. The verdict found a position
-    /// (`held` was `None`), so one is Vacant here: the writer's own state.
-    fn grant(&mut self, reclaimable: Reclaimable, id: NsId) {
-        for pos in self.directory.positions() {
-            if reclaimable.0 & 1 << pos.index() != 0 {
-                self.book[pos.index()] = Grant::Vacant;
-                self.directory.vacate(pos);
+    /// positions return to Vacant, then the permit's position, the lowest
+    /// Vacant one now, is Reserved, its Declared staged for step 7.
+    fn grant(&mut self, permit: GrantPermit, id: NsId) {
+        let GrantPermit { pos, reclaimable } = permit;
+        for at in self.directory.positions() {
+            if reclaimable.0 & 1 << at.index() != 0 {
+                self.book[at.index()] = Grant::Vacant;
+                self.directory.vacate(at);
             }
         }
-        let vacant = self.directory.positions().find(|pos| self.book[pos.index()] == Grant::Vacant);
-        let Some(pos) = vacant else {
-            unreachable!("an accepted tiered CREATE found no Vacant grant position");
-        };
+        debug_assert_eq!(self.book[pos.index()], Grant::Vacant, "a permit names a free position");
         self.book[pos.index()] = Grant::Reserved(id);
         self.directory.reserve(pos, id.0);
         self.directory.stage_declared(pos, id.0);
@@ -2109,29 +2118,28 @@ impl CatalogWriter {
         let taken = self.epochs.take_numbered(req.numbered);
         let min_published = self.handle.ckpt_board().min_published();
         let CatalogRequest { intent, export, slot, .. } = req;
-        let reclaimable = self.reclaimable(intent.as_ref());
+        let room = self.tiered_room(intent.as_ref());
         let fold = self.fold_at(min_published);
-        let verdict = self.decide(intent.as_ref(), &export, fold, reclaimable);
-        match verdict {
-            DdlVerdict::Accepted => {}
-            DdlVerdict::Refused(_) => {
+        let permit = match self.decide(intent.as_ref(), &export, fold, room) {
+            Ok(permit) => permit,
+            Err(refusal) => {
                 if cfg!(inf_canary_ns_refusal_writes_meta) {
                     write_meta(fs, data_dir, &self.shape(export).encode())?;
                 }
                 self.publish_gauges();
                 let published = self.grants.publish();
-                self.epochs.answer(taken, slot, verdict, published);
+                self.epochs.answer(taken, slot, DdlVerdict::Refused(refusal), published);
                 return Ok(());
             }
-        }
+        };
         self.tombstones.retire(min_published);
         let adds_slot = self.adds_slot(intent.as_ref());
         let payload = if cfg!(inf_canary_ns_intent_after_shape) {
             let payload = self.shape(export).encode();
-            self.accept(intent, reclaimable);
+            self.accept(intent, permit);
             payload
         } else {
-            self.accept(intent, reclaimable);
+            self.accept(intent, permit);
             self.shape(export).encode()
         };
         self.assert_capacity(adds_slot);
@@ -2148,17 +2156,16 @@ impl CatalogWriter {
         Ok(())
     }
 
-    /// Step 1's reclaim scan, for a tiered `CREATE` only (ADR-0148 D4): a
-    /// readiness persist, a `SET`, a `DROP` or a `CREATE` with no tier pays
-    /// no receipt load.
-    fn reclaimable(&self, intent: Option<&DdlIntent>) -> Reclaimable {
+    /// Step 1's reclaim scan and room, for a tiered `CREATE` only (ADR-0148
+    /// D4): its grant's permit, or why every position is held. A readiness
+    /// persist, a `SET`, a `DROP` or a `CREATE` with no tier pays no receipt
+    /// load and holds no permit.
+    fn tiered_room(&self, intent: Option<&DdlIntent>) -> Result<Option<GrantPermit>, TieredHeld> {
         match intent {
             Some(DdlIntent::Create { spec, .. }) if spec.tier.is_some() => {
-                self.grants.reclaimable()
+                self.grants.room().map(Some)
             }
-            Some(DdlIntent::Create { .. } | DdlIntent::Drop { .. }) | None => {
-                Reclaimable::default()
-            }
+            Some(DdlIntent::Create { .. } | DdlIntent::Drop { .. }) | None => Ok(None),
         }
     }
 
@@ -2216,18 +2223,20 @@ impl CatalogWriter {
     /// fold: the first row of ADR-0189 D3's table that holds, after a
     /// `CREATE`'s own check that its reserved id is the counter's next
     /// (ADR-0148 D4). A tiered `CREATE` meets the grant book's row after
-    /// `NameExists` and before the tombstone cap (ADR-0148 D2), with step
-    /// 1's `reclaimable` positions counted free. The cap's rows (D6) refuse
+    /// `NameExists` and before the tombstone cap (ADR-0148 D2): step 1's
+    /// `room`, which carries the grant's permit into an acceptance or why
+    /// every position is held into the refusal. The cap's rows (D6) refuse
     /// a durable `CREATE` and a `DROP` that leaves a tombstone, a
-    /// rollback's never.
+    /// rollback's never. `Ok` is the acceptance, with the permit a tiered
+    /// `CREATE` takes its grant by.
     fn decide(
         &self,
         intent: Option<&DdlIntent>,
         export: &NsCatalog,
         fold: BookFold,
-        reclaimable: Reclaimable,
-    ) -> DdlVerdict {
-        let Some(intent) = intent else { return DdlVerdict::Accepted };
+        room: Result<Option<GrantPermit>, TieredHeld>,
+    ) -> Result<Option<GrantPermit>, DdlRefusal> {
+        let Some(intent) = intent else { return Ok(None) };
         match intent {
             DdlIntent::Create { spec, reserved } => {
                 let next = self.handle.next_ns_id();
@@ -2236,60 +2245,54 @@ impl CatalogWriter {
                 let not_next = reserved.0 != next && !cfg!(inf_canary_ns_id_spent_on_refusal);
                 let spent = next == NS_IDS_EXHAUSTED && !cfg!(inf_canary_ns_id_wraps);
                 if *reserved != spec.id || not_next || spent {
-                    return DdlVerdict::Refused(DdlRefusal::IdNotNext);
+                    return Err(DdlRefusal::IdNotNext);
                 }
                 if self.pending.is_some() {
-                    return DdlVerdict::Refused(DdlRefusal::PendingConflict);
+                    return Err(DdlRefusal::PendingConflict);
                 }
                 let taken = export
                     .entries
                     .iter()
                     .any(|e| e.name == spec.name && !self.tombstones.contains(e.id.0));
                 if taken {
-                    return DdlVerdict::Refused(DdlRefusal::NameExists);
+                    return Err(DdlRefusal::NameExists);
                 }
-                if spec.tier.is_some()
-                    && let Some(held) = self.grants.held(reclaimable)
-                {
-                    return DdlVerdict::Refused(DdlRefusal::TieredCapacity(held));
-                }
+                let permit = room.map_err(DdlRefusal::TieredCapacity)?;
                 match fold.held() {
                     Some(held) if spec.mode == NsMode::Durable => {
-                        DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(held))
+                        Err(DdlRefusal::TombstoneCapacity(held))
                     }
-                    Some(_) | None => DdlVerdict::Accepted,
+                    Some(_) | None => Ok(permit),
                 }
             }
             DdlIntent::Drop { id, tombstone } => match &self.pending {
                 // A rollback replaces its own `CREATE`, whose reservation
                 // pays for its tombstone: never refused.
-                Some(PendingDdl::Create(spec)) if spec.id == *id => DdlVerdict::Accepted,
+                Some(PendingDdl::Create(spec)) if spec.id == *id => Ok(None),
                 Some(PendingDdl::Create(_) | PendingDdl::Drop(_)) => {
-                    DdlVerdict::Refused(DdlRefusal::PendingConflict)
+                    Err(DdlRefusal::PendingConflict)
                 }
                 None => match fold.held() {
-                    Some(held) if *tombstone => {
-                        DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(held))
-                    }
-                    Some(_) | None => DdlVerdict::Accepted,
+                    Some(held) if *tombstone => Err(DdlRefusal::TombstoneCapacity(held)),
+                    Some(_) | None => Ok(None),
                 },
             },
         }
     }
 
     /// An accepted request's state change (infallible): a `CREATE` commits
-    /// its id, a tiered one takes its grant (the reclaimed positions
-    /// returned first), and it becomes the pending DDL; a `DROP` flips the
-    /// namespace's grant to Retiring and becomes the pending DDL (a
-    /// rollback's `DROP` replaces its `CREATE`), and a durable drop's
-    /// tombstone joins the set, unstamped.
-    fn accept(&mut self, intent: Option<DdlIntent>, reclaimable: Reclaimable) {
+    /// its id, a tiered one takes its grant at its verdict's permit (the
+    /// reclaimed positions returned first), and it becomes the pending DDL;
+    /// a `DROP` flips the namespace's grant to Retiring and becomes the
+    /// pending DDL (a rollback's `DROP` replaces its `CREATE`), and a
+    /// durable drop's tombstone joins the set, unstamped.
+    fn accept(&mut self, intent: Option<DdlIntent>, permit: Option<GrantPermit>) {
         match intent {
             None => {}
             Some(DdlIntent::Create { spec, .. }) => {
                 self.commit_ns_id(spec.id);
-                if spec.tier.is_some() {
-                    self.grants.grant(reclaimable, spec.id);
+                if let Some(permit) = permit {
+                    self.grants.grant(permit, spec.id);
                 }
                 self.pending = Some(PendingDdl::Create(spec));
             }
@@ -2910,15 +2913,18 @@ mod drop_tombstone_tests {
     }
 
     impl CatalogWriter {
-        /// `decide` for a request that read no reclaim: every row but a
-        /// tiered `CREATE`'s, and that one with nothing reclaimable.
-        fn decide_unreclaimed(
+        /// `decide` with step 1's room read as `answer` reads it, its
+        /// result as the verdict the epoch carries.
+        fn decide_as_answered(
             &self,
             intent: Option<&DdlIntent>,
             export: &NsCatalog,
             fold: BookFold,
         ) -> super::DdlVerdict {
-            self.decide(intent, export, fold, super::Reclaimable::default())
+            match self.decide(intent, export, fold, self.tiered_room(intent)) {
+                Ok(_) => super::DdlVerdict::Accepted,
+                Err(refusal) => super::DdlVerdict::Refused(refusal),
+            }
         }
     }
 
@@ -3154,31 +3160,31 @@ mod drop_tombstone_tests {
         let w = writer_with_book(cap, |i| if i == 0 { 5 } else { 9 });
         let fold = w.fold_at(5);
         assert_eq!(fold, BookFold { live: 256, ready: 1, paceable: 255, blocked: 0 });
-        assert_eq!(w.decide_unreclaimed(Some(&durable(&w, 40)), &export, fold), accepted);
-        assert_eq!(w.decide_unreclaimed(Some(&drop_of(16, true)), &export, fold), accepted);
+        assert_eq!(w.decide_as_answered(Some(&durable(&w, 40)), &export, fold), accepted);
+        assert_eq!(w.decide_as_answered(Some(&drop_of(16, true)), &export, fold), accepted);
         // Paceable: every one stamped past the fold, none ready.
         let fold = w.fold_at(4);
-        assert_eq!(w.decide_unreclaimed(Some(&durable(&w, 40)), &export, fold), paceable);
-        assert_eq!(w.decide_unreclaimed(Some(&drop_of(16, true)), &export, fold), paceable);
+        assert_eq!(w.decide_as_answered(Some(&durable(&w, 40)), &export, fold), paceable);
+        assert_eq!(w.decide_as_answered(Some(&drop_of(16, true)), &export, fold), paceable);
         assert_eq!(
-            w.decide_unreclaimed(Some(&memory(&w, 40)), &export, fold),
+            w.decide_as_answered(Some(&memory(&w, 40)), &export, fold),
             accepted,
             "a memory CREATE"
         );
         assert_eq!(
-            w.decide_unreclaimed(Some(&drop_of(16, false)), &export, fold),
+            w.decide_as_answered(Some(&drop_of(16, false)), &export, fold),
             accepted,
             "no tombstone"
         );
         // One paceable beside 255 blocked still paces: 256 − 1 + 1 ≤ 256.
         let w = writer_with_book(cap, |i| if i == 0 { 9 } else { 0 });
-        assert_eq!(w.decide_unreclaimed(Some(&durable(&w, 40)), &export, w.fold_at(4)), paceable);
+        assert_eq!(w.decide_as_answered(Some(&durable(&w, 40)), &export, w.fold_at(4)), paceable);
         // Every one blocked: an operator, or a restart's re-stamp, frees one.
         let w = writer_with_book(cap, |_| 0);
         let fold = w.fold_at(u64::MAX);
         assert_eq!(fold, BookFold { live: 256, ready: 0, paceable: 0, blocked: 256 });
-        assert_eq!(w.decide_unreclaimed(Some(&durable(&w, 40)), &export, fold), limit);
-        assert_eq!(w.decide_unreclaimed(Some(&drop_of(16, true)), &export, fold), limit);
+        assert_eq!(w.decide_as_answered(Some(&durable(&w, 40)), &export, fold), limit);
+        assert_eq!(w.decide_as_answered(Some(&drop_of(16, true)), &export, fold), limit);
         // Busy's row, on a fold no book of this slice makes.
         let busy = BookFold { live: 300, ready: 0, paceable: 0, blocked: 255 };
         assert_eq!(busy.held(), Some(TombstoneHeld::Busy));
@@ -3186,18 +3192,18 @@ mod drop_tombstone_tests {
         // the 256th slot; its rollback's drop takes it over.
         let mut w = writer_with_book(cap - 1, |_| 0);
         let fold = w.fold_at(u64::MAX);
-        assert_eq!(w.decide_unreclaimed(Some(&durable(&w, 40)), &export, fold), accepted);
+        assert_eq!(w.decide_as_answered(Some(&durable(&w, 40)), &export, fold), accepted);
         let intent = durable(&w, 40);
-        w.accept(Some(intent), super::Reclaimable::default());
+        w.accept(Some(intent), None);
         w.assert_capacity(true);
         let fold = w.fold_at(u64::MAX);
         assert_eq!(
-            w.decide_unreclaimed(Some(&drop_of(40, true)), &export, fold),
+            w.decide_as_answered(Some(&drop_of(40, true)), &export, fold),
             accepted,
             "the rollback"
         );
         assert!(!w.adds_slot(Some(&drop_of(40, true))), "it takes over the reservation");
-        w.accept(Some(drop_of(40, true)), super::Reclaimable::default());
+        w.accept(Some(drop_of(40, true)), None);
         w.assert_capacity(false);
         assert_eq!(w.tombstones.len(), DROPPED_NS_MAX, "the rollback's tombstone is the 256th");
     }
@@ -3212,7 +3218,7 @@ mod drop_tombstone_tests {
         let mut w = writer_with_book(cap, |_| 0);
         let planted = DdlIntent::Drop { id: inf_log::NsId(40), tombstone: true };
         assert!(w.adds_slot(Some(&planted)));
-        w.accept(Some(planted), super::Reclaimable::default());
+        w.accept(Some(planted), None);
         w.assert_capacity(true);
     }
 
@@ -3235,10 +3241,7 @@ mod drop_tombstone_tests {
         for index in 0..u32::try_from(DROPPED_NS_MAX).expect("256") {
             w.tombstones.add(400 + index);
         }
-        w.accept(
-            Some(DdlIntent::Drop { id: inf_log::NsId(40), tombstone: true }),
-            super::Reclaimable::default(),
-        );
+        w.accept(Some(DdlIntent::Drop { id: inf_log::NsId(40), tombstone: true }), None);
         w.assert_capacity(true);
     }
 
@@ -3281,42 +3284,42 @@ mod drop_tombstone_tests {
         let drop_of = |id: u32| DdlIntent::Drop { id: inf_log::NsId(id), tombstone: true };
         let export = catalog(vec![entry(16)]);
         let fold = w.fold_at(0);
-        assert_eq!(w.decide_unreclaimed(None, &export, fold), super::DdlVerdict::Accepted);
+        assert_eq!(w.decide_as_answered(None, &export, fold), super::DdlVerdict::Accepted);
         let mut taken = entry(40);
         taken.name = b"ns16".to_vec();
         let name_exists = super::DdlVerdict::Refused(DdlRefusal::NameExists);
         assert_eq!(
-            w.decide_unreclaimed(Some(&create(&w, taken.clone())), &export, fold),
+            w.decide_as_answered(Some(&create(&w, taken.clone())), &export, fold),
             name_exists
         );
         w.tombstones.add(16);
         assert_eq!(
-            w.decide_unreclaimed(Some(&create(&w, taken)), &export, w.fold_at(0)),
+            w.decide_as_answered(Some(&create(&w, taken)), &export, w.fold_at(0)),
             super::DdlVerdict::Accepted,
             "a tombstoned id's lagging entry holds no name"
         );
         let fold = w.fold_at(0);
         assert_eq!(
-            w.decide_unreclaimed(Some(&create(&w, entry(41))), &export, fold),
+            w.decide_as_answered(Some(&create(&w, entry(41))), &export, fold),
             super::DdlVerdict::Accepted
         );
         let intent = create(&w, entry(41));
-        w.accept(Some(intent), super::Reclaimable::default());
+        w.accept(Some(intent), None);
         assert_eq!(w.handle.next_ns_id(), 42, "the acceptance commits the id");
         let conflict = super::DdlVerdict::Refused(DdlRefusal::PendingConflict);
         let fold = w.fold_at(0);
-        assert_eq!(w.decide_unreclaimed(Some(&create(&w, entry(42))), &export, fold), conflict);
-        assert_eq!(w.decide_unreclaimed(Some(&drop_of(42)), &export, fold), conflict);
+        assert_eq!(w.decide_as_answered(Some(&create(&w, entry(42))), &export, fold), conflict);
+        assert_eq!(w.decide_as_answered(Some(&drop_of(42)), &export, fold), conflict);
         assert_eq!(
-            w.decide_unreclaimed(Some(&drop_of(41)), &export, fold),
+            w.decide_as_answered(Some(&drop_of(41)), &export, fold),
             super::DdlVerdict::Accepted,
             "the rollback's drop of its own pending CREATE"
         );
-        w.accept(Some(drop_of(41)), super::Reclaimable::default());
+        w.accept(Some(drop_of(41)), None);
         let replaced = matches!(w.pending, Some(PendingDdl::Drop(id)) if id.0 == 41);
         assert!(replaced, "the drop replaced it");
         assert!(w.tombstones.contains(41));
-        assert_eq!(w.decide_unreclaimed(Some(&drop_of(41)), &export, w.fold_at(0)), conflict);
+        assert_eq!(w.decide_as_answered(Some(&drop_of(41)), &export, w.fold_at(0)), conflict);
     }
 
     /// ADR-0148 D4 at the writer: a `CREATE` whose reserved id is not the
@@ -3332,25 +3335,25 @@ mod drop_tombstone_tests {
         let stale = DdlIntent::Create { reserved: entry(next - 1).id, spec: entry(next - 1) };
         let fold = w.fold_at(0);
         assert_eq!(
-            w.decide_unreclaimed(Some(&stale), &export, fold),
+            w.decide_as_answered(Some(&stale), &export, fold),
             not_next,
             "an id below the counter"
         );
         let ahead = DdlIntent::Create { reserved: entry(next + 1).id, spec: entry(next + 1) };
         assert_eq!(
-            w.decide_unreclaimed(Some(&ahead), &export, fold),
+            w.decide_as_answered(Some(&ahead), &export, fold),
             not_next,
             "an id past the counter"
         );
         let mismatched = DdlIntent::Create { reserved: entry(next).id, spec: entry(next + 1) };
         assert_eq!(
-            w.decide_unreclaimed(Some(&mismatched), &export, fold),
+            w.decide_as_answered(Some(&mismatched), &export, fold),
             not_next,
             "a spec of another id"
         );
         let exhausted = create(&w, entry(super::NS_IDS_EXHAUSTED));
         assert_eq!(
-            w.decide_unreclaimed(Some(&exhausted), &export, fold),
+            w.decide_as_answered(Some(&exhausted), &export, fold),
             not_next,
             "a counter with none left"
         );
@@ -3363,7 +3366,7 @@ mod drop_tombstone_tests {
     fn a_notice_retires_only_its_own_kind_and_id() {
         let mut w = writer();
         let intent = create(&w, entry(40));
-        w.accept(Some(intent), super::Reclaimable::default());
+        w.accept(Some(intent), None);
         let (ns40, ns41) = (inf_log::NsId(40), inf_log::NsId(41));
         w.notice(DdlNotice::DropFanned { id: ns40, stamp: Some(7) });
         w.notice(DdlNotice::CreateApplied { id: ns41 });
@@ -3372,10 +3375,7 @@ mod drop_tombstone_tests {
         w.notice(DdlNotice::CreateApplied { id: ns40 });
         assert!(w.pending.is_none());
         assert_eq!(w.handle.ddl_pending(), 0);
-        w.accept(
-            Some(DdlIntent::Drop { id: ns40, tombstone: true }),
-            super::Reclaimable::default(),
-        );
+        w.accept(Some(DdlIntent::Drop { id: ns40, tombstone: true }), None);
         w.notice(DdlNotice::DropFanned { id: ns40, stamp: Some(7) });
         assert!(w.pending.is_none());
         assert_eq!(w.tombstones.entries, vec![stone(40, 7)], "the notice's stamp");
