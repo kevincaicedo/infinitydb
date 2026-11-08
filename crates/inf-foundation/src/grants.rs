@@ -518,10 +518,18 @@ mod loom_tests {
         assert!(reclaims > 0, "VACUOUS: no reclaim read both receipts");
     }
 
+    /// Executions in which the cell's pass read the reused grant Retiring
+    /// and wrote its receipt, and those in which its receipt stayed the old
+    /// one while the writer's reclaim of the reused grant ran.
+    static REUSE_RECEIPTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static REUSE_OLD_KEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     /// A stale observation across reuse: a cell that last saw the position
     /// Retiring(16) and published 16 meets the position reclaimed and
     /// granted to 17 while it passes; whatever its pass reads, the writer's
-    /// reclaim of 17 never accepts the 16.
+    /// reclaim of 17 never accepts the 16. Both outcomes of the pass are
+    /// reached: one that read Retiring(17) and wrote its receipt, one that
+    /// kept the old receipt under the reclaim.
     #[test]
     fn loom_an_old_receipt_never_reclaims_a_reused_position() {
         loom::model(|| {
@@ -550,7 +558,13 @@ mod loom_tests {
             let _writer = reuse.join().expect("writer");
             let reclaimed = board.all_name(pos, 17);
             let named = receipts.receipt(pos);
+            let reached = if named == 17 { &REUSE_RECEIPTED } else { &REUSE_OLD_KEPT };
+            reached.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             assert!(!reclaimed || named == 17, "the reclaim of 17 accepted receipt {named}");
         });
+        let receipted = REUSE_RECEIPTED.load(std::sync::atomic::Ordering::Relaxed);
+        let kept = REUSE_OLD_KEPT.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(receipted > 0, "VACUOUS: no pass read the reused grant Retiring");
+        assert!(kept > 0, "VACUOUS: no reclaim of the reused grant met the old receipt");
     }
 }
