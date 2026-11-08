@@ -159,7 +159,9 @@ LINTS = {
     "arithmetic_side_effects": ("fn", ("bound:",)),
     # ADR-0125 D2's opt-out, audited here since the ratchet absorbed it.
     "too_many_lines": ("fn", ("shape:",)),
-    "disallowed_methods": ("statement", ("clock:", "fs-seam:", "boot:", "control-thread:")),
+    # ADR-0202 D7: `listing:` names a whole directory listing's directory
+    # and its population's bound.
+    "disallowed_methods": ("statement", ("clock:", "fs-seam:", "boot:", "control-thread:", "listing:")),
     "disallowed_types": ("item", ("fs-seam:", "boot:", "control-thread:", "container:")),
     # ADR-0144 A2: a reservation is consumed before any await; no class, so
     # no allow. clippy.toml's `await-holding-invalid-types` lists the types.
@@ -748,8 +750,11 @@ if diagnostics:
             "libc::clock_gettime", "libc::gettimeofday", "libc::time"
         }
         container = code == "disallowed_types" and path in CONTAINER_PATHS
+        # ADR-0202 D7: clippy.toml's `inf_log::` entries are whole listings.
+        listing = path.startswith("inf_log::")
         classes = ({"fs-seam", "boot", "control-thread"} if fs else
-                   {"clock"} if clock else {"container"} if container else set())
+                   {"clock"} if clock else {"container"} if container else
+                   {"listing"} if listing else set())
         for span in d["spans"]:
             file, line = span["file_name"], span["line_start"]
             if Path(file).is_absolute() and Path(file).is_relative_to(Path.cwd()):
@@ -1259,14 +1264,17 @@ pwork=$(mktemp -d "$WS_ROOT/target/lint-scope-probe.XXXXXX")
 [ -n "$pwork" ] && [ -d "$pwork" ] || { echo "LINT-SCOPES SCOPE ERROR: mktemp failed"; exit 2; }
 trap '[ -n "$pwork" ] && [ -d "$pwork" ] && rm -rf "$pwork"' EXIT
 cp -R "$PROBE_SRC/." "$pwork/probe"
-# The await and discard plants hold the engine's own slot types: the copy
-# depends on crates/inf-foundation by the workspace's absolute path.
-[ -f "$WS_ROOT/crates/inf-foundation/Cargo.toml" ] ||
-    { echo "LINT-SCOPES SCOPE ERROR: $WS_ROOT/crates/inf-foundation is missing; the probe's slot plants need it"; exit 1; }
-sed -i.bak "s|path = \"../../crates/inf-foundation\"|path = \"$WS_ROOT/crates/inf-foundation\"|" "$pwork/probe/Cargo.toml"
-rm -f "$pwork/probe/Cargo.toml.bak"
-grep -q "path = \"$WS_ROOT/crates/inf-foundation\"" "$pwork/probe/Cargo.toml" ||
-    { echo "LINT-SCOPES SCOPE ERROR: the probe's inf-foundation dependency was not rewritten to $WS_ROOT"; exit 1; }
+# The await and discard plants hold the engine's own slot types, and the
+# listing plants call its whole listings (ADR-0202 D7): the copy depends on
+# crates/inf-foundation and crates/inf-log by the workspace's absolute path.
+for crate in inf-foundation inf-log; do
+    [ -f "$WS_ROOT/crates/$crate/Cargo.toml" ] ||
+        { echo "LINT-SCOPES SCOPE ERROR: $WS_ROOT/crates/$crate is missing; the probe's plants need it"; exit 1; }
+    sed -i.bak "s|path = \"../../crates/$crate\"|path = \"$WS_ROOT/crates/$crate\"|" "$pwork/probe/Cargo.toml"
+    rm -f "$pwork/probe/Cargo.toml.bak"
+    grep -q "path = \"$WS_ROOT/crates/$crate\"" "$pwork/probe/Cargo.toml" ||
+        { echo "LINT-SCOPES SCOPE ERROR: the probe's $crate dependency was not rewritten to $WS_ROOT"; exit 1; }
+done
 # Fixture mutations may supply their own config; both judges read the exact
 # config Clippy uses. The shipped probe inherits the production config.
 if [ ! -f "$pwork/probe/clippy.toml" ]; then

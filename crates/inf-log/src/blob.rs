@@ -930,6 +930,7 @@ pub fn unlink_quarantined_file<F: SegmentFs>(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: a whole listing of a fixture directory")]
 mod tests {
     use super::*;
     use crate::fs::mem::MemFs;

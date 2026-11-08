@@ -276,6 +276,10 @@ impl<F: SegmentFs> CkptCell<F> {
     /// rotor-prealloc metadata class). `.ick.new` orphans from a crashed
     /// walk are left in place; S11's manifest GC owns their removal.
     pub fn new(fs: F, dir: PathBuf, cell: u16, cfg: CkptConfig) -> io::Result<CkptCell<F>> {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "listing: ckpt/: the named checkpoint, ones a cut left and .ick.new orphans"
+        )]
         let next_id = fs
             .list_dir(&dir)?
             .iter()
@@ -1070,6 +1074,10 @@ impl<F: SegmentFs> ManifestCell<F> {
     /// One dir listing per publish: every `.ick` the new manifest does not
     /// name and every `.ick.new` orphan joins the bounded unlink queue.
     fn fill_gc_queue(&mut self) {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "listing: ckpt/: the named checkpoint, ones a cut left and .ick.new orphans"
+        )]
         let Ok(names) = self.fs.list_dir(&self.ckpt_dir) else {
             return; // listing failure: orphans wait for the next boot GC
         };
@@ -1128,6 +1136,7 @@ impl<F: SegmentFs> ManifestCell<F> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: a whole listing of a fixture directory")]
 mod tests {
     use super::*;
     use inf_foundation::time::Nanos;

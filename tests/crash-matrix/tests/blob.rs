@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! M4-S17 blob-extent crash rows (ADR-0061 D3/D5/D9) — carried at the
 //! node tier per `m4.toml`:
 //!

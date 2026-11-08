@@ -2084,6 +2084,26 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         (resume_evidence, anchor)
     }
 
+    /// The boot GC's checkpoint half: every `.ick` the MANIFEST does not
+    /// name and every `.ick.new` orphan, removed. The listing is whole: the
+    /// directory holds the named checkpoint, the ones a cut left before
+    /// their GC and the orphans of crashed walks.
+    fn remove_ckpt_orphans(&mut self) -> io::Result<()> {
+        let named = self.manifest.as_ref().map(|m| m.ckpt_id);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "listing: ckpt/: the named checkpoint, ones a cut left and .ick.new orphans"
+        )]
+        for name in self.fs().list_dir(&self.ckpt_dir)? {
+            let stale_ick = parse_ick_file_name(&name).is_some_and(|id| Some(id) != named);
+            if stale_ick || name.ends_with(".ick.new") {
+                self.fs().remove_file(&self.ckpt_dir.join(name))?;
+                self.stats.stale_files_removed += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// The rest of the finish once replay's state is handed over: the
     /// begin guard, the torn-tail truncation, the boot GC and the rotor
     /// reopened at the resume point under the resumed life's epoch.
@@ -2134,14 +2154,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             self.fs().remove_file(&self.log_dir.join(segment_file_name(stale)))?;
             self.stats.stale_files_removed += 1;
         }
-        let named = self.manifest.as_ref().map(|m| m.ckpt_id);
-        for name in self.fs().list_dir(&self.ckpt_dir)? {
-            let stale_ick = parse_ick_file_name(&name).is_some_and(|id| Some(id) != named);
-            if stale_ick || name.ends_with(".ick.new") {
-                self.fs().remove_file(&self.ckpt_dir.join(name))?;
-                self.stats.stale_files_removed += 1;
-            }
-        }
+        self.remove_ckpt_orphans()?;
 
         let fs = self.fs.take().expect("fs present");
         let scan = self.scan.as_ref().expect("scan set");

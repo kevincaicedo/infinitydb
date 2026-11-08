@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! M4.5-S06 sidecar recovery-unit crash rows (ADR-0078; the ADR-0073 D6
 //! damage taxonomy made executable at the recovery-driver tier):
 //!

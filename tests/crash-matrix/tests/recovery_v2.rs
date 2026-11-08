@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! M4-S12 recovery-unit crash rows (`m4.toml`, ADR-0057 D5/D6/D8): the
 //! windows between tier flush, MANIFEST v2 publication, and recovery.
 //! Each test injects its named failure, the process "dies" (state

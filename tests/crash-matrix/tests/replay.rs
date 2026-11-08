@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! Boot replay's fault rows (ADR-0174 D1, D2, D3, D5) — carried at the
 //! node tier per `m4.toml`:
 //!

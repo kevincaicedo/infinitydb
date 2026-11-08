@@ -2048,10 +2048,13 @@ mkdir -p "$LS_GATE/crates"
 cp -R "$SCRIPT_DIR" "$LS_GATE/scripts"
 cp rust-toolchain.toml clippy.toml "$LS_GATE/"
 # The probe's slot plants depend on the engine's inf-foundation (ADR-0144
-# A2): the gate copy resolves it under its own root, with a workspace whose
-# members are that crate alone (its manifest inherits from the workspace).
-cp -R crates/inf-foundation "$LS_GATE/crates/inf-foundation"
-rm -rf "$LS_GATE/crates/inf-foundation/fuzz"
+# A2) and its listing plants on inf-log (ADR-0202 D7): the gate copy
+# resolves them under its own root, with a workspace whose members are those
+# crates and inf-log's own (each manifest inherits from the workspace).
+for ls_crate in inf-foundation inf-simd inf-log; do
+    cp -R "crates/$ls_crate" "$LS_GATE/crates/$ls_crate"
+    rm -rf "$LS_GATE/crates/$ls_crate/fuzz"
+done
 sed 's|^members = .*|members = ["crates/*"]|' Cargo.toml >"$LS_GATE/Cargo.toml"
 grep -q '^members = \["crates/\*"\]$' "$LS_GATE/Cargo.toml" ||
     { echo "selftest: the gate copy's workspace members were not rewritten" >&2; exit 2; }
@@ -2240,6 +2243,26 @@ ls_api_diag std::fs::read 2
 expect red "lint-scopes: clock function cannot hide a filesystem call" ls_api_run
 ls_api_diag std::thread::sleep 2
 expect red "lint-scopes: clock function cannot hide a blocking sleep" ls_api_run
+# ADR-0202 D7: a whole listing is allowed only under `listing:`, and
+# `listing:` admits no other API.
+ls_case green "listing statement fixture" 'pub fn f(fs: &F) {
+    #[allow(clippy::disallowed_methods, reason = "listing: ckpt/: the named checkpoint and orphans")]
+    let _ = fs.list_dir(dir);
+}'
+ls_api_diag inf_log::fs::SegmentFs::list_dir 2
+expect green "lint-scopes: a whole listing under listing" ls_api_run
+ls_case green "boot statement over a listing fixture" 'pub fn f(fs: &F) {
+    #[allow(clippy::disallowed_methods, reason = "boot: a whole directory")]
+    let _ = fs.list_dir(dir);
+}'
+ls_api_diag inf_log::fs::SegmentFs::list_dir 2
+expect red "lint-scopes: a boot allow cannot hide a whole listing" ls_api_run
+ls_case green "listing statement over a filesystem call fixture" 'pub fn f() {
+    #[allow(clippy::disallowed_methods, reason = "listing: ckpt/: a fixture bound")]
+    let _ = std::fs::read("config");
+}'
+ls_api_diag std::fs::read 2
+expect red "lint-scopes: a listing allow cannot hide a filesystem call" ls_api_run
 for group in clippy::pedantic clippy::restriction clippy::style clippy::all warnings; do
     ls_case red "group suppression $group" "#[allow($group)]
 pub fn f() {}"

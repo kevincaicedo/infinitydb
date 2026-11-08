@@ -196,6 +196,10 @@ pub fn scan_log_dir_from<F: SegmentFs>(
     log_dir: &Path,
     floor: SegmentId,
 ) -> Result<ScanOutcome, ScanError> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "listing: log/: one name per segment of the retained log; a foreign one refuses"
+    )]
     let names = fs
         .list_dir(log_dir)
         .map_err(|err| ScanError::Io { path: log_dir.to_path_buf(), kind: err.kind() })?;

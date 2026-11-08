@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! The recovery driver stepping a demoting boot, at the server tier
 //! (ADR-0174 D1, R10, D6): `Recovery::step` under a byte budget
 //! over a tiered tail of several RAM windows, whose last window rewrites

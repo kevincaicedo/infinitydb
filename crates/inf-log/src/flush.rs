@@ -2318,6 +2318,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: a whole listing of a fixture directory")]
 mod boot_tests {
     use std::path::Path;
 

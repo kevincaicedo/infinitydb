@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! M4-S17 — blob-extent reference counting (plan AC 3, ADR-0061): random
 //! create/overwrite/delete storms over mixed inline + out-of-line values,
 //! with real (MemFs) extent files, the real flush pipeline demoting the
