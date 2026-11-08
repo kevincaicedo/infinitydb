@@ -5,7 +5,9 @@
 //! the catalog writer's answer through its own token and owes the writer
 //! a notice once its fan is done (ADR-0189 D2, D5).
 
-use inf_store::ddl::{Answer, CreatePersisted, DdlRefusal, DropPersisted, Receipt, Requested};
+use inf_store::ddl::{
+    Answer, CreatePersisted, DdlRefusal, DropPersisted, Receipt, Requested, TombstoneHeld,
+};
 use inf_wire::{Domain, Refusal};
 
 use super::*;
@@ -99,20 +101,74 @@ fn reserve_ns_units<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 }
 
 /// A CREATE's admission, before any effect: a durable namespace needs this
-/// node's durable storage and reserves its two units, the rollback's
-/// cleanup and the pacing unit, which a CREATE never spends (ADR-0159 D2).
+/// node's durable storage and reserves its two units, the pacing unit the
+/// tombstone cap may spend (ADR-0189 D6) and the rollback's cleanup
+/// (ADR-0159 D2).
 fn admit_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     mode: NsMode,
-) -> Result<NsCleanup, OwnedReply> {
+) -> Result<(Option<Admission>, NsCleanup), OwnedReply> {
     if mode == NsMode::Durable && shared.durable.borrow().is_none() {
         let refusal = "ERR this node has no durable storage (start infinityd with a data dir)";
         return Err(error_reply(shared, proto, refusal));
     }
     match reserve_ns_units(shared, mode) {
-        Ok((_pacing, cleanup)) => Ok(cleanup),
+        Ok((pacing, cleanup)) => Ok((pacing.map(Admission::First), cleanup)),
         Err(refusal) => Err(refusal.reply(shared, proto)),
+    }
+}
+
+/// A durable DDL's tombstone admission (ADR-0189 D6, N14): `First` holds
+/// the pacing unit reserved before any effect, and the pacing transition
+/// exists only from it, on the writer's `Paceable` verdict; once spent it
+/// is `Paced`, and a second `Paceable` is answered as `Busy`.
+enum Admission {
+    First(CkptCredit),
+    Paced,
+}
+
+impl Admission {
+    /// The pace on a `Paceable` refusal: in `First`, issue the pacing unit
+    /// as one all-cell checkpoint and wait until every cell published it,
+    /// as `INF.CKPT WAIT` waits, so every paceable tombstone is ready when
+    /// the program asks again; `false` once already paced (counted, never
+    /// reached: one pace suffices, ADR-0189 D6).
+    async fn pace<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        admission: &mut Option<Admission>,
+        shared: &Rc<Shared<O, F>>,
+        control: &ControlHandle,
+    ) -> bool {
+        let Some(Admission::First(unit)) = admission.take() else {
+            control.note_ddl_repaced();
+            *admission = Some(Admission::Paced);
+            return false;
+        };
+        *admission = Some(Admission::Paced);
+        control.note_ddl_paced();
+        let epoch = unit.issue(CkptTarget::All);
+        while shared.ckpt_sweep.borrow().observed().min_published < epoch.get() {
+            shared.ckpt_waiters.wait(0).await;
+        }
+        true
+    }
+
+    /// The planted canary's pace before the first request, on the gauge
+    /// word's counts (the shape the writer's verdict replaces): a pace the
+    /// writer's own fold may not need.
+    async fn pace_on_gauges<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        admission: &mut Option<Admission>,
+        shared: &Rc<Shared<O, F>>,
+        control: &ControlHandle,
+    ) {
+        let gauges = control.tombstone_gauges();
+        let after_ready = usize::from(gauges.live - gauges.ready.min(gauges.live));
+        if cfg!(inf_canary_ns_cap_from_gauges)
+            && admission.is_some()
+            && after_ready >= crate::control::DROPPED_NS_MAX
+        {
+            Admission::pace(admission, shared, control).await;
+        }
     }
 }
 
@@ -688,9 +744,14 @@ impl Drop for NoticeDue {
 
 /// The reply a DDL renders for the writer's refusal: `NameExists` as the
 /// namespace error every `CREATE` path answers; `PendingConflict` and
-/// `IdNotNext`, which the ticket makes unreachable, as internal errors.
+/// `IdNotNext`, which the ticket makes unreachable, as internal errors; the
+/// tombstone cap's (ADR-0189 D6; ADR-0172 D1) as `CapacityBusy(Catalog)`
+/// while a held slot returns without an operator, a `Paceable` the program
+/// could not pace included, and `LimitReached(Catalog)` once every held
+/// slot waits on one, each counted.
 fn ddl_refusal_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    control: &ControlHandle,
     proto: Protocol,
     refusal: DdlRefusal,
 ) -> OwnedReply {
@@ -698,6 +759,14 @@ fn ddl_refusal_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         DdlRefusal::NameExists => ns_error_reply(shared, proto, inf_store::NsError::Exists),
         DdlRefusal::PendingConflict => error_reply(shared, proto, DDL_PENDING_CONFLICT),
         DdlRefusal::IdNotNext => error_reply(shared, proto, DDL_ID_NOT_NEXT),
+        DdlRefusal::TombstoneCapacity(TombstoneHeld::Paceable | TombstoneHeld::Busy) => {
+            control.note_capacity_refused(true);
+            error_reply(shared, proto, Refusal::CapacityBusy(Domain::Catalog).render())
+        }
+        DdlRefusal::TombstoneCapacity(TombstoneHeld::Limit) => {
+            control.note_capacity_refused(false);
+            error_reply(shared, proto, Refusal::LimitReached(Domain::Catalog).render())
+        }
     }
 }
 
@@ -742,8 +811,8 @@ async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
         Ok(draft) => draft,
         Err(msg) => return error_reply(shared, proto, &msg),
     };
-    let cleanup = match admit_ns_create(shared, proto, draft.mode) {
-        Ok(cleanup) => cleanup,
+    let (mut admission, cleanup) = match admit_ns_create(shared, proto, draft.mode) {
+        Ok(admitted) => admitted,
         Err(refusal) => return refusal,
     };
     let reservation = match ticket.reserve_ns_id() {
@@ -754,15 +823,26 @@ async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     if let Err(e) = shared.store.borrow().ns_create_check(&spec) {
         return ns_error_reply(shared, proto, e);
     }
-    let export = shared.store.borrow().export_catalog(
-        control.next_ns_id(),
-        control.next_index_id(),
-        control.next_index_generation(),
-    );
-    let requested = control.request_create(export, spec.clone(), reservation);
-    let receipt = match await_answer(shared, control, requested).await {
-        Ok(receipt) => receipt,
-        Err(refusal) => return ddl_refusal_reply(shared, proto, refusal),
+    Admission::pace_on_gauges(&mut admission, shared, control).await;
+    let mut reservation = Some(reservation);
+    let receipt = loop {
+        // A refusal spent no id: the ticket reserves the same one again.
+        let reserved = match reservation.take().map_or_else(|| ticket.reserve_ns_id(), Ok) {
+            Ok(reserved) => reserved,
+            Err(refusal) => return error_reply(shared, proto, refusal.render()),
+        };
+        let export = shared.store.borrow().export_catalog(
+            control.next_ns_id(),
+            control.next_index_id(),
+            control.next_index_generation(),
+        );
+        let requested = control.request_create(export, spec.clone(), reserved);
+        match await_answer(shared, control, requested).await {
+            Ok(receipt) => break receipt,
+            Err(DdlRefusal::TombstoneCapacity(TombstoneHeld::Paceable))
+                if Admission::pace(&mut admission, shared, control).await => {}
+            Err(refusal) => return ddl_refusal_reply(shared, control, proto, refusal),
+        }
     };
     let notice = NoticeDue::created(control, &receipt);
     // Crash-matrix point (ADR-0103 D5): the on-disk state of a cut
@@ -798,27 +878,17 @@ async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
 }
 
 /// A `DROP`'s admission, before any effect (ADR-0159 D2): a durable
-/// namespace reserves its two units under the ticket, and at the tombstone
-/// cap the drop first waits for a node-wide checkpoint (the `INF.CKPT
-/// WAIT` machinery), so the writer's next accepted request retires every
-/// tombstone stamped.
-async fn admit_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+/// namespace reserves its two units under the ticket, its pacing unit for
+/// the tombstone cap, which the writer alone decides (ADR-0189 D6), and its
+/// cleanup.
+fn admit_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
-    control: &ControlHandle,
     proto: Protocol,
     mode: NsMode,
-) -> Result<NsCleanup, OwnedReply> {
+) -> Result<(Option<Admission>, NsCleanup), OwnedReply> {
     let (pacing, cleanup) =
         reserve_ns_units(shared, mode).map_err(|refusal| refusal.reply(shared, proto))?;
-    if let Some(pacing) = pacing
-        && control.drop_tombstones() >= crate::control::DROPPED_NS_MAX
-    {
-        let epoch = pacing.issue(CkptTarget::All);
-        while shared.ckpt_sweep.borrow().observed().min_published < epoch.get() {
-            shared.ckpt_waiters.wait(0).await;
-        }
-    }
-    Ok(cleanup)
+    Ok((pacing.map(Admission::First), cleanup))
 }
 
 /// `INF.NS DROP` (ADR-0189 D5): resolve the name to its spec and reserve
@@ -842,8 +912,8 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         Ok(spec) => spec.clone(),
         Err(e) => return ns_error_reply(shared, proto, e),
     };
-    let cleanup = match admit_ns_drop(shared, control, proto, spec.mode).await {
-        Ok(cleanup) => cleanup,
+    let (mut admission, cleanup) = match admit_ns_drop(shared, proto, spec.mode) {
+        Ok(admitted) => admitted,
         Err(refusal) => return refusal,
     };
     // Crash-matrix point: the on-disk state of a cut before the answer
@@ -852,16 +922,21 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     if inf_foundation::fault::fire(crate::fault::NS_DROP_BEFORE_META) {
         return error_reply(shared, proto, "ERR fault: ns_drop_before_meta");
     }
-    let export = shared.store.borrow().export_catalog(
-        control.next_ns_id(),
-        control.next_index_id(),
-        control.next_index_generation(),
-    );
-    let requested = control.request_drop(export, spec.id, cleanup.has_tombstone());
-    let receipt = match await_answer(shared, control, requested).await {
-        Ok(receipt) => receipt,
-        // Nothing was applied anywhere: every cell still serves it.
-        Err(refusal) => return ddl_refusal_reply(shared, proto, refusal),
+    Admission::pace_on_gauges(&mut admission, shared, control).await;
+    let receipt = loop {
+        let export = shared.store.borrow().export_catalog(
+            control.next_ns_id(),
+            control.next_index_id(),
+            control.next_index_generation(),
+        );
+        let requested = control.request_drop(export, spec.id, cleanup.has_tombstone());
+        match await_answer(shared, control, requested).await {
+            Ok(receipt) => break receipt,
+            Err(DdlRefusal::TombstoneCapacity(TombstoneHeld::Paceable))
+                if Admission::pace(&mut admission, shared, control).await => {}
+            // Nothing was applied anywhere: every cell still serves it.
+            Err(refusal) => return ddl_refusal_reply(shared, control, proto, refusal),
+        }
     };
     let notice = NoticeDue::dropped(control, &receipt);
     // Crash-matrix point: the on-disk state of a cut after the answer and
@@ -986,7 +1061,7 @@ async fn program_ns_set<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     let requested = control.request_set(export, id);
     match await_answer(shared, control, requested).await {
         Ok(_receipt) => simple_reply(shared, proto, "OK"),
-        Err(refusal) => ddl_refusal_reply(shared, proto, refusal),
+        Err(refusal) => ddl_refusal_reply(shared, control, proto, refusal),
     }
 }
 

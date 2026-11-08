@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use inf_foundation::fault::{self, FaultSpec, HoldGate};
 use inf_log::fs::{SegmentFs, StdSegmentFile, StdSegmentFs, TierIoMode};
 use inf_server::{CkptSpace, ControlHandle, ControlInbox, load_catalog};
-use inf_store::ddl::{Answer, CreatePersisted, DdlRefusal, Receipt, Requested};
+use inf_store::ddl::{Answer, CreatePersisted, DdlRefusal, Receipt, Requested, TombstoneHeld};
 use inf_store::{FsyncClass, IndexCatalog, NsCatalog, NsId, NsMode, NsSpec};
 
 /// The namespace the DDL creates or drops.
@@ -514,9 +514,10 @@ fn tombstoned(count: u32) -> NsCatalog {
 /// one and re-stamps them with one checkpoint no cell has yet published,
 /// so none is ready. A durable `CREATE` is then not admitted: it would hold
 /// a tombstone slot past the cap of 256 live and reserved (ADR-0189 D6,
-/// D7). Red while the writer admits every durable `CREATE`.
+/// D7); the writer answers `Paceable` and writes nothing. Once every cell
+/// publishes the boot's stamp, the same `CREATE` is accepted and every
+/// tombstone retires.
 #[test]
-#[ignore = "red until the catalog writer decides the tombstone cap at its verdict (ADR-0189 D6)"]
 fn a_durable_create_over_the_tombstone_cap_is_not_admitted_while_none_is_ready() {
     for count in [256u32, 257, 4096] {
         let dir = temp_dir(&format!("over-cap-{count}"));
@@ -538,5 +539,42 @@ fn a_durable_create_over_the_tombstone_cap_is_not_admitted_while_none_is_ready()
         );
         assert!(fs.ops().is_empty(), "the refusal touched the disk: {:?}", fs.ops());
         assert_eq!(after, before, "META's bytes moved");
+        let paceable = DdlRefusal::TombstoneCapacity(TombstoneHeld::Paceable);
+        assert_eq!(answer.map(|r| r.id()), Err(paceable), "the refusal paces");
     }
+    // Every cell publishes the boot's stamp: the same CREATE is accepted.
+    let dir = temp_dir("over-cap-drained");
+    let (control, mut inbox) = writer(&dir, Some(&tombstoned(4096)));
+    let stamp = control.ckpt_last_issued();
+    (0..2).for_each(|cell| control.ckpt_board().slot(cell).publish(stamp, 1, 1));
+    let (_, requested) = reserved_create(&control, catalog(Vec::new()), b"fresh", NsMode::Durable);
+    inbox.drain(&StdSegmentFs, &dir).expect("the drain");
+    let answer = answered(&control, requested).map(|r| r.id());
+    let held = meta(&dir).dropped.len();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(answer.is_ok(), "the drained book admits the CREATE: {answer:?}");
+    assert_eq!(held, 0, "every published-past tombstone retired");
+}
+
+/// The cap counts the slot its own admission takes (ADR-0189 D6, N7): at
+/// 256 tombstones, none ready, a durable `DROP` is refused and `META` never
+/// holds a 257th. The engagement is read from `META` before the request:
+/// the writer's fold met exactly the cap, or the test is `VACUOUS`.
+#[test]
+fn a_durable_drop_at_the_cap_writes_no_257th_tombstone() {
+    let dir = temp_dir("cap-no-257th");
+    let mut seed = tombstoned(256);
+    let victim = spec(DDL_NS + 256, b"victim", NsMode::Durable);
+    seed.entries.push(victim.clone());
+    seed.next_id = DDL_NS + 257;
+    let (control, mut inbox) = writer(&dir, Some(&seed));
+    assert_eq!(meta(&dir).dropped.len(), 256, "VACUOUS: the writer is not at the cap");
+    let requested = control.request_drop(catalog(vec![victim.clone()]), victim.id, true);
+    inbox.drain(&StdSegmentFs, &dir).expect("the drain");
+    let answer = answered(&control, requested).map(|r| r.id());
+    let held = meta(&dir).dropped.len();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(held <= 256, "META holds {held} tombstones: the cap admitted a 257th");
+    let paceable = DdlRefusal::TombstoneCapacity(TombstoneHeld::Paceable);
+    assert_eq!(answer, Err(paceable), "a durable DROP at the cap with none ready paces");
 }

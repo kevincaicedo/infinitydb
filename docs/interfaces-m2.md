@@ -1945,8 +1945,20 @@ count the arrivals that found it full.
      its `DropFanned` notice, and retired at the next accepted request
      once every cell's published epoch covers it; boot
      re-stamps survivors with one fresh request on the control writer's
-     quota. Bound `DROPPED_NS_MAX
-     = 256` — at the cap the `DROP` waits for its checkpoint first.
+     quota. Bound `DROPPED_NS_MAX = 256` live tombstones and reserved
+     slots, the writer's alone (ADR-0189 D6): a durable `CREATE`, or a
+     `DROP` that leaves a tombstone, is admitted while `live − ready + 1 ≤
+     256`; otherwise the writer refuses it before any effect with
+     `TombstoneCapacity`: `Paceable` when stamped tombstones await only
+     every cell's publication (the program issues its one pacing
+     checkpoint, waits until every cell published it and asks again),
+     `Busy` when a held slot returns without an operator (`-TRYAGAIN
+     catalog capacity in use`), `Limit` when every held slot waits on an
+     operator or a restart's re-stamp (`-ERR catalog limit reached`). A
+     rollback's drop is never refused. A boot over the cap (`T > 256`, at
+     most 4,096) seeds every tombstone under a ceiling of `max(256, T)`
+     and serves; admissions that take a slot meet the rows above until
+     the book drains.
   2. **`INF.NSFAN DROP name epoch id mode`** (6 positional args,
      ADR-0189 D5): the fan carries the epoch of the answer that drops the
      namespace, its id and its mode. Each peer builds its own receipt
@@ -1990,9 +2002,9 @@ count the arrivals that found it full.
 > its stamp and reported its `ns-N/` gone; at 256 tombstones the writer
 > alone admits, paces once or refuses. The first clause is built: the
 > writer numbers each request at dequeue and answers it through its own
-> slot after its `META` write, and a refusal writes nothing. So is the
-> second for `CREATE`, `DROP` and the `CREATE` rollback. The rest is not
-> built.
+> slot after its `META` write, and a refusal writes nothing. So are the
+> second, for `CREATE`, `DROP` and the `CREATE` rollback, and the last.
+> The rest is not built.
 
 - **M4-S19 amendment (ADR-0062) — namespace catalog v2 + the `INF.NS`
   tiering surface.**

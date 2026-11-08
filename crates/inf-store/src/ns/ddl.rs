@@ -47,6 +47,25 @@ pub enum DdlRefusal {
     /// the program answers it as an internal error. Its id is never
     /// committed (ADR-0148 D4).
     IdNotNext,
+    /// A durable `CREATE`, or a `DROP` that leaves a tombstone, found no
+    /// tombstone slot free at the writer's fold (ADR-0189 D6), and why.
+    TombstoneCapacity(TombstoneHeld),
+}
+
+/// Why the tombstone book holds every slot a durable DDL needs (ADR-0189
+/// D6), from the writer's fold at the request: the first that holds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TombstoneHeld {
+    /// Retiring the paceable tombstones makes room: every cell applied
+    /// their drops, and once every cell publishes a checkpoint issued now,
+    /// they are ready. The program paces once and asks again.
+    Paceable,
+    /// A held slot returns without an operator, but no pacing checkpoint
+    /// frees one: the client retries (`-TRYAGAIN catalog capacity in use`).
+    Busy,
+    /// Every held slot returns only after an operator acts or a restart
+    /// re-stamps it: `-ERR catalog limit reached`.
+    Limit,
 }
 
 /// A slot's verdict code: 0 is reserved for "unanswered".
@@ -54,6 +73,9 @@ const VERDICT_ACCEPTED: u8 = 1;
 const VERDICT_NAME_EXISTS: u8 = 2;
 const VERDICT_PENDING_CONFLICT: u8 = 3;
 const VERDICT_ID_NOT_NEXT: u8 = 4;
+const VERDICT_TOMBSTONE_PACEABLE: u8 = 5;
+const VERDICT_TOMBSTONE_BUSY: u8 = 6;
+const VERDICT_TOMBSTONE_LIMIT: u8 = 7;
 
 impl DdlVerdict {
     fn code(self) -> u8 {
@@ -62,6 +84,11 @@ impl DdlVerdict {
             DdlVerdict::Refused(DdlRefusal::NameExists) => VERDICT_NAME_EXISTS,
             DdlVerdict::Refused(DdlRefusal::PendingConflict) => VERDICT_PENDING_CONFLICT,
             DdlVerdict::Refused(DdlRefusal::IdNotNext) => VERDICT_ID_NOT_NEXT,
+            DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(held)) => match held {
+                TombstoneHeld::Paceable => VERDICT_TOMBSTONE_PACEABLE,
+                TombstoneHeld::Busy => VERDICT_TOMBSTONE_BUSY,
+                TombstoneHeld::Limit => VERDICT_TOMBSTONE_LIMIT,
+            },
         }
     }
 
@@ -72,6 +99,15 @@ impl DdlVerdict {
             VERDICT_NAME_EXISTS => DdlVerdict::Refused(DdlRefusal::NameExists),
             VERDICT_PENDING_CONFLICT => DdlVerdict::Refused(DdlRefusal::PendingConflict),
             VERDICT_ID_NOT_NEXT => DdlVerdict::Refused(DdlRefusal::IdNotNext),
+            VERDICT_TOMBSTONE_PACEABLE => {
+                DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Paceable))
+            }
+            VERDICT_TOMBSTONE_BUSY => {
+                DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Busy))
+            }
+            VERDICT_TOMBSTONE_LIMIT => {
+                DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Limit))
+            }
             other => unreachable!("an answered slot holds verdict code {other}"),
         }
     }
@@ -378,6 +414,9 @@ mod tests {
             DdlVerdict::Refused(DdlRefusal::NameExists),
             DdlVerdict::Refused(DdlRefusal::PendingConflict),
             DdlVerdict::Refused(DdlRefusal::IdNotNext),
+            DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Paceable)),
+            DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Busy)),
+            DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Limit)),
         ] {
             assert_eq!(DdlVerdict::from_code(verdict.code()), verdict);
         }

@@ -57,7 +57,8 @@ pub use control::{
     CkptCredit, CkptFinalCredit, CkptIssuers, CkptQuota, CkptSpace, CkptTarget, ControlHandle,
     ControlInbox, DROPPED_NS_MAX, DdlTicket, DetachedControl, INDEX_SLOTS, IndexBoard,
     IssuerMismatch, IssuerRefused, LastSave, NsIdReservation, RecoveryBoard, SweepStep,
-    load_catalog, load_catalog_from, spawn as spawn_control, spawn_in as spawn_control_in,
+    TombstoneGauges, load_catalog, load_catalog_from, spawn as spawn_control,
+    spawn_in as spawn_control_in,
 };
 pub use data_dir_lock::{DataDirLock, DataDirLockError, LOCK_FILE};
 pub use durable::{
