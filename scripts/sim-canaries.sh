@@ -739,6 +739,23 @@ rows=(
   # paces on the gauge word's ready count before it asks, a count the
   # writer folded before the cells published: the stale fold paces.
   "inf_canary_ns_cap_from_gauges crate-test inf-server test:node_e2e a_drop_at_the_cap_with_every_tombstone_ready_issues_no_pacing_checkpoint a pacing checkpoint beside its cleanup"
+  "inf_canary_ns_cap_from_gauges m2-ns-drop-window STALE-FOLD"
+  # ADR-0189 D5: the origin applies a DROP before its request, the order
+  # the receipt replaces: a checkpoint the origin publishes in the wait
+  # omits the namespace, and a cut before the answer loses its share.
+  "inf_canary_ns_apply_before_swap crate-test inf-server test:node_e2e a_checkpoint_inside_a_durable_drop_wait_keeps_every_acked_key writes acknowledged before the drop are not served"
+  "inf_canary_ns_apply_before_swap m2-ns-drop-window DROP-WINDOW-LOSS --seed 0xd0a50002"
+  # ADR-0189 D3 step 5: a pending drop is not stripped from a payload, so
+  # a lagging export inside the DROP's window keeps the namespace in META.
+  "inf_canary_ns_pending_drop_kept m2-ns-drop-window LAGGING-EXPORT-DROP"
+  # ADR-0189 D5: the rollback keeps the CREATE's notice, which posts as the
+  # rollback replaces it, and the writer matches notices by id alone: the
+  # CREATE's notice retires the rollback's drop, and a lagging export
+  # brings the namespace back.
+  "inf_canary_ns_notice_at_replacement m2-ns-drop-window LAGGING-EXPORT-ROLLBACK"
+  # The same post at replacement, kind and id matching kept: the stale
+  # notice is counted, and the DST's zero assertion goes red.
+  "inf_canary_ns_notice_posted_at_replacement m2-ns-drop-window NOTICE-STALE"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

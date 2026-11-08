@@ -286,8 +286,8 @@ fn stale_fold(
         let seed = world.seed;
         let epochs = report.stale_fold_epochs;
         report.violations.push(format!(
-            "seed {seed:#x}: the DROP at the cap issued {epochs} checkpoint epochs with every \
-             tombstone ready: it paced (the stale fold)"
+            "STALE-FOLD seed {seed:#x}: the DROP at the cap issued {epochs} checkpoint epochs \
+             with every tombstone ready: it paced"
         ));
     }
     Ok(())
@@ -314,7 +314,8 @@ fn lagging_arm(
     })?;
     lagging_export(node, 1, report);
     node.hold_inbox = false;
-    watch_window(world, node, report, &mut client, b"lag", "a memory DROP")?;
+    let window = ("LAGGING-EXPORT-DROP", "a memory DROP");
+    watch_window(world, node, report, &mut client, b"lag", window)?;
     // A memory CREATE whose peer leg is refused: its rollback's request,
     // then a lagging export from the origin, which still serves it.
     inf_foundation::fault::arm(NS_CREATE_FAN_REFUSED, FaultSpec::Nth(1));
@@ -330,14 +331,16 @@ fn lagging_arm(
     })?;
     lagging_export(node, 0, report);
     node.hold_inbox = false;
-    let rolled_back = watch_window(world, node, report, &mut client, b"lag2", "a rollback");
+    let window = ("LAGGING-EXPORT-ROLLBACK", "a rollback");
+    let rolled_back = watch_window(world, node, report, &mut client, b"lag2", window);
     inf_foundation::fault::disarm(NS_CREATE_FAN_REFUSED);
     rolled_back?;
     let stale = node.control.ddl_notices_stale();
     if stale != 0 {
         let seed = world.seed;
         report.violations.push(format!(
-            "seed {seed:#x}: ns_ddl_notices_stale is {stale}: a notice retired another DDL"
+            "NOTICE-STALE seed {seed:#x}: ns_ddl_notices_stale is {stale}: a notice retired \
+             another DDL"
         ));
     }
     Ok(())
@@ -364,7 +367,7 @@ fn watch_window(
     report: &mut NsDropWindowReport,
     client: &mut MiniClient,
     name: &[u8],
-    what: &str,
+    (tag, what): (&str, &str),
 ) -> Result<(), String> {
     let seed = world.seed;
     for _ in 0..STALL_STEPS {
@@ -372,8 +375,8 @@ fn watch_window(
         if names(&world.meta()?, name) {
             let name = String::from_utf8_lossy(name);
             report.violations.push(format!(
-                "seed {seed:#x}: META names '{name}' inside {what}'s window: a lagging export \
-                 brought it back"
+                "{tag} seed {seed:#x}: META names '{name}' inside {what}'s window: a lagging \
+                 export brought it back"
             ));
             return Ok(());
         }
@@ -530,8 +533,8 @@ fn audit_ledger(
             } else {
                 let key = String::from_utf8_lossy(key);
                 report.violations.push(format!(
-                    "seed {seed:#x}: acked key {key} lost after a cut before the DROP's answer \
-                     (cell {cell} read {:?})",
+                    "DROP-WINDOW-LOSS seed {seed:#x}: acked key {key} lost after a cut before \
+                     the DROP's answer (cell {cell} read {:?})",
                     String::from_utf8_lossy(&got)
                 ));
             }

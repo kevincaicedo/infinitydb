@@ -2083,7 +2083,9 @@ impl CatalogWriter {
                 }
                 None
             }
-            Some(PendingDdl::Drop(id)) => Some(*id),
+            // Canary `inf_canary_ns_pending_drop_kept`: the pending drop
+            // is not stripped from the payload.
+            Some(PendingDdl::Drop(id)) => (!cfg!(inf_canary_ns_pending_drop_kept)).then_some(*id),
             None => None,
         };
         let gone = |id: NsId| pending_drop == Some(id) || self.tombstones.contains(id.0);
@@ -2102,8 +2104,12 @@ impl CatalogWriter {
         let retires = match (&self.pending, notice) {
             (Some(PendingDdl::Create(spec)), DdlNotice::CreateApplied { id }) => spec.id == id,
             (Some(PendingDdl::Drop(pending)), DdlNotice::DropFanned { id, .. }) => *pending == id,
+            // Canary `inf_canary_ns_notice_at_replacement`: notices match
+            // by id alone, so a `CREATE`'s retires its rollback's drop.
+            (Some(PendingDdl::Drop(pending)), DdlNotice::CreateApplied { id }) => {
+                cfg!(inf_canary_ns_notice_at_replacement) && *pending == id
+            }
             (Some(PendingDdl::Create(_)), DdlNotice::DropFanned { .. })
-            | (Some(PendingDdl::Drop(_)), DdlNotice::CreateApplied { .. })
             | (None, DdlNotice::CreateApplied { .. } | DdlNotice::DropFanned { .. }) => false,
         };
         if !retires {

@@ -714,6 +714,15 @@ impl NoticeDue {
     /// (the rollback's `DROP` replaces its pending `CREATE`), and returns
     /// the notice the rollback owes.
     fn roll_back(mut self) -> NoticeDue {
+        // Canaries `inf_canary_ns_notice_at_replacement` and
+        // `inf_canary_ns_notice_posted_at_replacement`: the `CREATE`'s
+        // notice posts as the rollback replaces it, instead of being
+        // consumed by the rollback's send.
+        if cfg!(inf_canary_ns_notice_at_replacement)
+            || cfg!(inf_canary_ns_notice_posted_at_replacement)
+        {
+            self.send(None);
+        }
         self.kind = None;
         let (control, id) = (Arc::clone(&self.control), self.id);
         NoticeDue { control, id, kind: Some(NoticeKind::DropFanned) }
@@ -916,6 +925,11 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         Ok(admitted) => admitted,
         Err(refusal) => return refusal,
     };
+    // Canary `inf_canary_ns_apply_before_swap`: the origin drops the
+    // namespace before its request (the order the receipt replaces), so a
+    // checkpoint it publishes in the wait omits it.
+    #[cfg(inf_canary_ns_apply_before_swap)]
+    let _ = shared.store.borrow_mut().ns_drop_planted(name);
     // Crash-matrix point: the on-disk state of a cut before the answer
     // (nothing durable changed and every cell serves the namespace, so a
     // checkpoint any cell publishes before the node stops still names it).

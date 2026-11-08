@@ -1017,6 +1017,13 @@ impl Keyspace {
         self.drop_named(name)
     }
 
+    /// The planted canary's drop before the catalog writer's answer (the
+    /// order the receipt replaces).
+    #[cfg(inf_canary_ns_apply_before_swap)]
+    pub fn ns_drop_planted(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
+        self.drop_named(name)
+    }
+
     /// The one drop body: the registry entry, its store, its tiered table
     /// and its index declarations go together.
     fn drop_named(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
