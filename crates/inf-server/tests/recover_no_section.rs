@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! ADR-0174 D4: a tiered namespace that no MANIFEST section names — a
 //! crash before its first checkpoint publishes, after one tier flush —
 //! recovers through the empty section: its dead-life tier files removed

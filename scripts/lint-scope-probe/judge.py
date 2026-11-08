@@ -53,6 +53,10 @@ def slot(path):
     return path.startswith("inf_foundation::bounded::")
 
 
+def listing(path):
+    return path.startswith("inf_log::")
+
+
 cfg = tomllib.loads(config.read_text())
 # Clippy's help for an unresolved entry is `allow-invalid = true`, which
 # silences it on every architecture: an inert entry would stay green
@@ -68,8 +72,10 @@ for key in ("disallowed-methods", "disallowed-types", "await-holding-invalid-typ
 # that carries one, held across an `await` by its plant (ADR-0144 A2): the
 # lint matches the outermost type of a live local, so each is listed and
 # each lands with its own plant (the lint-scopes gate requires the entry for
-# every public type of `bounded` with a lifetime parameter).
+# every public type of `bounded` with a lifetime parameter). A whole
+# directory listing is an `inf_log::` method of its own family (ADR-0202 D7).
 CENSUS = (("disallowed-methods", "disallowed_methods", filesystem, "filesystem", 37),
+          ("disallowed-methods", "disallowed_methods", listing, "listing", 3),
           ("disallowed-types", "disallowed_types", filesystem, "filesystem", 5),
           ("disallowed-types", "disallowed_types", container, "container", 3),
           ("await-holding-invalid-types", "await_holding_invalid_type", slot, "slot type", 9))
@@ -79,7 +85,7 @@ for key, lint, family, label, count in CENSUS:
         errors.append(f"config needs {count} distinct {label} {key}, found {len(paths)}")
     witnesses = {path for code, path in plants.values()
                  if code == f"clippy::{lint}" and path and family(path)}
-    unstable = set(UNSTABLE) if lint == "disallowed_methods" else set()
+    unstable = {p for p in UNSTABLE if family(p)} if lint == "disallowed_methods" else set()
     for path in sorted(unstable - set(paths)):
         errors.append(f"unstable path {path} has no config entry")
     for path in sorted(set(paths) - witnesses - unstable):
@@ -141,9 +147,10 @@ for at, codes in sorted(seen.items()):
     if at not in plants and at not in controls:
         errors.append(f"{at}: unmarked diagnostic {sorted(codes)}")
 # nine decoder/enum, 41 stable APIs, two alias/UFCS bypasses, 11 containers,
-# nine slot types across an await, three discarded publishes
-if len(plants) < 75:
-    errors.append(f"{len(plants)} plants; expected at least 75")
+# nine slot types across an await, three discarded publishes, three whole
+# listings
+if len(plants) < 78:
+    errors.append(f"{len(plants)} plants; expected at least 78")
 if messages == 0:
     errors.append("clippy produced no diagnostics; the probe did not run")
 
@@ -215,7 +222,7 @@ if errors:
         print(f"lint-scopes probe: {disclosed[2:]}")
     sys.exit(1)
 print(f"lint-scopes probe OK: {len(plants)} exact lint/path plants, "
-      f"{len(controls)} clean controls; 36 stable filesystem methods, five filesystem types, "
-      f"three containers and nine slot types across an await covered{disclosed}")
+      f"{len(controls)} clean controls; 36 stable filesystem methods, three whole listings, five "
+      f"filesystem types, three containers and nine slot types across an await covered{disclosed}")
 print("lint-scopes unstable probe OK: 1/1 pinned-stable refusal (E0658 fs_set_times); "
       "all 37 filesystem method bans retained")

@@ -427,3 +427,18 @@ point = "torn_frame"
 tier = "node"
 test = "crash-matrix::ickv3::v3_named_unit_with_damaged_padding_fail_stops"
 expect = "v3-named-unit-damaged-padding"
+
+# ADR-0202 D5: the listing's two fault points fired at the boot's listing of
+# a tiered namespace's `cold/` — at its open, at a batch — refuse the boot
+# typed, naming the point; the next boot, the fault cleared, recovers.
+[[row]]
+point = "dir_listing_open_fail"
+tier = "node"
+test = "crash-matrix::tier::a_listing_fault_refuses_the_boot_typed_and_the_next_boot_recovers"
+expect = "boot-refuses-typed-then-recovers"
+
+[[row]]
+point = "dir_listing_next_fail"
+tier = "node"
+test = "crash-matrix::tier::a_listing_fault_refuses_the_boot_typed_and_the_next_boot_recovers"
+expect = "boot-refuses-typed-then-recovers"

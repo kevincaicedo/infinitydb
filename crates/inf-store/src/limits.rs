@@ -58,8 +58,11 @@ pub const SETTLE_WALK_BYTE_CHARGE: u64 = 1;
 
 /// The recovery step budget's price (ADR-0174 A1) of one RAM unit of boot
 /// work outside the record walk: one checkpoint entry's apply beside its
-/// bytes (a ref's pair probe, insert and live-set probe), or one listed
-/// address the end of the checkpoint releases (a probe and a death) — at
+/// bytes (a ref's pair probe, insert and live-set probe), one listed
+/// address the end of the checkpoint releases (a probe and a death), one
+/// parked death the hand-over stamps or extent id it seeds, one listed name
+/// the start step's tier map handles (its manifest search, an append), or
+/// one catalog file its build adds to the table and the pipeline — at
 /// most five ordered-map or index operations and no scan. 64 budget bytes,
 /// a few cache misses' worth beside the byte prices: an estimate the
 /// reference-box run calibrates, never a measurement. Owner: the recovery
@@ -155,3 +158,11 @@ const _: () = assert!(DOC_IDOC_BYTES_MAX <= inf_log::DOC_VERSION_MASK as usize);
 // The record clamp only ever lowers the format ceiling.
 #[cfg(feature = "doc")]
 const _: () = assert!(DOC_BODY_BYTES_MAX <= inf_doc::limits::DOC_BYTES_MAX);
+
+/// Ids one chunk of a boot id list holds (ADR-0174 A1): the tier map's two
+/// extent-id lists, the hand-over's revive list and the end of the
+/// checkpoint's release list, 32 KiB a chunk. Owner: `IdChunks`, whose
+/// chunk table grows by doubling at 24 B a chunk. Crossing: a full chunk
+/// ends and the next push starts a new one, so no push copies the ids
+/// already listed (INF: the table is 59 KiB at 10⁷ ids).
+pub const ID_CHUNK_IDS: usize = 4096;

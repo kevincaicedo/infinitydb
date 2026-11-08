@@ -222,7 +222,8 @@ fn delta_before_fsync(seeds: u64) {
     for seed in 0..seeds {
         // Small sectors make the one pending delta frame genuinely
         // tearable instead of merely present/absent.
-        let disk = SimDisk::with_config(SimDiskConfig { sector_bytes: 32 });
+        let disk =
+            SimDisk::with_config(SimDiskConfig { sector_bytes: 32, ..SimDiskConfig::default() });
         let mut log = LogBuilder::new(disk.clone(), &cfg);
         let full = log.frame(&[fixtures.full(b"doc", 1, &fixtures.v1)], 0);
         log.sync(full.base.segment);

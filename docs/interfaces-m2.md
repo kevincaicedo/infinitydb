@@ -441,6 +441,30 @@ those driver ops against the same `SimDisk`.
 > restart without a power cut keeps every pending `MetaOp`. The fault
 > points `ns_dir_remove_fail` and `ns_dir_sync_fail` fire inside those two
 > calls, and the disk logs every call. Not built.
+>
+> **ADR-0202 (2026-11-07):** the residue round lists through `open_listing` and reads
+> one batch, of the 256 names and 8 KiB above; `list_dir_bounded` and `Listing` are not added.
+
+### Directory listing additions (ADR-0202)
+
+> **ADR-0202 (2026-11-07), not built:** the seam lists a directory one bounded batch at
+> a time. `open_listing(dir) -> io::Result<OpenedDir<DirStream>>`, `OpenedDir::{Absent, Open}`,
+> opens it; `Absent` is the directory's own `ENOENT`, and any other errno is an `Err`.
+> `DirStream::next_batch(&mut NameBatch) -> io::Result<BatchEnd>`, `BatchEnd::{More, End}`,
+> fills a caller-owned batch of at most 256 names and 8 KiB of name bytes, each name the entry's
+> own bytes, never converted; a name that does not fit is carried whole to the next call, `More`
+> holds at least one name, a name over 1,024 bytes refuses the listing with `InvalidData`, and
+> after an `Err` the batch holds no name. Within one open stream a name present from the open to
+> `End` is returned exactly once; a name created, removed or renamed while it is open may be
+> returned or not, and one removed after it was returned may be returned again, so a removal of
+> a listed name goes through `remove_listed`, whose `Removal::Gone` is that earlier removal. The
+> order is the filesystem's on `StdSegmentFs` and ascending bytes on `MemFs` and `SimDisk`. The
+> stream owns its directory handle, holds no borrow, is neither `Clone` nor `Copy`, and closes on
+> drop. `list_dir` stays as a provided method that collects every batch and answers `Absent` as
+> `NotFound`; a call of it is a lint error unless its site names its directory's bound. On the
+> simulated disk a stream resumes after the greatest name it returned, a seeded mode returns once
+> more each name removed after it was returned, the fault points `dir_listing_open_fail` and
+> `dir_listing_next_fail` fire inside the two calls, and the disk counts opens and batches.
 
 ## `MutationEffect` → record seam (`inf-log::effect`, ADR-0012)
 

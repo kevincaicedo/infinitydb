@@ -49,8 +49,9 @@
 //! every other tiering counter (§3.1 "addresses are per-life"): recovery
 //! builds a fresh table and a fresh flush pipeline. Two boot-path device
 //! writes are deliberately outside `flush_bytes` — the recovery reseal of
-//! an unsealed tier file (`recover_seal_existing`, one footer per
-//! recovered file) and checkpoint/MANIFEST writes (they belong to the
+//! an unsealed tier file (one footer per recovered file, written by the
+//! reseal's seal after its open and its frame reads) and checkpoint/MANIFEST
+//! writes (they belong to the
 //! checkpoint domain, and `INFO persistence` already reports it).
 //!
 //! Memory-mode namespaces have no `TieredTable`, therefore no

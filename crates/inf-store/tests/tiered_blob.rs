@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! M4-S17 — blob-extent reference counting (plan AC 3, ADR-0061): random
 //! create/overwrite/delete storms over mixed inline + out-of-line values,
 //! with real (MemFs) extent files, the real flush pipeline demoting the
@@ -701,7 +705,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
     // the header-valid orphan quarantines (rename, bytes survive the
     // life), and only the next boot's second verdict unlinks; nothing
     // live is ever handed out.
-    let revive = table.extent_sweep_seed(&recovered.extents_listed, &[]);
+    let revive = table.extent_sweep_seed(&recovered.extents_listed.to_vec(), &[]);
     assert!(revive.is_empty(), "nothing was quarantined before this boot");
     let mut quarantined: Vec<u64> = Vec::new();
     loop {

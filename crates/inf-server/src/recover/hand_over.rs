@@ -26,8 +26,8 @@ use inf_store::limits::{REBUILD_GROUP_CHARGE_BYTES, RECOVER_PROBE_CHARGE_BYTES};
 use inf_store::{Keyspace, RebuildStep, ShadowRebuild, TieredTable};
 
 use super::{
-    BootFile, Phase, RecoverStats, RecoveredTierNs, RecoveringTierNs, Recovery, RecoveryProgress,
-    StepBudget, boot_io_charge, io_invalid, io_msg, replay_refused,
+    Phase, RecoverStats, RecoveredTierNs, RecoveringTierNs, Recovery, RecoveryProgress, StepBudget,
+    boot_io_charge, io_invalid, io_msg, replay_refused,
 };
 use crate::limits::BOOT_FILE_OP_CHARGE_BYTES;
 
@@ -85,7 +85,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     /// Replay has ended: the machines leave the replay seam for the
     /// hand-over, the next one last. Answers the phase that follows: the
     /// hand-over, or with no machine the resume `then` names.
-    pub(super) fn begin_hand_over(&mut self, then: ResumeFrom) -> Phase<BootFile<F>> {
+    pub(super) fn begin_hand_over(&mut self, then: ResumeFrom) -> Phase<F> {
         debug_assert!(self.recovering_tiers.lent.is_empty(), "every lent machine drained");
         let mut machines = std::mem::take(&mut self.recovering_tiers.tiers);
         machines.reverse();
@@ -156,7 +156,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 }
             }
             HandOverStage::SeedListed { at } => {
-                let listed = tier.extents_listed.get(at..).unwrap_or_default();
+                let listed = tier.extents_listed.run_from(at);
                 if listed.is_empty() {
                     return Ok(HandOverStage::SeedQuarantined { at: 0 });
                 }
@@ -167,7 +167,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 HandOverStage::SeedListed { at: at + batch }
             }
             HandOverStage::SeedQuarantined { at } => {
-                let quarantined = tier.extents_quarantined.get(at..).unwrap_or_default();
+                let quarantined = tier.extents_quarantined.run_from(at);
                 if quarantined.is_empty() {
                     return Ok(HandOverStage::Revive { at: 0 });
                 }
@@ -178,9 +178,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 HandOverStage::SeedQuarantined { at: at + batch }
             }
             HandOverStage::Revive { at } => {
-                let Some(revive) = tier.revive.get(at..).filter(|rest| !rest.is_empty()) else {
+                let revive = tier.revive.run_from(at);
+                if revive.is_empty() {
                     return Ok(HandOverStage::Rebuild(Box::new(table.begin_shadow_rebuild())));
-                };
+                }
                 let fs =
                     fs.as_ref().ok_or_else(|| io_msg("a hand-over with no filesystem".into()))?;
                 let batch = units_left(budget, BOOT_FILE_OP_CHARGE_BYTES).min(revive.len());

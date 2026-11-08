@@ -80,6 +80,14 @@ disallowed-methods = [
     { path = "std::os::unix::fs::lchown", reason = "blocking filesystem call (ADR-0144 D5)" },
     { path = "std::os::unix::fs::fchown", reason = "blocking filesystem call (ADR-0144 D5)" },
     { path = "std::os::unix::fs::chroot", reason = "blocking filesystem call (ADR-0144 D5)" },
+    # ADR-0202 D7: a whole listing of a directory whose population no limit
+    # bounds compiles only under a statement allow whose reason reads
+    # `listing: <directory>: <its population and bound>`; a budgeted boot
+    # walk lists through `open_listing`, one bounded batch a unit. Each entry
+    # has an exact-path plant in lint-scope-probe.
+    { path = "inf_log::fs::SegmentFs::list_dir", reason = "a whole directory listing: list one bounded batch at a time through `open_listing` (ADR-0202 D7)" },
+    { path = "inf_log::blob::list_extent_ids", reason = "a whole listing of `cold/`, whose extents no limit bounds (ADR-0202 D7)" },
+    { path = "inf_log::blob::list_quarantined_extent_ids", reason = "a whole listing of `cold/`, whose extents no limit bounds (ADR-0202 D7)" },
 ]
 
 # ADR-0144 A2: a reservation is consumed in the step that made it; held

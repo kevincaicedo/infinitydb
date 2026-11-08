@@ -76,9 +76,11 @@ use crate::durable::DurableConfig;
 mod frame_walk;
 mod hand_over;
 mod section_walk;
+mod tier_map;
 use frame_walk::cursor::FrameCursor;
 use frame_walk::{WalkEnd, YieldKind};
 use hand_over::{HandOverStage, ResumeFrom};
+use tier_map::{MapThen, TierMapWalk};
 
 /// The recovery pipeline's phases as the outside sees them (M4.5-S39d):
 /// what each [`Recovery::step`] is about to do, typed so the driver can
@@ -306,6 +308,9 @@ pub struct RecoverUnits {
     pub sweep_seeded: u64,
     /// Probe groups ADR-0093's ticket rebuild scanned.
     pub rebuild_groups: u64,
+    /// The tier map's builds, in catalog files built into their tables and
+    /// pipelines (a RAM unit each, at least one a namespace).
+    pub tier_map_built: u64,
 }
 
 /// The step facts of one cell's recovery (ADR-0174 A1.2), outside D6's
@@ -431,6 +436,7 @@ impl StepBudget {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum UnitPhase {
     Start,
+    TierMap,
     Ick,
     CkptEnd,
     Replay,
@@ -444,7 +450,7 @@ pub enum UnitPhase {
 }
 
 /// The phases [`RECOVERY_UNITS`] rows.
-pub const UNIT_PHASES: usize = 11;
+pub const UNIT_PHASES: usize = 12;
 
 impl UnitPhase {
     /// The phase's row in [`RECOVERY_UNITS`].
@@ -452,16 +458,17 @@ impl UnitPhase {
     pub const fn index(self) -> usize {
         match self {
             UnitPhase::Start => 0,
-            UnitPhase::Ick => 1,
-            UnitPhase::CkptEnd => 2,
-            UnitPhase::Replay => 3,
-            UnitPhase::Audit => 4,
-            UnitPhase::Probe => 5,
-            UnitPhase::Finish => 6,
-            UnitPhase::Settle => 7,
-            UnitPhase::HandOver => 8,
-            UnitPhase::Resume => 9,
-            UnitPhase::Complete => 10,
+            UnitPhase::TierMap => 1,
+            UnitPhase::Ick => 2,
+            UnitPhase::CkptEnd => 3,
+            UnitPhase::Replay => 4,
+            UnitPhase::Audit => 5,
+            UnitPhase::Probe => 6,
+            UnitPhase::Finish => 7,
+            UnitPhase::Settle => 8,
+            UnitPhase::HandOver => 9,
+            UnitPhase::Resume => 10,
+            UnitPhase::Complete => 11,
         }
     }
 }
@@ -497,7 +504,15 @@ pub const RECOVERY_UNITS: [RecoveryUnit; UNIT_PHASES] = [
         phase: UnitPhase::Start,
         entry: UnitEntry::None,
         budgeted: false,
-        unit: "directories, MANIFEST, the segment scan and the tier map: one step",
+        unit: "directories, MANIFEST and the segment scan: one step",
+    },
+    RecoveryUnit {
+        phase: UnitPhase::TierMap,
+        entry: UnitEntry::None,
+        budgeted: true,
+        unit: "one listing's open or batch, one listed name handled or removed, one manifested \
+               file's probe or held handle, a reseal's open, frame reads or seal, a swept \
+               directory's sync, or one namespace's build",
     },
     RecoveryUnit {
         phase: UnitPhase::Ick,
@@ -547,7 +562,7 @@ pub const RECOVERY_UNITS: [RecoveryUnit; UNIT_PHASES] = [
         entry: UnitEntry::None,
         budgeted: true,
         unit: "one parked replay death stamped, one listed or quarantined extent id seeded, one \
-               revive rename, one probe group the ticket rebuild scans or one slot it returns \
+               revive rename, one probe group the ticket rebuild scans, with the slot it returns \
                settled, or one machine's hand-over with its drain's seal",
     },
     RecoveryUnit {
@@ -714,16 +729,24 @@ pub enum RecoveryProgress {
     Complete,
 }
 
-/// Recovery phase (each `step` performs one bounded unit of the phase).
-enum Phase<File: SegmentFile> {
-    /// Dirs, MANIFEST, scan, floor checks, checkpoint open + presize —
-    /// bounded by directory-entry counts, one step.
+/// Recovery phase (each `step` performs one bounded unit of the phase),
+/// over the filesystem `F`: its readers hold the boot readers' files.
+enum Phase<F: SegmentFs> {
+    /// Dirs, MANIFEST, scan and floor checks — bounded by directory-entry
+    /// counts, one step.
     Start,
+    /// The tier map (ADR-0174 D4; ADR-0202) under the step budget: the
+    /// tombstoned namespaces' sweeps and the tiered namespaces' maps, a
+    /// step yielding at the next unit once its charge reaches the budget;
+    /// then the start step's branch goes on.
+    TierMap {
+        walk: Box<TierMapWalk<F>>,
+    },
     /// Checkpoint sections streamed under the step budget, a step yielding
     /// at the next record or entry once its charge reaches the budget, inside
     /// a section the reader holds (ADR-0174 A1).
     Ick {
-        reader: Box<IckReader<File>>,
+        reader: Box<IckReader<BootFile<F>>>,
     },
     /// The end of the checkpoint's releases (ADR-0174 R9), under the step
     /// budget: `at` the next listed address of the machine at index `tier`
@@ -738,7 +761,7 @@ enum Phase<File: SegmentFile> {
     /// budget (ADR-0174 A1).
     Replay {
         idx: usize,
-        reader: ReplayReader<File>,
+        reader: ReplayReader<BootFile<F>>,
     },
     /// M2-S14 slack audit of segment `idx`, right after its replay
     /// (ADR-0087 D6); one segment per step.
@@ -808,7 +831,7 @@ pub struct Recovery<F: SegmentFs> {
     cfg: DurableConfig,
     anchor: WallAnchor,
     now: Nanos,
-    phase: Phase<BootFile<F>>,
+    phase: Phase<F>,
     stats: RecoverStats,
     shard_dir: PathBuf,
     log_dir: PathBuf,
@@ -923,12 +946,12 @@ pub struct Recovery<F: SegmentFs> {
 struct RecoveringTierNs<F: SegmentFs> {
     ns: inf_log::NsId,
     replay: inf_store::TierReplay<F>,
-    extents_listed: Vec<u64>,
-    extents_quarantined: Vec<u64>,
+    extents_listed: inf_store::IdChunks,
+    extents_quarantined: inf_store::IdChunks,
     /// The quarantined ids the replayed map references, in the listing's
     /// order: the hand-over's sweep seed appends them, its revive stage
     /// renames them back (ADR-0096 D3).
-    revive: Vec<u64>,
+    revive: inf_store::IdChunks,
     /// Lent through the seam since the last drain (its index is in
     /// [`RecoveringTiers::lent`] once).
     lent: bool,
@@ -1105,7 +1128,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     #[must_use]
     pub fn phase(&self) -> RecoverPhase {
         match &self.phase {
-            Phase::Start => RecoverPhase::Start,
+            Phase::Start | Phase::TierMap { .. } => RecoverPhase::Start,
             Phase::Ick { .. } | Phase::CkptEnd { .. } => RecoverPhase::Ckpt,
             Phase::Replay { .. } => RecoverPhase::Replay,
             Phase::Audit { .. } | Phase::Probe { .. } => RecoverPhase::Audit,
@@ -1163,7 +1186,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     #[must_use]
     pub fn segments_progress(&self) -> (u64, u64) {
         let done = match &self.phase {
-            Phase::Start | Phase::Ick { .. } | Phase::CkptEnd { .. } => 0,
+            Phase::Start | Phase::TierMap { .. } | Phase::Ick { .. } | Phase::CkptEnd { .. } => 0,
             Phase::Replay { idx, .. } | Phase::Probe { idx } => *idx as u64,
             Phase::Audit { idx } => *idx as u64 + 1,
             Phase::Finish
@@ -1232,6 +1255,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         let budget_ref = &mut budget;
         let progress = match core::mem::replace(&mut self.phase, Phase::Complete) {
             Phase::Start => self.step_start(ks),
+            Phase::TierMap { walk } => self.step_tier_map(ks, walk, budget_ref),
             Phase::Ick { reader } => self.step_ick(ks, reader, budget_ref),
             Phase::CkptEnd { tier, at } => self.step_ckpt_end(ks, tier, at, budget_ref),
             Phase::Replay { idx, reader } => self.step_replay(ks, idx, reader, budget_ref),
@@ -1287,6 +1311,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     fn unit_phase(&self) -> UnitPhase {
         match &self.phase {
             Phase::Start => UnitPhase::Start,
+            Phase::TierMap { .. } => UnitPhase::TierMap,
             Phase::Ick { .. } => UnitPhase::Ick,
             Phase::CkptEnd { .. } => UnitPhase::CkptEnd,
             Phase::Replay { .. } => UnitPhase::Replay,
@@ -1381,7 +1406,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         }
         self.bytes_total = self.seg_sizes.iter().sum();
 
-        let next = if let Some(manifest) = manifest {
+        let fresh = manifest.is_none() && scan.is_empty();
+        let then = if let Some(manifest) = manifest {
             // The floor segment holds the begin marker and is never
             // truncated: its absence means the disk lost named state —
             // fail-stop.
@@ -1401,67 +1427,74 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     "MANIFEST lists segment {last_listed} but the log ends at {tail}"
                 )));
             }
-            // Tiered namespaces recover first (M4-S26; ADR-0174 D4): map
-            // manifested files, seed the new life at the manifested
-            // flushed watermark, and swap the recovered table in —
-            // checkpoint entries and tail records then apply onto the
-            // recovered life, never the fresh one.
-            self.recover_tiers(ks, Some(&manifest))?;
-            let ick_path = self.ckpt_dir.join(ick_file_name(manifest.ckpt_id));
-            // Presize from the footer counts before streaming (M2-S13):
-            // the bulk apply must not pay a doubling-rehash storm.
-            let (counts, probe_hit) =
-                read_ick_counts_probed(&self.boot_reads, &ick_path, IckReaderConfig::default())
-                    .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
-            self.stats.ckpt_footer_probe_hit = Some(probe_hit);
-            for &(ns, entries) in &counts {
-                ks.reserve_ns(inf_log::NsId(ns), entries);
-            }
-            let reader =
-                IckReader::open(&self.boot_reads, &ick_path, IckReaderConfig::default())
-                    .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
-            let info = reader.info();
-            if info.ckpt_id != manifest.ckpt_id
-                || info.begin_lsn != manifest.begin_lsn
-                || info.cell != self.cell
-            {
-                return Err(io_msg(format!(
-                    "checkpoint header disagrees with MANIFEST: ick {{id {}, begin {}, cell \
-                     {}}} vs manifest {{id {}, begin {}, cell {}}}",
-                    info.ckpt_id,
-                    info.begin_lsn,
-                    info.cell,
-                    manifest.ckpt_id,
-                    manifest.begin_lsn,
-                    self.cell
-                )));
-            }
-            self.bytes_total += reader.file_size();
             self.begin_lsn = Some(manifest.begin_lsn);
             self.manifest = Some(manifest);
-            Phase::Ick { reader: Box::new(reader) }
-        } else if scan.is_empty() {
+            // Tiered namespaces recover first (M4-S26; ADR-0174 D4): the
+            // tier map maps manifested files, seeds the new life at the
+            // manifested flushed watermark, and swaps the recovered table
+            // in — checkpoint entries and tail records then apply onto the
+            // recovered life, never the fresh one.
+            MapThen::Ckpt
+        } else if fresh {
             // Fresh cell: nothing to replay, nothing to audit. Its tiered
             // namespaces still recover through the empty section (ADR-0174
             // D4: a dead life's tier files go before any flush) and hand
             // their machines over, under the step budget, before its first
-            // segment is created; with none to hand over, it is created now.
-            self.recover_tiers(ks, None)?;
-            if self.recovering_tiers.tiers.is_empty() {
-                self.scan = Some(scan);
-                self.step_resume(ks, ResumeFrom::FreshCell)?;
-                return Ok(RecoveryProgress::Complete);
-            }
-            self.begin_hand_over(ResumeFrom::FreshCell)
+            // segment is created; with nothing to map, it is created now.
+            MapThen::FreshCell
         } else {
             // No MANIFEST: the whole retained log replays, into tiered
             // namespaces recovered through the empty section (D4).
-            self.recover_tiers(ks, None)?;
-            Phase::Replay { idx: 0, reader: ReplayReader::Unopened }
+            MapThen::Replay
         };
         self.scan = Some(scan);
-        self.phase = next;
+        let walk = self.tier_map_walk(ks, then)?;
+        if !walk.is_empty() {
+            self.phase = Phase::TierMap { walk: Box::new(walk) };
+            return Ok(RecoveryProgress::Working);
+        }
+        if then == MapThen::FreshCell {
+            self.step_resume(ks, ResumeFrom::FreshCell)?;
+            return Ok(RecoveryProgress::Complete);
+        }
+        self.phase = self.finish_tier_map(ks, walk.then())?;
         Ok(RecoveryProgress::Working)
+    }
+
+    /// The checkpoint the MANIFEST names, opened after the tier map (the
+    /// recovered tables take its entries): presized from its footer counts
+    /// before streaming (M2-S13: the bulk apply must not pay a
+    /// doubling-rehash storm), its header checked against the MANIFEST.
+    fn open_checkpoint(&mut self, ks: &mut Keyspace) -> io::Result<Phase<F>> {
+        let manifest = self.manifest.as_ref().ok_or_else(|| io_msg("no MANIFEST".into()))?;
+        let ick_path = self.ckpt_dir.join(ick_file_name(manifest.ckpt_id));
+        let (counts, probe_hit) =
+            read_ick_counts_probed(&self.boot_reads, &ick_path, IckReaderConfig::default())
+                .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+        self.stats.ckpt_footer_probe_hit = Some(probe_hit);
+        for &(ns, entries) in &counts {
+            ks.reserve_ns(inf_log::NsId(ns), entries);
+        }
+        let reader = IckReader::open(&self.boot_reads, &ick_path, IckReaderConfig::default())
+            .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+        let info = reader.info();
+        if info.ckpt_id != manifest.ckpt_id
+            || info.begin_lsn != manifest.begin_lsn
+            || info.cell != self.cell
+        {
+            return Err(io_msg(format!(
+                "checkpoint header disagrees with MANIFEST: ick {{id {}, begin {}, cell \
+                 {}}} vs manifest {{id {}, begin {}, cell {}}}",
+                info.ckpt_id,
+                info.begin_lsn,
+                info.cell,
+                manifest.ckpt_id,
+                manifest.begin_lsn,
+                self.cell
+            )));
+        }
+        self.bytes_total += reader.file_size();
+        Ok(Phase::Ick { reader: Box::new(reader) })
     }
 
     /// The end of replay (ADR-0174 R10's first half), once the finish
@@ -1495,148 +1528,6 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 tier.replay.end_of_replay(table);
             }
         }
-        Ok(())
-    }
-
-    /// Recovers every tiered namespace the catalog holds (ADR-0174 D4):
-    /// map + verify tier files, seed the new life at the manifested
-    /// flushed watermark, install the recovered table, and build the boot
-    /// machine that holds the creation-mode fds the plane's cold-read
-    /// table inherits. A namespace no section names — no MANIFEST yet, or
-    /// one published before the namespace was created — recovers through
-    /// the empty section: `flushed` 0, no file, its dead-life tier files
-    /// removed before any flush.
-    fn recover_tiers(&mut self, ks: &mut Keyspace, manifest: Option<&Manifest>) -> io::Result<()> {
-        self.sweep_dropped(ks, manifest)?;
-        let tiered: Vec<(inf_log::NsId, inf_store::TierSpec)> =
-            ks.ns_iter().filter_map(|spec| spec.tier.map(|tier| (spec.id, tier))).collect();
-        // Bound: one recovery per tiered namespace of the catalog.
-        for (ns, spec) in tiered {
-            let named = manifest.and_then(|m| m.tier_ns(ns.0));
-            let empty =
-                inf_log::manifest::TierNsManifest { ns: ns.0, flushed: 0, files: Vec::new() };
-            let section = named.unwrap_or(&empty);
-            let ckpt_id = manifest.map_or(0, |m| m.ckpt_id);
-            self.recover_tier_ns(ks, ns, &spec, section, ckpt_id)?;
-        }
-        // The seam finds a record's machine by binary search.
-        self.recovering_tiers.tiers.sort_unstable_by_key(|tier| tier.ns);
-        Ok(())
-    }
-
-    /// ADR-0100 D6: the catalog decides which namespaces exist. Over a
-    /// MANIFEST's tier sections a tombstoned id's residue is swept and an
-    /// unknown id's is corruption; then every tombstoned namespace's
-    /// directory no section names is swept — with or without a MANIFEST,
-    /// as D4 recovers a catalogued namespace with or without one (a DROP
-    /// cut mid-teardown before the first checkpoint publishes leaves it).
-    fn sweep_dropped(&mut self, ks: &Keyspace, manifest: Option<&Manifest>) -> io::Result<()> {
-        let mut swept: Vec<inf_log::NsId> = Vec::new();
-        for tier in manifest.map_or(&[][..], |m| m.tiers.as_slice()) {
-            let ns = inf_log::NsId(tier.ns);
-            if ks.ns_get_by_id(ns).and_then(|spec| spec.tier).is_some() {
-                continue;
-            }
-            if !ks.ns_tombstoned(ns) {
-                return Err(io_msg(format!(
-                    "MANIFEST carries a tier section for ns {} the catalog does not know and no \
-                     drop tombstone explains (corruption or a foreign META — ADR-0100 D6)",
-                    tier.ns
-                )));
-            }
-            self.sweep_dropped_ns(ns)?;
-            swept.push(ns);
-        }
-        let tombstones: Vec<inf_log::NsId> = ks.ns_tombstones().to_vec();
-        for ns in tombstones {
-            if !swept.contains(&ns) {
-                self.sweep_dropped_ns(ns)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// One tiered namespace through `section` (its manifest section, or
-    /// the empty one): the recovered table installed in the keyspace, the
-    /// boot machine kept for replay.
-    fn recover_tier_ns(
-        &mut self,
-        ks: &mut Keyspace,
-        ns: inf_log::NsId,
-        spec: &inf_store::TierSpec,
-        section: &inf_log::manifest::TierNsManifest,
-        ckpt_id: u64,
-    ) -> io::Result<()> {
-        let demote = spec.demotion_config();
-        let reserve_bytes = demote
-            .ring_reserve_bytes()
-            .ok_or_else(|| io_msg("tier spec ring reservation unrepresentable".into()))?;
-        let recovered = inf_store::recover_tiered_ns(
-            self.fs().clone(),
-            section,
-            ckpt_id,
-            inf_log::TierFlushConfig {
-                shard_dir: self.shard_dir.join(format!("ns-{}", ns.0)),
-                cell: u32::from(self.cell),
-                ns,
-                mode: spec.tier_io_mode,
-                file_capacity: inf_log::flush::TIER_FILE_CAPACITY_DEFAULT,
-                slice_bytes: spec.maintain_slice_bytes,
-                record_len_max: spec.record_len_max(),
-            },
-            inf_store::AddressSpaceConfig {
-                reserve_bytes,
-                page_bytes: inf_alloc::REGION_PAGE_BYTES,
-                life_origin: inf_store::LogicalAddr::ZERO, // overridden by the section
-            },
-            demote,
-            1024,
-            ks.hasher(),
-            &self.census,
-        )?;
-        ks.install_recovered_tiered(ns, recovered.table);
-        let removed = &mut self.stats.tier_replay.dead_life_files_removed;
-        *removed = removed.saturating_add(u64::from(recovered.stats.files_removed));
-        // The manifested files' creation-mode handles are the boot
-        // machine's (ADR-0054 D1; opened by `recover_tiered_ns`), and the
-        // hand-over at the end of replay returns them.
-        self.recovering_tiers.tiers.push(RecoveringTierNs {
-            ns,
-            replay: recovered.replay,
-            extents_listed: recovered.extents_listed,
-            extents_quarantined: recovered.extents_quarantined,
-            revive: Vec::new(),
-            lent: false,
-        });
-        Ok(())
-    }
-
-    /// Unlinks a tombstoned namespace's `ns-N/cold` files — tier files and
-    /// blob extents share that directory — before the cell serves
-    /// (ADR-0100 D6: the teardown an acked `DROP` owed). Idempotent: an
-    /// absent directory is nothing to do; a cut mid-sweep repeats it on
-    /// the next boot because the tombstone outlives the residue.
-    fn sweep_dropped_ns(&mut self, ns: inf_log::NsId) -> io::Result<()> {
-        let cold = self.shard_dir.join(format!("ns-{}", ns.0)).join("cold");
-        let names = match self.fs().list_dir(&cold) {
-            Ok(names) => names,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        let mut files = 0u64;
-        for name in names {
-            self.fs().remove_file(&cold.join(&name))?;
-            files += 1;
-        }
-        if files > 0 {
-            self.fs().sync_dir(&cold)?;
-        }
-        self.stats.dropped_ns_swept += 1;
-        self.stats.dropped_files_swept += files;
-        eprintln!(
-            "cell {}: swept dropped namespace {} residue ({files} files) — ADR-0100 D6",
-            self.cell, ns.0
-        );
         Ok(())
     }
 
@@ -2193,6 +2084,26 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         (resume_evidence, anchor)
     }
 
+    /// The boot GC's checkpoint half: every `.ick` the MANIFEST does not
+    /// name and every `.ick.new` orphan, removed. The listing is whole: the
+    /// directory holds the named checkpoint, the ones a cut left before
+    /// their GC and the orphans of crashed walks.
+    fn remove_ckpt_orphans(&mut self) -> io::Result<()> {
+        let named = self.manifest.as_ref().map(|m| m.ckpt_id);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "listing: ckpt/: the named checkpoint, ones a cut left and .ick.new orphans"
+        )]
+        for name in self.fs().list_dir(&self.ckpt_dir)? {
+            let stale_ick = parse_ick_file_name(&name).is_some_and(|id| Some(id) != named);
+            if stale_ick || name.ends_with(".ick.new") {
+                self.fs().remove_file(&self.ckpt_dir.join(name))?;
+                self.stats.stale_files_removed += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// The rest of the finish once replay's state is handed over: the
     /// begin guard, the torn-tail truncation, the boot GC and the rotor
     /// reopened at the resume point under the resumed life's epoch.
@@ -2243,14 +2154,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             self.fs().remove_file(&self.log_dir.join(segment_file_name(stale)))?;
             self.stats.stale_files_removed += 1;
         }
-        let named = self.manifest.as_ref().map(|m| m.ckpt_id);
-        for name in self.fs().list_dir(&self.ckpt_dir)? {
-            let stale_ick = parse_ick_file_name(&name).is_some_and(|id| Some(id) != named);
-            if stale_ick || name.ends_with(".ick.new") {
-                self.fs().remove_file(&self.ckpt_dir.join(name))?;
-                self.stats.stale_files_removed += 1;
-            }
-        }
+        self.remove_ckpt_orphans()?;
 
         let fs = self.fs.take().expect("fs present");
         let scan = self.scan.as_ref().expect("scan set");

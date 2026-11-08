@@ -2734,7 +2734,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 return run.report;
             }
         };
-        let extents_listed = recovered.extents_listed;
+        let extents_listed = recovered.extents_listed.to_vec();
         let replay_unit = run.replay_unit_bytes();
         let mut node = Booting::new(recovered.table, recovered.replay, hasher, &spec);
         let replayed = node

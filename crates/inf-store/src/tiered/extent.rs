@@ -345,7 +345,11 @@ impl TieredTable {
     /// The sweep seed's third stage over a batch of the `.quarantine`
     /// listing: the ids the replayed map references are appended to
     /// `revive`, for the caller to rename back before serving (ADR-0096 D3).
-    pub fn extent_seed_quarantined(&mut self, quarantined: &[u64], revive: &mut Vec<u64>) {
+    pub fn extent_seed_quarantined(
+        &mut self,
+        quarantined: &[u64],
+        revive: &mut crate::tiered_recover::IdChunks,
+    ) {
         self.extents.seed_quarantined(quarantined, revive);
     }
 

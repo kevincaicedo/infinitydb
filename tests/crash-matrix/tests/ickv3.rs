@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! M4.5-S36 `.ick` container v3 crash rows (ADR-0088 D3/D8): the aligned,
 //! direct-written checkpoint under the recovery driver's unchanged rules —
 //! "a file named `*.ick` is footer-complete; the MANIFEST is the only

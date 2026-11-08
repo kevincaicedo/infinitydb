@@ -770,6 +770,24 @@ rows=(
   # earlier grant of the position returns a grant whose owners still hold
   # it on a cell: the CREATE granted it finds the position held.
   "inf_canary_receipt_id_blind m4-ns-lifetimes REPLY:"
+  # ADR-0202 D1, D2, D5: a directory listing resumes one bounded batch at a
+  # time, and every name present from the open to its end is returned once.
+  # Planted, the std stream drops the name a full batch could not take.
+  "inf_canary_listing_carry_dropped crate-test inf-log test:dir_listing a_listing_ends_its_batches_at_both_bounds returned 0 times"
+  # The in-memory streams resume at their batch's first name, not its
+  # greatest: the next batch returns that batch's names again.
+  "inf_canary_listing_resume_rewinds crate-test inf-log test:dir_listing a_listing_ends_its_batches_at_both_bounds mem: ONCE:"
+  # A stream answers More with an empty batch before its End.
+  "inf_canary_listing_more_empty crate-test inf-log test:dir_listing a_listing_ends_its_batches_at_both_bounds MORE EMPTY"
+  # ADR-0174 A1, ADR-0202: the start step's tier map runs under the step
+  # budget, one unit at a time. Planted, it asks its budget only between
+  # namespaces: a namespace's files and whole listing run in one step.
+  "inf_canary_recover_map_whole crate-test inf-server test:recover_replay_steps the_start_of_a_boot_at_size_is_mapped_under_the_step_judge JUDGE"
+  # Planted, a reseal verifies every retained frame in one unit.
+  "inf_canary_recover_reseal_whole crate-test inf-server test:recover_replay_steps the_start_of_a_boot_at_size_is_mapped_under_the_step_judge JUDGE"
+  # ADR-0202 D3: a listed name the stream returns again after its removal
+  # is that earlier removal. Planted, the second removal refuses the boot.
+  "inf_canary_recover_listing_repeat_refused crate-test inf-server test:recover_replay_steps the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal REPEAT: the boot refused"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

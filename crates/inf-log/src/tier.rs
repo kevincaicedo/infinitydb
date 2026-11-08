@@ -15,11 +15,10 @@
 //! fdatasync. A record never spans files; sealing cuts only at record
 //! boundaries (the flush pipeline's contract, [`crate::flush`]).
 //!
-//! Recovery reopens an unsealed file through
-//! [`TierWriter::open_existing`] with the **manifested** durable length
-//! as the sole authority (ADR-0056 D5): bytes beyond it are dead-life
-//! garbage, truncated before any new flush — never trusted, never
-//! "recovered". [`inspect_tier_bytes`] is the typed, iterative,
+//! Recovery reseals an unsealed file through [`TierReseal`] with the
+//! **manifested** durable length as the sole authority (ADR-0056 D5):
+//! bytes beyond it are dead-life garbage, truncated before any new flush —
+//! never trusted, never "recovered". [`inspect_tier_bytes`] is the typed, iterative,
 //! bounded decoder for untrusted disk bytes (`fuzz_tierfile_decode`
 //! drives it — L9). fsync failure anywhere on this path is
 //! fatal-by-default (§8.4; ADR-0056 D4) — surfaced typed via
@@ -421,6 +420,151 @@ pub struct TierIdentity {
     pub base: LogicalAddr,
 }
 
+/// An unsealed tier file's reseal in progress (ADR-0056 D5), cut into its
+/// three kinds of unit so a recovery step can stop between frames: its open
+/// ([`open`](Self::open): the open, the header read and check, the truncate
+/// to the manifested frames), its frame reads ([`verify`](Self::verify),
+/// each CRC-checked) and its seal ([`VerifiedTier::seal`]: the `Recovered`
+/// footer and one barrier). It holds the one handle recovery writes the file
+/// through from its open to its seal, the next frame to verify and the frame
+/// count; while a cell recovers, recovery is the file's only writer, so a
+/// frame verified before a stop is the same bytes after it. A cut anywhere
+/// before the seal's barrier leaves the file unsealed, and the next boot
+/// reseals it again.
+pub struct TierReseal<F: SegmentFs> {
+    file: F::File,
+    path: PathBuf,
+    durable_len: u64,
+    /// The retained frames, `ceil(durable_len / TIER_FRAME_DATA)`.
+    frames: u64,
+    /// The next frame to verify, `<= frames`.
+    next: u64,
+    /// The end of the retained frames: the truncation's length and the
+    /// footer's offset.
+    cut: u64,
+    staging: FrameStaging,
+}
+
+/// A reseal whose every retained frame verified: made only by the
+/// [`TierReseal::verify`] call that reads the last one, and consumed by its
+/// [`seal`](Self::seal), so a seal before every frame verified does not
+/// compile.
+pub struct VerifiedTier<F: SegmentFs> {
+    file: F::File,
+    path: PathBuf,
+    durable_len: u64,
+    /// The footer's offset: the end of the retained frames.
+    footer_at: u64,
+    staging: FrameStaging,
+}
+
+/// What a [`TierReseal::verify`] call left.
+pub enum Verify<F: SegmentFs> {
+    /// Frames remain to verify: the reseal at its next frame.
+    More(TierReseal<F>),
+    /// Every retained frame verified.
+    Verified(VerifiedTier<F>),
+}
+
+impl<F: SegmentFs> TierReseal<F> {
+    /// The reseal's open unit: opens the manifested file `id` in `mode`,
+    /// verifies its header against `expect` and truncates it to the
+    /// manifested frames.
+    ///
+    /// # Errors
+    /// I/O failures from the fs seam; `InvalidData` when the header does
+    /// not verify or match `expect`.
+    pub fn open(
+        fs: &F,
+        shard_dir: &Path,
+        id: u32,
+        expect: TierIdentity,
+        durable_len: u64,
+        mode: TierIoMode,
+    ) -> io::Result<TierReseal<F>> {
+        let path = shard_dir.join("cold").join(tier_file_name(id));
+        let mut file = fs.open_tier(&path, mode)?;
+        let mut staging = FrameStaging::new(1);
+        read_block(&file, 0, staging.frame_mut())?;
+        let header = parse_tier_header(staging.frame_mut())
+            .map_err(|e| invalid(&path, format!("tier header: {e}")))?;
+        if header.identity != expect {
+            return Err(invalid(
+                &path,
+                format!(
+                    "tier identity mismatch: {:?} on disk, {expect:?} manifested",
+                    header.identity
+                ),
+            ));
+        }
+        let frames = durable_len.div_ceil(TIER_FRAME_DATA as u64);
+        let cut = TIER_HEADER_BYTES as u64 + frames * TIER_FRAME_BYTES as u64;
+        file.truncate(cut)?;
+        Ok(TierReseal { file, path, durable_len, frames, next: 0, cut, staging })
+    }
+
+    /// The retained frames not verified yet.
+    #[must_use]
+    pub fn frames_left(&self) -> u64 {
+        self.frames.saturating_sub(self.next)
+    }
+
+    /// The reseal's frame reads: CRC-checks the next retained frames, at
+    /// most `max` and at least one while any is left, each one block read
+    /// through the held handle, and answers what is left with the frames it
+    /// read. The call that reads the last frame answers `Verified`.
+    ///
+    /// # Errors
+    /// I/O failures; `InvalidData` when a frame at or below the manifested
+    /// watermark fails its CRC: served-data corruption, since the durable
+    /// copy is authoritative only when it verifies.
+    pub fn verify(mut self, max: u64) -> io::Result<(Verify<F>, u64)> {
+        let end = self.next.saturating_add(max.max(1)).min(self.frames);
+        let read = end.saturating_sub(self.next);
+        // Every retained frame must verify — the §3.1 durable copy is
+        // authoritative only when it does (bounded loop: `max` frames, one
+        // block read each).
+        for frame_index in self.next..end {
+            read_block(&self.file, tier_frame_offset(frame_index), self.staging.frame_mut())?;
+            let frame = self.staging.frame_mut();
+            let stored = u32::from_le_bytes(
+                frame[TIER_FRAME_DATA..TIER_FRAME_BYTES].try_into().expect("4 bytes"),
+            );
+            if crc32c(&frame[..TIER_FRAME_DATA]) != stored {
+                return Err(invalid(
+                    &self.path,
+                    format!("frame {frame_index} fails CRC below the manifested watermark"),
+                ));
+            }
+        }
+        self.next = end;
+        if self.next < self.frames {
+            return Ok((Verify::More(self), read));
+        }
+        let TierReseal { file, path, durable_len, cut, staging, .. } = self;
+        let verified = VerifiedTier { file, path, durable_len, footer_at: cut, staging };
+        Ok((Verify::Verified(verified), read))
+    }
+}
+
+impl<F: SegmentFs> VerifiedTier<F> {
+    /// The reseal's seal: the [`SealReason::Recovered`] footer at the
+    /// manifested length, then one fdatasync, which covers the
+    /// truncation, the footer and the final state — durable before any new
+    /// flush references the range. Answers the file's path.
+    ///
+    /// # Errors
+    /// I/O failures; an fsync-class failure is fatal to the cell, never
+    /// retried (ADR-0056 D4).
+    pub fn seal(mut self) -> io::Result<PathBuf> {
+        let footer = self.staging.frame_mut();
+        encode_tier_footer(footer, self.durable_len, SealReason::Recovered);
+        self.file.write_at(self.footer_at, footer)?;
+        self.file.sync_data()?;
+        Ok(self.path)
+    }
+}
+
 impl<F: SegmentFs> TierWriter<F> {
     /// Creates `shard_dir/cold/tier-NNNNNN.itier` in `mode` with its
     /// header block and dir-fsync barriers (a file must exist durably
@@ -488,15 +632,17 @@ impl<F: SegmentFs> TierWriter<F> {
     }
     /// Recovers an **unsealed** tier file to the manifested durable
     /// length and seals it there (ADR-0056 D5 — the recovery pre-flush
-    /// rule): verifies the header against `expect`, **truncates** to
-    /// exactly `header + ceil(durable_len / TIER_FRAME_DATA)` frames
-    /// (torn tails, un-manifested bytes, and stale footers beyond are
-    /// dead-life garbage — dropped, never trusted), CRC-verifies every
-    /// retained frame, writes a [`SealReason::Recovered`] footer at
-    /// `durable_len`, and fdatasyncs. The next flush starts a **new**
-    /// file at the adjacent base — recovery never resumes appends into
-    /// recovered frames, so no claimed byte is ever rewritten in place
-    /// (the torn-rewrite hazard v1 exists to remove).
+    /// rule), whole: the [`TierReseal`] units in their one order — the
+    /// open (the header verified against `expect`, the file **truncated**
+    /// to exactly `header + ceil(durable_len / TIER_FRAME_DATA)` frames:
+    /// torn tails, un-manifested bytes and stale footers beyond are
+    /// dead-life garbage, dropped, never trusted), every retained frame
+    /// CRC-verified, then the [`SealReason::Recovered`] footer at
+    /// `durable_len` and one fdatasync. The boot's recovery driver runs the
+    /// same units a step at a time. The next flush starts a **new** file at
+    /// the adjacent base — recovery never resumes appends into recovered
+    /// frames, so no claimed byte is ever rewritten in place (the
+    /// torn-rewrite hazard v1 exists to remove).
     ///
     /// # Errors
     /// I/O failures from the fs seam; `InvalidData` when the header does
@@ -512,46 +658,14 @@ impl<F: SegmentFs> TierWriter<F> {
         durable_len: u64,
         mode: TierIoMode,
     ) -> io::Result<PathBuf> {
-        let path = shard_dir.join("cold").join(tier_file_name(id));
-        let mut file = fs.open_tier(&path, mode)?;
-        let mut staging = FrameStaging::new(1);
-        read_block(&file, 0, staging.frame_mut())?;
-        let header = parse_tier_header(staging.frame_mut())
-            .map_err(|e| invalid(&path, format!("tier header: {e}")))?;
-        if header.identity != expect {
-            return Err(invalid(
-                &path,
-                format!(
-                    "tier identity mismatch: {:?} on disk, {expect:?} manifested",
-                    header.identity
-                ),
-            ));
-        }
-        let frames = durable_len.div_ceil(TIER_FRAME_DATA as u64);
-        let cut = TIER_HEADER_BYTES as u64 + frames * TIER_FRAME_BYTES as u64;
-        file.truncate(cut)?;
-        // Every retained frame must verify — the §3.1 durable copy is
-        // authoritative only when it does (bounded loop: `frames`).
-        for frame_index in 0..frames {
-            read_block(&file, tier_frame_offset(frame_index), staging.frame_mut())?;
-            let frame = staging.frame_mut();
-            let stored = u32::from_le_bytes(
-                frame[TIER_FRAME_DATA..TIER_FRAME_BYTES].try_into().expect("4 bytes"),
-            );
-            if crc32c(&frame[..TIER_FRAME_DATA]) != stored {
-                return Err(invalid(
-                    &path,
-                    format!("frame {frame_index} fails CRC below the manifested watermark"),
-                ));
+        let mut reseal = TierReseal::open(fs, shard_dir, id, expect, durable_len, mode)?;
+        // Bound: one call verifies every retained frame.
+        loop {
+            match reseal.verify(u64::MAX)?.0 {
+                Verify::More(rest) => reseal = rest,
+                Verify::Verified(verified) => return verified.seal(),
             }
         }
-        let footer = staging.frame_mut();
-        encode_tier_footer(footer, durable_len, SealReason::Recovered);
-        file.write_at(cut, footer)?;
-        // One barrier covers the truncation, the footer, and the final
-        // state — durable before any new flush references the range.
-        file.sync_data()?;
-        Ok(path)
     }
 
     /// First logical address of this file's range.
@@ -1675,6 +1789,89 @@ mod tests {
             TIER_HEADER_BYTES + 2 * TIER_FRAME_BYTES + TIER_FOOTER_BYTES,
             "un-manifested frames are gone"
         );
+    }
+
+    /// The reseal's three kinds of unit (ADR-0056 D5, cut into steps): a
+    /// reseal verified one frame a call reads each retained frame once,
+    /// answers `Verified` only at the call that reads the last, and seals
+    /// the bytes the whole reseal seals; dropped before its seal, it leaves
+    /// the file unsealed, and a later reseal seals it.
+    #[test]
+    fn a_reseal_a_frame_at_a_time_seals_what_the_whole_reseal_seals() {
+        let base = LogicalAddr::ZERO;
+        let identity = TierIdentity { cell: 0, ns: NsId(17), base };
+        let manifested = 5 * TIER_FRAME_DATA as u64 - 7;
+        let unsealed = |fs: &MemFs| {
+            let mut writer = TierWriter::create(
+                fs,
+                Path::new("shard-0"),
+                11,
+                0,
+                NsId(17),
+                base,
+                TierIoMode::Buffered,
+            )
+            .expect("create");
+            writer.append(base, &vec![0x5A; manifested as usize + 500]).expect("append");
+            writer.sync().expect("sync");
+        };
+        let open = |fs: &MemFs| {
+            TierReseal::open(
+                fs,
+                Path::new("shard-0"),
+                11,
+                identity,
+                manifested,
+                TierIoMode::Buffered,
+            )
+            .expect("the reseal's open")
+        };
+        let whole = MemFs::new();
+        unsealed(&whole);
+        let path = TierWriter::<MemFs>::recover_seal_existing(
+            &whole,
+            Path::new("shard-0"),
+            11,
+            identity,
+            manifested,
+            TierIoMode::Buffered,
+        )
+        .expect("the whole reseal");
+        let stepped = MemFs::new();
+        unsealed(&stepped);
+        let mut reseal = open(&stepped);
+        let reads = stepped.reads();
+        let mut calls = 0;
+        let verified = loop {
+            assert_eq!(reseal.frames_left(), 5 - calls, "one frame a call");
+            calls += 1;
+            match reseal.verify(1).expect("a frame verifies") {
+                (Verify::More(rest), 1) => reseal = rest,
+                (Verify::Verified(verified), 1) => break verified,
+                (_, read) => panic!("a call read {read} frames"),
+            }
+        };
+        assert_eq!(calls, 5, "Verified at the call that reads the last frame");
+        assert_eq!(stepped.reads() - reads, 5, "each retained frame read once");
+        verified.seal().expect("the seal");
+        assert_eq!(stepped.contents(&path), whole.contents(&path), "the whole reseal's bytes");
+        let cut = MemFs::new();
+        unsealed(&cut);
+        let (verify, read) = open(&cut).verify(2).expect("two frames");
+        assert!(matches!(verify, Verify::More(_)) && read == 2, "frames remain");
+        drop(verify); // a cut before the seal
+        let (_, footer) = probe_tier_file(&cut, &path).expect("probe");
+        assert!(footer.is_none(), "the file is still unsealed");
+        TierWriter::<MemFs>::recover_seal_existing(
+            &cut,
+            Path::new("shard-0"),
+            11,
+            identity,
+            manifested,
+            TierIoMode::Buffered,
+        )
+        .expect("the next boot's reseal");
+        assert_eq!(cut.contents(&path), whole.contents(&path), "the next boot seals it");
     }
 
     /// Recovery refuses a wrong identity and a corrupt retained frame —

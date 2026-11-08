@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! ADR-0174 D1 at the server tier, on the injected `MemFs` seam: a cell
 //! log whose tiered tail re-appends more than the namespace's RAM window
 //! (`MEM-BUDGET + MAINTAIN-SLICE`) boots through `open_cell_log` — replay

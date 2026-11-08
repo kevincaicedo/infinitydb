@@ -29,6 +29,7 @@ use crate::address_space::{Room, WindowFull};
 use crate::limits::{REPLAY_ROOM_ASKS_MAX, SETTLE_READ_CHARGE_BYTES, SETTLE_WALK_BYTE_CHARGE};
 use crate::record::{ColdKey, ColdKeyError};
 use crate::tiered::shadow::SettleCase;
+use crate::tiered_recover::IdChunks;
 
 /// Where the machine stands. Handed over is the machine consumed by
 /// [`TierReplay::hand_over`]; refused, the error that dropped it.
@@ -55,8 +56,8 @@ enum ReplayState {
 /// index, nothing appends), released once walked.
 #[derive(Debug)]
 enum ReleaseList {
-    Loading(Vec<u64>),
-    Releasing(Vec<u64>),
+    Loading(IdChunks),
+    Releasing(IdChunks),
     Released,
 }
 
@@ -492,7 +493,7 @@ impl<F: SegmentFs> TierReplay<F> {
             work: ReplayWork::default(),
             twins: Vec::new(),
             doomed: Vec::new(),
-            releases: ReleaseList::Loading(Vec::new()),
+            releases: ReleaseList::Loading(IdChunks::new()),
             key: Vec::with_capacity(crate::record::MAX_KEY_LEN),
             pending: None,
         }
@@ -891,7 +892,7 @@ impl<F: SegmentFs> TierReplay<F> {
     pub fn close_checkpoint(&mut self) -> usize {
         let list = match core::mem::replace(&mut self.releases, ReleaseList::Released) {
             ReleaseList::Loading(list) | ReleaseList::Releasing(list) => list,
-            ReleaseList::Released => Vec::new(),
+            ReleaseList::Released => IdChunks::new(),
         };
         let listed = list.len();
         self.releases = ReleaseList::Releasing(list);
@@ -919,8 +920,7 @@ impl<F: SegmentFs> TierReplay<F> {
         let ReleaseList::Releasing(list) = &self.releases else {
             return 0;
         };
-        let listed = list.get(at..).unwrap_or_default();
-        let walked = listed.len().min(max);
+        let walked = list.len().saturating_sub(at).min(max);
         if cfg!(inf_canary_replay_blob_release_skip) {
             // The planted canary breaks R9: a settled ref's blob
             // reference stays with no slot.
@@ -929,7 +929,8 @@ impl<F: SegmentFs> TierReplay<F> {
         if cfg!(inf_canary_replay_release_reordered) && at > 0 {
             // The planted canary breaks the settle order: a call that
             // resumes inside the list releases its batch in reverse.
-            for &addr in listed[..walked].iter().rev() {
+            let batch: Vec<u64> = list.iter_from(at).take(walked).collect();
+            for &addr in batch.iter().rev() {
                 if table.extents.reference_at(addr).is_some() {
                     table.extents.note_death(addr);
                     self.counters.blob_releases += 1;
@@ -939,7 +940,7 @@ impl<F: SegmentFs> TierReplay<F> {
         }
         // Bound: `max` listed addresses, each a map probe and a death.
         let mut released = 0u64;
-        for &addr in &listed[..walked] {
+        for addr in list.iter_from(at).take(walked) {
             if table.extents.reference_at(addr).is_some() {
                 table.extents.note_death(addr);
                 released += 1;
@@ -1440,6 +1441,7 @@ impl TieredTable {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: a whole listing of a fixture directory")]
 mod tests {
     use std::path::Path;
 

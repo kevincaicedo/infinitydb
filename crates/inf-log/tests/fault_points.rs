@@ -304,3 +304,60 @@ fn manifest_rename_fail_leaves_the_old_unit_authoritative() {
     write_manifest(&fs, &shard, &newer).expect("swap succeeds after the fault clears");
     assert_eq!(read_manifest(&fs, &shard).expect("readable").expect("present").ckpt_id, 2);
 }
+
+/// The listing tiers of the fault point under test, each with its
+/// directory: the in-memory and the simulated one (ADR-0202 D5; the std
+/// tier's errors are the kernel's).
+fn listing_tiers() -> (inf_log::fs::mem::MemFs, inf_log::fs::sim::SimDisk, PathBuf) {
+    let dir = PathBuf::from("data/shard-0/ns-17/cold");
+    use inf_log::fs::SegmentFs;
+    let mem = MemFs::new();
+    let sim = inf_log::fs::sim::SimDisk::new();
+    mem.create_dir_all(&dir).expect("dir");
+    sim.create_dir_all(&dir).expect("dir");
+    mem.create_meta(&dir.join("blob-000001.iblob")).expect("a name");
+    sim.create_meta(&dir.join("blob-000001.iblob")).expect("a name");
+    (mem, sim, dir)
+}
+
+/// ADR-0202 D5: `dir_listing_open_fail` refuses the open of a listing with
+/// the registry's injected error, on both tiers that carry it; the next
+/// open succeeds.
+#[test]
+fn dir_listing_open_fail_refuses_the_open() {
+    use inf_log::fs::{OpenedDir, SegmentFs};
+    fn refused<F: SegmentFs>(fs: &F, dir: &std::path::Path, tier: &str) {
+        fault::arm(inf_log::fault::DIR_LISTING_OPEN_FAIL, FaultSpec::Nth(1));
+        let err = fs.open_listing(dir).map(|_| ()).expect_err("the open is refused");
+        assert!(err.to_string().contains("injected fault: dir_listing_open_fail"), "{tier}: {err}");
+        assert!(matches!(fs.open_listing(dir).expect("then it opens"), OpenedDir::Open(_)));
+        fault::disarm_all();
+    }
+    let (mem, sim, dir) = listing_tiers();
+    refused(&mem, &dir, "mem");
+    refused(&sim, &dir, "sim");
+}
+
+/// ADR-0202 D5: `dir_listing_next_fail` fails a batch with the registry's
+/// injected error and leaves the batch holding no name; the stream answers
+/// the next call.
+#[test]
+fn dir_listing_next_fail_leaves_the_batch_empty() {
+    use inf_log::fs::{BatchEnd, DirStream, NameBatch, OpenedDir, SegmentFs};
+    fn failed<F: SegmentFs>(fs: &F, dir: &std::path::Path, tier: &str) {
+        let OpenedDir::Open(mut stream) = fs.open_listing(dir).expect("open") else {
+            panic!("{tier}: the directory is present")
+        };
+        let mut batch = NameBatch::new();
+        fault::arm(inf_log::fault::DIR_LISTING_NEXT_FAIL, FaultSpec::Nth(1));
+        let err = stream.next_batch(&mut batch).expect_err("the batch fails");
+        assert!(err.to_string().contains("injected fault: dir_listing_next_fail"), "{tier}: {err}");
+        assert!(batch.is_empty(), "{tier}: after an Err the batch holds no name");
+        assert_eq!(stream.next_batch(&mut batch).expect("then it lists"), BatchEnd::End);
+        assert_eq!(batch.len(), 1, "{tier}: the name");
+        fault::disarm_all();
+    }
+    let (mem, sim, dir) = listing_tiers();
+    failed(&mem, &dir, "mem");
+    failed(&sim, &dir, "sim");
+}

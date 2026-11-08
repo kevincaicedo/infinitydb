@@ -73,6 +73,12 @@
 //!   record's key window, ADR-0174 D3) — typed I/O error on the held handle: the boot refuses
 //!   typed, naming the namespace and the address; no boundary or cursor passed the unread record
 //!   and a `DEL` has changed nothing
+//! - `dir_listing_open_fail` — `MemFs::open_listing` and `SimDisk::open_listing` (the in-memory
+//!   and simulated tiers' streams, ADR-0202 D5) — the registry's injected error from the open:
+//!   every recovery consumer of a listing refuses the boot typed, as a listing error does; the std
+//!   tier's errors are the kernel's
+//! - `dir_listing_next_fail` — the same tiers' `next_batch` — the injected error from a batch, the
+//!   batch left holding no name: the consumer refuses the boot typed, its stream dropped
 //!
 //! **Torn-prefix physics (F-L04-14, ADR-0119 A1).** Every point that
 //! lands a prefix (`*_torn_frame`, `*_short_write`) lands it on the
@@ -112,6 +118,8 @@ pub const BLOB_UNLINK_FAIL: &str = "blob_unlink_fail";
 pub const TIER_WRITE_NOSPACE: &str = "tier_write_nospace";
 pub const BLOB_WRITE_NOSPACE: &str = "blob_write_nospace";
 pub const REPLAY_SETTLE_READ_FAIL: &str = "replay_settle_read_fail";
+pub const DIR_LISTING_OPEN_FAIL: &str = "dir_listing_open_fail";
+pub const DIR_LISTING_NEXT_FAIL: &str = "dir_listing_next_fail";
 
 /// Inventory for the CI coverage check and the S18 sim-disk scheduler.
 pub const ALL: &[&str] = &[
@@ -136,6 +144,8 @@ pub const ALL: &[&str] = &[
     TIER_WRITE_NOSPACE,
     BLOB_WRITE_NOSPACE,
     REPLAY_SETTLE_READ_FAIL,
+    DIR_LISTING_OPEN_FAIL,
+    DIR_LISTING_NEXT_FAIL,
 ];
 
 /// The injected error a firing point surfaces (named, greppable).

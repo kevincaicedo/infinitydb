@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! M4-S17 blob-extent crash rows (ADR-0061 D3/D5/D9) — carried at the
 //! node tier per `m4.toml`:
 //!
@@ -484,7 +488,8 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     // quarantines the header-valid file on this boot (the bytes leave
     // the listing but survive the life) and unlinks the twin only on
     // the next boot's second verdict.
-    assert!(t.extent_sweep_seed(&recovered.extents_listed, &[]).is_empty(), "nothing to revive");
+    let listed = recovered.extents_listed.to_vec();
+    assert!(t.extent_sweep_seed(&listed, &[]).is_empty(), "nothing to revive");
     let work = t.extent_reclaim_work(0, 8);
     assert_eq!(
         work,

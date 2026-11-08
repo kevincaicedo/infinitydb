@@ -209,3 +209,29 @@ const _: () = assert!(
     (TIER_ROUND_WRITES_MAX + TIER_ROUND_BARRIERS_MAX) as usize <= ROUND_OPS_MAX,
     "a round's ops fit the token op index"
 );
+
+/// Names one directory listing call returns (ADR-0202 D2): a `NameBatch`
+/// holds at most this many, its capacity fixed at `NameBatch::new`. Owner:
+/// the batch, the one bound of every listing of the seam. Crossing: the
+/// batch ends and the next `next_batch` call continues the stream, which
+/// keeps its position.
+pub const LISTING_BATCH_NAMES: usize = 256;
+
+/// Name bytes one directory listing call returns (ADR-0202 D2), the batch's
+/// byte capacity, fixed at `NameBatch::new`. Owner: the batch. Crossing: a
+/// name that does not fit is carried whole to the next call, so a stream
+/// holds at most one carried name; a name never splits.
+pub const LISTING_BATCH_BYTES: usize = 8 << 10;
+
+/// The longest directory entry name a listing accepts, in bytes (ADR-0202
+/// D2). `NAME_MAX` is 255 on ext4, xfs, tmpfs and btrfs, and macOS's
+/// `d_name` holds 1,024, so no supported filesystem reaches it. Owner: every
+/// tier's stream. Crossing: a longer name refuses the listing with
+/// `InvalidData` naming the directory; it is never skipped.
+pub const LISTING_NAME_BYTES_MAX: usize = 1 << 10;
+
+// An empty batch takes any name the listing accepts, so a carried name
+// always fits the next call and `More` never answers an empty batch; a
+// name's end fits the batch's 16-bit end offsets.
+const _: () = assert!(LISTING_NAME_BYTES_MAX <= LISTING_BATCH_BYTES, "a name fits an empty batch");
+const _: () = assert!(LISTING_BATCH_BYTES <= u16::MAX as usize, "a name end fits 16 bits");
