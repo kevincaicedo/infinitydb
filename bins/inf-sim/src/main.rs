@@ -15,6 +15,7 @@
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
 )]
 
+use inf_sim::coldstorm::{COLD_IDENTITY_PAIRS, ColdLeg};
 use inf_sim::net::Plant;
 use inf_sim::{
     CombinedScenario, DurableScenario, EpochMarksLeg, ExtentWindowLeg, LedgerWedgeLeg, Scenario,
@@ -93,6 +94,10 @@ fn main() {
     let mut window_leg: Option<ExtentWindowLeg> = None;
     // m2-ledger-wedge's leg, named the same way.
     let mut wedge_leg: Option<LedgerWedgeLeg> = None;
+    // m4-cold's leg (the storm when unnamed) and the identity leg's issuer
+    // position.
+    let mut cold_leg: Option<ColdLeg> = None;
+    let mut cold_identity_start: Option<u64> = None;
     // TM3's leg of m2-fill-tick and m2-group-hold: the loops at spin 0.
     let mut park_at_once = false;
 
@@ -171,6 +176,21 @@ fn main() {
                         format!("unknown window leg {name}; the legs are {}", window_leg_names())
                     })?);
                 }
+                "--cold-leg" => {
+                    let name = take("--cold-leg")?;
+                    cold_leg = Some(ColdLeg::parse(&name).ok_or_else(|| {
+                        format!("unknown cold leg {name}; the legs are {}", cold_leg_names())
+                    })?);
+                }
+                "--cold-identity-start" => {
+                    let start = parse_seed(&take("--cold-identity-start")?)?;
+                    if start >= COLD_IDENTITY_PAIRS {
+                        return Err(format!(
+                            "--cold-identity-start {start:#x}: a pair position below 2^55"
+                        ));
+                    }
+                    cold_identity_start = Some(start);
+                }
                 // m4-cold: total op count (the AC's 10⁶ run sets it; the
                 // smoke default is lighter).
                 "--ops" => {
@@ -185,6 +205,7 @@ fn main() {
                          [--replay-canary] [--lift-regime] [--replay-above-window] \
                          [--spec-variant ring-top|page] [--tier-leg {}] [--marks-leg {}] \
                          [--window-leg {}] [--wedge-leg {}] [--park-at-once] \
+                         [--cold-leg {}] [--cold-identity-start N] \
                          [--cells N] [--connections N] [--commands N] [--wheel-nodes-max N] \
                          [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
@@ -192,7 +213,8 @@ fn main() {
                         tier_leg_names(),
                         marks_leg_names(),
                         window_leg_names(),
-                        wedge_leg_names()
+                        wedge_leg_names(),
+                        cold_leg_names()
                     );
                     std::process::exit(0);
                 }
@@ -273,6 +295,33 @@ fn main() {
             eprintln!("inf-sim: --wedge-leg is m2-ledger-wedge's; {other} has no leg");
             std::process::exit(2);
         }
+    }
+    // m4-cold names its leg or runs the storm, and only it has one.
+    match (scenario_name.as_str(), cold_leg) {
+        ("m4-cold", _) | (_, None) => {}
+        (other, Some(_)) => {
+            eprintln!("inf-sim: --cold-leg is m4-cold's; {other} has no cold leg");
+            std::process::exit(2);
+        }
+    }
+    // The identity leg needs its issuer position, and only it takes one.
+    match (cold_leg == Some(ColdLeg::Identity), cold_identity_start) {
+        (true, None) => {
+            eprintln!("inf-sim: --cold-leg identity needs --cold-identity-start N");
+            std::process::exit(2);
+        }
+        (true, Some(_)) | (false, None) => {}
+        (false, Some(_)) => {
+            eprintln!("inf-sim: --cold-identity-start is the identity leg's (--cold-leg identity)");
+            std::process::exit(2);
+        }
+    }
+    // --ops sizes the storm; every other cold leg's shape is fixed.
+    if let Some(leg) = cold_leg.filter(|leg| *leg != ColdLeg::Storm)
+        && ops_override.is_some()
+    {
+        eprintln!("inf-sim: --ops sizes the storm; the {} leg's shape is fixed", leg.name());
+        std::process::exit(2);
     }
     // m4-extent-window names its leg, and only it has one.
     match (scenario_name.as_str(), window_leg) {
@@ -1567,7 +1616,20 @@ fn main() {
         if let Some(ops) = ops_override {
             scenario.ops = ops;
         }
+        scenario.leg = cold_leg.unwrap_or_default();
+        scenario.identity_start = cold_identity_start;
         let report = inf_sim::run_cold_storm_scenario(&scenario);
+        println!(
+            "inf-sim: m4-cold leg {}: {} rounds; a round's most: {} received, {} orphaned, {} \
+             delivered, {} issued ({} by one drain call)",
+            report.leg.name(),
+            report.rounds.len(),
+            report.round_max(|r| r.received),
+            report.round_max(|r| r.orphaned),
+            report.round_max(|r| r.delivered),
+            report.round_max(|r| r.issued),
+            report.round_max(|r| r.issued_drain_max)
+        );
         println!(
             "inf-sim: scenario m4-cold seed {seed:#x}: {} gets ({} cold, {} chunked, {} \
              restarts, {} cancelled [{} early / {} late]), {} merged waiters (queue hw {}), \
@@ -1770,6 +1832,11 @@ fn print_accept_retry(report: &inf_sim::harness::accept_retry::RetryReport) {
 /// The `--tier-leg` names, `|`-joined for a message.
 fn tier_leg_names() -> String {
     TierBudgetLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
+}
+
+/// The `--cold-leg` names, `|`-joined for a message.
+fn cold_leg_names() -> String {
+    ColdLeg::ALL.iter().map(|(_, name)| *name).collect::<Vec<_>>().join("|")
 }
 
 /// The `--marks-leg` names, `|`-joined for a message.

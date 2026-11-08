@@ -583,3 +583,72 @@ fn sixty_five_due_timers_take_two_turns_and_no_park() {
         );
     }
 }
+
+/// Where one iteration offers the cold host its delivery, and when the
+/// task woken by this turn's replies polls: the fixture's two marks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderMark {
+    Delivery,
+    Poll,
+}
+
+/// The delivery-placement fixture: FABRIC-IN spawns one task, ready at
+/// once, which records its poll; the plane records a mark where a cold
+/// delivery can run, which at HEAD is the head of `parse_execute`.
+struct DeliveryOrderPlane {
+    trace: Rc<std::cell::RefCell<Vec<OrderMark>>>,
+    spawned: bool,
+}
+
+impl CellPlane for DeliveryOrderPlane {
+    fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
+        panic!("the fixture issues no op: {c:?}");
+    }
+    fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {
+        assert!(!self.spawned, "the fixture admits one task");
+        self.spawned = true;
+        let trace = Rc::clone(&self.trace);
+        cx.executor.spawn_local(async move {
+            trace.borrow_mut().push(OrderMark::Poll);
+        });
+    }
+    fn parse_execute(&mut self, _cx: &mut LoopCx<'_>) {
+        self.trace.borrow_mut().push(OrderMark::Delivery);
+    }
+    fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+}
+
+/// One iteration of the fixture: its marks in order, after its controls
+/// (one driver entry, one poll, nothing pushed, no buffer leased or staged).
+fn delivery_order(remote_first_execute: bool) -> Vec<OrderMark> {
+    let config =
+        LoopConfig { spin_iters: 0, exec_budget: 1, remote_first_execute, ..LoopConfig::default() };
+    let mut lp = test_loop(config);
+    let trace = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut plane = DeliveryOrderPlane { trace: Rc::clone(&trace), spawned: false };
+    let stats = lp.run_iteration(&mut plane).expect("iteration");
+    assert_eq!(lp.driver().waits.len(), 1, "one driver entry");
+    assert_eq!(lp.driver().pushed, 0, "nothing pushed");
+    assert_eq!(stats.polled, 1, "one task poll");
+    assert_eq!((lp.pool().leased(), lp.pool().staged()), (0, 0), "no buffer held");
+    trace.take()
+}
+
+/// A turn's cold delivery runs before any task woken by its replies polls,
+/// in both `remote_first_execute` modes, so a resumed task never runs ahead
+/// of the delivery its turn owes (ADR-0181 R2). The default mode places the
+/// mark first, the control; with `remote_first_execute` the loop polls the
+/// woken task before `parse_execute`, the first place HEAD gives a delivery.
+#[test]
+#[ignore = "with remote_first_execute the loop polls tasks woken by the turn's replies before \
+            parse_execute, the first place a turn can deliver cold reads, so a resumed task runs \
+            ahead of the turn's delivery; red until the delivery runs before either poll"]
+fn a_turns_cold_delivery_precedes_a_woken_tasks_poll_in_both_modes() {
+    let marks = [OrderMark::Delivery, OrderMark::Poll];
+    assert_eq!(delivery_order(false), marks, "the control: the default mode");
+    assert_eq!(
+        delivery_order(true),
+        marks,
+        "with remote_first_execute a woken task polled before the turn's delivery"
+    );
+}

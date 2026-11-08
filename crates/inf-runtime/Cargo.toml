@@ -52,6 +52,12 @@ name = "timer_ab"
 harness = false
 test = false
 
+# The cold-read path's A/B by instructions (ADR-0181): the host's legs.
+[[bench]]
+name = "cold_path"
+harness = false
+test = false
+
 # M0-S04 echo gate (Linux + uring only; skipped without the feature).
 [[bench]]
 name = "uring_echo"

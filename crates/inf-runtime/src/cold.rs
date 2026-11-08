@@ -1601,4 +1601,504 @@ mod tests {
             Poll::Pending => panic!("value was parked; first poll must be Ready"),
         }
     }
+
+    /// Counts the wakes its tasks receive: the delivery oracle reads this
+    /// waker, never the host's counters.
+    #[derive(Default)]
+    struct WakeCount(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for WakeCount {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// One device read of `members` identical requests, each polled to
+    /// `Pending` under a counting waker, then its one receipt: returns the
+    /// wakes that receipt made. Every value is then polled, read as the
+    /// receipt's error and dropped, and custody reconciles.
+    fn wakes_of_one_receipt(members: usize) -> usize {
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+        let config =
+            ColdReadConfig { qd_cap: 1, overflow_cap: members, ..ColdReadConfig::default() };
+        let cold = shaped(1, config);
+        let file = TierFileId::new(77);
+        let count = std::sync::Arc::new(WakeCount::default());
+        let waker = Waker::from(std::sync::Arc::clone(&count));
+        let mut cx = Context::from_waker(&waker);
+        let mut waits: Vec<ColdWait> = (0..members).map(|_| ask(&cold, 99, file, 0, 8)).collect();
+        for wait in &mut waits {
+            assert!(core::pin::Pin::new(wait).poll(&mut cx).is_pending(), "nothing delivered yet");
+        }
+        let ops = drain_ops(&cold);
+        assert_eq!(ops.len(), 1, "the {members} identical requests merge into one device read");
+        let IoOp::TierRead { token, .. } = ops[0] else { panic!("drain builds TierRead") };
+        let result = CompletionResult::Error { errno: libc::EIO, buf: None };
+        let delivered = cold.on_completion(token, result, 1);
+        let wakes = count.0.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(delivered as usize, members, "engagement: every member was delivered");
+        for mut wait in waits {
+            let Poll::Ready(done) = core::pin::Pin::new(&mut wait).poll(&mut cx) else {
+                panic!("a delivered member is ready");
+            };
+            assert_eq!(done.outcome(), Err(libc::EIO), "each member carries the receipt's error");
+        }
+        drop(ops);
+        assert_eq!(cold.reconcile(), Ok(()), "every value dropped: custody is back");
+        wakes
+    }
+
+    /// A turn delivers at most 64 members (`COLD_DELIVERIES_PER_TURN`,
+    /// ADR-0181 R1) and a device receipt delivers none: it marks its window
+    /// ready for the turn's delivery. Here 65 identical requests merge into
+    /// one device read whose one receipt is routed. The oracle is the
+    /// waker's count, independent of the host; the one-member read engages
+    /// it, one receipt and one wake.
+    #[test]
+    #[ignore = "one device receipt builds and delivers its whole cohort before it returns, so a \
+                65-member read wakes 65 tasks in one call; red until a receipt delivers no member \
+                and a turn delivers at most 64"]
+    fn one_receipt_delivers_at_most_a_turns_allowance() {
+        const DELIVERIES_PER_TURN: usize = 64;
+        assert_eq!(wakes_of_one_receipt(1), 1, "engagement: one member, one wake");
+        let members = DELIVERIES_PER_TURN + 1;
+        let wakes = wakes_of_one_receipt(members);
+        assert!(
+            wakes <= DELIVERIES_PER_TURN,
+            "one receipt of a {members}-member read woke {wakes} tasks in one call; a turn \
+             delivers at most {DELIVERIES_PER_TURN}"
+        );
+    }
+
+    /// A drain call's preparation is bounded: it spends at most 64 work
+    /// units (`COLD_PREPARATION_WORK_PER_TURN`, ADR-0181 R3), a seed's head
+    /// inspection and finish cost 3, so a call issues at most 21 reads when
+    /// no request can join another; and a seed inspects only the requests
+    /// queued in its own and its two neighbouring buckets of its file. The
+    /// fixture: 64 live requests on 64 files, which the device cap and the
+    /// pool admit whole, then a 65th on a 65th file, cancelled, at the tail.
+    /// One call at HEAD issues all 64, its seeds visiting 63 + 62 + … + 0 =
+    /// 2,016 candidates, and its first seed's scan reaches the tail and
+    /// purges the cancelled request, on a file no seed can join.
+    #[test]
+    #[ignore = "a drain call issues to the device cap and each seed rescans every queued request \
+                of its class, so one call's work grows with the queue; red until a call spends at \
+                most 64 work units and a seed inspects only requests in its own buckets"]
+    fn a_drain_call_spends_a_bounded_preparation_allowance() {
+        const QD: usize = 64;
+        const ISSUES_PER_CALL_MAX: usize = 21;
+        const STRIDE: u64 = 16;
+        let config =
+            ColdReadConfig { qd_cap: QD, overflow_cap: 4 * QD, ..ColdReadConfig::default() };
+        let cold = shaped(QD, config);
+        let file = |rank: u64| TierFileId::new(u32::try_from(rank + 1).expect("fixture rank"));
+        let ranks = u64::try_from(QD).expect("fixture depth");
+        let live: Vec<ColdWait> =
+            (0..ranks).map(|rank| ask(&cold, 3, file(rank), rank * STRIDE, 8)).collect();
+        drop(ask(&cold, 3, file(ranks), ranks * STRIDE, 8));
+        let ops = drain_ops(&cold);
+        for (rank, op) in (0u64..).zip(&ops) {
+            let IoOp::TierRead { offset, buf, .. } = op else { panic!("drain builds TierRead") };
+            assert_eq!(offset.bytes(), rank * STRIDE, "engagement: FIFO admission order");
+            assert_eq!(buf.len(), 8, "engagement: an unmerged window");
+        }
+        let purged = cold.counters().cancelled_queued;
+        assert!(
+            ops.len() <= ISSUES_PER_CALL_MAX,
+            "one drain call issued {} reads over {QD} requests no seed can join, and a seed's \
+             scan reached the cancelled request at the tail ({purged} purged); a call spends at \
+             most 64 work units, 3 a seed",
+            ops.len()
+        );
+        assert_eq!(purged, 0, "a seed's scan reached a request on another file");
+        drop((live, ops));
+    }
+
+    /// The read counter never repeats a live identity. A token packs a
+    /// lifetime counter into 56 bits, so the mint after 2^56 − 1 carries id
+    /// 0's bits. The first read, id 0, stays queued; the counter is set to
+    /// its last value, which a second read takes; the third must be refused
+    /// for good with nothing changed, or carry a fresh identity, and the two
+    /// admitted reads still issue. HEAD mints id 0's token again, and the
+    /// gate's duplicate-key assert ends the cell.
+    #[test]
+    #[ignore = "the read counter packs 56 bits with no exhaustion test, so the mint after 2^56 - 1 \
+                repeats the first token and a live first read ends the cell at the gate's \
+                duplicate-key assert; red until the issuer refuses for good, changing nothing, \
+                before it repeats an identity"]
+    fn the_read_counter_never_repeats_a_live_identity() {
+        let cold = path(2);
+        let file = TierFileId::new(21);
+        let first = ask(&cold, 3, file, 0, 64);
+        cold.state.borrow_mut().next_read = (1 << 56) - 1;
+        let last = ask(&cold, 3, file, FRAME, 64);
+        let before = footprint(&cold, file);
+        match cold.enqueue(3, file, 2 * FRAME, 64, ReadClass::Foreground, 0) {
+            Ok(next) => {
+                let state = cold.state.borrow();
+                let live: std::collections::BTreeSet<u64> =
+                    state.pending[0].iter().map(|intent| intent.token.as_u64()).collect();
+                assert_eq!(live.len(), 3, "three live requests carry three identities");
+                drop(state);
+                drop(next);
+            }
+            Err(refused) => {
+                assert_ne!(refused, ColdRefused::QueueFull, "exhaustion is permanent, not a wait");
+                assert_eq!(footprint(&cold, file), before, "a refusal changes nothing");
+            }
+        }
+        let ops = drain_ops(&cold);
+        assert_eq!(ops.len(), 2, "the admitted reads issue after the refusal");
+        drop((first, last, ops));
+    }
+
+    /// A custody case's terminal receipt: success or `EIO`.
+    #[derive(Clone, Copy, Debug)]
+    enum Receipt {
+        Success,
+        Error,
+    }
+
+    impl Receipt {
+        fn result(self) -> CompletionResult {
+            match self {
+                Receipt::Success => CompletionResult::TierRead,
+                Receipt::Error => CompletionResult::Error { errno: libc::EIO, buf: None },
+            }
+        }
+
+        /// A success reads the pool's zeroed bytes (no device wrote them);
+        /// an error's bytes are never read.
+        fn check(self, done: &ColdDone, len: usize) {
+            match self {
+                Receipt::Success => {
+                    assert_eq!(done.outcome(), Ok(()));
+                    done.bytes(|bytes| assert_eq!(bytes, vec![0u8; len].as_slice()));
+                }
+                Receipt::Error => assert_eq!(done.outcome(), Err(libc::EIO)),
+            }
+        }
+    }
+
+    /// The custody the host reports: its leak report, or all zeros.
+    fn custody(cold: &ColdReads) -> ColdLeak {
+        cold.reconcile().err().unwrap_or(ColdLeak {
+            leased: 0,
+            inflight: 0,
+            pinned_files: 0,
+            queued: 0,
+            windows: 0,
+        })
+    }
+
+    /// One custody case at a pool of 3, a device depth of 1 and class queues
+    /// of 4, each window `members` identical requests; returns the planted
+    /// controls it rejected.
+    fn custody_case(members: usize, receipt: Receipt) -> u32 {
+        const POOL: usize = 3;
+        const CLASS_QUEUE: usize = 4;
+        const QUEUED: usize = 2 * CLASS_QUEUE;
+        const LEN: usize = 8;
+        let config = ColdReadConfig {
+            qd_cap: 1,
+            overflow_cap: CLASS_QUEUE,
+            merge: members > 1,
+            ..ColdReadConfig::default()
+        };
+        let cold = shaped(POOL, config);
+        assert_eq!(cold.pool_reserved_bytes(), (POOL * BUF) as u64);
+        let window_file = |window: usize| TierFileId::new(100 + window as u32);
+        let queued_file = |index: usize| TierFileId::new(200 + index as u32);
+        let mut held: Vec<ColdWait> = Vec::new();
+        for window in 0..POOL {
+            for _ in 0..members {
+                held.push(
+                    cold.enqueue(30, window_file(window), 0, LEN, ReadClass::Foreground, 10)
+                        .expect("room"),
+                );
+            }
+            let mut ops = drain_ops(&cold);
+            assert_eq!(ops.len(), 1, "one device read a window");
+            let IoOp::TierRead { fd, offset, ref buf, token } = ops[0] else { panic!("TierRead") };
+            assert_eq!((fd, offset.bytes(), buf.len() as usize), (30, 0, LEN));
+            assert_eq!(cold.inflight_on(window_file(window)) as usize, members);
+            assert_eq!(cold.on_completion(token, receipt.result(), 20) as usize, members);
+            ops.clear();
+            let expected = ColdLeak {
+                leased: window + 1,
+                inflight: 0,
+                pinned_files: window + 1,
+                queued: 0,
+                windows: window + 1,
+            };
+            assert_eq!(custody(&cold), expected, "a completed window keeps its buffer and pin");
+        }
+        let mut queued: Vec<ColdWait> = (0..QUEUED)
+            .map(|index| {
+                let class =
+                    if index < CLASS_QUEUE { ReadClass::Foreground } else { ReadClass::Maintain };
+                cold.enqueue(30, queued_file(index), 0, LEN, class, 30).expect("the class's room")
+            })
+            .collect();
+        let retained = ColdLeak {
+            leased: POOL,
+            inflight: 0,
+            pinned_files: POOL + QUEUED,
+            queued: QUEUED,
+            windows: POOL,
+        };
+        assert_eq!(custody(&cold), retained);
+        assert!(drain_ops(&cold).is_empty(), "every buffer is held: nothing issues");
+        assert_eq!(custody(&cold), retained);
+        let admitted = cold.counters().enqueued;
+        for (index, class) in [ReadClass::Foreground, ReadClass::Maintain].into_iter().enumerate() {
+            let refused = TierFileId::new(999 + index as u32);
+            let asked = cold.enqueue(30, refused, 0, LEN, class, 30);
+            assert!(matches!(asked, Err(ColdRefused::QueueFull)), "a full class queue refuses");
+            assert_eq!(cold.inflight_on(refused), 0, "a refusal pins nothing");
+        }
+        assert_eq!(cold.counters().enqueued, admitted);
+        assert_eq!(custody(&cold), retained);
+        let mut plants = 0;
+        let logical = held.len() + queued.len();
+        // The holders' bound: both class queues, plus every window's members.
+        let bound = 2 * CLASS_QUEUE + POOL * members;
+        assert!(logical <= bound);
+        if members > 1 {
+            assert_eq!(logical, bound, "the merged fixture reaches its bound");
+            // Two wrong bounds the predicate must reject: the device depth in
+            // the pool's place, and one holder a window.
+            for wrong in [2 * CLASS_QUEUE + config.qd_cap * members, POOL + QUEUED] {
+                assert!(logical > wrong, "the plant engages and rejects bound {wrong}");
+                plants += 1;
+            }
+        }
+        let values: Vec<ColdDone> = held.drain(..).map(block_on_ready).collect();
+        for (index, done) in values.iter().enumerate() {
+            assert_eq!(done.file(), window_file(index / members));
+            receipt.check(done, LEN);
+        }
+        assert_eq!(custody(&cold), retained, "polling a value moves no custody");
+        if members > 1 {
+            let at_poll = ColdLeak {
+                leased: 0,
+                inflight: 0,
+                pinned_files: QUEUED,
+                queued: QUEUED,
+                windows: 0,
+            };
+            assert_ne!(custody(&cold), at_poll, "a release at the poll is rejected");
+            plants += 1;
+        }
+        let mut values = values.into_iter();
+        for done in values.by_ref().take(members - 1) {
+            drop(done);
+        }
+        assert_eq!(cold.inflight_on(window_file(0)), 1, "the window's last value keeps its pin");
+        assert_eq!(custody(&cold), retained);
+        let one_returned = ColdLeak {
+            leased: POOL - 1,
+            inflight: 0,
+            pinned_files: POOL + QUEUED - 1,
+            queued: QUEUED,
+            windows: POOL - 1,
+        };
+        if members > 1 {
+            assert_ne!(custody(&cold), one_returned, "a release before the last value is rejected");
+            plants += 1;
+        }
+        drop(values.next().expect("the first window's last value"));
+        assert_eq!(cold.inflight_on(window_file(0)), 0);
+        assert_eq!(custody(&cold), one_returned, "exactly that window's buffer and pin return");
+        drop(values);
+        let only_queued =
+            ColdLeak { leased: 0, inflight: 0, pinned_files: QUEUED, queued: QUEUED, windows: 0 };
+        assert_eq!(custody(&cold), only_queued);
+        for (index, wait) in queued.drain(..).enumerate() {
+            assert_eq!(cold.inflight_on(queued_file(index)), 1, "a queued request keeps its pin");
+            drop(wait);
+        }
+        assert_eq!(custody(&cold), only_queued, "a cancelled request keeps its pin until a drain");
+        assert!(drain_ops(&cold).is_empty(), "the purge issues nothing");
+        assert_eq!(cold.reconcile(), Ok(()));
+        let counts = cold.counters();
+        assert_eq!(counts.enqueued, logical as u64);
+        assert_eq!(counts.issued, POOL as u64);
+        assert_eq!(counts.merged_waiters, (POOL * (members - 1)) as u64);
+        assert_eq!(counts.delivered, (POOL * members) as u64);
+        assert_eq!(counts.cancelled_queued, QUEUED as u64);
+        assert_eq!((counts.unclaimed, counts.queue_full, counts.pool_dry), (0, 2, 1));
+        assert_eq!(counts.queue_depth_high_water, QUEUED as u32);
+        let (completed, errored) = match receipt {
+            Receipt::Success => (POOL as u64, 0),
+            Receipt::Error => (0, POOL as u64),
+        };
+        assert_eq!((counts.completed, counts.errored), (completed, errored));
+        assert_eq!(
+            counts.enqueued,
+            counts.issued + counts.merged_waiters + counts.cancelled_queued
+        );
+        plants
+    }
+
+    /// The custody instrument: who holds a buffer, a window and a pin from
+    /// enqueue to a window's last value. Each of three files takes one read,
+    /// singleton or four identical requests merged, issued and completed,
+    /// its values kept; both class queues then fill on other files, which no
+    /// drain can issue with every buffer held, and a fifth request in each
+    /// class is refused before it pins. Polling moves no custody; dropping
+    /// all but a window's last value returns nothing; the last returns that
+    /// window's buffer and pin alone; the cancelled queue purges with no
+    /// device read. The planted controls (a wrong holder bound, a release at
+    /// the poll or before the last value) must not match what was observed.
+    #[test]
+    fn custody_holds_until_a_windows_last_value() {
+        let mut plants = 0;
+        for receipt in [Receipt::Success, Receipt::Error] {
+            for members in [1, 4] {
+                plants += custody_case(members, receipt);
+            }
+        }
+        assert_eq!(plants, 8, "every planted control engaged");
+    }
+
+    /// The fixed stores' entries as the cold host lays them out, built from
+    /// the real component types (`SlotId<u32>`, `FileOffset`, `AlignedBufId`,
+    /// `TierFileId`); the gate's hold, a claim on one holder slot, is one
+    /// `SlotId<u32>`. They are measured by `size_of` before any store holds
+    /// them.
+    #[allow(dead_code, reason = "layout carriers: measured by size_of, never built")]
+    mod layout {
+        use core::num::NonZeroU64;
+
+        use inf_alloc::AlignedBufId;
+        use inf_foundation::FileOffset;
+        use inf_foundation::bounded::SlotId;
+
+        use crate::cold::TierFileId;
+        use crate::driver::RawFd;
+
+        /// A logical or device id: the packed `TierRead` token word, never
+        /// zero (its class byte is `TierRead`'s), so an `Option` of one needs
+        /// no tag.
+        pub(super) struct Identity(NonZeroU64);
+
+        /// The pin key: the tiered namespace's lifetime and its file.
+        pub(super) struct PinKey {
+            pub(super) lifetime: u32,
+            pub(super) file: TierFileId,
+        }
+
+        /// A stored link: the handle the slab minted, or none.
+        pub(super) type Link = Option<SlotId<u32>>;
+
+        /// A queued request. The fields an inspection reads come first and
+        /// end by byte 52.
+        #[repr(C)]
+        pub(super) struct IntentSlot {
+            pub(super) offset: FileOffset,
+            pub(super) fd: RawFd,
+            pub(super) len: u32,
+            pub(super) hold: SlotId<u32>,
+            pub(super) bucket_next: Link,
+            pub(super) bucket_prev: Link,
+            pub(super) logical: Identity,
+            pub(super) device: Identity,
+            pub(super) key: PinKey,
+            pub(super) bucket: u64,
+            pub(super) enqueued_us: u64,
+            pub(super) fifo_prev: Link,
+            pub(super) fifo_next: Link,
+        }
+
+        /// One member's record in its window's waiter block.
+        pub(super) struct WaiterRecord {
+            pub(super) logical: Identity,
+            pub(super) skip: u32,
+            pub(super) len: u32,
+            pub(super) enqueued_us: u64,
+        }
+
+        /// A block position: a record, or none.
+        pub(super) type WaiterSlot = Option<WaiterRecord>;
+
+        /// One issued window's records: at most 31 members.
+        pub(super) type WaiterBlock = [WaiterSlot; 31];
+
+        #[repr(u8)]
+        pub(super) enum Phase {
+            Issued,
+            Ready,
+            Held,
+        }
+
+        /// One issued window.
+        pub(super) struct WindowDescriptor {
+            pub(super) device: Identity,
+            pub(super) completed_us: u64,
+            pub(super) key: PinKey,
+            pub(super) outcome: Result<(), i32>,
+            pub(super) block: SlotId<u32>,
+            pub(super) ready_next: Link,
+            pub(super) buf: AlignedBufId,
+            pub(super) initialized: u32,
+            pub(super) outstanding: u32,
+            pub(super) cursor: u32,
+            pub(super) phase: Phase,
+        }
+
+        /// A candidate list's two ends.
+        pub(super) struct ListEnds {
+            pub(super) head: SlotId<u32>,
+            pub(super) tail: SlotId<u32>,
+        }
+    }
+
+    /// The entries fit their strides: a waiter record and its block
+    /// position 24 B (the logical id's niche carries the position's tag), a
+    /// block of 31 at 744 B, a window descriptor at most 104 B, a queued
+    /// request at most 120 B, a candidate list's ends 24 B. Each field a
+    /// request's inspection reads ends by byte 56, so with the store's 8 B
+    /// slot header, on whichever side, it lies in the slot's first 64 B.
+    #[test]
+    fn the_fixed_stores_entries_fit_their_strides() {
+        use core::mem::{offset_of, size_of};
+        use layout::{
+            IntentSlot, ListEnds, WaiterBlock, WaiterRecord, WaiterSlot, WindowDescriptor,
+        };
+        let sizes = [
+            ("WaiterRecord", size_of::<WaiterRecord>(), 24),
+            ("WaiterSlot", size_of::<WaiterSlot>(), 24),
+            ("WaiterBlock", size_of::<WaiterBlock>(), 744),
+            ("WindowDescriptor", size_of::<WindowDescriptor>(), 104),
+            ("IntentSlot", size_of::<IntentSlot>(), 120),
+            ("ListEnds", size_of::<ListEnds>(), 24),
+        ];
+        for (name, size, bound) in sizes {
+            eprintln!("stride {name}: {size} B (bound {bound} B)");
+            assert!(size <= bound, "{name} is {size} B, above its stride's {bound} B");
+        }
+        let link = size_of::<layout::Link>();
+        let inspected = [
+            ("offset", offset_of!(IntentSlot, offset), size_of::<inf_foundation::FileOffset>()),
+            ("fd", offset_of!(IntentSlot, fd), size_of::<RawFd>()),
+            ("len", offset_of!(IntentSlot, len), size_of::<u32>()),
+            (
+                "hold",
+                offset_of!(IntentSlot, hold),
+                size_of::<inf_foundation::bounded::SlotId<u32>>(),
+            ),
+            ("bucket_next", offset_of!(IntentSlot, bucket_next), link),
+            ("bucket_prev", offset_of!(IntentSlot, bucket_prev), link),
+        ];
+        for (field, offset, size) in inspected {
+            eprintln!("IntentSlot.{field}: bytes {offset}..{}", offset + size);
+            assert!(offset + size <= 56, "IntentSlot.{field} ends at byte {}", offset + size);
+        }
+    }
 }
