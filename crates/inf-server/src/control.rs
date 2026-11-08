@@ -1177,7 +1177,7 @@ enum DdlIntent {
     /// the writer accepts it, and only when it is the counter's next.
     Create { spec: NsSpec, reserved: NsId },
     /// Namespace `id` goes; `tombstone` for a durable one.
-    Drop { id: u32, tombstone: bool },
+    Drop { id: NsId, tombstone: bool },
 }
 
 /// The one DDL the writer accepted and has not yet seen fanned
@@ -1188,7 +1188,7 @@ enum PendingDdl {
     /// An accepted `CREATE`, until its `CreateApplied`.
     Create(NsSpec),
     /// An accepted `DROP` or rollback, until its `DropFanned`.
-    Drop(u32),
+    Drop(NsId),
 }
 
 /// A DDL's notice to the writer (ADR-0189 D3, D5): it retires the pending
@@ -1197,11 +1197,11 @@ enum PendingDdl {
 pub(crate) enum DdlNotice {
     /// A `CREATE`'s fan completed, or the `CREATE` stopped after its answer:
     /// every cell's export carries what `META` holds of it from now on.
-    CreateApplied { id: u32 },
+    CreateApplied { id: NsId },
     /// A `DROP`'s or a rollback's fan completed, or it stopped after its
     /// answer; `stamp` is the epoch of the checkpoint that retires a
     /// durable drop's tombstone, `None` when the drop leaves it unstamped.
-    DropFanned { id: u32, stamp: Option<u64> },
+    DropFanned { id: NsId, stamp: Option<u64> },
 }
 
 /// The catalog writer's live tombstone set (ADR-0100 D2/D3): one entry
@@ -1495,10 +1495,10 @@ impl ControlHandle {
     pub fn request_drop(
         &self,
         export: NsCatalog,
-        id: u32,
+        id: NsId,
         tombstone: bool,
     ) -> Requested<DropPersisted> {
-        let (slot, requested) = ddl::answer_slot(NsId(id));
+        let (slot, requested) = ddl::answer_slot(id);
         let intent = Some(DdlIntent::Drop { id, tombstone });
         self.send_request(CatalogRequest::new(intent, export, Some(slot)));
         requested
@@ -1720,7 +1720,7 @@ impl CatalogWriter {
             }
             DdlIntent::Drop { id, .. } => match &self.pending {
                 // A rollback replaces its own `CREATE`: never refused.
-                Some(PendingDdl::Create(spec)) if spec.id.0 == *id => DdlVerdict::Accepted,
+                Some(PendingDdl::Create(spec)) if spec.id == *id => DdlVerdict::Accepted,
                 Some(PendingDdl::Create(_) | PendingDdl::Drop(_)) => {
                     DdlVerdict::Refused(DdlRefusal::PendingConflict)
                 }
@@ -1743,7 +1743,7 @@ impl CatalogWriter {
             Some(DdlIntent::Drop { id, tombstone }) => {
                 self.pending = Some(PendingDdl::Drop(id));
                 if tombstone {
-                    self.tombstones.add(id);
+                    self.tombstones.add(id.0);
                 }
             }
         }
@@ -1784,10 +1784,10 @@ impl CatalogWriter {
             Some(PendingDdl::Drop(id)) => Some(*id),
             None => None,
         };
-        let gone = |id: u32| pending_drop == Some(id) || self.tombstones.contains(id);
-        catalog.entries.retain(|e| !gone(e.id.0));
+        let gone = |id: NsId| pending_drop == Some(id) || self.tombstones.contains(id.0);
+        catalog.entries.retain(|e| !gone(e.id));
         if !cfg!(inf_canary_ns_index_record_kept) {
-            catalog.index.entries.retain(|r| !gone(r.ns.0));
+            catalog.index.entries.retain(|r| !gone(r.ns));
         }
         catalog.dropped = self.tombstones.ids();
         catalog
@@ -1798,7 +1798,7 @@ impl CatalogWriter {
     /// other changes nothing and is counted.
     fn notice(&mut self, notice: DdlNotice) {
         let retires = match (&self.pending, notice) {
-            (Some(PendingDdl::Create(spec)), DdlNotice::CreateApplied { id }) => spec.id.0 == id,
+            (Some(PendingDdl::Create(spec)), DdlNotice::CreateApplied { id }) => spec.id == id,
             (Some(PendingDdl::Drop(pending)), DdlNotice::DropFanned { id, .. }) => *pending == id,
             (Some(PendingDdl::Create(_)), DdlNotice::DropFanned { .. })
             | (Some(PendingDdl::Drop(_)), DdlNotice::CreateApplied { .. })
@@ -1810,7 +1810,7 @@ impl CatalogWriter {
         }
         self.pending = None;
         match notice {
-            DdlNotice::DropFanned { id, stamp: Some(epoch) } => self.tombstones.stamp(id, epoch),
+            DdlNotice::DropFanned { id, stamp: Some(epoch) } => self.tombstones.stamp(id.0, epoch),
             DdlNotice::DropFanned { stamp: None, .. } | DdlNotice::CreateApplied { .. } => {}
         }
         self.publish_gauges();
@@ -1835,7 +1835,7 @@ pub struct ControlInbox {
     handle: Arc<ControlHandle>,
     /// The writer itself — inline, deterministic.
     writer: CatalogWriter,
-    /// A request [`ControlInbox::drain_persists`] took past its bound:
+    /// A request [`ControlInbox::drain_requests`] took past its bound:
     /// first in line for the next drain, so queue order holds.
     next: Option<ControlMsg>,
 }
@@ -1856,9 +1856,11 @@ impl ControlInbox {
         self.handle.ckpt_board().min_published()
     }
 
-    /// Drains queued control work against `fs`. A failed catalog swap is
-    /// an error (the control thread's fail-stop analog — the caller owns
-    /// the verdict); failed unlinks are ignored (boot GC re-collects).
+    /// Drains queued control work against `fs`, every queued catalog
+    /// request answered: bounded by what the queue holds (256 messages;
+    /// senders block on a full queue). A failed catalog swap is an error
+    /// (the control thread's fail-stop analog — the caller owns the
+    /// verdict); failed unlinks are ignored (boot GC re-collects).
     ///
     /// # Errors
     /// The catalog META swap failed — a DDL was acked against it (§8.4).
@@ -1867,35 +1869,34 @@ impl ControlInbox {
         fs: &F,
         data_dir: &Path,
     ) -> std::io::Result<()> {
-        // Unbounded in persists; bounded by what the queue holds (256
-        // messages: senders block on a full queue).
-        self.drain_persists(fs, data_dir, u32::MAX).map(|_| ())
+        self.drain_requests(fs, data_dir, None).map(|_| ())
     }
 
-    /// [`drain`](Self::drain), answering at most `persists_max` catalog
-    /// requests: a request past the bound stays queued, first in line for
-    /// the next drain. Returns the requests answered. Tests: a harness
-    /// lets one swap land and holds the next.
+    /// [`drain`](Self::drain), answering at most `requests_max` catalog
+    /// requests when it is `Some` (every queued one when `None`): a
+    /// request past the bound stays queued, first in line for the next
+    /// drain. Returns the requests answered, refused ones included. Tests:
+    /// a harness lets one swap land and holds the next.
     ///
     /// # Errors
     /// As [`drain`](Self::drain).
-    pub fn drain_persists<F: inf_log::fs::SegmentFs>(
+    pub fn drain_requests<F: inf_log::fs::SegmentFs>(
         &mut self,
         fs: &F,
         data_dir: &Path,
-        persists_max: u32,
+        requests_max: Option<u32>,
     ) -> std::io::Result<u32> {
-        let mut written = 0u32;
+        let mut answered = 0u32;
         while let Some(msg) = self.next.take().or_else(|| self.rx.try_recv().ok()) {
-            let is_persist = match &msg {
+            let is_request = match &msg {
                 ControlMsg::Request(_) => true,
                 ControlMsg::Notice(_) | ControlMsg::Unlink(_) => false,
             };
-            if is_persist && written == persists_max {
+            if is_request && requests_max == Some(answered) {
                 self.next = Some(msg);
                 break;
             }
-            written += u32::from(is_persist);
+            answered += u32::from(is_request);
             match msg {
                 ControlMsg::Request(req) => self.writer.answer(req, fs, data_dir)?,
                 ControlMsg::Notice(notice) => self.writer.notice(notice),
@@ -1904,7 +1905,7 @@ impl ControlInbox {
                 }
             }
         }
-        Ok(written)
+        Ok(answered)
     }
 }
 
@@ -2304,7 +2305,7 @@ mod drop_tombstone_tests {
     #[test]
     fn the_writer_decides_each_row_of_its_table() {
         let mut w = writer();
-        let drop_of = |id: u32| DdlIntent::Drop { id, tombstone: true };
+        let drop_of = |id: u32| DdlIntent::Drop { id: inf_log::NsId(id), tombstone: true };
         let export = catalog(vec![entry(16)]);
         assert_eq!(w.decide(None, &export), super::DdlVerdict::Accepted);
         let mut taken = entry(40);
@@ -2330,7 +2331,8 @@ mod drop_tombstone_tests {
             "the rollback's drop of its own pending CREATE"
         );
         w.accept(Some(drop_of(41)));
-        assert!(matches!(w.pending, Some(PendingDdl::Drop(41))), "the drop replaced it");
+        let replaced = matches!(w.pending, Some(PendingDdl::Drop(id)) if id.0 == 41);
+        assert!(replaced, "the drop replaced it");
         assert!(w.tombstones.contains(41));
         assert_eq!(w.decide(Some(&drop_of(41)), &export), conflict);
     }
@@ -2363,18 +2365,19 @@ mod drop_tombstone_tests {
         let mut w = writer();
         let intent = create(&w, entry(40));
         w.accept(Some(intent));
-        w.notice(DdlNotice::DropFanned { id: 40, stamp: Some(7) });
-        w.notice(DdlNotice::CreateApplied { id: 41 });
+        let (ns40, ns41) = (inf_log::NsId(40), inf_log::NsId(41));
+        w.notice(DdlNotice::DropFanned { id: ns40, stamp: Some(7) });
+        w.notice(DdlNotice::CreateApplied { id: ns41 });
         assert_eq!(w.handle.ddl_notices_stale(), 2);
         assert!(matches!(&w.pending, Some(PendingDdl::Create(spec)) if spec.id.0 == 40));
-        w.notice(DdlNotice::CreateApplied { id: 40 });
+        w.notice(DdlNotice::CreateApplied { id: ns40 });
         assert!(w.pending.is_none());
         assert_eq!(w.handle.ddl_pending(), 0);
-        w.accept(Some(DdlIntent::Drop { id: 40, tombstone: true }));
-        w.notice(DdlNotice::DropFanned { id: 40, stamp: Some(7) });
+        w.accept(Some(DdlIntent::Drop { id: ns40, tombstone: true }));
+        w.notice(DdlNotice::DropFanned { id: ns40, stamp: Some(7) });
         assert!(w.pending.is_none());
         assert_eq!(w.tombstones.entries, vec![(40, Some(7))], "the notice's stamp");
-        w.notice(DdlNotice::CreateApplied { id: 40 });
+        w.notice(DdlNotice::CreateApplied { id: ns40 });
         assert_eq!(w.handle.ddl_notices_stale(), 3, "none pending: stale");
     }
 

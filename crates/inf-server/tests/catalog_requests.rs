@@ -231,7 +231,7 @@ fn held_ddl(
                 answered(&control, requested).map(|_| ())
             }
             Ddl::Drop => {
-                let requested = control.request_drop(catalog(Vec::new()), DDL_NS, true);
+                let requested = control.request_drop(catalog(Vec::new()), NsId(DDL_NS), true);
                 answered(&control, requested).map(|_| ())
             }
         };
@@ -426,7 +426,7 @@ fn every_payload_carries_the_ddl_in_flight() {
     let (control, mut inbox) = writer(&dir, Some(&seed));
     let fs = StdSegmentFs;
     // A memory DROP whose export still names the namespace.
-    let dropped = control.request_drop(catalog(vec![ledger.clone()]), DDL_NS, false);
+    let dropped = control.request_drop(catalog(vec![ledger.clone()]), NsId(DDL_NS), false);
     inbox.drain(&fs, &dir).expect("the drain");
     assert!(answered(&control, dropped).is_ok());
     assert!(!ids(&meta(&dir)).contains(&DDL_NS), "the DROP's own META names the namespace");
@@ -447,7 +447,7 @@ fn every_payload_carries_the_ddl_in_flight() {
         ids(&meta(&dir)).contains(&fresh.id.0),
         "a lagging export dropped the created namespace"
     );
-    let rolled_back = control.request_drop(catalog(vec![fresh.clone()]), fresh.id.0, false);
+    let rolled_back = control.request_drop(catalog(vec![fresh.clone()]), fresh.id, false);
     inbox.drain(&fs, &dir).expect("the drain");
     assert!(answered(&control, rolled_back).is_ok(), "the rollback's drop is accepted");
     control.request_persist(catalog(vec![fresh.clone()]));
@@ -481,7 +481,7 @@ fn an_index_on_the_dropped_namespace_leaves_meta_with_it() {
     lagging.index.next_generation = 2;
     let (control, mut inbox) = writer(&dir, Some(&lagging));
     let fs = StdSegmentFs;
-    let dropped = control.request_drop(catalog(Vec::new()), DDL_NS, true);
+    let dropped = control.request_drop(catalog(Vec::new()), NsId(DDL_NS), true);
     inbox.drain(&fs, &dir).expect("the drain");
     assert!(answered(&control, dropped).is_ok());
     // Cell 0's readiness export, from a cell whose fan leg has not landed.

@@ -600,7 +600,7 @@ fn lower_drop_release<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
 #[must_use = "a dropped notice posts at once, with no stamp"]
 struct NoticeDue {
     control: Arc<ControlHandle>,
-    id: u32,
+    id: NsId,
     /// `None` once posted or rolled back.
     kind: Option<NoticeKind>,
 }
@@ -615,13 +615,13 @@ enum NoticeKind {
 impl NoticeDue {
     /// The notice an accepted `CREATE` owes.
     fn created(control: &Arc<ControlHandle>, receipt: &CreatePersisted) -> NoticeDue {
-        let (control, id) = (Arc::clone(control), receipt.id().0);
+        let (control, id) = (Arc::clone(control), receipt.id());
         NoticeDue { control, id, kind: Some(NoticeKind::CreateApplied) }
     }
 
     /// The notice an accepted `DROP` owes.
     fn dropped(control: &Arc<ControlHandle>, receipt: &DropPersisted) -> NoticeDue {
-        let (control, id) = (Arc::clone(control), receipt.id().0);
+        let (control, id) = (Arc::clone(control), receipt.id());
         NoticeDue { control, id, kind: Some(NoticeKind::DropFanned) }
     }
 
@@ -759,7 +759,7 @@ async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();
     if let Some(error) = fan_all_or_first_error(shared, proto, &fan_argv).await {
         let rollback =
-            Rollback { id: spec.id.0, name: &spec.name, cleanup, tiered: spec.tier.is_some() };
+            Rollback { id: spec.id, name: &spec.name, cleanup, tiered: spec.tier.is_some() };
         rollback_create(shared, control, proto, rollback, notice).await;
         return error;
     }
@@ -838,7 +838,7 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         control.next_index_id(),
         control.next_index_generation(),
     );
-    let requested = control.request_drop(export, spec.id.0, cleanup.has_tombstone());
+    let requested = control.request_drop(export, spec.id, cleanup.has_tombstone());
     let receipt = match await_answer(shared, control, requested).await {
         Ok(receipt) => receipt,
         // The ticket admits one DDL, so no pending DDL can conflict: the
@@ -877,7 +877,7 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
 
 /// What a `CREATE`'s rollback undoes.
 struct Rollback<'a> {
-    id: u32,
+    id: NsId,
     name: &'a [u8],
     /// A durable namespace's tombstone stamp, reserved by its `CREATE`
     /// (ADR-0159 D2).
@@ -907,7 +907,7 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     // apply never happened — nothing to undo).
     let _ = shared.store.borrow_mut().ns_drop(name);
     if tiered {
-        shared.ns_drop_releases.borrow_mut().push((NsId(id), u64::MAX));
+        shared.ns_drop_releases.borrow_mut().push((id, u64::MAX));
     }
     let export = shared.store.borrow().export_catalog(
         control.next_ns_id(),
@@ -921,7 +921,7 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     };
     let epoch = receipt.fan_epoch();
     if tiered {
-        lower_drop_release(shared, NsId(id), epoch);
+        lower_drop_release(shared, id, epoch);
     }
     let epoch_text = epoch.to_string();
     let fan: [&[u8]; 4] = [b"INF.NSFAN", b"DROP", name, epoch_text.as_bytes()];

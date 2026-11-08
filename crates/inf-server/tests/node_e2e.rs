@@ -744,7 +744,7 @@ impl Node {
                                     inbox.drain(&fs, &pump_dir).expect("held-catalog META swap");
                                 } else if let n @ 1.. = allow.load(Ordering::Acquire) {
                                     let landed = inbox
-                                        .drain_persists(&fs, &pump_dir, n)
+                                        .drain_requests(&fs, &pump_dir, Some(n))
                                         .expect("held-catalog META swap");
                                     allow.fetch_sub(landed, Ordering::AcqRel);
                                 }
