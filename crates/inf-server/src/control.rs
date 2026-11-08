@@ -39,6 +39,7 @@
 //! any effect.
 
 use core::cell::Cell;
+use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1733,7 +1734,7 @@ impl DdlTicket {
     /// # Errors
     /// `IdentityExhausted(Namespace)` once the last id, `u32::MAX − 1`, is
     /// issued: before any effect, for the data directory's life.
-    pub fn reserve_ns_id(&self) -> Result<NsIdReservation, Refusal> {
+    pub fn reserve_ns_id(&self) -> Result<NsIdReservation<'_>, Refusal> {
         let next = self.handle.next_ns_id.load(Ordering::Acquire);
         // Canary `inf_canary_ns_id_wraps`: the exhaustion check is off, so a
         // spent counter issues `u32::MAX` and the commit wraps (the wire's
@@ -1748,7 +1749,7 @@ impl DdlTicket {
         if cfg!(inf_canary_ns_id_spent_on_refusal) {
             self.handle.next_ns_id.store(next.wrapping_add(1), Ordering::Release);
         }
-        Ok(NsIdReservation { id: NsId(next) })
+        Ok(NsIdReservation { id: NsId(next), ticket: PhantomData })
     }
 }
 
@@ -1756,13 +1757,16 @@ impl DdlTicket {
 /// D4): the counter's next value, not moved. Made only by
 /// [`DdlTicket::reserve_ns_id`] and consumed by
 /// [`ControlHandle::request_create`]; dropped, it changes nothing, so a
-/// `CREATE` refused before its request spends no id. Not `Clone`.
+/// `CREATE` refused before its request spends no id. Not `Clone`, and it
+/// borrows its ticket, so it cannot outlive the program that holds it; the
+/// writer still refuses one that is not the counter's next (`IdNotNext`).
 #[derive(Debug)]
-pub struct NsIdReservation {
+pub struct NsIdReservation<'t> {
     id: NsId,
+    ticket: PhantomData<&'t DdlTicket>,
 }
 
-impl NsIdReservation {
+impl NsIdReservation<'_> {
     /// The reserved id.
     #[must_use]
     pub fn id(&self) -> NsId {
@@ -1906,7 +1910,7 @@ impl ControlHandle {
         &self,
         export: NsCatalog,
         spec: NsSpec,
-        reservation: NsIdReservation,
+        reservation: NsIdReservation<'_>,
     ) -> Requested<CreatePersisted> {
         let (slot, requested) = ddl::answer_slot(spec.id);
         let intent = Some(DdlIntent::Create { spec, reserved: reservation.id });
@@ -2308,6 +2312,7 @@ impl CatalogWriter {
         if cfg!(inf_canary_ns_id_spent_on_refusal) {
             return;
         }
+        debug_assert!(id.0 < NS_IDS_EXHAUSTED, "decide refused a spent counter");
         let next = if cfg!(inf_canary_ns_id_wraps) { id.0.wrapping_add(1) } else { id.0 + 1 };
         self.handle.next_ns_id.store(next, Ordering::Release);
     }
