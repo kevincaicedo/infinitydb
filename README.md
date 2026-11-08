@@ -171,10 +171,19 @@ explains the design in detail.
 You need Linux (x86-64 or aarch64) with `io_uring`, kernel 5.15 or newer
 (6.1 or newer recommended); macOS builds through `kqueue` for development
 only. `rust-toolchain.toml` pins Rust 1.95, which `rustup` installs for you.
-The development tasks use [`just`](https://github.com/casey/just), and the
-test suite needs Redis 8.0.5 on `PATH` (or `INF_COMPAT_ORACLE_ADDR` pointing at
-one) and Python 3.11 or newer. `just check` also needs a C++17 compiler: it
-compiles the fuzz targets, and their build compiles libFuzzer's C++ runtime.
+The development tasks use [`just`](https://github.com/casey/just), and every
+`just` recipe needs Python 3.11 or newer. The test suite needs Redis 8.0.5 on
+`PATH` (or `INF_COMPAT_ORACLE_ADDR` pointing at one). `just check` also needs
+a C++17 compiler: it compiles the fuzz targets, and their build compiles
+libFuzzer's C++ runtime.
+
+Each checkout builds in a target directory of its own, which the first `just`
+recipe marks as this checkout's. A `target/` that a plain `cargo` command or
+an editor wrote before that is refused once: the recipe stops and prints the
+command that clears it, and the next build is cold, the release server
+included. So run any recipe, or `./scripts/target-root.sh --print`, before
+the first plain `cargo build` and before opening the clone in an editor that
+runs cargo; or run the printed command when the refusal comes.
 
 - `cargo build --release -p infinityd` builds the server
   (`infinityd --help` prints its usage).

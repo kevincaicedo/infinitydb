@@ -118,27 +118,32 @@ Requirements:
 - [`just`](https://github.com/casey/just) for the task runner, and
   `cargo-deny` for the dependency-policy check.
 
-**One target root a checkout.** Cargo reads outputs that another checkout
-wrote as fresh, so code that does not compile can pass. Each checkout
-therefore builds in a root of its own: `target/` when `CARGO_TARGET_DIR` is
-unset, else `$CARGO_TARGET_DIR/checkout-<key>`, the key 16 hex digits of
-SHA-256 of the checkout's physical path, so several checkouts can share one
-variable. The justfile exports that root as `CARGO_TARGET_DIR`, which outranks
-a cargo config's `build.target-dir` (set the variable instead), and before any
-recipe runs it refuses a configured build directory (`build-dir` in a cargo
-config, or `CARGO_BUILD_BUILD_DIR`) and a root holding outputs that no marker
-of this checkout names: a `target/` that cargo or an editor wrote before the
-first recipe, one copied or moved with its checkout, or one from before this
-rule. The refusal prints the one command that clears that root alone,
-`cd <checkout> && cargo clean --target-dir <root> && ./scripts/target-root.sh
---print`, never a bare `cargo clean`, which under a shared variable removes
-every checkout's root; the next build is cold. Under a shared variable each
-recipe lists on stderr the roots whose checkout is gone, or that hold no
-marker, with the commands that size and remove them, until they are removed.
-Two hosts that share one variable with checkouts at one path share a key, and
-a cargo config's `build-dir` or `build.target-dir` that a gate run alone, a
-command outside the recipes or a cargo call from another directory reads goes
-unseen.
+**One target root per checkout.** Before the first plain `cargo` command,
+and before opening the clone in an editor whose language server runs cargo,
+run any `just` recipe or `./scripts/target-root.sh --print`: it marks the
+checkout's root as its own. A root that cargo or an editor wrote first is
+refused once, and the build after its clean is cold.
+
+Cargo reads outputs that another checkout wrote as fresh, so code that does
+not compile can pass. Each checkout therefore builds in a root of its own:
+`target/` when `CARGO_TARGET_DIR` is unset, else
+`$CARGO_TARGET_DIR/checkout-<key>`, the key 16 hex digits of SHA-256 of the
+checkout's physical path, so several checkouts can share one variable. The
+justfile exports that root as `CARGO_TARGET_DIR`, which outranks a cargo
+config's `build.target-dir` (set the variable instead), and before any recipe
+runs it refuses a configured build directory (`build-dir` in a cargo config,
+or `CARGO_BUILD_BUILD_DIR`) and a root holding outputs that no marker of this
+checkout names: a `target/` that cargo or an editor wrote before the first
+recipe, one copied or moved with its checkout, or one from before this rule.
+The refusal prints the one command that clears that root alone, `cd <checkout>
+&& cargo clean --target-dir <root> && ./scripts/target-root.sh --print`, never
+a bare `cargo clean`, which under a shared variable removes every checkout's
+root; the next build is cold. Under a shared variable each recipe lists on
+stderr the roots whose checkout is gone, or that hold no marker, with the
+commands that size and remove them, until they are removed. Two hosts that
+share one variable with checkouts at one path share a key, and a cargo
+config's `build-dir` or `build.target-dir` that a gate run alone, a command
+outside the recipes or a cargo call from another directory reads goes unseen.
 
 Clone, run the full local ladder (`just check`, described below) and start
 a server:
