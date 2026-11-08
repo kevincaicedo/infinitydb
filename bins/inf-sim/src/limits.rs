@@ -20,3 +20,11 @@ pub const VIOLATIONS_PRINTED_FIRST: usize = 5;
 /// hashes, a verdict and these bytes at a time. Crossing: none — a larger
 /// readings type does not build.
 pub const READINGS_BYTES_MAX: usize = 64;
+
+/// Failing seeds a sweep shard run with `--out` copies to stderr. Owner:
+/// the sweep driver. Crossing: the results file keeps every seed's line, and
+/// one stderr line after the shard's last seed counts the rest and names
+/// that file. A shard run without `--out` has no results file, so its
+/// stderr is its record and takes every failing seed, each line cut by
+/// `VIOLATION_TEXT_BYTES_MAX`.
+pub const FAILING_SEEDS_PRINTED_MAX: u64 = 5;

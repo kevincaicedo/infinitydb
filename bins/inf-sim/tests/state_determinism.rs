@@ -25,35 +25,6 @@ fn a_single_run_under_the_flag_prints_the_twin_agreement_line() {
     assert!(stdout.contains(", trace_hash=0x"), "the trace hash is not named: {stdout}");
 }
 
-#[test]
-fn every_sweep_path_honors_state_verification_for_each_seed() {
-    for scenario in [
-        "m2-durable",
-        "m2-combined",
-        "m4-recovery",
-        "m4-tiered",
-        "m2-ns-create-window",
-        "m2-ns-drop-window",
-        "m2-ns-ddl-race",
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_inf-sim"))
-            .args([
-                "--scenario",
-                scenario,
-                "--seed",
-                "0xC0FFEE",
-                "--sweep",
-                "2",
-                "--verify-determinism",
-            ])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{scenario}: {output:?}");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(stdout.matches("state hash identical").count(), 2, "{scenario}: {stdout}");
-    }
-}
-
 /// Exit 2 with `message` on stderr and nothing run. An exit 2 for another
 /// reason (a missing leg, an unknown flag) is red, since the message is
 /// read too.
@@ -69,9 +40,6 @@ fn assert_refused(args: &[&str], message: &str) {
 /// count, a shard outside its count, and `--shard` or `--out` without
 /// `--sweep` each exit 2 with their own message before any run starts.
 #[test]
-#[ignore = "--sweep 0 runs no seed and exits 0, a --shard outside its count panics, and --shard \
-            or --out without --sweep is ignored; red until the sweep arguments are one type \
-            checked at the parse"]
 fn a_bad_sweep_argument_is_refused_at_the_parse() {
     let unused = std::env::temp_dir().join("inf-sim-out-never-created");
     let unused = unused.to_str().unwrap();
@@ -91,8 +59,6 @@ fn a_bad_sweep_argument_is_refused_at_the_parse() {
 /// A sweep runs every seed twice, so `--verify-determinism` beside
 /// `--sweep` is a usage error: its absence would read as once.
 #[test]
-#[ignore = "a sweep runs its twin only under --verify-determinism; red until a sweep always \
-            runs it and refuses the flag"]
 fn a_sweep_refuses_the_flag() {
     assert_refused(
         &["--scenario", "m2-durable", "--sweep", "1", "--verify-determinism"],

@@ -15,13 +15,16 @@
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
 )]
 
-use inf_sim::driver::{self, Exit, Verify};
+use inf_sim::driver::{self, Exit, Fold, Shard, Sweep, Verify};
 use inf_sim::net::Plant;
 use inf_sim::{
     CombinedScenario, DurableScenario, EpochMarksLeg, ExtentWindowLeg, LedgerWedgeLeg, Scenario,
     TierBudgetLeg, run_combined_scenario, run_durable_scenario, run_scenario,
 };
 use inf_sim::{RecoveryScenario, SeedClass, SpecVariant};
+
+use std::num::NonZeroU64;
+use std::path::PathBuf;
 
 fn parse_seed(text: &str) -> Result<u64, String> {
     let text = text.trim();
@@ -70,8 +73,8 @@ fn main() {
     let mut overrides: Vec<(String, u64)> = Vec::new();
     let mut trace_out: Option<String> = None;
 
-    let mut sweep: Option<u64> = None;
-    let mut shard = (0u64, 1u64);
+    let mut sweep: Option<NonZeroU64> = None;
+    let mut shard: Option<Shard> = None;
     let mut out_dir: Option<String> = None;
     let mut replay_canary = false;
     // F-L14-01 (batch 20): force the m2 lift regime on any seed — the
@@ -123,19 +126,8 @@ fn main() {
                     overrides.push((flag.clone(), value));
                 }
                 "--trace-out" => trace_out = Some(take("--trace-out")?),
-                "--sweep" => {
-                    sweep = Some(take("--sweep")?.parse().map_err(|e| format!("--sweep: {e}"))?)
-                }
-                "--shard" => {
-                    let spec = take("--shard")?;
-                    let (i, k) = spec
-                        .split_once('/')
-                        .ok_or_else(|| format!("--shard wants I/K, got {spec}"))?;
-                    shard = (
-                        i.parse().map_err(|e| format!("--shard: {e}"))?,
-                        k.parse().map_err(|e| format!("--shard: {e}"))?,
-                    );
-                }
+                "--sweep" => sweep = Some(driver::parse_seed_count(&take("--sweep")?)?),
+                "--shard" => shard = Some(Shard::parse(&take("--shard")?)?),
                 "--out" => out_dir = Some(take("--out")?),
                 "--replay-canary" => replay_canary = true,
                 "--lift-regime" => lift_regime = true,
@@ -226,6 +218,10 @@ fn main() {
         std::process::exit(2);
     }
     let determinism = if verify { Verify::Twin } else { Verify::Off };
+    let sweep = sweep_of(verify, seed, sweep, shard, out_dir).unwrap_or_else(|refusal| {
+        eprintln!("inf-sim: {refusal}");
+        std::process::exit(2);
+    });
     // The two flags each force one of m4-recovery's seed classes, which a
     // seed runs one of: together they are refused, never one dropped.
     let forced_class = match (replay_above_window, spec_variant) {
@@ -323,10 +319,8 @@ fn main() {
             marks_leg,
             wedge_leg,
             park_at_once,
-            verify,
-            sweep,
-            shard,
-            out_dir.as_deref(),
+            determinism,
+            sweep.as_ref(),
         );
         return;
     }
@@ -335,7 +329,7 @@ fn main() {
     // sweep mode). `--plant` does not apply (its planted bugs are source
     // mutations, per the S14 demonstrations).
     if scenario_name == "m2-combined" {
-        run_m2_combined(seed, verify, sweep, shard, out_dir.as_deref());
+        run_m2_combined(seed, determinism, sweep.as_ref());
         return;
     }
     // The M4-S04 steel-thread scenario (tiered lifecycle + cold reads
@@ -452,185 +446,10 @@ fn main() {
             }
             inf_sim::run_recovery_scenario(&scenario)
         };
-        if let Some(sweep) = sweep {
-            let (shard_i, shard_k) = shard;
-            assert!(shard_k > 0, "--shard I/K wants K > 0");
-            assert!(shard_i < shard_k, "--shard I/K wants I < K");
-            let mut lines = Vec::new();
-            let mut violations = 0u64;
-            let mut ran = 0u64;
-            let mut refs = 0u64;
-            let mut images = 0u64;
-            let mut cuts_before = 0u64;
-            let mut flush_lag = 0u64;
-            let mut live_entries = 0u64;
-            let mut relocations = 0u64;
-            let mut files_retired = 0u64;
-            let mut files_unlinked = 0u64;
-            let mut boot_gc = 0u64;
-            let mut blobs = 0u64;
-            let mut blob_orphans = 0u64;
-            let mut blob_reclaims = 0u64;
-            let mut shadow_opened = 0u64;
-            let mut shadow_at_cut = 0u64;
-            let mut shadow_reformed = 0u64;
-            let mut shadow_same_key = 0u64;
-            let mut shadow_collision = 0u64;
-            let mut shadow_collide_ops = 0u64;
-            let mut shadow_settled_at_boot = 0u64;
-            let mut shadow_drain_checks = 0u64;
-            let mut shadow_multi_winners = 0u64;
-            let mut shadow_multi_dels = 0u64;
-            let mut shadow_twin_origin_rows = 0u64;
-            let mut shadow_twin_origins_covered = 0u64;
-            let mut shadow_held_rows = 0u64;
-            let mut shadow_held_reformed = 0u64;
-            let mut shadow_held_not_restored = 0u64;
-            // ADR-0174 D6: the boots that demoted, the fitting boots the
-            // zero set was checked on, and boot replay's counters.
-            let mut demoting_boots = 0u64;
-            let mut fitting_boots = 0u64;
-            let mut boot_replay = inf_store::ReplayCounters::default();
-            let mut writer_parks = 0u64;
-            let mut two_crash_removed = 0u64;
-            let mut two_crash_skipped = 0u64;
-            // ADR-0174 D2 rule 6: the spec-variant seeds and their long
-            // records (the pads are `boot_replay.pads_placed`).
-            let mut variant_seeds = 0u64;
-            let mut long_records = 0u64;
-            let mut seal_census = inf_sim::SealCensus::default();
-            for i in (shard_i..sweep).step_by(shard_k as usize) {
-                let seed = seed.wrapping_add(i);
-                let report = run_one(seed);
-                demoting_boots += report.demoting_boots;
-                fitting_boots += report.fitting_boots_checked;
-                boot_replay.absorb(report.boot_replay);
-                writer_parks += report.writer_parks;
-                two_crash_removed += report.two_crash_markers_removed;
-                two_crash_skipped += report.two_crash_unit_past_window;
-                variant_seeds += u64::from(report.spec_variant.is_some());
-                long_records += report.long_records_written;
-                seal_census.absorb(report.seal_census);
-                if verify {
-                    let twin = run_one(seed);
-                    verify_hashes(
-                        (report.trace_hash, report.state_hash),
-                        (twin.trace_hash, twin.state_hash),
-                    );
-                    assert!(twin.ok(), "second run failed its oracles");
-                }
-                ran += 1;
-                shadow_held_rows += report.shadow_held_rows;
-                shadow_held_reformed += report.shadow_held_reformed;
-                shadow_held_not_restored += report.shadow_held_not_restored;
-                shadow_multi_winners += report.shadow_multi_ticket_winners;
-                shadow_multi_dels += report.shadow_multi_ticket_dels;
-                shadow_twin_origin_rows += report.shadow_twin_origin_rows;
-                shadow_twin_origins_covered += report.shadow_twin_origins_covered;
-                shadow_opened += report.shadow_opened;
-                shadow_at_cut += report.shadow_open_at_cut;
-                shadow_reformed += report.shadow_reformed;
-                shadow_same_key += report.shadow_same_key;
-                shadow_collision += report.shadow_collision;
-                shadow_collide_ops += report.shadow_collide_ops;
-                shadow_settled_at_boot += report.shadow_settled_at_boot;
-                shadow_drain_checks += report.shadow_drain_checks;
-                refs += report.refs_emitted;
-                images += report.images_emitted;
-                cuts_before += report.cut_before_publish;
-                flush_lag += report.flush_lag_lives;
-                live_entries += report.live_entries_emitted;
-                relocations += report.relocations;
-                files_retired += report.files_retired;
-                files_unlinked += report.files_unlinked;
-                boot_gc += report.unlinks_left_to_boot_gc;
-                blobs += report.blobs_written;
-                blob_orphans += report.blob_orphans_planted;
-                blob_reclaims += report.blob_extents_reclaimed;
-                if report.ok() {
-                    lines.push(format!("{seed:#x} ok"));
-                } else {
-                    violations += 1;
-                    let first = report.violations.first().unwrap_or("?");
-                    lines.push(format!("{seed:#x} VIOLATION {first}"));
-                    eprintln!("inf-sim: seed {seed:#x}: {first}");
-                }
-            }
-            // Coverage disclosed, never assumed (ADR-0045 D4): the seed
-            // classes must actually occur across the shard.
-            println!(
-                "inf-sim: m4-recovery sweep shard {shard_i}/{shard_k}: {ran} seeds, \
-                 {violations} violations, {refs} refs, {images} images, \
-                 {cuts_before} cut-before-publish lives, {flush_lag} flush-lag lives, \
-                 {live_entries} live-set entries, {relocations} relocations, \
-                 {files_retired} retired, {files_unlinked} unlinked, \
-                 {boot_gc} left-to-boot-gc, {blobs} blobs, {blob_orphans} orphans-planted, \
-                 {blob_reclaims} blob-reclaims; shadow {shadow_opened} opened, \
-                 {shadow_at_cut} open at a cut, {shadow_reformed} re-formed by recovery, \
-                 {shadow_same_key} same-key / {shadow_collision} collision verdicts; \
-                 {shadow_collide_ops} ops on crafted colliding pairs, \
-                 {shadow_settled_at_boot} slots settled at boot, {shadow_drain_checks} \
-                 DBSIZE-drain checks; rebuilt multi-ticket winners {shadow_multi_winners} \
-                 ({shadow_multi_dels} DELs drained them), twin-with-origins rows \
-                 {shadow_twin_origin_rows} ({shadow_twin_origins_covered} origins covered by \
-                 DEL markers), held-across-the-walk rows {shadow_held_rows} \
-                 ({shadow_held_reformed} re-formed at boot, {shadow_held_not_restored} not \
-                 restored by an older manifest); boots {demoting_boots} demoting / \
-                 {fitting_boots} fitting checked, boot replay {} demote steps / {} tier bytes / \
-                 {} settle reads / {} same-key / {} distinct / {} deletes verified / {} blob \
-                 releases, {writer_parks} writer parks, {two_crash_removed} two-crash refs \
-                 removed by a marker ({two_crash_skipped} rows skipped: unit past the raised \
-                 window); spec-variant seeds {variant_seeds}, {long_records} long records, {} \
-                 pads placed; boot files censused {} (capacity {} / gap {} / shutdown {} \
-                 seals), {} page pads crossed, against a summed bound of {} (closest boot: {})",
-                boot_replay.demote_steps,
-                boot_replay.tier_bytes,
-                boot_replay.settle_reads,
-                boot_replay.settled_same_key,
-                boot_replay.settled_distinct,
-                boot_replay.deletes_verified,
-                boot_replay.blob_releases,
-                boot_replay.pads_placed,
-                seal_census.files,
-                seal_census.capacity_seals,
-                seal_census.gap_seals,
-                seal_census.shutdown_seals,
-                seal_census.page_pads,
-                seal_census.bound,
-                closest_boot(seal_census.closest)
+        if let Some(sweep) = &sweep {
+            std::process::exit(
+                driver::run_sweep("m4-recovery", sweep, RecoveryFold::default(), run_one).code(),
             );
-            if let Some(dir) = out_dir {
-                std::fs::create_dir_all(&dir).expect("--out dir");
-                let manifest = format!(
-                    "scenario=m4-recovery base_seed={seed:#x} sweep={sweep} \
-                     shard={shard_i}/{shard_k} seeds_run={ran} violations={violations} \
-                     refs={refs} images={images} cut_before_publish={cuts_before} \
-                     flush_lag_lives={flush_lag} live_set_entries={live_entries} \
-                     relocations={relocations} files_retired={files_retired} \
-                     files_unlinked={files_unlinked} unlinks_boot_gc={boot_gc} \
-                     blobs={blobs} blob_orphans={blob_orphans} blob_reclaims={blob_reclaims} \
-                     shadow_opened={shadow_opened} shadow_at_cut={shadow_at_cut} \
-                     shadow_reformed={shadow_reformed} shadow_same_key={shadow_same_key} \
-                     shadow_collision={shadow_collision} shadow_collide_ops={shadow_collide_ops} \
-                     shadow_settled_at_boot={shadow_settled_at_boot} \
-                     shadow_drain_checks={shadow_drain_checks} \
-                     shadow_multi_winners={shadow_multi_winners} \
-                     shadow_multi_dels={shadow_multi_dels} \
-                     shadow_twin_origin_rows={shadow_twin_origin_rows} \
-                     shadow_twin_origins_covered={shadow_twin_origins_covered} \
-                     shadow_held_rows={shadow_held_rows} \
-                     shadow_held_reformed={shadow_held_reformed} \
-                     shadow_held_not_restored={shadow_held_not_restored}\n"
-                );
-                std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
-                    .expect("manifest");
-                std::fs::write(
-                    format!("{dir}/results-shard-{shard_i}.txt"),
-                    lines.join("\n") + "\n",
-                )
-                .expect("results");
-            }
-            std::process::exit(if violations > 0 { 1 } else { 0 });
         }
         let exit = driver::run_single(seed, determinism, run_one, |report| {
             println!(
@@ -730,240 +549,10 @@ fn main() {
             }
             inf_sim::run_tiered_scenario(&scenario)
         };
-        if let Some(sweep) = sweep {
-            let (shard_i, shard_k) = shard;
-            assert!(shard_k > 0, "--shard I/K wants K > 0");
-            assert!(shard_i < shard_k, "--shard I/K wants I < K");
-            let mut lines = Vec::new();
-            let mut violations = 0u64;
-            let mut refused = 0u64;
-            let mut ran = 0u64;
-            let mut sim_seconds = 0.0f64;
-            let mut commands = 0u64;
-            let mut audited = 0u64;
-            let mut flushed_pre_cut = 0u64;
-            let mut cold_resolves = 0u64;
-            let mut blob_sets = 0u64;
-            let mut race_replans = 0u64;
-            let mut dir_open_fault_seeds = 0u64;
-            let mut dir_open_faults_fired = 0u64;
-            let mut tier_read_fault_seeds = 0u64;
-            let mut tier_read_faults_fired = 0u64;
-            let mut tier_read_error_replies = 0u64;
-            let mut tier_read_faults_unconsumed = 0u64;
-            let mut scan_cold_pages = 0u64;
-            let mut scan_cold_reads = 0u64;
-            let mut ckpt_downgrades = 0u64;
-            let mut ckpt_bound_splits = 0u64;
-            let mut diskfull_refusals = 0u64;
-            let mut drop_values = 0u64;
-            let mut drop_other = 0u64;
-            let mut drop_reboots = 0u64;
-            let mut drop_reboot_residue = 0u64;
-            let mut drop_cut_whole = 0u64;
-            let mut drop_cut_swept = 0u64;
-            let mut shadow_seeds = 0u64;
-            let mut shadow_created = 0u64;
-            let mut shadow_same_key = 0u64;
-            let mut shadow_collision = 0u64;
-            let mut shadow_fallbacks = 0u64;
-            let mut shadow_stale = 0u64;
-            let mut shadow_at_cut = 0u64;
-            let mut collide_tickets = 0u64;
-            let mut collide_verdicts = 0u64;
-            let mut collide_ticketed = 0u64;
-            let mut collide_drains = 0u64;
-            let mut collide_scan_twins = 0u64;
-            let mut open_seeds = 0u64;
-            let mut open_tickets = 0u64;
-            let mut open_drains = 0u64;
-            let mut open_reads = 0u64;
-            let mut open_scan_twins = 0u64;
-            let mut open_retargeted = 0u64;
-            let mut open_forced_deletes = 0u64;
-            let mut open_ticketed = 0u64;
-            let mut open_collisions = 0u64;
-            let mut open_read_faults = 0u64;
-            let mut open_settled_without_read = 0u64;
-            let mut rebuilt_seeds = 0u64;
-            let mut rebuilt_tickets = 0u64;
-            let mut rebuilt_multi_dels = 0u64;
-            let mut rebuilt_same_key_twins = 0u64;
-            let mut rebuilt_fill_sets = 0u64;
-            let mut rebuilt_reboots = 0u64;
-            let mut promoted_extent_pairs = 0u64;
-            for i in (shard_i..sweep).step_by(shard_k as usize) {
-                let seed = seed.wrapping_add(i);
-                let report = run_one(seed);
-                if verify {
-                    let twin = run_one(seed);
-                    verify_hashes(
-                        (report.trace_hash, report.state_hash),
-                        (twin.trace_hash, twin.state_hash),
-                    );
-                    assert!(twin.ok(), "second run failed its oracles");
-                }
-                ran += 1;
-                rebuilt_seeds += u64::from(report.rebuilt_rows);
-                rebuilt_tickets += report.rebuilt_tickets;
-                rebuilt_multi_dels += report.rebuilt_multi_dels;
-                rebuilt_same_key_twins += report.rebuilt_same_key_twins;
-                rebuilt_fill_sets += report.rebuilt_fill_sets;
-                rebuilt_reboots += report.rebuilt_reboots;
-                promoted_extent_pairs += report.promoted_extent_pairs;
-                open_seeds += u64::from(report.open_rows);
-                open_tickets += report.open_tickets;
-                open_drains += report.open_dbsize_drains;
-                open_reads += report.open_dbsize_reads;
-                open_scan_twins += report.open_scan_twins;
-                open_retargeted += report.open_retargeted;
-                open_forced_deletes += report.open_forced_deletes;
-                open_ticketed += report.open_ticketed_fallbacks;
-                open_collisions += report.open_collision_verdicts;
-                open_read_faults += report.open_read_fault_errors;
-                open_settled_without_read += report.open_settled_without_read;
-                collide_tickets += report.collide_tickets;
-                collide_verdicts += report.collide_verdicts;
-                collide_ticketed += report.collide_ticketed_fallbacks;
-                collide_drains += report.collide_dbsize_drains;
-                collide_scan_twins += report.collide_scan_twins;
-                shadow_seeds += u64::from(report.shadow_arm);
-                shadow_created += report.shadow_created;
-                shadow_same_key += report.shadow_resolved_same_key;
-                shadow_collision += report.shadow_resolved_collision;
-                shadow_fallbacks += report.shadow_fallbacks;
-                shadow_stale += report.shadow_stale;
-                shadow_at_cut += report.shadow_pending_at_cut;
-                sim_seconds += report.sim_seconds;
-                commands += report.commands_done;
-                audited += report.audited_keys;
-                flushed_pre_cut += report.flushed_pre_cut_bytes;
-                cold_resolves += report.cold_resolves;
-                blob_sets += report.blob_sets;
-                race_replans += report.race_replans;
-                dir_open_fault_seeds += u64::from(report.dir_open_fault_arm);
-                dir_open_faults_fired += report.dir_open_faults_fired;
-                tier_read_fault_seeds += u64::from(report.tier_read_fault_arm);
-                tier_read_faults_fired += report.tier_read_faults_fired;
-                tier_read_error_replies += report.tier_read_error_replies;
-                tier_read_faults_unconsumed += report.tier_read_faults_unconsumed;
-                scan_cold_pages += report.scan_cold_pages;
-                scan_cold_reads += report.scan_cold_reads;
-                ckpt_downgrades += report.ckpt_downgrades;
-                ckpt_bound_splits += report.ckpt_bound_splits;
-                diskfull_refusals += report.diskfull_refusals;
-                drop_values += report.drop_replies_value;
-                drop_other += report.drop_replies_other;
-                drop_reboots += u64::from(report.drop_reboot_ok);
-                drop_reboot_residue += u64::from(report.drop_reboot_manifest_residue);
-                match report.drop_cut_outcome {
-                    inf_sim::tiered::DropCutOutcome::Whole => drop_cut_whole += 1,
-                    inf_sim::tiered::DropCutOutcome::Swept => drop_cut_swept += 1,
-                    inf_sim::tiered::DropCutOutcome::NotReached => {}
-                }
-                if report.refused_boot && report.ok() {
-                    refused += 1;
-                    lines.push(format!("{seed:#x} refused (taxonomy fail-stop)"));
-                } else if report.ok() {
-                    lines.push(format!("{seed:#x} ok"));
-                } else {
-                    violations += 1;
-                    let first = report.violations.first().unwrap_or("stall");
-                    lines.push(format!("{seed:#x} VIOLATION {first}"));
-                    eprintln!("inf-sim: seed {seed:#x}: {first}");
-                }
-            }
-            // Coverage disclosed, never assumed (ADR-0045 D4): demotion,
-            // cold reads, blobs, refusals, and both drop-race outcomes
-            // must actually occur across the shard.
-            println!(
-                "inf-sim: m4-tiered sweep shard {shard_i}/{shard_k}: {ran} seeds, {violations} \
-                 violations, {refused} legal taxonomy refusals, {commands} commands, {audited} \
-                 keys audited, {flushed_pre_cut} B flushed pre-cut, {cold_resolves} cold \
-                 resolves, {blob_sets} blob sets, {race_replans} blob-key race replans, \
-                 dir-open fault armed on {dir_open_fault_seeds} seeds ({dir_open_faults_fired} \
-                 fired), tier-read EIO armed on {tier_read_fault_seeds} seeds \
-                 ({tier_read_faults_fired} fired, {tier_read_error_replies} typed replies, \
-                 {tier_read_faults_unconsumed} unconsumed), SCAN batching oracle on \
-                 {scan_cold_pages} cold pages ({scan_cold_reads} cold intents), \
-                 ckpt arms [downgrades {ckpt_downgrades} bound_splits \
-                 {ckpt_bound_splits}], {diskfull_refusals} DISKFULL refusals, \
-                 drop-race {drop_values} values / {drop_other} typed-other; post-drop reboots \
-                 {drop_reboots} ({drop_reboot_residue} with MANIFEST residue), cut inside DROP: \
-                 {drop_cut_whole} whole / {drop_cut_swept} swept (ADR-0100); shadow arm on \
-                 {shadow_seeds} seeds: {shadow_created} tickets ({shadow_at_cut} open at the \
-                 cut), {shadow_same_key} same-key / {shadow_collision} collision verdicts, \
-                 {shadow_stale} stale, {shadow_fallbacks} fallbacks; forced collisions: \
-                 {collide_tickets} tickets, {collide_verdicts} collision verdicts, \
-                 {collide_ticketed} ticketed fallbacks, {collide_drains} DBSIZE drains, \
-                 {collide_scan_twins} SCAN twins; open-ticket rows on {open_seeds} seeds: \
-                 {open_tickets} tickets held open, {open_drains} DBSIZE drains reading \
-                 {open_reads} twins, {open_scan_twins} SCAN twins, {open_retargeted} \
-                 retargets, {open_forced_deletes} read-free forced deletes, {open_ticketed} \
-                 ticketed fallbacks, {open_collisions} collision verdicts, {open_read_faults} \
-                 injected read errors relayed, {open_settled_without_read} settled without a \
-                 read after resume; rebuilt multi-ticket rows on {rebuilt_seeds} seeds: \
-                 {rebuilt_tickets} tickets rebuilt, {rebuilt_multi_dels} DELs draining several, \
-                 {rebuilt_same_key_twins} same-key twins among them, {rebuilt_fill_sets} filler \
-                 writes, {rebuilt_reboots} reboots; {promoted_extent_pairs} cold blob GET pairs \
-                 re-resolved onto a promoted reference"
+        if let Some(sweep) = &sweep {
+            std::process::exit(
+                driver::run_sweep("m4-tiered", sweep, TieredFold::default(), run_one).code(),
             );
-            println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
-            if let Some(dir) = out_dir {
-                std::fs::create_dir_all(&dir).expect("--out dir");
-                let manifest = format!(
-                    "scenario=m4-tiered base_seed={seed:#x} sweep={sweep} \
-                     shard={shard_i}/{shard_k} seeds_run={ran} violations={violations} \
-                     refused={refused} commands={commands} keys_audited={audited} \
-                     flushed_pre_cut={flushed_pre_cut} cold_resolves={cold_resolves} \
-                     blob_sets={blob_sets} dir_open_fault_seeds={dir_open_fault_seeds} \
-                     dir_open_faults_fired={dir_open_faults_fired} \
-                     tier_read_fault_seeds={tier_read_fault_seeds} \
-                     tier_read_faults_fired={tier_read_faults_fired} \
-                     tier_read_error_replies={tier_read_error_replies} \
-                     tier_read_faults_unconsumed={tier_read_faults_unconsumed} \
-                     scan_cold_pages={scan_cold_pages} scan_cold_reads={scan_cold_reads} \
-                     ckpt_downgrades={ckpt_downgrades} ckpt_bound_splits={ckpt_bound_splits} \
-                     diskfull_refusals={diskfull_refusals} \
-                     drop_values={drop_values} drop_other={drop_other} \
-                     drop_reboots={drop_reboots} drop_reboot_residue={drop_reboot_residue} \
-                     drop_cut_whole={drop_cut_whole} drop_cut_swept={drop_cut_swept} \
-                     shadow_seeds={shadow_seeds} shadow_created={shadow_created} \
-                     shadow_at_cut={shadow_at_cut} shadow_same_key={shadow_same_key} \
-                     shadow_collision={shadow_collision} shadow_stale={shadow_stale} \
-                     shadow_fallbacks={shadow_fallbacks} collide_tickets={collide_tickets} \
-                     collide_verdicts={collide_verdicts} collide_ticketed={collide_ticketed} \
-                     collide_drains={collide_drains} collide_scan_twins={collide_scan_twins} \
-                     open_seeds={open_seeds} open_tickets={open_tickets} \
-                     open_drains={open_drains} open_reads={open_reads} \
-                     open_scan_twins={open_scan_twins} open_retargeted={open_retargeted} \
-                     open_forced_deletes={open_forced_deletes} open_ticketed={open_ticketed} \
-                     open_collisions={open_collisions} open_read_faults={open_read_faults} \
-                     open_settled_without_read={open_settled_without_read} \
-                     rebuilt_seeds={rebuilt_seeds} rebuilt_tickets={rebuilt_tickets} \
-                     rebuilt_multi_dels={rebuilt_multi_dels} \
-                     rebuilt_same_key_twins={rebuilt_same_key_twins} \
-                     rebuilt_fill_sets={rebuilt_fill_sets} rebuilt_reboots={rebuilt_reboots} \
-                     promoted_extent_pairs={promoted_extent_pairs}\n"
-                );
-                std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
-                    .expect("manifest");
-                std::fs::write(
-                    format!("{dir}/results-shard-{shard_i}.txt"),
-                    lines.join("\n") + "\n",
-                )
-                .expect("results");
-            }
-            // F-L04-02 engagement at sweep scope (batch 34's rule): armed
-            // seeds whose audits never met a fault proved nothing.
-            if tier_read_fault_seeds > 0 && tier_read_faults_fired == 0 {
-                eprintln!(
-                    "inf-sim: VIOLATION: TIER-READ FAULT ARM VACUOUS across the shard: \
-                     {tier_read_fault_seeds} armed seeds, no fault consumed"
-                );
-                violations += 1;
-            }
-            std::process::exit(if violations > 0 { 1 } else { 0 });
         }
         // The forced arm is a positive control: it must fire on the seed a
         // single run names. The check is part of the run, so the twin judges
@@ -1070,59 +659,10 @@ fn main() {
     // the audit that every cell agrees with META.
     if scenario_name == "m2-ns-ddl-race" {
         let run_one = |seed: u64| inf_sim::run_ns_ddl_race_scenario(seed);
-        if let Some(sweep) = sweep {
-            let (shard_i, shard_k) = shard;
-            assert!(shard_k > 0, "--shard I/K wants K > 0");
-            assert!(shard_i < shard_k, "--shard I/K wants I < K");
-            let mut violations = 0u64;
-            let mut ran = 0u64;
-            let (mut found, mut phantoms, mut partial, mut skips) = (0u64, 0u64, 0u64, 0u64);
-            let mut crossings = 0u64;
-            let mut lines = Vec::new();
-            for i in (shard_i..sweep).step_by(shard_k as usize) {
-                let seed = seed.wrapping_add(i);
-                let report = run_one(seed);
-                if verify {
-                    let twin = run_one(seed);
-                    verify_hashes(
-                        (report.trace_hash, report.state_hash),
-                        (twin.trace_hash, twin.state_hash),
-                    );
-                    assert!(twin.ok(), "second run failed its oracles");
-                }
-                ran += 1;
-                found += u64::from(report.drop_found);
-                crossings += report.crossings;
-                let served = u64::from(report.served_before_cut);
-                if served != 0 && served != 4 {
-                    phantoms += 1;
-                }
-                partial += u64::from(report.partial_served);
-                skips += report.skipped_unknown_ns;
-                if report.ok() {
-                    lines.push(format!("{seed:#x} ok"));
-                } else {
-                    violations += 1;
-                    let first = report.violations.first().unwrap_or("stall");
-                    lines.push(format!("{seed:#x} VIOLATION {first}"));
-                    eprintln!("inf-sim: seed {seed:#x}: {first}");
-                }
-            }
-            println!(
-                "inf-sim: m2-ns-ddl-race sweep shard {shard_i}/{shard_k}: {ran} seeds, \
-                 {violations} violations, {crossings} crossings (origin frozen mid-fan), {found} \
-                 DROPs found the namespace, {phantoms} phantom namespaces, {partial} cells serving \
-                 a refused CREATE, {skips} untombstoned unknown-ns skips"
+        if let Some(sweep) = &sweep {
+            std::process::exit(
+                driver::run_sweep("m2-ns-ddl-race", sweep, NsDdlFold::default(), run_one).code(),
             );
-            if let Some(dir) = out_dir.as_deref() {
-                std::fs::create_dir_all(dir).expect("out dir");
-                std::fs::write(
-                    format!("{dir}/results-shard-{shard_i}.txt"),
-                    lines.join("\n") + "\n",
-                )
-                .expect("results");
-            }
-            std::process::exit(if violations > 0 { 1 } else { 0 });
         }
         let exit = driver::run_single(seed, determinism, run_one, |report| {
             println!(
@@ -1158,47 +698,11 @@ fn main() {
     // class the seed picks, each with its reboot audit.
     if scenario_name == "m2-ns-drop-window" {
         let run_one = |seed: u64| inf_sim::run_ns_drop_window_scenario(seed);
-        if let Some(sweep) = sweep {
-            let (shard_i, shard_k) = shard;
-            assert!(shard_k > 0, "--shard I/K wants K > 0");
-            assert!(shard_i < shard_k, "--shard I/K wants I < K");
-            let (mut violations, mut ran, mut keys) = (0u64, 0u64, 0u64);
-            let mut lines = Vec::new();
-            for i in (shard_i..sweep).step_by(shard_k as usize) {
-                let seed = seed.wrapping_add(i);
-                let report = run_one(seed);
-                if verify {
-                    let twin = run_one(seed);
-                    verify_hashes(
-                        (report.trace_hash, report.state_hash),
-                        (twin.trace_hash, twin.state_hash),
-                    );
-                    assert!(twin.ok(), "second run failed its oracles");
-                }
-                ran += 1;
-                keys += report.keys_served;
-                if report.ok() {
-                    lines.push(format!("{seed:#x} ok {:?}", report.cut));
-                } else {
-                    violations += 1;
-                    let first = report.violations.first().unwrap_or("stall");
-                    lines.push(format!("{seed:#x} VIOLATION {first}"));
-                    eprintln!("inf-sim: seed {seed:#x}: {first}");
-                }
-            }
-            println!(
-                "inf-sim: m2-ns-drop-window sweep shard {shard_i}/{shard_k}: {ran} seeds, \
-                 {violations} violations, {keys} acked keys served after a cut before the answer"
+        if let Some(sweep) = &sweep {
+            std::process::exit(
+                driver::run_sweep("m2-ns-drop-window", sweep, NsDropFold::default(), run_one)
+                    .code(),
             );
-            if let Some(dir) = out_dir.as_deref() {
-                std::fs::create_dir_all(dir).expect("out dir");
-                std::fs::write(
-                    format!("{dir}/results-shard-{shard_i}.txt"),
-                    lines.join("\n") + "\n",
-                )
-                .expect("results");
-            }
-            std::process::exit(if violations > 0 { 1 } else { 0 });
         }
         let exit = driver::run_single(seed, determinism, run_one, |report| {
             println!(
@@ -1233,56 +737,11 @@ fn main() {
     // mirrors m4-cold's shape.
     if scenario_name == "m2-ns-create-window" {
         let run_one = |seed: u64| inf_sim::run_ns_create_window_scenario(seed);
-        if let Some(sweep) = sweep {
-            let (shard_i, shard_k) = shard;
-            assert!(shard_k > 0, "--shard I/K wants K > 0");
-            assert!(shard_i < shard_k, "--shard I/K wants I < K");
-            let mut violations = 0u64;
-            let mut ran = 0u64;
-            let (mut attempts, mut refused, mut acked, mut skips, mut held) =
-                (0u64, 0u64, 0u64, 0u64, 0u64);
-            let mut lines = Vec::new();
-            for i in (shard_i..sweep).step_by(shard_k as usize) {
-                let seed = seed.wrapping_add(i);
-                let report = run_one(seed);
-                if verify {
-                    let twin = run_one(seed);
-                    verify_hashes(
-                        (report.trace_hash, report.state_hash),
-                        (twin.trace_hash, twin.state_hash),
-                    );
-                    assert!(twin.ok(), "second run failed its oracles");
-                }
-                ran += 1;
-                attempts += report.use_attempts;
-                refused += report.use_refused;
-                acked += report.acked_in_window;
-                skips += report.skipped_unknown_ns;
-                held += report.held_steps;
-                if report.ok() {
-                    lines.push(format!("{seed:#x} ok"));
-                } else {
-                    violations += 1;
-                    let first = report.violations.first().unwrap_or("stall");
-                    lines.push(format!("{seed:#x} VIOLATION {first}"));
-                    eprintln!("inf-sim: seed {seed:#x}: {first}");
-                }
-            }
-            println!(
-                "inf-sim: m2-ns-create-window sweep shard {shard_i}/{shard_k}: {ran} seeds, \
-                 {violations} violations, {attempts} USE attempts in the window ({refused} \
-                 refused, {acked} writes acked), {skips} untombstoned unknown-ns skips, {held} \
-                 held steps"
+        if let Some(sweep) = &sweep {
+            std::process::exit(
+                driver::run_sweep("m2-ns-create-window", sweep, NsCreateFold::default(), run_one)
+                    .code(),
             );
-            if let Some(dir) = out_dir.as_deref() {
-                std::fs::create_dir_all(dir).expect("out dir");
-                std::fs::write(
-                    format!("{dir}/results-shard-{shard_i}.txt"),
-                    lines.join("\n") + "\n",
-                )
-                .expect("results");
-            }
-            std::process::exit(if violations > 0 { 1 } else { 0 });
         }
         let exit = driver::run_single(seed, determinism, run_one, |report| {
             println!(
@@ -1444,6 +903,33 @@ fn main() {
     std::process::exit(exit.code());
 }
 
+/// The sweep arguments as one checked type, or the refusal. `--shard` and
+/// `--out` need `--sweep`; `--verify-determinism` is a single run's, since
+/// a sweep runs every seed twice and a flag beside it would teach that its
+/// absence meant once.
+fn sweep_of(
+    verify: bool,
+    base_seed: u64,
+    seeds: Option<NonZeroU64>,
+    shard: Option<Shard>,
+    out: Option<String>,
+) -> Result<Option<Sweep>, String> {
+    let Some(seeds) = seeds else {
+        return match (shard, out) {
+            (Some(_), _) => Err("--shard needs --sweep".to_owned()),
+            (None, Some(_)) => Err("--out needs --sweep".to_owned()),
+            (None, None) => Ok(None),
+        };
+    };
+    if verify {
+        return Err(
+            "--verify-determinism is a single run's: a sweep runs every seed twice".to_owned()
+        );
+    }
+    let shard = shard.unwrap_or(Shard::WHOLE);
+    Ok(Some(Sweep::new(base_seed, seeds, shard, out.map(PathBuf::from))))
+}
+
 /// Shared durable runner: M2's key/value workload and M3's document
 /// workload differ only in scenario construction. Both write replayable
 /// per-seed results and a sweep manifest.
@@ -1524,10 +1010,8 @@ fn run_durable(
     marks_leg: Option<EpochMarksLeg>,
     wedge_leg: Option<LedgerWedgeLeg>,
     park_at_once: bool,
-    verify: bool,
-    sweep: Option<u64>,
-    (shard_i, shard_k): (u64, u64),
-    out_dir: Option<&str>,
+    determinism: Verify,
+    sweep: Option<&Sweep>,
 ) {
     let run_one = |seed: u64| -> inf_sim::DurableReport {
         let mut scenario = match scenario_name {
@@ -1568,7 +1052,6 @@ fn run_durable(
     };
 
     let Some(sweep) = sweep else {
-        let determinism = if verify { Verify::Twin } else { Verify::Off };
         let exit = driver::run_single(seed, determinism, run_one, |report| {
             println!(
                 "inf-sim: scenario {scenario_name} seed {seed:#x}: {} commands, {} steps, {} keys \
@@ -1694,240 +1177,20 @@ fn run_durable(
         std::process::exit(exit.code());
     };
 
-    // Sweep mode: seeds base+i for i ≡ shard_i (mod shard_k).
-    assert!(shard_k > 0, "--shard I/K wants K > 0");
-    assert!(shard_i < shard_k, "--shard I/K wants I < K");
-    let mut lines = Vec::new();
-    let mut violations = 0u64;
-    let mut refused = 0u64;
-    let mut ran = 0u64;
-    let mut sim_seconds = 0.0f64;
-    let mut equivalence_checks = 0u64;
-    let mut documents_compared = 0u64;
-    let mut corpus_documents = 0u64;
-    let mut cut_classes: std::collections::BTreeMap<&'static str, u64> =
-        std::collections::BTreeMap::new();
-    // Frame-pipeline coverage (ADR-0087 D7): seeds whose cells reached
-    // ≥ 2 frames in flight, the deepest seen, and the bounded waits.
-    let mut pipelined_seeds = 0u64;
-    let mut depth_max = 0u64;
-    let mut waits_barrier = 0u64;
-    let mut waits_rotation = 0u64;
-    let mut waits_reorder = 0u64;
-    let mut ckpt_downgrades = 0u64;
-    let mut bound_splits = 0u64;
-    let mut waits_fill = 0u64;
-    let mut waits_group = 0u64;
-    // Batch 42 log oracles: idle-tick violations summed, map depth and
-    // ledger entries as sweep maxima.
-    let mut idle_tick_violations = 0u64;
-    let mut frames_awaiting_max = 0u64;
-    let mut fsync_entries_max = 0u64;
-    let mut write_through_entries_max = 0u64;
-    let mut hold_episode_violations = 0u64;
-    // Device-budget coverage (ADR-0088 D8): background bytes granted,
-    // deferrals issued, seal-pace waits, worst frame-write latency.
-    let mut budget_bytes = 0u64;
-    let mut budget_deferrals = 0u64;
-    let (mut budget_unattainable, mut block_wait_ns_max) = (0u64, 0u64);
-    let mut waits_pace = 0u64;
-    let mut stall_max_us = 0u64;
-    // Transition coverage (ADR-0086 D4 as amended): packed tails reopened
-    // under a `Direct` rotor at the `m2-mode-transition` restart.
-    let mut reopened_packed_tails = 0u64;
-    // Recycling coverage (ADR-0090 D5): segments recycled, pool misses +
-    // fallbacks, rotations, and residue the reboots proved.
-    let mut recycled = 0u64;
-    let mut recycle_misses = 0u64;
-    let mut recycle_fallbacks = 0u64;
-    let mut recycle_served = 0u64;
-    let mut open_unreached = 0u64;
-    let mut recycle_sentinels = 0u64;
-    let mut clean_stop_torn_tails = 0u64;
-    let mut rotations = 0u64;
-    let mut residue_slacks = 0u64;
-    // Pool-wait coverage (ADR-0090 D9): both outcomes must occur in a
-    // sweep that claims to cover the wait.
-    let mut waits_started = 0u64;
-    let mut waits_satisfied = 0u64;
-    let mut waits_expired = 0u64;
-    let mut inline_preallocs = 0u64;
-    // The lift regime (F-L14-01): seeds that ran it, the records its
-    // writers landed behind the lift, the sidecars the final boot loaded,
-    // and — every seed — the residue slacks the final boot lifted past.
-    let mut lift_seeds = 0u64;
-    let mut lift_tiered_ops = 0u64;
-    let mut lift_indexed_ops = 0u64;
-    let mut lift_sidecars_loaded = 0u64;
-    let mut lift_plants = 0u64;
-    let mut lift_plant_lifts = 0u64;
-    let mut lift_plant_sidecars = 0u64;
-    let mut stale_slacks = 0u64;
-    for i in (shard_i..sweep).step_by(shard_k as usize) {
-        let seed = seed.wrapping_add(i);
-        let report = run_one(seed);
-        if verify {
-            let twin = run_one(seed);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (twin.trace_hash, twin.state_hash),
-            );
-            assert!(twin.ok(), "second run failed its oracles");
-        }
-        ran += 1;
-        pipelined_seeds += u64::from(report.frames_in_flight_max >= 2);
-        depth_max = depth_max.max(report.frames_in_flight_max);
-        waits_barrier += report.frame_waits_barrier;
-        waits_rotation += report.frame_waits_rotation;
-        waits_reorder += report.frame_waits_reorder;
-        ckpt_downgrades += report.ckpt_downgrades;
-        bound_splits += report.ckpt_bound_splits;
-        waits_fill += report.frame_waits_fill;
-        waits_group += report.frame_waits_group;
-        idle_tick_violations += report.idle_tick_violations;
-        frames_awaiting_max = frames_awaiting_max.max(report.frames_awaiting_max);
-        fsync_entries_max = fsync_entries_max.max(report.fsync_entries_max);
-        write_through_entries_max = write_through_entries_max.max(report.write_through_entries_max);
-        hold_episode_violations += report.hold_episode_violations;
-        budget_bytes += report.budget_background_bytes;
-        budget_deferrals += report.budget_deferrals;
-        budget_unattainable += report.budget_unattainable;
-        block_wait_ns_max = block_wait_ns_max.max(report.ckpt_block_wait_ns_max);
-        waits_pace += report.frame_waits_pace;
-        stall_max_us = stall_max_us.max(report.write_stall_max_us);
-        reopened_packed_tails += report.reopened_packed_tails;
-        recycled += report.segments_recycled;
-        recycle_misses += report.recycle_misses;
-        recycle_fallbacks += report.recycle_fallbacks;
-        recycle_served += report.recycle_served;
-        open_unreached += u64::from(report.recycle_open_unreached);
-        recycle_sentinels += report.recycle_sentinels;
-        clean_stop_torn_tails += report.clean_stop_torn_tails;
-        rotations += report.segment_rotations;
-        residue_slacks += report.recycled_residue_slacks;
-        waits_started += report.recycle_waits_started;
-        waits_satisfied += report.recycle_waits_satisfied;
-        waits_expired += report.recycle_waits_expired;
-        inline_preallocs += report.segment_inline_preallocs;
-        lift_seeds += u64::from(report.lift_regime);
-        lift_tiered_ops += report.lift_tiered_ops;
-        lift_indexed_ops += report.lift_indexed_ops;
-        lift_sidecars_loaded += report.lift_sidecars_loaded;
-        stale_slacks += report.stale_residue_slacks;
-        lift_plants += report.lift_plants;
-        lift_plant_lifts += report.lift_plant_lifts;
-        lift_plant_sidecars += report.lift_plant_sidecars;
-        sim_seconds += report.sim_seconds;
-        equivalence_checks += report.equivalence_checks;
-        documents_compared += report.documents_compared;
-        corpus_documents += report.corpus_documents_used;
-        for class in &report.cut_classes {
-            *cut_classes.entry(class).or_default() += 1;
-        }
-        if report.refused_boot && report.ok() {
-            // Legal §8.4 refusal (ADR-0018 taxonomy) — disclosed, not a
-            // violation.
-            refused += 1;
-            lines.push(format!("{seed:#x} refused (taxonomy fail-stop)"));
-        } else if report.ok() {
-            lines.push(format!("{seed:#x} ok"));
-        } else {
-            violations += 1;
-            let first = report.violations.first().unwrap_or("stall");
-            lines.push(format!("{seed:#x} VIOLATION {first}"));
-            eprintln!("inf-sim: seed {seed:#x}: {first}");
-        }
-    }
-    // Cut-class distribution (ADR-0045 D4): coverage is disclosed in the
-    // manifest, never assumed from the random process.
-    let classes: Vec<String> =
-        cut_classes.iter().map(|(class, count)| format!("{class}:{count}")).collect();
-    println!(
-        "inf-sim: {scenario_name} sweep shard {shard_i}/{shard_k}: {ran} seeds, {violations} \
-         violations, {refused} legal taxonomy refusals, {equivalence_checks} equivalence \
-         checks, {documents_compared} documents compared, cut classes [{}], frame pipeline \
-         [pipelined_seeds:{pipelined_seeds} depth_max:{depth_max} waits_barrier:{waits_barrier} \
-         waits_rotation:{waits_rotation} waits_reorder:{waits_reorder}], device budget \
-         [background_bytes:{budget_bytes} \
-         deferrals:{budget_deferrals} unattainable:{budget_unattainable} \
-         ckpt_block_wait_ns_max:{block_wait_ns_max} waits_pace:{waits_pace} \
-         write_stall_max_us:{stall_max_us}], \
-         reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades} \
-         bound_splits:{bound_splits} waits_fill:{waits_fill} waits_group:{waits_group}, log \
-         oracles \
-         [idle_tick_violations:{idle_tick_violations} frames_awaiting_max:{frames_awaiting_max} \
-         fsync_entries_max:{fsync_entries_max} \
-         write_through_entries_max:{write_through_entries_max} \
-         hold_episode_violations:{hold_episode_violations}], \
-         recycling [recycled:{recycled} misses:{recycle_misses} \
-         fallbacks:{recycle_fallbacks} served:{recycle_served} \
-         open_unreached:{open_unreached} rotations:{rotations} residue_slacks:{residue_slacks} \
-         waits_started:{waits_started} waits_satisfied:{waits_satisfied} \
-         waits_expired:{waits_expired} inline_preallocs:{inline_preallocs}], lift regime \
-         [seeds:{lift_seeds} tiered_ops:{lift_tiered_ops} indexed_ops:{lift_indexed_ops} \
-         sidecars_loaded:{lift_sidecars_loaded} stale_slacks:{stale_slacks} \
-         plants:{lift_plants} plant_lifts:{lift_plant_lifts} plant_sidecars:{lift_plant_sidecars}]",
-        classes.join(" ")
-    );
-    println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
-    if let Some(dir) = out_dir {
-        std::fs::create_dir_all(dir).expect("--out dir");
-        let manifest = format!(
-            "scenario={scenario_name} base_seed={seed:#x} sweep={sweep} shard={shard_i}/{shard_k} \
-             plant={plant:?} replay_canary={replay_canary} seeds_run={ran} \
-             violations={violations} refused={refused} equivalence_checks={equivalence_checks} \
-             documents_compared={documents_compared} corpus_documents={corpus_documents} \
-             cut_classes=[{}] pipelined_seeds={pipelined_seeds} depth_max={depth_max} \
-             waits_barrier={waits_barrier} waits_rotation={waits_rotation} \
-             waits_reorder={waits_reorder} budget_background_bytes={budget_bytes} \
-             budget_deferrals={budget_deferrals} budget_unattainable={budget_unattainable} \
-             ckpt_block_wait_ns_max={block_wait_ns_max} \
-             waits_pace={waits_pace} write_stall_max_us={stall_max_us} \
-             reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades} \
-             ckpt_bound_splits={bound_splits} waits_fill={waits_fill} waits_group={waits_group} \
-             idle_tick_violations={idle_tick_violations} frames_awaiting_max={frames_awaiting_max} \
-             fsync_entries_max={fsync_entries_max} \
-             write_through_entries_max={write_through_entries_max} \
-             hold_episode_violations={hold_episode_violations} \
-             segments_recycled={recycled} recycle_misses={recycle_misses} \
-             recycle_fallbacks={recycle_fallbacks} recycle_served={recycle_served} \
-             recycle_open_unreached={open_unreached} recycle_sentinels={recycle_sentinels} \
-             clean_stop_torn_tails={clean_stop_torn_tails} segment_rotations={rotations} \
-             recycled_residue_slacks={residue_slacks} recycle_waits_started={waits_started} \
-             recycle_waits_satisfied={waits_satisfied} recycle_waits_expired={waits_expired} \
-             segment_inline_preallocs={inline_preallocs} lift_seeds={lift_seeds} \
-             lift_tiered_ops={lift_tiered_ops} lift_indexed_ops={lift_indexed_ops} \
-             lift_sidecars_loaded={lift_sidecars_loaded} stale_residue_slacks={stale_slacks} \
-             lift_plants={lift_plants} lift_plant_lifts={lift_plant_lifts} \
-             lift_plant_sidecars={lift_plant_sidecars}\n",
-            classes.join(" ")
-        );
-        std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");
-        std::fs::write(format!("{dir}/results-shard-{shard_i}.txt"), lines.join("\n") + "\n")
-            .expect("results");
-    }
-    if violations > 0 {
-        std::process::exit(1);
-    }
+    let fold = DurableFold { plant, replay_canary, ..DurableFold::default() };
+    std::process::exit(driver::run_sweep(scenario_name, sweep, fold, run_one).code());
 }
 
 /// The M2.5-S14 combined runner: one seed, or a sharded sweep. Mirrors
 /// the shared durable runner (per-seed results + a manifest,
 /// `violations=0` gate);
 /// any failing seed replays byte-identically via `--seed`.
-fn run_m2_combined(
-    seed: u64,
-    verify: bool,
-    sweep: Option<u64>,
-    (shard_i, shard_k): (u64, u64),
-    out_dir: Option<&str>,
-) {
+fn run_m2_combined(seed: u64, determinism: Verify, sweep: Option<&Sweep>) {
     let run_one = |seed: u64| -> inf_sim::CombinedReport {
         run_combined_scenario(&CombinedScenario::m2_combined(seed))
     };
 
     let Some(sweep) = sweep else {
-        let determinism = if verify { Verify::Twin } else { Verify::Off };
         let exit = driver::run_single(seed, determinism, run_one, |report| {
             println!(
                 "inf-sim: scenario m2-combined seed {seed:#x}: {} commands, {} steps, {} keys \
@@ -1958,92 +1221,1103 @@ fn run_m2_combined(
         std::process::exit(exit.code());
     };
 
-    assert!(shard_k > 0, "--shard I/K wants K > 0");
-    assert!(shard_i < shard_k, "--shard I/K wants I < K");
-    let mut lines = Vec::new();
-    let mut violations = 0u64;
-    let mut refused = 0u64;
-    let mut ran = 0u64;
-    let mut sim_seconds = 0.0f64;
-    let mut published = 0u64;
-    let mut delivered = 0u64;
-    for i in (shard_i..sweep).step_by(shard_k as usize) {
-        let seed = seed.wrapping_add(i);
-        let report = run_one(seed);
-        if verify {
-            let twin = run_one(seed);
-            verify_hashes(
-                (report.trace_hash, report.state_hash),
-                (twin.trace_hash, twin.state_hash),
-            );
-            assert!(twin.ok(), "second run failed its oracles");
-        }
-        ran += 1;
-        sim_seconds += report.sim_seconds;
-        published += report.published;
-        delivered += report.delivered;
-        if report.refused_boot && report.ok() {
-            refused += 1;
-            lines.push(format!("{seed:#x} refused (taxonomy fail-stop)"));
-        } else if report.ok() {
-            lines.push(format!("{seed:#x} ok"));
-        } else {
-            violations += 1;
-            let first = report.violations.first().unwrap_or("stall");
-            lines.push(format!("{seed:#x} VIOLATION {first}"));
-            eprintln!("inf-sim: seed {seed:#x}: {first}");
-        }
+    std::process::exit(driver::run_sweep("m2-combined", sweep, CombinedFold, run_one).code());
+}
+
+/// `m4-recovery`'s shard: the seed classes and arms that must actually occur
+/// across it (ADR-0045 D4: coverage disclosed, never assumed).
+#[derive(Default)]
+struct RecoveryFold {
+    refs: u64,
+    images: u64,
+    cuts_before: u64,
+    flush_lag: u64,
+    live_entries: u64,
+    relocations: u64,
+    files_retired: u64,
+    files_unlinked: u64,
+    boot_gc: u64,
+    blobs: u64,
+    blob_orphans: u64,
+    blob_reclaims: u64,
+    shadow_opened: u64,
+    shadow_at_cut: u64,
+    shadow_reformed: u64,
+    shadow_same_key: u64,
+    shadow_collision: u64,
+    shadow_collide_ops: u64,
+    shadow_settled_at_boot: u64,
+    shadow_drain_checks: u64,
+    shadow_multi_winners: u64,
+    shadow_multi_dels: u64,
+    shadow_twin_origin_rows: u64,
+    shadow_twin_origins_covered: u64,
+    shadow_held_rows: u64,
+    shadow_held_reformed: u64,
+    shadow_held_not_restored: u64,
+    // ADR-0174 D6: the boots that demoted, the fitting boots the zero set
+    // was checked on, and boot replay's counters.
+    demoting_boots: u64,
+    fitting_boots: u64,
+    boot_replay: inf_store::ReplayCounters,
+    writer_parks: u64,
+    two_crash_removed: u64,
+    two_crash_skipped: u64,
+    // ADR-0174 D2 rule 6: the spec-variant seeds and their long records
+    // (the pads are `boot_replay.pads_placed`).
+    variant_seeds: u64,
+    long_records: u64,
+    seal_census: inf_sim::SealCensus,
+}
+
+impl Fold for RecoveryFold {
+    type Report = inf_sim::RecoveryReport;
+
+    fn absorb(&mut self, report: &Self::Report) {
+        self.demoting_boots += report.demoting_boots;
+        self.fitting_boots += report.fitting_boots_checked;
+        self.boot_replay.absorb(report.boot_replay);
+        self.writer_parks += report.writer_parks;
+        self.two_crash_removed += report.two_crash_markers_removed;
+        self.two_crash_skipped += report.two_crash_unit_past_window;
+        self.variant_seeds += u64::from(report.spec_variant.is_some());
+        self.long_records += report.long_records_written;
+        self.seal_census.absorb(report.seal_census);
+        self.shadow_held_rows += report.shadow_held_rows;
+        self.shadow_held_reformed += report.shadow_held_reformed;
+        self.shadow_held_not_restored += report.shadow_held_not_restored;
+        self.shadow_multi_winners += report.shadow_multi_ticket_winners;
+        self.shadow_multi_dels += report.shadow_multi_ticket_dels;
+        self.shadow_twin_origin_rows += report.shadow_twin_origin_rows;
+        self.shadow_twin_origins_covered += report.shadow_twin_origins_covered;
+        self.shadow_opened += report.shadow_opened;
+        self.shadow_at_cut += report.shadow_open_at_cut;
+        self.shadow_reformed += report.shadow_reformed;
+        self.shadow_same_key += report.shadow_same_key;
+        self.shadow_collision += report.shadow_collision;
+        self.shadow_collide_ops += report.shadow_collide_ops;
+        self.shadow_settled_at_boot += report.shadow_settled_at_boot;
+        self.shadow_drain_checks += report.shadow_drain_checks;
+        self.refs += report.refs_emitted;
+        self.images += report.images_emitted;
+        self.cuts_before += report.cut_before_publish;
+        self.flush_lag += report.flush_lag_lives;
+        self.live_entries += report.live_entries_emitted;
+        self.relocations += report.relocations;
+        self.files_retired += report.files_retired;
+        self.files_unlinked += report.files_unlinked;
+        self.boot_gc += report.unlinks_left_to_boot_gc;
+        self.blobs += report.blobs_written;
+        self.blob_orphans += report.blob_orphans_planted;
+        self.blob_reclaims += report.blob_extents_reclaimed;
     }
-    println!(
-        "inf-sim: m2-combined sweep shard {shard_i}/{shard_k}: {ran} seeds, {violations} \
-         violations, {refused} legal taxonomy refusals"
-    );
-    println!("inf-sim: sim_seconds={sim_seconds:.6} published={published} delivered={delivered}");
-    if let Some(dir) = out_dir {
-        std::fs::create_dir_all(dir).expect("--out dir");
-        let manifest = format!(
-            "scenario=m2-combined base_seed={seed:#x} sweep={sweep} shard={shard_i}/{shard_k} \
-             seeds_run={ran} violations={violations} refused={refused}\n"
-        );
-        std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");
-        std::fs::write(format!("{dir}/results-shard-{shard_i}.txt"), lines.join("\n") + "\n")
-            .expect("results");
+
+    fn coverage(&self) -> String {
+        format!("{}{}", self.coverage_lives(), self.coverage_boots())
     }
-    if violations > 0 {
-        std::process::exit(1);
+
+    fn manifest_tail(&self) -> String {
+        let Self {
+            refs,
+            images,
+            cuts_before,
+            flush_lag,
+            live_entries,
+            relocations,
+            files_retired,
+            files_unlinked,
+            boot_gc,
+            blobs,
+            blob_orphans,
+            blob_reclaims,
+            shadow_opened,
+            shadow_at_cut,
+            shadow_reformed,
+            shadow_same_key,
+            shadow_collision,
+            shadow_collide_ops,
+            shadow_settled_at_boot,
+            shadow_drain_checks,
+            shadow_multi_winners,
+            shadow_multi_dels,
+            shadow_twin_origin_rows,
+            shadow_twin_origins_covered,
+            shadow_held_rows,
+            shadow_held_reformed,
+            shadow_held_not_restored,
+            ..
+        } = self;
+        format!(
+            "refs={refs} images={images} cut_before_publish={cuts_before} \
+             flush_lag_lives={flush_lag} live_set_entries={live_entries} \
+             relocations={relocations} files_retired={files_retired} \
+             files_unlinked={files_unlinked} unlinks_boot_gc={boot_gc} \
+             blobs={blobs} blob_orphans={blob_orphans} blob_reclaims={blob_reclaims} \
+             shadow_opened={shadow_opened} shadow_at_cut={shadow_at_cut} \
+             shadow_reformed={shadow_reformed} shadow_same_key={shadow_same_key} \
+             shadow_collision={shadow_collision} shadow_collide_ops={shadow_collide_ops} \
+             shadow_settled_at_boot={shadow_settled_at_boot} \
+             shadow_drain_checks={shadow_drain_checks} \
+             shadow_multi_winners={shadow_multi_winners} \
+             shadow_multi_dels={shadow_multi_dels} \
+             shadow_twin_origin_rows={shadow_twin_origin_rows} \
+             shadow_twin_origins_covered={shadow_twin_origins_covered} \
+             shadow_held_rows={shadow_held_rows} \
+             shadow_held_reformed={shadow_held_reformed} \
+             shadow_held_not_restored={shadow_held_not_restored}"
+        )
+    }
+
+    fn shard_end_clauses(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
-fn verify_hashes(first: (u64, u64), second: (u64, u64)) {
-    if let Err(reason) = inf_sim::state::verify(first.0, first.1, second.0, second.1) {
-        eprintln!("inf-sim: DETERMINISM VIOLATION — {reason}");
-        std::process::exit(1);
+impl RecoveryFold {
+    fn coverage_lives(&self) -> String {
+        let Self {
+            refs,
+            images,
+            cuts_before,
+            flush_lag,
+            live_entries,
+            relocations,
+            files_retired,
+            files_unlinked,
+            boot_gc,
+            blobs,
+            blob_orphans,
+            blob_reclaims,
+            shadow_opened,
+            shadow_at_cut,
+            shadow_reformed,
+            shadow_same_key,
+            shadow_collision,
+            shadow_collide_ops,
+            shadow_settled_at_boot,
+            shadow_drain_checks,
+            shadow_multi_winners,
+            shadow_multi_dels,
+            shadow_twin_origin_rows,
+            shadow_twin_origins_covered,
+            shadow_held_rows,
+            shadow_held_reformed,
+            shadow_held_not_restored,
+            ..
+        } = self;
+        format!(
+            "{refs} refs, {images} images, \
+             {cuts_before} cut-before-publish lives, {flush_lag} flush-lag lives, \
+             {live_entries} live-set entries, {relocations} relocations, \
+             {files_retired} retired, {files_unlinked} unlinked, \
+             {boot_gc} left-to-boot-gc, {blobs} blobs, {blob_orphans} orphans-planted, \
+             {blob_reclaims} blob-reclaims; shadow {shadow_opened} opened, \
+             {shadow_at_cut} open at a cut, {shadow_reformed} re-formed by recovery, \
+             {shadow_same_key} same-key / {shadow_collision} collision verdicts; \
+             {shadow_collide_ops} ops on crafted colliding pairs, \
+             {shadow_settled_at_boot} slots settled at boot, {shadow_drain_checks} \
+             DBSIZE-drain checks; rebuilt multi-ticket winners {shadow_multi_winners} \
+             ({shadow_multi_dels} DELs drained them), twin-with-origins rows \
+             {shadow_twin_origin_rows} ({shadow_twin_origins_covered} origins covered by \
+             DEL markers), held-across-the-walk rows {shadow_held_rows} \
+             ({shadow_held_reformed} re-formed at boot, {shadow_held_not_restored} not \
+             restored by an older manifest); "
+        )
     }
-    println!("inf-sim: state_hash={:#018x}; state hash identical", first.1);
+
+    fn coverage_boots(&self) -> String {
+        let Self {
+            demoting_boots,
+            fitting_boots,
+            boot_replay,
+            writer_parks,
+            two_crash_removed,
+            two_crash_skipped,
+            variant_seeds,
+            long_records,
+            seal_census,
+            ..
+        } = self;
+        format!(
+            "boots {demoting_boots} demoting / \
+             {fitting_boots} fitting checked, boot replay {} demote steps / {} tier bytes / \
+             {} settle reads / {} same-key / {} distinct / {} deletes verified / {} blob \
+             releases, {writer_parks} writer parks, {two_crash_removed} two-crash refs \
+             removed by a marker ({two_crash_skipped} rows skipped: unit past the raised \
+             window); spec-variant seeds {variant_seeds}, {long_records} long records, {} \
+             pads placed; boot files censused {} (capacity {} / gap {} / shutdown {} \
+             seals), {} page pads crossed, against a summed bound of {} (closest boot: {})",
+            boot_replay.demote_steps,
+            boot_replay.tier_bytes,
+            boot_replay.settle_reads,
+            boot_replay.settled_same_key,
+            boot_replay.settled_distinct,
+            boot_replay.deletes_verified,
+            boot_replay.blob_releases,
+            boot_replay.pads_placed,
+            seal_census.files,
+            seal_census.capacity_seals,
+            seal_census.gap_seals,
+            seal_census.shutdown_seals,
+            seal_census.page_pads,
+            seal_census.bound,
+            closest_boot(seal_census.closest)
+        )
+    }
+}
+
+/// `m4-tiered`'s shard: demotion, cold reads, blobs, refusals and both
+/// drop-race outcomes must actually occur across it (ADR-0045 D4).
+#[derive(Default)]
+struct TieredFold {
+    commands: u64,
+    audited: u64,
+    flushed_pre_cut: u64,
+    cold_resolves: u64,
+    blob_sets: u64,
+    race_replans: u64,
+    dir_open_fault_seeds: u64,
+    dir_open_faults_fired: u64,
+    tier_read_fault_seeds: u64,
+    tier_read_faults_fired: u64,
+    tier_read_error_replies: u64,
+    tier_read_faults_unconsumed: u64,
+    scan_cold_pages: u64,
+    scan_cold_reads: u64,
+    ckpt_downgrades: u64,
+    ckpt_bound_splits: u64,
+    diskfull_refusals: u64,
+    drop_values: u64,
+    drop_other: u64,
+    drop_reboots: u64,
+    drop_reboot_residue: u64,
+    drop_cut_whole: u64,
+    drop_cut_swept: u64,
+    shadow_seeds: u64,
+    shadow_created: u64,
+    shadow_same_key: u64,
+    shadow_collision: u64,
+    shadow_fallbacks: u64,
+    shadow_stale: u64,
+    shadow_at_cut: u64,
+    collide_tickets: u64,
+    collide_verdicts: u64,
+    collide_ticketed: u64,
+    collide_drains: u64,
+    collide_scan_twins: u64,
+    open_seeds: u64,
+    open_tickets: u64,
+    open_drains: u64,
+    open_reads: u64,
+    open_scan_twins: u64,
+    open_retargeted: u64,
+    open_forced_deletes: u64,
+    open_ticketed: u64,
+    open_collisions: u64,
+    open_read_faults: u64,
+    open_settled_without_read: u64,
+    rebuilt_seeds: u64,
+    rebuilt_tickets: u64,
+    rebuilt_multi_dels: u64,
+    rebuilt_same_key_twins: u64,
+    rebuilt_fill_sets: u64,
+    rebuilt_reboots: u64,
+    promoted_extent_pairs: u64,
+}
+
+impl Fold for TieredFold {
+    type Report = inf_sim::TieredNodeReport;
+
+    fn absorb(&mut self, report: &Self::Report) {
+        self.absorb_tickets(report);
+        self.commands += report.commands_done;
+        self.audited += report.audited_keys;
+        self.flushed_pre_cut += report.flushed_pre_cut_bytes;
+        self.cold_resolves += report.cold_resolves;
+        self.blob_sets += report.blob_sets;
+        self.race_replans += report.race_replans;
+        self.dir_open_fault_seeds += u64::from(report.dir_open_fault_arm);
+        self.dir_open_faults_fired += report.dir_open_faults_fired;
+        self.tier_read_fault_seeds += u64::from(report.tier_read_fault_arm);
+        self.tier_read_faults_fired += report.tier_read_faults_fired;
+        self.tier_read_error_replies += report.tier_read_error_replies;
+        self.tier_read_faults_unconsumed += report.tier_read_faults_unconsumed;
+        self.scan_cold_pages += report.scan_cold_pages;
+        self.scan_cold_reads += report.scan_cold_reads;
+        self.ckpt_downgrades += report.ckpt_downgrades;
+        self.ckpt_bound_splits += report.ckpt_bound_splits;
+        self.diskfull_refusals += report.diskfull_refusals;
+        self.drop_values += report.drop_replies_value;
+        self.drop_other += report.drop_replies_other;
+        self.drop_reboots += u64::from(report.drop_reboot_ok);
+        self.drop_reboot_residue += u64::from(report.drop_reboot_manifest_residue);
+        match report.drop_cut_outcome {
+            inf_sim::tiered::DropCutOutcome::Whole => self.drop_cut_whole += 1,
+            inf_sim::tiered::DropCutOutcome::Swept => self.drop_cut_swept += 1,
+            inf_sim::tiered::DropCutOutcome::NotReached => {}
+        }
+    }
+
+    fn coverage(&self) -> String {
+        format!("{}{}", self.coverage_data_plane(), self.coverage_tickets())
+    }
+
+    fn manifest_tail(&self) -> String {
+        format!("{} {}", self.manifest_data_plane(), self.manifest_tickets())
+    }
+
+    /// The tier-read fault arm's engagement over the shard: armed seeds
+    /// whose audits never met a fault prove nothing. A single run's forced
+    /// arm checks its own seed instead.
+    fn shard_end_clauses(&self) -> Vec<String> {
+        let mut fired = Vec::new();
+        if self.tier_read_fault_seeds > 0 && self.tier_read_faults_fired == 0 {
+            fired.push(format!(
+                "TIER-READ FAULT ARM VACUOUS across the shard: {} armed seeds, no fault consumed",
+                self.tier_read_fault_seeds
+            ));
+        }
+        fired
+    }
+}
+
+impl TieredFold {
+    /// The shadow-ticket, forced-collision, open-ticket and rebuilt-row arms.
+    fn absorb_tickets(&mut self, report: &inf_sim::TieredNodeReport) {
+        self.rebuilt_seeds += u64::from(report.rebuilt_rows);
+        self.rebuilt_tickets += report.rebuilt_tickets;
+        self.rebuilt_multi_dels += report.rebuilt_multi_dels;
+        self.rebuilt_same_key_twins += report.rebuilt_same_key_twins;
+        self.rebuilt_fill_sets += report.rebuilt_fill_sets;
+        self.rebuilt_reboots += report.rebuilt_reboots;
+        self.promoted_extent_pairs += report.promoted_extent_pairs;
+        self.open_seeds += u64::from(report.open_rows);
+        self.open_tickets += report.open_tickets;
+        self.open_drains += report.open_dbsize_drains;
+        self.open_reads += report.open_dbsize_reads;
+        self.open_scan_twins += report.open_scan_twins;
+        self.open_retargeted += report.open_retargeted;
+        self.open_forced_deletes += report.open_forced_deletes;
+        self.open_ticketed += report.open_ticketed_fallbacks;
+        self.open_collisions += report.open_collision_verdicts;
+        self.open_read_faults += report.open_read_fault_errors;
+        self.open_settled_without_read += report.open_settled_without_read;
+        self.collide_tickets += report.collide_tickets;
+        self.collide_verdicts += report.collide_verdicts;
+        self.collide_ticketed += report.collide_ticketed_fallbacks;
+        self.collide_drains += report.collide_dbsize_drains;
+        self.collide_scan_twins += report.collide_scan_twins;
+        self.shadow_seeds += u64::from(report.shadow_arm);
+        self.shadow_created += report.shadow_created;
+        self.shadow_same_key += report.shadow_resolved_same_key;
+        self.shadow_collision += report.shadow_resolved_collision;
+        self.shadow_fallbacks += report.shadow_fallbacks;
+        self.shadow_stale += report.shadow_stale;
+        self.shadow_at_cut += report.shadow_pending_at_cut;
+    }
+
+    fn coverage_data_plane(&self) -> String {
+        let Self {
+            commands,
+            audited,
+            flushed_pre_cut,
+            cold_resolves,
+            blob_sets,
+            race_replans,
+            dir_open_fault_seeds,
+            dir_open_faults_fired,
+            tier_read_fault_seeds,
+            tier_read_faults_fired,
+            tier_read_error_replies,
+            tier_read_faults_unconsumed,
+            scan_cold_pages,
+            scan_cold_reads,
+            ckpt_downgrades,
+            ckpt_bound_splits,
+            diskfull_refusals,
+            drop_values,
+            drop_other,
+            drop_reboots,
+            drop_reboot_residue,
+            drop_cut_whole,
+            drop_cut_swept,
+            ..
+        } = self;
+        format!(
+            "{commands} commands, {audited} \
+             keys audited, {flushed_pre_cut} B flushed pre-cut, {cold_resolves} cold \
+             resolves, {blob_sets} blob sets, {race_replans} blob-key race replans, \
+             dir-open fault armed on {dir_open_fault_seeds} seeds ({dir_open_faults_fired} \
+             fired), tier-read EIO armed on {tier_read_fault_seeds} seeds \
+             ({tier_read_faults_fired} fired, {tier_read_error_replies} typed replies, \
+             {tier_read_faults_unconsumed} unconsumed), SCAN batching oracle on \
+             {scan_cold_pages} cold pages ({scan_cold_reads} cold intents), \
+             ckpt arms [downgrades {ckpt_downgrades} bound_splits \
+             {ckpt_bound_splits}], {diskfull_refusals} DISKFULL refusals, \
+             drop-race {drop_values} values / {drop_other} typed-other; post-drop reboots \
+             {drop_reboots} ({drop_reboot_residue} with MANIFEST residue), cut inside DROP: \
+             {drop_cut_whole} whole / {drop_cut_swept} swept (ADR-0100); "
+        )
+    }
+
+    fn coverage_tickets(&self) -> String {
+        let Self {
+            shadow_seeds,
+            shadow_created,
+            shadow_same_key,
+            shadow_collision,
+            shadow_fallbacks,
+            shadow_stale,
+            shadow_at_cut,
+            collide_tickets,
+            collide_verdicts,
+            collide_ticketed,
+            collide_drains,
+            collide_scan_twins,
+            open_seeds,
+            open_tickets,
+            open_drains,
+            open_reads,
+            open_scan_twins,
+            open_retargeted,
+            open_forced_deletes,
+            open_ticketed,
+            open_collisions,
+            open_read_faults,
+            open_settled_without_read,
+            rebuilt_seeds,
+            rebuilt_tickets,
+            rebuilt_multi_dels,
+            rebuilt_same_key_twins,
+            rebuilt_fill_sets,
+            rebuilt_reboots,
+            promoted_extent_pairs,
+            ..
+        } = self;
+        format!(
+            "shadow arm on \
+             {shadow_seeds} seeds: {shadow_created} tickets ({shadow_at_cut} open at the \
+             cut), {shadow_same_key} same-key / {shadow_collision} collision verdicts, \
+             {shadow_stale} stale, {shadow_fallbacks} fallbacks; forced collisions: \
+             {collide_tickets} tickets, {collide_verdicts} collision verdicts, \
+             {collide_ticketed} ticketed fallbacks, {collide_drains} DBSIZE drains, \
+             {collide_scan_twins} SCAN twins; open-ticket rows on {open_seeds} seeds: \
+             {open_tickets} tickets held open, {open_drains} DBSIZE drains reading \
+             {open_reads} twins, {open_scan_twins} SCAN twins, {open_retargeted} \
+             retargets, {open_forced_deletes} read-free forced deletes, {open_ticketed} \
+             ticketed fallbacks, {open_collisions} collision verdicts, {open_read_faults} \
+             injected read errors relayed, {open_settled_without_read} settled without a \
+             read after resume; rebuilt multi-ticket rows on {rebuilt_seeds} seeds: \
+             {rebuilt_tickets} tickets rebuilt, {rebuilt_multi_dels} DELs draining several, \
+             {rebuilt_same_key_twins} same-key twins among them, {rebuilt_fill_sets} filler \
+             writes, {rebuilt_reboots} reboots; {promoted_extent_pairs} cold blob GET pairs \
+             re-resolved onto a promoted reference"
+        )
+    }
+
+    fn manifest_data_plane(&self) -> String {
+        let Self {
+            commands,
+            audited,
+            flushed_pre_cut,
+            cold_resolves,
+            blob_sets,
+            dir_open_fault_seeds,
+            dir_open_faults_fired,
+            tier_read_fault_seeds,
+            tier_read_faults_fired,
+            tier_read_error_replies,
+            tier_read_faults_unconsumed,
+            scan_cold_pages,
+            scan_cold_reads,
+            ckpt_downgrades,
+            ckpt_bound_splits,
+            diskfull_refusals,
+            drop_values,
+            drop_other,
+            drop_reboots,
+            drop_reboot_residue,
+            drop_cut_whole,
+            drop_cut_swept,
+            ..
+        } = self;
+        format!(
+            "commands={commands} keys_audited={audited} \
+             flushed_pre_cut={flushed_pre_cut} cold_resolves={cold_resolves} \
+             blob_sets={blob_sets} dir_open_fault_seeds={dir_open_fault_seeds} \
+             dir_open_faults_fired={dir_open_faults_fired} \
+             tier_read_fault_seeds={tier_read_fault_seeds} \
+             tier_read_faults_fired={tier_read_faults_fired} \
+             tier_read_error_replies={tier_read_error_replies} \
+             tier_read_faults_unconsumed={tier_read_faults_unconsumed} \
+             scan_cold_pages={scan_cold_pages} scan_cold_reads={scan_cold_reads} \
+             ckpt_downgrades={ckpt_downgrades} ckpt_bound_splits={ckpt_bound_splits} \
+             diskfull_refusals={diskfull_refusals} \
+             drop_values={drop_values} drop_other={drop_other} \
+             drop_reboots={drop_reboots} drop_reboot_residue={drop_reboot_residue} \
+             drop_cut_whole={drop_cut_whole} drop_cut_swept={drop_cut_swept}"
+        )
+    }
+
+    fn manifest_tickets(&self) -> String {
+        let Self {
+            shadow_seeds,
+            shadow_created,
+            shadow_same_key,
+            shadow_collision,
+            shadow_fallbacks,
+            shadow_stale,
+            shadow_at_cut,
+            collide_tickets,
+            collide_verdicts,
+            collide_ticketed,
+            collide_drains,
+            collide_scan_twins,
+            open_seeds,
+            open_tickets,
+            open_drains,
+            open_reads,
+            open_scan_twins,
+            open_retargeted,
+            open_forced_deletes,
+            open_ticketed,
+            open_collisions,
+            open_read_faults,
+            open_settled_without_read,
+            rebuilt_seeds,
+            rebuilt_tickets,
+            rebuilt_multi_dels,
+            rebuilt_same_key_twins,
+            rebuilt_fill_sets,
+            rebuilt_reboots,
+            promoted_extent_pairs,
+            ..
+        } = self;
+        format!(
+            "shadow_seeds={shadow_seeds} shadow_created={shadow_created} \
+             shadow_at_cut={shadow_at_cut} shadow_same_key={shadow_same_key} \
+             shadow_collision={shadow_collision} shadow_stale={shadow_stale} \
+             shadow_fallbacks={shadow_fallbacks} collide_tickets={collide_tickets} \
+             collide_verdicts={collide_verdicts} collide_ticketed={collide_ticketed} \
+             collide_drains={collide_drains} collide_scan_twins={collide_scan_twins} \
+             open_seeds={open_seeds} open_tickets={open_tickets} \
+             open_drains={open_drains} open_reads={open_reads} \
+             open_scan_twins={open_scan_twins} open_retargeted={open_retargeted} \
+             open_forced_deletes={open_forced_deletes} open_ticketed={open_ticketed} \
+             open_collisions={open_collisions} open_read_faults={open_read_faults} \
+             open_settled_without_read={open_settled_without_read} \
+             rebuilt_seeds={rebuilt_seeds} rebuilt_tickets={rebuilt_tickets} \
+             rebuilt_multi_dels={rebuilt_multi_dels} \
+             rebuilt_same_key_twins={rebuilt_same_key_twins} \
+             rebuilt_fill_sets={rebuilt_fill_sets} rebuilt_reboots={rebuilt_reboots} \
+             promoted_extent_pairs={promoted_extent_pairs}"
+        )
+    }
+}
+
+/// `m2-ns-ddl-race`'s shard: the crossings and refused legs that must occur.
+#[derive(Default)]
+struct NsDdlFold {
+    found: u64,
+    phantoms: u64,
+    partial: u64,
+    skips: u64,
+    crossings: u64,
+}
+
+impl Fold for NsDdlFold {
+    type Report = inf_sim::NsDdlRaceReport;
+
+    fn absorb(&mut self, report: &Self::Report) {
+        self.found += u64::from(report.drop_found);
+        self.crossings += report.crossings;
+        let served = u64::from(report.served_before_cut);
+        if served != 0 && served != 4 {
+            self.phantoms += 1;
+        }
+        self.partial += u64::from(report.partial_served);
+        self.skips += report.skipped_unknown_ns;
+    }
+
+    fn coverage(&self) -> String {
+        let Self { found, phantoms, partial, skips, crossings } = self;
+        format!(
+            "{crossings} crossings (origin frozen mid-fan), {found} DROPs found the namespace, \
+             {phantoms} phantom namespaces, {partial} cells serving a refused CREATE, {skips} \
+             untombstoned unknown-ns skips"
+        )
+    }
+
+    fn manifest_tail(&self) -> String {
+        let Self { found, phantoms, partial, skips, crossings } = self;
+        format!(
+            "crossings={crossings} drops_found={found} phantom_namespaces={phantoms} \
+             partial_served={partial} unknown_ns_skips={skips}"
+        )
+    }
+
+    fn shard_end_clauses(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// `m2-ns-create-window`'s shard: the probes that met the held window.
+#[derive(Default)]
+struct NsCreateFold {
+    attempts: u64,
+    refused: u64,
+    acked: u64,
+    skips: u64,
+    held: u64,
+}
+
+impl Fold for NsCreateFold {
+    type Report = inf_sim::NsCreateWindowReport;
+
+    fn absorb(&mut self, report: &Self::Report) {
+        self.attempts += report.use_attempts;
+        self.refused += report.use_refused;
+        self.acked += report.acked_in_window;
+        self.skips += report.skipped_unknown_ns;
+        self.held += report.held_steps;
+    }
+
+    fn coverage(&self) -> String {
+        let Self { attempts, refused, acked, skips, held } = self;
+        format!(
+            "{attempts} USE attempts in the window ({refused} refused, {acked} writes acked), \
+             {skips} untombstoned unknown-ns skips, {held} held steps"
+        )
+    }
+
+    fn manifest_tail(&self) -> String {
+        let Self { attempts, refused, acked, skips, held } = self;
+        format!(
+            "use_attempts={attempts} use_refused={refused} acked_in_window={acked} \
+             unknown_ns_skips={skips} held_steps={held}"
+        )
+    }
+
+    fn shard_end_clauses(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// The durable runner's shard: the cut classes, the frame pipeline, the
+/// device budget, the log oracles, recycling and the lift regime, each
+/// disclosed so a sweep cannot claim coverage the random process never
+/// reached (ADR-0045 D4).
+#[derive(Default)]
+struct DurableFold {
+    plant: Plant,
+    replay_canary: bool,
+    equivalence_checks: u64,
+    documents_compared: u64,
+    corpus_documents: u64,
+    cut_classes: std::collections::BTreeMap<&'static str, u64>,
+    // Frame-pipeline coverage (ADR-0087 D7): seeds whose cells reached
+    // ≥ 2 frames in flight, the deepest seen, and the bounded waits.
+    pipelined_seeds: u64,
+    depth_max: u64,
+    waits_barrier: u64,
+    waits_rotation: u64,
+    waits_reorder: u64,
+    ckpt_downgrades: u64,
+    bound_splits: u64,
+    waits_fill: u64,
+    waits_group: u64,
+    // The log oracles: idle-tick violations summed, map depth and ledger
+    // entries as shard maxima.
+    idle_tick_violations: u64,
+    frames_awaiting_max: u64,
+    fsync_entries_max: u64,
+    write_through_entries_max: u64,
+    hold_episode_violations: u64,
+    // Device-budget coverage (ADR-0088 D8): background bytes granted,
+    // deferrals issued, seal-pace waits, worst frame-write latency.
+    budget_bytes: u64,
+    budget_deferrals: u64,
+    budget_unattainable: u64,
+    block_wait_ns_max: u64,
+    waits_pace: u64,
+    stall_max_us: u64,
+    // Transition coverage (ADR-0086 D4 as amended): packed tails reopened
+    // under a `Direct` rotor at the `m2-mode-transition` restart.
+    reopened_packed_tails: u64,
+    // Recycling coverage (ADR-0090 D5): segments recycled, pool misses +
+    // fallbacks, rotations, and residue the reboots proved.
+    recycled: u64,
+    recycle_misses: u64,
+    recycle_fallbacks: u64,
+    recycle_served: u64,
+    open_unreached: u64,
+    recycle_sentinels: u64,
+    clean_stop_torn_tails: u64,
+    rotations: u64,
+    residue_slacks: u64,
+    // Pool-wait coverage (ADR-0090 D9): both outcomes must occur in a
+    // sweep that claims to cover the wait.
+    waits_started: u64,
+    waits_satisfied: u64,
+    waits_expired: u64,
+    inline_preallocs: u64,
+    // The lift regime (F-L14-01): seeds that ran it, the records its
+    // writers landed behind the lift, the sidecars the final boot loaded,
+    // and — every seed — the residue slacks the final boot lifted past.
+    lift_seeds: u64,
+    lift_tiered_ops: u64,
+    lift_indexed_ops: u64,
+    lift_sidecars_loaded: u64,
+    lift_plants: u64,
+    lift_plant_lifts: u64,
+    lift_plant_sidecars: u64,
+    stale_slacks: u64,
+}
+
+impl Fold for DurableFold {
+    type Report = inf_sim::DurableReport;
+
+    fn absorb(&mut self, report: &Self::Report) {
+        self.absorb_log(report);
+        self.absorb_recycling(report);
+        self.equivalence_checks += report.equivalence_checks;
+        self.documents_compared += report.documents_compared;
+        self.corpus_documents += report.corpus_documents_used;
+        for class in &report.cut_classes {
+            *self.cut_classes.entry(class).or_default() += 1;
+        }
+    }
+
+    fn coverage(&self) -> String {
+        format!("{}{}", self.coverage_log(), self.coverage_recycling())
+    }
+
+    fn manifest_tail(&self) -> String {
+        format!("{} {}", self.manifest_log(), self.manifest_recycling())
+    }
+
+    fn shard_end_clauses(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+impl DurableFold {
+    /// The frame pipeline, the device budget and the log oracles.
+    fn absorb_log(&mut self, report: &inf_sim::DurableReport) {
+        self.pipelined_seeds += u64::from(report.frames_in_flight_max >= 2);
+        self.depth_max = self.depth_max.max(report.frames_in_flight_max);
+        self.waits_barrier += report.frame_waits_barrier;
+        self.waits_rotation += report.frame_waits_rotation;
+        self.waits_reorder += report.frame_waits_reorder;
+        self.ckpt_downgrades += report.ckpt_downgrades;
+        self.bound_splits += report.ckpt_bound_splits;
+        self.waits_fill += report.frame_waits_fill;
+        self.waits_group += report.frame_waits_group;
+        self.idle_tick_violations += report.idle_tick_violations;
+        self.frames_awaiting_max = self.frames_awaiting_max.max(report.frames_awaiting_max);
+        self.fsync_entries_max = self.fsync_entries_max.max(report.fsync_entries_max);
+        self.write_through_entries_max =
+            self.write_through_entries_max.max(report.write_through_entries_max);
+        self.hold_episode_violations += report.hold_episode_violations;
+        self.budget_bytes += report.budget_background_bytes;
+        self.budget_deferrals += report.budget_deferrals;
+        self.budget_unattainable += report.budget_unattainable;
+        self.block_wait_ns_max = self.block_wait_ns_max.max(report.ckpt_block_wait_ns_max);
+        self.waits_pace += report.frame_waits_pace;
+        self.stall_max_us = self.stall_max_us.max(report.write_stall_max_us);
+        self.reopened_packed_tails += report.reopened_packed_tails;
+    }
+
+    /// Recycling, the pool wait and the lift regime.
+    fn absorb_recycling(&mut self, report: &inf_sim::DurableReport) {
+        self.recycled += report.segments_recycled;
+        self.recycle_misses += report.recycle_misses;
+        self.recycle_fallbacks += report.recycle_fallbacks;
+        self.recycle_served += report.recycle_served;
+        self.open_unreached += u64::from(report.recycle_open_unreached);
+        self.recycle_sentinels += report.recycle_sentinels;
+        self.clean_stop_torn_tails += report.clean_stop_torn_tails;
+        self.rotations += report.segment_rotations;
+        self.residue_slacks += report.recycled_residue_slacks;
+        self.waits_started += report.recycle_waits_started;
+        self.waits_satisfied += report.recycle_waits_satisfied;
+        self.waits_expired += report.recycle_waits_expired;
+        self.inline_preallocs += report.segment_inline_preallocs;
+        self.lift_seeds += u64::from(report.lift_regime);
+        self.lift_tiered_ops += report.lift_tiered_ops;
+        self.lift_indexed_ops += report.lift_indexed_ops;
+        self.lift_sidecars_loaded += report.lift_sidecars_loaded;
+        self.stale_slacks += report.stale_residue_slacks;
+        self.lift_plants += report.lift_plants;
+        self.lift_plant_lifts += report.lift_plant_lifts;
+        self.lift_plant_sidecars += report.lift_plant_sidecars;
+    }
+
+    /// The cut-class distribution, `class:count` in class order.
+    fn classes(&self) -> String {
+        let classes: Vec<String> =
+            self.cut_classes.iter().map(|(class, count)| format!("{class}:{count}")).collect();
+        classes.join(" ")
+    }
+
+    fn coverage_log(&self) -> String {
+        let Self {
+            equivalence_checks,
+            documents_compared,
+            pipelined_seeds,
+            depth_max,
+            waits_barrier,
+            waits_rotation,
+            waits_reorder,
+            budget_bytes,
+            budget_deferrals,
+            budget_unattainable,
+            block_wait_ns_max,
+            waits_pace,
+            stall_max_us,
+            reopened_packed_tails,
+            ckpt_downgrades,
+            bound_splits,
+            waits_fill,
+            waits_group,
+            idle_tick_violations,
+            frames_awaiting_max,
+            fsync_entries_max,
+            write_through_entries_max,
+            hold_episode_violations,
+            ..
+        } = self;
+        format!(
+            "{equivalence_checks} equivalence \
+             checks, {documents_compared} documents compared, cut classes [{}], frame pipeline \
+             [pipelined_seeds:{pipelined_seeds} depth_max:{depth_max} \
+             waits_barrier:{waits_barrier} \
+             waits_rotation:{waits_rotation} waits_reorder:{waits_reorder}], device budget \
+             [background_bytes:{budget_bytes} \
+             deferrals:{budget_deferrals} unattainable:{budget_unattainable} \
+             ckpt_block_wait_ns_max:{block_wait_ns_max} waits_pace:{waits_pace} \
+             write_stall_max_us:{stall_max_us}], \
+             reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades} \
+             bound_splits:{bound_splits} waits_fill:{waits_fill} waits_group:{waits_group}, log \
+             oracles \
+             [idle_tick_violations:{idle_tick_violations} \
+             frames_awaiting_max:{frames_awaiting_max} \
+             fsync_entries_max:{fsync_entries_max} \
+             write_through_entries_max:{write_through_entries_max} \
+             hold_episode_violations:{hold_episode_violations}], ",
+            self.classes()
+        )
+    }
+
+    fn coverage_recycling(&self) -> String {
+        let Self {
+            recycled,
+            recycle_misses,
+            recycle_fallbacks,
+            recycle_served,
+            open_unreached,
+            rotations,
+            residue_slacks,
+            waits_started,
+            waits_satisfied,
+            waits_expired,
+            inline_preallocs,
+            lift_seeds,
+            lift_tiered_ops,
+            lift_indexed_ops,
+            lift_sidecars_loaded,
+            stale_slacks,
+            lift_plants,
+            lift_plant_lifts,
+            lift_plant_sidecars,
+            ..
+        } = self;
+        format!(
+            "recycling [recycled:{recycled} misses:{recycle_misses} \
+             fallbacks:{recycle_fallbacks} served:{recycle_served} \
+             open_unreached:{open_unreached} rotations:{rotations} residue_slacks:{residue_slacks} \
+             waits_started:{waits_started} waits_satisfied:{waits_satisfied} \
+             waits_expired:{waits_expired} inline_preallocs:{inline_preallocs}], lift regime \
+             [seeds:{lift_seeds} tiered_ops:{lift_tiered_ops} indexed_ops:{lift_indexed_ops} \
+             sidecars_loaded:{lift_sidecars_loaded} stale_slacks:{stale_slacks} \
+             plants:{lift_plants} plant_lifts:{lift_plant_lifts} \
+             plant_sidecars:{lift_plant_sidecars}]"
+        )
+    }
+
+    fn manifest_log(&self) -> String {
+        let Self {
+            plant,
+            replay_canary,
+            equivalence_checks,
+            documents_compared,
+            corpus_documents,
+            pipelined_seeds,
+            depth_max,
+            waits_barrier,
+            waits_rotation,
+            waits_reorder,
+            budget_bytes,
+            budget_deferrals,
+            budget_unattainable,
+            block_wait_ns_max,
+            waits_pace,
+            stall_max_us,
+            reopened_packed_tails,
+            ckpt_downgrades,
+            bound_splits,
+            waits_fill,
+            waits_group,
+            idle_tick_violations,
+            frames_awaiting_max,
+            fsync_entries_max,
+            write_through_entries_max,
+            hold_episode_violations,
+            ..
+        } = self;
+        format!(
+            "plant={plant:?} replay_canary={replay_canary} \
+             equivalence_checks={equivalence_checks} \
+             documents_compared={documents_compared} corpus_documents={corpus_documents} \
+             cut_classes=[{}] pipelined_seeds={pipelined_seeds} depth_max={depth_max} \
+             waits_barrier={waits_barrier} waits_rotation={waits_rotation} \
+             waits_reorder={waits_reorder} budget_background_bytes={budget_bytes} \
+             budget_deferrals={budget_deferrals} budget_unattainable={budget_unattainable} \
+             ckpt_block_wait_ns_max={block_wait_ns_max} \
+             waits_pace={waits_pace} write_stall_max_us={stall_max_us} \
+             reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades} \
+             ckpt_bound_splits={bound_splits} waits_fill={waits_fill} waits_group={waits_group} \
+             idle_tick_violations={idle_tick_violations} frames_awaiting_max={frames_awaiting_max} \
+             fsync_entries_max={fsync_entries_max} \
+             write_through_entries_max={write_through_entries_max} \
+             hold_episode_violations={hold_episode_violations}",
+            self.classes()
+        )
+    }
+
+    fn manifest_recycling(&self) -> String {
+        let Self {
+            recycled,
+            recycle_misses,
+            recycle_fallbacks,
+            recycle_served,
+            open_unreached,
+            recycle_sentinels,
+            clean_stop_torn_tails,
+            rotations,
+            residue_slacks,
+            waits_started,
+            waits_satisfied,
+            waits_expired,
+            inline_preallocs,
+            lift_seeds,
+            lift_tiered_ops,
+            lift_indexed_ops,
+            lift_sidecars_loaded,
+            stale_slacks,
+            lift_plants,
+            lift_plant_lifts,
+            lift_plant_sidecars,
+            ..
+        } = self;
+        format!(
+            "segments_recycled={recycled} recycle_misses={recycle_misses} \
+             recycle_fallbacks={recycle_fallbacks} recycle_served={recycle_served} \
+             recycle_open_unreached={open_unreached} recycle_sentinels={recycle_sentinels} \
+             clean_stop_torn_tails={clean_stop_torn_tails} segment_rotations={rotations} \
+             recycled_residue_slacks={residue_slacks} recycle_waits_started={waits_started} \
+             recycle_waits_satisfied={waits_satisfied} recycle_waits_expired={waits_expired} \
+             segment_inline_preallocs={inline_preallocs} lift_seeds={lift_seeds} \
+             lift_tiered_ops={lift_tiered_ops} lift_indexed_ops={lift_indexed_ops} \
+             lift_sidecars_loaded={lift_sidecars_loaded} stale_residue_slacks={stale_slacks} \
+             lift_plants={lift_plants} lift_plant_lifts={lift_plant_lifts} \
+             lift_plant_sidecars={lift_plant_sidecars}"
+        )
+    }
+}
+
+/// `m2-combined`'s shard counts nothing beyond the driver's: its published
+/// and delivered counts ride the `sim_seconds=` line.
+struct CombinedFold;
+
+impl Fold for CombinedFold {
+    type Report = inf_sim::CombinedReport;
+
+    fn absorb(&mut self, _report: &Self::Report) {}
+
+    fn coverage(&self) -> String {
+        "the published and delivered counts are on the sim_seconds line".to_owned()
+    }
+
+    fn manifest_tail(&self) -> String {
+        String::new()
+    }
+
+    fn shard_end_clauses(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// `m2-ns-drop-window`'s shard: the acked keys served after a cut before
+/// the answer, and the cut class each seed picked.
+#[derive(Default)]
+struct NsDropFold {
+    keys: u64,
+    cuts: std::collections::BTreeMap<String, u64>,
+}
+
+impl Fold for NsDropFold {
+    type Report = inf_sim::NsDropWindowReport;
+
+    fn absorb(&mut self, report: &Self::Report) {
+        self.keys += report.keys_served;
+        *self.cuts.entry(format!("{:?}", report.cut)).or_default() += 1;
+    }
+
+    fn coverage(&self) -> String {
+        format!(
+            "{} acked keys served after a cut before the answer, cut classes [{}]",
+            self.keys,
+            self.cut_classes()
+        )
+    }
+
+    fn manifest_tail(&self) -> String {
+        format!("keys_served={} cut_classes=[{}]", self.keys, self.cut_classes())
+    }
+
+    fn shard_end_clauses(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+impl NsDropFold {
+    /// The cut-class distribution, `class:count` in class order.
+    fn cut_classes(&self) -> String {
+        let classes: Vec<String> =
+            self.cuts.iter().map(|(class, count)| format!("{class}:{count}")).collect();
+        classes.join(" ")
+    }
 }
 
 #[cfg(test)]
-mod determinism_exit {
+mod tests {
+    use inf_sim::driver::Fold;
+
+    /// The tiered fold's shard-end clause: armed seeds whose audits met no
+    /// fault fire it, and the controls (an arm that fired, or no arm) hold.
     #[test]
-    fn state_only_mismatch_exits_one_with_a_named_reason() {
-        const CHILD: &str = "INF_SIM_STATE_VERIFY_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            super::verify_hashes((7, 1), (7, 2));
-            return;
-        }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "determinism_exit::state_only_mismatch_exits_one_with_a_named_reason",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(1), "{output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("state_hash differs"),
-            "{output:?}"
-        );
+    fn the_tiered_arm_that_never_fired_is_a_shard_violation() {
+        let vacuous = super::TieredFold { tier_read_fault_seeds: 3, ..Default::default() };
+        let fired = vacuous.shard_end_clauses();
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert!(fired[0].contains("TIER-READ FAULT ARM VACUOUS across the shard: 3 armed seeds"));
+        let engaged = super::TieredFold {
+            tier_read_fault_seeds: 3,
+            tier_read_faults_fired: 1,
+            ..Default::default()
+        };
+        assert!(engaged.shard_end_clauses().is_empty());
+        assert!(super::TieredFold::default().shard_end_clauses().is_empty());
     }
 }
