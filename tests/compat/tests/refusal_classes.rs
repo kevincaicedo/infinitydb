@@ -35,13 +35,15 @@ fn every_refusal_line_is_the_error_line_redis_emits() {
     assert_eq!(lines, 4 * Domain::ALL.len(), "VACUOUS: the table rendered {lines} lines");
 }
 
-/// The matrix's `INF.NS` row quotes the namespace identity space's bytes
-/// as the table renders them.
+/// The matrix's `INF.NS` row quotes the namespace identity space's and the
+/// catalog limit's bytes as the table renders them.
 #[test]
 fn the_matrix_quotes_the_rendered_refusal_bytes() {
     let row = compat::matrixgen::DECLARED.iter().find(|d| d.name == "INF.NS").expect("INF.NS row");
     let text = Refusal::IdentityExhausted(Domain::Namespace).render();
     assert!(row.note.contains(&format!("`-{text}`")), "INF.NS's row does not quote `-{text}`");
+    let limit = Refusal::LimitReached(Domain::Catalog).render();
+    assert!(row.note.contains(&format!("`-{limit}`")), "INF.NS's row does not quote `-{limit}`");
     let checkpoint = Refusal::IdentityExhausted(Domain::Checkpoint).render();
     for name in ["INF.NS", "INF.CKPT", "BGSAVE"] {
         let row = compat::matrixgen::DECLARED.iter().find(|d| d.name == name).expect("a row");

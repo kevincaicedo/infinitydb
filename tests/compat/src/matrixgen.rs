@@ -162,9 +162,10 @@ pub static DECLARED: &[Declared] = &[
              worst wheel debt across every store); `# Tiering` and `# Tripwires` are this \
              cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); `# Persistence` \
              is this cell's slice except the values it renders from node state, among them \
-             `loading` and the `loading_*` fields, `ns_drop_tombstones` and the \
-             `recover_node_tier_` fields; an unknown section name selects nothing (empty body, \
-             Redis shape); client-smoke CI is the open M1-S14 AC",
+             `loading` and the `loading_*` fields, the catalog writer's `ns_drop_*`, `ns_ddl_*` \
+             and `catalog_epoch` fields and the `recover_node_tier_` fields; an unknown \
+             section name selects nothing (empty body, Redis shape); client-smoke CI is the \
+             open M1-S14 AC",
     ),
     d(
         "COMMAND",
@@ -388,7 +389,13 @@ pub static DECLARED: &[Declared] = &[
          `CREATE` spends a namespace id only when the catalog accepts it, so a refused one \
          leaves the next id unchanged; once the last id (4294967294) is issued, every `CREATE` \
          answers `-ERR namespace identity space exhausted` before any effect, for the data \
-         directory's life (ADR-0148 D4, ADR-0172 `IdentityExhausted`)",
+         directory's life (ADR-0148 D4, ADR-0172 `IdentityExhausted`). A node holds at most 256 \
+         durable-drop tombstones and reserved slots; at the cap the catalog writer alone decides \
+         a durable `CREATE` or a `DROP` that leaves a tombstone: it proceeds once the tombstones \
+         every cell has checkpointed past retire, it waits for one node-wide checkpoint when \
+         that would ready them, and when every held slot waits on an operator or a restart it \
+         answers `-ERR catalog limit reached` before any effect (ADR-0189 D6, ADR-0172 \
+         `LimitReached`)",
     ),
     d(
         "INF.CKPT",
