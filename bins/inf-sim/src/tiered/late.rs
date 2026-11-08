@@ -724,7 +724,9 @@ fn phase_8(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdic
 /// times the keys the cells need (each cell's share is about one in
 /// `cells`). A refused `SET`, or a cell left short, is a violation.
 fn listing_residue(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
-    if !cx.scenario.listing_repeats {
+    // The planted canary writes no residue: every sweep then fits one batch,
+    // and the draw's engagement check must read it unengaged.
+    if !cx.scenario.listing_repeats || cfg!(inf_canary_listing_residue_unscaled) {
         return Ok(());
     }
     let cells = cx.scenario.cells;

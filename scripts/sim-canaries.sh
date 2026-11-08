@@ -3,9 +3,11 @@
 # `--cfg inf_canary_*` disables one load-bearing rule in the product,
 # removes from a harness leg what its engagement clause needs (a vacuity
 # plant), or breaks the simulator's model of a contract that a leg's oracle
-# takes as its premise (a premise plant); the last two are read in
-# `bins/inf-sim` alone. The scenario whose oracle owns that rule, clause or
-# premise must go red on the planted build — and green on the plain build.
+# takes as its premise (a premise plant); a vacuity plant is read in
+# `bins/inf-sim` alone, and a premise plant in `bins/inf-sim` or in the
+# simulated disk (`inf-log::fs::sim`), never on a product path. The scenario
+# whose oracle owns that rule, clause or premise must go red on the planted
+# build — and green on the plain build.
 # A canary the fleet never plants
 # proves nothing; `bins/inf-sim/tests/lanes.rs` fails when a cfg in the
 # workspace's `check-cfg` list has no row here.
@@ -749,6 +751,18 @@ rows=(
   # ADR-0202 D3: a listed name the stream returns again after its removal
   # is that earlier removal. Planted, the second removal refuses the boot.
   "inf_canary_recover_listing_repeat_refused crate-test inf-server test:recover_replay_steps the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal REPEAT: the boot refused"
+  # The same rule in m4-tiered's listing-repeat class (ADR-0202 D5): the
+  # post-drop reboot's sweep reads its dropped namespace past one batch over
+  # the disk's repeat mode, and planted, a repeated name refuses that reboot.
+  "inf_canary_recover_listing_repeat_refused m4-tiered post-drop --listing-repeats"
+  # A premise plant in the simulated disk: a call that served a repeat moves
+  # its key past one name it never returns, so a repeat takes a fresh name's
+  # place. The leg's residue oracle and the repeat-mode test see the name.
+  "inf_canary_listing_repeat_skips m4-tiered survived --listing-repeats"
+  "inf_canary_listing_repeat_skips crate-test inf-log test:dir_listing the_repeat_mode_returns_removed_names_again_and_moves_no_key ONCE: untouched"
+  # A vacuity plant: the leg writes no residue, so every sweep fits one batch
+  # and the draw's engagement check must read it unengaged.
+  "inf_canary_listing_residue_unscaled m4-tiered listing-repeats-unengaged --listing-repeats"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

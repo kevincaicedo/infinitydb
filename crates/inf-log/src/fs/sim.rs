@@ -126,11 +126,12 @@ pub struct SimDiskConfig {
     pub sector_bytes: u32,
     /// ADR-0202 D5, drawn per seed by the DST: at its next batch, a listing
     /// returns once more, before any new name, each name of its last batch
-    /// removed since — clause (b)'s repeat, which a stream may make, so
-    /// every consumer's `Gone` arm runs under the simulator. A repeat moves
-    /// no resume key, counts toward the batch's two bounds and is not
-    /// repeated again; [`SimDisk::listing_repeats_served`] is its
-    /// engagement counter.
+    /// removed since — clause (b)'s repeat, which a stream may make, so each
+    /// boot consumer's `Gone` arm runs on this disk: the dropped sweep's
+    /// under the simulator's draw, the live map's in the store's and the
+    /// server's tests (ADR-0202 A1). A repeat moves no resume key, counts
+    /// toward the batch's two bounds and is not repeated again;
+    /// [`SimDisk::listing_repeats_served`] is its engagement counter.
     pub listing_repeats_removed: bool,
 }
 
@@ -1614,6 +1615,11 @@ impl SimDirStream {
             }
         }
         state.listing_repeats_served += repeats;
+        // The planted canary lets a repeat take a fresh name's place: a call
+        // that served one moves its key past the next name, never returned.
+        if cfg!(inf_canary_listing_repeat_skips) && repeats > 0 {
+            skip_next_name(&state.os_names, &self.dir, &mut self.key);
+        }
         let repeated = batch.len();
         let end = super::fill_after(&state.os_names, &self.dir, &mut self.key, batch)?;
         // After `End` every call answers an empty `End`: the stream repeats
@@ -1623,6 +1629,28 @@ impl SimDirStream {
             self.last.extend(names.map(|name| self.dir.join(name)));
         }
         Ok(end)
+    }
+}
+
+/// The planted canary's skip: moves `key` past the next name of `dir`
+/// after it, as if that name had been returned.
+fn skip_next_name<V>(names: &BTreeMap<PathBuf, V>, dir: &Path, key: &mut ResumeKey) {
+    use std::ops::Bound;
+    let next = {
+        let from = match &*key {
+            ResumeKey::First => dir,
+            ResumeKey::After(path) => path.as_path(),
+            ResumeKey::Ended => return,
+        };
+        names
+            .range::<Path, _>((Bound::Excluded(from), Bound::Unbounded))
+            .map(|(path, _)| path)
+            .take_while(|path| path.starts_with(dir))
+            .find(|path| path.parent() == Some(dir))
+            .cloned()
+    };
+    if let Some(path) = next {
+        *key = ResumeKey::After(path);
     }
 }
 
