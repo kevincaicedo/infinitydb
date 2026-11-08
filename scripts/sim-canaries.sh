@@ -763,6 +763,13 @@ rows=(
   # A vacuity plant: the leg writes no residue, so every sweep fits one batch
   # and the draw's engagement check must read it unengaged.
   "inf_canary_listing_residue_unscaled m4-tiered listing-repeats-unengaged --listing-repeats"
+  # ADR-0202 D3: a boot consumer of a listing counts a `Removed` only, never
+  # a `Gone`, a repeated name's earlier removal. Planted, the live map counts
+  # a `Gone`: the boot's dead-life count reads above the files it removed.
+  "inf_canary_recover_map_gone_counted crate-test inf-server test:recover_replay_steps the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal REPEAT: REMOVED"
+  # Planted, the dropped namespace's sweep counts a `Gone`: its swept count
+  # reads above the names its directory held.
+  "inf_canary_recover_sweep_gone_counted crate-test inf-server test:recover_replay_steps the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal REPEAT: SWEPT"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
