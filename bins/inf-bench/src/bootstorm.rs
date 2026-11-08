@@ -38,7 +38,7 @@ const KNOWN: &[&str] = &[
 
 pub(crate) fn cmd_boot_storm(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(args, &[], KNOWN)?;
-    let bin = flags.str_or("infinityd-bin", "target/release/infinityd");
+    let bin = flags.str_or("infinityd-bin", &crate::cli::default_infinityd_bin());
     let cycles = flags.u64_or("cycles", 500)?;
     let cells = flags.u16_or("cells", 4)?;
     let pressure_mb = flags.u64_or("pressure-mb", 2048)?;
