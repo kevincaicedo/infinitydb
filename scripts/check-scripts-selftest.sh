@@ -5534,4 +5534,136 @@ tr_mutant unkeyed 's|"$TARGET_ROOT/$1-$TARGET_ROOT_KEY"|"$TARGET_ROOT/$1"|' tr_k
     "keeps an unkeyed directory"
 }
 
+# -------------------------------------------------------- target root scan
+group_target_root_scan() {
+# ADR-0198 A2: scripts/target_root_scan.py on this tree, then on fixture trees,
+# each holding the export's justfile, whose check recipe runs scripts/plant.sh,
+# and that one script: a plant is red for its own reason, and a per-run or
+# root directory beside it is green.
+SCAN="$SCRIPT_DIR/target_root_scan.py"
+TSW="$work/ts"
+mkdir -p "$TSW"
+ts_scan() { python3 -I "$SCAN" "$1"; }
+expect green "target-root scan: this tree is green" ts_scan .
+expect_output "target-root scan: the OK line counts what it read" \
+    "target-root scan OK: the justfile and [0-9][0-9]* of scripts/[*][.]sh read; [0-9][0-9]* target directories" ts_scan .
+ts_n=0
+ts_tree() { # <script body> [<justfile recipe line>]: a fixture tree at $TS_DIR
+    ts_n=$((ts_n + 1))
+    TS_DIR="$TSW/t$ts_n"
+    mkdir -p "$TS_DIR/scripts"
+    printf '%s\n' 'export CARGO_TARGET_DIR := `./scripts/target-root.sh --print`' '' 'check:' \
+        '    ./scripts/plant.sh' "${2:-    cargo test}" >"$TS_DIR/justfile"
+    printf '#!/usr/bin/env bash\n%s\n' "$1" >"$TS_DIR/scripts/plant.sh"
+}
+ts_red() { # <label> <reason pattern> <script body> [<justfile recipe line>]
+    ts_tree "$3" "${4:-}"
+    expect_red_because "target-root scan: $1" "$2" ts_scan "$TS_DIR"
+}
+ts_green() { # <label> <script body> [<justfile recipe line>]
+    ts_tree "$2" "${3:-}"
+    expect green "target-root scan: $1" ts_scan "$TS_DIR"
+}
+# A read of the variable, in shell, a heredoc and the justfile.
+ts_red "a raw read of CARGO_TARGET_DIR" "plant.sh:2: reads CARGO_TARGET_DIR itself" \
+    'echo "$CARGO_TARGET_DIR"'
+ts_red "the parent's form, \${CARGO_TARGET_DIR:-target}/fuzz-check" "reads CARGO_TARGET_DIR itself" \
+    'TARGET_DIR="${CARGO_TARGET_DIR:-target}/fuzz-check"'
+ts_red "a heredoc's os.environ read of CARGO_TARGET_DIR" "plant.sh:3: reads CARGO_TARGET_DIR itself" \
+    "python3 - <<'PY'
+root = os.environ['CARGO_TARGET_DIR']
+PY"
+ts_red "a recipe's \$CARGO_TARGET_DIR" "justfile:5: reads CARGO_TARGET_DIR itself" ':' \
+    '    ls "$CARGO_TARGET_DIR"'
+ts_tree ':' '    ls {{CARGO_TARGET_DIR}}'
+sed 's|^export CARGO_TARGET_DIR := .*$|export CARGO_TARGET_DIR := "target"|' "$TS_DIR/justfile" >"$TS_DIR/j"
+mv "$TS_DIR/j" "$TS_DIR/justfile"
+expect_red_because "target-root scan: a justfile whose CARGO_TARGET_DIR is not the helper's export" \
+    "CARGO_TARGET_DIR is assigned other than by the one export" ts_scan "$TS_DIR"
+expect_red_because "target-root scan: a justfile interpolating a CARGO_TARGET_DIR the helper did not export" \
+    "interpolates CARGO_TARGET_DIR with no export" ts_scan "$TS_DIR"
+# A --target-dir that is neither the root's nor made for this run.
+ts_red "an absolute literal --target-dir" "an absolute literal (/tmp/x)" 'cargo check --target-dir /tmp/x'
+ts_red "a check gate's --target-dir target/x" "a literal under target/ (target/x)" \
+    'cargo check --target-dir target/x'
+ts_red "a single-quoted --target-dir" "the single-quoted literal 'target/x'" \
+    "cargo check --target-dir 'target/x'"
+ts_red "a literal through CARGO_TARGET_DIR=" "a literal under target/ (target/x)" \
+    'CARGO_TARGET_DIR=target/x cargo build'
+ts_red "d=target/x, then --target-dir \"\$d/target\"" '$d, assigned at line 2 to a literal under target/' \
+    'd=target/x
+cargo check --target-dir "$d/target"'
+ts_red "d by mktemp -d and then by a literal: every assignment counts" \
+    '$d, assigned at line 3 to a literal under target/' 'd=$(mktemp -d)
+d=target/x
+cargo check --target-dir "$d/target"'
+ts_red "a \$d this file never assigns" '$d, assigned nowhere in this file' \
+    'cargo check --target-dir "$d/target"'
+ts_red "d=target/x, then a bare --target-dir \"\$d\"" '$d, assigned at line 2 to a literal under target/' \
+    'd=target/x
+cargo check --target-dir "$d"'
+ts_red "\$TARGET_ROOT where the helper is not sourced" "does not source target-root.sh" \
+    'cargo check --target-dir "$TARGET_ROOT/x"'
+ts_red "\$TARGET_ROOT the file assigns itself" "assigned in this file rather than by target_root_setup" \
+    '. scripts/target-root.sh
+target_root_setup "$(pwd -P)"
+TARGET_ROOT=target
+cargo check --target-dir "$TARGET_ROOT"'
+# A heredoc's argv: a quoted literal, and os.environ bound to a literal or nothing.
+ts_red "a heredoc's \"--target-dir\", \"target/fuzz-check\" (the parent's call)" \
+    "read from a variable the file binds" "python3 - <<'PY'
+CALL = [\"check\", \"--target-dir\", \"target/fuzz-check\"]
+PY"
+ts_red "a heredoc's os.environ bound to a literal" '$X, assigned at line 2 to a literal under target/' \
+    "X=target/x python3 - <<'PY'
+CALL = [\"check\", \"--target-dir\", os.environ[\"X\"]]
+PY"
+ts_red "a heredoc's os.environ the file never binds" '$X, assigned nowhere in this file' "python3 - <<'PY'
+CALL = [\"check\", \"--target-dir\", os.environ[\"X\"]]
+PY"
+# A built binary under a literal target/.
+ts_red "bin=target/release/inf-sim" "target/release/inf-sim names a built binary" 'bin=target/release/inf-sim'
+ts_red "./target/release/infinityd run" "./target/release/infinityd names a built binary" \
+    './target/release/infinityd --port 1'
+ts_red "a cross-compiled binary under target/" "target/x86_64-unknown-linux-gnu/release/inf" \
+    'strip target/x86_64-unknown-linux-gnu/release/inf'
+ts_red "a recipe's {{justfile_directory()}}/target/debug/infinityd" \
+    "justfile:5: {{justfile_directory()}}/target/debug/infinityd names a built binary" ':' \
+    '    INFINITYD_BIN={{justfile_directory()}}/target/debug/infinityd cargo test -p compat'
+# The forms that pass: per run, the root's, and literals that name no binary.
+ts_green "d=\$(mktemp -d target/x.XXXXXX), then --target-dir \"\$d/target\"" 'mkdir -p target
+d=$(mktemp -d target/x.XXXXXX)
+cargo check --target-dir "$d/target"'
+ts_green "a bare d=\$(mktemp -d), then --target-dir \"\$d/t\"" 'd=$(mktemp -d)
+cargo check --target-dir "$d/t"'
+ts_green "a template inside \$(pwd) (the clock-ban probe's)" \
+    'work=$(mktemp -d "$(pwd)/target/clock-ban-probe.XXXXXX")
+(cd "$work/probe" && cargo clippy --target-dir "$work/target")'
+ts_green "the helper's root and a path beneath it" '. "$SCRIPT_DIR/target-root.sh"
+target_root_setup "$(pwd -P)"
+cargo build --target-dir "$TARGET_ROOT"
+canary="$TARGET_ROOT/canary-$cfg"
+cargo build --target-dir "$canary"'
+ts_green "a heredoc's os.environ bound to the kept directory and a per-run one beneath it" \
+    "K=\$(target_root_kept fuzz-check)
+export K
+P=\$(mktemp -d \"\$K/probe.XXXXXX\")
+export P
+python3 - <<'PY'
+KEPT = [\"--target-dir\", os.environ[\"K\"]]
+PROBE = [\"--target-dir\", os.environ[\"P\"]]
+PY"
+ts_green "literals that name no binary, and comments" "# \$CARGO_TARGET_DIR and target/release/x in a comment
+find . -name Cargo.toml -not -path '*/target/*'
+inf-sim --out target/canary-out" '    INFINITYD_BIN={{quote(CARGO_TARGET_DIR + "/debug/infinityd")}} cargo test'
+mkdir -p "$TSW/empty"
+printf 'check:\n    true\n' >"$TSW/empty/justfile"
+ts_scope() { # a tree with no script is a scope error, exit 2
+    local status=0
+    ts_scan "$TSW/empty" || status=$?
+    [ "$status" -eq 2 ]
+}
+expect green "target-root scan: a tree with no script to read is a scope error" ts_scope
+}
+
 selftest_main "$SCRIPT_DIR/check-scripts-selftest.sh" "$@"
