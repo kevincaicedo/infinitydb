@@ -899,7 +899,7 @@ for row in "${rows[@]}"; do
   canary_root="$TARGET_ROOT/canary-$cfg"
   echo "== canary $cfg: building inf-sim with --cfg $cfg into $canary_root"
   RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
-    --target-dir "$canary_root"
+    --target-dir "$TARGET_ROOT/canary-$cfg"
   planted="$canary_root/release/inf-sim"
   echo "== canary $cfg: $name ${flags[*]} (lane seed $seed) on the planted build must go red"
   if "$planted" --scenario "$name" --seed "$seed" "${flags[@]}" > "$log" 2>&1; then

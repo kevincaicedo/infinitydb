@@ -1,0 +1,43 @@
+# The census of lines that name cargo's output layout (scripts/target_dirs.py,
+# ADR-0204 D4): one row per distinct line, tab-separated: the file, the kind,
+# the count of lines in that file with that text, the reason, and the line's
+# text without leading and trailing blanks. The census's header states each
+# kind's claim and what holds it.
+# file	kind	count	reason	text
+.github/workflows/infinity-release.yml	triple	1	names its own target triple: the probe gates' explicit --target (CARGO_BUILD_TARGET is their knob when one runs alone), the waker gate's tree build, the release job's cross builds; each reads a path that names the triple	cargo build --release --locked --target ${{ matrix.target }} -p infinityd -p inf
+bins/inf-bench/src/cli.rs	comment	1	a comment that states the rule	/// the default root's only: under `CARGO_TARGET_DIR` it is a stale binary or
+bins/inf-compare/src/env.rs	comment	1	a comment that states the rule	/// working directory's `target/`: under `CARGO_TARGET_DIR` that directory
+bins/inf-compare/src/env/tests.rs	comment	1	a comment that states the rule	// A root CARGO_TARGET_DIR moved, and a cross-compiled profile.
+justfile	export	1	the justfile's export of the root scripts/target-root.sh prints, or a recipe reading it	export CARGO_TARGET_DIR := `./scripts/target-root.sh --print`
+justfile	export	1	the justfile's export of the root scripts/target-root.sh prints, or a recipe reading it	INF_COMPAT_REQUIRE_BINARY=1 INFINITYD_BIN={{quote(CARGO_TARGET_DIR + "/debug/infinityd")}} cargo test -p compat -- --nocapture
+justfile	export	1	the justfile's export of the root scripts/target-root.sh prints, or a recipe reading it	{{quote(CARGO_TARGET_DIR + "/release/infinityd")}} --port {{port}} >/tmp/infinityd-client-smoke.log 2>&1 &
+scripts/check-clock-ban.sh	comment	1	a comment that states the rule	# CARGO_BUILD_TARGET names, else the host) clippy cannot resolve them and
+scripts/check-clock-ban.sh	fresh	1	a probe's per-run build through target_root_cargo_fresh, which refuses a directory an earlier run filled	(cd "$work/probe" && target_root_cargo_fresh "$work/target" env -u CLIPPY_CONF_DIR cargo clippy --quiet --color never --target "$PROBE_TARGET" --message-format=short -- -W clippy::disallowed-methods -W clippy::disallowed-types >"$diag" 2>&1) || probe_status=$?
+scripts/check-fuzz-targets.sh	comment	1	a comment that states the rule	#               --target-dir <root>/fuzz-check-<key>
+scripts/check-fuzz-targets.sh	comment	1	a comment that states the rule	# does not compile. A CARGO_TARGET_DIR naming this checkout's target is no
+scripts/check-fuzz-targets.sh	kept	1	the gate's kept directory, <root>/<name>-<key> from target_root_kept, which the self-test's call pins hold	KEPT = ["--target-dir", os.environ["INF_FUZZ_TARGET_DIR"]]
+scripts/check-fuzz-targets.sh	per-run	1	the fuzz probe's directory, made under the kept one by mktemp -d each run and removed at exit, which the self-test's call pins hold	PROBE_TARGET = ["--target-dir", os.environ["INF_FUZZ_PROBE_DIR"]]
+scripts/check-lint-ratchet.sh	kept	1	the gate's kept directory, <root>/<name>-<key> from target_root_kept, which the self-test's call pins hold	--target-dir "$TARGET_DIR" -- $LINTS &&
+scripts/check-lint-ratchet.sh	kept	1	the gate's kept directory, <root>/<name>-<key> from target_root_kept, which the self-test's call pins hold	--target-dir "$TARGET_DIR" -- $LINTS
+scripts/check-lint-scopes.sh	fresh	1	a probe's per-run build through target_root_cargo_fresh, which refuses a directory an earlier run filled	(cd "$pwork/probe" && target_root_cargo_fresh "$pwork/target" env -u CLIPPY_CONF_DIR -u RUSTC_BOOTSTRAP cargo +"$pin" clippy --quiet --target "$PROBE_TARGET" \
+scripts/check-waker-atomics.sh	comment	1	a comment that states the rule	# probe compile for one explicit target (probe-target.sh: CARGO_BUILD_TARGET,
+scripts/check-waker-atomics.sh	triple	1	names its own target triple: the probe gates' explicit --target (CARGO_BUILD_TARGET is their knob when one runs alone), the waker gate's tree build, the release job's cross builds; each reads a path that names the triple	RUSTFLAGS="--emit asm=$ASM" cargo rustc -p inf-runtime --release --lib --target "$target" \
+scripts/check-waker-atomics.sh	fresh	1	a probe's per-run build through target_root_cargo_fresh, which refuses a directory an earlier run filled	target_root_cargo_fresh "$work/ptarget" env RUSTFLAGS="--emit asm=$PASM" cargo build --release --quiet --target "$target" \
+scripts/probe-target.sh	comment	1	a comment that states the rule	# probe_target [<toolchain>]: sets PROBE_TARGET (CARGO_BUILD_TARGET, else the
+scripts/probe-target.sh	triple	1	names its own target triple: the probe gates' explicit --target (CARGO_BUILD_TARGET is their knob when one runs alone), the waker gate's tree build, the release job's cross builds; each reads a path that names the triple	PROBE_TARGET=${CARGO_BUILD_TARGET:-}
+scripts/probe-target.sh	triple	1	names its own target triple: the probe gates' explicit --target (CARGO_BUILD_TARGET is their knob when one runs alone), the waker gate's tree build, the release job's cross builds; each reads a path that names the triple	PROBE_ARCH=$(rustc $tc --print cfg --target "$PROBE_TARGET" |
+scripts/probe-target.sh	triple	1	names its own target triple: the probe gates' explicit --target (CARGO_BUILD_TARGET is their knob when one runs alone), the waker gate's tree build, the release job's cross builds; each reads a path that names the triple	[ -z "${CARGO_BUILD_TARGET:-}" ] || return 0
+scripts/run-sweep.sh	comment	1	a comment that states the rule	# run in this checkout's target root, whatever CARGO_TARGET_DIR holds
+scripts/run-sweep.sh	root	1	a build in the root, $TARGET_ROOT, which target_root_setup sets read-only, or a directory of the root named on this line	cargo build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT"
+scripts/sim-canaries.sh	comment	1	a comment that states the rule	# binary its own build made, whatever CARGO_TARGET_DIR holds (ADR-0198 A2).
+scripts/sim-canaries.sh	root	1	a build in the root, $TARGET_ROOT, which target_root_setup sets read-only, or a directory of the root named on this line	--target-dir "$TARGET_ROOT/canary-crate" -- "$name" > "$log" 2>&1; then
+scripts/sim-canaries.sh	root	1	a build in the root, $TARGET_ROOT, which target_root_setup sets read-only, or a directory of the root named on this line	if ! "$CARGO" test -p "$package" "${target_args[@]}" --target-dir "$TARGET_ROOT" -- "$name" \
+scripts/sim-canaries.sh	root	1	a build in the root, $TARGET_ROOT, which target_root_setup sets read-only, or a directory of the root named on this line	--release --lib --target-dir "$TARGET_ROOT/canary-loom" -- "$name" > "$log" 2>&1; then
+scripts/sim-canaries.sh	root	1	a build in the root, $TARGET_ROOT, which target_root_setup sets read-only, or a directory of the root named on this line	--lib --target-dir "$TARGET_ROOT/loom" -- "$name" > "$log" 2>&1 \
+scripts/sim-canaries.sh	root	1	a build in the root, $TARGET_ROOT, which target_root_setup sets read-only, or a directory of the root named on this line	"$CARGO" build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT"
+scripts/sim-canaries.sh	root	1	a build in the root, $TARGET_ROOT, which target_root_setup sets read-only, or a directory of the root named on this line	--target-dir "$TARGET_ROOT/canary-$cfg"
+scripts/sim-smoke.sh	comment	1	a comment that states the rule	# target root, whatever CARGO_TARGET_DIR holds (ADR-0198 A2).
+scripts/sim-smoke.sh	root	1	a build in the root, $TARGET_ROOT, which target_root_setup sets read-only, or a directory of the root named on this line	cargo build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT"
+tests/crash-matrix/run_node_rows.py	pass-through	1	the crash-matrix harness passes the target directory it runs from to the cargo it starts, so each node row runs the test binary this run built	"--profile", profile, "--target-dir", str(target_dir)]
+tests/crash-matrix/run_node_rows.py	pass-through	1	the crash-matrix harness passes the target directory it runs from to the cargo it starts, so each node row runs the test binary this run built	parser.add_argument("--target-dir", type=Path, default=ROOT / "target")
+tests/crash-matrix/tests/matrix.rs	pass-through	1	the crash-matrix harness passes the target directory it runs from to the cargo it starts, so each node row runs the test binary this run built	.arg("--target-dir")
