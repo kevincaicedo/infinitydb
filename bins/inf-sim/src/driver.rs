@@ -20,10 +20,15 @@
 //! their size, so a shard holds one run, two hashes, a verdict and at most
 //! [`READINGS_BYTES_MAX`] bytes of readings at a time.
 //!
+//! A panic is not caught: the drivers install a hook that names the running
+//! seed on stderr and, under `--out`, as the last line of the shard's
+//! results (`hook`), and the process dies as before.
+//!
 //! Every printed violation text goes through one line writer
 //! ([`write_text`]), which escapes control characters and cuts the escaped
 //! text at its bound, so a line stays one line of bounded length.
 
+mod hook;
 mod line;
 mod reports;
 mod violations;
@@ -200,6 +205,8 @@ pub fn run_single<R: SeedReport>(
     mut run_one: impl FnMut(u64) -> R,
     print: impl FnOnce(&R) -> Result<(), String>,
 ) -> Exit {
+    hook::install();
+    let _running = hook::Running::seed(seed);
     let first_lines = |report: &R| -> Result<(), String> {
         print(report)?;
         for line in report.violations().printed_lines() {
@@ -403,15 +410,20 @@ pub fn run_sweep<F: Fold>(
     mut fold: F,
     mut run_one: impl FnMut(u64) -> F::Report,
 ) -> Exit {
+    hook::install();
     let files = match sweep.out.as_deref().map(|dir| ShardFiles::open(dir, sweep.shard)) {
         None => None,
         Some(Ok(files)) => Some(files),
         Some(Err(error)) => return usage(&error),
     };
+    let lent = files.as_ref().map(|files| {
+        hook::LentResults::lend(&files.results, files.results_path.display().to_string())
+    });
     let mut tally = Tally::default();
     let mut copy = StderrCopy::of(files.as_ref());
     let mut sim_seconds: Option<SimSeconds> = None;
     for seed in sweep.shard_seeds() {
+        let _running = hook::Running::seed(seed);
         let Ok(twin) = twice(&mut run_one, seed, Keep::Hashes, |first: &F::Report| {
             tally.seeds_run += 1;
             fold.absorb(first);
@@ -424,7 +436,11 @@ pub fn run_sweep<F: Fold>(
         if let Some(Err(error)) = files.as_ref().map(|files| files.write_line(&outcome.results)) {
             return usage(&error);
         }
-        copy.seed(&outcome.stderr);
+        if copy.seed(&outcome.stderr) == Copied::Withheld
+            && let Some(lent) = &lent
+        {
+            lent.withheld_one();
+        }
     }
     copy.finish();
     let (index, count) = (sweep.shard.index(), sweep.shard.count());
@@ -574,16 +590,16 @@ impl StderrCopy {
         }
     }
 
-    fn seed(&mut self, lines: &[String]) {
+    fn seed(&mut self, lines: &[String]) -> Copied {
         if lines.is_empty() {
-            return;
+            return Copied::Passed;
         }
         match self {
             StderrCopy::Bounded { copied, withheld, .. }
                 if *copied >= FAILING_SEEDS_PRINTED_MAX =>
             {
                 *withheld += 1;
-                return;
+                return Copied::Withheld;
             }
             StderrCopy::Bounded { copied, .. } => *copied += 1,
             StderrCopy::Every => {}
@@ -591,6 +607,7 @@ impl StderrCopy {
         for line in lines {
             eprintln!("{line}");
         }
+        Copied::Printed
     }
 
     /// The crossing line, after the shard's last seed.
@@ -604,6 +621,16 @@ impl StderrCopy {
             );
         }
     }
+}
+
+/// What a shard did with one seed's stderr lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Copied {
+    /// The seed passed: it has none.
+    Passed,
+    Printed,
+    /// Past the bound: the results file holds its line.
+    Withheld,
 }
 
 /// The shard's two files under `--out`: the results, written one

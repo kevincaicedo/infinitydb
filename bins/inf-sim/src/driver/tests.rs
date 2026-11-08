@@ -461,3 +461,87 @@ fn a_shard_bounds_its_stderr_only_with_a_results_file() {
     assert!(!stderr.contains("more failing seeds not printed"), "{stderr}");
     remove(&out);
 }
+
+const PANIC: &str = "INF_SIM_DRIVER_PANIC_CHILD";
+const PANIC_TEST: &str = "driver::tests::a_panic_names_its_seed_in_the_results";
+
+/// The planted panic's message: two lines, and past the line writer's bound
+/// once escaped, a two-byte character astride the cut.
+fn planted_message() -> String {
+    // "planted\x0apanic on the second seed " is 36 escaped bytes, so the
+    // 2,011 bytes after it end at 2,047 and the 'é' would end at 2,049.
+    format!("planted\npanic on the second seed {}é tail", "x".repeat(2_011))
+}
+
+/// The child's shard: a panic on the second seed, or seven failing seeds
+/// and a panic on the eighth.
+fn panicking_shard(leg: &str, out: &Path) -> Exit {
+    let after_seven = leg == "after-seven";
+    let run_one = |seed: u64| {
+        let panics_at = if after_seven { 0x107 } else { 0x101 };
+        assert!(seed != panics_at, "{}", planted_message());
+        let mut report = Stub::clean(seed);
+        if after_seven {
+            report.violations.push(format!("seed {seed:#x} failed"));
+        }
+        report
+    };
+    run_sweep(
+        "stub",
+        &sweep_of(if after_seven { 8 } else { 3 }, Some(out)),
+        StubFold::default(),
+        run_one,
+    )
+}
+
+/// A panic is not caught, and the shard's results name its seed: the
+/// hook's line is the file's last, one line however many the message has,
+/// cut by the line writer between two characters; the child exits by the
+/// panic (101), not an abort, so the hook itself did not panic. A shard that
+/// had held failing seeds back from stderr also counts them on the hook's
+/// stderr and names the results file.
+#[test]
+fn a_panic_names_its_seed_in_the_results() {
+    if let (Some(leg), Some(out)) =
+        (std::env::var_os(PANIC), std::env::var_os("INF_SIM_DRIVER_PANIC_OUT"))
+    {
+        let _ = panicking_shard(leg.to_str().unwrap(), Path::new(&out));
+        unreachable!("the planted panic ends the shard");
+    }
+    let out = scratch("panic");
+    let output = child(
+        PANIC_TEST,
+        &[(PANIC, "second"), ("INF_SIM_DRIVER_PANIC_OUT", out.to_str().unwrap())],
+    );
+    assert_eq!(output.status.code(), Some(101), "{output:?}");
+    let text = format!(
+        "planted\\x0apanic on the second seed {} … (7 bytes not printed)",
+        "x".repeat(2_011)
+    );
+    let results = read(out.join("results-shard-0.txt"));
+    assert_eq!(results, format!("0x100 ok\n0x101 VIOLATION panic: {text}\n"), "{output:?}");
+    assert!(!out.join("manifest-shard-0.txt").exists(), "a dead shard writes no manifest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&format!("inf-sim: seed 0x101: panic: {text}")), "{stderr}");
+    assert!(!stderr.contains("more failing seeds not printed"), "none was held back: {stderr}");
+
+    let output = child(
+        PANIC_TEST,
+        &[(PANIC, "after-seven"), ("INF_SIM_DRIVER_PANIC_OUT", out.to_str().unwrap())],
+    );
+    assert_eq!(output.status.code(), Some(101), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let seeds =
+        stderr.lines().filter(|l| l.starts_with("inf-sim: seed ") && !l.contains("panic")).count();
+    assert_eq!(seeds, 5, "{stderr}");
+    assert!(stderr.contains("inf-sim: seed 0x107: panic: planted"), "{stderr}");
+    let held = format!(
+        "inf-sim: 2 more failing seeds not printed; every seed's line is in {}",
+        out.join("results-shard-0.txt").display()
+    );
+    assert!(stderr.lines().any(|l| l == held), "{stderr}");
+    let results = read(out.join("results-shard-0.txt"));
+    assert_eq!(results.lines().count(), 8, "{results}");
+    assert!(results.lines().last().unwrap().starts_with("0x107 VIOLATION panic: planted"));
+    remove(&out);
+}
