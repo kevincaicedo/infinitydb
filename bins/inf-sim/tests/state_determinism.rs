@@ -48,3 +48,74 @@ fn every_sweep_path_honors_state_verification_for_each_seed() {
         assert_eq!(stdout.matches("state hash identical").count(), 2, "{scenario}: {stdout}");
     }
 }
+
+/// Exit 2 with `message` on stderr and nothing run. An exit 2 for another
+/// reason (a missing leg, an unknown flag) is red, since the message is
+/// read too.
+fn assert_refused(args: &[&str], message: &str) {
+    let output = Command::new(env!("CARGO_BIN_EXE_inf-sim")).args(args).output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(message), "{args:?}: refused for another reason: {stderr}");
+    assert!(output.stdout.is_empty(), "{args:?}: a run started: {output:?}");
+}
+
+/// A sweep's arguments are checked where they are parsed: a zero seed
+/// count, a shard outside its count, and `--shard` or `--out` without
+/// `--sweep` each exit 2 with their own message before any run starts.
+#[test]
+#[ignore = "--sweep 0 runs no seed and exits 0, a --shard outside its count panics, and --shard \
+            or --out without --sweep is ignored; red until the sweep arguments are one type \
+            checked at the parse"]
+fn a_bad_sweep_argument_is_refused_at_the_parse() {
+    let unused = std::env::temp_dir().join("inf-sim-out-never-created");
+    let unused = unused.to_str().unwrap();
+    for (extra, message) in [
+        (&["--sweep", "0"][..], "a sweep runs at least 1 seed"),
+        (&["--sweep", "2", "--shard", "2/2"], "I is a shard index, below K"),
+        (&["--sweep", "2", "--shard", "0/0"], "K is the shard count, at least 1"),
+        (&["--shard", "0/2"], "--shard needs --sweep"),
+        (&["--out", unused], "--out needs --sweep"),
+    ] {
+        let mut args = vec!["--scenario", "m2-durable"];
+        args.extend(extra);
+        assert_refused(&args, message);
+    }
+}
+
+/// A sweep runs every seed twice, so `--verify-determinism` beside
+/// `--sweep` is a usage error: its absence would read as once.
+#[test]
+#[ignore = "a sweep runs its twin only under --verify-determinism; red until a sweep always \
+            runs it and refuses the flag"]
+fn a_sweep_refuses_the_flag() {
+    assert_refused(
+        &["--scenario", "m2-durable", "--sweep", "1", "--verify-determinism"],
+        "--verify-determinism is a single run's: a sweep runs every seed twice",
+    );
+}
+
+/// A scenario that cannot sweep refuses `--sweep` before any run, and the
+/// message names the scenarios that can.
+#[test]
+#[ignore = "eight scenarios run one seed under --sweep N and exit 0, and the refusal names \
+            three of the scenarios that sweep; red until --sweep is refused off the registry's \
+            sweep column"]
+fn a_scenario_that_cannot_sweep_refuses_a_sweep() {
+    for scenario in [
+        &["--scenario", "m4-steel"][..],
+        &["--scenario", "m45-backfill"],
+        &["--scenario", "m45-sidecar"],
+        &["--scenario", "m4-diskfull"],
+        &["--scenario", "m4-pressure"],
+        &["--scenario", "m4-cold"],
+        &["--scenario", "boot-storm"],
+        &["--scenario", "m4-extent-window", "--window-leg", "burst"],
+        &["--scenario", "m0-smoke"],
+    ] {
+        let mut args = scenario.to_vec();
+        args.extend(["--sweep", "1"]);
+        let refusal = format!("--sweep is not {}'s: the scenarios that sweep are", scenario[1]);
+        assert_refused(&args, &refusal);
+    }
+}
