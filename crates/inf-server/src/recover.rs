@@ -714,8 +714,9 @@ pub enum RecoveryProgress {
     Complete,
 }
 
-/// Recovery phase (each `step` performs one bounded unit of the phase).
-enum Phase<File: SegmentFile> {
+/// Recovery phase (each `step` performs one bounded unit of the phase),
+/// over the filesystem `F`: its readers hold the boot readers' files.
+enum Phase<F: SegmentFs> {
     /// Dirs, MANIFEST, scan, floor checks, checkpoint open + presize —
     /// bounded by directory-entry counts, one step.
     Start,
@@ -723,7 +724,7 @@ enum Phase<File: SegmentFile> {
     /// at the next record or entry once its charge reaches the budget, inside
     /// a section the reader holds (ADR-0174 A1).
     Ick {
-        reader: Box<IckReader<File>>,
+        reader: Box<IckReader<BootFile<F>>>,
     },
     /// The end of the checkpoint's releases (ADR-0174 R9), under the step
     /// budget: `at` the next listed address of the machine at index `tier`
@@ -738,7 +739,7 @@ enum Phase<File: SegmentFile> {
     /// budget (ADR-0174 A1).
     Replay {
         idx: usize,
-        reader: ReplayReader<File>,
+        reader: ReplayReader<BootFile<F>>,
     },
     /// M2-S14 slack audit of segment `idx`, right after its replay
     /// (ADR-0087 D6); one segment per step.
@@ -808,7 +809,7 @@ pub struct Recovery<F: SegmentFs> {
     cfg: DurableConfig,
     anchor: WallAnchor,
     now: Nanos,
-    phase: Phase<BootFile<F>>,
+    phase: Phase<F>,
     stats: RecoverStats,
     shard_dir: PathBuf,
     log_dir: PathBuf,
