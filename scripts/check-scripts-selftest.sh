@@ -5602,6 +5602,9 @@ ts_red "a \$d this file never assigns" '$d, assigned nowhere in this file' \
 ts_red "d=target/x, then a bare --target-dir \"\$d\"" '$d, assigned at line 2 to a literal under target/' \
     'd=target/x
 cargo check --target-dir "$d"'
+ts_red "d=\$(mktemp -d), then --target-dir \"\$d/../x\": a path that climbs out of it" \
+    'neither the root.s .* nor made for this run: a path that climbs out of $d' 'd=$(mktemp -d)
+cargo check --target-dir "$d/../x"'
 ts_red "\$TARGET_ROOT where the helper is not sourced" "does not source target-root.sh" \
     'cargo check --target-dir "$TARGET_ROOT/x"'
 ts_red "\$TARGET_ROOT the file assigns itself" "assigned in this file rather than by target_root_setup" \
@@ -5621,7 +5624,8 @@ PY"
 ts_red "a heredoc's os.environ the file never binds" '$X, assigned nowhere in this file' "python3 - <<'PY'
 CALL = [\"check\", \"--target-dir\", os.environ[\"X\"]]
 PY"
-# A built binary under a literal target/.
+# A built binary under a target/ that no run made: a literal, a parameter's
+# default, or beneath any prefix that is not a per-run directory.
 ts_red "bin=target/release/inf-sim" "target/release/inf-sim names a built binary" 'bin=target/release/inf-sim'
 ts_red "./target/release/infinityd run" "./target/release/infinityd names a built binary" \
     './target/release/infinityd --port 1'
@@ -5630,6 +5634,32 @@ ts_red "a cross-compiled binary under target/" "target/x86_64-unknown-linux-gnu/
 ts_red "a recipe's {{justfile_directory()}}/target/debug/infinityd" \
     "justfile:5: {{justfile_directory()}}/target/debug/infinityd names a built binary" ':' \
     '    INFINITYD_BIN={{justfile_directory()}}/target/debug/infinityd cargo test -p compat'
+ts_red "a parameter's default, \${BIN:-./target/release/infinityd}" \
+    '${BIN:-./target/release/infinityd} names a built binary under a target/ in a parameter' \
+    'BIN="${BIN:-./target/release/infinityd}"'
+ts_red "a parameter's default with no colon, \${X-target/release/inf-sim}" \
+    '${INF_SIM_BIN-target/release/inf-sim} names a built binary under a target/ in a parameter' \
+    'sim=${INF_SIM_BIN-target/release/inf-sim}'
+ts_red "\$root/target/release/inf-sim, root the checkout by cd and pwd" \
+    '$root/target/release/inf-sim names a built binary beneath $root, assigned at line 2' \
+    'root=$(cd "$(dirname "$0")/.." && pwd)
+tree_bin="$root/target/release/inf-sim"'
+ts_red "\$SCRIPT_DIR/../target/release/inf-sim" \
+    '$SCRIPT_DIR/../target/release/inf-sim names a built binary beneath a path that climbs out' \
+    'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+"$SCRIPT_DIR/../target/release/inf-sim" --help'
+ts_red "\$(pwd)/target/release/inf-sim" \
+    '$(pwd)/target/release/inf-sim names a built binary beneath a value the scan cannot follow' \
+    '"$(pwd)/target/release/inf-sim" --help'
+ts_red "a per-run directory's parent, \$work/../target/release/x" \
+    '$work/../target/release/x names a built binary beneath a path that climbs out of $work' \
+    'work=$(mktemp -d)
+"$work/../target/release/x" --help'
+ts_red "the helper's root, \$TARGET_ROOT/target/release/x" \
+    'names a built binary beneath the root scripts/target-root.sh computes' \
+    '. scripts/target-root.sh
+target_root_setup "$(pwd -P)"
+"$TARGET_ROOT/target/release/x" --help'
 # The forms that pass: per run, the root's, and literals that name no binary.
 ts_green "d=\$(mktemp -d target/x.XXXXXX), then --target-dir \"\$d/target\"" 'mkdir -p target
 d=$(mktemp -d target/x.XXXXXX)
@@ -5644,6 +5674,11 @@ target_root_setup "$(pwd -P)"
 cargo build --target-dir "$TARGET_ROOT"
 canary="$TARGET_ROOT/canary-$cfg"
 cargo build --target-dir "$canary"'
+ts_tree 'work=$(mktemp -d)
+"$work/target/release/x" --help'
+expect_output "target-root scan: \$work/target/release/x after work=\$(mktemp -d) is green and counted" \
+    "target-root scan OK: .* 1 built-binary paths under a target/, each beneath a directory made" \
+    ts_scan "$TS_DIR"
 ts_green "a heredoc's os.environ bound to the kept directory and a per-run one beneath it" \
     "K=\$(target_root_kept fuzz-check)
 export K

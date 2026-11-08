@@ -21,10 +21,17 @@ script that goes around it:
     the file (the environment's, a sourced file's) is neither. A heredoc's
     `"--target-dir", os.environ["X"]` reads X, whose every binding in the
     file must be the helper's or a per-run directory;
-  - a literal path under `target/` that names a built binary
-    (`target/[<triple>/]{debug,release}/<name>`, also after `./` or a
-    `{{…}}/` prefix): under a set CARGO_TARGET_DIR it is a stale binary or
-    none.
+  - a path that names a built binary under a `target/` directory,
+    `target/[<triple>/]{debug,release}/<name>`, wherever it occurs: under a
+    set CARGO_TARGET_DIR a checkout's `target/` holds a stale binary or
+    none. It is red bare or after `./`, `../` or `/`; in a parameter's
+    default (`${X:-…}`, `${X-…}`, `${X:=…}`, `${X=…}`); and after any prefix
+    (`$VAR/`, `${VAR}/`, `$(…)/`, a backquote, `{{…}}/`) but a directory
+    made for this run, by the kind rules above. The helper's root is not
+    such a prefix: the binaries it holds sit at `<root>/<profile>/<name>`.
+
+A path beneath a directory is one that does not climb out of it: a `..`
+component after the variable makes it neither kind.
 
 The scan holds no list of exempt sites: none is left. Comment lines are not
 read. A variable is read file-wide, not by function scope, so one name holds
@@ -40,8 +47,14 @@ SKIP = {"target-root.sh", "check-scripts-selftest.sh"}
 NAME = r"[A-Za-z_][A-Za-z0-9_]*"
 RAW_SHELL = re.compile(r"\$\{?CARGO_TARGET_DIR\b")
 RAW_PY = re.compile(r"(?:environ(?:\.get)?\s*[\[(]|getenv\s*\()\s*[\"']CARGO_TARGET_DIR[\"']")
-BINARY = re.compile(r"(?:^|(?<=[\s\"'=(:;|&]))(?:\./|\{\{[^}]*\}\}/)?target/(?:[^/\s\"'$]+/)?"
-                    r"(?:debug|release)/[^/\s\"']+")
+# `target/` as a whole path component: a name such as `my-target/` or
+# `x.target/` is another directory.
+BINARY = re.compile(r"(?<![A-Za-z0-9_.-])target/(?:[^/\s\"'$`{}()]+/)?(?:debug|release)/"
+                    r"[^/\s\"'`$(){};|&<>]+")
+DEFAULT = re.compile(r"\$\{(" + NAME + r")(:?[-=])")
+LEAD = re.compile(r"^(?:" + NAME + r"\+?=|--?[A-Za-z0-9-]+=)")
+DOTS = re.compile(r"^\.\.?(?:/\.\.?)*$")
+CLIMB = re.compile(r"(?:^|/)\.\.(?:/|$)")
 HEREDOC = re.compile(r"<<(-?)\s*(['\"]?)(" + NAME + r")\2")
 PY_SITE = re.compile(r"[\"']--target-dir[\"']\s*,\s*(os\.environ\[[^\]\n]*\]|[^,\]\)\n]+)")
 PY_ENV = re.compile(r"os\.environ\[\s*[\"'](" + NAME + r")[\"']\s*\]$")
@@ -49,16 +62,21 @@ SOURCES = re.compile(r"(?:^|[\s;&|])(?:\.|source)\s+[\"']?[^\s\"']*target-root\.
 EXPORT = "export CARGO_TARGET_DIR := `./scripts/target-root.sh --print`"
 MKTEMP = re.compile(r"^\$\(\s*mktemp\s(?:.*\s)?-d(?:\s|\)).*\)$|^\$\(\s*mktemp\s+-d\)$")
 KEPT = re.compile(r"^\$\(\s*target_root_kept\s+[A-Za-z0-9_-]+\s*\)$")
-REF = re.compile(r"^\$\{?(" + NAME + r")\}?(?:/.*)?$")
+REF = re.compile(r"^\$\{?(" + NAME + r")\}?(/.*)?$")
 
 
 def words(line):
-    """The line's shell words, quotes kept, `$( )` and `${ }` whole."""
+    """The line's shell words, quotes kept, `$( )`, `${ }` and `{{ }}` whole."""
+    return [line[begin:end] for begin, end in spans(line)]
+
+
+def spans(line):
+    """Each shell word of the line as (begin, end_exclusive)."""
     out, i, n = [], 0, len(line)
     while i < n:
         while i < n and line[i] in " \t;|&<>()":
             i += 1
-        start, depth = i, 0
+        start, depth, braces = i, 0, 0
         while i < n:
             c = line[i]
             if c == "\\":
@@ -78,15 +96,23 @@ def words(line):
                 depth += 1
                 i += 2
                 continue
+            if line.startswith("{{", i):
+                braces += 1  # a justfile interpolation, one word with its spaces
+                i += 2
+                continue
+            if line.startswith("}}", i) and braces > 0 and depth == 0:
+                braces -= 1
+                i += 2
+                continue
             if c in ")}" and depth > 0:
                 depth -= 1
                 i += 1
                 continue
-            if depth == 0 and c in " \t;|&<>()":
+            if depth == 0 and braces == 0 and c in " \t;|&<>()":
                 break
             i += 1
         if i > start:
-            out.append(line[start:i])
+            out.append((start, i))
     return out
 
 
@@ -145,6 +171,8 @@ class File:
         if KEPT.match(word):
             return "helper"
         ref = REF.match(word)
+        if ref and CLIMB.search(ref.group(2) or ""):
+            return f"a path that climbs out of ${ref.group(1)} ({value})"
         if not ref:
             if word.startswith(("target/", "./target/")) or word in ("target", "./target"):
                 return f"a literal under target/ ({value})"
@@ -180,6 +208,46 @@ class File:
         self.memo[name] = kind
         return kind
 
+    def binaries(self, text):
+        """The line's reds for built-binary paths, and the count beneath a per-run directory."""
+        reds, safe, defaults = [], 0, []
+        for found in DEFAULT.finditer(text):
+            depth, j = 1, found.end()
+            while j < len(text) and depth:
+                depth += {"{": 1, "}": -1}.get(text[j], 0)
+                j += 1
+            defaults.append((found.start(), j))
+            if BINARY.search(text[found.end():j]):
+                reds.append(f"{text[found.start():j]} names a built binary under a target/ in a "
+                            "parameter's default; take it from the root scripts/target-root.sh "
+                            "computes")
+        words_at = spans(text)
+        for found in BINARY.finditer(text):
+            at = found.start()
+            if any(begin <= at < end for begin, end in defaults):
+                continue
+            begin = next((b for b, e in words_at if b <= at < e), at)
+            prefix = LEAD.sub("", text[begin:at].replace('"', ""), count=1)
+            shown = prefix + found.group(0)
+            if not prefix.endswith("/") or DOTS.match(prefix[:-1]):
+                reds.append(f"{shown} names a built binary under a literal target/; take it from "
+                            "the root scripts/target-root.sh computes")
+                continue
+            if prefix == "/":
+                reds.append(f"{shown} names a built binary under an absolute literal; take it "
+                            "from the root scripts/target-root.sh computes")
+                continue
+            kind = self.kind_of(prefix[:-1])
+            if kind == "per-run":
+                safe += 1
+                continue
+            if kind == "helper":
+                kind = ("the root scripts/target-root.sh computes, whose binaries sit at "
+                        "<root>/<profile>/<name>, under no target/")
+            reds.append(f"{shown} names a built binary beneath {kind}; only a directory made "
+                        "for this run holds its own target/")
+        return reds, safe
+
 
 def scan(root):
     scripts = os.path.join(root, "scripts")
@@ -188,7 +256,7 @@ def scan(root):
     if not os.path.isfile(os.path.join(root, "justfile")) or not names:
         print(f"TARGET-ROOT SCAN SCOPE ERROR: {root} holds no justfile or no scripts/*.sh to read")
         return 2
-    reds, sites, binds = [], {"helper": 0, "per-run": 0}, 0
+    reds, sites, binds, safe = [], {"helper": 0, "per-run": 0}, 0, 0
     for rel in ["justfile"] + [f"scripts/{n}" for n in names]:
         f = File(root, rel)
         justfile = rel == "justfile"
@@ -205,9 +273,9 @@ def scan(root):
             if RAW_SHELL.search(text) or RAW_PY.search(text):
                 reds.append(f"{rel}:{number}: reads CARGO_TARGET_DIR itself; read the root through "
                             "scripts/target-root.sh")
-            for match in BINARY.finditer(text):
-                reds.append(f"{rel}:{number}: {match.group(0)} names a built binary under a literal "
-                            "target/; take it from the root scripts/target-root.sh computes")
+            found, beneath = f.binaries(text)
+            reds.extend(f"{rel}:{number}: {red}" for red in found)
+            safe += beneath
         for number, text in f.shell:
             ws = words(text)
             for i, word in enumerate(ws):
@@ -246,12 +314,14 @@ def scan(root):
         print(f"TARGET-ROOT SCAN: {red}")
     scope = (f"the justfile and {len(names)} of scripts/*.sh read; {sites['helper'] + sites['per-run']} "
              f"target directories ({sites['helper']} the root's, {sites['per-run']} per run; "
-             f"{binds} through a heredoc's environment); no exempt site")
+             f"{binds} through a heredoc's environment); {safe} built-binary paths under a "
+             "target/, each beneath a directory made for this run; no exempt site")
     if reds:
         print(f"target-root scan FAILED: {len(reds)} red ({scope})")
         return 1
     print(f"target-root scan OK: {scope}; no script reads CARGO_TARGET_DIR but through "
-          "scripts/target-root.sh, and no literal target/ path names a built binary")
+          "scripts/target-root.sh, and no path names a built binary under a target/ but "
+          "beneath a directory made for this run")
     return 0
 
 
