@@ -228,6 +228,53 @@ fn memory_section(
     text.push_str("\r\n");
 }
 
+/// ADR-0189 D11, node scope, read from the catalog writer's gauges as
+/// they stand: the tombstone book's word (live, ready, paceable,
+/// blocked), the writer's word, its pending DDL, the notices that retired
+/// none, and the cap's paces and refusals.
+fn ddl_gauge_lines(text: &mut String, node: &NodeInfo) {
+    let gauges = node.ddl_gauges.borrow();
+    let Some(g) = gauges.as_deref() else {
+        for field in DDL_GAUGE_FIELDS {
+            push(text, &format!("{field}:0"));
+        }
+        return;
+    };
+    let t = g.tombstones();
+    let (busy, limit) = g.refused_capacity();
+    let values = [
+        u64::from(t.live),
+        u64::from(t.ready),
+        u64::from(t.paceable),
+        u64::from(t.blocked),
+        g.catalog_epoch(),
+        g.pending(),
+        g.notices_stale(),
+        g.paced(),
+        g.repaced(),
+        busy,
+        limit,
+    ];
+    for (field, value) in DDL_GAUGE_FIELDS.iter().zip(values) {
+        push(text, &format!("{field}:{value}"));
+    }
+}
+
+/// The catalog writer's `INFO persistence` fields, in render order.
+const DDL_GAUGE_FIELDS: [&str; 11] = [
+    "ns_drop_tombstones",
+    "ns_drop_tombstones_ready",
+    "ns_drop_tombstones_paceable",
+    "ns_drop_tombstones_blocked",
+    "catalog_epoch",
+    "ns_ddl_pending",
+    "ns_ddl_notices_stale",
+    "ns_ddl_paced",
+    "ns_ddl_repaced",
+    "ns_drop_refused_capacity_busy",
+    "ns_drop_refused_capacity_limit",
+];
+
 /// `INFO` — the persistence lines.
 fn persistence_section(text: &mut String, node: &NodeInfo, now: Nanos) {
     push(text, "# Persistence");
@@ -271,14 +318,7 @@ fn persistence_section(text: &mut String, node: &NodeInfo, now: Nanos) {
     #[cfg(inf_canary_info_lastsave_from_observation)]
     let last_save_s = node.lastsave.observed_unix_s();
     push(text, &format!("rdb_last_save_time:{last_save_s}"));
-    // ADR-0100 D7: durable namespaces dropped since every cell last
-    // published a MANIFEST past the drop (node scope).
-    push(text, &format!("ns_drop_tombstones:{}", node.ns_drop_tombstones.get()));
-    // ADR-0189 D11: the catalog writer's word, its pending DDL and the
-    // notices that retired none (node scope).
-    push(text, &format!("catalog_epoch:{}", node.catalog_epoch.get()));
-    push(text, &format!("ns_ddl_pending:{}", node.ns_ddl_pending.get()));
-    push(text, &format!("ns_ddl_notices_stale:{}", node.ns_ddl_notices_stale.get()));
+    ddl_gauge_lines(text, node);
     push(text, "aof_enabled:0");
     push(text, "aof_rewrite_in_progress:0");
     log_gauge_lines(text, node);

@@ -1326,6 +1326,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             return Err(IssuerRefused { plane, mismatch, issuer });
         }
         *self.shared.node.memory_board.borrow_mut() = Some(Arc::clone(control.memory_board()));
+        *self.shared.node.ddl_gauges.borrow_mut() = Some(Arc::clone(control.ddl_gauges()));
         *self.shared.control.borrow_mut() = Some(control);
         *self.shared.ckpt_quota.borrow_mut() = Some(issuer.quota);
         self.final_credit = Some(issuer.final_credit);

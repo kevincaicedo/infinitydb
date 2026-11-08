@@ -1407,6 +1407,81 @@ enum ControlMsg {
     Unlink(PathBuf),
 }
 
+/// The catalog writer's node gauges and counters (ADR-0189 D11), node
+/// scope: every cell's `INFO` reads them as it renders, so no cell copies
+/// them each iteration, and no decision reads them.
+#[derive(Debug)]
+pub struct DdlGauges {
+    /// The catalog word: the highest request the writer answered.
+    word: Arc<CatalogWord>,
+    /// The tombstone book's gauge word ([`TombstoneGauges`]), stored by the
+    /// writer at each answer and stamp.
+    tombstones: AtomicU64,
+    /// 1 while the writer holds a pending DDL, else 0.
+    pending: AtomicU64,
+    /// Notices that matched no pending DDL (zero by design: the ticket
+    /// admits one DDL and each posts its own notice).
+    notices_stale: AtomicU64,
+    /// Pacing checkpoints the DDL programs issued at the cap.
+    paced: AtomicU64,
+    /// `Paceable` answers after a program's one pace (zero by design).
+    repaced: AtomicU64,
+    /// Durable DDLs refused at the cap, `-TRYAGAIN` and `-ERR`.
+    refused_busy: AtomicU64,
+    refused_limit: AtomicU64,
+}
+
+impl DdlGauges {
+    fn new(word: Arc<CatalogWord>) -> DdlGauges {
+        DdlGauges {
+            word,
+            tombstones: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
+            notices_stale: AtomicU64::new(0),
+            paced: AtomicU64::new(0),
+            repaced: AtomicU64::new(0),
+            refused_busy: AtomicU64::new(0),
+            refused_limit: AtomicU64::new(0),
+        }
+    }
+
+    /// The catalog word (`catalog_epoch`).
+    pub fn catalog_epoch(&self) -> u64 {
+        self.word.load()
+    }
+
+    /// The tombstone book's gauge word, read whole.
+    pub fn tombstones(&self) -> TombstoneGauges {
+        TombstoneGauges::unpack(self.tombstones.load(Ordering::Acquire))
+    }
+
+    /// 1 while the writer holds a pending DDL, else 0.
+    pub fn pending(&self) -> u64 {
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Notices that retired no pending DDL.
+    pub fn notices_stale(&self) -> u64 {
+        self.notices_stale.load(Ordering::Relaxed)
+    }
+
+    /// Pacing checkpoints the DDL programs issued at the cap.
+    pub fn paced(&self) -> u64 {
+        self.paced.load(Ordering::Relaxed)
+    }
+
+    /// `Paceable` answers after a program's one pace.
+    pub fn repaced(&self) -> u64 {
+        self.repaced.load(Ordering::Relaxed)
+    }
+
+    /// Durable DDLs refused at the cap, `(busy, limit)`.
+    pub fn refused_capacity(&self) -> (u64, u64) {
+        let busy = self.refused_busy.load(Ordering::Relaxed);
+        (busy, self.refused_limit.load(Ordering::Relaxed))
+    }
+}
+
 /// Shared handle the assembly wires into every cell's plane.
 pub struct ControlHandle {
     tx: mpsc::SyncSender<ControlMsg>,
@@ -1437,22 +1512,9 @@ pub struct ControlHandle {
     memory_board: Arc<MemoryBoard>,
     /// Per-cell index readiness (M4.5-S03, ADR-0075 D5).
     index_board: Arc<IndexBoard>,
-    /// The tombstone book's gauge word ([`TombstoneGauges`], ADR-0189
-    /// D11), stored by the writer at each answer and stamp: observation
-    /// only, no decision reads it.
-    tombstone_gauges: AtomicU64,
-    /// Node counters (ADR-0189 D11): pacing checkpoints the DDL programs
-    /// issued; `Paceable` answers after a program's one pace (zero by
-    /// design); durable DDLs refused at the cap, `-TRYAGAIN` and `-ERR`.
-    ddl_paced: AtomicU64,
-    ddl_repaced: AtomicU64,
-    refused_capacity_busy: AtomicU64,
-    refused_capacity_limit: AtomicU64,
-    /// Node gauge: 1 while the writer holds a pending DDL, else 0.
-    ddl_pending: AtomicU64,
-    /// Node counter: notices that matched no pending DDL (zero by design;
-    /// the ticket admits one DDL and each posts its own notice).
-    notices_stale: AtomicU64,
+    /// The catalog writer's node gauges and counters (ADR-0189 D11),
+    /// shared with every cell's `INFO`.
+    gauges: Arc<DdlGauges>,
     /// The node-wide DDL ticket (ADR-0108 D1): `0` = free, `cell + 1` =
     /// the cell whose DDL program holds it. One namespace DDL program
     /// runs at a time — its fan legs never cross another's. Taken by
@@ -1529,6 +1591,13 @@ impl NsIdReservation {
 }
 
 impl ControlHandle {
+    /// The writer's node gauges and counters (ADR-0189 D11), which every
+    /// cell's `INFO` reads as it renders.
+    #[must_use]
+    pub fn ddl_gauges(&self) -> &Arc<DdlGauges> {
+        &self.gauges
+    }
+
     /// Live drop tombstones, as the writer's last fold found them
     /// (ADR-0189 D11).
     pub fn drop_tombstones(&self) -> usize {
@@ -1538,50 +1607,50 @@ impl ControlHandle {
     /// The tombstone book's gauge word, read whole (ADR-0189 D11).
     #[must_use]
     pub fn tombstone_gauges(&self) -> TombstoneGauges {
-        TombstoneGauges::unpack(self.tombstone_gauges.load(Ordering::Acquire))
+        self.gauges.tombstones()
     }
 
     /// Node counter: pacing checkpoints the DDL programs issued at the cap.
     pub fn ddl_paced(&self) -> u64 {
-        self.ddl_paced.load(Ordering::Relaxed)
+        self.gauges.paced()
     }
 
     /// Node counter: `Paceable` answers after a program's one pace, each
     /// answered as `Busy` (zero by design: one pace suffices, ADR-0189 D6).
     pub fn ddl_repaced(&self) -> u64 {
-        self.ddl_repaced.load(Ordering::Relaxed)
+        self.gauges.repaced()
     }
 
     /// Node counters: durable DDLs refused at the cap, `(busy, limit)`.
     pub fn drop_refused_capacity(&self) -> (u64, u64) {
-        let busy = self.refused_capacity_busy.load(Ordering::Relaxed);
-        (busy, self.refused_capacity_limit.load(Ordering::Relaxed))
+        self.gauges.refused_capacity()
     }
 
     /// Counts a pacing checkpoint a DDL program issued.
     pub(crate) fn note_ddl_paced(&self) {
-        self.ddl_paced.fetch_add(1, Ordering::Relaxed);
+        self.gauges.paced.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Counts a `Paceable` answer after the program's one pace.
     pub(crate) fn note_ddl_repaced(&self) {
-        self.ddl_repaced.fetch_add(1, Ordering::Relaxed);
+        self.gauges.repaced.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Counts a durable DDL refused at the cap as the client sees it.
     pub(crate) fn note_capacity_refused(&self, busy: bool) {
-        let counter = if busy { &self.refused_capacity_busy } else { &self.refused_capacity_limit };
+        let gauges = &self.gauges;
+        let counter = if busy { &gauges.refused_busy } else { &gauges.refused_limit };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Node gauge: 1 while the writer holds a pending DDL (ADR-0189 D11).
     pub fn ddl_pending(&self) -> u64 {
-        self.ddl_pending.load(Ordering::Relaxed)
+        self.gauges.pending()
     }
 
     /// Node counter: notices that retired no pending DDL (ADR-0189 D11).
     pub fn ddl_notices_stale(&self) -> u64 {
-        self.notices_stale.load(Ordering::Relaxed)
+        self.gauges.notices_stale()
     }
 
     /// Takes the DDL ticket for `cell` (ADR-0108 D1), or `None` while
@@ -2038,7 +2107,7 @@ impl CatalogWriter {
             | (None, DdlNotice::CreateApplied { .. } | DdlNotice::DropFanned { .. }) => false,
         };
         if !retires {
-            self.handle.notices_stale.fetch_add(1, Ordering::Relaxed);
+            self.handle.gauges.notices_stale.fetch_add(1, Ordering::Relaxed);
             return;
         }
         self.pending = None;
@@ -2053,8 +2122,9 @@ impl CatalogWriter {
     /// now, and the pending DDL.
     fn publish_gauges(&self) {
         let fold = self.fold_at(self.handle.ckpt_board().min_published());
-        self.handle.tombstone_gauges.store(TombstoneGauges::of(fold).pack(), Ordering::Release);
-        self.handle.ddl_pending.store(u64::from(self.pending.is_some()), Ordering::Relaxed);
+        let gauges = &self.handle.gauges;
+        gauges.tombstones.store(TombstoneGauges::of(fold).pack(), Ordering::Release);
+        gauges.pending.store(u64::from(self.pending.is_some()), Ordering::Relaxed);
     }
 }
 
@@ -2211,18 +2281,12 @@ impl ControlHandle {
             requests_sent: AtomicU64::new(0),
             #[cfg(inf_canary_ns_epoch_at_send)]
             numbered: AtomicU64::new(0),
+            gauges: Arc::new(DdlGauges::new(Arc::clone(&word))),
             word,
             ckpt_clock: clock,
             recovery: Arc::new(RecoveryBoard::new(cells, start_unix_ms)),
             memory_board: Arc::new(MemoryBoard::new(cells)),
             index_board: Arc::new(IndexBoard::new(cells)),
-            tombstone_gauges: AtomicU64::new(0),
-            ddl_paced: AtomicU64::new(0),
-            ddl_repaced: AtomicU64::new(0),
-            refused_capacity_busy: AtomicU64::new(0),
-            refused_capacity_limit: AtomicU64::new(0),
-            ddl_pending: AtomicU64::new(0),
-            notices_stale: AtomicU64::new(0),
             ddl_holder: AtomicU16::new(0),
             ddl_generation: AtomicU64::new(0),
         });

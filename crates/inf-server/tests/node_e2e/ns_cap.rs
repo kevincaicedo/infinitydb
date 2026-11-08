@@ -125,6 +125,17 @@ fn every_tombstone_blocked_refuses_a_durable_ddl_until_a_restart_re_stamps_them(
     assert_eq!(control.ckpt_last_issued(), issued, "a refusal at the cap issued a checkpoint");
     assert_eq!(control.drop_refused_capacity(), (0, 2), "both refusals counted as limits");
     assert_eq!(control.ddl_paced(), 0, "no blocked tombstone is paced");
+    // INFO renders the writer's gauges as they stand (ADR-0189 D11).
+    let text = info_text(&mut c, b"persistence");
+    for line in [
+        "ns_drop_tombstones:256\r\n",
+        "ns_drop_tombstones_blocked:256\r\n",
+        "ns_drop_tombstones_ready:0\r\n",
+        "ns_drop_refused_capacity_limit:2\r\n",
+        "ns_ddl_paced:0\r\n",
+    ] {
+        assert!(text.contains(line), "INFO persistence lacks {line:?}: {text}");
+    }
     assert_eq!(create(&mut c, b"scratch", b"memory"), b"+OK\r\n", "a memory CREATE proceeds");
     drop(c);
     node.stop();
