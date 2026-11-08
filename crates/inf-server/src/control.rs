@@ -1431,6 +1431,12 @@ pub struct DdlGauges {
     /// Durable DDLs refused at the cap, `-TRYAGAIN` and `-ERR`.
     refused_busy: AtomicU64,
     refused_limit: AtomicU64,
+    /// Tiered `CREATE`s refused with every lifetime held, `-TRYAGAIN` (a
+    /// grant Retiring) and `-ERR` (ADR-0148 D1).
+    tiered_refused_busy: AtomicU64,
+    tiered_refused_limit: AtomicU64,
+    /// `CREATE`s refused with the namespace id space spent (ADR-0148 D4).
+    ns_id_refused_exhausted: AtomicU64,
 }
 
 impl DdlGauges {
@@ -1444,6 +1450,9 @@ impl DdlGauges {
             repaced: AtomicU64::new(0),
             refused_busy: AtomicU64::new(0),
             refused_limit: AtomicU64::new(0),
+            tiered_refused_busy: AtomicU64::new(0),
+            tiered_refused_limit: AtomicU64::new(0),
+            ns_id_refused_exhausted: AtomicU64::new(0),
         }
     }
 
@@ -1481,6 +1490,17 @@ impl DdlGauges {
     pub fn refused_capacity(&self) -> (u64, u64) {
         let busy = self.refused_busy.load(Ordering::Relaxed);
         (busy, self.refused_limit.load(Ordering::Relaxed))
+    }
+
+    /// Tiered `CREATE`s refused with every lifetime held, `(busy, limit)`.
+    pub fn tiered_refused(&self) -> (u64, u64) {
+        let busy = self.tiered_refused_busy.load(Ordering::Relaxed);
+        (busy, self.tiered_refused_limit.load(Ordering::Relaxed))
+    }
+
+    /// `CREATE`s refused with the namespace id space spent.
+    pub fn ns_id_refused_exhausted(&self) -> u64 {
+        self.ns_id_refused_exhausted.load(Ordering::Relaxed)
     }
 }
 
@@ -1562,6 +1582,7 @@ impl DdlTicket {
         // spent counter issues `u32::MAX` and the commit wraps (the wire's
         // ids oracle sees an id with no successor).
         if next == NS_IDS_EXHAUSTED && !cfg!(inf_canary_ns_id_wraps) {
+            self.handle.gauges.ns_id_refused_exhausted.fetch_add(1, Ordering::Relaxed);
             return Err(Refusal::IdentityExhausted(Domain::Namespace));
         }
         // Canary `inf_canary_ns_id_spent_on_refusal`: the reservation commits
@@ -1642,6 +1663,14 @@ impl ControlHandle {
     pub(crate) fn note_capacity_refused(&self, busy: bool) {
         let gauges = &self.gauges;
         let counter = if busy { &gauges.refused_busy } else { &gauges.refused_limit };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a tiered `CREATE` refused with every lifetime held, as the
+    /// client sees it.
+    pub(crate) fn note_tiered_refused(&self, busy: bool) {
+        let gauges = &self.gauges;
+        let counter = if busy { &gauges.tiered_refused_busy } else { &gauges.tiered_refused_limit };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 

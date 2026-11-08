@@ -231,7 +231,8 @@ fn memory_section(
 /// ADR-0189 D11, node scope, read from the catalog writer's gauges as
 /// they stand: the tombstone book's word (live, ready, paceable,
 /// blocked), the writer's word, its pending DDL, the notices that retired
-/// none, and the cap's paces and refusals.
+/// none, the cap's paces and refusals, the tiered lifetime bound's refusals
+/// (ADR-0148 D1) and the namespace id space's (ADR-0148 D4).
 fn ddl_gauge_lines(text: &mut String, node: &NodeInfo) {
     let gauges = node.ddl_gauges.borrow();
     let Some(g) = gauges.as_deref() else {
@@ -242,6 +243,7 @@ fn ddl_gauge_lines(text: &mut String, node: &NodeInfo) {
     };
     let t = g.tombstones();
     let (busy, limit) = g.refused_capacity();
+    let (tiered_busy, tiered_limit) = g.tiered_refused();
     let values = [
         u64::from(t.live),
         u64::from(t.ready),
@@ -254,6 +256,9 @@ fn ddl_gauge_lines(text: &mut String, node: &NodeInfo) {
         g.repaced(),
         busy,
         limit,
+        tiered_busy,
+        tiered_limit,
+        g.ns_id_refused_exhausted(),
     ];
     for (field, value) in DDL_GAUGE_FIELDS.iter().zip(values) {
         push(text, &format!("{field}:{value}"));
@@ -261,7 +266,7 @@ fn ddl_gauge_lines(text: &mut String, node: &NodeInfo) {
 }
 
 /// The catalog writer's `INFO persistence` fields, in render order.
-const DDL_GAUGE_FIELDS: [&str; 11] = [
+const DDL_GAUGE_FIELDS: [&str; 14] = [
     "ns_drop_tombstones",
     "ns_drop_tombstones_ready",
     "ns_drop_tombstones_paceable",
@@ -273,6 +278,9 @@ const DDL_GAUGE_FIELDS: [&str; 11] = [
     "ns_ddl_repaced",
     "ns_drop_refused_capacity_busy",
     "ns_drop_refused_capacity_limit",
+    "tiered_ns_refused_busy",
+    "tiered_ns_refused_limit",
+    "ns_id_refused_exhausted",
 ];
 
 /// `INFO` — the persistence lines.

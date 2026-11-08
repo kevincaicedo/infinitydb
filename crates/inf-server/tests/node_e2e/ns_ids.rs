@@ -213,6 +213,9 @@ fn the_last_namespace_id_is_issued_once_and_then_the_space_refuses() {
         }
         assert_eq!(reply, b"-ERR namespace identity space exhausted\r\n", "the spent space");
     }
+    // The refusals are the node's counter, read from any cell's INFO.
+    let refused = info_field(&info_persistence(&mut c), "ns_id_refused_exhausted");
+    assert_eq!(refused, 2, "each refused CREATE counted once, node scope");
     drop(c);
     node.stop();
     let node = Node::start_durable(2, &dir);

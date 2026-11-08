@@ -61,6 +61,23 @@ pub enum DdlRefusal {
     /// A durable `CREATE`, or a `DROP` that leaves a tombstone, found no
     /// tombstone slot free at the writer's fold (ADR-0189 D6), and why.
     TombstoneCapacity(TombstoneHeld),
+    /// A tiered `CREATE` found every tiered namespace lifetime of the node
+    /// held, after the writer's reclaim of every grant each cell's receipt
+    /// releases (ADR-0148 D1, D2), and why.
+    TieredCapacity(TieredHeld),
+}
+
+/// Why every tiered namespace lifetime of the node is held (ADR-0148 D1,
+/// ADR-0172 D3), from the writer's grant book at the request.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TieredHeld {
+    /// A held grant is Retiring: a dropped namespace's owners have not all
+    /// ended on every cell, and the grant returns once they have, with no
+    /// operator (`-TRYAGAIN tiered namespace capacity in use`).
+    Busy,
+    /// Every grant names a live namespace: one returns only when a client
+    /// drops one (`-ERR tiered namespace limit reached`).
+    Limit,
 }
 
 /// Why the tombstone book holds every slot a durable DDL needs (ADR-0189
@@ -87,6 +104,8 @@ const VERDICT_ID_NOT_NEXT: u8 = 4;
 const VERDICT_TOMBSTONE_PACEABLE: u8 = 5;
 const VERDICT_TOMBSTONE_BUSY: u8 = 6;
 const VERDICT_TOMBSTONE_LIMIT: u8 = 7;
+const VERDICT_TIERED_BUSY: u8 = 8;
+const VERDICT_TIERED_LIMIT: u8 = 9;
 
 impl DdlVerdict {
     fn code(self) -> u8 {
@@ -99,6 +118,10 @@ impl DdlVerdict {
                 TombstoneHeld::Paceable => VERDICT_TOMBSTONE_PACEABLE,
                 TombstoneHeld::Busy => VERDICT_TOMBSTONE_BUSY,
                 TombstoneHeld::Limit => VERDICT_TOMBSTONE_LIMIT,
+            },
+            DdlVerdict::Refused(DdlRefusal::TieredCapacity(held)) => match held {
+                TieredHeld::Busy => VERDICT_TIERED_BUSY,
+                TieredHeld::Limit => VERDICT_TIERED_LIMIT,
             },
         }
     }
@@ -118,6 +141,12 @@ impl DdlVerdict {
             }
             VERDICT_TOMBSTONE_LIMIT => {
                 DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Limit))
+            }
+            VERDICT_TIERED_BUSY => {
+                DdlVerdict::Refused(DdlRefusal::TieredCapacity(TieredHeld::Busy))
+            }
+            VERDICT_TIERED_LIMIT => {
+                DdlVerdict::Refused(DdlRefusal::TieredCapacity(TieredHeld::Limit))
             }
             other => unreachable!("an answered slot holds verdict code {other}"),
         }
@@ -428,6 +457,8 @@ mod tests {
             DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Paceable)),
             DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Busy)),
             DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Limit)),
+            DdlVerdict::Refused(DdlRefusal::TieredCapacity(TieredHeld::Busy)),
+            DdlVerdict::Refused(DdlRefusal::TieredCapacity(TieredHeld::Limit)),
         ] {
             assert_eq!(DdlVerdict::from_code(verdict.code()), verdict);
         }

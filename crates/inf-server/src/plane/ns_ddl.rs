@@ -6,7 +6,8 @@
 //! a notice once its fan is done (ADR-0189 D2, D5).
 
 use inf_store::ddl::{
-    Answer, CreatePersisted, DdlRefusal, DropPersisted, Receipt, Requested, TombstoneHeld,
+    Answer, CreatePersisted, DdlRefusal, DropPersisted, Receipt, Requested, TieredHeld,
+    TombstoneHeld,
 };
 use inf_wire::{Domain, Refusal};
 
@@ -757,7 +758,10 @@ impl Drop for NoticeDue {
 /// tombstone cap's (ADR-0189 D6; ADR-0172 D1) as `CapacityBusy(Catalog)`
 /// while a held slot returns without an operator, a `Paceable` the program
 /// could not pace included, and `LimitReached(Catalog)` once every held
-/// slot waits on one, each counted.
+/// slot waits on one; the tiered lifetime bound's (ADR-0148 D1; ADR-0172 D3)
+/// as `CapacityBusy(TieredNamespace)` while a grant is Retiring and
+/// `LimitReached(TieredNamespace)` once every grant names a live namespace;
+/// each capacity refusal counted.
 fn ddl_refusal_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     control: &ControlHandle,
@@ -775,6 +779,14 @@ fn ddl_refusal_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         DdlRefusal::TombstoneCapacity(TombstoneHeld::Limit) => {
             control.note_capacity_refused(false);
             error_reply(shared, proto, Refusal::LimitReached(Domain::Catalog).render())
+        }
+        DdlRefusal::TieredCapacity(TieredHeld::Busy) => {
+            control.note_tiered_refused(true);
+            error_reply(shared, proto, Refusal::CapacityBusy(Domain::TieredNamespace).render())
+        }
+        DdlRefusal::TieredCapacity(TieredHeld::Limit) => {
+            control.note_tiered_refused(false);
+            error_reply(shared, proto, Refusal::LimitReached(Domain::TieredNamespace).render())
         }
     }
 }
