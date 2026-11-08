@@ -1393,6 +1393,16 @@ fn main() {
         }
         let report = inf_sim::run_cold_storm_scenario(&scenario);
         println!(
+            "inf-sim: m4-cold: {} rounds; a round's most: {} received, {} orphaned, {} \
+             delivered, {} issued ({} by one drain call)",
+            report.rounds.len(),
+            report.round_max(|r| r.received),
+            report.round_max(|r| r.orphaned),
+            report.round_max(|r| r.delivered),
+            report.round_max(|r| r.issued),
+            report.round_max(|r| r.issued_drain_max)
+        );
+        println!(
             "inf-sim: scenario m4-cold seed {seed:#x}: {} gets ({} cold, {} chunked, {} \
              restarts, {} cancelled [{} early / {} late]), {} merged waiters (queue hw {}), \
              {} unlinks ({} deferrals), hash {:#018x}",

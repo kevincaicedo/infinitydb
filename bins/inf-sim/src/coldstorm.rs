@@ -21,6 +21,11 @@
 //! observation points. Custody reconciles to zero at the end. Every
 //! event folds into `trace_hash`; `--verify-determinism` requires
 //! two-run identity (L7).
+//!
+//! Every round records the values the harness received, the members
+//! orphaned at delivery (their waiter gone), the values the host delivered,
+//! and the device reads the drains issued, with the most one drain call
+//! issued: the delivery and preparation work the round did.
 
 use core::cell::RefCell;
 use std::collections::BTreeMap;
@@ -82,9 +87,25 @@ impl ColdStormScenario {
     }
 }
 
+/// One round's delivery and preparation work, read by the harness: the
+/// values it received (its own count, each one polled to `Ready`), the
+/// members the host orphaned at delivery (the round's `unclaimed`), the
+/// values the host delivered (the sum of its receipts' returns), and the
+/// device reads the round's drains issued, with the most one call issued.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoundCounts {
+    pub received: u32,
+    pub orphaned: u32,
+    pub delivered: u32,
+    pub issued: u32,
+    pub issued_drain_max: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct ColdStormReport {
     pub violations: Vec<String>,
+    /// Every round's delivery and preparation work, in order.
+    pub rounds: Vec<RoundCounts>,
     pub gets: u64,
     pub cold_served: u64,
     pub chunked_reads: u64,
@@ -108,6 +129,12 @@ impl ColdStormReport {
     #[must_use]
     pub fn ok(&self) -> bool {
         self.violations.is_empty()
+    }
+
+    /// The largest of one count over the run's rounds.
+    #[must_use]
+    pub fn round_max(&self, count: impl Fn(&RoundCounts) -> u32) -> u32 {
+        self.rounds.iter().map(count).max().unwrap_or(0)
     }
 }
 
@@ -181,6 +208,8 @@ struct World {
     values: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Injected virtual clock (µs), advanced once per round (L7).
     now_us: u64,
+    /// The round's delivery and preparation work so far.
+    counts: RoundCounts,
     report: ColdStormReport,
 }
 
@@ -372,6 +401,7 @@ async fn cold_get(world: Rc<RefCell<World>>, key: Vec<u8>, cancel_roll: u64) -> 
             break;
         }
         let done = wait.await; // ← suspension: plain data only
+        world.borrow_mut().counts.received += 1;
         if let Err(errno) = done.outcome() {
             world
                 .borrow_mut()
@@ -458,6 +488,7 @@ async fn cold_get(world: Rc<RefCell<World>>, key: Vec<u8>, cancel_roll: u64) -> 
                         Plan::Ram(_) => unreachable!("plan_chunk never resolves"),
                     };
                     let done = wait.await;
+                    world.borrow_mut().counts.received += 1;
                     if let Err(errno) = done.outcome() {
                         world.borrow_mut().violation(format!("staging read errno {errno}"));
                         break 'attempt;
@@ -800,13 +831,31 @@ fn pump(world: &mut World, recv_pool: &mut BufferPool) {
     // S10: the drain admits queued intents (merge + QD cap + deficit)
     // into the same submit the eager path always rode.
     let cold = world.cold.clone();
-    cold.drain(|op| world.driver.push(op));
+    let issued = cold.drain(|op| world.driver.push(op));
+    world.counts.issued += issued;
+    world.counts.issued_drain_max = world.counts.issued_drain_max.max(issued);
     let mut out = Vec::new();
     world.driver.submit_and_reap(recv_pool, Wait::Poll, &mut out).expect("sim submit");
     for completion in out {
         assert_eq!(completion.token.class(), TokenClass::TierRead);
-        world.cold.on_completion(completion.token, completion.result, world.now_us);
+        let delivered = world.cold.on_completion(completion.token, completion.result, world.now_us);
+        world.counts.delivered += delivered;
     }
+}
+
+/// Opens the round's counts; returns the host's `unclaimed` so far.
+fn begin_round(world: &mut World) -> u64 {
+    world.counts = RoundCounts::default();
+    world.cold.counters().unclaimed
+}
+
+/// Closes the round's counts: its orphaned members are the `unclaimed`
+/// the host counted since `unclaimed_before`.
+fn end_round(world: &mut World, unclaimed_before: u64) {
+    let orphaned = world.cold.counters().unclaimed - unclaimed_before;
+    world.counts.orphaned = u32::try_from(orphaned).expect("a round's members fit u32");
+    let counts = world.counts;
+    world.report.rounds.push(counts);
 }
 
 /// Runs the scenario once. Deterministic from the seed (L7).
@@ -856,6 +905,7 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
         model: BTreeMap::new(),
         values: BTreeMap::new(),
         now_us: 0,
+        counts: RoundCounts::default(),
         report: ColdStormReport::default(),
     }));
     let mut ex = CellExecutor::new(256);
@@ -867,12 +917,13 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
     while ops < scenario.ops || ex.live_tasks() > 0 {
         round += 1;
         assert!(round < scenario.ops.max(1) * 4, "storm rounds exploded (liveness)");
-        {
+        let unclaimed_before = {
             let mut world = world.borrow_mut();
             world.now_us = round * ROUND_US;
             let now = world.now_us;
             world.report.state.number(b"round-time-us", now);
-        }
+            begin_round(&mut world)
+        };
         // Foreground: new GETs (cold-heavy once files exist).
         if ops < scenario.ops {
             for _ in 0..GETS_PER_ROUND {
@@ -921,6 +972,7 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
             for answer in answers.borrow_mut().drain(..) {
                 verify_answer(world, answer);
             }
+            end_round(world, unclaimed_before);
         }
     }
 
