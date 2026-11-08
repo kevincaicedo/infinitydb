@@ -79,17 +79,19 @@ pub struct RecoveredTier<F: SegmentFs> {
     /// manifested file held, the barrier claim rule — and the counters.
     /// Its `hand_over` is the plane's pipeline and the handles.
     pub replay: TierReplay<F>,
-    /// Blob-extent ids present on disk (names only — no content reads;
-    /// M4-S17, ADR-0061 D6). The caller hands this to
+    /// Blob-extent ids present on disk, in the listing's order (names only
+    /// — no content reads; M4-S17, ADR-0061 D6): no consumer reads an
+    /// order, so none is sorted (on a real filesystem the order is its own,
+    /// hash order on an ext4 htree). The caller hands this to
     /// [`TieredTable::extent_sweep_seed`] **after** checkpoint + tail
     /// replay complete: liveness is decided by the post-replay
     /// refcounts, never by the manifest — the tier-file "unmanifested ⇒
     /// garbage" rule deliberately does not extend to extents.
     pub extents_listed: Vec<u64>,
-    /// `.quarantine`-named extent ids (ADR-0096 D3) — boot orphans a
-    /// previous life renamed instead of unlinking. Handed to the same
-    /// sweep seed; ids the replayed map references come back for
-    /// revival, the rest await their second-verdict unlink.
+    /// `.quarantine`-named extent ids (ADR-0096 D3), in the listing's order
+    /// — boot orphans a previous life renamed instead of unlinking. Handed
+    /// to the same sweep seed; ids the replayed map references come back
+    /// for revival, the rest await their second-verdict unlink.
     pub extents_quarantined: Vec<u64>,
     /// Boot facts.
     pub stats: TierRecoverStats,
@@ -501,13 +503,11 @@ impl<F: SegmentFs> NsTierMap<F> {
             census,
             catalog,
             handles,
-            mut extents_listed,
-            mut extents_quarantined,
+            extents_listed,
+            extents_quarantined,
             stats,
             ..
         } = self;
-        extents_listed.sort_unstable();
-        extents_quarantined.sort_unstable();
         let work = MapWork { ram_units: (catalog.len() as u64).max(1), ..MapWork::default() };
         let next_id = tier.files.iter().map(|f| f.id + 1).max().unwrap_or(0);
         let mut table = TieredTable::new(
