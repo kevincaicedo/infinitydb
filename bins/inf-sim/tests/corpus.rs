@@ -5,8 +5,8 @@
 use inf_sim::{
     BackfillScenario, BootStormScenario, CombinedScenario, DurableScenario, RecoveryScenario,
     Scenario, SidecarScenario, TieredScenario, run_backfill_scenario, run_boot_storm_scenario,
-    run_combined_scenario, run_durable_scenario, run_recovery_scenario, run_scenario,
-    run_sidecar_scenario, run_tiered_scenario,
+    run_combined_scenario, run_durable_scenario, run_ns_drop_window_scenario,
+    run_recovery_scenario, run_scenario, run_sidecar_scenario, run_tiered_scenario,
 };
 
 fn parse_seed(text: &str) -> u64 {
@@ -79,6 +79,19 @@ fn corpus_seeds_replay_green() {
             assert!(
                 report.ok(),
                 "corpus seed {line} regressed: violations={:?}",
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
+        // ADR-0189 D5: one seed per cut class of the namespace-drop window.
+        if name == "m2-ns-drop-window" {
+            let report = run_ns_drop_window_scenario(seed);
+            assert!(
+                report.ok(),
+                "corpus seed {line} ({:?}) regressed: stalled={} violations={:?}",
+                report.cut,
+                report.stalled,
                 report.violations
             );
             ran += 1;

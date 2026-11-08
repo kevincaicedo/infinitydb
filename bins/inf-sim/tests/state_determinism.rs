@@ -28,6 +28,7 @@ fn every_sweep_path_honors_state_verification_for_each_seed() {
         "m4-recovery",
         "m4-tiered",
         "m2-ns-create-window",
+        "m2-ns-drop-window",
         "m2-ns-ddl-race",
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_inf-sim"))

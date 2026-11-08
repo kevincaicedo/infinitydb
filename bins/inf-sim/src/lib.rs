@@ -33,7 +33,8 @@
 //!
 //! - scenarios — device
 //! - ---|---
-//! - `m2-*`, `m3-document`, `m2-combined`, `m4-tiered`, `m2-ns-create-window`, `m2-ns-ddl-race` —
+//! - `m2-*`, `m3-document`, `m2-combined`, `m4-tiered`, `m2-ns-create-window`,
+//!   `m2-ns-drop-window`, `m2-ns-ddl-race` —
 //!   the m2 reference stall device (`durable::m2_stall_config`, writes 8 µs + tail)
 //! - `m45-backfill`, `m45-sidecar`, `boot-storm` — `StallConfig::write_reorder()` — writes off the
 //!   timeline, fsyncs instant
@@ -68,6 +69,7 @@ mod lift;
 pub mod net;
 pub mod nscreate;
 pub mod nsddl;
+pub mod nsdrop;
 pub mod pressure;
 pub mod recovery;
 pub mod resp;
@@ -93,6 +95,7 @@ pub use extent_window::{
 pub use harness::{Scenario, SimReport, run_scenario};
 pub use nscreate::{NsCreateWindowReport, run_ns_create_window_scenario};
 pub use nsddl::{NsDdlRaceReport, run_ns_ddl_race_scenario};
+pub use nsdrop::{DropCut, NsDropWindowReport, run_ns_drop_window_scenario};
 pub use pressure::{PressureReport, PressureScenario, run_pressure_scenario};
 pub use recovery::{
     RecoveryReport, RecoveryScenario, SealCensus, SeedClass, SpecVariant, run_recovery_scenario,
@@ -127,6 +130,7 @@ pub const SCENARIOS: &[&str] = &[
     "m2-recycle",
     "m2-combined",
     "m2-ns-create-window",
+    "m2-ns-drop-window",
     "m2-ns-ddl-race",
     "m3-document",
     "boot-storm",

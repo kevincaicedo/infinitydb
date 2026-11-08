@@ -2509,6 +2509,13 @@ impl Node {
         self.control.recovery_board().all_ready()
     }
 
+    /// Answers at most `requests` queued catalog requests now, whatever
+    /// `hold_inbox` says (the `m2-ns-drop-window` scenario): the writer
+    /// answers the first and holds the next, first in line.
+    pub(crate) fn drain_inbox_requests(&mut self, requests: u32) -> std::io::Result<u32> {
+        self.inbox.drain_requests(&self.disk, &self.data_dir, Some(requests))
+    }
+
     /// Read-only plane access for the M3-S23 equivalence oracle — used
     /// only between scheduler steps (the borrow never crosses one).
     pub(crate) fn plane(&self, cell: usize) -> &SimPlane {
