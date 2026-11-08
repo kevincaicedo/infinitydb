@@ -94,6 +94,7 @@ rows=(
   "m4-diskfull"
   "m4-tiered"
   "m4-ns-lifetimes --verify-determinism"
+  "m4-ns-lifetimes --lifetimes-leg control"
   "m4-tiered --plant tier-read-eio"
   "m4-tiered --replay-above-window --verify-determinism"
   "m4-tier-budget --tier-leg two-8mb --verify-determinism"

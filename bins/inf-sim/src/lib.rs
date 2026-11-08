@@ -97,7 +97,7 @@ pub use harness::{Scenario, SimReport, run_scenario};
 pub use nscreate::{NsCreateWindowReport, run_ns_create_window_scenario};
 pub use nsddl::{NsDdlRaceReport, run_ns_ddl_race_scenario};
 pub use nsdrop::{DropCut, NsDropWindowReport, run_ns_drop_window_scenario};
-pub use nslifetimes::{NsLifetimesReport, run_ns_lifetimes_scenario};
+pub use nslifetimes::{LifetimesLeg, NsLifetimesReport, run_ns_lifetimes_scenario};
 pub use pressure::{PressureReport, PressureScenario, run_pressure_scenario};
 pub use recovery::{
     RecoveryReport, RecoveryScenario, SealCensus, SeedClass, SpecVariant, run_recovery_scenario,

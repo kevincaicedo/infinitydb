@@ -100,6 +100,8 @@ fn main() {
     let mut cold_identity_start: Option<u64> = None;
     // TM3's leg of m2-fill-tick and m2-group-hold: the loops at spin 0.
     let mut park_at_once = false;
+    // m4-ns-lifetimes's leg (the full one when unnamed).
+    let mut lifetimes_leg: Option<inf_sim::LifetimesLeg> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -145,6 +147,15 @@ fn main() {
                 "--lift-regime" => lift_regime = true,
                 "--replay-above-window" => replay_above_window = true,
                 "--park-at-once" => park_at_once = true,
+                "--lifetimes-leg" => {
+                    let name = take("--lifetimes-leg")?;
+                    lifetimes_leg = Some(inf_sim::LifetimesLeg::parse(&name).ok_or_else(|| {
+                        format!(
+                            "unknown lifetimes leg {name}; the legs are {}",
+                            inf_sim::LifetimesLeg::NAMES.join("|")
+                        )
+                    })?);
+                }
                 "--spec-variant" => {
                     spec_variant = Some(match take("--spec-variant")?.as_str() {
                         "ring-top" => SpecVariant::RingTop,
@@ -206,6 +217,7 @@ fn main() {
                          [--spec-variant ring-top|page] [--tier-leg {}] [--marks-leg {}] \
                          [--window-leg {}] [--wedge-leg {}] [--park-at-once] \
                          [--cold-leg {}] [--cold-identity-start N] \
+                         [--lifetimes-leg full|control] \
                          [--cells N] [--connections N] [--commands N] [--wheel-nodes-max N] \
                          [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
@@ -293,6 +305,14 @@ fn main() {
         ("m2-ledger-wedge", Some(_)) | (_, None) => {}
         (other, Some(_)) => {
             eprintln!("inf-sim: --wedge-leg is m2-ledger-wedge's; {other} has no leg");
+            std::process::exit(2);
+        }
+    }
+    // m4-ns-lifetimes runs its full leg unless named, and only it has one.
+    match (scenario_name.as_str(), lifetimes_leg) {
+        ("m4-ns-lifetimes", _) | (_, None) => {}
+        (other, Some(_)) => {
+            eprintln!("inf-sim: --lifetimes-leg is m4-ns-lifetimes's; {other} has no such leg");
             std::process::exit(2);
         }
     }
@@ -1334,7 +1354,8 @@ fn main() {
     // ADR-0148: tiered namespace lifetimes — the limit, the Retiring
     // refusal and its return, the disconnect and the peer refusal, a cut.
     if scenario_name == "m4-ns-lifetimes" {
-        let run_one = |seed: u64| inf_sim::run_ns_lifetimes_scenario(seed);
+        let leg = lifetimes_leg.unwrap_or_default();
+        let run_one = |seed: u64| inf_sim::run_ns_lifetimes_scenario(seed, leg);
         if let Some(sweep) = sweep {
             let (shard_i, shard_k) = shard;
             assert!(shard_k > 0, "--shard I/K wants K > 0");
@@ -1379,10 +1400,13 @@ fn main() {
         }
         let report = run_one(seed);
         println!(
-            "inf-sim: scenario m4-ns-lifetimes seed {seed:#x}: {} cells, {} commands, {} steps, \
-             {} CREATEs accepted, {} refused while a grant was Retiring, {} at the limit, at \
-             most {} ns directories holding open files under a shard, refused leg {}, trace {} \
-             bytes, hash {:#018x}",
+            "inf-sim: scenario m4-ns-lifetimes ({:?} leg) seed {seed:#x}: {} cells, {} commands, \
+             {} steps, {} CREATEs accepted, {} refused while a grant was Retiring, {} at the \
+             limit, at most {} ns directories holding open files under a shard ({} under cell \
+             0's at the limit), drops across held extent I/O {}, cold reads {}, peer rounds {}, \
+             failed unlinks {}, {} churn cycles, {} disconnects, refused leg {}, tombstones {} \
+             settled and {} after the rollback, trace {} bytes, hash {:#018x}",
+            report.leg,
             report.cells,
             report.commands_done,
             report.scheduler_steps,
@@ -1390,7 +1414,16 @@ fn main() {
             report.refused_busy,
             report.refused_limit,
             report.open_dirs_max,
+            report.dirs_at_limit,
+            report.extent_holds_across_drop,
+            report.cold_reads_across_drop,
+            report.rounds_held_across_drop,
+            report.unlink_failures,
+            report.churn_cycles,
+            report.disconnects,
             report.refused_leg,
+            report.tombstones_settled,
+            report.tombstones_after_rollback,
             report.trace.len(),
             report.trace_hash
         );
