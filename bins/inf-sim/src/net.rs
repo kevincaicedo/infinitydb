@@ -321,6 +321,10 @@ pub struct SimDriver {
     /// order: each is submitted at the first driver entry after its hold
     /// lifts, ahead of that entry's own ops.
     held_syncs: Vec<(RawFd, CompletionToken)>,
+    /// Tier reads the disk holds ([`SimDisk::hold_reads`]), submission
+    /// order: each is submitted at the first driver entry after its hold
+    /// lifts, ahead of that entry's own ops.
+    held_reads: Vec<IoOp>,
     /// The fds of the writes and syncs the last `submit_and_reap` carried
     /// from the loop: the device's reading of a park's own submit. One
     /// list, cleared at each submit, its capacity the largest submit's.
@@ -409,6 +413,7 @@ impl SimDriver {
             clock: None,
             pending_syncs: Vec::new(),
             held_syncs: Vec::new(),
+            held_reads: Vec::new(),
             submitted_io: Vec::new(),
             ops: Vec::new(),
             stats: SubmitStats::default(),
@@ -487,6 +492,13 @@ impl SimDriver {
         self.held_syncs.len()
     }
 
+    /// Tier reads the disk holds now ([`SimDisk::hold_reads`]): issued by
+    /// the cell's cold engine and kept from the device until the hold lifts
+    /// — the harness's own reading of a queued read, no product counter.
+    pub fn held_reads(&self) -> usize {
+        self.held_reads.len()
+    }
+
     /// Whether a write or a sync on a file `named` accepts is submitted
     /// and not completed: deferred on the device's timeline, or held by
     /// the disk. Reads do not count. The device's own reading, no product
@@ -532,6 +544,37 @@ fn release_held_syncs(
         }
         held
     });
+    ops.splice(0..0, released);
+}
+
+/// Moves every held tier read whose hold has lifted to the front of `ops`,
+/// in submission order, ahead of the released syncs' turn: a read held
+/// before the drain's own ops is submitted first, as the held syncs are.
+fn release_held_reads(disk: Option<&SimDisk>, held_reads: &mut Vec<IoOp>, ops: &mut Vec<IoOp>) {
+    let Some(disk) = disk else { return };
+    let held = |op: &IoOp| match op {
+        IoOp::TierRead { fd, .. } => disk.read_held(*fd),
+        IoOp::LogWrite { .. }
+        | IoOp::Fdatasync { .. }
+        | IoOp::AcceptArm { .. }
+        | IoOp::RecvArm { .. }
+        | IoOp::RecvDisarm { .. }
+        | IoOp::Send { .. }
+        | IoOp::Close { .. } => false,
+    };
+    if held_reads.iter().all(&held) {
+        return;
+    }
+    let mut released = Vec::new();
+    let mut kept = Vec::with_capacity(held_reads.len());
+    for op in held_reads.drain(..) {
+        if held(&op) {
+            kept.push(op);
+        } else {
+            released.push(op);
+        }
+    }
+    *held_reads = kept;
     ops.splice(0..0, released);
 }
 
@@ -727,6 +770,7 @@ impl BackendDriver for SimDriver {
         // syncs, which needs `self` free of the `ops` borrow.
         let mut ops = core::mem::take(&mut self.ops);
         release_held_syncs(self.disk.as_ref(), &mut self.held_syncs, &mut ops);
+        release_held_reads(self.disk.as_ref(), &mut self.held_reads, &mut ops);
         for op in ops.drain(..) {
             match op {
                 IoOp::AcceptArm { token, .. } => {
@@ -872,6 +916,12 @@ impl BackendDriver for SimDriver {
                         .disk
                         .as_ref()
                         .expect("tiered sim scenarios construct SimDriver::with_disk (M4-S04)");
+                    // A held read reaches the device only once its hold
+                    // lifts: it is observed then, not now.
+                    if disk.read_held(fd) {
+                        self.held_reads.push(IoOp::TierRead { fd, offset, buf, token });
+                        continue;
+                    }
                     self.observed.read_bytes += u64::from(buf.len());
                     self.observed.read_ops += 1;
                     // Bandwidth model (ADR-0088 D8): the read lands at its

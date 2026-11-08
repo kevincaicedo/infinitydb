@@ -785,6 +785,9 @@ struct DiskState {
     /// `Some`: fdatasyncs on files whose name the predicate accepts are
     /// held by the driver until the hold lifts ([`SimDisk::hold_syncs`]).
     hold_syncs: Option<fn(&Path) -> bool>,
+    /// `Some`: tier reads on files whose name the predicate accepts are
+    /// held by the driver until the hold lifts ([`SimDisk::hold_reads`]).
+    hold_reads: Option<fn(&Path) -> bool>,
     /// Listings opened on a present directory (ADR-0202 D5).
     listings_opened: u64,
     /// `next_batch` calls served.
@@ -1063,6 +1066,25 @@ impl SimDisk {
     /// hold lifts. With no hold armed every trace is unchanged.
     pub fn hold_syncs(&self, named: Option<fn(&Path) -> bool>) {
         self.state.borrow_mut().hold_syncs = named;
+    }
+
+    /// Holds every tier read on a file whose OS name `named` accepts until
+    /// the hold is lifted with `None`: a device that keeps one class of read
+    /// in its queue, the driver submitting the op, against the descriptor
+    /// it names, only once the hold lifts. A read whose descriptor closes
+    /// while it is held names no file, so the driver submits it at once and
+    /// the closed descriptor answers `EBADF`. With no hold armed every trace
+    /// is unchanged.
+    pub fn hold_reads(&self, named: Option<fn(&Path) -> bool>) {
+        self.state.borrow_mut().hold_reads = named;
+    }
+
+    /// Whether a tier read on the driver file fd `fd` is held now: a hold is
+    /// armed and its predicate accepts a name of the fd's open inode.
+    #[must_use]
+    pub fn read_held(&self, fd: i32) -> bool {
+        let Some(named) = self.state.borrow().hold_reads else { return false };
+        self.fd_named(fd, named)
     }
 
     /// Whether an fdatasync on the driver file fd `fd` is held now: a hold
@@ -2093,6 +2115,37 @@ mod model_tests {
         assert!(disk.fd_named(blob_fd, is_blob), "an fd names its inode's family");
         assert!(!disk.fd_named(seg_fd, is_blob), "and no other");
         assert!(!disk.fd_named(-1, is_blob), "a fd the model never issued names nothing");
+    }
+
+    /// A read hold names one family by the name behind its fd: held while
+    /// armed, not once lifted, and never on a closed descriptor, whose read
+    /// the driver then submits and the model answers `EBADF`, counted.
+    #[test]
+    fn a_named_family_holds_its_reads_until_the_hold_lifts_or_its_fd_closes() {
+        fn is_tier(name: &Path) -> bool {
+            name.extension().is_some_and(|ext| ext == "itier")
+        }
+        let disk = SimDisk::new();
+        disk.create_dir_all(Path::new("d")).expect("dirs");
+        let tier = disk.create_tier(&Path::new("d").join("tier-1.itier"), TierIoMode::Buffered);
+        let tier = tier.expect("tier");
+        let seg = disk.create_segment(&Path::new("d").join("seg-0.ilog"), 4096).expect("seg");
+        let (tier_fd, seg_fd) = (tier.raw_fd().expect("fd"), seg.raw_fd().expect("fd"));
+        assert!(!disk.read_held(tier_fd), "no hold armed");
+        disk.hold_reads(Some(is_tier));
+        assert!(disk.read_held(tier_fd));
+        assert!(!disk.read_held(seg_fd), "the hold names one family");
+        disk.hold_reads(None);
+        assert!(!disk.read_held(tier_fd), "the hold lifted");
+        disk.hold_reads(Some(is_tier));
+        drop(tier);
+        assert!(!disk.read_held(tier_fd), "a closed descriptor is never held");
+        let mut buf = [0u8; 8];
+        let at = FileOffset::new(0).expect("offset 0");
+        let read = disk.driver_read_at(tier_fd, at, &mut buf);
+        assert_eq!(read.err().and_then(|err| err.raw_os_error()), Some(libc::EBADF));
+        assert_eq!(disk.closed_fd_ops(), 1, "the closed descriptor's read is counted");
+        disk.hold_reads(None);
     }
 
     /// Perf row (L04): the determinism digest hashes the resident image
