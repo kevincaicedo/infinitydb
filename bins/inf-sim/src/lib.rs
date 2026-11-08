@@ -61,10 +61,12 @@ pub mod coldstorm;
 pub mod combined;
 pub mod diskfull;
 mod document;
+pub mod driver;
 pub mod durable;
 pub mod extent_window;
 pub mod harness;
 mod lift;
+pub mod limits;
 #[allow(unsafe_code)]
 pub mod net;
 pub mod nscreate;
