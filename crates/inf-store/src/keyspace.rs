@@ -2235,7 +2235,8 @@ mod tests {
         assert!(node.ns_get(b"ledger").is_some(), "a refused mutator changed nothing");
         let (mut epochs, word) = crate::ns::ddl::CatalogEpochs::new();
         let taken = epochs.take();
-        epochs.answer(taken, None, crate::ns::ddl::DdlVerdict::Accepted);
+        let published = inf_foundation::grants::GrantDirectory::new().1.publish();
+        epochs.answer(taken, None, crate::ns::ddl::DdlVerdict::Accepted, published);
         let receipt = DropPersisted::from_leg(NsId(16), 1, &word).expect("the word covers it");
         assert_eq!(model.ns_drop(&receipt), Err(NsError::Uncataloged));
         assert!(model.ns_get(b"ledger").is_some(), "a refused mutator changed nothing");

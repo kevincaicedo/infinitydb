@@ -129,8 +129,6 @@ impl GrantSlot {
 pub struct GrantDirectory {
     slots: [AtomicU64; POSITIONS],
     generation: AtomicU64,
-    /// The writer half is taken once.
-    writer_taken: AtomicBool,
 }
 
 /// Proof that the directory's stores of one catalog answer are published:
@@ -148,25 +146,17 @@ pub struct DirectoryCursor {
 }
 
 impl GrantDirectory {
-    /// A directory with every position Vacant, generation 0.
+    /// A directory with every position Vacant, generation 0, and its one
+    /// writer, made together so no second writer exists.
     #[must_use]
-    pub fn new() -> Arc<GrantDirectory> {
-        Arc::new(GrantDirectory {
+    pub fn new() -> (Arc<GrantDirectory>, DirectoryWriter) {
+        let directory = Arc::new(GrantDirectory {
             slots: core::array::from_fn(|_| AtomicU64::new(0)),
             generation: AtomicU64::new(0),
-            writer_taken: AtomicBool::new(false),
-        })
-    }
-
-    /// The directory's one writer, the first time it is asked for; `None`
-    /// after.
-    #[must_use]
-    pub fn writer(this: &Arc<Self>) -> Option<DirectoryWriter> {
-        if this.writer_taken.swap(true, Ordering::AcqRel) {
-            return None;
-        }
+        });
         let staged = [None; POSITIONS];
-        Some(DirectoryWriter { directory: Arc::clone(this), staged, staged_count: 0 })
+        let writer = DirectoryWriter { directory: Arc::clone(&directory), staged, staged_count: 0 };
+        (directory, writer)
     }
 
     /// The slot at `pos` now (`Acquire`).
@@ -225,8 +215,9 @@ impl DirectoryWriter {
         &self.directory
     }
 
-    /// Every position, lowest first: the writer's book walks them.
-    pub fn positions(&self) -> impl Iterator<Item = GrantPos> {
+    /// Every position, lowest first: the writer's book walks them. The
+    /// iterator borrows nothing, so the writer may store while it walks.
+    pub fn positions(&self) -> impl Iterator<Item = GrantPos> + use<> {
         (0..POSITIONS).map(GrantPos::at)
     }
 
@@ -385,9 +376,7 @@ mod tests {
     /// and a pass runs only on a generation it has not seen.
     #[test]
     fn a_publish_bumps_the_generation_once_after_its_stores() {
-        let directory = GrantDirectory::new();
-        let mut writer = GrantDirectory::writer(&directory).expect("the first writer");
-        assert!(GrantDirectory::writer(&directory).is_none(), "one writer a directory");
+        let (directory, mut writer) = GrantDirectory::new();
         let pos = writer.positions().next().expect("position 0");
         writer.reserve(pos, 16);
         assert_eq!(directory.slot(pos), GrantSlot::Reserved(16));
@@ -423,8 +412,7 @@ mod tests {
         let second = ReceiptBoard::writer(&board, 1).expect("cell 1's writer");
         assert!(ReceiptBoard::writer(&board, 0).is_none(), "one writer a cell");
         assert!(ReceiptBoard::writer(&board, 2).is_none(), "no cell 2");
-        let directory = GrantDirectory::new();
-        let writer = GrantDirectory::writer(&directory).expect("writer");
+        let (_directory, writer) = GrantDirectory::new();
         let pos = writer.positions().nth(3).expect("position 3");
         assert!(!board.all_name(pos, 16), "no receipt yet");
         first.publish(pos, 16);
@@ -456,8 +444,7 @@ mod loom_tests {
     #[test]
     fn loom_a_pass_that_sees_the_generation_sees_the_retiring() {
         loom::model(|| {
-            let directory = GrantDirectory::new();
-            let mut writer = GrantDirectory::writer(&directory).expect("writer");
+            let (directory, mut writer) = GrantDirectory::new();
             let pos = writer.positions().nth(1).expect("position 1");
             writer.reserve(pos, 16);
             writer.stage_declared(pos, 16);
@@ -498,12 +485,8 @@ mod loom_tests {
     fn loom_a_reclaim_that_reads_every_receipt_reads_every_end() {
         loom::model(|| {
             let board = ReceiptBoard::new(2);
-            let directory = GrantDirectory::new();
-            let pos = GrantDirectory::writer(&directory)
-                .expect("writer")
-                .positions()
-                .nth(2)
-                .expect("position 2");
+            let (_directory, writer) = GrantDirectory::new();
+            let pos = writer.positions().nth(2).expect("position 2");
             let ended = Arc::new([AtomicU32::new(0), AtomicU32::new(0)]);
             let cells: Vec<_> = (0..2u16)
                 .map(|cell| {
@@ -538,8 +521,7 @@ mod loom_tests {
         loom::model(|| {
             let board = ReceiptBoard::new(1);
             let receipts = ReceiptBoard::writer(&board, 0).expect("cell 0");
-            let directory = GrantDirectory::new();
-            let mut writer = GrantDirectory::writer(&directory).expect("writer");
+            let (directory, mut writer) = GrantDirectory::new();
             let pos = writer.positions().next().expect("position 0");
             receipts.publish(pos, 16);
             let reuse = thread::spawn(move || {

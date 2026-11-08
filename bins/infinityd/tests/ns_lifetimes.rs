@@ -191,9 +191,6 @@ fn line(c: &mut TcpStream, parts: &[&[u8]]) -> String {
 /// with the 64 before it accepted: a node holds at most 64 tiered
 /// namespace lifetimes.
 #[test]
-#[ignore = "a node admits tiered namespaces without a lifetime bound, so the 65th tiered CREATE \
-            answers +OK; red until a node holds at most 64 tiered namespace lifetimes and the \
-            next tiered CREATE is refused with the limit's typed reply"]
 fn the_sixty_fifth_tiered_create_is_refused_at_the_limit() {
     let dir = data_root("limit");
     let mut server = start(&dir);
@@ -331,8 +328,9 @@ fn boot_refused(dir: &Path) -> (std::process::ExitStatus, String) {
 /// The boot boundary (ADR-0148 D5, A1.2) at 63, 64 and 65 live tiered
 /// definitions, each catalog with two drop tombstones and their residue on
 /// disk: 63 and 64 boot and serve every definition, the tombstones taking
-/// no lifetime; 65 is refused before any cell, exit 1, the error naming the
-/// count and the limit. A catalog whose counter is not past a live id is
+/// no lifetime, and the booted book has room for one more tiered `CREATE`
+/// at 63 and none at 64; 65 is refused before any cell, exit 1, the error
+/// naming the count and the limit. A catalog whose counter is not past a live id is
 /// refused the same way (the counter check every boot's load runs).
 #[test]
 fn a_boot_serves_at_most_sixty_four_live_tiered_definitions() {
@@ -345,9 +343,14 @@ fn a_boot_serves_at_most_sixty_four_live_tiered_definitions() {
         let mut c = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
         c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
         let used = line(&mut c, &[b"INF.NS", b"USE", last.as_bytes()]);
+        let parts: [&[u8]; 7] =
+            [b"INF.NS", b"CREATE", b"one-more", b"MODE", b"durable", b"MEM-BUDGET", b"3mb"];
+        let created = line(&mut c, &parts);
         drop(c);
         let status = server.stop();
         assert_eq!(used, "+OK\r\n", "{live} live tiered definitions serve their last, {last}");
+        let room = if live == 63 { "+OK\r\n" } else { "-ERR tiered namespace limit reached\r\n" };
+        assert_eq!(created, room, "the booted book holds {live} grants, the tombstones none");
         assert!(status.success(), "the node of {live} stopped gracefully: {status}");
     }
     seed_tiered_catalog(&dir, LIFETIMES_MAX as u32 + 1);

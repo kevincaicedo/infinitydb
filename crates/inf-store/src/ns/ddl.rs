@@ -29,6 +29,7 @@ use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use inf_foundation::grants::DirectoryPublished;
 use inf_log::NsId;
 
 use crate::ns::NsSpec;
@@ -233,8 +234,17 @@ impl CatalogEpochs {
     /// Answers the request `taken` numbered: its slot first, when it has
     /// one, then the word, each with Release, so a reader woken by the
     /// word's edge reads its slot. An `Accepted` answer is given only after
-    /// the request's `META` write returned.
-    pub fn answer(&mut self, taken: TakenEpoch, slot: Option<AnswerSlot>, verdict: DdlVerdict) {
+    /// the request's `META` write returned. `published` is the tiered grant
+    /// directory's publish of this answer's stores (ADR-0148 D2): made
+    /// before the word, so a cell that reads an epoch reads the directory
+    /// that goes with it.
+    pub fn answer(
+        &mut self,
+        taken: TakenEpoch,
+        slot: Option<AnswerSlot>,
+        verdict: DdlVerdict,
+        _published: DirectoryPublished,
+    ) {
         debug_assert_eq!(taken.0, self.last, "requests are answered in the order they are taken");
         if let Some(AnswerSlot(slot)) = slot {
             slot.verdict.store(verdict.code(), Ordering::Relaxed);
@@ -392,6 +402,11 @@ impl<R: Receipt> Requested<R> {
 mod tests {
     use super::*;
 
+    /// A directory publish with nothing staged: the token every answer takes.
+    fn published() -> DirectoryPublished {
+        inf_foundation::grants::GrantDirectory::new().1.publish()
+    }
+
     /// A token reads its own slot and nothing else: a later request's
     /// answer moves the word past an unanswered earlier one without
     /// answering it, and each answer carries its own epoch and verdict.
@@ -407,7 +422,7 @@ mod tests {
         // The writer dequeues the second request first: queue order.
         let taken = epochs.take();
         assert_eq!(taken.get(), 1);
-        epochs.answer(taken, Some(second_slot), DdlVerdict::Accepted);
+        epochs.answer(taken, Some(second_slot), DdlVerdict::Accepted, published());
         let receipt = match second.answer(&word) {
             Answer::Accepted(receipt) => receipt,
             Answer::Pending(_) | Answer::Refused(_) => panic!("the answered token is accepted"),
@@ -419,14 +434,19 @@ mod tests {
         };
         // A request with no slot (the readiness persist) moves the word.
         let taken = epochs.take();
-        epochs.answer(taken, None, DdlVerdict::Accepted);
+        epochs.answer(taken, None, DdlVerdict::Accepted, published());
         assert!(word.covers(2));
         let first = match first.answer(&word) {
             Answer::Pending(token) => token,
             Answer::Refused(_) | Answer::Accepted(_) => panic!("still not its answer"),
         };
         let taken = epochs.take();
-        epochs.answer(taken, Some(first_slot), DdlVerdict::Refused(DdlRefusal::NameExists));
+        epochs.answer(
+            taken,
+            Some(first_slot),
+            DdlVerdict::Refused(DdlRefusal::NameExists),
+            published(),
+        );
         assert!(matches!(first.answer(&word), Answer::Refused(DdlRefusal::NameExists)));
         assert_eq!(word.load(), 3, "the word is the highest answered epoch");
     }
@@ -439,7 +459,7 @@ mod tests {
         let early = DropPersisted::from_leg(ns, 1, &word).err();
         assert_eq!(early, Some(NotDurable { epoch: 1, word: 0 }), "the word is below the epoch");
         let taken = epochs.take();
-        epochs.answer(taken, None, DdlVerdict::Accepted);
+        epochs.answer(taken, None, DdlVerdict::Accepted, published());
         let receipt = DropPersisted::from_leg(ns, 1, &word).expect("the word covers epoch 1");
         assert_eq!((receipt.id(), receipt.fan_epoch()), (ns, 1));
         assert!(DropPersisted::from_leg(ns, 2, &word).is_err(), "an epoch past the word");
