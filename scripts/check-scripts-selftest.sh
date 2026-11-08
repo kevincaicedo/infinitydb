@@ -24,6 +24,10 @@
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR/.."
+# The cases build fixture checkouts of their own, so none inherits the root the
+# justfile exports for this checkout, which every other checkout's helper
+# refuses (ADR-0204 D1); a case that needs CARGO_TARGET_DIR sets it itself.
+unset CARGO_TARGET_DIR
 # shellcheck source=selftest-lib.sh
 . "$SCRIPT_DIR/selftest-lib.sh"
 
@@ -2396,11 +2400,20 @@ rt_own="$(cd "$root" && pwd -P)/target/lint-ratchet-$rt_key"
 expect green "lint-ratchet: both passes name <root>/target/lint-ratchet-<key>, CARGO_TARGET_DIR unset" \
     rt_calls_ok "$root.calls" "$rt_own"
 rt_target="$work/rt-target"
-rt_call_run "$RATCHET" "$root" "$rt_target" >/dev/null 2>&1 || true
-expect green "lint-ratchet: set, both passes name \$CARGO_TARGET_DIR/checkout-<key>/lint-ratchet-<key>" \
-    rt_calls_ok "$root.calls" "$rt_target/checkout-$rt_key/lint-ratchet-$rt_key"
+rt_refused() { # <gate> <CARGO_TARGET_DIR>: the gate stops on the helper's refusal, before cargo
+    local status=0
+    rt_call_run "$1" "$root" "$2" >"$work/rt-refused" 2>&1 || status=$?
+    [ "$status" -ne 0 ] && [ ! -s "$root.calls" ] && grep -q 'LINT-RATCHET SCOPE ERROR' "$work/rt-refused" &&
+        grep -q "CARGO_TARGET_DIR is '$2'" "$work/rt-refused" && return 0
+    echo "exit $status:"
+    cat "$work/rt-refused"
+    [ ! -s "$root.calls" ] || { echo "cargo ran:"; cat "$root.calls"; }
+    return 1
+}
+expect green "lint-ratchet: a CARGO_TARGET_DIR naming another directory stops it before cargo" \
+    rt_refused "$RATCHET" "$rt_target"
 rt_mutant() { # <name> <sed expression> <CARGO_TARGET_DIR or ''> <what the copy does>
-    local dir="$work/rt-gate-$1" want=$rt_own
+    local dir="$work/rt-gate-$1"
     rm -rf "${dir:?}"
     mkdir -p "$dir"
     cp "$SCRIPT_DIR/lint_scope_table.py" "$SCRIPT_DIR/target-root.sh" "$dir/"
@@ -2410,17 +2423,20 @@ rt_mutant() { # <name> <sed expression> <CARGO_TARGET_DIR or ''> <what the copy 
         echo "selftest: the lint-ratchet mutant '$1' changed nothing" >&2
         exit 2
     fi
-    [ -z "$3" ] || want="$3/checkout-$rt_key/lint-ratchet-$rt_key"
-    rt_call_run "$dir/check-lint-ratchet.sh" "$root" "$3" >/dev/null 2>&1 || true
-    expect red "lint-ratchet: the calls' check is red on a gate that $4" rt_calls_ok "$root.calls" "$want"
+    if [ -n "$3" ]; then
+        expect red "lint-ratchet: the refusal's check is red on a gate that $4" \
+            rt_refused "$dir/check-lint-ratchet.sh" "$3"
+        return
+    fi
+    rt_call_run "$dir/check-lint-ratchet.sh" "$root" >/dev/null 2>&1 || true
+    expect red "lint-ratchet: the calls' check is red on a gate that $4" rt_calls_ok "$root.calls" "$rt_own"
 }
 RT_KEPT='^    TARGET_DIR=$(target_root_kept lint-ratchet)$'
 rt_mutant shared "s|$RT_KEPT|    TARGET_DIR=\$TARGET_ROOT|" '' "shares the recipe's target directory"
-rt_mutant raw "s|$RT_KEPT|    TARGET_DIR=\"\${CARGO_TARGET_DIR:-target}/lint-ratchet-\$TARGET_ROOT_KEY\"|" \
-    "$rt_target" "reads CARGO_TARGET_DIR itself"
+RT_SETUP='^    target_root_setup "$(pwd -P)" ||$'
+rt_mutant raw "s#$RT_SETUP#    true ||#;s|$RT_KEPT|    TARGET_DIR=\"\${CARGO_TARGET_DIR:-target}/lint-ratchet\"|" \
+    "$rt_target" "skips the helper and reads CARGO_TARGET_DIR itself"
 rt_mutant unkeyed "s|$RT_KEPT|    TARGET_DIR=\"\$TARGET_ROOT/lint-ratchet\"|" '' "keeps an unkeyed directory"
-rt_mutant fixed "s|$RT_KEPT|    TARGET_DIR=\"target/lint-ratchet-\$TARGET_ROOT_KEY\"|" "$rt_target" \
-    "ignores CARGO_TARGET_DIR"
 rt_mutant second 's|^            --target-dir "$TARGET_DIR" -- $LINTS$|            -- $LINTS|' \
     '' "drops the simulator pass's --target-dir"
 rt_mutant first 's|^            --target-dir "$TARGET_DIR" -- $LINTS &&$|            -- $LINTS \&\&|' \
@@ -4533,9 +4549,9 @@ expect_red_because "fuzz-targets: a probe knob that is neither on nor off" "is '
 # The call: every workspace's cargo call carries the flags the verdict rests
 # on, with RUSTFLAGS replaced and CARGO_ENCODED_RUSTFLAGS unset whatever the
 # caller set, and the gate's own target directory, `fuzz-check-<key>` under
-# the checkout's target root, read with the variable unset and set: never the
-# root's target itself, whose RUSTFLAGS differ, never another checkout's, and
-# never under the tree when the caller has moved its target elsewhere.
+# the checkout's target root, read with the variable unset: never the root's
+# target itself, whose RUSTFLAGS differ, and never another checkout's; a
+# variable naming another directory stops the gate before cargo (below).
 fz_calls_ok() { # <stub dir> <the target directory every call must name>
     python3 - "$1/calls" "$2" <<'PY'
 import sys
@@ -4583,14 +4599,22 @@ expect green "fuzz-targets: green under a caller's RUSTFLAGS and CARGO_ENCODED_R
     fz_argv_run "$FUZZ" "$root"
 expect green "fuzz-targets: each workspace's call carries the gate's flags and environment" \
     fz_calls_ok "$root.stub" "$FZ_OWN"
-# A caller's target root outside the tree, as a second worktree building into
-# the first checkout's target has: the gate builds under it, not in the tree.
+# A caller's CARGO_TARGET_DIR naming another directory, as a second worktree
+# building into the first checkout's target has: the gate stops before cargo.
 FZ_CALLER_TARGET="$work/fz-caller-target"
-rm -f "${root:?}.stub/calls"
-expect green "fuzz-targets: green with CARGO_TARGET_DIR set" \
-    fz_argv_run "$FUZZ" "$root" "$FZ_CALLER_TARGET"
-expect green "fuzz-targets: set, each call names \$CARGO_TARGET_DIR/checkout-<key>/fuzz-check-<key>" \
-    fz_calls_ok "$root.stub" "$FZ_CALLER_TARGET/checkout-$FZ_KEY/fuzz-check-$FZ_KEY"
+fz_refused() { # <gate> <root> <CARGO_TARGET_DIR>: a scope error on the helper's refusal, no call
+    local status=0
+    rm -f "${2:?}.stub/calls"
+    fz_argv_run "$1" "$2" "$3" >"$work/fz-refused" 2>&1 || status=$?
+    [ "$status" -ne 0 ] && [ ! -s "$2.stub/calls" ] && grep -q 'FUZZ-TARGETS SCOPE ERROR' "$work/fz-refused" &&
+        grep -q "CARGO_TARGET_DIR is '$3'" "$work/fz-refused" && return 0
+    echo "exit $status:"
+    cat "$work/fz-refused"
+    [ ! -s "$2.stub/calls" ] || { echo "cargo ran:"; cat "$2.stub/calls"; }
+    return 1
+}
+expect green "fuzz-targets: a CARGO_TARGET_DIR naming another directory stops it before cargo" \
+    fz_refused "$FUZZ" "$root" "$FZ_CALLER_TARGET"
 # The call's canaries: a copy of the gate with one part of its call changed
 # turns the case red. Each copy runs on the argv root, its calls cleared,
 # with CARGO_TARGET_DIR unset or set to the fourth argument.
@@ -4608,9 +4632,13 @@ fz_mutant() { # <name> <sed expression> <what the copy does> [<CARGO_TARGET_DIR>
         echo "selftest: the fuzz-targets mutant '$1' changed nothing" >&2
         exit 2
     fi
+    if [ -n "${4:-}" ]; then
+        expect red "fuzz-targets: the refusal's check is red on a gate that $3" \
+            fz_refused "$dir/check-fuzz-targets.sh" "$FZ_MROOT" "$4"
+        return
+    fi
     rm -f "${FZ_MROOT:?}.stub/calls"
-    [ -z "${4:-}" ] || want="$4/checkout-$FZ_KEY/fuzz-check-$FZ_KEY"
-    fz_argv_run "$dir/check-fuzz-targets.sh" "$FZ_MROOT" "${4:-}" >/dev/null 2>&1 || true
+    fz_argv_run "$dir/check-fuzz-targets.sh" "$FZ_MROOT" >/dev/null 2>&1 || true
     expect red "fuzz-targets: the call's check is red on a gate that $3" \
         fz_calls_ok "$FZ_MROOT.stub" "$want"
 }
@@ -4621,11 +4649,10 @@ fz_mutant format 's/"--message-format", "json",/"--message-format", "short",/' "
 fz_mutant color 's/^        "--color", "never"\]$/        ]/' "drops --color never"
 FZ_KEPT='^    INF_FUZZ_TARGET_DIR=$(target_root_kept fuzz-check)$'
 fz_mutant target-dir "s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\$TARGET_ROOT|" "shares the root's target directory"
-fz_mutant raw "s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\"\${CARGO_TARGET_DIR:-target}/fuzz-check-\$TARGET_ROOT_KEY\"|" \
-    "reads CARGO_TARGET_DIR itself" "$FZ_CALLER_TARGET"
+FZ_SETUP='^    target_root_setup "$(pwd -P)" ||$'
+fz_mutant raw "s#$FZ_SETUP#    true ||#;s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\"\${CARGO_TARGET_DIR:-target}/fuzz-check\"|" \
+    "skips the helper and reads CARGO_TARGET_DIR itself" "$FZ_CALLER_TARGET"
 fz_mutant unkeyed "s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\"\$TARGET_ROOT/fuzz-check\"|" "keeps an unkeyed directory"
-fz_mutant fixed "s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\"target/fuzz-check-\$TARGET_ROOT_KEY\"|" \
-    "ignores CARGO_TARGET_DIR" "$FZ_CALLER_TARGET"
 fz_mutant warnings 's/^RUSTFLAGS = "-D warnings --cfg fuzzing"$/RUSTFLAGS = "--cfg fuzzing"/' "drops -D warnings"
 fz_mutant cfg 's/^RUSTFLAGS = "-D warnings --cfg fuzzing"$/RUSTFLAGS = "-D warnings"/' "drops --cfg fuzzing"
 fz_mutant encoded 's/ if k != "CARGO_ENCODED_RUSTFLAGS"}/}/' "keeps the caller's CARGO_ENCODED_RUSTFLAGS"
@@ -5857,16 +5884,17 @@ expect green "deny: a red census runs no leg" dr_red_census
 
 # ------------------------------------------------------------- target root
 group_target_root() {
-# ADR-0198 A2: scripts/target-root.sh on fixture checkouts, each holding a
+# ADR-0204 D1: scripts/target-root.sh on fixture checkouts, each holding a
 # copy of the helper under scripts/. A stub cargo first on PATH records each
-# call and answers `cargo metadata` as TR_META says (its `clean` removes the
-# one directory it names, under the work root only); the config case runs the
-# pinned cargo itself. The key's oracle is fx_root_key. Paths hold a space, so
-# a printed command that splits a path is red.
+# call and answers `cargo metadata` as TR_META says, from the directory it
+# runs in (its `clean` removes the one directory it names, under the work
+# root only); the config cases run the pinned cargo itself. The key's oracle
+# is fx_root_key. Paths hold a space, so a printed command that splits a path
+# is red. Each case runs the sourced helper in a process of its own: the root
+# it sets is read-only in the shell that set it.
 TRW="$work/tr"
 TR_BIN="$TRW/bin"
-TR_ARGV="$TRW/argv-bin"
-mkdir -p "$TR_BIN" "$TR_ARGV"
+mkdir -p "$TR_BIN"
 IFS= read -r -d '' body <<'EOF' || true
 #!/usr/bin/env bash
 # The stub cargo: records each call, answers metadata, and `clean --target-dir
@@ -5879,7 +5907,7 @@ set -eu
 } >>"$TR_CALLS"
 case "$1" in
 metadata)
-    t=${CARGO_TARGET_DIR:-}
+    t="$(pwd -P)/target"
     case "${TR_META:-same}" in
     same) printf '{"target_directory":"%s","build_directory":"%s"}\n' "$t" "$t" ;;
     missing) printf '{"target_directory":"%s"}\n' "$t" ;;
@@ -5895,29 +5923,31 @@ clean)
 esac
 EOF
 printf '%s' "$body" >"$TR_BIN/cargo"
-# The stubs a printed line runs on: each records its argv, one word a field.
-printf '%s\n' '#!/usr/bin/env bash' '{ printf "%s" "${0##*/}"; printf "\t%s" "$@"; printf "\n"; } >>"$TR_ARGV_LOG"' \
-    >"$TR_ARGV/du"
-cp "$TR_ARGV/du" "$TR_ARGV/rm"
-chmod +x "$TR_BIN/cargo" "$TR_ARGV/du" "$TR_ARGV/rm"
+chmod +x "$TR_BIN/cargo"
 tr_checkout() { # <dir>: a fixture checkout holding the helper
     mkdir -p "$1/scripts"
     cp "$SCRIPT_DIR/target-root.sh" "$1/scripts/target-root.sh"
 }
 tr_phys() { (cd "$1" && pwd -P); }
 tr_key() { fx_root_key "$1"; }
-# tr_print <checkout> <CARGO_TARGET_DIR, or - for unset>: the export, stdout
-# to $TRW/out, stderr to $TRW/err, the stub's calls to $TRW/calls.
-tr_print() {
+# tr_entry <checkout> <CARGO_TARGET_DIR, or - for unset> <--print|--clean>
+# [<VAR=value>…]: an entry, stdout to $TRW/out, stderr to $TRW/err, the
+# stub's calls to $TRW/calls; the last arguments are set in its environment.
+tr_entry() {
+    local dir=$1 var=$2 how=$3
+    shift 3
     : >"$TRW/calls"
-    if [ "$2" = - ]; then
-        env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR PATH="$TR_BIN:$PATH" TR_CALLS="$TRW/calls" \
-            TR_WORK="$TRW" "$1/scripts/target-root.sh" --print >"$TRW/out" 2>"$TRW/err"
+    if [ "$var" = - ]; then
+        env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET PATH="$TR_BIN:$PATH" \
+            TR_CALLS="$TRW/calls" TR_WORK="$TRW" "$@" "$dir/scripts/target-root.sh" "$how" \
+            >"$TRW/out" 2>"$TRW/err"
     else
-        env -u CARGO_BUILD_BUILD_DIR CARGO_TARGET_DIR="$2" PATH="$TR_BIN:$PATH" TR_CALLS="$TRW/calls" \
-            TR_WORK="$TRW" "$1/scripts/target-root.sh" --print >"$TRW/out" 2>"$TRW/err"
+        env -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET CARGO_TARGET_DIR="$var" PATH="$TR_BIN:$PATH" \
+            TR_CALLS="$TRW/calls" TR_WORK="$TRW" "$@" "$dir/scripts/target-root.sh" "$how" \
+            >"$TRW/out" 2>"$TRW/err"
     fi
 }
+tr_print() { local dir=$1 var=$2; shift 2; tr_entry "$dir" "$var" --print "$@"; }
 tr_prints() { # <checkout> <var or -> <root>: exit 0, stdout exactly the root
     local status=0
     tr_print "$1" "$2" || status=$?
@@ -5926,24 +5956,50 @@ tr_prints() { # <checkout> <var or -> <root>: exit 0, stdout exactly the root
     cat "$TRW/out" "$TRW/err"
     return 1
 }
-tr_refused() { # <checkout> <var or -> <pattern>: exit 2, nothing on stdout, the reason on stderr
-    local status=0
-    tr_print "$1" "$2" || status=$?
-    [ "$status" -eq 2 ] && [ ! -s "$TRW/out" ] && grep -q -- "$3" "$TRW/err" && return 0
-    echo "exit $status, want 2 naming '$3':"
+# tr_refused <checkout> <var or -> <pattern> [<VAR=value>…]: exit 2, nothing
+# on stdout, the reason on stderr.
+tr_refused() {
+    local dir=$1 var=$2 pattern=$3 status=0
+    shift 3
+    tr_print "$dir" "$var" "$@" || status=$?
+    [ "$status" -eq 2 ] && [ ! -s "$TRW/out" ] && grep -q -- "$pattern" "$TRW/err" && return 0
+    echo "exit $status, want 2 naming '$pattern':"
     cat "$TRW/out" "$TRW/err"
     return 1
 }
-# tr_setup <checkout> <var or -> <line>: the sourced helper's key (1), physical
-# checkout (2) or root (3).
+# tr_setup <checkout> <var or -> <line> [<VAR=value>…]: the sourced helper's
+# key (1), physical checkout (2), root (3) or exported CARGO_TARGET_DIR (4),
+# in a shell of its own.
 tr_setup() {
-    local script='. "$1/scripts/target-root.sh" && target_root_setup "$1" &&
-printf "%s\n%s\n%s\n" "$TARGET_ROOT_KEY" "$TARGET_ROOT_CHECKOUT" "$TARGET_ROOT"'
-    if [ "$2" = - ]; then
-        env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR bash -c "$script" sh "$1" | sed -n "$3p"
+    local dir=$1 var=$2 line=$3 script='. "$1/scripts/target-root.sh" && target_root_setup "$1" &&
+printf "%s\n%s\n%s\n" "$TARGET_ROOT_KEY" "$TARGET_ROOT_CHECKOUT" "$TARGET_ROOT" && sh -c "echo \"\$CARGO_TARGET_DIR\""'
+    shift 3
+    if [ "$var" = - ]; then
+        env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET "$@" \
+            bash -c "$script" sh "$dir" | sed -n "${line}p"
     else
-        env -u CARGO_BUILD_BUILD_DIR CARGO_TARGET_DIR="$2" bash -c "$script" sh "$1" | sed -n "$3p"
+        env -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET CARGO_TARGET_DIR="$var" "$@" \
+            bash -c "$script" sh "$dir" | sed -n "${line}p"
     fi
+}
+# tr_setup_refused <checkout> <var or -> <pattern> [<VAR=value>…]: setup
+# returns 2 with the reason, in a shell of its own.
+tr_setup_refused() {
+    local dir=$1 var=$2 pattern=$3 status=0
+    shift 3
+    if [ "$var" = - ]; then
+        env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET "$@" \
+            bash -c '. "$1/scripts/target-root.sh" && target_root_setup "$1"' sh "$dir" \
+            >"$TRW/out" 2>"$TRW/err" || status=$?
+    else
+        env -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET CARGO_TARGET_DIR="$var" "$@" \
+            bash -c '. "$1/scripts/target-root.sh" && target_root_setup "$1"' sh "$dir" \
+            >"$TRW/out" 2>"$TRW/err" || status=$?
+    fi
+    [ "$status" -eq 2 ] && grep -q -- "$pattern" "$TRW/err" && return 0
+    echo "setup exit $status, want 2 naming '$pattern':"
+    cat "$TRW/out" "$TRW/err"
+    return 1
 }
 tr_is() { # <want> <command…>: the command prints exactly the wanted line
     local want=$1 got
@@ -5958,7 +6014,6 @@ tr_checkout "$TR_B"
 ln -s "$TR_A" "$TRW/link"
 TR_PA=$(tr_phys "$TR_A")
 TR_KA=$(tr_key "$TR_A")
-TR_KB=$(tr_key "$TR_B")
 TR_V="$TRW/shared root"
 # The key and the root, sourced.
 expect green "target-root: the key is 16 hex digits of SHA-256 of the physical path (a space in it)" \
@@ -5969,6 +6024,8 @@ expect green "target-root: a symlinked checkout's path is its physical one" \
     tr_is "$TR_PA" tr_setup "$TRW/link" - 2
 expect green "target-root: unset, the root is the checkout's target" \
     tr_is "$TR_PA/target" tr_setup "$TR_A" - 3
+expect green "target-root: setup exports CARGO_TARGET_DIR as the root" \
+    tr_is "$TR_PA/target" tr_setup "$TR_A" - 4
 expect green "target-root: an empty CARGO_TARGET_DIR counts as unset" \
     tr_is "$TR_PA/target" tr_setup "$TR_A" '' 3
 expect green "target-root: a variable naming the checkout's target is that target" \
@@ -5977,60 +6034,108 @@ expect green "target-root: a relative variable is read from the checkout's root"
     tr_is "$TR_PA/target" tr_setup "$TR_A" target 3
 expect green "target-root: the checkout's target named through a symlink is that target" \
     tr_is "$TR_PA/target" tr_setup "$TR_A" "$TRW/link/target" 3
-expect green "target-root: another variable holds a root a checkout, checkout-<key>" \
-    tr_is "$TR_V/checkout-$TR_KA" tr_setup "$TR_A" "$TR_V" 3
-expect green "target-root: a variable whose leaf is this checkout's checkout-<key> is the root" \
-    tr_is "$TR_V/checkout-$TR_KA" tr_setup "$TR_A" "$TR_V/checkout-$TR_KA" 3
-expect green "target-root: a relative variable elsewhere holds the root under the checkout" \
-    tr_is "$TR_PA/out/x/checkout-$TR_KA" tr_setup "$TR_A" out/x 3
-tr_kept() { # <checkout> <var or -> <name>
-    local script='. "$1/scripts/target-root.sh" && target_root_setup "$1" && target_root_kept "$2"'
-    if [ "$2" = - ]; then
-        env -u CARGO_TARGET_DIR bash -c "$script" sh "$1" "$3"
-    else
-        env CARGO_TARGET_DIR="$2" bash -c "$script" sh "$1" "$3"
-    fi
+expect green "target-root: setup refuses a CARGO_TARGET_DIR naming another directory" \
+    tr_setup_refused "$TR_A" "$TR_V" "CARGO_TARGET_DIR is '$TR_V', not this checkout's target $TR_PA/target"
+expect green "target-root: setup refuses a relative CARGO_TARGET_DIR naming another directory" \
+    tr_setup_refused "$TR_A" out/x "CARGO_TARGET_DIR is 'out/x', not this checkout's target"
+expect green "target-root: --print refuses a CARGO_TARGET_DIR naming another directory, before cargo" \
+    tr_refused "$TR_A" "$TR_V" "Unset it for this checkout (env -u CARGO_TARGET_DIR just check)"
+expect green "target-root: that refusal ran no cargo and wrote nothing" \
+    sh -c '[ ! -s "$1" ] && [ ! -e "$2" ]' sh "$TRW/calls" "$TR_A/target"
+tr_readonly() { # the root and the export are read-only in the shell that set them
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET bash -c '
+. "$1/scripts/target-root.sh" && target_root_setup "$1" || exit 1
+for v in TARGET_ROOT TARGET_ROOT_KEY TARGET_ROOT_CHECKOUT CARGO_TARGET_DIR; do
+    if (eval "$v=x") 2>/dev/null; then echo "$v is writable"; exit 1; fi
+done
+target_root_setup "$1" || { echo "a second setup of the same checkout refused"; exit 1; }' sh "$TR_A"
+}
+expect green "target-root: setup's root, key, checkout and CARGO_TARGET_DIR are read-only" tr_readonly
+tr_second_other() { # a second setup in one shell refuses another checkout's root
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET bash -c '
+. "$1/scripts/target-root.sh" && target_root_setup "$1" && target_root_setup "$2"' sh "$TR_A" "$TR_B"
+}
+expect_red_because "target-root: a second setup in one shell refuses another checkout's root" \
+    "CARGO_TARGET_DIR is '$TR_PA/target', not this checkout's target" tr_second_other
+tr_kept() { # <checkout> <name>
+    env -u CARGO_TARGET_DIR bash -c '. "$1/scripts/target-root.sh" && target_root_setup "$1" &&
+target_root_kept "$2"' sh "$1" "$2"
 }
 expect green "target-root: the fuzz gate's kept directory is <root>/fuzz-check-<key>" \
-    tr_is "$TR_PA/target/fuzz-check-$TR_KA" tr_kept "$TR_A" - fuzz-check
-expect green "target-root: the ratchet's kept directory under a set variable is keyed too" \
-    tr_is "$TR_V/checkout-$TR_KA/lint-ratchet-$TR_KA" tr_kept "$TR_A" "$TR_V" lint-ratchet
+    tr_is "$TR_PA/target/fuzz-check-$TR_KA" tr_kept "$TR_A" fuzz-check
+expect green "target-root: the ratchet's kept directory is <root>/lint-ratchet-<key>" \
+    tr_is "$TR_PA/target/lint-ratchet-$TR_KA" tr_kept "$TR_A" lint-ratchet
 expect_red_because "target-root: a kept directory the list does not name is refused" \
-    "is not a kept directory" tr_kept "$TR_A" - target
-tr_build_dir_sourced() {
-    env CARGO_BUILD_BUILD_DIR="$TRW/bd" bash -c '. "$1/scripts/target-root.sh" && target_root_setup "$1"' \
-        sh "$TR_A"
-}
-expect_red_because "target-root: a set CARGO_BUILD_BUILD_DIR is refused where a gate sources it" \
-    "CARGO_BUILD_BUILD_DIR is set" tr_build_dir_sourced
-tr_build_dir_print() {
-    local status=0
-    : >"$TRW/calls"
-    env -u CARGO_TARGET_DIR CARGO_BUILD_BUILD_DIR="$TRW/bd" PATH="$TR_BIN:$PATH" TR_CALLS="$TRW/calls" \
-        TR_WORK="$TRW" "$TR_A/scripts/target-root.sh" --print >"$TRW/out" 2>"$TRW/err" || status=$?
-    [ "$status" -eq 2 ] && [ ! -s "$TRW/out" ] && [ ! -s "$TRW/calls" ] && [ ! -e "$TR_A/target" ] &&
-        grep -q 'CARGO_BUILD_BUILD_DIR is set' "$TRW/err" && ! grep -q 'cargo clean' "$TRW/err"
-}
-expect green "target-root: --print under CARGO_BUILD_BUILD_DIR exits 2 before cargo, writing nothing" \
-    tr_build_dir_print
+    "is not a kept directory" tr_kept "$TR_A" target
+# Check 1: settings read without cargo, in setup and --print.
+for tr_var in CARGO_BUILD_BUILD_DIR CARGO_BUILD_TARGET; do
+    expect green "target-root: setup refuses a set $tr_var" \
+        tr_setup_refused "$TR_A" - "$tr_var is set" "$tr_var=x86_64-unknown-linux-gnu"
+    expect green "target-root: setup refuses $tr_var set empty" \
+        tr_setup_refused "$TR_A" - "$tr_var is set ('')" "$tr_var="
+    tr_set_print() { # <variable>: --print exits 2 before cargo, writing nothing
+        tr_refused "$TR_A" - "$1 is set" "$1=x86_64-unknown-linux-gnu" && [ ! -s "$TRW/calls" ] &&
+            [ ! -e "$TR_A/target" ] && ! grep -q 'cargo clean' "$TRW/err"
+    }
+    expect green "target-root: --print under $tr_var exits 2 before cargo, writing nothing" \
+        tr_set_print "$tr_var"
+done
+TR_CFG="$TRW/configured"
+tr_checkout "$TR_CFG"
+mkdir -p "$TR_CFG/.cargo"
+printf '[build]\ntarget = "x86_64-unknown-linux-gnu"\n' >"$TR_CFG/.cargo/config.toml"
+expect green "target-root: setup refuses a cargo config's build.target" \
+    tr_setup_refused "$TR_CFG" - "$(tr_phys "$TR_CFG")/.cargo/config.toml sets build.target"
+expect green "target-root: --print refuses a cargo config's build.target, before cargo" \
+    tr_refused "$TR_CFG" - "sets build.target ('x86_64-unknown-linux-gnu')"
+rm -rf "${TR_CFG:?}/.cargo"
+# Checks 3 and 4: a link or a file at the root; a checkout inside a root.
+TR_LN="$TRW/linked"
+tr_checkout "$TR_LN"
+mkdir -p "$TRW/elsewhere"
+ln -s "$TRW/elsewhere" "$TR_LN/target"
+expect green "target-root: a link at the root is refused" \
+    tr_refused "$TR_LN" - "$(tr_phys "$TR_LN")/target is a link (to $TRW/elsewhere)"
+expect green "target-root: setup refuses a link at the root" \
+    tr_setup_refused "$TR_LN" - "is a link"
+TR_FILE="$TRW/file-root"
+tr_checkout "$TR_FILE"
+: >"$TR_FILE/target"
+expect green "target-root: a root that is a file is refused" \
+    tr_refused "$TR_FILE" - "target exists and is not a directory"
+TR_IN="$TR_PA/target/inner"
+mkdir -p "$TR_PA/target"
+: >"$TR_A/Cargo.toml"
+tr_checkout "$TR_IN"
+expect green "target-root: a checkout inside another checkout's target is refused" \
+    tr_refused "$TR_IN" - "lies at or under $TR_PA/target, a target directory beside"
+rm -rf "${TR_PA:?}/target" "${TR_A:?}/Cargo.toml"
+TR_MK="$TRW/marked root"
+mkdir -p "$TR_MK"
+printf '%s\n' "$TRW/gone" >"$TR_MK/.checkout-path"
+tr_checkout "$TR_MK/co"
+expect green "target-root: a checkout inside a directory holding a marker is refused" \
+    tr_setup_refused "$TR_MK/co" - "lies at or under $TR_MK, a target root (it holds .checkout-path)"
 expect_red_because "target-root: --print alone is the command" "usage: scripts/target-root.sh --print" \
     "$TR_A/scripts/target-root.sh"
 # --print: the marker.
-tr_first() { # an absent root is made, marked, tagged and printed; cargo asked once, at the root
+tr_first() { # an absent root is made, marked, tagged and printed; cargo asked once, unset
     tr_prints "$TR_A" - "$TR_PA/target" || return 1
     [ "$(cat "$TR_A/target/.checkout-path")" = "$TR_PA" ] || { echo "marker"; return 1; }
     [ "$(head -n 1 "$TR_A/target/CACHEDIR.TAG")" = "Signature: 8a477f597d28d172789f06886806bc55" ] ||
         { echo "tag"; return 1; }
-    [ "$(cat "$TRW/calls")" = "$(printf 'call\tmetadata\t--no-deps\t--offline\t--format-version\t1\tCARGO_TARGET_DIR=%s' "$TR_PA/target")" ] ||
+    [ "$(cat "$TRW/calls")" = "$(printf 'call\tmetadata\t--no-deps\t--offline\t--format-version\t1\tCARGO_TARGET_DIR=<unset>')" ] ||
         { echo "calls:"; cat "$TRW/calls"; return 1; }
 }
 expect green "target-root: an absent root is marked with the physical path, tagged and printed" tr_first
 tr_again() {
-    tr_prints "$TR_A" - "$TR_PA/target" || return 1
+    tr_prints "$TR_A" "$TR_PA/target" "$TR_PA/target" || return 1
     [ "$(ls -A "$TR_A/target" | tr '\n' ' ')" = ".checkout-path CACHEDIR.TAG " ] ||
         { ls -A "$TR_A/target"; return 1; }
+    [ "$(cat "$TRW/calls")" = "$(printf 'call\tmetadata\t--no-deps\t--offline\t--format-version\t1\tCARGO_TARGET_DIR=<unset>')" ] ||
+        { echo "calls (cargo metadata runs with CARGO_TARGET_DIR removed):"; cat "$TRW/calls"; return 1; }
 }
-expect green "target-root: a root marked for this checkout is printed, nothing else written" tr_again
+expect green "target-root: a root marked for this checkout is printed, the variable removed for cargo" tr_again
 tr_kept_only() {
     local dir="$TRW/kept-only"
     tr_checkout "$dir"
@@ -6047,6 +6152,22 @@ mkdir -p "$TR_OUT/target/debug"
 expect green "target-root: outputs with no marker are refused, naming the root's own clean" \
     tr_refused "$TR_OUT" - "cargo clean --target-dir $TR_OUT/target && ./scripts/target-root.sh --print"
 expect green "target-root: a refused root gets no marker" test ! -e "$TR_OUT/target/.checkout-path"
+tr_clean_line() { # the refusal's printed command, run as printed: one path to cargo, then marked
+    local line
+    tr_print "$TR_OUT" - && return 1
+    line=$(sed -n 's/^    \(cd .* && cargo clean .*\)$/\1/p' "$TRW/err")
+    [ -n "$line" ] || { echo "no printed clean line"; cat "$TRW/err"; return 1; }
+    : >"$TRW/calls"
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET PATH="$TR_BIN:$PATH" \
+        TR_CALLS="$TRW/calls" TR_WORK="$TRW" bash -c "$line" >"$TRW/out" 2>"$TRW/err" ||
+        { cat "$TRW/err"; return 1; }
+    [ "$(sed -n 1p "$TRW/calls")" = "$(printf 'call\tclean\t--target-dir\t%s\tCARGO_TARGET_DIR=<unset>' "$TR_OUT/target")" ] ||
+        { echo "cargo's argv:"; cat "$TRW/calls"; return 1; }
+    [ "$(cat "$TRW/out")" = "$TR_OUT/target" ] && [ ! -e "$TR_OUT/target/debug" ] &&
+        [ "$(cat "$TR_OUT/target/.checkout-path")" = "$(tr_phys "$TR_OUT")" ]
+}
+expect green "target-root: the printed clean gets one path, its root, and the next --print marks it" \
+    tr_clean_line
 TR_OK="$TRW/other-key"
 tr_checkout "$TR_OK"
 mkdir -p "$TR_OK/target/fuzz-check-0123456789abcdef"
@@ -6058,102 +6179,56 @@ expect green "target-root: a checkout copied with its target is refused, naming 
 mv "$TRW/copy" "$TRW/moved"
 expect green "target-root: a checkout moved with its target is refused" \
     tr_refused "$TRW/moved" - "a checkout copied or moved with its target"
-# Two checkouts on one variable, a refusal there, its printed clean run, and
-# the dead roots listed beside them.
-expect green "target-root: on one variable the first checkout's root is checkout-<its key>" \
-    tr_prints "$TR_A" "$TR_V" "$TR_V/checkout-$TR_KA"
-expect green "target-root: on one variable the second checkout's root is its own" \
-    tr_prints "$TR_B" "$TR_V" "$TR_V/checkout-$TR_KB"
-expect green "target-root: each root on the variable is marked for its own checkout" \
-    tr_is "$(tr_phys "$TR_B")" cat "$TR_V/checkout-$TR_KB/.checkout-path"
-TR_C="$TRW/co c"
-tr_checkout "$TR_C"
-TR_KC=$(tr_key "$TR_C")
-mkdir -p "$TR_V/checkout-$TR_KC/debug"
-expect green "target-root: under the variable an unmarked root with outputs is refused, naming it" \
-    tr_refused "$TR_C" "$TR_V" "cargo clean --target-dir '$TR_V/checkout-$TR_KC'"
-tr_clean_line() { # the refusal's printed command, run as printed: one path to cargo, then marked
-    local line
-    tr_print "$TR_C" "$TR_V" && return 1
-    line=$(sed -n 's/^    \(cd .* && cargo clean .*\)$/\1/p' "$TRW/err")
-    [ -n "$line" ] || { echo "no printed clean line"; cat "$TRW/err"; return 1; }
-    : >"$TRW/calls"
-    env -u CARGO_BUILD_BUILD_DIR CARGO_TARGET_DIR="$TR_V" PATH="$TR_BIN:$PATH" TR_CALLS="$TRW/calls" \
-        TR_WORK="$TRW" bash -c "$line" >"$TRW/out" 2>"$TRW/err" || { cat "$TRW/err"; return 1; }
-    [ "$(sed -n 1p "$TRW/calls")" = "$(printf 'call\tclean\t--target-dir\t%s\tCARGO_TARGET_DIR=%s' "$TR_V/checkout-$TR_KC" "$TR_V")" ] ||
-        { echo "cargo's argv:"; cat "$TRW/calls"; return 1; }
-    [ "$(cat "$TRW/out")" = "$TR_V/checkout-$TR_KC" ] && [ ! -e "$TR_V/checkout-$TR_KC/debug" ] &&
-        [ -f "$TR_V/checkout-$TR_KA/.checkout-path" ] && [ -f "$TR_V/checkout-$TR_KB/.checkout-path" ]
-}
-expect green "target-root: the printed clean gets one path, its root, and the next --print marks it" \
-    tr_clean_line
-mkdir -p "$TR_V/checkout-nomarker/debug" "$TR_V/checkout-gone" "$TRW/gone"
-printf '%s\n' "$TRW/gone" >"$TR_V/checkout-gone/.checkout-path"
-rm -rf "${TRW:?}/gone"
-tr_dead() {
-    tr_prints "$TR_A" "$TR_V" "$TR_V/checkout-$TR_KA" || return 1
-    grep -q "the root $TR_V/checkout-gone was made for $TRW/gone, which is gone" "$TRW/err" &&
-        grep -q "the root $TR_V/checkout-nomarker has no marker" "$TRW/err" &&
-        ! grep -q "checkout-$TR_KB" "$TRW/err" && [ -d "$TR_V/checkout-nomarker/debug" ] ||
-        { cat "$TRW/err"; return 1; }
-}
-expect green "target-root: dead and unmarked roots beside it are listed, a live one is not, none removed" \
-    tr_dead
-tr_dead_lines() { # each printed du and rm line gets one argument: its dead root
-    local line
-    tr_print "$TR_A" "$TR_V" || return 1
-    : >"$TRW/argv"
-    sed -n 's/^    \(du -sh .*\)$/\1/p; s/^    \(rm -rf .*\)$/\1/p' "$TRW/err" >"$TRW/lines"
-    [ "$(grep -c . "$TRW/lines")" -eq 4 ] || { cat "$TRW/err"; return 1; }
-    while IFS= read -r line; do
-        env PATH="$TR_ARGV:$PATH" TR_ARGV_LOG="$TRW/argv" bash -c "$line" || return 1
-    done <"$TRW/lines"
-    [ "$(sort "$TRW/argv")" = "$(printf 'du\t-sh\t%s\ndu\t-sh\t%s\nrm\t-rf\t%s\nrm\t-rf\t%s' \
-        "$TR_V/checkout-gone" "$TR_V/checkout-nomarker" "$TR_V/checkout-gone" "$TR_V/checkout-nomarker")" ] ||
-        { echo "argv:"; cat "$TRW/argv"; return 1; }
-}
-expect green "target-root: each printed du and rm line runs on one path, its dead root" tr_dead_lines
-# --print: where cargo says the builds land.
+# --print: where cargo says the builds land, the variable removed.
 TR_M="$TRW/meta"
 tr_checkout "$TR_M"
 tr_meta() { # <TR_META> <pattern>: refused before any marker or clean
-    TR_META=$1 tr_refused "$TR_M" - "$2" && [ ! -e "$TR_M/target" ] && ! grep -q 'cargo clean' "$TRW/err"
+    tr_refused "$TR_M" - "$2" TR_META="$1" && [ ! -e "$TR_M/target" ] && ! grep -q 'cargo clean' "$TRW/err"
 }
 expect green "target-root: a metadata reply without build_directory is refused" \
     tr_meta missing "names no target or build directory as a path"
 expect green "target-root: a build_directory that is no path is refused" \
     tr_meta number "names no target or build directory as a path"
-expect green "target-root: a build directory apart from the target is refused, naming both and the config" \
-    tr_meta split "cargo's build directory is $TRW/bd, not its target directory $(tr_phys "$TR_M")/target: a cargo config file's build-dir"
+expect green "target-root: a build directory apart from the root is refused, naming it and the settings" \
+    tr_meta split "cargo's build directory is $TRW/bd, not this checkout's target $(tr_phys "$TR_M")/target: a cargo config's build.target-dir or build-dir"
 expect green "target-root: a target directory other than the root is refused" \
-    tr_meta elsewhere "cargo's target directory is $TRW/td, not this checkout's root"
+    tr_meta elsewhere "cargo's target directory is $TRW/td, not this checkout's target"
 expect green "target-root: a failing cargo metadata is refused with its message" \
     tr_meta fail "failed to parse manifest"
-# The pinned cargo itself: a config's build-dir moves the build directory.
+# The pinned cargo itself: a config's build-dir, and CARGO_BUILD_TARGET_DIR.
 TR_CF="$TRW/config"
 tr_checkout "$TR_CF"
 mkdir -p "$TR_CF/src" "$TR_CF/.cargo"
 printf '[package]\nname = "tr-config"\nversion = "0.0.0"\nedition = "2021"\n\n[workspace]\n' >"$TR_CF/Cargo.toml"
 printf 'fn main() {}\n' >"$TR_CF/src/main.rs"
 cp rust-toolchain.toml "$TR_CF/rust-toolchain.toml"
-tr_real() { # --print on the real cargo: <want status>
-    local status=0
-    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR "$TR_CF/scripts/target-root.sh" --print \
-        >"$TRW/out" 2>"$TRW/err" || status=$?
-    [ "$status" -eq "$1" ] || { echo "exit $status, want $1"; cat "$TRW/out" "$TRW/err"; return 1; }
+tr_real() { # --print on the real cargo: <want status> [<VAR=value>…]
+    local want=$1 status=0
+    shift
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET "$@" \
+        "$TR_CF/scripts/target-root.sh" --print >"$TRW/out" 2>"$TRW/err" || status=$?
+    [ "$status" -eq "$want" ] || { echo "exit $status, want $want"; cat "$TRW/out" "$TRW/err"; return 1; }
 }
 tr_real_config() {
     printf '[build]\nbuild-dir = "bd"\n' >"$TR_CF/.cargo/config.toml"
     tr_real 2 && [ ! -s "$TRW/out" ] && [ ! -e "$TR_CF/target" ] &&
-        grep -q "cargo's build directory is $(tr_phys "$TR_CF")/bd" "$TRW/err"
+        grep -q "cargo's build directory is $(tr_phys "$TR_CF")/bd" "$TRW/err" &&
+        grep -q "Read here: $(tr_phys "$TR_CF")/.cargo/config.toml" "$TRW/err"
 }
-expect green "target-root: on the pinned cargo a config's build-dir is refused, nothing written" \
+expect green "target-root: on the pinned cargo a config's build-dir is refused, naming the file" \
     tr_real_config
-tr_real_plain() {
+tr_real_build_target_dir() {
     rm -f "$TR_CF/.cargo/config.toml"
+    tr_real 2 CARGO_BUILD_TARGET_DIR="$TRW/btd" && [ ! -e "$TR_CF/target" ] &&
+        grep -q "cargo's target directory is $TRW/btd" "$TRW/err" &&
+        grep -q "Read here: CARGO_BUILD_TARGET_DIR='$TRW/btd'" "$TRW/err"
+}
+expect green "target-root: on the pinned cargo CARGO_BUILD_TARGET_DIR is refused, naming it" \
+    tr_real_build_target_dir
+tr_real_plain() {
     tr_real 0 && [ "$(cat "$TRW/out")" = "$(tr_phys "$TR_CF")/target" ]
 }
-expect green "target-root: on the pinned cargo, no build-dir, the root is printed (the control)" tr_real_plain
+expect green "target-root: on the pinned cargo, nothing set, the root is printed (the control)" tr_real_plain
 # The helper's canaries: a copy with one rule removed fails its case.
 tr_mutant() { # <name> <sed expression> <case function> <what the copy does>
     local dir="$TRW/mutant-$1"
@@ -6175,8 +6250,9 @@ tr_outputs_case() { # <helper dir>: outputs with no marker are refused
     mkdir -p "$1/target/debug"
     tr_refused "$1" - "but no marker naming this checkout"
 }
-tr_split_case() { TR_META=split tr_refused "$1" - "cargo's build directory is"; }
-tr_kept_case() { tr_is "$(tr_phys "$1")/target/fuzz-check-$(tr_key "$1")" tr_kept "$1" - fuzz-check; }
+tr_split_case() { tr_refused "$1" - "cargo's build directory is" TR_META=split; }
+tr_kept_case() { tr_is "$(tr_phys "$1")/target/fuzz-check-$(tr_key "$1")" tr_kept "$1" fuzz-check; }
+tr_variable_case() { tr_refused "$1" "$TR_V" "CARGO_TARGET_DIR is"; }
 tr_control() { # <name> <case function>: the case is green on the helper as it is
     local dir="$TRW/control-$1"
     tr_checkout "$dir"
@@ -6186,12 +6262,15 @@ tr_control marker tr_copy_case
 tr_control outputs tr_outputs_case
 tr_control build-dir tr_split_case
 tr_control unkeyed tr_kept_case
+tr_control variable tr_variable_case
 tr_mutant marker 's/if writer != phys + "\\n":/if False:/' tr_copy_case "skips the marker's checkout"
 tr_mutant outputs 's/^        if others:$/        if False:/' tr_outputs_case "stamps a root holding outputs"
-tr_mutant build-dir 's/^if os.path.realpath(build) != os.path.realpath(target):$/if False:/' tr_split_case \
+tr_mutant build-dir 's/^    if os.path.realpath(path) != os.path.realpath(root):$/    if False:/' tr_split_case \
     "skips the build directory"
 tr_mutant unkeyed 's|"$TARGET_ROOT/$1-$TARGET_ROOT_KEY"|"$TARGET_ROOT/$1"|' tr_kept_case \
     "keeps an unkeyed directory"
+tr_mutant variable 's/^    if named != os.path.realpath(root):$/    if False:/' tr_variable_case \
+    "follows a CARGO_TARGET_DIR naming another directory"
 }
 
 # -------------------------------------------------------- target root scan

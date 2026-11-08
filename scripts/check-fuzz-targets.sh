@@ -21,16 +21,17 @@
 # with RUSTFLAGS="-D warnings --cfg fuzzing" in place of the caller's and
 # CARGO_ENCODED_RUSTFLAGS unset (cargo ranks it above RUSTFLAGS), on the
 # toolchain rust-toolchain.toml pins. The target directory is the gate's
-# own, kept warm, under this checkout's target root: scripts/target-root.sh
-# computes both from the checkout's path and CARGO_TARGET_DIR (ADR-0198 A2),
-# and the gate reads the variable only through it. It is never the root
+# own, kept warm, under this checkout's target root, <checkout>/target:
+# scripts/target-root.sh computes both from the checkout's path and stops the
+# gate, a scope error before cargo runs, on any setting that would move that
+# root (ADR-0204 D1), so the gate reads none itself. It is never the root
 # workspace's target: the gate's RUSTFLAGS differ, so a shared target would
 # rebuild every shared unit at each switch. It is never another checkout's:
 # cargo reads a unit another checkout wrote as fresh, and three targets reach
 # production code only by #[path], whose included files cargo names by the
 # writer's path, so a shared or copied directory would pass a target that
-# does not compile. CARGO_TARGET_DIR says only where outputs land; it
-# selects no target and skips no probe. cargo-fuzz sets cfg(fuzzing) by
+# does not compile. A CARGO_TARGET_DIR naming this checkout's target is no
+# knob: it selects no target and skips no probe. cargo-fuzz sets cfg(fuzzing) by
 # default, so every arm a fuzz build compiles is compiled here; the root
 # workspace compiles the other arm. No build-script knob is set, so
 # libfuzzer-sys's build script compiles libFuzzer's C++ runtime: the gate

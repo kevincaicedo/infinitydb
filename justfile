@@ -1,9 +1,11 @@
 # InfinityDB workspace tasks. Run from infinitydb/ (the published repo root).
 
-# Every recipe builds in this checkout's own target root (ADR-0198 A2): cargo
-# reads another checkout's outputs as fresh, so scripts/target-root.sh refuses
-# a root a copied or moved checkout carries, or one holding outputs no marker
-# names, before any recipe runs.
+# Every recipe builds in this checkout's own target (ADR-0204 D1): cargo reads
+# another checkout's outputs as fresh, and a moved root or a target triple
+# leaves a path into target/<profile> naming an older build, so before any
+# recipe runs scripts/target-root.sh refuses each setting that moves the root,
+# a root a copied or moved checkout carries, and one holding outputs no marker
+# names.
 export CARGO_TARGET_DIR := `./scripts/target-root.sh --print`
 
 default: check
