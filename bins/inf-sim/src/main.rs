@@ -15,7 +15,8 @@
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
 )]
 
-use inf_sim::coldstorm::{COLD_IDENTITY_PAIRS, ColdLeg};
+use inf_runtime::limits::COLD_IDENTITY_PAIRS_MAX;
+use inf_sim::coldstorm::ColdLeg;
 use inf_sim::driver::{self, Exit, Fold, Shard, Sweep, Verify};
 use inf_sim::net::Plant;
 use inf_sim::{
@@ -150,7 +151,7 @@ fn main() {
                 }
                 "--cold-identity-start" => {
                     let start = parse_seed(&take("--cold-identity-start")?)?;
-                    if start >= COLD_IDENTITY_PAIRS {
+                    if start >= COLD_IDENTITY_PAIRS_MAX {
                         return Err(format!(
                             "--cold-identity-start {start:#x}: a pair position below 2^55"
                         ));

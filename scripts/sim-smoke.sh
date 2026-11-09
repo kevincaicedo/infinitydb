@@ -116,6 +116,9 @@ rows=(
   "m4-extent-window --window-leg cold --verify-determinism"
   "m45-backfill"
   "m45-sidecar"
+  # m4-cold's identity leg: the cold-read host's issuer placed 32 pairs before
+  # the end of its 2^55, so the space runs out inside the run (ADR-0181 R4).
+  "m4-cold --cold-leg identity --cold-identity-start 0x7fffffffffffe0 --verify-determinism"
 )
 
 ran=0

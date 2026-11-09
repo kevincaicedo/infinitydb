@@ -401,7 +401,10 @@ pub static DECLARED: &[Declared] = &[
          every cell has checkpointed past retire, it waits for one node-wide checkpoint when \
          that would ready them, and when every held slot waits on an operator or a restart it \
          answers `-ERR catalog limit reached` before any effect (ADR-0189 D6, ADR-0172 \
-         `LimitReached`)",
+         `LimitReached`). A cell's cold-read host issues each tiered read one identity pair, at \
+         most 2^55 in the host's life; past that every read that must reach the tier file \
+         answers `-ERR cold-read identity space exhausted` before any effect, and the reads \
+         admitted before still answer (ADR-0181 R4, ADR-0172 `IdentityExhausted`)",
     ),
     d(
         "INF.CKPT",

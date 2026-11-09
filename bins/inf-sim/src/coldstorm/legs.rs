@@ -16,8 +16,8 @@ use inf_log::TierIoMode;
 use inf_log::fs::sim::{DeviceFault, SimDisk, SimFile};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_runtime::{
-    BackendDriver, ColdDone, ColdReadConfig, ColdReads, ColdRefused, ColdWait, RawFd, ReadClass,
-    TierFileId, TokenClass, Wait,
+    BackendDriver, ColdDone, ColdReadConfig, ColdReads, ColdRefused, ColdWait, PairIssuer, RawFd,
+    ReadClass, TierFileId, TokenClass, Wait,
 };
 
 use super::{ColdLeg, ColdStormReport, ColdStormScenario, RoundCounts};
@@ -106,6 +106,9 @@ struct Fixture {
     cancel_after_issue: bool,
     /// This round's pumps leave the receipts in the device.
     receipts_held: bool,
+    /// Requests the host refused for a spent identity space: never offered
+    /// again, the refusal being permanent.
+    identity_refused: u64,
     report: ColdStormReport,
 }
 
@@ -116,8 +119,15 @@ impl Fixture {
         let disk = SimDisk::new();
         disk.create_dir_all(Path::new(LEG_DIR)).expect("the legs' directory");
         let net = CellNet::new(0, scenario.seed ^ 0xD15C, Plant::None);
+        // The identity leg places its issuer where `--cold-identity-start`
+        // says; every other leg's starts at pair 0.
+        let issuer = scenario
+            .identity_start
+            .map_or(Some(PairIssuer::new()), PairIssuer::starting_at)
+            .expect("the identity start is a pair position the command line checked");
+        let pool = AlignedPool::new(DEPTH, BUFFER_BYTES);
         Fixture {
-            cold: ColdReads::with_config(AlignedPool::new(DEPTH, BUFFER_BYTES), config),
+            cold: ColdReads::with_issuer(pool, config, issuer),
             driver: SimDriver::with_disk(net, disk.clone()),
             disk,
             recv_pool: BufferPool::new(2, 4096),
@@ -130,6 +140,7 @@ impl Fixture {
             errors_expected: false,
             cancel_after_issue: false,
             receipts_held: false,
+            identity_refused: 0,
             report: ColdStormReport { leg: scenario.leg, ..ColdStormReport::default() },
         }
     }
@@ -171,6 +182,7 @@ impl Fixture {
                     .violations
                     .push(format!("a leg's request is unrepresentable: {read:?}"));
             }
+            Err(ColdRefused::IdentityExhausted) => self.identity_refused += 1,
         }
     }
 
@@ -464,8 +476,10 @@ fn errors(fx: &mut Fixture, seed: u64) {
 }
 
 /// Reads across the point where the issuer's identities run out, set by
-/// `--cold-identity-start`, the first read held to the end. The host here
-/// has no issuer position to set, so the leg reads `VACUOUS`.
+/// `--cold-identity-start`, the first read held to the end: once the space is
+/// spent every request is refused `IdentityExhausted`, for good, and every
+/// request admitted before is answered (custody and answers are `finish`'s).
+/// A run whose requests all fit the space left reads `VACUOUS`.
 fn identity(fx: &mut Fixture, scenario: &ColdStormScenario) {
     const REQUESTS: usize = DEPTH;
     let start = scenario.identity_start.expect("the identity leg names its start");
@@ -474,9 +488,20 @@ fn identity(fx: &mut Fixture, scenario: &ColdStormScenario) {
     fx.round([kept]);
     fx.round((1..REQUESTS).map(|file| at(first + file, 0, 64)));
     fx.report.trace_hash = hash64(&start.to_le_bytes(), fx.report.trace_hash);
-    fx.vacuous(format!(
-        "the host has no issuer position to set at {start:#x}, so no identity runs out in the run"
-    ));
+    let left = inf_runtime::limits::COLD_IDENTITY_PAIRS_MAX - start;
+    let refused = fx.identity_refused;
+    let admitted = REQUESTS as u64 - refused;
+    if refused == 0 {
+        fx.vacuous(format!(
+            "{REQUESTS} requests fit the {left} pair(s) left at {start:#x}: no identity ran out"
+        ));
+    } else if fx.cold.identity_refusals() != refused || admitted != left.min(REQUESTS as u64) {
+        fx.report.violations.push(format!(
+            "identity: {refused} refusal(s) seen, the host counted {}; {admitted} admitted \
+             where {left} pair(s) were left",
+            fx.cold.identity_refusals()
+        ));
+    }
 }
 
 /// A stop's shape: 100 values held over four windows; then 60 singletons

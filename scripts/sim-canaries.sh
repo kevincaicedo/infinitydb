@@ -919,6 +919,9 @@ rows=(
   # refuses its repeated audit, which the planted gather serves.
   "inf_canary_json_gather_unaccounted crate-test inf-server test:node_e2e every_split_json_row_is_charged_whole_in_a_numbered_database reply mismatch"
   "inf_canary_json_gather_unaccounted m3-document REPLY"
+  # ADR-0181 R4: a cold-read host mints each identity pair once and never returns one; planted,
+  # a cancelled request's pair returns to the issuer, so the next request repeats its ids.
+  "inf_canary_cold_identity_recycled crate-test inf-runtime lib every_identity_the_issuer_mints_is_fresh_and_typed_by_parity an id repeats"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

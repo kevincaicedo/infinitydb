@@ -135,11 +135,6 @@ impl ColdLeg {
     }
 }
 
-/// The issuer's identity space, the bound `--cold-identity-start` is
-/// checked against: 2^55 pairs, a pair's logical id `2n` and device id
-/// `2n + 1` in the 56-bit `TierRead` token payload.
-pub const COLD_IDENTITY_PAIRS: u64 = 1 << 55;
-
 /// Scenario knobs. `ops` counts every GET + mutation (the AC's 10⁶-op
 /// run sets it explicitly; sim-smoke runs a lighter default) and sizes the
 /// storm alone: every other leg's shape is fixed.
@@ -149,7 +144,8 @@ pub struct ColdStormScenario {
     pub ops: u64,
     pub leg: ColdLeg,
     /// The `identity` leg's issuer position, a pair index below
-    /// [`COLD_IDENTITY_PAIRS`]; no other leg takes one.
+    /// [`COLD_IDENTITY_PAIRS_MAX`](inf_runtime::limits::COLD_IDENTITY_PAIRS_MAX);
+    /// no other leg takes one.
     pub identity_start: Option<u64>,
 }
 
@@ -410,12 +406,16 @@ fn plan_chunk(world: &Rc<RefCell<World>>, addr: u64, done: usize, remaining: usi
 /// A refused enqueue's plan: a full queue is backpressure (retry next
 /// round); an unrepresentable read is permanent, and no generator here
 /// plans a position above 2^49, so it is a corruption the storm reports
-/// (ADR-0167 D3).
+/// (ADR-0167 D3); and the storm's issuer starts at pair 0, so a spent
+/// identity space is one too.
 fn refused_plan(refused: inf_runtime::ColdRefused) -> Plan {
     match refused {
         inf_runtime::ColdRefused::QueueFull => Plan::Dry,
         inf_runtime::ColdRefused::Unrepresentable(read) => {
             Plan::Corrupt(format!("enqueue refused an unrepresentable read: {read:?}"))
+        }
+        inf_runtime::ColdRefused::IdentityExhausted => {
+            Plan::Corrupt("enqueue refused a spent identity space from pair 0".into())
         }
     }
 }
@@ -1150,18 +1150,18 @@ fn verify_answer(world: &mut World, answer: GetAnswer) {
 mod tests {
     use super::*;
 
-    /// Every fixed leg runs its shape at one seed. Each but the identity
-    /// and stop legs engages it and reads clean (custody back, every
-    /// request answered with its file's bytes); those two read `VACUOUS`,
-    /// and nothing else, while the host has no issuer position to set and
-    /// no stop to mark. Each leg's rounds are recorded.
+    /// Every fixed leg runs its shape at one seed. Each but the stop leg
+    /// engages it and reads clean (custody back, every request answered with
+    /// its file's bytes); the stop leg reads `VACUOUS`, and nothing else,
+    /// while the host has no stop to mark. Each leg's rounds are recorded.
     #[test]
     fn every_fixed_leg_runs_its_shape() {
         for (leg, name) in ColdLeg::ALL {
             if leg == ColdLeg::Storm {
                 continue;
             }
-            let identity_start = (leg == ColdLeg::Identity).then_some(COLD_IDENTITY_PAIRS - 2);
+            let identity_start = (leg == ColdLeg::Identity)
+                .then_some(inf_runtime::limits::COLD_IDENTITY_PAIRS_MAX - 2);
             let scenario =
                 ColdStormScenario { leg, identity_start, ..ColdStormScenario::m4_cold(1) };
             let report = run_cold_storm_scenario(&scenario);
@@ -1169,7 +1169,7 @@ mod tests {
             assert!(!report.rounds.is_empty(), "{name}: no round recorded");
             let vacuous: Vec<&str> =
                 report.violations.iter().filter(|v| v.starts_with("VACUOUS")).collect();
-            if matches!(leg, ColdLeg::Identity | ColdLeg::Stop) {
+            if leg == ColdLeg::Stop {
                 assert_eq!(vacuous.len(), 1, "{name}: {:?}", report.violations);
                 assert_eq!(report.violations.len(), 1, "{name}: {:?}", report.violations);
             } else {

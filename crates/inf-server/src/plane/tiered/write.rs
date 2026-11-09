@@ -287,6 +287,7 @@ pub(in crate::plane) async fn read_cold_record<
                 Err(ColdRefused::QueueFull) => return Err(ERR_COLD_BUSY),
                 // Permanent (ADR-0167 D3); a 48-bit address cannot reach it.
                 Err(ColdRefused::Unrepresentable(_)) => return Err(ERR_COLD_IO),
+                Err(ColdRefused::IdentityExhausted) => return Err(ERR_COLD_IDENTITY),
             }
         };
         let done = wait.await;

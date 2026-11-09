@@ -73,6 +73,7 @@ use inf_foundation::{BuildIntHasher, FileOffset, FileOffsetRefused, LogHistogram
 use crate::budget::Issue;
 use crate::driver::{CompletionResult, IoOp, RawFd, StableBytesMut};
 use crate::gate::{GateWait, KeyedGate};
+use crate::limits::COLD_IDENTITY_PAIRS_MAX;
 use crate::token::{CompletionToken, MAX_SLOT, TokenClass};
 
 /// Opaque per-cell tier-file identity — the pin-table key. Minted by the
@@ -109,6 +110,158 @@ impl ReadClass {
             ReadClass::Foreground => 0,
             ReadClass::Maintain => 1,
         }
+    }
+}
+
+/// A request's logical identity (ADR-0181 R4): the even word of its pair,
+/// the key its value is delivered under. Minted only by the host's
+/// [`PairIssuer`], beside the [`DeviceId`] the same pair reserves. The two
+/// are distinct types, so neither stands where the other is asked for:
+///
+/// ```compile_fail,E0308
+/// use inf_runtime::{DeviceId, LogicalId};
+/// fn device_of(logical: LogicalId) -> DeviceId {
+///     logical
+/// }
+/// ```
+///
+/// Its twin, the same function over one type, compiles:
+///
+/// ```
+/// use inf_runtime::DeviceId;
+/// fn device_of(device: DeviceId) -> DeviceId {
+///     device
+/// }
+/// ```
+///
+/// A value is delivered under its logical id alone, so a device id never
+/// completes the cold gate:
+///
+/// ```compile_fail,E0308
+/// use inf_runtime::gate::KeyedGate;
+/// use inf_runtime::{ColdDone, DeviceId, LogicalId};
+/// fn deliver(gate: &KeyedGate<LogicalId, ColdDone>, device: DeviceId, done: ColdDone) -> bool {
+///     gate.complete(device, done)
+/// }
+/// ```
+///
+/// Its twin, the logical id, compiles:
+///
+/// ```
+/// use inf_runtime::gate::KeyedGate;
+/// use inf_runtime::{ColdDone, LogicalId};
+/// fn deliver(gate: &KeyedGate<LogicalId, ColdDone>, logical: LogicalId, done: ColdDone) -> bool {
+///     gate.complete(logical, done)
+/// }
+/// ```
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct LogicalId(CompletionToken);
+
+/// A device read's identity (ADR-0181 R4): the odd word of its pair, the
+/// token its `TierRead` carries and its receipt returns. A read that serves
+/// a cohort carries its seed's; a member's own device id retires unused.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct DeviceId(CompletionToken);
+
+impl LogicalId {
+    /// The pair this id belongs to: its word index halved.
+    fn pair(self) -> u64 {
+        word_index(self.0) >> 1
+    }
+}
+
+impl DeviceId {
+    /// The token a `TierRead` carries for this read.
+    fn token(self) -> CompletionToken {
+        self.0
+    }
+}
+
+/// The `TierRead` token of word index `index` (`< 2^56`): the low 24 bits in
+/// the slot, the rest in the generation, as every cold token is packed.
+fn tier_read_token(index: u64) -> CompletionToken {
+    debug_assert!(index < 2 * COLD_IDENTITY_PAIRS_MAX, "a word index below 2^56");
+    // `index < 2^56`, so `index >> 24 < 2^32`: both narrowings are lossless.
+    CompletionToken::new(
+        TokenClass::TierRead,
+        (index & u64::from(MAX_SLOT)) as u32,
+        (index >> 24) as u32,
+    )
+}
+
+/// A cold token's word index: the inverse of [`tier_read_token`].
+fn word_index(token: CompletionToken) -> u64 {
+    (u64::from(token.generation()) << 24) | u64::from(token.slot())
+}
+
+/// The host's identity issuer (ADR-0181 R4): pair `n` is the logical id `2n`
+/// and the device id `2n + 1`, `n < COLD_IDENTITY_PAIRS_MAX`, each minted once
+/// in the host's lifetime and never returned. A host takes its issuer when it
+/// is built: [`PairIssuer::new`] starts at pair 0, the server's;
+/// [`PairIssuer::starting_at`] places a harness inside the space, so its
+/// exhaustion falls within a run.
+#[derive(Debug)]
+pub struct PairIssuer {
+    /// The next pair to mint; `COLD_IDENTITY_PAIRS_MAX` once every pair is spent.
+    next_pair: u64,
+}
+
+/// A pair the issuer can mint, read before the request's reservations and
+/// spent only on its success arm: a refusal after it mints nothing.
+struct PairPermit {
+    pair: u64,
+}
+
+impl PairIssuer {
+    /// The issuer at pair 0.
+    #[must_use]
+    pub const fn new() -> PairIssuer {
+        PairIssuer { next_pair: 0 }
+    }
+
+    /// The issuer at pair `pair`, or `None` at or past
+    /// [`COLD_IDENTITY_PAIRS_MAX`].
+    #[must_use]
+    pub const fn starting_at(pair: u64) -> Option<PairIssuer> {
+        if pair < COLD_IDENTITY_PAIRS_MAX { Some(PairIssuer { next_pair: pair }) } else { None }
+    }
+
+    /// The pairs spent or skipped: the issuer's position.
+    #[must_use]
+    pub const fn pairs_used(&self) -> u64 {
+        self.next_pair
+    }
+
+    /// The next pair, when one is left; nothing is spent.
+    fn reserve(&self) -> Option<PairPermit> {
+        (self.next_pair < COLD_IDENTITY_PAIRS_MAX).then_some(PairPermit { pair: self.next_pair })
+    }
+
+    /// Spends the reserved pair: its logical and device ids.
+    fn mint(&mut self, permit: PairPermit) -> (LogicalId, DeviceId) {
+        debug_assert_eq!(permit.pair, self.next_pair, "a permit is spent at the position it read");
+        self.next_pair = permit.pair + 1;
+        let logical = LogicalId(tier_read_token(2 * permit.pair));
+        let device = DeviceId(tier_read_token(2 * permit.pair + 1));
+        (logical, device)
+    }
+
+    /// A cancelled request's pair retires: it is never minted again.
+    fn retire(&mut self, logical: LogicalId) {
+        #[cfg(not(inf_canary_cold_identity_recycled))]
+        debug_assert!(logical.pair() < self.next_pair, "a retired pair was minted");
+        // Canary: the cancelled request's pair returns to the issuer, which
+        // mints it again.
+        #[cfg(inf_canary_cold_identity_recycled)]
+        {
+            self.next_pair = self.next_pair.min(logical.pair());
+        }
+    }
+}
+
+impl Default for PairIssuer {
+    fn default() -> PairIssuer {
+        PairIssuer::new()
     }
 }
 
@@ -208,6 +361,13 @@ pub enum ColdRefused {
     /// request is refused again (ADR-0167 D3). Checked before the queue
     /// bound; the caller answers a read failure, never backpressure.
     Unrepresentable(UnrepresentableRead),
+    /// The host has issued every one of its [`COLD_IDENTITY_PAIRS_MAX`]
+    /// identity pairs (ADR-0181 R4): permanent for this host, so every
+    /// later request is refused too. Checked after the request's own faults
+    /// and before the queue bound, with nothing changed; admitted reads still
+    /// issue and deliver. The caller answers `IdentityExhausted(ColdRead)`
+    /// (ADR-0172 D1), never backpressure.
+    IdentityExhausted,
 }
 
 /// Which check refused an [`ColdRefused::Unrepresentable`] request, in the
@@ -230,7 +390,9 @@ pub enum UnrepresentableRead {
 
 /// A queued read intent — plain data; the §3.3 pin is taken at enqueue.
 struct Intent {
-    token: CompletionToken,
+    logical: LogicalId,
+    /// The pair's device id, the read's token when this intent seeds it.
+    device: DeviceId,
     fd: RawFd,
     file: TierFileId,
     offset: FileOffset,
@@ -240,7 +402,7 @@ struct Intent {
 
 /// One waiter's subrange of an in-flight device read.
 struct Waiter {
-    token: CompletionToken,
+    logical: LogicalId,
     /// Offset into the merged window.
     skip: u32,
     len: u32,
@@ -287,8 +449,12 @@ struct ColdState {
     spare_waiters: Vec<Vec<Waiter>>,
     /// Merge scratch recycled across drains (bounded by `overflow_cap`).
     merge_scratch: Vec<Intent>,
-    /// Monotone read id → token {slot: low 24 bits, generation: high}.
-    next_read: u64,
+    /// The host's identity pairs (ADR-0181 R4).
+    issuer: PairIssuer,
+    /// `enqueue`s refused `IdentityExhausted` (cell, cumulative): the
+    /// refusal's own count, apart from the admission counters it leaves as
+    /// they were.
+    identity_refusals: u64,
 }
 
 impl ColdState {
@@ -299,16 +465,6 @@ impl ColdState {
         if *count == 0 {
             pins.remove(&file);
         }
-    }
-
-    fn mint_token(&mut self) -> CompletionToken {
-        let id = self.next_read;
-        self.next_read += 1;
-        CompletionToken::new(
-            TokenClass::TierRead,
-            (id & u64::from(MAX_SLOT)) as u32,
-            (id >> 24) as u32,
-        )
     }
 }
 
@@ -346,9 +502,9 @@ pub struct ColdLeak {
     pub windows: usize,
 }
 
-/// The future a suspended cold read parks on; resolves to the custody-
-/// carrying [`ColdDone`].
-pub type ColdWait = GateWait<CompletionToken, ColdDone>;
+/// The future a suspended cold read parks on, keyed by its request's
+/// [`LogicalId`]; resolves to the custody-carrying [`ColdDone`].
+pub type ColdWait = GateWait<LogicalId, ColdDone>;
 
 /// One cell's cold-read path state: pool, pins, queues, in-flight table,
 /// and the completion gate. Cheap-clone shared handle (cell-local `Rc`,
@@ -356,7 +512,7 @@ pub type ColdWait = GateWait<CompletionToken, ColdDone>;
 /// it.
 pub struct ColdReads {
     state: Rc<RefCell<ColdState>>,
-    gate: KeyedGate<CompletionToken, ColdDone>,
+    gate: KeyedGate<LogicalId, ColdDone>,
 }
 
 impl ColdReads {
@@ -402,10 +558,24 @@ impl ColdReads {
                 latency_hist: LogHistogram::new(),
                 spare_waiters: Vec::new(),
                 merge_scratch: Vec::new(),
-                next_read: 0,
+                issuer: PairIssuer::new(),
+                identity_refusals: 0,
             })),
             gate: KeyedGate::new(),
         }
+    }
+
+    /// [`with_config`](Self::with_config) with the host's identity issuer at
+    /// `issuer`'s position instead of pair 0: a harness places the space's
+    /// exhaustion inside its run (ADR-0181 R4).
+    ///
+    /// # Panics
+    /// As [`with_config`](Self::with_config).
+    #[must_use]
+    pub fn with_issuer(pool: AlignedPool, config: ColdReadConfig, issuer: PairIssuer) -> ColdReads {
+        let cold = ColdReads::with_config(pool, config);
+        cold.state.borrow_mut().issuer = issuer;
+        cold
     }
 
     /// Pool buffer size — the read-window ceiling per device read
@@ -435,9 +605,12 @@ impl ColdReads {
     /// # Errors
     /// [`ColdRefused::Unrepresentable`] when the request cannot become a
     /// device read — permanent, answered before the queue bound and with no
-    /// state changed (ADR-0167 D3). [`ColdRefused::QueueFull`] when the
-    /// class FIFO is at its bound — backpressure the caller shapes; it
-    /// counts `queue_full` and changes nothing else.
+    /// state changed (ADR-0167 D3). [`ColdRefused::IdentityExhausted`] when
+    /// the host's identity pairs are spent — permanent, answered next, before
+    /// the queue bound; it counts its own refusal and changes nothing else
+    /// (ADR-0181 R4). [`ColdRefused::QueueFull`] when the class FIFO is at
+    /// its bound — backpressure the caller shapes; it counts `queue_full`
+    /// and changes nothing else.
     pub fn enqueue(
         &self,
         fd: RawFd,
@@ -450,14 +623,21 @@ impl ColdReads {
         let mut state = self.state.borrow_mut();
         let (offset, len) = parse_window(offset, len, state.pool.buf_size())
             .map_err(ColdRefused::Unrepresentable)?;
+        // Both permanent refusals precede the temporary one, and the pair is
+        // minted on the success arm alone (ADR-0181 R4).
+        let Some(permit) = state.issuer.reserve() else {
+            state.identity_refusals += 1;
+            return Err(ColdRefused::IdentityExhausted);
+        };
         if state.pending[class.index()].len() >= state.config.overflow_cap {
             state.counters.queue_full += 1;
             return Err(ColdRefused::QueueFull);
         }
-        let token = state.mint_token();
+        let (logical, device) = state.issuer.mint(permit);
         *state.pins.entry(file).or_insert(0) += 1;
         state.pending[class.index()].push_back(Intent {
-            token,
+            logical,
+            device,
             fd,
             file,
             offset,
@@ -468,7 +648,7 @@ impl ColdReads {
         let depth = (state.pending[0].len() + state.pending[1].len()) as u32;
         state.counters.queue_depth_high_water = state.counters.queue_depth_high_water.max(depth);
         drop(state);
-        Ok(self.gate.waiter(token))
+        Ok(self.gate.waiter(logical))
     }
 
     /// Admits queued intents to the device: merges (when enabled),
@@ -554,16 +734,17 @@ impl ColdReads {
     /// Drops cancelled-while-queued heads of both FIFOs (pins released,
     /// counted). Mid-queue stale intents are filtered by the merge scan
     /// or when they surface as heads — lazy, bounded, deterministic.
-    fn purge_stale_heads(state: &mut ColdState, gate: &KeyedGate<CompletionToken, ColdDone>) {
-        let ColdState { pending, pins, counters, .. } = state;
+    fn purge_stale_heads(state: &mut ColdState, gate: &KeyedGate<LogicalId, ColdDone>) {
+        let ColdState { pending, pins, counters, issuer, .. } = state;
         for queue in pending.iter_mut() {
             while let Some(head) = queue.front() {
-                if gate.has_waiter(&head.token) {
+                if gate.has_waiter(&head.logical) {
                     break;
                 }
                 let intent = queue.pop_front().expect("front observed");
                 ColdState::unpin(pins, intent.file);
                 counters.cancelled_queued += 1;
+                issuer.retire(intent.logical);
             }
         }
     }
@@ -601,17 +782,19 @@ impl ColdReads {
     /// left behind is preserved (one rotate pass).
     fn admit(
         state: &mut ColdState,
-        gate: &KeyedGate<CompletionToken, ColdDone>,
+        gate: &KeyedGate<LogicalId, ColdDone>,
         class: usize,
         buf: AlignedBufId,
     ) -> IoOp {
         let buf_size = state.pool.buf_size();
         let merge = state.config.merge;
-        {
-            let ColdState { pending, pins, counters, merge_scratch, .. } = state;
+        let device = {
+            let ColdState { pending, pins, counters, merge_scratch, issuer, .. } = state;
             let queue = &mut pending[class];
             let seed = queue.pop_front().expect("picked class has a live head");
-            debug_assert!(gate.has_waiter(&seed.token), "heads were purged");
+            debug_assert!(gate.has_waiter(&seed.logical), "heads were purged");
+            // The read carries its seed's reserved device id (ADR-0181 R4).
+            let device = seed.device;
             // Span ends come from `bytes_after`: at most `i64::MAX`, so the
             // union arithmetic below cannot wrap (ADR-0167 D1).
             let mut lo = seed.offset.bytes();
@@ -626,9 +809,10 @@ impl ColdReads {
                 // original FIFO order.
                 for _ in 0..queue.len() {
                     let intent = queue.pop_front().expect("counted");
-                    if !gate.has_waiter(&intent.token) {
+                    if !gate.has_waiter(&intent.logical) {
                         ColdState::unpin(pins, intent.file);
                         counters.cancelled_queued += 1;
+                        issuer.retire(intent.logical);
                         continue;
                     }
                     let start = intent.offset.bytes();
@@ -655,8 +839,8 @@ impl ColdReads {
                     }
                 }
             }
-        }
-        let token = state.mint_token();
+            device
+        };
         let ColdState { pool, inflight, counters, qd_hist, spare_waiters, merge_scratch, .. } =
             state;
         let (fd, file) = (merge_scratch[0].fd, merge_scratch[0].file);
@@ -676,7 +860,7 @@ impl ColdReads {
         debug_assert!(waiters.is_empty(), "spare lists come back drained");
         for intent in merge_scratch.drain(..) {
             waiters.push(Waiter {
-                token: intent.token,
+                logical: intent.logical,
                 skip: (intent.offset.bytes() - lo.bytes()) as u32,
                 len: intent.len,
                 enqueued_us: intent.enqueued_us,
@@ -693,9 +877,9 @@ impl ColdReads {
         // them, regardless of what any issuing future does (including
         // being cancelled).
         let stable = unsafe { StableBytesMut::new(target) };
-        inflight.insert(token, DeviceRead { buf, file, len: window_len as u32, waiters });
+        inflight.insert(device.token(), DeviceRead { buf, file, len: window_len as u32, waiters });
         qd_hist.record(inflight.len() as u64);
-        IoOp::TierRead { fd, offset: lo, buf: stable, token }
+        IoOp::TierRead { fd, offset: lo, buf: stable, token: device.token() }
     }
 
     /// Routes a `TierRead`-class terminal completion: pops the device
@@ -759,7 +943,7 @@ impl ColdReads {
                 len: waiter.len,
                 file,
             };
-            if self.gate.complete(waiter.token, done) {
+            if self.gate.complete(waiter.logical, done) {
                 delivered += 1;
                 let mut state = self.state.borrow_mut();
                 state.counters.delivered += 1;
@@ -814,6 +998,20 @@ impl ColdReads {
     #[must_use]
     pub fn counters(&self) -> ColdReadCounters {
         self.state.borrow().counters
+    }
+
+    /// The identity pairs the host's issuer has spent or skipped, its
+    /// position (`cold_identity_pairs_used`, cell scope).
+    #[must_use]
+    pub fn identity_pairs_used(&self) -> u64 {
+        self.state.borrow().issuer.pairs_used()
+    }
+
+    /// `enqueue`s refused [`ColdRefused::IdentityExhausted`]
+    /// (`cold_identity_exhausted`, cell scope, cumulative).
+    #[must_use]
+    pub fn identity_refusals(&self) -> u64 {
+        self.state.borrow().identity_refusals
     }
 
     /// The in-flight device-read cap (ADR-0055 D2) — the most intents one
@@ -1460,10 +1658,10 @@ mod tests {
     }
 
     /// Everything a refused `enqueue` must leave untouched (ADR-0167 D3):
-    /// counters, queue depth, the file's pins and the token sequence.
+    /// counters, queue depth, the file's pins and the issuer's position.
     fn footprint(cold: &ColdReads, file: TierFileId) -> (ColdReadCounters, usize, u32, u64) {
-        let next_read = cold.state.borrow().next_read;
-        (cold.counters(), cold.queue_depth(), cold.inflight_on(file), next_read)
+        let pairs_used = cold.identity_pairs_used();
+        (cold.counters(), cold.queue_depth(), cold.inflight_on(file), pairs_used)
     }
 
     /// The permanent refusal `enqueue` answered, or a panic naming `what`.
@@ -1471,6 +1669,7 @@ mod tests {
         match asked {
             Err(ColdRefused::Unrepresentable(read)) => read,
             Err(ColdRefused::QueueFull) => panic!("{what}: answered QueueFull"),
+            Err(ColdRefused::IdentityExhausted) => panic!("{what}: answered IdentityExhausted"),
             Ok(_) => panic!("{what}: enqueue accepted it"),
         }
     }
@@ -1712,30 +1911,26 @@ mod tests {
         drop((live, ops));
     }
 
-    /// The read counter never repeats a live identity. A token packs a
-    /// lifetime counter into 56 bits, so the mint after 2^56 − 1 carries id
-    /// 0's bits. The first read, id 0, stays queued; the counter is set to
-    /// its last value, which a second read takes; the third must be refused
-    /// for good with nothing changed, or carry a fresh identity, and the two
-    /// admitted reads still issue. HEAD mints id 0's token again, and the
-    /// gate's duplicate-key assert ends the cell.
+    /// The issuer never repeats a live identity. A token packs a word index
+    /// into 56 bits, so a mint past the last pair would carry pair 0's bits.
+    /// The first read, pair 0, stays queued; the issuer is set to its last
+    /// pair, which a second read takes; the third must be refused for good
+    /// with nothing changed, or carry a fresh identity, and the two admitted
+    /// reads still issue.
     #[test]
-    #[ignore = "the read counter packs 56 bits with no exhaustion test, so the mint after 2^56 - 1 \
-                repeats the first token and a live first read ends the cell at the gate's \
-                duplicate-key assert; red until the issuer refuses for good, changing nothing, \
-                before it repeats an identity"]
     fn the_read_counter_never_repeats_a_live_identity() {
         let cold = path(2);
         let file = TierFileId::new(21);
         let first = ask(&cold, 3, file, 0, 64);
-        cold.state.borrow_mut().next_read = (1 << 56) - 1;
+        let last_pair = COLD_IDENTITY_PAIRS_MAX - 1;
+        cold.state.borrow_mut().issuer = PairIssuer::starting_at(last_pair).expect("the last pair");
         let last = ask(&cold, 3, file, FRAME, 64);
         let before = footprint(&cold, file);
         match cold.enqueue(3, file, 2 * FRAME, 64, ReadClass::Foreground, 0) {
             Ok(next) => {
                 let state = cold.state.borrow();
                 let live: std::collections::BTreeSet<u64> =
-                    state.pending[0].iter().map(|intent| intent.token.as_u64()).collect();
+                    state.pending[0].iter().map(|intent| intent.logical.0.as_u64()).collect();
                 assert_eq!(live.len(), 3, "three live requests carry three identities");
                 drop(state);
                 drop(next);
@@ -1748,6 +1943,88 @@ mod tests {
         let ops = drain_ops(&cold);
         assert_eq!(ops.len(), 2, "the admitted reads issue after the refusal");
         drop((first, last, ops));
+    }
+
+    /// ADR-0181 R4's order at the space's end: a request's own fault answers
+    /// first, then the spent space, permanently, before the queue bound,
+    /// even with the class queue full; nothing changes but the refusal's own
+    /// count, and the admitted reads still issue.
+    #[test]
+    fn a_spent_identity_space_refuses_before_the_queue_bound() {
+        let config = ColdReadConfig { overflow_cap: 2, merge: false, ..ColdReadConfig::default() };
+        let cold = shaped(4, config);
+        let file = TierFileId::new(22);
+        let last_two = COLD_IDENTITY_PAIRS_MAX - 2;
+        cold.state.borrow_mut().issuer = PairIssuer::starting_at(last_two).expect("in the space");
+        assert!(PairIssuer::starting_at(COLD_IDENTITY_PAIRS_MAX).is_none(), "no pair past 2^55");
+        let held = [ask(&cold, 3, file, 0, 64), ask(&cold, 3, file, FRAME, 64)];
+        assert_eq!(cold.identity_pairs_used(), COLD_IDENTITY_PAIRS_MAX, "every pair spent");
+        let before = footprint(&cold, file);
+        let fault = cold.enqueue(3, file, u64::MAX, 64, ReadClass::Foreground, 0);
+        assert!(matches!(fault, Err(ColdRefused::Unrepresentable(_))), "the request's own fault");
+        for class in [ReadClass::Foreground, ReadClass::Maintain] {
+            let asked = cold.enqueue(3, file, 2 * FRAME, 64, class, 0);
+            assert!(
+                matches!(asked, Err(ColdRefused::IdentityExhausted)),
+                "{class:?}: a spent space refuses for good, the class queue full or not"
+            );
+        }
+        assert_eq!(footprint(&cold, file), before, "a refusal changes nothing");
+        assert_eq!(cold.identity_refusals(), 2, "each refusal counted once");
+        assert_eq!(cold.counters().queue_full, 0, "never the temporary refusal");
+        let ops = drain_ops(&cold);
+        assert_eq!(ops.len(), 2, "the admitted reads issue after the refusals");
+        drop((held, ops));
+    }
+
+    /// The logical id the newest queued request of `class` carries, read
+    /// from the host's queue (its decode is the token layout's, not the
+    /// issuer's).
+    fn newest_logical(cold: &ColdReads, class: ReadClass) -> CompletionToken {
+        let state = cold.state.borrow();
+        state.pending[class.index()].back().expect("a request was just queued").logical.0
+    }
+
+    /// Every identity the issuer mints is fresh and typed by its parity
+    /// (OC6): an independent record of every logical id the host queues and
+    /// every device id its reads carry, over rounds that each admit one kept
+    /// and two cancelled requests, purge the cancelled and issue the kept,
+    /// finds no word index twice, every logical id even and every device id
+    /// odd, and a singleton read's device id its own request's pair.
+    #[test]
+    fn every_identity_the_issuer_mints_is_fresh_and_typed_by_parity() {
+        const ROUNDS: u32 = 8;
+        let config =
+            ColdReadConfig { qd_cap: 2, overflow_cap: 8, merge: false, ..Default::default() };
+        let cold = shaped(2, config);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut minted = 0u32;
+        for round in 0..ROUNDS {
+            let file = TierFileId::new(300 + round);
+            let kept = ask(&cold, 3, file, 0, 64);
+            let kept_logical = word_index(newest_logical(&cold, ReadClass::Foreground));
+            assert!(seen.insert(kept_logical), "an id repeats: logical {kept_logical}");
+            for at in 1..=2u64 {
+                drop(ask(&cold, 3, file, at * FRAME, 64));
+                let cancelled = word_index(newest_logical(&cold, ReadClass::Foreground));
+                assert!(seen.insert(cancelled), "an id repeats: logical {cancelled}");
+                assert_eq!(cancelled % 2, 0, "a logical id is even");
+            }
+            minted += 3;
+            let ops = drain_ops(&cold);
+            assert_eq!(ops.len(), 1, "round {round}: the kept request issues alone");
+            let IoOp::TierRead { token, .. } = ops[0] else { panic!("drain builds TierRead") };
+            let device = word_index(token);
+            assert!(seen.insert(device), "an id repeats: device {device}");
+            assert_eq!(kept_logical % 2, 0, "a logical id is even");
+            assert_eq!(device, kept_logical + 1, "a singleton reads under its own pair");
+            assert_eq!(cold.on_completion(token, CompletionResult::TierRead, 1), 1);
+            drop((block_on_ready(kept), ops));
+            assert!(drain_ops(&cold).is_empty(), "the purge issues nothing");
+        }
+        assert_eq!(cold.counters().cancelled_queued, u64::from(2 * ROUNDS), "engagement: purged");
+        assert_eq!(cold.identity_pairs_used(), u64::from(minted), "one pair a request");
+        assert_eq!(cold.reconcile(), Ok(()));
     }
 
     /// A custody case's terminal receipt: success or `EIO`.

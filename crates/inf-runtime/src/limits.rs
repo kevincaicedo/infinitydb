@@ -22,3 +22,13 @@ pub const TIMER_DELIVERIES_PER_TURN: u32 = 64;
 /// [`ParkCeilingTooLong`](crate::ParkCeilingTooLong) above it, and `infinityd` refuses a
 /// `--park-us` above it at argument parsing, before any cell starts.
 pub const PARK_CEILING_MAX: core::time::Duration = core::time::Duration::from_millis(100);
+
+/// Identity pairs one cold-read host issues in its lifetime (ADR-0181 R4): 2^55. Pair `n` is
+/// the logical id `2n` and the device id `2n + 1`, each a word index of the 56-bit `TierRead`
+/// token payload, so the payload holds 2^55 pairs. Owner: the host's
+/// [`PairIssuer`](crate::PairIssuer), which mints one pair at each admitted `enqueue` and never
+/// mints a pair twice. Crossing: a typed, permanent refusal — `enqueue` answers
+/// [`ColdRefused::IdentityExhausted`](crate::ColdRefused::IdentityExhausted) before any queue,
+/// gate or pin changes, every later request is refused alike, and the reads admitted before it
+/// still issue and deliver. A namespace drop does not reset the issuer; only a new host does.
+pub const COLD_IDENTITY_PAIRS_MAX: u64 = 1 << 55;

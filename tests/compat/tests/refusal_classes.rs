@@ -43,9 +43,9 @@ const CLASS_SUFFIXES: [&str; 4] =
 /// row's backquoted `-…` text that ends in a class suffix is one of
 /// `Refusal::every()`'s, so a mistyped line in any row is red and no row
 /// joins a list to be checked. The rows that answer a refusal quote it:
-/// `INF.NS` the namespace identity space's, the catalog limit's and both
-/// tiered lifetime lines, and the three checkpoint rows the checkpoint
-/// identity space's.
+/// `INF.NS` the namespace identity space's, the catalog limit's, both
+/// tiered lifetime lines and the cold-read identity space's, and the three
+/// checkpoint rows the checkpoint identity space's.
 #[test]
 fn the_matrix_quotes_the_rendered_refusal_bytes() {
     let rendered: Vec<String> = Refusal::every().map(|r| format!("-{}", r.render())).collect();
@@ -58,7 +58,7 @@ fn the_matrix_quotes_the_rendered_refusal_bytes() {
             }
         }
     }
-    assert!(quoted >= 7, "VACUOUS: the matrix quotes {quoted} refusal lines");
+    assert!(quoted >= 8, "VACUOUS: the matrix quotes {quoted} refusal lines");
     let quotes = |name: &str, refusal: Refusal| {
         let row = compat::matrixgen::DECLARED.iter().find(|d| d.name == name).expect("a row");
         let text = format!("`-{}`", refusal.render());
@@ -68,6 +68,7 @@ fn the_matrix_quotes_the_rendered_refusal_bytes() {
     quotes("INF.NS", Refusal::LimitReached(Domain::Catalog));
     quotes("INF.NS", Refusal::CapacityBusy(Domain::TieredNamespace));
     quotes("INF.NS", Refusal::LimitReached(Domain::TieredNamespace));
+    quotes("INF.NS", Refusal::IdentityExhausted(Domain::ColdRead));
     for name in ["INF.NS", "INF.CKPT", "BGSAVE"] {
         quotes(name, Refusal::IdentityExhausted(Domain::Checkpoint));
     }
