@@ -74,6 +74,7 @@ use inf_wire::{
 mod cache_boot_tests;
 mod cell_loop;
 mod conn;
+mod credit;
 mod dispatch;
 mod fabric;
 mod ns_ddl;
@@ -91,6 +92,7 @@ mod split;
 
 pub use conn::OwnedOutcome;
 use conn::{CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
+pub use credit::{MeshConfigRefused, checked_mesh_config};
 use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
 use fabric::{
     GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op,

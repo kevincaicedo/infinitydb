@@ -128,7 +128,7 @@ fn main() {
                     }
                 }
                 "--cells" | "--connections" | "--commands" | "--key-space"
-                | "--wheel-nodes-max" => {
+                | "--wheel-nodes-max" | "--fabric-credits" => {
                     let value = take(&flag)?.parse().map_err(|e| format!("{flag}: {e}"))?;
                     overrides.push((flag.clone(), value));
                 }
@@ -173,6 +173,7 @@ fn main() {
                          [--spec-variant ring-top|page] {} [--park-at-once] \
                          [--cold-identity-start N] \
                          [--cells N] [--connections N] [--commands N] [--wheel-nodes-max N] \
+                         [--fabric-credits N] \
                          [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios] \
                          [--list-sweeps]",
@@ -869,7 +870,7 @@ fn main() {
     scenario.plant = plant;
     for (flag, value) in overrides {
         match flag.as_str() {
-            "--cells" => scenario.cells = value as u16,
+            "--cells" => scenario.cells = checked_cells(value),
             "--connections" => scenario.connections = value as usize,
             "--commands" => scenario.commands = value,
             "--key-space" => scenario.key_space = value,
@@ -883,6 +884,7 @@ fn main() {
                     }
                 }
             }
+            "--fabric-credits" => scenario.fabric = checked_credits(scenario.fabric, value),
             _ => unreachable!(),
         }
     }
@@ -936,6 +938,40 @@ fn main() {
         Ok(())
     });
     std::process::exit(exit.code());
+}
+
+/// `--cells` as the plane takes it: narrowed to `u16` without wrapping, so
+/// 65,537 is refused rather than read as 1, then the topology's bound
+/// (`CellCount::new`); a refusal is the usage exit before any mesh exists.
+fn checked_cells(value: u64) -> u16 {
+    let checked = u16::try_from(value)
+        .map_err(|_| format!("must be <= {}", u16::MAX))
+        .and_then(|cells| inf_foundation::CellCount::new(cells).map_err(|e| e.to_string()));
+    match checked {
+        Ok(cells) => cells.get(),
+        Err(bound) => {
+            eprintln!("inf-sim: --cells {value} {bound}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `--fabric-credits` against the scenario's ring, through the plane's one
+/// mesh check (ADR-0192 D5): narrowed to `u32` without wrapping; a refusal
+/// is the usage exit before any mesh exists.
+fn checked_credits(fabric: inf_fabric::MeshConfig, value: u64) -> inf_fabric::MeshConfig {
+    let checked =
+        u32::try_from(value).map_err(|_| format!("is past {}", u32::MAX)).and_then(|credits| {
+            inf_server::checked_mesh_config(fabric.ring_capacity, credits)
+                .map_err(|refused| refused.to_string())
+        });
+    match checked {
+        Ok(mesh) => mesh,
+        Err(bound) => {
+            eprintln!("inf-sim: --fabric-credits {value}: {bound}");
+            std::process::exit(2);
+        }
+    }
 }
 
 /// The sweep arguments as one checked type, or the refusal. `--shard` and

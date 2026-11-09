@@ -177,6 +177,26 @@ pub struct Scenario {
     pub wheel_nodes_max: Option<WheelNodesMax>,
 }
 
+/// A simulator mesh, checked by the plane's one mesh check when the
+/// simulator is built: every scenario's mesh is a `const` through it, so a
+/// refused pair fails the build (ADR-0192 D5).
+pub(crate) const fn scenario_mesh(ring_capacity: usize, data_credits: u32) -> MeshConfig {
+    match inf_server::checked_mesh_config(ring_capacity, data_credits) {
+        Ok(mesh) => mesh,
+        Err(_) => panic!("a simulator mesh fails the plane's mesh check"),
+    }
+}
+
+/// The frozen scenarios' mesh and the durable runner's: 1,024 ring slots,
+/// 256 credits (a peer can never fill the 1,024-frame drain budget alone).
+pub(crate) const FROZEN_MESH: MeshConfig = scenario_mesh(1024, 256);
+
+/// The shipped binary's mesh, from the rows the binary reads.
+const BINARY_MESH: MeshConfig = scenario_mesh(
+    inf_server::limits::FABRIC_RING_SLOTS_PER_PEER,
+    inf_server::limits::FABRIC_CREDITS_PER_PEER,
+);
+
 /// Model-side plants for the content oracle's canary tests (F-L19-06's
 /// "planted-bug canary" ask): each must be caught by the quiescence
 /// reconciliation naming the affected key.
@@ -206,7 +226,7 @@ impl Scenario {
             key_space: 2_000,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -241,7 +261,7 @@ impl Scenario {
             key_space: 500,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -276,7 +296,7 @@ impl Scenario {
             key_space: 400,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -312,7 +332,7 @@ impl Scenario {
             key_space: 1,
             pipelined_every: 1,
             pipeline_window: 256,
-            fabric: MeshConfig { ring_capacity: 4096, data_credits: 1024 },
+            fabric: BINARY_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -345,7 +365,7 @@ impl Scenario {
             key_space: 500,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -372,7 +392,7 @@ impl Scenario {
             key_space: 2_000,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 8,
             channels: 8,

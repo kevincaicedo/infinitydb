@@ -264,3 +264,32 @@ fn audit_oracle_catches_a_planted_canary_on_the_served_surface() {
         report.oracle_violations
     );
 }
+
+/// The mesh flags refused at the flag: exit 2, the bound named, nothing
+/// run. `--fabric-credits` goes through the plane's mesh check against the
+/// scenario's 1,024-slot ring (513 is past the reply headroom whether or
+/// not the relation carries a progress term); `--cells` is narrowed without
+/// wrapping, so 65,537 is refused rather than read as 1.
+#[test]
+fn mesh_flags_are_refused_at_the_flag() {
+    let cases: [(&str, &str, &str); 6] = [
+        ("--fabric-credits", "0", "leaves no general window"),
+        ("--fabric-credits", "1", "leaves no general window"),
+        ("--fabric-credits", "513", "has no reply headroom for data_credits 513: at most 512"),
+        ("--fabric-credits", "4294967296", "is past 4294967295"),
+        ("--cells", "0", "must be >= 1"),
+        ("--cells", "65537", "must be <= 65535"),
+    ];
+    for (flag, value, bound) in cases {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_inf-sim"))
+            .args(["--scenario", "m0-smoke", "--commands", "100", flag, value])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{flag} {value}: {stdout} {stderr}");
+        assert!(stderr.contains(&format!("{flag} {value}")), "{flag} {value}: {stderr}");
+        assert!(stderr.contains(bound), "{flag} {value}: {stderr}");
+        assert!(!stdout.contains("inf-sim: scenario"), "{flag} {value} ran: {stdout}");
+    }
+}
