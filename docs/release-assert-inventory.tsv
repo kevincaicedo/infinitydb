@@ -594,6 +594,8 @@ I	1	crates/inf-store/src/address_space.rs	assert	ro_boundary retreat	watermark o
 C	1	crates/inf-store/src/address_space.rs	assert	window limit smaller than four pages	crates/inf-store/src/ns.rs:TierSpec::validate (MAINTAIN-SLICE ≥ 64 KiB ⇒ budget+slice ≥ 4 pages) and `crates/inf-store/src/tiered.rs:TieredTable::new` refuses typed below 4 pages
 I	1	crates/inf-store/src/address_space.rs	expect	origin is 48-bit	watermarks advance only through `LogicalAddr` values (48-bit by type)
 I	9	crates/inf-store/src/address_space.rs	expect	watermarks stay 48-bit	watermarks advance only through `LogicalAddr` values (48-bit by type)
+I	1	crates/inf-store/src/address_space.rs	assert	the hole marks fit one deque allocation	const assertion — evaluated at compile time, never at run time; `HOLE_MARKS_MAX` intervals of 16 B lie within `DEQUE_BACKING_BYTES_MAX`, so the marks' construction never refuses on its layout
+I	1	crates/inf-store/src/address_space.rs	unreachable	a sealed-dead interval past the hole marks' cap	the space's own state: a placement or a pad pushes a mark only where the window's arithmetic leaves one free — the RAM window crosses at most one interior ring multiple, plus one in transition, plus one page pad that `flushed` passes before its record applies (two ring tops and one page pad, `HOLE_MARKS_MAX`)
 I	3	crates/inf-store/src/catalog.rs	expect	length checked	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-store/src/doc.rs	expect	2-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	5	crates/inf-store/src/doc.rs	expect	4-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction

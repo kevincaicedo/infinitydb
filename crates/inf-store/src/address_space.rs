@@ -39,8 +39,18 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use inf_alloc::{Region, RegionConfig};
-use inf_foundation::bounded::CapCensus;
+use inf_foundation::bounded::{CapCensus, CappedDeque, Reserve, Reserved};
+use inf_foundation::limits::DEQUE_BACKING_BYTES_MAX;
 use inf_foundation::{LocalCounter, LogicalAddr};
+
+use crate::limits::{HOLE_MARKS, HOLE_MARKS_MAX};
+
+// The hole marks' one allocation fits a deque's backing bound, so their
+// construction never refuses on its layout.
+const _: () = assert!(
+    HOLE_MARKS_MAX as usize * core::mem::size_of::<Hole>() <= DEQUE_BACKING_BYTES_MAX,
+    "the hole marks fit one deque allocation"
+);
 
 /// Region classification for one address — the resolver's answer
 /// (M4 plan §3.1). Two compares, no loads beyond the watermark line.
@@ -174,6 +184,22 @@ impl PadTarget {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WindowFull;
 
+/// A sealed-dead interval `flushed` has not passed (ADR-0052 D2): a ring-top
+/// hole or a tail pad, raw addresses. No record lives in it; the flush
+/// crosses it as a gap.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Hole {
+    start: u64,
+    len: u64,
+}
+
+impl Hole {
+    /// The address just past the interval: the `flushed` value that pops it.
+    fn end(self) -> u64 {
+        self.start + self.len
+    }
+}
+
 /// Construction parameters. The ring size is derived from the namespace
 /// memory budget by the caller (S07/S19 own budget policy).
 #[derive(Copy, Clone, Debug)]
@@ -275,16 +301,16 @@ pub struct AddressSpace {
     /// engages at the budget, not at the (up to 2×) ring wall.
     window_limit: u64,
     dead_bytes: u64,
-    /// Sealed-dead intervals not yet passed by `flushed` — `(start, len)`,
-    /// in address order (ADR-0056 D3: ADR-0052 D2's "recorded sealed-dead
-    /// interval" made literal so the flush can skip them): ring-top holes
-    /// and tail pads (ADR-0174 D2 rule 6). Structurally ≤ 3 pending:
-    /// `tail − head ≤ R` means the RAM window crosses at most one
-    /// interior ring multiple, plus one in transition, plus one page pad,
-    /// whose mark `flushed` passes before its record applies (a page pad
-    /// needs a record longer than the window less a page, so the demote
+    /// Sealed-dead intervals not yet passed by `flushed`, in address order
+    /// (ADR-0056 D3: ADR-0052 D2's "recorded sealed-dead interval" made
+    /// literal so the flush can skip them): ring-top holes and tail pads
+    /// (ADR-0174 D2 rule 6). A capped deque on the cell's census under
+    /// `HOLE_MARKS`: `tail − head ≤ R` means the RAM window crosses at most
+    /// one interior ring multiple, plus one in transition, plus one page
+    /// pad, whose mark `flushed` passes before its record applies (a page
+    /// pad needs a record longer than the window less a page, so the demote
     /// step that follows it seals past the pad).
-    hole_marks: VecDeque<(u64, u64)>,
+    hole_marks: CappedDeque<Hole, Reserve>,
     /// Record-boundary flush cut points in `(flushed, ro_boundary]` —
     /// every `advance_ro_boundary` target is one (seal steps land on
     /// record starts, M4-S07). Bounded by [`FLUSH_CUT_CAP`]; when full,
@@ -329,22 +355,24 @@ struct WalkPin {
 const FLUSH_CUT_CAP: usize = 4096;
 
 impl AddressSpace {
-    /// Reserves the ring. `None` when the OS refuses the reservation —
-    /// namespace creation surfaces that as a typed error, never a panic.
-    /// `_census` is the cell's cap census (ADR-0163 D2), which the host
-    /// passes: no space mints one or holds a default.
+    /// Reserves the ring and builds the hole marks on `census`, the cell's
+    /// cap census (ADR-0163 D2), which the host passes: no space mints one
+    /// or holds a default. `None` when the OS refuses the reservation, or
+    /// the allocator or the census the marks' deque — namespace creation
+    /// surfaces that as a typed error, never a panic.
     ///
     /// # Panics
     /// Panics on config violations (non-power-of-two ring, ring smaller
     /// than four pages) — programmer errors.
     #[allow(clippy::disallowed_types, reason = "container: R")]
-    pub fn new(config: AddressSpaceConfig, _census: &Rc<CapCensus>) -> Option<AddressSpace> {
+    pub fn new(config: AddressSpaceConfig, census: &Rc<CapCensus>) -> Option<AddressSpace> {
         assert!(config.reserve_bytes.is_power_of_two(), "ring must be a power of two");
         assert!(config.reserve_bytes >= 4 * config.page_bytes, "ring smaller than four pages");
         let region = Region::new(RegionConfig {
             reserve_bytes: config.reserve_bytes,
             page_bytes: config.page_bytes,
         })?;
+        let hole_marks = CappedDeque::new(HOLE_MARKS, census).ok()?;
         let origin = config.life_origin.to_raw();
         Some(AddressSpace {
             region,
@@ -359,7 +387,7 @@ impl AddressSpace {
             commit_top_rel: 0,
             window_limit: config.reserve_bytes as u64,
             dead_bytes: 0,
-            hole_marks: VecDeque::new(),
+            hole_marks,
             flush_cuts: VecDeque::new(),
             walk_pin: None,
             record_pin: None,
@@ -653,11 +681,10 @@ impl AddressSpace {
             self.commit_top_rel = prospect.top_rel;
         }
         if prospect.hole > 0 {
+            self.push_hole(Hole { start: self.tail, len: prospect.hole });
             self.counters.seal_holes += 1;
             self.counters.seal_hole_bytes += prospect.hole;
             self.dead_bytes += prospect.hole;
-            self.hole_marks.push_back((self.tail, prospect.hole));
-            debug_assert!(self.hole_marks.len() <= 3, "two ring tops and one pad at most");
         }
         self.counters.tail_allocs += 1;
         self.tail = self.life_origin + prospect.start_rel + prospect.len;
@@ -699,6 +726,7 @@ impl AddressSpace {
         if !self.fits(pad) {
             return Err(WindowFull);
         }
+        self.push_hole(Hole { start: self.tail, len: pad_len });
         if pad.top_rel > self.commit_top_rel {
             self.commit_rel_pages(self.commit_top_rel, pad.top_rel);
             self.commit_top_rel = pad.top_rel;
@@ -708,11 +736,34 @@ impl AddressSpace {
             self.counters.seal_hole_bytes += pad_len;
         }
         self.dead_bytes += pad_len;
-        self.hole_marks.push_back((self.tail, pad_len));
-        debug_assert!(self.hole_marks.len() <= 3, "two ring tops and one pad at most");
         self.tail = t;
         self.assert_watermark_order();
         Ok(())
+    }
+
+    /// A test's plant: pads the tail by `len` bytes as a sealed-dead
+    /// interval with its mark, as [`pad_tail`](Self::pad_tail) places a pad,
+    /// where no answer of [`room`](Self::room) asks for one — so a test can
+    /// hold the hole marks at their cap, a state neither `alloc` nor a boot
+    /// pad reaches. `false`, with nothing changed but the marks' census row
+    /// on a refusal, when the pad would cross the ring top or the window, or
+    /// the marks refuse it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn plant_hole(&mut self, len: u64) -> bool {
+        let pad = self.prospect(len);
+        if pad.hole > 0 || !self.fits(pad) {
+            return false;
+        }
+        let Reserved::Slot(slot) = self.hole_marks.reserve() else { return false };
+        slot.publish(Hole { start: self.tail, len });
+        if pad.top_rel > self.commit_top_rel {
+            self.commit_rel_pages(self.commit_top_rel, pad.top_rel);
+            self.commit_top_rel = pad.top_rel;
+        }
+        self.dead_bytes += len;
+        self.tail += len;
+        self.assert_watermark_order();
+        true
     }
 
     /// The flushed-watermark value that would let a refused `alloc(len)`
@@ -740,6 +791,18 @@ impl AddressSpace {
             return None; // fits now — the caller's alloc will succeed.
         }
         LogicalAddr::from_raw(self.life_origin.checked_add(prospect.top_rel - self.window_limit)?)
+    }
+
+    /// Records a sealed-dead interval at the tail: a ring-top hole an
+    /// allocation makes or a pad. Its mark's slot is reserved here, and the
+    /// placement or pad that called it changed nothing yet: a full deque is
+    /// a fourth pending interval, which the window's arithmetic bounds at
+    /// three (two ring tops and one page pad, `HOLE_MARKS_MAX`).
+    fn push_hole(&mut self, hole: Hole) {
+        match self.hole_marks.reserve() {
+            Reserved::Slot(slot) => slot.publish(hole),
+            Reserved::Full => unreachable!("a sealed-dead interval past the hole marks' cap"),
+        }
     }
 
     /// Counts one tail-allocation stall (the caller is about to park on
@@ -793,7 +856,7 @@ impl AddressSpace {
     #[must_use]
     pub fn hole_at(&self, addr: LogicalAddr) -> Option<u64> {
         let a = addr.to_raw();
-        self.hole_marks.iter().find(|&&(start, _)| start == a).map(|&(_, len)| len)
+        self.hole_marks.iter().find(|hole| hole.start == a).map(|hole| hole.len)
     }
 
     /// How far a span of records starting at `cursor` may reach: the first
@@ -812,8 +875,8 @@ impl AddressSpace {
         assert!(c <= self.ro_boundary, "flush cursor above ro_boundary");
         let ring = self.ring_mask + 1;
         let ring_top = c + (ring - ((c - self.life_origin) & self.ring_mask));
-        let next_hole = self.hole_marks.iter().find(|&&(start, _)| start >= c);
-        next_hole.map_or(self.ro_boundary, |&(start, _)| start.min(self.ro_boundary)).min(ring_top)
+        let next_hole = self.hole_marks.iter().find(|hole| hole.start >= c);
+        next_hole.map_or(self.ro_boundary, |hole| hole.start.min(self.ro_boundary)).min(ring_top)
     }
 
     /// The next unit of flush work at `cursor`, bounded by `max_bytes` —
@@ -844,8 +907,8 @@ impl AddressSpace {
         // A hole beginning at the cursor is the gap chunk (its whole
         // extent is sealed: ro never lands inside a hole — holes contain
         // no record start).
-        let next_hole = self.hole_marks.iter().find(|&&(start, _)| start >= c);
-        if let Some(&(start, len)) = next_hole
+        let next_hole = self.hole_marks.iter().find(|hole| hole.start >= c).copied();
+        if let Some(Hole { start, len }) = next_hole
             && start == c
         {
             debug_assert!(start + len <= self.ro_boundary, "ro inside a hole");
@@ -875,7 +938,7 @@ impl AddressSpace {
         let ring = self.ring_mask + 1;
         let ring_top = c + (ring - ((c - self.life_origin) & self.ring_mask));
         let hard = next_hole
-            .map_or(self.ro_boundary, |&(start, _)| start.min(self.ro_boundary))
+            .map_or(self.ro_boundary, |hole| hole.start.min(self.ro_boundary))
             .min(ring_top);
         let budget_end = c.saturating_add(max_bytes).min(hard);
         let mut end = 0u64;
@@ -943,12 +1006,12 @@ impl AddressSpace {
         assert!(t <= self.ro_boundary, "flush above ro_boundary");
         // Consume passed marks; `flushed` must never land strictly inside
         // a hole (zero-content ranges advance whole — ADR-0056 D3).
-        while let Some(&(start, len)) = self.hole_marks.front() {
-            if start + len <= t {
+        while let Some(&hole) = self.hole_marks.front() {
+            if hole.end() <= t {
                 self.hole_marks.pop_front();
                 continue;
             }
-            debug_assert!(t <= start, "flushed lands inside a sealed-dead hole");
+            debug_assert!(t <= hole.start, "flushed lands inside a sealed-dead hole");
             break;
         }
         while self.flush_cuts.front().is_some_and(|&c| c <= t) {
@@ -1151,14 +1214,19 @@ mod tests {
     use super::*;
 
     fn space(ring: usize, page: usize) -> AddressSpace {
-        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        let census = CapCensus::new(inf_foundation::CellId(0)).0;
+        space_on(ring, page, &census)
+    }
+
+    /// A space at origin zero whose hole marks register on `census`.
+    fn space_on(ring: usize, page: usize, census: &Rc<CapCensus>) -> AddressSpace {
         AddressSpace::new(
             AddressSpaceConfig {
                 reserve_bytes: ring,
                 page_bytes: page,
                 life_origin: LogicalAddr::ZERO,
             },
-            &census,
+            census,
         )
         .expect("reservation")
     }
@@ -1368,7 +1436,20 @@ mod tests {
     /// `floor` bytes placed and released, then `rel_tail − floor` placed,
     /// sealed and flushed but resident. No chunk crosses the ring top.
     fn space_at(ring: usize, page: usize, window: u64, rel_tail: u64, floor: u64) -> AddressSpace {
-        let mut sp = space(ring, page);
+        let census = CapCensus::new(inf_foundation::CellId(0)).0;
+        space_at_on(ring, page, window, rel_tail, floor, &census)
+    }
+
+    /// [`space_at`] with its hole marks on `census`.
+    fn space_at_on(
+        ring: usize,
+        page: usize,
+        window: u64,
+        rel_tail: u64,
+        floor: u64,
+        census: &Rc<CapCensus>,
+    ) -> AddressSpace {
+        let mut sp = space_on(ring, page, census);
         sp.set_window_limit(window);
         let half = ring as u64 / 2;
         let mut placed = 0u64;

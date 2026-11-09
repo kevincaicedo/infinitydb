@@ -50,9 +50,9 @@ fn a_refused_seed_builds_no_plane_and_leaves_the_node_unwritten() {
 }
 
 /// The seeded keyspace's tables register on the plane's census: a tiered
-/// spec in an uncataloged seed leaves the table's capped holders' rows on
-/// the census the plane attaches to its node and its loop marks, and the
-/// recovery the plane begins builds on that census too.
+/// spec in an uncataloged seed leaves the table's capped holders' rows, its
+/// seal marks' and its hole marks', on the census the plane attaches to its
+/// node and its loop marks.
 #[test]
 fn a_seeded_tiered_table_registers_on_the_planes_census() {
     let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
@@ -67,4 +67,7 @@ fn a_seeded_tiered_table_registers_on_the_planes_census() {
     assert!(plane.shared.store.borrow().tiered_store(NsId(16)).is_some(), "the seeded table");
     let attached = node.cap_census.borrow().clone().expect("the plane's census attached");
     assert!(Rc::ptr_eq(&attached, serve_mark.census()), "the census the loop marks");
+    for cap in [inf_store::limits::SEAL_MARKS, inf_store::limits::HOLE_MARKS] {
+        assert!(attached.row(cap.name()).is_some(), "the table's `{}` row", cap.name());
+    }
 }
