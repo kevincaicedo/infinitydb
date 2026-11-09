@@ -576,3 +576,88 @@ pub(super) mod test_support {
         open.assemble(shared, proto)
     }
 }
+
+/// The leg decoder's accept and refuse rows: each protocol reads its own
+/// null and refuses the other's, and a count other than the leg's keys,
+/// trailing bytes, a negative length other than the null's and a frame
+/// header past its bound are each a malformed leg.
+#[cfg(test)]
+mod leg_decoder_rows {
+    use super::*;
+
+    const PROTOCOLS: [Protocol; 2] = [Protocol::Resp2, Protocol::Resp3];
+
+    /// `raw` as a `Success` leg of `keys` keys under `proto`: where its body
+    /// begins and each element's end, or `None` for a malformed leg.
+    fn decode(raw: &[u8], proto: Protocol, keys: usize) -> Option<(usize, Vec<usize>)> {
+        let reply =
+            OwnedReply::received(raw.to_vec(), ReplyOutcome::Success).expect("a non-empty reply");
+        let mut ends = vec![0; keys];
+        let view = reply.success().expect("a Success reply has a view");
+        let body_at = parse_json_mget_leg(view, proto, &mut ends)?;
+        Some((body_at, ends))
+    }
+
+    #[test]
+    fn each_protocol_reads_its_own_null_and_refuses_the_other() {
+        let resp2 = b"*2\r\n$-1\r\n$1\r\na\r\n";
+        let resp3 = b"*2\r\n_\r\n$1\r\na\r\n";
+        assert_eq!(decode(resp2, Protocol::Resp2, 2), Some((4, vec![9, 16])));
+        assert_eq!(decode(resp3, Protocol::Resp3, 2), Some((4, vec![7, 14])));
+        assert_eq!(decode(resp3, Protocol::Resp2, 2), None, "RESP3's null in a RESP2 leg");
+        assert_eq!(decode(resp2, Protocol::Resp3, 2), None, "RESP2's null in a RESP3 leg");
+    }
+
+    #[test]
+    fn a_count_other_than_the_legs_keys_is_malformed() {
+        let two = b"*2\r\n$1\r\na\r\n$1\r\nb\r\n";
+        for proto in PROTOCOLS {
+            assert_eq!(decode(two, proto, 2), Some((4, vec![11, 18])));
+            assert_eq!(decode(two, proto, 1), None, "a count above the leg's keys");
+            assert_eq!(decode(two, proto, 3), None, "a count below the leg's keys");
+            assert_eq!(decode(b"*2\r\n$1\r\na\r\n", proto, 2), None, "fewer frames than its count");
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_are_malformed() {
+        for proto in PROTOCOLS {
+            assert_eq!(decode(b"*1\r\n$1\r\na\r\n", proto, 1), Some((4, vec![11])));
+            assert_eq!(decode(b"*1\r\n$1\r\na\r\nX", proto, 1), None, "a byte past the frames");
+            assert_eq!(decode(b"*1\r\n$1\r\na\r\n$1\r\nb\r\n", proto, 1), None, "a frame past");
+            assert_eq!(decode(b"*1\r\n$1\r\nab\r\n", proto, 1), None, "a payload past its length");
+        }
+    }
+
+    #[test]
+    fn a_negative_length_other_than_the_null_is_malformed() {
+        for proto in PROTOCOLS {
+            for frame in ["$-2\r\n", "$-0\r\n", "$-9223372036854775808\r\n"] {
+                let raw = format!("*1\r\n{frame}");
+                assert_eq!(decode(raw.as_bytes(), proto, 1), None, "{proto:?} {frame:?}");
+            }
+        }
+    }
+
+    /// A header is its type byte, its digits and CRLF. A one-byte payload
+    /// whose length is written with leading zeros reaches the bound with a
+    /// payload that exists, so the header's own length alone decides.
+    #[test]
+    fn a_frame_header_past_its_bound_is_malformed() {
+        let bound = JSON_LEG_FRAME_HEADER_BYTES_MAX;
+        for header_bytes in [bound - 1, bound, bound + 1] {
+            let digits = header_bytes - 3;
+            let element = format!("*1\r\n${:0digits$}\r\na\r\n", 1);
+            let count = format!("*{:0digits$}\r\n$1\r\na\r\n", 1);
+            let (want_element, want_count) = if header_bytes <= bound {
+                (Some((4, vec![element.len()])), Some((header_bytes, vec![count.len()])))
+            } else {
+                (None, None)
+            };
+            for proto in PROTOCOLS {
+                assert_eq!(decode(element.as_bytes(), proto, 1), want_element, "{header_bytes} B");
+                assert_eq!(decode(count.as_bytes(), proto, 1), want_count, "{header_bytes} B");
+            }
+        }
+    }
+}

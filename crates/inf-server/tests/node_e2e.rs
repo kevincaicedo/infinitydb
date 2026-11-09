@@ -7281,27 +7281,48 @@ fn json_mget_gathers_across_cells() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// One split fixture of the gather oracle: a multi-key `JSON.*` row over one
-/// key per cell of a two-cell node, cell 0's key first, and the reply at the
-/// default budget, whose length L is the boundary: served at L, refused at
+/// One split fixture of the gather oracle: a multi-key `JSON.*` row over
+/// keys on both cells of a two-cell node, and its reply under each protocol,
+/// whose length L is that protocol's boundary: served at L, refused at
 /// L − 1, where each leg alone fits and only the whole crosses (ADR-0173 D1).
+/// A key never set answers the protocol's null inside its leg, which runs
+/// under the client's protocol, so the coordinator reads that protocol's
+/// null at L and at L − 1.
 #[cfg(feature = "doc")]
 struct SplitFixture {
     row: &'static str,
-    /// The document each cell's key holds, cell 0's first.
-    docs: [&'static [u8]; 2],
+    /// Per key in argv order: its owning cell, and the document it holds or
+    /// `None` for a key never set.
+    keys: &'static [(u16, Option<&'static [u8]>)],
     /// The command's arguments after its keys.
     tail: &'static [&'static [u8]],
-    reply: &'static [u8],
+    /// The reply under RESP2.
+    resp2: &'static [u8],
+    /// The reply under RESP3.
+    resp3: &'static [u8],
 }
 
+/// `JSON.MGET` over one document per cell, cell 0's first; then over a
+/// missing key on cell 1, cell 0's key and cell 1's, where the remote leg is
+/// a null and an element and the reply interleaves the two legs' elements in
+/// argv order.
 #[cfg(feature = "doc")]
-const SPLIT_FIXTURES: &[SplitFixture] = &[SplitFixture {
-    row: "JSON.MGET",
-    docs: [br#"{"n":1}"#, br#"{"n":22}"#],
-    tail: &[b"$.n"],
-    reply: b"*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
-}];
+const SPLIT_FIXTURES: &[SplitFixture] = &[
+    SplitFixture {
+        row: "JSON.MGET",
+        keys: &[(0, Some(br#"{"n":1}"#)), (1, Some(br#"{"n":22}"#))],
+        tail: &[b"$.n"],
+        resp2: b"*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+        resp3: b"*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+    },
+    SplitFixture {
+        row: "JSON.MGET",
+        keys: &[(1, None), (0, Some(br#"{"n":1}"#)), (1, Some(br#"{"n":22}"#))],
+        tail: &[b"$.n"],
+        resp2: b"*3\r\n$-1\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+        resp3: b"*3\r\n_\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+    },
+];
 
 /// The `JSON.` rows of `rows` whose key spec spans more than one argument and
 /// that no fixture of `fixtures` covers: a multi-key `JSON.*` command whose
@@ -7331,10 +7352,35 @@ enum SplitScope {
     Ns,
 }
 
-/// One leg of a split fixture at `budget`: the reply behind `PING`, read as
-/// `want`, and each cell's two counters, which say whose check refused.
+/// The protocol a split fixture's client speaks, which its legs run under.
 #[cfg(feature = "doc")]
-fn split_leg(f: &SplitFixture, scope: SplitScope, budget: usize, want: &[u8]) -> [[u64; 2]; 2] {
+#[derive(Copy, Clone, Debug)]
+enum SplitProtocol {
+    Resp2,
+    Resp3,
+}
+
+#[cfg(feature = "doc")]
+impl SplitFixture {
+    fn reply(&self, protocol: SplitProtocol) -> &'static [u8] {
+        match protocol {
+            SplitProtocol::Resp2 => self.resp2,
+            SplitProtocol::Resp3 => self.resp3,
+        }
+    }
+}
+
+/// One leg of a split fixture at `budget` under `protocol`: the reply behind
+/// `PING`, read as `want`, and each cell's two counters, which say whose
+/// check refused.
+#[cfg(feature = "doc")]
+fn split_leg(
+    f: &SplitFixture,
+    scope: SplitScope,
+    protocol: SplitProtocol,
+    budget: usize,
+    want: &[u8],
+) -> [[u64; 2]; 2] {
     let store = StoreConfig { doc_max_reply_bytes: budget, ..StoreConfig::default() };
     let dir = temp_data_dir("jsonsplit");
     let (node, _log) = match scope {
@@ -7342,20 +7388,32 @@ fn split_leg(f: &SplitFixture, scope: SplitScope, budget: usize, want: &[u8]) ->
         SplitScope::Ns => Node::start_recorded_in(2, Some(dir.clone()), store),
     };
     let mut client = conn_on_cell(&node, 0);
-    let keys = [key_for_cell_prefixed(2, 0, "split"), key_for_cell_prefixed(2, 1, "split")];
+    if let SplitProtocol::Resp3 = protocol {
+        hello3(&mut client);
+    }
+    let keys: Vec<Vec<u8>> = f
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(index, &(cell, _))| key_for_cell_prefixed(2, cell, &format!("split{index}")))
+        .collect();
     let mut setup = Vec::new();
-    let mut oks = f.docs.len();
+    let mut oks = 0;
     if let SplitScope::Ns = scope {
         setup.extend(cmd(&[b"INF.NS", b"CREATE", b"docs", b"MODE", b"memory"]));
         setup.extend(cmd(&[b"INF.NS", b"USE", b"docs"]));
         oks += 2;
     }
-    for (key, doc) in keys.iter().zip(f.docs) {
-        setup.extend(cmd(&[b"JSON.SET", key, b"$", doc]));
+    for (key, &(_, doc)) in keys.iter().zip(f.keys) {
+        if let Some(doc) = doc {
+            setup.extend(cmd(&[b"JSON.SET", key, b"$", doc]));
+            oks += 1;
+        }
     }
     client.write_all(&setup).expect("write");
     read_exactly(&mut client, &b"+OK\r\n".repeat(oks));
-    let mut argv: Vec<&[u8]> = vec![f.row.as_bytes(), &keys[0], &keys[1]];
+    let mut argv: Vec<&[u8]> = vec![f.row.as_bytes()];
+    argv.extend(keys.iter().map(Vec::as_slice));
     argv.extend_from_slice(f.tail);
     let mut pipeline = cmd(&[b"PING"]);
     pipeline.extend(cmd(&argv));
@@ -7372,24 +7430,29 @@ fn split_leg(f: &SplitFixture, scope: SplitScope, budget: usize, want: &[u8]) ->
     counters
 }
 
-/// A split fixture's boundary pair in `scope`: served at L with no refusal
-/// counted, refused at L − 1 by the coordinator's account alone (cell 0
-/// counts one refusal of L bytes; cell 1, whose leg fit, none).
+/// A split fixture's boundary pair in `scope`, under RESP2 and under RESP3:
+/// served at that protocol's L with no refusal counted, refused at L − 1 by
+/// the coordinator's account alone (cell 0 counts one refusal of L bytes;
+/// cell 1, whose leg fit, none).
 #[cfg(feature = "doc")]
 fn split_boundary(f: &SplitFixture, scope: SplitScope) {
-    let length = f.reply.len();
-    let served = split_leg(f, scope, length, f.reply);
-    assert_eq!(served, [[0, 0], [0, 0]], "{} {scope:?} at L = {length}", f.row);
-    let refused = split_leg(f, scope, length - 1, b"-ERR reply too large\r\n");
-    let want = [[1, u64::try_from(length).expect("u64")], [0, 0]];
-    assert_eq!(refused, want, "{} {scope:?} at L - 1: whose check refused", f.row);
+    for protocol in [SplitProtocol::Resp2, SplitProtocol::Resp3] {
+        let what = format!("{} over {} keys, {scope:?} {protocol:?}", f.row, f.keys.len());
+        let reply = f.reply(protocol);
+        let length = reply.len();
+        let served = split_leg(f, scope, protocol, length, reply);
+        assert_eq!(served, [[0, 0], [0, 0]], "{what} at L = {length}");
+        let refused = split_leg(f, scope, protocol, length - 1, b"-ERR reply too large\r\n");
+        let want = [[1, u64::try_from(length).expect("u64")], [0, 0]];
+        assert_eq!(refused, want, "{what} at L - 1: whose check refused");
+    }
 }
 
 /// The gather oracle in a numbered database: every multi-key `JSON.*` row
 /// has a split fixture, and each is served at its L and refused at L − 1
-/// at the wire, behind `PING`, though each leg fits. The canary of the
-/// coverage check runs in the same test: the same rows with no fixture name
-/// the multi-key row.
+/// at the wire, behind `PING`, under RESP2 and RESP3, though each leg fits.
+/// The canary of the coverage check runs in the same test: the same rows
+/// with no fixture name the multi-key row.
 #[test]
 #[cfg(feature = "doc")]
 fn every_split_json_row_is_charged_whole_in_a_numbered_database() {
@@ -7400,7 +7463,8 @@ fn every_split_json_row_is_charged_whole_in_a_numbered_database() {
     }
 }
 
-/// The gather oracle's named-namespace leg, on the durable node shape.
+/// The gather oracle's named-namespace leg, on the durable node shape,
+/// under RESP2 and RESP3.
 #[test]
 #[cfg(feature = "doc")]
 fn every_split_json_row_is_charged_whole_in_a_named_namespace() {
