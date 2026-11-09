@@ -53,8 +53,8 @@ crates/inf-server/src/plane/publish.rs	fn dispatch_pubsub	1	A	2027-01-31
 crates/inf-store/src/address_space.rs	fn AddressSpace::new	2	R	2027-01-31
 crates/inf-store/src/address_space.rs	struct AddressSpace	2	R	2027-01-31
 crates/inf-store/src/address_space.rs	use std::collections::VecDeque	1	R	2027-01-31
-crates/inf-store/src/tiered.rs	fn TieredTable::new	3	R	2027-01-31
-crates/inf-store/src/tiered.rs	struct TieredTable	3	R	2027-01-31
+crates/inf-store/src/tiered.rs	fn TieredTable::new	2	R	2027-01-31
+crates/inf-store/src/tiered.rs	struct TieredTable	2	R	2027-01-31
 crates/inf-store/src/tiered.rs	use std::collections::{…}	2	R	2027-01-31
 crates/inf-store/src/tiered/shadow.rs	fn ShadowSet::new	1	R	2027-01-31
 crates/inf-store/src/tiered/shadow.rs	struct ShadowSet	1	R	2027-01-31
