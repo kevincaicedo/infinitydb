@@ -431,6 +431,10 @@ pub(crate) struct TierCell<F: SegmentFs> {
     /// The node's grant directory and this cell's receipts; `None` on a
     /// cell with no catalog writer, which installs no tiered owner.
     grants: Option<CellGrants>,
+    /// The canary's dropped owners, parked aside with their positions and
+    /// receipts already returned.
+    #[cfg(inf_canary_grant_return_at_drop)]
+    parked: Vec<Box<TierNs<F>>>,
     /// Installs and drops that met a position its grant says cannot be
     /// there (F2, F3): zero while a position is granted again only after
     /// every cell's receipt.
@@ -737,8 +741,28 @@ impl<F: SegmentFs> TierCell<F> {
         if self.turn.holder == Some(ns) {
             self.turn.holder = None;
         }
-        *slot = Position::Draining { ns: owner, release, phase: DrainPhase::Round };
+        #[cfg(inf_canary_grant_return_at_drop)]
+        {
+            let _ = (slot, release);
+            self.park_at_drop(pos, owner);
+        }
+        #[cfg(not(inf_canary_grant_return_at_drop))]
+        {
+            *slot = Position::Draining { ns: owner, release, phase: DrainPhase::Round };
+        }
         true
+    }
+
+    /// The canary's drop: the position and this cell's receipt returned at
+    /// once, the owner parked aside until its round's sent ops end, its
+    /// handles open meanwhile.
+    #[cfg(inf_canary_grant_return_at_drop)]
+    fn park_at_drop(&mut self, pos: GrantPos, owner: Box<TierNs<F>>) {
+        self.positions[pos.index()] = Position::Vacant { round_seq: owner.round_seq };
+        if let Some(grants) = &self.grants {
+            grants.receipts.publish(pos, owner.ns.0);
+        }
+        self.parked.push(owner);
     }
 
     /// A compaction chain's end (ADR-0148 D3): resolved by position and id,
@@ -772,6 +796,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             positions: core::array::from_fn(|_| Position::Vacant { round_seq: 0 }),
             live: Vec::with_capacity(POSITIONS),
             grants,
+            #[cfg(inf_canary_grant_return_at_drop)]
+            parked: Vec::new(),
             position_conflicts: 0,
             cold: None,
             ram_hit_us: LogHistogram::new(),
@@ -1198,6 +1224,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         persisted: impl Fn(u64) -> bool,
         settled: impl Fn(u64) -> bool,
     ) -> u32 {
+        #[cfg(inf_canary_grant_return_at_drop)]
+        self.parked.retain(|t| t.round.as_ref().is_some_and(|r| r.pending > 0));
         let mut units = 0u32;
         for index in 0..POSITIONS {
             let Position::Draining { ns: t, release, phase } = &mut self.positions[index] else {
@@ -1488,6 +1516,9 @@ fn drained<F: SegmentFs>(t: &TierNs<F>, settled: impl Fn(u64) -> bool) -> bool {
     let files = t.flush.catalog_end_id().is_none() && t.retired.is_empty();
     let fence = t.extent_fence.get();
     let held = Rc::strong_count(&t.holds) > 1 || (fence != 0 && !settled(fence));
+    // The canary: the terminal step ignores the extent readers' holds and
+    // the extent fence.
+    let held = held && !cfg!(inf_canary_lifetime_holds_ignored);
     files && !t.compact_inflight && !held
 }
 

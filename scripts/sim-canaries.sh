@@ -788,6 +788,15 @@ rows=(
   # ADR-0202 D3: a listed name the stream returns again after its removal
   # is that earlier removal. Planted, the second removal refuses the boot.
   "inf_canary_recover_listing_repeat_refused crate-test inf-server test:recover_replay_steps the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal REPEAT: the boot refused"
+  # ADR-0148 D3: a drop returns its position and publishes its receipt at
+  # once, the owner parked aside with its handles open: the successor the
+  # returned grant admits is flushed beside the dropped owner's files, so a
+  # 65th directory holds open files under one shard.
+  "inf_canary_grant_return_at_drop m4-ns-lifetimes LIFETIMES:"
+  # ADR-0148 D3: the terminal step ignores the extent readers' holds and the
+  # extent fence: a held extent read and barrier keep the dropped
+  # namespace's directory open while its successor flushes.
+  "inf_canary_lifetime_holds_ignored m4-ns-lifetimes LIFETIMES:"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
