@@ -315,6 +315,8 @@ impl TieredTable {
     pub fn commit_retirement(&mut self) -> Vec<u32> {
         let landed = self.live.ckpt_begun();
         self.reloc_origins.retain(|_, origins| {
+            #[cfg(test)]
+            tests::DRAIN_VISITS.with(|visits| visits.set(visits.get() + 1));
             origins.retain(|&(_, stamp)| stamp >= landed);
             !origins.is_empty()
         });
@@ -405,6 +407,8 @@ impl TieredTable {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use inf_foundation::{KeyHasher, LogicalAddr};
     use inf_log::flush::TierFileMeta;
     use inf_log::tier::SealReason;
@@ -415,6 +419,12 @@ mod tests {
     use crate::record::{RecordKind, RecordSpec};
 
     const PAGE: u64 = 4 << 10;
+
+    thread_local! {
+        /// Origin-map entries the covering swap's drain visited on this
+        /// thread: the work of the swap's step, which a step must bound.
+        pub(super) static DRAIN_VISITS: Cell<u64> = const { Cell::new(0) };
+    }
 
     /// One cold record: its key's hash, its address below the life origin
     /// and its image, as a verified cold read fetches it.
@@ -503,6 +513,34 @@ mod tests {
             keys <= BAND_KEYS,
             "{keys} origin keys after {promoted} promotions with no covering swap: the map has \
              no key cap; the 4 MiB band holds {BAND_KEYS}"
+        );
+    }
+
+    /// The covering swap drains the origin map in its commit step, one pass
+    /// over every key: after 10^5 relocations a single `commit_retirement`
+    /// visits 10^5 entries. A step visits at most 4,096 and leaves the rest
+    /// to later turns. The table takes a 64 MiB budget, whose band holds
+    /// more keys than one step may visit.
+    #[test]
+    #[ignore = "the covering swap drains the relocation-origin map in one pass over every key, \
+                O(keys) in one step; red until the drain is a sliced sweep of at most 4,096 \
+                entries a turn"]
+    fn one_swap_step_visits_a_bounded_slice_of_the_origin_map() {
+        const STEP_VISITS_MAX: u64 = 4_096;
+        let (mut table, cold) = cold_table(64 << 20, 100_000);
+        let promoted = promote_each(&mut table, &cold);
+        let keys = table.reloc_origin_keys();
+        assert!(
+            keys as u64 > STEP_VISITS_MAX,
+            "engagement: {keys} keys after {promoted} promotions"
+        );
+        let before = DRAIN_VISITS.with(Cell::get);
+        let _retired = table.commit_retirement();
+        let visits = DRAIN_VISITS.with(Cell::get) - before;
+        assert!(
+            visits <= STEP_VISITS_MAX,
+            "one covering swap's step visited {visits} of {keys} origin entries; a step visits at \
+             most {STEP_VISITS_MAX}"
         );
     }
 }
