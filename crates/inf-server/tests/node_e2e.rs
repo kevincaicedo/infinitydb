@@ -7475,6 +7475,7 @@ fn every_split_json_row_is_charged_whole_in_a_named_namespace() {
 }
 
 /// One array reply of bulk and null elements, read whole as it came.
+#[cfg(feature = "doc")]
 fn read_bulk_array(stream: &mut TcpStream) -> Vec<u8> {
     let mut reply = read_line(stream);
     let count: usize = std::str::from_utf8(&reply[1..reply.len() - 2])
@@ -7496,6 +7497,7 @@ fn read_bulk_array(stream: &mut TcpStream) -> Vec<u8> {
 }
 
 /// `n` bytes of `stream`, read whole.
+#[cfg(feature = "doc")]
 fn read_n(stream: &mut TcpStream, n: usize) -> Vec<u8> {
     let mut got = vec![0u8; n];
     stream
