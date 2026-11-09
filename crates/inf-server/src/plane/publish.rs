@@ -286,7 +286,7 @@ pub(super) async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Cl
         };
         match reserve.as_mut() {
             Some(reserve) => {
-                let mut legs = FanLegs::open(reserve);
+                let mut legs = FanLegs::open(reserve, &shared.node.fabric_reserve_refused_cell);
                 fan_legs(&shared, &item, &mut legs).await;
                 legs.settle(&mut fold).await;
             }
@@ -318,8 +318,8 @@ async fn fan_legs<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 }
 
 /// The fan without the cell's reserve, derived never (the running pump
-/// holds it): each leg a general send and its wait, the replies folded in
-/// leg order.
+/// holds it): each leg a general send and its wait, counted as a refused
+/// leg, the replies folded in leg order.
 async fn fan_unreserved<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     item: &OwnerPub,
@@ -330,6 +330,8 @@ async fn fan_unreserved<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     for cell in targets {
         let fan = PubFanArgv::new(&item.channel, &item.payload, leg_tag(item, cell));
         let to = CellId(cell);
+        let refused = &shared.node.fabric_reserve_refused_cell;
+        refused.set(refused.get() + 1);
         if let Ok(waiter) =
             send_apply(shared, to, ApplyOrigin::Program, Protocol::Resp2, 0, fan.argv()).await
         {

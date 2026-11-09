@@ -20,6 +20,7 @@
 //! the fabric's ring relation: it reads
 //! [`MeshConfig::has_reply_headroom`], the relation's one statement.
 
+use core::cell::Cell;
 use core::fmt;
 
 use inf_fabric::{
@@ -167,23 +168,27 @@ impl PlaneFabric {
     ///
     /// # Errors
     /// [`FanLegRefused`], derived never: a peer at or below the fan's last,
-    /// or no credit free. Nothing is staged.
+    /// or no credit free. Nothing is staged, and the refusal is counted
+    /// once, in the cell's `fabric_reserve_refused_cell`.
     pub(super) fn stage_fan_leg(
         &mut self,
         legs: &mut FanLegs<'_>,
         to: CellId,
         op: &FanLegOp<'_>,
     ) -> Result<(), FanLegRefused> {
-        if legs.last.is_some_and(|last| to.0 <= last.0) {
-            return Err(FanLegRefused::NotAscending);
-        }
-        match self.fabric.send(to, &op.0) {
-            Ok(()) => {
-                legs.last = Some(to);
-                Ok(())
+        let refused = if legs.last.is_some_and(|last| to.0 <= last.0) {
+            FanLegRefused::NotAscending
+        } else {
+            match self.fabric.send(to, &op.0) {
+                Ok(()) => {
+                    legs.last = Some(to);
+                    return Ok(());
+                }
+                Err(SendError::NoCredit { .. }) => FanLegRefused::NoCredit,
             }
-            Err(SendError::NoCredit { .. }) => Err(FanLegRefused::NoCredit),
-        }
+        };
+        legs.refused.set(legs.refused.get() + 1);
+        Err(refused)
     }
 
     pub(super) fn next_token(&mut self) -> FabricToken {
@@ -316,18 +321,22 @@ pub(super) struct FanReserve {
     _sealed: (),
 }
 
-/// One open fan: the reserve it borrows, the last peer a leg went to, and
-/// every leg's reply waiter in leg order.
+/// One open fan: the reserve it borrows, the last peer a leg went to,
+/// every leg's reply waiter in leg order, and the cell's count of refused
+/// legs.
 #[must_use = "a fan settles before the next one opens"]
 pub(super) struct FanLegs<'r> {
     _reserve: &'r mut FanReserve,
     last: Option<CellId>,
     waiters: Vec<GateWait<u64, OwnedOutcome>>,
+    refused: &'r Cell<u64>,
 }
 
 impl<'r> FanLegs<'r> {
-    pub(super) fn open(reserve: &'r mut FanReserve) -> FanLegs<'r> {
-        FanLegs { _reserve: reserve, last: None, waiters: Vec::new() }
+    /// Opens a fan on the cell's reserve; `refused` is the cell's
+    /// `fabric_reserve_refused_cell`.
+    pub(super) fn open(reserve: &'r mut FanReserve, refused: &'r Cell<u64>) -> FanLegs<'r> {
+        FanLegs { _reserve: reserve, last: None, waiters: Vec::new(), refused }
     }
 
     /// A staged leg's reply waiter, or a refused leg's general one: either
@@ -359,6 +368,7 @@ pub(super) enum FanLegRefused {
 
 #[cfg(test)]
 mod tests {
+    use core::cell::Cell;
     use core::pin::pin;
     use core::task::{Context, Poll, Waker};
 
@@ -410,6 +420,7 @@ mod tests {
     #[test]
     fn a_general_stage_keeps_the_reserve_and_a_leg_takes_it() {
         let (mut plane, mut reserve, _peer) = two_cells();
+        let refused = Cell::new(0);
         let token = plane.next_token();
         let ops = [
             apply(&mut plane),
@@ -433,10 +444,11 @@ mod tests {
             plane.stage_general(PEER, &fourth),
             Err(SendError::NoCredit { needed: 2, available: 1 })
         );
-        let mut legs = FanLegs::open(&mut reserve);
+        let mut legs = FanLegs::open(&mut reserve, &refused);
         let op = leg(&mut plane);
         assert_eq!(plane.stage_fan_leg(&mut legs, PEER, &op), Ok(()));
         assert_eq!(plane.fabric.credits(PEER), 0, "the leg took the reserved credit");
+        assert_eq!(refused.get(), 0);
         settle(legs);
     }
 
@@ -445,13 +457,15 @@ mod tests {
     #[test]
     fn a_second_leg_to_one_peer_is_refused_then_staged_general() {
         let (mut plane, mut reserve, _peer) = two_cells();
-        let mut legs = FanLegs::open(&mut reserve);
+        let refused = Cell::new(0);
+        let mut legs = FanLegs::open(&mut reserve, &refused);
         let first = leg(&mut plane);
         assert_eq!(plane.stage_fan_leg(&mut legs, PEER, &first), Ok(()));
         let second = leg(&mut plane);
         let before = plane.fabric.credits(PEER);
         assert_eq!(plane.stage_fan_leg(&mut legs, PEER, &second), Err(FanLegRefused::NotAscending));
         assert_eq!(plane.fabric.credits(PEER), before, "a refused leg stages nothing");
+        assert_eq!(refused.get(), 1, "the refusal is counted once");
         assert_eq!(plane.stage_general(PEER, &second.into_general()), Ok(()));
         assert_eq!(plane.fabric.credits(PEER), before - 1);
         settle(legs);
@@ -462,11 +476,12 @@ mod tests {
     #[test]
     fn a_settled_fans_credit_returns_for_the_next_fan() {
         let (mut plane, mut reserve, mut peer) = two_cells();
+        let refused = Cell::new(0);
         for _ in 0..3 {
             let op = apply(&mut plane);
             assert_eq!(plane.stage_general(PEER, &op), Ok(()));
         }
-        let mut legs = FanLegs::open(&mut reserve);
+        let mut legs = FanLegs::open(&mut reserve, &refused);
         let op = leg(&mut plane);
         assert_eq!(plane.stage_fan_leg(&mut legs, PEER, &op), Ok(()));
         settle(legs);
@@ -485,10 +500,11 @@ mod tests {
         peer.flush();
         plane.drain(16, |_, _| {});
         assert_eq!(plane.fabric.credits(PEER), 1, "the leg's credit is back");
-        let mut legs = FanLegs::open(&mut reserve);
+        let mut legs = FanLegs::open(&mut reserve, &refused);
         let op = leg(&mut plane);
         assert_eq!(plane.stage_fan_leg(&mut legs, PEER, &op), Ok(()));
         settle(legs);
+        assert_eq!(refused.get(), 0, "no leg of either fan was refused");
     }
 
     /// Each case is one on which the fabric's relation and its successor

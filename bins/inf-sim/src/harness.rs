@@ -1877,6 +1877,16 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         }
     }
 
+    // The publish fan's reserve (ADR-0192 D3): every cell's count of fan
+    // legs that found no reserved credit reads 0, stalled or not; any other
+    // reading is the reserve's arithmetic wrong.
+    for (i, node) in nodes.iter().enumerate() {
+        let legs = node.fabric_reserve_refused_cell.get();
+        if legs != 0 {
+            violations.push(format!("RESERVE REFUSED: cell {i}, {legs} legs"));
+        }
+    }
+
     // The waker's wiring check (ADR-0003 A1.4): every cell's `waker_foreign_ops`, the gauge
     // INFO's `# Tripwires` renders, reads 0. The simulator runs every cell's loop on one thread,
     // so a waker used from another cell's step takes the owner lane and is not counted: a
