@@ -574,10 +574,12 @@ impl AddressSpace {
         prospect.top_rel - self.commit_floor_rel <= self.window_limit
     }
 
-    /// The 48-bit end check, in one place for [`alloc`](Self::alloc) and
-    /// [`room`](Self::room): the prospect's start address when the
-    /// record's end lies inside the space, else `None` — the space is
-    /// monotonic for a namespace's whole existence and never wraps.
+    /// The 48-bit end check, in one place for `classify`, which
+    /// [`alloc`](Self::alloc), [`room`](Self::room) and
+    /// [`stall_target`](Self::stall_target) match: the prospect's start
+    /// address when the record's end lies inside the space, else `None` —
+    /// the space is monotonic for a namespace's whole existence and never
+    /// wraps.
     #[inline]
     fn start_inside(&self, prospect: Prospect) -> Option<LogicalAddr> {
         let start = LogicalAddr::from_raw(self.life_origin.checked_add(prospect.start_rel)?)?;
@@ -594,32 +596,46 @@ impl AddressSpace {
     }
 
     /// The room question (ADR-0174 D2 rule 1): what must happen before
-    /// `len` bytes can be placed at the tail. Pure; mutates nothing.
-    /// Boot replay asks it at most four times per record (`Demote`,
-    /// `Pad`, `Demote`, `Fits` — D2 rule 6's proof, whose premise is a
-    /// window of at least half the ring: the ring is derived from the
-    /// spec at every boot), and the live path consumes the same
-    /// arithmetic through [`alloc`](Self::alloc) and
+    /// `len` bytes can be placed at the tail. It mutates nothing but the
+    /// hole marks' census row, which counts an answer the full marks gave
+    /// (`classify`'s marks-full arm). Boot replay asks it at most four
+    /// times per record (`Demote`, `Pad`, `Demote`, `Fits` — D2 rule 6's
+    /// proof, whose premise is a window of at least half the ring: the ring
+    /// is derived from the spec at every boot), and the live path consumes
+    /// the same classification through [`alloc`](Self::alloc) and
     /// [`stall_target`](Self::stall_target).
     ///
     /// # Panics
     /// As [`alloc`](Self::alloc).
-    pub fn room(&self, len: usize) -> Room {
-        self.classify(self.prospect(len as u64))
+    pub fn room(&mut self, len: usize) -> Room {
+        let prospect = self.prospect(len as u64);
+        self.classify(prospect)
     }
 
-    /// Classifies a prospect against the window and the tail (D2 rules 1
-    /// and 6). A record longer than the window is `End` before any need
-    /// is computed, so every need below is one of a record the window
-    /// holds. A need below or at the tail is a `Demote`; one above it is
-    /// unreachable by any release — the tail pads first: in case (a), a
-    /// ring-top hole, to the ring top the hole would make, which may need
-    /// room of its own, always at or below the tail (the hole is shorter
-    /// than the record, which is at most the window); in case (b) to the
-    /// next commit-page boundary, which commits nothing.
-    fn classify(&self, prospect: Prospect) -> Room {
+    /// Classifies a prospect against the window, the tail and the hole
+    /// marks (D2 rules 1 and 6, ADR-0174 D2.1): the one classification
+    /// [`room`](Self::room), [`alloc`](Self::alloc) and
+    /// [`stall_target`](Self::stall_target) match. A record longer than the
+    /// window is `End` before any need is computed, so every need below is
+    /// one of a record the window holds. An answer that would push a hole
+    /// mark — a placement past a ring-top hole, or a pad — while the marks
+    /// are full is `Demote` of the front hole's end instead: the `flushed`
+    /// value that pops it, above the head and at or below the tail. The
+    /// marks-full arm is tested before `Fits`. Otherwise a need below or at
+    /// the tail is a `Demote`; one above it is unreachable by any release —
+    /// the tail pads first: in case (a), a ring-top hole, to the ring top
+    /// the hole would make, which may need room of its own, always at or
+    /// below the tail (the hole is shorter than the record, which is at
+    /// most the window); in case (b) to the next commit-page boundary,
+    /// which commits nothing.
+    fn classify(&mut self, prospect: Prospect) -> Room {
         if self.start_inside(prospect).is_none() || prospect.len > self.window_limit {
             return Room::End;
+        }
+        if prospect.hole > 0
+            && let Some(front_end) = self.marks_full()
+        {
+            return Room::Demote(front_end);
         }
         if self.fits(prospect) {
             return Room::Fits;
@@ -651,8 +667,25 @@ impl AddressSpace {
             // pad's need is answered as a demote to the tail.
             return Room::Demote(self.addr_at(rel_tail));
         }
+        if let Some(front_end) = self.marks_full() {
+            return Room::Demote(front_end);
+        }
         let to = self.addr_at(self.page_ceil(rel_tail));
         Room::Pad(PadTarget { to, tail, kind: PadKind::Page })
+    }
+
+    /// The marks-full arm's test, asked only where the answer would push a
+    /// hole mark: the hole marks' own admission answers, so their cap is
+    /// one compare, the deque's. A slot reserved here is dropped unused (the
+    /// placement or the pad reserves again in its own step, before any
+    /// other change); a refusal counts the row's crossing, once per ask.
+    /// `Some` is the front hole's end: the deque is full, so it holds one.
+    fn marks_full(&mut self) -> Option<LogicalAddr> {
+        if matches!(self.hole_marks.reserve(), Reserved::Slot(_)) {
+            return None;
+        }
+        let front = self.hole_marks.front().copied()?;
+        Some(self.addr_at(front.end() - self.life_origin))
     }
 
     /// Allocates `len` bytes at the tail, committing ring pages as
@@ -660,36 +693,43 @@ impl AddressSpace {
     /// `None` when the RAM window (in whole pages) would exceed the
     /// admission bound (the budget window — ADR-0053 D1; the ring by
     /// default) — the backpressure signal S07 turns into
-    /// suspend-on-flushed-progress — or at the 48-bit end of the space.
-    /// Both decide on one [`Prospect`] by the same two predicates,
-    /// [`fits`](Self::fits) and [`start_inside`](Self::start_inside);
-    /// `alloc` never classifies a refusal, whose reason is
-    /// [`stall_target`](Self::stall_target)'s or `room`'s to tell, so
-    /// the placing path pays the arithmetic once and makes no call.
+    /// suspend-on-flushed-progress — at the 48-bit end of the space, or
+    /// where the allocation would push a hole mark the full marks refuse.
+    /// It places on the one classification `room` and
+    /// [`stall_target`](Self::stall_target) match, so a refusal's reason
+    /// and wait target are theirs to tell.
     ///
     /// May advance the tail past a ring-top hole first (ADR-0052 D2);
     /// hole bytes are dead on arrival, counted, and tripwired. No state
-    /// changes on refusal.
+    /// changes on refusal but the hole marks' census row, which counts a
+    /// refusal the full marks gave.
     pub fn alloc(&mut self, len: usize) -> Option<LogicalAddr> {
         let prospect = self.prospect(len as u64);
-        if !self.fits(prospect) {
-            return None;
+        match self.classify(prospect) {
+            Room::Fits => Some(self.place(prospect)),
+            Room::Demote(_) | Room::Pad(_) | Room::End => None,
         }
-        let addr = self.start_inside(prospect)?;
-        if prospect.top_rel > self.commit_top_rel {
-            self.commit_rel_pages(self.commit_top_rel, prospect.top_rel);
-            self.commit_top_rel = prospect.top_rel;
-        }
+    }
+
+    /// Places a prospect `classify` answered `Fits` for, in this step: its
+    /// start lies inside the space, its pages fit the window, and a hole it
+    /// makes has a mark's room.
+    fn place(&mut self, prospect: Prospect) -> LogicalAddr {
+        let addr = self.addr_at(prospect.start_rel);
         if prospect.hole > 0 {
             self.push_hole(Hole { start: self.tail, len: prospect.hole });
             self.counters.seal_holes += 1;
             self.counters.seal_hole_bytes += prospect.hole;
             self.dead_bytes += prospect.hole;
         }
+        if prospect.top_rel > self.commit_top_rel {
+            self.commit_rel_pages(self.commit_top_rel, prospect.top_rel);
+            self.commit_top_rel = prospect.top_rel;
+        }
         self.counters.tail_allocs += 1;
         self.tail = self.life_origin + prospect.start_rel + prospect.len;
         self.assert_watermark_order();
-        Some(addr)
+        addr
     }
 
     /// Pads the tail to a [`Room::Pad`] answer (ADR-0174 D2 rule 6): the
@@ -774,21 +814,36 @@ impl AddressSpace {
     /// ambiguity. Pure query: counting a stall is the caller's explicit
     /// act ([`note_tail_alloc_stall`](Self::note_tail_alloc_stall)).
     ///
-    /// Reads the same [`Prospect`] as [`alloc`](Self::alloc): the window
-    /// binds at `top_rel − commit_floor_rel ≤ window_limit`,
+    /// Matches the one classification [`alloc`](Self::alloc) placed on:
+    /// `Fits` is `None` (the caller's alloc will succeed), and `Demote(a)`
+    /// is `a` — the window's need, or at full hole marks the front hole's
+    /// end. `Pad` and `End` answer the window's need as it stands: the
+    /// window binds at `top_rel − commit_floor_rel ≤ window_limit`,
     /// `commit_floor_rel` follows `head`, and `head` may only chase
     /// `flushed` — so the wait key is `life_origin + (top_rel −
-    /// window_limit)`. Both terms are page multiples, so once `flushed`
-    /// reaches the target and the release slice runs, the retried
-    /// allocation fits by construction (no spurious wakes). The target
-    /// is reported as it stands, above the tail included: the live path
-    /// parks on it as built, and the pad of ADR-0174 D2 rule 6 is boot
-    /// replay's answer to that case, which asks [`room`](Self::room)
-    /// instead.
-    pub fn stall_target(&self, len: usize) -> Option<LogicalAddr> {
+    /// window_limit)`, above the tail for a pad's need (the live path parks
+    /// on it as built, and the pad of ADR-0174 D2 rule 6 is boot replay's
+    /// answer to that case, which asks [`room`](Self::room) instead), and
+    /// `None` where the window holds the record and only the 48-bit end
+    /// refuses it. The terms are page multiples, so once `flushed` reaches
+    /// the target and the release slice runs, the retried allocation fits
+    /// by construction (no spurious wakes). Counts a full marks' answer on
+    /// their census row, as `room` does.
+    pub fn stall_target(&mut self, len: usize) -> Option<LogicalAddr> {
         let prospect = self.prospect(len as u64);
+        match self.classify(prospect) {
+            Room::Fits => None,
+            Room::Demote(target) => Some(target),
+            Room::Pad(_) | Room::End => self.need_as_it_stands(prospect),
+        }
+    }
+
+    /// The window's need for a prospect `classify` answered `Pad` or `End`
+    /// for: `None` while the window holds it (only the 48-bit end refused
+    /// it), else the `flushed` value its committed pages need.
+    fn need_as_it_stands(&self, prospect: Prospect) -> Option<LogicalAddr> {
         if self.fits(prospect) {
-            return None; // fits now — the caller's alloc will succeed.
+            return None;
         }
         LogicalAddr::from_raw(self.life_origin.checked_add(prospect.top_rel - self.window_limit)?)
     }
@@ -1753,6 +1808,189 @@ mod tests {
         assert_eq!(sp.stall_target(page as usize), None, "no watermark progress helps");
         let last = sp.alloc((page - 1) as usize).expect("ends exactly at the last address");
         assert_eq!(last.to_raw() + page - 1, LogicalAddr::MAX_RAW);
+    }
+
+    /// The marks-full state at 4 KiB pages, an 8-page ring and a 4-page
+    /// window: the head at page 5, three planted pads of a page, a page and
+    /// a page less 100 bytes pending above it, and the tail 100 bytes below
+    /// the ring top. A 200-byte record then fits the window but needs a
+    /// ring-top hole: a fourth mark.
+    fn space_at_full_marks(census: &Rc<CapCensus>) -> AddressSpace {
+        const PAGE: u64 = 4 << 10;
+        let mut sp = AddressSpace::new(
+            AddressSpaceConfig {
+                reserve_bytes: 8 * PAGE as usize,
+                page_bytes: PAGE as usize,
+                life_origin: LogicalAddr::ZERO,
+            },
+            census,
+        )
+        .expect("reservation");
+        sp.set_window_limit(4 * PAGE);
+        for len in [4 * PAGE, PAGE] {
+            assert!(sp.plant_hole(len), "a released pad");
+            sp.advance_ro_boundary(sp.tail());
+            sp.advance_flushed(sp.tail());
+            sp.advance_head(sp.tail());
+        }
+        for len in [PAGE, PAGE, PAGE - 100] {
+            assert!(sp.plant_hole(len), "a pending pad");
+        }
+        assert_eq!(sp.hole_marks.len(), HOLE_MARKS_MAX as usize);
+        assert_eq!(sp.tail().to_raw(), 8 * PAGE - 100);
+        sp
+    }
+
+    /// A placement that needs a fourth hole mark waits for the front hole
+    /// (ADR-0174 D2.1's marks-full arm, tested before `Fits`): at full marks
+    /// a 200-byte record that fits the window but needs a ring-top hole is
+    /// refused with nothing changed, and `room` and `stall_target` name the
+    /// front hole's end, the `flushed` value that pops it. Once `flushed`
+    /// passes the front hole and the head follows, the same record places
+    /// past its ring-top hole and the marks are full again.
+    #[test]
+    fn a_placement_that_needs_a_fourth_hole_mark_waits_for_the_front_hole() {
+        const PAGE: u64 = 4 << 10;
+        let census = CapCensus::new(inf_foundation::CellId(0)).0;
+        let mut sp = space_at_full_marks(&census);
+        let before = (sp.tail(), sp.counters(), sp.report(), sp.hole_marks.len());
+        assert_eq!(sp.alloc(200), None, "a fourth mark is refused");
+        assert_eq!((sp.tail(), sp.counters(), sp.report(), sp.hole_marks.len()), before);
+        let front_end = LogicalAddr::from_raw(6 * PAGE).expect("48-bit");
+        assert_eq!(sp.room(200), Room::Demote(front_end), "room names the front hole's end");
+        assert_eq!(sp.stall_target(200), Some(front_end), "and so does the stall target");
+        let crossings = census.row(HOLE_MARKS.name()).map_or(0, |row| row.crossings);
+        assert_eq!(crossings, 3, "each ask the full marks answered counts");
+        sp.advance_ro_boundary(sp.tail());
+        sp.advance_flushed(front_end);
+        sp.advance_head(front_end);
+        assert_eq!(sp.hole_marks.len(), 2, "the front hole popped");
+        let placed = sp.alloc(200).expect("places once the front hole flushed");
+        assert_eq!(placed.to_raw(), 8 * PAGE, "past its ring-top hole");
+        assert_eq!(sp.hole_marks.len(), 3, "its hole's mark");
+    }
+
+    /// At full marks a record whose room would be a page pad is answered
+    /// `Demote` of the front hole's end, never `Pad`: the pad's own mark
+    /// would be a fourth. Case (b) of ADR-0174 D2 rule 6, at a 4-page
+    /// window over an 8-page ring, the head at page 1: a record of four
+    /// pages less a byte needs page 6's committed top, above the tail.
+    #[test]
+    fn a_page_pad_at_full_marks_answers_the_front_holes_end() {
+        const PAGE: u64 = 4 << 10;
+        let census = CapCensus::new(inf_foundation::CellId(0)).0;
+        let mut sp = space_on(8 * PAGE as usize, PAGE as usize, &census);
+        sp.set_window_limit(4 * PAGE);
+        assert!(sp.plant_hole(PAGE));
+        sp.advance_ro_boundary(sp.tail());
+        sp.advance_flushed(sp.tail());
+        sp.advance_head(sp.tail());
+        let len = (4 * PAGE - 1) as usize;
+        for _ in 1..HOLE_MARKS_MAX {
+            assert!(sp.plant_hole(1));
+        }
+        let below_cap = sp.room(len);
+        assert!(matches!(below_cap, Room::Pad(_)), "with room for a mark it pads: {below_cap:?}");
+        assert!(sp.plant_hole(1));
+        let front_end = LogicalAddr::from_raw(PAGE + 1).expect("48-bit");
+        assert_eq!(sp.room(len), Room::Demote(front_end), "never Pad at full marks");
+    }
+
+    /// A space of [`space_at`]'s state with `marks` synthetic one-unit
+    /// intervals pending from the head up (the marks' state at its count;
+    /// their dead bytes play no part in a classification).
+    fn space_with_marks(
+        ring: u64,
+        window: u64,
+        rel_tail: u64,
+        floor: u64,
+        marks: u64,
+        census: &Rc<CapCensus>,
+    ) -> AddressSpace {
+        let mut sp = space_at_on(ring as usize, 4, window, rel_tail, floor, census);
+        for start in floor..floor + marks {
+            let Reserved::Slot(slot) = sp.hole_marks.reserve() else {
+                panic!("a synthetic mark under the cap")
+            };
+            slot.publish(Hole { start, len: 1 });
+        }
+        sp
+    }
+
+    /// One state and length at every mark count: the answers the three
+    /// consumers give, against the answer with no mark pending. Returns
+    /// whether the full marks answered a placement past a ring-top hole
+    /// (`.0`) or a pad (`.1`).
+    fn marks_case(ring: u64, window: u64, rel_tail: u64, floor: u64, len: u64) -> (bool, bool) {
+        let census = CapCensus::new(inf_foundation::CellId(0)).0;
+        let alone = space_with_marks(ring, window, rel_tail, floor, 0, &census).room(len as usize);
+        let hole = (rel_tail % ring) + len > ring;
+        let pad = matches!(alone, Room::Pad(_));
+        let mut answered = (false, false);
+        for marks in 0..=u64::from(HOLE_MARKS_MAX) {
+            if floor + marks > rel_tail {
+                continue;
+            }
+            let mut sp = space_with_marks(ring, window, rel_tail, floor, marks, &census);
+            let full = marks == u64::from(HOLE_MARKS_MAX);
+            let front = LogicalAddr::from_raw(floor + 1).expect("48-bit");
+            let room = sp.room(len as usize);
+            let target = sp.stall_target(len as usize);
+            let placed = sp.alloc(len as usize);
+            let what =
+                format!("ring {ring} window {window} tail {rel_tail} floor {floor} len {len}");
+            if full && (hole || pad) && alone != Room::End {
+                assert_eq!(room, Room::Demote(front), "{what} marks {marks}");
+            } else {
+                assert_eq!(room, alone, "{what} marks {marks}");
+            }
+            assert_eq!(placed.is_some(), room == Room::Fits, "{what} marks {marks}");
+            let refused = target.is_some() || room == Room::End;
+            assert_eq!(placed.is_none(), refused, "{what} marks {marks}");
+            if full && (hole || pad) && room != Room::End {
+                assert_eq!(target, Some(front), "{what}: the front hole's end");
+                answered = (answered.0 || !pad, answered.1 || pad);
+            }
+        }
+        answered
+    }
+
+    /// The three consumers of the one classification agree at every mark
+    /// count (ADR-0174 D2 rule 1, with the marks-full arm): over every
+    /// legal state at a 4-unit page and every length, with 0 to 3 marks
+    /// pending, `room` answers what it answers with none, except that at
+    /// full marks an answer that would push a mark — a placement past a
+    /// ring-top hole, or a pad — is `Demote` of the front interval's end;
+    /// `stall_target` names that address too; and `alloc` places exactly
+    /// where `room` answers `Fits` and refuses exactly where `stall_target`
+    /// names an address or the space ends. Both kinds of mark-pushing
+    /// answer must occur, else VACUOUS.
+    #[test]
+    fn room_stall_target_and_alloc_agree_at_every_mark_count() {
+        const PAGE: u64 = 4;
+        let mut answered = (0u64, 0u64);
+        for window_pages in 4..=9u64 {
+            let window = window_pages * PAGE;
+            let mut rings = vec![window.next_power_of_two()];
+            if window_pages.is_power_of_two() {
+                rings.push(2 * window);
+            }
+            for ring in rings {
+                for rel_tail in 0..ring {
+                    let mut floor = page_ceil_of(rel_tail, PAGE).saturating_sub(window);
+                    while floor <= page_floor_of(rel_tail, PAGE) {
+                        for len in 1..=ring / 2 {
+                            let (hole, pad) = marks_case(ring, window, rel_tail, floor, len);
+                            answered.0 += u64::from(hole);
+                            answered.1 += u64::from(pad);
+                        }
+                        floor += PAGE;
+                    }
+                }
+            }
+        }
+        assert!(answered.0 > 0 && answered.1 > 0, "VACUOUS: full-marks answers {answered:?}");
+        eprintln!("marks property: full-marks answers (hole, pad) {answered:?}");
     }
 
     #[test]

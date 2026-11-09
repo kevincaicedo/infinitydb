@@ -1555,3 +1555,91 @@ pub(super) async fn mset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         TieredReply::Done(reply.finish())
     }
 }
+
+#[cfg(test)]
+mod hole_refusal_tests {
+    use super::*;
+    use inf_fabric::{Mesh, MeshConfig};
+
+    const MIB: u64 = 1 << 20;
+
+    /// A write whose record needs a fourth hole mark is refused before any
+    /// mutation, and through `write_block_of` the refusal is the tail
+    /// stall's park, with no reply byte, never `ERR_OOM`; once `flushed`
+    /// passes the front hole and the head follows, the same write places.
+    /// The plane's keyspace holds the tiered table, built on the plane's
+    /// census, whose `hole-marks` row counts the refused ask. The table's
+    /// window is four 1 MiB pages over an eight-page ring: the head at page
+    /// 5, three planted pads pending above it (pages 5 and 6, then page 7
+    /// less 100 bytes), so a 200-byte record fits the window and needs a
+    /// ring-top hole.
+    #[test]
+    fn a_write_that_needs_a_fourth_hole_mark_parks_until_the_front_hole_flushes() {
+        let tier = inf_store::TierSpec {
+            maintain_slice_bytes: 64 << 10,
+            ..inf_store::TierSpec::for_budget(4 * MIB)
+        };
+        let spec = inf_store::NsSpec {
+            id: NsId(16),
+            name: b"tiered".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: Some(tier),
+        };
+        let fabric = Mesh::new(1, MeshConfig::default()).into_iter().next().expect("one cell");
+        let seed =
+            KeyspaceSeed::Uncataloged { cfg: inf_store::StoreConfig::default(), specs: vec![spec] };
+        let (plane, _serve_mark, _timer_set) =
+            ServerPlane::<NoopObserver, crate::StdSegmentFs>::new(
+                CellId(0),
+                1,
+                -1,
+                seed,
+                fabric,
+                Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+                NoopObserver,
+                false,
+            )
+            .expect("the plane");
+        let shared = &plane.shared;
+        let mut ks = shared.store.borrow_mut();
+        let table = ks.tiered_store_mut(NsId(16)).expect("the tiered table");
+        assert_eq!(table.space().ring_bytes(), 8 * MIB, "an eight-page ring");
+        let space = table.space_mut();
+        for len in [4 * MIB, MIB] {
+            assert!(space.plant_hole(len), "a released pad");
+            space.advance_ro_boundary(space.tail());
+            space.advance_flushed(space.tail());
+            space.advance_head(space.tail());
+        }
+        for len in [MIB, MIB, MIB - 100] {
+            assert!(space.plant_hole(len), "a pending pad");
+        }
+        let value = vec![b'v'; 200 - 8 - 1];
+        let hash = table.hash_key(b"k");
+        let before = (table.space().tail(), table.space().counters());
+        let refused = table.insert(b"k", &value, hash).expect_err("a fourth hole mark");
+        assert_eq!(refused, inf_store::OpError::OutOfMemory);
+        assert_eq!((table.space().tail(), table.space().counters()), before, "nothing changed");
+        let block = write_block_of(
+            shared,
+            table,
+            b"k",
+            StallProbe::Inline(&value),
+            refused,
+            Protocol::Resp2,
+        );
+        assert!(matches!(block, WriteBlock::Stall), "the writer parks on the tail stall");
+        let crossings = plane.cap_census().row("hole-marks").map(|row| row.crossings);
+        assert!(crossings.is_some_and(|n| n >= 1), "the refused ask counted: {crossings:?}");
+        let space = table.space_mut();
+        space.advance_ro_boundary(space.tail());
+        let front_end = LogicalAddr::from_raw(6 * MIB).expect("48-bit");
+        space.advance_flushed(front_end);
+        space.advance_head(front_end);
+        let placed = table.insert(b"k", &value, hash).expect("places once the front hole flushed");
+        assert_eq!(placed.to_raw(), 8 * MIB, "past the ring-top hole");
+    }
+}
