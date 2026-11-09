@@ -1390,6 +1390,37 @@ expect red "canaries: a crate-test row FAILED on its engagement check is not a c
 expect_output "canaries: the engagement red is named" "the test's engagement check, not its oracle" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture crate-test fake test:suite the_row VACUOUS: the fault never fired" >"$dir/rows"
 expect red "canaries: a witness cannot name the engagement check" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# A scenario row is judged on the planted simulator's log: a line naming the
+# row's token is a catch unless every such line is the leg's engagement
+# clause for it (`<token> VACUOUS`); a vacuity row's token follows the word.
+# Stub simulators stand at INF_CANARY_SIM_TARGET, and the stub cargo builds
+# nothing.
+sim_fixture() {
+    local name=$1 token=$2 planted=$3 dir sims
+    [ -n "$name" ] && [ -n "$work" ] || { echo "sim_fixture: empty name or work dir" >&2; exit 2; }
+    dir="$work/$name"
+    sims="$dir/target/canary-inf_canary_fixture/release"
+    mkdir -p "$dir/target/release" "$sims"
+    echo "inf_canary_fixture fake-scenario $token" >"$dir/rows"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/cargo"
+    printf '#!/usr/bin/env bash\necho "inf-sim: scenario fake-scenario: green"\n' >"$dir/target/release/inf-sim"
+    printf '#!/usr/bin/env bash\n%s\n' "$planted" >"$sims/inf-sim"
+    chmod +x "$dir/cargo" "$dir/target/release/inf-sim" "$sims/inf-sim"
+    echo "$dir"
+}
+violation='echo "inf-sim: ORACLE VIOLATION: TOKEN VIOLATION seed 0x1 cell 0: the rule broke"'
+engaged='echo "inf-sim: ORACLE VIOLATION: TOKEN VACUOUS seed 0x1 cell 0: the regime was not reached"'
+dir=$(sim_fixture sim-caught TOKEN "$violation; exit 1")
+expect green "canaries: a scenario row whose planted log names its token is a catch" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(sim_fixture sim-toothless TOKEN "exit 0")
+expect_red_because "canaries: a scenario row's planted build that stays green is NOT CAUGHT" "NOT CAUGHT" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(sim_fixture sim-vacuous TOKEN "$engaged; ${engaged/cell 0/cell 1}; exit 1")
+expect_red_because "canaries: a scenario row red on its token's engagement clause alone is not a catch" "the leg's engagement clause, not its oracle" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(sim_fixture sim-vacuous-and-caught TOKEN "$engaged; $violation; exit 1")
+expect green "canaries: an engagement line beside the oracle's violation is still a catch" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect_output "canaries: the catch quotes the violation, not the engagement line" "caught: inf-sim: ORACLE VIOLATION: TOKEN VIOLATION" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(sim_fixture sim-vacuity-row token-unengaged 'echo "inf-sim: ORACLE VIOLATION: VACUOUS seed 0x1: token-unengaged — the plant held nothing"; exit 1')
+expect green "canaries: a vacuity row, whose token follows the word, is a catch" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 # ADR-0159 A1.6: a `loom` row builds both legs under `--cfg loom` — the
 # stub answers only when it sees it, so a driver that dropped the cfg is
 # red for another reason, never a catch.
