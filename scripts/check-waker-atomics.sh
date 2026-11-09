@@ -405,7 +405,97 @@ else
     probe="$probe_for, $reds of $plants plants red, $greens of $cleans controls green"
 fi
 
-scope="$tree_target $flavor asm, vtable-resolved: 4 wakers + $((reached - wakers)) owner-lane bodies, $instrs_total instruction lines scanned, $unresolved callees with no body (each listed), $ijumps indirect jumps, $zero zero-instruction bodies; boundary ($live):${boundary_seen:- none}; probe: $probe"
+# ---- 3. the source census (ADR-0003 A1.6, A1.7) --------------------------
+# A hand-made `Waker` needs a `RawWakerVTable`, and the workspace ships one: in code (comments
+# and string literals removed), every `.rs` file under crates/, bins/ and tests/ that names it
+# is red unless it is an entry below, each a file with the rule that keeps it. An entry that is
+# absent, or names it nowhere, is red too, so an entry leaves with what it holds. The entries:
+# the executor's vtable; and a bench-only copy of the executor that an A/B keeps as its leg A,
+# listed from the change that holds both the copy and this census until the change that removes
+# the copy, its verdicts recorded.
+CENSUS_ENTRIES=(
+    "crates/inf-runtime/src/executor.rs|the executor's waker vtable"
+    "crates/inf-runtime/benches/waker_ab/executor_a.rs|the waker A/B's leg A, until its verdicts are recorded"
+)
+# A Rust file's code: comments (line and nested block), string literals (plain, byte and raw)
+# and char literals blanked; lifetimes stay. One line out per line in.
+cat >"$work/code-only.awk" <<'AWK'
+{
+    line = $0; out = ""; i = 1; n = length(line)
+    while (i <= n) {
+        c = substr(line, i, 1); two = substr(line, i, 2)
+        if (depth > 0) {
+            if (two == "*/") { depth--; i += 2 } else if (two == "/*") { depth++; i += 2 } else { i++ }
+            continue
+        }
+        if (instr) {
+            if (c == "\\") { i += 2 } else { if (c == "\"") instr = 0; i++ }
+            continue
+        }
+        if (inraw) {
+            if (substr(line, i, length(closer)) == closer) { inraw = 0; i += length(closer) } else { i++ }
+            continue
+        }
+        if (two == "//") break
+        if (two == "/*") { depth = 1; i += 2; continue }
+        if (c == "\"") { instr = 1; i++; continue }
+        prev = (i > 1) ? substr(line, i - 1, 1) : ""
+        if ((c == "r" || c == "b") && prev !~ /[A-Za-z0-9_]/ && match(substr(line, i), /^b?r#*"/)) {
+            closer = "\"" substr(substr(line, i, RLENGTH), (c == "b" ? 3 : 2), RLENGTH - (c == "b" ? 3 : 2))
+            inraw = 1; i += RLENGTH; continue
+        }
+        if (c == "'" && match(substr(line, i), /^'([^\\']|\\[^x]|\\x[0-9a-fA-F][0-9a-fA-F]|\\u[{][0-9a-fA-F]+[}])'/)) {
+            i += RLENGTH; continue
+        }
+        out = out c; i++
+    }
+    print out
+}
+AWK
+census_read=0
+census_named=
+for dir in crates bins tests; do
+    [ -d "$dir" ] || { echo "WAKER SCOPE ERROR: the census's directory $dir/ is missing"; exit 2; }
+done
+census_read=$(find crates bins tests -name '*.rs' -type f -not -path '*/target/*' | wc -l | tr -d ' ')
+[ "$census_read" -gt 0 ] || { echo "WAKER SCOPE ERROR: the census read no .rs file"; exit 2; }
+while IFS= read -r file; do
+    # Through a file: under pipefail, `grep -q` closing the pipe early would fail awk's write.
+    awk -f "$work/code-only.awk" "$file" >"$work/code-only.rs"
+    if grep -q 'RawWakerVTable' "$work/code-only.rs"; then
+        census_named="$census_named $file"
+    fi
+done < <(grep -rl --include='*.rs' --exclude-dir=target RawWakerVTable crates bins tests || true)
+census_entries=
+for entry in "${CENSUS_ENTRIES[@]}"; do
+    file=${entry%%|*}
+    census_entries="$census_entries $file (${entry#*|}),"
+    case " $census_named " in
+        *" $file "*) ;;
+        *)
+            if [ -f "$file" ]; then
+                echo "WAKER CENSUS: $file is an entry that names RawWakerVTable nowhere in its code"
+            else
+                echo "WAKER CENSUS: $file is an entry that is absent"
+            fi
+            echo "  (an entry leaves the census with what it holds)"
+            fail=1 ;;
+    esac
+done
+for file in $census_named; do
+    listed=0
+    for entry in "${CENSUS_ENTRIES[@]}"; do
+        [ "$file" = "${entry%%|*}" ] && listed=1
+    done
+    if [ "$listed" -eq 0 ]; then
+        echo "WAKER CENSUS: $file names RawWakerVTable outside the census's entries"
+        echo "  (the workspace ships one hand-made waker: use Waker::noop(), or the executor's)"
+        fail=1
+    fi
+done
+census_entries=${census_entries%,}
+
+scope="$tree_target $flavor asm, vtable-resolved: 4 wakers + $((reached - wakers)) owner-lane bodies, $instrs_total instruction lines scanned, $unresolved callees with no body (each listed), $ijumps indirect jumps, $zero zero-instruction bodies; boundary ($live):${boundary_seen:- none}; census: $census_read .rs files read, entries:$census_entries; probe: $probe"
 if [ "$fail" -ne 0 ]; then
     echo "waker-atomics FAILED ($scope)"
     echo "The waker's owner lane runs no atomic: its read-modify-writes are the foreign lane's (ADR-0003 A1.5)."
