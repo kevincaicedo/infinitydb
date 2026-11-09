@@ -910,8 +910,8 @@ for row in "${rows[@]}"; do
   RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
     --target-dir "$target"
   planted="$target/release/inf-sim"
-  echo "== canary $cfg: $name ${flags[*]} (lane seed $seed) on the planted build must go red"
-  if "$planted" --scenario "$name" --seed "$seed" "${flags[@]}" > "$log" 2>&1; then
+  echo "== canary $cfg: $name ${flags[*]:-} (lane seed $seed) on the planted build must go red"
+  if "$planted" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
     fail=1
   elif ! grep -q -- "$expect" "$log"; then
@@ -927,13 +927,13 @@ for row in "${rows[@]}"; do
   else
     echo "   caught: $(cut -c1-160 <<<"${catches%%$'\n'*}")"
   fi
-  leg="$name ${flags[*]}"
+  leg="$name ${flags[*]:-}"
   if [[ "$plain_green" == *"|$leg|"* ]]; then
-    echo "== canary $cfg: $name ${flags[*]} on the plain build: green above, not run again"
+    echo "== canary $cfg: $name ${flags[*]:-} on the plain build: green above, not run again"
     continue
   fi
-  echo "== canary $cfg: $name ${flags[*]} on the plain build must stay green"
-  "$plain" --scenario "$name" --seed "$seed" "${flags[@]}" > /dev/null
+  echo "== canary $cfg: $name ${flags[*]:-} on the plain build must stay green"
+  "$plain" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > /dev/null
   plain_green+="$leg|"
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi
