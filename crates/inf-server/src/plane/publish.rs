@@ -89,14 +89,14 @@ pub(super) async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + C
                 let targets = shared.pubsub.borrow().fan_targets(channel, shared.cell.0);
                 let mut waiters = Vec::new();
                 for cell in targets {
-                    let fan = &[&b"INF.PUBFAN"[..], channel, payload];
+                    let fan = PubFanArgv::new(channel, payload, None);
                     if let Ok(waiter) = send_apply(
                         shared,
                         CellId(cell),
                         ApplyOrigin::Program,
                         Protocol::Resp2,
                         0,
-                        fan,
+                        fan.argv(),
                     )
                     .await
                     {
@@ -257,43 +257,98 @@ pub(super) fn unsubscribe_closed_conn<
 /// RTT-bound — a recorded M1 simplification (no gate measures sustained
 /// publish throughput; revisit with evidence per L4 if a workload demands
 /// overlap).
+///
+/// The reply waits on the fan's legs, so the legs draw on the credit every
+/// general send leaves free toward each peer, through the cell's one fan
+/// reserve: one fan open at a time, one leg toward each peer, so a leg
+/// never waits for a credit an unanswered `INF.PUB` holds and every reply
+/// it waits on is sent at a peer's drain (ADR-0192 D3). An overlapping pump
+/// must keep one leg in flight per peer.
 pub(super) async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: Rc<Shared<O, F>>,
 ) {
+    // One pump runs at a time (`pub_pump_active`), so it finds the reserve.
+    let mut reserve = shared.fan_reserve.take();
+    debug_assert!(reserve.is_some(), "the running owner pump holds the cell's fan reserve");
     loop {
         let Some(item) = shared.pub_queue.borrow_mut().pop_front() else {
+            // Put back in the step that clears the flag, no await between,
+            // so the pump the next drain spawns finds it.
+            shared.fan_reserve.set(reserve);
             shared.pub_pump_active.set(false);
             return;
         };
         let (mut total, _) = deliver_local(&shared, &item.channel, &item.payload, None);
-        let targets = shared.pubsub.borrow().fan_targets(&item.channel, shared.cell.0);
-        let mut waiters = Vec::new();
-        for cell in targets {
-            // ADR-0101 D2: the origin cell's leg echoes the publisher
-            // tag; every other leg keeps the three-arg form.
-            let tagged = item.tag.as_ref().filter(|_| cell == item.origin.0);
-            let fan: &[&[u8]] = match tagged {
-                Some((conn, seq)) => &[&b"INF.PUBFAN"[..], &item.channel, &item.payload, conn, seq],
-                None => &[&b"INF.PUBFAN"[..], &item.channel, &item.payload],
-            };
-            if let Ok(waiter) =
-                send_apply(&shared, CellId(cell), ApplyOrigin::Program, Protocol::Resp2, 0, fan)
-                    .await
-            {
-                note_fan(&shared.node);
-                waiters.push(waiter);
-            }
-        }
-        for waiter in waiters {
-            if let OwnedOutcome::Int(n) = waiter.await {
+        let mut fold = |outcome: OwnedOutcome| {
+            if let OwnedOutcome::Int(n) = outcome {
                 total += n;
             }
+        };
+        match reserve.as_mut() {
+            Some(reserve) => {
+                let mut legs = FanLegs::open(reserve);
+                fan_legs(&shared, &item, &mut legs).await;
+                legs.settle(&mut fold).await;
+            }
+            None => fan_unreserved(&shared, &item, &mut fold).await,
         }
         // Publish the reply now — the origin's pump is suspended on it.
         let mut fabric = shared.fabric.borrow_mut();
         fabric.reply(item.origin, item.token, &Outcome::Int(total));
         fabric.flush();
     }
+}
+
+/// One fan's legs, one per subscriber-bearing peer in ascending order
+/// (`fan_targets`), each on the reserved credit.
+async fn fan_legs<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    item: &OwnerPub,
+    legs: &mut FanLegs<'_>,
+) {
+    let targets = shared.pubsub.borrow().fan_targets(&item.channel, shared.cell.0);
+    for cell in targets {
+        let tag = leg_tag(item, cell);
+        let sent =
+            send_fan_leg(shared, legs, CellId(cell), &item.channel, &item.payload, tag).await;
+        if sent.is_ok() {
+            note_fan(&shared.node);
+        }
+    }
+}
+
+/// The fan without the cell's reserve, derived never (the running pump
+/// holds it): each leg a general send and its wait, the replies folded in
+/// leg order.
+async fn fan_unreserved<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    item: &OwnerPub,
+    fold: &mut impl FnMut(OwnedOutcome),
+) {
+    let targets = shared.pubsub.borrow().fan_targets(&item.channel, shared.cell.0);
+    let mut waiters = Vec::new();
+    for cell in targets {
+        let fan = PubFanArgv::new(&item.channel, &item.payload, leg_tag(item, cell));
+        let to = CellId(cell);
+        if let Ok(waiter) =
+            send_apply(shared, to, ApplyOrigin::Program, Protocol::Resp2, 0, fan.argv()).await
+        {
+            note_fan(&shared.node);
+            waiters.push(waiter);
+        }
+    }
+    for waiter in waiters {
+        fold(waiter.await);
+    }
+}
+
+/// ADR-0101 D2: the origin cell's leg echoes the publisher tag; every other
+/// leg keeps the three-arg form.
+fn leg_tag(item: &OwnerPub, cell: u16) -> Option<(&[u8], &[u8])> {
+    item.tag
+        .as_ref()
+        .filter(|_| cell == item.origin.0)
+        .map(|(conn, seq)| (conn.as_slice(), seq.as_slice()))
 }
 
 /// A publisher subscribed to its own channel reads its frames after its
