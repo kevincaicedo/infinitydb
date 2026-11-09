@@ -598,8 +598,10 @@ impl Consumer<T> { pub fn consume_batch(&mut self, max: usize, f: impl FnMut(T))
 // Mesh: N×(N−1) ring pairs + single-writer doorbells + credit flow control.
 // (implemented — the code is the spec)
 pub struct MeshConfig { pub ring_capacity: usize, pub data_credits: u32 }
-   // construction asserts ring_capacity ≥ 2 × data_credits: the reserved
-   // reply headroom that makes `reply` infallible (deadlock freedom).
+impl MeshConfig { pub const fn has_reply_headroom(self) -> bool; }
+   // has_reply_headroom: ring_capacity ≥ 2 × data_credits, the relation's
+   // one statement, which construction asserts: the reserved reply headroom
+   // that makes `reply` infallible (deadlock freedom).
 pub enum SendError { NoCredit { needed: u32, available: u32 } }
 pub struct Mesh;
 pub struct CellFabric;                      // one per cell; moved to its thread
