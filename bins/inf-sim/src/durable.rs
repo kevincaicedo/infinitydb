@@ -1095,12 +1095,13 @@ impl DurableScenario {
     /// target). The m2 durability oracle and the reply oracle run
     /// unchanged; the tier class's own oracles — no offer above the cap,
     /// one pass's tier bytes within the cap and the pool, every ready
-    /// group issued within the fair turn's bound, the spend equal to the
-    /// disk's tier bytes and ops, one plan per cell turn — run on the
-    /// per-cell scrape at the cut, and the run reports the tier class per
-    /// cell. The budget scenario's generic oracles stay off: their
-    /// engagement clause (some background class deferred) is vacuous on
-    /// the legs whose class never waits for a refill.
+    /// group issued within the fair turn's bound — run on the per-cell
+    /// scrape at the cut; the spend equal to the disk's tier bytes and ops
+    /// plus those granted and not yet submitted, and one plan per cell
+    /// turn, are judged at every step boundary; and the run reports the
+    /// tier class per cell. The budget scenario's generic oracles stay
+    /// off: their engagement clause (some background class deferred) is
+    /// vacuous on the legs whose class never waits for a refill.
     #[must_use]
     pub fn m4_tier_budget(seed: u64, leg: TierBudgetLeg) -> DurableScenario {
         let cells: u16 = 2;

@@ -521,14 +521,6 @@ impl SimDriver {
         self.observed
     }
 
-    /// Tier-class bytes and ops pushed and not yet submitted — what a cut
-    /// catches between the plane's push and the next driver entry; the
-    /// accounting oracle adds them to the observed ledger for an exact
-    /// equality.
-    pub fn queued_tier_io(&self) -> (u64, u64) {
-        tier_io_of(&self.ops)
-    }
-
     /// Fdatasyncs the disk holds now ([`SimDisk::hold_syncs`]): submitted
     /// by the plane and kept from the device until the hold lifts — the
     /// harness's own reading of a held barrier, no product counter.
@@ -623,7 +615,7 @@ fn release_held_reads(disk: Option<&SimDisk>, held_reads: &mut Vec<IoOp>, ops: &
 }
 
 /// The tier-class bytes and ops among `ops`, by each op's token class.
-fn tier_io_of(ops: &[IoOp]) -> (u64, u64) {
+pub(crate) fn tier_io_of(ops: &[IoOp]) -> (u64, u64) {
     let is_tier = |token: CompletionToken| IoClass::of(token.class()) == Some(IoClass::TierFlush);
     let mut tally = (0u64, 0u64);
     for op in ops {

@@ -421,7 +421,8 @@ pub struct TierBudgetCell {
     pub overrun_bytes: u64,
     pub driver_bytes: u64,
     pub driver_ops: u64,
-    /// Tier-class bytes and ops pushed and not yet submitted at the cut.
+    /// Tier-class bytes and ops granted and waiting in the cell loop's
+    /// queue for the next submit, at the cut.
     pub queued_bytes: u64,
     pub queued_ops: u64,
     /// The most tier-class bytes and ops one driver entry carried.

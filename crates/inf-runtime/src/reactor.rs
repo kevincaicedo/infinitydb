@@ -483,6 +483,14 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         ]
     }
 
+    /// The ops the plane pushed during the last iteration, not yet
+    /// submitted: the next iteration's first driver entry takes them whole,
+    /// so between two iterations they wait here and the driver's own queue
+    /// holds none of them. Population: this cell's loop.
+    pub fn next_submit_ops(&self) -> &[IoOp] {
+        &self.ops
+    }
+
     pub fn driver(&self) -> &D {
         &self.driver
     }

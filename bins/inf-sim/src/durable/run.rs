@@ -577,6 +577,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let mut tier_oracle = TierTurnOracle::new(&node, scenario.cells, true);
     let mut turn_shape = TurnShape::new(scenario);
     let mut thief_premise = ThiefPremise::new(scenario);
+    let mut tier_spend = TierSpendSteps::new(scenario);
     let no_model_leg = scenario.tier_budget.is_some_and(|shape| shape.leg.model_absent());
     if no_model_leg {
         tier_oracle.arm_after_the_visits_bound();
@@ -599,6 +600,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         tier_oracle.sample(&node, &disk, scenario, &mut report);
         turn_shape.sample(&node);
         thief_premise.sample(&node, scenario, clock.now());
+        tier_spend.sample(&node, step);
         if let Some(wedge) = ledger_wedge.as_mut() {
             wedge.observe(step, &node, &disk, clock.now());
             if wedge.cut_due(step, seeded_cut) {
@@ -986,6 +988,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         tier_budget_scrape(scenario, shape, &node, &disk, &mut report);
         turn_shape.judge(scenario, shape, &node, &mut report);
         thief_premise.judge(scenario.seed, &mut report);
+        tier_spend.judge(scenario.seed, &mut report);
     }
     derived_ledger_counters(scenario.seed, &mut report);
     engagement_checks(scenario, &node, &mut report);
@@ -1446,11 +1449,11 @@ fn derived_ledger_counters(seed: u64, report: &mut DurableReport) {
 /// the model (the driver's own tally), every ready group's wait within
 /// the fair turn's bound `n × T_c` computed from the model and the
 /// scenario's step (the plane's gauge, judged by the harness's
-/// arithmetic), the spend equal to the disk's tier bytes and ops with the
-/// ops a cut caught between push and submit (exact), and the leg's own
-/// reads: contention and refusals on the legs that reach them, a plan
-/// passed over on the eight-namespace leg, neither on the control leg;
-/// with the write-fault plant, a retry.
+/// arithmetic), and the leg's own reads: contention and refusals on the
+/// legs that reach them, a plan passed over on the eight-namespace leg,
+/// neither on the control leg; with the write-fault plant, a retry. The
+/// spend's equality is judged at every step boundary ([`TierSpendSteps`]),
+/// the cut its last.
 fn tier_budget_scrape(
     scenario: &DurableScenario,
     shape: TierBudgetShape,
@@ -1478,9 +1481,9 @@ fn tier_budget_scrape(
     }
 }
 
-/// One cell's tier class at the cut: the budget's counters, the driver's
-/// observed and queued tier I/O, the turn's gauges and each namespace's
-/// watermarks.
+/// One cell's tier class at the cut: the budget's counters, the spend's
+/// three terms ([`tier_spend_terms`]), the turn's gauges and each
+/// namespace's watermarks.
 fn tier_budget_cell(
     node: &Node,
     cell: usize,
@@ -1491,20 +1494,20 @@ fn tier_budget_cell(
     use inf_server::TierFlushGauge as G;
     let counted = stats.io_budget[IoClass::TierFlush.index()];
     let observed = node.cells[cell].0.driver().observed_io();
-    let (queued_bytes, queued_ops) = node.cells[cell].0.driver().queued_tier_io();
+    let terms = tier_spend_terms(node, cell, stats);
     let gauges = node.plane(cell).tier_flush_gauges();
     let gauge = |slot: G| gauges[slot as usize];
     TierBudgetCell {
         cell: cell as u16,
         unattainable: counted.unattainable,
         deferrals: counted.deferrals,
-        spent_bytes: counted.spent_bytes,
-        spent_ops: counted.spent_ops,
+        spent_bytes: terms.spent_bytes,
+        spent_ops: terms.spent_ops,
         overrun_bytes: counted.overrun_bytes,
-        driver_bytes: observed.bytes[IoClass::TierFlush.index()],
-        driver_ops: observed.ops[IoClass::TierFlush.index()],
-        queued_bytes,
-        queued_ops,
+        driver_bytes: terms.driver_bytes,
+        driver_ops: terms.driver_ops,
+        queued_bytes: terms.queued_bytes,
+        queued_ops: terms.queued_ops,
         pass_bytes_max: observed.tier_pass_bytes_max,
         pass_ops_max: observed.tier_pass_ops_max,
         groups_deferred: gauge(G::GroupsDeferred),
@@ -1568,10 +1571,10 @@ fn tier_budget_vacuous(
 /// The tier class's oracles on one cell, each independent of the
 /// budget's code: no offer above the cap and no overrun, one driver
 /// entry's tier bytes within the cap and the pool, every ready group's
-/// wait within `n × T_c` (with the leg's engagement), the spend equal to
-/// the disk's tier bytes and ops with what a cut caught queued, and the
-/// control leg's reads. The no-model leg reads its own clauses in place
-/// of the cap's and the wait's ([`tier_no_model_oracles`]).
+/// wait within `n × T_c` (with the leg's engagement), and the control
+/// leg's reads. The no-model leg reads its own clauses in place of the
+/// cap's and the wait's ([`tier_no_model_oracles`]). The spend's equality
+/// has one judge, [`TierSpendSteps`], whose last step is the cut.
 fn tier_budget_oracles(
     scenario: &DurableScenario,
     leg: TierBudgetLeg,
@@ -1626,20 +1629,6 @@ fn tier_budget_oracles(
             "TIER-TURN VACUOUS seed {seed:#x} cell {cell}: the turn refused {} time(s) and was \
              contended {} time(s); the leg needs both",
             record.turn_waits, record.turn_contended
-        ));
-    }
-    let seen_bytes = record.driver_bytes + record.queued_bytes;
-    let seen_ops = record.driver_ops + record.queued_ops;
-    if record.spent_bytes != seen_bytes || record.spent_ops != seen_ops {
-        report.violations.push(format!(
-            "TIER-SPEND VIOLATION seed {seed:#x} cell {cell}: the budget spent {} B {} ops, the \
-             driver saw {} B {} ops ({} B {} ops queued at the cut)",
-            record.spent_bytes,
-            record.spent_ops,
-            seen_bytes,
-            seen_ops,
-            record.queued_bytes,
-            record.queued_ops
         ));
     }
     // G4's count is judged per iteration by `TierTurnOracle`, its
@@ -1781,6 +1770,125 @@ impl TurnShape {
                 "VACUOUS seed {:#x} cell {cell}: turn-shape-unreached — {why}",
                 scenario.seed
             ));
+        }
+    }
+}
+
+/// G3's three terms on one cell between two iterations: the tier class's
+/// spend in the budget's ledger, the tier bytes and ops the driver
+/// observed, and those granted and not yet submitted. A grant waits in one
+/// place, the cell loop's queue: the plane pushes MAINTAIN's grants there
+/// in the iteration that granted them, and the next iteration's first
+/// driver entry takes the queue whole.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct TierSpendTerms {
+    spent_bytes: u64,
+    spent_ops: u64,
+    driver_bytes: u64,
+    driver_ops: u64,
+    queued_bytes: u64,
+    queued_ops: u64,
+}
+
+impl TierSpendTerms {
+    /// G3: the spend is what the driver saw and what waits to be
+    /// submitted, on both axes.
+    fn holds(&self) -> bool {
+        self.spent_bytes == self.driver_bytes + self.queued_bytes
+            && self.spent_ops == self.driver_ops + self.queued_ops
+    }
+}
+
+/// The one reader of G3's terms on `cell`: the step check reads it at
+/// every step boundary and the scrape at the cut. Population: one cell's
+/// budget, driver and loop.
+fn tier_spend_terms(node: &Node, cell: usize, stats: &inf_server::DurableStats) -> TierSpendTerms {
+    let tier = inf_runtime::IoClass::TierFlush.index();
+    let counted = stats.io_budget[tier];
+    let cell_loop = &node.cells[cell].0;
+    let observed = cell_loop.driver().observed_io();
+    let (queued_bytes, queued_ops) = crate::net::tier_io_of(cell_loop.next_submit_ops());
+    TierSpendTerms {
+        spent_bytes: counted.spent_bytes,
+        spent_ops: counted.spent_ops,
+        driver_bytes: observed.bytes[tier],
+        driver_ops: observed.ops[tier],
+        queued_bytes,
+        queued_ops,
+    }
+}
+
+/// G3 judged at every step boundary of the traffic phase, per cell: every
+/// grant waits in the cell loop's queue across exactly one boundary (a
+/// step runs each cell's iteration once), so the term read from that
+/// queue is tested where it differs from the driver's. A cell's first
+/// broken step is its violation; the steps whose loop queue held a tier op
+/// are the check's liveness, and a cell that spent with none is vacuous:
+/// the check told the two queues apart nowhere on it.
+struct TierSpendSteps {
+    cells: Vec<TierSpendCell>,
+}
+
+/// One cell's reading of the step check.
+#[derive(Clone, Copy, Debug, Default)]
+struct TierSpendCell {
+    /// Steps whose cell-loop queue held a tier op.
+    queued_steps: u64,
+    /// Steps at which the equality broke, and the first of them.
+    broken_steps: u64,
+    first_broken: Option<(u64, TierSpendTerms)>,
+    /// The tier ops spent at the last boundary read.
+    spent_ops: u64,
+}
+
+impl TierSpendSteps {
+    fn new(scenario: &DurableScenario) -> TierSpendSteps {
+        let cells = if scenario.tier_budget.is_some() { usize::from(scenario.cells) } else { 0 };
+        TierSpendSteps { cells: vec![TierSpendCell::default(); cells] }
+    }
+
+    /// One pass a cell over the ops its last iteration pushed.
+    fn sample(&mut self, node: &Node, step: u64) {
+        for (cell, read) in self.cells.iter_mut().enumerate() {
+            let Some(stats) = node.plane(cell).durable_stats() else { continue };
+            let terms = tier_spend_terms(node, cell, &stats);
+            read.spent_ops = terms.spent_ops;
+            if terms.queued_ops > 0 {
+                read.queued_steps += 1;
+            }
+            if !terms.holds() {
+                read.broken_steps += 1;
+                read.first_broken.get_or_insert((step, terms));
+            }
+        }
+    }
+
+    /// One violation line a cell whose equality broke, at its first broken
+    /// step, and one vacuity line a cell that spent with no queued step.
+    fn judge(&self, seed: u64, report: &mut DurableReport) {
+        for (cell, read) in self.cells.iter().enumerate() {
+            if let Some((step, terms)) = read.first_broken {
+                report.violations.push(format!(
+                    "TIER-SPEND VIOLATION seed {seed:#x} cell {cell}: at step {step} the budget \
+                     spent {} B {} ops, the driver saw {} B {} ops and the cell loop's queue held \
+                     {} B {} ops for the next submit; {} step(s) broke the equality",
+                    terms.spent_bytes,
+                    terms.spent_ops,
+                    terms.driver_bytes,
+                    terms.driver_ops,
+                    terms.queued_bytes,
+                    terms.queued_ops,
+                    read.broken_steps
+                ));
+            }
+            if read.spent_ops > 0 && read.queued_steps == 0 {
+                report.violations.push(format!(
+                    "VACUOUS seed {seed:#x} cell {cell}: tier-spend-unqueued — the tier class \
+                     spent {} op(s) and no step boundary found a tier op in the cell loop's \
+                     queue, so the check told that queue from the driver's nowhere",
+                    read.spent_ops
+                ));
+            }
         }
     }
 }
