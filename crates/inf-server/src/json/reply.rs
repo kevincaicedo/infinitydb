@@ -38,7 +38,7 @@ use crate::limits::FixedShape;
 
 /// Pinned phrasing for a reply over the namespace's `doc-max-reply-bytes`
 /// (ADR-0099 D3, beside ADR-0039 D5's `ERR document too large`).
-pub(super) const REPLY_TOO_LARGE: &str = "ERR reply too large";
+pub(crate) const REPLY_TOO_LARGE: &str = "ERR reply too large";
 
 /// A handler's one reply, charged against one account.
 pub(super) struct JsonReply<'w, 'b> {

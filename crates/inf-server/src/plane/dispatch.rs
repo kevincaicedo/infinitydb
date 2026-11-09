@@ -3,6 +3,9 @@
 //! and `dispatch_one` — the command-family switch every remote command
 //! enters through.
 
+#[cfg(feature = "doc")]
+use super::json_gather::{GatherTarget, JsonGather, json_gather};
+use super::scatter::send_whole;
 use super::*;
 
 /// A reply slot awaiting its in-order turn on the wire.
@@ -27,11 +30,13 @@ pub(super) enum PendingReply {
         proto: Protocol,
         refusal: Option<OwnedReply>,
     },
-    /// Split MGET / JSON.MGET: per-key replies reassemble into one array
-    /// in argv order. `unwrap_single` marks JSON.MGET's shape: each
-    /// sub-reply is a single-key `*1` array whose element joins the outer
-    /// array (ADR-0041 D9).
-    Gather { parts: Vec<GatherPart>, proto: Protocol, unwrap_single: bool },
+    /// Split `MGET`: per-key replies reassemble into one array in argv
+    /// order.
+    Gather { parts: Vec<GatherPart>, proto: Protocol },
+    /// A cross-cell `JSON.MGET` (ADR-0173 D4): its legs in flight under one
+    /// account of the whole reply, settled at the reply's turn.
+    #[cfg(feature = "doc")]
+    JsonGather(Box<JsonGather>),
     /// Fanned MSET / scattered FLUSH: all legs must come back `+OK` (the
     /// first error leg wins the reply otherwise). A leg that could not be
     /// sent (`refusal`) makes the reply that refusal — never a silent
@@ -219,6 +224,7 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
                     | CommandId::Unlink
                     | CommandId::Touch
                     | CommandId::Mget
+                    | CommandId::JsonMget
                     | CommandId::Mset
                     | CommandId::Msetnx
             );
@@ -367,9 +373,11 @@ pub(super) async fn settle_reply<O: PlaneObserver + 'static, F: SegmentFs + Clon
                 Ok(total) => int_reply(shared, proto, total),
             }
         }
-        PendingReply::Gather { parts, proto, unwrap_single } => {
-            settle_gather(shared, parts, proto, unwrap_single, inflight).await
+        PendingReply::Gather { parts, proto } => {
+            settle_gather(shared, parts, proto, inflight).await
         }
+        #[cfg(feature = "doc")]
+        PendingReply::JsonGather(gather) => gather.finish(shared, inflight).await,
         PendingReply::Durable { waiter, reply } => {
             waiter.await;
             reply
@@ -420,14 +428,12 @@ async fn settle_all_ok<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
     }
 }
 
-/// The `MGET`/`JSON.MGET` gather: every position in argv order, each
-/// element pasted after the array header; a `Success` single-key
-/// sub-reply of `JSON.MGET` is stripped to its element (ADR-0041 D9).
+/// The `MGET` gather: every position in argv order, each element pasted
+/// after the array header.
 async fn settle_gather<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     parts: Vec<GatherPart>,
     proto: Protocol,
-    unwrap_single: bool,
     inflight: &mut usize,
 ) -> OwnedReply {
     let mut reply = OpenReply::new(shared.take_reply_buf());
@@ -451,7 +457,7 @@ async fn settle_gather<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
         let mut w = RespWriter::new(reply.reply(), proto);
         match element {
             Some(element) => {
-                w.encoded(if unwrap_single { gather_element(&element) } else { element.bytes() });
+                w.encoded(element.bytes());
                 shared.recycle_reply_buf(element.into_bytes());
             }
             None => w.null(),
@@ -736,8 +742,8 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         }
         #[cfg(feature = "doc")]
         Some(meta) if well_formed && meta.id == CommandId::JsonMget && has_remote_key(meta) => {
-            pending
-                .push_back(gather_json_mget(shared, origin, proto, id, db, argv, inflight).await);
+            let target = GatherTarget { origin, proto, id, db, scope: ScatterScope::Db };
+            pending.push_back(json_gather(shared, target, meta, argv, inflight).await);
         }
         Some(meta) if well_formed && meta.id == CommandId::Mset && has_remote_key(meta) => {
             pending.push_back(program_mset(shared, origin, proto, id, db, argv, inflight).await);
@@ -762,14 +768,9 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // Single-owner remote command: ship the whole argv; the owner
             // executes and returns its raw RESP reply. The destination is
             // the first key's owner, computed in the routing pass above.
-            let owner = first_owner;
-            match send_apply(shared, owner, ApplyOrigin::Client, proto, db, argv).await {
-                Ok(waiter) => {
-                    *inflight += 1;
-                    pending.push_back(PendingReply::Remote { waiter, proto });
-                }
-                Err(refusal) => pending.push_back(PendingReply::Done(refusal)),
-            }
+            let scope = ScatterScope::Db;
+            pending
+                .push_back(send_whole(shared, first_owner, proto, db, scope, argv, inflight).await);
         }
         _ => {
             return dispatch_mirror(
@@ -913,54 +914,7 @@ async fn gather_mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
             }
         }
     }
-    PendingReply::Gather { parts, proto, unwrap_single: false }
-}
-
-/// `JSON.MGET` with a remote key (M3-S11; ADR-0041 D9): the `MGET` shape
-/// with single-key sub-ops, the path riding every one.
-#[cfg(feature = "doc")]
-pub(super) async fn gather_json_mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
-    origin: ExecOrigin,
-    proto: Protocol,
-    id: u64,
-    db: u16,
-    argv: &[&[u8]],
-    inflight: &mut usize,
-) -> PendingReply {
-    // JSON.MGET gather (M3-S11; ADR-0041 D9): the MGET shape with
-    // single-key `JSON.MGET k path` sub-ops — each sub-reply is a
-    // `*1` array whose element joins the outer array in argv
-    // order. The path (final argument) rides every sub-op.
-    let path = argv[argv.len() - 1];
-    let mut parts = Vec::with_capacity(argv.len() - 2);
-    for k in &argv[1..argv.len() - 1] {
-        if shared.router.is_local(k, shared.cell) {
-            let mut reply = OpenReply::new(shared.take_reply_buf());
-            let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
-            shared.execute_owned_into(origin, &sub, proto, id, db, None, false, reply.reply());
-            parts.push(GatherPart::Done(reply.finish()));
-        } else {
-            let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
-            match send_apply(
-                shared,
-                shared.router.cell_of(SlotRouter::slot_of(k)),
-                ApplyOrigin::Client,
-                proto,
-                db,
-                &sub,
-            )
-            .await
-            {
-                Ok(waiter) => {
-                    parts.push(GatherPart::Wait(waiter));
-                    *inflight += 1;
-                }
-                Err(refusal) => parts.push(GatherPart::Done(refusal)),
-            }
-        }
-    }
-    PendingReply::Gather { parts, proto, unwrap_single: true }
+    PendingReply::Gather { parts, proto }
 }
 
 /// `MSET` with a remote key: local pairs first (an OOM reply preempts the

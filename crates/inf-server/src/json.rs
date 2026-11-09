@@ -41,6 +41,7 @@ use inf_wire::{CommandId, Protocol, RespWriter};
 
 use crate::exec::{Argv, ConnCx, NodeInfo, parse_i64};
 use crate::limits::FixedShape;
+pub(crate) use reply::REPLY_TOO_LARGE;
 use reply::{
     FixedReservation, FixedValue, JsonReply, ReplyBuild, ReplyError, ReplyStop, ReplyVerdict,
     Settled,

@@ -887,6 +887,12 @@ rows=(
   # A closed header's last drop frees it with Q set: the last take then
   # reaches the freed bridge.
   "inf_canary_closed_free_ignores_queue loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
+  # ADR-0173 D1, D4: the cross-cell JSON.MGET gather admits every leg
+  # without charging its account. The gather oracle serves the split
+  # fixture at L - 1, where only the whole crosses; m3-document's model
+  # refuses its repeated audit, which the planted gather serves.
+  "inf_canary_json_gather_unaccounted crate-test inf-server test:node_e2e every_split_json_row_is_charged_whole_in_a_numbered_database reply mismatch"
+  "inf_canary_json_gather_unaccounted m3-document REPLY"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

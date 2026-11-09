@@ -83,15 +83,21 @@ mod scatter;
 mod shared;
 mod tiered;
 mod timers;
+// The owner split's one caller is the JSON gather, so both carry its feature.
+#[cfg(feature = "doc")]
+mod json_gather;
+#[cfg(feature = "doc")]
+mod split;
 
 pub use conn::OwnedOutcome;
 use conn::{CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
 use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
 use fabric::{
-    GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, gather_element,
-    handle_fabric_op, parse_stageable, stage_argv_block_argv, stage_or_handle, staged_outcome,
-    wire_reply,
+    GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op,
+    parse_stageable, stage_argv_block_argv, stage_or_handle, staged_outcome, wire_reply,
 };
+#[cfg(feature = "doc")]
+pub use json_gather::parse_json_mget_leg;
 use ns_ddl::{
     SendNow, dispatch_ns, program_ckpt, program_ns_ddl, send_apply, send_apply_ns, try_send_apply,
 };

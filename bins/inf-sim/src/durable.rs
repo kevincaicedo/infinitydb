@@ -66,8 +66,10 @@ mod run;
 mod stop_tick;
 mod timers;
 pub use ledger_wedge::{LedgerWedgeLeg, LedgerWedgeReport};
+pub(crate) use mget_audit::{
+    DOCUMENT_REPLY_BUDGET_BYTES, MgetTally, audit_report, next_audit_command, with_reply_budget,
+};
 pub use mget_audit::{MgetAuditFold, MgetAuditReport, MgetAudits};
-pub(crate) use mget_audit::{MgetTally, audit_report, next_audit_command, with_reply_budget};
 pub use run::run_durable_scenario;
 pub use stop_tick::StopTickReport;
 pub use timers::{TimersReport, WakeLeg, WakeReport};
@@ -1591,9 +1593,7 @@ impl DurableScenario {
             stop_tick: false,
             fill_dense: false,
             wake: WakeLeg::OFF,
-            mget_audits: Some(MgetAudits {
-                reply_budget_bytes: StoreConfig::default().doc_max_reply_bytes,
-            }),
+            mget_audits: Some(MgetAudits { reply_budget_bytes: DOCUMENT_REPLY_BUDGET_BYTES }),
         }
     }
 }

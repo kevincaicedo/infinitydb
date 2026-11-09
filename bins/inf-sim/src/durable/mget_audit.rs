@@ -31,6 +31,12 @@ pub struct MgetAudits {
     pub reply_budget_bytes: usize,
 }
 
+/// `m3-document`'s audit budget. It admits every single-document reply of
+/// the workload (a corpus document is at most 6,144 B of canonical text, and
+/// its model's members add under 128 B), and it sits between the repeated
+/// shape's part per owner (6,214 B) and its whole (12,425 B).
+pub(crate) const DOCUMENT_REPLY_BUDGET_BYTES: usize = 8_192;
+
 /// What a run's audits reached, node sums over every life.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MgetAuditReport {
@@ -357,7 +363,13 @@ pub(crate) fn audit_report(
     }
     sum.unreached = !reached;
     if reached {
-        for (name, count) in [("mget-served", sum.served), ("mget-split", sum.split)] {
+        let counters = [
+            ("mget-served", sum.served),
+            ("mget-refused", sum.refused),
+            ("mget-split", sum.split),
+            ("mget-split-sum-refused", sum.split_sum_refused),
+        ];
+        for (name, count) in counters {
             if count == 0 {
                 report.violations.push(format!(
                     "VACUOUS seed {:#x}: {name} — a writer was answered on every audit shape \
@@ -397,11 +409,11 @@ mod tests {
         assert_eq!(window[5], AuditSend::Audit(AuditShape::Stream));
     }
 
-    /// The record's arithmetic: a pad element is 1,035 B, the pair 2,074 B,
+    /// The arithmetic: a pad element is 1,035 B, the pair 2,074 B,
     /// one owner's six copies 6,214 B and the repeated whole 12,425 B, so
     /// at 8,192 B the repeated shape is the coordinator's refusal alone.
     #[test]
-    fn the_shapes_render_the_records_byte_counts() {
+    fn the_shapes_render_their_byte_counts() {
         let pad = pad_document();
         assert_eq!(pad.len(), PAD_DOCUMENT_BYTES);
         assert_eq!(element(&pad).len(), 1_035);
