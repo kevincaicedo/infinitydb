@@ -919,6 +919,15 @@ rows=(
   # refuses its repeated audit, which the planted gather serves.
   "inf_canary_json_gather_unaccounted crate-test inf-server test:node_e2e every_split_json_row_is_charged_whole_in_a_numbered_database reply mismatch"
   "inf_canary_json_gather_unaccounted m3-document REPLY"
+  # ADR-0192 D3: the publish fan's legs are general sends that wait for a
+  # credit, as if none were kept for the fan; each owner's pump waits for a
+  # credit only the other owner's replies return, and the liveness detector
+  # reads the stall.
+  "inf_canary_fan_draws_general m1-pub-cross STALL"
+  # ADR-0192 D2: a general send may take the fan's last credit; a leg then
+  # finds none and is counted before it waits, and the run's end reads the
+  # count on every cell.
+  "inf_canary_reserve_unguarded m1-pub-cross RESERVE"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

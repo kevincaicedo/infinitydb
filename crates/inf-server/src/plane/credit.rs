@@ -144,19 +144,27 @@ impl PlaneFabric {
         // reads it on a stage made at the floor; the unit test reads that
         // each stage costs exactly one at any count.
         debug_assert!(
-            self.fabric.credits(to) >= FAN_RESERVE_PER_PEER,
+            cfg!(inf_canary_reserve_unguarded) || self.fabric.credits(to) >= FAN_RESERVE_PER_PEER,
             "a general op took the publish fan's reserved credit"
         );
         Ok(())
     }
 
     /// The reserve's guard: one comparison on the fabric's credit probe.
+    #[cfg(not(inf_canary_reserve_unguarded))]
     fn keep_reserve(&self, to: CellId) -> Result<(), SendError> {
         let available = self.fabric.credits(to);
         if available >= GENERAL_CREDITS_NEEDED {
             return Ok(());
         }
         Err(SendError::NoCredit { needed: GENERAL_CREDITS_NEEDED, available })
+    }
+
+    /// Canary: no guard, so a general send may take the publish fan's last
+    /// credit and a fan leg then finds none.
+    #[cfg(inf_canary_reserve_unguarded)]
+    fn keep_reserve(&self, _to: CellId) -> Result<(), SendError> {
+        Ok(())
     }
 
     /// Stages one publish fan leg toward `to`, which may take the credit

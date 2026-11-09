@@ -309,8 +309,19 @@ async fn fan_legs<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let targets = shared.pubsub.borrow().fan_targets(&item.channel, shared.cell.0);
     for cell in targets {
         let tag = leg_tag(item, cell);
+        #[cfg(not(inf_canary_fan_draws_general))]
         let sent =
             send_fan_leg(shared, legs, CellId(cell), &item.channel, &item.payload, tag).await;
+        // Canary: every leg a general send that waits for a credit, as if
+        // no credit were kept for the fan.
+        #[cfg(inf_canary_fan_draws_general)]
+        let sent = {
+            let fan = PubFanArgv::new(&item.channel, &item.payload, tag);
+            let to = CellId(cell);
+            send_apply(shared, to, ApplyOrigin::Program, Protocol::Resp2, 0, fan.argv())
+                .await
+                .map(|waiter| legs.push(waiter))
+        };
         if sent.is_ok() {
             note_fan(&shared.node);
         }
