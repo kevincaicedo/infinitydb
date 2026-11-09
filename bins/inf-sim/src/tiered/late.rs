@@ -1035,7 +1035,9 @@ fn phase_10(cx: &mut Late<'_>, node: Node) -> Verdict {
     ) {
         Ok(node) => node,
         Err(what) => {
-            cx.fail(format!("post-drop reboot: {what}"));
+            // A name no other line prints: the run's summary spells
+            // `post-drop reboot` on every run, red or green.
+            cx.fail(format!("post-drop-reboot-failed — {what}"));
             return Err(());
         }
     };

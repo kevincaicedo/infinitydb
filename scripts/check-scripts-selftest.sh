@@ -1390,20 +1390,39 @@ expect red "canaries: a crate-test row FAILED on its engagement check is not a c
 expect_output "canaries: the engagement red is named" "the test's engagement check, not its oracle" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture crate-test fake test:suite the_row VACUOUS: the fault never fired" >"$dir/rows"
 expect red "canaries: a witness cannot name the engagement check" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# Every row's plain control runs first, and its own output (a passing
+# test's prints too: `--show-output`) must not carry the witness: a phrase
+# the test prints on every run is in any red's log, so it catches nothing.
+printing_ok='echo "test the_row ... ok"; echo "---- the_row stdout ----"; echo "the oracle saw a stale value: 0 of 9 checked"; exit 0'
+dir=$(canary_fixture canary-witness-printed "$oracle_line" "$printing_ok")
+echo "inf_canary_fixture crate-test fake test:suite the_row the oracle saw a stale value" >"$dir/rows"
+expect_red_because "canaries: a crate-test witness the plain run prints is no catch" "no catch possible: the plain build prints the witness" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+{
+    echo '#!/usr/bin/env bash'
+    echo 'if [ -n "${RUSTFLAGS:-}" ]; then'
+    echo "$oracle_line"
+    echo 'fi'
+    echo 'case " $* " in'
+    echo '  *" --show-output "*) echo "test the_row ... ok"; echo "the oracle saw a stale value: 0"; exit 0 ;;'
+    echo 'esac'
+    echo "$ok_line"
+} >"$dir/cargo"
+expect_red_because "canaries: the crate-test control reads a passing test's own prints" "no catch possible" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 # A scenario row is judged on the planted simulator's log: a line naming the
 # row's token is a catch, but a line carrying `VACUOUS` is an engagement
 # clause and a catch only where the token is its name (whole, closed by `:`
 # or ` —`): a vacuity row. Stub simulators stand at INF_CANARY_SIM_TARGET,
 # and the stub cargo builds nothing.
 sim_fixture() {
-    local name=$1 token=$2 planted=$3 dir sims
+    local name=$1 token=$2 planted=$3 plain=${4:-'echo "inf-sim: scenario fake-scenario: green"'}
+    local dir sims
     [ -n "$name" ] && [ -n "$work" ] || { echo "sim_fixture: empty name or work dir" >&2; exit 2; }
     dir="$work/$name"
     sims="$dir/target/canary-inf_canary_fixture/release"
     mkdir -p "$dir/target/release" "$sims"
     echo "inf_canary_fixture fake-scenario $token" >"$dir/rows"
     printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/cargo"
-    printf '#!/usr/bin/env bash\necho "inf-sim: scenario fake-scenario: green"\n' >"$dir/target/release/inf-sim"
+    printf '#!/usr/bin/env bash\n%s\n' "$plain" >"$dir/target/release/inf-sim"
     printf '#!/usr/bin/env bash\n%s\n' "$planted" >"$sims/inf-sim"
     chmod +x "$dir/cargo" "$dir/target/release/inf-sim" "$sims/inf-sim"
     echo "$dir"
@@ -1433,6 +1452,35 @@ dir=$(sim_fixture sim-clause-text TOKEN 'echo "inf-sim: VIOLATION: other-unengag
 expect_red_because "canaries: a token inside another clause's text is not a catch" "the leg's engagement clause, not its oracle" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 dir=$(sim_fixture sim-name-prefix token 'echo "inf-sim: VIOLATION: VACUOUS seed 0x1: token-unengaged — the plant held nothing"; exit 1')
 expect_red_because "canaries: a token that only begins a clause's name is not a catch" "the leg's engagement clause, not its oracle" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# A summary line every run prints carries the token: on the planted build
+# any red names it (a reboot that failed for another reason, the oracle
+# off), so the plain control's log refuses the row before its plant runs.
+summary='echo "inf-sim: fake-scenario seed 0x1: TOKEN reboot true, trace 9 bytes"'
+dir=$(sim_fixture sim-summary TOKEN "${summary/true/false}; echo \"inf-sim: ORACLE VIOLATION: seed 0x1: another check\"; exit 1" "$summary")
+expect_red_because "canaries: a token the plain simulator prints on its summary line is no catch" "no catch possible: the plain build prints the substring 'TOKEN'" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+long_summary="echo \"inf-sim: fake-scenario seed 0x1: $(printf '%0120d' 0) TOKEN reboot true\""
+dir=$(sim_fixture sim-summary-long TOKEN "exit 1" "$long_summary")
+expect_output "canaries: the refusal quotes the control's line from just before the token" '^   \.\.\.0* TOKEN reboot true$' env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(sim_fixture sim-summary-and-caught TOKEN "${summary/true/false}; $violation; exit 1" "$summary")
+expect_red_because "canaries: the oracle's line beside a summary that names the token is still no catch" "no catch possible" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(sim_fixture sim-summary-other-token TOKEN-VIOLATION-NAME "${summary/true/false}; echo \"inf-sim: ORACLE VIOLATION: seed 0x1: TOKEN-VIOLATION-NAME — the rule broke\"; exit 1" "$summary")
+expect green "canaries: a token the oracle's line alone carries is caught beside such a summary" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# Rows on one leg share its control run and its log: the second row is
+# judged on the first row's control.
+printf '%s\n' "inf_canary_fixture fake-scenario TOKEN-VIOLATION-NAME" "inf_canary_fixture fake-scenario TOKEN" >"$dir/rows"
+expect_red_because "canaries: a second row on a leg is judged on the leg's one control" "no catch possible: the plain build prints the substring 'TOKEN'" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect_output "canaries: the leg's control runs once" "on the plain build: green above, not run again" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(sim_fixture sim-control-red TOKEN "$violation; exit 1" 'echo "inf-sim: ORACLE VIOLATION: seed 0x1: the plain run broke"; exit 1')
+expect_red_because "canaries: a scenario row whose plain build is red has no control" "the plain build is red (a canary needs a green control)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# INF_CANARY_CONTROLS_ONLY=1 runs every row's control and judges no plant:
+# the sweep of the control rule over the table.
+dir=$(sim_fixture sim-controls-only TOKEN 'touch "$(dirname "$0")/planted-ran"; exit 0')
+expect green "canaries: controls-only reads a clean control green" env INF_CANARY_CONTROLS_ONLY=1 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect_output "canaries: controls-only says it judged no plant" "controls only: 1 rows' controls green" env INF_CANARY_CONTROLS_ONLY=1 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect red "canaries: controls-only never ran the planted simulator" test -e "$dir/target/canary-inf_canary_fixture/release/planted-ran"
+dir=$(sim_fixture sim-controls-only-printed TOKEN "exit 0" "$summary")
+expect_red_because "canaries: controls-only refuses a token the control prints" "no catch possible" env INF_CANARY_CONTROLS_ONLY=1 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect_red_because "canaries: a controls-only knob other than 0 or 1 is a scope failure" "INF_CANARY_CONTROLS_ONLY wants 0 or 1" env INF_CANARY_CONTROLS_ONLY=yes INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 # ADR-0159 A1.6: a `loom` row builds both legs under `--cfg loom` — the
 # stub answers only when it sees it, so a driver that dropped the cfg is
 # red for another reason, never a catch.
@@ -1467,6 +1515,8 @@ dir=$(loom_fixture loom-toothless "$ok_line" "$ok_line")
 expect red "canaries: a loom model that stays green when planted is NOT CAUGHT" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 dir=$(loom_fixture loom-no-control "$witness_line" "$failed_line")
 expect red "canaries: a loom model red on the plain loom build is no control leg" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(loom_fixture loom-witness-printed "$witness_line" 'echo "test the_row ... ok"; echo "WITNESS: 0 stale effects"; exit 0')
+expect_red_because "canaries: a loom witness the plain loom run prints is no catch" "no catch possible: the plain build prints the witness 'WITNESS:'" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture loom fake the_row" >"$work/canary-short-loom-row"
 expect red "canaries: a loom row without its witness is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-short-loom-row" INF_CANARY_CARGO="$dir/cargo" $CANARY
 }

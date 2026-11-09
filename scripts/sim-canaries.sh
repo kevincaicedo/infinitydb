@@ -44,7 +44,15 @@
 #     free piece of the model's own assertion: a Loom budget panic, the
 #     model's VACUOUS check or an `expect` also fail the test, and none of
 #     them is the oracle seeing the stale effect.
+# Every row runs its plain control first, and the control's own output
+# must not carry the row's substring or witness: a line every run prints —
+# a summary, a header, a report — carries it on any red as well, so a
+# planted log naming it says nothing of the oracle, and the row is refused
+# before its plant is built. A crate-test or loom control runs with
+# `--show-output`, so a passing test's own prints are read too.
 # Usage: scripts/sim-canaries.sh [seed]
+# INF_CANARY_CONTROLS_ONLY=1 runs every row's control alone and judges no
+# plant: the sweep of that rule over the table, much cheaper than the lane.
 # Sharding: INF_CANARY_SHARD=I/K runs the rows of every K-th cfg from the
 # I-th, cfgs counted by their first row in the table, so a cfg's planted
 # build is made in one shard and the K shards run every row exactly once
@@ -58,6 +66,14 @@ cd "$(dirname "$0")/.."
 seed=${1:-0xC0FFEE}
 CARGO=${INF_CANARY_CARGO:-cargo}
 sim_target=${INF_CANARY_SIM_TARGET:-target}
+controls_only=${INF_CANARY_CONTROLS_ONLY:-0}
+case "$controls_only" in
+  0 | 1) ;;
+  *)
+    echo "sim-canaries: SCOPE ERROR — INF_CANARY_CONTROLS_ONLY wants 0 or 1, got '$controls_only'"
+    exit 1
+    ;;
+esac
 
 rows=(
   # ADR-0090 D5: the segment-blind scanner takes a foreign segment's
@@ -804,7 +820,7 @@ rows=(
   # The same rule in m4-tiered's listing-repeat class (ADR-0202 D5): the
   # post-drop reboot's sweep reads its dropped namespace past one batch over
   # the disk's repeat mode, and planted, a repeated name refuses that reboot.
-  "inf_canary_recover_listing_repeat_refused m4-tiered post-drop --listing-repeats"
+  "inf_canary_recover_listing_repeat_refused m4-tiered post-drop-reboot-failed --listing-repeats"
   # A premise plant in the simulated disk: a call that served a repeat moves
   # its key past one name it never returns, so a repeat takes a fresh name's
   # place. The leg's residue oracle and the repeat-mode test see the name.
@@ -900,9 +916,36 @@ if [ -n "${INF_CANARY_SHARD:-}" ]; then
 fi
 
 fail=0
-log=$(mktemp)
-[ -n "$log" ] && [ -f "$log" ] || { echo "sim-canaries: mktemp failed"; exit 2; }
-trap '[ -n "$log" ] && [ -f "$log" ] && rm -f "$log"' EXIT
+work=$(mktemp -d "${TMPDIR:-/tmp}/sim-canaries.XXXXXX")
+case "$work" in
+  */sim-canaries.??????) [ -d "$work" ] || { echo "sim-canaries: mktemp failed"; exit 2; } ;;
+  *) echo "sim-canaries: mktemp failed"; exit 2 ;;
+esac
+trap 'case "$work" in */sim-canaries.??????) rm -rf -- "$work" ;; esac' EXIT
+log=$work/planted.log
+control=$work/control.log
+
+# control_names <token> <control log>: zero when the plain build's own log
+# carries the row's substring or witness, read as bytes with the control
+# bytes dropped; prints 160 bytes of the first such line from 60 before the
+# token. The whole log is read, so no writer of the pipe is cut short.
+control_names() {
+  tr -d '\000-\010\013-\037\177' <"$2" | TOKEN=$1 LC_ALL=C awk '
+    !found && (at = index($0, ENVIRON["TOKEN"])) > 0 {
+      from = at > 60 ? at - 60 : 1
+      print (from > 1 ? "..." : "") substr($0, from, 160)
+      found = 1
+    }
+    END { exit !found }'
+}
+
+# refuse_printed <what> <token>: the row's verdict when its control printed
+# the token (control_names' line in $printed).
+refuse_printed() {
+  echo "   no catch possible: the plain build prints the $1 '$2' too, so any red reads caught:"
+  echo "   $printed"
+  fail=1
+}
 
 # crate_test <cfg> <package> <lib|test:NAME> <test name> <witness, or empty>
 crate_test() {
@@ -914,6 +957,19 @@ crate_test() {
   esac
   if [ "$package" = inf-sim ]; then target_args+=(--features dst); fi
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
+  echo "== canary $cfg: $package $target $name on the plain build must stay green"
+  if ! "$CARGO" test -p "$package" "${target_args[@]}" -- "$name" --show-output > "$control" 2>&1 \
+      || ! grep -Eq -- "${verdict}ok" "$control"; then
+    echo "   the plain build does not pass '$name' (a canary needs a green control):"
+    tail -5 "$control"
+    fail=1
+    return
+  fi
+  if [ -n "$witness" ] && printed=$(control_names "$witness" "$control"); then
+    refuse_printed witness "$witness"
+    return
+  fi
+  if [ "$controls_only" -eq 1 ]; then return; fi
   echo "== canary $cfg: $package $target $name on the planted build must go red"
   if RUSTFLAGS="--cfg $cfg" "$CARGO" test -p "$package" "${target_args[@]}" \
       --target-dir "target/canary-crate" -- "$name" > "$log" 2>&1; then
@@ -936,13 +992,6 @@ crate_test() {
   else
     echo "   caught: $(grep -E -m1 -- "${verdict}FAILED" "$log")"
   fi
-  echo "== canary $cfg: $package $target $name on the plain build must stay green"
-  if ! "$CARGO" test -p "$package" "${target_args[@]}" -- "$name" > "$log" 2>&1 \
-      || ! grep -Eq -- "${verdict}ok" "$log"; then
-    echo "   the plain build does not pass '$name' (a canary needs a green control):"
-    tail -5 "$log"
-    fail=1
-  fi
 }
 
 # loom_test <cfg> <package> <test name> <witness>: the model under
@@ -951,6 +1000,20 @@ crate_test() {
 loom_test() {
   local cfg=$1 package=$2 name=$3 witness=$4
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
+  echo "== canary $cfg: $package loom $name on the plain loom build must stay green"
+  if ! RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" --release \
+      --lib --target-dir "target/loom" -- "$name" --show-output > "$control" 2>&1 \
+      || ! grep -Eq -- "${verdict}ok" "$control"; then
+    echo "   the plain loom build does not pass '$name' (a canary needs a green control):"
+    tail -5 "$control"
+    fail=1
+    return
+  fi
+  if printed=$(control_names "$witness" "$control"); then
+    refuse_printed witness "$witness"
+    return
+  fi
+  if [ "$controls_only" -eq 1 ]; then return; fi
   echo "== canary $cfg: $package loom $name on the planted build must go red"
   if RUSTFLAGS="--cfg loom --cfg $cfg" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" \
       --release --lib --target-dir "target/canary-loom" -- "$name" > "$log" 2>&1; then
@@ -966,14 +1029,6 @@ loom_test() {
     fail=1
   else
     echo "   caught: $(grep -F -m1 -- "$witness" "$log" | cut -c1-160)"
-  fi
-  echo "== canary $cfg: $package loom $name on the plain loom build must stay green"
-  if ! RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" --release \
-      --lib --target-dir "target/loom" -- "$name" > "$log" 2>&1 \
-      || ! grep -Eq -- "${verdict}ok" "$log"; then
-    echo "   the plain loom build does not pass '$name' (a canary needs a green control):"
-    tail -5 "$log"
-    fail=1
   fi
 }
 
@@ -1006,9 +1061,10 @@ token_catches() {
 
 sim_built=0
 # A plain leg is the scenario, its flags and the seed, not the plant: rows
-# that share one share its run (three rows run m4-recovery
-# --replay-above-window at the lane seed, about 34 s each).
-plain_green="|"
+# that share one share its run and its log (three rows run m4-recovery
+# --replay-above-window at the lane seed, about 34 s each). A leg's log is
+# `leg-<index>.log`, its index its place in `control_legs`, matched whole.
+control_legs=()
 start=$SECONDS
 for row in "${rows[@]}"; do
   # shellcheck disable=SC2206
@@ -1030,6 +1086,29 @@ for row in "${rows[@]}"; do
     sim_built=1
   fi
   plain=$sim_target/release/inf-sim
+  leg="$name ${flags[*]:-}" index=-1
+  for j in ${control_legs[@]+"${!control_legs[@]}"}; do
+    if [ "${control_legs[$j]}" = "$leg" ]; then index=$j; break; fi
+  done
+  if [ "$index" -ge 0 ]; then
+    echo "== canary $cfg: $leg on the plain build: green above, not run again"
+  else
+    echo "== canary $cfg: $leg on the plain build must stay green"
+    index=${#control_legs[@]}
+    if ! "$plain" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} \
+        > "$work/leg-$index.log" 2>&1; then
+      echo "   the plain build is red (a canary needs a green control):"
+      tail -5 "$work/leg-$index.log"
+      fail=1
+      continue
+    fi
+    control_legs+=("$leg")
+  fi
+  if printed=$(control_names "$expect" "$work/leg-$index.log"); then
+    refuse_printed substring "$expect"
+    continue
+  fi
+  if [ "$controls_only" -eq 1 ]; then continue; fi
   target="$sim_target/canary-$cfg"
   echo "== canary $cfg: building inf-sim with --cfg $cfg into $target"
   RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
@@ -1052,14 +1131,11 @@ for row in "${rows[@]}"; do
   else
     echo "   caught: $(cut -c1-160 <<<"${catches%%$'\n'*}")"
   fi
-  leg="$name ${flags[*]:-}"
-  if [[ "$plain_green" == *"|$leg|"* ]]; then
-    echo "== canary $cfg: $name ${flags[*]:-} on the plain build: green above, not run again"
-    continue
-  fi
-  echo "== canary $cfg: $name ${flags[*]:-} on the plain build must stay green"
-  "$plain" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > /dev/null
-  plain_green+="$leg|"
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi
+if [ "$controls_only" -eq 1 ]; then
+  echo "sim-canaries: controls only: ${#rows[@]} rows' controls green, none printing its row's" \
+    "substring or witness, no plant judged, in $((SECONDS - start)) s (seed $seed)"
+  exit 0
+fi
 echo "sim-canaries: ${#rows[@]} canaries caught, plain builds green in $((SECONDS - start)) s (seed $seed)"
