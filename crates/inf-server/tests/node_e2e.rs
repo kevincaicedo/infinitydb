@@ -226,6 +226,68 @@ struct Node {
 /// A set of tiered namespace names, in byte order.
 type NsNames = std::collections::BTreeSet<Vec<u8>>;
 
+/// What a node is assembled with beyond its shape: the store configuration
+/// every cell's keyspace takes, and the log its cells' observers record into
+/// (`None`: they record nothing).
+#[derive(Clone, Default)]
+struct NodeExtras {
+    store: StoreConfig,
+    log: Option<ExecLog>,
+}
+
+/// One command a cell executed, as its observer saw it: the cell, the cell a
+/// fabric `Apply` came from (`None` for a connection of the cell's own) and
+/// the argv.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Executed {
+    cell: u16,
+    from: Option<u16>,
+    argv: Vec<Vec<u8>>,
+}
+
+/// The executions of every cell of one node, in the order the cells logged
+/// them (each cell's own order is its execution order).
+type ExecLog = Arc<std::sync::Mutex<Vec<Executed>>>;
+
+/// A cell's observer: appends each execution to the node's log when the node
+/// was started with one. A test reads which cell ran which command, so a leg
+/// a gather sent, held or never sent is observed on its owner.
+struct Recorder {
+    cell: u16,
+    log: Option<ExecLog>,
+}
+
+impl inf_server::PlaneObserver for Recorder {
+    fn on_execute(
+        &mut self,
+        cell: CellId,
+        origin: inf_server::ExecOrigin,
+        _scope: inf_server::ExecScope,
+        argv: &[&[u8]],
+        _reply: &[u8],
+        _now: Nanos,
+    ) {
+        debug_assert_eq!(cell.0, self.cell, "a cell's observer observes its own cell");
+        let Some(log) = &self.log else { return };
+        let from = match origin {
+            inf_server::ExecOrigin::Conn(..) => None,
+            inf_server::ExecOrigin::Fabric(from) => Some(from.0),
+        };
+        let argv = argv.iter().map(|arg| arg.to_vec()).collect();
+        log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Executed {
+            cell: cell.0,
+            from,
+            argv,
+        });
+    }
+}
+
+/// The executions in `log` whose command is `name`, in log order.
+fn executed(log: &ExecLog, name: &[u8]) -> Vec<Executed> {
+    let log = log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    log.iter().filter(|e| e.argv.first().is_some_and(|a| a.as_slice() == name)).cloned().collect()
+}
+
 struct CatalogPump {
     hold: Arc<AtomicBool>,
     /// Swaps the pump may still land while `hold` is set
@@ -263,6 +325,7 @@ impl Node {
             None,
             None,
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -290,6 +353,42 @@ impl Node {
         Node::start_with(cells, None, CkptTrigger::Manual)
     }
 
+    /// A volatile node of `cells` cells whose keyspaces take `store` and
+    /// whose cells record every execution into the returned log.
+    fn start_recorded(cells: u16, store: StoreConfig) -> (Node, ExecLog) {
+        Node::start_recorded_in(cells, None, store)
+    }
+
+    /// [`Node::start_recorded`] over `data_dir`, a durable node (named
+    /// namespaces need its control plane).
+    fn start_recorded_in(
+        cells: u16,
+        data_dir: Option<std::path::PathBuf>,
+        store: StoreConfig,
+    ) -> (Node, ExecLog) {
+        let log = ExecLog::default();
+        let node = Node::start_cfg_default(
+            cells,
+            data_dir,
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            Default::default(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            NodeExtras { store, log: Some(Arc::clone(&log)) },
+        );
+        (node, log)
+    }
+
     /// A volatile node whose cell clocks all read `held` (see [`HeldClock`]).
     fn start_held_clock(cells: u16, held: HeldClock) -> Node {
         Node::start_cfg_default(
@@ -309,6 +408,7 @@ impl Node {
             None,
             Some(held),
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -384,6 +484,7 @@ impl Node {
             None,
             None,
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -416,6 +517,7 @@ impl Node {
             None,
             None,
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -444,6 +546,7 @@ impl Node {
             Some(std::num::NonZeroU64::new(units).expect("headroom >= 1")),
             None,
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -654,6 +757,7 @@ impl Node {
             None,
             None,
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -675,6 +779,7 @@ impl Node {
         ckpt_headroom: Option<std::num::NonZeroU64>,
         held_clock: Option<HeldClock>,
         holds: Vec<(u16, &'static str, inf_foundation::fault::HoldGate)>,
+        extras: NodeExtras,
     ) -> Node {
         assert!(held_clock.is_none() || data_dir.is_none(), "a held clock boots a volatile node");
         let stop = Arc::new(AtomicBool::new(false));
@@ -786,6 +891,7 @@ impl Node {
             let faults = faults.clone();
             let holds = holds.clone();
             let default_ns = default_ns.clone();
+            let extras = extras.clone();
             handles.push(std::thread::spawn(move || {
                 // M2-S16: arm this cell's fault plan before recovery — the
                 // registry is thread-local (cells are single-threaded, L1).
@@ -825,9 +931,9 @@ impl Node {
                     Some((_, catalog, _)) => {
                         let empty = inf_store::NsCatalog::empty();
                         let catalog = catalog.as_ref().unwrap_or(&empty);
-                        Keyspace::cataloged(StoreConfig::default(), catalog).expect("seed catalog")
+                        Keyspace::cataloged(extras.store, catalog).expect("seed catalog")
                     }
-                    None => Keyspace::new(StoreConfig::default()),
+                    None => Keyspace::new(extras.store),
                 };
                 let mut durable = None;
                 if let Some((dir, _catalog, control)) = &boot {
@@ -859,7 +965,7 @@ impl Node {
                     ks,
                     fabric,
                     node,
-                    NoopObserver,
+                    Recorder { cell: i as u16, log: extras.log.clone() },
                     false,
                 )
                 .expect("the server's timer owners fit their cap");
@@ -1188,7 +1294,7 @@ fn stop_phase_of_byte(byte: u8) -> Option<inf_server::StopPhase> {
 /// Adds to `at_default` each tiered namespace on `plane`'s cell that runs
 /// at the product's `TAIL-STALL-TIMEOUT` default. The harness calls it after
 /// every iteration, so a namespace dropped before the stop is recorded too.
-fn note_product_tail_stall(plane: &ServerPlane, at_default: &mut NsNames) {
+fn note_product_tail_stall(plane: &ServerPlane<Recorder>, at_default: &mut NsNames) {
     for spec in plane.keyspace().ns_iter() {
         let Some(tier) = &spec.tier else {
             continue;
@@ -7060,6 +7166,46 @@ fn lastsave_and_rdb_last_save_time_answer_one_second_after_inf_ckpt_cell_wait() 
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The recorded node harness at five cells: every cell's keyspace takes the
+/// node's store configuration, and the log names the cell that executed each
+/// command — a connection's own on its cell, an `Apply` on its owner with the
+/// cell it came from. A budget of 23 B serves a 10 B reply and refuses a
+/// 41 B one on the key's owner, where the default budget serves both.
+#[test]
+fn a_recorded_node_of_five_cells_logs_each_owner_under_its_store_config() {
+    let store = StoreConfig { doc_max_reply_bytes: 23, ..StoreConfig::default() };
+    let (node, log) = Node::start_recorded(5, store);
+    let mut client = conn_on_cell(&node, 0);
+    let keys: Vec<Vec<u8>> = (0..5).map(|cell| key_for_cell(5, cell)).collect();
+    for key in &keys {
+        client.write_all(&cmd(&[b"SET", key, b"v"])).expect("write");
+        read_exactly(&mut client, b"+OK\r\n");
+    }
+    let sets = executed(&log, b"SET");
+    let owners: Vec<(u16, Option<u16>, &[u8])> =
+        sets.iter().map(|e| (e.cell, e.from, e.argv[1].as_slice())).collect();
+    let want: Vec<(u16, Option<u16>, &[u8])> = (0..5u16)
+        .map(|cell| (cell, (cell != 0).then_some(0), keys[usize::from(cell)].as_slice()))
+        .collect();
+    assert_eq!(owners, want, "each SET ran once, on its key's owner");
+    #[cfg(feature = "doc")]
+    {
+        let (small, large) =
+            (key_for_cell_prefixed(5, 1, "small"), key_for_cell_prefixed(5, 1, "j"));
+        let text = format!("\"{}\"", "x".repeat(30));
+        let mut pipeline = cmd(&[b"JSON.SET", &small, b"$", b"[1]"]);
+        pipeline.extend(cmd(&[b"JSON.SET", &large, b"$", text.as_bytes()]));
+        pipeline.extend(cmd(&[b"JSON.GET", &small, b"$"]));
+        pipeline.extend(cmd(&[b"JSON.GET", &large, b"$"]));
+        client.write_all(&pipeline).expect("write");
+        read_exactly(&mut client, b"+OK\r\n+OK\r\n$5\r\n[[1]]\r\n-ERR reply too large\r\n");
+        let gets = executed(&log, b"JSON.GET");
+        assert!(gets.iter().all(|e| (e.cell, e.from) == (1, Some(0))), "{gets:?}");
+    }
+    drop(client);
+    node.stop();
+}
+
 /// M3-S11 cross-cell `JSON.MGET` (ADR-0041 D9): the gather splits per
 /// key with single-key sub-ops whose `*1` elements reassemble in argv
 /// order — over the default db, and over a **named** namespace, which is
@@ -10596,6 +10742,7 @@ fn rollback_wait_scenario(checkpoint: bool, tag: &str) {
         None,
         None,
         vec![(1, inf_server::fault::NS_CREATE_LEG_HELD, leg.clone())],
+        NodeExtras::default(),
     );
     let control = Arc::clone(node.control.as_ref().expect("a durable node"));
     // The `CREATE`'s swap lands; the rollback's stays queued.
