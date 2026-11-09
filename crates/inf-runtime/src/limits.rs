@@ -32,3 +32,20 @@ pub const PARK_CEILING_MAX: core::time::Duration = core::time::Duration::from_mi
 /// gate or pin changes, every later request is refused alike, and the reads admitted before it
 /// still issue and deliver. A namespace drop does not reset the issuer; only a new host does.
 pub const COLD_IDENTITY_PAIRS_MAX: u64 = 1 << 55;
+
+/// Member visits one host turn's cold-read delivery makes (ADR-0181 R1): 64, live, cancelled or
+/// orphaned members alike. Owner: the turn's [`ColdDeliveryBudget`](crate::ColdDeliveryBudget),
+/// which [`ColdTurn::begin`](crate::ColdTurn::begin) alone builds — once a native iteration, by
+/// the reactor, or once a declared turn, by a standalone host — and which every delivery call of
+/// the turn shares; the reactor charges what it spent to the turn's Foreground group. Crossing:
+/// pace — the members not yet visited wait for the next turn, which the park decision keeps
+/// coming while any is ready; nothing is dropped.
+pub const COLD_DELIVERIES_PER_TURN: u32 = 64;
+
+/// Work units one host turn's cold-read preparation spends (ADR-0181 R3): 64, a head inspection
+/// one unit and any other candidate two. Owner: the turn's
+/// [`ColdPreparationBudget`](crate::ColdPreparationBudget), which
+/// [`ColdTurn::begin`](crate::ColdTurn::begin) alone builds, beside the delivery allowance, and
+/// which no caller can reset. Crossing: pace — the queued requests not yet inspected wait for
+/// the next turn.
+pub const COLD_PREPARATION_WORK_PER_TURN: u32 = 64;

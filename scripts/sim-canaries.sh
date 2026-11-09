@@ -922,6 +922,9 @@ rows=(
   # ADR-0181 R4: a cold-read host mints each identity pair once and never returns one; planted,
   # a cancelled request's pair returns to the issuer, so the next request repeats its ids.
   "inf_canary_cold_identity_recycled crate-test inf-runtime lib every_identity_the_issuer_mints_is_fresh_and_typed_by_parity an id repeats"
+  # ADR-0181 R2: a turn's cold delivery runs before either executor pass; planted, it runs at
+  # parse_execute's head, so with remote_first_execute a woken task polls first.
+  "inf_canary_cold_delivery_after_execute crate-test inf-runtime test:reactor a_turns_cold_delivery_precedes_a_woken_tasks_poll_in_both_modes polled before the turn's delivery"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

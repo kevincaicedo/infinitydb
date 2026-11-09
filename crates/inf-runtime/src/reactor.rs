@@ -10,7 +10,9 @@
 //!   1   dispatch      plane.on_completion per completion, then due timers
 //!                     one notice at a time under the turn's allowance
 //!   2   FABRIC-IN     plane.fabric_in (bounded drain)
-//!  3+4  PARSE+EXECUTE plane.parse_execute under the foreground budget,
+//!  3+4  PARSE+EXECUTE plane.before_execute (the turn's cold delivery, before
+//!                     either executor pass), then
+//!                     plane.parse_execute under the foreground budget,
 //!                     then executor.run_ready for resumed futures
 //!                     (`remote_first_execute` prepends a bounded run_ready
 //!                     + FABRIC-OUT so resumed pumps' remote ops publish
@@ -36,6 +38,7 @@ use inf_foundation::LogHistogram;
 use inf_foundation::bounded::{CapCensus, ServeMark};
 use inf_foundation::time::{Clock, Nanos};
 
+use crate::cold::{ColdDeliveryBudget, ColdPreparationBudget, ColdTurn};
 use crate::driver::{BackendDriver, Completion, IoOp, Wait};
 use crate::executor::CellExecutor;
 use crate::limits::{PARK_CEILING_MAX, TIMER_DELIVERIES_PER_TURN};
@@ -148,6 +151,9 @@ pub struct LoopCx<'a> {
     timers: &'a mut TimerSet,
     ops: &'a mut Vec<IoOp>,
     sched: &'a mut GroupScheduler,
+    /// The iteration's cold-read allowances, begun by the loop alone and
+    /// lent, never reset (ADR-0181 R2, R3).
+    cold: ColdTurn,
     commands: u64,
     fabric_msgs: u64,
 }
@@ -182,6 +188,19 @@ impl LoopCx<'_> {
     pub fn timers(&mut self) -> Timers<'_> {
         Timers::new(self.timers, self.now)
     }
+
+    /// The iteration's cold delivery allowance, shared by every delivery
+    /// call of the iteration: lent, never built, copied or reset here
+    /// (ADR-0181 R2).
+    pub fn cold_delivery_budget(&mut self) -> &mut ColdDeliveryBudget {
+        self.cold.delivery()
+    }
+
+    /// The iteration's cold preparation allowance, beside the delivery one
+    /// and apart from it (ADR-0181 R3).
+    pub fn cold_preparation_budget(&mut self) -> &mut ColdPreparationBudget {
+        self.cold.preparation()
+    }
 }
 
 impl core::fmt::Debug for LoopCx<'_> {
@@ -206,6 +225,16 @@ pub trait CellPlane {
     }
     /// Step 2: drain inbound fabric rings (bounded).
     fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {
+        let _ = cx;
+    }
+    /// The head of steps 3+4, once an iteration, after FABRIC-IN and before
+    /// either executor pass polls (ADR-0181 R2): the plane serves its turn's
+    /// cold delivery from `cx.cold_delivery_budget()`, so a task its replies
+    /// woke never runs ahead of the delivery the turn owes. It parses no
+    /// command, submits no I/O, starts no task and renews no budget; the
+    /// loop charges the delivery units it spent to the Foreground group. A
+    /// plane with no cold reads keeps this no-op.
+    fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
         let _ = cx;
     }
     /// Steps 3+4: parse frames and execute commands under
@@ -362,6 +391,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
                 timers: &mut self.timers,
                 ops: &mut self.ops,
                 sched: &mut self.sched,
+                cold: ColdTurn::begin(),
                 commands: 0,
                 fabric_msgs: 0,
             };
@@ -374,6 +404,14 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
 
             // ---- step 2: FABRIC-IN.
             plane.fabric_in(&mut cx);
+
+            // ---- steps 3+4's head: the turn's cold delivery, before either
+            // executor pass, charged to Foreground through the scheduler
+            // (a delivery is not a command: `cmds_per_iter` stays the
+            // plane's). Canary: delivery at `parse_execute`'s head, after
+            // the early executor pass.
+            #[cfg(not(inf_canary_cold_delivery_after_execute))]
+            serve_cold_delivery(plane, &mut cx);
 
             // ---- steps 3+4: PARSE + EXECUTE (foreground budget).
             // Remote-first ordering (M2.5-S21 lever): futures woken by this
@@ -388,6 +426,8 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
                     plane.fabric_out(&mut cx);
                 }
             }
+            #[cfg(inf_canary_cold_delivery_after_execute)]
+            serve_cold_delivery(plane, &mut cx);
             plane.parse_execute(&mut cx);
             polled = early_polled + cx.executor.run_ready(self.config.exec_budget);
 
@@ -548,6 +588,17 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     /// Timers armed on this cell now: at most the set's positions.
     pub fn armed_timers(&self) -> u32 {
         self.timers.armed()
+    }
+}
+
+/// Steps 3+4's head (ADR-0181 R2): the plane's cold delivery under the
+/// iteration's allowance, then the units it spent charged to Foreground
+/// through the scheduler, never `LoopCx::charge`, which counts commands.
+fn serve_cold_delivery(plane: &mut impl CellPlane, cx: &mut LoopCx<'_>) {
+    plane.before_execute(cx);
+    let spent = cx.cold.delivery().spent();
+    if spent > 0 {
+        cx.sched.charge(GroupClass::Foreground, spent);
     }
 }
 

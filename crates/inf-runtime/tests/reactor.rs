@@ -20,7 +20,7 @@ use inf_alloc::BufferPool;
 use inf_foundation::CellId;
 use inf_foundation::bounded::{Cap, CapCensus, CapFill, CensusPhase};
 use inf_foundation::time::{Nanos, StdClock, VirtualClock};
-use inf_runtime::limits::PARK_CEILING_MAX;
+use inf_runtime::limits::{COLD_DELIVERIES_PER_TURN, PARK_CEILING_MAX};
 use inf_runtime::{
     BackendDriver, Capabilities, CellLoop, CellPlane, Completion, GroupClass, IoOp, LoopConfig,
     LoopCx, ParkCeiling, ParkCeilingTooLong, Reserved, SubmitStats, TimerNotice, TimerOutcome,
@@ -596,11 +596,14 @@ enum OrderMark {
 }
 
 /// The delivery-placement fixture: FABRIC-IN spawns one task, ready at
-/// once, which records its poll; the plane records a mark where a cold
-/// delivery can run, which at HEAD is the head of `parse_execute`.
+/// once, which records its poll; the plane records a mark where its cold
+/// delivery runs, `before_execute`, with the iteration's delivery
+/// allowance as it found it there.
 struct DeliveryOrderPlane {
     trace: Rc<std::cell::RefCell<Vec<OrderMark>>>,
     spawned: bool,
+    /// The delivery allowance each mark found: a turn's full 64 once.
+    allowances: Vec<u32>,
 }
 
 impl CellPlane for DeliveryOrderPlane {
@@ -615,37 +618,40 @@ impl CellPlane for DeliveryOrderPlane {
             trace.borrow_mut().push(OrderMark::Poll);
         });
     }
-    fn parse_execute(&mut self, _cx: &mut LoopCx<'_>) {
+    fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
         self.trace.borrow_mut().push(OrderMark::Delivery);
+        self.allowances.push(cx.cold_delivery_budget().remaining());
     }
+    fn parse_execute(&mut self, _cx: &mut LoopCx<'_>) {}
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
 }
 
 /// One iteration of the fixture: its marks in order, after its controls
-/// (one driver entry, one poll, nothing pushed, no buffer leased or staged).
+/// (one driver entry, one poll, nothing pushed, no buffer leased or staged,
+/// one turn's whole delivery allowance at its one mark).
 fn delivery_order(remote_first_execute: bool) -> Vec<OrderMark> {
     let config =
         LoopConfig { spin_iters: 0, exec_budget: 1, remote_first_execute, ..LoopConfig::default() };
     let mut lp = test_loop(config);
     let trace = Rc::new(std::cell::RefCell::new(Vec::new()));
-    let mut plane = DeliveryOrderPlane { trace: Rc::clone(&trace), spawned: false };
+    let mut plane =
+        DeliveryOrderPlane { trace: Rc::clone(&trace), spawned: false, allowances: Vec::new() };
     let stats = lp.run_iteration(&mut plane).expect("iteration");
     assert_eq!(lp.driver().waits.len(), 1, "one driver entry");
     assert_eq!(lp.driver().pushed, 0, "nothing pushed");
     assert_eq!(stats.polled, 1, "one task poll");
     assert_eq!((lp.pool().leased(), lp.pool().staged()), (0, 0), "no buffer held");
+    assert_eq!(plane.allowances, [COLD_DELIVERIES_PER_TURN], "one allowance, begun whole, once");
     trace.take()
 }
 
 /// A turn's cold delivery runs before any task woken by its replies polls,
 /// in both `remote_first_execute` modes, so a resumed task never runs ahead
 /// of the delivery its turn owes (ADR-0181 R2). The default mode places the
-/// mark first, the control; with `remote_first_execute` the loop polls the
-/// woken task before `parse_execute`, the first place HEAD gives a delivery.
+/// mark first, the control; with `remote_first_execute` the loop's early
+/// executor pass polls the woken task, so the mark must precede it too. A
+/// second mark in one iteration, a second allowance, is red.
 #[test]
-#[ignore = "with remote_first_execute the loop polls tasks woken by the turn's replies before \
-            parse_execute, the first place a turn can deliver cold reads, so a resumed task runs \
-            ahead of the turn's delivery; red until the delivery runs before either poll"]
 fn a_turns_cold_delivery_precedes_a_woken_tasks_poll_in_both_modes() {
     let marks = [OrderMark::Delivery, OrderMark::Poll];
     assert_eq!(delivery_order(false), marks, "the control: the default mode");

@@ -73,7 +73,9 @@ use inf_foundation::{BuildIntHasher, FileOffset, FileOffsetRefused, LogHistogram
 use crate::budget::Issue;
 use crate::driver::{CompletionResult, IoOp, RawFd, StableBytesMut};
 use crate::gate::{GateWait, KeyedGate};
-use crate::limits::COLD_IDENTITY_PAIRS_MAX;
+use crate::limits::{
+    COLD_DELIVERIES_PER_TURN, COLD_IDENTITY_PAIRS_MAX, COLD_PREPARATION_WORK_PER_TURN,
+};
 use crate::token::{CompletionToken, MAX_SLOT, TokenClass};
 
 /// Opaque per-cell tier-file identity — the pin-table key. Minted by the
@@ -262,6 +264,120 @@ impl PairIssuer {
 impl Default for PairIssuer {
     fn default() -> PairIssuer {
         PairIssuer::new()
+    }
+}
+
+/// One host turn's cold-read allowances (ADR-0181 R1–R3): the delivery
+/// budget and the preparation budget, built together by
+/// [`ColdTurn::begin`], their one constructor. The native reactor begins one
+/// per iteration and lends both through `LoopCx`; a standalone host begins
+/// one per turn it declares, its pumps sharing it. Neither budget is `Copy`
+/// or `Clone`, and no caller can renew one, so every call of a turn spends
+/// from the same allowance.
+#[derive(Debug)]
+pub struct ColdTurn {
+    delivery: ColdDeliveryBudget,
+    preparation: ColdPreparationBudget,
+}
+
+impl ColdTurn {
+    /// A turn's full allowances: [`COLD_DELIVERIES_PER_TURN`] member visits
+    /// and [`COLD_PREPARATION_WORK_PER_TURN`] preparation units.
+    #[must_use]
+    pub fn begin() -> ColdTurn {
+        ColdTurn {
+            delivery: ColdDeliveryBudget { remaining: COLD_DELIVERIES_PER_TURN, spent: 0 },
+            preparation: ColdPreparationBudget {
+                remaining: COLD_PREPARATION_WORK_PER_TURN,
+                spent: 0,
+            },
+        }
+    }
+
+    /// The turn's delivery allowance, lent, never copied.
+    pub fn delivery(&mut self) -> &mut ColdDeliveryBudget {
+        &mut self.delivery
+    }
+
+    /// The turn's preparation allowance, lent, never copied.
+    pub fn preparation(&mut self) -> &mut ColdPreparationBudget {
+        &mut self.preparation
+    }
+}
+
+/// One turn's member visits (ADR-0181 R1): [`COLD_DELIVERIES_PER_TURN`] at
+/// [`ColdTurn::begin`], one spent before each member a delivery step
+/// visits. Its fields are private, so no struct literal outside this module
+/// builds one:
+///
+/// ```compile_fail,E0451
+/// use inf_runtime::ColdDeliveryBudget;
+/// let _ = ColdDeliveryBudget { remaining: 64, spent: 0 };
+/// ```
+///
+/// Its twin, the one constructor, compiles:
+///
+/// ```
+/// use inf_runtime::{ColdDeliveryBudget, ColdTurn};
+/// let mut turn = ColdTurn::begin();
+/// let budget: &mut ColdDeliveryBudget = turn.delivery();
+/// assert_eq!(budget.remaining(), 64);
+/// ```
+#[derive(Debug)]
+pub struct ColdDeliveryBudget {
+    remaining: u32,
+    /// Units spent this turn: what the turn's group is charged.
+    spent: u32,
+}
+
+impl ColdDeliveryBudget {
+    /// Member visits left this turn.
+    #[must_use]
+    pub fn remaining(&self) -> u32 {
+        self.remaining
+    }
+
+    /// Member visits spent this turn.
+    #[must_use]
+    pub fn spent(&self) -> u32 {
+        self.spent
+    }
+}
+
+/// One turn's preparation work (ADR-0181 R3):
+/// [`COLD_PREPARATION_WORK_PER_TURN`] units at [`ColdTurn::begin`], beside
+/// the delivery allowance and apart from it. Its fields are private:
+///
+/// ```compile_fail,E0451
+/// use inf_runtime::ColdPreparationBudget;
+/// let _ = ColdPreparationBudget { remaining: 64, spent: 0 };
+/// ```
+///
+/// Its twin compiles:
+///
+/// ```
+/// use inf_runtime::{ColdPreparationBudget, ColdTurn};
+/// let mut turn = ColdTurn::begin();
+/// let budget: &mut ColdPreparationBudget = turn.preparation();
+/// assert_eq!(budget.remaining(), 64);
+/// ```
+#[derive(Debug)]
+pub struct ColdPreparationBudget {
+    remaining: u32,
+    spent: u32,
+}
+
+impl ColdPreparationBudget {
+    /// Work units left this turn.
+    #[must_use]
+    pub fn remaining(&self) -> u32 {
+        self.remaining
+    }
+
+    /// Work units spent this turn.
+    #[must_use]
+    pub fn spent(&self) -> u32 {
+        self.spent
     }
 }
 
@@ -1883,7 +1999,8 @@ mod tests {
                 most 64 work units and a seed inspects only requests in its own buckets"]
     fn a_drain_call_spends_a_bounded_preparation_allowance() {
         const QD: usize = 64;
-        const ISSUES_PER_CALL_MAX: usize = 21;
+        // A seed's head inspection and its finish cost 3 units.
+        const ISSUES_PER_CALL_MAX: usize = (COLD_PREPARATION_WORK_PER_TURN / 3) as usize;
         const STRIDE: u64 = 16;
         let config =
             ColdReadConfig { qd_cap: QD, overflow_cap: 4 * QD, ..ColdReadConfig::default() };
