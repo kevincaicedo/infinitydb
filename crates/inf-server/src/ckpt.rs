@@ -1302,4 +1302,27 @@ mod tests {
         assert!(ckpt.should_begin(0, 0), "the manual request survives the backoff");
         assert!(!ckpt.tick_backoff(), "backoff is one-shot per abort");
     }
+
+    /// With the interval cause off, nothing but the manual latch begins a
+    /// walk: the predicate reads the latch and the two interval thresholds
+    /// alone, so a table whose relocation-origin map stands past its high
+    /// water never gets the covering swap that drains it (ADR-0180 R1, R5).
+    /// The predicate has no input for relocation pressure; given every
+    /// byte and record a cell can log, it still answers `false`.
+    #[test]
+    #[ignore = "at interval_bytes = 0 the trigger answers only the manual latch, so relocation \
+                pressure never begins a walk; red until relocation pressure is a cause of its own \
+                that begins one, at most once every 30 s"]
+    fn relocation_pressure_begins_a_walk_with_the_interval_off() {
+        let fs = SimDisk::new();
+        let dirs = create_cell_dirs(&fs, Path::new("data/shard-0")).expect("dirs");
+        let cfg = CkptConfig { interval_bytes: 0, ..CkptConfig::default() };
+        let ckpt = CkptCell::new(fs.clone(), dirs.ckpt, 0, cfg).expect("cell");
+        assert!(!ckpt.requested, "engagement: no manual request is pending");
+        assert!(
+            ckpt.should_begin(u64::MAX, u64::MAX),
+            "with the interval cause off and no manual request the trigger answers false: \
+             relocation pressure has no cause that begins a walk"
+        );
+    }
 }
