@@ -31,11 +31,36 @@ impl Protocol {
 
 pub struct JsonCase {
     pub id: &'static str,
+    /// The command as written. An argument too large for the source holds
+    /// a short description here, and `generated` names it.
     pub argv: &'static [&'static str],
     /// This reply may contain JSON text in RESP bulk payloads. Used only for
     /// the independent semantic diagnostic on a byte mismatch.
     pub json_reply: bool,
     pub source: &'static str,
+    pub generated: Option<GeneratedArg>,
+}
+
+/// One argument built when the case runs, for a value too large to write in
+/// the source (a document of millions of bytes): `argv[index]` is replaced
+/// by `text()`, on the oracle and on InfinityDB alike.
+#[derive(Copy, Clone)]
+pub struct GeneratedArg {
+    pub index: usize,
+    pub text: fn() -> String,
+}
+
+impl JsonCase {
+    /// The arguments the case sends: `argv` with its generated argument, if
+    /// any, in place.
+    pub fn args(&self) -> Vec<String> {
+        let mut args: Vec<String> = self.argv.iter().map(|arg| (*arg).to_string()).collect();
+        if let Some(generated) = self.generated {
+            assert!(generated.index < args.len(), "{}: generated argument past argv", self.id);
+            args[generated.index] = (generated.text)();
+        }
+        args
+    }
 }
 
 const fn c(
@@ -44,7 +69,7 @@ const fn c(
     json_reply: bool,
     source: &'static str,
 ) -> JsonCase {
-    JsonCase { id, argv, json_reply, source }
+    JsonCase { id, argv, json_reply, source, generated: None }
 }
 
 /// 127 nested arrays around `0`: the deepest value both parsers accept.
@@ -635,6 +660,24 @@ mod tests {
             compare(&case, Protocol::Resp2, b"$1\r\n1\r\n", b"$3\r\n1.0\r\n", &[deviation]),
             Ok(Comparison::Allowed { deviation_index: 0, semantic_equal: true })
         );
+    }
+
+    fn three_x() -> String {
+        format!("\"{}\"", "x".repeat(3))
+    }
+
+    /// A generated argument replaces its placeholder and nothing else; a
+    /// case without one sends its argv as written.
+    #[test]
+    fn a_generated_argument_replaces_its_placeholder() {
+        let generated = GeneratedArg { index: 3, text: three_x };
+        let case = JsonCase {
+            generated: Some(generated),
+            ..c("g", &["JSON.SET", "k", "$", "<3 x>"], false, "g")
+        };
+        assert_eq!(case.args(), ["JSON.SET", "k", "$", "\"xxx\""]);
+        let plain = c("p", &["JSON.GET", "k"], true, "p");
+        assert_eq!(plain.args(), ["JSON.GET", "k"]);
     }
 
     #[test]
