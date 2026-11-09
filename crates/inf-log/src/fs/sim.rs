@@ -1935,19 +1935,26 @@ mod model_tests {
         assert!(bytes <= 1000 * 4096 * 2, "1000 barriers copied {bytes} bytes (O(file) per fsync)");
     }
 
-    /// A driver file fd reads its inode's OS name, the new one after a
-    /// rename; a directory fd, a closed fd and one never issued read none.
+    /// A driver file fd reads the OS names of its own inode alone, beside
+    /// another namespace's open tier file, and the new name after a rename;
+    /// a directory fd, a closed fd and one never issued read none.
     #[test]
     fn a_file_fd_reads_the_names_of_its_inode() {
         let disk = SimDisk::new();
         let dir = Path::new("shard-0").join("ns-7").join("cold");
+        let other_dir = Path::new("shard-0").join("ns-8").join("cold");
         disk.create_dir_all(&dir).expect("dirs");
+        disk.create_dir_all(&other_dir).expect("other dirs");
         let (first, second) = (dir.join("tier-000000.itier"), dir.join("tier-000001.itier"));
+        let other_name = other_dir.join("tier-000000.itier");
         let tier = disk.create_tier(&first, TierIoMode::Buffered).expect("tier");
-        let fd = tier.raw_fd().expect("fd");
-        assert_eq!(disk.file_fd_names(fd), vec![first.clone()]);
+        let other = disk.create_tier(&other_name, TierIoMode::Buffered).expect("other tier");
+        let (fd, other_fd) = (tier.raw_fd().expect("fd"), other.raw_fd().expect("other fd"));
+        assert_eq!(disk.file_fd_names(fd), vec![first.clone()], "an fd names its own inode alone");
+        assert_eq!(disk.file_fd_names(other_fd), vec![other_name.clone()]);
         disk.rename(&first, &second).expect("rename");
         assert_eq!(disk.file_fd_names(fd), vec![second], "the fd follows its inode");
+        assert_eq!(disk.file_fd_names(other_fd), vec![other_name], "no other fd's name moved");
         let dir_fd = disk.open_dir(&dir).expect("dir").raw_fd().expect("dir fd");
         assert!(disk.file_fd_names(dir_fd).is_empty(), "a directory fd names no file");
         assert!(disk.file_fd_names(-1).is_empty(), "a fd the model never issued names nothing");
