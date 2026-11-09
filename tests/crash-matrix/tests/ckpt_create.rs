@@ -16,10 +16,15 @@ use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::sim::{CallResult, DiskCall, LoggedCall};
 use inf_sim::{DurableScenario, run_durable_scenario};
 
+/// Every seed is a whole-node scenario run: 256 seeds took 320.8 s on an
+/// efficiency core at 2.6 GHz and 166.4 s on a performance core at 3.4 GHz,
+/// so one costs at most 1,260 ms on the slowest core timed.
+const SEEDS: crash_matrix::NodeSeeds = crash_matrix::NodeSeeds::new(2, 1_260);
+
 #[test]
 fn a_refused_staging_create_aborts_its_walk_and_a_cut_recovers() {
     let point = inf_log::fault::CKPT_CREATE_FAIL;
-    for round in 0..crash_matrix::seed_count(2) {
+    for round in 0..SEEDS.count() {
         // Odd seeds run the write-through segment class, whose frames cross
         // the scenario's checkpoint interval several times a run.
         let seed = 0xC4EA_7E01 + 2 * round;

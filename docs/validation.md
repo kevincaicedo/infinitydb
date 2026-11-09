@@ -66,7 +66,10 @@ explicitly unsupported on other hosts and must pass on Linux CI. A
 carrier still running at `crash_matrix::NODE_CARRIER_LIMIT_SECONDS` is
 killed, and one that passes past its budget, half that limit, fails with
 its time; each carrier's time prints beside its verdict, and every carrier
-runs before the verdict, so a red one hides no later row.
+runs before the verdict, so a red one hides no later row. A carrier whose
+every seed runs a whole scenario caps its seeds (`crash_matrix::NodeSeeds`)
+from one seed's measured cost, at half the budget on the slowest core it
+was timed on, and says so when `CRASH_MATRIX_SEEDS` asks for more.
 
 Run the smallest relevant check while developing, then the required suite:
 

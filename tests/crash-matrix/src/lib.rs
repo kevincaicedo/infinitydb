@@ -80,6 +80,41 @@ pub const NODE_CARRIER_LIMIT_SECONDS: u64 = 180;
 /// slow away, and the runner's line per carrier shows the margin left.
 pub const NODE_CARRIER_BUDGET_SECONDS: u64 = NODE_CARRIER_LIMIT_SECONDS / 2;
 
+/// The seeds of a node carrier whose every seed runs a whole scenario: its
+/// pull-request default, and a cap that keeps `CRASH_MATRIX_SEEDS` from
+/// carrying it past the runner's budget. Built in a `const`, so a default
+/// past its cap, or a zero cost, is a compile error.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeSeeds {
+    default: u64,
+    max: u64,
+}
+
+impl NodeSeeds {
+    /// `seed_cost_ms_slowest` is one seed's cost on the slowest core the
+    /// carrier was timed on. The cap is the seeds that fill half the budget
+    /// at that cost, rounded down, so a core twice as slow still finishes
+    /// inside the budget.
+    pub const fn new(default: u64, seed_cost_ms_slowest: u64) -> Self {
+        let max = NODE_CARRIER_BUDGET_SECONDS * 1_000 / 2 / seed_cost_ms_slowest;
+        assert!(default > 0, "a node carrier runs at least one seed");
+        assert!(default <= max, "a node carrier's default seed count is past its cap");
+        Self { default, max }
+    }
+
+    /// `seed_count(default)` capped; a run the cap shortened says so.
+    pub fn count(self) -> u64 {
+        let seeds = seed_count(self.default);
+        if seeds > self.max {
+            eprintln!(
+                "crash matrix: {seeds} seeds requested, {} run (the carrier's cap)",
+                self.max
+            );
+        }
+        seeds.min(self.max)
+    }
+}
+
 // ---------------------------------------------------------------------
 // Matrix definition (m2.toml): hand-rolled reader for exactly this
 // schema (`[[row]]` tables of scalars + string lists — the house
