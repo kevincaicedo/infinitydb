@@ -2320,8 +2320,16 @@ fn port_seed() -> u32 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// A fresh data directory named by `tag`, the process id and this call's
+/// ordinal in the process, so no two calls share one: tests run at once,
+/// and a helper that two tests call with one tag must not clear the other's
+/// live directory. A directory an earlier process of the same id left
+/// behind is cleared.
 fn temp_data_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("inf-s08-{tag}-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call = NEXT.fetch_add(1, Ordering::Relaxed);
+    let name = format!("inf-s08-{tag}-{}-{call}", std::process::id());
+    let dir = std::env::temp_dir().join(name);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).expect("clear stale test dir");
     }
