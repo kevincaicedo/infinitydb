@@ -92,6 +92,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         stop_tick: None,
         timers: super::TimersReport::default(),
         wake: super::WakeReport::default(),
+        mget: super::MgetAuditReport::default(),
     };
     #[track_caller]
     fn fail(report: &mut DurableReport, what: String) {
@@ -1330,6 +1331,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     report.equivalence_checks = equivalence.checks;
     report.documents_compared = equivalence.documents_compared;
     report.corpus_documents_used = writers.iter().map(|w| w.corpus_docs_used).sum();
+    audit_report(scenario, &writers, &mut report);
 
     // ---- audit ----------------------------------------------------------
     if audit_ledgers(

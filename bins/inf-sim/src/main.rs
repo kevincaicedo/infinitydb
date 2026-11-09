@@ -1188,6 +1188,9 @@ fn run_durable(
             if park_at_once {
                 println!("inf-sim: wake {:?}", report.wake);
             }
+            if report.mget.ran {
+                println!("inf-sim: {}", report.mget.describe());
+            }
             if let Some(wedge) = &report.ledger_wedge {
                 println!(
                     "inf-sim: ledger wedge leg {}: armed at step {:?}, hold from step {:?} to \
@@ -2079,6 +2082,9 @@ struct DurableFold {
     lift_plant_lifts: u64,
     lift_plant_sidecars: u64,
     stale_slacks: u64,
+    // The `JSON.MGET` audits: their counters summed over the seeds that ran
+    // them, and those seeds' count and unreached count.
+    mget: inf_sim::durable::MgetAuditFold,
 }
 
 impl Fold for DurableFold {
@@ -2090,13 +2096,14 @@ impl Fold for DurableFold {
         self.equivalence_checks += report.equivalence_checks;
         self.documents_compared += report.documents_compared;
         self.corpus_documents += report.corpus_documents_used;
+        self.mget.absorb(&report.mget);
         for class in &report.cut_classes {
             *self.cut_classes.entry(class).or_default() += 1;
         }
     }
 
     fn coverage(&self) -> String {
-        format!("{}{}", self.coverage_log(), self.coverage_recycling())
+        format!("{}{}{}", self.coverage_log(), self.coverage_recycling(), self.mget.coverage())
     }
 
     fn manifest_tail(&self) -> String {
@@ -2104,7 +2111,7 @@ impl Fold for DurableFold {
     }
 
     fn shard_end_clauses(&self) -> Vec<String> {
-        Vec::new()
+        self.mget.shard_end_clauses()
     }
 }
 

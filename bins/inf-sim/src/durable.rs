@@ -59,12 +59,15 @@ mod audit;
 #[cfg(test)]
 mod lastsave;
 mod ledger_wedge;
+mod mget_audit;
 #[cfg(test)]
 mod park;
 mod run;
 mod stop_tick;
 mod timers;
 pub use ledger_wedge::{LedgerWedgeLeg, LedgerWedgeReport};
+pub use mget_audit::{MgetAuditFold, MgetAuditReport, MgetAudits};
+pub(crate) use mget_audit::{MgetTally, audit_report, next_audit_command, with_reply_budget};
 pub use run::run_durable_scenario;
 pub use stop_tick::StopTickReport;
 pub use timers::{TimersReport, WakeLeg, WakeReport};
@@ -319,6 +322,10 @@ pub struct DurableScenario {
     /// `park_at_once` makes, whose loops run at spin 0. `OFF` everywhere
     /// else.
     pub wake: WakeLeg,
+    /// The `JSON.MGET` audits of the document workload (`durable/mget_audit.rs`)
+    /// and the reply budget every cell's stores take. `None` everywhere
+    /// else: every other trace stays byte-identical.
+    pub mget_audits: Option<MgetAudits>,
 }
 
 /// The epoch-marks shape's legs, chosen by name (`--marks-leg`), never by
@@ -1022,6 +1029,7 @@ impl DurableScenario {
             stop_tick: false,
             fill_dense: false,
             wake: WakeLeg::OFF,
+            mget_audits: None,
         }
     }
 
@@ -1411,6 +1419,7 @@ impl DurableScenario {
             stop_tick: false,
             fill_dense: false,
             wake: WakeLeg::OFF,
+            mget_audits: None,
         }
     }
 
@@ -1582,6 +1591,9 @@ impl DurableScenario {
             stop_tick: false,
             fill_dense: false,
             wake: WakeLeg::OFF,
+            mget_audits: Some(MgetAudits {
+                reply_budget_bytes: StoreConfig::default().doc_max_reply_bytes,
+            }),
         }
     }
 }
@@ -1776,6 +1788,8 @@ pub struct DurableReport {
     pub timers: TimersReport,
     /// TM3's readings over the traffic phase (zeros off its leg).
     pub wake: WakeReport,
+    /// The `JSON.MGET` audits' engagement (`durable/mget_audit.rs`).
+    pub mget: MgetAuditReport,
 }
 
 /// One cell's reclaim-marks census row at the cut of an epoch-marks run.
@@ -1978,6 +1992,9 @@ pub(crate) struct Writer {
     /// `SET`s this writer built: the ADR-0178 arm pads ordinals ≡ 0 mod
     /// 16, so every armed `always` writer pads its first `SET`.
     pub(crate) sets: u64,
+    /// The `JSON.MGET` audits this writer was answered on, and the one in
+    /// flight (`durable/mget_audit.rs`).
+    pub(crate) mget: MgetTally,
 }
 
 pub(crate) fn encode(argv: &[&[u8]]) -> Vec<u8> {
@@ -2032,6 +2049,7 @@ impl Writer {
             models: BTreeMap::new(),
             corpus_docs_used: 0,
             sets: 0,
+            mget: MgetTally::default(),
         }
     }
 
@@ -2173,6 +2191,7 @@ impl Writer {
                 String::from_utf8_lossy(&reply)
             ));
         }
+        self.mget.answered();
         if pending.mutates {
             let ops = self.ledger.entry(pending.key.clone()).or_default();
             let rec = ops.last_mut().expect("sent op has a ledger entry");
@@ -2442,7 +2461,10 @@ pub(crate) fn boot(
         // The node's keyspace is cataloged (ADR-0189 D4), as `infinityd`'s.
         let empty = inf_store::NsCatalog::empty();
         let ks = Keyspace::cataloged(
-            StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() },
+            with_reply_budget(
+                scenario,
+                StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() },
+            ),
             catalog.as_ref().unwrap_or(&empty),
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
