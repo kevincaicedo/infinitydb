@@ -131,9 +131,17 @@ Invariants:
   shared state through its header's `Rc` and the stack through the bridge;
   the executor reads both through `&` and `Cell`s and never forms `&mut` to
   a header or to the shared state, so `settle_held`, which unlinks a Held
-  header inside another task's poll, writes nothing of the executor. No
-  function holds a reference argument to a header across its free: the
-  paths that may free one take its raw pointer.
+  header inside another task's poll, writes nothing of the executor. A
+  function that frees a header takes its raw pointer. A foreign `wake` or
+  `drop` keeps references past the access that may let another thread free
+  the header: it holds `&WakeBridge` and `&RemoteStack` (and
+  `WakeBridge::release_waker`'s `&self`) across its swap, or its push's
+  compare-and-swap, after which the drain or another thread's last drop may
+  free the header and the stack. Those references cover atomics only, as
+  `Arc::drop`'s `&AtomicUsize` does across its decrement, and the call
+  touches neither through them after that access unless it answered
+  `Released::Last`, which makes it the one freer (ADR-0003 A1.2.5). Miri
+  runs both paths in `tests/waker_threads.rs` and `tests/waker_close.rs`.
 - **Close, then the last waker frees.** The executor's drop drains, drops
   every future (deciding each header), frees its spare header open (kept
   only while no waker names it and no push holds it, so freed as any quiet

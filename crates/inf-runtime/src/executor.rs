@@ -15,8 +15,8 @@
 //! links), which only the thread that built the executor reaches. Each operation compares the
 //! bridge's mark with the calling thread's ([`owner_part`]):
 //!
-//! - **the owner lane** (the marks match): HEAD's cell-local transition, with no atomic
-//!   read-modify-write, fence or ordered access (ADR-0003 A1.5); `o` is compared with
+//! - **the owner lane** (the marks match): the single-threaded transition, on `Cell`s, with no
+//!   atomic read-modify-write, fence or ordered access (ADR-0003 A1.5); `o` is compared with
 //!   `LANE_COUNT_MAX` before it grows;
 //! - **the foreign lane** (any other thread, and every thread once the executor is gone):
 //!   [`foreign`], five `#[inline(never)]` functions over `inf_foundation::wake`. A foreign wake
@@ -144,7 +144,8 @@ struct OwnerPart {
 type Header = NonNull<WakeHeader>;
 
 // The bridge's four words, the state and slot, the shared state's `Rc`, `o` and the held list's
-// two links: nine words, 40 bytes over a header of HEAD's `Rc` waker (ADR-0003 A1.2.2).
+// two links: nine words, 40 bytes more than a single-threaded `Rc` header's four (its two counts,
+// the state and slot, the ready queue's `Rc`) (ADR-0003 A1.2.2).
 const _: () = assert!(size_of::<WakeHeader>() == 72, "a wake header is nine words");
 
 /// The owner part of a header.
@@ -183,9 +184,9 @@ unsafe fn owner_part(data: *const ()) -> Option<Header> {
     owned.then(|| unsafe { NonNull::new_unchecked(data.cast_mut().cast::<WakeHeader>()) })
 }
 
-/// The owner lane's wake transition, HEAD's: Idle → Queued and pushed; Running → RunningWoken;
-/// otherwise nothing. Runs inside `Waker::wake`, so it touches only the header and the shared
-/// ready queue, never the executor.
+/// The owner lane's wake transition, a single-threaded waker's: Idle → Queued and pushed;
+/// Running → RunningWoken; otherwise nothing. Runs inside `Waker::wake`, so it touches only the
+/// header and the shared ready queue, never the executor.
 fn wake_task(owner: &OwnerPart) {
     match owner.state.get() {
         TaskState::Idle => {
@@ -370,7 +371,13 @@ mod foreign {
     /// `data` is a live header's address, which the caller's waker names and gives up here.
     #[inline(never)]
     pub(super) unsafe fn wake(data: *const ()) {
-        // SAFETY: per this function's contract.
+        // SAFETY: per this function's contract, the waker keeps the header and the stack
+        // allocated until its swap, or its push's compare-and-swap, inside `foreign_wake_at`;
+        // after that access the drain, or another thread's last drop, may free both while these
+        // references and the callee's `&self` are live. They cover atomics only, as `Arc::drop`'s
+        // `&AtomicUsize` does across its decrement, and the call touches neither after that
+        // access unless it answered `Last`, which makes this call the one freer (ADR-0003
+        // A1.2.5).
         let (bridge, stack) = unsafe { bridge_and_stack(data) };
         // SAFETY: per this function's contract.
         let released = bridge.foreign_wake_at(stack, unsafe { node(data) });
@@ -384,7 +391,13 @@ mod foreign {
     /// `data` is a live header's address, which the caller's waker names and gives up here.
     #[inline(never)]
     pub(super) unsafe fn drop(data: *const ()) {
-        // SAFETY: per this function's contract.
+        // SAFETY: per this function's contract, the waker keeps the header and the stack
+        // allocated until its swap, or its push's compare-and-swap, inside `foreign_drop_at`;
+        // after that access the drain, or another thread's last drop, may free both while these
+        // references and the callee's `&self` are live. They cover atomics only, as `Arc::drop`'s
+        // `&AtomicUsize` does across its decrement, and the call touches neither after that
+        // access unless it answered `Last`, which makes this call the one freer (ADR-0003
+        // A1.2.5).
         let (bridge, stack) = unsafe { bridge_and_stack(data) };
         // SAFETY: per this function's contract.
         let released = bridge.foreign_drop_at(stack, unsafe { node(data) });
@@ -892,9 +905,10 @@ impl CellExecutor {
     /// before its `Q` and `W` are cleared. A cleared `W` is the owner-lane wake of that header's
     /// task; then a Held header no waker names is unlinked and freed. Cold and out of line: no
     /// product path queues a foreign wake while the executor lives (ADR-0149 D1), and a check
-    /// inside this body made every `run_ready` call it and run its prologue, which saves the
-    /// registers the drain uses, before the empty test (about 20 instructions a call, against
-    /// one load and a branch; the waker A/B's suspend and wake-run rows read the difference).
+    /// inside this body would make every `run_ready` call it and run its prologue, which saves
+    /// the registers the drain uses, before the empty test: about 20 instructions a call, against
+    /// the inline check's load and branch; the waker A/B's suspend and wake-run rows read the
+    /// difference.
     #[cold]
     #[inline(never)]
     fn drain_pending(&self) {
