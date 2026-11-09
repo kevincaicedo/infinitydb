@@ -109,6 +109,8 @@ refusal_table! {
         Index => "index";
         /// A store's resources.
         Store => "store";
+        /// A cell's cold-read host: its request identities.
+        ColdRead => "cold-read";
     ]
 }
 
@@ -130,6 +132,8 @@ mod tests {
         let limit = Refusal::LimitReached(Domain::TieredNamespace);
         assert_eq!(limit.render(), "ERR tiered namespace limit reached");
         assert_eq!(Refusal::LimitReached(Domain::Catalog).render(), "ERR catalog limit reached");
+        let cold = Refusal::IdentityExhausted(Domain::ColdRead);
+        assert_eq!(cold.render(), "ERR cold-read identity space exhausted");
     }
 
     /// Every line is one RESP error line: a Redis error prefix, the domain's
