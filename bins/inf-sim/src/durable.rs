@@ -587,26 +587,8 @@ impl TierBudgetLeg {
             TierBudgetLeg::TwoAt1mbHostile => TierBudgetShape {
                 leg: self,
                 namespaces: TWO,
-                first: TierBudgetLoad {
-                    writers: 12,
-                    ops_per_writer: 4_000,
-                    keys_per_writer: 40,
-                    think_ns_max: 0,
-                    mem_budget: b"256mb",
-                    mutable_permille: b"10",
-                    maintain_slice: b"1mb",
-                    tail_stall_timeout_ms: None,
-                },
-                rest: TierBudgetLoad {
-                    writers: 1,
-                    ops_per_writer: 6_000,
-                    keys_per_writer: 40,
-                    think_ns_max: 0,
-                    mem_budget: b"8mb",
-                    mutable_permille: b"100",
-                    maintain_slice: b"64kb",
-                    tail_stall_timeout_ms: None,
-                },
+                first: TierBudgetLoad::HOSTILE_FIRST,
+                rest: TierBudgetLoad::HOSTILE_REST,
             },
             TierBudgetLeg::OneAt64mbNoModel => {
                 let load = TierBudgetLoad {
@@ -651,6 +633,34 @@ pub struct TierBudgetLoad {
     /// The `TAIL-STALL-TIMEOUT` the `CREATE` names, in milliseconds;
     /// `None` keeps the namespace default (1,000 ms).
     pub tail_stall_timeout_ms: Option<&'static [u8]>,
+}
+
+impl TierBudgetLoad {
+    /// The hostile leg's first namespace: twelve writers bursting into a
+    /// 256 MiB window with one percent of it mutable, at `1mb`.
+    const HOSTILE_FIRST: TierBudgetLoad = TierBudgetLoad {
+        writers: 12,
+        ops_per_writer: 4_000,
+        keys_per_writer: 40,
+        think_ns_max: 0,
+        mem_budget: b"256mb",
+        mutable_permille: b"10",
+        maintain_slice: b"1mb",
+        tail_stall_timeout_ms: None,
+    };
+
+    /// The hostile leg's second namespace: one writer into an 8 MiB window
+    /// at a 64 KiB slice.
+    const HOSTILE_REST: TierBudgetLoad = TierBudgetLoad {
+        writers: 1,
+        ops_per_writer: 6_000,
+        keys_per_writer: 40,
+        think_ns_max: 0,
+        mem_budget: b"8mb",
+        mutable_permille: b"100",
+        maintain_slice: b"64kb",
+        tail_stall_timeout_ms: None,
+    };
 }
 
 /// How many tiered namespaces the tier-budget shape runs and how each
