@@ -1879,7 +1879,9 @@ pub static JSON_REPLY_SHAPES: &[ReplyShape] = &[
         dollar: "array: per key, bulk JSON match-array or null",
         legacy: "array: per key, bulk first match or null",
         resp3: NULLS,
-        notes: "per-key atomicity only — no cross-cell snapshot (ADR-0041 D9)",
+        notes: "per-key atomicity only — no cross-cell snapshot (ADR-0041 D9); a reply over \
+                `doc-max-reply-bytes`, counted over the whole array, answers `ERR reply too large` \
+                and no element is served (ADR-0173 D1)",
     },
     ReplyShape {
         name: "JSON.DEL",

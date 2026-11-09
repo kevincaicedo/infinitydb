@@ -1275,7 +1275,13 @@ Commands whose keys live on several cells run as small programs on the pump:
 - `DEL`, `UNLINK`, `EXISTS` and `TOUCH` count local keys directly and send one
   operation per remote key, then sum the results. If any leg fails, the reply
   is that error, never a partial sum.
-- `MGET` and `JSON.MGET` gather values from each owner in key order.
+- `MGET` gathers values from each owner in key order.
+- `JSON.MGET` sends one leg per owning cell, the command over that cell's
+  keys, with at most three legs in flight; a wider gather waits for its
+  oldest leg before it sends the next. The accepting cell charges the whole
+  reply to one `doc-max-reply-bytes` account: a reply over it answers
+  `ERR reply too large` and serves no element, a leg's error is the whole
+  reply, and the legs still in flight are awaited before the reply is sent.
 - `MSET` applies its local pairs, then sends one leg per remote pair and
   replies `OK` when all legs succeed. `MSETNX` across cells checks, then sets.
 - `RENAME` and `RENAMENX` across two owners read a snapshot of the source,
