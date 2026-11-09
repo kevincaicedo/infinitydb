@@ -1,7 +1,10 @@
 //! The simulated disk's call log: the calls an oracle times and matches,
 //! each logged by the call that performs it, so the code an oracle judges
-//! neither writes an entry nor can skip one. A failure the disk did not
-//! log was not injected.
+//! neither writes an entry nor can skip one. A point that fires inside a
+//! logged call (`ckpt_create_fail`) is that call's entry, its result
+//! `Injected`; a point that fires before the disk is called leaves no
+//! entry: a rename onto `MANIFEST` that `manifest_rename_fail` refuses
+//! never reaches the disk.
 //!
 //! Two calls are logged: a checkpoint's staging create (`create_meta` or
 //! `create_meta_direct` on a `ckpt-NNNNNN.ick.new` name), with its result
