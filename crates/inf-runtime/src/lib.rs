@@ -65,7 +65,9 @@ pub use driver::{
 };
 pub use executor::{CellExecutor, PollImmediate, TaskId};
 pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};
-pub use reactor::{CellLoop, CellPlane, IterStats, LoopConfig, LoopCx};
+pub use reactor::{
+    CellLoop, CellPlane, IterStats, LoopConfig, LoopCx, ParkCeiling, ParkCeilingTooLong,
+};
 pub use sched::{GroupClass, GroupScheduler};
 pub use timer::{
     ArmError, Cancelled, Closed, Consumed, OwnerPhase, Reserved, Successor, TimerArm, TimerNotice,

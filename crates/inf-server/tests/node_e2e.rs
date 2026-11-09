@@ -880,7 +880,8 @@ impl Node {
                     );
                 }
                 let config = LoopConfig {
-                    park_default: Some(Duration::from_millis(5)),
+                    park_default: inf_runtime::ParkCeiling::new(Duration::from_millis(5))
+                        .expect("a park ceiling within the maximum"),
                     ..Default::default()
                 };
                 let clock = match held_clock {

@@ -248,7 +248,8 @@ fn drive_cell(
     cfg.recover.boot_prefetch = boot_prefetch;
     plane.begin_recovery(StdSegmentFs, &cfg, i as u16, StdClock::new().now());
     let config = LoopConfig {
-        park_default: Some(std::time::Duration::from_micros(500)),
+        park_default: inf_runtime::ParkCeiling::new(std::time::Duration::from_micros(500))
+            .expect("a park ceiling within the maximum"),
         ..Default::default()
     };
     let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set);

@@ -26,8 +26,9 @@ use inf_alloc::BufferPool;
 use inf_fabric::{CellFabric, Mesh, MeshConfig};
 use inf_foundation::time::{Clock, StdClock};
 use inf_foundation::{CellId, KeyHasher};
+use inf_runtime::limits::PARK_CEILING_MAX;
 use inf_runtime::net::{bound_port, listen_reuseport, pin_current_thread};
-use inf_runtime::{BackendDriver, CellLoop, LoopConfig};
+use inf_runtime::{BackendDriver, CellLoop, LoopConfig, ParkCeiling};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane, StdSegmentFs};
 use inf_store::{Keyspace, StoreConfig};
 
@@ -50,7 +51,8 @@ struct Args {
     pin_start: Option<usize>,
     pin_stride: u16,
     route_local_only: bool,
-    park_us: Option<u64>,
+    /// `--park-us`, checked at the flag: at most `PARK_CEILING_MAX`.
+    park: Option<ParkCeiling>,
     /// Durable-plane root (M2-S08/S11): `--data-dir` enables the catalog,
     /// per-cell log recovery, checkpoints, and truncation. Absent = the
     /// memory-only node (the M2-S09 zero-cost posture).
@@ -198,7 +200,7 @@ impl Default for Args {
             pin_start: None,
             pin_stride: 2,
             route_local_only: false,
-            park_us: None,
+            park: None,
             data_dir: None,
             ckpt_interval_bytes: inf_server::DEFAULT_CKPT_INTERVAL_BYTES,
             segment_bytes: inf_server::DEFAULT_SEGMENT_BYTES,
@@ -274,8 +276,17 @@ fn parse_args() -> Result<Args, String> {
             "--deasync-dispatch" => args.deasync_dispatch = true,
             "--no-deasync-dispatch" => args.deasync_dispatch = false,
             "--park-us" => {
-                args.park_us =
-                    Some(take("--park-us")?.parse().map_err(|e| format!("--park-us: {e}"))?);
+                let micros: u64 =
+                    take("--park-us")?.parse().map_err(|e| format!("--park-us: {e}"))?;
+                // ADR-0003 A1.2.7: every park a cell loop issues ends within its ceiling, at
+                // most PARK_CEILING_MAX; a longer one is refused here, before any cell starts.
+                let ceiling = ParkCeiling::new(std::time::Duration::from_micros(micros));
+                args.park = Some(ceiling.map_err(|_| {
+                    format!(
+                        "--park-us must be <= {} (the longest park a cell loop takes)",
+                        PARK_CEILING_MAX.as_micros()
+                    )
+                })?);
             }
             "--data-dir" => args.data_dir = Some(take("--data-dir")?.into()),
             "--ckpt-interval-bytes" => {
@@ -1477,9 +1488,16 @@ fn cell_main(
     plane.set_park_flags(std::sync::Arc::clone(&wiring.park_flags));
     // Multi-cell dev-tier (kqueue, no wakeups) still parks briefly so a
     // parked peer notices doorbells within the ceiling.
-    let park_us = args.park_us.unwrap_or(if args.cells.get() > 1 { 500 } else { 5_000 });
+    // These defaults are this binary's settings, not bounds: the bound is PARK_CEILING_MAX,
+    // which the flag's check and the ceiling's one constructor hold.
+    let park_us = if args.cells.get() > 1 { 500 } else { 5_000 };
+    let park = match args.park {
+        Some(ceiling) => ceiling,
+        None => ParkCeiling::new(std::time::Duration::from_micros(park_us))
+            .map_err(|refused| std::io::Error::other(refused.to_string()))?,
+    };
     let config = LoopConfig {
-        park_default: Some(std::time::Duration::from_micros(park_us)),
+        park_default: park,
         remote_first_execute: args.remote_first_execute,
         ..Default::default()
     };

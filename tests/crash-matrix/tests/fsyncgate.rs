@@ -110,8 +110,11 @@ fn start_node(
         .expect("the server's timer owners fit their cap");
         plane.set_control(Arc::clone(&board), issuer).expect("cell 0's issuer");
         plane.begin_recovery(inf_server::StdSegmentFs, &cfg, 0, StdClock::new().now());
-        let config =
-            LoopConfig { park_default: Some(Duration::from_millis(5)), ..Default::default() };
+        let config = LoopConfig {
+            park_default: inf_runtime::ParkCeiling::new(Duration::from_millis(5))
+                .expect("a park ceiling within the maximum"),
+            ..Default::default()
+        };
         let mut cell_loop =
             CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set);
         while !stop.load(Ordering::Relaxed) {

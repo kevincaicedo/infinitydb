@@ -73,6 +73,8 @@ fn out_of_range_boot_flags_are_usage_errors_not_panics() {
             "--buf-size must be <= 2147483647",
         ),
         ("cells-over", &["--cells", "16385"], "--cells must be <= 16384"),
+        // The longest park a cell loop takes, 100 ms: one microsecond more is refused.
+        ("park-over", &["--park-us", "100001"], "--park-us must be <= 100000"),
         // The staging buffer's domain: one MiB up to the frame decoder
         // bound, read from its constant (64 MiB).
         ("staging-zero", &["--log-staging-mib", "0"], "--log-staging-mib is 1..=64"),
@@ -101,4 +103,12 @@ fn out_of_range_boot_flags_are_usage_errors_not_panics() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n---\n"));
+}
+
+/// The longest park a cell loop takes, 100 ms, passes the flag's check: the parser reads it
+/// and `--version`, after it, exits 0.
+#[test]
+fn the_longest_park_passes_the_flag() {
+    let (code, stderr) = boot("park-max", &["--park-us", "100000", "--version"]);
+    assert_eq!(code, Some(0), "--park-us 100000 is refused: {stderr}");
 }

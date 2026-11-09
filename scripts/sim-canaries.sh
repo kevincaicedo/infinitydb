@@ -879,6 +879,9 @@ rows=(
   "inf_canary_settle_held_skipped crate-test inf-runtime test:waker_threads a_waker_dropped_during_another_tasks_poll_frees_the_first_held_header freed inside the poll"
   # `close` keeps the owner part: its `Rc` holds the shared state past the executor's drop.
   "inf_canary_close_keeps_owner_part crate-test inf-runtime test:waker_close an_executor_dropped_before_its_threads_last_wakers_frees_each_at_its_drop released at drop"
+  # ADR-0003 A1.2.7: every park a cell loop issues carries a timeout of at most its ceiling;
+  # planted, a park with no timer armed passes none and waits without limit.
+  "inf_canary_park_without_ceiling crate-test inf-runtime test:reactor an_idle_park_carries_its_ceiling at most its ceiling"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
