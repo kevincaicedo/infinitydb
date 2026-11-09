@@ -556,7 +556,9 @@ impl<F: SegmentFs> NsTierMap<F> {
         // name's manifest search is a binary search.
         if tier.files.binary_search_by_key(&id, |file| file.id).is_err() {
             work.file_ops += 1;
-            if remove_listed(&self.fs, &self.cold_dir.join(name))? == Removal::Removed {
+            let removal = remove_listed(&self.fs, &self.cold_dir.join(name))?;
+            // The planted canary counts a `Gone` as a removal of its own.
+            if removal == Removal::Removed || cfg!(inf_canary_recover_map_gone_counted) {
                 self.stats.files_removed += 1;
             }
         }

@@ -37,7 +37,10 @@ bin=target/release/inf-sim
 # ADR-0174 D1: the replay-above-window seed class forced on the smoke
 # seed — a boot whose tiered replay exceeds the window demotes. D2 rule
 # 6: m4-recovery's spec-variant class, each case forced — a boot at a
-# window below its ring pads.
+# window below its ring pads. ADR-0202 D5: m4-tiered's listing-repeat class
+# forced on the smoke seed — the post-drop reboot's sweep reads its dropped
+# namespace past one batch and takes each repeated name as its earlier
+# removal.
 # m4-tier-budget runs each of its legs (two namespaces at 8mb, eight at
 # 1mb, the one-namespace control, two at 1mb at the hostile share, one at
 # 64mb with no device model) on its own row, and the retry arm (one tier
@@ -99,6 +102,7 @@ rows=(
   "m4-ns-lifetimes --seed 0x2"
   "m4-tiered --plant tier-read-eio"
   "m4-tiered --replay-above-window --verify-determinism"
+  "m4-tiered --listing-repeats --verify-determinism"
   "m4-tier-budget --tier-leg two-8mb --verify-determinism"
   "m4-tier-budget --tier-leg eight-1mb --verify-determinism"
   "m4-tier-budget --tier-leg one-1mb --verify-determinism"

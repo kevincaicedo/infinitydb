@@ -81,6 +81,10 @@ fn main() {
     // m4-recovery and m4-tiered — the tail replay must demote; a run in it
     // that never exceeded a window is VACUOUS.
     let mut replay_above_window = false;
+    // ADR-0202 D5: force m4-tiered's listing-repeat seed class on any seed
+    // — the post-drop reboot's sweep reads past one batch and meets each
+    // removed name again; a run in it that served no repeat is VACUOUS.
+    let mut listing_repeats = false;
     // ADR-0174 D2 rule 6: force m4-recovery's spec-variant class on any
     // seed — every boot recovers at a window below its ring, with records
     // up to the inline maximum; a run that placed no pad is VACUOUS.
@@ -146,6 +150,7 @@ fn main() {
                 "--replay-canary" => replay_canary = true,
                 "--lift-regime" => lift_regime = true,
                 "--replay-above-window" => replay_above_window = true,
+                "--listing-repeats" => listing_repeats = true,
                 "--park-at-once" => park_at_once = true,
                 "--lifetimes-leg" => {
                     let name = take("--lifetimes-leg")?;
@@ -214,6 +219,7 @@ fn main() {
                          [--plant lost-wakeup|fsync-lies|accept-error|accept-broken|\
                          tier-read-eio|tier-write-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--replay-above-window] \
+                         [--listing-repeats] \
                          [--spec-variant ring-top|page] [--tier-leg {}] [--marks-leg {}] \
                          [--window-leg {}] [--wedge-leg {}] [--park-at-once] \
                          [--cold-leg {}] [--cold-identity-start N] \
@@ -256,6 +262,12 @@ fn main() {
     // since a leg that dispatches early would run with the flag ignored.
     if park_at_once && !matches!(scenario_name.as_str(), "m2-fill-tick" | "m2-group-hold") {
         eprintln!("inf-sim: --park-at-once is m2-fill-tick's and m2-group-hold's");
+        std::process::exit(2);
+    }
+    // The listing-repeat class is m4-tiered's alone: refused elsewhere
+    // before a runner starts, never ignored.
+    if listing_repeats && scenario_name != "m4-tiered" {
+        eprintln!("inf-sim: --listing-repeats is m4-tiered's");
         std::process::exit(2);
     }
     // The two flags each force one of m4-recovery's seed classes, which a
@@ -889,6 +901,9 @@ fn main() {
             if replay_above_window {
                 scenario = scenario.with_replay_above_window();
             }
+            if listing_repeats {
+                scenario = scenario.with_listing_repeats();
+            }
             inf_sim::run_tiered_scenario(&scenario)
         };
         if let Some(sweep) = sweep {
@@ -956,6 +971,8 @@ fn main() {
             let mut rebuilt_fill_sets = 0u64;
             let mut rebuilt_reboots = 0u64;
             let mut promoted_extent_pairs = 0u64;
+            let mut listing_repeat_seeds = 0u64;
+            let mut listing_repeats_served = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
@@ -975,6 +992,8 @@ fn main() {
                 rebuilt_fill_sets += report.rebuilt_fill_sets;
                 rebuilt_reboots += report.rebuilt_reboots;
                 promoted_extent_pairs += report.promoted_extent_pairs;
+                listing_repeat_seeds += u64::from(report.listing_repeats);
+                listing_repeats_served += report.listing_repeats_served;
                 open_seeds += u64::from(report.open_rows);
                 open_tickets += report.open_tickets;
                 open_drains += report.open_dbsize_drains;
@@ -1075,7 +1094,8 @@ fn main() {
                  {rebuilt_tickets} tickets rebuilt, {rebuilt_multi_dels} DELs draining several, \
                  {rebuilt_same_key_twins} same-key twins among them, {rebuilt_fill_sets} filler \
                  writes, {rebuilt_reboots} reboots; {promoted_extent_pairs} cold blob GET pairs \
-                 re-resolved onto a promoted reference"
+                 re-resolved onto a promoted reference; listing-repeat draw on \
+                 {listing_repeat_seeds} seeds ({listing_repeats_served} repeats served)"
             );
             println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
             if let Some(dir) = out_dir {
@@ -1115,7 +1135,9 @@ fn main() {
                      rebuilt_multi_dels={rebuilt_multi_dels} \
                      rebuilt_same_key_twins={rebuilt_same_key_twins} \
                      rebuilt_fill_sets={rebuilt_fill_sets} rebuilt_reboots={rebuilt_reboots} \
-                     promoted_extent_pairs={promoted_extent_pairs}\n"
+                     promoted_extent_pairs={promoted_extent_pairs} \
+                     listing_repeat_seeds={listing_repeat_seeds} \
+                     listing_repeats_served={listing_repeats_served}\n"
                 );
                 std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
                     .expect("manifest");
@@ -1159,8 +1181,8 @@ fn main() {
              / bound splits {}, SCAN batching oracle on {} cold pages ({} cold intents), replay \
              unit above the window on {} cell(s) (acked record bytes per cell {:?}), boot \
              tier replay {:?} (demote steps, bytes, barriers, files sealed, settle reads, \
-             deletes verified, step charge max), {} aged deletes acked, trace {} bytes, hash \
-             {:#018x}",
+             deletes verified, step charge max), {} aged deletes acked, listing-repeat draw {} \
+             ({} repeats served), trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -1210,6 +1232,8 @@ fn main() {
             report.acked_record_bytes_per_cell,
             report.boot_tier,
             report.aged_deletes_acked,
+            report.listing_repeats,
+            report.listing_repeats_served,
             report.trace.len(),
             report.trace_hash
         );

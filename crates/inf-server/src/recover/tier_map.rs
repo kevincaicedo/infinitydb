@@ -240,7 +240,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 if let Some(name) = batch.name(next) {
                     work.file_ops += 1;
                     work.ram_units += 1;
-                    if remove_listed(fs, &cold.join(name))? == Removal::Removed {
+                    let removal = remove_listed(fs, &cold.join(name))?;
+                    // The planted canary counts a `Gone` as a removal of its own.
+                    if removal == Removal::Removed || cfg!(inf_canary_recover_sweep_gone_counted) {
                         removed += 1;
                     }
                     let sweep = DropSweep::Listing { stream, batch, next: next + 1, end, removed };

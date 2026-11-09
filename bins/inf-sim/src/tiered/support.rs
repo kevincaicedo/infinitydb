@@ -61,7 +61,7 @@ fn next_tiered_command(
 
 /// The cell that owns `key` and replays its records (the node's
 /// contiguous slot router), not the cell a writer's connection reached.
-fn owner_cell(cells: u16, key: &[u8]) -> usize {
+pub(super) fn owner_cell(cells: u16, key: &[u8]) -> usize {
     inf_store::SlotRouter::new_contiguous(cells)
         .cell_of(inf_store::SlotRouter::slot_of(key))
         .as_usize()
