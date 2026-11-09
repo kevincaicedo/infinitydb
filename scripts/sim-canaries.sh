@@ -887,6 +887,11 @@ rows=(
   # A closed header's last drop frees it with Q set: the last take then
   # reaches the freed bridge.
   "inf_canary_closed_free_ignores_queue loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
+  # The thief leg's premise: a thief of two writers with a tenth of its
+  # window mutable seals late and holds a backlog below its slice inside the
+  # wait bound's window, so the leg's premise clause reads it vacuous (a
+  # vacuity plant, read in the simulator alone).
+  "inf_canary_thief_premise_short m4-tier-budget thief-premise-short --tier-leg two-1mb-thief"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

@@ -576,6 +576,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let mut wake_oracle = super::timers::WakeOracle::new(scenario);
     let mut tier_oracle = TierTurnOracle::new(&node, scenario.cells, true);
     let mut turn_shape = TurnShape::new(scenario);
+    let mut thief_premise = ThiefPremise::new(scenario);
     let no_model_leg = scenario.tier_budget.is_some_and(|shape| shape.leg.model_absent());
     if no_model_leg {
         tier_oracle.arm_after_the_visits_bound();
@@ -597,6 +598,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         wake_oracle.sample(&node, &mut report.wake);
         tier_oracle.sample(&node, &disk, scenario, &mut report);
         turn_shape.sample(&node);
+        thief_premise.sample(&node, scenario, clock.now());
         if let Some(wedge) = ledger_wedge.as_mut() {
             wedge.observe(step, &node, &disk, clock.now());
             if wedge.cut_due(step, seeded_cut) {
@@ -983,6 +985,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     if let Some(shape) = scenario.tier_budget {
         tier_budget_scrape(scenario, shape, &node, &disk, &mut report);
         turn_shape.judge(scenario, shape, &node, &mut report);
+        thief_premise.judge(scenario.seed, &mut report);
     }
     derived_ledger_counters(scenario.seed, &mut report);
     engagement_checks(scenario, &node, &mut report);
@@ -1780,6 +1783,99 @@ impl TurnShape {
             ));
         }
     }
+}
+
+/// The thief leg's premise, read on every run of it: from the first pass
+/// the turn reads contended on a cell, for `n × T_c` of injected time, the
+/// first namespace holds a sealed backlog (sealed less flushed) of at
+/// least its slice, the `MAINTAIN-SLICE` its spec carries. A thief whose
+/// backlog runs short leaves openings to the second namespace under any
+/// visit order, so the planted turn cannot hold the second's group past
+/// the bound. The plant gives the thief more of the class than the fair
+/// turn does, so this reads the premise's necessary half, where the plain
+/// run can.
+struct ThiefPremise {
+    cells: Vec<PremiseCell>,
+    window_ns: u64,
+}
+
+/// One cell's reading of the thief leg's premise.
+#[derive(Clone, Copy, Debug, Default)]
+struct PremiseCell {
+    /// The injected time of the first contended pass.
+    from_ns: Option<u64>,
+    /// The first namespace's `MAINTAIN-SLICE`, from its spec.
+    slice_bytes: Option<u64>,
+    /// The least sealed backlog read inside the window.
+    least_bytes: Option<u64>,
+}
+
+impl ThiefPremise {
+    fn new(scenario: &DurableScenario) -> ThiefPremise {
+        let thief = scenario.tier_budget.filter(|shape| shape.leg.is_thief());
+        let window_ns = thief.map_or(0, |shape| tier_turn_bound_ns(scenario, shape));
+        let cells = if thief.is_some() { usize::from(scenario.cells) } else { 0 };
+        ThiefPremise { cells: vec![PremiseCell::default(); cells], window_ns }
+    }
+
+    fn sample(&mut self, node: &Node, scenario: &DurableScenario, now: Nanos) {
+        use inf_server::TierFlushGauge as G;
+        let Some(shape) = scenario.tier_budget else { return };
+        for (cell, read) in self.cells.iter_mut().enumerate() {
+            if read.from_ns.is_none()
+                && node.plane(cell).tier_flush_gauges()[G::TurnContended as usize] > 0
+            {
+                read.from_ns = Some(now.0);
+            }
+            let Some(from) = read.from_ns else { continue };
+            if now.0 > from.saturating_add(self.window_ns) {
+                continue;
+            }
+            let keyspace = node.plane(cell).keyspace();
+            if read.slice_bytes.is_none() {
+                read.slice_bytes = thief_slice_bytes(&keyspace);
+            }
+            let flushed = tier_budget_flushed(&keyspace, shape);
+            if let Some(&(_, flushed, sealed, _)) = flushed.iter().find(|row| row.0 == 0) {
+                let backlog = sealed.saturating_sub(flushed);
+                read.least_bytes =
+                    Some(read.least_bytes.map_or(backlog, |least| least.min(backlog)));
+            }
+        }
+    }
+
+    /// One line a contended cell whose premise is unread or short; a cell
+    /// the turn never contended on is the contention clause's.
+    fn judge(&self, seed: u64, report: &mut DurableReport) {
+        for (cell, read) in self.cells.iter().enumerate() {
+            if read.from_ns.is_none() {
+                continue;
+            }
+            let why = match (read.slice_bytes, read.least_bytes) {
+                (None, _) => "the first namespace carries no tier spec, so no slice".to_string(),
+                (Some(_), None) => {
+                    "the first namespace's backlog was read at no step of the window".to_string()
+                }
+                (Some(slice), Some(least)) if least < slice => format!(
+                    "the first namespace's backlog read {least} B, below its slice of {slice} B, \
+                     within n × T_c of the first contended pass"
+                ),
+                (Some(_), Some(_)) => continue,
+            };
+            report
+                .violations
+                .push(format!("VACUOUS seed {seed:#x} cell {cell}: thief-premise-short — {why}"));
+        }
+    }
+}
+
+/// The first tier-budget namespace's `MAINTAIN-SLICE` on one cell, read
+/// from its spec in the keyspace: the product's own parse of its load's
+/// slice.
+fn thief_slice_bytes(keyspace: &inf_store::Keyspace) -> Option<u64> {
+    let name = NsClass::TierBudget(0).name();
+    let spec = keyspace.ns_iter().find(|spec| spec.name.as_slice() == name)?;
+    spec.tier.map(|tier| tier.maintain_slice_bytes)
 }
 
 /// The first two tier-budget namespaces' ids on one cell, once both

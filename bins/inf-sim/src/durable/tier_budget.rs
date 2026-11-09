@@ -342,6 +342,7 @@ impl TierBudgetLoad {
     /// 256 MiB ring: no writer parks, and no round meets the ring top or a
     /// rotation, so past its first a round of at most 15 records is one
     /// batch and its tail, two writes of at most 17 frames, then its sync.
+    #[cfg(not(inf_canary_thief_premise_short))]
     const THIEF: TierBudgetLoad = TierBudgetLoad {
         writers: 12,
         ops_per_writer: 3_000,
@@ -349,6 +350,24 @@ impl TierBudgetLoad {
         think_ns_max: 0,
         mem_budget: b"128mb",
         mutable_permille: b"10",
+        maintain_slice: b"64kb",
+        tail_stall_timeout_ms: None,
+        values: TierBudgetValues::SetOnlyUnique { value_bytes: 4_096 },
+    };
+
+    /// A planted canary: the thief of two writers with a tenth of its
+    /// window mutable, which seals once its tail passes 12.8 MiB and sends
+    /// at a sixth of the twelve writers' rate, so its backlog runs below
+    /// its slice inside the bound's window and the leg's premise clause
+    /// reads it vacuous.
+    #[cfg(inf_canary_thief_premise_short)]
+    const THIEF: TierBudgetLoad = TierBudgetLoad {
+        writers: 2,
+        ops_per_writer: 20_000,
+        keys_per_writer: 20_000,
+        think_ns_max: 0,
+        mem_budget: b"128mb",
+        mutable_permille: b"100",
         maintain_slice: b"64kb",
         tail_stall_timeout_ms: None,
         values: TierBudgetValues::SetOnlyUnique { value_bytes: 4_096 },
