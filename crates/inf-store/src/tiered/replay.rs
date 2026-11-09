@@ -1456,6 +1456,7 @@ mod tests {
     const PAGE: u64 = 4 << 10;
 
     fn table() -> TieredTable {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(64 << 10, PAGE);
         TieredTable::new(
             AddressSpaceConfig {
@@ -1466,6 +1467,7 @@ mod tests {
             demote,
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring")
     }

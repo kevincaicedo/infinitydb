@@ -405,6 +405,7 @@ impl TierFleet {
 }
 
 fn build_world(demote: DemotionConfig, seed: u64) -> Rc<RefCell<World>> {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let ring = demote.ring_reserve_bytes().expect("valid budget");
     let mut ks =
         Keyspace::new(StoreConfig { hasher: KeyHasher::from_seed(seed), ..Default::default() });
@@ -418,6 +419,7 @@ fn build_world(demote: DemotionConfig, seed: u64) -> Rc<RefCell<World>> {
             },
             demote,
             1024,
+            &census,
         )
         .is_ok()
     );

@@ -77,9 +77,10 @@ fn space_config(origin: u64) -> AddressSpaceConfig {
 }
 
 fn rig(fs: &MemFs) -> (TieredTable, TierFlush<MemFs>) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
-    let table =
-        TieredTable::new(space_config(0), demote(), 256, KeyHasher::default()).expect("ring");
+    let table = TieredTable::new(space_config(0), demote(), 256, KeyHasher::default(), &census)
+        .expect("ring");
     let flush = TierFlush::new(
         fs.clone(),
         flush_config(),

@@ -493,16 +493,20 @@ struct Oracle {
 /// program has its own DST, `m2-ns-create-window`). Ids start at
 /// `FIRST_NAMED_NS_ID`, names are `ns0`, `ns1`, …
 pub(crate) fn seed_namespaces(ks: &mut Keyspace, namespaces: u16) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     for i in 0..namespaces {
-        ks.ns_create(NsSpec {
-            id: NsId(FIRST_NAMED_NS_ID + u32::from(i)),
-            name: format!("ns{i}").into_bytes(),
-            mode: NsMode::Memory,
-            fsync: None,
-            policy: None,
-            maxmemory: None,
-            tier: None,
-        })
+        ks.ns_create(
+            NsSpec {
+                id: NsId(FIRST_NAMED_NS_ID + u32::from(i)),
+                name: format!("ns{i}").into_bytes(),
+                mode: NsMode::Memory,
+                fsync: None,
+                policy: None,
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("seeded namespace names are valid and unique");
     }
 }

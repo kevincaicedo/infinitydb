@@ -91,6 +91,7 @@ struct Rig {
 
 impl Rig {
     fn new(dead_ratio_pct: u8) -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         // Seal in flush-slice quanta, so one barrier writes a full run of
         // frames instead of rewriting the same partial tail frame every
         // time (the S13 slice-budget finding — at a 4 KiB quantum the
@@ -109,6 +110,7 @@ impl Rig {
             demote,
             KEYS as usize * 2,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         table.set_compaction_config(CompactionConfig { dead_ratio_pct, slice_bytes: 1 << 20 });

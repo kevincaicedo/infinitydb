@@ -50,16 +50,20 @@ fn step_cfg() -> DurableConfig {
 /// `fresh_keyspace` plus a materialized tiered namespace at the smallest
 /// window (no MANIFEST — the first-crash shape).
 fn tiered_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace();
-    ks.ns_create(NsSpec {
-        id: TIER_NS,
-        name: b"hot".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: Some(TierSpec::for_budget(MEM_BUDGET)),
-    })
+    ks.ns_create(
+        NsSpec {
+            id: TIER_NS,
+            name: b"hot".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(MEM_BUDGET)),
+        },
+        &census,
+    )
     .expect("tiered ns");
     ks
 }
@@ -1961,6 +1965,7 @@ fn ick_sections(fs: &MemFs, ick: &std::path::Path) -> (u64, u64) {
 /// (`inf_canary_recover_room_reask_counted`).
 #[test]
 fn room_asks_count_across_suspensions_and_the_hostile_spec_boots() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     const BIG: usize = 2_900 << 10;
     let fs = MemFs::new();
     let cfg = cfg_with(SegmentConfig { segment_bytes: 64 << 20, ..Default::default() });
@@ -1968,15 +1973,18 @@ fn room_asks_count_across_suspensions_and_the_hostile_spec_boots() {
     spec.blob_threshold_bytes = 3 << 20;
     let keyspace = || {
         let mut ks = fresh_keyspace();
-        ks.ns_create(NsSpec {
-            id: TIER_NS,
-            name: b"hostile".to_vec(),
-            mode: NsMode::Durable,
-            fsync: Some(FsyncClass::Always),
-            policy: None,
-            maxmemory: None,
-            tier: Some(spec),
-        })
+        ks.ns_create(
+            NsSpec {
+                id: TIER_NS,
+                name: b"hostile".to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(FsyncClass::Always),
+                policy: None,
+                maxmemory: None,
+                tier: Some(spec),
+            },
+            &census,
+        )
         .expect("tiered ns");
         ks
     };
@@ -2076,8 +2084,8 @@ fn first_life<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig, keys: u64) -> F
         life_origin: inf_store::LogicalAddr::ZERO,
     };
     let hasher = inf_store::KeyHasher::default();
-    let mut table = TieredTable::new(space, demote, 4096, hasher).expect("the table");
     let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(CELL)).0;
+    let mut table = TieredTable::new(space, demote, 4096, hasher, &census).expect("the table");
     let flush_cfg = inf_log::TierFlushConfig {
         shard_dir: shard.join(format!("ns-{}", TIER_NS.0)),
         cell: u32::from(CELL),
@@ -2702,16 +2710,20 @@ const SECOND_EXTENTS: Extents =
 
 /// [`tiered_keyspace`] plus [`SECOND_NS`] at the same smallest window.
 fn two_tier_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = tiered_keyspace();
-    ks.ns_create(NsSpec {
-        id: SECOND_NS,
-        name: b"warm".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: Some(TierSpec::for_budget(MEM_BUDGET)),
-    })
+    ks.ns_create(
+        NsSpec {
+            id: SECOND_NS,
+            name: b"warm".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(MEM_BUDGET)),
+        },
+        &census,
+    )
     .expect("the second tiered ns");
     ks
 }
@@ -2971,6 +2983,7 @@ const START_AT_ONE: StartSizes = StartSizes { extents: 20_000, dropped_names: 2_
 /// [`tiered_keyspace`] with a tombstone for [`DROPPED_NS`]: its directory
 /// is an acked `DROP`'s leftover, the start step's to sweep.
 fn start_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let entries = tiered_keyspace().ns_iter().cloned().collect();
     let mut ks = Keyspace::new(inf_store::StoreConfig::default());
     let catalog = inf_store::NsCatalog {
@@ -2979,7 +2992,7 @@ fn start_keyspace() -> Keyspace {
         index: inf_store::IndexCatalog::default(),
         dropped: vec![DROPPED_NS.0],
     };
-    ks.seed_catalog(&catalog).expect("the catalog");
+    ks.seed_catalog(&catalog, &census).expect("the catalog");
     ks
 }
 

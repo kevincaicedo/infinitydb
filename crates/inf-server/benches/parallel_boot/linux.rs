@@ -210,6 +210,7 @@ fn drive_cell(
     root: &Path,
     stop: &AtomicBool,
 ) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut pool = BufferPool::new(256, 4096);
     let mut driver = UringDriver::new(256).expect("uring");
     driver.register_pool(&mut pool).expect("register");
@@ -220,15 +221,18 @@ fn drive_cell(
         .unwrap_or(0);
     node.wall_anchor.set((0, unix_ms));
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"bench".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"bench".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("ns");
     let (mut plane, serve_mark, timer_set) = ServerPlane::new(
         CellId(i as u16),

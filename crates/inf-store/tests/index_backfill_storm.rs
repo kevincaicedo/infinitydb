@@ -503,6 +503,7 @@ fn eviction_during_backfill_converges() {
 /// power-cut/full-node leg is the `m45-backfill` inf-sim scenario.
 #[test]
 fn restart_regresses_and_rebuilds_cleanly() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let ns = NsId(0);
     let (mut ks, _rng, now) = populated_fixture(ns, 300, 0x5EED_0508);
     declare_indexes(&mut ks, ns);
@@ -515,7 +516,7 @@ fn restart_regresses_and_rebuilds_cleanly() {
     let scanned_before: u64 = ks.idx_backfill_progress().iter().map(|p| p.docs_scanned).sum();
     assert!(scanned_before > 0, "the walk had progress to lose");
     let catalog = ks.export_catalog(17, 100, 100);
-    ks.seed_catalog(&catalog).expect("seed");
+    ks.seed_catalog(&catalog, &census).expect("seed");
     // Regression: every state is backfilling, no job survives, binding
     // refuses typed — partial results are unrepresentable.
     for &(id, ..) in INDEXES {
@@ -538,7 +539,7 @@ fn restart_regresses_and_rebuilds_cleanly() {
         }
         ks.export_catalog(17, 100, 100)
     };
-    ks.seed_catalog(&ready_catalog).expect("seed");
+    ks.seed_catalog(&ready_catalog, &census).expect("seed");
     for &(id, ..) in INDEXES {
         assert_eq!(ks.idx_registry().cell_state(IndexId(id)), Some(IndexState::Backfilling));
         assert_eq!(ks.idx_registry().was_ready(IndexId(id)), Some(true), "the D4 hint");

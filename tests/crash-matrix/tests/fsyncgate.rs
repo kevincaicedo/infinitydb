@@ -84,8 +84,13 @@ fn start_node(
         driver.register_pool(&mut pool).expect("register");
         // The node's keyspace is cataloged, as `infinityd`'s (ADR-0189 D4).
         let empty = inf_store::NsCatalog::empty();
-        let ks = Keyspace::cataloged(StoreConfig::default(), catalog.as_ref().unwrap_or(&empty))
-            .expect("seed catalog");
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        let ks = Keyspace::cataloged(
+            StoreConfig::default(),
+            catalog.as_ref().unwrap_or(&empty),
+            &census,
+        )
+        .expect("seed catalog");
         let cfg = inf_server::DurableConfig {
             data_dir: dir,
             geometry: inf_log::LogGeometry::default(),

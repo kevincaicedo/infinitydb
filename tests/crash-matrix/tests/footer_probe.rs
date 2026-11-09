@@ -40,17 +40,21 @@ fn cfg() -> DurableConfig {
 }
 
 fn keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     for (id, name) in [(FULL, &b"ledger"[..]), (EMPTY, &b"fresh"[..])] {
-        ks.ns_create(NsSpec {
-            id,
-            name: name.to_vec(),
-            mode: NsMode::Durable,
-            fsync: Some(FsyncClass::Always),
-            policy: None,
-            maxmemory: None,
-            tier: None,
-        })
+        ks.ns_create(
+            NsSpec {
+                id,
+                name: name.to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(FsyncClass::Always),
+                policy: None,
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("ns");
     }
     ks

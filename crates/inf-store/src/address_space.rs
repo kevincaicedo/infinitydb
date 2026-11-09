@@ -36,8 +36,10 @@
 
 #[allow(clippy::disallowed_types, reason = "container: R")]
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use inf_alloc::{Region, RegionConfig};
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::{LocalCounter, LogicalAddr};
 
 /// Region classification for one address — the resolver's answer
@@ -329,12 +331,14 @@ const FLUSH_CUT_CAP: usize = 4096;
 impl AddressSpace {
     /// Reserves the ring. `None` when the OS refuses the reservation —
     /// namespace creation surfaces that as a typed error, never a panic.
+    /// `_census` is the cell's cap census (ADR-0163 D2), which the host
+    /// passes: no space mints one or holds a default.
     ///
     /// # Panics
     /// Panics on config violations (non-power-of-two ring, ring smaller
     /// than four pages) — programmer errors.
     #[allow(clippy::disallowed_types, reason = "container: R")]
-    pub fn new(config: AddressSpaceConfig) -> Option<AddressSpace> {
+    pub fn new(config: AddressSpaceConfig, _census: &Rc<CapCensus>) -> Option<AddressSpace> {
         assert!(config.reserve_bytes.is_power_of_two(), "ring must be a power of two");
         assert!(config.reserve_bytes >= 4 * config.page_bytes, "ring smaller than four pages");
         let region = Region::new(RegionConfig {
@@ -1147,11 +1151,15 @@ mod tests {
     use super::*;
 
     fn space(ring: usize, page: usize) -> AddressSpace {
-        AddressSpace::new(AddressSpaceConfig {
-            reserve_bytes: ring,
-            page_bytes: page,
-            life_origin: LogicalAddr::ZERO,
-        })
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        AddressSpace::new(
+            AddressSpaceConfig {
+                reserve_bytes: ring,
+                page_bytes: page,
+                life_origin: LogicalAddr::ZERO,
+            },
+            &census,
+        )
         .expect("reservation")
     }
 
@@ -1644,13 +1652,17 @@ mod tests {
     /// record ending exactly at the last address places.
     #[test]
     fn the_forty_eight_bit_end_answers_end() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let page = 1u64 << 12;
         let origin = LogicalAddr::from_raw(LogicalAddr::MAX_RAW + 1 - 2 * page).expect("48-bit");
-        let mut sp = AddressSpace::new(AddressSpaceConfig {
-            reserve_bytes: 1 << 16,
-            page_bytes: page as usize,
-            life_origin: origin,
-        })
+        let mut sp = AddressSpace::new(
+            AddressSpaceConfig {
+                reserve_bytes: 1 << 16,
+                page_bytes: page as usize,
+                life_origin: origin,
+            },
+            &census,
+        )
         .expect("reservation");
         assert_eq!(sp.alloc(page as usize), Some(origin), "one page below the end fits");
         let before = (sp.tail(), sp.counters(), sp.report());
@@ -1740,12 +1752,12 @@ mod tests {
 
     #[test]
     fn new_life_origin_offsets_the_ring() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let origin = LogicalAddr::from_raw(0x10_0000).expect("fits");
-        let mut space = AddressSpace::new(AddressSpaceConfig {
-            reserve_bytes: 1 << 16,
-            page_bytes: 1 << 12,
-            life_origin: origin,
-        })
+        let mut space = AddressSpace::new(
+            AddressSpaceConfig { reserve_bytes: 1 << 16, page_bytes: 1 << 12, life_origin: origin },
+            &census,
+        )
         .expect("reservation");
         let a = space.alloc(128).expect("fits");
         assert_eq!(a, origin, "first allocation starts the new life");

@@ -26,7 +26,9 @@ pub mod shadow;
 
 #[allow(clippy::disallowed_types, reason = "container: R")]
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::{BuildIntHasher, KeyHasher, LogicalAddr};
 
 use inf_log::flush::{TierFileMeta, TierFlush, TierFlushError};
@@ -343,15 +345,18 @@ pub struct FlushSliceOutcome {
 
 impl TieredTable {
     /// `None` when the ring reservation fails (namespace creation surfaces
-    /// it typed).
+    /// it typed). `census` is the cell's cap census (ADR-0163 D2), which
+    /// the host passes: the table's capped holders register on it, and no
+    /// table mints one or holds a default.
     #[allow(clippy::disallowed_types, reason = "container: R")]
     pub fn new(
         config: AddressSpaceConfig,
         demote: DemotionConfig,
         initial_keys: usize,
         hasher: KeyHasher,
+        census: &Rc<CapCensus>,
     ) -> Option<TieredTable> {
-        let mut space = AddressSpace::new(config)?;
+        let mut space = AddressSpace::new(config, census)?;
         // The budget admission bound (ADR-0053 D1): alloc refuses — and
         // backpressure engages — at `budget + slice`, not at the (up to
         // 2×) ring wall. Nonsense budgets refuse typed here.
@@ -1365,6 +1370,7 @@ mod tests {
     }
 
     fn cold_table() -> TieredTable {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut cold = TieredTable::new(
             AddressSpaceConfig {
                 reserve_bytes: 1 << 16,
@@ -1374,6 +1380,7 @@ mod tests {
             DemotionConfig::for_budget(1 << 16, 1 << 12),
             64,
             KeyHasher::default(),
+            &census,
         )
         .unwrap();
         cold.seed_recovered_files(
@@ -1427,6 +1434,7 @@ mod tests {
     }
 
     fn table() -> TieredTable {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         TieredTable::new(
             AddressSpaceConfig {
                 reserve_bytes: 1 << 16,
@@ -1436,6 +1444,7 @@ mod tests {
             DemotionConfig::for_budget(1 << 16, 1 << 12),
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("reservation")
     }
@@ -1509,6 +1518,7 @@ mod tests {
     /// per-slice byte bound (ADR-0053 D2/D3).
     #[test]
     fn seal_slice_lands_on_record_boundaries_within_the_slice() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         // Budget = quarter ring, target = 25% of that, slice = one page.
         let mut t = TieredTable::new(
             AddressSpaceConfig {
@@ -1519,6 +1529,7 @@ mod tests {
             DemotionConfig::for_budget(1 << 14, 1 << 12),
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("reservation");
         // ~40 records ≈ 2.5 pages of mutable bytes (record ≈ 260 B).
@@ -1555,6 +1566,7 @@ mod tests {
     /// record of progress per step (the ADR-0053 D2 anti-deadlock rule).
     #[test]
     fn seal_slice_makes_progress_past_an_oversized_record() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut t = TieredTable::new(
             AddressSpaceConfig {
                 reserve_bytes: 1 << 16,
@@ -1565,6 +1577,7 @@ mod tests {
             DemotionConfig { mem_budget_bytes: 1 << 14, mutable_permille: 0, slice_bytes: 256 },
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("reservation");
         let hash = t.hash_key(b"wide");

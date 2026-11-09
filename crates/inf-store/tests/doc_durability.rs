@@ -41,16 +41,20 @@ fn set_doc(store: &mut CellStore, key: &[u8], idoc: &[u8]) {
 }
 
 fn durable_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"docs".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"docs".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("namespace");
     ks
 }
@@ -286,6 +290,7 @@ fn replay_skips_prior_incarnation_instead_of_binding_by_version() {
 
 #[test]
 fn replay_uses_recorded_bounds_not_lowered_boot_config() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let initial = JsonParser::new().parse(br#"{"a":[1,2],"pad":"xxxxxxxx"}"#).expect("fixture");
     let expected = JsonParser::new().parse(br#"{"a":[2,3],"pad":"xxxxxxxx"}"#).expect("fixture");
     let mut ks = Keyspace::new(StoreConfig {
@@ -293,15 +298,18 @@ fn replay_uses_recorded_bounds_not_lowered_boot_config() {
         doc_max_path_matches: 1,
         ..StoreConfig::default()
     });
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"docs".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"docs".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("namespace");
     inf_store::drive_record(
         &mut ks,

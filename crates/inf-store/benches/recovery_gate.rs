@@ -58,16 +58,20 @@ impl ReplaySpill for Lent {
 /// A keyspace holding the tiered namespace at `budget`, and its boot
 /// machine over an empty pipeline (no manifested file: a fitting boot).
 fn booting(fs: &MemFs, budget: u64, n: u64) -> (Keyspace, Lent) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"tiered".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Everysec),
-        policy: None,
-        maxmemory: None,
-        tier: Some(TierSpec::for_budget(budget)),
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"tiered".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Everysec),
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(budget)),
+        },
+        &census,
+    )
     .expect("create the tiered namespace");
     ks.reserve_ns(NS, n);
     let flush = TierFlush::new(
@@ -157,6 +161,7 @@ fn bench_images(n: u64, value_len: usize) {
 
 /// Ref row: `n` addr-refs (14 B each), applied index-only.
 fn bench_refs(n: u64) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     fs.create_dir_all(Path::new("shard-0")).expect("dir");
     let cfg = CkptConfig::default();
@@ -194,6 +199,7 @@ fn bench_refs(n: u64) {
             demote,
             usize::try_from(n).expect("fits"),
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         // One manifested file covering every ref (M4-S14): `replay_ref`

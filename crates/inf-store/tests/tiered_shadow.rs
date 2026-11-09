@@ -73,6 +73,7 @@ impl Harness {
     }
 
     fn with_demote(demote: DemotionConfig, ring: u64) -> Harness {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut table = TieredTable::new(
             AddressSpaceConfig {
                 reserve_bytes: ring as usize,
@@ -82,6 +83,7 @@ impl Harness {
             demote,
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("reservation");
         // The arm under test; the shipping default is off (ADR-0093 D8).
@@ -660,6 +662,7 @@ fn promotion_skips_a_tickets_cold_slot() {
 /// for the cold slot ends the ticket.
 #[test]
 fn recovery_appliers_reform_pairs_in_both_orders() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let origin = LogicalAddr::from_raw(1 << 20).expect("fits");
     let pre_life = LogicalAddr::from_raw(4096).expect("fits");
     let make = || {
@@ -672,6 +675,7 @@ fn recovery_appliers_reform_pairs_in_both_orders() {
             DemotionConfig::for_budget(RING, PAGE),
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("reservation")
     };
@@ -921,6 +925,7 @@ fn recovered_table() -> TieredTable {
 /// home-group collisions needs the final group mask up front — growth
 /// would re-home half of them).
 fn recovered_table_sized(initial_keys: usize) -> TieredTable {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let origin = LogicalAddr::from_raw(1 << 20).expect("fits");
     let mut t = TieredTable::new(
         AddressSpaceConfig {
@@ -931,6 +936,7 @@ fn recovered_table_sized(initial_keys: usize) -> TieredTable {
         DemotionConfig::for_budget(RING, PAGE),
         initial_keys,
         KeyHasher::default(),
+        &census,
     )
     .expect("reservation");
     t.seed_recovered_files(
@@ -1486,6 +1492,7 @@ struct Rig {
 
 impl Rig {
     fn new() -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         // A zero mutable target: every page but the tail's seals, so the
         // first file fills, overflows and seals under a small corpus.
         let demote =
@@ -1500,6 +1507,7 @@ impl Rig {
             demote,
             2048,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         let flush = TierFlush::new(

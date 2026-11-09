@@ -924,13 +924,13 @@ pub(super) fn apply_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     spec: inf_store::NsSpec,
 ) -> Result<(), CreateRefused> {
     let Some(tier) = spec.tier else {
-        return Ok(shared.store.borrow_mut().ns_create(spec)?);
+        return Ok(shared.store.borrow_mut().ns_create(spec, &shared.census)?);
     };
     let permit = match shared.tier.borrow_mut().as_mut() {
         Some(cell) => cell.admit_install(spec.id).map_err(CreateRefused::Grant)?,
         None => return Err(CreateRefused::Grant(crate::tier_cell::InstallRefused::NotDeclared)),
     };
-    shared.store.borrow_mut().ns_create(spec)?;
+    shared.store.borrow_mut().ns_create(spec, &shared.census)?;
     if let Some(cell) = shared.tier.borrow_mut().as_mut() {
         cell.install(permit, &tier);
     }

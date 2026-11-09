@@ -528,6 +528,7 @@ pub(crate) fn survival_audit(
     cut_time: Nanos,
     tally: &mut AuditTally,
 ) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     debug_assert_eq!(scenario.workload, DurableWorkload::KeyValue);
     let data_dir = PathBuf::from("node");
     let catalog = match load_catalog_from(disk, &data_dir) {
@@ -543,7 +544,7 @@ pub(crate) fn survival_audit(
     };
     let mut ks =
         Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
-    if let Err(err) = ks.seed_catalog(&catalog) {
+    if let Err(err) = ks.seed_catalog(&catalog, &census) {
         tally.violations.push(format!("survival audit: seed_catalog failed: {err:?}"));
         return;
     }

@@ -499,19 +499,23 @@ impl Booting {
         hasher: KeyHasher,
         spec: &Spec,
     ) -> Booting {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         // The spec's threshold holds during replay, as the catalog's does
         // at a server's boot: a value at or above it is a typed refusal.
         table.set_blob_config(spec.blob());
         let mut ks = Keyspace::new(StoreConfig { hasher, ..StoreConfig::default() });
-        ks.ns_create(NsSpec {
-            id: NS,
-            name: b"tiered-88".to_vec(),
-            mode: NsMode::Durable,
-            fsync: Some(FsyncClass::Everysec),
-            policy: None,
-            maxmemory: None,
-            tier: Some(TierSpec::for_budget(4 << 20)),
-        })
+        ks.ns_create(
+            NsSpec {
+                id: NS,
+                name: b"tiered-88".to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(FsyncClass::Everysec),
+                policy: None,
+                maxmemory: None,
+                tier: Some(TierSpec::for_budget(4 << 20)),
+            },
+            &census,
+        )
         .expect("create the tiered namespace");
         // The harness's table keeps its own knobs (budget, blob, shadow).
         *ks.tiered_store_mut(NS).expect("materialized") = table;
@@ -640,8 +644,9 @@ impl Booting {
 }
 
 fn tiered_table(spec: &Spec, origin: u64, hasher: KeyHasher) -> TieredTable {
-    let mut table =
-        TieredTable::new(space_config(spec, origin), spec.live, 1024, hasher).expect("ring");
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+    let mut table = TieredTable::new(space_config(spec, origin), spec.live, 1024, hasher, &census)
+        .expect("ring");
     table.set_blob_config(spec.blob());
     // The shadow arm (M4.5-S37, ADR-0093 D8) runs on in this harness —
     // the store-level DST's authority over the mechanism.

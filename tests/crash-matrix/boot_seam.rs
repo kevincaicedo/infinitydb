@@ -35,16 +35,20 @@ impl ReplaySpill for Lent {
 /// place (the driver also applies the catalog's knobs; the carriers keep
 /// the table's own).
 pub fn keyspace_with(ns: NsId, table: TieredTable) -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: ns,
-        name: format!("tiered-{}", ns.0).into_bytes(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Everysec),
-        policy: None,
-        maxmemory: None,
-        tier: Some(TierSpec::for_budget(4 << 20)),
-    })
+    ks.ns_create(
+        NsSpec {
+            id: ns,
+            name: format!("tiered-{}", ns.0).into_bytes(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Everysec),
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(4 << 20)),
+        },
+        &census,
+    )
     .expect("create the tiered namespace");
     *ks.tiered_store_mut(ns).expect("materialized") = table;
     ks

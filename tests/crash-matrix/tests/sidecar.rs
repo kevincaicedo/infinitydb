@@ -82,17 +82,21 @@ const INDEXES: &[(u32, &str, IndexKeyType)] =
 /// The index-bearing catalog: declarations persisted `ready` pre-crash
 /// (`seed_catalog` regresses them and keeps the `was_ready` hint).
 fn catalog() -> NsCatalog {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut template = Keyspace::new(StoreConfig::default());
     template
-        .ns_create(NsSpec {
-            id: NS,
-            name: b"docs".to_vec(),
-            mode: NsMode::Durable,
-            fsync: Some(FsyncClass::Always),
-            policy: None,
-            maxmemory: None,
-            tier: None,
-        })
+        .ns_create(
+            NsSpec {
+                id: NS,
+                name: b"docs".to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(FsyncClass::Always),
+                policy: None,
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("ns");
     for &(id, path, key_type) in INDEXES {
         template
@@ -111,8 +115,9 @@ fn catalog() -> NsCatalog {
 }
 
 fn booted_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.seed_catalog(&catalog()).expect("seed");
+    ks.seed_catalog(&catalog(), &census).expect("seed");
     ks
 }
 

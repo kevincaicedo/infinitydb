@@ -278,6 +278,7 @@ fn reply_outcome_dbsize_drain_error_is_the_reply() {
 const TIERED: NsId = NsId(16);
 
 fn tiered_namespace(cells: &Cells) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     for plane in &cells.planes {
         let spec = NsSpec {
             id: TIERED,
@@ -288,7 +289,7 @@ fn tiered_namespace(cells: &Cells) {
             maxmemory: None,
             tier: Some(TierSpec::for_budget(64 << 20)),
         };
-        plane.shared.store.borrow_mut().ns_create(spec).expect("a fresh tiered namespace");
+        plane.shared.store.borrow_mut().ns_create(spec, &census).expect("a fresh tiered namespace");
     }
 }
 

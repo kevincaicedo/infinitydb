@@ -2409,6 +2409,7 @@ pub(crate) fn boot(
     clock: &Rc<VirtualClock>,
     observer: &TraceObserver,
 ) -> std::io::Result<Node> {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     observer.1.update(|state| {
         state.number(b"boot", clock.now().0);
         state.disk(disk);
@@ -2454,6 +2455,7 @@ pub(crate) fn boot(
         let ks = Keyspace::cataloged(
             StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() },
             catalog.as_ref().unwrap_or(&empty),
+            &census,
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
         let (mut plane, serve_mark, timer_set) = SimPlane::new(

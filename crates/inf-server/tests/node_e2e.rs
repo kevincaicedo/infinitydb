@@ -825,7 +825,10 @@ impl Node {
                     Some((_, catalog, _)) => {
                         let empty = inf_store::NsCatalog::empty();
                         let catalog = catalog.as_ref().unwrap_or(&empty);
-                        Keyspace::cataloged(StoreConfig::default(), catalog).expect("seed catalog")
+                        let census =
+                            inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+                        Keyspace::cataloged(StoreConfig::default(), catalog, &census)
+                            .expect("seed catalog")
                     }
                     None => Keyspace::new(StoreConfig::default()),
                 };

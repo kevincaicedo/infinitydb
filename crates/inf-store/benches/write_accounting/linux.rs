@@ -155,6 +155,7 @@ struct Run {
 /// Writes `user_mib` MiB of user bytes through the full path — WAL frame
 /// then tier flush — and returns what the counters saw.
 fn workload(dir: &Path, user_mib: u64, leg: Leg) -> Run {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let log_dir = dir.join("log");
     let shard_dir = dir.join("shard-0");
     let dirs = create_cell_dirs(&StdSegmentFs, dir).expect("cell dirs");
@@ -172,6 +173,7 @@ fn workload(dir: &Path, user_mib: u64, leg: Leg) -> Run {
             },
             demote,
             1 << 16,
+            &census,
         )
         .is_ok()
     );

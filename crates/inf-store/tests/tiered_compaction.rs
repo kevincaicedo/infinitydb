@@ -68,10 +68,12 @@ struct Rig {
 
 impl Rig {
     fn new() -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
         let fs = MemFs::new();
-        let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
-            .expect("ring");
+        let table =
+            TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default(), &census)
+                .expect("ring");
         let flush = TierFlush::new(
             fs.clone(),
             flush_config(NS, FILE_CAPACITY),
@@ -437,11 +439,13 @@ fn retirement_requires_a_covering_checkpoint_and_survives_abort() {
 /// slice — never a suspension — and flush/release progress resumes it.
 #[test]
 fn stalled_relocation_resumes_after_window_progress() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // A small budget so relocations hit the admission bound quickly.
     let demote = DemotionConfig::for_budget(192 << 10, PAGE);
     let fs = MemFs::new();
-    let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
-        .expect("ring");
+    let table =
+        TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default(), &census)
+            .expect("ring");
     let flush = TierFlush::new(
         fs.clone(),
         flush_config(NS, FILE_CAPACITY),
@@ -806,6 +810,7 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
 #[cfg(unix)]
 #[test]
 fn endurance_slice_disk_oscillates_and_reclaims() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     use inf_log::fs::StdSegmentFs;
 
     let root = std::env::temp_dir().join(format!("inf-s15-endurance-{}", std::process::id()));
@@ -837,8 +842,9 @@ fn endurance_slice_disk_oscillates_and_reclaims() {
     // reclaim pipeline actually cycles.
     let demote = DemotionConfig::for_budget(256 << 10, PAGE);
     let config = TierFlushConfig { shard_dir: shard.clone(), ..flush_config(NS, FILE_CAPACITY) };
-    let mut table = TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default())
-        .expect("ring");
+    let mut table =
+        TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default(), &census)
+            .expect("ring");
     table.set_compaction_config(CompactionConfig { dead_ratio_pct: 50, slice_bytes: 1 << 20 });
     let mut flush = TierFlush::new(
         StdSegmentFs,

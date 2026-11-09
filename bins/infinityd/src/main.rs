@@ -1286,6 +1286,7 @@ fn cell_main(
     hasher: KeyHasher,
     wiring: &NodeWiring,
 ) -> std::io::Result<()> {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let CellLaunch { cell, fabric, wake_fd, cache_permit, ckpt_issuer } = launch;
     // Setup-phase narration (M2.5-S01): the 500-cycle storm caught cells
     // stalling BEFORE the first loop iteration ("spawned" forever) — every
@@ -1370,7 +1371,7 @@ fn cell_main(
     let ks = match &boot {
         Some((_, catalog, ..)) => {
             let empty = inf_store::NsCatalog::empty();
-            Keyspace::cataloged(store_cfg, catalog.as_ref().unwrap_or(&empty))
+            Keyspace::cataloged(store_cfg, catalog.as_ref().unwrap_or(&empty), &census)
                 .map_err(|e| std::io::Error::other(format!("{e:?}")))?
         }
         None => Keyspace::new(store_cfg),

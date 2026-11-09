@@ -503,6 +503,7 @@ pub(crate) fn equivalence_check(
     stats: &mut EquivalenceStats,
     violations: &mut Violations,
 ) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let data_dir = PathBuf::from("node");
     let catalog = match load_catalog_from(disk, &data_dir) {
         Ok(Some(catalog)) => catalog,
@@ -518,7 +519,7 @@ pub(crate) fn equivalence_check(
     for cell in 0..scenario.cells {
         let mut shadow =
             Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
-        if let Err(err) = shadow.seed_catalog(&catalog) {
+        if let Err(err) = shadow.seed_catalog(&catalog, &census) {
             violations.push(format!(
                 "REPLAY EQUIVALENCE VIOLATION seed {:#x} [{label}]: seed_catalog: {err:?}",
                 scenario.seed

@@ -352,6 +352,7 @@ struct Corpus {
 fn build_demoted_corpus(
     dir: &std::path::Path,
 ) -> (Rc<RefCell<Ctx>>, Corpus, TierWriter<StdSegmentFs>) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     assert!(
         ks.materialize_tiered(
@@ -363,6 +364,7 @@ fn build_demoted_corpus(
             },
             DemotionConfig::for_budget(RING as u64, PAGE as u64),
             64,
+            &census,
         )
         .is_ok()
     );

@@ -87,16 +87,20 @@ fn fixture(ns: NsId) -> Keyspace {
 /// A durable named namespace carrying the same index set (the replay
 /// arm's host — defaults never log, L2).
 fn durable_fixture(ns: NsId) -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(inf_store::NsSpec {
-        id: ns,
-        name: b"ledger".to_vec(),
-        mode: inf_store::NsMode::Durable,
-        fsync: Some(inf_store::FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        inf_store::NsSpec {
+            id: ns,
+            name: b"ledger".to_vec(),
+            mode: inf_store::NsMode::Durable,
+            fsync: Some(inf_store::FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("create durable ns");
     for &(id, path, key_type) in INDEXES {
         let program = compile(path.as_bytes()).expect("valid path").as_bytes().to_vec();

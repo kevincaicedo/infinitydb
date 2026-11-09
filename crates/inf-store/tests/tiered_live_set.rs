@@ -46,6 +46,7 @@ struct Storm {
 
 impl Storm {
     fn new() -> Storm {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
         let table = TieredTable::new(
             AddressSpaceConfig {
@@ -56,6 +57,7 @@ impl Storm {
             demote,
             2048,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         let flush = TierFlush::new(

@@ -75,10 +75,12 @@ struct Life {
 
 impl Life {
     fn new(demote: DemotionConfig) -> Life {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let fs = MemFs::new();
         fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
-        let table = TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default())
-            .expect("ring");
+        let table =
+            TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default(), &census)
+                .expect("ring");
         let flush = TierFlush::new(
             fs.clone(),
             flush_config(NS, FILE_CAPACITY),
@@ -1706,9 +1708,11 @@ fn four_refs_of_one_key_under_one_sealed_winner_refuse_typed() {
 fn a_settle_keeps_or_removes_only_on_a_verified_record_of_its_hash() {
     use inf_log::tier::TierIdentity;
     fn image(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
-        let mut t = TieredTable::new(space_config(demote, 0), demote, 64, KeyHasher::default())
-            .expect("ring");
+        let mut t =
+            TieredTable::new(space_config(demote, 0), demote, 64, KeyHasher::default(), &census)
+                .expect("ring");
         let addr = t.insert(key, value, KeyHasher::default().hash(key)).expect("fits");
         let len = t.record(addr).encoded_len;
         t.record_bytes(addr, len).to_vec()
@@ -2682,9 +2686,11 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
 /// A table recovered at origin 1 MiB with one manifested file below it
 /// (a ref must name a file's range).
 fn recovered_at_one_mib() -> TieredTable {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let demote = DemotionConfig::for_budget(BUDGET, PAGE);
-    let mut t = TieredTable::new(space_config(demote, 1 << 20), demote, 64, KeyHasher::default())
-        .expect("ring");
+    let mut t =
+        TieredTable::new(space_config(demote, 1 << 20), demote, 64, KeyHasher::default(), &census)
+            .expect("ring");
     t.seed_recovered_files(
         &[TierFileMeta {
             id: 0,
@@ -2725,6 +2731,7 @@ fn a_marker_at_or_above_the_origin_removes_nothing() {
 /// settled ref's origin stayed keyed by the dead address.
 #[test]
 fn a_replayed_overwrite_moves_the_origins_to_the_new_record() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let pre_life = LogicalAddr::from_raw(4096).expect("fits");
     let (k1, k2) = forced_collision_pair(6);
     let hash = KeyHasher::default().hash(&k1);
@@ -2736,8 +2743,9 @@ fn a_replayed_overwrite_moves_the_origins_to_the_new_record() {
     // are k1's older record).
     let image = {
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
-        let mut s = TieredTable::new(space_config(demote, 0), demote, 64, KeyHasher::default())
-            .expect("ring");
+        let mut s =
+            TieredTable::new(space_config(demote, 0), demote, 64, KeyHasher::default(), &census)
+                .expect("ring");
         let addr = s.insert(&k1, b"one-old", hash).expect("fits");
         let len = s.record(addr).encoded_len;
         s.record_bytes(addr, len).to_vec()
