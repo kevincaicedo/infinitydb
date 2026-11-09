@@ -575,6 +575,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let mut timers_oracle = super::timers::TimersOracle::new(scenario);
     let mut wake_oracle = super::timers::WakeOracle::new(scenario);
     let mut tier_oracle = TierTurnOracle::new(&node, scenario.cells, true);
+    let mut turn_shape = TurnShape::new(scenario);
     let no_model_leg = scenario.tier_budget.is_some_and(|shape| shape.leg.model_absent());
     if no_model_leg {
         tier_oracle.arm_after_the_visits_bound();
@@ -595,6 +596,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         timers_oracle.sample(&node, clock.now(), &mut report.timers);
         wake_oracle.sample(&node, &mut report.wake);
         tier_oracle.sample(&node, &disk, scenario, &mut report);
+        turn_shape.sample(&node);
         if let Some(wedge) = ledger_wedge.as_mut() {
             wedge.observe(step, &node, &disk, clock.now());
             if wedge.cut_due(step, seeded_cut) {
@@ -980,6 +982,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     }
     if let Some(shape) = scenario.tier_budget {
         tier_budget_scrape(scenario, shape, &node, &disk, &mut report);
+        turn_shape.judge(scenario, shape, &node, &mut report);
     }
     derived_ledger_counters(scenario.seed, &mut report);
     engagement_checks(scenario, &node, &mut report);
@@ -1645,6 +1648,148 @@ fn tier_budget_oracles(
             record.turn_contended, record.plan_waits
         ));
     }
+}
+
+/// The thief leg's shape clause, judged on a cell whose wait bound held:
+/// the regime the planted turn needs, read from the driver's tally of
+/// each entry's tier writes by namespace directory. Engaged when one entry
+/// carried two or more of the second namespace's writes totalling
+/// 256 KiB to one group's bytes (a write group of two ops or more: the
+/// builder takes the longest run within one group's bytes and ops, and a
+/// round's sync waits for its writes), and the first namespace's writes
+/// reached the driver in two entries or more, each past its first at most
+/// two writes and 69,632 B: the second's group is then above the thief's
+/// on bytes and not below it on ops, so the planted turn holds it
+/// whichever axis binds. A tier write whose file names no `ns-<id>`
+/// directory leaves the shape read from no file.
+struct TurnShape {
+    cells: Vec<TurnShapeCell>,
+}
+
+/// One cell's reading of the thief leg's shape.
+#[derive(Clone, Copy, Debug, Default)]
+struct TurnShapeCell {
+    /// The first and second namespaces' directory ids, once both exist.
+    dirs: Option<(u32, u32)>,
+    /// The driver entry folded last: a frozen cell runs no entry in a step.
+    entry_seen: u64,
+    thief_entries: u64,
+    thief_later_writes_max: u64,
+    thief_later_bytes_max: u64,
+    victim_group: bool,
+}
+
+impl TurnShape {
+    /// The most writes and bytes one entry of the first namespace past its
+    /// first may carry: one batch and its tail of a 64 KiB slice, two
+    /// writes of at most 17 frames.
+    const THIEF_WRITES_MAX: u64 = 2;
+    const THIEF_BYTES_MAX: u64 = 69_632;
+    /// The second namespace's write group: two writes or more, 256 KiB to
+    /// one group's bytes.
+    const VICTIM_WRITES_MIN: u64 = 2;
+    const VICTIM_BYTES: core::ops::RangeInclusive<u64> =
+        256 * 1024..=inf_log::limits::TIER_GROUP_BYTES_MAX;
+
+    fn new(scenario: &DurableScenario) -> TurnShape {
+        let thief = scenario.tier_budget.is_some_and(|shape| shape.leg.is_thief());
+        let cells = if thief { usize::from(scenario.cells) } else { 0 };
+        TurnShape { cells: vec![TurnShapeCell::default(); cells] }
+    }
+
+    /// Folds each cell's last driver entry, once an entry. Sampled in the
+    /// traffic phase, after each step: the setup's entries carry no tier
+    /// write.
+    fn sample(&mut self, node: &Node) {
+        for (cell, read) in self.cells.iter_mut().enumerate() {
+            let Some(tally) = node.cells[cell].0.driver().tier_dirs() else { continue };
+            if tally.entries == read.entry_seen {
+                continue;
+            }
+            read.entry_seen = tally.entries;
+            if read.dirs.is_none() {
+                read.dirs = tier_budget_dirs(&node.plane(cell).keyspace());
+            }
+            let Some((thief, victim)) = read.dirs else { continue };
+            for row in &tally.entry {
+                if row.ns == thief {
+                    read.thief_entries += 1;
+                    if read.thief_entries > 1 {
+                        read.thief_later_writes_max = read.thief_later_writes_max.max(row.writes);
+                        read.thief_later_bytes_max = read.thief_later_bytes_max.max(row.bytes);
+                    }
+                } else if row.ns == victim
+                    && row.writes >= Self::VICTIM_WRITES_MIN
+                    && Self::VICTIM_BYTES.contains(&row.bytes)
+                {
+                    read.victim_group = true;
+                }
+            }
+        }
+    }
+
+    /// One line a cell whose wait bound held and whose shape is unreached.
+    /// A red wait bound needs no witness, and on a planted run the held
+    /// group never reaches the driver.
+    fn judge(
+        &self,
+        scenario: &DurableScenario,
+        shape: TierBudgetShape,
+        node: &Node,
+        report: &mut DurableReport,
+    ) {
+        let bound_ns = tier_turn_bound_ns(scenario, shape);
+        for (cell, read) in self.cells.iter().enumerate() {
+            let record = report.tier_budget_cells.iter().find(|r| usize::from(r.cell) == cell);
+            if record.is_none_or(|record| record.group_wait_ns_max > bound_ns) {
+                continue;
+            }
+            let tally = node.cells[cell].0.driver().tier_dirs();
+            let unnamed = tally.map_or(0, |tally| tally.unnamed_writes);
+            let why = if unnamed > 0 {
+                format!("{unnamed} tier write(s) named no ns-<id> directory")
+            } else if !read.victim_group {
+                format!(
+                    "no driver entry carried two or more of the second namespace's writes \
+                     totalling {} to {} B",
+                    Self::VICTIM_BYTES.start(),
+                    Self::VICTIM_BYTES.end()
+                )
+            } else if read.thief_entries < 2 {
+                format!(
+                    "the first namespace's writes reached the driver in {} entries",
+                    read.thief_entries
+                )
+            } else if read.thief_later_writes_max > Self::THIEF_WRITES_MAX
+                || read.thief_later_bytes_max > Self::THIEF_BYTES_MAX
+            {
+                format!(
+                    "an entry of the first namespace past its first carried up to {} write(s) \
+                     and {} B, past {} and {} B",
+                    read.thief_later_writes_max,
+                    read.thief_later_bytes_max,
+                    Self::THIEF_WRITES_MAX,
+                    Self::THIEF_BYTES_MAX
+                )
+            } else {
+                continue;
+            };
+            report.violations.push(format!(
+                "VACUOUS seed {:#x} cell {cell}: turn-shape-unreached — {why}",
+                scenario.seed
+            ));
+        }
+    }
+}
+
+/// The first two tier-budget namespaces' ids on one cell, once both
+/// exist: the `ns-<id>` directories their files sit in.
+fn tier_budget_dirs(keyspace: &inf_store::Keyspace) -> Option<(u32, u32)> {
+    let id = |index: u8| {
+        let name = NsClass::TierBudget(index).name();
+        keyspace.ns_iter().find(|spec| spec.name.as_slice() == name).map(|spec| spec.id.0)
+    };
+    Some((id(0)?, id(1)?))
 }
 
 /// Whether every tier-budget writer has sent its quota and holds no
