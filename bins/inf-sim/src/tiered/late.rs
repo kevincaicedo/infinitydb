@@ -486,7 +486,7 @@ fn phase_7d(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdi
                 engaged += 1;
                 break;
             }
-            fill_batch(cx, node, audit, batches)?;
+            fill_batch(cx, node, audit, "p7d", batches)?;
             batches += 1;
         }
     }
@@ -503,18 +503,38 @@ fn phase_7d(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdi
     Ok(())
 }
 
-/// Phase 7d's filler: 32 inline writes on the keys' cell, then a few
-/// scheduler steps for MAINTAIN to demote and release.
-fn fill_batch(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient, batch: u64) -> Verdict {
+/// A filler batch on one cell: 32 inline 2 KiB writes whose keys share the
+/// hashtag `tag`, so the batch presses the one cell that owns them, then a
+/// few scheduler steps for MAINTAIN to demote and release.
+fn fill_batch(
+    cx: &mut Late<'_>,
+    node: &mut Node,
+    audit: &mut MiniClient,
+    tag: &str,
+    batch: u64,
+) -> Verdict {
     const FILL_KEYS: u64 = 32;
     for i in 0..FILL_KEYS {
-        let key = format!("{{p7d}}fill:{batch}:{i}").into_bytes();
+        let key = format!("{{{tag}}}fill:{batch}:{i}").into_bytes();
         let value = value_bytes(b'f', 997, batch * FILL_KEYS + i, 2048);
-        call7d!(cx, node, audit, &[b"SET", &key, &value], b"+OK\r\n", "filler SET");
+        let set: &[&[u8]] = &[b"SET", &key, &value];
+        match audit.call(node, cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max, set) {
+            Ok(Some(reply)) if reply == b"+OK\r\n" => {}
+            other => bail7d!(
+                cx,
+                "{tag} filler SET {} answered {}",
+                preview(&key),
+                other.map_or_else(
+                    |e| e.to_string(),
+                    |r| r.map_or("nothing".to_owned(), |r| preview(&r))
+                )
+            ),
+        }
+        cx.report.commands_done += 1;
     }
     for _ in 0..8 {
         if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
-            bail7d!(cx, "phase-7d fill: {err}");
+            bail7d!(cx, "{tag} fill: {err}");
         }
     }
     Ok(())
@@ -544,7 +564,7 @@ fn cool_to_first_touch(
                 keys.len()
             );
         }
-        fill_batch(cx, node, audit, batches)?;
+        fill_batch(cx, node, audit, "p7d", batches)?;
         batches += 1;
         for (i, key) in keys.iter().enumerate() {
             if touched[i] {
