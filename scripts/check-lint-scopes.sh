@@ -74,7 +74,7 @@ ADR0143_EXEMPTIONS_MAX=15
 # is red), and only a lower number may replace it. The approved copies read
 # it from this one line, so it stays spelled `NAME=<digits>` alone. The
 # capped-backing allows are exact: 1, on `struct CappedDeque` (ADR-0151 D6).
-CONTAINER_EXEMPTIONS_MAX=88
+CONTAINER_EXEMPTIONS_MAX=87
 CAPPED_BACKING_SITES=1
 # ADR-0201 D1: the first move line, the later expiry each record's rows may
 # move up to (a ceiling) where the second line below names no date for it.

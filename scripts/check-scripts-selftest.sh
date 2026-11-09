@@ -1647,7 +1647,10 @@ group_waker_atomics() {
 # start and could not match it), and the aarch64 pair. The cargo-driven
 # probe is fixture-skipped and disclosed; it always runs on the real tree,
 # and its verdict logic is pinned below on fixtures of its asm.
-WAKER=./scripts/check-waker-atomics.sh
+# The scan's fixtures hold no boundary, so they run with the live-boundary check off; the
+# boundary's own cases below run without that switch.
+WAKER="env INF_WAKER_LIVE=off ./scripts/check-waker-atomics.sh"
+WAKER_LIVE=./scripts/check-waker-atomics.sh
 waker_asm() { # <name>: writes a fixture .s from stdin, echoes its path
     local out="$work/$1.s"
     cat >"$out"
@@ -1670,7 +1673,7 @@ asm=$( { for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do
          done
          waker_vtable; } | waker_asm waker-clean )
 expect green "waker: a clean vtable scans green" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
-expect_output "waker: the scope line discloses instructions actually scanned" "4 wakers + 0 called bodies, 8 instruction lines scanned" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+expect_output "waker: the scope line discloses instructions actually scanned" "4 wakers + 0 owner-lane bodies, 8 instruction lines scanned" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 
 # Mach-O (batch 70, lane L11 N18): rustc's DWARF labels there are `Lfunc_beginN`
 # and `LBBn_m` — no dot. The batch-69 scanner took `Lfunc_begin` for the body's
@@ -1691,7 +1694,7 @@ asm=$( { printf '\t.section\t__TEXT,__text,regular,pure_instructions\n\t.build_v
          for f in waker_wake waker_wake_by_ref waker_drop; do macho_body "$f" 'mov\tx0, x1' 'ret'; done
          macho_vtable; } | waker_asm waker-macho-clean )
 expect green "waker: a Mach-O vtable with DWARF labels scans green" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
-expect_output "waker: Mach-O bodies are scanned, not swallowed by Lfunc_begin" "4 wakers + 0 called bodies, 8 instruction lines scanned, 0 unresolved" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+expect_output "waker: Mach-O bodies are scanned, not swallowed by Lfunc_begin" "4 wakers + 0 owner-lane bodies, 8 instruction lines scanned, 0 callees with no body" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 asm=$( { printf '\t.section\t__TEXT,__text,regular,pure_instructions\n'
          macho_body waker_wake 'cbz\tx0, LBB1_2' 'ldaddal\tw8, w9, [x0]' 'ret'
          for f in waker_clone waker_wake_by_ref waker_drop; do macho_body "$f" 'ret'; done
@@ -1723,8 +1726,10 @@ done
 # not the RCpc forms.
 for insn in 'bl\t__aarch64_sync_cache_range' 'bl\t__aarch64_cas8_acq_rel_shim' 'stur\tx8, [x0, #8]' 'ldur\tx0, [x0, #8]'
 do
+    # A callee's body is in the fixture, so the closed callee list does not decide the case.
     asm=$( { waker_body waker_wake 'movq\t%rdi, %rax' "$insn" 'retq'
              for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+             for f in __aarch64_sync_cache_range __aarch64_cas8_acq_rel_shim; do waker_body "$f" 'ret'; done
              waker_vtable; } | waker_asm waker-insn-clean )
     expect green "waker: '$insn' is not an atomic" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 done
@@ -1771,13 +1776,13 @@ for insn in 'callq\t*%rax' 'callq\t*8(%rax)' 'blr\tx8'; do
     expect_red_because "waker: an indirect call '$insn' on the waker path is red" \
         "INDIRECT CALL on the waker path: waker_wake" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 done
-asm=$( { waker_body waker_wake 'jmpq\t*%rax' 'callq\t*ext_fn@GOTPCREL(%rip)' 'retq'
+asm=$( { waker_body waker_wake 'jmpq\t*%rax' 'callq\t*memcpy@GOTPCREL(%rip)' 'retq'
          for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
          waker_vtable; } | waker_asm waker-ijump )
 expect_output "waker: an indirect jump is counted on the scope line" \
-    "1 unresolved edges, 1 indirect jumps" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+    "1 callees with no body (each listed), 1 indirect jumps" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 expect_output "waker: a call through the GOT is a direct, disclosed edge" \
-    "unfollowed callees (no body in this asm): ext_fn" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+    "listed callees (no body in this asm): memcpy" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 # The probe's contract (scripts/waker-atomics-probe/src/lib.rs) judged against
 # a fixture of its asm. The arm64 Linux shape — CAS and fetch-add as helper
 # calls, the SeqCst store as `stlr` — is green; a fetch-add plant that reports
@@ -1793,6 +1798,41 @@ psym() { # <name>: the probe item's symbol, legacy mangling unless PSYM=v0
         printf '_ZN19waker_atomics_probe%s%s17h0123456789abcdefE' "${#1}" "$1"
     fi
 }
+ppath() { # <module…> <name>: a nested probe item's symbol, legacy mangling unless PSYM=v0
+    local part nest=
+    if [ "${PSYM:-legacy}" = v0 ]; then
+        for part in "${@:1:$#-1}"; do nest="${nest}Nt"; done
+        printf '_RNv%sCs1a2B3c_19waker_atomics_probe' "$nest"
+        for part in "$@"; do printf '%s%s' "${#part}" "$part"; done
+    else
+        printf '_ZN19waker_atomics_probe'
+        for part in "$@"; do printf '%s%s' "${#part}" "$part"; done
+        printf '17h0123456789abcdefE'
+    fi
+}
+# The probe's second vtable, its boundary module and its lane module, in the arm64 Linux shape:
+# each boundary body carries a helper call; the four roots call the boundary (one beside an
+# atomic), the lane's out-of-line read-modify-write and the nested crate's function; no root
+# reaches `settle_held`.
+probe_boundary_asm() {
+    local f
+    for f in clone wake wake_by_ref drop settle_held; do
+        waker_body "$(ppath executor foreign "$f")" 'cbz\tx0, .LBB9_2' 'bl\t__aarch64_ldadd8_acq_rel' 'ret'
+    done
+    waker_body "$(ppath lane fetch_add_one)" 'bl\t__aarch64_ldadd8_acq_rel' 'ret'
+    waker_body "$(psym boundary_clone)" "bl\t$(ppath executor foreign clone)" \
+        "bl\t$(ppath executor foreign wake_by_ref)" 'ret'
+    waker_body "$(psym beside_wake)" "bl\t$(ppath executor foreign wake)" \
+        'bl\t__aarch64_ldadd8_acq_rel' 'ret'
+    waker_body "$(psym drift_wake_by_ref)" "bl\t$(ppath lane fetch_add_one)" 'ret'
+    waker_body "$(psym unlisted_drop)" "bl\t$(ppath executor foreign drop)" \
+        'bl\t_ZN26waker_atomics_probe_nested7outline17h0123456789abcdefE' 'ret'
+    printf '%s:\n' "$(psym BOUNDARY_WAKER_VTABLE)"
+    for f in boundary_clone beside_wake drift_wake_by_ref unlisted_drop; do
+        printf '\t.xword\t%s\n' "$(psym "$f")"
+    done
+    printf '\t.size\t%s, 32\n' "$(psym BOUNDARY_WAKER_VTABLE)"
+}
 probe_fixture() { # <name> <clone> <wake> <wake_by_ref> <off-path> [<waker_drop insns…>]
     local name=$1 clone=$2 wake=$3 by_ref=$4 off=$5
     shift 5
@@ -1806,14 +1846,15 @@ probe_fixture() { # <name> <clone> <wake> <wake_by_ref> <off-path> [<waker_drop 
       for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do
           printf '\t.xword\t%s\n' "$(psym "$f")"
       done
-      printf '\t.size\t%s, 32\n' "$(psym WAKER_VTABLE)"; } | waker_asm "$name"
+      printf '\t.size\t%s, 32\n' "$(psym WAKER_VTABLE)"
+      probe_boundary_asm; } | waker_asm "$name"
 }
 tree=$( { for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do waker_body "$f" 'ret'; done
           waker_vtable; } | waker_asm waker-tree )
 pasm=$(probe_fixture waker-probe-arm64 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
     'stlr\tx9, [x8]' 'bl\t__aarch64_ldadd8_acq_rel')
 expect_output "waker probe: the arm64 Linux shape is 3 plants red, 2 controls green" \
-    "probe: fixture asm, 3 of 3 planted wakers red, 2 of 2 controls green" \
+    "probe: fixture asm, 7 of 7 plants red, 3 of 3 controls green" \
     env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 expect green "waker probe: the arm64 Linux shape passes" env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 # The controls are exact: a probe copy with both control lines deleted is red.
@@ -1823,12 +1864,13 @@ cp -R scripts/waker-atomics-probe "$work/wk/scripts/"
 sed -i.bak '/WAKER-PROBE: expect-clean/d; /WAKER-PROBE: expect-unscanned/d' \
     "$work/wk/scripts/waker-atomics-probe/src/lib.rs"
 expect_red_because "waker probe: a probe whose controls were deleted is red" \
-    "probe declares 0 clean and 0 off-path controls (expected exactly 1 and 1)" \
-    env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" "$work/wk/scripts/check-waker-atomics.sh"
+    "probe declares 0 clean, 0 off-path and 1 boundary controls (expected exactly 1, 1 and 1)" \
+    env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" INF_WAKER_LIVE=off \
+    "$work/wk/scripts/check-waker-atomics.sh"
 pasm=$(PSYM=v0 probe_fixture waker-probe-v0 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
     'stlr\tx9, [x8]' 'bl\t__aarch64_ldadd8_acq_rel')
 expect_output "waker probe: v0-mangled names match their own symbols" \
-    "probe: fixture asm, 3 of 3 planted wakers red, 2 of 2 controls green" \
+    "probe: fixture asm, 7 of 7 plants red, 3 of 3 controls green" \
     env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 inner=_ZN19waker_atomics_probe10waker_drop5inner17h0123456789abcdefE
 pasm=$(probe_fixture waker-probe-nested 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
@@ -1849,6 +1891,47 @@ expect_red_because "waker probe: an off-path atomic the scanner cannot see is a 
     env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 expect_red_because "waker probe: the probe-asm hook outside fixture mode is refused" \
     "INF_WAKER_PROBE_ASM without INF_WAKER_ASM" env INF_WAKER_PROBE_ASM="$pasm" $WAKER
+# The boundary (ADR-0003 A1.6): the five functions of `executor::foreign` are present, not
+# followed, and listed with their atomics; an atomic beside a call to one is red; each must be
+# reached; a callee with no body is red unless the closed list holds it.
+fsym() { printf '_ZN11inf_runtime8executor7foreign%s%s17h0123456789abcdefE' "${#1}" "$1"; }
+boundary_tree() { # <waker_wake's extra insn> <waker_drop's callee> [settle_held reached: yes|no]
+    local f settle=${3:-yes}
+    for f in clone wake wake_by_ref drop settle_held; do
+        waker_body "$(fsym "$f")" 'lock\t\txaddq\t%rax, (%rcx)' 'retq'
+    done
+    waker_body waker_clone "callq\t$(fsym clone)" 'retq'
+    if [ "$settle" = yes ]; then
+        waker_body waker_wake "callq\t$(fsym wake)" "callq\t$(fsym settle_held)" "$1" 'retq'
+    else
+        waker_body waker_wake "callq\t$(fsym wake)" "$1" 'retq'
+    fi
+    waker_body waker_wake_by_ref "callq\t$(fsym wake_by_ref)" 'callq\t__tls_get_addr@PLT' 'retq'
+    waker_body waker_drop "callq\t$(fsym drop)" "callq\t$2" 'retq'
+    waker_vtable
+}
+asm=$(boundary_tree 'movq\t%rdi, %rax' '_RNvNtCsjrHSEGnQ3l9_3std7process5abort' | waker_asm waker-boundary)
+expect green "waker boundary: atomics behind the five boundary functions scan green" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+expect_output "waker boundary: each boundary function is listed with its atomics" \
+    "boundary (checked): clone (2 instructions, 1 atomics), drop (2 instructions, 1 atomics)" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+expect_output "waker boundary: a listed callee is printed, not red" \
+    "listed callees (no body in this asm): _RNvNtCsjrHSEGnQ3l9_3std7process5abort __tls_get_addr" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+asm=$(boundary_tree 'lock\t\txaddq\t%rax, (%rcx)' memcpy | waker_asm waker-beside)
+expect_red_because "waker boundary: an atomic beside a boundary call is red" \
+    "ATOMIC on the waker's owner lane: waker_wake" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+asm=$(boundary_tree 'movq\t%rdi, %rax' memcpy no | waker_asm waker-dead)
+expect_red_because "waker boundary: a boundary function no waker reaches is red" \
+    "DEAD BOUNDARY: executor::foreign::settle_held" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+asm=$(boundary_tree 'movq\t%rdi, %rax' _ZN14inf_foundation4wake10WakeBridge5quiet17h0123456789abcdefE |
+      waker_asm waker-unlisted)
+expect_red_because "waker boundary: a callee the closed list does not hold is red" \
+    "UNLISTED CALLEE on the waker's owner lane: waker_drop>_ZN14inf_foundation4wake10WakeBridge5quiet" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+expect_red_because "waker boundary: the live-boundary switch outside fixture mode is refused" \
+    "INF_WAKER_LIVE=off outside fixture mode" env INF_WAKER_LIVE=off $WAKER_LIVE
 }
 
 # ------------------------------------------------------- fault points (D9)
@@ -4442,7 +4525,7 @@ fz_manifest() {
 }
 # fz_root <name>: members crates/a (a library) and bins/b (a binary), one fuzz
 # workspace each — t_one, and b_parse including bins/b/src/parse.rs by
-# `#[path]` —, the five probe manifests, a `check` recipe running their gates,
+# `#[path]` —, the six probe manifests, a `check` recipe running their gates,
 # and the stub answering both workspaces green. Its stub files sit beside it.
 fz_root() {
     local root probe
@@ -4466,6 +4549,9 @@ fz_root() {
         printf '[package]\nname = "%s"\nversion = "0.0.0"\n\n[workspace]\n' "$probe" \
             >"$root/scripts/$probe/Cargo.toml"
     done
+    mkdir -p "$root/scripts/waker-atomics-probe/nested"
+    printf '[package]\nname = "nested"\nversion = "0.0.0"\n' \
+        >"$root/scripts/waker-atomics-probe/nested/Cargo.toml"
     printf 'check:\n    ./scripts/check-clock-ban.sh\n    ./scripts/check-lint-scopes.sh\n' >"$root/justfile"
     printf '    ./scripts/check-fuzz-targets.sh\n    ./scripts/check-waker-atomics.sh\n' >>"$root/justfile"
     git -C "$root" init -q
@@ -4517,7 +4603,7 @@ expect_output "fuzz-targets: the OK line counts what it compiled and read" \
     "fuzz-targets OK: 2 fuzz workspaces, 2 of 2 targets compiled (2 .*bin.* rows, 2 files)" \
     fz_replay "$root.log"
 expect_output "fuzz-targets: the OK line discloses the probe off in fixture mode" \
-    "probe: skipped (fixture mode, INF_FUZZ_CHECK_PROBE=off); 5 probe manifests, each run by its gate" \
+    "probe: skipped (fixture mode, INF_FUZZ_CHECK_PROBE=off); 6 probe manifests, each run by its gate" \
     fz_replay "$root.log"
 expect_output "fuzz-targets: the OK line counts the #[path] sites and files read" \
     "0 seed directories (git-listed); 1 #.path. sites, 1 files read" fz_replay "$root.log"
@@ -4684,7 +4770,7 @@ expect_red_because "fuzz-targets: C4: a workspace-inherited dependency of a prob
 expect green "fuzz-targets: C4: a probe's path dependency on a manifest of the tree" \
     fz_lacks "$FZ_C4 .a.," "$root.log"
 expect_output "fuzz-targets: the OK line says no probe names a third-party crate" \
-    "5 probe manifests, each run by its gate and naming no third-party crate" fz_replay "$FZ_CLEAN_LOG"
+    "6 probe manifests, each run by its gate and naming no third-party crate" fz_replay "$FZ_CLEAN_LOG"
 # C5: one row a file, at fuzz_targets/<name>.rs, each name once.
 root=$(fz_root c5-file)
 printf 'fn main() {}\n' >"$root/crates/a/fuzz/fuzz_targets/x.rs"

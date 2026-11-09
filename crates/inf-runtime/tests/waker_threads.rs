@@ -1,8 +1,9 @@
 //! A standard `Waker` is `Send + Sync`: its vtable's four functions must be thread-safe, whatever
 //! the future that cloned it. So safe code may move a cell executor's waker to another thread, or
 //! wake one task from two threads at once. Each test here does that through the executor's safe
-//! API, and each must be sound: Miri, whose data-race detector sees an unsynchronized access to
-//! the executor's cell-local state, runs them.
+//! API, and each must be sound: they run natively and under Miri, the oracle they are written
+//! for, whose data-race detector sees an unsynchronized access to the executor's cell-local
+//! state and whose Stacked Borrows and leak checks see a header reached or kept wrongly.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -63,11 +64,6 @@ fn a_waker_moved_to_another_thread_and_back_is_sound() {
 /// Two threads wake one parked task at once, then drop their wakers there. The wakes coalesce:
 /// the next `run_ready` polls the task once and leaves nothing queued.
 #[test]
-#[cfg_attr(
-    not(miri),
-    ignore = "on this executor two threads waking one task race on its cell-local state (a \
-              RefCell borrow can panic natively); Miri reports the race"
-)]
 fn two_threads_wake_one_task() {
     let (mut executor, polls, first) = parked_task();
     let second = first.clone();

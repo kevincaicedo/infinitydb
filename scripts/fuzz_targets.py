@@ -82,6 +82,7 @@ PROBES = {
     "scripts/fuzz-check-probe/stale-lock/Cargo.toml": "check-fuzz-targets.sh",
     "scripts/lint-scope-probe/Cargo.toml": "check-lint-scopes.sh",
     "scripts/waker-atomics-probe/Cargo.toml": "check-waker-atomics.sh",
+    "scripts/waker-atomics-probe/nested/Cargo.toml": "check-waker-atomics.sh",
 }
 SEED_KINDS = ("corpus", "corpora", "seeds")
 # A manifest's dependency tables, cargo's older spellings among them.

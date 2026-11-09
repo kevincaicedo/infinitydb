@@ -4,7 +4,7 @@
 //! scheduler groups, and the 10-step reactor loop.
 //!
 //! This is the only crate allowed to name io_uring/kqueue symbols (§3.3).
-//! `unsafe` is confined to three audited areas — backend FFI, the Rc waker
+//! `unsafe` is confined to three audited areas — backend FFI, the waker
 //! vtable, and type-erased task storage — see `SAFETY.md`.
 //!
 //! Backends: `UringDriver` (Linux, `--features uring`, the performance
