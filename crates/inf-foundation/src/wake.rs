@@ -450,7 +450,15 @@ impl WakeBridge {
     /// A foreign `wake_by_ref`: `W` and `Q` set unless the header is closed, and the bridge
     /// pushed if `Q` was clear. `stack` is the bridge's own.
     pub fn foreign_wake_by_ref(&self, stack: &RemoteStack) -> Pushed {
+        self.foreign_wake_by_ref_at(stack, NonNull::from(self))
+    }
+
+    /// [`WakeBridge::foreign_wake_by_ref`], whose push links `node`: this bridge's address, with
+    /// the provenance of the header that holds it, so the drain reaches the whole header
+    /// through the link. A reference to the bridge reaches its own bytes alone.
+    pub fn foreign_wake_by_ref_at(&self, stack: &RemoteStack, node: NonNull<WakeBridge>) -> Pushed {
         debug_assert!(ptr::eq(stack, self.stack()), "a bridge's calls name its own stack");
+        debug_assert!(ptr::eq(node.as_ptr(), self), "a push links the bridge itself");
         count_before(stack);
         let raise = if PLANT_WAKE_WITHOUT_QUEUE { WOKEN } else { WOKEN | QUEUED };
         self.tomb.visit();
@@ -475,7 +483,7 @@ impl WakeBridge {
         let pushed = if PLANT_WAKE_WITHOUT_QUEUE || old.has(QUEUED) {
             Pushed::Already
         } else {
-            match self.queue(stack) {
+            match stack.push(self, node) {
                 Landed::Yes => Pushed::Now,
                 Landed::Closed => {
                     let settled = self.unqueue();
@@ -492,14 +500,26 @@ impl WakeBridge {
     /// A foreign `wake`, which consumes its waker: `c − 1` with `W` and `Q` set unless the header
     /// is closed. `stack` is the bridge's own.
     pub fn foreign_wake(&self, stack: &RemoteStack) -> Released {
+        self.foreign_wake_at(stack, NonNull::from(self))
+    }
+
+    /// [`WakeBridge::foreign_wake`], whose push links `node` (as
+    /// [`WakeBridge::foreign_wake_by_ref_at`]).
+    pub fn foreign_wake_at(&self, stack: &RemoteStack, node: NonNull<WakeBridge>) -> Released {
         let raise = if PLANT_WAKE_WITHOUT_QUEUE { WOKEN } else { WOKEN | QUEUED };
-        self.release_waker(stack, raise)
+        self.release_waker(stack, node, raise)
     }
 
     /// A foreign drop: `c − 1` with `Q` set unless the header is closed. `stack` is the bridge's
     /// own.
     pub fn foreign_drop(&self, stack: &RemoteStack) -> Released {
-        self.release_waker(stack, QUEUED)
+        self.foreign_drop_at(stack, NonNull::from(self))
+    }
+
+    /// [`WakeBridge::foreign_drop`], whose push links `node` (as
+    /// [`WakeBridge::foreign_wake_by_ref_at`]).
+    pub fn foreign_drop_at(&self, stack: &RemoteStack, node: NonNull<WakeBridge>) -> Released {
+        self.release_waker(stack, node, QUEUED)
     }
 
     /// Whether no waker names the header and it is not queued: `w = 0` with `Q` clear, the
@@ -538,9 +558,15 @@ impl WakeBridge {
         }
     }
 
-    /// `c − 1` with `raise` set unless closed, then the push or the free that follows.
-    fn release_waker(&self, stack: &RemoteStack, raise: u64) -> Released {
+    /// `c − 1` with `raise` set unless closed, then the push of `node` or the free that follows.
+    fn release_waker(
+        &self,
+        stack: &RemoteStack,
+        node: NonNull<WakeBridge>,
+        raise: u64,
+    ) -> Released {
         debug_assert!(ptr::eq(stack, self.stack()), "a bridge's calls name its own stack");
+        debug_assert!(ptr::eq(node.as_ptr(), self), "a push links the bridge itself");
         count_before(stack);
         // The word before the swap that set (or skipped) `raise`, and the count after the drop.
         let (before, count) = if PLANT_DROP_NOTIFY_SPLIT && raise == QUEUED {
@@ -559,7 +585,7 @@ impl WakeBridge {
         } else if (PLANT_WAKE_WITHOUT_QUEUE && raise != QUEUED) || before.has(QUEUED) {
             Released::Kept
         } else {
-            match self.queue(stack) {
+            match stack.push(self, node) {
                 Landed::Yes => Released::Queued,
                 Landed::Closed => match self.unqueue() {
                     Settled::Kept => Released::Kept,
@@ -584,11 +610,6 @@ impl WakeBridge {
                 Err(now) => word = now,
             }
         }
-    }
-
-    /// The push that follows a swap which set `Q` from clear.
-    fn queue(&self, stack: &RemoteStack) -> Landed {
-        stack.push(self)
     }
 
     /// Clears `Q` and `W` in one read-modify-write and says whether that left a closed header
@@ -690,10 +711,11 @@ impl RemoteStack {
         self.foreign_ops.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Pushes `bridge`, whose swap set `Q` from clear. Retried only when another thread's push or
-    /// take changed the head first (lock-free).
-    fn push(&self, bridge: &WakeBridge) -> Landed {
-        let node = ptr::from_ref(bridge).cast_mut();
+    /// Pushes `bridge` as `node`, its address with its header's provenance, after a swap that
+    /// set `Q` from clear. Retried only when another thread's push or take changed the head first
+    /// (lock-free).
+    fn push(&self, bridge: &WakeBridge, node: NonNull<WakeBridge>) -> Landed {
+        let node = node.as_ptr();
         self.tomb.visit();
         let mut head = self.head.load(Ordering::Relaxed);
         loop {
