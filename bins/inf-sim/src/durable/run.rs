@@ -1626,8 +1626,8 @@ fn tier_budget_oracles(
     }
     if leg.expects_contention() && (record.turn_waits == 0 || record.turn_contended == 0) {
         report.violations.push(format!(
-            "TIER-TURN VACUOUS seed {seed:#x} cell {cell}: the turn refused {} time(s) and was \
-             contended {} time(s); the leg needs both",
+            "TIER-CONTENTION VACUOUS seed {seed:#x} cell {cell}: the turn refused {} time(s) and \
+             was contended {} time(s); the leg needs both",
             record.turn_waits, record.turn_contended
         ));
     }
