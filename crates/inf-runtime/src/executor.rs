@@ -25,10 +25,11 @@
 //!
 //! A finished task's header is decided only after its future's drop: kept spare, freed, or
 //! **Held** — linked into a list in the shared state — while a waker names it or a foreign wake
-//! for it is queued. The executor's drop closes every header it still holds: the last waker of a
-//! closed header frees it, on whichever thread drops it, and the stack with the last. No product
-//! path moves a waker off its cell (ADR-0149 D1); the foreign lane makes a violation a counted,
-//! sound wake (`waker_foreign_ops`). `SAFETY.md` holds the audit of this module's `unsafe`.
+//! for it is queued. The executor's drop frees its spare header, which nothing names, and closes
+//! every other header it still holds: the last waker of a closed header frees it, on whichever
+//! thread drops it, and the stack with the last. No product path moves a waker off its cell
+//! (ADR-0149 D1); the foreign lane makes a violation a counted, sound wake (`waker_foreign_ops`).
+//! `SAFETY.md` holds the audit of this module's `unsafe`.
 
 use core::alloc::Layout;
 use core::cell::{Cell, RefCell};
@@ -1025,10 +1026,11 @@ unsafe fn decide_released(header: Header) {
 
 impl Drop for CellExecutor {
     /// The executor's drop (ADR-0003 A1.3): it drains; marks every task's header Dead and drops
-    /// the futures, deciding each header after its future as `release` does; closes every header
-    /// still held, the held list's and the spare; takes the stack a last time, leaving its head
-    /// closed; then releases its own count of the stack and, the last, its `Rc` of the shared
-    /// state. Nothing is kept for the process: a closed header lives until its last waker's drop.
+    /// the futures, deciding each header after its future as `release` does; frees the spare
+    /// header as it frees any quiet one, with no atomic; closes every header the held list still
+    /// links; takes the stack a last time, leaving its head closed; then releases its own count
+    /// of the stack and, the last, its `Rc` of the shared state. Nothing is kept for the process:
+    /// a closed header lives until its last waker's drop.
     fn drop(&mut self) {
         self.drain_remote();
         for entry in self.entries.iter().flatten() {
@@ -1048,7 +1050,13 @@ impl Drop for CellExecutor {
             self.close(header);
         }
         if let Some(spare) = self.spare_header.take() {
-            self.close(spare);
+            // SAFETY: the executor holds its spare: open, on this thread, on no list.
+            debug_assert!(unsafe { quiet(spare) }, "a spare is unnamed and unqueued");
+            // SAFETY: a spare is kept only when no waker names it and no push holds it
+            // (`decide_first_poll`), and nothing lends it until the next first poll takes it, so
+            // it is freed open, as `decide_released` frees a quiet header: no count of the stack
+            // to take or release, and no swap.
+            unsafe { free_open(spare) };
         }
         let mut last = self.stack_ref().take_last();
         // SAFETY: a queued bridge is allocated while its `Q` is set.

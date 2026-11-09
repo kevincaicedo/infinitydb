@@ -135,7 +135,9 @@ Invariants:
   function holds a reference argument to a header across its free: the
   paths that may free one take its raw pointer.
 - **Close, then the last waker frees.** The executor's drop drains, drops
-  every future (deciding each header), closes every header it still holds
+  every future (deciding each header), frees its spare header open (kept
+  only while no waker names it and no push holds it, so freed as any quiet
+  header is, with no atomic), closes every header it still holds
   (counted on the stack, the owner part dropped in place, `MARK_CLOSED`, `o`
   folded into `c` with `X`), takes the stack a last time, leaving its head
   closed, and releases its own count of the stack and its `Rc` of the
