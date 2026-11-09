@@ -892,6 +892,13 @@ rows=(
   # later starts, which the stride test reads as a crossing at its widest
   # window.
   "inf_canary_seal_mark_stride_one crate-test inf-store lib the_stride_keeps_the_seal_marks_under_their_cap_at_every_window stride-short"
+  # The first plant at a tiered table's marks' cap edges, at the unit tier:
+  # no leg fills them (the stride keeps the seal marks at half their cap,
+  # the window's arithmetic the hole marks at two of three). One short, the
+  # 8,192nd seal mark merges into the back and the third planted hole is
+  # refused, each read by its edge test's own token.
+  "inf_canary_cap_minus_one crate-test inf-store lib the_seal_marks_cap_admits_its_last_mark_and_merges_the_next seal-marks-edge-short"
+  "inf_canary_cap_minus_one crate-test inf-store lib the_hole_marks_cap_admits_three_and_refuses_a_fourth hole-marks-edge-short"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

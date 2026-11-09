@@ -161,3 +161,61 @@ impl SealMarks {
         self.marks.iter().copied()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use inf_foundation::CellId;
+
+    use super::*;
+
+    const PAGE: u64 = 4 << 10;
+
+    /// Marks at a stride of one 4 KiB page, whatever the ring: the cap's
+    /// edge, which the stride keeps every ring from reaching.
+    fn marks_at_stride_one(census: &Rc<CapCensus>) -> SealMarks {
+        SealMarks {
+            marks: CappedDeque::new(SEAL_MARKS, census).expect("built"),
+            bucket_shift: PAGE.trailing_zeros(),
+            last_bucket: NO_MARK_BUCKET,
+        }
+    }
+
+    /// One record at the start of each of `pages` pages above page 0, the
+    /// ro-boundary at the origin: every page's record pushes a mark.
+    fn note_pages(marks: &mut SealMarks, pages: u64) {
+        for page in 1..=pages {
+            let offset = page * PAGE;
+            let addr = LogicalAddr::from_raw(offset).expect("48-bit");
+            marks.note(addr, offset, || LogicalAddr::ZERO);
+        }
+    }
+
+    /// The cap's edge at a stride of one page: `SEAL_MARKS_MAX − 1` and
+    /// `SEAL_MARKS_MAX` buckets keep one mark each and cross nothing; one
+    /// more holds the cap, counts one crossing, and the back mark is the
+    /// newest start (`LaterStart`), so every mark is still a record start.
+    #[test]
+    fn the_seal_marks_cap_admits_its_last_mark_and_merges_the_next() {
+        for count in [SEAL_MARKS_MAX - 1, SEAL_MARKS_MAX] {
+            let census = CapCensus::new(CellId(0)).0;
+            let mut marks = marks_at_stride_one(&census);
+            note_pages(&mut marks, u64::from(count));
+            let held = marks.len();
+            assert_eq!(
+                held, count as usize,
+                "seal-marks-edge-short — {held} seal marks after {count} buckets"
+            );
+            let row = census.row(SEAL_MARKS.name()).expect("the seal marks' row");
+            assert_eq!((row.high_water, row.crossings), (count, 0));
+        }
+        let census = CapCensus::new(CellId(0)).0;
+        let mut marks = marks_at_stride_one(&census);
+        let past = u64::from(SEAL_MARKS_MAX) + 1;
+        note_pages(&mut marks, past);
+        assert_eq!(marks.len(), SEAL_MARKS_MAX as usize, "the cap holds");
+        let row = census.row(SEAL_MARKS.name()).expect("the seal marks' row");
+        assert_eq!(row.crossings, 1, "the merge at the cap counts");
+        let newest = marks.iter().last().expect("a back mark");
+        assert_eq!(newest.addr().to_raw(), past * PAGE, "the back took the newest start");
+    }
+}

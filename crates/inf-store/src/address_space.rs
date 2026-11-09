@@ -1993,6 +1993,29 @@ mod tests {
         eprintln!("marks property: full-marks answers (hole, pad) {answered:?}");
     }
 
+    /// The hole marks' cap edge (`HOLE_MARKS_MAX`, three): planted pads,
+    /// a state neither `alloc` nor a boot pad reaches. The first, second and
+    /// third are each admitted with no crossing; a fourth is refused with
+    /// nothing changed and counts one crossing on the row.
+    #[test]
+    fn the_hole_marks_cap_admits_three_and_refuses_a_fourth() {
+        let census = CapCensus::new(inf_foundation::CellId(0)).0;
+        let mut sp = space_on(1 << 16, 1 << 12, &census);
+        for planted in 1..=HOLE_MARKS_MAX {
+            assert!(
+                sp.plant_hole(100),
+                "hole-marks-edge-short — the hole marks refused pad {planted} of {HOLE_MARKS_MAX}"
+            );
+            let row = census.row(HOLE_MARKS.name()).expect("the hole marks' row");
+            assert_eq!((row.high_water, row.crossings), (planted, 0));
+        }
+        let before = (sp.tail(), sp.report());
+        assert!(!sp.plant_hole(100), "a fourth pending interval is refused");
+        assert_eq!((sp.tail(), sp.report()), before, "the refusal changes nothing");
+        let row = census.row(HOLE_MARKS.name()).expect("the hole marks' row");
+        assert_eq!(row.crossings, 1, "the refusal counts");
+    }
+
     #[test]
     fn window_exhaustion_refuses_without_mutation() {
         let mut space = space(1 << 16, 1 << 12);
