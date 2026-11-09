@@ -882,6 +882,10 @@ rows=(
   # ADR-0003 A1.2.7: every park a cell loop issues carries a timeout of at most its ceiling;
   # planted, a park with no timer armed passes none and waits without limit.
   "inf_canary_park_without_ceiling crate-test inf-runtime test:reactor an_idle_park_carries_its_ceiling at most its ceiling"
+  # Every waker operation takes the foreign lane: the simulator's wiring check reads the count
+  # above 0, and the binary at two cells, where cells are threads, reads it on its cells.
+  "inf_canary_waker_foreign_lane_always m0-smoke waker-foreign-ops"
+  "inf_canary_waker_foreign_lane_always crate-test infinityd test:waker_cells no_waker_takes_the_foreign_lane_at_two_cells waker_foreign_ops above 0"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

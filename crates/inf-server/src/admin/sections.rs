@@ -438,6 +438,8 @@ fn tripwires_section(
     push(text, &format!("{}:{p999}", tw::LOOP_ITER_P999_US));
     push(text, &format!("fabric_rtt_p50_ns:{}", node.fabric_rtt_p50_ns.get()));
     push(text, &format!("recv_dropped:{}", node.recv_dropped.get()));
+    // Waker operations made off this cell's thread: 0 while no path moves a waker off its cell.
+    push(text, &format!("waker_foreign_ops:{}", node.waker_foreign_ops.get()));
     let [submits, raw_sqes, raw_cqes, iters, commands, fabric_msgs] = node.raw_counters.get();
     push(text, &format!("raw_submits:{submits}"));
     push(text, &format!("raw_sqes:{raw_sqes}"));

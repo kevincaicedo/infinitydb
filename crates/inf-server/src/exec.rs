@@ -137,6 +137,9 @@ pub struct NodeState {
     pub tier_position_conflicts: Cell<u64>,
     pub connections: Cell<u64>,
     pub recv_dropped: Cell<u64>,
+    /// The cell executor's `waker_foreign_ops`: waker operations made off the cell's thread,
+    /// which no product path makes (ADR-0003 A1.4). Cell scope, flushed by MAINTAIN.
+    pub waker_foreign_ops: Cell<u64>,
     pub fabric_rtt_p50_ns: Cell<u64>,
     pub cell: Cell<u16>,
     pub cells: Cell<u16>,

@@ -53,6 +53,8 @@ const UNASSIGNED: u32 = u32::MAX;
 
 /// The lane compare answers the owner part on every thread.
 const PLANT_OWNER_UNCHECKED: bool = cfg!(inf_canary_waker_owner_unchecked);
+/// The lane compare answers no owner part on any thread: every operation is foreign.
+const PLANT_FOREIGN_LANE_ALWAYS: bool = cfg!(inf_canary_waker_foreign_lane_always);
 /// A finished header's reuse reads `o` and not the lane word.
 const PLANT_REUSE_OWNER_COUNT_ONLY: bool = cfg!(inf_canary_wake_reuse_owner_count_only);
 /// The swap that leaves a closed header at `c = 0` with `Q` clear frees nothing.
@@ -174,7 +176,8 @@ unsafe fn owner_part(data: *const ()) -> Option<Header> {
     // SAFETY: the caller's waker keeps the header allocated; the bridge, at offset 0, is atomics
     // only, so any thread may form this reference.
     let marked = unsafe { &*data.cast::<WakeBridge>() }.owner_mark();
-    let owned = marked == ThreadMark::current() || PLANT_OWNER_UNCHECKED;
+    let owned =
+        (marked == ThreadMark::current() || PLANT_OWNER_UNCHECKED) && !PLANT_FOREIGN_LANE_ALWAYS;
     // SAFETY: `data` is a header's own pointer (`waker_ref`, `waker_clone`), never null.
     owned.then(|| unsafe { NonNull::new_unchecked(data.cast_mut().cast::<WakeHeader>()) })
 }

@@ -1792,6 +1792,21 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         }
     }
 
+    // The waker's wiring check (ADR-0003 A1.4): every cell's `waker_foreign_ops`, the gauge
+    // INFO's `# Tripwires` renders, reads 0. The simulator runs every cell's loop on one thread,
+    // so a waker used from another cell's step takes the owner lane and is not counted: a
+    // reading above 0 here is the compare or the counter wrong, never evidence that a waker
+    // stayed on its cell (the binary at two cells is that leg).
+    for (i, node) in nodes.iter().enumerate() {
+        let ops = node.waker_foreign_ops.get();
+        if ops != 0 {
+            violations.push(format!(
+                "cell {i}: waker-foreign-ops {ops} on one thread, where every waker operation is \
+                 the owner lane's"
+            ));
+        }
+    }
+
     // Admission reconciliation (ADR-0123 D1): the cells' `rejected_
     // connections` fold equals the clients that saw the refusal frame,
     // per cell; and a scenario that seeds the bound must have reached it.
