@@ -68,8 +68,9 @@ pub const MARK_CLOSED: u64 = u64::MAX;
 /// The next mark to claim. A `core` atomic under Loom too: a `static` cannot hold Loom's atomics,
 /// which are not `const`-constructible, and a mark's uniqueness needs the read-modify-write
 /// alone, no ordering (ADR-0003 A1.2.8). Width: marks 1 to `MARK_CLOSED − 1` are issued, one per
-/// executor-building thread of the process (INF 584 years at 10⁹ claims a second); past them a
-/// claim aborts the process, so no mark is issued twice, and 0 and `MARK_CLOSED` never.
+/// executor-building thread of the process (about 584 years at 10⁹ claims a second, by
+/// arithmetic); past them a claim aborts the process, so no mark is issued twice, and 0 and
+/// `MARK_CLOSED` never.
 static NEXT_MARK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 std::thread_local! {
@@ -450,7 +451,15 @@ impl WakeBridge {
     /// A foreign `wake_by_ref`: `W` and `Q` set unless the header is closed, and the bridge
     /// pushed if `Q` was clear. `stack` is the bridge's own.
     pub fn foreign_wake_by_ref(&self, stack: &RemoteStack) -> Pushed {
+        self.foreign_wake_by_ref_at(stack, NonNull::from(self))
+    }
+
+    /// [`WakeBridge::foreign_wake_by_ref`], whose push links `node`: this bridge's address, with
+    /// the provenance of the header that holds it, so the drain reaches the whole header
+    /// through the link. A reference to the bridge reaches its own bytes alone.
+    pub fn foreign_wake_by_ref_at(&self, stack: &RemoteStack, node: NonNull<WakeBridge>) -> Pushed {
         debug_assert!(ptr::eq(stack, self.stack()), "a bridge's calls name its own stack");
+        debug_assert!(ptr::eq(node.as_ptr(), self), "a push links the bridge itself");
         count_before(stack);
         let raise = if PLANT_WAKE_WITHOUT_QUEUE { WOKEN } else { WOKEN | QUEUED };
         self.tomb.visit();
@@ -475,7 +484,7 @@ impl WakeBridge {
         let pushed = if PLANT_WAKE_WITHOUT_QUEUE || old.has(QUEUED) {
             Pushed::Already
         } else {
-            match self.queue(stack) {
+            match stack.push(self, node) {
                 Landed::Yes => Pushed::Now,
                 Landed::Closed => {
                     let settled = self.unqueue();
@@ -492,14 +501,26 @@ impl WakeBridge {
     /// A foreign `wake`, which consumes its waker: `c − 1` with `W` and `Q` set unless the header
     /// is closed. `stack` is the bridge's own.
     pub fn foreign_wake(&self, stack: &RemoteStack) -> Released {
+        self.foreign_wake_at(stack, NonNull::from(self))
+    }
+
+    /// [`WakeBridge::foreign_wake`], whose push links `node` (as
+    /// [`WakeBridge::foreign_wake_by_ref_at`]).
+    pub fn foreign_wake_at(&self, stack: &RemoteStack, node: NonNull<WakeBridge>) -> Released {
         let raise = if PLANT_WAKE_WITHOUT_QUEUE { WOKEN } else { WOKEN | QUEUED };
-        self.release_waker(stack, raise)
+        self.release_waker(stack, node, raise)
     }
 
     /// A foreign drop: `c − 1` with `Q` set unless the header is closed. `stack` is the bridge's
     /// own.
     pub fn foreign_drop(&self, stack: &RemoteStack) -> Released {
-        self.release_waker(stack, QUEUED)
+        self.foreign_drop_at(stack, NonNull::from(self))
+    }
+
+    /// [`WakeBridge::foreign_drop`], whose push links `node` (as
+    /// [`WakeBridge::foreign_wake_by_ref_at`]).
+    pub fn foreign_drop_at(&self, stack: &RemoteStack, node: NonNull<WakeBridge>) -> Released {
+        self.release_waker(stack, node, QUEUED)
     }
 
     /// Whether no waker names the header and it is not queued: `w = 0` with `Q` clear, the
@@ -513,6 +534,14 @@ impl WakeBridge {
         let lane = Lane(self.lane.load(Ordering::Relaxed));
         debug_assert!(!lane.has(CLOSED), "a closed header has no owner lane");
         lane.count() + owner_count == 0 && !lane.has(QUEUED)
+    }
+
+    /// Canary only: whether no waker names the header, whatever `Q` says — the reuse test of a
+    /// planted executor that recycles a header with a wake still queued.
+    #[cfg(inf_canary_ready_ignores_queued)]
+    #[must_use]
+    pub fn unnamed_ignoring_queue(&self, owner_count: i64) -> bool {
+        Lane(self.lane.load(Ordering::Relaxed)).count() + owner_count == 0
     }
 
     /// Closes the header at its executor's drop, after the owner part was dropped in place: the
@@ -538,9 +567,15 @@ impl WakeBridge {
         }
     }
 
-    /// `c − 1` with `raise` set unless closed, then the push or the free that follows.
-    fn release_waker(&self, stack: &RemoteStack, raise: u64) -> Released {
+    /// `c − 1` with `raise` set unless closed, then the push of `node` or the free that follows.
+    fn release_waker(
+        &self,
+        stack: &RemoteStack,
+        node: NonNull<WakeBridge>,
+        raise: u64,
+    ) -> Released {
         debug_assert!(ptr::eq(stack, self.stack()), "a bridge's calls name its own stack");
+        debug_assert!(ptr::eq(node.as_ptr(), self), "a push links the bridge itself");
         count_before(stack);
         // The word before the swap that set (or skipped) `raise`, and the count after the drop.
         let (before, count) = if PLANT_DROP_NOTIFY_SPLIT && raise == QUEUED {
@@ -559,7 +594,7 @@ impl WakeBridge {
         } else if (PLANT_WAKE_WITHOUT_QUEUE && raise != QUEUED) || before.has(QUEUED) {
             Released::Kept
         } else {
-            match self.queue(stack) {
+            match stack.push(self, node) {
                 Landed::Yes => Released::Queued,
                 Landed::Closed => match self.unqueue() {
                     Settled::Kept => Released::Kept,
@@ -584,11 +619,6 @@ impl WakeBridge {
                 Err(now) => word = now,
             }
         }
-    }
-
-    /// The push that follows a swap which set `Q` from clear.
-    fn queue(&self, stack: &RemoteStack) -> Landed {
-        stack.push(self)
     }
 
     /// Clears `Q` and `W` in one read-modify-write and says whether that left a closed header
@@ -676,7 +706,10 @@ impl RemoteStack {
     /// Releases one count: a freed closed header's, or the executor's own after its last take.
     pub fn release(&self) -> Freed {
         self.tomb.visit();
-        if self.counted.fetch_sub(1, RETAIN_ORDERING) != 1 {
+        let held = self.counted.fetch_sub(1, RETAIN_ORDERING);
+        // A release past zero would wrap the count and leave the stack to no one.
+        debug_assert_ne!(held, 0, "a release follows its own count");
+        if held != 1 {
             return Freed::No;
         }
         // The acquire half: the freer follows every other release.
@@ -690,10 +723,11 @@ impl RemoteStack {
         self.foreign_ops.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Pushes `bridge`, whose swap set `Q` from clear. Retried only when another thread's push or
-    /// take changed the head first (lock-free).
-    fn push(&self, bridge: &WakeBridge) -> Landed {
-        let node = ptr::from_ref(bridge).cast_mut();
+    /// Pushes `bridge` as `node`, its address with its header's provenance, after a swap that
+    /// set `Q` from clear. Retried only when another thread's push or take changed the head first
+    /// (lock-free).
+    fn push(&self, bridge: &WakeBridge, node: NonNull<WakeBridge>) -> Landed {
+        let node = node.as_ptr();
         self.tomb.visit();
         let mut head = self.head.load(Ordering::Relaxed);
         loop {
@@ -720,11 +754,18 @@ impl Default for RemoteStack {
 
 /// The bridges one take removed from the stack, settled one at a time by the owner. A bridge
 /// stays queued (`Q` set) until its turn, so each must be settled; dropping this with entries
-/// left would lose their wakes.
+/// left would lose their wakes, which its drop checks in debug builds.
 #[must_use]
 #[derive(Debug)]
 pub struct Drained {
     next: *mut WakeBridge,
+}
+
+impl Drop for Drained {
+    fn drop(&mut self) {
+        // An entry left here keeps `Q` set and is never pushed again: its wakes are lost.
+        debug_assert!(self.next.is_null(), "a drain settles every bridge it took");
+    }
 }
 
 impl Drained {
@@ -779,7 +820,7 @@ impl Drained {
 #[cfg(all(test, not(loom)))]
 mod tests {
     //! The bridge's contract on one thread at a time, its marks, and the bound's fail-stop. The
-    //! interleavings are the Loom models' (`loom_tests.rs`).
+    //! interleavings are the Loom models' (the `loom_tests` module below).
 
     use std::sync::mpsc;
 
@@ -943,6 +984,28 @@ mod tests {
         assert_eq!(bridge.foreign_drop(&stack), Released::Kept);
         assert!(!Lane(bridge.lane.load(RELAXED)).has(QUEUED), "the pusher cleared its own Q");
         assert_eq!(bridge.foreign_wake_by_ref(&stack), Pushed::Closed);
+    }
+
+    /// A drain dropped with a bridge it took and never settled is caught in debug builds: that
+    /// bridge keeps `Q` set, so it is never pushed again and its wakes are lost.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a drain settles every bridge it took")]
+    fn a_drain_dropped_with_a_bridge_unsettled_is_caught() {
+        let stack = RemoteStack::new();
+        let bridge = bridge_with_count(&stack, 0);
+        assert_eq!(bridge.foreign_wake_by_ref(&stack), Pushed::Now);
+        drop(stack.take());
+    }
+
+    /// A release with no count left is caught in debug builds: it would wrap the count.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a release follows its own count")]
+    fn a_release_past_zero_is_caught() {
+        let stack = RemoteStack::new();
+        assert_eq!(stack.release(), Freed::Stack, "the executor's own count");
+        let _ = stack.release();
     }
 
     /// A foreign clone at `LANE_COUNT_MAX`, or a `close` folding 1 into a count there, aborts

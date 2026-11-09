@@ -172,6 +172,17 @@ Before calling a small loss or gain:
    Each variant's own code still sits at its own addresses, so its placement
    still differs; pair the timing with step 1's instruction count.
 
+A copy of the old code is other code. Placement does not move an
+instruction count, but the old implementation copied into the benchmark
+crate, or compiled in another crate or beside other code, compiles to
+other instructions: at one source such a copy has counted tens of
+instructions per operation more or fewer than the old build itself. So
+step 1 reads the old count from the old build: two builds of one benchmark
+source, one on each revision, each in its own clean checkout, with the
+benchmark's files and every input its copy compiles from checked identical
+before either builds. A copy in the new build serves step 2's timing only,
+and its offset from the old build at the same source is reported beside it.
+
 Record which of these the conclusion rests on. A cross-binary timing result
 is context, not the verdict.
 

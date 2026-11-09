@@ -44,7 +44,8 @@ fn cell(
         LoopConfig {
             spin_iters: 4,
             exec_budget: 1024,
-            park_default: Some(std::time::Duration::from_millis(1)),
+            park_default: inf_runtime::ParkCeiling::new(std::time::Duration::from_millis(1))
+                .expect("a park ceiling within the maximum"),
             remote_first_execute: false,
         },
         serve_mark,
@@ -234,7 +235,8 @@ fn four_frames_in_flight_pipeline_rotates_drained_and_replays_identically() {
         LoopConfig {
             spin_iters: 4,
             exec_budget: 1024,
-            park_default: Some(std::time::Duration::from_millis(1)),
+            park_default: inf_runtime::ParkCeiling::new(std::time::Duration::from_millis(1))
+                .expect("a park ceiling within the maximum"),
             remote_first_execute: false,
         },
         serve_mark,

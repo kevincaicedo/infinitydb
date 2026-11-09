@@ -40,8 +40,8 @@ const _: () =
 /// would pass it aborts the process before the count is written (`std::process::abort`, as `Rc`
 /// and `Arc` do at theirs). Memory bounds no count here (`mem::forget` of a waker is safe and
 /// holds none), and a header's reuse resets neither, so only code that forgets 2⁶⁰ clones, or
-/// moves 2⁶⁰ net clones between the lanes over one header's life, reaches it: INF 36 years of one
-/// core at 10⁹ a second.
+/// moves 2⁶⁰ net clones between the lanes over one header's life, reaches it: about 36 years of one
+/// core at 10⁹ a second (arithmetic, not a measurement).
 pub const LANE_COUNT_MAX: i64 = (1 << 60) - 1;
 
 /// Distinct cap names one cell's census holds (ADR-0163 D2): the rows of

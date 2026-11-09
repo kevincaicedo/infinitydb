@@ -2,20 +2,19 @@
     clippy::disallowed_types,
     reason = "benchmark: leg A's executor copy keeps its std ready queue, outside cell code"
 )]
-//! The waker's A/B by instructions (L4, ADR-0003 A1.5): four waker paths of the cell executor,
-//! each on three legs, from one binary.
+//! The waker's A/B by instructions (L4, ADR-0003 A1.5, ADR-0205): four waker paths of the cell
+//! executor, each on three legs, from one binary.
 //!
-//! - A: the executor with an `Rc` waker, a bench-only copy in `waker_ab/executor_a.rs`, so every
-//!   A leg measures the same code whatever the engine's executor becomes.
+//! - A: the executor with an `Rc` waker, a bench-only copy in `waker_ab/executor_a.rs`. Compiled
+//!   in this crate beside the steps that call it, the copy is other code than the product's own
+//!   build of the same source, so A is a control, never a base: B − A is reported, never judged.
 //! - B: the product, `inf_runtime::CellExecutor`.
-//! - P: B's operation with each waker operation in it also handed to the leg's foreign half,
-//!   [`ForeignLane`], one call per waker operation and one drain per op. P is the instrument's
-//!   planted red: it carries the read-modify-writes of a waker whose every operation is atomic
-//!   only while its foreign half drives a wake bridge's foreign entries. This binary's foreign
-//!   half counts its calls and nothing else, so P reads B and a few instructions of its counter,
-//!   and its liveness bound below reads `VACUOUS`.
+//! - P: B's operation with each waker operation in it also driven through a wake bridge of its
+//!   own, [`ForeignLane`], by `inf_foundation::wake`'s foreign entries, and drained once per op:
+//!   P carries the read-modify-writes of a waker whose every operation takes the foreign lane.
 //!
-//! The rows, one op each (`--variant <leg>-<row>`), with B − A's budget in instructions per op:
+//! The rows, one op each (`--variant <leg>-<row>`), with the budget of the product's change in
+//! instructions per op:
 //!
 //! - `fast` (≤ 3): `poll_immediate` of a future Ready on its first poll, which runs in the
 //!   reused scratch block and makes no task.
@@ -29,25 +28,34 @@
 //! Each op is one `#[inline(never)]` step through `&mut` of a long-lived owner, as the cell's
 //! loop drives its executor.
 //!
-//! The instrument: exact user-space instructions per op, `(I(n) − I(0)) / n` at `n` = 10⁷, read
-//! outside this binary (`perf stat -e instructions:u,cycles:u`) on one pinned performance core,
-//! the legs of a row in the order A B P B A, twice. A run counts only when its controls hold:
+//! The instrument: exact user-space instructions, cycles and locked loads per op,
+//! `(I(n) − I(0)) / n` at `n` = 10⁷, read outside this binary by `perf stat` on one pinned
+//! performance core, the legs of a row in the order A B P B A, twice. A row's verdict is B less
+//! the B of a second build of this same source on the product before the change: two builds,
+//! each in its own clean checkout, whose bench files and every input leg A compiles from are
+//! checked identical before either builds. A run counts only when its controls hold:
 //!
-//! - the same binary against itself: A's two legs agree within 0.05 per op, at a resolution of
-//!   0.01; the spread of cycles is recorded beside it;
-//! - liveness: P − A ≥ 30 per op on the `suspend` row (the foreign half's counter adds, swaps,
-//!   push and drain), else the run is `VACUOUS`;
+//! - the same binary against itself: A's two legs, and B's, agree within 0.05 per op, at a
+//!   resolution of 0.01; across the two builds A agrees within 0.05 too, a control that can
+//!   show that the builds differ, never that they are the same;
+//! - B runs no locked instruction on any row; one that does is attributed by precise samples
+//!   before any number is read;
+//! - liveness: each P leg reads its bridge's own count of foreign operations and its delivered
+//!   bridges, 2, 2 and 1 foreign operations and one delivery per op on `clone-drop`, `suspend`
+//!   and `wake-run`, and exits 1 on a mismatch; the PMU counts the locked instructions those
+//!   calls run. The planted leg `p-skip-suspend` runs P's checks over a half that calls
+//!   nothing, and must exit 1 with no locked load above B's;
 //! - engagement: after its loop each leg checks what its ops left behind (the tasks still live,
-//!   the polls, the value the gate delivered last, the foreign half's calls), and exits 1 if
-//!   one is not as the row's ops imply.
+//!   the polls, the value the gate delivered last), and exits 1 if one is not as the row's ops
+//!   imply. The expected foreign counts are keyed on the leg, never on its half's type.
 //!
 //! One leg, then one leg counted: `perf` wraps the binary that `--no-run` prints, never `cargo`,
 //! whose own instructions would join the count; on a hybrid CPU `<core>` is a performance core
 //! and the `cpu_core` lines count.
 //!
-//!   cargo bench -p inf-runtime --bench waker_ab --no-run
-//!   taskset -c <core> perf stat -e instructions:u,cycles:u -x, -- <binary> \
-//!       --variant <leg>-<row> --ops <n>
+//!   cargo bench -p inf-runtime --bench waker_ab --no-run --locked
+//!   taskset -c <core> perf stat -e instructions:u,cycles:u,mem_inst_retired.lock_loads:u \
+//!       -x, -- <binary> --variant <leg>-<row> --ops <n>
 
 #[allow(dead_code, reason = "leg A is the whole executor; the rows drive four of its paths")]
 #[path = "waker_ab/executor_a.rs"]
@@ -61,6 +69,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use inf_foundation::wake::{RemoteStack, ThreadMark, WakeBridge};
 use inf_runtime::FabricGate;
 
 /// Tasks each leg's executor reserves room for: the rows keep at most one.
@@ -123,23 +132,22 @@ impl Executor for inf_runtime::CellExecutor {
 
 /// A leg's foreign half: one call per waker operation of B's op, and one per drain.
 trait Foreign {
-    /// What each call adds to `calls`: 0 for a half that makes no call, 1 for one that counts.
-    const COUNTED: u64;
     fn new() -> Self;
     fn on_clone(&mut self);
     fn on_wake_by_ref(&mut self);
     fn on_wake(&mut self);
     fn on_drop(&mut self);
     fn on_drain(&mut self);
-    /// Calls made, the engagement check's count.
-    fn calls(&self) -> u64;
+    /// The bridge's own count of foreign operations (`waker_foreign_ops`).
+    fn foreign_ops(&self) -> u64;
+    /// Bridges the drains delivered.
+    fn delivered(&self) -> u64;
 }
 
 /// A's and B's foreign half: nothing, compiled away.
 struct NoForeign;
 
 impl Foreign for NoForeign {
-    const COUNTED: u64 = 0;
     fn new() -> Self {
         NoForeign
     }
@@ -153,51 +161,89 @@ impl Foreign for NoForeign {
     fn on_drop(&mut self) {}
     #[inline(always)]
     fn on_drain(&mut self) {}
-    fn calls(&self) -> u64 {
+    fn foreign_ops(&self) -> u64 {
+        0
+    }
+    fn delivered(&self) -> u64 {
         0
     }
 }
 
-/// P's foreign half. Here it counts its calls, the engagement check's count, and drives no wake
-/// bridge, so P's liveness bound reads `VACUOUS` (the module docs).
-struct ForeignLane {
-    calls: u64,
+/// The liveness clause's planted red: run under P's expected counts, a half that calls
+/// nothing must fail the leg's checks and run no locked instruction.
+struct SkippedLane;
+
+impl Foreign for SkippedLane {
+    fn new() -> Self {
+        SkippedLane
+    }
+    #[inline(always)]
+    fn on_clone(&mut self) {}
+    #[inline(always)]
+    fn on_wake_by_ref(&mut self) {}
+    #[inline(always)]
+    fn on_wake(&mut self) {}
+    #[inline(always)]
+    fn on_drop(&mut self) {}
+    #[inline(always)]
+    fn on_drain(&mut self) {}
+    fn foreign_ops(&self) -> u64 {
+        0
+    }
+    fn delivered(&self) -> u64 {
+        0
+    }
 }
 
-impl ForeignLane {
-    #[inline(always)]
-    fn count(&mut self) {
-        self.calls = black_box(self.calls) + 1;
-    }
+/// P's foreign half: a wake bridge on a remote stack of its own, both allocated before the leg's
+/// loop, driven through the foreign entries, one call per waker operation of B's op, and drained
+/// once per op. Its liveness is the stack's own count of foreign operations and the bridges its
+/// drains delivered, checked against the leg's counts after the loop, and the locked
+/// instructions those calls run, which the PMU counts.
+struct ForeignLane {
+    stack: Box<RemoteStack>,
+    bridge: Box<WakeBridge>,
+    delivered: u64,
 }
 
 impl Foreign for ForeignLane {
-    const COUNTED: u64 = 1;
     fn new() -> Self {
-        ForeignLane { calls: 0 }
+        let stack = Box::new(RemoteStack::new());
+        let bridge = Box::new(WakeBridge::new(&stack, ThreadMark::claim()));
+        ForeignLane { stack, bridge, delivered: 0 }
     }
     #[inline(always)]
     fn on_clone(&mut self) {
-        self.count();
+        self.bridge.foreign_clone(&self.stack);
     }
     #[inline(always)]
     fn on_wake_by_ref(&mut self) {
-        self.count();
+        black_box(self.bridge.foreign_wake_by_ref(&self.stack));
     }
     #[inline(always)]
     fn on_wake(&mut self) {
-        self.count();
+        let _ = black_box(self.bridge.foreign_wake(&self.stack));
     }
     #[inline(always)]
     fn on_drop(&mut self) {
-        self.count();
+        let _ = black_box(self.bridge.foreign_drop(&self.stack));
     }
     #[inline(always)]
     fn on_drain(&mut self) {
-        self.count();
+        if self.stack.pending() {
+            let bridge = &*self.bridge;
+            let mut drained = self.stack.take();
+            while let Some((_, delivery)) = drained.deliver_next(|_| bridge) {
+                black_box(delivery);
+                self.delivered += 1;
+            }
+        }
     }
-    fn calls(&self) -> u64 {
-        self.calls
+    fn foreign_ops(&self) -> u64 {
+        self.stack.foreign_ops()
+    }
+    fn delivered(&self) -> u64 {
+        self.delivered
     }
 }
 
@@ -324,7 +370,7 @@ fn drive_fast<E: Executor>(ops: u64) -> Result<(), String> {
     expect("fast live tasks", usize_count(cell.exec.live_tasks()), 0)
 }
 
-fn drive_clone_drop<E: Executor, L: Foreign>(ops: u64) -> Result<(), String> {
+fn drive_clone_drop<E: Executor, L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
     let mut cell = ParkedCell::<E>::new()?;
     let mut lane = L::new();
     for _ in 0..ops {
@@ -332,10 +378,11 @@ fn drive_clone_drop<E: Executor, L: Foreign>(ops: u64) -> Result<(), String> {
     }
     expect("clone-drop live tasks", usize_count(cell.exec.live_tasks()), 1)?;
     expect("clone-drop polls", cell.polls.get(), 1)?;
-    expect("clone-drop foreign calls", lane.calls(), ops * 3 * L::COUNTED)
+    expect("clone-drop foreign ops", lane.foreign_ops(), ops * 2 * per_op)?;
+    expect("clone-drop delivered", lane.delivered(), ops * per_op)
 }
 
-fn drive_suspend<E: Executor, L: Foreign>(ops: u64) -> Result<(), String> {
+fn drive_suspend<E: Executor, L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
     let mut cell = SuspendCell {
         exec: E::with_capacity(TASKS),
         gate: FabricGate::new(),
@@ -351,10 +398,11 @@ fn drive_suspend<E: Executor, L: Foreign>(ops: u64) -> Result<(), String> {
     expect("suspend value delivered last", cell.sink.get(), ops)?;
     expect("suspend live tasks", usize_count(cell.exec.live_tasks()), 0)?;
     expect("suspend gate entries", usize_count(cell.gate.pending()), 0)?;
-    expect("suspend foreign calls", lane.calls(), ops * 3 * L::COUNTED)
+    expect("suspend foreign ops", lane.foreign_ops(), ops * 2 * per_op)?;
+    expect("suspend delivered", lane.delivered(), ops * per_op)
 }
 
-fn drive_wake_run<E: Executor, L: Foreign>(ops: u64) -> Result<(), String> {
+fn drive_wake_run<E: Executor, L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
     let mut cell = ParkedCell::<E>::new()?;
     let mut lane = L::new();
     let mut polled = 0u64;
@@ -364,7 +412,8 @@ fn drive_wake_run<E: Executor, L: Foreign>(ops: u64) -> Result<(), String> {
     expect("wake-run polls in run_ready", polled, ops)?;
     expect("wake-run polls", cell.polls.get(), ops + 1)?;
     expect("wake-run live tasks", usize_count(cell.exec.live_tasks()), 1)?;
-    expect("wake-run foreign calls", lane.calls(), ops * 2 * L::COUNTED)
+    expect("wake-run foreign ops", lane.foreign_ops(), ops * per_op)?;
+    expect("wake-run delivered", lane.delivered(), ops * per_op)
 }
 
 #[derive(Clone, Copy)]
@@ -372,6 +421,8 @@ enum Leg {
     A,
     B,
     P,
+    /// P's checks over [`SkippedLane`]: the liveness clause's planted red.
+    PSkip,
 }
 
 #[derive(Clone, Copy)]
@@ -383,7 +434,7 @@ enum Row {
 }
 
 /// The one table of variant names: `--variant` is parsed against it.
-const VARIANTS: [(&str, Leg, Row); 12] = [
+const VARIANTS: [(&str, Leg, Row); 13] = [
     ("a-fast", Leg::A, Row::Fast),
     ("b-fast", Leg::B, Row::Fast),
     ("p-fast", Leg::P, Row::Fast),
@@ -396,14 +447,17 @@ const VARIANTS: [(&str, Leg, Row); 12] = [
     ("a-wake-run", Leg::A, Row::WakeRun),
     ("b-wake-run", Leg::B, Row::WakeRun),
     ("p-wake-run", Leg::P, Row::WakeRun),
+    ("p-skip-suspend", Leg::PSkip, Row::Suspend),
 ];
 
-fn run_row<E: Executor, L: Foreign>(row: Row, ops: u64) -> Result<(), String> {
+/// `per_op` is the leg's: each foreign operation and delivery a P leg's row implies per op, 1
+/// for P and its planted leg, 0 for A and B.
+fn run_row<E: Executor, L: Foreign>(row: Row, ops: u64, per_op: u64) -> Result<(), String> {
     match row {
         Row::Fast => drive_fast::<E>(ops),
-        Row::CloneDrop => drive_clone_drop::<E, L>(ops),
-        Row::Suspend => drive_suspend::<E, L>(ops),
-        Row::WakeRun => drive_wake_run::<E, L>(ops),
+        Row::CloneDrop => drive_clone_drop::<E, L>(ops, per_op),
+        Row::Suspend => drive_suspend::<E, L>(ops, per_op),
+        Row::WakeRun => drive_wake_run::<E, L>(ops, per_op),
     }
 }
 
@@ -434,9 +488,10 @@ fn parse() -> Result<(Leg, Row, u64), String> {
 
 fn main() -> ExitCode {
     let outcome = parse().and_then(|(leg, row, ops)| match leg {
-        Leg::A => run_row::<executor_a::CellExecutor, NoForeign>(row, ops),
-        Leg::B => run_row::<inf_runtime::CellExecutor, NoForeign>(row, ops),
-        Leg::P => run_row::<inf_runtime::CellExecutor, ForeignLane>(row, ops),
+        Leg::A => run_row::<executor_a::CellExecutor, NoForeign>(row, ops, 0),
+        Leg::B => run_row::<inf_runtime::CellExecutor, NoForeign>(row, ops, 0),
+        Leg::P => run_row::<inf_runtime::CellExecutor, ForeignLane>(row, ops, 1),
+        Leg::PSkip => run_row::<inf_runtime::CellExecutor, SkippedLane>(row, ops, 1),
     });
     match outcome {
         Ok(()) => ExitCode::SUCCESS,

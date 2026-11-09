@@ -17,8 +17,7 @@ crates/inf-runtime/src/cold.rs	fn ColdState::unpin	1	C	2027-01-31
 crates/inf-runtime/src/cold.rs	struct ColdState	4	C	2027-01-31
 crates/inf-runtime/src/cold.rs	use std::collections::{…}	2	C	2027-01-31
 crates/inf-runtime/src/executor.rs	fn CellExecutor::new	1	E	2026-12-31
-crates/inf-runtime/src/executor.rs	struct CellExecutor	1	E	2026-12-31
-crates/inf-runtime/src/executor.rs	struct TaskHeader	1	E	2026-12-31
+crates/inf-runtime/src/executor.rs	struct ExecShared	1	E	2026-12-31
 crates/inf-runtime/src/executor.rs	use std::collections::VecDeque	1	E	2026-12-31
 crates/inf-runtime/src/gate.rs	fn KeyedGate::new	1	E	2026-12-31
 crates/inf-runtime/src/gate.rs	fn WaitList::new	1	E	2026-12-31

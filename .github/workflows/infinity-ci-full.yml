@@ -119,6 +119,12 @@ jobs:
         run: cargo +nightly miri test -p inf-alloc -p inf-fabric
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
+      # The cell executor's waker is sound on any thread (ADR-0003 A1): its executor, cross-thread
+      # and drop tests, each with the leak check on.
+      - name: miri (inf-runtime's executor and waker tests) strict provenance
+        run: cargo +nightly miri test -p inf-runtime --test executor --test waker_threads --test waker_close
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
 
   fuzz-targets:
     # The fuzz smoke's matrix: every target the fuzz manifests list, with its
