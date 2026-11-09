@@ -238,7 +238,35 @@ pub static JSON_CASES: &[JsonCase] = &[
     // The parsed-value bound: a 128-level value and a 128-level element.
     c("depth-set-128-value", &["JSON.SET", "deep128", "$", ARRAYS_128], false, "A1"),
     c("depth-arrappend-128-element", &["JSON.ARRAPPEND", "deep", "$.a", ARRAYS_128], false, "A1"),
+    // One account for the whole reply (ADR-0173 D1): one 16,000,000-byte
+    // string document, read 8 times (128,000,140 B, under the 128 MiB
+    // default) and 9 times (144,000,157 B, over it).
+    JsonCase {
+        generated: Some(GeneratedArg { index: 3, text: big_string_document }),
+        ..c("mget-big-document", &["JSON.SET", "big", "$", BIG_DOCUMENT], false, "ADR-0173")
+    },
+    c(
+        "mget-at-reply-budget",
+        &["JSON.MGET", "big", "big", "big", "big", "big", "big", "big", "big", "$"],
+        true,
+        "ADR-0173",
+    ),
+    c(
+        "mget-over-reply-budget",
+        &["JSON.MGET", "big", "big", "big", "big", "big", "big", "big", "big", "big", "$"],
+        false,
+        "ADR-0173",
+    ),
 ];
+
+/// The placeholder `mget-big-document` writes for its generated document.
+const BIG_DOCUMENT: &str = "<a JSON string of 16,000,000 x>";
+
+/// A JSON string of 16,000,000 `x`: 16,000,002 bytes of JSON text, under the
+/// 16 MiB document cap; its `$` element is a 16,000,004-byte bulk.
+fn big_string_document() -> String {
+    format!("\"{}\"", "x".repeat(16_000_000))
+}
 
 pub struct Deviation {
     pub case_id: &'static str,
@@ -262,6 +290,22 @@ const fn d(
 /// The only accepted RedisJSON byte deviations. Entries are populated from
 /// observed, understood differences; the runtime test rejects stale entries.
 pub static DEVIATIONS: &[Deviation] = &[
+    d(
+        "mget-over-reply-budget",
+        Protocol::Resp2,
+        "JSON.MGET",
+        "the whole reply shares one doc-max-reply-bytes budget (128 MiB by default): InfinityDB \
+         answers ERR reply too large and serves no element; RedisJSON has no reply budget and \
+         answers the array",
+    ),
+    d(
+        "mget-over-reply-budget",
+        Protocol::Resp3,
+        "JSON.MGET",
+        "the whole reply shares one doc-max-reply-bytes budget (128 MiB by default): InfinityDB \
+         answers ERR reply too large and serves no element; RedisJSON has no reply budget and \
+         answers the array",
+    ),
     d(
         "s15-debug-missing",
         Protocol::Resp2,
