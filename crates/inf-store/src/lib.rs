@@ -51,7 +51,9 @@ pub use catalog::{CatalogError, IndexCatalog, NsCatalog};
 pub use demote::{DemoteStats, DemotionConfig, EvictionPressure, MUTABLE_PERMILLE_DEFAULT};
 pub use doc::DocDomain;
 #[cfg(feature = "doc")]
-pub use doc::{JsonLogDecision, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSetOutcome};
+pub use doc::{
+    JsonLogDecision, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSetOutcome, ReplyLimit,
+};
 pub use evict::{EvictStats, EvictionPolicy};
 pub use extents::{
     BLOB_MAX_BYTES_DEFAULT, BLOB_RECLAIM_PER_SLICE_DEFAULT, BLOB_THRESHOLD_DEFAULT, BlobConfig,
