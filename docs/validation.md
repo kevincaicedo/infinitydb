@@ -62,7 +62,11 @@ Each invocation must pass one non-ignored test and emit its point/verdict
 receipt after the assertions. Missing, ignored or empty carriers and
 invented verdicts fail. Cargo resolves current test binaries offline;
 receipts live only in captured child output. Linux reactor rows are
-explicitly unsupported on other hosts and must pass on Linux CI.
+explicitly unsupported on other hosts and must pass on Linux CI. A
+carrier still running at `crash_matrix::NODE_CARRIER_LIMIT_SECONDS` is
+killed, and one that passes past its budget, half that limit, fails with
+its time; each carrier's time prints beside its verdict, and every carrier
+runs before the verdict, so a red one hides no later row.
 
 Run the smallest relevant check while developing, then the required suite:
 

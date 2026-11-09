@@ -69,6 +69,17 @@ pub fn seed_count(default: u64) -> u64 {
     seeds
 }
 
+/// The node-rows runner (`run_node_rows.py`, given it by
+/// `node_rows_execute_and_prove_their_verdicts`) kills a carrier still
+/// running after this many seconds and reads its rows red.
+pub const NODE_CARRIER_LIMIT_SECONDS: u64 = 180;
+
+/// A carrier that passes but ran longer than this reads red too, with its
+/// time. Half the limit: a carrier whose cost grows (more seeds, a slower
+/// core) is named by its budget while the kill is still a core twice as
+/// slow away, and the runner's line per carrier shows the margin left.
+pub const NODE_CARRIER_BUDGET_SECONDS: u64 = NODE_CARRIER_LIMIT_SECONDS / 2;
+
 // ---------------------------------------------------------------------
 // Matrix definition (m2.toml): hand-rolled reader for exactly this
 // schema (`[[row]]` tables of scalars + string lists — the house
