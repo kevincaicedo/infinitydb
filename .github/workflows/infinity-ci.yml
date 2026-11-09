@@ -279,6 +279,11 @@ jobs:
         env:
           RUSTFLAGS: --cfg loom
           LOOM_MAX_PREEMPTIONS: "3"
+      - name: loom models (checkpoint issuance, grants, the wake bridge)
+        run: cargo test -p inf-foundation --release loom_ -- --nocapture
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: "3"
 
   sim-smoke:
     runs-on: ubuntu-24.04
