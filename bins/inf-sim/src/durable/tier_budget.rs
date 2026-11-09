@@ -172,6 +172,14 @@ impl TierBudgetLeg {
         matches!(self, TierBudgetLeg::EightAt1mb)
     }
 
+    /// The thief leg: its oracles read the planted turn's regime, the
+    /// turn's shape from the driver (its drivers alone tally each entry's
+    /// tier writes by namespace directory) and the first namespace's
+    /// backlog.
+    pub fn is_thief(self) -> bool {
+        matches!(self, TierBudgetLeg::TwoAt1mbThief)
+    }
+
     /// The control leg: one namespace, so the turn never contends and
     /// the plan never passes one over.
     pub fn is_control(self) -> bool {

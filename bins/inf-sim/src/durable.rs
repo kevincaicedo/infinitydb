@@ -2106,6 +2106,11 @@ pub(crate) fn boot(
         // The clock rides into the driver for the stall device (M2.5-S14);
         // with no stall model armed this is exactly `with_disk`.
         let driver = SimDriver::with_disk_stall(Rc::clone(&net), disk.clone(), Rc::clone(clock));
+        let driver = if scenario.tier_budget.is_some_and(|shape| shape.leg.is_thief()) {
+            driver.tallying_tier_dirs()
+        } else {
+            driver
+        };
         let pool = BufferPool::new(128, 1024);
         let node_info = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
