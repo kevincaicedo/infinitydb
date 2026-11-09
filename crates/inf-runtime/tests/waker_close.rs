@@ -2,12 +2,12 @@
     clippy::disallowed_types,
     reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
 )]
-//! What an executor's drop leaves behind (ADR-0003 A1.3): it frees every future, the scratch
-//! block and its shared state inside the drop, and closes each header a waker still names. A
-//! closed header is freed by its last waker's drop, on whichever thread drops it, and the remote
-//! stack with the last closed header it counts: nothing is kept for the process, however many
-//! executors it creates and drops. The counting allocator reads each byte back, per thread; Miri
-//! runs these too, its leak check on.
+//! What an executor's drop leaves behind (ADR-0003 A1.3): it frees every future, its spare
+//! header, the scratch block and its shared state inside the drop, and closes each header a waker
+//! still names. A closed header is freed by its last waker's drop, on whichever thread drops it,
+//! and the remote stack with the last closed header it counts: nothing is kept for the process,
+//! however many executors it creates and drops. The counting allocator reads each byte back, per
+//! thread; Miri runs these too, its leak check on.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -163,18 +163,23 @@ fn held_past_drop(
     built + dropped
 }
 
-/// One executor's life with no waker left past its drop: the bytes it kept.
+/// One executor's life with no waker left past its drop: the bytes it kept. After the parked
+/// task, a first poll that completes leaves the executor a spare header, which its drop frees
+/// open: the spare is in the window too.
 fn none_left(out: &Rc<Cell<Option<Waker>>>) -> i128 {
     kept_across(|| {
         let mut executor = CellExecutor::new(1);
         drop(park(&mut executor, out));
+        let outcome = executor.poll_immediate(async {});
+        assert_eq!(outcome, PollImmediate::Completed, "a first poll that completes keeps a spare");
         drop(executor);
     })
 }
 
 /// Executors created and dropped in one process keep nothing: each dropped under a waker another
-/// thread holds and then drops, and again with no waker left. Allocated less freed, summed over
-/// both threads across each executor's build and drop and each held waker's drop, is 0.
+/// thread holds and then drops, and again with no waker left and a spare header. Allocated less
+/// freed, summed over both threads across each executor's build and drop and each held waker's
+/// drop, is 0.
 #[test]
 fn executors_created_and_dropped_keep_nothing() {
     let (to, from) = mpsc::sync_channel::<Hold>(0);
