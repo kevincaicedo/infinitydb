@@ -581,8 +581,9 @@ pub(super) mod test_support {
 
 /// The leg decoder's accept and refuse rows: each protocol reads its own
 /// null and refuses the other's, and a count other than the leg's keys,
-/// trailing bytes, a negative length other than the null's and a frame
-/// header past its bound are each a malformed leg.
+/// trailing bytes, a negative length other than the null's, a frame header
+/// past its bound, a length past the integer and an element that is not a
+/// bulk are each a malformed leg.
 #[cfg(test)]
 mod leg_decoder_rows {
     use super::*;
@@ -618,6 +619,28 @@ mod leg_decoder_rows {
             assert_eq!(decode(two, proto, 1), None, "a count above the leg's keys");
             assert_eq!(decode(two, proto, 3), None, "a count below the leg's keys");
             assert_eq!(decode(b"*2\r\n$1\r\na\r\n", proto, 2), None, "fewer frames than its count");
+            // Frames that tile the leg's two keys exactly, under a header whose count lies: the
+            // count's own check is the one rule that refuses these.
+            assert_eq!(decode(b"*3\r\n$1\r\na\r\n$1\r\nb\r\n", proto, 2), None, "a count of 3");
+            assert_eq!(decode(b"*1\r\n$1\r\na\r\n$1\r\nb\r\n", proto, 2), None, "a count of 1");
+        }
+    }
+
+    /// A length past the integer and an element that is not a bulk are each malformed: a count's
+    /// and a bulk's 2^64, and an integer frame where a bulk or the null stands.
+    #[test]
+    fn a_length_past_the_integer_or_a_non_bulk_element_is_malformed() {
+        let rows: [(&[u8], usize); 4] = [
+            (b"*18446744073709551616\r\n$1\r\na\r\n", 1),
+            (b"*1\r\n$18446744073709551616\r\na\r\n", 1),
+            (b"*1\r\n:1\r\n", 1),
+            (b"*2\r\n$1\r\na\r\n:1\r\n", 2),
+        ];
+        for proto in PROTOCOLS {
+            for (raw, keys) in rows {
+                let shown = String::from_utf8_lossy(raw);
+                assert_eq!(decode(raw, proto, keys), None, "{proto:?} {shown:?}");
+            }
         }
     }
 
