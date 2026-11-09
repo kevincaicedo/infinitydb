@@ -862,6 +862,14 @@ fn main() {
         "m0-fabric-fairness" => Scenario::m0_fabric_fairness(seed),
         "m0-admission" => Scenario::m0_admission(seed),
         "m1-cache" => Scenario::m1_cache(seed),
+        // The row's leg is defaulted, so the leg check always names one.
+        "m1-pub-cross" => match leg.and_then(LegValue::pub_target) {
+            Some(target) => Scenario::m1_pub_cross(seed, target),
+            None => {
+                eprintln!("inf-sim: m1-pub-cross runs on a --pub-target leg");
+                std::process::exit(2);
+            }
+        },
         other => {
             eprintln!("inf-sim: unknown scenario {other} (have: {})", scenario_names().join(", "));
             std::process::exit(2);
