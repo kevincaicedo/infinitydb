@@ -1323,6 +1323,39 @@ mod tests {
         assert!(offset_of!(Map, branches) + 8 + 16 <= 64);
     }
 
+    /// A leaf slot's tag lives in a spare value of its entry when the entry
+    /// has one, so the slot is the entry: a 72 B entry of a 16 B key and a
+    /// 56 B chain whose length is a four-value enum fills a 72 B slot, and
+    /// the same chain with a byte length, whose 256 values are all taken,
+    /// takes an 8 B tag beside it. A branch slot is 20 B. These strides are
+    /// what a map's backing bytes are made of (ADR-0151 D5).
+    #[test]
+    fn a_leaf_slot_keeps_its_tag_in_a_spare_value_of_its_entry() {
+        #[allow(dead_code, reason = "a layout: the variants are never built")]
+        enum Length {
+            Zero,
+            One,
+            Two,
+            Three,
+        }
+        #[allow(dead_code, reason = "a layout: the fields are never read")]
+        struct EnumChain {
+            length: Length,
+            pairs: [(u64, u64); 3],
+        }
+        #[allow(dead_code, reason = "a layout: the fields are never read")]
+        struct ByteChain {
+            length: u8,
+            pairs: [(u64, u64); 3],
+        }
+        type Key = (u64, u64);
+        assert_eq!(size_of::<EnumChain>(), 56, "a chain's stride");
+        assert_eq!(size_of::<Leaf<Key, EnumChain>>(), 72);
+        assert_eq!(size_of::<Slot<Leaf<Key, EnumChain>, ()>>(), 72, "the tag in a spare length");
+        assert_eq!(size_of::<Slot<Leaf<Key, ByteChain>, ()>>(), 80, "the tag beside a byte length");
+        assert_eq!(size_of::<Slot<Branch, ()>>(), 20);
+    }
+
     // The unsliced drops: a live map (two stores), a builder at its `More`
     // (its leaf store alone holds an item) and a retiring prefix, each
     // dropped holding backing while the cell serves, are counted and
