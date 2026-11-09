@@ -857,6 +857,32 @@ fn reply_outcome_json_mget_success_element_is_stripped() {
     assert!(!reply.is_error());
 }
 
+/// A split `JSON.MGET` on a tiered namespace answers what its one-owner form does, the tiered
+/// arm's refusal, and reading the reply's account makes no `CellStore` for the namespace on the
+/// accepting cell: a tiered namespace's records live in its tiered table, and a store beside it
+/// would be state the keyspace's walks (`used_bytes`, eviction, the state digest) carry for
+/// nothing until the namespace drops.
+#[cfg(feature = "doc")]
+#[test]
+fn json_mget_split_on_a_tiered_namespace_makes_no_store() {
+    let cells = Cells::new();
+    tiered_namespace(&cells);
+    let (local, remote) = (cells.key_on(0), cells.key_on(1));
+    let one_owner = tiered_command(&cells, &[b"JSON.MGET", &local, b"$"]);
+    let split = tiered_command(&cells, &[b"JSON.MGET", &local, &remote, b"$"]);
+    assert!(one_owner.is_error(), "the tiered arm refuses JSON.MGET");
+    assert_eq!(
+        String::from_utf8_lossy(split.bytes()),
+        String::from_utf8_lossy(one_owner.bytes()),
+        "the split answers the one-owner refusal"
+    );
+    for (cell, plane) in cells.planes.iter().enumerate() {
+        let store = plane.shared.store.borrow();
+        assert!(store.is_tiered(TIERED), "cell {cell}: the namespace is tiered");
+        assert!(store.ns_store(TIERED).is_none(), "cell {cell}: a CellStore beside the table");
+    }
+}
+
 /// One answer a remote leg can give, by the settle table's rows.
 #[cfg(feature = "doc")]
 #[derive(Copy, Clone, Debug)]

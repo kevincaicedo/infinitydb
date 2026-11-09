@@ -169,18 +169,20 @@ async fn local_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 impl Open {
     /// The account read once from the addressed store, the reply opened with
     /// its header, the FIFO built: a FIFO that cannot be built answers the
-    /// cross-cell failure line, with no leg run or sent.
+    /// cross-cell failure line, with no leg run or sent. A namespace's
+    /// account is read without making its store: a tiered namespace keeps
+    /// none.
     fn new<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         shared: &Shared<O, F>,
         target: GatherTarget,
         plan: GatherPlan,
     ) -> Result<Open, OwnedReply> {
-        let limit = {
-            let mut store = shared.store.borrow_mut();
-            match target.scope {
-                ScatterScope::Db => Some(store.db_mut(usize::from(target.db)).doc_reply_limit()),
-                ScatterScope::Ns(ns) => store.ns_store_mut(ns).map(|s| s.doc_reply_limit()),
+        let limit = match target.scope {
+            ScatterScope::Db => {
+                let mut store = shared.store.borrow_mut();
+                Some(store.db_mut(usize::from(target.db)).doc_reply_limit())
             }
+            ScatterScope::Ns(ns) => shared.store.borrow().ns_doc_reply_limit(ns),
         };
         match limit {
             Some(limit) => Open::with_limit(shared, target.proto, plan, limit),

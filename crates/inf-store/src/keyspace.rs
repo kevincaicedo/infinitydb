@@ -42,6 +42,8 @@ use inf_foundation::LogicalAddr;
 use crate::address_space::{AddressSpaceConfig, TieringCounters};
 use crate::catalog::{IndexCatalog, NsCatalog};
 use crate::demote::{DemoteStats, DemotionConfig, EvictionPressure};
+#[cfg(feature = "doc")]
+use crate::doc::ReplyLimit;
 use crate::evict::{EvictStats, EvictionPolicy};
 use crate::index_backfill::{BackfillInfo, BackfillJob, BackfillTickStats};
 use crate::index_registry::{IndexError, IndexId, IndexRegistry, IndexSpec, IndexState};
@@ -1122,6 +1124,22 @@ impl Keyspace {
     /// Read-only view of named namespace `id` when materialized.
     pub fn ns_store(&self, id: NsId) -> Option<&CellStore> {
         self.named_stores.iter().find(|e| e.id == id).map(|e| e.store.as_ref())
+    }
+
+    /// The `JSON.*` reply account of named namespace `id` (ADR-0173 D1), read
+    /// without materializing a store: the store's own when it exists, else
+    /// the budget every store of this keyspace is built with. `None` when
+    /// `id` isn't registered (unknown or dropped). A tiered namespace's
+    /// records live in its table, so a cross-cell read of its account must
+    /// leave no `CellStore` beside it, as [`Self::ns_store_mut`] would.
+    #[cfg(feature = "doc")]
+    #[must_use]
+    pub fn ns_doc_reply_limit(&self, id: NsId) -> Option<ReplyLimit> {
+        self.named.get_by_id(id)?;
+        Some(match self.ns_store(id) {
+            Some(store) => store.doc_reply_limit(),
+            None => ReplyLimit::configured(&self.cfg),
+        })
     }
 
     /// The durability class of namespace `id`: `None` for memory (default
@@ -2206,6 +2224,34 @@ mod tests {
         assert_eq!(ks.ns_fsync_class(NsId(0)), None, "defaults are memory");
         ks.ns_drop_uncataloged(b"ledger").expect("drop");
         assert!(ks.ns_store_mut(NsId(16)).is_none(), "dropped ids resolve to no store");
+    }
+
+    /// A namespace's reply account is read without materializing its store:
+    /// a tiered namespace keeps none, a plain one gets none from the read,
+    /// a materialized store's account is its own, and an unregistered id has
+    /// none.
+    #[cfg(feature = "doc")]
+    #[test]
+    fn a_namespaces_reply_limit_is_read_without_making_its_store() {
+        let cfg = StoreConfig { doc_max_reply_bytes: 64, ..StoreConfig::default() };
+        let mut ks = Keyspace::new(cfg);
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(NsSpec {
+            fsync: Some(FsyncClass::Everysec),
+            tier: Some(crate::ns::TierSpec::for_budget(64 << 20)),
+            ..durable_spec(17, b"cold")
+        })
+        .expect("tiered create");
+        let configured = CellStore::new(cfg).doc_reply_limit();
+        assert!(configured.admits(64).is_ok(), "the configured budget");
+        assert!(configured.admits(65).is_err(), "the configured budget");
+        assert_eq!(ks.ns_doc_reply_limit(NsId(17)), Some(configured), "tiered");
+        assert!(ks.ns_store(NsId(17)).is_none(), "a tiered namespace keeps no store");
+        assert_eq!(ks.ns_doc_reply_limit(NsId(16)), Some(configured), "plain, unmaterialized");
+        assert!(ks.ns_store(NsId(16)).is_none(), "the read makes no store");
+        ks.ns_store_mut(NsId(16)).expect("registered");
+        assert_eq!(ks.ns_doc_reply_limit(NsId(16)), Some(configured), "the store's own");
+        assert_eq!(ks.ns_doc_reply_limit(NsId(99)), None, "an unregistered id");
     }
 
     #[test]

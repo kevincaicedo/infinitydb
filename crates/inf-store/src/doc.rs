@@ -1101,12 +1101,13 @@ impl CellStore {
     /// Namespace-resolved reply budget (ADR-0173 D1): one account for the
     /// whole RESP reply of a `JSON.*` command, `JSON.MGET` across cells
     /// included; a reply that would cross it answers the pinned
-    /// `ERR reply too large` in place of everything the command wrote. The
-    /// one constructor of a [`ReplyLimit`], so no number of the budget leaves
-    /// this crate.
+    /// `ERR reply too large` in place of everything the command wrote. With
+    /// [`crate::Keyspace::ns_doc_reply_limit`], which reads a namespace's
+    /// without making its store, the way to a [`ReplyLimit`]: both build it
+    /// from the store config, so no number of the budget leaves this crate.
     #[inline]
     pub fn doc_reply_limit(&self) -> ReplyLimit {
-        ReplyLimit { budget_bytes: self.cfg.doc_max_reply_bytes }
+        ReplyLimit::configured(&self.cfg)
     }
 
     /// The document memory domain (S19 wires this into reports/`INFO`).
@@ -1359,6 +1360,12 @@ pub struct ReplyLimit {
 
 #[cfg(feature = "doc")]
 impl ReplyLimit {
+    /// The budget `cfg` configures: the one place a `ReplyLimit` is built.
+    #[inline]
+    pub(crate) fn configured(cfg: &StoreConfig) -> ReplyLimit {
+        ReplyLimit { budget_bytes: cfg.doc_max_reply_bytes }
+    }
+
     /// Whether a reply of `reply_bytes`, counted from the command's own mark,
     /// fits the budget: the one predicate of the account. Its callers pass
     /// a predicted length (a frame about to be written) or a measured one
