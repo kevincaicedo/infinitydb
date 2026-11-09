@@ -60,6 +60,8 @@ mod audit;
 mod lastsave;
 mod ledger_wedge;
 #[cfg(test)]
+mod marks;
+#[cfg(test)]
 mod park;
 mod run;
 mod stop_tick;
@@ -2500,6 +2502,10 @@ impl Node {
                 continue;
             }
             let (cell_loop, plane) = &mut self.cells[idx];
+            // Every call the disk logs in this iteration names this cell and
+            // the step's injected time.
+            let cell = inf_foundation::CellId(idx as u16);
+            disk.mark(inf_log::fs::sim::DiskPhase::Cell(cell), clock.now());
             self.iter_stats[idx] = Some(cell_loop.run_iteration(plane).expect("sim iteration"));
             if let Some(err) = plane.take_boot_error() {
                 return Err(err);
