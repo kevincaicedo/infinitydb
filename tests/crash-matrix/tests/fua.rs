@@ -313,13 +313,15 @@ fn recover_in(
     mode: SegmentIoMode,
     context: &str,
 ) -> (SegmentRotor<SimDisk>, inf_server::RecoverStats) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace(FsyncClass::Always);
     let segment =
         SegmentConfig { segment_bytes: SEGMENT_BYTES, io_mode: mode, ..Default::default() };
     let cfg =
         inf_server::DurableConfig { geometry: rig_geometry(segment), ..config(SEGMENT_BYTES) };
     let (rotor, stats, _) =
-        open_cell_log(disk.clone(), &mut ks, CELL, &cfg, anchor(), now()).expect("recovers");
+        open_cell_log(disk.clone(), &mut ks, CELL, &cfg, anchor(), now(), &census)
+            .expect("recovers");
     let store = ks.ns_store_mut(NS).expect("ns");
     for (key, (value, acked)) in model {
         let got = store.get(key, now()).map(<[u8]>::to_vec);

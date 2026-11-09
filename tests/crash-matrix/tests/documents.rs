@@ -166,9 +166,10 @@ impl<F: SegmentFs + Clone> LogBuilder<F> {
 }
 
 fn recover<F: SegmentFs + Clone + 'static>(fs: F, cfg: &DurableConfig) -> (Keyspace, RecoverStats) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = keyspace();
     let (_rotor, stats, _manifest) =
-        open_cell_log(fs, &mut ks, CELL, cfg, ANCHOR, NOW).expect("document recovery");
+        open_cell_log(fs, &mut ks, CELL, cfg, ANCHOR, NOW, &census).expect("document recovery");
     (ks, stats)
 }
 

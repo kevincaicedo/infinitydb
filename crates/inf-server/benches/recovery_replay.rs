@@ -265,8 +265,10 @@ fn timed_recover<F: inf_log::fs::SegmentFs + Clone>(
     anchor: WallAnchor,
     now: Nanos,
 ) -> (f64, inf_server::RecoverStats) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let start = Instant::now();
-    let (rotor, stats, _seed) = open_cell_log(fs, ks, CELL, cfg, anchor, now).expect("recover");
+    let (rotor, stats, _seed) =
+        open_cell_log(fs, ks, CELL, cfg, anchor, now, &census).expect("recover");
     let millis = start.elapsed().as_secs_f64() * 1e3;
     drop(rotor);
     (millis, stats)

@@ -297,10 +297,11 @@ fn find_idx_block(image: &[u8]) -> usize {
 
 #[test]
 fn named_sidecar_unit_boots_loads_and_catches_up() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     build_shard(&fs, 5);
     let mut ks = booted_keyspace();
-    open_cell_log(fs, &mut ks, CELL, &cfg(), anchor(), now()).expect("boot");
+    open_cell_log(fs, &mut ks, CELL, &cfg(), anchor(), now(), &census).expect("boot");
     let info = ks.idx_sidecar_info();
     assert_eq!((info.loaded, info.rebuilt, info.damaged_sections), (2, 0, 0));
     for &(id, ..) in INDEXES {
@@ -324,6 +325,7 @@ fn named_sidecar_unit_boots_loads_and_catches_up() {
 
 #[test]
 fn mid_sidecar_write_orphan_is_harmless_and_collected() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     let published = build_shard(&fs, 3);
     // The cut-mid-sidecar-write shape: a staging orphan truncated inside
@@ -336,7 +338,7 @@ fn mid_sidecar_write_orphan_is_harmless_and_collected() {
 
     let mut ks = booted_keyspace();
     let (_rotor, stats, _seed) =
-        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now()).expect("boot");
+        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now(), &census).expect("boot");
     // The old unit stays authoritative and its sidecars load.
     assert_eq!(ks.idx_sidecar_info().loaded, 2, "the published unit is untouched by the orphan");
     assert!(stats.stale_files_removed >= 1, "the orphan is boot-GC'd");
@@ -346,6 +348,7 @@ fn mid_sidecar_write_orphan_is_harmless_and_collected() {
 
 #[test]
 fn mid_sidecar_write_without_any_published_unit_rebuilds() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // Nothing was ever published: only the log and the torn `.ick.new`.
     let fs = MemFs::new();
     let published = build_shard(&fs, 0);
@@ -358,7 +361,7 @@ fn mid_sidecar_write_without_any_published_unit_rebuilds() {
     drop(orphan);
 
     let mut ks = booted_keyspace();
-    open_cell_log(fs, &mut ks, CELL, &cfg(), anchor(), now()).expect("boot");
+    open_cell_log(fs, &mut ks, CELL, &cfg(), anchor(), now(), &census).expect("boot");
     let info = ks.idx_sidecar_info();
     assert_eq!(info.loaded, 0, "an unpublished torn sidecar never loads");
     assert_eq!(info.rebuilt, 2, "every declaration records its rebuild decision");
@@ -375,6 +378,7 @@ fn mid_sidecar_write_without_any_published_unit_rebuilds() {
 
 #[test]
 fn truncated_published_sidecar_unit_fail_stops() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // The manifest named it — framing damage anywhere is corruption
     // (§8.4), sidecar sections included: a torn unit never quietly
     // serves. Sweep cut points across the file, denser near the tail
@@ -393,13 +397,14 @@ fn truncated_published_sidecar_unit_fail_stops() {
         torn.write_at(0, &published[..cut]).expect("write");
         drop(torn);
         let mut ks = booted_keyspace();
-        let err = open_cell_log(fs, &mut ks, CELL, &cfg(), anchor(), now());
+        let err = open_cell_log(fs, &mut ks, CELL, &cfg(), anchor(), now(), &census);
         assert!(err.is_err(), "cut at {cut}/{} must fail-stop", published.len());
     }
 }
 
 #[test]
 fn damaged_sidecar_body_rebuilds_one_index_and_boots() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     let published = build_shard(&fs, 2);
     // Flip one byte inside the first 0x06 body (past the 36-byte meta):
@@ -415,7 +420,7 @@ fn damaged_sidecar_body_rebuilds_one_index_and_boots() {
     drop(damaged);
 
     let mut ks = booted_keyspace();
-    open_cell_log(fs, &mut ks, CELL, &cfg(), anchor(), now())
+    open_cell_log(fs, &mut ks, CELL, &cfg(), anchor(), now(), &census)
         .expect("body damage never refuses a boot (L2)");
     let info = ks.idx_sidecar_info();
     assert_eq!(info.damaged_sections, 1, "the damage is counted (L10)");
@@ -433,12 +438,13 @@ fn damaged_sidecar_body_rebuilds_one_index_and_boots() {
 /// in `m45.toml`.
 #[test]
 fn a_tail_trip_turns_the_load_into_a_rebuild() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     use inf_foundation::fault::{self, FaultSpec};
     let fs = MemFs::new();
     build_shard(&fs, 5);
     let mut ks = booted_keyspace();
     fault::arm(inf_store::fault::IDX_APPLY_TRIP, FaultSpec::Nth(1));
-    let boot = open_cell_log(fs, &mut ks, CELL, &cfg(), anchor(), now());
+    let boot = open_cell_log(fs, &mut ks, CELL, &cfg(), anchor(), now(), &census);
     let fired = fault::fired(inf_store::fault::IDX_APPLY_TRIP);
     fault::disarm(inf_store::fault::IDX_APPLY_TRIP);
     boot.expect("a vetoed tree never refuses a boot (L2)");

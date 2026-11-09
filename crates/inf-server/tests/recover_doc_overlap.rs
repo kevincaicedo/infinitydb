@@ -69,6 +69,7 @@ fn keyspace() -> Keyspace {
 
 #[test]
 fn fuzzy_checkpoint_overlap_counts_stale_and_missing_deltas() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     let cfg = config();
     let dirs = create_cell_dirs(&fs, Path::new("data/shard-0")).expect("dirs");
@@ -190,7 +191,7 @@ fn fuzzy_checkpoint_overlap_counts_stale_and_missing_deltas() {
 
     let mut recovered = keyspace();
     let (_rotor, stats, _manifest) =
-        open_cell_log(fs, &mut recovered, 0, &cfg, ANCHOR, NOW).expect("boot recovery");
+        open_cell_log(fs, &mut recovered, 0, &cfg, ANCHOR, NOW, &census).expect("boot recovery");
     assert_eq!(stats.doc_deltas_skipped_stale, 2);
     assert_eq!(stats.doc_deltas_skipped_missing, 1);
 

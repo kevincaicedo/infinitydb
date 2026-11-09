@@ -167,12 +167,13 @@ fn build_shard(fs: &MemFs, tail_ops: u64) -> Vec<u8> {
 
 #[test]
 fn v3_named_unit_loads_and_the_tail_replays_over_it() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     let published = build_shard(&fs, 25);
     assert_eq!(published.len() % ICK_BLOCK_ALIGN, 0);
     let mut ks = fresh_keyspace();
     let (_rotor, stats, manifest) =
-        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now()).expect("boot");
+        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now(), &census).expect("boot");
     assert!(manifest.is_some(), "the MANIFEST named the v3 unit");
     assert!(stats.records_applied >= 25, "the tail replayed");
     for i in 0..KEYS {
@@ -184,6 +185,7 @@ fn v3_named_unit_loads_and_the_tail_replays_over_it() {
 
 #[test]
 fn v3_mid_section_orphan_is_collected_and_the_old_unit_loads() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     let published = build_shard(&fs, 10);
     // A second checkpoint that never finished: torn inside its second
@@ -198,7 +200,7 @@ fn v3_mid_section_orphan_is_collected_and_the_old_unit_loads() {
 
     let mut ks = fresh_keyspace();
     let (_rotor, stats, manifest) =
-        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now()).expect("boot");
+        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now(), &census).expect("boot");
     assert_eq!(manifest.map(|m| m.ckpt_id), Some(1), "the old unit is authoritative");
     assert!(stats.stale_files_removed >= 1, "the orphan is boot-GC'd");
     let names = fs.list_dir(&Path::new(SHARD).join("ckpt")).expect("dir");
@@ -210,6 +212,7 @@ fn v3_mid_section_orphan_is_collected_and_the_old_unit_loads() {
 
 #[test]
 fn v3_footer_complete_orphan_without_a_manifest_never_loads() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // The cut between the footer write and its fdatasync (or the rename):
     // the staging file looks complete, nothing names it.
     let fs = MemFs::new();
@@ -224,7 +227,7 @@ fn v3_footer_complete_orphan_without_a_manifest_never_loads() {
 
     let mut ks = fresh_keyspace();
     let (_rotor, stats, manifest) =
-        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now()).expect("boot");
+        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now(), &census).expect("boot");
     assert!(manifest.is_none(), "nothing was published");
     assert!(stats.stale_files_removed >= 1, "the complete-looking orphan is collected");
     // Only the log's own records exist: the checkpoint's generation-1
@@ -237,6 +240,7 @@ fn v3_footer_complete_orphan_without_a_manifest_never_loads() {
 
 #[test]
 fn v3_named_unit_with_damaged_padding_fail_stops() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     let published = build_shard(&fs, 5);
     // The header block's padding (after the header CRC, before the first
@@ -253,7 +257,7 @@ fn v3_named_unit_with_damaged_padding_fail_stops() {
     drop(f);
 
     let mut ks = fresh_keyspace();
-    let err = open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now())
+    let err = open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now(), &census)
         .expect_err("a named unit with non-zero padding is corruption");
     let text = err.to_string();
     assert!(text.contains("Padding"), "typed refusal names the padding: {text}");

@@ -118,6 +118,7 @@ fn build_shard(fs: &MemFs, populated: &[NsId]) {
 }
 
 fn boot(fs: &MemFs) -> inf_server::RecoverStats {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = keyspace();
     let (_rotor, stats, manifest) = open_cell_log(
         fs.clone(),
@@ -126,6 +127,7 @@ fn boot(fs: &MemFs) -> inf_server::RecoverStats {
         &cfg(),
         WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 },
         Nanos::from_millis(1),
+        &census,
     )
     .expect("boot");
     assert_eq!(manifest.map(|m| m.ckpt_id), Some(1));

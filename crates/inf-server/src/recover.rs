@@ -680,7 +680,8 @@ pub struct RecoveredManifest {
 /// Opens (or creates) cell `cell`'s log under the node data dir, loading
 /// the manifest-named checkpoint (if any) and replaying the tail into
 /// `ks`. Returns the rotor positioned at the tail, ready for
-/// `begin_frame_deferred`, plus the recovered manifest seed.
+/// `begin_frame_deferred`, plus the recovered manifest seed. Recovered
+/// tables register on `census`, the one `ks` was seeded on (ADR-0163 D2).
 ///
 /// `fs` is the injected filesystem seam (§3.3): `StdSegmentFs` on the
 /// node, `MemFs` in the recovery test tiers, the sim disk at M2-S18.
@@ -697,8 +698,9 @@ pub fn open_cell_log<F: SegmentFs + Clone>(
     cfg: &DurableConfig,
     anchor: WallAnchor,
     now: Nanos,
+    census: &std::rc::Rc<inf_foundation::bounded::CapCensus>,
 ) -> io::Result<(SegmentRotor<F>, RecoverStats, Option<RecoveredManifest>)> {
-    let mut recovery = Recovery::new(fs, cell, cfg, anchor, now);
+    let mut recovery = Recovery::new(fs, cell, cfg, anchor, now, std::rc::Rc::clone(census));
     while recovery.step(ks, u64::MAX)? == RecoveryProgress::Working {}
     Ok(recovery.finish())
 }
@@ -846,10 +848,10 @@ pub struct Recovery<F: SegmentFs> {
     /// upper bound; progress credits the slack when a segment completes).
     seg_sizes: Vec<u64>,
     ends: Vec<(u32, Option<ReadError>)>,
-    /// The cell's cap census (ADR-0163 D2): a recovered tier pipeline's
-    /// capped holders register their rows on it, so they stand on the
-    /// plane's census once the pipeline is installed. A standalone
-    /// recovery (tests, the offline open) builds its own.
+    /// The cell's cap census (ADR-0163 D2), which the host passes at
+    /// construction: every recovered table's and tier pipeline's capped
+    /// holders register their rows on it, so they stand on the census the
+    /// host's keyspace was seeded on. No recovery builds one of its own.
     census: std::rc::Rc<inf_foundation::bounded::CapCensus>,
     residue: Vec<bool>,
     /// Per segment: its slack's validating frames are discarded-life
@@ -1031,9 +1033,18 @@ pub(crate) struct RecoveredTierNs<F: SegmentFs> {
 
 impl<F: SegmentFs + Clone> Recovery<F> {
     /// Prepares recovery for cell `cell` under `cfg.data_dir`. No I/O
-    /// happens here — the first [`step`](Self::step) does.
+    /// happens here — the first [`step`](Self::step) does. Recovered
+    /// tables register on `census`, the one the host's keyspace was seeded
+    /// on (ADR-0163 D2).
     #[must_use]
-    pub fn new(fs: F, cell: u16, cfg: &DurableConfig, anchor: WallAnchor, now: Nanos) -> Self {
+    pub fn new(
+        fs: F,
+        cell: u16,
+        cfg: &DurableConfig,
+        anchor: WallAnchor,
+        now: Nanos,
+        census: std::rc::Rc<inf_foundation::bounded::CapCensus>,
+    ) -> Self {
         let shard_dir = cfg.data_dir.join(format!("shard-{cell}"));
         let boot_reads = ReadAheadFs::new(fs.clone(), cfg.recover.boot_prefetch);
         Recovery {
@@ -1056,7 +1067,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             segments: Vec::new(),
             seg_sizes: Vec::new(),
             ends: Vec::new(),
-            census: inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(cell)).0,
+            census,
             residue: Vec::new(),
             stale_slack: Vec::new(),
             bytes_total: 0,
@@ -1094,15 +1105,6 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     #[must_use]
     pub fn deferred_boot_sync(mut self) -> Self {
         self.defer_boot_sync = true;
-        self
-    }
-
-    /// Registers the recovered tier pipelines' capped holders on `census`,
-    /// the cell's own (ADR-0163 D2), in place of the standalone census a
-    /// recovery builds for itself.
-    #[must_use]
-    pub fn with_census(mut self, census: std::rc::Rc<inf_foundation::bounded::CapCensus>) -> Self {
-        self.census = census;
         self
     }
 

@@ -849,9 +849,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.boot = Some(BootRecovery {
             // Loop-resident boots defer boot-metadata fsyncs into driver
             // barriers (M2.5-S01): ready never blocks on the device.
-            rec: Recovery::new(fs.clone(), cell_id, cfg, anchor, now)
-                .deferred_boot_sync()
-                .with_census(Rc::clone(&self.shared.census)),
+            rec: Recovery::new(
+                fs.clone(),
+                cell_id,
+                cfg,
+                anchor,
+                now,
+                Rc::clone(&self.shared.census),
+            )
+            .deferred_boot_sync(),
             fs,
             cfg: cfg.clone(),
             cell_id,

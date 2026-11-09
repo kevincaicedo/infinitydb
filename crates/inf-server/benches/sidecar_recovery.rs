@@ -260,6 +260,7 @@ fn boot(data_dir: &Path) -> (Keyspace, f64) {
         &cfg(data_dir.to_path_buf()),
         WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 },
         Nanos::from_millis(1),
+        &census,
     )
     .expect("boot");
     (ks, t.elapsed().as_secs_f64())

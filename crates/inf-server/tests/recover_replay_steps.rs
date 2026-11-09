@@ -319,11 +319,13 @@ fn assert_model(served: &Model, model: &Model, when: &str) {
 /// at a budget it had not spent, every step.
 #[test]
 fn a_zero_step_budget_completes_a_demoting_boot() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     let cfg = step_cfg();
     let model = write_unit(&fs, &cfg, 3).model;
     let mut ks = tiered_keyspace();
-    let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
+    let mut recovery =
+        Recovery::new(fs.clone(), CELL, &cfg, anchor(), now(), std::rc::Rc::clone(&census));
     // Bound: at a zero budget each step consumes one record, seals one
     // record in a demote step's walk, completes a demote step, or settles
     // one record at the end of replay — under four steps per model key,
@@ -418,6 +420,7 @@ fn every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_
 /// One boot under `budget`, its upper bounds asserted; returns the replay
 /// steps that yielded under the budget.
 fn step_under_budget(budget: u64) -> Vec<String> {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     use inf_server::{RecoverPhase, UnitPhase};
     let barrier = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES;
     let read_price = inf_store::limits::SETTLE_READ_CHARGE_BYTES;
@@ -433,7 +436,8 @@ fn step_under_budget(budget: u64) -> Vec<String> {
     let settle_unit = record + 4 * read_price;
 
     let mut ks = tiered_keyspace();
-    let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
+    let mut recovery =
+        Recovery::new(fs.clone(), CELL, &cfg, anchor(), now(), std::rc::Rc::clone(&census));
     let (mut largest, mut settle_steps, mut open_span) = (0u64, 0u64, None);
     let mut early = Vec::new();
     loop {
@@ -575,9 +579,11 @@ struct BootState {
 /// it landed there, and drops every handle — the process dies; the
 /// caller cuts the power.
 fn boot_cut(disk: &inf_server::SimDisk, cfg: &DurableConfig, budget: u64, cut: Cut) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     use inf_server::{RecoverPhase, UnitPhase};
     let mut ks = tiered_keyspace();
-    let mut recovery = Recovery::new(disk.clone(), CELL, cfg, anchor(), now());
+    let mut recovery =
+        Recovery::new(disk.clone(), CELL, cfg, anchor(), now(), std::rc::Rc::clone(&census));
     let mut settle_steps = 0u64;
     let cold = cold_dir(cfg);
     // Bound: the boot's own steps — every step progresses (above).
@@ -617,8 +623,10 @@ fn boot_whole(
     budget: u64,
     model: &Model,
 ) -> std::io::Result<BootState> {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = tiered_keyspace();
-    let mut recovery = Recovery::new(disk.clone(), CELL, cfg, anchor(), now());
+    let mut recovery =
+        Recovery::new(disk.clone(), CELL, cfg, anchor(), now(), std::rc::Rc::clone(&census));
     while recovery.step(&mut ks, budget)? == RecoveryProgress::Working {}
     let (_rotor, stats, _seed) = recovery.finish();
     assert!(stats.tier_replay.counters.demote_steps > 0, "VACUOUS: the boot did not demote");
@@ -1148,9 +1156,11 @@ fn judged_boot_logged(
     budget: u64,
     unit_of: &dyn Fn(inf_server::UnitPhase) -> u64,
 ) -> (Vec<String>, std::io::Result<inf_server::RecoverStats>, Keyspace, Vec<StepUnits>) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     use inf_server::UnitEntry;
     let files_max = manifested_files_max(fs, cfg);
-    let mut recovery = Recovery::new(fs.clone(), CELL, cfg, anchor(), now());
+    let mut recovery =
+        Recovery::new(fs.clone(), CELL, cfg, anchor(), now(), std::rc::Rc::clone(&census));
     let (mut over, mut log) = (Vec::new(), Vec::new());
     // Bound: every step makes progress (the zero-budget row).
     for step in 0u64.. {
@@ -1554,7 +1564,9 @@ fn boot_recovered<F: SegmentFs + Clone>(
     budget: u64,
     model: &Model,
 ) -> (Recovered, inf_server::RecoverStats) {
-    let mut recovery = Recovery::new(fs.clone(), CELL, cfg, anchor(), now());
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+    let mut recovery =
+        Recovery::new(fs.clone(), CELL, cfg, anchor(), now(), std::rc::Rc::clone(&census));
     // Bound: every step makes progress; a boot of these units at a budget of
     // 0 takes well under a million steps, so a walk that re-applies records
     // without moving on is caught here, not as a hang.
@@ -1708,8 +1720,10 @@ fn memory_boot(
     cfg: &DurableConfig,
     budget: u64,
 ) -> (std::io::Result<inf_server::RecoverStats>, inf_store::StateDigest) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace();
-    let mut recovery = Recovery::new(fs.clone(), CELL, cfg, anchor(), now());
+    let mut recovery =
+        Recovery::new(fs.clone(), CELL, cfg, anchor(), now(), std::rc::Rc::clone(&census));
     // Bound: every step makes progress (the zero-budget row).
     loop {
         match recovery.step(&mut ks, budget) {
@@ -1831,6 +1845,7 @@ fn a_parked_frame_across_the_begin_lsn_skips_below_and_applies_above_once() {
 /// (`inf_canary_recover_frame_end_counted`): the boot completes.
 #[test]
 fn a_frame_whose_count_is_short_refuses_the_boot_at_every_budget() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     let cfg = cfg();
     let mut log = LogBuilder::new(&fs, &cfg);
@@ -1862,7 +1877,8 @@ fn a_frame_whose_count_is_short_refuses_the_boot_at_every_budget() {
     );
     for budget in [u64::MAX, 1] {
         let mut ks = fresh_keyspace();
-        let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
+        let mut recovery =
+            Recovery::new(fs.clone(), CELL, &cfg, anchor(), now(), std::rc::Rc::clone(&census));
         // Bound: every step makes progress; the boot refuses or completes.
         let err = loop {
             match recovery.step(&mut ks, budget) {
@@ -2008,7 +2024,8 @@ fn room_asks_count_across_suspensions_and_the_hostile_spec_boots() {
     drop(log);
     make_durable(&fs, &cfg);
     let mut ks = keyspace();
-    let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
+    let mut recovery =
+        Recovery::new(fs.clone(), CELL, &cfg, anchor(), now(), std::rc::Rc::clone(&census));
     // Bound: every step makes progress (the zero-budget row).
     while recovery.step(&mut ks, 1).expect("ROOM ASKS: the hostile spec boots")
         == RecoveryProgress::Working
@@ -2891,12 +2908,14 @@ fn write_fresh_cell<F: SegmentFs>(fs: &F, cfg: &DurableConfig) {
 /// completes in its first step.
 #[test]
 fn a_fresh_cell_hands_its_tiered_machines_over_under_the_step_budget() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     const BUDGET: u64 = 256;
     let cfg = step_cfg();
     let fs = MemFs::new();
     write_fresh_cell(&fs, &cfg);
     let mut ks = tiered_keyspace();
-    let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
+    let mut recovery =
+        Recovery::new(fs.clone(), CELL, &cfg, anchor(), now(), std::rc::Rc::clone(&census));
     let mut hand_over_steps = 0u64;
     // Bound: a step a unit batch, 72 seeds at four a step.
     for _ in 0..1_000 {
@@ -2937,7 +2956,8 @@ fn a_fresh_cell_hands_its_tiered_machines_over_under_the_step_budget() {
     }
 
     let mut ks = fresh_keyspace();
-    let mut recovery = Recovery::new(MemFs::new(), CELL, &cfg, anchor(), now());
+    let mut recovery =
+        Recovery::new(MemFs::new(), CELL, &cfg, anchor(), now(), std::rc::Rc::clone(&census));
     let first = recovery.step(&mut ks, BUDGET).expect("a fresh memory cell's step");
     assert_eq!(first, RecoveryProgress::Complete, "nothing to hand over: one step");
 }
@@ -3308,6 +3328,7 @@ fn every_budget_recovers_the_start_of_the_unparked_boot() {
 /// name refuses the boot (`inf_canary_recover_listing_repeat_refused`).
 #[test]
 fn the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let disk = inf_server::SimDisk::with_config(inf_log::fs::sim::SimDiskConfig {
         listing_repeats_removed: true,
         ..inf_log::fs::sim::SimDiskConfig::default()
@@ -3316,7 +3337,8 @@ fn the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal() {
     let sizes = StartSizes { extents: 20_000, dropped_names: 2_000 };
     let unit = write_start_unit(&disk, &cfg, sizes);
     let mut ks = start_keyspace();
-    let mut recovery = Recovery::new(disk.clone(), CELL, &cfg, anchor(), now());
+    let mut recovery =
+        Recovery::new(disk.clone(), CELL, &cfg, anchor(), now(), std::rc::Rc::clone(&census));
     // Bound: every step makes progress.
     for steps in 0u64.. {
         let refused = |err| panic!("REPEAT: the boot refused a repeated name: {err}");
@@ -3338,6 +3360,7 @@ fn the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal() {
 /// naming the point; the next boot, the fault cleared, recovers the unit.
 #[test]
 fn a_listing_fault_refuses_the_tier_map_typed() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     use inf_foundation::fault::{self, FaultSpec};
     let cfg = step_cfg();
     let sizes = StartSizes { extents: 100, dropped_names: 10 };
@@ -3345,7 +3368,8 @@ fn a_listing_fault_refuses_the_tier_map_typed() {
         let fs = MemFs::new();
         let unit = write_start_unit(&fs, &cfg, sizes);
         let mut ks = start_keyspace();
-        let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
+        let mut recovery =
+            Recovery::new(fs.clone(), CELL, &cfg, anchor(), now(), std::rc::Rc::clone(&census));
         assert_eq!(
             recovery.step(&mut ks, 256 << 10).expect("the log's half"),
             RecoveryProgress::Working
