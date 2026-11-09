@@ -521,6 +521,14 @@ impl SimDriver {
         self.observed
     }
 
+    /// A planted canary's reader: the tier bytes and ops in the driver's own
+    /// queue, which every entry drains, read by the spend's step check in
+    /// place of the cell loop's queue.
+    #[cfg(inf_canary_tier_spend_driver_queue)]
+    pub fn driver_queue_tier_io(&self) -> (u64, u64) {
+        tier_io_of(&self.ops)
+    }
+
     /// Fdatasyncs the disk holds now ([`SimDisk::hold_syncs`]): submitted
     /// by the plane and kept from the device until the hold lifts — the
     /// harness's own reading of a held barrier, no product counter.

@@ -1803,7 +1803,13 @@ fn tier_spend_terms(node: &Node, cell: usize, stats: &inf_server::DurableStats) 
     let counted = stats.io_budget[tier];
     let cell_loop = &node.cells[cell].0;
     let observed = cell_loop.driver().observed_io();
+    #[cfg(not(inf_canary_tier_spend_driver_queue))]
     let (queued_bytes, queued_ops) = crate::net::tier_io_of(cell_loop.next_submit_ops());
+    // A planted canary: the queued term reads the driver's own queue, empty
+    // between two iterations, so the equality breaks at the first step a
+    // grant waits and no step reads a tier op queued (a vacuity plant).
+    #[cfg(inf_canary_tier_spend_driver_queue)]
+    let (queued_bytes, queued_ops) = cell_loop.driver().driver_queue_tier_io();
     TierSpendTerms {
         spent_bytes: counted.spent_bytes,
         spent_ops: counted.spent_ops,

@@ -891,6 +891,12 @@ rows=(
   # wait bound's window, so the leg's premise clause reads it vacuous (a
   # vacuity plant, read in the simulator alone).
   "inf_canary_thief_premise_short m4-tier-budget thief-premise-short --tier-leg two-1mb-thief"
+  # The spend's queued term reads the driver's own queue, which every entry
+  # drains, in place of the cell loop's, where a grant waits one step: the
+  # equality breaks at the first step a grant waits, and no step finds a
+  # tier op queued (a vacuity plant, read in the simulator alone).
+  "inf_canary_tier_spend_driver_queue m4-tier-budget TIER-SPEND --tier-leg two-1mb-thief"
+  "inf_canary_tier_spend_driver_queue m4-tier-budget tier-spend-unqueued --tier-leg two-1mb-thief"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
