@@ -150,7 +150,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         for index in shape.namespaces.indices() {
             let class = NsClass::TierBudget(index);
             let load = shape.load(index);
-            let create: &[&[u8]] = &[
+            let mut create: Vec<&[u8]> = vec![
                 b"INF.NS",
                 b"CREATE",
                 class.name(),
@@ -169,8 +169,11 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                 b"TIER-IO-MODE",
                 b"buffered",
             ];
+            if let Some(timeout_ms) = load.tail_stall_timeout_ms {
+                create.extend_from_slice(&[b"TAIL-STALL-TIMEOUT", timeout_ms]);
+            }
             let reply =
-                setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, create);
+                setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, &create);
             match reply {
                 Ok(Some(ok)) if ok == b"+OK\r\n" => {}
                 Ok(other) => {

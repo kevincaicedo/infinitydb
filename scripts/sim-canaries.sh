@@ -15,7 +15,15 @@
 #   `<cfg> <scenario> <expected violation substring> [flags…]` — an
 #     `inf-sim` scenario (a sweep where one seed may not reach the rule).
 #     A row whose flags carry their own `--seed` runs at that seed whatever
-#     the lane's (`inf-sim` takes the last one): a named regression seed;
+#     the lane's (`inf-sim` takes the last one): a named regression seed.
+#     A log line carrying `VACUOUS` is an engagement clause, not the oracle
+#     seeing the planted violation: it is a catch only where the substring
+#     is the clause's own name, standing whole and closed by `:` or ` —`
+#     (a vacuity row: `VACUOUS seed 0x1 cell 0: <substring> — …`,
+#     `VACUOUS <substring>: …`, `<substring>: DRAW VACUOUS: …`). A planted
+#     log whose every line carrying the substring is a clause it does not
+#     name (`<substring> VACUOUS`, `<substring> leg VACUOUS`, a clause's
+#     text) is red for another reason;
 #   `<cfg> crate-test <package> <lib|test:NAME> <test name> [witness…]` —
 #     a crate's own test, for a rule whose oracle lives below the simulator
 #     (the store-tier index rows, ADR-0139). The planted build must report
@@ -42,11 +50,14 @@
 # build is made in one shard and the K shards run every row exactly once
 # (the nightly's matrix: the whole lane outlasts one runner's job limit).
 # Fixture mode (scripts/check-scripts-selftest.sh): INF_CANARY_ROWS_FILE
-# replaces the row table and INF_CANARY_CARGO the cargo binary.
+# replaces the row table, INF_CANARY_CARGO the cargo binary and
+# INF_CANARY_SIM_TARGET the directory a scenario row's simulators are read
+# from (`target`; a stub cargo builds nothing there).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 seed=${1:-0xC0FFEE}
 CARGO=${INF_CANARY_CARGO:-cargo}
+sim_target=${INF_CANARY_SIM_TARGET:-target}
 
 rows=(
   # ADR-0090 D5: the segment-blind scanner takes a foreign segment's
@@ -966,6 +977,33 @@ loom_test() {
   fi
 }
 
+# token_catches <token> <log>: the log's lines naming a scenario row's
+# expected violation substring, read as bytes with the control bytes dropped
+# (a violation line may quote a key's raw bytes), less every engagement
+# clause the token does not name. A line carrying `VACUOUS` is kept only
+# where the token stands whole (no name character before it) and is closed
+# by `:` or ` —`, the clause's name; wherever else it stands — before the
+# word, as a leg's name, in the clause's text — the line is an engagement
+# clause, not the oracle. Non-zero when no line is left.
+token_catches() {
+  tr -d '\000-\010\013-\037\177' <"$2" | TOKEN=$1 LC_ALL=C awk '
+    function names_clause(line, token,    from, at, pos, before, after) {
+      from = 1
+      while (from <= length(line) && (at = index(substr(line, from), token)) > 0) {
+        pos = from + at - 1
+        before = pos > 1 ? substr(line, pos - 1, 1) : " "
+        after = substr(line, pos + length(token))
+        if (before !~ /[A-Za-z0-9_-]/ && (substr(after, 1, 1) == ":" || index(after, " —") == 1))
+          return 1
+        from = pos + 1
+      }
+      return 0
+    }
+    index($0, ENVIRON["TOKEN"]) == 0 { next }
+    index($0, "VACUOUS") == 0 || names_clause($0, ENVIRON["TOKEN"]) { print; kept = 1 }
+    END { exit !kept }'
+}
+
 sim_built=0
 # A plain leg is the scenario, its flags and the seed, not the plant: rows
 # that share one share its run (three rows run m4-recovery
@@ -991,32 +1029,36 @@ for row in "${rows[@]}"; do
     "$CARGO" build --release -p inf-sim --features dst --bin inf-sim
     sim_built=1
   fi
-  plain=target/release/inf-sim
-  target="target/canary-$cfg"
+  plain=$sim_target/release/inf-sim
+  target="$sim_target/canary-$cfg"
   echo "== canary $cfg: building inf-sim with --cfg $cfg into $target"
   RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
     --target-dir "$target"
   planted="$target/release/inf-sim"
-  echo "== canary $cfg: $name ${flags[*]} (lane seed $seed) on the planted build must go red"
-  if "$planted" --scenario "$name" --seed "$seed" "${flags[@]}" > "$log" 2>&1; then
+  echo "== canary $cfg: $name ${flags[*]:-} (lane seed $seed) on the planted build must go red"
+  if "$planted" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
     fail=1
   elif ! grep -q -- "$expect" "$log"; then
     echo "   red for another reason (expected a violation mentioning '$expect'):"
     tail -5 "$log"
     fail=1
+  elif ! catches=$(token_catches "$expect" "$log"); then
+    # Each line naming the token is an engagement clause it does not name:
+    # the run missed a regime, and the oracle judged nothing.
+    echo "   red for another reason (the leg's engagement clause, not its oracle):"
+    grep -a -m1 -- "$expect" "$log" | tr -d '\000-\010\013-\037\177' | cut -c1-160
+    fail=1
   else
-    # A violation line may quote a key's raw bytes: read the log as text
-    # and drop the control bytes, or the catch prints nothing.
-    echo "   caught: $(grep -a -m1 -- "$expect" "$log" | tr -d '\000-\010\013-\037\177' | cut -c1-160)"
+    echo "   caught: $(cut -c1-160 <<<"${catches%%$'\n'*}")"
   fi
-  leg="$name ${flags[*]}"
+  leg="$name ${flags[*]:-}"
   if [[ "$plain_green" == *"|$leg|"* ]]; then
-    echo "== canary $cfg: $name ${flags[*]} on the plain build: green above, not run again"
+    echo "== canary $cfg: $name ${flags[*]:-} on the plain build: green above, not run again"
     continue
   fi
-  echo "== canary $cfg: $name ${flags[*]} on the plain build must stay green"
-  "$plain" --scenario "$name" --seed "$seed" "${flags[@]}" > /dev/null
+  echo "== canary $cfg: $name ${flags[*]:-} on the plain build must stay green"
+  "$plain" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > /dev/null
   plain_green+="$leg|"
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi

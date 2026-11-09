@@ -574,6 +574,8 @@ impl TierBudgetLeg {
                 mem_budget: b"3mb",
                 mutable_permille: b"100",
                 maintain_slice,
+                tail_stall_timeout_ms: None,
+                values: TierBudgetValues::Mixed,
             };
             TierBudgetShape { leg: self, namespaces, first: load, rest: load }
         };
@@ -587,24 +589,8 @@ impl TierBudgetLeg {
             TierBudgetLeg::TwoAt1mbHostile => TierBudgetShape {
                 leg: self,
                 namespaces: TWO,
-                first: TierBudgetLoad {
-                    writers: 12,
-                    ops_per_writer: 4_000,
-                    keys_per_writer: 40,
-                    think_ns_max: 0,
-                    mem_budget: b"256mb",
-                    mutable_permille: b"10",
-                    maintain_slice: b"1mb",
-                },
-                rest: TierBudgetLoad {
-                    writers: 1,
-                    ops_per_writer: 6_000,
-                    keys_per_writer: 40,
-                    think_ns_max: 0,
-                    mem_budget: b"8mb",
-                    mutable_permille: b"100",
-                    maintain_slice: b"64kb",
-                },
+                first: TierBudgetLoad::HOSTILE_FIRST,
+                rest: TierBudgetLoad::HOSTILE_REST,
             },
             TierBudgetLeg::OneAt64mbNoModel => {
                 let load = TierBudgetLoad {
@@ -615,6 +601,8 @@ impl TierBudgetLeg {
                     mem_budget: b"72mb",
                     mutable_permille: b"900",
                     maintain_slice: b"64mb",
+                    tail_stall_timeout_ms: None,
+                    values: TierBudgetValues::Mixed,
                 };
                 TierBudgetShape { leg: self, namespaces: ONE, first: load, rest: load }
             }
@@ -645,6 +633,52 @@ pub struct TierBudgetLoad {
     /// round issues in groups of at most one group's bytes and ops
     /// whatever the slice.
     pub maintain_slice: &'static [u8],
+    /// The `TAIL-STALL-TIMEOUT` the `CREATE` names, in milliseconds;
+    /// `None` keeps the namespace default (1,000 ms).
+    pub tail_stall_timeout_ms: Option<&'static [u8]>,
+    /// What the writers send.
+    pub values: TierBudgetValues,
+}
+
+impl TierBudgetLoad {
+    /// The hostile leg's first namespace: twelve writers bursting into a
+    /// 256 MiB window with one percent of it mutable, at `1mb`.
+    const HOSTILE_FIRST: TierBudgetLoad = TierBudgetLoad {
+        writers: 12,
+        ops_per_writer: 4_000,
+        keys_per_writer: 40,
+        think_ns_max: 0,
+        mem_budget: b"256mb",
+        mutable_permille: b"10",
+        maintain_slice: b"1mb",
+        tail_stall_timeout_ms: None,
+        values: TierBudgetValues::Mixed,
+    };
+
+    /// The hostile leg's second namespace: one writer into an 8 MiB window
+    /// at a 64 KiB slice.
+    const HOSTILE_REST: TierBudgetLoad = TierBudgetLoad {
+        writers: 1,
+        ops_per_writer: 6_000,
+        keys_per_writer: 40,
+        think_ns_max: 0,
+        mem_budget: b"8mb",
+        mutable_permille: b"100",
+        maintain_slice: b"64kb",
+        tail_stall_timeout_ms: None,
+        values: TierBudgetValues::Mixed,
+    };
+}
+
+/// The value class of a tier-budget namespace's writers.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TierBudgetValues {
+    /// The lift regime's mix: `SET`s of 1–10 KiB, `GET`s and `DEL`s over
+    /// the writer's keys.
+    Mixed,
+    /// `SET`s alone, each of a new key (`k:<writer>:<sent>`), each value
+    /// `value_bytes` long: every record lands once and stays live.
+    SetOnlyUnique { value_bytes: usize },
 }
 
 /// How many tiered namespaces the tier-budget shape runs and how each
@@ -2006,6 +2040,11 @@ impl Writer {
     /// extents, overwrites and deletes of cold keys that stage
     /// displacement pairs — every reply exact.
     fn next_tiered_command(&mut self, scenario: &DurableScenario) -> (Vec<u8>, Pending) {
+        if let (NsClass::TierBudget(index), Some(shape)) = (self.class, scenario.tier_budget)
+            && let TierBudgetValues::SetOnlyUnique { value_bytes } = shape.load(index).values
+        {
+            return self.next_unique_set(value_bytes);
+        }
         let keys = match (self.class, scenario.tier_budget) {
             (NsClass::TierBudget(index), Some(shape)) => shape.load(index).keys_per_writer,
             _ => scenario.keys_per_writer,
@@ -2040,6 +2079,24 @@ impl Writer {
             let wire = encode(&[b"DEL", &key]);
             (wire, Pending { key, state_after: None, expect, mutates: true, taints: false })
         }
+    }
+
+    /// A `SET` of a key this writer never wrote (`k:<writer>:<sent>`) to a
+    /// `value_bytes` value stamped with the writer and its count: every
+    /// record lands once and stays live until the cut.
+    fn next_unique_set(&mut self, value_bytes: usize) -> (Vec<u8>, Pending) {
+        let key = format!("k:{}:{}", self.id, self.sent).into_bytes();
+        let stamp = format!("u:{}:{}:", self.id, self.sent).into_bytes();
+        let value: Vec<u8> = stamp.iter().copied().cycle().take(value_bytes).collect();
+        let wire = encode(&[b"SET", &key, &value]);
+        let pending = Pending {
+            key,
+            state_after: Some(value),
+            expect: b"+OK\r\n".to_vec(),
+            mutates: true,
+            taints: false,
+        };
+        (wire, pending)
     }
 
     /// The epoch-marks wedge leg's traffic: the first write of a writer's

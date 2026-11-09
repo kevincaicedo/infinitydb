@@ -1102,11 +1102,18 @@ impl SimDisk {
     #[must_use]
     pub fn fd_named(&self, fd: i32, named: fn(&Path) -> bool) -> bool {
         let state = self.state.borrow();
-        let Some(open) = file_fd_index(fd).ok().and_then(|index| state.open_files.get(&index))
-        else {
-            return false;
-        };
-        state.os_names.iter().any(|(name, &ino)| ino == open.ino && named(name))
+        file_fd_names_in(&state, fd).any(|name| named(name))
+    }
+
+    /// The OS names of the inode the driver file fd `fd` is open on, in
+    /// name order: the file an op names, read from the model's own
+    /// descriptor table by the lookup [`SimDisk::fd_named`] makes. Empty for
+    /// a directory fd, a closed one, or one the model never issued. One
+    /// pass over the OS names.
+    #[must_use]
+    pub fn file_fd_names(&self, fd: i32) -> Vec<PathBuf> {
+        let state = self.state.borrow();
+        file_fd_names_in(&state, fd).cloned().collect()
     }
 
     /// Model a filesystem without `O_DIRECT`: every `create_meta_direct`
@@ -1473,6 +1480,17 @@ fn file_fd_index(fd: i32) -> io::Result<u64> {
     } else {
         Err(io::Error::new(io::ErrorKind::InvalidInput, format!("not a sim file fd: {fd}")))
     }
+}
+
+/// The OS names of the inode the driver file fd `fd` is open on, in name
+/// order: none for a directory fd, a closed one, or one never issued, and
+/// then no name is read.
+fn file_fd_names_in(state: &DiskState, fd: i32) -> impl Iterator<Item = &PathBuf> {
+    let ino = file_fd_index(fd).ok().and_then(|index| state.open_files.get(&index));
+    let ino = ino.map(|open| open.ino);
+    ino.into_iter().flat_map(move |ino| {
+        state.os_names.iter().filter(move |&(_, &named)| named == ino).map(|(name, _)| name)
+    })
 }
 
 /// One open handle — one open file description with its own fd and
@@ -2113,6 +2131,33 @@ mod model_tests {
         }
         let bytes = copied();
         assert!(bytes <= 1000 * 4096 * 2, "1000 barriers copied {bytes} bytes (O(file) per fsync)");
+    }
+
+    /// A driver file fd reads the OS names of its own inode alone, beside
+    /// another namespace's open tier file, and the new name after a rename;
+    /// a directory fd, a closed fd and one never issued read none.
+    #[test]
+    fn a_file_fd_reads_the_names_of_its_inode() {
+        let disk = SimDisk::new();
+        let dir = Path::new("shard-0").join("ns-7").join("cold");
+        let other_dir = Path::new("shard-0").join("ns-8").join("cold");
+        disk.create_dir_all(&dir).expect("dirs");
+        disk.create_dir_all(&other_dir).expect("other dirs");
+        let (first, second) = (dir.join("tier-000000.itier"), dir.join("tier-000001.itier"));
+        let other_name = other_dir.join("tier-000000.itier");
+        let tier = disk.create_tier(&first, TierIoMode::Buffered).expect("tier");
+        let other = disk.create_tier(&other_name, TierIoMode::Buffered).expect("other tier");
+        let (fd, other_fd) = (tier.raw_fd().expect("fd"), other.raw_fd().expect("other fd"));
+        assert_eq!(disk.file_fd_names(fd), vec![first.clone()], "an fd names its own inode alone");
+        assert_eq!(disk.file_fd_names(other_fd), vec![other_name.clone()]);
+        disk.rename(&first, &second).expect("rename");
+        assert_eq!(disk.file_fd_names(fd), vec![second], "the fd follows its inode");
+        assert_eq!(disk.file_fd_names(other_fd), vec![other_name], "no other fd's name moved");
+        let dir_fd = disk.open_dir(&dir).expect("dir").raw_fd().expect("dir fd");
+        assert!(disk.file_fd_names(dir_fd).is_empty(), "a directory fd names no file");
+        assert!(disk.file_fd_names(-1).is_empty(), "a fd the model never issued names nothing");
+        drop(tier);
+        assert!(disk.file_fd_names(fd).is_empty(), "a closed fd names nothing");
     }
 
     /// The family accessors read the model's own tables: open descriptors
