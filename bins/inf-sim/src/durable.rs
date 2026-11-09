@@ -573,6 +573,7 @@ impl TierBudgetLeg {
                 mem_budget: b"3mb",
                 mutable_permille: b"100",
                 maintain_slice,
+                tail_stall_timeout_ms: None,
             };
             TierBudgetShape { leg: self, namespaces, first: load, rest: load }
         };
@@ -594,6 +595,7 @@ impl TierBudgetLeg {
                     mem_budget: b"256mb",
                     mutable_permille: b"10",
                     maintain_slice: b"1mb",
+                    tail_stall_timeout_ms: None,
                 },
                 rest: TierBudgetLoad {
                     writers: 1,
@@ -603,6 +605,7 @@ impl TierBudgetLeg {
                     mem_budget: b"8mb",
                     mutable_permille: b"100",
                     maintain_slice: b"64kb",
+                    tail_stall_timeout_ms: None,
                 },
             },
             TierBudgetLeg::OneAt64mbNoModel => {
@@ -614,6 +617,7 @@ impl TierBudgetLeg {
                     mem_budget: b"72mb",
                     mutable_permille: b"900",
                     maintain_slice: b"64mb",
+                    tail_stall_timeout_ms: None,
                 };
                 TierBudgetShape { leg: self, namespaces: ONE, first: load, rest: load }
             }
@@ -644,6 +648,9 @@ pub struct TierBudgetLoad {
     /// round issues in groups of at most one group's bytes and ops
     /// whatever the slice.
     pub maintain_slice: &'static [u8],
+    /// The `TAIL-STALL-TIMEOUT` the `CREATE` names, in milliseconds;
+    /// `None` keeps the namespace default (1,000 ms).
+    pub tail_stall_timeout_ms: Option<&'static [u8]>,
 }
 
 /// How many tiered namespaces the tier-budget shape runs and how each
