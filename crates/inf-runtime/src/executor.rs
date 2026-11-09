@@ -877,15 +877,27 @@ impl CellExecutor {
         polled
     }
 
-    /// The drain (ADR-0003 A1.2.7): when the remote stack is not empty, takes all of it; each
-    /// bridge's link is read before its `Q` and `W` are cleared. A cleared `W` is the owner-lane
-    /// wake of that header's task; then a Held header no waker names is unlinked and freed.
+    /// The drain's check (ADR-0003 A1.2.7): one `Relaxed` load of the remote stack's head and a
+    /// branch, inline in `run_ready` and the executor's drop; the drain runs only when a foreign
+    /// wake is queued.
+    #[inline(always)]
     fn drain_remote(&self) {
-        let stack = self.stack_ref();
-        if !stack.pending() {
-            return;
+        if self.stack_ref().pending() {
+            self.drain_pending();
         }
-        let mut drained = stack.take();
+    }
+
+    /// The drain (ADR-0003 A1.2.7): takes all of the remote stack; each bridge's link is read
+    /// before its `Q` and `W` are cleared. A cleared `W` is the owner-lane wake of that header's
+    /// task; then a Held header no waker names is unlinked and freed. Cold and out of line: no
+    /// product path queues a foreign wake while the executor lives (ADR-0149 D1), and a check
+    /// inside this body made every `run_ready` call it and run its prologue, which saves the
+    /// registers the drain uses, before the empty test (about 20 instructions a call, against
+    /// one load and a branch; the waker A/B's suspend and wake-run rows read the difference).
+    #[cold]
+    #[inline(never)]
+    fn drain_pending(&self) {
+        let mut drained = self.stack_ref().take();
         // SAFETY: a queued bridge is allocated while its `Q` is set: the push's node, the
         // header's own address.
         while let Some((at, delivery)) = drained.deliver_next(|at| unsafe { &*at.as_ptr() }) {
