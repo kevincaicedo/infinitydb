@@ -206,7 +206,7 @@ mod tests {
         let r = acquisition::two_key_history(Rules::withdrawn());
         assert_eq!(r.stuck.len(), 2, "{r:?}");
         assert_eq!(
-            r.violations[0],
+            &r.violations[0],
             "ACQUISITION DEADLOCK: 2 transaction(s) stuck with no message in flight — T1 waits on \
                  key 1@cell1 behind T2; T2 waits on key 0@cell0 behind T1"
         );
@@ -295,7 +295,7 @@ mod tests {
             ..Rules::chosen()
         });
         assert_eq!(
-            r.violations,
+            r.violations.iter().collect::<Vec<_>>(),
             vec![
                 "WATCH INTERVAL VIOLATION: T1 committed after key 1 was mutated between the \
                      owner's validation and the decision"
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn every_terminal_path_releases_every_intent_and_every_staged_set() {
-        let leak = |v: &String| v.starts_with("INTENT LEAK") || v.starts_with("STAGING LEAK");
+        let leak = |v: &str| v.starts_with("INTENT LEAK") || v.starts_with("STAGING LEAK");
         for seed in 1..=32u64 {
             for faults in [false, true] {
                 let r = acquisition::storm_with(Rules::chosen(), 3, 4, 16, seed, faults);
@@ -348,7 +348,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Aborted("condition failed"));
         assert_eq!(published, Some(0));
         assert_eq!(
-            r.violations,
+            r.violations.iter().collect::<Vec<_>>(),
             vec![
                 "STAGING VIOLATION: T1 aborted (condition failed) but its write to key 0@cell0 is \
                      published"
@@ -406,7 +406,9 @@ mod tests {
                 Cancel::Disconnect,
                 seed,
             );
-            partial.extend(r.violations.iter().filter(|v| v.starts_with("PARTIAL")).cloned());
+            partial.extend(
+                r.violations.iter().filter(|v| v.starts_with("PARTIAL")).map(str::to_owned),
+            );
             false_abort += usize::from(r.violations.iter().any(|v| v.starts_with("FALSE ABORT")));
         }
         assert!(
@@ -437,10 +439,10 @@ mod tests {
         assert_eq!(outcome, Outcome::Aborted("timeout"));
         assert_eq!(r.violations.len(), 1, "{r:?}");
         assert!(
-            r.violations[0]
+            &r.violations[0]
                 .starts_with("STAGING VIOLATION: T1 aborted (timeout) but its write to key"),
             "{}",
-            r.violations[0]
+            &r.violations[0]
         );
     }
 
@@ -512,7 +514,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Committed);
         assert_eq!(published, [None, None], "the source is deleted, the destination never set");
         assert_eq!(
-            r.violations,
+            r.violations.iter().collect::<Vec<_>>(),
             vec![
                 "REPLY MISMATCH: T1's RENAME 0→1 replied no such key where the serial history \
                      replies OK"
@@ -525,7 +527,7 @@ mod tests {
         let (r, outcome, _) = acquisition::rename_history(rules, true, false);
         assert_eq!(outcome, Outcome::Aborted("no such key"));
         assert_eq!(
-            r.violations,
+            r.violations.iter().collect::<Vec<_>>(),
             vec![
                 "DEPENDENT LEG: T1 aborted (no such key) but the serial history commits its RENAME \
                      0→1"
@@ -535,7 +537,7 @@ mod tests {
         let (r, _, published) = acquisition::rename_history(rules, false, true);
         assert_eq!(published, [None, None], "the refused destination lost the source");
         assert_eq!(
-            r.violations,
+            r.violations.iter().collect::<Vec<_>>(),
             vec![
                 "DEPENDENT COMMAND: T1's RENAME 0→1 left key 0@cell0 = absent where the serial \
                      history gives T1"
@@ -563,7 +565,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Committed);
         assert_eq!(published, [Some(1), Some(0)], "cell 0 set its key; cell 1 refused");
         assert_eq!(
-            r.violations,
+            r.violations.iter().collect::<Vec<_>>(),
             vec![
                 "DEPENDENT COMMAND: T2's MSETNX [0, 1] left key 0@cell0 = T2 where the serial \
                      history gives absent"
@@ -659,7 +661,7 @@ mod tests {
         );
         assert_eq!(published, [None, None]);
         assert_eq!(
-            r.violations,
+            r.violations.iter().collect::<Vec<_>>(),
             vec![
                 "REPLY MISMATCH: T1's RENAME 0→1 replied no such key where the serial history \
                      replies OK"
@@ -681,7 +683,7 @@ mod tests {
         assert_eq!(published, [None, Some(0)], "the state is right — only the reply is wrong");
         assert_eq!(reply, Some(vec![Reply::Ok, Reply::Ok, Reply::Value(None)]));
         assert_eq!(
-            r.violations,
+            r.violations.iter().collect::<Vec<_>>(),
             vec![
                 "REPLY MISMATCH: T1's GET 1 replied absent where the serial history replies T1"
                     .to_string()

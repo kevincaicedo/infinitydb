@@ -19,6 +19,7 @@
 //! Every event folds into `trace_hash`; `--verify-determinism` runs the
 //! scenario twice and requires hash identity (L7).
 
+use crate::driver::Violations;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -67,7 +68,7 @@ impl SteelScenario {
 
 #[derive(Debug, Default)]
 pub struct SteelReport {
-    pub violations: Vec<String>,
+    pub violations: Violations,
     pub cold_reads: u64,
     pub promotions: u64,
     pub trace_hash: u64,

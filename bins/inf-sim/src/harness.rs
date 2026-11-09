@@ -48,6 +48,7 @@
 //! client completions. Same seed ⇒ byte-identical trace (the determinism
 //! AC); the comparator just memcmps two runs.
 
+use crate::driver::Violations;
 use core::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::RawFd;
@@ -412,7 +413,7 @@ pub struct SimReport {
     pub state_hash: u64,
     pub events: u64,
     pub commands_done: u64,
-    pub oracle_violations: Vec<String>,
+    pub oracle_violations: Violations,
     /// Cap census rows read at the end of the run, summed over the cells
     /// (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
@@ -480,7 +481,7 @@ struct Oracle {
     trace: Vec<u8>,
     state: crate::state::StateHash,
     events: u64,
-    violations: Vec<String>,
+    violations: Violations,
     /// Scatter legs the replay oracle left to the audit oracle.
     replays_skipped: u64,
 }
@@ -573,7 +574,7 @@ impl Oracle {
             trace: Vec::new(),
             state: crate::state::StateHash::default(),
             events: 0,
-            violations: Vec::new(),
+            violations: Violations::new(),
             replays_skipped: 0,
         }
     }
@@ -952,7 +953,7 @@ impl SimClient {
         &mut self,
         check: Check,
         raw: &[u8],
-        violations: &mut Vec<String>,
+        violations: &mut Violations,
         scan_walks: &mut u64,
     ) {
         let who = format!("client {} ({})", self.id, self.scope.name());
@@ -1231,7 +1232,7 @@ impl SimSubscriber {
     /// Feeds one delivery, checking channel membership, payload shape, and
     /// the per-(channel, publisher) sequence. Violations describe the seed's
     /// finding precisely.
-    pub(crate) fn deliver(&mut self, channel: &[u8], payload: &[u8], violations: &mut Vec<String>) {
+    pub(crate) fn deliver(&mut self, channel: &[u8], payload: &[u8], violations: &mut Violations) {
         self.received += 1;
         let chan: u64 = match channel.strip_prefix(b"chan:") {
             Some(digits) => core::str::from_utf8(digits).ok().and_then(|s| s.parse().ok()),
@@ -1464,7 +1465,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         state_hash: 0,
         events: 0,
         commands_done: 0,
-        oracle_violations: Vec::new(),
+        oracle_violations: Violations::new(),
         cap_rows_checked: 0,
         cap_rows_crossed: 0,
         stalled: false,
@@ -1486,7 +1487,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         idle_closed: 0,
         idle_survived: 0,
     };
-    let mut violations: Vec<String> = Vec::new();
+    let mut violations = Violations::new();
 
     let mut last_progress = (0u64, 0u64);
     let mut idle_steps = 0u64;
@@ -1867,7 +1868,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             plane.drain_expiry(final_now);
             let live = plane.keyspace_report().live_records;
             node_live += live;
-            violations.extend(audit::expired_retained(i, live, plane, final_now));
+            audit::expired_retained(i, live, plane, final_now, &mut violations);
             let (channels, patterns, bytes) = plane.pubsub_gauges();
             if channels != 0 || patterns != 0 || bytes != 0 {
                 violations.push(format!(
@@ -1882,7 +1883,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                 ));
             }
         }
-        violations.extend(audit::small_cap_engagement(scenario, &cells));
+        audit::small_cap_engagement(scenario, &cells, &mut violations);
         {
             let mut oracle = oracle.0.borrow_mut();
             audit::drain_model_expiry(&mut oracle.model, final_now);
@@ -1951,7 +1952,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     report.state_hash = state.value();
     // Appended, never assigned: a check that wrote the report's list before
     // this point keeps its line.
-    report.oracle_violations.extend(oracle.violations.iter().cloned());
+    report.oracle_violations.extend(oracle.violations.clone());
     report.oracle_violations.extend(violations);
     report.sim_seconds = clock.now().0.saturating_sub(1) as f64 / 1e9;
     report

@@ -294,6 +294,7 @@ impl Fixture {
         }
     }
 
+    #[track_caller]
     fn vacuous(&mut self, why: String) {
         self.report.violations.push(format!("VACUOUS {}: {why}", self.report.leg.name()));
     }

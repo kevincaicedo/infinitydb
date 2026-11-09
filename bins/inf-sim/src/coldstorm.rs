@@ -31,6 +31,7 @@
 //! (`legs.rs`): fixed shapes over files of known contents, each with the
 //! same per-round counts.
 
+use crate::driver::Violations;
 use core::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -186,7 +187,7 @@ impl RoundCounts {
 pub struct ColdStormReport {
     /// The leg the run drove.
     pub leg: ColdLeg,
-    pub violations: Vec<String>,
+    pub violations: Violations,
     /// Every round's delivery and preparation work, in order.
     pub rounds: Vec<RoundCounts>,
     /// Values received carrying a device error (the `errors` leg's).
@@ -307,6 +308,7 @@ impl World {
         self.files.iter().find(|f| addr >= f.base && addr < f.base + f.len)
     }
 
+    #[track_caller]
     fn violation(&mut self, message: String) {
         self.report.violations.push(message);
     }
@@ -1165,7 +1167,7 @@ mod tests {
             let report = run_cold_storm_scenario(&scenario);
             assert_eq!(report.leg, leg);
             assert!(!report.rounds.is_empty(), "{name}: no round recorded");
-            let vacuous: Vec<&String> =
+            let vacuous: Vec<&str> =
                 report.violations.iter().filter(|v| v.starts_with("VACUOUS")).collect();
             if matches!(leg, ColdLeg::Identity | ColdLeg::Stop) {
                 assert_eq!(vacuous.len(), 1, "{name}: {:?}", report.violations);

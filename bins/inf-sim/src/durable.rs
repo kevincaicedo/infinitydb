@@ -20,6 +20,7 @@
 //! acks, checkpoint epochs, truncation, and the ADR-0017 unlink
 //! resurrection cases all happen inside the deterministic loop.
 
+use crate::driver::Violations;
 use core::cell::RefCell;
 use std::collections::BTreeMap;
 use std::os::fd::RawFd;
@@ -1558,12 +1559,12 @@ pub(crate) fn m2_fill_config() -> inf_server::FillConfig {
 
 /// What one seeded run produced. `trace` is the determinism artifact
 /// (every apply event incl. the post-recovery audit reads).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DurableReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
     pub state_hash: u64,
-    pub violations: Vec<String>,
+    pub violations: Violations,
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
@@ -2672,7 +2673,7 @@ pub(crate) struct AuditTally {
     pub(crate) required_ops: u64,
     pub(crate) allowed_lost_ops: u64,
     pub(crate) audited_keys: u64,
-    pub(crate) violations: Vec<String>,
+    pub(crate) violations: Violations,
 }
 
 impl AuditTally {

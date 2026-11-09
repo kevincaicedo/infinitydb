@@ -2,6 +2,7 @@
 //! traffic, cuts, reboots, and the per-phase oracles it drives.
 
 use super::*;
+use crate::driver::Violations;
 
 // ---- the run ---------------------------------------------------------------
 
@@ -21,7 +22,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         trace: Vec::new(),
         trace_hash: 0,
         state_hash: 0,
-        violations: Vec::new(),
+        violations: Violations::new(),
         cap_rows_checked: 0,
         cap_rows_crossed: 0,
         stalled: false,
@@ -92,9 +93,10 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         timers: super::TimersReport::default(),
         wake: super::WakeReport::default(),
     };
-    let fail = |report: &mut DurableReport, what: String| {
+    #[track_caller]
+    fn fail(report: &mut DurableReport, what: String) {
         report.violations.push(what);
-    };
+    }
     let dense_leg = scenario.fill_dense;
 
     // ---- boot 1 + DDL ------------------------------------------------

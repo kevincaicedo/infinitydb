@@ -25,6 +25,7 @@
 //! wake) and reported; every event folds into `trace_hash` and
 //! `--verify-determinism` requires two-run identity (L7).
 
+use crate::driver::Violations;
 use core::cell::{Cell, RefCell};
 use core::future::Future;
 use core::pin::Pin;
@@ -86,7 +87,7 @@ impl PressureScenario {
 
 #[derive(Debug, Default)]
 pub struct PressureReport {
-    pub violations: Vec<String>,
+    pub violations: Violations,
     pub stalls: u64,
     pub stall_timeouts: u64,
     /// Virtual stall latencies (park → wake), nanoseconds.
@@ -180,7 +181,7 @@ struct World {
     /// after [`WEDGE_EARLIEST_ROUND`].
     wedge_from: Option<u64>,
     /// Writer-side violations (spin-guard trips), merged into the report.
-    violations: Vec<String>,
+    violations: Violations,
     trace_hash: u64,
 }
 
@@ -433,7 +434,7 @@ fn build_world(demote: DemotionConfig, seed: u64) -> Rc<RefCell<World>> {
         oom_verdicts: 0,
         writers_done: 0,
         wedge_from: None,
-        violations: Vec::new(),
+        violations: Violations::new(),
         trace_hash: 0,
     }))
 }

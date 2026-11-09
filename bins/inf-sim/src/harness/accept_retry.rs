@@ -14,6 +14,7 @@
 //! reads the timer set, the plane's owner, the deadline the plane armed or
 //! its error counter.
 
+use crate::driver::Violations;
 use core::cell::RefCell;
 use core::fmt;
 use std::rc::Rc;
@@ -114,9 +115,9 @@ impl RetryWatch {
     }
 
     /// The run's verdict, after its last step, pushed onto the run's list.
-    pub(super) fn finish(mut self, violations: &mut Vec<String>) -> RetryReport {
+    pub(super) fn finish(mut self, violations: &mut Violations) -> RetryReport {
         self.report.open = self.open.iter().map(|slot| u64::from(slot.is_some())).sum();
-        violations.extend(self.report.verdict());
+        self.report.verdict(violations);
         self.report
     }
 }
@@ -141,8 +142,7 @@ impl RetryReport {
     }
 
     /// The violation lines of a finished run, each with its own token.
-    fn verdict(&self) -> Vec<String> {
-        let mut lines = Vec::new();
+    fn verdict(&self, lines: &mut Violations) {
         if self.parks == 0 {
             lines.push(
                 "VACUOUS accept-retry-unengaged: the leg's plant parked no accept arm".to_owned(),
@@ -178,7 +178,6 @@ impl RetryReport {
                 shown(self.past_deadline_ns_max)
             ));
         }
-        lines
     }
 }
 
@@ -291,13 +290,20 @@ mod tests {
         assert_eq!(report.latency_ns_min, Some(101 * MS - 1 - 1_000));
     }
 
+    /// The verdict's lines, as the run's list receives them.
+    fn verdict_of(report: &RetryReport) -> Violations {
+        let mut lines = Violations::new();
+        report.verdict(&mut lines);
+        lines
+    }
+
     #[test]
     fn each_clause_of_the_verdict_carries_its_own_token() {
         let unengaged = RetryReport::default();
-        assert_eq!(unengaged.verdict().len(), 1);
-        assert!(unengaged.verdict()[0].starts_with("VACUOUS accept-retry-unengaged"));
+        assert_eq!(verdict_of(&unengaged).len(), 1);
+        assert!(verdict_of(&unengaged)[0].starts_with("VACUOUS accept-retry-unengaged"));
         let green = RetryReport { parks: 3, retried: 3, ..RetryReport::default() };
-        assert!(green.verdict().is_empty());
+        assert!(verdict_of(&green).is_empty());
         for (report, token) in [
             (RetryReport { parks: 1, open: 1, ..RetryReport::default() }, "accept-retry-missing"),
             (
@@ -307,7 +313,7 @@ mod tests {
             (RetryReport { parks: 1, early: 1, ..RetryReport::default() }, "accept-retry-early"),
             (RetryReport { parks: 1, late: 1, ..RetryReport::default() }, "accept-retry-late"),
         ] {
-            let lines = report.verdict();
+            let lines = verdict_of(&report);
             assert_eq!(lines.len(), 1, "{token}: {lines:?}");
             assert!(lines[0].starts_with(token), "{token}: {lines:?}");
         }

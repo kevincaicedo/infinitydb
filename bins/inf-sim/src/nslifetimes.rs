@@ -61,6 +61,7 @@ use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_log::fs::sim::StallConfig;
 use inf_server::CkptTarget;
 
+use crate::driver::Violations;
 use crate::durable::{
     DurableScenario, MiniClient, Node, STALL_STEPS, TraceObserver, boot, build_disk,
     m2_stall_config,
@@ -167,7 +168,7 @@ pub struct NsLifetimesReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
     pub state_hash: u64,
-    pub violations: Vec<String>,
+    pub violations: Violations,
     /// Cap census rows read at the end of every life (node sum).
     pub cap_rows_checked: u64,
     /// Census rows the crossing rule judged (their `crossings > 0`).
@@ -260,6 +261,9 @@ fn name(prefix: &str, index: u32) -> Vec<u8> {
 }
 
 impl Run {
+    /// Records a violation, the caller's line its check, while the report
+    /// holds fewer than 16.
+    #[track_caller]
     fn fail(&mut self, message: String) {
         if self.report.violations.len() < 16 {
             self.report.violations.push(message);
@@ -1029,7 +1033,7 @@ fn empty_report(cells: u16, leg: LifetimesLeg) -> NsLifetimesReport {
         trace: Vec::new(),
         trace_hash: 0,
         state_hash: 0,
-        violations: Vec::new(),
+        violations: Violations::default(),
         cap_rows_checked: 0,
         cap_rows_crossed: 0,
         stalled: false,
