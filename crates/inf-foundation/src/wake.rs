@@ -68,8 +68,9 @@ pub const MARK_CLOSED: u64 = u64::MAX;
 /// The next mark to claim. A `core` atomic under Loom too: a `static` cannot hold Loom's atomics,
 /// which are not `const`-constructible, and a mark's uniqueness needs the read-modify-write
 /// alone, no ordering (ADR-0003 A1.2.8). Width: marks 1 to `MARK_CLOSED − 1` are issued, one per
-/// executor-building thread of the process (INF 584 years at 10⁹ claims a second); past them a
-/// claim aborts the process, so no mark is issued twice, and 0 and `MARK_CLOSED` never.
+/// executor-building thread of the process (about 584 years at 10⁹ claims a second, by
+/// arithmetic); past them a claim aborts the process, so no mark is issued twice, and 0 and
+/// `MARK_CLOSED` never.
 static NEXT_MARK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 std::thread_local! {
@@ -819,7 +820,7 @@ impl Drained {
 #[cfg(all(test, not(loom)))]
 mod tests {
     //! The bridge's contract on one thread at a time, its marks, and the bound's fail-stop. The
-    //! interleavings are the Loom models' (`loom_tests.rs`).
+    //! interleavings are the Loom models' (the `loom_tests` module below).
 
     use std::sync::mpsc;
 
