@@ -46,7 +46,10 @@ use inf_log::{
     TIER_FRAME_BYTES, TIER_FRAME_DATA, TierIoMode, TierWriter, tier_extract, tier_frame_offset,
     tier_frame_span,
 };
-use inf_runtime::{BackendDriver, CellExecutor, ColdReads, RawFd, TierFileId, TokenClass, Wait};
+use inf_runtime::{
+    BackendDriver, CellExecutor, ColdReads, ColdReceipt, ColdTurn, Completion, CompletionResult,
+    RawFd, TierFileId, TokenClass, Wait,
+};
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId, StoreConfig,
     TieredLookup, TieredTable,
@@ -159,8 +162,9 @@ impl ColdStormScenario {
 /// One round's delivery and preparation work, read by the harness: the
 /// values it received (its own count, each one polled to `Ready`), the
 /// members the host orphaned at delivery (the round's `unclaimed`), the
-/// values the host delivered (the sum of its receipts' returns), and the
-/// device reads the round's drains issued, with the most one call issued.
+/// values the host delivered (the sum of its delivery calls' progress), and
+/// the device reads the round's drains issued, with the most one call
+/// issued.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RoundCounts {
     pub received: u32,
@@ -912,9 +916,10 @@ fn unlink_drained(world: &mut World) {
     world.report.trace_hash = hash64(&unlinks.to_le_bytes(), world.report.trace_hash ^ deferrals);
 }
 
-/// Pump the sim driver and route TierRead completions into the custody
-/// table (the plane's completion-dispatch role).
-fn pump(world: &mut World, recv_pool: &mut BufferPool) {
+/// Pump the sim driver, record its TierRead receipts in the custody table
+/// (the plane's completion-dispatch role) and serve the round's delivery
+/// from its one turn, which both pumps share (ADR-0181 R2).
+fn pump(world: &mut World, recv_pool: &mut BufferPool, turn: &mut ColdTurn) {
     // S10: the drain admits queued intents (merge + QD cap + deficit)
     // into the same submit the eager path always rode.
     let cold = world.cold.clone();
@@ -924,10 +929,36 @@ fn pump(world: &mut World, recv_pool: &mut BufferPool) {
     let mut out = Vec::new();
     world.driver.submit_and_reap(recv_pool, Wait::Poll, &mut out).expect("sim submit");
     for completion in out {
-        assert_eq!(completion.token.class(), TokenClass::TierRead);
-        let delivered = world.cold.on_completion(completion.token, completion.result, world.now_us);
-        world.counts.delivered += delivered;
+        if let ColdReceipt::Foreign = record_receipt(&world.cold, completion, world.now_us) {
+            world.violation("a cold receipt named no issued read".into());
+        }
     }
+    deliver(world, turn);
+}
+
+/// The round's delivery service on its turn's allowance (the plane's
+/// `before_execute` role): the values delivered, counted.
+fn deliver(world: &mut World, turn: &mut ColdTurn) {
+    let progress = world.cold.deliver_ready(turn.delivery(), world.now_us);
+    world.counts.delivered += progress.delivered;
+}
+
+/// Records one `TierRead` completion, its outcome as the dispatch decides
+/// it: a full window, or the op's errno.
+pub(crate) fn record_receipt(cold: &ColdReads, completion: Completion, now_us: u64) -> ColdReceipt {
+    assert_eq!(completion.token.class(), TokenClass::TierRead);
+    let outcome = match completion.result {
+        CompletionResult::TierRead => Ok(()),
+        CompletionResult::Error { errno, .. } => Err(errno),
+        other @ (CompletionResult::Accepted { .. }
+        | CompletionResult::Recv { .. }
+        | CompletionResult::RecvDropped
+        | CompletionResult::Sent { .. }
+        | CompletionResult::LogWritten
+        | CompletionResult::Synced
+        | CompletionResult::Closed) => panic!("a tier read completed as {other:?}"),
+    };
+    cold.record_completion(completion.token, outcome, now_us)
 }
 
 /// Opens the round's counts; returns the host's `unclaimed` so far.
@@ -1007,12 +1038,17 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
     while ops < scenario.ops || ex.live_tasks() > 0 {
         round += 1;
         assert!(round < scenario.ops.max(1) * 4, "storm rounds exploded (liveness)");
+        // One host turn a round: its delivery allowance serves the ready
+        // work first, then both pumps share what is left (ADR-0181 R2).
+        let mut turn = ColdTurn::begin();
         let unclaimed_before = {
             let mut world = world.borrow_mut();
             world.now_us = round * ROUND_US;
             let now = world.now_us;
             world.report.state.number(b"round-time-us", now);
-            begin_round(&mut world)
+            let unclaimed_before = begin_round(&mut world);
+            deliver(&mut world, &mut turn);
+            unclaimed_before
         };
         // Foreground: new GETs (cold-heavy once files exist).
         if ops < scenario.ops {
@@ -1048,12 +1084,12 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
                 relocation_wave(world);
             }
             maintain_round(world);
-            pump(world, &mut recv_pool);
+            pump(world, &mut recv_pool, &mut turn);
         }
         ex.run_ready(512); // resume: re-resolve, decode, or restart.
         {
             let world = &mut *world.borrow_mut();
-            pump(world, &mut recv_pool); // chunk continuations
+            pump(world, &mut recv_pool, &mut turn); // chunk continuations
         }
         ex.run_ready(512);
         // Oracle: verify every completed GET against the history model.

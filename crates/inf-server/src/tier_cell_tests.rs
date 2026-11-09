@@ -1531,13 +1531,12 @@ fn a_cold_read_queued_before_a_drop_reads_its_own_file() {
     let mut scratch = vec![0u8; buf.len() as usize];
     let read = cell.fs.driver_read_at(issued, at, &mut scratch);
     let result = match &read {
-        Ok(_) => inf_runtime::CompletionResult::TierRead,
-        Err(err) => inf_runtime::CompletionResult::Error {
-            errno: err.raw_os_error().unwrap_or(EIO),
-            buf: None,
-        },
+        Ok(_) => Ok(()),
+        Err(err) => Err(err.raw_os_error().unwrap_or(EIO)),
     };
-    cold.on_completion(token, result, 0);
+    assert_eq!(cold.record_completion(token, result, 0), inf_runtime::ColdReceipt::Recorded);
+    let mut turn = inf_runtime::ColdTurn::begin();
+    let _ = cold.deliver_ready(turn.delivery(), 0);
     drop(wait);
     assert!(
         read.is_ok(),

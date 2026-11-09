@@ -56,9 +56,10 @@ pub use budget::{
     FLOOR_DIVISOR, IoClass, Issue, SealPace,
 };
 pub use cold::{
-    ColdDeliveryBudget, ColdDone, ColdLeak, ColdPreparationBudget, ColdReadConfig,
-    ColdReadCounters, ColdReads, ColdRefused, ColdTurn, ColdWait, DeviceId, LogicalId, PairIssuer,
-    ReadClass, TierFileId, UnrepresentableRead,
+    ColdDeliveryBudget, ColdDeliveryProgress, ColdDeliveryState, ColdDone, ColdLeak,
+    ColdPreparationBudget, ColdReadConfig, ColdReadCounters, ColdReads, ColdReceipt, ColdRefused,
+    ColdTurn, ColdWait, DeviceId, LogicalId, PairIssuer, ReadClass, TierFileId,
+    UnrepresentableRead,
 };
 pub use driver::{
     AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd,

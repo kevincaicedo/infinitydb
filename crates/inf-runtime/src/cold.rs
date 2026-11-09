@@ -12,14 +12,19 @@
 //!   spends device bandwidth.
 //! - **In flight**, the buffer and file pins belong to the *device read*,
 //!   held in the cell-local in-flight table.
-//! - **At terminal completion**, [`ColdReads::on_completion`] pops the
-//!   device read and delivers each waiter a [`ColdDone`] carrying its
-//!   subrange of the shared window. Every `ColdDone` drop releases that
-//!   waiter's file pin; the **last** drop releases the buffer lease —
-//!   exactly once across every cancellation interleaving (waiter
-//!   resumed, cancelled before completion, cancelled after delivery,
-//!   or a fully-cancelled merged read). Singleton and merged reads are
-//!   one code path: a singleton is a window with one waiter.
+//! - **At terminal completion**, [`ColdReads::record_completion`] records
+//!   the device read's outcome and links its window onto the ready list;
+//!   it visits no member. The turn's delivery service,
+//!   [`ColdReads::deliver_ready`], then visits the ready windows' members
+//!   round-robin, at most a turn's allowance a turn
+//!   (`COLD_DELIVERIES_PER_TURN`, ADR-0181 R1), giving each waiter a
+//!   [`ColdDone`] carrying its subrange of the shared window. Every
+//!   `ColdDone` drop releases that waiter's file pin; the **last** drop,
+//!   once every member was visited, releases the buffer lease — exactly
+//!   once across every cancellation interleaving (waiter resumed,
+//!   cancelled before completion, cancelled after delivery, or a
+//!   fully-cancelled merged read). Singleton and merged reads are one code
+//!   path: a singleton is a window with one waiter.
 //!
 //! Shaping (ADR-0055): [`ColdReads::enqueue`] parks an intent in a
 //! bounded per-class FIFO; [`ColdReads::drain`] — once per reactor
@@ -71,7 +76,7 @@ use inf_foundation::limits::DRIVER_OP_BYTES_MAX;
 use inf_foundation::{BuildIntHasher, FileOffset, FileOffsetRefused, LogHistogram};
 
 use crate::budget::Issue;
-use crate::driver::{CompletionResult, IoOp, RawFd, StableBytesMut};
+use crate::driver::{IoOp, RawFd, StableBytesMut};
 use crate::gate::{GateWait, KeyedGate};
 use crate::limits::{
     COLD_DELIVERIES_PER_TURN, COLD_IDENTITY_PAIRS_MAX, COLD_PREPARATION_WORK_PER_TURN,
@@ -331,6 +336,15 @@ pub struct ColdDeliveryBudget {
 }
 
 impl ColdDeliveryBudget {
+    /// Spends one visit, before the member it visits; `false` once the
+    /// turn's are spent, with nothing spent.
+    fn take(&mut self) -> bool {
+        let Some(left) = self.remaining.checked_sub(1) else { return false };
+        self.remaining = left;
+        self.spent += 1;
+        true
+    }
+
     /// Member visits left this turn.
     #[must_use]
     pub fn remaining(&self) -> u32 {
@@ -446,6 +460,19 @@ pub struct ColdReadCounters {
     /// `Maintain` reads the device budget deferred at drain (M4.5-S36,
     /// ADR-0088 D5) — per drain, not per intent; the intents stay queued.
     pub maintain_deferred: u64,
+    /// Member visits the delivery service spent: one a member, live,
+    /// cancelled or orphaned (ADR-0181 R1; `cold_delivery_work`).
+    pub delivery_work: u64,
+    /// The most member visits one turn spent, at most
+    /// `COLD_DELIVERIES_PER_TURN` (`cold_delivery_work_turn_max`).
+    pub delivery_work_turn_max: u32,
+    /// Receipts whose word named no Issued window — never minted, already
+    /// recorded, or their window gone: refused and counted, never asserted,
+    /// and 0 on a healthy run (ADR-0181 R1; `cold_receipt_foreign`).
+    pub receipts_foreign: u64,
+    /// Ready-list links that named no ready window: a defect, 0 on every
+    /// run, the walk stopped where it met one (`cold_link_stale`).
+    pub links_stale: u64,
 }
 
 impl ColdReadCounters {
@@ -525,12 +552,45 @@ struct Waiter {
     enqueued_us: u64,
 }
 
-/// One in-flight device read (singleton or merged — same shape).
+/// Where a window stands between its issue and its last member's visit
+/// (ADR-0181 R5). A window whose every member was visited leaves the
+/// table; its shared custody alone remains, until its last value drops.
+#[derive(Copy, Clone, Debug)]
+enum WindowPhase {
+    /// The device holds the read.
+    Issued,
+    /// The receipt is recorded: the outcome every member carries, and its
+    /// injected time.
+    Ready { outcome: Result<(), i32>, receipt_us: u64 },
+}
+
+/// One device read's window (singleton or merged — same shape): its
+/// members, its phase and its delivery cursor.
 struct DeviceRead {
     buf: AlignedBufId,
     file: TierFileId,
     len: u32,
     waiters: Vec<Waiter>,
+    phase: WindowPhase,
+    /// The next member to visit; `waiters.len()` once every one was.
+    cursor: u32,
+    /// The next window on the ready list, while this one is on it.
+    ready_next: Option<CompletionToken>,
+}
+
+impl DeviceRead {
+    /// A window the device holds: Issued, its cursor at its first member.
+    fn issued(buf: AlignedBufId, file: TierFileId, len: u32, waiters: Vec<Waiter>) -> DeviceRead {
+        DeviceRead {
+            buf,
+            file,
+            len,
+            waiters,
+            phase: WindowPhase::Issued,
+            cursor: 0,
+            ready_next: None,
+        }
+    }
 }
 
 /// A terminally-completed window shared by its waiters' `ColdDone`s;
@@ -549,8 +609,25 @@ struct ColdState {
     /// Deficit grants remaining per class (refilled together when both
     /// are spent under contention).
     grants: [u32; 2],
+    /// Every window from its issue until its last member is visited,
+    /// keyed by its device token: Issued, then Ready.
     inflight: HashMap<CompletionToken, DeviceRead, BuildIntHasher>,
+    /// Every window from its receipt until its last value drops.
     windows: HashMap<CompletionToken, SharedWindow, BuildIntHasher>,
+    /// Issued windows: the device QD the cap bounds (`cold_reads_inflight`).
+    device_reads: usize,
+    /// The ready list's ends: windows with members left to visit, linked
+    /// through their `ready_next` in receipt order, a visited window
+    /// re-linked at the tail.
+    ready_head: Option<CompletionToken>,
+    ready_tail: Option<CompletionToken>,
+    /// Members of ready windows not yet visited, and those windows
+    /// (`cold_delivery_pending_members`, `cold_delivery_pending_windows`).
+    pending_members: u64,
+    pending_windows: u64,
+    /// Receipt-to-delivery delay of delivered values, injected µs
+    /// (`cold_delivery_delay_p99_us`).
+    delay_hist: LogHistogram,
     /// Per-file pin count over queued + in-flight + undropped `ColdDone`
     /// custody (§3.3). Entries exist only while nonzero.
     pins: HashMap<TierFileId, u32, BuildIntHasher>,
@@ -606,6 +683,54 @@ fn parse_window(
     // this narrowing never refuses; were it to, the fault is the same.
     let len = u32::try_from(window_bytes).map_err(|_| too_wide)?;
     Ok((offset, len))
+}
+
+/// What [`ColdReads::record_completion`] made of a receipt.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[must_use]
+pub enum ColdReceipt {
+    /// The window it named was Issued: now Ready, linked for delivery.
+    Recorded,
+    /// It named no Issued window: counted, and nothing changed.
+    Foreign,
+}
+
+/// Whether ready windows remain after a delivery call.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ColdDeliveryState {
+    /// No window has a member left to visit.
+    Idle,
+    /// Members wait for a later step: the turn's allowance ran out.
+    Ready,
+}
+
+/// One delivery call's work (ADR-0181 R1): the members it visited,
+/// [`examined`](Self::examined), split into values handed to live waiters
+/// and members whose waiter was gone. It never calls an orphan a read.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct ColdDeliveryProgress {
+    /// Values delivered to live waiters.
+    pub delivered: u32,
+    /// Members whose waiter was gone: each value dropped at its visit.
+    pub unclaimed: u32,
+    /// Whether ready windows remain.
+    pub state: ColdDeliveryState,
+}
+
+impl ColdDeliveryProgress {
+    /// Members visited: `delivered + unclaimed`.
+    #[must_use]
+    pub fn examined(&self) -> u32 {
+        self.delivered + self.unclaimed
+    }
+}
+
+/// One member's visit, built under the state borrow and delivered after it.
+struct DeliveryStep {
+    logical: LogicalId,
+    done: ColdDone,
+    enqueued_us: u64,
+    receipt_us: u64,
 }
 
 /// Leak report from [`ColdReads::reconcile`].
@@ -668,6 +793,12 @@ impl ColdReads {
                 grants,
                 inflight: HashMap::default(),
                 windows: HashMap::default(),
+                device_reads: 0,
+                ready_head: None,
+                ready_tail: None,
+                pending_members: 0,
+                pending_windows: 0,
+                delay_hist: LogHistogram::new(),
                 pins: HashMap::default(),
                 counters: ColdReadCounters::default(),
                 qd_hist: LogHistogram::new(),
@@ -712,8 +843,9 @@ impl ColdReads {
     /// Parks a read intent in its class FIFO and returns the waiter.
     /// The file pin is taken now; the buffer is leased at drain time.
     /// **Nothing but plain data crosses the suspension** — custody sits
-    /// in the queue/in-flight tables until the terminal completion
-    /// routes through [`on_completion`](Self::on_completion).
+    /// in the queue/in-flight tables until the terminal completion is
+    /// recorded ([`record_completion`](Self::record_completion)) and the
+    /// turn's delivery ([`deliver_ready`](Self::deliver_ready)) visits it.
     ///
     /// `now_us` is injected time (L7): the reactor clock in production,
     /// sim time in DST — it feeds the `cold_read_p99_us` histogram.
@@ -802,7 +934,7 @@ impl ColdReads {
         loop {
             let mut state_ref = self.state.borrow_mut();
             let state = &mut *state_ref;
-            if state.inflight.len() >= state.config.qd_cap {
+            if state.device_reads >= state.config.qd_cap {
                 break;
             }
             Self::purge_stale_heads(state, &self.gate);
@@ -894,8 +1026,8 @@ impl ColdReads {
 
     /// Pops the class FIFO's live head as the seed, joins mergeable
     /// intents (same file, adjacent/overlapping, union fits one pool
-    /// buffer), and builds the device read. FIFO order of everything
-    /// left behind is preserved (one rotate pass).
+    /// buffer), and builds the device read ([`issue`](Self::issue)). FIFO
+    /// order of everything left behind is preserved (one rotate pass).
     fn admit(
         state: &mut ColdState,
         gate: &KeyedGate<LogicalId, ColdDone>,
@@ -957,8 +1089,15 @@ impl ColdReads {
             }
             device
         };
-        let ColdState { pool, inflight, counters, qd_hist, spare_waiters, merge_scratch, .. } =
-            state;
+        Self::issue(state, device, buf)
+    }
+
+    /// Builds the merged window's device read under `device`, the seed's
+    /// reserved id: each member's record written once from the union, the
+    /// window Issued in the table, the device QD counted.
+    fn issue(state: &mut ColdState, device: DeviceId, buf: AlignedBufId) -> IoOp {
+        let buf_size = state.pool.buf_size();
+        let ColdState { pool, inflight, counters, spare_waiters, merge_scratch, .. } = state;
         let (fd, file) = (merge_scratch[0].fd, merge_scratch[0].file);
         // The lowest intent's position is already a `FileOffset`: the merged
         // read never re-parses a position (ADR-0167 D3).
@@ -987,90 +1126,196 @@ impl ColdReads {
         let target = &mut pool.bytes_mut(buf)[..window_len];
         // SAFETY: the pool buffer's address is stable for the pool's
         // lifetime (inf-alloc invariant) and its lease is held by the
-        // in-flight table — released only when the last `ColdDone` built
-        // at this device read's terminal completion drops — so nothing
-        // reads, writes, or re-leases these bytes while the driver owns
-        // them, regardless of what any issuing future does (including
-        // being cancelled).
+        // window — released only when its last value drops, after the
+        // receipt and every member's visit — so nothing reads, writes, or
+        // re-leases these bytes while the driver owns them, regardless of
+        // what any issuing future does (including being cancelled).
         let stable = unsafe { StableBytesMut::new(target) };
-        inflight.insert(device.token(), DeviceRead { buf, file, len: window_len as u32, waiters });
-        qd_hist.record(inflight.len() as u64);
+        inflight.insert(device.token(), DeviceRead::issued(buf, file, window_len as u32, waiters));
+        state.device_reads += 1;
+        state.qd_hist.record(state.device_reads as u64);
         IoOp::TierRead { fd, offset: lo, buf: stable, token: device.token() }
     }
 
-    /// Routes a `TierRead`-class terminal completion: pops the device
-    /// read, parks its window as shared custody, and delivers each
-    /// waiter a [`ColdDone`] carrying its subrange. Returns how many
-    /// live waiters received one; cancelled waiters' custody releases
-    /// here (counted, the designed path — never a panic). `now_us`
-    /// feeds the delivery-latency histogram (injected time, L7).
+    /// Records a `TierRead` receipt (ADR-0181 R1): `result` is the outcome
+    /// the completion dispatch decided, `Ok(())` for a full window or
+    /// `Err(errno)`. The window the device token names, while Issued,
+    /// becomes Ready with `result` and `now_us` (injected time, L7), returns
+    /// its device-QD position and is linked once at the ready list's tail.
+    /// No member is visited, no task woken, and no buffer or pin returns:
+    /// the turn's [`deliver_ready`](Self::deliver_ready) does that.
     ///
-    /// # Panics
-    /// Panics on a token this path never issued or already completed —
-    /// duplicate/foreign terminal completions are driver-contract bugs.
-    pub fn on_completion(
+    /// A receipt is what the host receives from the driver, so it is
+    /// checked here: a word that names no Issued window — never minted,
+    /// already recorded, or its window gone — is [`ColdReceipt::Foreign`],
+    /// counted (`receipts_foreign`) and changing nothing, never a panic.
+    pub fn record_completion(
         &self,
         token: CompletionToken,
-        result: CompletionResult,
+        result: Result<(), i32>,
         now_us: u64,
-    ) -> u32 {
-        let outcome = match result {
-            CompletionResult::TierRead => Ok(()),
-            CompletionResult::Error { errno, buf } => {
-                debug_assert!(buf.is_none(), "tier reads never carry recv-pool buffers");
-                Err(errno)
-            }
-            other @ (CompletionResult::Accepted { .. }
-            | CompletionResult::Recv { .. }
-            | CompletionResult::RecvDropped
-            | CompletionResult::Sent { .. }
-            | CompletionResult::LogWritten
-            | CompletionResult::Synced
-            | CompletionResult::Closed) => {
-                panic!("non-tier completion routed to ColdReads: {other:?}")
-            }
+    ) -> ColdReceipt {
+        let mut state_ref = self.state.borrow_mut();
+        let state = &mut *state_ref;
+        let Some(read) = state.inflight.get_mut(&token) else {
+            state.counters.receipts_foreign += 1;
+            return ColdReceipt::Foreign;
         };
-        let (file, mut waiters) = {
-            let mut state = self.state.borrow_mut();
-            match outcome {
-                Ok(()) => state.counters.completed += 1,
-                Err(_) => state.counters.errored += 1,
-            }
-            let read = state.inflight.remove(&token).expect("completion for an unknown cold read");
-            for waiter in &read.waiters {
-                debug_assert!(
-                    waiter.skip + waiter.len <= read.len,
-                    "every waiter subrange sits inside the window"
-                );
-            }
-            state.windows.insert(
-                token,
-                SharedWindow { buf: read.buf, remaining: read.waiters.len() as u32 },
+        let WindowPhase::Issued = read.phase else {
+            state.counters.receipts_foreign += 1;
+            return ColdReceipt::Foreign;
+        };
+        for waiter in &read.waiters {
+            debug_assert!(
+                waiter.skip + waiter.len <= read.len,
+                "every waiter subrange sits inside the window"
             );
-            (read.file, read.waiters)
-        };
-        let mut delivered = 0u32;
-        for waiter in waiters.drain(..) {
-            let done = ColdDone {
-                outcome,
-                state: Rc::clone(&self.state),
-                window: token,
-                skip: waiter.skip,
-                len: waiter.len,
-                file,
-            };
-            if self.gate.complete(waiter.logical, done) {
-                delivered += 1;
+        }
+        read.phase = WindowPhase::Ready { outcome: result, receipt_us: now_us };
+        let members = read.waiters.len();
+        let buf = read.buf;
+        match result {
+            Ok(()) => state.counters.completed += 1,
+            Err(_) => state.counters.errored += 1,
+        }
+        state.device_reads -= 1;
+        // Lossless: a window's members are at most the class queue's bound.
+        state.windows.insert(token, SharedWindow { buf, remaining: members as u32 });
+        state.pending_members += members as u64;
+        state.pending_windows += 1;
+        Self::link_ready(state, token);
+        ColdReceipt::Recorded
+    }
+
+    /// The turn's delivery service (ADR-0181 R1): visits the ready windows'
+    /// members round-robin, one member a step and each step one unit of
+    /// `budget` spent before its visit, until the list is empty or the
+    /// turn's allowance is spent. A step reads the member at its window's
+    /// cursor, advances the cursor and re-links the window at the tail (or
+    /// takes it off at its last member) **before** it completes the gate,
+    /// with the state borrow released, so a value dropped in the gate's
+    /// orphan cleanup re-resolves its window. A live waiter receives its
+    /// [`ColdDone`] (`delivered`); an orphaned member's value is dropped,
+    /// returning its share (`unclaimed`). `now_us` is injected time (L7).
+    pub fn deliver_ready(
+        &self,
+        budget: &mut ColdDeliveryBudget,
+        now_us: u64,
+    ) -> ColdDeliveryProgress {
+        let spent_before = budget.spent();
+        let mut progress =
+            ColdDeliveryProgress { delivered: 0, unclaimed: 0, state: ColdDeliveryState::Idle };
+        while let Some(step) = self.delivery_step(budget) {
+            if self.gate.complete(step.logical, step.done) {
+                progress.delivered += 1;
                 let mut state = self.state.borrow_mut();
                 state.counters.delivered += 1;
-                state.latency_hist.record(now_us.saturating_sub(waiter.enqueued_us));
+                state.latency_hist.record(now_us.saturating_sub(step.enqueued_us));
+                state.delay_hist.record(now_us.saturating_sub(step.receipt_us));
             } else {
+                progress.unclaimed += 1;
                 self.state.borrow_mut().counters.unclaimed += 1;
             }
         }
         let mut state = self.state.borrow_mut();
-        state.spare_waiters.push(waiters);
-        delivered
+        let spent = budget.spent().saturating_sub(spent_before);
+        state.counters.delivery_work += u64::from(spent);
+        let turn_max = state.counters.delivery_work_turn_max.max(budget.spent());
+        state.counters.delivery_work_turn_max = turn_max;
+        if state.ready_head.is_some() {
+            progress.state = ColdDeliveryState::Ready;
+        }
+        progress
+    }
+
+    /// One delivery step under a short state borrow: a unit spent, the
+    /// ready head's member at its cursor read, the cursor advanced and the
+    /// window re-linked or retired, and the member's value built. `None`
+    /// with nothing spent when no window is ready or the allowance is
+    /// spent; `None` after the unit when a link names no ready window, a
+    /// defect counted where the walk stopped.
+    fn delivery_step(&self, budget: &mut ColdDeliveryBudget) -> Option<DeliveryStep> {
+        let mut state_ref = self.state.borrow_mut();
+        let state = &mut *state_ref;
+        let window = state.ready_head?;
+        if !budget.take() {
+            return None;
+        }
+        let Some(read) = state.inflight.get_mut(&window) else {
+            return Self::link_stale(state, "the ready head names no window");
+        };
+        let WindowPhase::Ready { outcome, receipt_us } = read.phase else {
+            return Self::link_stale(state, "the ready head names an Issued window");
+        };
+        let Some(waiter) = read.waiters.get(read.cursor as usize) else {
+            return Self::link_stale(state, "the ready head has no member left");
+        };
+        let (logical, skip, len, enqueued_us) =
+            (waiter.logical, waiter.skip, waiter.len, waiter.enqueued_us);
+        read.cursor += 1;
+        let last = read.cursor as usize == read.waiters.len();
+        let file = read.file;
+        state.ready_head = read.ready_next.take();
+        if state.ready_head.is_none() {
+            state.ready_tail = None;
+        }
+        state.pending_members -= 1;
+        if last {
+            state.pending_windows -= 1;
+            if let Some(mut read) = state.inflight.remove(&window) {
+                read.waiters.clear();
+                state.spare_waiters.push(read.waiters);
+            }
+        } else {
+            Self::link_ready(state, window);
+        }
+        let done = ColdDone { outcome, state: Rc::clone(&self.state), window, skip, len, file };
+        Some(DeliveryStep { logical, done, enqueued_us, receipt_us })
+    }
+
+    /// Links `window` at the ready list's tail.
+    fn link_ready(state: &mut ColdState, window: CompletionToken) {
+        match state.ready_tail {
+            Some(tail) => match state.inflight.get_mut(&tail) {
+                Some(read) => read.ready_next = Some(window),
+                None => {
+                    state.counters.links_stale += 1;
+                    debug_assert!(false, "cold-link-stale: the ready tail names no window");
+                }
+            },
+            None => state.ready_head = Some(window),
+        }
+        state.ready_tail = Some(window);
+    }
+
+    /// A ready-list link that named no ready window (a defect): counted, a
+    /// debug assertion carrying `cold-link-stale`, and the walk stops.
+    fn link_stale(state: &mut ColdState, why: &str) -> Option<DeliveryStep> {
+        state.counters.links_stale += 1;
+        debug_assert!(false, "cold-link-stale: {why}");
+        None
+    }
+
+    /// Whether a window has members left to visit: the park decision's
+    /// delivery half (ADR-0181 R2).
+    #[must_use]
+    pub fn has_ready_delivery(&self) -> bool {
+        self.state.borrow().ready_head.is_some()
+    }
+
+    /// Members of ready windows not yet visited, and those windows
+    /// (`cold_delivery_pending_members`, `cold_delivery_pending_windows`).
+    #[must_use]
+    pub fn delivery_pending(&self) -> (u64, u64) {
+        let state = self.state.borrow();
+        (state.pending_members, state.pending_windows)
+    }
+
+    /// Receipt-to-delivery delay percentile in injected µs
+    /// (`cold_delivery_delay_p99_us` at `p = 99.0`; delivered values only).
+    #[must_use]
+    pub fn delivery_delay_percentile_us(&self, p: f64) -> u64 {
+        self.state.borrow().delay_hist.percentile(p)
     }
 
     /// Cold reads pinning `file` — queued, in flight, or delivered with
@@ -1082,10 +1327,11 @@ impl ColdReads {
     }
 
     /// Device reads in flight — `cold_reads_inflight`, bounded by the
-    /// QD cap (merged reads count once; the S08-era hook, now capped).
+    /// QD cap (merged reads count once; the S08-era hook, now capped): the
+    /// Issued windows, a Ready one no longer counted.
     #[must_use]
     pub fn inflight_total(&self) -> usize {
-        self.state.borrow().inflight.len()
+        self.state.borrow().device_reads
     }
 
     /// Queued intents across both classes — `cold_queue_depth` (the
@@ -1190,7 +1436,23 @@ impl core::fmt::Debug for ColdReads {
 /// A terminally-completed cold read **and** this waiter's share of the
 /// window custody. Dropping it — resumed, cancelled, or unclaimed —
 /// releases this waiter's file pin and, on the last drop of the shared
-/// window, the buffer lease: exactly once, wherever the values end up.
+/// window, once every member was visited, the buffer lease: exactly once,
+/// wherever the values end up. One share is one value, so it is not
+/// `Clone`:
+///
+/// ```compile_fail,E0599
+/// fn twice(done: inf_runtime::ColdDone) -> (inf_runtime::ColdDone, inf_runtime::ColdDone) {
+///     (done.clone(), done)
+/// }
+/// ```
+///
+/// Its twin, the share moved once, compiles:
+///
+/// ```
+/// fn once(done: inf_runtime::ColdDone) -> inf_runtime::ColdDone {
+///     done
+/// }
+/// ```
 pub struct ColdDone {
     outcome: Result<(), i32>,
     state: Rc<RefCell<ColdState>>,
@@ -1203,9 +1465,9 @@ pub struct ColdDone {
 }
 
 impl ColdDone {
-    /// `Ok` when the window is full ([`CompletionResult::TierRead`]);
-    /// `Err(errno)` on the op's terminal error (EIO inside the flushed
-    /// range is corruption — the caller surfaces it typed).
+    /// `Ok` when the window is full; `Err(errno)` on the op's terminal error
+    /// (EIO inside the flushed range is corruption — the caller surfaces it
+    /// typed).
     pub fn outcome(&self) -> Result<(), i32> {
         self.outcome
     }
@@ -1284,6 +1546,24 @@ mod tests {
         ops
     }
 
+    /// Plays a receipt and the turns that deliver it: records `result` for
+    /// `token`, then serves whole turns until no window is ready; returns
+    /// the values delivered to live waiters.
+    fn deliver_all(
+        cold: &ColdReads,
+        token: CompletionToken,
+        result: Result<(), i32>,
+        now_us: u64,
+    ) -> u32 {
+        assert_eq!(cold.record_completion(token, result, now_us), ColdReceipt::Recorded);
+        let mut delivered = 0;
+        while cold.has_ready_delivery() {
+            let mut turn = ColdTurn::begin();
+            delivered += cold.deliver_ready(turn.delivery(), now_us).delivered;
+        }
+        delivered
+    }
+
     /// Play the driver: fill the destination with `fill` through the
     /// stable handle and hand back the device token.
     fn complete(op: IoOp, fill: u8) -> CompletionToken {
@@ -1309,7 +1589,7 @@ mod tests {
         assert_eq!(cold.queue_depth(), 0);
         assert_eq!(cold.inflight_total(), 1);
         let token = complete(ops.remove(0), 0xC0);
-        assert_eq!(cold.on_completion(token, CompletionResult::TierRead, 5), 1);
+        assert_eq!(deliver_all(&cold, token, Ok(()), 5), 1);
         let done = block_on_ready(waiter);
         assert_eq!(done.outcome(), Ok(()));
         assert_eq!(done.file(), file);
@@ -1339,7 +1619,7 @@ mod tests {
         drop(waiter); // the command was cancelled mid-suspension
         assert_eq!(cold.inflight_on(file), 1, "the op still owns the pin");
         let token = complete(ops.remove(0), 0xC0);
-        assert_eq!(cold.on_completion(token, CompletionResult::TierRead, 0), 0, "no live waiter");
+        assert_eq!(deliver_all(&cold, token, Ok(()), 0), 0, "no live waiter");
         assert_eq!(cold.reconcile(), Ok(()), "custody released at the unclaimed delivery");
         assert_eq!(cold.counters().unclaimed, 1);
     }
@@ -1353,7 +1633,7 @@ mod tests {
         let waiter = ask(&cold, 3, file, 0, 64);
         let mut ops = drain_ops(&cold);
         let token = complete(ops.remove(0), 0xC0);
-        assert_eq!(cold.on_completion(token, CompletionResult::TierRead, 0), 1, "delivery parks");
+        assert_eq!(deliver_all(&cold, token, Ok(()), 0), 1, "delivery parks");
         drop(waiter); // cancelled between delivery and poll
         assert_eq!(cold.reconcile(), Ok(()), "the parked ColdDone released on drop");
     }
@@ -1380,8 +1660,7 @@ mod tests {
         let waiter = ask(&cold, 3, file, 0, 64);
         let mut ops = drain_ops(&cold);
         let IoOp::TierRead { token, .. } = ops.remove(0) else { panic!("drain builds TierRead") };
-        let result = CompletionResult::Error { errno: libc::EIO, buf: None };
-        assert_eq!(cold.on_completion(token, result, 0), 1);
+        assert_eq!(deliver_all(&cold, token, Err(libc::EIO), 0), 1);
         let done = block_on_ready(waiter);
         assert_eq!(done.outcome(), Err(libc::EIO), "EIO in the flushed range is corruption");
         drop(done);
@@ -1403,12 +1682,12 @@ mod tests {
         assert_eq!(cold.counters().pool_dry, 1, "the second intent stalled on the pool");
         assert_eq!(cold.queue_depth(), 1);
         let token = complete(ops.remove(0), 0xAA);
-        cold.on_completion(token, CompletionResult::TierRead, 0);
+        deliver_all(&cold, token, Ok(()), 0);
         drop(block_on_ready(first)); // returns the lease
         let mut ops = drain_ops(&cold);
         assert_eq!(ops.len(), 1, "the queued intent proceeds after the release");
         let token = complete(ops.remove(0), 0xBB);
-        cold.on_completion(token, CompletionResult::TierRead, 0);
+        deliver_all(&cold, token, Ok(()), 0);
         drop(block_on_ready(second));
         assert_eq!(cold.reconcile(), Ok(()));
     }
@@ -1451,7 +1730,7 @@ mod tests {
         assert_eq!(issued, offsets[..2], "FIFO admission order");
         assert!(drain_ops(&cold).is_empty(), "cap holds while nothing completed");
         let token = complete(ops.into_iter().next().expect("first"), 0xCC);
-        cold.on_completion(token, CompletionResult::TierRead, 0);
+        deliver_all(&cold, token, Ok(()), 0);
         let ops = drain_ops(&cold);
         assert_eq!(ops.len(), 1, "one freed slot admits one queued intent");
         let IoOp::TierRead { offset, .. } = &ops[0] else { panic!("TierRead") };
@@ -1481,7 +1760,7 @@ mod tests {
         assert_eq!(counters.issued, 1);
         assert_eq!(counters.merged_waiters, 3);
         let token = complete(ops.remove(0), 0xEE);
-        assert_eq!(cold.on_completion(token, CompletionResult::TierRead, 9), 4, "full fan-out");
+        assert_eq!(deliver_all(&cold, token, Ok(()), 9), 4, "full fan-out");
         for (waiter, len) in [(a, FRAME as usize), (b, FRAME as usize), (c, FRAME as usize)] {
             let done = block_on_ready(waiter);
             done.bytes(|bytes| assert_eq!(bytes.len(), len));
@@ -1536,7 +1815,7 @@ mod tests {
         assert_eq!(ops.len(), 1, "merged before the cancellation");
         drop(cancel); // cancelled while the merged read is in flight
         let token = complete(ops.remove(0), 0xDD);
-        assert_eq!(cold.on_completion(token, CompletionResult::TierRead, 0), 1);
+        assert_eq!(deliver_all(&cold, token, Ok(()), 0), 1);
         let counters = cold.counters();
         assert_eq!(counters.delivered, 1);
         assert_eq!(counters.unclaimed, 1, "the cancelled share released at delivery");
@@ -1603,7 +1882,7 @@ mod tests {
             let IoOp::TierRead { offset, .. } = ops[0] else { panic!("TierRead") };
             order.push(if offset.bytes() >= 100 << 20 { 'm' } else { 'f' });
             let token = complete(ops.remove(0), 0x11);
-            cold.on_completion(token, CompletionResult::TierRead, 0);
+            deliver_all(&cold, token, Ok(()), 0);
         }
         let split: String = order.iter().collect();
         assert_eq!(split, "fffmfffmfffmfffm", "3:1 deficit under contention");
@@ -1627,7 +1906,7 @@ mod tests {
             cold.enqueue(3, file, 0, 64, ReadClass::Foreground, late_us).expect("queue sized");
         let mut ops = drain_ops(&cold);
         let token = complete(ops.remove(0), 0xC0);
-        assert_eq!(cold.on_completion(token, CompletionResult::TierRead, late_us + 12), 1);
+        assert_eq!(deliver_all(&cold, token, Ok(()), late_us + 12), 1);
         assert_eq!(cold.latency_percentile_us(99.0), 12, "the delta, never uptime");
         drop(block_on_ready(waiter));
         assert_eq!(cold.reconcile(), Ok(()));
@@ -1646,7 +1925,7 @@ mod tests {
         let waiter = ask(&cold, 3, file, 0, 64);
         let mut ops = drain_ops(&cold);
         let token = complete(ops.remove(0), 0xC0);
-        assert_eq!(cold.on_completion(token, CompletionResult::TierRead, 12), 1);
+        assert_eq!(deliver_all(&cold, token, Ok(()), 12), 1);
         {
             // Same-file test module: reach the private histogram and
             // Fibonacci-double its counts past u32::MAX (25 rounds of
@@ -1926,10 +2205,11 @@ mod tests {
     }
 
     /// One device read of `members` identical requests, each polled to
-    /// `Pending` under a counting waker, then its one receipt: returns the
-    /// wakes that receipt made. Every value is then polled, read as the
-    /// receipt's error and dropped, and custody reconciles.
-    fn wakes_of_one_receipt(members: usize) -> usize {
+    /// `Pending` under a counting waker, then its one receipt and the turns
+    /// that deliver it: returns the wakes the receipt made and each turn's.
+    /// Every value is then polled, read as the receipt's error and dropped,
+    /// and custody reconciles.
+    fn wakes_of_one_receipt(members: usize) -> (usize, Vec<usize>) {
         use core::future::Future;
         use core::task::{Context, Poll, Waker};
         let config =
@@ -1946,41 +2226,67 @@ mod tests {
         let ops = drain_ops(&cold);
         assert_eq!(ops.len(), 1, "the {members} identical requests merge into one device read");
         let IoOp::TierRead { token, .. } = ops[0] else { panic!("drain builds TierRead") };
-        let result = CompletionResult::Error { errno: libc::EIO, buf: None };
-        let delivered = cold.on_completion(token, result, 1);
-        let wakes = count.0.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(delivered as usize, members, "engagement: every member was delivered");
-        for mut wait in waits {
+        let wakes = || count.0.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(cold.record_completion(token, Err(libc::EIO), 1), ColdReceipt::Recorded);
+        let at_receipt = wakes();
+        let mut turns = Vec::new();
+        while cold.has_ready_delivery() {
+            assert!(turns.len() < members, "every turn visits a member");
+            let before = wakes();
+            let mut turn = ColdTurn::begin();
+            let progress = cold.deliver_ready(turn.delivery(), 2);
+            assert_eq!(progress.examined() as usize, wakes() - before, "each visit one wake");
+            turns.push(wakes() - before);
+        }
+        let woken = at_receipt + turns.iter().sum::<usize>();
+        assert_eq!(woken, members, "engagement: every member was delivered, over the turns");
+        for (index, mut wait) in waits.into_iter().enumerate() {
             let Poll::Ready(done) = core::pin::Pin::new(&mut wait).poll(&mut cx) else {
                 panic!("a delivered member is ready");
             };
             assert_eq!(done.outcome(), Err(libc::EIO), "each member carries the receipt's error");
+            drop(done);
+            let pins = cold.inflight_on(file) as usize;
+            assert_eq!(pins, members - index - 1, "each value's drop returns its own pin");
         }
+        let counts = cold.counters();
+        let exact = (counts.issued, counts.errored, counts.unclaimed, counts.delivered);
+        assert_eq!(exact, (1, 1, 0, members as u64), "one read, its error, every member delivered");
+        assert_eq!(
+            counts.enqueued,
+            counts.issued + counts.merged_waiters + counts.cancelled_queued
+        );
         drop(ops);
         assert_eq!(cold.reconcile(), Ok(()), "every value dropped: custody is back");
-        wakes
+        (at_receipt, turns)
     }
 
     /// A turn delivers at most 64 members (`COLD_DELIVERIES_PER_TURN`,
     /// ADR-0181 R1) and a device receipt delivers none: it marks its window
     /// ready for the turn's delivery. Here 65 identical requests merge into
-    /// one device read whose one receipt is routed. The oracle is the
-    /// waker's count, independent of the host; the one-member read engages
-    /// it, one receipt and one wake.
+    /// one device read whose one receipt is routed, then turns deliver it.
+    /// The oracle is the waker's count, independent of the host; the
+    /// one-member read engages it, no wake at the receipt and one at its
+    /// turn.
     #[test]
-    #[ignore = "one device receipt builds and delivers its whole cohort before it returns, so a \
-                65-member read wakes 65 tasks in one call; red until a receipt delivers no member \
-                and a turn delivers at most 64"]
     fn one_receipt_delivers_at_most_a_turns_allowance() {
-        const DELIVERIES_PER_TURN: usize = 64;
-        assert_eq!(wakes_of_one_receipt(1), 1, "engagement: one member, one wake");
-        let members = DELIVERIES_PER_TURN + 1;
-        let wakes = wakes_of_one_receipt(members);
+        let per_turn = COLD_DELIVERIES_PER_TURN as usize;
+        assert_eq!(wakes_of_one_receipt(1), (0, vec![1]), "engagement: one member, one wake");
+        let members = per_turn + 1;
+        let (at_receipt, turns) = wakes_of_one_receipt(members);
         assert!(
-            wakes <= DELIVERIES_PER_TURN,
-            "one receipt of a {members}-member read woke {wakes} tasks in one call; a turn \
-             delivers at most {DELIVERIES_PER_TURN}"
+            at_receipt <= per_turn,
+            "one receipt of a {members}-member read woke {at_receipt} tasks in one call; a turn \
+             delivers at most {per_turn}"
         );
+        assert_eq!(at_receipt, 0, "a receipt visits no member");
+        for (turn, wakes) in turns.iter().enumerate() {
+            assert!(
+                *wakes <= per_turn,
+                "turn {turn} woke {wakes} tasks; a turn delivers at most {per_turn}"
+            );
+        }
+        assert_eq!(turns, [per_turn, 1], "the 65th member waits for the next turn");
     }
 
     /// A drain call's preparation is bounded: it spends at most 64 work
@@ -2135,7 +2441,7 @@ mod tests {
             assert!(seen.insert(device), "an id repeats: device {device}");
             assert_eq!(kept_logical % 2, 0, "a logical id is even");
             assert_eq!(device, kept_logical + 1, "a singleton reads under its own pair");
-            assert_eq!(cold.on_completion(token, CompletionResult::TierRead, 1), 1);
+            assert_eq!(deliver_all(&cold, token, Ok(()), 1), 1);
             drop((block_on_ready(kept), ops));
             assert!(drain_ops(&cold).is_empty(), "the purge issues nothing");
         }
@@ -2152,10 +2458,10 @@ mod tests {
     }
 
     impl Receipt {
-        fn result(self) -> CompletionResult {
+        fn result(self) -> Result<(), i32> {
             match self {
-                Receipt::Success => CompletionResult::TierRead,
-                Receipt::Error => CompletionResult::Error { errno: libc::EIO, buf: None },
+                Receipt::Success => Ok(()),
+                Receipt::Error => Err(libc::EIO),
             }
         }
 
@@ -2214,7 +2520,7 @@ mod tests {
             let IoOp::TierRead { fd, offset, ref buf, token } = ops[0] else { panic!("TierRead") };
             assert_eq!((fd, offset.bytes(), buf.len() as usize), (30, 0, LEN));
             assert_eq!(cold.inflight_on(window_file(window)) as usize, members);
-            assert_eq!(cold.on_completion(token, receipt.result(), 20) as usize, members);
+            assert_eq!(deliver_all(&cold, token, receipt.result(), 20) as usize, members);
             ops.clear();
             let expected = ColdLeak {
                 leased: window + 1,

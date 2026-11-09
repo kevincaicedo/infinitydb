@@ -15,12 +15,13 @@ use inf_foundation::hash64;
 use inf_log::TierIoMode;
 use inf_log::fs::sim::{DeviceFault, SimDisk, SimFile};
 use inf_log::fs::{SegmentFile, SegmentFs};
+use inf_runtime::limits::COLD_DELIVERIES_PER_TURN;
 use inf_runtime::{
-    BackendDriver, ColdDone, ColdReadConfig, ColdReads, ColdRefused, ColdWait, PairIssuer, RawFd,
-    ReadClass, TierFileId, TokenClass, Wait,
+    BackendDriver, ColdDone, ColdReadConfig, ColdReads, ColdReceipt, ColdRefused, ColdTurn,
+    ColdWait, PairIssuer, RawFd, ReadClass, TierFileId, Wait,
 };
 
-use super::{ColdLeg, ColdStormReport, ColdStormScenario, RoundCounts};
+use super::{ColdLeg, ColdStormReport, ColdStormScenario, RoundCounts, record_receipt};
 use crate::net::{CellNet, Plant, SimDriver};
 
 /// The legs' device depth: the default `COLD-READ-QD`, so the pool holds 64
@@ -35,6 +36,10 @@ const LEG_DIR: &str = "legs/cold";
 /// Rounds with no traffic after a leg's last arrival, in which the host
 /// drains what is left.
 const QUIET_ROUNDS: u64 = 8;
+/// The most further quiet rounds a leg waits for its ready delivery, at a
+/// turn's allowance a round: every buffer's window at a class queue's
+/// members, the most a host at the legs' depth can hold ready.
+const DELIVERY_ROUNDS_MAX: u64 = (DEPTH * CLASS_QUEUE) as u64 / COLD_DELIVERIES_PER_TURN as u64;
 /// Injected time per round (µs), as the storm's.
 const ROUND_US: u64 = 1000;
 /// A dense cohort: 31 adjacent requests of 512 B, one buffer's union.
@@ -186,11 +191,12 @@ impl Fixture {
         }
     }
 
-    /// One pump: the drain, then the device's receipts routed, unless the
-    /// round holds them. Under `cancel_after_issue` the receipts wait in
-    /// the device until no request is queued, and then every held wait is
-    /// dropped before they are routed.
-    fn pump(&mut self) {
+    /// One pump: the drain, then the device's receipts recorded and the
+    /// turn's delivery served, unless the round holds the receipts. Under
+    /// `cancel_after_issue` the receipts wait in the device until no request
+    /// is queued, and then every held wait is dropped before they are
+    /// recorded.
+    fn pump(&mut self, turn: &mut ColdTurn) {
         let cold = self.cold.clone();
         let driver = &mut self.driver;
         let issued = cold.drain(|op| driver.push(op));
@@ -210,10 +216,18 @@ impl Fixture {
         let mut out = Vec::new();
         self.driver.submit_and_reap(&mut self.recv_pool, Wait::Poll, &mut out).expect("sim submit");
         for completion in out {
-            assert_eq!(completion.token.class(), TokenClass::TierRead);
-            self.counts.delivered +=
-                cold.on_completion(completion.token, completion.result, self.now_us);
+            if let ColdReceipt::Foreign = record_receipt(&cold, completion, self.now_us) {
+                self.report.violations.push("a cold receipt named no issued read".into());
+            }
         }
+        self.deliver(turn);
+    }
+
+    /// The turn's delivery service (the plane's `before_execute` role): the
+    /// values delivered, counted.
+    fn deliver(&mut self, turn: &mut ColdTurn) {
+        let progress = self.cold.deliver_ready(turn.delivery(), self.now_us);
+        self.counts.delivered += progress.delivered;
     }
 
     /// The consumers: each due wait polled once (a value received is
@@ -276,19 +290,23 @@ impl Fixture {
         }
     }
 
-    /// One round: the arrivals and the requests refused last round offered,
-    /// then two pumps, each followed by the consumers.
+    /// One round, one host turn: the turn's delivery serves the ready work,
+    /// then the arrivals and the requests refused last round are offered,
+    /// then two pumps, each followed by the consumers, share the turn's
+    /// allowance (ADR-0181 R2).
     fn round(&mut self, arrivals: impl IntoIterator<Item = Request>) {
         self.round += 1;
         self.now_us = self.round * ROUND_US;
         self.counts = RoundCounts::default();
         let unclaimed = self.cold.counters().unclaimed;
+        let mut turn = ColdTurn::begin();
+        self.deliver(&mut turn);
         let retry = std::mem::take(&mut self.retry);
         for request in retry.into_iter().chain(arrivals) {
             self.offer(request);
         }
         for _ in 0..2 {
-            self.pump();
+            self.pump(&mut turn);
             self.consume();
         }
         self.counts.orphaned =
@@ -299,10 +317,22 @@ impl Fixture {
         self.report.rounds.push(counts);
     }
 
-    /// The quiet rounds: no traffic, the host drains what is left.
+    /// The quiet rounds: no traffic, the host drains what is left, then as
+    /// many more as its ready delivery needs, at most
+    /// [`DELIVERY_ROUNDS_MAX`].
     fn quiet(&mut self) {
         for _ in 0..QUIET_ROUNDS {
             self.round(None);
+        }
+        let mut more = 0;
+        while self.cold.has_ready_delivery() && more < DELIVERY_ROUNDS_MAX {
+            self.round(None);
+            more += 1;
+        }
+        if self.cold.has_ready_delivery() {
+            self.report
+                .violations
+                .push(format!("ready delivery left after {more} further quiet rounds (liveness)"));
         }
     }
 
@@ -370,6 +400,9 @@ fn cancel_all(fx: &mut Fixture, seed: u64) {
     fx.cancel_after_issue = true;
     fx.round((0..MEMBERS).map(|_| at(file, 0, 64)));
     fx.cancel_after_issue = false;
+    // A turn visits at most its allowance: the last member is the next
+    // turn's.
+    fx.round(None);
     let counts = fx.cold.counters();
     if counts.unclaimed != MEMBERS as u64 || counts.delivered != 0 {
         fx.vacuous(format!("{MEMBERS} members orphaned wanted, {counts:?}"));

@@ -20,7 +20,7 @@ use inf_foundation::bounded::{
     Built, Cap, CapCensus, CapFill, CappedSlab, Retiring, WrapWithProof,
 };
 use inf_runtime::{
-    ColdDone, ColdReadConfig, ColdReads, ColdRefused, ColdWait, CompletionResult, IoOp, Issue,
+    ColdDone, ColdReadConfig, ColdReads, ColdReceipt, ColdRefused, ColdTurn, ColdWait, IoOp, Issue,
     ReadClass, TierFileId,
 };
 
@@ -73,11 +73,17 @@ fn defer_maintain(class: ReadClass, _bytes: u64) -> Issue {
     }
 }
 
-/// Every kept device read's receipt, success.
+/// Every kept device read's receipt, success, then turns until every
+/// member is delivered.
 fn receipts(cold: &ColdReads, ops: &mut Vec<IoOp>, now_us: u64) {
     for op in ops.drain(..) {
         let IoOp::TierRead { token, .. } = op else { panic!("the host issues reads") };
-        cold.on_completion(token, CompletionResult::TierRead, now_us);
+        let receipt = cold.record_completion(token, Ok(()), now_us);
+        assert_eq!(receipt, ColdReceipt::Recorded, "a receipt names an issued read");
+    }
+    while cold.has_ready_delivery() {
+        let mut turn = ColdTurn::begin();
+        let _ = cold.deliver_ready(turn.delivery(), now_us);
     }
 }
 
