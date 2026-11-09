@@ -65,16 +65,42 @@ pub enum TierBudgetLeg {
     /// driver has seen a pass of the turn's 64 ops, so the retry is that
     /// round's.
     OneAt64mbNoModel,
+    /// Two namespaces at the hostile share, the first a thief of the tier
+    /// class's credit: twelve writers of 4 KiB `SET`s on new keys into a
+    /// 128 MiB window at `64kb` with one percent of it mutable, so it seals
+    /// from its first seconds and faster than the class flushes while it
+    /// sends; past its first, each round is one write group of at most two
+    /// writes and 69,632 B, then a sync, ready again within a few steps of
+    /// its grant. The second is the hostile leg's 1 MiB backlog, whose
+    /// write group is larger on bytes and not smaller on ops. The fair
+    /// turn's refusal ends the pass, so the credit builds to the second's
+    /// group within `T_c`; a visit that starts at index 0 and continues
+    /// past a refusal grants the thief at every opening while it holds a
+    /// sealed backlog and holds the second's group until that backlog is
+    /// flushed, more than three bounds: the fair turn's wait-bound
+    /// oracle's planted leg.
+    TwoAt1mbThief,
 }
 
 impl TierBudgetLeg {
-    pub const ALL: [TierBudgetLeg; 5] = [
+    pub const ALL: [TierBudgetLeg; 6] = [
         TierBudgetLeg::TwoAt8mb,
         TierBudgetLeg::EightAt1mb,
         TierBudgetLeg::OneAt1mb,
         TierBudgetLeg::TwoAt1mbHostile,
         TierBudgetLeg::OneAt64mbNoModel,
+        TierBudgetLeg::TwoAt1mbThief,
     ];
+
+    /// The thief leg's cut, in fair-turn bounds: a group the planted turn
+    /// holds until the thief's backlog is flushed has waited past one bound
+    /// by then, and the cut reads its wait.
+    const THIEF_CUT_BOUNDS: u64 = 4;
+
+    /// A scheduler step's mean advance on the tier-budget shape, about
+    /// 1 ms (1 µs plus a draw below its 2 ms bound): the unit the thief
+    /// leg's cut counts its bounds in.
+    const STEP_NS_MEAN: u64 = 1_000_000;
 
     /// The leg's name on the command line.
     pub fn name(self) -> &'static str {
@@ -84,6 +110,26 @@ impl TierBudgetLeg {
             TierBudgetLeg::OneAt1mb => "one-1mb",
             TierBudgetLeg::TwoAt1mbHostile => "two-1mb-hostile",
             TierBudgetLeg::OneAt64mbNoModel => "one-64mb-no-model",
+            TierBudgetLeg::TwoAt1mbThief => "two-1mb-thief",
+        }
+    }
+
+    /// The scheduler step of the leg's cut, given the seeded one and the
+    /// fair turn's bound `n × T_c` in nanoseconds: every leg cuts at the
+    /// seeded step but the thief leg, which cuts no earlier than
+    /// [`Self::THIEF_CUT_BOUNDS`] bounds of mean steps, so a group its
+    /// planted turn holds waits past the bound before the cut reads it.
+    pub(crate) fn cut_step(self, seeded: u64, turn_bound_ns: u64) -> u64 {
+        match self {
+            TierBudgetLeg::TwoAt1mbThief => {
+                let bound_steps = turn_bound_ns.div_ceil(Self::STEP_NS_MEAN);
+                seeded.max(Self::THIEF_CUT_BOUNDS.saturating_mul(bound_steps))
+            }
+            TierBudgetLeg::TwoAt8mb
+            | TierBudgetLeg::EightAt1mb
+            | TierBudgetLeg::OneAt1mb
+            | TierBudgetLeg::TwoAt1mbHostile
+            | TierBudgetLeg::OneAt64mbNoModel => seeded,
         }
     }
 
@@ -99,7 +145,7 @@ impl TierBudgetLeg {
     pub fn model(self) -> inf_runtime::DeviceModel {
         let divisor = match self {
             TierBudgetLeg::TwoAt8mb | TierBudgetLeg::EightAt1mb | TierBudgetLeg::OneAt1mb => 1,
-            TierBudgetLeg::TwoAt1mbHostile => 128,
+            TierBudgetLeg::TwoAt1mbHostile | TierBudgetLeg::TwoAt1mbThief => 128,
             TierBudgetLeg::OneAt64mbNoModel => return inf_runtime::DeviceModel::ABSENT,
         };
         inf_runtime::DeviceModel {
@@ -116,7 +162,7 @@ impl TierBudgetLeg {
     /// reference share a round's groups fit the class cap, so nothing
     /// waits for a refill).
     pub fn expects_contention(self) -> bool {
-        matches!(self, TierBudgetLeg::TwoAt1mbHostile)
+        matches!(self, TierBudgetLeg::TwoAt1mbHostile | TierBudgetLeg::TwoAt1mbThief)
     }
 
     /// Whether the leg's oracle requires a namespace with work to have
@@ -155,7 +201,9 @@ impl TierBudgetLeg {
     /// no-model leg six writers without think time fill a 72 MiB window
     /// whose first seal comes at 64.8 MiB: 84,000 commands of about 2 KiB
     /// each on the tail (two thirds are `SET`s of 1–10 KiB) are 84 MiB a
-    /// cell by key hash, above the seal with a margin.
+    /// cell by key hash, above the seal with a margin. On the thief leg the
+    /// first namespace is [`TierBudgetLoad::THIEF`] and the second the
+    /// hostile leg's first.
     pub(super) fn shape(self) -> TierBudgetShape {
         const ONE: TierBudgetCount = match TierBudgetCount::new(1) {
             Some(count) => count,
@@ -195,6 +243,12 @@ impl TierBudgetLeg {
                 namespaces: TWO,
                 first: TierBudgetLoad::HOSTILE_FIRST,
                 rest: TierBudgetLoad::HOSTILE_REST,
+            },
+            TierBudgetLeg::TwoAt1mbThief => TierBudgetShape {
+                leg: self,
+                namespaces: TWO,
+                first: TierBudgetLoad::THIEF,
+                rest: TierBudgetLoad::HOSTILE_FIRST,
             },
             TierBudgetLeg::OneAt64mbNoModel => {
                 let load = TierBudgetLoad {
@@ -271,6 +325,25 @@ impl TierBudgetLoad {
         maintain_slice: b"64kb",
         tail_stall_timeout_ms: None,
         values: TierBudgetValues::Mixed,
+    };
+
+    /// The thief leg's first namespace: twelve writers of 3,000 `SET`s,
+    /// each a 4,096 B value on a new key (a record of at most 4,114 B),
+    /// into a 128 MiB window at `64kb` with one percent of it mutable. A
+    /// cell's half of the writes, about 74 MB, is below the window and its
+    /// 256 MiB ring: no writer parks, and no round meets the ring top or a
+    /// rotation, so past its first a round of at most 15 records is one
+    /// batch and its tail, two writes of at most 17 frames, then its sync.
+    const THIEF: TierBudgetLoad = TierBudgetLoad {
+        writers: 12,
+        ops_per_writer: 3_000,
+        keys_per_writer: 3_000,
+        think_ns_max: 0,
+        mem_budget: b"128mb",
+        mutable_permille: b"10",
+        maintain_slice: b"64kb",
+        tail_stall_timeout_ms: None,
+        values: TierBudgetValues::SetOnlyUnique { value_bytes: 4_096 },
     };
 }
 

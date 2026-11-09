@@ -548,6 +548,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let total_ops: u64 = writers.iter().map(|w| w.quota).sum();
     let cut_step = 200 + rng.next_below(total_ops * 6);
     let cut_step = scenario.epoch_marks.map_or(cut_step, |leg| leg.cut_step(cut_step));
+    let cut_step = scenario.tier_budget.map_or(cut_step, |shape| {
+        shape.leg.cut_step(cut_step, tier_turn_bound_ns(scenario, shape))
+    });
     // The ledger-wedge leg cuts on its own reading (`LedgerWedge::cut_due`),
     // at the seeded step or after the held seal's fold.
     let seeded_cut = cut_step;
@@ -1449,11 +1452,7 @@ fn tier_budget_scrape(
     disk: &SimDisk,
     report: &mut DurableReport,
 ) {
-    let bound_ns = fair_turn_bound_ns(
-        scenario.device.model_share,
-        u64::from(shape.namespaces.get()),
-        scenario.step_ns_max,
-    );
+    let bound_ns = tier_turn_bound_ns(scenario, shape);
     let pass_bound = tier_pass_bound_bytes(scenario.device.model_share);
     if scenario.plant == crate::net::Plant::TierWriteEio {
         report.plant_fired |= disk.faults_fired() > 0;
@@ -1713,6 +1712,13 @@ fn fair_turn_bound_ns(share: inf_runtime::DeviceModel, namespaces: u64, step_ns_
     let ops = axis(share.write_ops_per_s, inf_log::limits::TIER_GROUP_OPS_MAX as u64);
     let t_c = bytes.unwrap_or(0).max(ops.unwrap_or(0));
     namespaces * t_c
+}
+
+/// The fair turn's bound on `scenario`'s tier-budget shape, `n × T_c`: the
+/// one source the wait-bound oracle and the thief leg's cut read.
+fn tier_turn_bound_ns(scenario: &DurableScenario, shape: TierBudgetShape) -> u64 {
+    let namespaces = u64::from(shape.namespaces.get());
+    fair_turn_bound_ns(scenario.device.model_share, namespaces, scenario.step_ns_max)
 }
 
 /// The most tier bytes one MAINTAIN pass can draw, from the model: the
