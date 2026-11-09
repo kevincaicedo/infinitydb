@@ -1752,4 +1752,29 @@ mod tests {
         space.bytes_mut(a, 128).fill(0x77);
         assert!(space.bytes(a, 128).iter().all(|&b| b == 0x77));
     }
+
+    /// A seal step past the flush-cut list's cap drops its cut uncounted:
+    /// 4,097 seal steps with no flush keep the first 4,096 cuts, and no
+    /// census row counts the crossing. The capped list registers its row on
+    /// the cell's census and counts the dropped cut there.
+    #[test]
+    #[ignore = "the flush-cut list drops a cut at its 4,096 cap with no count and registers no \
+                census row; red until the list is a capped deque whose census row counts the \
+                crossing"]
+    fn a_cut_past_the_cap_is_counted_on_its_census_row() {
+        const CUTS_MAX: usize = 4_096;
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        let mut space = space(1 << 16, 1 << 12);
+        for _ in 0..=CUTS_MAX {
+            let record = space.alloc(8).expect("fits");
+            space.advance_ro_boundary(LogicalAddr::from_raw(record.to_raw() + 8).expect("fits"));
+        }
+        assert_eq!(space.flush_cuts.len(), CUTS_MAX, "engagement: the list kept 4,096 cuts");
+        let crossings = census.row("flush-cuts").map(|row| row.crossings);
+        assert_eq!(
+            crossings,
+            Some(1),
+            "4,097 seal steps crossed the 4,096-cut list once, and no census row counted it"
+        );
+    }
 }

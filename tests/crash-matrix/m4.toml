@@ -78,6 +78,12 @@
 #                         changed nothing, the boot stops typed, and a
 #                         later boot with the fault cleared recovers
 #                         the same unit
+#   walk-aborted-unit-kept — a checkpoint's staging create refused
+#                         before its file exists aborts the walk with no
+#                         file left: the MANIFEST still names the last
+#                         published unit, the trigger retries after its
+#                         backoff, and a cut recovers every acknowledged
+#                         write (the scenario's durability audit)
 
 schema = 1
 milestone = "m4"
@@ -442,3 +448,13 @@ point = "dir_listing_next_fail"
 tier = "node"
 test = "crash-matrix::tier::a_listing_fault_refuses_the_boot_typed_and_the_next_boot_recovers"
 expect = "boot-refuses-typed-then-recovers"
+
+# A checkpoint's staging create refused before its file exists (the open
+# failing, `EMFILE` or `ENOSPC`, on the simulated disk): the walk aborts,
+# the last published unit stays the recovery unit, and the cut after it
+# recovers every acknowledged write.
+[[row]]
+point = "ckpt_create_fail"
+tier = "node"
+test = "crash-matrix::ckpt_create::a_refused_staging_create_aborts_its_walk_and_a_cut_recovers"
+expect = "walk-aborted-unit-kept"

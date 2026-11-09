@@ -235,3 +235,10 @@ pub const LISTING_NAME_BYTES_MAX: usize = 1 << 10;
 // name's end fits the batch's 16-bit end offsets.
 const _: () = assert!(LISTING_NAME_BYTES_MAX <= LISTING_BATCH_BYTES, "a name fits an empty batch");
 const _: () = assert!(LISTING_BATCH_BYTES <= u16::MAX as usize, "a name end fits 16 bits");
+
+/// Calls the simulated disk's call log holds: the checkpoint staging creates
+/// and `MANIFEST` renames an oracle reads, a few per second of injected time
+/// a cell. Owner: the simulated disk. Crossing: a call past it is counted
+/// (`SimDisk::calls_unlogged`), not kept, so an oracle reading the log finds
+/// it incomplete and refuses to judge it.
+pub const SIM_DISK_CALLS_LOGGED_MAX: usize = 1 << 16;

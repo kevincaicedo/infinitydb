@@ -355,6 +355,13 @@ pub fn ick_staging_file_name(id: u64) -> String {
     format!("ckpt-{id:06}.ick.new")
 }
 
+/// Parses `ckpt-NNNNNN.ick.new` → id: the staging name
+/// [`ick_staging_file_name`] writes, by [`parse_ick_file_name`]'s digit rule.
+#[must_use]
+pub fn parse_ick_staging_file_name(name: &str) -> Option<u64> {
+    parse_ick_file_name(name.strip_suffix(".new")?)
+}
+
 /// Parses `ckpt-NNNNNN.ick` → id (boot scan of the ckpt dir; foreign names
 /// return `None` for the caller's naming policy).
 #[must_use]
@@ -3221,5 +3228,9 @@ mod tests {
         assert_eq!(parse_ick_file_name("ckpt-000005.ick.new"), None);
         assert_eq!(parse_ick_file_name("seg-000005.ilog"), None);
         assert_eq!(parse_ick_file_name("ckpt-x.ick"), None);
+        assert_eq!(parse_ick_staging_file_name(&ick_staging_file_name(5)), Some(5));
+        assert_eq!(parse_ick_staging_file_name("ckpt-000005.ick"), None);
+        assert_eq!(parse_ick_staging_file_name("ckpt-x.ick.new"), None);
+        assert_eq!(parse_ick_staging_file_name("MANIFEST.new"), None);
     }
 }

@@ -79,6 +79,12 @@
 //!   tier's errors are the kernel's
 //! - `dir_listing_next_fail` — the same tiers' `next_batch` — the injected error from a batch, the
 //!   batch left holding no name: the consumer refuses the boot typed, its stream dropped
+//! - `ckpt_create_fail` — `SimDisk::create_meta` and `SimDisk::create_meta_direct` on a
+//!   checkpoint's staging name (`ckpt-NNNNNN.ick.new`), before the file exists — typed I/O error
+//!   with no file left (`EMFILE` or `ENOSPC` at the open): the walk aborts as on any failed create
+//!   and the trigger retries after its backoff. It fires in the simulated disk only, whose call
+//!   log records each refusal beside the creates that succeed, so an oracle matches every attempt
+//!   to a create
 //!
 //! **Torn-prefix physics (F-L04-14, ADR-0119 A1).** Every point that
 //! lands a prefix (`*_torn_frame`, `*_short_write`) lands it on the
@@ -120,6 +126,7 @@ pub const BLOB_WRITE_NOSPACE: &str = "blob_write_nospace";
 pub const REPLAY_SETTLE_READ_FAIL: &str = "replay_settle_read_fail";
 pub const DIR_LISTING_OPEN_FAIL: &str = "dir_listing_open_fail";
 pub const DIR_LISTING_NEXT_FAIL: &str = "dir_listing_next_fail";
+pub const CKPT_CREATE_FAIL: &str = "ckpt_create_fail";
 
 /// Inventory for the CI coverage check and the S18 sim-disk scheduler.
 pub const ALL: &[&str] = &[
@@ -146,6 +153,7 @@ pub const ALL: &[&str] = &[
     REPLAY_SETTLE_READ_FAIL,
     DIR_LISTING_OPEN_FAIL,
     DIR_LISTING_NEXT_FAIL,
+    CKPT_CREATE_FAIL,
 ];
 
 /// The injected error a firing point surfaces (named, greppable).

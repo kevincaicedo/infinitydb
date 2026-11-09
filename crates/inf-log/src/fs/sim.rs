@@ -94,6 +94,11 @@
 //! the dead switch (every op, every file) cannot express. The fault is
 //! consumed by whichever tier issues the op (blocking or driver) and
 //! touches no byte; [`SimDisk::faults_fired`] is the engagement witness.
+//!
+//! **Call log** ([`SimDisk::logged_calls`]): the disk logs each checkpoint
+//! staging create and each rename onto a `MANIFEST` from inside the call,
+//! with its result and the harness's last [`SimDisk::mark`], so an oracle
+//! reads what the cell asked of the disk and when, never the cell's counters.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -109,6 +114,11 @@ use super::{
     BatchEnd, DirStream, NameBatch, OpenedDir, ResumeKey, SegmentFile, SegmentFs, SegmentIoMode,
     TierIoMode,
 };
+
+mod calls;
+
+use calls::CallLog;
+pub use calls::{CallResult, DiskCall, DiskMark, DiskPhase, LoggedCall};
 
 /// Fake-fd base for file handles (dir handles sit above it). High
 /// enough that no simulated socket fd space collides. One fd per
@@ -796,6 +806,8 @@ struct DiskState {
     /// Removed names a listing returned again (the repeat mode's
     /// engagement witness).
     listing_repeats_served: u64,
+    /// The call log an oracle reads (`calls.rs`).
+    calls: CallLog,
 }
 
 impl DiskState {
@@ -1204,6 +1216,25 @@ impl SimDisk {
         self.state.borrow().sync_dir_calls
     }
 
+    /// Sets the mark every call logged from now on carries: the phase the
+    /// harness runs and the injected time it gave it.
+    pub fn mark(&self, phase: DiskPhase, at: inf_foundation::time::Nanos) {
+        self.state.borrow_mut().calls.mark(DiskMark { phase, at });
+    }
+
+    /// The logged calls from index `first` on, in call order: a reader
+    /// that keeps its own index reads each entry once.
+    #[must_use]
+    pub fn logged_calls(&self, first: usize) -> Vec<LoggedCall> {
+        self.state.borrow().calls.entries_from(first)
+    }
+
+    /// Calls the log could not hold: a log a reader finds incomplete.
+    #[must_use]
+    pub fn calls_unlogged(&self) -> u64 {
+        self.state.borrow().calls.unlogged()
+    }
+
     /// The power cut (ADR-0020 D6): per directory, a seeded prefix of
     /// its pending metadata ops survives; per surviving inode, pending
     /// writes lose/tear/reorder at sector granularity. Clears the dead
@@ -1455,6 +1486,72 @@ impl SimDisk {
         let ino = state.ino_of(path)?;
         let fd = state.open_fd(ino, direct);
         Ok(SimFile { state: Rc::clone(&self.state), target: Target::File { ino, fd, direct } })
+    }
+
+    /// A create the call log records when it makes a checkpoint's staging
+    /// file: its result and whether the name exists after it. Every other
+    /// create runs unlogged. `ckpt_create_fail` fires here, before the
+    /// create, so a refused create leaves no file, and the log records the
+    /// refusal as it records every other result.
+    fn create_logged(
+        &self,
+        path: &Path,
+        create: impl FnOnce() -> io::Result<SimFile>,
+    ) -> io::Result<SimFile> {
+        if !calls::is_checkpoint_staging(path) {
+            return create();
+        }
+        let (created, result) = if inf_foundation::fault::fire(crate::fault::CKPT_CREATE_FAIL) {
+            let point = crate::fault::CKPT_CREATE_FAIL;
+            (Err(crate::fault::injected(point)), CallResult::Injected(point))
+        } else {
+            let created = create();
+            let result = CallResult::of(&created);
+            (created, result)
+        };
+        let mut state = self.state.borrow_mut();
+        let call = DiskCall::CheckpointCreate { left_file: state.os_names.contains_key(path) };
+        state.calls.record(call, path, result);
+        drop(state);
+        created
+    }
+
+    /// The rename itself: the OS names move at once, the directory's
+    /// journal queues the op for its barrier.
+    fn rename_names(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut state = self.state.borrow_mut();
+        state.tick_op()?;
+        let parent = parent_dir(to);
+        if parent_dir(from) != parent {
+            // Same-directory only: every caller's swap protocol is, and a
+            // cross-directory rename would need two-journal ordering the
+            // model deliberately does not define.
+            return Err(io::Error::other(format!(
+                "sim disk models same-directory renames only ({} -> {})",
+                from.display(),
+                to.display()
+            )));
+        }
+        if !state.dirs.contains(&parent) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no dir {}", parent.display()),
+            ));
+        }
+        let ino = state.os_names.remove(from).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("no file {}", from.display()))
+        })?;
+        // Replaces an existing destination atomically, like POSIX rename.
+        let clobbered = state.os_names.insert(to.to_path_buf(), ino);
+        state
+            .pending_meta
+            .entry(parent)
+            .or_default()
+            .push(MetaOp::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
+        if let Some(old) = clobbered {
+            state.release_if_orphan(old);
+        }
+        Ok(())
     }
 }
 
@@ -1848,20 +1945,22 @@ impl SegmentFs for SimDisk {
 
     fn create_meta(&self, path: &Path) -> io::Result<Self::File> {
         // No durability side effects (ADR-0017): all volatile.
-        self.create_inode(path, Vec::new(), Vec::new())
+        self.create_logged(path, || self.create_inode(path, Vec::new(), Vec::new()))
     }
 
     fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
-        if self.state.borrow().refuse_direct_meta {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "SimDisk: O_DIRECT refused (refuse_direct_meta)",
-            ));
-        }
-        // Volatile like `create_meta`, flagged direct: every driver write
-        // to it is alignment-asserted (ADR-0088 D3) and gated by the
-        // meta refusal budget (D3 as amended).
-        self.create_inode_full(path, Vec::new(), Vec::new(), 0, true, true)
+        self.create_logged(path, || {
+            if self.state.borrow().refuse_direct_meta {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "SimDisk: O_DIRECT refused (refuse_direct_meta)",
+                ));
+            }
+            // Volatile like `create_meta`, flagged direct: every driver
+            // write to it is alignment-asserted (ADR-0088 D3) and gated by
+            // the meta refusal budget (D3 as amended).
+            self.create_inode_full(path, Vec::new(), Vec::new(), 0, true, true)
+        })
     }
 
     fn open_dir(&self, dir: &Path) -> io::Result<Self::File> {
@@ -1899,39 +1998,12 @@ impl SegmentFs for SimDisk {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        let mut state = self.state.borrow_mut();
-        state.tick_op()?;
-        let parent = parent_dir(to);
-        if parent_dir(from) != parent {
-            // Same-directory only: every caller's swap protocol is, and a
-            // cross-directory rename would need two-journal ordering the
-            // model deliberately does not define.
-            return Err(io::Error::other(format!(
-                "sim disk models same-directory renames only ({} -> {})",
-                from.display(),
-                to.display()
-            )));
+        let renamed = self.rename_names(from, to);
+        if calls::is_manifest(to) {
+            let result = CallResult::of(&renamed);
+            self.state.borrow_mut().calls.record(DiskCall::ManifestRename, to, result);
         }
-        if !state.dirs.contains(&parent) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no dir {}", parent.display()),
-            ));
-        }
-        let ino = state.os_names.remove(from).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("no file {}", from.display()))
-        })?;
-        // Replaces an existing destination atomically, like POSIX rename.
-        let clobbered = state.os_names.insert(to.to_path_buf(), ino);
-        state
-            .pending_meta
-            .entry(parent)
-            .or_default()
-            .push(MetaOp::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
-        if let Some(old) = clobbered {
-            state.release_if_orphan(old);
-        }
-        Ok(())
+        renamed
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
