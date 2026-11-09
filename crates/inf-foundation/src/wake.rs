@@ -697,7 +697,10 @@ impl RemoteStack {
     /// Releases one count: a freed closed header's, or the executor's own after its last take.
     pub fn release(&self) -> Freed {
         self.tomb.visit();
-        if self.counted.fetch_sub(1, RETAIN_ORDERING) != 1 {
+        let held = self.counted.fetch_sub(1, RETAIN_ORDERING);
+        // A release past zero would wrap the count and leave the stack to no one.
+        debug_assert_ne!(held, 0, "a release follows its own count");
+        if held != 1 {
             return Freed::No;
         }
         // The acquire half: the freer follows every other release.
@@ -742,11 +745,18 @@ impl Default for RemoteStack {
 
 /// The bridges one take removed from the stack, settled one at a time by the owner. A bridge
 /// stays queued (`Q` set) until its turn, so each must be settled; dropping this with entries
-/// left would lose their wakes.
+/// left would lose their wakes, which its drop checks in debug builds.
 #[must_use]
 #[derive(Debug)]
 pub struct Drained {
     next: *mut WakeBridge,
+}
+
+impl Drop for Drained {
+    fn drop(&mut self) {
+        // An entry left here keeps `Q` set and is never pushed again: its wakes are lost.
+        debug_assert!(self.next.is_null(), "a drain settles every bridge it took");
+    }
 }
 
 impl Drained {
@@ -965,6 +975,28 @@ mod tests {
         assert_eq!(bridge.foreign_drop(&stack), Released::Kept);
         assert!(!Lane(bridge.lane.load(RELAXED)).has(QUEUED), "the pusher cleared its own Q");
         assert_eq!(bridge.foreign_wake_by_ref(&stack), Pushed::Closed);
+    }
+
+    /// A drain dropped with a bridge it took and never settled is caught in debug builds: that
+    /// bridge keeps `Q` set, so it is never pushed again and its wakes are lost.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a drain settles every bridge it took")]
+    fn a_drain_dropped_with_a_bridge_unsettled_is_caught() {
+        let stack = RemoteStack::new();
+        let bridge = bridge_with_count(&stack, 0);
+        assert_eq!(bridge.foreign_wake_by_ref(&stack), Pushed::Now);
+        drop(stack.take());
+    }
+
+    /// A release with no count left is caught in debug builds: it would wrap the count.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a release follows its own count")]
+    fn a_release_past_zero_is_caught() {
+        let stack = RemoteStack::new();
+        assert_eq!(stack.release(), Freed::Stack, "the executor's own count");
+        let _ = stack.release();
     }
 
     /// A foreign clone at `LANE_COUNT_MAX`, or a `close` folding 1 into a count there, aborts
