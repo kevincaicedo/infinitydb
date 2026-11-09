@@ -797,6 +797,11 @@ rows=(
   # extent fence: a held extent read and barrier keep the dropped
   # namespace's directory open while its successor flushes.
   "inf_canary_lifetime_holds_ignored m4-ns-lifetimes LIFETIMES:"
+  # ADR-0148 D3: a dropped namespace's owner closes its handles at the drop,
+  # whatever the cold reads queued on its files: a read held at the device
+  # across the DROP is then submitted on a closed descriptor.
+  "inf_canary_drop_closes_handles m4-ns-lifetimes CUSTODY:"
+  "inf_canary_drop_closes_handles m4-tiered CUSTODY:"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

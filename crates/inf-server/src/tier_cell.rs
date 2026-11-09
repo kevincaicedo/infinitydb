@@ -727,7 +727,7 @@ impl<F: SegmentFs> TierCell<F> {
         };
         let pos = self.live.remove(at);
         let slot = &mut self.positions[pos.index()];
-        let owner = match std::mem::replace(slot, Position::Vacant { round_seq: 0 }) {
+        let mut owner = match std::mem::replace(slot, Position::Vacant { round_seq: 0 }) {
             Position::Live(t) => t,
             other @ (Position::Vacant { .. } | Position::Draining { .. }) => {
                 *slot = other;
@@ -737,6 +737,9 @@ impl<F: SegmentFs> TierCell<F> {
         };
         if owner.stall_waiters.any_waiting() {
             owner.stall_waiters.wake_all(());
+        }
+        if cfg!(inf_canary_drop_closes_handles) {
+            close_at_drop(&mut owner);
         }
         if self.turn.holder == Some(ns) {
             self.turn.holder = None;
@@ -1506,6 +1509,19 @@ fn drain_files<F: SegmentFs>(
         }
     }
     attempted
+}
+
+/// The canary's drop: the owner's handles closed at its entry to Draining,
+/// as a drop that discarded the owner closed them, whatever the cold reads
+/// pinned on its files — its sealed files' at once, the pipeline's when no
+/// round is out — each file's record kept for its unlink.
+fn close_at_drop<F: SegmentFs>(t: &mut TierNs<F>) {
+    t.files.clear();
+    if t.round.is_none() {
+        while let Some(meta) = t.flush.pop_catalog_end() {
+            t.retired.push(meta);
+        }
+    }
 }
 
 /// Whether a Files-phase owner's every child owner has ended: no file in
