@@ -887,6 +887,11 @@ rows=(
   # A closed header's last drop frees it with Q set: the last take then
   # reaches the freed bridge.
   "inf_canary_closed_free_ignores_queue loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
+  # A tiered table's seal marks: the stride planted at one commit page, so
+  # a ring past the cap's reach fills the marks and the back mark takes
+  # later starts, which the stride test reads as a crossing at its widest
+  # window.
+  "inf_canary_seal_mark_stride_one crate-test inf-store lib the_stride_keeps_the_seal_marks_under_their_cap_at_every_window stride-short"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

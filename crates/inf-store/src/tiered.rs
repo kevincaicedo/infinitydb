@@ -361,7 +361,8 @@ impl TieredTable {
             return None;
         }
         space.set_window_limit(window);
-        let seal_marks = seal_marks::SealMarks::new(space.page_bytes(), census).ok()?;
+        let seal_marks =
+            seal_marks::SealMarks::new(space.ring_bytes(), space.page_bytes(), census).ok()?;
         Some(TieredTable {
             hasher,
             index: Index::with_capacity(initial_keys.max(64)),
@@ -1337,6 +1338,7 @@ impl core::fmt::Debug for TieredTable {
 mod tests {
     use super::*;
     use crate::limits::{SEAL_MARKS, SEAL_MARKS_MAX};
+    use seal_marks::SealMark;
 
     /// A table over 4 KiB test pages whose window is `window_pages` pages,
     /// its ring the next power of two, on `census`.
@@ -1376,14 +1378,66 @@ mod tests {
     /// record placed a page and none sealed. The marks hold at most their
     /// cap, `SEAL_MARKS_MAX`, where one mark a page held 16,384.
     #[test]
-    fn a_window_of_sixteen_thousand_pages_holds_the_marks_at_their_cap() {
+    fn a_window_of_sixteen_thousand_pages_holds_the_marks_within_their_cap() {
         let census = CapCensus::new(inf_foundation::CellId(0)).0;
         let mut table = paged_table(16_384, &census);
         place_one_record_a_page(&mut table, 16_384);
         let marks = table.seal_marks.len();
         assert!(marks <= SEAL_MARKS_MAX as usize, "{marks} seal marks past the cap");
         let row = census.row(SEAL_MARKS.name()).expect("the seal marks' row");
-        assert_eq!(row.high_water, SEAL_MARKS_MAX.min(16_384));
+        assert!(row.high_water as usize >= marks, "the row read the marks held");
+        assert!(row.high_water <= SEAL_MARKS_MAX, "the row within the cap");
+    }
+
+    /// The stride keeps the seal marks under their cap (ADR-0053 D2), as
+    /// the unbounded list's first record of each stride bucket: windows of
+    /// `cap/2 − 1`, `cap/2`, `cap/2 + 1` and `4 × cap` pages of 4 KiB, one
+    /// record a page, the watermarks driven by the seal steps. The marks
+    /// hold at most half the cap and one more and cross nothing; then each
+    /// seal step lands on a record start and seals at most its slice and
+    /// one stride.
+    #[test]
+    fn the_stride_keeps_the_seal_marks_under_their_cap_at_every_window() {
+        let half = u64::from(SEAL_MARKS_MAX) / 2;
+        for pages in [half - 1, half, half + 1, 4 * u64::from(SEAL_MARKS_MAX)] {
+            let census = CapCensus::new(inf_foundation::CellId(0)).0;
+            let mut table = paged_table(pages, &census);
+            let starts = place_one_record_a_page(&mut table, pages);
+            let crossings = census.row(SEAL_MARKS.name()).map_or(0, |row| row.crossings);
+            assert_eq!(crossings, 0, "stride-short — {crossings} crossing(s) at {pages} pages");
+            let stride = table.seal_marks.stride_bytes();
+            let ro = table.space().ro_boundary();
+            let mut model = Vec::new();
+            let mut last_bucket = None;
+            for start in &starts {
+                let bucket = start.to_raw() / stride;
+                if last_bucket != Some(bucket) {
+                    model.push(*start);
+                    last_bucket = Some(bucket);
+                }
+            }
+            model.retain(|start| *start > ro);
+            let held: Vec<LogicalAddr> = table.seal_marks.iter().map(SealMark::addr).collect();
+            assert_eq!(held, model, "{pages} pages: the marks are the list's bucket firsts");
+            assert!(held.len() as u64 <= half + 1, "{pages} pages: {} marks", held.len());
+            let slice = table.demote.slice_bytes;
+            let mut steps = 0u32;
+            loop {
+                let before = table.space().ro_boundary();
+                let sealed = table.seal_slice();
+                if sealed == 0 {
+                    break;
+                }
+                let after = table.space().ro_boundary();
+                assert!(starts.binary_search(&after).is_ok(), "{pages} pages: a seal off a start");
+                assert!(
+                    sealed <= slice + stride,
+                    "{pages} pages: {sealed} B sealed from {before:?}"
+                );
+                steps += 1;
+            }
+            assert!(steps > 0, "VACUOUS: {pages} pages sealed nothing");
+        }
     }
 
     #[test]

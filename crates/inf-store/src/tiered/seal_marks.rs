@@ -1,9 +1,12 @@
 //! The seal marks of one tiered table (ADR-0053 D2): the record starts its
 //! ro-boundary may seal to. Each placement asks one shift and one compare: the
-//! first record placed in a commit page pushes its start. A seal step lands on
-//! a mark. The marks are a capped deque on the cell's census; at the cap the
-//! back mark takes the new start, which coarsens the seal steps and counts as
-//! the row's crossing.
+//! first record placed in a stride bucket of commit pages pushes its start.
+//! The stride is fixed when the table is built, so that the ring holds at most
+//! half the cap's buckets; a window, at most the ring, then holds at most half
+//! the cap and one more marks, and the cap is never reached. A seal step lands
+//! on a mark, so it may overrun its slice by at most one stride. The marks are
+//! a capped deque on the cell's census; at the cap the back mark takes the new
+//! start, which coarsens the seal steps and counts as the row's crossing.
 
 use std::rc::Rc;
 
@@ -19,6 +22,10 @@ const _: () = assert!(
     SEAL_MARKS_MAX as usize * core::mem::size_of::<SealMark>() <= DEQUE_BACKING_BYTES_MAX,
     "the seal marks fit one deque allocation"
 );
+
+/// The buckets a ring may hold: half the cap, so a window holds at most half
+/// the cap and one more marks.
+const RING_BUCKETS_MAX: u64 = SEAL_MARKS_MAX as u64 / 2;
 
 /// A record start the ro-boundary may seal to. A table's marks strictly
 /// increase and lie above its ro-boundary once the stale ones are popped.
@@ -47,11 +54,11 @@ impl Merge<SealMark> for LaterStart {
     }
 }
 
-/// One tiered table's seal marks.
+/// One tiered table's seal marks and the stride that buckets them.
 pub(crate) struct SealMarks {
     marks: CappedDeque<SealMark, Coalesce<LaterStart>>,
-    /// `log2` of a bucket's bytes, the commit page's, so a placement's
-    /// bucket is one shift of its offset from the life origin.
+    /// `log2` of a bucket's bytes: the commit page's and the stride's, so a
+    /// placement's bucket is one shift of its offset from the life origin.
     bucket_shift: u32,
     /// The newest mark's bucket; `NO_MARK_BUCKET` before the first.
     last_bucket: u64,
@@ -61,20 +68,39 @@ pub(crate) struct SealMarks {
 const NO_MARK_BUCKET: u64 = u64::MAX;
 
 impl SealMarks {
-    /// The marks of a table over commit pages of `page_bytes` (a power of
-    /// two), on `census` under `SEAL_MARKS`: one allocation of
-    /// `SEAL_MARKS_MAX` marks, never grown.
+    /// The marks of a table whose ring is `ring_bytes` over commit pages of
+    /// `page_bytes` (both powers of two), on `census` under `SEAL_MARKS`: one
+    /// allocation of `SEAL_MARKS_MAX` marks, never grown.
     ///
     /// # Errors
     /// The deque's construction refusal: the allocator refused the backing,
     /// or the census refused the row.
-    pub(crate) fn new(page_bytes: u64, census: &Rc<CapCensus>) -> Result<SealMarks, CapError> {
+    pub(crate) fn new(
+        ring_bytes: u64,
+        page_bytes: u64,
+        census: &Rc<CapCensus>,
+    ) -> Result<SealMarks, CapError> {
+        debug_assert!(ring_bytes.is_power_of_two(), "the ring is a power of two");
         debug_assert!(page_bytes.is_power_of_two(), "a commit page is a power of two");
+        let page_shift = page_bytes.trailing_zeros();
+        let ring_pages = ring_bytes >> page_shift;
+        let stride_shift = Self::stride_shift(ring_pages);
         Ok(SealMarks {
             marks: CappedDeque::new(SEAL_MARKS, census)?,
-            bucket_shift: page_bytes.trailing_zeros(),
+            bucket_shift: page_shift + stride_shift,
             last_bucket: NO_MARK_BUCKET,
         })
+    }
+
+    /// The stride, in `log2` pages: the least that buckets `ring_pages` (a
+    /// power of two) into at most `RING_BUCKETS_MAX`.
+    fn stride_shift(ring_pages: u64) -> u32 {
+        // Canary: the stride is one page whatever the ring, so a ring past
+        // the cap's reach fills the marks and the back takes later starts.
+        if cfg!(inf_canary_seal_mark_stride_one) {
+            return 0;
+        }
+        ring_pages.trailing_zeros().saturating_sub(RING_BUCKETS_MAX.trailing_zeros())
     }
 
     /// A record placed at `addr`, an offset `offset` from the life origin:
@@ -121,5 +147,17 @@ impl SealMarks {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.marks.len()
+    }
+
+    /// The stride's bytes: the commit page times the stride's pages.
+    #[cfg(test)]
+    pub(crate) fn stride_bytes(&self) -> u64 {
+        1 << self.bucket_shift
+    }
+
+    /// The marks, oldest first.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = SealMark> + '_ {
+        self.marks.iter().copied()
     }
 }
