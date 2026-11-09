@@ -493,7 +493,10 @@ I	1	crates/inf-server/src/json.rs	unreachable	unconditional set applies	`SetCond
 I	2	crates/inf-server/src/key_hash.rs	expect	8 bytes	`bytes` is a `[u8; 16]`; `[..8]`/`[8..]` are 8-byte slices
 I	1	crates/inf-server/src/limits.rs	assert	every fixed shape fits the column's maximum	compile-time const assertion over `FixedShape::ALL` — never executes
 I	1	crates/inf-server/src/limits.rs	assert	the fixed column's maximum is 348 bytes	compile-time const assertion — never executes
+I	1	crates/inf-server/src/limits.rs	assert	`$`, 20 digits and CRLF	compile-time const assertion (the leg decoder's frame-header bound, 23 B, is the writer's longest bulk header) — never executes
 C	1	crates/inf-server/src/plane/conn.rs	expect	argc fits u32	argv is a parsed frame: `crates/inf-wire/src/parser.rs:parse_multibulk` bounds `argc` to `ParserLimits::max_args` (1024) and the frame to `max_frame_bytes`
+I	1	crates/inf-server/src/plane/json_gather.rs	assert	a gather's window fits the connection's	compile-time const assertion (JSON_GATHER_LEGS_IN_FLIGHT_MAX ≤ REMOTE_WINDOW) — never executes
+I	1	crates/inf-server/src/plane/json_gather.rs	assert	a leg's argv fits the codec's argument cap	compile-time const assertion (the client parser's argument cap ≤ MAX_APPLY_ARGS, so a leg, a subset of a client's argv, always encodes) — never executes
 C	2	crates/inf-server/src/plane/fabric.rs	expect	argc fits u32	argv is a parsed frame: `crates/inf-wire/src/parser.rs:parse_multibulk` bounds `argc` to `ParserLimits::max_args` (1024) and the frame to `max_frame_bytes`
 I	1	crates/inf-server/src/plane/cell_loop.rs	expect	Backfilling → Ready is an ADR-0075 D3 edge	`idx_fleet_candidates` yields only Backfilling indexes (the registry's own state), and the flip is the ADR-0075 D3 edge from that state
 C	2	crates/inf-server/src/plane/fabric.rs	expect	block fits u32	a staged block is one parsed frame: `crates/inf-wire/src/parser.rs:parse_multibulk` bounds it to `ParserLimits::max_frame_bytes` (bulk cap + 64 KiB; 16 MiB + 64 KiB default — ADR-0122)

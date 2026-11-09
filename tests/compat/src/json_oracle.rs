@@ -31,11 +31,36 @@ impl Protocol {
 
 pub struct JsonCase {
     pub id: &'static str,
+    /// The command as written. An argument too large for the source holds
+    /// a short description here, and `generated` names it.
     pub argv: &'static [&'static str],
     /// This reply may contain JSON text in RESP bulk payloads. Used only for
     /// the independent semantic diagnostic on a byte mismatch.
     pub json_reply: bool,
     pub source: &'static str,
+    pub generated: Option<GeneratedArg>,
+}
+
+/// One argument built when the case runs, for a value too large to write in
+/// the source (a document of millions of bytes): `argv[index]` is replaced
+/// by `text()`, on the oracle and on InfinityDB alike.
+#[derive(Copy, Clone)]
+pub struct GeneratedArg {
+    pub index: usize,
+    pub text: fn() -> String,
+}
+
+impl JsonCase {
+    /// The arguments the case sends: `argv` with its generated argument, if
+    /// any, in place.
+    pub fn args(&self) -> Vec<String> {
+        let mut args: Vec<String> = self.argv.iter().map(|arg| (*arg).to_string()).collect();
+        if let Some(generated) = self.generated {
+            assert!(generated.index < args.len(), "{}: generated argument past argv", self.id);
+            args[generated.index] = (generated.text)();
+        }
+        args
+    }
 }
 
 const fn c(
@@ -44,7 +69,7 @@ const fn c(
     json_reply: bool,
     source: &'static str,
 ) -> JsonCase {
-    JsonCase { id, argv, json_reply, source }
+    JsonCase { id, argv, json_reply, source, generated: None }
 }
 
 /// 127 nested arrays around `0`: the deepest value both parsers accept.
@@ -213,7 +238,35 @@ pub static JSON_CASES: &[JsonCase] = &[
     // The parsed-value bound: a 128-level value and a 128-level element.
     c("depth-set-128-value", &["JSON.SET", "deep128", "$", ARRAYS_128], false, "A1"),
     c("depth-arrappend-128-element", &["JSON.ARRAPPEND", "deep", "$.a", ARRAYS_128], false, "A1"),
+    // One account for the whole reply (ADR-0173 D1): one 16,000,000-byte
+    // string document, read 8 times (128,000,140 B, under the 128 MiB
+    // default) and 9 times (144,000,157 B, over it).
+    JsonCase {
+        generated: Some(GeneratedArg { index: 3, text: big_string_document }),
+        ..c("mget-big-document", &["JSON.SET", "big", "$", BIG_DOCUMENT], false, "ADR-0173")
+    },
+    c(
+        "mget-at-reply-budget",
+        &["JSON.MGET", "big", "big", "big", "big", "big", "big", "big", "big", "$"],
+        true,
+        "ADR-0173",
+    ),
+    c(
+        "mget-over-reply-budget",
+        &["JSON.MGET", "big", "big", "big", "big", "big", "big", "big", "big", "big", "$"],
+        false,
+        "ADR-0173",
+    ),
 ];
+
+/// The placeholder `mget-big-document` writes for its generated document.
+const BIG_DOCUMENT: &str = "<a JSON string of 16,000,000 x>";
+
+/// A JSON string of 16,000,000 `x`: 16,000,002 bytes of JSON text, under the
+/// 16 MiB document cap; its `$` element is a 16,000,004-byte bulk.
+fn big_string_document() -> String {
+    format!("\"{}\"", "x".repeat(16_000_000))
+}
 
 pub struct Deviation {
     pub case_id: &'static str,
@@ -237,6 +290,22 @@ const fn d(
 /// The only accepted RedisJSON byte deviations. Entries are populated from
 /// observed, understood differences; the runtime test rejects stale entries.
 pub static DEVIATIONS: &[Deviation] = &[
+    d(
+        "mget-over-reply-budget",
+        Protocol::Resp2,
+        "JSON.MGET",
+        "the whole reply shares one doc-max-reply-bytes budget (128 MiB by default): InfinityDB \
+         answers ERR reply too large and serves no element; RedisJSON has no reply budget and \
+         answers the array",
+    ),
+    d(
+        "mget-over-reply-budget",
+        Protocol::Resp3,
+        "JSON.MGET",
+        "the whole reply shares one doc-max-reply-bytes budget (128 MiB by default): InfinityDB \
+         answers ERR reply too large and serves no element; RedisJSON has no reply budget and \
+         answers the array",
+    ),
     d(
         "s15-debug-missing",
         Protocol::Resp2,
@@ -635,6 +704,24 @@ mod tests {
             compare(&case, Protocol::Resp2, b"$1\r\n1\r\n", b"$3\r\n1.0\r\n", &[deviation]),
             Ok(Comparison::Allowed { deviation_index: 0, semantic_equal: true })
         );
+    }
+
+    fn three_x() -> String {
+        format!("\"{}\"", "x".repeat(3))
+    }
+
+    /// A generated argument replaces its placeholder and nothing else; a
+    /// case without one sends its argv as written.
+    #[test]
+    fn a_generated_argument_replaces_its_placeholder() {
+        let generated = GeneratedArg { index: 3, text: three_x };
+        let case = JsonCase {
+            generated: Some(generated),
+            ..c("g", &["JSON.SET", "k", "$", "<3 x>"], false, "g")
+        };
+        assert_eq!(case.args(), ["JSON.SET", "k", "$", "\"xxx\""]);
+        let plain = c("p", &["JSON.GET", "k"], true, "p");
+        assert_eq!(plain.args(), ["JSON.GET", "k"]);
     }
 
     #[test]

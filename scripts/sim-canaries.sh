@@ -913,6 +913,12 @@ rows=(
   # above 0, and the binary at two cells, where cells are threads, reads it on its cells.
   "inf_canary_waker_foreign_lane_always m0-smoke waker-foreign-ops"
   "inf_canary_waker_foreign_lane_always crate-test infinityd test:waker_cells no_waker_takes_the_foreign_lane_at_two_cells waker_foreign_ops above 0"
+  # ADR-0173 D1, D4: the cross-cell JSON.MGET gather admits every leg
+  # without charging its account. The gather oracle serves the split
+  # fixture at L - 1, where only the whole crosses; m3-document's model
+  # refuses its repeated audit, which the planted gather serves.
+  "inf_canary_json_gather_unaccounted crate-test inf-server test:node_e2e every_split_json_row_is_charged_whole_in_a_numbered_database reply mismatch"
+  "inf_canary_json_gather_unaccounted m3-document REPLY"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

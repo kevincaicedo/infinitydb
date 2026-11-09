@@ -39,8 +39,9 @@ use inf_store::{
 };
 use inf_wire::{CommandId, Protocol, RespWriter};
 
-use crate::exec::{Argv, ConnCx, parse_i64};
+use crate::exec::{Argv, ConnCx, NodeInfo, parse_i64};
 use crate::limits::FixedShape;
+pub(crate) use reply::REPLY_TOO_LARGE;
 use reply::{
     FixedReservation, FixedValue, JsonReply, ReplyBuild, ReplyError, ReplyStop, ReplyVerdict,
     Settled,
@@ -186,7 +187,7 @@ pub(crate) fn execute_json(
     now: Nanos,
     w: &mut RespWriter<'_>,
 ) {
-    let reply = JsonReply::open(w, store.doc_max_reply_bytes());
+    let reply = JsonReply::open(w, store.doc_reply_limit());
     let settled = match id {
         CommandId::JsonSet => set(argv, store, cx, now, reply),
         CommandId::JsonGet => get(argv, store, cx, now, reply),
@@ -216,14 +217,18 @@ pub(crate) fn execute_json(
         settled.refusals() == 0 || settled.verdict() != ReplyVerdict::Declined,
         "a declined reply refused nothing"
     );
-    // The one site that folds a reply's refusal figures into this cell's
-    // counters (ADR-0099 A1). Both saturate: they are lifetime metrics,
-    // and no accounting reads them.
-    let node = &cx.node;
-    let refusals = node.json_reply_refusals_cell.get();
-    node.json_reply_refusals_cell.set(refusals.saturating_add(settled.refusals()));
-    let refused_bytes = node.json_reply_refused_bytes_cell.get();
-    node.json_reply_refused_bytes_cell.set(refused_bytes.saturating_add(settled.refused_bytes()));
+    fold_reply_refusals(&cx.node, settled.refusals(), settled.refused_bytes());
+}
+
+/// The one fold of a reply's refusal figures into this cell's counters
+/// (ADR-0099 A1; ADR-0173 D1): a handler's reply on its owner, or a
+/// cross-cell `JSON.MGET` the coordinator's account refused. Both saturate:
+/// they are lifetime metrics, and no accounting reads them.
+pub(crate) fn fold_reply_refusals(node: &NodeInfo, refusals: u64, refused_bytes: u64) {
+    let count = node.json_reply_refusals_cell.get();
+    node.json_reply_refusals_cell.set(count.saturating_add(refusals));
+    let bytes = node.json_reply_refused_bytes_cell.get();
+    node.json_reply_refused_bytes_cell.set(bytes.saturating_add(refused_bytes));
 }
 
 // ---- JSON.DEBUG -------------------------------------------------------------
@@ -659,33 +664,49 @@ fn mget(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    reply: JsonReply<'_, '_>,
+    mut reply: JsonReply<'_, '_>,
 ) -> Settled {
     let path = argv.arg(argv.len() - 1);
     let program = match compile(store, cx, path) {
         Ok(program) => program,
         Err(error) => return reply.decline(error),
     };
+    let built = mget_build(argv, store, &program, now, &mut reply);
+    reply.settle(built)
+}
+
+/// `JSON.MGET`'s array, every frame charged to the one account of the
+/// whole reply (ADR-0173 D3): the header, then per key its match array or
+/// a null. The first crossing write stops the build, and `settle` answers
+/// the refusal in place of everything written.
+fn mget_build(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    program: &PathProgram,
+    now: Nanos,
+    reply: &mut JsonReply<'_, '_>,
+) -> ReplyBuild<'static> {
     let limits = eval_limits(store);
-    let mut elements = reply.per_element_array(argv.len() - 2);
+    reply.array_header(argv.len() - 2)?;
     for i in 1..argv.len() - 1 {
         // Per-key element: missing and non-document keys answer nil
         // (RedisJSON MGET semantics); legacy paths answer the first
-        // match, `$` paths the full match array ("[]" when none).
+        // match, `$` paths the full match array ("[]" when none). A null
+        // is content, not a refusal.
         let element = match store.json_get(argv.arg(i), now) {
-            Ok(Some(read)) => match eval(&program, read.root, &limits) {
+            Ok(Some(read)) => match eval(program, read.root, &limits) {
                 Ok(m) if program.is_legacy() && m.is_empty() => None,
-                Ok(m) => Some(path_reply(read.root, &program, &m)),
+                Ok(m) => Some(path_reply(read.root, program, &m)),
                 Err(_) => None,
             },
             Ok(None) | Err(_) => None,
         };
         match element {
-            Some(tree) => elements.document(&tree),
-            None => elements.null(),
+            Some(tree) => reply.reply_tree(&tree, &SerializeOpts::default())?,
+            None => reply.null()?,
         }
     }
-    elements.finish()
+    Ok(())
 }
 
 // ---- JSON.DEL / JSON.FORGET / JSON.TYPE --------------------------------------
@@ -1858,7 +1879,9 @@ pub static JSON_REPLY_SHAPES: &[ReplyShape] = &[
         dollar: "array: per key, bulk JSON match-array or null",
         legacy: "array: per key, bulk first match or null",
         resp3: NULLS,
-        notes: "per-key atomicity only — no cross-cell snapshot (ADR-0041 D9)",
+        notes: "per-key atomicity only — no cross-cell snapshot (ADR-0041 D9); a reply over \
+                `doc-max-reply-bytes`, counted over the whole array, answers `ERR reply too large` \
+                and no element is served (ADR-0173 D1)",
     },
     ReplyShape {
         name: "JSON.DEL",
@@ -2146,11 +2169,11 @@ mod tests {
 
     /// `json_reply_refusals_cell` and `json_reply_refused_bytes_cell`
     /// (ADR-0099 A1's observables): a refused reply counts one and the
-    /// bytes it built before its rollback; each refused `MGET` element
-    /// counts one; a served or declined reply counts nothing; both folds
-    /// saturate. `$[0,0]` over `[[1,2,3]]` answers `*2\r\n:3\r\n:3\r\n`
-    /// (12 B): at 11 B the header and the first count (8 B) are written,
-    /// then the second count crosses.
+    /// bytes it built before its rollback, a `JSON.MGET` too, whose whole
+    /// array is one reply (ADR-0173 D3); a served or declined reply counts
+    /// nothing; both folds saturate. `$[0,0]` over `[[1,2,3]]` answers
+    /// `*2\r\n:3\r\n:3\r\n` (12 B): at 11 B the header and the first count
+    /// (8 B) are written, then the second count crosses.
     #[test]
     fn reply_refusals_fold_into_this_cells_counters() {
         let config = inf_store::StoreConfig { doc_max_reply_bytes: 11, ..Default::default() };
@@ -2170,13 +2193,15 @@ mod tests {
         let declined = run(&[b"JSON.ARRLEN", b"k", b"$["], &mut store, &cx, now);
         assert!(declined.starts_with(b"-ERR"), "{}", String::from_utf8_lossy(&declined));
         assert_eq!(counters(), (1, 8), "a declined reply counts nothing");
-        // Each MGET element is its own account: `$` answers the bulk
-        // `[[[1,2,3]]]` (18 B), which crosses 11 B.
+        // One account for the whole array: its header (4 B) is written,
+        // then the first bulk `[[[1,2,3]]]` (18 B) crosses 11 B and the
+        // whole reply is refused: one refusal, of the header and the bytes
+        // the crossing bulk built before its rollback.
         let mget = run(&[b"JSON.MGET", b"k", b"k", b"$"], &mut store, &cx, now);
-        assert_eq!(mget, b"*2\r\n-ERR reply too large\r\n-ERR reply too large\r\n");
+        assert_eq!(mget, b"-ERR reply too large\r\n");
         let (refusal_count, bytes) = counters();
-        assert_eq!(refusal_count, 3, "two refused elements count two");
-        assert!(bytes > 8, "the refused elements' built bytes count");
+        assert_eq!(refusal_count, 2, "one refusal for the whole array");
+        assert!(bytes > 8 + 4, "the header and the crossing bulk's built bytes: {bytes}");
         refusals.set(u64::MAX);
         refused_bytes.set(u64::MAX);
         let refused = run(&[b"JSON.ARRLEN", b"k", b"$[0,0]"], &mut store, &cx, now);

@@ -161,6 +161,7 @@ fn base(scenario: &SidecarScenario) -> DurableScenario {
         stop_tick: false,
         fill_dense: false,
         wake: WakeLeg::OFF,
+        mget_audits: None,
     }
 }
 

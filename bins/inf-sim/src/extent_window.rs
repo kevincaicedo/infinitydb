@@ -371,6 +371,7 @@ impl ExtentWindowScenario {
             stop_tick: false,
             fill_dense: false,
             wake: WakeLeg::OFF,
+            mget_audits: None,
         }
     }
 }

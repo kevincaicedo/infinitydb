@@ -1,8 +1,8 @@
-//! One byte account per `JSON.*` reply (ADR-0099 A1).
+//! One byte account per `JSON.*` reply (ADR-0099 A1; ADR-0173 D1).
 //!
-//! `execute_json` opens a [`JsonReply`] over the connection's writer, sized
-//! from the namespace's `doc-max-reply-bytes`, and hands it to the handler
-//! by value. Every non-error byte the reply writes is charged to the one
+//! `execute_json` opens a [`JsonReply`] over the connection's writer with
+//! the namespace's [`ReplyLimit`] (`doc-max-reply-bytes`), and hands it to
+//! the handler by value. Every non-error byte the reply writes is charged to the one
 //! account, framing included. A write that would cross the account writes
 //! nothing and returns [`ReplyTooLarge`]; the handler then consumes the
 //! reply with [`JsonReply::refuse`], which rolls the whole reply back and
@@ -29,7 +29,7 @@ use inf_doc::path::{EvalError, PathError};
 use inf_doc::ser::{
     Reply, ReplyTooLarge, SerializeOpts, serialize_into_bounded, serialize_reply_into_bounded,
 };
-use inf_store::OpError;
+use inf_store::{OpError, ReplyLimit};
 use inf_wire::limits::PATCHED_HEADER_SLACK_BYTES;
 use inf_wire::{Protocol, ReplyMark, RespWriter};
 
@@ -38,7 +38,7 @@ use crate::limits::FixedShape;
 
 /// Pinned phrasing for a reply over the namespace's `doc-max-reply-bytes`
 /// (ADR-0099 D3, beside ADR-0039 D5's `ERR document too large`).
-pub(super) const REPLY_TOO_LARGE: &str = "ERR reply too large";
+pub(crate) const REPLY_TOO_LARGE: &str = "ERR reply too large";
 
 /// A handler's one reply, charged against one account.
 pub(super) struct JsonReply<'w, 'b> {
@@ -46,16 +46,15 @@ pub(super) struct JsonReply<'w, 'b> {
     mark: ReplyMark,
     /// The buffer length at the mark: bytes before it are earlier replies.
     start_offset_bytes: usize,
-    budget_bytes: usize,
-    /// The buffer length the reply may reach: the mark plus the budget.
-    limit_at: usize,
+    /// The command's one account, counted from the mark.
+    limit: ReplyLimit,
     /// Bytes a crossing document bulk built before the account refused it:
     /// with what the rollback discards, the refusal's cost in bytes.
     discarded_bytes: usize,
 }
 
 /// How a handler's reply ended (ADR-0099 A1). Only the consuming ends of
-/// [`JsonReply`], [`FixedReply`] and [`PerElementArray`] make one.
+/// [`JsonReply`] and [`FixedReply`] make one.
 #[must_use]
 #[derive(Debug)]
 pub(super) struct Settled {
@@ -66,7 +65,7 @@ pub(super) struct Settled {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum ReplyVerdict {
-    /// The built reply stands (an `MGET` with refused elements included).
+    /// The built reply stands.
     Served,
     /// The account refused: `-ERR reply too large` replaced the reply.
     Refused,
@@ -79,8 +78,7 @@ impl Settled {
         self.verdict
     }
 
-    /// Refusals this reply counted: one for a refused reply, one per
-    /// refused `MGET` element.
+    /// Refusals this reply counted: one for a refused reply.
     pub(super) fn refusals(&self) -> u64 {
         self.refusals
     }
@@ -192,22 +190,27 @@ fn json_error(error: &JsonParseError, w: &mut RespWriter<'_>) {
 impl<'w, 'b> JsonReply<'w, 'b> {
     /// Opens the command's account at the writer's current end. Called by
     /// `execute_json` alone, once per command (ADR-0099 A1).
-    pub(super) fn open(writer: &'w mut RespWriter<'b>, budget_bytes: usize) -> Self {
+    pub(super) fn open(writer: &'w mut RespWriter<'b>, limit: ReplyLimit) -> Self {
         let start_offset_bytes = writer.buffered_bytes();
         let mark = writer.mark();
-        let limit_at = start_offset_bytes.saturating_add(budget_bytes);
-        JsonReply { writer, mark, start_offset_bytes, budget_bytes, limit_at, discarded_bytes: 0 }
+        JsonReply { writer, mark, start_offset_bytes, limit, discarded_bytes: 0 }
+    }
+
+    /// The reply's bytes so far, from the command's own mark.
+    fn written_bytes(&self) -> usize {
+        self.writer.buffered_bytes() - self.start_offset_bytes
     }
 
     pub(super) fn protocol(&self) -> Protocol {
         self.writer.protocol()
     }
 
-    /// Refuses a frame of `frame_bytes` that would pass the account.
+    /// Refuses a frame of `frame_bytes` that would pass the account: the
+    /// predicate on the predicted length (ADR-0173 D1).
     fn charge(&self, frame_bytes: usize) -> Result<(), ReplyTooLarge> {
-        match self.writer.buffered_bytes().checked_add(frame_bytes) {
-            Some(end) if end <= self.limit_at => Ok(()),
-            Some(_) | None => Err(ReplyTooLarge),
+        match self.written_bytes().checked_add(frame_bytes) {
+            Some(reply_bytes) => self.limit.admits(reply_bytes),
+            None => Err(ReplyTooLarge),
         }
     }
 
@@ -298,7 +301,8 @@ impl<'w, 'b> JsonReply<'w, 'b> {
     ) -> Result<(), ReplyTooLarge> {
         let frame_at = self.writer.buffered_bytes();
         let frame = self.writer.mark();
-        let limit = self.limit_at.saturating_add(PATCHED_HEADER_SLACK_BYTES);
+        let stop = self.limit.serializer_stop(PATCHED_HEADER_SLACK_BYTES);
+        let limit = self.start_offset_bytes.saturating_add(stop);
         let mut built_bytes = 0;
         let written = self.writer.try_bulk_patched(|out| {
             let result = serialize(out, limit);
@@ -311,10 +315,10 @@ impl<'w, 'b> JsonReply<'w, 'b> {
             self.discarded_bytes += built_bytes;
             return Err(refusal);
         }
-        if self.writer.buffered_bytes() > self.limit_at {
+        if let Err(refusal) = self.limit.admits(self.written_bytes()) {
             self.discarded_bytes += self.writer.buffered_bytes() - frame_at;
             self.writer.rollback(&frame);
-            return Err(ReplyTooLarge);
+            return Err(refusal);
         }
         Ok(())
     }
@@ -325,14 +329,14 @@ impl<'w, 'b> JsonReply<'w, 'b> {
         // rule it checks, so the independent reply oracle must go red.
         let planted =
             cfg!(inf_canary_json_reply_uncharged) || cfg!(inf_canary_json_reply_framing_uncharged);
-        let within = self.writer.buffered_bytes() <= self.limit_at;
+        let within = self.limit.admits(self.written_bytes()).is_ok();
         debug_assert!(planted || within, "charged writes stay in");
         Settled { verdict: ReplyVerdict::Served, refusals: 0, refused_bytes: 0 }
     }
 
     /// Rolls the whole reply back and answers `ERR reply too large`.
     pub(super) fn refuse(self, _refusal: ReplyTooLarge) -> Settled {
-        let written = self.writer.buffered_bytes() - self.start_offset_bytes;
+        let written = self.written_bytes();
         self.writer.rollback(&self.mark);
         self.writer.error(REPLY_TOO_LARGE);
         let refused_bytes = u64::try_from(written + self.discarded_bytes).unwrap_or(u64::MAX);
@@ -364,14 +368,6 @@ impl<'w, 'b> JsonReply<'w, 'b> {
             Ok(()) => FixedReservation::Reserved(FixedReply { reply: self, shape }),
             Err(refusal) => FixedReservation::Refused(self.refuse(refusal)),
         }
-    }
-
-    /// `JSON.MGET` only: the outer header is not charged, and each element
-    /// is charged against its own account of the whole budget. The reply's
-    /// aggregate is ADR-0099 A1's dated deviation, not bounded here.
-    pub(super) fn per_element_array(self, count: usize) -> PerElementArray<'w, 'b> {
-        self.writer.array_header(count);
-        PerElementArray { reply: self, refusals: 0, refused_bytes: 0 }
     }
 }
 
@@ -505,52 +501,6 @@ impl<'w, 'b> FixedReply<'w, 'b> {
     /// general path (the reservation wrote nothing).
     pub(super) fn reopen(self, _unapplied: Unapplied) -> JsonReply<'w, 'b> {
         self.reply
-    }
-}
-
-/// `JSON.MGET`'s reply: one account of the whole budget per element.
-pub(super) struct PerElementArray<'w, 'b> {
-    reply: JsonReply<'w, 'b>,
-    refusals: u64,
-    refused_bytes: u64,
-}
-
-impl PerElementArray<'_, '_> {
-    /// One element's JSON text; a crossing element answers the pinned
-    /// error as that element (the `EXEC` error-in-array precedent).
-    pub(super) fn document(&mut self, reply: &Reply<'_>) {
-        self.open_element();
-        if let Err(ReplyTooLarge) = self.reply.reply_tree(reply, &SerializeOpts::default()) {
-            self.refuse_element();
-        }
-    }
-
-    /// A missing or non-document key's null element.
-    pub(super) fn null(&mut self) {
-        self.open_element();
-        if let Err(ReplyTooLarge) = self.reply.null() {
-            self.refuse_element();
-        }
-    }
-
-    /// Opens the next element's account of the whole budget at the
-    /// buffer's end. A crossing write rolls its own frame back.
-    fn open_element(&mut self) {
-        let element_at = self.reply.writer.buffered_bytes();
-        self.reply.limit_at = element_at.saturating_add(self.reply.budget_bytes);
-        self.reply.discarded_bytes = 0;
-    }
-
-    fn refuse_element(&mut self) {
-        self.refusals += 1;
-        let discarded = u64::try_from(self.reply.discarded_bytes).unwrap_or(u64::MAX);
-        self.refused_bytes = self.refused_bytes.saturating_add(discarded);
-        self.reply.writer.error(REPLY_TOO_LARGE);
-    }
-
-    pub(super) fn finish(self) -> Settled {
-        let (refusals, refused_bytes) = (self.refusals, self.refused_bytes);
-        Settled { verdict: ReplyVerdict::Served, refusals, refused_bytes }
     }
 }
 

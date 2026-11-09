@@ -18,11 +18,13 @@ use inf_store::{
 
 use crate::fault::SHADOW_TWIN_READ_FAIL;
 
-#[cfg(feature = "doc")]
-use super::dispatch::gather_json_mget;
 use super::dispatch::{dispatch_scatter, program_mset, settle_reply};
+#[cfg(feature = "doc")]
+use super::json_gather::{GatherTarget, json_gather, test_support};
 use super::publish::program_pubsub;
 use super::scatter::{PROGRAM_REPLY_MALFORMED, read_scan_leg};
+#[cfg(feature = "doc")]
+use super::split::{OwnerSplit, split_by_owner};
 use super::*;
 
 /// The client-side key every settled reply is written for (no connection
@@ -768,42 +770,82 @@ fn reply_outcome_rename_take_leg_error_is_the_reply() {
     assert_eq!(reply, BLOB);
 }
 
-/// `JSON.MGET` over one local and one remote key, the remote leg answered
-/// by `answer`; the client's reply.
+/// `JSON.MGET` over one local and one remote key, gathered and settled as
+/// the pump does, the remote leg answered by `answer`: the client's reply,
+/// and the local key's element.
 #[cfg(feature = "doc")]
 fn json_mget(
     cells: &Cells,
     answer: impl FnMut(&[&[u8]]) -> Option<Outcome<'static>>,
-) -> (Vec<u8>, Vec<u8>) {
+) -> (OwnedReply, Vec<u8>) {
     let (local, remote) = (cells.key_on(0), cells.key_on(1));
     let element = cells.local(0, &[b"JSON.MGET", &local, b"$.a"]);
-    let element = element.strip_prefix(b"*1\r\n").expect("a one-element sub-reply").to_vec();
+    let element = element.strip_prefix(b"*1\r\n").expect("a one-element leg").to_vec();
     let shared = cells.origin();
     let argv: &[&[u8]] = &[b"JSON.MGET", &local, &remote, b"$.a"];
+    let meta = lookup(argv[0]).expect("a registered command");
+    let target = GatherTarget {
+        origin: ORIGIN,
+        proto: Protocol::Resp2,
+        id: 0,
+        db: 0,
+        scope: ScatterScope::Db,
+    };
     let reply = cells.drive(
         async {
             let mut inflight = 0;
-            let pending =
-                gather_json_mget(shared, ORIGIN, Protocol::Resp2, 0, 0, argv, &mut inflight).await;
-            settle_reply(shared, KEY, pending, &mut inflight).await.into_bytes()
+            let pending = json_gather(shared, target, meta, argv, &mut inflight).await;
+            let reply = settle_reply(shared, KEY, pending, &mut inflight).await;
+            assert_eq!(inflight, 0, "every leg sent was awaited");
+            reply
         },
         answer,
     );
     (reply, element)
 }
 
-/// The `JSON.MGET` gather pastes an `Error` element whole, whatever its
-/// first byte: no shape is read from an error (ADR-0190 D2).
+/// A remote leg's `Error` reply is the whole reply, moved whole whatever its
+/// first byte (ADR-0173 A1.2): never an element of the array.
 #[cfg(feature = "doc")]
 #[test]
-fn reply_outcome_json_mget_error_element_is_pasted_whole() {
+fn reply_outcome_json_mget_error_leg_is_the_reply() {
     let cells = Cells::new();
-    let (reply, element) =
+    let (reply, _) =
         json_mget(&cells, |args| (args[0] == b"JSON.MGET").then_some(Outcome::ErrorReply(BLOB)));
-    assert_eq!(reply, [b"*2\r\n".as_slice(), &element, BLOB].concat());
+    assert_eq!(String::from_utf8_lossy(reply.bytes()), String::from_utf8_lossy(BLOB));
+    assert!(reply.is_error());
 }
 
-/// Control: a `Success` element is stripped to the one value it carries.
+/// A `Success` leg without its array header is a malformed peer reply: the
+/// leg rule's one line, `Error` by its outcome.
+#[cfg(feature = "doc")]
+#[test]
+fn reply_outcome_json_mget_headerless_success_leg_is_malformed() {
+    let cells = Cells::new();
+    let (reply, _) =
+        json_mget(&cells, |args| (args[0] == b"JSON.MGET").then_some(Outcome::Bytes(b"+OK\r\n")));
+    assert_eq!(reply.bytes(), written_error(PROGRAM_REPLY_MALFORMED));
+    assert!(reply.is_error());
+}
+
+/// A leg the fabric refused is the cross-cell failure line for the whole
+/// reply, never a null element.
+#[cfg(feature = "doc")]
+#[test]
+fn reply_outcome_json_mget_fabric_refusal_leg_fails() {
+    let cells = Cells::new();
+    let (reply, _) = json_mget(&cells, |args| {
+        (args[0] == b"JSON.MGET").then_some(Outcome::Err(ErrCode::OutOfMemory))
+    });
+    assert_eq!(
+        String::from_utf8_lossy(reply.bytes()),
+        String::from_utf8_lossy(&written_error(CROSS_CELL_EXECUTION_FAILED))
+    );
+    assert!(reply.is_error());
+}
+
+/// Control: a `Success` leg's elements are pasted in argv order behind the
+/// gather's own header.
 #[cfg(feature = "doc")]
 #[test]
 fn reply_outcome_json_mget_success_element_is_stripped() {
@@ -811,5 +853,182 @@ fn reply_outcome_json_mget_success_element_is_stripped() {
     let (reply, element) = json_mget(&cells, |args| {
         (args[0] == b"JSON.MGET").then_some(Outcome::Bytes(b"*1\r\n$5\r\n[1,2]\r\n"))
     });
-    assert_eq!(reply, [b"*2\r\n".as_slice(), &element, b"$5\r\n[1,2]\r\n"].concat());
+    assert_eq!(reply.bytes(), [b"*2\r\n".as_slice(), &element, b"$5\r\n[1,2]\r\n"].concat());
+    assert!(!reply.is_error());
+}
+
+/// One answer a remote leg can give, by the settle table's rows.
+#[cfg(feature = "doc")]
+#[derive(Copy, Clone, Debug)]
+enum LegAnswer {
+    /// A one-element success, 9 B of element.
+    Small,
+    /// A one-element success, 24 B of element.
+    Large,
+    /// An `Error` reply in RESP2's line.
+    DashError,
+    /// An `Error` reply in RESP3's blob form.
+    BlobError,
+    /// A `Success` reply its decoder refuses.
+    Malformed,
+    /// Not a reply: the fabric refused the leg.
+    Refused,
+}
+
+#[cfg(feature = "doc")]
+impl LegAnswer {
+    fn outcome(self) -> OwnedOutcome {
+        let reply = |bytes: &[u8], outcome| {
+            OwnedOutcome::Reply(OwnedReply::received(bytes.to_vec(), outcome).expect("bytes"))
+        };
+        match self {
+            LegAnswer::Small => reply(b"*1\r\n$3\r\n[1]\r\n", ReplyOutcome::Success),
+            LegAnswer::Large => {
+                reply(b"*1\r\n$17\r\n[\"0123456789abc\"]\r\n", ReplyOutcome::Success)
+            }
+            LegAnswer::DashError => reply(b"-ERR a\r\n", ReplyOutcome::Error),
+            LegAnswer::BlobError => reply(BLOB, ReplyOutcome::Error),
+            LegAnswer::Malformed => reply(b"+OK\r\n", ReplyOutcome::Success),
+            LegAnswer::Refused => OwnedOutcome::Err(ErrCode::OutOfMemory),
+        }
+    }
+}
+
+/// A plan of `legs` remote legs, one key each on cells 1 to `legs` of a
+/// four-cell router, as cell 0 sees it.
+#[cfg(feature = "doc")]
+fn remote_plan(legs: usize) -> super::split::GatherPlan {
+    let router = SlotRouter::new_contiguous(4);
+    let keys: Vec<Vec<u8>> = (1..=legs)
+        .map(|cell| {
+            (0..1000)
+                .map(|n| format!("leg:{n}").into_bytes())
+                .find(|k| router.cell_of(SlotRouter::slot_of(k)) == CellId(cell as u16))
+                .expect("every cell owns a key")
+        })
+        .collect();
+    let mut argv: Vec<&[u8]> = vec![b"JSON.MGET"];
+    argv.extend(keys.iter().map(Vec::as_slice));
+    argv.push(b"$");
+    let meta = lookup(b"JSON.MGET").expect("a registered command");
+    match split_by_owner(&router, CellId(0), meta, &argv) {
+        OwnerSplit::Many(plan) => plan,
+        OwnerSplit::One(owner) => panic!("one owner {owner:?} for {legs} legs"),
+    }
+}
+
+/// A 40 B account: two small legs fit (22 B), a large one beside a small
+/// one does not (37 B fits at two legs; 46 B at three).
+#[cfg(feature = "doc")]
+fn small_limit() -> inf_store::ReplyLimit {
+    inf_store::CellStore::new(StoreConfig { doc_max_reply_bytes: 40, ..StoreConfig::default() })
+        .doc_reply_limit()
+}
+
+/// The gather of `answers`, its legs' waiters on a gate of the test's own,
+/// completed in `order` with the fold polled once after each completion (a
+/// no-op waker): the reply, and the gate's live entries after it.
+#[cfg(feature = "doc")]
+fn gathered_in(cells: &Cells, answers: &[LegAnswer], order: &[usize]) -> (OwnedReply, usize) {
+    let shared = cells.origin();
+    let gate: inf_runtime::FabricGate<OwnedOutcome> = inf_runtime::FabricGate::new();
+    let tokens: Vec<u64> = (0..answers.len() as u64).map(|t| 0xFEED_0000 + t).collect();
+    let waiters = tokens.iter().map(|&t| gate.waiter(t)).collect();
+    let plan = remote_plan(answers.len());
+    let gather = test_support::in_flight(shared, Protocol::Resp2, plan, small_limit(), waiters);
+    let mut inflight = answers.len();
+    let reply = {
+        let mut finish = pin!(gather.finish(shared, &mut inflight));
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut ready = None;
+        for &leg in order {
+            assert!(ready.is_none(), "the fold ended before every leg answered");
+            assert!(gate.complete(tokens[leg], answers[leg].outcome()), "a live waiter");
+            if let Poll::Ready(reply) = finish.as_mut().poll(&mut cx) {
+                ready = Some(reply);
+            }
+        }
+        ready.expect("every leg answered: the fold is done")
+    };
+    assert_eq!(inflight, 0, "every leg awaited");
+    (reply, gate.pending())
+}
+
+/// The verdict does not depend on the order the replies arrive in. For
+/// 2 and 3 remote legs answering from every settle row, `Error` legs in
+/// RESP2's line and RESP3's blob form among them, every completion order
+/// gives the in-order run's bytes, outcome and an empty gate. The canary,
+/// in the same test: the same fold fed in completion order gives another
+/// reply when two legs answer different errors.
+#[cfg(feature = "doc")]
+#[test]
+fn reply_outcome_json_mget_verdict_is_independent_of_arrival_order() {
+    use LegAnswer::{BlobError, DashError, Large, Malformed, Refused, Small};
+    let cells = Cells::new();
+    let cases: &[&[LegAnswer]] = &[
+        &[Small, Small],
+        &[Small, Large],
+        &[DashError, BlobError],
+        &[BlobError, Malformed],
+        &[Refused, DashError],
+        &[Small, Small, Small],
+        &[Small, Large, Small],
+        &[Small, DashError, BlobError],
+        &[Malformed, Small, Refused],
+        &[Large, BlobError, Small],
+    ];
+    let permutations: &[&[usize]] =
+        &[&[0, 1, 2], &[0, 2, 1], &[1, 0, 2], &[1, 2, 0], &[2, 0, 1], &[2, 1, 0]];
+    for answers in cases {
+        let orders: Vec<Vec<usize>> = permutations
+            .iter()
+            .map(|p| p.iter().copied().filter(|&leg| leg < answers.len()).collect::<Vec<_>>())
+            .collect();
+        let (in_order, live) = gathered_in(&cells, answers, &orders[0]);
+        assert_eq!(live, 0, "{answers:?}: the gate holds nothing");
+        for order in &orders {
+            let (reply, live) = gathered_in(&cells, answers, order);
+            assert_eq!(
+                (String::from_utf8_lossy(reply.bytes()), reply.is_error(), live),
+                (String::from_utf8_lossy(in_order.bytes()), in_order.is_error(), 0),
+                "{answers:?} completed in {order:?}"
+            );
+        }
+    }
+    // The canary: the fold fed in completion order takes the first error to
+    // arrive for the first leg's, which an arrival order can change.
+    let fed = |order: &[usize]| {
+        let answers = [DashError, BlobError];
+        let outcomes = order.iter().map(|&leg| answers[leg].outcome()).collect();
+        let plan = remote_plan(2);
+        let shared = cells.origin();
+        test_support::settled_as_given(shared, Protocol::Resp2, plan, small_limit(), outcomes)
+    };
+    assert_ne!(
+        fed(&[0, 1]).bytes(),
+        fed(&[1, 0]).bytes(),
+        "VACUOUS: no order changed the fed fold"
+    );
+}
+
+/// The gather's own refusal is its reply's first and only frame, `Error` by
+/// its outcome, and one refusal on this cell.
+#[cfg(feature = "doc")]
+#[test]
+fn reply_outcome_json_mget_sum_over_the_account_is_refused() {
+    let cells = Cells::new();
+    let shared = cells.origin();
+    let before = shared.node.json_reply_refusals_cell.get();
+    let outcomes =
+        vec![LegAnswer::Small.outcome(), LegAnswer::Large.outcome(), LegAnswer::Small.outcome()];
+    let reply = test_support::settled_as_given(
+        shared,
+        Protocol::Resp2,
+        remote_plan(3),
+        small_limit(),
+        outcomes,
+    );
+    assert_eq!(reply.bytes(), written_error("ERR reply too large"));
+    assert!(reply.is_error());
+    assert_eq!(shared.node.json_reply_refusals_cell.get() - before, 1, "one refusal, on this cell");
 }

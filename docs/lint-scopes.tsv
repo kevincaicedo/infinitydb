@@ -54,6 +54,7 @@ inf-server/scan_cursor	crates/inf-server/src/exec.rs::parse_cursor	cast,arith	de
 inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_array_header	cast,arith	deny
 inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_scan_head	cast,arith	deny
 inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_take_reply	cast,arith	deny
+inf-server/scatter_replies	crates/inf-server/src/plane/json_gather.rs::parse_json_mget_leg	cast,arith	deny
 inf-store/fuzz_catalog	crates/inf-store/src/catalog.rs	cast,arith	deny
 inf-store/fuzz_cold_key	crates/inf-store/src/record.rs::from_window	cast,arith	deny
 inf-store/tier_span_select	crates/inf-store/src/tiered/select.rs	cast,arith	deny

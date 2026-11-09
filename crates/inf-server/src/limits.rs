@@ -215,6 +215,48 @@ const _: () = {
     assert!(JSON_FIXED_REPLY_BYTES_MAX == 348, "the fixed column's maximum is 348 bytes");
 };
 
+/// Legs of one cross-cell `JSON.MGET` gather in flight at once (ADR-0173
+/// D4): 3, the owner's value, which keeps a gather over every cell of a
+/// four-cell node at one round trip. Owner: the gather's FIFO of leg
+/// waiters, built per gather on the cell's census; every gather of the cell
+/// shares the `json-gather-legs` row. Crossing: pacing — with this many legs
+/// in flight the next leg waits for the oldest leg's reply (the
+/// connection's pump with it), and the row counts a crossing in `INFO caps`.
+/// A larger value needs a decision record that first accounts for the
+/// memory a connection's queued requests hold: one refused gather can hold
+/// (this value + 1) × `doc-max-reply-bytes`.
+#[cfg(feature = "doc")]
+pub const JSON_GATHER_LEGS_IN_FLIGHT_MAX: u32 = 3;
+
+/// The gather window's cap: `JSON_GATHER_LEGS_IN_FLIGHT_MAX` entries under
+/// the census name `json-gather-legs`, filled while the cell serves.
+#[cfg(feature = "doc")]
+pub const JSON_GATHER_LEGS: Cap =
+    Cap::entries::<JSON_GATHER_LEGS_IN_FLIGHT_MAX>("json-gather-legs", CapFill::Serving);
+
+/// Bytes of the longest frame header a `JSON.MGET` leg's reply carries: a
+/// type byte, the decimal of a `u64` length (20 digits at most), CRLF — the
+/// most the reply writer emits for one element. Owner: the gather's leg
+/// decoder, which looks for a header's CRLF within it. Crossing: a header
+/// longer than this is a malformed success, answered
+/// `ERR cross-cell program reply malformed`.
+#[cfg(feature = "doc")]
+pub const JSON_LEG_FRAME_HEADER_BYTES_MAX: usize = 1 + decimal_digits(u64::MAX) + 2;
+
+#[cfg(feature = "doc")]
+const _: () = assert!(JSON_LEG_FRAME_HEADER_BYTES_MAX == 23, "`$`, 20 digits and CRLF");
+
+/// Decimal digits of `value`.
+#[cfg(feature = "doc")]
+const fn decimal_digits(mut value: u64) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
 /// The recovery step budget's price (ADR-0174 A1) of one boot file
 /// operation outside replay — in the start step's tier map, an open of an
 /// existing tier file, a truncate, a removal, a directory listing's open

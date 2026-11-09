@@ -487,7 +487,9 @@ pub static DECLARED: &[Declared] = &[
         Status::Partial,
         "M3",
         "S21 corpus exact; per-key atomicity only — no cross-cell snapshot (each cell serves \
-         its key at its own serve time)",
+         its key at its own serve time); a reply over doc-max-reply-bytes (128 MiB by default), \
+         counted over the whole array, answers ERR reply too large and serves nothing, where \
+         RedisJSON answers the array",
     ),
     d(
         "JSON.DEL",

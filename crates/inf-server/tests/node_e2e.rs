@@ -226,6 +226,68 @@ struct Node {
 /// A set of tiered namespace names, in byte order.
 type NsNames = std::collections::BTreeSet<Vec<u8>>;
 
+/// What a node is assembled with beyond its shape: the store configuration
+/// every cell's keyspace takes, and the log its cells' observers record into
+/// (`None`: they record nothing).
+#[derive(Clone, Default)]
+struct NodeExtras {
+    store: StoreConfig,
+    log: Option<ExecLog>,
+}
+
+/// One command a cell executed, as its observer saw it: the cell, the cell a
+/// fabric `Apply` came from (`None` for a connection of the cell's own) and
+/// the argv.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Executed {
+    cell: u16,
+    from: Option<u16>,
+    argv: Vec<Vec<u8>>,
+}
+
+/// The executions of every cell of one node, in the order the cells logged
+/// them (each cell's own order is its execution order).
+type ExecLog = Arc<std::sync::Mutex<Vec<Executed>>>;
+
+/// A cell's observer: appends each execution to the node's log when the node
+/// was started with one. A test reads which cell ran which command, so a leg
+/// a gather sent, held or never sent is observed on its owner.
+struct Recorder {
+    cell: u16,
+    log: Option<ExecLog>,
+}
+
+impl inf_server::PlaneObserver for Recorder {
+    fn on_execute(
+        &mut self,
+        cell: CellId,
+        origin: inf_server::ExecOrigin,
+        _scope: inf_server::ExecScope,
+        argv: &[&[u8]],
+        _reply: &[u8],
+        _now: Nanos,
+    ) {
+        debug_assert_eq!(cell.0, self.cell, "a cell's observer observes its own cell");
+        let Some(log) = &self.log else { return };
+        let from = match origin {
+            inf_server::ExecOrigin::Conn(..) => None,
+            inf_server::ExecOrigin::Fabric(from) => Some(from.0),
+        };
+        let argv = argv.iter().map(|arg| arg.to_vec()).collect();
+        log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Executed {
+            cell: cell.0,
+            from,
+            argv,
+        });
+    }
+}
+
+/// The executions in `log` whose command is `name`, in log order.
+fn executed(log: &ExecLog, name: &[u8]) -> Vec<Executed> {
+    let log = log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    log.iter().filter(|e| e.argv.first().is_some_and(|a| a.as_slice() == name)).cloned().collect()
+}
+
 struct CatalogPump {
     hold: Arc<AtomicBool>,
     /// Swaps the pump may still land while `hold` is set
@@ -263,6 +325,7 @@ impl Node {
             None,
             None,
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -290,6 +353,42 @@ impl Node {
         Node::start_with(cells, None, CkptTrigger::Manual)
     }
 
+    /// A volatile node of `cells` cells whose keyspaces take `store` and
+    /// whose cells record every execution into the returned log.
+    fn start_recorded(cells: u16, store: StoreConfig) -> (Node, ExecLog) {
+        Node::start_recorded_in(cells, None, store)
+    }
+
+    /// [`Node::start_recorded`] over `data_dir`, a durable node (named
+    /// namespaces need its control plane).
+    fn start_recorded_in(
+        cells: u16,
+        data_dir: Option<std::path::PathBuf>,
+        store: StoreConfig,
+    ) -> (Node, ExecLog) {
+        let log = ExecLog::default();
+        let node = Node::start_cfg_default(
+            cells,
+            data_dir,
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            Default::default(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            NodeExtras { store, log: Some(Arc::clone(&log)) },
+        );
+        (node, log)
+    }
+
     /// A volatile node whose cell clocks all read `held` (see [`HeldClock`]).
     fn start_held_clock(cells: u16, held: HeldClock) -> Node {
         Node::start_cfg_default(
@@ -309,6 +408,7 @@ impl Node {
             None,
             Some(held),
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -384,6 +484,7 @@ impl Node {
             None,
             None,
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -416,6 +517,7 @@ impl Node {
             None,
             None,
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -444,6 +546,7 @@ impl Node {
             Some(std::num::NonZeroU64::new(units).expect("headroom >= 1")),
             None,
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -654,6 +757,7 @@ impl Node {
             None,
             None,
             Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -675,6 +779,7 @@ impl Node {
         ckpt_headroom: Option<std::num::NonZeroU64>,
         held_clock: Option<HeldClock>,
         holds: Vec<(u16, &'static str, inf_foundation::fault::HoldGate)>,
+        extras: NodeExtras,
     ) -> Node {
         assert!(held_clock.is_none() || data_dir.is_none(), "a held clock boots a volatile node");
         let stop = Arc::new(AtomicBool::new(false));
@@ -786,6 +891,7 @@ impl Node {
             let faults = faults.clone();
             let holds = holds.clone();
             let default_ns = default_ns.clone();
+            let extras = extras.clone();
             handles.push(std::thread::spawn(move || {
                 // M2-S16: arm this cell's fault plan before recovery — the
                 // registry is thread-local (cells are single-threaded, L1).
@@ -825,9 +931,9 @@ impl Node {
                     Some((_, catalog, _)) => {
                         let empty = inf_store::NsCatalog::empty();
                         let catalog = catalog.as_ref().unwrap_or(&empty);
-                        Keyspace::cataloged(StoreConfig::default(), catalog).expect("seed catalog")
+                        Keyspace::cataloged(extras.store, catalog).expect("seed catalog")
                     }
-                    None => Keyspace::new(StoreConfig::default()),
+                    None => Keyspace::new(extras.store),
                 };
                 let mut durable = None;
                 if let Some((dir, _catalog, control)) = &boot {
@@ -859,7 +965,7 @@ impl Node {
                     ks,
                     fabric,
                     node,
-                    NoopObserver,
+                    Recorder { cell: i as u16, log: extras.log.clone() },
                     false,
                 )
                 .expect("the server's timer owners fit their cap");
@@ -1189,7 +1295,7 @@ fn stop_phase_of_byte(byte: u8) -> Option<inf_server::StopPhase> {
 /// Adds to `at_default` each tiered namespace on `plane`'s cell that runs
 /// at the product's `TAIL-STALL-TIMEOUT` default. The harness calls it after
 /// every iteration, so a namespace dropped before the stop is recorded too.
-fn note_product_tail_stall(plane: &ServerPlane, at_default: &mut NsNames) {
+fn note_product_tail_stall(plane: &ServerPlane<Recorder>, at_default: &mut NsNames) {
     for spec in plane.keyspace().ns_iter() {
         let Some(tier) = &spec.tier else {
             continue;
@@ -1872,6 +1978,22 @@ fn deasync_dispatch_matches_pump_semantics() {
     sub.write_all(&cmd(&[b"SUBSCRIBE", b"ch2"])).expect("write");
     read_exactly(&mut sub, b"*3\r\n$9\r\nsubscribe\r\n$3\r\nch2\r\n:2\r\n");
 
+    // `JSON.MGET` across the two cells takes the gather, as on the pump:
+    // from the cell owning the second key, a whole-argv `Apply` to the
+    // first key's owner would answer that owner's null for the second.
+    #[cfg(feature = "doc")]
+    {
+        let mut c1 = conn_on_cell(&node, 1);
+        let (d0, d1) = (key_for_cell_prefixed(2, 0, "doc"), key_for_cell_prefixed(2, 1, "doc"));
+        let mut pipeline = cmd(&[b"JSON.SET", &d0, b"$", br#"{"n":1}"#]);
+        pipeline.extend(cmd(&[b"JSON.SET", &d1, b"$", br#"{"n":2}"#]));
+        pipeline.extend(cmd(&[b"JSON.MGET", &d0, &d1, b"$.n"]));
+        c1.write_all(&pipeline).expect("write");
+        read_exactly(&mut c1, b"+OK\r\n+OK\r\n");
+        let reply = read_bulk_array(&mut c1);
+        assert_eq!(String::from_utf8_lossy(&reply), "*2\r\n$3\r\n[1]\r\n$3\r\n[2]\r\n");
+    }
+
     node.stop();
 }
 
@@ -2199,8 +2321,16 @@ fn port_seed() -> u32 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// A fresh data directory named by `tag`, the process id and this call's
+/// ordinal in the process, so no two calls share one: tests run at once,
+/// and a helper that two tests call with one tag must not clear the other's
+/// live directory. A directory an earlier process of the same id left
+/// behind is cleared.
 fn temp_data_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("inf-s08-{tag}-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call = NEXT.fetch_add(1, Ordering::Relaxed);
+    let name = format!("inf-s08-{tag}-{}-{call}", std::process::id());
+    let dir = std::env::temp_dir().join(name);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).expect("clear stale test dir");
     }
@@ -7061,13 +7191,52 @@ fn lastsave_and_rdb_last_save_time_answer_one_second_after_inf_ckpt_cell_wait() 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// M3-S11 cross-cell `JSON.MGET` (ADR-0041 D9): the gather splits per
-/// key with single-key sub-ops whose `*1` elements reassemble in argv
-/// order — over the default db, and over a **named** namespace, which is
-/// exactly the ADR-0032 D5 binding this story executes (`send_apply_ns`
-/// per remote position; the generic multi-key refusal stays for
-/// everything else). Single-key remote JSON commands ride the ordinary
-/// fast arm alongside.
+/// The recorded node harness at five cells: every cell's keyspace takes the
+/// node's store configuration, and the log names the cell that executed each
+/// command — a connection's own on its cell, an `Apply` on its owner with the
+/// cell it came from. A budget of 23 B serves a 10 B reply and refuses a
+/// 41 B one on the key's owner, where the default budget serves both.
+#[test]
+fn a_recorded_node_of_five_cells_logs_each_owner_under_its_store_config() {
+    let store = StoreConfig { doc_max_reply_bytes: 23, ..StoreConfig::default() };
+    let (node, log) = Node::start_recorded(5, store);
+    let mut client = conn_on_cell(&node, 0);
+    let keys: Vec<Vec<u8>> = (0..5).map(|cell| key_for_cell(5, cell)).collect();
+    for key in &keys {
+        client.write_all(&cmd(&[b"SET", key, b"v"])).expect("write");
+        read_exactly(&mut client, b"+OK\r\n");
+    }
+    let sets = executed(&log, b"SET");
+    let owners: Vec<(u16, Option<u16>, &[u8])> =
+        sets.iter().map(|e| (e.cell, e.from, e.argv[1].as_slice())).collect();
+    let want: Vec<(u16, Option<u16>, &[u8])> = (0..5u16)
+        .map(|cell| (cell, (cell != 0).then_some(0), keys[usize::from(cell)].as_slice()))
+        .collect();
+    assert_eq!(owners, want, "each SET ran once, on its key's owner");
+    #[cfg(feature = "doc")]
+    {
+        let (small, large) =
+            (key_for_cell_prefixed(5, 1, "small"), key_for_cell_prefixed(5, 1, "j"));
+        let text = format!("\"{}\"", "x".repeat(30));
+        let mut pipeline = cmd(&[b"JSON.SET", &small, b"$", b"[1]"]);
+        pipeline.extend(cmd(&[b"JSON.SET", &large, b"$", text.as_bytes()]));
+        pipeline.extend(cmd(&[b"JSON.GET", &small, b"$"]));
+        pipeline.extend(cmd(&[b"JSON.GET", &large, b"$"]));
+        client.write_all(&pipeline).expect("write");
+        read_exactly(&mut client, b"+OK\r\n+OK\r\n$5\r\n[[1]]\r\n-ERR reply too large\r\n");
+        let gets = executed(&log, b"JSON.GET");
+        assert!(gets.iter().all(|e| (e.cell, e.from) == (1, Some(0))), "{gets:?}");
+    }
+    drop(client);
+    node.stop();
+}
+
+/// Cross-cell `JSON.MGET` (ADR-0173 D4): the gather sends one leg per
+/// owning cell, the command over that cell's keys, and pastes the legs'
+/// elements in argv order behind its own header — over the default db, and
+/// over a **named** namespace (`ApplyNs` legs; the generic multi-key refusal
+/// stays for every other command). Single-key remote JSON commands ride the
+/// ordinary fast arm alongside.
 #[test]
 #[cfg(feature = "doc")]
 fn json_mget_gathers_across_cells() {
@@ -7108,6 +7277,434 @@ fn json_mget_gathers_across_cells() {
     client.write_all(&cmd(&[b"MGET", &k0, &k1])).expect("write");
     let line = read_line(&mut client);
     assert!(line.starts_with(b"-ERR multi-key commands"), "refusal stays: {line:?}");
+    drop(client);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// One split fixture of the gather oracle: a multi-key `JSON.*` row over
+/// keys on both cells of a two-cell node, and its reply under each protocol,
+/// whose length L is that protocol's boundary: served at L, refused at
+/// L − 1, where each leg alone fits and only the whole crosses (ADR-0173 D1).
+/// A key never set answers the protocol's null inside its leg, which runs
+/// under the client's protocol, so the coordinator reads that protocol's
+/// null at L and at L − 1.
+#[cfg(feature = "doc")]
+struct SplitFixture {
+    row: &'static str,
+    /// Per key in argv order: its owning cell, and the document it holds or
+    /// `None` for a key never set.
+    keys: &'static [(u16, Option<&'static [u8]>)],
+    /// The command's arguments after its keys.
+    tail: &'static [&'static [u8]],
+    /// The reply under RESP2.
+    resp2: &'static [u8],
+    /// The reply under RESP3.
+    resp3: &'static [u8],
+}
+
+/// `JSON.MGET` over one document per cell, cell 0's first; then over a
+/// missing key on cell 1, cell 0's key and cell 1's, where the remote leg is
+/// a null and an element and the reply interleaves the two legs' elements in
+/// argv order.
+#[cfg(feature = "doc")]
+const SPLIT_FIXTURES: &[SplitFixture] = &[
+    SplitFixture {
+        row: "JSON.MGET",
+        keys: &[(0, Some(br#"{"n":1}"#)), (1, Some(br#"{"n":22}"#))],
+        tail: &[b"$.n"],
+        resp2: b"*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+        resp3: b"*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+    },
+    SplitFixture {
+        row: "JSON.MGET",
+        keys: &[(1, None), (0, Some(br#"{"n":1}"#)), (1, Some(br#"{"n":22}"#))],
+        tail: &[b"$.n"],
+        resp2: b"*3\r\n$-1\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+        resp3: b"*3\r\n_\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+    },
+];
+
+/// The `JSON.` rows of `rows` whose key spec spans more than one argument and
+/// that no fixture of `fixtures` covers: a multi-key `JSON.*` command whose
+/// reply is split across cells has no boundary pair.
+#[cfg(feature = "doc")]
+fn rows_without_split_fixture(
+    rows: &[inf_wire::CommandMeta],
+    fixtures: &[SplitFixture],
+) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|meta| meta.name.starts_with("JSON."))
+        .filter(|meta| {
+            let spec = inf_wire::key_spec(meta, None);
+            spec.first != 0 && (spec.last < 0 || i16::from(spec.last) > i16::from(spec.first))
+        })
+        .map(|meta| meta.name)
+        .filter(|name| !fixtures.iter().any(|f| f.row == *name))
+        .collect()
+}
+
+/// Where a split fixture runs: a numbered database of a volatile node, or a
+/// named memory namespace of a durable one.
+#[cfg(feature = "doc")]
+#[derive(Copy, Clone, Debug)]
+enum SplitScope {
+    Db,
+    Ns,
+}
+
+/// The protocol a split fixture's client speaks, which its legs run under.
+#[cfg(feature = "doc")]
+#[derive(Copy, Clone, Debug)]
+enum SplitProtocol {
+    Resp2,
+    Resp3,
+}
+
+#[cfg(feature = "doc")]
+impl SplitFixture {
+    fn reply(&self, protocol: SplitProtocol) -> &'static [u8] {
+        match protocol {
+            SplitProtocol::Resp2 => self.resp2,
+            SplitProtocol::Resp3 => self.resp3,
+        }
+    }
+}
+
+/// One leg of a split fixture at `budget` under `protocol`: the reply behind
+/// `PING`, read as `want`, and each cell's two counters, which say whose
+/// check refused.
+#[cfg(feature = "doc")]
+fn split_leg(
+    f: &SplitFixture,
+    scope: SplitScope,
+    protocol: SplitProtocol,
+    budget: usize,
+    want: &[u8],
+) -> [[u64; 2]; 2] {
+    let store = StoreConfig { doc_max_reply_bytes: budget, ..StoreConfig::default() };
+    let dir = temp_data_dir("jsonsplit");
+    let (node, _log) = match scope {
+        SplitScope::Db => Node::start_recorded(2, store),
+        SplitScope::Ns => Node::start_recorded_in(2, Some(dir.clone()), store),
+    };
+    let mut client = conn_on_cell(&node, 0);
+    if let SplitProtocol::Resp3 = protocol {
+        hello3(&mut client);
+    }
+    let keys: Vec<Vec<u8>> = f
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(index, &(cell, _))| key_for_cell_prefixed(2, cell, &format!("split{index}")))
+        .collect();
+    let mut setup = Vec::new();
+    let mut oks = 0;
+    if let SplitScope::Ns = scope {
+        setup.extend(cmd(&[b"INF.NS", b"CREATE", b"docs", b"MODE", b"memory"]));
+        setup.extend(cmd(&[b"INF.NS", b"USE", b"docs"]));
+        oks += 2;
+    }
+    for (key, &(_, doc)) in keys.iter().zip(f.keys) {
+        if let Some(doc) = doc {
+            setup.extend(cmd(&[b"JSON.SET", key, b"$", doc]));
+            oks += 1;
+        }
+    }
+    client.write_all(&setup).expect("write");
+    read_exactly(&mut client, &b"+OK\r\n".repeat(oks));
+    let mut argv: Vec<&[u8]> = vec![f.row.as_bytes()];
+    argv.extend(keys.iter().map(Vec::as_slice));
+    argv.extend_from_slice(f.tail);
+    let mut pipeline = cmd(&[b"PING"]);
+    pipeline.extend(cmd(&argv));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, &[b"+PONG\r\n".as_slice(), want].concat());
+    let counters = [0, 1].map(|cell| {
+        let stats = info_text(&mut conn_on_cell(&node, cell), b"stats");
+        ["json_reply_refusals_cell", "json_reply_refused_bytes_cell"]
+            .map(|field| info_field(&stats, field))
+    });
+    drop(client);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    counters
+}
+
+/// A split fixture's boundary pair in `scope`, under RESP2 and under RESP3:
+/// served at that protocol's L with no refusal counted, refused at L − 1 by
+/// the coordinator's account alone (cell 0 counts one refusal of L bytes;
+/// cell 1, whose leg fit, none).
+#[cfg(feature = "doc")]
+fn split_boundary(f: &SplitFixture, scope: SplitScope) {
+    for protocol in [SplitProtocol::Resp2, SplitProtocol::Resp3] {
+        let what = format!("{} over {} keys, {scope:?} {protocol:?}", f.row, f.keys.len());
+        let reply = f.reply(protocol);
+        let length = reply.len();
+        let served = split_leg(f, scope, protocol, length, reply);
+        assert_eq!(served, [[0, 0], [0, 0]], "{what} at L = {length}");
+        let refused = split_leg(f, scope, protocol, length - 1, b"-ERR reply too large\r\n");
+        let want = [[1, u64::try_from(length).expect("u64")], [0, 0]];
+        assert_eq!(refused, want, "{what} at L - 1: whose check refused");
+    }
+}
+
+/// The gather oracle in a numbered database: every multi-key `JSON.*` row
+/// has a split fixture, and each is served at its L and refused at L − 1
+/// at the wire, behind `PING`, under RESP2 and RESP3, though each leg fits.
+/// The canary of the coverage check runs in the same test: the same rows
+/// with no fixture name the multi-key row.
+#[test]
+#[cfg(feature = "doc")]
+fn every_split_json_row_is_charged_whole_in_a_numbered_database() {
+    assert_eq!(rows_without_split_fixture(&inf_wire::COMMANDS, SPLIT_FIXTURES), [""; 0]);
+    assert_eq!(rows_without_split_fixture(&inf_wire::COMMANDS, &[]), ["JSON.MGET"]);
+    for fixture in SPLIT_FIXTURES {
+        split_boundary(fixture, SplitScope::Db);
+    }
+}
+
+/// The gather oracle's named-namespace leg, on the durable node shape,
+/// under RESP2 and RESP3.
+#[test]
+#[cfg(feature = "doc")]
+fn every_split_json_row_is_charged_whole_in_a_named_namespace() {
+    for fixture in SPLIT_FIXTURES {
+        split_boundary(fixture, SplitScope::Ns);
+    }
+}
+
+/// One array reply of bulk and null elements, read whole as it came.
+fn read_bulk_array(stream: &mut TcpStream) -> Vec<u8> {
+    let mut reply = read_line(stream);
+    let count: usize = std::str::from_utf8(&reply[1..reply.len() - 2])
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| panic!("not an array header: {:?}", String::from_utf8_lossy(&reply)));
+    for _ in 0..count {
+        let header = read_line(stream);
+        let len: i64 = std::str::from_utf8(&header[1..header.len() - 2])
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or_else(|| panic!("not a bulk: {:?}", String::from_utf8_lossy(&header)));
+        reply.extend_from_slice(&header);
+        if let Ok(len) = usize::try_from(len) {
+            reply.extend(read_n(stream, len + 2));
+        }
+    }
+    reply
+}
+
+/// `n` bytes of `stream`, read whole.
+fn read_n(stream: &mut TcpStream, n: usize) -> Vec<u8> {
+    let mut got = vec![0u8; n];
+    stream
+        .read_exact(&mut got)
+        .unwrap_or_else(|e| panic!("{}", reply_read_failed(stream, "read", &e)));
+    got
+}
+
+/// The whole-reply rule at the default budget (128 MiB) across two cells: a
+/// 133-byte path of four 16-member duplicate unions selects 65,536 matches
+/// of one 1,102-byte string, so each key's reply is 72,286,226 B and is
+/// served, and the two keys' reply, 144,572,448 B, is refused with no
+/// element sent; the connection keeps serving, and `PING` before it stands.
+#[test]
+#[cfg(feature = "doc")]
+fn json_mget_aggregate_refuses_at_the_wire() {
+    let node = Node::start(2);
+    let mut client = conn_on_cell(&node, 0);
+    let (local, remote) = (key_for_cell(2, 0), key_for_cell(2, 1));
+    let union = format!("[{}]", ["0"; 16].join(","));
+    let path = format!("${}", union.repeat(4));
+    assert_eq!(path.len(), 133, "four unions of 16 members");
+    let doc = format!("[[[[\"{}\"]]]]", "x".repeat(1_100));
+    let mut setup = cmd(&[b"JSON.SET", &local, b"$", doc.as_bytes()]);
+    setup.extend(cmd(&[b"JSON.SET", &remote, b"$", doc.as_bytes()]));
+    client.write_all(&setup).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n");
+    // `[` + 65,536 matches of 1,102 B + 65,535 commas + `]`, as one bulk.
+    let payload = 2 + 65_536 * 1_102 + 65_535;
+    let element = format!("${payload}\r\n").len() + payload + 2;
+    assert_eq!((4 + element, 4 + 2 * element), (72_286_226, 144_572_448));
+    let mut pipeline = cmd(&[b"PING"]);
+    pipeline.extend(cmd(&[b"JSON.MGET", &local, &remote, path.as_bytes()]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+PONG\r\n-ERR reply too large\r\n");
+    for key in [&local, &remote] {
+        client.write_all(&cmd(&[b"JSON.MGET", key, path.as_bytes()])).expect("write");
+        let reply = read_n(&mut client, 4 + element);
+        let head = format!("*1\r\n${payload}\r\n[\"x");
+        assert!(reply.starts_with(head.as_bytes()), "{:?}", String::from_utf8_lossy(&reply[..32]));
+        assert!(reply.ends_with(b"\"]\r\n"), "one whole element");
+    }
+    client.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut client, b"+PONG\r\n");
+    drop(client);
+    node.stop();
+}
+
+/// The two keys of a two-cell gather, cell 0's first, each holding `docs`.
+#[cfg(feature = "doc")]
+fn split_docs(client: &mut TcpStream, prefix: &str, docs: [&[u8]; 2]) -> [Vec<u8>; 2] {
+    let keys = [key_for_cell_prefixed(2, 0, prefix), key_for_cell_prefixed(2, 1, prefix)];
+    let mut setup = cmd(&[b"JSON.SET", &keys[0], b"$", docs[0]]);
+    setup.extend(cmd(&[b"JSON.SET", &keys[1], b"$", docs[1]]));
+    client.write_all(&setup).expect("write");
+    read_exactly(client, b"+OK\r\n+OK\r\n");
+    keys
+}
+
+/// The local leg is settled first: when it alone crosses the budget, the
+/// gather answers that leg's refusal and sends no remote leg, which the
+/// remote owner's log shows. Control: with the budget at the whole reply's
+/// length the same command is served and the owner executes one leg.
+#[test]
+#[cfg(feature = "doc")]
+fn json_mget_sends_no_leg_after_the_local_leg_refuses() {
+    for (budget, want, legs) in [
+        (12, b"-ERR reply too large\r\n".as_slice(), 0),
+        (23, b"*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n".as_slice(), 1),
+    ] {
+        let store = StoreConfig { doc_max_reply_bytes: budget, ..StoreConfig::default() };
+        let (node, log) = Node::start_recorded(2, store);
+        let mut client = conn_on_cell(&node, 0);
+        let keys = split_docs(&mut client, "first", [br#"{"n":1}"#, br#"{"n":22}"#]);
+        client.write_all(&cmd(&[b"JSON.MGET", &keys[0], &keys[1], b"$.n"])).expect("write");
+        read_exactly(&mut client, want);
+        let remote: Vec<Executed> =
+            executed(&log, b"JSON.MGET").into_iter().filter(|e| e.cell == 1).collect();
+        assert_eq!(remote.len(), legs, "budget {budget}: the remote owner's legs {remote:?}");
+        if let Some(leg) = remote.first() {
+            assert_eq!(
+                (leg.from, &leg.argv[1..]),
+                (Some(0), &[keys[1].clone(), b"$.n".to_vec()][..])
+            );
+        }
+        drop(client);
+        node.stop();
+    }
+}
+
+/// A path that does not compile answers its one error line, whatever the
+/// owners of the keys: all on the accepting cell, all on the other, or
+/// split, the reply is the same line, never an array of errors.
+#[test]
+#[cfg(feature = "doc")]
+fn json_mget_path_error_is_one_line_at_both_topologies() {
+    let node = Node::start(2);
+    let mut client = conn_on_cell(&node, 0);
+    let a = split_docs(&mut client, "pa", [br#"{"n":1}"#, br#"{"n":2}"#]);
+    let b = split_docs(&mut client, "pb", [br#"{"n":3}"#, br#"{"n":4}"#]);
+    let shapes: [[&[u8]; 2]; 3] = [[&a[0], &b[0]], [&a[1], &b[1]], [&a[0], &a[1]]];
+    let mut lines = Vec::new();
+    for [first, second] in shapes {
+        client.write_all(&cmd(&[b"JSON.MGET", first, second, b"$["])).expect("write");
+        lines.push(read_line(&mut client));
+    }
+    assert!(lines[0].starts_with(b"-ERR"), "{:?}", String::from_utf8_lossy(&lines[0]));
+    assert_eq!(lines[1], lines[0], "all remote");
+    assert_eq!(lines[2], lines[0], "split");
+    client.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut client, b"+PONG\r\n");
+    drop(client);
+    node.stop();
+}
+
+/// Pacing at the window (three remote legs of one gather in flight), on the
+/// smallest node that paces: five cells, one key per cell, so four remote
+/// owners. At a 64 B budget the gather of `a` (49 B) is served and the fifth
+/// cell executes its leg; the gather of `b` crosses at its first remote leg
+/// (13 B + 55 B), whose owner admitted it (59 B), so the reply is refused,
+/// the second and third owners execute legs that are drained, and the
+/// fourth executes nothing: its leg was held behind the window and never
+/// sent. The census row counts the pacing. Thirty-three more refused gathers
+/// pipelined before a remote `JSON.GET` leave the connection's window as it
+/// was, so the `JSON.GET` is answered.
+#[test]
+#[cfg(feature = "doc")]
+fn json_mget_paces_past_the_window() {
+    let store = StoreConfig { doc_max_reply_bytes: 64, ..StoreConfig::default() };
+    let (node, log) = Node::start_recorded(5, store);
+    let mut client = conn_on_cell(&node, 0);
+    let a: Vec<Vec<u8>> = (0..5).map(|cell| key_for_cell_prefixed(5, cell, "pa")).collect();
+    let b: Vec<Vec<u8>> = (0..5).map(|cell| key_for_cell_prefixed(5, cell, "pb")).collect();
+    let wide = format!(r#"{{"n":"{}"}}"#, "x".repeat(44));
+    let mut setup = Vec::new();
+    for cell in 0..5 {
+        setup.extend(cmd(&[b"JSON.SET", &a[cell], b"$", br#"{"n":1}"#]));
+        let doc: &[u8] = if cell == 1 { wide.as_bytes() } else { br#"{"n":1}"# };
+        setup.extend(cmd(&[b"JSON.SET", &b[cell], b"$", doc]));
+    }
+    client.write_all(&setup).expect("write");
+    read_exactly(&mut client, &b"+OK\r\n".repeat(10));
+    let mget = |keys: &[Vec<u8>]| {
+        let mut argv: Vec<&[u8]> = vec![b"JSON.MGET"];
+        argv.extend(keys.iter().map(Vec::as_slice));
+        argv.push(b"$.n");
+        cmd(&argv)
+    };
+    client.write_all(&mget(&a)).expect("write");
+    read_exactly(&mut client, &[b"*5\r\n".as_slice(), &b"$3\r\n[1]\r\n".repeat(5)].concat());
+    let legs_on = |keys: &[Vec<u8>], cell: u16| {
+        let key = &keys[usize::from(cell)];
+        let legs = executed(&log, b"JSON.MGET");
+        legs.iter().filter(|e| e.cell == cell && e.argv.contains(key)).count()
+    };
+    assert_eq!(legs_on(&a, 4), 1, "the served gather's fourth remote owner ran its leg");
+    client.write_all(&mget(&b)).expect("write");
+    read_exactly(&mut client, b"-ERR reply too large\r\n");
+    let ran: Vec<usize> = (1..5).map(|cell| legs_on(&b, cell)).collect();
+    assert_eq!(ran, [1, 1, 1, 0], "legs that ran, owners 1 to 4: the fourth was held");
+    let caps = info_text(&mut client, b"caps");
+    let row = caps
+        .lines()
+        .find_map(|line| line.strip_prefix("cap_row_json-gather-legs:"))
+        .unwrap_or_else(|| panic!("no json-gather-legs row in {caps}"));
+    let crossings: u64 = row
+        .split(',')
+        .find_map(|field| field.strip_prefix("crossings="))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{row}"));
+    assert!(crossings >= 1, "the window paced: {row}");
+    assert!(row.starts_with("entries_max=3,fill=serving,"), "{row}");
+    let mut pipeline = Vec::new();
+    for _ in 0..33 {
+        pipeline.extend(mget(&b));
+    }
+    pipeline.extend(cmd(&[b"JSON.GET", &a[1], b"$.n"]));
+    client.write_all(&pipeline).expect("write");
+    let refusals = b"-ERR reply too large\r\n".repeat(33);
+    read_exactly(&mut client, &[refusals.as_slice(), b"$3\r\n[1]\r\n"].concat());
+    drop(client);
+    node.stop();
+}
+
+/// A gather over a tiered namespace answers the tiered refusal as its one
+/// line, as the command whose keys are all on the accepting cell does: the
+/// local leg runs through the tiered arm, and a remote owner's refusal is
+/// the reply, never an element.
+#[test]
+#[cfg(feature = "doc")]
+fn json_mget_on_a_tiered_namespace_is_one_line() {
+    let dir = temp_data_dir("jsonmget-tiered");
+    let node = Node::start_durable(2, &dir);
+    let mut client = conn_on_cell(&node, 0);
+    client.write_all(&tiered_ns_create(b"t", &[b"MEM-BUDGET", b"8mb"])).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+    client.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+    let (k0, k0b, k1) = (
+        key_for_cell_prefixed(2, 0, "ta"),
+        key_for_cell_prefixed(2, 0, "tb"),
+        key_for_cell_prefixed(2, 1, "ta"),
+    );
+    client.write_all(&cmd(&[b"JSON.MGET", &k0, &k0b, b"$"])).expect("write");
+    let local = read_line(&mut client);
+    assert!(local.starts_with(b"-ERR this command is not supported on tiered"), "{local:?}");
+    client.write_all(&cmd(&[b"JSON.MGET", &k0, &k1, b"$"])).expect("write");
+    let split = read_line(&mut client);
+    assert_eq!(String::from_utf8_lossy(&split), String::from_utf8_lossy(&local), "split");
     drop(client);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
@@ -10597,6 +11194,7 @@ fn rollback_wait_scenario(checkpoint: bool, tag: &str) {
         None,
         None,
         vec![(1, inf_server::fault::NS_CREATE_LEG_HELD, leg.clone())],
+        NodeExtras::default(),
     );
     let control = Arc::clone(node.control.as_ref().expect("a durable node"));
     // The `CREATE`'s swap lands; the rollback's stays queued.

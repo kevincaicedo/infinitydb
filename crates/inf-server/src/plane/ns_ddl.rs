@@ -11,6 +11,9 @@ use inf_store::ddl::{
 };
 use inf_wire::{Domain, Refusal};
 
+#[cfg(feature = "doc")]
+use super::json_gather::{GatherTarget, json_gather};
+use super::scatter::send_whole;
 use super::*;
 use crate::control::{CkptCredit, CkptTarget, DdlNotice, DdlTicket};
 
@@ -227,39 +230,12 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
     if !keys.is_empty() && !shared.route_local_only {
         let owner = owner_of(keys[0]);
         if keys[1..].iter().any(|k| owner_of(k) != owner) {
-            // M3-S11: the JSON surface binds the named-ns multi-key
-            // programs (exactly the ADR-0032 D5 plan) — the MGET gather
-            // with ns-aware sub-ops. The generic refusal below stays for
-            // every other command until M5.
+            // A `JSON.MGET` over two owners is the gather, as in a numbered
+            // database (ADR-0173 D4).
             #[cfg(feature = "doc")]
             if meta.id == CommandId::JsonMget {
-                let path = argv[argv.len() - 1];
-                let mut parts = Vec::with_capacity(argv.len() - 2);
-                for k in &argv[1..argv.len() - 1] {
-                    let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
-                    if shared.router.is_local(k, shared.cell) {
-                        let (reply, _) = execute_ns_local(shared, origin, &sub, proto, id, db, ns);
-                        parts.push(GatherPart::Done(reply));
-                    } else {
-                        match send_apply_ns(
-                            shared,
-                            owner_of(k),
-                            ApplyOrigin::Client,
-                            proto,
-                            ns,
-                            &sub,
-                        )
-                        .await
-                        {
-                            Ok(waiter) => {
-                                parts.push(GatherPart::Wait(waiter));
-                                *inflight += 1;
-                            }
-                            Err(refusal) => parts.push(GatherPart::Done(refusal)),
-                        }
-                    }
-                }
-                pending.push_back(PendingReply::Gather { parts, proto, unwrap_single: true });
+                let target = GatherTarget { origin, proto, id, db, scope: ScatterScope::Ns(ns) };
+                pending.push_back(json_gather(shared, target, meta, argv, inflight).await);
                 return true;
             }
             // Every other multi-key command that spans cells is refused in
@@ -272,13 +248,8 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
             return true;
         }
         if owner.0 != shared.cell.0 {
-            match send_apply_ns(shared, owner, ApplyOrigin::Client, proto, ns, argv).await {
-                Ok(waiter) => {
-                    *inflight += 1;
-                    pending.push_back(PendingReply::Remote { waiter, proto });
-                }
-                Err(refusal) => pending.push_back(PendingReply::Done(refusal)),
-            }
+            let scope = ScatterScope::Ns(ns);
+            pending.push_back(send_whole(shared, owner, proto, db, scope, argv, inflight).await);
             return true;
         }
     }
