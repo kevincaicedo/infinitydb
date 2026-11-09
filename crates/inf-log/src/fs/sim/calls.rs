@@ -187,6 +187,45 @@ mod tests {
         assert_eq!(disk.calls_unlogged(), 0);
     }
 
+    /// `ckpt_create_fail` refuses a checkpoint's staging create on both
+    /// create calls before the file exists: the error names the point, no
+    /// file is left, and the log records each refusal under the mark, then
+    /// the create that follows once the point is disarmed. A create of
+    /// another name never meets it.
+    #[test]
+    fn a_refused_staging_create_leaves_no_file_and_is_logged() {
+        use inf_foundation::fault::{self, FaultSpec};
+        let disk = SimDisk::new();
+        let ckpt = Path::new("shard-0/ckpt");
+        disk.create_dir_all(ckpt).expect("dirs");
+        let (staging, other) =
+            (ckpt.join("ckpt-000004.ick.new"), Path::new("shard-0/MANIFEST.new"));
+        let mark = DiskMark { phase: DiskPhase::Cell(CellId(0)), at: Nanos(9) };
+        disk.mark(mark.phase, mark.at);
+        fault::arm(crate::fault::CKPT_CREATE_FAIL, FaultSpec::Always);
+        let refused = [disk.create_meta(&staging).err(), disk.create_meta_direct(&staging).err()];
+        let other_created = disk.create_meta(other).map(drop);
+        let fired = fault::fired(crate::fault::CKPT_CREATE_FAIL);
+        fault::disarm_all();
+        for err in refused {
+            let err = err.expect("the staging create is refused");
+            assert!(err.to_string().contains("ckpt_create_fail"), "typed and named: {err}");
+        }
+        assert_eq!(fired, 2, "engagement: both staging creates met the point");
+        assert!(other_created.is_ok(), "another name never meets the point");
+        assert!(disk.open_read(&staging).is_err(), "a refused create leaves no file");
+        let _created = disk.create_meta_direct(&staging).expect("disarmed, the create runs");
+        let point = CallResult::Injected(crate::fault::CKPT_CREATE_FAIL);
+        let none = DiskCall::CheckpointCreate { left_file: false };
+        let made = DiskCall::CheckpointCreate { left_file: true };
+        let expected = vec![
+            entry(none, &staging, point, Some(mark)),
+            entry(none, &staging, point, Some(mark)),
+            entry(made, &staging, CallResult::Ok, Some(mark)),
+        ];
+        assert_eq!(disk.logged_calls(0), expected, "each attempt is a logged create");
+    }
+
     /// At the cap a call is counted, not kept: the log a reader sees is
     /// whole or says it is not.
     #[test]

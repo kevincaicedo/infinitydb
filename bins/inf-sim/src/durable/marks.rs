@@ -71,3 +71,42 @@ fn each_checkpoint_call_carries_the_mark_of_the_cell_that_made_it() {
     }
     assert_eq!(quiet.node.disk.calls_unlogged(), 0);
 }
+
+/// `ckpt_create_fail` once, then `INF.CKPT WAIT` on a one-cell node: the
+/// refused staging create is logged under the cell's mark with no file left,
+/// the walk aborts, and the retry after its backoff is the next logged
+/// create; it makes the file, the `MANIFEST` rename follows, and the `WAIT`
+/// answers. Each attempt is a logged create.
+#[test]
+fn a_refused_create_aborts_the_walk_and_its_retry_is_the_next_logged_create() {
+    use inf_foundation::fault::{self, FaultSpec};
+    let point = inf_log::fault::CKPT_CREATE_FAIL;
+    let mut quiet = Quiet::boot(1, 0, 0);
+    let first = quiet.node.disk.logged_calls(0).len();
+    let mut client = MiniClient::connect(&mut quiet.node, 0);
+    fault::arm(inf_log::fault::CKPT_CREATE_FAIL, FaultSpec::Nth(1));
+    let reply = call(&mut quiet, &mut client, &[b"INF.CKPT", b"WAIT"]);
+    let fired = fault::fired(point);
+    fault::disarm_all();
+    assert_eq!(reply, b"+OK\r\n", "the retry serves the manual request");
+    assert_eq!(fired, 1, "engagement: one staging create refused");
+    let (_, aborted) = quiet.node.plane(0).ckpt_stats_for_sim();
+    assert_eq!(aborted, 1, "the refused create aborted its walk");
+    let calls = quiet.node.disk.logged_calls(first);
+    let refused =
+        first_of(&calls, 0, |call| matches!(call.call, DiskCall::CheckpointCreate { .. }));
+    let retried = refused + 1;
+    let renamed = first_of(&calls, 0, |call| call.call == DiskCall::ManifestRename);
+    let (refusal, retry) = (&calls[refused], &calls[retried]);
+    assert_eq!(refusal.call, DiskCall::CheckpointCreate { left_file: false }, "{calls:#?}");
+    assert_eq!(refusal.result, CallResult::Injected(point));
+    assert_eq!(retry.call, DiskCall::CheckpointCreate { left_file: true }, "{calls:#?}");
+    assert_eq!(retry.result, CallResult::Ok);
+    assert!(retried < renamed, "the rename follows the retry: {calls:#?}");
+    let (refused_at, retried_at) = (refusal.mark.map(|m| m.at), retry.mark.map(|m| m.at));
+    assert!(refused_at < retried_at, "the retry waited out the backoff: {calls:#?}");
+    for call in &calls {
+        let mark = call.mark.unwrap_or_else(|| panic!("an unmarked call: {call:?}"));
+        assert_eq!(mark.phase, DiskPhase::Cell(CellId(0)), "{call:?}");
+    }
+}

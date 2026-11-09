@@ -1483,7 +1483,9 @@ impl SimDisk {
 
     /// A create the call log records when it makes a checkpoint's staging
     /// file: its result and whether the name exists after it. Every other
-    /// create runs unlogged.
+    /// create runs unlogged. `ckpt_create_fail` fires here, before the
+    /// create, so a refused create leaves no file, and the log records the
+    /// refusal as it records every other result.
     fn create_logged(
         &self,
         path: &Path,
@@ -1492,10 +1494,17 @@ impl SimDisk {
         if !calls::is_checkpoint_staging(path) {
             return create();
         }
-        let created = create();
+        let (created, result) = if inf_foundation::fault::fire(crate::fault::CKPT_CREATE_FAIL) {
+            let point = crate::fault::CKPT_CREATE_FAIL;
+            (Err(crate::fault::injected(point)), CallResult::Injected(point))
+        } else {
+            let created = create();
+            let result = CallResult::of(&created);
+            (created, result)
+        };
         let mut state = self.state.borrow_mut();
         let call = DiskCall::CheckpointCreate { left_file: state.os_names.contains_key(path) };
-        state.calls.record(call, path, CallResult::of(&created));
+        state.calls.record(call, path, result);
         drop(state);
         created
     }
