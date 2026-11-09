@@ -860,6 +860,25 @@ rows=(
   # A closed header's last drop frees it with Q set: the last take then
   # reaches the freed bridge.
   "inf_canary_closed_free_ignores_queue loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
+  # The executor's lanes (ADR-0003 A1): each plant breaks one rule of the wake header, and
+  # the test that holds the rule goes red at its own assertion.
+  # The lane compare answers the owner part on every thread: a foreign wake counts nothing.
+  "inf_canary_waker_owner_unchecked crate-test inf-runtime test:waker_threads a_wake_from_another_thread_takes_the_foreign_lane one foreign wake, counted"
+  # Reuse reads `o` and not the lane word: a header a foreign clone names is kept spare.
+  "inf_canary_wake_reuse_owner_count_only crate-test inf-runtime test:waker_threads a_foreign_clone_keeps_a_finished_tasks_header a foreign clone keeps the finished task's header"
+  # A completing first poll recycles its header with a wake queued: the next task is polled twice.
+  "inf_canary_ready_ignores_queued crate-test inf-runtime test:waker_threads a_foreign_wake_queued_for_a_finished_task_never_polls_the_next the next task was polled once"
+  # The swap that leaves a closed header unnamed and unqueued frees nothing.
+  "inf_canary_closed_header_kept crate-test inf-runtime test:waker_close an_executor_dropped_before_its_threads_last_wakers_frees_each_at_its_drop its header, freed"
+  "inf_canary_closed_header_kept crate-test inf-runtime test:waker_close executors_created_and_dropped_keep_nothing allocated less freed over both threads"
+  # The owner lane's half of the count's bound: an owner clone at the bound does not abort.
+  "inf_canary_wake_count_unbounded crate-test inf-runtime lib an_owner_lane_clone_at_the_bound_aborts not by SIGABRT"
+  # An owner-lane drop frees a Dead, undecided header: inside the future's own drop.
+  "inf_canary_settle_on_dead crate-test inf-runtime test:waker_threads a_future_that_keeps_its_own_waker_clone_is_freed_once freed nothing"
+  # An owner-lane drop of a Held header's last waker does not settle it.
+  "inf_canary_settle_held_skipped crate-test inf-runtime test:waker_threads a_waker_dropped_during_another_tasks_poll_frees_the_first_held_header freed inside the poll"
+  # `close` keeps the owner part: its `Rc` holds the shared state past the executor's drop.
+  "inf_canary_close_keeps_owner_part crate-test inf-runtime test:waker_close an_executor_dropped_before_its_threads_last_wakers_frees_each_at_its_drop released at drop"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

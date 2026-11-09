@@ -535,6 +535,14 @@ impl WakeBridge {
         lane.count() + owner_count == 0 && !lane.has(QUEUED)
     }
 
+    /// Canary only: whether no waker names the header, whatever `Q` says — the reuse test of a
+    /// planted executor that recycles a header with a wake still queued.
+    #[cfg(inf_canary_ready_ignores_queued)]
+    #[must_use]
+    pub fn unnamed_ignoring_queue(&self, owner_count: i64) -> bool {
+        Lane(self.lane.load(Ordering::Relaxed)).count() + owner_count == 0
+    }
+
     /// Closes the header at its executor's drop, after the owner part was dropped in place: the
     /// mark set to [`MARK_CLOSED`], then one swap folds `owner_count` into `c` and sets `X`, under
     /// the bound's compare. From that swap on every operation, on every thread, is foreign.

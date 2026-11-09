@@ -49,6 +49,24 @@ use inf_foundation::wake::{Closing, Delivery, RemoteStack, Settled, ThreadMark, 
 /// Slot value while a task header is not (yet) bound to a slab slot.
 const UNASSIGNED: u32 = u32::MAX;
 
+// ---- Planted violations (canaries; each a `cfg`, never a feature) -------------------------
+
+/// The lane compare answers the owner part on every thread.
+const PLANT_OWNER_UNCHECKED: bool = cfg!(inf_canary_waker_owner_unchecked);
+/// A finished header's reuse reads `o` and not the lane word.
+const PLANT_REUSE_OWNER_COUNT_ONLY: bool = cfg!(inf_canary_wake_reuse_owner_count_only);
+/// The swap that leaves a closed header at `c = 0` with `Q` clear frees nothing.
+const PLANT_CLOSED_HEADER_KEPT: bool = cfg!(inf_canary_closed_header_kept);
+/// The owner lane compares no count with `LANE_COUNT_MAX` (the foreign lane's half is
+/// `inf_foundation::wake`'s).
+const PLANT_COUNT_UNBOUNDED: bool = cfg!(inf_canary_wake_count_unbounded);
+/// An owner-lane drop settles a Dead header too, not only a Held one.
+const PLANT_SETTLE_ON_DEAD: bool = cfg!(inf_canary_settle_on_dead);
+/// An owner-lane drop of a Held header's last waker does not settle it.
+const PLANT_SETTLE_HELD_SKIPPED: bool = cfg!(inf_canary_settle_held_skipped);
+/// `close` does not drop the owner part, so its `Rc` keeps the shared state.
+const PLANT_CLOSE_KEEPS_OWNER_PART: bool = cfg!(inf_canary_close_keeps_owner_part);
+
 /// Identifies a spawned task while it is live. Slot indices are reused;
 /// `generation` makes stale ids detectable (`CellExecutor::is_live`).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -156,7 +174,7 @@ unsafe fn owner_part(data: *const ()) -> Option<Header> {
     // SAFETY: the caller's waker keeps the header allocated; the bridge, at offset 0, is atomics
     // only, so any thread may form this reference.
     let marked = unsafe { &*data.cast::<WakeBridge>() }.owner_mark();
-    let owned = marked == ThreadMark::current();
+    let owned = marked == ThreadMark::current() || PLANT_OWNER_UNCHECKED;
     // SAFETY: `data` is a header's own pointer (`waker_ref`, `waker_clone`), never null.
     owned.then(|| unsafe { NonNull::new_unchecked(data.cast_mut().cast::<WakeHeader>()) })
 }
@@ -184,7 +202,7 @@ fn wake_task(owner: &OwnerPart) {
 #[inline(always)]
 fn owner_clone(owner: &OwnerPart) {
     let count = owner.owner_count.get();
-    if count >= LANE_COUNT_MAX {
+    if !PLANT_COUNT_UNBOUNDED && count >= LANE_COUNT_MAX {
         // Fail-stop before the count is written, as `Rc` and `Arc` at their bounds.
         std::process::abort();
     }
@@ -201,7 +219,12 @@ unsafe fn owner_drop(header: Header) {
     // SAFETY: the compare matched, so this is the owner thread and the header is open.
     let owner = unsafe { owner(header) };
     owner.owner_count.set(owner.owner_count.get() - 1);
-    if owner.state.get() == TaskState::Held {
+    let settles = match owner.state.get() {
+        TaskState::Held => true,
+        TaskState::Dead => PLANT_SETTLE_ON_DEAD,
+        TaskState::Idle | TaskState::Queued | TaskState::Running | TaskState::RunningWoken => false,
+    };
+    if settles && !PLANT_SETTLE_HELD_SKIPPED {
         // SAFETY: as above; `owner` is not used after this call.
         unsafe { foreign::settle_held(header) };
     }
@@ -481,6 +504,9 @@ unsafe fn free_open(header: Header) {
 /// `header` is closed and this thread's swap (or the executor's close or last take) left it at
 /// `c = 0` with `Q` clear: no waker names it, no push holds it, and this thread is its one freer.
 unsafe fn free_closed(header: Header) {
+    if PLANT_CLOSED_HEADER_KEPT {
+        return;
+    }
     // SAFETY: per this function's contract; the stack outlives every header it counts.
     let stack = unsafe { bridge(header) }.stack();
     // SAFETY: as above; the owner part was dropped in place at the close, and `ManuallyDrop`
@@ -499,6 +525,9 @@ unsafe fn free_closed(header: Header) {
 unsafe fn quiet(header: Header) -> bool {
     // SAFETY: per this function's contract.
     let owner_count = unsafe { owner(header) }.owner_count.get();
+    if PLANT_REUSE_OWNER_COUNT_ONLY {
+        return owner_count == 0;
+    }
     // SAFETY: as above.
     unsafe { bridge(header) }.quiet(owner_count)
 }
@@ -741,7 +770,13 @@ impl CellExecutor {
     /// takes a new header (a clone escaped a future that completed anyway).
     fn decide_first_poll(&mut self, header: Header) {
         // SAFETY: the executor holds the header: open, on this thread.
+        #[cfg(not(inf_canary_ready_ignores_queued))]
         let quiet = unsafe { quiet(header) };
+        // Canary: a completing first poll recycles its header with `Q` set.
+        // SAFETY: as above.
+        #[cfg(inf_canary_ready_ignores_queued)]
+        let quiet = unsafe { bridge(header) }
+            .unnamed_ignoring_queue(unsafe { owner(header) }.owner_count.get());
         if quiet {
             self.spare_header = Some(header);
         } else {
@@ -921,8 +956,10 @@ impl CellExecutor {
         self.stack_ref().retain();
         // SAFETY: the executor holds the header: open, on this thread, unlinked by the caller.
         let owner_count = unsafe { owner(header) }.owner_count.get();
-        // SAFETY: as above; the last owner-part access, which releases its `Rc`.
-        unsafe { ManuallyDrop::drop(&mut (*header.as_ptr()).owner) };
+        if !PLANT_CLOSE_KEEPS_OWNER_PART {
+            // SAFETY: as above; the last owner-part access, which releases its `Rc`.
+            unsafe { ManuallyDrop::drop(&mut (*header.as_ptr()).owner) };
+        }
         // SAFETY: the bridge outlives the owner part; atomics only.
         match unsafe { bridge(header) }.close(owner_count) {
             // SAFETY: `close` left it at `c = 0` with `Q` clear: this thread frees it.
