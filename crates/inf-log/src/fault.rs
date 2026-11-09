@@ -82,9 +82,9 @@
 //! - `ckpt_create_fail` — `SimDisk::create_meta` and `SimDisk::create_meta_direct` on a
 //!   checkpoint's staging name (`ckpt-NNNNNN.ick.new`), before the file exists — typed I/O error
 //!   with no file left (`EMFILE` or `ENOSPC` at the open): the walk aborts as on any failed create
-//!   and the trigger retries after its backoff. It fires in the simulated disk only, whose call
-//!   log records each refusal beside the creates that succeed, so an oracle matches every attempt
-//!   to a create
+//!   and publishes nothing, and the automatic trigger's next walk publishes. It fires in the
+//!   simulated disk only, whose call log records each refusal beside the creates that succeed, so
+//!   an oracle matches every attempt to a create
 //!
 //! **Torn-prefix physics (F-L04-14, ADR-0119 A1).** Every point that
 //! lands a prefix (`*_torn_frame`, `*_short_write`) lands it on the

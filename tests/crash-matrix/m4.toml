@@ -80,10 +80,14 @@
 #                         the same unit
 #   walk-aborted-unit-kept — a checkpoint's staging create refused
 #                         before its file exists aborts the walk with no
-#                         file left: the MANIFEST still names the last
-#                         published unit, the trigger retries after its
-#                         backoff, and a cut recovers every acknowledged
-#                         write (the scenario's durability audit)
+#                         file left, and its cell renames nothing onto
+#                         its MANIFEST before its next walk's create, so
+#                         the MANIFEST still names the last published
+#                         unit; that next walk, begun by the automatic
+#                         trigger, publishes, and a cut recovers every
+#                         acknowledged write (the scenario's durability
+#                         audit; the carrier reads every other clause in
+#                         the simulated disk's call log at the cut)
 
 schema = 1
 milestone = "m4"
@@ -451,8 +455,9 @@ expect = "boot-refuses-typed-then-recovers"
 
 # A checkpoint's staging create refused before its file exists (the open
 # failing, `EMFILE` or `ENOSPC`, on the simulated disk): the walk aborts,
-# the last published unit stays the recovery unit, and the cut after it
-# recovers every acknowledged write.
+# the last published unit stays the recovery unit until the automatic
+# trigger's next walk publishes, and the cut after it recovers every
+# acknowledged write.
 [[row]]
 point = "ckpt_create_fail"
 tier = "node"

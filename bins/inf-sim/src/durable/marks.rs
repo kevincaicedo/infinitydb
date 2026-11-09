@@ -74,9 +74,11 @@ fn each_checkpoint_call_carries_the_mark_of_the_cell_that_made_it() {
 
 /// `ckpt_create_fail` once, then `INF.CKPT WAIT` on a one-cell node: the
 /// refused staging create is logged under the cell's mark with no file left,
-/// the walk aborts, and the retry after its backoff is the next logged
-/// create; it makes the file, the `MANIFEST` rename follows, and the `WAIT`
-/// answers. Each attempt is a logged create.
+/// the walk aborts and hands the manual request back, and the retry that
+/// serves it is the next logged create, at a later step; it makes the file,
+/// the `MANIFEST` rename follows, and the `WAIT` answers. Each attempt is a
+/// logged create. The retry here is the manual request's; the automatic
+/// trigger's is read by the crash matrix's `ckpt_create_fail` row.
 #[test]
 fn a_refused_create_aborts_the_walk_and_its_retry_is_the_next_logged_create() {
     use inf_foundation::fault::{self, FaultSpec};
@@ -104,7 +106,7 @@ fn a_refused_create_aborts_the_walk_and_its_retry_is_the_next_logged_create() {
     assert_eq!(retry.result, CallResult::Ok);
     assert!(retried < renamed, "the rename follows the retry: {calls:#?}");
     let (refused_at, retried_at) = (refusal.mark.map(|m| m.at), retry.mark.map(|m| m.at));
-    assert!(refused_at < retried_at, "the retry waited out the backoff: {calls:#?}");
+    assert!(refused_at < retried_at, "the retry comes at a later step: {calls:#?}");
     for call in &calls {
         let mark = call.mark.unwrap_or_else(|| panic!("an unmarked call: {call:?}"));
         assert_eq!(mark.phase, DiskPhase::Cell(CellId(0)), "{call:?}");

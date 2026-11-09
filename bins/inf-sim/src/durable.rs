@@ -1670,6 +1670,14 @@ pub struct DurableReport {
     /// Sections sealed for the ADR-0117 section bound, scraped at the
     /// cut — the section-bound arm's engagement witness (batch 34).
     pub ckpt_bound_splits: u64,
+    /// The simulated disk's call log as the cut found it: the checkpoint
+    /// staging creates and the renames onto a `MANIFEST` the disk logged up
+    /// to the cut, in call order, each under the harness's mark of the cell
+    /// whose iteration made it; and the calls past the log's cap, counted,
+    /// not kept. A carrier matches an injected refusal to the walks that
+    /// follow it here, on the disk's side, never in the cell's counters.
+    pub disk_calls: Vec<inf_log::fs::sim::LoggedCall>,
+    pub disk_calls_unlogged: u64,
     /// The requested plant fired (batch 34 disclosure for the positive
     /// controls — a plant that never fires is a vacuous run).
     pub plant_fired: bool,

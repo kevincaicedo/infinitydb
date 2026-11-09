@@ -49,6 +49,8 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         ledger_prealloc_deferrals: 0,
         ckpt_downgrades: 0,
         ckpt_bound_splits: 0,
+        disk_calls: Vec::new(),
+        disk_calls_unlogged: 0,
         plant_fired: false,
         frame_waits_fill: 0,
         frame_waits_group: 0,
@@ -830,6 +832,8 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
 
     // ---- POWER CUT ----------------------------------------------------
     let cut_time = clock.now();
+    report.disk_calls = disk.logged_calls(0);
+    report.disk_calls_unlogged = disk.calls_unlogged();
     if let Some(leg) = scenario.epoch_marks {
         epoch_marks_scrape(scenario, leg, &node, &mut report);
     }
