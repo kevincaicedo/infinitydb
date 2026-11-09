@@ -58,7 +58,7 @@ fn serving_cell() -> (CellLoop<Idle, VirtualClock>, ServerPlane, Rc<CapCensus>) 
         CellId(0),
         1,
         -1,
-        Keyspace::new(StoreConfig::default()),
+        KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
         fabric,
         Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
         NoopObserver,

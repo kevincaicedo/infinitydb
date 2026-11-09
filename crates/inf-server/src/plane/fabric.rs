@@ -750,7 +750,7 @@ mod fabric_batch_depth {
 
     use inf_fabric::{FabricToken, Mesh, MeshConfig, Op};
     use inf_foundation::KeySlot;
-    use inf_store::{Keyspace, StoreConfig};
+    use inf_store::{KeyspaceSeed, StoreConfig};
 
     use super::{
         CellId, Nanos, NodeInfo, NoopObserver, ReplyStream, ServerPlane, handle_fabric_op,
@@ -774,7 +774,7 @@ mod fabric_batch_depth {
             CellId(0),
             2,
             -1,
-            Keyspace::new(StoreConfig::default()),
+            KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
             fabric,
             Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
             NoopObserver,

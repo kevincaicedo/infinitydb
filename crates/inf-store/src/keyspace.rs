@@ -239,6 +239,40 @@ pub struct Keyspace {
     cataloging: Cataloging,
 }
 
+/// What a keyspace is built from (ADR-0189 D4), handed to the host of its
+/// cap census: a plane that serves the keyspace builds the census first,
+/// then the keyspace on it through [`build`](KeyspaceSeed::build), its one
+/// builder, so every capped store of the cell registers on that census.
+#[derive(Clone, Debug)]
+pub enum KeyspaceSeed {
+    /// The node's keyspace: the boot catalog the host decoded from `META`,
+    /// or the empty catalog of a fresh data directory. It is cataloged.
+    Cataloged { cfg: StoreConfig, catalog: NsCatalog },
+    /// A host with no data directory, so no catalog writer: its namespace
+    /// specs, each created uncataloged, in order.
+    Uncataloged { cfg: StoreConfig, specs: Vec<NsSpec> },
+}
+
+impl KeyspaceSeed {
+    /// Builds the keyspace, every capped store of it on `census`.
+    ///
+    /// # Errors
+    /// The first refusal: the catalog's, as [`Keyspace::cataloged`]'s, or a
+    /// spec's, as [`Keyspace::ns_create`]'s. Nothing built is returned.
+    pub fn build(self, census: &Rc<CapCensus>) -> Result<Keyspace, NsError> {
+        match self {
+            KeyspaceSeed::Cataloged { cfg, catalog } => Keyspace::cataloged(cfg, &catalog, census),
+            KeyspaceSeed::Uncataloged { cfg, specs } => {
+                let mut ks = Keyspace::new(cfg);
+                for spec in specs {
+                    ks.ns_create(spec, census)?;
+                }
+                Ok(ks)
+            }
+        }
+    }
+}
+
 /// Whether a keyspace answers to a catalog writer (ADR-0189 D4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Cataloging {

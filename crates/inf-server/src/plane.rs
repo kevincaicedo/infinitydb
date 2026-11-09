@@ -60,8 +60,8 @@ use inf_runtime::{
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
 use inf_store::{
-    CellStore, EvictBudget, ExpiryBudget, Keyspace, LogFullImage, NsId, NsMode, SlotRouter,
-    WallAnchor,
+    CellStore, EvictBudget, ExpiryBudget, Keyspace, KeyspaceSeed, LogFullImage, NsId, NsMode,
+    SlotRouter, WallAnchor,
 };
 use inf_wire::{
     ArgvRef, CmdFlags, CommandId, ConnParser, ErrorPassthrough, OpenReply, OwnedReply, Parsed,
@@ -80,6 +80,9 @@ mod ns_ddl;
 mod publish;
 mod pumps;
 mod scatter;
+#[cfg(test)]
+#[path = "seed_tests.rs"]
+mod seed_tests;
 mod shared;
 mod tiered;
 mod timers;
@@ -708,34 +711,62 @@ enum StopCheckpoint {
     Requested(CheckpointEpoch),
 }
 
+/// Why [`ServerPlane::new`] built no plane: nothing was written to its
+/// node, and what was built dropped while the census assembles.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PlaneBuildError {
+    /// The keyspace's seed was refused (ADR-0189 D4): a catalog the seeding
+    /// refuses, a spec refused, or a seeded table's build refused.
+    Seed(inf_store::NsError),
+    /// The timer assembly was refused.
+    Timers(TimerAssemblyError),
+}
+
+impl core::fmt::Display for PlaneBuildError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            // A refused seed is the boot's error, and its text is the
+            // refusal's `Debug`, which names the variant and its fields.
+            PlaneBuildError::Seed(refused) => write!(f, "{refused:?}"),
+            PlaneBuildError::Timers(refused) => write!(f, "{refused}"),
+        }
+    }
+}
+
+impl std::error::Error for PlaneBuildError {}
+
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// `listener` must be a listening fd this plane's driver will own.
     /// Returns the plane, its cell's serve mark and its cell's timer set:
-    /// the cap census is built here, once, with `cell`, then on it the set
+    /// the cap census is built here, once, with `cell`; then on it the
+    /// keyspace from `seed` ([`KeyspaceSeed::build`], its one builder), so
+    /// every capped store of the cell registers on that census; then the set
     /// and the server's timer owners (`ServerTimers::build`, their one
     /// constructor), before anything is written to `node`; the plane keeps
     /// the owners. The host hands the mark and the set to the cell's loop,
     /// which takes the mark as its first iteration begins (ADR-0163 D2,
-    /// ADR-0154 D1).
+    /// ADR-0154 D1, ADR-0189 D4).
     ///
     /// # Errors
-    /// The timer assembly's refusal: no plane, `node` unwritten, and what
-    /// was built dropped while the census assembles. Derived never on a
-    /// correct build but for the allocator's refusal.
+    /// The seed's refusal or the timer assembly's: no plane, `node`
+    /// unwritten, and what was built dropped while the census assembles.
+    /// The timer assembly's is derived never on a correct build but for the
+    /// allocator's refusal.
     #[allow(clippy::too_many_arguments)] // construction-time wiring, not an API surface
     #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new(
         cell: CellId,
         cells: u16,
         listener: RawFd,
-        store: Keyspace,
+        seed: KeyspaceSeed,
         fabric: CellFabric,
         node: Rc<NodeInfo>,
         observer: O,
         route_local_only: bool,
-    ) -> Result<(ServerPlane<O, F>, ServeMark, TimerSet), TimerAssemblyError> {
+    ) -> Result<(ServerPlane<O, F>, ServeMark, TimerSet), PlaneBuildError> {
         let (census, serve_mark) = CapCensus::new(cell);
-        let (timer_set, timers) = ServerTimers::build(&census)?;
+        let store = seed.build(&census).map_err(PlaneBuildError::Seed)?;
+        let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
         node.cell.set(cell.0);
         node.cells.set(cells);
         node.cap_census.replace(Some(Rc::clone(&census)));

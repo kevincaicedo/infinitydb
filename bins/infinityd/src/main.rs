@@ -29,7 +29,7 @@ use inf_foundation::{CellId, KeyHasher};
 use inf_runtime::net::{bound_port, listen_reuseport, pin_current_thread};
 use inf_runtime::{BackendDriver, CellLoop, LoopConfig};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane, StdSegmentFs};
-use inf_store::{Keyspace, StoreConfig};
+use inf_store::{KeyspaceSeed, StoreConfig};
 
 /// How often (iterations) each cell refreshes its INFO stats snapshot.
 const STATS_EVERY: u64 = 1024;
@@ -1286,7 +1286,6 @@ fn cell_main(
     hasher: KeyHasher,
     wiring: &NodeWiring,
 ) -> std::io::Result<()> {
-    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let CellLaunch { cell, fabric, wake_fd, cache_permit, ckpt_issuer } = launch;
     // Setup-phase narration (M2.5-S01): the 500-cycle storm caught cells
     // stalling BEFORE the first loop iteration ("spawned" forever) — every
@@ -1367,14 +1366,14 @@ fn cell_main(
     // decode, or the empty catalog of a fresh data directory, so a
     // namespace entry changes only with the catalog writer's receipt. A
     // node with no data directory has no catalog writer and answers no DDL.
+    // The plane builds it from this seed on its cell's census.
     let store_cfg = StoreConfig { hasher, ..StoreConfig::default() };
-    let ks = match &boot {
-        Some((_, catalog, ..)) => {
-            let empty = inf_store::NsCatalog::empty();
-            Keyspace::cataloged(store_cfg, catalog.as_ref().unwrap_or(&empty), &census)
-                .map_err(|e| std::io::Error::other(format!("{e:?}")))?
-        }
-        None => Keyspace::new(store_cfg),
+    let seed = match &boot {
+        Some((_, catalog, ..)) => KeyspaceSeed::Cataloged {
+            cfg: store_cfg,
+            catalog: catalog.clone().unwrap_or_else(inf_store::NsCatalog::empty),
+        },
+        None => KeyspaceSeed::Uncataloged { cfg: store_cfg, specs: Vec::new() },
     };
     let mut durable = None;
     if let Some((dir, _catalog, control, io, seal_barriers_per_s, geometry, provenance)) = &boot {
@@ -1431,13 +1430,13 @@ fn cell_main(
         durable = Some((cfg, std::sync::Arc::clone(control)));
     }
     mark(15); // setup:plane
-    // A refused timer assembly ends the cell's setup before its loop
-    // exists, and the cell's thread ends the process with its text.
+    // A refused seed or timer assembly ends the cell's setup before its
+    // loop exists, and the cell's thread ends the process with its text.
     let (mut plane, serve_mark, timer_set) = ServerPlane::new(
         CellId(cell),
         args.cells.get(),
         listener.into_raw_fd(), // the driver owns the listener fd now
-        ks,
+        seed,
         fabric,
         Rc::clone(&node),
         NoopObserver,

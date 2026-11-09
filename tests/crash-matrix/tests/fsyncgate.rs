@@ -47,7 +47,7 @@ use inf_foundation::time::{Clock, StdClock};
 use inf_runtime::net::{bound_port, listen_reuseport};
 use inf_runtime::{BackendDriver, CellLoop, LoopConfig, UringDriver};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
-use inf_store::{Keyspace, StoreConfig};
+use inf_store::{KeyspaceSeed, StoreConfig};
 
 /// Minimal single-cell durable node (the node_e2e assembly, trimmed).
 /// Returns the bound port and the thread handles; the node serves until
@@ -83,14 +83,10 @@ fn start_node(
         let mut driver = UringDriver::new(256).expect("uring");
         driver.register_pool(&mut pool).expect("register");
         // The node's keyspace is cataloged, as `infinityd`'s (ADR-0189 D4).
-        let empty = inf_store::NsCatalog::empty();
-        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
-        let ks = Keyspace::cataloged(
-            StoreConfig::default(),
-            catalog.as_ref().unwrap_or(&empty),
-            &census,
-        )
-        .expect("seed catalog");
+        let seed = KeyspaceSeed::Cataloged {
+            cfg: StoreConfig::default(),
+            catalog: catalog.unwrap_or_else(inf_store::NsCatalog::empty),
+        };
         let cfg = inf_server::DurableConfig {
             data_dir: dir,
             geometry: inf_log::LogGeometry::default(),
@@ -106,7 +102,7 @@ fn start_node(
             CellId(0),
             1,
             listener.into_raw_fd(),
-            ks,
+            seed,
             fabric,
             Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
             NoopObserver,

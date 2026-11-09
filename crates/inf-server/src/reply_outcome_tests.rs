@@ -12,8 +12,7 @@ use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::KeySlot;
 use inf_foundation::fault::FaultSpec;
 use inf_store::{
-    AddrClass, Keyspace, LogicalAddr, NsSpec, ShadowProbe, ShadowVerdict, StoreConfig, TierSpec,
-    TieredTable,
+    AddrClass, LogicalAddr, NsSpec, ShadowProbe, ShadowVerdict, StoreConfig, TierSpec, TieredTable,
 };
 
 use crate::fault::SHADOW_TWIN_READ_FAIL;
@@ -47,7 +46,7 @@ impl Cells {
                     CellId(cell as u16),
                     2,
                     -1,
-                    Keyspace::new(StoreConfig::default()),
+                    KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
                     fabric,
                     Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
                     NoopObserver,
