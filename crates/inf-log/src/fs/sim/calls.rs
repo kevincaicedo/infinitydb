@@ -61,7 +61,7 @@ pub enum CallResult {
 impl CallResult {
     /// The result of a call that ran, no point having fired in it.
     #[must_use]
-    pub fn of<T>(result: &io::Result<T>) -> CallResult {
+    pub(crate) fn of<T>(result: &io::Result<T>) -> CallResult {
         match result {
             Ok(_) => CallResult::Ok,
             Err(err) => CallResult::Failed(err.kind()),

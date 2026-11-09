@@ -358,7 +358,7 @@ pub fn ick_staging_file_name(id: u64) -> String {
 /// Parses `ckpt-NNNNNN.ick.new` → id: the staging name
 /// [`ick_staging_file_name`] writes, by [`parse_ick_file_name`]'s digit rule.
 #[must_use]
-pub fn parse_ick_staging_file_name(name: &str) -> Option<u64> {
+pub(crate) fn parse_ick_staging_file_name(name: &str) -> Option<u64> {
     parse_ick_file_name(name.strip_suffix(".new")?)
 }
 
