@@ -150,3 +150,22 @@ fn corpus_seeds_replay_green() {
     }
     assert!(ran >= 4, "corpus unexpectedly small ({ran} entries)");
 }
+
+/// The drop race's filler leg: the path a seed whose phase-2 keys all
+/// answer from RAM at phase 9 takes (one seed in thousands of the nightly's
+/// sweep), forced. The race writes a filler on one cell until the filler's
+/// first key reads cold, and the DROP meets that read held at the device;
+/// a filler that never pushed its key out of RAM within its bound is the
+/// run's VACUOUS clause.
+#[test]
+fn the_drop_race_filler_leg_meets_its_held_read() {
+    let scenario = TieredScenario::m4_tiered(0xC0FFEE).with_drop_race_filler();
+    let report = run_tiered_scenario(&scenario);
+    assert!(report.ok(), "stalled={} violations={:?}", report.stalled, report.violations);
+    assert!(report.drop_race_fill_batches > 0, "the leg wrote no filler batch");
+    assert_eq!(
+        report.drop_race_probes, report.drop_race_fill_batches,
+        "the leg probes the filler's first key once a batch, and no phase-2 key"
+    );
+    assert_eq!(report.drop_reads_held, 1, "the DROP met the filler key's held read");
+}

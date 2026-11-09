@@ -919,6 +919,9 @@ fn main() {
             let mut diskfull_refusals = 0u64;
             let mut drop_values = 0u64;
             let mut drop_other = 0u64;
+            let mut drop_probes = 0u64;
+            let mut drop_fill_seeds = 0u64;
+            let mut drop_fill_batches = 0u64;
             let mut drop_reboots = 0u64;
             let mut drop_reboot_residue = 0u64;
             let mut drop_cut_whole = 0u64;
@@ -1015,6 +1018,9 @@ fn main() {
                 diskfull_refusals += report.diskfull_refusals;
                 drop_values += report.drop_replies_value;
                 drop_other += report.drop_replies_other;
+                drop_probes += report.drop_race_probes;
+                drop_fill_seeds += u64::from(report.drop_race_fill_batches > 0);
+                drop_fill_batches += report.drop_race_fill_batches;
                 drop_reboots += u64::from(report.drop_reboot_ok);
                 drop_reboot_residue += u64::from(report.drop_reboot_manifest_residue);
                 match report.drop_cut_outcome {
@@ -1049,7 +1055,9 @@ fn main() {
                  {scan_cold_pages} cold pages ({scan_cold_reads} cold intents), \
                  ckpt arms [downgrades {ckpt_downgrades} bound_splits \
                  {ckpt_bound_splits}], {diskfull_refusals} DISKFULL refusals, \
-                 drop-race {drop_values} values / {drop_other} typed-other; post-drop reboots \
+                 drop-race {drop_values} values / {drop_other} typed-other ({drop_probes} probe \
+                 GETs, a filler on {drop_fill_seeds} seeds in {drop_fill_batches} batches); \
+                 post-drop reboots \
                  {drop_reboots} ({drop_reboot_residue} with MANIFEST residue), cut inside DROP: \
                  {drop_cut_whole} whole / {drop_cut_swept} swept (ADR-0100); shadow arm on \
                  {shadow_seeds} seeds: {shadow_created} tickets ({shadow_at_cut} open at the \
@@ -1087,6 +1095,8 @@ fn main() {
                      ckpt_downgrades={ckpt_downgrades} ckpt_bound_splits={ckpt_bound_splits} \
                      diskfull_refusals={diskfull_refusals} \
                      drop_values={drop_values} drop_other={drop_other} \
+                     drop_probes={drop_probes} drop_fill_seeds={drop_fill_seeds} \
+                     drop_fill_batches={drop_fill_batches} \
                      drop_reboots={drop_reboots} drop_reboot_residue={drop_reboot_residue} \
                      drop_cut_whole={drop_cut_whole} drop_cut_swept={drop_cut_swept} \
                      shadow_seeds={shadow_seeds} shadow_created={shadow_created} \
@@ -1139,8 +1149,9 @@ fn main() {
             "inf-sim: m4-tiered seed {seed:#x}: {} commands, {} steps, {} keys audited, {} \
              required ops, {} allowed-lost, {} B flushed pre-cut, {} B flushed final, {} cold \
              resolves, {} blob sets, {} DISKFULL refusals (reopened: {}), drop-race {} values / \
-             {} typed-other, post-drop reboot {} (MANIFEST residue {}), cut inside DROP after {} \
-             steps: {:?}, refused-boot {}, shadow arm {} ({} tickets, {} open at the cut, \
+             {} typed-other ({} probe GETs, {} filler batches, {} DROPs met a held tier read), \
+             post-drop reboot {} (MANIFEST residue {}), cut inside DROP after {} steps: {:?}, \
+             refused-boot {}, shadow arm {} ({} tickets, {} open at the cut, \
              {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}; \
              phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
              DBSIZE drains, {} SCAN twins), blob-key race {} replans, dir-open fault arm {} \
@@ -1163,6 +1174,9 @@ fn main() {
             report.diskfull_reopened,
             report.drop_replies_value,
             report.drop_replies_other,
+            report.drop_race_probes,
+            report.drop_race_fill_batches,
+            report.drop_reads_held,
             report.drop_reboot_ok,
             report.drop_reboot_manifest_residue,
             report.drop_cut_steps,

@@ -35,7 +35,9 @@
 //!    refusal over commands, reads/deletes proceeding at the cap, and
 //!    admission **reopening** when the budget lifts (recovery is
 //!    automatic — the M1-S07 honesty pattern's disk twin).
-//! 9. The S19 drop-race finale: pipelined cold GETs race `INF.NS DROP`;
+//! 9. The drop-race finale: pipelined GETs race `INF.NS DROP` behind
+//!    a first GET whose tier read the device holds across the drop (a
+//!    phase-2 key that reads cold, or a filler key pushed out of RAM);
 //!    every reply is typed, the node answers `PING` after.
 //!
 //! **Shadow-slot arm (M4.5-S37, ADR-0093 D8):** three of every four
@@ -208,6 +210,11 @@ pub struct TieredScenario {
     /// acknowledged no aged delete or whose reboot verified none, is
     /// VACUOUS.
     pub replay_above_window: bool,
+    /// The drop race's filler leg: phase 9 probes no phase-2 key and holds
+    /// the read of its filler's first key, the path a seed whose phase-2
+    /// keys all answer from RAM takes. Off on every seed; a test names it
+    /// ([`TieredScenario::with_drop_race_filler`]).
+    pub drop_race_filler: bool,
 }
 
 impl TieredScenario {
@@ -243,8 +250,16 @@ impl TieredScenario {
             ckpt_direct_refused_after: (seed % 8 == 6).then_some(2),
             tier_read_fault: seed % 8 == 7,
             replay_above_window: false,
+            drop_race_filler: false,
         };
         if matches!(seed % 16, 2 | 11) { scenario.with_replay_above_window() } else { scenario }
+    }
+
+    /// The drop race's filler leg on any seed (the field's doc).
+    #[must_use]
+    pub fn with_drop_race_filler(mut self) -> TieredScenario {
+        self.drop_race_filler = true;
+        self
     }
 
     /// The replay-above-window class's knobs: the interval above any run
@@ -423,6 +438,12 @@ pub struct TieredNodeReport {
     /// Drop-race `DROP`s answered while a cold read of the namespace's tier
     /// files was held at the device: the custody oracle's engagement.
     pub drop_reads_held: u64,
+    /// Drop-race probe GETs sent with the device's tier reads held, the
+    /// held one included: phase 2's keys in order, then the filler's first.
+    pub drop_race_probes: u64,
+    /// Filler batches the drop race wrote on one cell because every phase-2
+    /// key answered from RAM (0 on a seed where one of them read cold).
+    pub drop_race_fill_batches: u64,
     /// Phase 10 (ADR-0100 D6): the post-drop reboot succeeded; whether a
     /// MANIFEST still named the dropped namespace (the row is inert on a
     /// seed where a checkpoint raced the drop — disclosed).
@@ -2041,7 +2062,14 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         fail(&mut report, format!("CUSTODY: {closed} driver ops named a closed descriptor"));
     }
     if report.drop_reads_held == 0 {
-        fail(&mut report, "VACUOUS: no DROP met a cold read held on its tier files".to_string());
+        let (probes, batches) = (report.drop_race_probes, report.drop_race_fill_batches);
+        fail(
+            &mut report,
+            format!(
+                "VACUOUS: no DROP met a cold read held on its tier files ({probes} probe GETs, \
+                 {batches} filler batches)"
+            ),
+        );
     }
     finish(report, &observer, &clock)
 }

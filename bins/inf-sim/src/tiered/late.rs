@@ -737,67 +737,128 @@ fn is_tier_file(path: &std::path::Path) -> bool {
     path.extension().is_some_and(|ext| ext == "itier")
 }
 
-/// Steps a drop race waits for its first cold read to reach the device.
-const RACE_READ_WAIT_STEPS: u64 = 512;
+/// Whether any cell's device holds a tier read now: the harness's own
+/// reading of the driver's queue, no product counter.
+fn tier_reads_held(node: &Node, cells: u16) -> bool {
+    (0..usize::from(cells)).any(|cell| node.driver(cell).held_reads() > 0)
+}
 
-/// Phase 9: the S19 drop race through the wire. Its cold reads are held at
-/// the device until the DROP is answered, so the drop is applied while a
-/// read of the namespace's tier files is queued: the dropped owner keeps
-/// each file open until its read ends (the custody oracle).
-fn phase_9(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
-    let racer_cell = 0usize;
-    let racer_fd = node.nets[racer_cell].borrow_mut().connect();
-    node.nets[racer_cell]
-        .borrow_mut()
-        .client_send(racer_fd, &encode(&[b"INF.NS", b"USE", NS_NAME]));
-    // Settle the USE reply before pipelining (one framed +OK).
-    let mut rx = Vec::new();
-    let mut settled = false;
+/// GETs the drop race pipelines behind its first, held, read.
+const RACE_PIPELINED_KEYS: usize = 29;
+
+/// The hashtag of the drop race's own filler: every key on one cell.
+const RACE_FILL_TAG: &str = "p9";
+
+/// Filler batches the drop race writes, at most, until the filler's first
+/// key reads cold: 64 × 32 × 2 KiB = 4 MiB on one cell, above the
+/// namespace's 3 MiB memory budget, so that key leaves RAM inside the bound
+/// (phase 7d cools its keys under the same bound).
+const RACE_FILL_BATCHES_MAX: u64 = 64;
+
+/// What a drop-race probe GET met at the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+    /// A tier read of the namespace's files is held at the device: the
+    /// probe's own (its key lives in a tier file and its reply waits on the
+    /// read) or one MAINTAIN issued while the probe ran.
+    Held,
+    /// The GET answered with no tier read held.
+    Answered,
+}
+
+/// Sends `GET key` on `racer` and steps until the device holds a tier read
+/// or the GET answers. A held read ends the probe first: the GET's reply,
+/// sent or not, is the race's to drain.
+fn probe(cx: &mut Late<'_>, node: &mut Node, racer: &mut MiniClient, key: &[u8]) -> Verdict<Probe> {
+    cx.report.drop_race_probes += 1;
+    racer.send(node, &[b"GET", key]);
     for _ in 0..STALL_STEPS {
-        if node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max).is_err() {
-            break;
-        }
-        cx.report.scheduler_steps += 1;
-        let bytes = node.nets[racer_cell].borrow_mut().client_recv(racer_fd);
-        rx.extend_from_slice(&bytes);
-        if let Some(n) = reply_len(&rx) {
-            let reply: Vec<u8> = rx.drain(..n).collect();
-            if reply != b"+OK\r\n" {
-                cx.fail(format!("racer USE answered {}", preview(&reply)));
-                return Err(());
-            }
-            settled = true;
-            break;
-        }
-    }
-    if !settled {
-        cx.report.stalled = true;
-        cx.fail("racer USE stalled".to_string());
-        return Err(());
-    }
-    let race_keys: Vec<Vec<u8>> = cx.observed.keys().take(30).cloned().collect();
-    let mut batch = Vec::new();
-    for key in &race_keys {
-        batch.extend_from_slice(&encode(&[b"GET", key]));
-    }
-    cx.disk.hold_reads(Some(is_tier_file));
-    node.nets[racer_cell].borrow_mut().client_send(racer_fd, &batch);
-    let cells = usize::from(cx.scenario.cells);
-    let reads_held = |node: &Node| (0..cells).any(|cell| node.driver(cell).held_reads() > 0);
-    for _ in 0..RACE_READ_WAIT_STEPS {
-        if reads_held(node) {
-            break;
-        }
         if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
-            cx.fail(format!("drop-race read wait: {err}"));
+            cx.fail(format!("drop-race probe: {err}"));
             return Err(());
         }
         cx.report.scheduler_steps += 1;
+        if tier_reads_held(node, cx.scenario.cells) {
+            return Ok(Probe::Held);
+        }
+        if let Some(reply) = racer.recv(node) {
+            if !matches!(reply.first(), Some(b'$' | b'-')) {
+                cx.fail(format!("untyped drop-race probe reply: {}", preview(&reply)));
+                return Err(());
+            }
+            return Ok(Probe::Answered);
+        }
+    }
+    cx.report.stalled = true;
+    cx.fail(format!("drop-race probe GET {} stalled", preview(key)));
+    Err(())
+}
+
+/// The drop race's first read: GETs on `racer`, one at a time with every
+/// tier read held at the device, until one is held. Phase 2's keys go
+/// first, in order; on a seed where every one answers from RAM, a filler
+/// on one cell pushes its own first key out of RAM, probed after each
+/// batch (the filler leg starts there). `Answered` only past the filler's
+/// bound: then no DROP meets a held read and the engagement clause is red.
+fn race_first_read(
+    cx: &mut Late<'_>,
+    node: &mut Node,
+    audit: &mut MiniClient,
+    racer: &mut MiniClient,
+) -> Verdict<Probe> {
+    let observed = cx.observed;
+    cx.disk.hold_reads(Some(is_tier_file));
+    let phase_2_keys = if cx.scenario.drop_race_filler { 0 } else { observed.len() };
+    for key in observed.keys().take(phase_2_keys) {
+        if probe(cx, node, racer, key)? == Probe::Held {
+            return Ok(Probe::Held);
+        }
+    }
+    let first_fill_key = format!("{{{RACE_FILL_TAG}}}fill:0:0").into_bytes();
+    for batch in 0..RACE_FILL_BATCHES_MAX {
+        cx.disk.hold_reads(None);
+        fill_batch(cx, node, audit, RACE_FILL_TAG, batch)?;
+        cx.report.drop_race_fill_batches += 1;
+        cx.disk.hold_reads(Some(is_tier_file));
+        if probe(cx, node, racer, &first_fill_key)? == Probe::Held {
+            return Ok(Probe::Held);
+        }
+    }
+    Ok(Probe::Answered)
+}
+
+/// Phase 9: the namespace drop race through the wire. Its first GET is one
+/// whose tier read the device holds until the DROP is answered, so the drop
+/// is applied while a read of the namespace's tier files is queued: the
+/// dropped owner keeps each file open until its read ends (the custody
+/// oracle). The race's other GETs queue behind it on one connection.
+fn phase_9(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
+    let mut racer = MiniClient::connect(node, 0);
+    let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
+    match racer.call(node, cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max, use_ns) {
+        Ok(Some(reply)) if reply == b"+OK\r\n" => {}
+        Ok(None) => {
+            cx.report.stalled = true;
+            cx.fail("racer USE stalled".to_string());
+            return Err(());
+        }
+        other => {
+            cx.fail(format!("racer USE answered {other:?}"));
+            return Err(());
+        }
+    }
+    let first = race_first_read(cx, node, audit, &mut racer)?;
+    let observed = cx.observed;
+    let pipelined = observed.keys().take(RACE_PIPELINED_KEYS);
+    let mut in_flight = usize::from(first == Probe::Held);
+    for key in pipelined {
+        racer.send(node, &[b"GET", key]);
+        in_flight += 1;
     }
     // DROP races the pipelined reads from a second connection.
     let drop_ns: &[&[u8]] = &[b"INF.NS", b"DROP", NS_NAME];
     let dropped = audit.call(node, cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max, drop_ns);
-    if reads_held(node) {
+    if tier_reads_held(node, cx.scenario.cells) {
         cx.report.drop_reads_held += 1;
     }
     cx.disk.hold_reads(None);
@@ -808,46 +869,7 @@ fn phase_9(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdic
             return Err(());
         }
     }
-    // Every pipelined reply must arrive typed — a missing reply is the
-    // hang this row exists to catch (§3.3 teardown vs in-flight custody).
-    let mut answered = 0usize;
-    let mut idle = 0u64;
-    while answered < race_keys.len() {
-        if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
-            cx.fail(format!("drop-race drain: {err}"));
-            return Err(());
-        }
-        cx.report.scheduler_steps += 1;
-        let bytes = node.nets[racer_cell].borrow_mut().client_recv(racer_fd);
-        if bytes.is_empty() {
-            idle += 1;
-            if idle >= STALL_STEPS {
-                cx.report.stalled = true;
-                cx.fail(format!(
-                    "DROP-RACE HANG: {} of {} pipelined replies never arrived",
-                    race_keys.len() - answered,
-                    race_keys.len()
-                ));
-                return Err(());
-            }
-        } else {
-            idle = 0;
-        }
-        rx.extend_from_slice(&bytes);
-        while let Some(n) = reply_len(&rx) {
-            let reply: Vec<u8> = rx.drain(..n).collect();
-            answered += 1;
-            match reply.first() {
-                Some(b'$') if reply.starts_with(b"$-1") => cx.report.drop_replies_other += 1,
-                Some(b'$') => cx.report.drop_replies_value += 1,
-                Some(b'-') => cx.report.drop_replies_other += 1,
-                _ => cx.fail(format!("untyped drop-race reply: {}", preview(&reply))),
-            }
-            if answered == race_keys.len() {
-                break;
-            }
-        }
-    }
+    drain_race(cx, node, &mut racer, in_flight)?;
     // The audit connection sits on the dropped namespace: its PING must
     // answer the typed dropped-namespace error (never a hang or a crash).
     let ping: &[&[u8]] = &[b"PING"];
@@ -867,6 +889,47 @@ fn phase_9(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdic
         other => cx.fail(format!("USE of the dropped ns answered {other:?}")),
     }
 
+    Ok(())
+}
+
+/// Every reply of the race must arrive typed: a missing reply is the hang
+/// this row exists to catch, a dropped owner's teardown stranding a read.
+fn drain_race(
+    cx: &mut Late<'_>,
+    node: &mut Node,
+    racer: &mut MiniClient,
+    in_flight: usize,
+) -> Verdict {
+    let mut answered = 0usize;
+    let mut idle = 0u64;
+    while answered < in_flight {
+        if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
+            cx.fail(format!("drop-race drain: {err}"));
+            return Err(());
+        }
+        cx.report.scheduler_steps += 1;
+        let before = answered;
+        while answered < in_flight
+            && let Some(reply) = racer.recv(node)
+        {
+            answered += 1;
+            match reply.first() {
+                Some(b'$') if reply.starts_with(b"$-1") => cx.report.drop_replies_other += 1,
+                Some(b'$') => cx.report.drop_replies_value += 1,
+                Some(b'-') => cx.report.drop_replies_other += 1,
+                _ => cx.fail(format!("untyped drop-race reply: {}", preview(&reply))),
+            }
+        }
+        idle = if answered == before { idle + 1 } else { 0 };
+        if idle >= STALL_STEPS {
+            cx.report.stalled = true;
+            cx.fail(format!(
+                "DROP-RACE HANG: {} of {in_flight} pipelined replies never arrived",
+                in_flight - answered
+            ));
+            return Err(());
+        }
+    }
     Ok(())
 }
 
