@@ -333,6 +333,13 @@ impl TieredTable {
         self.live.abort_retirement();
     }
 
+    /// Keys of the relocation-origin map (tests only): one per record
+    /// relocated since the covering swap that drains it.
+    #[cfg(test)]
+    pub(crate) fn reloc_origin_keys(&self) -> usize {
+        self.reloc_origins.len()
+    }
+
     /// The cold floor (ADR-0059 D5): the lowest surviving tier file's
     /// base — no live address exists below it. The endurance AC's "head
     /// advances" is this coordinate strictly increasing.
@@ -393,5 +400,109 @@ impl TieredTable {
             end: f.base + f.data_len,
             deferred: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use inf_foundation::{KeyHasher, LogicalAddr};
+    use inf_log::flush::TierFileMeta;
+    use inf_log::tier::SealReason;
+
+    use super::TieredTable;
+    use crate::address_space::AddressSpaceConfig;
+    use crate::demote::DemotionConfig;
+    use crate::record::{RecordKind, RecordSpec};
+
+    const PAGE: u64 = 4 << 10;
+
+    /// One cold record: its key's hash, its address below the life origin
+    /// and its image, as a verified cold read fetches it.
+    struct Cold {
+        hash: u64,
+        addr: LogicalAddr,
+        image: Vec<u8>,
+    }
+
+    /// A table at `budget` whose recovered tier file holds `records`
+    /// one-byte strings back to back below the life origin, each indexed as
+    /// the boot's checkpoint refs it.
+    fn cold_table(budget: u64, records: u32) -> (TieredTable, Vec<Cold>) {
+        let images: Vec<Vec<u8>> = (0..records)
+            .map(|index| {
+                let key = format!("key-{index:06}");
+                let spec = RecordSpec {
+                    key: key.as_bytes(),
+                    value: b"v",
+                    version: 1,
+                    expire_at_ms: None,
+                    kind: RecordKind::String { raw: true },
+                };
+                let mut image = vec![0; spec.encoded_len()];
+                spec.write(&mut image);
+                image
+            })
+            .collect();
+        let cold_bytes: u64 = images.iter().map(|image| image.len() as u64).sum();
+        let demote = DemotionConfig::for_budget(budget, PAGE);
+        let config = AddressSpaceConfig {
+            reserve_bytes: demote.ring_reserve_bytes().expect("a valid budget"),
+            page_bytes: PAGE as usize,
+            life_origin: LogicalAddr::from_raw(cold_bytes.next_multiple_of(PAGE)).expect("48-bit"),
+        };
+        let mut table = TieredTable::new(config, demote, images.len(), KeyHasher::default())
+            .expect("the ring reserves");
+        let file = TierFileMeta {
+            id: 0,
+            base: LogicalAddr::ZERO,
+            data_len: cold_bytes,
+            reason: SealReason::Capacity,
+            path: "tier-000000.itier".into(),
+        };
+        table.seed_recovered_files(&[file], 0);
+        let mut at = 0;
+        let cold = images
+            .into_iter()
+            .map(|image| {
+                let hash = table.hash_key(TieredTable::decode_record(&image).key);
+                let addr = LogicalAddr::from_raw(at).expect("48-bit");
+                at += image.len() as u64;
+                table.replay_ref(hash, addr);
+                Cold { hash, addr, image }
+            })
+            .collect();
+        (table, cold)
+    }
+
+    /// Offers each record twice, as two verified cold reads of its key: the
+    /// second touch promotes it. Returns the promotions.
+    fn promote_each(table: &mut TieredTable, cold: &[Cold]) -> usize {
+        cold.iter()
+            .filter(|record| {
+                let first = table.try_promote(record.hash, record.addr, &record.image);
+                first || table.try_promote(record.hash, record.addr, &record.image)
+            })
+            .count()
+    }
+
+    /// The origin map gains one key per record relocated since its covering
+    /// swap, and nothing bounds the keys: 2,049 promotions at a 4 MiB
+    /// `MEM-BUDGET` with no checkpoint leave 2,049, past the 2,048 keys of
+    /// the band a 4 MiB table takes.
+    #[test]
+    #[ignore = "the relocation-origin map has no key cap, so each relocation since the covering \
+                swap adds a key; red until the map takes the band of its table's budget, 2,048 \
+                keys at 4 MiB, and a relocation past it defers, counted"]
+    fn relocations_past_the_band_leave_the_origin_map_at_its_cap() {
+        const BAND_KEYS: usize = 2_048;
+        let (mut table, cold) = cold_table(4 << 20, 2_049);
+        let promoted = promote_each(&mut table, &cold);
+        assert!(promoted >= BAND_KEYS, "engagement: {promoted} of 2,049 records promoted");
+        let keys = table.reloc_origin_keys();
+        assert!(
+            keys <= BAND_KEYS,
+            "{keys} origin keys after {promoted} promotions with no covering swap: the map has \
+             no key cap; the 4 MiB band holds {BAND_KEYS}"
+        );
     }
 }
