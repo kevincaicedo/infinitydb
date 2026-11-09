@@ -141,16 +141,15 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         }
     }
 
-    // The tier-budget shape's namespaces: tiered `always`, the leg's
-    // window with a tenth of it mutable, every generated value inline
-    // (the threshold is above the generator's largest value, so the tier
-    // class, not the blob class, carries the bytes), the shape's
-    // `MAINTAIN-SLICE`.
+    // The tier-budget shape's namespaces: tiered `always`, each load's
+    // window and mutable fraction, every generated value inline (the
+    // threshold is above the generator's largest value, so the tier class,
+    // not the blob class, carries the bytes), the load's `MAINTAIN-SLICE`.
     if let Some(shape) = scenario.tier_budget {
         for index in shape.namespaces.indices() {
             let class = NsClass::TierBudget(index);
             let load = shape.load(index);
-            let mut create: Vec<&[u8]> = vec![
+            let create: &[&[u8]] = &[
                 b"INF.NS",
                 b"CREATE",
                 class.name(),
@@ -169,11 +168,8 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                 b"TIER-IO-MODE",
                 b"buffered",
             ];
-            if let Some(timeout_ms) = load.tail_stall_timeout_ms {
-                create.extend_from_slice(&[b"TAIL-STALL-TIMEOUT", timeout_ms]);
-            }
             let reply =
-                setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, &create);
+                setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, create);
             match reply {
                 Ok(Some(ok)) if ok == b"+OK\r\n" => {}
                 Ok(other) => {
