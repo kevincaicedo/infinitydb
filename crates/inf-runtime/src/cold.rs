@@ -2893,4 +2893,190 @@ mod tests {
             assert!(offset + size <= 56, "IntentSlot.{field} ends at byte {}", offset + size);
         }
     }
+
+    /// The receipt-facing state a foreign receipt must leave as it was: the
+    /// device QD, the ready list's ends and pending counts, the readiness,
+    /// each window's phase, cursor, members and link, and each shared
+    /// window's custody count, every table read in word order.
+    fn receipt_state(cold: &ColdReads) -> String {
+        let state = cold.state.borrow();
+        let mut windows: Vec<(u64, String)> = state
+            .inflight
+            .iter()
+            .map(|(token, read)| {
+                let (phase, cursor, members) = (read.phase, read.cursor, read.waiters.len());
+                let next = read.ready_next.map(word_index);
+                (word_index(*token), format!("{phase:?} at {cursor} of {members}, next {next:?}"))
+            })
+            .collect();
+        windows.sort_unstable();
+        let mut shared: Vec<(u64, u32)> = state
+            .windows
+            .iter()
+            .map(|(token, window)| (word_index(*token), window.remaining))
+            .collect();
+        shared.sort_unstable();
+        let ends = (state.ready_head.map(word_index), state.ready_tail.map(word_index));
+        let pending = (state.pending_members, state.pending_windows);
+        let (qd, readiness) = (state.device_reads, state.readiness);
+        format!("qd {qd}, ready {ends:?} {pending:?}, {readiness:?}; {windows:?}; {shared:?}")
+    }
+
+    /// The device token of the one `TierRead` in `ops` on `fd`.
+    fn token_on(ops: &[IoOp], fd: RawFd) -> CompletionToken {
+        let mut on = ops.iter().filter_map(|op| match *op {
+            IoOp::TierRead { fd: read_fd, token, .. } if read_fd == fd => Some(token),
+            _ => None,
+        });
+        let token = on.next().expect("a read on the descriptor");
+        assert!(on.next().is_none(), "one read on the descriptor");
+        token
+    }
+
+    /// A receipt that names no Issued window is foreign (ADR-0181 R1, I6):
+    /// a word the issuer never minted, a request's logical word, a duplicate
+    /// while its window is Ready, one after its last member's visit and one
+    /// after its last value's drop each return `ColdReceipt::Foreign`, count
+    /// one `receipts_foreign` and leave every window, the ready list and
+    /// custody as they were. A second window stays Issued throughout, so a
+    /// duplicate recorded as a receipt would also move the device QD.
+    #[test]
+    fn a_foreign_receipt_is_counted_and_changes_nothing() {
+        let config = ColdReadConfig { qd_cap: 2, overflow_cap: 4, ..ColdReadConfig::default() };
+        let cold = shaped(2, config);
+        let (file, other) = (TierFileId::new(41), TierFileId::new(42));
+        let members = [ask(&cold, 5, file, 0, 8), ask(&cold, 5, file, 0, 8)];
+        let logical = newest_logical(&cold, ReadClass::Foreground);
+        let held = ask(&cold, 6, other, 0, 8);
+        let ops = drain_ops(&cold);
+        assert_eq!(ops.len(), 2, "one window a file");
+        let (window, issued) = (token_on(&ops, 5), token_on(&ops, 6));
+        let never_minted = tier_read_token(2 * cold.identity_pairs_used() + 1);
+        let foreign = |case: &str, token: CompletionToken| {
+            let (counters, state, leak) = (cold.counters(), receipt_state(&cold), custody(&cold));
+            let receipt = cold.record_completion(token, Ok(()), 9);
+            assert_eq!(receipt, ColdReceipt::Foreign, "{case} is foreign");
+            let expected =
+                ColdReadCounters { receipts_foreign: counters.receipts_foreign + 1, ..counters };
+            assert_eq!(cold.counters(), expected, "{case}: one foreign receipt, nothing else");
+            assert_eq!(receipt_state(&cold), state, "{case}: the windows and ready list untouched");
+            assert_eq!(custody(&cold), leak, "{case}: custody untouched");
+        };
+        foreign("a word never minted", never_minted);
+        foreign("a request's logical word", logical);
+        assert_eq!(cold.record_completion(window, Ok(()), 1), ColdReceipt::Recorded);
+        foreign("a duplicate while its window is Ready", window);
+        let mut turn = ColdTurn::begin();
+        assert_eq!(cold.deliver_ready(turn.delivery(), 2).delivered, 2, "both members delivered");
+        assert!(!cold.has_ready_delivery(), "the window's last member was visited");
+        foreign("a duplicate after its last member's visit", window);
+        drop(members.map(block_on_ready));
+        foreign("a duplicate after its last value's drop", window);
+        assert_eq!(deliver_all(&cold, issued, Ok(()), 3), 1, "the Issued window kept its receipt");
+        drop((block_on_ready(held), ops));
+        assert_eq!(cold.counters().receipts_foreign, 5, "engagement: five foreign receipts");
+        assert_eq!(cold.reconcile(), Ok(()));
+    }
+
+    /// The order a member's wake took: its first wake takes the next number
+    /// of the sequence every member's waker shares.
+    struct WakeOrder {
+        sequence: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        at: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::task::Wake for WakeOrder {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            use std::sync::atomic::Ordering::Relaxed;
+            let at = self.sequence.fetch_add(1, Relaxed);
+            assert_eq!(self.at.swap(at, Relaxed), usize::MAX, "a member is woken once");
+        }
+    }
+
+    /// Delivery is round-robin over the ready windows (ADR-0181 R1): 64
+    /// windows of 31 members, each on its own file and all received before
+    /// one turn, are visited one member a window a pass, so the first turn's
+    /// 64 visits reach every window once, every window's first member is
+    /// visited before any window's second, and each pass visits the windows
+    /// in receipt order. The oracle is the order the members' own wakers
+    /// saw, which shares nothing with the host.
+    #[test]
+    fn a_shared_turn_visits_each_ready_windows_first_member_before_any_second() {
+        use core::future::Future;
+        use core::task::{Context, Waker};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        const WINDOWS: usize = COLD_DELIVERIES_PER_TURN as usize;
+        const MEMBERS: usize = 31;
+        const FD_BASE: RawFd = 100;
+        let config = ColdReadConfig {
+            qd_cap: WINDOWS,
+            overflow_cap: WINDOWS * MEMBERS,
+            ..ColdReadConfig::default()
+        };
+        let cold = shaped(WINDOWS, config);
+        let sequence = Arc::new(AtomicUsize::new(0));
+        let mut members = Vec::with_capacity(WINDOWS * MEMBERS);
+        for (window, fd) in (FD_BASE..).take(WINDOWS).enumerate() {
+            let file = TierFileId::new(500 + u32::try_from(window).expect("64 files"));
+            for _ in 0..MEMBERS {
+                let order = Arc::new(WakeOrder {
+                    sequence: Arc::clone(&sequence),
+                    at: AtomicUsize::new(usize::MAX),
+                });
+                let waker = Waker::from(Arc::clone(&order));
+                let mut wait = ask(&cold, fd, file, 0, 8);
+                let polled = core::pin::Pin::new(&mut wait)
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending();
+                assert!(polled, "nothing delivered yet");
+                members.push((window, order, wait));
+            }
+        }
+        let ops = drain_ops(&cold);
+        assert_eq!(ops.len(), WINDOWS, "one window of {MEMBERS} a file");
+        // The receipts land in the reverse of the requests' order, so a
+        // pass's order is the receipts', not the queue's.
+        let mut rank = [usize::MAX; WINDOWS];
+        for (received, window) in (0..WINDOWS).rev().enumerate() {
+            let fd = FD_BASE + RawFd::try_from(window).expect("64 descriptors");
+            let token = token_on(&ops, fd);
+            assert_eq!(cold.record_completion(token, Ok(()), 1), ColdReceipt::Recorded);
+            rank[window] = received;
+        }
+        let mut turns = Vec::new();
+        while cold.has_ready_delivery() {
+            assert!(turns.len() < MEMBERS, "every turn visits a member");
+            let mut turn = ColdTurn::begin();
+            turns.push(cold.deliver_ready(turn.delivery(), 2).delivered);
+        }
+        let per_turn = COLD_DELIVERIES_PER_TURN;
+        assert_eq!(turns, [per_turn; MEMBERS], "engagement: 64 visits a turn over 31 turns");
+        let mut seen: Vec<Vec<usize>> = (0..WINDOWS).map(|_| Vec::with_capacity(MEMBERS)).collect();
+        for (window, order, _) in &members {
+            seen[*window].push(order.at.load(Relaxed));
+        }
+        for wakes in &mut seen {
+            wakes.sort_unstable();
+        }
+        let first_turn = seen.iter().filter(|wakes| wakes[0] < WINDOWS).count();
+        assert_eq!(first_turn, WINDOWS, "the first turn's 64 visits reach every window once");
+        let last_first = seen.iter().map(|wakes| wakes[0]).max();
+        let first_second = seen.iter().map(|wakes| wakes[1]).min();
+        assert!(last_first < first_second, "a second member was visited before a first");
+        for (window, wakes) in seen.iter().enumerate() {
+            let passes: Vec<usize> =
+                (0..MEMBERS).map(|pass| pass * WINDOWS + rank[window]).collect();
+            assert_eq!(*wakes, passes, "window {window}: one member a pass, in receipt order");
+        }
+        for (_, _, wait) in members {
+            drop(block_on_ready(wait));
+        }
+        drop(ops);
+        assert_eq!(cold.reconcile(), Ok(()), "every value dropped: custody is back");
+    }
 }
