@@ -1272,6 +1272,17 @@ impl TieredTable {
         Ok(addr)
     }
 
+    /// Test support: one tiered placement as `append`, `append_extent`
+    /// and `relocate` make it — the tail allocation through the room
+    /// question's one classification, then the placement's seal-mark step
+    /// — with no record written: the placement A/B's judged shape.
+    #[cfg(feature = "test-support")]
+    pub fn place_for_bench(&mut self, len: usize) -> Option<LogicalAddr> {
+        let addr = self.space.alloc(len)?;
+        self.note_seal_mark(addr);
+        Some(addr)
+    }
+
     /// Seal-mark bookkeeping (ADR-0053 D2): the first record starting
     /// in each commit page is a legal ro-boundary landing point. One
     /// compare per allocation; stale marks (behind the boundary) trim

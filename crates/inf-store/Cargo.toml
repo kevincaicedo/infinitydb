@@ -131,5 +131,10 @@ harness = false
 test = false
 required-features = ["doc"]
 
+[[bench]]
+name = "placement"
+harness = false
+test = false
+
 [lints]
 workspace = true
