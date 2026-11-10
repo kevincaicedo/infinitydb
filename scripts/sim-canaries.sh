@@ -928,6 +928,13 @@ rows=(
   # ADR-0181 R2: a parked loop never holds ready cold delivery; planted, the park veto ignores
   # it, so an idle loop parks with a ready window.
   "inf_canary_cold_park_without_delivery crate-test inf-runtime test:reactor a_ready_cold_window_keeps_the_loop_from_parking parked with ready delivery"
+  # ADR-0181 R1: one host turn visits at most 64 cold-read members, one allowance a turn shared
+  # by every delivery call. Planted, each receipt renews the allowance; an orphaned member
+  # spends no unit; coldstorm begins a turn at each pump. m4-cold's dense and cancel-all legs
+  # count each round's visits independently of the host.
+  "inf_canary_cold_delivery_budget_per_cqe m4-cold cold-delivery-work-over --cold-leg dense"
+  "inf_canary_cold_cancel_uncharged m4-cold cold-delivery-work-over --cold-leg cancel-all"
+  "inf_canary_cold_turn_budget_per_pump m4-cold cold-delivery-work-over --cold-leg dense"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

@@ -119,6 +119,11 @@ rows=(
   # m4-cold's identity leg: the cold-read host's issuer placed 32 pairs before
   # the end of its 2^55, so the space runs out inside the run (ADR-0181 R4).
   "m4-cold --cold-leg identity --cold-identity-start 0x7fffffffffffe0 --verify-determinism"
+  # m4-cold's delivery legs: 31-member cohorts past a turn's 64 visits, 65
+  # orphaned members, and errored reads, each round's visits counted.
+  "m4-cold --cold-leg dense --verify-determinism"
+  "m4-cold --cold-leg cancel-all --verify-determinism"
+  "m4-cold --cold-leg errors --verify-determinism"
 )
 
 ran=0

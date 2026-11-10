@@ -345,6 +345,20 @@ impl ColdDeliveryBudget {
         true
     }
 
+    /// Canary: a receipt renews the allowance, `receipts` turns' worth.
+    #[cfg(inf_canary_cold_delivery_budget_per_cqe)]
+    fn renew(&mut self, receipts: u32) {
+        let renewed = COLD_DELIVERIES_PER_TURN.saturating_mul(receipts);
+        self.remaining = self.remaining.saturating_add(renewed);
+    }
+
+    /// Canary: an orphaned member's visit is given back.
+    #[cfg(inf_canary_cold_cancel_uncharged)]
+    fn refund(&mut self) {
+        self.remaining += 1;
+        self.spent -= 1;
+    }
+
     /// Member visits left this turn.
     #[must_use]
     pub fn remaining(&self) -> u32 {
@@ -630,6 +644,9 @@ struct ColdState {
     delay_hist: LogHistogram,
     /// Preparation's readiness, written by each event that changes it.
     readiness: ColdReadiness,
+    /// Canary: receipts recorded since the last delivery call.
+    #[cfg(inf_canary_cold_delivery_budget_per_cqe)]
+    renewals: u32,
     /// Per-file pin count over queued + in-flight + undropped `ColdDone`
     /// custody (§3.3). Entries exist only while nonzero.
     pins: HashMap<TierFileId, u32, BuildIntHasher>,
@@ -821,6 +838,8 @@ impl ColdReads {
                 pending_windows: 0,
                 delay_hist: LogHistogram::new(),
                 readiness: ColdReadiness::Idle,
+                #[cfg(inf_canary_cold_delivery_budget_per_cqe)]
+                renewals: 0,
                 pins: HashMap::default(),
                 counters: ColdReadCounters::default(),
                 qd_hist: LogHistogram::new(),
@@ -1221,6 +1240,11 @@ impl ColdReads {
         state.windows.insert(token, SharedWindow { buf, remaining: members as u32 });
         state.pending_members += members as u64;
         state.pending_windows += 1;
+        // Canary: the receipt renews the turn's delivery allowance.
+        #[cfg(inf_canary_cold_delivery_budget_per_cqe)]
+        {
+            state.renewals += 1;
+        }
         Self::link_ready(state, token);
         ColdReceipt::Recorded
     }
@@ -1240,6 +1264,8 @@ impl ColdReads {
         budget: &mut ColdDeliveryBudget,
         now_us: u64,
     ) -> ColdDeliveryProgress {
+        #[cfg(inf_canary_cold_delivery_budget_per_cqe)]
+        budget.renew(core::mem::take(&mut self.state.borrow_mut().renewals));
         let spent_before = budget.spent();
         let mut progress =
             ColdDeliveryProgress { delivered: 0, unclaimed: 0, state: ColdDeliveryState::Idle };
@@ -1253,6 +1279,9 @@ impl ColdReads {
             } else {
                 progress.unclaimed += 1;
                 self.state.borrow_mut().counters.unclaimed += 1;
+                // Canary: an orphaned member spends no unit.
+                #[cfg(inf_canary_cold_cancel_uncharged)]
+                budget.refund();
             }
         }
         let mut state = self.state.borrow_mut();

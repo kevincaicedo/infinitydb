@@ -25,7 +25,10 @@
 //! Every round records the values the harness received, the members
 //! orphaned at delivery (their waiter gone), the values the host delivered,
 //! and the device reads the drains issued, with the most one drain call
-//! issued: the delivery and preparation work the round did.
+//! issued: the delivery and preparation work the round did. A round is one
+//! host turn, so it visits at most a turn's allowance of members
+//! (`cold-delivery-work-over`, ADR-0181 R1): the values the harness saw
+//! delivered, by its own count, plus the members orphaned.
 //!
 //! That is the `storm` leg, the default. `--cold-leg` names the others
 //! (`legs.rs`): fixed shapes over files of known contents, each with the
@@ -46,6 +49,7 @@ use inf_log::{
     TIER_FRAME_BYTES, TIER_FRAME_DATA, TierIoMode, TierWriter, tier_extract, tier_frame_offset,
     tier_frame_span,
 };
+use inf_runtime::limits::COLD_DELIVERIES_PER_TURN;
 use inf_runtime::{
     BackendDriver, CellExecutor, ColdReads, ColdReceipt, ColdTurn, Completion, CompletionResult,
     RawFd, TierFileId, TokenClass, Wait,
@@ -165,9 +169,15 @@ impl ColdStormScenario {
 /// values the host delivered (the sum of its delivery calls' progress), and
 /// the device reads the round's drains issued, with the most one call
 /// issued.
+///
+/// `woken` is the legs' count of their waits woken by a delivery, which the
+/// harness reads on its own waker: a leg's consumer may poll rounds after
+/// its value was delivered, so its `received` is no delivery count. The
+/// storm polls every woken task within its round, so its `received` is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RoundCounts {
     pub received: u32,
+    pub woken: u32,
     pub orphaned: u32,
     pub delivered: u32,
     pub issued: u32,
@@ -177,10 +187,57 @@ pub struct RoundCounts {
 impl RoundCounts {
     /// The counts as one word, for a run's hash.
     fn fold(self) -> u64 {
-        let words =
-            [self.received, self.orphaned, self.delivered, self.issued, self.issued_drain_max];
+        let words = [
+            self.received,
+            self.woken,
+            self.orphaned,
+            self.delivered,
+            self.issued,
+            self.issued_drain_max,
+        ];
         words.iter().fold(0u64, |acc, &word| acc.rotate_left(13) ^ u64::from(word))
     }
+}
+
+/// OC2 (ADR-0181 R1): a round is one host turn, which visits at most
+/// `COLD_DELIVERIES_PER_TURN` members, live, cancelled or orphaned. A
+/// round's visits are the values the harness saw delivered (`seen`, its own
+/// count) plus the members the round's delivery calls orphaned; a round
+/// above the allowance is `cold-delivery-work-over`, as is a host whose own
+/// turn maximum is. Returns the most one round visited.
+fn judge_delivery_work(
+    report: &mut ColdStormReport,
+    cold: &ColdReads,
+    seen: impl Fn(&RoundCounts) -> u32,
+) -> u32 {
+    let mut most = 0;
+    let mut over: Vec<(usize, u32)> = Vec::new();
+    for (index, counts) in report.rounds.iter().enumerate() {
+        let visited = seen(counts) + counts.orphaned;
+        most = most.max(visited);
+        if visited > COLD_DELIVERIES_PER_TURN && over.len() < 4 {
+            over.push((index + 1, visited));
+        }
+    }
+    for (round, visited) in over {
+        report.violations.push(format!(
+            "cold-delivery-work-over: round {round} visited {visited} members; a turn visits at \
+             most {COLD_DELIVERIES_PER_TURN}"
+        ));
+    }
+    let turn_max = cold.counters().delivery_work_turn_max;
+    if turn_max > COLD_DELIVERIES_PER_TURN {
+        report
+            .violations
+            .push(format!("cold-delivery-work-over: the host spent {turn_max} visits in one turn"));
+    }
+    let (members, windows) = cold.delivery_pending();
+    if (members, windows) != (0, 0) {
+        report.violations.push(format!(
+            "cold-delivery-pending: {members} member(s) of {windows} window(s) undelivered at rest"
+        ));
+    }
+    most
 }
 
 #[derive(Debug, Default)]
@@ -920,6 +977,11 @@ fn unlink_drained(world: &mut World) {
 /// (the plane's completion-dispatch role) and serve the round's delivery
 /// from its one turn, which both pumps share (ADR-0181 R2).
 fn pump(world: &mut World, recv_pool: &mut BufferPool, turn: &mut ColdTurn) {
+    // Canary: the harness begins a turn at each pump, not each round.
+    #[cfg(inf_canary_cold_turn_budget_per_pump)]
+    {
+        *turn = ColdTurn::begin();
+    }
     // S10: the drain admits queued intents (merge + QD cap + deficit)
     // into the same submit the eager path always rode.
     let cold = world.cold.clone();
@@ -937,10 +999,12 @@ fn pump(world: &mut World, recv_pool: &mut BufferPool, turn: &mut ColdTurn) {
 }
 
 /// The round's delivery service on its turn's allowance (the plane's
-/// `before_execute` role): the values delivered, counted.
+/// `before_execute` role): the values delivered and the members orphaned,
+/// counted.
 fn deliver(world: &mut World, turn: &mut ColdTurn) {
     let progress = world.cold.deliver_ready(turn.delivery(), world.now_us);
     world.counts.delivered += progress.delivered;
+    world.counts.orphaned += progress.unclaimed;
 }
 
 /// Records one `TierRead` completion, its outcome as the dispatch decides
@@ -967,11 +1031,17 @@ fn begin_round(world: &mut World) -> u64 {
     world.cold.counters().unclaimed
 }
 
-/// Closes the round's counts: its orphaned members are the `unclaimed`
-/// the host counted since `unclaimed_before`.
+/// Closes the round's counts: its orphaned members, the sum of its delivery
+/// calls' `unclaimed`, must be the `unclaimed` the host counted since
+/// `unclaimed_before` (a wiring check).
 fn end_round(world: &mut World, unclaimed_before: u64) {
-    let orphaned = world.cold.counters().unclaimed - unclaimed_before;
-    world.counts.orphaned = u32::try_from(orphaned).expect("a round's members fit u32");
+    let counted = world.cold.counters().unclaimed - unclaimed_before;
+    if counted != u64::from(world.counts.orphaned) {
+        let orphaned = world.counts.orphaned;
+        world.violation(format!(
+            "the round's {orphaned} orphaned members, the host counted {counted}"
+        ));
+    }
     let counts = world.counts;
     world.report.rounds.push(counts);
 }
@@ -1107,6 +1177,8 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
     if let Err(leak) = world.cold.reconcile() {
         world.report.violations.push(format!("custody leak: {leak:?}"));
     }
+    let cold = world.cold.clone();
+    judge_delivery_work(&mut world.report, &cold, |counts| counts.received);
     let counters = world.cold.counters();
     world.report.merged_waiters = counters.merged_waiters;
     world.report.queue_high_water = counters.queue_depth_high_water;
