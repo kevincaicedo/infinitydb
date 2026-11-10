@@ -35,7 +35,12 @@
 //!   lie on 256 files, or on one file at a stride of one pool buffer plus
 //!   one byte, so no two join.
 //! - `reactor-iteration`: one iteration of the cell loop over a plane that
-//!   holds no cold host and does nothing at its steps.
+//!   holds no cold host and does nothing at its steps: the plane's default
+//!   `before_execute`, A of the hook's row.
+//! - `reactor-iteration-hook`: the same iteration over a plane whose
+//!   `before_execute` is the server's: its cold host read under a short
+//!   borrow of its tier slot, which holds no tiered namespace, B of the
+//!   hook's row (`≤ 10` instructions over A an iteration).
 //!
 //! Beside them, the rate legs (`cold_path/rates.rs`), reported and never
 //! judged: one container operation a step, on the capped map and slab B
@@ -75,12 +80,14 @@ mod gate;
 #[path = "cold_path/rates.rs"]
 mod rates;
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::hint::black_box;
 use std::io;
 use std::pin::Pin;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use inf_alloc::{AlignedPool, BufferPool};
@@ -119,11 +126,12 @@ enum Leg {
     Cohort { depth: usize, background: usize },
     Deep { stride: bool },
     ReactorIteration,
+    ReactorHook,
     Rate(RateLeg),
 }
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 60] = [
+const LEGS: [(&str, Leg, u8); 62] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -146,6 +154,8 @@ const LEGS: [(&str, Leg, u8); 60] = [
     ("deep-stride-plus-one", Leg::Deep { stride: true }, 1),
     ("reactor-iteration", Leg::ReactorIteration, 0),
     ("reactor-iteration-plus-one", Leg::ReactorIteration, 1),
+    ("reactor-iteration-hook", Leg::ReactorHook, 0),
+    ("reactor-iteration-hook-plus-one", Leg::ReactorHook, 1),
     ("harness", Leg::Rate(RateLeg::Harness), 0),
     ("harness-plus-one", Leg::Rate(RateLeg::Harness), 1),
     ("map-get-0", Leg::Rate(RateLeg::MapGet { depth: 0 }), 0),
@@ -377,7 +387,7 @@ fn drive_host<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
         | Leg::Singleton { depth, background }
         | Leg::Cohort { depth, background } => (depth, background),
         Leg::Deep { .. } => (1, 0),
-        Leg::ReactorIteration | Leg::Rate(_) => {
+        Leg::ReactorIteration | Leg::ReactorHook | Leg::Rate(_) => {
             unreachable!("a reactor or rate leg drives its own state")
         }
     };
@@ -402,7 +412,7 @@ fn drive_host<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
             Leg::Singleton { .. } => step_singleton(cell),
             Leg::Cohort { .. } => step_cohort(cell),
             Leg::Deep { stride } => step_deep(cell, stride, op),
-            Leg::ReactorIteration | Leg::Rate(_) => {
+            Leg::ReactorIteration | Leg::ReactorHook | Leg::Rate(_) => {
                 unreachable!("a reactor or rate leg drives its own state")
             }
         };
@@ -425,7 +435,7 @@ fn engaged(leg: Leg, cell: &HostCell, ops: u64) {
             (ops, ops * members, ops * (members - 1), 0, ops * u64::from(background > 0))
         }
         Leg::Deep { .. } => (ops, ops, 0, 0, 0),
-        Leg::ReactorIteration | Leg::Rate(_) => {
+        Leg::ReactorIteration | Leg::ReactorHook | Leg::Rate(_) => {
             unreachable!("a reactor or rate leg drives its own state")
         }
     };
@@ -485,9 +495,43 @@ impl CellPlane for IdlePlane {
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
 }
 
-/// Drives `ops` iterations of the cell loop with `NOPS` planted per op.
+/// The server's tier slot as its hook reads it: the cell's tiered state,
+/// absent on a cell that never created a tiered namespace, and in it the
+/// cold host.
+struct TierSlot {
+    cold: Option<inf_runtime::ColdReads>,
+}
+
+/// The state the server's planes share, as the hook reaches its tier slot.
+struct SharedTier {
+    tier: RefCell<Option<TierSlot>>,
+}
+
+/// The hook leg's plane: the server's `before_execute` over a cell with no
+/// tiered namespace, nothing at any other step.
+struct HookPlane {
+    shared: Rc<SharedTier>,
+}
+
+impl CellPlane for HookPlane {
+    fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
+        panic!("the reactor leg reaps nothing: {c:?}");
+    }
+    fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
+        let cold = self.shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
+        if let Some(cold) = cold {
+            let now_us = cx.now.as_micros();
+            let _ = cold.deliver_ready(cx.cold_delivery_budget(), now_us);
+        }
+    }
+    fn parse_execute(&mut self, _cx: &mut LoopCx<'_>) {}
+    fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+}
+
+/// Drives `ops` iterations of the cell loop over `plane` with `NOPS`
+/// planted per op.
 #[inline(never)]
-fn drive_loop<const NOPS: u8>(ops: u64) -> u64 {
+fn drive_loop<const NOPS: u8, P: CellPlane>(ops: u64, mut plane: P) -> u64 {
     let (census, serve_mark) = CapCensus::new(CellId(0));
     let timers = TimerSet::build(LOOP_OWNERS, &census).expect("the leg's timer set");
     // Spinning forever: the loop polls every entry and never parks.
@@ -495,7 +539,6 @@ fn drive_loop<const NOPS: u8>(ops: u64) -> u64 {
     let pool = BufferPool::new(1, 1024);
     let clock = VirtualClock::new(Nanos(1));
     let mut lp = CellLoop::new(IdleDriver, clock, pool, config, serve_mark, timers);
-    let mut plane = IdlePlane;
     let lp = black_box(&mut lp);
     let mut accumulator = 0u64;
     for _ in 0..ops {
@@ -509,6 +552,11 @@ fn drive_loop<const NOPS: u8>(ops: u64) -> u64 {
     accumulator.wrapping_add(lp.executor().live_tasks() as u64)
 }
 
+/// The hook leg's plane over a cell with no tiered namespace.
+fn hook_plane() -> HookPlane {
+    HookPlane { shared: Rc::new(SharedTier { tier: RefCell::new(None) }) }
+}
+
 fn main() -> ExitCode {
     let args = match parse() {
         Ok(args) => args,
@@ -518,8 +566,10 @@ fn main() -> ExitCode {
         }
     };
     let result = match (args.leg, args.nops) {
-        (Leg::ReactorIteration, 0) => drive_loop::<0>(args.ops),
-        (Leg::ReactorIteration, _) => drive_loop::<1>(args.ops),
+        (Leg::ReactorIteration, 0) => drive_loop::<0, _>(args.ops, IdlePlane),
+        (Leg::ReactorIteration, _) => drive_loop::<1, _>(args.ops, IdlePlane),
+        (Leg::ReactorHook, 0) => drive_loop::<0, _>(args.ops, hook_plane()),
+        (Leg::ReactorHook, _) => drive_loop::<1, _>(args.ops, hook_plane()),
         (Leg::Rate(leg), 0) => rates::drive::<0>(leg, args.ops),
         (Leg::Rate(leg), _) => rates::drive::<1>(leg, args.ops),
         (leg, 0) => drive_host::<0>(leg, args.ops),
