@@ -111,6 +111,10 @@ struct Prospect {
     /// The record's start, relative to the life origin: the tail past
     /// the hole.
     start_rel: u64,
+    /// The record's start address when its end lies inside the space, else
+    /// `None`: the 48-bit end check, which `classify` answers `End` for, so a
+    /// placement takes the start that check admitted.
+    start: Option<LogicalAddr>,
     /// The committed top the allocation needs — after the hole and after
     /// the record — relative to the origin, page-aligned, never below
     /// the committed top of today.
@@ -563,7 +567,8 @@ impl AddressSpace {
         let hole = if ring_offset + len > ring { ring - ring_offset } else { 0 };
         let start_rel = rel_tail + hole;
         let top_rel = self.page_ceil(start_rel + len).max(self.commit_top_rel);
-        Prospect { len, hole, start_rel, top_rel }
+        let start = self.start_inside(start_rel, len);
+        Prospect { len, hole, start_rel, start, top_rel }
     }
 
     /// [`Room::Fits`]'s predicate: the committed window the prospect
@@ -574,16 +579,15 @@ impl AddressSpace {
         prospect.top_rel - self.commit_floor_rel <= self.window_limit
     }
 
-    /// The 48-bit end check, in one place for `classify`, which
-    /// [`alloc`](Self::alloc), [`room`](Self::room) and
-    /// [`stall_target`](Self::stall_target) match: the prospect's start
-    /// address when the record's end lies inside the space, else `None` —
-    /// the space is monotonic for a namespace's whole existence and never
-    /// wraps.
+    /// The 48-bit end check, in one place for [`prospect`](Self::prospect),
+    /// whose `start` `classify` answers `End` for: the start address of a
+    /// record of `len` bytes at `start_rel` when its end lies inside the
+    /// space, else `None` — the space is monotonic for a namespace's whole
+    /// existence and never wraps.
     #[inline]
-    fn start_inside(&self, prospect: Prospect) -> Option<LogicalAddr> {
-        let start = LogicalAddr::from_raw(self.life_origin.checked_add(prospect.start_rel)?)?;
-        start.advanced(prospect.len)?;
+    fn start_inside(&self, start_rel: u64, len: u64) -> Option<LogicalAddr> {
+        let start = LogicalAddr::from_raw(self.life_origin.checked_add(start_rel)?)?;
+        start.advanced(len)?;
         Some(start)
     }
 
@@ -617,7 +621,10 @@ impl AddressSpace {
     /// [`room`](Self::room), [`alloc`](Self::alloc) and
     /// [`stall_target`](Self::stall_target) match. A record longer than the
     /// window is `End` before any need is computed, so every need below is
-    /// one of a record the window holds. An answer that would push a hole
+    /// one of a record the window holds; the length is asked only of a
+    /// prospect that does not fit, since one whose pages fit the window is
+    /// no longer than it (its start is at or above the committed floor, the
+    /// tail being at or above the head). An answer that would push a hole
     /// mark — a placement past a ring-top hole, or a pad — while the marks
     /// are full is `Demote` of the front hole's end instead: the `flushed`
     /// value that pops it, above the head and at or below the tail. The
@@ -629,7 +636,11 @@ impl AddressSpace {
     /// most the window); in case (b) to the next commit-page boundary,
     /// which commits nothing.
     fn classify(&mut self, prospect: Prospect) -> Room {
-        if self.start_inside(prospect).is_none() || prospect.len > self.window_limit {
+        if prospect.start.is_none() {
+            return Room::End;
+        }
+        let fits = self.fits(prospect);
+        if !fits && prospect.len > self.window_limit {
             return Room::End;
         }
         if prospect.hole > 0
@@ -637,7 +648,7 @@ impl AddressSpace {
         {
             return Room::Demote(front_end);
         }
-        if self.fits(prospect) {
+        if fits {
             return Room::Fits;
         }
         let rel_tail = self.tail - self.life_origin;
@@ -706,16 +717,18 @@ impl AddressSpace {
     pub fn alloc(&mut self, len: usize) -> Option<LogicalAddr> {
         let prospect = self.prospect(len as u64);
         match self.classify(prospect) {
-            Room::Fits => Some(self.place(prospect)),
+            Room::Fits => {
+                let start = prospect.start.expect("a prospect classified to fit starts inside");
+                Some(self.place(prospect, start))
+            }
             Room::Demote(_) | Room::Pad(_) | Room::End => None,
         }
     }
 
-    /// Places a prospect `classify` answered `Fits` for, in this step: its
-    /// start lies inside the space, its pages fit the window, and a hole it
-    /// makes has a mark's room.
-    fn place(&mut self, prospect: Prospect) -> LogicalAddr {
-        let addr = self.addr_at(prospect.start_rel);
+    /// Places a prospect `classify` answered `Fits` for, in this step, at
+    /// `addr`, the start its 48-bit end check admitted: its pages fit the
+    /// window, and a hole it makes has a mark's room.
+    fn place(&mut self, prospect: Prospect, addr: LogicalAddr) -> LogicalAddr {
         if prospect.hole > 0 {
             self.push_hole(Hole { start: self.tail, len: prospect.hole });
             self.counters.seal_holes += 1;
