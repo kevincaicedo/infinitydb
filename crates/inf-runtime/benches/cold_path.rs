@@ -41,6 +41,12 @@
 //!   `before_execute` is the server's: its cold host read under a short
 //!   borrow of its tier slot, which holds no tiered namespace, B of the
 //!   hook's row (`≤ 10` instructions over A an iteration).
+//! - `reactor-iteration-server`, `reactor-iteration-server-hook`: the same
+//!   pair over planes that both hold the hook's tier slot and whose
+//!   `parse_execute` hands the loop context to a step out of line, as every
+//!   server step does: the context escapes, so the loop's stores into it
+//!   stay in both legs, as on a server cell, and the pair differs in the
+//!   hook alone.
 //!
 //! Beside them, the rate legs (`cold_path/rates.rs`), reported and never
 //! judged: one container operation a step, on the capped map and slab B
@@ -125,13 +131,26 @@ enum Leg {
     Singleton { depth: usize, background: usize },
     Cohort { depth: usize, background: usize },
     Deep { stride: bool },
-    ReactorIteration,
-    ReactorHook,
+    Reactor(ReactorPlane),
     Rate(RateLeg),
 }
 
+/// A reactor leg's plane: the hook's row is read on two pairs of them.
+#[derive(Clone, Copy)]
+enum ReactorPlane {
+    /// No state and nothing at any step: the default `before_execute`.
+    Idle,
+    /// The server's `before_execute`, nothing at any other step.
+    Hook,
+    /// The hook's tier slot and the server's out-of-line steps, the
+    /// default `before_execute`.
+    Server,
+    /// [`ReactorPlane::Server`] with the server's `before_execute`.
+    ServerHook,
+}
+
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 62] = [
+const LEGS: [(&str, Leg, u8); 66] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -152,10 +171,14 @@ const LEGS: [(&str, Leg, u8); 62] = [
     ("deep-files-plus-one", Leg::Deep { stride: false }, 1),
     ("deep-stride", Leg::Deep { stride: true }, 0),
     ("deep-stride-plus-one", Leg::Deep { stride: true }, 1),
-    ("reactor-iteration", Leg::ReactorIteration, 0),
-    ("reactor-iteration-plus-one", Leg::ReactorIteration, 1),
-    ("reactor-iteration-hook", Leg::ReactorHook, 0),
-    ("reactor-iteration-hook-plus-one", Leg::ReactorHook, 1),
+    ("reactor-iteration", Leg::Reactor(ReactorPlane::Idle), 0),
+    ("reactor-iteration-plus-one", Leg::Reactor(ReactorPlane::Idle), 1),
+    ("reactor-iteration-hook", Leg::Reactor(ReactorPlane::Hook), 0),
+    ("reactor-iteration-hook-plus-one", Leg::Reactor(ReactorPlane::Hook), 1),
+    ("reactor-iteration-server", Leg::Reactor(ReactorPlane::Server), 0),
+    ("reactor-iteration-server-plus-one", Leg::Reactor(ReactorPlane::Server), 1),
+    ("reactor-iteration-server-hook", Leg::Reactor(ReactorPlane::ServerHook), 0),
+    ("reactor-iteration-server-hook-plus-one", Leg::Reactor(ReactorPlane::ServerHook), 1),
     ("harness", Leg::Rate(RateLeg::Harness), 0),
     ("harness-plus-one", Leg::Rate(RateLeg::Harness), 1),
     ("map-get-0", Leg::Rate(RateLeg::MapGet { depth: 0 }), 0),
@@ -387,7 +410,7 @@ fn drive_host<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
         | Leg::Singleton { depth, background }
         | Leg::Cohort { depth, background } => (depth, background),
         Leg::Deep { .. } => (1, 0),
-        Leg::ReactorIteration | Leg::ReactorHook | Leg::Rate(_) => {
+        Leg::Reactor(_) | Leg::Rate(_) => {
             unreachable!("a reactor or rate leg drives its own state")
         }
     };
@@ -412,7 +435,7 @@ fn drive_host<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
             Leg::Singleton { .. } => step_singleton(cell),
             Leg::Cohort { .. } => step_cohort(cell),
             Leg::Deep { stride } => step_deep(cell, stride, op),
-            Leg::ReactorIteration | Leg::ReactorHook | Leg::Rate(_) => {
+            Leg::Reactor(_) | Leg::Rate(_) => {
                 unreachable!("a reactor or rate leg drives its own state")
             }
         };
@@ -435,7 +458,7 @@ fn engaged(leg: Leg, cell: &HostCell, ops: u64) {
             (ops, ops * members, ops * (members - 1), 0, ops * u64::from(background > 0))
         }
         Leg::Deep { .. } => (ops, ops, 0, 0, 0),
-        Leg::ReactorIteration | Leg::ReactorHook | Leg::Rate(_) => {
+        Leg::Reactor(_) | Leg::Rate(_) => {
             unreachable!("a reactor or rate leg drives its own state")
         }
     };
@@ -507,13 +530,14 @@ struct SharedTier {
     tier: RefCell<Option<TierSlot>>,
 }
 
-/// The hook leg's plane: the server's `before_execute` over a cell with no
-/// tiered namespace, nothing at any other step.
-struct HookPlane {
+/// The hook legs' plane: the server's `before_execute` over a cell with no
+/// tiered namespace. `SERVER_STEPS` false, nothing at any other step;
+/// true, its `parse_execute` is [`server_steps`].
+struct HookPlane<const SERVER_STEPS: bool> {
     shared: Rc<SharedTier>,
 }
 
-impl CellPlane for HookPlane {
+impl<const SERVER_STEPS: bool> CellPlane for HookPlane<SERVER_STEPS> {
     fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
         panic!("the reactor leg reaps nothing: {c:?}");
     }
@@ -524,8 +548,38 @@ impl CellPlane for HookPlane {
             let _ = cold.deliver_ready(cx.cold_delivery_budget(), now_us);
         }
     }
-    fn parse_execute(&mut self, _cx: &mut LoopCx<'_>) {}
+    fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
+        if SERVER_STEPS {
+            server_steps(&self.shared, cx);
+        }
+    }
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+}
+
+/// The server-shaped control: [`HookPlane`]'s state and its server steps
+/// with the plane's default `before_execute`, so the pair differs in the
+/// hook alone.
+struct ServerShapedPlane {
+    shared: Rc<SharedTier>,
+}
+
+impl CellPlane for ServerShapedPlane {
+    fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
+        panic!("the reactor leg reaps nothing: {c:?}");
+    }
+    fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
+        server_steps(&self.shared, cx);
+    }
+    fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+}
+
+/// A server step as the loop sees it: out of line and handed the loop
+/// context, which therefore escapes the iteration, as it does on a server
+/// cell, whose `fabric_in`, `parse_execute` and `respond` each take it.
+#[inline(never)]
+fn server_steps(shared: &SharedTier, cx: &mut LoopCx<'_>) {
+    black_box(shared);
+    black_box(cx);
 }
 
 /// Drives `ops` iterations of the cell loop over `plane` with `NOPS`
@@ -552,9 +606,25 @@ fn drive_loop<const NOPS: u8, P: CellPlane>(ops: u64, mut plane: P) -> u64 {
     accumulator.wrapping_add(lp.executor().live_tasks() as u64)
 }
 
-/// The hook leg's plane over a cell with no tiered namespace.
-fn hook_plane() -> HookPlane {
-    HookPlane { shared: Rc::new(SharedTier { tier: RefCell::new(None) }) }
+/// A cell's shared state with no tiered namespace.
+fn shared_tier() -> Rc<SharedTier> {
+    Rc::new(SharedTier { tier: RefCell::new(None) })
+}
+
+/// Drives `ops` iterations of a reactor leg over its plane.
+fn drive_reactor<const NOPS: u8>(plane: ReactorPlane, ops: u64) -> u64 {
+    match plane {
+        ReactorPlane::Idle => drive_loop::<NOPS, _>(ops, IdlePlane),
+        ReactorPlane::Hook => {
+            drive_loop::<NOPS, _>(ops, HookPlane::<false> { shared: shared_tier() })
+        }
+        ReactorPlane::Server => {
+            drive_loop::<NOPS, _>(ops, ServerShapedPlane { shared: shared_tier() })
+        }
+        ReactorPlane::ServerHook => {
+            drive_loop::<NOPS, _>(ops, HookPlane::<true> { shared: shared_tier() })
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -566,10 +636,8 @@ fn main() -> ExitCode {
         }
     };
     let result = match (args.leg, args.nops) {
-        (Leg::ReactorIteration, 0) => drive_loop::<0, _>(args.ops, IdlePlane),
-        (Leg::ReactorIteration, _) => drive_loop::<1, _>(args.ops, IdlePlane),
-        (Leg::ReactorHook, 0) => drive_loop::<0, _>(args.ops, hook_plane()),
-        (Leg::ReactorHook, _) => drive_loop::<1, _>(args.ops, hook_plane()),
+        (Leg::Reactor(plane), 0) => drive_reactor::<0>(plane, args.ops),
+        (Leg::Reactor(plane), _) => drive_reactor::<1>(plane, args.ops),
         (Leg::Rate(leg), 0) => rates::drive::<0>(leg, args.ops),
         (Leg::Rate(leg), _) => rates::drive::<1>(leg, args.ops),
         (leg, 0) => drive_host::<0>(leg, args.ops),
