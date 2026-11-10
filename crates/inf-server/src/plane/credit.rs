@@ -57,11 +57,15 @@ impl fmt::Display for MeshConfigRefused {
             MeshConfigRefused::RingNotPowerOfTwo { ring_capacity } => {
                 write!(f, "ring_capacity {ring_capacity} is not a power of two")
             }
+            // No bound is printed: a figure computed here would be a second
+            // statement of the fabric's ring relation, and the message would
+            // name a refused count as the bound once the relation moves
+            // (ADR-0192 D5). The function named is the relation.
             MeshConfigRefused::NoReplyHeadroom { ring_capacity, data_credits } => write!(
                 f,
                 "ring_capacity {ring_capacity} has no reply headroom for data_credits \
-                 {data_credits}: at most {}",
-                ring_capacity / 2
+                 {data_credits}: the fabric's ring relation (MeshConfig::has_reply_headroom) \
+                 refuses the pair"
             ),
         }
     }
