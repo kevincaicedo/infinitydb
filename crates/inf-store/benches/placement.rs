@@ -173,16 +173,11 @@ fn table_place(table: &mut TieredTable, len: usize) -> Option<LogicalAddr> {
     table.place_for_bench(len)
 }
 
-/// One placement on the parent's.
+/// One placement on the parent's table, called as the table's is: one
+/// table, its tail allocation and its mark step.
 #[inline(never)]
-fn parent_place(
-    space: &mut parent::Space,
-    marks: &mut parent::Marks,
-    len: usize,
-) -> Option<LogicalAddr> {
-    let addr = space.alloc(len)?;
-    marks.note(space, addr);
-    Some(addr)
+fn parent_place(table: &mut parent::Table, len: usize) -> Option<LogicalAddr> {
+    table.place(len)
 }
 
 /// What a leg's engagement reads after its loop.
@@ -194,52 +189,46 @@ struct Engagement {
     seal_marks: u64,
 }
 
-/// A version's placement, its release to the tail and its engagement.
+/// A version's placement, its release to the tail and its engagement. Each
+/// version's table is the placer itself, so the op passes its pointer to the
+/// placement function unchanged on every version.
 trait Placer {
     fn place(&mut self, len: usize) -> Option<LogicalAddr>;
     fn release(&mut self);
-    fn engagement(&self) -> Engagement;
+    fn engagement(&self, census: &CapCensus) -> Engagement;
 }
 
-struct Table {
-    table: TieredTable,
-    census: Rc<CapCensus>,
+/// The table as built for `shape`.
+fn table(shape: Shape, census: &Rc<CapCensus>) -> TieredTable {
+    let (ring, window) = shape.geometry();
+    let config = AddressSpaceConfig {
+        reserve_bytes: ring as usize,
+        page_bytes: MIB as usize,
+        life_origin: LogicalAddr::ZERO,
+    };
+    // The window is the budget and one slice of one commit page.
+    let demotion = DemotionConfig::for_budget(window - MIB, MIB);
+    TieredTable::new(config, demotion, 64, KeyHasher::default(), census).expect("the ring reserves")
 }
 
-impl Table {
-    fn new(shape: Shape, census: &Rc<CapCensus>) -> Table {
-        let (ring, window) = shape.geometry();
-        let config = AddressSpaceConfig {
-            reserve_bytes: ring as usize,
-            page_bytes: MIB as usize,
-            life_origin: LogicalAddr::ZERO,
-        };
-        // The window is the budget and one slice of one commit page.
-        let demotion = DemotionConfig::for_budget(window - MIB, MIB);
-        let table = TieredTable::new(config, demotion, 64, KeyHasher::default(), census)
-            .expect("the ring reserves");
-        Table { table, census: Rc::clone(census) }
-    }
-}
-
-impl Placer for Table {
+impl Placer for TieredTable {
     #[inline]
     fn place(&mut self, len: usize) -> Option<LogicalAddr> {
-        table_place(&mut self.table, len)
+        table_place(self, len)
     }
 
     /// Seal, flush and release to the tail, as demotion's slices would.
     fn release(&mut self) {
-        let space = self.table.space_mut();
+        let space = self.space_mut();
         let tail = space.tail();
         space.advance_ro_boundary(tail);
         space.advance_flushed(tail);
         space.advance_head(tail);
     }
 
-    fn engagement(&self) -> Engagement {
-        let counters = self.table.space().counters();
-        let seal_marks = self.census.row("seal-marks").map_or(0, |row| row.high_water);
+    fn engagement(&self, census: &CapCensus) -> Engagement {
+        let counters = self.space().counters();
+        let seal_marks = census.row("seal-marks").map_or(0, |row| row.high_water);
         Engagement {
             allocs: counters.tail_allocs,
             commits: counters.region_commit_pages,
@@ -249,32 +238,19 @@ impl Placer for Table {
     }
 }
 
-struct Parent {
-    space: parent::Space,
-    marks: parent::Marks,
-}
-
-impl Parent {
-    fn new(shape: Shape) -> Parent {
-        let (ring, window) = shape.geometry();
-        let space = parent::Space::new(ring as usize, MIB as usize, window);
-        Parent { space, marks: parent::Marks::new() }
-    }
-}
-
-impl Placer for Parent {
+impl Placer for parent::Table {
     #[inline]
     fn place(&mut self, len: usize) -> Option<LogicalAddr> {
-        parent_place(&mut self.space, &mut self.marks, len)
+        parent_place(self, len)
     }
 
     fn release(&mut self) {
-        self.space.release_to_tail();
+        self.release_to_tail();
     }
 
-    fn engagement(&self) -> Engagement {
-        let (allocs, commits, holes) = self.space.counts();
-        Engagement { allocs, commits, holes, seal_marks: self.marks.len() as u64 }
+    fn engagement(&self, _census: &CapCensus) -> Engagement {
+        let (allocs, commits, holes, marks) = self.counts();
+        Engagement { allocs, commits, holes, seal_marks: marks as u64 }
     }
 }
 
@@ -294,7 +270,12 @@ fn fill<P: Placer>(placer: &mut P, len: usize) -> Option<LogicalAddr> {
 }
 
 /// Drives `ops` ops of `shape` and checks the leg's engagement.
-fn drive<P: Placer, const NOPS: u8>(placer: &mut P, shape: Shape, ops: u64) -> u64 {
+fn drive<P: Placer, const NOPS: u8>(
+    placer: &mut P,
+    shape: Shape,
+    ops: u64,
+    census: &CapCensus,
+) -> u64 {
     let len = black_box(shape.len());
     let mut accumulator = 0u64;
     let placed = match shape {
@@ -340,7 +321,7 @@ fn drive<P: Placer, const NOPS: u8>(placer: &mut P, shape: Shape, ops: u64) -> u
             filled
         }
     };
-    let engagement = placer.engagement();
+    let engagement = placer.engagement(census);
     assert_eq!(engagement.allocs, placed, "engagement: one allocation a placement");
     if ops > 0 {
         match shape {
@@ -362,20 +343,24 @@ fn drive<P: Placer, const NOPS: u8>(placer: &mut P, shape: Shape, ops: u64) -> u
     accumulator
 }
 
-fn run_leg<P: Placer>(placer: &mut P, shape: Shape, nops: u8, ops: u64) -> u64 {
+fn run_leg<P: Placer>(placer: &mut P, shape: Shape, nops: u8, ops: u64, census: &CapCensus) -> u64 {
     match nops {
-        0 => drive::<P, 0>(placer, shape, ops),
-        1 => drive::<P, 1>(placer, shape, ops),
-        3 => drive::<P, 3>(placer, shape, ops),
-        7 => drive::<P, 7>(placer, shape, ops),
+        0 => drive::<P, 0>(placer, shape, ops, census),
+        1 => drive::<P, 1>(placer, shape, ops, census),
+        3 => drive::<P, 3>(placer, shape, ops, census),
+        7 => drive::<P, 7>(placer, shape, ops, census),
         other => panic!("no leg plants {other}"),
     }
 }
 
 fn run(version: Version, shape: Shape, nops: u8, ops: u64, census: &Rc<CapCensus>) -> u64 {
     match version {
-        Version::Table => run_leg(&mut Table::new(shape, census), shape, nops, ops),
-        Version::Parent => run_leg(&mut Parent::new(shape), shape, nops, ops),
+        Version::Table => run_leg(&mut table(shape, census), shape, nops, ops, census),
+        Version::Parent => {
+            let (ring, window) = shape.geometry();
+            let mut parent = parent::Table::new(ring as usize, MIB as usize, window);
+            run_leg(&mut parent, shape, nops, ops, census)
+        }
     }
 }
 

@@ -2,8 +2,10 @@
 //! address space's tail allocation (its one prospect, the window's fit and
 //! the 48-bit end, the ring-top hole's mark on an unbounded list) and the
 //! table's seal-mark step (one mark per commit page by a division, on an
-//! unbounded list). Only what one placement and the leg's release run is
-//! here; it is deleted with this module when the verdict is recorded.
+//! unbounded list), on one table that holds both, as the parent's table did,
+//! so that its placement is called as the table's is. Only what one placement
+//! and the leg's release run is here; it is deleted with this module when the
+//! verdict is recorded.
 use std::collections::VecDeque;
 
 use inf_alloc::{Region, RegionConfig};
@@ -210,20 +212,53 @@ impl Space {
     }
 }
 
+/// The parent's table: the space and its seal marks.
+pub struct Table {
+    space: Space,
+    marks: Marks,
+}
+
+impl Table {
+    pub fn new(ring_bytes: usize, page_bytes: usize, window: u64) -> Table {
+        Table { space: Space::new(ring_bytes, page_bytes, window), marks: Marks::new() }
+    }
+
+    /// One placement as the parent's table made it: the tail allocation,
+    /// then its seal-mark step.
+    #[inline]
+    pub fn place(&mut self, len: usize) -> Option<LogicalAddr> {
+        let addr = self.space.alloc(len)?;
+        self.marks.note(&self.space, addr);
+        Some(addr)
+    }
+
+    /// The leg's release to the tail.
+    pub fn release_to_tail(&mut self) {
+        self.space.release_to_tail();
+    }
+
+    /// Engagement: allocations served, pages committed, ring-top holes made
+    /// and the seal marks held.
+    pub fn counts(&self) -> (u64, u64, u64, usize) {
+        let (allocs, commits, holes) = self.space.counts();
+        (allocs, commits, holes, self.marks.len())
+    }
+}
+
 /// The parent's seal marks: one per commit page, on an unbounded list.
-pub struct Marks {
+struct Marks {
     seal_marks: VecDeque<LogicalAddr>,
     last_mark_page: u64,
 }
 
 impl Marks {
-    pub fn new() -> Marks {
+    fn new() -> Marks {
         Marks { seal_marks: VecDeque::new(), last_mark_page: u64::MAX }
     }
 
     /// The parent's `note_seal_mark`, out of line, as the table's is.
     #[inline(never)]
-    pub fn note(&mut self, space: &Space, addr: LogicalAddr) {
+    fn note(&mut self, space: &Space, addr: LogicalAddr) {
         let page = addr.offset_from(space.life_origin()) / space.page_bytes();
         if page != self.last_mark_page {
             let ro = space.ro_boundary();
@@ -236,7 +271,7 @@ impl Marks {
     }
 
     /// Engagement: the marks held.
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.seal_marks.len()
     }
 }
