@@ -47,6 +47,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         });
         true
     }
+
+    /// The turn's cold delivery (ADR-0181 R1, R2) from the iteration's
+    /// allowance: the cold handle is cloned under a short tier borrow, which
+    /// is released before any gate wake or orphan cleanup runs. Out of line,
+    /// so a cell with no cold engine carries none of it in its iteration
+    /// (`inf-runtime`'s `cold_path` bench, its server-shaped reactor legs).
+    #[inline(never)]
+    fn deliver_cold(&self, cx: &mut LoopCx<'_>) {
+        let cold = self.shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
+        if let Some(cold) = cold {
+            let now_us = cx.now.as_micros();
+            let _ = cold.deliver_ready(cx.cold_delivery_budget(), now_us);
+        }
+    }
 }
 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for ServerPlane<O, F> {
@@ -313,13 +327,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
     fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
         // ADR-0181 R2: the turn's cold delivery, before either executor
         // pass and outside `parse_execute`'s listener-startup and DEBUG
-        // SLEEP returns. The cold handle is cloned under a short tier
-        // borrow and the borrow released before any gate wake or orphan
-        // cleanup runs. A cell with no cold engine pays one `Option` test.
-        let cold = self.shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
-        if let Some(cold) = cold {
-            let now_us = cx.now.as_micros();
-            let _ = cold.deliver_ready(cx.cold_delivery_budget(), now_us);
+        // SLEEP returns. A cell with no cold engine pays the engine's
+        // presence test under a short tier borrow; the delivery itself is
+        // out of the iteration's line.
+        let engine = self.shared.tier.borrow().as_ref().is_some_and(|t| t.cold.is_some());
+        if engine {
+            self.deliver_cold(cx);
         }
     }
 

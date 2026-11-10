@@ -542,10 +542,9 @@ impl<const SERVER_STEPS: bool> CellPlane for HookPlane<SERVER_STEPS> {
         panic!("the reactor leg reaps nothing: {c:?}");
     }
     fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
-        let cold = self.shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
-        if let Some(cold) = cold {
-            let now_us = cx.now.as_micros();
-            let _ = cold.deliver_ready(cx.cold_delivery_budget(), now_us);
+        let engine = self.shared.tier.borrow().as_ref().is_some_and(|t| t.cold.is_some());
+        if engine {
+            deliver_cold(&self.shared, cx);
         }
     }
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
@@ -554,6 +553,17 @@ impl<const SERVER_STEPS: bool> CellPlane for HookPlane<SERVER_STEPS> {
         }
     }
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+}
+
+/// The server's delivery, out of the iteration's line: the cold handle
+/// cloned under a short tier borrow, released before any gate wake.
+#[inline(never)]
+fn deliver_cold(shared: &SharedTier, cx: &mut LoopCx<'_>) {
+    let cold = shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
+    if let Some(cold) = cold {
+        let now_us = cx.now.as_micros();
+        let _ = cold.deliver_ready(cx.cold_delivery_budget(), now_us);
+    }
 }
 
 /// The server-shaped control: [`HookPlane`]'s state and its server steps
