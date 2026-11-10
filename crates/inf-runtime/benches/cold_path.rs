@@ -1,13 +1,14 @@
 #![allow(
     clippy::disallowed_types,
-    reason = "bench target: leg A is the cold-read host with its std tables, the deep legs \
-              keep their waits in a deque reserved before the loop, and the rate legs measure \
-              leg A's tables"
+    reason = "bench target: leg A is the cold-read host and its gate with their std tables, \
+              the deep legs keep their waits in a deque reserved before the loop, and the rate \
+              legs measure leg A's tables"
 )]
 //! The cold-read path's A/B by instructions (L4): the cell's cold-read
 //! operations on the host as it stood before its fixed stores (A, a
-//! bench-only copy in `cold_path/cold.rs`, so every A leg measures the same
-//! code after the engine's host changes) and, once they are built, on the
+//! bench-only copy in `cold_path/cold.rs` over its gate's in
+//! `cold_path/gate.rs`, so every A leg measures the same code after the
+//! engine's host and gate change) and, once they are built, on the
 //! fixed stores (B), from one binary. Each leg's background is held by the
 //! bench's device budget, which answers `NotThisSlice` to every maintain
 //! offer and `Now` to the foreground, so no background read issues.
@@ -68,6 +69,9 @@
 #[path = "cold_path/cold.rs"]
 #[allow(dead_code, reason = "the host is copied whole; each leg drives part of it")]
 mod cold;
+#[path = "cold_path/gate.rs"]
+#[allow(dead_code, reason = "the gate is copied whole; leg A drives part of it")]
+mod gate;
 #[path = "cold_path/rates.rs"]
 mod rates;
 
