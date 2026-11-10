@@ -375,9 +375,10 @@ mod foreign {
         // allocated until its swap, or its push's compare-and-swap, inside `foreign_wake_at`;
         // after that access the drain, or another thread's last drop, may free both while these
         // references and the callee's `&self` are live. They cover atomics only, as `Arc::drop`'s
-        // `&AtomicUsize` does across its decrement, and the call touches neither after that
-        // access unless it answered `Last`, which makes this call the one freer (ADR-0003
-        // A1.2.5).
+        // `&AtomicUsize` does across its decrement, and after that access neither this call nor
+        // the callee reads through or copies one unless it answered `Last`, which makes this
+        // call the one freer (ADR-0003 A1.2.5); `tests/waker_race.rs` races that window under
+        // Miri.
         let (bridge, stack) = unsafe { bridge_and_stack(data) };
         // SAFETY: per this function's contract.
         let released = bridge.foreign_wake_at(stack, unsafe { node(data) });
@@ -395,9 +396,10 @@ mod foreign {
         // allocated until its swap, or its push's compare-and-swap, inside `foreign_drop_at`;
         // after that access the drain, or another thread's last drop, may free both while these
         // references and the callee's `&self` are live. They cover atomics only, as `Arc::drop`'s
-        // `&AtomicUsize` does across its decrement, and the call touches neither after that
-        // access unless it answered `Last`, which makes this call the one freer (ADR-0003
-        // A1.2.5).
+        // `&AtomicUsize` does across its decrement, and after that access neither this call nor
+        // the callee reads through or copies one unless it answered `Last`, which makes this
+        // call the one freer (ADR-0003 A1.2.5); `tests/waker_race.rs` races that window under
+        // Miri.
         let (bridge, stack) = unsafe { bridge_and_stack(data) };
         // SAFETY: per this function's contract.
         let released = bridge.foreign_drop_at(stack, unsafe { node(data) });
