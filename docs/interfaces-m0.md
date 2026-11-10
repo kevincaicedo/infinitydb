@@ -627,7 +627,7 @@ impl CellFabric {
 }
 ```
 
-> **ADR-0192 (2026-10-29), implementation open:** deadlock freedom holds
+> **ADR-0192 (2026-10-29), built:** deadlock freedom holds
 > under a condition on the server. A reply sent in the drain pass that read
 > its op cannot wait: `reply` is credit-free and the drain never blocks or
 > sends. A reply a cell defers past that drain may wait only on (a) its own
@@ -650,9 +650,8 @@ impl CellFabric {
 > every mesh through one checked constructor, which refuses
 > `data_credits ≤ 1`, a ring that is not a power of two and a mesh
 > `has_reply_headroom` refuses; test meshes keep a debug assertion. `send`,
-> `reply`, `drain`, `SendError` and the relation's value are unchanged. Not
-> built; the block above states the mesh as implemented today (ADR-0192
-> D1, D2, D5).
+> `reply`, `drain`, `SendError` and the relation's value are unchanged. The
+> block above is the built shape (ADR-0192 D1, D2, D5).
 
 **Execution origin (ADR-0115 D2–D5).** `Apply` and `ApplyNs` carry
 `program: bool`: `false` for forwarded client argv, `true` for legs composed
