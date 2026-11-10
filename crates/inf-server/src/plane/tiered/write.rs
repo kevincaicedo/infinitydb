@@ -1558,23 +1558,23 @@ pub(super) async fn mset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
 
 #[cfg(test)]
 mod hole_refusal_tests {
+    use std::path::Path;
+
     use super::*;
     use inf_fabric::{Mesh, MeshConfig};
+    use inf_log::TierIoMode;
+    use inf_log::blob::{ExtentId, ExtentWriter};
+    use inf_log::fs::mem::MemFs;
 
     const MIB: u64 = 1 << 20;
 
-    /// A write whose record needs a fourth hole mark is refused before any
-    /// mutation, and through `write_block_of` the refusal is the tail
-    /// stall's park, with no reply byte, never `ERR_OOM`; once `flushed`
-    /// passes the front hole and the head follows, the same write places.
-    /// The plane's keyspace holds the tiered table, built on the plane's
-    /// census, whose `hole-marks` row counts the refused ask. The table's
-    /// window is four 1 MiB pages over an eight-page ring: the head at page
-    /// 5, three planted pads pending above it (pages 5 and 6, then page 7
-    /// less 100 bytes), so a 200-byte record fits the window and needs a
-    /// ring-top hole.
-    #[test]
-    fn a_write_that_needs_a_fourth_hole_mark_parks_until_the_front_hole_flushes() {
+    /// A plane serving one tiered namespace, built on the plane's census, whose
+    /// table's window is four 1 MiB pages over an eight-page ring: the head at
+    /// page 5 and three planted pads pending above it (pages 5 and 6, then page
+    /// 7 less `short` bytes), so a record longer than `short` bytes fits the
+    /// window and needs a ring-top hole, a fourth hole mark. The front pad ends
+    /// at page 6.
+    fn plane_at_three_pending_holes(short: u64) -> ServerPlane<NoopObserver, crate::StdSegmentFs> {
         let tier = inf_store::TierSpec {
             maintain_slice_bytes: 64 << 10,
             ..inf_store::TierSpec::for_budget(4 * MIB)
@@ -1603,20 +1603,51 @@ mod hole_refusal_tests {
                 false,
             )
             .expect("the plane");
+        {
+            let mut ks = plane.shared.store.borrow_mut();
+            let table = ks.tiered_store_mut(NsId(16)).expect("the tiered table");
+            assert_eq!(table.space().ring_bytes(), 8 * MIB, "an eight-page ring");
+            let space = table.space_mut();
+            for len in [4 * MIB, MIB] {
+                assert!(space.plant_hole(len), "a released pad");
+                space.advance_ro_boundary(space.tail());
+                space.advance_flushed(space.tail());
+                space.advance_head(space.tail());
+            }
+            for len in [MIB, MIB, MIB - short] {
+                assert!(space.plant_hole(len), "a pending pad");
+            }
+        }
+        plane
+    }
+
+    /// Seals the tail, then flushes and releases to the front pad's end, the
+    /// `flushed` value that pops its mark.
+    fn flush_past_the_front_hole(table: &mut TieredTable) {
+        let space = table.space_mut();
+        space.advance_ro_boundary(space.tail());
+        let front_end = LogicalAddr::from_raw(6 * MIB).expect("48-bit");
+        space.advance_flushed(front_end);
+        space.advance_head(front_end);
+    }
+
+    /// The `hole-marks` row's crossings on `plane`'s census.
+    fn hole_mark_crossings(plane: &ServerPlane<NoopObserver, crate::StdSegmentFs>) -> u64 {
+        plane.cap_census().row("hole-marks").map_or(0, |row| row.crossings)
+    }
+
+    /// A write whose record needs a fourth hole mark is refused before any
+    /// mutation, and through `write_block_of` the refusal is the tail
+    /// stall's park, with no reply byte, never `ERR_OOM`; once `flushed`
+    /// passes the front hole and the head follows, the same write places.
+    /// The plane census's `hole-marks` row counts the refused ask. A
+    /// 200-byte record needs the ring-top hole past the last 100 bytes.
+    #[test]
+    fn a_write_that_needs_a_fourth_hole_mark_parks_until_the_front_hole_flushes() {
+        let plane = plane_at_three_pending_holes(100);
         let shared = &plane.shared;
         let mut ks = shared.store.borrow_mut();
         let table = ks.tiered_store_mut(NsId(16)).expect("the tiered table");
-        assert_eq!(table.space().ring_bytes(), 8 * MIB, "an eight-page ring");
-        let space = table.space_mut();
-        for len in [4 * MIB, MIB] {
-            assert!(space.plant_hole(len), "a released pad");
-            space.advance_ro_boundary(space.tail());
-            space.advance_flushed(space.tail());
-            space.advance_head(space.tail());
-        }
-        for len in [MIB, MIB, MIB - 100] {
-            assert!(space.plant_hole(len), "a pending pad");
-        }
         let value = vec![b'v'; 200 - 8 - 1];
         let hash = table.hash_key(b"k");
         let before = (table.space().tail(), table.space().counters());
@@ -1632,14 +1663,64 @@ mod hole_refusal_tests {
             Protocol::Resp2,
         );
         assert!(matches!(block, WriteBlock::Stall), "the writer parks on the tail stall");
-        let crossings = plane.cap_census().row("hole-marks").map(|row| row.crossings);
-        assert!(crossings.is_some_and(|n| n >= 1), "the refused ask counted: {crossings:?}");
-        let space = table.space_mut();
-        space.advance_ro_boundary(space.tail());
-        let front_end = LogicalAddr::from_raw(6 * MIB).expect("48-bit");
-        space.advance_flushed(front_end);
-        space.advance_head(front_end);
+        let crossings = hole_mark_crossings(&plane);
+        assert!(crossings >= 1, "the refused ask counted: {crossings}");
+        flush_past_the_front_hole(table);
         let placed = table.insert(b"k", &value, hash).expect("places once the front hole flushed");
+        assert_eq!(placed.to_raw(), 8 * MIB, "past the ring-top hole");
+    }
+
+    /// The blob leg: a `SET` whose value lives in an extent refuses the
+    /// 24-byte reference record where it needs a fourth hole mark (the last
+    /// 20 bytes below the ring top), and the store's refusal reaches
+    /// `write_block_of` through `refused_block` with the extent probe, which
+    /// sizes the stall target from the reference, never the value: the
+    /// writer parks on the front hole's end, with no reply byte, never
+    /// `ERR_OOM`. Once `flushed` passes the front hole the same reference
+    /// places past the ring-top hole.
+    #[test]
+    fn a_blob_write_whose_reference_needs_a_fourth_hole_mark_parks_until_the_front_hole_flushes() {
+        let plane = plane_at_three_pending_holes(20);
+        let shared = &plane.shared;
+        let fs = MemFs::new();
+        let value = vec![0x42u8; 9_000];
+        let mut writer = ExtentWriter::create(
+            &fs,
+            Path::new("shard-0"),
+            ExtentId(1),
+            0,
+            NsId(16),
+            value.len() as u64,
+            TierIoMode::Buffered,
+        )
+        .expect("the extent's file");
+        writer.append_chunk(&value).expect("the extent's chunk");
+        let sealed = writer.finish().expect("the sealed extent");
+        let mut ks = shared.store.borrow_mut();
+        let table = ks.tiered_store_mut(NsId(16)).expect("the tiered table");
+        let hash = table.hash_key(b"b");
+        let before = (table.space().tail(), table.space().counters());
+        let refused = table.insert_extent(b"b", hash, &sealed).expect_err("a fourth hole mark");
+        assert_eq!(refused, inf_store::OpError::OutOfMemory);
+        assert_eq!((table.space().tail(), table.space().counters()), before, "nothing changed");
+        let front_end = LogicalAddr::from_raw(6 * MIB).expect("48-bit");
+        assert_eq!(table.extent_stall_target(b"b"), Some(front_end), "the front hole's end");
+        let write = BlobWrite {
+            ns: NsId(16),
+            class: FsyncClass::Always,
+            key: b"b",
+            hash,
+            value: &value,
+            old: None,
+            proto: Protocol::Resp2,
+        };
+        let block = refused_block(shared, &write, table, ExtentRefusal::Store(refused));
+        assert!(matches!(block, WriteBlock::Stall), "the writer parks on the tail stall");
+        let crossings = hole_mark_crossings(&plane);
+        assert!(crossings >= 1, "the refused ask counted: {crossings}");
+        flush_past_the_front_hole(table);
+        let placed =
+            table.insert_extent(b"b", hash, &sealed).expect("places once the front hole flushed");
         assert_eq!(placed.to_raw(), 8 * MIB, "past the ring-top hole");
     }
 }
