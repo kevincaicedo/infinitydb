@@ -136,8 +136,8 @@ use crate::durable::{DrainHold, DurableCell, DurableConfig};
 #[cfg(feature = "doc")]
 use crate::exec::DocLogAdmission;
 use crate::exec::{
-    ConnCx, ConnNamespace, NodeInfo, TIER_FLUSH_GAUGES, TierFlushGauge, execute, execute_slices,
-    stall_request, unavailable_default_allows,
+    COLD_GAUGES, ColdGauge, ConnCx, ConnNamespace, NodeInfo, TIER_FLUSH_GAUGES, TierFlushGauge,
+    execute, execute_slices, stall_request, unavailable_default_allows,
 };
 use crate::limits::ACCEPT_RETRY;
 use crate::pubsub::{self, PubSubCell, SubKind};
@@ -1331,6 +1331,22 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 counters.pool_dry,
                 counters.queue_full,
             ]);
+            let (members, windows) = cold.delivery_pending();
+            let mut gauges = [0u64; COLD_GAUGES];
+            for (slot, value) in [
+                (ColdGauge::DeliveryWork, counters.delivery_work),
+                (ColdGauge::DeliveryWorkTurnMax, u64::from(counters.delivery_work_turn_max)),
+                (ColdGauge::DeliveryPendingMembers, members),
+                (ColdGauge::DeliveryPendingWindows, windows),
+                (ColdGauge::DeliveryDelayP99Us, cold.delivery_delay_percentile_us(99.0)),
+                (ColdGauge::ReceiptsForeign, counters.receipts_foreign),
+                (ColdGauge::LinksStale, counters.links_stale),
+                (ColdGauge::IdentityExhausted, cold.identity_refusals()),
+                (ColdGauge::IdentityPairsUsed, cold.identity_pairs_used()),
+            ] {
+                gauges[slot as usize] = value;
+            }
+            self.shared.node.cold.set(gauges);
         }
     }
 
