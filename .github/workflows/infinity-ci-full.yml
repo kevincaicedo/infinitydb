@@ -125,6 +125,14 @@ jobs:
         run: cargo +nightly miri test -p inf-runtime --test executor --test waker_threads --test waker_close
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
+      # A consuming foreign waker call forms no reference to its header or the remote stack once
+      # its swap, or its push, may let another thread free them (ADR-0003 A1.2.5). The default
+      # schedule never preempts a call inside that window, so the races run at a pinned
+      # preemption rate over a pinned seed range, each seed a schedule, on one test thread.
+      - name: miri (inf-runtime's waker races) strict provenance, pinned schedules
+        run: cargo +nightly miri test -p inf-runtime --test waker_race -- --test-threads=1
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-preemption-rate=0.002 -Zmiri-many-seeds=0..32
 
   fuzz-targets:
     # The fuzz smoke's matrix: every target the fuzz manifests list, with its
