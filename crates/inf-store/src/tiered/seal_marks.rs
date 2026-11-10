@@ -150,7 +150,6 @@ impl SealMarks {
     }
 
     /// The stride's bytes: the commit page times the stride's pages.
-    #[cfg(test)]
     pub(crate) fn stride_bytes(&self) -> u64 {
         1 << self.bucket_shift
     }

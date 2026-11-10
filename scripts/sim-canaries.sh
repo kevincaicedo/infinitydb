@@ -899,6 +899,10 @@ rows=(
   # refused, each read by its edge test's own token.
   "inf_canary_cap_minus_one crate-test inf-store lib the_seal_marks_cap_admits_its_last_mark_and_merges_the_next seal-marks-edge-short"
   "inf_canary_cap_minus_one crate-test inf-store lib the_hole_marks_cap_admits_three_and_refuses_a_fourth hole-marks-edge-short"
+  # The same stride plant at the pressure storm's wide ring, whose engagement
+  # is the stride above one commit page: planted at one page, the leg's stride
+  # clause is VACUOUS by its own name.
+  "inf_canary_seal_mark_stride_one m4-pressure pressure-stride-unengaged --pressure-leg wide-ring"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

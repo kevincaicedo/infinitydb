@@ -1283,6 +1283,16 @@ impl TieredTable {
         Some(addr)
     }
 
+    /// The seal marks' stride in bytes, fixed at the table's build: one
+    /// commit page, or a power-of-two multiple of it on a ring that holds
+    /// more than half the marks' cap of pages, so that a ring holds at most
+    /// half the cap's buckets. A seal step lands on a mark, so it may overrun
+    /// its slice by at most this much.
+    #[must_use]
+    pub fn seal_mark_stride_bytes(&self) -> u64 {
+        self.seal_marks.stride_bytes()
+    }
+
     /// Seal-mark bookkeeping (ADR-0053 D2): the first record starting
     /// in each commit page is a legal ro-boundary landing point. One
     /// compare per allocation; stale marks (behind the boundary) trim

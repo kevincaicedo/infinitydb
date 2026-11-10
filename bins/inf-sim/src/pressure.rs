@@ -24,6 +24,15 @@
 //! Stall latency is measured in virtual nanoseconds per stall (park →
 //! wake) and reported; every event folds into `trace_hash` and
 //! `--verify-determinism` requires two-run identity (L7).
+//!
+//! Two legs press two windows. `budget` (the default) is a 256 KiB budget at
+//! 4 KiB pages, a 128-page ring, so the table's seal marks bucket at one
+//! page. `wide-ring` is a 16 MiB budget, an 8,192-page ring past the reach
+//! of the marks at one page, so their stride is two pages and a seal step
+//! may overrun its slice by one stride: the storm's values are larger, so
+//! that it fills the window, and the device's rates scale with its demand.
+//! Its engagement is the stride above one page and a seal step past its
+//! slice, each read on the table, else `VACUOUS`.
 
 use crate::driver::Violations;
 use core::cell::{Cell, RefCell};
@@ -49,19 +58,13 @@ use inf_store::{
 
 const NS: NsId = NsId(88);
 const PAGE: u64 = 4 << 10;
-const BUDGET: u64 = 256 << 10;
 /// Virtual round length (one reactor MAINTAIN cadence).
 const ROUND_NS: u64 = 1_000_000; // 1 ms
 /// Scenario stall timeout (a tight knob so the wedge phase stays cheap;
 /// the ADR-0053 default of 1000 ms is config, not this harness).
 const STALL_TIMEOUT_NS: u64 = 250 * ROUND_NS;
 const WRITERS: usize = 8;
-const OPS_PER_WRITER: u64 = 400;
 const OPS_PER_ROUND: u64 = 4;
-/// Device bandwidth: full speed exceeds the storm's demand; the
-/// throttled phase serves roughly a tenth of demand.
-const DEVICE_FULL_BYTES_PER_ROUND: u64 = 64 << 10;
-const DEVICE_THROTTLED_BYTES_PER_ROUND: u64 = 480;
 /// Wedge phase schedule, in rounds.
 /// Earliest round the wedge may begin. The wedge itself triggers on the
 /// first stall at or after this round (deterministic per seed): a stall
@@ -72,16 +75,89 @@ const DEVICE_THROTTLED_BYTES_PER_ROUND: u64 = 480;
 const WEDGE_EARLIEST_ROUND: u64 = 100;
 const MAX_ROUNDS: u64 = 20_000;
 
+/// The window a run presses (the module's two legs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PressureLeg {
+    /// A 256 KiB budget at 4 KiB pages: a 128-page ring, the seal marks at
+    /// one page.
+    Budget,
+    /// A 16 MiB budget at 4 KiB pages: an 8,192-page ring, the seal marks at
+    /// a stride of two pages.
+    WideRing,
+}
+
+impl PressureLeg {
+    pub const ALL: [PressureLeg; 2] = [PressureLeg::Budget, PressureLeg::WideRing];
+
+    /// The leg's name on the command line.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            PressureLeg::Budget => "budget",
+            PressureLeg::WideRing => "wide-ring",
+        }
+    }
+
+    /// The leg named `name`, if any.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<PressureLeg> {
+        PressureLeg::ALL.into_iter().find(|leg| leg.name() == name)
+    }
+
+    fn shape(self) -> Shape {
+        match self {
+            PressureLeg::Budget => Shape {
+                budget: 256 << 10,
+                value_len_min: 96,
+                value_len_span: 128,
+                ops_per_writer: 400,
+                device_full_bytes_per_round: 64 << 10,
+                device_throttled_bytes_per_round: 480,
+            },
+            // The storm's demand is about 8 × 4 × 2 KiB = 64 KiB a round:
+            // full speed four times that, the throttled phase about a tenth,
+            // so the window (4,097 pages) fills in about 300 rounds, past the
+            // wedge's earliest round, and 1,600 ops a writer keep writing
+            // through the wedge and the drain.
+            PressureLeg::WideRing => Shape {
+                budget: 16 << 20,
+                value_len_min: 1024,
+                value_len_span: 2048,
+                ops_per_writer: 1_600,
+                device_full_bytes_per_round: 256 << 10,
+                device_throttled_bytes_per_round: 6 << 10,
+            },
+        }
+    }
+}
+
+/// A leg's sizes: the window the storm presses and the storm and device
+/// that press it.
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    /// The table's memory budget; its window is the budget and one slice.
+    budget: u64,
+    value_len_min: usize,
+    /// Each value is `value_len_min` bytes and less than this many more.
+    value_len_span: u64,
+    ops_per_writer: u64,
+    /// Device bandwidth: full speed exceeds the storm's demand; the
+    /// throttled phase serves roughly a tenth of it.
+    device_full_bytes_per_round: u64,
+    device_throttled_bytes_per_round: u64,
+}
+
 /// Scenario knobs (the DSL v0 shape).
 #[derive(Debug)]
 pub struct PressureScenario {
     pub seed: u64,
+    pub leg: PressureLeg,
 }
 
 impl PressureScenario {
     #[must_use]
     pub fn m4_pressure(seed: u64) -> PressureScenario {
-        PressureScenario { seed }
+        PressureScenario { seed, leg: PressureLeg::Budget }
     }
 }
 
@@ -94,6 +170,9 @@ pub struct PressureReport {
     pub stall_p50_ns: u64,
     pub stall_p99_ns: u64,
     pub peak_committed_bytes: u64,
+    /// The table's seal-mark stride, read at the wide ring's audit (0 on the
+    /// budget leg, which reads none).
+    pub seal_mark_stride_bytes: u64,
     pub trace_hash: u64,
     pub state_hash: u64,
     state: crate::state::StateHash,
@@ -164,6 +243,8 @@ impl Future for RoundYield {
 
 struct World {
     ks: Keyspace,
+    leg: PressureLeg,
+    shape: Shape,
     /// Data bytes the device may still absorb this round.
     device_credit: u64,
     gate: WatermarkGate,
@@ -191,13 +272,13 @@ impl World {
     }
 }
 
-/// One writer's storm: `OPS_PER_WRITER` seeded upserts over a 128-key
-/// working set, at most `OPS_PER_ROUND` per round, stalling typed on the
-/// budget window.
+/// One writer's storm: the leg's seeded upserts over a 128-key working set,
+/// at most `OPS_PER_ROUND` per round, stalling typed on the budget window.
 async fn writer_storm(world: Rc<RefCell<World>>, writer: usize, seed: u64) {
     let mut rng = SplitMix64::new(seed ^ ((writer as u64) << 32));
     let mut in_round = 0u64;
-    for op in 0..OPS_PER_WRITER {
+    let shape = world.borrow().shape;
+    for op in 0..shape.ops_per_writer {
         if in_round >= OPS_PER_ROUND {
             let wakers = Rc::clone(&world.borrow().round_wakers);
             RoundYield { round_wakers: wakers, parked: false }.await;
@@ -205,7 +286,9 @@ async fn writer_storm(world: Rc<RefCell<World>>, writer: usize, seed: u64) {
         }
         in_round += 1;
         let key = format!("w{writer}:{:04}", rng.next_u64() % 128).into_bytes();
-        let value = vec![(rng.next_u64() % 251) as u8; 96 + (rng.next_u64() % 128) as usize];
+        let fill = (rng.next_u64() % 251) as u8;
+        let len = shape.value_len_min + (rng.next_u64() % shape.value_len_span) as usize;
+        let value = vec![fill; len];
         write_until_done(&world, &key, &value, op).await;
     }
     world.borrow_mut().writers_done += 1;
@@ -404,7 +487,9 @@ impl TierFleet {
     }
 }
 
-fn build_world(demote: DemotionConfig, seed: u64) -> Rc<RefCell<World>> {
+fn build_world(leg: PressureLeg, seed: u64) -> Rc<RefCell<World>> {
+    let shape = leg.shape();
+    let demote = DemotionConfig::for_budget(shape.budget, PAGE);
     let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let ring = demote.ring_reserve_bytes().expect("valid budget");
     let mut ks =
@@ -425,6 +510,8 @@ fn build_world(demote: DemotionConfig, seed: u64) -> Rc<RefCell<World>> {
     );
     Rc::new(RefCell::new(World {
         ks,
+        leg,
+        shape,
         device_credit: 0,
         gate: WatermarkGate::new(),
         now: Rc::new(Cell::new(0)),
@@ -442,17 +529,17 @@ fn build_world(demote: DemotionConfig, seed: u64) -> Rc<RefCell<World>> {
 }
 
 /// This round's device credit under the three-phase schedule.
-fn device_credit_for(round: u64, wedge_from: Option<u64>) -> u64 {
+fn device_credit_for(shape: &Shape, round: u64, wedge_from: Option<u64>) -> u64 {
     let Some(from) = wedge_from else {
-        return DEVICE_THROTTLED_BYTES_PER_ROUND;
+        return shape.device_throttled_bytes_per_round;
     };
     let wedge_end = from + STALL_TIMEOUT_NS / ROUND_NS + 50;
     if round < from {
-        DEVICE_THROTTLED_BYTES_PER_ROUND
+        shape.device_throttled_bytes_per_round
     } else if round < wedge_end {
         0 // wedged
     } else {
-        DEVICE_FULL_BYTES_PER_ROUND
+        shape.device_full_bytes_per_round
     }
 }
 
@@ -471,8 +558,9 @@ fn run_round(
         // Bank this round's credit (bounded: full-speed rounds cover
         // demand outright, so the bank never grows past a few slices).
         let world = &mut *world.borrow_mut();
-        let credit = device_credit_for(round, world.wedge_from);
-        world.device_credit = (world.device_credit + credit).min(DEVICE_FULL_BYTES_PER_ROUND);
+        let shape = world.shape;
+        let credit = device_credit_for(&shape, round, world.wedge_from);
+        world.device_credit = (world.device_credit + credit).min(shape.device_full_bytes_per_round);
         if credit == 0 {
             world.device_credit = 0; // wedged: the device is gone, not saving up
         }
@@ -494,9 +582,10 @@ fn run_round(
         world.gate.advance(head);
         let committed = world.table().space().report().committed_bytes;
         report.peak_committed_bytes = report.peak_committed_bytes.max(committed);
-        if committed > BUDGET + PAGE {
+        let budget = world.shape.budget;
+        if committed > budget + PAGE {
             report.violations.push(format!(
-                "round {round}: committed {committed} exceeds budget {BUDGET} + slice {PAGE}"
+                "round {round}: committed {committed} exceeds budget {budget} + slice {PAGE}"
             ));
         }
     }
@@ -515,7 +604,7 @@ fn run_round(
 fn drain(world: &Rc<RefCell<World>>, fleet: &mut TierFleet) {
     let world = &mut *world.borrow_mut();
     loop {
-        world.device_credit = DEVICE_FULL_BYTES_PER_ROUND;
+        world.device_credit = world.shape.device_full_bytes_per_round;
         let first = world.ks.demote_tick();
         fleet.flush_round(world);
         let second = world.ks.demote_tick();
@@ -556,6 +645,12 @@ fn audit(world: &Rc<RefCell<World>>, fleet: &TierFleet, report: &mut PressureRep
             counters.tail_alloc_stalls, world.stalls
         ));
     }
+    match world.leg {
+        PressureLeg::Budget => {}
+        PressureLeg::WideRing => {
+            stride_engagement(world, counters.demote_slices, counters.demote_sealed_bytes, report);
+        }
+    }
     let keys: Vec<(Vec<u8>, Vec<u8>)> =
         world.model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     for (key, want) in keys {
@@ -587,6 +682,33 @@ fn audit(world: &Rc<RefCell<World>>, fleet: &TierFleet, report: &mut PressureRep
     );
 }
 
+/// The wide ring's engagement: the table's seal marks bucket at more than one
+/// commit page, and some seal step sealed past its one-page slice, which only
+/// a stride can make it do: the mean of the steps' sealed bytes is above the
+/// slice. Either missing is `VACUOUS`, never a green run.
+fn stride_engagement(
+    world: &mut World,
+    slices: u64,
+    sealed_bytes: u64,
+    report: &mut PressureReport,
+) {
+    let stride = world.table().seal_mark_stride_bytes();
+    report.seal_mark_stride_bytes = stride;
+    if stride <= PAGE {
+        report.violations.push(format!(
+            "VACUOUS pressure-stride-unengaged: the seal marks' stride is {stride} B, one commit \
+             page of {PAGE} B, on a ring of {} pages",
+            world.table().space().ring_bytes() / PAGE
+        ));
+    }
+    if sealed_bytes <= slices.saturating_mul(PAGE) {
+        report.violations.push(format!(
+            "VACUOUS pressure-overrun-unengaged: {slices} seal steps sealed {sealed_bytes} B, \
+             none past its {PAGE} B slice on the mean"
+        ));
+    }
+}
+
 /// Ground-truth read: RAM via the table, cold via the device's bytes,
 /// fingerprint false positives excluded and retried.
 fn read_back(world: &mut World, fleet: &TierFleet, key: &[u8], want_len: usize) -> Option<Vec<u8>> {
@@ -613,7 +735,7 @@ fn read_back(world: &mut World, fleet: &TierFleet, key: &[u8], want_len: usize) 
 #[must_use]
 pub fn run_pressure_scenario(scenario: &PressureScenario) -> PressureReport {
     let mut report = PressureReport::default();
-    let world = build_world(DemotionConfig::for_budget(BUDGET, PAGE), scenario.seed);
+    let world = build_world(scenario.leg, scenario.seed);
     let mut fleet = TierFleet::new();
     let mut ex = CellExecutor::new(64);
     for writer in 0..WRITERS {

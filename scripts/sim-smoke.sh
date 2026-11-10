@@ -116,6 +116,9 @@ rows=(
   "m4-extent-window --window-leg cold --verify-determinism"
   "m45-backfill"
   "m45-sidecar"
+  # The pressure storm on a ring past the seal marks' reach at one page: their
+  # stride is two pages, so a seal step may overrun its slice by one stride.
+  "m4-pressure --pressure-leg wide-ring --verify-determinism"
 )
 
 ran=0
