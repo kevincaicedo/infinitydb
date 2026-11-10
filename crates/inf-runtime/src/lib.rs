@@ -57,8 +57,8 @@ pub use budget::{
 };
 pub use cold::{
     ColdDeliveryBudget, ColdDeliveryProgress, ColdDeliveryState, ColdDone, ColdLeak,
-    ColdPreparationBudget, ColdReadConfig, ColdReadCounters, ColdReads, ColdReceipt, ColdRefused,
-    ColdTurn, ColdWait, DeviceId, LogicalId, PairIssuer, ReadClass, TierFileId,
+    ColdPreparationBudget, ColdReadConfig, ColdReadCounters, ColdReadiness, ColdReads, ColdReceipt,
+    ColdRefused, ColdTurn, ColdWait, DeviceId, LogicalId, PairIssuer, ReadClass, TierFileId,
     UnrepresentableRead,
 };
 pub use driver::{

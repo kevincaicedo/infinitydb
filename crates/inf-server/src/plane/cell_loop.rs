@@ -344,12 +344,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         if self.ckpt_observation_owed() && self.shared.ckpt_waiters.any_waiting() {
             return true;
         }
-        // A parked loop never holds ready cold delivery (ADR-0181 R2):
-        // members a turn's allowance left wait for the next turn, not for
-        // a park's timeout, park flags or none.
+        // A parked loop never holds ready cold work (ADR-0181 R2, R6):
+        // members a turn's allowance left, or a drain that may issue now,
+        // wait for the next turn, not for a park's timeout, park flags or
+        // none.
         let tier = self.shared.tier.borrow();
         let cold = tier.as_ref().and_then(|t| t.cold.as_ref());
-        if cold.is_some_and(|cold| cold.has_ready_delivery()) {
+        if cold.is_some_and(|cold| cold.holds_ready_work()) {
             return true;
         }
         drop(tier);

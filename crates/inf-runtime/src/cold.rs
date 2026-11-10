@@ -628,6 +628,8 @@ struct ColdState {
     /// Receipt-to-delivery delay of delivered values, injected µs
     /// (`cold_delivery_delay_p99_us`).
     delay_hist: LogHistogram,
+    /// Preparation's readiness, written by each event that changes it.
+    readiness: ColdReadiness,
     /// Per-file pin count over queued + in-flight + undropped `ColdDone`
     /// custody (§3.3). Entries exist only while nonzero.
     pins: HashMap<TierFileId, u32, BuildIntHasher>,
@@ -683,6 +685,25 @@ fn parse_window(
     // this narrowing never refuses; were it to, the fault is the same.
     let len = u32::try_from(window_bytes).map_err(|_| too_wide)?;
     Ok((offset, len))
+}
+
+/// The host's stored preparation readiness (ADR-0181 R6): what its last
+/// event says a drain may do next, read without a queue walk. Only
+/// `CpuPending` asks for another turn at once; each `Wait*` waits for its
+/// resource owner's event.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ColdReadiness {
+    /// Nothing is queued that a drain could issue.
+    Idle,
+    /// A drain may issue now: a request was admitted, or the resource the
+    /// last drain waited on came back.
+    CpuPending,
+    /// The device QD is full: a receipt frees a slot.
+    WaitDevice,
+    /// Every pool buffer is held: a window's last value returns one.
+    WaitPool,
+    /// The device budget deferred the drain: the next slice's refill.
+    WaitIoBudget,
 }
 
 /// What [`ColdReads::record_completion`] made of a receipt.
@@ -799,6 +820,7 @@ impl ColdReads {
                 pending_members: 0,
                 pending_windows: 0,
                 delay_hist: LogHistogram::new(),
+                readiness: ColdReadiness::Idle,
                 pins: HashMap::default(),
                 counters: ColdReadCounters::default(),
                 qd_hist: LogHistogram::new(),
@@ -893,6 +915,7 @@ impl ColdReads {
             enqueued_us: now_us,
         });
         state.counters.enqueued += 1;
+        state.readiness = ColdReadiness::CpuPending;
         let depth = (state.pending[0].len() + state.pending[1].len()) as u32;
         state.counters.queue_depth_high_water = state.counters.queue_depth_high_water.max(depth);
         drop(state);
@@ -931,14 +954,21 @@ impl ColdReads {
     ) -> u32 {
         let mut issued = 0u32;
         let mut maintain_allowed = true;
+        // What the drain stops on: its readiness once the queues are not
+        // empty (ADR-0181 R6).
+        let mut stopped = ColdReadiness::Idle;
         loop {
             let mut state_ref = self.state.borrow_mut();
             let state = &mut *state_ref;
             if state.device_reads >= state.config.qd_cap {
+                stopped = ColdReadiness::WaitDevice;
                 break;
             }
             Self::purge_stale_heads(state, &self.gate);
             if state.pending[0].is_empty() && (state.pending[1].is_empty() || !maintain_allowed) {
+                if !maintain_allowed {
+                    stopped = ColdReadiness::WaitIoBudget;
+                }
                 break;
             }
             let (class, grant_spent) = Self::pick_class(state, maintain_allowed);
@@ -951,6 +981,7 @@ impl ColdReads {
                     // refused). Nothing changes within this slice, so it
                     // ends here with the intent queued for the next one —
                     // a `continue` would spin the cell.
+                    stopped = ColdReadiness::WaitIoBudget;
                     break;
                 }
                 Issue::NotThisSlice => {
@@ -965,6 +996,7 @@ impl ColdReads {
             let Some(buf) = state.pool.try_lease() else {
                 state.counters.pool_dry += 1;
                 refund(class_enum, bound, 1);
+                stopped = ColdReadiness::WaitPool;
                 break;
             };
             let op = Self::admit(state, &self.gate, class, buf);
@@ -976,6 +1008,9 @@ impl ColdReads {
             push(op);
             issued += 1;
         }
+        let mut state = self.state.borrow_mut();
+        let queued = !(state.pending[0].is_empty() && state.pending[1].is_empty());
+        state.readiness = if queued { stopped } else { ColdReadiness::Idle };
         issued
     }
 
@@ -1179,6 +1214,9 @@ impl ColdReads {
             Err(_) => state.counters.errored += 1,
         }
         state.device_reads -= 1;
+        if state.readiness == ColdReadiness::WaitDevice {
+            state.readiness = ColdReadiness::CpuPending;
+        }
         // Lossless: a window's members are at most the class queue's bound.
         state.windows.insert(token, SharedWindow { buf, remaining: members as u32 });
         state.pending_members += members as u64;
@@ -1301,6 +1339,34 @@ impl ColdReads {
     #[must_use]
     pub fn has_ready_delivery(&self) -> bool {
         self.state.borrow().ready_head.is_some()
+    }
+
+    /// Whether a drain may issue now (`CpuPending`): the park decision's
+    /// preparation half, read from the stored readiness (ADR-0181 R6).
+    #[must_use]
+    pub fn has_ready_preparation(&self) -> bool {
+        self.state.borrow().readiness == ColdReadiness::CpuPending
+    }
+
+    /// The stored preparation readiness.
+    #[must_use]
+    pub fn readiness(&self) -> ColdReadiness {
+        self.state.borrow().readiness
+    }
+
+    /// Whether the host holds work its cell must not park on (ADR-0181 R2,
+    /// R6): a ready window, or a drain that may issue now. A cell loop's
+    /// `before_park` asks this before its park flags, so a parked loop never
+    /// holds either.
+    #[must_use]
+    pub fn holds_ready_work(&self) -> bool {
+        // Canary: the park decision ignores ready delivery.
+        #[cfg(inf_canary_cold_park_without_delivery)]
+        return self.has_ready_preparation();
+        #[cfg(not(inf_canary_cold_park_without_delivery))]
+        {
+            self.has_ready_delivery() || self.has_ready_preparation()
+        }
     }
 
     /// Members of ready windows not yet visited, and those windows
@@ -1498,13 +1564,17 @@ impl ColdDone {
 impl Drop for ColdDone {
     fn drop(&mut self) {
         let mut state = self.state.borrow_mut();
-        let ColdState { pins, windows, pool, .. } = &mut *state;
+        let ColdState { pins, windows, pool, readiness, .. } = &mut *state;
         ColdState::unpin(pins, self.file);
         let window = windows.get_mut(&self.window).expect("shared window outlives its ColdDones");
         window.remaining -= 1;
         if window.remaining == 0 {
             pool.release(window.buf);
             windows.remove(&self.window);
+            // A buffer came back: a drain waiting on the pool may issue.
+            if *readiness == ColdReadiness::WaitPool {
+                *readiness = ColdReadiness::CpuPending;
+            }
         }
     }
 }

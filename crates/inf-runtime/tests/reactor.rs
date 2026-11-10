@@ -16,15 +16,17 @@ use std::io;
 use std::rc::Rc;
 use std::time::Duration;
 
+use inf_alloc::AlignedPool;
 use inf_alloc::BufferPool;
 use inf_foundation::CellId;
 use inf_foundation::bounded::{Cap, CapCensus, CapFill, CensusPhase};
 use inf_foundation::time::{Nanos, StdClock, VirtualClock};
 use inf_runtime::limits::{COLD_DELIVERIES_PER_TURN, PARK_CEILING_MAX};
 use inf_runtime::{
-    BackendDriver, Capabilities, CellLoop, CellPlane, Completion, GroupClass, IoOp, LoopConfig,
-    LoopCx, ParkCeiling, ParkCeilingTooLong, Reserved, SubmitStats, TimerNotice, TimerOutcome,
-    TimerOwner, TimerSet, Wait,
+    BackendDriver, Capabilities, CellLoop, CellPlane, ColdReadConfig, ColdReadiness, ColdReads,
+    ColdReceipt, Completion, GroupClass, IoOp, LoopConfig, LoopCx, ParkCeiling, ParkCeilingTooLong,
+    ReadClass, Reserved, SubmitStats, TierFileId, TimerNotice, TimerOutcome, TimerOwner, TimerSet,
+    Wait,
 };
 
 /// The runtime fixture's timer positions: one, which the timer test
@@ -778,4 +780,95 @@ fn an_idle_park_carries_its_ceiling() {
         timeouts.iter().all(|t| t.is_some_and(|t| t <= ceiling.get())),
         "every park carries a timeout of at most its ceiling: {timeouts:?}"
     );
+}
+
+/// The idle-progress fixture: a cold host whose ready window the plane
+/// delivers in `before_execute`, whose drain runs in MAINTAIN, and whose
+/// `before_park` is the host's park veto; it runs no task and issues no
+/// read of its own.
+struct ColdIdlePlane {
+    cold: ColdReads,
+    /// Each iteration's delivery: the members it visited.
+    visited: Vec<u32>,
+}
+
+impl CellPlane for ColdIdlePlane {
+    fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
+        panic!("the fixture's reads complete by hand: {c:?}");
+    }
+    fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
+        let progress = self.cold.deliver_ready(cx.cold_delivery_budget(), 0);
+        self.visited.push(progress.examined());
+    }
+    fn parse_execute(&mut self, _cx: &mut LoopCx<'_>) {}
+    fn maintain(&mut self, cx: &mut LoopCx<'_>) {
+        let cold = self.cold.clone();
+        cold.drain(|op| cx.push(op));
+    }
+    fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+    fn before_park(&mut self) -> bool {
+        self.cold.holds_ready_work()
+    }
+}
+
+/// One iteration of the fixture: whether the host held ready delivery as
+/// the iteration began, and whether the iteration parked.
+fn idle_iteration(
+    lp: &mut CellLoop<NullDriver, StdClock>,
+    plane: &mut ColdIdlePlane,
+) -> (bool, bool) {
+    let ready = plane.cold.has_ready_delivery();
+    let stats = lp.run_iteration(plane).expect("iteration");
+    (ready, stats.parked)
+}
+
+/// A loop with ready cold work never parks on it (ADR-0181 R2, R6): one
+/// window of `2 × 64 + 2` orphaned members, its receipt recorded, and no
+/// task, no command and no I/O after; the loop stays unparked, a turn's 64
+/// members an iteration, until the window is delivered, then parks. A
+/// request admitted while the loop idles keeps it unparked until a drain
+/// takes it.
+#[test]
+fn a_ready_cold_window_keeps_the_loop_from_parking() {
+    let per_turn = COLD_DELIVERIES_PER_TURN as usize;
+    let members = 2 * per_turn + 2;
+    let config = ColdReadConfig { qd_cap: 1, overflow_cap: members, ..ColdReadConfig::default() };
+    let cold = ColdReads::with_config(AlignedPool::new(1, 4 * inf_alloc::TIER_READ_ALIGN), config);
+    let file = TierFileId::new(9);
+    let waits: Vec<_> = (0..members)
+        .map(|_| cold.enqueue(-1, file, 0, 64, ReadClass::Foreground, 0).expect("the class's room"))
+        .collect();
+    let mut ops = Vec::new();
+    cold.drain(|op| ops.push(op));
+    drop(waits);
+    let Some(IoOp::TierRead { token, .. }) = ops.pop() else { panic!("one merged read") };
+    assert_eq!(cold.record_completion(token, Ok(()), 0), ColdReceipt::Recorded);
+    let config = LoopConfig { spin_iters: 0, ..LoopConfig::default() };
+    let mut lp = test_loop(config);
+    let mut plane = ColdIdlePlane { cold: cold.clone(), visited: Vec::new() };
+    let mut readings = Vec::new();
+    for _ in 0..5 {
+        readings.push(idle_iteration(&mut lp, &mut plane));
+    }
+    for (iteration, (ready, parked)) in readings.iter().enumerate() {
+        assert!(!(*ready && *parked), "iteration {iteration} parked with ready delivery");
+    }
+    assert_eq!(
+        plane.visited,
+        [per_turn, per_turn, 2, 0, 0].map(|n| n as u32),
+        "a turn's allowance"
+    );
+    assert_eq!(readings[3], (false, true), "engagement: the idle loop parks once delivered");
+    assert_eq!(cold.reconcile(), Ok(()), "every orphan returned its share");
+    // A request admitted while the loop idles: the next iteration polls
+    // and drains it, and the one after parks on the read in flight.
+    let wait = cold.enqueue(-1, file, 0, 64, ReadClass::Foreground, 0).expect("room");
+    assert_eq!(cold.readiness(), ColdReadiness::CpuPending);
+    let (_, parked) = idle_iteration(&mut lp, &mut plane);
+    assert!(!parked, "a parked loop held a request a drain could issue");
+    assert_eq!(cold.inflight_total(), 1, "the drain issued it");
+    assert_eq!(cold.readiness(), ColdReadiness::Idle);
+    let (_, parked) = idle_iteration(&mut lp, &mut plane);
+    assert!(parked, "engagement: nothing left but the device's read");
+    drop(wait);
 }

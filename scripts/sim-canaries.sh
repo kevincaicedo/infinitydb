@@ -925,6 +925,9 @@ rows=(
   # ADR-0181 R2: a turn's cold delivery runs before either executor pass; planted, it runs at
   # parse_execute's head, so with remote_first_execute a woken task polls first.
   "inf_canary_cold_delivery_after_execute crate-test inf-runtime test:reactor a_turns_cold_delivery_precedes_a_woken_tasks_poll_in_both_modes polled before the turn's delivery"
+  # ADR-0181 R2: a parked loop never holds ready cold delivery; planted, the park veto ignores
+  # it, so an idle loop parks with a ready window.
+  "inf_canary_cold_park_without_delivery crate-test inf-runtime test:reactor a_ready_cold_window_keeps_the_loop_from_parking parked with ready delivery"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
