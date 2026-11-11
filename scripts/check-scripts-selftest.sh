@@ -1499,6 +1499,13 @@ expect red "canaries: controls-only never ran the planted simulator" test -e "$d
 dir=$(sim_fixture sim-controls-only-printed TOKEN "exit 0" "$summary")
 expect_red_because "canaries: controls-only refuses a token the control prints" "no catch possible" env INF_CANARY_CONTROLS_ONLY=1 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 expect_red_because "canaries: a controls-only knob other than 0 or 1 is a scope failure" "INF_CANARY_CONTROLS_ONLY wants 0 or 1" env INF_CANARY_CONTROLS_ONLY=yes INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# INF_CANARY_SIM_TARGET is the stub route alone (ADR-0204): beside a real
+# cargo, here a `cargo` on PATH that builds nothing as a root holding an
+# earlier round's build would, the row would judge the simulators the knob
+# names, and their stale catch would read green. Refused before any build.
+dir=$(sim_fixture sim-target-real-cargo TOKEN "$violation; exit 1")
+mkdir -p "$dir/bin" && cp "$dir/cargo" "$dir/bin/cargo" && chmod +x "$dir/bin/cargo"
+expect_red_because "canaries: a simulator directory beside a real cargo is a scope failure" "INF_CANARY_SIM_TARGET is the self-test's stub route" env -u INF_CANARY_CARGO PATH="$dir/bin:$PATH" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 # ADR-0159 A1.6: a `loom` row builds both legs under `--cfg loom` — the
 # stub answers only when it sees it, so a driver that dropped the cfg is
 # red for another reason, never a catch.

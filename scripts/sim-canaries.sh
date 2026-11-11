@@ -60,7 +60,9 @@
 # Fixture mode (scripts/check-scripts-selftest.sh): INF_CANARY_ROWS_FILE
 # replaces the row table, INF_CANARY_CARGO the cargo binary and
 # INF_CANARY_SIM_TARGET the directory a scenario row's simulators are read
-# from (`target`; a stub cargo builds nothing there).
+# from (`target`; a stub cargo builds nothing there). INF_CANARY_SIM_TARGET
+# without INF_CANARY_CARGO is a scope error: beside a real cargo a row judges
+# the simulators its own build wrote in this checkout's root (ADR-0204).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 seed=${1:-0xC0FFEE}
@@ -953,6 +955,13 @@ fi
 # shellcheck source=target-root.sh
 . scripts/target-root.sh
 target_root_setup "$(pwd -P)"
+# The simulator directory knob is the self-test's stub route: a real cargo
+# builds into the root, so a row read elsewhere would judge another build.
+if [ -n "${INF_CANARY_SIM_TARGET:-}" ] && [ -z "${INF_CANARY_CARGO:-}" ]; then
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_SIM_TARGET is the self-test's stub route and" \
+    "needs INF_CANARY_CARGO; beside a real cargo a row reads what it built in $TARGET_ROOT"
+  exit 1
+fi
 
 fail=0
 work=$(mktemp -d "${TMPDIR:-/tmp}/sim-canaries.XXXXXX")
@@ -1150,7 +1159,7 @@ for row in "${rows[@]}"; do
   fi
   if [ "$controls_only" -eq 1 ]; then continue; fi
   canary_root="$sim_target/canary-$cfg"
-  echo "== canary $cfg: building inf-sim with --cfg $cfg into $canary_root"
+  echo "== canary $cfg: building inf-sim with --cfg $cfg into $TARGET_ROOT/canary-$cfg"
   RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
     --target-dir "$TARGET_ROOT/canary-$cfg"
   planted="$canary_root/release/inf-sim"
