@@ -1167,9 +1167,8 @@ mod tests {
         let guard = |script: &str| ServerGuard { child: spawn_ready(script), port: 0 };
         // `sh` runs a trap only once its foreground `sleep` returns, so the
         // loop sleeps briefly and the trap lands within one pass.
-        let traps = |code: u8| {
-            format!("trap 'exit {code}' TERM; echo ready; while :; do sleep 0.01; done")
-        };
+        let traps =
+            |code: u8| format!("trap 'exit {code}' TERM; echo ready; while :; do sleep 0.01; done");
         let deadline = Duration::from_secs(GRACEFUL_STOP_DEADLINE_S);
         let clean = guard(&traps(0));
         assert!(clean.stop_graceful(deadline).is_ok(), "exit 0 after SIGTERM");
