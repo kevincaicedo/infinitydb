@@ -19,7 +19,7 @@
 //! the test red; `INF_MEMLOCK_BOOT_REQUIRE=1` (CI's Linux legs) makes the
 //! skip below a failure.
 
-// nextest-alone: 3.4-3.8 s. The kernel keeps the pinned-memory budget per
+// nextest-alone: 3.4-5.2 s. The kernel keeps the pinned-memory budget per
 // user, and every node a sibling test process boots charges its rings to it,
 // so the budget this verdict reads is the lane's unless it runs alone. Nodes
 // another lane boots on the box charge it too, which running alone in this
