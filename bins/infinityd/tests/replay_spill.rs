@@ -51,11 +51,14 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// those rounds land on is shared with every test process running beside
 /// the arm, so a slow flush there is no defect of it: on a device whose
 /// every flush waits 3 s a demote arm answered a legal `-STALLED` at the
-/// product's 1 s default. Like [`READ_TIMEOUT`] this bound turns a wedged
-/// flush into a failure; it is no device budget (ADR-0200 D7). It sits
-/// below that timeout, so a write that does stall answers typed before the
-/// client calls it a hang.
-const TAIL_STALL_TIMEOUT_MS: u64 = 20_000;
+/// product's 1 s default. A parked write waits whole device barriers, two
+/// to a flush round, behind as many rounds as its cell's flush has queued,
+/// and no product limit bounds that count, so the bound is the largest
+/// value the key takes (1 to 60,000 ms). Like [`READ_TIMEOUT`] it turns a
+/// wedged flush into a failure; it is no device budget (ADR-0200 D7, A1).
+/// It sits below that timeout, so a write that does stall answers typed
+/// before the client calls it a hang.
+const TAIL_STALL_TIMEOUT_MS: u64 = 60_000;
 const _: () = assert!(
     (TAIL_STALL_TIMEOUT_MS as u128) < READ_TIMEOUT.as_millis(),
     "a stalled write answers before the client's hang bound"
