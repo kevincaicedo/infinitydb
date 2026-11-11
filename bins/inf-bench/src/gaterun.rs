@@ -794,7 +794,7 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         .get("fill-keys")
         .map_or(Ok(10_000_000), str::parse)
         .map_err(|e| format!("--fill-keys: {e}"))?;
-    let infinityd = flags.str_or("infinityd-bin", "target/release/infinityd");
+    let infinityd = flags.str_or("infinityd-bin", &crate::cli::default_infinityd_bin());
     let redis_bin = flags.str_or("redis-bin", "redis-server");
     let reference_box = flags.bool("reference-box");
 

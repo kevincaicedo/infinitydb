@@ -896,15 +896,13 @@ fn shell_token(s: &str) -> String {
     if s.is_empty() || s.contains(char::is_whitespace) { format!("'{s}'") } else { s.to_string() }
 }
 
-/// Prefer a release build next to the workspace, then debug, then `$PATH`.
+/// The server built in the target root that built this binary, release
+/// before debug, else `$PATH`'s (`env::built_binaries`).
 fn resolve_infinityd() -> PathBuf {
-    for candidate in ["target/release/infinityd", "target/debug/infinityd"] {
-        let path = PathBuf::from(candidate);
-        if path.exists() {
-            return path;
-        }
-    }
-    PathBuf::from("infinityd")
+    crate::env::built_binaries("infinityd")
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("infinityd"))
 }
 
 fn on_path(program: &str) -> bool {

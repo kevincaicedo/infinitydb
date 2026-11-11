@@ -132,7 +132,7 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     let replicates: usize = flags.usize_or("replicates", 3)?;
     let duration: u64 = flags.u64_or("duration", 10)?;
     let cells: u16 = flags.u16_or("cells", 4)?;
-    let infinityd = flags.str_or("infinityd-bin", "target/release/infinityd");
+    let infinityd = flags.str_or("infinityd-bin", &crate::cli::default_infinityd_bin());
     let reference_box = flags.bool("reference-box");
     // Server data lives on a real filesystem: an fsync against tmpfs
     // (p50 ~77 µs) measures nothing this row cares about.

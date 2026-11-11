@@ -110,7 +110,7 @@ fn invalid_or_uncontrolled_cpu_placement_refuses_before_launch_and_artifacts() {
 fn unavailable_failing_and_trimmed_taskset_cannot_silently_disable_pinning() {
     let fixture = Fixture::new("failed-taskset");
     let taskset = fixture.0.join("taskset");
-    let absent = Command::new(env!("CARGO_BIN_EXE_inf-compare"))
+    let absent = Command::new(fixture.bin())
         .current_dir(&fixture.0)
         .env("PATH", "")
         .args([

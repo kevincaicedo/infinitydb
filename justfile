@@ -1,5 +1,13 @@
 # InfinityDB workspace tasks. Run from infinitydb/ (the published repo root).
 
+# Every recipe builds in this checkout's own target (ADR-0204 D1): cargo reads
+# another checkout's outputs as fresh, and a moved root or a target triple
+# leaves a path into target/<profile> naming an older build, so before any
+# recipe runs scripts/target-root.sh refuses each setting that moves the root,
+# a root a copied or moved checkout carries, and one holding outputs no marker
+# names.
+export CARGO_TARGET_DIR := `./scripts/target-root.sh --print`
+
 default: check
 
 check:
@@ -135,10 +143,11 @@ loom:
     # `wake` types.
     RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p inf-foundation --release loom_
 
-# Compat-diff requires Redis 8.0.5 on PATH or INF_COMPAT_ORACLE_ADDR.
+# Compat-diff requires Redis 8.0.5 on PATH or INF_COMPAT_ORACLE_ADDR. The
+# server it diffs is the one it builds, in this checkout's target root.
 compat:
     cargo build -p infinityd
-    INF_COMPAT_REQUIRE_BINARY=1 INFINITYD_BIN={{justfile_directory()}}/target/debug/infinityd cargo test -p compat -- --nocapture
+    INF_COMPAT_REQUIRE_BINARY=1 INFINITYD_BIN={{quote(CARGO_TARGET_DIR + "/debug/infinityd")}} cargo test -p compat -- --nocapture
 
 # Deterministic simulator smoke scenarios, each twice, comparing traces.
 # m4-steel is the M4-S04 steel-thread twin (tiered lifecycle + cold reads
@@ -242,7 +251,7 @@ client-smoke port="6379":
     set -euo pipefail
     cargo build --release -p infinityd
     docker build -t infinitydb-client-smoke -f deploy/client-smoke/Dockerfile tests/client-smoke
-    ./target/release/infinityd --port {{port}} >/tmp/infinityd-client-smoke.log 2>&1 &
+    {{quote(CARGO_TARGET_DIR + "/release/infinityd")}} --port {{port}} >/tmp/infinityd-client-smoke.log 2>&1 &
     pid=$!
     trap 'kill "$pid" 2>/dev/null || true' EXIT
     for i in $(seq 1 50); do redis-cli -p {{port}} ping 2>/dev/null | grep -q PONG && break || sleep 0.2; done
