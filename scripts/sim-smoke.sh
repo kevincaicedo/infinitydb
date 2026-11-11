@@ -10,8 +10,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 seed=${1:-0xC0FFEE}
 
-cargo build --release -p inf-sim --features dst --bin inf-sim
-bin=target/release/inf-sim
+# The simulator this run builds is the one it runs: both in this checkout's
+# target root, whatever CARGO_TARGET_DIR holds (ADR-0198 A2).
+# shellcheck source=target-root.sh
+. scripts/target-root.sh
+target_root_setup "$(pwd -P)"
+cargo build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT"
+bin="$TARGET_ROOT/release/inf-sim"
 
 # F-L11-05: an accept-path error is a counter, never connection teardown.
 # The accept-broken row parks each listener as broken, which no close

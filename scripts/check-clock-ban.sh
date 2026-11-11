@@ -96,7 +96,14 @@ else
     # The verdict parses clippy's human-readable lines, so colour is pinned
     # off: CI sets CARGO_TERM_COLOR=always, whose escapes hide every plant.
     probe_target || { echo "CLOCK-BAN SCOPE ERROR: the probe's target architecture is unknown"; exit 1; }
-    (cd "$work/probe" && env -u CLIPPY_CONF_DIR cargo clippy --quiet --color never --target "$PROBE_TARGET" --target-dir "$work/target" --message-format=short -- -W clippy::disallowed-methods -W clippy::disallowed-types >"$diag" 2>&1) || true
+    # The probe builds cold, in a directory no earlier run wrote (ADR-0204 D4):
+    # exit 2 is that check's refusal with nothing run, a scope error; any other
+    # status is clippy's, which the plants below judge.
+    # shellcheck source=target-root.sh
+    . "$SCRIPT_DIR/target-root.sh"
+    probe_status=0
+    (cd "$work/probe" && target_root_cargo_fresh "$work/target" env -u CLIPPY_CONF_DIR cargo clippy --quiet --color never --target "$PROBE_TARGET" --message-format=short -- -W clippy::disallowed-methods -W clippy::disallowed-types >"$diag" 2>&1) || probe_status=$?
+    [ "$probe_status" -ne 2 ] || { echo "CLOCK-BAN SCOPE ERROR: the probe did not run:"; sed 's/^/    | /' "$diag"; exit 1; }
     plants=0
     controls=0
     foreign_plants=0

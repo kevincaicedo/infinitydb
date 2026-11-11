@@ -947,6 +947,13 @@ if [ -n "${INF_CANARY_SHARD:-}" ]; then
   rows=("${picked[@]}")
 fi
 
+# Every build lands in this checkout's target root, each planted cfg in a
+# directory of its own there (its RUSTFLAGS differ), and every leg runs the
+# binary its own build made, whatever CARGO_TARGET_DIR holds (ADR-0198 A2).
+# shellcheck source=target-root.sh
+. scripts/target-root.sh
+target_root_setup "$(pwd -P)"
+
 fail=0
 work=$(mktemp -d "${TMPDIR:-/tmp}/sim-canaries.XXXXXX")
 case "$work" in
@@ -990,7 +997,8 @@ crate_test() {
   if [ "$package" = inf-sim ]; then target_args+=(--features dst); fi
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
   echo "== canary $cfg: $package $target $name on the plain build must stay green"
-  if ! "$CARGO" test -p "$package" "${target_args[@]}" -- "$name" --show-output > "$control" 2>&1 \
+  if ! "$CARGO" test -p "$package" "${target_args[@]}" --target-dir "$TARGET_ROOT" -- "$name" \
+      --show-output > "$control" 2>&1 \
       || ! grep -Eq -- "${verdict}ok" "$control"; then
     echo "   the plain build does not pass '$name' (a canary needs a green control):"
     tail -5 "$control"
@@ -1004,7 +1012,7 @@ crate_test() {
   if [ "$controls_only" -eq 1 ]; then return; fi
   echo "== canary $cfg: $package $target $name on the planted build must go red"
   if RUSTFLAGS="--cfg $cfg" "$CARGO" test -p "$package" "${target_args[@]}" \
-      --target-dir "target/canary-crate" -- "$name" > "$log" 2>&1; then
+      --target-dir "$TARGET_ROOT/canary-crate" -- "$name" > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
@@ -1034,7 +1042,7 @@ loom_test() {
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
   echo "== canary $cfg: $package loom $name on the plain loom build must stay green"
   if ! RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" --release \
-      --lib --target-dir "target/loom" -- "$name" --show-output > "$control" 2>&1 \
+      --lib --target-dir "$TARGET_ROOT/loom" -- "$name" --show-output > "$control" 2>&1 \
       || ! grep -Eq -- "${verdict}ok" "$control"; then
     echo "   the plain loom build does not pass '$name' (a canary needs a green control):"
     tail -5 "$control"
@@ -1048,7 +1056,7 @@ loom_test() {
   if [ "$controls_only" -eq 1 ]; then return; fi
   echo "== canary $cfg: $package loom $name on the planted build must go red"
   if RUSTFLAGS="--cfg loom --cfg $cfg" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" \
-      --release --lib --target-dir "target/canary-loom" -- "$name" > "$log" 2>&1; then
+      --release --lib --target-dir "$TARGET_ROOT/canary-loom" -- "$name" > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the model has no teeth)"
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
@@ -1114,7 +1122,7 @@ for row in "${rows[@]}"; do
   fi
   name=${parts[1]}; expect=${parts[2]}; flags=("${parts[@]:3}")
   if [ "$sim_built" -eq 0 ]; then
-    "$CARGO" build --release -p inf-sim --features dst --bin inf-sim
+    "$CARGO" build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT"
     sim_built=1
   fi
   plain=$sim_target/release/inf-sim
@@ -1141,11 +1149,11 @@ for row in "${rows[@]}"; do
     continue
   fi
   if [ "$controls_only" -eq 1 ]; then continue; fi
-  target="$sim_target/canary-$cfg"
-  echo "== canary $cfg: building inf-sim with --cfg $cfg into $target"
+  canary_root="$sim_target/canary-$cfg"
+  echo "== canary $cfg: building inf-sim with --cfg $cfg into $canary_root"
   RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
-    --target-dir "$target"
-  planted="$target/release/inf-sim"
+    --target-dir "$TARGET_ROOT/canary-$cfg"
+  planted="$canary_root/release/inf-sim"
   echo "== canary $cfg: $name ${flags[*]:-} (lane seed $seed) on the planted build must go red"
   if "$planted" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"

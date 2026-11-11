@@ -1087,7 +1087,7 @@ impl BlobSetArgs {
     fn parse(flags: &Flags, plant: Plant) -> Result<BlobSetArgs, String> {
         let env_ok = env_gate(flags)?;
         let reference_box = flags.bool("reference-box");
-        let binary = flags.str_or("infinityd-bin", "target/release/infinityd");
+        let binary = flags.str_or("infinityd-bin", &crate::cli::default_infinityd_bin());
         let data_root = flags.require("data-root")?.to_string();
         let filesystem = admit_device_root(flags, Path::new(&data_root), reference_box)?;
         if crate::gaterun::is_memory_fs(&filesystem) {
