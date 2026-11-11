@@ -33,6 +33,10 @@
 //! readiness is a `DBSIZE` answer, a refusal is the exit.
 #![cfg(target_os = "linux")]
 
+// nextest-stall-default: each tiered namespace here is created, refused or
+// booted from a seeded catalog, and none is written: no write reaches a
+// window (ADR-0053 D4), so the stall bound is never read.
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};

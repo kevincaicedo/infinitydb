@@ -11,6 +11,9 @@
 //! and what this test proves is the record *application* semantics.
 //! Oracles compare content and versions, never addresses (§3.1).
 
+// nextest-stall-default: the store sits below the server plane, which alone
+// arms the tail stall (ADR-0053 D4): no write here waits on it.
+
 use std::collections::BTreeMap;
 use std::path::Path;
 

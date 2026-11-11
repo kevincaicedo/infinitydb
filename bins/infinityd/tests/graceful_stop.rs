@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 /// One spawning test at a time (batch 69): macOS sets `CLOEXEC` after
 /// `socket(2)`, so a sibling test's `posix_spawn` in that window inherits
 /// this test's client socket and its port picker — the client then never
-/// sees the server's FIN, and the picked port is a ghost's.
+/// sees the server's FIN, and the picked port is a ghost's. Separate
+/// processes cannot race this way, so the lock binds the threads of one test
+/// process only.
+// nextest-in-process: a spawn race between the threads of one test process
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 fn unique() -> u32 {

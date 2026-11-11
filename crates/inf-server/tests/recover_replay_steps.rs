@@ -13,6 +13,10 @@
 //! file's CRC-verified frames. The start step's tier map is judged at its
 //! own size (ADR-0202): the sweeps, the maps and their listings.
 
+// nextest-stall-default: the cell's keyspace runs on the injected `MemFs`
+// seam, below the server plane, which alone arms the tail stall (ADR-0053
+// D4): no write here waits on it.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;

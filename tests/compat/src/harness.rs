@@ -228,7 +228,10 @@ pub const ORACLE_VERSION: &str = "8.0.5";
 /// Serializes every test in a process on the one pinned
 /// `INF_COMPAT_ORACLE_ADDR` server. Tests in a binary run in parallel,
 /// and the scripts write, flush and count one shared keyspace: unlocked,
-/// one test's `FLUSHALL` lands mid-way through another's matrix.
+/// one test's `FLUSHALL` lands mid-way through another's matrix. Under
+/// nextest each test is a process of its own, which this lock cannot reach:
+/// the `compat-oracle` group of one thread keeps the package's tests apart.
+// nextest-group: compat-oracle
 static SHARED_ORACLE: Mutex<()> = Mutex::new(());
 
 /// Keeps an oracle to its test: a spawned server dies with the guard; the

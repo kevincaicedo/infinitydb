@@ -5612,6 +5612,9 @@ fn t_ckpt_seconds(share_bytes_per_s: f64, owed: f64, cap: f64, charged: f64, del
 /// advanced, the checkpoint never published, and `INF.CKPT WAIT` never
 /// returned. The bound is two D4 waits (the oversized block, then the
 /// footer behind its debt) plus 2 s of harness slack.
+// nextest-alone: 1.0-2.0 s. Its bound, about 3.5 s, is its subject and leaves
+// less slack than a hang bound, so the CPU and device that sibling test
+// processes take would move the verdict (ADR-0200 D7).
 #[test]
 fn a_checkpoint_holding_a_value_above_the_class_cap_completes() {
     let dir = temp_data_dir("ckpt-overrun");
