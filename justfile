@@ -12,6 +12,10 @@ default: check
 
 check:
     cargo fmt --all --check
+    # ADR-0200 D5: the tests run under cargo-nextest, at least the version
+    # .config/nextest.toml requires; a missing or older one is red here, in
+    # about a second, not after the gates.
+    cargo nextest show-config version
     # Every relative link in a published Markdown file resolves inside the
     # repository (ADR-0166 D5), beside the document identities.
     ./scripts/check-doc-artifacts.sh
@@ -69,6 +73,11 @@ check:
     # ADR-0106 second amendment (review 2026-08-30, F-L20-03): the M0-S06
     # AC's own gate ran nowhere and scanned zero instructions per waker.
     ./scripts/check-waker-atomics.sh
+    # ADR-0200 D2, D4, D7: every static lock and run-alone test in a test
+    # target has its nextest override, CI installs the nextest the config
+    # requires, and no test file reads free space or leaves a tiered
+    # namespace's stall bound unstated.
+    ./scripts/check-nextest-config.sh
     cargo clippy --workspace --all-targets -- -D warnings
     # ADR-0164: the document gates of the combined checkout; a standalone
     # checkout prints the skip. They run after clippy, so a compile or lint
@@ -78,14 +87,19 @@ check:
     # their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
     # It runs after clippy, so a compile or lint red stops the run first.
     ./scripts/check-scripts-selftest.sh
-    cargo test --workspace
+    # ADR-0200 D1: each set's tests run under nextest, one process a test,
+    # every binary even after a red; its doctests run under cargo test.
+    cargo nextest run --no-fail-fast --workspace
+    cargo test --doc --workspace
     cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings
-    cargo test -p inf-doc -p inf-store --features doc-intern-keys
+    cargo nextest run --no-fail-fast -p inf-doc -p inf-store --features doc-intern-keys
+    cargo test --doc -p inf-doc -p inf-store --features doc-intern-keys
     # Slim-build lane (L11, ADR-0041 D3): a docless server carries zero
     # document/path code and must keep compiling that way — warnings
     # denied since ADR-0125 A2 (a doc-only const warned here for months).
     cargo clippy -p inf-server -p inf-store --no-default-features -- -D warnings
-    cargo test -p inf-server -p inf-store --no-default-features
+    cargo nextest run --no-fail-fast -p inf-server -p inf-store --no-default-features
+    cargo test --doc -p inf-server -p inf-store --no-default-features
 
 build:
     cargo build --workspace --exclude inf-sim
