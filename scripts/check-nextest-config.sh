@@ -328,6 +328,17 @@ class Source:
             up = first - 1
         return found.group(1) if found else None
 
+    def attribute_end(self, number):
+        """The last line of the attribute that starts on `number`: where its
+        brackets, counted from its first line, balance (an attribute spans
+        lines, `#![allow(\\n…\\n)]`), or the file's last line."""
+        end, balance = number, 0
+        while True:
+            balance += self.code[end].count("[") - self.code[end].count("]")
+            if balance <= 0 or end + 1 >= len(self.code):
+                return end
+            end += 1
+
     def leading(self):
         """The line numbers of the file's leading block: comments, blank lines and
         inner attributes before its first item."""
@@ -338,12 +349,7 @@ class Source:
                 block.append(number)
                 number += 1
             elif code.startswith("#!["):
-                end = number
-                while self.code[end].count("[") - self.code[end].count("]") > 0 or end == number:
-                    balance = sum(c.count("[") - c.count("]") for c in self.code[number:end + 1])
-                    if balance <= 0 or end + 1 >= len(self.code):
-                        break
-                    end += 1
+                end = self.attribute_end(number)
                 block.extend(range(number, end + 1))
                 number = end + 1
             else:
@@ -471,9 +477,7 @@ for path in scanned:
             code = here.code[below].strip()
             if not code.startswith("#["):
                 break
-            first, end = below, below
-            while sum(c.count("[") - c.count("]") for c in here.code[first:end + 1]) > 0:
-                end += 1
+            end = here.attribute_end(below)
             is_test |= re.fullmatch(r"#\[test\]", code) is not None
             below = end + 1
         function = re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)",
