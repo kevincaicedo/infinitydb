@@ -120,8 +120,12 @@ Requirements:
   library.
 - **A C++17 compiler** (`c++`, `g++` or `clang++`): `just check` compiles every
   fuzz target, and their build compiles libFuzzer's C++ runtime.
-- [`just`](https://github.com/casey/just) for the task runner, and
-  `cargo-deny` for the dependency-policy check.
+- [`just`](https://github.com/casey/just) for the task runner,
+  `cargo-deny` for the dependency-policy check, and
+  [`cargo-nextest`](https://nexte.st) for the tests, at the version
+  `.config/nextest.toml` requires (its `nextest-version`): `cargo install
+  --locked cargo-nextest --version <that version>`. `just check` is red at
+  its second line when nextest is missing or older.
 
 **A checkout builds in its own `target/`.** Before the first plain `cargo`
 command, and before opening the clone in an editor whose language server runs
@@ -239,8 +243,20 @@ shipping features, file length and line width, lint ratchet and scopes,
 documentation links); the gates' own self-test, which runs each gate on
 planted cases and requires each to exit non-zero (a case written with
 `expect_red_because` also requires its cause in the gate's output); clippy
-with `-D warnings`; and the workspace tests. The `check` recipe in the
-[`justfile`](justfile) is the exact list.
+with `-D warnings`; and the tests of the workspace and of two feature sets,
+each test a process of its own under `cargo nextest run`, which runs every
+test binary even after a red, and their doctests under `cargo test --doc`.
+The `check` recipe in the [`justfile`](justfile) is the exact list. While
+you edit one crate, its clippy and `cargo nextest run -p <crate>` are the
+quick loop.
+
+Under nextest a static lock in a test target no longer keeps its tests
+apart, so `.config/nextest.toml` does: a lock that keeps tests apart puts
+its target in a group of one thread, and a test whose verdict reads what
+other tests share (a pinned-memory budget, a live rate, a tight wall-clock
+bound) runs alone, first. Each such lock and test carries a marker in its
+source saying why; `scripts/check-nextest-config.sh` pairs every marker with
+its rule and names what is missing.
 
 Layer-specific checks, run them when you touch the relevant area:
 
