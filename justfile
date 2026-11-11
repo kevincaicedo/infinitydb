@@ -15,9 +15,6 @@ check:
     # Every relative link in a published Markdown file resolves inside the
     # repository (ADR-0166 D5), beside the document identities.
     ./scripts/check-doc-artifacts.sh
-    # ADR-0164: the document gates of the combined checkout; a standalone
-    # checkout prints the skip.
-    ./scripts/check-parent-doc-gates.sh
     ./scripts/check-dep-dag.sh
     ./scripts/check-cell-denylist.sh
     ./scripts/check-fault-points.sh
@@ -73,6 +70,10 @@ check:
     # AC's own gate ran nowhere and scanned zero instructions per waker.
     ./scripts/check-waker-atomics.sh
     cargo clippy --workspace --all-targets -- -D warnings
+    # ADR-0164: the document gates of the combined checkout; a standalone
+    # checkout prints the skip. They run after clippy, so a compile or lint
+    # red comes first.
+    ./scripts/check-parent-doc-gates.sh
     # ADR-0106: the gates above must go red on a planted violation, or
     # their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
     # It runs after clippy, so a compile or lint red stops the run first.
