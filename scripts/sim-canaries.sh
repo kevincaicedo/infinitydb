@@ -61,8 +61,9 @@
 # replaces the row table, INF_CANARY_CARGO the cargo binary and
 # INF_CANARY_SIM_TARGET the directory a scenario row's simulators are read
 # from (`target`; a stub cargo builds nothing there). INF_CANARY_SIM_TARGET
-# without INF_CANARY_CARGO is a scope error: beside a real cargo a row judges
-# the simulators its own build wrote in this checkout's root (ADR-0204).
+# beside a real cargo (no INF_CANARY_CARGO, or one whose `--version` answers
+# as cargo does) is a scope error: a row judges the simulators its own build
+# wrote in this checkout's root (ADR-0204).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 seed=${1:-0xC0FFEE}
@@ -957,10 +958,19 @@ fi
 target_root_setup "$(pwd -P)"
 # The simulator directory knob is the self-test's stub route: a real cargo
 # builds into the root, so a row read elsewhere would judge another build.
-if [ -n "${INF_CANARY_SIM_TARGET:-}" ] && [ -z "${INF_CANARY_CARGO:-}" ]; then
-  echo "sim-canaries: SCOPE ERROR — INF_CANARY_SIM_TARGET is the self-test's stub route and" \
-    "needs INF_CANARY_CARGO; beside a real cargo a row reads what it built in $TARGET_ROOT"
-  exit 1
+# A cargo is real when none is named, or when it answers `--version` as cargo
+# does: the real one or a wrapper passing through to it.
+if [ -n "${INF_CANARY_SIM_TARGET:-}" ]; then
+  cargo_answer=
+  if [ -n "${INF_CANARY_CARGO:-}" ]; then cargo_answer=$("$CARGO" --version 2>/dev/null || true); fi
+  case "${INF_CANARY_CARGO:+named}:$cargo_answer" in
+    : | named:"cargo "[0-9]*)
+      echo "sim-canaries: SCOPE ERROR — INF_CANARY_SIM_TARGET is the self-test's stub route, and" \
+        "this cargo is a real one: unset INF_CANARY_SIM_TARGET, so each row reads what it built" \
+        "in $TARGET_ROOT"
+      exit 1
+      ;;
+  esac
 fi
 
 fail=0

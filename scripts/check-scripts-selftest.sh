@@ -1506,6 +1506,11 @@ expect_red_because "canaries: a controls-only knob other than 0 or 1 is a scope 
 dir=$(sim_fixture sim-target-real-cargo TOKEN "$violation; exit 1")
 mkdir -p "$dir/bin" && cp "$dir/cargo" "$dir/bin/cargo" && chmod +x "$dir/bin/cargo"
 expect_red_because "canaries: a simulator directory beside a real cargo is a scope failure" "INF_CANARY_SIM_TARGET is the self-test's stub route" env -u INF_CANARY_CARGO PATH="$dir/bin:$PATH" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# The same knob beside a named cargo that answers `--version` as cargo does:
+# the real one, or a wrapper passing through to it. Refused as well.
+dir=$(sim_fixture sim-target-named-real-cargo TOKEN "$violation; exit 1")
+printf '#!/usr/bin/env bash\ncase "${1:-}" in --version) echo "cargo 1.95.0 (0123abcd 2026-03-01)" ;; esac\nexit 0\n' >"$dir/cargo"
+expect_red_because "canaries: a simulator directory beside a cargo answering as cargo is a scope failure" "unset INF_CANARY_SIM_TARGET" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 # ADR-0159 A1.6: a `loom` row builds both legs under `--cfg loom` — the
 # stub answers only when it sees it, so a driver that dropped the cfg is
 # red for another reason, never a catch.
