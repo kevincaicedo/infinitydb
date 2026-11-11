@@ -53,8 +53,16 @@ jobs:
           toolchain: 1.95.0
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # ADR-0200 D4: the tests run under cargo-nextest, the version
+      # .config/nextest.toml requires, installed from its published lock.
+      - name: install cargo-nextest
+        run: cargo install --locked cargo-nextest --version 0.9.150
       - name: fmt
         run: cargo fmt --all --check
+      # ADR-0200 D5: red here, not after the gates, when the installed
+      # nextest is missing or older than the config's floor.
+      - name: nextest meets the config's floor
+        run: cargo nextest show-config version
       - name: documentation identities and relative links (ADR-0106 D15, ADR-0166 D5)
         run: ./scripts/check-doc-artifacts.sh
       - name: dep-DAG law
@@ -113,6 +121,12 @@ jobs:
       - name: lint ratchet (ADR-0144 D3; absorbs the fn-length ratchet)
         if: runner.os == 'Linux'
         run: ./scripts/check-lint-ratchet.sh
+      # ADR-0200 D2, D4, D7: every static lock and run-alone test in a test
+      # target has its nextest override, this workflow installs the nextest
+      # the config requires, and no test file reads free space or leaves a
+      # tiered namespace's stall bound unstated.
+      - name: nextest config (ADR-0200)
+        run: ./scripts/check-nextest-config.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       # ADR-0106: the gates must go red on a planted violation, or their OK
@@ -124,12 +138,17 @@ jobs:
         run: cargo build --workspace --exclude inf-sim
       - name: build simulator (isolated DST features)
         run: cargo build -p inf-sim --features dst
+      # ADR-0200 D1: one process a test, every binary even after a red; the
+      # doctests under cargo test. Compat runs with its pinned oracles in
+      # compat-diff.
       - name: test (compat runs with its pinned oracles in compat-diff)
-        run: cargo test --workspace --exclude compat
+        run: cargo nextest run --no-fail-fast --workspace --exclude compat
         env:
           # memlock_boot may skip only where rings are not charged to
           # RLIMIT_MEMLOCK; on the Linux legs a skip is a failure.
           INF_MEMLOCK_BOOT_REQUIRE: ${{ runner.os == 'Linux' && '1' || '0' }}
+      - name: doctests
+        run: cargo test --doc --workspace --exclude compat
 
   slim-build:
     # L11: workspace feature unification hides missing doc guards, so the
@@ -145,6 +164,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: slim-build
+      # ADR-0200 D4: the tests run under cargo-nextest, the version
+      # .config/nextest.toml requires, installed from its published lock.
+      - name: install cargo-nextest
+        run: cargo install --locked cargo-nextest --version 0.9.150
+      # ADR-0200 D5: red here, not after the gates, when the installed
+      # nextest is missing or older than the config's floor.
+      - name: nextest meets the config's floor
+        run: cargo nextest show-config version
       - name: slim clippy
         run: cargo clippy -p inf-server -p inf-store --no-default-features -- -D warnings
       - name: slim libraries
@@ -162,7 +189,9 @@ jobs:
             exit 1
           fi
       - name: slim tests
-        run: cargo test -p inf-server -p inf-store --no-default-features
+        run: cargo nextest run --no-fail-fast -p inf-server -p inf-store --no-default-features
+      - name: slim doctests
+        run: cargo test --doc -p inf-server -p inf-store --no-default-features
 
   doc-intern-keys:
     runs-on: ubuntu-24.04
@@ -176,10 +205,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: doc-intern-keys
+      # ADR-0200 D4: the tests run under cargo-nextest, the version
+      # .config/nextest.toml requires, installed from its published lock.
+      - name: install cargo-nextest
+        run: cargo install --locked cargo-nextest --version 0.9.150
+      # ADR-0200 D5: red here, not after the gates, when the installed
+      # nextest is missing or older than the config's floor.
+      - name: nextest meets the config's floor
+        run: cargo nextest show-config version
       - name: interned document clippy
         run: cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings
       - name: interned document tests
-        run: cargo test -p inf-doc -p inf-store --features doc-intern-keys
+        run: cargo nextest run --no-fail-fast -p inf-doc -p inf-store --features doc-intern-keys
+      - name: interned document doctests
+        run: cargo test --doc -p inf-doc -p inf-store --features doc-intern-keys
 
   benchmark-sanity:
     # Correctness and compilation only; hosted runners do not prove perf gates.
