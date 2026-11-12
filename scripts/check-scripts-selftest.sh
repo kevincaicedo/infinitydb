@@ -21,6 +21,9 @@
 # <name>` runs one). A group's body is not indented: its heredocs and
 # multi-line strings are fixture bytes. INF_SELFTEST_CASE_LOG=<an empty
 # directory> writes one record a case (the lib's header says what it holds).
+# A group stays under 20 s as the driver runs it: the longest group is the
+# line's floor, so a longer one is cut, each part building its own fixtures;
+# the OK line names the longest group with its seconds on every run.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR/.."
@@ -4604,6 +4607,8 @@ expect_red_because "lint-scopes: containers — a committed raise is red against
     "record T counts sum to 4, above the introducing commit's 3" lc_run "$root"
 }
 
+# Each probe case is a cold clippy build of about 3 s, so the probe's cases sit
+# in groups of at most four: a group stays under the 20 s bound above.
 group_lint_scopes_probe() {
 ls_setup
 # the probe's judge: a plant that compiles clean, and a plant that fails
@@ -4620,6 +4625,11 @@ expect red "lint-scopes: a probe that fails for an unrelated reason" ls_probe "$
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unmarked"
 sed -i.bak 's|_ => 0, // PLANT clippy::match_wildcard_for_single_variants|_ => 0,|' "$work/probe-unmarked/src/lib.rs"
 expect red "lint-scopes: a diagnostic on a line with no marker" ls_probe "$work/probe-unmarked"
+}
+
+group_lint_scopes_probe_config() {
+ls_setup
+root=$(ls_root ls-probe)
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-wrong-path"
 sed -i.bak 's|PLANT clippy::disallowed_methods std::fs::read$|PLANT clippy::disallowed_methods std::fs::write|' "$work/probe-wrong-path/src/filesystem.rs"
 expect red "lint-scopes: the right lint naming the wrong API is red" ls_probe "$work/probe-wrong-path"
@@ -4630,6 +4640,11 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unreachable-api"
 sed 's|std::fs::write|std::fs::no_such_fn|' clippy.toml >"$work/probe-unreachable-api/clippy.toml"
 expect_red_because "lint-scopes: an unreachable config entry is red" \
     'unresolved config entry: `std::fs::no_such_fn`' ls_probe "$work/probe-unreachable-api"
+}
+
+group_lint_scopes_probe_arch() {
+ls_setup
+root=$(ls_root ls-probe)
 # ADR-0106 D18, on whichever leg runs this: an unresolved entry under the
 # probe target's own `core::arch` module (on x86_64, ADR-0106 D7.5's inert
 # `_rdtscp` shape) or under a module no leg compiles for is red; one under
@@ -4851,6 +4866,7 @@ expect_red_because "probe-target: a job env that replaces the fuzz-target gate's
     "\`INF_FUZZ_CARGO\` is set where the probe gates inherit it" legs_cover "$work/wf-fuzz-cargo.yml"
 }
 
+# Probe cases again: at most four a group, as above group_lint_scopes_probe.
 group_lint_scopes_unstable() {
 ls_setup
 root=$(ls_root ls-probe)
@@ -4864,6 +4880,12 @@ expect red "lint-scopes: an unrelated error alongside the unstable refusal is re
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-missing"
 sed -i.bak '/let _ =/d' "$work/probe-unstable-missing/unstable/set_times.rs"
 expect red "lint-scopes: removing the unstable call is red" ls_probe "$work/probe-unstable-missing"
+}
+
+group_lint_scopes_unstable_census() {
+ls_setup
+root=$(ls_root ls-probe)
+# ADR-0144 A1, as above: the unstable call's configured path, its feature, its census.
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-config"
 sed 's|std::fs::set_times|std::fs::File::set_times|' clippy.toml >"$work/probe-unstable-config/clippy.toml"
 expect red "lint-scopes: changing the configured unstable path is red" ls_probe "$work/probe-unstable-config"
@@ -4873,7 +4895,11 @@ expect red "lint-scopes: the unstable feature must match its census" ls_probe "$
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-extra"
 cp "$work/probe-unstable-extra/unstable/set_times.rs" "$work/probe-unstable-extra/unstable/extra.rs"
 expect red "lint-scopes: the unstable census cannot grow" ls_probe "$work/probe-unstable-extra"
+}
 
+group_lint_scopes_container_plants() {
+ls_setup
+root=$(ls_root ls-probe)
 # ADR-0163 D2: the shipped probe's container plants draw their lint naming
 # their path under the production config (the green case above). A config
 # that loses a path, the backing without its one allow, and a two-span plant
@@ -4894,7 +4920,11 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-containers-new"
 printf 'pub struct Added {\n    pub value: std::collections::HashMap<u8, u8>,\n}\n' >>"$work/probe-containers-new/src/containers.rs"
 expect_red_because "lint-scopes: a new container with no plant marker is red by its lint and path" \
     "unmarked diagnostic \[('clippy::disallowed_types', 'std::collections::HashMap')\]" ls_probe "$work/probe-containers-new"
+}
 
+group_lint_scopes_slot_plants() {
+ls_setup
+root=$(ls_root ls-probe)
 # ADR-0144 A2: the slot plants draw `await_holding_invalid_type` naming their
 # configured path under the production config (the green case above): the
 # slot, and the answer that carries it, since the lint matches the outermost
@@ -4913,6 +4943,12 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-consumed"
 sed -i.bak 's|            yield_once().await;|            slot.publish(0);|; s|            slot.publish(1);|            yield_once().await;|' "$work/probe-await-consumed/src/awaits.rs"
 expect_red_because "lint-scopes: a slot consumed before the await draws nothing on the plant" \
     "did NOT draw clippy::await_holding_invalid_type inf_foundation::bounded::DequeSlot" ls_probe "$work/probe-await-consumed"
+}
+
+group_lint_scopes_answer_plants() {
+ls_setup
+root=$(ls_root ls-probe)
+# ADR-0144 A2, as above: the answer's plant and the discard plant.
 # The answer's plant at four columns: the slot's lines above sit at twelve,
 # so the anchored edits reach only the answer's await and its match.
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-answer-matched"
