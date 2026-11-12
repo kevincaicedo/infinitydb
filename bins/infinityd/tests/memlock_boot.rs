@@ -29,14 +29,14 @@
 //! memory and standard input: a node whose standard input is not the
 //! lock's `nodes` file was started outside the lock.
 
-#[path = "support/node.rs"]
-mod node;
-
 // nextest-alone: 3.3-5.2 s. The kernel keeps the pinned-memory budget per
 // user, and every node a sibling test process boots charges its rings to it,
 // so the budget this verdict reads is the lane's unless it runs alone. Nodes
-// another lane boots on the box charge it too, which running alone in this
-// lane does not prevent (ADR-0203).
+// another lane's tests boot charge it too: those the box's node lock keeps
+// away (ADR-0203 D2), a node no test started it does not.
+
+#[path = "support/node.rs"]
+mod node;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
