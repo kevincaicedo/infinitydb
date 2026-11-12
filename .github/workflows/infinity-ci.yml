@@ -52,7 +52,12 @@ jobs:
         with:
           toolchain: 1.95.0
           components: clippy, rustfmt
+      # The cache saves only on a key it did not restore whole, so a key made
+      # before cargo-nextest was installed here would never keep it: v1 starts
+      # the key again with the binary in ~/.cargo/bin.
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
       # ADR-0200 D4: the tests run under cargo-nextest, the version
       # .config/nextest.toml requires, installed from its published lock.
       - name: install cargo-nextest
@@ -161,8 +166,12 @@ jobs:
         with:
           toolchain: 1.95.0
           components: clippy
+      # The cache saves only on a key it did not restore whole, so a key made
+      # before cargo-nextest was installed here would never keep it: v1 starts
+      # the key again with the binary in ~/.cargo/bin.
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
           key: slim-build
       # ADR-0200 D4: the tests run under cargo-nextest, the version
       # .config/nextest.toml requires, installed from its published lock.
@@ -202,8 +211,12 @@ jobs:
         with:
           toolchain: 1.95.0
           components: clippy
+      # The cache saves only on a key it did not restore whole, so a key made
+      # before cargo-nextest was installed here would never keep it: v1 starts
+      # the key again with the binary in ~/.cargo/bin.
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
           key: doc-intern-keys
       # ADR-0200 D4: the tests run under cargo-nextest, the version
       # .config/nextest.toml requires, installed from its published lock.
