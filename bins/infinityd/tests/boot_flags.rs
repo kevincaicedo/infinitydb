@@ -22,8 +22,11 @@
 //! the box down. The cases must exit at the parser, before any cell or
 //! mesh allocation, so the cap is invisible to a correct binary.
 #![cfg(target_os = "linux")]
+#[path = "support/node.rs"]
+mod node;
+
+use node::{NodeBinary, Ulimit};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// 4 GiB in KiB — `ulimit -v` units.
 const CHILD_AS_CAP_KIB: u64 = 4 * 1024 * 1024;
@@ -41,10 +44,9 @@ fn scratch(tag: &str) -> PathBuf {
 /// (exit code, stderr). A signal death reports `None`.
 fn boot(tag: &str, flags: &[&str]) -> (Option<i32>, String) {
     let dir = scratch(tag);
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(format!("ulimit -v {CHILD_AS_CAP_KIB} && exec \"$0\" \"$@\""))
-        .arg(env!("CARGO_BIN_EXE_infinityd"))
+    let out = NodeBinary::built()
+        .command()
+        .ulimit(Ulimit::AddressSpaceKib(CHILD_AS_CAP_KIB))
         .args(["--port", "0", "--device-probe", "off", "--data-dir"])
         .arg(&dir)
         .args(flags)

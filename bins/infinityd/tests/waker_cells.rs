@@ -17,11 +17,16 @@
 //! namespace's cold gate.
 #![cfg(target_os = "linux")]
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 const CELLS: u16 = 2;
@@ -57,7 +62,7 @@ fn nanos() -> u128 {
 
 /// `infinityd` at two cells on a data directory, killed and reaped on drop.
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
     _dir: DataDir,
@@ -73,7 +78,8 @@ impl Server {
             .expect("addr")
             .port()
             .to_string();
-        let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+        let child = NodeBinary::built()
+            .command()
             .args(["--port", &port, "--cells", &CELLS.to_string()])
             .args(["--accept-handoff", "on", "--device-probe", "off"])
             .arg("--data-dir")
@@ -106,13 +112,6 @@ impl Server {
 
     fn text(&self) -> String {
         std::fs::read_to_string(&self.stderr).unwrap_or_default()
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
