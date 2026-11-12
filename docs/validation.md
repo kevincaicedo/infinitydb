@@ -95,6 +95,19 @@ ones included. A script run alone, outside a recipe, under a cargo config's
 `build-dir` puts its intermediate outputs there: only the export and
 `--clean` ask cargo for its build directory.
 
+The `dev` profile, and `test` with it, builds `inf-doc` at `opt-level` 1
+(the workspace `Cargo.toml`): its intern-table test walks a 65,535-key
+dictionary in about 10 s instead of 39 s unoptimized. One build serves
+`cargo build` and the tests, so a debug `infinityd` carries an optimized
+`inf-doc`. Debug assertions and overflow checks stay on, and `inf-doc`'s two
+`build_profile` tests are red in any build of the crate without them, a
+`--release` test build included. To step through `inf-doc` unoptimized,
+build with `--config 'profile.dev.package.inf-doc.opt-level=0'`: cargo then
+writes a second set of every unit above `inf-doc` beside the first. A
+changed profile key renames those units, so a root built before the change
+keeps the old ones, gigabytes that nothing reads, until
+`./scripts/target-root.sh --clean`; the next run builds cold.
+
 `cargo test -p crash-matrix` requires Python 3.11+ and runs every node row
 in `m2.toml`, `m4.toml` and `m45.toml` by exact package/target/function.
 Each invocation must pass one non-ignored test and emit its point/verdict
