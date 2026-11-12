@@ -23,11 +23,13 @@ use std::time::{Duration, Instant};
 use crate::matrix::{Case, Check};
 use crate::resp::{encode_command, frame_len};
 
-/// The one way a test starts `infinityd`: every node holds the box's node
-/// lock shared from before its first ring to its exit (ADR-0203 D1).
-/// Compat's tests reach it here, never by a `#[path]` of their own: its
-/// in-process state exists once per copy, and a nested start through a
-/// second copy would wait on a writer that waits on it.
+// The one way a test starts `infinityd`: every node holds the box's node
+// lock shared from before its first ring to its exit (ADR-0203 D1).
+// Compat's tests reach it here, never by a `#[path]` of their own: its
+// in-process state exists once per copy, and a nested start through a
+// second copy would wait on a writer that waits on it. A plain comment: an
+// outer doc comment here would make rustdoc name the module's doctests by
+// this file.
 #[path = "../../../bins/infinityd/tests/support/node.rs"]
 pub mod node;
 
@@ -509,7 +511,7 @@ pub fn spawn_infinityd_at(
         .stdout(Stdio::null())
         .stderr(log)
         .spawn()
-        .unwrap_or_else(|error| panic!("the infinityd INFINITYD_BIN names did not start: {error}"));
+        .unwrap_or_else(|error| panic!("INFINITYD_BIN's node: {error}"));
     ProcessGuard { process: Spawned::Node(node), scratch: Some(dir), log: Some(log_path) }
 }
 

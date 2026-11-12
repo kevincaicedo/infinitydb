@@ -23,6 +23,7 @@ fn process_threads_children_and_all_generator_paths_observe_disjoint_masks() {
     let fixture = Fixture::new("cpu-placement");
     std::fs::write(fixture.0.join("observe-affinity"), "").unwrap();
     for name in ["redis-server", "dragonfly"] {
+        // node-spawn-allow: copies the fixture's Python stand-in named for the engine
         std::fs::copy(fixture.0.join("infinityd"), fixture.0.join(name)).unwrap();
     }
     let server = cpus[0].to_string();

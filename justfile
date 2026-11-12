@@ -27,6 +27,9 @@ check:
     # ADR-0190 D4, A2: no production site of inf-server decides a reply's outcome
     # from its bytes, or names a fabric reply tag outside the functions that set and read it.
     ./scripts/check-reply-outcome.sh
+    # ADR-0203 D3: a test names infinityd only through the node module, whose
+    # starts hold the box's node lock; every ring outside a node is a census row.
+    ./scripts/check-node-spawn.sh
     # ADR-0172 D2: a pre-effect refusal's text is inf_wire::Refusal's alone,
     # so no production line of inf-server spells a refusal class suffix.
     ./scripts/check-refusal-text.sh

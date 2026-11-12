@@ -83,6 +83,10 @@ jobs:
       # ADR-0190 D4: a reply's outcome is read beside its bytes, never from them.
       - name: reply-outcome gate (ADR-0190 D4)
         run: ./scripts/check-reply-outcome.sh
+      # ADR-0203 D3: a test names infinityd only through the node module, whose
+      # starts hold the box's node lock; every ring outside a node is a census row.
+      - name: node-spawn gate (ADR-0203 D3)
+        run: ./scripts/check-node-spawn.sh
       # ADR-0172 D2: a pre-effect refusal's text is inf_wire::Refusal's alone.
       - name: refusal-text gate (ADR-0172 D2)
         run: ./scripts/check-refusal-text.sh

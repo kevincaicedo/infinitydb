@@ -1099,6 +1099,452 @@ expect_output "reply-outcome: the OK line names each row whose file is not in th
     env INF_CHECK_ROOT="$root" $REPLY
 }
 
+# -------------------------------------------------------------- node spawn
+group_node_spawn() {
+# ADR-0203 D3: scripts/check-node-spawn.sh on a fixture checkout of its own
+# `git init`, its base committed and green as built: every rule's token in the
+# module, rule 4's in the module's test, each sanctioned shape, an ignored
+# file, an excluded file a test includes, and the ring census's files written
+# from the gate's own table. A case writes its plant, runs the gate, and the
+# checkout returns to its base. A plant is red for its own rule at its own
+# file:line; a scope error names its cause.
+NS="$SCRIPT_DIR/check-node-spawn.sh"
+NSW="$work/ns"
+mkdir -p "$NSW"
+ns() { env INF_CHECK_ROOT="$1" "$NS"; }
+NS_ROOT="$NSW/base"
+# ns_put <path>: a file of the fixture at <path>, from stdin.
+ns_put() {
+    [ -n "$1" ] && [ -d "$NS_ROOT/.git" ] || { echo "ns_put: no path or no fixture" >&2; exit 2; }
+    mkdir -p "$(dirname "$NS_ROOT/$1")"
+    cat >"$NS_ROOT/$1"
+}
+# ns_reset: the checkout back at its base; an ignored file stays.
+ns_reset() {
+    fx_git "$NS_ROOT" checkout -q -- .
+    fx_git "$NS_ROOT" clean -fdq
+}
+mkdir -p "$NS_ROOT"
+git -C "$NS_ROOT" init -q
+ns_put bins/infinityd/tests/support/node.rs <<'EOF'
+//! The module: every rule's token is its own.
+pub fn built() -> Option<&'static str> {
+    option_env!("CARGO_BIN_EXE_infinityd")
+}
+pub fn from_infinityd_bin() -> Option<String> {
+    std::env::var("INFINITYD_BIN").ok()
+}
+pub fn dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+}
+pub const NAME: &str = "infinityd";
+EOF
+ns_put bins/infinityd/tests/node_lock.rs <<'EOF'
+#[path = "support/node.rs"]
+mod node;
+
+fn private(command: &mut std::process::Command, dir: &std::path::Path) {
+    command.env("XDG_RUNTIME_DIR", dir).env_clear();
+}
+EOF
+ns_put bins/inf-bench/src/lib.rs <<'EOF'
+pub const RELEASE: &str = "target/release/infinityd";
+EOF
+ns_put bins/inf-bench/src/shared.rs <<'EOF'
+pub fn shared() {}
+EOF
+ns_put bins/inf-compare/src/main.rs <<'EOF'
+fn main() {}
+EOF
+ns_put tests/compat/tests/required_binary.rs <<'EOF'
+// CARGO_BIN_EXE_infinityd and "infinityd" in a comment name nothing.
+/* XDG_RUNTIME_DIR, env_clear and "INFINITYD_BIN" in a block comment */
+/// A doc line: NEXTEST_BIN_EXE_infinityd, UringDriver::new(config).
+fn shapes(child: &mut std::process::Command, binary: &str) {
+    child.env("INFINITYD_BIN", binary);
+    child.env_remove("INFINITYD_BIN");
+    child.env(
+        "INFINITYD_BIN",
+        binary,
+    );
+    eprintln!("SKIPPED: INFINITYD_BIN is unset; just compat sets it");
+    let _ = std::process::Command::new("true").spawn().expect("spawn infinityd");
+    let _ = env!("CARGO_TARGET_TMPDIR");
+}
+struct Fake;
+impl Fake {
+    fn register_pool(&mut self) {}
+}
+EOF
+ns_put crates/fx/tests/uses_bench.rs <<'EOF'
+#[path = "../../../bins/inf-bench/src/shared.rs"]
+mod shared;
+EOF
+printf 'ignored/\n' | ns_put .gitignore
+ns_put ignored/x.rs <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+"$NS" --census >"$NSW/census"
+while IFS="$(printf '\t')" read -r class path rings regs; do
+    {
+        printf '// A %s row of the ring census.\nfn census(config: u32) {\n' "$class"
+        n=0
+        while [ "$n" -lt "$rings" ]; do printf '    let _ = UringDriver::new(config);\n'; n=$((n + 1)); done
+        n=0
+        while [ "$n" -lt "$regs" ]; do printf '    driver.register_pool(&mut pool);\n'; n=$((n + 1)); done
+        printf '}\n'
+    } | ns_put "$path"
+done <"$NSW/census"
+fx_git "$NS_ROOT" add -A
+fx_git "$NS_ROOT" -c user.name=t -c user.email=t@t commit -q -m base
+
+ns_rows=$(wc -l <"$NSW/census" | tr -d ' ')
+expect green "node-spawn: --census prints the table's rows" [ "$ns_rows" -gt 0 ]
+expect green "node-spawn: the base, every sanctioned shape and the module's own tokens, is green" \
+    ns "$NS_ROOT"
+expect_output "node-spawn: the OK line counts the scan, the #[path] reach and the exclusions" \
+    "node-spawn OK: $((ns_rows + 5)) files, .* ($((ns_rows + 4)) listed, 1 reached only by #.path., 1 of them under the excluded directories; 2 #.path. includes followed; 0 listed path(s) gone" \
+    ns "$NS_ROOT"
+expect_output "node-spawn: the OK line counts the census rows by class" \
+    "ring census: $(grep -c '^test' "$NSW/census") test, $(grep -c '^bench' "$NSW/census") bench, $(grep -c '^node' "$NSW/census") node row(s)" \
+    ns "$NS_ROOT"
+
+# Each rule red at its plant's file:line, in a file git does not track yet.
+P=crates/fx/tests/plant.rs
+ns_case() {
+    local label=$1 pattern=$2
+    ns_put "$P"
+    expect_red_because "node-spawn: $label" "$pattern" ns "$NS_ROOT"
+    ns_reset
+}
+ns_case 'env!("CARGO_BIN_EXE_infinityd") is rule 1' "$P:1: rule 1," \
+    <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+ns_case 'std::env::var("NEXTEST_BIN_EXE_infinityd") is rule 1' "$P:2: rule 1," <<'EOF'
+fn f() {
+    let _ = std::env::var("NEXTEST_BIN_EXE_infinityd");
+}
+EOF
+ns_case 'a const holding "INFINITYD_BIN" read by std::env::var is rule 2' "$P:1: rule 2," <<'EOF'
+const VAR: &str = "INFINITYD_BIN";
+fn f() {
+    let _ = std::env::var(VAR);
+}
+EOF
+ns_case 'a std::env::vars() filter on "INFINITYD_BIN" is rule 2' "$P:2: rule 2," <<'EOF'
+fn f() {
+    let _ = std::env::vars().filter(|(key, _)| key == "INFINITYD_BIN").count();
+}
+EOF
+ns_case '"INFINITYD_BIN" as .env'\''s second argument is rule 2' "$P:2: rule 2," <<'EOF'
+fn f(command: &mut std::process::Command) {
+    command.env("PATH", "INFINITYD_BIN");
+}
+EOF
+ns_case '"INFINITYD_BIN" as .env'\''s second argument, split across lines, is rule 2' \
+    "$P:4: rule 2," <<'EOF'
+fn f(command: &mut std::process::Command) {
+    command.env(
+        "PATH",
+        "INFINITYD_BIN",
+    );
+}
+EOF
+ns_case 'Command::new("infinityd") is rule 3' "$P:2: rule 3," <<'EOF'
+fn f() {
+    let _ = std::process::Command::new("infinityd").spawn();
+}
+EOF
+ns_case 'a CARGO_MANIFEST_DIR target path is rule 3' "$P:2: rule 3," <<'EOF'
+fn f() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/infinityd")
+}
+EOF
+ns_case 'a current_exe() path'\''s .join("infinityd") is rule 3' "$P:3: rule 3," <<'EOF'
+fn f() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    exe.parent().unwrap().join("infinityd")
+}
+EOF
+for literal in 'r"infinityd"' 'r#"../../target/debug/infinityd"#' 'b"infinityd"' 'c"infinityd"' \
+    'br"infinityd"' 'cr"../infinityd"' 'r##"../../target/debug/infinityd"##'; do
+    ns_case "$literal is rule 3" "$P:1: rule 3," <<<"pub fn f() { let _ = $literal; }"
+done
+ns_case '.env_remove("XDG_RUNTIME_DIR") is rule 4' "$P:2: rule 4," <<'EOF'
+fn f(command: &mut std::process::Command) {
+    command.env_remove("XDG_RUNTIME_DIR");
+}
+EOF
+ns_case '.env_clear() is rule 4' "$P:2: rule 4," <<'EOF'
+fn f(command: &mut std::process::Command) {
+    command.env_clear();
+}
+EOF
+ns_case 'a bare marker is red' "$P:2: a bare node-spawn-allow marker" <<'EOF'
+fn f() {
+    // node-spawn-allow:
+    let _ = std::process::Command::new("infinityd");
+}
+EOF
+ns_case 'a marker with no colon is bare' "$P:2: a bare node-spawn-allow marker" <<'EOF'
+fn f() {
+    // node-spawn-allow a stand-in
+    let _ = std::process::Command::new("infinityd");
+}
+EOF
+ns_case 'a marker that marks no hit is red' "$P:2: node-spawn-allow marks no hit" <<'EOF'
+fn f() {
+    // node-spawn-allow: a stand-in, two lines above its hit
+
+    let _ = std::process::Command::new("infinityd");
+}
+EOF
+ns_case 'a marker two lines above leaves its hit red' "$P:4: rule 3," <<'EOF'
+fn f() {
+    // node-spawn-allow: a stand-in, two lines above its hit
+
+    let _ = std::process::Command::new("infinityd");
+}
+EOF
+ns_case 'a line comment holding /* then a token, no */ after, is read' "$P:2: rule 1," <<'EOF'
+// the lock's files are /* never removed
+pub const B: &str = env!("CARGO_BIN_EXE_infinityd");
+EOF
+ns_case 'a line comment holding /* then a token, a */ after, is read' "$P:2: rule 1," <<'EOF'
+// the lock's files are /* never removed
+pub const B: &str = env!("CARGO_BIN_EXE_infinityd");
+// */
+EOF
+ns_case 'a block comment holding // then a token on its line is read' "$P:1: rule 1," \
+    <<<'/* a // b */ pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+ns_case 'a // inside a string literal opens no comment' "$P:1: rule 1," \
+    <<<'pub const B: (&str, &str) = ("http://x", env!("CARGO_BIN_EXE_infinityd"));'
+ns_case 'a /* inside a string literal opens no comment' "$P:2: rule 1," <<'EOF'
+pub const GLOB: &str = "src/*.rs";
+pub const B: &str = env!("CARGO_BIN_EXE_infinityd");
+EOF
+ns_case 'rule 2 reads every literal on its line, not only the first' "$P:2: rule 2," <<'EOF'
+fn f(command: &mut std::process::Command) {
+    command.env("INFINITYD_BIN", std::env::var("INFINITYD_BIN").unwrap());
+}
+EOF
+ns_case 'a call ending env( with no dot is no .env( exception' "$P:5: rule 2," <<'EOF'
+fn get_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+fn f() {
+    let _ = get_env("INFINITYD_BIN");
+}
+EOF
+ns_case 'a marker on the line below its hit sanctions nothing' "$P:2: rule 3," <<'EOF'
+fn f() {
+    let _ = std::process::Command::new("infinityd");
+    // node-spawn-allow: a marker on the line below its hit
+}
+EOF
+ns_case 'a marker in a block comment with no reason is bare' "$P:2: a bare node-spawn-allow marker" \
+    <<'EOF'
+fn f() {
+    /* node-spawn-allow: */
+    let _ = std::process::Command::new("infinityd");
+}
+EOF
+printf 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");\n' | ns_put crates/fx/tests/support/node.rs
+expect_red_because "node-spawn: another file named node.rs is not the module" \
+    "crates/fx/tests/support/node.rs:1: rule 1," ns "$NS_ROOT"
+ns_reset
+printf 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");\n' | ns_put bins/inf-bench/srcx/plant.rs
+expect_red_because "node-spawn: a sibling of an excluded directory sharing its prefix is read" \
+    "bins/inf-bench/srcx/plant.rs:1: rule 1," ns "$NS_ROOT"
+ns_reset
+
+# Sanctioned shapes, each green; each shape moved out of its exemption, red.
+ns_put "$P" <<'EOF'
+fn f() {
+    // node-spawn-allow: a fixture stand-in named for the engine
+    let _ = std::process::Command::new("infinityd");
+    let _ = std::process::Command::new("./infinityd"); // node-spawn-allow: the same stand-in
+}
+EOF
+expect green "node-spawn: a marker on its line or the line above sanctions its hit" ns "$NS_ROOT"
+expect_output "node-spawn: a marked site is listed with its reason" \
+    "allowed: $P:2: a fixture stand-in named for the engine" ns "$NS_ROOT"
+ns_reset
+ns_put bins/infinityd/tests/support/other.rs <"$NS_ROOT/bins/infinityd/tests/support/node.rs"
+expect_red_because "node-spawn: the module's own tokens in another file are red" \
+    "other.rs:3: rule 1," ns "$NS_ROOT"
+expect_output "node-spawn: ... rule 2 there" "other.rs:6: rule 2," ns "$NS_ROOT"
+expect_output "node-spawn: ... rule 3 there" "other.rs:11: rule 3," ns "$NS_ROOT"
+expect_output "node-spawn: ... rule 4 there" "other.rs:9: rule 4," ns "$NS_ROOT"
+ns_reset
+sed -n '4,6p' "$NS_ROOT/bins/infinityd/tests/node_lock.rs" | ns_put bins/infinityd/tests/lock_copy.rs
+expect_red_because "node-spawn: the module test's rule-4 tokens in another test are red" \
+    "lock_copy.rs:2: rule 4," ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<<'pub fn f() -> Option<String> { std::env::var("CARGO_BIN_EXE_infinityd_probe").ok() }'
+expect green "node-spawn: rule 1's token is bounded on its right (another binary's variable)" \
+    ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<'EOF'
+fn f(command: &mut std::process::Command, binary: &str) {
+    command.env(
+        // the variable compat reads
+        "INFINITYD_BIN",
+        binary,
+    );
+}
+EOF
+expect green "node-spawn: rule 2's split call reads the previous code line, past a comment" \
+    ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<'EOF'
+pub fn f() -> Option<String> {
+    std::env::var("OLD_XDG_RUNTIME_DIR").ok()
+}
+pub fn env_clearance() {}
+EOF
+expect green "node-spawn: rule 4's tokens are bounded on both sides" ns "$NS_ROOT"
+ns_reset
+
+# The red's text: the module, and the call each package writes instead.
+ns_put bins/infinityd/tests/plant.rs <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+expect_output "node-spawn: a red in bins/infinityd names the module and its call" \
+    "only through bins/infinityd/tests/support/node.rs: write NodeBinary::built().command()...spawn()" \
+    ns "$NS_ROOT"
+ns_reset
+ns_put tests/compat/tests/plant.rs <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+expect_output "node-spawn: a red in tests/compat names the harness" \
+    "start nodes through compat::harness" ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+expect_output "node-spawn: a red elsewhere names from_infinityd_bin and built_or" \
+    "write NodeBinary::from_infinityd_bin(), or NodeBinary::built_or(<var>)" ns "$NS_ROOT"
+ns_reset
+
+# Scope: tracked and untracked files are read, a gone one is counted, and a
+# #[path] target is read even under an excluded directory.
+printf 'fn more() {\n    let _ = env!("CARGO_BIN_EXE_infinityd");\n}\n' \
+    >>"$NS_ROOT/tests/compat/tests/required_binary.rs"
+expect_red_because "node-spawn: a token added to a tracked file is red" \
+    "tests/compat/tests/required_binary.rs:20: rule 1," ns "$NS_ROOT"
+ns_reset
+rm -f "$NS_ROOT/crates/fx/tests/uses_bench.rs"
+expect_output "node-spawn: a listed path gone from the work tree is skipped and counted" \
+    "1 listed path(s) gone from the work tree" ns "$NS_ROOT"
+ns_reset
+ns_put bins/inf-bench/src/planted.rs <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+expect green "node-spawn: an excluded file no test includes is not read" ns "$NS_ROOT"
+printf '#[path = "../../../bins/inf-bench/src/planted.rs"]\nmod planted;\n' | ns_put "$P"
+expect_red_because "node-spawn: a #[path] target under an excluded directory is read" \
+    "bins/inf-bench/src/planted.rs:1 (included by $P:1 through #.path.): rule 1," ns "$NS_ROOT"
+ns_reset
+printf '#[path = "../../../bins/inf-bench/src/first.rs"]\nmod first;\n' | ns_put "$P"
+printf '#[path = "second.rs"]\nmod second;\n' | ns_put bins/inf-bench/src/first.rs
+printf 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");\n' | ns_put bins/inf-bench/src/second.rs
+expect_red_because "node-spawn: a #[path] target of a #[path] target is read" \
+    "bins/inf-bench/src/second.rs:1 (included by bins/inf-bench/src/first.rs:1 through #.path.): rule 1," \
+    ns "$NS_ROOT"
+ns_reset
+
+# The ring census.
+ns_put "$P" <<<'fn f() { let _ = inf_runtime::UringDriver::new(config); }'
+expect_red_because "node-spawn: a new file naming UringDriver::new is red, naming its row" \
+    "ring census: $P names UringDriver::new 1 time(s), outside the table; add the row $P|" \
+    ns "$NS_ROOT"
+ns_reset
+printf 'fn more() {\n    driver.register_tier_pool(&mut pool);\n}\n' \
+    >>"$NS_ROOT/tests/crash-matrix/tests/fsyncgate.rs"
+expect_red_because "node-spawn: a census row whose count moved is red" \
+    "ring census: tests/crash-matrix/tests/fsyncgate.rs names UringDriver::new 1 time(s) and 1 registration(s), its row 1 and 0" \
+    ns "$NS_ROOT"
+ns_reset
+printf 'fn more(config: u32) {\n    let _ = UringDriver::new(config);\n}\n' \
+    >>"$NS_ROOT/tests/crash-matrix/tests/fsyncgate.rs"
+expect_red_because "node-spawn: a census row whose ring count moved is red" \
+    "ring census: tests/crash-matrix/tests/fsyncgate.rs names UringDriver::new 2 time(s) and 0 registration(s), its row 1 and 0" \
+    ns "$NS_ROOT"
+ns_reset
+printf 'fn census() {}\n' >"$NS_ROOT/tests/crash-matrix/tests/fsyncgate.rs"
+expect_red_because "node-spawn: a census row whose file names neither token is red" \
+    "ring census: tests/crash-matrix/tests/fsyncgate.rs names neither" ns "$NS_ROOT"
+ns_reset
+rm -f "$NS_ROOT/tests/crash-matrix/tests/fsyncgate.rs"
+expect_red_because "node-spawn: a census row whose file is gone is red" \
+    "ring census: the row tests/crash-matrix/tests/fsyncgate.rs names no scanned file" ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<<'fn f() { let _ = FakeUringDriver::new(config); }'
+expect green "node-spawn: the census's constructor is bounded on its left (another type's new)" \
+    ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<<'fn f() { let _ = UringDriver::new_probe(config); }'
+expect green "node-spawn: the census's constructor is bounded on its right (another function)" \
+    ns "$NS_ROOT"
+ns_reset
+
+# Scope errors.
+printf 'fn f() {}\n/* never closed\nfn g() {}\n' | ns_put "$P"
+expect_red_because "node-spawn: a file that ends inside a block comment is a scope error" \
+    "SCOPE ERROR: $P ends inside the block comment opened at its line 2" ns "$NS_ROOT"
+ns_reset
+printf '#[path = "missing.rs"]\nmod missing;\n' | ns_put "$P"
+expect_red_because "node-spawn: a #[path] target that does not exist is a scope error" \
+    "SCOPE ERROR: $P:1: #.path = \"missing.rs\". names crates/fx/tests/missing.rs, which does not exist" \
+    ns "$NS_ROOT"
+ns_reset
+printf '#[path = "../../../../outside.rs"]\nmod outside;\n' | ns_put "$P"
+expect_red_because "node-spawn: a #[path] target outside the root is a scope error" \
+    "resolves outside" ns "$NS_ROOT"
+ns_reset
+rm -f "$NS_ROOT/bins/infinityd/tests/support/node.rs"
+expect_red_because "node-spawn: a missing module is a scope error" \
+    "SCOPE ERROR: the module bins/infinityd/tests/support/node.rs is missing" ns "$NS_ROOT"
+ns_reset
+rm -f "$NS_ROOT/bins/infinityd/tests/node_lock.rs"
+expect_red_because "node-spawn: a missing module test is a scope error" \
+    "SCOPE ERROR: the module's test bins/infinityd/tests/node_lock.rs" ns "$NS_ROOT"
+ns_reset
+for dir in bins/inf-bench/src bins/inf-compare/src; do
+    rm -rf "${NS_ROOT:?}/$dir"
+    expect_red_because "node-spawn: a missing excluded directory $dir is a scope error" \
+        "SCOPE ERROR: the excluded directory $dir is missing" ns "$NS_ROOT"
+    ns_reset
+done
+printf 'x' | ns_put "$(printf 'crates/fx/tests/a\tb.rs')"
+expect_red_because "node-spawn: a path holding a tab is a scope error" \
+    "SCOPE ERROR: a listed path holds a tab or a newline" ns "$NS_ROOT"
+ns_reset
+printf 'x' | ns_put "$(printf 'crates/fx/tests/a\nb.rs')"
+expect_red_because "node-spawn: a path holding a newline is a scope error" \
+    "SCOPE ERROR: a listed path holds a tab or a newline" ns "$NS_ROOT"
+ns_reset
+ns_put 'a=b.rs' <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+printf 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");\n' | ns_put 'x=1/plant.rs'
+expect_red_because "node-spawn: a path awk would take for an assignment is read (a=b.rs)" \
+    "a=b.rs:1: rule 1," ns "$NS_ROOT"
+expect_output "node-spawn: ... and a file under a directory named x=1" "x=1/plant.rs:1: rule 1," \
+    ns "$NS_ROOT"
+ns_reset
+expect_red_because "node-spawn: a root that is not its own git work tree is a scope error" \
+    "SCOPE ERROR: .* is not its own git work tree" ns "$NS_ROOT/crates"
+mkdir -p "$NSW/nogit/bins/infinityd/tests/support"
+cp "$NS_ROOT/bins/infinityd/tests/support/node.rs" "$NSW/nogit/bins/infinityd/tests/support/"
+expect_red_because "node-spawn: a root outside a git work tree is a scope error" \
+    "SCOPE ERROR: .* is not inside a git work tree" ns "$NSW/nogit"
+NS_ROOT="$NSW/empty"
+mkdir -p "$NS_ROOT"
+git -C "$NS_ROOT" init -q
+cp -R "$NSW/base/bins" "$NS_ROOT/"
+printf '*.rs\n' | ns_put .gitignore
+expect_red_because "node-spawn: an empty scan is a scope error" \
+    "SCOPE ERROR: no \*.rs file to scan" ns "$NS_ROOT"
+NS_ROOT="$NSW/blank"
+mkdir -p "$NS_ROOT"
+git -C "$NS_ROOT" init -q
+: | ns_put bins/infinityd/tests/support/node.rs
+: | ns_put bins/infinityd/tests/node_lock.rs
+mkdir -p "$NS_ROOT/bins/inf-bench/src" "$NS_ROOT/bins/inf-compare/src"
+expect_red_because "node-spawn: every listed file empty, the blanker reading no line, is a scope error" \
+    "SCOPE ERROR: the blanker read no line" ns "$NS_ROOT"
+NS_ROOT="$NSW/base"
+}
+
 # ------------------------------------------------------------ refusal text
 group_refusal_text() {
 # ADR-0172 D2: no production line of crates/inf-server/src spells a refusal
