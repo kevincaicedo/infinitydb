@@ -7346,6 +7346,11 @@ printf '\n#[test] // nextest-alone: 2 s. The verdict reads a live rate.\nfn b_ma
 expect_red_because "nextest-config: a marker beside code is red" \
     "b.rs:8: a comment spelled like a marker" ncfg "$NC_DIR"
 nc_tree
+printf '\n/*\n// nextest-alone: 2 s. The verdict reads a live rate.\n*/\n#[test]\nfn b_marked() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a marker's line inside a block comment is red" \
+    "b.rs:9: a comment spelled like a marker" ncfg "$NC_DIR"
+nc_tree
 printf '\n// The whole target would need a `nextest-alone: <reason>` marker to run alone.\nfn helper() {}\n' \
     >>"$NC_DIR/crates/fx/tests/b.rs"
 expect green "nextest-config: a marker named in prose is no marker" ncfg "$NC_DIR"
