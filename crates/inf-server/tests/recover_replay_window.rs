@@ -10,10 +10,6 @@
 //! the tier file's CRC-verified frames. Red before the replay seam: the
 //! boot refuses with `replay apply failed … OutOfMemory`.
 
-// nextest-stall-default: the cell's keyspace runs on the injected `MemFs`
-// seam, below the server plane, which alone arms the tail stall (ADR-0053
-// D4): no write here waits on it.
-
 use std::path::{Path, PathBuf};
 
 use inf_log::fs::mem::MemFs;

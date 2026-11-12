@@ -20,9 +20,6 @@
     reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
 )]
 
-// nextest-stall-default: the store sits below the server plane, which alone
-// arms the tail stall (ADR-0053 D4): no write here waits on it.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 

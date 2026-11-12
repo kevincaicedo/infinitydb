@@ -46,10 +46,12 @@
 #            one in code (its comments may name them): free space is every
 #            process's, so a test reads what its own process holds (D7).
 #   stall    a .rs file under bins/*/tests/, crates/*/tests/ or tests/ that
-#            names MEM-BUDGET names TAIL-STALL-TIMEOUT or carries
-#            `nextest-stall-default: <reason>` in its leading comments: a
-#            tiered namespace's stall bound is a hang bound the test states,
-#            or the reason says why no write of the file can park (D7).
+#            names MEM-BUDGET outside its comments states TAIL-STALL-TIMEOUT
+#            (the key as a string literal of its own, `b"TAIL-STALL-TIMEOUT"`)
+#            or carries `nextest-stall-default: <reason>` in its leading
+#            comments: a tiered namespace's stall bound is a hang bound the
+#            test states, or the reason says why no write of the file can park
+#            (D7).
 #   marker   every marker binds what its rule names; one that binds nothing
 #            is stale.
 #
@@ -82,6 +84,8 @@ LEAK = {"period": "100ms", "result": "fail"}
 SECONDS = re.compile(r"(?<![\w.])[0-9]+(?:\.[0-9]+)? s\b")
 LOCK_TYPES = re.compile(r"\b(?:Mutex|RwLock|Condvar)\b")
 FREE_SPACE = ("statvfs", "statfs", "f_bavail", "f_bfree")
+# A test states a namespace's stall bound as an argument: the key, a literal of its own.
+STATES_STALL = re.compile(r'(?<![A-Za-z0-9_])b?"TAIL-STALL-TIMEOUT"')
 # A marker is a `//` comment line of its own that starts with its kind and a
 # colon; a prose mention later in a comment is no marker. A comment that starts
 # like one in any other spelling (no colon, capitals, a doc or block comment,
@@ -636,7 +640,7 @@ budget_files = stated = defaulted = 0
 for path in scanned:
     here = source(path)
     lead = here.leading()
-    names_budget = under_tests(path) and "MEM-BUDGET" in here.text
+    names_budget = under_tests(path) and "MEM-BUDGET" in here.uncommented
     has_marker = False
     for number, raw in enumerate(here.raw):
         mark = MARKER.search(raw) if here.is_comment(number) else None
@@ -651,13 +655,13 @@ for path in scanned:
     if not names_budget:
         continue
     budget_files += 1
-    if "TAIL-STALL-TIMEOUT" in here.text:
+    if STATES_STALL.search(here.uncommented):
         stated += 1
     elif has_marker:
         defaulted += 1
     else:
-        red(f"{path}: names MEM-BUDGET, and neither names TAIL-STALL-TIMEOUT nor carries "
-            "`nextest-stall-default: <reason>` in its leading comments")
+        red(f"{path}: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT (a literal of its "
+            "own) nor carries `nextest-stall-default: <reason>` in its leading comments")
 
 for path in scanned:
     here = source(path)

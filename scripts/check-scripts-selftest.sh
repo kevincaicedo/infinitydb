@@ -7079,14 +7079,22 @@ EOF
 // nextest-alone: 3.5 s. The whole target reads a per-user budget.
 // nextest-stall-default: no write reaches a window, so no write parks.
 
+const CREATE: [&[u8]; 2] = [b"MEM-BUDGET", b"8mb"];
+
 #[test]
-fn boots() {}
+fn boots() {
+    let _ = CREATE;
+}
 EOF
     cat >"$NC_DIR/bins/fxd/tests/tiered.rs" <<'EOF'
 //! Writes a namespace with MEM-BUDGET 8mb and TAIL-STALL-TIMEOUT 60000.
 
+const CREATE: [&[u8]; 4] = [b"MEM-BUDGET", b"8mb", b"TAIL-STALL-TIMEOUT", b"60000"];
+
 #[test]
-fn tiered() {}
+fn tiered() {
+    let _ = CREATE;
+}
 EOF
     cat >"$NC_CFG" <<'EOF'
 nextest-version = { required = "0.9.150" }
@@ -7350,11 +7358,28 @@ expect_red_because "nextest-config: a free-space read in an integration test is 
 nc_tree
 nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'// nextest-stall-default: no write reaches a window, so no write parks.\n' ''
 expect_red_because "nextest-config: a MEM-BUDGET file with neither the key nor the marker is red" \
-    "boot.rs: names MEM-BUDGET, and neither names TAIL-STALL-TIMEOUT nor carries" ncfg "$NC_DIR"
+    "boot.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
 nc_tree
 nc_sub "$NC_DIR/crates/fx/tests/b.rs" 'mod support;' $'// nextest-stall-default: a file naming no budget\n\nmod support;'
 expect_red_because "nextest-config: a stall marker in a file naming no budget is red" \
     "b.rs:1: a .nextest-stall-default:. marker binds nothing" ncfg "$NC_DIR"
+# The stall rule reads code: a key in a comment, or a stall key named inside
+# prose, neither makes a budget file nor states its bound.
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'// nextest-stall-default: no write reaches a window, so no write parks.\n' \
+    $'// Runs at the product\'s TAIL-STALL-TIMEOUT default.\n'
+expect_red_because "nextest-config: a stall key named in a comment states no bound" \
+    "boot.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" 'b"TAIL-STALL-TIMEOUT", b"60000"' 'b"8mb at the TAIL-STALL-TIMEOUT default", b""'
+expect_red_because "nextest-config: a stall key inside prose states no bound" \
+    "tiered.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" 'b"MEM-BUDGET", b"8mb", ' ''
+expect green "nextest-config: a file naming MEM-BUDGET only in a comment is no budget file" ncfg "$NC_DIR"
+nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" '//! Writes' $'// nextest-stall-default: no write parks.\n//! Writes'
+expect_red_because "nextest-config: so a stall marker there binds nothing" \
+    "tiered.rs:1: a .nextest-stall-default:. marker binds nothing" ncfg "$NC_DIR"
 # Scope: what the gate reads must exist.
 nc_tree
 rm -f "$NC_CFG"
