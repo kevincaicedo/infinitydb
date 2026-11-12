@@ -7255,6 +7255,28 @@ expect green "nextest-config: a run-alone test in an inline module is named by i
 nc_tree
 nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'#![allow(\n    clippy::disallowed_methods,\n' $'#![allow(\n    clippy::disallowed_methods,\n    clippy::disallowed_types,\n'
 expect green "nextest-config: a leading marker below an inner attribute of four lines binds" ncfg "$NC_DIR"
+# One marker spelling: a comment that starts like a marker in another is red on
+# its line; a marker named in prose is no marker.
+nc_spelled() { # <label> <comment line>: the line above a new test in b.rs is red
+    nc_tree
+    printf '\n%s\n#[test]\nfn b_marked() {}\n' "$2" >>"$NC_DIR/crates/fx/tests/b.rs"
+    expect_red_because "nextest-config: a marker $1 is red" \
+        "b.rs:8: a comment spelled like a marker" ncfg "$NC_DIR"
+}
+nc_spelled "without its colon" '// nextest-alone - 2 s. The verdict reads a live rate.'
+nc_spelled "in capitals" '// Nextest-Alone: 2 s. The verdict reads a live rate.'
+nc_spelled "with a space before its colon" '// nextest-alone : 2 s. The verdict reads a live rate.'
+nc_spelled "in a block comment" '/* nextest-alone: 2 s. The verdict reads a live rate. */'
+nc_spelled "in a doc comment" '/// nextest-alone: 2 s. The verdict reads a live rate.'
+nc_tree
+printf '\n#[test] // nextest-alone: 2 s. The verdict reads a live rate.\nfn b_marked() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a marker beside code is red" \
+    "b.rs:8: a comment spelled like a marker" ncfg "$NC_DIR"
+nc_tree
+printf '\n// The whole target would need a `nextest-alone: <reason>` marker to run alone.\nfn helper() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect green "nextest-config: a marker named in prose is no marker" ncfg "$NC_DIR"
 # D4: CI installs the floor, --locked.
 nc_tree
 nc_sub "$NC_DIR/.github/workflows/ci.yml" '--locked ' ''

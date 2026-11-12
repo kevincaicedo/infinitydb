@@ -76,7 +76,14 @@ LEAK = {"period": "100ms", "result": "fail"}
 SECONDS = re.compile(r"(?<![\w.])[0-9]+(?:\.[0-9]+)? s\b")
 LOCK_TYPES = re.compile(r"\b(?:Mutex|RwLock|Condvar)\b")
 FREE_SPACE = ("statvfs", "statfs", "f_bavail", "f_bfree")
-MARKER = re.compile(r"\bnextest-(group|in-process|alone|stall-default):(.*)$")
+# A marker is a `//` comment line of its own that starts with its kind and a
+# colon; a prose mention later in a comment is no marker. A comment that starts
+# like one in any other spelling (no colon, capitals, a doc or block comment,
+# beside code) is red: it would read as a marker and bind nothing.
+MARKER = re.compile(r"^\s*//(?![/!])\s*nextest-(group|in-process|alone|stall-default):(.*)$")
+NEAR_MARKER = re.compile(
+    r"(?i)^nextest\s*[-_ ]?\s*(?:group|in\s*[-_ ]?\s*process|alone|stall\s*[-_ ]?\s*default)\b"
+)
 FILTER = re.compile(
     r"^(?:binary_id\((?P<binary>[A-Za-z0-9_-]+(?:::(?:bin/)?[A-Za-z0-9_-]+)?)\)"
     r"|package\((?P<package>[A-Za-z0-9_-]+)\))"
@@ -234,8 +241,10 @@ def blank(text):
     return re.sub(r"[^\n]", " ", text)
 
 
-def strip(text):
-    """The text with comments and the insides of literals blanked, offsets kept."""
+def strip(text, keep_strings=False, comments=None):
+    """The text with comments and the insides of literals blanked, offsets kept;
+    with `keep_strings`, comments only. Each comment's span (start, end, token)
+    goes to `comments` when one is given."""
     out, at = [], 0
     while True:
         found = STRIP.search(text, at)
@@ -272,19 +281,30 @@ def strip(text):
             close = '"' + "#" * token.count("#")
             end = text.find(close, found.end())
             end = len(text) if end < 0 else end + len(close)
-        out.append(blank(text[start:end]))
+        is_comment = token in ("//", "/*")
+        if is_comment and comments is not None:
+            comments.append((start, end, token))
+        out.append(text[start:end] if keep_strings and not is_comment else blank(text[start:end]))
         at = end
 
 
 class Source:
-    """One .rs file, read once: its lines, its code with literals blanked, the
-    inline module path at each line, and its `mod <name>;` declarations."""
+    """One .rs file, read once: its lines, its code with comments and literals
+    blanked, its text with comments blanked, its comments, the inline module
+    path at each line, and its `mod <name>;` declarations."""
 
     def __init__(self, path):
         self.path = path
         self.text = path.read_text(encoding="utf-8", errors="replace")
         self.raw = self.text.split("\n")
-        self.code = strip(self.text).split("\n")
+        spans = []
+        self.code = strip(self.text, comments=spans).split("\n")
+        self.uncommented = strip(self.text, keep_strings=True)
+        self.comments = []  # (line index, comment token, the text after it, code before it)
+        for start, end, token in spans:
+            line = self.text.count("\n", 0, start)
+            before = self.text[self.text.rfind("\n", 0, start) + 1:start]
+            self.comments.append((line, token, self.text[start + 2:end], before.strip() != ""))
         self.inline = []  # the inline module path at each line's start
         self.declared = []  # (line index, inline path, name, #[path] or None)
         frames, depth = [], 0
@@ -573,6 +593,16 @@ for path in scanned:
         mark = MARKER.search(raw) if here.is_comment(number) else None
         if mark and (path, number) not in bound and mark.group(1) in ("group", "in-process"):
             red(f"{path}:{number + 1}: a `nextest-{mark.group(1)}:` marker on no static lock")
+    for line, token, body, beside_code in here.comments:
+        for offset, part in enumerate(body.split("\n")):
+            text = part.lstrip("/!* \t")
+            if not NEAR_MARKER.match(text):
+                continue
+            number = line + offset
+            if token == "//" and not beside_code and MARKER.match(here.raw[number]):
+                continue
+            red(f"{path}:{number + 1}: a comment spelled like a marker (`{text[:40].rstrip()}`) "
+                "is not read: a marker is a comment line of its own, `// nextest-<kind>: <reason>`")
 
 # ---- D4: the install step ---------------------------------------------------------
 workflows = sorted(Path(".github/workflows").glob("*.y*ml"))
