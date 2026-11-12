@@ -7143,7 +7143,7 @@ NC_GROUP=$'[[profile.default.overrides]]\nfilter = \'binary_id(fx::a)\'\n'
 nc_tree
 expect green "nextest-config: the fixture workspace is green" ncfg "$NC_DIR"
 expect_output "nextest-config: the OK line counts each rule's population" \
-    "nextest-config OK: nextest-version 0.9.150; 1 groups of one thread (serial), 1 group overrides at priority 50; 2 run alone at priority 100, first (fx::a/a_alone, fxd::boot); 2 static locks, 1 grouped and 1 in-process; 2 test files name MEM-BUDGET, 1 state TAIL-STALL-TIMEOUT and 1 carry nextest-stall-default; no free-space read in 5 integration-test files and 1 library files they link; 1 cargo-nextest installs in CI at 0.9.150, each --locked; [0-9]* .rs files of 6 test binaries read" \
+    "nextest-config OK: nextest-version 0.9.150; 1 groups of one thread (serial), 1 group overrides at priority 50; 2 run alone at priority 100, first (fx::a/a_alone, fxd::boot); 2 static locks, 1 grouped and 1 in-process; 2 test files name MEM-BUDGET, 1 state TAIL-STALL-TIMEOUT and 1 carry nextest-stall-default; no free-space read in 5 integration-test files and 1 library files they link; 1 cargo-nextest installs in CI at 0.9.150, each --locked, one in each of the 1 jobs that run it; [0-9]* .rs files of 6 test binaries read" \
     ncfg "$NC_DIR"
 # The config holds its listed keys only, in their listed shapes.
 nc_tree
@@ -7349,6 +7349,20 @@ nc_tree
 nc_sub "$NC_DIR/.github/workflows/ci.yml" '--version 0.9.150' '--version 0.9.149'
 expect_red_because "nextest-config: an install of another version is red" \
     "ci.yml:4: a cargo-nextest install names .--locked. and .--version 0.9.150." ncfg "$NC_DIR"
+nc_tree
+printf '  other:\n    steps:\n      - run: cargo nextest run -p fx\n' >>"$NC_DIR/.github/workflows/ci.yml"
+expect_red_because "nextest-config: a job that runs nextest with no install is red" \
+    "ci.yml:8: job .other. runs cargo nextest and installs no cargo-nextest" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/.github/workflows/ci.yml" '      - run: cargo install' '      # - run: cargo install'
+printf '  other:\n    steps:\n      - run: cargo install --locked cargo-nextest --version 0.9.150\n' \
+    >>"$NC_DIR/.github/workflows/ci.yml"
+expect_red_because "nextest-config: a commented-out install installs nothing" \
+    "ci.yml:5: job .test. runs cargo nextest and installs no cargo-nextest" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/.github/workflows/ci.yml" $'      - run: cargo install --locked cargo-nextest --version 0.9.150\n' ''
+expect_red_because "nextest-config: no install in any workflow is a scope error" \
+    "SCOPE ERROR: no cargo-nextest install in any workflow" ncfg "$NC_DIR"
 # D7: no free-space read; each MEM-BUDGET file states its stall bound or why
 # no write parks.
 nc_tree

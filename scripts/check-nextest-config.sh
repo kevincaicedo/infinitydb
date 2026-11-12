@@ -40,7 +40,8 @@
 #            run. A run-alone override selects each marked target or test, and
 #            selects nothing unmarked.
 #   install  a `cargo install` of cargo-nextest in .github/workflows names
-#            `--locked` and `--version` with the floor of `nextest-version`.
+#            `--locked` and `--version` with the floor of `nextest-version`, and
+#            each job that runs `cargo nextest` has one (a comment is none).
 #   oracle   no file of an integration-test target names statvfs, statfs,
 #            f_bavail or f_bfree, and no library file such a target links reads
 #            one in code (its comments may name them): free space is every
@@ -61,7 +62,7 @@
 # `mod` and `#[path]` from each target's root as rustc resolves them, and
 # reads each file once. Scope failures exit 2: no config, no `cargo
 # metadata`, no test binary, no .rs file, a `mod` that resolves to no file,
-# no workflow. INF_CHECK_ROOT names another checkout (the self-test's
+# no workflow, no cargo-nextest install in any workflow. INF_CHECK_ROOT names another checkout (the self-test's
 # fixtures).
 set -euo pipefail
 cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
@@ -684,17 +685,43 @@ for path in scanned:
 workflows = sorted(Path(".github/workflows").glob("*.y*ml"))
 if not workflows:
     scope_error("no workflow under .github/workflows")
-installs = 0
+installs = nextest_jobs = 0
 for path in workflows:
+    in_jobs, job, job_indent = False, None, None
+    jobs = {}  # job -> [the first line that runs cargo nextest, the installs in it]
     for number, raw in enumerate(path.read_text(encoding="utf-8").split("\n")):
-        if "cargo install" not in raw or "cargo-nextest" not in raw:
+        text = raw.strip()
+        if not text or text.startswith("#"):
             continue
-        installs += 1
-        words = raw.split()
-        version = re.search(r"--version[ =]+(\S+)", raw)
-        if "--locked" not in words or not version or version.group(1).strip("'\"") != floor:
-            red(f"{path}:{number + 1}: a cargo-nextest install names `--locked` and "
-                f"`--version {floor}`, the floor of {CONFIG}")
+        indent = len(raw) - len(raw.lstrip(" "))
+        if indent == 0:
+            in_jobs, job, job_indent = text.split("#")[0].strip() == "jobs:", None, None
+            continue
+        key = re.match(r"([A-Za-z0-9_-]+):\s*(?:#.*)?$", text)
+        if in_jobs and key and indent == (job_indent or indent):
+            job, job_indent = key.group(1), indent
+            jobs.setdefault(job, [None, 0])
+            continue
+        if "cargo install" in raw and "cargo-nextest" in raw:
+            installs += 1
+            jobs.setdefault(job or "", [None, 0])[1] += 1
+            words = raw.split()
+            version = re.search(r"--version[ =]+(\S+)", raw)
+            if "--locked" not in words or not version or version.group(1).strip("'\"") != floor:
+                red(f"{path}:{number + 1}: a cargo-nextest install names `--locked` and "
+                    f"`--version {floor}`, the floor of {CONFIG}")
+        elif re.search(r"\bcargo\s+nextest\b", raw):
+            runs = jobs.setdefault(job or "", [None, 0])
+            runs[0] = number if runs[0] is None else runs[0]
+    for name, (first, count) in sorted(jobs.items()):
+        if first is None:
+            continue
+        nextest_jobs += 1
+        if not count:
+            red(f"{path}:{first + 1}: job `{name}` runs cargo nextest and installs no cargo-nextest "
+                f"(`cargo install --locked cargo-nextest --version {floor}`)")
+if not installs:
+    scope_error("no cargo-nextest install in any workflow under .github/workflows")
 
 if reds:
     print("\n".join(reds))
@@ -711,6 +738,6 @@ print(
     f"state TAIL-STALL-TIMEOUT and {defaulted} carry nextest-stall-default; no free-space read in "
     f"{free_space_files} integration-test files and {len(linked)} library files they link; "
     f"{installs} cargo-nextest installs in CI at "
-    f"{floor}, each --locked; {len(scanned)} .rs files of {len(binaries)} test binaries read"
+    f"{floor}, each --locked, one in each of the {nextest_jobs} jobs that run it; {len(scanned)} .rs files of {len(binaries)} test binaries read"
 )
 PY
