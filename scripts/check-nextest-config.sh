@@ -31,7 +31,8 @@
 #            `mod` or `#[path]`) and, for a library's file, each test binary of
 #            its package and of every workspace package that links it (through
 #            normal dependencies, then one normal or dev edge). Every group is
-#            named by a marker.
+#            named by a marker, and each binary a group override selects holds a
+#            lock marked with that group.
 #   alone    a test target or one test that must run alone in its lane
 #            carries `nextest-alone: <reason>` in its file's leading comments
 #            or on the comments above its `#[test]`, and the reason gives its
@@ -491,6 +492,7 @@ linked = {path for path, users in linked_by.items()
 scanned = sorted(set(rust_files) | set(linked_by))
 bound = set()  # (file, line) of each marker that binds
 locks = []  # (file, line, verdict, group or reason)
+holders = {}  # group -> the test binaries that hold a lock marked with it
 alone_marks = []  # (file, line, test path or None)
 
 for path in scanned:
@@ -530,6 +532,7 @@ for path in scanned:
         if reason not in groups:
             red(f"{path}:{above + 1}: names test group `{reason}`, which [test-groups] lacks")
         users = sorted(linked_by.get(path, set()))
+        holders.setdefault(reason, set()).update(users)
         if not users:
             red(f"{path}:{number + 1}: a grouped lock in a file no test binary compiles")
         for binary in users:
@@ -597,6 +600,10 @@ for index, kind, chosen, wanted, _ in parsed:
             shown = f"`{binary}` test `{wanted}`" if wanted else f"test binary `{binary}`"
             red(f"{CONFIG}: override {index + 1} runs {shown} alone, and no `nextest-alone:` "
                 "marker names it")
+for index, kind, chosen, _, group in parsed:
+    for binary in sorted(chosen - holders.get(group, set())) if kind == "group" else ():
+        red(f"{CONFIG}: override {index + 1} puts `{binary}` in group `{group}`, and no lock that "
+            f"binary holds is marked `nextest-group: {group}`")
 named = {reason for _, _, verdict, reason in locks if verdict == "group"}
 for group in sorted(set(groups) - named):
     red(f"{CONFIG}: test group `{group}` is named by no lock's `nextest-group:` marker")

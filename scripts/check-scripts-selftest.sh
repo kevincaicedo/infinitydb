@@ -7205,7 +7205,13 @@ expect_red_because "nextest-config: a filter naming no package is red" \
     "filter names package .nope., which cargo metadata lacks" ncfg "$NC_DIR"
 nc_tree
 nc_sub "$NC_CFG" "filter = 'binary_id(fx::a)'" "filter = 'package(fx)'"
-expect green "nextest-config: a group's override by package selects the lock's binary" ncfg "$NC_DIR"
+expect_red_because "nextest-config: a group override selecting a binary that holds no such lock is red" \
+    "override 3 puts .fx::b. in group .serial., and no lock that binary holds" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" $'// nextest-group: serial\n#[allow(dead_code)]\nstatic SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' ''
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" '(TEXT, &SERIAL, &support::SPAWN)' '(TEXT, &support::SPAWN)'
+expect_red_because "nextest-config: a group override left behind by its lock is red" \
+    "override 3 puts .fx::a. in group .serial., and no lock that binary holds" ncfg "$NC_DIR"
 # The static locks: each marked, each group's marker paired with an override
 # that selects every binary compiling the file.
 nc_tree
