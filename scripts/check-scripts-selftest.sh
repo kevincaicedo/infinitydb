@@ -1478,6 +1478,183 @@ expect green "node-spawn: the census's constructor is bounded on its right (anot
     ns "$NS_ROOT"
 ns_reset
 
+# Rule 5 (ADR-0203 D3 as A2 amends it): a plant appended to the module, red at
+# its own line of the module (the plant's first line is 1) or green.
+NSM=bins/infinityd/tests/support/node.rs
+nsm_base=$(wc -l <"$NS_ROOT/$NSM" | tr -d ' ')
+nf_case() {
+    local label=$1 line=$2 why=$3
+    cat >>"$NS_ROOT/$NSM"
+    expect_red_because "node-spawn: $label" "$NSM:$((nsm_base + line)): $why" ns "$NS_ROOT"
+    ns_reset
+}
+nf_green() {
+    cat >>"$NS_ROOT/$NSM"
+    expect green "node-spawn: $1" ns "$NS_ROOT"
+    ns_reset
+}
+for vis in 'pub' 'pub(crate)' 'pub(super)' 'pub(in crate::harness)'; do
+    printf 'pub struct Named {\n    field: u8,\n    %s planted: u8,\n}\n' "$vis" |
+        nf_case "rule 5: $vis on a named field" 3 "rule 5, a field of Named carries a visibility"
+    printf 'pub struct Positional(u8, %s std::path::PathBuf);\n' "$vis" |
+        nf_case "rule 5: $vis on a positional field" 1 "rule 5, a field of Positional carries"
+done
+nf_case 'rule 5: a bare node-field-public marker is red' 1 "a bare node-field-public marker" <<'EOF'
+// node-field-public:
+pub struct Bare {
+    pub field: u8,
+}
+EOF
+nf_case 'rule 5: a marker with no reason is bare' 1 "a bare node-field-public marker" <<'EOF'
+// node-field-public: 1 fields
+pub struct Bare {
+    pub field: u8,
+}
+EOF
+nf_case 'rule 5: a marker with no count is bare' 1 "a bare node-field-public marker" <<'EOF'
+// node-field-public: some fields, a count in words
+pub struct Bare {
+    pub field: u8,
+}
+EOF
+nf_case 'rule 5: a marker on a struct with no public field is red' 1 \
+    "node-field-public marks Closed, which has no field with a visibility" <<'EOF'
+// node-field-public: 1 fields, nothing public
+pub struct Closed {
+    field: u8,
+}
+EOF
+nf_case 'rule 5: a marker two lines above its struct marks no struct' 1 \
+    "node-field-public marks no struct on its line or the next" <<'EOF'
+// node-field-public: 1 fields, two lines above
+
+pub struct Far {
+    pub field: u8,
+}
+EOF
+nf_case 'rule 5: a marker on the line below its struct marks no struct' 2 \
+    "node-field-public marks no struct on its line or the next" <<'EOF'
+pub struct Below {
+    // node-field-public: 1 fields, inside the body
+    pub field: u8,
+}
+EOF
+cat >>"$NS_ROOT/$NSM" <<'EOF'
+// node-field-public: 1 fields, one of two
+pub struct Counted {
+    pub first: u8,
+    pub second: u8,
+}
+EOF
+expect_red_because "node-spawn: rule 5: a marker whose count is not its struct's is red" \
+    "$NSM:$((nsm_base + 1)): node-field-public counts 1 field(s) with a visibility and Counted has 2" \
+    ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: ... and leaves each of the struct's fields red" \
+    "$NSM:$((nsm_base + 4)): rule 5, a field of Counted" ns "$NS_ROOT"
+ns_reset
+nf_case 'rule 5: a second marker on one struct is red' 2 \
+    "a second node-field-public marker on Twice" <<'EOF'
+// node-field-public: 1 fields, the line above
+pub struct Twice { // node-field-public: 1 fields, its own line
+    pub field: u8,
+}
+EOF
+nf_case 'rule 5: a bound whose return holds parens opens no body' 2 "rule 5, a field of Generic" <<'EOF'
+pub struct Generic<F: Fn(u32) -> (u32, u32)> {
+    pub planted: F,
+}
+EOF
+cat >>"$NS_ROOT/$NSM" <<'EOF'
+pub struct Bounded<F>
+where
+    F: Fn(u32) -> u32,
+{
+    pub planted: F,
+}
+pub struct After(pub u8);
+EOF
+expect_red_because "node-spawn: rule 5: a where clause's parens open no body" \
+    "$NSM:$((nsm_base + 5)): rule 5, a field of Bounded" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: ... and the next struct's body opens at its own paren" \
+    "$NSM:$((nsm_base + 7)): rule 5, a field of After" ns "$NS_ROOT"
+ns_reset
+nf_case 'rule 5: braces nested in a named body do not close it' 3 "rule 5, a field of Nested" <<'EOF'
+pub struct Nested {
+    buffer: [u8; { 4 }],
+    pub planted: u8,
+}
+EOF
+nf_case 'rule 5: parens nested in a positional body do not close it' 1 "rule 5, a field of Pair" \
+    <<<'pub struct Pair((u8, u8), pub u8);'
+nf_case 'rule 5: a brace inside a string literal closes no body' 3 "rule 5, a field of Quoted" <<'EOF'
+pub struct Quoted {
+    #[doc = "a } in a string"]
+    pub planted: u8,
+}
+EOF
+printf 'pub struct Open {\n    field: u8,\n' >>"$NS_ROOT/$NSM"
+expect_red_because "node-spawn: rule 5: a struct whose body does not close is a scope error" \
+    "SCOPE ERROR: $NSM: rule 5 cannot bound the body of Open (its line $((nsm_base + 1)))" \
+    ns "$NS_ROOT"
+ns_reset
+: >"$NS_ROOT/$NSM"
+expect_red_because "node-spawn: rule 5: an empty module is a scope error" \
+    "SCOPE ERROR: rule 5 read no line of the module" ns "$NS_ROOT"
+ns_reset
+cat >>"$NS_ROOT/$NSM" <<'EOF'
+// node-field-public: 2 fields, a test sets both
+pub struct Marked {
+    pub first: u8,
+    pub(crate) second: u8,
+}
+/* node-field-public: 1 fields, in a block comment */
+pub struct Blocked(pub u8);
+EOF
+expect green "node-spawn: rule 5: a marked struct with its counted fields is green" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: the OK line lists each marker with its struct and count" \
+    "public by design: $NSM:$((nsm_base + 1)): Marked, 2 field(s): a test sets both" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: ... a block comment's marker without its close" \
+    "public by design: $NSM:$((nsm_base + 6)): Blocked, 1 field(s): in a block comment$" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: the OK line counts the structs and their public fields" \
+    "rule 5: 2 struct(s) in the module, 3 field(s) with a visibility, all in 2 marked struct(s)" \
+    ns "$NS_ROOT"
+ns_reset
+nf_green "rule 5: a marker on its struct's own line marks it" <<'EOF'
+pub struct OnItsLine { // node-field-public: 1 fields, its own line
+    pub only: u8,
+}
+EOF
+nf_green 'rule 5: a pub fn in an impl, after a unit struct, is no field' <<'EOF'
+pub struct Unit;
+impl Unit {
+    pub fn method(&self) {}
+}
+EOF
+nf_green 'rule 5: pub inside a longer name or a raw identifier is no visibility' <<'EOF'
+pub struct Private {
+    field: u8,
+    publish: u8,
+    epub: u8,
+    r#pub: u8,
+}
+pub struct Positional(u8, std::path::PathBuf);
+EOF
+nf_green 'rule 5: struct inside a longer name, a raw identifier or a string opens no body' <<'EOF'
+mod destruct {
+    pub fn f() {}
+}
+mod structure {
+    pub fn f() {}
+}
+mod r#struct {
+    pub fn f() {}
+}
+pub const TEXT: &str = "struct S { pub x: u8 }";
+EOF
+printf 'pub struct Other {\n    pub field: u8,\n}\n' | ns_put crates/fx/tests/support/node.rs
+expect green "node-spawn: rule 5 reads the module alone: a pub field in another node.rs" ns "$NS_ROOT"
+ns_reset
+
 # Scope errors.
 printf 'fn f() {}\n/* never closed\nfn g() {}\n' | ns_put "$P"
 expect_red_because "node-spawn: a file that ends inside a block comment is a scope error" \

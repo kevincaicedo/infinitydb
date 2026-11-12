@@ -4,8 +4,9 @@
 # every node it starts the box's node lock, held by the node itself from
 # before its first ring to its exit, and end the node with its handle. No
 # type refuses a string, so this gate holds the other half: outside the
-# module no file names the binary. Four rules, read on each scanned line with
-# its comments blanked, each red with its file and line:
+# module no file names the binary, and inside it no field is public. Five
+# rules, read on each scanned line with its comments blanked, each red with
+# its file and line; rules 1 to 4 read every file but the module:
 #   1. the token BIN_EXE_infinityd, in cargo's spelling and in nextest's
 #      (CARGO_BIN_EXE_infinityd, NEXTEST_BIN_EXE_infinityd);
 #   2. the literal "INFINITYD_BIN", except as the first argument of `.env(`
@@ -16,7 +17,16 @@
 #      any prefix (b, c, r, br, cr, any number of #s);
 #   4. the token XDG_RUNTIME_DIR or env_clear, outside the module and its own
 #      test, bins/infinityd/tests/node_lock.rs: either moves the lock's
-#      directory, so a node would hold another lock than the box's.
+#      directory, so a node would hold another lock than the box's;
+#   5. in the module's file alone, a field that carries a visibility (pub,
+#      pub(crate), pub(super), pub(in ..)), named or positional, inside a
+#      struct's body (ADR-0203 D3 as its A2 amends it): the module's fields
+#      hold the binary's path, a command, a child and the lock's open files.
+#      A test target that includes the module reads a field any visibility
+#      opens, where a compile_fail doctest, another crate, sees a plain `pub`
+#      only. A struct public by design carries `node-field-public: <n>
+#      fields, <reason>` on its line or the line above, <n> its count of such
+#      fields, so a field added to it is red until the marker is read again.
 # What no token shows is review's: a name built from pieces, the variable's
 # name built at run time, an escape inside the literal, the name inside a
 # longer string (`sh -c "exec infinityd"`), `env -i` in a shell string.
@@ -36,8 +46,10 @@
 # A scope error exits 2 (ADR-0106 D1): a root that is not its own git
 # work tree, a missing module, module test or excluded directory, an empty
 # scan, a path holding a tab or a newline, a `#[path]` target that does not
-# exist where it resolves or resolves outside the root, and a file that ends
-# inside a block comment, whose rest the blanker would drop unseen.
+# exist where it resolves or resolves outside the root, a file that ends
+# inside a block comment, whose rest the blanker would drop unseen, a module
+# with no line for rule 5 to read, and a struct of the module whose body
+# rule 5 cannot bound: it does not close before the file ends.
 #
 # What the scan does not read, each able to turn a red green (review holds
 # them; ADR-0203 D3 states the forms the scan reads):
@@ -52,14 +64,21 @@
 #     that ends in a backslash (`r"\"`), a `//` inside a later string on the
 #     line cuts the rest of the line, a token included; a later line of a
 #     multi-line string literal that holds `/*` blanks every line up to the
-#     next `*/`.
+#     next `*/`;
+#   - rule 5 reads the bodies the `struct` keyword opens in the module's own
+#     file, string literals emptied by the same per-line quote count, and
+#     takes every `pub` inside a body for a field's visibility: not a
+#     `union`, a visibility a macro writes, a struct of the module declared
+#     in another file, nor a `pub const` or `pub static` that holds a path.
 # The same count reads some text as code, a false red a marker answers: a
 # quoted value inside a raw string, a comment after a `'"'` char literal, and
 # the rest of a nested block comment after its first `*/`.
 #
 # A legitimate use carries `node-spawn-allow: <reason>` on its line or the
 # line above (ADR-0106 D4) and is listed on the OK line; a bare marker is
-# red, and so is a marker that marks no hit.
+# red, and so is a marker that marks no hit. Rule 5's marker is listed there
+# too, and is red bare, on no struct, as a struct's second, on a struct with
+# no public field, or with a count that is not its struct's.
 #
 # The ring census (ADR-0203 D3): io_uring rings that belong to no node take
 # no lock, and memlock_boot's budget counts them. Every scanned file that
@@ -241,6 +260,8 @@ while IFS= read -r path; do files[${#files[@]}]=./$path; done <"$work/seen"
 awk 'index($0, "node-spawn-allow") {
     f = FILENAME; sub("^[.]/", "", f); print f "\t" FNR "\t" $0
 }' "${files[@]}" >"$work/markers"
+# Rule 5's markers, from the module's raw lines alone.
+awk 'index($0, "node-field-public") { print FNR "\t" $0 }' "./$MODULE" >"$work/field-markers"
 printf '%s' "$CENSUS" >"$work/census"
 
 # The verdict: one record a line, `red <text>`, `scope <text>`, `allowed
@@ -270,6 +291,63 @@ function hit(f, l, rule) {
         hit_file[hits] = f; hit_line[hits] = l; hit_rule[hits] = rule
     }
 }
+function word_at(s, i, w,   before, after) {
+    if (substr(s, i, length(w)) != w) { return 0 }
+    before = i > 1 ? substr(s, i - 1, 1) : " "
+    after = substr(s, i + length(w), 1)
+    return before !~ "[A-Za-z0-9_#]" && after !~ "[A-Za-z0-9_]"
+}
+# Rule 5 on one line of the module, string literals emptied. The keyword
+# `struct` opens a header; its first `{` or `(` outside the generics opens
+# the body (a `(` after `where` opens a bound, not the body), and `;` ends a
+# unit struct. The body ends at its matching `}` or `)`, and every `pub`
+# inside it is the visibility of a field: no type holds the keyword.
+function fields(text, l,   i, c, n, pad) {
+    gsub("\"[^\"]*\"", "\"\"", text)
+    n = length(text)
+    i = 1
+    while (i <= n) {
+        if (state5 == 0) {
+            pad = " " substr(text, i)
+            if (!match(pad, "[^A-Za-z0-9_#]struct([^A-Za-z0-9_]|$)")) { return }
+            i += RSTART + 5
+            structs++
+            struct_line[structs] = l
+            struct_at[l] = structs
+            struct_name[structs] = "a struct"
+            if (match(substr(text, i), "^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*")) {
+                struct_name[structs] = substr(text, i, RLENGTH)
+                sub("^[[:space:]]+", "", struct_name[structs])
+                i += RLENGTH
+            }
+            state5 = 1
+            where5 = 0
+            continue
+        }
+        c = substr(text, i, 1)
+        if (state5 == 1) {
+            if (c == "<") {
+                angle5++
+            } else if (c == ">") {
+                if (substr(text, i - 1, 1) != "-") { angle5-- }
+            } else if (angle5 == 0) {
+                if (c == "{") { state5 = 2; depth5 = 1 }
+                else if (c == "(" && !where5) { state5 = 3; depth5 = 1 }
+                else if (c == ";") { state5 = 0 }
+                else if (word_at(text, i, "where")) { where5 = 1 }
+            }
+        } else if (c == (state5 == 2 ? "{" : "(")) {
+            depth5++
+        } else if (c == (state5 == 2 ? "}" : ")")) {
+            depth5--
+            if (depth5 == 0) { state5 = 0 }
+        } else if (word_at(text, i, "pub")) {
+            public[structs]++
+            public_line[structs, public[structs]] = l
+        }
+        i++
+    }
+}
 FILENAME == includesf {
     split($0, field, "\t")
     if (!(field[3] in includer)) { includer[field[3]] = field[1] ":" field[2] }
@@ -286,6 +364,20 @@ FILENAME == markersf {
     sub("[[:space:]]*[*]/.*$", "", reason)
     marker[f SUBSEP l] = reason
     markers++; marker_file[markers] = f; marker_line[markers] = l
+    next
+}
+FILENAME == fieldmarkersf {
+    p = index($0, "\t"); l = substr($0, 1, p - 1); raw = substr($0, p + 1)
+    m = index(raw, "node-field-public")
+    after = substr(raw, m + length("node-field-public"))
+    claim = ""
+    if (substr(after, 1, 1) == ":") { claim = trim(substr(after, 2)) }
+    sub("[[:space:]]*[*]/.*$", "", claim)
+    fmarkers++; fmarker_line[fmarkers] = l; fmarker_count[fmarkers] = -1
+    if (match(claim, "^[0-9]+ fields,[[:space:]]*[^[:space:]]")) {
+        fmarker_count[fmarkers] = substr(claim, 1, index(claim, " ") - 1) + 0
+        fmarker_reason[fmarkers] = trim(substr(claim, index(claim, ",") + 1))
+    }
     next
 }
 FILENAME == censusf {
@@ -314,6 +406,7 @@ FILENAME == censusf {
     }
     if (f != current) { current = f; prev_code = "" }
     lines++
+    if (f == module) { module_lines++; fields(text, l) }
     pad = " " text " "
     rings[f] += count(pad, "[^A-Za-z0-9_]UringDriver::new[^A-Za-z0-9_]")
     regs[f] += count(text, "[.]register_(tier_)?pool[(]")
@@ -395,7 +488,70 @@ END {
                 "; write " f "|" row_class[f] "|" rings[f] "|" regs[f]
         }
     }
+    # Rule 5: a marker marks the struct on its line, else the one on the
+    # next line, and no struct has two.
+    for (k = 1; k <= fmarkers; k++) {
+        l = fmarker_line[k]
+        if (fmarker_count[k] < 0) {
+            print "red " module ":" l ": a bare node-field-public marker; write" \
+                " node-field-public: <n> fields, <reason>, <n> the count of its struct'\''s" \
+                " fields with a visibility"
+            continue
+        }
+        s = 0
+        below = l + 1
+        if (l in struct_at) {
+            s = struct_at[l]
+        } else if (below in struct_at) {
+            s = struct_at[below]
+        }
+        if (s == 0) {
+            print "red " module ":" l ": node-field-public marks no struct on its line or" \
+                " the next; remove it"
+            continue
+        }
+        if (s in struct_marker) {
+            print "red " module ":" l ": a second node-field-public marker on " struct_name[s] \
+                "; keep one"
+            continue
+        }
+        struct_marker[s] = k
+    }
+    for (s = 1; s <= structs; s++) {
+        public_fields += public[s]
+        if (s in struct_marker) {
+            k = struct_marker[s]
+            if (public[s] == 0) {
+                print "red " module ":" fmarker_line[k] ": node-field-public marks " \
+                    struct_name[s] ", which has no field with a visibility; remove it"
+                continue
+            }
+            if (fmarker_count[k] == public[s]) {
+                print "public " module ":" fmarker_line[k] ": " struct_name[s] ", " public[s] \
+                    " field(s): " fmarker_reason[k]
+                public_structs++
+                continue
+            }
+            print "red " module ":" fmarker_line[k] ": node-field-public counts " fmarker_count[k] \
+                " field(s) with a visibility and " struct_name[s] " has " public[s] \
+                ": read its fields again, then write their count"
+        }
+        for (j = 1; j <= public[s]; j++) {
+            print "red " module ":" public_line[s, j] ": rule 5, a field of " struct_name[s] \
+                " carries a visibility; a test reaches the module'\''s state through its methods" \
+                " only: make the field private, or mark a struct public by design" \
+                " node-field-public: <n> fields, <reason> on its line or the line above"
+        }
+    }
+    if (state5 != 0) {
+        print "scope " module ": rule 5 cannot bound the body of " struct_name[structs] \
+            " (its line " struct_line[structs] "): it does not close before the file ends"
+    }
     print "count lines " lines + 0
+    print "count module_lines " module_lines + 0
+    print "count structs " structs + 0
+    print "count public_fields " public_fields + 0
+    print "count public_structs " public_structs + 0
     print "count hits " hits + 0
     print "count marked " marked
     print "count census " (class_rows["test"] + 0) " test, " (class_rows["bench"] + 0) \
@@ -404,9 +560,9 @@ END {
 
 awk -v module="$MODULE" -v module_test="$MODULE_TEST" \
     -v includesf="$work/includes" -v reachedf="$work/reached" -v markersf="$work/markers" \
-    -v censusf="$work/census" "$AWK_RULES" \
-    "$work/includes" "$work/reached" "$work/markers" "$work/census" "$work/blanked" \
-    >"$work/verdict"
+    -v fieldmarkersf="$work/field-markers" -v censusf="$work/census" "$AWK_RULES" \
+    "$work/includes" "$work/reached" "$work/markers" "$work/field-markers" "$work/census" \
+    "$work/blanked" >"$work/verdict"
 
 if grep -q '^scope ' "$work/verdict"; then
     sed -n 's/^scope /NODE-SPAWN SCOPE ERROR: /p' "$work/verdict"
@@ -415,6 +571,8 @@ fi
 value() { sed -n "s/^count $1 //p" "$work/verdict"; }
 scanned=$(wc -l <"$work/seen" | tr -d ' ')
 [ "$(value lines)" -gt 0 ] || scope_error "the blanker read no line: an empty scan is no verdict"
+[ "$(value module_lines)" -gt 0 ] ||
+    scope_error "rule 5 read no line of the module $MODULE: an empty module is no verdict"
 includes=$(wc -l <"$work/includes" | tr -d ' ')
 reached=$(wc -l <"$work/reached" | tr -d ' ')
 excluded=$(wc -l <"$work/excluded" | tr -d ' ')
@@ -434,5 +592,8 @@ echo "node-spawn OK: $scanned files, $(value lines) lines scanned ($listed liste
     "reached only by #[path], $reached_excluded of them under the excluded directories;" \
     "$includes #[path] includes followed; $gone listed path(s) gone from the work tree);" \
     "excluded: $EXCLUDED ($excluded files); the module: $MODULE; $(value hits) hit(s)," \
-    "$(value marked) marked; ring census: $(value census) row(s)"
+    "$(value marked) marked; ring census: $(value census) row(s); rule 5: $(value structs)" \
+    "struct(s) in the module, $(value public_fields) field(s) with a visibility, all in" \
+    "$(value public_structs) marked struct(s)"
 sed -n 's/^allowed /  allowed: /p' "$work/verdict"
+sed -n 's/^public /  public by design: /p' "$work/verdict"

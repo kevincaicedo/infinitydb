@@ -378,6 +378,7 @@ impl Scope for Private {}
 
 /// The deadlines and the settle of one lock.
 #[derive(Clone, Copy, Debug)]
+// node-field-public: 3 fields, durations a test sets for its own lock; no path, command or file
 pub struct Waits {
     /// A start's wait for both locks.
     pub shared: Duration,
@@ -408,6 +409,7 @@ pub enum Ulimit {
 /// What this process holds on one lock: its live shared nodes (in the
 /// process and on the calling thread) and whether it holds the lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// node-field-public: 3 fields, counts and a flag copied out for a test to read; nothing to start
 pub struct Live {
     pub process: u32,
     pub thread: u32,
@@ -882,6 +884,7 @@ pub enum NodeError {
 
 /// A lock path and why it cannot be used.
 #[derive(Debug)]
+// node-field-public: 2 fields, the lock's refused path (directory, lock file or uid probe) and why
 pub struct DirRefusal {
     pub path: PathBuf,
     pub reason: DirReason,
@@ -900,6 +903,7 @@ pub enum DirReason {
 
 /// The lock file a wait gave up on, and how long it waited.
 #[derive(Debug)]
+// node-field-public: 2 fields, a lock file's path under dir() and the time a wait spent on it
 pub struct LockTimeout {
     pub lock: PathBuf,
     pub waited: Duration,
