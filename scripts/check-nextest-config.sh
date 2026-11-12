@@ -51,10 +51,11 @@
 # Whether an assertion's input is box-wide, or a stated bound a hang bound,
 # is a property of the program that no text scan decides: review holds it.
 # The source scan reads comments and string literals as blank, follows
-# `mod` and `#[path]` from each target's root, and reads each file once.
-# Scope failures exit 2: no config, no `cargo metadata`, no test binary, no
-# .rs file, no workflow. INF_CHECK_ROOT names another checkout (the
-# self-test's fixtures).
+# `mod` and `#[path]` from each target's root as rustc resolves them, and
+# reads each file once. Scope failures exit 2: no config, no `cargo
+# metadata`, no test binary, no .rs file, a `mod` that resolves to no file,
+# no workflow. INF_CHECK_ROOT names another checkout (the self-test's
+# fixtures).
 set -euo pipefail
 cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
 
@@ -405,19 +406,26 @@ rust_files = sorted(Path(name) for name in listed if name.endswith(".rs") and Pa
 if not rust_files:
     scope_error("git lists no .rs file under crates/, bins/ or tests/")
 
-# Which test binaries compile each file, and at which module path.
-compiled_by = {}  # file -> {(binary id, module path)}
-for binary, (_, root_file, kinds) in sorted(binaries.items()):
-    todo, seen = [(root_file, (), True)], set()
+unresolved = []  # each `mod` declaration that resolves to no file
+
+
+def walk(root_file):
+    """Every file a crate root compiles, by `mod` and `#[path]`, with its module
+    paths. As rustc resolves them: `mod x;` in a root, a `mod.rs` or a file
+    loaded by `#[path]` reads `x.rs` or `x/mod.rs` beside it, in any other file
+    `<stem>/x.rs`; a `#[path]` is relative to the declaring file's directory,
+    inside an inline module to that module's directory."""
+    files, todo = {}, [(root_file, (), True)]
     while todo:
-        path, module, mod_rs = todo.pop()
-        if (path, module) in seen or not path.is_file():
+        path, module, owns_dir = todo.pop()
+        if module in files.get(path, set()):
             continue
-        seen.add((path, module))
-        compiled_by.setdefault(path, set()).add((binary, module))
-        here = source(path)
-        for _, inline, name, attribute in here.declared:
-            base = path.parent if mod_rs else path.parent / path.stem
+        if not path.is_file():
+            unresolved.append(f"{path} (a crate root cargo metadata names)")
+            continue
+        files.setdefault(path, set()).add(module)
+        for number, inline, name, attribute in source(path).declared:
+            base = path.parent if owns_dir else path.parent / path.stem
             if attribute is not None:
                 start = base.joinpath(*inline) if inline else path.parent
                 child = Path(os.path.normpath(start / attribute))
@@ -426,7 +434,20 @@ for binary, (_, root_file, kinds) in sorted(binaries.items()):
                 child = start / f"{name}.rs"
                 if not child.is_file():
                     child = start / name / "mod.rs"
-            todo.append((child, module + inline + (name,), child.name == "mod.rs"))
+            if not child.is_file():
+                unresolved.append(f"{path}:{number + 1}: `mod {name};` resolves to no file ({child})")
+                continue
+            todo.append((child, module + inline + (name,), attribute is not None or child.name == "mod.rs"))
+    return files
+
+
+# Which test binaries compile each file, and at which module path.
+compiled_by = {}  # file -> {(binary id, module path)}
+for binary, (_, root_file, kinds) in sorted(binaries.items()):
+    for path, modules in walk(root_file).items():
+        compiled_by.setdefault(path, set()).update((binary, module) for module in modules)
+if unresolved:
+    scope_error("a module this gate cannot find would go unread: " + "; ".join(unresolved[:5]))
 
 integration = {path for path, users in compiled_by.items()
                if any("test" in binaries[b][2] for b, _ in users)}

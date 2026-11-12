@@ -7255,6 +7255,27 @@ expect green "nextest-config: a run-alone test in an inline module is named by i
 nc_tree
 nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'#![allow(\n    clippy::disallowed_methods,\n' $'#![allow(\n    clippy::disallowed_methods,\n    clippy::disallowed_types,\n'
 expect green "nextest-config: a leading marker below an inner attribute of four lines binds" ncfg "$NC_DIR"
+# Modules resolve as rustc resolves them: a `#[path]` file's own `mod` sits
+# beside it, and a declaration that resolves to no file is a scope error.
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/inc"
+printf '#[path = "inc/part.rs"]\nmod part;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+printf 'pub mod nested;\n' >"$NC_DIR/crates/fx/tests/inc/part.rs"
+printf 'pub fn free() -> &'"'"'static str { "statvfs" }\n' >"$NC_DIR/crates/fx/tests/inc/nested.rs"
+expect_red_because "nextest-config: a #[path] file's own module is read where rustc reads it" \
+    "inc/nested.rs:1: names .statvfs. in an integration-test target" ncfg "$NC_DIR"
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/inc"
+printf '#[path = "inc/part.rs"]\nmod part;\n' >>"$NC_DIR/crates/fx/tests/a.rs"
+printf 'pub mod nested;\n' >"$NC_DIR/crates/fx/tests/inc/part.rs"
+printf '// nextest-group: serial\npub static DEEP: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' \
+    >"$NC_DIR/crates/fx/tests/inc/nested.rs"
+expect green "nextest-config: a grouped lock in a #[path] file's own module binds its binary" ncfg "$NC_DIR"
+nc_tree
+printf 'mod missing;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a module that resolves to no file is a scope error" \
+    "SCOPE ERROR: a module this gate cannot find would go unread: crates/fx/tests/b.rs:7: .mod missing;." \
+    ncfg "$NC_DIR"
 # One marker spelling: a comment that starts like a marker in another is red on
 # its line; a marker named in prose is no marker.
 nc_spelled() { # <label> <comment line>: the line above a new test in b.rs is red
