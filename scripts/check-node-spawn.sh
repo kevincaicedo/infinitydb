@@ -29,12 +29,33 @@
 # excluded directory: a campaign source a test includes is that test's code.
 # A listed path gone from the work tree is skipped and counted. Comments are
 # blanked by rust-strip-comments.awk in its files mode, one pass a round of
-# files, which leaves string literals intact; markers are read from the raw
-# line. A scope error exits 2 (ADR-0106 D1): a root that is not its own git
+# files; markers are read from the raw line. The blanker reads a backslash
+# escape as two characters of its own and counts double quotes on one line,
+# never across lines, so a string literal is read whole only where its quotes
+# balance on its line.
+# A scope error exits 2 (ADR-0106 D1): a root that is not its own git
 # work tree, a missing module, module test or excluded directory, an empty
 # scan, a path holding a tab or a newline, a `#[path]` target that does not
 # exist where it resolves or resolves outside the root, and a file that ends
 # inside a block comment, whose rest the blanker would drop unseen.
+#
+# What the scan does not read, each able to turn a red green (review holds
+# them; ADR-0203 D3 states the forms the scan reads):
+#   - the #[path] follower reads `#[path = "..."]` with a plain string only:
+#     not `#[path = r"..."]`, `cfg_attr(.., path = ..)` or `include!(..)`,
+#     nor a plain `mod child;` in a file only a #[path] reaches, whose child
+#     under an excluded directory goes unread. An absolute target is joined
+#     to the includer's directory, and a #[path] inside an inline module is
+#     resolved against the file's directory, not the module's: either is a
+#     scope error naming a path rustc does not read, or another file read;
+#   - the blanker's quote count: after a `'"'` char literal, or a raw string
+#     that ends in a backslash (`r"\"`), a `//` inside a later string on the
+#     line cuts the rest of the line, a token included; a later line of a
+#     multi-line string literal that holds `/*` blanks every line up to the
+#     next `*/`.
+# The same count reads some text as code, a false red a marker answers: a
+# quoted value inside a raw string, a comment after a `'"'` char literal, and
+# the rest of a nested block comment after its first `*/`.
 #
 # A legitimate use carries `node-spawn-allow: <reason>` on its line or the
 # line above (ADR-0106 D4) and is listed on the OK line; a bare marker is
