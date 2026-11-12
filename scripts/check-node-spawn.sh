@@ -169,6 +169,7 @@ function norm(path,   n, parts, i, k, stack, out) {
 }
 {
     p = index($0, "\t"); file = substr($0, 1, p - 1); rest = substr($0, p + 1)
+    sub("^[.]/", "", file)
     q = index(rest, "\t"); line = substr(rest, 1, q - 1); text = substr(rest, q + 1)
     if (line == "open-block") { next }
     while (match(text, "#[[][[:space:]]*path[[:space:]]*=[[:space:]]*\"[^\"]*\"[[:space:]]*[]]")) {
@@ -183,14 +184,17 @@ function norm(path,   n, parts, i, k, stack, out) {
 }'
 
 # Rounds: blank the round's files in one pass, then queue each `#[path]`
-# target not yet scanned. Each scanned file is in exactly one round.
+# target not yet scanned. Each scanned file is in exactly one round. awk reads
+# an operand `name=value` as an assignment and `-` as standard input, so a
+# path of either form would be counted and never read: every path goes to awk
+# as `./path`, which is neither, and each program drops the `./` it prints.
 : >"$work/blanked"
 : >"$work/includes"
 : >"$work/reached"
 cp "$work/round" "$work/seen"
 while [ -s "$work/round" ]; do
     files=()
-    while IFS= read -r path; do files[${#files[@]}]=$path; done <"$work/round"
+    while IFS= read -r path; do files[${#files[@]}]=./$path; done <"$work/round"
     awk -v mode=files -f "$BLANK" "${files[@]}" >"$work/round.blanked"
     cat "$work/round.blanked" >>"$work/blanked"
     awk "$AWK_PATHS" "$work/round.blanked" >"$work/round.includes"
@@ -212,9 +216,10 @@ done
 
 # Markers, from the raw lines of every scanned file.
 files=()
-while IFS= read -r path; do files[${#files[@]}]=$path; done <"$work/seen"
-awk 'index($0, "node-spawn-allow") { print FILENAME "\t" FNR "\t" $0 }' "${files[@]}" \
-    >"$work/markers"
+while IFS= read -r path; do files[${#files[@]}]=./$path; done <"$work/seen"
+awk 'index($0, "node-spawn-allow") {
+    f = FILENAME; sub("^[.]/", "", f); print f "\t" FNR "\t" $0
+}' "${files[@]}" >"$work/markers"
 printf '%s' "$CENSUS" >"$work/census"
 
 # The verdict: one record a line, `red <text>`, `scope <text>`, `allowed
@@ -280,6 +285,7 @@ FILENAME == censusf {
 {
     p = index($0, "\t"); f = substr($0, 1, p - 1); rest = substr($0, p + 1)
     q = index(rest, "\t"); l = substr(rest, 1, q - 1); text = substr(rest, q + 1)
+    sub("^[.]/", "", f)
     if (l == "open-block") {
         print "scope " f " ends inside the block comment opened at its line " text \
             ": the blanker would drop the rest unseen"

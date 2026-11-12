@@ -1514,6 +1514,13 @@ printf 'x' | ns_put "$(printf 'crates/fx/tests/a\nb.rs')"
 expect_red_because "node-spawn: a path holding a newline is a scope error" \
     "SCOPE ERROR: a listed path holds a tab or a newline" ns "$NS_ROOT"
 ns_reset
+ns_put 'a=b.rs' <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+printf 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");\n' | ns_put 'x=1/plant.rs'
+expect_red_because "node-spawn: a path awk would take for an assignment is read (a=b.rs)" \
+    "a=b.rs:1: rule 1," ns "$NS_ROOT"
+expect_output "node-spawn: ... and a file under a directory named x=1" "x=1/plant.rs:1: rule 1," \
+    ns "$NS_ROOT"
+ns_reset
 expect_red_because "node-spawn: a root that is not its own git work tree is a scope error" \
     "SCOPE ERROR: .* is not its own git work tree" ns "$NS_ROOT/crates"
 mkdir -p "$NSW/nogit/bins/infinityd/tests/support"
