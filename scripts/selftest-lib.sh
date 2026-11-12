@@ -8,9 +8,13 @@
 # is loaded, and a name only one of them lists is red. With no argument it
 # lints the groups' fixtures, runs every group in a process of its own, at most
 # CARGO_BUILD_JOBS (default 4) at once and each at CARGO_BUILD_JOBS=1, prints
-# their output in file order and folds their counts. `--group <name>` runs one
-# group in a work directory of its own and prints `group <name>: <pass> <fail>`;
-# `--list-groups` prints bash's table; `--lint` runs the fixture lint alone.
+# their output in file order, folds their counts and names the longest group
+# with its seconds on the OK line. `--group <name>` runs one group in a work
+# directory of its own and prints `group <name>: <pass> <fail>`, then `group
+# <name> clock: <began> <ended>`, the monotonic clock in tenths of a second
+# around the group; `--list-groups` prints bash's table; `--lint` runs the
+# fixture lint alone. A count or stamp the driver reads is 0 or [1-9][0-9]*, or
+# the group is red: its arithmetic never meets a leading zero or a non-number.
 #
 # Portable bash 3.2 (ADR-0106 D18), as the macOS leg runs it: no mapfile, no
 # `wait -n`, no associative arrays, no `{fd}` redirection; BSD xargs, sed and
@@ -170,6 +174,31 @@ selftest_defined() {
 selftest_declared() {
     declare -F | sed -n 's/^declare -f[a-z]* group_//p'
 }
+# selftest_clock: the monotonic clock in tenths of a second; bash 3.2 has no
+# clock finer than a second, and python3 is already the lint's.
+selftest_clock() {
+    python3 -I -S -c 'import time; print(int(time.monotonic() * 10))'
+}
+# selftest_number <word>: true for 0 or [1-9][0-9]*, the only numbers the
+# driver's arithmetic reads.
+selftest_number() {
+    case $1 in '' | 0?* | *[!0-9]*) return 1 ;; esac
+}
+# selftest_tenths <group> <log>: the group's tenths of a second, from its one
+# clock line of two stamps in order; else that line, or `none`, and status 1.
+# The driver reads it for a group no earlier check counted red.
+selftest_tenths() {
+    local line began ended
+    line=$(sed -n "/^group $1 clock: /p" "$2")
+    began=${line#"group $1 clock: "}
+    ended=${began#* }
+    began=${began%% *}
+    if ! selftest_number "$began" || ! selftest_number "$ended" || [ "$ended" -lt "$began" ]; then
+        echo "${line:-none}"
+        return 1
+    fi
+    echo $((ended - began))
+}
 
 # The fixture lint: an absent fixture passes a bare `expect red`, so a function
 # the self-test defines is red when it reads a `$work/<name>` before it, or a
@@ -190,7 +219,7 @@ selftest_lint() {
 
 # selftest_run_group <self> <name>: one group in its own work directory.
 selftest_run_group() {
-    local self=$1 name=$2 logged
+    local self=$1 name=$2 logged began
     case " $(selftest_defined "$self" | tr '\n' ' ') " in
     *" $name "*) ;;
     *) echo "selftest: no group '$name' in $self" >&2; exit 2 ;;
@@ -199,6 +228,7 @@ selftest_run_group() {
     [ -n "$work" ] && [ -d "$work" ] || { echo "selftest: mktemp failed" >&2; exit 2; }
     trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
     SELFTEST_GROUP=$name
+    began=$(selftest_clock)
     if [ -n "${INF_SELFTEST_CASE_LOG:-}" ]; then
         mkdir "$INF_SELFTEST_CASE_LOG/$name" || exit 2
     fi
@@ -212,13 +242,14 @@ selftest_run_group() {
         fi
     fi
     echo "group $name: $pass $fail"
+    echo "group $name clock: $began $(selftest_clock)"
     [ "$fail" -eq 0 ]
 }
 
 # selftest_drive <self>: every group, folded into one verdict.
 selftest_drive() {
     local self=$1 jobs=${CARGO_BUILD_JOBS:-4} defined g n=0 red=0 groups_red=0 line
-    local status count names='' gp gf
+    local status count names='' gp gf tenths longest=-1 longest_group=''
     case $jobs in
     '' | 0* | *[!0-9]*) echo "selftest: CARGO_BUILD_JOBS '$jobs' is not a positive integer" >&2; exit 2 ;;
     esac
@@ -273,7 +304,7 @@ selftest_drive() {
         n=$((n + 1))
         names="$names${names:+, }$g"
         status=$(cat "$root/$g.status" 2>/dev/null || echo none)
-        sed "/^group $g: /d" "$root/$g.log" 2>/dev/null || true
+        sed -e "/^group $g: /d" -e "/^group $g clock: /d" "$root/$g.log" 2>/dev/null || true
         count=$(grep -c "^group $g: " "$root/$g.log" 2>/dev/null || true)
         if [ "${count:-0}" -ne 1 ]; then
             echo "SELFTEST DRIVER: group $g printed ${count:-0} count lines (exit $status), not one"
@@ -303,6 +334,13 @@ selftest_drive() {
             groups_red=$((groups_red + 1))
         elif [ "$gf" -ne 0 ]; then
             groups_red=$((groups_red + 1))
+        elif ! tenths=$(selftest_tenths "$g" "$root/$g.log"); then
+            echo "SELFTEST DRIVER: group $g's clock line is not one line of two stamps" \
+                "in order: $tenths"
+            groups_red=$((groups_red + 1))
+        elif [ "$tenths" -gt "$longest" ]; then
+            longest=$tenths
+            longest_group=$g
         fi
     done
     if [ "$red" -ne 0 ] || [ "$groups_red" -ne 0 ] || [ "$fail" -ne 0 ] || [ "$pass" -eq 0 ]; then
@@ -311,7 +349,8 @@ selftest_drive() {
         exit 1
     fi
     echo "check-scripts self-test OK ($pass cases in $n groups, each exiting non-zero on its" \
-        "planted case: $names)"
+        "planted case: $names); the longest group: $longest_group," \
+        "$((longest / 10)).$((longest % 10)) s"
 }
 
 # selftest_main <self> [--group <name> | --list-groups | --lint]

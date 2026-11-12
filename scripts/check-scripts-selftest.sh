@@ -264,6 +264,62 @@ drv_own_log() { # each group's records hold its own labels only
         ! cat "$work/drv-log/two/"* | grep -q '^label	one '
 }
 expect green "driver: two groups at once each write only their own case log" drv_own_log
+# A group's seconds come from the clock line its process prints; the OK line
+# names the longest. A fixture clock that answers by the group, and by whether
+# a case has run yet, makes the seconds exact (tenths of a second).
+drv_only() { # <fixture> <line>: the driver exits 0 and prints that line alone
+    local out
+    out=$(drv_run "$1" 2>&1) || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out"
+    [ "$out" = "$2" ]
+}
+drv_clocked() { # <name> <begin> <end>: one green group; its clock reads <begin>, then <end>
+    drv_fixture "$1" 'group_one() {' 'expect green "one passes" true' '}' \
+        "selftest_clock() { if [ \$((pass + fail)) -eq 0 ]; then echo $2; else echo $3; fi; }"
+}
+f=$(drv_fixture clocked 'group_one() {' 'expect green "one passes" true' '}' \
+    'group_two() {' 'expect green "two passes" true' '}' \
+    'selftest_clock() { if [ $((pass + fail)) -eq 0 ]; then echo 100;' \
+    'else case $SELFTEST_GROUP in one) echo 105 ;; *) echo 130 ;; esac; fi; }')
+drv_ok='check-scripts self-test OK (2 cases in 2 groups, each exiting non-zero on its planted case:'
+expect green "driver: the OK line, alone, names the longest group with its seconds" drv_only "$f" \
+    "$drv_ok one, two); the longest group: two, 3.0 s"
+f=$(drv_clocked instant 100 100)
+expect_output "driver: a group of no measurable time is still named, at 0.0 s" \
+    "; the longest group: one, 0\.0 s\$" drv_run "$f"
+drv_tenths() { # the lib's clock: tenths of the monotonic seconds read between two of its reads
+    local before seconds after
+    before=$(selftest_clock)
+    seconds=$(python3 -I -S -c 'import time; print(time.monotonic())')
+    after=$(selftest_clock)
+    echo "clock $before, monotonic seconds $seconds, clock $after"
+    awk -v b="$before" -v s="$seconds" -v a="$after" \
+        'BEGIN { t = int(s * 10); exit !(b <= t && t <= a) }'
+}
+expect green "driver: the group clock reads the monotonic clock in tenths of a second" drv_tenths
+drv_clock_red="group one's clock line is not one line of two stamps in order:"
+f=$(drv_fixture noclock 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 0"' \
+    'exit 0' '}')
+expect_red_because "driver: a group that prints no clock line is red, named" "$drv_clock_red none" \
+    drv_run "$f"
+f=$(drv_fixture redonce 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 0"' \
+    'exit 1' '}')
+expect_red_because "driver: a group red by its count is counted once, its clock line unread" \
+    "check-scripts self-test FAILED: 0 of 1 cases failed; 1 of 1 groups red; 0 driver error(s)" \
+    drv_run "$f"
+f=$(drv_fixture twoclocks 'group_one() {' 'expect green "one passes" true' \
+    'echo "group one clock: 100 105"' '}')
+expect_red_because "driver: a group that prints two clock lines is red, named" \
+    "$drv_clock_red group one clock: 100 105" drv_run "$f"
+f=$(drv_clocked octal 08 100)
+expect_red_because "driver: a begin stamp with a leading zero is red, named" \
+    "$drv_clock_red group one clock: 08 100" drv_run "$f"
+f=$(drv_clocked notnumber 100 1e3)
+expect_red_because "driver: an end stamp that is no whole number is red, named" \
+    "$drv_clock_red group one clock: 100 1e3" drv_run "$f"
+f=$(drv_clocked backwards 105 100)
+expect_red_because "driver: a clock that runs backwards is red, named" \
+    "$drv_clock_red group one clock: 105 100" drv_run "$f"
 }
 
 # The gates' crate set (scripts/cell-crates.sh) names exclusions that must
