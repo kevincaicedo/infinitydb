@@ -689,8 +689,9 @@ impl<S: Scope> NodeCommand<S> {
     /// input is the locked `nodes` description, so the lock lives as long
     /// as the child, and the returned [`Node`] kills and reaps it on drop.
     pub fn spawn(self) -> Result<Node, NodeError> {
+        let program = self.program.clone();
         let (counted, mut command) = self.shared()?;
-        let child = command.spawn().map_err(NodeError::Spawn)?;
+        let child = command.spawn().map_err(|error| spawn_failed(&program, STARTED, error))?;
         // This process's copy of the description closes here: the child's
         // fd 0 is its only holder.
         drop(command);
@@ -703,10 +704,12 @@ impl<S: Scope> NodeCommand<S> {
     pub fn output(mut self) -> Result<Output, NodeError> {
         self.stdout.get_or_insert_with(Stdio::piped);
         self.stderr.get_or_insert_with(Stdio::piped);
+        let program = self.program.clone();
         let (counted, mut command) = self.shared()?;
-        let child = command.spawn().map_err(NodeError::Spawn)?;
+        let child = command.spawn().map_err(|error| spawn_failed(&program, STARTED, error))?;
         drop(command);
-        let output = child.wait_with_output().map_err(NodeError::Spawn);
+        let output =
+            child.wait_with_output().map_err(|error| spawn_failed(&program, REAPED, error));
         drop(counted);
         output
     }
@@ -715,9 +718,10 @@ impl<S: Scope> NodeCommand<S> {
     /// standard input is null. The returned [`LeasedNode`] borrows the lease.
     pub fn spawn_under(self, lease: &ExclusiveLease<S>) -> Result<LeasedNode<'_>, NodeError> {
         assert_eq!(lease.flag.0.id, self.lock.state.id, "a lease starts its own lock's commands");
+        let program = self.program.clone();
         let (_, mut command) = self.into_command();
         command.stdin(Stdio::null());
-        let child = command.spawn().map_err(NodeError::Spawn)?;
+        let child = command.spawn().map_err(|error| spawn_failed(&program, STARTED, error))?;
         Ok(LeasedNode { child, lease: PhantomData })
     }
 
@@ -871,7 +875,8 @@ pub enum NodeError {
     LeasedHere,
     /// An ask in a process with this many live shared nodes of its own.
     NodesHere(u32),
-    /// The child could not be started or waited for (`ENOENT`, `EACCES`).
+    /// The child could not be started or waited for (`ENOENT`, `EACCES`):
+    /// the error keeps its kind, and its text names the program.
     Spawn(io::Error),
 }
 
@@ -921,12 +926,23 @@ impl fmt::Display for NodeError {
             NodeError::NodesHere(live) => {
                 write!(f, "this process holds {live} live node(s) under the node lock")
             }
-            NodeError::Spawn(error) => write!(f, "the child did not start: {error}"),
+            NodeError::Spawn(error) => write!(f, "{error}"),
         }
     }
 }
 
 impl std::error::Error for NodeError {}
+
+const STARTED: &str = "did not start";
+const REAPED: &str = "could not be waited for";
+
+/// A spawn's or a wait's failure, its kind kept. Only an error's text names a
+/// binary's path (ADR-0203), so the program rides in the text, never in a
+/// field a test could read back and start.
+fn spawn_failed(program: &Path, what: &str, error: io::Error) -> NodeError {
+    let text = format!("{} {what}: {error}", program.display());
+    NodeError::Spawn(io::Error::new(error.kind(), text))
+}
 
 #[derive(Clone, Copy)]
 enum Mode {

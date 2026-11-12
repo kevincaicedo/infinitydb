@@ -735,7 +735,12 @@ fn missing_binary() {
     assert_eq!(format!("{binary:?}"), "NodeBinary(..)");
     assert_eq!(format!("{command:?}"), "NodeCommand(..)");
     match command.output() {
-        Err(NodeError::Spawn(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        Err(NodeError::Spawn(error)) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            // The error's text names the path, for the red a test prints.
+            let missing = std::env::var_os(MISSING_BINARY).expect("the case sets the variable");
+            assert!(error.to_string().contains(&*missing.to_string_lossy()), "{error}");
+        }
         other => panic!("a missing binary: {other:?}"),
     }
     assert_eq!(lock.live(), Live { process: 0, thread: 0, leased: false });

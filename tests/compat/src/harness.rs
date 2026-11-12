@@ -511,7 +511,7 @@ pub fn spawn_infinityd_at(
         .stdout(Stdio::null())
         .stderr(log)
         .spawn()
-        .unwrap_or_else(|error| panic!("the infinityd INFINITYD_BIN names did not start: {error}"));
+        .unwrap_or_else(|error| panic!("INFINITYD_BIN's node: {error}"));
     ProcessGuard { process: Spawned::Node(node), scratch: Some(dir), log: Some(log_path) }
 }
 
