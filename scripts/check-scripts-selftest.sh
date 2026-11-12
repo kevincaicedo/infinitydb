@@ -12,7 +12,7 @@
 # INF_CHECK_ROOT (the gates) and INF_SIM_BIN / INF_SWEEP_SHARDS (the sweep
 # runner, with a stub simulator). No cargo, except in the lint-scope probe
 # cases, which run `cargo clippy` on the pinned toolchain, and the target-root
-# config cases, which run `cargo metadata` there.
+# config and nextest-config cases, which run `cargo metadata` there.
 #
 # The cases live in group functions, `group_<name>() {`, one a gate's
 # section or a part of one, each building every fixture it reads: the driver
@@ -7009,6 +7009,507 @@ expect_red_because "target-dirs: a missing table is a scope error" "SCOPE ERROR:
 td_tree README.md 'nothing'
 expect_red_because "target-dirs: a tree whose every file is skipped is a scope error" \
     "SCOPE ERROR: git lists no file to read" td "$TD_DIR"
+}
+
+# ---------------------------------------------------------- nextest-config
+group_nextest_config() {
+# ADR-0200 D2, D4, D7: scripts/check-nextest-config.sh on fixture workspaces
+# (each its own `git init`, its files untracked), each built green and given
+# one plant. A plant is red for its own reason; a sanctioned shape is green.
+NC="$SCRIPT_DIR/check-nextest-config.sh"
+NCW="$work/nc"
+mkdir -p "$NCW"
+ncfg() { env INF_CHECK_ROOT="$1" "$NC"; }
+nc_n=0
+# nc_tree: a fresh fixture workspace in NC_DIR, green as built. Package fx has
+# two test targets that both include tests/support/mod.rs; package fxd has a
+# binary and two test targets, one run alone as a whole, its marker below an
+# inner attribute that spans lines.
+nc_tree() {
+    nc_n=$((nc_n + 1))
+    NC_DIR="$NCW/w$nc_n"
+    NC_CFG="$NC_DIR/.config/nextest.toml"
+    mkdir -p "$NC_DIR/.config" "$NC_DIR/.github/workflows" "$NC_DIR/crates/fx/src" \
+        "$NC_DIR/crates/fx/tests/support" "$NC_DIR/bins/fxd/src" "$NC_DIR/bins/fxd/tests"
+    git -C "$NC_DIR" init -q
+    cp rust-toolchain.toml "$NC_DIR/"
+    printf '[workspace]\nmembers = ["crates/fx", "bins/fxd"]\nresolver = "2"\n' >"$NC_DIR/Cargo.toml"
+    printf '[package]\nname = "fx"\nversion = "0.0.0"\nedition = "2021"\n' >"$NC_DIR/crates/fx/Cargo.toml"
+    printf '[package]\nname = "fxd"\nversion = "0.0.0"\nedition = "2021"\n' >"$NC_DIR/bins/fxd/Cargo.toml"
+    : >"$NC_DIR/crates/fx/src/lib.rs"
+    printf 'fn main() {}\n' >"$NC_DIR/bins/fxd/src/main.rs"
+    cat >"$NC_DIR/crates/fx/tests/a.rs" <<'EOF'
+mod support;
+
+const TEXT: &str = "static FAKE: Mutex<()> in a string is no lock";
+
+// nextest-group: serial
+#[allow(dead_code)]
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn a_one() {
+    let _ = (TEXT, &SERIAL, &support::SPAWN);
+}
+
+// nextest-alone: 1.5 s. A fixture test whose verdict reads what the lane
+// shares.
+#[test]
+fn a_alone() {}
+EOF
+    cat >"$NC_DIR/crates/fx/tests/b.rs" <<'EOF'
+mod support;
+
+#[test]
+fn b_one() {
+    let _ = &support::SPAWN;
+}
+EOF
+    cat >"$NC_DIR/crates/fx/tests/support/mod.rs" <<'EOF'
+// nextest-in-process: a race between the threads of one test process
+pub static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+EOF
+    cat >"$NC_DIR/bins/fxd/tests/boot.rs" <<'EOF'
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a fixture: an inner attribute spanning lines"
+)]
+//! Creates a namespace with MEM-BUDGET 8mb and writes nothing to it.
+
+// nextest-alone: 3.5 s. The whole target reads a per-user budget.
+// nextest-stall-default: no write reaches a window, so no write parks.
+
+const CREATE: [&[u8]; 2] = [b"MEM-BUDGET", b"8mb"];
+
+#[test]
+fn boots() {
+    let _ = CREATE;
+}
+EOF
+    cat >"$NC_DIR/bins/fxd/tests/tiered.rs" <<'EOF'
+//! Writes a namespace with MEM-BUDGET 8mb and TAIL-STALL-TIMEOUT 60000.
+
+const CREATE: [&[u8]; 4] = [b"MEM-BUDGET", b"8mb", b"TAIL-STALL-TIMEOUT", b"60000"];
+
+#[test]
+fn tiered() {
+    let _ = CREATE;
+}
+EOF
+    cat >"$NC_CFG" <<'EOF'
+nextest-version = { required = "0.9.150" }
+
+[test-groups]
+serial = { max-threads = 1 }
+
+[profile.default]
+leak-timeout = { period = "100ms", result = "fail" }
+
+[[profile.default.overrides]]
+filter = 'binary_id(fxd::boot)'
+threads-required = "num-test-threads"
+priority = 100
+
+[[profile.default.overrides]]
+filter = 'binary_id(fx::a) & test(=a_alone)'
+threads-required = "num-test-threads"
+priority = 100
+
+[[profile.default.overrides]]
+filter = 'binary_id(fx::a)'
+test-group = "serial"
+priority = 50
+EOF
+    cat >"$NC_DIR/.github/workflows/ci.yml" <<'EOF'
+jobs:
+  test:
+    steps:
+      - run: cargo install --locked cargo-nextest --version 0.9.150
+      - run: cargo nextest run --workspace
+EOF
+}
+# nc_sub <file> <old> <new>: every <old> in the file replaced; one must be there.
+nc_sub() {
+    python3 -I -c '
+import pathlib, sys
+path, old, new = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+text = path.read_text()
+if old not in text:
+    sys.exit(f"nc_sub: {old!r} is not in {path}")
+path.write_text(text.replace(old, new))' "$@"
+}
+NC_GROUP=$'[[profile.default.overrides]]\nfilter = \'binary_id(fx::a)\'\n'
+
+nc_tree
+expect green "nextest-config: the fixture workspace is green" ncfg "$NC_DIR"
+expect_output "nextest-config: the OK line counts each rule's population" \
+    "nextest-config OK: nextest-version 0.9.150; 1 groups of one thread (serial), 1 group overrides at priority 50; 2 run alone at priority 100, first (fx::a/a_alone, fxd::boot); 2 static locks, 1 grouped and 1 in-process; 2 test files name MEM-BUDGET, 1 state TAIL-STALL-TIMEOUT and 1 carry nextest-stall-default; no free-space read in 5 integration-test files and 1 library files they link; 1 cargo-nextest installs in CI at 0.9.150, each --locked, one in each of the 1 jobs that run it; [0-9]* .rs files of 6 test binaries read" \
+    ncfg "$NC_DIR"
+# The config holds its listed keys only, in their listed shapes.
+nc_tree
+nc_sub "$NC_CFG" 'nextest-version =' $'experimental = ["setup-scripts"]\nnextest-version ='
+expect_red_because "nextest-config: a top-level key outside the list is red" \
+    "top-level key .experimental. is outside the list" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'leak-timeout =' $'retries = 2\nleak-timeout ='
+expect_red_because "nextest-config: a retry setting in the profile is red" \
+    "profile key .retries. is outside the list" ncfg "$NC_DIR"
+nc_tree
+printf '\n[profile.ci]\nfail-fast = false\n' >>"$NC_CFG"
+expect_red_because "nextest-config: a second profile is red" \
+    "holds a profile other than .default." ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'serial = { max-threads = 1 }' 'serial = { max-threads = 2 }'
+expect_red_because "nextest-config: a group of two threads is red" \
+    "test group .serial. is not" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'result = "fail"' 'result = "pass"'
+expect_red_because "nextest-config: a leak that passes is red" "leak-timeout. is not" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" '{ required = "0.9.150" }' '"0.9.150"'
+expect_red_because "nextest-config: a version floor that is a bare string is red" \
+    "nextest-version. is not" ncfg "$NC_DIR"
+# The overrides: their two shapes, their priorities, their order.
+nc_tree
+nc_sub "$NC_CFG" 'priority = 100' 'priority = 50'
+expect_red_because "nextest-config: a run-alone override without priority 100 is red (canary)" \
+    "a run-alone override sets priority 100, not 50" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 50' 'priority = 100'
+expect_red_because "nextest-config: a group's override without priority 50 is red (canary)" \
+    "a group's override sets priority 50, not 100" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" $'\n'"$NC_GROUP"$'test-group = "serial"\npriority = 50\n' ''
+nc_sub "$NC_CFG" $'\n[[profile.default.overrides]]\nfilter = \'binary_id(fxd::boot)\'' \
+    $'\n'"$NC_GROUP"$'test-group = "serial"\npriority = 50\n\n[[profile.default.overrides]]\nfilter = \'binary_id(fxd::boot)\''
+expect_red_because "nextest-config: a run-alone override after a group's is red (canary)" \
+    "run-alone override 3 comes after group override 1" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 50' $'priority = 50\nslow-timeout = "60s"'
+expect_red_because "nextest-config: an override with a timeout is red" "holds keys" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'test-group = "serial"' 'test-group = ["serial"]'
+expect_red_because "nextest-config: a list-valued test group is red, not a traceback" \
+    "override 3: test-group has the wrong type" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 50' 'priority = 50.0'
+expect_red_because "nextest-config: a priority that is no integer is red" \
+    "override 3: priority has the wrong type" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'threads-required = "num-test-threads"' 'threads-required = "num-cpus"'
+expect_red_because "nextest-config: a run-alone override short of every slot is red" \
+    'threads-required. is not "num-test-threads"' ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "filter = 'binary_id(fxd::boot)'" "filter = 'test(boots)'"
+expect_red_because "nextest-config: a filter in none of the forms is red" "is in none of the forms" \
+    ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'binary_id(fxd::boot)' 'binary_id(fxd::gone)'
+expect_red_because "nextest-config: a filter naming no test binary is red" \
+    "filter names test binary .fxd::gone., which cargo metadata lacks" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "filter = 'binary_id(fx::a)'" "filter = 'package(nope)'"
+expect_red_because "nextest-config: a filter naming no package is red" \
+    "filter names package .nope., which cargo metadata lacks" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "filter = 'binary_id(fx::a)'" "filter = 'package(fx)'"
+expect_red_because "nextest-config: a group override selecting a binary that holds no such lock is red" \
+    "override 3 puts .fx::b. in group .serial., and no lock that binary holds" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" $'// nextest-group: serial\n#[allow(dead_code)]\nstatic SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' ''
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" '(TEXT, &SERIAL, &support::SPAWN)' '(TEXT, &support::SPAWN)'
+expect_red_because "nextest-config: a group override left behind by its lock is red" \
+    "override 3 puts .fx::a. in group .serial., and no lock that binary holds" ncfg "$NC_DIR"
+# The static locks: each marked, each group's marker paired with an override
+# that selects every binary compiling the file.
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" '// nextest-group: serial' '// the fixture lock'
+expect_red_because "nextest-config: an unmarked static lock is red" "a.rs:7: a static lock with no" ncfg "$NC_DIR"
+nc_tree
+printf 'static WAKE: std::sync::Condvar = std::sync::Condvar::new();\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: an unmarked static Condvar is red" "b.rs:7: a static lock with no" \
+    ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/support/mod.rs" \
+    '// nextest-in-process: a race between the threads of one test process' '// nextest-group: serial'
+expect_red_because "nextest-config: a grouped lock in an included file binds each binary that compiles it" \
+    "test binary .fx::b. compiles this lock, and no override puts it in group .serial." ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" 'nextest-group: serial' 'nextest-group: nogroup'
+expect_red_because "nextest-config: a lock's marker naming no group is red" \
+    "names test group .nogroup., which .test-groups. lacks" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'serial = { max-threads = 1 }' $'serial = { max-threads = 1 }\nspare = { max-threads = 1 }'
+expect_red_because "nextest-config: a group no marker names is red" \
+    "test group .spare. is named by no lock's" ncfg "$NC_DIR"
+nc_tree
+printf '// nextest-group: serial\nconst NOT_A_LOCK: u8 = 0;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a group marker on no static lock is red" \
+    "b.rs:7: a .nextest-group:. marker on no static lock" ncfg "$NC_DIR"
+# The run-alone markers and their overrides.
+nc_tree
+nc_sub "$NC_CFG" 'binary_id(fx::a) & test(=a_alone)' 'binary_id(fx::b) & test(=b_one)'
+expect_red_because "nextest-config: a marked test no run-alone override selects is red" \
+    "test .a_alone. is marked to run alone, and no run-alone override selects it" ncfg "$NC_DIR"
+expect_red_because "nextest-config: a run-alone override no marker names is red" \
+    "runs .fx::b. test .b_one. alone, and no .nextest-alone:. marker names it" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" '1.5 s. ' ''
+expect_red_because "nextest-config: a run-alone reason without its time is red" \
+    "gives no time in seconds" ncfg "$NC_DIR"
+nc_tree
+printf '// nextest-alone: 2 s. above no test\nconst NOTHING: u8 = 0;\n' >>"$NC_DIR/crates/fx/tests/a.rs"
+expect_red_because "nextest-config: a run-alone marker above no test, below the leading block, is red" \
+    "a.rs:18: a .nextest-alone:. marker neither above a .#.test.. nor" ncfg "$NC_DIR"
+nc_tree
+printf 'mod inner {\n    // nextest-alone: 0.5 s. a test in an inline module\n    #[test]\n    fn deep() {}\n}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+nc_sub "$NC_CFG" $'\n'"$NC_GROUP" $'\n[[profile.default.overrides]]\nfilter = \'binary_id(fx::b) & test(=inner::deep)\'\nthreads-required = "num-test-threads"\npriority = 100\n\n'"$NC_GROUP"
+expect green "nextest-config: a run-alone test in an inline module is named by its module path" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'#![allow(\n    clippy::disallowed_methods,\n' $'#![allow(\n    clippy::disallowed_methods,\n    clippy::disallowed_types,\n'
+expect green "nextest-config: a leading marker below an inner attribute of four lines binds" ncfg "$NC_DIR"
+# A library's statics reach every test binary that links it: its package's,
+# and those of each workspace package that depends on it.
+nc_lib_lock() { # fx's library holds a grouped lock; the group override names <filter>
+    nc_tree
+    printf '// nextest-group: serial\npub static SHARED: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' \
+        >"$NC_DIR/crates/fx/src/lib.rs"
+    printf "\n[[profile.default.overrides]]\nfilter = '%s'\ntest-group = \"serial\"\npriority = 50\n" "$1" \
+        >>"$NC_CFG"
+}
+nc_lib_lock 'binary_id(fx)'
+expect_red_because "nextest-config: a library's lock grouped for the library's own binary only is red" \
+    "lib.rs:2: test binary .fx::b. compiles this lock, and no override puts it in group .serial." \
+    ncfg "$NC_DIR"
+nc_lib_lock 'package(fx)'
+expect green "nextest-config: a library's lock grouped for its whole package is green" ncfg "$NC_DIR"
+printf '\n[dev-dependencies]\nfx = { path = "../../crates/fx" }\n' >>"$NC_DIR/bins/fxd/Cargo.toml"
+expect_red_because "nextest-config: a library's lock reaches a package that depends on it" \
+    "lib.rs:2: test binary .fxd::tiered. compiles this lock" ncfg "$NC_DIR"
+printf "\n[[profile.default.overrides]]\nfilter = 'package(fxd)'\ntest-group = \"serial\"\npriority = 50\n" \
+    >>"$NC_CFG"
+expect green "nextest-config: grouped in the dependent package too, it is green" ncfg "$NC_DIR"
+nc_lib_lock 'package(fx)'
+mkdir -p "$NC_DIR/crates/mid/src"
+printf '[package]\nname = "mid"\nversion = "0.0.0"\nedition = "2021"\n\n[lib]\ntest = false\n\n[dependencies]\nfx = { path = "../fx" }\n' \
+    >"$NC_DIR/crates/mid/Cargo.toml"
+: >"$NC_DIR/crates/mid/src/lib.rs"
+printf '[workspace]\nmembers = ["crates/fx", "crates/mid", "bins/fxd"]\nresolver = "2"\n' >"$NC_DIR/Cargo.toml"
+printf '\n[dev-dependencies]\nmid = { path = "../../crates/mid" }\n' >>"$NC_DIR/bins/fxd/Cargo.toml"
+expect_red_because "nextest-config: a library's lock reaches through a normal dependency's dependents" \
+    "lib.rs:2: test binary .fxd::tiered. compiles this lock" ncfg "$NC_DIR"
+nc_tree
+printf '/// Free space, which `statvfs` would read, is no oracle here.\npub fn held() -> u64 { 0 }\n' \
+    >"$NC_DIR/crates/fx/src/lib.rs"
+expect green "nextest-config: a library's comment may name a free-space call" ncfg "$NC_DIR"
+printf 'pub fn free() -> &'"'"'static str { "statvfs" }\n' >>"$NC_DIR/crates/fx/src/lib.rs"
+expect_red_because "nextest-config: a free-space read in a library integration tests link is red" \
+    "lib.rs:3: reads .statvfs. in a library integration tests link" ncfg "$NC_DIR"
+# Modules resolve as rustc resolves them: a `#[path]` file's own `mod` sits
+# beside it, and a declaration that resolves to no file is a scope error.
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/inc"
+printf '#[path = "inc/part.rs"]\nmod part;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+printf 'pub mod nested;\n' >"$NC_DIR/crates/fx/tests/inc/part.rs"
+printf 'pub fn free() -> &'"'"'static str { "statvfs" }\n' >"$NC_DIR/crates/fx/tests/inc/nested.rs"
+expect_red_because "nextest-config: a #[path] file's own module is read where rustc reads it" \
+    "inc/nested.rs:1: names .statvfs. in an integration-test target" ncfg "$NC_DIR"
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/inc"
+printf '#[path = "inc/part.rs"]\nmod part;\n' >>"$NC_DIR/crates/fx/tests/a.rs"
+printf 'pub mod nested;\n' >"$NC_DIR/crates/fx/tests/inc/part.rs"
+printf '// nextest-group: serial\npub static DEEP: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' \
+    >"$NC_DIR/crates/fx/tests/inc/nested.rs"
+expect green "nextest-config: a grouped lock in a #[path] file's own module binds its binary" ncfg "$NC_DIR"
+nc_tree
+printf 'mod missing;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a module that resolves to no file is a scope error" \
+    "SCOPE ERROR: a module this gate cannot find would go unread: crates/fx/tests/b.rs:7: .mod missing;." \
+    ncfg "$NC_DIR"
+# One marker spelling: a comment that starts like a marker in another is red on
+# its line; a marker named in prose is no marker.
+nc_spelled() { # <label> <comment line>: the line above a new test in b.rs is red
+    nc_tree
+    printf '\n%s\n#[test]\nfn b_marked() {}\n' "$2" >>"$NC_DIR/crates/fx/tests/b.rs"
+    expect_red_because "nextest-config: a marker $1 is red" \
+        "b.rs:8: a comment spelled like a marker" ncfg "$NC_DIR"
+}
+nc_spelled "without its colon" '// nextest-alone - 2 s. The verdict reads a live rate.'
+nc_spelled "in capitals" '// Nextest-Alone: 2 s. The verdict reads a live rate.'
+nc_spelled "with a space before its colon" '// nextest-alone : 2 s. The verdict reads a live rate.'
+nc_spelled "in a block comment" '/* nextest-alone: 2 s. The verdict reads a live rate. */'
+nc_spelled "in a doc comment" '/// nextest-alone: 2 s. The verdict reads a live rate.'
+nc_tree
+printf '\n#[test] // nextest-alone: 2 s. The verdict reads a live rate.\nfn b_marked() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a marker beside code is red" \
+    "b.rs:8: a comment spelled like a marker" ncfg "$NC_DIR"
+nc_tree
+printf '\n/*\n// nextest-alone: 2 s. The verdict reads a live rate.\n*/\n#[test]\nfn b_marked() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a marker's line inside a block comment is red" \
+    "b.rs:9: a comment spelled like a marker" ncfg "$NC_DIR"
+nc_tree
+printf '\n// The whole target would need a `nextest-alone: <reason>` marker to run alone.\nfn helper() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect green "nextest-config: a marker named in prose is no marker" ncfg "$NC_DIR"
+# D4: CI installs the floor, --locked.
+nc_tree
+nc_sub "$NC_DIR/.github/workflows/ci.yml" '--locked ' ''
+expect_red_because "nextest-config: an install without --locked is red" \
+    "a cargo-nextest install names .--locked." ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/.github/workflows/ci.yml" '--version 0.9.150' '--version 0.9.149'
+expect_red_because "nextest-config: an install of another version is red" \
+    "ci.yml:4: a cargo-nextest install names .--locked. and .--version 0.9.150." ncfg "$NC_DIR"
+nc_tree
+printf '  other:\n    steps:\n      - run: cargo nextest run -p fx\n' >>"$NC_DIR/.github/workflows/ci.yml"
+expect_red_because "nextest-config: a job that runs nextest with no install is red" \
+    "ci.yml:8: job .other. runs cargo nextest and installs no cargo-nextest" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/.github/workflows/ci.yml" '      - run: cargo install' '      # - run: cargo install'
+printf '  other:\n    steps:\n      - run: cargo install --locked cargo-nextest --version 0.9.150\n' \
+    >>"$NC_DIR/.github/workflows/ci.yml"
+expect_red_because "nextest-config: a commented-out install installs nothing" \
+    "ci.yml:5: job .test. runs cargo nextest and installs no cargo-nextest" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/.github/workflows/ci.yml" $'      - run: cargo install --locked cargo-nextest --version 0.9.150\n' ''
+expect_red_because "nextest-config: no install in any workflow is a scope error" \
+    "SCOPE ERROR: no cargo-nextest install in any workflow" ncfg "$NC_DIR"
+# D7: no free-space read; each MEM-BUDGET file states its stall bound or why
+# no write parks.
+nc_tree
+printf 'fn free() -> &'"'"'static str { "statvfs" }\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a free-space read in an integration test is red" \
+    "b.rs:7: names .statvfs. in an integration-test target" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'// nextest-stall-default: no write reaches a window, so no write parks.\n' ''
+expect_red_because "nextest-config: a MEM-BUDGET file with neither the key nor the marker is red" \
+    "boot.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/b.rs" 'mod support;' $'// nextest-stall-default: a file naming no budget\n\nmod support;'
+expect_red_because "nextest-config: a stall marker in a file naming no budget is red" \
+    "b.rs:1: a .nextest-stall-default:. marker binds nothing" ncfg "$NC_DIR"
+# The stall rule reads code: a key in a comment, or a stall key named inside
+# prose, neither makes a budget file nor states its bound.
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'// nextest-stall-default: no write reaches a window, so no write parks.\n' \
+    $'// Runs at the product\'s TAIL-STALL-TIMEOUT default.\n'
+expect_red_because "nextest-config: a stall key named in a comment states no bound" \
+    "boot.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'// nextest-stall-default: no write reaches a window, so no write parks.\n' \
+    $'// Pass b"TAIL-STALL-TIMEOUT" to state the bound.\n'
+expect_red_because "nextest-config: the stall key's literal inside a comment states no bound" \
+    "boot.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" 'b"TAIL-STALL-TIMEOUT", b"60000"' 'b"8mb at the TAIL-STALL-TIMEOUT default", b""'
+expect_red_because "nextest-config: a stall key inside prose states no bound" \
+    "tiered.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" 'b"MEM-BUDGET", b"8mb", ' ''
+expect green "nextest-config: a file naming MEM-BUDGET only in a comment is no budget file" ncfg "$NC_DIR"
+nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" '//! Writes' $'// nextest-stall-default: no write parks.\n//! Writes'
+expect_red_because "nextest-config: so a stall marker there binds nothing" \
+    "tiered.rs:1: a .nextest-stall-default:. marker binds nothing" ncfg "$NC_DIR"
+# Each remaining rule, planted once.
+nc_tree
+nc_sub "$NC_CFG" 'test-group = "serial"' 'test-group = "nogroup"'
+expect_red_because "nextest-config: a group override naming no group is red" \
+    "override 3 names test group .nogroup., which .test-groups. lacks" ncfg "$NC_DIR"
+nc_tree
+printf 'static TABLE: std::sync::RwLock<()> = std::sync::RwLock::new(());\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: an unmarked static RwLock is red" "b.rs:7: a static lock with no" \
+    ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "filter = 'binary_id(fx::a)'" "filter = 'binary_id(fx::a) & test(=a_one)'"
+expect_red_because "nextest-config: a one-test group override does not group a lock's binary" \
+    "a.rs:7: test binary .fx::a. compiles this lock, and no override puts it in group" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" '// nextest-group: serial' '// nextest-group: the serial one'
+expect_red_because "nextest-config: a group marker naming no group word is red" \
+    "a.rs:5: .nextest-group:. names no group" ncfg "$NC_DIR"
+nc_tree
+printf '// nextest-in-process:\npub static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' \
+    >"$NC_DIR/crates/fx/tests/support/mod.rs"
+expect_red_because "nextest-config: an in-process marker without its reason is red" \
+    "mod.rs:1: .nextest-in-process:. gives no reason" ncfg "$NC_DIR"
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/orphan"
+printf '// nextest-group: serial\npub static LOST: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' \
+    >"$NC_DIR/crates/fx/tests/orphan/lost.rs"
+expect_red_because "nextest-config: a grouped lock in a file no binary compiles is red" \
+    "lost.rs:2: a grouped lock in a file no test binary compiles" ncfg "$NC_DIR"
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/orphan"
+printf '// nextest-alone: 2 s. A test no binary compiles.\n#[test]\nfn lost() {}\n' \
+    >"$NC_DIR/crates/fx/tests/orphan/lost.rs"
+expect_red_because "nextest-config: a run-alone marker in a file no binary compiles is red" \
+    "lost.rs:1: a .nextest-alone:. marker in a file no test binary compiles" ncfg "$NC_DIR"
+for nc_word in statfs f_bavail f_bfree; do
+    nc_tree
+    printf 'fn free() -> &'"'"'static str { "%s" }\n' "$nc_word" >>"$NC_DIR/crates/fx/tests/b.rs"
+    expect_red_because "nextest-config: $nc_word in an integration test is red" \
+        "b.rs:7: names .$nc_word. in an integration-test target" ncfg "$NC_DIR"
+done
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'// nextest-stall-default: no write reaches a window, so no write parks.\n' ''
+printf '\n// nextest-stall-default: no write reaches a window, so no write parks.\nfn helper() {}\n' \
+    >>"$NC_DIR/bins/fxd/tests/boot.rs"
+expect_red_because "nextest-config: a stall marker below the file's first item binds nothing" \
+    "boot.rs:16: a .nextest-stall-default:. marker binds nothing" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" 'nextest-stall-default: no write reaches a window, so no write parks.' \
+    'nextest-stall-default:'
+expect_red_because "nextest-config: a stall marker without its reason binds nothing" \
+    "boot.rs:8: a .nextest-stall-default:. marker binds nothing" ncfg "$NC_DIR"
+nc_tree
+printf '\n// nextest-alone: 2 s. A test in an included module.\n#[test]\nfn deep() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/support/mod.rs"
+expect_red_because "nextest-config: a run-alone test in an included file binds each binary under its path" \
+    "test .support::deep. is marked to run alone" ncfg "$NC_DIR"
+nc_sub "$NC_CFG" $'\n'"$NC_GROUP" $'\n[[profile.default.overrides]]\nfilter = \'binary_id(fx::a) & test(=support::deep)\'\nthreads-required = "num-test-threads"\npriority = 100\n\n[[profile.default.overrides]]\nfilter = \'binary_id(fx::b) & test(=support::deep)\'\nthreads-required = "num-test-threads"\npriority = 100\n\n'"$NC_GROUP"
+expect green "nextest-config: its overrides name it by its module path in each binary" ncfg "$NC_DIR"
+nc_tree
+printf 'const CREATE: [&[u8]; 2] = [b"MEM-BUDGET", b"8mb"];\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: the stall rule reads crates/*/tests" \
+    "b.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+mkdir -p "$NC_DIR/tests"
+printf 'const CREATE: [&[u8]; 2] = [b"MEM-BUDGET", b"8mb"];\n' >"$NC_DIR/tests/loose.rs"
+expect_red_because "nextest-config: the stall rule reads tests/" \
+    "tests/loose.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+printf '\nconst DOC: &str = "\nstatic FAKE: std::sync::Mutex<()> = std::sync::Mutex::new(());\n";\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect green "nextest-config: a string's line that reads as a lock is no lock" ncfg "$NC_DIR"
+# Scope: what the gate reads must exist.
+nc_tree
+rm -f "$NC_CFG"
+expect_red_because "nextest-config: no config is a scope error" \
+    "SCOPE ERROR: .config/nextest.toml is missing" ncfg "$NC_DIR"
+nc_tree
+rm -f "$NC_DIR/.github/workflows/ci.yml"
+expect_red_because "nextest-config: no workflow is a scope error" \
+    "SCOPE ERROR: no workflow under .github/workflows" ncfg "$NC_DIR"
+nc_tree
+rm -f "$NC_DIR/Cargo.toml"
+expect_red_because "nextest-config: no workspace is a scope error" \
+    "SCOPE ERROR: cargo metadata exited" ncfg "$NC_DIR"
+nc_tree
+printf 'autotests = false\nautobins = false\n\n[lib]\ntest = false\n' >>"$NC_DIR/crates/fx/Cargo.toml"
+printf '[workspace]\nmembers = ["crates/fx"]\nresolver = "2"\n' >"$NC_DIR/Cargo.toml"
+expect_red_because "nextest-config: a workspace with no test binary is a scope error" \
+    "SCOPE ERROR: cargo metadata lists no test binary" ncfg "$NC_DIR"
+nc_tree
+printf '*.rs\n' >"$NC_DIR/.gitignore"
+expect_red_because "nextest-config: no .rs file git lists is a scope error" \
+    "SCOPE ERROR: git lists no .rs file" ncfg "$NC_DIR"
+nc_tree
+printf '\n[[test]]\nname = "ghost"\npath = "tests/ghost.rs"\n' >>"$NC_DIR/crates/fx/Cargo.toml"
+expect_red_because "nextest-config: a crate root that is no file is a scope error" \
+    "SCOPE ERROR: a module this gate cannot find would go unread: crates/fx/tests/ghost.rs" ncfg "$NC_DIR"
 }
 
 selftest_main "$SCRIPT_DIR/check-scripts-selftest.sh" "$@"

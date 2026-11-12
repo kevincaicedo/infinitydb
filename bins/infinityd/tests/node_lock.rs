@@ -72,12 +72,14 @@ fn raw_try(dir: &Path, name: &str, exclusive: bool) -> bool {
     }
 }
 
-/// Whether an exclusive raw try succeeds within 1 s. Under `cargo test`
-/// the tests are threads of one process, and a sibling's spawn copies this
-/// test's descriptions into its child until that child's `exec`: a copy
-/// holds the lock for that instant. A lock held past 1 s is held.
+/// Whether an exclusive raw try succeeds within 10 s, a hang bound
+/// (ADR-0200 D7). Under `cargo test` the tests are threads of one process,
+/// and a sibling's spawn copies this test's descriptions into its child
+/// until that child's `exec` closes them: a copy holds the lock for that
+/// instant, however far load stretches it. A defect this reads holds the
+/// lock until after the assert, or for a 60 s stand-in's life.
 fn free(dir: &Path, name: &str) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if raw_try(dir, name, true) {
             return true;
@@ -201,25 +203,28 @@ fn field(report: &str, key: &str) -> String {
         .to_owned()
 }
 
-/// The lock rides the child: with every test-side handle but the
-/// `Node` gone, `nodes` is held until the stand-in exits; a raw command's
-/// child holds nothing (control).
+/// The lock rides the child (ADR-0203 D1): with every test-side handle but
+/// the `Node` gone, `nodes` is held until the stand-in exits; a raw
+/// command's child holds nothing (control). Each child lives 60 s and is
+/// killed once read, so the reads find it alive however slowly this thread
+/// runs: its life is a hang bound (ADR-0200 D7), not a time budget.
 #[test]
 fn the_lock_rides_the_child() {
     let dir = scratch("rides");
     let lock = NodeLock::at(&dir, WAITS);
-    let mut raw = ChildRun(Command::new("sleep").arg("5").spawn().expect("raw sleep"));
+    let mut raw = ChildRun(Command::new("sleep").arg("60").spawn().expect("raw sleep"));
     assert!(free(&dir, "nodes"), "a raw command's child holds no lock");
     let _ = raw.0.kill();
     let _ = raw.0.wait();
     drop(raw);
 
-    let mut node = lock.stand_in().arg("0.5").spawn().expect("a stand-in");
+    let mut node = lock.stand_in().arg("60").spawn().expect("a stand-in");
     assert!(!raw_try(&dir, "nodes", true), "a live stand-in holds `nodes`");
     assert!(raw_try(&dir, "nodes", false), "shared beside shared");
     assert!(free(&dir, "turnstile"), "a start releases the turnstile");
     assert_eq!(lock.live(), Live { process: 1, thread: 1, leased: false });
-    node.wait().expect("the stand-in exits");
+    node.kill().expect("end the stand-in");
+    node.wait().expect("reap the stand-in");
     assert!(free(&dir, "nodes"), "an exited stand-in holds nothing");
     drop(node);
     assert_clean(&lock);
@@ -345,8 +350,12 @@ fn the_writer_settles_before_its_lease_returns() {
     assert_clean(&lock);
 }
 
-/// In-process refusals: a leased process refuses a shared start, and
-/// a process with a live node refuses an ask, each at once and typed.
+/// In-process refusals (ADR-0203 D2): a leased process refuses a shared
+/// start, and a process with a live node refuses an ask, each at once and
+/// typed. "At once" is read against a hang bound (ADR-0200 D7): a refusal
+/// made only after its lock wait reads that wait's 10 s deadline, twice the
+/// bound, since the lease holds the lock through the start and a 60 s
+/// stand-in holds `nodes` through the ask.
 #[test]
 fn a_process_never_holds_the_lease_beside_its_own_node() {
     let dir = scratch("in-process");
@@ -356,32 +365,39 @@ fn a_process_never_holds_the_lease_beside_its_own_node() {
     let began = Instant::now();
     let refused = lock.stand_in().arg("5").spawn();
     assert!(matches!(refused, Err(NodeError::LeasedHere)), "{:?}", refused.err());
-    assert!(began.elapsed() < Duration::from_millis(100));
+    let waited = began.elapsed();
+    assert!(waited < Duration::from_secs(5), "the leased refusal waited {waited:?}");
     assert_eq!(lock.live(), Live { process: 0, thread: 0, leased: true });
     let again = lock.exclusive();
     assert!(matches!(again, Err(NodeError::LeasedHere)), "{:?}", again.err());
     drop(lease);
     assert_clean(&lock);
 
-    let mut node = lock.stand_in().arg("0.3").spawn().expect("a stand-in");
+    let mut node = lock.stand_in().arg("60").spawn().expect("a stand-in");
     let began = Instant::now();
     let refused = lock.exclusive();
     assert!(matches!(refused, Err(NodeError::NodesHere(1))), "{:?}", refused.err());
-    assert!(began.elapsed() < Duration::from_millis(100));
+    let waited = began.elapsed();
+    assert!(waited < Duration::from_secs(5), "the refused ask waited {waited:?}");
     assert!(!lock.live().leased, "the refused ask cleared its flag");
-    node.wait().expect("the stand-in exits");
+    node.kill().expect("end the stand-in");
+    node.wait().expect("reap the stand-in");
     drop(node);
     assert_clean(&lock);
 }
 
-/// The writer's deadline: a stand-in outlives the writer's wait; its
-/// ask times out with the turnstile released and its flag cleared (the
-/// child asserts both), and a first start then passes at once.
+/// The writer's deadline (ADR-0203 D2): a 60 s stand-in outlives the
+/// writer child's 500 ms wait, so its ask times out. The oracle is the
+/// child's own asserts, made before it exits (its exit frees whatever it
+/// held): the ask cleared its flag and released the turnstile. A first start
+/// then passes beside the live stand-in: a control, read against a hang
+/// bound (ADR-0200 D7) that a start waiting behind a shared holder would
+/// cross at its 10 s deadline.
 #[test]
 fn the_writers_deadline_frees_what_it_took() {
     let dir = scratch("deadline");
     let lock = Arc::new(NodeLock::at(&dir, WAITS));
-    let mut stand_in = lock.stand_in().arg("5").spawn().expect("a stand-in");
+    let mut stand_in = lock.stand_in().arg("60").spawn().expect("a stand-in");
     let report = ChildRun::writer(&dir, Duration::from_millis(500), Duration::ZERO).finish();
     assert_eq!(field(&report, "outcome"), "timed-out", "{report}");
     let other = Arc::clone(&lock);
@@ -394,14 +410,15 @@ fn the_writers_deadline_frees_what_it_took() {
     })
     .join()
     .expect("the starting thread");
-    assert!(waited < Duration::from_millis(100), "a first start waited {waited:?}");
+    assert!(waited < Duration::from_secs(5), "the control's first start waited {waited:?}");
     stand_in.kill().expect("kill the stand-in");
     drop(stand_in);
     assert_clean(&*lock);
 }
 
 /// A node ends with its guard: a closure that starts a 60 s stand-in and
-/// panics returns within 1 s, through `spawn`, through `spawn_under`, and
+/// panics returns within a 30 s hang bound (a guard that does not kill
+/// waits out the stand-in's 60 s), through `spawn`, through `spawn_under`, and
 /// through a `.ulimit` command, whose shell must exec the stand-in in its
 /// own pid (Linux reads it), so the kill reaches it.
 #[test]
@@ -432,7 +449,7 @@ fn a_node_ends_when_its_guard_unwinds() {
         let unwound = panicked.expect("the closure started its stand-in").elapsed();
         let case = format!("leased {leased}, limited {limited}");
         assert!(execed, "{case}: the shell did not exec the stand-in in its own pid");
-        assert!(unwound < Duration::from_secs(1), "{case}: unwinding took {unwound:?}");
+        assert!(unwound < Duration::from_secs(30), "{case}: unwinding took {unwound:?}");
         assert_clean(&lock);
     }
 }
@@ -455,8 +472,10 @@ fn runs_as(pid: u32, name: &str) -> bool {
     }
 }
 
-/// A foreign exclusive holder: a start times out at its deadline,
-/// within a watchdog, with nothing kept, and is clean once it is released.
+/// A foreign exclusive holder: a start times out at its 500 ms deadline,
+/// not before it and within a 5 s hang bound (a start that ignored its own
+/// wait would take the default 10 s, where the watchdog also stands), with
+/// nothing kept, and is clean once it is released.
 #[test]
 fn a_foreign_exclusive_holder_times_a_start_out() {
     let dir = scratch("foreign");
@@ -478,13 +497,13 @@ fn a_foreign_exclusive_holder_times_a_start_out() {
         let _ = sender.send((outcome, began.elapsed()));
     });
     let (outcome, waited) =
-        receiver.recv_timeout(Duration::from_secs(3)).expect("watchdog: the start never returned");
+        receiver.recv_timeout(Duration::from_secs(10)).expect("watchdog: the start never returned");
     match outcome {
         Err(NodeError::TimedOut(timeout)) => assert_eq!(timeout.lock, dir.join("nodes")),
         other => panic!("a start beside a foreign holder: {:?}", other.err()),
     }
     assert!(waited >= Duration::from_millis(500), "timed out early: {waited:?}");
-    assert!(waited < Duration::from_secs(1), "timed out late: {waited:?}");
+    assert!(waited < Duration::from_secs(5), "timed out late: {waited:?}");
     assert!(free(&dir, "turnstile"), "the timed-out start released the turnstile");
     drop(foreign);
     assert_clean(&*lock);

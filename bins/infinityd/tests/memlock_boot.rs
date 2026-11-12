@@ -29,6 +29,14 @@
 //! memory and standard input: a node whose standard input is not the
 //! lock's `nodes` file was started outside the lock.
 
+// nextest-alone: 4.0-5.2 s under nextest on a ring-charging kernel, the
+// lease's 1 s settle included; a drain of other lanes' nodes before the lease
+// adds to it. The kernel keeps the pinned-memory budget per user, and every
+// node a sibling test process boots charges its rings to it, so the budget
+// this verdict reads is the lane's unless it runs alone. Nodes other lanes
+// start through the node module the box's node lock keeps away (ADR-0203
+// D2); a node started outside the module it does not.
+
 #[path = "support/node.rs"]
 mod node;
 

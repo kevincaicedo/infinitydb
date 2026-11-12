@@ -1477,6 +1477,19 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// A spawned process, killed and reaped on drop, a failed assertion's
+    /// unwind included: none outlives its test holding the test's output.
+    #[cfg(target_os = "linux")]
+    struct KillOnDrop(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// A leg directory a live process names as its `--data-dir` (the
     /// orphaned node of a killed run) is kept by the sweep and refused to a
     /// new leg; once that process is gone the sweep removes it. The owner
@@ -1490,19 +1503,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let held = root.join("a-c1-r2");
         std::fs::create_dir_all(held.join("shard-0")).unwrap();
-        // A loop, not a lone `sleep`: `sh -c` execs a single command in its
-        // place, which drops the `--data-dir` argument the scan reads.
-        let mut owner = std::process::Command::new("sh")
-            .args([
-                "-c",
-                "while :; do sleep 1; done",
-                "sh",
-                "--data-dir",
-                &held.display().to_string(),
-            ])
+        // `read` is a builtin, so the shell itself stays the process whose
+        // arguments name the directory (`sh -c` would exec a lone external
+        // command in its place, dropping them), and it starts no child that a
+        // kill of the shell would leave holding this test's output. Its stdin
+        // is a pipe nothing writes, so it waits until the guard kills it.
+        let owner = std::process::Command::new("sh")
+            .args(["-c", "read -r _", "sh", "--data-dir", &held.display().to_string()])
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .expect("a shell holds the directory's name");
-        let pid = owner.id();
+        let owner = KillOnDrop(owner);
+        let pid = owner.0.id();
         assert_eq!(
             Owners::read().of(&held),
             Owner::Live(pid),
@@ -1516,8 +1528,7 @@ mod tests {
         };
         assert!(refused.contains(&format!("pid {pid}")), "{refused}");
         assert!(held.join("shard-0").is_dir(), "a refused create touches nothing");
-        owner.kill().unwrap();
-        owner.wait().unwrap();
+        drop(owner);
         assert_eq!(Owners::read().of(&held), Owner::Idle);
         assert_eq!(LegDir::clear_stale(&root).unwrap(), vec![Swept::Removed("a-c1-r2".into())]);
         assert!(!held.exists());

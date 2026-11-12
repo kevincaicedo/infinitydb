@@ -37,6 +37,16 @@ just compat
 just sim-smoke
 ```
 
+`just check` runs each feature set's tests under cargo-nextest, one process
+a test, every binary even after a red, and their doctests under `cargo test
+--doc` (ADR-0200 D1). It needs nextest at the version `.config/nextest.toml`
+requires (`nextest-version`; `cargo install --locked cargo-nextest --version
+<that version>`, as CI installs it), and is red at its second line when
+nextest is missing or older (D5). Its isolation rules (groups of one thread,
+tests run alone) live in that file, each paired with its marker in the test's
+source by `scripts/check-nextest-config.sh` (D2). The layer commands below
+keep `cargo test`.
+
 `just check`, workspace tests and `just compat` require Redis **8.0.5** on
 PATH or `INF_COMPAT_ORACLE_ADDR` pointing to that version. An absent,
 broken or wrong-version oracle fails; there is no successful skip. The
