@@ -12,7 +12,8 @@
 #            `leak-timeout = { period = "100ms", result = "fail" }` and its
 #            overrides only; an override is `filter`, `priority` and either
 #            `test-group` (a group's, priority 50) or `threads-required =
-#            "num-test-threads"` (a run-alone one, priority 100), and every
+#            "num-test-threads"` (a run-alone one, priority 100), each value a
+#            string but the priority, an integer, and every
 #            run-alone override comes before every group's (nextest takes each
 #            setting from the first override that matches, and queues by
 #            priority, then in list order). So no filter, retry or timeout
@@ -183,6 +184,13 @@ for index, entry in enumerate(overrides):
         red(f"{where} is not a table")
         continue
     keys = set(entry)
+    wrong = [key for key in sorted(keys & {"filter", "test-group", "threads-required"})
+             if not isinstance(entry[key], str)]
+    if "priority" in entry and (type(entry["priority"]) is not int):
+        wrong.append("priority")
+    if wrong:
+        red(f"{where}: {', '.join(wrong)} has the wrong type (a string each; priority an integer)")
+        continue
     if keys == {"filter", "test-group", "priority"}:
         kind = "group"
         if entry["test-group"] not in groups:
@@ -199,7 +207,7 @@ for index, entry in enumerate(overrides):
         red(f"{where} holds keys {sorted(keys)}: a group's is filter, test-group, priority; "
             "a run-alone one's filter, threads-required, priority")
         continue
-    match = FILTER.match(entry["filter"]) if isinstance(entry["filter"], str) else None
+    match = FILTER.match(entry["filter"])
     if not match:
         red(f"{where}: filter {entry['filter']!r} is in none of the forms")
         continue

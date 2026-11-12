@@ -7180,7 +7180,15 @@ nc_tree
 nc_sub "$NC_CFG" 'priority = 50' $'priority = 50\nslow-timeout = "60s"'
 expect_red_because "nextest-config: an override with a timeout is red" "holds keys" ncfg "$NC_DIR"
 nc_tree
-nc_sub "$NC_CFG" 'threads-required = "num-test-threads"' 'threads-required = 4'
+nc_sub "$NC_CFG" 'test-group = "serial"' 'test-group = ["serial"]'
+expect_red_because "nextest-config: a list-valued test group is red, not a traceback" \
+    "override 3: test-group has the wrong type" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 50' 'priority = 50.0'
+expect_red_because "nextest-config: a priority that is no integer is red" \
+    "override 3: priority has the wrong type" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'threads-required = "num-test-threads"' 'threads-required = "num-cpus"'
 expect_red_because "nextest-config: a run-alone override short of every slot is red" \
     'threads-required. is not "num-test-threads"' ncfg "$NC_DIR"
 nc_tree
