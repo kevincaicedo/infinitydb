@@ -35,6 +35,244 @@
 //! flag) exists once per copy: through a second copy a nested start would
 //! wait at the turnstile while its thread holds a node, until the writer's
 //! deadline, and the in-process refusals would not see across the copies.
+//!
+//! # The ways out the types refuse
+//!
+//! Each block below writes one way the binary's path, a command or a node's
+//! child could leave the module, and must not compile; its fence names the
+//! error the refusal raises, which rustdoc checks on nightly. The `no_run`
+//! block after them is their twin: one function a block, with that block's
+//! names and the allowed form of its expression, so a block that fails for
+//! another reason (a renamed method) leaves the twin red. No block runs: each
+//! is a function no code calls, so none starts a node or takes a lock.
+//!
+//! The binary's path enters no `Command`: it is no program, has no `Display`,
+//! no `Deref` and no accessor.
+//!
+//! ```compile_fail,E0277
+//! use compat::harness::node::NodeBinary;
+//! use std::process::Command;
+//! fn way_out(binary: NodeBinary) {
+//!     let _ = Command::new(binary);
+//! }
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use compat::harness::node::NodeBinary;
+//! fn way_out(binary: NodeBinary) -> String {
+//!     format!("{}", binary)
+//! }
+//! ```
+//!
+//! ```compile_fail,E0614
+//! use compat::harness::node::NodeBinary;
+//! use std::process::Command;
+//! fn way_out(binary: NodeBinary) {
+//!     let _ = Command::new(&*binary);
+//! }
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use compat::harness::node::NodeBinary;
+//! fn way_out(binary: NodeBinary) {
+//!     let _ = binary.path();
+//! }
+//! ```
+//!
+//! A scope runs its own program only: the box-wide lock starts no stand-in,
+//! a box-wide lease no stand-in, a private lease not the binary.
+//!
+//! ```compile_fail,E0599
+//! use compat::harness::node::NodeLock;
+//! fn way_out() {
+//!     let _ = NodeLock::box_wide().stand_in();
+//! }
+//! ```
+//!
+//! ```compile_fail,E0308
+//! use compat::harness::node::{BoxWide, ExclusiveLease, NodeLock, Private};
+//! fn way_out(private: NodeLock<Private>, lease: &ExclusiveLease<BoxWide>) {
+//!     let _ = private.stand_in().spawn_under(lease);
+//! }
+//! ```
+//!
+//! ```compile_fail,E0308
+//! use compat::harness::node::{ExclusiveLease, NodeBinary, Private};
+//! fn way_out(binary: NodeBinary, lease: &ExclusiveLease<Private>) {
+//!     let _ = binary.command().spawn_under(lease);
+//! }
+//! ```
+//!
+//! A command becomes no `Command`, takes no standard input (its standard
+//! input is the lock) and is built only by the module.
+//!
+//! ```compile_fail,E0277
+//! use compat::harness::node::NodeBinary;
+//! use std::process::Command;
+//! fn way_out(binary: NodeBinary) {
+//!     let _: Command = binary.command().into();
+//! }
+//! ```
+//!
+//! ```compile_fail,E0614
+//! use compat::harness::node::NodeBinary;
+//! fn way_out(binary: NodeBinary) {
+//!     let command = binary.command();
+//!     let _ = &*command;
+//! }
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use compat::harness::node::{BoxWide, NodeCommand};
+//! use std::process::Stdio;
+//! fn way_out(command: NodeCommand<BoxWide>) {
+//!     let _ = command.stdin(Stdio::null());
+//! }
+//! ```
+//!
+//! ```compile_fail,E0451
+//! use compat::harness::node::{BoxWide, NodeCommand, NodeLock};
+//! use std::path::PathBuf;
+//! fn way_out(lock: NodeLock<BoxWide>, program: PathBuf) -> NodeCommand<BoxWide> {
+//!     NodeCommand {
+//!         lock,
+//!         program,
+//!         args: Vec::new(),
+//!         envs: Vec::new(),
+//!         stdout: None,
+//!         stderr: None,
+//!         ulimit: None,
+//!     }
+//! }
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use compat::harness::node::{NodeCommand, Private};
+//! use std::path::PathBuf;
+//! fn way_out(program: PathBuf) -> NodeCommand<Private> {
+//!     NodeCommand::<Private>::new(program)
+//! }
+//! ```
+//!
+//! A node's handle gives no way to its child, which only its drop ends.
+//!
+//! ```compile_fail,E0614
+//! use compat::harness::node::Node;
+//! fn way_out(node: Node) {
+//!     let _ = &*node;
+//! }
+//! ```
+//!
+//! ```compile_fail,E0614
+//! use compat::harness::node::LeasedNode;
+//! fn way_out(leased: LeasedNode<'_>) {
+//!     let _ = &*leased;
+//! }
+//! ```
+//!
+//! The twin: each block's names and signature, its expression in the allowed
+//! form; together they call every method of a command.
+//!
+//! ```no_run
+//! mod as_program {
+//!     use compat::harness::node::NodeBinary;
+//!     use std::process::Command;
+//!     pub fn allowed(binary: NodeBinary) {
+//!         let _ = binary.command().arg("--help").output();
+//!     }
+//! }
+//! mod as_display {
+//!     use compat::harness::node::NodeBinary;
+//!     pub fn allowed(binary: NodeBinary) -> String {
+//!         format!("{binary:?}")
+//!     }
+//! }
+//! mod as_deref {
+//!     use compat::harness::node::NodeBinary;
+//!     use std::process::Command;
+//!     pub fn allowed(binary: NodeBinary) {
+//!         let _ = binary.command().args(["--cells", "1"]).spawn();
+//!     }
+//! }
+//! mod as_accessor {
+//!     use compat::harness::node::NodeBinary;
+//!     pub fn allowed(binary: NodeBinary) {
+//!         let _ = binary.command();
+//!     }
+//! }
+//! mod box_wide_stand_in {
+//!     use compat::harness::node::{NodeLock, Waits};
+//!     use std::path::Path;
+//!     pub fn allowed(dir: &Path) {
+//!         let _ = NodeLock::at(dir, Waits::BOX_WIDE).stand_in();
+//!     }
+//! }
+//! mod stand_in_under_box_wide_lease {
+//!     use compat::harness::node::{BoxWide, ExclusiveLease, NodeLock, Private};
+//!     pub fn allowed(private: NodeLock<Private>, lease: &ExclusiveLease<Private>) {
+//!         let _ = private.stand_in().spawn_under(lease);
+//!     }
+//! }
+//! mod binary_under_private_lease {
+//!     use compat::harness::node::{BoxWide, ExclusiveLease, NodeBinary, Private};
+//!     pub fn allowed(binary: NodeBinary, lease: &ExclusiveLease<BoxWide>) {
+//!         let _ = binary.command().spawn_under(lease);
+//!     }
+//! }
+//! mod command_into {
+//!     use compat::harness::node::NodeBinary;
+//!     use std::process::Command;
+//!     pub fn allowed(binary: NodeBinary) {
+//!         let _ = binary.command().env("INF_TWIN", "1").output();
+//!     }
+//! }
+//! mod command_deref {
+//!     use compat::harness::node::{NodeBinary, Ulimit};
+//!     pub fn allowed(binary: NodeBinary) {
+//!         let command = binary.command();
+//!         let _ = command.ulimit(Ulimit::LockedKib(64));
+//!     }
+//! }
+//! mod command_stdin {
+//!     use compat::harness::node::{BoxWide, NodeCommand};
+//!     use std::process::Stdio;
+//!     pub fn allowed(command: NodeCommand<BoxWide>) {
+//!         let _ = command.stdout(Stdio::null()).stderr(Stdio::null());
+//!     }
+//! }
+//! mod command_literal {
+//!     use compat::harness::node::{BoxWide, NodeBinary, NodeCommand, NodeLock};
+//!     use std::path::PathBuf;
+//!     pub fn allowed(
+//!         lock: NodeLock<BoxWide>,
+//!         program: PathBuf,
+//!         binary: NodeBinary,
+//!     ) -> NodeCommand<BoxWide> {
+//!         let _ = (lock.dir(), program);
+//!         binary.command()
+//!     }
+//! }
+//! mod command_new {
+//!     use compat::harness::node::{NodeCommand, NodeLock, Private};
+//!     use std::path::PathBuf;
+//!     pub fn allowed(program: PathBuf, lock: NodeLock<Private>) -> NodeCommand<Private> {
+//!         let _ = program;
+//!         lock.stand_in()
+//!     }
+//! }
+//! mod node_deref {
+//!     use compat::harness::node::Node;
+//!     pub fn allowed(node: Node) -> u32 {
+//!         node.id()
+//!     }
+//! }
+//! mod leased_deref {
+//!     use compat::harness::node::LeasedNode;
+//!     pub fn allowed(leased: LeasedNode<'_>) -> u32 {
+//!         leased.id()
+//!     }
+//! }
+//! ```
 #![allow(dead_code)]
 #![allow(clippy::disallowed_types, reason = "test-only: lock files and a uid probe")]
 
@@ -101,9 +339,21 @@ impl NodeBinary {
         }
     }
 
+    /// The binary `INFINITYD_BIN` names, for a package cargo builds no
+    /// `infinityd` beside (compat's recipe and CI set it). `None` when the
+    /// variable is unset, empty or not Unicode: the caller skips its lane,
+    /// or refuses when the lane is required, and never starts a path that
+    /// names no binary.
+    pub fn from_infinityd_bin() -> Option<Self> {
+        match std::env::var("INFINITYD_BIN") {
+            Ok(path) if !path.is_empty() => Some(Self { path: PathBuf::from(path) }),
+            Ok(_) | Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => None,
+        }
+    }
+
     /// The only command that runs the binary: its starts take the box's lock.
     pub fn command(&self) -> NodeCommand<BoxWide> {
-        NodeCommand::new(NodeLock::box_wide(), self.path.clone())
+        NodeCommand::under_lock(NodeLock::box_wide(), self.path.clone())
     }
 }
 
@@ -296,7 +546,7 @@ impl NodeLock<Private> {
 
     /// `sleep`, the only command a private lock starts: a stand-in node.
     pub fn stand_in(&self) -> NodeCommand<Private> {
-        NodeCommand::new(self.copy(), PathBuf::from("sleep"))
+        NodeCommand::under_lock(self.copy(), PathBuf::from("sleep"))
     }
 }
 
@@ -384,7 +634,10 @@ impl<S: Scope> fmt::Debug for NodeCommand<S> {
 }
 
 impl<S: Scope> NodeCommand<S> {
-    fn new(lock: NodeLock<S>, program: PathBuf) -> Self {
+    /// The module's own constructor. No `new` exists, private or public:
+    /// the doc's block that calls one fails as a missing item, so only a
+    /// constructor added to the type compiles it.
+    fn under_lock(lock: NodeLock<S>, program: PathBuf) -> Self {
         Self {
             lock,
             program,
