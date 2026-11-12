@@ -1141,22 +1141,26 @@ mod tests {
         child.wait().expect("reap");
     }
 
-    /// Spawns `sh -c <script>` and returns once it has printed its first
-    /// line. Each script prints `ready` after its `trap`, so the signal the
-    /// test sends next finds the trap installed, however slowly the shell
-    /// was scheduled: an ordering read, not a settle time.
+    /// Spawns `sh -c <script>` under a guard and returns once it has printed
+    /// its first line. Each script prints `ready` after its `trap`, so the
+    /// signal the test sends next finds the trap installed, however slowly
+    /// the shell was scheduled: an ordering read, not a settle time. The
+    /// guard exists from the spawn, so a failed read kills and reaps the
+    /// shell instead of leaving it holding the test's output.
     #[cfg(target_os = "linux")]
-    fn spawn_ready(script: &str) -> Child {
+    fn spawn_ready(script: &str) -> ServerGuard {
         use std::io::Read as _;
-        let mut child = Command::new("sh")
+        let child = Command::new("sh")
             .args(["-c", script])
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn sh");
+        let mut guard = ServerGuard { child, port: 0 };
         let mut line = [0u8; 6];
-        child.stdout.as_mut().expect("piped").read_exact(&mut line).expect("sh's ready line");
+        let stdout = guard.child.stdout.as_mut().expect("piped");
+        stdout.read_exact(&mut line).expect("sh's ready line");
         assert_eq!(&line, b"ready\n", "the script prints `ready` first");
-        child
+        guard
     }
 
     /// A warm directory needs exit 0 after `SIGTERM`: a process the signal
@@ -1164,18 +1168,17 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn a_graceful_stop_needs_exit_zero() {
-        let guard = |script: &str| ServerGuard { child: spawn_ready(script), port: 0 };
         // `sh` runs a trap only once its foreground `sleep` returns, so the
         // loop sleeps briefly and the trap lands within one pass.
         let traps =
             |code: u8| format!("trap 'exit {code}' TERM; echo ready; while :; do sleep 0.01; done");
         let deadline = Duration::from_secs(GRACEFUL_STOP_DEADLINE_S);
-        let clean = guard(&traps(0));
+        let clean = spawn_ready(&traps(0));
         assert!(clean.stop_graceful(deadline).is_ok(), "exit 0 after SIGTERM");
-        let failing = guard(&traps(1));
+        let failing = spawn_ready(&traps(1));
         let result = failing.stop_graceful(deadline);
         assert!(matches!(result, Err(StopError::Exit(s)) if s.code() == Some(1)), "{result:?}");
-        let killed = guard("echo ready; while :; do sleep 0.01; done");
+        let killed = spawn_ready("echo ready; while :; do sleep 0.01; done");
         let result = killed.stop_graceful(deadline);
         assert!(matches!(result, Err(StopError::Exit(s)) if s.code().is_none()), "{result:?}");
     }
@@ -1186,9 +1189,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn a_stop_past_its_deadline_is_refused_and_the_child_reaped() {
-        let child = spawn_ready("trap '' TERM; echo ready; while :; do sleep 0.01; done");
-        let pid = child.id();
-        let deaf = ServerGuard { child, port: 0 };
+        let deaf = spawn_ready("trap '' TERM; echo ready; while :; do sleep 0.01; done");
+        let pid = deaf.pid();
         let deadline = Duration::from_millis(100);
         let asked = Instant::now();
         let result = deaf.stop_graceful(deadline);
