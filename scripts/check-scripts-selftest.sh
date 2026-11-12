@@ -323,6 +323,32 @@ expect_red_because "driver: an end stamp that is no whole number is red, named" 
 f=$(drv_clocked backwards 105 100)
 expect_red_because "driver: a clock that runs backwards is red, named" \
     "$drv_clock_red group one clock: 105 100" drv_run "$f"
+# The driver's sort, uniq and comm run under LC_ALL=C: stand-ins that answer
+# `collation_differs` under any other locale setting would turn its control red.
+mkdir -p "$work/drv-collate"
+for drv_tool in sort uniq comm; do
+    printf '#!/bin/sh\n[ "${LC_ALL-}" = C ] && exec %s "$@"\necho collation_differs\n' \
+        "$(command -v "$drv_tool")" >"$work/drv-collate/$drv_tool"
+    chmod +x "$work/drv-collate/$drv_tool"
+done
+drv_stand_ins() { # each stand-in answers otherwise outside LC_ALL=C, so the plant is live
+    local tool
+    for tool in sort uniq comm; do
+        [ "$(LC_ALL=POSIX "$work/drv-collate/$tool" /dev/null /dev/null)" = collation_differs ] ||
+            return 1
+    done
+}
+expect green "driver: the collation stand-ins answer otherwise outside LC_ALL=C (control)" \
+    drv_stand_ins
+drv_collated() ( # <fixture>: the driver beside the stand-ins, its caller's locale POSIX
+    PATH="$work/drv-collate:$PATH" LC_ALL=POSIX
+    export PATH LC_ALL
+    drv_run "$1"
+)
+f=$(drv_fixture collate 'group_one() {' 'expect green "one passes" true' '}' \
+    'group_two() {' 'expect green "two passes" true' '}')
+expect_output "driver: sort, uniq and comm read one collation whatever the caller's locale" \
+    "check-scripts self-test OK (2 cases in 2 groups" drv_collated "$f"
 }
 
 # The gates' crate set (scripts/cell-crates.sh) names exclusions that must

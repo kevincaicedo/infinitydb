@@ -271,17 +271,20 @@ selftest_drive() {
         sed 's/^/    | /' "$root/declared.err"
         red=$((red + 1))
     fi
-    sort "$root/defined" >"$root/defined.sorted"
-    sort "$root/declared" >"$root/declared.sorted"
-    for g in $(uniq -d "$root/defined.sorted"); do
+    # One collation, bytes (LC_ALL=C), for sort, uniq and comm: comm and uniq
+    # read their input in the order they collate, which must be the order sort
+    # wrote whatever the caller's locale and whichever system's tools these are.
+    LC_ALL=C sort "$root/defined" >"$root/defined.sorted"
+    LC_ALL=C sort "$root/declared" >"$root/declared.sorted"
+    for g in $(LC_ALL=C uniq -d "$root/defined.sorted"); do
         echo "SELFTEST DRIVER: group $g is defined twice"
         red=$((red + 1))
     done
-    for g in $(sort -u "$root/defined" | comm -23 - "$root/declared.sorted"); do
+    for g in $(LC_ALL=C sort -u "$root/defined" | LC_ALL=C comm -23 - "$root/declared.sorted"); do
         echo "SELFTEST DRIVER: group $g is in the definition lines only (bash's table lacks it)"
         red=$((red + 1))
     done
-    for g in $(comm -13 "$root/defined.sorted" "$root/declared.sorted"); do
+    for g in $(LC_ALL=C comm -13 "$root/defined.sorted" "$root/declared.sorted"); do
         echo "SELFTEST DRIVER: group $g is in bash's function table only (its definition is not \`group_$g() {\`)"
         red=$((red + 1))
     done
