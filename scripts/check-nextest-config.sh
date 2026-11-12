@@ -318,11 +318,8 @@ class Source:
         spans = []
         self.code = strip(self.text, comments=spans).split("\n")
         self.uncommented = strip(self.text, keep_strings=True)
-        self.comments = []  # (line index, comment token, the text after it, code before it)
-        for start, end, token in spans:
-            line = self.text.count("\n", 0, start)
-            before = self.text[self.text.rfind("\n", 0, start) + 1:start]
-            self.comments.append((line, token, self.text[start + 2:end], before.strip() != ""))
+        self.comments = [(self.text.count("\n", 0, start), token, self.text[start + 2:end])
+                         for start, end, token in spans]  # (line index, token, the text after it)
         self.inline = []  # the inline module path at each line's start
         self.declared = []  # (line index, inline path, name, #[path] or None)
         frames, depth = [], 0
@@ -670,13 +667,13 @@ for path in scanned:
         mark = MARKER.search(raw) if here.is_comment(number) else None
         if mark and (path, number) not in bound and mark.group(1) in ("group", "in-process"):
             red(f"{path}:{number + 1}: a `nextest-{mark.group(1)}:` marker on no static lock")
-    for line, token, body, beside_code in here.comments:
+    for line, token, body in here.comments:
         for offset, part in enumerate(body.split("\n")):
             text = part.lstrip("/!* \t")
             if not NEAR_MARKER.match(text):
                 continue
             number = line + offset
-            if token == "//" and not beside_code and MARKER.match(here.raw[number]):
+            if token == "//" and MARKER.match(here.raw[number]):
                 continue
             red(f"{path}:{number + 1}: a comment spelled like a marker (`{text[:40].rstrip()}`) "
                 "is not read: a marker is a comment line of its own, `// nextest-<kind>: <reason>`")
