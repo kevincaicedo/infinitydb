@@ -7135,7 +7135,7 @@ NC_GROUP=$'[[profile.default.overrides]]\nfilter = \'binary_id(fx::a)\'\n'
 nc_tree
 expect green "nextest-config: the fixture workspace is green" ncfg "$NC_DIR"
 expect_output "nextest-config: the OK line counts each rule's population" \
-    "nextest-config OK: nextest-version 0.9.150; 1 groups of one thread (serial), 1 group overrides at priority 50; 2 run alone at priority 100, first (fx::a/a_alone, fxd::boot); 2 static locks, 1 grouped and 1 in-process; 2 test files name MEM-BUDGET, 1 state TAIL-STALL-TIMEOUT and 1 carry nextest-stall-default; no free-space read in 5 integration-test files; 1 cargo-nextest installs in CI at 0.9.150, each --locked; [0-9]* .rs files of 6 test binaries read" \
+    "nextest-config OK: nextest-version 0.9.150; 1 groups of one thread (serial), 1 group overrides at priority 50; 2 run alone at priority 100, first (fx::a/a_alone, fxd::boot); 2 static locks, 1 grouped and 1 in-process; 2 test files name MEM-BUDGET, 1 state TAIL-STALL-TIMEOUT and 1 carry nextest-stall-default; no free-space read in 5 integration-test files and 1 library files they link; 1 cargo-nextest installs in CI at 0.9.150, each --locked; [0-9]* .rs files of 6 test binaries read" \
     ncfg "$NC_DIR"
 # The config holds its listed keys only, in their listed shapes.
 nc_tree
@@ -7255,6 +7255,34 @@ expect green "nextest-config: a run-alone test in an inline module is named by i
 nc_tree
 nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'#![allow(\n    clippy::disallowed_methods,\n' $'#![allow(\n    clippy::disallowed_methods,\n    clippy::disallowed_types,\n'
 expect green "nextest-config: a leading marker below an inner attribute of four lines binds" ncfg "$NC_DIR"
+# A library's statics reach every test binary that links it: its package's,
+# and those of each workspace package that depends on it.
+nc_lib_lock() { # fx's library holds a grouped lock; the group override names <filter>
+    nc_tree
+    printf '// nextest-group: serial\npub static SHARED: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' \
+        >"$NC_DIR/crates/fx/src/lib.rs"
+    printf "\n[[profile.default.overrides]]\nfilter = '%s'\ntest-group = \"serial\"\npriority = 50\n" "$1" \
+        >>"$NC_CFG"
+}
+nc_lib_lock 'binary_id(fx)'
+expect_red_because "nextest-config: a library's lock grouped for the library's own binary only is red" \
+    "lib.rs:2: test binary .fx::b. compiles this lock, and no override puts it in group .serial." \
+    ncfg "$NC_DIR"
+nc_lib_lock 'package(fx)'
+expect green "nextest-config: a library's lock grouped for its whole package is green" ncfg "$NC_DIR"
+printf '\n[dev-dependencies]\nfx = { path = "../../crates/fx" }\n' >>"$NC_DIR/bins/fxd/Cargo.toml"
+expect_red_because "nextest-config: a library's lock reaches a package that depends on it" \
+    "lib.rs:2: test binary .fxd::tiered. compiles this lock" ncfg "$NC_DIR"
+printf "\n[[profile.default.overrides]]\nfilter = 'package(fxd)'\ntest-group = \"serial\"\npriority = 50\n" \
+    >>"$NC_CFG"
+expect green "nextest-config: grouped in the dependent package too, it is green" ncfg "$NC_DIR"
+nc_tree
+printf '/// Free space, which `statvfs` would read, is no oracle here.\npub fn held() -> u64 { 0 }\n' \
+    >"$NC_DIR/crates/fx/src/lib.rs"
+expect green "nextest-config: a library's comment may name a free-space call" ncfg "$NC_DIR"
+printf 'pub fn free() -> &'"'"'static str { "statvfs" }\n' >>"$NC_DIR/crates/fx/src/lib.rs"
+expect_red_because "nextest-config: a free-space read in a library integration tests link is red" \
+    "lib.rs:3: reads .statvfs. in a library integration tests link" ncfg "$NC_DIR"
 # Modules resolve as rustc resolves them: a `#[path]` file's own `mod` sits
 # beside it, and a declaration that resolves to no file is a scope error.
 nc_tree

@@ -26,9 +26,12 @@
 #            file under crates/, bins/ or tests/, carries on the comment line
 #            above it (attributes between) `nextest-group: <group>` or
 #            `nextest-in-process: <reason>`. A group marker's group exists, and
-#            a group override selects every test binary that compiles the file
-#            (its root, or a file it includes by `mod` or `#[path]`); every
-#            group is named by a marker.
+#            a group override selects every test binary that holds the lock:
+#            each that compiles the file (its root, or a file it includes by
+#            `mod` or `#[path]`) and, for a library's file, each test binary of
+#            its package and of every workspace package that links it (through
+#            normal dependencies, then one normal or dev edge). Every group is
+#            named by a marker.
 #   alone    a test target or one test that must run alone in its lane
 #            carries `nextest-alone: <reason>` in its file's leading comments
 #            or on the comments above its `#[test]`, and the reason gives its
@@ -38,8 +41,9 @@
 #   install  a `cargo install` of cargo-nextest in .github/workflows names
 #            `--locked` and `--version` with the floor of `nextest-version`.
 #   oracle   no file of an integration-test target names statvfs, statfs,
-#            f_bavail or f_bfree: free space is every process's, so a test
-#            reads what its own process holds instead (D7).
+#            f_bavail or f_bfree, and no library file such a target links reads
+#            one in code (its comments may name them): free space is every
+#            process's, so a test reads what its own process holds (D7).
 #   stall    a .rs file under bins/*/tests/, crates/*/tests/ or tests/ that
 #            names MEM-BUDGET names TAIL-STALL-TIMEOUT or carries
 #            `nextest-stall-default: <reason>` in its leading comments: a
@@ -156,9 +160,12 @@ try:
     packages = json.loads(metadata.stdout)["packages"]
     root = Path.cwd().resolve()
     binaries = {}  # binary id -> (package, root file, kind)
+    lib_roots = {}  # package -> the root of the library other targets link
     for package in packages:
         for target in package["targets"]:
             kinds = target["kind"]
+            if set(kinds) & {"lib", "rlib", "dylib"}:
+                lib_roots[package["name"]] = Path(os.path.normpath(target["src_path"])).relative_to(root)
             if "custom-build" in kinds or not target.get("test", False):
                 continue
             if "bin" in kinds:
@@ -172,6 +179,10 @@ try:
             source = Path(os.path.normpath(target["src_path"]))
             binaries[binary] = (package["name"], source.relative_to(root), kinds)
     package_names = {package["name"] for package in packages}
+    # Workspace edges a test binary links through: normal and dev, not build.
+    depends = {package["name"]: {(dep["name"], dep.get("kind")) for dep in package["dependencies"]
+                                 if dep["name"] in package_names and dep.get("kind") != "build"}
+               for package in packages}
 except (ValueError, KeyError, TypeError) as err:
     scope_error(f"invalid cargo metadata ({err})")
 if not binaries:
@@ -446,12 +457,38 @@ compiled_by = {}  # file -> {(binary id, module path)}
 for binary, (_, root_file, kinds) in sorted(binaries.items()):
     for path, modules in walk(root_file).items():
         compiled_by.setdefault(path, set()).update((binary, module) for module in modules)
+
+
+def linkers(package):
+    """The packages whose test binaries link `package`'s library: itself, each
+    that reaches it through normal dependencies, and each that depends on one
+    of those, dev dependencies included."""
+    normal, grew = {package}, True
+    while grew:
+        grew = False
+        for name, edges in depends.items():
+            if name not in normal and any(dep in normal and kind is None for dep, kind in edges):
+                normal.add(name)
+                grew = True
+    return normal | {name for name, edges in depends.items() if any(dep in normal for dep, _ in edges)}
+
+
+# Which test binaries hold each file's statics: those that compile it, and for a
+# library's file every test binary that links the library.
+linked_by = {path: {binary for binary, _ in users} for path, users in compiled_by.items()}
+for package, lib_root in sorted(lib_roots.items()):
+    reach = linkers(package)
+    users = {binary for binary, (owner, _, _) in binaries.items() if owner in reach}
+    for path in walk(lib_root):
+        linked_by.setdefault(path, set()).update(users)
 if unresolved:
     scope_error("a module this gate cannot find would go unread: " + "; ".join(unresolved[:5]))
 
 integration = {path for path, users in compiled_by.items()
                if any("test" in binaries[b][2] for b, _ in users)}
-scanned = sorted(set(rust_files) | set(compiled_by))
+linked = {path for path, users in linked_by.items()
+          if path not in integration and any("test" in binaries[b][2] for b in users)}
+scanned = sorted(set(rust_files) | set(linked_by))
 bound = set()  # (file, line) of each marker that binds
 locks = []  # (file, line, verdict, group or reason)
 alone_marks = []  # (file, line, test path or None)
@@ -492,10 +529,10 @@ for path in scanned:
         locks.append((path, number, "group", reason))
         if reason not in groups:
             red(f"{path}:{above + 1}: names test group `{reason}`, which [test-groups] lacks")
-        users = sorted(compiled_by.get(path, set()))
+        users = sorted(linked_by.get(path, set()))
         if not users:
             red(f"{path}:{number + 1}: a grouped lock in a file no test binary compiles")
-        for binary, _ in users:
+        for binary in users:
             if not any(kind == "group" and group == reason and binary in chosen and test is None
                        for _, kind, chosen, test, group in parsed):
                 red(f"{path}:{number + 1}: test binary `{binary}` compiles this lock, and no "
@@ -573,6 +610,13 @@ for path in sorted(integration):
             if word in raw:
                 red(f"{path}:{number + 1}: names `{word}` in an integration-test target: free "
                     "space is every process's, so read what this process holds")
+# A library an integration test links reads none in code; its comments may name them.
+for path in sorted(linked):
+    for number, line in enumerate(source(path).uncommented.split("\n")):
+        for word in FREE_SPACE:
+            if word in line:
+                red(f"{path}:{number + 1}: reads `{word}` in a library integration tests link: "
+                    "free space is every process's, so read what this process holds")
 
 
 def under_tests(path):
@@ -654,7 +698,8 @@ print(
     f"({', '.join(alone_names) or 'none'}); {len(locks)} static locks, {len(locks) - in_process} "
     f"grouped and {in_process} in-process; {budget_files} test files name MEM-BUDGET, {stated} "
     f"state TAIL-STALL-TIMEOUT and {defaulted} carry nextest-stall-default; no free-space read in "
-    f"{free_space_files} integration-test files; {installs} cargo-nextest installs in CI at "
+    f"{free_space_files} integration-test files and {len(linked)} library files they link; "
+    f"{installs} cargo-nextest installs in CI at "
     f"{floor}, each --locked; {len(scanned)} .rs files of {len(binaries)} test binaries read"
 )
 PY
