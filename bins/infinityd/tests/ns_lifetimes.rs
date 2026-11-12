@@ -33,10 +33,14 @@
 //! readiness is a `DBSIZE` answer, a refusal is the exit.
 #![cfg(target_os = "linux")]
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{BoxWide, Node, NodeBinary, NodeCommand, Ulimit};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -61,16 +65,9 @@ fn data_root(tag: &str) -> PathBuf {
 }
 
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Server {
@@ -103,21 +100,16 @@ impl Server {
 
 /// A two-cell durable node on `dir`, up: listening and out of `-LOADING`.
 fn start(dir: &Path) -> Server {
-    spawn(dir, Command::new(env!("CARGO_BIN_EXE_infinityd")))
+    spawn(dir, NodeBinary::built().command())
 }
 
 /// [`start`] under an address-space cap of `cap_kib` KiB, so the OS
 /// refuses a mapping the cap cannot hold.
 fn start_capped(dir: &Path, cap_kib: u64) -> Server {
-    let mut command = Command::new("sh");
-    command
-        .arg("-c")
-        .arg(format!("ulimit -v {cap_kib} && exec \"$0\" \"$@\""))
-        .arg(env!("CARGO_BIN_EXE_infinityd"));
-    spawn(dir, command)
+    spawn(dir, NodeBinary::built().command().ulimit(Ulimit::AddressSpaceKib(cap_kib)))
 }
 
-fn spawn(dir: &Path, mut command: Command) -> Server {
+fn spawn(dir: &Path, command: NodeCommand<BoxWide>) -> Server {
     std::fs::create_dir_all(dir).expect("data dir");
     let stderr = dir.join(format!("stderr-{}-{}", std::process::id(), unique()));
     let mut child = command
@@ -350,7 +342,8 @@ fn seed_tiered_catalog(dir: &Path, live: u32) -> String {
 /// its status and stderr. A node that comes up is a failure.
 fn boot_refused(dir: &Path) -> (std::process::ExitStatus, String) {
     let stderr = dir.join(format!("stderr-refused-{}", unique()));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+    let mut child = NodeBinary::built()
+        .command()
         .args(["--port", "0", "--cells", "2", "--data-dir"])
         .arg(dir)
         .args(["--device-probe", "off"])

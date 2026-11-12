@@ -18,11 +18,27 @@
 //! 0.92¹⁰⁰ ≈ 0.02 %. `INF_MEMLOCK_BOOT_BIN` names another build, to show
 //! the test red; `INF_MEMLOCK_BOOT_REQUIRE=1` (CI's Linux legs) makes the
 //! skip below a failure.
+//!
+//! The budget is the user's, so any other process of the user that holds
+//! it turns this test red. Every node a test starts holds the box's node
+//! lock shared (`support/node.rs`); this test takes it exclusive after its
+//! engagement boot and boots its control and its 100 nodes under the
+//! lease, so no node another test started, in this lane or another, runs
+//! beside them. A failure lists the budget's other holders (a process with
+//! an io_uring or perf ring), each with its ancestors, cgroup, pinned
+//! memory and standard input: a node whose standard input is not the
+//! lock's `nodes` file was started outside the lock.
+
+#[path = "support/node.rs"]
+mod node;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+
+use node::{BoxWide, ExclusiveLease, LeasedNode, Node, NodeBinary, NodeLock, Ulimit};
 
 const BOOTS: usize = 100;
 /// The shipped default: four rings of about 404 KiB each, so three
@@ -34,15 +50,41 @@ const CELLS: &str = "4";
 const MEMLOCK_KIB: u32 = 8 * 1024;
 /// Below one ring: a kernel that charges rings refuses a node here.
 const MEMLOCK_KIB_BELOW_ONE_RING: u32 = 64;
+/// How many ancestors a holder's line names.
+const ANCESTORS: usize = 16;
 
-/// A spawned node, killed on drop: a failed assertion never leaves it
-/// running and holding locked memory the next boot is charged against.
-struct Spawned(Child);
+/// A started node: shared (the engagement boot) or under the lease. Either
+/// kills and reaps its child on drop, so a failed assertion never leaves
+/// it running and holding locked memory the next boot is charged against.
+enum Started<'lease> {
+    Shared(Node),
+    Leased(LeasedNode<'lease>),
+}
 
-impl Drop for Spawned {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+impl Started<'_> {
+    fn try_exited(&mut self) -> bool {
+        let status = match self {
+            Started::Shared(node) => node.try_wait(),
+            Started::Leased(node) => node.try_wait(),
+        };
+        status.expect("try_wait").is_some()
+    }
+
+    fn end(&mut self) {
+        let _ = match self {
+            Started::Shared(node) => node.kill().and_then(|()| node.wait().map(drop)),
+            Started::Leased(node) => node.kill().and_then(|()| node.wait().map(drop)),
+        };
+    }
+
+    fn stderr(&mut self) -> String {
+        let pipe = match self {
+            Started::Shared(node) => node.take_stderr(),
+            Started::Leased(node) => node.take_stderr(),
+        };
+        let mut stderr = String::new();
+        pipe.expect("piped stderr").read_to_string(&mut stderr).expect("stderr");
+        stderr
     }
 }
 
@@ -52,31 +94,28 @@ enum Boot {
     Exited(String),
 }
 
-/// Boots `infinityd` under a `memlock_kib` limit. Served means `DBSIZE`
-/// answered: it scatters to every cell, so every cell's setup is done.
-fn boot(cells: &str, memlock_kib: u32) -> Boot {
+/// Boots `infinityd` under a `memlock_kib` limit: shared through the node
+/// lock, or under `lease`. Served means `DBSIZE` answered: it scatters to
+/// every cell, so every cell's setup is done.
+fn boot(cells: &str, memlock_kib: u32, lease: Option<&ExclusiveLease<BoxWide>>) -> Boot {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("probe bind")
         .local_addr()
         .expect("probe address")
         .port();
-    let binary = std::env::var("INF_MEMLOCK_BOOT_BIN")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_infinityd").to_owned());
-    let mut node = Spawned(
-        Command::new("sh")
-            .args(["-c", r#"ulimit -l "$1" && shift && exec "$@""#, "sh"])
-            .arg(memlock_kib.to_string())
-            .arg(binary)
-            .args(["--port", &port.to_string(), "--cells", cells])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn infinityd under sh"),
-    );
-    let child = &mut node.0;
+    let command = NodeBinary::built_or("INF_MEMLOCK_BOOT_BIN")
+        .command()
+        .ulimit(Ulimit::LockedKib(memlock_kib))
+        .args(["--port", &port.to_string(), "--cells", cells])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut node = match lease {
+        None => Started::Shared(command.spawn().expect("spawn infinityd under the node lock")),
+        Some(lease) => Started::Leased(command.spawn_under(lease).expect("spawn infinityd")),
+    };
     let deadline = Instant::now() + Duration::from_secs(30);
     let served = loop {
-        if child.try_wait().expect("try_wait").is_some() {
+        if node.try_exited() {
             break false;
         }
         if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
@@ -87,12 +126,10 @@ fn boot(cells: &str, memlock_kib: u32) -> Boot {
     };
     if !served {
         // A reset can precede the failing cell's stderr line; let it exit.
-        wait_for_exit(child, deadline);
+        wait_for_exit(&mut node, deadline);
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    let mut stderr = String::new();
-    child.stderr.take().expect("piped stderr").read_to_string(&mut stderr).expect("stderr");
+    node.end();
+    let stderr = node.stderr();
     if !served {
         return Boot::Exited(stderr);
     }
@@ -112,8 +149,8 @@ fn answers_dbsize(stream: &mut TcpStream) -> bool {
     stream.read_exact(&mut reply).is_ok() && &reply == b":0\r\n"
 }
 
-fn wait_for_exit(child: &mut Child, deadline: Instant) {
-    while child.try_wait().expect("try_wait").is_none() && Instant::now() < deadline {
+fn wait_for_exit(node: &mut Started<'_>, deadline: Instant) {
+    while !node.try_exited() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -123,42 +160,115 @@ fn reason(stderr: &str) -> &str {
     stderr.lines().last().unwrap_or("(no stderr)")
 }
 
-/// The `Uid:` and `VmPin:` fields of one `/proc/<pid>/status`.
-fn uid_and_pinned_kib(status: &str) -> (Option<&str>, u64) {
-    let field = |name: &str| {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(name))
-            .and_then(|rest| rest.split_whitespace().next())
-    };
-    (field("Uid:"), field("VmPin:").and_then(|kib| kib.parse().ok()).unwrap_or(0))
+/// One field of a `/proc/<pid>/status` text.
+fn status_field<'a>(status: &'a str, name: &str) -> Option<&'a str> {
+    status.lines().find_map(|line| line.strip_prefix(name)).map(str::trim)
 }
 
-/// This user's other processes with pinned memory: io_uring charges a
-/// registered buffer to `VmPin` and to the same per-user budget the
-/// control leg is refused by. A ring alone shows no `VmPin`.
-fn pinned_peers() -> String {
+/// A process's name and its ancestors', nearest first.
+fn lineage(pid: &str) -> String {
+    let mut names = Vec::new();
+    let mut current = pid.to_owned();
+    for _ in 0..ANCESTORS {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{current}/status")) else { break };
+        names.push(status_field(&status, "Name:").unwrap_or("?").to_owned());
+        match status_field(&status, "PPid:") {
+            Some(parent) if parent != "0" => current = parent.to_owned(),
+            _ => break,
+        }
+    }
+    names.join(" < ")
+}
+
+/// This user's other processes that hold an io_uring or perf ring, the
+/// counter's holders: each with its ancestors, cgroup, `VmPin` and fd 0. A
+/// holder whose fd 0 is not the lock's `nodes` file holds outside the lock.
+fn holders(lock: &NodeLock<BoxWide>) -> String {
+    let nodes = lock.dir().join("nodes");
     let own = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let own_uid = uid_and_pinned_kib(&own).0.unwrap_or("?").to_owned();
+    let own_uid = status_field(&own, "Uid:").and_then(|uid| uid.split_whitespace().next());
     let self_pid = std::process::id().to_string();
-    let mut peers = Vec::new();
+    let mut found = Vec::new();
     for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
         let pid = entry.file_name().to_string_lossy().into_owned();
         if pid == self_pid || !pid.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
         let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else { continue };
-        let (uid, pinned_kib) = uid_and_pinned_kib(&status);
-        if uid == Some(own_uid.as_str()) && pinned_kib > 0 {
-            let name = status.lines().next().and_then(|l| l.strip_prefix("Name:")).unwrap_or("");
-            peers.push(format!("pid {pid} ({}) VmPin {pinned_kib} kB", name.trim()));
+        let uid = status_field(&status, "Uid:").and_then(|uid| uid.split_whitespace().next());
+        if uid.is_none() || uid != own_uid {
+            continue;
+        }
+        let (mut rings, mut perf) = (0, 0);
+        for fd in std::fs::read_dir(entry.path().join("fd")).into_iter().flatten().flatten() {
+            match std::fs::read_link(fd.path()).ok().as_deref().and_then(Path::to_str) {
+                Some("anon_inode:[io_uring]") => rings += 1,
+                Some("anon_inode:[perf_event]") => perf += 1,
+                _ => {}
+            }
+        }
+        if rings == 0 && perf == 0 {
+            continue;
+        }
+        let fd0 = std::fs::read_link(entry.path().join("fd/0")).ok();
+        let outside =
+            if fd0.as_deref() == Some(nodes.as_path()) { "" } else { ", outside the lock" };
+        let fd0 = fd0.map_or_else(|| "(none)".to_owned(), |path| path.display().to_string());
+        let cgroup = std::fs::read_to_string(entry.path().join("cgroup")).unwrap_or_default();
+        found.push(format!(
+            "pid {pid} ({}): {rings} io_uring and {perf} perf_event fds, VmPin {}, cgroup {}, \
+             fd 0 {fd0}{outside}",
+            lineage(&pid),
+            status_field(&status, "VmPin:").unwrap_or("?"),
+            cgroup.lines().last().unwrap_or("?"),
+        ));
+    }
+    if found.is_empty() { "none".to_owned() } else { found.join("; ") }
+}
+
+/// The takers of the lock's two files in `/proc/locks`. `/proc/locks`
+/// names the process that took a lock, not every process that holds it: a
+/// node holds `nodes` through the description its starter took, so its
+/// taker is a test, possibly gone, its pid dead or reused. `fd0_holders`
+/// names the nodes themselves.
+fn lock_takers(lock: &NodeLock<BoxWide>) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let files: Vec<(&str, u64)> = ["turnstile", "nodes"]
+        .into_iter()
+        .filter_map(|name| Some((name, std::fs::metadata(lock.dir().join(name)).ok()?.ino())))
+        .collect();
+    let table = std::fs::read_to_string("/proc/locks").unwrap_or_default();
+    let mut takers = Vec::new();
+    for line in table.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(at) = fields.iter().position(|field| field.matches(':').count() == 2) else {
+            continue;
+        };
+        let inode = fields[at].rsplit(':').next().and_then(|inode| inode.parse::<u64>().ok());
+        for (name, ino) in &files {
+            if inode == Some(*ino) && at >= 2 {
+                takers.push(format!("taker pid {} {} {name}", fields[at - 1], fields[at - 2]));
+            }
         }
     }
-    if peers.is_empty() {
-        "none with VmPin (a ring-only holder shows none)".to_owned()
-    } else {
-        peers.join(", ")
+    if takers.is_empty() { "none".to_owned() } else { takers.join(", ") }
+}
+
+/// This user's processes whose standard input is the lock's `nodes` file:
+/// the nodes that hold it shared, each with its ancestors.
+fn fd0_holders(lock: &NodeLock<BoxWide>) -> String {
+    let nodes = lock.dir().join("nodes");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let pid = entry.file_name().to_string_lossy().into_owned();
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if std::fs::read_link(entry.path().join("fd/0")).ok().as_deref() == Some(nodes.as_path()) {
+            found.push(format!("pid {pid} ({})", lineage(&pid)));
+        }
     }
+    if found.is_empty() { "none".to_owned() } else { found.join(", ") }
 }
 
 /// `INF_MEMLOCK_BOOT_REQUIRE=1`: a skip is a failure (a runner whose
@@ -170,8 +280,9 @@ fn skip_is_failure() -> bool {
 #[test]
 fn a_node_boots_under_the_default_memlock_limit() {
     // Engagement: where rings are not charged (an older kernel, or
-    // CAP_IPC_LOCK) the race cannot occur and this test cannot go red.
-    match boot("1", MEMLOCK_KIB_BELOW_ONE_RING) {
+    // CAP_IPC_LOCK) the race cannot occur and this test cannot go red. A
+    // shared start: it reads nothing of the budget but its own refusal.
+    match boot("1", MEMLOCK_KIB_BELOW_ONE_RING, None) {
         Boot::Served(_) => {
             let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
             let why = format!(
@@ -187,29 +298,44 @@ fn a_node_boots_under_the_default_memlock_limit() {
             "under {MEMLOCK_KIB_BELOW_ONE_RING} KiB a node fails for another reason: {stderr}"
         ),
     }
+    // From here no node another test starts holds the budget: they wait.
+    let lock = NodeLock::box_wide();
+    let lease = lock.exclusive().unwrap_or_else(|error| {
+        panic!(
+            "the node lock: {error}; its takers: {}; its holders by fd 0: {}; the budget's \
+             holders: {}",
+            lock_takers(&lock),
+            fd0_holders(&lock),
+            holders(&lock)
+        )
+    });
     // Control: one cell has no sibling to race, so its refusal means the
-    // budget is held elsewhere: by another process of this user, or by a
-    // node an earlier test stopped, whose rings and registered buffers the
+    // budget is held elsewhere: by a process of this user outside the lock,
+    // or by a node that just ended, whose rings and registered buffers the
     // kernel uncharges only after the process is gone. Wait until it boots.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while let Boot::Exited(stderr) = boot("1", MEMLOCK_KIB) {
+    while let Boot::Exited(stderr) = boot("1", MEMLOCK_KIB, Some(&lease)) {
         assert!(
             Instant::now() < deadline,
-            "a one-cell node fails under {MEMLOCK_KIB} KiB: {}; this user's processes \
-             holding pinned memory: {}",
+            "a one-cell node fails under {MEMLOCK_KIB} KiB: {}; the budget's holders: {}",
             reason(&stderr),
-            pinned_peers()
+            holders(&lock)
         );
     }
     let mut failed = Vec::new();
     for index in 0..BOOTS {
-        match boot(CELLS, MEMLOCK_KIB) {
+        match boot(CELLS, MEMLOCK_KIB, Some(&lease)) {
             Boot::Served(stderr) => assert!(
                 stderr.contains("fixed_buffers: false"),
                 "boot {index}: the probe was not refused, so it never charged up to the \
                  limit: {stderr}"
             ),
-            Boot::Exited(stderr) => failed.push(format!("boot {index}: {}", reason(&stderr))),
+            // The holders now, while one that failed this boot may still live.
+            Boot::Exited(stderr) => failed.push(format!(
+                "boot {index}: {}; the budget's holders: {}",
+                reason(&stderr),
+                holders(&lock)
+            )),
         }
     }
     assert!(failed.is_empty(), "{} of {BOOTS} boots failed: {failed:#?}", failed.len());

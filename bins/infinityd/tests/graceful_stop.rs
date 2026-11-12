@@ -4,10 +4,14 @@
 //! exit code and the next boot replays every frame.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // harness process, not cell code
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -32,16 +36,9 @@ fn data_root(tag: &str) -> PathBuf {
 }
 
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Server {
@@ -61,10 +58,9 @@ impl Server {
             .expect("addr")
             .port()
             .to_string();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_infinityd"));
-        command.args(["--port", &port, "--cells", cells]);
+        let mut command = NodeBinary::built().command().args(["--port", &port, "--cells", cells]);
         if durable {
-            command.arg("--data-dir").arg(dir).args(["--device-probe", "off"]);
+            command = command.arg("--data-dir").arg(dir).args(["--device-probe", "off"]);
         }
         let child = command
             .args(extra)

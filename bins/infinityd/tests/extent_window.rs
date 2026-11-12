@@ -23,11 +23,15 @@
 // (ADR-0053 D4), so the stall bound is never read. The writers the test
 // parks wait on the extent-seal window, a park with no deadline.
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const CELLS: u16 = 2;
@@ -46,7 +50,7 @@ const DESCRIPTOR_HEADROOM: usize = 24;
 const READ_BACK_DEADLINE: Duration = Duration::from_secs(30);
 
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
 }
@@ -71,7 +75,8 @@ impl Server {
             .expect("addr")
             .port()
             .to_string();
-        let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+        let child = NodeBinary::built()
+            .command()
             .args(["--port", &port, "--cells", &CELLS.to_string()])
             .args(["--accept-handoff", "on", "--device-probe", "off", "--data-dir"])
             .arg(dir)
