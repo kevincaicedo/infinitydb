@@ -86,6 +86,7 @@ impl Fixture {
         let generator = root.join("memtier_benchmark");
         std::fs::write(&generator, include_str!("fixtures/memtier.sh")).unwrap();
         std::fs::set_permissions(generator, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // node-spawn-allow: a Python stand-in named for the engine, which inf-compare runs
         let engine = root.join("infinityd");
         std::fs::write(&engine, include_str!("fixtures/infinityd.py")).unwrap();
         std::fs::set_permissions(engine, std::fs::Permissions::from_mode(0o700)).unwrap();
