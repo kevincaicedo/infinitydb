@@ -23,6 +23,7 @@
 #[path = "support/node.rs"]
 mod node;
 
+use inf_runtime::limits::COLD_DELIVERIES_PER_TURN;
 use node::{Node, NodeBinary};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -40,8 +41,6 @@ const VALUE_LEN: usize = 400;
 const SET_BATCH: usize = 500;
 /// The readers, each sending one `GET` of the next cold key.
 const READERS: usize = 128;
-/// A turn's delivery allowance, `COLD_DELIVERIES_PER_TURN`.
-const DELIVERIES_PER_TURN: u64 = 64;
 /// How long the demotion and the gauges' flush may take: slack by orders of
 /// magnitude over a few MiB written and a few iterations.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -301,7 +300,8 @@ fn a_cold_burst_is_delivered_a_turn_at_a_time() {
         "cold_delivery: {gets} GETs, {enqueued} cold requests, {issued} device reads, {work} \
          member visits, at most {turn_max} in one turn"
     );
-    assert!(turn_max <= DELIVERIES_PER_TURN, "a turn visited {turn_max} members");
+    let allowance = u64::from(COLD_DELIVERIES_PER_TURN);
+    assert!(turn_max <= allowance, "a turn visited {turn_max} members");
     assert!(turn_max > 0, "engagement: no turn delivered");
     assert_eq!(field(&after, "cold_delivery_pending_members"), 0, "every member delivered");
     assert_eq!(field(&after, "cold_receipt_foreign"), 0, "every receipt named its read");
