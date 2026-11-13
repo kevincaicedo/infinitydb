@@ -14,7 +14,7 @@ use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_runtime::{
     AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken,
-    IoClass, IoOp, RawFd, StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier,
+    IoClass, IoOp, RawFd, StableBytes, StableBytesMut, SubmitStats, TokenClass, Wait, WriteBarrier,
     classify_accept_errno,
 };
 use inf_server::SimDisk;
@@ -392,6 +392,10 @@ pub struct ObservedIo {
     pub ops: [u64; IoClass::COUNT],
     pub read_bytes: u64,
     pub read_ops: u64,
+    /// Tier reads the driver completed, a value or an error, counted as it
+    /// hands each completion to the loop: the device's own completion
+    /// marks, which a harness reads between steps against its replies.
+    pub read_completions: u64,
     /// The most tier-class bytes and ops one driver entry carried — what
     /// one MAINTAIN pass submitted for the tier flush, read from the ops'
     /// token class alone (the attainable oracle's disk-side clause).
@@ -1138,6 +1142,8 @@ impl BackendDriver for SimDriver {
         }
 
         let produced = out.len() - before;
+        let reads = out[before..].iter().filter(|c| c.token.class() == TokenClass::TierRead);
+        self.observed.read_completions += reads.count() as u64;
         self.stats = SubmitStats { syscalls: 1, sqes: submitted, cqes: produced as u64 };
         Ok(produced)
     }
