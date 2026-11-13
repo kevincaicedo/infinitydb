@@ -121,6 +121,16 @@ rows=(
   "m4-extent-window --window-leg cold --verify-determinism"
   "m45-backfill"
   "m45-sidecar"
+  # Publishes that cross between cells faster than their owners answer, on
+  # eight credits: two cells publishing to each other's channels, a ring of
+  # three, eight cells each publishing to any other, the two-credit floor;
+  # and the controls, no publish crossing and a window that never fills.
+  "m1-pub-cross"
+  "m1-pub-cross --cells 3 --verify-determinism"
+  "m1-pub-cross --cells 8 --pub-target others --verify-determinism"
+  "m1-pub-cross --fabric-credits 2 --verify-determinism"
+  "m1-pub-cross --pub-target own --verify-determinism"
+  "m1-pub-cross --fabric-credits 256 --verify-determinism"
 )
 
 ran=0

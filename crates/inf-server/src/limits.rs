@@ -286,3 +286,27 @@ pub const BOOT_FILE_OP_CHARGE_BYTES: u64 = 128 << 10;
 /// window, never a spin (ADR-0118 D2), and a queued client waits one more
 /// window for each failed retry.
 pub const ACCEPT_RETRY: Nanos = Nanos::from_millis(100);
+
+/// Data credits the plane keeps free toward each peer for the owner pump's
+/// publish fan (ADR-0192 D2): a general send stages only while more than
+/// this many credits toward its peer are free, so at least one stays free
+/// after it, and a fan leg, one in flight toward each peer, may take it.
+/// Unit: data credits per directed cell pair. Owner: the plane's
+/// `PlaneFabric`. Crossing: a general send with this many or fewer free
+/// gets `NoCredit` and parks for a returned credit, as at the window's end:
+/// the client sees latency, never a refusal.
+pub const FAN_RESERVE_PER_PEER: u32 = 1;
+
+/// Data credits per directed cell pair of the shipped binary's mesh; the
+/// general window is this less [`FAN_RESERVE_PER_PEER`]. Unit: data
+/// credits. Owner: `infinityd`'s mesh constant, built through
+/// `checked_mesh_config`. Crossing: a send past the window parks for a
+/// returned credit.
+pub const FABRIC_CREDITS_PER_PEER: u32 = 1024;
+
+/// Ring slots per directed cell pair of the shipped binary's mesh: a power
+/// of two with reply headroom over [`FABRIC_CREDITS_PER_PEER`]. Unit: ring
+/// slots. Owner: `infinityd`'s mesh constant, built through
+/// `checked_mesh_config`. Crossing: none at run time; a pair the check
+/// refuses fails the build.
+pub const FABRIC_RING_SLOTS_PER_PEER: usize = 4096;

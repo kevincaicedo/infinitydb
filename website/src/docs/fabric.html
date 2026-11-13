@@ -38,14 +38,14 @@ OK
 
 <h2 id="credits">Credits and backpressure</h2>
 <table class="doc-table"><thead><tr><th>Bound</th><th>Default</th><th>When crossed</th></tr></thead><tbody>
-<tr><td>Unanswered data operations toward one peer</td><td>1,024 credits</td><td>the sender waits for a credit to return</td></tr>
+<tr><td>Unanswered data operations toward one peer</td><td>1,024 credits (1,023 for general traffic, one kept for the publish fan)</td><td>the sender waits for a credit to return</td></tr>
 <tr><td>Remote operations in flight per connection, tested before each command</td><td>32</td><td>the pump dispatches no further command until replies arrive; one command then adds one operation per remote key (at most 1,023 under the 1,024-argument cap) or one per other cell it reaches, so at most 31 plus one command's operations are in flight: 1,054 on a node of up to 1,024 cells</td></tr>
 <tr><td>Pending replies per connection</td><td>256</td><td>the pump stops dispatching until replies drain</td></tr>
 <tr><td>Queued commands per connection</td><td>1,024, resume at 64</td><td>the cell stops receiving; TCP pushes back on the client</td></tr>
 <tr><td>Fabric drain per iteration</td><td>about 1,024 messages</td><td>the rest wait for the next iteration</td></tr>
 </tbody></table>
 <p>Pressure travels back to the client instead of into a growing queue. A saturated owner returns credits slowly, the origin's pumps stop dispatching, queued commands reach their cap and the cell disarms the connection's receive. TCP flow control does the rest.</p>
-<p>Replies need no credit, and each ring holds at least twice the credit count, so a reply can always be sent. The drain never blocks and never sends. Together these remove the cycle in which two cells wait on each other, so the fabric cannot deadlock.</p>
+<p>Replies need no credit, and each ring holds at least twice the credit count, so a reply can always be sent. The drain never blocks and never sends. A reply a cell holds back past its drain, such as a publish's receiver count, waits only on its own cell or on messages sent from a credit nothing else can hold: general traffic leaves one credit toward each peer free for the publish fan. Together these remove the cycle in which two cells wait on each other, so the fabric cannot deadlock.</p>
 
 <h2 id="verified">How the ring is checked</h2>
 <p>The ring is the only <code>unsafe</code> code in <code>inf-fabric</code>, and each block is listed with its argument in the crate's <a href="https://github.com/kevincaicedo/infinitydb/blob/main/crates/inf-fabric/SAFETY.md"><code>SAFETY.md</code></a>. Indices use release and acquire ordering only, never <code>SeqCst</code>. Loom model-checks publish, consume, wrap-around, full, empty and the stale-cache path across two threads, and Miri runs the ring's tests under strict provenance. The fabric codec's decoder is total, bounded and fuzzed. If you change <code>inf-fabric</code>, run the model check:</p>

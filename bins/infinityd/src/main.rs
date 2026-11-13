@@ -41,6 +41,16 @@ const DEFAULT_CELLS: inf_foundation::CellCount = match inf_foundation::CellCount
     Err(_) => panic!("four cells is a valid topology"),
 };
 
+/// The shipped fabric mesh: the two `limits` rows, checked when the binary
+/// is built, so a pair the plane's check refuses fails the build.
+const FABRIC_MESH: MeshConfig = match inf_server::checked_mesh_config(
+    inf_server::limits::FABRIC_RING_SLOTS_PER_PEER,
+    inf_server::limits::FABRIC_CREDITS_PER_PEER,
+) {
+    Ok(mesh) => mesh,
+    Err(_) => panic!("the shipped fabric mesh fails the plane's mesh check"),
+};
+
 #[derive(Clone, Debug)]
 struct Args {
     port: u16,
@@ -824,8 +834,7 @@ fn main() {
     // Linux-only (see the cfg block below); on other targets the binding is
     // consumed by `into_iter()` and never needs `mut`.
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut fabrics =
-        Mesh::new(args.cells.get(), MeshConfig { ring_capacity: 4096, data_credits: 1024 });
+    let mut fabrics = Mesh::new(args.cells.get(), FABRIC_MESH);
 
     // Doorbell wakeups (M0-R1, Linux): each cell adopts an eventfd watch;
     // peers wake a parked cell through the park board + LoopWaker. The dev

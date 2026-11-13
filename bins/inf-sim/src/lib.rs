@@ -95,7 +95,7 @@ pub use durable::{
 pub use extent_window::{
     ExtentWindowLeg, ExtentWindowReport, ExtentWindowScenario, run_extent_window_scenario,
 };
-pub use harness::{Scenario, SimReport, run_scenario};
+pub use harness::{PubTarget, Scenario, SimReport, run_scenario};
 pub use nscreate::{NsCreateWindowReport, run_ns_create_window_scenario};
 pub use nsddl::{NsDdlRaceReport, run_ns_ddl_race_scenario};
 pub use nsdrop::{DropCut, NsDropWindowReport, run_ns_drop_window_scenario};
@@ -156,6 +156,7 @@ pub const SCENARIOS: &[ScenarioRow] = &[
     ScenarioRow::single("m4-extent-window").with_leg(Leg::ExtentWindow),
     ScenarioRow::single("m45-backfill"),
     ScenarioRow::single("m45-sidecar"),
+    ScenarioRow::single("m1-pub-cross").with_default_leg(LegValue::PubTarget(PubTarget::Next)),
 ];
 
 /// One registry row: a scenario's name and its two columns.
@@ -252,7 +253,7 @@ impl ScenarioRow {
     }
 }
 
-/// The leg column's kinds: the six legged scenarios' leg flags.
+/// The leg column's kinds: the seven legged scenarios' leg flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leg {
     TierBudget,
@@ -261,17 +262,19 @@ pub enum Leg {
     ExtentWindow,
     Cold,
     Lifetimes,
+    PubTarget,
 }
 
 impl Leg {
     /// Every leg kind, in the order the help text lists their flags.
-    pub const ALL: [Leg; 6] = [
+    pub const ALL: [Leg; 7] = [
         Leg::TierBudget,
         Leg::EpochMarks,
         Leg::ExtentWindow,
         Leg::LedgerWedge,
         Leg::Cold,
         Leg::Lifetimes,
+        Leg::PubTarget,
     ];
 
     /// The leg kind whose flag `flag` is.
@@ -289,6 +292,7 @@ impl Leg {
             Leg::ExtentWindow => ExtentWindowLeg::parse(name).map(LegValue::ExtentWindow),
             Leg::Cold => ColdLeg::parse(name).map(LegValue::Cold),
             Leg::Lifetimes => LifetimesLeg::parse(name).map(LegValue::Lifetimes),
+            Leg::PubTarget => PubTarget::parse(name).map(LegValue::PubTarget),
         };
         value.ok_or_else(|| {
             format!("unknown {} {name}; the legs are {}", self.flag(), self.names().join("|"))
@@ -305,6 +309,7 @@ impl Leg {
             Leg::ExtentWindow => "--window-leg",
             Leg::Cold => "--cold-leg",
             Leg::Lifetimes => "--lifetimes-leg",
+            Leg::PubTarget => "--pub-target",
         }
     }
 
@@ -319,6 +324,7 @@ impl Leg {
             Leg::ExtentWindow => ExtentWindowLeg::ALL.iter().map(|leg| leg.name()).collect(),
             Leg::Cold => ColdLeg::ALL.iter().map(|(_, name)| *name).collect(),
             Leg::Lifetimes => LifetimesLeg::NAMES.to_vec(),
+            Leg::PubTarget => PubTarget::ALL.iter().map(|target| target.name()).collect(),
         }
     }
 }
@@ -333,6 +339,7 @@ pub enum LegValue {
     ExtentWindow(ExtentWindowLeg),
     Cold(ColdLeg),
     Lifetimes(LifetimesLeg),
+    PubTarget(PubTarget),
 }
 
 impl LegValue {
@@ -345,6 +352,7 @@ impl LegValue {
             LegValue::ExtentWindow(_) => Leg::ExtentWindow,
             LegValue::Cold(_) => Leg::Cold,
             LegValue::Lifetimes(_) => Leg::Lifetimes,
+            LegValue::PubTarget(_) => Leg::PubTarget,
         }
     }
 
@@ -357,6 +365,21 @@ impl LegValue {
             | LegValue::EpochMarks(_)
             | LegValue::LedgerWedge(_)
             | LegValue::ExtentWindow(_)
+            | LegValue::Lifetimes(_)
+            | LegValue::PubTarget(_) => None,
+        }
+    }
+
+    /// `m1-pub-cross`'s leg, when this value is one.
+    #[must_use]
+    pub const fn pub_target(self) -> Option<PubTarget> {
+        match self {
+            LegValue::PubTarget(target) => Some(target),
+            LegValue::TierBudget(_)
+            | LegValue::EpochMarks(_)
+            | LegValue::LedgerWedge(_)
+            | LegValue::ExtentWindow(_)
+            | LegValue::Cold(_)
             | LegValue::Lifetimes(_) => None,
         }
     }

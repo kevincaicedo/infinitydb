@@ -29,7 +29,7 @@ use std::rc::Rc;
 
 use inf_alloc::BufferPool;
 use inf_doc::path::compile;
-use inf_fabric::{Mesh, MeshConfig};
+use inf_fabric::Mesh;
 use inf_foundation::bounded::CapRow;
 use inf_foundation::fault::FaultSpec;
 use inf_foundation::rng::{Entropy, SplitMix64};
@@ -2457,7 +2457,7 @@ pub(crate) fn boot(
     .map_err(|refused| std::io::Error::new(std::io::ErrorKind::InvalidData, refused.to_string()))?;
     let inf_server::CkptIssuers { host: ckpt_host, cells: cell_issuers } = issuers;
     let mut cell_issuers = cell_issuers.into_iter();
-    let fabrics = Mesh::new(scenario.cells, MeshConfig { ring_capacity: 1024, data_credits: 256 });
+    let fabrics = Mesh::new(scenario.cells, crate::harness::FROZEN_MESH);
     let mut nets = Vec::new();
     let mut cells = Vec::new();
     for (i, fabric) in fabrics.into_iter().enumerate() {

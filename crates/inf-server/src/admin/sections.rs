@@ -473,6 +473,9 @@ fn tripwires_section(
     push(text, &format!("expiry_alias_over:{}", stats.expiry_alias_over));
     push(text, &format!("sweep_passes_voided:{}", stats.sweep_passes_voided));
     push(text, &format!("pubsub_fan_msgs:{}", node.pubsub_fan_msgs.get()));
+    // Derived never: a fan leg that found no reserved credit (cell scope).
+    let refused = node.fabric_reserve_refused_cell.get();
+    push(text, &format!("fabric_reserve_refused_cell:{refused}"));
     push(text, &format!("pubsub_delivered:{}", node.pubsub_delivered.get()));
     push(text, &format!("pubsub_state_bytes:{}", node.pubsub_state_bytes.get()));
     push(text, &format!("{}:{}", tw::WIRE_BUFFERS_BYTES, node.wire_buffers_bytes.get()));
