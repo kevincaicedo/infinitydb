@@ -310,6 +310,12 @@ impl ColdTurn {
     }
 }
 
+// What a turn holds is what every iteration of every cell stores into its loop context: two
+// budgets of two `u32` each, 16 bytes, and nothing to drop, so beginning a turn is four stores
+// and ending it none (ADR-0181 R2).
+const _: () = assert!(size_of::<ColdTurn>() == 16, "a turn is two budgets of two u32 each");
+const _: () = assert!(!core::mem::needs_drop::<ColdTurn>(), "a turn holds nothing to drop");
+
 /// One turn's member visits (ADR-0181 R1): [`COLD_DELIVERIES_PER_TURN`] at
 /// [`ColdTurn::begin`], one spent before each member a delivery step
 /// visits. Its fields are private, so no struct literal outside this module
