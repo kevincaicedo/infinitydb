@@ -76,6 +76,11 @@
 //! - liveness: each leg's `-plus-one` variant reads the leg + 1.00, ± 0.05:
 //!   one `nop` per op at the top of the driving loop's body, outside the
 //!   measured step;
+//! - the hook's row's verdict plant: `reactor-iteration-server-hook-plus-four`
+//!   to `-plus-ten`, B of the row with four to ten `nop`s an iteration, the
+//!   same way. A run reads the one its reading names, `p` = max(4, 11 − the
+//!   reading rounded to a whole count), and it must read a loss: above 10
+//!   over A;
 //! - engagement: after its loop each leg asserts what its ops did (requests
 //!   purged, reads issued and delivered, background left queued), so a leg
 //!   that did nothing reads red.
@@ -163,7 +168,7 @@ enum ReactorPlane {
 }
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 68] = [
+const LEGS: [(&str, Leg, u8); 75] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -194,6 +199,13 @@ const LEGS: [(&str, Leg, u8); 68] = [
     ("reactor-iteration-server-hook-plus-one", Leg::Reactor(ReactorPlane::ServerHook), 1),
     ("reactor-iteration-server-late", Leg::Reactor(ReactorPlane::ServerLate), 0),
     ("reactor-iteration-server-late-plus-one", Leg::Reactor(ReactorPlane::ServerLate), 1),
+    ("reactor-iteration-server-hook-plus-four", Leg::Reactor(ReactorPlane::ServerHook), 4),
+    ("reactor-iteration-server-hook-plus-five", Leg::Reactor(ReactorPlane::ServerHook), 5),
+    ("reactor-iteration-server-hook-plus-six", Leg::Reactor(ReactorPlane::ServerHook), 6),
+    ("reactor-iteration-server-hook-plus-seven", Leg::Reactor(ReactorPlane::ServerHook), 7),
+    ("reactor-iteration-server-hook-plus-eight", Leg::Reactor(ReactorPlane::ServerHook), 8),
+    ("reactor-iteration-server-hook-plus-nine", Leg::Reactor(ReactorPlane::ServerHook), 9),
+    ("reactor-iteration-server-hook-plus-ten", Leg::Reactor(ReactorPlane::ServerHook), 10),
     ("harness", Leg::Rate(RateLeg::Harness), 0),
     ("harness-plus-one", Leg::Rate(RateLeg::Harness), 1),
     ("map-get-0", Leg::Rate(RateLeg::MapGet { depth: 0 }), 0),
@@ -674,6 +686,23 @@ fn drive_reactor<const NOPS: u8>(plane: ReactorPlane, ops: u64) -> u64 {
     }
 }
 
+/// Drives a reactor leg with its plant: none, the liveness `nop`, or the
+/// hook's row's verdict plant of four to ten.
+fn drive_reactor_planted(plane: ReactorPlane, nops: u8, ops: u64) -> u64 {
+    match nops {
+        0 => drive_reactor::<0>(plane, ops),
+        1 => drive_reactor::<1>(plane, ops),
+        4 => drive_reactor::<4>(plane, ops),
+        5 => drive_reactor::<5>(plane, ops),
+        6 => drive_reactor::<6>(plane, ops),
+        7 => drive_reactor::<7>(plane, ops),
+        8 => drive_reactor::<8>(plane, ops),
+        9 => drive_reactor::<9>(plane, ops),
+        10 => drive_reactor::<10>(plane, ops),
+        other => panic!("no reactor leg plants {other} nops"),
+    }
+}
+
 fn main() -> ExitCode {
     let args = match parse() {
         Ok(args) => args,
@@ -683,8 +712,7 @@ fn main() -> ExitCode {
         }
     };
     let result = match (args.leg, args.nops) {
-        (Leg::Reactor(plane), 0) => drive_reactor::<0>(plane, args.ops),
-        (Leg::Reactor(plane), _) => drive_reactor::<1>(plane, args.ops),
+        (Leg::Reactor(plane), nops) => drive_reactor_planted(plane, nops, args.ops),
         (Leg::Rate(leg), 0) => rates::drive::<0>(leg, args.ops),
         (Leg::Rate(leg), _) => rates::drive::<1>(leg, args.ops),
         (leg, 0) => drive_host::<0>(leg, args.ops),
