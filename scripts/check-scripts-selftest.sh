@@ -21,9 +21,9 @@
 # <name>` runs one). A group's body is not indented: its heredocs and
 # multi-line strings are fixture bytes. INF_SELFTEST_CASE_LOG=<an empty
 # directory> writes one record a case (the lib's header says what it holds).
-# A group stays under 20 s as the driver runs it: the longest group is the
-# line's floor, so a longer one is cut, each part building its own fixtures;
-# the OK line names the longest group with its seconds on every run.
+# A group the driver runs for more than 20 s is cut, each part building its
+# own fixtures: the longest group is the line's floor. The OK line names the
+# longest group with its seconds on every run, which is where a cut shows.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR/.."
@@ -102,12 +102,14 @@ drv_fixture() {
     chmod +x "$file"
     echo "$file"
 }
-drv_run() { env -u INF_SELFTEST_CASE_LOG CARGO_BUILD_JOBS=2 "$@"; }
+# A fixture's driver runs outside any job pool, so its width is the one planted.
+drv_run() { env -u INF_SELFTEST_CASE_LOG -u CARGO_MAKEFLAGS CARGO_BUILD_JOBS=2 "$@"; }
 f=$(drv_fixture control 'group_one() {' 'expect green "one passes" true' '}' \
     'group_two() {' 'expect red "two passes" false' '}')
+drv_ok_re='check-scripts self-test OK (2 cases in 2 groups; the longest group:'
+drv_ok_re="$drv_ok_re [a-z]*, [0-9]*\.[0-9] s;"
 expect_output "driver: the control's OK line names its groups and counts" \
-    "check-scripts self-test OK (2 cases in 2 groups, each exiting non-zero on its planted case: one, two)" \
-    drv_run "$f"
+    "$drv_ok_re each exiting non-zero on its planted case: one, two)\$" drv_run "$f"
 expect_output "driver: --group runs one group and prints its count line" "group two: 1 0" \
     drv_run "$f" --group two
 expect_red_because "driver: --group refuses a name no definition line holds" "no group 'three'" \
@@ -259,7 +261,8 @@ f=$(drv_fixture overlap \
 mkdir -p "$work/drv-sync" "$work/drv-log"
 expect_output "driver: two groups at once each see only their own fixture" \
     "check-scripts self-test OK (4 cases in 2 groups" \
-    env DRV_SYNC="$work/drv-sync" INF_SELFTEST_CASE_LOG="$work/drv-log" CARGO_BUILD_JOBS=2 "$f"
+    env -u CARGO_MAKEFLAGS DRV_SYNC="$work/drv-sync" INF_SELFTEST_CASE_LOG="$work/drv-log" \
+    CARGO_BUILD_JOBS=2 "$f"
 drv_own_log() { # each group's records hold its own labels only
     [ "$(cat "$work/drv-log/one/"* | grep -c '^label	one ')" -eq 2 ] &&
         [ "$(cat "$work/drv-log/two/"* | grep -c '^label	two ')" -eq 2 ] &&
@@ -286,18 +289,19 @@ drv_pair() { # <name> <one's end> <two's end>: two green groups, each clock 100,
         'selftest_clock() { if [ $((pass + fail)) -eq 0 ]; then echo 100;' \
         "else case \$SELFTEST_GROUP in one) echo $2 ;; *) echo $3 ;; esac; fi; }"
 }
-drv_ok='check-scripts self-test OK (2 cases in 2 groups, each exiting non-zero on its planted case:'
+drv_ok='check-scripts self-test OK (2 cases in 2 groups; the longest group:'
+drv_groups='each exiting non-zero on its planted case: one, two)'
 # The longest group is the last read in one fixture and the first in the other,
 # so a driver that names the last group, or the first, is red on one of them.
 f=$(drv_pair clocked 105 130)
 expect green "driver: the OK line, alone, names the longest group with its seconds" drv_only "$f" \
-    "$drv_ok one, two); the longest group: two, 3.0 s"
+    "$drv_ok two, 3.0 s; $drv_groups"
 f=$(drv_pair clocked-first 130 105)
 expect green "driver: the longest group is named when it is the first read" drv_only "$f" \
-    "$drv_ok one, two); the longest group: one, 3.0 s"
+    "$drv_ok one, 3.0 s; $drv_groups"
 f=$(drv_clocked instant 100 100)
 expect_output "driver: a group of no measurable time is still named, at 0.0 s" \
-    "; the longest group: one, 0\.0 s\$" drv_run "$f"
+    "; the longest group: one, 0\.0 s;" drv_run "$f"
 drv_tenths() { # the lib's clock: tenths of the monotonic seconds read between two of its reads
     local before seconds after
     before=$(selftest_clock)
@@ -331,6 +335,18 @@ expect_red_because "driver: an end stamp that is no whole number is red, named" 
 f=$(drv_clocked backwards 105 100)
 expect_red_because "driver: a clock that runs backwards is red, named" \
     "$drv_clock_red group one clock: 105 100" drv_run "$f"
+f=$(drv_clocked signed 100 +105)
+expect_red_because "driver: a signed end stamp is red, named" \
+    "$drv_clock_red group one clock: 100 +105" drv_run "$f"
+# A clock line of one stamp: the group's count is green, so its clock line
+# alone makes it red, and the tally counts that group once.
+f=$(drv_fixture onestamp 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 0"' \
+    'echo "group one clock: 100"' 'exit 0' '}')
+expect_red_because "driver: a clock line of one stamp is red, named" \
+    "$drv_clock_red group one clock: 100\$" drv_run "$f"
+expect_red_because "driver: a group red by its clock line alone is one red group, no failed case" \
+    "check-scripts self-test FAILED: 0 of 1 cases failed; 1 of 1 groups red; 0 driver error(s)" \
+    drv_run "$f"
 # The driver's sort, uniq and comm run under LC_ALL=C: stand-ins that answer
 # `collation_differs` under any other locale setting would turn its control red.
 mkdir -p "$work/drv-collate"
@@ -357,6 +373,371 @@ f=$(drv_fixture collate 'group_one() {' 'expect green "one passes" true' '}' \
     'group_two() {' 'expect green "two passes" true' '}')
 expect_output "driver: sort, uniq and comm read one collation whatever the caller's locale" \
     "check-scripts self-test OK (2 cases in 2 groups" drv_collated "$f"
+# The width and the job pool. Each of three groups notes how many groups hold a
+# slot when it starts and when it ends, in $DRV_LIVE/peaks; with DRV_MEET set it
+# first waits, at most 5 s, until that many hold one. Outside a pool at most
+# CARGO_BUILD_JOBS run at once; under a pool of k free tokens at most k + 1,
+# each group beyond the first holding a token, and every token comes back.
+f=$(drv_fixture held \
+    'drv_live() { ls "$DRV_LIVE" | grep -c "^on\\." >>"$DRV_LIVE/peaks"; }' \
+    'drv_hold() { : >"$DRV_LIVE/on.$$"; drv_live; n=0' \
+    '    while [ "$(ls "$DRV_LIVE" | grep -c "^on\\.")" -lt "${DRV_MEET:-0}" ] &&' \
+    '        [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done' \
+    '    sleep 0.3; drv_live; rm -f "$DRV_LIVE/on.$$"; }' \
+    'group_one() {' 'expect green "one holds a slot" drv_hold' '}' \
+    'group_two() {' 'expect green "two holds a slot" drv_hold' '}' \
+    'group_three() {' 'expect green "three holds a slot" drv_hold' '}')
+drv_peak() { # <peaks file> <most> [<least>]: every count is a number, the largest within bounds
+    awk -v most="$2" -v least="${3:-0}" '
+        !/^(0|[1-9][0-9]*)$/ { bad = 1 }
+        $0 + 0 > peak { peak = $0 + 0 }
+        END {
+            print "counts " NR ", peak " peak
+            exit !(!bad && NR > 0 && peak <= most && peak >= least)
+        }' "$1"
+}
+drv_wide() { # <live dir> <jobs> [<meet>]: the fixture outside any pool
+    env -u INF_SELFTEST_CASE_LOG -u CARGO_MAKEFLAGS DRV_LIVE="$1" DRV_MEET="${3:-0}" \
+        CARGO_BUILD_JOBS="$2" "$f"
+}
+# drv_pooled <pool FIFO> <tokens> <live dir>: the fixture at CARGO_BUILD_JOBS=3
+# under a pool holding that many tokens; red unless every token came back.
+drv_pooled() (
+    exec 9<>"$1"
+    i=0
+    while [ "$i" -lt "$2" ]; do
+        printf + >&9
+        i=$((i + 1))
+    done
+    env -u INF_SELFTEST_CASE_LOG CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:$1" DRV_LIVE="$3" \
+        CARGO_BUILD_JOBS=3 "$f" 9>&- || exit 1
+    left=$(python3 -I -S -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK)
+try:
+    print(len(os.read(fd, 4096)))
+except BlockingIOError:
+    print(0)' "$1")
+    echo "tokens back: $left of $2"
+    [ "$left" = "$2" ]
+)
+mkdir -p "$work/drv-meet" "$work/drv-wide" "$work/drv-pool1" "$work/drv-pool0" "$work/drv-gone"
+expect_output "driver: three groups that meet run at once at CARGO_BUILD_JOBS=3" \
+    "check-scripts self-test OK (3 cases in 3 groups" drv_wide "$work/drv-meet" 3 3
+expect red "driver: the count of groups at once reads past 2 when three run (canary)" \
+    drv_peak "$work/drv-meet/peaks" 2
+expect_output "driver: three groups run green at CARGO_BUILD_JOBS=2" \
+    "check-scripts self-test OK (3 cases in 3 groups" drv_wide "$work/drv-wide" 2
+expect green "driver: at CARGO_BUILD_JOBS=2 at most two groups run at once" \
+    drv_peak "$work/drv-wide/peaks" 2
+mkfifo "$work/drv-pool1/p" "$work/drv-pool0/p"
+expect_output "driver: under a pool of one free token the groups run green, every token back" \
+    "tokens back: 1 of 1" drv_pooled "$work/drv-pool1/p" 1 "$work/drv-pool1"
+expect green "driver: under a pool of one free token at most two groups run at once" \
+    drv_peak "$work/drv-pool1/peaks" 2
+expect_output "driver: under a pool with no free token every group runs, one at a time, and ends" \
+    "tokens back: 0 of 0" drv_pooled "$work/drv-pool0/p" 0 "$work/drv-pool0"
+expect green "driver: under a pool with no free token one group runs at a time" \
+    drv_peak "$work/drv-pool0/peaks" 1 1
+expect_red_because "driver: a pool that is no fifo: path is refused" \
+    "selftest: CARGO_MAKEFLAGS names a pool the driver cannot open: '3,4'" \
+    env -u INF_SELFTEST_CASE_LOG CARGO_MAKEFLAGS='-j --jobserver-auth=3,4' "$f"
+expect_red_because "driver: a pool whose FIFO is gone is refused" \
+    "a pool the driver cannot open: 'fifo:$work/drv-gone/p'" \
+    env -u INF_SELFTEST_CASE_LOG CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:$work/drv-gone/p" "$f"
+}
+
+group_stage() {
+# scripts/check-stage.sh on fixture gates, each case in a scripts directory of
+# its own beside a copy of the stage and its take. Every run unsets the job
+# pool the self-test may inherit, so its width is the one planted, unless the
+# case plants a pool of its own.
+stg_dir() { # <name>: a scripts directory holding the stage and its take
+    local dir="$work/stg-$1/scripts"
+    mkdir -p "$dir"
+    cp "$SCRIPT_DIR/check-stage.sh" "$SCRIPT_DIR/job_token.py" "$dir/"
+    echo "$dir"
+}
+stg_gate() { # <dir> <name> <line…>: the executable gate check-<name>.sh holding those lines
+    local file="$1/check-$2.sh"
+    shift 2
+    printf '%s\n' '#!/usr/bin/env bash' "$@" >"$file"
+    chmod +x "$file"
+}
+stg_long() { # <dir> <name> <lines>: a green gate printing that many lines, then that it ran
+    stg_gate "$1" "$2" "for i in \$(seq 1 $3); do echo \"$2 line \$i\"; done" "echo \"gate $2 ran\""
+}
+# A gate holding a slot notes how many hold one when it starts and when it
+# ends, in $STG_LIVE/peaks (a cargo-like client: each of its jobs does); with
+# STG_MEET set it first waits, at most 5 s, until that many hold one.
+stg_holder='stg_live() { ls "$STG_LIVE" | grep -c "^on\." >>"$STG_LIVE/peaks"; }
+stg_hold() {
+    : >"$STG_LIVE/on.$1"
+    stg_live
+    n=0
+    while [ "$(ls "$STG_LIVE" | grep -c "^on\.")" -lt "${STG_MEET:-0}" ] && [ "$n" -lt 50 ]; do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    sleep 0.3
+    stg_live
+    rm -f "$STG_LIVE/on.$1"
+}'
+stg_hold_gate() { # <dir> <name>: a gate that holds one slot
+    stg_gate "$1" "$2" "$stg_holder" "stg_hold $2.\$\$" "echo \"gate $2 ran\""
+}
+# A cargo-like client of three jobs: under the pool CARGO_MAKEFLAGS names the
+# first runs on its own token and each other on a token it takes and gives
+# back; with STG_CHEAT set it ignores the pool, as a cargo with a pool of its
+# own would.
+stg_client() { # <dir> <name>
+    stg_gate "$1" "$2" "$stg_holder" 'fifo=' \
+        'for w in ${CARGO_MAKEFLAGS:-}; do' \
+        '    case $w in --jobserver-auth=fifo:*) fifo=${w#*fifo:} ;; esac' 'done' \
+        '[ -z "${STG_CHEAT:-}" ] || fifo=' \
+        "stg_hold $2.1.\$\$ &" \
+        'for j in 2 3; do' \
+        '    if [ -z "$fifo" ]; then' \
+        "        stg_hold $2.\$j.\$\$ &" \
+        '        continue' \
+        '    fi' \
+        '    t=$(python3 -I -S "$(dirname "$0")/job_token.py" take "$fifo") || exit 1' \
+        "    (stg_hold $2.\$j.\$\$; printf \"\\\\\$(printf %03o \"\${t#* }\")\" >\"\$fifo\") &" \
+        'done' 'wait' "echo \"gate $2 ran\""
+}
+stg_run() { # <dir> <jobs> <gate…>: the stage there, outside any pool
+    local dir=$1 jobs=$2
+    shift 2
+    (cd "$dir/.." && env -u CARGO_MAKEFLAGS -u INF_CHECK_STAGE CARGO_BUILD_JOBS="$jobs" \
+        ./scripts/check-stage.sh "$@")
+}
+stg_serial() { # <dir> <gate…>: the stage there, one gate at a time
+    local dir=$1
+    shift
+    (cd "$dir/.." && env -u CARGO_MAKEFLAGS INF_CHECK_STAGE=serial ./scripts/check-stage.sh "$@")
+}
+stg_peak() { # <peaks file> <most> [<least>]: every count is a number, the largest within bounds
+    awk -v most="$2" -v least="${3:-0}" '
+        !/^(0|[1-9][0-9]*)$/ { bad = 1 }
+        $0 + 0 > peak { peak = $0 + 0 }
+        END {
+            print "counts " NR ", peak " peak
+            exit !(!bad && NR > 0 && peak <= most && peak >= least)
+        }' "$1"
+}
+# A gate red at place 3 of 4, its file:line at the end of 62 lines, with long
+# green outputs before and after it (the fourth starts beside it): the stage is
+# red, every started gate ends, the red output is printed after the green ones,
+# and the last 40 lines hold its header, its file:line and its name.
+d=$(stg_dir red3)
+stg_long "$d" a 60
+stg_long "$d" b 60
+stg_gate "$d" c 'n=0' \
+    'while [ ! -e "$STG_MARK" ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done' \
+    'for i in $(seq 1 60); do echo "c line $i"; done' \
+    'echo "crates/fake/src/lib.rs:12: a planted violation"' 'echo "check-c FAILED"' 'exit 1'
+stg_gate "$d" d ': >"$STG_MARK"' 'for i in $(seq 1 60); do echo "d line $i"; done' \
+    'echo "gate d ran"'
+export STG_MARK="$work/stg-red3/mark"
+expect red "stage: a gate red at place 3 of 4 turns the stage red" \
+    stg_run "$d" 2 check-a.sh check-b.sh check-c.sh check-d.sh
+cp "$work/log" "$work/stg-red3/out"
+tail -n 40 "$work/stg-red3/out" >"$work/stg-red3/tail"
+expect green "stage: the last 40 lines hold the red gate's closing header" \
+    grep -q '^--- check-c.sh: exit 1, [0-9]*\.[0-9] s, its last 11 lines$' "$work/stg-red3/tail"
+expect green "stage: the last 40 lines hold the red gate's file:line" \
+    grep -qx 'crates/fake/src/lib.rs:12: a planted violation' "$work/stg-red3/tail"
+expect green "stage: the last 40 lines name the red gate" \
+    grep -qx 'check-stage FAILED: 1 of 4 red, 0 not started: check-c.sh' "$work/stg-red3/tail"
+expect green "stage: the gate started beside the red one ran to its end" \
+    grep -qx 'gate d ran' "$work/stg-red3/out"
+stg_after() { # <file> <first> <then>: a line <then> follows the line <first>
+    awk -v a="$2" -v b="$3" '$0 == a { at = NR } $0 == b && at { found = 1 }
+        END { exit !found }' "$1"
+}
+expect green "stage: the red gate's output is printed after every green one's" \
+    stg_after "$work/stg-red3/out" 'gate d ran' 'c line 1'
+# Four gates red at once, one green: each red one is printed after the green
+# one and named; the closing block shows the first three, the fourth's output
+# whole above it.
+d=$(stg_dir red4)
+stg_long "$d" g 20
+for stg_r in r1 r2 r3 r4; do
+    stg_gate "$d" "$stg_r" ": >\"\$STG_REDS/$stg_r\"" \
+        'n=0' 'while [ "$(ls "$STG_REDS" | wc -l)" -lt 4 ] && [ "$n" -lt 50 ]; do' \
+        '    sleep 0.1; n=$((n + 1))' 'done' \
+        "for i in \$(seq 1 15); do echo \"$stg_r line \$i\"; done" \
+        "echo \"$stg_r: planted at $stg_r.rs:1\"" 'exit 1'
+done
+mkdir -p "$work/stg-red4/reds"
+export STG_REDS="$work/stg-red4/reds"
+expect red "stage: four gates red at once turn the stage red" \
+    stg_run "$d" 4 check-g.sh check-r1.sh check-r2.sh check-r3.sh check-r4.sh
+cp "$work/log" "$work/stg-red4/out"
+stg_red4='check-stage FAILED: 4 of 5 red, 0 not started:'
+expect green "stage: the naming line names all four red gates" grep -qx \
+    "$stg_red4 check-r1.sh check-r2.sh check-r3.sh check-r4.sh" "$work/stg-red4/out"
+stg_block() { # <file>: three red gates in the closing block, the fourth's output above it
+    [ "$(grep -c ', its last 11 lines$' "$1")" -eq 3 ] &&
+        ! grep -q '^--- check-r4.sh: .*, its last 11 lines$' "$1" &&
+        awk '/^r4 line 1$/ && !r4 { r4 = NR } / its last 11 lines$/ && !block { block = NR }
+            END { exit !(r4 && block && r4 < block) }' "$1"
+}
+expect green "stage: the closing block shows the first three red gates, the fourth's output above" \
+    stg_block "$work/stg-red4/out"
+expect green "stage: every red gate's output is printed after the green one's" \
+    stg_after "$work/stg-red4/out" 'gate g ran' 'r1 line 1'
+expect green "stage: the closing block fits the 40 lines a red line keeps" \
+    awk '/ its last 11 lines$/ && !start { start = NR }
+        /^check-stage FAILED: / { exit !(start && NR - start < 40) }' "$work/stg-red4/out"
+# Two gates that each wait for the other's file: green at once, red one at a time.
+d=$(stg_dir meet)
+for stg_r in p q; do
+    stg_gate "$d" "$stg_r" ": >\"\$STG_MEET/$stg_r\"" \
+        'n=0' 'while [ "$(ls "$STG_MEET" | wc -l)" -lt 2 ] && [ "$n" -lt 30 ]; do' \
+        '    sleep 0.1; n=$((n + 1))' 'done' \
+        '[ "$(ls "$STG_MEET" | wc -l)" -eq 2 ] || exit 1' "echo \"gate $stg_r met\""
+done
+mkdir -p "$work/stg-meet/at-once" "$work/stg-meet/serial"
+STG_MEET="$work/stg-meet/at-once" expect green \
+    "stage: two gates that wait for each other run at once" stg_run "$d" 2 check-p.sh check-q.sh
+STG_MEET="$work/stg-meet/serial" expect_red_because \
+    "stage: the same two gates are red one at a time (INF_CHECK_STAGE=serial)" \
+    'check-stage FAILED: 1 of 2 red, 1 not started: check-p.sh' \
+    stg_serial "$d" check-p.sh check-q.sh
+# The job pool: two cargo-like clients of three jobs each, at CARGO_BUILD_JOBS=3.
+d=$(stg_dir pool)
+stg_client "$d" ca
+stg_client "$d" cb
+mkdir -p "$work/stg-pool/own" "$work/stg-pool/given" "$work/stg-pool/cheat" "$work/stg-pool/fifo"
+STG_LIVE="$work/stg-pool/own" expect_output "stage: two clients run green under the pool it makes" \
+    "check-stage: 2 of 2 gates green in .* at once on 3 jobs (a pool of its own, 2 tokens)" \
+    stg_run "$d" 3 check-ca.sh check-cb.sh
+expect green "stage: under its own pool at most three jobs hold a slot at once" \
+    stg_peak "$work/stg-pool/own/peaks" 3
+STG_CHEAT=1 STG_MEET=6 STG_LIVE="$work/stg-pool/cheat" expect green \
+    "stage: clients that ignore the pool run green" stg_run "$d" 3 check-ca.sh check-cb.sh
+expect red "stage: the count of jobs at once reads past three when clients ignore the pool" \
+    stg_peak "$work/stg-pool/cheat/peaks" 3
+mkfifo "$work/stg-pool/fifo/p"
+# stg_given: the stage at CARGO_BUILD_JOBS=3 under a pool of two tokens; red
+# unless both came back.
+stg_given() (
+    exec 9<>"$work/stg-pool/fifo/p"
+    printf ++ >&9
+    (cd "$d/.." && env -u INF_CHECK_STAGE CARGO_BUILD_JOBS=3 STG_LIVE="$work/stg-pool/given" \
+        CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:$work/stg-pool/fifo/p" \
+        ./scripts/check-stage.sh check-ca.sh check-cb.sh 9>&-) || exit 1
+    left=$(python3 -I -S -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK)
+try:
+    print(len(os.read(fd, 4096)))
+except BlockingIOError:
+    print(0)' "$work/stg-pool/fifo/p")
+    echo "tokens back: $left of 2"
+    [ "$left" = 2 ]
+)
+expect_output "stage: under the pool CARGO_MAKEFLAGS names it makes none, every token back" \
+    "tokens back: 2 of 2" stg_given
+cp "$work/log" "$work/stg-pool/given.out"
+expect green "stage: under the pool CARGO_MAKEFLAGS names it says so" \
+    grep -q "at once on 3 jobs (the pool CARGO_MAKEFLAGS names)" "$work/stg-pool/given.out"
+expect green "stage: under a pool of two free tokens at most three jobs hold a slot at once" \
+    stg_peak "$work/stg-pool/given/peaks" 3
+# One token: every gate runs, one at a time, and the stage ends; a stage inside
+# a stage draws the outer stage's pool and makes none.
+d=$(stg_dir one)
+stg_hold_gate "$d" h1
+stg_hold_gate "$d" h2
+stg_hold_gate "$d" h3
+stg_gate "$d" inner 'exec "$(dirname "$0")/check-stage.sh" check-h1.sh check-h2.sh'
+mkdir -p "$work/stg-one/one" "$work/stg-one/nested"
+STG_LIVE="$work/stg-one/one" expect_output \
+    "stage: at one token every gate runs and the stage ends" \
+    "check-stage: 3 of 3 gates green in .* at once on 1 jobs (a pool of its own, 0 tokens)" \
+    stg_run "$d" 1 check-h1.sh check-h2.sh check-h3.sh
+expect green "stage: at one token one gate runs at a time" stg_peak "$work/stg-one/one/peaks" 1 1
+STG_LIVE="$work/stg-one/nested" expect_output "stage: a stage inside a stage draws the outer pool" \
+    "check-stage: 2 of 2 gates green in .* (the pool CARGO_MAKEFLAGS names)" \
+    stg_run "$d" 2 check-inner.sh check-h3.sh
+expect green "stage: a stage inside a stage keeps the outer width" \
+    stg_peak "$work/stg-one/nested/peaks" 2
+# A gate whose child keeps its output file open: a file, not a pipe, so the
+# stage ends with its gates (the bound is a hang bound, not the verdict's).
+d=$(stg_dir child)
+stg_gate "$d" held 'sleep 30 &' 'echo $! >"$STG_CHILD"' 'echo "gate held ran"'
+stg_child() {
+    local began=$SECONDS status=0
+    STG_CHILD="$work/stg-child/pid" stg_run "$d" 2 check-held.sh || status=$?
+    kill "$(cat "$work/stg-child/pid")" 2>/dev/null || :
+    [ "$status" -eq 0 ] && [ $((SECONDS - began)) -lt 20 ]
+}
+expect green "stage: a gate's child that keeps its output open does not hold the stage" stg_child
+# The control: one gate at a time prints what at once prints, but for seconds
+# and its own last line.
+d=$(stg_dir same)
+stg_long "$d" a 30
+stg_long "$d" b 30
+stg_long "$d" c 30
+stg_norm() { # <file>: the output, seconds and the stage's own lines taken out
+    sed -e 's/^\(--- .*: exit [0-9]*\), [0-9]*\.[0-9] s$/\1/' -e '/^check-stage: /d' "$1"
+}
+for stg_r in a b c; do
+    echo "--- check-$stg_r.sh: exit 0"
+    seq 1 30 | sed "s/^/$stg_r line /"
+    echo "gate $stg_r ran"
+done >"$work/stg-same/expected"
+expect_output "stage: three gates run green at once" "check-stage: 3 of 3 gates green in " \
+    stg_run "$d" 3 check-a.sh check-b.sh check-c.sh
+stg_norm "$work/log" >"$work/stg-same/at-once"
+expect green "stage: at once prints every gate's whole output under its header, in argument order" \
+    cmp "$work/stg-same/expected" "$work/stg-same/at-once"
+expect_output "stage: the same three run green one at a time" \
+    "check-stage: 3 of 3 gates green in " \
+    stg_serial "$d" check-a.sh check-b.sh check-c.sh
+stg_norm "$work/log" >"$work/stg-same/serial"
+expect green "stage: one gate at a time prints what at once prints, but for seconds" \
+    cmp "$work/stg-same/at-once" "$work/stg-same/serial"
+# Refused, nothing run: each refusal names its cause and the marker gate never runs.
+d=$(stg_dir refused)
+stg_gate "$d" mark ': >"$STG_RAN"'
+stg_gate "$d" noexec 'true'
+chmod -x "$d/check-noexec.sh"
+export STG_RAN="$work/stg-refused/ran"
+expect_red_because "stage: no gate named is refused" 'usage: check-stage.sh' stg_run "$d" 2
+expect_red_because "stage: a name with no file is refused" \
+    "'check-gone.sh' is no executable file in ./scripts; nothing ran" \
+    stg_run "$d" 2 check-mark.sh check-gone.sh
+expect_red_because "stage: a file that is not executable is refused" \
+    "'check-noexec.sh' is no executable file" stg_run "$d" 2 check-mark.sh check-noexec.sh
+expect_red_because "stage: a name that is no check-*.sh file is refused" \
+    "'job_token.py' is no check-\*.sh file name; nothing ran" \
+    stg_run "$d" 2 check-mark.sh job_token.py
+expect_red_because "stage: a path is no gate name" \
+    "'../scripts/check-mark.sh' is no check-\*.sh file name" stg_run "$d" 2 ../scripts/check-mark.sh
+expect_red_because "stage: a gate named twice is refused" \
+    "'check-mark.sh' is named twice; nothing ran" stg_run "$d" 2 check-mark.sh check-mark.sh
+expect_red_because "stage: CARGO_BUILD_JOBS=0 is refused" \
+    "CARGO_BUILD_JOBS '0' is not a positive integer" stg_run "$d" 0 check-mark.sh
+expect_red_because "stage: CARGO_BUILD_JOBS over the bound is refused" \
+    "CARGO_BUILD_JOBS 1025 is over 1024" stg_run "$d" 1025 check-mark.sh
+stg_mode() {
+    (cd "$d/.." && env -u CARGO_MAKEFLAGS INF_CHECK_STAGE=parallel ./scripts/check-stage.sh "$@")
+}
+expect_red_because "stage: an INF_CHECK_STAGE other than serial is refused" \
+    "INF_CHECK_STAGE 'parallel' is neither unset nor serial" stg_mode check-mark.sh
+stg_pool() { # <CARGO_MAKEFLAGS> <gate…>
+    local flags=$1
+    shift
+    (cd "$d/.." && env -u INF_CHECK_STAGE CARGO_MAKEFLAGS="$flags" ./scripts/check-stage.sh "$@")
+}
+expect_red_because "stage: a pool that is no fifo: path is refused" \
+    "a pool this stage cannot open: '3,4' is no fifo: path" \
+    stg_pool '-j --jobserver-auth=3,4' check-mark.sh
+expect_red_because "stage: a pool whose FIFO is gone is refused" "which is no FIFO; nothing ran" \
+    stg_pool "-j --jobserver-auth=fifo:$work/stg-refused/gone" check-mark.sh
+expect red "stage: no refused run ran a gate" test -e "$STG_RAN"
+expect green "stage: CARGO_BUILD_JOBS at the bound runs (control)" stg_run "$d" 1024 check-mark.sh
+expect green "stage: the control ran its gate" test -e "$STG_RAN"
 }
 
 # The gates' crate set (scripts/cell-crates.sh) names exclusions that must
@@ -4919,7 +5300,7 @@ expect_red_because "lint-scopes: containers — a committed raise is red against
 }
 
 # Each probe case is a cold clippy build of about 3 s, so the probe's cases sit
-# in groups of at most four: a group stays under the 20 s bound above.
+# in groups of at most four, by the cut rule above.
 group_lint_scopes_probe() {
 ls_setup
 # the probe's judge: a plant that compiles clean, and a plant that fails
@@ -5810,6 +6191,18 @@ root=$(fz_root c4-recipe)
 fz_sed '/check-lint-scopes.sh/d' "$root/justfile"
 fz_red "C4: a probe whose gate the check recipe does not run" \
     "C4 scripts/lint-scope-probe/Cargo.toml: its gate scripts/check-lint-scopes.sh is not run" "$root"
+# A stage line runs the gates it names: a probe's gate named there is run, its
+# name removed is not, and a name on any other line runs nothing.
+root=$(fz_root c4-stage)
+printf 'check:\n    ./scripts/check-stage.sh check-clock-ban.sh check-lint-scopes.sh %s\n' \
+    'check-fuzz-targets.sh check-waker-atomics.sh' >"$root/justfile"
+expect green "fuzz-targets: C4: probe gates named on a stage line are run" fz_run "$root"
+fz_sed 's/ check-lint-scopes.sh / /' "$root/justfile"
+fz_c4='C4 scripts/lint-scope-probe/Cargo.toml: its gate scripts/check-lint-scopes.sh is not run'
+fz_red "C4: a probe whose gate a stage line no longer names" "$fz_c4" "$root"
+fz_sed 's|^    ./scripts/check-stage.sh |    ./scripts/check-other.sh check-lint-scopes.sh |' \
+    "$root/justfile"
+fz_red "C4: a gate's name on a line that is no stage line" "$fz_c4" "$root"
 # ...or that names a third-party crate, whose lock no cargo-deny leg reads: a
 # registry package in a lock it commits, a registry, git or workspace
 # dependency, a target's dependency, a path out of the tree; a path to a
