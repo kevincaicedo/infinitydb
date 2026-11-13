@@ -293,9 +293,10 @@ impl Arena {
 > ColdWait` + `drain(push) → issued` — bounded per-class intent FIFOs,
 > per-cell device-QD cap, 3:1 foreground:maintain deficit, and
 > adjacent/overlapping same-file coalescing with shared-window `ColdDone`
-> fan-out (last drop releases the lease). `on_completion` gains the
-> injected `now_us` and returns the delivered-waiter count. The driver
-> contract is untouched: a merged read is one ordinary `TierRead` whose
+> fan-out (last drop releases the lease). `on_completion` gained the
+> injected `now_us` and returned the delivered-waiter count;
+> `record_completion` and `deliver_ready` have replaced it (ADR-0181 R1,
+> below). The driver contract is untouched: a merged read is one ordinary `TierRead` whose
 > window fits one pool buffer (the `ReadFixed` upgrade applies only to a
 > registered pool).
 > `KeyedGate` gains `has_waiter` (drain-side stale-intent skip). No
@@ -329,10 +330,12 @@ impl Arena {
 > keeps counting reads that await the device; pending-delivery members and
 > windows and delivery work get their own counters; and `cold_read_p99_us`
 > samples at logical delivery, with device-to-delivery delay observed
-> apart (ADR-0152 D3, D4). The `on_completion` fan-out above is the
-> implemented shape; this replacement is not built.
+> apart (ADR-0152 D3, D4). The receipt, the budgeted delivery, the park
+> veto and these counters are built, in the signature the ADR-0181 note
+> below gives, and the `on_completion` fan-out is gone; the fixed waiter
+> and window storage is not yet built.
 
-> **Accepted 2026-09-22, implementation open — ADR-0152 A1:** the optional
+> **Accepted 2026-09-22, built — ADR-0152 A1:** the optional
 > early executor pass precedes `parse_execute`. The A1 correction adds a
 > default-no-op `CellPlane::before_execute` hook after FABRIC-IN and
 > before both scheduled executor passes, borrowing one native-turn cold
@@ -362,8 +365,13 @@ impl Arena {
 > `COLD_PREPARATION_WORK_PER_TURN` (64 each), are `inf-runtime::limits`
 > constants; `record_completion` takes the outcome as `Result<(), i32>`
 > and returns `ColdReceipt`, not `()`; and `enqueue` takes the tiered
-> lifetime its pin key names. The three notes above summarize it. Not
-> built.
+> lifetime its pin key names. The three notes above summarize it. Built:
+> the two limits, `record_completion`'s signature, the `before_execute`
+> delivery with its park veto, the stored readiness and the identity pairs
+> with `ColdRefused::IdentityExhausted`. Not yet built: `enqueue`'s
+> lifetime argument, the preparation budget in `drain` and
+> `drain_budgeted`, `ColdWait`'s cancellation notice, the retry timer and
+> the fixed storage.
 
 > **Accepted 2026-09-22, implementation open — ADR-0153:** cold-pool
 > construction and native registration establishes a fallible chunked pool
@@ -494,8 +502,8 @@ pub struct LoopCx<'a> {            // ops pushed here ride the NEXT single submi
     // push(IoOp) · budget(GroupClass) · charge(GroupClass, units) · note_fabric(msgs)
     // Private delivery and preparation budgets initialized once per native iteration.
 }
-pub struct ColdDeliveryBudget { remaining: u32 } // private, non-Copy; no public reset/constructor
-pub struct ColdPreparationBudget { remaining: u32 } // same restrictions, separate allowance
+pub struct ColdDeliveryBudget { remaining: u32, spent: u32 } // private, non-Copy; no public reset/constructor
+pub struct ColdPreparationBudget { remaining: u32, spent: u32 } // same restrictions, separate allowance
 impl LoopCx<'_> {
     pub fn cold_delivery_budget(&mut self) -> &mut ColdDeliveryBudget;
     pub fn cold_preparation_budget(&mut self) -> &mut ColdPreparationBudget;
