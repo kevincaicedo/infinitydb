@@ -7862,7 +7862,8 @@ expect_red_because "target-dirs: a tree whose every file is skipped is a scope e
 
 # ---------------------------------------------------------- nextest-config
 group_nextest_config() {
-# ADR-0200 D2, D4, D7: scripts/check-nextest-config.sh on fixture workspaces
+# ADR-0207 D1-D3, ADR-0200 D4, D7: scripts/check-nextest-config.sh on fixture
+# workspaces
 # (each its own `git init`, its files untracked), each built green and given
 # one plant. A plant is red for its own reason; a sanctioned shape is green.
 NC="$SCRIPT_DIR/check-nextest-config.sh"

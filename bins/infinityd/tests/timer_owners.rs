@@ -373,7 +373,7 @@ fn densest_window(readings: &[Reading], window: Duration) -> (u64, Duration) {
 
 // nextest-alone: 0.1-0.6 s. Engagement needs eight fill episodes on one cell
 // inside one 100 ms fill window, and the CPU that sibling test processes take
-// thins the burst (ADR-0200 A1). Alone, a run can still read `VACUOUS`: this
+// thins the burst (ADR-0207 D4). Alone, a run can still read `VACUOUS`: this
 // keeps the rate where `cargo test`, which ran this binary alone, had it.
 #[test]
 fn a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell() {
