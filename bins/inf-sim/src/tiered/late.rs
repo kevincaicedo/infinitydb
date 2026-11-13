@@ -657,12 +657,14 @@ const BURST_HELD_STEADY_STEPS: u64 = 8;
 /// issues is queued there; released at one driver entry, their receipts
 /// make more members ready than a turn visits. Nothing else runs, and a
 /// sim cell iterates every step, so the server's `before_execute` delivers
-/// them. Oracle: each reply is its value and arrives within
+/// them. Oracle: each reply is its value, and a cold one arrives within
 /// ⌈members / 64⌉ + 2 steps of the latest tier-read completion the owner's
-/// sim driver marked at or before it (the harness's reply log against the
-/// device's own count); a `GET` unanswered at `STALL_STEPS` is a stuck
-/// client. Engagement: some reply waited at least two steps past its mark,
-/// so a turn's allowance left members to a later turn; else VACUOUS.
+/// sim driver counted at or before it, its own receipt being no later (the
+/// harness's reply log against the device's own count); a `GET` unanswered
+/// at `STALL_STEPS` is a stuck client. Engagement: some step left the
+/// owner's cold host members to visit (its pending count, read between
+/// steps: a wiring half), so a turn's allowance left members to a later
+/// turn; else VACUOUS.
 fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
     let seed = cx.scenario.seed;
     let keys: Vec<Vec<u8>> =
@@ -675,28 +677,34 @@ fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdi
     burst_cool(cx, node, audit)?;
     let owner = super::support::owner_cell(cx.scenario.cells, &keys[0]);
     let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
-    let mut readers = Vec::with_capacity(BURST_READERS);
+    let mut burst = Burst {
+        owner,
+        readers: Vec::with_capacity(BURST_READERS),
+        wants: values.iter().map(|value| bulk(value)).collect(),
+        answered: vec![false; BURST_READERS],
+        left: BURST_READERS,
+    };
     for _ in 0..BURST_READERS {
         let mut reader = MiniClient::connect(node, owner);
         call7d!(cx, node, reader, use_ns, b"+OK\r\n", "USE of a burst reader");
-        readers.push(reader);
+        burst.readers.push(reader);
     }
     cx.disk.hold_reads(Some(is_tier_file));
-    for (reader, key) in readers.iter_mut().zip(&keys) {
+    for (reader, key) in burst.readers.iter_mut().zip(&keys) {
         reader.send(node, &[b"GET", key]);
     }
-    let held = burst_hold(cx, node, owner);
+    let held = burst_hold(cx, node, &mut burst);
     cx.disk.hold_reads(None);
     if held? == 0 {
         bail7d!(cx, "COLD BURST VACUOUS seed {seed:#x}: the burst issued no tier read");
     }
-    let wants: Vec<Vec<u8>> = values.iter().map(|value| bulk(value)).collect();
-    let lag_max = burst_deliver(cx, node, owner, &mut readers, &wants)?;
-    if lag_max < 2 {
+    let cold = burst.left;
+    let pending_max = burst_deliver(cx, node, &mut burst)?;
+    if pending_max == 0 {
         bail7d!(
             cx,
-            "COLD BURST VACUOUS seed {seed:#x}: no reply waited past its receipt's turn (the \
-             largest lag {lag_max} steps): a turn's allowance never left a member"
+            "COLD BURST VACUOUS seed {seed:#x}: {cold} GETs read cold and no step left a member \
+             to visit: no turn's allowance left one to a later turn"
         );
     }
     let pending = scrape7d!(cx, node, &["cold_delivery_pending_members"])[0];
@@ -704,6 +712,46 @@ fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdi
         bail7d!(cx, "COLD BURST seed {seed:#x}: {pending} members left after every reply");
     }
     Ok(())
+}
+
+/// Phase 7e's readers and what they answered.
+struct Burst {
+    /// The cell that owns every burst key; its readers connect to it.
+    owner: usize,
+    readers: Vec<MiniClient>,
+    /// Each reader's expected reply.
+    wants: Vec<Vec<u8>>,
+    answered: Vec<bool>,
+    /// Readers not yet answered.
+    left: usize,
+}
+
+impl Burst {
+    /// Reads every reply that has arrived and judges it against its value.
+    /// Returns how many arrived.
+    fn collect(&mut self, cx: &mut Late<'_>, node: &mut Node) -> Verdict<usize> {
+        let seed = cx.scenario.seed;
+        let mut arrived = 0;
+        for (i, reader) in self.readers.iter_mut().enumerate() {
+            if self.answered[i] {
+                continue;
+            }
+            let Some(reply) = reader.recv(node) else { continue };
+            if reply != self.wants[i] {
+                bail7d!(
+                    cx,
+                    "COLD BURST VIOLATION seed {seed:#x}: reader {i} answered {}, wanted {}",
+                    preview(&reply),
+                    preview(&self.wants[i])
+                );
+            }
+            self.answered[i] = true;
+            arrived += 1;
+        }
+        self.left -= arrived;
+        cx.report.commands_done += arrived as u64;
+        Ok(arrived)
+    }
 }
 
 /// Phase 7e's cooling: filler batches on the burst's cell until a sentinel
@@ -733,15 +781,18 @@ fn burst_cool(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Ver
 }
 
 /// Steps until the owner's held tier reads stop growing: every read the
-/// burst issues is queued at the device. Returns how many it holds.
-fn burst_hold(cx: &mut Late<'_>, node: &mut Node, owner: usize) -> Verdict<usize> {
+/// burst issues is queued at the device. A reply that arrives meanwhile is
+/// a `GET` answered from RAM, judged and kept out of the cold count.
+/// Returns the reads held.
+fn burst_hold(cx: &mut Late<'_>, node: &mut Node, burst: &mut Burst) -> Verdict<usize> {
     let (mut held, mut steady) = (0, 0u64);
     for _ in 0..STALL_STEPS {
         if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
             bail7d!(cx, "phase-7e hold step: {err}");
         }
         cx.report.scheduler_steps += 1;
-        let now = node.driver(owner).held_reads();
+        burst.collect(cx, node)?;
+        let now = node.driver(burst.owner).held_reads();
         if now > 0 && now == held {
             steady += 1;
             if steady == BURST_HELD_STEADY_STEPS {
@@ -754,65 +805,46 @@ fn burst_hold(cx: &mut Late<'_>, node: &mut Node, owner: usize) -> Verdict<usize
     Ok(held)
 }
 
-/// Steps until every burst reader's reply is in, each judged against the
-/// latest completion mark at or before it. Returns the largest lag.
-fn burst_deliver(
-    cx: &mut Late<'_>,
-    node: &mut Node,
-    owner: usize,
-    readers: &mut [MiniClient],
-    wants: &[Vec<u8>],
-) -> Verdict<u64> {
+/// Steps until every burst reader's reply is in, each cold reply judged
+/// against the latest completion mark at or before it. Returns the most
+/// members a step left the owner's cold host to visit.
+fn burst_deliver(cx: &mut Late<'_>, node: &mut Node, burst: &mut Burst) -> Verdict<u64> {
     let seed = cx.scenario.seed;
-    let bound =
-        (readers.len() as u64).div_ceil(u64::from(inf_runtime::limits::COLD_DELIVERIES_PER_TURN));
-    let bound = bound + 2;
-    let mut answered = vec![false; readers.len()];
-    let mut completions = node.driver(owner).observed_io().read_completions;
-    let (mut mark, mut lag_max, mut left) = (None, 0u64, readers.len());
+    let members = burst.left as u64;
+    let turn = u64::from(inf_runtime::limits::COLD_DELIVERIES_PER_TURN);
+    let bound = members.div_ceil(turn) + 2;
+    let mut completions = node.driver(burst.owner).observed_io().read_completions;
+    let (mut mark, mut pending_max) = (None, 0);
     for step in 0..STALL_STEPS {
         if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
             bail7d!(cx, "phase-7e burst step: {err}");
         }
         cx.report.scheduler_steps += 1;
-        let now = node.driver(owner).observed_io().read_completions;
+        let now = node.driver(burst.owner).observed_io().read_completions;
         if now > completions {
             (mark, completions) = (Some(step), now);
         }
-        for (i, reader) in readers.iter_mut().enumerate() {
-            if answered[i] {
-                continue;
-            }
-            let Some(reply) = reader.recv(node) else { continue };
-            (answered[i], left) = (true, left - 1);
-            cx.report.commands_done += 1;
-            if reply != wants[i] {
-                bail7d!(
-                    cx,
-                    "COLD BURST VIOLATION seed {seed:#x}: reader {i} answered {}, wanted {}",
-                    preview(&reply),
-                    preview(&wants[i])
-                );
-            }
+        pending_max = pending_max.max(node.plane(burst.owner).cold_pending_for_sim());
+        let arrived = burst.collect(cx, node)?;
+        if arrived > 0 {
             let Some(mark) = mark else {
-                bail7d!(cx, "COLD BURST seed {seed:#x}: reader {i} answered before any receipt");
+                bail7d!(cx, "COLD BURST seed {seed:#x}: a cold GET answered before any receipt");
             };
-            let lag = step - mark;
-            lag_max = lag_max.max(lag);
-            if lag > bound {
+            if step - mark > bound {
                 bail7d!(
                     cx,
-                    "COLD BURST VIOLATION seed {seed:#x}: reader {i} answered {lag} steps after \
-                     the latest receipt, over {bound} (⌈{} / 64⌉ + 2)",
-                    readers.len()
+                    "COLD BURST VIOLATION seed {seed:#x}: {arrived} replies arrived {} steps after \
+                     the latest receipt, over {bound} (⌈{members} / 64⌉ + 2)",
+                    step - mark
                 );
             }
         }
-        if left == 0 {
-            return Ok(lag_max);
+        if burst.left == 0 {
+            return Ok(pending_max);
         }
     }
     cx.report.stalled = true;
+    let left = burst.left;
     bail7d!(cx, "COLD BURST STALL seed {seed:#x}: {left} readers never answered (a stuck client)");
 }
 
