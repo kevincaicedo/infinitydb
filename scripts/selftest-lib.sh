@@ -353,9 +353,9 @@ selftest_drive() {
             "$groups_red of $n groups red; $red driver error(s)"
         exit 1
     fi
-    echo "check-scripts self-test OK ($pass cases in $n groups, each exiting non-zero on its" \
-        "planted case: $names); the longest group: $longest_group," \
-        "$((longest / 10)).$((longest % 10)) s"
+    echo "check-scripts self-test OK ($pass cases in $n groups; the longest group:" \
+        "$longest_group, $((longest / 10)).$((longest % 10)) s; each exiting non-zero on its" \
+        "planted case: $names)"
 }
 
 # selftest_main <self> [--group <name> | --list-groups | --lint]

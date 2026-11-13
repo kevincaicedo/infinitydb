@@ -105,9 +105,10 @@ drv_fixture() {
 drv_run() { env -u INF_SELFTEST_CASE_LOG CARGO_BUILD_JOBS=2 "$@"; }
 f=$(drv_fixture control 'group_one() {' 'expect green "one passes" true' '}' \
     'group_two() {' 'expect red "two passes" false' '}')
+drv_ok_re='check-scripts self-test OK (2 cases in 2 groups; the longest group:'
+drv_ok_re="$drv_ok_re [a-z]*, [0-9]*\.[0-9] s;"
 expect_output "driver: the control's OK line names its groups and counts" \
-    "check-scripts self-test OK (2 cases in 2 groups, each exiting non-zero on its planted case: one, two)" \
-    drv_run "$f"
+    "$drv_ok_re each exiting non-zero on its planted case: one, two)\$" drv_run "$f"
 expect_output "driver: --group runs one group and prints its count line" "group two: 1 0" \
     drv_run "$f" --group two
 expect_red_because "driver: --group refuses a name no definition line holds" "no group 'three'" \
@@ -286,18 +287,19 @@ drv_pair() { # <name> <one's end> <two's end>: two green groups, each clock 100,
         'selftest_clock() { if [ $((pass + fail)) -eq 0 ]; then echo 100;' \
         "else case \$SELFTEST_GROUP in one) echo $2 ;; *) echo $3 ;; esac; fi; }"
 }
-drv_ok='check-scripts self-test OK (2 cases in 2 groups, each exiting non-zero on its planted case:'
+drv_ok='check-scripts self-test OK (2 cases in 2 groups; the longest group:'
+drv_groups='each exiting non-zero on its planted case: one, two)'
 # The longest group is the last read in one fixture and the first in the other,
 # so a driver that names the last group, or the first, is red on one of them.
 f=$(drv_pair clocked 105 130)
 expect green "driver: the OK line, alone, names the longest group with its seconds" drv_only "$f" \
-    "$drv_ok one, two); the longest group: two, 3.0 s"
+    "$drv_ok two, 3.0 s; $drv_groups"
 f=$(drv_pair clocked-first 130 105)
 expect green "driver: the longest group is named when it is the first read" drv_only "$f" \
-    "$drv_ok one, two); the longest group: one, 3.0 s"
+    "$drv_ok one, 3.0 s; $drv_groups"
 f=$(drv_clocked instant 100 100)
 expect_output "driver: a group of no measurable time is still named, at 0.0 s" \
-    "; the longest group: one, 0\.0 s\$" drv_run "$f"
+    "; the longest group: one, 0\.0 s;" drv_run "$f"
 drv_tenths() { # the lib's clock: tenths of the monotonic seconds read between two of its reads
     local before seconds after
     before=$(selftest_clock)
