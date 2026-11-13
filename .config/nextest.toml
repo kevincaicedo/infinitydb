@@ -138,10 +138,6 @@ filter = 'binary_id(infinityd::replay_spill) & test(=the_same_load_inside_every_
 priority = 30
 
 [[profile.default.overrides]]
-filter = 'binary_id(inf-store) & test(=index_maint::tests::death_scratch_is_released_when_the_evaluation_is_refused)'
-priority = 29
-
-[[profile.default.overrides]]
 filter = 'binary_id(crash-matrix::matrix) & test(=node_rows_execute_and_prove_their_verdicts)'
 priority = 25
 
