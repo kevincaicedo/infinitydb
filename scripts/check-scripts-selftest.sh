@@ -6191,6 +6191,18 @@ root=$(fz_root c4-recipe)
 fz_sed '/check-lint-scopes.sh/d' "$root/justfile"
 fz_red "C4: a probe whose gate the check recipe does not run" \
     "C4 scripts/lint-scope-probe/Cargo.toml: its gate scripts/check-lint-scopes.sh is not run" "$root"
+# A stage line runs the gates it names: a probe's gate named there is run, its
+# name removed is not, and a name on any other line runs nothing.
+root=$(fz_root c4-stage)
+printf 'check:\n    ./scripts/check-stage.sh check-clock-ban.sh check-lint-scopes.sh %s\n' \
+    'check-fuzz-targets.sh check-waker-atomics.sh' >"$root/justfile"
+expect green "fuzz-targets: C4: probe gates named on a stage line are run" fz_run "$root"
+fz_sed 's/ check-lint-scopes.sh / /' "$root/justfile"
+fz_c4='C4 scripts/lint-scope-probe/Cargo.toml: its gate scripts/check-lint-scopes.sh is not run'
+fz_red "C4: a probe whose gate a stage line no longer names" "$fz_c4" "$root"
+fz_sed 's|^    ./scripts/check-stage.sh |    ./scripts/check-other.sh check-lint-scopes.sh |' \
+    "$root/justfile"
+fz_red "C4: a gate's name on a line that is no stage line" "$fz_c4" "$root"
 # ...or that names a third-party crate, whose lock no cargo-deny leg reads: a
 # registry package in a lock it commits, a registry, git or workspace
 # dependency, a target's dependency, a path out of the tree; a path to a

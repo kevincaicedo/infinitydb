@@ -16,80 +16,62 @@ check:
     # .config/nextest.toml requires; a missing or older one is red here, in
     # about a second, not after the gates.
     cargo nextest show-config version
+    # One stage (scripts/check-stage.sh) runs the gates it names at once, under one
+    # job pool of CARGO_BUILD_JOBS, and prints each one's output whole under its
+    # own header; INF_CHECK_STAGE=serial runs them one at a time. The comments
+    # below are the gates', in the order the line names them.
     # Every relative link in a published Markdown file resolves inside the
     # repository (ADR-0166 D5), beside the document identities.
-    ./scripts/check-doc-artifacts.sh
-    ./scripts/check-dep-dag.sh
-    ./scripts/check-cell-denylist.sh
-    ./scripts/check-fault-points.sh
-    ./scripts/check-fsync-fail-stop.sh
-    ./scripts/check-panic-policy.sh
     # ADR-0190 D4, A2: no production site of inf-server decides a reply's outcome
     # from its bytes, or names a fabric reply tag outside the functions that set and read it.
-    ./scripts/check-reply-outcome.sh
     # ADR-0203 D3: a test names infinityd only through the node module, whose
     # starts hold the box's node lock; every ring outside a node is a census row.
-    ./scripts/check-node-spawn.sh
     # ADR-0172 D2: a pre-effect refusal's text is inf_wire::Refusal's alone,
     # so no production line of inf-server spells a refusal class suffix.
-    ./scripts/check-refusal-text.sh
     # ADR-0107 D2 (review 2026-08-30, Theme 4): every release assert/expect/
     # panic/unreachable in cell code is a classified inventory row.
-    ./scripts/check-release-asserts.sh
-    ./scripts/check-safety-inventory.sh
     # ADR-0125: the counted disciplines are gates: 3000 production lines per
     # file, 100 columns on every line of the Rust files under crates/, bins/
     # and tests/, and the 70-line function ratchet.
-    ./scripts/check-file-length.sh
-    ./scripts/check-line-width.sh
     # ADR-0144 D3: one ratchet — fn-length, and the cast / arithmetic
     # backlog of the decoder files docs/lint-scopes.tsv lists — judged
     # against the table's approved copies in history.
-    ./scripts/check-lint-ratchet.sh
     # ADR-0144: every `src/lib.rs`, `src/main.rs` and `src/bin/*.rs` root
     # under crates/ and bins/ is under the wildcard deny, an attribute
     # silences a lint of the ADR only as a reasoned allow of one of that
     # lint's classes, the ADR-0143 exemptions are frozen, and the probe's
     # plants draw their lint.
-    ./scripts/check-lint-scopes.sh
     # ADR-0165 D2: every saturating_/wrapping_ call in a deny-arith scope is a
     # counted row of docs/arith-spellings.tsv, reviewed against D1's rows.
-    ./scripts/check-arith-spellings.sh
     # ADR-0121: every `src/lib.rs`, `src/main.rs` and `src/bin/*.rs` root of
     # the workspace forbids or denies unsafe_code, the deny set is the
     # audited-leaf list, and every allow written exactly
     # `allow(unsafe_code)` is module-scoped.
-    ./scripts/check-unsafe-roots.sh
     # ADR-0107 (review 2026-08-30, F-L16-01): no normal dependency edge may
     # request fault-points/collision-oracle — a workspace build would link
     # infinityd against a colliding hasher.
-    ./scripts/check-shipping-features.sh
     # ADR-0198: every fuzz target compiles, on the pinned toolchain with
     # warnings denied, under its committed lock and cfg(fuzzing), and a probe
     # of planted reds proves the gate sees each shape it guards.
-    ./scripts/check-fuzz-targets.sh
     # ADR-0106 first amendment (review 2026-08-30 F-L18-05): the ambient-
     # clock ban is clippy's type-resolved disallowed-methods; this gate
     # proves the config is in force on planted bypass spellings; the
     # common lint-scopes audit lists and checks the sanctioned sites.
-    ./scripts/check-clock-ban.sh
     # ADR-0106 second amendment (review 2026-08-30, F-L20-03): the M0-S06
     # AC's own gate ran nowhere and scanned zero instructions per waker.
-    ./scripts/check-waker-atomics.sh
     # ADR-0207 D1-D3, ADR-0200 D4, D7: every static lock and every marked
     # run-alone or long test has its nextest override, CI installs the nextest
     # the config requires, and no test file reads free space or leaves a
     # tiered namespace's stall bound unstated.
-    ./scripts/check-nextest-config.sh
+    ./scripts/check-stage.sh check-doc-artifacts.sh check-dep-dag.sh check-cell-denylist.sh check-fault-points.sh check-fsync-fail-stop.sh check-panic-policy.sh check-reply-outcome.sh check-node-spawn.sh check-refusal-text.sh check-release-asserts.sh check-safety-inventory.sh check-file-length.sh check-line-width.sh check-lint-ratchet.sh check-lint-scopes.sh check-arith-spellings.sh check-unsafe-roots.sh check-shipping-features.sh check-fuzz-targets.sh check-clock-ban.sh check-waker-atomics.sh check-nextest-config.sh
     cargo clippy --workspace --all-targets -- -D warnings
     # ADR-0164: the document gates of the combined checkout; a standalone
     # checkout prints the skip. They run after clippy, so a compile or lint
     # red comes first.
-    ./scripts/check-parent-doc-gates.sh
     # ADR-0106: the gates above must go red on a planted violation, or
     # their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
     # It runs after clippy, so a compile or lint red stops the run first.
-    ./scripts/check-scripts-selftest.sh
+    ./scripts/check-stage.sh check-parent-doc-gates.sh check-scripts-selftest.sh
     # ADR-0200 D1: each set's tests run under nextest, one process a test,
     # every binary even after a red; its doctests run under cargo test.
     cargo nextest run --no-fail-fast --workspace
