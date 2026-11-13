@@ -51,6 +51,13 @@
 //!   steps take it before the hook and after it. The context escapes before
 //!   the hook, so the loop's turn stores and its spent-unit test stay in
 //!   both legs, as on a server cell.
+//! - `reactor-iteration-server-late`: the control that A of the hook's row
+//!   is a server's: the same plane with the default `before_execute` and
+//!   both hand-outs at `parse_execute`, after the hook. There the compiler
+//!   proves that no unit was spent and deletes the loop's spent-unit test,
+//!   so a faithful A reads at least 2 over it (the test is at least a
+//!   compare and a branch), and a pair whose context first leaves after
+//!   the hook reads 0 or less.
 //!
 //! Beside them, the rate legs (`cold_path/rates.rs`), reported and never
 //! judged: one container operation a step, on the capped map and slab B
@@ -150,10 +157,13 @@ enum ReactorPlane {
     Server,
     /// [`ServerShapedPlane`] with the server's `before_execute`.
     ServerHook,
+    /// [`ServerShapedPlane`]'s default leg with both hand-outs after the
+    /// hook: the late control.
+    ServerLate,
 }
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 66] = [
+const LEGS: [(&str, Leg, u8); 68] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -182,6 +192,8 @@ const LEGS: [(&str, Leg, u8); 66] = [
     ("reactor-iteration-server-plus-one", Leg::Reactor(ReactorPlane::Server), 1),
     ("reactor-iteration-server-hook", Leg::Reactor(ReactorPlane::ServerHook), 0),
     ("reactor-iteration-server-hook-plus-one", Leg::Reactor(ReactorPlane::ServerHook), 1),
+    ("reactor-iteration-server-late", Leg::Reactor(ReactorPlane::ServerLate), 0),
+    ("reactor-iteration-server-late-plus-one", Leg::Reactor(ReactorPlane::ServerLate), 1),
     ("harness", Leg::Rate(RateLeg::Harness), 0),
     ("harness-plus-one", Leg::Rate(RateLeg::Harness), 1),
     ("map-get-0", Leg::Rate(RateLeg::MapGet { depth: 0 }), 0),
@@ -578,16 +590,20 @@ fn deliver_cold(shared: &SharedTier, cx: &mut LoopCx<'_>) {
 /// hook, and at `parse_execute`, after it. `HOOK` true, its
 /// `before_execute` is the server's (B of the row); false, the plane's
 /// default (A). One type for both, so the legs differ in the hook alone.
-struct ServerShapedPlane<const HOOK: bool> {
+/// `LATE` true moves the `fabric_in` hand-out to `parse_execute`, after
+/// the hook: the late control, only with `HOOK` false.
+struct ServerShapedPlane<const HOOK: bool, const LATE: bool> {
     shared: Rc<SharedTier>,
 }
 
-impl<const HOOK: bool> CellPlane for ServerShapedPlane<HOOK> {
+impl<const HOOK: bool, const LATE: bool> CellPlane for ServerShapedPlane<HOOK, LATE> {
     fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
         panic!("the reactor leg reaps nothing: {c:?}");
     }
     fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {
-        server_steps(&self.shared, cx);
+        if !LATE {
+            server_steps(&self.shared, cx);
+        }
     }
     fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
         if HOOK {
@@ -595,6 +611,9 @@ impl<const HOOK: bool> CellPlane for ServerShapedPlane<HOOK> {
         }
     }
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
+        if LATE {
+            server_steps(&self.shared, cx);
+        }
         server_steps(&self.shared, cx);
     }
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
@@ -644,10 +663,13 @@ fn drive_reactor<const NOPS: u8>(plane: ReactorPlane, ops: u64) -> u64 {
         ReactorPlane::Idle => drive_loop::<NOPS, _>(ops, IdlePlane),
         ReactorPlane::Hook => drive_loop::<NOPS, _>(ops, HookPlane { shared: shared_tier() }),
         ReactorPlane::Server => {
-            drive_loop::<NOPS, _>(ops, ServerShapedPlane::<false> { shared: shared_tier() })
+            drive_loop::<NOPS, _>(ops, ServerShapedPlane::<false, false> { shared: shared_tier() })
         }
         ReactorPlane::ServerHook => {
-            drive_loop::<NOPS, _>(ops, ServerShapedPlane::<true> { shared: shared_tier() })
+            drive_loop::<NOPS, _>(ops, ServerShapedPlane::<true, false> { shared: shared_tier() })
+        }
+        ReactorPlane::ServerLate => {
+            drive_loop::<NOPS, _>(ops, ServerShapedPlane::<false, true> { shared: shared_tier() })
         }
     }
 }
