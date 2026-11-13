@@ -203,8 +203,12 @@
 //! }
 //! ```
 //!
-//! A command's raw `Command`, which carries the lock, and its constructor
-//! from a path are private methods.
+//! A command's raw `Command`, before the lock rides its standard input, and
+//! its constructor from a path are private methods. Each names a type private
+//! to this module in its signature (`Unlocked`, `Program`), so no code outside
+//! the module can call it even when its visibility is widened: the crate that
+//! includes the module may read what a doctest, another crate, may not
+//! (ADR-0203 D1).
 //!
 //! ```compile_fail,E0624
 //! use compat::harness::node::NodeBinary;
@@ -446,7 +450,7 @@ impl NodeBinary {
 
     /// The only command that runs the binary: its starts take the box's lock.
     pub fn command(&self) -> NodeCommand<BoxWide> {
-        NodeCommand::under_lock(NodeLock::box_wide(), self.path.clone())
+        NodeCommand::under_lock(NodeLock::box_wide(), Program(self.path.clone()))
     }
 }
 
@@ -641,7 +645,7 @@ impl NodeLock<Private> {
 
     /// `sleep`, the only command a private lock starts: a stand-in node.
     pub fn stand_in(&self) -> NodeCommand<Private> {
-        NodeCommand::under_lock(self.copy(), PathBuf::from("sleep"))
+        NodeCommand::under_lock(self.copy(), Program(PathBuf::from("sleep")))
     }
 }
 
@@ -721,6 +725,14 @@ pub struct NodeCommand<S: Scope> {
     ulimit: Option<Ulimit>,
 }
 
+/// The program a command runs: the node binary's path or `sleep`. Only the
+/// module builds one, so no code outside it can call `NodeCommand::under_lock`.
+struct Program(PathBuf);
+
+/// A command's raw `Command`, before the lock rides its standard input. Only
+/// the module opens one, so no code outside it can call `into_command`.
+struct Unlocked(Command);
+
 /// No path: the binary's path never leaves the module through a command.
 impl<S: Scope> fmt::Debug for NodeCommand<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -732,7 +744,7 @@ impl<S: Scope> NodeCommand<S> {
     /// The module's own constructor. No `new` exists, private or public:
     /// the doc's block that calls one fails as a missing item, so only a
     /// constructor added to the type compiles it.
-    fn under_lock(lock: NodeLock<S>, program: PathBuf) -> Self {
+    fn under_lock(lock: NodeLock<S>, Program(program): Program) -> Self {
         Self {
             lock,
             program,
@@ -814,7 +826,7 @@ impl<S: Scope> NodeCommand<S> {
     pub fn spawn_under(self, lease: &ExclusiveLease<S>) -> Result<LeasedNode<'_>, NodeError> {
         assert_eq!(lease.flag.0.id, self.lock.state.id, "a lease starts its own lock's commands");
         let program = self.program.clone();
-        let (_, mut command) = self.into_command();
+        let Unlocked(mut command) = self.into_command();
         command.stdin(Stdio::null());
         let child = command.spawn().map_err(|error| spawn_failed(&program, STARTED, error))?;
         Ok(LeasedNode { child, lease: PhantomData })
@@ -845,12 +857,12 @@ impl<S: Scope> NodeCommand<S> {
         let nodes = open_lock(&dir, NODES)?;
         poll_lock(&nodes, Mode::Shared, &dir.join(NODES), began, wait)?;
         drop(turnstile);
-        let (_, mut command) = self.into_command();
+        let Unlocked(mut command) = self.into_command();
         command.stdin(Stdio::from(nodes));
         Ok((counted, command))
     }
 
-    fn into_command(self) -> (NodeLock<S>, Command) {
+    fn into_command(self) -> Unlocked {
         let mut command = match self.ulimit {
             None => Command::new(&self.program),
             Some(limit) => {
@@ -878,7 +890,7 @@ impl<S: Scope> NodeCommand<S> {
         if let Some(stderr) = self.stderr {
             command.stderr(stderr);
         }
-        (self.lock, command)
+        Unlocked(command)
     }
 }
 
