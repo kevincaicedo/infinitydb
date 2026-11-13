@@ -199,7 +199,7 @@ impl RoundCounts {
     }
 }
 
-/// OC2 (ADR-0181 R1): a round is one host turn, which visits at most
+/// A round is one host turn (ADR-0181 R1), which visits at most
 /// `COLD_DELIVERIES_PER_TURN` members, live, cancelled or orphaned. A
 /// round's visits are the values the harness saw delivered (`seen`, its own
 /// count) plus the members the round's delivery calls orphaned; a round

@@ -2514,7 +2514,7 @@ mod tests {
     }
 
     /// Every identity the issuer mints is fresh and typed by its parity
-    /// (OC6): an independent record of every logical id the host queues and
+    /// (ADR-0181 R4): an independent record of every logical id the host queues and
     /// every device id its reads carry, over rounds that each admit one kept
     /// and two cancelled requests, purge the cancelled and issue the kept,
     /// finds no word index twice, every logical id even and every device id
