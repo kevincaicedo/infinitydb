@@ -252,6 +252,7 @@ fn an_own_publication_with_a_waiter_does_not_park_before_its_wake() {
 /// `S` sweep phases, until one reaches that window. A sweep that watched
 /// another cell's slot (`inf_canary_ckpt_sweep_own_slot_zero`) parks at
 /// every topology here, as the guard without the term does.
+// nextest-long: 20 s
 #[test]
 fn an_own_publication_on_a_peer_cell_does_not_park_before_its_wake() {
     let mut parked = Vec::new();

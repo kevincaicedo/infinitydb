@@ -6051,6 +6051,7 @@ fn two_backlogged_tiered_namespaces_on_one_cell_acknowledge_every_write() {
 
 /// R3-exit, leg two: the `1mb` namespace under a light steady load
 /// beside the `8mb` one's backlog.
+// nextest-long: 39 s
 #[test]
 fn a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write() {
     two_tiered_namespaces_acknowledge_every_write(&TierExitLeg {
@@ -7514,6 +7515,7 @@ fn read_n(stream: &mut TcpStream, n: usize) -> Vec<u8> {
 /// of one 1,102-byte string, so each key's reply is 72,286,226 B and is
 /// served, and the two keys' reply, 144,572,448 B, is refused with no
 /// element sent; the connection keeps serving, and `PING` before it stands.
+// nextest-long: 99 s
 #[test]
 #[cfg(feature = "doc")]
 fn json_mget_aggregate_refuses_at_the_wire() {

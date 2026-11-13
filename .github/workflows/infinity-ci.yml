@@ -130,10 +130,10 @@ jobs:
       - name: lint ratchet (ADR-0144 D3; absorbs the fn-length ratchet)
         if: runner.os == 'Linux'
         run: ./scripts/check-lint-ratchet.sh
-      # ADR-0200 D2, D4, D7: every static lock and run-alone test in a test
-      # target has its nextest override, this workflow installs the nextest
-      # the config requires, and no test file reads free space or leaves a
-      # tiered namespace's stall bound unstated.
+      # ADR-0207 D1-D3, ADR-0200 D4, D7: every static lock and every marked
+      # run-alone or long test has its nextest override, this workflow
+      # installs the nextest the config requires, and no test file reads free
+      # space or leaves a tiered namespace's stall bound unstated.
       - name: nextest config (ADR-0200)
         run: ./scripts/check-nextest-config.sh
       - name: clippy

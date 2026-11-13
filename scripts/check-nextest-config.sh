@@ -2,26 +2,28 @@
 # The tests run under cargo-nextest, one process a test (ADR-0200 D1), so a
 # static lock inside a test target no longer keeps that target's tests apart.
 # Each isolation rule has one owner per runner, and this gate pairs them
-# (ADR-0200 D2): the lock or marker in the source for `cargo test`, an override
-# in .config/nextest.toml for nextest. It also holds the install rule (D4) and
-# two oracle scans (D7). Red, each with its file and line:
+# (ADR-0207 D1-D3): the lock or marker in the source for `cargo test`, an
+# override in .config/nextest.toml for nextest; a long test's marker and its
+# override give it an early start. It also holds the install rule (ADR-0200
+# D4) and two oracle scans (ADR-0200 D7). Red, each with its file and line:
 #
 #   config   a key outside this list: the top level holds `nextest-version =
 #            { required = "<x.y.z>" }`, `[test-groups]` and `[profile.default]`
 #            only; a group is `{ max-threads = 1 }`; the profile holds
 #            `leak-timeout = { period = "100ms", result = "fail" }` and its
-#            overrides only; an override is `filter`, `priority` and either
-#            `test-group` (a group's, priority 50) or `threads-required =
-#            "num-test-threads"` (a run-alone one, priority 100), each value a
-#            string but the priority, an integer, and every
-#            run-alone override comes before every group's (nextest takes each
-#            setting from the first override that matches, and queues by
-#            priority, then in list order). So no filter, retry or timeout
-#            setting narrows or softens a run.
+#            overrides only; an override is `filter`, `priority` and one of
+#            three shapes: `threads-required = "num-test-threads"` (a run-alone
+#            one, priority 100), `test-group` (a group's, priority 50) or
+#            nothing more (a long one, below). Each value is a string but the
+#            priority, an integer, and every run-alone override comes before
+#            every group's (nextest takes each setting from the first override
+#            that matches, and queues by priority, then in list order). So no
+#            filter, retry or timeout setting narrows or softens a run.
 #   filter   one of `binary_id(<package>)`, `binary_id(<package>::<test
 #            target>)`, `binary_id(<package>::bin/<name>)` or
 #            `package(<package>)`, optionally `& test(=<name>)`, naming a
-#            package and a target `cargo metadata` lists.
+#            package and a target `cargo metadata` lists; a long override's is
+#            a `binary_id(…) & test(=<name>)`, one test.
 #   lock     a `static` whose type names Mutex, RwLock or Condvar, in a .rs
 #            file under crates/, bins/ or tests/, carries on the comment line
 #            above it (attributes between) `nextest-group: <group>` or
@@ -39,6 +41,16 @@
 #            time in seconds ("3.5 s"): each such test adds that time to every
 #            run. A run-alone override selects each marked target or test, and
 #            selects nothing unmarked.
+#   long     a test of 15 s or more at the box's 10 test threads, run neither
+#            alone nor in a group, may carry `nextest-long: <n> s` on the
+#            comments above its `#[test]`, n an integer of 15 or more: its
+#            time. A long override selects each marked test at priority n, 49
+#            at most, under a group's 50: each chain starts once the run-alone
+#            tests end and the long tests take the other slots, the longest
+#            first. It selects nothing unmarked and no test another override
+#            selects, so the first match never gives a test two shapes. A start
+#            order changes no verdict, so no rule here reads a test's time: a
+#            missing or stale marker costs seconds, and review holds it.
 #   install  a `cargo install` of cargo-nextest in .github/workflows names
 #            `--locked` and `--version` with the floor of `nextest-version`, and
 #            each job that runs `cargo nextest` has one (a comment is none).
@@ -53,8 +65,12 @@
 #            comments: a tiered namespace's stall bound is a hang bound the
 #            test states, or the reason says why no write of the file can park
 #            (D7).
-#   marker   every marker binds what its rule names; one that binds nothing
-#            is stale.
+#   marker   the markers are five words, `nextest-group`, `nextest-in-process`,
+#            `nextest-alone`, `nextest-stall-default` and `nextest-long`, each a
+#            `//` comment line of its own; a comment that starts like one in
+#            another spelling, or with `nextest` then `-`, `_` or `.` and any
+#            other word, is red. Every marker binds what its rule names; one
+#            that binds nothing is stale.
 #
 # Whether an assertion's input is box-wide, or a stated bound a hang bound,
 # is a property of the program that no text scan decides: review holds it.
@@ -80,6 +96,10 @@ NAME = "nextest-config"
 CONFIG = Path(".config/nextest.toml")
 ALONE_PRIORITY = 100
 GROUP_PRIORITY = 50
+# A long test starts after the run-alone tests and with the groups' chains.
+LONG_PRIORITY_MAX = GROUP_PRIORITY - 1
+LONG_MIN_S = 15
+LONG_SECONDS = re.compile(r"([1-9][0-9]*) s")
 ALL_THREADS = "num-test-threads"
 LEAK = {"period": "100ms", "result": "fail"}
 SECONDS = re.compile(r"(?<![\w.])[0-9]+(?:\.[0-9]+)? s\b")
@@ -90,10 +110,12 @@ STATES_STALL = re.compile(r'(?<![A-Za-z0-9_])b?"TAIL-STALL-TIMEOUT"')
 # A marker is a `//` comment line of its own that starts with its kind and a
 # colon; a prose mention later in a comment is no marker. A comment that starts
 # like one in any other spelling (no colon, capitals, a doc or block comment,
-# beside code) is red: it would read as a marker and bind nothing.
-MARKER = re.compile(r"^\s*//(?![/!])\s*nextest-(group|in-process|alone|stall-default):(.*)$")
+# beside code, a word outside the five) is red: it would read as a marker and
+# bind nothing.
+MARKER = re.compile(r"^\s*//(?![/!])\s*nextest-(group|in-process|alone|stall-default|long):(.*)$")
 NEAR_MARKER = re.compile(
-    r"(?i)^nextest\s*[-_ ]?\s*(?:group|in\s*[-_ ]?\s*process|alone|stall\s*[-_ ]?\s*default)\b"
+    r"(?i)^nextest\s*(?:[-_.]\s*\w"
+    r"|(?:group|in\s*[-_ ]?\s*process|alone|stall\s*[-_ ]?\s*default|long)\b)"
 )
 FILTER = re.compile(
     r"^(?:binary_id\((?P<binary>[A-Za-z0-9_-]+(?:::(?:bin/)?[A-Za-z0-9_-]+)?)\)"
@@ -216,7 +238,9 @@ for index, entry in enumerate(overrides):
     if wrong:
         red(f"{where}: {', '.join(wrong)} has the wrong type (a string each; priority an integer)")
         continue
-    if keys == {"filter", "test-group", "priority"}:
+    if keys == {"filter", "priority"}:
+        kind = "long"
+    elif keys == {"filter", "test-group", "priority"}:
         kind = "group"
         if entry["test-group"] not in groups:
             red(f"{where} names test group `{entry['test-group']}`, which [test-groups] lacks")
@@ -230,7 +254,7 @@ for index, entry in enumerate(overrides):
             red(f"{where}: a run-alone override sets priority {ALONE_PRIORITY}, not {entry['priority']}")
     else:
         red(f"{where} holds keys {sorted(keys)}: a group's is filter, test-group, priority; "
-            "a run-alone one's filter, threads-required, priority")
+            "a run-alone one's filter, threads-required, priority; a long one's filter, priority")
         continue
     match = FILTER.match(entry["filter"])
     if not match:
@@ -242,12 +266,21 @@ for index, entry in enumerate(overrides):
     if match["binary"] and match["binary"] not in binaries:
         red(f"{where}: filter names test binary `{match['binary']}`, which cargo metadata lacks")
         continue
+    if kind == "long" and not (match["binary"] and match["test"]):
+        red(f"{where}: a long override's filter is one test, `binary_id(…) & test(=<name>)`, "
+            f"not {entry['filter']!r}")
+        continue
     parsed.append((index, kind, selects(match), match["test"], entry.get("test-group")))
 alone_at = [index for index, kind, *_ in parsed if kind == "alone"]
 group_at = [index for index, kind, *_ in parsed if kind == "group"]
 if alone_at and group_at and max(alone_at) > min(group_at):
     red(f"{CONFIG}: run-alone override {max(alone_at) + 1} comes after group override "
         f"{min(group_at) + 1}; every run-alone override comes first")
+for index, kind, chosen, wanted, _ in parsed:
+    for other, _, theirs, their_test, _ in parsed if kind == "long" else ():
+        if other != index and chosen & theirs and their_test in (None, wanted):
+            red(f"{CONFIG}: long override {index + 1} selects `{min(chosen)}` test `{wanted}`, "
+                f"which override {other + 1} also selects: a test takes one shape")
 
 
 # ---- the sources --------------------------------------------------------------
@@ -543,45 +576,69 @@ for path in scanned:
                 red(f"{path}:{number + 1}: test binary `{binary}` compiles this lock, and no "
                     f"override puts it in group `{reason}`")
 
+
+
+def marked_test(here, number):
+    """The module path of the test whose `#[test]` the comments and attributes
+    below line `number` lead to, or None."""
+    below, is_test = number + 1, False
+    while below < len(here.raw):
+        if here.is_comment(below):
+            below += 1
+            continue
+        code = here.code[below].strip()
+        if not code.startswith("#["):
+            break
+        end = here.attribute_end(below)
+        is_test |= re.fullmatch(r"#\[test\]", code) is not None
+        below = end + 1
+    function = re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)",
+                        here.code[below]) if below < len(here.code) else None
+    return here.inline[below] + (function.group(1),) if is_test and function else None
+
+
+def alone_mark(here, path, number, mark, lead):
+    reason, follow = mark.group(2), number + 1
+    while (follow < len(here.raw) and here.is_comment(follow)
+           and here.raw[follow].strip() not in ("//", "///") and not MARKER.search(here.raw[follow])):
+        reason += " " + here.raw[follow].strip().lstrip("/").strip()
+        follow += 1
+    if not SECONDS.search(reason):
+        red(f"{path}:{number + 1}: a `nextest-alone:` reason gives no time in seconds "
+            "(\"3.5 s\"): each run-alone test adds its time to every run")
+    test = marked_test(here, number)
+    if test is None and number not in lead:
+        red(f"{path}:{number + 1}: a `nextest-alone:` marker neither above a `#[test]` nor "
+            "in its file's leading comments binds nothing")
+        return
+    alone_marks.append((path, number, test))
+    bound.add((path, number))
+
+
+def long_mark(here, path, number, mark):
+    test = marked_test(here, number)
+    if test is None:
+        red(f"{path}:{number + 1}: a `nextest-long:` marker above no `#[test]` binds nothing")
+        return
+    bound.add((path, number))
+    seconds = LONG_SECONDS.fullmatch(mark.group(2).strip())
+    if not seconds or int(seconds.group(1)) < LONG_MIN_S:
+        red(f"{path}:{number + 1}: a `nextest-long:` marker reads `<n> s`, n an integer of "
+            f"{LONG_MIN_S} or more, not {mark.group(2).strip()!r}")
+        return
+    long_marks.append((path, number, test, int(seconds.group(1))))
+
+
+long_marks = []  # (file, line, test path, seconds)
 for path in scanned:
     here = source(path)
     lead = here.leading()
     for number, raw in enumerate(here.raw):
-        if not here.is_comment(number):
-            continue
-        mark = MARKER.search(raw)
-        if not mark or mark.group(1) != "alone":
-            continue
-        reason, follow = mark.group(2), number + 1
-        while (follow < len(here.raw) and here.is_comment(follow)
-               and here.raw[follow].strip() not in ("//", "///") and not MARKER.search(here.raw[follow])):
-            reason += " " + here.raw[follow].strip().lstrip("/").strip()
-            follow += 1
-        if not SECONDS.search(reason):
-            red(f"{path}:{number + 1}: a `nextest-alone:` reason gives no time in seconds "
-                "(\"3.5 s\"): each run-alone test adds its time to every run")
-        below, is_test = number + 1, False
-        while below < len(here.raw):
-            if here.is_comment(below):
-                below += 1
-                continue
-            code = here.code[below].strip()
-            if not code.startswith("#["):
-                break
-            end = here.attribute_end(below)
-            is_test |= re.fullmatch(r"#\[test\]", code) is not None
-            below = end + 1
-        function = re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)",
-                            here.code[below]) if below < len(here.code) else None
-        if is_test and function:
-            alone_marks.append((path, number, here.inline[below] + (function.group(1),)))
-        elif number in lead:
-            alone_marks.append((path, number, None))
-        else:
-            red(f"{path}:{number + 1}: a `nextest-alone:` marker neither above a `#[test]` nor "
-                "in its file's leading comments binds nothing")
-            continue
-        bound.add((path, number))
+        mark = MARKER.search(raw) if here.is_comment(number) else None
+        if mark and mark.group(1) == "alone":
+            alone_mark(here, path, number, mark, lead)
+        elif mark and mark.group(1) == "long":
+            long_mark(here, path, number, mark)
 
 expected = set()  # (binary id, test name or None)
 for path, number, test in alone_marks:
@@ -602,6 +659,29 @@ for index, kind, chosen, wanted, _ in parsed:
             shown = f"`{binary}` test `{wanted}`" if wanted else f"test binary `{binary}`"
             red(f"{CONFIG}: override {index + 1} runs {shown} alone, and no `nextest-alone:` "
                 "marker names it")
+expected_long = {}  # (binary id, test name) -> the priority its marker asks
+for path, number, test, seconds in long_marks:
+    users = sorted(compiled_by.get(path, set()))
+    if not users:
+        red(f"{path}:{number + 1}: a `nextest-long:` marker in a file no test binary compiles")
+    for binary, module in users:
+        name, wants = "::".join(module + test), min(seconds, LONG_PRIORITY_MAX)
+        expected_long[(binary, name)] = wants
+        found = [index for index, kind, chosen, wanted, _ in parsed
+                 if kind == "long" and binary in chosen and wanted == name]
+        if not found:
+            red(f"{path}:{number + 1}: `{binary}` test `{name}` is marked long, and no long "
+                "override selects it")
+        for index in found:
+            if overrides[index]["priority"] != wants:
+                red(f"{CONFIG}: override {index + 1} starts `{binary}` test `{name}` at priority "
+                    f"{overrides[index]['priority']}; its marker's {seconds} s asks {wants} "
+                    f"({LONG_PRIORITY_MAX} at most)")
+for index, kind, chosen, wanted, _ in parsed:
+    for binary in sorted(chosen) if kind == "long" else ():
+        if (binary, wanted) not in expected_long:
+            red(f"{CONFIG}: override {index + 1} starts `{binary}` test `{wanted}` early, and no "
+                "`nextest-long:` marker names it")
 for index, kind, chosen, _, group in parsed:
     for binary in sorted(chosen - holders.get(group, set())) if kind == "group" else ():
         red(f"{CONFIG}: override {index + 1} puts `{binary}` in group `{group}`, and no lock that "
@@ -722,7 +802,8 @@ if not installs:
 
 if reds:
     print("\n".join(reds))
-    print(f"{NAME} FAILED: {len(reds)} violation(s); the rules are this gate's header (ADR-0200 D2, D4, D7)")
+    print(f"{NAME} FAILED: {len(reds)} violation(s); the rules are this gate's header "
+          "(ADR-0207 D1-D3; ADR-0200 D4, D7)")
     sys.exit(1)
 alone_names = [f"{b}/{t}" if t else b for b, t in sorted(expected)]
 in_process = sum(1 for lock in locks if lock[2] == "in-process")
@@ -730,7 +811,8 @@ print(
     f"{NAME} OK: nextest-version {floor}; {len(groups)} groups of one thread "
     f"({', '.join(sorted(groups)) or 'none'}), {len(group_at)} group overrides at priority "
     f"{GROUP_PRIORITY}; {len(expected)} run alone at priority {ALONE_PRIORITY}, first "
-    f"({', '.join(alone_names) or 'none'}); {len(locks)} static locks, {len(locks) - in_process} "
+    f"({', '.join(alone_names) or 'none'}); {len(expected_long)} long, each at its marker's "
+    f"seconds, {LONG_PRIORITY_MAX} at most; {len(locks)} static locks, {len(locks) - in_process} "
     f"grouped and {in_process} in-process; {budget_files} test files name MEM-BUDGET, {stated} "
     f"state TAIL-STALL-TIMEOUT and {defaulted} carry nextest-stall-default; no free-space read in "
     f"{free_space_files} integration-test files and {len(linked)} library files they link; "

@@ -16,6 +16,7 @@ fn parse_seed(text: &str) -> u64 {
     )
 }
 
+// nextest-long: 70 s
 #[test]
 fn corpus_seeds_replay_green() {
     let text = include_str!("../seeds/corpus.txt");

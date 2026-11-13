@@ -2006,6 +2006,7 @@ mod tests {
     /// applied, and every window comes back. The reservation is the round plan's
     /// own count, so a plan that reserves fewer windows than its span takes
     /// stops at the stage's take.
+    // nextest-long: 32 s
     #[test]
     fn the_round_envelope_holds_over_its_two_hundred_cases() {
         const D: u64 = TIER_FRAME_DATA as u64;

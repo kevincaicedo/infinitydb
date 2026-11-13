@@ -76,10 +76,10 @@ check:
     # ADR-0106 second amendment (review 2026-08-30, F-L20-03): the M0-S06
     # AC's own gate ran nowhere and scanned zero instructions per waker.
     ./scripts/check-waker-atomics.sh
-    # ADR-0200 D2, D4, D7: every static lock and run-alone test in a test
-    # target has its nextest override, CI installs the nextest the config
-    # requires, and no test file reads free space or leaves a tiered
-    # namespace's stall bound unstated.
+    # ADR-0207 D1-D3, ADR-0200 D4, D7: every static lock and every marked
+    # run-alone or long test has its nextest override, CI installs the nextest
+    # the config requires, and no test file reads free space or leaves a
+    # tiered namespace's stall bound unstated.
     ./scripts/check-nextest-config.sh
     cargo clippy --workspace --all-targets -- -D warnings
     # ADR-0164: the document gates of the combined checkout; a standalone

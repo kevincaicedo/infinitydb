@@ -131,6 +131,7 @@ fn field<'a>(info: &'a str, key: &str) -> &'a str {
 }
 
 /// The lifecycle, end to end, on one data directory.
+// nextest-long: 48 s
 #[test]
 fn a_fresh_data_directory_is_probed_once_and_the_model_is_identity_bound() {
     let dir = data_root();

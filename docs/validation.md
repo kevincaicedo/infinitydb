@@ -43,9 +43,10 @@ a test, every binary even after a red, and their doctests under `cargo test
 requires (`nextest-version`; `cargo install --locked cargo-nextest --version
 <that version>`, as CI installs it), and is red at its second line when
 nextest is missing or older (D5). Its isolation rules (groups of one thread,
-tests run alone) live in that file, each paired with its marker in the test's
-source by `scripts/check-nextest-config.sh` (D2). The layer commands below
-keep `cargo test`.
+tests run alone) and its start order (a test of 15 s or more starts by its
+seconds, the longest first) live in that file, each paired with its marker in
+the test's source by `scripts/check-nextest-config.sh` (ADR-0207 D1-D3). The
+layer commands below keep `cargo test`.
 
 `just check`, workspace tests and `just compat` require Redis **8.0.5** on
 PATH or `INF_COMPAT_ORACLE_ADDR` pointing to that version. An absent,

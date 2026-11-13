@@ -86,6 +86,7 @@ fn a_refusal_resumes_at_the_refused_entry_with_no_miss_and_no_duplicate() {
 /// inserts that double the table, insert/delete cycles that recycle it
 /// at the same size, deletes of pre-existing keys ahead of and behind
 /// the resume. Every key present for the whole walk is emitted.
+// nextest-long: 18 s
 #[test]
 fn persistent_keys_survive_refusals_under_interleaved_churn() {
     let rounds = if cfg!(miri) { 2 } else { 24 };
