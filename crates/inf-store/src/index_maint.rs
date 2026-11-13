@@ -1995,6 +1995,7 @@ mod tests {
     /// the evaluation — the last fails with nearly all of the document's
     /// keys buffered — and the planted backfill trip, which fails after
     /// every one of them is.
+    // nextest-long: 29 s
     #[test]
     fn death_scratch_is_released_when_the_evaluation_is_refused() {
         use inf_foundation::fault::{self, FaultSpec};

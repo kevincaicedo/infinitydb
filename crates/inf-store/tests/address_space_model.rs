@@ -252,6 +252,7 @@ proptest! {
 
 /// The M4-S01 AC storm: 10⁶ random alloc/resolve/advance/rewrite ops vs
 /// the shadow model, one seed, deterministic.
+// nextest-long: 18 s
 #[test]
 fn address_space_storm_million_ops() {
     let ops = if cfg!(miri) { 3_000 } else { 1_000_000 };

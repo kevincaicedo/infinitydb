@@ -551,16 +551,19 @@ fn assert_step_bound(fsync: &str, field: &dyn Fn(&str) -> u64, info: &str) {
     assert!(yields > 0, "VACUOUS (arm {fsync}): no step yielded inside a unit: {info}");
 }
 
+// nextest-long: 37 s
 #[test]
 fn a_tail_above_every_cells_window_boots_under_fsync_always() {
     run_arm("always", Leg::Demote);
 }
 
+// nextest-long: 35 s
 #[test]
 fn a_tail_above_every_cells_window_boots_under_fsync_everysec() {
     run_arm("everysec", Leg::Demote);
 }
 
+// nextest-long: 30 s
 #[test]
 fn the_same_load_inside_every_cells_window_boots_without_demoting() {
     run_arm("always", Leg::Fit);

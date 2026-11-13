@@ -1,14 +1,16 @@
-# cargo-nextest's rules for this workspace's tests (ADR-0200 D2). Under
+# cargo-nextest's rules for this workspace's tests (ADR-0207 D1-D3). Under
 # nextest every test is a process of its own, so a static lock in a test
 # target no longer keeps that target's tests apart: the groups below do. Each
 # lock in a test target carries a marker on the comment line above it, the
 # group it needs (`nextest-group: <group>`) or why it guards a race between
 # the threads of one process only (`nextest-in-process: <reason>`); a test
 # target, or one test, that must run alone in its lane carries
-# `nextest-alone: <reason, with its time in seconds>`.
+# `nextest-alone: <reason, with its time in seconds>`; a test of 15 s or more
+# that runs neither alone nor in a group may carry `nextest-long: <n> s`, its
+# time at the box runner's 10 test threads.
 # scripts/check-nextest-config.sh pairs every marker with its override here
 # and refuses any key outside this file's list: the version floor, the leak
-# rule, groups of one thread, and the two override shapes with their
+# rule, groups of one thread, and the three override shapes with their
 # priorities. So no filter, retry or timeout setting can narrow or soften a
 # run.
 #
@@ -18,7 +20,11 @@
 # slot; reached while a group's serial chain holds one, it would leave the
 # lane idle until the chain ends. So each run-alone override sets priority 100
 # and comes before every group's override, which sets 50: the run-alone tests
-# run first, one at a time, before any chain starts.
+# run first, one at a time, before any chain starts. A long test's override
+# sets its marker's seconds, 49 at most: once the run-alone tests end, each
+# chain takes a slot and the long tests the others, the longest first, so a
+# line ends near its floor instead of on a long test its list reached last.
+# A long override names one test, and no other override selects that test.
 
 # The oldest nextest these rules hold for. `cargo nextest show-config version`
 # in `just check` exits non-zero below it, and CI installs exactly this
@@ -71,3 +77,98 @@ priority = 50
 filter = 'package(compat)'
 test-group = "compat-oracle"
 priority = 50
+
+# The long tests, the longest first: each starts at its marker's seconds, 49 at
+# most. A start order changes no verdict.
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-sim) & test(=durable::timers::tests::a_sparse_fill_writer_keeps_a_cells_timers_within_its_roles)'
+priority = 49
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-server::node_e2e) & test(=json_mget_aggregate_refuses_at_the_wire)'
+priority = 49
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-sim) & test(=durable::timers::tests::dense_fill_episodes_keep_a_cells_timers_within_its_roles)'
+priority = 49
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-sim::corpus) & test(=corpus_seeds_replay_green)'
+priority = 49
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-server::recover_replay_steps) & test(=the_start_of_a_boot_at_size_is_mapped_under_the_step_judge)'
+priority = 49
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-server::recover_replay_steps) & test(=every_budget_recovers_the_start_of_the_unparked_boot)'
+priority = 49
+
+[[profile.default.overrides]]
+filter = 'binary_id(infinityd::device_probe) & test(=a_fresh_data_directory_is_probed_once_and_the_model_is_identity_bound)'
+priority = 48
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-server::recover_replay_steps) & test(=the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal)'
+priority = 42
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-server::node_e2e) & test(=a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write)'
+priority = 39
+
+[[profile.default.overrides]]
+filter = 'binary_id(infinityd::replay_spill) & test(=a_tail_above_every_cells_window_boots_under_fsync_always)'
+priority = 37
+
+[[profile.default.overrides]]
+filter = 'binary_id(infinityd::replay_spill) & test(=a_tail_above_every_cells_window_boots_under_fsync_everysec)'
+priority = 35
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-server::recover_replay_steps) & test(=every_budget_recovers_the_state_of_the_unparked_boot)'
+priority = 34
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-log) & test(=flush::tests::the_round_envelope_holds_over_its_two_hundred_cases)'
+priority = 32
+
+[[profile.default.overrides]]
+filter = 'binary_id(infinityd::replay_spill) & test(=the_same_load_inside_every_cells_window_boots_without_demoting)'
+priority = 30
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-store) & test(=index_maint::tests::death_scratch_is_released_when_the_evaluation_is_refused)'
+priority = 29
+
+[[profile.default.overrides]]
+filter = 'binary_id(crash-matrix::matrix) & test(=node_rows_execute_and_prove_their_verdicts)'
+priority = 25
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-alloc) & test(=arena::tests::storm_reconciles_byte_exact)'
+priority = 23
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-sim) & test(=durable::park::an_own_publication_on_a_peer_cell_does_not_park_before_its_wake)'
+priority = 20
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-store::tiered_live_set) & test(=live_set_storm_million_ops)'
+priority = 20
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-store::tiered_mutation) & test(=tiered_mutation_storm_million_ops)'
+priority = 18
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-store::ckpt_walk_resume) & test(=persistent_keys_survive_refusals_under_interleaved_churn)'
+priority = 18
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-store::address_space_model) & test(=address_space_storm_million_ops)'
+priority = 18
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-server::recover_replay_steps) & test(=every_budget_recovers_the_end_of_the_unparked_boot)'
+priority = 15
