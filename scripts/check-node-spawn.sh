@@ -49,7 +49,8 @@
 # exist where it resolves or resolves outside the root, a file that ends
 # inside a block comment, whose rest the blanker would drop unseen, a module
 # with no line for rule 5 to read, and a struct of the module whose body
-# rule 5 cannot bound: it does not close before the file ends.
+# rule 5 cannot bound: it does not close before the file ends, or a
+# `struct`, `impl` or `fn` item opens before it does.
 #
 # What the scan does not read, each able to turn a red green (review holds
 # them; ADR-0203 D3 states the forms the scan reads):
@@ -66,13 +67,19 @@
 #     multi-line string literal that holds `/*` blanks every line up to the
 #     next `*/`;
 #   - rule 5 reads the bodies the `struct` keyword opens in the module's own
-#     file, string literals emptied by the same per-line quote count, and
-#     takes every `pub` inside a body for a field's visibility: not a
+#     file, char and string literals emptied by the same per-line count, a
+#     brace inside a header's generics or brackets read as a const block,
+#     and takes every `pub` inside a body for a field's visibility: not a
 #     `union`, a visibility a macro writes, a struct of the module declared
-#     in another file, nor a `pub const` or `pub static` that holds a path.
+#     in another file, nor a `pub const` or `pub static` that holds a path;
+#     a later line of a multi-line string inside a body is read as code, so
+#     a `}` there closes the body and hides the fields after it.
 # The same count reads some text as code, a false red a marker answers: a
 # quoted value inside a raw string, a comment after a `'"'` char literal, and
-# the rest of a nested block comment after its first `*/`.
+# the rest of a nested block comment after its first `*/`. Rule 5 has three
+# more: a `pub` in a macro call in a field's type is a false red; two structs
+# on one line bind a marker to the last; a later line of a multi-line string
+# holding `struct` is a false red, or a scope error.
 #
 # A legitimate use carries `node-spawn-allow: <reason>` on its line or the
 # line above (ADR-0106 D4) and is listed on the OK line; a bare marker is
@@ -297,12 +304,16 @@ function word_at(s, i, w,   before, after) {
     after = substr(s, i + length(w), 1)
     return before !~ "[A-Za-z0-9_#]" && after !~ "[A-Za-z0-9_]"
 }
-# Rule 5 on one line of the module, string literals emptied. The keyword
-# `struct` opens a header; its first `{` or `(` outside the generics opens
-# the body (a `(` after `where` opens a bound, not the body), and `;` ends a
-# unit struct. The body ends at its matching `}` or `)`, and every `pub`
-# inside it is the visibility of a field: no type holds the keyword.
+# Rule 5 on one line of the module, char and string literals emptied. The
+# keyword `struct` opens a header; its first `{` or `(` outside the generics
+# and brackets opens the body (a `(` after `where` opens a bound, not the
+# body), and `;` there ends a unit struct. Inside the generics or brackets a
+# brace opens a const block, read whole; a `>` after `-` or `=` is an arrow.
+# A `struct`, `impl` or `fn` item met before the body opens is a scope error.
+# The body ends at its matching `}` or `)`, and every `pub` inside it is the
+# visibility of a field: no type holds the keyword.
 function fields(text, l,   i, c, n, pad) {
+    gsub("\047[^\047]\047", "\047\047", text)
     gsub("\"[^\"]*\"", "\"\"", text)
     n = length(text)
     i = 1
@@ -326,11 +337,29 @@ function fields(text, l,   i, c, n, pad) {
         }
         c = substr(text, i, 1)
         if (state5 == 1) {
-            if (c == "<") {
+            if (word_at(text, i, "struct") || word_at(text, i, "impl") ||
+                (word_at(text, i, "fn") && substr(text, i + 2) ~ "^[[:space:]]+[A-Za-z_]")) {
+                print "scope " module ": rule 5 cannot bound the header of " struct_name[structs] \
+                    " (its line " struct_line[structs] "): an item opens at line " l \
+                    " before its body does"
+                state5 = 0
+                continue
+            }
+            if (c == "{" && (angle5 != 0 || square5 != 0)) {
+                brace5++
+            } else if (c == "}" && brace5 > 0) {
+                brace5--
+            } else if (brace5 > 0) {
+                # inside a const block: nothing there bounds the header
+            } else if (c == "[") {
+                square5++
+            } else if (c == "]") {
+                square5--
+            } else if (c == "<") {
                 angle5++
             } else if (c == ">") {
-                if (substr(text, i - 1, 1) != "-") { angle5-- }
-            } else if (angle5 == 0) {
+                if (substr(text, i - 1, 1) !~ "[-=]") { angle5-- }
+            } else if (angle5 == 0 && square5 == 0) {
                 if (c == "{") { state5 = 2; depth5 = 1 }
                 else if (c == "(" && !where5) { state5 = 3; depth5 = 1 }
                 else if (c == ";") { state5 = 0 }

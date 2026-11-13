@@ -1654,6 +1654,106 @@ EOF
 printf 'pub struct Other {\n    pub field: u8,\n}\n' | ns_put crates/fx/tests/support/node.rs
 expect green "node-spawn: rule 5 reads the module alone: a pub field in another node.rs" ns "$NS_ROOT"
 ns_reset
+# Rule 5's parser: a header's const block and brackets, char literals, arrows,
+# and an item met before a body opens.
+nf_case 'rule 5: a const block in a generic default is read whole' 2 "rule 5, a field of Shift" <<'EOF'
+pub struct Shift<const N: usize = { 1 << 2 }> {
+    pub planted: [u8; N],
+}
+EOF
+nf_case "rule 5: a const block's > closes no generics" 2 "rule 5, a field of Compare" <<'EOF'
+pub struct Compare<const N: usize = { (3 > 2) as usize }> {
+    pub planted: [u8; N],
+}
+EOF
+nf_case "rule 5: a where clause's brackets hold their ; and const block" 5 \
+    "rule 5, a field of WhereBlock" <<'EOF'
+pub struct WhereBlock
+where
+    [u8; { 1 << 2 }]: Sized,
+{
+    pub planted: u8,
+}
+EOF
+nf_case "rule 5: a '}' char literal closes no body" 3 "rule 5, a field of CharBrace" <<'EOF'
+pub struct CharBrace {
+    width: [u8; { '}' as usize }],
+    pub planted: u8,
+}
+EOF
+nf_case "rule 5: a '\"' char literal opens no string" 1 "rule 5, a field of OddQuote" <<'EOF'
+pub struct OddQuote(Wrap<{ b'"' }>, pub u8, Wrap<{ "x".len() as u8 }>);
+EOF
+cat >>"$NS_ROOT/$NSM" <<'EOF'
+macro_rules! make {
+    (struct $name:ident) => {
+        pub struct $name {
+            pub planted: u8,
+        }
+    };
+}
+EOF
+expect_red_because "node-spawn: rule 5: a matcher's => closes no generics" \
+    "$NSM:$((nsm_base + 3)): rule 5, a field of a struct" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: ... and the arm's struct is read" \
+    "$NSM:$((nsm_base + 4)): rule 5, a field of a struct" ns "$NS_ROOT"
+ns_reset
+for item in 'pub struct Next {' 'impl Next {' 'fn helper() {'; do
+    printf 'pub struct Truncated<T>\n%s\n    pub planted: u8,\n}\n' "$item" >>"$NS_ROOT/$NSM"
+    expect_red_because "node-spawn: rule 5: '$item' before a header's body opens is a scope error" \
+        "SCOPE ERROR: $NSM: rule 5 cannot bound the header of Truncated (its line $((nsm_base + 1))): an item opens at line $((nsm_base + 2))" \
+        ns "$NS_ROOT"
+    ns_reset
+done
+nf_green 'rule 5: a fn pointer type in a header is no item' \
+    <<<'pub struct Callback<F = fn(u8) -> u8>(F);'
+nf_green 'rule 5: a lifetime is no char literal' <<'EOF'
+pub struct Borrowed<'a>(&'a u8);
+pub struct After(u8);
+EOF
+printf 'pub struct Unfinished<T>\n' >>"$NS_ROOT/$NSM"
+expect_red_because "node-spawn: rule 5: a header still open at the file's end is a scope error" \
+    "SCOPE ERROR: $NSM: rule 5 cannot bound the body of Unfinished (its line $((nsm_base + 1)))" \
+    ns "$NS_ROOT"
+ns_reset
+nf_case 'rule 5: a marker that counts more than its struct has is red' 1 \
+    "node-field-public counts 3 field(s) with a visibility and Over has 2" <<'EOF'
+// node-field-public: 3 fields, one more than there is
+pub struct Over {
+    pub first: u8,
+    pub second: u8,
+}
+EOF
+nf_case 'rule 5: a marker in the singular is bare' 1 "a bare node-field-public marker" <<'EOF'
+// node-field-public: 1 field, the singular
+pub struct One {
+    pub only: u8,
+}
+EOF
+nf_case "rule 5: a where inside a name rule 5 cannot read opens no where clause" 3 \
+    "rule 5, a field of a struct" <<'EOF'
+macro_rules! named {
+    ($nowhere:ident) => {
+        pub struct $nowhere(pub u8);
+    };
+}
+EOF
+cat >>"$NS_ROOT/$NSM" <<'EOF'
+// node-field-public: 2 fields, both on one line
+pub struct Two(pub u8, pub u8);
+EOF
+expect green "node-spawn: rule 5: two pub on one line are two fields" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: ... listed with their count" \
+    "public by design: $NSM:$((nsm_base + 1)): Two, 2 field(s): both on one line" ns "$NS_ROOT"
+ns_reset
+nf_green 'rule 5: two structs on one line: the marker marks the last' <<'EOF'
+// node-field-public: 1 fields, the last struct of its line
+pub struct Empty; pub struct Last(pub u8);
+EOF
+nf_green "rule 5: a marker on its struct's line marks it before the next line's" <<'EOF'
+pub struct First(pub u8); // node-field-public: 1 fields, its own line
+pub struct Second(pub u8); // node-field-public: 1 fields, its own line too
+EOF
 
 # Scope errors.
 printf 'fn f() {}\n/* never closed\nfn g() {}\n' | ns_put "$P"
