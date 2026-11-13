@@ -1776,12 +1776,14 @@ impl TurnShape {
     }
 }
 
-/// G3's three terms on one cell between two iterations: the tier class's
-/// spend in the budget's ledger, the tier bytes and ops the driver
-/// observed, and those granted and not yet submitted. A grant waits in one
-/// place, the cell loop's queue: the plane pushes MAINTAIN's grants there
-/// in the iteration that granted them, and the next iteration's first
-/// driver entry takes the queue whole.
+/// The three terms of the spend's equality, the rule that the tier class's
+/// spend equals the tier bytes and ops the sim disk saw (ADR-0178 I10), on
+/// one cell between two iterations: the tier class's spend in the budget's
+/// ledger, the tier bytes and ops the driver observed, and those granted
+/// and not yet submitted. A grant waits in one place, the cell loop's
+/// queue: the plane pushes MAINTAIN's grants there in the iteration that
+/// granted them, and the next iteration's first driver entry takes the
+/// queue whole.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct TierSpendTerms {
     spent_bytes: u64,
@@ -1793,17 +1795,17 @@ struct TierSpendTerms {
 }
 
 impl TierSpendTerms {
-    /// G3: the spend is what the driver saw and what waits to be
-    /// submitted, on both axes.
+    /// The spend's equality: the spend is what the driver saw and what
+    /// waits to be submitted, on both axes.
     fn holds(&self) -> bool {
         self.spent_bytes == self.driver_bytes + self.queued_bytes
             && self.spent_ops == self.driver_ops + self.queued_ops
     }
 }
 
-/// The one reader of G3's terms on `cell`: the step check reads it at
-/// every step boundary and the scrape at the cut. Population: one cell's
-/// budget, driver and loop.
+/// The one reader of the terms of the spend's equality on `cell`: the step
+/// check reads it at every step boundary and the scrape at the cut.
+/// Population: one cell's budget, driver and loop.
 fn tier_spend_terms(node: &Node, cell: usize, stats: &inf_server::DurableStats) -> TierSpendTerms {
     let tier = inf_runtime::IoClass::TierFlush.index();
     let counted = stats.io_budget[tier];
@@ -1826,10 +1828,10 @@ fn tier_spend_terms(node: &Node, cell: usize, stats: &inf_server::DurableStats) 
     }
 }
 
-/// G3 judged at every step boundary of the traffic phase, per cell: every
-/// grant waits in the cell loop's queue across exactly one boundary (a
-/// step runs each cell's iteration once), so the term read from that
-/// queue is tested where it differs from the driver's. A cell's first
+/// The spend's equality judged at every step boundary of the traffic phase,
+/// per cell: every grant waits in the cell loop's queue across exactly one
+/// boundary (a step runs each cell's iteration once), so the term read from
+/// that queue is tested where it differs from the driver's. A cell's first
 /// broken step is its violation; the steps whose loop queue held a tier op
 /// are the check's liveness, and a cell that spent with none is vacuous:
 /// the check told the two queues apart nowhere on it.
