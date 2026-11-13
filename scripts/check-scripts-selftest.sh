@@ -280,13 +280,21 @@ drv_clocked() { # <name> <begin> <end>: one green group; its clock reads <begin>
     drv_fixture "$1" 'group_one() {' 'expect green "one passes" true' '}' \
         "selftest_clock() { if [ \$((pass + fail)) -eq 0 ]; then echo $2; else echo $3; fi; }"
 }
-f=$(drv_fixture clocked 'group_one() {' 'expect green "one passes" true' '}' \
-    'group_two() {' 'expect green "two passes" true' '}' \
-    'selftest_clock() { if [ $((pass + fail)) -eq 0 ]; then echo 100;' \
-    'else case $SELFTEST_GROUP in one) echo 105 ;; *) echo 130 ;; esac; fi; }')
+drv_pair() { # <name> <one's end> <two's end>: two green groups, each clock 100, then its end
+    drv_fixture "$1" 'group_one() {' 'expect green "one passes" true' '}' \
+        'group_two() {' 'expect green "two passes" true' '}' \
+        'selftest_clock() { if [ $((pass + fail)) -eq 0 ]; then echo 100;' \
+        "else case \$SELFTEST_GROUP in one) echo $2 ;; *) echo $3 ;; esac; fi; }"
+}
 drv_ok='check-scripts self-test OK (2 cases in 2 groups, each exiting non-zero on its planted case:'
+# The longest group is the last read in one fixture and the first in the other,
+# so a driver that names the last group, or the first, is red on one of them.
+f=$(drv_pair clocked 105 130)
 expect green "driver: the OK line, alone, names the longest group with its seconds" drv_only "$f" \
     "$drv_ok one, two); the longest group: two, 3.0 s"
+f=$(drv_pair clocked-first 130 105)
+expect green "driver: the longest group is named when it is the first read" drv_only "$f" \
+    "$drv_ok one, two); the longest group: one, 3.0 s"
 f=$(drv_clocked instant 100 100)
 expect_output "driver: a group of no measurable time is still named, at 0.0 s" \
     "; the longest group: one, 0\.0 s\$" drv_run "$f"
