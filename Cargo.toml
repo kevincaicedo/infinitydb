@@ -72,6 +72,17 @@ undocumented_unsafe_blocks = "deny"
 dbg_macro = "deny"
 todo = "deny"
 
+# inf-doc's unit tests walk a 65,535-key intern table, a dictionary walk
+# quadratic in its size: about 39 s unoptimized, 10 s at opt-level 1, and the
+# longest test of its feature set. `test` inherits `dev`, so a test run and
+# `cargo build` stay one build that shares every unit above inf-doc, and a
+# path into target/debug names it (ADR-0204 D3). Debug assertions and overflow
+# checks keep their `dev` values: inf-doc's `build_profile` tests fail in any
+# build of the crate without them. A package given an opt-level here carries
+# the same two tests; review holds that, no gate reads this table.
+[profile.dev.package.inf-doc]
+opt-level = 1
+
 # Benchmarks and profiling need symbols; keep debug info in release.
 [profile.release]
 lto = "thin"
