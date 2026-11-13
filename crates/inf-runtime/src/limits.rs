@@ -46,6 +46,7 @@ pub const COLD_DELIVERIES_PER_TURN: u32 = 64;
 /// one unit and any other candidate two. Owner: the turn's
 /// [`ColdPreparationBudget`](crate::ColdPreparationBudget), which
 /// [`ColdTurn::begin`](crate::ColdTurn::begin) alone builds, beside the delivery allowance, and
-/// which no caller can reset. Crossing: pace — the queued requests not yet inspected wait for
-/// the next turn.
+/// which no caller can reset. Crossing: none yet — every turn builds and lends the allowance and
+/// no drain spends it until the budgeted preparation pass, whose crossing is pace, the queued
+/// requests not yet inspected waiting for the next turn.
 pub const COLD_PREPARATION_WORK_PER_TURN: u32 = 64;
