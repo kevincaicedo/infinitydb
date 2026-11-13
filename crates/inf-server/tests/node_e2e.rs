@@ -9938,12 +9938,23 @@ fn del_of_a_rebuilt_winner_carrying_two_tickets_drains_every_ticket() {
     c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
     read_exactly(&mut c, format!(":{}\r\n", filler_keys + 2).as_bytes());
     drop(c);
-    node.stop();
+    // Life 3 reads the DEL, an everysec write: the crash-equivalent stop
+    // promises it nothing, so life 2 drains and syncs its log.
+    node.stop_synced();
     // Life 3 (no fault): the deletion is durable, the collision keys
     // survive, no ticket re-forms (the winner is gone).
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
     use_t(&mut c);
+    // The precondition, read before any GET: the boot replayed life 2's
+    // marker and Delete past life 1's checkpoint. Without them the GET
+    // would serve the checkpoint's k1, a wrong value for a lost frame.
+    let replayed = scrape_u64(&mut c, b"persistence", "recover_replay_records:");
+    assert!(
+        replayed >= 2,
+        "VACUOUS: life 2's DEL did not reach the log before its stop ({replayed} record(s) \
+         replayed past the checkpoint, want its marker and its Delete)"
+    );
     c.write_all(&cmd(&[b"GET", &k1])).expect("write");
     read_exactly(&mut c, b"$-1\r\n");
     c.write_all(&cmd(&[b"GET", &k0])).expect("write");
