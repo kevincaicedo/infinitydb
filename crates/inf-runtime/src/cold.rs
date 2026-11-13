@@ -777,6 +777,21 @@ struct DeliveryStep {
     receipt_us: u64,
 }
 
+/// What one delivery step met: each outcome its own variant, so the walk's
+/// end state is the step's answer, never read back from the list.
+enum DeliveryVisit {
+    /// A member visited, its unit spent: its value, delivered after the
+    /// state borrow.
+    Member(DeliveryStep),
+    /// No window is ready; nothing spent.
+    Idle,
+    /// The turn's allowance is spent; nothing spent, the ready windows wait.
+    Spent,
+    /// A ready link named no ready window, after its unit: a defect,
+    /// counted where the walk stopped, the link left in place.
+    Stale,
+}
+
 /// Leak report from [`ColdReads::reconcile`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct ColdLeak {
@@ -1275,7 +1290,15 @@ impl ColdReads {
         let spent_before = budget.spent();
         let mut progress =
             ColdDeliveryProgress { delivered: 0, unclaimed: 0, state: ColdDeliveryState::Idle };
-        while let Some(step) = self.delivery_step(budget) {
+        loop {
+            let step = match self.delivery_step(budget) {
+                DeliveryVisit::Member(step) => step,
+                DeliveryVisit::Idle => break,
+                DeliveryVisit::Spent | DeliveryVisit::Stale => {
+                    progress.state = ColdDeliveryState::Ready;
+                    break;
+                }
+            };
             if self.gate.complete(step.logical, step.done) {
                 progress.delivered += 1;
                 let mut state = self.state.borrow_mut();
@@ -1295,24 +1318,18 @@ impl ColdReads {
         state.counters.delivery_work += u64::from(spent);
         let turn_max = state.counters.delivery_work_turn_max.max(budget.spent());
         state.counters.delivery_work_turn_max = turn_max;
-        if state.ready_head.is_some() {
-            progress.state = ColdDeliveryState::Ready;
-        }
         progress
     }
 
     /// One delivery step under a short state borrow: a unit spent, the
     /// ready head's member at its cursor read, the cursor advanced and the
-    /// window re-linked or retired, and the member's value built. `None`
-    /// with nothing spent when no window is ready or the allowance is
-    /// spent; `None` after the unit when a link names no ready window, a
-    /// defect counted where the walk stopped.
-    fn delivery_step(&self, budget: &mut ColdDeliveryBudget) -> Option<DeliveryStep> {
+    /// window re-linked or retired, and the member's value built.
+    fn delivery_step(&self, budget: &mut ColdDeliveryBudget) -> DeliveryVisit {
         let mut state_ref = self.state.borrow_mut();
         let state = &mut *state_ref;
-        let window = state.ready_head?;
+        let Some(window) = state.ready_head else { return DeliveryVisit::Idle };
         if !budget.take() {
-            return None;
+            return DeliveryVisit::Spent;
         }
         let Some(read) = state.inflight.get_mut(&window) else {
             return Self::link_stale(state, "the ready head names no window");
@@ -1343,7 +1360,7 @@ impl ColdReads {
             Self::link_ready(state, window);
         }
         let done = ColdDone { outcome, state: Rc::clone(&self.state), window, skip, len, file };
-        Some(DeliveryStep { logical, done, enqueued_us, receipt_us })
+        DeliveryVisit::Member(DeliveryStep { logical, done, enqueued_us, receipt_us })
     }
 
     /// Links `window` at the ready list's tail.
@@ -1363,10 +1380,10 @@ impl ColdReads {
 
     /// A ready-list link that named no ready window (a defect): counted, a
     /// debug assertion carrying `cold-link-stale`, and the walk stops.
-    fn link_stale(state: &mut ColdState, why: &str) -> Option<DeliveryStep> {
+    fn link_stale(state: &mut ColdState, why: &str) -> DeliveryVisit {
         state.counters.links_stale += 1;
         debug_assert!(false, "cold-link-stale: {why}");
-        None
+        DeliveryVisit::Stale
     }
 
     /// Whether a window has members left to visit: the park decision's
