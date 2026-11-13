@@ -20,10 +20,14 @@
 // the writer's batches never reach. The cold reads park on the device, never
 // on a stall.
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Keys written, each a small value: about 13 MB, four times the
@@ -46,7 +50,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 const TAIL_STALL_TIMEOUT_MS: &[u8] = b"60000";
 
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
 }
@@ -70,7 +74,8 @@ impl Server {
             .expect("addr")
             .port()
             .to_string();
-        let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+        let child = NodeBinary::built()
+            .command()
             .args(["--port", &port, "--cells", "1", "--device-probe", "off", "--data-dir"])
             .arg(dir)
             .stdout(Stdio::null())
