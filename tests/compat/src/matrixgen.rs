@@ -21,6 +21,9 @@
 //! - `extension` — InfinityDB `INF.*` surface, unknown to Redis.
 //! - `internal` — fabric program primitives, not a client surface.
 
+// nextest-stall-default: this file creates and writes no namespace; it names the
+// tiering keys only in the text of the compatibility matrix it renders.
+
 use inf_wire::{COMMANDS, CmdFlags};
 
 use crate::candidate::Candidate;

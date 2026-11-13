@@ -22,7 +22,11 @@
 //! makes one compare-and-swap of the lane word, retried only after another thread's swap
 //! succeeded (lock-free); then, if its swap set `Q` from clear, pushes the bridge. The swap, or
 //! the push, is the call's last access to the header and the stack, unless it made the caller
-//! the header's freer ([`Released::Last`]).
+//! the header's freer ([`Released::Last`]). After it the call neither reads through its
+//! references to them nor copies one, not even into a function that reads nothing: another
+//! thread may have freed both, and a reference to freed memory is undefined behavior once it is
+//! formed. Only a schedule that preempts the call there shows a breach: `inf-runtime`'s
+//! `tests/waker_race.rs` runs that window under Miri at a pinned preemption rate.
 //!
 //! **The drain** is the owner's: [`RemoteStack::take`] takes the whole stack in one swap, and
 //! for each bridge [`Drained::deliver_next`] reads its link first, then clears `Q` and `W` in one
@@ -225,7 +229,9 @@ const RETAIN_ZERO_ORDERING: Ordering = Ordering::Relaxed;
 const PLANT_DROP_NOTIFY_SPLIT: bool = cfg!(inf_canary_wake_drop_notify_split);
 /// The drain clears `Q` before it reads the link.
 const PLANT_CLEAR_BEFORE_LINK: bool = cfg!(inf_canary_wake_clear_before_link);
-/// A foreign call adds to `waker_foreign_ops` after its swap and its push.
+/// A foreign call adds to `waker_foreign_ops` after its swap and its push. That add is compiled
+/// into the planted build alone, a `cfg` statement at each call's end, so a plain build has no
+/// statement past the access that names the stack.
 const PLANT_COUNT_AFTER_PUSH: bool = cfg!(inf_canary_wake_count_after_push);
 /// A foreign wake sets `W` and not `Q`, so it pushes nothing.
 const PLANT_WAKE_WITHOUT_QUEUE: bool = cfg!(inf_canary_wake_without_queue);
@@ -445,7 +451,8 @@ impl WakeBridge {
             }
             lane.with_count(count + 1)
         });
-        count_after(stack);
+        #[cfg(inf_canary_wake_count_after_push)]
+        stack.count_foreign();
     }
 
     /// A foreign `wake_by_ref`: `W` and `Q` set unless the header is closed, and the bridge
@@ -467,7 +474,8 @@ impl WakeBridge {
         let old = loop {
             let lane = Lane(word);
             if lane.has(CLOSED) {
-                count_after(stack);
+                #[cfg(inf_canary_wake_count_after_push)]
+                stack.count_foreign();
                 return Pushed::Closed;
             }
             self.tomb.visit();
@@ -494,7 +502,8 @@ impl WakeBridge {
                 }
             }
         };
-        count_after(stack);
+        #[cfg(inf_canary_wake_count_after_push)]
+        stack.count_foreign();
         pushed
     }
 
@@ -602,7 +611,10 @@ impl WakeBridge {
                 },
             }
         };
-        count_after(stack);
+        // Past the swap or the push nothing names `self` or `stack`: another thread may have
+        // freed both (the module's rule).
+        #[cfg(inf_canary_wake_count_after_push)]
+        stack.count_foreign();
         released
     }
 
@@ -642,16 +654,11 @@ fn raise_unless_closed(lane: Lane, raise: u64) -> Lane {
 }
 
 /// A foreign call's add to `waker_foreign_ops`, made first: the call's waker then still keeps
-/// the header, and so the stack, allocated (ADR-0003 A1.2.5).
+/// the header, and so the stack, allocated (ADR-0003 A1.2.5). The plant's add after the access
+/// is a `cfg` statement in each call, never a call of a function like this one: even a call
+/// that does nothing would copy the reference after another thread may have freed the stack.
 fn count_before(stack: &RemoteStack) {
     if !PLANT_COUNT_AFTER_PUSH {
-        stack.count_foreign();
-    }
-}
-
-/// The add's planted place: after the swap and the push.
-fn count_after(stack: &RemoteStack) {
-    if PLANT_COUNT_AFTER_PUSH {
         stack.count_foreign();
     }
 }

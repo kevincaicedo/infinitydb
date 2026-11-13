@@ -227,6 +227,11 @@ pub struct NodeState {
     pub pubsub_fan_msgs: Cell<u64>,
     pub pubsub_delivered: Cell<u64>,
     pub cob_disconnections: Cell<u64>,
+    /// Publish fan legs this cell's owner pump could not stage on the
+    /// credit general sends leave free, each then sent as a general op
+    /// (ADR-0192 D3). Cell scope; 0 by the reserve's proof, so any other
+    /// reading is a finding (`INFO` `# Tripwires`).
+    pub fabric_reserve_refused_cell: Cell<u64>,
     /// Idle connections closed by `timeout` (ADR-0123 D2; `INFO stats
     /// idle_disconnections`, cell scope).
     pub idle_disconnections: Cell<u64>,

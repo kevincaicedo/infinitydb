@@ -5612,6 +5612,9 @@ fn t_ckpt_seconds(share_bytes_per_s: f64, owed: f64, cap: f64, charged: f64, del
 /// advanced, the checkpoint never published, and `INF.CKPT WAIT` never
 /// returned. The bound is two D4 waits (the oversized block, then the
 /// footer behind its debt) plus 2 s of harness slack.
+// nextest-alone: 1.0-2.0 s. Its bound, about 3.5 s, is its subject and leaves
+// less slack than a hang bound, so the CPU and device that sibling test
+// processes take would move the verdict (ADR-0200 D7).
 #[test]
 fn a_checkpoint_holding_a_value_above_the_class_cap_completes() {
     let dir = temp_data_dir("ckpt-overrun");
@@ -6048,6 +6051,7 @@ fn two_backlogged_tiered_namespaces_on_one_cell_acknowledge_every_write() {
 
 /// R3-exit, leg two: the `1mb` namespace under a light steady load
 /// beside the `8mb` one's backlog.
+// nextest-long: 39 s
 #[test]
 fn a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write() {
     two_tiered_namespaces_acknowledge_every_write(&TierExitLeg {
@@ -7511,6 +7515,7 @@ fn read_n(stream: &mut TcpStream, n: usize) -> Vec<u8> {
 /// of one 1,102-byte string, so each key's reply is 72,286,226 B and is
 /// served, and the two keys' reply, 144,572,448 B, is refused with no
 /// element sent; the connection keeps serving, and `PING` before it stands.
+// nextest-long: 99 s
 #[test]
 #[cfg(feature = "doc")]
 fn json_mget_aggregate_refuses_at_the_wire() {
@@ -9933,12 +9938,23 @@ fn del_of_a_rebuilt_winner_carrying_two_tickets_drains_every_ticket() {
     c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
     read_exactly(&mut c, format!(":{}\r\n", filler_keys + 2).as_bytes());
     drop(c);
-    node.stop();
+    // Life 3 reads the DEL, an everysec write: the crash-equivalent stop
+    // promises it nothing, so life 2 drains and syncs its log.
+    node.stop_synced();
     // Life 3 (no fault): the deletion is durable, the collision keys
     // survive, no ticket re-forms (the winner is gone).
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
     use_t(&mut c);
+    // The precondition, read before any GET: the boot replayed life 2's
+    // marker and Delete past life 1's checkpoint. Without them the GET
+    // would serve the checkpoint's k1, a wrong value for a lost frame.
+    let replayed = scrape_u64(&mut c, b"persistence", "recover_replay_records:");
+    assert!(
+        replayed >= 2,
+        "VACUOUS: life 2's DEL did not reach the log before its stop ({replayed} record(s) \
+         replayed past the checkpoint, want its marker and its Delete)"
+    );
     c.write_all(&cmd(&[b"GET", &k1])).expect("write");
     read_exactly(&mut c, b"$-1\r\n");
     c.write_all(&cmd(&[b"GET", &k0])).expect("write");

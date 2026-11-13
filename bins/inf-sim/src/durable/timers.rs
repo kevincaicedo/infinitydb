@@ -329,6 +329,7 @@ mod tests {
     /// armed at once with the episodes inside one window; one owner per
     /// role, its arm cancelled at the episode's issue, holds the peak at
     /// the role count.
+    // nextest-long: 85 s
     #[test]
     fn dense_fill_episodes_keep_a_cells_timers_within_its_roles() {
         let scenario = DurableScenario::m2_fill_tick_dense(SEED);
@@ -358,6 +359,7 @@ mod tests {
     /// 3 s, holds the everysec timer and the few episodes one sparse writer
     /// opens in a window, so the dense leg's red is its density and not the
     /// instrument.
+    // nextest-long: 138 s
     #[test]
     fn a_sparse_fill_writer_keeps_a_cells_timers_within_its_roles() {
         let report = run_durable_scenario(&DurableScenario::m2_fill_tick(SEED));

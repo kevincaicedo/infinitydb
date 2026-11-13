@@ -1291,8 +1291,15 @@ PY
 # ADR-0106 D18: the probe compiles for an explicit target, so the
 # architecture the judge discloses is the one Clippy resolved against.
 probe_target "$pin" || { echo "LINT-SCOPES SCOPE ERROR: the probe's target architecture is unknown"; exit 1; }
-(cd "$pwork/probe" && env -u CLIPPY_CONF_DIR -u RUSTC_BOOTSTRAP cargo +"$pin" clippy --quiet --target "$PROBE_TARGET" \
-    --target-dir "$pwork/target" --message-format=json >"$pwork/diag.json" 2>"$pwork/stderr") || true
+# The probe builds cold, in a directory no earlier run wrote (ADR-0204 D4): exit
+# 2 is that check's refusal with nothing run, a scope error; any other status is
+# clippy's, which the judge reads.
+# shellcheck source=target-root.sh
+. "$SCRIPT_DIR/target-root.sh"
+probe_status=0
+(cd "$pwork/probe" && target_root_cargo_fresh "$pwork/target" env -u CLIPPY_CONF_DIR -u RUSTC_BOOTSTRAP cargo +"$pin" clippy --quiet --target "$PROBE_TARGET" \
+    --message-format=json >"$pwork/diag.json" 2>"$pwork/stderr") || probe_status=$?
+[ "$probe_status" -ne 2 ] || { echo "LINT-SCOPES SCOPE ERROR: the probe did not run:"; sed 's/^/    | /' "$pwork/stderr"; exit 1; }
 # The unresolved entries probe-target.sh defers to their own leg; the judge
 # fails every other one.
 foreign=

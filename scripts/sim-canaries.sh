@@ -60,7 +60,10 @@
 # Fixture mode (scripts/check-scripts-selftest.sh): INF_CANARY_ROWS_FILE
 # replaces the row table, INF_CANARY_CARGO the cargo binary and
 # INF_CANARY_SIM_TARGET the directory a scenario row's simulators are read
-# from (`target`; a stub cargo builds nothing there).
+# from (`target`; a stub cargo builds nothing there). INF_CANARY_SIM_TARGET
+# beside a real cargo (no INF_CANARY_CARGO, or one whose `--version` answers
+# as cargo does) is a scope error: a row judges the simulators its own build
+# wrote in this checkout's root (ADR-0204).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 seed=${1:-0xC0FFEE}
@@ -232,17 +235,16 @@ rows=(
   # The group is every unsent write: a whole 1 MiB round offered at once,
   # above the class cap at the hostile share.
   "inf_canary_tier_group_whole_round m4-tier-budget TIER-CAP --tier-leg two-1mb-hostile"
-  # The issue visit starts at index 0 and continues past a refusal: at the
-  # hostile share the second namespace's group waits past n × T_c.
-  "inf_canary_tier_turn_index_order m4-tier-budget TIER-TURN --tier-leg two-1mb-hostile"
-  # The same plant at the two-cell binary, the light-load leg: the starved
-  # namespace's ready group waits past n × T_c, read from INFO beside the
-  # replies (its writer's own bound is four group bounds, so the replies
-  # stay +OK). The both-backlogged leg is not a row: at the real device
-  # its planted starvation depends on when the light namespace's groups
-  # become ready relative to the heavy one's, so it cannot go red
-  # reliably; it stays a test of the fair build.
-  "inf_canary_tier_turn_index_order crate-test inf-server test:node_e2e a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write a ready group waited"
+  # The issue visit starts at index 0 and continues past a refusal: on the
+  # thief leg the thief, first in the visit, takes every opening while it
+  # holds a sealed backlog, and the second namespace's group, larger on
+  # bytes and not smaller on ops, waits for that backlog, past n × T_c.
+  # The plant's one row: with rounds bounded by the slice, a second
+  # namespace with small groups is served between a backlog's rounds
+  # whatever the visit order, and at the binary a starved writer's typed
+  # timeout fails a test before its witness, so the binary tests stay
+  # tests of the fair build.
+  "inf_canary_tier_turn_index_order m4-tier-budget TIER-TURN --tier-leg two-1mb-thief"
   # A retry group reaches the driver with no offer: the spend falls below
   # what the disk saw, on the retry arm.
   "inf_canary_tier_retry_ungranted m4-tier-budget TIER-SPEND --tier-leg two-8mb --plant tier-write-eio"
@@ -919,6 +921,26 @@ rows=(
   # refuses its repeated audit, which the planted gather serves.
   "inf_canary_json_gather_unaccounted crate-test inf-server test:node_e2e every_split_json_row_is_charged_whole_in_a_numbered_database reply mismatch"
   "inf_canary_json_gather_unaccounted m3-document REPLY"
+  # ADR-0192 D3: the publish fan's legs are general sends that wait for a
+  # credit, as if none were kept for the fan; each owner's pump waits for a
+  # credit only the other owner's replies return, and the liveness detector
+  # reads the stall.
+  "inf_canary_fan_draws_general m1-pub-cross STALL"
+  # ADR-0192 D2: a general send may take the fan's last credit; a leg then
+  # finds none and is counted before it waits, and the run's end reads the
+  # count on every cell.
+  "inf_canary_reserve_unguarded m1-pub-cross RESERVE"
+  # The thief leg's premise: a thief of two writers with a tenth of its
+  # window mutable seals late and holds a backlog below its slice inside the
+  # wait bound's window, so the leg's premise clause reads it vacuous (a
+  # vacuity plant, read in the simulator alone).
+  "inf_canary_thief_premise_short m4-tier-budget thief-premise-short --tier-leg two-1mb-thief"
+  # The spend's queued term reads the driver's own queue, which every entry
+  # drains, in place of the cell loop's, where a grant waits one step: the
+  # equality breaks at the first step a grant waits, and no step finds a
+  # tier op queued (a vacuity plant, read in the simulator alone).
+  "inf_canary_tier_spend_driver_queue m4-tier-budget TIER-SPEND --tier-leg two-1mb-thief"
+  "inf_canary_tier_spend_driver_queue m4-tier-budget tier-spend-unqueued --tier-leg two-1mb-thief"
   # ADR-0181 R4: a cold-read host mints each identity pair once and never returns one; planted,
   # a cancelled request's pair returns to the issuer, so the next request repeats its ids.
   "inf_canary_cold_identity_recycled crate-test inf-runtime lib every_identity_the_issuer_mints_is_fresh_and_typed_by_parity an id repeats"
@@ -961,6 +983,29 @@ if [ -n "${INF_CANARY_SHARD:-}" ]; then
   echo "sim-canaries: shard $shard_i/$shard_k: ${#picked[@]} of ${#rows[@]} rows (${#cfgs[@]} cfgs)"
   [ "${#picked[@]}" -gt 0 ] || { echo "sim-canaries: SCOPE ERROR — shard $shard_i/$shard_k holds no cfg"; exit 1; }
   rows=("${picked[@]}")
+fi
+
+# Every build lands in this checkout's target root, each planted cfg in a
+# directory of its own there (its RUSTFLAGS differ), and every leg runs the
+# binary its own build made, whatever CARGO_TARGET_DIR holds (ADR-0198 A2).
+# shellcheck source=target-root.sh
+. scripts/target-root.sh
+target_root_setup "$(pwd -P)"
+# The simulator directory knob is the self-test's stub route: a real cargo
+# builds into the root, so a row read elsewhere would judge another build.
+# A cargo is real when none is named, or when it answers `--version` as cargo
+# does: the real one or a wrapper passing through to it.
+if [ -n "${INF_CANARY_SIM_TARGET:-}" ]; then
+  cargo_answer=
+  if [ -n "${INF_CANARY_CARGO:-}" ]; then cargo_answer=$("$CARGO" --version 2>/dev/null || true); fi
+  case "${INF_CANARY_CARGO:+named}:$cargo_answer" in
+    : | named:"cargo "[0-9]*)
+      echo "sim-canaries: SCOPE ERROR — INF_CANARY_SIM_TARGET is the self-test's stub route, and" \
+        "this cargo is a real one: unset INF_CANARY_SIM_TARGET, so each row reads what it built" \
+        "in $TARGET_ROOT"
+      exit 1
+      ;;
+  esac
 fi
 
 fail=0
@@ -1006,7 +1051,8 @@ crate_test() {
   if [ "$package" = inf-sim ]; then target_args+=(--features dst); fi
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
   echo "== canary $cfg: $package $target $name on the plain build must stay green"
-  if ! "$CARGO" test -p "$package" "${target_args[@]}" -- "$name" --show-output > "$control" 2>&1 \
+  if ! "$CARGO" test -p "$package" "${target_args[@]}" --target-dir "$TARGET_ROOT" -- "$name" \
+      --show-output > "$control" 2>&1 \
       || ! grep -Eq -- "${verdict}ok" "$control"; then
     echo "   the plain build does not pass '$name' (a canary needs a green control):"
     tail -5 "$control"
@@ -1020,7 +1066,7 @@ crate_test() {
   if [ "$controls_only" -eq 1 ]; then return; fi
   echo "== canary $cfg: $package $target $name on the planted build must go red"
   if RUSTFLAGS="--cfg $cfg" "$CARGO" test -p "$package" "${target_args[@]}" \
-      --target-dir "target/canary-crate" -- "$name" > "$log" 2>&1; then
+      --target-dir "$TARGET_ROOT/canary-crate" -- "$name" > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
@@ -1050,7 +1096,7 @@ loom_test() {
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
   echo "== canary $cfg: $package loom $name on the plain loom build must stay green"
   if ! RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" --release \
-      --lib --target-dir "target/loom" -- "$name" --show-output > "$control" 2>&1 \
+      --lib --target-dir "$TARGET_ROOT/loom" -- "$name" --show-output > "$control" 2>&1 \
       || ! grep -Eq -- "${verdict}ok" "$control"; then
     echo "   the plain loom build does not pass '$name' (a canary needs a green control):"
     tail -5 "$control"
@@ -1064,7 +1110,7 @@ loom_test() {
   if [ "$controls_only" -eq 1 ]; then return; fi
   echo "== canary $cfg: $package loom $name on the planted build must go red"
   if RUSTFLAGS="--cfg loom --cfg $cfg" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" \
-      --release --lib --target-dir "target/canary-loom" -- "$name" > "$log" 2>&1; then
+      --release --lib --target-dir "$TARGET_ROOT/canary-loom" -- "$name" > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the model has no teeth)"
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
@@ -1130,7 +1176,7 @@ for row in "${rows[@]}"; do
   fi
   name=${parts[1]}; expect=${parts[2]}; flags=("${parts[@]:3}")
   if [ "$sim_built" -eq 0 ]; then
-    "$CARGO" build --release -p inf-sim --features dst --bin inf-sim
+    "$CARGO" build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT"
     sim_built=1
   fi
   plain=$sim_target/release/inf-sim
@@ -1157,11 +1203,11 @@ for row in "${rows[@]}"; do
     continue
   fi
   if [ "$controls_only" -eq 1 ]; then continue; fi
-  target="$sim_target/canary-$cfg"
-  echo "== canary $cfg: building inf-sim with --cfg $cfg into $target"
+  canary_root="$sim_target/canary-$cfg"
+  echo "== canary $cfg: building inf-sim with --cfg $cfg into $TARGET_ROOT/canary-$cfg"
   RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
-    --target-dir "$target"
-  planted="$target/release/inf-sim"
+    --target-dir "$TARGET_ROOT/canary-$cfg"
+  planted="$canary_root/release/inf-sim"
   echo "== canary $cfg: $name ${flags[*]:-} (lane seed $seed) on the planted build must go red"
   if "$planted" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"

@@ -4,6 +4,10 @@
 //! does not depend on how rustfmt lays out an arm; a flag the usage line
 //! omits on purpose is a row of `NOT_IN_HELP` with its reason.
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::NodeBinary;
 use std::collections::BTreeSet;
 
 /// Parsed flags the usage line leaves out, each with why.
@@ -90,10 +94,8 @@ fn the_scan_reads_every_flag_literal_however_the_arm_is_laid_out() {
 fn help_names_every_parsed_flag() {
     let flags = flag_literals(parse_args_source());
     assert_eq!(flags.len(), PARSED_FLAG_COUNT, "parse_args's flags: {flags:?}");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_infinityd"))
-        .arg("--help")
-        .output()
-        .expect("infinityd --help runs");
+    let output =
+        NodeBinary::built().command().arg("--help").output().expect("infinityd --help runs");
     assert!(output.status.success(), "--help exits 0");
     let help = String::from_utf8(output.stdout).expect("UTF-8 usage line");
     let named = |flag: &str| {

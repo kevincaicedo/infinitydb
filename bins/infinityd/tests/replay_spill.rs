@@ -23,11 +23,16 @@
 //! write is under a completed barrier and both arms compare exactly.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // harness process, not cell code
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -51,11 +56,14 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// those rounds land on is shared with every test process running beside
 /// the arm, so a slow flush there is no defect of it: on a device whose
 /// every flush waits 3 s a demote arm answered a legal `-STALLED` at the
-/// product's 1 s default. Like [`READ_TIMEOUT`] this bound turns a wedged
-/// flush into a failure; it is no device budget (ADR-0200 D7). It sits
-/// below that timeout, so a write that does stall answers typed before the
-/// client calls it a hang.
-const TAIL_STALL_TIMEOUT_MS: u64 = 20_000;
+/// product's 1 s default. A parked write waits whole device barriers, two
+/// to a flush round, behind as many rounds as its cell's flush has queued,
+/// and no product limit bounds that count, so the bound is the largest
+/// value the key takes (1 to 60,000 ms). Like [`READ_TIMEOUT`] it turns a
+/// wedged flush into a failure; it is no device budget (ADR-0200 D7, A1).
+/// It sits below that timeout, so a write that does stall answers typed
+/// before the client calls it a hang.
+const TAIL_STALL_TIMEOUT_MS: u64 = 60_000;
 const _: () = assert!(
     (TAIL_STALL_TIMEOUT_MS as u128) < READ_TIMEOUT.as_millis(),
     "a stalled write answers before the client's hang bound"
@@ -81,16 +89,9 @@ fn data_root(tag: &str) -> PathBuf {
 }
 
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Server {
@@ -104,7 +105,8 @@ impl Server {
             .expect("addr")
             .port()
             .to_string();
-        let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+        let child = NodeBinary::built()
+            .command()
             .args(["--port", &port, "--cells", CELLS, "--pin-start", "4", "--pin-stride", "2"])
             .arg("--data-dir")
             .arg(dir)
@@ -549,16 +551,19 @@ fn assert_step_bound(fsync: &str, field: &dyn Fn(&str) -> u64, info: &str) {
     assert!(yields > 0, "VACUOUS (arm {fsync}): no step yielded inside a unit: {info}");
 }
 
+// nextest-long: 37 s
 #[test]
 fn a_tail_above_every_cells_window_boots_under_fsync_always() {
     run_arm("always", Leg::Demote);
 }
 
+// nextest-long: 35 s
 #[test]
 fn a_tail_above_every_cells_window_boots_under_fsync_everysec() {
     run_arm("everysec", Leg::Demote);
 }
 
+// nextest-long: 30 s
 #[test]
 fn the_same_load_inside_every_cells_window_boots_without_demoting() {
     run_arm("always", Leg::Fit);

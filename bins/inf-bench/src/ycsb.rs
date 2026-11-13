@@ -1342,7 +1342,7 @@ pub fn cmd_ycsb(args: &[String]) -> Result<(), String> {
     let pin_start = flags.str_or("pin-start", "4");
     let seed: u64 = flags.u64_or("seed", 0x1D0C_2026)?;
     let data_root = flags.str_or("data-root", &std::env::temp_dir().to_string_lossy());
-    let bin = flags.str_or("infinityd-bin", "target/release/infinityd");
+    let bin = flags.str_or("infinityd-bin", &crate::cli::default_infinityd_bin());
     let reference_box = flags.bool("reference-box");
     let env_ok = env_gate(&flags)?;
 

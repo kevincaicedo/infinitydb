@@ -4,6 +4,9 @@
 //! and the eviction-pressure p99.9 gate rows belong to the M1-S17 campaign
 //! on the reference box (L10).
 
+// nextest-stall-default: the store sits below the server plane, which alone
+// arms the tail stall (ADR-0053 D4): no write here waits on it.
+
 use inf_foundation::time::Nanos;
 use inf_store::{
     AddressSpaceConfig, CellStore, DemotionConfig, EvictBudget, EvictionPolicy, Keyspace,

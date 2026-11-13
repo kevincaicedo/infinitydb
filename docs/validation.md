@@ -37,6 +37,17 @@ just compat
 just sim-smoke
 ```
 
+`just check` runs each feature set's tests under cargo-nextest, one process
+a test, every binary even after a red, and their doctests under `cargo test
+--doc` (ADR-0200 D1). It needs nextest at the version `.config/nextest.toml`
+requires (`nextest-version`; `cargo install --locked cargo-nextest --version
+<that version>`, as CI installs it), and is red at its second line when
+nextest is missing or older (D5). Its isolation rules (groups of one thread,
+tests run alone) and its start order (a test of 15 s or more starts by its
+seconds, the longest first) live in that file, each paired with its marker in
+the test's source by `scripts/check-nextest-config.sh` (ADR-0207 D1-D3). The
+layer commands below keep `cargo test`.
+
 `just check`, workspace tests and `just compat` require Redis **8.0.5** on
 PATH or `INF_COMPAT_ORACLE_ADDR` pointing to that version. An absent,
 broken or wrong-version oracle fails; there is no successful skip. The
@@ -55,6 +66,48 @@ its node's data directory there, where no other workload's device latency
 reaches the frames it counts. A missing `/dev/shm`, another filesystem or an
 older kernel fails the test as `MEDIUM`; there is no successful skip. The
 server itself runs on Linux 5.15 or newer.
+
+Every recipe builds in this checkout's own `target/` (ADR-0204 D1), which
+`scripts/target-root.sh` checks and the justfile exports as
+`CARGO_TARGET_DIR`. Cargo reads another checkout's outputs as fresh, and a
+target triple or a moved root leaves a path into `target/<profile>` naming an
+older build, so before any recipe runs the export refuses with exit 2 every
+setting that moves the build: a `CARGO_TARGET_DIR` naming another directory,
+`CARGO_BUILD_TARGET`, `CARGO_BUILD_BUILD_DIR`, `CARGO_BUILD_TARGET_DIR`, a
+cargo config's `build.target`, `build.target-dir`, `build-dir` or `include`,
+a link at `target`, and a checkout inside another's `target/`. It also refuses
+a root holding outputs no marker of this checkout names (cargo or an editor
+first, a copied or moved checkout, a root from before the rule), printing `cd
+<checkout> && ./scripts/target-root.sh --clean` and no path to remove; that
+command refuses a root holding a `.git` or another checkout's root, or one a
+live checkout's linked `target` shares, and otherwise cleans and marks it
+(ADR-0204 D2); the next run builds cold. The gates that keep a target beside
+the recipe's (the lint ratchet, the fuzz-target gate) keep `<name>-<key>`
+under that root, the key 16 hex digits of SHA-256 of the checkout's physical
+path. The fuzz gate's probe builds in a directory of its own each run, and the
+clock-ban, lint-scope and waker-atomics probes build through
+`target_root_cargo_fresh`, which refuses a directory an earlier run filled.
+The recipes that run what they build (`sim-smoke`, `sim-canaries`, the sweeps,
+`compat`, `client-smoke`), `inf-compare`'s checker and `inf-bench`'s default
+`--infinityd-bin` run the binaries this root built. Every line that names a
+cargo output setting is a row of `scripts/target-dirs.tsv` (ADR-0204 D4),
+which the gates' self-test checks against every file git lists, untracked
+ones included. A script run alone, outside a recipe, under a cargo config's
+`build-dir` puts its intermediate outputs there: only the export and
+`--clean` ask cargo for its build directory.
+
+The `dev` profile, and `test` with it, builds `inf-doc` at `opt-level` 1
+(the workspace `Cargo.toml`): its intern-table test walks a 65,535-key
+dictionary in about 10 s instead of 39 s unoptimized. One build serves
+`cargo build` and the tests, so a debug `infinityd` carries an optimized
+`inf-doc`. Debug assertions and overflow checks stay on, and `inf-doc`'s two
+`build_profile` tests are red in any build of the crate without them, a
+`--release` test build included. To step through `inf-doc` unoptimized,
+build with `--config 'profile.dev.package.inf-doc.opt-level=0'`: cargo then
+writes a second set of every unit above `inf-doc` beside the first. A
+changed profile key renames those units, so a root built before the change
+keeps the old ones, gigabytes that nothing reads, until
+`./scripts/target-root.sh --clean`; the next run builds cold.
 
 `cargo test -p crash-matrix` requires Python 3.11+ and runs every node row
 in `m2.toml`, `m4.toml` and `m45.toml` by exact package/target/function.

@@ -21,10 +21,14 @@
 //! them and no more.
 #![cfg(target_os = "linux")]
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 fn free_port() -> u16 {
@@ -40,15 +44,9 @@ fn data_root() -> PathBuf {
 }
 
 struct Server {
-    child: Child,
+    /// Held for its drop, which ends the node.
+    _node: Node,
     port: u16,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 /// Spawn `infinityd` and wait for the port (the probe makes the first
@@ -57,7 +55,8 @@ impl Drop for Server {
 fn spawn(dir: &Path, extra: &[&str]) -> Result<Server, (i32, String)> {
     let port = free_port();
     let stderr = dir.join(format!("stderr-{port}"));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+    let mut child = NodeBinary::built()
+        .command()
         .args(["--port", &port.to_string(), "--cells", "1", "--data-dir"])
         .arg(dir)
         .args(["--probe-seconds", "1"])
@@ -69,7 +68,7 @@ fn spawn(dir: &Path, extra: &[&str]) -> Result<Server, (i32, String)> {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Ok(Server { child, port });
+            return Ok(Server { _node: child, port });
         }
         if let Some(status) = child.try_wait().expect("try_wait") {
             let text = std::fs::read_to_string(&stderr).unwrap_or_default();
@@ -132,6 +131,7 @@ fn field<'a>(info: &'a str, key: &str) -> &'a str {
 }
 
 /// The lifecycle, end to end, on one data directory.
+// nextest-long: 48 s
 #[test]
 fn a_fresh_data_directory_is_probed_once_and_the_model_is_identity_bound() {
     let dir = data_root();

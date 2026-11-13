@@ -13,7 +13,9 @@ the root workspace (its `members` globs); a fuzz manifest, at
 `[workspace]` table of its own and the root's `license` (outside the root's
 workspace it cannot inherit it, so it states it, and `cargo deny` reads it,
 ADR-0198 D6); or a probe manifest that PROBES names with
-the gate that compiles it, which the `check` recipe must run. A probe names
+the gate that compiles it, which the `check` recipe must run: a line of its
+own, `./scripts/<gate>`, or a word naming it on a `./scripts/check-stage.sh`
+line, which runs the gates it names. A probe names
 no third-party crate of its own: each dependency is by `path` to a manifest
 of this tree, and a lock it commits names no package with a `source` (a
 registry or git crate), so the locks `deny_matrix` lists hold every
@@ -84,6 +86,8 @@ PROBES = {
     "scripts/waker-atomics-probe/Cargo.toml": "check-waker-atomics.sh",
     "scripts/waker-atomics-probe/nested/Cargo.toml": "check-waker-atomics.sh",
 }
+# The recipe line that runs the script gates it names at once.
+STAGE = "./scripts/check-stage.sh"
 SEED_KINDS = ("corpus", "corpora", "seeds")
 # A manifest's dependency tables, cargo's older spellings among them.
 DEP_TABLES = ("dependencies", "dev-dependencies", "dev_dependencies", "build-dependencies",
@@ -209,6 +213,16 @@ def glob_match(directory, pattern):
     """Cargo's `members` glob: `*` stays inside one path segment."""
     parts, globs = directory.split("/"), pattern.strip("/").split("/")
     return len(parts) == len(globs) and all(fnmatch.fnmatchcase(p, g) for p, g in zip(parts, globs))
+
+
+def recipe_runs(recipe, gate):
+    """Whether a `check` line runs scripts/<gate>: its own line, or a stage line
+    (`./scripts/check-stage.sh` and the gates' file names) naming it."""
+    for line in recipe:
+        words = line.split()
+        if line == f"./scripts/{gate}" or (words[:1] == [STAGE] and gate in words[1:]):
+            return True
+    return False
 
 
 def check_recipe(root):
@@ -433,7 +447,7 @@ def _census(c, root):
     for m, gate in sorted(PROBES.items()):
         if m not in listed:
             c.errors.append(f"C4 {m}: a probe row whose manifest is gone (a stale exclusion)")
-        elif recipe is None or f"./scripts/{gate}" not in recipe:
+        elif recipe is None or not recipe_runs(recipe, gate):
             c.errors.append(f"C4 {m}: its gate scripts/{gate} is not run by the `check` recipe")
     for m in c.probes:
         for crate in third_party(root, m, parsed[m], listed):

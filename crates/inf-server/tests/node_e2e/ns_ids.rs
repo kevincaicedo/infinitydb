@@ -3,6 +3,10 @@
 //! id a refusal spent would be lost, and a client repeating a refused
 //! `CREATE` would spend the id space at the DDL's pace.
 
+// nextest-stall-default: each tiered `CREATE` here is refused or accepted, and
+// no tiered namespace is written: no write reaches a window (ADR-0053 D4), so
+// the stall bound is never read.
+
 use super::*;
 
 /// `INF.NS INFO name`'s `id` field.

@@ -41,11 +41,16 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // harness process, not cell code
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use inf_log::fs::SegmentFs;
@@ -163,7 +168,7 @@ fn run_pid(text: &str) -> Option<u32> {
 /// The node, which owns its data directory: a struct's fields drop after
 /// its `drop` body returns, so the node is reaped before the directory goes.
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
     dir: DataDir,
@@ -200,7 +205,8 @@ impl Server {
             .expect("addr")
             .port()
             .to_string();
-        let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+        let child = NodeBinary::built()
+            .command()
             .args(["--port", &port, "--cells", &CELLS.to_string()])
             .args(["--accept-handoff", "on", "--device-probe", "off"])
             .args(["--barrier-class", "fua", "--fill-window-us", &FILL_WINDOW_US.to_string()])
@@ -365,6 +371,10 @@ fn densest_window(readings: &[Reading], window: Duration) -> (u64, Duration) {
     densest
 }
 
+// nextest-alone: 0.1-0.6 s. Engagement needs eight fill episodes on one cell
+// inside one 100 ms fill window, and the CPU that sibling test processes take
+// thins the burst (ADR-0207 D4). Alone, a run can still read `VACUOUS`: this
+// keeps the rate where `cargo test`, which ran this binary alone, had it.
 #[test]
 fn a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell() {
     let server = Server::spawn(DataDir::create());

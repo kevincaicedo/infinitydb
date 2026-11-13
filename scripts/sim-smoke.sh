@@ -10,8 +10,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 seed=${1:-0xC0FFEE}
 
-cargo build --release -p inf-sim --features dst --bin inf-sim
-bin=target/release/inf-sim
+# The simulator this run builds is the one it runs: both in this checkout's
+# target root, whatever CARGO_TARGET_DIR holds (ADR-0198 A2).
+# shellcheck source=target-root.sh
+. scripts/target-root.sh
+target_root_setup "$(pwd -P)"
+cargo build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT"
+bin="$TARGET_ROOT/release/inf-sim"
 
 # F-L11-05: an accept-path error is a counter, never connection teardown.
 # The accept-broken row parks each listener as broken, which no close
@@ -43,7 +48,8 @@ bin=target/release/inf-sim
 # removal.
 # m4-tier-budget runs each of its legs (two namespaces at 8mb, eight at
 # 1mb, the one-namespace control, two at 1mb at the hostile share, one at
-# 64mb with no device model) on its own row, and the retry arm (one tier
+# 64mb with no device model, and two at the hostile share whose first is a
+# thief of the tier class's credit) on its own row, and the retry arm (one tier
 # write fails and is retried) on the 8mb leg and on the no-model leg,
 # where the 64 MiB round is more ops than one turn's visits and the
 # retry group is built behind a run of done writes: a leg is named,
@@ -116,6 +122,17 @@ rows=(
   "m4-extent-window --window-leg cold --verify-determinism"
   "m45-backfill"
   "m45-sidecar"
+  # Publishes that cross between cells faster than their owners answer, on
+  # eight credits: two cells publishing to each other's channels, a ring of
+  # three, eight cells each publishing to any other, the two-credit floor;
+  # and the controls, no publish crossing and a window that never fills.
+  "m1-pub-cross"
+  "m1-pub-cross --cells 3 --verify-determinism"
+  "m1-pub-cross --cells 8 --pub-target others --verify-determinism"
+  "m1-pub-cross --fabric-credits 2 --verify-determinism"
+  "m1-pub-cross --pub-target own --verify-determinism"
+  "m1-pub-cross --fabric-credits 256 --verify-determinism"
+  "m4-tier-budget --tier-leg two-1mb-thief --verify-determinism"
   # m4-cold's identity leg: the cold-read host's issuer placed 32 pairs before
   # the end of its 2^55, so the space runs out inside the run (ADR-0181 R4).
   "m4-cold --cold-leg identity --cold-identity-start 0x7fffffffffffe0 --verify-determinism"

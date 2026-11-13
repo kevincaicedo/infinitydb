@@ -138,10 +138,20 @@ Invariants:
   `WakeBridge::release_waker`'s `&self`) across its swap, or its push's
   compare-and-swap, after which the drain or another thread's last drop may
   free the header and the stack. Those references cover atomics only, as
-  `Arc::drop`'s `&AtomicUsize` does across its decrement, and the call
-  touches neither through them after that access unless it answered
-  `Released::Last`, which makes it the one freer (ADR-0003 A1.2.5). Miri
-  runs both paths in `tests/waker_threads.rs` and `tests/waker_close.rs`.
+  `Arc::drop`'s `&AtomicUsize` does across its decrement, and after that
+  access the call neither reads through them nor copies one, not even into
+  an argument of a function that reads nothing, unless it answered
+  `Released::Last`, which makes it the one freer (ADR-0003 A1.2.5): a
+  reference to freed memory is undefined behavior once it is formed. The
+  rule is review-only, held by an oracle: safe Rust has no type that ends a
+  shared reference's use at an atomic access while its function still
+  holds it, and passing the header's raw address instead would put
+  `unsafe` in `inf-foundation`, which forbids it. Miri's default schedule
+  never preempts a call inside that window, so `tests/waker_race.rs` races
+  two foreign last drops of a closed header, and a foreign `wake` or `drop`
+  against the drain and the executor's drop, at a pinned preemption rate
+  over a pinned seed range (the CI's Miri job); a reference formed after
+  the access is red there.
 - **Close, then the last waker frees.** The executor's drop drains, drops
   every future (deciding each header), frees its spare header open (kept
   only while no waker names it and no push holds it, so freed as any quiet
@@ -161,7 +171,8 @@ Invariants:
 
 Miri (strict provenance, its data-race detector, Stacked Borrows, the leak
 check) runs `tests/executor.rs`, `tests/waker_threads.rs` and
-`tests/waker_close.rs`; Loom models the lane's protocol on
+`tests/waker_close.rs` on its default schedule, and `tests/waker_race.rs`
+on the pinned schedules above; Loom models the lane's protocol on
 `inf_foundation::wake`'s own types. Neither models the kernel, and none of
 this rests on one.
 

@@ -70,6 +70,7 @@ fn every_declared_point_has_a_matrix_row() {
     }
 }
 
+// nextest-long: 25 s
 #[test]
 fn node_rows_execute_and_prove_their_verdicts() {
     let executable = std::env::current_exe().expect("test executable");

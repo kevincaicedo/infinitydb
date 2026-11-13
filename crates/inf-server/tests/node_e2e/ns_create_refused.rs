@@ -6,6 +6,10 @@
 //! the namespace on no cell and in no durable `META`, before and after a
 //! cut, so the origin withdraws the definition durably before it answers.
 
+// nextest-stall-default: each tiered `CREATE` here is refused or accepted, and
+// no tiered namespace is written: no write reaches a window (ADR-0053 D4), so
+// the stall bound is never read.
+
 use super::*;
 
 /// Whether the `META` on disk names a namespace called `name`, and its

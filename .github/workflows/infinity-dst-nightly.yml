@@ -50,10 +50,10 @@ defaults:
 
 jobs:
   # ADR-0020 D5: the kill-and-recover crash matrix with the expanded seed
-  # set. The per-PR tier runs via `cargo test --workspace` in infinity-ci
-  # on every PR; the nightly hunts seed-dependent states. Deterministic:
-  # the seed set is a fixed superset of the PR set — any failure
-  # reproduces locally with the same CRASH_MATRIX_SEEDS value (L7).
+  # set. The per-PR tier runs via `cargo nextest run --workspace` in
+  # infinity-ci on every PR (ADR-0200 D1); the nightly hunts seed-dependent
+  # states. Deterministic: the seed set is a fixed superset of the PR set —
+  # any failure reproduces locally with the same CRASH_MATRIX_SEEDS value (L7).
   crash-matrix:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

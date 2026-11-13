@@ -19,21 +19,25 @@
 //! boot that serves cannot outlive its test.
 #![cfg(target_os = "linux")]
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// A launched node and its scratch directory; dropping it kills the child
 /// before the directory goes.
-struct Node {
-    child: Child,
+struct Booted {
+    child: Node,
     root: PathBuf,
     stderr: PathBuf,
 }
 
-impl Drop for Node {
+impl Drop for Booted {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -59,14 +63,15 @@ struct Boot {
     stderr: String,
 }
 
-fn launch(tag: &str, flags: &[&str]) -> Node {
+fn launch(tag: &str, flags: &[&str]) -> Booted {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/e2e-log-geometry")
         .join(format!("{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("data dir");
     let stderr = root.join("stderr");
-    let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+    let child = NodeBinary::built()
+        .command()
         .args(["--port", "0", "--cells", "1", "--device-probe", "off", "--data-dir"])
         .arg(&root)
         .args(flags)
@@ -74,7 +79,7 @@ fn launch(tag: &str, flags: &[&str]) -> Node {
         .stderr(Stdio::from(std::fs::File::create(&stderr).expect("stderr file")))
         .spawn()
         .expect("spawn infinityd");
-    Node { child, root, stderr }
+    Booted { child, root, stderr }
 }
 
 /// Boots `infinityd` with `flags` and reads how it ended. The node is
