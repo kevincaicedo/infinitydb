@@ -21,6 +21,9 @@
 # <name>` runs one). A group's body is not indented: its heredocs and
 # multi-line strings are fixture bytes. INF_SELFTEST_CASE_LOG=<an empty
 # directory> writes one record a case (the lib's header says what it holds).
+# A group stays under 20 s as the driver runs it: the longest group is the
+# line's floor, so a longer one is cut, each part building its own fixtures;
+# the OK line names the longest group with its seconds on every run.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR/.."
@@ -264,6 +267,96 @@ drv_own_log() { # each group's records hold its own labels only
         ! cat "$work/drv-log/two/"* | grep -q '^label	one '
 }
 expect green "driver: two groups at once each write only their own case log" drv_own_log
+# A group's seconds come from the clock line its process prints; the OK line
+# names the longest. A fixture clock that answers by the group, and by whether
+# a case has run yet, makes the seconds exact (tenths of a second).
+drv_only() { # <fixture> <line>: the driver exits 0 and prints that line alone
+    local out
+    out=$(drv_run "$1" 2>&1) || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out"
+    [ "$out" = "$2" ]
+}
+drv_clocked() { # <name> <begin> <end>: one green group; its clock reads <begin>, then <end>
+    drv_fixture "$1" 'group_one() {' 'expect green "one passes" true' '}' \
+        "selftest_clock() { if [ \$((pass + fail)) -eq 0 ]; then echo $2; else echo $3; fi; }"
+}
+drv_pair() { # <name> <one's end> <two's end>: two green groups, each clock 100, then its end
+    drv_fixture "$1" 'group_one() {' 'expect green "one passes" true' '}' \
+        'group_two() {' 'expect green "two passes" true' '}' \
+        'selftest_clock() { if [ $((pass + fail)) -eq 0 ]; then echo 100;' \
+        "else case \$SELFTEST_GROUP in one) echo $2 ;; *) echo $3 ;; esac; fi; }"
+}
+drv_ok='check-scripts self-test OK (2 cases in 2 groups, each exiting non-zero on its planted case:'
+# The longest group is the last read in one fixture and the first in the other,
+# so a driver that names the last group, or the first, is red on one of them.
+f=$(drv_pair clocked 105 130)
+expect green "driver: the OK line, alone, names the longest group with its seconds" drv_only "$f" \
+    "$drv_ok one, two); the longest group: two, 3.0 s"
+f=$(drv_pair clocked-first 130 105)
+expect green "driver: the longest group is named when it is the first read" drv_only "$f" \
+    "$drv_ok one, two); the longest group: one, 3.0 s"
+f=$(drv_clocked instant 100 100)
+expect_output "driver: a group of no measurable time is still named, at 0.0 s" \
+    "; the longest group: one, 0\.0 s\$" drv_run "$f"
+drv_tenths() { # the lib's clock: tenths of the monotonic seconds read between two of its reads
+    local before seconds after
+    before=$(selftest_clock)
+    seconds=$(python3 -I -S -c 'import time; print(time.monotonic())')
+    after=$(selftest_clock)
+    echo "clock $before, monotonic seconds $seconds, clock $after"
+    awk -v b="$before" -v s="$seconds" -v a="$after" \
+        'BEGIN { t = int(s * 10); exit !(b <= t && t <= a) }'
+}
+expect green "driver: the group clock reads the monotonic clock in tenths of a second" drv_tenths
+drv_clock_red="group one's clock line is not one line of two stamps in order:"
+f=$(drv_fixture noclock 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 0"' \
+    'exit 0' '}')
+expect_red_because "driver: a group that prints no clock line is red, named" "$drv_clock_red none" \
+    drv_run "$f"
+f=$(drv_fixture redonce 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 0"' \
+    'exit 1' '}')
+expect_red_because "driver: a group red by its count is counted once, its clock line unread" \
+    "check-scripts self-test FAILED: 0 of 1 cases failed; 1 of 1 groups red; 0 driver error(s)" \
+    drv_run "$f"
+f=$(drv_fixture twoclocks 'group_one() {' 'expect green "one passes" true' \
+    'echo "group one clock: 100 105"' '}')
+expect_red_because "driver: a group that prints two clock lines is red, named" \
+    "$drv_clock_red group one clock: 100 105" drv_run "$f"
+f=$(drv_clocked octal 08 100)
+expect_red_because "driver: a begin stamp with a leading zero is red, named" \
+    "$drv_clock_red group one clock: 08 100" drv_run "$f"
+f=$(drv_clocked notnumber 100 1e3)
+expect_red_because "driver: an end stamp that is no whole number is red, named" \
+    "$drv_clock_red group one clock: 100 1e3" drv_run "$f"
+f=$(drv_clocked backwards 105 100)
+expect_red_because "driver: a clock that runs backwards is red, named" \
+    "$drv_clock_red group one clock: 105 100" drv_run "$f"
+# The driver's sort, uniq and comm run under LC_ALL=C: stand-ins that answer
+# `collation_differs` under any other locale setting would turn its control red.
+mkdir -p "$work/drv-collate"
+for drv_tool in sort uniq comm; do
+    printf '#!/bin/sh\n[ "${LC_ALL-}" = C ] && exec %s "$@"\necho collation_differs\n' \
+        "$(command -v "$drv_tool")" >"$work/drv-collate/$drv_tool"
+    chmod +x "$work/drv-collate/$drv_tool"
+done
+drv_stand_ins() { # each stand-in answers otherwise outside LC_ALL=C, so the plant is live
+    local tool
+    for tool in sort uniq comm; do
+        [ "$(LC_ALL=POSIX "$work/drv-collate/$tool" /dev/null /dev/null)" = collation_differs ] ||
+            return 1
+    done
+}
+expect green "driver: the collation stand-ins answer otherwise outside LC_ALL=C (control)" \
+    drv_stand_ins
+drv_collated() ( # <fixture>: the driver beside the stand-ins, its caller's locale POSIX
+    PATH="$work/drv-collate:$PATH" LC_ALL=POSIX
+    export PATH LC_ALL
+    drv_run "$1"
+)
+f=$(drv_fixture collate 'group_one() {' 'expect green "one passes" true' '}' \
+    'group_two() {' 'expect green "two passes" true' '}')
+expect_output "driver: sort, uniq and comm read one collation whatever the caller's locale" \
+    "check-scripts self-test OK (2 cases in 2 groups" drv_collated "$f"
 }
 
 # The gates' crate set (scripts/cell-crates.sh) names exclusions that must
@@ -4825,6 +4918,8 @@ expect_red_because "lint-scopes: containers — a committed raise is red against
     "record T counts sum to 4, above the introducing commit's 3" lc_run "$root"
 }
 
+# Each probe case is a cold clippy build of about 3 s, so the probe's cases sit
+# in groups of at most four: a group stays under the 20 s bound above.
 group_lint_scopes_probe() {
 ls_setup
 # the probe's judge: a plant that compiles clean, and a plant that fails
@@ -4841,6 +4936,11 @@ expect red "lint-scopes: a probe that fails for an unrelated reason" ls_probe "$
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unmarked"
 sed -i.bak 's|_ => 0, // PLANT clippy::match_wildcard_for_single_variants|_ => 0,|' "$work/probe-unmarked/src/lib.rs"
 expect red "lint-scopes: a diagnostic on a line with no marker" ls_probe "$work/probe-unmarked"
+}
+
+group_lint_scopes_probe_config() {
+ls_setup
+root=$(ls_root ls-probe)
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-wrong-path"
 sed -i.bak 's|PLANT clippy::disallowed_methods std::fs::read$|PLANT clippy::disallowed_methods std::fs::write|' "$work/probe-wrong-path/src/filesystem.rs"
 expect red "lint-scopes: the right lint naming the wrong API is red" ls_probe "$work/probe-wrong-path"
@@ -4851,6 +4951,11 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unreachable-api"
 sed 's|std::fs::write|std::fs::no_such_fn|' clippy.toml >"$work/probe-unreachable-api/clippy.toml"
 expect_red_because "lint-scopes: an unreachable config entry is red" \
     'unresolved config entry: `std::fs::no_such_fn`' ls_probe "$work/probe-unreachable-api"
+}
+
+group_lint_scopes_probe_arch() {
+ls_setup
+root=$(ls_root ls-probe)
 # ADR-0106 D18, on whichever leg runs this: an unresolved entry under the
 # probe target's own `core::arch` module (on x86_64, ADR-0106 D7.5's inert
 # `_rdtscp` shape) or under a module no leg compiles for is red; one under
@@ -5072,6 +5177,7 @@ expect_red_because "probe-target: a job env that replaces the fuzz-target gate's
     "\`INF_FUZZ_CARGO\` is set where the probe gates inherit it" legs_cover "$work/wf-fuzz-cargo.yml"
 }
 
+# Probe cases again: at most four a group, as above group_lint_scopes_probe.
 group_lint_scopes_unstable() {
 ls_setup
 root=$(ls_root ls-probe)
@@ -5085,6 +5191,12 @@ expect red "lint-scopes: an unrelated error alongside the unstable refusal is re
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-missing"
 sed -i.bak '/let _ =/d' "$work/probe-unstable-missing/unstable/set_times.rs"
 expect red "lint-scopes: removing the unstable call is red" ls_probe "$work/probe-unstable-missing"
+}
+
+group_lint_scopes_unstable_census() {
+ls_setup
+root=$(ls_root ls-probe)
+# ADR-0144 A1, as above: the unstable call's configured path, its feature, its census.
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-config"
 sed 's|std::fs::set_times|std::fs::File::set_times|' clippy.toml >"$work/probe-unstable-config/clippy.toml"
 expect red "lint-scopes: changing the configured unstable path is red" ls_probe "$work/probe-unstable-config"
@@ -5094,7 +5206,11 @@ expect red "lint-scopes: the unstable feature must match its census" ls_probe "$
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-extra"
 cp "$work/probe-unstable-extra/unstable/set_times.rs" "$work/probe-unstable-extra/unstable/extra.rs"
 expect red "lint-scopes: the unstable census cannot grow" ls_probe "$work/probe-unstable-extra"
+}
 
+group_lint_scopes_container_plants() {
+ls_setup
+root=$(ls_root ls-probe)
 # ADR-0163 D2: the shipped probe's container plants draw their lint naming
 # their path under the production config (the green case above). A config
 # that loses a path, the backing without its one allow, and a two-span plant
@@ -5115,7 +5231,11 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-containers-new"
 printf 'pub struct Added {\n    pub value: std::collections::HashMap<u8, u8>,\n}\n' >>"$work/probe-containers-new/src/containers.rs"
 expect_red_because "lint-scopes: a new container with no plant marker is red by its lint and path" \
     "unmarked diagnostic \[('clippy::disallowed_types', 'std::collections::HashMap')\]" ls_probe "$work/probe-containers-new"
+}
 
+group_lint_scopes_slot_plants() {
+ls_setup
+root=$(ls_root ls-probe)
 # ADR-0144 A2: the slot plants draw `await_holding_invalid_type` naming their
 # configured path under the production config (the green case above): the
 # slot, and the answer that carries it, since the lint matches the outermost
@@ -5134,6 +5254,12 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-consumed"
 sed -i.bak 's|            yield_once().await;|            slot.publish(0);|; s|            slot.publish(1);|            yield_once().await;|' "$work/probe-await-consumed/src/awaits.rs"
 expect_red_because "lint-scopes: a slot consumed before the await draws nothing on the plant" \
     "did NOT draw clippy::await_holding_invalid_type inf_foundation::bounded::DequeSlot" ls_probe "$work/probe-await-consumed"
+}
+
+group_lint_scopes_answer_plants() {
+ls_setup
+root=$(ls_root ls-probe)
+# ADR-0144 A2, as above: the answer's plant and the discard plant.
 # The answer's plant at four columns: the slot's lines above sit at twelve,
 # so the anchored edits reach only the answer's await and its match.
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-answer-matched"
