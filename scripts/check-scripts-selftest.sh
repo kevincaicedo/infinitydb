@@ -7873,7 +7873,7 @@ nc_n=0
 # nc_tree: a fresh fixture workspace in NC_DIR, green as built. Package fx has
 # two test targets that both include tests/support/mod.rs; package fxd has a
 # binary and two test targets, one run alone as a whole, its marker below an
-# inner attribute that spans lines.
+# inner attribute that spans lines, the other holding a long test.
 nc_tree() {
     nc_n=$((nc_n + 1))
     NC_DIR="$NCW/w$nc_n"
@@ -7944,6 +7944,10 @@ const CREATE: [&[u8]; 4] = [b"MEM-BUDGET", b"8mb", b"TAIL-STALL-TIMEOUT", b"6000
 fn tiered() {
     let _ = CREATE;
 }
+
+// nextest-long: 20 s
+#[test]
+fn tiered_storm() {}
 EOF
     cat >"$NC_CFG" <<'EOF'
 nextest-version = { required = "0.9.150" }
@@ -7968,6 +7972,10 @@ priority = 100
 filter = 'binary_id(fx::a)'
 test-group = "serial"
 priority = 50
+
+[[profile.default.overrides]]
+filter = 'binary_id(fxd::tiered) & test(=tiered_storm)'
+priority = 20
 EOF
     cat >"$NC_DIR/.github/workflows/ci.yml" <<'EOF'
 jobs:
@@ -7988,11 +7996,12 @@ if old not in text:
 path.write_text(text.replace(old, new))' "$@"
 }
 NC_GROUP=$'[[profile.default.overrides]]\nfilter = \'binary_id(fx::a)\'\n'
+NC_LONG=$'[[profile.default.overrides]]\nfilter = \'binary_id(fxd::tiered) & test(=tiered_storm)\'\npriority = 20\n'
 
 nc_tree
 expect green "nextest-config: the fixture workspace is green" ncfg "$NC_DIR"
 expect_output "nextest-config: the OK line counts each rule's population" \
-    "nextest-config OK: nextest-version 0.9.150; 1 groups of one thread (serial), 1 group overrides at priority 50; 2 run alone at priority 100, first (fx::a/a_alone, fxd::boot); 2 static locks, 1 grouped and 1 in-process; 2 test files name MEM-BUDGET, 1 state TAIL-STALL-TIMEOUT and 1 carry nextest-stall-default; no free-space read in 5 integration-test files and 1 library files they link; 1 cargo-nextest installs in CI at 0.9.150, each --locked, one in each of the 1 jobs that run it; [0-9]* .rs files of 6 test binaries read" \
+    "nextest-config OK: nextest-version 0.9.150; 1 groups of one thread (serial), 1 group overrides at priority 50; 2 run alone at priority 100, first (fx::a/a_alone, fxd::boot); 1 long, each at its marker's seconds, 49 at most; 2 static locks, 1 grouped and 1 in-process; 2 test files name MEM-BUDGET, 1 state TAIL-STALL-TIMEOUT and 1 carry nextest-stall-default; no free-space read in 5 integration-test files and 1 library files they link; 1 cargo-nextest installs in CI at 0.9.150, each --locked, one in each of the 1 jobs that run it; [0-9]* .rs files of 6 test binaries read" \
     ncfg "$NC_DIR"
 # The config holds its listed keys only, in their listed shapes.
 nc_tree
@@ -8118,10 +8127,111 @@ expect green "nextest-config: a run-alone test in an inline module is named by i
 nc_tree
 nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'#![allow(\n    clippy::disallowed_methods,\n' $'#![allow(\n    clippy::disallowed_methods,\n    clippy::disallowed_types,\n'
 expect green "nextest-config: a leading marker below an inner attribute of four lines binds" ncfg "$NC_DIR"
+# The long markers and their overrides: one test each, at the marker's
+# seconds, 49 at most, on no test another override selects.
+nc_long() { # <marker text> <priority>: the fixture's long test so marked, its override at <priority>
+    nc_tree
+    nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" '// nextest-long: 20 s' "// nextest-long: $1"
+    nc_sub "$NC_CFG" 'priority = 20' "priority = $2"
+}
+nc_long '15 s' 15
+expect green "nextest-config: a long marker of 15 s at priority 15 is green" ncfg "$NC_DIR"
+nc_long '14 s' 14
+expect_red_because "nextest-config: a long marker under 15 s is red" \
+    "tiered.rs:10: a .nextest-long:. marker reads .<n> s., n an integer of 15 or more, not '14 s'" ncfg "$NC_DIR"
+nc_long '60 s' 49
+expect green "nextest-config: a long marker over 49 s at priority 49 is green" ncfg "$NC_DIR"
+nc_long '60 s' 60
+expect_red_because "nextest-config: a long override above 49 is red (canary)" \
+    "override 4 starts .fxd::tiered. test .tiered_storm. at priority 60; its marker's 60 s asks 49" ncfg "$NC_DIR"
+nc_long '20 s' 21
+expect_red_because "nextest-config: a long override at a priority not its marker's is red (canary)" \
+    "override 4 starts .fxd::tiered. test .tiered_storm. at priority 21; its marker's 20 s asks 20" ncfg "$NC_DIR"
+for nc_text in '20' '20.5 s' '020 s' '20 s, a storm'; do
+    nc_long "$nc_text" 20
+    expect_red_because "nextest-config: a long marker reading '$nc_text' is red" \
+        "tiered.rs:10: a .nextest-long:. marker reads .<n> s." ncfg "$NC_DIR"
+done
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" $'// nextest-long: 20 s\n' ''
+expect_red_because "nextest-config: a long override no marker names is red (canary)" \
+    "override 4 starts .fxd::tiered. test .tiered_storm. early, and no .nextest-long:. marker" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" $'\n'"$NC_LONG" ''
+expect_red_because "nextest-config: a long marker no override selects is red (canary)" \
+    "tiered.rs:10: .fxd::tiered. test .tiered_storm. is marked long, and no long override selects it" \
+    ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "'binary_id(fxd::tiered) & test(=tiered_storm)'" "'binary_id(fxd::tiered)'"
+expect_red_because "nextest-config: a long override on a whole binary is red" \
+    "override 4: a long override's filter is one test" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "'binary_id(fxd::tiered) & test(=tiered_storm)'" "'package(fxd) & test(=tiered_storm)'"
+expect_red_because "nextest-config: a long override on a package's test is red" \
+    "override 4: a long override's filter is one test" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 20' $'priority = 20\nslow-timeout = "60s"'
+expect_red_because "nextest-config: a long override with a third key is red" "override 4 holds keys" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 20' $'priority = 20\ntest-group = "serial"'
+expect_red_because "nextest-config: a long override with a test group is a group's, red at its priority" \
+    "override 4: a group's override sets priority 50, not 20" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 20' $'priority = 20\nthreads-required = "num-test-threads"'
+expect_red_because "nextest-config: a long override with every slot is a run-alone one, red at its priority" \
+    "override 4: a run-alone override sets priority 100, not 20" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'#[test]\nfn boots()' $'// nextest-long: 20 s\n#[test]\nfn boots()'
+printf "\n[[profile.default.overrides]]\nfilter = 'binary_id(fxd::boot) & test(=boots)'\npriority = 20\n" >>"$NC_CFG"
+expect_red_because "nextest-config: a long override on a test of a binary run alone is red" \
+    "long override 5 selects .fxd::boot. test .boots., which override 1 also selects" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" $'// shares.\n#[test]' $'// shares.\n// nextest-long: 20 s\n#[test]'
+printf "\n[[profile.default.overrides]]\nfilter = 'binary_id(fx::a) & test(=a_alone)'\npriority = 20\n" >>"$NC_CFG"
+expect_red_because "nextest-config: a long override on a run-alone test is red" \
+    "long override 5 selects .fx::a. test .a_alone., which override 2 also selects" ncfg "$NC_DIR"
+nc_tree
+printf '\n%s' "$NC_LONG" >>"$NC_CFG"
+expect_red_because "nextest-config: two long overrides on one test are red" \
+    "long override 4 selects .fxd::tiered. test .tiered_storm., which override 5 also selects" ncfg "$NC_DIR"
+# A test joins a set by its marker and its override, and either half alone is
+# red (above): a binary may hold a run-alone test and a long one.
+nc_tree
+printf '\n// nextest-alone: 2 s. Reads a live rate.\n#[test]\nfn b_alone() {}\n\n// nextest-long: 30 s\n#[test]\nfn b_long() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+nc_sub "$NC_CFG" $'\n'"$NC_GROUP" $'\n[[profile.default.overrides]]\nfilter = \'binary_id(fx::b) & test(=b_alone)\'\nthreads-required = "num-test-threads"\npriority = 100\n\n'"$NC_GROUP"
+printf "\n[[profile.default.overrides]]\nfilter = 'binary_id(fx::b) & test(=b_long)'\npriority = 30\n" >>"$NC_CFG"
+expect green "nextest-config: a long test beside a run-alone test in one binary is green" ncfg "$NC_DIR"
+nc_tree
+printf '\n// nextest-long: 20 s\nconst NOT_A_TEST: u8 = 0;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a long marker above no test is red" \
+    "b.rs:8: a .nextest-long:. marker above no .#.test.. binds nothing" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/b.rs" 'mod support;' $'// nextest-long: 20 s\n\nmod support;'
+expect_red_because "nextest-config: a long marker in a file's leading comments binds nothing" \
+    "b.rs:1: a .nextest-long:. marker above no .#.test.. binds nothing" ncfg "$NC_DIR"
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/orphan"
+printf '// nextest-long: 20 s\n#[test]\nfn lost() {}\n' >"$NC_DIR/crates/fx/tests/orphan/lost.rs"
+expect_red_because "nextest-config: a long marker in a file no binary compiles is red" \
+    "lost.rs:1: a .nextest-long:. marker in a file no test binary compiles" ncfg "$NC_DIR"
+nc_tree # fx::b and fxd::tiered both compile crates/fx/tests/common/mod.rs
+mkdir -p "$NC_DIR/crates/fx/tests/common"
+printf '// nextest-long: 20 s\n#[test]\nfn storm() {}\n' >"$NC_DIR/crates/fx/tests/common/mod.rs"
+printf '\nmod common;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+printf '\n#[path = "../../../crates/fx/tests/common/mod.rs"]\nmod common;\n' >>"$NC_DIR/bins/fxd/tests/tiered.rs"
+printf "\n[[profile.default.overrides]]\nfilter = 'binary_id(fx::b) & test(=common::storm)'\npriority = 20\n" >>"$NC_CFG"
+expect_red_because "nextest-config: a long test in an included file binds each binary under its path" \
+    "common/mod.rs:1: .fxd::tiered. test .common::storm. is marked long, and no long override" ncfg "$NC_DIR"
+printf "\n[[profile.default.overrides]]\nfilter = 'binary_id(fxd::tiered) & test(=common::storm)'\npriority = 20\n" \
+    >>"$NC_CFG"
+expect green "nextest-config: its long overrides name it by its module path in each binary" ncfg "$NC_DIR"
 # A library's statics reach every test binary that links it: its package's,
 # and those of each workspace package that depends on it.
 nc_lib_lock() { # fx's library holds a grouped lock; the group override names <filter>
-    nc_tree
+    nc_tree # with no long test: a group here may take a whole package
+    nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" $'// nextest-long: 20 s\n' ''
+    nc_sub "$NC_CFG" $'\n'"$NC_LONG" ''
     printf '// nextest-group: serial\npub static SHARED: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' \
         >"$NC_DIR/crates/fx/src/lib.rs"
     printf "\n[[profile.default.overrides]]\nfilter = '%s'\ntest-group = \"serial\"\npriority = 50\n" "$1" \
@@ -8189,6 +8299,17 @@ nc_spelled "in capitals" '// Nextest-Alone: 2 s. The verdict reads a live rate.'
 nc_spelled "with a space before its colon" '// nextest-alone : 2 s. The verdict reads a live rate.'
 nc_spelled "in a block comment" '/* nextest-alone: 2 s. The verdict reads a live rate. */'
 nc_spelled "in a doc comment" '/// nextest-alone: 2 s. The verdict reads a live rate.'
+nc_spelled "with a word outside the five" '// nextest-solo: 2 s. The verdict reads a live rate.'
+nc_spelled "with a longer word" '// nextest-run-alone: 2 s. The verdict reads a live rate.'
+nc_spelled "with a dot" '// nextest.alone: 2 s. The verdict reads a live rate.'
+nc_spelled "long without its colon" '// nextest-long 20 s'
+nc_spelled "long with a space" '// nextest long: 20 s'
+nc_spelled "long with a longer word" '// nextest-longest: 20 s'
+nc_spelled "long with an underscore" '// nextest_long: 20 s'
+nc_tree
+printf '\n/// nextest runs each test in a process of its own.\n#[test]\nfn b_prose() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect green "nextest-config: prose that starts with the runner's name is no marker" ncfg "$NC_DIR"
 nc_tree
 printf '\n#[test] // nextest-alone: 2 s. The verdict reads a live rate.\nfn b_marked() {}\n' \
     >>"$NC_DIR/crates/fx/tests/b.rs"
