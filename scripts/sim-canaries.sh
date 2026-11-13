@@ -950,6 +950,10 @@ rows=(
   # ADR-0181 R2: a parked loop never holds ready cold delivery; planted, the park veto ignores
   # it, so an idle loop parks with a ready window.
   "inf_canary_cold_park_without_delivery crate-test inf-runtime test:reactor a_ready_cold_window_keeps_the_loop_from_parking parked with ready delivery"
+  # The same plant on the shipped plane over the sim driver: the server's
+  # before_park asks the same function, so at spin_iters 0 a cell whose turn
+  # left cold-read members to visit begins an iteration parked.
+  "inf_canary_cold_park_without_delivery crate-test inf-sim lib a_cell_with_cold_members_to_visit_begins_no_iteration_parked began parked while the step before it left cold-read members"
   # ADR-0181 R1: one host turn visits at most 64 cold-read members, one allowance a turn shared
   # by every delivery call. Planted, each receipt renews the allowance; an orphaned member
   # spends no unit; coldstorm begins a turn at each pump. m4-cold's dense and cancel-all legs

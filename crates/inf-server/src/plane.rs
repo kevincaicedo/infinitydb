@@ -1426,6 +1426,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.ckpt_waiters.waiting()
     }
 
+    /// Cold-read members this cell's turns have yet to visit (its cold
+    /// host's pending delivery; 0 on a cell with no cold host), for the
+    /// simulator's park test: used only between scheduler steps.
+    pub fn cold_pending_for_sim(&self) -> u64 {
+        let tier = self.shared.tier.borrow();
+        tier.as_ref().and_then(|t| t.cold.as_ref()).map_or(0, |cold| cold.delivery_pending().0)
+    }
+
     /// Wires this plane's slot of the doorbell-wakeup park board (the same
     /// `Arc` goes to every cell's fabric via `CellFabric::set_wakeups`).
     pub fn set_park_flags(&mut self, flags: Arc<Vec<AtomicBool>>) {
