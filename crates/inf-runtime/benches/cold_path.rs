@@ -39,14 +39,18 @@
 //!   `before_execute`, A of the hook's row.
 //! - `reactor-iteration-hook`: the same iteration over a plane whose
 //!   `before_execute` is the server's: its cold host read under a short
-//!   borrow of its tier slot, which holds no tiered namespace, B of the
-//!   hook's row (`≤ 10` instructions over A an iteration).
-//! - `reactor-iteration-server`, `reactor-iteration-server-hook`: the same
-//!   pair over planes that both hold the hook's tier slot and whose
-//!   `parse_execute` hands the loop context to a step out of line, as every
-//!   server step does: the context escapes, so the loop's stores into it
-//!   stay in both legs, as on a server cell, and the pair differs in the
-//!   hook alone.
+//!   borrow of its tier slot, which holds no tiered namespace. With the
+//!   leg above it is a control and judges nothing: its A lets the context
+//!   never leave the iteration, so the compiler drops the context's setup
+//!   there, which no server cell can drop.
+//! - `reactor-iteration-server`, `reactor-iteration-server-hook`: the hook's
+//!   row, `≤ 10` instructions an iteration of B over A. One plane, generic
+//!   over the hook, so the two legs differ in `before_execute` alone: it
+//!   holds the hook's tier slot and hands the loop context to a step out of
+//!   line at `fabric_in` and again at `parse_execute`, as a server cell's
+//!   steps take it before the hook and after it. The context escapes before
+//!   the hook, so the loop's turn stores and its spent-unit test stay in
+//!   both legs, as on a server cell.
 //!
 //! Beside them, the rate legs (`cold_path/rates.rs`), reported and never
 //! judged: one container operation a step, on the capped map and slab B
@@ -142,10 +146,9 @@ enum ReactorPlane {
     Idle,
     /// The server's `before_execute`, nothing at any other step.
     Hook,
-    /// The hook's tier slot and the server's out-of-line steps, the
-    /// default `before_execute`.
+    /// [`ServerShapedPlane`] with the plane's default `before_execute`.
     Server,
-    /// [`ReactorPlane::Server`] with the server's `before_execute`.
+    /// [`ServerShapedPlane`] with the server's `before_execute`.
     ServerHook,
 }
 
@@ -530,28 +533,32 @@ struct SharedTier {
     tier: RefCell<Option<TierSlot>>,
 }
 
-/// The hook legs' plane: the server's `before_execute` over a cell with no
-/// tiered namespace. `SERVER_STEPS` false, nothing at any other step;
-/// true, its `parse_execute` is [`server_steps`].
-struct HookPlane<const SERVER_STEPS: bool> {
+/// The server's `before_execute` (`ServerPlane::before_execute` in
+/// `inf-server`), this bench's one copy of it: on a cell with no tiered
+/// namespace, the tier slot's borrow test and its presence test, and
+/// nothing else.
+#[inline(always)]
+fn server_hook(shared: &SharedTier, cx: &mut LoopCx<'_>) {
+    let engine = shared.tier.borrow().as_ref().is_some_and(|t| t.cold.is_some());
+    if engine {
+        deliver_cold(shared, cx);
+    }
+}
+
+/// C0's hook leg's plane: the server's `before_execute` over a cell with no
+/// tiered namespace, nothing at any other step.
+struct HookPlane {
     shared: Rc<SharedTier>,
 }
 
-impl<const SERVER_STEPS: bool> CellPlane for HookPlane<SERVER_STEPS> {
+impl CellPlane for HookPlane {
     fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
         panic!("the reactor leg reaps nothing: {c:?}");
     }
     fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
-        let engine = self.shared.tier.borrow().as_ref().is_some_and(|t| t.cold.is_some());
-        if engine {
-            deliver_cold(&self.shared, cx);
-        }
+        server_hook(&self.shared, cx);
     }
-    fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
-        if SERVER_STEPS {
-            server_steps(&self.shared, cx);
-        }
-    }
+    fn parse_execute(&mut self, _cx: &mut LoopCx<'_>) {}
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
 }
 
@@ -566,16 +573,26 @@ fn deliver_cold(shared: &SharedTier, cx: &mut LoopCx<'_>) {
     }
 }
 
-/// The server-shaped control: [`HookPlane`]'s state and its server steps
-/// with the plane's default `before_execute`, so the pair differs in the
-/// hook alone.
-struct ServerShapedPlane {
+/// The hook's row's plane, a server cell's shape: the hook's tier slot, and
+/// the loop context handed to [`server_steps`] at `fabric_in`, before the
+/// hook, and at `parse_execute`, after it. `HOOK` true, its
+/// `before_execute` is the server's (B of the row); false, the plane's
+/// default (A). One type for both, so the legs differ in the hook alone.
+struct ServerShapedPlane<const HOOK: bool> {
     shared: Rc<SharedTier>,
 }
 
-impl CellPlane for ServerShapedPlane {
+impl<const HOOK: bool> CellPlane for ServerShapedPlane<HOOK> {
     fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
         panic!("the reactor leg reaps nothing: {c:?}");
+    }
+    fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {
+        server_steps(&self.shared, cx);
+    }
+    fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
+        if HOOK {
+            server_hook(&self.shared, cx);
+        }
     }
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
         server_steps(&self.shared, cx);
@@ -625,14 +642,12 @@ fn shared_tier() -> Rc<SharedTier> {
 fn drive_reactor<const NOPS: u8>(plane: ReactorPlane, ops: u64) -> u64 {
     match plane {
         ReactorPlane::Idle => drive_loop::<NOPS, _>(ops, IdlePlane),
-        ReactorPlane::Hook => {
-            drive_loop::<NOPS, _>(ops, HookPlane::<false> { shared: shared_tier() })
-        }
+        ReactorPlane::Hook => drive_loop::<NOPS, _>(ops, HookPlane { shared: shared_tier() }),
         ReactorPlane::Server => {
-            drive_loop::<NOPS, _>(ops, ServerShapedPlane { shared: shared_tier() })
+            drive_loop::<NOPS, _>(ops, ServerShapedPlane::<false> { shared: shared_tier() })
         }
         ReactorPlane::ServerHook => {
-            drive_loop::<NOPS, _>(ops, HookPlane::<true> { shared: shared_tier() })
+            drive_loop::<NOPS, _>(ops, ServerShapedPlane::<true> { shared: shared_tier() })
         }
     }
 }
