@@ -16,13 +16,17 @@
 //! pump fans back: every reply arrives, `:2`, only while the fan's legs draw
 //! a credit no unanswered publish can hold.
 
+#[path = "support/node.rs"]
+mod node;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use inf_store::SlotRouter;
+use node::{Node, NodeBinary};
 
 const CELLS: u16 = 2;
 const PUBLISHERS_PER_CELL: usize = 40;
@@ -34,7 +38,7 @@ const CONNECT_ATTEMPTS_MAX: usize = 1_000;
 const REPLY_DEADLINE: Duration = Duration::from_secs(30);
 
 struct Server {
-    child: Child,
+    child: Node,
     stderr: PathBuf,
 }
 
@@ -62,7 +66,8 @@ fn spawn() -> (Server, u16) {
         .expect("addr")
         .port()
         .to_string();
-    let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+    let child = NodeBinary::built()
+        .command()
         .args(["--port", &port, "--cells", &CELLS.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&stderr).expect("stderr file")))
