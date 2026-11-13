@@ -235,17 +235,16 @@ rows=(
   # The group is every unsent write: a whole 1 MiB round offered at once,
   # above the class cap at the hostile share.
   "inf_canary_tier_group_whole_round m4-tier-budget TIER-CAP --tier-leg two-1mb-hostile"
-  # The issue visit starts at index 0 and continues past a refusal: at the
-  # hostile share the second namespace's group waits past n × T_c.
-  "inf_canary_tier_turn_index_order m4-tier-budget TIER-TURN --tier-leg two-1mb-hostile"
-  # The same plant at the two-cell binary, the light-load leg: the starved
-  # namespace's ready group waits past n × T_c, read from INFO beside the
-  # replies (its writer's own bound is four group bounds, so the replies
-  # stay +OK). The both-backlogged leg is not a row: at the real device
-  # its planted starvation depends on when the light namespace's groups
-  # become ready relative to the heavy one's, so it cannot go red
-  # reliably; it stays a test of the fair build.
-  "inf_canary_tier_turn_index_order crate-test inf-server test:node_e2e a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write a ready group waited"
+  # The issue visit starts at index 0 and continues past a refusal: on the
+  # thief leg the thief, first in the visit, takes every opening while it
+  # holds a sealed backlog, and the second namespace's group, larger on
+  # bytes and not smaller on ops, waits for that backlog, past n × T_c.
+  # The plant's one row: with rounds bounded by the slice, a second
+  # namespace with small groups is served between a backlog's rounds
+  # whatever the visit order, and at the binary a starved writer's typed
+  # timeout fails a test before its witness, so the binary tests stay
+  # tests of the fair build.
+  "inf_canary_tier_turn_index_order m4-tier-budget TIER-TURN --tier-leg two-1mb-thief"
   # A retry group reaches the driver with no offer: the spend falls below
   # what the disk saw, on the retry arm.
   "inf_canary_tier_retry_ungranted m4-tier-budget TIER-SPEND --tier-leg two-8mb --plant tier-write-eio"
@@ -931,6 +930,17 @@ rows=(
   # finds none and is counted before it waits, and the run's end reads the
   # count on every cell.
   "inf_canary_reserve_unguarded m1-pub-cross RESERVE"
+  # The thief leg's premise: a thief of two writers with a tenth of its
+  # window mutable seals late and holds a backlog below its slice inside the
+  # wait bound's window, so the leg's premise clause reads it vacuous (a
+  # vacuity plant, read in the simulator alone).
+  "inf_canary_thief_premise_short m4-tier-budget thief-premise-short --tier-leg two-1mb-thief"
+  # The spend's queued term reads the driver's own queue, which every entry
+  # drains, in place of the cell loop's, where a grant waits one step: the
+  # equality breaks at the first step a grant waits, and no step finds a
+  # tier op queued (a vacuity plant, read in the simulator alone).
+  "inf_canary_tier_spend_driver_queue m4-tier-budget TIER-SPEND --tier-leg two-1mb-thief"
+  "inf_canary_tier_spend_driver_queue m4-tier-budget tier-spend-unqueued --tier-leg two-1mb-thief"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
