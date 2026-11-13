@@ -170,6 +170,57 @@
 //! }
 //! ```
 //!
+//! A field is read only inside the module: another crate borrows none, so no
+//! handle hands out the binary's path, a command's program or a node's
+//! child. A doctest sees a plain `pub` only; `scripts/check-node-spawn.sh`
+//! reads every field of this file for any visibility.
+//!
+//! ```compile_fail,E0616
+//! use compat::harness::node::NodeBinary;
+//! fn way_out(binary: NodeBinary) {
+//!     let _ = &binary.path;
+//! }
+//! ```
+//!
+//! ```compile_fail,E0616
+//! use compat::harness::node::{BoxWide, NodeCommand};
+//! fn way_out(command: NodeCommand<BoxWide>) {
+//!     let _ = &command.program;
+//! }
+//! ```
+//!
+//! ```compile_fail,E0616
+//! use compat::harness::node::Node;
+//! fn way_out(node: Node) {
+//!     let _ = &node.child;
+//! }
+//! ```
+//!
+//! ```compile_fail,E0616
+//! use compat::harness::node::LeasedNode;
+//! fn way_out(leased: LeasedNode<'_>) {
+//!     let _ = &leased.child;
+//! }
+//! ```
+//!
+//! A command's raw `Command`, which carries the lock, and its constructor
+//! from a path are private methods.
+//!
+//! ```compile_fail,E0624
+//! use compat::harness::node::NodeBinary;
+//! fn way_out(binary: NodeBinary) {
+//!     let _ = binary.command().into_command();
+//! }
+//! ```
+//!
+//! ```compile_fail,E0624
+//! use compat::harness::node::{BoxWide, NodeCommand, NodeLock};
+//! use std::path::PathBuf;
+//! fn way_out(lock: NodeLock<BoxWide>, path: PathBuf) -> NodeCommand<BoxWide> {
+//!     NodeCommand::under_lock(lock, path)
+//! }
+//! ```
+//!
 //! The twin: each block's names and signature, its expression in the allowed
 //! form; together they call every method of a command.
 //!
@@ -270,6 +321,48 @@
 //!     use compat::harness::node::LeasedNode;
 //!     pub fn allowed(leased: LeasedNode<'_>) -> u32 {
 //!         leased.id()
+//!     }
+//! }
+//! mod binary_field {
+//!     use compat::harness::node::NodeBinary;
+//!     pub fn allowed(binary: NodeBinary) -> String {
+//!         format!("{binary:?}")
+//!     }
+//! }
+//! mod command_field {
+//!     use compat::harness::node::{BoxWide, NodeCommand};
+//!     pub fn allowed(command: NodeCommand<BoxWide>) {
+//!         let _ = command.arg("--help");
+//!     }
+//! }
+//! mod node_field {
+//!     use compat::harness::node::Node;
+//!     pub fn allowed(node: Node) -> u32 {
+//!         node.id()
+//!     }
+//! }
+//! mod leased_field {
+//!     use compat::harness::node::LeasedNode;
+//!     pub fn allowed(leased: LeasedNode<'_>) -> u32 {
+//!         leased.id()
+//!     }
+//! }
+//! mod command_into_command {
+//!     use compat::harness::node::NodeBinary;
+//!     pub fn allowed(binary: NodeBinary) {
+//!         let _ = binary.command().spawn();
+//!     }
+//! }
+//! mod command_under_lock {
+//!     use compat::harness::node::{BoxWide, NodeBinary, NodeCommand, NodeLock};
+//!     use std::path::PathBuf;
+//!     pub fn allowed(
+//!         lock: NodeLock<BoxWide>,
+//!         path: PathBuf,
+//!         binary: NodeBinary,
+//!     ) -> NodeCommand<BoxWide> {
+//!         let _ = (lock.dir(), path);
+//!         binary.command()
 //!     }
 //! }
 //! ```
@@ -378,6 +471,7 @@ impl Scope for Private {}
 
 /// The deadlines and the settle of one lock.
 #[derive(Clone, Copy, Debug)]
+// node-field-public: 3 fields, durations a test sets for its own lock; no path, command or file
 pub struct Waits {
     /// A start's wait for both locks.
     pub shared: Duration,
@@ -408,6 +502,7 @@ pub enum Ulimit {
 /// What this process holds on one lock: its live shared nodes (in the
 /// process and on the calling thread) and whether it holds the lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// node-field-public: 3 fields, counts and a flag copied out for a test to read; nothing to start
 pub struct Live {
     pub process: u32,
     pub thread: u32,
@@ -882,6 +977,7 @@ pub enum NodeError {
 
 /// A lock path and why it cannot be used.
 #[derive(Debug)]
+// node-field-public: 2 fields, the lock's refused path (directory, lock file or uid probe) and why
 pub struct DirRefusal {
     pub path: PathBuf,
     pub reason: DirReason,
@@ -900,6 +996,7 @@ pub enum DirReason {
 
 /// The lock file a wait gave up on, and how long it waited.
 #[derive(Debug)]
+// node-field-public: 2 fields, a lock file's path under dir() and the time a wait spent on it
 pub struct LockTimeout {
     pub lock: PathBuf,
     pub waited: Duration,
