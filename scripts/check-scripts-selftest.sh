@@ -102,7 +102,8 @@ drv_fixture() {
     chmod +x "$file"
     echo "$file"
 }
-drv_run() { env -u INF_SELFTEST_CASE_LOG CARGO_BUILD_JOBS=2 "$@"; }
+# A fixture's driver runs outside any job pool, so its width is the one planted.
+drv_run() { env -u INF_SELFTEST_CASE_LOG -u CARGO_MAKEFLAGS CARGO_BUILD_JOBS=2 "$@"; }
 f=$(drv_fixture control 'group_one() {' 'expect green "one passes" true' '}' \
     'group_two() {' 'expect red "two passes" false' '}')
 drv_ok_re='check-scripts self-test OK (2 cases in 2 groups; the longest group:'
@@ -260,7 +261,8 @@ f=$(drv_fixture overlap \
 mkdir -p "$work/drv-sync" "$work/drv-log"
 expect_output "driver: two groups at once each see only their own fixture" \
     "check-scripts self-test OK (4 cases in 2 groups" \
-    env DRV_SYNC="$work/drv-sync" INF_SELFTEST_CASE_LOG="$work/drv-log" CARGO_BUILD_JOBS=2 "$f"
+    env -u CARGO_MAKEFLAGS DRV_SYNC="$work/drv-sync" INF_SELFTEST_CASE_LOG="$work/drv-log" \
+    CARGO_BUILD_JOBS=2 "$f"
 drv_own_log() { # each group's records hold its own labels only
     [ "$(cat "$work/drv-log/one/"* | grep -c '^label	one ')" -eq 2 ] &&
         [ "$(cat "$work/drv-log/two/"* | grep -c '^label	two ')" -eq 2 ] &&
@@ -371,6 +373,77 @@ f=$(drv_fixture collate 'group_one() {' 'expect green "one passes" true' '}' \
     'group_two() {' 'expect green "two passes" true' '}')
 expect_output "driver: sort, uniq and comm read one collation whatever the caller's locale" \
     "check-scripts self-test OK (2 cases in 2 groups" drv_collated "$f"
+# The width and the job pool. Each of three groups notes how many groups hold a
+# slot when it starts and when it ends, in $DRV_LIVE/peaks; with DRV_MEET set it
+# first waits, at most 5 s, until that many hold one. Outside a pool at most
+# CARGO_BUILD_JOBS run at once; under a pool of k free tokens at most k + 1,
+# each group beyond the first holding a token, and every token comes back.
+f=$(drv_fixture held \
+    'drv_live() { ls "$DRV_LIVE" | grep -c "^on\\." >>"$DRV_LIVE/peaks"; }' \
+    'drv_hold() { : >"$DRV_LIVE/on.$$"; drv_live; n=0' \
+    '    while [ "$(ls "$DRV_LIVE" | grep -c "^on\\.")" -lt "${DRV_MEET:-0}" ] &&' \
+    '        [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done' \
+    '    sleep 0.3; drv_live; rm -f "$DRV_LIVE/on.$$"; }' \
+    'group_one() {' 'expect green "one holds a slot" drv_hold' '}' \
+    'group_two() {' 'expect green "two holds a slot" drv_hold' '}' \
+    'group_three() {' 'expect green "three holds a slot" drv_hold' '}')
+drv_peak() { # <peaks file> <most> [<least>]: every count is a number, the largest within bounds
+    awk -v most="$2" -v least="${3:-0}" '
+        !/^(0|[1-9][0-9]*)$/ { bad = 1 }
+        $0 + 0 > peak { peak = $0 + 0 }
+        END {
+            print "counts " NR ", peak " peak
+            exit !(!bad && NR > 0 && peak <= most && peak >= least)
+        }' "$1"
+}
+drv_wide() { # <live dir> <jobs> [<meet>]: the fixture outside any pool
+    env -u INF_SELFTEST_CASE_LOG -u CARGO_MAKEFLAGS DRV_LIVE="$1" DRV_MEET="${3:-0}" \
+        CARGO_BUILD_JOBS="$2" "$f"
+}
+# drv_pooled <pool FIFO> <tokens> <live dir>: the fixture at CARGO_BUILD_JOBS=3
+# under a pool holding that many tokens; red unless every token came back.
+drv_pooled() (
+    exec 9<>"$1"
+    i=0
+    while [ "$i" -lt "$2" ]; do
+        printf + >&9
+        i=$((i + 1))
+    done
+    env -u INF_SELFTEST_CASE_LOG CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:$1" DRV_LIVE="$3" \
+        CARGO_BUILD_JOBS=3 "$f" 9>&- || exit 1
+    left=$(python3 -I -S -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK)
+try:
+    print(len(os.read(fd, 4096)))
+except BlockingIOError:
+    print(0)' "$1")
+    echo "tokens back: $left of $2"
+    [ "$left" = "$2" ]
+)
+mkdir -p "$work/drv-meet" "$work/drv-wide" "$work/drv-pool1" "$work/drv-pool0" "$work/drv-gone"
+expect_output "driver: three groups that meet run at once at CARGO_BUILD_JOBS=3" \
+    "check-scripts self-test OK (3 cases in 3 groups" drv_wide "$work/drv-meet" 3 3
+expect red "driver: the count of groups at once reads past 2 when three run (canary)" \
+    drv_peak "$work/drv-meet/peaks" 2
+expect_output "driver: three groups run green at CARGO_BUILD_JOBS=2" \
+    "check-scripts self-test OK (3 cases in 3 groups" drv_wide "$work/drv-wide" 2
+expect green "driver: at CARGO_BUILD_JOBS=2 at most two groups run at once" \
+    drv_peak "$work/drv-wide/peaks" 2
+mkfifo "$work/drv-pool1/p" "$work/drv-pool0/p"
+expect_output "driver: under a pool of one free token the groups run green, every token back" \
+    "tokens back: 1 of 1" drv_pooled "$work/drv-pool1/p" 1 "$work/drv-pool1"
+expect green "driver: under a pool of one free token at most two groups run at once" \
+    drv_peak "$work/drv-pool1/peaks" 2
+expect_output "driver: under a pool with no free token every group runs, one at a time, and ends" \
+    "tokens back: 0 of 0" drv_pooled "$work/drv-pool0/p" 0 "$work/drv-pool0"
+expect green "driver: under a pool with no free token one group runs at a time" \
+    drv_peak "$work/drv-pool0/peaks" 1 1
+expect_red_because "driver: a pool that is no fifo: path is refused" \
+    "selftest: CARGO_MAKEFLAGS names a pool the driver cannot open: '3,4'" \
+    env -u INF_SELFTEST_CASE_LOG CARGO_MAKEFLAGS='-j --jobserver-auth=3,4' "$f"
+expect_red_because "driver: a pool whose FIFO is gone is refused" \
+    "a pool the driver cannot open: 'fifo:$work/drv-gone/p'" \
+    env -u INF_SELFTEST_CASE_LOG CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:$work/drv-gone/p" "$f"
 }
 
 # The gates' crate set (scripts/cell-crates.sh) names exclusions that must
