@@ -331,6 +331,18 @@ expect_red_because "driver: an end stamp that is no whole number is red, named" 
 f=$(drv_clocked backwards 105 100)
 expect_red_because "driver: a clock that runs backwards is red, named" \
     "$drv_clock_red group one clock: 105 100" drv_run "$f"
+f=$(drv_clocked signed 100 +105)
+expect_red_because "driver: a signed end stamp is red, named" \
+    "$drv_clock_red group one clock: 100 +105" drv_run "$f"
+# A clock line of one stamp: the group's count is green, so its clock line
+# alone makes it red, and the tally counts that group once.
+f=$(drv_fixture onestamp 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 0"' \
+    'echo "group one clock: 100"' 'exit 0' '}')
+expect_red_because "driver: a clock line of one stamp is red, named" \
+    "$drv_clock_red group one clock: 100\$" drv_run "$f"
+expect_red_because "driver: a group red by its clock line alone is one red group, no failed case" \
+    "check-scripts self-test FAILED: 0 of 1 cases failed; 1 of 1 groups red; 0 driver error(s)" \
+    drv_run "$f"
 # The driver's sort, uniq and comm run under LC_ALL=C: stand-ins that answer
 # `collation_differs` under any other locale setting would turn its control red.
 mkdir -p "$work/drv-collate"

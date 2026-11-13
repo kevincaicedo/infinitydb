@@ -185,15 +185,17 @@ selftest_number() {
     case $1 in '' | 0?* | *[!0-9]*) return 1 ;; esac
 }
 # selftest_tenths <group> <log>: the group's tenths of a second, from its one
-# clock line of two stamps in order; else that line, or `none`, and status 1.
-# The driver reads it for a group no earlier check counted red.
+# clock line of exactly two stamps, one space apart and in order; else that
+# line, or `none`, and status 1. The driver reads it for a group no earlier
+# check counted red.
 selftest_tenths() {
-    local line began ended
+    local line stamps began ended
     line=$(sed -n "/^group $1 clock: /p" "$2")
-    began=${line#"group $1 clock: "}
-    ended=${began#* }
-    began=${began%% *}
-    if ! selftest_number "$began" || ! selftest_number "$ended" || [ "$ended" -lt "$began" ]; then
+    stamps=${line#"group $1 clock: "}
+    began=${stamps%% *}
+    ended=${stamps#"$began "}
+    if [ "$began" = "$stamps" ] || ! selftest_number "$began" || ! selftest_number "$ended" ||
+        [ "$ended" -lt "$began" ]; then
         echo "${line:-none}"
         return 1
     fi
