@@ -21,9 +21,9 @@
 # <name>` runs one). A group's body is not indented: its heredocs and
 # multi-line strings are fixture bytes. INF_SELFTEST_CASE_LOG=<an empty
 # directory> writes one record a case (the lib's header says what it holds).
-# A group stays under 20 s as the driver runs it: the longest group is the
-# line's floor, so a longer one is cut, each part building its own fixtures;
-# the OK line names the longest group with its seconds on every run.
+# A group the driver runs for more than 20 s is cut, each part building its
+# own fixtures: the longest group is the line's floor. The OK line names the
+# longest group with its seconds on every run, which is where a cut shows.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR/.."
@@ -4919,7 +4919,7 @@ expect_red_because "lint-scopes: containers — a committed raise is red against
 }
 
 # Each probe case is a cold clippy build of about 3 s, so the probe's cases sit
-# in groups of at most four: a group stays under the 20 s bound above.
+# in groups of at most four, by the cut rule above.
 group_lint_scopes_probe() {
 ls_setup
 # the probe's judge: a plant that compiles clean, and a plant that fails
