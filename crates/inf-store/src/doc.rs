@@ -27,6 +27,8 @@
 #[cfg(feature = "doc")]
 use inf_alloc::{Arena, ArenaAddr};
 #[cfg(feature = "doc")]
+use inf_doc::ser::ReplyTooLarge;
+#[cfg(feature = "doc")]
 use inf_doc::{
     ApplyError, ApplyOp, ArenaDoc, CanonicalDoc, DocError, DocLimits, DocMemReport, DocRef,
     DocValue, FreezeScratch, ScalarPatch, TapeDoc, patch_scalar_in_place,
@@ -1096,12 +1098,16 @@ impl CellStore {
         self.cfg.doc_max_path_matches
     }
 
-    /// Namespace-resolved reply budget (ADR-0099 A1): one account for the
-    /// whole RESP reply of a `JSON.*` command; a reply that would cross it
-    /// answers the pinned `ERR reply too large` before the command's effect.
+    /// Namespace-resolved reply budget (ADR-0173 D1): one account for the
+    /// whole RESP reply of a `JSON.*` command, `JSON.MGET` across cells
+    /// included; a reply that would cross it answers the pinned
+    /// `ERR reply too large` in place of everything the command wrote. With
+    /// [`crate::Keyspace::ns_doc_reply_limit`], which reads a namespace's
+    /// without making its store, the way to a [`ReplyLimit`]: both build it
+    /// from the store config, so no number of the budget leaves this crate.
     #[inline]
-    pub fn doc_max_reply_bytes(&self) -> usize {
-        self.cfg.doc_max_reply_bytes
+    pub fn doc_reply_limit(&self) -> ReplyLimit {
+        ReplyLimit::configured(&self.cfg)
     }
 
     /// The document memory domain (S19 wires this into reports/`INFO`).
@@ -1336,6 +1342,46 @@ impl CellStore {
                 }
             }
         }
+    }
+}
+
+/// One store's `JSON.*` reply budget (ADR-0173 D1), `doc-max-reply-bytes`:
+/// one account for every RESP byte one command's reply contributes, framing
+/// included, counted from the command's own mark. It hands out no number:
+/// its two operations are the predicate and the one write-ahead stop, so a
+/// handler or a cross-cell gather cannot compare a length with the budget
+/// by hand or keep a second account. Crossing: `ReplyTooLarge`, which the
+/// reply answers as `ERR reply too large` with nothing of the reply served.
+#[cfg(feature = "doc")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ReplyLimit {
+    budget_bytes: usize,
+}
+
+#[cfg(feature = "doc")]
+impl ReplyLimit {
+    /// The budget `cfg` configures: the one place a `ReplyLimit` is built.
+    #[inline]
+    pub(crate) fn configured(cfg: &StoreConfig) -> ReplyLimit {
+        ReplyLimit { budget_bytes: cfg.doc_max_reply_bytes }
+    }
+
+    /// Whether a reply of `reply_bytes`, counted from the command's own mark,
+    /// fits the budget: the one predicate of the account. Its callers pass
+    /// a predicted length (a frame about to be written) or a measured one
+    /// (a patched bulk's post-check, a gather's sum).
+    #[inline]
+    pub fn admits(self, reply_bytes: usize) -> Result<(), ReplyTooLarge> {
+        if reply_bytes <= self.budget_bytes { Ok(()) } else { Err(ReplyTooLarge) }
+    }
+
+    /// Where a bounded serializer that writes `write_ahead_bytes` ahead of
+    /// its check stops: the budget plus that slack, in bytes from the
+    /// command's mark. What it lets through is checked by [`Self::admits`]
+    /// and rolled back; the one caller is the patched document bulk.
+    #[inline]
+    pub fn serializer_stop(self, write_ahead_bytes: usize) -> usize {
+        self.budget_bytes.saturating_add(write_ahead_bytes)
     }
 }
 

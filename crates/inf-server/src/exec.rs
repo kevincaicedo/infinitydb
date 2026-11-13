@@ -138,6 +138,9 @@ pub struct NodeState {
     pub tier_position_conflicts: Cell<u64>,
     pub connections: Cell<u64>,
     pub recv_dropped: Cell<u64>,
+    /// The cell executor's `waker_foreign_ops`: waker operations made off the cell's thread,
+    /// which no product path makes (ADR-0003 A1.4). Cell scope, flushed by MAINTAIN.
+    pub waker_foreign_ops: Cell<u64>,
     pub fabric_rtt_p50_ns: Cell<u64>,
     pub cell: Cell<u16>,
     pub cells: Cell<u16>,
@@ -192,13 +195,17 @@ pub struct NodeState {
     pub pubsub_fan_msgs: Cell<u64>,
     pub pubsub_delivered: Cell<u64>,
     pub cob_disconnections: Cell<u64>,
+    /// Publish fan legs this cell's owner pump could not stage on the
+    /// credit general sends leave free, each then sent as a general op
+    /// (ADR-0192 D3). Cell scope; 0 by the reserve's proof, so any other
+    /// reading is a finding (`INFO` `# Tripwires`).
+    pub fabric_reserve_refused_cell: Cell<u64>,
     /// Idle connections closed by `timeout` (ADR-0123 D2; `INFO stats
     /// idle_disconnections`, cell scope).
     pub idle_disconnections: Cell<u64>,
-    /// `JSON.*` replies this cell refused over `doc-max-reply-bytes` (a
-    /// refused `JSON.MGET` element counts one) and the reply bytes those
-    /// refusals built and discarded — the CPU the limit cost (ADR-0099 A1;
-    /// `INFO stats`, cell scope). Lifetime counters that saturate at
+    /// `JSON.*` replies this cell refused over `doc-max-reply-bytes` and
+    /// the reply bytes those refusals built and discarded — the CPU the
+    /// limit cost (ADR-0099 A1; `INFO stats`, cell scope). Lifetime counters that saturate at
     /// `u64::MAX`: metrics only, no accounting reads them.
     #[cfg(feature = "doc")]
     pub json_reply_refusals_cell: Cell<u64>,

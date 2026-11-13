@@ -11,7 +11,8 @@
 # Fixture trees are built under mktemp and handed to the gates through
 # INF_CHECK_ROOT (the gates) and INF_SIM_BIN / INF_SWEEP_SHARDS (the sweep
 # runner, with a stub simulator). No cargo, except in the lint-scope probe
-# cases, which run `cargo clippy` on the pinned toolchain.
+# cases, which run `cargo clippy` on the pinned toolchain, and the target-root
+# config and nextest-config cases, which run `cargo metadata` there.
 #
 # The cases live in group functions, `group_<name>() {`, one a gate's
 # section or a part of one, each building every fixture it reads: the driver
@@ -20,9 +21,16 @@
 # <name>` runs one). A group's body is not indented: its heredocs and
 # multi-line strings are fixture bytes. INF_SELFTEST_CASE_LOG=<an empty
 # directory> writes one record a case (the lib's header says what it holds).
+# A group the driver runs for more than 20 s is cut, each part building its
+# own fixtures: the longest group is the line's floor. The OK line names the
+# longest group with its seconds on every run, which is where a cut shows.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR/.."
+# The cases build fixture checkouts of their own, so none inherits the root the
+# justfile exports for this checkout, which every other checkout's helper
+# refuses (ADR-0204 D1); a case that needs CARGO_TARGET_DIR sets it itself.
+unset CARGO_TARGET_DIR
 # shellcheck source=selftest-lib.sh
 . "$SCRIPT_DIR/selftest-lib.sh"
 
@@ -94,12 +102,14 @@ drv_fixture() {
     chmod +x "$file"
     echo "$file"
 }
-drv_run() { env -u INF_SELFTEST_CASE_LOG CARGO_BUILD_JOBS=2 "$@"; }
+# A fixture's driver runs outside any job pool, so its width is the one planted.
+drv_run() { env -u INF_SELFTEST_CASE_LOG -u CARGO_MAKEFLAGS CARGO_BUILD_JOBS=2 "$@"; }
 f=$(drv_fixture control 'group_one() {' 'expect green "one passes" true' '}' \
     'group_two() {' 'expect red "two passes" false' '}')
+drv_ok_re='check-scripts self-test OK (2 cases in 2 groups; the longest group:'
+drv_ok_re="$drv_ok_re [a-z]*, [0-9]*\.[0-9] s;"
 expect_output "driver: the control's OK line names its groups and counts" \
-    "check-scripts self-test OK (2 cases in 2 groups, each exiting non-zero on its planted case: one, two)" \
-    drv_run "$f"
+    "$drv_ok_re each exiting non-zero on its planted case: one, two)\$" drv_run "$f"
 expect_output "driver: --group runs one group and prints its count line" "group two: 1 0" \
     drv_run "$f" --group two
 expect_red_because "driver: --group refuses a name no definition line holds" "no group 'three'" \
@@ -251,7 +261,8 @@ f=$(drv_fixture overlap \
 mkdir -p "$work/drv-sync" "$work/drv-log"
 expect_output "driver: two groups at once each see only their own fixture" \
     "check-scripts self-test OK (4 cases in 2 groups" \
-    env DRV_SYNC="$work/drv-sync" INF_SELFTEST_CASE_LOG="$work/drv-log" CARGO_BUILD_JOBS=2 "$f"
+    env -u CARGO_MAKEFLAGS DRV_SYNC="$work/drv-sync" INF_SELFTEST_CASE_LOG="$work/drv-log" \
+    CARGO_BUILD_JOBS=2 "$f"
 drv_own_log() { # each group's records hold its own labels only
     [ "$(cat "$work/drv-log/one/"* | grep -c '^label	one ')" -eq 2 ] &&
         [ "$(cat "$work/drv-log/two/"* | grep -c '^label	two ')" -eq 2 ] &&
@@ -259,6 +270,474 @@ drv_own_log() { # each group's records hold its own labels only
         ! cat "$work/drv-log/two/"* | grep -q '^label	one '
 }
 expect green "driver: two groups at once each write only their own case log" drv_own_log
+# A group's seconds come from the clock line its process prints; the OK line
+# names the longest. A fixture clock that answers by the group, and by whether
+# a case has run yet, makes the seconds exact (tenths of a second).
+drv_only() { # <fixture> <line>: the driver exits 0 and prints that line alone
+    local out
+    out=$(drv_run "$1" 2>&1) || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out"
+    [ "$out" = "$2" ]
+}
+drv_clocked() { # <name> <begin> <end>: one green group; its clock reads <begin>, then <end>
+    drv_fixture "$1" 'group_one() {' 'expect green "one passes" true' '}' \
+        "selftest_clock() { if [ \$((pass + fail)) -eq 0 ]; then echo $2; else echo $3; fi; }"
+}
+drv_pair() { # <name> <one's end> <two's end>: two green groups, each clock 100, then its end
+    drv_fixture "$1" 'group_one() {' 'expect green "one passes" true' '}' \
+        'group_two() {' 'expect green "two passes" true' '}' \
+        'selftest_clock() { if [ $((pass + fail)) -eq 0 ]; then echo 100;' \
+        "else case \$SELFTEST_GROUP in one) echo $2 ;; *) echo $3 ;; esac; fi; }"
+}
+drv_ok='check-scripts self-test OK (2 cases in 2 groups; the longest group:'
+drv_groups='each exiting non-zero on its planted case: one, two)'
+# The longest group is the last read in one fixture and the first in the other,
+# so a driver that names the last group, or the first, is red on one of them.
+f=$(drv_pair clocked 105 130)
+expect green "driver: the OK line, alone, names the longest group with its seconds" drv_only "$f" \
+    "$drv_ok two, 3.0 s; $drv_groups"
+f=$(drv_pair clocked-first 130 105)
+expect green "driver: the longest group is named when it is the first read" drv_only "$f" \
+    "$drv_ok one, 3.0 s; $drv_groups"
+f=$(drv_clocked instant 100 100)
+expect_output "driver: a group of no measurable time is still named, at 0.0 s" \
+    "; the longest group: one, 0\.0 s;" drv_run "$f"
+drv_tenths() { # the lib's clock: tenths of the monotonic seconds read between two of its reads
+    local before seconds after
+    before=$(selftest_clock)
+    seconds=$(python3 -I -S -c 'import time; print(time.monotonic())')
+    after=$(selftest_clock)
+    echo "clock $before, monotonic seconds $seconds, clock $after"
+    awk -v b="$before" -v s="$seconds" -v a="$after" \
+        'BEGIN { t = int(s * 10); exit !(b <= t && t <= a) }'
+}
+expect green "driver: the group clock reads the monotonic clock in tenths of a second" drv_tenths
+drv_clock_red="group one's clock line is not one line of two stamps in order:"
+f=$(drv_fixture noclock 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 0"' \
+    'exit 0' '}')
+expect_red_because "driver: a group that prints no clock line is red, named" "$drv_clock_red none" \
+    drv_run "$f"
+f=$(drv_fixture redonce 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 0"' \
+    'exit 1' '}')
+expect_red_because "driver: a group red by its count is counted once, its clock line unread" \
+    "check-scripts self-test FAILED: 0 of 1 cases failed; 1 of 1 groups red; 0 driver error(s)" \
+    drv_run "$f"
+f=$(drv_fixture twoclocks 'group_one() {' 'expect green "one passes" true' \
+    'echo "group one clock: 100 105"' '}')
+expect_red_because "driver: a group that prints two clock lines is red, named" \
+    "$drv_clock_red group one clock: 100 105" drv_run "$f"
+f=$(drv_clocked octal 08 100)
+expect_red_because "driver: a begin stamp with a leading zero is red, named" \
+    "$drv_clock_red group one clock: 08 100" drv_run "$f"
+f=$(drv_clocked notnumber 100 1e3)
+expect_red_because "driver: an end stamp that is no whole number is red, named" \
+    "$drv_clock_red group one clock: 100 1e3" drv_run "$f"
+f=$(drv_clocked backwards 105 100)
+expect_red_because "driver: a clock that runs backwards is red, named" \
+    "$drv_clock_red group one clock: 105 100" drv_run "$f"
+f=$(drv_clocked signed 100 +105)
+expect_red_because "driver: a signed end stamp is red, named" \
+    "$drv_clock_red group one clock: 100 +105" drv_run "$f"
+# A clock line of one stamp: the group's count is green, so its clock line
+# alone makes it red, and the tally counts that group once.
+f=$(drv_fixture onestamp 'group_one() {' 'expect green "one passes" true' 'echo "group one: 1 0"' \
+    'echo "group one clock: 100"' 'exit 0' '}')
+expect_red_because "driver: a clock line of one stamp is red, named" \
+    "$drv_clock_red group one clock: 100\$" drv_run "$f"
+expect_red_because "driver: a group red by its clock line alone is one red group, no failed case" \
+    "check-scripts self-test FAILED: 0 of 1 cases failed; 1 of 1 groups red; 0 driver error(s)" \
+    drv_run "$f"
+# The driver's sort, uniq and comm run under LC_ALL=C: stand-ins that answer
+# `collation_differs` under any other locale setting would turn its control red.
+mkdir -p "$work/drv-collate"
+for drv_tool in sort uniq comm; do
+    printf '#!/bin/sh\n[ "${LC_ALL-}" = C ] && exec %s "$@"\necho collation_differs\n' \
+        "$(command -v "$drv_tool")" >"$work/drv-collate/$drv_tool"
+    chmod +x "$work/drv-collate/$drv_tool"
+done
+drv_stand_ins() { # each stand-in answers otherwise outside LC_ALL=C, so the plant is live
+    local tool
+    for tool in sort uniq comm; do
+        [ "$(LC_ALL=POSIX "$work/drv-collate/$tool" /dev/null /dev/null)" = collation_differs ] ||
+            return 1
+    done
+}
+expect green "driver: the collation stand-ins answer otherwise outside LC_ALL=C (control)" \
+    drv_stand_ins
+drv_collated() ( # <fixture>: the driver beside the stand-ins, its caller's locale POSIX
+    PATH="$work/drv-collate:$PATH" LC_ALL=POSIX
+    export PATH LC_ALL
+    drv_run "$1"
+)
+f=$(drv_fixture collate 'group_one() {' 'expect green "one passes" true' '}' \
+    'group_two() {' 'expect green "two passes" true' '}')
+expect_output "driver: sort, uniq and comm read one collation whatever the caller's locale" \
+    "check-scripts self-test OK (2 cases in 2 groups" drv_collated "$f"
+# The width and the job pool. Each of three groups notes how many groups hold a
+# slot when it starts and when it ends, in $DRV_LIVE/peaks; with DRV_MEET set it
+# first waits, at most 5 s, until that many hold one. Outside a pool at most
+# CARGO_BUILD_JOBS run at once; under a pool of k free tokens at most k + 1,
+# each group beyond the first holding a token, and every token comes back.
+f=$(drv_fixture held \
+    'drv_live() { ls "$DRV_LIVE" | grep -c "^on\\." >>"$DRV_LIVE/peaks"; }' \
+    'drv_hold() { : >"$DRV_LIVE/on.$$"; drv_live; n=0' \
+    '    while [ "$(ls "$DRV_LIVE" | grep -c "^on\\.")" -lt "${DRV_MEET:-0}" ] &&' \
+    '        [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done' \
+    '    sleep 0.3; drv_live; rm -f "$DRV_LIVE/on.$$"; }' \
+    'group_one() {' 'expect green "one holds a slot" drv_hold' '}' \
+    'group_two() {' 'expect green "two holds a slot" drv_hold' '}' \
+    'group_three() {' 'expect green "three holds a slot" drv_hold' '}')
+drv_peak() { # <peaks file> <most> [<least>]: every count is a number, the largest within bounds
+    awk -v most="$2" -v least="${3:-0}" '
+        !/^(0|[1-9][0-9]*)$/ { bad = 1 }
+        $0 + 0 > peak { peak = $0 + 0 }
+        END {
+            print "counts " NR ", peak " peak
+            exit !(!bad && NR > 0 && peak <= most && peak >= least)
+        }' "$1"
+}
+drv_wide() { # <live dir> <jobs> [<meet>]: the fixture outside any pool
+    env -u INF_SELFTEST_CASE_LOG -u CARGO_MAKEFLAGS DRV_LIVE="$1" DRV_MEET="${3:-0}" \
+        CARGO_BUILD_JOBS="$2" "$f"
+}
+# drv_pooled <pool FIFO> <tokens> <live dir>: the fixture at CARGO_BUILD_JOBS=3
+# under a pool holding that many tokens; red unless every token came back.
+drv_pooled() (
+    exec 9<>"$1"
+    i=0
+    while [ "$i" -lt "$2" ]; do
+        printf + >&9
+        i=$((i + 1))
+    done
+    env -u INF_SELFTEST_CASE_LOG CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:$1" DRV_LIVE="$3" \
+        CARGO_BUILD_JOBS=3 "$f" 9>&- || exit 1
+    left=$(python3 -I -S -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK)
+try:
+    print(len(os.read(fd, 4096)))
+except BlockingIOError:
+    print(0)' "$1")
+    echo "tokens back: $left of $2"
+    [ "$left" = "$2" ]
+)
+mkdir -p "$work/drv-meet" "$work/drv-wide" "$work/drv-pool1" "$work/drv-pool0" "$work/drv-gone"
+expect_output "driver: three groups that meet run at once at CARGO_BUILD_JOBS=3" \
+    "check-scripts self-test OK (3 cases in 3 groups" drv_wide "$work/drv-meet" 3 3
+expect red "driver: the count of groups at once reads past 2 when three run (canary)" \
+    drv_peak "$work/drv-meet/peaks" 2
+expect_output "driver: three groups run green at CARGO_BUILD_JOBS=2" \
+    "check-scripts self-test OK (3 cases in 3 groups" drv_wide "$work/drv-wide" 2
+expect green "driver: at CARGO_BUILD_JOBS=2 at most two groups run at once" \
+    drv_peak "$work/drv-wide/peaks" 2
+mkfifo "$work/drv-pool1/p" "$work/drv-pool0/p"
+expect_output "driver: under a pool of one free token the groups run green, every token back" \
+    "tokens back: 1 of 1" drv_pooled "$work/drv-pool1/p" 1 "$work/drv-pool1"
+expect green "driver: under a pool of one free token at most two groups run at once" \
+    drv_peak "$work/drv-pool1/peaks" 2
+expect_output "driver: under a pool with no free token every group runs, one at a time, and ends" \
+    "tokens back: 0 of 0" drv_pooled "$work/drv-pool0/p" 0 "$work/drv-pool0"
+expect green "driver: under a pool with no free token one group runs at a time" \
+    drv_peak "$work/drv-pool0/peaks" 1 1
+expect_red_because "driver: a pool that is no fifo: path is refused" \
+    "selftest: CARGO_MAKEFLAGS names a pool the driver cannot open: '3,4'" \
+    env -u INF_SELFTEST_CASE_LOG CARGO_MAKEFLAGS='-j --jobserver-auth=3,4' "$f"
+expect_red_because "driver: a pool whose FIFO is gone is refused" \
+    "a pool the driver cannot open: 'fifo:$work/drv-gone/p'" \
+    env -u INF_SELFTEST_CASE_LOG CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:$work/drv-gone/p" "$f"
+}
+
+group_stage() {
+# scripts/check-stage.sh on fixture gates, each case in a scripts directory of
+# its own beside a copy of the stage and its take. Every run unsets the job
+# pool the self-test may inherit, so its width is the one planted, unless the
+# case plants a pool of its own.
+stg_dir() { # <name>: a scripts directory holding the stage and its take
+    local dir="$work/stg-$1/scripts"
+    mkdir -p "$dir"
+    cp "$SCRIPT_DIR/check-stage.sh" "$SCRIPT_DIR/job_token.py" "$dir/"
+    echo "$dir"
+}
+stg_gate() { # <dir> <name> <line…>: the executable gate check-<name>.sh holding those lines
+    local file="$1/check-$2.sh"
+    shift 2
+    printf '%s\n' '#!/usr/bin/env bash' "$@" >"$file"
+    chmod +x "$file"
+}
+stg_long() { # <dir> <name> <lines>: a green gate printing that many lines, then that it ran
+    stg_gate "$1" "$2" "for i in \$(seq 1 $3); do echo \"$2 line \$i\"; done" "echo \"gate $2 ran\""
+}
+# A gate holding a slot notes how many hold one when it starts and when it
+# ends, in $STG_LIVE/peaks (a cargo-like client: each of its jobs does); with
+# STG_MEET set it first waits, at most 5 s, until that many hold one.
+stg_holder='stg_live() { ls "$STG_LIVE" | grep -c "^on\." >>"$STG_LIVE/peaks"; }
+stg_hold() {
+    : >"$STG_LIVE/on.$1"
+    stg_live
+    n=0
+    while [ "$(ls "$STG_LIVE" | grep -c "^on\.")" -lt "${STG_MEET:-0}" ] && [ "$n" -lt 50 ]; do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    sleep 0.3
+    stg_live
+    rm -f "$STG_LIVE/on.$1"
+}'
+stg_hold_gate() { # <dir> <name>: a gate that holds one slot
+    stg_gate "$1" "$2" "$stg_holder" "stg_hold $2.\$\$" "echo \"gate $2 ran\""
+}
+# A cargo-like client of three jobs: under the pool CARGO_MAKEFLAGS names the
+# first runs on its own token and each other on a token it takes and gives
+# back; with STG_CHEAT set it ignores the pool, as a cargo with a pool of its
+# own would.
+stg_client() { # <dir> <name>
+    stg_gate "$1" "$2" "$stg_holder" 'fifo=' \
+        'for w in ${CARGO_MAKEFLAGS:-}; do' \
+        '    case $w in --jobserver-auth=fifo:*) fifo=${w#*fifo:} ;; esac' 'done' \
+        '[ -z "${STG_CHEAT:-}" ] || fifo=' \
+        "stg_hold $2.1.\$\$ &" \
+        'for j in 2 3; do' \
+        '    if [ -z "$fifo" ]; then' \
+        "        stg_hold $2.\$j.\$\$ &" \
+        '        continue' \
+        '    fi' \
+        '    t=$(python3 -I -S "$(dirname "$0")/job_token.py" take "$fifo") || exit 1' \
+        "    (stg_hold $2.\$j.\$\$; printf \"\\\\\$(printf %03o \"\${t#* }\")\" >\"\$fifo\") &" \
+        'done' 'wait' "echo \"gate $2 ran\""
+}
+stg_run() { # <dir> <jobs> <gate…>: the stage there, outside any pool
+    local dir=$1 jobs=$2
+    shift 2
+    (cd "$dir/.." && env -u CARGO_MAKEFLAGS -u INF_CHECK_STAGE CARGO_BUILD_JOBS="$jobs" \
+        ./scripts/check-stage.sh "$@")
+}
+stg_serial() { # <dir> <gate…>: the stage there, one gate at a time
+    local dir=$1
+    shift
+    (cd "$dir/.." && env -u CARGO_MAKEFLAGS INF_CHECK_STAGE=serial ./scripts/check-stage.sh "$@")
+}
+stg_peak() { # <peaks file> <most> [<least>]: every count is a number, the largest within bounds
+    awk -v most="$2" -v least="${3:-0}" '
+        !/^(0|[1-9][0-9]*)$/ { bad = 1 }
+        $0 + 0 > peak { peak = $0 + 0 }
+        END {
+            print "counts " NR ", peak " peak
+            exit !(!bad && NR > 0 && peak <= most && peak >= least)
+        }' "$1"
+}
+# A gate red at place 3 of 4, its file:line at the end of 62 lines, with long
+# green outputs before and after it (the fourth starts beside it): the stage is
+# red, every started gate ends, the red output is printed after the green ones,
+# and the last 40 lines hold its header, its file:line and its name.
+d=$(stg_dir red3)
+stg_long "$d" a 60
+stg_long "$d" b 60
+stg_gate "$d" c 'n=0' \
+    'while [ ! -e "$STG_MARK" ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done' \
+    'for i in $(seq 1 60); do echo "c line $i"; done' \
+    'echo "crates/fake/src/lib.rs:12: a planted violation"' 'echo "check-c FAILED"' 'exit 1'
+stg_gate "$d" d ': >"$STG_MARK"' 'for i in $(seq 1 60); do echo "d line $i"; done' \
+    'echo "gate d ran"'
+export STG_MARK="$work/stg-red3/mark"
+expect red "stage: a gate red at place 3 of 4 turns the stage red" \
+    stg_run "$d" 2 check-a.sh check-b.sh check-c.sh check-d.sh
+cp "$work/log" "$work/stg-red3/out"
+tail -n 40 "$work/stg-red3/out" >"$work/stg-red3/tail"
+expect green "stage: the last 40 lines hold the red gate's closing header" \
+    grep -q '^--- check-c.sh: exit 1, [0-9]*\.[0-9] s, its last 11 lines$' "$work/stg-red3/tail"
+expect green "stage: the last 40 lines hold the red gate's file:line" \
+    grep -qx 'crates/fake/src/lib.rs:12: a planted violation' "$work/stg-red3/tail"
+expect green "stage: the last 40 lines name the red gate" \
+    grep -qx 'check-stage FAILED: 1 of 4 red, 0 not started: check-c.sh' "$work/stg-red3/tail"
+expect green "stage: the gate started beside the red one ran to its end" \
+    grep -qx 'gate d ran' "$work/stg-red3/out"
+stg_after() { # <file> <first> <then>: a line <then> follows the line <first>
+    awk -v a="$2" -v b="$3" '$0 == a { at = NR } $0 == b && at { found = 1 }
+        END { exit !found }' "$1"
+}
+expect green "stage: the red gate's output is printed after every green one's" \
+    stg_after "$work/stg-red3/out" 'gate d ran' 'c line 1'
+# Four gates red at once, one green: each red one is printed after the green
+# one and named; the closing block shows the first three, the fourth's output
+# whole above it.
+d=$(stg_dir red4)
+stg_long "$d" g 20
+for stg_r in r1 r2 r3 r4; do
+    stg_gate "$d" "$stg_r" ": >\"\$STG_REDS/$stg_r\"" \
+        'n=0' 'while [ "$(ls "$STG_REDS" | wc -l)" -lt 4 ] && [ "$n" -lt 50 ]; do' \
+        '    sleep 0.1; n=$((n + 1))' 'done' \
+        "for i in \$(seq 1 15); do echo \"$stg_r line \$i\"; done" \
+        "echo \"$stg_r: planted at $stg_r.rs:1\"" 'exit 1'
+done
+mkdir -p "$work/stg-red4/reds"
+export STG_REDS="$work/stg-red4/reds"
+expect red "stage: four gates red at once turn the stage red" \
+    stg_run "$d" 4 check-g.sh check-r1.sh check-r2.sh check-r3.sh check-r4.sh
+cp "$work/log" "$work/stg-red4/out"
+stg_red4='check-stage FAILED: 4 of 5 red, 0 not started:'
+expect green "stage: the naming line names all four red gates" grep -qx \
+    "$stg_red4 check-r1.sh check-r2.sh check-r3.sh check-r4.sh" "$work/stg-red4/out"
+stg_block() { # <file>: three red gates in the closing block, the fourth's output above it
+    [ "$(grep -c ', its last 11 lines$' "$1")" -eq 3 ] &&
+        ! grep -q '^--- check-r4.sh: .*, its last 11 lines$' "$1" &&
+        awk '/^r4 line 1$/ && !r4 { r4 = NR } / its last 11 lines$/ && !block { block = NR }
+            END { exit !(r4 && block && r4 < block) }' "$1"
+}
+expect green "stage: the closing block shows the first three red gates, the fourth's output above" \
+    stg_block "$work/stg-red4/out"
+expect green "stage: every red gate's output is printed after the green one's" \
+    stg_after "$work/stg-red4/out" 'gate g ran' 'r1 line 1'
+expect green "stage: the closing block fits the 40 lines a red line keeps" \
+    awk '/ its last 11 lines$/ && !start { start = NR }
+        /^check-stage FAILED: / { exit !(start && NR - start < 40) }' "$work/stg-red4/out"
+# Two gates that each wait for the other's file: green at once, red one at a time.
+d=$(stg_dir meet)
+for stg_r in p q; do
+    stg_gate "$d" "$stg_r" ": >\"\$STG_MEET/$stg_r\"" \
+        'n=0' 'while [ "$(ls "$STG_MEET" | wc -l)" -lt 2 ] && [ "$n" -lt 30 ]; do' \
+        '    sleep 0.1; n=$((n + 1))' 'done' \
+        '[ "$(ls "$STG_MEET" | wc -l)" -eq 2 ] || exit 1' "echo \"gate $stg_r met\""
+done
+mkdir -p "$work/stg-meet/at-once" "$work/stg-meet/serial"
+STG_MEET="$work/stg-meet/at-once" expect green \
+    "stage: two gates that wait for each other run at once" stg_run "$d" 2 check-p.sh check-q.sh
+STG_MEET="$work/stg-meet/serial" expect_red_because \
+    "stage: the same two gates are red one at a time (INF_CHECK_STAGE=serial)" \
+    'check-stage FAILED: 1 of 2 red, 1 not started: check-p.sh' \
+    stg_serial "$d" check-p.sh check-q.sh
+# The job pool: two cargo-like clients of three jobs each, at CARGO_BUILD_JOBS=3.
+d=$(stg_dir pool)
+stg_client "$d" ca
+stg_client "$d" cb
+mkdir -p "$work/stg-pool/own" "$work/stg-pool/given" "$work/stg-pool/cheat" "$work/stg-pool/fifo"
+STG_LIVE="$work/stg-pool/own" expect_output "stage: two clients run green under the pool it makes" \
+    "check-stage: 2 of 2 gates green in .* at once on 3 jobs (a pool of its own, 2 tokens)" \
+    stg_run "$d" 3 check-ca.sh check-cb.sh
+expect green "stage: under its own pool at most three jobs hold a slot at once" \
+    stg_peak "$work/stg-pool/own/peaks" 3
+STG_CHEAT=1 STG_MEET=6 STG_LIVE="$work/stg-pool/cheat" expect green \
+    "stage: clients that ignore the pool run green" stg_run "$d" 3 check-ca.sh check-cb.sh
+expect red "stage: the count of jobs at once reads past three when clients ignore the pool" \
+    stg_peak "$work/stg-pool/cheat/peaks" 3
+mkfifo "$work/stg-pool/fifo/p"
+# stg_given: the stage at CARGO_BUILD_JOBS=3 under a pool of two tokens; red
+# unless both came back.
+stg_given() (
+    exec 9<>"$work/stg-pool/fifo/p"
+    printf ++ >&9
+    (cd "$d/.." && env -u INF_CHECK_STAGE CARGO_BUILD_JOBS=3 STG_LIVE="$work/stg-pool/given" \
+        CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:$work/stg-pool/fifo/p" \
+        ./scripts/check-stage.sh check-ca.sh check-cb.sh 9>&-) || exit 1
+    left=$(python3 -I -S -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK)
+try:
+    print(len(os.read(fd, 4096)))
+except BlockingIOError:
+    print(0)' "$work/stg-pool/fifo/p")
+    echo "tokens back: $left of 2"
+    [ "$left" = 2 ]
+)
+expect_output "stage: under the pool CARGO_MAKEFLAGS names it makes none, every token back" \
+    "tokens back: 2 of 2" stg_given
+cp "$work/log" "$work/stg-pool/given.out"
+expect green "stage: under the pool CARGO_MAKEFLAGS names it says so" \
+    grep -q "at once on 3 jobs (the pool CARGO_MAKEFLAGS names)" "$work/stg-pool/given.out"
+expect green "stage: under a pool of two free tokens at most three jobs hold a slot at once" \
+    stg_peak "$work/stg-pool/given/peaks" 3
+# One token: every gate runs, one at a time, and the stage ends; a stage inside
+# a stage draws the outer stage's pool and makes none.
+d=$(stg_dir one)
+stg_hold_gate "$d" h1
+stg_hold_gate "$d" h2
+stg_hold_gate "$d" h3
+stg_gate "$d" inner 'exec "$(dirname "$0")/check-stage.sh" check-h1.sh check-h2.sh'
+mkdir -p "$work/stg-one/one" "$work/stg-one/nested"
+STG_LIVE="$work/stg-one/one" expect_output \
+    "stage: at one token every gate runs and the stage ends" \
+    "check-stage: 3 of 3 gates green in .* at once on 1 jobs (a pool of its own, 0 tokens)" \
+    stg_run "$d" 1 check-h1.sh check-h2.sh check-h3.sh
+expect green "stage: at one token one gate runs at a time" stg_peak "$work/stg-one/one/peaks" 1 1
+STG_LIVE="$work/stg-one/nested" expect_output "stage: a stage inside a stage draws the outer pool" \
+    "check-stage: 2 of 2 gates green in .* (the pool CARGO_MAKEFLAGS names)" \
+    stg_run "$d" 2 check-inner.sh check-h3.sh
+expect green "stage: a stage inside a stage keeps the outer width" \
+    stg_peak "$work/stg-one/nested/peaks" 2
+# A gate whose child keeps its output file open: a file, not a pipe, so the
+# stage ends with its gates (the bound is a hang bound, not the verdict's).
+d=$(stg_dir child)
+stg_gate "$d" held 'sleep 30 &' 'echo $! >"$STG_CHILD"' 'echo "gate held ran"'
+stg_child() {
+    local began=$SECONDS status=0
+    STG_CHILD="$work/stg-child/pid" stg_run "$d" 2 check-held.sh || status=$?
+    kill "$(cat "$work/stg-child/pid")" 2>/dev/null || :
+    [ "$status" -eq 0 ] && [ $((SECONDS - began)) -lt 20 ]
+}
+expect green "stage: a gate's child that keeps its output open does not hold the stage" stg_child
+# The control: one gate at a time prints what at once prints, but for seconds
+# and its own last line.
+d=$(stg_dir same)
+stg_long "$d" a 30
+stg_long "$d" b 30
+stg_long "$d" c 30
+stg_norm() { # <file>: the output, seconds and the stage's own lines taken out
+    sed -e 's/^\(--- .*: exit [0-9]*\), [0-9]*\.[0-9] s$/\1/' -e '/^check-stage: /d' "$1"
+}
+for stg_r in a b c; do
+    echo "--- check-$stg_r.sh: exit 0"
+    seq 1 30 | sed "s/^/$stg_r line /"
+    echo "gate $stg_r ran"
+done >"$work/stg-same/expected"
+expect_output "stage: three gates run green at once" "check-stage: 3 of 3 gates green in " \
+    stg_run "$d" 3 check-a.sh check-b.sh check-c.sh
+stg_norm "$work/log" >"$work/stg-same/at-once"
+expect green "stage: at once prints every gate's whole output under its header, in argument order" \
+    cmp "$work/stg-same/expected" "$work/stg-same/at-once"
+expect_output "stage: the same three run green one at a time" \
+    "check-stage: 3 of 3 gates green in " \
+    stg_serial "$d" check-a.sh check-b.sh check-c.sh
+stg_norm "$work/log" >"$work/stg-same/serial"
+expect green "stage: one gate at a time prints what at once prints, but for seconds" \
+    cmp "$work/stg-same/at-once" "$work/stg-same/serial"
+# Refused, nothing run: each refusal names its cause and the marker gate never runs.
+d=$(stg_dir refused)
+stg_gate "$d" mark ': >"$STG_RAN"'
+stg_gate "$d" noexec 'true'
+chmod -x "$d/check-noexec.sh"
+export STG_RAN="$work/stg-refused/ran"
+expect_red_because "stage: no gate named is refused" 'usage: check-stage.sh' stg_run "$d" 2
+expect_red_because "stage: a name with no file is refused" \
+    "'check-gone.sh' is no executable file in ./scripts; nothing ran" \
+    stg_run "$d" 2 check-mark.sh check-gone.sh
+expect_red_because "stage: a file that is not executable is refused" \
+    "'check-noexec.sh' is no executable file" stg_run "$d" 2 check-mark.sh check-noexec.sh
+expect_red_because "stage: a name that is no check-*.sh file is refused" \
+    "'job_token.py' is no check-\*.sh file name; nothing ran" \
+    stg_run "$d" 2 check-mark.sh job_token.py
+expect_red_because "stage: a path is no gate name" \
+    "'../scripts/check-mark.sh' is no check-\*.sh file name" stg_run "$d" 2 ../scripts/check-mark.sh
+expect_red_because "stage: a gate named twice is refused" \
+    "'check-mark.sh' is named twice; nothing ran" stg_run "$d" 2 check-mark.sh check-mark.sh
+expect_red_because "stage: CARGO_BUILD_JOBS=0 is refused" \
+    "CARGO_BUILD_JOBS '0' is not a positive integer" stg_run "$d" 0 check-mark.sh
+expect_red_because "stage: CARGO_BUILD_JOBS over the bound is refused" \
+    "CARGO_BUILD_JOBS 1025 is over 1024" stg_run "$d" 1025 check-mark.sh
+stg_mode() {
+    (cd "$d/.." && env -u CARGO_MAKEFLAGS INF_CHECK_STAGE=parallel ./scripts/check-stage.sh "$@")
+}
+expect_red_because "stage: an INF_CHECK_STAGE other than serial is refused" \
+    "INF_CHECK_STAGE 'parallel' is neither unset nor serial" stg_mode check-mark.sh
+stg_pool() { # <CARGO_MAKEFLAGS> <gate…>
+    local flags=$1
+    shift
+    (cd "$d/.." && env -u INF_CHECK_STAGE CARGO_MAKEFLAGS="$flags" ./scripts/check-stage.sh "$@")
+}
+expect_red_because "stage: a pool that is no fifo: path is refused" \
+    "a pool this stage cannot open: '3,4' is no fifo: path" \
+    stg_pool '-j --jobserver-auth=3,4' check-mark.sh
+expect_red_because "stage: a pool whose FIFO is gone is refused" "which is no FIFO; nothing ran" \
+    stg_pool "-j --jobserver-auth=fifo:$work/stg-refused/gone" check-mark.sh
+expect red "stage: no refused run ran a gate" test -e "$STG_RAN"
+expect green "stage: CARGO_BUILD_JOBS at the bound runs (control)" stg_run "$d" 1024 check-mark.sh
+expect green "stage: the control ran its gate" test -e "$STG_RAN"
 }
 
 # The gates' crate set (scripts/cell-crates.sh) names exclusions that must
@@ -285,6 +764,19 @@ fixture() {
 # fx_build_empty: an empty root with an empty crates/, the shape every gate's
 # scope assertion refuses; each group that reads it builds it.
 fx_build_empty() { mkdir -p "$work/empty/crates"; }
+
+# fx_root_key <dir>: the target-root key of a checkout at <dir>, the first 16
+# hex digits of SHA-256 of its physical path, read by coreutils' sha256sum or
+# perl's shasum: an oracle that shares no code with scripts/target-root.sh.
+fx_root_key() {
+    local phys
+    phys=$(cd "$1" && pwd -P) || return 1
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$phys" | sha256sum | cut -c1-16
+    else
+        printf '%s' "$phys" | shasum -a 256 | cut -c1-16
+    fi
+}
 
 # ---------------------------------------------------------------- deny-list
 group_deny_list() {
@@ -1081,6 +1573,729 @@ expect_output "reply-outcome: the OK line names each row whose file is not in th
     env INF_CHECK_ROOT="$root" $REPLY
 }
 
+# -------------------------------------------------------------- node spawn
+group_node_spawn() {
+# ADR-0203 D3: scripts/check-node-spawn.sh on a fixture checkout of its own
+# `git init`, its base committed and green as built: every rule's token in the
+# module, rule 4's in the module's test, each sanctioned shape, an ignored
+# file, an excluded file a test includes, and the ring census's files written
+# from the gate's own table. A case writes its plant, runs the gate, and the
+# checkout returns to its base. A plant is red for its own rule at its own
+# file:line; a scope error names its cause.
+NS="$SCRIPT_DIR/check-node-spawn.sh"
+NSW="$work/ns"
+mkdir -p "$NSW"
+ns() { env INF_CHECK_ROOT="$1" "$NS"; }
+NS_ROOT="$NSW/base"
+# ns_put <path>: a file of the fixture at <path>, from stdin.
+ns_put() {
+    [ -n "$1" ] && [ -d "$NS_ROOT/.git" ] || { echo "ns_put: no path or no fixture" >&2; exit 2; }
+    mkdir -p "$(dirname "$NS_ROOT/$1")"
+    cat >"$NS_ROOT/$1"
+}
+# ns_reset: the checkout back at its base; an ignored file stays.
+ns_reset() {
+    fx_git "$NS_ROOT" checkout -q -- .
+    fx_git "$NS_ROOT" clean -fdq
+}
+mkdir -p "$NS_ROOT"
+git -C "$NS_ROOT" init -q
+ns_put bins/infinityd/tests/support/node.rs <<'EOF'
+//! The module: every rule's token is its own.
+pub fn built() -> Option<&'static str> {
+    option_env!("CARGO_BIN_EXE_infinityd")
+}
+pub fn from_infinityd_bin() -> Option<String> {
+    std::env::var("INFINITYD_BIN").ok()
+}
+pub fn dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+}
+pub const NAME: &str = "infinityd";
+EOF
+ns_put bins/infinityd/tests/node_lock.rs <<'EOF'
+#[path = "support/node.rs"]
+mod node;
+
+fn private(command: &mut std::process::Command, dir: &std::path::Path) {
+    command.env("XDG_RUNTIME_DIR", dir).env_clear();
+}
+EOF
+ns_put bins/inf-bench/src/lib.rs <<'EOF'
+pub const RELEASE: &str = "target/release/infinityd";
+EOF
+ns_put bins/inf-bench/src/shared.rs <<'EOF'
+pub fn shared() {}
+EOF
+ns_put bins/inf-compare/src/main.rs <<'EOF'
+fn main() {}
+EOF
+ns_put tests/compat/tests/required_binary.rs <<'EOF'
+// CARGO_BIN_EXE_infinityd and "infinityd" in a comment name nothing.
+/* XDG_RUNTIME_DIR, env_clear and "INFINITYD_BIN" in a block comment */
+/// A doc line: NEXTEST_BIN_EXE_infinityd, UringDriver::new(config).
+fn shapes(child: &mut std::process::Command, binary: &str) {
+    child.env("INFINITYD_BIN", binary);
+    child.env_remove("INFINITYD_BIN");
+    child.env(
+        "INFINITYD_BIN",
+        binary,
+    );
+    eprintln!("SKIPPED: INFINITYD_BIN is unset; just compat sets it");
+    let _ = std::process::Command::new("true").spawn().expect("spawn infinityd");
+    let _ = env!("CARGO_TARGET_TMPDIR");
+}
+struct Fake;
+impl Fake {
+    fn register_pool(&mut self) {}
+}
+EOF
+ns_put crates/fx/tests/uses_bench.rs <<'EOF'
+#[path = "../../../bins/inf-bench/src/shared.rs"]
+mod shared;
+EOF
+printf 'ignored/\n' | ns_put .gitignore
+ns_put ignored/x.rs <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+"$NS" --census >"$NSW/census"
+while IFS="$(printf '\t')" read -r class path rings regs; do
+    {
+        printf '// A %s row of the ring census.\nfn census(config: u32) {\n' "$class"
+        n=0
+        while [ "$n" -lt "$rings" ]; do printf '    let _ = UringDriver::new(config);\n'; n=$((n + 1)); done
+        n=0
+        while [ "$n" -lt "$regs" ]; do printf '    driver.register_pool(&mut pool);\n'; n=$((n + 1)); done
+        printf '}\n'
+    } | ns_put "$path"
+done <"$NSW/census"
+fx_git "$NS_ROOT" add -A
+fx_git "$NS_ROOT" -c user.name=t -c user.email=t@t commit -q -m base
+
+ns_rows=$(wc -l <"$NSW/census" | tr -d ' ')
+expect green "node-spawn: --census prints the table's rows" [ "$ns_rows" -gt 0 ]
+expect green "node-spawn: the base, every sanctioned shape and the module's own tokens, is green" \
+    ns "$NS_ROOT"
+expect_output "node-spawn: the OK line counts the scan, the #[path] reach and the exclusions" \
+    "node-spawn OK: $((ns_rows + 5)) files, .* ($((ns_rows + 4)) listed, 1 reached only by #.path., 1 of them under the excluded directories; 2 #.path. includes followed; 0 listed path(s) gone" \
+    ns "$NS_ROOT"
+expect_output "node-spawn: the OK line counts the census rows by class" \
+    "ring census: $(grep -c '^test' "$NSW/census") test, $(grep -c '^bench' "$NSW/census") bench, $(grep -c '^node' "$NSW/census") node row(s)" \
+    ns "$NS_ROOT"
+
+# Each rule red at its plant's file:line, in a file git does not track yet.
+P=crates/fx/tests/plant.rs
+ns_case() {
+    local label=$1 pattern=$2
+    ns_put "$P"
+    expect_red_because "node-spawn: $label" "$pattern" ns "$NS_ROOT"
+    ns_reset
+}
+ns_case 'env!("CARGO_BIN_EXE_infinityd") is rule 1' "$P:1: rule 1," \
+    <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+ns_case 'std::env::var("NEXTEST_BIN_EXE_infinityd") is rule 1' "$P:2: rule 1," <<'EOF'
+fn f() {
+    let _ = std::env::var("NEXTEST_BIN_EXE_infinityd");
+}
+EOF
+ns_case 'a const holding "INFINITYD_BIN" read by std::env::var is rule 2' "$P:1: rule 2," <<'EOF'
+const VAR: &str = "INFINITYD_BIN";
+fn f() {
+    let _ = std::env::var(VAR);
+}
+EOF
+ns_case 'a std::env::vars() filter on "INFINITYD_BIN" is rule 2' "$P:2: rule 2," <<'EOF'
+fn f() {
+    let _ = std::env::vars().filter(|(key, _)| key == "INFINITYD_BIN").count();
+}
+EOF
+ns_case '"INFINITYD_BIN" as .env'\''s second argument is rule 2' "$P:2: rule 2," <<'EOF'
+fn f(command: &mut std::process::Command) {
+    command.env("PATH", "INFINITYD_BIN");
+}
+EOF
+ns_case '"INFINITYD_BIN" as .env'\''s second argument, split across lines, is rule 2' \
+    "$P:4: rule 2," <<'EOF'
+fn f(command: &mut std::process::Command) {
+    command.env(
+        "PATH",
+        "INFINITYD_BIN",
+    );
+}
+EOF
+ns_case 'Command::new("infinityd") is rule 3' "$P:2: rule 3," <<'EOF'
+fn f() {
+    let _ = std::process::Command::new("infinityd").spawn();
+}
+EOF
+ns_case 'a CARGO_MANIFEST_DIR target path is rule 3' "$P:2: rule 3," <<'EOF'
+fn f() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/infinityd")
+}
+EOF
+ns_case 'a current_exe() path'\''s .join("infinityd") is rule 3' "$P:3: rule 3," <<'EOF'
+fn f() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    exe.parent().unwrap().join("infinityd")
+}
+EOF
+for literal in 'r"infinityd"' 'r#"../../target/debug/infinityd"#' 'b"infinityd"' 'c"infinityd"' \
+    'br"infinityd"' 'cr"../infinityd"' 'r##"../../target/debug/infinityd"##'; do
+    ns_case "$literal is rule 3" "$P:1: rule 3," <<<"pub fn f() { let _ = $literal; }"
+done
+ns_case '.env_remove("XDG_RUNTIME_DIR") is rule 4' "$P:2: rule 4," <<'EOF'
+fn f(command: &mut std::process::Command) {
+    command.env_remove("XDG_RUNTIME_DIR");
+}
+EOF
+ns_case '.env_clear() is rule 4' "$P:2: rule 4," <<'EOF'
+fn f(command: &mut std::process::Command) {
+    command.env_clear();
+}
+EOF
+ns_case 'a bare marker is red' "$P:2: a bare node-spawn-allow marker" <<'EOF'
+fn f() {
+    // node-spawn-allow:
+    let _ = std::process::Command::new("infinityd");
+}
+EOF
+ns_case 'a marker with no colon is bare' "$P:2: a bare node-spawn-allow marker" <<'EOF'
+fn f() {
+    // node-spawn-allow a stand-in
+    let _ = std::process::Command::new("infinityd");
+}
+EOF
+ns_case 'a marker that marks no hit is red' "$P:2: node-spawn-allow marks no hit" <<'EOF'
+fn f() {
+    // node-spawn-allow: a stand-in, two lines above its hit
+
+    let _ = std::process::Command::new("infinityd");
+}
+EOF
+ns_case 'a marker two lines above leaves its hit red' "$P:4: rule 3," <<'EOF'
+fn f() {
+    // node-spawn-allow: a stand-in, two lines above its hit
+
+    let _ = std::process::Command::new("infinityd");
+}
+EOF
+ns_case 'a line comment holding /* then a token, no */ after, is read' "$P:2: rule 1," <<'EOF'
+// the lock's files are /* never removed
+pub const B: &str = env!("CARGO_BIN_EXE_infinityd");
+EOF
+ns_case 'a line comment holding /* then a token, a */ after, is read' "$P:2: rule 1," <<'EOF'
+// the lock's files are /* never removed
+pub const B: &str = env!("CARGO_BIN_EXE_infinityd");
+// */
+EOF
+ns_case 'a block comment holding // then a token on its line is read' "$P:1: rule 1," \
+    <<<'/* a // b */ pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+ns_case 'a // inside a string literal opens no comment' "$P:1: rule 1," \
+    <<<'pub const B: (&str, &str) = ("http://x", env!("CARGO_BIN_EXE_infinityd"));'
+ns_case 'a /* inside a string literal opens no comment' "$P:2: rule 1," <<'EOF'
+pub const GLOB: &str = "src/*.rs";
+pub const B: &str = env!("CARGO_BIN_EXE_infinityd");
+EOF
+ns_case 'rule 2 reads every literal on its line, not only the first' "$P:2: rule 2," <<'EOF'
+fn f(command: &mut std::process::Command) {
+    command.env("INFINITYD_BIN", std::env::var("INFINITYD_BIN").unwrap());
+}
+EOF
+ns_case 'a call ending env( with no dot is no .env( exception' "$P:5: rule 2," <<'EOF'
+fn get_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+fn f() {
+    let _ = get_env("INFINITYD_BIN");
+}
+EOF
+ns_case 'a marker on the line below its hit sanctions nothing' "$P:2: rule 3," <<'EOF'
+fn f() {
+    let _ = std::process::Command::new("infinityd");
+    // node-spawn-allow: a marker on the line below its hit
+}
+EOF
+ns_case 'a marker in a block comment with no reason is bare' "$P:2: a bare node-spawn-allow marker" \
+    <<'EOF'
+fn f() {
+    /* node-spawn-allow: */
+    let _ = std::process::Command::new("infinityd");
+}
+EOF
+printf 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");\n' | ns_put crates/fx/tests/support/node.rs
+expect_red_because "node-spawn: another file named node.rs is not the module" \
+    "crates/fx/tests/support/node.rs:1: rule 1," ns "$NS_ROOT"
+ns_reset
+printf 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");\n' | ns_put bins/inf-bench/srcx/plant.rs
+expect_red_because "node-spawn: a sibling of an excluded directory sharing its prefix is read" \
+    "bins/inf-bench/srcx/plant.rs:1: rule 1," ns "$NS_ROOT"
+ns_reset
+
+# Sanctioned shapes, each green; each shape moved out of its exemption, red.
+ns_put "$P" <<'EOF'
+fn f() {
+    // node-spawn-allow: a fixture stand-in named for the engine
+    let _ = std::process::Command::new("infinityd");
+    let _ = std::process::Command::new("./infinityd"); // node-spawn-allow: the same stand-in
+}
+EOF
+expect green "node-spawn: a marker on its line or the line above sanctions its hit" ns "$NS_ROOT"
+expect_output "node-spawn: a marked site is listed with its reason" \
+    "allowed: $P:2: a fixture stand-in named for the engine" ns "$NS_ROOT"
+ns_reset
+ns_put bins/infinityd/tests/support/other.rs <"$NS_ROOT/bins/infinityd/tests/support/node.rs"
+expect_red_because "node-spawn: the module's own tokens in another file are red" \
+    "other.rs:3: rule 1," ns "$NS_ROOT"
+expect_output "node-spawn: ... rule 2 there" "other.rs:6: rule 2," ns "$NS_ROOT"
+expect_output "node-spawn: ... rule 3 there" "other.rs:11: rule 3," ns "$NS_ROOT"
+expect_output "node-spawn: ... rule 4 there" "other.rs:9: rule 4," ns "$NS_ROOT"
+ns_reset
+sed -n '4,6p' "$NS_ROOT/bins/infinityd/tests/node_lock.rs" | ns_put bins/infinityd/tests/lock_copy.rs
+expect_red_because "node-spawn: the module test's rule-4 tokens in another test are red" \
+    "lock_copy.rs:2: rule 4," ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<<'pub fn f() -> Option<String> { std::env::var("CARGO_BIN_EXE_infinityd_probe").ok() }'
+expect green "node-spawn: rule 1's token is bounded on its right (another binary's variable)" \
+    ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<'EOF'
+fn f(command: &mut std::process::Command, binary: &str) {
+    command.env(
+        // the variable compat reads
+        "INFINITYD_BIN",
+        binary,
+    );
+}
+EOF
+expect green "node-spawn: rule 2's split call reads the previous code line, past a comment" \
+    ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<'EOF'
+pub fn f() -> Option<String> {
+    std::env::var("OLD_XDG_RUNTIME_DIR").ok()
+}
+pub fn env_clearance() {}
+EOF
+expect green "node-spawn: rule 4's tokens are bounded on both sides" ns "$NS_ROOT"
+ns_reset
+
+# The red's text: the module, and the call each package writes instead.
+ns_put bins/infinityd/tests/plant.rs <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+expect_output "node-spawn: a red in bins/infinityd names the module and its call" \
+    "only through bins/infinityd/tests/support/node.rs: write NodeBinary::built().command()...spawn()" \
+    ns "$NS_ROOT"
+ns_reset
+ns_put tests/compat/tests/plant.rs <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+expect_output "node-spawn: a red in tests/compat names the harness" \
+    "start nodes through compat::harness" ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+expect_output "node-spawn: a red elsewhere names from_infinityd_bin and built_or" \
+    "write NodeBinary::from_infinityd_bin(), or NodeBinary::built_or(<var>)" ns "$NS_ROOT"
+ns_reset
+
+# Scope: tracked and untracked files are read, a gone one is counted, and a
+# #[path] target is read even under an excluded directory.
+printf 'fn more() {\n    let _ = env!("CARGO_BIN_EXE_infinityd");\n}\n' \
+    >>"$NS_ROOT/tests/compat/tests/required_binary.rs"
+expect_red_because "node-spawn: a token added to a tracked file is red" \
+    "tests/compat/tests/required_binary.rs:20: rule 1," ns "$NS_ROOT"
+ns_reset
+rm -f "$NS_ROOT/crates/fx/tests/uses_bench.rs"
+expect_output "node-spawn: a listed path gone from the work tree is skipped and counted" \
+    "1 listed path(s) gone from the work tree" ns "$NS_ROOT"
+ns_reset
+ns_put bins/inf-bench/src/planted.rs <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+expect green "node-spawn: an excluded file no test includes is not read" ns "$NS_ROOT"
+printf '#[path = "../../../bins/inf-bench/src/planted.rs"]\nmod planted;\n' | ns_put "$P"
+expect_red_because "node-spawn: a #[path] target under an excluded directory is read" \
+    "bins/inf-bench/src/planted.rs:1 (included by $P:1 through #.path.): rule 1," ns "$NS_ROOT"
+ns_reset
+printf '#[path = "../../../bins/inf-bench/src/first.rs"]\nmod first;\n' | ns_put "$P"
+printf '#[path = "second.rs"]\nmod second;\n' | ns_put bins/inf-bench/src/first.rs
+printf 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");\n' | ns_put bins/inf-bench/src/second.rs
+expect_red_because "node-spawn: a #[path] target of a #[path] target is read" \
+    "bins/inf-bench/src/second.rs:1 (included by bins/inf-bench/src/first.rs:1 through #.path.): rule 1," \
+    ns "$NS_ROOT"
+ns_reset
+
+# The ring census.
+ns_put "$P" <<<'fn f() { let _ = inf_runtime::UringDriver::new(config); }'
+expect_red_because "node-spawn: a new file naming UringDriver::new is red, naming its row" \
+    "ring census: $P names UringDriver::new 1 time(s), outside the table; add the row $P|" \
+    ns "$NS_ROOT"
+ns_reset
+printf 'fn more() {\n    driver.register_tier_pool(&mut pool);\n}\n' \
+    >>"$NS_ROOT/tests/crash-matrix/tests/fsyncgate.rs"
+expect_red_because "node-spawn: a census row whose count moved is red" \
+    "ring census: tests/crash-matrix/tests/fsyncgate.rs names UringDriver::new 1 time(s) and 1 registration(s), its row 1 and 0" \
+    ns "$NS_ROOT"
+ns_reset
+printf 'fn more(config: u32) {\n    let _ = UringDriver::new(config);\n}\n' \
+    >>"$NS_ROOT/tests/crash-matrix/tests/fsyncgate.rs"
+expect_red_because "node-spawn: a census row whose ring count moved is red" \
+    "ring census: tests/crash-matrix/tests/fsyncgate.rs names UringDriver::new 2 time(s) and 0 registration(s), its row 1 and 0" \
+    ns "$NS_ROOT"
+ns_reset
+printf 'fn census() {}\n' >"$NS_ROOT/tests/crash-matrix/tests/fsyncgate.rs"
+expect_red_because "node-spawn: a census row whose file names neither token is red" \
+    "ring census: tests/crash-matrix/tests/fsyncgate.rs names neither" ns "$NS_ROOT"
+ns_reset
+rm -f "$NS_ROOT/tests/crash-matrix/tests/fsyncgate.rs"
+expect_red_because "node-spawn: a census row whose file is gone is red" \
+    "ring census: the row tests/crash-matrix/tests/fsyncgate.rs names no scanned file" ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<<'fn f() { let _ = FakeUringDriver::new(config); }'
+expect green "node-spawn: the census's constructor is bounded on its left (another type's new)" \
+    ns "$NS_ROOT"
+ns_reset
+ns_put "$P" <<<'fn f() { let _ = UringDriver::new_probe(config); }'
+expect green "node-spawn: the census's constructor is bounded on its right (another function)" \
+    ns "$NS_ROOT"
+ns_reset
+
+# Rule 5 (ADR-0203 D3 as A2 amends it): a plant appended to the module, red at
+# its own line of the module (the plant's first line is 1) or green.
+NSM=bins/infinityd/tests/support/node.rs
+nsm_base=$(wc -l <"$NS_ROOT/$NSM" | tr -d ' ')
+nf_case() {
+    local label=$1 line=$2 why=$3
+    cat >>"$NS_ROOT/$NSM"
+    expect_red_because "node-spawn: $label" "$NSM:$((nsm_base + line)): $why" ns "$NS_ROOT"
+    ns_reset
+}
+nf_green() {
+    cat >>"$NS_ROOT/$NSM"
+    expect green "node-spawn: $1" ns "$NS_ROOT"
+    ns_reset
+}
+for vis in 'pub' 'pub(crate)' 'pub(super)' 'pub(in crate::harness)'; do
+    printf 'pub struct Named {\n    field: u8,\n    %s planted: u8,\n}\n' "$vis" |
+        nf_case "rule 5: $vis on a named field" 3 "rule 5, a field of Named carries a visibility"
+    printf 'pub struct Positional(u8, %s std::path::PathBuf);\n' "$vis" |
+        nf_case "rule 5: $vis on a positional field" 1 "rule 5, a field of Positional carries"
+done
+nf_case 'rule 5: a bare node-field-public marker is red' 1 "a bare node-field-public marker" <<'EOF'
+// node-field-public:
+pub struct Bare {
+    pub field: u8,
+}
+EOF
+nf_case 'rule 5: a marker with no reason is bare' 1 "a bare node-field-public marker" <<'EOF'
+// node-field-public: 1 fields
+pub struct Bare {
+    pub field: u8,
+}
+EOF
+nf_case 'rule 5: a marker with no count is bare' 1 "a bare node-field-public marker" <<'EOF'
+// node-field-public: some fields, a count in words
+pub struct Bare {
+    pub field: u8,
+}
+EOF
+nf_case 'rule 5: a marker on a struct with no public field is red' 1 \
+    "node-field-public marks Closed, which has no field with a visibility" <<'EOF'
+// node-field-public: 1 fields, nothing public
+pub struct Closed {
+    field: u8,
+}
+EOF
+nf_case 'rule 5: a marker two lines above its struct marks no struct' 1 \
+    "node-field-public marks no struct on its line or the next" <<'EOF'
+// node-field-public: 1 fields, two lines above
+
+pub struct Far {
+    pub field: u8,
+}
+EOF
+nf_case 'rule 5: a marker on the line below its struct marks no struct' 2 \
+    "node-field-public marks no struct on its line or the next" <<'EOF'
+pub struct Below {
+    // node-field-public: 1 fields, inside the body
+    pub field: u8,
+}
+EOF
+cat >>"$NS_ROOT/$NSM" <<'EOF'
+// node-field-public: 1 fields, one of two
+pub struct Counted {
+    pub first: u8,
+    pub second: u8,
+}
+EOF
+expect_red_because "node-spawn: rule 5: a marker whose count is not its struct's is red" \
+    "$NSM:$((nsm_base + 1)): node-field-public counts 1 field(s) with a visibility and Counted has 2" \
+    ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: ... and leaves each of the struct's fields red" \
+    "$NSM:$((nsm_base + 4)): rule 5, a field of Counted" ns "$NS_ROOT"
+ns_reset
+nf_case 'rule 5: a second marker on one struct is red' 2 \
+    "a second node-field-public marker on Twice" <<'EOF'
+// node-field-public: 1 fields, the line above
+pub struct Twice { // node-field-public: 1 fields, its own line
+    pub field: u8,
+}
+EOF
+nf_case 'rule 5: a bound whose return holds parens opens no body' 2 "rule 5, a field of Generic" <<'EOF'
+pub struct Generic<F: Fn(u32) -> (u32, u32)> {
+    pub planted: F,
+}
+EOF
+cat >>"$NS_ROOT/$NSM" <<'EOF'
+pub struct Bounded<F>
+where
+    F: Fn(u32) -> u32,
+{
+    pub planted: F,
+}
+pub struct After(pub u8);
+EOF
+expect_red_because "node-spawn: rule 5: a where clause's parens open no body" \
+    "$NSM:$((nsm_base + 5)): rule 5, a field of Bounded" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: ... and the next struct's body opens at its own paren" \
+    "$NSM:$((nsm_base + 7)): rule 5, a field of After" ns "$NS_ROOT"
+ns_reset
+nf_case 'rule 5: braces nested in a named body do not close it' 3 "rule 5, a field of Nested" <<'EOF'
+pub struct Nested {
+    buffer: [u8; { 4 }],
+    pub planted: u8,
+}
+EOF
+nf_case 'rule 5: parens nested in a positional body do not close it' 1 "rule 5, a field of Pair" \
+    <<<'pub struct Pair((u8, u8), pub u8);'
+nf_case 'rule 5: a brace inside a string literal closes no body' 3 "rule 5, a field of Quoted" <<'EOF'
+pub struct Quoted {
+    #[doc = "a } in a string"]
+    pub planted: u8,
+}
+EOF
+printf 'pub struct Open {\n    field: u8,\n' >>"$NS_ROOT/$NSM"
+expect_red_because "node-spawn: rule 5: a struct whose body does not close is a scope error" \
+    "SCOPE ERROR: $NSM: rule 5 cannot bound the body of Open (its line $((nsm_base + 1)))" \
+    ns "$NS_ROOT"
+ns_reset
+: >"$NS_ROOT/$NSM"
+expect_red_because "node-spawn: rule 5: an empty module is a scope error" \
+    "SCOPE ERROR: rule 5 read no line of the module" ns "$NS_ROOT"
+ns_reset
+cat >>"$NS_ROOT/$NSM" <<'EOF'
+// node-field-public: 2 fields, a test sets both
+pub struct Marked {
+    pub first: u8,
+    pub(crate) second: u8,
+}
+/* node-field-public: 1 fields, in a block comment */
+pub struct Blocked(pub u8);
+EOF
+expect green "node-spawn: rule 5: a marked struct with its counted fields is green" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: the OK line lists each marker with its struct and count" \
+    "public by design: $NSM:$((nsm_base + 1)): Marked, 2 field(s): a test sets both" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: ... a block comment's marker without its close" \
+    "public by design: $NSM:$((nsm_base + 6)): Blocked, 1 field(s): in a block comment$" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: the OK line counts the structs and their public fields" \
+    "rule 5: 2 struct(s) in the module, 3 field(s) with a visibility, all in 2 marked struct(s)" \
+    ns "$NS_ROOT"
+ns_reset
+nf_green "rule 5: a marker on its struct's own line marks it" <<'EOF'
+pub struct OnItsLine { // node-field-public: 1 fields, its own line
+    pub only: u8,
+}
+EOF
+nf_green 'rule 5: a pub fn in an impl, after a unit struct, is no field' <<'EOF'
+pub struct Unit;
+impl Unit {
+    pub fn method(&self) {}
+}
+EOF
+nf_green 'rule 5: pub inside a longer name or a raw identifier is no visibility' <<'EOF'
+pub struct Private {
+    field: u8,
+    publish: u8,
+    epub: u8,
+    r#pub: u8,
+}
+pub struct Positional(u8, std::path::PathBuf);
+EOF
+nf_green 'rule 5: struct inside a longer name, a raw identifier or a string opens no body' <<'EOF'
+mod destruct {
+    pub fn f() {}
+}
+mod structure {
+    pub fn f() {}
+}
+mod r#struct {
+    pub fn f() {}
+}
+pub const TEXT: &str = "struct S { pub x: u8 }";
+EOF
+printf 'pub struct Other {\n    pub field: u8,\n}\n' | ns_put crates/fx/tests/support/node.rs
+expect green "node-spawn: rule 5 reads the module alone: a pub field in another node.rs" ns "$NS_ROOT"
+ns_reset
+# Rule 5's parser: a header's const block and brackets, char literals, arrows,
+# and an item met before a body opens.
+nf_case 'rule 5: a const block in a generic default is read whole' 2 "rule 5, a field of Shift" <<'EOF'
+pub struct Shift<const N: usize = { 1 << 2 }> {
+    pub planted: [u8; N],
+}
+EOF
+nf_case "rule 5: a const block's > closes no generics" 2 "rule 5, a field of Compare" <<'EOF'
+pub struct Compare<const N: usize = { (3 > 2) as usize }> {
+    pub planted: [u8; N],
+}
+EOF
+nf_case "rule 5: a where clause's brackets hold their ; and const block" 5 \
+    "rule 5, a field of WhereBlock" <<'EOF'
+pub struct WhereBlock
+where
+    [u8; { 1 << 2 }]: Sized,
+{
+    pub planted: u8,
+}
+EOF
+nf_case "rule 5: a '}' char literal closes no body" 3 "rule 5, a field of CharBrace" <<'EOF'
+pub struct CharBrace {
+    width: [u8; { '}' as usize }],
+    pub planted: u8,
+}
+EOF
+nf_case "rule 5: a '\"' char literal opens no string" 1 "rule 5, a field of OddQuote" <<'EOF'
+pub struct OddQuote(Wrap<{ b'"' }>, pub u8, Wrap<{ "x".len() as u8 }>);
+EOF
+cat >>"$NS_ROOT/$NSM" <<'EOF'
+macro_rules! make {
+    (struct $name:ident) => {
+        pub struct $name {
+            pub planted: u8,
+        }
+    };
+}
+EOF
+expect_red_because "node-spawn: rule 5: a matcher's => closes no generics" \
+    "$NSM:$((nsm_base + 3)): rule 5, a field of a struct" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: ... and the arm's struct is read" \
+    "$NSM:$((nsm_base + 4)): rule 5, a field of a struct" ns "$NS_ROOT"
+ns_reset
+for item in 'pub struct Next {' 'impl Next {' 'fn helper() {'; do
+    printf 'pub struct Truncated<T>\n%s\n    pub planted: u8,\n}\n' "$item" >>"$NS_ROOT/$NSM"
+    expect_red_because "node-spawn: rule 5: '$item' before a header's body opens is a scope error" \
+        "SCOPE ERROR: $NSM: rule 5 cannot bound the header of Truncated (its line $((nsm_base + 1))): an item opens at line $((nsm_base + 2))" \
+        ns "$NS_ROOT"
+    ns_reset
+done
+nf_green 'rule 5: a fn pointer type in a header is no item' \
+    <<<'pub struct Callback<F = fn(u8) -> u8>(F);'
+nf_green 'rule 5: a lifetime is no char literal' <<'EOF'
+pub struct Borrowed<'a>(&'a u8);
+pub struct After(u8);
+EOF
+printf 'pub struct Unfinished<T>\n' >>"$NS_ROOT/$NSM"
+expect_red_because "node-spawn: rule 5: a header still open at the file's end is a scope error" \
+    "SCOPE ERROR: $NSM: rule 5 cannot bound the body of Unfinished (its line $((nsm_base + 1)))" \
+    ns "$NS_ROOT"
+ns_reset
+nf_case 'rule 5: a marker that counts more than its struct has is red' 1 \
+    "node-field-public counts 3 field(s) with a visibility and Over has 2" <<'EOF'
+// node-field-public: 3 fields, one more than there is
+pub struct Over {
+    pub first: u8,
+    pub second: u8,
+}
+EOF
+nf_case 'rule 5: a marker in the singular is bare' 1 "a bare node-field-public marker" <<'EOF'
+// node-field-public: 1 field, the singular
+pub struct One {
+    pub only: u8,
+}
+EOF
+nf_case "rule 5: a where inside a name rule 5 cannot read opens no where clause" 3 \
+    "rule 5, a field of a struct" <<'EOF'
+macro_rules! named {
+    ($nowhere:ident) => {
+        pub struct $nowhere(pub u8);
+    };
+}
+EOF
+cat >>"$NS_ROOT/$NSM" <<'EOF'
+// node-field-public: 2 fields, both on one line
+pub struct Two(pub u8, pub u8);
+EOF
+expect green "node-spawn: rule 5: two pub on one line are two fields" ns "$NS_ROOT"
+expect_output "node-spawn: rule 5: ... listed with their count" \
+    "public by design: $NSM:$((nsm_base + 1)): Two, 2 field(s): both on one line" ns "$NS_ROOT"
+ns_reset
+nf_green 'rule 5: two structs on one line: the marker marks the last' <<'EOF'
+// node-field-public: 1 fields, the last struct of its line
+pub struct Empty; pub struct Last(pub u8);
+EOF
+nf_green "rule 5: a marker on its struct's line marks it before the next line's" <<'EOF'
+pub struct First(pub u8); // node-field-public: 1 fields, its own line
+pub struct Second(pub u8); // node-field-public: 1 fields, its own line too
+EOF
+
+# Scope errors.
+printf 'fn f() {}\n/* never closed\nfn g() {}\n' | ns_put "$P"
+expect_red_because "node-spawn: a file that ends inside a block comment is a scope error" \
+    "SCOPE ERROR: $P ends inside the block comment opened at its line 2" ns "$NS_ROOT"
+ns_reset
+printf '#[path = "missing.rs"]\nmod missing;\n' | ns_put "$P"
+expect_red_because "node-spawn: a #[path] target that does not exist is a scope error" \
+    "SCOPE ERROR: $P:1: #.path = \"missing.rs\". names crates/fx/tests/missing.rs, which does not exist" \
+    ns "$NS_ROOT"
+ns_reset
+printf '#[path = "../../../../outside.rs"]\nmod outside;\n' | ns_put "$P"
+expect_red_because "node-spawn: a #[path] target outside the root is a scope error" \
+    "resolves outside" ns "$NS_ROOT"
+ns_reset
+rm -f "$NS_ROOT/bins/infinityd/tests/support/node.rs"
+expect_red_because "node-spawn: a missing module is a scope error" \
+    "SCOPE ERROR: the module bins/infinityd/tests/support/node.rs is missing" ns "$NS_ROOT"
+ns_reset
+rm -f "$NS_ROOT/bins/infinityd/tests/node_lock.rs"
+expect_red_because "node-spawn: a missing module test is a scope error" \
+    "SCOPE ERROR: the module's test bins/infinityd/tests/node_lock.rs" ns "$NS_ROOT"
+ns_reset
+for dir in bins/inf-bench/src bins/inf-compare/src; do
+    rm -rf "${NS_ROOT:?}/$dir"
+    expect_red_because "node-spawn: a missing excluded directory $dir is a scope error" \
+        "SCOPE ERROR: the excluded directory $dir is missing" ns "$NS_ROOT"
+    ns_reset
+done
+printf 'x' | ns_put "$(printf 'crates/fx/tests/a\tb.rs')"
+expect_red_because "node-spawn: a path holding a tab is a scope error" \
+    "SCOPE ERROR: a listed path holds a tab or a newline" ns "$NS_ROOT"
+ns_reset
+printf 'x' | ns_put "$(printf 'crates/fx/tests/a\nb.rs')"
+expect_red_because "node-spawn: a path holding a newline is a scope error" \
+    "SCOPE ERROR: a listed path holds a tab or a newline" ns "$NS_ROOT"
+ns_reset
+ns_put 'a=b.rs' <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
+printf 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");\n' | ns_put 'x=1/plant.rs'
+expect_red_because "node-spawn: a path awk would take for an assignment is read (a=b.rs)" \
+    "a=b.rs:1: rule 1," ns "$NS_ROOT"
+expect_output "node-spawn: ... and a file under a directory named x=1" "x=1/plant.rs:1: rule 1," \
+    ns "$NS_ROOT"
+ns_reset
+expect_red_because "node-spawn: a root that is not its own git work tree is a scope error" \
+    "SCOPE ERROR: .* is not its own git work tree" ns "$NS_ROOT/crates"
+mkdir -p "$NSW/nogit/bins/infinityd/tests/support"
+cp "$NS_ROOT/bins/infinityd/tests/support/node.rs" "$NSW/nogit/bins/infinityd/tests/support/"
+expect_red_because "node-spawn: a root outside a git work tree is a scope error" \
+    "SCOPE ERROR: .* is not inside a git work tree" ns "$NSW/nogit"
+NS_ROOT="$NSW/empty"
+mkdir -p "$NS_ROOT"
+git -C "$NS_ROOT" init -q
+cp -R "$NSW/base/bins" "$NS_ROOT/"
+printf '*.rs\n' | ns_put .gitignore
+expect_red_because "node-spawn: an empty scan is a scope error" \
+    "SCOPE ERROR: no \*.rs file to scan" ns "$NS_ROOT"
+NS_ROOT="$NSW/blank"
+mkdir -p "$NS_ROOT"
+git -C "$NS_ROOT" init -q
+: | ns_put bins/infinityd/tests/support/node.rs
+: | ns_put bins/infinityd/tests/node_lock.rs
+mkdir -p "$NS_ROOT/bins/inf-bench/src" "$NS_ROOT/bins/inf-compare/src"
+expect_red_because "node-spawn: every listed file empty, the blanker reading no line, is a scope error" \
+    "SCOPE ERROR: the blanker read no line" ns "$NS_ROOT"
+NS_ROOT="$NSW/base"
+}
+
 # ------------------------------------------------------------ refusal text
 group_refusal_text() {
 # ADR-0172 D2: no production line of crates/inf-server/src spells a refusal
@@ -1481,6 +2696,18 @@ expect red "canaries: controls-only never ran the planted simulator" test -e "$d
 dir=$(sim_fixture sim-controls-only-printed TOKEN "exit 0" "$summary")
 expect_red_because "canaries: controls-only refuses a token the control prints" "no catch possible" env INF_CANARY_CONTROLS_ONLY=1 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 expect_red_because "canaries: a controls-only knob other than 0 or 1 is a scope failure" "INF_CANARY_CONTROLS_ONLY wants 0 or 1" env INF_CANARY_CONTROLS_ONLY=yes INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# INF_CANARY_SIM_TARGET is the stub route alone (ADR-0204): beside a real
+# cargo, here a `cargo` on PATH that builds nothing as a root holding an
+# earlier round's build would, the row would judge the simulators the knob
+# names, and their stale catch would read green. Refused before any build.
+dir=$(sim_fixture sim-target-real-cargo TOKEN "$violation; exit 1")
+mkdir -p "$dir/bin" && cp "$dir/cargo" "$dir/bin/cargo" && chmod +x "$dir/bin/cargo"
+expect_red_because "canaries: a simulator directory beside a real cargo is a scope failure" "INF_CANARY_SIM_TARGET is the self-test's stub route" env -u INF_CANARY_CARGO PATH="$dir/bin:$PATH" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# The same knob beside a named cargo that answers `--version` as cargo does:
+# the real one, or a wrapper passing through to it. Refused as well.
+dir=$(sim_fixture sim-target-named-real-cargo TOKEN "$violation; exit 1")
+printf '#!/usr/bin/env bash\ncase "${1:-}" in --version) echo "cargo 1.95.0 (0123abcd 2026-03-01)" ;; esac\nexit 0\n' >"$dir/cargo"
+expect_red_because "canaries: a simulator directory beside a cargo answering as cargo is a scope failure" "unset INF_CANARY_SIM_TARGET" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 # ADR-0159 A1.6: a `loom` row builds both legs under `--cfg loom` — the
 # stub answers only when it sees it, so a driver that dropped the cfg is
 # red for another reason, never a catch.
@@ -1740,7 +2967,10 @@ group_waker_atomics() {
 # start and could not match it), and the aarch64 pair. The cargo-driven
 # probe is fixture-skipped and disclosed; it always runs on the real tree,
 # and its verdict logic is pinned below on fixtures of its asm.
-WAKER=./scripts/check-waker-atomics.sh
+# The scan's fixtures hold no boundary, so they run with the live-boundary check off; the
+# boundary's own cases below run without that switch.
+WAKER="env INF_WAKER_LIVE=off ./scripts/check-waker-atomics.sh"
+WAKER_LIVE=./scripts/check-waker-atomics.sh
 waker_asm() { # <name>: writes a fixture .s from stdin, echoes its path
     local out="$work/$1.s"
     cat >"$out"
@@ -1763,7 +2993,7 @@ asm=$( { for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do
          done
          waker_vtable; } | waker_asm waker-clean )
 expect green "waker: a clean vtable scans green" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
-expect_output "waker: the scope line discloses instructions actually scanned" "4 wakers + 0 called bodies, 8 instruction lines scanned" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+expect_output "waker: the scope line discloses instructions actually scanned" "4 wakers + 0 owner-lane bodies, 8 instruction lines scanned" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 
 # Mach-O (batch 70, lane L11 N18): rustc's DWARF labels there are `Lfunc_beginN`
 # and `LBBn_m` — no dot. The batch-69 scanner took `Lfunc_begin` for the body's
@@ -1784,7 +3014,7 @@ asm=$( { printf '\t.section\t__TEXT,__text,regular,pure_instructions\n\t.build_v
          for f in waker_wake waker_wake_by_ref waker_drop; do macho_body "$f" 'mov\tx0, x1' 'ret'; done
          macho_vtable; } | waker_asm waker-macho-clean )
 expect green "waker: a Mach-O vtable with DWARF labels scans green" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
-expect_output "waker: Mach-O bodies are scanned, not swallowed by Lfunc_begin" "4 wakers + 0 called bodies, 8 instruction lines scanned, 0 unresolved" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+expect_output "waker: Mach-O bodies are scanned, not swallowed by Lfunc_begin" "4 wakers + 0 owner-lane bodies, 8 instruction lines scanned, 0 callees with no body" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 asm=$( { printf '\t.section\t__TEXT,__text,regular,pure_instructions\n'
          macho_body waker_wake 'cbz\tx0, LBB1_2' 'ldaddal\tw8, w9, [x0]' 'ret'
          for f in waker_clone waker_wake_by_ref waker_drop; do macho_body "$f" 'ret'; done
@@ -1816,8 +3046,10 @@ done
 # not the RCpc forms.
 for insn in 'bl\t__aarch64_sync_cache_range' 'bl\t__aarch64_cas8_acq_rel_shim' 'stur\tx8, [x0, #8]' 'ldur\tx0, [x0, #8]'
 do
+    # A callee's body is in the fixture, so the closed callee list does not decide the case.
     asm=$( { waker_body waker_wake 'movq\t%rdi, %rax' "$insn" 'retq'
              for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+             for f in __aarch64_sync_cache_range __aarch64_cas8_acq_rel_shim; do waker_body "$f" 'ret'; done
              waker_vtable; } | waker_asm waker-insn-clean )
     expect green "waker: '$insn' is not an atomic" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 done
@@ -1864,13 +3096,13 @@ for insn in 'callq\t*%rax' 'callq\t*8(%rax)' 'blr\tx8'; do
     expect_red_because "waker: an indirect call '$insn' on the waker path is red" \
         "INDIRECT CALL on the waker path: waker_wake" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 done
-asm=$( { waker_body waker_wake 'jmpq\t*%rax' 'callq\t*ext_fn@GOTPCREL(%rip)' 'retq'
+asm=$( { waker_body waker_wake 'jmpq\t*%rax' 'callq\t*memcpy@GOTPCREL(%rip)' 'retq'
          for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
          waker_vtable; } | waker_asm waker-ijump )
 expect_output "waker: an indirect jump is counted on the scope line" \
-    "1 unresolved edges, 1 indirect jumps" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+    "1 callees with no body (each listed), 1 indirect jumps" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 expect_output "waker: a call through the GOT is a direct, disclosed edge" \
-    "unfollowed callees (no body in this asm): ext_fn" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+    "listed callees (no body in this asm): memcpy" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 # The probe's contract (scripts/waker-atomics-probe/src/lib.rs) judged against
 # a fixture of its asm. The arm64 Linux shape — CAS and fetch-add as helper
 # calls, the SeqCst store as `stlr` — is green; a fetch-add plant that reports
@@ -1886,6 +3118,41 @@ psym() { # <name>: the probe item's symbol, legacy mangling unless PSYM=v0
         printf '_ZN19waker_atomics_probe%s%s17h0123456789abcdefE' "${#1}" "$1"
     fi
 }
+ppath() { # <module…> <name>: a nested probe item's symbol, legacy mangling unless PSYM=v0
+    local part nest=
+    if [ "${PSYM:-legacy}" = v0 ]; then
+        for part in "${@:1:$#-1}"; do nest="${nest}Nt"; done
+        printf '_RNv%sCs1a2B3c_19waker_atomics_probe' "$nest"
+        for part in "$@"; do printf '%s%s' "${#part}" "$part"; done
+    else
+        printf '_ZN19waker_atomics_probe'
+        for part in "$@"; do printf '%s%s' "${#part}" "$part"; done
+        printf '17h0123456789abcdefE'
+    fi
+}
+# The probe's second vtable, its boundary module and its lane module, in the arm64 Linux shape:
+# each boundary body carries a helper call; the four roots call the boundary (one beside an
+# atomic), the lane's out-of-line read-modify-write and the nested crate's function; no root
+# reaches `settle_held`.
+probe_boundary_asm() {
+    local f
+    for f in clone wake wake_by_ref drop settle_held; do
+        waker_body "$(ppath executor foreign "$f")" 'cbz\tx0, .LBB9_2' 'bl\t__aarch64_ldadd8_acq_rel' 'ret'
+    done
+    waker_body "$(ppath lane fetch_add_one)" 'bl\t__aarch64_ldadd8_acq_rel' 'ret'
+    waker_body "$(psym boundary_clone)" "bl\t$(ppath executor foreign clone)" \
+        "bl\t$(ppath executor foreign wake_by_ref)" 'ret'
+    waker_body "$(psym beside_wake)" "bl\t$(ppath executor foreign wake)" \
+        'bl\t__aarch64_ldadd8_acq_rel' 'ret'
+    waker_body "$(psym drift_wake_by_ref)" "bl\t$(ppath lane fetch_add_one)" 'ret'
+    waker_body "$(psym unlisted_drop)" "bl\t$(ppath executor foreign drop)" \
+        'bl\t_ZN26waker_atomics_probe_nested7outline17h0123456789abcdefE' 'ret'
+    printf '%s:\n' "$(psym BOUNDARY_WAKER_VTABLE)"
+    for f in boundary_clone beside_wake drift_wake_by_ref unlisted_drop; do
+        printf '\t.xword\t%s\n' "$(psym "$f")"
+    done
+    printf '\t.size\t%s, 32\n' "$(psym BOUNDARY_WAKER_VTABLE)"
+}
 probe_fixture() { # <name> <clone> <wake> <wake_by_ref> <off-path> [<waker_drop insns…>]
     local name=$1 clone=$2 wake=$3 by_ref=$4 off=$5
     shift 5
@@ -1899,14 +3166,15 @@ probe_fixture() { # <name> <clone> <wake> <wake_by_ref> <off-path> [<waker_drop 
       for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do
           printf '\t.xword\t%s\n' "$(psym "$f")"
       done
-      printf '\t.size\t%s, 32\n' "$(psym WAKER_VTABLE)"; } | waker_asm "$name"
+      printf '\t.size\t%s, 32\n' "$(psym WAKER_VTABLE)"
+      probe_boundary_asm; } | waker_asm "$name"
 }
 tree=$( { for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do waker_body "$f" 'ret'; done
           waker_vtable; } | waker_asm waker-tree )
 pasm=$(probe_fixture waker-probe-arm64 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
     'stlr\tx9, [x8]' 'bl\t__aarch64_ldadd8_acq_rel')
 expect_output "waker probe: the arm64 Linux shape is 3 plants red, 2 controls green" \
-    "probe: fixture asm, 3 of 3 planted wakers red, 2 of 2 controls green" \
+    "probe: fixture asm, 7 of 7 plants red, 3 of 3 controls green" \
     env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 expect green "waker probe: the arm64 Linux shape passes" env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 # The controls are exact: a probe copy with both control lines deleted is red.
@@ -1916,12 +3184,13 @@ cp -R scripts/waker-atomics-probe "$work/wk/scripts/"
 sed -i.bak '/WAKER-PROBE: expect-clean/d; /WAKER-PROBE: expect-unscanned/d' \
     "$work/wk/scripts/waker-atomics-probe/src/lib.rs"
 expect_red_because "waker probe: a probe whose controls were deleted is red" \
-    "probe declares 0 clean and 0 off-path controls (expected exactly 1 and 1)" \
-    env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" "$work/wk/scripts/check-waker-atomics.sh"
+    "probe declares 0 clean, 0 off-path and 1 boundary controls (expected exactly 1, 1 and 1)" \
+    env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" INF_WAKER_LIVE=off \
+    "$work/wk/scripts/check-waker-atomics.sh"
 pasm=$(PSYM=v0 probe_fixture waker-probe-v0 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
     'stlr\tx9, [x8]' 'bl\t__aarch64_ldadd8_acq_rel')
 expect_output "waker probe: v0-mangled names match their own symbols" \
-    "probe: fixture asm, 3 of 3 planted wakers red, 2 of 2 controls green" \
+    "probe: fixture asm, 7 of 7 plants red, 3 of 3 controls green" \
     env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 inner=_ZN19waker_atomics_probe10waker_drop5inner17h0123456789abcdefE
 pasm=$(probe_fixture waker-probe-nested 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
@@ -1942,6 +3211,75 @@ expect_red_because "waker probe: an off-path atomic the scanner cannot see is a 
     env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 expect_red_because "waker probe: the probe-asm hook outside fixture mode is refused" \
     "INF_WAKER_PROBE_ASM without INF_WAKER_ASM" env INF_WAKER_PROBE_ASM="$pasm" $WAKER
+# The boundary (ADR-0003 A1.6): the five functions of `executor::foreign` are present, not
+# followed, and listed with their atomics; an atomic beside a call to one is red; each must be
+# reached; a callee with no body is red unless the closed list holds it.
+fsym() { printf '_ZN11inf_runtime8executor7foreign%s%s17h0123456789abcdefE' "${#1}" "$1"; }
+boundary_tree() { # <waker_wake's extra insn> <waker_drop's callee> [settle_held reached: yes|no]
+    local f settle=${3:-yes}
+    for f in clone wake wake_by_ref drop settle_held; do
+        waker_body "$(fsym "$f")" 'lock\t\txaddq\t%rax, (%rcx)' 'retq'
+    done
+    waker_body waker_clone "callq\t$(fsym clone)" 'retq'
+    if [ "$settle" = yes ]; then
+        waker_body waker_wake "callq\t$(fsym wake)" "callq\t$(fsym settle_held)" "$1" 'retq'
+    else
+        waker_body waker_wake "callq\t$(fsym wake)" "$1" 'retq'
+    fi
+    waker_body waker_wake_by_ref "callq\t$(fsym wake_by_ref)" 'callq\t__tls_get_addr@PLT' 'retq'
+    waker_body waker_drop "callq\t$(fsym drop)" "callq\t$2" 'retq'
+    waker_vtable
+}
+asm=$(boundary_tree 'movq\t%rdi, %rax' '_RNvNtCsjrHSEGnQ3l9_3std7process5abort' | waker_asm waker-boundary)
+expect green "waker boundary: atomics behind the five boundary functions scan green" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+expect_output "waker boundary: each boundary function is listed with its atomics" \
+    "boundary (checked): clone (2 instructions, 1 atomics), drop (2 instructions, 1 atomics)" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+expect_output "waker boundary: a listed callee is printed, not red" \
+    "listed callees (no body in this asm): _RNvNtCsjrHSEGnQ3l9_3std7process5abort __tls_get_addr" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+asm=$(boundary_tree 'lock\t\txaddq\t%rax, (%rcx)' memcpy | waker_asm waker-beside)
+expect_red_because "waker boundary: an atomic beside a boundary call is red" \
+    "ATOMIC on the waker's owner lane: waker_wake" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+asm=$(boundary_tree 'movq\t%rdi, %rax' memcpy no | waker_asm waker-dead)
+expect_red_because "waker boundary: a boundary function no waker reaches is red" \
+    "DEAD BOUNDARY: executor::foreign::settle_held" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+asm=$(boundary_tree 'movq\t%rdi, %rax' _ZN14inf_foundation4wake10WakeBridge5quiet17h0123456789abcdefE |
+      waker_asm waker-unlisted)
+expect_red_because "waker boundary: a callee the closed list does not hold is red" \
+    "UNLISTED CALLEE on the waker's owner lane: waker_drop>_ZN14inf_foundation4wake10WakeBridge5quiet" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+expect_red_because "waker boundary: the live-boundary switch outside fixture mode is refused" \
+    "INF_WAKER_LIVE=off outside fixture mode" env INF_WAKER_LIVE=off $WAKER_LIVE
+# The source census (ADR-0003 A1.6): `RawWakerVTable` named in code outside the census's entries
+# is red, and so is an entry that names it nowhere; comments and string literals are not code.
+census_root() { # <name>: a fixture root whose two entries each name it in code
+    local root="$work/census-$1"
+    mkdir -p "$root/crates/inf-runtime/src" "$root/crates/inf-runtime/benches/waker_ab" \
+        "$root/crates/x/src" "$root/bins" "$root/tests"
+    printf 'static V: RawWakerVTable = v();\n' >"$root/crates/inf-runtime/src/executor.rs"
+    printf 'use core::task::RawWakerVTable;\n' \
+        >"$root/crates/inf-runtime/benches/waker_ab/executor_a.rs"
+    printf '// RawWakerVTable\n/* RawWakerVTable */ fn f() -> &str { "RawWakerVTable" }\n' \
+        >"$root/crates/x/src/lib.rs"
+    echo "$root"
+}
+root=$(census_root clean)
+expect_output "waker census: a name in comments and strings is no name in code" \
+    "census: 3 .rs files read, entries:" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+root=$(census_root outside)
+printf 'pub static W: core::task::RawWakerVTable = w();\n' >>"$root/crates/x/src/lib.rs"
+expect_red_because "waker census: a file outside its entries naming the vtable type is red" \
+    "WAKER CENSUS: crates/x/src/lib.rs names RawWakerVTable outside the census's entries" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+root=$(census_root unnamed)
+printf '// RawWakerVTable, in a comment only\n' \
+    >"$root/crates/inf-runtime/benches/waker_ab/executor_a.rs"
+expect_red_because "waker census: an entry that names the vtable type nowhere is red" \
+    "WAKER CENSUS: crates/inf-runtime/benches/waker_ab/executor_a.rs is an entry that names RawWakerVTable nowhere" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
 }
 
 # ------------------------------------------------------- fault points (D9)
@@ -2416,11 +3754,12 @@ printf 't/x\t%s::gone\tcast,arith\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
 expect red "lint-ratchet: an item scope naming no function is a scope error" rt_run "$root"
 printf 't/x\t%s\tcast,bogus\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
 expect red "lint-ratchet: an unknown lint family is a scope error" rt_run "$root"
-# The calls: both clippy passes run in the gate's own target directory under
-# the caller's target root, `${CARGO_TARGET_DIR:-target}/lint-ratchet` (a pass
-# in the recipe's target would re-check every member at each switch of lint
-# arguments), with the lint set the backlog counts. A stub cargo first on PATH
-# records each call; a copy of the gate with one part of a call changed is red.
+# The calls: both clippy passes run in the gate's own target directory,
+# `lint-ratchet-<key>` under the checkout's target root (a pass in the recipe's
+# target would re-check every member at each switch of lint arguments; the key
+# keeps a copied checkout's passes off the original's), with the lint set the
+# backlog counts. A stub cargo first on PATH records each call; a copy of the
+# gate with one part of a call changed is red.
 RT_BIN="$work/rt-bin"
 mkdir -p "$RT_BIN"
 IFS= read -r -d '' body <<'EOF' || true
@@ -2469,31 +3808,54 @@ PY
 # a real tree, so its status here is not the case's).
 expect_output "lint-ratchet: the verdict reads the recorded passes' report" \
     "lint-ratchet OK: no backlog" rt_call_run "$RATCHET" "$root"
-expect green "lint-ratchet: both passes name target/lint-ratchet, CARGO_TARGET_DIR unset" \
-    rt_calls_ok "$root.calls" target/lint-ratchet
+rt_key=$(fx_root_key "$root")
+rt_own="$(cd "$root" && pwd -P)/target/lint-ratchet-$rt_key"
+expect green "lint-ratchet: both passes name <root>/target/lint-ratchet-<key>, CARGO_TARGET_DIR unset" \
+    rt_calls_ok "$root.calls" "$rt_own"
 rt_target="$work/rt-target"
-rt_call_run "$RATCHET" "$root" "$rt_target" >/dev/null 2>&1 || true
-expect green "lint-ratchet: both passes name \$CARGO_TARGET_DIR/lint-ratchet when it is set" \
-    rt_calls_ok "$root.calls" "$rt_target/lint-ratchet"
+rt_refused() { # <gate> <CARGO_TARGET_DIR>: the gate stops on the helper's refusal, before cargo
+    local status=0
+    rt_call_run "$1" "$root" "$2" >"$work/rt-refused" 2>&1 || status=$?
+    [ "$status" -ne 0 ] && [ ! -s "$root.calls" ] && grep -q 'LINT-RATCHET SCOPE ERROR' "$work/rt-refused" &&
+        grep -q "CARGO_TARGET_DIR is '$2'" "$work/rt-refused" && return 0
+    echo "exit $status:"
+    cat "$work/rt-refused"
+    [ ! -s "$root.calls" ] || { echo "cargo ran:"; cat "$root.calls"; }
+    return 1
+}
+expect green "lint-ratchet: a CARGO_TARGET_DIR naming another directory stops it before cargo" \
+    rt_refused "$RATCHET" "$rt_target"
+ln -s "$root" "$work/rt-link"
+for rt_var in "$(cd "$root" && pwd -P)/target" target "$work/rt-link/target"; do
+    rt_call_run "$RATCHET" "$root" "$rt_var" >/dev/null 2>&1 || true
+    expect green "lint-ratchet: CARGO_TARGET_DIR=$rt_var, the checkout's target, names the kept directory" \
+        rt_calls_ok "$root.calls" "$rt_own"
+done
 rt_mutant() { # <name> <sed expression> <CARGO_TARGET_DIR or ''> <what the copy does>
-    local dir="$work/rt-gate-$1" want=target/lint-ratchet
+    local dir="$work/rt-gate-$1"
     rm -rf "${dir:?}"
     mkdir -p "$dir"
-    cp "$SCRIPT_DIR/lint_scope_table.py" "$dir/"
+    cp "$SCRIPT_DIR/lint_scope_table.py" "$SCRIPT_DIR/target-root.sh" "$dir/"
     sed "$2" "$RATCHET" >"$dir/check-lint-ratchet.sh"
     chmod +x "$dir/check-lint-ratchet.sh"
     if cmp -s "$RATCHET" "$dir/check-lint-ratchet.sh"; then
         echo "selftest: the lint-ratchet mutant '$1' changed nothing" >&2
         exit 2
     fi
-    [ -z "$3" ] || want="$3/lint-ratchet"
-    rt_call_run "$dir/check-lint-ratchet.sh" "$root" "$3" >/dev/null 2>&1 || true
-    expect red "lint-ratchet: the calls' check is red on a gate that $4" rt_calls_ok "$root.calls" "$want"
+    if [ -n "$3" ]; then
+        expect red "lint-ratchet: the refusal's check is red on a gate that $4" \
+            rt_refused "$dir/check-lint-ratchet.sh" "$3"
+        return
+    fi
+    rt_call_run "$dir/check-lint-ratchet.sh" "$root" >/dev/null 2>&1 || true
+    expect red "lint-ratchet: the calls' check is red on a gate that $4" rt_calls_ok "$root.calls" "$rt_own"
 }
-rt_mutant shared 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/lint-ratchet"$|TARGET_DIR="${CARGO_TARGET_DIR:-target}"|' \
-    '' "shares the recipe's target directory"
-rt_mutant fixed 's|^TARGET_DIR="${CARGO_TARGET_DIR:-target}/lint-ratchet"$|TARGET_DIR="target/lint-ratchet"|' \
-    "$rt_target" "ignores CARGO_TARGET_DIR"
+RT_KEPT='^    TARGET_DIR=$(target_root_kept lint-ratchet)$'
+rt_mutant shared "s|$RT_KEPT|    TARGET_DIR=\$TARGET_ROOT|" '' "shares the recipe's target directory"
+RT_SETUP='^    target_root_setup "$(pwd -P)" ||$'
+rt_mutant raw "s#$RT_SETUP#    true ||#;s|$RT_KEPT|    TARGET_DIR=\"\${CARGO_TARGET_DIR:-target}/lint-ratchet\"|" \
+    "$rt_target" "skips the helper and reads CARGO_TARGET_DIR itself"
+rt_mutant unkeyed "s|$RT_KEPT|    TARGET_DIR=\"\$TARGET_ROOT/lint-ratchet\"|" '' "keeps an unkeyed directory"
 rt_mutant second 's|^            --target-dir "$TARGET_DIR" -- $LINTS$|            -- $LINTS|' \
     '' "drops the simulator pass's --target-dir"
 rt_mutant first 's|^            --target-dir "$TARGET_DIR" -- $LINTS &&$|            -- $LINTS \&\&|' \
@@ -3937,6 +5299,8 @@ expect_red_because "lint-scopes: containers — a committed raise is red against
     "record T counts sum to 4, above the introducing commit's 3" lc_run "$root"
 }
 
+# Each probe case is a cold clippy build of about 3 s, so the probe's cases sit
+# in groups of at most four, by the cut rule above.
 group_lint_scopes_probe() {
 ls_setup
 # the probe's judge: a plant that compiles clean, and a plant that fails
@@ -3953,6 +5317,11 @@ expect red "lint-scopes: a probe that fails for an unrelated reason" ls_probe "$
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unmarked"
 sed -i.bak 's|_ => 0, // PLANT clippy::match_wildcard_for_single_variants|_ => 0,|' "$work/probe-unmarked/src/lib.rs"
 expect red "lint-scopes: a diagnostic on a line with no marker" ls_probe "$work/probe-unmarked"
+}
+
+group_lint_scopes_probe_config() {
+ls_setup
+root=$(ls_root ls-probe)
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-wrong-path"
 sed -i.bak 's|PLANT clippy::disallowed_methods std::fs::read$|PLANT clippy::disallowed_methods std::fs::write|' "$work/probe-wrong-path/src/filesystem.rs"
 expect red "lint-scopes: the right lint naming the wrong API is red" ls_probe "$work/probe-wrong-path"
@@ -3963,6 +5332,11 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unreachable-api"
 sed 's|std::fs::write|std::fs::no_such_fn|' clippy.toml >"$work/probe-unreachable-api/clippy.toml"
 expect_red_because "lint-scopes: an unreachable config entry is red" \
     'unresolved config entry: `std::fs::no_such_fn`' ls_probe "$work/probe-unreachable-api"
+}
+
+group_lint_scopes_probe_arch() {
+ls_setup
+root=$(ls_root ls-probe)
 # ADR-0106 D18, on whichever leg runs this: an unresolved entry under the
 # probe target's own `core::arch` module (on x86_64, ADR-0106 D7.5's inert
 # `_rdtscp` shape) or under a module no leg compiles for is red; one under
@@ -4184,6 +5558,7 @@ expect_red_because "probe-target: a job env that replaces the fuzz-target gate's
     "\`INF_FUZZ_CARGO\` is set where the probe gates inherit it" legs_cover "$work/wf-fuzz-cargo.yml"
 }
 
+# Probe cases again: at most four a group, as above group_lint_scopes_probe.
 group_lint_scopes_unstable() {
 ls_setup
 root=$(ls_root ls-probe)
@@ -4197,6 +5572,12 @@ expect red "lint-scopes: an unrelated error alongside the unstable refusal is re
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-missing"
 sed -i.bak '/let _ =/d' "$work/probe-unstable-missing/unstable/set_times.rs"
 expect red "lint-scopes: removing the unstable call is red" ls_probe "$work/probe-unstable-missing"
+}
+
+group_lint_scopes_unstable_census() {
+ls_setup
+root=$(ls_root ls-probe)
+# ADR-0144 A1, as above: the unstable call's configured path, its feature, its census.
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-config"
 sed 's|std::fs::set_times|std::fs::File::set_times|' clippy.toml >"$work/probe-unstable-config/clippy.toml"
 expect red "lint-scopes: changing the configured unstable path is red" ls_probe "$work/probe-unstable-config"
@@ -4206,7 +5587,11 @@ expect red "lint-scopes: the unstable feature must match its census" ls_probe "$
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-extra"
 cp "$work/probe-unstable-extra/unstable/set_times.rs" "$work/probe-unstable-extra/unstable/extra.rs"
 expect red "lint-scopes: the unstable census cannot grow" ls_probe "$work/probe-unstable-extra"
+}
 
+group_lint_scopes_container_plants() {
+ls_setup
+root=$(ls_root ls-probe)
 # ADR-0163 D2: the shipped probe's container plants draw their lint naming
 # their path under the production config (the green case above). A config
 # that loses a path, the backing without its one allow, and a two-span plant
@@ -4227,7 +5612,11 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-containers-new"
 printf 'pub struct Added {\n    pub value: std::collections::HashMap<u8, u8>,\n}\n' >>"$work/probe-containers-new/src/containers.rs"
 expect_red_because "lint-scopes: a new container with no plant marker is red by its lint and path" \
     "unmarked diagnostic \[('clippy::disallowed_types', 'std::collections::HashMap')\]" ls_probe "$work/probe-containers-new"
+}
 
+group_lint_scopes_slot_plants() {
+ls_setup
+root=$(ls_root ls-probe)
 # ADR-0144 A2: the slot plants draw `await_holding_invalid_type` naming their
 # configured path under the production config (the green case above): the
 # slot, and the answer that carries it, since the lint matches the outermost
@@ -4246,6 +5635,12 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-consumed"
 sed -i.bak 's|            yield_once().await;|            slot.publish(0);|; s|            slot.publish(1);|            yield_once().await;|' "$work/probe-await-consumed/src/awaits.rs"
 expect_red_because "lint-scopes: a slot consumed before the await draws nothing on the plant" \
     "did NOT draw clippy::await_holding_invalid_type inf_foundation::bounded::DequeSlot" ls_probe "$work/probe-await-consumed"
+}
+
+group_lint_scopes_answer_plants() {
+ls_setup
+root=$(ls_root ls-probe)
+# ADR-0144 A2, as above: the answer's plant and the discard plant.
 # The answer's plant at four columns: the slot's lines above sit at twelve,
 # so the anchored edits reach only the answer's await and its match.
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-answer-matched"
@@ -4535,7 +5930,7 @@ fz_manifest() {
 }
 # fz_root <name>: members crates/a (a library) and bins/b (a binary), one fuzz
 # workspace each — t_one, and b_parse including bins/b/src/parse.rs by
-# `#[path]` —, the five probe manifests, a `check` recipe running their gates,
+# `#[path]` —, the six probe manifests, a `check` recipe running their gates,
 # and the stub answering both workspaces green. Its stub files sit beside it.
 fz_root() {
     local root probe
@@ -4559,6 +5954,9 @@ fz_root() {
         printf '[package]\nname = "%s"\nversion = "0.0.0"\n\n[workspace]\n' "$probe" \
             >"$root/scripts/$probe/Cargo.toml"
     done
+    mkdir -p "$root/scripts/waker-atomics-probe/nested"
+    printf '[package]\nname = "nested"\nversion = "0.0.0"\n' \
+        >"$root/scripts/waker-atomics-probe/nested/Cargo.toml"
     printf 'check:\n    ./scripts/check-clock-ban.sh\n    ./scripts/check-lint-scopes.sh\n' >"$root/justfile"
     printf '    ./scripts/check-fuzz-targets.sh\n    ./scripts/check-waker-atomics.sh\n' >>"$root/justfile"
     git -C "$root" init -q
@@ -4567,12 +5965,14 @@ fz_root() {
     fz_depinfo "$root" b_parse fuzz_targets/b_parse.rs fuzz_targets/../../src/parse.rs
     echo "$root"
 }
+# Each run unsets CARGO_TARGET_DIR, so a fixture's kept directory sits in its
+# own target, under the work directory, whatever the caller exports.
 fz_run() { # <root> [args…]: the gate on a fixture root, its probe off
-    env INF_CHECK_ROOT="$1" INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" FZ_STUB="$1.stub" \
-        "$FUZZ" "${@:2}"
+    env -u CARGO_TARGET_DIR INF_CHECK_ROOT="$1" INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" \
+        FZ_STUB="$1.stub" "$FUZZ" "${@:2}"
 }
 fz_probe_run() { # <root>: the gate with its probe on
-    env INF_CHECK_ROOT="$1" INF_FUZZ_CARGO="$FZ_CARGO" FZ_STUB="$1.stub" "$FUZZ"
+    env -u CARGO_TARGET_DIR INF_CHECK_ROOT="$1" INF_FUZZ_CARGO="$FZ_CARGO" FZ_STUB="$1.stub" "$FUZZ"
 }
 fz_red() { # <label> <pattern> <root>: red on the fixture, naming its row
     expect_red_because "fuzz-targets: $1" "$2" fz_run "$3"
@@ -4610,7 +6010,7 @@ expect_output "fuzz-targets: the OK line counts what it compiled and read" \
     "fuzz-targets OK: 2 fuzz workspaces, 2 of 2 targets compiled (2 .*bin.* rows, 2 files)" \
     fz_replay "$root.log"
 expect_output "fuzz-targets: the OK line discloses the probe off in fixture mode" \
-    "probe: skipped (fixture mode, INF_FUZZ_CHECK_PROBE=off); 5 probe manifests, each run by its gate" \
+    "probe: skipped (fixture mode, INF_FUZZ_CHECK_PROBE=off); 6 probe manifests, each run by its gate" \
     fz_replay "$root.log"
 expect_output "fuzz-targets: the OK line counts the #[path] sites and files read" \
     "0 seed directories (git-listed); 1 #.path. sites, 1 files read" fz_replay "$root.log"
@@ -4626,15 +6026,18 @@ expect_red_because "fuzz-targets: a probe knob that is neither on nor off" "is '
 
 # The call: every workspace's cargo call carries the flags the verdict rests
 # on, with RUSTFLAGS replaced and CARGO_ENCODED_RUSTFLAGS unset whatever the
-# caller set.
-fz_calls_ok() { # <stub dir>
-    python3 - "$1/calls" <<'PY'
+# caller set, and the gate's own target directory, `fuzz-check-<key>` under
+# the checkout's target root, read with the variable unset: never the root's
+# target itself, whose RUSTFLAGS differ, and never another checkout's; a
+# variable naming another directory stops the gate before cargo (below).
+fz_calls_ok() { # <stub dir> <the target directory every call must name>
+    python3 - "$1/calls" "$2" <<'PY'
 import sys
 lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
 calls = [lines[i:i + 3] for i in range(0, len(lines) - 1, 3)]
 want = {"bins/b/fuzz/Cargo.toml", "crates/a/fuzz/Cargo.toml"}
 rest = ["--bins", "--locked", "--keep-going", "--message-format", "json", "--color", "never",
-        "--target-dir", "target/fuzz-check"]
+        "--target-dir", sys.argv[2]]
 seen, bad = set(), []
 for call, flags, encoded in calls:
     argv = call.split(" ")[1:]
@@ -4654,43 +6057,87 @@ print("\n".join(bad))
 sys.exit(1 if bad else 0)
 PY
 }
-fz_argv_run() { # <gate> <root>: the gate under a caller's own RUSTFLAGS
-    env RUSTFLAGS=-Awarnings CARGO_ENCODED_RUSTFLAGS=-Awarnings INF_CHECK_ROOT="$2" \
-        INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" FZ_STUB="$2.stub" "$1"
+# fz_argv_run <gate> <root> [<CARGO_TARGET_DIR>]: the gate under a caller's
+# own RUSTFLAGS, with CARGO_TARGET_DIR set to the third argument, or unset.
+fz_argv_run() {
+    if [ -n "${3:-}" ]; then
+        env CARGO_TARGET_DIR="$3" RUSTFLAGS=-Awarnings CARGO_ENCODED_RUSTFLAGS=-Awarnings \
+            INF_CHECK_ROOT="$2" INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" \
+            FZ_STUB="$2.stub" "$1"
+    else
+        env -u CARGO_TARGET_DIR RUSTFLAGS=-Awarnings CARGO_ENCODED_RUSTFLAGS=-Awarnings \
+            INF_CHECK_ROOT="$2" INF_FUZZ_CHECK_PROBE=off INF_FUZZ_CARGO="$FZ_CARGO" \
+            FZ_STUB="$2.stub" "$1"
+    fi
 }
 root=$(fz_root argv)
+FZ_KEY=$(fx_root_key "$root")
+FZ_OWN="$(cd "$root" && pwd -P)/target/fuzz-check-$FZ_KEY"
 expect green "fuzz-targets: green under a caller's RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS" \
     fz_argv_run "$FUZZ" "$root"
 expect green "fuzz-targets: each workspace's call carries the gate's flags and environment" \
-    fz_calls_ok "$root.stub"
-# The call's canaries: a copy of the gate with one part of its call dropped
-# turns the case red. Each copy runs on the argv root, its calls cleared.
+    fz_calls_ok "$root.stub" "$FZ_OWN"
+# A caller's CARGO_TARGET_DIR naming another directory, as a second worktree
+# building into the first checkout's target has: the gate stops before cargo.
+FZ_CALLER_TARGET="$work/fz-caller-target"
+fz_refused() { # <gate> <root> <CARGO_TARGET_DIR>: a scope error on the helper's refusal, no call
+    local status=0
+    rm -f "${2:?}.stub/calls"
+    fz_argv_run "$1" "$2" "$3" >"$work/fz-refused" 2>&1 || status=$?
+    [ "$status" -ne 0 ] && [ ! -s "$2.stub/calls" ] && grep -q 'FUZZ-TARGETS SCOPE ERROR' "$work/fz-refused" &&
+        grep -q "CARGO_TARGET_DIR is '$3'" "$work/fz-refused" && return 0
+    echo "exit $status:"
+    cat "$work/fz-refused"
+    [ ! -s "$2.stub/calls" ] || { echo "cargo ran:"; cat "$2.stub/calls"; }
+    return 1
+}
+expect green "fuzz-targets: a CARGO_TARGET_DIR naming another directory stops it before cargo" \
+    fz_refused "$FUZZ" "$root" "$FZ_CALLER_TARGET"
+ln -s "$root" "$work/fz-link"
+for fz_var in "$(cd "$root" && pwd -P)/target" target "$work/fz-link/target"; do
+    rm -f "${root:?}.stub/calls"
+    fz_argv_run "$FUZZ" "$root" "$fz_var" >/dev/null 2>&1 || true
+    expect green "fuzz-targets: CARGO_TARGET_DIR=$fz_var, the checkout's target, names the kept directory" \
+        fz_calls_ok "$root.stub" "$FZ_OWN"
+done
+# The call's canaries: a copy of the gate with one part of its call changed
+# turns the case red. Each copy runs on the argv root, its calls cleared,
+# with CARGO_TARGET_DIR unset or set to the fourth argument.
 FZ_MROOT=$root
-fz_mutant() { # <name> <sed expression> <what the copy drops>
-    local dir
+fz_mutant() { # <name> <sed expression> <what the copy does> [<CARGO_TARGET_DIR>]
+    local dir want=$FZ_OWN
     dir="$work/fz-gate-$1"
     rm -rf "${dir:?}"
     mkdir -p "$dir"
     cp "$SCRIPT_DIR/check-fuzz-targets.sh" "$SCRIPT_DIR/fuzz_targets.py" "$SCRIPT_DIR/lint_scope_table.py" \
-        "$SCRIPT_DIR/strip-test-modules.awk" "$dir/"
+        "$SCRIPT_DIR/strip-test-modules.awk" "$SCRIPT_DIR/target-root.sh" "$dir/"
     fz_sed "$2" "$dir/check-fuzz-targets.sh"
     chmod +x "$dir/check-fuzz-targets.sh"
     if cmp -s "$SCRIPT_DIR/check-fuzz-targets.sh" "$dir/check-fuzz-targets.sh"; then
         echo "selftest: the fuzz-targets mutant '$1' changed nothing" >&2
         exit 2
     fi
+    if [ -n "${4:-}" ]; then
+        expect red "fuzz-targets: the refusal's check is red on a gate that $3" \
+            fz_refused "$dir/check-fuzz-targets.sh" "$FZ_MROOT" "$4"
+        return
+    fi
     rm -f "${FZ_MROOT:?}.stub/calls"
     fz_argv_run "$dir/check-fuzz-targets.sh" "$FZ_MROOT" >/dev/null 2>&1 || true
     expect red "fuzz-targets: the call's check is red on a gate that $3" \
-        fz_calls_ok "$FZ_MROOT.stub"
+        fz_calls_ok "$FZ_MROOT.stub" "$want"
 }
 fz_mutant bins 's/"check", "--bins", /"check", /' "drops --bins"
 fz_mutant locked 's/"--locked", //' "drops --locked"
 fz_mutant keep-going 's/"--keep-going", //' "drops --keep-going"
 fz_mutant format 's/"--message-format", "json",/"--message-format", "short",/' "reads cargo's short format"
-fz_mutant color 's/"--color", "never", //' "drops --color never"
-fz_mutant target-dir 's|"--target-dir", "target/fuzz-check"|"--target-dir", "target"|' \
-    "shares the root's target directory"
+fz_mutant color 's/^        "--color", "never"\]$/        ]/' "drops --color never"
+FZ_KEPT='^    INF_FUZZ_TARGET_DIR=$(target_root_kept fuzz-check)$'
+fz_mutant target-dir "s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\$TARGET_ROOT|" "shares the root's target directory"
+FZ_SETUP='^    target_root_setup "$(pwd -P)" ||$'
+fz_mutant raw "s#$FZ_SETUP#    true ||#;s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\"\${CARGO_TARGET_DIR:-target}/fuzz-check\"|" \
+    "skips the helper and reads CARGO_TARGET_DIR itself" "$FZ_CALLER_TARGET"
+fz_mutant unkeyed "s|$FZ_KEPT|    INF_FUZZ_TARGET_DIR=\"\$TARGET_ROOT/fuzz-check\"|" "keeps an unkeyed directory"
 fz_mutant warnings 's/^RUSTFLAGS = "-D warnings --cfg fuzzing"$/RUSTFLAGS = "--cfg fuzzing"/' "drops -D warnings"
 fz_mutant cfg 's/^RUSTFLAGS = "-D warnings --cfg fuzzing"$/RUSTFLAGS = "-D warnings"/' "drops --cfg fuzzing"
 fz_mutant encoded 's/ if k != "CARGO_ENCODED_RUSTFLAGS"}/}/' "keeps the caller's CARGO_ENCODED_RUSTFLAGS"
@@ -4744,6 +6191,18 @@ root=$(fz_root c4-recipe)
 fz_sed '/check-lint-scopes.sh/d' "$root/justfile"
 fz_red "C4: a probe whose gate the check recipe does not run" \
     "C4 scripts/lint-scope-probe/Cargo.toml: its gate scripts/check-lint-scopes.sh is not run" "$root"
+# A stage line runs the gates it names: a probe's gate named there is run, its
+# name removed is not, and a name on any other line runs nothing.
+root=$(fz_root c4-stage)
+printf 'check:\n    ./scripts/check-stage.sh check-clock-ban.sh check-lint-scopes.sh %s\n' \
+    'check-fuzz-targets.sh check-waker-atomics.sh' >"$root/justfile"
+expect green "fuzz-targets: C4: probe gates named on a stage line are run" fz_run "$root"
+fz_sed 's/ check-lint-scopes.sh / /' "$root/justfile"
+fz_c4='C4 scripts/lint-scope-probe/Cargo.toml: its gate scripts/check-lint-scopes.sh is not run'
+fz_red "C4: a probe whose gate a stage line no longer names" "$fz_c4" "$root"
+fz_sed 's|^    ./scripts/check-stage.sh |    ./scripts/check-other.sh check-lint-scopes.sh |' \
+    "$root/justfile"
+fz_red "C4: a gate's name on a line that is no stage line" "$fz_c4" "$root"
 # ...or that names a third-party crate, whose lock no cargo-deny leg reads: a
 # registry package in a lock it commits, a registry, git or workspace
 # dependency, a target's dependency, a path out of the tree; a path to a
@@ -4777,7 +6236,7 @@ expect_red_because "fuzz-targets: C4: a workspace-inherited dependency of a prob
 expect green "fuzz-targets: C4: a probe's path dependency on a manifest of the tree" \
     fz_lacks "$FZ_C4 .a.," "$root.log"
 expect_output "fuzz-targets: the OK line says no probe names a third-party crate" \
-    "5 probe manifests, each run by its gate and naming no third-party crate" fz_replay "$FZ_CLEAN_LOG"
+    "6 probe manifests, each run by its gate and naming no third-party crate" fz_replay "$FZ_CLEAN_LOG"
 # C5: one row a file, at fuzz_targets/<name>.rs, each name once.
 root=$(fz_root c5-file)
 printf 'fn main() {}\n' >"$root/crates/a/fuzz/fuzz_targets/x.rs"
@@ -5101,6 +6560,65 @@ fz_probe "$root"
 expect_output "fuzz-targets: the probe's five verdicts on the OK line" \
     "probe: plant_crate E0433 absent_crate, plant_warning denied, plant_cfg E0433 absent_cfg_crate, control compiled naming shared/ok.rs, stale_lock refused by --locked;" \
     fz_probe_run "$root"
+# The probe's directory: one a run, made by mktemp -d under the kept directory
+# and gone at exit, while the census workspaces build in the kept one.
+FZ_PKEPT="$(cd "$root" && pwd -P)/target/fuzz-check-$(fx_root_key "$root")"
+fz_probe_dirs() { # <root> <kept>: prints one run's probe directory; red unless it is per run
+    rm -f "$1.stub/calls"
+    fz_probe_run "$1" >/dev/null 2>&1 || return 1
+    python3 - "$1.stub/calls" "$2" <<'PY'
+import os
+import re
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+calls = [lines[i].split(" ")[1:] for i in range(0, len(lines) - 1, 3)]
+probe = {"scripts/fuzz-check-probe/Cargo.toml", "scripts/fuzz-check-probe/stale-lock/Cargo.toml"}
+dirs, bad, called = set(), [], set()
+for argv in calls:
+    where = argv[argv.index("--target-dir") + 1] if "--target-dir" in argv else None
+    called.add(argv[2])
+    if argv[2] in probe:
+        dirs.add(where)
+    elif where != sys.argv[2]:
+        bad.append(f"{argv[2]} builds in {where}, not the kept {sys.argv[2]}")
+pattern = re.compile(re.escape(sys.argv[2]) + r"/probe\.[A-Za-z0-9]{6}")
+if not probe <= called:
+    bad.append(f"the probe's manifests were not both called: {sorted(called)}")
+if len(dirs) != 1 or not all(d and pattern.fullmatch(d) for d in dirs):
+    bad.append(f"the probe builds in {sorted(map(str, dirs))}, not one mktemp directory under the kept one")
+bad += [f"the probe's directory {d} outlived the run" for d in dirs if d and os.path.exists(d)]
+print("\n".join(bad) if bad else dirs.pop())
+sys.exit(1 if bad else 0)
+PY
+}
+fz_probe_per_run() { # <root> <kept>: two runs, two probe directories
+    local first second
+    first=$(fz_probe_dirs "$1" "$2") || { echo "$first"; return 1; }
+    second=$(fz_probe_dirs "$1" "$2") || { echo "$second"; return 1; }
+    [ "$first" != "$second" ] || { echo "both runs built the probe in $first"; return 1; }
+}
+expect green "fuzz-targets: the probe builds in a directory of its own each run, gone at exit" \
+    fz_probe_per_run "$root" "$FZ_PKEPT"
+fz_probe_mutant() { # <name> <sed expression> <what the copy does>
+    local dir="$work/fz-probe-gate-$1" FUZZ
+    rm -rf "${dir:?}"
+    mkdir -p "$dir"
+    cp "$SCRIPT_DIR/check-fuzz-targets.sh" "$SCRIPT_DIR/fuzz_targets.py" "$SCRIPT_DIR/lint_scope_table.py" \
+        "$SCRIPT_DIR/strip-test-modules.awk" "$SCRIPT_DIR/target-root.sh" "$dir/"
+    fz_sed "$2" "$dir/check-fuzz-targets.sh"
+    chmod +x "$dir/check-fuzz-targets.sh"
+    if cmp -s "$SCRIPT_DIR/check-fuzz-targets.sh" "$dir/check-fuzz-targets.sh"; then
+        echo "selftest: the fuzz-targets probe mutant '$1' changed nothing" >&2
+        exit 2
+    fi
+    FUZZ="$dir/check-fuzz-targets.sh"
+    expect red "fuzz-targets: the probe's directory check is red on a gate that $3" \
+        fz_probe_per_run "$root" "$FZ_PKEPT"
+}
+fz_probe_mutant fixed 's|^\(        INF_FUZZ_PROBE_DIR=\)$(mktemp -d "$INF_FUZZ_TARGET_DIR/probe.XXXXXX")$|\1"$INF_FUZZ_TARGET_DIR/probe.fixed1"; mkdir -p "$INF_FUZZ_PROBE_DIR"|' \
+    "builds the probe in a fixed directory"
+fz_probe_mutant kept 's|^    PROBE_TARGET = \["--target-dir", os.environ\["INF_FUZZ_PROBE_DIR"\]\]$|    PROBE_TARGET = KEPT|' \
+    "builds the probe in the kept directory"
 FZ_PROOT=$root  # fz_probe rewrites both probe answers, so the plants share it
 fz_plant() { # <plant> <label> <pattern>
     fz_probe "$FZ_PROOT" "$1"
@@ -5859,6 +7377,1503 @@ dr_red_census() {
     ! dr_run "$DR/recipe.sh" '' 1 - && ! grep -q 'deny OK' "$DR/out" && dr_legs 0
 }
 expect green "deny: a red census runs no leg" dr_red_census
+}
+
+# ------------------------------------------------------------- target root
+group_target_root() {
+# ADR-0204 D1, D2, D5: scripts/target-root.sh on fixture checkouts, each with a
+# copy of the helper under scripts/. A stub cargo first on PATH records each
+# call and answers `cargo metadata` as TR_META says, from the directory it
+# runs in (its `clean` removes the one directory it names, under the work
+# root only); the config cases run the pinned cargo itself. The key's oracle
+# is fx_root_key. Paths hold a space, so a printed command that splits a path
+# is red. Each case runs the sourced helper in a process of its own: the root
+# it sets is read-only in the shell that set it.
+TRW="$work/tr"
+TR_BIN="$TRW/bin"
+mkdir -p "$TR_BIN"
+IFS= read -r -d '' body <<'EOF' || true
+#!/usr/bin/env bash
+# The stub cargo: records each call, answers metadata, and `clean --target-dir
+# <dir>` removes that one directory when it lies under the work root.
+set -eu
+{
+    printf 'call'
+    printf '\t%s' "$@"
+    printf '\tCARGO_TARGET_DIR=%s\n' "${CARGO_TARGET_DIR-<unset>}"
+} >>"$TR_CALLS"
+case "$1" in
+metadata)
+    t="$(pwd -P)/target"
+    case "${TR_META:-same}" in
+    same) printf '{"target_directory":"%s","build_directory":"%s"}\n' "$t" "$t" ;;
+    missing) printf '{"target_directory":"%s"}\n' "$t" ;;
+    number) printf '{"target_directory":"%s","build_directory":7}\n' "$t" ;;
+    split) printf '{"target_directory":"%s","build_directory":"%s/bd"}\n' "$t" "$TR_WORK" ;;
+    elsewhere) printf '{"target_directory":"%s/td","build_directory":"%s/td"}\n' "$TR_WORK" "$TR_WORK" ;;
+    fail) echo "error: failed to parse manifest" >&2; exit 101 ;;
+    esac ;;
+clean)
+    [ "$#" -eq 3 ] && [ "$2" = --target-dir ] || exit 3
+    case "$3" in "$TR_WORK"/?*) rm -rf "$3" ;; *) exit 3 ;; esac ;;
+*) exit 3 ;;
+esac
+EOF
+printf '%s' "$body" >"$TR_BIN/cargo"
+chmod +x "$TR_BIN/cargo"
+tr_checkout() { # <dir>: a fixture checkout holding the helper
+    mkdir -p "$1/scripts"
+    cp "$SCRIPT_DIR/target-root.sh" "$1/scripts/target-root.sh"
+}
+tr_phys() { (cd "$1" && pwd -P); }
+tr_key() { fx_root_key "$1"; }
+# tr_entry <checkout> <CARGO_TARGET_DIR, or - for unset> <--print|--clean>
+# [<VAR=value>…]: an entry, stdout to $TRW/out, stderr to $TRW/err, the
+# stub's calls to $TRW/calls; the last arguments are set in its environment.
+tr_entry() {
+    local dir=$1 var=$2 how=$3
+    shift 3
+    : >"$TRW/calls"
+    if [ "$var" = - ]; then
+        env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET PATH="$TR_BIN:$PATH" \
+            TR_CALLS="$TRW/calls" TR_WORK="$TRW" "$@" "$dir/scripts/target-root.sh" "$how" \
+            >"$TRW/out" 2>"$TRW/err"
+    else
+        env -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET CARGO_TARGET_DIR="$var" PATH="$TR_BIN:$PATH" \
+            TR_CALLS="$TRW/calls" TR_WORK="$TRW" "$@" "$dir/scripts/target-root.sh" "$how" \
+            >"$TRW/out" 2>"$TRW/err"
+    fi
+}
+tr_print() { local dir=$1 var=$2; shift 2; tr_entry "$dir" "$var" --print "$@"; }
+tr_clean() { local dir=$1 var=$2; shift 2; tr_entry "$dir" "$var" --clean "$@"; }
+# tr_clean_refused <checkout> <var or -> <pattern> [<VAR=value>…]: --clean
+# exits 2, nothing on stdout, nothing removed, no cargo clean called.
+tr_clean_refused() {
+    local dir=$1 var=$2 pattern=$3 status=0
+    shift 3
+    tr_clean "$dir" "$var" "$@" || status=$?
+    [ "$status" -eq 2 ] && [ ! -s "$TRW/out" ] && grep -q -- "$pattern" "$TRW/err" &&
+        ! grep -q "$(printf 'call\tclean')" "$TRW/calls" && return 0
+    echo "--clean exit $status, want 2 naming '$pattern':"
+    cat "$TRW/out" "$TRW/err" "$TRW/calls"
+    return 1
+}
+tr_prints() { # <checkout> <var or -> <root>: exit 0, stdout exactly the root
+    local status=0
+    tr_print "$1" "$2" || status=$?
+    [ "$status" -eq 0 ] && [ "$(cat "$TRW/out")" = "$3" ] && return 0
+    echo "exit $status, want 0 and $3:"
+    cat "$TRW/out" "$TRW/err"
+    return 1
+}
+# tr_refused <checkout> <var or -> <pattern> [<VAR=value>…]: exit 2, nothing
+# on stdout, the reason on stderr.
+tr_refused() {
+    local dir=$1 var=$2 pattern=$3 status=0
+    shift 3
+    tr_print "$dir" "$var" "$@" || status=$?
+    [ "$status" -eq 2 ] && [ ! -s "$TRW/out" ] && grep -q -- "$pattern" "$TRW/err" && return 0
+    echo "exit $status, want 2 naming '$pattern':"
+    cat "$TRW/out" "$TRW/err"
+    return 1
+}
+# tr_setup <checkout> <var or -> <line> [<VAR=value>…]: the sourced helper's
+# key (1), physical checkout (2), root (3) or exported CARGO_TARGET_DIR (4),
+# in a shell of its own.
+tr_setup() {
+    local dir=$1 var=$2 line=$3 script='. "$1/scripts/target-root.sh" && target_root_setup "$1" &&
+printf "%s\n%s\n%s\n" "$TARGET_ROOT_KEY" "$TARGET_ROOT_CHECKOUT" "$TARGET_ROOT" && sh -c "echo \"\$CARGO_TARGET_DIR\""'
+    shift 3
+    if [ "$var" = - ]; then
+        env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET "$@" \
+            bash -c "$script" sh "$dir" | sed -n "${line}p"
+    else
+        env -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET CARGO_TARGET_DIR="$var" "$@" \
+            bash -c "$script" sh "$dir" | sed -n "${line}p"
+    fi
+}
+# tr_setup_refused <checkout> <var or -> <pattern> [<VAR=value>…]: setup
+# returns 2 with the reason, in a shell of its own.
+tr_setup_refused() {
+    local dir=$1 var=$2 pattern=$3 status=0
+    shift 3
+    if [ "$var" = - ]; then
+        env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET "$@" \
+            bash -c '. "$1/scripts/target-root.sh" && target_root_setup "$1"' sh "$dir" \
+            >"$TRW/out" 2>"$TRW/err" || status=$?
+    else
+        env -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET CARGO_TARGET_DIR="$var" "$@" \
+            bash -c '. "$1/scripts/target-root.sh" && target_root_setup "$1"' sh "$dir" \
+            >"$TRW/out" 2>"$TRW/err" || status=$?
+    fi
+    [ "$status" -eq 2 ] && grep -q -- "$pattern" "$TRW/err" && return 0
+    echo "setup exit $status, want 2 naming '$pattern':"
+    cat "$TRW/out" "$TRW/err"
+    return 1
+}
+tr_is() { # <want> <command…>: the command prints exactly the wanted line
+    local want=$1 got
+    shift
+    got=$("$@") || { echo "exit non-zero: $*"; return 1; }
+    [ "$got" = "$want" ] || { echo "got '$got', want '$want'"; return 1; }
+}
+tr_b() { # <dir>: a checkout B with a .git, a marked root and a file in it
+    tr_checkout "$1"
+    mkdir -p "$1/.git" "$1/target/debug"
+    printf 'ref: refs/heads/b\n' >"$1/.git/HEAD"
+    tr_phys "$1" >"$1/target/.checkout-path"
+    printf 'built by B\n' >"$1/target/debug/b-bin"
+}
+tr_b_snap() { # <dir>: copies of B's .git HEAD, marker and file
+    rm -rf "${TRW:?}/snap"
+    mkdir -p "$TRW/snap"
+    cp "$1/.git/HEAD" "$1/target/.checkout-path" "$1/target/debug/b-bin" "$TRW/snap/"
+}
+tr_b_intact() { # <dir>: B's .git, marker and file unchanged
+    cmp -s "$1/.git/HEAD" "$TRW/snap/HEAD" && cmp -s "$1/target/.checkout-path" "$TRW/snap/.checkout-path" &&
+        cmp -s "$1/target/debug/b-bin" "$TRW/snap/b-bin" || { echo "B changed: $1"; return 1; }
+}
+tr_no_command() { # <stderr file>: a refusal that prints no command at all
+    ! grep -q '^    ' "$1" || { echo "a command was printed:"; cat "$1"; return 1; }
+}
+tr_printed_run() { # <stderr file>: run each printed command as printed, on the stub cargo
+    local line
+    while IFS= read -r line; do
+        case "$line" in "    "*) ;; *) continue ;; esac
+        env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET -u CARGO_BUILD_BUILD_DIR PATH="$TR_BIN:$PATH" \
+            TR_CALLS="$TRW/calls" TR_WORK="$TRW" bash -c "${line#    }" >/dev/null 2>&1 || :
+    done <"$1"
+}
+TR_A="$TRW/co a"
+TR_B="$TRW/co-b"
+tr_checkout "$TR_A"
+tr_checkout "$TR_B"
+ln -s "$TR_A" "$TRW/link"
+TR_PA=$(tr_phys "$TR_A")
+TR_KA=$(tr_key "$TR_A")
+TR_V="$TRW/shared root"
+# The key and the root, sourced.
+expect green "target-root: the key is 16 hex digits of SHA-256 of the physical path (a space in it)" \
+    tr_is "$TR_KA" tr_setup "$TR_A" - 1
+expect green "target-root: a symlinked checkout is keyed by its physical path" \
+    tr_is "$TR_KA" tr_setup "$TRW/link" - 1
+expect green "target-root: a symlinked checkout's path is its physical one" \
+    tr_is "$TR_PA" tr_setup "$TRW/link" - 2
+expect green "target-root: unset, the root is the checkout's target" \
+    tr_is "$TR_PA/target" tr_setup "$TR_A" - 3
+expect green "target-root: setup exports CARGO_TARGET_DIR as the root" \
+    tr_is "$TR_PA/target" tr_setup "$TR_A" - 4
+expect green "target-root: an empty CARGO_TARGET_DIR counts as unset" \
+    tr_is "$TR_PA/target" tr_setup "$TR_A" '' 3
+expect green "target-root: a variable naming the checkout's target is that target" \
+    tr_is "$TR_PA/target" tr_setup "$TR_A" "$TR_PA/target" 3
+expect green "target-root: a relative variable is read from the checkout's root" \
+    tr_is "$TR_PA/target" tr_setup "$TR_A" target 3
+expect green "target-root: the checkout's target named through a symlink is that target" \
+    tr_is "$TR_PA/target" tr_setup "$TR_A" "$TRW/link/target" 3
+expect green "target-root: setup refuses a CARGO_TARGET_DIR naming another directory" \
+    tr_setup_refused "$TR_A" "$TR_V" "CARGO_TARGET_DIR is '$TR_V', not this checkout's target $TR_PA/target"
+expect green "target-root: setup refuses a relative CARGO_TARGET_DIR naming another directory" \
+    tr_setup_refused "$TR_A" out/x "CARGO_TARGET_DIR is 'out/x', not this checkout's target"
+expect green "target-root: --print refuses a CARGO_TARGET_DIR naming another directory, before cargo" \
+    tr_refused "$TR_A" "$TR_V" "Unset it for this checkout (env -u CARGO_TARGET_DIR just check)"
+expect green "target-root: that refusal ran no cargo and wrote nothing" \
+    sh -c '[ ! -s "$1" ] && [ ! -e "$2" ]' sh "$TRW/calls" "$TR_A/target"
+tr_readonly() { # the root and the export are read-only in the shell that set them
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET bash -c '
+. "$1/scripts/target-root.sh" && target_root_setup "$1" || exit 1
+for v in TARGET_ROOT TARGET_ROOT_KEY TARGET_ROOT_CHECKOUT CARGO_TARGET_DIR; do
+    if (eval "$v=x") 2>/dev/null; then echo "$v is writable"; exit 1; fi
+done
+target_root_setup "$1" || { echo "a second setup of the same checkout refused"; exit 1; }' sh "$TR_A"
+}
+expect green "target-root: setup's root, key, checkout and CARGO_TARGET_DIR are read-only" tr_readonly
+tr_second_other() { # a second setup in one shell refuses another checkout's root
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET bash -c '
+. "$1/scripts/target-root.sh" && target_root_setup "$1" && target_root_setup "$2"' sh "$TR_A" "$TR_B"
+}
+expect_red_because "target-root: a second setup in one shell refuses another checkout's root" \
+    "CARGO_TARGET_DIR is '$TR_PA/target', not this checkout's target" tr_second_other
+tr_kept() { # <checkout> <name>
+    env -u CARGO_TARGET_DIR bash -c '. "$1/scripts/target-root.sh" && target_root_setup "$1" &&
+target_root_kept "$2"' sh "$1" "$2"
+}
+expect green "target-root: the fuzz gate's kept directory is <root>/fuzz-check-<key>" \
+    tr_is "$TR_PA/target/fuzz-check-$TR_KA" tr_kept "$TR_A" fuzz-check
+expect green "target-root: the ratchet's kept directory is <root>/lint-ratchet-<key>" \
+    tr_is "$TR_PA/target/lint-ratchet-$TR_KA" tr_kept "$TR_A" lint-ratchet
+expect_red_because "target-root: a kept directory the list does not name is refused" \
+    "is not a kept directory" tr_kept "$TR_A" target
+# Check 1: settings read without cargo, in setup and --print.
+for tr_var in CARGO_BUILD_BUILD_DIR CARGO_BUILD_TARGET; do
+    expect green "target-root: setup refuses a set $tr_var" \
+        tr_setup_refused "$TR_A" - "$tr_var is set" "$tr_var=x86_64-unknown-linux-gnu"
+    expect green "target-root: setup refuses $tr_var set empty" \
+        tr_setup_refused "$TR_A" - "$tr_var is set ('')" "$tr_var="
+    tr_set_print() { # <variable>: --print exits 2 before cargo, writing nothing
+        tr_refused "$TR_A" - "$1 is set" "$1=x86_64-unknown-linux-gnu" && [ ! -s "$TRW/calls" ] &&
+            [ ! -e "$TR_A/target" ] && ! grep -q 'cargo clean' "$TRW/err"
+    }
+    expect green "target-root: --print under $tr_var exits 2 before cargo, writing nothing" \
+        tr_set_print "$tr_var"
+done
+TR_CFG="$TRW/configured"
+tr_checkout "$TR_CFG"
+mkdir -p "$TR_CFG/.cargo"
+printf '[build]\ntarget = "x86_64-unknown-linux-gnu"\n' >"$TR_CFG/.cargo/config.toml"
+expect green "target-root: setup refuses a cargo config's build.target" \
+    tr_setup_refused "$TR_CFG" - "$(tr_phys "$TR_CFG")/.cargo/config.toml sets build.target"
+expect green "target-root: --print refuses a cargo config's build.target, before cargo" \
+    tr_refused "$TR_CFG" - "sets build.target ('x86_64-unknown-linux-gnu')"
+rm -rf "${TR_CFG:?}/.cargo"
+# Checks 3 and 4: a link or a file at the root; a checkout inside a root.
+TR_LN="$TRW/linked"
+tr_checkout "$TR_LN"
+mkdir -p "$TRW/elsewhere"
+ln -s "$TRW/elsewhere" "$TR_LN/target"
+expect green "target-root: a link at the root is refused" \
+    tr_refused "$TR_LN" - "$(tr_phys "$TR_LN")/target is a link (to $TRW/elsewhere)"
+expect green "target-root: setup refuses a link at the root" \
+    tr_setup_refused "$TR_LN" - "is a link"
+TR_FILE="$TRW/file-root"
+tr_checkout "$TR_FILE"
+: >"$TR_FILE/target"
+expect green "target-root: a root that is a file is refused" \
+    tr_refused "$TR_FILE" - "target exists and is not a directory"
+TR_IN="$TR_PA/target/inner"
+mkdir -p "$TR_PA/target"
+: >"$TR_A/Cargo.toml"
+tr_checkout "$TR_IN"
+expect green "target-root: a checkout inside another checkout's target is refused" \
+    tr_refused "$TR_IN" - "lies at or under $TR_PA/target, a target directory beside"
+rm -rf "${TR_PA:?}/target" "${TR_A:?}/Cargo.toml"
+TR_MK="$TRW/marked root"
+mkdir -p "$TR_MK"
+printf '%s\n' "$TRW/gone" >"$TR_MK/.checkout-path"
+tr_checkout "$TR_MK/co"
+expect green "target-root: a checkout inside a directory holding a marker is refused" \
+    tr_setup_refused "$TR_MK/co" - "lies at or under $TR_MK, a target root (it holds .checkout-path)"
+expect_red_because "target-root: --print or --clean alone is the command" \
+    "usage: scripts/target-root.sh --print | --clean" "$TR_A/scripts/target-root.sh"
+# --print: the marker.
+tr_first() { # an absent root is made, marked, tagged and printed; cargo asked once, unset
+    tr_prints "$TR_A" - "$TR_PA/target" || return 1
+    [ "$(cat "$TR_A/target/.checkout-path")" = "$TR_PA" ] || { echo "marker"; return 1; }
+    [ "$(head -n 1 "$TR_A/target/CACHEDIR.TAG")" = "Signature: 8a477f597d28d172789f06886806bc55" ] ||
+        { echo "tag"; return 1; }
+    [ "$(cat "$TRW/calls")" = "$(printf 'call\tmetadata\t--no-deps\t--offline\t--format-version\t1\tCARGO_TARGET_DIR=<unset>')" ] ||
+        { echo "calls:"; cat "$TRW/calls"; return 1; }
+}
+expect green "target-root: an absent root is marked with the physical path, tagged and printed" tr_first
+tr_again() {
+    tr_prints "$TR_A" "$TR_PA/target" "$TR_PA/target" || return 1
+    [ "$(ls -A "$TR_A/target" | tr '\n' ' ')" = ".checkout-path CACHEDIR.TAG " ] ||
+        { ls -A "$TR_A/target"; return 1; }
+    [ "$(cat "$TRW/calls")" = "$(printf 'call\tmetadata\t--no-deps\t--offline\t--format-version\t1\tCARGO_TARGET_DIR=<unset>')" ] ||
+        { echo "calls (cargo metadata runs with CARGO_TARGET_DIR removed):"; cat "$TRW/calls"; return 1; }
+}
+expect green "target-root: a root marked for this checkout is printed, the variable removed for cargo" tr_again
+tr_kept_only() {
+    local dir="$TRW/kept-only"
+    tr_checkout "$dir"
+    mkdir -p "$dir/target/fuzz-check-$(tr_key "$dir")/x" "$dir/target/lint-ratchet-$(tr_key "$dir")"
+    : >"$dir/target/.checkout-path.tmp.123"
+    tr_prints "$dir" - "$(tr_phys "$dir")/target" || return 1
+    [ "$(cat "$dir/target/.checkout-path")" = "$(tr_phys "$dir")" ]
+}
+expect green "target-root: a root holding only this checkout's kept directories and a temporary is marked" \
+    tr_kept_only
+TR_OUT="$TRW/the outputs"
+tr_checkout "$TR_OUT"
+mkdir -p "$TR_OUT/target/debug"
+expect green "target-root: outputs with no marker are refused, printing the one --clean command, quoted" \
+    tr_refused "$TR_OUT" - "^    cd '$TR_OUT' && ./scripts/target-root.sh --clean$"
+expect green "target-root: a refused root gets no marker" test ! -e "$TR_OUT/target/.checkout-path"
+tr_one_command() { # <stderr file>: the refusal prints one command, its own checkout's --clean
+    [ "$(grep -c '^    ' "$1")" -eq 1 ] && grep -q '^    cd .* && ./scripts/target-root.sh --clean$' "$1" &&
+        ! grep -q 'cargo clean\|rm -rf' "$1" || { cat "$1"; return 1; }
+}
+expect green "target-root: that refusal prints no other command and no path to remove" \
+    tr_one_command "$TRW/err"
+tr_clean_line() { # the refusal's printed command, run as printed: one path to cargo, then marked
+    local line
+    tr_print "$TR_OUT" - && return 1
+    line=$(sed -n 's/^    \(cd .* && \.\/scripts\/target-root\.sh --clean\)$/\1/p' "$TRW/err")
+    [ -n "$line" ] || { echo "no printed --clean line"; cat "$TRW/err"; return 1; }
+    : >"$TRW/calls"
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET PATH="$TR_BIN:$PATH" \
+        TR_CALLS="$TRW/calls" TR_WORK="$TRW" bash -c "$line" >"$TRW/out" 2>"$TRW/err" ||
+        { cat "$TRW/err"; return 1; }
+    [ "$(sed -n 2p "$TRW/calls")" = "$(printf 'call\tclean\t--target-dir\t%s\tCARGO_TARGET_DIR=<unset>' "$TR_OUT/target")" ] ||
+        { echo "cargo's argv (metadata, then the clean):"; cat "$TRW/calls"; return 1; }
+    [ "$(cat "$TRW/out")" = "$TR_OUT/target" ] && [ ! -e "$TR_OUT/target/debug" ] &&
+        [ "$(cat "$TR_OUT/target/.checkout-path")" = "$(tr_phys "$TR_OUT")" ]
+}
+expect green "target-root: the printed --clean gives cargo one path, its root, and marks it" \
+    tr_clean_line
+TR_OK="$TRW/other-key"
+tr_checkout "$TR_OK"
+mkdir -p "$TR_OK/target/fuzz-check-0123456789abcdef"
+expect green "target-root: another checkout's kept directory is output no marker names" \
+    tr_refused "$TR_OK" - "holds fuzz-check-0123456789abcdef but no marker"
+cp -a "$TR_A" "$TRW/copy"
+expect green "target-root: a checkout copied with its target is refused, naming both paths" \
+    tr_refused "$TRW/copy" - "holds the outputs of the checkout at $TR_PA, not of this one at $(tr_phys "$TRW/copy")"
+expect green "target-root: the copy's refusal prints its own --clean alone" tr_one_command "$TRW/err"
+mv "$TRW/copy" "$TRW/moved"
+expect green "target-root: a checkout moved with its target is refused" \
+    tr_refused "$TRW/moved" - "a checkout copied or moved with its target"
+# --clean: checks 1-5 first, then the walk and the marker, then cargo's clean.
+TR_CL="$TRW/clean me"
+tr_checkout "$TR_CL"
+TR_PCL=$(tr_phys "$TR_CL")
+expect green "target-root: --clean refuses a CARGO_TARGET_DIR naming another directory" \
+    tr_clean_refused "$TR_CL" "$TR_V" "CARGO_TARGET_DIR is"
+expect green "target-root: --clean refuses a set CARGO_BUILD_TARGET" \
+    tr_clean_refused "$TR_CL" - "CARGO_BUILD_TARGET is set" CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu
+expect green "target-root: --clean refuses cargo's build directory apart from the root" \
+    tr_clean_refused "$TR_CL" - "cargo's build directory is" TR_META=split
+tr_clean_absent() { # an absent root: nothing to remove, marked and printed
+    local status=0
+    tr_clean "$TR_CL" - || status=$?
+    [ "$status" -eq 0 ] && [ "$(cat "$TRW/out")" = "$TR_PCL/target" ] &&
+        [ "$(cat "$TR_CL/target/.checkout-path")" = "$TR_PCL" ] &&
+        ! grep -q "$(printf 'call\tclean')" "$TRW/calls" || { cat "$TRW/out" "$TRW/err" "$TRW/calls"; return 1; }
+}
+expect green "target-root: --clean on an absent root marks it, removing nothing" tr_clean_absent
+tr_clean_outputs() { # a marked root with outputs: cleaned by cargo, then marked again
+    local status=0
+    mkdir -p "$TR_CL/target/debug/deps"
+    tr_clean "$TR_CL" - || status=$?
+    [ "$status" -eq 0 ] && [ "$(cat "$TRW/out")" = "$TR_PCL/target" ] && [ ! -e "$TR_CL/target/debug" ] &&
+        [ "$(ls -A "$TR_CL/target" | tr '\n' ' ')" = ".checkout-path CACHEDIR.TAG " ] &&
+        [ "$(sed -n 2p "$TRW/calls")" = "$(printf 'call\tclean\t--target-dir\t%s\tCARGO_TARGET_DIR=<unset>' "$TR_PCL/target")" ] ||
+        { cat "$TRW/out" "$TRW/err" "$TRW/calls"; ls -A "$TR_CL/target"; return 1; }
+}
+expect green "target-root: --clean removes the root through cargo's clean, then marks it" tr_clean_outputs
+tr_walk_case() { # <name> <path under the root> <pattern>: --print names it, --clean refuses it
+    local dir="$TRW/walk-$1"
+    tr_checkout "$dir"
+    mkdir -p "$dir/target/debug" "$(dirname "$dir/target/$2")"
+    : >"$dir/target/$2"
+    : >"$dir/target/debug/kept"
+    tr_refused "$dir" - "$3" || return 1
+    ! grep -q '^    ' "$TRW/err" || { echo "a command was printed:"; cat "$TRW/err"; return 1; }
+    tr_clean_refused "$dir" - "$3" || return 1
+    [ -e "$dir/target/$2" ] && [ -e "$dir/target/debug/kept" ]
+}
+expect green "target-root: a .git below the root is named, no command printed; --clean refuses it" \
+    tr_walk_case below-git "debug/wt/.git" "holds $TRW/walk-below-git/target/debug/wt/.git, a work tree or a repository"
+expect green "target-root: a .git at the root's top is refused too" \
+    tr_walk_case top-git ".git" "holds $TRW/walk-top-git/target/.git, a work tree or a repository"
+expect green "target-root: another root's marker below the root is named; --clean refuses it" \
+    tr_walk_case below-marker "debug/x/.checkout-path" "another checkout's target root"
+tr_clean_walk_marked() { # a marked root: --clean still walks before removing
+    local dir="$TRW/walk-marked"
+    tr_checkout "$dir"
+    tr_prints "$dir" - "$(tr_phys "$dir")/target" || return 1
+    mkdir -p "$dir/target/debug/b"
+    : >"$dir/target/debug/b/.git"
+    tr_clean_refused "$dir" - "a work tree or a repository" && [ -e "$dir/target/debug/b/.git" ]
+}
+expect green "target-root: --clean on a marked root refuses a .git below it" tr_clean_walk_marked
+tr_sharer() { # W's target is a link to R, R's marker names W: --print names W, no command; --clean refuses
+    local dir="$TRW/shared-r" other="$TRW/sharer w"
+    tr_checkout "$dir"
+    tr_checkout "$other"
+    mkdir -p "$dir/target/debug"
+    tr_phys "$other" >"$dir/target/.checkout-path"
+    ln -s "$dir/target" "$other/target"
+    tr_refused "$dir" - "is also the target of the checkout at $(tr_phys "$other")" || return 1
+    ! grep -q '^    ' "$TRW/err" || { echo "a command was printed:"; cat "$TRW/err"; return 1; }
+    tr_clean_refused "$dir" - "is also the target of the checkout at" || return 1
+    [ -d "$dir/target/debug" ]
+}
+expect green "target-root: a root that a live checkout's linked target shares is named; --clean refuses" \
+    tr_sharer
+tr_gone_writer() { # the marker names a checkout that is gone: a copy's root, cleaned by --clean
+    local dir="$TRW/gone-writer"
+    tr_checkout "$dir"
+    mkdir -p "$dir/target/debug"
+    printf '%s\n' "$TRW/no-such-checkout" >"$dir/target/.checkout-path"
+    tr_refused "$dir" - "holds the outputs of the checkout at $TRW/no-such-checkout" || return 1
+    tr_one_command "$TRW/err" || return 1
+    tr_clean "$dir" - && [ ! -e "$dir/target/debug" ] && [ "$(cat "$dir/target/.checkout-path")" = "$(tr_phys "$dir")" ]
+}
+expect green "target-root: a root a gone checkout marked prints --clean, which cleans and marks it" \
+    tr_gone_writer
+# --print: where cargo says the builds land, the variable removed.
+TR_M="$TRW/meta"
+tr_checkout "$TR_M"
+tr_meta() { # <TR_META> <pattern>: refused before any marker or clean
+    tr_refused "$TR_M" - "$2" TR_META="$1" && [ ! -e "$TR_M/target" ] && ! grep -q 'cargo clean' "$TRW/err"
+}
+expect green "target-root: a metadata reply without build_directory is refused" \
+    tr_meta missing "names no target or build directory as a path"
+expect green "target-root: a build_directory that is no path is refused" \
+    tr_meta number "names no target or build directory as a path"
+expect green "target-root: a build directory apart from the root is refused, naming it and the settings" \
+    tr_meta split "cargo's build directory is $TRW/bd, not this checkout's target $(tr_phys "$TR_M")/target: a cargo config's build.target-dir or build-dir"
+expect green "target-root: a target directory other than the root is refused" \
+    tr_meta elsewhere "cargo's target directory is $TRW/td, not this checkout's target"
+expect green "target-root: a failing cargo metadata is refused with its message" \
+    tr_meta fail "failed to parse manifest"
+# The pinned cargo itself: a config's build-dir, and CARGO_BUILD_TARGET_DIR.
+TR_CF="$TRW/config"
+tr_checkout "$TR_CF"
+mkdir -p "$TR_CF/src" "$TR_CF/.cargo"
+printf '[package]\nname = "tr-config"\nversion = "0.0.0"\nedition = "2021"\n\n[workspace]\n' >"$TR_CF/Cargo.toml"
+printf 'fn main() {}\n' >"$TR_CF/src/main.rs"
+cp rust-toolchain.toml "$TR_CF/rust-toolchain.toml"
+tr_real() { # --print on the real cargo: <want status> [<VAR=value>…]
+    local want=$1 status=0
+    shift
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET "$@" \
+        "$TR_CF/scripts/target-root.sh" --print >"$TRW/out" 2>"$TRW/err" || status=$?
+    [ "$status" -eq "$want" ] || { echo "exit $status, want $want"; cat "$TRW/out" "$TRW/err"; return 1; }
+}
+tr_real_config() {
+    printf '[build]\nbuild-dir = "bd"\n' >"$TR_CF/.cargo/config.toml"
+    tr_real 2 && [ ! -s "$TRW/out" ] && [ ! -e "$TR_CF/target" ] &&
+        grep -q "cargo's build directory is $(tr_phys "$TR_CF")/bd" "$TRW/err" &&
+        grep -q "Read here: $(tr_phys "$TR_CF")/.cargo/config.toml" "$TRW/err"
+}
+expect green "target-root: on the pinned cargo a config's build-dir is refused, naming the file" \
+    tr_real_config
+rm -f "$TR_CF/.cargo/config.toml"
+tr_real_build_target_dir() {
+    tr_real 2 CARGO_BUILD_TARGET_DIR="$TRW/btd" && [ ! -e "$TR_CF/target" ] &&
+        grep -q "cargo's target directory is $TRW/btd" "$TRW/err" &&
+        grep -q "Read here: CARGO_BUILD_TARGET_DIR='$TRW/btd'" "$TRW/err"
+}
+expect green "target-root: on the pinned cargo CARGO_BUILD_TARGET_DIR is refused, naming it" \
+    tr_real_build_target_dir
+tr_real_target_dir() {
+    printf '[build]\ntarget-dir = "elsewhere"\n' >"$TR_CF/.cargo/config.toml"
+    tr_real 2 && [ ! -e "$TR_CF/target" ] &&
+        grep -q "cargo's target directory is $(tr_phys "$TR_CF")/elsewhere" "$TRW/err"
+}
+expect green "target-root: on the pinned cargo a config's build.target-dir is refused" tr_real_target_dir
+tr_real_clean_build_dir() { # --clean under a config's build-dir that holds B's outputs: refused, B intact
+    local b="$TRW/real-b" status=0
+    tr_b "$b"
+    tr_b_snap "$b"
+    printf '[build]\nbuild-dir = "%s"\n' "$(tr_phys "$b")/target" >"$TR_CF/.cargo/config.toml"
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET \
+        "$TR_CF/scripts/target-root.sh" --clean >"$TRW/out" 2>"$TRW/err" || status=$?
+    rm -f "$TR_CF/.cargo/config.toml"
+    [ "$status" -eq 2 ] && grep -q "cargo's build directory is $(tr_phys "$b")/target" "$TRW/err" ||
+        { echo "exit $status"; cat "$TRW/err"; return 1; }
+    tr_b_intact "$b"
+}
+expect green "target-root: on the pinned cargo --clean under a build-dir holding B's outputs keeps them" \
+    tr_real_clean_build_dir
+tr_real_plain() {
+    tr_real 0 && [ "$(cat "$TRW/out")" = "$(tr_phys "$TR_CF")/target" ]
+}
+expect green "target-root: on the pinned cargo, nothing set, the root is printed (the control)" tr_real_plain
+# ADR-0204 D5: the nesting and removal legs. Each leg's B is a fixture
+# checkout whose .git, marker and a file of its root are copied before the leg
+# and compared after it; no entry of another checkout may print or run a
+# command that changes them, on the stub cargo whose clean really removes.
+TR_NA="$TRW/nest a"
+tr_checkout "$TR_NA"
+: >"$TR_NA/Cargo.toml"
+TR_PNA=$(tr_phys "$TR_NA")
+TR_NB="$TRW/nest-b"
+tr_b "$TR_NB"
+tr_b_snap "$TR_NB"
+tr_b_on() { # <B's CARGO_TARGET_DIR>: refused in setup, --print and --clean, nothing written under A
+    local before
+    before=$(ls -A "$TR_NA" "$TR_NA/target" 2>/dev/null)
+    tr_setup_refused "$TR_NB" "$1" "CARGO_TARGET_DIR is" || return 1
+    tr_refused "$TR_NB" "$1" "CARGO_TARGET_DIR is" && tr_no_command "$TRW/err" || return 1
+    tr_clean_refused "$TR_NB" "$1" "CARGO_TARGET_DIR is" || return 1
+    [ "$(ls -A "$TR_NA" "$TR_NA/target" 2>/dev/null)" = "$before" ] || { echo "written under A"; return 1; }
+    tr_b_intact "$TR_NB"
+}
+expect green "target-root: B on A's target is refused in each entry, nothing written under A" \
+    tr_b_on "$TR_PNA/target"
+expect green "target-root: B on a path inside A's target is refused in each entry" tr_b_on "$TR_PNA/target/x"
+expect green "target-root: B on A's checkout is refused in each entry" tr_b_on "$TR_PNA"
+expect green "target-root: B on a parent two checkouts share is refused in each entry" tr_b_on "$TRW/two share"
+tr_two_on_one() { # two checkouts given one variable: each refused
+    tr_setup_refused "$TR_A" "$TR_V" "CARGO_TARGET_DIR is" && tr_setup_refused "$TR_NB" "$TR_V" "CARGO_TARGET_DIR is" &&
+        tr_refused "$TR_A" "$TR_V" "CARGO_TARGET_DIR is" && tr_refused "$TR_NB" "$TR_V" "CARGO_TARGET_DIR is"
+}
+expect green "target-root: two checkouts given one variable are each refused" tr_two_on_one
+tr_prints "$TR_NA" - "$TR_PNA/target" >/dev/null
+expect green "target-root: B on another checkout's root is refused in each entry" tr_b_on "$TR_PNA/target"
+rm -rf "${TR_PNA:?}/target"
+# A root nested as the per-variable rule made it: <A>/target/checkout-<kB>,
+# holding B's marker and outputs, in a root from before the rule (no marker).
+tr_nested_by_hand() {
+    local nest="$TR_PNA/target/checkout-$(tr_key "$TR_NB")"
+    mkdir -p "$nest/debug"
+    tr_phys "$TR_NB" >"$nest/.checkout-path"
+    printf 'built by B\n' >"$nest/debug/b-bin"
+    cp "$nest/.checkout-path" "$TRW/nest-marker"
+    tr_refused "$TR_NA" - "holds $nest/.checkout-path, another checkout's target root" || return 1
+    tr_no_command "$TRW/err" || return 1
+    tr_clean_refused "$TR_NA" - "another checkout's target root" || return 1
+    tr_printed_run "$TRW/err"
+    cmp -s "$nest/.checkout-path" "$TRW/nest-marker" && [ -f "$nest/debug/b-bin" ] || { echo "B's nested root changed"; return 1; }
+}
+expect green "target-root: a root nested in A's is named, no command printed, and --clean keeps it" \
+    tr_nested_by_hand
+rm -rf "${TR_PNA:?}/target"
+# The dead-root fixture: under a variable, X's root, with Y's live root nested
+# inside it, X's checkout gone; Z on the variable is refused, printing no path.
+tr_dead_root() {
+    local v="$TRW/dead v" y="$TRW/dead-y" z="$TRW/dead z" nest
+    tr_checkout "$z"
+    tr_b "$y"
+    nest="$v/checkout-0123456789abcdef/checkout-$(tr_key "$y")"
+    mkdir -p "$nest/debug"
+    printf '%s\n' "$TRW/gone-x" >"$v/checkout-0123456789abcdef/.checkout-path"
+    tr_phys "$y" >"$nest/.checkout-path"
+    printf 'y\n' >"$nest/debug/b-bin"
+    tr_refused "$z" "$v" "CARGO_TARGET_DIR is" && tr_no_command "$TRW/err" || return 1
+    tr_printed_run "$TRW/err"
+    [ -f "$nest/.checkout-path" ] && [ -f "$nest/debug/b-bin" ] && ! grep -q "$v/checkout" "$TRW/err"
+}
+expect green "target-root: on a variable holding a dead root with a live one nested, nothing is printed to remove" \
+    tr_dead_root
+# B's checkout inside A's root, as git worktree add or a clone puts it.
+tr_checkout_in_root() {
+    local inner="$TR_PNA/target/debug/wt"
+    tr_b "$inner"
+    tr_b_snap "$inner"
+    tr_setup_refused "$inner" - "lies at or under $TR_PNA/target, a target directory beside" || return 1
+    tr_refused "$inner" - "lies at or under" && tr_no_command "$TRW/err" || return 1
+    tr_clean_refused "$inner" - "lies at or under" || return 1
+    tr_refused "$TR_NA" - "holds $inner/.git, a work tree or a repository" && tr_no_command "$TRW/err" || return 1
+    tr_clean_refused "$TR_NA" - "a work tree or a repository" || return 1
+    tr_b_intact "$inner"
+}
+expect green "target-root: B's checkout inside A's root is refused, A names it, and --clean keeps it" \
+    tr_checkout_in_root
+rm -rf "${TR_PNA:?}/target"
+# The copy's gates build their own keyed directories.
+expect green "target-root: a copied checkout's gates keep directories under its own key" \
+    tr_is "$(tr_phys "$TRW/moved")/target/fuzz-check-$(tr_key "$TRW/moved")" tr_kept "$TRW/moved" fuzz-check
+# The triple and the config read, in each entry: no command printed, nothing written.
+TR_HOST=$(rustc -vV | sed -n "s/^host: //p")
+TR_TP="$TRW/triple parent"
+TR_T="$TR_TP/co"
+tr_checkout "$TR_T"
+mkdir -p "$TRW/cargo-home"
+tr_triple() { # <label> <pattern> [<VAR=value>…]: setup, --print and --clean refuse it
+    local label=$1 pattern=$2
+    shift 2
+    expect green "target-root: setup refuses $label" tr_setup_refused "$TR_T" - "$pattern" "$@"
+    tr_triple_print() { tr_refused "$TR_T" - "$@" && tr_no_command "$TRW/err" && [ ! -e "$TR_T/target" ]; }
+    expect green "target-root: --print refuses $label, writing nothing" tr_triple_print "$pattern" "$@"
+    expect green "target-root: --clean refuses $label" tr_clean_refused "$TR_T" - "$pattern" "$@"
+}
+tr_triple "CARGO_BUILD_TARGET set to the host's triple" "CARGO_BUILD_TARGET is set" CARGO_BUILD_TARGET="$TR_HOST"
+tr_triple "CARGO_BUILD_TARGET set empty" "CARGO_BUILD_TARGET is set ('')" CARGO_BUILD_TARGET=
+mkdir -p "$TR_T/.cargo"
+printf '[build]\ntarget = "%s"\n' "$TR_HOST" >"$TR_T/.cargo/config.toml"
+tr_triple "build.target in the checkout's config.toml" "$TR_T/.cargo/config.toml sets build.target"
+rm -f "$TR_T/.cargo/config.toml"
+printf 'build.target = "%s"\n' "$TR_HOST" >"$TR_T/.cargo/config"
+tr_triple "build.target as a dotted key in a config without extension" "$TR_T/.cargo/config sets build.target"
+rm -f "$TR_T/.cargo/config"
+mkdir -p "$TR_TP/.cargo"
+printf '[build]\ntarget = ["%s"]\n' "$TR_HOST" >"$TR_TP/.cargo/config.toml"
+tr_triple "build.target as an array in a directory above the checkout" "$TR_TP/.cargo/config.toml sets build.target"
+rm -rf "${TR_TP:?}/.cargo"
+printf '[build]\ntarget = "%s"\n' "$TR_HOST" >"$TRW/cargo-home/config.toml"
+tr_triple "build.target in CARGO_HOME's config" "cargo-home/config.toml sets build.target" CARGO_HOME="$TRW/cargo-home"
+printf 'include = ["extra.toml"]\n' >"$TRW/cargo-home/config.toml"
+tr_triple "a config holding an include" "holds an include, which cargo follows" CARGO_HOME="$TRW/cargo-home"
+printf '[build\n' >"$TRW/cargo-home/config.toml"
+tr_triple "a config that cannot be parsed" "cannot be read or parsed" CARGO_HOME="$TRW/cargo-home"
+rm -f "$TRW/cargo-home/config.toml"
+expect green "target-root: the same checkout, nothing set, is printed (the triple legs' control)" \
+    tr_prints "$TR_T" - "$(tr_phys "$TR_T")/target"
+# target_root_cargo_fresh: a per-run build, cold. The recorder prints the
+# variable and its arguments; "ran" says the command ran.
+printf '%s\n' '#!/bin/sh' 'printf "ran CARGO_TARGET_DIR=%s FOO=%s argv=%s\n" "$CARGO_TARGET_DIR" "${FOO-<unset>}" "$*"' \
+    >"$TR_BIN/recorder"
+chmod +x "$TR_BIN/recorder"
+TR_FR="$TRW/fresh"
+mkdir -p "$TR_FR"
+tr_fresh() { # <dir> <args…>: the function in a shell of its own, FOO=1 and a read-only variable
+    env FOO=1 CARGO_TARGET_DIR="$TRW/caller" bash -c '. "$1/scripts/target-root.sh"; readonly CARGO_TARGET_DIR
+shift; target_root_cargo_fresh "$@"' sh "$TR_A" "$@"
+}
+expect green "target-root: a fresh build on an absent directory runs there, under a read-only variable" \
+    tr_is "ran CARGO_TARGET_DIR=$TR_FR/absent FOO=1 argv=a b" tr_fresh "$TR_FR/absent" "$TR_BIN/recorder" a b
+mkdir -p "$TR_FR/empty"
+expect green "target-root: a fresh build on an empty directory runs there" \
+    tr_is "ran CARGO_TARGET_DIR=$TR_FR/empty FOO=1 argv=" tr_fresh "$TR_FR/empty" "$TR_BIN/recorder"
+expect green "target-root: an env -u prefix stays in the argv, the variable set beside it" \
+    tr_is "ran CARGO_TARGET_DIR=$TR_FR/absent FOO=<unset> argv=x" \
+    tr_fresh "$TR_FR/absent" env -u FOO "$TR_BIN/recorder" x
+mkdir -p "$TR_FR/full"
+: >"$TR_FR/full/earlier"
+tr_fresh_refused() { # <pattern> <dir> <args…>: exit 2, nothing ran
+    local pattern=$1 status=0
+    shift
+    tr_fresh "$@" >"$TRW/out" 2>"$TRW/err" || status=$?
+    [ "$status" -eq 2 ] && ! grep -q '^ran' "$TRW/out" && grep -q -- "$pattern" "$TRW/err" && return 0
+    echo "exit $status, want 2 naming '$pattern':"
+    cat "$TRW/out" "$TRW/err"
+    return 1
+}
+expect green "target-root: a fresh build refuses a directory an earlier run filled, running nothing" \
+    tr_fresh_refused "holds an earlier run's entries" "$TR_FR/full" "$TR_BIN/recorder"
+: >"$TR_FR/file"
+expect green "target-root: a fresh build refuses a file at its directory" \
+    tr_fresh_refused "is not a directory" "$TR_FR/file" "$TR_BIN/recorder"
+ln -s "$TR_FR/empty" "$TR_FR/link"
+expect green "target-root: a fresh build refuses a link at its directory" \
+    tr_fresh_refused "is not a directory" "$TR_FR/link" "$TR_BIN/recorder"
+for tr_arg in --target-dir --target-dir=x --config --config=build.target-dir=x CARGO_TARGET_DIR=x; do
+    expect green "target-root: a fresh build refuses an argv naming $tr_arg, which outranks its directory" \
+        tr_fresh_refused "names '$tr_arg'" "$TR_FR/absent" "$TR_BIN/recorder" "$tr_arg"
+done
+expect green "target-root: a fresh build refuses an env -u CARGO_TARGET_DIR, which undoes its directory" \
+    tr_fresh_refused "names 'CARGO_TARGET_DIR'" "$TR_FR/absent" env -u CARGO_TARGET_DIR "$TR_BIN/recorder"
+expect green "target-root: a fresh build with no command is refused" \
+    tr_fresh_refused "usage: target_root_cargo_fresh" "$TR_FR/absent"
+# The helper's canaries: a copy with one rule removed fails its case.
+tr_mutant() { # <name> <sed expression> <case function> <what the copy does>
+    local dir="$TRW/mutant-$1"
+    tr_checkout "$dir"
+    sed "$2" "$SCRIPT_DIR/target-root.sh" >"$dir/scripts/target-root.sh"
+    if cmp -s "$SCRIPT_DIR/target-root.sh" "$dir/scripts/target-root.sh"; then
+        echo "selftest: the target-root mutant '$1' changed nothing" >&2
+        exit 2
+    fi
+    expect red "target-root: the case is red on a helper that $4" "$3" "$dir"
+}
+tr_copy_case() { # <helper dir>: its copy, copied with a marked target, is refused
+    tr_prints "$1" - "$(tr_phys "$1")/target" || return 1
+    rm -rf "${1:?}-copy"
+    cp -a "$1" "$1-copy"
+    tr_refused "$1-copy" - "a checkout copied or moved with its target"
+}
+tr_outputs_case() { # <helper dir>: outputs with no marker are refused
+    mkdir -p "$1/target/debug"
+    tr_refused "$1" - "but no marker naming this checkout"
+}
+tr_split_case() { tr_refused "$1" - "cargo's build directory is" TR_META=split; }
+tr_kept_case() { tr_is "$(tr_phys "$1")/target/fuzz-check-$(tr_key "$1")" tr_kept "$1" fuzz-check; }
+tr_variable_case() { tr_refused "$1" "$TR_V" "CARGO_TARGET_DIR is"; }
+tr_control() { # <name> <case function>: the case is green on the helper as it is
+    local dir="$TRW/control-$1"
+    tr_checkout "$dir"
+    expect green "target-root: the $1 case is green on the helper as it is (the control)" "$2" "$dir"
+}
+tr_control marker tr_copy_case
+tr_control outputs tr_outputs_case
+tr_control build-dir tr_split_case
+tr_control unkeyed tr_kept_case
+tr_control variable tr_variable_case
+tr_walk_mutant_case() { # <helper dir>: --clean refuses a root holding a work tree
+    mkdir -p "$1/target/debug/wt"
+    : >"$1/target/debug/wt/.git"
+    tr_clean_refused "$1" - "a work tree or a repository" && [ -e "$1/target/debug/wt/.git" ]
+}
+tr_control walk tr_walk_mutant_case
+tr_fresh_case() { # <helper dir>: its fresh build refuses a directory an earlier run filled
+    local status=0
+    env bash -c '. "$1/scripts/target-root.sh"; target_root_cargo_fresh "$2" "$3"' sh "$1" "$TR_FR/full" \
+        "$TR_BIN/recorder" >"$TRW/out" 2>&1 || status=$?
+    [ "$status" -eq 2 ] && ! grep -q '^ran' "$TRW/out"
+}
+tr_control fresh tr_fresh_case
+tr_mutant fresh 's/^    if \[ -d "\$dir" \] && \[ -n "\$(ls -A "\$dir")" \]; then$/    if false; then/' tr_fresh_case \
+    "builds in a directory an earlier run filled"
+tr_mutant marker 's/^if writer is not None and writer != phys + "\\n":$/if False:/' tr_copy_case \
+    "skips the marker's checkout"
+tr_mutant walk 's/^            if name == ".git" or (name == MARKER and here != root):$/            if False:/' \
+    tr_walk_mutant_case "removes a root that holds a work tree"
+tr_mutant outputs 's/^        if others:$/        if False:/' tr_outputs_case "stamps a root holding outputs"
+tr_mutant build-dir 's/^    if os.path.realpath(path) != os.path.realpath(root):$/    if False:/' tr_split_case \
+    "skips the build directory"
+tr_mutant unkeyed 's|"$TARGET_ROOT/$1-$TARGET_ROOT_KEY"|"$TARGET_ROOT/$1"|' tr_kept_case \
+    "keeps an unkeyed directory"
+tr_mutant variable 's/^    if named != os.path.realpath(root):$/    if False:/' tr_variable_case \
+    "follows a CARGO_TARGET_DIR naming another directory"
+}
+
+# --------------------------------------------------- cargo output-layout census
+group_target_dirs() {
+# ADR-0204 D4: scripts/target_dirs.py on this tree, then on fixture
+# repositories (each its own `git init`, its files untracked unless a case
+# commits them), each with a table of its own. A plant is red for its own
+# reason; a row that holds it is green.
+TD="$SCRIPT_DIR/target_dirs.py"
+TDW="$work/td"
+mkdir -p "$TDW"
+td() { python3 -I "$TD" "$@"; }
+expect green "target-dirs: this tree is green" td .
+expect_output "target-dirs: the OK line counts the files read, the lines and the rows by kind" \
+    "target-dirs census OK: [0-9][0-9]* files git lists read .*; [0-9][0-9]* lines naming cargo's output layout in [0-9][0-9]* rows and 0 cargo config files below the checkout, each a row: export [0-9]" \
+    td .
+# A row of this tree's table removed: the tree is red on that row's lines.
+td_row=$(grep -v '^#' scripts/target-dirs.tsv | grep -m1 $'\troot\t')
+td_file=${td_row%%$'\t'*}
+grep -vxF -- "$td_row" scripts/target-dirs.tsv >"$TDW/short.tsv"
+expect_red_because "target-dirs: this tree with a root row removed is red on its line" \
+    "^target-dirs census: $td_file:[0-9]*: names cargo's output layout and no row" td . "$TDW/short.tsv"
+td_n=0
+td_tree() { # <file> <text…>: a fixture repository holding <file> with each text a line, and an empty table
+    local file=$1
+    shift
+    td_n=$((td_n + 1))
+    TD_DIR="$TDW/t$td_n"
+    mkdir -p "$TD_DIR/scripts" "$(dirname "$TD_DIR/$file")"
+    git -C "$TD_DIR" init -q
+    printf '# file\tkind\tcount\treason\ttext\n' >"$TD_DIR/scripts/target-dirs.tsv"
+    printf '%s\n' "$@" >"$TD_DIR/$file"
+}
+td_row() { # <file> <kind> <count> <text>: a row of the fixture's table
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "a fixture row" "$4" >>"$TD_DIR/scripts/target-dirs.tsv"
+}
+# Each name, in each kind of file, is a line the table must hold.
+TD_NAMES="target-dir build-dir --target build.target CARGO_TARGET_DIR CARGO_BUILD_TARGET CARGO_BUILD_BUILD_DIR --config CARGO_HOME .cargo/config"
+td_every_name() { # <dir> <file> <count>: red on each of the file's lines, one a name, <count> in all
+    local status=0 n name
+    td "$1" >"$TDW/out" 2>&1 || status=$?
+    [ "$status" -eq 1 ] || { echo "exit $status"; cat "$TDW/out"; return 1; }
+    n=0
+    for name in $TD_NAMES; do
+        n=$((n + 1))
+        grep -q "^target-dirs census: $2:$n: names cargo's output layout" "$TDW/out" ||
+            { echo "line $n ($name) not red:"; cat "$TDW/out"; return 1; }
+    done
+    [ "$(grep -c "names cargo's output layout" "$TDW/out")" -eq "$3" ] || { cat "$TDW/out"; return 1; }
+}
+for td_kind in scripts/plant.sh justfile scripts/tool.py src/lib.rs .github/workflows/ci.yml Cargo.toml; do
+    td_lines=()
+    for td_name in $TD_NAMES; do td_lines+=("  x $td_name y"); done
+    td_tree "$td_kind" "${td_lines[@]}"
+    expect green "target-dirs: each name in $td_kind is red, each line named" \
+        td_every_name "$TD_DIR" "$td_kind" 10
+    for td_name in $TD_NAMES; do td_row "$td_kind" triple 1 "x $td_name y"; done
+    expect green "target-dirs: each line in $td_kind held by its row (leading blanks trimmed) is green" td "$TD_DIR"
+done
+td_tree scripts/a.sh 'echo one'
+expect green "target-dirs: a tree with no output-layout line and an empty table is green" td "$TD_DIR"
+td_tree scripts/a.sh 'cargo build --target-dir "$x"'
+td_row scripts/a.sh root 1 'cargo build --target-dir "$x"'
+expect_red_because "target-dirs: a root row whose text does not hold \$TARGET_ROOT is red" \
+    "a root row's text holds \$TARGET_ROOT" td "$TD_DIR"
+td_tree scripts/a.sh 'cargo build --target-dir "$TARGET_ROOT/x"'
+td_row scripts/a.sh root 1 'cargo build --target-dir "$TARGET_ROOT/x"'
+expect green "target-dirs: a root row holding \$TARGET_ROOT is green" td "$TD_DIR"
+td_tree scripts/a.sh 'env CARGO_TARGET_DIR="$d" cargo build'
+td_row scripts/a.sh fresh 1 'env CARGO_TARGET_DIR="$d" cargo build'
+expect_red_because "target-dirs: a fresh row whose text does not call target_root_cargo_fresh is red" \
+    "a fresh row's text holds target_root_cargo_fresh" td "$TD_DIR"
+td_tree scripts/a.sh 'x --target-dir y'
+td_row scripts/a.sh comment 1 'x --target-dir y'
+expect_red_because "target-dirs: a comment row whose text is not a comment is red" \
+    "a comment row's text starts with # or //" td "$TD_DIR"
+td_tree scripts/a.sh 'echo "$CARGO_TARGET_DIR"'
+td_row scripts/a.sh export 1 'echo "$CARGO_TARGET_DIR"'
+expect_red_because "target-dirs: an export row outside the justfile is red" "the export's rows are the justfile's" \
+    td "$TD_DIR"
+td_tree scripts/a.sh 'x --config y'
+td_row scripts/a.sh maybe 1 'x --config y'
+expect_red_because "target-dirs: a row of an unknown kind is red" "the kind 'maybe' is not one of" td "$TD_DIR"
+td_tree scripts/a.sh 'x --config y' 'x --config y'
+td_row scripts/a.sh triple 1 'x --config y'
+expect_red_because "target-dirs: a row whose count is below its lines is red" \
+    "the row matches 2 line(s), its count is 1" td "$TD_DIR"
+td_tree scripts/a.sh 'x --config y'
+td_row scripts/a.sh triple 2 'x --config y'
+expect_red_because "target-dirs: a row whose count is above its lines is red" \
+    "the row matches 1 line(s), its count is 2" td "$TD_DIR"
+td_tree scripts/a.sh 'echo one'
+td_row scripts/a.sh triple 1 'x --config y'
+expect_red_because "target-dirs: a row that no line matches is red" "the row matches 0 line(s)" td "$TD_DIR"
+td_tree scripts/a.sh 'x --config y'
+td_row scripts/a.sh triple 1 'x --config y'
+td_row scripts/a.sh triple 1 'x --config y'
+expect_red_because "target-dirs: a second row for one line is red" "a second row for scripts/a.sh" td "$TD_DIR"
+td_tree scripts/a.sh 'x --config y'
+printf 'scripts/a.sh\ttriple\t1\t \tx --config y\n' >>"$TD_DIR/scripts/target-dirs.tsv"
+expect_red_because "target-dirs: a row with no reason is red" "the row gives no reason" td "$TD_DIR"
+td_tree scripts/a.sh 'x --config y'
+printf 'scripts/a.sh\ttriple\t1\tx --config y\n' >>"$TD_DIR/scripts/target-dirs.tsv"
+expect_red_because "target-dirs: a row of four fields is a scope error" "SCOPE ERROR: scripts/target-dirs.tsv:2: 4 fields" \
+    td "$TD_DIR"
+td_tree scripts/a.sh '    x --config y'
+td_row scripts/a.sh triple 1 'x --config y'
+printf '\t  x --config y  \n' >"$TD_DIR/scripts/a.sh"
+expect green "target-dirs: a row's line re-indented is still held" td "$TD_DIR"
+td_tree scripts/a.sh 'x --config y'
+td_row scripts/a.sh triple 1 'x --config y'
+printf 'x --config z\n' >>"$TD_DIR/scripts/a.sh"
+expect_red_because "target-dirs: a new line beside a held one is red, naming it" \
+    "scripts/a.sh:2: names cargo's output layout and no row" td "$TD_DIR"
+# The files the census reads: untracked ones too; Markdown and the rule's own files not.
+td_tree notes.txt 'try CARGO_TARGET_DIR=/x'
+expect_red_because "target-dirs: an untracked file naming a setting is red" "notes.txt:1: names cargo's output layout" \
+    td "$TD_DIR"
+printf 'notes.txt\n' >"$TD_DIR/.gitignore"
+expect green "target-dirs: the same file, git-ignored, is not read" td "$TD_DIR"
+td_tree scripts/a.sh 'echo one'
+printf 'set CARGO_TARGET_DIR\n' >"$TD_DIR/README.md"
+printf 'CARGO_TARGET_DIR\n' >"$TD_DIR/scripts/target-root.sh"
+printf 'CARGO_TARGET_DIR\n' >"$TD_DIR/scripts/check-scripts-selftest.sh"
+printf 'CARGO_TARGET_DIR\n' >"$TD_DIR/scripts/target_dirs.py"
+expect green "target-dirs: Markdown, the helper, the self-test and the census itself are not read" td "$TD_DIR"
+# A cargo config file below the checkout, whatever its keys spell.
+td_tree scripts/a.sh 'echo one'
+mkdir -p "$TD_DIR/.cargo" "$TD_DIR/sub/.cargo"
+printf '[alias]\nb = "build"\n' >"$TD_DIR/.cargo/config.toml"
+expect_red_because "target-dirs: a .cargo/config.toml below the checkout is red" \
+    "^target-dirs census: .cargo/config.toml: a cargo config file below the checkout" td "$TD_DIR"
+td_row .cargo/config.toml config 1 ''
+expect green "target-dirs: a config row naming it is green" td "$TD_DIR"
+printf '[build]\njobs = 1\n' >"$TD_DIR/sub/.cargo/config"
+expect_red_because "target-dirs: a .cargo/config in a subdirectory is red" \
+    "^target-dirs census: sub/.cargo/config: a cargo config file below the checkout" td "$TD_DIR"
+rm -f "$TD_DIR/sub/.cargo/config" "$TD_DIR/.cargo/config.toml"
+expect_red_because "target-dirs: a config row whose file is gone is red" "a config file that git does not list" \
+    td "$TD_DIR"
+# Scope: a work tree's top, the table, a file to read.
+mkdir -p "$TDW/not-a-repo/scripts"
+printf '# file\tkind\tcount\treason\ttext\n' >"$TDW/not-a-repo/scripts/target-dirs.tsv"
+expect_red_because "target-dirs: a directory that is not a work tree's top is a scope error" \
+    "SCOPE ERROR: .* is not the top of a git work tree" td "$TDW/not-a-repo"
+td_tree scripts/a.sh 'echo one'
+rm -f "$TD_DIR/scripts/target-dirs.tsv"
+expect_red_because "target-dirs: a missing table is a scope error" "SCOPE ERROR: cannot read scripts/target-dirs.tsv" \
+    td "$TD_DIR"
+td_tree README.md 'nothing'
+expect_red_because "target-dirs: a tree whose every file is skipped is a scope error" \
+    "SCOPE ERROR: git lists no file to read" td "$TD_DIR"
+}
+
+# ---------------------------------------------------------- nextest-config
+group_nextest_config() {
+# ADR-0207 D1-D3, ADR-0200 D4, D7: scripts/check-nextest-config.sh on fixture
+# workspaces
+# (each its own `git init`, its files untracked), each built green and given
+# one plant. A plant is red for its own reason; a sanctioned shape is green.
+NC="$SCRIPT_DIR/check-nextest-config.sh"
+NCW="$work/nc"
+mkdir -p "$NCW"
+ncfg() { env INF_CHECK_ROOT="$1" "$NC"; }
+nc_n=0
+# nc_tree: a fresh fixture workspace in NC_DIR, green as built. Package fx has
+# two test targets that both include tests/support/mod.rs; package fxd has a
+# binary and two test targets, one run alone as a whole, its marker below an
+# inner attribute that spans lines, the other holding a long test.
+nc_tree() {
+    nc_n=$((nc_n + 1))
+    NC_DIR="$NCW/w$nc_n"
+    NC_CFG="$NC_DIR/.config/nextest.toml"
+    mkdir -p "$NC_DIR/.config" "$NC_DIR/.github/workflows" "$NC_DIR/crates/fx/src" \
+        "$NC_DIR/crates/fx/tests/support" "$NC_DIR/bins/fxd/src" "$NC_DIR/bins/fxd/tests"
+    git -C "$NC_DIR" init -q
+    cp rust-toolchain.toml "$NC_DIR/"
+    printf '[workspace]\nmembers = ["crates/fx", "bins/fxd"]\nresolver = "2"\n' >"$NC_DIR/Cargo.toml"
+    printf '[package]\nname = "fx"\nversion = "0.0.0"\nedition = "2021"\n' >"$NC_DIR/crates/fx/Cargo.toml"
+    printf '[package]\nname = "fxd"\nversion = "0.0.0"\nedition = "2021"\n' >"$NC_DIR/bins/fxd/Cargo.toml"
+    : >"$NC_DIR/crates/fx/src/lib.rs"
+    printf 'fn main() {}\n' >"$NC_DIR/bins/fxd/src/main.rs"
+    cat >"$NC_DIR/crates/fx/tests/a.rs" <<'EOF'
+mod support;
+
+const TEXT: &str = "static FAKE: Mutex<()> in a string is no lock";
+
+// nextest-group: serial
+#[allow(dead_code)]
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn a_one() {
+    let _ = (TEXT, &SERIAL, &support::SPAWN);
+}
+
+// nextest-alone: 1.5 s. A fixture test whose verdict reads what the lane
+// shares.
+#[test]
+fn a_alone() {}
+EOF
+    cat >"$NC_DIR/crates/fx/tests/b.rs" <<'EOF'
+mod support;
+
+#[test]
+fn b_one() {
+    let _ = &support::SPAWN;
+}
+EOF
+    cat >"$NC_DIR/crates/fx/tests/support/mod.rs" <<'EOF'
+// nextest-in-process: a race between the threads of one test process
+pub static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+EOF
+    cat >"$NC_DIR/bins/fxd/tests/boot.rs" <<'EOF'
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a fixture: an inner attribute spanning lines"
+)]
+//! Creates a namespace with MEM-BUDGET 8mb and writes nothing to it.
+
+// nextest-alone: 3.5 s. The whole target reads a per-user budget.
+// nextest-stall-default: no write reaches a window, so no write parks.
+
+const CREATE: [&[u8]; 2] = [b"MEM-BUDGET", b"8mb"];
+
+#[test]
+fn boots() {
+    let _ = CREATE;
+}
+EOF
+    cat >"$NC_DIR/bins/fxd/tests/tiered.rs" <<'EOF'
+//! Writes a namespace with MEM-BUDGET 8mb and TAIL-STALL-TIMEOUT 60000.
+
+const CREATE: [&[u8]; 4] = [b"MEM-BUDGET", b"8mb", b"TAIL-STALL-TIMEOUT", b"60000"];
+
+#[test]
+fn tiered() {
+    let _ = CREATE;
+}
+
+// nextest-long: 20 s
+#[test]
+fn tiered_storm() {}
+EOF
+    cat >"$NC_CFG" <<'EOF'
+nextest-version = { required = "0.9.150" }
+
+[test-groups]
+serial = { max-threads = 1 }
+
+[profile.default]
+leak-timeout = { period = "100ms", result = "fail" }
+
+[[profile.default.overrides]]
+filter = 'binary_id(fxd::boot)'
+threads-required = "num-test-threads"
+priority = 100
+
+[[profile.default.overrides]]
+filter = 'binary_id(fx::a) & test(=a_alone)'
+threads-required = "num-test-threads"
+priority = 100
+
+[[profile.default.overrides]]
+filter = 'binary_id(fx::a)'
+test-group = "serial"
+priority = 50
+
+[[profile.default.overrides]]
+filter = 'binary_id(fxd::tiered) & test(=tiered_storm)'
+priority = 20
+EOF
+    cat >"$NC_DIR/.github/workflows/ci.yml" <<'EOF'
+jobs:
+  test:
+    steps:
+      - run: cargo install --locked cargo-nextest --version 0.9.150
+      - run: cargo nextest run --workspace
+EOF
+}
+# nc_sub <file> <old> <new>: every <old> in the file replaced; one must be there.
+nc_sub() {
+    python3 -I -c '
+import pathlib, sys
+path, old, new = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+text = path.read_text()
+if old not in text:
+    sys.exit(f"nc_sub: {old!r} is not in {path}")
+path.write_text(text.replace(old, new))' "$@"
+}
+NC_GROUP=$'[[profile.default.overrides]]\nfilter = \'binary_id(fx::a)\'\n'
+NC_LONG=$'[[profile.default.overrides]]\nfilter = \'binary_id(fxd::tiered) & test(=tiered_storm)\'\npriority = 20\n'
+
+nc_tree
+expect green "nextest-config: the fixture workspace is green" ncfg "$NC_DIR"
+expect_output "nextest-config: the OK line counts each rule's population" \
+    "nextest-config OK: nextest-version 0.9.150; 1 groups of one thread (serial), 1 group overrides at priority 50; 2 run alone at priority 100, first (fx::a/a_alone, fxd::boot); 1 long, each at its marker's seconds, 49 at most; 2 static locks, 1 grouped and 1 in-process; 2 test files name MEM-BUDGET, 1 state TAIL-STALL-TIMEOUT and 1 carry nextest-stall-default; no free-space read in 5 integration-test files and 1 library files they link; 1 cargo-nextest installs in CI at 0.9.150, each --locked, one in each of the 1 jobs that run it; [0-9]* .rs files of 6 test binaries read" \
+    ncfg "$NC_DIR"
+# The config holds its listed keys only, in their listed shapes.
+nc_tree
+nc_sub "$NC_CFG" 'nextest-version =' $'experimental = ["setup-scripts"]\nnextest-version ='
+expect_red_because "nextest-config: a top-level key outside the list is red" \
+    "top-level key .experimental. is outside the list" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'leak-timeout =' $'retries = 2\nleak-timeout ='
+expect_red_because "nextest-config: a retry setting in the profile is red" \
+    "profile key .retries. is outside the list" ncfg "$NC_DIR"
+nc_tree
+printf '\n[profile.ci]\nfail-fast = false\n' >>"$NC_CFG"
+expect_red_because "nextest-config: a second profile is red" \
+    "holds a profile other than .default." ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'serial = { max-threads = 1 }' 'serial = { max-threads = 2 }'
+expect_red_because "nextest-config: a group of two threads is red" \
+    "test group .serial. is not" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'result = "fail"' 'result = "pass"'
+expect_red_because "nextest-config: a leak that passes is red" "leak-timeout. is not" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" '{ required = "0.9.150" }' '"0.9.150"'
+expect_red_because "nextest-config: a version floor that is a bare string is red" \
+    "nextest-version. is not" ncfg "$NC_DIR"
+# The overrides: their two shapes, their priorities, their order.
+nc_tree
+nc_sub "$NC_CFG" 'priority = 100' 'priority = 50'
+expect_red_because "nextest-config: a run-alone override without priority 100 is red (canary)" \
+    "a run-alone override sets priority 100, not 50" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 50' 'priority = 100'
+expect_red_because "nextest-config: a group's override without priority 50 is red (canary)" \
+    "a group's override sets priority 50, not 100" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" $'\n'"$NC_GROUP"$'test-group = "serial"\npriority = 50\n' ''
+nc_sub "$NC_CFG" $'\n[[profile.default.overrides]]\nfilter = \'binary_id(fxd::boot)\'' \
+    $'\n'"$NC_GROUP"$'test-group = "serial"\npriority = 50\n\n[[profile.default.overrides]]\nfilter = \'binary_id(fxd::boot)\''
+expect_red_because "nextest-config: a run-alone override after a group's is red (canary)" \
+    "run-alone override 3 comes after group override 1" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 50' $'priority = 50\nslow-timeout = "60s"'
+expect_red_because "nextest-config: an override with a timeout is red" "holds keys" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'test-group = "serial"' 'test-group = ["serial"]'
+expect_red_because "nextest-config: a list-valued test group is red, not a traceback" \
+    "override 3: test-group has the wrong type" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 50' 'priority = 50.0'
+expect_red_because "nextest-config: a priority that is no integer is red" \
+    "override 3: priority has the wrong type" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'threads-required = "num-test-threads"' 'threads-required = "num-cpus"'
+expect_red_because "nextest-config: a run-alone override short of every slot is red" \
+    'threads-required. is not "num-test-threads"' ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "filter = 'binary_id(fxd::boot)'" "filter = 'test(boots)'"
+expect_red_because "nextest-config: a filter in none of the forms is red" "is in none of the forms" \
+    ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'binary_id(fxd::boot)' 'binary_id(fxd::gone)'
+expect_red_because "nextest-config: a filter naming no test binary is red" \
+    "filter names test binary .fxd::gone., which cargo metadata lacks" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "filter = 'binary_id(fx::a)'" "filter = 'package(nope)'"
+expect_red_because "nextest-config: a filter naming no package is red" \
+    "filter names package .nope., which cargo metadata lacks" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "filter = 'binary_id(fx::a)'" "filter = 'package(fx)'"
+expect_red_because "nextest-config: a group override selecting a binary that holds no such lock is red" \
+    "override 3 puts .fx::b. in group .serial., and no lock that binary holds" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" $'// nextest-group: serial\n#[allow(dead_code)]\nstatic SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' ''
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" '(TEXT, &SERIAL, &support::SPAWN)' '(TEXT, &support::SPAWN)'
+expect_red_because "nextest-config: a group override left behind by its lock is red" \
+    "override 3 puts .fx::a. in group .serial., and no lock that binary holds" ncfg "$NC_DIR"
+# The static locks: each marked, each group's marker paired with an override
+# that selects every binary compiling the file.
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" '// nextest-group: serial' '// the fixture lock'
+expect_red_because "nextest-config: an unmarked static lock is red" "a.rs:7: a static lock with no" ncfg "$NC_DIR"
+nc_tree
+printf 'static WAKE: std::sync::Condvar = std::sync::Condvar::new();\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: an unmarked static Condvar is red" "b.rs:7: a static lock with no" \
+    ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/support/mod.rs" \
+    '// nextest-in-process: a race between the threads of one test process' '// nextest-group: serial'
+expect_red_because "nextest-config: a grouped lock in an included file binds each binary that compiles it" \
+    "test binary .fx::b. compiles this lock, and no override puts it in group .serial." ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" 'nextest-group: serial' 'nextest-group: nogroup'
+expect_red_because "nextest-config: a lock's marker naming no group is red" \
+    "names test group .nogroup., which .test-groups. lacks" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'serial = { max-threads = 1 }' $'serial = { max-threads = 1 }\nspare = { max-threads = 1 }'
+expect_red_because "nextest-config: a group no marker names is red" \
+    "test group .spare. is named by no lock's" ncfg "$NC_DIR"
+nc_tree
+printf '// nextest-group: serial\nconst NOT_A_LOCK: u8 = 0;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a group marker on no static lock is red" \
+    "b.rs:7: a .nextest-group:. marker on no static lock" ncfg "$NC_DIR"
+# The run-alone markers and their overrides.
+nc_tree
+nc_sub "$NC_CFG" 'binary_id(fx::a) & test(=a_alone)' 'binary_id(fx::b) & test(=b_one)'
+expect_red_because "nextest-config: a marked test no run-alone override selects is red" \
+    "test .a_alone. is marked to run alone, and no run-alone override selects it" ncfg "$NC_DIR"
+expect_red_because "nextest-config: a run-alone override no marker names is red" \
+    "runs .fx::b. test .b_one. alone, and no .nextest-alone:. marker names it" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" '1.5 s. ' ''
+expect_red_because "nextest-config: a run-alone reason without its time is red" \
+    "gives no time in seconds" ncfg "$NC_DIR"
+nc_tree
+printf '// nextest-alone: 2 s. above no test\nconst NOTHING: u8 = 0;\n' >>"$NC_DIR/crates/fx/tests/a.rs"
+expect_red_because "nextest-config: a run-alone marker above no test, below the leading block, is red" \
+    "a.rs:18: a .nextest-alone:. marker neither above a .#.test.. nor" ncfg "$NC_DIR"
+nc_tree
+printf 'mod inner {\n    // nextest-alone: 0.5 s. a test in an inline module\n    #[test]\n    fn deep() {}\n}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+nc_sub "$NC_CFG" $'\n'"$NC_GROUP" $'\n[[profile.default.overrides]]\nfilter = \'binary_id(fx::b) & test(=inner::deep)\'\nthreads-required = "num-test-threads"\npriority = 100\n\n'"$NC_GROUP"
+expect green "nextest-config: a run-alone test in an inline module is named by its module path" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'#![allow(\n    clippy::disallowed_methods,\n' $'#![allow(\n    clippy::disallowed_methods,\n    clippy::disallowed_types,\n'
+expect green "nextest-config: a leading marker below an inner attribute of four lines binds" ncfg "$NC_DIR"
+# The long markers and their overrides: one test each, at the marker's
+# seconds, 49 at most, on no test another override selects.
+nc_long() { # <marker text> <priority>: the fixture's long test so marked, its override at <priority>
+    nc_tree
+    nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" '// nextest-long: 20 s' "// nextest-long: $1"
+    nc_sub "$NC_CFG" 'priority = 20' "priority = $2"
+}
+nc_long '15 s' 15
+expect green "nextest-config: a long marker of 15 s at priority 15 is green" ncfg "$NC_DIR"
+nc_long '14 s' 14
+expect_red_because "nextest-config: a long marker under 15 s is red" \
+    "tiered.rs:10: a .nextest-long:. marker reads .<n> s., n an integer of 15 or more, not '14 s'" ncfg "$NC_DIR"
+nc_long '60 s' 49
+expect green "nextest-config: a long marker over 49 s at priority 49 is green" ncfg "$NC_DIR"
+nc_long '60 s' 60
+expect_red_because "nextest-config: a long override above 49 is red (canary)" \
+    "override 4 starts .fxd::tiered. test .tiered_storm. at priority 60; its marker's 60 s asks 49" ncfg "$NC_DIR"
+nc_long '20 s' 21
+expect_red_because "nextest-config: a long override at a priority not its marker's is red (canary)" \
+    "override 4 starts .fxd::tiered. test .tiered_storm. at priority 21; its marker's 20 s asks 20" ncfg "$NC_DIR"
+for nc_text in '20' '20.5 s' '020 s' '20 s, a storm'; do
+    nc_long "$nc_text" 20
+    expect_red_because "nextest-config: a long marker reading '$nc_text' is red" \
+        "tiered.rs:10: a .nextest-long:. marker reads .<n> s." ncfg "$NC_DIR"
+done
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" $'// nextest-long: 20 s\n' ''
+expect_red_because "nextest-config: a long override no marker names is red (canary)" \
+    "override 4 starts .fxd::tiered. test .tiered_storm. early, and no .nextest-long:. marker" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" $'\n'"$NC_LONG" ''
+expect_red_because "nextest-config: a long marker no override selects is red (canary)" \
+    "tiered.rs:10: .fxd::tiered. test .tiered_storm. is marked long, and no long override selects it" \
+    ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "'binary_id(fxd::tiered) & test(=tiered_storm)'" "'binary_id(fxd::tiered)'"
+expect_red_because "nextest-config: a long override on a whole binary is red" \
+    "override 4: a long override's filter is one test" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "'binary_id(fxd::tiered) & test(=tiered_storm)'" "'package(fxd) & test(=tiered_storm)'"
+expect_red_because "nextest-config: a long override on a package's test is red" \
+    "override 4: a long override's filter is one test" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 20' $'priority = 20\nslow-timeout = "60s"'
+expect_red_because "nextest-config: a long override with a third key is red" "override 4 holds keys" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 20' $'priority = 20\ntest-group = "serial"'
+expect_red_because "nextest-config: a long override with a test group is a group's, red at its priority" \
+    "override 4: a group's override sets priority 50, not 20" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" 'priority = 20' $'priority = 20\nthreads-required = "num-test-threads"'
+expect_red_because "nextest-config: a long override with every slot is a run-alone one, red at its priority" \
+    "override 4: a run-alone override sets priority 100, not 20" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'#[test]\nfn boots()' $'// nextest-long: 20 s\n#[test]\nfn boots()'
+printf "\n[[profile.default.overrides]]\nfilter = 'binary_id(fxd::boot) & test(=boots)'\npriority = 20\n" >>"$NC_CFG"
+expect_red_because "nextest-config: a long override on a test of a binary run alone is red" \
+    "long override 5 selects .fxd::boot. test .boots., which override 1 also selects" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" $'// shares.\n#[test]' $'// shares.\n// nextest-long: 20 s\n#[test]'
+printf "\n[[profile.default.overrides]]\nfilter = 'binary_id(fx::a) & test(=a_alone)'\npriority = 20\n" >>"$NC_CFG"
+expect_red_because "nextest-config: a long override on a run-alone test is red" \
+    "long override 5 selects .fx::a. test .a_alone., which override 2 also selects" ncfg "$NC_DIR"
+nc_tree
+printf '\n%s' "$NC_LONG" >>"$NC_CFG"
+expect_red_because "nextest-config: two long overrides on one test are red" \
+    "long override 4 selects .fxd::tiered. test .tiered_storm., which override 5 also selects" ncfg "$NC_DIR"
+# A test joins a set by its marker and its override, and either half alone is
+# red (above): a binary may hold a run-alone test and a long one.
+nc_tree
+printf '\n// nextest-alone: 2 s. Reads a live rate.\n#[test]\nfn b_alone() {}\n\n// nextest-long: 30 s\n#[test]\nfn b_long() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+nc_sub "$NC_CFG" $'\n'"$NC_GROUP" $'\n[[profile.default.overrides]]\nfilter = \'binary_id(fx::b) & test(=b_alone)\'\nthreads-required = "num-test-threads"\npriority = 100\n\n'"$NC_GROUP"
+printf "\n[[profile.default.overrides]]\nfilter = 'binary_id(fx::b) & test(=b_long)'\npriority = 30\n" >>"$NC_CFG"
+expect green "nextest-config: a long test beside a run-alone test in one binary is green" ncfg "$NC_DIR"
+nc_tree
+printf '\n// nextest-long: 20 s\nconst NOT_A_TEST: u8 = 0;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a long marker above no test is red" \
+    "b.rs:8: a .nextest-long:. marker above no .#.test.. binds nothing" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/b.rs" 'mod support;' $'// nextest-long: 20 s\n\nmod support;'
+expect_red_because "nextest-config: a long marker in a file's leading comments binds nothing" \
+    "b.rs:1: a .nextest-long:. marker above no .#.test.. binds nothing" ncfg "$NC_DIR"
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/orphan"
+printf '// nextest-long: 20 s\n#[test]\nfn lost() {}\n' >"$NC_DIR/crates/fx/tests/orphan/lost.rs"
+expect_red_because "nextest-config: a long marker in a file no binary compiles is red" \
+    "lost.rs:1: a .nextest-long:. marker in a file no test binary compiles" ncfg "$NC_DIR"
+nc_tree # fx::b and fxd::tiered both compile crates/fx/tests/common/mod.rs
+mkdir -p "$NC_DIR/crates/fx/tests/common"
+printf '// nextest-long: 20 s\n#[test]\nfn storm() {}\n' >"$NC_DIR/crates/fx/tests/common/mod.rs"
+printf '\nmod common;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+printf '\n#[path = "../../../crates/fx/tests/common/mod.rs"]\nmod common;\n' >>"$NC_DIR/bins/fxd/tests/tiered.rs"
+printf "\n[[profile.default.overrides]]\nfilter = 'binary_id(fx::b) & test(=common::storm)'\npriority = 20\n" >>"$NC_CFG"
+expect_red_because "nextest-config: a long test in an included file binds each binary under its path" \
+    "common/mod.rs:1: .fxd::tiered. test .common::storm. is marked long, and no long override" ncfg "$NC_DIR"
+printf "\n[[profile.default.overrides]]\nfilter = 'binary_id(fxd::tiered) & test(=common::storm)'\npriority = 20\n" \
+    >>"$NC_CFG"
+expect green "nextest-config: its long overrides name it by its module path in each binary" ncfg "$NC_DIR"
+# A library's statics reach every test binary that links it: its package's,
+# and those of each workspace package that depends on it.
+nc_lib_lock() { # fx's library holds a grouped lock; the group override names <filter>
+    nc_tree # with no long test: a group here may take a whole package
+    nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" $'// nextest-long: 20 s\n' ''
+    nc_sub "$NC_CFG" $'\n'"$NC_LONG" ''
+    printf '// nextest-group: serial\npub static SHARED: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' \
+        >"$NC_DIR/crates/fx/src/lib.rs"
+    printf "\n[[profile.default.overrides]]\nfilter = '%s'\ntest-group = \"serial\"\npriority = 50\n" "$1" \
+        >>"$NC_CFG"
+}
+nc_lib_lock 'binary_id(fx)'
+expect_red_because "nextest-config: a library's lock grouped for the library's own binary only is red" \
+    "lib.rs:2: test binary .fx::b. compiles this lock, and no override puts it in group .serial." \
+    ncfg "$NC_DIR"
+nc_lib_lock 'package(fx)'
+expect green "nextest-config: a library's lock grouped for its whole package is green" ncfg "$NC_DIR"
+printf '\n[dev-dependencies]\nfx = { path = "../../crates/fx" }\n' >>"$NC_DIR/bins/fxd/Cargo.toml"
+expect_red_because "nextest-config: a library's lock reaches a package that depends on it" \
+    "lib.rs:2: test binary .fxd::tiered. compiles this lock" ncfg "$NC_DIR"
+printf "\n[[profile.default.overrides]]\nfilter = 'package(fxd)'\ntest-group = \"serial\"\npriority = 50\n" \
+    >>"$NC_CFG"
+expect green "nextest-config: grouped in the dependent package too, it is green" ncfg "$NC_DIR"
+nc_lib_lock 'package(fx)'
+mkdir -p "$NC_DIR/crates/mid/src"
+printf '[package]\nname = "mid"\nversion = "0.0.0"\nedition = "2021"\n\n[lib]\ntest = false\n\n[dependencies]\nfx = { path = "../fx" }\n' \
+    >"$NC_DIR/crates/mid/Cargo.toml"
+: >"$NC_DIR/crates/mid/src/lib.rs"
+printf '[workspace]\nmembers = ["crates/fx", "crates/mid", "bins/fxd"]\nresolver = "2"\n' >"$NC_DIR/Cargo.toml"
+printf '\n[dev-dependencies]\nmid = { path = "../../crates/mid" }\n' >>"$NC_DIR/bins/fxd/Cargo.toml"
+expect_red_because "nextest-config: a library's lock reaches through a normal dependency's dependents" \
+    "lib.rs:2: test binary .fxd::tiered. compiles this lock" ncfg "$NC_DIR"
+nc_tree
+printf '/// Free space, which `statvfs` would read, is no oracle here.\npub fn held() -> u64 { 0 }\n' \
+    >"$NC_DIR/crates/fx/src/lib.rs"
+expect green "nextest-config: a library's comment may name a free-space call" ncfg "$NC_DIR"
+printf 'pub fn free() -> &'"'"'static str { "statvfs" }\n' >>"$NC_DIR/crates/fx/src/lib.rs"
+expect_red_because "nextest-config: a free-space read in a library integration tests link is red" \
+    "lib.rs:3: reads .statvfs. in a library integration tests link" ncfg "$NC_DIR"
+# Modules resolve as rustc resolves them: a `#[path]` file's own `mod` sits
+# beside it, and a declaration that resolves to no file is a scope error.
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/inc"
+printf '#[path = "inc/part.rs"]\nmod part;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+printf 'pub mod nested;\n' >"$NC_DIR/crates/fx/tests/inc/part.rs"
+printf 'pub fn free() -> &'"'"'static str { "statvfs" }\n' >"$NC_DIR/crates/fx/tests/inc/nested.rs"
+expect_red_because "nextest-config: a #[path] file's own module is read where rustc reads it" \
+    "inc/nested.rs:1: names .statvfs. in an integration-test target" ncfg "$NC_DIR"
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/inc"
+printf '#[path = "inc/part.rs"]\nmod part;\n' >>"$NC_DIR/crates/fx/tests/a.rs"
+printf 'pub mod nested;\n' >"$NC_DIR/crates/fx/tests/inc/part.rs"
+printf '// nextest-group: serial\npub static DEEP: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' \
+    >"$NC_DIR/crates/fx/tests/inc/nested.rs"
+expect green "nextest-config: a grouped lock in a #[path] file's own module binds its binary" ncfg "$NC_DIR"
+nc_tree
+printf 'mod missing;\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a module that resolves to no file is a scope error" \
+    "SCOPE ERROR: a module this gate cannot find would go unread: crates/fx/tests/b.rs:7: .mod missing;." \
+    ncfg "$NC_DIR"
+# One marker spelling: a comment that starts like a marker in another is red on
+# its line; a marker named in prose is no marker.
+nc_spelled() { # <label> <comment line>: the line above a new test in b.rs is red
+    nc_tree
+    printf '\n%s\n#[test]\nfn b_marked() {}\n' "$2" >>"$NC_DIR/crates/fx/tests/b.rs"
+    expect_red_because "nextest-config: a marker $1 is red" \
+        "b.rs:8: a comment spelled like a marker" ncfg "$NC_DIR"
+}
+nc_spelled "without its colon" '// nextest-alone - 2 s. The verdict reads a live rate.'
+nc_spelled "in capitals" '// Nextest-Alone: 2 s. The verdict reads a live rate.'
+nc_spelled "with a space before its colon" '// nextest-alone : 2 s. The verdict reads a live rate.'
+nc_spelled "in a block comment" '/* nextest-alone: 2 s. The verdict reads a live rate. */'
+nc_spelled "in a doc comment" '/// nextest-alone: 2 s. The verdict reads a live rate.'
+nc_spelled "with a word outside the five" '// nextest-solo: 2 s. The verdict reads a live rate.'
+nc_spelled "with a longer word" '// nextest-run-alone: 2 s. The verdict reads a live rate.'
+nc_spelled "with a dot" '// nextest.alone: 2 s. The verdict reads a live rate.'
+nc_spelled "long without its colon" '// nextest-long 20 s'
+nc_spelled "long with a space" '// nextest long: 20 s'
+nc_spelled "long with a longer word" '// nextest-longest: 20 s'
+nc_spelled "long with an underscore" '// nextest_long: 20 s'
+nc_tree
+printf '\n/// nextest runs each test in a process of its own.\n#[test]\nfn b_prose() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect green "nextest-config: prose that starts with the runner's name is no marker" ncfg "$NC_DIR"
+nc_tree
+printf '\n#[test] // nextest-alone: 2 s. The verdict reads a live rate.\nfn b_marked() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a marker beside code is red" \
+    "b.rs:8: a comment spelled like a marker" ncfg "$NC_DIR"
+nc_tree
+printf '\n/*\n// nextest-alone: 2 s. The verdict reads a live rate.\n*/\n#[test]\nfn b_marked() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a marker's line inside a block comment is red" \
+    "b.rs:9: a comment spelled like a marker" ncfg "$NC_DIR"
+nc_tree
+printf '\n// The whole target would need a `nextest-alone: <reason>` marker to run alone.\nfn helper() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect green "nextest-config: a marker named in prose is no marker" ncfg "$NC_DIR"
+# D4: CI installs the floor, --locked.
+nc_tree
+nc_sub "$NC_DIR/.github/workflows/ci.yml" '--locked ' ''
+expect_red_because "nextest-config: an install without --locked is red" \
+    "a cargo-nextest install names .--locked." ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/.github/workflows/ci.yml" '--version 0.9.150' '--version 0.9.149'
+expect_red_because "nextest-config: an install of another version is red" \
+    "ci.yml:4: a cargo-nextest install names .--locked. and .--version 0.9.150." ncfg "$NC_DIR"
+nc_tree
+printf '  other:\n    steps:\n      - run: cargo nextest run -p fx\n' >>"$NC_DIR/.github/workflows/ci.yml"
+expect_red_because "nextest-config: a job that runs nextest with no install is red" \
+    "ci.yml:8: job .other. runs cargo nextest and installs no cargo-nextest" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/.github/workflows/ci.yml" '      - run: cargo install' '      # - run: cargo install'
+printf '  other:\n    steps:\n      - run: cargo install --locked cargo-nextest --version 0.9.150\n' \
+    >>"$NC_DIR/.github/workflows/ci.yml"
+expect_red_because "nextest-config: a commented-out install installs nothing" \
+    "ci.yml:5: job .test. runs cargo nextest and installs no cargo-nextest" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/.github/workflows/ci.yml" $'      - run: cargo install --locked cargo-nextest --version 0.9.150\n' ''
+expect_red_because "nextest-config: no install in any workflow is a scope error" \
+    "SCOPE ERROR: no cargo-nextest install in any workflow" ncfg "$NC_DIR"
+# D7: no free-space read; each MEM-BUDGET file states its stall bound or why
+# no write parks.
+nc_tree
+printf 'fn free() -> &'"'"'static str { "statvfs" }\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: a free-space read in an integration test is red" \
+    "b.rs:7: names .statvfs. in an integration-test target" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'// nextest-stall-default: no write reaches a window, so no write parks.\n' ''
+expect_red_because "nextest-config: a MEM-BUDGET file with neither the key nor the marker is red" \
+    "boot.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/b.rs" 'mod support;' $'// nextest-stall-default: a file naming no budget\n\nmod support;'
+expect_red_because "nextest-config: a stall marker in a file naming no budget is red" \
+    "b.rs:1: a .nextest-stall-default:. marker binds nothing" ncfg "$NC_DIR"
+# The stall rule reads code: a key in a comment, or a stall key named inside
+# prose, neither makes a budget file nor states its bound.
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'// nextest-stall-default: no write reaches a window, so no write parks.\n' \
+    $'// Runs at the product\'s TAIL-STALL-TIMEOUT default.\n'
+expect_red_because "nextest-config: a stall key named in a comment states no bound" \
+    "boot.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'// nextest-stall-default: no write reaches a window, so no write parks.\n' \
+    $'// Pass b"TAIL-STALL-TIMEOUT" to state the bound.\n'
+expect_red_because "nextest-config: the stall key's literal inside a comment states no bound" \
+    "boot.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" 'b"TAIL-STALL-TIMEOUT", b"60000"' 'b"8mb at the TAIL-STALL-TIMEOUT default", b""'
+expect_red_because "nextest-config: a stall key inside prose states no bound" \
+    "tiered.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" 'b"MEM-BUDGET", b"8mb", ' ''
+expect green "nextest-config: a file naming MEM-BUDGET only in a comment is no budget file" ncfg "$NC_DIR"
+nc_sub "$NC_DIR/bins/fxd/tests/tiered.rs" '//! Writes' $'// nextest-stall-default: no write parks.\n//! Writes'
+expect_red_because "nextest-config: so a stall marker there binds nothing" \
+    "tiered.rs:1: a .nextest-stall-default:. marker binds nothing" ncfg "$NC_DIR"
+# Each remaining rule, planted once.
+nc_tree
+nc_sub "$NC_CFG" 'test-group = "serial"' 'test-group = "nogroup"'
+expect_red_because "nextest-config: a group override naming no group is red" \
+    "override 3 names test group .nogroup., which .test-groups. lacks" ncfg "$NC_DIR"
+nc_tree
+printf 'static TABLE: std::sync::RwLock<()> = std::sync::RwLock::new(());\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: an unmarked static RwLock is red" "b.rs:7: a static lock with no" \
+    ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_CFG" "filter = 'binary_id(fx::a)'" "filter = 'binary_id(fx::a) & test(=a_one)'"
+expect_red_because "nextest-config: a one-test group override does not group a lock's binary" \
+    "a.rs:7: test binary .fx::a. compiles this lock, and no override puts it in group" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/crates/fx/tests/a.rs" '// nextest-group: serial' '// nextest-group: the serial one'
+expect_red_because "nextest-config: a group marker naming no group word is red" \
+    "a.rs:5: .nextest-group:. names no group" ncfg "$NC_DIR"
+nc_tree
+printf '// nextest-in-process:\npub static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' \
+    >"$NC_DIR/crates/fx/tests/support/mod.rs"
+expect_red_because "nextest-config: an in-process marker without its reason is red" \
+    "mod.rs:1: .nextest-in-process:. gives no reason" ncfg "$NC_DIR"
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/orphan"
+printf '// nextest-group: serial\npub static LOST: std::sync::Mutex<()> = std::sync::Mutex::new(());\n' \
+    >"$NC_DIR/crates/fx/tests/orphan/lost.rs"
+expect_red_because "nextest-config: a grouped lock in a file no binary compiles is red" \
+    "lost.rs:2: a grouped lock in a file no test binary compiles" ncfg "$NC_DIR"
+nc_tree
+mkdir -p "$NC_DIR/crates/fx/tests/orphan"
+printf '// nextest-alone: 2 s. A test no binary compiles.\n#[test]\nfn lost() {}\n' \
+    >"$NC_DIR/crates/fx/tests/orphan/lost.rs"
+expect_red_because "nextest-config: a run-alone marker in a file no binary compiles is red" \
+    "lost.rs:1: a .nextest-alone:. marker in a file no test binary compiles" ncfg "$NC_DIR"
+for nc_word in statfs f_bavail f_bfree; do
+    nc_tree
+    printf 'fn free() -> &'"'"'static str { "%s" }\n' "$nc_word" >>"$NC_DIR/crates/fx/tests/b.rs"
+    expect_red_because "nextest-config: $nc_word in an integration test is red" \
+        "b.rs:7: names .$nc_word. in an integration-test target" ncfg "$NC_DIR"
+done
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" $'// nextest-stall-default: no write reaches a window, so no write parks.\n' ''
+printf '\n// nextest-stall-default: no write reaches a window, so no write parks.\nfn helper() {}\n' \
+    >>"$NC_DIR/bins/fxd/tests/boot.rs"
+expect_red_because "nextest-config: a stall marker below the file's first item binds nothing" \
+    "boot.rs:16: a .nextest-stall-default:. marker binds nothing" ncfg "$NC_DIR"
+nc_tree
+nc_sub "$NC_DIR/bins/fxd/tests/boot.rs" 'nextest-stall-default: no write reaches a window, so no write parks.' \
+    'nextest-stall-default:'
+expect_red_because "nextest-config: a stall marker without its reason binds nothing" \
+    "boot.rs:8: a .nextest-stall-default:. marker binds nothing" ncfg "$NC_DIR"
+nc_tree
+printf '\n// nextest-alone: 2 s. A test in an included module.\n#[test]\nfn deep() {}\n' \
+    >>"$NC_DIR/crates/fx/tests/support/mod.rs"
+expect_red_because "nextest-config: a run-alone test in an included file binds each binary under its path" \
+    "test .support::deep. is marked to run alone" ncfg "$NC_DIR"
+nc_sub "$NC_CFG" $'\n'"$NC_GROUP" $'\n[[profile.default.overrides]]\nfilter = \'binary_id(fx::a) & test(=support::deep)\'\nthreads-required = "num-test-threads"\npriority = 100\n\n[[profile.default.overrides]]\nfilter = \'binary_id(fx::b) & test(=support::deep)\'\nthreads-required = "num-test-threads"\npriority = 100\n\n'"$NC_GROUP"
+expect green "nextest-config: its overrides name it by its module path in each binary" ncfg "$NC_DIR"
+nc_tree
+printf 'const CREATE: [&[u8]; 2] = [b"MEM-BUDGET", b"8mb"];\n' >>"$NC_DIR/crates/fx/tests/b.rs"
+expect_red_because "nextest-config: the stall rule reads crates/*/tests" \
+    "b.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+mkdir -p "$NC_DIR/tests"
+printf 'const CREATE: [&[u8]; 2] = [b"MEM-BUDGET", b"8mb"];\n' >"$NC_DIR/tests/loose.rs"
+expect_red_because "nextest-config: the stall rule reads tests/" \
+    "tests/loose.rs: names MEM-BUDGET, and neither states TAIL-STALL-TIMEOUT" ncfg "$NC_DIR"
+nc_tree
+printf '\nconst DOC: &str = "\nstatic FAKE: std::sync::Mutex<()> = std::sync::Mutex::new(());\n";\n' \
+    >>"$NC_DIR/crates/fx/tests/b.rs"
+expect green "nextest-config: a string's line that reads as a lock is no lock" ncfg "$NC_DIR"
+# Scope: what the gate reads must exist.
+nc_tree
+rm -f "$NC_CFG"
+expect_red_because "nextest-config: no config is a scope error" \
+    "SCOPE ERROR: .config/nextest.toml is missing" ncfg "$NC_DIR"
+nc_tree
+rm -f "$NC_DIR/.github/workflows/ci.yml"
+expect_red_because "nextest-config: no workflow is a scope error" \
+    "SCOPE ERROR: no workflow under .github/workflows" ncfg "$NC_DIR"
+nc_tree
+rm -f "$NC_DIR/Cargo.toml"
+expect_red_because "nextest-config: no workspace is a scope error" \
+    "SCOPE ERROR: cargo metadata exited" ncfg "$NC_DIR"
+nc_tree
+printf 'autotests = false\nautobins = false\n\n[lib]\ntest = false\n' >>"$NC_DIR/crates/fx/Cargo.toml"
+printf '[workspace]\nmembers = ["crates/fx"]\nresolver = "2"\n' >"$NC_DIR/Cargo.toml"
+expect_red_because "nextest-config: a workspace with no test binary is a scope error" \
+    "SCOPE ERROR: cargo metadata lists no test binary" ncfg "$NC_DIR"
+nc_tree
+printf '*.rs\n' >"$NC_DIR/.gitignore"
+expect_red_because "nextest-config: no .rs file git lists is a scope error" \
+    "SCOPE ERROR: git lists no .rs file" ncfg "$NC_DIR"
+nc_tree
+printf '\n[[test]]\nname = "ghost"\npath = "tests/ghost.rs"\n' >>"$NC_DIR/crates/fx/Cargo.toml"
+expect_red_because "nextest-config: a crate root that is no file is a scope error" \
+    "SCOPE ERROR: a module this gate cannot find would go unread: crates/fx/tests/ghost.rs" ncfg "$NC_DIR"
 }
 
 selftest_main "$SCRIPT_DIR/check-scripts-selftest.sh" "$@"

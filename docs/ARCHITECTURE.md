@@ -637,8 +637,12 @@ total, bounded and fuzzed.
 peer. Sending consumes a credit; draining the reply returns it. A sender out
 of credits parks until a credit returns. Replies need no credit, and each
 ring holds at least twice the credit count, so a reply can always be sent and
-draining never waits for space: there is no cycle in which two cells wait for
-each other.
+draining never waits for space. A reply a cell holds back past the drain that
+read its operation waits only on its own cell's loop, or on operations sent
+from credits no held-back operation can hold, each answered in a drain: general
+traffic leaves one credit toward each peer free, and only the publish fan's
+legs, one in flight toward each peer, take it. So there is no cycle in which
+two cells wait for each other.
 
 **Draining.** FABRIC-IN drains about 1,024 messages per iteration,
 round-robin over peers from a rotating starting point. Slots are consumed
@@ -1275,7 +1279,13 @@ Commands whose keys live on several cells run as small programs on the pump:
 - `DEL`, `UNLINK`, `EXISTS` and `TOUCH` count local keys directly and send one
   operation per remote key, then sum the results. If any leg fails, the reply
   is that error, never a partial sum.
-- `MGET` and `JSON.MGET` gather values from each owner in key order.
+- `MGET` gathers values from each owner in key order.
+- `JSON.MGET` sends one leg per owning cell, the command over that cell's
+  keys, with at most three legs in flight; a wider gather waits for its
+  oldest leg before it sends the next. The accepting cell charges the whole
+  reply to one `doc-max-reply-bytes` account: a reply over it answers
+  `ERR reply too large` and serves no element, a leg's error is the whole
+  reply, and the legs still in flight are awaited before the reply is sent.
 - `MSET` applies its local pairs, then sends one leg per remote pair and
   replies `OK` when all legs succeed. `MSETNX` across cells checks, then sets.
 - `RENAME` and `RENAMENX` across two owners read a snapshot of the source,
@@ -1300,7 +1310,10 @@ A channel is owned by the cell that owns `slot(channel)`. Subscriber state
 lives on the subscriber's own cell. When a cell gains its first subscriber to
 a channel, or loses its last, it tells the channel's owner. `PUBLISH` goes to
 the owner, which sends one fabric message per cell that has subscribers, not
-one per subscriber. Pattern subscriptions are kept on the subscriber's cell
+one per subscriber. The owner answers after every subscriber cell has
+acknowledged its delivery, and its fan uses the credit general traffic leaves
+free toward each peer, so it never waits behind unanswered publishes, its own
+cell's or a peer's. Pattern subscriptions are kept on the subscriber's cell
 too, and every cell holds a copy of the pattern index: when a cell gains its
 first subscriber to a pattern, or loses its last, it tells every cell. So any
 owner can find the cells with matching pattern subscribers without a global
@@ -1363,7 +1376,7 @@ background I/O is not budgeted and checkpoints are paced at a fixed rate.
 | Key / inline value | 255 B / 16 MiB − 1 | typed error |
 | Queued commands per connection | 1,024 (resume at 64) | stop receiving; TCP pushes back |
 | Remote ops / pending replies per connection, tested before each command | 32 / 256 | the pump dispatches no further command until replies arrive; one command then adds one op per remote key (at most 1,023 under the 1,024-argument cap) or one per other cell it reaches, so at most 31 plus one command's ops are in flight: 1,054 on a node of up to 1,024 cells |
-| Fabric credits per destination | 1,024 | sender waits for a credit |
+| Fabric credits per destination | 1,024 (1,023 for general traffic, one kept for the publish fan) | sender waits for a credit |
 | Fabric drain per iteration | about 1,024 messages (checked between 8-slot chunks, so it can overshoot by one chunk) | the rest next iteration |
 | Resumed futures per iteration | 1,024 | the rest next iteration |
 | Expirations per slice | 4,096 | the rest next slice |

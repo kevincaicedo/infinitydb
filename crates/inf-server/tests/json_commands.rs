@@ -500,8 +500,8 @@ fn get_reply_over_the_budget_answers_a_typed_error() {
 
 /// ADR-0099 D3/D4 at a lowered budget: all three amplification reaches
 /// from F-L15-01 refuse with the pinned phrasing, an in-budget reply is
-/// untouched, and the per-element commands answer the error as the
-/// element (array header already committed — the EXEC precedent).
+/// untouched, and `JSON.MGET` answers one refusal for the whole array, its
+/// healthy element included (ADR-0173 D1, D3).
 #[test]
 fn reply_budget_refuses_every_amplification_reach() {
     let mut db =
@@ -526,11 +526,9 @@ fn reply_budget_refuses_every_amplification_reach() {
     let newline = "n".repeat(30_000);
     db.run_str(&["JSON.SET", "a", "$", "[1,2,3]"]);
     assert_reply(&mut db, &["JSON.GET", "a", "NEWLINE", &newline, "$"], "-ERR reply too large\r\n");
-    // MGET: the healthy key's element survives beside the refused one.
-    let reply = db.run_str(&["JSON.MGET", "a", "deep", "$..*"]);
-    let text = String::from_utf8_lossy(&reply);
-    assert!(text.starts_with("*2\r\n$"), "healthy element first: {text:?}");
-    assert!(text.ends_with("-ERR reply too large\r\n"), "refused element: {text:?}");
+    // MGET: one account for the whole array, so the healthy key's element
+    // is not served beside the one that crosses it.
+    assert_reply(&mut db, &["JSON.MGET", "a", "deep", "$..*"], "-ERR reply too large\r\n");
     // ARRPOP: a popped element over the budget refuses the whole reply,
     // which is built before the pop commits, so nothing is popped
     // (ADR-0099 A1).
@@ -541,6 +539,23 @@ fn reply_budget_refuses_every_amplification_reach() {
 }
 
 const REFUSED: &str = "-ERR reply too large\r\n";
+
+/// One account for the whole `JSON.MGET` reply (ADR-0173 D1, D3): three
+/// 30,000-byte documents under a 64 KiB budget fit one by one (30,014 B an
+/// element) and cross together (90,046 B), so the reply is the refusal line
+/// and no element is served. Control: two of them (60,032 B) are served.
+#[test]
+fn mget_aggregate_over_the_reply_budget() {
+    let mut db = db_with_reply_budget(64 << 10);
+    let doc = format!("\"{}\"", "x".repeat(30_000));
+    for key in ["a", "b", "c"] {
+        assert_reply(&mut db, &["JSON.SET", key, "$", &doc], "+OK\r\n");
+    }
+    let element = bulk(&format!("[{doc}]"));
+    assert_eq!(element.len(), 30_014);
+    assert_reply_head(&mut db, &["JSON.MGET", "a", "b", "$"], &format!("*2\r\n{element}{element}"));
+    assert_reply_head(&mut db, &["JSON.MGET", "a", "b", "c", "$"], REFUSED);
+}
 
 /// A printable head of a reply or argument: the amplified replies below are
 /// hundreds of kilobytes, and a mismatch message needs only their shape.
@@ -1214,8 +1229,6 @@ enum Settlement {
     /// The general path behind a fixed reservation: budget < M(shape) or
     /// the final reply's bytes > budget.
     FixedThenCharged(FixedShape),
-    /// `JSON.MGET`: each element against its own account.
-    PerElement,
 }
 
 /// The fixture's arm, and the witness that proves the arm ran.
@@ -1295,7 +1308,7 @@ fn float_leaves() -> (&'static [(&'static str, &'static str)], &'static str, &'s
 fn reply_fixtures() -> Vec<Fixture> {
     use Arm::{Fast, General, Path, Plain, Root};
     use FixedShape::{Count, Number, Status, Toggle};
-    use Settlement::{Charged, Fixed, FixedThenCharged, PerElement};
+    use Settlement::{Charged, Fixed, FixedThenCharged};
     let ok = "+OK\r\n";
     let (float_docs, float_resp2, float_resp3) = float_leaves();
     vec![
@@ -1352,7 +1365,7 @@ fn reply_fixtures() -> Vec<Fixture> {
             fx(
                 "JSON.MGET",
                 Plain,
-                PerElement,
+                Charged,
                 &[("k1", r#"{"a":1}"#), ("k2", r#"{"a":22}"#)],
                 &["JSON.MGET", "k1", "k2", "$.a"],
                 "*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
@@ -1876,38 +1889,6 @@ fn leg(f: &Fixture, proto: Protocol, budget: usize) -> Leg {
     Leg { reply, before, after, in_place }
 }
 
-/// The RESP elements of an `*N` reply (bulk, null or error lines): the
-/// per-element oracle compares element by element.
-fn elements(reply: &[u8]) -> Vec<&[u8]> {
-    let line_end =
-        |from: usize| from + reply[from..].windows(2).position(|w| w == b"\r\n").expect("CRLF") + 2;
-    let mut at = line_end(0);
-    let mut out = Vec::new();
-    while at < reply.len() {
-        let header_end = line_end(at);
-        let end = match reply[at] {
-            b'$' if reply[at + 1] != b'-' => {
-                let digits = std::str::from_utf8(&reply[at + 1..header_end - 2]).expect("digits");
-                header_end + digits.parse::<usize>().expect("length") + 2
-            }
-            _ => header_end,
-        };
-        out.push(&reply[at..end]);
-        at = end;
-    }
-    out
-}
-
-fn per_element_refusal(served: &[u8], budget: usize) -> Vec<u8> {
-    let count = elements(served).len();
-    let mut want = format!("*{count}\r\n").into_bytes();
-    for element in elements(served) {
-        let refused = element.len() > budget;
-        want.extend_from_slice(if refused { REFUSED.as_bytes() } else { element });
-    }
-    want
-}
-
 /// The fixture's declared arm, checked on a served leg — an arm whose
 /// witness did not move is VACUOUS, and VACUOUS is red.
 fn assert_engaged(f: &Fixture, leg: &Leg, what: &str) {
@@ -1950,13 +1931,7 @@ fn check_fixture(f: &Fixture, proto: Protocol) {
     assert_engaged(f, &served, &what("(a)"));
     let length = served.reply.len();
     // (b) a zero budget refuses before any effect.
-    let zero = match f.settlement {
-        Settlement::PerElement => per_element_refusal(&served.reply, 0),
-        Settlement::Charged | Settlement::Fixed(_) | Settlement::FixedThenCharged(_) => {
-            REFUSED.as_bytes().to_vec()
-        }
-    };
-    assert_refused(&leg(f, proto, 0), &zero, &what("(b) budget 0"));
+    assert_refused(&leg(f, proto, 0), REFUSED.as_bytes(), &what("(b) budget 0"));
     // (c) the boundary pair B, B − 1.
     let boundary = match f.settlement {
         Settlement::Charged => length,
@@ -1965,7 +1940,6 @@ fn check_fixture(f: &Fixture, proto: Protocol) {
             shape.reply_bytes_max()
         }
         Settlement::FixedThenCharged(shape) => length.max(shape.reply_bytes_max()),
-        Settlement::PerElement => elements(&served.reply).iter().map(|e| e.len()).max().unwrap(),
     };
     let at = leg(f, proto, boundary);
     let at_what = what(&format!("(c) served at B = {boundary}"));
@@ -1973,13 +1947,8 @@ fn check_fixture(f: &Fixture, proto: Protocol) {
     assert!(at.after == served.after, "{at_what}: post-state differs from (a)");
     assert_engaged(f, &at, &at_what);
     let below = leg(f, proto, boundary - 1);
-    let below_want = match f.settlement {
-        Settlement::PerElement => per_element_refusal(&served.reply, boundary - 1),
-        Settlement::Charged | Settlement::Fixed(_) | Settlement::FixedThenCharged(_) => {
-            REFUSED.as_bytes().to_vec()
-        }
-    };
-    assert_refused(&below, &below_want, &what(&format!("(c) refused at B - 1 = {}", boundary - 1)));
+    let below_what = what(&format!("(c) refused at B - 1 = {}", boundary - 1));
+    assert_refused(&below, REFUSED.as_bytes(), &below_what);
 }
 
 /// ADR-0099 A1's oracle: every `JSON.*` registry row has a fixture, and

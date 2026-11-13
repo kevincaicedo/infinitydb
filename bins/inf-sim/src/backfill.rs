@@ -150,6 +150,7 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         stop_tick: false,
         fill_dense: false,
         wake: WakeLeg::OFF,
+        mget_audits: None,
     }
 }
 

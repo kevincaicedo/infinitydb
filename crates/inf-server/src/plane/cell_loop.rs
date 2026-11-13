@@ -1153,6 +1153,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     fn maintain_conn_sweep(&mut self, cx: &mut LoopCx<'_>) {
         let node = &self.shared.node;
         node.recv_dropped.set(self.shared.recv_dropped.get());
+        node.waker_foreign_ops.set(cx.executor.waker_foreign_ops());
         node.accept_errors.set(self.shared.accept_errors.get());
         node.timers_armed_max.set(u64::from(cx.timers().armed_max()));
         node.fabric_rtt_p50_ns.set(self.shared.rtt_ns.borrow().percentile(50.0));

@@ -110,7 +110,7 @@ pub(crate) struct DocModel {
 }
 
 impl DocModel {
-    fn render(&self) -> Vec<u8> {
+    pub(crate) fn render(&self) -> Vec<u8> {
         let corpus = corpus_documents();
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(
@@ -157,6 +157,9 @@ pub(crate) fn next_document_command(
     scenario: &DurableScenario,
 ) -> (Vec<u8>, Pending) {
     let key = writer.key(scenario.keys_per_writer);
+    if let Some(send) = crate::durable::next_audit_command(writer, scenario, &key) {
+        return send;
+    }
     let corpus = corpus_documents();
     if !writer.models.contains_key(&key) || writer.sent.is_multiple_of(96) {
         let blob = if writer.rng.next_below(2) == 0 {

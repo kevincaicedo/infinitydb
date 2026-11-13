@@ -20,9 +20,11 @@ use inf_alloc::BufferPool;
 use inf_foundation::CellId;
 use inf_foundation::bounded::{Cap, CapCensus, CapFill, CensusPhase};
 use inf_foundation::time::{Nanos, StdClock, VirtualClock};
+use inf_runtime::limits::PARK_CEILING_MAX;
 use inf_runtime::{
     BackendDriver, Capabilities, CellLoop, CellPlane, Completion, GroupClass, IoOp, LoopConfig,
-    LoopCx, Reserved, SubmitStats, TimerNotice, TimerOutcome, TimerOwner, TimerSet, Wait,
+    LoopCx, ParkCeiling, ParkCeilingTooLong, Reserved, SubmitStats, TimerNotice, TimerOutcome,
+    TimerOwner, TimerSet, Wait,
 };
 
 /// The runtime fixture's timer positions: one, which the timer test
@@ -287,7 +289,7 @@ impl CellPlane for TimerPlane {
 fn armed_timer_fires_through_the_loop() {
     let config = LoopConfig {
         spin_iters: 0,
-        park_default: Some(Duration::from_millis(1)),
+        park_default: ParkCeiling::new(Duration::from_millis(1)).expect("within the maximum"),
         ..LoopConfig::default()
     };
     let (mut lp, owners) = test_loop_owning(config, 1);
@@ -470,7 +472,8 @@ fn a_task_woken_in_maintain_is_polled_before_any_park() {
     for spin_iters in [1, 0] {
         let mut lp = test_loop(LoopConfig {
             spin_iters,
-            park_default: Some(Duration::from_secs(10)),
+            // Ten seconds asked for, above the maximum: the loop takes the maximum.
+            park_default: ParkCeiling::new(Duration::from_secs(10)).unwrap_or(ParkCeiling::MAX),
             ..LoopConfig::default()
         });
         let mut plane = WakeInMaintain {
@@ -549,8 +552,8 @@ fn sixty_five_due_timers_take_two_turns_and_no_park() {
         let clock = Rc::new(VirtualClock::new(Nanos::from_millis(10)));
         let (census, serve_mark) = CapCensus::new(CellId(0));
         let (timers, owners) = timer_set(COHORT_OWNERS, &census, 65);
-        let config =
-            LoopConfig { spin_iters, park_default: Some(park_default), ..LoopConfig::default() };
+        let ceiling = ParkCeiling::new(park_default).expect("within the maximum");
+        let config = LoopConfig { spin_iters, park_default: ceiling, ..LoopConfig::default() };
         let mut lp = CellLoop::new(
             NullDriver::default(),
             Rc::clone(&clock),
@@ -650,5 +653,123 @@ fn a_turns_cold_delivery_precedes_a_woken_tasks_poll_in_both_modes() {
         delivery_order(true),
         marks,
         "with remote_first_execute a woken task polled before the turn's delivery"
+    );
+}
+
+/// A driver whose park, once the plane has exported a parked task's waker, wakes that waker from
+/// another thread while it parks: a foreign wake pushed during the park, which rings no doorbell.
+/// It records each park's timeout.
+#[derive(Default)]
+struct ForeignWakeDriver {
+    park_timeouts: Vec<Option<Duration>>,
+    waker: std::sync::Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    /// The park, by its index, during which the foreign wake was pushed.
+    woken_in: Option<usize>,
+}
+
+impl BackendDriver for ForeignWakeDriver {
+    fn push(&mut self, _op: IoOp) {}
+    fn submit_and_reap(
+        &mut self,
+        _pool: &mut BufferPool,
+        wait: Wait,
+        _out: &mut Vec<Completion>,
+    ) -> io::Result<usize> {
+        if let Wait::Park { timeout } = wait {
+            self.park_timeouts.push(timeout);
+            let exported = self.waker.lock().expect("the waker slot").take();
+            if let Some(waker) = exported {
+                std::thread::spawn(move || waker.wake()).join().expect("the waking thread");
+                self.woken_in = Some(self.park_timeouts.len() - 1);
+            }
+        }
+        Ok(0)
+    }
+    fn register_pool(&mut self, _pool: &mut BufferPool) -> io::Result<()> {
+        Ok(())
+    }
+    fn capabilities(&self) -> Capabilities {
+        NullDriver::default().capabilities()
+    }
+    fn submit_stats(&self) -> SubmitStats {
+        SubmitStats::default()
+    }
+}
+
+/// Spawns one task in its first PARSE that parks, puts a clone of its waker where the driver
+/// reads it, and finishes on its next poll; it counts the task's polls.
+struct ExportParked {
+    waker: std::sync::Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    polls: Rc<std::cell::Cell<u32>>,
+    spawned: bool,
+}
+
+impl CellPlane for ExportParked {
+    fn on_completion(&mut self, _cx: &mut LoopCx<'_>, _c: Completion) {}
+    fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
+        if self.spawned {
+            return;
+        }
+        self.spawned = true;
+        let slot = std::sync::Arc::clone(&self.waker);
+        let polls = Rc::clone(&self.polls);
+        cx.executor.spawn_local(core::future::poll_fn(move |cx| {
+            polls.set(polls.get() + 1);
+            if polls.get() > 1 {
+                return std::task::Poll::Ready(());
+            }
+            *slot.lock().expect("the waker slot") = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }));
+    }
+    fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+}
+
+/// Every park a cell loop issues carries a timeout of at most its ceiling (ADR-0003 A1.2.7), and
+/// a foreign wake pushed during a park, the only ready task, is drained and polled by the
+/// iteration that park opens. A ceiling above `PARK_CEILING_MAX` is refused.
+#[test]
+fn an_idle_park_carries_its_ceiling() {
+    let over = PARK_CEILING_MAX + Duration::from_nanos(1);
+    assert_eq!(
+        ParkCeiling::new(over),
+        Err(ParkCeilingTooLong { asked: over }),
+        "a ceiling one nanosecond above the maximum is refused"
+    );
+    assert_eq!(ParkCeiling::new(PARK_CEILING_MAX), Ok(ParkCeiling::MAX));
+    let ceiling = ParkCeiling::new(Duration::from_millis(7)).expect("within the maximum");
+    let driver = ForeignWakeDriver::default();
+    let mut plane = ExportParked {
+        waker: std::sync::Arc::clone(&driver.waker),
+        polls: Rc::default(),
+        spawned: false,
+    };
+    let (census, serve_mark) = CapCensus::new(CellId(0));
+    let (timers, _) = timer_set(FIXTURE_OWNERS, &census, 0);
+    let config = LoopConfig { spin_iters: 0, park_default: ceiling, ..LoopConfig::default() };
+    let mut lp = CellLoop::new(
+        driver,
+        StdClock::new(),
+        BufferPool::new(4, 1024),
+        config,
+        serve_mark,
+        timers,
+    );
+    let first = lp.run_iteration(&mut plane).expect("iteration");
+    assert_eq!((first.parked, first.polled), (false, 1), "the task is spawned and parks");
+    let woken = lp.run_iteration(&mut plane).expect("iteration");
+    assert_eq!(lp.driver().woken_in, Some(0), "the foreign wake was pushed during the first park");
+    assert!(woken.parked, "the iteration opened with a park");
+    assert_eq!(woken.polled, 1, "the park's own iteration drained the wake and polled the task");
+    assert_eq!(plane.polls.get(), 2);
+    assert_eq!(lp.executor().waker_foreign_ops(), 1, "one foreign wake, which consumed its waker");
+    for _ in 0..3 {
+        lp.run_iteration(&mut plane).expect("iteration");
+    }
+    let timeouts = &lp.driver().park_timeouts;
+    assert!(timeouts.len() >= 3, "the idle loop parked: {timeouts:?}");
+    assert!(
+        timeouts.iter().all(|t| t.is_some_and(|t| t <= ceiling.get())),
+        "every park carries a timeout of at most its ceiling: {timeouts:?}"
     );
 }

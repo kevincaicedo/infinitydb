@@ -19,6 +19,9 @@
 //! - `default_blob_threshold_derives_from_the_ring` — the pre-fix default
 //!   (16 MiB regardless of the ring) is exactly what let F-L06-01 in.
 
+// nextest-stall-default: the store sits below the server plane, which alone
+// arms the tail stall (ADR-0053 D4): no write here waits on it.
+
 use inf_alloc::REGION_PAGE_BYTES;
 use inf_log::{FsyncClass, NsId};
 use inf_store::{

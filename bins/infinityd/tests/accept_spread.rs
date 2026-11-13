@@ -5,27 +5,24 @@
 //! (ADR-0128). Pre-fix on macOS: 32 connections, `cell:0` × 32.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // harness process, not cell code
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 const CELLS: u16 = 2;
 const CONNS: usize = 32;
 
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 fn spawn(tag: &str, extra: &[&str]) -> Server {
@@ -41,9 +38,8 @@ fn spawn(tag: &str, extra: &[&str]) -> Server {
         .to_string();
     // `INF_ACCEPT_SPREAD_BIN` points the suite at another build — the
     // review's pre-fix red (batch 70) ran it against the batch-69 binary.
-    let bin = std::env::var("INF_ACCEPT_SPREAD_BIN")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_infinityd").to_string());
-    let child = Command::new(bin)
+    let child = NodeBinary::built_or("INF_ACCEPT_SPREAD_BIN")
+        .command()
         .args(["--port", &port, "--cells", &CELLS.to_string(), "--data-dir"])
         .arg(&dir)
         .args(["--device-probe", "off"])

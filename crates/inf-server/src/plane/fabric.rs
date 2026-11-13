@@ -657,30 +657,10 @@ pub(super) fn flush_apply_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone
     stage_bytes.clear();
 }
 
-/// One MGET position: rendered locally at dispatch, or one remote `GET`.
+/// One `MGET` position: rendered locally at dispatch, or one remote `GET`.
 pub(super) enum GatherPart {
     Done(OwnedReply),
     Wait(GateWait<u64, OwnedOutcome>),
-}
-
-/// The element a single-key `JSON.MGET` sub-reply contributes to the
-/// gathered array (M3-S11 gather; ADR-0041 D9): an `Error` reply is pasted
-/// untouched (an error is a legal RESP array element); a `Success` reply
-/// is a one-element array, its `*1\r\n` header stripped. Which is decided
-/// by the reply's outcome, never by its bytes (ADR-0190 D2).
-pub(super) fn gather_element(reply: &OwnedReply) -> &[u8] {
-    let view = match reply.success() {
-        Ok(view) => view,
-        Err(ErrorPassthrough) => return reply.bytes(),
-    };
-    // reply-outcome-allow: the shape strip of a SuccessView, whose outcome success() read
-    match view.bytes().strip_prefix(b"*1\r\n") {
-        Some(element) => element,
-        None => {
-            debug_assert!(false, "a Success JSON.MGET sub-reply is a one-element array");
-            view.bytes()
-        }
-    }
 }
 
 /// The wire form of a staged reply (ADR-0190 D3): the tag is set from the

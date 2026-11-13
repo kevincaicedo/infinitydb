@@ -337,6 +337,9 @@ pub struct SimDriver {
     /// blocks on it, since the scheduler owns virtual time, so this is what
     /// a park asked for: its timeout, read by the oracles.
     wait: Option<Wait>,
+    /// Each entry's tier writes by namespace directory, when a leg's clause
+    /// reads them ([`SimDriver::tallying_tier_dirs`]).
+    tier_dirs: Option<TierDirTally>,
 }
 
 /// One deferred op: applied AND completed only once the virtual clock
@@ -396,6 +399,32 @@ pub struct ObservedIo {
     pub tier_pass_ops_max: u64,
 }
 
+/// One namespace directory's tier writes in one driver entry: the writes
+/// whose file has an OS name under `ns-<ns>`, and their bytes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TierDirWrites {
+    pub ns: u32,
+    pub writes: u64,
+    pub bytes: u64,
+}
+
+/// The tier writes of each driver entry by namespace directory: a turn's
+/// shape read from the device's side. A driver op carries an fd and a
+/// token, so each write is keyed by the `ns-<id>` component of an OS name
+/// of the file its fd is open on, read from the sim disk at the entry;
+/// the token's lane, the server's own recycled allocation, is never read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TierDirTally {
+    /// Driver entries so far: the entry [`Self::entry`] belongs to.
+    pub entries: u64,
+    /// The last entry's tier writes, one row a directory, in the order of
+    /// each directory's first write.
+    pub entry: Vec<TierDirWrites>,
+    /// Tier writes over the driver's life whose file has no OS name under
+    /// a `ns-<id>` directory: a shape read from no file.
+    pub unnamed_writes: u64,
+}
+
 impl ObservedIo {
     fn note(&mut self, token: CompletionToken, bytes: u64) {
         if let Some(class) = IoClass::of(token.class()) {
@@ -419,7 +448,22 @@ impl SimDriver {
             stats: SubmitStats::default(),
             observed: ObservedIo::default(),
             wait: None,
+            tier_dirs: None,
         }
+    }
+
+    /// The same driver, keeping each entry's tier writes by namespace
+    /// directory ([`TierDirTally`]): one pass over the sim disk's OS names
+    /// per tier write, so only a leg whose clause reads the tally asks.
+    #[must_use]
+    pub fn tallying_tier_dirs(self) -> SimDriver {
+        SimDriver { tier_dirs: Some(TierDirTally::default()), ..self }
+    }
+
+    /// The tally of each entry's tier writes by namespace directory, on a
+    /// driver that keeps it.
+    pub fn tier_dirs(&self) -> Option<&TierDirTally> {
+        self.tier_dirs.as_ref()
     }
 
     /// The wait the loop handed the last `submit_and_reap`, `None` before
@@ -477,11 +521,11 @@ impl SimDriver {
         self.observed
     }
 
-    /// Tier-class bytes and ops pushed and not yet submitted — what a cut
-    /// catches between the plane's push and the next driver entry; the
-    /// accounting oracle adds them to the observed ledger for an exact
-    /// equality.
-    pub fn queued_tier_io(&self) -> (u64, u64) {
+    /// A planted canary's reader: the tier bytes and ops in the driver's own
+    /// queue, which every entry drains, read by the spend's step check in
+    /// place of the cell loop's queue.
+    #[cfg(inf_canary_tier_spend_driver_queue)]
+    pub fn driver_queue_tier_io(&self) -> (u64, u64) {
         tier_io_of(&self.ops)
     }
 
@@ -579,7 +623,7 @@ fn release_held_reads(disk: Option<&SimDisk>, held_reads: &mut Vec<IoOp>, ops: &
 }
 
 /// The tier-class bytes and ops among `ops`, by each op's token class.
-fn tier_io_of(ops: &[IoOp]) -> (u64, u64) {
+pub(crate) fn tier_io_of(ops: &[IoOp]) -> (u64, u64) {
     let is_tier = |token: CompletionToken| IoClass::of(token.class()) == Some(IoClass::TierFlush);
     let mut tally = (0u64, 0u64);
     for op in ops {
@@ -600,6 +644,41 @@ fn tier_io_of(ops: &[IoOp]) -> (u64, u64) {
         }
     }
     tally
+}
+
+/// One driver entry's tier writes folded into `tally` by the namespace
+/// directory each write's file sits in.
+fn tally_tier_dirs(disk: Option<&SimDisk>, ops: &[IoOp], tally: &mut TierDirTally) {
+    tally.entries += 1;
+    tally.entry.clear();
+    for op in ops {
+        let IoOp::LogWrite { fd, data, token, .. } = op else { continue };
+        if IoClass::of(token.class()) != Some(IoClass::TierFlush) {
+            continue;
+        }
+        let names = disk.map(|disk| disk.file_fd_names(*fd)).unwrap_or_default();
+        let Some(ns) = names.iter().find_map(|name| ns_dir_of(name)) else {
+            tally.unnamed_writes += 1;
+            continue;
+        };
+        let bytes = u64::from(data.len());
+        match tally.entry.iter_mut().find(|row| row.ns == ns) {
+            Some(row) => {
+                row.writes += 1;
+                row.bytes += bytes;
+            }
+            None => tally.entry.push(TierDirWrites { ns, writes: 1, bytes }),
+        }
+    }
+}
+
+/// The `<id>` of the `ns-<id>` directory right under a `shard-N` directory
+/// that `path` sits in: how the data directory lays out a namespace's
+/// files. `None` for any other path.
+fn ns_dir_of(path: &std::path::Path) -> Option<u32> {
+    let mut parts = path.components().map(|part| part.as_os_str().to_str());
+    parts.find(|part| part.is_some_and(|part| part.starts_with("shard-")))?;
+    parts.next()??.strip_prefix("ns-")?.parse().ok()
 }
 
 /// Queue a deferred op in due order. Write-through and plain-write draws
@@ -707,6 +786,9 @@ impl BackendDriver for SimDriver {
         let (tier_bytes, tier_ops) = tier_io_of(&self.ops);
         self.observed.tier_pass_bytes_max = self.observed.tier_pass_bytes_max.max(tier_bytes);
         self.observed.tier_pass_ops_max = self.observed.tier_pass_ops_max.max(tier_ops);
+        if let Some(tally) = self.tier_dirs.as_mut() {
+            tally_tier_dirs(self.disk.as_ref(), &self.ops, tally);
+        }
 
         // M2.5-S14: release fsyncs whose device service time elapsed.
         // The flush is deferred WITH the completion — during the stall
@@ -1079,5 +1161,24 @@ impl BackendDriver for SimDriver {
 
     fn submit_stats(&self) -> SubmitStats {
         self.stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ns_dir_of;
+    use std::path::Path;
+
+    /// A tier file is keyed by the `ns-<id>` directory right under its
+    /// shard; a log segment, a namespace-like name outside a shard and a
+    /// malformed id key nothing.
+    #[test]
+    fn a_tier_file_is_keyed_by_its_namespace_directory() {
+        assert_eq!(ns_dir_of(Path::new("node/shard-1/ns-16/cold/tier-000000.itier")), Some(16));
+        assert_eq!(ns_dir_of(Path::new("/data/shard-0/ns-7/cold/tier-000003.itier")), Some(7));
+        assert_eq!(ns_dir_of(Path::new("node/shard-0/seg-000000.ilog")), None);
+        assert_eq!(ns_dir_of(Path::new("ns-3/shard-0/seg-000000.ilog")), None);
+        assert_eq!(ns_dir_of(Path::new("node/shard-0/ns-x/cold/tier-000000.itier")), None);
+        assert_eq!(ns_dir_of(Path::new("node/shard-0")), None);
     }
 }

@@ -74,6 +74,7 @@ use inf_wire::{
 mod cache_boot_tests;
 mod cell_loop;
 mod conn;
+mod credit;
 mod dispatch;
 mod fabric;
 mod ns_ddl;
@@ -86,17 +87,26 @@ mod seed_tests;
 mod shared;
 mod tiered;
 mod timers;
+// The owner split's one caller is the JSON gather, so both carry its feature.
+#[cfg(feature = "doc")]
+mod json_gather;
+#[cfg(feature = "doc")]
+mod split;
 
 pub use conn::OwnedOutcome;
 use conn::{CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
+use credit::{FanLegs, FanReserve, PlaneFabric, PointOp, PubFanArgv};
+pub use credit::{MeshConfigRefused, checked_mesh_config};
 use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
 use fabric::{
-    GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, gather_element,
-    handle_fabric_op, parse_stageable, stage_argv_block_argv, stage_or_handle, staged_outcome,
-    wire_reply,
+    GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op,
+    parse_stageable, stage_argv_block_argv, stage_or_handle, staged_outcome, wire_reply,
 };
+#[cfg(feature = "doc")]
+pub use json_gather::parse_json_mget_leg;
 use ns_ddl::{
-    SendNow, dispatch_ns, program_ckpt, program_ns_ddl, send_apply, send_apply_ns, try_send_apply,
+    SendNow, dispatch_ns, program_ckpt, program_ns_ddl, send_apply, send_apply_ns, send_fan_leg,
+    try_send_apply,
 };
 use publish::{
     dispatch_pubsub, enforce_output_cap, flush_sub_deltas, handle_pubsub_apply, owner_pub_pump,
@@ -260,7 +270,7 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// injected-clock instant (fabric service continues — deadlock safety).
     stall_until: Cell<Nanos>,
     store: RefCell<Keyspace>,
-    fabric: RefCell<CellFabric>,
+    fabric: RefCell<PlaneFabric>,
     conns: RefCell<ConnSlab>,
     gate: FabricGate<OwnedOutcome>,
     credit_waiters: WaitList<CellId>,
@@ -314,6 +324,10 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// queue preserves per-publisher delivery order across fan-outs).
     pub_queue: RefCell<VecDeque<OwnerPub>>,
     pub_pump_active: Cell<bool>,
+    /// The cell's one publish-fan reserve (ADR-0192 D3): parked here while
+    /// no owner pump runs; the pump takes it at its start and puts it back
+    /// in the step that clears `pub_pump_active`.
+    fan_reserve: Cell<Option<FanReserve>>,
     /// The connection knobs (ADR-0123 D5): `maxclients` share, `timeout`,
     /// `tcp-keepalive`, both output-buffer classes — read at assembly,
     /// refreshed by the MAINTAIN config sweep.
@@ -772,6 +786,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         node.cap_census.replace(Some(Rc::clone(&census)));
         // ADR-0123 D5: the connection knobs before the first accept.
         let knobs = crate::config::conn_knobs(&node.config.borrow(), cells);
+        let (fabric, fan_reserve) = PlaneFabric::new(fabric);
         let plane = ServerPlane {
             shared: Rc::new(Shared {
                 cell,
@@ -804,6 +819,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 pubsub: RefCell::new(PubSubCell::new(cells)),
                 pub_queue: RefCell::new(VecDeque::new()),
                 pub_pump_active: Cell::new(false),
+                fan_reserve: Cell::new(Some(fan_reserve)),
                 knobs: Cell::new(knobs),
                 parser_limits: Cell::new(ParserLimits::default()),
                 durable: RefCell::new(None),
@@ -1474,7 +1490,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
         let mut fabric = shared.fabric.borrow_mut();
         let token = fabric.next_token();
-        if fabric.send(to, &Op::AdoptConn { token, fd }).is_err() {
+        // A general send: a refusal, the reserve's included, keeps the
+        // socket local, as a peer without credit always did.
+        if fabric.stage_general(to, &PointOp::adopt_conn(token, fd)).is_err() {
             return false;
         }
         shared.adopt_acks.borrow_mut().push(token.0);

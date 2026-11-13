@@ -4,7 +4,7 @@
 //! scheduler groups, and the 10-step reactor loop.
 //!
 //! This is the only crate allowed to name io_uring/kqueue symbols (§3.3).
-//! `unsafe` is confined to three audited areas — backend FFI, the Rc waker
+//! `unsafe` is confined to three audited areas — backend FFI, the waker
 //! vtable, and type-erased task storage — see `SAFETY.md`.
 //!
 //! Backends: `UringDriver` (Linux, `--features uring`, the performance
@@ -65,7 +65,9 @@ pub use driver::{
 };
 pub use executor::{CellExecutor, PollImmediate, TaskId};
 pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};
-pub use reactor::{CellLoop, CellPlane, IterStats, LoopConfig, LoopCx};
+pub use reactor::{
+    CellLoop, CellPlane, IterStats, LoopConfig, LoopCx, ParkCeiling, ParkCeilingTooLong,
+};
 pub use sched::{GroupClass, GroupScheduler};
 pub use timer::{
     ArmError, Cancelled, Closed, Consumed, OwnerPhase, Reserved, Successor, TimerArm, TimerNotice,

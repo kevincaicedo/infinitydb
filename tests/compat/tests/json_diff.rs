@@ -57,9 +57,9 @@ fn json_matrix_matches_pinned_redisjson() {
         candidate_roundtrip(&mut candidate, &["FLUSHALL"]);
 
         for case in JSON_CASES {
-            let argv = strings(case.argv);
+            let argv = case.args();
             let oracle_reply = oracle.roundtrip(&argv).expect("oracle command");
-            let candidate_reply = candidate_roundtrip(&mut candidate, case.argv);
+            let candidate_reply = candidate.execute_wire(&encode_command(&argv));
             match compare(case, protocol, &oracle_reply, &candidate_reply, DEVIATIONS) {
                 Ok(Comparison::Exact) => exact += 1,
                 Ok(Comparison::Allowed { deviation_index, semantic_equal: same }) => {

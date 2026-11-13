@@ -23,6 +23,7 @@ fn process_threads_children_and_all_generator_paths_observe_disjoint_masks() {
     let fixture = Fixture::new("cpu-placement");
     std::fs::write(fixture.0.join("observe-affinity"), "").unwrap();
     for name in ["redis-server", "dragonfly"] {
+        // node-spawn-allow: copies the fixture's Python stand-in named for the engine
         std::fs::copy(fixture.0.join("infinityd"), fixture.0.join(name)).unwrap();
     }
     let server = cpus[0].to_string();
@@ -110,7 +111,7 @@ fn invalid_or_uncontrolled_cpu_placement_refuses_before_launch_and_artifacts() {
 fn unavailable_failing_and_trimmed_taskset_cannot_silently_disable_pinning() {
     let fixture = Fixture::new("failed-taskset");
     let taskset = fixture.0.join("taskset");
-    let absent = Command::new(env!("CARGO_BIN_EXE_inf-compare"))
+    let absent = Command::new(fixture.bin())
         .current_dir(&fixture.0)
         .env("PATH", "")
         .args([

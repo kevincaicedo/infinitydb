@@ -45,7 +45,7 @@ use inf_foundation::CellId;
 use inf_foundation::fault::FaultSpec;
 use inf_foundation::time::{Clock, StdClock};
 use inf_runtime::net::{bound_port, listen_reuseport};
-use inf_runtime::{BackendDriver, CellLoop, LoopConfig, UringDriver};
+use inf_runtime::{CellLoop, LoopConfig, UringDriver};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
 use inf_store::{KeyspaceSeed, StoreConfig};
 
@@ -79,9 +79,8 @@ fn start_node(
         for &(point, spec) in &faults {
             inf_foundation::fault::arm(point, spec);
         }
-        let mut pool = BufferPool::new(256, 4096);
-        let mut driver = UringDriver::new(256).expect("uring");
-        driver.register_pool(&mut pool).expect("register");
+        let pool = BufferPool::new(256, 4096);
+        let driver = UringDriver::new(256).expect("uring");
         // The node's keyspace is cataloged, as `infinityd`'s (ADR-0189 D4).
         let seed = KeyspaceSeed::Cataloged {
             cfg: StoreConfig::default(),
@@ -111,8 +110,11 @@ fn start_node(
         .expect("the server's timer owners fit their cap");
         plane.set_control(Arc::clone(&board), issuer).expect("cell 0's issuer");
         plane.begin_recovery(inf_server::StdSegmentFs, &cfg, 0, StdClock::new().now());
-        let config =
-            LoopConfig { park_default: Some(Duration::from_millis(5)), ..Default::default() };
+        let config = LoopConfig {
+            park_default: inf_runtime::ParkCeiling::new(Duration::from_millis(5))
+                .expect("a park ceiling within the maximum"),
+            ..Default::default()
+        };
         let mut cell_loop =
             CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set);
         while !stop.load(Ordering::Relaxed) {

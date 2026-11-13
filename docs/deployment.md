@@ -128,7 +128,9 @@ infinityd [--port 6379] [--cells 4] [--pin-start CORE] [--pin-stride 2]
 The table covers the flags an operator sets. `infinityd --help` lists the
 others. `--park-us N` is the longest an idle cell parks before it checks
 again, in microseconds (500 with more than one cell, 5000 with one; a timer
-due sooner wakes it earlier). The others tune the write path or the idle
+due sooner wakes it earlier). It is at most 100000 (100 ms), and a larger
+value is refused at startup: a wake that reaches a cell from outside its
+thread is delivered when the park ends. The others tune the write path or the idle
 loop, or select an experiment arm, and their defaults are the ones to run
 with.
 

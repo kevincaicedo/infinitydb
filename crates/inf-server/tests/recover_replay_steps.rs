@@ -1649,6 +1649,7 @@ fn ns_recovered<F: SegmentFs>(
 /// (`inf_canary_recover_skip_on_resume`: a key absent) or applies its last
 /// consumed record again (`inf_canary_recover_twice_on_resume`: counters
 /// and tier files differ).
+// nextest-long: 34 s
 #[test]
 fn every_budget_recovers_the_state_of_the_unparked_boot() {
     let cfg = step_cfg();
@@ -2689,6 +2690,7 @@ fn the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge() {
 /// small budgets queue a batch a step) with each candidate's origin, extent
 /// id cursor (past every listed id), ticket rebuild counters, D6 counters
 /// and record counts.
+// nextest-long: 15 s
 #[test]
 fn every_budget_recovers_the_end_of_the_unparked_boot() {
     let cfg = step_cfg();
@@ -3246,6 +3248,7 @@ fn start_unit_of(phase: inf_server::UnitPhase) -> u64 {
 /// map runs a namespace's files and its whole listing in one step
 /// (`inf_canary_recover_map_whole`), and where a reseal verifies every frame
 /// in one unit (`inf_canary_recover_reseal_whole`).
+// nextest-long: 61 s
 #[test]
 fn the_start_of_a_boot_at_size_is_mapped_under_the_step_judge() {
     for (budget, sizes) in [(256 << 10, START), (1, START_AT_ONE)] {
@@ -3299,6 +3302,7 @@ fn start_mapped_under_the_judge(budget: u64, sizes: StartSizes) {
 /// resealed file among it), the reclaim queue in its hand-out order with
 /// its origins, the id cursor — and so are the counters, and every boot
 /// meets the start unit's oracles.
+// nextest-long: 61 s
 #[test]
 fn every_budget_recovers_the_start_of_the_unparked_boot() {
     let cfg = step_cfg();
@@ -3326,6 +3330,7 @@ fn every_budget_recovers_the_start_of_the_unparked_boot() {
 /// completes, counts every removal once and meets the start unit's oracles
 /// — and the repeats were served (else `VACUOUS`). Red where a repeated
 /// name refuses the boot (`inf_canary_recover_listing_repeat_refused`).
+// nextest-long: 42 s
 #[test]
 fn the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal() {
     let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;

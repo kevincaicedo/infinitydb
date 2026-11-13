@@ -86,6 +86,7 @@ impl Fixture {
         let generator = root.join("memtier_benchmark");
         std::fs::write(&generator, include_str!("fixtures/memtier.sh")).unwrap();
         std::fs::set_permissions(generator, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // node-spawn-allow: a Python stand-in named for the engine, which inf-compare runs
         let engine = root.join("infinityd");
         std::fs::write(&engine, include_str!("fixtures/infinityd.py")).unwrap();
         std::fs::set_permissions(engine, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -93,11 +94,24 @@ impl Fixture {
         std::fs::write(&generator, include_str!("fixtures/redisbench.sh")).unwrap();
         std::fs::set_permissions(generator, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(root.join("affinity.py"), include_str!("fixtures/affinity.py")).unwrap();
+        // The comparator runs the engine and the checker built in the target
+        // root that built it, else PATH's: a copy of it in this root, where
+        // nothing is built, reaches the fixture's engines on PATH. `cp` writes
+        // the copy, so no write descriptor of this process, which a sibling
+        // test's fork would inherit, holds it busy (ETXTBSY) when it runs.
+        let bin = root.join("target/release/inf-compare");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        let copied = Command::new("cp").arg(env!("CARGO_BIN_EXE_inf-compare")).arg(&bin).status();
+        assert!(copied.unwrap().success(), "copy the comparator into {}", root.display());
         Self(root)
     }
 
+    fn bin(&self) -> PathBuf {
+        self.0.join("target/release/inf-compare")
+    }
+
     fn run(&self, args: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_inf-compare"));
+        let mut command = Command::new(self.bin());
         command
             .current_dir(&self.0)
             .env("PATH", format!("{}:/usr/bin:/bin", self.0.display()))

@@ -76,12 +76,14 @@ use crate::resp::{Reply, SubFrame, parse_reply, parse_sub_frame, reply_len};
 pub mod accept_retry;
 mod audit;
 mod idle;
+mod pub_cross;
 pub mod shadow;
 
 use audit::{
     AuditState, fold_model_entries, fold_node_entries, plant_canary, reconcile_entries, run_audit,
 };
 use idle::{IdlePhase, REFUSAL_FRAME, drive_idle_phase};
+pub use pub_cross::PubTarget;
 
 // ---- shared data definitions (behaviour lives in the child modules) ----------
 
@@ -175,7 +177,34 @@ pub struct Scenario {
     /// swept instead of scheduled (ADR-0008 A1): the run must see both a
     /// refusal and a sweep reap, or it is `VACUOUS`.
     pub wheel_nodes_max: Option<WheelNodesMax>,
+    /// `m1-pub-cross`'s publish target (`--pub-target`); `None` on every
+    /// other scenario, which keeps its placement and RNG stream exactly.
+    pub pub_target: Option<PubTarget>,
 }
+
+/// A simulator mesh, checked by the plane's one mesh check when the
+/// simulator is built: every scenario's mesh is a `const` through it, so a
+/// refused pair fails the build (ADR-0192 D5).
+pub(crate) const fn scenario_mesh(ring_capacity: usize, data_credits: u32) -> MeshConfig {
+    match inf_server::checked_mesh_config(ring_capacity, data_credits) {
+        Ok(mesh) => mesh,
+        Err(_) => panic!("a simulator mesh fails the plane's mesh check"),
+    }
+}
+
+/// The frozen scenarios' mesh and the durable runner's: 1,024 ring slots,
+/// 256 credits (a peer can never fill the 1,024-frame drain budget alone).
+pub(crate) const FROZEN_MESH: MeshConfig = scenario_mesh(1024, 256);
+
+/// The shipped binary's mesh, from the rows the binary reads.
+const BINARY_MESH: MeshConfig = scenario_mesh(
+    inf_server::limits::FABRIC_RING_SLOTS_PER_PEER,
+    inf_server::limits::FABRIC_CREDITS_PER_PEER,
+);
+
+/// `m1-pub-cross`'s mesh: eight credits per directed pair, a window its
+/// publishers fill within their first iterations.
+const PUB_CROSS_MESH: MeshConfig = scenario_mesh(1024, 8);
 
 /// Model-side plants for the content oracle's canary tests (F-L19-06's
 /// "planted-bug canary" ask): each must be caught by the quiescence
@@ -206,7 +235,7 @@ impl Scenario {
             key_space: 2_000,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -221,6 +250,7 @@ impl Scenario {
             timeout_secs: 0,
             idle_clients: 0,
             wheel_nodes_max: None,
+            pub_target: None,
         }
     }
 
@@ -241,7 +271,7 @@ impl Scenario {
             key_space: 500,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -256,6 +286,7 @@ impl Scenario {
             timeout_secs: 0,
             idle_clients: 0,
             wheel_nodes_max: None,
+            pub_target: None,
         }
     }
 
@@ -276,7 +307,7 @@ impl Scenario {
             key_space: 400,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -291,6 +322,7 @@ impl Scenario {
             timeout_secs: 0,
             idle_clients: 0,
             wheel_nodes_max: None,
+            pub_target: None,
         }
     }
 
@@ -312,7 +344,7 @@ impl Scenario {
             key_space: 1,
             pipelined_every: 1,
             pipeline_window: 256,
-            fabric: MeshConfig { ring_capacity: 4096, data_credits: 1024 },
+            fabric: BINARY_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -327,6 +359,7 @@ impl Scenario {
             timeout_secs: 0,
             idle_clients: 0,
             wheel_nodes_max: None,
+            pub_target: None,
         }
     }
 
@@ -345,7 +378,7 @@ impl Scenario {
             key_space: 500,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -360,6 +393,7 @@ impl Scenario {
             timeout_secs: 1,
             idle_clients: 4,
             wheel_nodes_max: None,
+            pub_target: None,
         }
     }
 
@@ -372,7 +406,7 @@ impl Scenario {
             key_space: 2_000,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 8,
             channels: 8,
@@ -387,6 +421,44 @@ impl Scenario {
             timeout_secs: 0,
             idle_clients: 0,
             wheel_nodes_max: None,
+            pub_target: None,
+        }
+    }
+
+    /// Cross-cell publishes that fill the owners' credits: one pinned
+    /// `PSUBSCRIBE chan:*` per cell; 16 publishers pinned round-robin to the
+    /// cells, each pipelined 16 deep, each `PUBLISH` to a channel its target
+    /// cell owns (`target`: the next cell, any other, or its own) and every
+    /// fourth command a `SET` or `GET` on a key that cell owns. Eight
+    /// credits per directed pair, so both directions' unanswered `INF.PUB`s
+    /// can hold every credit while each owner's pump fans its legs back:
+    /// only a credit no deferred op can hold keeps the fan moving. Every
+    /// reply must be the cell count.
+    pub fn m1_pub_cross(seed: u64, target: PubTarget) -> Scenario {
+        Scenario {
+            seed,
+            cells: 2,
+            connections: 16,
+            commands: 8_192,
+            key_space: 1_024,
+            pipelined_every: 1,
+            pipeline_window: 16,
+            fabric: PUB_CROSS_MESH,
+            plant: Plant::None,
+            subscribers: 2,
+            channels: 256,
+            publish_percent: 0,
+            step_ns_max: 15_000,
+            adversarial_percent: 0,
+            namespaces: 0,
+            surface_percent: 0,
+            audit_every: 0,
+            canary: Canary::None,
+            maxclients: 0,
+            timeout_secs: 0,
+            idle_clients: 0,
+            wheel_nodes_max: None,
+            pub_target: Some(target),
         }
     }
 
@@ -1379,7 +1451,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     let per_client = scenario.commands / scenario.connections as u64;
     let remainder = scenario.commands % scenario.connections as u64;
     for i in 0..scenario.connections {
-        let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
+        let cell = pub_cross::placement(scenario, i, &mut rng);
         let fd = nets[cell].borrow_mut().connect();
         let window = if scenario.pipelined_every > 0 && i % scenario.pipelined_every == 0 {
             scenario.pipeline_window
@@ -1410,10 +1482,10 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     // gated on every confirmation (the plane's confirmed ⇒ reachable
     // happens-before, made assertable).
     let mut subs = Vec::new();
-    for s in 0..scenario.subscribers {
-        let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
+    for s in 0..pub_cross::subscribers(scenario) {
+        let cell = pub_cross::placement(scenario, s, &mut rng);
         let fd = nets[cell].borrow_mut().connect();
-        let plan = subscription_plan(s, scenario.channels.max(1));
+        let plan = pub_cross::subscription(scenario, s);
         let sub = SimSubscriber {
             index: s,
             cell,
@@ -1492,6 +1564,16 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         idle_survived: 0,
     };
     let mut violations = Violations::new();
+    // `m1-pub-cross`'s plan; a cell its load cannot reach is the run's
+    // violation, never a quiet pass.
+    let cross = match pub_cross::CrossPlan::new(scenario) {
+        Some(Ok(plan)) => Some(plan),
+        Some(Err(refusal)) => {
+            violations.push(refusal);
+            None
+        }
+        None => None,
+    };
 
     let mut last_progress = (0u64, 0u64);
     let mut idle_steps = 0u64;
@@ -1609,7 +1691,10 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             // is quiescent; closing a finished client is not sending.
             if subs_ready && audit_state == AuditState::Idle {
                 while client.sent < client.quota && client.sent - client.replied < client.window {
-                    let (wire, check, publish) = client.next_command(scenario);
+                    let (wire, check, publish) = match &cross {
+                        Some(plan) => plan.next_command(client),
+                        None => client.next_command(scenario),
+                    };
                     let check = match publish {
                         Some(chan) => {
                             report.published += 1;
@@ -1792,6 +1877,31 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             violations.push(format!(
                 "cell {i}: a peer went unvisited for {streak} consecutive budget-exhausted \
                  drains (bound {streak_bound}) — FABRIC-IN starved it"
+            ));
+        }
+    }
+
+    // The publish fan's reserve (ADR-0192 D3): every cell's count of fan
+    // legs that found no reserved credit reads 0, stalled or not; any other
+    // reading is the reserve's arithmetic wrong.
+    for (i, node) in nodes.iter().enumerate() {
+        let legs = node.fabric_reserve_refused_cell.get();
+        if legs != 0 {
+            violations.push(format!("RESERVE REFUSED: cell {i}, {legs} legs"));
+        }
+    }
+
+    // The waker's wiring check (ADR-0003 A1.4): every cell's `waker_foreign_ops`, the gauge
+    // INFO's `# Tripwires` renders, reads 0. The simulator runs every cell's loop on one thread,
+    // so a waker used from another cell's step takes the owner lane and is not counted: a
+    // reading above 0 here is the compare or the counter wrong, never evidence that a waker
+    // stayed on its cell (the binary at two cells is that leg).
+    for (i, node) in nodes.iter().enumerate() {
+        let ops = node.waker_foreign_ops.get();
+        if ops != 0 {
+            violations.push(format!(
+                "cell {i}: waker-foreign-ops {ops} on one thread, where every waker operation is \
+                 the owner lane's"
             ));
         }
     }

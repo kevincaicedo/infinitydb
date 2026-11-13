@@ -11,6 +11,9 @@ use inf_store::ddl::{
 };
 use inf_wire::{Domain, Refusal};
 
+#[cfg(feature = "doc")]
+use super::json_gather::{GatherTarget, json_gather};
+use super::scatter::send_whole;
 use super::*;
 use crate::control::{CkptCredit, CkptTarget, DdlNotice, DdlTicket};
 
@@ -227,39 +230,12 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
     if !keys.is_empty() && !shared.route_local_only {
         let owner = owner_of(keys[0]);
         if keys[1..].iter().any(|k| owner_of(k) != owner) {
-            // M3-S11: the JSON surface binds the named-ns multi-key
-            // programs (exactly the ADR-0032 D5 plan) — the MGET gather
-            // with ns-aware sub-ops. The generic refusal below stays for
-            // every other command until M5.
+            // A `JSON.MGET` over two owners is the gather, as in a numbered
+            // database (ADR-0173 D4).
             #[cfg(feature = "doc")]
             if meta.id == CommandId::JsonMget {
-                let path = argv[argv.len() - 1];
-                let mut parts = Vec::with_capacity(argv.len() - 2);
-                for k in &argv[1..argv.len() - 1] {
-                    let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
-                    if shared.router.is_local(k, shared.cell) {
-                        let (reply, _) = execute_ns_local(shared, origin, &sub, proto, id, db, ns);
-                        parts.push(GatherPart::Done(reply));
-                    } else {
-                        match send_apply_ns(
-                            shared,
-                            owner_of(k),
-                            ApplyOrigin::Client,
-                            proto,
-                            ns,
-                            &sub,
-                        )
-                        .await
-                        {
-                            Ok(waiter) => {
-                                parts.push(GatherPart::Wait(waiter));
-                                *inflight += 1;
-                            }
-                            Err(refusal) => parts.push(GatherPart::Done(refusal)),
-                        }
-                    }
-                }
-                pending.push_back(PendingReply::Gather { parts, proto, unwrap_single: true });
+                let target = GatherTarget { origin, proto, id, db, scope: ScatterScope::Ns(ns) };
+                pending.push_back(json_gather(shared, target, meta, argv, inflight).await);
                 return true;
             }
             // Every other multi-key command that spans cells is refused in
@@ -272,13 +248,8 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
             return true;
         }
         if owner.0 != shared.cell.0 {
-            match send_apply_ns(shared, owner, ApplyOrigin::Client, proto, ns, argv).await {
-                Ok(waiter) => {
-                    *inflight += 1;
-                    pending.push_back(PendingReply::Remote { waiter, proto });
-                }
-                Err(refusal) => pending.push_back(PendingReply::Done(refusal)),
-            }
+            let scope = ScatterScope::Ns(ns);
+            pending.push_back(send_whole(shared, owner, proto, db, scope, argv, inflight).await);
             return true;
         }
     }
@@ -1194,13 +1165,11 @@ pub(super) async fn send_apply_ns<O: PlaneObserver + 'static, F: SegmentFs + Clo
         let token = fabric.next_token();
         (token, shared.gate.waiter(token.0))
     };
-    let proto_byte: u8 = match proto {
-        Protocol::Resp3 => 3,
-        Protocol::Resp2 => 2,
-    };
-    let op = Op::ApplyNs { token, slot, cmd: proto_byte, ns: ns.0, args, program };
+    let op = PointOp::apply_ns(token, slot, cmd_byte(proto, 0), ns.0, args, program);
+    // A general send: refused while it would take the publish fan's
+    // reserved credit, it parks for a returned credit as at the window's end.
     loop {
-        let sent = shared.fabric.borrow_mut().send(to, &op);
+        let sent = shared.fabric.borrow_mut().stage_general(to, &op);
         match sent {
             Ok(()) => break,
             Err(SendError::NoCredit { .. }) => shared.credit_waiters.wait(to).await,
@@ -1227,7 +1196,8 @@ pub(super) enum SendNow {
 /// fabric borrow, waiter registered only after a successful stage (safe
 /// for the same reason as `send_apply`'s post-staging registration — the
 /// peer cannot observe the op until FABRIC-OUT publishes it, after this
-/// synchronous stretch).
+/// synchronous stretch). A general send: refused while it would take the
+/// publish fan's reserved credit, it answers [`SendNow::NoCredit`].
 pub(super) fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     to: CellId,
@@ -1241,15 +1211,11 @@ pub(super) fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 
         return SendNow::Refused(too_many_args_reply(proto));
     };
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
-    let proto_byte: u8 = match proto {
-        Protocol::Resp3 => 3,
-        Protocol::Resp2 => 2,
-    };
-    let cmd_byte = proto_byte | (db_nibble(db) << 4);
+    let cmd = cmd_byte(proto, db);
     let (token, sent) = {
         let mut fabric = shared.fabric.borrow_mut();
         let token = fabric.next_token();
-        let sent = fabric.send(to, &Op::Apply { token, slot, cmd: cmd_byte, args, program });
+        let sent = fabric.stage_general(to, &PointOp::apply(token, slot, cmd, args, program));
         (token, sent)
     };
     if sent.is_err() {
@@ -1264,9 +1230,11 @@ pub(super) fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 
 
 /// Ship `argv` to `to` as an `Apply` and return the reply waiter, waiting
 /// for fabric credits when exhausted (backpressure, never unbounded
-/// queueing). The send time is queued for delivery-side RTT recording.
-/// `Err` carries the refusal reply when the argv exceeds the codec's
-/// argument cap.
+/// queueing). A general send: refused while it would take the publish
+/// fan's reserved credit, it parks for a returned credit as at the window's
+/// end. The send time is queued for delivery-side RTT recording. `Err`
+/// carries the refusal reply when the argv exceeds the codec's argument
+/// cap.
 pub(super) async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     to: CellId,
@@ -1282,38 +1250,95 @@ pub(super) async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone 
     // Routing is the `to` cell; the slot field is advisory (keyless scatter
     // applies carry the empty-key slot).
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
-    // `cmd` packs `{db:4 | proto:4}` (ADR-0009) — SELECT travels with the
-    // op on the byte the codec already had; db fits the nibble by `DATABASES`.
+    let cmd = cmd_byte(proto, db);
+    // Token draw + first send attempt share one fabric borrow (M2.5
+    // Phase H).
+    let (token, op, sent) = {
+        let mut fabric = shared.fabric.borrow_mut();
+        let token = fabric.next_token();
+        let op = PointOp::apply(token, slot, cmd, args, program);
+        let sent = fabric.stage_general(to, &op);
+        (token, op, sent)
+    };
+    // RTT pairing relies on in-order replies; `INF.PUB` replies are deferred
+    // by the owner pump (fan acks first), so its hops are not RTT samples —
+    // the fan legs (`INF.PUBFAN`) cover pub/sub in the histogram instead.
+    let sample_rtt = argv.first().copied() != Some(&b"INF.PUB"[..]);
+    Ok(finish_send(shared, to, token, &op, sent, sample_rtt).await)
+}
+
+/// Stages one publish fan leg, `INF.PUBFAN channel payload` with the
+/// publisher's tag on the leg to its own cell, on the credit general sends
+/// leave free (ADR-0192 D3), and hands its reply waiter to the open fan.
+/// The leg never waits: when the fan opened no leg was in flight, and its
+/// legs go to distinct peers. A refused leg (derived never) is staged as a
+/// general op, the path and wait of any other send; its waiter joins the
+/// fan's all the same. Retrying the leg path is never the fallback: a leg
+/// out of peer order can never stage there. `Err` is the argument cap's
+/// refusal, which a leg's five slices never reach.
+pub(super) async fn send_fan_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    legs: &mut FanLegs<'_>,
+    to: CellId,
+    channel: &[u8],
+    payload: &[u8],
+    tag: Option<(&[u8], &[u8])>,
+) -> Result<(), OwnedReply> {
+    let fan = PubFanArgv::new(channel, payload, tag);
+    let (token, op, staged) = {
+        let mut fabric = shared.fabric.borrow_mut();
+        let token = fabric.next_token();
+        let Some(op) = fan.op(token, cmd_byte(Protocol::Resp2, 0)) else {
+            return Err(too_many_args_reply(Protocol::Resp2));
+        };
+        let staged = fabric.stage_fan_leg(legs, to, &op);
+        (token, op, staged)
+    };
+    let op = op.into_general();
+    let sent = match staged {
+        Ok(()) => Ok(()),
+        Err(_refused) => shared.fabric.borrow_mut().stage_general(to, &op),
+    };
+    legs.push(finish_send(shared, to, token, &op, sent, true).await);
+    Ok(())
+}
+
+/// What a send shares once its first stage ran: the reply waiter,
+/// registered after the stage (`send` only stages into the outbound pack —
+/// the peer cannot observe the op until FABRIC-OUT publishes it, after this
+/// synchronous stretch — so no reply can precede the registration, and the
+/// gate parks any value arriving before the waiter's first poll
+/// regardless); then, while the general path refuses, a park on the cell's
+/// credit waiters and a retry, woken by each returned credit; then the RTT
+/// sample.
+async fn finish_send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    to: CellId,
+    token: FabricToken,
+    op: &PointOp<'_>,
+    mut sent: Result<(), SendError>,
+    sample_rtt: bool,
+) -> GateWait<u64, OwnedOutcome> {
+    let waiter = shared.gate.waiter(token.0);
+    while let Err(SendError::NoCredit { .. }) = sent {
+        shared.credit_waiters.wait(to).await;
+        sent = shared.fabric.borrow_mut().stage_general(to, op);
+    }
+    if sample_rtt {
+        shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
+    }
+    waiter
+}
+
+/// `Apply`'s `cmd` byte: `{db:4 | proto:4}` (ADR-0009) — SELECT travels
+/// with the op on the byte the codec already had; db fits the nibble by
+/// `DATABASES`.
+fn cmd_byte(proto: Protocol, db: u16) -> u8 {
     let proto_byte: u8 = match proto {
         Protocol::Resp3 => 3,
         Protocol::Resp2 => 2,
     };
-    let cmd_byte = proto_byte | (db_nibble(db) << 4);
-    // Token draw + first send attempt share one fabric borrow (M2.5
-    // Phase H). Registering the waiter *after* staging stays safe: `send`
-    // only stages into the outbound pack — the peer cannot observe the op
-    // until FABRIC-OUT publishes it, after this synchronous stretch — so
-    // no reply can precede the registration (and the gate parks any value
-    // arriving before the waiter's first poll regardless).
-    let (token, op, mut sent) = {
-        let mut fabric = shared.fabric.borrow_mut();
-        let token = fabric.next_token();
-        let op = Op::Apply { token, slot, cmd: cmd_byte, args, program };
-        let sent = fabric.send(to, &op);
-        (token, op, sent)
-    };
-    let waiter = shared.gate.waiter(token.0);
-    while let Err(SendError::NoCredit { .. }) = sent {
-        shared.credit_waiters.wait(to).await;
-        sent = shared.fabric.borrow_mut().send(to, &op);
-    }
-    // RTT pairing relies on in-order replies; `INF.PUB` replies are deferred
-    // by the owner pump (fan acks first), so its hops are not RTT samples —
-    // the fan legs (`INF.PUBFAN`) cover pub/sub in the histogram instead.
-    if argv.first().copied() != Some(&b"INF.PUB"[..]) {
-        shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
-    }
-    Ok(waiter)
+    proto_byte | (db_nibble(db) << 4)
 }
 
 // `db` rides 4 bits of the fabric `Apply` cmd byte; the one owner of the

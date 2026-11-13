@@ -9,17 +9,68 @@
 //! F-L19-09: until this mode existed, every compat claim was proven
 //! against one in-process `Keyspace` with no cells, no namespaces and
 //! no tier).
+//!
+//! [`node`] starts every candidate, under the box's node lock.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::matrix::{Case, Check};
 use crate::resp::{encode_command, frame_len};
+
+// The one way a test starts `infinityd`: every node holds the box's node
+// lock shared from before its first ring to its exit (ADR-0203 D1).
+// Compat's tests reach it here, never by a `#[path]` of their own: its
+// in-process state exists once per copy, and a nested start through a
+// second copy would wait on a writer that waits on it. A plain comment: an
+// outer doc comment here would make rustdoc name the module's doctests by
+// this file.
+#[path = "../../../bins/infinityd/tests/support/node.rs"]
+pub mod node;
+
+use node::{Node, NodeBinary};
+
+/// A spawned server's process: the oracle's own child, or a node the
+/// [`node`] module started, which holds the node lock until it exits.
+enum Spawned {
+    Oracle(Child),
+    Node(Node),
+}
+
+impl Spawned {
+    fn id(&self) -> u32 {
+        match self {
+            Spawned::Oracle(child) => child.id(),
+            Spawned::Node(node) => node.id(),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        match self {
+            Spawned::Oracle(child) => child.try_wait(),
+            Spawned::Node(node) => node.try_wait(),
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Spawned::Oracle(child) => child.kill(),
+            Spawned::Node(node) => node.kill(),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        match self {
+            Spawned::Oracle(child) => child.wait(),
+            Spawned::Node(node) => node.wait(),
+        }
+    }
+}
 
 /// A spawned server process killed on drop. The scratch directory goes
 /// with it — unless the dropping thread is panicking and the process
@@ -27,7 +78,7 @@ use crate::resp::{encode_command, frame_len};
 /// log tail (batch 59: two flakes in batches 57/58 left no evidence
 /// because the node died mid-test and this `rm` took `infinityd.log`).
 pub struct ProcessGuard {
-    child: Child,
+    process: Spawned,
     scratch: Option<PathBuf>,
     /// The process's stderr file inside `scratch`, when it has one.
     log: Option<PathBuf>,
@@ -40,9 +91,9 @@ impl Drop for ProcessGuard {
     fn drop(&mut self) {
         // Whether the process ended on its own before the test did — a
         // node that died mid-test is the evidence this guard used to erase.
-        let exited = self.child.try_wait().ok().flatten();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let exited = self.process.try_wait().ok().flatten();
+        let _ = self.process.kill();
+        let _ = self.process.wait();
         let Some(dir) = self.scratch.take() else { return };
         if std::thread::panicking()
             && let Some(log) = &self.log
@@ -72,15 +123,15 @@ impl ProcessGuard {
 
     /// The spawned process's pid (what `INFO server:process_id` must name).
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.process.id()
     }
 
     /// Waits up to `timeout` for the process to exit on its own; `None`
     /// when it is still running (a refusal a test asserts on must exit).
-    pub fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+    pub fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(Some(status)) = self.child.try_wait() {
+            if let Ok(Some(status)) = self.process.try_wait() {
                 return Some(status);
             }
             if Instant::now() >= deadline {
@@ -198,10 +249,10 @@ fn spawn_redis() -> (ProcessGuard, TcpStream) {
                  on PATH or INF_COMPAT_ORACLE_ADDR pointing to that version"
             );
         });
-    let mut guard = ProcessGuard { child, scratch: Some(dir), log: None };
+    let mut guard = ProcessGuard { process: Spawned::Oracle(child), scratch: Some(dir), log: None };
     let deadline = Instant::now() + Duration::from_secs(10);
     let stream = loop {
-        if let Some(status) = guard.child.try_wait().expect("poll Redis oracle") {
+        if let Some(status) = guard.process.try_wait().expect("poll Redis oracle") {
             panic!("redis-server exited before readiness: {status}");
         }
         match TcpStream::connect(("127.0.0.1", port)) {
@@ -228,7 +279,10 @@ pub const ORACLE_VERSION: &str = "8.0.5";
 /// Serializes every test in a process on the one pinned
 /// `INF_COMPAT_ORACLE_ADDR` server. Tests in a binary run in parallel,
 /// and the scripts write, flush and count one shared keyspace: unlocked,
-/// one test's `FLUSHALL` lands mid-way through another's matrix.
+/// one test's `FLUSHALL` lands mid-way through another's matrix. Under
+/// nextest each test is a process of its own, which this lock cannot reach:
+/// the `compat-oracle` group of one thread keeps the package's tests apart.
+// nextest-group: compat-oracle
 static SHARED_ORACLE: Mutex<()> = Mutex::new(());
 
 /// Keeps an oracle to its test: a spawned server dies with the guard; the
@@ -298,7 +352,7 @@ fn redis_version(stream: &mut TcpStream) -> Option<String> {
 /// The real-node candidate (F-L19-09): spawns `$INFINITYD_BIN` with
 /// `cells` cells and a fresh durable root under `scratch_base`, waits
 /// for readiness (`PING` → `+PONG`; `-LOADING` retries), and returns a
-/// connected stream. `None` when optional and `INFINITYD_BIN` is unset.
+/// connected stream. `None` when optional and `INFINITYD_BIN` is unset, empty or not Unicode.
 /// `INF_COMPAT_REQUIRE_BINARY=1` forbids skipping. A broken binary panics: an
 /// asked-for candidate must not silently skip (the F-L19-11 principle).
 pub fn infinityd(cells: u16, scratch_base: &Path) -> Option<(ProcessGuard, TcpStream)> {
@@ -309,8 +363,8 @@ pub fn infinityd(cells: u16, scratch_base: &Path) -> Option<(ProcessGuard, TcpSt
     }
 }
 
-/// The candidate binary path when the lane is on (`None` = skip).
-pub fn candidate() -> Option<String> {
+/// The candidate binary when the lane is on (`None` = skip).
+pub fn candidate() -> Option<NodeBinary> {
     candidate_binary()
 }
 
@@ -329,7 +383,7 @@ pub fn candidate() -> Option<String> {
 /// status and quotes the log tail), or another process answered on the
 /// port (the message names its pid and command line).
 pub fn infinityd_at(
-    bin: &str,
+    bin: &NodeBinary,
     cells: u16,
     port: u16,
     scratch_base: &Path,
@@ -338,7 +392,7 @@ pub fn infinityd_at(
     let dir = guard.scratch.clone().expect("spawned node has a scratch dir");
     let deadline = Instant::now() + Duration::from_secs(30);
     let stream = loop {
-        if let Ok(Some(status)) = guard.child.try_wait() {
+        if let Ok(Some(status)) = guard.process.try_wait() {
             let log = std::fs::read_to_string(dir.join("infinityd.log")).unwrap_or_default();
             return Err(format!(
                 "infinityd exited before answering PING on {port}: {status}; log tail:\n{log}"
@@ -364,19 +418,19 @@ pub fn infinityd_at(
                         // Test orchestration thread — not cell code.
                         #[allow(clippy::disallowed_methods)]
                         std::thread::sleep(Duration::from_millis(300));
-                        let exit = guard.child.try_wait().ok().flatten();
+                        let exit = guard.process.try_wait().ok().flatten();
                         let log =
                             std::fs::read_to_string(dir.join("infinityd.log")).unwrap_or_default();
                         return Err(format!(
                             "readiness read on port {port} failed: {e} (spawned infinityd pid {} \
                              300 ms later: {exit:?}); its log:\n{log}",
-                            guard.child.id()
+                            guard.process.id()
                         ));
                     }
                 }
                 let reply = read_frames(&mut s, &mut buf, 1);
                 if reply == b"+PONG\r\n" {
-                    let child = guard.child.id();
+                    let child = guard.process.id();
                     match info_process_id(&mut s, &mut buf) {
                         Some(pid) if pid == child => break s,
                         Some(pid) => {
@@ -422,9 +476,16 @@ fn cmdline_of(pid: u32) -> String {
         .unwrap_or_default()
 }
 
-/// Spawns `bin` on `port` with a fresh scratch dir and its stderr in
-/// `infinityd.log` there — no readiness wait.
-pub fn spawn_infinityd_at(bin: &str, cells: u16, port: u16, scratch_base: &Path) -> ProcessGuard {
+/// Starts `bin` on `port` with a fresh scratch dir and its stderr in
+/// `infinityd.log` there — no readiness wait. The start takes the box's
+/// node lock shared, which the node holds until it exits (ADR-0203 D1); a
+/// start the lock refuses past its deadline panics, naming the lock.
+pub fn spawn_infinityd_at(
+    bin: &NodeBinary,
+    cells: u16,
+    port: u16,
+    scratch_base: &Path,
+) -> ProcessGuard {
     let dir = scratch_base.join(format!(
         "inf-compat-node-{}-{port}",
         std::time::SystemTime::now()
@@ -435,7 +496,8 @@ pub fn spawn_infinityd_at(bin: &str, cells: u16, port: u16, scratch_base: &Path)
     std::fs::create_dir_all(&dir).expect("create node scratch dir");
     let log_path = dir.join("infinityd.log");
     let log = std::fs::File::create(&log_path).expect("create node log");
-    let child = Command::new(bin)
+    let node = bin
+        .command()
         .args([
             "--port",
             &port.to_string(),
@@ -449,24 +511,27 @@ pub fn spawn_infinityd_at(bin: &str, cells: u16, port: u16, scratch_base: &Path)
         .stdout(Stdio::null())
         .stderr(log)
         .spawn()
-        .unwrap_or_else(|e| panic!("INFINITYD_BIN={bin} failed to spawn: {e}"));
-    ProcessGuard { child, scratch: Some(dir), log: Some(log_path) }
+        .unwrap_or_else(|error| panic!("INFINITYD_BIN's node: {error}"));
+    ProcessGuard { process: Spawned::Node(node), scratch: Some(dir), log: Some(log_path) }
 }
 
-fn candidate_binary() -> Option<String> {
+/// The binary `INFINITYD_BIN` names when the lane is on. An unset, empty or
+/// non-Unicode value skips the lane, or is red under
+/// `INF_COMPAT_REQUIRE_BINARY=1`, which `just compat` and CI set.
+fn candidate_binary() -> Option<NodeBinary> {
     let required = match std::env::var("INF_COMPAT_REQUIRE_BINARY") {
         Err(std::env::VarError::NotPresent) => false,
         Ok(value) if value == "1" => true,
         _ => panic!("INF_COMPAT_REQUIRE_BINARY must be unset or 1"),
     };
-    let bin = std::env::var("INFINITYD_BIN");
+    let binary = NodeBinary::from_infinityd_bin();
     if required {
         assert!(
-            bin.as_ref().is_ok_and(|path| !path.is_empty()),
-            "INF_COMPAT_REQUIRE_BINARY=1 requires INFINITYD_BIN"
+            binary.is_some(),
+            "INF_COMPAT_REQUIRE_BINARY=1 requires INFINITYD_BIN, a non-empty Unicode path"
         );
     }
-    bin.ok()
+    binary
 }
 
 /// Reads exactly `n` complete RESP frames from `stream`, buffering

@@ -38,7 +38,7 @@ use inf_foundation::time::{Clock, Nanos};
 
 use crate::driver::{BackendDriver, Completion, IoOp, Wait};
 use crate::executor::CellExecutor;
-use crate::limits::TIMER_DELIVERIES_PER_TURN;
+use crate::limits::{PARK_CEILING_MAX, TIMER_DELIVERIES_PER_TURN};
 use crate::sched::{GroupClass, GroupScheduler};
 use crate::timer::{Consumed, TimerNotice, TimerOutcome, TimerSet, Timers};
 
@@ -50,8 +50,9 @@ pub struct LoopConfig {
     pub spin_iters: u32,
     /// Max resumed futures polled per iteration (EXECUTE slice bound).
     pub exec_budget: usize,
-    /// Park ceiling when no timer is armed; `None` parks indefinitely.
-    pub park_default: Option<Duration>,
+    /// The longest park: a park ends by the earliest armed timer or this ceiling, whichever
+    /// comes first, so every park carries a timeout.
+    pub park_default: ParkCeiling,
     /// M2.5-S21 A/B knob: run reply-woken futures and publish staged fabric
     /// ops (an extra FABRIC-OUT) *before* PARSE+EXECUTE, so a remote hop
     /// issued by a resumed pump overlaps this iteration's local work instead
@@ -65,9 +66,54 @@ impl Default for LoopConfig {
         LoopConfig {
             spin_iters: 64,
             exec_budget: 1024,
-            park_default: Some(Duration::from_millis(100)),
+            park_default: ParkCeiling::MAX,
             remote_first_execute: false,
         }
+    }
+}
+
+/// The longest park a cell loop takes (ADR-0003 A1.2.7): at most [`PARK_CEILING_MAX`], by its
+/// one constructor. A wake no doorbell rings — a waker used off its cell's thread — is drained by
+/// the `run_ready` of the iteration the park opens, so the ceiling bounds its latency.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ParkCeiling(Duration);
+
+/// A park ceiling above [`PARK_CEILING_MAX`] was asked for.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ParkCeilingTooLong {
+    /// The ceiling asked for.
+    pub asked: Duration,
+}
+
+impl core::fmt::Display for ParkCeilingTooLong {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "a park ceiling of {} µs is above the longest park a cell loop takes, {} µs",
+            self.asked.as_micros(),
+            PARK_CEILING_MAX.as_micros()
+        )
+    }
+}
+
+impl ParkCeiling {
+    /// [`PARK_CEILING_MAX`] itself.
+    pub const MAX: ParkCeiling = ParkCeiling(PARK_CEILING_MAX);
+
+    /// `ceiling`, or the refusal when it is above [`PARK_CEILING_MAX`].
+    ///
+    /// # Errors
+    /// [`ParkCeilingTooLong`] above the maximum.
+    pub const fn new(ceiling: Duration) -> Result<ParkCeiling, ParkCeilingTooLong> {
+        if ceiling.as_nanos() > PARK_CEILING_MAX.as_nanos() {
+            return Err(ParkCeilingTooLong { asked: ceiling });
+        }
+        Ok(ParkCeiling(ceiling))
+    }
+
+    /// The ceiling.
+    pub const fn get(self) -> Duration {
+        self.0
     }
 }
 
@@ -429,22 +475,26 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         if due || plane.before_park() {
             return Wait::Poll;
         }
-        Wait::Park { timeout: self.park_timeout(now) }
+        let timeout = self.park_timeout(now);
+        // Canary: with no timer armed the park passes no timeout, so it waits without limit.
+        #[cfg(inf_canary_park_without_ceiling)]
+        if now.is_none() {
+            let _ = timeout;
+            return Wait::Park { timeout: None };
+        }
+        Wait::Park { timeout: Some(timeout) }
     }
 
     /// A park's timeout: until the earliest arm from `now`, the decision's
-    /// clock read (`None` with nothing armed), capped by `park_default`. Not
-    /// due at `now` means its deadline is past `now`, so the timer term is
-    /// positive and exact: the heap walks no tick boundaries.
-    fn park_timeout(&self, now: Option<Nanos>) -> Option<Duration> {
-        let to_next_timer = now
-            .zip(self.timers.next_deadline())
-            .map(|(now, deadline)| Duration::from_nanos(deadline.saturating_sub(now).0));
-        match (to_next_timer, self.config.park_default) {
-            (Some(t), Some(d)) => Some(t.min(d)),
-            (Some(t), None) => Some(t),
-            (None, d) => d,
-        }
+    /// clock read (`None` with nothing armed), capped by `park_default`, the
+    /// loop's ceiling, which caps every park (ADR-0003 A1.2.7). Not due at
+    /// `now` means its deadline is past `now`, so the timer term is positive
+    /// and exact: the heap walks no tick boundaries.
+    fn park_timeout(&self, now: Option<Nanos>) -> Duration {
+        let ceiling = self.config.park_default.get();
+        now.zip(self.timers.next_deadline())
+            .map(|(now, deadline)| Duration::from_nanos(deadline.saturating_sub(now).0))
+            .map_or(ceiling, |to_next_timer| to_next_timer.min(ceiling))
     }
 
     /// Always-on lifetime iteration histogram (µs). The §6 gate subtracts
@@ -481,6 +531,14 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             (tw::FABRIC_MSGS_PER_BATCH, per(self.fabric_total, self.iterations)),
             (tw::LOOP_ITER_P999_US, self.iter_hist_us.percentile(99.9)),
         ]
+    }
+
+    /// The ops the plane pushed during the last iteration, not yet
+    /// submitted: the next iteration's first driver entry takes them whole,
+    /// so between two iterations they wait here and the driver's own queue
+    /// holds none of them. Population: this cell's loop.
+    pub fn next_submit_ops(&self) -> &[IoOp] {
+        &self.ops
     }
 
     pub fn driver(&self) -> &D {

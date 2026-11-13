@@ -84,6 +84,9 @@ pub use inf_log::fs::StdSegmentFs;
 #[cfg(feature = "doc")]
 pub use json::{JSON_REPLY_SHAPES, ReplyShape};
 #[doc(hidden)]
+#[cfg(feature = "doc")]
+pub use plane::parse_json_mget_leg;
+#[doc(hidden)]
 pub use plane::{parse_array_header, parse_scan_head, parse_take_reply};
 #[doc(hidden)]
 pub use process_info::stat::cpu_microseconds as process_stat_cpu_microseconds;
@@ -111,6 +114,7 @@ pub use plane::{
     ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneBuildError, PlaneObserver, ServerPlane,
     StopHold, StopPhase, TimerAssemblyError, TimerRole, fold_live_entries,
 };
+pub use plane::{MeshConfigRefused, checked_mesh_config};
 pub use readahead::boot_prefetch_threads_spawned;
 // Harness-facing (batch 61): the compat harness reserves ports with the
 // node's own bind-only probe; `inf-server` already owns the socket-facing

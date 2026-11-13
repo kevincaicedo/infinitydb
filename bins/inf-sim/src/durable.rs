@@ -29,7 +29,7 @@ use std::rc::Rc;
 
 use inf_alloc::BufferPool;
 use inf_doc::path::compile;
-use inf_fabric::{Mesh, MeshConfig};
+use inf_fabric::Mesh;
 use inf_foundation::bounded::CapRow;
 use inf_foundation::fault::FaultSpec;
 use inf_foundation::rng::{Entropy, SplitMix64};
@@ -62,14 +62,24 @@ mod lastsave;
 mod ledger_wedge;
 #[cfg(test)]
 mod marks;
+mod mget_audit;
 #[cfg(test)]
 mod park;
 mod run;
 mod stop_tick;
+mod tier_budget;
 mod timers;
 pub use ledger_wedge::{LedgerWedgeLeg, LedgerWedgeReport};
+pub(crate) use mget_audit::{
+    DOCUMENT_REPLY_BUDGET_BYTES, MgetTally, audit_report, next_audit_command, with_reply_budget,
+};
+pub use mget_audit::{MgetAuditFold, MgetAuditReport, MgetAudits};
 pub use run::run_durable_scenario;
 pub use stop_tick::StopTickReport;
+pub use tier_budget::{
+    TierBudgetCell, TierBudgetCount, TierBudgetLeg, TierBudgetLoad, TierBudgetShape,
+    TierBudgetValues,
+};
 pub use timers::{TimersReport, WakeLeg, WakeReport};
 
 pub(crate) use audit::survival_audit;
@@ -322,6 +332,10 @@ pub struct DurableScenario {
     /// `park_at_once` makes, whose loops run at spin 0. `OFF` everywhere
     /// else.
     pub wake: WakeLeg,
+    /// The `JSON.MGET` audits of the document workload (`durable/mget_audit.rs`)
+    /// and the reply budget every cell's stores take. `None` everywhere
+    /// else: every other trace stays byte-identical.
+    pub mget_audits: Option<MgetAudits>,
 }
 
 /// The epoch-marks shape's legs, chosen by name (`--marks-leg`), never by
@@ -402,341 +416,6 @@ impl EpochMarksLeg {
             EpochMarksLeg::Everysec | EpochMarksLeg::Wedge => b"4kb",
         }
     }
-}
-
-/// How many tiered namespaces the tier-budget shape runs:
-/// `1..=TIER_BUDGET_NS_MAX`, the indices the fixed name table covers. The
-/// one constructor checks the range, so every index below a count names
-/// a namespace.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct TierBudgetCount(u8);
-
-impl TierBudgetCount {
-    /// `count` in `1..=TIER_BUDGET_NS_MAX`, else `None`.
-    pub const fn new(count: u8) -> Option<TierBudgetCount> {
-        if count >= 1 && count <= TIER_BUDGET_NS_MAX { Some(TierBudgetCount(count)) } else { None }
-    }
-
-    pub const fn get(self) -> u8 {
-        self.0
-    }
-
-    /// The namespaces' indices, each a valid [`NsClass::TierBudget`] index.
-    pub fn indices(self) -> std::ops::Range<u8> {
-        0..self.0
-    }
-}
-
-/// The tier-budget shape's legs, chosen by name (`--tier-leg`), never by
-/// the seed: every seed of a run drives the one leg named, so a sweep is
-/// one shape and the smoke lane runs each leg on its own row. The list
-/// grows by a variant here and a row there.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TierBudgetLeg {
-    /// Two namespaces at `MAINTAIN-SLICE 8mb` on the reference share: a
-    /// round of eight full groups waits for refills between them, so the
-    /// turn is contended and refuses.
-    TwoAt8mb,
-    /// Eight namespaces at `1mb`, the most a cell carries here: the
-    /// one-plan-per-turn oracle's leg.
-    EightAt1mb,
-    /// One namespace at `1mb` on the reference share: the control leg,
-    /// which reads no contention and no plan passed over.
-    OneAt1mb,
-    /// Two namespaces at the hostile share (the reference box's rate at
-    /// the share a cell holds among 256): the first at `1mb` under a
-    /// burst its flush cannot drain, the second at `64kb` under a light
-    /// steady load, so the second's small groups take their turn between
-    /// the first's — the fair turn's wait-bound oracle's leg, and the
-    /// leg on which a whole round offered at once is above the class cap.
-    TwoAt1mbHostile,
-    /// One namespace at `64mb` with no device model (the regime of
-    /// `--device-probe off`: every offer is `Now`, nothing waits for a
-    /// refill): a 64 MiB round — 67 writes and 3 barriers — is more ops
-    /// than one turn's 64 descriptor visits, so it issues across turns,
-    /// and with the write-fault plant its retry group is built behind a
-    /// run of done writes: the leg of the group builder's cursor rule.
-    /// The window is 72 MiB with nine tenths mutable, so while the fill
-    /// lasts each seal takes the excess above 64.8 MiB, a page or so;
-    /// once the writers are done the harness drops `MUTABLE-FRACTION` to
-    /// 10 permille, the next seal takes the whole 64 MiB slice and the
-    /// next plan stages the round. The write fault is armed once the
-    /// driver has seen a pass of the turn's 64 ops, so the retry is that
-    /// round's.
-    OneAt64mbNoModel,
-}
-
-impl TierBudgetLeg {
-    pub const ALL: [TierBudgetLeg; 5] = [
-        TierBudgetLeg::TwoAt8mb,
-        TierBudgetLeg::EightAt1mb,
-        TierBudgetLeg::OneAt1mb,
-        TierBudgetLeg::TwoAt1mbHostile,
-        TierBudgetLeg::OneAt64mbNoModel,
-    ];
-
-    /// The leg's name on the command line.
-    pub fn name(self) -> &'static str {
-        match self {
-            TierBudgetLeg::TwoAt8mb => "two-8mb",
-            TierBudgetLeg::EightAt1mb => "eight-1mb",
-            TierBudgetLeg::OneAt1mb => "one-1mb",
-            TierBudgetLeg::TwoAt1mbHostile => "two-1mb-hostile",
-            TierBudgetLeg::OneAt64mbNoModel => "one-64mb-no-model",
-        }
-    }
-
-    /// The leg named `name`, if any.
-    pub fn parse(name: &str) -> Option<TierBudgetLeg> {
-        TierBudgetLeg::ALL.into_iter().find(|leg| leg.name() == name)
-    }
-
-    /// The leg's device model: the reference box's (489 MB/s, 40,000
-    /// ops/s), shared by the node's cells, or that box's rate at the
-    /// share a cell holds among 256, carried by the two cells here; the
-    /// no-model leg has none (`DeviceModel::ABSENT`).
-    pub fn model(self) -> inf_runtime::DeviceModel {
-        let divisor = match self {
-            TierBudgetLeg::TwoAt8mb | TierBudgetLeg::EightAt1mb | TierBudgetLeg::OneAt1mb => 1,
-            TierBudgetLeg::TwoAt1mbHostile => 128,
-            TierBudgetLeg::OneAt64mbNoModel => return inf_runtime::DeviceModel::ABSENT,
-        };
-        inf_runtime::DeviceModel {
-            write_bytes_per_s: 489_000_000 / divisor,
-            write_ops_per_s: 40_000 / divisor,
-            read_bytes_per_s: 489_000_000 / divisor,
-            read_ops_per_s: 40_000 / divisor,
-        }
-    }
-
-    /// Whether the leg's oracle requires the turn to have been contended
-    /// and to have refused (the wait-bound oracle's engagement); the
-    /// other legs read the bound without requiring the regime (on the
-    /// reference share a round's groups fit the class cap, so nothing
-    /// waits for a refill).
-    pub fn expects_contention(self) -> bool {
-        matches!(self, TierBudgetLeg::TwoAt1mbHostile)
-    }
-
-    /// Whether the leg's oracle requires a namespace with work to have
-    /// been passed over by the cell's one plan (the one-plan oracle's
-    /// engagement).
-    pub fn expects_plan_waits(self) -> bool {
-        matches!(self, TierBudgetLeg::EightAt1mb)
-    }
-
-    /// The control leg: one namespace, so the turn never contends and
-    /// the plan never passes one over.
-    pub fn is_control(self) -> bool {
-        matches!(self, TierBudgetLeg::OneAt1mb)
-    }
-
-    /// The no-model leg: the budget reads its model absent, every offer
-    /// is `Now`, and the cap and wait-bound oracles have no reading; its
-    /// regime is a round of more ops than one turn's descriptor visits.
-    pub fn model_absent(self) -> bool {
-        matches!(self, TierBudgetLeg::OneAt64mbNoModel)
-    }
-
-    /// The leg's shape. On the reference-share legs, 3 writers per
-    /// namespace with no think time and a 3 MiB window with a tenth of
-    /// it mutable: seal marks land per 1 MiB commit page and a cell seals
-    /// once a namespace's tail is a page past the mutable target. On the
-    /// hostile leg the first namespace's twelve writers burst with no
-    /// think time into a 256 MiB window with one percent of it mutable:
-    /// their frames hold the foreground at the share, so the tier class
-    /// refills at its floor while the sealed backlog outruns it for the
-    /// whole burst, and no writer parks on its tail. The second
-    /// namespace's one writer, also without think time, writes into an
-    /// 8 MiB window at a 64 KiB slice: its small rounds are ready from
-    /// early on, each takes its turn between the first's groups, and the
-    /// window holds what the floor cannot drain during the burst. On the
-    /// no-model leg six writers without think time fill a 72 MiB window
-    /// whose first seal comes at 64.8 MiB: 84,000 commands of about 2 KiB
-    /// each on the tail (two thirds are `SET`s of 1–10 KiB) are 84 MiB a
-    /// cell by key hash, above the seal with a margin.
-    fn shape(self) -> TierBudgetShape {
-        const ONE: TierBudgetCount = match TierBudgetCount::new(1) {
-            Some(count) => count,
-            None => panic!("one tier-budget namespace is within the name table"),
-        };
-        const TWO: TierBudgetCount = match TierBudgetCount::new(2) {
-            Some(count) => count,
-            None => panic!("two tier-budget namespaces are within the name table"),
-        };
-        const EIGHT: TierBudgetCount = match TierBudgetCount::new(TIER_BUDGET_NS_MAX) {
-            Some(count) => count,
-            None => panic!("the name table's size is within itself"),
-        };
-        let reference = |namespaces: TierBudgetCount, maintain_slice: &'static [u8], ops, keys| {
-            let load = TierBudgetLoad {
-                writers: 3,
-                ops_per_writer: ops,
-                keys_per_writer: keys,
-                think_ns_max: 0,
-                mem_budget: b"3mb",
-                mutable_permille: b"100",
-                maintain_slice,
-                tail_stall_timeout_ms: None,
-                values: TierBudgetValues::Mixed,
-            };
-            TierBudgetShape { leg: self, namespaces, first: load, rest: load }
-        };
-        match self {
-            TierBudgetLeg::TwoAt8mb => reference(TWO, b"8mb", 1_000, 40),
-            // 2,000 keys a writer: a live set of about 9 MB a cell, above
-            // the 3 MiB window, so the recovered life seals every
-            // namespace at its first MAINTAIN.
-            TierBudgetLeg::EightAt1mb => reference(EIGHT, b"1mb", 1_000, 2_000),
-            TierBudgetLeg::OneAt1mb => reference(ONE, b"1mb", 3_000, 40),
-            TierBudgetLeg::TwoAt1mbHostile => TierBudgetShape {
-                leg: self,
-                namespaces: TWO,
-                first: TierBudgetLoad::HOSTILE_FIRST,
-                rest: TierBudgetLoad::HOSTILE_REST,
-            },
-            TierBudgetLeg::OneAt64mbNoModel => {
-                let load = TierBudgetLoad {
-                    writers: 6,
-                    ops_per_writer: 14_000,
-                    keys_per_writer: 40,
-                    think_ns_max: 0,
-                    mem_budget: b"72mb",
-                    mutable_permille: b"900",
-                    maintain_slice: b"64mb",
-                    tail_stall_timeout_ms: None,
-                    values: TierBudgetValues::Mixed,
-                };
-                TierBudgetShape { leg: self, namespaces: ONE, first: load, rest: load }
-            }
-        }
-    }
-}
-
-/// One tier-budget namespace's load and window: its closed-loop writers,
-/// each on a seeded cell, their ops and think time, and its `INF.NS
-/// CREATE` arguments.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct TierBudgetLoad {
-    pub writers: usize,
-    /// Ops per writer (the other classes keep the scenario's
-    /// `ops_per_writer`).
-    pub ops_per_writer: u64,
-    /// Keys per writer: the namespace's live set is the writers' keys,
-    /// so a count whose live set is above the window is what a recovered
-    /// life seals at its first MAINTAIN (the other classes keep the
-    /// scenario's `keys_per_writer`).
-    pub keys_per_writer: u64,
-    /// The longest think time between a writer's commands, drawn per
-    /// command; 0 = none.
-    pub think_ns_max: u64,
-    pub mem_budget: &'static [u8],
-    pub mutable_permille: &'static [u8],
-    /// The `MAINTAIN-SLICE`: the most record bytes one round stages; a
-    /// round issues in groups of at most one group's bytes and ops
-    /// whatever the slice.
-    pub maintain_slice: &'static [u8],
-    /// The `TAIL-STALL-TIMEOUT` the `CREATE` names, in milliseconds;
-    /// `None` keeps the namespace default (1,000 ms).
-    pub tail_stall_timeout_ms: Option<&'static [u8]>,
-    /// What the writers send.
-    pub values: TierBudgetValues,
-}
-
-impl TierBudgetLoad {
-    /// The hostile leg's first namespace: twelve writers bursting into a
-    /// 256 MiB window with one percent of it mutable, at `1mb`.
-    const HOSTILE_FIRST: TierBudgetLoad = TierBudgetLoad {
-        writers: 12,
-        ops_per_writer: 4_000,
-        keys_per_writer: 40,
-        think_ns_max: 0,
-        mem_budget: b"256mb",
-        mutable_permille: b"10",
-        maintain_slice: b"1mb",
-        tail_stall_timeout_ms: None,
-        values: TierBudgetValues::Mixed,
-    };
-
-    /// The hostile leg's second namespace: one writer into an 8 MiB window
-    /// at a 64 KiB slice.
-    const HOSTILE_REST: TierBudgetLoad = TierBudgetLoad {
-        writers: 1,
-        ops_per_writer: 6_000,
-        keys_per_writer: 40,
-        think_ns_max: 0,
-        mem_budget: b"8mb",
-        mutable_permille: b"100",
-        maintain_slice: b"64kb",
-        tail_stall_timeout_ms: None,
-        values: TierBudgetValues::Mixed,
-    };
-}
-
-/// The value class of a tier-budget namespace's writers.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TierBudgetValues {
-    /// The lift regime's mix: `SET`s of 1–10 KiB, `GET`s and `DEL`s over
-    /// the writer's keys.
-    Mixed,
-    /// `SET`s alone, each of a new key (`k:<writer>:<sent>`), each value
-    /// `value_bytes` long: every record lands once and stays live.
-    SetOnlyUnique { value_bytes: usize },
-}
-
-/// How many tiered namespaces the tier-budget shape runs and how each
-/// is loaded (see [`DurableScenario::tier_budget`]); built only by
-/// [`TierBudgetLeg::shape`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct TierBudgetShape {
-    /// The leg this shape is, for the oracles' per-leg reads.
-    pub leg: TierBudgetLeg,
-    /// Tiered namespaces created on the node; every cell materializes
-    /// each one (the DDL fans out).
-    pub namespaces: TierBudgetCount,
-    /// The first namespace's load, and every other's.
-    pub first: TierBudgetLoad,
-    pub rest: TierBudgetLoad,
-}
-
-impl TierBudgetShape {
-    /// The load of the namespace at `index`.
-    pub fn load(&self, index: u8) -> TierBudgetLoad {
-        if index == 0 { self.first } else { self.rest }
-    }
-}
-
-/// One cell's tier-flush class at the cut of a tier-budget run: what the
-/// budget counted against what the sim disk saw, and the flush each
-/// namespace reached. Read from the budget's own ledger and the driver's
-/// observed bytes; `flushed` is each namespace's watermark advance.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TierBudgetCell {
-    pub cell: u16,
-    pub unattainable: u64,
-    pub deferrals: u64,
-    pub spent_bytes: u64,
-    pub spent_ops: u64,
-    pub overrun_bytes: u64,
-    pub driver_bytes: u64,
-    pub driver_ops: u64,
-    /// Tier-class bytes and ops pushed and not yet submitted at the cut.
-    pub queued_bytes: u64,
-    pub queued_ops: u64,
-    /// The most tier-class bytes and ops one driver entry carried.
-    pub pass_bytes_max: u64,
-    pub pass_ops_max: u64,
-    /// The turn's counters as the last MAINTAIN flushed them.
-    pub groups_deferred: u64,
-    pub group_wait_ns_max: u64,
-    pub turn_waits: u64,
-    pub turn_contended: u64,
-    pub plan_waits: u64,
-    pub rounds_planned: u64,
-    pub write_retries: u64,
-    /// `(namespace index, flushed, ro-boundary, tail)` bytes past the
-    /// life origin, per tier-budget namespace materialized on the cell.
-    pub flushed: Vec<(u8, u64, u64, u64)>,
 }
 
 /// The oversized-value pad of ADR-0178's sim arm (see
@@ -1025,6 +704,7 @@ impl DurableScenario {
             stop_tick: false,
             fill_dense: false,
             wake: WakeLeg::OFF,
+            mget_audits: None,
         }
     }
 
@@ -1414,6 +1094,7 @@ impl DurableScenario {
             stop_tick: false,
             fill_dense: false,
             wake: WakeLeg::OFF,
+            mget_audits: None,
         }
     }
 
@@ -1428,12 +1109,13 @@ impl DurableScenario {
     /// target). The m2 durability oracle and the reply oracle run
     /// unchanged; the tier class's own oracles — no offer above the cap,
     /// one pass's tier bytes within the cap and the pool, every ready
-    /// group issued within the fair turn's bound, the spend equal to the
-    /// disk's tier bytes and ops, one plan per cell turn — run on the
-    /// per-cell scrape at the cut, and the run reports the tier class per
-    /// cell. The budget scenario's generic oracles stay off: their
-    /// engagement clause (some background class deferred) is vacuous on
-    /// the legs whose class never waits for a refill.
+    /// group issued within the fair turn's bound — run on the per-cell
+    /// scrape at the cut; the spend equal to the disk's tier bytes and ops
+    /// plus those granted and not yet submitted, and one plan per cell
+    /// turn, are judged at every step boundary; and the run reports the
+    /// tier class per cell. The budget scenario's generic oracles stay
+    /// off: their engagement clause (some background class deferred) is
+    /// vacuous on the legs whose class never waits for a refill.
     #[must_use]
     pub fn m4_tier_budget(seed: u64, leg: TierBudgetLeg) -> DurableScenario {
         let cells: u16 = 2;
@@ -1585,6 +1267,7 @@ impl DurableScenario {
             stop_tick: false,
             fill_dense: false,
             wake: WakeLeg::OFF,
+            mget_audits: Some(MgetAudits { reply_budget_bytes: DOCUMENT_REPLY_BUDGET_BYTES }),
         }
     }
 }
@@ -1787,6 +1470,8 @@ pub struct DurableReport {
     pub timers: TimersReport,
     /// TM3's readings over the traffic phase (zeros off its leg).
     pub wake: WakeReport,
+    /// The `JSON.MGET` audits' engagement (`durable/mget_audit.rs`).
+    pub mget: MgetAuditReport,
 }
 
 /// One cell's reclaim-marks census row at the cut of an epoch-marks run.
@@ -1989,6 +1674,9 @@ pub(crate) struct Writer {
     /// `SET`s this writer built: the ADR-0178 arm pads ordinals ≡ 0 mod
     /// 16, so every armed `always` writer pads its first `SET`.
     pub(crate) sets: u64,
+    /// The `JSON.MGET` audits this writer was answered on, and the one in
+    /// flight (`durable/mget_audit.rs`).
+    pub(crate) mget: MgetTally,
 }
 
 pub(crate) fn encode(argv: &[&[u8]]) -> Vec<u8> {
@@ -2043,6 +1731,7 @@ impl Writer {
             models: BTreeMap::new(),
             corpus_docs_used: 0,
             sets: 0,
+            mget: MgetTally::default(),
         }
     }
 
@@ -2184,6 +1873,7 @@ impl Writer {
                 String::from_utf8_lossy(&reply)
             ));
         }
+        self.mget.answered();
         if pending.mutates {
             let ops = self.ledger.entry(pending.key.clone()).or_default();
             let rec = ops.last_mut().expect("sent op has a ledger entry");
@@ -2439,7 +2129,7 @@ pub(crate) fn boot(
     .map_err(|refused| std::io::Error::new(std::io::ErrorKind::InvalidData, refused.to_string()))?;
     let inf_server::CkptIssuers { host: ckpt_host, cells: cell_issuers } = issuers;
     let mut cell_issuers = cell_issuers.into_iter();
-    let fabrics = Mesh::new(scenario.cells, MeshConfig { ring_capacity: 1024, data_credits: 256 });
+    let fabrics = Mesh::new(scenario.cells, crate::harness::FROZEN_MESH);
     let mut nets = Vec::new();
     let mut cells = Vec::new();
     for (i, fabric) in fabrics.into_iter().enumerate() {
@@ -2447,13 +2137,21 @@ pub(crate) fn boot(
         // The clock rides into the driver for the stall device (M2.5-S14);
         // with no stall model armed this is exactly `with_disk`.
         let driver = SimDriver::with_disk_stall(Rc::clone(&net), disk.clone(), Rc::clone(clock));
+        let driver = if scenario.tier_budget.is_some_and(|shape| shape.leg.is_thief()) {
+            driver.tallying_tier_dirs()
+        } else {
+            driver
+        };
         let pool = BufferPool::new(128, 1024);
         let node_info = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
         // The node's keyspace is cataloged (ADR-0189 D4), as `infinityd`'s,
         // and the plane builds it from this seed on its cell's census.
         let seed = KeyspaceSeed::Cataloged {
-            cfg: StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() },
+            cfg: with_reply_budget(
+                scenario,
+                StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() },
+            ),
             catalog: catalog.clone().unwrap_or_else(inf_store::NsCatalog::empty),
         };
         let (mut plane, serve_mark, timer_set) = SimPlane::new(

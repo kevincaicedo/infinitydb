@@ -273,7 +273,7 @@ pub(super) enum ScatterScope {
 /// namespace execution otherwise. Read-only programs only — a gated
 /// (durable-write) verdict here is a dispatch bug, answered as a typed
 /// error rather than an unfenced ack.
-async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+pub(super) async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     proto: Protocol,
@@ -306,7 +306,7 @@ async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
 /// Ship one scatter leg to `to` under `scope` and return the reply
 /// waiter (`Apply` for the numbered database, `ApplyNs` for a named
 /// namespace). `Err` carries the refusal reply.
-async fn scatter_send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+pub(super) async fn scatter_send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     to: CellId,
     proto: Protocol,
@@ -319,6 +319,28 @@ async fn scatter_send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         ScatterScope::Ns(ns) => {
             send_apply_ns(shared, to, ApplyOrigin::Client, proto, ns, argv).await
         }
+    }
+}
+
+/// A command whose keys have one remote owner, shipped whole to it under
+/// `scope`: the owner executes it and its reply is the client's, staged as
+/// one remote op of the connection's window. The one single-owner send of
+/// both dispatch sites and of a `JSON.MGET` whose keys share an owner.
+pub(super) async fn send_whole<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    owner: CellId,
+    proto: Protocol,
+    db: u16,
+    scope: ScatterScope,
+    argv: &[&[u8]],
+    inflight: &mut usize,
+) -> PendingReply {
+    match scatter_send(shared, owner, proto, db, scope, argv).await {
+        Ok(waiter) => {
+            *inflight += 1;
+            PendingReply::Remote { waiter, proto }
+        }
+        Err(refusal) => PendingReply::Done(refusal),
     }
 }
 
@@ -843,7 +865,7 @@ pub(super) fn read_scan_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + '
 /// type, so an `Error` leg passes through whole and `decode` sees only a
 /// `Success` leg's bytes; one it refuses is a malformed peer reply, its
 /// buffer recycled and the refusal written into a fresh one.
-fn read_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static, T>(
+pub(super) fn read_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static, T>(
     shared: &Shared<O, F>,
     proto: Protocol,
     reply: OwnedReply,
@@ -1044,6 +1066,16 @@ pub(super) fn extract_keys_iter<'v, 'a>(
     meta: &inf_wire::CommandMeta,
     argv: &'v [&'a [u8]],
 ) -> impl Iterator<Item = &'a [u8]> + 'v {
+    key_positions(meta, argv).map(move |i| argv[i])
+}
+
+/// The argv positions of a command's keys, in the key spec's order: the one
+/// reading of the spec behind [`extract_keys_iter`] and the owner split, so
+/// both route the same keys. Every position is inside `argv`.
+pub(super) fn key_positions(
+    meta: &inf_wire::CommandMeta,
+    argv: &[&[u8]],
+) -> impl Iterator<Item = usize> + use<> {
     let spec = inf_wire::key_spec(meta, argv.get(1).copied());
     let last = if spec.last >= 0 {
         spec.last as usize
@@ -1055,7 +1087,8 @@ pub(super) fn extract_keys_iter<'v, 'a>(
     } else {
         (usize::from(spec.first), last)
     };
-    (start..=last).step_by(usize::from(spec.step).max(1)).map_while(move |i| argv.get(i).copied())
+    let len = argv.len();
+    (start..=last).step_by(usize::from(spec.step).max(1)).take_while(move |&i| i < len)
 }
 
 #[cfg(test)]

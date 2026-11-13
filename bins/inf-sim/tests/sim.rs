@@ -1,5 +1,6 @@
 //! M0-S20 ACs + the DST items E3/E5 deferred here.
 
+use inf_fabric::MeshConfig;
 use inf_sim::harness::Canary;
 use inf_sim::net::Plant;
 use inf_sim::{Scenario, run_scenario};
@@ -263,4 +264,46 @@ fn audit_oracle_catches_a_planted_canary_on_the_served_surface() {
              {content}): {:?}",
         report.oracle_violations
     );
+}
+
+/// The mesh flags refused at the flag: exit 2, the refusal named, nothing
+/// run. `--fabric-credits` goes through the plane's mesh check against the
+/// scenario's ring. The case past the reply headroom reads its premise from
+/// the fabric's relation, and its line is matched whole: it names the
+/// relation and prints no bound, since a bound printed beside the relation
+/// would be a second statement of it. `--cells` is narrowed without
+/// wrapping, so 65,537 is refused rather than read as 1.
+#[test]
+fn mesh_flags_are_refused_at_the_flag() {
+    let ring = Scenario::m0_smoke(0).fabric;
+    let past = MeshConfig { data_credits: 513, ..ring };
+    assert!(!past.has_reply_headroom(), "513 credits fit the scenario's ring: {ring:?}");
+    let headroom = format!(
+        "inf-sim: --fabric-credits 513: ring_capacity {} has no reply headroom for data_credits \
+         513: the fabric's ring relation (MeshConfig::has_reply_headroom) refuses the pair",
+        ring.ring_capacity
+    );
+    // (flag, value, the refusal's text, whether that text is its whole line)
+    let cases: [(&str, &str, &str, bool); 6] = [
+        ("--fabric-credits", "0", "leaves no general window", false),
+        ("--fabric-credits", "1", "leaves no general window", false),
+        ("--fabric-credits", "513", &headroom, true),
+        ("--fabric-credits", "4294967296", "is past 4294967295", false),
+        ("--cells", "0", "must be >= 1", false),
+        ("--cells", "65537", "must be <= 65535", false),
+    ];
+    for (flag, value, bound, whole_line) in cases {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_inf-sim"))
+            .args(["--scenario", "m0-smoke", "--commands", "100", flag, value])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{flag} {value}: {stdout} {stderr}");
+        assert!(stderr.contains(&format!("{flag} {value}")), "{flag} {value}: {stderr}");
+        assert!(stderr.contains(bound), "{flag} {value}: {stderr}");
+        let matched_whole = stderr.lines().any(|line| line == bound);
+        assert!(!whole_line || matched_whole, "{flag} {value}: {stderr}");
+        assert!(!stdout.contains("inf-sim: scenario"), "{flag} {value} ran: {stdout}");
+    }
 }

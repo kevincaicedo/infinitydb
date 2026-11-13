@@ -20,7 +20,7 @@ both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
-**Corpus:** 683 compared executions · 74 documented deviations · 0 tolerated failures.
+**Corpus:** 689 compared executions · 76 documented deviations · 0 tolerated failures.
 **Surface:** 91 commands — 47 full · 39 partial · 0 stub · 2 extension · 3 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
@@ -107,9 +107,9 @@ live keys.
 | `INF.TAKE` | internal | M1 | write fast | -2 | 0 | 0 | fabric-program primitive (ADR-0115): unknown to every client, hidden from COMMAND, executed only on a program-marked Apply; read/delete+TTL, IF value deadline conditionally deletes the matching string snapshot (ADR-0110) |
 | `INF.PEEK` | internal | M1 | readonly fast | -2 | 0 | 0 | fabric-program primitive (ADR-0115): unknown to every client; read+TTL, ABS reads a string snapshot with absolute Unix expiry, ABS NOSTATS omits client hit/miss accounting (ADR-0110) |
 | `INF.PUT` | internal | M1 | write | -4 | 0 | 0 | fabric-program primitive (ADR-0115): unknown to every client — a client-typed INF.PUT is byte-identical to Redis (unknown command), also under maxmemory; the RENAME/RENAMENX destination leg: `key value deadline [NX]`, absolute Unix-ms deadline or -1, SET's replies; admitted as RENAME is — no DENYOOM — while the arena's own refusal still answers OOM (ADR-0110 third amendment) |
-| `JSON.SET` | partial | M3 | write denyoom | -4 | 38 | 38 | S21 corpus exact except parser-specific malformed-input text, a 128-level value (accepted; RedisJSON refuses a parsed value's 128th container) and the composed-depth refusal: a path write whose result would nest past 128 containers answers `ERR document nesting too deep` and changes nothing, where RedisJSON stores a document its own JSON.SET cannot read back — a permanent product boundary (ADR-0042 A1); root sets preserve TTL (as RedisJSON — S22 probe); durable writes use M3-S17 document records |
+| `JSON.SET` | partial | M3 | write denyoom | -4 | 40 | 40 | S21 corpus exact except parser-specific malformed-input text, a 128-level value (accepted; RedisJSON refuses a parsed value's 128th container) and the composed-depth refusal: a path write whose result would nest past 128 containers answers `ERR document nesting too deep` and changes nothing, where RedisJSON stores a document its own JSON.SET cannot read back — a permanent product boundary (ADR-0042 A1); root sets preserve TTL (as RedisJSON — S22 probe); durable writes use M3-S17 document records |
 | `JSON.GET` | partial | M3 | readonly | -2 | 36 | 36 | S21 corpus exact except documented large-exponent f64 text and module-specific WRONGTYPE wording; INDENT/NEWLINE/SPACE covered; path match sets capped by doc-max-path-matches |
-| `JSON.MGET` | partial | M3 | readonly | -3 | 2 | 2 | S21 corpus exact; per-key atomicity only — no cross-cell snapshot (each cell serves its key at its own serve time) |
+| `JSON.MGET` | partial | M3 | readonly | -3 | 6 | 6 | S21 corpus exact; per-key atomicity only — no cross-cell snapshot (each cell serves its key at its own serve time); a reply over doc-max-reply-bytes (128 MiB by default), counted over the whole array, answers ERR reply too large and serves nothing, where RedisJSON answers the array |
 | `JSON.DEL` | partial | M3 | write | -2 | 6 | 6 | recursive-overlap result count differs from RedisJSON while post-state is identical |
 | `JSON.FORGET` | partial | M3 | write | -2 | 2 | 2 | alias of JSON.DEL — inherits its recursive-overlap count difference (S22 probe: the oracle reports 2 where InfinityDB reports 3 raw matches); own S21 corpus case exact |
 | `JSON.TYPE` | full | M3 | readonly fast | -2 | 4 | 4 | RESP2/RESP3 type-name vocabulary and frames are exact in the S21 corpus |
@@ -225,6 +225,11 @@ bytes or post-state differ by an understood, reviewed design decision.
 - RedisJSON RESP2 `fuzz-exp-get`: large-exponent f64 parsing and canonical text differ from RedisJSON rounding
 - RedisJSON RESP3 `edge-wrongtype-get`: InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error text
 - RedisJSON RESP3 `fuzz-exp-get`: large-exponent f64 parsing and canonical text differ from RedisJSON rounding
+
+### `JSON.MGET`
+
+- RedisJSON RESP2 `mget-over-reply-budget`: the whole reply shares one doc-max-reply-bytes budget (128 MiB by default): InfinityDB answers ERR reply too large and serves no element; RedisJSON has no reply budget and answers the array
+- RedisJSON RESP3 `mget-over-reply-budget`: the whole reply shares one doc-max-reply-bytes budget (128 MiB by default): InfinityDB answers ERR reply too large and serves no element; RedisJSON has no reply budget and answers the array
 
 ### `JSON.DEL`
 

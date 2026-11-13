@@ -52,9 +52,22 @@ jobs:
         with:
           toolchain: 1.95.0
           components: clippy, rustfmt
+      # The cache saves only on a key it did not restore whole, so a key made
+      # before cargo-nextest was installed here would never keep it: v1 starts
+      # the key again with the binary in ~/.cargo/bin.
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+      # ADR-0200 D4: the tests run under cargo-nextest, the version
+      # .config/nextest.toml requires, installed from its published lock.
+      - name: install cargo-nextest
+        run: cargo install --locked cargo-nextest --version 0.9.150
       - name: fmt
         run: cargo fmt --all --check
+      # ADR-0200 D5: red here, not after the gates, when the installed
+      # nextest is missing or older than the config's floor.
+      - name: nextest meets the config's floor
+        run: cargo nextest show-config version
       - name: documentation identities and relative links (ADR-0106 D15, ADR-0166 D5)
         run: ./scripts/check-doc-artifacts.sh
       - name: dep-DAG law
@@ -70,6 +83,10 @@ jobs:
       # ADR-0190 D4: a reply's outcome is read beside its bytes, never from them.
       - name: reply-outcome gate (ADR-0190 D4)
         run: ./scripts/check-reply-outcome.sh
+      # ADR-0203 D3: a test names infinityd only through the node module, whose
+      # starts hold the box's node lock; every ring outside a node is a census row.
+      - name: node-spawn gate (ADR-0203 D3)
+        run: ./scripts/check-node-spawn.sh
       # ADR-0172 D2: a pre-effect refusal's text is inf_wire::Refusal's alone.
       - name: refusal-text gate (ADR-0172 D2)
         run: ./scripts/check-refusal-text.sh
@@ -107,12 +124,18 @@ jobs:
       - name: lint scopes (ADR-0144)
         run: ./scripts/check-lint-scopes.sh
       # Linux only: the baseline is recorded there (cfg-gated files). Its two
-      # clippy passes keep their own target, target/lint-ratchet: in the
-      # target the clippy step uses, their lint arguments would re-check every
-      # member twice.
+      # clippy passes keep their own target, target/lint-ratchet-<key>, the key
+      # this checkout's (scripts/target-root.sh): in the target the clippy step
+      # uses, their lint arguments would re-check every member twice.
       - name: lint ratchet (ADR-0144 D3; absorbs the fn-length ratchet)
         if: runner.os == 'Linux'
         run: ./scripts/check-lint-ratchet.sh
+      # ADR-0207 D1-D3, ADR-0200 D4, D7: every static lock and every marked
+      # run-alone or long test has its nextest override, this workflow
+      # installs the nextest the config requires, and no test file reads free
+      # space or leaves a tiered namespace's stall bound unstated.
+      - name: nextest config (ADR-0200)
+        run: ./scripts/check-nextest-config.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       # ADR-0106: the gates must go red on a planted violation, or their OK
@@ -124,12 +147,17 @@ jobs:
         run: cargo build --workspace --exclude inf-sim
       - name: build simulator (isolated DST features)
         run: cargo build -p inf-sim --features dst
+      # ADR-0200 D1: one process a test, every binary even after a red; the
+      # doctests under cargo test. Compat runs with its pinned oracles in
+      # compat-diff.
       - name: test (compat runs with its pinned oracles in compat-diff)
-        run: cargo test --workspace --exclude compat
+        run: cargo nextest run --no-fail-fast --workspace --exclude compat
         env:
           # memlock_boot may skip only where rings are not charged to
           # RLIMIT_MEMLOCK; on the Linux legs a skip is a failure.
           INF_MEMLOCK_BOOT_REQUIRE: ${{ runner.os == 'Linux' && '1' || '0' }}
+      - name: doctests
+        run: cargo test --doc --workspace --exclude compat
 
   slim-build:
     # L11: workspace feature unification hides missing doc guards, so the
@@ -142,9 +170,21 @@ jobs:
         with:
           toolchain: 1.95.0
           components: clippy
+      # The cache saves only on a key it did not restore whole, so a key made
+      # before cargo-nextest was installed here would never keep it: v1 starts
+      # the key again with the binary in ~/.cargo/bin.
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
           key: slim-build
+      # ADR-0200 D4: the tests run under cargo-nextest, the version
+      # .config/nextest.toml requires, installed from its published lock.
+      - name: install cargo-nextest
+        run: cargo install --locked cargo-nextest --version 0.9.150
+      # ADR-0200 D5: red here, not after the gates, when the installed
+      # nextest is missing or older than the config's floor.
+      - name: nextest meets the config's floor
+        run: cargo nextest show-config version
       - name: slim clippy
         run: cargo clippy -p inf-server -p inf-store --no-default-features -- -D warnings
       - name: slim libraries
@@ -162,7 +202,9 @@ jobs:
             exit 1
           fi
       - name: slim tests
-        run: cargo test -p inf-server -p inf-store --no-default-features
+        run: cargo nextest run --no-fail-fast -p inf-server -p inf-store --no-default-features
+      - name: slim doctests
+        run: cargo test --doc -p inf-server -p inf-store --no-default-features
 
   doc-intern-keys:
     runs-on: ubuntu-24.04
@@ -173,13 +215,27 @@ jobs:
         with:
           toolchain: 1.95.0
           components: clippy
+      # The cache saves only on a key it did not restore whole, so a key made
+      # before cargo-nextest was installed here would never keep it: v1 starts
+      # the key again with the binary in ~/.cargo/bin.
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
           key: doc-intern-keys
+      # ADR-0200 D4: the tests run under cargo-nextest, the version
+      # .config/nextest.toml requires, installed from its published lock.
+      - name: install cargo-nextest
+        run: cargo install --locked cargo-nextest --version 0.9.150
+      # ADR-0200 D5: red here, not after the gates, when the installed
+      # nextest is missing or older than the config's floor.
+      - name: nextest meets the config's floor
+        run: cargo nextest show-config version
       - name: interned document clippy
         run: cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings
       - name: interned document tests
-        run: cargo test -p inf-doc -p inf-store --features doc-intern-keys
+        run: cargo nextest run --no-fail-fast -p inf-doc -p inf-store --features doc-intern-keys
+      - name: interned document doctests
+        run: cargo test --doc -p inf-doc -p inf-store --features doc-intern-keys
 
   benchmark-sanity:
     # Correctness and compilation only; hosted runners do not prove perf gates.
@@ -276,6 +332,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: loom model (SPSC ring)
         run: cargo test -p inf-fabric --release loom_ -- --nocapture
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: "3"
+      - name: loom models (checkpoint issuance, grants, the wake bridge)
+        run: cargo test -p inf-foundation --release loom_ -- --nocapture
         env:
           RUSTFLAGS: --cfg loom
           LOOM_MAX_PREEMPTIONS: "3"

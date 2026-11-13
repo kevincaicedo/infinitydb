@@ -1587,16 +1587,9 @@ mod tests {
     /// already parked (first poll returns Ready — the gate contract).
     fn block_on_ready(waiter: ColdWait) -> ColdDone {
         use core::future::Future;
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        fn noop(_: *const ()) {}
-        fn clone(p: *const ()) -> RawWaker {
-            RawWaker::new(p, &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        // SAFETY: the no-op waker never dereferences its pointer.
-        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        use core::task::{Context, Poll, Waker};
         let mut waiter = waiter;
-        match core::pin::Pin::new(&mut waiter).poll(&mut Context::from_waker(&waker)) {
+        match core::pin::Pin::new(&mut waiter).poll(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(done) => done,
             Poll::Pending => panic!("value was parked; first poll must be Ready"),
         }

@@ -266,8 +266,18 @@ fn watermark_gate_wakes_at_or_below() {
 
 // ---- Randomized interleaving proptest (M0-S06 AC) ---------------------------
 
+/// 256 cases natively; under Miri, 8 cases and no failure file, which isolation forbids (the
+/// interpreter's checks, not the case count, are what that run is for).
+fn interleavings() -> ProptestConfig {
+    if cfg!(miri) {
+        ProptestConfig { cases: 8, failure_persistence: None, ..ProptestConfig::default() }
+    } else {
+        ProptestConfig::with_cases(256)
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(interleavings())]
 
     /// N tasks each await a unique key; completions and executor slices are
     /// interleaved in random order. Reference model: every task completes

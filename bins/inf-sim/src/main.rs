@@ -128,7 +128,7 @@ fn main() {
                     }
                 }
                 "--cells" | "--connections" | "--commands" | "--key-space"
-                | "--wheel-nodes-max" => {
+                | "--wheel-nodes-max" | "--fabric-credits" => {
                     let value = take(&flag)?.parse().map_err(|e| format!("{flag}: {e}"))?;
                     overrides.push((flag.clone(), value));
                 }
@@ -173,6 +173,7 @@ fn main() {
                          [--spec-variant ring-top|page] {} [--park-at-once] \
                          [--cold-identity-start N] \
                          [--cells N] [--connections N] [--commands N] [--wheel-nodes-max N] \
+                         [--fabric-credits N] \
                          [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios] \
                          [--list-sweeps]",
@@ -867,6 +868,14 @@ fn main() {
         "m0-fabric-fairness" => Scenario::m0_fabric_fairness(seed),
         "m0-admission" => Scenario::m0_admission(seed),
         "m1-cache" => Scenario::m1_cache(seed),
+        // The row's leg is defaulted, so the leg check always names one.
+        "m1-pub-cross" => match leg.and_then(LegValue::pub_target) {
+            Some(target) => Scenario::m1_pub_cross(seed, target),
+            None => {
+                eprintln!("inf-sim: m1-pub-cross runs on a --pub-target leg");
+                std::process::exit(2);
+            }
+        },
         other => {
             eprintln!("inf-sim: unknown scenario {other} (have: {})", scenario_names().join(", "));
             std::process::exit(2);
@@ -875,7 +884,7 @@ fn main() {
     scenario.plant = plant;
     for (flag, value) in overrides {
         match flag.as_str() {
-            "--cells" => scenario.cells = value as u16,
+            "--cells" => scenario.cells = checked_cells(value),
             "--connections" => scenario.connections = value as usize,
             "--commands" => scenario.commands = value,
             "--key-space" => scenario.key_space = value,
@@ -889,6 +898,7 @@ fn main() {
                     }
                 }
             }
+            "--fabric-credits" => scenario.fabric = checked_credits(scenario.fabric, value),
             _ => unreachable!(),
         }
     }
@@ -942,6 +952,40 @@ fn main() {
         Ok(())
     });
     std::process::exit(exit.code());
+}
+
+/// `--cells` as the plane takes it: narrowed to `u16` without wrapping, so
+/// 65,537 is refused rather than read as 1, then the topology's bound
+/// (`CellCount::new`); a refusal is the usage exit before any mesh exists.
+fn checked_cells(value: u64) -> u16 {
+    let checked = u16::try_from(value)
+        .map_err(|_| format!("must be <= {}", u16::MAX))
+        .and_then(|cells| inf_foundation::CellCount::new(cells).map_err(|e| e.to_string()));
+    match checked {
+        Ok(cells) => cells.get(),
+        Err(bound) => {
+            eprintln!("inf-sim: --cells {value} {bound}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `--fabric-credits` against the scenario's ring, through the plane's one
+/// mesh check (ADR-0192 D5): narrowed to `u32` without wrapping; a refusal
+/// is the usage exit before any mesh exists.
+fn checked_credits(fabric: inf_fabric::MeshConfig, value: u64) -> inf_fabric::MeshConfig {
+    let checked =
+        u32::try_from(value).map_err(|_| format!("is past {}", u32::MAX)).and_then(|credits| {
+            inf_server::checked_mesh_config(fabric.ring_capacity, credits)
+                .map_err(|refused| refused.to_string())
+        });
+    match checked {
+        Ok(mesh) => mesh,
+        Err(bound) => {
+            eprintln!("inf-sim: --fabric-credits {value}: {bound}");
+            std::process::exit(2);
+        }
+    }
 }
 
 /// The sweep arguments as one checked type, or the refusal. `--shard` and
@@ -1193,6 +1237,9 @@ fn run_durable(
             }
             if park_at_once {
                 println!("inf-sim: wake {:?}", report.wake);
+            }
+            if report.mget.ran {
+                println!("inf-sim: {}", report.mget.describe());
             }
             if let Some(wedge) = &report.ledger_wedge {
                 println!(
@@ -2085,6 +2132,9 @@ struct DurableFold {
     lift_plant_lifts: u64,
     lift_plant_sidecars: u64,
     stale_slacks: u64,
+    // The `JSON.MGET` audits: their counters summed over the seeds that ran
+    // them, and those seeds' count and unreached count.
+    mget: inf_sim::durable::MgetAuditFold,
 }
 
 impl Fold for DurableFold {
@@ -2096,13 +2146,14 @@ impl Fold for DurableFold {
         self.equivalence_checks += report.equivalence_checks;
         self.documents_compared += report.documents_compared;
         self.corpus_documents += report.corpus_documents_used;
+        self.mget.absorb(&report.mget);
         for class in &report.cut_classes {
             *self.cut_classes.entry(class).or_default() += 1;
         }
     }
 
     fn coverage(&self) -> String {
-        format!("{}{}", self.coverage_log(), self.coverage_recycling())
+        format!("{}{}{}", self.coverage_log(), self.coverage_recycling(), self.mget.coverage())
     }
 
     fn manifest_tail(&self) -> String {
@@ -2110,7 +2161,7 @@ impl Fold for DurableFold {
     }
 
     fn shard_end_clauses(&self) -> Vec<String> {
-        Vec::new()
+        self.mget.shard_end_clauses()
     }
 }
 
