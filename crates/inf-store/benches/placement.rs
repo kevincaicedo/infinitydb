@@ -6,10 +6,7 @@
 //! The judged difference is B − B₀ per placement: B is a `table-<shape>`
 //! leg of this bench built on the product, B₀ the same leg of the same
 //! source built on the product before the change (the base build), so the
-//! base reads the product's own code and never a copy of it. Each
-//! `parent-<shape>` leg runs a copy of the base's placement
-//! (`placement/parent.rs`), which must read the same in both builds: a
-//! control on the two builds, never a base.
+//! base reads the product's own code and never a copy of it.
 //!
 //! The rule: B − B₀ ≤ 2 instructions where a placement crosses nothing
 //! (`plain`), ≤ 10 where it commits a page (`crossing`), ≤ 20 where it makes
@@ -85,8 +82,6 @@
 //! `v` is a leg of `LEGS`; `n` ≥ 0 (0 is the I(0) leg); `b` is `base` or
 //! `tip`, the build the leg runs on.
 
-#![allow(clippy::disallowed_types, reason = "bench target: the parent's unbounded lists")]
-
 use std::hint::black_box;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -94,9 +89,6 @@ use std::rc::Rc;
 use inf_foundation::CellId;
 use inf_foundation::bounded::CapCensus;
 use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, Room, TieredTable};
-
-#[path = "placement/parent.rs"]
-mod parent;
 
 const MIB: u64 = 1 << 20;
 /// The filler `hole`, `refused-hole` and `refused-page-pad` place.
@@ -227,17 +219,8 @@ impl Shape {
 /// The room question's answer after a leg's loop.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Answer {
-    /// The parent's copy, which is not asked.
-    NotAsked,
     Fits,
     Refused(Exit),
-}
-
-/// The table as built, or the parent's placement.
-#[derive(Copy, Clone)]
-enum Version {
-    Table,
-    Parent,
 }
 
 /// The build a leg runs on: the base's has no seal-marks census row.
@@ -247,43 +230,38 @@ enum Build {
     Tip,
 }
 
-/// Each leg: its name, its version, its shape and its plant in `nop`s.
-const LEGS: [(&str, Version, Shape, u8); 35] = [
-    ("table-plain", Version::Table, Shape::Plain, 0),
-    ("table-plain-plus-one", Version::Table, Shape::Plain, 1),
-    ("table-plain-plus-three", Version::Table, Shape::Plain, 3),
-    ("parent-plain", Version::Parent, Shape::Plain, 0),
-    ("table-crossing", Version::Table, Shape::Crossing, 0),
-    ("table-crossing-plus-one", Version::Table, Shape::Crossing, 1),
-    ("table-crossing-plus-eleven", Version::Table, Shape::Crossing, 11),
-    ("parent-crossing", Version::Parent, Shape::Crossing, 0),
-    ("table-hole", Version::Table, Shape::Hole, 0),
-    ("table-hole-plus-one", Version::Table, Shape::Hole, 1),
-    ("table-hole-plus-twenty-one", Version::Table, Shape::Hole, 21),
-    ("parent-hole", Version::Parent, Shape::Hole, 0),
-    ("table-refused", Version::Table, Shape::Refused, 0),
-    ("table-refused-plus-one", Version::Table, Shape::Refused, 1),
-    ("table-refused-plus-twenty-three", Version::Table, Shape::Refused, 23),
-    ("parent-refused", Version::Parent, Shape::Refused, 0),
-    ("table-refused-hole", Version::Table, Shape::RefusedHole, 0),
-    ("table-refused-hole-plus-one", Version::Table, Shape::RefusedHole, 1),
-    ("table-refused-hole-plus-twenty-seven", Version::Table, Shape::RefusedHole, 27),
-    ("parent-refused-hole", Version::Parent, Shape::RefusedHole, 0),
-    ("table-refused-end", Version::Table, Shape::RefusedEnd, 0),
-    ("table-refused-end-plus-one", Version::Table, Shape::RefusedEnd, 1),
-    ("table-refused-end-plus-eight", Version::Table, Shape::RefusedEnd, 8),
-    ("table-refused-long", Version::Table, Shape::RefusedLong, 0),
-    ("table-refused-long-plus-one", Version::Table, Shape::RefusedLong, 1),
-    ("table-refused-long-plus-fifteen", Version::Table, Shape::RefusedLong, 15),
-    ("table-refused-pad", Version::Table, Shape::RefusedPad, 0),
-    ("table-refused-pad-plus-one", Version::Table, Shape::RefusedPad, 1),
-    ("table-refused-pad-plus-sixty-four", Version::Table, Shape::RefusedPad, 64),
-    ("table-refused-pad-need", Version::Table, Shape::RefusedPadNeed, 0),
-    ("table-refused-pad-need-plus-one", Version::Table, Shape::RefusedPadNeed, 1),
-    ("table-refused-pad-need-plus-sixty-five", Version::Table, Shape::RefusedPadNeed, 65),
-    ("table-refused-page-pad", Version::Table, Shape::RefusedPagePad, 0),
-    ("table-refused-page-pad-plus-one", Version::Table, Shape::RefusedPagePad, 1),
-    ("table-refused-page-pad-plus-thirty-two", Version::Table, Shape::RefusedPagePad, 32),
+/// Each leg: its name, its shape and its plant in `nop`s.
+const LEGS: [(&str, Shape, u8); 30] = [
+    ("table-plain", Shape::Plain, 0),
+    ("table-plain-plus-one", Shape::Plain, 1),
+    ("table-plain-plus-three", Shape::Plain, 3),
+    ("table-crossing", Shape::Crossing, 0),
+    ("table-crossing-plus-one", Shape::Crossing, 1),
+    ("table-crossing-plus-eleven", Shape::Crossing, 11),
+    ("table-hole", Shape::Hole, 0),
+    ("table-hole-plus-one", Shape::Hole, 1),
+    ("table-hole-plus-twenty-one", Shape::Hole, 21),
+    ("table-refused", Shape::Refused, 0),
+    ("table-refused-plus-one", Shape::Refused, 1),
+    ("table-refused-plus-twenty-three", Shape::Refused, 23),
+    ("table-refused-hole", Shape::RefusedHole, 0),
+    ("table-refused-hole-plus-one", Shape::RefusedHole, 1),
+    ("table-refused-hole-plus-twenty-seven", Shape::RefusedHole, 27),
+    ("table-refused-end", Shape::RefusedEnd, 0),
+    ("table-refused-end-plus-one", Shape::RefusedEnd, 1),
+    ("table-refused-end-plus-eight", Shape::RefusedEnd, 8),
+    ("table-refused-long", Shape::RefusedLong, 0),
+    ("table-refused-long-plus-one", Shape::RefusedLong, 1),
+    ("table-refused-long-plus-fifteen", Shape::RefusedLong, 15),
+    ("table-refused-pad", Shape::RefusedPad, 0),
+    ("table-refused-pad-plus-one", Shape::RefusedPad, 1),
+    ("table-refused-pad-plus-sixty-four", Shape::RefusedPad, 64),
+    ("table-refused-pad-need", Shape::RefusedPadNeed, 0),
+    ("table-refused-pad-need-plus-one", Shape::RefusedPadNeed, 1),
+    ("table-refused-pad-need-plus-sixty-five", Shape::RefusedPadNeed, 65),
+    ("table-refused-page-pad", Shape::RefusedPagePad, 0),
+    ("table-refused-page-pad-plus-one", Shape::RefusedPagePad, 1),
+    ("table-refused-page-pad-plus-thirty-two", Shape::RefusedPagePad, 32),
 ];
 
 /// The plants: `NOPS` instructions per op, each a `nop` with no operand,
@@ -310,35 +288,14 @@ fn table_place(table: &mut TieredTable, len: usize) -> Option<LogicalAddr> {
     table.place_for_bench(len)
 }
 
-/// One placement on the parent's table, called as the table's is: one
-/// table, its tail allocation and its mark step.
-#[inline(never)]
-fn parent_place(table: &mut parent::Table, len: usize) -> Option<LogicalAddr> {
-    table.place(len)
-}
-
 /// What a leg's engagement reads after its loop.
 struct Engagement {
     allocs: u64,
     commits: u64,
     holes: u64,
-    /// The seal marks' census row's high water, `None` with no row (the
-    /// table), or the marks' count (the parent).
+    /// The seal marks' census row's high water, `None` where the build has
+    /// no such row.
     seal_marks: Option<u64>,
-}
-
-/// A version's placement, its releases, its engagement and the room
-/// question's answer. Each version's table is the placer itself, so the op
-/// passes its pointer to the placement function unchanged on every version.
-trait Placer {
-    fn place(&mut self, len: usize) -> Option<LogicalAddr>;
-    fn release(&mut self);
-    /// The tail's offset from the life's origin.
-    fn tail_offset(&self) -> u64;
-    fn engagement(&self, census: &CapCensus) -> Engagement;
-    /// Asks `room` and `stall_target` for `len` bytes, outside the op: the
-    /// room's answer, its offsets from the origin.
-    fn exit(&mut self, len: usize) -> Answer;
 }
 
 /// The table as built for `shape`.
@@ -354,109 +311,81 @@ fn table(shape: Shape, census: &Rc<CapCensus>) -> TieredTable {
     TieredTable::new(config, demotion, 64, KeyHasher::default(), census).expect("the ring reserves")
 }
 
-impl Placer for TieredTable {
-    #[inline]
-    fn place(&mut self, len: usize) -> Option<LogicalAddr> {
-        table_place(self, len)
-    }
+/// Seals, flushes and releases to the tail, as demotion's slices would.
+fn release(table: &mut TieredTable) {
+    let space = table.space_mut();
+    let tail = space.tail();
+    space.advance_ro_boundary(tail);
+    space.advance_flushed(tail);
+    space.advance_head(tail);
+}
 
-    /// Seal, flush and release to the tail, as demotion's slices would.
-    fn release(&mut self) {
-        let space = self.space_mut();
-        let tail = space.tail();
-        space.advance_ro_boundary(tail);
-        space.advance_flushed(tail);
-        space.advance_head(tail);
-    }
+/// The tail's offset from the life's origin.
+fn tail_offset(table: &TieredTable) -> u64 {
+    table.space().tail().to_raw() - table.space().life_origin().to_raw()
+}
 
-    fn tail_offset(&self) -> u64 {
-        self.space().tail().to_raw() - self.space().life_origin().to_raw()
-    }
-
-    fn engagement(&self, census: &CapCensus) -> Engagement {
-        let counters = self.space().counters();
-        let seal_marks = census.row("seal-marks").map(|row| u64::from(row.high_water));
-        Engagement {
-            allocs: counters.tail_allocs,
-            commits: counters.region_commit_pages,
-            holes: counters.seal_holes,
-            seal_marks,
-        }
-    }
-
-    fn exit(&mut self, len: usize) -> Answer {
-        let space = self.space_mut();
-        let origin = space.life_origin().to_raw();
-        black_box(space.stall_target(len));
-        match space.room(len) {
-            Room::Fits => Answer::Fits,
-            Room::Demote(to) => Answer::Refused(Exit::Demote(to.to_raw() - origin)),
-            Room::Pad(pad) => Answer::Refused(Exit::Pad(pad.to().to_raw() - origin)),
-            Room::End => Answer::Refused(Exit::End),
-        }
+fn engagement(table: &TieredTable, census: &CapCensus) -> Engagement {
+    let counters = table.space().counters();
+    let seal_marks = census.row("seal-marks").map(|row| u64::from(row.high_water));
+    Engagement {
+        allocs: counters.tail_allocs,
+        commits: counters.region_commit_pages,
+        holes: counters.seal_holes,
+        seal_marks,
     }
 }
 
-impl Placer for parent::Table {
-    #[inline]
-    fn place(&mut self, len: usize) -> Option<LogicalAddr> {
-        parent_place(self, len)
-    }
-
-    fn release(&mut self) {
-        self.release_to_tail();
-    }
-
-    fn tail_offset(&self) -> u64 {
-        panic!("the parent's copy runs the judged shapes alone, which read no tail");
-    }
-
-    fn engagement(&self, _census: &CapCensus) -> Engagement {
-        let (allocs, commits, holes, marks) = self.counts();
-        Engagement { allocs, commits, holes, seal_marks: Some(marks as u64) }
-    }
-
-    fn exit(&mut self, _len: usize) -> Answer {
-        Answer::NotAsked
+/// Asks `room` and `stall_target` for `len` bytes, outside the op: the
+/// room's answer, its offsets from the origin.
+fn answer(table: &mut TieredTable, len: usize) -> Answer {
+    let space = table.space_mut();
+    let origin = space.life_origin().to_raw();
+    black_box(space.stall_target(len));
+    match space.room(len) {
+        Room::Fits => Answer::Fits,
+        Room::Demote(to) => Answer::Refused(Exit::Demote(to.to_raw() - origin)),
+        Room::Pad(pad) => Answer::Refused(Exit::Pad(pad.to().to_raw() - origin)),
+        Room::End => Answer::Refused(Exit::End),
     }
 }
 
 /// The counted op: the plant, then one placement.
 #[inline(never)]
-fn op<P: Placer, const NOPS: u8>(placer: &mut P, len: usize) -> Option<LogicalAddr> {
+fn op<const NOPS: u8>(table: &mut TieredTable, len: usize) -> Option<LogicalAddr> {
     plant::<NOPS>();
-    black_box(placer.place(len))
+    black_box(table_place(table, len))
 }
 
 /// A placement outside the counted op: a filler, a warm-up or the fill. It is
 /// inlined into the driving loop, so it is never the op function's code (an
 /// out-of-line copy would be folded with the unplanted op).
 #[inline(always)]
-fn fill<P: Placer>(placer: &mut P, len: usize) -> Option<LogicalAddr> {
-    black_box(placer.place(len))
+fn fill(table: &mut TieredTable, len: usize) -> Option<LogicalAddr> {
+    black_box(table_place(table, len))
 }
 
 /// Places 1 MiB records from the tail to `tail`, each inside the window;
 /// returns the placements.
-fn fill_to<P: Placer>(placer: &mut P, tail: u64) -> u64 {
-    let from = placer.tail_offset();
+fn fill_to(table: &mut TieredTable, tail: u64) -> u64 {
+    let from = tail_offset(table);
     assert!(tail >= from && (tail - from).is_multiple_of(MIB), "a fill of whole records");
     let records = (tail - from) / MIB;
     for _ in 0..records {
-        fill(placer, MIB as usize).expect("a fill inside the window places");
+        fill(table, MIB as usize).expect("a fill inside the window places");
     }
     records
 }
 
 /// Brings a refusal leg to its refusing state, outside the op; returns the
 /// placements it made.
-fn prepare<P: Placer>(placer: &mut P, shape: Shape, len: usize) -> u64 {
+fn prepare(table: &mut TieredTable, shape: Shape, len: usize) -> u64 {
     match shape {
         // `refused-end` fills to the end of the space, where its window is
         // full too.
         Shape::Refused | Shape::RefusedEnd => {
             let mut filled = 0;
-            while fill(placer, len).is_some() {
+            while fill(table, len).is_some() {
                 filled += 1;
             }
             filled
@@ -464,22 +393,22 @@ fn prepare<P: Placer>(placer: &mut P, shape: Shape, len: usize) -> u64 {
         Shape::RefusedHole => {
             // A filler and a record below the ring top: the next record
             // needs a ring-top hole, and the window is full.
-            fill(placer, FILLER_BYTES).expect("the filler places");
-            fill(placer, len).expect("the record below the ring top places");
+            fill(table, FILLER_BYTES).expect("the filler places");
+            fill(table, len).expect("the record below the ring top places");
             2
         }
         Shape::RefusedPad | Shape::RefusedPadNeed => {
-            let placed = fill_to(placer, PAD_HEAD_BYTES);
-            placer.release();
-            let placed = placed + fill_to(placer, PAD_TAIL_BYTES);
+            let placed = fill_to(table, PAD_HEAD_BYTES);
+            release(table);
+            let placed = placed + fill_to(table, PAD_TAIL_BYTES);
             if shape == Shape::RefusedPad {
-                placer.release();
+                release(table);
             }
             placed
         }
         Shape::RefusedPagePad => {
-            fill(placer, FILLER_BYTES).expect("the filler places");
-            placer.release();
+            fill(table, FILLER_BYTES).expect("the filler places");
+            release(table);
             1
         }
         Shape::RefusedLong => 0,
@@ -490,8 +419,8 @@ fn prepare<P: Placer>(placer: &mut P, shape: Shape, len: usize) -> u64 {
 }
 
 /// Drives `ops` ops of `shape` and checks the leg's engagement.
-fn drive<P: Placer, const NOPS: u8>(
-    placer: &mut P,
+fn drive<const NOPS: u8>(
+    table: &mut TieredTable,
     shape: Shape,
     ops: u64,
     build: Build,
@@ -505,11 +434,11 @@ fn drive<P: Placer, const NOPS: u8>(
             let mut until_release = per_release;
             for _ in 0..ops {
                 if until_release == 0 {
-                    placer.release();
+                    release(table);
                     until_release = per_release;
                 }
                 until_release -= 1;
-                let addr = op::<P, NOPS>(placer, len).expect("a window with room places");
+                let addr = op::<NOPS>(table, len).expect("a window with room places");
                 accumulator ^= addr.to_raw();
             }
             ops
@@ -518,14 +447,14 @@ fn drive<P: Placer, const NOPS: u8>(
             let filler = black_box(FILLER_BYTES);
             // Warm-up: a filler and a record that fit below the ring top,
             // so that from here every record needs a ring-top hole.
-            fill(placer, filler).expect("the warm-up's filler places");
-            fill(placer, len).expect("the warm-up's record places");
+            fill(table, filler).expect("the warm-up's filler places");
+            fill(table, len).expect("the warm-up's record places");
             for _ in 0..ops {
-                placer.release();
-                let addr = fill(placer, filler).expect("a filler places");
+                release(table);
+                let addr = fill(table, filler).expect("a filler places");
                 accumulator ^= addr.to_raw();
-                placer.release();
-                let addr = op::<P, NOPS>(placer, len).expect("a released window places");
+                release(table);
+                let addr = op::<NOPS>(table, len).expect("a released window places");
                 accumulator ^= addr.to_raw();
             }
             2 + 2 * ops
@@ -537,33 +466,31 @@ fn drive<P: Placer, const NOPS: u8>(
         | Shape::RefusedPad
         | Shape::RefusedPadNeed
         | Shape::RefusedPagePad => {
-            let filled = prepare(placer, shape, len);
+            let filled = prepare(table, shape, len);
             for _ in 0..ops {
-                accumulator += u64::from(op::<P, NOPS>(placer, len).is_none());
+                accumulator += u64::from(op::<NOPS>(table, len).is_none());
             }
             assert_eq!(accumulator, ops, "engagement: every op refused");
             filled
         }
     };
-    engage(placer, shape, ops, placed, build, census);
+    engage(table, shape, ops, placed, build, census);
     accumulator
 }
 
 /// The leg's engagement, read after its loop and outside the op.
-fn engage<P: Placer>(
-    placer: &mut P,
+fn engage(
+    table: &mut TieredTable,
     shape: Shape,
     ops: u64,
     placed: u64,
     build: Build,
     census: &CapCensus,
 ) {
-    let answer = placer.exit(shape.len());
-    let engagement = placer.engagement(census);
+    let answer = answer(table, shape.len());
+    let engagement = engagement(table, census);
     assert_eq!(engagement.allocs, placed, "engagement: one allocation a placement");
-    if let Some(want) = shape.exit()
-        && answer != Answer::NotAsked
-    {
+    if let Some(want) = shape.exit() {
         assert_eq!(answer, Answer::Refused(want), "engagement: the leg's refusal");
     }
     if ops == 0 {
@@ -594,8 +521,8 @@ fn engage<P: Placer>(
     }
 }
 
-fn run_leg<P: Placer>(
-    placer: &mut P,
+fn run_leg(
+    table: &mut TieredTable,
     shape: Shape,
     nops: u8,
     ops: u64,
@@ -603,43 +530,34 @@ fn run_leg<P: Placer>(
     census: &CapCensus,
 ) -> u64 {
     match nops {
-        0 => drive::<P, 0>(placer, shape, ops, build, census),
-        1 => drive::<P, 1>(placer, shape, ops, build, census),
-        3 => drive::<P, 3>(placer, shape, ops, build, census),
-        8 => drive::<P, 8>(placer, shape, ops, build, census),
-        11 => drive::<P, 11>(placer, shape, ops, build, census),
-        15 => drive::<P, 15>(placer, shape, ops, build, census),
-        21 => drive::<P, 21>(placer, shape, ops, build, census),
-        23 => drive::<P, 23>(placer, shape, ops, build, census),
-        27 => drive::<P, 27>(placer, shape, ops, build, census),
-        32 => drive::<P, 32>(placer, shape, ops, build, census),
-        64 => drive::<P, 64>(placer, shape, ops, build, census),
-        65 => drive::<P, 65>(placer, shape, ops, build, census),
+        0 => drive::<0>(table, shape, ops, build, census),
+        1 => drive::<1>(table, shape, ops, build, census),
+        3 => drive::<3>(table, shape, ops, build, census),
+        8 => drive::<8>(table, shape, ops, build, census),
+        11 => drive::<11>(table, shape, ops, build, census),
+        15 => drive::<15>(table, shape, ops, build, census),
+        21 => drive::<21>(table, shape, ops, build, census),
+        23 => drive::<23>(table, shape, ops, build, census),
+        27 => drive::<27>(table, shape, ops, build, census),
+        32 => drive::<32>(table, shape, ops, build, census),
+        64 => drive::<64>(table, shape, ops, build, census),
+        65 => drive::<65>(table, shape, ops, build, census),
         other => panic!("no leg plants {other}"),
     }
 }
 
-fn run(version: Version, shape: Shape, nops: u8, ops: u64, build: Build) -> u64 {
+fn run(shape: Shape, nops: u8, ops: u64, build: Build) -> u64 {
     let (census, serve_mark) = CapCensus::new(CellId(0));
     serve_mark.take();
-    match version {
-        Version::Table => {
-            let mut table = table(shape, &census);
-            // The product's tables register their seal marks on the census;
-            // the base's hold them on a plain list.
-            let row = census.row("seal-marks").is_some();
-            assert_eq!(row, build == Build::Tip, "engagement: the seal-marks row and the build");
-            run_leg(&mut table, shape, nops, ops, build, &census)
-        }
-        Version::Parent => {
-            let (ring, window) = shape.geometry();
-            let mut parent = parent::Table::new(ring as usize, MIB as usize, window);
-            run_leg(&mut parent, shape, nops, ops, build, &census)
-        }
-    }
+    let mut table = table(shape, &census);
+    // The product's tables register their seal marks on the census; the
+    // base's hold them on a plain list.
+    let row = census.row("seal-marks").is_some();
+    assert_eq!(row, build == Build::Tip, "engagement: the seal-marks row and the build");
+    run_leg(&mut table, shape, nops, ops, build, &census)
 }
 
-type Leg = (&'static str, Version, Shape, u8);
+type Leg = (&'static str, Shape, u8);
 
 fn parse() -> Result<(Leg, u64, Build), String> {
     let mut leg = None;
@@ -677,14 +595,14 @@ fn parse() -> Result<(Leg, u64, Build), String> {
 }
 
 fn main() -> ExitCode {
-    let ((variant, version, shape, nops), ops, build) = match parse() {
+    let ((variant, shape, nops), ops, build) = match parse() {
         Ok(args) => args,
         Err(e) => {
             eprintln!("placement: {e}");
             return ExitCode::from(2);
         }
     };
-    let accumulator = run(version, shape, nops, ops, build);
+    let accumulator = run(shape, nops, ops, build);
     println!("{variant} ops {ops} accumulator {}", black_box(accumulator));
     ExitCode::SUCCESS
 }
