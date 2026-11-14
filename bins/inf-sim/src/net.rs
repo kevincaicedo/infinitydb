@@ -243,6 +243,12 @@ impl CellNet {
         self.whole_chunks = true;
     }
 
+    /// Deliver seeded chunks again, as before [`Self::deliver_whole`]: the
+    /// end of one burst a harness phase sent whole.
+    pub fn deliver_chunked(&mut self) {
+        self.whole_chunks = false;
+    }
+
     /// Client side: open a connection to this cell; returns the fd handle.
     pub fn connect(&mut self) -> RawFd {
         self.next_fd += 1;
