@@ -583,11 +583,14 @@ impl CellPlane for HookPlane {
 }
 
 /// The server's delivery, out of the iteration's line: the cold handle
-/// cloned under a short tier borrow, released before any gate wake.
+/// cloned under a short tier borrow, released before any gate wake, and
+/// the allowance lent only when the host holds ready delivery.
 #[inline(never)]
 fn deliver_cold(shared: &SharedTier, cx: &mut LoopCx<'_>) {
     let cold = shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
-    if let Some(cold) = cold {
+    if let Some(cold) = cold
+        && cold.has_ready_delivery()
+    {
         let now_us = cx.now.as_micros();
         let _ = cx.with_cold_delivery_budget(|budget| cold.deliver_ready(budget, now_us));
     }

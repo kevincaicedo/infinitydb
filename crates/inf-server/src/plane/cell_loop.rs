@@ -50,13 +50,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
 
     /// The turn's cold delivery (ADR-0181 R1, R2) from the iteration's
     /// allowance: the cold handle is cloned under a short tier borrow, which
-    /// is released before any gate wake or orphan cleanup runs. Out of line,
-    /// so a cell with no cold engine carries none of it in its iteration
+    /// is released before any gate wake or orphan cleanup runs, and the
+    /// allowance is lent only when the host holds ready delivery, so an
+    /// iteration with nothing ready builds no turn. Out of line, so a cell
+    /// with no cold engine carries none of it in its iteration
     /// (`inf-runtime`'s `cold_path` bench, its server-shaped reactor legs).
     #[inline(never)]
     fn deliver_cold(&self, cx: &mut LoopCx<'_>) {
         let cold = self.shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
-        if let Some(cold) = cold {
+        if let Some(cold) = cold
+            && cold.has_ready_delivery()
+        {
             let now_us = cx.now.as_micros();
             let _ = cx.with_cold_delivery_budget(|budget| cold.deliver_ready(budget, now_us));
         }
