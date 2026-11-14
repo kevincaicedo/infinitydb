@@ -1008,6 +1008,13 @@ rows=(
   # shortest wait's last step; or until the 7th, the wait's first step.
   "inf_canary_cold_ready_left_fifteen_turns m4-tiered cold-burst-unvisited --seed 0x51ee0630"
   "inf_canary_cold_ready_left_seven_turns m4-tiered cold-burst-unvisited --seed 0x51ee0630"
+  # m4-tiered's SCAN batching oracle judges a page that put 16 tier reads or more at its cell's
+  # device once the cell held the whole command, no other reader's among them, and is red when
+  # every driver entry that took a read took one. Planted, a page awaits each cold key before it
+  # names the next. At the seed the plain build judges 6 pages and sets 3 aside (the corpus test
+  # the_scan_batching_oracle_judges_pages_and_sets_others_aside holds both), and planted, its
+  # judged pages are red.
+  "inf_canary_scan_chunk_of_one m4-tiered scan-one-read-an-entry --seed 0x51ee082d"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

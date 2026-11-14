@@ -918,10 +918,15 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     // authoritative). A typed read failure fails the whole page — the
     // client retries its cursor — never a silently shorter page with an
     // advanced cursor (C2; the DBSIZE drain's rule).
+    #[cfg(not(inf_canary_scan_chunk_of_one))]
     let chunk = {
         let tier = shared.tier.borrow();
         tier.as_ref().and_then(|t| t.cold.as_ref()).map_or(1, inf_runtime::ColdReads::qd_cap).max(1)
     };
+    // Canary: a chunk of one, so the page awaits each cold key before it
+    // names the next, one device read a driver entry.
+    #[cfg(inf_canary_scan_chunk_of_one)]
+    let chunk = 1;
     let fail = |shared: &Rc<Shared<O, F>>, message: &'static str| {
         if let Some(table) = shared.store.borrow_mut().tiered_store_mut(ns) {
             table.note_cold_read_error();
