@@ -210,8 +210,10 @@ threads. Give every key exactly one owning cell and all of those become
 local, single-threaded problems.
 
 This shows up directly in the types. A cell's store is an `Rc<RefCell<...>>`,
-not an `Arc<Mutex<...>>`. Command futures are `!Send`, and the executor's
-wakers use no atomic instructions. Cell code may not name locks, channels,
+not an `Arc<Mutex<...>>`. Command futures are `!Send`. A waker may move to
+another thread, as Rust requires, but on its own cell's thread it runs no
+atomic read-modify-write; only a wake from another thread, which no server
+path makes, pays for one. Cell code may not name locks, channels,
 `tokio`, `sleep`, thread spawning, or the ambient clock or randomness; a
 denylist script and clippy's `disallowed-types` / `disallowed-methods`
 reject them at build time.
@@ -1439,9 +1441,12 @@ the attribute and any allow written exactly `allow(unsafe_code)` that is not
 on a whole module; it does not read an allow in another spelling (a reasoned
 `#[allow(unsafe_code, reason = …)]`, `#[expect(unsafe_code)]`, a grouped
 allow). The ring is checked with Loom; the allocator and fabric with Miri.
-The executor's wakers are deliberately not thread-safe: they use no atomics
-(a CI check inspects the waker path for atomic instructions), and command
-futures are `!Send`, which keeps them on their cell's thread.
+The executor's wakers are thread-safe at a small bridge: on their own cell's
+thread they run no atomic read-modify-write (a CI check inspects the waker
+path's machine code for atomic instructions outside the bridge's foreign
+lane), and a wake from another thread is queued for the cell to deliver.
+Command futures are `!Send`, which keeps them on their cell's thread. The
+bridge's lane is checked with Loom and the executor with Miri.
 
 **Untrusted bytes.** Client requests, fabric messages and every on-disk
 format (log frames, segments, checkpoints, MANIFEST, catalog, tier files,

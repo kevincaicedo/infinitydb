@@ -33,6 +33,9 @@
 //! to a boundary function, an atomic beside one, an owner arm that calls a read-modify-write in
 //! another module whose body is in the asm (the drift a lane module invites), an owner arm that
 //! calls an out-of-line function of a nested crate, and a boundary function no root reaches.
+//!
+//! The third vtable holds one plant: a callee that a waker reaches by a conditional tail call
+//! (`jne <callee>` on x86-64) is on the owner lane, as a callee reached by a jump is.
 #![allow(dead_code)]
 
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -190,3 +193,22 @@ unsafe fn unlisted_drop(data: *const ()) {
 
 pub static BOUNDARY_WAKER_VTABLE: RawWakerVTable =
     RawWakerVTable::new(boundary_clone, beside_wake, drift_wake_by_ref, unlisted_drop);
+
+/// A read-modify-write out of line whose one caller reaches it in tail position under a branch.
+#[inline(never)]
+fn tail_fetch_add(data: *const ()) {
+    COUNT.fetch_add(data as usize, Ordering::AcqRel);
+}
+
+/// The third vtable's drop. On x86-64 its call compiles to a conditional tail call, `jne
+/// <callee>` (the product's linked `waker_drop` reaches its boundary functions the same way), so
+/// the callee is on the owner lane only if the gate reads a conditional branch to a symbol as an
+/// edge. WAKER-PROBE: expect-atomic tail_drop
+unsafe fn tail_drop(data: *const ()) {
+    if !data.is_null() {
+        tail_fetch_add(data);
+    }
+}
+
+pub static TAIL_WAKER_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, tail_drop);

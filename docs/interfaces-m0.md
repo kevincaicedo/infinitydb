@@ -166,7 +166,7 @@ impl Arena {
 > No wire, durable or token layout changes. The old signatures below do
 > not establish that the replacement is built.
 
-> **Accepted 2026-10-19, implementation open — ADR-0003 A1:** a standard
+> **Accepted 2026-10-19, built — ADR-0003 A1:** a standard
 > `Waker` is thread-safe. Its data names a `Sync` wake bridge whose only
 > atomics are its foreign lane's; on its own cell's thread a waker
 > operation runs no atomic read-modify-write. A wake from another thread
