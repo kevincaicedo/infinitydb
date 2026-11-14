@@ -50,10 +50,13 @@
 //!   line at `fabric_in` and again at `parse_execute`, as a server cell's
 //!   steps take it before the hook and after it. The context escapes before
 //!   the hook, as on a server cell, so the compiler keeps the context's
-//!   setup in both legs.
-//! - `reactor-iteration-server-late`: the same plane with the default
-//!   `before_execute` and both hand-outs at `parse_execute`, after the
-//!   hook; reported beside A, it judges nothing.
+//!   setup in both legs. Neither lends, so the loop holds no cold turn:
+//!   each asserts that its loop built none.
+//! - `reactor-iteration-server-lend`: A's plane lending the delivery
+//!   allowance once in `before_execute` and spending nothing, so every
+//!   iteration builds a turn at that lend; it asserts that its last
+//!   iteration built one. Reported, never judged: it shows the turn where
+//!   one is built, by the loop's stamp and by the count over A.
 //!
 //! Beside them, the rate legs (`cold_path/rates.rs`), reported and never
 //! judged: one container operation a step, on the capped map and slab B
@@ -79,7 +82,10 @@
 //!   over A;
 //! - engagement: after its loop each leg asserts what its ops did (requests
 //!   purged, reads issued and delivered, background left queued), so a leg
-//!   that did nothing reads red.
+//!   that did nothing reads red; each reactor leg asserts what its loop
+//!   built (no cold turn on a leg that lends nothing, the last iteration's
+//!   on the lend leg, and nothing at `--ops 0`), and a failed assertion
+//!   exits nonzero.
 //!
 //! `perf` wraps the binary that `--no-run` prints, never `cargo`, whose own
 //! instructions would join the count; on a hybrid CPU `<core>` is a
@@ -158,9 +164,9 @@ enum ReactorPlane {
     Server,
     /// [`ServerShapedPlane`] with the server's `before_execute`.
     ServerHook,
-    /// [`ServerShapedPlane`]'s default leg with both hand-outs after the
-    /// hook: the late control.
-    ServerLate,
+    /// [`ServerShapedPlane`] lending the delivery allowance once in
+    /// `before_execute`: a turn built every iteration.
+    ServerLend,
 }
 
 /// The one table of leg names: `--variant` is parsed against it.
@@ -193,8 +199,8 @@ const LEGS: [(&str, Leg, u8); 75] = [
     ("reactor-iteration-server-plus-one", Leg::Reactor(ReactorPlane::Server), 1),
     ("reactor-iteration-server-hook", Leg::Reactor(ReactorPlane::ServerHook), 0),
     ("reactor-iteration-server-hook-plus-one", Leg::Reactor(ReactorPlane::ServerHook), 1),
-    ("reactor-iteration-server-late", Leg::Reactor(ReactorPlane::ServerLate), 0),
-    ("reactor-iteration-server-late-plus-one", Leg::Reactor(ReactorPlane::ServerLate), 1),
+    ("reactor-iteration-server-lend", Leg::Reactor(ReactorPlane::ServerLend), 0),
+    ("reactor-iteration-server-lend-plus-one", Leg::Reactor(ReactorPlane::ServerLend), 1),
     ("reactor-iteration-server-hook-plus-four", Leg::Reactor(ReactorPlane::ServerHook), 4),
     ("reactor-iteration-server-hook-plus-five", Leg::Reactor(ReactorPlane::ServerHook), 5),
     ("reactor-iteration-server-hook-plus-six", Leg::Reactor(ReactorPlane::ServerHook), 6),
@@ -601,30 +607,30 @@ fn deliver_cold(shared: &SharedTier, cx: &mut LoopCx<'_>) {
 /// hook, and at `parse_execute`, after it. `HOOK` true, its
 /// `before_execute` is the server's (B of the row); false, the plane's
 /// default (A). One type for both, so the legs differ in the hook alone.
-/// `LATE` true moves the `fabric_in` hand-out to `parse_execute`, after
-/// the hook: the late control, only with `HOOK` false.
-struct ServerShapedPlane<const HOOK: bool, const LATE: bool> {
+/// `LEND` true, with `HOOK` false, lends the delivery allowance once in
+/// `before_execute` and spends nothing: the lend leg.
+struct ServerShapedPlane<const HOOK: bool, const LEND: bool> {
     shared: Rc<SharedTier>,
 }
 
-impl<const HOOK: bool, const LATE: bool> CellPlane for ServerShapedPlane<HOOK, LATE> {
+impl<const HOOK: bool, const LEND: bool> CellPlane for ServerShapedPlane<HOOK, LEND> {
     fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
         panic!("the reactor leg reaps nothing: {c:?}");
     }
     fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {
-        if !LATE {
-            server_steps(&self.shared, cx);
-        }
+        server_steps(&self.shared, cx);
     }
     fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
         if HOOK {
             server_hook(&self.shared, cx);
         }
+        if LEND {
+            cx.with_cold_delivery_budget(|budget| {
+                black_box(budget);
+            });
+        }
     }
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
-        if LATE {
-            server_steps(&self.shared, cx);
-        }
         server_steps(&self.shared, cx);
     }
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
@@ -639,10 +645,19 @@ fn server_steps(shared: &SharedTier, cx: &mut LoopCx<'_>) {
     black_box(cx);
 }
 
+/// What a reactor leg's loop builds of the cold turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Turns {
+    /// No step lends, so no iteration builds a turn.
+    None,
+    /// A lend builds one every iteration.
+    EveryIteration,
+}
+
 /// Drives `ops` iterations of the cell loop over `plane` with `NOPS`
 /// planted per op.
 #[inline(never)]
-fn drive_loop<const NOPS: u8, P: CellPlane>(ops: u64, mut plane: P) -> u64 {
+fn drive_loop<const NOPS: u8, P: CellPlane>(ops: u64, mut plane: P, turns: Turns) -> u64 {
     let (census, serve_mark) = CapCensus::new(CellId(0));
     let timers = TimerSet::build(LOOP_OWNERS, &census).expect("the leg's timer set");
     // Spinning forever: the loop polls every entry and never parks.
@@ -658,8 +673,19 @@ fn drive_loop<const NOPS: u8, P: CellPlane>(ops: u64, mut plane: P) -> u64 {
         accumulator = accumulator.wrapping_add(u64::from(stats.parked));
     }
     // Engagement, after the counted loop: every iteration ran and none
-    // parked.
+    // parked, and the loop built the cold turns its plane lent for: none
+    // with no lend, the last iteration's with a lend every iteration, and
+    // none at `ops` 0 either way.
     assert_eq!(accumulator, 0, "an iteration parked");
+    let built_at = match turns {
+        Turns::None => 0,
+        Turns::EveryIteration => ops,
+    };
+    assert_eq!(
+        lp.cold_turn_built_at(),
+        built_at,
+        "the loop's cold turn: no lend builds none, a lend every iteration builds the last one"
+    );
     accumulator.wrapping_add(lp.executor().live_tasks() as u64)
 }
 
@@ -671,16 +697,21 @@ fn shared_tier() -> Rc<SharedTier> {
 /// Drives `ops` iterations of a reactor leg over its plane.
 fn drive_reactor<const NOPS: u8>(plane: ReactorPlane, ops: u64) -> u64 {
     match plane {
-        ReactorPlane::Idle => drive_loop::<NOPS, _>(ops, IdlePlane),
-        ReactorPlane::Hook => drive_loop::<NOPS, _>(ops, HookPlane { shared: shared_tier() }),
+        ReactorPlane::Idle => drive_loop::<NOPS, _>(ops, IdlePlane, Turns::None),
+        ReactorPlane::Hook => {
+            drive_loop::<NOPS, _>(ops, HookPlane { shared: shared_tier() }, Turns::None)
+        }
         ReactorPlane::Server => {
-            drive_loop::<NOPS, _>(ops, ServerShapedPlane::<false, false> { shared: shared_tier() })
+            let plane = ServerShapedPlane::<false, false> { shared: shared_tier() };
+            drive_loop::<NOPS, _>(ops, plane, Turns::None)
         }
         ReactorPlane::ServerHook => {
-            drive_loop::<NOPS, _>(ops, ServerShapedPlane::<true, false> { shared: shared_tier() })
+            let plane = ServerShapedPlane::<true, false> { shared: shared_tier() };
+            drive_loop::<NOPS, _>(ops, plane, Turns::None)
         }
-        ReactorPlane::ServerLate => {
-            drive_loop::<NOPS, _>(ops, ServerShapedPlane::<false, true> { shared: shared_tier() })
+        ReactorPlane::ServerLend => {
+            let plane = ServerShapedPlane::<false, true> { shared: shared_tier() };
+            drive_loop::<NOPS, _>(ops, plane, Turns::EveryIteration)
         }
     }
 }
