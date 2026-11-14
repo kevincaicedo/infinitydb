@@ -10,6 +10,7 @@
 //! after phase 10's reboot.
 
 use super::*;
+use crate::resp::Reply;
 
 /// Cross-phase state the late phases share with the script.
 pub(super) struct Late<'a> {
@@ -670,11 +671,14 @@ const BURST_ROUNDS_MAX: u32 = 3;
 /// late. The next round is released once the held reads are steady, and only while the owner's
 /// cold host has no member left to visit (its pending count: a member a receipt made ready and no
 /// turn visited is late). A reader with no read held for `STALL_STEPS`, or still waiting at round
-/// [`BURST_ROUNDS_MAX`]'s bound, is a stuck client. Engagement: some step left the owner's cold
-/// host members to visit (its pending count, read between steps: a wiring half), so a turn's
-/// allowance left members to a later turn; else VACUOUS.
+/// [`BURST_ROUNDS_MAX`]'s bound, is a stuck client. The phase is quiet of copy-forward too: from
+/// before its keys are written to its last reply, no file sealed gives a burst key back to RAM
+/// ([`burst_quiet`]). Engagement: some step left the owner's cold host members to visit (its
+/// pending count, read between steps: a wiring half), so a turn's allowance left members to a
+/// later turn; else VACUOUS.
 fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
     let seed = cx.scenario.seed;
+    let ratio = burst_quiet(cx, node, audit)?;
     let keys: Vec<Vec<u8>> =
         (0..BURST_READERS).map(|i| format!("{{{BURST_TAG}}}burst:{i:03}").into_bytes()).collect();
     let values: Vec<Vec<u8>> =
@@ -727,7 +731,71 @@ fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdi
     if pending != 0 {
         bail7d!(cx, "COLD BURST seed {seed:#x}: {pending} members left after every reply");
     }
+    let set_back: &[&[u8]] = &[b"INF.NS", b"SET", NS_NAME, b"COMPACTION-DEAD-RATIO", &ratio];
+    call7d!(cx, node, audit, set_back, b"+OK\r\n", "phase 7e's dead ratio set back");
     Ok(())
+}
+
+/// Phase 7e's compaction dead ratio, in percent: at 100 the dead-ratio arm
+/// takes a file only with every byte dead.
+const BURST_DEAD_RATIO_PCT: &[u8] = b"100";
+
+/// Phase 7e's quiet of copy-forward, set before the burst's keys are
+/// written. Compaction re-appends a file's live records at the RAM tail,
+/// and a file sealed while the keys cool is a candidate at its seal when
+/// its dead bytes are half its data (a node that replayed its whole log
+/// and demoted it again holds mostly dead bytes): it would give burst keys
+/// back to RAM at addresses above the sentinel, which reads cold. So the
+/// namespace's dead ratio is set to [`BURST_DEAD_RATIO_PCT`]; a candidate
+/// already picked ends on a file sealed before the keys were written. The
+/// pressure arm takes the widest dead ratio whatever the setting, but only
+/// under a disk budget, so the namespace must have none, else VACUOUS.
+/// Returns the ratio it read, which the phase sets back after its last
+/// reply.
+fn burst_quiet(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict<Vec<u8>> {
+    let seed = cx.scenario.seed;
+    let info: &[&[u8]] = &[b"INF.NS", b"INFO", NS_NAME];
+    let reply = match audit.call(node, cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max, info) {
+        Ok(Some(reply)) => reply,
+        other => bail7d!(
+            cx,
+            "phase-7e INF.NS INFO answered {}",
+            other.map_or_else(
+                |e| e.to_string(),
+                |r| r.map_or("nothing".to_owned(), |r| preview(&r))
+            )
+        ),
+    };
+    cx.report.commands_done += 1;
+    let fields =
+        (ns_info_field(&reply, b"compaction-dead-ratio"), ns_info_field(&reply, b"disk-budget"));
+    let (Some(ratio), Some(budget)) = fields else {
+        bail7d!(cx, "phase-7e INF.NS INFO carries no tier block: {}", preview(&reply));
+    };
+    if budget != b"0" {
+        bail7d!(
+            cx,
+            "COLD BURST VACUOUS seed {seed:#x}: the namespace's disk-budget is {}, so \
+             compaction's pressure arm may give a burst key back to RAM",
+            String::from_utf8_lossy(&budget)
+        );
+    }
+    let quiet: &[&[u8]] =
+        &[b"INF.NS", b"SET", NS_NAME, b"COMPACTION-DEAD-RATIO", BURST_DEAD_RATIO_PCT];
+    call7d!(cx, node, audit, quiet, b"+OK\r\n", "phase 7e's dead ratio");
+    Ok(ratio)
+}
+
+/// `field`'s value in an `INF.NS INFO` reply, an array of field and value
+/// bulks.
+fn ns_info_field(reply: &[u8], field: &[u8]) -> Option<Vec<u8>> {
+    let Ok(Reply::Array(items)) = crate::resp::try_parse_reply(reply) else {
+        return None;
+    };
+    items.chunks_exact(2).find_map(|pair| match pair {
+        [Reply::Bulk(name), Reply::Bulk(value)] if name == field => Some(value.clone()),
+        _ => None,
+    })
 }
 
 /// Phase 7e's readers and what they answered.
