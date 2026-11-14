@@ -416,30 +416,34 @@ fn phase_7c(
     Ok((node, audit))
 }
 
-/// Phase 7d's steps share these: a failure is on the report and `Err`
-/// ends the script.
+/// Phase 7d's and 7e's steps share these: a failure is on the report and
+/// `Err` ends the script. A scrape or a call prints its phase's name, the
+/// first argument of the shared form, so each phase calls its own pair
+/// (`scrape7d!` and `call7d!`, `scrape7e!` and `call7e!`) and a red is read
+/// as its own phase's.
 macro_rules! bail7d {
     ($cx:expr, $($arg:tt)*) => {{
         $cx.fail(format!($($arg)*));
         return Err(());
     }};
 }
-macro_rules! scrape7d {
-    ($cx:expr, $node:expr, $keys:expr) => {
+macro_rules! scrape_late {
+    ($phase:literal, $cx:expr, $node:expr, $keys:expr) => {
         match info_sum($node, $cx.rng, $cx.clock, $cx.disk, $cx.scenario, $keys) {
             Ok(v) => v,
-            Err(err) => bail7d!($cx, "phase-7d scrape: {err}"),
+            Err(err) => bail7d!($cx, "{} scrape: {err}", $phase),
         }
     };
 }
-macro_rules! call7d {
-    ($cx:expr, $node:expr, $client:expr, $cmd:expr, $want:expr, $what:expr) => {{
+macro_rules! call_late {
+    ($name:literal, $cx:expr, $node:expr, $client:expr, $cmd:expr, $want:expr, $what:expr) => {{
         let want: &[u8] = $want;
         match $client.call($node, $cx.rng, $cx.clock, $cx.disk, $cx.scenario.step_ns_max, $cmd) {
             Ok(Some(reply)) if reply == want => {}
             other => bail7d!(
                 $cx,
-                "PROMOTED-EXTENT VIOLATION seed {:#x}: {} answered {}, wanted {}",
+                "{} VIOLATION seed {:#x}: {} answered {}, wanted {}",
+                $name,
                 $cx.scenario.seed,
                 $what,
                 other.map_or_else(
@@ -451,6 +455,18 @@ macro_rules! call7d {
         }
         $cx.report.commands_done += 1;
     }};
+}
+macro_rules! scrape7d {
+    ($($arg:tt)*) => { scrape_late!("phase-7d", $($arg)*) };
+}
+macro_rules! call7d {
+    ($($arg:tt)*) => { call_late!("PROMOTED-EXTENT", $($arg)*) };
+}
+macro_rules! scrape7e {
+    ($($arg:tt)*) => { scrape_late!("phase-7e", $($arg)*) };
+}
+macro_rules! call7e {
+    ($($arg:tt)*) => { call_late!("COLD BURST", $($arg)*) };
 }
 
 /// Phase 7d (issue #11, the nightly of 2026-11-06): two GETs of one cold
@@ -689,7 +705,7 @@ fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdi
     let values: Vec<Vec<u8>> =
         (0..BURST_READERS).map(|i| value_bytes(b'e', 7, i as u64, BURST_VALUE_LEN)).collect();
     for (key, value) in keys.iter().zip(&values) {
-        call7d!(cx, node, audit, &[b"SET", key, value], b"+OK\r\n", "SET of a burst key");
+        call7e!(cx, node, audit, &[b"SET", key, value], b"+OK\r\n", "SET of a burst key");
     }
     burst_cool(cx, node, audit)?;
     let owner = super::support::owner_cell(cx.scenario.cells, &keys[0]);
@@ -703,7 +719,7 @@ fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdi
     };
     for _ in 0..BURST_READERS {
         let mut reader = MiniClient::connect(node, owner);
-        call7d!(cx, node, reader, use_ns, b"+OK\r\n", "USE of a burst reader");
+        call7e!(cx, node, reader, use_ns, b"+OK\r\n", "USE of a burst reader");
         burst.readers.push(reader);
     }
     // The burst reaches the owner at one reap, as a stopped-then-resumed
@@ -732,12 +748,12 @@ fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdi
              to visit: no turn's allowance left one to a later turn"
         );
     }
-    let pending = scrape7d!(cx, node, &["cold_delivery_pending_members"])[0];
+    let pending = scrape7e!(cx, node, &["cold_delivery_pending_members"])[0];
     if pending != 0 {
         bail7d!(cx, "COLD BURST seed {seed:#x}: {pending} members left after every reply");
     }
     let set_back: &[&[u8]] = &[b"INF.NS", b"SET", NS_NAME, b"COMPACTION-DEAD-RATIO", &ratio];
-    call7d!(cx, node, audit, set_back, b"+OK\r\n", "phase 7e's dead ratio set back");
+    call7e!(cx, node, audit, set_back, b"+OK\r\n", "phase 7e's dead ratio set back");
     Ok(())
 }
 
@@ -787,7 +803,7 @@ fn burst_quiet(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Ve
     }
     let quiet: &[&[u8]] =
         &[b"INF.NS", b"SET", NS_NAME, b"COMPACTION-DEAD-RATIO", BURST_DEAD_RATIO_PCT];
-    call7d!(cx, node, audit, quiet, b"+OK\r\n", "phase 7e's dead ratio");
+    call7e!(cx, node, audit, quiet, b"+OK\r\n", "phase 7e's dead ratio");
     Ok(ratio)
 }
 
@@ -852,13 +868,13 @@ fn burst_cool(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Ver
     let seed = cx.scenario.seed;
     let sentinel = format!("{{{BURST_TAG}}}sentinel").into_bytes();
     let value = value_bytes(b's', 7, 0, BURST_VALUE_LEN);
-    call7d!(cx, node, audit, &[b"SET", &sentinel, &value], b"+OK\r\n", "SET of the sentinel");
+    call7e!(cx, node, audit, &[b"SET", &sentinel, &value], b"+OK\r\n", "SET of the sentinel");
     let want = bulk(&value);
     for batch in 0..FILL_BATCHES_MAX {
         fill_batch(cx, node, audit, BURST_TAG, batch)?;
-        let before = scrape7d!(cx, node, &["tiering_cold_resolves"])[0];
-        call7d!(cx, node, audit, &[b"GET", &sentinel], &want, "GET of the sentinel");
-        if scrape7d!(cx, node, &["tiering_cold_resolves"])[0] > before {
+        let before = scrape7e!(cx, node, &["tiering_cold_resolves"])[0];
+        call7e!(cx, node, audit, &[b"GET", &sentinel], &want, "GET of the sentinel");
+        if scrape7e!(cx, node, &["tiering_cold_resolves"])[0] > before {
             return Ok(());
         }
     }
