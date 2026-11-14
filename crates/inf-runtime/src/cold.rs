@@ -658,6 +658,9 @@ struct ColdState {
     /// Canary: receipts recorded since the last delivery call.
     #[cfg(inf_canary_cold_delivery_budget_per_cqe)]
     renewals: u32,
+    /// Canary: a receipt was recorded since the last delivery call.
+    #[cfg(inf_canary_cold_ready_left_to_receipt)]
+    fresh_receipt: bool,
     /// Per-file pin count over queued + in-flight + undropped `ColdDone`
     /// custody (§3.3). Entries exist only while nonzero.
     pins: HashMap<TierFileId, u32, BuildIntHasher>,
@@ -866,6 +869,8 @@ impl ColdReads {
                 readiness: ColdReadiness::Idle,
                 #[cfg(inf_canary_cold_delivery_budget_per_cqe)]
                 renewals: 0,
+                #[cfg(inf_canary_cold_ready_left_to_receipt)]
+                fresh_receipt: false,
                 pins: HashMap::default(),
                 counters: ColdReadCounters::default(),
                 qd_hist: LogHistogram::new(),
@@ -1271,6 +1276,10 @@ impl ColdReads {
         {
             state.renewals += 1;
         }
+        #[cfg(inf_canary_cold_ready_left_to_receipt)]
+        {
+            state.fresh_receipt = true;
+        }
         Self::link_ready(state, token);
         ColdReceipt::Recorded
     }
@@ -1295,7 +1304,18 @@ impl ColdReads {
         let spent_before = budget.spent();
         let mut progress =
             ColdDeliveryProgress { delivered: 0, unclaimed: 0, state: ColdDeliveryState::Idle };
+        // Canary: a turn that no new receipt precedes leaves the last ready
+        // member unvisited, until a later receipt's turn.
+        #[cfg(inf_canary_cold_ready_left_to_receipt)]
+        let fresh = core::mem::take(&mut self.state.borrow_mut().fresh_receipt);
         loop {
+            #[cfg(inf_canary_cold_ready_left_to_receipt)]
+            {
+                if !fresh && self.state.borrow().pending_members == 1 {
+                    progress.state = ColdDeliveryState::Ready;
+                    break;
+                }
+            }
             let step = match self.delivery_step(budget) {
                 DeliveryVisit::Member(step) => step,
                 DeliveryVisit::Idle => break,

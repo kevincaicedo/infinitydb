@@ -981,6 +981,11 @@ rows=(
   # and a reader still waiting at the third round's bound is a stuck client. Planted, the phase
   # allows no round after the first, and the regression seed's re-reader stalls at the cap.
   "inf_canary_cold_burst_one_round m4-tiered cold-burst-round-cap --seed 0x51ee0630"
+  # A held read shows that some reader reads again, not that each one left does, so phase 7e
+  # releases no round while the owner's cold host has a member left to visit. Planted, a turn that
+  # no new receipt precedes leaves the host's last ready member unvisited, and at the regression
+  # seed the round's re-read is held while that member waits.
+  "inf_canary_cold_ready_left_to_receipt m4-tiered cold-burst-unvisited --seed 0x51ee0630"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
