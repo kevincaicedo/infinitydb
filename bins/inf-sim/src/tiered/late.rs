@@ -897,8 +897,15 @@ struct Round {
     /// Readers unanswered at the release.
     readers: u64,
     /// Steps after the round's receipt within which its replies arrive:
-    /// ⌈`readers` / a turn's visits⌉ + 2.
+    /// [`burst_bound`] of `readers`.
     bound: u64,
+}
+
+/// A round's bound: the steps after its receipt within which the replies of
+/// `readers` arrive, ⌈`readers` / a turn's visits⌉ + 2. The one home of the
+/// bound, so a const that names a step of the bound reads it here.
+const fn burst_bound(readers: u64) -> u64 {
+    readers.div_ceil(inf_runtime::limits::COLD_DELIVERIES_PER_TURN as u64) + 2
 }
 
 /// Steps until every burst reader's reply is in, in rounds: the first
@@ -914,12 +921,11 @@ fn burst_deliver(
     held: usize,
 ) -> Verdict<u64> {
     let seed = cx.scenario.seed;
-    let turn = u64::from(inf_runtime::limits::COLD_DELIVERIES_PER_TURN);
     let mut pending_max = 0;
     let mut round = Round { index: 1, held, readers: 0, bound: 0 };
     loop {
         round.readers = burst.left as u64;
-        round.bound = round.readers.div_ceil(turn) + 2;
+        round.bound = burst_bound(round.readers);
         cx.report.burst_rounds = round.index;
         if burst_round(cx, node, burst, round, &mut pending_max)? {
             return Ok(pending_max);
