@@ -47,6 +47,7 @@ fn an_origin_refused_create_answers_and_its_name_creates_again() {
     c.write_all(&create).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     drop(c);
+    node.expect_crash_loss("a crash-matrix carrier: the next life reads the catalog and new keys");
     node.stop();
     let node = Node::start_durable(2, &dir);
     for cell in 0..2u16 {

@@ -176,7 +176,7 @@ fn every_accepted_create_takes_the_last_committed_id_plus_one() {
     assert_eq!(create_durable(&mut c, b"c1"), b"+OK\r\n");
     oracle.accepted("c1", ns_id(&mut c, b"c1"));
     drop(c);
-    node.stop();
+    node.stop_synced();
     let node = Node::start_durable(2, &dir);
     let mut c = node.connect();
     assert_eq!(create_durable(&mut c, b"c2"), b"+OK\r\n");
