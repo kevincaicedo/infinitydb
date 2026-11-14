@@ -708,7 +708,7 @@ fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdi
     // The burst reaches the owner at one reap, as a stopped-then-resumed
     // client's would: its requests are queued together and merge, so every
     // read the burst issues fits the device's depth and is held whole.
-    node.nets[owner].borrow_mut().deliver_whole();
+    let delivery = node.nets[owner].borrow_mut().deliver_whole();
     cx.disk.hold_reads(Some(is_tier_file));
     for (reader, key) in burst.readers.iter_mut().zip(&keys) {
         reader.send(node, &[b"GET", key]);
@@ -722,7 +722,7 @@ fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdi
     let cold = burst.left;
     let delivered = burst_deliver(cx, node, &mut burst, held);
     cx.disk.hold_reads(None);
-    node.nets[owner].borrow_mut().deliver_chunked();
+    node.nets[owner].borrow_mut().restore_delivery(delivery);
     let pending_max = delivered?;
     if pending_max == 0 {
         bail7d!(
