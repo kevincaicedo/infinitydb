@@ -41,7 +41,7 @@ fn_length	2	bins/inf-sim/src/recovery.rs
 fn_length	1	bins/inf-sim/src/sidecar.rs
 fn_length	1	bins/inf-sim/src/steel.rs
 fn_length	3	bins/inf-sim/src/tiered/late.rs
-fn_length	2	bins/inf-sim/src/tiered/support.rs
+fn_length	1	bins/inf-sim/src/tiered/support.rs
 fn_length	3	bins/inf-sim/src/txmodel/acquisition.rs
 fn_length	1	bins/inf-sim/src/txmodel/durable.rs
 fn_length	1	bins/inf-sim/src/txmodel/watch.rs

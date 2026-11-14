@@ -560,7 +560,8 @@ fn main() {
                  phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
                  DBSIZE drains, {} SCAN twins), blob-key race {} replans, dir-open fault arm {} \
                  (fired {}), tier-read EIO arm {} (fired {}, {} typed replies), ckpt downgrades {} \
-                 / bound splits {}, SCAN batching oracle on {} cold pages ({} cold intents), \
+                 / bound splits {}, SCAN batching oracle judged {} pages ({} violating, {} set \
+                 aside for another reader; {} cold pages, {} cold intents on their cells), \
                  replay \
                  unit above the window on {} cell(s) (acked record bytes per cell {:?}), boot \
                  tier replay {:?} (demote steps, bytes, barriers, files sealed, settle reads, \
@@ -609,6 +610,9 @@ fn main() {
                 report.tier_read_error_replies,
                 report.ckpt_downgrades,
                 report.ckpt_bound_splits,
+                report.scan_pages_judged,
+                report.scan_pages_violating,
+                report.scan_pages_set_aside,
                 report.scan_cold_pages,
                 report.scan_cold_reads,
                 report.replay_above_window_cells,
@@ -622,12 +626,16 @@ fn main() {
             );
             println!(
                 "inf-sim: sim_seconds={:.6} published=0 delivered=0 tier_read_fault_arm={} \
-                 tier_read_faults_fired={} tier_read_error_replies={} scan_cold_pages={} \
+                 tier_read_faults_fired={} tier_read_error_replies={} scan_pages_judged={} \
+                 scan_pages_violating={} scan_pages_set_aside={} scan_cold_pages={} \
                  scan_cold_reads={}",
                 report.sim_seconds,
                 report.tier_read_fault_arm,
                 report.tier_read_faults_fired,
                 report.tier_read_error_replies,
+                report.scan_pages_judged,
+                report.scan_pages_violating,
+                report.scan_pages_set_aside,
                 report.scan_cold_pages,
                 report.scan_cold_reads
             );
@@ -1616,6 +1624,9 @@ struct TieredFold {
     tier_read_faults_fired: u64,
     tier_read_error_replies: u64,
     tier_read_faults_unconsumed: u64,
+    scan_pages_judged: u64,
+    scan_pages_violating: u64,
+    scan_pages_set_aside: u64,
     scan_cold_pages: u64,
     scan_cold_reads: u64,
     ckpt_downgrades: u64,
@@ -1682,6 +1693,9 @@ impl Fold for TieredFold {
         self.tier_read_faults_fired += report.tier_read_faults_fired;
         self.tier_read_error_replies += report.tier_read_error_replies;
         self.tier_read_faults_unconsumed += report.tier_read_faults_unconsumed;
+        self.scan_pages_judged += report.scan_pages_judged;
+        self.scan_pages_violating += report.scan_pages_violating;
+        self.scan_pages_set_aside += report.scan_pages_set_aside;
         self.scan_cold_pages += report.scan_cold_pages;
         self.scan_cold_reads += report.scan_cold_reads;
         self.ckpt_downgrades += report.ckpt_downgrades;
@@ -1776,6 +1790,9 @@ impl TieredFold {
             tier_read_faults_fired,
             tier_read_error_replies,
             tier_read_faults_unconsumed,
+            scan_pages_judged,
+            scan_pages_violating,
+            scan_pages_set_aside,
             scan_cold_pages,
             scan_cold_reads,
             ckpt_downgrades,
@@ -1799,8 +1816,10 @@ impl TieredFold {
              dir-open fault armed on {dir_open_fault_seeds} seeds ({dir_open_faults_fired} \
              fired), tier-read EIO armed on {tier_read_fault_seeds} seeds \
              ({tier_read_faults_fired} fired, {tier_read_error_replies} typed replies, \
-             {tier_read_faults_unconsumed} unconsumed), SCAN batching oracle on \
-             {scan_cold_pages} cold pages ({scan_cold_reads} cold intents), \
+             {tier_read_faults_unconsumed} unconsumed), SCAN batching oracle judged \
+             {scan_pages_judged} pages ({scan_pages_violating} violating, \
+             {scan_pages_set_aside} set aside for another reader; {scan_cold_pages} cold \
+             pages, {scan_cold_reads} cold intents on their cells), \
              ckpt arms [downgrades {ckpt_downgrades} bound_splits \
              {ckpt_bound_splits}], {diskfull_refusals} DISKFULL refusals, \
              drop-race {drop_values} values / {drop_other} typed-other ({drop_probes} probe \
@@ -1882,6 +1901,9 @@ impl TieredFold {
             tier_read_faults_fired,
             tier_read_error_replies,
             tier_read_faults_unconsumed,
+            scan_pages_judged,
+            scan_pages_violating,
+            scan_pages_set_aside,
             scan_cold_pages,
             scan_cold_reads,
             ckpt_downgrades,
@@ -1907,6 +1929,9 @@ impl TieredFold {
              tier_read_faults_fired={tier_read_faults_fired} \
              tier_read_error_replies={tier_read_error_replies} \
              tier_read_faults_unconsumed={tier_read_faults_unconsumed} \
+             scan_pages_judged={scan_pages_judged} \
+             scan_pages_violating={scan_pages_violating} \
+             scan_pages_set_aside={scan_pages_set_aside} \
              scan_cold_pages={scan_cold_pages} scan_cold_reads={scan_cold_reads} \
              ckpt_downgrades={ckpt_downgrades} ckpt_bound_splits={ckpt_bound_splits} \
              diskfull_refusals={diskfull_refusals} \

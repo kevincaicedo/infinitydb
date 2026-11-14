@@ -315,6 +315,14 @@ impl CellNet {
     pub fn pending_bytes(&self) -> usize {
         self.conns.values().map(|c| c.to_server.len()).sum()
     }
+
+    /// Client→server bytes of the one connection `fd` that the server has
+    /// not taken yet, `None` for an fd this net never opened: a client's
+    /// own share of [`pending_bytes`](Self::pending_bytes), which counts
+    /// every connection of the cell.
+    pub fn unread(&self, fd: RawFd) -> Option<usize> {
+        self.conns.get(&fd).map(|c| c.to_server.len())
+    }
 }
 
 /// `BackendDriver` over a [`CellNet`]. One per cell. Durable scenarios

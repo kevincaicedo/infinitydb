@@ -2357,6 +2357,14 @@ impl Node {
         self.cells[cell].0.driver()
     }
 
+    /// The tier reads `cell`'s sim driver has taken in this node's life, read
+    /// between scheduler steps. The driver counts a read as it takes it, a
+    /// held one once its hold lifts, and the count only grows. It carries no
+    /// owner: a reading of it is the cell's, never one command's.
+    pub(crate) fn cell_tier_reads(&self, cell: usize) -> u64 {
+        self.driver(cell).observed_io().read_ops
+    }
+
     /// What `cell`'s reactor iteration reported in the last scheduler step,
     /// `None` when that step did not run the cell (frozen): a skipped cell
     /// has no iteration to read. `parked` is the reactor's own decision,
@@ -2399,6 +2407,36 @@ pub(crate) struct MiniClient {
     rx: Vec<u8>,
 }
 
+/// One command's reply and the tier reads its cell's sim driver took while
+/// the command was in flight ([`MiniClient::round_trip`]). Each reading is
+/// the cell's: the driver's count carries no owner, so the verdict that
+/// reads one says when it may stand for the command's (ADR-0208 D1). It holds
+/// no step count: a round trip's steps are the net's chunking of the command
+/// and the reply's own, never work the product did.
+#[derive(Debug)]
+pub(crate) struct RoundTrip {
+    pub(crate) reply: Vec<u8>,
+    /// Reads taken from the send through the step after which the cell held
+    /// every byte of the command. That step's driver entry ran before the
+    /// cell parsed the command, so none of these reads is the command's.
+    pub(crate) cell_reads_before: u64,
+    /// Reads taken after that step, through the step whose end found the
+    /// reply framed.
+    pub(crate) cell_reads: u64,
+    /// The steps among those in which the driver took a read or more, so at
+    /// most `cell_reads`.
+    pub(crate) cell_read_steps: u64,
+}
+
+/// Where a pumped command stands at its cell, read after each step.
+#[derive(Copy, Clone, Debug)]
+enum Arrival {
+    /// Bytes of the command are still in the client's queue to the cell.
+    Sent,
+    /// The cell has taken every byte of it.
+    Whole,
+}
+
 impl MiniClient {
     pub(crate) fn connect(node: &mut Node, cell: usize) -> MiniClient {
         let fd = node.nets[cell].borrow_mut().connect();
@@ -2425,6 +2463,66 @@ impl MiniClient {
             }
         }
         Ok(None) // stall — the caller records the verdict
+    }
+
+    /// [`call`](Self::call)'s round trip, read as it runs: it sends `argv`
+    /// and steps the node to its framed reply, and after each step reads the
+    /// tier reads the cell's driver took in it and this connection's bytes
+    /// the cell has not taken. It takes no draw and sends nothing beyond
+    /// `argv`, so a run's trace is `call`'s. A verdict reads the reply and the
+    /// [`RoundTrip`]'s readings, never the steps: they count the net's chunks
+    /// of the command and the reply's own, so they stay here as the hang
+    /// bound. `None` is a stall after [`STALL_STEPS`] steps, as `call`'s.
+    pub(crate) fn round_trip(
+        &mut self,
+        node: &mut Node,
+        rng: &mut SplitMix64,
+        clock: &Rc<VirtualClock>,
+        disk: &SimDisk,
+        step_ns_max: u64,
+        argv: &[&[u8]],
+    ) -> std::io::Result<Option<RoundTrip>> {
+        node.nets[self.cell].borrow_mut().client_send(self.fd, &encode(argv));
+        let mut arrival = Arrival::Sent;
+        let mut taken = node.cell_tier_reads(self.cell);
+        let (mut cell_reads_before, mut cell_reads, mut cell_read_steps) = (0u64, 0u64, 0u64);
+        for _ in 0..STALL_STEPS {
+            node.step(rng, clock, disk, step_ns_max)?;
+            let now = node.cell_tier_reads(self.cell);
+            let took = now - taken;
+            taken = now;
+            match arrival {
+                Arrival::Sent => {
+                    cell_reads_before += took;
+                    if node.nets[self.cell].borrow().unread(self.fd) == Some(0) {
+                        arrival = Arrival::Whole;
+                    }
+                }
+                Arrival::Whole => {
+                    if took > 0 {
+                        cell_reads += took;
+                        cell_read_steps += 1;
+                    }
+                }
+            }
+            let bytes = node.nets[self.cell].borrow_mut().client_recv(self.fd);
+            self.rx.extend_from_slice(&bytes);
+            if let Some(n) = reply_len(&self.rx) {
+                assert!(
+                    matches!(arrival, Arrival::Whole),
+                    "a reply framed before its cell took the whole command: a cell answers \
+                     only bytes it has taken"
+                );
+                let reply: Vec<u8> = self.rx.drain(..n).collect();
+                return Ok(Some(RoundTrip {
+                    reply,
+                    cell_reads_before,
+                    cell_reads,
+                    cell_read_steps,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// Sends `argv` without awaiting its reply — for commands that must

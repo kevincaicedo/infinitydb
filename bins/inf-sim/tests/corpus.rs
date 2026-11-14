@@ -170,3 +170,40 @@ fn the_drop_race_filler_leg_meets_its_held_read() {
     );
     assert_eq!(report.drop_reads_held, 1, "the DROP met the filler key's held read");
 }
+
+/// `m4-tiered` at `0x51ee07f7`, one seed of the nightly's 4,000 from
+/// `0x51EE0000`. Cell 1's page of 16 cold slots enqueues them in one reactor
+/// iteration, and the device takes their 6 merged reads at one entry, though
+/// the page answers 16 scheduler steps after its send: the net hands the
+/// command's 56 bytes to the cell in 12 seeded chunks, a step each, and the
+/// reply takes 3 more. The batching oracle reads the tier reads the cell's
+/// device took once the cell held the whole command, so the arrival's steps
+/// are in no count, and no page of this seed puts 16 reads at its device:
+/// none is judged, and none is set aside.
+// nextest-long: 15 s
+#[test]
+fn a_scan_page_is_judged_by_the_steps_its_reads_took() {
+    let report = run_tiered_scenario(&TieredScenario::m4_tiered(0x51ee_07f7));
+    assert!(report.ok(), "stalled={} violations={:?}", report.stalled, report.violations);
+    assert_eq!(report.scan_pages_judged, 0, "no page of this seed reaches the oracle's floor");
+    assert_eq!(report.scan_pages_set_aside, 0, "no page of this seed reaches the oracle's floor");
+}
+
+/// `m4-tiered` at `0x51ee082d`: the seed where the `SCAN` batching oracle is
+/// seen speaking. It judges 6 pages, none violating, and sets aside 3 whose
+/// cell's device took another reader's tier reads around the page, so both
+/// the verdict and the guard before it are reached on the plain build.
+// nextest-long: 37 s
+#[test]
+fn the_scan_batching_oracle_judges_pages_and_sets_others_aside() {
+    let report = run_tiered_scenario(&TieredScenario::m4_tiered(0x51ee_082d));
+    assert!(report.ok(), "stalled={} violations={:?}", report.stalled, report.violations);
+    let repin = format!(
+        "the seed's pages move with the scenario's draws, so a new count is right only in a \
+         change that also moves this seed's trace hash ({:#018x} here): re-pin it there, and \
+         check the canary's row still judges pages",
+        report.trace_hash
+    );
+    assert_eq!(report.scan_pages_judged, 6, "pages judged: {repin}");
+    assert_eq!(report.scan_pages_set_aside, 3, "pages set aside for another reader: {repin}");
+}

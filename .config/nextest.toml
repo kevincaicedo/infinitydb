@@ -122,6 +122,10 @@ filter = 'binary_id(infinityd::replay_spill) & test(=a_tail_above_every_cells_wi
 priority = 37
 
 [[profile.default.overrides]]
+filter = 'binary_id(inf-sim::corpus) & test(=the_scan_batching_oracle_judges_pages_and_sets_others_aside)'
+priority = 37
+
+[[profile.default.overrides]]
 filter = 'binary_id(infinityd::replay_spill) & test(=a_tail_above_every_cells_window_boots_under_fsync_everysec)'
 priority = 35
 
@@ -167,4 +171,8 @@ priority = 18
 
 [[profile.default.overrides]]
 filter = 'binary_id(inf-server::recover_replay_steps) & test(=every_budget_recovers_the_end_of_the_unparked_boot)'
+priority = 15
+
+[[profile.default.overrides]]
+filter = 'binary_id(inf-sim::corpus) & test(=a_scan_page_is_judged_by_the_steps_its_reads_took)'
 priority = 15

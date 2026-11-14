@@ -453,10 +453,18 @@ pub struct TieredNodeReport {
     /// Armed faults the audit never consumed (disarmed after it).
     pub tier_read_faults_unconsumed: u64,
     /// F-L17-13 (L3): `SCAN` pages that resolved cold slots, and the cold
-    /// intents they enqueued — the batching oracle's coverage (a walk
-    /// that never met a cold page proves nothing about batching).
+    /// intents the cell's `INFO tiering` counted across each: the cell's
+    /// count, not the page's, so it is disclosed and judges nothing.
     pub scan_cold_pages: u64,
     pub scan_cold_reads: u64,
+    /// The `SCAN` batching oracle's pages over every walk of the run
+    /// (ADR-0208 D2): judged (16 tier reads or more at the asked cell's
+    /// device and no other reader there), violating (every driver entry
+    /// that took a read took one), and set aside (16 reads or more beside
+    /// another reader).
+    pub scan_pages_judged: u64,
+    pub scan_pages_violating: u64,
+    pub scan_pages_set_aside: u64,
     /// F-L03-04 / ADR-0117 engagement: checkpoint staging downgrades
     /// (the `EINVAL` seeds) and sections sealed for the bound (the
     /// section-bound seeds), summed over cells at phase 10b.
