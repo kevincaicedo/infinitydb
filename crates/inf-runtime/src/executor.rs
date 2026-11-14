@@ -626,6 +626,10 @@ impl Drop for Scratch {
     }
 }
 
+// Inlined in every instance of the first poll (`poll_immediate` is generic): left to the
+// inliner, one instance in a large caller called it while the others inlined it, so two
+// links of one source ran other code on the first poll (ADR-0205 D2).
+#[inline(always)]
 fn allocate(layout: Layout) -> NonNull<u8> {
     if layout.size() == 0 {
         // Zero-sized futures need no storage; a well-aligned dangling
@@ -713,6 +717,8 @@ impl CellExecutor {
 
     /// A new header: no waker counted on either lane, no flag, this thread's mark and this
     /// executor's stack.
+    // Inlined in every instance of the first poll, as `allocate` is (ADR-0205 D2).
+    #[inline(always)]
     fn new_header(&self) -> Header {
         let header = Box::new(WakeHeader {
             bridge: WakeBridge::new(self.stack_ref(), self.mark),
@@ -787,6 +793,8 @@ impl CellExecutor {
     /// A completed first poll's header, its future dropped: kept spare for the next first poll
     /// when no waker names it and it is not queued; otherwise Held, and the next first poll
     /// takes a new header (a clone escaped a future that completed anyway).
+    // Inlined in every instance of the first poll, as `allocate` is (ADR-0205 D2).
+    #[inline(always)]
     fn decide_first_poll(&mut self, header: Header) {
         // SAFETY: the executor holds the header: open, on this thread.
         #[cfg(not(inf_canary_ready_ignores_queued))]
@@ -930,13 +938,30 @@ impl CellExecutor {
         let owner = unsafe { owner(entry.header) };
         owner.state.set(TaskState::Dead);
         owner.slot.set(UNASSIGNED);
-        self.free.push(slot);
+        // The push never grows in line: the growth call would take a pointer into the executor,
+        // and unless the link proves that it keeps none, `run_ready` reloads the executor's
+        // fields after every poll, so its body would depend on what else the binary links.
+        if self.free.len() < self.free.capacity() {
+            self.free.push(slot);
+        } else {
+            self.grow_free(slot);
+        }
         self.live -= 1;
         // The future drops in place here (drop_in_place + dealloc): every waker it owned is
         // counted out before the decision.
         drop(entry.fut);
         // SAFETY: as above; its future is dropped, so the header is decided once, here.
         unsafe { decide_released(entry.header) };
+    }
+
+    /// The free list's growth, cold and out of line: the list is taken out of the executor,
+    /// grown and put back, so the growth call receives no pointer into the executor.
+    #[cold]
+    #[inline(never)]
+    fn grow_free(&mut self, slot: u32) {
+        let mut free = core::mem::take(&mut self.free);
+        free.push(slot);
+        self.free = free;
     }
 
     /// Live (suspended or queued) tasks — slab occupancy. The leak assert:
