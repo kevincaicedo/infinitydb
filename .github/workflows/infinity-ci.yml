@@ -111,8 +111,9 @@ jobs:
       # sanctioned site.
       - name: clock ban (type-resolved, planted-bypass probe)
         run: ./scripts/check-clock-ban.sh
-      # ADR-0106 D8, ADR-0003: no atomics in the waker path, read from the
-      # bodies each waker's vtable reaches, against a planted-bypass probe.
+      # ADR-0106 D8, ADR-0003 A1: no atomic on the waker's owner lane, read
+      # from the bodies each waker's vtable reaches up to the foreign lane's
+      # boundary, against a planted-bypass probe.
       # Linux only: the Mach-O asm flavor is handled but unverified, and an
       # unverified red on one leg would be noise, not evidence.
       - name: waker-atomics (vtable-resolved, planted-bypass probe)
