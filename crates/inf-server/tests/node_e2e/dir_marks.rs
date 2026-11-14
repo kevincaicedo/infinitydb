@@ -99,7 +99,7 @@ fn marks() -> MutexGuard<'static, BTreeMap<PathBuf, DirMark>> {
     MARKS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// One key for every spelling of a directory (`dir`, `dir/.`): its
+/// One key for every spelling of a directory (`dir`, `dir/../<name>`): its
 /// canonical path, else the path as given.
 fn dir_key(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
@@ -281,16 +281,20 @@ fn reading_of(text: &str, cell: u16) -> Option<(u64, u64)> {
 
 /// The planted violation: the shared life ends crash-equivalent with its
 /// frame above the watermark and no statement. The next boot, through
-/// another spelling of the directory (`dir/.`, one key), is refused before
-/// it opens anything, and the message names cell 0 with a reading that is
-/// not zero.
+/// another spelling of the directory (`dir/../<name>`, one key), is refused
+/// before it opens anything, and the message names cell 0 with a reading
+/// that is not zero.
 #[test]
 fn a_crash_stop_above_the_watermark_fails_the_next_boot_vacuous() {
     let dir = temp_data_dir("crash-loss-plant");
     let (node, c) = crash_loss_life(&dir);
     drop(c);
     node.stop();
-    let alias = dir.join(".");
+    // `Path` compares by components and drops a `.` from them, so `dir/.`
+    // equals `dir` with the key taken as given and never tests the canonical
+    // key; a `..` stays, so only `canonicalize` maps this spelling to `dir`.
+    let name = dir.file_name().expect("a temporary data directory has a name");
+    let alias = dir.join("..").join(name);
     let text = match std::panic::catch_unwind(|| Node::start_durable(1, &alias)) {
         Ok(node) => {
             node.stop();
