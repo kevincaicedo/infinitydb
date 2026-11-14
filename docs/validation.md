@@ -235,6 +235,11 @@ source, one on each revision, each in its own clean checkout, with the
 benchmark's files and every input its copy compiles from checked identical
 before either builds. A copy in the new build serves step 2's timing only,
 and its offset from the old build at the same source is reported beside it.
+A benchmark binary is not the server binary either: it can be built with
+other features and beside other code, so before a count is read the
+functions it measures are compared, instruction for instruction, with the
+same functions in the server binary built at the same revision, and a count
+read on code that differs is not the server's.
 
 Record which of these the conclusion rests on. A cross-binary timing result
 is context, not the verdict.
