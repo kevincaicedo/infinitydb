@@ -646,10 +646,6 @@ const BURST_TAG: &str = "p7e";
 /// A burst key's value: small, so one device read covers many adjacent keys.
 const BURST_VALUE_LEN: usize = 400;
 
-/// Steps in a row the owner's held reads must stay unchanged before the
-/// burst's issue counts as done.
-const BURST_HELD_STEADY_STEPS: u64 = 8;
-
 /// Phase 7e: a cold burst on a quiet node, then its delivery (ADR-0181 R1,
 /// R2). Burst keys on one cell are written and pushed out of RAM by filler
 /// batches; then one `GET` of each from its own connection to the owning
@@ -785,24 +781,14 @@ fn burst_cool(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Ver
 /// a `GET` answered from RAM, judged and kept out of the cold count.
 /// Returns the reads held.
 fn burst_hold(cx: &mut Late<'_>, node: &mut Node, burst: &mut Burst) -> Verdict<usize> {
-    let (mut held, mut steady) = (0, 0u64);
-    for _ in 0..STALL_STEPS {
+    steady_held_reads(STALL_STEPS, || {
         if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
             bail7d!(cx, "phase-7e hold step: {err}");
         }
         cx.report.scheduler_steps += 1;
         burst.collect(cx, node)?;
-        let now = node.driver(burst.owner).held_reads();
-        if now > 0 && now == held {
-            steady += 1;
-            if steady == BURST_HELD_STEADY_STEPS {
-                break;
-            }
-        } else {
-            (held, steady) = (now, 0);
-        }
-    }
-    Ok(held)
+        Ok(node.driver(burst.owner).held_reads())
+    })
 }
 
 /// Steps until every burst reader's reply is in, each cold reply judged
@@ -834,7 +820,7 @@ fn burst_deliver(cx: &mut Late<'_>, node: &mut Node, burst: &mut Burst) -> Verdi
                 bail7d!(
                     cx,
                     "COLD BURST VIOLATION seed {seed:#x}: {arrived} replies arrived {} steps after \
-                     the latest receipt, over {bound} (⌈{members} / 64⌉ + 2)",
+                     the latest receipt, over {bound} (⌈{members} / {turn}⌉ + 2)",
                     step - mark
                 );
             }
@@ -1015,11 +1001,6 @@ fn check_listing_repeats(cx: &mut Late<'_>) {
                 .to_string(),
         );
     }
-}
-
-/// A tier file, by its name.
-fn is_tier_file(path: &std::path::Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "itier")
 }
 
 /// Whether any cell's device holds a tier read now: the harness's own

@@ -63,7 +63,7 @@ use inf_server::CkptTarget;
 
 use crate::driver::Violations;
 use crate::durable::{
-    DurableScenario, MiniClient, Node, STALL_STEPS, TraceObserver, boot, build_disk,
+    DurableScenario, MiniClient, Node, STALL_STEPS, TraceObserver, boot, build_disk, is_tier_file,
     m2_stall_config,
 };
 
@@ -235,11 +235,6 @@ struct Run {
     next_key: u64,
 }
 
-/// A tier file, by its name.
-fn is_tier(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "itier")
-}
-
 /// A blob extent file, by its name.
 fn is_extent(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "iblob")
@@ -247,7 +242,7 @@ fn is_extent(path: &Path) -> bool {
 
 /// A tier file under cell 1's shard: the pinned cycle's peer.
 fn is_peer_tier(path: &Path) -> bool {
-    is_tier(path) && path.components().any(|part| part.as_os_str() == "shard-1")
+    is_tier_file(path) && path.components().any(|part| part.as_os_str() == "shard-1")
 }
 
 fn create_argv(name: &[u8]) -> Vec<&[u8]> {
@@ -695,7 +690,7 @@ fn pinned_cycle(
 ) -> Result<(), String> {
     run.disk.hold_syncs(Some(is_peer_tier));
     run.write_until(victim, 1, "held a flush barrier on cell 1", |run| run.held(1).0 > 0)?;
-    run.disk.hold_reads(Some(is_tier));
+    run.disk.hold_reads(Some(is_tier_file));
     let keys: Vec<Vec<u8>> = run
         .live
         .get(victim)

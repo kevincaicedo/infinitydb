@@ -78,7 +78,7 @@ use inf_server::StallConfig;
 use crate::durable::{
     DurableScenario, DurableWorkload, MiniClient, Node, NsClass, OpRec, Pending, STALL_STEPS,
     TraceObserver, WakeLeg, Writer, admissible_states, boot, build_disk_with, bulk, encode,
-    m2_stall_config, required_index,
+    is_tier_file, m2_stall_config, required_index, steady_held_reads,
 };
 use crate::net::Plant;
 use crate::resp::reply_len;

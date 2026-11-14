@@ -1695,6 +1695,41 @@ pub(crate) fn bulk(value: &[u8]) -> Vec<u8> {
     wire
 }
 
+/// A tier file, by its name: the predicate a harness hands the sim disk's
+/// tier-read hold.
+pub(crate) fn is_tier_file(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "itier")
+}
+
+/// Steps in a row a cell's held tier reads must stay unchanged, above 0,
+/// before a harness counts a burst's issue as done.
+pub(crate) const HELD_READS_STEADY_STEPS: u64 = 8;
+
+/// Runs `step` at most `steps_max` times, each one scheduler step that
+/// answers the watched cell's held tier reads (the sim driver's own count,
+/// no product counter), until that count stays above 0 and unchanged for
+/// [`HELD_READS_STEADY_STEPS`] steps in a row: every read the burst issues
+/// is queued at the device. Returns the reads held then, or the last steady
+/// count at the bound (0 when none held); a `step` error ends the wait.
+pub(crate) fn steady_held_reads<E>(
+    steps_max: u64,
+    mut step: impl FnMut() -> Result<usize, E>,
+) -> Result<usize, E> {
+    let (mut held, mut steady) = (0, 0);
+    for _ in 0..steps_max {
+        let now = step()?;
+        if now > 0 && now == held {
+            steady += 1;
+            if steady == HELD_READS_STEADY_STEPS {
+                break;
+            }
+        } else {
+            (held, steady) = (now, 0);
+        }
+    }
+    Ok(held)
+}
+
 impl Writer {
     /// One writer with the frozen per-id RNG stream (`0xD11E_0000 + id`
     /// — the m2 trace contract). `channels` sizes the PUBLISH sequence

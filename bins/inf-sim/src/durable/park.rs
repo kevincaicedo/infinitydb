@@ -29,7 +29,10 @@ use inf_foundation::rng::SplitMix64;
 use inf_foundation::time::{Nanos, VirtualClock};
 use inf_server::{SimDisk, StallConfig};
 
-use super::{DurableScenario, MiniClient, Node, TraceObserver, boot, build_disk};
+use super::{
+    DurableScenario, MiniClient, Node, TraceObserver, boot, build_disk, is_tier_file,
+    steady_held_reads,
+};
 
 const SEED: u64 = 0xC0FFEE;
 
@@ -417,13 +420,6 @@ const COLD_KEYS_MAX: usize = 40_000;
 const COLD_PARK_STEPS_MAX: u32 = 256;
 /// Steps the quiet clause reads after the cell parks.
 const COLD_QUIET_STEPS: u32 = 16;
-/// Steps in a row the device's held reads must stay unchanged before the
-/// burst's issue counts as done.
-const COLD_HELD_STEADY_STEPS: u32 = 8;
-
-fn is_tier_file(path: &std::path::Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "itier")
-}
 
 fn cold_key(i: usize) -> Vec<u8> {
     format!("c:{i:05}").into_bytes()
@@ -545,19 +541,11 @@ fn a_cell_with_cold_members_to_visit_begins_no_iteration_parked() {
     for (i, reader) in readers.iter_mut().enumerate() {
         reader.send(&mut quiet.node, &[b"GET", &cold_key(i)]);
     }
-    let (mut held, mut steady) = (0, 0);
-    for _ in 0..STEPS_MAX {
+    let held = steady_held_reads(u64::from(STEPS_MAX), || {
         quiet.step();
-        let now = quiet.node.driver(0).held_reads();
-        if now > 0 && now == held {
-            steady += 1;
-            if steady == COLD_HELD_STEADY_STEPS {
-                break;
-            }
-        } else {
-            (held, steady) = (now, 0);
-        }
-    }
+        Ok::<_, std::convert::Infallible>(quiet.node.driver(0).held_reads())
+    });
+    let Ok(held) = held;
     assert!(held > 0, "VACUOUS: the burst issued no tier read");
     quiet.disk.hold_reads(None);
     let pending = |quiet: &Quiet| quiet.node.plane(0).cold_pending_for_sim();

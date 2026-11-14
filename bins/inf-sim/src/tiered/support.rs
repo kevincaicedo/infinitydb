@@ -291,7 +291,7 @@ pub(super) fn tier_read_fault_probe(
     report.tier_read_fault_arm = true;
     let mut armed = 0u64;
     for (path, _) in disk.image() {
-        if path.extension().is_some_and(|ext| ext == "itier") {
+        if is_tier_file(&path) {
             disk.inject(&path, inf_server::DeviceFault::ReadEio, 1)
                 .map_err(|err| format!("tier-read arm {path:?}: {err}"))?;
             armed += 1;
