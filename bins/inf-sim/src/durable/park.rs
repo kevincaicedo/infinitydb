@@ -30,7 +30,7 @@ use inf_foundation::time::{Nanos, VirtualClock};
 use inf_server::{SimDisk, StallConfig};
 
 use super::{
-    DurableScenario, MiniClient, Node, TraceObserver, boot, build_disk, is_tier_file,
+    DurableScenario, HeldReads, MiniClient, Node, TraceObserver, boot, build_disk, is_tier_file,
     steady_held_reads,
 };
 
@@ -541,9 +541,10 @@ fn a_cell_with_cold_members_to_visit_begins_no_iteration_parked() {
     for (i, reader) in readers.iter_mut().enumerate() {
         reader.send(&mut quiet.node, &[b"GET", &cold_key(i)]);
     }
+    // Every reader waits through the hold: its replies are read after it.
     let held = steady_held_reads(u64::from(STEPS_MAX), || {
         quiet.step();
-        Ok::<_, std::convert::Infallible>(quiet.node.driver(0).held_reads())
+        Ok::<_, std::convert::Infallible>(HeldReads::Waiting(quiet.node.driver(0).held_reads()))
     });
     let Ok(held) = held;
     assert!(held > 0, "VACUOUS: the burst issued no tier read");

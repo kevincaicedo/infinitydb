@@ -1705,19 +1705,29 @@ pub(crate) fn is_tier_file(path: &std::path::Path) -> bool {
 /// before a harness counts a burst's issue as done.
 pub(crate) const HELD_READS_STEADY_STEPS: u64 = 8;
 
+/// What one step of [`steady_held_reads`] answers.
+pub(crate) enum HeldReads {
+    /// A reader still waits on its reply: the watched cell's held tier reads.
+    Waiting(usize),
+    /// Every reader has answered, so nothing is left to wait for.
+    Answered,
+}
+
 /// Runs `step` at most `steps_max` times, each one scheduler step that
 /// answers the watched cell's held tier reads (the sim driver's own count,
 /// no product counter), until that count stays above 0 and unchanged for
 /// [`HELD_READS_STEADY_STEPS`] steps in a row: every read the burst issues
-/// is queued at the device. Returns the reads held then, or the last steady
-/// count at the bound (0 when none held); a `step` error ends the wait.
+/// is queued at the device. A step that answers [`HeldReads::Answered`]
+/// ends the wait early. Returns the last count a step read: the steady
+/// count, or at the bound or the early end whatever the last count was (0
+/// when none was read or none held); a `step` error ends the wait.
 pub(crate) fn steady_held_reads<E>(
     steps_max: u64,
-    mut step: impl FnMut() -> Result<usize, E>,
+    mut step: impl FnMut() -> Result<HeldReads, E>,
 ) -> Result<usize, E> {
     let (mut held, mut steady) = (0, 0);
     for _ in 0..steps_max {
-        let now = step()?;
+        let HeldReads::Waiting(now) = step()? else { break };
         if now > 0 && now == held {
             steady += 1;
             if steady == HELD_READS_STEADY_STEPS {

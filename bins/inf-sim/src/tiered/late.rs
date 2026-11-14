@@ -870,7 +870,8 @@ fn burst_cool(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Ver
 
 /// Steps until the owner's held tier reads stop growing: every read the
 /// burst issues is queued at the device. A reply that arrives meanwhile is
-/// a `GET` answered from RAM, judged and kept out of the cold count.
+/// a `GET` answered from RAM, judged and kept out of the cold count; once
+/// every reader has answered so, the hold has nothing left to wait for.
 /// Returns the reads held.
 fn burst_hold(cx: &mut Late<'_>, node: &mut Node, burst: &mut Burst) -> Verdict<usize> {
     steady_held_reads(STALL_STEPS, || {
@@ -879,7 +880,10 @@ fn burst_hold(cx: &mut Late<'_>, node: &mut Node, burst: &mut Burst) -> Verdict<
         }
         cx.report.scheduler_steps += 1;
         burst.collect(cx, node)?;
-        Ok(node.driver(burst.owner).held_reads())
+        if burst.left == 0 {
+            return Ok(HeldReads::Answered);
+        }
+        Ok(HeldReads::Waiting(node.driver(burst.owner).held_reads()))
     })
 }
 
@@ -1017,7 +1021,8 @@ fn burst_wait(
                  past round {index}'s bound of {bound} steps (⌈{readers} / {turn}⌉ + 2)"
             );
         }
-        Ok(node.driver(burst.owner).held_reads())
+        // A reply ends the wait above as late, so every reader left still waits.
+        Ok(HeldReads::Waiting(node.driver(burst.owner).held_reads()))
     })?;
     let left = burst.left;
     if held == 0 {
