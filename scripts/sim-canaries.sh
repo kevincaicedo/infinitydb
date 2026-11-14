@@ -976,6 +976,11 @@ rows=(
   "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --plant tier-read-eio"
   "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --replay-above-window"
   "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --listing-repeats"
+  # m4-tiered's phase 7e delivers a cold burst in rounds: a reader that reads again after its
+  # resume (its candidate held another key's record) is judged against the next round's receipt,
+  # and a reader still waiting at the third round's bound is a stuck client. Planted, the phase
+  # allows no round after the first, and the regression seed's re-reader stalls at the cap.
+  "inf_canary_cold_burst_one_round m4-tiered cold-burst-round-cap --seed 0x51ee0630"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

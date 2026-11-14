@@ -652,7 +652,11 @@ const BURST_VALUE_LEN: usize = 400;
 /// fingerprint match), its key's cold address moved while it waited, or its image ran past its
 /// window; each further round needs one more such miss, so a reader still waiting at the last
 /// round's bound is a stuck client.
+#[cfg(not(inf_canary_cold_burst_one_round))]
 const BURST_ROUNDS_MAX: u32 = 3;
+// Canary: no round after the burst's own.
+#[cfg(inf_canary_cold_burst_one_round)]
+const BURST_ROUNDS_MAX: u32 = 1;
 
 /// Phase 7e: a cold burst, then its delivery in rounds (ADR-0181 R1, R2). Burst keys on one cell
 /// are written and pushed out of RAM by filler batches; then one `GET` of each from its own
