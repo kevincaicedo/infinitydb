@@ -646,22 +646,33 @@ const BURST_TAG: &str = "p7e";
 /// A burst key's value: small, so one device read covers many adjacent keys.
 const BURST_VALUE_LEN: usize = 400;
 
-/// Phase 7e: a cold burst, then its delivery (ADR-0181 R1, R2). Burst keys on one cell are written
-/// and pushed out of RAM by filler batches; then one `GET` of each from its own connection to the
-/// owning cell, all reaching it at one reap, so they merge into fewer reads than the device's
-/// depth, while the device holds tier reads until every read the burst issues is queued there;
-/// released at one driver entry, their receipts make more members ready than a turn visits. Other
-/// tier reads may run beside the burst (a replay-above-window node keeps reading its tier), so the
-/// oracle's mark is the burst's own receipt: the step at which the owner's sim driver has counted
-/// the reads the hold released, set once. From that step to the last reply the device holds tier
-/// reads again, so no other read completes and no other window becomes ready, and a sim cell
-/// iterates every step, so the server's `before_execute` delivers the burst alone. Oracle: each
-/// reply is its value, and a cold one arriving after the mark arrives within ⌈members / 64⌉ + 2
-/// steps of it (the harness's reply log against the device's own count); a `GET` unanswered at
-/// `STALL_STEPS` is a stuck client, as is a burst read issued after the release, which the second
-/// hold keeps from the device. Engagement: some step left the owner's cold host members to visit
-/// (its pending count, read between steps: a wiring half), so a turn's allowance left members to a
-/// later turn; else VACUOUS.
+/// Rounds of phase 7e's delivery: the burst's own reads, then at most two rounds of re-reads. A
+/// reader reads again after its resume when its candidate held another key's record (a
+/// fingerprint match), its key's cold address moved while it waited, or its image ran past its
+/// window; each further round needs one more such miss, so a reader still waiting at the last
+/// round's bound is a stuck client.
+const BURST_ROUNDS_MAX: u32 = 3;
+
+/// Phase 7e: a cold burst, then its delivery in rounds (ADR-0181 R1, R2). Burst keys on one cell
+/// are written and pushed out of RAM by filler batches; then one `GET` of each from its own
+/// connection to the owning cell, all reaching it at one reap, so they merge into fewer reads than
+/// the device's depth, while the device holds tier reads until every read the burst issues is
+/// queued there; released at one driver entry, their receipts make more members ready than a turn
+/// visits. A round is the tier reads the device holds, released at one driver entry. Other tier
+/// reads may run beside the burst (a replay-above-window node keeps reading its tier), so a
+/// round's receipt is its own: the step at which the owner's sim driver has counted the reads it
+/// released, set once. From that step the device holds tier reads again, so no other read
+/// completes and no other window becomes ready, and a sim cell iterates every step, so the
+/// server's `before_execute` delivers the round alone. The burst's reads are the first round; a
+/// read the device comes to hold after a receipt is a re-read, the next round's. Oracle: each reply
+/// is its value, and a cold one arrives within ⌈readers left / 64⌉ + 2 steps of its round's
+/// receipt (the harness's reply log against the device's own count): a reply past that bound is
+/// late. The next round is released once the held reads are steady, and only while the owner's
+/// cold host has no member left to visit (its pending count: a member a receipt made ready and no
+/// turn visited is late). A reader with no read held for `STALL_STEPS`, or still waiting at round
+/// [`BURST_ROUNDS_MAX`]'s bound, is a stuck client. Engagement: some step left the owner's cold
+/// host members to visit (its pending count, read between steps: a wiring half), so a turn's
+/// allowance left members to a later turn; else VACUOUS.
 fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
     let seed = cx.scenario.seed;
     let keys: Vec<Vec<u8>> =
@@ -800,12 +811,26 @@ fn burst_hold(cx: &mut Late<'_>, node: &mut Node, burst: &mut Burst) -> Verdict<
     })
 }
 
-/// Steps until every burst reader's reply is in, each cold reply after the
-/// burst's receipt judged against it. The receipt is the step at which the
-/// owner's driver has counted the `held` reads the hold released, set once;
-/// from it the device holds tier reads again, until the caller lifts the
-/// hold. Returns the most members a step left the owner's cold host to
-/// visit.
+/// One round of phase 7e's delivery.
+#[derive(Clone, Copy)]
+struct Round {
+    /// 1 for the burst's own reads, then each round of re-reads.
+    index: u32,
+    /// The tier reads the device held, which the round releases.
+    held: usize,
+    /// Readers unanswered at the release.
+    readers: u64,
+    /// Steps after the round's receipt within which its replies arrive:
+    /// ⌈`readers` / a turn's visits⌉ + 2.
+    bound: u64,
+}
+
+/// Steps until every burst reader's reply is in, in rounds: the first
+/// releases the `held` reads of the burst, and each round's replies are
+/// judged against its own receipt. Past a round's bound with readers left,
+/// the reads the device came to hold are the next round's. From a receipt
+/// the device holds tier reads again, until the caller lifts the hold.
+/// Returns the most members a step left the owner's cold host to visit.
 fn burst_deliver(
     cx: &mut Late<'_>,
     node: &mut Node,
@@ -813,12 +838,48 @@ fn burst_deliver(
     held: usize,
 ) -> Verdict<u64> {
     let seed = cx.scenario.seed;
-    let members = burst.left as u64;
     let turn = u64::from(inf_runtime::limits::COLD_DELIVERIES_PER_TURN);
-    let bound = members.div_ceil(turn) + 2;
+    let mut pending_max = 0;
+    let mut round = Round { index: 1, held, readers: 0, bound: 0 };
+    loop {
+        round.readers = burst.left as u64;
+        round.bound = round.readers.div_ceil(turn) + 2;
+        cx.report.burst_rounds = round.index;
+        if burst_round(cx, node, burst, round, &mut pending_max)? {
+            return Ok(pending_max);
+        }
+        round.held = burst_wait(cx, node, burst, round, &mut pending_max)?;
+        if round.index == BURST_ROUNDS_MAX {
+            cx.report.stalled = true;
+            let left = burst.left;
+            bail7d!(
+                cx,
+                "COLD BURST STALL seed {seed:#x}: cold-burst-round-cap: {left} readers still wait \
+                 on a read after {} rounds (a stuck client)",
+                round.index
+            );
+        }
+        round.index += 1;
+        cx.disk.hold_reads(None);
+    }
+}
+
+/// One round of [`burst_deliver`]: steps from its release until every
+/// reader has answered (`true`), or until its bound has passed since its
+/// receipt with readers left (`false`). The receipt is the step at which
+/// the owner's driver has counted the round's held reads, set once; from it
+/// the device holds tier reads again.
+fn burst_round(
+    cx: &mut Late<'_>,
+    node: &mut Node,
+    burst: &mut Burst,
+    round: Round,
+    pending_max: &mut u64,
+) -> Verdict<bool> {
+    let seed = cx.scenario.seed;
     let released = node.driver(burst.owner).observed_io().read_completions;
-    let received = released + held as u64;
-    let (mut mark, mut pending_max) = (None, 0);
+    let received = released + round.held as u64;
+    let mut mark = None;
     for step in 0..STALL_STEPS {
         if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
             bail7d!(cx, "phase-7e burst step: {err}");
@@ -829,36 +890,82 @@ fn burst_deliver(
             mark = Some(step);
             cx.disk.hold_reads(Some(is_tier_file));
         }
-        pending_max = pending_max.max(node.plane(burst.owner).cold_pending_for_sim());
+        *pending_max = (*pending_max).max(node.plane(burst.owner).cold_pending_for_sim());
         let arrived = burst.collect(cx, node)?;
         if arrived > 0 && completions == released {
             bail7d!(cx, "COLD BURST seed {seed:#x}: a cold GET answered before any receipt");
-        }
-        if let Some(mark) = mark
-            && arrived > 0
-            && step - mark > bound
-        {
-            bail7d!(
-                cx,
-                "COLD BURST VIOLATION seed {seed:#x}: cold-burst-late: {arrived} replies arrived \
-                 {} steps after the burst's receipt, over {bound} (⌈{members} / {turn}⌉ + 2)",
-                step - mark
-            );
         }
         if burst.left == 0 {
             if mark.is_none() {
                 bail7d!(
                     cx,
                     "COLD BURST VACUOUS seed {seed:#x}: every reply arrived before the owner \
-                     counted the {held} reads the hold released: no reply was judged"
+                     counted the {} reads the hold released: no reply was judged",
+                    round.held
                 );
             }
-            return Ok(pending_max);
+            return Ok(true);
+        }
+        if mark.is_some_and(|mark| step - mark == round.bound) {
+            return Ok(false);
         }
     }
     cx.report.stalled = true;
     let left = burst.left;
     bail7d!(cx, "COLD BURST STALL seed {seed:#x}: {left} readers never answered (a stuck client)");
+}
+
+/// Past a round's bound with readers left: steps until the tier reads the
+/// device holds are steady above 0, and returns them, the next round's. A
+/// reply meanwhile is late: no read completed since the receipt, so the
+/// receipt made its member ready. A member still unvisited then is late
+/// too, whatever read is held; no read held at `STALL_STEPS` is a stuck
+/// client.
+fn burst_wait(
+    cx: &mut Late<'_>,
+    node: &mut Node,
+    burst: &mut Burst,
+    round: Round,
+    pending_max: &mut u64,
+) -> Verdict<usize> {
+    let seed = cx.scenario.seed;
+    let turn = inf_runtime::limits::COLD_DELIVERIES_PER_TURN;
+    let (index, bound, readers) = (round.index, round.bound, round.readers);
+    let held = steady_held_reads(STALL_STEPS, || {
+        if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
+            bail7d!(cx, "phase-7e wait step: {err}");
+        }
+        cx.report.scheduler_steps += 1;
+        *pending_max = (*pending_max).max(node.plane(burst.owner).cold_pending_for_sim());
+        let arrived = burst.collect(cx, node)?;
+        if arrived > 0 {
+            bail7d!(
+                cx,
+                "COLD BURST VIOLATION seed {seed:#x}: cold-burst-late: {arrived} replies arrived \
+                 past round {index}'s bound of {bound} steps (⌈{readers} / {turn}⌉ + 2)"
+            );
+        }
+        Ok(node.driver(burst.owner).held_reads())
+    })?;
+    let left = burst.left;
+    if held == 0 {
+        cx.report.stalled = true;
+        bail7d!(
+            cx,
+            "COLD BURST STALL seed {seed:#x}: {left} readers never answered and the device holds \
+             no read of theirs (a stuck client)"
+        );
+    }
+    let unvisited = node.plane(burst.owner).cold_pending_for_sim();
+    if unvisited > 0 {
+        bail7d!(
+            cx,
+            "COLD BURST VIOLATION seed {seed:#x}: cold-burst-late: cold-burst-unvisited: \
+             {unvisited} members a receipt made ready are unvisited past round {index}'s bound \
+             of {bound} steps, {held} reads held"
+        );
+    }
+    Ok(held)
 }
 
 /// Phase 8: DISKFULL clamp → typed refusal → reopen (ADR-0063).
