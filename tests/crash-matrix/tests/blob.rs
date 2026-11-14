@@ -68,12 +68,14 @@ fn demote() -> DemotionConfig {
 }
 
 fn table(origin: u64) -> TieredTable {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let space = AddressSpaceConfig {
         reserve_bytes: demote().ring_reserve_bytes().expect("valid"),
         page_bytes: PAGE as usize,
         life_origin: LogicalAddr::from_raw(origin).expect("48-bit"),
     };
-    let mut t = TieredTable::new(space, demote(), 256, KeyHasher::default()).expect("ring");
+    let mut t =
+        TieredTable::new(space, demote(), 256, KeyHasher::default(), &census).expect("ring");
     t.set_blob_config(inf_store::BlobConfig { threshold_bytes: 64, max_bytes: 1 << 20 });
     t
 }

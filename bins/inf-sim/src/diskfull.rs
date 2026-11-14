@@ -106,6 +106,7 @@ struct World {
 
 impl World {
     fn new(seed: u64) -> World {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks =
             Keyspace::new(StoreConfig { hasher: KeyHasher::from_seed(seed), ..Default::default() });
         let demote = DemotionConfig {
@@ -122,6 +123,7 @@ impl World {
             },
             demote,
             1024,
+            &census,
         )
         .expect("materialize");
         let table = ks.tiered_store_mut(NS).expect("materialized");
@@ -140,7 +142,7 @@ impl World {
                 record_len_max: 16 << 20,
             },
             0,
-            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+            &census,
         );
         World {
             ks,

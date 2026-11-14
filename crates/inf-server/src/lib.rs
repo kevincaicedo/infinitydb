@@ -111,8 +111,8 @@ pub use key_hash::{
 };
 pub use loop_snapshot::LoopSnapshot;
 pub use plane::{
-    ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane, StopHold,
-    StopPhase, TimerAssemblyError, TimerRole, fold_live_entries,
+    ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneBuildError, PlaneObserver, ServerPlane,
+    StopHold, StopPhase, TimerAssemblyError, TimerRole, fold_live_entries,
 };
 pub use plane::{MeshConfigRefused, checked_mesh_config};
 pub use readahead::boot_prefetch_threads_spawned;

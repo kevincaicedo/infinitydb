@@ -92,6 +92,7 @@ fn drain(table: &mut TieredTable, flush: &mut TierFlush<MemFs>) {
 /// the next creation.
 #[test]
 fn aggregate_va_bounds_creation_and_drop_returns_capacity() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     let tier = TierSpec::for_budget(8 << 20);
     let ring = tier.demotion_config().ring_reserve_bytes().expect("valid") as u64;
@@ -99,12 +100,12 @@ fn aggregate_va_bounds_creation_and_drop_returns_capacity() {
     // Room for two rings plus slack that a third cannot fit in.
     ks.set_tiered_va_limit(2 * ring + ring / 2);
 
-    ks.ns_create(tiered_spec(16, b"t-one", tier)).expect("first admits");
-    ks.ns_create(tiered_spec(17, b"t-two", tier)).expect("second admits");
+    ks.ns_create(tiered_spec(16, b"t-one", tier), &census).expect("first admits");
+    ks.ns_create(tiered_spec(17, b"t-two", tier), &census).expect("second admits");
     assert_eq!(ks.tiered_tables(), 2);
     assert_eq!(ks.tiering_usage().reserved_bytes, 2 * ring);
 
-    let refused = ks.ns_create(tiered_spec(18, b"t-three", tier));
+    let refused = ks.ns_create(tiered_spec(18, b"t-three", tier), &census);
     assert_eq!(
         refused,
         Err(NsError::TierVaLimitExceeded {
@@ -124,7 +125,7 @@ fn aggregate_va_bounds_creation_and_drop_returns_capacity() {
     ks.ns_drop_uncataloged(b"t-two").expect("drop");
     assert_eq!(ks.tiering_usage().reserved_bytes, ring, "exactly one ring returned");
     assert_eq!(ks.tiered_tables(), 1);
-    ks.ns_create(tiered_spec(18, b"t-three", tier)).expect("freed capacity admits");
+    ks.ns_create(tiered_spec(18, b"t-three", tier), &census).expect("freed capacity admits");
     assert_eq!(ks.tiering_usage().reserved_bytes, 2 * ring);
 }
 
@@ -133,6 +134,7 @@ fn aggregate_va_bounds_creation_and_drop_returns_capacity() {
 /// all, and the D2 clamps hold at registration.
 #[test]
 fn spec_materialization_and_hot_reload_apply_together() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     let tier = TierSpec {
         disk_budget_bytes: 64 << 20,
@@ -142,7 +144,7 @@ fn spec_materialization_and_hot_reload_apply_together() {
         blob_threshold_bytes: 8 << 10,
         ..TierSpec::for_budget(8 << 20)
     };
-    ks.ns_create(tiered_spec(16, b"tiered", tier)).expect("create");
+    ks.ns_create(tiered_spec(16, b"tiered", tier), &census).expect("create");
     let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
     assert_eq!(table.demotion().mem_budget_bytes, 8 << 20);
     assert_eq!(table.demotion().mutable_permille, 100);
@@ -155,7 +157,7 @@ fn spec_materialization_and_hot_reload_apply_together() {
     // unrepresentable through configuration).
     let bad = TierSpec { compaction_dead_ratio_pct: 10, ..tier };
     assert!(matches!(
-        ks.ns_create(tiered_spec(17, b"bad", bad)),
+        ks.ns_create(tiered_spec(17, b"bad", bad), &census),
         Err(NsError::InvalidTierConfig(_))
     ));
 
@@ -179,15 +181,18 @@ fn spec_materialization_and_hot_reload_apply_together() {
 
     // SET on a non-tiered namespace refuses typed (tiering is a
     // create-time decision — D1/D3).
-    ks.ns_create(NsSpec {
-        id: NsId(18),
-        name: b"plain".to_vec(),
-        mode: NsMode::Durable,
-        fsync: None,
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NsId(18),
+            name: b"plain".to_vec(),
+            mode: NsMode::Durable,
+            fsync: None,
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("plain durable");
     assert_eq!(ks.ns_set_tier(b"plain", tier), Err(NsError::NotTiered));
 }
@@ -200,10 +205,11 @@ fn spec_materialization_and_hot_reload_apply_together() {
 /// the test below).
 #[test]
 fn memory_fill_respects_each_namespace_budget() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     let tier = TierSpec { mutable_permille: 100, ..TierSpec::for_budget(8 << 20) };
-    ks.ns_create(tiered_spec(16, b"fill-a", tier)).expect("create");
-    ks.ns_create(tiered_spec(17, b"fill-b", tier)).expect("create");
+    ks.ns_create(tiered_spec(16, b"fill-a", tier), &census).expect("create");
+    ks.ns_create(tiered_spec(17, b"fill-b", tier), &census).expect("create");
     let fs = MemFs::new();
     let mut flushes = [flush_for(NsId(16), &fs), flush_for(NsId(17), &fs)];
     let budget = tier.mem_budget_bytes;
@@ -252,6 +258,7 @@ fn memory_fill_respects_each_namespace_budget() {
 /// exactly.
 #[test]
 fn disk_pressure_engages_before_the_cap() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     // Disk budget 16 MiB: the 7/8 threshold leaves 2 MiB of headroom —
     // two MAINTAIN slices — so a per-slice pressure check must observe
@@ -264,7 +271,7 @@ fn disk_pressure_engages_before_the_cap() {
         blob_threshold_bytes: 4 << 10,
         ..TierSpec::for_budget(8 << 20)
     };
-    ks.ns_create(tiered_spec(16, b"disky", tier)).expect("create");
+    ks.ns_create(tiered_spec(16, b"disky", tier), &census).expect("create");
     let fs = MemFs::new();
     let mut flush = flush_for(NsId(16), &fs);
     let budget = tier.disk_budget_bytes;
@@ -354,6 +361,7 @@ fn disk_pressure_engages_before_the_cap() {
 #[cfg(unix)]
 #[test]
 fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     use inf_log::fs::StdSegmentFs;
 
     let root = std::env::temp_dir().join(format!("inf-s19-teardown-{}", std::process::id()));
@@ -373,7 +381,7 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
         blob_threshold_bytes: 4 << 10,
         ..TierSpec::for_budget(8 << 20)
     };
-    ks.ns_create(tiered_spec(16, b"doomed", tier)).expect("create");
+    ks.ns_create(tiered_spec(16, b"doomed", tier), &census).expect("create");
     let mut flush = TierFlush::new(
         StdSegmentFs,
         TierFlushConfig {

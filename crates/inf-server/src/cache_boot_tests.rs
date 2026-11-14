@@ -82,7 +82,7 @@ fn plane_on(permit: crate::CacheBootPermit, clock: Rc<VirtualClock>) -> (TestLoo
         CellId(0),
         2,
         7,
-        Keyspace::new(StoreConfig::default()),
+        KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
         fabric,
         node,
         NoopObserver,

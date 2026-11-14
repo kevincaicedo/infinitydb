@@ -499,19 +499,23 @@ impl Booting {
         hasher: KeyHasher,
         spec: &Spec,
     ) -> Booting {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         // The spec's threshold holds during replay, as the catalog's does
         // at a server's boot: a value at or above it is a typed refusal.
         table.set_blob_config(spec.blob());
         let mut ks = Keyspace::new(StoreConfig { hasher, ..StoreConfig::default() });
-        ks.ns_create(NsSpec {
-            id: NS,
-            name: b"tiered-88".to_vec(),
-            mode: NsMode::Durable,
-            fsync: Some(FsyncClass::Everysec),
-            policy: None,
-            maxmemory: None,
-            tier: Some(TierSpec::for_budget(4 << 20)),
-        })
+        ks.ns_create(
+            NsSpec {
+                id: NS,
+                name: b"tiered-88".to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(FsyncClass::Everysec),
+                policy: None,
+                maxmemory: None,
+                tier: Some(TierSpec::for_budget(4 << 20)),
+            },
+            &census,
+        )
         .expect("create the tiered namespace");
         // The harness's table keeps its own knobs (budget, blob, shadow).
         *ks.tiered_store_mut(NS).expect("materialized") = table;
@@ -640,8 +644,9 @@ impl Booting {
 }
 
 fn tiered_table(spec: &Spec, origin: u64, hasher: KeyHasher) -> TieredTable {
-    let mut table =
-        TieredTable::new(space_config(spec, origin), spec.live, 1024, hasher).expect("ring");
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+    let mut table = TieredTable::new(space_config(spec, origin), spec.live, 1024, hasher, &census)
+        .expect("ring");
     table.set_blob_config(spec.blob());
     // The shadow arm (M4.5-S37, ADR-0093 D8) runs on in this harness —
     // the store-level DST's authority over the mechanism.
@@ -1128,12 +1133,12 @@ impl Run {
     /// [`park_for_room`]: Self::park_for_room
     fn placeable(&mut self, life: &mut Life, len: usize) -> bool {
         for round in 0..PARK_ROUNDS_MAX {
-            if matches!(life.table.space().room(len), Room::Fits) {
+            if matches!(life.table.space_mut().room(len), Room::Fits) {
                 return true;
             }
             self.park_round(life, round, len, "fill");
         }
-        matches!(life.table.space().room(len), Room::Fits)
+        matches!(life.table.space_mut().room(len), Room::Fits)
     }
 
     /// One round of the park on a full window: the reconciler from the
@@ -1149,7 +1154,7 @@ impl Run {
         }
         self.maintain(life);
         if self.spec.variant.is_some()
-            && !matches!(life.table.space().room(len), Room::Fits)
+            && !matches!(life.table.space_mut().room(len), Room::Fits)
             && life.flush.append_cursor().is_some()
         {
             life.table.flush_barrier(&mut life.flush).expect("sim barrier seal");
@@ -1171,13 +1176,13 @@ impl Run {
     /// whether the op may proceed.
     fn park_for_room(&mut self, life: &mut Life, len: usize) -> bool {
         for round in 0..PARK_ROUNDS_MAX {
-            if matches!(life.table.space().room(len), Room::Fits) {
+            if matches!(life.table.space_mut().room(len), Room::Fits) {
                 return true;
             }
             self.report.writer_parks += 1;
             self.park_round(life, round, len, "park");
         }
-        if matches!(life.table.space().room(len), Room::Fits) {
+        if matches!(life.table.space_mut().room(len), Room::Fits) {
             return true;
         }
         // The held ticket's injected read error clears: its winner pins
@@ -1193,7 +1198,7 @@ impl Run {
                 self.reconcile(life, 16, "park");
             }
             self.maintain(life);
-            if matches!(life.table.space().room(len), Room::Fits) {
+            if matches!(life.table.space_mut().room(len), Room::Fits) {
                 return true;
             }
         }
@@ -1201,11 +1206,11 @@ impl Run {
             self.report.writes_parked_past_a_walk += 1;
             return false;
         }
+        let room = life.table.space_mut().room(len);
         let space = life.table.space();
         self.report.violations.push(format!(
             "a live write of {len} bytes found no room after {PARK_ROUNDS_MAX} maintain rounds \
-             ({:?}; head {} flushed {} tail {}, pin {:?}, {} tickets open)",
-            space.room(len),
+             ({room:?}; head {} flushed {} tail {}, pin {:?}, {} tickets open)",
             space.head().to_raw(),
             space.flushed().to_raw(),
             space.tail().to_raw(),

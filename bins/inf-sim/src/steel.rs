@@ -284,6 +284,7 @@ fn run_life(
     report: &mut SteelReport,
     hasher: KeyHasher,
 ) -> (LogicalAddr, u32) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // Replay the ledger into a fresh life (the harness plays the WAL).
     let mut ks = Keyspace::new(StoreConfig { hasher, ..Default::default() });
     assert!(
@@ -292,6 +293,7 @@ fn run_life(
             AddressSpaceConfig { reserve_bytes: RING, page_bytes: PAGE, life_origin },
             DemotionConfig::for_budget(RING as u64, PAGE as u64),
             64,
+            &census,
         )
         .is_ok()
     );
@@ -335,7 +337,7 @@ fn run_life(
             record_len_max: 16 << 20,
         },
         tier_file_id,
-        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        &census,
     );
     table.flush_drain(&mut flush).expect("flush drain");
     assert_eq!(table.space().flushed(), tail, "drain confirms the whole sealed range");

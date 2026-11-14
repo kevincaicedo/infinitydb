@@ -247,6 +247,7 @@ fn pick(sorted: &[u64], p: f64) -> f64 {
 }
 
 pub fn run() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let Some(base) = std::env::var_os("INF_TIER_AB_DIR") else {
         eprintln!("cold_shaping: set INF_TIER_AB_DIR to a real-device directory; skipping");
         return;
@@ -342,6 +343,7 @@ pub fn run() {
                 },
                 DemotionConfig::for_budget(1 << 24, 1 << 12),
                 RAM_KEYS as usize * 2,
+                &census,
             )
             .is_ok()
         );

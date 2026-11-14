@@ -101,6 +101,7 @@ struct Rig<F: SegmentFs + Clone> {
 
 impl<F: SegmentFs + Clone> Rig<F> {
     fn new(fs: F, shard: &Path, value_len: u64, budget: u64, file_capacity: u64) -> Rig<F> {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig {
             mem_budget_bytes: budget,
             mutable_permille: MUTABLE_PERMILLE,
@@ -115,6 +116,7 @@ impl<F: SegmentFs + Clone> Rig<F> {
             demote,
             2048,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         table.set_blob_config(BlobConfig { threshold_bytes: THRESHOLD, max_bytes: 1 << 20 });
@@ -416,6 +418,7 @@ impl<F: SegmentFs + Clone> Rig<F> {
 /// that still finds it unreferenced may destroy it.
 #[test]
 fn boot_orphan_sweep_quarantines_before_destruction() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     let shard = Path::new(SHARD);
     let mut rig = Rig::new(fs.clone(), shard, 256, 1 << 20, 1 << 20);
@@ -439,6 +442,7 @@ fn boot_orphan_sweep_quarantines_before_destruction() {
         demote,
         2048,
         KeyHasher::default(),
+        &census,
     )
     .expect("ring");
     boot.restore_extent_entry(addr1, e1, len1);
@@ -496,6 +500,7 @@ fn boot_orphan_sweep_quarantines_before_destruction() {
         demote,
         2048,
         KeyHasher::default(),
+        &census,
     )
     .expect("ring");
     boot2.restore_extent_entry(addr1, e1, len1);

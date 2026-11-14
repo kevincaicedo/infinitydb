@@ -189,6 +189,7 @@ fn namespaces_are_kept_in_id_order() {
 /// page boundaries and the demotion slice is one 4 KiB page, so each
 /// step — one flush cut — is one page's records, about 4 KiB.
 fn sealed_backlog(seal_steps: u32) -> Keyspace {
+    let cell_census = census();
     const PAGE: u64 = 4 << 10;
     let demote = DemotionConfig::for_budget(1 << 20, PAGE);
     let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
@@ -198,7 +199,7 @@ fn sealed_backlog(seal_steps: u32) -> Keyspace {
         life_origin: LogicalAddr::ZERO,
     };
     let mut ks = Keyspace::new(StoreConfig::default());
-    assert!(ks.materialize_tiered(NsId(16), space, demote, 2048).is_ok());
+    assert!(ks.materialize_tiered(NsId(16), space, demote, 2048, &cell_census).is_ok());
     let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
     let hasher = KeyHasher::default();
     let mut index = 0u32;
@@ -225,6 +226,7 @@ fn sealed_backlog_on(
     budget: u64,
     sealed_bytes: u64,
 ) -> Vec<LogicalAddr> {
+    let cell_census = census();
     const PAGE: u64 = 4 << 10;
     let demote = DemotionConfig::for_budget(budget, PAGE);
     let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
@@ -233,7 +235,7 @@ fn sealed_backlog_on(
         page_bytes: PAGE as usize,
         life_origin: LogicalAddr::ZERO,
     };
-    assert!(ks.materialize_tiered(ns, space, demote, 65_536).is_ok());
+    assert!(ks.materialize_tiered(ns, space, demote, 65_536, &cell_census).is_ok());
     fill_sealed(ks.tiered_store_mut(ns).expect("materialized"), sealed_bytes)
 }
 
@@ -261,6 +263,7 @@ fn fill_sealed(table: &mut inf_store::TieredTable, sealed_bytes: u64) -> Vec<Log
 /// name) and materializes its table on 1 MiB
 /// commit pages.
 fn register_tiered(ks: &mut Keyspace, id: NsId, name: &[u8], tier: TierSpec) {
+    let cell_census = census();
     let spec = inf_store::NsSpec {
         id,
         name: name.to_vec(),
@@ -270,7 +273,7 @@ fn register_tiered(ks: &mut Keyspace, id: NsId, name: &[u8], tier: TierSpec) {
         maxmemory: None,
         tier: Some(tier),
     };
-    ks.ns_create(spec).expect("a fresh tiered namespace");
+    ks.ns_create(spec, &cell_census).expect("a fresh tiered namespace");
 }
 
 /// A spec whose rounds are 8 MiB (ten writes, three barriers) and whose
@@ -679,12 +682,14 @@ fn a_retry_group_is_offered_and_charged_like_any_group() {
 /// refused creation.)
 #[test]
 fn a_refused_plan_stages_nothing_and_plans_again_next_turn() {
-    let mut cell = TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    let cell_census = census();
+    let mut cell =
+        TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), Rc::clone(&cell_census));
     cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 6 << 10, ..spec() });
     let config = flush_config(&cell, 4 << 10, 6 << 10);
     let fs = cell.fs.clone();
     let t = cell.nth_mut(0);
-    t.flush = TierFlush::new(fs, config, 0, &census());
+    t.flush = TierFlush::new(fs, config, 0, &cell_census);
     t.flush.set_drive(TierDrive::Reactor);
     let mut ks = sealed_backlog(3);
     let mut admission = Recording { inner: plane_budget(reference_model(), 1), offers: Vec::new() };
@@ -1269,6 +1274,7 @@ impl AckClasses for HeldWatermark {
 
 /// A fresh cell with tiered namespace 16 materialized: `(cell, keyspace)`.
 fn marks_fixture() -> (TierCell<MemFs>, Keyspace) {
+    let cell_census = census();
     const PAGE: u64 = 4 << 10;
     let demote = DemotionConfig::for_budget(1 << 20, PAGE);
     let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
@@ -1278,8 +1284,9 @@ fn marks_fixture() -> (TierCell<MemFs>, Keyspace) {
         life_origin: LogicalAddr::ZERO,
     };
     let mut ks = Keyspace::new(StoreConfig::default());
-    assert!(ks.materialize_tiered(NsId(16), space, demote, 64).is_ok());
-    let mut cell = TierCell::standalone(MemFs::new(), 0, PathBuf::from("/shard-0"), census());
+    assert!(ks.materialize_tiered(NsId(16), space, demote, 64, &cell_census).is_ok());
+    let mut cell =
+        TierCell::standalone(MemFs::new(), 0, PathBuf::from("/shard-0"), Rc::clone(&cell_census));
     cell.create_ns(NsId(16), &spec());
     (cell, ks)
 }
@@ -1365,7 +1372,9 @@ fn seventeen_sealed_ticks_keep_the_cap_and_count_one_crossing() {
 /// index.
 #[test]
 fn a_round_over_a_coarse_cut_history_stays_within_the_op_bound() {
-    let mut cell = TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    let cell_census = census();
+    let mut cell =
+        TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), Rc::clone(&cell_census));
     let spec = TierSpec { tier_io_mode: TierIoMode::Buffered, ..TierSpec::for_budget(512 << 20) };
     spec.validate().expect("a valid namespace");
     cell.create_ns(NsId(16), &spec);
@@ -1376,7 +1385,7 @@ fn a_round_over_a_coarse_cut_history_stays_within_the_op_bound() {
         page_bytes: 1 << 20,
         life_origin: LogicalAddr::ZERO,
     };
-    assert!(ks.materialize_tiered(NsId(16), space, demote, 8192).is_ok());
+    assert!(ks.materialize_tiered(NsId(16), space, demote, 8192, &cell_census).is_ok());
     let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
     let hasher = KeyHasher::default();
     let mut insert = |ordinal: u64, encoded: usize| {
@@ -1584,6 +1593,7 @@ fn a_dropped_namespaces_failed_unlink_keeps_its_file_and_its_position() {
 /// by the namespace's retirement list, its handle already closed. Returns
 /// the cell, the keyspace and the files' paths in id order.
 fn retired_files(files: u32) -> (TierCell<SimDisk>, Keyspace, Vec<PathBuf>) {
+    let cell_census = census();
     const PAGE: u64 = 4 << 10;
     let demote = DemotionConfig::for_budget(1 << 20, PAGE);
     let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
@@ -1593,8 +1603,9 @@ fn retired_files(files: u32) -> (TierCell<SimDisk>, Keyspace, Vec<PathBuf>) {
         life_origin: LogicalAddr::ZERO,
     };
     let mut ks = Keyspace::new(StoreConfig::default());
-    assert!(ks.materialize_tiered(NsId(16), space, demote, 64).is_ok());
-    let mut cell = TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    assert!(ks.materialize_tiered(NsId(16), space, demote, 64, &cell_census).is_ok());
+    let mut cell =
+        TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), Rc::clone(&cell_census));
     cell.create_ns(NsId(16), &spec());
     let cold = cell.nth(0).dir.join("cold");
     cell.fs.create_dir_all(&cold).expect("the cold directory");
@@ -1726,6 +1737,7 @@ fn the_cell_leaves_tier_file_unlinks_to_the_control_thread() {
 /// `retired_files` builds one. Returns the cell, the keyspace and the two
 /// files' paths, namespace 16's first.
 fn same_numbered_retired_files(id: u32) -> (TierCell<SimDisk>, Keyspace, [PathBuf; 2]) {
+    let cell_census = census();
     const PAGE: u64 = 4 << 10;
     let demote = DemotionConfig::for_budget(1 << 20, PAGE);
     let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
@@ -1735,9 +1747,10 @@ fn same_numbered_retired_files(id: u32) -> (TierCell<SimDisk>, Keyspace, [PathBu
         life_origin: LogicalAddr::ZERO,
     };
     let mut ks = Keyspace::new(StoreConfig::default());
-    let mut cell = TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    let mut cell =
+        TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), Rc::clone(&cell_census));
     for ns in [NsId(16), NsId(17)] {
-        assert!(ks.materialize_tiered(ns, space, demote, 64).is_ok());
+        assert!(ks.materialize_tiered(ns, space, demote, 64, &cell_census).is_ok());
         cell.create_ns(ns, &spec());
     }
     let paths = [0, 1].map(|index| {

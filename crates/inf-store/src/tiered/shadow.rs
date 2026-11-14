@@ -1520,6 +1520,7 @@ mod tests {
     use crate::demote::DemotionConfig;
 
     fn table_at(origin: u64) -> TieredTable {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         TieredTable::new(
             AddressSpaceConfig {
                 reserve_bytes: 1 << 16,
@@ -1529,6 +1530,7 @@ mod tests {
             DemotionConfig::for_budget(1 << 16, 1 << 12),
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("reservation")
     }

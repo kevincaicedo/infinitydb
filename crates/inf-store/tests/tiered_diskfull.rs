@@ -78,6 +78,7 @@ fn seeded(x: &mut u64) -> u64 {
 
 impl Rig {
     fn new(disk_budget: u64) -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         // A 256 KiB MAINTAIN quantum: sealing keeps pace with the fill,
         // so `tail − flushed` stays near the mutable target instead of
         // ballooning to the whole window — the admission projection then
@@ -98,6 +99,7 @@ impl Rig {
             demote,
             2048,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         table.set_compaction_config(CompactionConfig { dead_ratio_pct: 50, slice_bytes: 1 << 20 });

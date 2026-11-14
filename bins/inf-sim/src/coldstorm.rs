@@ -948,6 +948,7 @@ fn end_round(world: &mut World, unclaimed_before: u64) {
 /// Runs the scenario once. Deterministic from the seed (L7).
 #[must_use]
 pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     if scenario.leg != ColdLeg::Storm {
         return legs::run_leg(scenario);
     }
@@ -972,6 +973,7 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
             },
             demote,
             KEYS as usize * 2,
+            &census,
         )
         .is_ok()
     );

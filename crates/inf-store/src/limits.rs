@@ -3,6 +3,8 @@
 //! limit on everything"). Bounds older than this module still live
 //! beside their code; a new one lands here.
 
+use inf_foundation::bounded::{Cap, CapFill};
+
 /// Control groups (16 slots each) one alias enumeration may **load**
 /// (ADR-0139 D9). Charged by the traversal when it reads a group's
 /// control bytes, fragment match or not: a chain that ends in its 32nd
@@ -166,3 +168,35 @@ const _: () = assert!(DOC_BODY_BYTES_MAX <= inf_doc::limits::DOC_BYTES_MAX);
 /// ends and the next push starts a new one, so no push copies the ids
 /// already listed (INF: the table is 59 KiB at 10⁷ ids).
 pub const ID_CHUNK_IDS: usize = 4096;
+
+/// Seal marks one tiered table holds: the record starts its ro-boundary may
+/// seal to (ADR-0053 D2), the first record placed in each stride bucket of
+/// commit pages between the boundary and the tail. The stride is fixed at the
+/// table's construction so that the ring's buckets are at most half this cap
+/// (a ring past 4,096 pages strides by pages), so the window holds at most
+/// half the cap and one more. Owner: the table's seal marks, one deque per
+/// tiered table per cell, built with the table. Crossing: coalesce — at the
+/// cap the back mark takes the new start, so a seal step's landing points
+/// coarsen; each such merge counts as the row's crossing in `INFO caps`, and
+/// none occurs while the stride holds.
+pub const SEAL_MARKS_MAX: u32 = 8192;
+
+/// The seal marks' cap: `SEAL_MARKS_MAX` record starts under the census name
+/// `seal-marks`, filled while the cell serves.
+pub const SEAL_MARKS: Cap = Cap::entries::<SEAL_MARKS_MAX>("seal-marks", CapFill::Serving);
+
+/// Sealed-dead intervals one address space holds before `flushed` passes
+/// them (ADR-0052 D2, ADR-0174 D2 rule 6): ring-top holes and tail pads. The
+/// window crosses at most one interior ring multiple, plus one in transition,
+/// plus one page pad, which `flushed` passes before its record applies; two
+/// are reached. Owner: the table's address space, one deque built with it.
+/// Crossing: pace — a placement that would push a mark while the deque is
+/// full is refused before any mutation, and its wait target is the front
+/// hole's end, the `flushed` value that pops it: a live writer parks on the
+/// tail stall, and boot replay demotes to that address. Each refused ask
+/// counts as the row's crossing in `INFO caps`.
+pub const HOLE_MARKS_MAX: u32 = 3;
+
+/// The hole marks' cap: `HOLE_MARKS_MAX` intervals under the census name
+/// `hole-marks`, filled while the cell serves.
+pub const HOLE_MARKS: Cap = Cap::entries::<HOLE_MARKS_MAX>("hole-marks", CapFill::Serving);

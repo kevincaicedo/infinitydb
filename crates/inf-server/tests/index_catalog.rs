@@ -52,6 +52,7 @@ fn cell_count() -> inf_foundation::CellCount {
 /// control plane boots from a catalog naming `ledger`, so its counter is
 /// past `ledger`'s id as every `META` it writes must be.
 fn fleet() -> (Vec<Keyspace>, std::sync::Arc<ControlHandle>, inf_server::ControlInbox) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let seed = inf_store::NsCatalog {
         next_id: ledger_spec().id.0 + 1,
         entries: vec![ledger_spec()],
@@ -64,7 +65,7 @@ fn fleet() -> (Vec<Keyspace>, std::sync::Arc<ControlHandle>, inf_server::Control
     let mut cells = Vec::new();
     for _ in 0..CELLS {
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(ledger_spec()).expect("ns create");
+        ks.ns_create(ledger_spec(), &census).expect("ns create");
         cells.push(ks);
     }
     (cells, control, inbox)
@@ -165,6 +166,7 @@ fn drop_during_query_fails_the_binding_typed() {
 /// completion restores `ready`.
 #[test]
 fn declarations_survive_restart_through_the_meta_swap() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let dir =
         std::env::temp_dir().join(format!("inf-m45-s03-meta-{}-{}", std::process::id(), line!()));
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -198,7 +200,7 @@ fn declarations_survive_restart_through_the_meta_swap() {
     assert!(control2.next_index_id() > dropping_id.0, "ids never regress");
     assert!(control2.next_index_generation() > dropping_generation, "generations never regress");
     let mut fresh = Keyspace::new(StoreConfig::default());
-    fresh.seed_catalog(&loaded).expect("seed");
+    fresh.seed_catalog(&loaded, &census).expect("seed");
     let reg = fresh.idx_registry();
     assert!(reg.get_by_id(dropping_id).is_none(), "dropping resumed its drop");
     let survivor = reg.get_by_id(ready_id).expect("declaration survives");

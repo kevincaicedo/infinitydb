@@ -18,6 +18,7 @@ const NOW: Nanos = Nanos::from_millis(1);
 const ANCHOR: WallAnchor = WallAnchor { internal_ms: 0, unix_ms: 0 };
 
 fn keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     ks.ns_create(NsSpec {
         id: NS,
@@ -27,7 +28,7 @@ fn keyspace() -> Keyspace {
         policy: None,
         maxmemory: None,
     tier: None,
-})
+}, &census)
     .expect("fixed namespace");
     ks
 }

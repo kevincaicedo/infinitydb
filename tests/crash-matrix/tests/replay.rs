@@ -91,10 +91,12 @@ fn maintain(table: &mut TieredTable, flush: &mut TierFlush<MemFs>) {
 /// The crashed life: a checkpoint of nothing, then two windows of tail
 /// records around one key, and that key's `DEL` last.
 fn crashed_life() -> (MemFs, Vec<u8>) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
     let mut table =
-        TieredTable::new(space_config(0), demote(), 4096, KeyHasher::default()).expect("ring");
+        TieredTable::new(space_config(0), demote(), 4096, KeyHasher::default(), &census)
+            .expect("ring");
     let mut flush = TierFlush::new(
         fs.clone(),
         flush_config(),

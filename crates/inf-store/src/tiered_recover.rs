@@ -615,6 +615,7 @@ impl<F: SegmentFs> NsTierMap<F> {
             demote,
             initial_keys,
             hasher,
+            &census,
         )
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::OutOfMemory, "tier ring reservation failed")
@@ -834,6 +835,7 @@ mod tests {
     /// A recovered table at origin 1 MiB with one manifested file below
     /// it (a ref must name a file's range).
     fn table() -> TieredTable {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
         let mut table = TieredTable::new(
             AddressSpaceConfig {
@@ -844,6 +846,7 @@ mod tests {
             demote,
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         table.seed_recovered_files(

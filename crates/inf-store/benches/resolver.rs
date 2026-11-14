@@ -48,6 +48,7 @@ fn best_sweep(mut sweep: impl FnMut() -> u64, ops: usize) -> f64 {
 }
 
 fn bench_set(n: usize, label: &str) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // M3 baseline: records in the arena, addresses are arena offsets.
     let mut arena = Arena::new(ArenaConfig::default());
     let mut arena_addrs: Vec<ArenaAddr> = Vec::with_capacity(n);
@@ -58,11 +59,14 @@ fn bench_set(n: usize, label: &str) {
     }
     // M4 tiered space sized so the whole set is RAM-resident (mutable).
     let ring = (n * RECORD_LEN * 2).next_power_of_two();
-    let mut space = AddressSpace::new(AddressSpaceConfig {
-        reserve_bytes: ring,
-        page_bytes: 1 << 20,
-        life_origin: LogicalAddr::ZERO,
-    })
+    let mut space = AddressSpace::new(
+        AddressSpaceConfig {
+            reserve_bytes: ring,
+            page_bytes: 1 << 20,
+            life_origin: LogicalAddr::ZERO,
+        },
+        &census,
+    )
     .expect("reservation");
     let mut logical_addrs: Vec<LogicalAddr> = Vec::with_capacity(n);
     for i in 0..n {

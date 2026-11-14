@@ -36,6 +36,7 @@ struct Rig {
 
 impl Rig {
     fn new() -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let fs = MemFs::new();
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
         let ring = demote.ring_reserve_bytes().expect("valid budget");
@@ -50,6 +51,7 @@ impl Rig {
                 },
                 demote,
                 2048,
+                &census,
             )
             .is_ok()
         );

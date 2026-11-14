@@ -103,8 +103,8 @@ impl TieredTable {
         }
         let slice_limit = ro.saturating_add(self.demote.slice_bytes).min(target_addr);
         let mut chosen: Option<u64> = None;
-        while let Some(&mark) = self.seal_marks.front() {
-            let m = mark.to_raw();
+        while let Some(mark) = self.seal_marks.front() {
+            let m = mark.addr().to_raw();
             if m <= ro {
                 self.seal_marks.pop_front(); // stale: the boundary passed it
                 continue;

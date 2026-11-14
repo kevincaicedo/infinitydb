@@ -276,7 +276,7 @@ impl Rig {
                     CellId(cell as u16),
                     2,
                     -1,
-                    Keyspace::new(StoreConfig::default()),
+                    KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
                     fabric,
                     Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
                     NoopObserver,

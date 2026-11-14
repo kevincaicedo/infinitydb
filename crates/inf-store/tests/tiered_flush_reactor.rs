@@ -49,6 +49,7 @@ fn seeded(x: &mut u64) -> u64 {
 }
 
 fn keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let demote = DemotionConfig::for_budget(BUDGET, PAGE);
     let ring = demote.ring_reserve_bytes().expect("valid budget");
     let mut ks = Keyspace::new(StoreConfig::default());
@@ -62,6 +63,7 @@ fn keyspace() -> Keyspace {
             },
             DemotionConfig::for_budget(BUDGET, PAGE),
             2048,
+            &census,
         )
         .is_ok()
     );

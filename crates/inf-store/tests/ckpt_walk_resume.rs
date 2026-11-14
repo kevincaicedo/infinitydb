@@ -170,6 +170,7 @@ fn persistent_keys_survive_refusals_under_interleaved_churn() {
 /// refusals stop before the entry and the next slice re-enters at it.
 #[test]
 fn the_tiered_image_walk_resumes_at_the_refused_entry() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
     let space = AddressSpaceConfig {
         reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
@@ -177,7 +178,7 @@ fn the_tiered_image_walk_resumes_at_the_refused_entry() {
         life_origin: LogicalAddr::ZERO,
     };
     let hasher = KeyHasher::default();
-    let mut table = TieredTable::new(space, demote, 2048, hasher).expect("ring");
+    let mut table = TieredTable::new(space, demote, 2048, hasher, &census).expect("ring");
     let keys: BTreeSet<Vec<u8>> = (0..1200u32).map(|i| format!("t:{i:04}").into_bytes()).collect();
     for key in &keys {
         table.insert(key, b"value", hasher.hash(key)).expect("fits");

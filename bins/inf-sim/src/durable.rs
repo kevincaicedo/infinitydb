@@ -46,7 +46,8 @@ use inf_server::{
     SimDisk, SimDiskConfig, StallConfig, load_catalog_from,
 };
 use inf_store::{
-    IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, NsId, StoreConfig, WallAnchor,
+    IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, KeyspaceSeed, NsId, StoreConfig,
+    WallAnchor,
 };
 
 use crate::harness::{STEP_NS_FLOOR, node_hasher};
@@ -2144,21 +2145,20 @@ pub(crate) fn boot(
         let pool = BufferPool::new(128, 1024);
         let node_info = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
-        // The node's keyspace is cataloged (ADR-0189 D4), as `infinityd`'s.
-        let empty = inf_store::NsCatalog::empty();
-        let ks = Keyspace::cataloged(
-            with_reply_budget(
+        // The node's keyspace is cataloged (ADR-0189 D4), as `infinityd`'s,
+        // and the plane builds it from this seed on its cell's census.
+        let seed = KeyspaceSeed::Cataloged {
+            cfg: with_reply_budget(
                 scenario,
                 StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() },
             ),
-            catalog.as_ref().unwrap_or(&empty),
-        )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+            catalog: catalog.clone().unwrap_or_else(inf_store::NsCatalog::empty),
+        };
         let (mut plane, serve_mark, timer_set) = SimPlane::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
-            ks,
+            seed,
             fabric,
             node_info,
             observer.clone(),

@@ -136,12 +136,16 @@ fn check_identities(space: &AddressSpace, model: &Model) {
 }
 
 fn run_storm(seed: u64, ops: usize) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let origin = if seed.is_multiple_of(3) { 0 } else { (seed % (1 << 30)) & !(PAGE - 1) };
-    let mut space = AddressSpace::new(AddressSpaceConfig {
-        reserve_bytes: RING as usize,
-        page_bytes: PAGE as usize,
-        life_origin: LogicalAddr::from_raw(origin).expect("origin fits"),
-    })
+    let mut space = AddressSpace::new(
+        AddressSpaceConfig {
+            reserve_bytes: RING as usize,
+            page_bytes: PAGE as usize,
+            life_origin: LogicalAddr::from_raw(origin).expect("origin fits"),
+        },
+        &census,
+    )
     .expect("reservation");
     let mut model = Model::new(origin);
     let mut x = seed | 1;

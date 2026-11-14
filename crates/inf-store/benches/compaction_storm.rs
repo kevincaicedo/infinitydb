@@ -154,6 +154,7 @@ impl<F: SegmentFs> Storm<F> {
 }
 
 fn run_storm<F: SegmentFs + Clone>(fs: F, shard_dir: PathBuf, mode: TierIoMode, label: &str) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let demote = DemotionConfig::for_budget(BUDGET, PAGE);
     let ring = demote.ring_reserve_bytes().expect("valid budget");
     let mut ks = Keyspace::new(StoreConfig::default());
@@ -167,6 +168,7 @@ fn run_storm<F: SegmentFs + Clone>(fs: F, shard_dir: PathBuf, mode: TierIoMode, 
             },
             demote,
             KEYS as usize * 2,
+            &census,
         )
         .is_ok()
     );

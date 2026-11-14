@@ -160,16 +160,20 @@ impl TestSpill {
 /// table takes its place (the driver's `install_recovered_tiered` also
 /// applies the catalog's knobs; the tests keep the table's own).
 pub fn keyspace_with(ns: NsId, table: TieredTable) -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: ns,
-        name: format!("tiered-{}", ns.0).into_bytes(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Everysec),
-        policy: None,
-        maxmemory: None,
-        tier: Some(TierSpec::for_budget(4 << 20)),
-    })
+    ks.ns_create(
+        NsSpec {
+            id: ns,
+            name: format!("tiered-{}", ns.0).into_bytes(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Everysec),
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(4 << 20)),
+        },
+        &census,
+    )
     .expect("create the tiered namespace");
     *ks.tiered_store_mut(ns).expect("materialized") = table;
     ks
@@ -178,9 +182,11 @@ pub fn keyspace_with(ns: NsId, table: TieredTable) -> Keyspace {
 /// The recovered table out of the keyspace, after the dispatcher's work
 /// (a placeholder takes its slot).
 pub fn take_table(ks: &mut Keyspace, ns: NsId) -> TieredTable {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let demote = DemotionConfig::for_budget(BUDGET, PAGE);
     let placeholder =
-        TieredTable::new(space_config(demote, 0), demote, 1, KeyHasher::default()).expect("ring");
+        TieredTable::new(space_config(demote, 0), demote, 1, KeyHasher::default(), &census)
+            .expect("ring");
     std::mem::replace(ks.tiered_store_mut(ns).expect("materialized"), placeholder)
 }
 
