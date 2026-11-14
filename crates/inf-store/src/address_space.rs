@@ -2133,7 +2133,7 @@ mod tests {
     fn a_cut_past_the_cap_is_counted_on_its_census_row() {
         const CUTS_MAX: usize = 4_096;
         let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
-        let mut space = space(1 << 16, 1 << 12);
+        let mut space = space_on(1 << 16, 1 << 12, &census);
         for _ in 0..=CUTS_MAX {
             let record = space.alloc(8).expect("fits");
             space.advance_ro_boundary(LogicalAddr::from_raw(record.to_raw() + 8).expect("fits"));
