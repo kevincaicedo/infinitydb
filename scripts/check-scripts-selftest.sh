@@ -3070,6 +3070,29 @@ asm=$( { waker_body waker_drop 'callq\thelper_fn' 'retq'
          waker_body helper_fn 'lock\t\txaddq\t%rax, (%rcx)' 'retq'
          waker_vtable; } | waker_asm waker-hop )
 expect red "waker: an atomic one call hop out of a waker is red" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+# A conditional branch to a symbol is an edge, as a jump is: x86-64's conditional tail call
+# (`jne <sym>`, with or without LLVM's `# TAILCALL` comment) and aarch64's four spellings. To a
+# local label it stays in the body (the cases above).
+for insn in 'jne\thelper_fn' 'je\thelper_fn # TAILCALL' 'b.ne\thelper_fn' 'cbnz\tx0, helper_fn' \
+    'tbnz\tw8, #0, helper_fn'; do
+    asm=$( { waker_body waker_drop 'testq\t%rdi, %rdi' "$insn" 'retq'
+             for f in waker_clone waker_wake waker_wake_by_ref; do waker_body "$f" 'retq'; done
+             waker_body helper_fn 'lock\t\txaddq\t%rax, (%rcx)' 'retq'
+             waker_vtable; } | waker_asm waker-cond )
+    expect_red_because "waker: an atomic behind a conditional branch '$insn' is red" \
+        "ATOMIC on the waker's owner lane: waker_drop>helper_fn" \
+        env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+done
+# A control transfer the scanner has no edge rule for is red, never assumed clean: x86's `loop`
+# forms and aarch64's pointer-authenticated branches.
+for insn in 'loopne\thelper_fn' 'braa\tx8, x9'; do
+    asm=$( { waker_body waker_wake 'movq\t%rdi, %rax' "$insn" 'retq'
+             for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+             waker_vtable; } | waker_asm waker-unread )
+    expect_red_because "waker: a transfer the scan reads no edge for, '$insn', is red" \
+        "UNREAD BRANCH on the waker path: waker_wake" \
+        env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+done
 # The same atomic in a function the vtable never reaches must NOT be reported.
 asm=$( { for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
          waker_body off_path 'lock\t\txaddq\t%rax, (%rcx)' 'retq'
@@ -3152,6 +3175,14 @@ probe_boundary_asm() {
         printf '\t.xword\t%s\n' "$(psym "$f")"
     done
     printf '\t.size\t%s, 32\n' "$(psym BOUNDARY_WAKER_VTABLE)"
+    # The third vtable: a drop that reaches a read-modify-write by a conditional tail call.
+    waker_body "$(psym tail_fetch_add)" 'bl\t__aarch64_ldadd8_acq_rel' 'ret'
+    waker_body "$(psym tail_drop)" "cbnz\tx0, $(psym tail_fetch_add)" 'ret'
+    printf '%s:\n' "$(psym TAIL_WAKER_VTABLE)"
+    for f in waker_clone waker_wake waker_wake_by_ref tail_drop; do
+        printf '\t.xword\t%s\n' "$(psym "$f")"
+    done
+    printf '\t.size\t%s, 32\n' "$(psym TAIL_WAKER_VTABLE)"
 }
 probe_fixture() { # <name> <clone> <wake> <wake_by_ref> <off-path> [<waker_drop insns…>]
     local name=$1 clone=$2 wake=$3 by_ref=$4 off=$5
@@ -3173,8 +3204,8 @@ tree=$( { for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do waker
           waker_vtable; } | waker_asm waker-tree )
 pasm=$(probe_fixture waker-probe-arm64 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
     'stlr\tx9, [x8]' 'bl\t__aarch64_ldadd8_acq_rel')
-expect_output "waker probe: the arm64 Linux shape is 3 plants red, 2 controls green" \
-    "probe: fixture asm, 7 of 7 plants red, 3 of 3 controls green" \
+expect_output "waker probe: the arm64 Linux shape is 8 plants red, 3 controls green" \
+    "probe: fixture asm, 8 of 8 plants red, 3 of 3 controls green" \
     env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 expect green "waker probe: the arm64 Linux shape passes" env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 # The controls are exact: a probe copy with both control lines deleted is red.
@@ -3190,7 +3221,7 @@ expect_red_because "waker probe: a probe whose controls were deleted is red" \
 pasm=$(PSYM=v0 probe_fixture waker-probe-v0 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
     'stlr\tx9, [x8]' 'bl\t__aarch64_ldadd8_acq_rel')
 expect_output "waker probe: v0-mangled names match their own symbols" \
-    "probe: fixture asm, 7 of 7 plants red, 3 of 3 controls green" \
+    "probe: fixture asm, 8 of 8 plants red, 3 of 3 controls green" \
     env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 inner=_ZN19waker_atomics_probe10waker_drop5inner17h0123456789abcdefE
 pasm=$(probe_fixture waker-probe-nested 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
@@ -3215,8 +3246,8 @@ expect_red_because "waker probe: the probe-asm hook outside fixture mode is refu
 # followed, and listed with their atomics; an atomic beside a call to one is red; each must be
 # reached; a callee with no body is red unless the closed list holds it.
 fsym() { printf '_ZN11inf_runtime8executor7foreign%s%s17h0123456789abcdefE' "${#1}" "$1"; }
-boundary_tree() { # <waker_wake's extra insn> <waker_drop's callee> [settle_held reached: yes|no]
-    local f settle=${3:-yes}
+boundary_tree() { # <waker_wake's insn> <waker_drop's callee> [settle_held: yes|no] [drop's branch]
+    local f settle=${3:-yes} reach=${4:-callq}
     for f in clone wake wake_by_ref drop settle_held; do
         waker_body "$(fsym "$f")" 'lock\t\txaddq\t%rax, (%rcx)' 'retq'
     done
@@ -3227,7 +3258,7 @@ boundary_tree() { # <waker_wake's extra insn> <waker_drop's callee> [settle_held
         waker_body waker_wake "callq\t$(fsym wake)" "$1" 'retq'
     fi
     waker_body waker_wake_by_ref "callq\t$(fsym wake_by_ref)" 'callq\t__tls_get_addr@PLT' 'retq'
-    waker_body waker_drop "callq\t$(fsym drop)" "callq\t$2" 'retq'
+    waker_body waker_drop "$reach\t$(fsym drop)" "callq\t$2" 'retq'
     waker_vtable
 }
 asm=$(boundary_tree 'movq\t%rdi, %rax' '_RNvNtCsjrHSEGnQ3l9_3std7process5abort' | waker_asm waker-boundary)
@@ -3245,6 +3276,10 @@ expect_red_because "waker boundary: an atomic beside a boundary call is red" \
 asm=$(boundary_tree 'movq\t%rdi, %rax' memcpy no | waker_asm waker-dead)
 expect_red_because "waker boundary: a boundary function no waker reaches is red" \
     "DEAD BOUNDARY: executor::foreign::settle_held" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
+# The linked `waker_drop`'s shape: its boundary function reached by a conditional tail call.
+asm=$(boundary_tree 'movq\t%rdi, %rax' memcpy yes jne | waker_asm waker-cond-boundary)
+expect green "waker boundary: a boundary function a conditional tail call reaches is live" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER_LIVE
 asm=$(boundary_tree 'movq\t%rdi, %rax' _ZN14inf_foundation4wake10WakeBridge5quiet17h0123456789abcdefE |
       waker_asm waker-unlisted)
 expect_red_because "waker boundary: a callee the closed list does not hold is red" \

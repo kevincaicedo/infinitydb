@@ -7,8 +7,10 @@
 #   BODY <sym> <start> <end> <instrs>
 #   ATOMIC <sym> <line> <mnemonic>   an atomic instruction inside a body,
 #                                    or the outline-atomics helper it calls
-#   CALL <sym> <line> <target>       a direct call/branch leaving the body
+#   CALL <sym> <line> <target>       a direct call or branch, conditional or not, leaving the
+#                                    body
 #   INDIRECT <sym> <line> <call|jump>  an indirect branch inside a body
+#   UNREAD <sym> <line> <mnemonic>   a control transfer the scan has no edge rule for
 #
 # Bodies are delimited structurally — the symbol label line, then
 # `.cfi_startproc` … `.cfi_endproc` (emitted for both ELF and Mach-O), with
@@ -66,6 +68,33 @@ function is_outline_atomic(t) {
 
 function is_branch(m) {
     return m ~ /^(call|callq|calll|jmp|jmpq|bl|br|blr|b)$/
+}
+
+# A conditional branch: x86's every `j<cc>` (not `jmp`), aarch64's `b.<cond>` and `bc.<cond>`,
+# `cbz`/`cbnz` and `tbz`/`tbnz`. To a local label it stays in the body. To a symbol it is a
+# conditional tail call, which LLVM emits on x86-64 for a direct callee (`jne <sym>`), and its
+# target is an edge as a jump's is: a scan that skipped it would leave that callee unscanned.
+function is_cond_branch(m) {
+    return m ~ /^j(a|ae|b|be|c|cxz|e|ecxz|g|ge|l|le|na|nae|nb|nbe|nc|ne|ng|nge|nl|nle|no|np|ns|nz|o|p|pe|po|rcxz|s|z)$/ ||
+           m ~ /^bc?\.[a-z][a-z]$/ || m ~ /^(cbz|cbnz|tbz|tbnz)$/
+}
+
+# Every other control transfer of the two families, for a closed world: x86's remaining `j`,
+# `loop`, far and `call` forms, aarch64's pointer-authenticated branches. A body that holds one
+# is red (UNREAD), never assumed clean: the scan has no edge rule for it, so a spelling the
+# tables above do not read cannot leave its target unscanned in silence.
+function is_transfer(m) {
+    return m ~ /^(j[a-z]+|loop[a-z]*|l?call[a-z]*|ljmp[a-z]*)$/ ||
+           m ~ /^(b|bl|br|blr)(aa|ab|aaz|abz)$/
+}
+
+# The conditional branch's target, by its operand's position, so a trailing comment (`jne <t>
+# # TAILCALL`) is never read as it: the second field, the third after `cbz`/`cbnz`'s register
+# (`cbz x0, <t>`), the fourth after `tbz`/`tbnz`'s register and bit (`tbnz w8, #0, <t>`).
+function cond_target(m,   t) {
+    t = (m ~ /^(cbz|cbnz)$/) ? $3 : (m ~ /^(tbz|tbnz)$/) ? $4 : $2
+    sub(/,$/, "", t)
+    return t
 }
 
 # A call returns to the body; a jump (a jump table, or a tail branch) does not.
@@ -130,6 +159,15 @@ inbody == 1 {
             print "CALL " cur " " NR " " tgt
         }
     }
+    else if (is_cond_branch($1)) {
+        tgt = cond_target($1)
+        if (tgt != "" && !is_local(tgt)) {
+            sub(/@.*$/, "", tgt)
+            if (is_outline_atomic(tgt)) { print "ATOMIC " cur " " NR " " tgt }
+            print "CALL " cur " " NR " " tgt
+        }
+    }
+    else if (is_transfer($1)) { print "UNREAD " cur " " NR " " $1 }
     next
 }
 

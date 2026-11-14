@@ -10,8 +10,9 @@
 #     printed a count);
 #   * it delimits bodies structurally (`.cfi_startproc` … `.cfi_endproc`, ELF `.size` fallback)
 #     and FAILS when a body scans zero instructions;
-#   * it follows direct calls transitively through every callee whose body is in the same asm:
-#     that is the owner lane, and an atomic there is red with its call path. A call into
+#   * it follows direct calls and branches, a conditional tail call among them, transitively
+#     through every callee whose body is in the same asm: that is the owner lane, and an atomic
+#     there is red with its call path. A call into
 #     `inf_foundation::wake` is no exception: followed where its body is in the asm, and an
 #     unlisted callee where it is not;
 #   * the boundary (BOUNDARY below) is present, not followed: each of the five functions of
@@ -22,10 +23,10 @@
 #     the ready queue's growth (ADR-0003 A1.5's allocator exception, which leaves the list with
 #     the executor's intrusive ready list); the listed ones are printed on every run;
 #   * an indirect call on the owner lane is red (its target cannot be followed); indirect jumps
-#     are counted;
-#   * it compiles a planted-bypass probe (`scripts/waker-atomics-probe`), whose two vtables and
-#     boundary module carry known verdicts, and asserts each one: a gate that cannot go red is
-#     not a gate.
+#     are counted; a control transfer the scanner has no edge rule for is red (UNREAD);
+#   * it compiles a planted-bypass probe (`scripts/waker-atomics-probe`), whose three vtables
+#     and boundary module carry known verdicts, and asserts each one: a gate that cannot go red
+#     is not a gate.
 #
 # The ordered-access clause (an acquire load or a release store) is seen on aarch64, whose
 # `ldar`/`ldapr`/`stlr` the scanner counts; on x86-64 such an access is a plain `mov`, so there
@@ -94,7 +95,8 @@ scan_asm() {
 # verdict <facts>: per body a root reaches, `SCANNED <sym> <instrs> <depth> <path> [atomics…]`
 # for the owner lane and `BOUNDARY <name> <sym> <instrs> <path> [atomics…]` for a boundary
 # function (present, not followed); per callee with no body `LISTED <path> <sym>` or `UNLISTED
-# <path> <sym>`; `ICALL <sym> <line> <path>` per indirect call and `IJUMP <sym> <n>`; and
+# <path> <sym>`; `ICALL <sym> <line> <path>` per indirect call and `IJUMP <sym> <n>`;
+# `UNREAD <sym> <path> <line>:<mnemonic>…` per scanned body with a transfer no rule reads; and
 # `DEAD <name>` per boundary function no root reaches. Reachability is the transitive closure
 # of direct calls over bodies that exist in this asm, stopped at the boundary.
 verdict() {
@@ -117,6 +119,7 @@ verdict() {
         $1 == "BODY"   { instrs[$2] = $5; seen[$2] = 1; next }
         $1 == "ATOMIC" { atomic[$2] = atomic[$2] " " $3 ":" $4; next }
         $1 == "CALL"   { edge[$2] = edge[$2] " " $4; next }
+        $1 == "UNREAD" { unread[$2] = unread[$2] " " $3 ":" $4; next }
         $1 == "INDIRECT" {
             if ($4 == "call") icall[$2] = icall[$2] " " $3
             else ijump[$2]++
@@ -145,6 +148,7 @@ verdict() {
                 m = split(icall[s], c, " ")
                 for (j = 1; j <= m; j++) print "ICALL " s " " c[j] " " from[s]
                 if (s in ijump) print "IJUMP " s " " ijump[s]
+                if (s in unread) print "UNREAD " s " " from[s] unread[s]
                 n = split(edge[s], t, " ")
                 for (j = 1; j <= n; j++) {
                     if (t[j] == "" || (t[j] in from)) continue
@@ -247,6 +251,12 @@ while read -r _ sym line path; do
     fail=1
 done < <(grep '^ICALL ' "$work/verdict")
 ijumps=$(awk '$1 == "IJUMP" { n += $3 } END { print n + 0 }' "$work/verdict")
+# A transfer the scanner has no edge rule for leaves its target unread: red, never clean.
+while read -r _ sym path rest; do
+    echo "UNREAD BRANCH on the waker path: $path"
+    echo "  at $sym (asm line:mnemonic):$rest; the scanner reads no edge for it, so it is never assumed clean"
+    fail=1
+done < <(grep '^UNREAD ' "$work/verdict")
 
 # Callees with no body in this asm are never assumed clean: one outside the closed list is red,
 # with its path, and the listed ones are printed on every run.
@@ -390,10 +400,11 @@ else
                 greens=$((greens + ok)) ;;
         esac
     done < <(sed -n 's|^.*WAKER-PROBE: \(expect-[a-z-]*\)[[:space:]]\{1,\}\([A-Za-z0-9_]*\).*$|\1 \2|p' "$PROBE_SRC/src/lib.rs")
-    # The plants: three refcount spellings, an atomic beside a boundary call and the drift into
-    # another module's read-modify-write; one unlisted callee; one dead boundary.
-    if [ "$atomics" -lt 5 ] || [ "$unlisted" -ne 1 ] || [ "$dead" -ne 1 ]; then
-        echo "WAKER SCOPE ERROR: probe declares $atomics atomic, $unlisted unlisted and $dead dead-boundary plants (expected >= 5, 1 and 1) — the fixture was edited down"
+    # The plants: three refcount spellings, an atomic beside a boundary call, the drift into
+    # another module's read-modify-write and a read-modify-write a conditional tail call
+    # reaches; one unlisted callee; one dead boundary.
+    if [ "$atomics" -lt 6 ] || [ "$unlisted" -ne 1 ] || [ "$dead" -ne 1 ]; then
+        echo "WAKER SCOPE ERROR: probe declares $atomics atomic, $unlisted unlisted and $dead dead-boundary plants (expected >= 6, 1 and 1) — the fixture was edited down"
         fail=1
     fi
     # The controls are exact: the vtable's one clean waker, one atomic off the path and one
