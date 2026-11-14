@@ -1837,6 +1837,20 @@ mod tests {
         // enqueue refusals were invisible in soak artifacts).
         assert!(text.contains("cold_pool_dry:0"), "{text}");
         assert!(text.contains("cold_queue_full:0"), "{text}");
+        // The cold host's delivery and identity gauges render beside them.
+        for field in [
+            "cold_delivery_work:0",
+            "cold_delivery_work_turn_max:0",
+            "cold_delivery_pending_members:0",
+            "cold_delivery_pending_windows:0",
+            "cold_delivery_delay_p99_us:0",
+            "cold_receipt_foreign:0",
+            "cold_link_stale:0",
+            "cold_identity_exhausted:0",
+            "cold_identity_pairs_used:0",
+        ] {
+            assert!(text.contains(field), "{field}: {text}");
+        }
     }
 
     /// v0.4.0-alpha instrument fix: the typed `-BUSY` staging-admission

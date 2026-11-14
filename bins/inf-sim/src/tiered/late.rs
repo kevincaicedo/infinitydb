@@ -1,6 +1,7 @@
 //! The tiered scenario's late phases — 7c (a rebuilt winner carrying
 //! several tickets, ADR-0093 A10), 7d (two GETs of one cold blob key in
-//! flight together, issue #11), 8 (DISKFULL clamp → typed refusal →
+//! flight together, issue #11), 7e (a cold burst on a quiet node, delivered
+//! a turn's allowance at a time, ADR-0181 R1), 8 (DISKFULL clamp → typed refusal →
 //! reopen, ADR-0063), 9 (the S19 drop race through the wire), 10 and 10b
 //! (reboots after a DROP and a cut inside one, ADR-0100). Each phase is a
 //! straight-line script over [`Late`]; `Err(())` means "finish now" — the
@@ -9,6 +10,7 @@
 //! after phase 10's reboot.
 
 use super::*;
+use crate::resp::Reply;
 
 /// Cross-phase state the late phases share with the script.
 pub(super) struct Late<'a> {
@@ -56,6 +58,7 @@ pub(super) fn run(cx: &mut Late<'_>, node: Node, audit: MiniClient, total_keys: 
         phase_7c(cx, node, audit, total_keys)?
     };
     phase_7d(cx, &mut node, &mut audit)?;
+    phase_7e(cx, &mut node, &mut audit)?;
     phase_8(cx, &mut node, &mut audit)?;
     listing_residue(cx, &mut node, &mut audit)?;
     phase_9(cx, &mut node, &mut audit)?;
@@ -413,30 +416,34 @@ fn phase_7c(
     Ok((node, audit))
 }
 
-/// Phase 7d's steps share these: a failure is on the report and `Err`
-/// ends the script.
+/// Phase 7d's and 7e's steps share these: a failure is on the report and
+/// `Err` ends the script. A scrape or a call prints its phase's name, the
+/// first argument of the shared form, so each phase calls its own pair
+/// (`scrape7d!` and `call7d!`, `scrape7e!` and `call7e!`) and a red is read
+/// as its own phase's.
 macro_rules! bail7d {
     ($cx:expr, $($arg:tt)*) => {{
         $cx.fail(format!($($arg)*));
         return Err(());
     }};
 }
-macro_rules! scrape7d {
-    ($cx:expr, $node:expr, $keys:expr) => {
+macro_rules! scrape_late {
+    ($phase:literal, $cx:expr, $node:expr, $keys:expr) => {
         match info_sum($node, $cx.rng, $cx.clock, $cx.disk, $cx.scenario, $keys) {
             Ok(v) => v,
-            Err(err) => bail7d!($cx, "phase-7d scrape: {err}"),
+            Err(err) => bail7d!($cx, "{} scrape: {err}", $phase),
         }
     };
 }
-macro_rules! call7d {
-    ($cx:expr, $node:expr, $client:expr, $cmd:expr, $want:expr, $what:expr) => {{
+macro_rules! call_late {
+    ($name:literal, $cx:expr, $node:expr, $client:expr, $cmd:expr, $want:expr, $what:expr) => {{
         let want: &[u8] = $want;
         match $client.call($node, $cx.rng, $cx.clock, $cx.disk, $cx.scenario.step_ns_max, $cmd) {
             Ok(Some(reply)) if reply == want => {}
             other => bail7d!(
                 $cx,
-                "PROMOTED-EXTENT VIOLATION seed {:#x}: {} answered {}, wanted {}",
+                "{} VIOLATION seed {:#x}: {} answered {}, wanted {}",
+                $name,
                 $cx.scenario.seed,
                 $what,
                 other.map_or_else(
@@ -448,6 +455,18 @@ macro_rules! call7d {
         }
         $cx.report.commands_done += 1;
     }};
+}
+macro_rules! scrape7d {
+    ($($arg:tt)*) => { scrape_late!("phase-7d", $($arg)*) };
+}
+macro_rules! call7d {
+    ($($arg:tt)*) => { call_late!("PROMOTED-EXTENT", $($arg)*) };
+}
+macro_rules! scrape7e {
+    ($($arg:tt)*) => { scrape_late!("phase-7e", $($arg)*) };
+}
+macro_rules! call7e {
+    ($($arg:tt)*) => { call_late!("COLD BURST", $($arg)*) };
 }
 
 /// Phase 7d (issue #11, the nightly of 2026-11-06): two GETs of one cold
@@ -633,6 +652,446 @@ fn promoting_pair(
     Ok(after[0] > before[0] && after[1] >= before[1] + 2)
 }
 
+/// Phase 7e's readers: one `GET` a connection, since a connection's pipeline
+/// holds one cold read at a time; four turns of a turn's 64 visits.
+const BURST_READERS: usize = 256;
+
+/// Phase 7e's keys' hashtag: every burst and filler key on one owning cell,
+/// the cell its readers connect to.
+const BURST_TAG: &str = "p7e";
+
+/// A burst key's value: small, so one device read covers many adjacent keys.
+const BURST_VALUE_LEN: usize = 400;
+
+/// Rounds of phase 7e's delivery: the burst's own reads, then at most two rounds of re-reads. A
+/// reader reads again after its resume when its candidate held another key's record (a
+/// fingerprint match), its key's cold address moved while it waited, or its image ran past its
+/// window; each further round needs one more such miss, so a reader still waiting at the last
+/// round's bound is a stuck client.
+#[cfg(not(inf_canary_cold_burst_one_round))]
+const BURST_ROUNDS_MAX: u32 = 3;
+// Canary: no round after the burst's own.
+#[cfg(inf_canary_cold_burst_one_round)]
+const BURST_ROUNDS_MAX: u32 = 1;
+
+/// Phase 7e: a cold burst, then its delivery in rounds (ADR-0181 R1, R2). Burst keys on one cell
+/// are written and pushed out of RAM by filler batches; then one `GET` of each from its own
+/// connection to the owning cell, all reaching it at one reap, so they merge into fewer reads than
+/// the device's depth, while the device holds tier reads until every read the burst issues is
+/// queued there; released at one driver entry, their receipts make more members ready than a turn
+/// visits. A round is the tier reads the device holds, released at one driver entry. Other tier
+/// reads may run beside the burst (a replay-above-window node keeps reading its tier), so a
+/// round's receipt is its own: the step at which the owner's sim driver has counted the reads it
+/// released, set once. From that step the device holds tier reads again, so no other read
+/// completes and no other window becomes ready, and a sim cell iterates every step, so the
+/// server's `before_execute` delivers the round alone. The burst's reads are the first round; a
+/// read the device comes to hold after a receipt is a re-read, the next round's. Oracle: each reply
+/// is its value, and a cold one arrives within ⌈readers left / 64⌉ + 2 steps of its round's
+/// receipt (the harness's reply log against the device's own count): a reply past that bound is
+/// late. Past a round's bound the owner's cold host's pending count is judged at every step to the
+/// next release, the count the wait begins with and each step's own, after the step's replies: a
+/// member a receipt made ready and no turn visited within the bound is unvisited. The next round
+/// is released once the held reads are steady. A reader with no read held for `STALL_STEPS`, or
+/// still waiting at round [`BURST_ROUNDS_MAX`]'s bound, is a stuck client. The phase is quiet of
+/// copy-forward too: from before its keys are written to its last reply, no file sealed gives a
+/// burst key back to RAM ([`burst_quiet`]). Engagement: some step left the owner's cold host
+/// members to visit (its pending count, read between steps: a wiring half), so a turn's allowance
+/// left members to a later turn; else VACUOUS.
+fn phase_7e(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
+    let seed = cx.scenario.seed;
+    let ratio = burst_quiet(cx, node, audit)?;
+    let keys: Vec<Vec<u8>> =
+        (0..BURST_READERS).map(|i| format!("{{{BURST_TAG}}}burst:{i:03}").into_bytes()).collect();
+    let values: Vec<Vec<u8>> =
+        (0..BURST_READERS).map(|i| value_bytes(b'e', 7, i as u64, BURST_VALUE_LEN)).collect();
+    for (key, value) in keys.iter().zip(&values) {
+        call7e!(cx, node, audit, &[b"SET", key, value], b"+OK\r\n", "SET of a burst key");
+    }
+    burst_cool(cx, node, audit)?;
+    let owner = super::support::owner_cell(cx.scenario.cells, &keys[0]);
+    let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
+    let mut burst = Burst {
+        owner,
+        readers: Vec::with_capacity(BURST_READERS),
+        wants: values.iter().map(|value| bulk(value)).collect(),
+        answered: vec![false; BURST_READERS],
+        left: BURST_READERS,
+    };
+    for _ in 0..BURST_READERS {
+        let mut reader = MiniClient::connect(node, owner);
+        call7e!(cx, node, reader, use_ns, b"+OK\r\n", "USE of a burst reader");
+        burst.readers.push(reader);
+    }
+    // The burst reaches the owner at one reap, as a stopped-then-resumed
+    // client's would: its requests are queued together and merge, so every
+    // read the burst issues fits the device's depth and is held whole.
+    let delivery = node.nets[owner].borrow_mut().deliver_whole();
+    cx.disk.hold_reads(Some(is_tier_file));
+    for (reader, key) in burst.readers.iter_mut().zip(&keys) {
+        reader.send(node, &[b"GET", key]);
+    }
+    let held = burst_hold(cx, node, &mut burst);
+    cx.disk.hold_reads(None);
+    let held = held?;
+    if held == 0 {
+        bail7d!(cx, "COLD BURST VACUOUS seed {seed:#x}: the burst issued no tier read");
+    }
+    let cold = burst.left;
+    let delivered = burst_deliver(cx, node, &mut burst, held);
+    cx.disk.hold_reads(None);
+    node.nets[owner].borrow_mut().restore_delivery(delivery);
+    let pending_max = delivered?;
+    if pending_max == 0 {
+        bail7d!(
+            cx,
+            "COLD BURST VACUOUS seed {seed:#x}: {cold} GETs read cold and no step left a member \
+             to visit: no turn's allowance left one to a later turn"
+        );
+    }
+    let pending = scrape7e!(cx, node, &["cold_delivery_pending_members"])[0];
+    if pending != 0 {
+        bail7d!(cx, "COLD BURST seed {seed:#x}: {pending} members left after every reply");
+    }
+    let set_back: &[&[u8]] = &[b"INF.NS", b"SET", NS_NAME, b"COMPACTION-DEAD-RATIO", &ratio];
+    call7e!(cx, node, audit, set_back, b"+OK\r\n", "phase 7e's dead ratio set back");
+    Ok(())
+}
+
+/// Phase 7e's compaction dead ratio, in percent: at 100 the dead-ratio arm
+/// takes a file only with every byte dead.
+const BURST_DEAD_RATIO_PCT: &[u8] = b"100";
+
+/// Phase 7e's quiet of copy-forward, set before the burst's keys are
+/// written. Compaction re-appends a file's live records at the RAM tail,
+/// and a file sealed while the keys cool is a candidate at its seal when
+/// its dead bytes are half its data (a node that replayed its whole log
+/// and demoted it again holds mostly dead bytes): it would give burst keys
+/// back to RAM at addresses above the sentinel, which reads cold. So the
+/// namespace's dead ratio is set to [`BURST_DEAD_RATIO_PCT`]; a candidate
+/// already picked ends on a file sealed before the keys were written. The
+/// pressure arm takes the widest dead ratio whatever the setting, but only
+/// under a disk budget, so the namespace must have none, else VACUOUS.
+/// Returns the ratio it read, which the phase sets back after its last
+/// reply.
+fn burst_quiet(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict<Vec<u8>> {
+    let seed = cx.scenario.seed;
+    let info: &[&[u8]] = &[b"INF.NS", b"INFO", NS_NAME];
+    let reply = match audit.call(node, cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max, info) {
+        Ok(Some(reply)) => reply,
+        other => bail7d!(
+            cx,
+            "phase-7e INF.NS INFO answered {}",
+            other.map_or_else(
+                |e| e.to_string(),
+                |r| r.map_or("nothing".to_owned(), |r| preview(&r))
+            )
+        ),
+    };
+    cx.report.commands_done += 1;
+    let fields =
+        (ns_info_field(&reply, b"compaction-dead-ratio"), ns_info_field(&reply, b"disk-budget"));
+    let (Some(ratio), Some(budget)) = fields else {
+        bail7d!(cx, "phase-7e INF.NS INFO carries no tier block: {}", preview(&reply));
+    };
+    if budget != b"0" {
+        bail7d!(
+            cx,
+            "COLD BURST VACUOUS seed {seed:#x}: the namespace's disk-budget is {}, so \
+             compaction's pressure arm may give a burst key back to RAM",
+            String::from_utf8_lossy(&budget)
+        );
+    }
+    let quiet: &[&[u8]] =
+        &[b"INF.NS", b"SET", NS_NAME, b"COMPACTION-DEAD-RATIO", BURST_DEAD_RATIO_PCT];
+    call7e!(cx, node, audit, quiet, b"+OK\r\n", "phase 7e's dead ratio");
+    Ok(ratio)
+}
+
+/// `field`'s value in an `INF.NS INFO` reply, an array of field and value
+/// bulks.
+fn ns_info_field(reply: &[u8], field: &[u8]) -> Option<Vec<u8>> {
+    let Ok(Reply::Array(items)) = crate::resp::try_parse_reply(reply) else {
+        return None;
+    };
+    items.chunks_exact(2).find_map(|pair| match pair {
+        [Reply::Bulk(name), Reply::Bulk(value)] if name == field => Some(value.clone()),
+        _ => None,
+    })
+}
+
+/// Phase 7e's readers and what they answered.
+struct Burst {
+    /// The cell that owns every burst key; its readers connect to it.
+    owner: usize,
+    readers: Vec<MiniClient>,
+    /// Each reader's expected reply.
+    wants: Vec<Vec<u8>>,
+    answered: Vec<bool>,
+    /// Readers not yet answered.
+    left: usize,
+}
+
+impl Burst {
+    /// Reads every reply that has arrived and judges it against its value.
+    /// Returns how many arrived.
+    fn collect(&mut self, cx: &mut Late<'_>, node: &mut Node) -> Verdict<usize> {
+        let seed = cx.scenario.seed;
+        let mut arrived = 0;
+        for (i, reader) in self.readers.iter_mut().enumerate() {
+            if self.answered[i] {
+                continue;
+            }
+            let Some(reply) = reader.recv(node) else { continue };
+            if reply != self.wants[i] {
+                bail7d!(
+                    cx,
+                    "COLD BURST VIOLATION seed {seed:#x}: reader {i} answered {}, wanted {}",
+                    preview(&reply),
+                    preview(&self.wants[i])
+                );
+            }
+            self.answered[i] = true;
+            arrived += 1;
+        }
+        self.left -= arrived;
+        cx.report.commands_done += arrived as u64;
+        Ok(arrived)
+    }
+}
+
+/// Phase 7e's cooling: filler batches on the burst's cell until a sentinel
+/// key written after the burst keys reads cold; the burst keys, older, aged
+/// out of RAM before it. Bounded as phase 7d's; a sentinel still in RAM at
+/// the bound is a vacuous row.
+fn burst_cool(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
+    const FILL_BATCHES_MAX: u64 = 64;
+    let seed = cx.scenario.seed;
+    let sentinel = format!("{{{BURST_TAG}}}sentinel").into_bytes();
+    let value = value_bytes(b's', 7, 0, BURST_VALUE_LEN);
+    call7e!(cx, node, audit, &[b"SET", &sentinel, &value], b"+OK\r\n", "SET of the sentinel");
+    let want = bulk(&value);
+    for batch in 0..FILL_BATCHES_MAX {
+        fill_batch(cx, node, audit, BURST_TAG, batch)?;
+        let before = scrape7e!(cx, node, &["tiering_cold_resolves"])[0];
+        call7e!(cx, node, audit, &[b"GET", &sentinel], &want, "GET of the sentinel");
+        if scrape7e!(cx, node, &["tiering_cold_resolves"])[0] > before {
+            return Ok(());
+        }
+    }
+    bail7d!(
+        cx,
+        "COLD BURST VACUOUS seed {seed:#x}: {FILL_BATCHES_MAX} filler batches left the sentinel \
+         in RAM"
+    );
+}
+
+/// Steps until the owner's held tier reads stop growing: every read the
+/// burst issues is queued at the device. A reply that arrives meanwhile is
+/// a `GET` answered from RAM, judged and kept out of the cold count; once
+/// every reader has answered so, the hold has nothing left to wait for.
+/// Returns the reads held.
+fn burst_hold(cx: &mut Late<'_>, node: &mut Node, burst: &mut Burst) -> Verdict<usize> {
+    steady_held_reads(STALL_STEPS, || {
+        if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
+            bail7d!(cx, "phase-7e hold step: {err}");
+        }
+        cx.report.scheduler_steps += 1;
+        burst.collect(cx, node)?;
+        if burst.left == 0 {
+            return Ok(HeldReads::Answered);
+        }
+        Ok(HeldReads::Waiting(node.driver(burst.owner).held_reads()))
+    })
+}
+
+/// One round of phase 7e's delivery.
+#[derive(Clone, Copy)]
+struct Round {
+    /// 1 for the burst's own reads, then each round of re-reads.
+    index: u32,
+    /// The tier reads the device held, which the round releases.
+    held: usize,
+    /// Readers unanswered at the release.
+    readers: u64,
+    /// Steps after the round's receipt within which its replies arrive:
+    /// [`burst_bound`] of `readers`.
+    bound: u64,
+}
+
+/// A round's bound: the steps after its receipt within which the replies of
+/// `readers` arrive, ⌈`readers` / a turn's visits⌉ + 2. The one home of the
+/// bound, so a const that names a step of the bound reads it here.
+const fn burst_bound(readers: u64) -> u64 {
+    readers.div_ceil(inf_runtime::limits::COLD_DELIVERIES_PER_TURN as u64) + 2
+}
+
+// Canary: the planted host's delay is the wait step its row names, at the
+// burst's readers; a moved const would be caught on another step, silently.
+// Seven turns: the wait's first step, one past round 1's bound.
+#[cfg(inf_canary_cold_ready_left_seven_turns)]
+const _: () =
+    assert!(inf_runtime::limits::COLD_READY_LEFT_TURNS == burst_bound(BURST_READERS as u64) + 1);
+// Fifteen turns: the shortest wait's last step, its first step and the held
+// reads' steady steps past the bound.
+#[cfg(inf_canary_cold_ready_left_fifteen_turns)]
+const _: () = assert!(
+    inf_runtime::limits::COLD_READY_LEFT_TURNS
+        == burst_bound(BURST_READERS as u64) + 1 + crate::durable::HELD_READS_STEADY_STEPS
+);
+
+/// Steps until every burst reader's reply is in, in rounds: the first
+/// releases the `held` reads of the burst, and each round's replies are
+/// judged against its own receipt. Past a round's bound with readers left,
+/// the reads the device came to hold are the next round's. From a receipt
+/// the device holds tier reads again, until the caller lifts the hold.
+/// Returns the most members a step left the owner's cold host to visit.
+fn burst_deliver(
+    cx: &mut Late<'_>,
+    node: &mut Node,
+    burst: &mut Burst,
+    held: usize,
+) -> Verdict<u64> {
+    let seed = cx.scenario.seed;
+    let mut pending_max = 0;
+    let mut round = Round { index: 1, held, readers: 0, bound: 0 };
+    loop {
+        round.readers = burst.left as u64;
+        round.bound = burst_bound(round.readers);
+        cx.report.burst_rounds = round.index;
+        if burst_round(cx, node, burst, round, &mut pending_max)? {
+            return Ok(pending_max);
+        }
+        round.held = burst_wait(cx, node, burst, round, &mut pending_max)?;
+        if round.index == BURST_ROUNDS_MAX {
+            cx.report.stalled = true;
+            let left = burst.left;
+            bail7d!(
+                cx,
+                "COLD BURST STALL seed {seed:#x}: cold-burst-round-cap: {left} readers still wait \
+                 on a read after {} rounds (a stuck client)",
+                round.index
+            );
+        }
+        round.index += 1;
+        cx.disk.hold_reads(None);
+    }
+}
+
+/// One round of [`burst_deliver`]: steps from its release until every
+/// reader has answered (`true`), or until its bound has passed since its
+/// receipt with readers left (`false`). The receipt is the step at which
+/// the owner's driver has counted the round's held reads, set once; from it
+/// the device holds tier reads again.
+fn burst_round(
+    cx: &mut Late<'_>,
+    node: &mut Node,
+    burst: &mut Burst,
+    round: Round,
+    pending_max: &mut u64,
+) -> Verdict<bool> {
+    let seed = cx.scenario.seed;
+    let released = node.driver(burst.owner).observed_io().read_completions;
+    let received = released + round.held as u64;
+    let mut mark = None;
+    for step in 0..STALL_STEPS {
+        if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
+            bail7d!(cx, "phase-7e burst step: {err}");
+        }
+        cx.report.scheduler_steps += 1;
+        let completions = node.driver(burst.owner).observed_io().read_completions;
+        if mark.is_none() && completions >= received {
+            mark = Some(step);
+            cx.disk.hold_reads(Some(is_tier_file));
+        }
+        *pending_max = (*pending_max).max(node.plane(burst.owner).cold_pending_for_sim());
+        let arrived = burst.collect(cx, node)?;
+        if arrived > 0 && completions == released {
+            bail7d!(cx, "COLD BURST seed {seed:#x}: a cold GET answered before any receipt");
+        }
+        if burst.left == 0 {
+            if mark.is_none() {
+                bail7d!(
+                    cx,
+                    "COLD BURST VACUOUS seed {seed:#x}: every reply arrived before the owner \
+                     counted the {} reads the hold released: no reply was judged",
+                    round.held
+                );
+            }
+            return Ok(true);
+        }
+        if mark.is_some_and(|mark| step - mark == round.bound) {
+            return Ok(false);
+        }
+    }
+    cx.report.stalled = true;
+    let left = burst.left;
+    bail7d!(cx, "COLD BURST STALL seed {seed:#x}: {left} readers never answered (a stuck client)");
+}
+
+/// Past a round's bound with readers left: steps until the tier reads the
+/// device holds are steady above 0, and returns them, the next round's. At
+/// each step a reply is late first: no read completed since the receipt, so
+/// the receipt made its member ready. Then the owner's cold host's pending
+/// count is judged, the count the wait began with and the step's own: one
+/// above 0 is a member a receipt made ready that no turn visited within the
+/// bound, whatever read is held. Every count from the bound's step to the
+/// release is judged, so a member first visited on a wait step reads
+/// unvisited, never on time. No read held at `STALL_STEPS` is a stuck client.
+fn burst_wait(
+    cx: &mut Late<'_>,
+    node: &mut Node,
+    burst: &mut Burst,
+    round: Round,
+    pending_max: &mut u64,
+) -> Verdict<usize> {
+    let seed = cx.scenario.seed;
+    let turn = inf_runtime::limits::COLD_DELIVERIES_PER_TURN;
+    let (index, bound, readers) = (round.index, round.bound, round.readers);
+    // The members the bound's step left: judged with the first wait step's
+    // own count, after that step's replies, so a reply is the reply clause's.
+    let first = node.plane(burst.owner).cold_pending_for_sim();
+    let mut wait_step = 0u64;
+    let held = steady_held_reads(STALL_STEPS, || {
+        if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
+            bail7d!(cx, "phase-7e wait step: {err}");
+        }
+        cx.report.scheduler_steps += 1;
+        wait_step += 1;
+        let pending = node.plane(burst.owner).cold_pending_for_sim();
+        *pending_max = (*pending_max).max(pending);
+        let arrived = burst.collect(cx, node)?;
+        if arrived > 0 {
+            bail7d!(
+                cx,
+                "COLD BURST VIOLATION seed {seed:#x}: cold-burst-late: {arrived} replies arrived \
+                 past round {index}'s bound of {bound} steps (⌈{readers} / {turn}⌉ + 2)"
+            );
+        }
+        // The first count is 0 past the first step, else that step ended the wait.
+        let unvisited = first.max(pending);
+        if unvisited > 0 {
+            bail7d!(
+                cx,
+                "COLD BURST VIOLATION seed {seed:#x}: cold-burst-unvisited: {unvisited} members a \
+                 receipt made ready are unvisited at wait step {wait_step} past round {index}'s \
+                 bound of {bound} steps"
+            );
+        }
+        // A reply or a member left ends the wait above, so every reader left still waits.
+        Ok(HeldReads::Waiting(node.driver(burst.owner).held_reads()))
+    })?;
+    let left = burst.left;
+    if held == 0 {
+        cx.report.stalled = true;
+        bail7d!(
+            cx,
+            "COLD BURST STALL seed {seed:#x}: {left} readers never answered and the device holds \
+             no read of theirs (a stuck client)"
+        );
+    }
+    Ok(held)
+}
+
 /// Phase 8: DISKFULL clamp → typed refusal → reopen (ADR-0063).
 fn phase_8(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdict {
     // A probe key guaranteed live before the clamp (GET/DEL at the cap
@@ -800,11 +1259,6 @@ fn check_listing_repeats(cx: &mut Late<'_>) {
                 .to_string(),
         );
     }
-}
-
-/// A tier file, by its name.
-fn is_tier_file(path: &std::path::Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "itier")
 }
 
 /// Whether any cell's device holds a tier read now: the harness's own

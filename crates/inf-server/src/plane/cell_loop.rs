@@ -47,6 +47,24 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         });
         true
     }
+
+    /// The turn's cold delivery (ADR-0181 R1, R2) from the iteration's
+    /// allowance: the cold handle is cloned under a short tier borrow, which
+    /// is released before any gate wake or orphan cleanup runs, and the
+    /// allowance is lent only when the host holds ready delivery, so an
+    /// iteration with nothing ready builds no turn. Out of line, so a cell
+    /// with no cold engine carries none of it in its iteration
+    /// (`inf-runtime`'s `cold_path` bench, its server-shaped reactor legs).
+    #[inline(never)]
+    fn deliver_cold(&self, cx: &mut LoopCx<'_>) {
+        let cold = self.shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
+        if let Some(cold) = cold
+            && cold.has_ready_delivery()
+        {
+            let now_us = cx.now.as_micros();
+            let _ = cx.with_cold_delivery_budget(|budget| cold.deliver_ready(budget, now_us));
+        }
+    }
 }
 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for ServerPlane<O, F> {
@@ -148,17 +166,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 // Cold-read failure (M4-S26): custody must release —
                 // waiters observe the typed errno and the command layer
                 // answers a typed error, never a crash (operating error).
+                // The receipt is recorded here; the next turn's
+                // `before_execute` delivers its members (ADR-0181 R1).
                 if c.token.class() == TokenClass::TierRead {
                     let tier = self.shared.tier.borrow();
                     let cold = tier
                         .as_ref()
                         .and_then(|t| t.cold.as_ref())
                         .expect("TierRead completion implies a live cold-read engine");
-                    cold.on_completion(
-                        c.token,
-                        CompletionResult::Error { buf: None, errno },
-                        cx.now.as_micros(),
-                    );
+                    record_cold_receipt(cold, c.token, Err(errno), cx.now.as_micros());
                     return;
                 }
                 // Accept-path failures belong to the listener, never to a
@@ -270,14 +286,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 }
             }
             CompletionResult::TierRead => {
-                // M4-S26: route into the custody table — waiters wake and
-                // their futures run in this iteration's EXECUTE slice.
+                // M4-S26: route into the custody table — this iteration's
+                // `before_execute` delivers its members, so their futures
+                // run in this iteration's EXECUTE slice (ADR-0181 R1, R2).
                 let tier = self.shared.tier.borrow();
                 let cold = tier
                     .as_ref()
                     .and_then(|t| t.cold.as_ref())
                     .expect("TierRead completion implies a live cold-read engine");
-                cold.on_completion(c.token, CompletionResult::TierRead, cx.now.as_micros());
+                record_cold_receipt(cold, c.token, Ok(()), cx.now.as_micros());
             }
         }
     }
@@ -311,6 +328,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         }
     }
 
+    fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
+        // ADR-0181 R2: the turn's cold delivery, before either executor
+        // pass and outside `parse_execute`'s listener-startup and DEBUG
+        // SLEEP returns. A cell with no cold engine pays the engine's
+        // presence test under a short tier borrow; the delivery itself is
+        // out of the iteration's line.
+        let engine = self.shared.tier.borrow().as_ref().is_some_and(|t| t.cold.is_some());
+        if engine {
+            self.deliver_cold(cx);
+        }
+    }
+
     fn before_park(&mut self) -> bool {
         // Boot replay pending: keep polling (M2-S15) — parking would gate
         // recovery throughput on the park timeout. Throttled (test-only)
@@ -332,6 +361,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         if self.ckpt_observation_owed() && self.shared.ckpt_waiters.any_waiting() {
             return true;
         }
+        // A parked loop never holds ready cold work (ADR-0181 R2, R6):
+        // members a turn's allowance left, or a drain that may issue now,
+        // wait for the next turn, not for a park's timeout, park flags or
+        // none.
+        let tier = self.shared.tier.borrow();
+        let cold = tier.as_ref().and_then(|t| t.cold.as_ref());
+        if cold.is_some_and(|cold| cold.holds_ready_work()) {
+            return true;
+        }
+        drop(tier);
         let Some(flags) = &self.park_flags else { return false };
         let me = usize::from(self.shared.cell.0);
         flags[me].store(true, Ordering::Relaxed);
@@ -1308,4 +1347,18 @@ fn publish_durable_stats(node: &NodeInfo, stats: crate::durable::DurableStats) {
     node.recycle_waits_satisfied.set(stats.recycle_waits_satisfied);
     node.recycle_waits_expired.set(stats.recycle_waits_expired);
     node.recycle_wait_active_bytes_max.set(stats.recycle_wait_active_bytes_max);
+}
+
+/// Records a cold-read receipt the dispatch decided (ADR-0181 R1). A foreign
+/// receipt is the host's to count; the dispatch has nothing more to do with
+/// either answer.
+fn record_cold_receipt(
+    cold: &inf_runtime::ColdReads,
+    token: inf_runtime::CompletionToken,
+    result: Result<(), i32>,
+    now_us: u64,
+) {
+    match cold.record_completion(token, result, now_us) {
+        inf_runtime::ColdReceipt::Recorded | inf_runtime::ColdReceipt::Foreign => {}
+    }
 }

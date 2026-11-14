@@ -957,6 +957,57 @@ rows=(
   # tier op queued (a vacuity plant, read in the simulator alone).
   "inf_canary_tier_spend_driver_queue m4-tier-budget TIER-SPEND --tier-leg two-1mb-thief"
   "inf_canary_tier_spend_driver_queue m4-tier-budget tier-spend-unqueued --tier-leg two-1mb-thief"
+  # ADR-0181 R4: a cold-read host mints each identity pair once and never returns one; planted,
+  # a cancelled request's pair returns to the issuer, so the next request repeats its ids.
+  "inf_canary_cold_identity_recycled crate-test inf-runtime lib every_identity_the_issuer_mints_is_fresh_and_typed_by_parity an id repeats"
+  # ADR-0181 R2: a turn's cold delivery runs before either executor pass; planted, it runs at
+  # parse_execute's head, so with remote_first_execute a woken task polls first.
+  "inf_canary_cold_delivery_after_execute crate-test inf-runtime test:reactor a_turns_cold_delivery_precedes_a_woken_tasks_poll_in_both_modes polled before the turn's delivery"
+  # ADR-0181 R2: a parked loop never holds ready cold delivery; planted, the park veto ignores
+  # it, so an idle loop parks with a ready window.
+  "inf_canary_cold_park_without_delivery crate-test inf-runtime test:reactor a_ready_cold_window_keeps_the_loop_from_parking parked with ready delivery"
+  # The same plant on the shipped plane over the sim driver: the server's
+  # before_park asks the same function, so at spin_iters 0 a cell whose turn
+  # left cold-read members to visit begins an iteration parked.
+  "inf_canary_cold_park_without_delivery crate-test inf-sim lib a_cell_with_cold_members_to_visit_begins_no_iteration_parked began parked while the step before it left cold-read members"
+  # ADR-0181 R1: one host turn visits at most 64 cold-read members, one allowance a turn shared
+  # by every delivery call. Planted, each receipt renews the allowance; an orphaned member
+  # spends no unit; coldstorm begins a turn at each pump. m4-cold's dense and cancel-all legs
+  # count each round's visits independently of the host.
+  "inf_canary_cold_delivery_budget_per_cqe m4-cold cold-delivery-work-over --cold-leg dense"
+  "inf_canary_cold_cancel_uncharged m4-cold cold-delivery-work-over --cold-leg cancel-all"
+  "inf_canary_cold_turn_budget_per_pump m4-cold cold-delivery-work-over --cold-leg dense"
+  # ADR-0181 R2 (A1.1): every lend of a native iteration, at any step, shares one turn, built at
+  # its first lend. Planted, every lend builds the turn, so one iteration visits more than 64.
+  "inf_canary_cold_turn_per_lend crate-test inf-runtime test:reactor every_lend_of_an_iteration_shares_one_turn share one turn"
+  # ADR-0181 R2 (A1.1): a native iteration in which no step lends builds no turn. Planted, the
+  # loop builds one as each iteration begins: the loop's stamp moves with no lend, and on the
+  # shipped plane over the sim driver it moves after a burst's last member is visited.
+  "inf_canary_cold_turn_eager crate-test inf-runtime test:reactor an_iteration_that_lends_nothing_builds_no_turn lent nothing built a turn"
+  "inf_canary_cold_turn_eager crate-test inf-sim lib a_cell_with_cold_members_to_visit_begins_no_iteration_parked built a cold turn after the burst's last member"
+  # ADR-0181 R1: a turn visits 64 cold-read members, so m4-tiered's phase 7e answers a burst of
+  # ready members within ⌈members / 64⌉ + 2 steps of its receipt. Planted, a turn visits 8, and
+  # each of the scenario's four smoke forms answers late.
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late"
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --plant tier-read-eio"
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --replay-above-window"
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --listing-repeats"
+  # m4-tiered's phase 7e delivers a cold burst in rounds: a reader that reads again after its
+  # resume (its candidate held another key's record) is judged against the next round's receipt,
+  # and a reader still waiting at the third round's bound is a stuck client. Planted, the phase
+  # allows no round after the first, and the regression seed's re-reader stalls at the cap.
+  "inf_canary_cold_burst_one_round m4-tiered cold-burst-round-cap --seed 0x51ee0630"
+  # A held read shows that some reader reads again, not that each one left does, so phase 7e
+  # releases no round while the owner's cold host has a member left to visit. Planted, a turn that
+  # no new receipt precedes leaves the host's last ready member unvisited, and at the regression
+  # seed the round's re-read is held while that member waits.
+  "inf_canary_cold_ready_left_to_receipt m4-tiered cold-burst-unvisited --seed 0x51ee0630"
+  # Past a round's bound phase 7e judges the host's pending count at every step to the next
+  # release: the count the wait begins with and each step's own. Planted, the host's last ready
+  # member waits until the 15th delivery turn after its receipt's own, so it is visited on the
+  # shortest wait's last step; or until the 7th, the wait's first step.
+  "inf_canary_cold_ready_left_fifteen_turns m4-tiered cold-burst-unvisited --seed 0x51ee0630"
+  "inf_canary_cold_ready_left_seven_turns m4-tiered cold-burst-unvisited --seed 0x51ee0630"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

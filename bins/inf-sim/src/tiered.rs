@@ -76,9 +76,9 @@ use inf_log::fs::sim::{SimDisk, SimDiskConfig};
 use inf_server::StallConfig;
 
 use crate::durable::{
-    DurableScenario, DurableWorkload, MiniClient, Node, NsClass, OpRec, Pending, STALL_STEPS,
-    TraceObserver, WakeLeg, Writer, admissible_states, boot, build_disk_with, bulk, encode,
-    m2_stall_config, required_index,
+    DurableScenario, DurableWorkload, HeldReads, MiniClient, Node, NsClass, OpRec, Pending,
+    STALL_STEPS, TraceObserver, WakeLeg, Writer, admissible_states, boot, build_disk_with, bulk,
+    encode, is_tier_file, m2_stall_config, required_index, steady_held_reads,
 };
 use crate::net::Plant;
 use crate::resp::reply_len;
@@ -551,6 +551,9 @@ pub struct TieredNodeReport {
     /// record — the pairs whose second read re-resolved onto the promoted
     /// extent reference.
     pub promoted_extent_pairs: u64,
+    /// Phase 7e: the rounds its burst was delivered in, 1 for the burst's
+    /// own reads and one more for each round of re-reads.
+    pub burst_rounds: u32,
     /// The listing-repeat draw this seed ran, and the removed names the
     /// disk returned again by the end of the post-drop reboot: its
     /// engagement, read from the disk's own count.

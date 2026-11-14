@@ -14,7 +14,7 @@ use inf_alloc::{AlignedBufId, AlignedPool};
 use inf_foundation::limits::DRIVER_OP_BYTES_MAX;
 use inf_foundation::{BuildIntHasher, FileOffset, FileOffsetRefused, LogHistogram};
 
-use inf_runtime::gate::{GateWait, KeyedGate};
+use crate::gate::{GateWait, KeyedGate};
 use inf_runtime::{
     CompletionResult, CompletionToken, IoOp, Issue, MAX_SLOT, RawFd, StableBytesMut, TokenClass,
 };

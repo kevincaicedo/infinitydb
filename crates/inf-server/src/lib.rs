@@ -71,8 +71,8 @@ pub use durable::{
 #[doc(hidden)]
 pub use exec::parse_cursor;
 pub use exec::{
-    ConnCx, ConnNamespace, NodeInfo, NodeState, TIER_FLUSH_GAUGES, TierFlushGauge, execute,
-    execute_slices, stall_request,
+    COLD_GAUGES, ColdGauge, ConnCx, ConnNamespace, NodeInfo, NodeState, TIER_FLUSH_GAUGES,
+    TierFlushGauge, execute, execute_slices, stall_request,
 };
 pub use glob::glob_match;
 #[cfg(feature = "doc")]

@@ -36,6 +36,7 @@ use super::*;
 use crate::exec::Argv;
 use inf_runtime::ColdRefused;
 use inf_store::{LogicalAddr, TieredLookup, TieredTable};
+use inf_wire::{Domain, Refusal};
 mod write;
 
 use write::{
@@ -61,6 +62,9 @@ const ERR_UNSUPPORTED: &str =
     "ERR this command is not supported on tiered namespaces in M4 (string family only)";
 const ERR_COLD_IO: &str = "ERR cold read failed (tier I/O error)";
 const ERR_COLD_BUSY: &str = "BUSY cold-read queue saturated, try again";
+/// The cell's cold-read host has spent its identity space (ADR-0181 R4):
+/// permanent for its boot, so each read is answered once, never `BUSY`.
+const ERR_COLD_IDENTITY: &str = Refusal::IdentityExhausted(Domain::ColdRead).render();
 const ERR_STALLED: &str =
     "STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)";
 const ERR_FAILED: &str = "ERR durable plane failed (fail-stop)";
@@ -400,6 +404,7 @@ fn probe<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         // Permanent (ADR-0167 D3): the one cold-read-failure reply, never
         // backpressure a client would retry.
         Err(ColdRefused::Unrepresentable(_)) => Probe::Fail(ERR_COLD_IO),
+        Err(ColdRefused::IdentityExhausted) => Probe::Fail(ERR_COLD_IDENTITY),
     }
 }
 
@@ -443,8 +448,8 @@ async fn serve_cold_image<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
     }
     match ext {
         Some(ext) => match fetch_extent(shared, ns, ext).await {
-            Some(value) => Resolved::Extent { addr, value, version, encoded_len },
-            None => Resolved::Fail(ERR_BLOB_READ),
+            Ok(value) => Resolved::Extent { addr, value, version, encoded_len },
+            Err(line) => Resolved::Fail(line),
         },
         None => {
             let value = TieredTable::decode_record(&image).value.to_vec();
@@ -497,8 +502,8 @@ async fn resolve_ram<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         (inf_store::ExtentRef::decode(parts.value), parts.version, parts.encoded_len)
     };
     match fetch_extent(shared, ns, ext).await {
-        Some(value) => Resolved::Extent { addr, value, version, encoded_len },
-        None => Resolved::Fail(ERR_BLOB_READ),
+        Ok(value) => Resolved::Extent { addr, value, version, encoded_len },
+        Err(line) => Resolved::Fail(line),
     }
 }
 
@@ -1157,6 +1162,7 @@ fn plan_key_fetch<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 Err(ColdRefused::QueueFull) => Ok(KeyFetch::Busy),
                 // Permanent (ADR-0167 D3): the page fails typed, never BUSY.
                 Err(ColdRefused::Unrepresentable(_)) => Err(ERR_COLD_IO),
+                Err(ColdRefused::IdentityExhausted) => Err(ERR_COLD_IDENTITY),
             }
         }
         None => {
@@ -1205,20 +1211,22 @@ async fn decode_key(plan: ColdPlan) -> Result<Option<Vec<u8>>, &'static str> {
 /// a concurrent reclaim's unlink cannot invalidate the reads (POSIX
 /// keeps the inode; the S08 cancellation test's contract). Pins ride a
 /// synthetic high-bit `TierFileId` so extent reads never alias a tier
-/// file's retirement gate.
+/// file's retirement gate. A failed fetch answers its reply line: the blob
+/// read's, or the spent identity space's.
 async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
     ext: inf_store::ExtentRef,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, &'static str> {
     debug_assert_eq!(ext.offset, 0, "v1 extent references start at 0");
     // The hold lives as long as the reader: a drop meanwhile holds the
     // namespace's owner (ADR-0148 D3).
     let (reader, _hold) = {
         let tier = shared.tier.borrow();
-        tier.as_ref()?.open_extent_reader(ns, ext.extent_id).ok()?
+        let tier = tier.as_ref().ok_or(ERR_BLOB_READ)?;
+        tier.open_extent_reader(ns, ext.extent_id).map_err(|_| ERR_BLOB_READ)?
     };
-    let fd = reader.raw_fd()?;
+    let fd = reader.raw_fd().ok_or(ERR_BLOB_READ)?;
     let file = inf_runtime::TierFileId::new(0x8000_0000 | (ext.extent_id as u32 & 0x7FFF_FFFF));
     let total_frames = ext.len.div_ceil(inf_log::TIER_FRAME_DATA as u64);
     let window_frames_cap = (crate::tier_cell::COLD_POOL_BUF / inf_log::TIER_FRAME_BYTES) as u64;
@@ -1230,7 +1238,7 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         let frames = window_frames_cap.min(total_frames - first);
         let wait = {
             let tier = shared.tier.borrow();
-            let cold = tier.as_ref().and_then(|t| t.cold.clone())?;
+            let cold = tier.as_ref().and_then(|t| t.cold.clone()).ok_or(ERR_BLOB_READ)?;
             // Same-clock stamp as `on_completion` (the `cold_read_p99_us`
             // pair).
             let asked = cold.enqueue(
@@ -1241,15 +1249,19 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 inf_runtime::ReadClass::Foreground,
                 shared.now.get().as_micros(),
             );
-            // Either refusal ends the fetch, which the resolver answers
-            // `ERR_BLOB_READ` (ADR-0167 D3's callers table).
+            // A temporary or a request's refusal ends the fetch, which the
+            // resolver answers `ERR_BLOB_READ` (ADR-0167 D3's callers table);
+            // the spent identity space answers its own line (ADR-0181 R4).
             match asked {
                 Ok(wait) => wait,
-                Err(ColdRefused::QueueFull | ColdRefused::Unrepresentable(_)) => return None,
+                Err(ColdRefused::QueueFull | ColdRefused::Unrepresentable(_)) => {
+                    return Err(ERR_BLOB_READ);
+                }
+                Err(ColdRefused::IdentityExhausted) => return Err(ERR_COLD_IDENTITY),
             }
         };
         let done = wait.await;
-        done.outcome().ok()?;
+        done.outcome().map_err(|_| ERR_BLOB_READ)?;
         // Extract into a scratch and extend — `tier_extract` REPLACES its
         // output's contents, so handing it the accumulator erased every
         // previously assembled window and this loop never terminated for
@@ -1267,11 +1279,11 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         });
         drop(done);
         if !ok {
-            return None;
+            return Err(ERR_BLOB_READ);
         }
     }
     drop(reader); // the fd stayed open across every read
-    Some(out)
+    Ok(out)
 }
 
 // ---- small helpers ----

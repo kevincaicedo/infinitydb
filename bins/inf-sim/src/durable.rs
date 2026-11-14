@@ -1696,6 +1696,51 @@ pub(crate) fn bulk(value: &[u8]) -> Vec<u8> {
     wire
 }
 
+/// A tier file, by its name: the predicate a harness hands the sim disk's
+/// tier-read hold.
+pub(crate) fn is_tier_file(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "itier")
+}
+
+/// Steps in a row a cell's held tier reads must stay unchanged, above 0,
+/// before a harness counts a burst's issue as done.
+pub(crate) const HELD_READS_STEADY_STEPS: u64 = 8;
+
+/// What one step of [`steady_held_reads`] answers.
+pub(crate) enum HeldReads {
+    /// A reader still waits on its reply: the watched cell's held tier reads.
+    Waiting(usize),
+    /// Every reader has answered, so nothing is left to wait for.
+    Answered,
+}
+
+/// Runs `step` at most `steps_max` times, each one scheduler step that
+/// answers the watched cell's held tier reads (the sim driver's own count,
+/// no product counter), until that count stays above 0 and unchanged for
+/// [`HELD_READS_STEADY_STEPS`] steps in a row: every read the burst issues
+/// is queued at the device. A step that answers [`HeldReads::Answered`]
+/// ends the wait early. Returns the last count a step read: the steady
+/// count, or at the bound or the early end whatever the last count was (0
+/// when none was read or none held); a `step` error ends the wait.
+pub(crate) fn steady_held_reads<E>(
+    steps_max: u64,
+    mut step: impl FnMut() -> Result<HeldReads, E>,
+) -> Result<usize, E> {
+    let (mut held, mut steady) = (0, 0);
+    for _ in 0..steps_max {
+        let HeldReads::Waiting(now) = step()? else { break };
+        if now > 0 && now == held {
+            steady += 1;
+            if steady == HELD_READS_STEADY_STEPS {
+                break;
+            }
+        } else {
+            (held, steady) = (now, 0);
+        }
+    }
+    Ok(held)
+}
+
 impl Writer {
     /// One writer with the frozen per-id RNG stream (`0xD11E_0000 + id`
     /// — the m2 trace contract). `channels` sizes the PUBLISH sequence
@@ -2321,6 +2366,15 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn iter_stats(&self, cell: usize) -> Option<IterStats> {
         self.iter_stats[cell]
+    }
+
+    /// `cell`'s reactor, its own two readings of its cold turn: the
+    /// iteration whose lend last built the turn (0 before any) and the
+    /// iterations begun, both counted from 1. Read between scheduler steps.
+    #[cfg(test)]
+    pub(crate) fn cold_turn_built_at(&self, cell: usize) -> (u64, u64) {
+        let cell_loop = &self.cells[cell].0;
+        (cell_loop.cold_turn_built_at(), cell_loop.counters()[3])
     }
 
     /// Summed pub/sub registry gauges across cells (combined-scenario

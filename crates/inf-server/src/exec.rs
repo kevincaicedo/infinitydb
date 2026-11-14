@@ -75,6 +75,35 @@ pub enum TierFlushGauge {
 /// The number of [`TierFlushGauge`] slots.
 pub const TIER_FLUSH_GAUGES: usize = TierFlushGauge::FileIdsExhausted as usize + 1;
 
+/// The slots of [`NodeState::cold`], one gauge each, cell scope: the cold
+/// host's delivery service (ADR-0181 R1, R7) and its identity issuer
+/// (R4), flushed by the tiered MAINTAIN.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum ColdGauge {
+    /// Member visits the delivery service spent, cumulative.
+    DeliveryWork = 0,
+    /// The most member visits one turn spent: at most 64.
+    DeliveryWorkTurnMax,
+    /// Members of ready windows not yet visited.
+    DeliveryPendingMembers,
+    /// Windows with members left to visit.
+    DeliveryPendingWindows,
+    /// Receipt-to-delivery delay p99 of delivered values, injected µs.
+    DeliveryDelayP99Us,
+    /// Receipts that named no issued read, refused and counted.
+    ReceiptsForeign,
+    /// Ready-list links that named no ready window: a defect, 0.
+    LinksStale,
+    /// Requests refused for a spent identity space, cumulative.
+    IdentityExhausted,
+    /// The identity issuer's position: pairs spent or skipped.
+    IdentityPairsUsed,
+}
+
+/// The number of [`ColdGauge`] slots.
+pub const COLD_GAUGES: usize = ColdGauge::IdentityPairsUsed as usize + 1;
+
 /// Default-initializable state surfaced through the command layer (M0-S19 + M1-S03):
 /// the frozen tripwire snapshot, the memory-attribution domains the store
 /// can't see, and the M1 cell-local registries (clients, config), the
@@ -103,6 +132,10 @@ pub struct NodeState {
     /// ADR-0178 D5), flushed by MAINTAIN, in [`TierFlushGauge`]'s order.
     /// Identically zero on nodes that never created a tiered namespace.
     pub tier_flush: Cell<[u64; TIER_FLUSH_GAUGES]>,
+    /// The cold host's delivery and identity gauges, in [`ColdGauge`]'s
+    /// order, flushed by the tiered MAINTAIN. Identically zero on nodes
+    /// that never created a tiered namespace.
+    pub cold: Cell<[u64; COLD_GAUGES]>,
     /// The cell's cap census (ADR-0163 D2), attached by the plane at its
     /// construction, or on a host with no plane by its first planeless
     /// `CREATE`: INFO's `# Caps` renders it, cell scope. A bare harness that

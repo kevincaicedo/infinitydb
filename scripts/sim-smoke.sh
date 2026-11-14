@@ -109,6 +109,9 @@ rows=(
   "m4-tiered --plant tier-read-eio"
   "m4-tiered --replay-above-window --verify-determinism"
   "m4-tiered --listing-repeats --verify-determinism"
+  # m4-tiered at a seed whose cold burst takes a second round: a reader's candidate held another
+  # key's record, so it reads again after its resume, and the next round releases that read.
+  "m4-tiered --seed 0x51ee0630 --verify-determinism"
   "m4-tier-budget --tier-leg two-8mb --verify-determinism"
   "m4-tier-budget --tier-leg eight-1mb --verify-determinism"
   "m4-tier-budget --tier-leg one-1mb --verify-determinism"
@@ -136,6 +139,14 @@ rows=(
   "m1-pub-cross --pub-target own --verify-determinism"
   "m1-pub-cross --fabric-credits 256 --verify-determinism"
   "m4-tier-budget --tier-leg two-1mb-thief --verify-determinism"
+  # m4-cold's identity leg: the cold-read host's issuer placed 32 pairs before
+  # the end of its 2^55, so the space runs out inside the run (ADR-0181 R4).
+  "m4-cold --cold-leg identity --cold-identity-start 0x7fffffffffffe0 --verify-determinism"
+  # m4-cold's delivery legs: 31-member cohorts past a turn's 64 visits, 65
+  # orphaned members, and errored reads, each round's visits counted.
+  "m4-cold --cold-leg dense --verify-determinism"
+  "m4-cold --cold-leg cancel-all --verify-determinism"
+  "m4-cold --cold-leg errors --verify-determinism"
 )
 
 ran=0

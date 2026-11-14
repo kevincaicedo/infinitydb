@@ -14,10 +14,21 @@ use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_runtime::{
     AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken,
-    IoClass, IoOp, RawFd, StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier,
+    IoClass, IoOp, RawFd, StableBytes, StableBytesMut, SubmitStats, TokenClass, Wait, WriteBarrier,
     classify_accept_errno,
 };
 use inf_server::SimDisk;
+
+/// How a cell's net hands a connection's pending bytes to a reap.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Delivery {
+    /// A seeded chunk a reap, every scenario's default: frames span reaps,
+    /// so the parser's accumulator is exercised on every run.
+    Chunked,
+    /// The whole pending bytes, up to one receive buffer, a reap: commands
+    /// of one size sent at one step reach the server at one reap.
+    Whole,
+}
 
 /// Fault plants (armed per scenario, fire on seeded draws).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -177,10 +188,9 @@ pub struct CellNet {
     rng: SplitMix64,
     plant: Plant,
     plant_fired: bool,
-    /// Each reap delivers a connection's whole pending bytes, up to one
-    /// receive buffer, instead of a seeded chunk: commands sent at one
-    /// step arrive at one reap ([`CellNet::deliver_whole`]).
-    whole_chunks: bool,
+    /// What a reap hands each connection's server side
+    /// ([`CellNet::deliver_whole`]).
+    delivery: Delivery,
 }
 
 /// Synthetic listener fd for a cell (never a real fd).
@@ -230,7 +240,7 @@ impl CellNet {
             rng: SplitMix64::new(seed ^ 0xD15C_0000 ^ u64::from(cell)),
             plant,
             plant_fired: false,
-            whole_chunks: false,
+            delivery: Delivery::Chunked,
         }))
     }
 
@@ -238,9 +248,17 @@ impl CellNet {
     /// a reap, from now on: commands of one size sent at one step reach
     /// the server at one reap, the burst a stopped-then-resumed process
     /// reads. The seeded chunking stays every other scenario's (no draw is
-    /// taken here, so their traces are unchanged).
-    pub fn deliver_whole(&mut self) {
-        self.whole_chunks = true;
+    /// taken here, so their traces are unchanged). Returns the delivery it
+    /// replaced, which a harness phase that sends one burst whole restores
+    /// at the burst's end ([`Self::restore_delivery`]).
+    pub fn deliver_whole(&mut self) -> Delivery {
+        core::mem::replace(&mut self.delivery, Delivery::Whole)
+    }
+
+    /// Deliver as `delivery` from now on: what [`Self::deliver_whole`]
+    /// replaced, at the end of the burst it was set for.
+    pub fn restore_delivery(&mut self, delivery: Delivery) {
+        self.delivery = delivery;
     }
 
     /// Client side: open a connection to this cell; returns the fd handle.
@@ -392,6 +410,10 @@ pub struct ObservedIo {
     pub ops: [u64; IoClass::COUNT],
     pub read_bytes: u64,
     pub read_ops: u64,
+    /// Tier reads the driver completed, a value or an error, counted as it
+    /// hands each completion to the loop: the device's own completion
+    /// marks, which a harness reads between steps against its replies.
+    pub read_completions: u64,
     /// The most tier-class bytes and ops one driver entry carried — what
     /// one MAINTAIN pass submitted for the tier flush, read from the ops'
     /// token class alone (the attainable oracle's disk-side clause).
@@ -1099,7 +1121,7 @@ impl BackendDriver for SimDriver {
         // frames exercise the parser's accumulator on every run.
         let fds: Vec<RawFd> = net.conns.keys().copied().collect();
         for fd in fds {
-            let CellNet { conns, rng, plant, plant_fired, whole_chunks, .. } = &mut *net;
+            let CellNet { conns, rng, plant, plant_fired, delivery, .. } = &mut *net;
             let Some(conn) = conns.get_mut(&fd) else { continue };
             if !conn.recv_armed || conn.server_closed || conn.suppressed {
                 continue;
@@ -1126,7 +1148,10 @@ impl BackendDriver for SimDriver {
             }
             let Some(buf) = pool.try_lease(LeaseKind::Recv) else { continue };
             let max = conn.to_server.len().min(pool.buf_size());
-            let chunk = if *whole_chunks { max } else { 1 + (rng.next_u64() as usize) % max };
+            let chunk = match delivery {
+                Delivery::Whole => max,
+                Delivery::Chunked => 1 + (rng.next_u64() as usize) % max,
+            };
             let bytes = pool.bytes_mut(buf);
             for (i, b) in conn.to_server.drain(..chunk).enumerate() {
                 bytes[i] = b;
@@ -1138,6 +1163,8 @@ impl BackendDriver for SimDriver {
         }
 
         let produced = out.len() - before;
+        let reads = out[before..].iter().filter(|c| c.token.class() == TokenClass::TierRead);
+        self.observed.read_completions += reads.count() as u64;
         self.stats = SubmitStats { syscalls: 1, sqes: submitted, cqes: produced as u64 };
         Ok(produced)
     }

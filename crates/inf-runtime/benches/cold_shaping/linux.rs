@@ -34,8 +34,8 @@ use inf_alloc::{AlignedPool, BufferPool};
 use inf_log::fs::StdSegmentFs;
 use inf_log::{TIER_FRAME_BYTES, TierIoMode, TierWriter, tier_frame_offset, tier_frame_span};
 use inf_runtime::{
-    BackendDriver, ColdReadConfig, ColdReads, ColdWait, RawFd, ReadClass, TierFileId, TokenClass,
-    UringDriver, Wait,
+    BackendDriver, ColdReadConfig, ColdReads, ColdReceipt, ColdTurn, ColdWait, Completion,
+    CompletionResult, RawFd, ReadClass, TierFileId, TokenClass, UringDriver, Wait,
 };
 use inf_store::KeyHasher;
 use inf_store::{
@@ -200,10 +200,7 @@ fn coalesce_leg(
         }
         out.clear();
         driver.submit_and_reap(&mut recv_pool, Wait::Poll, &mut out).expect("submit");
-        for completion in out.drain(..) {
-            assert_eq!(completion.token.class(), TokenClass::TierRead);
-            cold.on_completion(completion.token, completion.result, 0);
-        }
+        route(&cold, &mut out, 0);
         let mut i = 0;
         while i < outstanding.len() {
             if let Some(done) = poll_ready(&mut outstanding[i]) {
@@ -404,10 +401,7 @@ pub fn run() {
                 }
                 out.clear();
                 driver.submit_and_reap(&mut recv_pool, Wait::Poll, &mut out).expect("submit");
-                for completion in out.drain(..) {
-                    assert_eq!(completion.token.class(), TokenClass::TierRead);
-                    cold.on_completion(completion.token, completion.result, 0);
-                }
+                route(&cold, &mut out, 0);
                 let mut i = 0;
                 while i < outstanding.len() {
                     if let Some(done) = poll_ready(&mut outstanding[i]) {
@@ -436,9 +430,7 @@ pub fn run() {
                 }
                 out.clear();
                 driver.submit_and_reap(&mut recv_pool, Wait::Poll, &mut out).expect("submit");
-                for completion in out.drain(..) {
-                    cold.on_completion(completion.token, completion.result, 0);
-                }
+                route(&cold, &mut out, 0);
                 let mut i = 0;
                 while i < outstanding.len() {
                     if let Some(done) = poll_ready(&mut outstanding[i]) {
@@ -503,4 +495,23 @@ pub fn run() {
         .and_then(|mut f| f.write_all(report.as_bytes()))
         .expect("artifact write");
     println!("\nartifact: {}", out_path.display());
+}
+
+/// Records a pump's `TierRead` completions in the host, each outcome as the
+/// dispatch decides it, then serves the pump's one turn of delivery
+/// (ADR-0181 R1, R2): a turn's allowance a pump, so a later pump delivers
+/// what this one left.
+fn route(cold: &ColdReads, out: &mut Vec<Completion>, now_us: u64) {
+    for completion in out.drain(..) {
+        assert_eq!(completion.token.class(), TokenClass::TierRead);
+        let outcome = match completion.result {
+            CompletionResult::TierRead => Ok(()),
+            CompletionResult::Error { errno, .. } => Err(errno),
+            other => panic!("a tier read completed as {other:?}"),
+        };
+        let receipt = cold.record_completion(completion.token, outcome, now_us);
+        assert_eq!(receipt, ColdReceipt::Recorded, "a receipt names an issued read");
+    }
+    let mut turn = ColdTurn::begin();
+    let _ = cold.deliver_ready(turn.delivery(), now_us);
 }

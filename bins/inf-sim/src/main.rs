@@ -15,7 +15,8 @@
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
 )]
 
-use inf_sim::coldstorm::{COLD_IDENTITY_PAIRS, ColdLeg};
+use inf_runtime::limits::COLD_IDENTITY_PAIRS_MAX;
+use inf_sim::coldstorm::ColdLeg;
 use inf_sim::driver::{self, Exit, Fold, Shard, Sweep, Verify};
 use inf_sim::net::Plant;
 use inf_sim::{
@@ -150,7 +151,7 @@ fn main() {
                 }
                 "--cold-identity-start" => {
                     let start = parse_seed(&take("--cold-identity-start")?)?;
-                    if start >= COLD_IDENTITY_PAIRS {
+                    if start >= COLD_IDENTITY_PAIRS_MAX {
                         return Err(format!(
                             "--cold-identity-start {start:#x}: a pair position below 2^55"
                         ));
@@ -1659,6 +1660,7 @@ struct TieredFold {
     rebuilt_fill_sets: u64,
     rebuilt_reboots: u64,
     promoted_extent_pairs: u64,
+    cold_burst_reread_seeds: u64,
     listing_repeat_seeds: u64,
     listing_repeats_served: u64,
 }
@@ -1732,6 +1734,7 @@ impl TieredFold {
         self.rebuilt_fill_sets += report.rebuilt_fill_sets;
         self.rebuilt_reboots += report.rebuilt_reboots;
         self.promoted_extent_pairs += report.promoted_extent_pairs;
+        self.cold_burst_reread_seeds += u64::from(report.burst_rounds > 1);
         self.listing_repeat_seeds += u64::from(report.listing_repeats);
         self.listing_repeats_served += report.listing_repeats_served;
         self.open_seeds += u64::from(report.open_rows);
@@ -1947,6 +1950,7 @@ impl TieredFold {
             rebuilt_fill_sets,
             rebuilt_reboots,
             promoted_extent_pairs,
+            cold_burst_reread_seeds,
             listing_repeat_seeds,
             listing_repeats_served,
             ..
@@ -1969,6 +1973,7 @@ impl TieredFold {
              rebuilt_same_key_twins={rebuilt_same_key_twins} \
              rebuilt_fill_sets={rebuilt_fill_sets} rebuilt_reboots={rebuilt_reboots} \
              promoted_extent_pairs={promoted_extent_pairs} \
+             cold_burst_reread_seeds={cold_burst_reread_seeds} \
              listing_repeat_seeds={listing_repeat_seeds} \
              listing_repeats_served={listing_repeats_served}"
         )

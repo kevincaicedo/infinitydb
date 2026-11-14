@@ -893,6 +893,23 @@ fn tiering_read_lines(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     // instrument fix — invisible in soak artifacts until now).
     push(text, &format!("cold_pool_dry:{}", split[13]));
     push(text, &format!("cold_queue_full:{}", split[14]));
+    // ADR-0181 R1, R4, R7: the cold host's delivery service — the member
+    // visits it spent, the most in one turn (at most 64), the members and
+    // windows still to visit, and the receipt-to-delivery delay — the
+    // receipts and ready links that named nothing, and its identity
+    // issuer: the requests refused for a spent space and its position.
+    use crate::exec::ColdGauge as C;
+    let cold = node.cold.get();
+    let cold_gauge = |slot: C| cold[slot as usize];
+    push(text, &format!("cold_delivery_work:{}", cold_gauge(C::DeliveryWork)));
+    push(text, &format!("cold_delivery_work_turn_max:{}", cold_gauge(C::DeliveryWorkTurnMax)));
+    push(text, &format!("cold_delivery_pending_members:{}", cold_gauge(C::DeliveryPendingMembers)));
+    push(text, &format!("cold_delivery_pending_windows:{}", cold_gauge(C::DeliveryPendingWindows)));
+    push(text, &format!("cold_delivery_delay_p99_us:{}", cold_gauge(C::DeliveryDelayP99Us)));
+    push(text, &format!("cold_receipt_foreign:{}", cold_gauge(C::ReceiptsForeign)));
+    push(text, &format!("cold_link_stale:{}", cold_gauge(C::LinksStale)));
+    push(text, &format!("cold_identity_exhausted:{}", cold_gauge(C::IdentityExhausted)));
+    push(text, &format!("cold_identity_pairs_used:{}", cold_gauge(C::IdentityPairsUsed)));
     push(text, &format!("tiering_tail_allocs:{}", tiering.tail_allocs));
     push(text, &format!("tiering_seal_holes:{}", tiering.seal_holes));
     push(text, &format!("tiering_seal_hole_bytes:{}", tiering.seal_hole_bytes));

@@ -8,6 +8,8 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use inf_alloc::{AlignedPool, BufferPool};
@@ -15,12 +17,15 @@ use inf_foundation::hash64;
 use inf_log::TierIoMode;
 use inf_log::fs::sim::{DeviceFault, SimDisk, SimFile};
 use inf_log::fs::{SegmentFile, SegmentFs};
+use inf_runtime::limits::COLD_DELIVERIES_PER_TURN;
 use inf_runtime::{
-    BackendDriver, ColdDone, ColdReadConfig, ColdReads, ColdRefused, ColdWait, RawFd, ReadClass,
-    TierFileId, TokenClass, Wait,
+    BackendDriver, ColdDone, ColdReadConfig, ColdReads, ColdReceipt, ColdRefused, ColdTurn,
+    ColdWait, PairIssuer, RawFd, ReadClass, TierFileId, Wait,
 };
 
-use super::{ColdLeg, ColdStormReport, ColdStormScenario, RoundCounts};
+use super::{
+    ColdLeg, ColdStormReport, ColdStormScenario, RoundCounts, judge_delivery_work, record_receipt,
+};
 use crate::net::{CellNet, Plant, SimDriver};
 
 /// The legs' device depth: the default `COLD-READ-QD`, so the pool holds 64
@@ -35,6 +40,10 @@ const LEG_DIR: &str = "legs/cold";
 /// Rounds with no traffic after a leg's last arrival, in which the host
 /// drains what is left.
 const QUIET_ROUNDS: u64 = 8;
+/// The most further quiet rounds a leg waits for its ready delivery, at a
+/// turn's allowance a round: every buffer's window at a class queue's
+/// members, the most a host at the legs' depth can hold ready.
+const DELIVERY_ROUNDS_MAX: u64 = (DEPTH * CLASS_QUEUE) as u64 / COLD_DELIVERIES_PER_TURN as u64;
 /// Injected time per round (µs), as the storm's.
 const ROUND_US: u64 = 1000;
 /// A dense cohort: 31 adjacent requests of 512 B, one buffer's union.
@@ -67,6 +76,22 @@ struct Request {
 /// its value at once.
 fn at(file: usize, offset: u64, len: usize) -> Request {
     Request { file, offset, len, class: ReadClass::Foreground, poll_round: 0, keep_rounds: 0 }
+}
+
+/// Counts the wakes the harness's waits receive: each a value delivered to a
+/// live wait, the delivery oracle's own observation, independent of the
+/// host's counters.
+#[derive(Default)]
+struct WakeCount(AtomicU32);
+
+impl std::task::Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// A request the harness holds: its wait until its value is received,
@@ -106,6 +131,12 @@ struct Fixture {
     cancel_after_issue: bool,
     /// This round's pumps leave the receipts in the device.
     receipts_held: bool,
+    /// Requests the host refused for a spent identity space: never offered
+    /// again, the refusal being permanent.
+    identity_refused: u64,
+    /// The waker every held wait is polled with, and its count of wakes.
+    wakes: Arc<WakeCount>,
+    waker: Waker,
     report: ColdStormReport,
 }
 
@@ -116,8 +147,17 @@ impl Fixture {
         let disk = SimDisk::new();
         disk.create_dir_all(Path::new(LEG_DIR)).expect("the legs' directory");
         let net = CellNet::new(0, scenario.seed ^ 0xD15C, Plant::None);
+        // The identity leg places its issuer where `--cold-identity-start`
+        // says; every other leg's starts at pair 0.
+        let issuer = scenario
+            .identity_start
+            .map_or(Some(PairIssuer::new()), PairIssuer::starting_at)
+            .expect("the identity start is a pair position the command line checked");
+        let pool = AlignedPool::new(DEPTH, BUFFER_BYTES);
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wakes));
         Fixture {
-            cold: ColdReads::with_config(AlignedPool::new(DEPTH, BUFFER_BYTES), config),
+            cold: ColdReads::with_issuer(pool, config, issuer),
             driver: SimDriver::with_disk(net, disk.clone()),
             disk,
             recv_pool: BufferPool::new(2, 4096),
@@ -130,6 +170,9 @@ impl Fixture {
             errors_expected: false,
             cancel_after_issue: false,
             receipts_held: false,
+            identity_refused: 0,
+            wakes,
+            waker,
             report: ColdStormReport { leg: scenario.leg, ..ColdStormReport::default() },
         }
     }
@@ -164,21 +207,36 @@ impl Fixture {
             self.now_us,
         );
         match asked {
-            Ok(wait) => self.held.push(Held { request, wait: Some(wait), value: None }),
+            Ok(mut wait) => {
+                // Polled once at admission, so the delivery wakes this
+                // harness's waker whenever its consumer is due.
+                let mut cx = Context::from_waker(&self.waker);
+                if core::pin::Pin::new(&mut wait).poll(&mut cx).is_ready() {
+                    self.report.violations.push("a value was delivered at its admission".into());
+                }
+                self.held.push(Held { request, wait: Some(wait), value: None });
+            }
             Err(ColdRefused::QueueFull) => self.retry.push(request),
             Err(ColdRefused::Unrepresentable(read)) => {
                 self.report
                     .violations
                     .push(format!("a leg's request is unrepresentable: {read:?}"));
             }
+            Err(ColdRefused::IdentityExhausted) => self.identity_refused += 1,
         }
     }
 
-    /// One pump: the drain, then the device's receipts routed, unless the
-    /// round holds them. Under `cancel_after_issue` the receipts wait in
-    /// the device until no request is queued, and then every held wait is
-    /// dropped before they are routed.
-    fn pump(&mut self) {
+    /// One pump: the drain, then the device's receipts recorded and the
+    /// turn's delivery served, unless the round holds the receipts. Under
+    /// `cancel_after_issue` the receipts wait in the device until no request
+    /// is queued, and then every held wait is dropped before they are
+    /// recorded.
+    fn pump(&mut self, turn: &mut ColdTurn) {
+        // Canary: the harness begins a turn at each pump, not each round.
+        #[cfg(inf_canary_cold_turn_budget_per_pump)]
+        {
+            *turn = ColdTurn::begin();
+        }
         let cold = self.cold.clone();
         let driver = &mut self.driver;
         let issued = cold.drain(|op| driver.push(op));
@@ -198,16 +256,26 @@ impl Fixture {
         let mut out = Vec::new();
         self.driver.submit_and_reap(&mut self.recv_pool, Wait::Poll, &mut out).expect("sim submit");
         for completion in out {
-            assert_eq!(completion.token.class(), TokenClass::TierRead);
-            self.counts.delivered +=
-                cold.on_completion(completion.token, completion.result, self.now_us);
+            if let ColdReceipt::Foreign = record_receipt(&cold, completion, self.now_us) {
+                self.report.violations.push("a cold receipt named no issued read".into());
+            }
         }
+        self.deliver(turn);
+    }
+
+    /// The turn's delivery service (the plane's `before_execute` role): the
+    /// values delivered, counted.
+    fn deliver(&mut self, turn: &mut ColdTurn) {
+        let progress = self.cold.deliver_ready(turn.delivery(), self.now_us);
+        self.counts.delivered += progress.delivered;
+        self.counts.orphaned += progress.unclaimed;
     }
 
     /// The consumers: each due wait polled once (a value received is
     /// counted and checked), each value past its keep dropped.
     fn consume(&mut self) {
-        let mut cx = Context::from_waker(Waker::noop());
+        let waker = self.waker.clone();
+        let mut cx = Context::from_waker(&waker);
         let round = self.round;
         let mut received = Vec::new();
         for (index, held) in self.held.iter_mut().enumerate() {
@@ -264,33 +332,57 @@ impl Fixture {
         }
     }
 
-    /// One round: the arrivals and the requests refused last round offered,
-    /// then two pumps, each followed by the consumers.
+    /// One round, one host turn: the turn's delivery serves the ready work,
+    /// then the arrivals and the requests refused last round are offered,
+    /// then two pumps, each followed by the consumers, share the turn's
+    /// allowance (ADR-0181 R2).
     fn round(&mut self, arrivals: impl IntoIterator<Item = Request>) {
         self.round += 1;
         self.now_us = self.round * ROUND_US;
         self.counts = RoundCounts::default();
         let unclaimed = self.cold.counters().unclaimed;
+        let wakes = self.wakes.0.load(Ordering::Relaxed);
+        let mut turn = ColdTurn::begin();
+        self.deliver(&mut turn);
         let retry = std::mem::take(&mut self.retry);
         for request in retry.into_iter().chain(arrivals) {
             self.offer(request);
         }
         for _ in 0..2 {
-            self.pump();
+            self.pump(&mut turn);
             self.consume();
         }
-        self.counts.orphaned =
-            u32::try_from(self.cold.counters().unclaimed - unclaimed).expect("a round's members");
+        self.counts.woken = self.wakes.0.load(Ordering::Relaxed) - wakes;
+        let counted = self.cold.counters().unclaimed - unclaimed;
+        if counted != u64::from(self.counts.orphaned) {
+            let orphaned = self.counts.orphaned;
+            self.report.violations.push(format!(
+                "round {}: {orphaned} orphaned members, the host counted {counted}",
+                self.round
+            ));
+        }
         let counts = self.counts;
         self.report.trace_hash =
             hash64(&counts.fold().to_le_bytes(), self.report.trace_hash ^ self.round);
         self.report.rounds.push(counts);
     }
 
-    /// The quiet rounds: no traffic, the host drains what is left.
+    /// The quiet rounds: no traffic, the host drains what is left, then as
+    /// many more as its ready delivery needs, at most
+    /// [`DELIVERY_ROUNDS_MAX`].
     fn quiet(&mut self) {
         for _ in 0..QUIET_ROUNDS {
             self.round(None);
+        }
+        let mut more = 0;
+        while self.cold.has_ready_delivery() && more < DELIVERY_ROUNDS_MAX {
+            self.round(None);
+            more += 1;
+        }
+        if self.cold.has_ready_delivery() {
+            self.report
+                .violations
+                .push(format!("ready delivery left after {more} further quiet rounds (liveness)"));
         }
     }
 
@@ -319,6 +411,13 @@ impl Fixture {
         let counts = self.cold.counters();
         if counts.enqueued != counts.issued + counts.merged_waiters + counts.cancelled_queued {
             self.report.violations.push(format!("admission identity broken: {counts:?}"));
+        }
+        let most = judge_delivery_work(&mut self.report, &self.cold, |counts| counts.woken);
+        if self.report.leg == ColdLeg::Dense && most < COLD_DELIVERIES_PER_TURN {
+            self.vacuous(format!(
+                "cold-delivery-work-unreached: the most one round visited was {most} of a turn's \
+                 {COLD_DELIVERIES_PER_TURN}"
+            ));
         }
         self.report.merged_waiters = counts.merged_waiters;
         self.report.queue_high_water = counts.queue_depth_high_water;
@@ -358,6 +457,9 @@ fn cancel_all(fx: &mut Fixture, seed: u64) {
     fx.cancel_after_issue = true;
     fx.round((0..MEMBERS).map(|_| at(file, 0, 64)));
     fx.cancel_after_issue = false;
+    // A turn visits at most its allowance: the last member is the next
+    // turn's.
+    fx.round(None);
     let counts = fx.cold.counters();
     if counts.unclaimed != MEMBERS as u64 || counts.delivered != 0 {
         fx.vacuous(format!("{MEMBERS} members orphaned wanted, {counts:?}"));
@@ -464,8 +566,10 @@ fn errors(fx: &mut Fixture, seed: u64) {
 }
 
 /// Reads across the point where the issuer's identities run out, set by
-/// `--cold-identity-start`, the first read held to the end. The host here
-/// has no issuer position to set, so the leg reads `VACUOUS`.
+/// `--cold-identity-start`, the first read held to the end: once the space is
+/// spent every request is refused `IdentityExhausted`, for good, and every
+/// request admitted before is answered (custody and answers are `finish`'s).
+/// A run whose requests all fit the space left reads `VACUOUS`.
 fn identity(fx: &mut Fixture, scenario: &ColdStormScenario) {
     const REQUESTS: usize = DEPTH;
     let start = scenario.identity_start.expect("the identity leg names its start");
@@ -474,9 +578,20 @@ fn identity(fx: &mut Fixture, scenario: &ColdStormScenario) {
     fx.round([kept]);
     fx.round((1..REQUESTS).map(|file| at(first + file, 0, 64)));
     fx.report.trace_hash = hash64(&start.to_le_bytes(), fx.report.trace_hash);
-    fx.vacuous(format!(
-        "the host has no issuer position to set at {start:#x}, so no identity runs out in the run"
-    ));
+    let left = inf_runtime::limits::COLD_IDENTITY_PAIRS_MAX - start;
+    let refused = fx.identity_refused;
+    let admitted = REQUESTS as u64 - refused;
+    if refused == 0 {
+        fx.vacuous(format!(
+            "{REQUESTS} requests fit the {left} pair(s) left at {start:#x}: no identity ran out"
+        ));
+    } else if fx.cold.identity_refusals() != refused || admitted != left.min(REQUESTS as u64) {
+        fx.report.violations.push(format!(
+            "identity: {refused} refusal(s) seen, the host counted {}; {admitted} admitted \
+             where {left} pair(s) were left",
+            fx.cold.identity_refusals()
+        ));
+    }
 }
 
 /// A stop's shape: 100 values held over four windows; then 60 singletons

@@ -1,13 +1,14 @@
 #![allow(
     clippy::disallowed_types,
-    reason = "bench target: leg A is the cold-read host with its std tables, the deep legs \
-              keep their waits in a deque reserved before the loop, and the rate legs measure \
-              leg A's tables"
+    reason = "bench target: leg A is the cold-read host and its gate with their std tables, \
+              the deep legs keep their waits in a deque reserved before the loop, and the rate \
+              legs measure leg A's tables"
 )]
 //! The cold-read path's A/B by instructions (L4): the cell's cold-read
 //! operations on the host as it stood before its fixed stores (A, a
-//! bench-only copy in `cold_path/cold.rs`, so every A leg measures the same
-//! code after the engine's host changes) and, once they are built, on the
+//! bench-only copy in `cold_path/cold.rs` over its gate's in
+//! `cold_path/gate.rs`, so every A leg measures the same code after the
+//! engine's host and gate change) and, once they are built, on the
 //! fixed stores (B), from one binary. Each leg's background is held by the
 //! bench's device budget, which answers `NotThisSlice` to every maintain
 //! offer and `Now` to the foreground, so no background read issues.
@@ -34,7 +35,28 @@
 //!   lie on 256 files, or on one file at a stride of one pool buffer plus
 //!   one byte, so no two join.
 //! - `reactor-iteration`: one iteration of the cell loop over a plane that
-//!   holds no cold host and does nothing at its steps.
+//!   holds no cold host and does nothing at its steps: the plane's default
+//!   `before_execute`, A of the hook's row.
+//! - `reactor-iteration-hook`: the same iteration over a plane whose
+//!   `before_execute` is the server's: its cold host read under a short
+//!   borrow of its tier slot, which holds no tiered namespace. With the
+//!   leg above it is a control and judges nothing: its A lets the context
+//!   never leave the iteration, so the compiler drops the context's setup
+//!   there, which no server cell can drop.
+//! - `reactor-iteration-server`, `reactor-iteration-server-hook`: the hook's
+//!   row, `≤ 10` instructions an iteration of B over A. One plane, generic
+//!   over the hook, so the two legs differ in `before_execute` alone: it
+//!   holds the hook's tier slot and hands the loop context to a step out of
+//!   line at `fabric_in` and again at `parse_execute`, as a server cell's
+//!   steps take it before the hook and after it. The context escapes before
+//!   the hook, as on a server cell, so the compiler keeps the context's
+//!   setup in both legs. Neither lends, so the loop holds no cold turn:
+//!   each asserts that its loop built none.
+//! - `reactor-iteration-server-lend`: A's plane lending the delivery
+//!   allowance once in `before_execute` and spending nothing, so every
+//!   iteration builds a turn at that lend; it asserts that its last
+//!   iteration built one. Reported, never judged: it shows the turn where
+//!   one is built, by the loop's stamp and by the count over A.
 //!
 //! Beside them, the rate legs (`cold_path/rates.rs`), reported and never
 //! judged: one container operation a step, on the capped map and slab B
@@ -53,9 +75,17 @@
 //! - liveness: each leg's `-plus-one` variant reads the leg + 1.00, ± 0.05:
 //!   one `nop` per op at the top of the driving loop's body, outside the
 //!   measured step;
+//! - the hook's row's verdict plant: `reactor-iteration-server-hook-plus-four`
+//!   to `-plus-ten`, B of the row with four to ten `nop`s an iteration, the
+//!   same way. A run reads the one its reading names, `p` = max(4, 11 − the
+//!   reading rounded to a whole count), and it must read a loss: above 10
+//!   over A;
 //! - engagement: after its loop each leg asserts what its ops did (requests
 //!   purged, reads issued and delivered, background left queued), so a leg
-//!   that did nothing reads red.
+//!   that did nothing reads red; each reactor leg asserts what its loop
+//!   built (no cold turn on a leg that lends nothing, the last iteration's
+//!   on the lend leg, and nothing at `--ops 0`), and a failed assertion
+//!   exits nonzero.
 //!
 //! `perf` wraps the binary that `--no-run` prints, never `cargo`, whose own
 //! instructions would join the count; on a hybrid CPU `<core>` is a
@@ -68,15 +98,20 @@
 #[path = "cold_path/cold.rs"]
 #[allow(dead_code, reason = "the host is copied whole; each leg drives part of it")]
 mod cold;
+#[path = "cold_path/gate.rs"]
+#[allow(dead_code, reason = "the gate is copied whole; leg A drives part of it")]
+mod gate;
 #[path = "cold_path/rates.rs"]
 mod rates;
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::hint::black_box;
 use std::io;
 use std::pin::Pin;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use inf_alloc::{AlignedPool, BufferPool};
@@ -114,12 +149,28 @@ enum Leg {
     Singleton { depth: usize, background: usize },
     Cohort { depth: usize, background: usize },
     Deep { stride: bool },
-    ReactorIteration,
+    Reactor(ReactorPlane),
     Rate(RateLeg),
 }
 
+/// A reactor leg's plane: the hook's row is read on two pairs of them.
+#[derive(Clone, Copy)]
+enum ReactorPlane {
+    /// No state and nothing at any step: the default `before_execute`.
+    Idle,
+    /// The server's `before_execute`, nothing at any other step.
+    Hook,
+    /// [`ServerShapedPlane`] with the plane's default `before_execute`.
+    Server,
+    /// [`ServerShapedPlane`] with the server's `before_execute`.
+    ServerHook,
+    /// [`ServerShapedPlane`] lending the delivery allowance once in
+    /// `before_execute`: a turn built every iteration.
+    ServerLend,
+}
+
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 60] = [
+const LEGS: [(&str, Leg, u8); 75] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -140,8 +191,23 @@ const LEGS: [(&str, Leg, u8); 60] = [
     ("deep-files-plus-one", Leg::Deep { stride: false }, 1),
     ("deep-stride", Leg::Deep { stride: true }, 0),
     ("deep-stride-plus-one", Leg::Deep { stride: true }, 1),
-    ("reactor-iteration", Leg::ReactorIteration, 0),
-    ("reactor-iteration-plus-one", Leg::ReactorIteration, 1),
+    ("reactor-iteration", Leg::Reactor(ReactorPlane::Idle), 0),
+    ("reactor-iteration-plus-one", Leg::Reactor(ReactorPlane::Idle), 1),
+    ("reactor-iteration-hook", Leg::Reactor(ReactorPlane::Hook), 0),
+    ("reactor-iteration-hook-plus-one", Leg::Reactor(ReactorPlane::Hook), 1),
+    ("reactor-iteration-server", Leg::Reactor(ReactorPlane::Server), 0),
+    ("reactor-iteration-server-plus-one", Leg::Reactor(ReactorPlane::Server), 1),
+    ("reactor-iteration-server-hook", Leg::Reactor(ReactorPlane::ServerHook), 0),
+    ("reactor-iteration-server-hook-plus-one", Leg::Reactor(ReactorPlane::ServerHook), 1),
+    ("reactor-iteration-server-lend", Leg::Reactor(ReactorPlane::ServerLend), 0),
+    ("reactor-iteration-server-lend-plus-one", Leg::Reactor(ReactorPlane::ServerLend), 1),
+    ("reactor-iteration-server-hook-plus-four", Leg::Reactor(ReactorPlane::ServerHook), 4),
+    ("reactor-iteration-server-hook-plus-five", Leg::Reactor(ReactorPlane::ServerHook), 5),
+    ("reactor-iteration-server-hook-plus-six", Leg::Reactor(ReactorPlane::ServerHook), 6),
+    ("reactor-iteration-server-hook-plus-seven", Leg::Reactor(ReactorPlane::ServerHook), 7),
+    ("reactor-iteration-server-hook-plus-eight", Leg::Reactor(ReactorPlane::ServerHook), 8),
+    ("reactor-iteration-server-hook-plus-nine", Leg::Reactor(ReactorPlane::ServerHook), 9),
+    ("reactor-iteration-server-hook-plus-ten", Leg::Reactor(ReactorPlane::ServerHook), 10),
     ("harness", Leg::Rate(RateLeg::Harness), 0),
     ("harness-plus-one", Leg::Rate(RateLeg::Harness), 1),
     ("map-get-0", Leg::Rate(RateLeg::MapGet { depth: 0 }), 0),
@@ -373,7 +439,7 @@ fn drive_host<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
         | Leg::Singleton { depth, background }
         | Leg::Cohort { depth, background } => (depth, background),
         Leg::Deep { .. } => (1, 0),
-        Leg::ReactorIteration | Leg::Rate(_) => {
+        Leg::Reactor(_) | Leg::Rate(_) => {
             unreachable!("a reactor or rate leg drives its own state")
         }
     };
@@ -398,7 +464,7 @@ fn drive_host<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
             Leg::Singleton { .. } => step_singleton(cell),
             Leg::Cohort { .. } => step_cohort(cell),
             Leg::Deep { stride } => step_deep(cell, stride, op),
-            Leg::ReactorIteration | Leg::Rate(_) => {
+            Leg::Reactor(_) | Leg::Rate(_) => {
                 unreachable!("a reactor or rate leg drives its own state")
             }
         };
@@ -421,7 +487,7 @@ fn engaged(leg: Leg, cell: &HostCell, ops: u64) {
             (ops, ops * members, ops * (members - 1), 0, ops * u64::from(background > 0))
         }
         Leg::Deep { .. } => (ops, ops, 0, 0, 0),
-        Leg::ReactorIteration | Leg::Rate(_) => {
+        Leg::Reactor(_) | Leg::Rate(_) => {
             unreachable!("a reactor or rate leg drives its own state")
         }
     };
@@ -481,9 +547,117 @@ impl CellPlane for IdlePlane {
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
 }
 
-/// Drives `ops` iterations of the cell loop with `NOPS` planted per op.
+/// The server's tier slot as its hook reads it: the cell's tiered state,
+/// absent on a cell that never created a tiered namespace, and in it the
+/// cold host.
+struct TierSlot {
+    cold: Option<inf_runtime::ColdReads>,
+}
+
+/// The state the server's planes share, as the hook reaches its tier slot.
+struct SharedTier {
+    tier: RefCell<Option<TierSlot>>,
+}
+
+/// The server's `before_execute` (`ServerPlane::before_execute` in
+/// `inf-server`), this bench's one copy of it: on a cell with no tiered
+/// namespace, the tier slot's borrow test and its presence test, and
+/// nothing else.
+#[inline(always)]
+fn server_hook(shared: &SharedTier, cx: &mut LoopCx<'_>) {
+    let engine = shared.tier.borrow().as_ref().is_some_and(|t| t.cold.is_some());
+    if engine {
+        deliver_cold(shared, cx);
+    }
+}
+
+/// C0's hook leg's plane: the server's `before_execute` over a cell with no
+/// tiered namespace, nothing at any other step.
+struct HookPlane {
+    shared: Rc<SharedTier>,
+}
+
+impl CellPlane for HookPlane {
+    fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
+        panic!("the reactor leg reaps nothing: {c:?}");
+    }
+    fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
+        server_hook(&self.shared, cx);
+    }
+    fn parse_execute(&mut self, _cx: &mut LoopCx<'_>) {}
+    fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+}
+
+/// The server's delivery, out of the iteration's line: the cold handle
+/// cloned under a short tier borrow, released before any gate wake, and
+/// the allowance lent only when the host holds ready delivery.
 #[inline(never)]
-fn drive_loop<const NOPS: u8>(ops: u64) -> u64 {
+fn deliver_cold(shared: &SharedTier, cx: &mut LoopCx<'_>) {
+    let cold = shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
+    if let Some(cold) = cold
+        && cold.has_ready_delivery()
+    {
+        let now_us = cx.now.as_micros();
+        let _ = cx.with_cold_delivery_budget(|budget| cold.deliver_ready(budget, now_us));
+    }
+}
+
+/// The hook's row's plane, a server cell's shape: the hook's tier slot, and
+/// the loop context handed to [`server_steps`] at `fabric_in`, before the
+/// hook, and at `parse_execute`, after it. `HOOK` true, its
+/// `before_execute` is the server's (B of the row); false, the plane's
+/// default (A). One type for both, so the legs differ in the hook alone.
+/// `LEND` true, with `HOOK` false, lends the delivery allowance once in
+/// `before_execute` and spends nothing: the lend leg.
+struct ServerShapedPlane<const HOOK: bool, const LEND: bool> {
+    shared: Rc<SharedTier>,
+}
+
+impl<const HOOK: bool, const LEND: bool> CellPlane for ServerShapedPlane<HOOK, LEND> {
+    fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
+        panic!("the reactor leg reaps nothing: {c:?}");
+    }
+    fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {
+        server_steps(&self.shared, cx);
+    }
+    fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
+        if HOOK {
+            server_hook(&self.shared, cx);
+        }
+        if LEND {
+            cx.with_cold_delivery_budget(|budget| {
+                black_box(budget);
+            });
+        }
+    }
+    fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
+        server_steps(&self.shared, cx);
+    }
+    fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+}
+
+/// A server step as the loop sees it: out of line and handed the loop
+/// context, which therefore escapes the iteration, as it does on a server
+/// cell, whose `fabric_in`, `parse_execute` and `respond` each take it.
+#[inline(never)]
+fn server_steps(shared: &SharedTier, cx: &mut LoopCx<'_>) {
+    black_box(shared);
+    black_box(cx);
+}
+
+/// What a reactor leg's loop builds of the cold turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Turns {
+    /// No step lends, so no iteration builds a turn.
+    None,
+    /// A lend builds one every iteration.
+    EveryIteration,
+}
+
+/// Drives `ops` iterations of the cell loop over `plane` with `NOPS`
+/// planted per op.
+#[inline(never)]
+fn drive_loop<const NOPS: u8, P: CellPlane>(ops: u64, mut plane: P, turns: Turns) -> u64 {
     let (census, serve_mark) = CapCensus::new(CellId(0));
     let timers = TimerSet::build(LOOP_OWNERS, &census).expect("the leg's timer set");
     // Spinning forever: the loop polls every entry and never parks.
@@ -491,7 +665,6 @@ fn drive_loop<const NOPS: u8>(ops: u64) -> u64 {
     let pool = BufferPool::new(1, 1024);
     let clock = VirtualClock::new(Nanos(1));
     let mut lp = CellLoop::new(IdleDriver, clock, pool, config, serve_mark, timers);
-    let mut plane = IdlePlane;
     let lp = black_box(&mut lp);
     let mut accumulator = 0u64;
     for _ in 0..ops {
@@ -500,9 +673,64 @@ fn drive_loop<const NOPS: u8>(ops: u64) -> u64 {
         accumulator = accumulator.wrapping_add(u64::from(stats.parked));
     }
     // Engagement, after the counted loop: every iteration ran and none
-    // parked.
+    // parked, and the loop built the cold turns its plane lent for: none
+    // with no lend, the last iteration's with a lend every iteration, and
+    // none at `ops` 0 either way.
     assert_eq!(accumulator, 0, "an iteration parked");
+    let built_at = match turns {
+        Turns::None => 0,
+        Turns::EveryIteration => ops,
+    };
+    assert_eq!(
+        lp.cold_turn_built_at(),
+        built_at,
+        "the loop's cold turn: no lend builds none, a lend every iteration builds the last one"
+    );
     accumulator.wrapping_add(lp.executor().live_tasks() as u64)
+}
+
+/// A cell's shared state with no tiered namespace.
+fn shared_tier() -> Rc<SharedTier> {
+    Rc::new(SharedTier { tier: RefCell::new(None) })
+}
+
+/// Drives `ops` iterations of a reactor leg over its plane.
+fn drive_reactor<const NOPS: u8>(plane: ReactorPlane, ops: u64) -> u64 {
+    match plane {
+        ReactorPlane::Idle => drive_loop::<NOPS, _>(ops, IdlePlane, Turns::None),
+        ReactorPlane::Hook => {
+            drive_loop::<NOPS, _>(ops, HookPlane { shared: shared_tier() }, Turns::None)
+        }
+        ReactorPlane::Server => {
+            let plane = ServerShapedPlane::<false, false> { shared: shared_tier() };
+            drive_loop::<NOPS, _>(ops, plane, Turns::None)
+        }
+        ReactorPlane::ServerHook => {
+            let plane = ServerShapedPlane::<true, false> { shared: shared_tier() };
+            drive_loop::<NOPS, _>(ops, plane, Turns::None)
+        }
+        ReactorPlane::ServerLend => {
+            let plane = ServerShapedPlane::<false, true> { shared: shared_tier() };
+            drive_loop::<NOPS, _>(ops, plane, Turns::EveryIteration)
+        }
+    }
+}
+
+/// Drives a reactor leg with its plant: none, the liveness `nop`, or the
+/// hook's row's verdict plant of four to ten.
+fn drive_reactor_planted(plane: ReactorPlane, nops: u8, ops: u64) -> u64 {
+    match nops {
+        0 => drive_reactor::<0>(plane, ops),
+        1 => drive_reactor::<1>(plane, ops),
+        4 => drive_reactor::<4>(plane, ops),
+        5 => drive_reactor::<5>(plane, ops),
+        6 => drive_reactor::<6>(plane, ops),
+        7 => drive_reactor::<7>(plane, ops),
+        8 => drive_reactor::<8>(plane, ops),
+        9 => drive_reactor::<9>(plane, ops),
+        10 => drive_reactor::<10>(plane, ops),
+        other => panic!("no reactor leg plants {other} nops"),
+    }
 }
 
 fn main() -> ExitCode {
@@ -514,8 +742,7 @@ fn main() -> ExitCode {
         }
     };
     let result = match (args.leg, args.nops) {
-        (Leg::ReactorIteration, 0) => drive_loop::<0>(args.ops),
-        (Leg::ReactorIteration, _) => drive_loop::<1>(args.ops),
+        (Leg::Reactor(plane), nops) => drive_reactor_planted(plane, nops, args.ops),
         (Leg::Rate(leg), 0) => rates::drive::<0>(leg, args.ops),
         (Leg::Rate(leg), _) => rates::drive::<1>(leg, args.ops),
         (leg, 0) => drive_host::<0>(leg, args.ops),
