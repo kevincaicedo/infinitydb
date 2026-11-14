@@ -423,10 +423,8 @@ fi
 # A hand-made `Waker` needs a `RawWakerVTable`, and the workspace ships one: in code (comments
 # and string literals removed), every `.rs` file under crates/, bins/ and tests/ that names it
 # is red unless it is an entry below, each a file with the rule that keeps it. An entry that is
-# absent, or names it nowhere, is red too, so an entry leaves with what it holds. The entries:
-# the executor's vtable; and a bench-only copy of the executor that an A/B keeps as its leg A,
-# listed from the change that holds both the copy and this census until the change that removes
-# the copy, its verdicts recorded.
+# absent, or names it nowhere, is red too, so an entry leaves with what it holds. The one entry
+# is the executor's waker vtable.
 CENSUS_ENTRIES=(
     "crates/inf-runtime/src/executor.rs|the executor's waker vtable"
 )
