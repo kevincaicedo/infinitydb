@@ -214,9 +214,11 @@ not an `Arc<Mutex<...>>`. Command futures are `!Send`. A waker may move to
 another thread, as Rust requires, but on its own cell's thread it runs no
 atomic read-modify-write; only a wake from another thread, which no server
 path makes, pays for one. Cell code may not name locks, channels,
-`tokio`, `sleep`, thread spawning, or the ambient clock or randomness; a
+`tokio`, `sleep`, thread spawning, the ambient clock or randomness, or
+the process environment, whose every read takes a process-wide lock; a
 denylist script and clippy's `disallowed-types` / `disallowed-methods`
-reject them at build time.
+reject them at build time. A setting the environment carries is read
+once at boot, before any cell starts, and handed to the cell.
 
 A few things do cross threads, and each is small and off the per-key path:
 

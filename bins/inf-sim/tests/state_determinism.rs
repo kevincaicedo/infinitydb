@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: an unused output path under the temp dir, not cell code (ADR-0209 D3)"
+)]
 //! The determinism twin at the binary, and the sweep arguments' refusals,
 //! read off the scenario registry. A single run under the flag prints the
 //! twin's agreement line; a row outside the sweep column refuses `--sweep`;

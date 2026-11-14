@@ -6,6 +6,13 @@
 # M4.5-S36 (ADR-0088): no ambient clocks or randomness either — L7's
 # injected-time rule was enforced by convention until the device budget
 # became the first clock consumer added since it was written.
+# ADR-0209 D4: no process environment either. A read takes std's
+# process-wide lock and scans the whole block, and its value is ambient
+# input. ENV_PATTERN is the second reader of clippy.toml's std::env entries,
+# by text, and the proven reader of libc's getenv, setenv, unsetenv and
+# putenv, whose clippy entries resolve but have no plant (ADR-0209 A1); it
+# carries glibc's secure_getenv and clearenv, which no portable entry names.
+# No denylist-allow marker admits one of its hits.
 #
 # Review 2026-08-30, P1 (F-L00-01, F-L17-03, F-L18-05, F-L19-16,
 # F-L20-01) — ADR-0106: the list named `crates/inf-server/src/cell`, a
@@ -32,6 +39,9 @@ STRIP="$SCRIPT_DIR/strip-test-modules.awk"
 
 # One ERE; awk dynamic-regex safe (no backslash escapes).
 PATTERN='tokio::|async_std::|std::sync::Mutex|std::sync::RwLock|std::sync::Condvar|std::sync::mpsc|thread::sleep|thread::spawn|thread::Builder|thread::park|Instant::now|SystemTime::now|rand::'
+# `env::var` covers var_os, vars and vars_os; `getenv` covers secure_getenv;
+# `setenv` covers unsetenv. A hit is red with or without a marker.
+ENV_PATTERN='env::var|env::set_var|env::remove_var|env::temp_dir|env::home_dir|getenv|setenv|putenv|clearenv'
 MARKER='denylist-allow'
 
 DIRS=()
@@ -70,12 +80,16 @@ $f"*) continue ;; esac
         lines=$((lines + n))
         stripped=$((stripped + s))
         # A hit is allowed when its line or the line above carries the
-        # marker WITH a reason; full-line comments never execute.
-        out=$(awk -f "$STRIP" "$f" | awk -v pat="$PATTERN" -v marker="$MARKER" '
+        # marker WITH a reason; full-line comments never execute. An
+        # environment hit is never allowed.
+        out=$(awk -f "$STRIP" "$f" | awk -v pat="$PATTERN" -v envpat="$ENV_PATTERN" -v marker="$MARKER" '
             function reason(s) { sub("^.*" marker ":[[:space:]]*", "", s); return s }
             {
-                hit = ($0 !~ /^[[:space:]]*\/\//) && ($0 ~ pat)
-                if (hit) {
+                code = ($0 !~ /^[[:space:]]*\/\//)
+                hit = code && ($0 ~ pat)
+                if (code && $0 ~ envpat) {
+                    print "V " NR ": " $0 "   <-- the process environment: no " marker " marker admits it"
+                } else if (hit) {
                     withreason = marker ":[[:space:]]*[^[:space:]]"
                     if ($0 ~ withreason) { print "A " NR ": " reason($0) }
                     else if (prev ~ withreason) { print "A " NR ": " reason(prev) }
@@ -104,7 +118,8 @@ scope="${#DIRS[@]} crates, $files files, $lines lines scanned, $stripped test-on
 if [ "$fail" -ne 0 ]; then
     echo "cell deny-list FAILED ($scope)"
     echo "Cell code must not block, lock, spawn, or read ambient time/randomness (L1/L6/L7)."
-    echo "Sanctioned control-plane sites carry '$MARKER: <reason>' on the line or the one above."
+    echo "Sanctioned control-plane sites carry '$MARKER: <reason>' on the line or the one above;"
+    echo "the process environment has no sanctioned site (ADR-0209 D4)."
     exit 1
 fi
 echo "cell deny-list OK ($scope)"

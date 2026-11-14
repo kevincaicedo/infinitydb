@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Node-spawn gate (ADR-0203 D3): a test starts `infinityd` only through the
-# node module, bins/infinityd/tests/support/node.rs. The module's types give
+# Node-spawn gate (ADR-0203 D3, ADR-0209 D5): a test starts `infinityd` only
+# through the node module, bins/infinityd/tests/support/node.rs; and every
+# ring an inf-runtime test builds is checked engaged. The module's types give
 # every node it starts the box's node lock, held by the node itself from
-# before its first ring to its exit, and end the node with its handle. No
-# type refuses a string, so this gate holds the other half: outside the
-# module no file names the binary, and inside it no field is public. Five
-# rules, read on each scanned line with its comments blanked, each red with
-# its file and line; rules 1 to 4 read every file but the module:
+# before its first ring to its exit, and end the node with its handle. No type
+# refuses a string, so this gate holds the other half: outside the module no
+# file names the binary, and inside it no field is public. Five rules, read on
+# each scanned line with its comments blanked, each red with its file and
+# line; rules 1 to 4 read every file but the module:
 #   1. the token BIN_EXE_infinityd, in cargo's spelling and in nextest's
 #      (CARGO_BIN_EXE_infinityd, NEXTEST_BIN_EXE_infinityd);
 #   2. the literal "INFINITYD_BIN", except as the first argument of `.env(`
@@ -99,6 +100,11 @@
 # outside the lock: its pages are counted against that test's bound when it
 # lands. `--census` prints the rows (class, file, rings, registrations) and
 # exits; the test rows are the list of ring holders outside the lock.
+# Each crates/inf-runtime/tests/*.rs file that builds a ring checks every ring
+# it builds engaged the mode its environment selects (ADR-0209 D5): the same
+# comment-blanked text names `uring_env::assert_engaged(` at least as often
+# as UringDriver::new, else the file is red, naming the call. The count reads
+# that qualified spelling alone, so a call imported by `use` reads as missing.
 #
 # Portable bash 3.2 and POSIX awk (ADR-0106 D18): the CI matrix includes
 # macOS. INF_CHECK_ROOT names another checkout (the self-test's fixtures).
@@ -439,6 +445,7 @@ FILENAME == censusf {
     if (f == module) { module_lines++; fields(text, l) }
     pad = " " text " "
     rings[f] += count(pad, "[^A-Za-z0-9_]UringDriver::new[^A-Za-z0-9_]")
+    engaged[f] += count(pad, "[^A-Za-z0-9_]uring_env::assert_engaged[(]")
     regs[f] += count(text, "[.]register_(tier_)?pool[(]")
     if (f != module) {
         if (match(pad, "BIN_EXE_infinityd[^A-Za-z0-9_]")) { hit(f, l, 1) }
@@ -502,6 +509,19 @@ END {
         if (rings[f] > 0 && !(f in row_class)) {
             print "red ring census: " f " names UringDriver::new " rings[f] " time(s), outside" \
                 " the table; add the row " f "|<test, bench or node>|" rings[f] "|" regs[f]
+        }
+    }
+    # ADR-0209 D5: every ring an inf-runtime test file builds is checked
+    # engaged, by the qualified call alone.
+    for (f in rings) {
+        if (rings[f] == 0 || f !~ "^crates/inf-runtime/tests/[^/]*[.]rs$") { continue }
+        test_rings += rings[f]
+        checked += (engaged[f] < rings[f]) ? engaged[f] : rings[f]
+        if (engaged[f] < rings[f]) {
+            print "red ring census: " f " builds " rings[f] " ring(s) and checks " \
+                (engaged[f] + 0) " engaged; call uring_env::assert_engaged(…) on each ring" \
+                " it builds, spelled so (crates/inf-runtime/tests/support/uring_env.rs): a" \
+                " call imported by use reads as missing"
         }
     }
     for (i = 1; i <= rows; i++) {
@@ -586,6 +606,7 @@ END {
     print "count marked " marked
     print "count census " (class_rows["test"] + 0) " test, " (class_rows["bench"] + 0) \
         " bench, " (class_rows["node"] + 0) " node"
+    print "count engaged " (checked + 0) " of " (test_rings + 0)
 }'
 
 awk -v module="$MODULE" -v module_test="$MODULE_TEST" \
@@ -622,7 +643,8 @@ echo "node-spawn OK: $scanned files, $(value lines) lines scanned ($listed liste
     "reached only by #[path], $reached_excluded of them under the excluded directories;" \
     "$includes #[path] includes followed; $gone listed path(s) gone from the work tree);" \
     "excluded: $EXCLUDED ($excluded files); the module: $MODULE; $(value hits) hit(s)," \
-    "$(value marked) marked; ring census: $(value census) row(s); rule 5: $(value structs)" \
+    "$(value marked) marked; ring census: $(value census) row(s), $(value engaged)" \
+    "inf-runtime test ring(s) checked engaged; rule 5: $(value structs)" \
     "struct(s) in the module, $(value public_fields) field(s) with a visibility, all in" \
     "$(value public_structs) marked struct(s)"
 sed -n 's/^allowed /  allowed: /p' "$work/verdict"

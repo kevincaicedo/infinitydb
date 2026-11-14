@@ -22,7 +22,7 @@ const MULTISHOT_ACCEPT_FROM: (u32, u32) = (5, 19);
 
 /// The selections a test ring is built with: the decoder over the test's
 /// environment, read once, where the ring is built.
-#[allow(clippy::disallowed_methods, reason = "test support: the test's environment, not cell code")]
+#[allow(clippy::disallowed_methods, reason = "test-only: the test's environment, not cell code")]
 pub fn config() -> UringConfig {
     UringConfig::from_lookup(std::env::var_os)
 }
@@ -31,7 +31,7 @@ pub fn config() -> UringConfig {
 /// selects. With `INF_URING_FORCE_DEGRADED` present the ring is degraded:
 /// no multishot accept, no multishot recv. Absent, a kernel at 5.19 or
 /// later gives multishot accept.
-#[allow(clippy::disallowed_methods, reason = "test support: the test's environment, not cell code")]
+#[allow(clippy::disallowed_methods, reason = "test-only: the test's environment, not cell code")]
 pub fn assert_engaged(caps: &Capabilities) {
     if std::env::var_os("INF_URING_FORCE_DEGRADED").is_some() {
         assert!(!caps.multishot_accept, "a degraded leg's ring accepts multishot: {caps:?}");
@@ -42,7 +42,7 @@ pub fn assert_engaged(caps: &Capabilities) {
 }
 
 /// `major.minor` of the running kernel, from `/proc/sys/kernel/osrelease`.
-#[allow(clippy::disallowed_methods, reason = "test support: a kernel fact, not cell code")]
+#[allow(clippy::disallowed_methods, reason = "test-only: a kernel fact, not cell code")]
 fn kernel_release() -> (u32, u32) {
     let text = std::fs::read_to_string("/proc/sys/kernel/osrelease").expect("the kernel release");
     let mut parts = text.trim().split(['.', '-']);

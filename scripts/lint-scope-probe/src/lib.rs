@@ -11,6 +11,7 @@
 pub mod awaits;
 pub mod containers;
 pub mod discards;
+pub mod environment;
 pub mod filesystem;
 pub mod listing;
 

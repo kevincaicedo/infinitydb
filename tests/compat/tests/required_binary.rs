@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: a child test reads its role from the environment (ADR-0209 D3)"
+)]
 //! Required binary execution must fail when its candidate is absent.
 
 use std::ffi::OsStr;

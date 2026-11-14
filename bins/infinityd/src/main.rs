@@ -810,20 +810,15 @@ fn version_line() -> String {
 }
 
 fn main() {
-    let mut args = match parse_args() {
+    // The uring driver's selections ride the parse: decoded here, on the main
+    // thread, before any cell thread exists (ADR-0209 D2).
+    let mut args = match parse_args().map(with_uring_selections) {
         Ok(args) => args,
         Err(e) => {
             eprintln!("infinityd: {e}");
             std::process::exit(2);
         }
     };
-    // The uring driver's selections, decoded here on the main thread before
-    // any cell thread exists: no cell reads the process environment
-    // (ADR-0209 D2).
-    #[cfg(target_os = "linux")]
-    {
-        args.uring = uring_selections();
-    }
     // The graceful stop (ADR-0124 D1): one flag every cell polls.
     let stop = match inf_runtime::signal::install_stop_flag() {
         Ok(flag) => flag,
@@ -1608,14 +1603,22 @@ fn cell_main(
     }
 }
 
-/// The uring driver's selections from the process environment: the three
-/// variables `UringConfig::from_lookup` names, each selecting when present,
-/// read once at boot (ADR-0209 D2).
+/// `args` with the uring driver's selections decoded from the process
+/// environment: the three variables `UringConfig::from_lookup` names, each
+/// selecting when present, read once at boot (ADR-0209 D2). No cell reads
+/// the environment. Off Linux there is no uring driver and `args` passes
+/// through.
 #[cfg(target_os = "linux")]
-fn uring_selections() -> inf_runtime::UringConfig {
+fn with_uring_selections(mut args: Args) -> Args {
     #[allow(clippy::disallowed_methods, reason = "boot: decoded before any cell thread exists")]
-    let config = inf_runtime::UringConfig::from_lookup(std::env::var_os);
-    config
+    let uring = inf_runtime::UringConfig::from_lookup(std::env::var_os);
+    args.uring = uring;
+    args
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_uring_selections(args: Args) -> Args {
+    args
 }
 
 #[cfg(target_os = "linux")]

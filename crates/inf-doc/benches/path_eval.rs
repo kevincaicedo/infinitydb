@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the canary variable is the bench's input, not cell code (ADR-0209 D3)"
+)]
 //! Direct materialized and streaming path workloads for ARCH-W0.3 T2.
 //! Fixed scalar answers check engagement before measurement. Setting
 //! INF_BENCH_PATH_CANARY plants a wrong answer and must fail that check.

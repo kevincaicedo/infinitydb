@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: the oracle's address comes from the environment (ADR-0209 D3)"
+)]
 //! InfinityDB against a pinned RedisJSON, under RESP2 and RESP3: a reply that
 //! differs from the oracle's fails unless its case and protocol are on the
 //! allowlist, which admits it whatever its bytes, and an allowlist entry
