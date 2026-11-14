@@ -415,6 +415,8 @@ const COLD_SET_BATCH: usize = 500;
 const COLD_KEYS_MAX: usize = 40_000;
 /// Steps the cell may take to park once the burst is answered.
 const COLD_PARK_STEPS_MAX: u32 = 256;
+/// Steps the quiet clause reads after the cell parks.
+const COLD_QUIET_STEPS: u32 = 16;
 /// Steps in a row the device's held reads must stay unchanged before the
 /// burst's issue counts as done.
 const COLD_HELD_STEADY_STEPS: u32 = 8;
@@ -488,7 +490,11 @@ impl Quiet {
 /// shares no code with the veto's `holds_ready_work`, and the plant leaves
 /// the count alone. Planted (`inf_canary_cold_park_without_delivery`), the
 /// veto ignores ready delivery and an iteration begins parked with members
-/// pending; with the server's own veto deleted, the same.
+/// pending; with the server's own veto deleted, the same. Its quiet clause
+/// (ADR-0181 A1.1): once the last member is visited no step lends, so the
+/// loop's cold turn stays the one the burst's last lend built while the
+/// iteration count grows; a turn built as each iteration begins, or a hook
+/// that lends with nothing ready, moves it.
 #[test]
 fn a_cell_with_cold_members_to_visit_begins_no_iteration_parked() {
     let mut quiet = Quiet::boot(1, 0, 0);
@@ -583,15 +589,35 @@ fn a_cell_with_cold_members_to_visit_begins_no_iteration_parked() {
          (step, members pending): {parked_with_pending:?}"
     );
     assert!(left_pending > 0, "VACUOUS: no step left a cold-read member to visit");
-    let parks_before = quiet.parks_read;
-    for _ in 0..COLD_PARK_STEPS_MAX {
-        if quiet.step_watched() {
-            break;
+    let (built, iterations) = quiet.node.cold_turn_built_at(0);
+    assert!(built > 0, "VACUOUS: the burst's delivery built no cold turn");
+    let mut built_later = Vec::new();
+    let mut quiet_step = |quiet: &mut Quiet, step: u32| {
+        let parked = quiet.step_watched();
+        let (now, _) = quiet.node.cold_turn_built_at(0);
+        if now != built {
+            built_later.push((step, now));
         }
+        parked
+    };
+    let parks_before = quiet.parks_read;
+    let mut steps = 0;
+    while steps < COLD_PARK_STEPS_MAX && !quiet_step(&mut quiet, steps) {
+        steps += 1;
     }
     assert!(
         quiet.parks_read > parks_before,
         "liveness: the cell owed nothing after the burst and read no park in \
          {COLD_PARK_STEPS_MAX} steps"
+    );
+    for step in steps + 1..=steps + COLD_QUIET_STEPS {
+        quiet_step(&mut quiet, step);
+    }
+    let (_, iterations_after) = quiet.node.cold_turn_built_at(0);
+    assert!(iterations_after > iterations, "VACUOUS: the cell ran no iteration after the burst");
+    assert!(
+        built_later.is_empty(),
+        "a step built a cold turn after the burst's last member was visited, which iteration \
+         {built} built, as (step after it, iteration that built): {built_later:?}"
     );
 }

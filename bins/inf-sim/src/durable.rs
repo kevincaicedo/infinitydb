@@ -2323,6 +2323,15 @@ impl Node {
         self.iter_stats[cell]
     }
 
+    /// `cell`'s reactor, its own two readings of its cold turn: the
+    /// iteration whose lend last built the turn (0 before any) and the
+    /// iterations begun, both counted from 1. Read between scheduler steps.
+    #[cfg(test)]
+    pub(crate) fn cold_turn_built_at(&self, cell: usize) -> (u64, u64) {
+        let cell_loop = &self.cells[cell].0;
+        (cell_loop.cold_turn_built_at(), cell_loop.counters()[3])
+    }
+
     /// Summed pub/sub registry gauges across cells (combined-scenario
     /// quiescence oracle, M2.5-S14): (channels, patterns, bytes).
     pub(crate) fn pubsub_gauges(&self) -> (u64, u64, usize) {
