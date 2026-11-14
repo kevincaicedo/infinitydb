@@ -170,3 +170,20 @@ fn the_drop_race_filler_leg_meets_its_held_read() {
     );
     assert_eq!(report.drop_reads_held, 1, "the DROP met the filler key's held read");
 }
+
+/// `m4-tiered` at `0x51ee07f7`, one seed of the nightly's 4,000 from
+/// `0x51EE0000`. Cell 1's page of 16 cold slots enqueues them in one reactor
+/// iteration, and the device takes their 6 merged reads at one entry. The
+/// page still answers 16 scheduler steps after its send: the net hands the
+/// command's 56 bytes to the cell in 12 seeded chunks, a step each, and the
+/// reply takes 3 more. A page's reads are batched when the device takes them
+/// in fewer steps than the page has cold slots, however long the command
+/// took to arrive.
+#[test]
+#[ignore = "the SCAN batching oracle counts every scheduler step between a page's send and its \
+            reply, so the steps the net takes to deliver the command read as one device round \
+            trip a key; red until the oracle counts the steps in which the device took a read"]
+fn a_scan_page_is_judged_by_the_steps_its_reads_took() {
+    let report = run_tiered_scenario(&TieredScenario::m4_tiered(0x51ee_07f7));
+    assert!(report.ok(), "stalled={} violations={:?}", report.stalled, report.violations);
+}
