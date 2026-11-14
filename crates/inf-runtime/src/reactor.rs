@@ -748,7 +748,14 @@ mod turn {
         /// when another iteration built it, and lent as it stands when this
         /// one did, a spent allowance included.
         fn cold_turn(&mut self) -> &mut ColdTurn {
-            if self.cold_built_at != self.iterations {
+            let stale = self.cold_built_at != self.iterations;
+            // Canary: every lend builds the turn.
+            #[cfg(inf_canary_cold_turn_per_lend)]
+            let stale = {
+                let _ = stale;
+                true
+            };
+            if stale {
                 self.cold = ColdTurn::begin();
                 self.cold_built_at = self.iterations;
             }

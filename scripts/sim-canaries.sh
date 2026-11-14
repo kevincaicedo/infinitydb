@@ -961,6 +961,9 @@ rows=(
   "inf_canary_cold_delivery_budget_per_cqe m4-cold cold-delivery-work-over --cold-leg dense"
   "inf_canary_cold_cancel_uncharged m4-cold cold-delivery-work-over --cold-leg cancel-all"
   "inf_canary_cold_turn_budget_per_pump m4-cold cold-delivery-work-over --cold-leg dense"
+  # ADR-0181 R2 (A1.1): every lend of a native iteration, at any step, shares one turn, built at
+  # its first lend. Planted, every lend builds the turn, so one iteration visits more than 64.
+  "inf_canary_cold_turn_per_lend crate-test inf-runtime test:reactor every_lend_of_an_iteration_shares_one_turn share one turn"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
