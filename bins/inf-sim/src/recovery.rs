@@ -36,6 +36,7 @@
 //! Every event folds into `trace_hash`; `--verify-determinism` runs the
 //! scenario twice and requires hash identity (L7).
 
+use crate::driver::Violations;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -50,8 +51,8 @@ use inf_log::fs::SegmentFs;
 use inf_log::fs::sim::SimDisk;
 use inf_log::manifest::TierNsManifest;
 use inf_log::{
-    CkptConfig, Lsn, Manifest, MutationEffect, NsId, RecordView, SealReason, SegmentId,
-    StagingConfig, StagingRing, SyncIckWriter, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
+    CkptConfig, LogGeometry, Lsn, Manifest, MutationEffect, NsId, RecordView, SealReason,
+    SegmentId, StagingRing, SyncIckWriter, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
     TierIoMode, decode_record, parse_tier_file_name, probe_tier_file, read_ick_hybrid,
     read_manifest, tier_extract, tier_frame_offset, tier_frame_span, write_manifest,
 };
@@ -315,7 +316,7 @@ impl RecoveryScenario {
 
 #[derive(Debug, Default)]
 pub struct RecoveryReport {
-    pub violations: Vec<String>,
+    pub violations: Violations,
     pub lives: u64,
     pub refs_emitted: u64,
     pub images_emitted: u64,
@@ -498,32 +499,46 @@ impl Booting {
         hasher: KeyHasher,
         spec: &Spec,
     ) -> Booting {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         // The spec's threshold holds during replay, as the catalog's does
         // at a server's boot: a value at or above it is a typed refusal.
         table.set_blob_config(spec.blob());
         let mut ks = Keyspace::new(StoreConfig { hasher, ..StoreConfig::default() });
-        ks.ns_create(NsSpec {
-            id: NS,
-            name: b"tiered-88".to_vec(),
-            mode: NsMode::Durable,
-            fsync: Some(FsyncClass::Everysec),
-            policy: None,
-            maxmemory: None,
-            tier: Some(TierSpec::for_budget(4 << 20)),
-        })
+        ks.ns_create(
+            NsSpec {
+                id: NS,
+                name: b"tiered-88".to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(FsyncClass::Everysec),
+                policy: None,
+                maxmemory: None,
+                tier: Some(TierSpec::for_budget(4 << 20)),
+            },
+            &census,
+        )
         .expect("create the tiered namespace");
         // The harness's table keeps its own knobs (budget, blob, shadow).
         *ks.tiered_store_mut(NS).expect("materialized") = table;
         Booting { ks, lent: Lent { machine }, longest_range: 0 }
     }
 
-    /// One record through the shipped dispatcher, measuring the span its
-    /// apply flushed ([`Booting::longest_range`]).
+    /// One record through the store's driver, measuring the span its
+    /// apply flushed ([`Booting::longest_range`]): the record presented,
+    /// its demote steps run, then presented again, so the span is the
+    /// whole of the room it made. Around one presentation that needs room
+    /// the span would read 0.
     fn apply(&mut self, record: &RecordView<'_>) -> Result<(), String> {
         let flushed =
             |ks: &Keyspace| ks.tiered_store(NS).expect("materialized").space().flushed().to_raw();
         let before = flushed(&self.ks);
-        let applied = self.ks.apply_record(record, BOOT_NOW, BOOT_ANCHOR, &mut self.lent);
+        let applied = inf_store::drive_record(
+            &mut self.ks,
+            record,
+            BOOT_NOW,
+            BOOT_ANCHOR,
+            &mut self.lent,
+            u64::MAX,
+        );
         let span = flushed(&self.ks) - before;
         self.longest_range = self.longest_range.max(span);
         applied.map(|_| ()).map_err(|e| format!("{e:?}"))
@@ -629,8 +644,9 @@ impl Booting {
 }
 
 fn tiered_table(spec: &Spec, origin: u64, hasher: KeyHasher) -> TieredTable {
-    let mut table =
-        TieredTable::new(space_config(spec, origin), spec.live, 1024, hasher).expect("ring");
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+    let mut table = TieredTable::new(space_config(spec, origin), spec.live, 1024, hasher, &census)
+        .expect("ring");
     table.set_blob_config(spec.blob());
     // The shadow arm (M4.5-S37, ADR-0093 D8) runs on in this harness —
     // the store-level DST's authority over the mechanism.
@@ -646,6 +662,7 @@ fn flush_config(shard: &Path) -> TierFlushConfig {
         mode: TierIoMode::Buffered,
         file_capacity: FILE_CAPACITY,
         slice_bytes: PAGE,
+        record_len_max: 16 << 20,
     }
 }
 
@@ -893,7 +910,7 @@ impl Run {
     /// modeled tail is the durable record here, not the ring).
     fn stage(&mut self, life: &mut Life, effect: &MutationEffect<'_>) {
         if life.table.stage_wal(&mut life.ring, effect).is_err() {
-            life.ring = StagingRing::new(StagingConfig::default());
+            life.ring = StagingRing::new(LogGeometry::default());
             life.table.stage_wal(&mut life.ring, effect).expect("a fresh ring has room");
         }
     }
@@ -1116,12 +1133,12 @@ impl Run {
     /// [`park_for_room`]: Self::park_for_room
     fn placeable(&mut self, life: &mut Life, len: usize) -> bool {
         for round in 0..PARK_ROUNDS_MAX {
-            if matches!(life.table.space().room(len), Room::Fits) {
+            if matches!(life.table.space_mut().room(len), Room::Fits) {
                 return true;
             }
             self.park_round(life, round, len, "fill");
         }
-        matches!(life.table.space().room(len), Room::Fits)
+        matches!(life.table.space_mut().room(len), Room::Fits)
     }
 
     /// One round of the park on a full window: the reconciler from the
@@ -1137,7 +1154,7 @@ impl Run {
         }
         self.maintain(life);
         if self.spec.variant.is_some()
-            && !matches!(life.table.space().room(len), Room::Fits)
+            && !matches!(life.table.space_mut().room(len), Room::Fits)
             && life.flush.append_cursor().is_some()
         {
             life.table.flush_barrier(&mut life.flush).expect("sim barrier seal");
@@ -1159,13 +1176,13 @@ impl Run {
     /// whether the op may proceed.
     fn park_for_room(&mut self, life: &mut Life, len: usize) -> bool {
         for round in 0..PARK_ROUNDS_MAX {
-            if matches!(life.table.space().room(len), Room::Fits) {
+            if matches!(life.table.space_mut().room(len), Room::Fits) {
                 return true;
             }
             self.report.writer_parks += 1;
             self.park_round(life, round, len, "park");
         }
-        if matches!(life.table.space().room(len), Room::Fits) {
+        if matches!(life.table.space_mut().room(len), Room::Fits) {
             return true;
         }
         // The held ticket's injected read error clears: its winner pins
@@ -1181,7 +1198,7 @@ impl Run {
                 self.reconcile(life, 16, "park");
             }
             self.maintain(life);
-            if matches!(life.table.space().room(len), Room::Fits) {
+            if matches!(life.table.space_mut().room(len), Room::Fits) {
                 return true;
             }
         }
@@ -1189,11 +1206,11 @@ impl Run {
             self.report.writes_parked_past_a_walk += 1;
             return false;
         }
+        let room = life.table.space_mut().room(len);
         let space = life.table.space();
         self.report.violations.push(format!(
             "a live write of {len} bytes found no room after {PARK_ROUNDS_MAX} maintain rounds \
-             ({:?}; head {} flushed {} tail {}, pin {:?}, {} tickets open)",
-            space.room(len),
+             ({room:?}; head {} flushed {} tail {}, pin {:?}, {} tickets open)",
             space.head().to_raw(),
             space.flushed().to_raw(),
             space.tail().to_raw(),
@@ -1366,7 +1383,7 @@ impl Run {
         let life = Life {
             table,
             flush: handed.flush,
-            ring: StagingRing::new(StagingConfig::default()),
+            ring: StagingRing::new(LogGeometry::default()),
             flush_lag: false,
         };
         for (key, hash, _) in &rows {
@@ -1410,6 +1427,7 @@ impl Run {
             raised(),
             1024,
             hasher,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         )
         .map_err(|e| format!("tier recovery: {e}"))?;
         let mut node = Booting::new(recovered.table, recovered.replay, hasher, &self.spec);
@@ -2376,8 +2394,13 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
     };
     let mut life = Life {
         table: tiered_table(&spec, 0, hasher),
-        flush: TierFlush::new(disk.clone(), flush_config(&shard), 0),
-        ring: StagingRing::new(StagingConfig::default()),
+        flush: TierFlush::new(
+            disk.clone(),
+            flush_config(&shard),
+            0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        ),
+        ring: StagingRing::new(LogGeometry::default()),
         flush_lag: false,
     };
     let mut ckpt_id = 0u64;
@@ -2708,6 +2731,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             spec.boot,
             1024,
             hasher,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         ) {
             Ok(recovered) => recovered,
             Err(e) => {
@@ -2716,7 +2740,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 return run.report;
             }
         };
-        let extents_listed = recovered.extents_listed;
+        let extents_listed = recovered.extents_listed.to_vec();
         let replay_unit = run.replay_unit_bytes();
         let mut node = Booting::new(recovered.table, recovered.replay, hasher, &spec);
         let replayed = node
@@ -2773,7 +2797,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         life = Life {
             table,
             flush: handed.flush,
-            ring: StagingRing::new(StagingConfig::default()),
+            ring: StagingRing::new(LogGeometry::default()),
             flush_lag: false,
         };
         // The D5 rebuild: every pair the checkpoint and the tail restored

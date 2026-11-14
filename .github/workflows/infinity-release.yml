@@ -8,16 +8,13 @@
 # first run must verify the tag trigger, GHCR permissions, and the
 # image-size/scan gates.
 #
-# The alpha tag itself stays gated on M0-R2 (reference box); this
+# The alpha tag itself stays gated on the reference box's evidence; this
 # pipeline existing does not authorize tagging.
 #
-# REHEARSAL MODE (2026-08-17). Until now the only trigger was a tag push, so
-# the pipeline could not be exercised without performing the release act it
-# exists to perform — `gh workflow run infinity-release.yml` returned
-# HTTP 422 ("Workflow does not have 'workflow_dispatch' trigger"), which is
-# why readiness item 7 recorded it as never run while C9's image-size gate
-# stayed unmeasured. `workflow_dispatch` now runs a NON-PUBLISHING rehearsal:
-# it builds the binaries and the image, and runs the size gate, the
+# REHEARSAL MODE. A tag push is the only publishing trigger. So that the
+# pipeline can be exercised without performing the release act it exists
+# to perform, `workflow_dispatch` runs a NON-PUBLISHING rehearsal: it
+# builds the binaries and the image, and runs the size gate, the
 # out-of-the-box redis-cli smoke and the Trivy scan — but pushes nothing to
 # GHCR and creates no release. The image is built for linux/amd64 only and
 # `load`ed into the local daemon, because buildx cannot `load` a multi-arch
@@ -31,8 +28,8 @@
 # tag deleted afterwards (note a GHCR image tag is public the moment it is
 # pushed; the GitHub release is a draft and is not).
 #
-# On a tag push every step below behaves exactly as it did before this
-# change: the rehearsal path is additive and gated on `publish == false`.
+# On a tag push the rehearsal path changes no step below: it is additive
+# and gated on `publish == false`.
 name: infinity-release
 
 on:
@@ -184,8 +181,7 @@ jobs:
           fi
           size=$(docker image inspect ${{ env.IMAGE }}:${{ needs.meta.outputs.version }} --format '{{.Size}}')
           echo "image size: $size bytes"
-          # 10 MB — owner decision 2026-08-08; matches m1-gates.toml
-          # image_size.
+          # 10 MB, the image-size bound; matches m1-gates.toml image_size.
           test "$size" -lt 10485760
       - name: smoke (redis-cli, the documented run command)
         run: |
@@ -201,7 +197,11 @@ jobs:
           test "$(redis-cli -p 6399 GET k)" = "v"
           docker rm -f inf
       - name: image scan (release-blocking)
-        uses: aquasecurity/trivy-action@0.28.0
+        # Pinned by commit, never by tag: GHSA-69fq-xp46-6x23 force-pushed
+        # 76 of this action's 77 tags to an infostealer. 0.35.0 is the
+        # immutable release the advisory names safe; it installs trivy
+        # v0.69.3 through a SHA-pinned setup-trivy.
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           image-ref: ${{ env.IMAGE }}:${{ needs.meta.outputs.version }}
           format: table
@@ -229,7 +229,7 @@ jobs:
     needs: [meta, binaries, docker, sbom]
     # The release act itself. Skipped on a rehearsal — the preceding jobs
     # still prove the artifacts build, the size gate holds, the image smokes
-    # clean and the scan passes, which is what C9 needs.
+    # clean and the scan passes.
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     steps:

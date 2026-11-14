@@ -2,6 +2,7 @@
 //! deadlines, and the idle timeout oracle.
 
 use super::*;
+use crate::driver::Violations;
 
 // ---- admission + idle phase (ADR-0123, batch 50) ------------------------------
 
@@ -76,7 +77,7 @@ pub(super) fn drive_idle_phase(
     rng: &mut SplitMix64,
     regular_unwound: bool,
     report: &mut SimReport,
-    violations: &mut Vec<String>,
+    violations: &mut Violations,
 ) -> bool {
     if idle.done {
         return true;

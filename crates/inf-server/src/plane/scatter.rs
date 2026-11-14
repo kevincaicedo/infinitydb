@@ -11,21 +11,22 @@ use super::*;
 /// the reply; **any leg that is neither** — a typed fabric error, or a
 /// shape no counted apply produces — is an internal error, so a release
 /// build can never answer a partial sum (the review of `44527f4`:
-/// the shape was a `debug_assert!` before). Pure, so the rows below pin
-/// it without a fabric.
+/// the shape was a `debug_assert!` before). A leg's reply is an error by
+/// its outcome, never by its bytes (ADR-0190 D2). Pure, so the rows below
+/// pin it without a fabric.
 pub(super) struct CountedFold {
     acc: i64,
-    error: Option<Vec<u8>>,
+    error: Option<OwnedReply>,
 }
 
 impl CountedFold {
-    pub(super) fn new(acc: i64, refusal: Option<Vec<u8>>) -> CountedFold {
+    pub(super) fn new(acc: i64, refusal: Option<OwnedReply>) -> CountedFold {
         CountedFold { acc, error: refusal }
     }
 
-    /// Fold one leg. Returns a buffer the fold did not keep (an error
+    /// Fold one leg. Returns a reply the fold did not keep (an error
     /// after the first), for the caller to recycle.
-    pub(super) fn leg(&mut self, outcome: OwnedOutcome, proto: Protocol) -> Option<Vec<u8>> {
+    pub(super) fn leg(&mut self, outcome: OwnedOutcome, proto: Protocol) -> Option<OwnedReply> {
         let error = match outcome {
             OwnedOutcome::Int(n) => {
                 self.acc = self.acc.saturating_add(n);
@@ -33,31 +34,25 @@ impl CountedFold {
             }
             // A typed error reply from a leg (a tiered `DBSIZE` drain
             // that could not read a twin, ADR-0093 A3).
-            OwnedOutcome::Bytes(bytes) if bytes.first() == Some(&b'-') => bytes,
-            OwnedOutcome::Err(code) => {
-                let mut bytes = Vec::new();
-                RespWriter::new(&mut bytes, proto)
-                    .error(&format!("ERR cross-cell execution failed ({code:?})"));
-                bytes
-            }
+            OwnedOutcome::Reply(reply) if reply.is_error() => reply,
+            OwnedOutcome::Err(_) => owned_error(Vec::new(), proto, CROSS_CELL_EXECUTION_FAILED),
             other @ (OwnedOutcome::Ok
-            | OwnedOutcome::Bytes(_)
+            | OwnedOutcome::Reply(_)
             | OwnedOutcome::Nil
             | OwnedOutcome::Bool(_)) => {
-                let mut bytes = Vec::new();
-                RespWriter::new(&mut bytes, proto).error(&format!(
+                let text = format!(
                     "ERR internal: a counted leg returned {} instead of a count (fail-closed)",
                     match other {
                         OwnedOutcome::Ok => "OK",
                         OwnedOutcome::Nil => "nil",
                         OwnedOutcome::Bool(_) => "a boolean",
-                        OwnedOutcome::Bytes(_) => "a non-error reply",
+                        OwnedOutcome::Reply(_) => "a non-error reply",
                         OwnedOutcome::Int(_) | OwnedOutcome::Err(_) => {
                             unreachable!("the outer match took Int and Err")
                         }
                     }
-                ));
-                bytes
+                );
+                owned_error(Vec::new(), proto, &text)
             }
         };
         if self.error.is_none() {
@@ -69,12 +64,30 @@ impl CountedFold {
     }
 
     /// The reply: the sum, or the first error seen.
-    pub(super) fn finish(self) -> Result<i64, Vec<u8>> {
+    pub(super) fn finish(self) -> Result<i64, OwnedReply> {
         match self.error {
             Some(error) => Err(error),
             None => Ok(self.acc),
         }
     }
+}
+
+/// The one text of a cross-cell refusal the client reads: a fabric
+/// `Err(code)`, a zero-byte leg, or a leg of a shape its fold cannot take
+/// (ADR-0190 D2). One `const`, read by every writer of it.
+pub(super) const CROSS_CELL_EXECUTION_FAILED: &str = "ERR cross-cell execution failed";
+
+/// The one text of a program leg the program cannot read: a `Success` leg
+/// its decoder refuses, or a value of a shape the program never asked for
+/// (ADR-0190 A1.2). One `const`, read by every writer of it.
+pub(super) const PROGRAM_REPLY_MALFORMED: &str = "ERR cross-cell program reply malformed";
+
+/// An error reply written into `buf` (cleared first), closed with its
+/// outcome.
+fn owned_error(buf: Vec<u8>, proto: Protocol, text: &str) -> OwnedReply {
+    let mut reply = OpenReply::new(buf);
+    RespWriter::new(reply.reply(), proto).error(text);
+    reply.finish()
 }
 
 /// All cells except this one (scatter targets).
@@ -88,7 +101,7 @@ pub(super) async fn ns_dbsize_local<O: PlaneObserver + 'static, F: SegmentFs + C
     origin: ExecOrigin,
     ns: NsId,
     proto: Protocol,
-) -> Result<i64, Vec<u8>> {
+) -> Result<i64, OwnedReply> {
     let tiered = shared.store.borrow().is_tiered(ns);
     let n = if tiered {
         tiered::dbsize_count(shared, ns, proto).await? as i64
@@ -106,30 +119,17 @@ pub(super) async fn ns_dbsize_local<O: PlaneObserver + 'static, F: SegmentFs + C
         ks.ns_store(ns).map_or(0, |store| store.len() as i64)
     };
     let now = shared.now.get();
-    let mut reply = Vec::new();
-    RespWriter::new(&mut reply, Protocol::Resp2).int(n);
+    let mut reply = OpenReply::new(Vec::new());
+    RespWriter::new(reply.reply(), Protocol::Resp2).int(n);
     shared.observer.borrow_mut().on_execute(
         shared.cell,
         origin,
         ExecScope::Ns(ns),
         &[b"DBSIZE"],
-        &reply,
+        reply.bytes(),
         now,
     );
     Ok(n)
-}
-
-/// A leg's error reply, re-rendered for the connection's protocol (the
-/// bytes are RESP2/RESP3-identical for a simple error — passed through).
-pub(super) fn return_error<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
-    error: Vec<u8>,
-    _proto: Protocol,
-) -> Vec<u8> {
-    let mut reply = shared.take_reply_buf();
-    reply.extend_from_slice(&error);
-    shared.recycle_reply_buf(error);
-    reply
 }
 
 pub(super) fn peer_cells<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -142,30 +142,28 @@ pub(super) fn error_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
     shared: &Shared<O, F>,
     proto: Protocol,
     text: &str,
-) -> Vec<u8> {
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).error(text);
-    reply
+) -> OwnedReply {
+    owned_error(shared.take_reply_buf(), proto, text)
 }
 
 pub(super) fn int_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     proto: Protocol,
     n: i64,
-) -> Vec<u8> {
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).int(n);
-    reply
+) -> OwnedReply {
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    RespWriter::new(reply.reply(), proto).int(n);
+    reply.finish()
 }
 
 pub(super) fn simple_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     proto: Protocol,
     text: &str,
-) -> Vec<u8> {
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).simple(text);
-    reply
+) -> OwnedReply {
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    RespWriter::new(reply.reply(), proto).simple(text);
+    reply.finish()
 }
 
 pub(super) fn run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -175,15 +173,15 @@ pub(super) fn run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     id: u64,
     db: u16,
     argv: &[&[u8]],
-) -> Vec<u8> {
-    let mut reply = shared.take_reply_buf();
+) -> OwnedReply {
+    let mut reply = OpenReply::new(shared.take_reply_buf());
     // A program's local leg (ADR-0115 D2).
-    shared.execute_owned_into(origin, argv, proto, id, db, None, true, &mut reply);
-    reply
+    shared.execute_owned_into(origin, argv, proto, id, db, None, true, reply.reply());
+    reply.finish()
 }
 
 /// One program step: execute `argv` on `cell` (locally or via Apply) and
-/// return its raw RESP reply bytes.
+/// return its reply, the outcome beside the bytes.
 async fn run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
@@ -192,19 +190,12 @@ async fn run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     id: u64,
     db: u16,
     argv: &[&[u8]],
-) -> Vec<u8> {
+) -> OwnedReply {
     if cell.0 == shared.cell.0 {
         return run_local(shared, origin, proto, id, db, argv);
     }
     match send_apply(shared, cell, ApplyOrigin::Program, proto, db, argv).await {
-        Ok(waiter) => match waiter.await {
-            OwnedOutcome::Bytes(bytes) => bytes,
-            outcome @ (OwnedOutcome::Ok
-            | OwnedOutcome::Int(_)
-            | OwnedOutcome::Nil
-            | OwnedOutcome::Bool(_)
-            | OwnedOutcome::Err(_)) => render_outcome(shared, outcome, proto),
-        },
+        Ok(waiter) => render_outcome(shared, waiter.await, proto),
         Err(refusal) => refusal,
     }
 }
@@ -222,6 +213,14 @@ async fn run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 /// set — the durable gate's soundness depends on it.
 pub(super) fn stages_despite_error(id: CommandId) -> bool {
     matches!(id, CommandId::Mset | CommandId::Msetnx)
+}
+
+/// Whether a write stages its durable effects: on a `Success` reply, or on
+/// any reply of a command that stages despite an error. The one staging
+/// gate for both execution paths (ADR-0190 D2), read from the reply's
+/// outcome, never its bytes.
+pub(super) fn stages(outcome: ReplyOutcome, id: CommandId) -> bool {
+    outcome == ReplyOutcome::Success || stages_despite_error(id)
 }
 
 /// Whether a command on a named namespace executes through the ordinary
@@ -274,7 +273,7 @@ pub(super) enum ScatterScope {
 /// namespace execution otherwise. Read-only programs only — a gated
 /// (durable-write) verdict here is a dispatch bug, answered as a typed
 /// error rather than an unfenced ack.
-async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+pub(super) async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     proto: Protocol,
@@ -282,7 +281,7 @@ async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     db: u16,
     ns: NsId,
     argv: &[&[u8]],
-) -> Vec<u8> {
+) -> OwnedReply {
     let (tiered, class) = {
         let ks = shared.store.borrow();
         (ks.is_tiered(ns), ks.ns_fsync_class(ns))
@@ -293,33 +292,55 @@ async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             tiered::TieredReply::Done(reply) => reply,
             tiered::TieredReply::Gated { reply, .. } => {
                 debug_assert!(false, "read-only scatter leg staged a durable effect");
-                shared.recycle_reply_buf(reply);
-                error_reply(shared, proto, "ERR cross-cell execution failed")
+                shared.recycle_reply_buf(reply.into_bytes());
+                error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED)
             }
         }
     } else {
-        let mut reply = shared.take_reply_buf();
-        shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), true, &mut reply);
-        reply
+        let mut reply = OpenReply::new(shared.take_reply_buf());
+        shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), true, reply.reply());
+        reply.finish()
     }
 }
 
 /// Ship one scatter leg to `to` under `scope` and return the reply
 /// waiter (`Apply` for the numbered database, `ApplyNs` for a named
 /// namespace). `Err` carries the refusal reply.
-async fn scatter_send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+pub(super) async fn scatter_send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     to: CellId,
     proto: Protocol,
     db: u16,
     scope: ScatterScope,
     argv: &[&[u8]],
-) -> Result<GateWait<u64, OwnedOutcome>, Vec<u8>> {
+) -> Result<GateWait<u64, OwnedOutcome>, OwnedReply> {
     match scope {
         ScatterScope::Db => send_apply(shared, to, ApplyOrigin::Client, proto, db, argv).await,
         ScatterScope::Ns(ns) => {
             send_apply_ns(shared, to, ApplyOrigin::Client, proto, ns, argv).await
         }
+    }
+}
+
+/// A command whose keys have one remote owner, shipped whole to it under
+/// `scope`: the owner executes it and its reply is the client's, staged as
+/// one remote op of the connection's window. The one single-owner send of
+/// both dispatch sites and of a `JSON.MGET` whose keys share an owner.
+pub(super) async fn send_whole<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    owner: CellId,
+    proto: Protocol,
+    db: u16,
+    scope: ScatterScope,
+    argv: &[&[u8]],
+    inflight: &mut usize,
+) -> PendingReply {
+    match scatter_send(shared, owner, proto, db, scope, argv).await {
+        Ok(waiter) => {
+            *inflight += 1;
+            PendingReply::Remote { waiter, proto }
+        }
+        Err(refusal) => PendingReply::Done(refusal),
     }
 }
 
@@ -334,7 +355,7 @@ async fn scatter_run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     db: u16,
     scope: ScatterScope,
     argv: &[&[u8]],
-) -> Vec<u8> {
+) -> OwnedReply {
     match scope {
         ScatterScope::Db => run_on(shared, origin, cell, proto, id, db, argv).await,
         ScatterScope::Ns(ns) => {
@@ -342,14 +363,7 @@ async fn scatter_run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 return ns_run_local(shared, origin, proto, id, db, ns, argv).await;
             }
             match send_apply_ns(shared, cell, ApplyOrigin::Program, proto, ns, argv).await {
-                Ok(waiter) => match waiter.await {
-                    OwnedOutcome::Bytes(bytes) => bytes,
-                    outcome @ (OwnedOutcome::Ok
-                    | OwnedOutcome::Int(_)
-                    | OwnedOutcome::Nil
-                    | OwnedOutcome::Bool(_)
-                    | OwnedOutcome::Err(_)) => render_outcome(shared, outcome, proto),
-                },
+                Ok(waiter) => render_outcome(shared, waiter.await, proto),
                 Err(refusal) => refusal,
             }
         }
@@ -365,19 +379,19 @@ async fn count_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     db: u16,
     name: &[u8],
     key: &[u8],
-) -> Result<i64, Vec<u8>> {
+) -> Result<i64, OwnedReply> {
     if cell.0 == shared.cell.0 {
         return Ok(shared.apply_counted(origin, name, key, db));
     }
     match send_apply(shared, cell, ApplyOrigin::Program, Protocol::Resp2, db, &[name, key]).await {
         Ok(waiter) => match waiter.await {
             OwnedOutcome::Int(n) => Ok(n),
-            OwnedOutcome::Ok
-            | OwnedOutcome::Bytes(_)
-            | OwnedOutcome::Nil
-            | OwnedOutcome::Bool(_)
-            | OwnedOutcome::Err(_) => {
-                Err(error_reply(shared, proto, "ERR cross-cell execution failed"))
+            OwnedOutcome::Reply(reply) => {
+                shared.recycle_reply_buf(reply.into_bytes());
+                Err(error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED))
+            }
+            OwnedOutcome::Ok | OwnedOutcome::Nil | OwnedOutcome::Bool(_) | OwnedOutcome::Err(_) => {
+                Err(error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED))
             }
         },
         Err(refusal) => Err(refusal),
@@ -394,7 +408,7 @@ pub(super) async fn program_msetnx<O: PlaneObserver + 'static, F: SegmentFs + Cl
     id: u64,
     db: u16,
     argv: &[&[u8]],
-) -> Vec<u8> {
+) -> OwnedReply {
     if argv.len().is_multiple_of(2) {
         return error_reply(shared, proto, "ERR wrong number of arguments for 'msetnx' command");
     }
@@ -414,10 +428,10 @@ pub(super) async fn program_msetnx<O: PlaneObserver + 'static, F: SegmentFs + Cl
         let reply =
             run_on(shared, origin, owner, Protocol::Resp2, id, db, &[b"SET", argv[i], argv[i + 1]])
                 .await;
-        if reply.first() == Some(&b'-') {
+        if reply.is_error() {
             return reply;
         }
-        shared.recycle_reply_buf(reply);
+        shared.recycle_reply_buf(reply.into_bytes());
         i += 2;
     }
     int_reply(shared, proto, 1)
@@ -435,7 +449,7 @@ pub(super) async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clon
     db: u16,
     cmd: CommandId,
     argv: &[&[u8]],
-) -> Vec<u8> {
+) -> OwnedReply {
     let (source, target) = (argv[1], argv[2]);
     let target_owner = shared.router.cell_of(SlotRouter::slot_of(target));
     let (target_db, replace) = match move_options(cmd, argv, db) {
@@ -452,7 +466,7 @@ pub(super) async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clon
         None => return error_reply(shared, proto, "ERR no such key"),
     };
     if deadline < -1 {
-        return error_reply(shared, proto, "ERR cross-cell program reply malformed");
+        return error_reply(shared, proto, PROGRAM_REPLY_MALFORMED);
     }
     if cmd == CommandId::Renamenx {
         // Preserve the existing-target no-op even under OOM. SET NX below
@@ -467,17 +481,17 @@ pub(super) async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clon
     let expiry = (deadline >= 0).then(|| crate::exec::fmt_u64(&mut deadline_buf, deadline as u64));
     let put = move_put_args(cmd, target, &value, expiry, replace);
     let reply = run_on(shared, origin, target_owner, Protocol::Resp2, id, target_db, &put).await;
-    if reply.first() == Some(&b'-') {
+    if reply.is_error() {
         return reply;
     }
-    let applied = reply == b"+OK\r\n";
-    let skipped = reply == b"$-1\r\n";
-    shared.recycle_reply_buf(reply);
+    let applied = reply.bytes() == b"+OK\r\n";
+    let skipped = reply.bytes() == b"$-1\r\n";
+    shared.recycle_reply_buf(reply.into_bytes());
     if skipped && !replace {
         return int_reply(shared, proto, 0);
     }
     if !applied {
-        return error_reply(shared, proto, "ERR cross-cell program reply malformed");
+        return error_reply(shared, proto, PROGRAM_REPLY_MALFORMED);
     }
     if cmd == CommandId::Copy {
         return int_reply(shared, proto, 1);
@@ -528,7 +542,7 @@ async fn move_read<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     db: u16,
     source: &[u8],
     command: CommandId,
-) -> Result<Option<(Vec<u8>, i64)>, Vec<u8>> {
+) -> Result<Option<(Vec<u8>, i64)>, OwnedReply> {
     let owner = shared.router.cell_of(SlotRouter::slot_of(source));
     let args: &[&[u8]] = if command == CommandId::Copy {
         &[b"INF.PEEK", source, b"ABS"]
@@ -536,14 +550,12 @@ async fn move_read<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         &[b"INF.PEEK", source, b"ABS", b"NOSTATS"]
     };
     let raw = run_on(shared, origin, owner, Protocol::Resp2, id, db, args).await;
-    if raw.first() == Some(&b'-') {
-        return Err(raw);
-    }
-    let snapshot = parse_take_reply(&raw);
-    shared.recycle_reply_buf(raw);
-    snapshot.ok_or_else(|| {
-        error_reply(shared, Protocol::Resp2, "ERR cross-cell program reply malformed")
-    })
+    let snapshot = match raw.success() {
+        Ok(view) => parse_take_reply(view),
+        Err(ErrorPassthrough) => return Err(raw),
+    };
+    shared.recycle_reply_buf(raw.into_bytes());
+    snapshot.ok_or_else(|| error_reply(shared, Protocol::Resp2, PROGRAM_REPLY_MALFORMED))
 }
 
 /// Only an exact match at the source authorizes removal after a successful
@@ -556,7 +568,7 @@ async fn move_remove<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     source: &[u8],
     value: &[u8],
     deadline_text: &[u8],
-) -> Result<(), Vec<u8>> {
+) -> Result<(), OwnedReply> {
     let source_owner = shared.router.cell_of(SlotRouter::slot_of(source));
     let reply = run_on(
         shared,
@@ -568,12 +580,12 @@ async fn move_remove<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         &[b"INF.TAKE", source, b"IF", value, deadline_text],
     )
     .await;
-    if reply.first() == Some(&b'-') {
+    if reply.is_error() {
         return Err(reply);
     }
-    let removed = reply == b":1\r\n";
-    let changed = reply == b":0\r\n";
-    shared.recycle_reply_buf(reply);
+    let removed = reply.bytes() == b":1\r\n";
+    let changed = reply.bytes() == b":0\r\n";
+    shared.recycle_reply_buf(reply.into_bytes());
     if changed {
         return Err(error_reply(
             shared,
@@ -582,7 +594,7 @@ async fn move_remove<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         ));
     }
     if !removed {
-        return Err(error_reply(shared, Protocol::Resp2, "ERR cross-cell program reply malformed"));
+        return Err(error_reply(shared, Protocol::Resp2, PROGRAM_REPLY_MALFORMED));
     }
     Ok(())
 }
@@ -624,14 +636,16 @@ pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clon
     db: u16,
     scope: ScatterScope,
     argv: &[&[u8]],
-) -> Vec<u8> {
+) -> OwnedReply {
     let local = match scope {
         ScatterScope::Db => run_local(shared, origin, proto, id, db, argv),
         ScatterScope::Ns(ns) => ns_run_local(shared, origin, proto, id, db, ns, argv).await,
     };
-    let Some((mut total, local_off)) = parse_array_header(&local) else {
-        return local; // error passthrough
+    let local = match read_array_leg(shared, proto, local) {
+        Ok(leg) => leg,
+        Err(answer) => return answer,
     };
+    let mut total = local.count();
     let mut waiters = Vec::new();
     for cell in peer_cells(shared) {
         match scatter_send(shared, cell, proto, db, scope, argv).await {
@@ -639,34 +653,39 @@ pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clon
             Err(refusal) => return refusal,
         }
     }
-    let mut bodies: Vec<(Vec<u8>, usize)> = Vec::new();
+    let mut bodies: Vec<ArrayLeg> = Vec::new();
     for waiter in waiters {
         match waiter.await {
-            OwnedOutcome::Bytes(bytes) => {
-                let Some((n, off)) = parse_array_header(&bytes) else {
-                    return bytes; // peer error passthrough
-                };
-                total += n;
-                bodies.push((bytes, off));
-            }
+            OwnedOutcome::Reply(reply) => match read_array_leg(shared, proto, reply) {
+                Ok(leg) => {
+                    total += leg.count();
+                    bodies.push(leg);
+                }
+                Err(answer) => return answer,
+            },
             OwnedOutcome::Ok
             | OwnedOutcome::Int(_)
             | OwnedOutcome::Nil
             | OwnedOutcome::Bool(_)
             | OwnedOutcome::Err(_) => {
-                return error_reply(shared, proto, "ERR cross-cell execution failed");
+                return error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED);
             }
         }
     }
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).array_header(total);
-    reply.extend_from_slice(&local[local_off..]);
-    shared.recycle_reply_buf(local);
-    for (bytes, off) in bodies {
-        reply.extend_from_slice(&bytes[off..]);
-        shared.recycle_reply_buf(bytes);
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    {
+        let mut w = RespWriter::new(reply.reply(), proto);
+        w.array_header(total);
+        w.encoded(local.body());
+        for body in &bodies {
+            w.encoded(body.body());
+        }
     }
-    reply
+    shared.recycle_reply_buf(local.into_reply().into_bytes());
+    for body in bodies {
+        shared.recycle_reply_buf(body.into_reply().into_bytes());
+    }
+    reply.finish()
 }
 
 /// Scattered SCAN: the cursor packs `{cell:16 | per-cell cursor:48}`; one
@@ -680,7 +699,7 @@ pub(super) async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clon
     db: u16,
     scope: ScatterScope,
     argv: &[&[u8]],
-) -> Vec<u8> {
+) -> OwnedReply {
     let Some(cursor) = crate::exec::parse_cursor(argv[1]) else {
         return error_reply(shared, proto, "ERR invalid cursor");
     };
@@ -693,9 +712,11 @@ pub(super) async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clon
     let mut sub: Vec<&[u8]> = argv.to_vec();
     sub[1] = local_cursor;
     let raw = scatter_run_on(shared, origin, CellId(target), proto, id, db, scope, &sub).await;
-    let Some((inner, rest_at)) = parse_scan_head(&raw) else {
-        return raw; // error passthrough
+    let leg = match read_scan_leg(shared, proto, raw) {
+        Ok(leg) => leg,
+        Err(answer) => return answer,
     };
+    let inner = leg.cursor();
     let next = if inner != 0 {
         (u64::from(target) << SCAN_CELL_SHIFT) | inner
     } else if target + 1 < shared.cells {
@@ -703,16 +724,16 @@ pub(super) async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clon
     } else {
         0
     };
-    let mut reply = shared.take_reply_buf();
+    let mut reply = OpenReply::new(shared.take_reply_buf());
     {
-        let mut w = RespWriter::new(&mut reply, proto);
+        let mut w = RespWriter::new(reply.reply(), proto);
         w.array_header(2);
         let mut next_buf = [0u8; 20];
         w.bulk(crate::exec::fmt_u64(&mut next_buf, next));
+        w.encoded(leg.rest());
     }
-    reply.extend_from_slice(&raw[rest_at..]);
-    shared.recycle_reply_buf(raw);
-    reply
+    shared.recycle_reply_buf(leg.into_reply().into_bytes());
+    reply.finish()
 }
 
 /// Scattered RANDOMKEY: two-level random — a random starting cell, then the
@@ -728,19 +749,19 @@ pub(super) async fn program_randomkey<
     db: u16,
     scope: ScatterScope,
     argv: &[&[u8]],
-) -> Vec<u8> {
+) -> OwnedReply {
     let start = (crate::exec::next_rand(&shared.node) % u64::from(shared.cells)) as u16;
     for i in 0..shared.cells {
         let cell = CellId((start + i) % shared.cells);
         let raw = scatter_run_on(shared, origin, cell, proto, id, db, scope, argv).await;
-        if raw != b"$-1\r\n" && raw != b"_\r\n" {
+        if raw.bytes() != b"$-1\r\n" && raw.bytes() != b"_\r\n" {
             return raw;
         }
-        shared.recycle_reply_buf(raw);
+        shared.recycle_reply_buf(raw.into_bytes());
     }
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).null();
-    reply
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    RespWriter::new(reply.reply(), proto).null();
+    reply.finish()
 }
 
 /// Decimal text of `v` in a caller-owned stack buffer (the publisher tag
@@ -767,8 +788,111 @@ pub(super) fn parse_publisher_tag(conn: &[u8], seq: &[u8]) -> Option<(ConnKey, u
     Some((ConnKey::unpack(conn), seq))
 }
 
-/// `*N\r\n` array header → `(N, body offset)`. `None` for errors/nulls.
-/// Public for the fuzz target.
+/// An array leg its reader accepted (`KEYS`, `PUBSUB CHANNELS`): the reply,
+/// its element count and where its body starts. Only `read_array_leg`
+/// builds one, so every leg a merge pastes had its outcome read.
+#[derive(Debug)]
+pub(super) struct ArrayLeg {
+    reply: OwnedReply,
+    count: usize,
+    body_at: usize,
+}
+
+impl ArrayLeg {
+    pub(super) fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The elements, as the merge pastes them under its own header.
+    pub(super) fn body(&self) -> &[u8] {
+        &self.reply.bytes()[self.body_at..]
+    }
+
+    /// The reply, for the pool's recycle once its body is pasted.
+    pub(super) fn into_reply(self) -> OwnedReply {
+        self.reply
+    }
+}
+
+/// A `SCAN` leg its reader accepted: the reply, the cell's next cursor and
+/// where the keys array starts. Only `read_scan_leg` builds one.
+#[derive(Debug)]
+pub(super) struct ScanLeg {
+    reply: OwnedReply,
+    cursor: u64,
+    rest_at: usize,
+}
+
+impl ScanLeg {
+    pub(super) fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// The keys array, as the program pastes it after its own cursor.
+    pub(super) fn rest(&self) -> &[u8] {
+        &self.reply.bytes()[self.rest_at..]
+    }
+
+    /// The reply, for the pool's recycle once its keys are pasted.
+    pub(super) fn into_reply(self) -> OwnedReply {
+        self.reply
+    }
+}
+
+/// An array leg's three answers (ADR-0190 A1.2): an `Error` leg is the
+/// reply, untouched; a `Success` leg without an array header answers
+/// `PROGRAM_REPLY_MALFORMED`; a well-formed leg is the leg.
+pub(super) fn read_array_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    proto: Protocol,
+    reply: OwnedReply,
+) -> Result<ArrayLeg, OwnedReply> {
+    let (reply, (count, body_at)) = read_leg(shared, proto, reply, parse_array_header)?;
+    Ok(ArrayLeg { reply, count, body_at })
+}
+
+/// A `SCAN` leg's three answers, as `read_array_leg`'s for its head.
+pub(super) fn read_scan_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    proto: Protocol,
+    reply: OwnedReply,
+) -> Result<ScanLeg, OwnedReply> {
+    let (reply, (cursor, rest_at)) = read_leg(shared, proto, reply, parse_scan_head)?;
+    Ok(ScanLeg { reply, cursor, rest_at })
+}
+
+/// The one rule behind every leg reader: the outcome is read first, by
+/// type, so an `Error` leg passes through whole and `decode` sees only a
+/// `Success` leg's bytes; one it refuses is a malformed peer reply, its
+/// buffer recycled and the refusal written into a fresh one.
+pub(super) fn read_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static, T>(
+    shared: &Shared<O, F>,
+    proto: Protocol,
+    reply: OwnedReply,
+    decode: impl FnOnce(SuccessView<'_>) -> Option<T>,
+) -> Result<(OwnedReply, T), OwnedReply> {
+    let decoded = match reply.success() {
+        Ok(view) => decode(view),
+        Err(ErrorPassthrough) => return Err(reply),
+    };
+    match decoded {
+        Some(value) => Ok((reply, value)),
+        None => {
+            shared.recycle_reply_buf(reply.into_bytes());
+            Err(error_reply(shared, proto, PROGRAM_REPLY_MALFORMED))
+        }
+    }
+}
+
+/// `*N\r\n` array header → `(N, body offset)`. `None` for a null array or
+/// any other shape. A value decoder over a `SuccessView`: its caller read
+/// the leg's outcome by type, so `None` means a malformed success, which
+/// `read_array_leg` answers (ADR-0190 A1.2). Public for the fuzz target,
+/// and never over a reply's raw bytes:
+///
+/// ```compile_fail,E0308
+/// let _ = inf_server::parse_array_header(b"*0\r\n");
+/// ```
 #[doc(hidden)]
 #[cfg_attr(
     not(test),
@@ -779,7 +903,9 @@ pub(super) fn parse_publisher_tag(conn: &[u8], seq: &[u8]) -> Option<(ConnKey, u
         clippy::arithmetic_side_effects
     )
 )]
-pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
+pub fn parse_array_header(reply: SuccessView<'_>) -> Option<(usize, usize)> {
+    let raw = reply.bytes();
+    // reply-outcome-allow: a value decoder over a SuccessView, whose outcome its caller read
     let rest = raw.strip_prefix(b"*")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let n: i64 = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
@@ -790,7 +916,14 @@ pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
 /// `*2\r\n$N\r\n<cursor>\r\n…` SCAN reply head → `(cursor, keys offset)`.
 /// Every bound is checked before it is indexed (F-L12-06): the cursor's
 /// trailing CRLF must exist, so the offset never lands past the buffer
-/// (`&raw[rest_at..]` at the caller). Public for the fuzz target.
+/// `ScanLeg::rest` slices. A value decoder over a `SuccessView`:
+/// its caller read the leg's outcome by type, so `None` means a malformed
+/// success, which `read_scan_leg` answers (ADR-0190 A1.2). Public for the
+/// fuzz target, and never over a reply's raw bytes:
+///
+/// ```compile_fail,E0308
+/// let _ = inf_server::parse_scan_head(b"*2\r\n$1\r\n0\r\n*0\r\n");
+/// ```
 #[doc(hidden)]
 #[cfg_attr(
     not(test),
@@ -801,7 +934,9 @@ pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
         clippy::arithmetic_side_effects
     )
 )]
-pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
+pub fn parse_scan_head(reply: SuccessView<'_>) -> Option<(u64, usize)> {
+    let raw = reply.bytes();
+    // reply-outcome-allow: a value decoder over a SuccessView, whose outcome its caller read
     let rest = raw.strip_prefix(b"*2\r\n$")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let len: usize = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
@@ -818,6 +953,13 @@ pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
 /// Two-field snapshot reply: `*-1` means missing; `*2 [$value][:time]`
 /// carries milliseconds (-1 means no expiry). Legacy forms return remaining
 /// TTL; the move program's `INF.PEEK key ABS` returns absolute Unix expiry.
+/// A value decoder over a `SuccessView`: its one caller, the move's read
+/// leg, read the outcome by type (ADR-0190 A1.2). Public for the fuzz
+/// targets, and never over a reply's raw bytes:
+///
+/// ```compile_fail,E0308
+/// let _ = inf_server::parse_take_reply(b"*-1\r\n");
+/// ```
 #[cfg_attr(
     not(test),
     deny(
@@ -827,10 +969,12 @@ pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
         clippy::arithmetic_side_effects
     )
 )]
-pub fn parse_take_reply(raw: &[u8]) -> Option<Option<(Vec<u8>, i64)>> {
+pub fn parse_take_reply(reply: SuccessView<'_>) -> Option<Option<(Vec<u8>, i64)>> {
+    let raw = reply.bytes();
     if raw == b"*-1\r\n" {
         return Some(None);
     }
+    // reply-outcome-allow: a value decoder over a SuccessView, whose outcome its caller read
     let rest = raw.strip_prefix(b"*2\r\n$")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let len: usize = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
@@ -922,6 +1066,16 @@ pub(super) fn extract_keys_iter<'v, 'a>(
     meta: &inf_wire::CommandMeta,
     argv: &'v [&'a [u8]],
 ) -> impl Iterator<Item = &'a [u8]> + 'v {
+    key_positions(meta, argv).map(move |i| argv[i])
+}
+
+/// The argv positions of a command's keys, in the key spec's order: the one
+/// reading of the spec behind [`extract_keys_iter`] and the owner split, so
+/// both route the same keys. Every position is inside `argv`.
+pub(super) fn key_positions(
+    meta: &inf_wire::CommandMeta,
+    argv: &[&[u8]],
+) -> impl Iterator<Item = usize> + use<> {
     let spec = inf_wire::key_spec(meta, argv.get(1).copied());
     let last = if spec.last >= 0 {
         spec.last as usize
@@ -933,24 +1087,41 @@ pub(super) fn extract_keys_iter<'v, 'a>(
     } else {
         (usize::from(spec.first), last)
     };
-    (start..=last).step_by(usize::from(spec.step).max(1)).map_while(move |i| argv.get(i).copied())
+    let len = argv.len();
+    (start..=last).step_by(usize::from(spec.step).max(1)).take_while(move |&i| i < len)
 }
 
 #[cfg(test)]
 mod scatter_reply_parsers {
+    use super::{OpenReply, OwnedReply, ReplyOutcome, SuccessView};
     use super::{parse_array_header, parse_scan_head, parse_take_reply};
+
+    /// `raw` as a `Success` leg reply. An empty `raw` is a reply that wrote
+    /// nothing, the one empty view a decoder meets: `received` refuses zero
+    /// bytes, a finished empty reply does not.
+    fn leg(raw: &[u8]) -> OwnedReply {
+        match OwnedReply::received(raw.to_vec(), ReplyOutcome::Success) {
+            Ok(reply) => reply,
+            Err(_) => OpenReply::new(Vec::new()).finish(),
+        }
+    }
+
+    fn view(reply: &OwnedReply) -> SuccessView<'_> {
+        reply.success().expect("a Success reply has a view")
+    }
 
     /// F-L12-06: a SCAN head without its trailing CRLF must be refused,
     /// never answered with an offset past the buffer.
     #[test]
     fn scan_head_without_a_terminator_is_refused() {
-        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0\r\n"), Some((0, 11)));
-        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0"), None);
-        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0\r"), None);
-        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0\n\n"), None);
-        assert_eq!(parse_scan_head(b"*2\r\n$2\r\n0"), None);
+        let head = |raw: &[u8]| parse_scan_head(view(&leg(raw)));
+        assert_eq!(head(b"*2\r\n$1\r\n0\r\n"), Some((0, 11)));
+        assert_eq!(head(b"*2\r\n$1\r\n0"), None);
+        assert_eq!(head(b"*2\r\n$1\r\n0\r"), None);
+        assert_eq!(head(b"*2\r\n$1\r\n0\n\n"), None);
+        assert_eq!(head(b"*2\r\n$2\r\n0"), None);
         let ok = b"*2\r\n$3\r\n123\r\n*0\r\n";
-        let (cursor, at) = parse_scan_head(ok).expect("well formed");
+        let (cursor, at) = head(ok).expect("well formed");
         assert_eq!((cursor, &ok[at..]), (123, &b"*0\r\n"[..]));
     }
 
@@ -958,17 +1129,18 @@ mod scatter_reply_parsers {
     /// maximum, and one past it; the offset is always `*` + digits + CRLF.
     #[test]
     fn array_header_count_is_narrowed_never_wrapped() {
-        assert_eq!(parse_array_header(b"*0\r\n"), Some((0, 4)));
-        assert_eq!(parse_array_header(b"*1\r\nx"), Some((1, 4)));
-        assert_eq!(parse_array_header(b"*-1\r\n"), None, "a null array has no body");
-        assert_eq!(parse_array_header(b"*-9223372036854775808\r\n"), None);
+        let header = |raw: &[u8]| parse_array_header(view(&leg(raw)));
+        assert_eq!(header(b"*0\r\n"), Some((0, 4)));
+        assert_eq!(header(b"*1\r\nx"), Some((1, 4)));
+        assert_eq!(header(b"*-1\r\n"), None, "a null array has no body");
+        assert_eq!(header(b"*-9223372036854775808\r\n"), None);
         assert_eq!(
-            parse_array_header(b"*9223372036854775807\r\n"),
+            header(b"*9223372036854775807\r\n"),
             Some((i64::MAX as usize, 22)),
             "the largest count a peer can state"
         );
-        assert_eq!(parse_array_header(b"*9223372036854775808\r\n"), None, "past i64");
-        assert_eq!(parse_array_header(b"*\r\n"), None, "no digits");
+        assert_eq!(header(b"*9223372036854775808\r\n"), None, "past i64");
+        assert_eq!(header(b"*\r\n"), None, "no digits");
     }
 
     /// The keys offset is the head's exact length, at the smallest cursor
@@ -978,11 +1150,11 @@ mod scatter_reply_parsers {
         for cursor in ["0", "18446744073709551615"] {
             let head = format!("*2\r\n${}\r\n{cursor}\r\n", cursor.len());
             let raw = format!("{head}*0\r\n");
-            let parsed = parse_scan_head(raw.as_bytes()).expect("a well-formed head");
+            let parsed = parse_scan_head(view(&leg(raw.as_bytes()))).expect("a well-formed head");
             assert_eq!(parsed, (cursor.parse().expect("u64"), head.len()));
         }
         assert_eq!(
-            parse_scan_head(b"*2\r\n$18446744073709551615\r\n0\r\n"),
+            parse_scan_head(view(&leg(b"*2\r\n$18446744073709551615\r\n0\r\n"))),
             None,
             "length past the buffer"
         );
@@ -1005,11 +1177,16 @@ mod scatter_reply_parsers {
         ];
         for raw in samples {
             for n in 0..=raw.len() {
-                let _ = parse_scan_head(&raw[..n]);
-                let _ = parse_take_reply(&raw[..n]);
-                let _ = parse_array_header(&raw[..n]);
+                let reply = leg(&raw[..n]);
+                let _ = parse_scan_head(view(&reply));
+                let _ = parse_take_reply(view(&reply));
+                let _ = parse_array_header(view(&reply));
             }
         }
+        let nothing = leg(b"");
+        assert_eq!(parse_array_header(view(&nothing)), None, "an empty view is refused");
+        assert_eq!(parse_scan_head(view(&nothing)), None);
+        assert_eq!(parse_take_reply(view(&nothing)), None);
     }
 }
 
@@ -1017,9 +1194,18 @@ mod scatter_reply_parsers {
 mod counted_fold_tests {
     use inf_fabric::ErrCode;
 
-    use super::{CountedFold, OwnedOutcome, Protocol};
+    use super::{CountedFold, OwnedOutcome, OwnedReply, Protocol, ReplyOutcome};
 
-    fn fold(legs: Vec<OwnedOutcome>) -> Result<i64, Vec<u8>> {
+    /// A leg's reply as the decode builds it, its outcome from the wire.
+    fn leg_reply(bytes: &[u8], outcome: ReplyOutcome) -> OwnedReply {
+        OwnedReply::received(bytes.to_vec(), outcome).expect("a non-empty reply")
+    }
+
+    fn error(bytes: &[u8]) -> OwnedReply {
+        leg_reply(bytes, ReplyOutcome::Error)
+    }
+
+    fn fold(legs: Vec<OwnedOutcome>) -> Result<i64, OwnedReply> {
         let mut fold = CountedFold::new(0, None);
         for leg in legs {
             let _ = fold.leg(leg, Protocol::Resp2);
@@ -1034,16 +1220,17 @@ mod counted_fold_tests {
         assert_eq!(
             fold(vec![
                 OwnedOutcome::Int(2),
-                OwnedOutcome::Bytes(b"-ERR twin\r\n".to_vec()),
+                OwnedOutcome::Reply(error(b"-ERR twin\r\n")),
                 OwnedOutcome::Int(3),
             ]),
-            Err(b"-ERR twin\r\n".to_vec())
+            Err(error(b"-ERR twin\r\n"))
         );
     }
 
     /// The review of `44527f4`: an unexpected leg outcome was a
     /// `debug_assert!`, so a release build summed the rest. Now every
-    /// non-count leg is a typed error and no integer is ever returned.
+    /// non-count leg is a typed error and no integer is ever returned;
+    /// a success reply is foreign whatever its bytes.
     #[test]
     fn an_injected_typed_error_or_foreign_shape_never_yields_a_count() {
         for foreign in [
@@ -1052,31 +1239,37 @@ mod counted_fold_tests {
             OwnedOutcome::Ok,
             OwnedOutcome::Nil,
             OwnedOutcome::Bool(true),
-            OwnedOutcome::Bytes(b"+OK\r\n".to_vec()),
+            OwnedOutcome::Reply(leg_reply(b"+OK\r\n", ReplyOutcome::Success)),
+            OwnedOutcome::Reply(leg_reply(b"-ERR tagged success\r\n", ReplyOutcome::Success)),
         ] {
             let label = format!("{foreign:?}");
             let reply =
                 fold(vec![OwnedOutcome::Int(2), foreign, OwnedOutcome::Int(5)]).expect_err(&label);
-            assert_eq!(reply.first(), Some(&b'-'), "{label}: {reply:?}");
-            let text = String::from_utf8_lossy(&reply);
-            assert!(text.starts_with("-ERR "), "{label}: {text}");
+            assert!(reply.is_error(), "{label}: {reply:?}");
         }
     }
 
-    /// The first error wins; later ones are handed back for recycling,
+    /// The first error wins; later replies are handed back for recycling,
     /// and a refusal already in hand outranks every leg.
     #[test]
     fn the_first_error_wins_and_later_buffers_are_handed_back() {
         let mut fold = CountedFold::new(0, None);
-        assert!(fold.leg(OwnedOutcome::Bytes(b"-ERR one\r\n".to_vec()), Protocol::Resp2).is_none());
+        assert!(fold.leg(OwnedOutcome::Reply(error(b"-ERR one\r\n")), Protocol::Resp2).is_none());
         assert_eq!(
-            fold.leg(OwnedOutcome::Bytes(b"-ERR two\r\n".to_vec()), Protocol::Resp2),
-            Some(b"-ERR two\r\n".to_vec())
+            fold.leg(OwnedOutcome::Reply(error(b"-ERR two\r\n")), Protocol::Resp2),
+            Some(error(b"-ERR two\r\n"))
         );
         assert!(fold.leg(OwnedOutcome::Err(ErrCode::WrongType), Protocol::Resp2).is_some());
-        assert_eq!(fold.finish(), Err(b"-ERR one\r\n".to_vec()));
-        let mut refused = CountedFold::new(4, Some(b"-ERR refused\r\n".to_vec()));
+        assert_eq!(fold.finish(), Err(error(b"-ERR one\r\n")));
+        let mut refused = CountedFold::new(4, Some(error(b"-ERR refused\r\n")));
         assert!(refused.leg(OwnedOutcome::Int(1), Protocol::Resp2).is_none());
-        assert_eq!(refused.finish(), Err(b"-ERR refused\r\n".to_vec()));
+        assert_eq!(refused.finish(), Err(error(b"-ERR refused\r\n")));
+    }
+
+    /// A fabric refusal renders the one cross-cell refusal text.
+    #[test]
+    fn a_refused_leg_renders_the_one_refusal_text() {
+        let reply = fold(vec![OwnedOutcome::Err(ErrCode::EmptyReply)]).expect_err("refused");
+        assert_eq!(reply.bytes(), b"-ERR cross-cell execution failed\r\n");
     }
 }

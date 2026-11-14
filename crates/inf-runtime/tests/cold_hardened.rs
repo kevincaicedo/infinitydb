@@ -41,8 +41,8 @@ use inf_log::{
     tier_frame_span,
 };
 use inf_runtime::{
-    BackendDriver, CellExecutor, ColdReads, ColdWait, PollImmediate, RawFd, ReadClass, TierFileId,
-    TokenClass, UringDriver, Wait,
+    BackendDriver, CellExecutor, ColdReads, ColdReceipt, ColdTurn, ColdWait, Completion,
+    CompletionResult, PollImmediate, RawFd, ReadClass, TierFileId, TokenClass, UringDriver, Wait,
 };
 use inf_store::KeyHasher;
 use inf_store::{
@@ -232,13 +232,7 @@ fn pump(ctx: &Rc<RefCell<Ctx>>, ex: &mut CellExecutor) {
             )
             .expect("submit");
     }
-    {
-        let ctx = ctx.borrow();
-        for completion in out {
-            assert_eq!(completion.token.class(), TokenClass::TierRead);
-            ctx.cold.on_completion(completion.token, completion.result, 0);
-        }
-    }
+    route(&ctx.borrow().cold, &mut out, 0);
     ex.run_ready(64);
 }
 
@@ -267,6 +261,7 @@ struct Corpus {
 fn build_demoted_corpus(
     dir: &std::path::Path,
 ) -> (Rc<RefCell<Ctx>>, Corpus, TierWriter<StdSegmentFs>) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     assert!(
         ks.materialize_tiered(
@@ -278,6 +273,7 @@ fn build_demoted_corpus(
             },
             DemotionConfig::for_budget(RING as u64, PAGE as u64),
             64,
+            &census,
         )
         .is_ok()
     );
@@ -472,4 +468,23 @@ fn cancellation_and_unlink_discipline_on_uring() {
     assert!(served_cold);
     assert_eq!(ctx.borrow().cold.reconcile(), Ok(()));
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Records a pump's `TierRead` completions in the host, each outcome as the
+/// dispatch decides it, then serves the pump's one turn of delivery
+/// (ADR-0181 R1, R2): a turn's allowance a pump, so a later pump delivers
+/// what this one left.
+fn route(cold: &ColdReads, out: &mut Vec<Completion>, now_us: u64) {
+    for completion in out.drain(..) {
+        assert_eq!(completion.token.class(), TokenClass::TierRead);
+        let outcome = match completion.result {
+            CompletionResult::TierRead => Ok(()),
+            CompletionResult::Error { errno, .. } => Err(errno),
+            other => panic!("a tier read completed as {other:?}"),
+        };
+        let receipt = cold.record_completion(completion.token, outcome, now_us);
+        assert_eq!(receipt, ColdReceipt::Recorded, "a receipt names an issued read");
+    }
+    let mut turn = ColdTurn::begin();
+    let _ = cold.deliver_ready(turn.delivery(), now_us);
 }

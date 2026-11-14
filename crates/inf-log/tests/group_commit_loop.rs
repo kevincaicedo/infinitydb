@@ -21,8 +21,8 @@ use inf_foundation::bounded::CapCensus;
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
-    FsyncClass, Lsn, ReaderConfig, SegmentConfig, SegmentId, SegmentReader, StagingConfig,
-    SyncReason, scan_log_dir,
+    FsyncClass, LogGeometry, Lsn, ReaderConfig, SegmentConfig, SegmentId, SegmentReader,
+    StagingConfig, SyncReason, scan_log_dir,
 };
 use inf_runtime::{CellLoop, LoopConfig, TokenClass};
 use support::{DurablePlane, IoMode, ScriptedDriver, job_key, job_value, test_dir};
@@ -35,7 +35,8 @@ fn cell(
     segment_bytes: u32,
 ) -> (TestLoop, DurablePlane, Rc<VirtualClock>) {
     let clock = Rc::new(VirtualClock::new(Nanos::ZERO));
-    let (_census, serve_mark) = CapCensus::new(CellId(0));
+    let (census, serve_mark) = CapCensus::new(CellId(0));
+    let (timer_set, everysec_owner) = support::everysec_timers(&census);
     let lp = CellLoop::new(
         driver,
         Rc::clone(&clock),
@@ -43,15 +44,21 @@ fn cell(
         LoopConfig {
             spin_iters: 4,
             exec_budget: 1024,
-            park_default: Some(std::time::Duration::from_millis(1)),
+            park_default: inf_runtime::ParkCeiling::new(std::time::Duration::from_millis(1))
+                .expect("a park ceiling within the maximum"),
             remote_first_execute: false,
         },
         serve_mark,
+        timer_set,
     );
+    // A 64 KiB ring, or one segment's worth on smaller segments: a frame
+    // the ring seals always fits a segment (the harness rule, ADR-0191).
+    let staging = StagingConfig::with_capacity(segment_bytes.min(64 << 10));
+    let segment = SegmentConfig { segment_bytes, ..Default::default() };
     let plane = DurablePlane::new(
         dir,
-        StagingConfig::with_capacity(64 << 10),
-        SegmentConfig { segment_bytes, ..Default::default() },
+        LogGeometry::new(staging, segment).expect("geometry"),
+        everysec_owner,
     );
     (lp, plane, clock)
 }
@@ -74,7 +81,7 @@ fn run_until_quiesced(
         iters += 1;
         let quiesced = plane.jobs.is_empty()
             && plane.staging.is_empty()
-            && plane.in_flight.is_empty()
+            && plane.commit.frames_unwritten() == 0
             && plane.commit.pending_fsyncs() == 0;
         if plane.cell_failed {
             break;
@@ -191,7 +198,10 @@ fn everysec_only_load_never_touches_the_gate() {
     let (mut lp, mut plane, clock) = cell(&dir, ScriptedDriver::new(IoMode::Real), 1 << 20);
     plane.push_jobs(200, FsyncClass::Everysec);
     let mut iters = 0;
-    while !(plane.jobs.is_empty() && plane.staging.is_empty() && plane.in_flight.is_empty()) {
+    while !(plane.jobs.is_empty()
+        && plane.staging.is_empty()
+        && plane.commit.frames_unwritten() == 0)
+    {
         lp.run_iteration(&mut plane).expect("iteration");
         // The fast path pays no gate registration for everysec (S06 AC).
         assert_eq!(plane.gate.waiting(), 0, "everysec must not register gate waiters");
@@ -216,7 +226,8 @@ fn four_frames_in_flight_pipeline_rotates_drained_and_replays_identically() {
     let mut driver = ScriptedDriver::new(IoMode::Real);
     driver.delays = std::iter::repeat_n(3, 1 << 16).collect();
     let clock = Rc::new(VirtualClock::new(Nanos::ZERO));
-    let (_census, serve_mark) = CapCensus::new(CellId(0));
+    let (census, serve_mark) = CapCensus::new(CellId(0));
+    let (timer_set, everysec_owner) = support::everysec_timers(&census);
     let mut lp = CellLoop::new(
         driver,
         Rc::clone(&clock),
@@ -224,15 +235,20 @@ fn four_frames_in_flight_pipeline_rotates_drained_and_replays_identically() {
         LoopConfig {
             spin_iters: 4,
             exec_budget: 1024,
-            park_default: Some(std::time::Duration::from_millis(1)),
+            park_default: inf_runtime::ParkCeiling::new(std::time::Duration::from_millis(1))
+                .expect("a park ceiling within the maximum"),
             remote_first_execute: false,
         },
         serve_mark,
+        timer_set,
     );
+    // Four frames in flight, each buffer one 8 KiB segment's worth.
+    let staging = StagingConfig { capacity_bytes: 8 << 10, frames_in_flight: 4 };
+    let segment = SegmentConfig { segment_bytes: 8 << 10, ..Default::default() };
     let mut plane = DurablePlane::new(
         &dir,
-        StagingConfig { capacity_bytes: 64 << 10, frames_in_flight: 4 },
-        SegmentConfig { segment_bytes: 8 << 10, ..Default::default() },
+        LogGeometry::new(staging, segment).expect("geometry"),
+        everysec_owner,
     );
     plane.jobs_per_iter = 8;
     for chunk in 0..60 {

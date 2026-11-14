@@ -23,18 +23,51 @@
 //! write is under a completed barrier and both arms compare exactly.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // harness process, not cell code
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+/// One arm at a time inside this process: macOS sets `CLOEXEC` after
+/// `socket(2)`, so a sibling thread's `posix_spawn` in that window inherits
+/// this arm's client socket or port probe. An arm spawns twice and opens
+/// sockets between, so it holds the lock throughout. Separate processes
+/// cannot race this way, so the lock binds the threads of one test process
+/// only.
+// nextest-in-process: a spawn race between the threads of one test process
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 const CELLS: &str = "4";
+/// How long the client waits on one reply before it calls the node hung.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// The `TAIL-STALL-TIMEOUT`, in milliseconds, of the load's namespace `t`,
+/// in every arm. A tiered write past its window parks until a flush round
+/// lands (ADR-0053 D4): the demote arms park, their 64 MiB fill running
+/// through 4 MiB windows, and the fit leg's windows never fill. The device
+/// those rounds land on is shared with every test process running beside
+/// the arm, so a slow flush there is no defect of it: on a device whose
+/// every flush waits 3 s a demote arm answered a legal `-STALLED` at the
+/// product's 1 s default. A parked write waits whole device barriers, two
+/// to a flush round, behind as many rounds as its cell's flush has queued,
+/// and no product limit bounds that count, so the bound is the largest
+/// value the key takes (1 to 60,000 ms). Like [`READ_TIMEOUT`] it turns a
+/// wedged flush into a failure; it is no device budget (ADR-0200 D7, A1).
+/// It sits below that timeout, so a write that does stall answers typed
+/// before the client calls it a hang.
+const TAIL_STALL_TIMEOUT_MS: u64 = 60_000;
+const _: () = assert!(
+    (TAIL_STALL_TIMEOUT_MS as u128) < READ_TIMEOUT.as_millis(),
+    "a stalled write answers before the client's hang bound"
+);
 const TAGS: u64 = 64;
 /// 64 MiB of load: 16 MiB per cell on average, four windows each.
 const LOAD_BYTES: u64 = 64 << 20;
@@ -55,40 +88,10 @@ fn data_root(tag: &str) -> PathBuf {
     root
 }
 
-/// The filesystem type under `path`, from `/proc/self/mountinfo` (the
-/// longest mount point that prefixes the canonical path).
-fn fs_type(path: &Path) -> String {
-    let canonical = std::fs::canonicalize(path).expect("canonical data root");
-    let canonical = canonical.to_string_lossy().into_owned();
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    let mut best: Option<(usize, String)> = None;
-    for line in mounts.lines() {
-        let mut halves = line.splitn(2, " - ");
-        let (Some(head), Some(tail)) = (halves.next(), halves.next()) else { continue };
-        let fields: Vec<&str> = head.split(' ').collect();
-        let Some(point) = fields.get(4) else { continue };
-        let Some(kind) = tail.split(' ').next() else { continue };
-        let point = point.replace("\\040", " ");
-        let covers = canonical == point
-            || canonical.starts_with(&format!("{}/", point.trim_end_matches('/')));
-        if covers && best.as_ref().is_none_or(|(len, _)| point.len() > *len) {
-            best = Some((point.len(), kind.to_owned()));
-        }
-    }
-    best.map_or_else(String::new, |(_, kind)| kind)
-}
-
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Server {
@@ -102,7 +105,8 @@ impl Server {
             .expect("addr")
             .port()
             .to_string();
-        let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+        let child = NodeBinary::built()
+            .command()
             .args(["--port", &port, "--cells", CELLS, "--pin-start", "4", "--pin-stride", "2"])
             .arg("--data-dir")
             .arg(dir)
@@ -175,7 +179,7 @@ impl Client {
                 Err(e) => panic!("connect: {e:?}"),
             }
         };
-        c.set_read_timeout(Some(Duration::from_secs(120))).expect("timeout");
+        c.set_read_timeout(Some(READ_TIMEOUT)).expect("timeout");
         c.set_nodelay(true).expect("nodelay");
         Client(c)
     }
@@ -369,7 +373,8 @@ const ZERO_SET: [&str; 10] = [
 fn run_arm(fsync: &str, leg: Leg) {
     let _one_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = data_root(&format!("spill-{fsync}-{leg:?}"));
-    let kind = fs_type(&dir);
+    // The node's own reader of a directory's filesystem.
+    let kind = inf_probe::identity_of(&dir).fs_type;
     assert!(
         kind != "tmpfs",
         "VACUOUS: the data root {} is on tmpfs; direct mode needs a disk filesystem",
@@ -377,6 +382,7 @@ fn run_arm(fsync: &str, leg: Leg) {
     );
     let mut server = Server::spawn(&dir).expect("first boot");
     let mut c = Client::connect(server.port);
+    let stall = TAIL_STALL_TIMEOUT_MS.to_string();
     c.ok(&[
         b"INF.NS",
         b"CREATE",
@@ -390,6 +396,8 @@ fn run_arm(fsync: &str, leg: Leg) {
             Leg::Demote => b"3mb",
             Leg::Fit => b"64mb",
         },
+        b"TAIL-STALL-TIMEOUT",
+        stall.as_bytes(),
     ]);
     c.ok(&[b"INF.NS", b"USE", b"t"]);
     let (model, deleted) = load(&mut c);
@@ -491,6 +499,7 @@ fn run_arm(fsync: &str, leg: Leg) {
             assert!(reads > 0, "VACUOUS (arm {fsync}): no settle read: {info}");
             let verified = field("recover_node_tier_deletes_verified");
             assert!(verified > 0, "VACUOUS (arm {fsync}): no delete verified: {info}");
+            assert_step_bound(fsync, &field, &info);
         }
         Leg::Fit => {
             // The control leg: a boot that fits every window demotes
@@ -505,16 +514,56 @@ fn run_arm(fsync: &str, leg: Leg) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The step bound at the shipped default budget (ADR-0174 A1): no
+/// recovery step of any cell did more work than `step_bytes` and one unit
+/// (`U`, from the node's configuration and this load, never from the
+/// engine), and steps yielded inside a unit — else the gauge was read on a
+/// boot that never parked (`VACUOUS`). `U` is the largest frame the node
+/// can have written, `max_sealed_frame_bytes` of its staging capacity (the
+/// default 4 MiB) under `Direct` (the larger of the two layouts), plus the
+/// largest of a record, a record settled against its one cold twin, and a
+/// demote step's flush: a lead (`MAINTAIN-SLICE`, 1 MiB at `MEM-BUDGET 3mb`),
+/// a page and two records of tier bytes, with its barrier, one seal it may
+/// cross and the directory sync of the file that seal opens.
+fn assert_step_bound(fsync: &str, field: &dyn Fn(&str) -> u64, info: &str) {
+    let step_bytes = inf_server::RecoverConfig::default().step_bytes;
+    let staging = inf_log::StagingConfig::with_capacity(4 << 20);
+    let entry = u64::from(inf_log::max_sealed_frame_bytes(staging, inf_log::SegmentIoMode::Direct));
+    let record = (8 + key(TAGS - 1, u64::from(u32::MAX)).len() + VALUE_LEN) as u64;
+    let barrier = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES;
+    let flush = (1 << 20) + 4096 + 2 * record + 3 * barrier;
+    let settled = record + inf_store::limits::SETTLE_READ_CHARGE_BYTES;
+    let unit = entry + flush.max(settled).max(record);
+    let work = field("recover_node_step_work_bytes_max");
+    let yields = field("recover_node_yields_in_frame")
+        + field("recover_node_yields_in_section")
+        + field("recover_node_yields_in_demote_step");
+    eprintln!(
+        "replay_spill arm {fsync}: step work max {work} bytes against {step_bytes} + {unit}, \
+         {} steps, {yields} yields inside a unit",
+        field("recover_node_steps")
+    );
+    assert!(
+        work <= step_bytes + unit,
+        "STEP BOUND (arm {fsync}): a step did {work} bytes of work, over {step_bytes} + {unit}: \
+         {info}"
+    );
+    assert!(yields > 0, "VACUOUS (arm {fsync}): no step yielded inside a unit: {info}");
+}
+
+// nextest-long: 37 s
 #[test]
 fn a_tail_above_every_cells_window_boots_under_fsync_always() {
     run_arm("always", Leg::Demote);
 }
 
+// nextest-long: 35 s
 #[test]
 fn a_tail_above_every_cells_window_boots_under_fsync_everysec() {
     run_arm("everysec", Leg::Demote);
 }
 
+// nextest-long: 30 s
 #[test]
 fn the_same_load_inside_every_cells_window_boots_without_demoting() {
     run_arm("always", Leg::Fit);

@@ -22,11 +22,20 @@
 //! being the record under test. Harness rules are the topology test's.
 #![cfg(target_os = "linux")]
 
+// nextest-stall-default: four short SETs put bytes in a tiered window of at
+// least its 8 MiB MEM-BUDGET; no write parks (ADR-0053 D4), so the stall
+// bound is never read.
+
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -53,26 +62,21 @@ fn data_root(tag: &str) -> PathBuf {
 }
 
 struct Server {
-    child: Child,
+    /// Held for its drop, which ends the node.
+    _node: Node,
     port: u16,
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 struct Launched {
-    child: Child,
+    child: Node,
     stderr: PathBuf,
 }
 
 fn launch(dir: &Path) -> Launched {
     std::fs::create_dir_all(dir).expect("data dir");
     let stderr = dir.join(format!("stderr-{}-{}", std::process::id(), unique()));
-    let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+    let child = NodeBinary::built()
+        .command()
         .args(["--port", "0", "--cells", "1", "--data-dir"])
         .arg(dir)
         .args(["--device-probe", "off", "--segment-bytes", SEGMENT_BYTES])
@@ -98,7 +102,7 @@ fn wait_up(mut launched: Launched) -> Result<(Server, String), (i32, String)> {
         if let Some(port) = announced_port(&text)
             && serving(port)
         {
-            return Ok((Server { child: launched.child, port }, text));
+            return Ok((Server { _node: launched.child, port }, text));
         }
         assert!(Instant::now() < deadline, "infinityd never came up: {text}");
         std::thread::sleep(Duration::from_millis(20));

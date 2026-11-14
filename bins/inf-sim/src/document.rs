@@ -14,6 +14,7 @@
 //! used here: recovery truncates tails and GCs segments — a mutating
 //! oracle is a heisen-oracle.
 
+use crate::driver::Violations;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -58,8 +59,8 @@ pub(crate) struct CorpusDoc {
 pub(crate) fn corpus_documents() -> &'static [CorpusDoc] {
     static CORPUS: OnceLock<Vec<CorpusDoc>> = OnceLock::new();
     CORPUS.get_or_init(|| {
-        let dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/inf-doc/fuzz/corpora/json");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/inf-doc/fuzz/corpora/json_parse");
         let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("fuzz corpus dir {}: {e}", dir.display()))
             .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -109,7 +110,7 @@ pub(crate) struct DocModel {
 }
 
 impl DocModel {
-    fn render(&self) -> Vec<u8> {
+    pub(crate) fn render(&self) -> Vec<u8> {
         let corpus = corpus_documents();
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(
@@ -156,6 +157,9 @@ pub(crate) fn next_document_command(
     scenario: &DurableScenario,
 ) -> (Vec<u8>, Pending) {
     let key = writer.key(scenario.keys_per_writer);
+    if let Some(send) = crate::durable::next_audit_command(writer, scenario, &key) {
+        return send;
+    }
     let corpus = corpus_documents();
     if !writer.models.contains_key(&key) || writer.sent.is_multiple_of(96) {
         let blob = if writer.rng.next_below(2) == 0 {
@@ -326,8 +330,7 @@ fn replay_shadow(
     if let Some(manifest) = &manifest {
         let ick = shard.join("ckpt").join(ick_file_name(manifest.ckpt_id));
         read_ick(disk, &ick, IckReaderConfig::default(), |record| {
-            shadow
-                .apply_record(&record, now, anchor, &mut inf_store::NoSpill)
+            inf_store::drive_record(shadow, &record, now, anchor, &mut inf_store::NoSpill, u64::MAX)
                 .map(|_| ())
                 .map_err(|e| format!("{e:?}"))
         })
@@ -358,8 +361,7 @@ fn replay_shadow(
                 return Ok(());
             }
         }
-        shadow
-            .apply_record(record, now, anchor, &mut inf_store::NoSpill)
+        inf_store::drive_record(shadow, record, now, anchor, &mut inf_store::NoSpill, u64::MAX)
             .map(|_| ())
             .map_err(|e| format!("apply: {e:?}"))
     })
@@ -398,6 +400,25 @@ fn preview(text: &[u8]) -> String {
     format!("{}{}", String::from_utf8_lossy(&text[..cut]), if text.len() > cut { "…" } else { "" })
 }
 
+/// One cell's comparison: every mismatch is a violation that names the
+/// seed, the instant, the cell, the namespace and the key, and each call
+/// site of [`Mismatches::fail`] is its own check.
+struct Mismatches<'a> {
+    context: String,
+    violations: &'a mut Violations,
+}
+
+impl Mismatches<'_> {
+    #[track_caller]
+    fn fail(&mut self, key: &[u8], what: String) {
+        self.violations.push(format!(
+            "REPLAY EQUIVALENCE VIOLATION {} key {:?}: {what}",
+            self.context,
+            String::from_utf8_lossy(key)
+        ));
+    }
+}
+
 /// Byte-exact per-document comparison: lineage, version, canonical idoc
 /// bytes, and the E8 canonical serialization (ADR-0039 D4). Violations
 /// name the seed, instant, cell, namespace, and key — a 10k-seed sweep
@@ -411,23 +432,18 @@ fn compare_documents(
     live: &BTreeMap<Vec<u8>, DocImage>,
     shadow: &BTreeMap<Vec<u8>, DocImage>,
     stats: &mut EquivalenceStats,
-    violations: &mut Vec<String>,
+    violations: &mut Violations,
 ) {
     let context = format!("seed {seed:#x} [{label}] cell {cell} ns {ns_name}");
-    let mut fail = |key: &[u8], what: String| {
-        violations.push(format!(
-            "REPLAY EQUIVALENCE VIOLATION {context} key {:?}: {what}",
-            String::from_utf8_lossy(key)
-        ));
-    };
+    let mut mismatch = Mismatches { context, violations };
     for (key, live_image) in live {
         let Some(shadow_image) = shadow.get(key) else {
-            fail(key, "live document absent from the replayed shadow".to_string());
+            mismatch.fail(key, "live document absent from the replayed shadow".to_string());
             continue;
         };
         stats.documents_compared += 1;
         if live_image.lineage != shadow_image.lineage {
-            fail(
+            mismatch.fail(
                 key,
                 format!(
                     "lineage diverged: live {} vs replayed {}",
@@ -436,7 +452,7 @@ fn compare_documents(
             );
         }
         if live_image.version != shadow_image.version {
-            fail(
+            mismatch.fail(
                 key,
                 format!(
                     "version diverged: live {} vs replayed {}",
@@ -449,7 +465,7 @@ fn compare_documents(
         match (live_text, shadow_text) {
             (Ok(live_text), Ok(shadow_text)) => {
                 if live_text != shadow_text {
-                    fail(
+                    mismatch.fail(
                         key,
                         format!(
                             "canonical serialization diverged: live {} vs replayed {}",
@@ -461,17 +477,19 @@ fn compare_documents(
                     // Equal canonical text with unequal frozen bytes would
                     // mean the canonical encoding is not unique — a format
                     // bug, not a replay bug; still a finding.
-                    fail(key, "canonical idoc bytes diverged under equal text".to_string());
+                    mismatch
+                        .fail(key, "canonical idoc bytes diverged under equal text".to_string());
                 }
             }
             (live_text, shadow_text) => {
-                fail(key, format!("undecodable frozen idoc: {live_text:?} / {shadow_text:?}"));
+                mismatch
+                    .fail(key, format!("undecodable frozen idoc: {live_text:?} / {shadow_text:?}"));
             }
         }
     }
     for key in shadow.keys() {
         if !live.contains_key(key) {
-            fail(key, "replayed document absent from the live store".to_string());
+            mismatch.fail(key, "replayed document absent from the live store".to_string());
         }
     }
 }
@@ -486,8 +504,9 @@ pub(crate) fn equivalence_check(
     disk: &SimDisk,
     now: Nanos,
     stats: &mut EquivalenceStats,
-    violations: &mut Vec<String>,
+    violations: &mut Violations,
 ) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let data_dir = PathBuf::from("node");
     let catalog = match load_catalog_from(disk, &data_dir) {
         Ok(Some(catalog)) => catalog,
@@ -503,7 +522,7 @@ pub(crate) fn equivalence_check(
     for cell in 0..scenario.cells {
         let mut shadow =
             Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
-        if let Err(err) = shadow.seed_catalog(&catalog) {
+        if let Err(err) = shadow.seed_catalog(&catalog, &census) {
             violations.push(format!(
                 "REPLAY EQUIVALENCE VIOLATION seed {:#x} [{label}]: seed_catalog: {err:?}",
                 scenario.seed

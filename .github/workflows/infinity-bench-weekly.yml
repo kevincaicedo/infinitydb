@@ -1,19 +1,19 @@
-# InfinityDB weekly pressure-row campaign (the M1 pressure rows, reduced,
-# on the reference box weekly).
+# InfinityDB weekly pressure-row campaign (the m1 gate's pressure rows,
+# reduced, on the reference box weekly).
 #
-# REQUIRES a self-hosted runner labeled `reference-box` (the M0-R2 box:
+# REQUIRES a self-hosted runner labeled `reference-box` (the reference box:
 # pinned cores, performance governor, redis-server 8.x installed). The rows
 # are meaningless on shared GitHub runners (L10), so the campaign job never
 # falls back to one — it simply does not run until the box is registered.
 #
-# ARMING SWITCH (2026-08-08). The job is gated on the repository variable
+# ARMING SWITCH. The job is gated on the repository variable
 # `REFERENCE_BOX_ONLINE`. Unset, the weekly schedule fires, reports that the
 # campaign is disarmed, and exits green in seconds.
 #
-#   Before: every Monday's `pressure-rows` sat in the queue with no runner
-#   able to accept it until GitHub killed it at the 24 h limit — one red
-#   "exceeded the maximum execution time while awaiting a runner" annotation
-#   per week (run #8), which is noise, not honesty. `timeout-minutes` does
+#   Without it, every Monday's `pressure-rows` would sit in the queue with
+#   no runner able to accept it until GitHub ended it at the 24 h limit —
+#   one red "exceeded the maximum execution time while awaiting a runner"
+#   annotation a week, which is noise, not honesty. `timeout-minutes` does
 #   not bound queue time, so only a guard can prevent this.
 #
 #   To arm, once the reference-box runner is registered and online:
@@ -58,7 +58,7 @@ jobs:
               echo "### Weekly pressure-row campaign: DISARMED"
               echo
               echo "No \`reference-box\` self-hosted runner is declared online, so the"
-              echo "campaign did not run. Binding rows require the M0-R2 box (pinned"
+              echo "campaign did not run. Binding rows require the reference box (pinned"
               echo "cores, performance governor, redis-server 8.x) — a shared GitHub"
               echo "runner cannot produce them (L10), and queueing for one that does"
               echo "not exist just burns the 24 h runner-wait limit."
@@ -82,7 +82,8 @@ jobs:
       - name: reduced pressure-row campaign (binding tier)
         # Full-size gate campaign sizes (50M-key FLUSHALL row, 10M fill,
         # 100k subscriptions) are the milestone-verdict run, executed
-        # manually per M1-S17; the weekly keeps a reduced regression watch.
+        # by hand on the reference box; the weekly keeps a reduced regression
+        # watch.
         run: |
           ./target/release/inf-bench gate-run m1 --reference-box \
             --duration 10 --replicates 3 \
@@ -90,7 +91,7 @@ jobs:
             --maxmemory-mb 1024 --subs 2000 --sub-channels 50
       - name: build inf-compare
         run: cargo build --release -p inf-compare
-      - name: reduced inf-compare sweep (M2.5-S22, ADR-0025 D3)
+      - name: reduced inf-compare sweep (ADR-0025 D3)
         # The standing comparative instrument beside the in-house rows:
         # the reduced workload set (set/get/mixed/memory), all present
         # engines, both generators — the weekly signal between full

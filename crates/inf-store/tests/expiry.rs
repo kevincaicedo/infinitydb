@@ -490,8 +490,9 @@ fn a_busy_db0_does_not_starve_the_other_namespaces_wheels() {
 /// them.
 #[test]
 fn a_named_namespace_last_in_the_chain_still_gets_its_wheel_ticks() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(sessions_ns()).expect("create");
+    ks.ns_create(sessions_ns(), &census).expect("create");
     set_ttl_in(ks.ns_store_mut(NsId(16)).expect("registered"), "s:", 10, 10);
     set_ttl_in(ks.db_mut(0), "hot:", 2_000, 50);
     for _ in 0..20 {

@@ -30,6 +30,7 @@ pub mod fault;
 pub mod flush;
 mod frame;
 pub mod fs;
+mod geometry;
 pub mod limits;
 mod lsn;
 pub mod manifest;
@@ -57,8 +58,9 @@ pub use ckpt::{
     read_ick, read_ick_hybrid,
 };
 pub use commit::{
-    CommitStats, ExtentRegistration, ExtentSync, FrameId, FramePlan, FsyncClass, FsyncTicket,
-    GroupCommit, REORDER_WINDOW_FRAMES, SyncReason, WRITE_THROUGH_WINDOW_ENTRIES,
+    CommitStats, Due, ExtentRegistration, ExtentSync, FrameBarrier, FrameId, FramePlan,
+    FrameQueued, FsyncClass, FsyncTicket, GroupCommit, Hold, LedgerClass, SealPlan, SyncReason,
+    WrittenFrame,
 };
 pub use effect::MutationEffect;
 pub use flush::{
@@ -67,12 +69,14 @@ pub use flush::{
     TierFlushError,
 };
 pub use frame::{
-    DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_HEADER_LEN_V1, FRAME_MAGIC,
-    FRAME_MAGIC_V1, FRAME_MAGIC_V3, FRAME_TRAILER_LEN, FrameBuilder, FrameDecodeError, FrameIter,
-    FrameLayout, FrameRecordError, FrameRef, FrameStamp, MIN_FRAME_LEN, MIN_FRAME_LEN_V1,
-    RecordIter, align_up_frame, decode_frame, frame_header_len,
+    CursorMismatch, DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_HEADER_LEN_V1,
+    FRAME_MAGIC, FRAME_MAGIC_V1, FRAME_MAGIC_V3, FRAME_TRAILER_LEN, FrameBuilder, FrameDecodeError,
+    FrameIter, FrameLayout, FrameRecordError, FrameRef, FrameStamp, MIN_FRAME_LEN,
+    MIN_FRAME_LEN_V1, RecordCursor, RecordIter, align_up_frame, decode_frame, frame_header_len,
 };
 pub use fs::{SegmentIoMode, TierIoMode, is_storage_exhausted};
+pub use geometry::{LogGeometry, LogGeometryError, max_sealed_frame_bytes};
+pub use limits::{REORDER_WINDOW_FRAMES, WRITE_THROUGH_WINDOW_ENTRIES};
 pub use lsn::{Lsn, MAX_SEGMENT_LEN, SegmentId, check_segment_len};
 pub use manifest::{
     Manifest, ManifestDecodeError, TierFileRange, TierNsManifest, manifest_envelope, read_manifest,
@@ -85,8 +89,8 @@ pub use record::{
     DOC_VERSION_MASK, DocLineage, NsId, RecordDecodeError, RecordType, RecordView, decode_record,
 };
 pub use scan::{
-    CellDirs, ScanError, ScanOutcome, SegmentScan, create_cell_dirs, create_cell_dirs_deferred,
-    scan_log_dir, scan_log_dir_from,
+    BootDirs, CellDirs, ScanError, ScanOutcome, SegmentScan, create_cell_dirs,
+    create_cell_dirs_deferred, scan_log_dir, scan_log_dir_from,
 };
 pub use segment::{
     DEFAULT_FUA_MAX_FRAME_BYTES, DEFAULT_RECYCLE_SLOTS, DEFAULT_SEGMENT_BYTES, DeferredBegin,
@@ -102,9 +106,10 @@ pub use staging::{
 };
 pub use tail::{LogCorruption, RegionEvidence, RegionScan, scan_region, scan_region_evidence};
 pub use tier::{
-    RoundEffect, SealOutcome, SealReason, TIER_FOOTER_BYTES, TIER_FRAME_BYTES, TIER_FRAME_DATA,
-    TIER_HEADER_BYTES, TIER_KEY_WINDOW_BYTES, TierCorruption, TierDecodeError, TierFooterV1,
-    TierHeaderV1, TierIdentity, TierOpView, TierSummary, TierWriteFailure, TierWriter,
-    inspect_tier_bytes, parse_tier_file_name, parse_tier_footer, parse_tier_header,
-    probe_tier_file, tier_extract, tier_file_name, tier_frame_offset, tier_frame_span,
+    OpState, RoundEffect, RoundEffects, SealOutcome, SealReason, TIER_FOOTER_BYTES,
+    TIER_FRAME_BYTES, TIER_FRAME_DATA, TIER_HEADER_BYTES, TIER_KEY_WINDOW_BYTES, TierCorruption,
+    TierDecodeError, TierFooterV1, TierHeaderV1, TierIdentity, TierOpView, TierSummary,
+    TierWriteFailure, TierWriter, inspect_tier_bytes, parse_tier_file_name, parse_tier_footer,
+    parse_tier_header, probe_tier_file, tier_extract, tier_file_name, tier_frame_offset,
+    tier_frame_span,
 };

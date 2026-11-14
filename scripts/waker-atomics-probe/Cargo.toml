@@ -1,7 +1,8 @@
-# Planted-bypass probe for scripts/check-waker-atomics.sh (review
-# 2026-08-30 F-L20-03, ADR-0106 D8). Not a workspace member: the gate
-# copies it under a temp dir and emits its release asm with the same
-# pipeline it uses on inf-runtime, then asserts each declared verdict.
+# Planted-bypass probe for scripts/check-waker-atomics.sh (ADR-0106 D8,
+# ADR-0003 A1.6). Not a workspace member: the gate copies it under a temp dir
+# and emits its release asm with the same pipeline it uses on inf-runtime,
+# then asserts each declared verdict. The nested crate is the out-of-line
+# callee the closed callee list does not hold.
 [package]
 name = "waker-atomics-probe"
 version = "0.0.0"
@@ -12,6 +13,9 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+waker-atomics-probe-nested = { path = "nested" }
 
 [profile.release]
 codegen-units = 1

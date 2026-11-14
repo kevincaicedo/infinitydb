@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 
 use crate::frame::{FRAME_ALIGN, FRAME_HEADER_LEN, FrameBuilder, FrameLayout, FrameStamp};
 use crate::fs::{SegmentFile, SegmentFs, SegmentIoMode};
+use crate::geometry::LogGeometry;
 use crate::lsn::{Lsn, SegmentId};
 use crate::scan::SegmentScan;
 
@@ -163,6 +164,21 @@ pub fn parse_segment_file_name(name: &str) -> Option<SegmentId> {
     u32::try_from(digits.parse::<u64>().ok()?).ok().map(SegmentId)
 }
 
+impl SegmentIoMode {
+    /// How a frame sealed on a segment of this mode lies on the device
+    /// (ADR-0086 D3): a `Buffered` segment packs (v2), an `O_DIRECT` one
+    /// aligns (v3). The one place the mode picks the layout: the active
+    /// segment, the segment a rotation lands on and the largest frame a
+    /// geometry admits (`max_sealed_frame_bytes`) all read it here.
+    #[must_use]
+    pub const fn layout(self) -> FrameLayout {
+        match self {
+            SegmentIoMode::Buffered => FrameLayout::Packed,
+            SegmentIoMode::Direct => FrameLayout::Aligned,
+        }
+    }
+}
+
 /// Lifecycle configuration. Values are per-cell config (M2 plan §4);
 /// time-based sealing ships default-off (the M2 cut line — size sealing is
 /// the load-bearing path).
@@ -177,8 +193,8 @@ pub struct SegmentConfig {
     pub seal_after_ms: Option<u64>,
     /// I/O mode of every segment created from here on (ADR-0086 D1).
     /// `Buffered` is the M2 path byte-for-byte and the default until the
-    /// reference-box A/B; `Direct` requires `segment_bytes` to be a
-    /// multiple of [`FRAME_ALIGN`].
+    /// reference-box A/B; under `Direct`, [`LogGeometry::new`] refuses a
+    /// `segment_bytes` that is not a multiple of [`FRAME_ALIGN`].
     pub io_mode: SegmentIoMode,
     /// Largest padded frame written write-through on a pre-zeroed
     /// `Direct` segment; larger frames keep the linked fdatasync (the
@@ -200,33 +216,21 @@ pub struct SegmentConfig {
 
 impl Default for SegmentConfig {
     fn default() -> Self {
-        SegmentConfig {
-            segment_bytes: DEFAULT_SEGMENT_BYTES,
-            seal_after_ms: None,
-            io_mode: SegmentIoMode::Buffered,
-            fua_max_frame_bytes: DEFAULT_FUA_MAX_FRAME_BYTES,
-            recycle_slots: DEFAULT_RECYCLE_SLOTS,
-            prealloc: PreallocPolicy::DEFAULT,
-        }
+        SegmentConfig::DEFAULT
     }
 }
 
 impl SegmentConfig {
-    /// Boot-configuration invariant (ADR-0086 D3): aligned frames need an
-    /// aligned segment end, or the last frame's padding would run past
-    /// the preallocation.
-    ///
-    /// # Panics
-    /// If `Direct` is configured with a `segment_bytes` that is not a
-    /// multiple of [`FRAME_ALIGN`].
-    pub fn assert_valid(&self) {
-        if self.io_mode == SegmentIoMode::Direct {
-            assert!(
-                self.segment_bytes.is_multiple_of(FRAME_ALIGN),
-                "Direct segments need segment_bytes to be a multiple of {FRAME_ALIGN}"
-            );
-        }
-    }
+    /// The shipped segment: 256 MiB `Buffered`, size-sealed, one recycle
+    /// slot (inert until `Direct`), the bounded pool wait.
+    pub const DEFAULT: SegmentConfig = SegmentConfig {
+        segment_bytes: DEFAULT_SEGMENT_BYTES,
+        seal_after_ms: None,
+        io_mode: SegmentIoMode::Buffered,
+        fua_max_frame_bytes: DEFAULT_FUA_MAX_FRAME_BYTES,
+        recycle_slots: DEFAULT_RECYCLE_SLOTS,
+        prealloc: PreallocPolicy::DEFAULT,
+    };
 }
 
 /// Non-recoverable fsync failure (§8.4, the fsyncgate rule): once an
@@ -265,11 +269,6 @@ pub enum LogError {
     NoSpace {
         segment: SegmentId,
     },
-    /// A frame larger than one segment can never be stored.
-    FrameTooLarge {
-        len: u32,
-        max: u32,
-    },
     /// Rotation is due but the next segment has a zero-fill slice or
     /// barrier in flight (ADR-0086 D4): the frame waits one completion.
     /// Retryable — the LOG step returns and re-tries next iteration.
@@ -290,9 +289,6 @@ impl fmt::Display for LogError {
             LogError::NoSpace { segment } => {
                 write!(f, "no space to preallocate {segment}: durable writes refused")
             }
-            LogError::FrameTooLarge { len, max } => {
-                write!(f, "frame of {len} bytes exceeds segment capacity {max}")
-            }
             LogError::NextNotReady { segment } => {
                 write!(f, "next segment {segment} has a zero-fill op in flight: frame waits")
             }
@@ -309,9 +305,7 @@ impl std::error::Error for LogError {
             // fsync-fail-stop-allow: Error::source arm: hands out the io::Error, never handles it
             LogError::Fsync(err) => Some(err),
             LogError::Io { source, .. } => Some(source),
-            LogError::NoSpace { .. }
-            | LogError::FrameTooLarge { .. }
-            | LogError::NextNotReady { .. } => None,
+            LogError::NoSpace { .. } | LogError::NextNotReady { .. } => None,
         }
     }
 }
@@ -364,6 +358,24 @@ impl FrameSlot {
     pub fn write_through_ok(&self) -> bool {
         self.write_through_ok
     }
+}
+
+/// A frame reserved on a segment fits it (ADR-0191 D4): `len`, the frame's
+/// largest on-device length in its rotor (`padded_bound`), is at most the
+/// segment's `segment` bytes. The staging ring seals at most its capacity
+/// (`StagingRing::stage`); the ring and the rotor are built from one
+/// geometry, by construction and not by type (the server builds a cell's
+/// rotor and its ring from one configuration); and that geometry holds a
+/// segment of at least the largest frame its capacity seals under the
+/// configured mode (`LogGeometry::new`, row 5), so no sealed frame reaches
+/// the other branch.
+/// Release, not debug: a frame reserved past the preallocation is written
+/// past it, and recovery's scan, the recycle sentinel's block and the
+/// reorder arithmetic no longer describe the file. The compare is the one
+/// the reservation always made, and the message carries no operands: a
+/// formatted message would keep both on the stack of every reservation.
+fn assert_frame_fits(len: u32, segment: u32) {
+    assert!(len <= segment, "frame exceeds the segment: the staging ring sealed past its geometry");
 }
 
 /// A segment leaving the rotor under **deferred seal** (M2-S05, ADR-0013
@@ -494,10 +506,7 @@ struct ActiveSegment<File> {
 
 impl<File> ActiveSegment<File> {
     fn layout(&self) -> FrameLayout {
-        match self.io_mode {
-            SegmentIoMode::Buffered => FrameLayout::Packed,
-            SegmentIoMode::Direct => FrameLayout::Aligned,
-        }
+        self.io_mode.layout()
     }
 }
 
@@ -592,9 +601,11 @@ pub const RECYCLE_SENTINEL_KEY: &[u8] = b"INF-RECYCLE-SENTINEL";
 /// one block, so the bytes are an aligned `O_DIRECT` source); returns
 /// the padded frame.
 ///
-/// # Panics
-/// If `segment_bytes` is not a positive multiple of [`FRAME_ALIGN`]
-/// (`SegmentConfig::assert_valid` for `Direct`, the only recycling mode).
+/// `segment_bytes` is a recycling rotor's segment size. Recycling runs on
+/// `Direct` segments only (ADR-0090 D1), and a `Direct` geometry holds the
+/// size at a multiple of [`FRAME_ALIGN`] of at least one block (rows 4 and
+/// 5 of [`LogGeometry::new`]), so the block's base, `segment_bytes −
+/// FRAME_ALIGN`, is exact; a debug build checks it.
 pub fn build_recycle_sentinel(
     builder: &mut FrameBuilder,
     old: SegmentId,
@@ -613,12 +624,14 @@ pub fn build_recycle_sentinel(
     image
 }
 
-/// The sentinel's block: the segment's last (ADR-0090 A15).
+/// The sentinel's block: the segment's last (ADR-0090 A15). Its input is
+/// proven, not a caller's claim: both sentinel sites exist only for a
+/// pooled file, which only a recycling rotor takes, and recycling is
+/// `recycle_slots > 0` under `Direct` (ADR-0090 D1), where the geometry
+/// makes `segment_bytes` aligned and at least one block (ADR-0191 D1).
 fn recycle_sentinel_base(segment_bytes: u32) -> u32 {
-    assert!(
-        segment_bytes >= FRAME_ALIGN && segment_bytes.is_multiple_of(FRAME_ALIGN),
-        "Direct segments need segment_bytes to be a multiple of {FRAME_ALIGN}"
-    );
+    debug_assert!(segment_bytes >= FRAME_ALIGN, "a recycled segment holds its sentinel block");
+    debug_assert!(segment_bytes.is_multiple_of(FRAME_ALIGN), "a recycled segment is aligned");
     segment_bytes - FRAME_ALIGN
 }
 
@@ -717,8 +730,10 @@ impl<F: SegmentFs> fmt::Debug for SegmentRotor<F> {
 impl<F: SegmentFs> SegmentRotor<F> {
     /// First boot of a cell: create `seg-000000.ilog` preallocated in an
     /// existing (already dir-fsynced — see `create_cell_dirs`) log dir.
-    pub fn create_fresh(fs: F, log_dir: PathBuf, cfg: SegmentConfig) -> Result<Self, LogError> {
-        cfg.assert_valid();
+    /// The rotor runs `geometry.segment()`, a segment the geometry proved
+    /// holds every frame its staging ring can seal (ADR-0191 D3).
+    pub fn create_fresh(fs: F, log_dir: PathBuf, geometry: LogGeometry) -> Result<Self, LogError> {
+        let cfg = geometry.segment();
         let id = SegmentId(0);
         let file = create_prealloc(&fs, &log_dir, id, &cfg)?;
         let active = activate(id, file, 0, cfg.io_mode)?;
@@ -751,9 +766,9 @@ impl<F: SegmentFs> SegmentRotor<F> {
     pub fn create_fresh_deferred(
         fs: F,
         log_dir: PathBuf,
-        cfg: SegmentConfig,
+        geometry: LogGeometry,
     ) -> Result<Self, LogError> {
-        cfg.assert_valid();
+        let cfg = geometry.segment();
         let id = SegmentId(0);
         let file = create_prealloc_deferred(&fs, &log_dir, id, &cfg)?;
         let active = activate(id, file, 0, cfg.io_mode)?;
@@ -815,14 +830,14 @@ impl<F: SegmentFs> SegmentRotor<F> {
     pub fn open_existing(
         fs: F,
         log_dir: PathBuf,
-        cfg: SegmentConfig,
+        geometry: LogGeometry,
         scan: &SegmentScan,
         tail_offset: u32,
     ) -> Result<Self, LogError> {
-        cfg.assert_valid();
         let Some(tail) = scan.tail() else {
-            return Self::create_fresh(fs, log_dir, cfg);
+            return Self::create_fresh(fs, log_dir, geometry);
         };
+        let cfg = geometry.segment();
         let path = log_dir.join(segment_file_name(tail));
         let packed_tail = !tail_offset.is_multiple_of(FRAME_ALIGN);
         let tail_mode = match cfg.io_mode {
@@ -879,11 +894,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// (a fresh segment is created in the configured mode).
     #[must_use]
     pub fn next_layout(&self) -> FrameLayout {
-        let mode = self.next.as_ref().map_or(self.cfg.io_mode, |next| next.io_mode);
-        match mode {
-            SegmentIoMode::Buffered => FrameLayout::Packed,
-            SegmentIoMode::Direct => FrameLayout::Aligned,
-        }
+        self.next.as_ref().map_or(self.cfg.io_mode, |next| next.io_mode).layout()
     }
 
     /// True while the active segment writes write-through frames for
@@ -967,6 +978,16 @@ impl<F: SegmentFs> SegmentRotor<F> {
         } else {
             NextState::Filling { cursor, in_flight: 0 }
         };
+    }
+
+    /// Whether the next segment's zero-fill barrier is owed now — a pure
+    /// peek of [`take_zero_fill_barrier`](Self::take_zero_fill_barrier),
+    /// for a plane that asks the ledger's class before it takes one.
+    #[must_use]
+    pub fn zero_fill_barrier_owed(&self) -> bool {
+        self.next.as_ref().is_some_and(|next| {
+            next.state == NextState::AwaitBarrier && next.file.raw_fd().is_some()
+        })
     }
 
     /// The next segment's fd when its zero-fill barrier is owed (every
@@ -1289,10 +1310,13 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// rotating first if its padded length does not fit the active
     /// segment. Hot path: the fit check is one compare; rotation itself is
     /// a pointer swap onto the preallocated next segment.
+    ///
+    /// # Panics
+    /// If the frame could not fit an empty segment — a frame the staging
+    /// ring cannot seal under this rotor's geometry (see
+    /// `assert_frame_fits`).
     pub fn begin_frame(&mut self, frame_len: u32, now_ms: u64) -> Result<FrameSlot, LogError> {
-        if self.padded_bound(frame_len) > self.cfg.segment_bytes {
-            return Err(LogError::FrameTooLarge { len: frame_len, max: self.cfg.segment_bytes });
-        }
+        assert_frame_fits(self.padded_bound(frame_len), self.cfg.segment_bytes);
         if !self.fits(frame_len) {
             self.rotate()?;
         }
@@ -1308,14 +1332,16 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// config lands). A class-upgrade rotation (ADR-0086 D4) also lands
     /// here — callers establish no frame is in flight first
     /// (`rotation_due` + drain, ADR-0087 D4).
+    ///
+    /// # Panics
+    /// As [`begin_frame`](Self::begin_frame), for a frame no segment of
+    /// this rotor's geometry holds.
     pub fn begin_frame_deferred(
         &mut self,
         frame_len: u32,
         now_ms: u64,
     ) -> Result<DeferredBegin<F::File>, LogError> {
-        if self.padded_bound(frame_len) > self.cfg.segment_bytes {
-            return Err(LogError::FrameTooLarge { len: frame_len, max: self.cfg.segment_bytes });
-        }
+        assert_frame_fits(self.padded_bound(frame_len), self.cfg.segment_bytes);
         let handoff = if !self.fits(frame_len) || self.upgrade_due() {
             Some(self.rotate_deferred()?)
         } else {
@@ -1360,8 +1386,8 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// The largest on-device length a frame of `frame_len` bytes can take
     /// in this rotor — the active layout's, or the aligned one when the
     /// configured mode could rotate it onto a `Direct` segment. Bounds the
-    /// `FrameTooLarge` refusal so a rotation never discovers a frame that
-    /// fit the old segment but not the new.
+    /// reservation's fit assertion, so a rotation never discovers a frame
+    /// that fit the old segment but not the new.
     fn padded_bound(&self, frame_len: u32) -> u32 {
         let here = self.active.layout().padded_len(frame_len);
         match self.cfg.io_mode {

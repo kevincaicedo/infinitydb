@@ -61,7 +61,7 @@ fn next_tiered_command(
 
 /// The cell that owns `key` and replays its records (the node's
 /// contiguous slot router), not the cell a writer's connection reached.
-fn owner_cell(cells: u16, key: &[u8]) -> usize {
+pub(super) fn owner_cell(cells: u16, key: &[u8]) -> usize {
     inf_store::SlotRouter::new_contiguous(cells)
         .cell_of(inf_store::SlotRouter::slot_of(key))
         .as_usize()
@@ -291,7 +291,7 @@ pub(super) fn tier_read_fault_probe(
     report.tier_read_fault_arm = true;
     let mut armed = 0u64;
     for (path, _) in disk.image() {
-        if path.extension().is_some_and(|ext| ext == "itier") {
+        if is_tier_file(&path) {
             disk.inject(&path, inf_server::DeviceFault::ReadEio, 1)
                 .map_err(|err| format!("tier-read arm {path:?}: {err}"))?;
             armed += 1;
@@ -498,64 +498,17 @@ pub(super) fn scan_all_keys(
         keys: Vec<Vec<u8>>,
         set: BTreeSet<Vec<u8>>,
     }
+    // The namespace's `CREATE` (`MEM-BUDGET 3mb`) sets no `COLD-READ-QD`, so
+    // each cell's cold host runs at a budget-only spec's.
+    let qd = u64::from(inf_store::TierSpec::for_budget(3 << 20).cold_read_qd);
+    assert!(
+        SCAN_ORACLE_READS_MIN >= 2 * SCAN_PAGE_SLOTS.div_ceil(qd),
+        "the SCAN batching floor ({SCAN_ORACLE_READS_MIN} reads) is under twice the rounds of a \
+         page of {SCAN_PAGE_SLOTS} slots at a QD of {qd}: derive it again for this QD"
+    );
     let mut first: Option<FirstWalk> = None;
     for cell in 0..usize::from(scenario.cells) {
-        let mut probe = MiniClient::connect(node, cell);
-        let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
-        match probe.call(node, rng, clock, disk, scenario.step_ns_max, use_ns) {
-            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
-            other => return Err(format!("USE on cell {cell} answered {other:?}")),
-        }
-        let mut keys = Vec::new();
-        let mut cursor = 0u64;
-        for _ in 0..4096 {
-            let cursor_text = cursor.to_string();
-            let scan: &[&[u8]] = &[b"SCAN", cursor_text.as_bytes(), b"COUNT", b"512"];
-            // F-L17-13 (L3): a page that resolves K cold slots must not
-            // cost K reactor iterations — the sequential loop paid one
-            // device round trip *and* one iteration per key; a batched
-            // page enqueues a chunk before it suspends. Cold intents come
-            // from the cell's own `INFO tiering` (the counters are
-            // cell-scoped, and so is this probe); iterations are the
-            // steps this page took to answer.
-            let cold_before =
-                info_tiering(&mut probe, node, rng, clock, disk, scenario.step_ns_max)
-                    .map(|t| info_field(&t, "cold_reads_enqueued"))?;
-            probe.send(node, scan);
-            let mut steps = 0u64;
-            let reply = loop {
-                if steps >= STALL_STEPS {
-                    return Err(format!("SCAN on cell {cell} stalled after {steps} steps"));
-                }
-                node.step(rng, clock, disk, scenario.step_ns_max)
-                    .map_err(|e| format!("SCAN on cell {cell}: {e}"))?;
-                steps += 1;
-                if let Some(reply) = probe.recv(node) {
-                    break reply;
-                }
-            };
-            let cold = info_tiering(&mut probe, node, rng, clock, disk, scenario.step_ns_max)
-                .map(|t| info_field(&t, "cold_reads_enqueued"))?
-                .saturating_sub(cold_before);
-            if cold > 0 {
-                report.scan_cold_pages += 1;
-                report.scan_cold_reads += cold;
-            }
-            if cold >= SCAN_BATCH_ORACLE_MIN_COLD && steps >= cold {
-                report.violations.push(format!(
-                    "SCAN BATCHING VIOLATION: cell {cell} page at cursor {cursor} resolved \
-                     {cold} cold slots in {steps} iterations — one device round trip per \
-                     key, never a batch (F-L17-13, L3 / ADR-0055 D1)"
-                ));
-            }
-            let (next, named) = parse_scan_reply(&reply)
-                .ok_or_else(|| format!("SCAN on cell {cell}: unparsable {}", preview(&reply)))?;
-            keys.extend(named);
-            cursor = next;
-            if cursor == 0 {
-                break;
-            }
-        }
+        let keys = walk_cell(node, rng, clock, disk, scenario, report, cell)?;
         let set: BTreeSet<Vec<u8>> = keys.iter().cloned().collect();
         match &first {
             None => first = Some(FirstWalk { keys, set }),
@@ -572,6 +525,71 @@ pub(super) fn scan_all_keys(
         }
     }
     Ok(first.map(|walk| walk.keys).unwrap_or_default())
+}
+
+/// One cell's `SCAN` walk, its pages of [`SCAN_PAGE_SLOTS`] each judged by the
+/// batching oracle as they answer: every key it names, in its order.
+fn walk_cell(
+    node: &mut Node,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &TieredScenario,
+    report: &mut TieredNodeReport,
+    cell: usize,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut probe = MiniClient::connect(node, cell);
+    let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
+    match probe.call(node, rng, clock, disk, scenario.step_ns_max, use_ns) {
+        Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+        other => return Err(format!("USE on cell {cell} answered {other:?}")),
+    }
+    let count_text = SCAN_PAGE_SLOTS.to_string();
+    let mut keys = Vec::new();
+    let mut cursor = 0u64;
+    for _ in 0..4096 {
+        let cursor_text = cursor.to_string();
+        let scan: &[&[u8]] = &[b"SCAN", cursor_text.as_bytes(), b"COUNT", count_text.as_bytes()];
+        // F-L17-13 (L3): a page that resolves K cold slots must not
+        // put them at its cell's device one read a driver entry, the shape
+        // of a page that awaits each key before it names the next (ADR-0208
+        // D3). The scrapes of the cell's `INFO tiering` around the page are
+        // its guard steps: a read the device takes in one, or before the
+        // cell holds the whole command, is another reader's. Their intent
+        // count is the cell's, and judges nothing.
+        let at_guard = node.cell_tier_reads(cell);
+        let cold_before = info_tiering(&mut probe, node, rng, clock, disk, scenario.step_ns_max)
+            .map(|t| info_field(&t, "cold_reads_enqueued"))?;
+        let guard_before = node.cell_tier_reads(cell) - at_guard;
+        let stalled = || format!("SCAN on cell {cell} stalled after {STALL_STEPS} steps");
+        let page = probe
+            .round_trip(node, rng, clock, disk, scenario.step_ns_max, scan)
+            .map_err(|e| format!("SCAN on cell {cell}: {e}"))?
+            .ok_or_else(stalled)?;
+        let at_reply = node.cell_tier_reads(cell);
+        let cold = info_tiering(&mut probe, node, rng, clock, disk, scenario.step_ns_max)
+            .map(|t| info_field(&t, "cold_reads_enqueued"))?
+            .saturating_sub(cold_before);
+        let guard_after = node.cell_tier_reads(cell) - at_reply;
+        if cold > 0 {
+            report.scan_cold_pages += 1;
+            report.scan_cold_reads += cold;
+        }
+        let reads = PageReads {
+            cell_reads_outside: guard_before + page.cell_reads_before + guard_after,
+            cell_reads: page.cell_reads,
+            cell_read_steps: page.cell_read_steps,
+        };
+        count_page(report, cell, cursor, cold, reads);
+        let (next, named) = parse_scan_reply(&page.reply)
+            .ok_or_else(|| format!("SCAN on cell {cell}: unparsable {}", preview(&page.reply)))?;
+        keys.extend(named);
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    Ok(keys)
 }
 
 /// `*2 $cursor *N $key…` → `(cursor, keys)`; `None` on any other shape.
@@ -606,10 +624,104 @@ fn parse_scan_reply(reply: &[u8]) -> Option<(u64, Vec<Vec<u8>>)> {
     Some((cursor, keys))
 }
 
-/// Cold slots a `SCAN` page must resolve before the batching oracle
-/// speaks: below this a page's iteration count is dominated by the
-/// reply itself, not by its reads.
-const SCAN_BATCH_ORACLE_MIN_COLD: u64 = 16;
+/// Slots a walk page asks for, its `SCAN … COUNT`. A page may hold more:
+/// the index ends a page only after a whole home group, so a page holds up
+/// to `SCAN_PAGE_SLOTS` − 1 slots and the slots one home group's walk emits.
+/// Owner: the walk. Crossing: the walk's entry asserts that
+/// [`SCAN_ORACLE_READS_MIN`] is at least twice the cold-read rounds of a page
+/// of this many slots at the namespace's QD cap, and fails the run if not.
+const SCAN_PAGE_SLOTS: u64 = 512;
+
+/// Tier reads a page's cell's device must take after the cell holds the
+/// whole command before the batching oracle judges the page (ADR-0208 D2).
+/// A batched page enqueues a QD cap of intents a round, and a round reaches
+/// the device at one driver entry, so a page whose every round merges into
+/// one read puts as many reads as rounds there, one an entry. The floor is
+/// twice the 8 rounds of a page of [`SCAN_PAGE_SLOTS`] at a QD of 64: the
+/// second half is the overshoot's, so such a page reaches it only at 16
+/// rounds, 961 slots. Owner: the walk. Crossing: a page under it is not
+/// judged; at it or above, a page no other reader met at the device is.
+const SCAN_ORACLE_READS_MIN: u64 = 16;
+
+/// The tier reads one walk page's cell took around and after the page. Each
+/// is the cell's: the sim driver's count carries no owner.
+#[derive(Copy, Clone, Debug)]
+struct PageReads {
+    /// Reads in the scrape before the page, from its send until the cell
+    /// held the whole command, and in the scrape after its reply. None can
+    /// be the page's: it has enqueued nothing before the cell parses it, and
+    /// it answers only once every read it awaited is delivered.
+    cell_reads_outside: u64,
+    /// Reads after the cell held the whole command, through the reply.
+    cell_reads: u64,
+    /// The steps among those in which the driver took a read or more.
+    cell_read_steps: u64,
+}
+
+/// What the batching oracle makes of one page.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PageVerdict {
+    /// Fewer reads than the floor: not judged, whoever else read.
+    UnderFloor,
+    /// The floor's reads beside another reader at the device: not judged,
+    /// and counted as set aside.
+    SetAside,
+    /// Judged: some driver entry took two reads or more.
+    Batched,
+    /// Judged: every entry that took a read took exactly one.
+    Violation,
+}
+
+/// The `SCAN` batching oracle's verdict on one page's readings (ADR-0208
+/// D2, D3): a page no other reader met at its cell's device, with
+/// [`SCAN_ORACLE_READS_MIN`] reads or more, is a violation when every entry
+/// that took a read took exactly one. A chunk of intents enqueued before the
+/// page suspends reaches the device at one entry, so a batched page shares
+/// an entry between two reads somewhere.
+fn judge(reads: PageReads) -> PageVerdict {
+    assert!(
+        reads.cell_read_steps <= reads.cell_reads,
+        "a read step takes one tier read or more: {reads:?}"
+    );
+    if reads.cell_reads < SCAN_ORACLE_READS_MIN {
+        PageVerdict::UnderFloor
+    } else if reads.cell_reads_outside > 0 {
+        PageVerdict::SetAside
+    } else if reads.cell_read_steps < reads.cell_reads {
+        PageVerdict::Batched
+    } else {
+        PageVerdict::Violation
+    }
+}
+
+/// Counts one page's verdict in the run's report. A violation's line names
+/// the page and its readings, and the cell's intents across the page for its
+/// diagnosis.
+fn count_page(
+    report: &mut TieredNodeReport,
+    cell: usize,
+    cursor: u64,
+    cold: u64,
+    reads: PageReads,
+) {
+    match judge(reads) {
+        PageVerdict::UnderFloor => {}
+        PageVerdict::SetAside => report.scan_pages_set_aside += 1,
+        PageVerdict::Batched => report.scan_pages_judged += 1,
+        PageVerdict::Violation => {
+            report.scan_pages_judged += 1;
+            report.scan_pages_violating += 1;
+            let PageReads { cell_reads, cell_read_steps, .. } = reads;
+            report.violations.push(format!(
+                "SCAN BATCHING VIOLATION: cell {cell} page at cursor {cursor}: its device took \
+                 {cell_reads} tier reads in {cell_read_steps} entries, one a read \
+                 (scan-one-read-an-entry; {cold} intents on the cell across the page) — one \
+                 device round trip per \
+                 key, never a batch (F-L17-13, L3 / ADR-0055 D1)"
+            ));
+        }
+    }
+}
 
 pub(super) fn info_field(text: &str, key: &str) -> u64 {
     text.lines()
@@ -734,4 +846,50 @@ pub(super) fn finish(
     report.trace_hash = hash64(&report.trace, 0x71E7);
     report.sim_seconds = clock.now().0.saturating_sub(1) as f64 / 1e9;
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The batching oracle's verdict table, at 0, 1, 15, 16 and 17 tier reads
+    /// after the cell held the whole command: under the floor nothing is
+    /// judged; at it, another reader sets the page aside, an entry of two
+    /// reads is batched, and one read an entry is the violation.
+    #[test]
+    fn judge_answers_each_row_of_its_table() {
+        use PageVerdict::{Batched, SetAside, UnderFloor, Violation};
+        // (cell_reads_outside, cell_reads, cell_read_steps, verdict)
+        let rows = [
+            (0, 0, 0, UnderFloor),
+            (1, 0, 0, UnderFloor),
+            (0, 1, 1, UnderFloor),
+            (1, 1, 1, UnderFloor),
+            (0, 15, 15, UnderFloor),
+            (0, 15, 14, UnderFloor),
+            (1, 15, 15, UnderFloor),
+            (1, 15, 14, UnderFloor),
+            (0, 16, 16, Violation),
+            (0, 16, 15, Batched),
+            (0, 16, 1, Batched),
+            (1, 16, 16, SetAside),
+            (1, 16, 15, SetAside),
+            (0, 17, 17, Violation),
+            (0, 17, 16, Batched),
+            (1, 17, 17, SetAside),
+            (1, 17, 16, SetAside),
+        ];
+        for (outside, cell_reads, cell_read_steps, verdict) in rows {
+            let reads = PageReads { cell_reads_outside: outside, cell_reads, cell_read_steps };
+            assert_eq!(judge(reads), verdict, "{reads:?}");
+        }
+    }
+
+    /// A read step takes one read or more, so readings with more read steps
+    /// than reads are no page's: the verdict refuses them.
+    #[test]
+    #[should_panic(expected = "a read step takes one tier read or more")]
+    fn judge_refuses_more_read_steps_than_reads() {
+        let _ = judge(PageReads { cell_reads_outside: 0, cell_reads: 16, cell_read_steps: 17 });
+    }
 }

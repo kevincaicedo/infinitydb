@@ -2,7 +2,8 @@
 
 Cell runtime for InfinityDB: the `BackendDriver` contract, io_uring and
 kqueue backends, the single-threaded cell executor with typed suspension
-gates, the timer wheel, scheduler groups, and the 10-step reactor loop.
+gates, the fixed timer set (an indexed heap of reserved owners), scheduler
+groups, and the 10-step reactor loop.
 
 ## Backend tiers
 

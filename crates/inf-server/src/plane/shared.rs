@@ -50,9 +50,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         db: u16,
         ns: Option<NsId>,
         program: bool,
-        out: &mut Vec<u8>,
+        out: &mut ReplyBuf,
     ) -> bool {
-        let before = out.len();
         let mut cx = ConnCx {
             proto,
             id,
@@ -122,7 +121,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
                 origin,
                 ExecScope::of(&cx),
                 argv,
-                &out[before..],
+                out.bytes(),
                 now,
             );
             return false;
@@ -137,7 +136,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         }
         #[cfg(feature = "doc")]
         self.node.doc_log_admission.set(None);
-        self.observer.borrow_mut().on_execute(self.cell, origin, scope, argv, &out[before..], now);
+        self.observer.borrow_mut().on_execute(self.cell, origin, scope, argv, out.bytes(), now);
         cx.close_requested.get()
     }
 
@@ -237,14 +236,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             let store = ks.db_mut(usize::from(db));
             if del { store.del(key, now) } else { store.exists(key, now) }
         };
-        let mut reply = Vec::new();
-        RespWriter::new(&mut reply, Protocol::Resp2).int(i64::from(hit));
+        let mut reply = OpenReply::new(Vec::new());
+        RespWriter::new(reply.reply(), Protocol::Resp2).int(i64::from(hit));
         self.observer.borrow_mut().on_execute(
             self.cell,
             origin,
             ExecScope::Db(db),
             &[name, key],
-            &reply,
+            reply.bytes(),
             now,
         );
         i64::from(hit)
@@ -254,14 +253,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     pub(super) fn apply_dbsize(&self, origin: ExecOrigin, db: u16) -> i64 {
         let now = self.now.get();
         let len = self.store.borrow_mut().db_mut(usize::from(db)).len() as i64;
-        let mut reply = Vec::new();
-        RespWriter::new(&mut reply, Protocol::Resp2).int(len);
+        let mut reply = OpenReply::new(Vec::new());
+        RespWriter::new(reply.reply(), Protocol::Resp2).int(len);
         self.observer.borrow_mut().on_execute(
             self.cell,
             origin,
             ExecScope::Db(db),
             &[b"DBSIZE"],
-            &reply,
+            reply.bytes(),
             now,
         );
         len
@@ -527,9 +526,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         proto: Protocol,
         ns: NsId,
         program: bool,
-        out: &mut Vec<u8>,
+        out: &mut ReplyBuf,
     ) -> NsApplyOutcome {
-        let before = out.len();
         let meta = lookup(argv[0]);
         let class = self.store.borrow().ns_fsync_class(ns);
         let is_write = meta.is_some_and(|m| m.flags.contains(CmdFlags::WRITE));
@@ -583,10 +581,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             program,
             out,
         );
+        // Every command writes at least one frame; its outcome is the frame
+        // at the reply's start (ADR-0190 D2) — a byte count, never a read
+        // of the encoding.
+        debug_assert!(!out.bytes().is_empty(), "every command writes at least one frame");
         let mut outcome = NsApplyOutcome::Reply;
         if is_write
             && let (Some(meta), Some(class)) = (meta, class)
-            && (out.get(before) != Some(&b'-') || stages_despite_error(meta.id))
+            && stages(out.outcome(), meta.id)
             && let Some(seq) = self.stage_durable_effects(ns, meta, argv, class)
             && class == FsyncClass::Always
         {
@@ -681,61 +683,89 @@ pub(super) enum NsApplyOutcome {
 }
 
 /// Applies the internal `INF.NSFAN` DDL fan on a peer cell (M2-S08):
-/// `CREATE name mode fsync policy maxmemory id` / `DROP name`, fields as
-/// the origin serialized them (`-` = none). Returns false for non-NSFAN.
+/// `CREATE name mode fsync policy maxmemory id tier` / `DROP name epoch id
+/// mode` / `SET name …`, fields as the origin serialized them (`-` =
+/// none). Returns false for non-NSFAN.
 pub(super) fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     from: CellId,
     token: FabricToken,
     argv: &[&[u8]],
-    scratch: &mut Vec<u8>,
+    scratch: &mut ReplyStream,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
 ) -> bool {
     if !argv[0].eq_ignore_ascii_case(b"INF.NSFAN") {
         return false;
     }
-    let start = scratch.len();
-    let mut w = RespWriter::new(scratch, Protocol::Resp2);
+    // Test builds only: a test holds a `CREATE` leg here, so a write the
+    // origin acknowledges lands while the fan is in flight.
+    if argv.len() == 9
+        && argv[1].eq_ignore_ascii_case(b"CREATE")
+        && inf_foundation::fault::fire(crate::fault::NS_CREATE_LEG_HELD)
+    {
+        inf_foundation::fault::hold(crate::fault::NS_CREATE_LEG_HELD);
+    }
     // Crash-matrix point (ADR-0108 D3): a peer refusing its `CREATE`
-    // leg — the deterministic stand-in for the OS refusing the tier
-    // ring reservation on this cell after the catalog swap.
+    // leg — the deterministic stand-in for any refusal of the apply on
+    // this cell after the catalog swap: the OS refusing the tier ring
+    // reservation, or an admission bound lowered here during the wait.
     if argv.len() == 9
         && argv[1].eq_ignore_ascii_case(b"CREATE")
         && inf_foundation::fault::fire(crate::fault::NS_CREATE_FAN_REFUSED)
     {
-        w.error("ERR fault: ns_create_fan_refused");
-        staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+        let refusal = |w: &mut RespWriter<'_>| w.error("ERR fault: ns_create_fan_refused");
+        stage_leg_refusal(scratch, staged, (from, token), refusal);
+        return true;
+    }
+    if argv.len() == 6 && argv[1].eq_ignore_ascii_case(b"DROP") {
+        // Crash-matrix point: this peer cannot apply the drop (test builds
+        // only); in its place, every refusal below is the same fail-stop.
+        let refused = if inf_foundation::fault::fire(crate::fault::NS_DROP_LEG_REFUSED) {
+            Err("the injected refusal".to_owned())
+        } else {
+            apply_drop_leg(shared, argv)
+        };
+        if let Err(why) = refused {
+            let name = String::from_utf8_lossy(argv[2]);
+            let detail = format!("cell {} cannot apply the drop of '{name}': {why}", shared.cell.0);
+            super::ddl_fail_stop("DROP leg apply", &detail);
+        }
+        staged.push((from, token, StagedReply::Ok));
         return true;
     }
     match apply_nsfan(shared, argv) {
-        Ok(()) => w.simple("OK"),
-        Err(e) => crate::admin::ns_error(e, &mut w),
+        // An applied leg answers its variant alone (ADR-0189 D5): the
+        // origin reads `Ok` as applied, never a reply's bytes.
+        Ok(()) => staged.push((from, token, StagedReply::Ok)),
+        Err(refused) => stage_leg_refusal(scratch, staged, (from, token), |w| refused.write(w)),
     }
-    staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
     true
+}
+
+/// Stages a refused DDL leg's error reply in the drain's scratch, its
+/// outcome read from the reply's writer (ADR-0190 D2).
+fn stage_leg_refusal(
+    scratch: &mut ReplyStream,
+    staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
+    (from, token): (CellId, FabricToken),
+    write: impl FnOnce(&mut RespWriter<'_>),
+) {
+    let start = scratch.len();
+    let reply = scratch.open();
+    write(&mut RespWriter::new(reply, Protocol::Resp2));
+    let outcome = reply.outcome();
+    staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
 }
 
 fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     argv: &[&[u8]],
-) -> Result<(), inf_store::NsError> {
+) -> Result<(), CreateRefused> {
     use inf_store::NsError;
     let malformed = NsError::InvalidName; // internal vocabulary; never client-visible
-    if argv.len() == 4 && argv[1].eq_ignore_ascii_case(b"DROP") {
-        // ADR-0100 D4: the leg carries the persist epoch of the catalog
-        // swap that drops the namespace; this cell's tier teardown holds
-        // until that epoch is durable (D5).
-        let epoch: u64 =
-            core::str::from_utf8(argv[3]).ok().and_then(|s| s.parse().ok()).ok_or(malformed)?;
-        let spec = shared.store.borrow_mut().ns_drop(argv[2])?;
-        if spec.tier.is_some() {
-            shared.ns_drop_releases.borrow_mut().push((spec.id, epoch));
-        }
-        return Ok(());
-    }
     if argv.len() == 4 && argv[1].eq_ignore_ascii_case(b"SET") {
         let tier = tier_from_fan(argv[3])?.ok_or(malformed)?;
-        return shared.store.borrow_mut().ns_set_tier(argv[2], tier);
+        return Ok(shared.store.borrow_mut().ns_set_tier(argv[2], tier)?);
     }
     // Memory-namespace pressure keys (M4-S27, ADR-0068 D3): the MEMCFG
     // tag disambiguates from the tier-SET arm above.
@@ -758,10 +788,10 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     .ok_or_else(|| malformed.clone())?,
             ),
         };
-        return shared.store.borrow_mut().ns_set_memory(argv[2], policy, maxmemory);
+        return Ok(shared.store.borrow_mut().ns_set_memory(argv[2], policy, maxmemory)?);
     }
     if argv.len() != 9 || !argv[1].eq_ignore_ascii_case(b"CREATE") {
-        return Err(malformed);
+        return Err(malformed.into());
     }
     fn parse_str(b: &[u8]) -> Result<&str, inf_store::NsError> {
         core::str::from_utf8(b).map_err(|_| inf_store::NsError::InvalidName)
@@ -771,7 +801,7 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         b"-" => None,
         b"everysec" => Some(FsyncClass::Everysec),
         b"always" => Some(FsyncClass::Always),
-        _ => return Err(malformed),
+        _ => return Err(malformed.into()),
     };
     let policy = match argv[5] {
         b"-" => None,
@@ -785,7 +815,7 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     };
     let id: u32 = parse_str(argv[7])?.parse().map_err(|_| malformed.clone())?;
     let tier = tier_from_fan(argv[8])?;
-    shared.store.borrow_mut().ns_create(inf_store::NsSpec {
+    let spec = inf_store::NsSpec {
         id: NsId(id),
         name: argv[2].to_vec(),
         mode,
@@ -793,7 +823,118 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         policy,
         maxmemory,
         tier,
-    })
+    };
+    apply_create(shared, spec)
+}
+
+/// A peer's `INF.NSFAN DROP name epoch id mode` leg (ADR-0189 D4, D5):
+/// its receipt is built from the leg's epoch read against the catalog word,
+/// which the origin's own receipt already covered; the namespace the name
+/// holds here, if any, must carry the leg's id and mode; then the drop
+/// applies, `Removed` or `Absent` (a peer that refused or never received
+/// the `CREATE` leg), either an applied leg. `Err` says why this cell
+/// cannot apply it: each is unreachable while the origin fans an accepted
+/// drop's own leg, and each is the caller's fail-stop.
+fn apply_drop_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    argv: &[&[u8]],
+) -> Result<inf_store::ddl::DropApplied, String> {
+    let field = |at: usize| core::str::from_utf8(argv[at]).ok();
+    let epoch: u64 = field(3).and_then(|s| s.parse().ok()).ok_or("a malformed epoch")?;
+    let id: u32 = field(4).and_then(|s| s.parse().ok()).ok_or("a malformed id")?;
+    let mode = field(5).and_then(NsMode::parse).ok_or("a malformed mode")?;
+    let Some(control) = shared.control.borrow().clone() else {
+        return Err("no catalog writer on this node".to_owned());
+    };
+    let receipt = inf_store::ddl::DropPersisted::from_leg(NsId(id), epoch, control.catalog_word())
+        .map_err(|e| format!("epoch {} is not durable (the word is {})", e.epoch, e.word))?;
+    if let Some(spec) = shared.store.borrow().ns_get(argv[2])
+        && (spec.id != receipt.id() || spec.mode != mode)
+    {
+        let held = format!("{} {}", spec.id.0, spec.mode.name());
+        return Err(format!("the leg names {id} {}, this cell holds {held}", mode.name()));
+    }
+    apply_drop(shared, &receipt).map_err(|e| format!("{e:?}"))
+}
+
+/// Applies an accepted `DROP` to this cell's keyspace with its receipt
+/// (ADR-0189 D4, D5): the origin's, a rollback's and a peer's leg alike. A
+/// removed tiered namespace's tier files wait on the receipt's epoch
+/// (ADR-0189 D9), which the catalog word already covers, so they leave at
+/// the next MAINTAIN's teardown slices.
+pub(super) fn apply_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    receipt: &inf_store::ddl::DropPersisted,
+) -> Result<inf_store::ddl::DropApplied, inf_store::NsError> {
+    let applied = shared.store.borrow_mut().ns_drop(receipt)?;
+    if let inf_store::ddl::DropApplied::Removed(spec) = &applied
+        && spec.tier.is_some()
+        && let Some(tier) = shared.tier.borrow_mut().as_mut()
+    {
+        // The same step moves the owner to Draining (ADR-0148 D3); a cell
+        // with no Live owner of it counts the conflict (F3).
+        tier.drain(spec.id, receipt.fan_epoch());
+    }
+    Ok(applied)
+}
+
+/// Why a cell's apply of a `CREATE` refused (ADR-0148 D2): the store's
+/// own refusal, or the grant's.
+#[derive(Debug)]
+pub(super) enum CreateRefused {
+    /// The store refused the namespace: a validation it re-ran, or its
+    /// reservation.
+    Store(inf_store::NsError),
+    /// The directory names no grant this cell can install it at.
+    Grant(crate::tier_cell::InstallRefused),
+}
+
+impl From<inf_store::NsError> for CreateRefused {
+    fn from(e: inf_store::NsError) -> CreateRefused {
+        CreateRefused::Store(e)
+    }
+}
+
+impl CreateRefused {
+    /// The refusal's reply: the store's error as every `CREATE` path
+    /// renders it; a grant the directory does not name as the store's
+    /// unknown-namespace error; an occupied position as an internal error.
+    pub(super) fn write(self, w: &mut RespWriter<'_>) {
+        match self {
+            CreateRefused::Store(e) => crate::admin::ns_error(e, w),
+            CreateRefused::Grant(crate::tier_cell::InstallRefused::NotDeclared) => {
+                crate::admin::ns_error(inf_store::NsError::Unknown, w);
+            }
+            CreateRefused::Grant(crate::tier_cell::InstallRefused::Occupied) => {
+                w.error("ERR internal: the namespace's grant position holds an owner on this cell");
+            }
+        }
+    }
+}
+
+/// Applies an accepted `CREATE` to this cell's store and tiered plane
+/// (ADR-0148 D2, D3): the origin's and every peer's leg alike. A tiered
+/// namespace's owner is installed at the position the node's directory
+/// names Declared for it, in one nonsuspending step with the store's
+/// `ns_create`: the grant admitted first (it moves nothing), the store's
+/// fallible reservation next, the pipeline last. A grant the directory
+/// does not name, or a position this cell holds, refuses before any effect.
+pub(super) fn apply_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    spec: inf_store::NsSpec,
+) -> Result<(), CreateRefused> {
+    let Some(tier) = spec.tier else {
+        return Ok(shared.store.borrow_mut().ns_create(spec, &shared.census)?);
+    };
+    let permit = match shared.tier.borrow_mut().as_mut() {
+        Some(cell) => cell.admit_install(spec.id).map_err(CreateRefused::Grant)?,
+        None => return Err(CreateRefused::Grant(crate::tier_cell::InstallRefused::NotDeclared)),
+    };
+    shared.store.borrow_mut().ns_create(spec, &shared.census)?;
+    if let Some(cell) = shared.tier.borrow_mut().as_mut() {
+        cell.install(permit, &tier);
+    }
+    Ok(())
 }
 
 /// Serializes a tier spec for the `INF.NSFAN` vector (M4-S19): `-` for

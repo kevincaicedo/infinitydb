@@ -19,6 +19,7 @@
 //! Every event folds into `trace_hash`; `--verify-determinism` runs the
 //! scenario twice and requires hash identity (L7).
 
+use crate::driver::Violations;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -67,7 +68,7 @@ impl SteelScenario {
 
 #[derive(Debug, Default)]
 pub struct SteelReport {
-    pub violations: Vec<String>,
+    pub violations: Violations,
     pub cold_reads: u64,
     pub promotions: u64,
     pub trace_hash: u64,
@@ -283,6 +284,7 @@ fn run_life(
     report: &mut SteelReport,
     hasher: KeyHasher,
 ) -> (LogicalAddr, u32) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // Replay the ledger into a fresh life (the harness plays the WAL).
     let mut ks = Keyspace::new(StoreConfig { hasher, ..Default::default() });
     assert!(
@@ -291,6 +293,7 @@ fn run_life(
             AddressSpaceConfig { reserve_bytes: RING, page_bytes: PAGE, life_origin },
             DemotionConfig::for_budget(RING as u64, PAGE as u64),
             64,
+            &census,
         )
         .is_ok()
     );
@@ -331,8 +334,10 @@ fn run_life(
             mode: TierIoMode::Buffered,
             file_capacity: TIER_FILE_CAPACITY_DEFAULT,
             slice_bytes: PAGE as u64,
+            record_len_max: 16 << 20,
         },
         tier_file_id,
+        &census,
     );
     table.flush_drain(&mut flush).expect("flush drain");
     assert_eq!(table.space().flushed(), tail, "drain confirms the whole sealed range");

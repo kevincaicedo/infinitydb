@@ -1,6 +1,7 @@
 //! Runtime bounds owned by the server. Every crossing names its behavior here.
 
 use inf_foundation::bounded::{Cap, CapFill};
+use inf_foundation::time::Nanos;
 
 /// Reclaim marks one tiered namespace holds on its cell: ADR-0061 D5's
 /// `(seq, epoch)` marks, one per ack class (ADR-0163 D2). After MAINTAIN
@@ -23,6 +24,48 @@ pub const EPOCH_MARKS_MAX: u32 = 16;
 /// `epoch-marks`, filled while the cell serves.
 pub const EPOCH_MARKS: Cap = Cap::entries::<EPOCH_MARKS_MAX>("epoch-marks", CapFill::Serving);
 
+/// Ack points one cell's durable plane holds: a frame's exclusive end and
+/// the last durable seq it carries, for every frame queued and not yet
+/// covered by the fsync watermark. Coalescing keeps a written point only
+/// where an unfolded ledger entry covers up to it, so the map holds at most
+/// the frames behind the written prefix, one point per unfolded ledger entry
+/// and one more: `REORDER_WINDOW_FRAMES + FSYNC_LEDGER_ENTRIES + 1`. Owner:
+/// the cell's `DurableCell`, one map built with it. Crossing: pacing — the
+/// LOG step asks the map's admission before the frame's plan and holds the
+/// frame while it is full (derived never to occur; `frame_waits_ack_map`
+/// counts it once per held frame).
+#[cfg(not(inf_canary_ack_map_window_only))]
+pub const ACK_MAP_ENTRIES: u32 =
+    inf_log::limits::REORDER_WINDOW_FRAMES + inf_log::limits::FSYNC_LEDGER_ENTRIES + 1;
+/// Canary: the ack map sized as the frame queue alone, so it fills while
+/// unfolded ledger entries keep their points.
+#[cfg(inf_canary_ack_map_window_only)]
+pub const ACK_MAP_ENTRIES: u32 = inf_log::limits::REORDER_WINDOW_FRAMES;
+
+/// The ack map's cap: `ACK_MAP_ENTRIES` entries under the census name
+/// `ack-map`, filled while the cell serves.
+pub const ACK_MAP: Cap = Cap::entries::<ACK_MAP_ENTRIES>("ack-map", CapFill::Serving);
+
+/// Timer owner positions one server cell holds (ADR-0154 D1, D4): its roles'
+/// count, `TimerRole::COUNT` (one listener's accept retry, everysec, fill
+/// hold, group hold), so the cap is derived from the producers and a role
+/// added is a position added. Owner: `ServerTimers::build`, the cell's one
+/// constructor of its set and its owners, inside `ServerPlane::new`.
+/// `CapFill::Assembly`: the build reserves every position before the cell's
+/// loop exists, and no role closes its owner, so the `timer-owners` row is
+/// full at the serve mark and takes no publish after it (the census counts
+/// any in `cap_assembly_violations`). Crossing: a reserve refused at the
+/// assembly fails it before anything serves (`TimerAssemblyError`); derived
+/// never, as the cap is the role count.
+#[cfg(not(inf_canary_timer_owners_short))]
+pub const SERVER_TIMER_OWNERS: Cap =
+    Cap::entries::<{ crate::TimerRole::COUNT }>("timer-owners", CapFill::Assembly);
+/// Canary: a cap one short of the roles, so every assembly's last reserve
+/// is refused.
+#[cfg(inf_canary_timer_owners_short)]
+pub const SERVER_TIMER_OWNERS: Cap =
+    Cap::entries::<{ crate::TimerRole::COUNT - 1 }>("timer-owners", CapFill::Assembly);
+
 /// Checkpoint-board slots one cell's sweep visits per MAINTAIN turn
 /// (ADR-0159 D4, A1.4). Owner: the cell's `BoardSweep`, charged as one
 /// Maintenance unit per turn as MAINTAIN's first budgeted step. Crossing:
@@ -31,15 +74,32 @@ pub const EPOCH_MARKS: Cap = Cap::entries::<EPOCH_MARKS_MAX>("epoch-marks", CapF
 /// publication is observed within two completed sweeps.
 pub const CKPT_BOARD_VISITS_PER_TURN: usize = 64;
 
+/// Tiered namespace lifetimes a node holds at once (ADR-0148 D1, A1.1), the
+/// one value `inf_foundation::limits` declares with its unit and crossing:
+/// the catalog writer's grant book refuses a tiered `CREATE` past it, and a
+/// boot whose catalog names more live tiered definitions is refused before
+/// any cell.
+pub use inf_foundation::limits::TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX;
+
+/// The namespace-id counter's spent value (ADR-0148 D4). Unit: namespace
+/// ids per data directory, issued from `FIRST_NAMED_NS_ID` up to
+/// `u32::MAX − 1`, once each (ADR-0015 D2). Owner: the catalog writer, the
+/// counter's one mover. Crossing: a counter at this value issues none, so
+/// every `INF.NS CREATE` answers `IdentityExhausted(Namespace)` before any
+/// effect, for the data directory's life.
+pub const NS_IDS_EXHAUSTED: u32 = u32::MAX;
+
 /// The recovery step budget's price of one byte a tiered boot replay
 /// machine wrote to a tier file (ADR-0174 R10; D6's gauge reads the
 /// largest step's charge): one budget byte, the device bytes the step
 /// moved. Owner: the recovery driver (`RecoverConfig::step_bytes` is the
-/// budget it charges). Crossing: a step whose bytes read plus its charge
-/// reach the budget yields at the next frame or checkpoint section (the
-/// non-yielding unit, ADR-0174 OD-1), or after the settle step that
-/// reached it. The bytes the end settle walks and its reads are priced by
-/// the store, whose walk yields on them
+/// budget it charges). Crossing: a step whose charge — the bytes its cursor
+/// passed and its priced boot work — reaches the budget yields at the next
+/// record or entry, inside a log frame or a checkpoint section (ADR-0174
+/// A1), after an index-sidecar section, after the settle step that reached
+/// it, or at the hand-over's next unit. The bytes a demote step's seal walk
+/// and the end settle pass, and their reads, are priced by the store, whose
+/// walks yield on them
 /// ([`ReplayWork::settle_charge_bytes`](inf_store::ReplayWork::settle_charge_bytes)).
 pub const REPLAY_TIER_BYTE_CHARGE: u64 = 1;
 
@@ -154,3 +214,99 @@ const _: () = {
     }
     assert!(JSON_FIXED_REPLY_BYTES_MAX == 348, "the fixed column's maximum is 348 bytes");
 };
+
+/// Legs of one cross-cell `JSON.MGET` gather in flight at once (ADR-0173
+/// D4): 3, the owner's value, which keeps a gather over every cell of a
+/// four-cell node at one round trip. Owner: the gather's FIFO of leg
+/// waiters, built per gather on the cell's census; every gather of the cell
+/// shares the `json-gather-legs` row. Crossing: pacing — with this many legs
+/// in flight the next leg waits for the oldest leg's reply (the
+/// connection's pump with it), and the row counts a crossing in `INFO caps`.
+/// A larger value needs a decision record that first accounts for the
+/// memory a connection's queued requests hold: one refused gather can hold
+/// (this value + 1) × `doc-max-reply-bytes`.
+#[cfg(feature = "doc")]
+pub const JSON_GATHER_LEGS_IN_FLIGHT_MAX: u32 = 3;
+
+/// The gather window's cap: `JSON_GATHER_LEGS_IN_FLIGHT_MAX` entries under
+/// the census name `json-gather-legs`, filled while the cell serves.
+#[cfg(feature = "doc")]
+pub const JSON_GATHER_LEGS: Cap =
+    Cap::entries::<JSON_GATHER_LEGS_IN_FLIGHT_MAX>("json-gather-legs", CapFill::Serving);
+
+/// Bytes of the longest frame header a `JSON.MGET` leg's reply carries: a
+/// type byte, the decimal of a `u64` length (20 digits at most), CRLF — the
+/// most the reply writer emits for one element. Owner: the gather's leg
+/// decoder, which looks for a header's CRLF within it. Crossing: a header
+/// longer than this is a malformed success, answered
+/// `ERR cross-cell program reply malformed`.
+#[cfg(feature = "doc")]
+pub const JSON_LEG_FRAME_HEADER_BYTES_MAX: usize = 1 + decimal_digits(u64::MAX) + 2;
+
+#[cfg(feature = "doc")]
+const _: () = assert!(JSON_LEG_FRAME_HEADER_BYTES_MAX == 23, "`$`, 20 digits and CRLF");
+
+/// Decimal digits of `value`.
+#[cfg(feature = "doc")]
+const fn decimal_digits(mut value: u64) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// The recovery step budget's price (ADR-0174 A1) of one boot file
+/// operation outside replay — in the start step's tier map, an open of an
+/// existing tier file, a truncate, a removal, a directory listing's open
+/// and each batch it reads (at most 256 names and 8 KiB, ADR-0202 D2); at
+/// the hand-over, the rename that brings a quarantined extent the replayed
+/// map references back under its name (ADR-0096 D3): 128 KiB, about 100 µs
+/// of a device that moves 1 GiB/s, as a settle read is priced; a cold
+/// listing batch reads a few directory blocks. An estimate the
+/// reference-box run calibrates, never a measurement. Owner: the recovery
+/// driver, which charges it per operation and, at the hand-over, runs as
+/// many a turn as its budget left buys, at least one. Crossing: the step
+/// yields once its charge reaches the budget, at the next unit, and the
+/// next step resumes at its phase's cursor.
+pub const BOOT_FILE_OP_CHARGE_BYTES: u64 = 128 << 10;
+
+/// The accept retry's window, in injected time: after the driver parks a
+/// listener's accept arm on an exhaustion or a broken-listener failure, the
+/// plane's accept-retry timer owner re-arms it this long after the failure.
+/// Descriptors freed outside the driver (segment files, checkpoint handles),
+/// and a listener parked as broken, which no `Close` resumes, let queued
+/// clients in by this retry alone. Owner: the plane's accept-retry owner,
+/// armed from Idle by a window's first failure. Crossing: pacing. Failures
+/// inside a window coalesce into its one arm, which falls due at most one
+/// window and the deadline's rounding millisecond after the window's first
+/// failure (ADR-0154 D3). While the failure persists, each retry fails
+/// again, counts one error and arms one more window: one `accept(2)` a
+/// window, never a spin (ADR-0118 D2), and a queued client waits one more
+/// window for each failed retry.
+pub const ACCEPT_RETRY: Nanos = Nanos::from_millis(100);
+
+/// Data credits the plane keeps free toward each peer for the owner pump's
+/// publish fan (ADR-0192 D2): a general send stages only while more than
+/// this many credits toward its peer are free, so at least one stays free
+/// after it, and a fan leg, one in flight toward each peer, may take it.
+/// Unit: data credits per directed cell pair. Owner: the plane's
+/// `PlaneFabric`. Crossing: a general send with this many or fewer free
+/// gets `NoCredit` and parks for a returned credit, as at the window's end:
+/// the client sees latency, never a refusal.
+pub const FAN_RESERVE_PER_PEER: u32 = 1;
+
+/// Data credits per directed cell pair of the shipped binary's mesh; the
+/// general window is this less [`FAN_RESERVE_PER_PEER`]. Unit: data
+/// credits. Owner: `infinityd`'s mesh constant, built through
+/// `checked_mesh_config`. Crossing: a send past the window parks for a
+/// returned credit.
+pub const FABRIC_CREDITS_PER_PEER: u32 = 1024;
+
+/// Ring slots per directed cell pair of the shipped binary's mesh: a power
+/// of two with reply headroom over [`FABRIC_CREDITS_PER_PEER`]. Unit: ring
+/// slots. Owner: `infinityd`'s mesh constant, built through
+/// `checked_mesh_config`. Crossing: none at run time; a pair the check
+/// refuses fails the build.
+pub const FABRIC_RING_SLOTS_PER_PEER: usize = 4096;

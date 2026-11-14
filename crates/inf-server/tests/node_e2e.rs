@@ -2,6 +2,10 @@
     clippy::disallowed_methods,
     reason = "test target: harness deadlines and timings, not cell code"
 )]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: the drain message reads each cell's stop hold"
+)]
 //! End-to-end node assembly test (Linux + uring): two real cells on real
 //! threads behind one SO_REUSEPORT port, driven over TCP — local fast path,
 //! cross-cell Apply round-trips, multi-key aggregation, pipelined reply
@@ -26,7 +30,7 @@ use inf_foundation::time::{Clock, Nanos, StdClock};
 use inf_runtime::net::{bound_port, listen_reuseport};
 use inf_runtime::{CellLoop, LoopConfig, UringDriver};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
-use inf_store::{Keyspace, SlotRouter, StoreConfig};
+use inf_store::{KeyspaceSeed, SlotRouter, StoreConfig};
 
 /// The checkpoint trigger a test node boots with (ADR-0088 D4). The
 /// product derives its interval from the last checkpoint's size, which
@@ -187,7 +191,15 @@ struct Node {
     /// cleared by [`Node::stop_synced`].
     stop_checkpoint: Arc<AtomicBool>,
     drained: Arc<std::sync::atomic::AtomicU16>,
-    handles: Vec<std::thread::JoinHandle<()>>,
+    /// Each cell's stop phase as it last read it ([`stop_phase_byte`]), so a
+    /// drain that times out names where every cell stands.
+    stop_phases: Arc<Vec<std::sync::atomic::AtomicU8>>,
+    /// Each cell's stop hold as it last read it, beside its phase: the wait
+    /// a drain that times out names.
+    stop_holds: StopHolds,
+    /// Each cell thread returns the tiered namespaces it ran at the
+    /// product's `TAIL-STALL-TIMEOUT` default ([`note_product_tail_stall`]).
+    handles: Vec<std::thread::JoinHandle<NsNames>>,
     /// Control handle of a durable node (manual checkpoint trigger — the
     /// surface `INF.CKPT` rides at S20).
     control: Option<Arc<inf_server::ControlHandle>>,
@@ -204,10 +216,83 @@ struct Node {
     process_sampler: std::cell::RefCell<inf_server::ProcessSampler>,
     /// One per cell, open unless a test holds it (`drive_paced_ckpt_with_pump`).
     clock_gates: Vec<Arc<ClockGate>>,
+    /// The tiered namespaces whose `TAIL-STALL-TIMEOUT` the test stated,
+    /// by name: through [`tiered_ns_create_stalling_at`], or as the
+    /// product's default it is about ([`Node::expect_product_tail_stall`]).
+    /// The stop's check ([`Node::assert_tail_stall_stated`]) passes them.
+    tail_stall_stated: std::cell::RefCell<NsNames>,
+}
+
+/// A set of tiered namespace names, in byte order.
+type NsNames = std::collections::BTreeSet<Vec<u8>>;
+
+/// What a node is assembled with beyond its shape: the store configuration
+/// every cell's keyspace takes, and the log its cells' observers record into
+/// (`None`: they record nothing).
+#[derive(Clone, Default)]
+struct NodeExtras {
+    store: StoreConfig,
+    log: Option<ExecLog>,
+}
+
+/// One command a cell executed, as its observer saw it: the cell, the cell a
+/// fabric `Apply` came from (`None` for a connection of the cell's own) and
+/// the argv.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Executed {
+    cell: u16,
+    from: Option<u16>,
+    argv: Vec<Vec<u8>>,
+}
+
+/// The executions of every cell of one node, in the order the cells logged
+/// them (each cell's own order is its execution order).
+type ExecLog = Arc<std::sync::Mutex<Vec<Executed>>>;
+
+/// A cell's observer: appends each execution to the node's log when the node
+/// was started with one. A test reads which cell ran which command, so a leg
+/// a gather sent, held or never sent is observed on its owner.
+struct Recorder {
+    cell: u16,
+    log: Option<ExecLog>,
+}
+
+impl inf_server::PlaneObserver for Recorder {
+    fn on_execute(
+        &mut self,
+        cell: CellId,
+        origin: inf_server::ExecOrigin,
+        _scope: inf_server::ExecScope,
+        argv: &[&[u8]],
+        _reply: &[u8],
+        _now: Nanos,
+    ) {
+        debug_assert_eq!(cell.0, self.cell, "a cell's observer observes its own cell");
+        let Some(log) = &self.log else { return };
+        let from = match origin {
+            inf_server::ExecOrigin::Conn(..) => None,
+            inf_server::ExecOrigin::Fabric(from) => Some(from.0),
+        };
+        let argv = argv.iter().map(|arg| arg.to_vec()).collect();
+        log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Executed {
+            cell: cell.0,
+            from,
+            argv,
+        });
+    }
+}
+
+/// The executions in `log` whose command is `name`, in log order.
+fn executed(log: &ExecLog, name: &[u8]) -> Vec<Executed> {
+    let log = log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    log.iter().filter(|e| e.argv.first().is_some_and(|a| a.as_slice() == name)).cloned().collect()
 }
 
 struct CatalogPump {
     hold: Arc<AtomicBool>,
+    /// Swaps the pump may still land while `hold` is set
+    /// ([`Node::land_held_persists`]): one lands, the next stays queued.
+    allow: Arc<std::sync::atomic::AtomicU32>,
     stop: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<()>,
 }
@@ -221,11 +306,12 @@ impl Node {
         cells: u16,
         data_dir: &std::path::Path,
         hold: Arc<AtomicBool>,
+        trigger: CkptTrigger,
     ) -> Node {
         Node::start_cfg_default(
             cells,
             Some(data_dir.to_path_buf()),
-            CkptTrigger::Manual,
+            trigger,
             Default::default(),
             Vec::new(),
             false,
@@ -238,7 +324,16 @@ impl Node {
             Some(hold),
             None,
             None,
+            Vec::new(),
+            NodeExtras::default(),
         )
+    }
+
+    /// Lets the held catalog writer land `n` more swaps while `hold`
+    /// stays set: a swap past them stays queued, first in line.
+    fn land_held_persists(&self, n: u32) {
+        let pump = self.catalog_pump.as_ref().expect("a held-catalog node");
+        pump.allow.fetch_add(n, Ordering::AcqRel);
     }
 
     /// Ends the node the way a power cut inside a held swap would: cell
@@ -247,16 +342,51 @@ impl Node {
     /// stays on disk (process-kill physics).
     fn kill_without_catalog_drain(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        for handle in self.handles.drain(..) {
-            handle.join().expect("cell thread");
-        }
+        let at_default = self.join_cells();
         let pump = self.catalog_pump.take().expect("a held-catalog node");
         pump.stop.store(true, Ordering::Relaxed);
         pump.handle.join().expect("catalog pump thread");
+        self.assert_tail_stall_stated(&at_default);
     }
 
     fn start(cells: u16) -> Node {
         Node::start_with(cells, None, CkptTrigger::Manual)
+    }
+
+    /// A volatile node of `cells` cells whose keyspaces take `store` and
+    /// whose cells record every execution into the returned log.
+    fn start_recorded(cells: u16, store: StoreConfig) -> (Node, ExecLog) {
+        Node::start_recorded_in(cells, None, store)
+    }
+
+    /// [`Node::start_recorded`] over `data_dir`, a durable node (named
+    /// namespaces need its control plane).
+    fn start_recorded_in(
+        cells: u16,
+        data_dir: Option<std::path::PathBuf>,
+        store: StoreConfig,
+    ) -> (Node, ExecLog) {
+        let log = ExecLog::default();
+        let node = Node::start_cfg_default(
+            cells,
+            data_dir,
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            Default::default(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            NodeExtras { store, log: Some(Arc::clone(&log)) },
+        );
+        (node, log)
     }
 
     /// A volatile node whose cell clocks all read `held` (see [`HeldClock`]).
@@ -277,6 +407,8 @@ impl Node {
             None,
             None,
             Some(held),
+            Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -286,6 +418,48 @@ impl Node {
     /// Automatic checkpoints stay off (tests own the trigger).
     fn start_durable(cells: u16, data_dir: &std::path::Path) -> Node {
         Node::start_with(cells, Some(data_dir.to_path_buf()), CkptTrigger::Manual)
+    }
+
+    /// Boots a durable node on `dir` and returns recovery's verdict instead
+    /// of panicking on it: `Err` carries the refusing cell's fail-stop
+    /// message, after the cells that did recover are stopped. The throttle
+    /// at the full rate only turns off `start_cfg`'s own wait: its delay is
+    /// 0 ns a step, and the cells park between recovery steps (the
+    /// throttled cadence), which changes when a step runs, not what it does.
+    fn start_durable_or_refusal(cells: u16, dir: &std::path::Path) -> Result<Node, String> {
+        let recover = inf_server::RecoverConfig {
+            throttle_bytes_per_sec: Some(u64::MAX),
+            ..Default::default()
+        };
+        let mut node = Node::start_full(
+            cells,
+            Some(dir.to_path_buf()),
+            CkptTrigger::Manual,
+            recover,
+            Vec::new(),
+        );
+        let control = Arc::clone(node.control.as_ref().expect("a durable node"));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if control.recovery_board().all_ready() {
+                return Ok(node);
+            }
+            if let Some(at) = node.handles.iter().position(std::thread::JoinHandle::is_finished) {
+                let refusal = match node.handles.remove(at).join() {
+                    Ok(_) => "a cell thread exited during recovery".to_owned(),
+                    Err(payload) => payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                        .unwrap_or_else(|| "a cell thread panicked".to_owned()),
+                };
+                node.stop();
+                return Err(refusal);
+            }
+            assert!(Instant::now() < deadline, "recovery did not finish in 60 s");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn start_durable_with_default_ns(
@@ -309,6 +483,8 @@ impl Node {
             None,
             None,
             None,
+            Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -340,6 +516,8 @@ impl Node {
             None,
             None,
             None,
+            Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -367,6 +545,8 @@ impl Node {
             None,
             Some(std::num::NonZeroU64::new(units).expect("headroom >= 1")),
             None,
+            Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -576,6 +756,8 @@ impl Node {
             None,
             None,
             None,
+            Vec::new(),
+            NodeExtras::default(),
         )
     }
 
@@ -596,6 +778,8 @@ impl Node {
         held_catalog: Option<Arc<AtomicBool>>,
         ckpt_headroom: Option<std::num::NonZeroU64>,
         held_clock: Option<HeldClock>,
+        holds: Vec<(u16, &'static str, inf_foundation::fault::HoldGate)>,
+        extras: NodeExtras,
     ) -> Node {
         assert!(held_clock.is_none() || data_dir.is_none(), "a held clock boots a volatile node");
         let stop = Arc::new(AtomicBool::new(false));
@@ -605,6 +789,9 @@ impl Node {
         let stop_checkpoint = Arc::new(AtomicBool::new(true));
         let quiet = Arc::new(std::sync::atomic::AtomicU16::new(0));
         let drained = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let stop_phases: Arc<Vec<std::sync::atomic::AtomicU8>> =
+            Arc::new((0..cells).map(|_| Default::default()).collect());
+        let stop_holds: StopHolds = Arc::new((0..cells).map(|_| Default::default()).collect());
         // The node identity (ADR-0124 D5): one value per node, every cell.
         let run_id = {
             let seed = u64::from(std::process::id()) << 32 | u64::from(port_seed());
@@ -637,35 +824,44 @@ impl Node {
             let (control, issuers) = match &held_catalog {
                 None => {
                     inf_server::spawn_control_in(dir.clone(), catalog.as_ref(), space, boot_unix_ms)
+                        .expect("the catalog boots")
                 }
                 Some(hold) => {
                     // The sim's detached writer, driven by a harness
-                    // thread that honours `hold` — same `prepare_persist`,
+                    // thread that honours `hold` — the same
+                    // `CatalogWriter::answer`,
                     // same on-disk swap, no control thread.
                     let (control, mut inbox, issuers) = inf_server::ControlHandle::detached_in(
                         catalog.as_ref(),
                         space,
                         boot_unix_ms,
-                    );
+                    )
+                    .expect("the catalog boots");
                     let hold = Arc::clone(hold);
+                    let allow = Arc::new(std::sync::atomic::AtomicU32::new(0));
                     let pump_stop = Arc::new(AtomicBool::new(false));
                     let pump_dir = dir.clone();
                     let handle = {
                         let hold = Arc::clone(&hold);
+                        let allow = Arc::clone(&allow);
                         let pump_stop = Arc::clone(&pump_stop);
                         std::thread::spawn(move || {
                             while !pump_stop.load(Ordering::Relaxed) {
+                                let fs = inf_server::StdSegmentFs;
                                 if !hold.load(Ordering::Relaxed) {
-                                    inbox
-                                        .drain(&inf_server::StdSegmentFs, &pump_dir)
+                                    inbox.drain(&fs, &pump_dir).expect("held-catalog META swap");
+                                } else if let n @ 1.. = allow.load(Ordering::Acquire) {
+                                    let landed = inbox
+                                        .drain_requests(&fs, &pump_dir, Some(n))
                                         .expect("held-catalog META swap");
+                                    allow.fetch_sub(landed, Ordering::AcqRel);
                                 }
                                 #[allow(clippy::disallowed_methods)] // harness thread
                                 std::thread::sleep(Duration::from_millis(1));
                             }
                         })
                     };
-                    catalog_pump = Some(CatalogPump { hold, stop: pump_stop, handle });
+                    catalog_pump = Some(CatalogPump { hold, allow, stop: pump_stop, handle });
                     (control, issuers)
                 }
             };
@@ -688,15 +884,27 @@ impl Node {
             let stop_checkpoint = Arc::clone(&stop_checkpoint);
             let quiet = Arc::clone(&quiet);
             let drained = Arc::clone(&drained);
+            let stop_phases = Arc::clone(&stop_phases);
+            let stop_holds = Arc::clone(&stop_holds);
             let boot = boot.clone();
             let issuer = cell_issuers.get_mut(i).and_then(Option::take);
             let faults = faults.clone();
+            let holds = holds.clone();
             let default_ns = default_ns.clone();
+            let extras = extras.clone();
             handles.push(std::thread::spawn(move || {
                 // M2-S16: arm this cell's fault plan before recovery — the
                 // registry is thread-local (cells are single-threaded, L1).
                 for &(point, spec) in &faults {
                     inf_foundation::fault::arm(point, spec);
+                }
+                // A hold is armed on the one cell it names. Every cell's
+                // closure keeps its clone of the plan for the thread's
+                // life, so a gate a test abandons is never released here:
+                // a test that panics before its release leaves the held
+                // cell waiting until the test process exits.
+                for (_, point, gate) in holds.iter().filter(|(cell, ..)| usize::from(*cell) == i) {
+                    inf_foundation::fault::arm_hold(point, gate);
                 }
                 let pool = BufferPool::new(256, 4096);
                 // No fixed-buffer registration: it is a capability probe no
@@ -718,20 +926,28 @@ impl Node {
                         .unwrap_or(0),
                 };
                 node.wall_anchor.set((0, unix_ms));
-                let mut ks = Keyspace::new(StoreConfig::default());
+                // A durable node's keyspace is cataloged, as `infinityd`'s.
+                let cfg = extras.store;
+                let seed = match &boot {
+                    Some((_, catalog, _)) => KeyspaceSeed::Cataloged {
+                        cfg,
+                        catalog: catalog.clone().unwrap_or_else(inf_store::NsCatalog::empty),
+                    },
+                    None => KeyspaceSeed::Uncataloged { cfg, specs: Vec::new() },
+                };
                 let mut durable = None;
-                if let Some((dir, catalog, control)) = &boot {
-                    if let Some(catalog) = catalog {
-                        ks.seed_catalog(catalog).expect("seed catalog");
-                    }
+                if let Some((dir, _catalog, control)) = &boot {
                     let cfg = inf_server::DurableConfig {
                         data_dir: dir.clone(),
-                        staging: staging.unwrap_or_default(),
-                        segment: inf_log::SegmentConfig {
-                            segment_bytes: 8 << 20, // small: tests rotate
-                            io_mode,
-                            ..Default::default()
-                        },
+                        geometry: inf_log::LogGeometry::new(
+                            staging.unwrap_or_default(),
+                            inf_log::SegmentConfig {
+                                segment_bytes: 8 << 20, // small: tests rotate
+                                io_mode,
+                                ..Default::default()
+                            },
+                        )
+                        .expect("the node's log geometry"),
                         ckpt: ckpt.config(),
                         recover,
                         flush_bound: 1,
@@ -742,16 +958,17 @@ impl Node {
                     };
                     durable = Some((cfg, Arc::clone(control)));
                 }
-                let (mut plane, serve_mark) = ServerPlane::new(
+                let (mut plane, serve_mark, timer_set) = ServerPlane::new(
                     CellId(i as u16),
                     cells,
                     listener.into_raw_fd(),
-                    ks,
+                    seed,
                     fabric,
                     node,
-                    NoopObserver,
+                    Recorder { cell: i as u16, log: extras.log.clone() },
                     false,
-                );
+                )
+                .expect("the server's timer owners fit their cap");
                 plane.set_tcp_transport(true);
                 plane.set_fabric_apply_prefetch(apply_prefetch);
                 plane.set_parse_batch_prefetch(parse_prefetch);
@@ -769,24 +986,31 @@ impl Node {
                     );
                 }
                 let config = LoopConfig {
-                    park_default: Some(Duration::from_millis(5)),
+                    park_default: inf_runtime::ParkCeiling::new(Duration::from_millis(5))
+                        .expect("a park ceiling within the maximum"),
                     ..Default::default()
                 };
                 let clock = match held_clock {
                     Some(held) => CellClock::Held(held.internal),
                     None => CellClock::Running(gate.start()),
                 };
-                let mut cell_loop = CellLoop::new(driver, clock, pool, config, serve_mark);
+                let mut cell_loop =
+                    CellLoop::new(driver, clock, pool, config, serve_mark, timer_set);
                 let (mut counted_quiet, mut counted) = (false, false);
+                let mut at_default = NsNames::new();
                 while !stop.load(Ordering::Relaxed) {
                     cell_loop.run_iteration(&mut plane).expect("iteration");
                     if let Some(err) = plane.take_boot_error() {
                         panic!("cell {i} recovery failed (fail-stop): {err}");
                     }
+                    note_product_tail_stall(&plane, &mut at_default);
                     if graceful.load(Ordering::Relaxed) {
                         plane.set_stop_checkpoint(stop_checkpoint.load(Ordering::Relaxed));
                         plane.request_stop();
                         let phase = plane.stop_phase();
+                        stop_phases[i].store(stop_phase_byte(phase), Ordering::Release);
+                        *stop_holds[i].lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            plane.stop_hold();
                         if !counted_quiet
                             && matches!(
                                 phase,
@@ -808,6 +1032,7 @@ impl Node {
                         }
                     }
                 }
+                at_default
             }));
         }
         let control = boot.map(|(_, _, control)| control);
@@ -818,12 +1043,15 @@ impl Node {
             graceful,
             stop_checkpoint,
             drained,
+            stop_phases,
+            stop_holds,
             handles,
             control,
             ckpt_host: std::cell::RefCell::new(ckpt_host),
             catalog_pump,
             process_sampler: std::cell::RefCell::new(process_sampler),
             clock_gates,
+            tail_stall_stated: Default::default(),
         };
         // Most tests speak data commands immediately after start: wait out
         // the -LOADING window unless the test throttled recovery to
@@ -878,11 +1106,40 @@ impl Node {
         self.graceful.store(true, Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(30);
         while self.drained.load(Ordering::Acquire) < self.cells {
-            assert!(Instant::now() < deadline, "the node did not drain in 30 s");
+            assert!(Instant::now() < deadline, "{}", self.drain_timed_out());
             #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
             std::thread::sleep(Duration::from_millis(1));
         }
         self.stop();
+    }
+
+    /// The drain timeout's message: every cell's stop phase and the wait
+    /// that holds it, and how many drained. A cell held at `Quiet` has no
+    /// live connection left: it waits on the other cells, on the stop
+    /// checkpoint's publication (when the stop takes one) or on one of its
+    /// durable terms, which its hold names.
+    fn drain_timed_out(&self) -> String {
+        let phases: Vec<String> = self
+            .stop_phases
+            .iter()
+            .zip(self.stop_holds.iter())
+            .enumerate()
+            .map(|(cell, (byte, hold))| {
+                let byte = byte.load(Ordering::Acquire);
+                let hold = *hold.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                match stop_phase_of_byte(byte) {
+                    Some(phase) => format!("cell {cell} {phase:?} held by {hold:?}"),
+                    None => format!("cell {cell} unread ({byte})"),
+                }
+            })
+            .collect();
+        format!(
+            "the node did not drain in 30 s: {} of {} cells drained; {}; stop checkpoint {}",
+            self.drained.load(Ordering::Acquire),
+            self.cells,
+            phases.join(", "),
+            if self.stop_checkpoint.load(Ordering::Relaxed) { "on" } else { "off" }
+        )
     }
 
     /// The durable stop without a checkpoint (`--shutdown-checkpoint
@@ -900,9 +1157,7 @@ impl Node {
     /// sync; queued frame writes die with the ring). See [`Node::stop_synced`].
     fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        for handle in self.handles.drain(..) {
-            handle.join().expect("cell thread");
-        }
+        let at_default = self.join_cells();
         // The control thread is detached (`spawn_control`) and outlives the
         // join above: delegated unlinks (truncated segments, stale `.ick`s —
         // ADR-0017) drain asynchronously. A restart on the same data dir
@@ -941,6 +1196,117 @@ impl Node {
             pump.stop.store(true, Ordering::Relaxed);
             pump.handle.join().expect("catalog pump thread");
         }
+        self.assert_tail_stall_stated(&at_default);
+    }
+
+    /// Joins every cell thread (the caller set `stop`), each with the
+    /// tiered namespaces it ran at the product's `TAIL-STALL-TIMEOUT`
+    /// default, in cell order.
+    fn join_cells(&mut self) -> Vec<NsNames> {
+        self.handles.drain(..).map(|handle| handle.join().expect("cell thread")).collect()
+    }
+
+    /// The test's subject is the product's `TAIL-STALL-TIMEOUT` default on
+    /// the tiered namespace `name`: the stop does not fail on that one.
+    fn expect_product_tail_stall(&self, name: &[u8]) {
+        self.tail_stall_stated.borrow_mut().insert(name.to_vec());
+    }
+
+    /// Fails the test on a tiered namespace that ran at the product's
+    /// `TAIL-STALL-TIMEOUT` default, unless that default is its subject: on
+    /// the device this binary's tests share, a fill there can answer a legal
+    /// `-STALLED`, so a tiered fixture states its bound through
+    /// [`tiered_ns_create`]. Runs after every thread is joined, at every end
+    /// of a node: a drop that skips the stop fails on its own (`Drop`). It
+    /// passes a namespace by its stated name, not by a value apart from the
+    /// default, so a stated bound that equals the default passes too.
+    fn assert_tail_stall_stated(&self, at_default: &[NsNames]) {
+        let stated = self.tail_stall_stated.borrow();
+        for (cell, names) in at_default.iter().enumerate() {
+            if let Some(name) = names.iter().find(|name| !stated.contains(*name)) {
+                panic!(
+                    "tiered namespace {} on cell {cell} ran at the product's \
+                     TAIL-STALL-TIMEOUT default: create it with tiered_ns_create, or name it in \
+                     expect_product_tail_stall when the default is the test's subject",
+                    String::from_utf8_lossy(name)
+                );
+            }
+        }
+    }
+}
+
+/// A node ends through [`Node::stop`] (directly or through a graceful
+/// stop) or [`Node::kill_without_catalog_drain`]; each joins the cells and
+/// then runs the stop's checks. A node dropped with its cells running
+/// skipped those checks, and its cells would run on beside every later
+/// test of the binary, so the drop stops and joins them, then fails the
+/// test. A test already failing only signals its threads to exit (a join
+/// could wait on a wedged cell), so its first failure stays the one
+/// reported.
+impl Drop for Node {
+    fn drop(&mut self) {
+        if let Some(pump) = &self.catalog_pump {
+            pump.stop.store(true, Ordering::Relaxed);
+        }
+        if self.handles.is_empty() {
+            return;
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        if std::thread::panicking() {
+            return;
+        }
+        self.join_cells();
+        if let Some(pump) = self.catalog_pump.take() {
+            pump.handle.join().expect("catalog pump thread");
+        }
+        panic!(
+            "a {}-cell node on port {} was dropped without its stop: end it with stop, \
+             stop_gracefully, stop_synced or kill_without_catalog_drain, so the stop's \
+             checks run",
+            self.cells, self.port
+        );
+    }
+}
+
+/// Each cell's stop hold, published by its thread beside its phase byte and
+/// read by the drain timeout's message.
+type StopHolds = Arc<Vec<std::sync::Mutex<Option<inf_server::StopHold>>>>;
+
+/// A cell's stop phase as one byte, so the cell publishes it without a
+/// lock; 0 is a cell that has not read its phase since the stop began.
+fn stop_phase_byte(phase: inf_server::StopPhase) -> u8 {
+    use inf_server::StopPhase as P;
+    match phase {
+        P::Serving => 1,
+        P::Draining => 2,
+        P::Quiet => 3,
+        P::Drained => 4,
+    }
+}
+
+/// The phase [`stop_phase_byte`] encoded as `byte`; `None` for 0.
+fn stop_phase_of_byte(byte: u8) -> Option<inf_server::StopPhase> {
+    use inf_server::StopPhase as P;
+    [P::Serving, P::Draining, P::Quiet, P::Drained]
+        .into_iter()
+        .find(|&phase| stop_phase_byte(phase) == byte)
+}
+
+/// Adds to `at_default` each tiered namespace on `plane`'s cell that runs
+/// at the product's `TAIL-STALL-TIMEOUT` default. The harness calls it after
+/// every iteration, so a namespace dropped before the stop is recorded too.
+fn note_product_tail_stall(plane: &ServerPlane<Recorder>, at_default: &mut NsNames) {
+    for spec in plane.keyspace().ns_iter() {
+        let Some(tier) = &spec.tier else {
+            continue;
+        };
+        if at_default.contains(&spec.name) {
+            continue;
+        }
+        let product = inf_store::TierSpec::for_budget(tier.mem_budget_bytes);
+        if tier.tail_stall_timeout_ms == product.tail_stall_timeout_ms {
+            at_default.insert(spec.name.clone());
+        }
     }
 }
 
@@ -963,6 +1329,55 @@ fn cmd(parts: &[&[u8]]) -> Vec<u8> {
 /// device latency budget.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The `TAIL-STALL-TIMEOUT`, in milliseconds, of every tiered namespace
+/// this binary creates for a test whose subject is not the stall. A tiered
+/// write past its window parks until a flush round lands (ADR-0053 D4),
+/// and every test running here at once shares the device those rounds
+/// land on: at the default thread count it has held one round past the
+/// product's 1 s default, which answers a legal `-STALLED`, and one write
+/// for about 2.6 s. Like [`REPLY_TIMEOUT`] this bound turns a wedged flush
+/// into a failure; it is no device budget. It sits below that timeout, so
+/// a write that does stall answers typed before the client calls it a hang.
+const FIXTURE_TAIL_STALL_TIMEOUT_MS: u64 = 20_000;
+const _: () = assert!(
+    (FIXTURE_TAIL_STALL_TIMEOUT_MS as u128) < REPLY_TIMEOUT.as_millis(),
+    "a stalled fixture write answers before the client's hang bound"
+);
+
+/// `INF.NS CREATE name MODE durable options… TAIL-STALL-TIMEOUT` at
+/// [`FIXTURE_TAIL_STALL_TIMEOUT_MS`]: how this binary creates a tiered
+/// namespace whose test is not about the stall.
+fn tiered_ns_create(name: &[u8], options: &[&[u8]]) -> Vec<u8> {
+    tiered_ns_command(name, options, FIXTURE_TAIL_STALL_TIMEOUT_MS)
+}
+
+/// [`tiered_ns_create`] at the test's own `TAIL-STALL-TIMEOUT`, for a test
+/// whose subject is the stall. It records `name` on `node` as stated, so
+/// the stop's check passes it whatever the bound's value — a bound derived
+/// from a device model that comes out at the product's default included.
+fn tiered_ns_create_stalling_at(
+    node: &Node,
+    name: &[u8],
+    options: &[&[u8]],
+    timeout_ms: u64,
+) -> Vec<u8> {
+    node.tail_stall_stated.borrow_mut().insert(name.to_vec());
+    tiered_ns_command(name, options, timeout_ms)
+}
+
+/// The tiered namespace's `INF.NS CREATE`. The constructors state the mode
+/// and the bound, so `options` names neither.
+fn tiered_ns_command(name: &[u8], options: &[&[u8]], timeout_ms: u64) -> Vec<u8> {
+    assert!(options.contains(&&b"MEM-BUDGET"[..]), "a tiered namespace names its MEM-BUDGET");
+    assert!(!options.contains(&&b"MODE"[..]), "the constructor states the mode");
+    assert!(!options.contains(&&b"TAIL-STALL-TIMEOUT"[..]), "the constructor states the bound");
+    let timeout = timeout_ms.to_string();
+    let mut parts: Vec<&[u8]> = vec![b"INF.NS", b"CREATE", name, b"MODE", b"durable"];
+    parts.extend_from_slice(options);
+    parts.extend_from_slice(&[b"TAIL-STALL-TIMEOUT", timeout.as_bytes()]);
+    cmd(&parts)
+}
+
 /// A failed reply read, named: a timeout is a missing reply.
 fn reply_read_failed(stream: &TcpStream, what: &str, err: &std::io::Error) -> String {
     match err.kind() {
@@ -974,19 +1389,194 @@ fn reply_read_failed(stream: &TcpStream, what: &str, err: &std::io::Error) -> St
     }
 }
 
+/// The most bytes a mismatched reply's error line is read to so the
+/// message prints it whole: the product's error replies are one short
+/// line, and a line that never ends stops here or at the stream's read
+/// timeout.
+const ERROR_LINE_BYTES_MAX: usize = 1024;
+
 fn read_exactly(stream: &mut TcpStream, want: &[u8]) {
     let mut got = vec![0u8; want.len()];
     if let Err(err) = stream.read_exact(&mut got) {
         let what = format!("read reply {:?}", String::from_utf8_lossy(want));
         panic!("{}", reply_read_failed(stream, &what, &err));
     }
-    assert_eq!(
-        got,
-        want,
+    if got != want {
+        panic!("{}", reply_mismatch(stream, &got, want));
+    }
+}
+
+/// Names a reply that is not `want`. Where `got` first differs from
+/// `want` with an error reply (`-` that begins a reply line), the rest of
+/// that line is read, so the message carries the server's whole answer
+/// rather than the first `want.len()` bytes of it; a `-STALLED` adds the
+/// state that explains its wait.
+fn reply_mismatch(stream: &mut TcpStream, got: &[u8], want: &[u8]) -> String {
+    let mut message = format!(
         "reply mismatch: got {:?} want {:?}",
-        String::from_utf8_lossy(&got),
+        String::from_utf8_lossy(got),
         String::from_utf8_lossy(want)
     );
+    let Some(line) = diverging_error_line(stream, got, want) else {
+        return message;
+    };
+    message.push_str(&format!("; the error reply whole: {:?}", String::from_utf8_lossy(&line)));
+    if line.starts_with(b"-STALLED") {
+        message.push_str(&stalled_diagnosis(stream));
+    }
+    message
+}
+
+/// The error reply at the first byte where `got` differs from `want`,
+/// read to its line's end (at most [`ERROR_LINE_BYTES_MAX`] bytes, within
+/// the stream's read timeout); `None` when that byte is not a `-` that
+/// begins a reply line.
+fn diverging_error_line(stream: &mut TcpStream, got: &[u8], want: &[u8]) -> Option<Vec<u8>> {
+    let at = got.iter().zip(want).position(|(got, want)| got != want)?;
+    let begins_line = at == 0 || got[..at].ends_with(b"\r\n");
+    if !begins_line || got[at] != b'-' {
+        return None;
+    }
+    let mut line = got[at..].to_vec();
+    if let Some(end) = line.windows(2).position(|pair| pair == b"\r\n") {
+        line.truncate(end + 2);
+        return Some(line);
+    }
+    let mut byte = [0u8; 1];
+    while !line.ends_with(b"\r\n") && line.len() < ERROR_LINE_BYTES_MAX {
+        if stream.read_exact(&mut byte).is_err() {
+            break;
+        }
+        line.push(byte[0]);
+    }
+    Some(line)
+}
+
+/// The `INFO tiering` fields that place a stalled tiered write: the
+/// cell's flush rounds (completed, in flight, the slowest), and the
+/// waits that would show an engine budget, turn or plan holding one.
+const STALL_DIAGNOSIS_FIELDS: [&str; 7] = [
+    "tiering_flush_rounds",
+    "tiering_flush_rounds_inflight",
+    "tiering_flush_round_p99_us",
+    "tier_flush_groups_deferred",
+    "tier_group_wait_ns_max",
+    "tier_turn_waits",
+    "tier_plan_waits",
+];
+
+/// The fresh connections a stall diagnosis opens to reach every cell.
+const STALL_DIAGNOSIS_CONNECTS_MAX: usize = 64;
+
+/// How long one diagnosis connection may take to connect or answer.
+const STALL_DIAGNOSIS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The largest `INFO` body a diagnosis reads.
+const STALL_DIAGNOSIS_INFO_BYTES_MAX: usize = 1 << 20;
+
+/// What a `-STALLED` needs to be read without an instrument: the bound it
+/// waited out — a tiered write past its window parks for a flush round
+/// until its namespace's `TAIL-STALL-TIMEOUT` (ADR-0053 D4) — and each
+/// cell's flush-round state. The cells are read over fresh connections to
+/// the same port, because the failing one may still owe pipelined
+/// replies, and after the reply, so a round that landed since reads as
+/// landed.
+fn stalled_diagnosis(stream: &TcpStream) -> String {
+    let mut text = format!(
+        "\na tiered write waited out its namespace's TAIL-STALL-TIMEOUT for a flush round \
+         (the product's default unless the namespace states one: this binary's fixtures \
+         state FIXTURE_TAIL_STALL_TIMEOUT_MS = {FIXTURE_TAIL_STALL_TIMEOUT_MS} ms, a \
+         stall-subject test its own); INFO tiering after the reply:"
+    );
+    match stream.peer_addr() {
+        Ok(addr) => text.push_str(&cells_flush_state(addr)),
+        Err(err) => text.push_str(&format!(" unread ({err})")),
+    }
+    text
+}
+
+/// [`STALL_DIAGNOSIS_FIELDS`] and every tiered namespace's watermarks, one
+/// line per cell, read until each cell of the node answered once.
+fn cells_flush_state(addr: std::net::SocketAddr) -> String {
+    let mut read = std::collections::BTreeMap::new();
+    let mut cells = 1;
+    let mut text = String::new();
+    for _ in 0..STALL_DIAGNOSIS_CONNECTS_MAX {
+        if read.len() >= cells {
+            break;
+        }
+        match cell_flush_state(addr) {
+            Ok((cell, count, state)) => {
+                cells = count;
+                read.entry(cell).or_insert(state);
+            }
+            Err(err) => {
+                text.push_str(&format!("\n  a diagnosis connection failed: {err}"));
+                break;
+            }
+        }
+    }
+    for (cell, state) in &read {
+        text.push_str(&format!("\n  cell {cell}: {state}"));
+    }
+    if read.len() < cells {
+        text.push_str(&format!("\n  {} of {cells} cells answered", read.len()));
+    }
+    text
+}
+
+/// One fresh connection's cell, the node's cell count and that cell's
+/// flush-round state.
+fn cell_flush_state(addr: std::net::SocketAddr) -> std::io::Result<(u64, usize, String)> {
+    let mut conn = TcpStream::connect_timeout(&addr, STALL_DIAGNOSIS_TIMEOUT)?;
+    conn.set_read_timeout(Some(STALL_DIAGNOSIS_TIMEOUT))?;
+    let server = info_text_fallible(&mut conn, b"server")?;
+    let number = |name: &str| -> std::io::Result<u64> {
+        server
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+            .and_then(|value| value.trim().parse().ok())
+            .ok_or_else(|| std::io::Error::other(format!("INFO server has no {name}")))
+    };
+    let cell = number("cell")?;
+    let cells = usize::try_from(number("cells")?).map_err(std::io::Error::other)?;
+    let tiering = info_text_fallible(&mut conn, b"tiering")?;
+    let mut state = Vec::new();
+    for line in tiering.lines() {
+        let name = line.split(':').next().unwrap_or("");
+        if STALL_DIAGNOSIS_FIELDS.contains(&name) {
+            state.push(line.to_owned());
+        } else if name.starts_with("tiering_ns") {
+            // head, flushed, ro_boundary, tail and committed_bytes lead the line.
+            state.push(line.splitn(6, ',').take(5).collect::<Vec<_>>().join(","));
+        }
+    }
+    Ok((cell, cells, state.join(" ")))
+}
+
+/// [`info_text`] that returns an error instead of panicking, for a
+/// failure message under construction.
+fn info_text_fallible(conn: &mut TcpStream, section: &[u8]) -> std::io::Result<String> {
+    conn.write_all(&cmd(&[b"INFO", section]))?;
+    let mut header = Vec::new();
+    let mut byte = [0u8; 1];
+    while !header.ends_with(b"\r\n") {
+        if header.len() > 32 {
+            return Err(std::io::Error::other("INFO header past 32 bytes"));
+        }
+        conn.read_exact(&mut byte)?;
+        header.push(byte[0]);
+    }
+    let length = std::str::from_utf8(&header[..header.len() - 2])
+        .ok()
+        .and_then(|text| text.strip_prefix('$'))
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .filter(|&length| length <= STALL_DIAGNOSIS_INFO_BYTES_MAX)
+        .ok_or_else(|| std::io::Error::other(format!("INFO reply header {header:?}")))?;
+    let mut body = vec![0u8; length + 2];
+    conn.read_exact(&mut body)?;
+    body.truncate(length);
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// A key owned by `cell` under an N-cell contiguous router.
@@ -1388,6 +1978,22 @@ fn deasync_dispatch_matches_pump_semantics() {
     sub.write_all(&cmd(&[b"SUBSCRIBE", b"ch2"])).expect("write");
     read_exactly(&mut sub, b"*3\r\n$9\r\nsubscribe\r\n$3\r\nch2\r\n:2\r\n");
 
+    // `JSON.MGET` across the two cells takes the gather, as on the pump:
+    // from the cell owning the second key, a whole-argv `Apply` to the
+    // first key's owner would answer that owner's null for the second.
+    #[cfg(feature = "doc")]
+    {
+        let mut c1 = conn_on_cell(&node, 1);
+        let (d0, d1) = (key_for_cell_prefixed(2, 0, "doc"), key_for_cell_prefixed(2, 1, "doc"));
+        let mut pipeline = cmd(&[b"JSON.SET", &d0, b"$", br#"{"n":1}"#]);
+        pipeline.extend(cmd(&[b"JSON.SET", &d1, b"$", br#"{"n":2}"#]));
+        pipeline.extend(cmd(&[b"JSON.MGET", &d0, &d1, b"$.n"]));
+        c1.write_all(&pipeline).expect("write");
+        read_exactly(&mut c1, b"+OK\r\n+OK\r\n");
+        let reply = read_bulk_array(&mut c1);
+        assert_eq!(String::from_utf8_lossy(&reply), "*2\r\n$3\r\n[1]\r\n$3\r\n[2]\r\n");
+    }
+
     node.stop();
 }
 
@@ -1715,8 +2321,16 @@ fn port_seed() -> u32 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// A fresh data directory named by `tag`, the process id and this call's
+/// ordinal in the process, so no two calls share one: tests run at once,
+/// and a helper that two tests call with one tag must not clear the other's
+/// live directory. A directory an earlier process of the same id left
+/// behind is cleared.
 fn temp_data_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("inf-s08-{tag}-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call = NEXT.fetch_add(1, Ordering::Relaxed);
+    let name = format!("inf-s08-{tag}-{}-{call}", std::process::id());
+    let dir = std::env::temp_dir().join(name);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).expect("clear stale test dir");
     }
@@ -1749,25 +2363,16 @@ fn namespace_bound_dbsize_counts_every_cell() {
     let dir = temp_data_dir("ns-dbsize");
     let node = Node::start_durable(2, &dir);
     let mut c = node.connect();
-    let namespaces: [&[&[u8]]; 3] = [
-        &[b"INF.NS", b"CREATE", b"cache", b"MODE", b"memory"],
-        &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"],
-        &[
-            b"INF.NS",
-            b"CREATE",
+    let namespaces = [
+        cmd(&[b"INF.NS", b"CREATE", b"cache", b"MODE", b"memory"]),
+        cmd(&[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"]),
+        tiered_ns_create(
             b"hot",
-            b"MODE",
-            b"durable",
-            b"MEM-BUDGET",
-            b"8mb",
-            b"DISK-BUDGET",
-            b"64mb",
-            b"MUTABLE-FRACTION",
-            b"100",
-        ],
+            &[b"MEM-BUDGET", b"8mb", b"DISK-BUDGET", b"64mb", b"MUTABLE-FRACTION", b"100"],
+        ),
     ];
     for create in namespaces {
-        c.write_all(&cmd(create)).expect("write");
+        c.write_all(&create).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
     }
     // Keys owned by each cell, ten per cell, so a per-cell answer would
@@ -1806,6 +2411,9 @@ fn namespace_bound_dbsize_counts_every_cell() {
         other.write_all(&cmd(&[b"DBSIZE"])).expect("write");
         read_exactly(&mut other, b":17\r\n");
     }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Reads one flat RESP array of bulk strings (the `KEYS` reply shape).
@@ -1898,24 +2506,15 @@ fn namespace_bound_scan_covers_durable_and_tiered_namespaces() {
     let dir = temp_data_dir("ns-scan-sweep");
     let node = Node::start_durable(2, &dir);
     let mut c = node.connect();
-    let namespaces: [&[&[u8]]; 2] = [
-        &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"],
-        &[
-            b"INF.NS",
-            b"CREATE",
+    let namespaces = [
+        cmd(&[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"]),
+        tiered_ns_create(
             b"hot",
-            b"MODE",
-            b"durable",
-            b"MEM-BUDGET",
-            b"8mb",
-            b"DISK-BUDGET",
-            b"64mb",
-            b"MUTABLE-FRACTION",
-            b"100",
-        ],
+            &[b"MEM-BUDGET", b"8mb", b"DISK-BUDGET", b"64mb", b"MUTABLE-FRACTION", b"100"],
+        ),
     ];
     for create in namespaces {
-        c.write_all(&cmd(create)).expect("write");
+        c.write_all(&create).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
     }
     drop(c);
@@ -2125,6 +2724,86 @@ fn durable_mset_bounds_failure_is_atomic_across_recovery() {
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A refused write on a durable `always` namespace stages nothing: the
+/// staging gate reads the reply's outcome, not its first byte (ADR-0190
+/// D2). `k` is seeded so a misread refusal would stage the key's unchanged
+/// value, a redundant record the log count shows. The refusal comes from
+/// the command itself (`EX 0`), after admission: an over-bound value is
+/// refused by the staging admission before the command runs.
+#[test]
+fn reply_outcome_refused_set_on_always_stages_nothing() {
+    let dir = temp_data_dir("reply-outcome");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"pay", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pay"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"other", b"EX", b"0"])).expect("write");
+    let refusal = read_line(&mut c);
+    if cfg!(inf_canary_resp3_blob_error) {
+        assert_eq!(refusal.first(), Some(&b'!'), "VACUOUS: the plant wrote no blob error");
+        let _text = read_line(&mut c);
+    } else {
+        assert_eq!(refusal, b"-ERR invalid expire time in 'set' command\r\n");
+    }
+    c.write_all(&cmd(&[b"SET", b"z", b"9"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"k"])).expect("write");
+    read_exactly(&mut c, b"$1\r\nv\r\n");
+    // One read, no window: the count rises when a record is staged, and the
+    // one cell's MAINTAIN publishes it in the iteration that executed the
+    // write, before any later command runs. Every record staged before the
+    // last acknowledged `SET` — a refusal's included — is in the gauge this
+    // `INFO` reads.
+    let info = info_text(&mut c, b"persistence");
+    let appended = info
+        .lines()
+        .find_map(|line| line.strip_prefix("log_records_appended:"))
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .expect("INFO persistence reports log_records_appended");
+    assert_eq!(appended, 2, "the two acknowledged SETs and nothing for the refusal");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A four-cell `MSET` under `maxmemory 1` whose pairs all live off the
+/// connection's cell: no local pair can refuse first, so every pair rides a
+/// fabric leg, each owner refuses, and the client reads an owner's own
+/// `-OOM` bytes through the fan's fold, never `+OK` (ADR-0190 D2). RESP3,
+/// as the four-cell compat case runs it. The connection's cell is read from
+/// `INFO server`, so every boot reaches the remote legs, whichever cell
+/// accepted the connection.
+#[test]
+fn reply_outcome_four_cell_mset_of_remote_pairs_is_the_owners_oom() {
+    let node = Node::start(4);
+    let mut c = node.connect();
+    let cell = info_field(&info_text(&mut c, b"server"), "cell");
+    let cell = u16::try_from(cell).expect("a cell index");
+    let mut argv: Vec<Vec<u8>> = vec![b"MSET".to_vec()];
+    for owner in (0..4).filter(|&owner| owner != cell) {
+        argv.push(key_for_cell(4, owner));
+        argv.push(b"v".to_vec());
+    }
+    hello3(&mut c);
+    let budget: &[&[u8]] =
+        &[b"CONFIG", b"SET", b"maxmemory", b"1", b"maxmemory-policy", b"noeviction"];
+    c.write_all(&cmd(budget)).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let mset: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+    c.write_all(&cmd(&mset)).expect("write");
+    let reply = String::from_utf8(read_line(&mut c)).expect("a line reply");
+    assert_eq!(reply, "-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    drop(c);
+    node.stop();
 }
 
 /// The `mset_midway_oom` crash-matrix row, local-pump site (review of
@@ -2621,19 +3300,10 @@ fn tiered_blob_get_spanning_multiple_cold_windows() {
     let dir = temp_data_dir("blob-multiwindow");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create(
         b"blobs",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"8mb",
-        b"DISK-BUDGET",
-        b"64mb",
-        b"BLOB-THRESHOLD",
-        b"4kb",
-    ]))
+        &[b"MEM-BUDGET", b"8mb", b"DISK-BUDGET", b"64mb", b"BLOB-THRESHOLD", b"4kb"],
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"blobs"])).expect("write");
@@ -2671,19 +3341,10 @@ fn tiered_namespace_lifecycle_survives_restart() {
     // Two cells so the NSFAN peer fan is real, not a no-op.
     let node = Node::start_durable(2, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create(
         b"hot",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"8mb",
-        b"DISK-BUDGET",
-        b"64mb",
-        b"MUTABLE-FRACTION",
-        b"100",
-    ]))
+        &[b"MEM-BUDGET", b"8mb", b"DISK-BUDGET", b"64mb", b"MUTABLE-FRACTION", b"100"],
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     // This connection's cell materialized its table; the +OK above is
@@ -2830,18 +3491,8 @@ fn tiered_data_plane_serves_and_survives_restart() {
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
-        c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
-            b"t",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
-            b"MEM-BUDGET",
-            b"3mb",
-        ]))
-        .expect("write");
+        c.write_all(&tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]))
+            .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
@@ -2936,6 +3587,181 @@ fn tiered_data_plane_serves_and_survives_restart() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A modeled device whose budget paces a tiered namespace's flush rounds
+/// past the product's 1 s `TAIL-STALL-TIMEOUT` default and well inside
+/// [`FIXTURE_TAIL_STALL_TIMEOUT_MS`]: at 1 MB/s of writes a fill against a
+/// `MEM-BUDGET 3mb` window waits about 2.5 s for its slowest round, on any
+/// device that is at least that fast.
+const PACED_ROUND_MODEL: inf_runtime::DeviceModel = inf_runtime::DeviceModel {
+    write_bytes_per_s: 1_000_000,
+    write_ops_per_s: 40_000,
+    read_bytes_per_s: 40_000_000,
+    read_ops_per_s: 40_000,
+};
+
+/// The tail-stall bound a paced fill runs its namespace at.
+#[derive(Copy, Clone)]
+enum PacedBound {
+    /// None stated: the product's default.
+    ProductDefault,
+    /// [`FIXTURE_TAIL_STALL_TIMEOUT_MS`], through [`tiered_ns_create`].
+    Fixture,
+}
+
+/// Writes up to 600 values of 8 KiB (4.8 MiB, past a `MEM-BUDGET 3mb`
+/// window) to `t`, created at `bound`, on a node paced by
+/// [`PACED_ROUND_MODEL`]: `Ok(())` when every write is acknowledged, else
+/// the first other reply with the writes acknowledged before it.
+fn paced_tiered_fill(tag: &str, bound: PacedBound) -> Result<(), (Vec<u8>, usize)> {
+    let options: &[&[u8]] = &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"];
+    let dir = temp_data_dir(tag);
+    let node = Node::start_durable_with_device_model(1, &dir, PACED_ROUND_MODEL);
+    let create = match bound {
+        PacedBound::ProductDefault => {
+            node.expect_product_tail_stall(b"t");
+            let mut parts: Vec<&[u8]> = vec![b"INF.NS", b"CREATE", b"t", b"MODE", b"durable"];
+            parts.extend_from_slice(options);
+            cmd(&parts)
+        }
+        PacedBound::Fixture => tiered_ns_create(b"t", options),
+    };
+    let mut c = node.connect();
+    c.write_all(&create).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let mut outcome = Ok(());
+    for i in 0..600usize {
+        let key = format!("k:{i:04}").into_bytes();
+        let value = format!("g0:{i:04}:").into_bytes().repeat(1024);
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        let reply = read_line(&mut c);
+        if reply != b"+OK\r\n" {
+            // The refused write mutated nothing (ADR-0053 D4): its key is
+            // absent and the namespace holds exactly the acknowledged ones.
+            c.write_all(&cmd(&[b"GET", &key])).expect("write");
+            read_exactly(&mut c, b"$-1\r\n");
+            c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+            read_exactly(&mut c, format!(":{i}\r\n").as_bytes());
+            outcome = Err((reply, i));
+            break;
+        }
+    }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    outcome
+}
+
+/// The rule the fixture bound answers: a fill whose flush round outlasts
+/// the namespace's `TAIL-STALL-TIMEOUT` — here the product's 1 s default
+/// against a round the device model holds for about 2.5 s — answers the
+/// typed `-STALLED` and mutates nothing. A device every test of this
+/// binary shares can hold a round as long, which is why every other
+/// tiered fixture here states [`FIXTURE_TAIL_STALL_TIMEOUT_MS`].
+#[test]
+fn a_flush_round_past_the_default_tail_stall_timeout_answers_stalled() {
+    let (reply, acknowledged) =
+        paced_tiered_fill("paced-default-stall", PacedBound::ProductDefault)
+            .expect_err("a 2.5 s round answers a fill at the 1 s default");
+    assert_eq!(
+        reply,
+        b"-STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)\r\n",
+        "after {acknowledged} acknowledged writes"
+    );
+}
+
+/// The same paced fill at [`FIXTURE_TAIL_STALL_TIMEOUT_MS`]: every write is
+/// acknowledged, so the fixture bound outlasts a round the default cannot.
+#[test]
+fn the_fixture_tail_stall_bound_outlasts_a_paced_flush_round() {
+    if let Err((reply, acknowledged)) =
+        paced_tiered_fill("paced-fixture-bound", PacedBound::Fixture)
+    {
+        panic!(
+            "write {acknowledged} answered {:?} at the fixture bound",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+}
+
+/// The stop's check, planted: a tiered namespace created with no stated
+/// bound runs at the product's default, and the stop names it — so a
+/// tiered fixture that skips [`tiered_ns_create`] cannot stay green. The
+/// namespace the test names as its subject (`expected`, which the check
+/// reads first) passes, and does not excuse its neighbour.
+#[test]
+fn a_tiered_namespace_at_the_product_tail_stall_default_fails_the_stop() {
+    let dir = temp_data_dir("tail-stall-unstated");
+    let node = Node::start_durable(1, &dir);
+    node.expect_product_tail_stall(b"expected");
+    let mut c = node.connect();
+    for name in [&b"expected"[..], b"plain"] {
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            name,
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            b"3mb",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    drop(c);
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.stop()));
+    std::fs::remove_dir_all(&dir).ok();
+    let panic = stopped.expect_err("the stop fails on a namespace at the product default");
+    let message = panic.downcast_ref::<String>().map_or("", String::as_str);
+    assert!(message.contains("namespace plain on cell 0"), "{message}");
+}
+
+/// A bound stated through [`tiered_ns_create_stalling_at`] passes the stop
+/// even when its value is the product's default: the check passes the
+/// names a test stated, not the values apart from the default.
+#[test]
+fn a_stated_tail_stall_bound_at_the_default_value_passes_the_stop() {
+    let dir = temp_data_dir("tail-stall-stated-default");
+    let node = Node::start_durable(1, &dir);
+    let default_ms = inf_store::TierSpec::for_budget(3 << 20).tail_stall_timeout_ms;
+    let create =
+        tiered_ns_create_stalling_at(&node, b"stated", &[b"MEM-BUDGET", b"3mb"], default_ms.into());
+    let mut c = node.connect();
+    c.write_all(&create).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same namespace on a node the test drops without a stop, planted:
+/// the stop's checks never run there, so the drop itself fails the test —
+/// a tiered fixture that also skips its stop cannot stay green either.
+#[test]
+fn a_node_dropped_without_its_stop_fails_the_test() {
+    let dir = temp_data_dir("tail-stall-dropped");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"plain",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(node)));
+    std::fs::remove_dir_all(&dir).ok();
+    let panic = dropped.expect_err("a node dropped without its stop fails the test");
+    let message = panic.downcast_ref::<String>().map_or("", String::as_str);
+    assert!(message.contains("was dropped without its stop"), "{message}");
+}
+
 /// Reads one `SCAN` reply (`[next-cursor, [key…]]`) off the stream.
 fn read_scan_page(stream: &mut TcpStream) -> (u64, Vec<Vec<u8>>) {
     let header = read_line(stream);
@@ -2984,18 +3810,8 @@ fn tiered_scan_names_every_cold_key_across_the_window() {
     let small = 150usize; // 50 B values — the always-worked control band
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"t",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"everysec",
-        b"MEM-BUDGET",
-        b"3mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -3078,18 +3894,8 @@ fn tiered_scan_batches_its_cold_key_reads() {
     let dir = temp_data_dir("tiered-scan-batch");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"t",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"everysec",
-        b"MEM-BUDGET",
-        b"3mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -3177,19 +3983,10 @@ fn blob_values_round_trip_and_survive_restart() {
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
-        c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
+        c.write_all(&tiered_ns_create(
             b"b",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
-            b"MEM-BUDGET",
-            b"3mb",
-            b"BLOB-THRESHOLD",
-            b"4kb",
-        ]))
+            &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4kb"],
+        ))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
@@ -3244,19 +4041,10 @@ fn blob_write_at_disk_full_replies_diskfull() {
         vec![(inf_log::fault::BLOB_WRITE_NOSPACE, inf_foundation::fault::FaultSpec::Always)],
     );
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create(
         b"b",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"everysec",
-        b"MEM-BUDGET",
-        b"3mb",
-        b"BLOB-THRESHOLD",
-        b"4kb",
-    ]))
+        &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4kb"],
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
@@ -3292,19 +4080,10 @@ fn a_blob_write_refused_inside_the_window_gives_its_unit_back() {
         vec![(inf_log::fault::BLOB_WRITE_NOSPACE, inf_foundation::fault::FaultSpec::Always)],
     );
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create(
         b"b",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"always",
-        b"MEM-BUDGET",
-        b"3mb",
-        b"BLOB-THRESHOLD",
-        b"4kb",
-    ]))
+        &[b"FSYNC", b"always", b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4kb"],
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
@@ -3464,25 +4243,23 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
             CkptTrigger::Paced { slice_bytes, stream_bytes_per_sec },
         );
         let mut c = node.connect();
-        c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
+        c.write_all(&tiered_ns_create(
             b"b",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
-            b"MEM-BUDGET",
-            b"3mb",
-            b"BLOB-THRESHOLD",
-            b"4kb",
-            // Copy-forward off (a 100% dead-ratio trigger never fires):
-            // compaction would otherwise relocate the cold blob
-            // references to the RAM tail once the filler is deleted, and
-            // pass 3 would have nothing to walk.
-            b"COMPACTION-DEAD-RATIO",
-            b"100",
-        ]))
+            &[
+                b"FSYNC",
+                b"everysec",
+                b"MEM-BUDGET",
+                b"3mb",
+                b"BLOB-THRESHOLD",
+                b"4kb",
+                // Copy-forward off (a 100% dead-ratio trigger never fires):
+                // compaction would otherwise relocate the cold blob
+                // references to the RAM tail once the filler is deleted, and
+                // pass 3 would have nothing to walk.
+                b"COMPACTION-DEAD-RATIO",
+                b"100",
+            ],
+        ))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
@@ -3655,22 +4432,12 @@ fn a_checkpoint_names_a_ticketed_blob_winner_in_its_image_alone() {
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
-        ok(
-            &mut c,
-            &[
-                b"INF.NS",
-                b"CREATE",
-                b"t",
-                b"MODE",
-                b"durable",
-                b"MEM-BUDGET",
-                b"3mb",
-                b"BLOB-THRESHOLD",
-                b"4kb",
-                b"MUTABLE-FRACTION",
-                b"200",
-            ],
-        );
+        c.write_all(&tiered_ns_create(
+            b"t",
+            &[b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4kb", b"MUTABLE-FRACTION", b"200"],
+        ))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
         // Promotion off: the cold `GET` below is a witness, never a
         // relocation. The shadow path on, its reconciler paused.
         ok(&mut c, &[b"CONFIG", b"SET", b"tiered-promote-on-read", b"no"]);
@@ -3826,18 +4593,8 @@ fn tiered_cold_read_failure_is_typed_for_every_read_command() {
         vec![(inf_server::fault::COLD_ENQUEUE_FULL, inf_foundation::fault::FaultSpec::Always)],
     );
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"t",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"everysec",
-        b"MEM-BUDGET",
-        b"3mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -4013,18 +4770,8 @@ fn unaddressable_fixture(tag: &str) -> (Node, TcpStream, std::path::PathBuf) {
         )],
     );
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"t",
-        b"MODE",
-        b"durable",
-        b"FSYNC",
-        b"everysec",
-        b"MEM-BUDGET",
-        b"3mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"t", &[b"FSYNC", b"everysec", b"MEM-BUDGET", b"3mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -4183,19 +4930,10 @@ fn blob_boot_orphan_quarantines_for_one_life_then_reclaims() {
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
-        c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
+        c.write_all(&tiered_ns_create(
             b"q",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"always",
-            b"MEM-BUDGET",
-            b"3mb",
-            b"BLOB-THRESHOLD",
-            b"4kb",
-        ]))
+            &[b"FSYNC", b"always", b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4kb"],
+        ))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         c.write_all(&cmd(&[b"INF.NS", b"USE", b"q"])).expect("write");
@@ -4299,18 +5037,8 @@ fn diskfull_admission_refuses_typed_over_tcp() {
     let dir = temp_data_dir("tiered-diskfull");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"d",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"3mb",
-        b"DISK-BUDGET",
-        b"1mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"d", &[b"MEM-BUDGET", b"3mb", b"DISK-BUDGET", b"1mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"d"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -4358,8 +5086,7 @@ fn drop_races_inflight_cold_reads() {
     let dir = temp_data_dir("tiered-drop-race");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"r", b"MODE", b"durable", b"MEM-BUDGET", b"3mb"]))
-        .expect("write");
+    c.write_all(&tiered_ns_create(b"r", &[b"MEM-BUDGET", b"3mb"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"r"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -4885,6 +5612,9 @@ fn t_ckpt_seconds(share_bytes_per_s: f64, owed: f64, cap: f64, charged: f64, del
 /// advanced, the checkpoint never published, and `INF.CKPT WAIT` never
 /// returned. The bound is two D4 waits (the oversized block, then the
 /// footer behind its debt) plus 2 s of harness slack.
+// nextest-alone: 1.0-2.0 s. Its bound, about 3.5 s, is its subject and leaves
+// less slack than a hang bound, so the CPU and device that sibling test
+// processes take would move the verdict (ADR-0200 D7).
 #[test]
 fn a_checkpoint_holding_a_value_above_the_class_cap_completes() {
     let dir = temp_data_dir("ckpt-overrun");
@@ -4968,19 +5698,12 @@ fn overrun_tier_namespace(node: &Node) -> TcpStream {
 fn tier_namespace_with_slice(node: &Node, slice: &[u8], slice_bytes: u64) -> TcpStream {
     let timeout_ms = round_bound_ms(overrun_test_model(), 2, 1, slice_bytes);
     let mut c = conn_on_cell(node, 0);
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create_stalling_at(
+        node,
         b"t",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"4mb",
-        b"MAINTAIN-SLICE",
-        slice,
-        b"TAIL-STALL-TIMEOUT",
-        timeout_ms.to_string().as_bytes(),
-    ]))
+        &[b"MEM-BUDGET", b"4mb", b"MAINTAIN-SLICE", slice],
+        timeout_ms,
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     drop(c);
@@ -5173,19 +5896,12 @@ fn reference_share_at_256_cells() -> inf_runtime::DeviceModel {
 fn create_tier_namespace(node: &Node, name: &[u8], slice: &[u8], timeout_ms: u64) {
     assert!((1..=60_000).contains(&timeout_ms), "TAIL-STALL-TIMEOUT {timeout_ms} is 1..=60000");
     let mut c = conn_on_cell(node, 0);
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create_stalling_at(
+        node,
         name,
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"4mb",
-        b"MAINTAIN-SLICE",
-        slice,
-        b"TAIL-STALL-TIMEOUT",
-        timeout_ms.to_string().as_bytes(),
-    ]))
+        &[b"MEM-BUDGET", b"4mb", b"MAINTAIN-SLICE", slice],
+        timeout_ms,
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
 }
@@ -5335,6 +6051,7 @@ fn two_backlogged_tiered_namespaces_on_one_cell_acknowledge_every_write() {
 
 /// R3-exit, leg two: the `1mb` namespace under a light steady load
 /// beside the `8mb` one's backlog.
+// nextest-long: 39 s
 #[test]
 fn a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write() {
     two_tiered_namespaces_acknowledge_every_write(&TierExitLeg {
@@ -6270,49 +6987,6 @@ fn canary_the_snapshot_oracle_sees_a_drop_that_succeeds() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// ADR-0159 D2 at the tombstone cap (2 cells): a durable DROP that finds
-/// `DROPPED_NS_MAX` live tombstones issues its pacing unit as one all-cell
-/// checkpoint and persists only after every cell published it; below the
-/// cap the unit is dropped unissued. Every DROP here is cut after its
-/// catalog swap (`ns_drop_after_meta`), so no fan runs, no cleanup stamp is
-/// issued and the tombstones stay live. The cut also ends the DROP at the
-/// cap, after its pacing wait: the branch under test.
-#[test]
-fn a_drop_at_the_tombstone_cap_waits_for_its_pacing_checkpoint() {
-    let dir = temp_data_dir("ckptpacing");
-    let cut = (inf_server::fault::NS_DROP_AFTER_META, inf_foundation::fault::FaultSpec::Always);
-    let node = Node::start_durable_with_faults(2, &dir, vec![cut]);
-    let control = Arc::clone(node.control.as_ref().expect("durable"));
-    let cap = inf_server::DROPPED_NS_MAX;
-    let mut c = conn_on_cell(&node, 0);
-    let create_and_drop = |c: &mut TcpStream, index: usize| {
-        let name = format!("paced{index}");
-        let create = [&b"INF.NS"[..], b"CREATE", name.as_bytes(), b"MODE", b"durable"];
-        c.write_all(&cmd(&create)).expect("write");
-        read_exactly(c, b"+OK\r\n");
-        c.write_all(&cmd(&[b"INF.NS", b"DROP", name.as_bytes()])).expect("write");
-        read_exactly(c, b"-ERR fault: ns_drop_after_meta\r\n");
-    };
-    let issued = control.ckpt_last_issued();
-    for index in 0..cap {
-        create_and_drop(&mut c, index);
-    }
-    assert_eq!(control.drop_tombstones(), cap, "every cut DROP left its tombstone live");
-    assert_eq!(control.ckpt_last_issued(), issued, "below the cap no DROP issued an epoch");
-    create_and_drop(&mut c, cap);
-    let paced = control.ckpt_last_issued();
-    assert_eq!(paced, issued + 1, "the DROP at the cap issued its one pacing epoch");
-    let board = control.ckpt_board();
-    for cell in 0..node.cells {
-        let published = board.slot(cell).published();
-        assert!(published >= paced, "cell {cell} published {published} before the DROP persisted");
-    }
-    assert_eq!(control.drop_tombstones(), cap + 1, "the paced DROP persisted its own tombstone");
-    drop(c);
-    node.stop();
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 /// ADR-0159 D4 at the top of the space (2 cells): both slots publish
 /// epochs near `u64::MAX`, so the published sum passes 2^64 — `WAIT`
 /// returns only after both cells' checkpoints complete, and the sweep's
@@ -6372,7 +7046,8 @@ fn ckpt_one_cell_exhausted_while_the_other_still_reserves() {
 #[test]
 fn set_control_refuses_the_checkpoint_issuer_of_another_cell() {
     let two = inf_foundation::CellCount::new(2).expect("two cells");
-    let (control, _inbox, issuers) = inf_server::ControlHandle::detached(two, 0);
+    let (control, _inbox, issuers) =
+        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
     let mut fabrics = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
     let mut plane = |cell: u16| unwired_plane(cell, 2, fabrics.next().expect("a fabric per cell"));
     let (mut first, mut second) = (plane(0), plane(1));
@@ -6396,16 +7071,17 @@ fn unwired_plane(
     fabric: inf_fabric::CellFabric,
 ) -> ServerPlane<NoopObserver, inf_server::StdSegmentFs> {
     let listener = listen_reuseport(0).expect("listen");
-    let (plane, _serve_mark) = ServerPlane::new(
+    let (plane, _serve_mark, _timer_set) = ServerPlane::new(
         CellId(cell),
         cells,
         listener.into_raw_fd(),
-        Keyspace::new(StoreConfig::default()),
+        KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
         fabric,
         Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
         NoopObserver,
         false,
-    );
+    )
+    .expect("the server's timer owners fit their cap");
     plane
 }
 
@@ -6418,8 +7094,10 @@ fn unwired_plane(
 #[test]
 fn set_control_refuses_an_issuer_of_another_boot() {
     let two = inf_foundation::CellCount::new(2).expect("two cells");
-    let (control, _inbox, _issuers) = inf_server::ControlHandle::detached(two, 0);
-    let (other, _other_inbox, other_issuers) = inf_server::ControlHandle::detached(two, 0);
+    let (control, _inbox, _issuers) =
+        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
+    let (other, _other_inbox, other_issuers) =
+        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
     let mut fabrics = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
     let mut plane = unwired_plane(0, 2, fabrics.next().expect("cell 0's fabric"));
     let foreign = other_issuers.cells.into_iter().next().expect("the other boot's cell 0");
@@ -6436,7 +7114,8 @@ fn set_control_refuses_an_issuer_of_another_boot() {
 #[test]
 fn set_control_refuses_a_board_of_another_cell_count() {
     let two = inf_foundation::CellCount::new(2).expect("two cells");
-    let (control, _inbox, issuers) = inf_server::ControlHandle::detached(two, 0);
+    let (control, _inbox, issuers) =
+        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
     let mut fabrics = Mesh::new(4, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
     let mut plane = unwired_plane(0, 4, fabrics.next().expect("cell 0's fabric"));
     let zero = issuers.cells.into_iter().next().expect("cell 0's issuer");
@@ -6516,13 +7195,52 @@ fn lastsave_and_rdb_last_save_time_answer_one_second_after_inf_ckpt_cell_wait() 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// M3-S11 cross-cell `JSON.MGET` (ADR-0041 D9): the gather splits per
-/// key with single-key sub-ops whose `*1` elements reassemble in argv
-/// order — over the default db, and over a **named** namespace, which is
-/// exactly the ADR-0032 D5 binding this story executes (`send_apply_ns`
-/// per remote position; the generic multi-key refusal stays for
-/// everything else). Single-key remote JSON commands ride the ordinary
-/// fast arm alongside.
+/// The recorded node harness at five cells: every cell's keyspace takes the
+/// node's store configuration, and the log names the cell that executed each
+/// command — a connection's own on its cell, an `Apply` on its owner with the
+/// cell it came from. A budget of 23 B serves a 10 B reply and refuses a
+/// 41 B one on the key's owner, where the default budget serves both.
+#[test]
+fn a_recorded_node_of_five_cells_logs_each_owner_under_its_store_config() {
+    let store = StoreConfig { doc_max_reply_bytes: 23, ..StoreConfig::default() };
+    let (node, log) = Node::start_recorded(5, store);
+    let mut client = conn_on_cell(&node, 0);
+    let keys: Vec<Vec<u8>> = (0..5).map(|cell| key_for_cell(5, cell)).collect();
+    for key in &keys {
+        client.write_all(&cmd(&[b"SET", key, b"v"])).expect("write");
+        read_exactly(&mut client, b"+OK\r\n");
+    }
+    let sets = executed(&log, b"SET");
+    let owners: Vec<(u16, Option<u16>, &[u8])> =
+        sets.iter().map(|e| (e.cell, e.from, e.argv[1].as_slice())).collect();
+    let want: Vec<(u16, Option<u16>, &[u8])> = (0..5u16)
+        .map(|cell| (cell, (cell != 0).then_some(0), keys[usize::from(cell)].as_slice()))
+        .collect();
+    assert_eq!(owners, want, "each SET ran once, on its key's owner");
+    #[cfg(feature = "doc")]
+    {
+        let (small, large) =
+            (key_for_cell_prefixed(5, 1, "small"), key_for_cell_prefixed(5, 1, "j"));
+        let text = format!("\"{}\"", "x".repeat(30));
+        let mut pipeline = cmd(&[b"JSON.SET", &small, b"$", b"[1]"]);
+        pipeline.extend(cmd(&[b"JSON.SET", &large, b"$", text.as_bytes()]));
+        pipeline.extend(cmd(&[b"JSON.GET", &small, b"$"]));
+        pipeline.extend(cmd(&[b"JSON.GET", &large, b"$"]));
+        client.write_all(&pipeline).expect("write");
+        read_exactly(&mut client, b"+OK\r\n+OK\r\n$5\r\n[[1]]\r\n-ERR reply too large\r\n");
+        let gets = executed(&log, b"JSON.GET");
+        assert!(gets.iter().all(|e| (e.cell, e.from) == (1, Some(0))), "{gets:?}");
+    }
+    drop(client);
+    node.stop();
+}
+
+/// Cross-cell `JSON.MGET` (ADR-0173 D4): the gather sends one leg per
+/// owning cell, the command over that cell's keys, and pastes the legs'
+/// elements in argv order behind its own header — over the default db, and
+/// over a **named** namespace (`ApplyNs` legs; the generic multi-key refusal
+/// stays for every other command). Single-key remote JSON commands ride the
+/// ordinary fast arm alongside.
 #[test]
 #[cfg(feature = "doc")]
 fn json_mget_gathers_across_cells() {
@@ -6563,6 +7281,440 @@ fn json_mget_gathers_across_cells() {
     client.write_all(&cmd(&[b"MGET", &k0, &k1])).expect("write");
     let line = read_line(&mut client);
     assert!(line.starts_with(b"-ERR multi-key commands"), "refusal stays: {line:?}");
+    drop(client);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// One split fixture of the gather oracle: a multi-key `JSON.*` row over
+/// keys on both cells of a two-cell node, and its reply under each protocol,
+/// whose length L is that protocol's boundary: served at L, refused at
+/// L − 1, where each leg alone fits and only the whole crosses (ADR-0173 D1).
+/// A key never set answers the protocol's null inside its leg, which runs
+/// under the client's protocol, so the coordinator reads that protocol's
+/// null at L and at L − 1.
+#[cfg(feature = "doc")]
+struct SplitFixture {
+    row: &'static str,
+    /// Per key in argv order: its owning cell, and the document it holds or
+    /// `None` for a key never set.
+    keys: &'static [(u16, Option<&'static [u8]>)],
+    /// The command's arguments after its keys.
+    tail: &'static [&'static [u8]],
+    /// The reply under RESP2.
+    resp2: &'static [u8],
+    /// The reply under RESP3.
+    resp3: &'static [u8],
+}
+
+/// `JSON.MGET` over one document per cell, cell 0's first; then over a
+/// missing key on cell 1, cell 0's key and cell 1's, where the remote leg is
+/// a null and an element and the reply interleaves the two legs' elements in
+/// argv order.
+#[cfg(feature = "doc")]
+const SPLIT_FIXTURES: &[SplitFixture] = &[
+    SplitFixture {
+        row: "JSON.MGET",
+        keys: &[(0, Some(br#"{"n":1}"#)), (1, Some(br#"{"n":22}"#))],
+        tail: &[b"$.n"],
+        resp2: b"*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+        resp3: b"*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+    },
+    SplitFixture {
+        row: "JSON.MGET",
+        keys: &[(1, None), (0, Some(br#"{"n":1}"#)), (1, Some(br#"{"n":22}"#))],
+        tail: &[b"$.n"],
+        resp2: b"*3\r\n$-1\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+        resp3: b"*3\r\n_\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+    },
+];
+
+/// The `JSON.` rows of `rows` whose key spec spans more than one argument and
+/// that no fixture of `fixtures` covers: a multi-key `JSON.*` command whose
+/// reply is split across cells has no boundary pair.
+#[cfg(feature = "doc")]
+fn rows_without_split_fixture(
+    rows: &[inf_wire::CommandMeta],
+    fixtures: &[SplitFixture],
+) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|meta| meta.name.starts_with("JSON."))
+        .filter(|meta| {
+            let spec = inf_wire::key_spec(meta, None);
+            spec.first != 0 && (spec.last < 0 || i16::from(spec.last) > i16::from(spec.first))
+        })
+        .map(|meta| meta.name)
+        .filter(|name| !fixtures.iter().any(|f| f.row == *name))
+        .collect()
+}
+
+/// Where a split fixture runs: a numbered database of a volatile node, or a
+/// named memory namespace of a durable one.
+#[cfg(feature = "doc")]
+#[derive(Copy, Clone, Debug)]
+enum SplitScope {
+    Db,
+    Ns,
+}
+
+/// The protocol a split fixture's client speaks, which its legs run under.
+#[cfg(feature = "doc")]
+#[derive(Copy, Clone, Debug)]
+enum SplitProtocol {
+    Resp2,
+    Resp3,
+}
+
+#[cfg(feature = "doc")]
+impl SplitFixture {
+    fn reply(&self, protocol: SplitProtocol) -> &'static [u8] {
+        match protocol {
+            SplitProtocol::Resp2 => self.resp2,
+            SplitProtocol::Resp3 => self.resp3,
+        }
+    }
+}
+
+/// One leg of a split fixture at `budget` under `protocol`: the reply behind
+/// `PING`, read as `want`, and each cell's two counters, which say whose
+/// check refused.
+#[cfg(feature = "doc")]
+fn split_leg(
+    f: &SplitFixture,
+    scope: SplitScope,
+    protocol: SplitProtocol,
+    budget: usize,
+    want: &[u8],
+) -> [[u64; 2]; 2] {
+    let store = StoreConfig { doc_max_reply_bytes: budget, ..StoreConfig::default() };
+    let dir = temp_data_dir("jsonsplit");
+    let (node, _log) = match scope {
+        SplitScope::Db => Node::start_recorded(2, store),
+        SplitScope::Ns => Node::start_recorded_in(2, Some(dir.clone()), store),
+    };
+    let mut client = conn_on_cell(&node, 0);
+    if let SplitProtocol::Resp3 = protocol {
+        hello3(&mut client);
+    }
+    let keys: Vec<Vec<u8>> = f
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(index, &(cell, _))| key_for_cell_prefixed(2, cell, &format!("split{index}")))
+        .collect();
+    let mut setup = Vec::new();
+    let mut oks = 0;
+    if let SplitScope::Ns = scope {
+        setup.extend(cmd(&[b"INF.NS", b"CREATE", b"docs", b"MODE", b"memory"]));
+        setup.extend(cmd(&[b"INF.NS", b"USE", b"docs"]));
+        oks += 2;
+    }
+    for (key, &(_, doc)) in keys.iter().zip(f.keys) {
+        if let Some(doc) = doc {
+            setup.extend(cmd(&[b"JSON.SET", key, b"$", doc]));
+            oks += 1;
+        }
+    }
+    client.write_all(&setup).expect("write");
+    read_exactly(&mut client, &b"+OK\r\n".repeat(oks));
+    let mut argv: Vec<&[u8]> = vec![f.row.as_bytes()];
+    argv.extend(keys.iter().map(Vec::as_slice));
+    argv.extend_from_slice(f.tail);
+    let mut pipeline = cmd(&[b"PING"]);
+    pipeline.extend(cmd(&argv));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, &[b"+PONG\r\n".as_slice(), want].concat());
+    let counters = [0, 1].map(|cell| {
+        let stats = info_text(&mut conn_on_cell(&node, cell), b"stats");
+        ["json_reply_refusals_cell", "json_reply_refused_bytes_cell"]
+            .map(|field| info_field(&stats, field))
+    });
+    drop(client);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    counters
+}
+
+/// A split fixture's boundary pair in `scope`, under RESP2 and under RESP3:
+/// served at that protocol's L with no refusal counted, refused at L − 1 by
+/// the coordinator's account alone (cell 0 counts one refusal of L bytes;
+/// cell 1, whose leg fit, none).
+#[cfg(feature = "doc")]
+fn split_boundary(f: &SplitFixture, scope: SplitScope) {
+    for protocol in [SplitProtocol::Resp2, SplitProtocol::Resp3] {
+        let what = format!("{} over {} keys, {scope:?} {protocol:?}", f.row, f.keys.len());
+        let reply = f.reply(protocol);
+        let length = reply.len();
+        let served = split_leg(f, scope, protocol, length, reply);
+        assert_eq!(served, [[0, 0], [0, 0]], "{what} at L = {length}");
+        let refused = split_leg(f, scope, protocol, length - 1, b"-ERR reply too large\r\n");
+        let want = [[1, u64::try_from(length).expect("u64")], [0, 0]];
+        assert_eq!(refused, want, "{what} at L - 1: whose check refused");
+    }
+}
+
+/// The gather oracle in a numbered database: every multi-key `JSON.*` row
+/// has a split fixture, and each is served at its L and refused at L − 1
+/// at the wire, behind `PING`, under RESP2 and RESP3, though each leg fits.
+/// The canary of the coverage check runs in the same test: the same rows
+/// with no fixture name the multi-key row.
+#[test]
+#[cfg(feature = "doc")]
+fn every_split_json_row_is_charged_whole_in_a_numbered_database() {
+    assert_eq!(rows_without_split_fixture(&inf_wire::COMMANDS, SPLIT_FIXTURES), [""; 0]);
+    assert_eq!(rows_without_split_fixture(&inf_wire::COMMANDS, &[]), ["JSON.MGET"]);
+    for fixture in SPLIT_FIXTURES {
+        split_boundary(fixture, SplitScope::Db);
+    }
+}
+
+/// The gather oracle's named-namespace leg, on the durable node shape,
+/// under RESP2 and RESP3.
+#[test]
+#[cfg(feature = "doc")]
+fn every_split_json_row_is_charged_whole_in_a_named_namespace() {
+    for fixture in SPLIT_FIXTURES {
+        split_boundary(fixture, SplitScope::Ns);
+    }
+}
+
+/// One array reply of bulk and null elements, read whole as it came.
+#[cfg(feature = "doc")]
+fn read_bulk_array(stream: &mut TcpStream) -> Vec<u8> {
+    let mut reply = read_line(stream);
+    let count: usize = std::str::from_utf8(&reply[1..reply.len() - 2])
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| panic!("not an array header: {:?}", String::from_utf8_lossy(&reply)));
+    for _ in 0..count {
+        let header = read_line(stream);
+        let len: i64 = std::str::from_utf8(&header[1..header.len() - 2])
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or_else(|| panic!("not a bulk: {:?}", String::from_utf8_lossy(&header)));
+        reply.extend_from_slice(&header);
+        if let Ok(len) = usize::try_from(len) {
+            reply.extend(read_n(stream, len + 2));
+        }
+    }
+    reply
+}
+
+/// `n` bytes of `stream`, read whole.
+#[cfg(feature = "doc")]
+fn read_n(stream: &mut TcpStream, n: usize) -> Vec<u8> {
+    let mut got = vec![0u8; n];
+    stream
+        .read_exact(&mut got)
+        .unwrap_or_else(|e| panic!("{}", reply_read_failed(stream, "read", &e)));
+    got
+}
+
+/// The whole-reply rule at the default budget (128 MiB) across two cells: a
+/// 133-byte path of four 16-member duplicate unions selects 65,536 matches
+/// of one 1,102-byte string, so each key's reply is 72,286,226 B and is
+/// served, and the two keys' reply, 144,572,448 B, is refused with no
+/// element sent; the connection keeps serving, and `PING` before it stands.
+// nextest-long: 99 s
+#[test]
+#[cfg(feature = "doc")]
+fn json_mget_aggregate_refuses_at_the_wire() {
+    let node = Node::start(2);
+    let mut client = conn_on_cell(&node, 0);
+    let (local, remote) = (key_for_cell(2, 0), key_for_cell(2, 1));
+    let union = format!("[{}]", ["0"; 16].join(","));
+    let path = format!("${}", union.repeat(4));
+    assert_eq!(path.len(), 133, "four unions of 16 members");
+    let doc = format!("[[[[\"{}\"]]]]", "x".repeat(1_100));
+    let mut setup = cmd(&[b"JSON.SET", &local, b"$", doc.as_bytes()]);
+    setup.extend(cmd(&[b"JSON.SET", &remote, b"$", doc.as_bytes()]));
+    client.write_all(&setup).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n");
+    // `[` + 65,536 matches of 1,102 B + 65,535 commas + `]`, as one bulk.
+    let payload = 2 + 65_536 * 1_102 + 65_535;
+    let element = format!("${payload}\r\n").len() + payload + 2;
+    assert_eq!((4 + element, 4 + 2 * element), (72_286_226, 144_572_448));
+    let mut pipeline = cmd(&[b"PING"]);
+    pipeline.extend(cmd(&[b"JSON.MGET", &local, &remote, path.as_bytes()]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+PONG\r\n-ERR reply too large\r\n");
+    for key in [&local, &remote] {
+        client.write_all(&cmd(&[b"JSON.MGET", key, path.as_bytes()])).expect("write");
+        let reply = read_n(&mut client, 4 + element);
+        let head = format!("*1\r\n${payload}\r\n[\"x");
+        assert!(reply.starts_with(head.as_bytes()), "{:?}", String::from_utf8_lossy(&reply[..32]));
+        assert!(reply.ends_with(b"\"]\r\n"), "one whole element");
+    }
+    client.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut client, b"+PONG\r\n");
+    drop(client);
+    node.stop();
+}
+
+/// The two keys of a two-cell gather, cell 0's first, each holding `docs`.
+#[cfg(feature = "doc")]
+fn split_docs(client: &mut TcpStream, prefix: &str, docs: [&[u8]; 2]) -> [Vec<u8>; 2] {
+    let keys = [key_for_cell_prefixed(2, 0, prefix), key_for_cell_prefixed(2, 1, prefix)];
+    let mut setup = cmd(&[b"JSON.SET", &keys[0], b"$", docs[0]]);
+    setup.extend(cmd(&[b"JSON.SET", &keys[1], b"$", docs[1]]));
+    client.write_all(&setup).expect("write");
+    read_exactly(client, b"+OK\r\n+OK\r\n");
+    keys
+}
+
+/// The local leg is settled first: when it alone crosses the budget, the
+/// gather answers that leg's refusal and sends no remote leg, which the
+/// remote owner's log shows. Control: with the budget at the whole reply's
+/// length the same command is served and the owner executes one leg.
+#[test]
+#[cfg(feature = "doc")]
+fn json_mget_sends_no_leg_after_the_local_leg_refuses() {
+    for (budget, want, legs) in [
+        (12, b"-ERR reply too large\r\n".as_slice(), 0),
+        (23, b"*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n".as_slice(), 1),
+    ] {
+        let store = StoreConfig { doc_max_reply_bytes: budget, ..StoreConfig::default() };
+        let (node, log) = Node::start_recorded(2, store);
+        let mut client = conn_on_cell(&node, 0);
+        let keys = split_docs(&mut client, "first", [br#"{"n":1}"#, br#"{"n":22}"#]);
+        client.write_all(&cmd(&[b"JSON.MGET", &keys[0], &keys[1], b"$.n"])).expect("write");
+        read_exactly(&mut client, want);
+        let remote: Vec<Executed> =
+            executed(&log, b"JSON.MGET").into_iter().filter(|e| e.cell == 1).collect();
+        assert_eq!(remote.len(), legs, "budget {budget}: the remote owner's legs {remote:?}");
+        if let Some(leg) = remote.first() {
+            assert_eq!(
+                (leg.from, &leg.argv[1..]),
+                (Some(0), &[keys[1].clone(), b"$.n".to_vec()][..])
+            );
+        }
+        drop(client);
+        node.stop();
+    }
+}
+
+/// A path that does not compile answers its one error line, whatever the
+/// owners of the keys: all on the accepting cell, all on the other, or
+/// split, the reply is the same line, never an array of errors.
+#[test]
+#[cfg(feature = "doc")]
+fn json_mget_path_error_is_one_line_at_both_topologies() {
+    let node = Node::start(2);
+    let mut client = conn_on_cell(&node, 0);
+    let a = split_docs(&mut client, "pa", [br#"{"n":1}"#, br#"{"n":2}"#]);
+    let b = split_docs(&mut client, "pb", [br#"{"n":3}"#, br#"{"n":4}"#]);
+    let shapes: [[&[u8]; 2]; 3] = [[&a[0], &b[0]], [&a[1], &b[1]], [&a[0], &a[1]]];
+    let mut lines = Vec::new();
+    for [first, second] in shapes {
+        client.write_all(&cmd(&[b"JSON.MGET", first, second, b"$["])).expect("write");
+        lines.push(read_line(&mut client));
+    }
+    assert!(lines[0].starts_with(b"-ERR"), "{:?}", String::from_utf8_lossy(&lines[0]));
+    assert_eq!(lines[1], lines[0], "all remote");
+    assert_eq!(lines[2], lines[0], "split");
+    client.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut client, b"+PONG\r\n");
+    drop(client);
+    node.stop();
+}
+
+/// Pacing at the window (three remote legs of one gather in flight), on the
+/// smallest node that paces: five cells, one key per cell, so four remote
+/// owners. At a 64 B budget the gather of `a` (49 B) is served and the fifth
+/// cell executes its leg; the gather of `b` crosses at its first remote leg
+/// (13 B + 55 B), whose owner admitted it (59 B), so the reply is refused,
+/// the second and third owners execute legs that are drained, and the
+/// fourth executes nothing: its leg was held behind the window and never
+/// sent. The census row counts the pacing. Thirty-three more refused gathers
+/// pipelined before a remote `JSON.GET` leave the connection's window as it
+/// was, so the `JSON.GET` is answered.
+#[test]
+#[cfg(feature = "doc")]
+fn json_mget_paces_past_the_window() {
+    let store = StoreConfig { doc_max_reply_bytes: 64, ..StoreConfig::default() };
+    let (node, log) = Node::start_recorded(5, store);
+    let mut client = conn_on_cell(&node, 0);
+    let a: Vec<Vec<u8>> = (0..5).map(|cell| key_for_cell_prefixed(5, cell, "pa")).collect();
+    let b: Vec<Vec<u8>> = (0..5).map(|cell| key_for_cell_prefixed(5, cell, "pb")).collect();
+    let wide = format!(r#"{{"n":"{}"}}"#, "x".repeat(44));
+    let mut setup = Vec::new();
+    for cell in 0..5 {
+        setup.extend(cmd(&[b"JSON.SET", &a[cell], b"$", br#"{"n":1}"#]));
+        let doc: &[u8] = if cell == 1 { wide.as_bytes() } else { br#"{"n":1}"# };
+        setup.extend(cmd(&[b"JSON.SET", &b[cell], b"$", doc]));
+    }
+    client.write_all(&setup).expect("write");
+    read_exactly(&mut client, &b"+OK\r\n".repeat(10));
+    let mget = |keys: &[Vec<u8>]| {
+        let mut argv: Vec<&[u8]> = vec![b"JSON.MGET"];
+        argv.extend(keys.iter().map(Vec::as_slice));
+        argv.push(b"$.n");
+        cmd(&argv)
+    };
+    client.write_all(&mget(&a)).expect("write");
+    read_exactly(&mut client, &[b"*5\r\n".as_slice(), &b"$3\r\n[1]\r\n".repeat(5)].concat());
+    let legs_on = |keys: &[Vec<u8>], cell: u16| {
+        let key = &keys[usize::from(cell)];
+        let legs = executed(&log, b"JSON.MGET");
+        legs.iter().filter(|e| e.cell == cell && e.argv.contains(key)).count()
+    };
+    assert_eq!(legs_on(&a, 4), 1, "the served gather's fourth remote owner ran its leg");
+    client.write_all(&mget(&b)).expect("write");
+    read_exactly(&mut client, b"-ERR reply too large\r\n");
+    let ran: Vec<usize> = (1..5).map(|cell| legs_on(&b, cell)).collect();
+    assert_eq!(ran, [1, 1, 1, 0], "legs that ran, owners 1 to 4: the fourth was held");
+    let caps = info_text(&mut client, b"caps");
+    let row = caps
+        .lines()
+        .find_map(|line| line.strip_prefix("cap_row_json-gather-legs:"))
+        .unwrap_or_else(|| panic!("no json-gather-legs row in {caps}"));
+    let crossings: u64 = row
+        .split(',')
+        .find_map(|field| field.strip_prefix("crossings="))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{row}"));
+    assert!(crossings >= 1, "the window paced: {row}");
+    assert!(row.starts_with("entries_max=3,fill=serving,"), "{row}");
+    let mut pipeline = Vec::new();
+    for _ in 0..33 {
+        pipeline.extend(mget(&b));
+    }
+    pipeline.extend(cmd(&[b"JSON.GET", &a[1], b"$.n"]));
+    client.write_all(&pipeline).expect("write");
+    let refusals = b"-ERR reply too large\r\n".repeat(33);
+    read_exactly(&mut client, &[refusals.as_slice(), b"$3\r\n[1]\r\n"].concat());
+    drop(client);
+    node.stop();
+}
+
+/// A gather over a tiered namespace answers the tiered refusal as its one
+/// line, as the command whose keys are all on the accepting cell does: the
+/// local leg runs through the tiered arm, and a remote owner's refusal is
+/// the reply, never an element.
+#[test]
+#[cfg(feature = "doc")]
+fn json_mget_on_a_tiered_namespace_is_one_line() {
+    let dir = temp_data_dir("jsonmget-tiered");
+    let node = Node::start_durable(2, &dir);
+    let mut client = conn_on_cell(&node, 0);
+    client.write_all(&tiered_ns_create(b"t", &[b"MEM-BUDGET", b"8mb"])).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+    client.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+    let (k0, k0b, k1) = (
+        key_for_cell_prefixed(2, 0, "ta"),
+        key_for_cell_prefixed(2, 0, "tb"),
+        key_for_cell_prefixed(2, 1, "ta"),
+    );
+    client.write_all(&cmd(&[b"JSON.MGET", &k0, &k0b, b"$"])).expect("write");
+    let local = read_line(&mut client);
+    assert!(local.starts_with(b"-ERR this command is not supported on tiered"), "{local:?}");
+    client.write_all(&cmd(&[b"JSON.MGET", &k0, &k1, b"$"])).expect("write");
+    let split = read_line(&mut client);
+    assert_eq!(String::from_utf8_lossy(&split), String::from_utf8_lossy(&local), "split");
+    drop(client);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// ADR-0099 A1 at the shipped topology and the default budget (128 MiB):
@@ -7672,21 +8824,19 @@ fn cold_value(i: u32) -> Vec<u8> {
 /// prove nothing.
 fn seed_tiered_namespace_with_checkpoint(node: &Node, dir: &std::path::Path, keys: u32) {
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    c.write_all(&tiered_ns_create(
         b"cold",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"8mb",
-        b"DISK-BUDGET",
-        b"64mb",
-        b"MUTABLE-FRACTION",
-        b"100",
-        b"BLOB-THRESHOLD",
-        b"4kb",
-    ]))
+        &[
+            b"MEM-BUDGET",
+            b"8mb",
+            b"DISK-BUDGET",
+            b"64mb",
+            b"MUTABLE-FRACTION",
+            b"100",
+            b"BLOB-THRESHOLD",
+            b"4kb",
+        ],
+    ))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"cold"])).expect("write");
@@ -7830,16 +8980,12 @@ fn assert_cold_keys_served(conn: &mut TcpStream, keys: u32) {
     read_exactly(conn, b"+OK\r\n");
 }
 
-/// Crash-matrix row `ns_drop_before_meta` (ADR-0100 D5): the DDL stops
-/// after the local apply and before the catalog persist request — the
-/// on-disk state of a cut at that instant. Nothing durable changed, the
-/// node's checkpoints are manual and none is requested after the drop,
-/// before the crash-equivalent stop, and the teardown hold kept every
-/// tier file (the origin cell's registry alone lacks the namespace, so
-/// the origin's own files are the ones that would have been unlinked
-/// pre-ADR). A restart serves the namespace with every key. A checkpoint
-/// of the origin cell published after the drop would omit the namespace
-/// (ADR-0186 D2); no row covers it.
+/// Crash-matrix row `ns_drop_before_meta` (ADR-0189 D5): the DDL stops
+/// just before its catalog request — the on-disk state of a cut before the
+/// answer. Nothing was applied anywhere and nothing durable changed, so
+/// the checkpoint every cell, the origin included, publishes before the
+/// crash-equivalent stop still names the namespace, and every tier file
+/// stays. A restart serves the namespace with every key.
 #[test]
 fn dropped_tiered_namespace_survives_a_cut_before_its_swap() {
     let dir = temp_data_dir("drop-cut-before");
@@ -7853,6 +8999,10 @@ fn dropped_tiered_namespace_survives_a_cut_before_its_swap() {
     let mut c = node.connect();
     c.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
     read_exactly(&mut c, b"-ERR fault: ns_drop_before_meta\r\n");
+    // Every cell, the origin included, publishes a checkpoint before the
+    // stop: no cell applied the drop, so each still names the namespace.
+    let epoch = node.request_ckpt_all();
+    drop_wait_published(&node, epoch);
     // Give MAINTAIN time to run its teardown slices: the hold must keep
     // every file since no catalog swap carried the drop.
     #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
@@ -7880,12 +9030,11 @@ fn dropped_tiered_namespace_survives_a_cut_before_its_swap() {
     receipt::verified("ns_drop_before_meta", "namespace-restored-whole");
 }
 
-/// Crash-matrix row `ns_drop_after_meta` (ADR-0100 D6): the DDL stops
-/// once the catalog swap is durable and before the fan — the on-disk
-/// state of a cut after the swap. `META` lacks the namespace and carries
-/// its tombstone while each peer's `MANIFEST` still names it. The restart
-/// boots (the pre-ADR fail-stop refused exactly this state), sweeps the
-/// residue on every cell, and the namespace is gone.
+/// Crash-matrix row `ns_drop_after_meta` (ADR-0189 D5): the DDL stops
+/// after the writer's answer and before the origin's apply — the on-disk
+/// state of a cut after the answer. `META` lacks the namespace and carries
+/// its tombstone while every cell's `MANIFEST` still names it. The restart
+/// boots, sweeps the residue on every cell, and the namespace is gone.
 #[test]
 fn dropped_tiered_namespace_survives_a_cut_after_its_swap() {
     let dir = temp_data_dir("drop-cut-after");
@@ -7958,8 +9107,7 @@ fn ns_create_sub_floor_budget_refuses_typed_and_node_survives() {
         read_exactly(&mut c, b"+PONG\r\n");
     }
     // 3mb + the 1 MiB default slice = exactly four commit pages.
-    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"tiny", b"MODE", b"durable", b"MEM-BUDGET", b"3mb"]))
-        .expect("write");
+    c.write_all(&tiered_ns_create(b"tiny", &[b"MEM-BUDGET", b"3mb"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"tiny"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -7986,18 +9134,8 @@ fn inline_value_above_half_ring_is_routed_out_of_line() {
     let dir = temp_data_dir("l06-01-half-ring");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"hot",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"3mb",
-        b"DISK-BUDGET",
-        b"64mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"hot", &[b"MEM-BUDGET", b"3mb", b"DISK-BUDGET", b"64mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"hot"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -8025,18 +9163,8 @@ fn inline_value_above_half_ring_is_routed_out_of_line() {
     );
     // The explicit face: a threshold the ring cannot honour is refused
     // at the gauntlet, never accepted and clamped in silence.
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"hot2",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"3mb",
-        b"BLOB-THRESHOLD",
-        b"4mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(b"hot2", &[b"MEM-BUDGET", b"3mb", b"BLOB-THRESHOLD", b"4mb"]))
+        .expect("write");
     let reply = read_line(&mut c);
     assert!(
         reply.starts_with(b"-ERR BLOB-THRESHOLD"),
@@ -8121,19 +9249,10 @@ fn concurrent_writes_to_a_blob_key_never_desync_the_index() {
     let node = Node::start_durable(1, &dir);
     let mut a = node.connect();
     let mut b = node.connect();
-    a.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
+    a.write_all(&tiered_ns_create(
         b"hot",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"16mb",
-        b"DISK-BUDGET",
-        b"512mb",
-        b"BLOB-THRESHOLD",
-        b"4kb",
-    ]))
+        &[b"MEM-BUDGET", b"16mb", b"DISK-BUDGET", b"512mb", b"BLOB-THRESHOLD", b"4kb"],
+    ))
     .expect("write");
     read_exactly(&mut a, b"+OK\r\n");
     for c in [&mut a, &mut b] {
@@ -8191,7 +9310,8 @@ fn concurrent_writes_to_a_blob_key_never_desync_the_index() {
 fn namespace_is_unusable_until_its_definition_is_durable() {
     let dir = temp_data_dir("c14-create-window");
     let hold = Arc::new(AtomicBool::new(true));
-    let node = Node::start_durable_with_held_catalog(2, &dir, Arc::clone(&hold));
+    let node =
+        Node::start_durable_with_held_catalog(2, &dir, Arc::clone(&hold), CkptTrigger::Manual);
     let mut creator = node.connect();
     creator
         .write_all(&cmd(&[
@@ -8261,7 +9381,7 @@ fn namespace_is_unusable_until_its_definition_is_durable() {
     // The released half: the swap lands, the CREATE acks, the namespace
     // serves on every cell, and an acked write survives a restart.
     let hold = Arc::new(AtomicBool::new(false));
-    let node = Node::start_durable_with_held_catalog(2, &dir, hold);
+    let node = Node::start_durable_with_held_catalog(2, &dir, hold, CkptTrigger::Manual);
     let mut c = node.connect();
     c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"fresh2", b"MODE", b"durable", b"FSYNC", b"always"]))
         .expect("write");
@@ -8416,22 +9536,12 @@ fn connection_level_commands_ignore_the_bound_namespace() {
     let dir = temp_data_dir("conn-level-ns");
     let node = Node::start_durable(4, &dir);
     let mut admin = node.connect();
-    for argv in [
-        &[&b"INF.NS"[..], b"CREATE", b"mem", b"MODE", b"memory"][..],
-        &[
-            &b"INF.NS"[..],
-            b"CREATE",
-            b"tier",
-            b"MODE",
-            b"durable",
-            b"MEM-BUDGET",
-            b"64mb",
-            b"DISK-BUDGET",
-            b"256mb",
-        ][..],
+    for create in [
+        cmd(&[b"INF.NS", b"CREATE", b"mem", b"MODE", b"memory"]),
+        tiered_ns_create(b"tier", &[b"MEM-BUDGET", b"64mb", b"DISK-BUDGET", b"256mb"]),
     ] {
-        admin.write_all(&cmd(argv)).expect("write");
-        assert_eq!(read_line(&mut admin), b"+OK\r\n", "{argv:?}");
+        admin.write_all(&create).expect("write");
+        assert_eq!(read_line(&mut admin), b"+OK\r\n", "{}", String::from_utf8_lossy(&create));
     }
     // One template per connection-level command. `QUIT` closes the
     // connection after its `+OK`; the subscribe family flips the
@@ -8751,18 +9861,8 @@ fn del_of_a_rebuilt_winner_carrying_two_tickets_drains_every_ticket() {
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
-        c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
-            b"t",
-            b"MODE",
-            b"durable",
-            b"MEM-BUDGET",
-            b"3mb",
-            b"MUTABLE-FRACTION",
-            b"200",
-        ]))
-        .expect("write");
+        c.write_all(&tiered_ns_create(b"t", &[b"MEM-BUDGET", b"3mb", b"MUTABLE-FRACTION", b"200"]))
+            .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         use_t(&mut c);
         for (k, v) in [(&k0, &v0), (&k2, &v2)] {
@@ -8838,12 +9938,23 @@ fn del_of_a_rebuilt_winner_carrying_two_tickets_drains_every_ticket() {
     c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
     read_exactly(&mut c, format!(":{}\r\n", filler_keys + 2).as_bytes());
     drop(c);
-    node.stop();
+    // Life 3 reads the DEL, an everysec write: the crash-equivalent stop
+    // promises it nothing, so life 2 drains and syncs its log.
+    node.stop_synced();
     // Life 3 (no fault): the deletion is durable, the collision keys
     // survive, no ticket re-forms (the winner is gone).
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
     use_t(&mut c);
+    // The precondition, read before any GET: the boot replayed life 2's
+    // marker and Delete past life 1's checkpoint. Without them the GET
+    // would serve the checkpoint's k1, a wrong value for a lost frame.
+    let replayed = scrape_u64(&mut c, b"persistence", "recover_replay_records:");
+    assert!(
+        replayed >= 2,
+        "VACUOUS: life 2's DEL did not reach the log before its stop ({replayed} record(s) \
+         replayed past the checkpoint, want its marker and its Delete)"
+    );
     c.write_all(&cmd(&[b"GET", &k1])).expect("write");
     read_exactly(&mut c, b"$-1\r\n");
     c.write_all(&cmd(&[b"GET", &k0])).expect("write");
@@ -9406,18 +10517,8 @@ fn client_ids_are_node_unique_so_a_foreign_kill_reaches_nothing() {
 /// Creates a tiered namespace and binds `c` to it (the §5.5 regime: one
 /// cell, a namespace-bound connection).
 fn bind_tiered(c: &mut TcpStream, ns: &[u8]) {
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        ns,
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"8mb",
-        b"DISK-BUDGET",
-        b"64mb",
-    ]))
-    .expect("write");
+    c.write_all(&tiered_ns_create(ns, &[b"MEM-BUDGET", b"8mb", b"DISK-BUDGET", b"64mb"]))
+        .expect("write");
     read_exactly(c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
     read_exactly(c, b"+OK\r\n");
@@ -9536,3 +10637,804 @@ fn tiered_namespace_parses_arguments_like_the_numbered_db() {
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- a cut inside a namespace DROP's catalog wait ----
+//
+// `INF.NS DROP` asks the catalog writer for the swap that drops the
+// namespace and waits for its answer before it fans the drop or replies.
+// Until that answer the drop is un-acked, and a cut must boot the old
+// catalog with every acknowledged key served on every cell: every cell
+// serves the old definition through the wait, the origin included, so a
+// checkpoint published in it still names the namespace (ADR-0189 D5).
+// These scenarios hold the swap (the harness-driven catalog writer never
+// drains), let every cell publish a checkpoint inside the wait or not,
+// cut, and read back every key the seed recorded. The checkpoint either
+// opens inside the wait or is already walking the namespace when the drop
+// requests its swap. The oracle is the client's own record of acknowledged
+// writes, compared with what the restarted node serves per owning cell; it
+// reads no server counter. A restart that refuses to boot is its other red.
+// The control leg cuts at the same instant with no checkpoint in the wait.
+
+/// Keys the durable seed writes on each cell, and each value's length:
+/// 128 KiB a cell, several slices of the walk even when one slice stages a
+/// whole scan chunk of entries (about 35 KB of these), so the drop, sent
+/// after the first slice, finds most of the share still ahead of the walk.
+const DROP_WAIT_DURABLE_KEYS_PER_CELL: usize = 128;
+const DROP_WAIT_DURABLE_VALUE_BYTES: usize = 1 << 10;
+
+/// The namespace a drop-wait scenario drops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DropWaitNs {
+    /// `ledger`: durable, `FSYNC always`, so each `+OK` follows its fsync.
+    Durable,
+    /// `cold` (id 16): tiered, its values demoted to tier files that a
+    /// checkpoint published on every cell names before the drop.
+    Tiered,
+}
+
+impl DropWaitNs {
+    fn name(self) -> &'static [u8] {
+        match self {
+            DropWaitNs::Durable => b"ledger",
+            DropWaitNs::Tiered => b"cold",
+        }
+    }
+}
+
+/// What the cells' checkpoints do while the drop waits for its swap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DropWaitCheckpoint {
+    /// None is requested: the control leg.
+    NotRequested,
+    /// One is requested once the drop has requested its swap, and it
+    /// publishes on every cell before the cut.
+    OpensInside,
+    /// A paced one opens before the drop, and cell 0's walk has written
+    /// its first section of the namespace before the drop requests its
+    /// swap; it publishes on every cell before the cut.
+    WalksAcross,
+}
+
+/// One recorded write: the key, the value its `+OK` acknowledged and the
+/// cell that owns the key.
+struct AckedWrite {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    cell: u16,
+}
+
+/// A drop parked on its held swap: its connection, whose reply never
+/// comes, and what a `USE` on cell 0 answered once the swap was requested.
+struct DropInFlight {
+    _dropper: TcpStream,
+    origin_use: String,
+}
+
+/// The cell that owns `key` under a two-cell contiguous router.
+fn drop_wait_owner(key: &[u8]) -> u16 {
+    let router = SlotRouter::new_contiguous(2);
+    let owner = router.cell_of(SlotRouter::slot_of(key));
+    (0..2u16).find(|&cell| owner == CellId(cell)).expect("a two-cell router names cell 0 or 1")
+}
+
+/// Seeds `kind` on a fresh two-cell node, stops it, and returns the
+/// scenario's named keys, which are every key the oracle reads back (at
+/// least one owned by each cell): each durable key, or the tiered seed's
+/// `k0..k31`. The tiered seed's ring-fill writes (`fill{batch}:{i}`) are
+/// acknowledged too, but the helper does not say how many it wrote, so
+/// they are neither recorded nor read back.
+fn seed_drop_wait_namespace(kind: DropWaitNs, dir: &std::path::Path) -> Vec<AckedWrite> {
+    let node = Node::start_durable(2, dir);
+    let acked: Vec<AckedWrite> = match kind {
+        DropWaitNs::Durable => {
+            let mut c = node.connect();
+            c.write_all(&cmd(&[
+                b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"always",
+            ]))
+            .expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+            let mut c = connect_use(&node, b"ledger");
+            let mut acked = Vec::new();
+            for cell in 0..2u16 {
+                for key in keys_for_cell(2, cell, DROP_WAIT_DURABLE_KEYS_PER_CELL) {
+                    let mut value = [b"acked:".as_slice(), &key].concat();
+                    value.resize(DROP_WAIT_DURABLE_VALUE_BYTES, b'.');
+                    c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+                    read_exactly(&mut c, b"+OK\r\n");
+                    acked.push(AckedWrite { key, value, cell });
+                }
+            }
+            acked
+        }
+        // The helper's `INF.CKPT WAIT` publishes a checkpoint covering
+        // every key below on both cells, so each is durable.
+        DropWaitNs::Tiered => {
+            seed_tiered_namespace_with_checkpoint(&node, dir, 32);
+            (0..32u32)
+                .map(|i| {
+                    let key = format!("k{i}").into_bytes();
+                    AckedWrite { cell: drop_wait_owner(&key), key, value: cold_value(i) }
+                })
+                .collect()
+        }
+    };
+    node.stop();
+    for cell in 0..2u16 {
+        assert!(acked.iter().any(|w| w.cell == cell), "VACUOUS: no acked key on cell {cell}");
+    }
+    acked
+}
+
+/// Reads every recorded write back through `ns` and returns one line per
+/// write the node does not serve as acknowledged.
+fn drop_wait_misses(node: &Node, ns: &[u8], acked: &[AckedWrite]) -> Vec<String> {
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+    let used = read_line(&mut c);
+    if used != b"+OK\r\n" {
+        return vec![format!(
+            "namespace '{}' not served: {:?}",
+            String::from_utf8_lossy(ns),
+            String::from_utf8_lossy(&used)
+        )];
+    }
+    let mut misses = Vec::new();
+    for w in acked {
+        c.write_all(&cmd(&[b"GET", &w.key])).expect("write");
+        let key = String::from_utf8_lossy(&w.key);
+        match read_get(&mut c) {
+            Ok(body) if body == w.value => {}
+            Ok(body) if body.is_empty() => misses.push(format!("cell {}: {key} is nil", w.cell)),
+            Ok(body) => misses.push(format!("cell {}: {key} served {} bytes", w.cell, body.len())),
+            Err(err) => misses.push(format!("cell {}: {key} answered {err}", w.cell)),
+        }
+    }
+    misses
+}
+
+/// One `INF.NS USE ns` on a connection of `cell`; the reply line.
+fn drop_wait_use_on(node: &Node, cell: u16, ns: &[u8]) -> String {
+    let mut c = conn_on_cell(node, cell);
+    c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+    String::from_utf8_lossy(&read_line(&mut c)).trim_end().to_owned()
+}
+
+/// Sends `INF.NS DROP ns` on a connection of cell 0 and returns once the
+/// drop has requested its catalog swap, which the held writer never makes
+/// durable. The cell runs the drop's steps up to that request without
+/// yielding, so a checkpoint requested after this returns opens while the
+/// drop waits, whatever the origin's keyspace holds by then. Cell 1 still
+/// serves the namespace: no peer is told before the swap.
+fn drop_on_origin(node: &Node, ns: &[u8]) -> DropInFlight {
+    let control = node.control.as_ref().expect("a durable node");
+    let requested = control.persist_requests_sent();
+    let mut dropper = conn_on_cell(node, 0);
+    dropper.write_all(&cmd(&[b"INF.NS", b"DROP", ns])).expect("write");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while control.persist_requests_sent() == requested {
+        assert!(Instant::now() < deadline, "the drop never requested its catalog swap");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(control.persist_requests_sent(), requested + 1, "one swap: the drop's");
+    assert_eq!(drop_wait_use_on(node, 1, ns), "+OK", "cell 1 serves it until the swap");
+    DropInFlight { _dropper: dropper, origin_use: drop_wait_use_on(node, 0, ns) }
+}
+
+/// The highest checkpoint epoch every cell has published.
+fn drop_wait_min_published(node: &Node) -> u64 {
+    let board = node.control.as_ref().expect("a durable node").ckpt_board();
+    (0..node.cells).map(|cell| board.slot(cell).published()).min().unwrap_or(0)
+}
+
+/// Waits until checkpoint `epoch` reached a durable `MANIFEST` on every cell.
+fn drop_wait_published(node: &Node, epoch: u64) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while drop_wait_min_published(node) < epoch {
+        assert!(Instant::now() < deadline, "checkpoint {epoch} never published on every cell");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// What cell 0's staging image held when the drop was sent.
+struct WalkAtDrop {
+    /// Post-images outside the default database in its written sections.
+    written: usize,
+    /// Their keys' and values' bytes: a floor under what the walk streamed.
+    written_kv_bytes: u64,
+    /// The most the pace let the walk stream on the held clock.
+    allowance_bytes: u64,
+}
+
+/// The post-images outside the default database that the written sections
+/// of cell 0's staging image hold, and their keys' and values' bytes. The
+/// image has no footer yet, so the read ends in an error after the last
+/// written section; each section counted here passed its checksum.
+fn drop_wait_staged_images(dir: &std::path::Path) -> (usize, u64) {
+    let staging = dir.join("shard-0").join("ckpt");
+    let image = std::fs::read_dir(&staging)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".ick.new"));
+    let Some(image) = image else {
+        return (0, 0);
+    };
+    let (mut written, mut written_kv_bytes) = (0usize, 0u64);
+    let _ = inf_log::ckpt::read_ick_hybrid(
+        &inf_log::fs::StdSegmentFs,
+        &image,
+        inf_log::ckpt::IckReaderConfig::default(),
+        |record| {
+            if let inf_log::RecordView::StringPostImage { ns, key, value } = record
+                && ns.0 != 0
+            {
+                written += 1;
+                written_kv_bytes += (key.len() + value.len()) as u64;
+            }
+            Ok::<(), ()>(())
+        },
+        |_| Ok(()),
+        |_| Ok(()),
+        |_| Ok(()),
+        |_| Ok(()),
+    );
+    (written, written_kv_bytes)
+}
+
+/// The paced pass of [`DropWaitCheckpoint::WalksAcross`]. The clocks are
+/// held, and a round trip to cell 0 follows before the request, so the
+/// iteration that opens the checkpoint reads the held clock. The pace lets
+/// the walk stream `stream_bytes_per_sec` times the time since it opened,
+/// so the clocks step 1 ms per round trip until cell 0's staging image
+/// holds a section past its header, and stay put from there to the drop.
+/// The default database holds nothing, so that section is the
+/// namespace's: a tiered namespace's address references, which its walk
+/// emits first, or a durable namespace's first post-images. Then the drop
+/// requests its swap, and the walk runs out on every cell with the pace
+/// lifted.
+fn walk_across_the_drop(
+    node: &Node,
+    dir: &std::path::Path,
+    ns: &[u8],
+    stream_bytes_per_sec: u32,
+) -> (DropInFlight, WalkAtDrop) {
+    let staging = dir.join("shard-0").join("ckpt");
+    let past_header = || {
+        std::fs::read_dir(&staging).into_iter().flatten().flatten().any(|entry| {
+            entry.file_name().to_string_lossy().ends_with(".ick.new")
+                && entry
+                    .metadata()
+                    .is_ok_and(|meta| meta.len() > inf_log::ckpt::ICK_BLOCK_ALIGN as u64)
+        })
+    };
+    let board = node.control.as_ref().expect("a durable node").ckpt_board();
+    let mut probe = conn_on_cell(node, 0);
+    node.clock_gates.iter().for_each(|gate| gate.hold());
+    let _ = info_text(&mut probe, b"persistence");
+    let epoch = node.request_ckpt_all();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut stepped_ms = 0u64;
+    while !past_header() {
+        assert!(Instant::now() < deadline, "cell 0's walk never wrote a section");
+        node.clock_gates.iter().for_each(|gate| gate.step(Duration::from_millis(1)));
+        stepped_ms += 1;
+        // A round trip gives the cell an iteration on the stepped clock.
+        let _ = info_text(&mut probe, b"persistence");
+    }
+    assert!(board.slot(0).published() < epoch, "VACUOUS: cell 0's walk published already");
+    let (written, written_kv_bytes) = drop_wait_staged_images(dir);
+    let allowance_bytes = (u64::from(stream_bytes_per_sec) * stepped_ms.max(1)).div_ceil(1000);
+    let at_drop = WalkAtDrop { written, written_kv_bytes, allowance_bytes };
+    let in_flight = drop_on_origin(node, ns);
+    while drop_wait_min_published(node) < epoch {
+        assert!(Instant::now() < deadline, "checkpoint {epoch} never published on every cell");
+        node.clock_gates.iter().for_each(|gate| gate.step(Duration::from_secs(1)));
+        let _ = info_text(&mut probe, b"persistence");
+    }
+    node.clock_gates.iter().for_each(|gate| gate.open());
+    (in_flight, at_drop)
+}
+
+/// The durable walk leg's engagement, read from cell 0's staging image
+/// when the drop was sent: the walk had written some of the namespace and
+/// fewer keys than cell 0 owns. What it had written outweighs the pace's
+/// allowance on the held clock, so no slice could start after those
+/// sections (one starts only while the streamed bytes are under the
+/// allowance), and none was in flight or staged: every key not written was
+/// still ahead of the walk, which a checkpoint that opens in the wait
+/// cannot show.
+fn drop_wait_assert_walk_mid_share(acked: &[AckedWrite], at_drop: &WalkAtDrop) {
+    let owned = acked.iter().filter(|w| w.cell == 0).count();
+    let WalkAtDrop { written, written_kv_bytes, allowance_bytes } = *at_drop;
+    assert!(written > 0, "VACUOUS: cell 0's walk had written none of the namespace at the drop");
+    assert!(written < owned, "VACUOUS: cell 0's walk had written all {owned} of its keys");
+    assert!(
+        written_kv_bytes >= allowance_bytes,
+        "VACUOUS: cell 0's walk was not held by its pace at the drop ({written_kv_bytes} B \
+         written, {allowance_bytes} B allowed)"
+    );
+}
+
+/// What cell 0's published checkpoint says about namespace 16: whether
+/// its `MANIFEST` has the tier section, and the address references its
+/// image holds.
+fn drop_wait_origin_tier_witness(dir: &std::path::Path) -> (bool, usize) {
+    let shard = dir.join("shard-0");
+    let manifest = inf_log::read_manifest(&inf_log::fs::StdSegmentFs, &shard)
+        .expect("manifest reads")
+        .expect("checkpoint published");
+    let ick = shard.join("ckpt").join(inf_log::ckpt::ick_file_name(manifest.ckpt_id));
+    let mut refs = 0usize;
+    let _ = inf_log::ckpt::read_ick_hybrid(
+        &inf_log::fs::StdSegmentFs,
+        &ick,
+        inf_log::ckpt::IckReaderConfig::default(),
+        |_| Ok::<(), ()>(()),
+        |section| {
+            if section.ns == 16 {
+                refs += section.len();
+            }
+            Ok(())
+        },
+        |_| Ok(()),
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .expect("published checkpoint validates");
+    (manifest.tier_ns(16).is_some(), refs)
+}
+
+/// Files under `shard-k/ns-16/cold` per cell: (tier files, blob extents
+/// live or quarantined).
+fn drop_wait_cold_files(dir: &std::path::Path) -> Vec<(usize, usize)> {
+    (0..2u16)
+        .map(|cell| {
+            let cold = dir.join(format!("shard-{cell}")).join("ns-16").join("cold");
+            let names: Vec<String> = std::fs::read_dir(&cold)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            let tier = names.iter().filter(|n| inf_log::parse_tier_file_name(n).is_some());
+            let extents = names.iter().filter(|n| {
+                inf_log::parse_extent_file_name(n).is_some()
+                    || inf_log::parse_quarantined_file_name(n).is_some()
+            });
+            (tier.count(), extents.count())
+        })
+        .collect()
+}
+
+/// Restarts on `dir` with the real control thread, reads every recorded
+/// write back, stops the node and returns the misses; a refused boot
+/// panics with the refusal. The tiered file count is taken after the
+/// stop, which drains the control thread's queued unlinks, so it is the
+/// restart's settled state rather than a sample of that queue.
+fn drop_wait_restart(
+    dir: &std::path::Path,
+    kind: DropWaitNs,
+    acked: &[AckedWrite],
+    context: &mut String,
+) -> Vec<String> {
+    let served = Node::start_durable_or_refusal(2, dir).map(|node| {
+        let misses = drop_wait_misses(&node, kind.name(), acked);
+        node.stop();
+        misses
+    });
+    if kind == DropWaitNs::Tiered {
+        let cold_after = drop_wait_cold_files(dir);
+        context.push_str(&format!(", after the restart and its stop {cold_after:?}"));
+    }
+    match served {
+        Ok(misses) => misses,
+        Err(refusal) => {
+            std::fs::remove_dir_all(dir).ok();
+            panic!("the restart refused to boot: {refusal}\n  {context}");
+        }
+    }
+}
+
+/// The scenario: seed, restart with the swap held, drop on cell 0, the
+/// checkpoint `checkpoint` names, cut, restart, and the oracle.
+fn drop_wait_scenario(kind: DropWaitNs, checkpoint: DropWaitCheckpoint, tag: &str) {
+    let dir = temp_data_dir(tag);
+    let acked = seed_drop_wait_namespace(kind, &dir);
+    let ns = kind.name();
+    let (slice_bytes, stream_bytes_per_sec) = (4u32 << 10, 256u32 << 10);
+    let trigger = match checkpoint {
+        DropWaitCheckpoint::WalksAcross => CkptTrigger::Paced { slice_bytes, stream_bytes_per_sec },
+        DropWaitCheckpoint::NotRequested | DropWaitCheckpoint::OpensInside => CkptTrigger::Manual,
+    };
+    // The catalog writer never drains on this node: every swap requested
+    // from here on stays un-durable, and the cut below loses it.
+    let hold = Arc::new(AtomicBool::new(true));
+    let node = Node::start_durable_with_held_catalog(2, &dir, hold, trigger);
+    let before = drop_wait_misses(&node, ns, &acked);
+    assert!(before.is_empty(), "acked writes missing before the drop: {before:?}");
+    let control = Arc::clone(node.control.as_ref().expect("a durable node"));
+    let persisted_before = control.persisted_epoch();
+    let published_before = drop_wait_min_published(&node);
+    let (in_flight, at_drop) = match checkpoint {
+        DropWaitCheckpoint::NotRequested => (drop_on_origin(&node, ns), None),
+        DropWaitCheckpoint::OpensInside => {
+            let in_flight = drop_on_origin(&node, ns);
+            let epoch = node.request_ckpt_all();
+            drop_wait_published(&node, epoch);
+            (in_flight, None)
+        }
+        DropWaitCheckpoint::WalksAcross => {
+            let (in_flight, at_drop) = walk_across_the_drop(&node, &dir, ns, stream_bytes_per_sec);
+            (in_flight, Some(at_drop))
+        }
+    };
+    assert_eq!(control.persisted_epoch(), persisted_before, "the drop's swap stayed held");
+    if checkpoint == DropWaitCheckpoint::NotRequested {
+        assert_eq!(drop_wait_min_published(&node), published_before, "no checkpoint in the wait");
+    }
+    let origin_use = in_flight.origin_use.clone();
+    drop(in_flight);
+    node.kill_without_catalog_drain();
+    let mut context = format!(
+        "namespace '{}' ({kind:?}), un-acked DROP from cell 0, its catalog swap never durable, \
+         checkpoint {checkpoint:?}; cell 0 answered USE in the wait: {origin_use:?}",
+        String::from_utf8_lossy(ns)
+    );
+    if let Some(at_drop) = &at_drop {
+        context.push_str(&format!(
+            "; cell 0's staging image when the drop was sent: {} post-images ({} B of keys and \
+             values), pace allowance {} B",
+            at_drop.written, at_drop.written_kv_bytes, at_drop.allowance_bytes
+        ));
+        if kind == DropWaitNs::Durable {
+            drop_wait_assert_walk_mid_share(&acked, at_drop);
+        }
+    }
+    if kind == DropWaitNs::Tiered {
+        let cold_at_cut = drop_wait_cold_files(&dir);
+        let (named, refs) = drop_wait_origin_tier_witness(&dir);
+        if checkpoint == DropWaitCheckpoint::WalksAcross {
+            assert!(refs > 0, "VACUOUS: cell 0's walk staged no address reference");
+        }
+        context.push_str(&format!(
+            "; cell 0's last checkpoint: MANIFEST tier section for ns 16 {named}, address \
+             refs for ns 16 in its image {refs}; (tier files, extents) per cell at the cut \
+             {cold_at_cut:?}"
+        ));
+    }
+    let misses = drop_wait_restart(&dir, kind, &acked, &mut context);
+    std::fs::remove_dir_all(&dir).ok();
+    let lost =
+        |cell: u16| misses.iter().filter(|m| m.starts_with(&format!("cell {cell}:"))).count();
+    let owned = |cell: u16| acked.iter().filter(|w| w.cell == cell).count();
+    assert!(
+        misses.is_empty(),
+        "{} of {} writes acknowledged before the drop are not served after the restart \
+         (cell 0: {} of {} lost, cell 1: {} of {} lost); first: {:?}\n  {context}",
+        misses.len(),
+        acked.len(),
+        lost(0),
+        owned(0),
+        lost(1),
+        owned(1),
+        &misses[..misses.len().min(4)]
+    );
+}
+
+/// A checkpoint of every cell that opens while a durable namespace's drop
+/// waits for its swap keeps every key a cut there restores.
+#[test]
+fn a_checkpoint_inside_a_durable_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Durable, DropWaitCheckpoint::OpensInside, "dw-durable-ckpt");
+}
+
+/// The control leg of the durable tests: the same cut, no checkpoint.
+#[test]
+fn a_cut_inside_a_durable_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Durable, DropWaitCheckpoint::NotRequested, "dw-durable-cut");
+}
+
+/// A checkpoint already part-way through a durable namespace when the
+/// drop requests its swap: the keys its walk had not reached must still be
+/// served after a cut there.
+#[test]
+fn a_walk_across_a_durable_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Durable, DropWaitCheckpoint::WalksAcross, "dw-durable-walk");
+}
+
+/// The same for a tiered namespace, whose keys live in tier files the
+/// origin's `MANIFEST` must keep naming.
+#[test]
+fn a_checkpoint_inside_a_tiered_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Tiered, DropWaitCheckpoint::OpensInside, "dw-tiered-ckpt");
+}
+
+/// The control leg of the tiered tests: the same cut, no checkpoint.
+#[test]
+fn a_cut_inside_a_tiered_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Tiered, DropWaitCheckpoint::NotRequested, "dw-tiered-cut");
+}
+
+/// A checkpoint already walking the tiered namespace when the drop
+/// requests its swap: the image's address references and the `MANIFEST`'s
+/// tier section must agree, so the restart boots and serves every key.
+#[test]
+fn a_walk_across_a_tiered_drop_wait_keeps_every_acked_key() {
+    drop_wait_scenario(DropWaitNs::Tiered, DropWaitCheckpoint::WalksAcross, "dw-tiered-walk");
+}
+
+// ---- a cut inside a rolled-back CREATE's catalog wait ----
+//
+// A `CREATE` whose fan a peer refuses rolls back: it asks the catalog
+// writer for the swap that drops the namespace again and waits for its
+// answer. The `CREATE`'s own swap is durable by then, and the origin
+// served the namespace while its fan was in flight, so a write acknowledged
+// there is the client's to keep: a cut before the rollback's answer must
+// boot the catalog that names the namespace and serve that write (ADR-0189
+// D5, the rollback in the `DROP`'s order). The scenario lets the
+// `CREATE`'s swap land and holds the rollback's, holds the peer's `CREATE`
+// leg until a write on the origin is acknowledged, lets every cell publish
+// a checkpoint inside the rollback's wait or not, cuts, and reads the
+// write back. The control leg cuts at the same instant with no checkpoint.
+
+/// Keys the rolled-back scenario writes on the origin, and each value's
+/// length.
+const ROLLBACK_WAIT_KEYS: usize = 64;
+const ROLLBACK_WAIT_VALUE_BYTES: usize = 1 << 10;
+
+/// The rolled-back `CREATE`'s scenario: `checkpoint` publishes one on
+/// every cell inside the rollback's wait.
+fn rollback_wait_scenario(checkpoint: bool, tag: &str) {
+    let dir = temp_data_dir(tag);
+    let leg = inf_foundation::fault::HoldGate::new();
+    let hold = Arc::new(AtomicBool::new(true));
+    // A peer's first `CREATE` leg waits on `leg`, then is refused.
+    let node = Node::start_cfg_default(
+        2,
+        Some(dir.clone()),
+        CkptTrigger::Manual,
+        Default::default(),
+        vec![
+            (inf_server::fault::NS_CREATE_LEG_HELD, inf_foundation::fault::FaultSpec::Nth(1)),
+            (inf_server::fault::NS_CREATE_FAN_REFUSED, inf_foundation::fault::FaultSpec::Nth(1)),
+        ],
+        false,
+        false,
+        false,
+        None,
+        inf_log::SegmentIoMode::Buffered,
+        None,
+        Default::default(),
+        Some(hold),
+        None,
+        None,
+        vec![(1, inf_server::fault::NS_CREATE_LEG_HELD, leg.clone())],
+        NodeExtras::default(),
+    );
+    let control = Arc::clone(node.control.as_ref().expect("a durable node"));
+    // The `CREATE`'s swap lands; the rollback's stays queued.
+    node.land_held_persists(1);
+    // Both connections land on cell 0 before the peer holds its leg: a
+    // connection that lands on the held peer is not answered.
+    let mut creator = conn_on_cell(&node, 0);
+    let mut writer = conn_on_cell(&node, 0);
+    creator
+        .write_all(&cmd(&[
+            b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"always",
+        ]))
+        .expect("write");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !leg.is_held() {
+        assert!(Instant::now() < deadline, "the CREATE never fanned its leg");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The fan is in flight: the origin serves the namespace, and every
+    // write here follows its fsync (`FSYNC always`).
+    writer.write_all(&cmd(&[b"INF.NS", b"USE", b"ledger"])).expect("write");
+    read_exactly(&mut writer, b"+OK\r\n");
+    let mut acked = Vec::new();
+    for key in keys_for_cell(2, 0, ROLLBACK_WAIT_KEYS) {
+        let mut value = [b"acked:".as_slice(), &key].concat();
+        value.resize(ROLLBACK_WAIT_VALUE_BYTES, b'.');
+        writer.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(&mut writer, b"+OK\r\n");
+        acked.push(AckedWrite { key, value, cell: 0 });
+    }
+    drop(writer);
+    // The peer refuses its leg; the origin rolls back and requests the
+    // swap that drops the namespace, which the held writer never lands.
+    let requested = control.persist_requests_sent();
+    leg.release();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while control.persist_requests_sent() == requested {
+        assert!(Instant::now() < deadline, "the rollback never requested its catalog swap");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let published_before = drop_wait_min_published(&node);
+    if checkpoint {
+        let epoch = node.request_ckpt_all();
+        drop_wait_published(&node, epoch);
+    } else {
+        assert_eq!(drop_wait_min_published(&node), published_before, "no checkpoint in the wait");
+    }
+    let origin_use = drop_wait_use_on(&node, 0, b"ledger");
+    drop(creator);
+    node.kill_without_catalog_drain();
+    let mut context = format!(
+        "a CREATE of 'ledger' rolled back after a refused leg, its rollback's swap never \
+         durable, checkpoint in the wait {checkpoint}; cell 0 answered USE in the wait: \
+         {origin_use:?}"
+    );
+    let misses = drop_wait_restart(&dir, DropWaitNs::Durable, &acked, &mut context);
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        misses.is_empty(),
+        "{} of {} writes acknowledged inside the CREATE's fan are not served after the restart \
+         (cell 0: {} of {} lost); first: {:?}\n  {context}",
+        misses.len(),
+        acked.len(),
+        misses.len(),
+        acked.len(),
+        &misses[..misses.len().min(4)]
+    );
+}
+
+/// A checkpoint of every cell that publishes while a rolled-back
+/// `CREATE` waits for the swap that drops it keeps every write the origin
+/// acknowledged inside the fan.
+#[test]
+fn a_checkpoint_inside_a_rolled_back_create_wait_keeps_every_acked_key() {
+    rollback_wait_scenario(true, "rw-ckpt");
+}
+
+/// The control leg: the same cut, no checkpoint.
+#[test]
+fn a_cut_inside_a_rolled_back_create_wait_keeps_every_acked_key() {
+    rollback_wait_scenario(false, "rw-cut");
+    receipt::verified("ns_create_leg_held", "rolled-back-create-keeps-acked-writes");
+}
+
+// ---- every exit after the catalog writer's answer posts its notice ----
+
+/// The catalog writer holds one pending DDL until the DDL's notice
+/// arrives (ADR-0189 D3), and every exit of a DDL after its answer posts
+/// that notice (D5): a fault point that stops a DDL after its answer, a
+/// `CREATE` rolled back after a refused leg, and a normal end each leave
+/// the next DDL admitted (`+OK`), never refused as conflicting with a DDL
+/// still pending. Every DDL runs from cell 0, whose fault plan counts its
+/// own occurrences; the refused leg is cell 1's third `CREATE` leg.
+#[test]
+fn a_ddl_stopped_after_its_answer_leaves_no_ddl_pending() {
+    use inf_foundation::fault::FaultSpec;
+    use inf_server::fault::{NS_CREATE_AFTER_META, NS_CREATE_FAN_REFUSED, NS_DROP_AFTER_META};
+    let dir = temp_data_dir("ddl-after-answer");
+    let node = Node::start_durable_with_faults(
+        2,
+        &dir,
+        vec![
+            (NS_CREATE_AFTER_META, FaultSpec::Nth(1)),
+            (NS_DROP_AFTER_META, FaultSpec::Nth(1)),
+            (NS_CREATE_FAN_REFUSED, FaultSpec::Nth(3)),
+        ],
+    );
+    let mut c = conn_on_cell(&node, 0);
+    let steps: [(&[&[u8]], &[u8]); 6] = [
+        (&[b"CREATE", b"a", b"MODE", b"durable"], b"-ERR fault: ns_create_after_meta\r\n"),
+        (&[b"CREATE", b"b", b"MODE", b"durable"], b"+OK\r\n"),
+        (&[b"DROP", b"b"], b"-ERR fault: ns_drop_after_meta\r\n"),
+        (&[b"CREATE", b"c", b"MODE", b"durable"], b"+OK\r\n"),
+        (&[b"CREATE", b"d", b"MODE", b"durable"], b"-ERR fault: ns_create_fan_refused\r\n"),
+        (&[b"CREATE", b"e", b"MODE", b"durable"], b"+OK\r\n"),
+    ];
+    for (step, (args, want)) in steps.iter().enumerate() {
+        let argv: Vec<&[u8]> = [&b"INF.NS"[..]].into_iter().chain(args.iter().copied()).collect();
+        c.write_all(&cmd(&argv)).expect("write");
+        let reply = read_line(&mut c);
+        assert_eq!(
+            String::from_utf8_lossy(&reply),
+            String::from_utf8_lossy(want),
+            "step {step} ({}): the DDL after one stopped past its answer",
+            String::from_utf8_lossy(&args.join(&b' '))
+        );
+    }
+    let text = wait_persistence_field(&mut c, "ns_ddl_pending", "0");
+    assert!(text.contains("ns_ddl_pending:0\r\n"), "no DDL is left pending: {text}");
+    assert!(text.contains("ns_ddl_notices_stale:0\r\n"), "every notice retired its DDL: {text}");
+    assert!(!text.contains("catalog_epoch:0\r\n"), "the writer answered requests: {text}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- a tiered DROP frees its origin's tier files on the running node ----
+
+/// What cell `conn`'s tier cell counted at its last MAINTAIN: the sealed
+/// and active files of its tiered namespaces, and its flush rounds live
+/// or draining.
+fn tier_cell_files_and_rounds(conn: &mut TcpStream) -> (u64, u64) {
+    let files = scrape_u64(conn, b"tiering", "tiering_files_sealed:")
+        + scrape_u64(conn, b"tiering", "tiering_files_active:");
+    (files, scrape_u64(conn, b"tiering", "tiering_flush_rounds_inflight:"))
+}
+
+/// A tiered `DROP` frees its origin's tier files on the running node once
+/// the catalog swap that carries it is durable (ADR-0189 D9): the origin
+/// applies the drop only after the writer's answer, so while the swap is
+/// held it serves the namespace and keeps every tier file; once the swap
+/// lands it applies, and every cell's tier files of ns 16 leave with no
+/// restart (each cell holds them until the drop's epoch is durable, which
+/// the answer already is). The namespace's other residue waits for the
+/// residue sweep. Oracle: the shard directories and the wire.
+#[test]
+fn a_tiered_drop_frees_its_origins_tier_files_without_a_restart() {
+    let dir = temp_data_dir("drop-frees-origin");
+    seed_drop_wait_namespace(DropWaitNs::Tiered, &dir);
+    let hold = Arc::new(AtomicBool::new(true));
+    let node = Node::start_durable_with_held_catalog(2, &dir, hold, CkptTrigger::Manual);
+    let control = Arc::clone(node.control.as_ref().expect("a durable node"));
+    let before = drop_wait_cold_files(&dir);
+    assert!(before[0].0 > 0, "VACUOUS: cell 0 has no tier file of ns 16: {before:?}");
+    let mut gauges = conn_on_cell(&node, 0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while tier_cell_files_and_rounds(&mut gauges).0 == 0 {
+        assert!(Instant::now() < deadline, "VACUOUS: cell 0's tier cell never counted a file");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let requested = control.persist_requests_sent();
+    let mut dropper = conn_on_cell(&node, 0);
+    dropper.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
+    while control.persist_requests_sent() == requested {
+        assert!(Instant::now() < deadline, "the drop never requested its catalog swap");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // While the swap is held, the origin serves the namespace and its
+    // tier cell keeps every file.
+    assert_eq!(drop_wait_use_on(&node, 0, b"cold"), "+OK", "the origin serves it until its swap");
+    assert!(tier_cell_files_and_rounds(&mut gauges).0 > 0, "cell 0's tier cell let go its files");
+    let held = drop_wait_cold_files(&dir);
+    assert_eq!(held[0].0, before[0].0, "cell 0 unlinked a tier file before its swap was durable");
+    node.land_held_persists(1);
+    read_exactly(&mut dropper, b"+OK\r\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = drop_wait_cold_files(&dir);
+        if now.iter().all(|&(tier, _)| tier == 0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tier files of the dropped namespace are still on disk 10 s after its swap, \
+             (tier files, extents) per cell {now:?}; at the hold {held:?}"
+        );
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(dropper);
+    drop(gauges);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Namespace ids at the node, in a file of their own.
+#[path = "node_e2e/ns_ids.rs"]
+mod ns_ids;
+
+/// A `CREATE` its origin refuses after the catalog swap, in a file of its own.
+#[path = "node_e2e/ns_create_refused.rs"]
+mod ns_create_refused;
+
+/// The tombstone cap at the node, in a file of its own.
+#[path = "node_e2e/ns_cap.rs"]
+mod ns_cap;
+
+/// The DDL fail-stops and the stop after the origin's apply, in a file of
+/// their own.
+#[path = "node_e2e/ns_fail_stop.rs"]
+mod ns_fail_stop;

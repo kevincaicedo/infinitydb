@@ -26,7 +26,9 @@ pub mod shadow;
 
 #[allow(clippy::disallowed_types, reason = "container: R")]
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::{BuildIntHasher, KeyHasher, LogicalAddr};
 
 use inf_log::flush::{TierFileMeta, TierFlush, TierFlushError};
@@ -43,8 +45,10 @@ use crate::write_accounting::WriteAccounting;
 
 mod extent;
 mod flush;
+mod seal_marks;
+pub mod select;
 
-pub use flush::StageFailed;
+pub use flush::SealedFiles;
 
 // ---- shared data definitions (behaviour lives in the child modules) ----------
 
@@ -101,9 +105,6 @@ impl<'a> RecordParts<'a> {
     }
 }
 
-/// Sentinel for "no seal mark recorded yet" (M4-S07).
-const NO_MARK_PAGE: u64 = u64::MAX;
-
 /// One durable-tiered namespace's record table on one cell (L1).
 #[allow(clippy::disallowed_types, reason = "container: R")]
 pub struct TieredTable {
@@ -122,13 +123,11 @@ pub struct TieredTable {
     live_bytes: u64,
     demote: DemotionConfig,
     /// Record-start addresses the ro-boundary may seal to (ADR-0053 D2):
-    /// one mark per commit page — the first record allocated in each page
-    /// pushes its address. Address-ordered by construction (bump
-    /// allocation); bounded by ring/page entries (stale marks pop as the
-    /// boundary passes them).
-    seal_marks: VecDeque<LogicalAddr>,
-    /// Commit-page index (life-relative) of the newest mark.
-    last_mark_page: u64,
+    /// the first record placed in each bucket of commit pages pushes its
+    /// start. Address-ordered by construction (bump allocation); a capped
+    /// deque on the cell's census, under `SEAL_MARKS` (stale marks pop as
+    /// the boundary passes them).
+    seal_marks: seal_marks::SealMarks,
     /// Flush-chunk ends appended but not yet confirmed (M4-S11, ADR-0056
     /// D3): ascending (the drive cursor is monotone), pruned below
     /// `flushed` after every confirm, capped by [`FLUSH_ENDS_CAP`]
@@ -342,15 +341,18 @@ pub struct FlushSliceOutcome {
 
 impl TieredTable {
     /// `None` when the ring reservation fails (namespace creation surfaces
-    /// it typed).
+    /// it typed). `census` is the cell's cap census (ADR-0163 D2), which
+    /// the host passes: the table's capped holders register on it, and no
+    /// table mints one or holds a default.
     #[allow(clippy::disallowed_types, reason = "container: R")]
     pub fn new(
         config: AddressSpaceConfig,
         demote: DemotionConfig,
         initial_keys: usize,
         hasher: KeyHasher,
+        census: &Rc<CapCensus>,
     ) -> Option<TieredTable> {
-        let mut space = AddressSpace::new(config)?;
+        let mut space = AddressSpace::new(config, census)?;
         // The budget admission bound (ADR-0053 D1): alloc refuses — and
         // backpressure engages — at `budget + slice`, not at the (up to
         // 2×) ring wall. Nonsense budgets refuse typed here.
@@ -359,6 +361,8 @@ impl TieredTable {
             return None;
         }
         space.set_window_limit(window);
+        let seal_marks =
+            seal_marks::SealMarks::new(space.ring_bytes(), space.page_bytes(), census).ok()?;
         Some(TieredTable {
             hasher,
             index: Index::with_capacity(initial_keys.max(64)),
@@ -367,8 +371,7 @@ impl TieredTable {
             walk_image_addrs: Vec::new(),
             live_bytes: 0,
             demote,
-            seal_marks: VecDeque::new(),
-            last_mark_page: NO_MARK_PAGE,
+            seal_marks,
             flush_ends: VecDeque::new(),
             write: WriteAccounting::default(),
             flush_device_seen: 0,
@@ -1269,6 +1272,27 @@ impl TieredTable {
         Ok(addr)
     }
 
+    /// Test support: one tiered placement as `append`, `append_extent`
+    /// and `relocate` make it — the tail allocation through the room
+    /// question's one classification, then the placement's seal-mark step
+    /// — with no record written: the placement A/B's judged shape.
+    #[cfg(feature = "test-support")]
+    pub fn place_for_bench(&mut self, len: usize) -> Option<LogicalAddr> {
+        let addr = self.space.alloc(len)?;
+        self.note_seal_mark(addr);
+        Some(addr)
+    }
+
+    /// The seal marks' stride in bytes, fixed at the table's build: one
+    /// commit page, or a power-of-two multiple of it on a ring that holds
+    /// more than half the marks' cap of pages, so that a ring holds at most
+    /// half the cap's buckets. A seal step lands on a mark, so it may overrun
+    /// its slice by at most this much.
+    #[must_use]
+    pub fn seal_mark_stride_bytes(&self) -> u64 {
+        self.seal_marks.stride_bytes()
+    }
+
     /// Seal-mark bookkeeping (ADR-0053 D2): the first record starting
     /// in each commit page is a legal ro-boundary landing point. One
     /// compare per allocation; stale marks (behind the boundary) trim
@@ -1278,15 +1302,9 @@ impl TieredTable {
     /// starves of landing points (M4-S15's relocation shares the site
     /// for exactly that reason).
     fn note_seal_mark(&mut self, addr: LogicalAddr) {
-        let page = addr.offset_from(self.space.life_origin()) / self.space.page_bytes();
-        if page != self.last_mark_page {
-            let ro = self.space.ro_boundary();
-            while self.seal_marks.front().is_some_and(|&mark| mark <= ro) {
-                self.seal_marks.pop_front();
-            }
-            self.seal_marks.push_back(addr);
-            self.last_mark_page = page;
-        }
+        let offset = addr.offset_from(self.space.life_origin());
+        let space = &self.space;
+        self.seal_marks.note(addr, offset, || space.ro_boundary());
     }
 
     /// Places a verbatim record image at the tail (M4-S15, ADR-0059 D2)
@@ -1340,6 +1358,123 @@ impl core::fmt::Debug for TieredTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::{SEAL_MARKS, SEAL_MARKS_MAX};
+    use seal_marks::SealMark;
+
+    /// A table over 4 KiB test pages whose window is `window_pages` pages,
+    /// its ring the next power of two, on `census`.
+    fn paged_table(window_pages: u64, census: &Rc<CapCensus>) -> TieredTable {
+        const PAGE: u64 = 4 << 10;
+        let demote = DemotionConfig::for_budget(window_pages * PAGE - PAGE, PAGE);
+        let ring = demote.ring_reserve_bytes().expect("a ring");
+        TieredTable::new(
+            AddressSpaceConfig {
+                reserve_bytes: ring,
+                page_bytes: PAGE as usize,
+                life_origin: LogicalAddr::ZERO,
+            },
+            demote,
+            1024,
+            KeyHasher::default(),
+            census,
+        )
+        .expect("reservation")
+    }
+
+    /// One record a 4 KiB page, `pages` of them, with no seal step: every
+    /// page's first record would be a mark. Returns each record's start.
+    fn place_one_record_a_page(table: &mut TieredTable, pages: u64) -> Vec<LogicalAddr> {
+        const PAGE: usize = 4 << 10;
+        let mut starts = Vec::with_capacity(pages as usize);
+        let value = vec![0x5A; PAGE - 8 - 6];
+        for page in 0..pages {
+            let key = format!("k{page:05}");
+            let hash = table.hash_key(key.as_bytes());
+            starts.push(table.insert(key.as_bytes(), &value, hash).expect("the window holds it"));
+        }
+        starts
+    }
+
+    /// A window past the marks' reach: 16,384 pages of 4 KiB (64 MiB), one
+    /// record placed a page and none sealed. The marks hold at most their
+    /// cap, `SEAL_MARKS_MAX`, where one mark a page held 16,384.
+    #[test]
+    fn a_window_of_sixteen_thousand_pages_holds_the_marks_within_their_cap() {
+        let census = CapCensus::new(inf_foundation::CellId(0)).0;
+        let mut table = paged_table(16_384, &census);
+        place_one_record_a_page(&mut table, 16_384);
+        let marks = table.seal_marks.len();
+        assert!(marks <= SEAL_MARKS_MAX as usize, "{marks} seal marks past the cap");
+        let row = census.row(SEAL_MARKS.name()).expect("the seal marks' row");
+        assert!(row.high_water as usize >= marks, "the row read the marks held");
+        assert!(row.high_water <= SEAL_MARKS_MAX, "the row within the cap");
+    }
+
+    /// The stride keeps the seal marks under their cap (ADR-0053 D2), as
+    /// the unbounded list's first record of each stride bucket: windows of
+    /// `cap/2 − 1`, `cap/2`, `cap/2 + 1` and `4 × cap` pages of 4 KiB, one
+    /// record a page, the watermarks driven by the seal steps. The marks
+    /// hold at most half the cap and one more and cross nothing; then each
+    /// seal step lands on a record start and seals at most its slice and
+    /// one stride. Last, each window's stride is the least that buckets its
+    /// ring into half the cap, from the window's own arithmetic: a wider one
+    /// passes every clause above, and a seal step's overrun, which the tail
+    /// stall's liveness reads, grows with it.
+    #[test]
+    fn the_stride_keeps_the_seal_marks_under_their_cap_at_every_window() {
+        const PAGE: u64 = 4 << 10;
+        let half = u64::from(SEAL_MARKS_MAX) / 2;
+        let mut strides = Vec::new();
+        for pages in [half - 1, half, half + 1, 4 * u64::from(SEAL_MARKS_MAX)] {
+            let census = CapCensus::new(inf_foundation::CellId(0)).0;
+            let mut table = paged_table(pages, &census);
+            let starts = place_one_record_a_page(&mut table, pages);
+            let crossings = census.row(SEAL_MARKS.name()).map_or(0, |row| row.crossings);
+            assert_eq!(crossings, 0, "stride-short — {crossings} crossing(s) at {pages} pages");
+            let stride = table.seal_marks.stride_bytes();
+            // The ring is the window's next power of two: its pages over half
+            // the cap, at least one page.
+            let least = PAGE * (pages.next_power_of_two() / half).max(1);
+            strides.push((pages, stride, least));
+            let ro = table.space().ro_boundary();
+            let mut model = Vec::new();
+            let mut last_bucket = None;
+            for start in &starts {
+                let bucket = start.to_raw() / stride;
+                if last_bucket != Some(bucket) {
+                    model.push(*start);
+                    last_bucket = Some(bucket);
+                }
+            }
+            model.retain(|start| *start > ro);
+            let held: Vec<LogicalAddr> = table.seal_marks.iter().map(SealMark::addr).collect();
+            assert_eq!(held, model, "{pages} pages: the marks are the list's bucket firsts");
+            assert!(held.len() as u64 <= half + 1, "{pages} pages: {} marks", held.len());
+            let slice = table.demote.slice_bytes;
+            let mut steps = 0u32;
+            loop {
+                let before = table.space().ro_boundary();
+                let sealed = table.seal_slice();
+                if sealed == 0 {
+                    break;
+                }
+                let after = table.space().ro_boundary();
+                assert!(starts.binary_search(&after).is_ok(), "{pages} pages: a seal off a start");
+                assert!(
+                    sealed <= slice + stride,
+                    "{pages} pages: {sealed} B sealed from {before:?}"
+                );
+                steps += 1;
+            }
+            assert!(steps > 0, "VACUOUS: {pages} pages sealed nothing");
+        }
+        for (pages, stride, least) in strides {
+            assert_eq!(
+                stride, least,
+                "stride-wide — {pages} pages: {stride} B, the least {least} B"
+            );
+        }
+    }
 
     #[test]
     fn simulation_digest_observes_resident_changes_and_cold_index_without_mutation() {
@@ -1364,6 +1499,7 @@ mod tests {
     }
 
     fn cold_table() -> TieredTable {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut cold = TieredTable::new(
             AddressSpaceConfig {
                 reserve_bytes: 1 << 16,
@@ -1373,6 +1509,7 @@ mod tests {
             DemotionConfig::for_budget(1 << 16, 1 << 12),
             64,
             KeyHasher::default(),
+            &census,
         )
         .unwrap();
         cold.seed_recovered_files(
@@ -1426,6 +1563,7 @@ mod tests {
     }
 
     fn table() -> TieredTable {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         TieredTable::new(
             AddressSpaceConfig {
                 reserve_bytes: 1 << 16,
@@ -1435,6 +1573,7 @@ mod tests {
             DemotionConfig::for_budget(1 << 16, 1 << 12),
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("reservation")
     }
@@ -1508,6 +1647,7 @@ mod tests {
     /// per-slice byte bound (ADR-0053 D2/D3).
     #[test]
     fn seal_slice_lands_on_record_boundaries_within_the_slice() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         // Budget = quarter ring, target = 25% of that, slice = one page.
         let mut t = TieredTable::new(
             AddressSpaceConfig {
@@ -1518,6 +1658,7 @@ mod tests {
             DemotionConfig::for_budget(1 << 14, 1 << 12),
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("reservation");
         // ~40 records ≈ 2.5 pages of mutable bytes (record ≈ 260 B).
@@ -1554,6 +1695,7 @@ mod tests {
     /// record of progress per step (the ADR-0053 D2 anti-deadlock rule).
     #[test]
     fn seal_slice_makes_progress_past_an_oversized_record() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut t = TieredTable::new(
             AddressSpaceConfig {
                 reserve_bytes: 1 << 16,
@@ -1564,6 +1706,7 @@ mod tests {
             DemotionConfig { mem_budget_bytes: 1 << 14, mutable_permille: 0, slice_bytes: 256 },
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("reservation");
         let hash = t.hash_key(b"wide");

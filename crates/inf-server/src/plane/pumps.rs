@@ -30,7 +30,8 @@ pub(super) async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clo
         // A scattered `DBSIZE` leg (the origin's `Counted` shape): this
         // cell's exact count as a typed integer — the tiered drain runs
         // here, on the pump, exactly as a local `DBSIZE` would — or the
-        // drain's error as bytes for the origin to relay.
+        // drain's error reply, tagged from its outcome (ADR-0190 D3), for
+        // the origin to relay.
         if argv.len() == 1 && argv[0].eq_ignore_ascii_case(b"DBSIZE") {
             let origin_cell = ExecOrigin::Fabric(CellId(origin));
             match ns_dbsize_local(&shared, origin_cell, item.ns, item.proto).await {
@@ -41,9 +42,9 @@ pub(super) async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clo
                     shared.fabric.borrow_mut().reply(
                         CellId(origin),
                         item.token,
-                        &Outcome::Bytes(&reply),
+                        &wire_reply(reply.bytes(), reply.outcome()),
                     );
-                    shared.recycle_reply_buf(reply);
+                    shared.recycle_reply_buf(reply.into_bytes());
                 }
             }
             continue;
@@ -66,9 +67,9 @@ pub(super) async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clo
                 shared.fabric.borrow_mut().reply(
                     CellId(origin),
                     item.token,
-                    &Outcome::Bytes(&reply),
+                    &wire_reply(reply.bytes(), reply.outcome()),
                 );
-                shared.recycle_reply_buf(reply);
+                shared.recycle_reply_buf(reply.into_bytes());
             }
             // M4.5-S29: the durability wait leaves the pump. Holding the
             // FIFO across it serialized each origin to one `always` write
@@ -113,10 +114,13 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     program: bool,
 ) {
     loop {
-        let mut buf = shared.take_reply_buf();
-        match shared.execute_ns_owned(CellId(origin), argv, proto, ns, program, &mut buf) {
+        let mut reply = OpenReply::new(shared.take_reply_buf());
+        let applied =
+            shared.execute_ns_owned(CellId(origin), argv, proto, ns, program, reply.reply());
+        let reply = reply.finish();
+        match applied {
             NsApplyOutcome::Park => {
-                shared.recycle_reply_buf(buf);
+                shared.recycle_reply_buf(reply.into_bytes());
                 let wait = {
                     let mut durable = shared.durable.borrow_mut();
                     let cell = durable.as_mut().expect("durable admission parked");
@@ -126,8 +130,9 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 wait.await;
             }
             NsApplyOutcome::Reply => {
-                shared.fabric.borrow_mut().reply(CellId(origin), token, &Outcome::Bytes(&buf));
-                shared.recycle_reply_buf(buf);
+                let outcome = wire_reply(reply.bytes(), reply.outcome());
+                shared.fabric.borrow_mut().reply(CellId(origin), token, &outcome);
+                shared.recycle_reply_buf(reply.into_bytes());
                 return;
             }
             NsApplyOutcome::Gated(seq) => {
@@ -135,7 +140,7 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                     to: CellId(origin),
                     token,
                     seq,
-                    reply: buf,
+                    reply,
                 });
                 return;
             }
@@ -319,9 +324,9 @@ pub(super) async fn compact_pump<O: PlaneObserver + 'static, F: SegmentFs + Clon
             break 'chain;
         }
     }
-    if let Some(tier) = shared.tier.borrow_mut().as_mut()
-        && let Some(t) = tier.ns_mut(read.ns)
-    {
-        t.compact_inflight = false;
+    // The chain's end resolves its owner by position and id, Live or
+    // Draining, so a dropped namespace's drain sees its chain back.
+    if let Some(tier) = shared.tier.borrow_mut().as_mut() {
+        tier.chain_back(read.pos, read.ns);
     }
 }

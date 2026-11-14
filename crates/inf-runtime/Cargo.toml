@@ -21,10 +21,15 @@ io-uring = { workspace = true, optional = true }
 [features]
 uring = ["dep:io-uring"]
 # M0-S19 A/B artifact only: compiles the always-on tripwire counters out to
-# prove they cost nothing. Never enabled in shipping builds.
+# prove they cost nothing; the iteration count stays, the cold turn's epoch
+# (ADR-0181 A1.3). Never enabled in shipping builds.
 no-tripwires = []
 
 [dev-dependencies]
+# The timer set's last-generation tests reach the slab's test hook
+# (`place_generation_last`); `fault-points` stays off every normal edge
+# (scripts/check-shipping-features.sh).
+inf-foundation = { workspace = true, features = ["fault-points"] }
 proptest.workspace = true
 criterion.workspace = true
 # Conformance tests poke sockets (setsockopt) directly.
@@ -39,6 +44,24 @@ inf-log.workspace = true
 
 [[bench]]
 name = "executor"
+harness = false
+test = false
+
+# The timers' A/B by instructions (ADR-0154 D5): the wheel's legs.
+[[bench]]
+name = "timer_ab"
+harness = false
+test = false
+
+# The cold-read path's A/B by instructions (ADR-0181): the host's legs.
+[[bench]]
+name = "cold_path"
+harness = false
+test = false
+
+# The waker's A/B by instructions (ADR-0003 A1.5): legs A, B and P, chosen by argument.
+[[bench]]
+name = "waker_ab"
 harness = false
 test = false
 

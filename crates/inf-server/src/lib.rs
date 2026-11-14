@@ -39,11 +39,13 @@ mod recover;
 mod tier_cell;
 mod topology;
 
-/// Process exit code for a durable-path fail-stop (§8.4, the fsyncgate
-/// rule): an fsync/log-write error freezes the watermark — no ack for the
-/// affected batch ever fires — and the process exits with this code
-/// (M2-S17, ADR-0020 D3). Boot-recovery failure keeps exit code 1
-/// (`infinityd`'s `take_boot_error` path).
+/// Process exit code for a durable fail-stop: an fsync or log-write error
+/// freezes the watermark — no ack for the affected batch ever fires — and
+/// the process exits with this code (the fsyncgate rule, ADR-0020 D3); so
+/// does durable state this node cannot serve, a namespace change `META`
+/// holds that a cell cannot apply (ADR-0189 D4). The stderr line names the
+/// arm. Boot-recovery failure keeps exit code 1 (`infinityd`'s
+/// `take_boot_error` path).
 pub const EXIT_DURABLE_FAILSTOP: i32 = 3;
 
 pub use cache_boot::{CacheBootGroup, CacheBootPermit};
@@ -52,16 +54,16 @@ pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
 pub use control::{
     BoardObservation, BoardSweep, CellIssuer, CellRecoverySlot, CheckpointEpoch, CkptBoard,
-    CkptCredit, CkptFinalCredit, CkptIssuers, CkptQuota, CkptSpace, CkptTarget, ControlHandle,
-    ControlInbox, CreateOutcome, CreateVerdict, DROPPED_NS_MAX, DdlTicket, DetachedControl,
-    INDEX_SLOTS, IndexBoard, IssuerMismatch, IssuerRefused, LastSave, PENDING_CREATE_MAX,
-    RecoveryBoard, SweepStep, load_catalog, load_catalog_from, spawn as spawn_control,
-    spawn_in as spawn_control_in,
+    CkptCredit, CkptFinalCredit, CkptIssuers, CkptQuota, CkptSpace, CkptTarget, ControlBootRefused,
+    ControlHandle, ControlInbox, DROPPED_NS_MAX, DdlGauges, DdlTicket, DetachedControl,
+    INDEX_SLOTS, IndexBoard, IssuerMismatch, IssuerRefused, LastSave, NsIdReservation,
+    RecoveryBoard, SweepStep, TombstoneGauges, load_catalog, load_catalog_from,
+    spawn as spawn_control, spawn_in as spawn_control_in,
 };
 pub use data_dir_lock::{DataDirLock, DataDirLockError, LOCK_FILE};
 pub use durable::{
-    DeviceConfig, DurableConfig, DurableStats, FillConfig, GroupDecision, GroupHoldConfig,
-    RecoverConfig,
+    DeviceConfig, DrainHold, DurableConfig, DurableStats, FillConfig, GroupDecision,
+    GroupHoldConfig, RecoverConfig,
 };
 // Durable-config vocabulary re-exported for the assembly tier: bins name
 // `inf-server` only (dep-DAG), and `DurableConfig`'s fields are these
@@ -69,8 +71,8 @@ pub use durable::{
 #[doc(hidden)]
 pub use exec::parse_cursor;
 pub use exec::{
-    ConnCx, ConnNamespace, NodeInfo, NodeState, TIER_FLUSH_GAUGES, TierFlushGauge, execute,
-    execute_slices, stall_request,
+    COLD_GAUGES, ColdGauge, ConnCx, ConnNamespace, NodeInfo, NodeState, TIER_FLUSH_GAUGES,
+    TierFlushGauge, execute, execute_slices, stall_request,
 };
 pub use glob::glob_match;
 #[cfg(feature = "doc")]
@@ -82,16 +84,22 @@ pub use inf_log::fs::StdSegmentFs;
 #[cfg(feature = "doc")]
 pub use json::{JSON_REPLY_SHAPES, ReplyShape};
 #[doc(hidden)]
+#[cfg(feature = "doc")]
+pub use plane::parse_json_mget_leg;
+#[doc(hidden)]
 pub use plane::{parse_array_header, parse_scan_head, parse_take_reply};
+#[doc(hidden)]
+pub use process_info::stat::cpu_microseconds as process_stat_cpu_microseconds;
 pub use process_info::{ProcessBoard, ProcessSample, ProcessSampler};
 // M2-S18 (ADR-0020 D6/D7): the sim tier's disk, re-exported for the
 // assembly/simulator tier exactly like `StdSegmentFs` above — bins name
 // `inf-server` only (dep-DAG).
 pub use inf_log::fs::sim::{DeviceFault, SimDisk, SimDiskConfig, StallConfig};
 pub use inf_log::{
-    CkptConfig, DEFAULT_FUA_MAX_FRAME_BYTES, DEFAULT_RECYCLE_SLOTS, DEFAULT_SEGMENT_BYTES,
-    FRAME_ALIGN, FramesInFlight, MAX_FRAMES_IN_FLIGHT, PoolWaitBound, PreallocPolicy,
-    SegmentConfig, SegmentIoMode, StagingConfig,
+    CkptConfig, DEFAULT_FUA_MAX_FRAME_BYTES, DEFAULT_MAX_FRAME_LEN, DEFAULT_RECYCLE_SLOTS,
+    DEFAULT_SEGMENT_BYTES, FRAME_ALIGN, FramesInFlight, LogGeometry, LogGeometryError,
+    MAX_FRAMES_IN_FLIGHT, PoolWaitBound, PreallocPolicy, SegmentConfig, SegmentIoMode,
+    StagingConfig, max_sealed_frame_bytes,
 };
 pub use io_properties::{
     IO_PROPERTIES_FILE, IoProperties, IoPropertiesError, IoPropertiesSource, IoProvenance,
@@ -103,17 +111,19 @@ pub use key_hash::{
 };
 pub use loop_snapshot::LoopSnapshot;
 pub use plane::{
-    ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane, StopPhase,
-    fold_live_entries,
+    ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneBuildError, PlaneObserver, ServerPlane,
+    StopHold, StopPhase, TimerAssemblyError, TimerRole, fold_live_entries,
 };
+pub use plane::{MeshConfigRefused, checked_mesh_config};
 pub use readahead::boot_prefetch_threads_spawned;
 // Harness-facing (batch 61): the compat harness reserves ports with the
 // node's own bind-only probe; `inf-server` already owns the socket-facing
 // assembly, so no new dep-DAG edge.
 pub use inf_runtime::net::probe_addr_unowned;
 pub use recover::{
-    RecoverPhase, RecoverPhases, RecoverStats, RecoveredManifest, Recovery, RecoveryProgress,
-    open_cell_log,
+    RECOVERY_UNITS, RecoverPhase, RecoverPhases, RecoverStats, RecoverUnits, RecoveredManifest,
+    Recovery, RecoveryProgress, RecoveryUnit, STEP_FACT_FIELDS, StepBudget, StepFacts, UnitEntry,
+    UnitPhase, open_cell_log,
 };
 pub use topology::{
     TOPOLOGY_FILE, TopologyError, TopologySource, create_topology, load_topology, parse_topology,

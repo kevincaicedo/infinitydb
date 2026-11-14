@@ -12,7 +12,7 @@ use inf_foundation::time::Nanos;
 use inf_store::{
     CellStore, EvictionPolicy, Keyspace, NsError, NsMode, NsSpec, PressureConfig, TierSpec,
 };
-use inf_wire::{CmdFlags, Protocol, RespWriter};
+use inf_wire::{CmdFlags, Protocol, ReplyBuf, RespWriter};
 
 use crate::clients::{format_client_line, valid_client_name};
 use crate::config::{ConfigSetError, ValidatedSet};
@@ -26,7 +26,7 @@ pub(crate) use sections::info;
 
 // ---- shared data definitions (behaviour lives in the child modules) ----------
 
-pub(crate) fn hello(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, out: &mut Vec<u8>) {
+pub(crate) fn hello(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, out: &mut ReplyBuf) {
     let mut requested = cx.proto;
     if argv.len() >= 2 {
         match parse_i64(argv.arg(1)) {
@@ -365,7 +365,7 @@ pub(crate) fn inf_ns(
             );
         }
         let id = next_local_ns_id(ks);
-        match ks.ns_create(draft.with_id(id)) {
+        match ks.ns_create(draft.with_id(id), &planeless_census(node)) {
             Ok(()) => w.simple("OK"),
             Err(e) => ns_error(e, w),
         }
@@ -412,7 +412,7 @@ pub(crate) fn inf_ns(
         if argv.len() != 3 {
             return arity_error("INF.NS|DROP", w);
         }
-        match ks.ns_drop(argv.arg(2)) {
+        match ks.ns_drop_uncataloged(argv.arg(2)) {
             Ok(_) => w.simple("OK"),
             Err(e) => ns_error(e, w),
         }
@@ -706,6 +706,12 @@ pub(crate) fn ns_error(e: NsError, w: &mut RespWriter<'_>) {
             "ERR not a tiered namespace — tiering is set at CREATE with MEM-BUDGET \
              (drop and recreate to add it, ADR-0062 D3)",
         ),
+        NsError::Cataloged => {
+            w.error("ERR internal: the node's namespaces change only through the catalog writer")
+        }
+        NsError::Uncataloged => {
+            w.error("ERR internal: this keyspace has no catalog writer to answer a namespace DDL")
+        }
     }
 }
 
@@ -900,9 +906,22 @@ fn next_local_ns_id(ks: &Keyspace) -> u32 {
     ks.ns_iter().map(|s| s.id.0 + 1).max().unwrap_or(inf_store::FIRST_NAMED_NS_ID)
 }
 
+/// The cap census a planeless `CREATE` builds on (ADR-0163 D2): the cell's,
+/// which a plane attaches to `node` at its construction; on a host with no
+/// plane, one this host builds once, on its first create, and attaches there,
+/// never marked. Every table of the keyspace then lands on one census, though
+/// a planeless create is memory-only and registers nothing.
+fn planeless_census(node: &NodeInfo) -> std::rc::Rc<inf_foundation::bounded::CapCensus> {
+    let mut attached = node.cap_census.borrow_mut();
+    let census = attached.get_or_insert_with(|| {
+        inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(node.cell.get())).0
+    });
+    std::rc::Rc::clone(census)
+}
+
 // ---- CLIENT ------------------------------------------------------------------
 
-pub(crate) fn client(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, out: &mut Vec<u8>) {
+pub(crate) fn client(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, out: &mut ReplyBuf) {
     let proto = cx.proto;
     let mut w = RespWriter::new(out, proto);
     let sub = argv.arg(1);
@@ -1048,7 +1067,7 @@ mod tests {
     use super::*;
     use crate::exec::execute;
     use inf_store::{EvictionPolicy, SetExpire, SetOptions, StoreConfig};
-    use inf_wire::{ConnParser, Parsed, ParserLimits};
+    use inf_wire::{ConnParser, Parsed, ParserLimits, ReplyStream};
 
     fn run(cx: &mut ConnCx, store: &mut Keyspace, parts: &[&[u8]]) -> Vec<u8> {
         let mut wire = format!("*{}\r\n", parts.len()).into_bytes();
@@ -1060,9 +1079,9 @@ mod tests {
         let mut parser = ConnParser::new(ParserLimits::default());
         let mut iter = parser.feed(&wire);
         let Some(Parsed::Command(argv)) = iter.next() else { panic!("one command") };
-        let mut out = Vec::new();
-        execute(&argv, store, cx, Nanos(1), &mut out);
-        out
+        let mut out = ReplyStream::new(Vec::new());
+        execute(&argv, store, cx, Nanos(1), out.open());
+        out.into_vec()
     }
 
     /// Review 2026-09-01 (INFINITYD_BIN compat lane): the per-cell fan of
@@ -1365,13 +1384,20 @@ mod tests {
         assert!(caps.contains("# Caps\r\ncaps_scope:cell\r\n"), "{caps}");
         assert!(caps.contains("cap_census_phase:serving\r\n"), "{caps}");
         assert!(caps.contains("cap_assembly_violations:0\r\n"), "{caps}");
+        assert!(caps.contains("cap_unsliced_drops:0\r\n"), "{caps}");
         assert!(caps.contains("cap_rows:2\r\n"), "{caps}");
         assert!(
-            caps.contains("cap_row_pairs:entries_max=2,fill=serving,high_water=2,crossings=1\r\n"),
+            caps.contains(
+                "cap_row_pairs:entries_max=2,fill=serving,high_water=2,crossings=1,\
+                 capacity_now=2\r\n"
+            ),
             "{caps}"
         );
         assert!(
-            caps.contains("cap_row_marks:entries_max=3,fill=serving,high_water=3,crossings=2\r\n"),
+            caps.contains(
+                "cap_row_marks:entries_max=3,fill=serving,high_water=3,crossings=2,\
+                 capacity_now=3\r\n"
+            ),
             "{caps}"
         );
         let all = String::from_utf8(run(&mut cx, &mut store, &[b"INFO"])).expect("ascii");
@@ -1552,6 +1578,7 @@ mod tests {
     /// `used_memory` and out of the pool; a peer's publication adds in.
     #[test]
     fn info_memory_renders_the_maxmemory_comparable() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         for i in 0..8u32 {
@@ -1562,15 +1589,18 @@ mod tests {
             );
         }
         store
-            .ns_create(inf_store::NsSpec {
-                id: inf_store::NsId(16),
-                name: b"cache".to_vec(),
-                mode: inf_store::NsMode::Memory,
-                fsync: None,
-                policy: Some(EvictionPolicy::AllKeysRandom),
-                maxmemory: Some(64 << 20),
-                tier: None,
-            })
+            .ns_create(
+                inf_store::NsSpec {
+                    id: inf_store::NsId(16),
+                    name: b"cache".to_vec(),
+                    mode: inf_store::NsMode::Memory,
+                    fsync: None,
+                    policy: Some(EvictionPolicy::AllKeysRandom),
+                    maxmemory: Some(64 << 20),
+                    tier: None,
+                },
+                &census,
+            )
             .expect("create");
         let cache = store.ns_store_mut(inf_store::NsId(16)).expect("registered");
         for i in 0..64u32 {
@@ -1621,10 +1651,10 @@ mod tests {
         store.db_mut(3).set(b"stale", b"v", opts, Nanos(0)).expect("set");
         let later = Nanos(5_000 * 1_000_000);
         assert_eq!(store.expiry_lag_ms(later), 5_000);
-        let mut out = Vec::new();
-        let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+        let mut out = ReplyStream::new(Vec::new());
+        let mut w = RespWriter::new(out.open(), Protocol::Resp2);
         info(&[b"INFO".as_slice(), b"stats"][..], &store, &cx.node, later, &mut w);
-        let text = String::from_utf8(out).expect("ascii");
+        let text = String::from_utf8(out.into_vec()).expect("ascii");
         assert!(text.contains("expiry_debt_ms:5000\r\n"), "{text}");
     }
 
@@ -1718,6 +1748,7 @@ mod tests {
     /// cell aggregate is the exact sum of those lines.
     #[test]
     fn info_tiering_renders_per_namespace_watermarks_and_write_counters() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
@@ -1735,6 +1766,7 @@ mod tests {
                     },
                     demote,
                     64,
+                    &census,
                 )
                 .is_ok()
         );
@@ -1768,6 +1800,7 @@ mod tests {
     /// zero (the §3.3 degenerate contract, asserted above).
     #[test]
     fn info_tiering_ram_hit_split_renders_absent_not_zero_when_tiered() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId};
 
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
@@ -1785,6 +1818,7 @@ mod tests {
                     },
                     demote,
                     64,
+                    &census,
                 )
                 .is_ok()
         );
@@ -1803,6 +1837,20 @@ mod tests {
         // enqueue refusals were invisible in soak artifacts).
         assert!(text.contains("cold_pool_dry:0"), "{text}");
         assert!(text.contains("cold_queue_full:0"), "{text}");
+        // The cold host's delivery and identity gauges render beside them.
+        for field in [
+            "cold_delivery_work:0",
+            "cold_delivery_work_turn_max:0",
+            "cold_delivery_pending_members:0",
+            "cold_delivery_pending_windows:0",
+            "cold_delivery_delay_p99_us:0",
+            "cold_receipt_foreign:0",
+            "cold_link_stale:0",
+            "cold_identity_exhausted:0",
+            "cold_identity_pairs_used:0",
+        ] {
+            assert!(text.contains(field), "{field}: {text}");
+        }
     }
 
     /// v0.4.0-alpha instrument fix: the typed `-BUSY` staging-admission
@@ -1843,12 +1891,13 @@ mod tests {
     /// averaged away.
     #[test]
     fn info_tiering_reports_write_amplification_per_namespace() {
-        use inf_log::{MutationEffect, StagingConfig, StagingRing};
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        use inf_log::{LogGeometry, MutationEffect, StagingRing};
         use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
-        let mut ring = StagingRing::new(StagingConfig::default());
+        let mut ring = StagingRing::new(LogGeometry::default());
         for id in [7u32, 9u32] {
             let ns = NsId(id);
             let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
@@ -1863,6 +1912,7 @@ mod tests {
                         },
                         demote,
                         64,
+                        &census,
                     )
                     .is_ok()
             );
@@ -1987,6 +2037,7 @@ mod tests {
     /// tier block read back through `INF.NS INFO`.
     #[test]
     fn inf_ns_tiering_surface() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         // Tier keys without MEM-BUDGET refuse typed (the discriminator).
@@ -2015,15 +2066,18 @@ mod tests {
         // drive the rest of the surface against it.
         let tier = TierSpec::for_budget(8 << 20);
         store
-            .ns_create(NsSpec {
-                id: inf_store::NsId(16),
-                name: b"tiered".to_vec(),
-                mode: NsMode::Durable,
-                fsync: None,
-                policy: None,
-                maxmemory: None,
-                tier: Some(tier),
-            })
+            .ns_create(
+                NsSpec {
+                    id: inf_store::NsId(16),
+                    name: b"tiered".to_vec(),
+                    mode: NsMode::Durable,
+                    fsync: None,
+                    policy: None,
+                    maxmemory: None,
+                    tier: Some(tier),
+                },
+                &census,
+            )
             .expect("create");
         // M4-S26: the D8 refusal is lifted — USE succeeds; the planeless
         // exec fallback still refuses data commands (plane-resident).
@@ -2075,6 +2129,7 @@ mod tests {
     /// refusals on durable namespaces and for tier keys on memory ones.
     #[test]
     fn inf_ns_memory_pressure_surface() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let r = run(
@@ -2113,15 +2168,18 @@ mod tests {
         // Durable namespaces refuse both keys typed (planeless memory-only
         // CREATE means the durable entry registers directly).
         store
-            .ns_create(NsSpec {
-                id: inf_store::NsId(31),
-                name: b"ledger".to_vec(),
-                mode: NsMode::Durable,
-                fsync: None,
-                policy: None,
-                maxmemory: None,
-                tier: None,
-            })
+            .ns_create(
+                NsSpec {
+                    id: inf_store::NsId(31),
+                    name: b"ledger".to_vec(),
+                    mode: NsMode::Durable,
+                    fsync: None,
+                    policy: None,
+                    maxmemory: None,
+                    tier: None,
+                },
+                &census,
+            )
             .expect("create");
         let r = run(&mut cx, &mut store, &[b"INF.NS", b"SET", b"ledger", b"MAXMEMORY", b"1mb"]);
         assert!(r.starts_with(b"-ERR durable namespaces do not evict"), "{r:?}");
@@ -2134,6 +2192,7 @@ mod tests {
     /// counted in exactly one leg).
     #[test]
     fn info_tiering_splits_the_blob_write_amplification_leg() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         use std::path::Path;
 
         use inf_log::TierIoMode;
@@ -2156,6 +2215,7 @@ mod tests {
                     },
                     demote,
                     64,
+                    &census,
                 )
                 .is_ok()
         );

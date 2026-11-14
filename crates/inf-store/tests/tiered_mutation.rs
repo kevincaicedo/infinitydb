@@ -66,6 +66,7 @@ struct Harness {
 
 impl Harness {
     fn new(life_origin: LogicalAddr) -> Harness {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         Harness {
             table: TieredTable::new(
                 AddressSpaceConfig {
@@ -76,6 +77,7 @@ impl Harness {
                 DemotionConfig::for_budget(RING, PAGE),
                 64,
                 KeyHasher::default(),
+                &census,
             )
             .expect("reservation"),
             oracle: HashMap::new(),
@@ -396,6 +398,7 @@ proptest! {
 /// The M4-S05/S06 AC storm: 10⁶ ops of in-place and copy-to-tail updates
 /// across region migrations and crash/replay lives, one seed,
 /// deterministic.
+// nextest-long: 18 s
 #[test]
 fn tiered_mutation_storm_million_ops() {
     let ops = if cfg!(miri) { 2_000 } else { 1_000_000 };

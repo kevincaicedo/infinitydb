@@ -25,6 +25,14 @@
   containerd) — see [below](#the-io_uring--seccomp-requirement).
 - macOS builds for development and correctness testing (via `kqueue`) but is
   not a performance target and is not recommended for deployment.
+- A **local filesystem** for the data directory that keeps POSIX `readdir`'s
+  rule within one open directory: a name present for the whole of a listing
+  is returned exactly once, even while other names are removed from it. Boot
+  recovery lists a directory a bounded batch at a time and removes names
+  between batches. ext4 and tmpfs are tested; xfs keeps the rule by design.
+  NFS and FUSE mounts are outside it: under concurrent change their directory
+  cookies may repeat or skip a name. No other process may write the data
+  directory.
 
 ## Running with Docker
 
@@ -120,7 +128,9 @@ infinityd [--port 6379] [--cells 4] [--pin-start CORE] [--pin-stride 2]
 The table covers the flags an operator sets. `infinityd --help` lists the
 others. `--park-us N` is the longest an idle cell parks before it checks
 again, in microseconds (500 with more than one cell, 5000 with one; a timer
-due sooner wakes it earlier). The others tune the write path or the idle
+due sooner wakes it earlier). It is at most 100000 (100 ms), and a larger
+value is refused at startup: a wake that reaches a cell from outside its
+thread is delivered when the park ends. The others tune the write path or the idle
 loop, or select an experiment arm, and their defaults are the ones to run
 with.
 

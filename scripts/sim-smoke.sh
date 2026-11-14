@@ -10,10 +10,19 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 seed=${1:-0xC0FFEE}
 
-cargo build --release -p inf-sim --features dst --bin inf-sim
-bin=target/release/inf-sim
+# The simulator this run builds is the one it runs: both in this checkout's
+# target root, whatever CARGO_TARGET_DIR holds (ADR-0198 A2).
+# shellcheck source=target-root.sh
+. scripts/target-root.sh
+target_root_setup "$(pwd -P)"
+cargo build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT"
+bin="$TARGET_ROOT/release/inf-sim"
 
 # F-L11-05: an accept-path error is a counter, never connection teardown.
+# The accept-broken row parks each listener as broken, which no close
+# resumes: the plane's accept retry is the queued clients' one way in, and
+# its oracle times each re-arm against the retry's deadline. Its twin runs,
+# as its trace is its own.
 # Adversarial key/value lengths at 4 cells.
 # F-L19-05/06: namespace-bound + SELECTed clients, the served surface and
 # the stored content under audit at 4 cells.
@@ -24,17 +33,31 @@ bin=target/release/inf-sim
 # F-L04-02 (ADR-0119): one EIO under a cold read is one typed reply.
 # F-L19-03: the m2 device/mode/window/recycle oracles and the three
 # m2 fill/hold/pending scenarios ran in no automated lane.
+# m2-fill-dense is the fill scenario's dense leg: hundreds of hold
+# episodes inside one window, and a cell's timers stay its roles' owners.
+# The two --park-at-once rows run the wake oracle on the hold scenarios at
+# spin 0: a held frame's park asks no longer than its window. The fill leg
+# drops the twin (its trace is its base row's, which runs the twin); the
+# group leg keeps it, and its twin compares the wake readings too.
 # ADR-0174 D1: the replay-above-window seed class forced on the smoke
 # seed — a boot whose tiered replay exceeds the window demotes. D2 rule
 # 6: m4-recovery's spec-variant class, each case forced — a boot at a
-# window below its ring pads.
+# window below its ring pads. ADR-0202 D5: m4-tiered's listing-repeat class
+# forced on the smoke seed — the post-drop reboot's sweep reads its dropped
+# namespace past one batch and takes each repeated name as its earlier
+# removal.
 # m4-tier-budget runs each of its legs (two namespaces at 8mb, eight at
 # 1mb, the one-namespace control, two at 1mb at the hostile share, one at
-# 64mb with no device model) on its own row, and the retry arm (one tier
+# 64mb with no device model, and two at the hostile share whose first is a
+# thief of the tier class's credit) on its own row, and the retry arm (one tier
 # write fails and is retried) on the 8mb leg and on the no-model leg,
 # where the 64 MiB round is more ops than one turn's visits and the
 # retry group is built behind a run of done writes: a leg is named,
 # never drawn from the seed.
+# m2-ledger-wedge runs its main leg (a seal held while 128 writers keep the
+# log rotating: at most one segment id appears inside the hold) and its
+# control (one writer: no rotation and no new segment inside the hold) on
+# their own rows.
 # m4-epoch-marks runs its two legs on their own rows: the everysec leg (no
 # wedge, every merge of the reclaim marks exact, no crossing) and the wedge
 # leg (a seal held at the ledger's front with write-through frames behind
@@ -42,6 +65,7 @@ bin=target/release/inf-sim
 rows=(
   "m0-smoke"
   "m0-smoke --plant accept-error"
+  "m0-smoke --plant accept-broken --verify-determinism"
   "m0-adversarial --cells 4 --verify-determinism"
   "m0-surface --cells 4 --verify-determinism"
   "m0-fabric-fairness"
@@ -53,12 +77,19 @@ rows=(
   "m2-mode-transition"
   "m2-reorder-window"
   "m2-fill-tick"
+  "m2-fill-tick --park-at-once"
+  "m2-fill-dense"
   "m2-group-hold"
+  "m2-group-hold --park-at-once --verify-determinism"
   "m2-fua-pending"
+  "m2-ledger-wedge --wedge-leg main --verify-determinism"
+  "m2-ledger-wedge --wedge-leg control --verify-determinism"
+  "m2-stop-tick --verify-determinism"
   "m2-ckpt-refused"
   "m2-recycle"
   "m2-combined"
   "m2-ns-create-window"
+  "m2-ns-drop-window"
   "m2-ns-ddl-race"
   "m3-document"
   "boot-storm"
@@ -71,8 +102,16 @@ rows=(
   "m4-recovery --spec-variant page --verify-determinism"
   "m4-diskfull"
   "m4-tiered"
+  "m4-ns-lifetimes --verify-determinism"
+  "m4-ns-lifetimes --lifetimes-leg control"
+  # A tiered namespace dropped mid-checkpoint-walk, past its first pass.
+  "m4-ns-lifetimes --seed 0x2"
   "m4-tiered --plant tier-read-eio"
   "m4-tiered --replay-above-window --verify-determinism"
+  "m4-tiered --listing-repeats --verify-determinism"
+  # m4-tiered at a seed whose cold burst takes a second round: a reader's candidate held another
+  # key's record, so it reads again after its resume, and the next round releases that read.
+  "m4-tiered --seed 0x51ee0630 --verify-determinism"
   "m4-tier-budget --tier-leg two-8mb --verify-determinism"
   "m4-tier-budget --tier-leg eight-1mb --verify-determinism"
   "m4-tier-budget --tier-leg one-1mb --verify-determinism"
@@ -86,6 +125,28 @@ rows=(
   "m4-extent-window --window-leg cold --verify-determinism"
   "m45-backfill"
   "m45-sidecar"
+  # The pressure storm on a ring past the seal marks' reach at one page: their
+  # stride is two pages, so a seal step may overrun its slice by one stride.
+  "m4-pressure --pressure-leg wide-ring --verify-determinism"
+  # Publishes that cross between cells faster than their owners answer, on
+  # eight credits: two cells publishing to each other's channels, a ring of
+  # three, eight cells each publishing to any other, the two-credit floor;
+  # and the controls, no publish crossing and a window that never fills.
+  "m1-pub-cross"
+  "m1-pub-cross --cells 3 --verify-determinism"
+  "m1-pub-cross --cells 8 --pub-target others --verify-determinism"
+  "m1-pub-cross --fabric-credits 2 --verify-determinism"
+  "m1-pub-cross --pub-target own --verify-determinism"
+  "m1-pub-cross --fabric-credits 256 --verify-determinism"
+  "m4-tier-budget --tier-leg two-1mb-thief --verify-determinism"
+  # m4-cold's identity leg: the cold-read host's issuer placed 32 pairs before
+  # the end of its 2^55, so the space runs out inside the run (ADR-0181 R4).
+  "m4-cold --cold-leg identity --cold-identity-start 0x7fffffffffffe0 --verify-determinism"
+  # m4-cold's delivery legs: 31-member cohorts past a turn's 64 visits, 65
+  # orphaned members, and errored reads, each round's visits counted.
+  "m4-cold --cold-leg dense --verify-determinism"
+  "m4-cold --cold-leg cancel-all --verify-determinism"
+  "m4-cold --cold-leg errors --verify-determinism"
 )
 
 ran=0

@@ -29,6 +29,7 @@ use crate::address_space::{Room, WindowFull};
 use crate::limits::{REPLAY_ROOM_ASKS_MAX, SETTLE_READ_CHARGE_BYTES, SETTLE_WALK_BYTE_CHARGE};
 use crate::record::{ColdKey, ColdKeyError};
 use crate::tiered::shadow::SettleCase;
+use crate::tiered_recover::IdChunks;
 
 /// Where the machine stands. Handed over is the machine consumed by
 /// [`TierReplay::hand_over`]; refused, the error that dropped it.
@@ -45,6 +46,19 @@ enum ReplayState {
     /// Replay ended while `Spilling`; `cursor` is the end-of-replay
     /// settle's position in `[ro, tail]`.
     Settling { cursor: LogicalAddr },
+}
+
+/// The end of the checkpoint's release list (ADR-0174 R9, A1.3): 8 B per
+/// ref a boot settle removed while the checkpoint loaded — before the 0x05
+/// entry that would release its blob reference could exist — in settle
+/// order, with no cap of its own: it is bounded by the origin map it
+/// shadows. Open while the checkpoint loads, closed at its end (walked by
+/// index, nothing appends), released once walked.
+#[derive(Debug)]
+enum ReleaseList {
+    Loading(IdChunks),
+    Releasing(IdChunks),
+    Released,
 }
 
 /// The machine's phase, for the boot line and the oracles.
@@ -89,9 +103,9 @@ pub struct ReplayCounters {
 
 /// Boot I/O the machine did since its owner last drained it: what the
 /// recovery driver charges to its step budget — the settle reads and the
-/// bytes the end settle walked at
+/// bytes the seal and end settle walks passed at
 /// [`settle_charge_bytes`](Self::settle_charge_bytes), the prices' one
-/// home, which the walk yields on too; the tier bytes and barriers at the
+/// home, which both walks yield on too; the tier bytes and barriers at the
 /// driver's prices.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct ReplayWork {
@@ -101,7 +115,8 @@ pub struct ReplayWork {
     pub barriers: u64,
     /// Settle reads made.
     pub settle_reads: u64,
-    /// Bytes walked by the end-of-replay settle.
+    /// Bytes walked by a demote step's seal walk and the end-of-replay
+    /// settle.
     pub walked_bytes: u64,
 }
 
@@ -165,9 +180,10 @@ impl ReplayCounters {
 /// The replay seam: lends a namespace's boot machine to the keyspace's
 /// tiered replay arms, one lookup per record. The machine accumulates
 /// the boot I/O it does ([`ReplayWork`]); the seam's owner drains it with
-/// [`TierReplay::take_work`] where it decides whether to yield — at a
-/// frame or section boundary, and per end-of-replay settle step — so no
-/// record pays for the charge. `None` is a namespace with no machine:
+/// [`TierReplay::take_work`] where it asks its step budget — after a
+/// record whose answer was priced, after a demote step, at the end of a
+/// unit — so a record that does no priced work pays nothing for the
+/// charge. `None` is a namespace with no machine:
 /// its replay places what fits and refuses typed where a demote would be
 /// needed (ADR-0174 D4 gives every tiered namespace a machine).
 pub trait ReplaySpill {
@@ -234,6 +250,12 @@ pub enum ReplayRefusal {
     /// disk admission is open at boot and the window was just made, so
     /// this names a defect, typed.
     Store(OpError),
+    /// A record waiting for room found its demote step's facts changed
+    /// between two steps: `room` answering other than the target while the
+    /// head is below it, the boundary moved under the settled span, another
+    /// record presented, or a demote step with no record waiting (ADR-0174
+    /// A1). A defect class, as `RoomAsks` is: no input reaches it.
+    RoomMoved { why: &'static str },
 }
 
 impl core::fmt::Display for ReplayRefusal {
@@ -294,6 +316,9 @@ impl core::fmt::Display for ReplayRefusal {
                 tail.to_raw()
             ),
             ReplayRefusal::Store(e) => write!(f, "the store refused a fitted placement: {e:?}"),
+            ReplayRefusal::RoomMoved { why } => {
+                write!(f, "a record waiting for room found its demote step moved: {why}")
+            }
         }
     }
 }
@@ -314,18 +339,33 @@ pub enum Displaced {
 
 /// The settle walk's receipt (R7): the boundary advances only to the end
 /// of a span whose every live record was settled against its cold twins,
-/// so no RAM record below it has a same-key cold slot.
+/// so no RAM record below it has a same-key cold slot. `from` is where the
+/// walk began: a seal advances the boundary on a span only from the
+/// boundary itself, so a walk the step budget stopped resumes on its own
+/// receipt, never on a bare address (ADR-0174 A1.3). Only
+/// [`TierReplay::settle_walk`] makes one or lengthens one.
 #[must_use = "a settled span is what the boundary may advance to"]
+#[derive(Debug)]
 pub struct SettledSpan {
+    from: LogicalAddr,
     end: LogicalAddr,
 }
 
+/// Where a settle walk starts: at an address, or at the end of a span an
+/// earlier walk of the same seal settled, which it lengthens.
+#[derive(Debug)]
+enum WalkStart {
+    At(LogicalAddr),
+    Extend(SettledSpan),
+}
+
 /// Where a settle walk goes: a demote step's seal walk to a target
-/// address, or one end-of-replay step to a budget.
+/// address under the budget left, or one end-of-replay step to a budget.
 #[derive(Copy, Clone, Debug)]
 enum WalkTo {
-    /// To the first record start at or above `stop` (D2 rule 2).
-    Seal { stop: u64 },
+    /// To the first record start at or above `stop` (D2 rule 2), or until
+    /// its charge reaches `budget_bytes` (ADR-0174 A1.3).
+    Seal { stop: u64, budget_bytes: u64 },
     /// Until the step's charge reaches `budget_bytes` (R10).
     Settle { budget_bytes: u64 },
 }
@@ -335,8 +375,69 @@ enum WalkTo {
 enum WalkEnd {
     /// At the tail: every record from the walk's start is settled.
     Tail,
-    /// At its stop or its budget, short of the tail.
-    Stopped,
+    /// A seal walk at its stop, short of the tail.
+    AtStop,
+    /// The charge reached the budget after a record, short of the tail.
+    Spent,
+}
+
+/// A record waiting for room (ADR-0174 D2, A1.3): the target `room`
+/// answered, the room asks the record made, counted across suspensions
+/// (rule 1), the record's length, and the span the seal walk has settled
+/// so far, the walk's own receipt.
+#[derive(Debug)]
+struct PendingRoom {
+    target: LogicalAddr,
+    asks: u32,
+    len: usize,
+    settled: Option<SettledSpan>,
+}
+
+/// What one [`TierReplay::demote_step`] reports.
+#[must_use = "a demote step that answers More has not made the room"]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DemoteProgress {
+    /// The seal walk stopped at the budget left; call again.
+    More,
+    /// The head reached the target: present the record again.
+    Room,
+}
+
+/// What the room question answered a record (D2 rule 1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RoomVerdict {
+    /// The record fits: place it.
+    Fits,
+    /// A demote step is under way for it: the record changed nothing.
+    NeedsRoom,
+}
+
+/// What a placement changes on the machine once its record is placed: no
+/// more, the first record's `Seeded` → `Fitting`, or the waiting record's
+/// pending room cleared — read once, from the state, before the room
+/// question.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PlaceEntry {
+    Plain,
+    Seeded,
+    Waiting,
+}
+
+/// What a replayed upsert did: placed at an address, or waiting for room
+/// with nothing of it applied.
+#[must_use = "a record that needs room was not placed"]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    Placed(LogicalAddr),
+    NeedsRoom,
+}
+
+/// Whether a replayed `DEL` read cold slots (R6): the boot work its answer
+/// prices.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeleteReads {
+    None,
+    Read,
 }
 
 /// What one end-of-replay settle step reports (R10).
@@ -361,12 +462,17 @@ pub struct TierReplay<F: SegmentFs> {
     twins: Vec<LogicalAddr>,
     /// Scratch: a `DEL`'s verified same-key cold slots, `(address, len)`.
     doomed: Vec<(LogicalAddr, u32)>,
-    /// Scratch: the chained addresses the end of the checkpoint releases,
-    /// in address order (bounded by the origin map's entries).
-    released: Vec<u64>,
+    /// The settled refs' addresses the end of the checkpoint releases
+    /// (ADR-0174 R9, A1.3), in settle order.
+    releases: ReleaseList,
     /// Scratch: the key of the record being settled (its RAM bytes may
     /// move under the settle).
     key: Vec<u8>,
+    /// The record waiting for room, while a demote step is under way. Set
+    /// only by [`begin_demote`](Self::begin_demote), which enters
+    /// `Spilling`, so a machine in any other state holds none and its
+    /// replay entries read it only in `Spilling`.
+    pending: Option<PendingRoom>,
 }
 
 impl<F: SegmentFs> TierReplay<F> {
@@ -387,9 +493,19 @@ impl<F: SegmentFs> TierReplay<F> {
             work: ReplayWork::default(),
             twins: Vec::new(),
             doomed: Vec::new(),
-            released: Vec::new(),
+            releases: ReleaseList::Loading(IdChunks::new()),
             key: Vec::with_capacity(crate::record::MAX_KEY_LEN),
+            pending: None,
         }
+    }
+
+    /// Whether a record is waiting for room: a demote step is under way, or
+    /// made the room and the record is not placed yet. Never at the end of
+    /// replay — every record a walk presents is applied before the walk
+    /// moves on.
+    #[must_use]
+    pub fn waits_for_room(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// The machine's phase.
@@ -448,57 +564,107 @@ impl<F: SegmentFs> TierReplay<F> {
 
     // ---- the demote step (ADR-0174 D2) ----
 
-    /// Makes room for a record whose `room` answered `Demote(target)`:
-    /// seal one lead past the need with every sealed record settled
-    /// (rule 2, rule 3), one flush with one barrier that the boot
-    /// pipeline claims whole (rule 4), release until the head reaches the
-    /// target. Enters `Spilling` before the first read or write.
-    fn demote(
-        &mut self,
-        table: &mut TieredTable,
-        target: LogicalAddr,
-    ) -> Result<(), ReplayRefusal> {
+    /// Step 0 of a demote step, at the room question that answered
+    /// `Demote(target)` — after the length refusals and before the marker
+    /// drain (ADR-0174 D1): the record waits for room with `asks` asks made and
+    /// has changed nothing; the machine enters `Spilling` and counts the
+    /// step once, before its first read or write.
+    fn begin_demote(&mut self, target: LogicalAddr, asks: u32, len: usize) {
         self.state = ReplayState::Spilling;
         self.counters.demote_steps += 1;
+        self.pending = Some(PendingRoom { target, asks, len, settled: None });
+    }
+
+    /// Makes room for the record waiting for it, under `left` budget bytes
+    /// (ADR-0174 D2, A1.3): seal one lead past the target with every sealed
+    /// record settled (rules 2, 3), one flush with one barrier that the
+    /// boot pipeline claims whole (rule 4), release until the head reaches
+    /// the target. Only the seal walk resumes: it charges every walked byte
+    /// and every read, and once its charge reaches `left` after a record it
+    /// keeps the span it settled and answers `More`, the boundary unmoved;
+    /// the flush and the release run whole once the walk reaches its stop.
+    /// A completed step is one seal, one flush cut and one barrier. `Room`
+    /// once the head reached the target; the record is then presented
+    /// again and keeps its asks until it is placed.
+    ///
+    /// # Errors
+    /// The walk's settle refusals, the flush's, `DemoteStalled`, and
+    /// `RoomMoved` with no record waiting or when the boundary moved under
+    /// the settled span.
+    pub fn demote_step(
+        &mut self,
+        table: &mut TieredTable,
+        left: u64,
+    ) -> Result<DemoteProgress, ReplayRefusal> {
+        let Some(mut pending) = self.pending.take() else {
+            return Err(ReplayRefusal::RoomMoved { why: "a demote step with no record waiting" });
+        };
+        let target = pending.target;
         if table.space.flushed() < target {
+            let start = match pending.settled.take() {
+                Some(span) if span.from == table.space.ro_boundary() => WalkStart::Extend(span),
+                Some(_) => {
+                    return Err(ReplayRefusal::RoomMoved {
+                        why: "the boundary moved under the span",
+                    });
+                }
+                None => WalkStart::At(table.space.ro_boundary()),
+            };
             let stop = target.to_raw().saturating_add(self.lead);
-            let from = table.space.ro_boundary();
-            // Bound: `H + lead − ro` bytes walked, plus one record.
-            let (span, _) = self.settle_walk(table, from, WalkTo::Seal { stop })?;
+            // The planted canary walks the whole seal in one call, as a
+            // demote step did inside one record's apply.
+            let budget_bytes =
+                if cfg!(inf_canary_recover_seal_unbudgeted) { u64::MAX } else { left.max(1) };
+            // Bound: the charge left plus one record and its exact-hash
+            // group's reads.
+            let (span, end) =
+                self.settle_walk(table, start, WalkTo::Seal { stop, budget_bytes })?;
+            if end == WalkEnd::Spent {
+                pending.settled = Some(span);
+                self.pending = Some(pending);
+                return Ok(DemoteProgress::More);
+            }
             table.seal_settled(span);
-            let cut = table.space.ro_boundary().to_raw();
-            let cursor = table.flush_start_cursor(&self.flush);
-            // One span, one barrier, one more per gap or capacity seal it
-            // crosses. A boot seals a file at the capacity target, before a
-            // gap and once at the hand-over (ADR-0174 D2 rule 5), so for `D`
-            // the span the boot flushed (`flushed` − life origin, holes and
-            // pads included) and `C` the file capacity it seals at most
-            // ⌊2D ÷ C⌋ + ⌈D ÷ ring⌉ + page pads + 1 files: a capacity-sealed
-            // file and the range that overflowed it hold more than `C`, a
-            // file is in at most two such pairs (⌊D ÷ (C − S)⌋ when `S`, the
-            // longest range one demote step appends, is below `C`), and ring
-            // tops lie a ring apart. No limit of their own: the device and
-            // the handle limit bound them (a typed refusal at a create).
-            if cut > cursor {
-                let outcome = table
-                    .flush_span(&mut self.flush, cut - cursor)
-                    .map_err(|cause| self.flush_refusal(table, cause))?;
-                self.note_flush(outcome);
-            }
-            // The planted canary breaks D2 rule 5: the step seals the file
-            // to free the partial frame, as the live stall seal does — a
-            // boot file with the stall reason.
-            #[cfg(inf_canary_replay_stall_seal)]
-            {
-                let planted = self.flush.seal_stall_planted();
-                planted.map_err(|cause| self.flush_refusal(table, cause))?;
-            }
+            self.flush_cut(table)?;
         }
         // Bound: ⌈(target − head) ÷ slice⌉ releases, whole pages each.
         while table.space.head() < target {
             if table.release_slice() == 0 {
                 return Err(ReplayRefusal::DemoteStalled { head: table.space.head(), target });
             }
+        }
+        self.pending = Some(pending);
+        Ok(DemoteProgress::Room)
+    }
+
+    /// Rule 4 after the seal: the flush over `[flush cursor, ro)`, one unit.
+    fn flush_cut(&mut self, table: &mut TieredTable) -> Result<(), ReplayRefusal> {
+        let cut = table.space.ro_boundary().to_raw();
+        let cursor = table.flush_start_cursor(&self.flush);
+        // One span, one barrier, one more per gap or capacity seal it
+        // crosses. A boot seals a file at the capacity target, before a
+        // gap and once at the hand-over (ADR-0174 D2 rule 5), so for `D`
+        // the span the boot flushed (`flushed` − life origin, holes and
+        // pads included) and `C` the file capacity it seals at most
+        // ⌊2D ÷ C⌋ + ⌈D ÷ ring⌉ + page pads + 1 files: a capacity-sealed
+        // file and the range that overflowed it hold more than `C`, a
+        // file is in at most two such pairs (⌊D ÷ (C − S)⌋ when `S`, the
+        // longest range one demote step appends, is below `C`), and ring
+        // tops lie a ring apart. No limit of their own: the device and
+        // the handle limit bound them (a typed refusal at a create).
+        if cut > cursor {
+            let outcome = table
+                .flush_span(&mut self.flush, cut - cursor)
+                .map_err(|cause| self.flush_refusal(table, cause))?;
+            self.note_flush(outcome);
+        }
+        // The planted canary breaks D2 rule 5: the step seals the file
+        // to free the partial frame, as the live stall seal does — a
+        // boot file with the stall reason.
+        #[cfg(inf_canary_replay_stall_seal)]
+        {
+            let planted = self.flush.seal_stall_planted();
+            planted.map_err(|cause| self.flush_refusal(table, cause))?;
         }
         Ok(())
     }
@@ -519,27 +685,33 @@ impl<F: SegmentFs> TierReplay<F> {
         self.work.barriers += barriers;
     }
 
-    /// Walks the records from `from`, settling every live one against
+    /// Walks the records from `start`, settling every live one against
     /// its exact-hash cold slots (R7), to where `to` says: a demote
     /// step's seal walk stops at the first record start at or above its
-    /// target; an end-of-replay step yields after the record whose charge
-    /// — its walked bytes and settle reads at
-    /// [`ReplayWork::settle_charge_bytes`] — reaches its budget. Either
-    /// ends at the tail. A hole is
-    /// passed whole by its mark. Returns the span settled and how the
-    /// walk ended.
+    /// target; either walk yields after the record whose charge — its
+    /// walked bytes and settle reads at [`ReplayWork::settle_charge_bytes`]
+    /// — reaches its budget. Either ends at the tail. A hole is passed
+    /// whole by its mark. Returns the span settled — from `start`'s address,
+    /// or the span it extends — and how the walk ended; the only maker and
+    /// the only extender of a [`SettledSpan`].
     ///
-    /// Bound per call: a seal walk passes `H + lead − ro` bytes plus one
-    /// record; an end-of-replay step charges at most its budget plus one
-    /// record's bytes and its twins' reads (an exact-hash group).
+    /// Bound per call: the budget plus one record's bytes and its twins'
+    /// reads (an exact-hash group); a seal walk passes at most
+    /// `H + lead − ro` bytes plus one record over all its calls.
     fn settle_walk(
         &mut self,
         table: &mut TieredTable,
-        from: LogicalAddr,
+        start: WalkStart,
         to: WalkTo,
     ) -> Result<(SettledSpan, WalkEnd), ReplayRefusal> {
         let tail = table.space.tail().to_raw();
-        let mut at = from.to_raw();
+        let (from, mut at) = match start {
+            WalkStart::At(addr) => (addr, addr.to_raw()),
+            WalkStart::Extend(span) => (span.from, span.end.to_raw()),
+        };
+        let budget_bytes = match to {
+            WalkTo::Seal { budget_bytes, .. } | WalkTo::Settle { budget_bytes } => budget_bytes,
+        };
         let mut walked = 0u64;
         let reads_before = self.counters.settle_reads;
         let end = loop {
@@ -551,10 +723,10 @@ impl<F: SegmentFs> TierReplay<F> {
                 at += hole;
                 continue;
             }
-            if let WalkTo::Seal { stop } = to
+            if let WalkTo::Seal { stop, .. } = to
                 && at >= stop
             {
-                break WalkEnd::Stopped;
+                break WalkEnd::AtStop;
             }
             let (len, hash) = {
                 let parts = table.record(here);
@@ -570,20 +742,17 @@ impl<F: SegmentFs> TierReplay<F> {
             }
             at += len;
             walked += len;
-            if let WalkTo::Settle { budget_bytes } = to {
-                let settle_reads = self.counters.settle_reads - reads_before;
-                let walk =
-                    ReplayWork { walked_bytes: walked, settle_reads, ..ReplayWork::default() };
-                if walk.settle_charge_bytes() >= budget_bytes {
-                    break if at >= tail { WalkEnd::Tail } else { WalkEnd::Stopped };
-                }
+            let settle_reads = self.counters.settle_reads - reads_before;
+            let walk = ReplayWork { walked_bytes: walked, settle_reads, ..ReplayWork::default() };
+            if walk.settle_charge_bytes() >= budget_bytes {
+                break if at >= tail { WalkEnd::Tail } else { WalkEnd::Spent };
             }
         };
-        if matches!(to, WalkTo::Settle { .. }) {
-            self.work.walked_bytes += walked;
-        }
+        // Both walks' bytes are charged: the seal walk's as the end
+        // settle's (ADR-0174 A1.2).
+        self.work.walked_bytes += walked;
         let end_addr = LogicalAddr::from_raw(at).expect("watermarks stay 48-bit");
-        Ok((SettledSpan { end: end_addr }, end))
+        Ok((SettledSpan { from, end: end_addr }, end))
     }
 
     /// One pass over the exact-hash group of the record at `here`: whether
@@ -635,6 +804,19 @@ impl<F: SegmentFs> TierReplay<F> {
             let case = SettleCase::at_boot(cold, table.space.life_origin(), twin.record_len());
             if !table.settle_pair(hash, cold.to_raw(), winner.to_raw(), case) {
                 return Err(ReplayRefusal::OriginRoom { winner, cold });
+            }
+            // A ref settled while the checkpoint loads precedes the 0x05
+            // entry that would release its blob reference (R9's list). The
+            // list names each address once: a settle collects only a slotted
+            // pair and removes it, and no later ref slots it again (R2) — one
+            // probe of the index, not a walk of the list.
+            if let (SettleCase::RefAtBoot, ReleaseList::Loading(list)) = (case, &mut self.releases)
+            {
+                debug_assert!(
+                    !table.index.contains_pair(hash, cold),
+                    "a listed ref left the index"
+                );
+                list.push(cold.to_raw());
             }
             self.counters.settled_same_key += 1;
         }
@@ -688,44 +870,98 @@ impl<F: SegmentFs> TierReplay<F> {
 
     // ---- the end of the checkpoint, the end of replay, the hand-over ----
 
-    /// R9, at the end of the checkpoint and before the tail: every
-    /// address a boot settle chained releases its blob reference, now
-    /// that the 0x05 section has registered the entries the settles
-    /// preceded. Nothing for an address with no entry.
+    /// R9, at the end of the checkpoint and before the tail, run to
+    /// completion: the list closes, every listed address releases its blob
+    /// reference, and the list is freed ([`close_checkpoint`],
+    /// [`release_from`] and [`end_releases`] are the stepped form the
+    /// recovery driver runs under its budget).
+    ///
+    /// [`close_checkpoint`]: Self::close_checkpoint
+    /// [`release_from`]: Self::release_from
+    /// [`end_releases`]: Self::end_releases
     pub fn end_of_checkpoint(&mut self, table: &mut TieredTable) {
+        let listed = self.close_checkpoint();
+        self.release_from(table, 0, listed);
+        self.end_releases();
+    }
+
+    /// The checkpoint has ended (R9): the list closes — no settle appends
+    /// to it again, so an index into it names one address for as long as
+    /// it lives — and its length is what [`release_from`](Self::release_from)
+    /// walks.
+    pub fn close_checkpoint(&mut self) -> usize {
+        let list = match core::mem::replace(&mut self.releases, ReleaseList::Released) {
+            ReleaseList::Loading(list) | ReleaseList::Releasing(list) => list,
+            ReleaseList::Released => IdChunks::new(),
+        };
+        let listed = list.len();
+        self.releases = ReleaseList::Releasing(list);
+        listed
+    }
+
+    /// The closed list's length: what [`release_from`](Self::release_from)
+    /// walks (nothing while the checkpoint loads or once released).
+    #[must_use]
+    pub fn releases_listed(&self) -> usize {
+        match &self.releases {
+            ReleaseList::Releasing(list) => list.len(),
+            ReleaseList::Loading(_) | ReleaseList::Released => 0,
+        }
+    }
+
+    /// Releases the listed addresses `[at, at + max)` of the closed list,
+    /// clamped to it, in settle order (R9, A1.3): each address whose
+    /// blob-reference entry the 0x05 section registered dies once, now
+    /// that the entry exists; nothing for an address with none. Answers how
+    /// many listed addresses it walked. The list's order is the settles' —
+    /// a function of the recovery unit, the same at every step budget — so
+    /// the reclaim queue takes the deaths in one order at every budget.
+    pub fn release_from(&mut self, table: &mut TieredTable, at: usize, max: usize) -> usize {
+        let ReleaseList::Releasing(list) = &self.releases else {
+            return 0;
+        };
+        let walked = list.len().saturating_sub(at).min(max);
         if cfg!(inf_canary_replay_blob_release_skip) {
             // The planted canary breaks R9: a settled ref's blob
             // reference stays with no slot.
-            return;
+            return walked;
         }
-        if table.reloc_origins.is_empty() {
-            return;
+        if cfg!(inf_canary_replay_release_reordered) && at > 0 {
+            // The planted canary breaks the settle order: a call that
+            // resumes inside the list releases its batch in reverse.
+            let batch: Vec<u64> = list.iter_from(at).take(walked).collect();
+            for &addr in batch.iter().rev() {
+                if table.extents.reference_at(addr).is_some() {
+                    table.extents.note_death(addr);
+                    self.counters.blob_releases += 1;
+                }
+            }
+            return walked;
         }
-        // Bound: one pass over the origin map, once per boot — at most the
-        // refs settled during image load, each a map lookup — into the
-        // scratch, sorted: the map's iteration order must not choose the
-        // order the reclaim queue takes the deaths in.
-        self.released.clear();
-        for origins in table.reloc_origins.values() {
-            self.released.extend(origins.iter().map(|&(addr, _)| addr));
-        }
-        self.released.sort_unstable();
-        debug_assert!(self.released.windows(2).all(|w| w[0] < w[1]), "no address chained twice");
+        // Bound: `max` listed addresses, each a map probe and a death.
         let mut released = 0u64;
-        for &addr in &self.released {
+        for addr in list.iter_from(at).take(walked) {
             if table.extents.reference_at(addr).is_some() {
                 table.extents.note_death(addr);
                 released += 1;
             }
         }
-        self.released.clear();
         self.counters.blob_releases += released;
+        walked
+    }
+
+    /// The closed list is walked: it is freed, and the settles of the tail
+    /// replay that follows list nothing (their blob references' entries
+    /// exist, so each settle released its own).
+    pub fn end_releases(&mut self) {
+        self.releases = ReleaseList::Released;
     }
 
     /// R10's first half: replay has ended. A machine that demoted
     /// enters `Settling` with its cursor at `ro`; one that did not is
     /// ready to hand over.
     pub fn end_of_replay(&mut self, table: &TieredTable) {
+        debug_assert!(self.pending.is_none(), "replay ends with no record waiting for room");
         if self.state == ReplayState::Spilling {
             let cursor = if cfg!(inf_canary_replay_no_end_settle) {
                 // The planted canary breaks R10: no end settle, so the
@@ -756,11 +992,12 @@ impl<F: SegmentFs> TierReplay<F> {
             ReplayState::Settling { cursor } => cursor,
         };
         let budget_bytes = budget_bytes.max(1);
-        let (span, end) = self.settle_walk(table, cursor, WalkTo::Settle { budget_bytes })?;
+        let to = WalkTo::Settle { budget_bytes };
+        let (span, end) = self.settle_walk(table, WalkStart::At(cursor), to)?;
         self.state = ReplayState::Settling { cursor: span.end };
         Ok(match end {
             WalkEnd::Tail => SettleProgress::Done,
-            WalkEnd::Stopped => SettleProgress::More,
+            WalkEnd::AtStop | WalkEnd::Spent => SettleProgress::More,
         })
     }
 
@@ -844,7 +1081,13 @@ impl TieredTable {
         value: &[u8],
         hash: u64,
     ) -> Result<LogicalAddr, ReplayRefusal> {
-        self.replay_upsert_lent::<<NoSpill as ReplaySpill>::Fs>(None, markers, key, value, hash)
+        let placed = self
+            .replay_upsert_lent::<<NoSpill as ReplaySpill>::Fs>(None, markers, key, value, hash);
+        match placed? {
+            Placement::Placed(addr) => Ok(addr),
+            // A record waits for room only with a machine to make it.
+            Placement::NeedsRoom => Err(ReplayRefusal::RoomMoved { why: "no machine to wait on" }),
+        }
     }
 
     /// [`replay_delete_lent`](Self::replay_delete_lent) with no machine,
@@ -858,14 +1101,18 @@ impl TieredTable {
         key: &[u8],
         hash: u64,
     ) -> Result<bool, ReplayRefusal> {
-        self.replay_delete_lent::<<NoSpill as ReplaySpill>::Fs>(None, markers, key, hash)
+        let deleted =
+            self.replay_delete_lent::<<NoSpill as ReplaySpill>::Fs>(None, markers, key, hash);
+        deleted.map(|(removed, _reads)| removed)
     }
 
     /// Replays one checkpoint image or tail `SET` (R5): the typed length
-    /// refusals first, then the room question until it answers `Fits` —
-    /// a demote step or a pad per answer, at most four asks — then the
-    /// parked markers (R3, R4), then the blind key-verified upsert: a RAM
-    /// record of the key is overwritten in place of its slot with its
+    /// refusals first, then the room question until it answers `Fits` — a
+    /// pad per answer, at most four asks — or `Demote`, where the record
+    /// answers `NeedsRoom` having changed nothing and the driver runs the
+    /// demote step under its budget and presents it again (ADR-0174 A1.5),
+    /// then the parked markers (R3, R4), then the blind key-verified upsert:
+    /// a RAM record of the key is overwritten in place of its slot with its
     /// origins moved to the new record; none inserts at the tail, cold
     /// exact-hash slots untouched and unread (R5).
     ///
@@ -879,7 +1126,7 @@ impl TieredTable {
         key: &[u8],
         value: &[u8],
         hash: u64,
-    ) -> Result<LogicalAddr, ReplayRefusal> {
+    ) -> Result<Placement, ReplayRefusal> {
         let admitted = self.admit_inline(key, value).map_err(ReplayRefusal::TooLarge)?;
         self.replay_place(replay, markers, hash, admitted.len(), |t| t.apply_image(admitted, hash))
     }
@@ -896,7 +1143,7 @@ impl TieredTable {
         key: &[u8],
         hash: u64,
         ext: ExtentRef,
-    ) -> Result<LogicalAddr, ReplayRefusal> {
+    ) -> Result<Placement, ReplayRefusal> {
         let len = self.admit_extent(key, ext).map_err(ReplayRefusal::TooLarge)?;
         TieredTable::extent_admission_cost(ext, len).map_err(ReplayRefusal::TooLarge)?;
         self.replay_place(replay, markers, hash, len, |t| t.apply_extent_image(key, hash, ext))
@@ -905,7 +1152,10 @@ impl TieredTable {
     /// The placement sequence both upserts share, after their length
     /// refusals: the state (no record after the end of replay), the room
     /// question, the parked markers, the arm, and `Seeded` → `Fitting` —
-    /// one read of the state, one ask of `room` for a record that fits.
+    /// one read of the state, one ask of `room` for a record that fits. A
+    /// record waiting for room is the one presented again, of its length;
+    /// it keeps its asks until it is placed. Only `Spilling` can hold one,
+    /// so a fitting boot reads no pending record and clears none.
     fn replay_place<F: SegmentFs>(
         &mut self,
         mut replay: Option<&mut TierReplay<F>>,
@@ -913,29 +1163,60 @@ impl TieredTable {
         hash: u64,
         len: usize,
         arm: impl FnOnce(&mut TieredTable) -> Result<LogicalAddr, OpError>,
-    ) -> Result<LogicalAddr, ReplayRefusal> {
-        let seeded = match replay.as_deref().map(|r| r.state) {
-            Some(ReplayState::Settling { .. }) => return Err(ReplayRefusal::ReplayEnded),
-            Some(ReplayState::Seeded) => true,
-            Some(ReplayState::Fitting | ReplayState::Spilling) | None => false,
+    ) -> Result<Placement, ReplayRefusal> {
+        let entry = match replay.as_deref() {
+            None => PlaceEntry::Plain,
+            Some(r) => {
+                debug_assert!(
+                    r.pending.is_none() || r.state == ReplayState::Spilling,
+                    "a record waits for room only while the machine spills"
+                );
+                match r.state {
+                    ReplayState::Settling { .. } => return Err(ReplayRefusal::ReplayEnded),
+                    ReplayState::Seeded => PlaceEntry::Seeded,
+                    ReplayState::Fitting => PlaceEntry::Plain,
+                    ReplayState::Spilling => match &r.pending {
+                        None => PlaceEntry::Plain,
+                        Some(pending) if pending.len == len => PlaceEntry::Waiting,
+                        Some(_) => {
+                            let why = "another record presented";
+                            return Err(ReplayRefusal::RoomMoved { why });
+                        }
+                    },
+                }
+            }
         };
-        self.make_room(replay.as_deref_mut(), len)?;
+        match self.make_room(replay.as_deref_mut(), len)? {
+            RoomVerdict::Fits => {}
+            RoomVerdict::NeedsRoom => return Ok(Placement::NeedsRoom),
+        }
         self.drain_markers(replay.as_deref_mut(), markers, hash);
         let placed = arm(self).map_err(ReplayRefusal::Store)?;
-        if seeded && let Some(r) = replay {
-            debug_assert_eq!(r.state, ReplayState::Seeded, "a seeded table's first record fits");
-            r.state = ReplayState::Fitting;
+        if let Some(r) = replay {
+            match entry {
+                PlaceEntry::Plain => {}
+                PlaceEntry::Seeded => {
+                    debug_assert_eq!(
+                        r.state,
+                        ReplayState::Seeded,
+                        "a seeded table's first record fits"
+                    );
+                    r.state = ReplayState::Fitting;
+                }
+                PlaceEntry::Waiting => r.pending = None,
+            }
         }
-        Ok(placed)
+        Ok(Placement::Placed(placed))
     }
 
     /// Replays one tail `DEL` (R6): the settle read of each exact-hash
     /// cold slot this boot demoted first, then the parked markers,
     /// then the RAM record of the key — with its origins — and the read
     /// slots whose key matched, each with its exact death. Returns
-    /// whether anything of the key was removed. A cold slot at or above
-    /// the origin exists only once a demote step began, so `Seeded` and
-    /// `Fitting` read and probe nothing.
+    /// whether anything of the key was removed and whether it read, the
+    /// boot work its answer prices. A cold slot at or above the origin
+    /// exists only once a demote step began, so `Seeded` and `Fitting`
+    /// read and probe nothing.
     ///
     /// # Errors
     /// A settle read or identity refusal; nothing changed.
@@ -945,16 +1226,20 @@ impl TieredTable {
         markers: &[LogicalAddr],
         key: &[u8],
         hash: u64,
-    ) -> Result<bool, ReplayRefusal> {
+    ) -> Result<(bool, DeleteReads), ReplayRefusal> {
         if let Some(r) = replay.as_deref_mut() {
             match r.state {
                 ReplayState::Settling { .. } => return Err(ReplayRefusal::ReplayEnded),
+                // Only `Spilling` can hold a record waiting for room.
+                ReplayState::Spilling if r.pending.is_some() => {
+                    return Err(ReplayRefusal::RoomMoved { why: "a delete presented" });
+                }
                 ReplayState::Spilling => return self.replay_delete_spilling(r, markers, key, hash),
                 ReplayState::Seeded | ReplayState::Fitting => {}
             }
         }
         self.drain_markers(replay, markers, hash);
-        Ok(self.apply_delete(key, hash))
+        Ok((self.apply_delete(key, hash), DeleteReads::None))
     }
 
     /// [`replay_delete_lent`](Self::replay_delete_lent) once a demote step began:
@@ -966,8 +1251,14 @@ impl TieredTable {
         markers: &[LogicalAddr],
         key: &[u8],
         hash: u64,
-    ) -> Result<bool, ReplayRefusal> {
+    ) -> Result<(bool, DeleteReads), ReplayRefusal> {
+        let reads_before = r.counters.settle_reads;
         r.verify_cold_for_delete(self, key, hash)?;
+        let reads = if r.counters.settle_reads > reads_before {
+            DeleteReads::Read
+        } else {
+            DeleteReads::None
+        };
         self.drain_markers(Some(&mut *r), markers, hash);
         let mut removed = self.apply_delete(key, hash);
         for i in 0..r.doomed.len() {
@@ -980,7 +1271,7 @@ impl TieredTable {
             removed = true;
         }
         r.doomed.clear();
-        Ok(removed)
+        Ok((removed, reads))
     }
 
     /// Replays one checkpoint address reference (R1): insert unless
@@ -1025,21 +1316,22 @@ impl TieredTable {
         Displaced::Removed
     }
 
-    /// D2 rule 1's room question, asked until it answers `Fits`: `Demote` runs
-    /// the step, `Pad` moves the tail, `End` and a fifth ask refuse typed.
-    /// The record that fits — every record of a boot that fits — asks
-    /// once and leaves; the loop is the out-of-line rest. The two hints
-    /// are measured: without them a replayed `SET` through a lent machine
-    /// costs 26 more instructions (the fitting-boot replay A/B).
+    /// D2 rule 1's room question, asked until it answers `Fits`: `Demote`
+    /// begins a demote step and answers `NeedsRoom`, `Pad` moves the tail,
+    /// `End` and a fifth ask refuse typed. The record that fits — every
+    /// record of a boot that fits — asks once and leaves; the loop is the
+    /// out-of-line rest. The two hints are measured: without them a
+    /// replayed `SET` through a lent machine costs 26 more instructions
+    /// (the fitting-boot replay A/B).
     #[inline]
     fn make_room<F: SegmentFs>(
         &mut self,
         replay: Option<&mut TierReplay<F>>,
         len: usize,
-    ) -> Result<(), ReplayRefusal> {
+    ) -> Result<RoomVerdict, ReplayRefusal> {
         let first = self.space.room(len);
         if matches!(first, Room::Fits) {
-            return Ok(());
+            return Ok(RoomVerdict::Fits);
         }
         self.make_room_after(replay, len, first)
     }
@@ -1053,9 +1345,29 @@ impl TieredTable {
         mut replay: Option<&mut TierReplay<F>>,
         len: usize,
         first: Room,
-    ) -> Result<(), ReplayRefusal> {
-        let mut answer = Some(first);
+    ) -> Result<RoomVerdict, ReplayRefusal> {
         let mut asks = 0u32;
+        if let Some(pending) = replay.as_deref_mut().and_then(|r| r.pending.as_mut()) {
+            // The record presented again while its demote step is under
+            // way: the step resumes, and its room question is the same ask
+            // (D2 rule 1, ADR-0174 A1.3), so `room` must still answer the
+            // target the step makes room for.
+            if self.space.head() < pending.target {
+                if first != Room::Demote(pending.target) {
+                    return Err(ReplayRefusal::RoomMoved { why: "room answers another target" });
+                }
+                if cfg!(inf_canary_recover_room_reask_counted) {
+                    // The planted canary counts the resumed ask as a new one.
+                    pending.asks += 1;
+                    if pending.asks > REPLAY_ROOM_ASKS_MAX {
+                        return Err(ReplayRefusal::RoomAsks { len, asks: pending.asks });
+                    }
+                }
+                return Ok(RoomVerdict::NeedsRoom);
+            }
+            asks = pending.asks;
+        }
+        let mut answer = Some(first);
         loop {
             asks += 1;
             if asks > REPLAY_ROOM_ASKS_MAX {
@@ -1063,7 +1375,7 @@ impl TieredTable {
             }
             let room = answer.take().unwrap_or_else(|| self.space.room(len));
             match room {
-                Room::Fits => return Ok(()),
+                Room::Fits => return Ok(RoomVerdict::Fits),
                 Room::End => return Err(ReplayRefusal::End { len }),
                 Room::Demote(target) => {
                     if cfg!(inf_canary_replay_no_demote) {
@@ -1074,7 +1386,8 @@ impl TieredTable {
                     let Some(r) = replay.as_deref_mut() else {
                         return Err(ReplayRefusal::NoPipeline { need: Room::Demote(target) });
                     };
-                    r.demote(self, target)?;
+                    r.begin_demote(target, asks, len);
+                    return Ok(RoomVerdict::NeedsRoom);
                 }
                 Room::Pad(target) => {
                     let Some(r) = replay.as_deref_mut() else {
@@ -1114,8 +1427,11 @@ impl TieredTable {
         }
     }
 
-    /// The boundary's one boot advance (R7): to the end of a settled span.
+    /// The boundary's one boot advance (R7): to the end of a settled span
+    /// that starts at the boundary, so a walk the step budget stopped and
+    /// resumed still seals only records it settled (ADR-0174 A1.3).
     fn seal_settled(&mut self, span: SettledSpan) {
+        assert_eq!(span.from, self.space.ro_boundary(), "a sealed span starts at the boundary");
         let from = self.space.ro_boundary().to_raw();
         if span.end.to_raw() > from {
             self.space.advance_ro_boundary(span.end);
@@ -1125,6 +1441,7 @@ impl TieredTable {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: a whole listing of a fixture directory")]
 mod tests {
     use std::path::Path;
 
@@ -1139,6 +1456,7 @@ mod tests {
     const PAGE: u64 = 4 << 10;
 
     fn table() -> TieredTable {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(64 << 10, PAGE);
         TieredTable::new(
             AddressSpaceConfig {
@@ -1149,6 +1467,7 @@ mod tests {
             demote,
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring")
     }
@@ -1163,10 +1482,31 @@ mod tests {
                 mode: TierIoMode::Buffered,
                 file_capacity: 1 << 20,
                 slice_bytes: PAGE,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         TierReplay::new(BootFlush::new(flush, Vec::new()), table)
+    }
+
+    /// One record through the entry, driven as `drive_record` drives it:
+    /// presented, and on `NeedsRoom` its demote step run whole, then
+    /// presented again.
+    fn upsert(table: &mut TieredTable, replay: &mut TierReplay<MemFs>, key: &[u8], value: &[u8]) {
+        let hash = table.hash_key(key);
+        // Bound: four room asks a record (D2 rule 1).
+        loop {
+            let placed = table.replay_upsert_lent(Some(&mut *replay), &[], key, value, hash);
+            match placed.expect("replays") {
+                Placement::Placed(_) => return,
+                Placement::NeedsRoom => {
+                    while replay.demote_step(table, u64::MAX).expect("demotes")
+                        == DemoteProgress::More
+                    {}
+                }
+            }
+        }
     }
 
     /// Two windows of records through the entry: the machine demotes.
@@ -1174,8 +1514,7 @@ mod tests {
         let value = vec![0x5A; 900];
         for i in 0..160u32 {
             let key = format!("k:{i:04}").into_bytes();
-            let hash = table.hash_key(&key);
-            table.replay_upsert_lent(Some(replay), &[], &key, &value, hash).expect("replays");
+            upsert(table, replay, &key, &value);
         }
         assert!(replay.counters().demote_steps > 0);
         assert_eq!(replay.phase(), ReplayPhase::Spilling);
@@ -1266,8 +1605,7 @@ mod tests {
         let value = vec![0x6B; 900];
         for i in 0..56u32 {
             let key = format!("k:{i:04}").into_bytes();
-            let hash = table.hash_key(&key);
-            table.replay_upsert_lent(Some(&mut replay), &[], &key, &value, hash).expect("replays");
+            upsert(&mut table, &mut replay, &key, &value);
         }
         replay.end_of_replay(&table);
         let budget: u64 = 64 << 10;
@@ -1311,29 +1649,51 @@ mod tests {
         assert_eq!(table.space().tail(), LogicalAddr::ZERO, "nothing placed");
     }
 
-    /// The end of the checkpoint releases the settled refs' blob
-    /// references in address order, whatever order the origin map holds
-    /// them in: the reclaim queue takes the deaths in that order.
+    /// The end of the checkpoint releases the settled refs' blob references
+    /// in the order the settles listed them, whatever order the origin map
+    /// holds them in, and a release stepped in batches — of one address, and
+    /// of two, so that calls resume inside the list (`at` 2 and 4) and walk
+    /// more than one address there — releases in the same order: the
+    /// reclaim queue takes the deaths in one order at every step budget.
+    /// Red where a call that resumes inside the list releases its batch in
+    /// reverse (`inf_canary_replay_release_reordered`).
     #[test]
-    fn the_end_of_the_checkpoint_releases_blob_references_in_address_order() {
+    fn the_end_of_the_checkpoint_releases_blob_references_in_settle_order() {
         let fs = MemFs::new();
-        let mut table = table();
-        let mut replay = machine(&fs, &table);
-        // Three settled refs chained into one survivor, the origin list in
-        // descending address order; each names its own extent.
-        let refs = [(3 << 12, 30), (2 << 12, 20), (1 << 12, 10)];
-        for &(addr, extent_id) in &refs {
-            table.extents.register(addr, extent_id, 4096);
-        }
-        let origins: Vec<(u64, u64)> = refs.iter().map(|&(addr, _)| (addr, 1)).collect();
-        table.reloc_origins.insert((7, 1 << 20), origins);
-        replay.end_of_checkpoint(&mut table);
-        assert_eq!(replay.counters().blob_releases, 3);
-        let seeded = table.extents.sweep_seed(&[], &[]);
-        assert!(seeded.is_empty());
-        let order: Vec<u64> =
-            table.extents.reclaim_work(0, 8).iter().map(|c| c.extent_id).collect();
-        assert_eq!(order, vec![10, 20, 30], "released in address order");
+        // Five refs settled during image load, in descending address order;
+        // each names its own extent.
+        let refs = [(5 << 12, 50), (4 << 12, 40), (3 << 12, 30), (2 << 12, 20), (1 << 12, 10)];
+        let settled: Vec<u64> = refs.iter().map(|&(_, extent_id)| extent_id).collect();
+        // `None` releases the list whole; `Some(max)` at most `max` a call.
+        let order_of = |batch: Option<usize>| {
+            let mut table = table();
+            let mut replay = machine(&fs, &table);
+            for &(addr, extent_id) in &refs {
+                table.extents.register(addr, extent_id, 4096);
+            }
+            replay.releases = ReleaseList::Loading(refs.iter().map(|&(addr, _)| addr).collect());
+            let mut calls = 0;
+            if let Some(max) = batch {
+                let listed = replay.close_checkpoint();
+                let mut at = 0;
+                // Bound: ⌈listed ÷ max⌉ calls, each walking at least one.
+                while at < listed {
+                    at += replay.release_from(&mut table, at, max);
+                    calls += 1;
+                }
+                replay.end_releases();
+            } else {
+                replay.end_of_checkpoint(&mut table);
+            }
+            assert_eq!(calls, batch.map_or(0, |max| refs.len().div_ceil(max)));
+            assert_eq!(replay.counters().blob_releases, 5);
+            let seeded = table.extents.sweep_seed(&[], &[]);
+            assert!(seeded.is_empty());
+            table.extents.reclaim_work(0, 8).iter().map(|c| c.extent_id).collect::<Vec<u64>>()
+        };
+        assert_eq!(order_of(None), settled, "released in settle order");
+        assert_eq!(order_of(Some(1)), settled, "and so an address a call");
+        assert_eq!(order_of(Some(2)), settled, "and so two a call, resumed at 2 and 4");
     }
 
     /// A fresh table in a fresh directory of the same `MemFs` (the file

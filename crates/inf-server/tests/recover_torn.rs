@@ -15,7 +15,8 @@ use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
     FRAME_HEADER_LEN, FrameBuilder, FrameStamp, Lsn, Manifest, MutationEffect, RecordView,
-    SegmentId, SegmentRotor, StagingRing, create_cell_dirs, segment_file_name, write_manifest,
+    SegmentConfig, SegmentId, SegmentRotor, StagingRing, create_cell_dirs, segment_file_name,
+    write_manifest,
 };
 use inf_server::{DurableConfig, open_cell_log};
 
@@ -67,7 +68,7 @@ fn resume_over_remnants_then_recover_again_is_clean() {
     // The cell keeps writing over the remnant region through the
     // recovered rotor (a smaller frame than the remnant), under the
     // recovery-derived life — the assembly wiring ADR-0031 D6 requires.
-    let mut ring = StagingRing::new(config.staging);
+    let mut ring = StagingRing::new(config.geometry);
     ring.set_frame_epoch(rotor.resume_epoch());
     let at = ring
         .stage(&MutationEffect::StringSet { ns: NS, key: b"post", value: b"torn" })
@@ -120,8 +121,8 @@ fn sealed_volume_with_a_corrupt_frame(
 ) -> (Lsn, Vec<Lsn>) {
     let dirs = create_cell_dirs(fs, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     let mut frame_bases: Vec<Lsn> = Vec::new();
     for i in 0..20u32 {
         let key = format!("k:{i}");
@@ -145,6 +146,7 @@ fn sealed_volume_with_a_corrupt_frame(
 
 #[test]
 fn unattested_hole_in_a_sealed_segment_truncates_and_discards_later_segments() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // ADR-0087 D6 (amends ADR-0031 D4): a validating frame beyond a hole
     // in a *sealed* segment is judged by the same stamp evidence as one
     // in the resume region. A hole exists only if the barrier covering
@@ -153,14 +155,14 @@ fn unattested_hole_in_a_sealed_segment_truncates_and_discards_later_segments() {
     // there, discards every later segment unreplayed, and resumes — the
     // availability refusal ADR-0086 recorded is gone.
     let fs = MemFs::new();
-    let mut config = cfg();
-    config.segment.segment_bytes = 256;
+    let config = cfg_with(SegmentConfig { segment_bytes: 256, ..Default::default() });
     let (victim, frame_bases) = sealed_volume_with_a_corrupt_frame(&fs, &config, 1);
     assert!(victim.offset > 0, "a mid-segment hole: the segment keeps its own prefix");
 
     let mut ks = fresh_keyspace();
-    let (rotor, stats, _) = open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now())
-        .expect("an un-attested hole in sealed slack truncates");
+    let (rotor, stats, _) =
+        open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now(), &census)
+            .expect("an un-attested hole in sealed slack truncates");
     let hole_index = frame_bases.iter().position(|b| *b == victim).expect("victim indexed");
     for (i, _) in frame_bases.iter().enumerate() {
         let key = format!("k:{i}");
@@ -178,7 +180,8 @@ fn unattested_hole_in_a_sealed_segment_truncates_and_discards_later_segments() {
     // the `resume_over_remnants` rule) and the same prefix.
     let mut ks2 = fresh_keyspace();
     let (_, stats2, _) =
-        open_cell_log(fs.clone(), &mut ks2, CELL, &config, anchor(), now()).expect("idempotent");
+        open_cell_log(fs.clone(), &mut ks2, CELL, &config, anchor(), now(), &census)
+            .expect("idempotent");
     assert_eq!(stats2.torn_truncated_at, Some(victim));
     // Only the hole segment's own remnants remain to be discarded.
     let remnants_in_hole_segment = frame_bases
@@ -196,13 +199,13 @@ fn unattested_hole_in_a_sealed_segment_truncates_and_discards_later_segments() {
 
 #[test]
 fn unattested_hole_at_a_sealed_segments_first_frame_resumes_in_the_previous_segment() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // ADR-0087 D6: a hole at offset 0 keeps nothing of its own — the
     // previous data-bearing segment's end is the resume point and the
     // hole's segment is removed like any trailing one (the pristine
     // prealloc invariant, as for a torn tail).
     let fs = MemFs::new();
-    let mut config = cfg();
-    config.segment.segment_bytes = 256;
+    let config = cfg_with(SegmentConfig { segment_bytes: 256, ..Default::default() });
     let (victim, frame_bases) = sealed_volume_with_a_corrupt_frame(&fs, &config, 0);
     assert_eq!(victim.offset, 0);
     let previous_end = data_end_of(
@@ -212,8 +215,9 @@ fn unattested_hole_at_a_sealed_segments_first_frame_resumes_in_the_previous_segm
     );
 
     let mut ks = fresh_keyspace();
-    let (rotor, stats, _) = open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now())
-        .expect("truncates into the previous segment");
+    let (rotor, stats, _) =
+        open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now(), &census)
+            .expect("truncates into the previous segment");
     assert_eq!(stats.torn_truncated_at, Some(previous_end));
     assert_eq!(rotor.active_segment(), SegmentId(0));
     assert_eq!(rotor.append_cursor(), previous_end);
@@ -239,13 +243,13 @@ fn data_end_of(fs: &MemFs, config: &DurableConfig, base: &Lsn) -> Lsn {
 
 #[test]
 fn attested_hole_in_a_sealed_segment_refuses_to_start() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // The other verdict of ADR-0087 D6: frames sealed by a live plane
     // stamp the watermark (`LogBuilder` attests its own base), so a frame
     // in a later segment attests coverage past the corrupted one — the
     // device lost covered data, and boot refuses naming segment 1.
     let fs = MemFs::new();
-    let mut config = cfg();
-    config.segment.segment_bytes = 256;
+    let config = cfg_with(SegmentConfig { segment_bytes: 256, ..Default::default() });
     let mut log = LogBuilder::new(&fs, &config);
     let mut bases = Vec::new();
     for i in 0..20u32 {
@@ -258,7 +262,7 @@ fn attested_hole_in_a_sealed_segment_refuses_to_start() {
     log.poke(victim.segment, victim.offset + FRAME_HEADER_LEN as u32, &[0x55]);
 
     let mut ks = fresh_keyspace();
-    let err = open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now())
+    let err = open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now(), &census)
         .map(|_| ())
         .expect_err("an attested hole in a sealed segment is fail-stop");
     let msg = err.to_string();
@@ -408,17 +412,17 @@ fn v1_frame_at(segment: SegmentId, offset: u32, key: &[u8], value: &[u8]) -> Vec
 
 #[test]
 fn garbage_in_sealed_slack_is_tolerated_and_counted() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // The legitimate end-state of an earlier torn-tail resume: the
     // truncated segment sealed with remnant garbage beyond its data end.
     // It must never fail-stop (that would poison every boot after a
     // benign torn tail) — but it is counted, never silent.
     let fs = MemFs::new();
-    let mut config = cfg();
-    config.segment.segment_bytes = 256;
+    let config = cfg_with(SegmentConfig { segment_bytes: 256, ..Default::default() });
     let dirs = create_cell_dirs(&fs, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     let mut seg0_end = 0u32;
     for i in 0..12u32 {
         let key = format!("k:{i}");
@@ -440,8 +444,9 @@ fn garbage_in_sealed_slack_is_tolerated_and_counted() {
     file.write_at(u64::from(seg0_end) + 3, b"\xBA\xDB\xAD").expect("poke");
 
     let mut ks = fresh_keyspace();
-    let (_rotor, stats, _seed) = open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now())
-        .expect("sealed-slack remnants must not fail the boot");
+    let (_rotor, stats, _seed) =
+        open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now(), &census)
+            .expect("sealed-slack remnants must not fail the boot");
     assert_eq!(stats.sealed_slack_remnants, 1, "remnants counted, never silent");
     assert_eq!(stats.torn_truncated_at, None, "the tail itself is clean");
     assert_eq!(get(&mut ks, b"k:11").as_deref(), Some(&b"vvvvvvvv"[..]));

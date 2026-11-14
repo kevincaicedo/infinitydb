@@ -39,9 +39,9 @@ use inf_foundation::time::Nanos;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    CkptConfig, FRAME_HEADER_LEN, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentConfig,
-    SegmentId, SegmentReader, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs,
-    scan_log_dir, write_manifest,
+    CkptConfig, DEFAULT_STAGING_BYTES, FRAME_HEADER_LEN, LogGeometry, Lsn, Manifest,
+    MutationEffect, NsId, RecordView, SegmentConfig, SegmentId, SegmentReader, SegmentRotor,
+    StagingConfig, StagingRing, create_cell_dirs, scan_log_dir, write_manifest,
 };
 use inf_server::{DurableConfig, RecoverStats, RecoveredManifest, open_cell_log};
 use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StateDigest, StoreConfig, WallAnchor};
@@ -67,6 +67,52 @@ pub fn seed_count(default: u64) -> u64 {
     };
     assert!(seeds > 0, "CRASH_MATRIX_SEEDS must be positive");
     seeds
+}
+
+/// The node-rows runner (`run_node_rows.py`, given it by
+/// `node_rows_execute_and_prove_their_verdicts`) kills a carrier still
+/// running after this many seconds and reads its rows red.
+pub const NODE_CARRIER_LIMIT_SECONDS: u64 = 180;
+
+/// A carrier that passes but ran longer than this reads red too, with its
+/// time. Half the limit: a carrier whose cost grows (more seeds, a slower
+/// core) is named by its budget while the kill is still a core twice as
+/// slow away, and the runner's line per carrier shows the margin left.
+pub const NODE_CARRIER_BUDGET_SECONDS: u64 = NODE_CARRIER_LIMIT_SECONDS / 2;
+
+/// The seeds of a node carrier whose every seed runs a whole scenario: its
+/// pull-request default, and a cap that keeps `CRASH_MATRIX_SEEDS` from
+/// carrying it past the runner's budget. Built in a `const`, so a default
+/// past its cap, or a zero cost, is a compile error.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeSeeds {
+    default: u64,
+    max: u64,
+}
+
+impl NodeSeeds {
+    /// `seed_cost_ms_slowest` is one seed's cost on the slowest core the
+    /// carrier was timed on. The cap is the seeds that fill half the budget
+    /// at that cost, rounded down, so a core twice as slow still finishes
+    /// inside the budget.
+    pub const fn new(default: u64, seed_cost_ms_slowest: u64) -> Self {
+        let max = NODE_CARRIER_BUDGET_SECONDS * 1_000 / 2 / seed_cost_ms_slowest;
+        assert!(default > 0, "a node carrier runs at least one seed");
+        assert!(default <= max, "a node carrier's default seed count is past its cap");
+        Self { default, max }
+    }
+
+    /// `seed_count(default)` capped; a run the cap shortened says so.
+    pub fn count(self) -> u64 {
+        let seeds = seed_count(self.default);
+        if seeds > self.max {
+            eprintln!(
+                "crash matrix: {seeds} seeds requested, {} run (the carrier's cap)",
+                self.max
+            );
+        }
+        seeds.min(self.max)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -205,12 +251,24 @@ pub fn workload(name: &str) -> Workload {
     }
 }
 
+/// The matrix's geometry for `segment`: a staging ring no larger than one
+/// segment, `min(4 MiB, segment_bytes)`, so every frame it seals fits (the
+/// harness rule, ADR-0191). A row that needs a smaller ring names its own.
+///
+/// # Panics
+/// If the pair is not a legal log geometry — a wrong literal fails the row
+/// at construction.
+#[must_use]
+pub fn geometry(segment: SegmentConfig) -> LogGeometry {
+    let staging = StagingConfig::with_capacity(segment.segment_bytes.min(DEFAULT_STAGING_BYTES));
+    LogGeometry::new(staging, segment).expect("a crash-matrix log geometry")
+}
+
 #[must_use]
 pub fn config(segment_bytes: u32) -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes, ..Default::default() },
+        geometry: geometry(SegmentConfig { segment_bytes, ..Default::default() }),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -223,16 +281,20 @@ pub fn config(segment_bytes: u32) -> DurableConfig {
 
 #[must_use]
 pub fn fresh_keyspace(policy: FsyncClass) -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(policy),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"ledger".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(policy),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("ns");
     ks
 }
@@ -297,8 +359,8 @@ pub fn run_workload(
     let cfg = config(wl.segment_bytes);
     let dirs = create_cell_dirs(fs, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.segment).expect("rotor");
-    let mut ring = StagingRing::new(cfg.staging);
+        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.geometry).expect("rotor");
+    let mut ring = StagingRing::new(cfg.geometry);
     let mut rng = SplitMix64::new(seed | 1);
     let mut out = RunOutcome::default();
 
@@ -556,7 +618,15 @@ pub fn reference_replay(fs: &MemFs, class: FsyncClass) -> StateDigest {
         let outcome = reader.apply_frames(|frame| {
             for record in frame.records() {
                 let (_, record) = record.expect("valid record in valid frame");
-                ks.apply_record(&record, now(), anchor(), &mut inf_store::NoSpill).expect("apply");
+                inf_store::drive_record(
+                    &mut ks,
+                    &record,
+                    now(),
+                    anchor(),
+                    &mut inf_store::NoSpill,
+                    u64::MAX,
+                )
+                .expect("apply");
             }
             Ok::<(), std::convert::Infallible>(())
         });
@@ -579,9 +649,10 @@ pub struct Recovered {
 
 #[must_use]
 pub fn recover(fs: &MemFs, class: FsyncClass, segment_bytes: u32) -> Recovered {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace(class);
     let (rotor, stats, unit) =
-        open_cell_log(fs.clone(), &mut ks, CELL, &config(segment_bytes), anchor(), now())
+        open_cell_log(fs.clone(), &mut ks, CELL, &config(segment_bytes), anchor(), now(), &census)
             .expect("matrix rows recover; fail-stop rows assert separately");
     let resume = Lsn::new(rotor.active_segment(), rotor.active_written());
     let digest = ks.state_digest(now());

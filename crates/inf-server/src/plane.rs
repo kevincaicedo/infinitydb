@@ -23,9 +23,11 @@
 //!   reply has been emitted (a pipeline barrier).
 //! - **Cross-cell vocabulary** (M0-experimental `Apply`, reshaped by M4):
 //!   single-owner commands ship as `Op::Apply { cmd: protocol, args: argv }`
-//!   and return the owner's raw RESP reply (`Outcome::Bytes`) — byte-exact
-//!   by construction. `DEL`/`EXISTS` (the only multi-key M0 commands) split
-//!   per key and aggregate typed `Outcome::Int` replies.
+//!   and return the owner's raw RESP reply — byte-exact by construction —
+//!   as `Outcome::Bytes` or `Outcome::ErrorReply`, tagged from the reply's
+//!   outcome, never from its bytes (ADR-0190 D3). `DEL`/`EXISTS` (the
+//!   only multi-key M0 commands) split per key and aggregate typed
+//!   `Outcome::Int` replies.
 //! - **Observer seam**: every apply point (local execution, and the owner
 //!   side of a remote `Apply`) reports `(argv, reply, now)` — `inf-sim`'s
 //!   linearizability oracle hangs off this; [`NoopObserver`] monomorphizes
@@ -53,17 +55,18 @@ use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
 use inf_runtime::GroupClass;
 use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoClass, IoOp,
-    Issue, LoopCx, RawFd, TokenClass, WaitList,
+    Issue, LoopCx, OwnerPhase, RawFd, TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
 use inf_store::{
-    CellStore, EvictBudget, ExpiryBudget, Keyspace, LogFullImage, NsId, NsMode, SlotRouter,
-    WallAnchor,
+    CellStore, EvictBudget, ExpiryBudget, Keyspace, KeyspaceSeed, LogFullImage, NsId, NsMode,
+    SlotRouter, WallAnchor,
 };
 use inf_wire::{
-    ArgvRef, CmdFlags, CommandId, ConnParser, Parsed, ParserLimits, Protocol, RespWriter, arity_ok,
-    extract_keys, lookup,
+    ArgvRef, CmdFlags, CommandId, ConnParser, ErrorPassthrough, OpenReply, OwnedReply, Parsed,
+    ParserLimits, Protocol, ReplyBuf, ReplyOutcome, ReplyStream, RespWriter, SuccessView,
+    ZeroByteReply, arity_ok, extract_keys, lookup,
 };
 
 #[cfg(test)]
@@ -71,24 +74,39 @@ use inf_wire::{
 mod cache_boot_tests;
 mod cell_loop;
 mod conn;
+mod credit;
 mod dispatch;
 mod fabric;
 mod ns_ddl;
 mod publish;
 mod pumps;
 mod scatter;
+#[cfg(test)]
+#[path = "seed_tests.rs"]
+mod seed_tests;
 mod shared;
 mod tiered;
+mod timers;
+// The owner split's one caller is the JSON gather, so both carry its feature.
+#[cfg(feature = "doc")]
+mod json_gather;
+#[cfg(feature = "doc")]
+mod split;
 
 pub use conn::OwnedOutcome;
-use conn::{ACCEPT_RETRY, ACCEPT_RETRY_TIMER_KEY, CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
+use conn::{CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
+use credit::{FanLegs, FanReserve, PlaneFabric, PointOp, PubFanArgv};
+pub use credit::{MeshConfigRefused, checked_mesh_config};
 use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
 use fabric::{
     GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op,
-    parse_stageable, stage_argv_block_argv, stage_or_handle, strip_single_element,
+    parse_stageable, stage_argv_block_argv, stage_or_handle, staged_outcome, wire_reply,
 };
+#[cfg(feature = "doc")]
+pub use json_gather::parse_json_mget_leg;
 use ns_ddl::{
-    SendNow, dispatch_ns, program_ckpt, program_ns_ddl, send_apply, send_apply_ns, try_send_apply,
+    SendNow, dispatch_ns, program_ckpt, program_ns_ddl, send_apply, send_apply_ns, send_fan_leg,
+    try_send_apply,
 };
 use publish::{
     dispatch_pubsub, enforce_output_cap, flush_sub_deltas, handle_pubsub_apply, owner_pub_pump,
@@ -96,25 +114,39 @@ use publish::{
 };
 use pumps::{compact_pump, ns_apply_pump, shadow_pump};
 use scatter::{
-    CountedFold, ScatterScope, error_reply, extract_keys_iter, extract_keys_slices, int_reply,
-    keyspace_level, ns_dbsize_local, parse_publisher_tag, peer_cells, program_keys, program_move,
-    program_msetnx, program_randomkey, program_scan, return_error, run_local, simple_reply,
-    stages_despite_error, u64_decimal,
+    CROSS_CELL_EXECUTION_FAILED, CountedFold, ScatterScope, error_reply, extract_keys_iter,
+    extract_keys_slices, int_reply, keyspace_level, ns_dbsize_local, parse_publisher_tag,
+    peer_cells, program_keys, program_move, program_msetnx, program_randomkey, program_scan,
+    read_array_leg, run_local, simple_reply, stages, u64_decimal,
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
-use shared::{DurableAdmission, NsApplyOutcome, handle_ns_apply, tier_to_fan};
+use shared::{DurableAdmission, NsApplyOutcome, apply_drop, handle_ns_apply, tier_to_fan};
+
+/// ADR-0189 D4's fail-stop: a namespace change `META` holds that this cell
+/// cannot apply, or a leg the origin reads as refused. A cell left on the
+/// old value would serve and export it, so the node stops with
+/// [`EXIT_DURABLE_FAILSTOP`](crate::EXIT_DURABLE_FAILSTOP), the stderr line
+/// naming the arm; the boot serves `META`'s value on every cell.
+fn ddl_fail_stop(arm: &str, detail: &str) -> ! {
+    eprintln!("namespace DDL {arm} failed (fail-stop): {detail}");
+    std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
+}
+pub(crate) use timers::DurableTimers;
+use timers::ServerTimers;
+pub use timers::{TimerAssemblyError, TimerRole};
 
 use crate::control::{
     BoardSweep, CellIssuer, CheckpointEpoch, CkptFinalCredit, CkptQuota, ControlHandle,
     IssuerRefused, RecoveryBoard,
 };
-use crate::durable::{DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
+use crate::durable::{DrainHold, DurableCell, DurableConfig};
 #[cfg(feature = "doc")]
 use crate::exec::DocLogAdmission;
 use crate::exec::{
-    ConnCx, ConnNamespace, NodeInfo, TIER_FLUSH_GAUGES, TierFlushGauge, execute, execute_slices,
-    stall_request, unavailable_default_allows,
+    COLD_GAUGES, ColdGauge, ConnCx, ConnNamespace, NodeInfo, TIER_FLUSH_GAUGES, TierFlushGauge,
+    execute, execute_slices, stall_request, unavailable_default_allows,
 };
+use crate::limits::ACCEPT_RETRY;
 use crate::pubsub::{self, PubSubCell, SubKind};
 use crate::recover::{RecoverPhase, Recovery, RecoveryProgress};
 
@@ -175,8 +207,8 @@ pub(super) struct Conn {
     fd: RawFd,
     parser: ConnParser,
     cx: ConnCx,
-    /// Staged reply bytes awaiting RESPOND.
-    out: Vec<u8>,
+    /// Staged reply bytes awaiting RESPOND, one reply opened at a time.
+    out: ReplyStream,
     /// One in-flight Send max: two outstanding sends on one socket have no
     /// kernel ordering guarantee.
     send_inflight: bool,
@@ -220,7 +252,7 @@ pub(super) struct GatedReply {
     to: CellId,
     token: FabricToken,
     seq: u64,
-    reply: Vec<u8>,
+    reply: OwnedReply,
 }
 
 #[allow(clippy::disallowed_types, reason = "container: E")]
@@ -238,7 +270,7 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// injected-clock instant (fabric service continues — deadlock safety).
     stall_until: Cell<Nanos>,
     store: RefCell<Keyspace>,
-    fabric: RefCell<CellFabric>,
+    fabric: RefCell<PlaneFabric>,
     conns: RefCell<ConnSlab>,
     gate: FabricGate<OwnedOutcome>,
     credit_waiters: WaitList<CellId>,
@@ -292,6 +324,10 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// queue preserves per-publisher delivery order across fan-outs).
     pub_queue: RefCell<VecDeque<OwnerPub>>,
     pub_pump_active: Cell<bool>,
+    /// The cell's one publish-fan reserve (ADR-0192 D3): parked here while
+    /// no owner pump runs; the pump takes it at its start and puts it back
+    /// in the step that clears `pub_pump_active`.
+    fan_reserve: Cell<Option<FanReserve>>,
     /// The connection knobs (ADR-0123 D5): `maxclients` share, `timeout`,
     /// `tcp-keepalive`, both output-buffer classes — read at assembly,
     /// refreshed by the MAINTAIN config sweep.
@@ -312,16 +348,6 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// (a tiered namespace is a configuration of `MODE durable` —
     /// ADR-0062 D1); inner state stays empty until one materializes.
     tier: RefCell<Option<crate::tier_cell::TierCell<F>>>,
-    /// Dropped tiered namespaces whose tier files wait for the catalog
-    /// swap that drops them (ADR-0100 D5): `(ns, epoch)` recorded on the
-    /// origin, before that swap, by the DROP program or a `CREATE`
-    /// rollback, and on a peer, after it, by the `INF.NSFAN DROP` apply
-    /// (ADR-0186 D1). A fault-injected stop at `ns_drop_before_meta`
-    /// records `u64::MAX`, an epoch no swap reaches, so those files hold
-    /// until the restart. Consumed by `TierCell::sync_namespaces`, which
-    /// parks the tier files on the entry's epoch. Bounded by DDL rate —
-    /// one entry per drop, consumed at the next MAINTAIN.
-    ns_drop_releases: RefCell<Vec<(NsId, u64)>>,
     /// Fabric-origin tiered applies (M4-S26): per-origin FIFO queues. A
     /// tiered apply can suspend on a cold read, so it cannot run inside
     /// the synchronous FABRIC-IN drain — each origin's applies run on
@@ -544,8 +570,9 @@ pub struct ServerPlane<
     started: bool,
     /// Recv completions staged from step 1 for PARSE+EXECUTE (step 3+4).
     inbox: Vec<(ConnKey, BufferId, u32)>,
-    /// Reusable FABRIC-IN scratch: owner-side reply bytes for this drain.
-    reply_scratch: Vec<u8>,
+    /// Reusable FABRIC-IN scratch: owner-side reply bytes for this drain,
+    /// one reply opened per op it answers.
+    reply_scratch: ReplyStream,
     /// Fabric-apply prefetch batch (reused across FABRIC-IN steps).
     apply_stage: Vec<StagedApply>,
     apply_stage_bytes: Vec<u8>,
@@ -568,10 +595,10 @@ pub struct ServerPlane<
     /// Last CONFIG-store version pushed into the keyspace (M1-E3
     /// `hot-per-cell` sweep — one u64 compare per MAINTAIN, no re-parse).
     config_pushed: u64,
-    /// The everysec wheel key was armed (M2-S05; once per plane).
-    everysec_armed: bool,
-    /// An accept-retry wheel key is pending (F-L11-02: at most one).
-    accept_retry_armed: bool,
+    /// The cell's timer owners, one per role (ADR-0154 D4), reserved by
+    /// `new` before the loop exists: the accept retry's, and the durable
+    /// roles' until the durable plane takes them.
+    timers: ServerTimers,
     /// Accepted fds are TCP sockets (`infinityd`, the e2e harness): the
     /// plane sets `tcp-keepalive` on them (ADR-0123 D3). The DST models
     /// no TCP stack and leaves this off.
@@ -625,10 +652,14 @@ struct BootRecovery<F: SegmentFs> {
 /// An owner-side reply produced during the FABRIC-IN drain (ranges index
 /// into the reply scratch buffer).
 enum StagedReply {
-    Bytes(usize, usize),
+    /// A reply's bytes in the drain's scratch with its outcome, read from
+    /// the reply's writer, never chosen (ADR-0190 D2).
+    Bytes(usize, usize, ReplyOutcome),
     Int(i64),
     Nil,
-    /// The adopt ack (ADR-0128): returns the origin's credit, nothing else.
+    /// The adopt ack (ADR-0128), or an applied namespace DDL leg
+    /// (ADR-0189 D5): its variant is all it carries, and it returns the
+    /// origin's credit.
     Ok,
     /// Typed refusal for an op the M0 plane does not speak.
     Refused,
@@ -649,6 +680,26 @@ pub enum StopPhase {
     Drained,
 }
 
+/// What a cell's stop waits on (ADR-0199 D3): the wait the drain's last
+/// MAINTAIN step returned from. Every wait of the drive names its variant,
+/// so a stop that cannot end says why, beside its phase.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StopHold {
+    /// Connections still flushing and closing.
+    Connections { live: usize },
+    /// This cell is `Quiet`; the assembly has not yet seen every cell
+    /// `Quiet` ([`ServerPlane::finish_stop`]).
+    NodeQuiet,
+    /// The stop checkpoint of this epoch is not yet published on the
+    /// cell's board slot.
+    StopCheckpoint { epoch: u64 },
+    /// The final sync was requested in this step.
+    FinalSyncRequested,
+    /// The durable cell is not quiescent: the first of its terms that
+    /// holds it.
+    Durable(DrainHold),
+}
+
 /// The drain's own state (one `Option` check per MAINTAIN while serving).
 struct StopDrive {
     phase: StopPhase,
@@ -659,6 +710,9 @@ struct StopDrive {
     /// The stop checkpoint (ADR-0159 D3).
     checkpoint: StopCheckpoint,
     final_sync_requested: bool,
+    /// The wait the last step returned from; `None` before the first step
+    /// and once `Drained`.
+    hold: Option<StopHold>,
 }
 
 /// A stop's checkpoint (ADR-0159 D3): the cell's final credit until the
@@ -671,29 +725,68 @@ enum StopCheckpoint {
     Requested(CheckpointEpoch),
 }
 
+/// Why [`ServerPlane::new`] built no plane: nothing was written to its
+/// node, and what was built dropped while the census assembles.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PlaneBuildError {
+    /// The keyspace's seed was refused (ADR-0189 D4): a catalog the seeding
+    /// refuses, a spec refused, or a seeded table's build refused.
+    Seed(inf_store::NsError),
+    /// The timer assembly was refused.
+    Timers(TimerAssemblyError),
+}
+
+impl core::fmt::Display for PlaneBuildError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            // A refused seed is the boot's error, and its text is the
+            // refusal's `Debug`, which names the variant and its fields.
+            PlaneBuildError::Seed(refused) => write!(f, "{refused:?}"),
+            PlaneBuildError::Timers(refused) => write!(f, "{refused}"),
+        }
+    }
+}
+
+impl std::error::Error for PlaneBuildError {}
+
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// `listener` must be a listening fd this plane's driver will own.
-    /// Returns the plane and its cell's serve mark: the cap census is built
-    /// here, once, with `cell`, and the host hands the mark to the cell's
-    /// loop, which takes it as its first iteration begins (ADR-0163 D2).
+    /// Returns the plane, its cell's serve mark and its cell's timer set:
+    /// the cap census is built here, once, with `cell`; then on it the
+    /// keyspace from `seed` ([`KeyspaceSeed::build`], its one builder), so
+    /// every capped store of the cell registers on that census; then the set
+    /// and the server's timer owners (`ServerTimers::build`, their one
+    /// constructor), before anything is written to `node`; the plane keeps
+    /// the owners. The host hands the mark and the set to the cell's loop,
+    /// which takes the mark as its first iteration begins (ADR-0163 D2,
+    /// ADR-0154 D1, ADR-0189 D4).
+    ///
+    /// # Errors
+    /// The seed's refusal or the timer assembly's: no plane, `node`
+    /// unwritten, and what was built dropped while the census assembles.
+    /// The timer assembly's is derived never on a correct build but for the
+    /// allocator's refusal.
     #[allow(clippy::too_many_arguments)] // construction-time wiring, not an API surface
     #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new(
         cell: CellId,
         cells: u16,
         listener: RawFd,
-        store: Keyspace,
+        seed: KeyspaceSeed,
         fabric: CellFabric,
         node: Rc<NodeInfo>,
         observer: O,
         route_local_only: bool,
-    ) -> (ServerPlane<O, F>, ServeMark) {
+    ) -> Result<(ServerPlane<O, F>, ServeMark, TimerSet), PlaneBuildError> {
+        let (census, serve_mark) = CapCensus::new(cell);
+        let store = seed.build(&census).map_err(PlaneBuildError::Seed)?;
+        let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
         node.cell.set(cell.0);
         node.cells.set(cells);
-        let (census, serve_mark) = CapCensus::new(cell);
         node.cap_census.replace(Some(Rc::clone(&census)));
         // ADR-0123 D5: the connection knobs before the first accept.
         let knobs = crate::config::conn_knobs(&node.config.borrow(), cells);
+        let (fabric, fan_reserve) = PlaneFabric::new(fabric);
         let plane = ServerPlane {
             shared: Rc::new(Shared {
                 cell,
@@ -726,12 +819,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 pubsub: RefCell::new(PubSubCell::new(cells)),
                 pub_queue: RefCell::new(VecDeque::new()),
                 pub_pump_active: Cell::new(false),
+                fan_reserve: Cell::new(Some(fan_reserve)),
                 knobs: Cell::new(knobs),
                 parser_limits: Cell::new(ParserLimits::default()),
                 durable: RefCell::new(None),
                 census,
                 tier: RefCell::new(None),
-                ns_drop_releases: RefCell::new(Vec::new()),
                 ns_applies: RefCell::new((0..cells).map(|_| VecDeque::new()).collect::<Vec<_>>()),
                 ns_pump_active: RefCell::new(vec![false; usize::from(cells)]),
                 pump_gated: RefCell::new(VecDeque::new()),
@@ -756,7 +849,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             listener,
             started: false,
             inbox: Vec::new(),
-            reply_scratch: Vec::new(),
+            reply_scratch: ReplyStream::new(Vec::new()),
             apply_stage: Vec::new(),
             apply_stage_bytes: Vec::new(),
             parse_stage: Vec::new(),
@@ -766,8 +859,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             expiry_lag: 0,
             // MAX forces one push on the first MAINTAIN (boot-time config).
             config_pushed: u64::MAX,
-            everysec_armed: false,
-            accept_retry_armed: false,
+            timers,
             tcp_transport: false,
             ckpt_epoch_seen: 0,
             early_fabric_flush: false,
@@ -779,7 +871,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             stop: None,
             stop_checkpoint: true,
         };
-        (plane, serve_mark)
+        Ok((plane, serve_mark, timer_set))
     }
 
     /// Starts loop-resident boot recovery (M2-S15): the cell serves from
@@ -804,7 +896,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.boot = Some(BootRecovery {
             // Loop-resident boots defer boot-metadata fsyncs into driver
             // barriers (M2.5-S01): ready never blocks on the device.
-            rec: Recovery::new(fs.clone(), cell_id, cfg, anchor, now).deferred_boot_sync(),
+            rec: Recovery::new(
+                fs.clone(),
+                cell_id,
+                cfg,
+                anchor,
+                now,
+                Rc::clone(&self.shared.census),
+            )
+            .deferred_boot_sync(),
             fs,
             cfg: cfg.clone(),
             cell_id,
@@ -885,17 +985,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         // (M4-S26; ADR-0057 D6): the flush pipeline
                         // resumes with the manifested catalog and the
                         // cold-read table inherits the boot-opened fds.
-                        if !recovered_tiers.is_empty() {
-                            let ks = self.shared.store.borrow();
-                            let mut tier = self.shared.tier.borrow_mut();
-                            let tier = tier.as_mut().expect("enable_durable built tier state");
-                            for rt in recovered_tiers {
-                                let spec = ks
-                                    .ns_get_by_id(rt.ns)
-                                    .and_then(|spec| spec.tier)
-                                    .expect("recovered namespace carries a tier block");
-                                tier.install_recovered(rt.ns, &spec, rt.flush, rt.files);
-                            }
+                        if let Err(err) = self.install_recovered_tiers(recovered_tiers) {
+                            self.boot_error = Some(err);
+                            return;
                         }
                         // Boot-metadata durability rides driver barriers at
                         // the head of the commit ledger (M2.5-S01): every
@@ -904,6 +996,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         // waiting on the device.
                         if let Some(cell) = self.shared.durable.borrow_mut().as_mut() {
                             cell.arm_boot_barriers(cx, barrier_dirs);
+                            // The durable plane exists from here: its tick
+                            // starts, once (ADR-0154 D4).
+                            cell.arm_everysec(cx);
                         }
                         self.shared
                             .node
@@ -927,6 +1022,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         if let Some(board) = &self.loading_board {
                             let slot = board.slot(boot.cell_id);
                             slot.publish_tier_replay(stats.tier_replay);
+                            slot.publish_step_facts(stats.step);
                             slot.mark_ready(
                                 stats.ckpt_records + stats.records_applied,
                                 stats.torn_truncated_at,
@@ -950,14 +1046,54 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
     }
 
+    /// Installs every recovered tiered namespace's owner at the position the
+    /// node's directory names Declared for it (ADR-0148 D2, D5), before the
+    /// cell serves. The writer seeded the directory from the same catalog
+    /// the store recovered, so a refusal is a boot error, never a guess.
+    fn install_recovered_tiers(
+        &mut self,
+        recovered: Vec<crate::recover::RecoveredTierNs<F>>,
+    ) -> std::io::Result<()> {
+        if recovered.is_empty() {
+            return Ok(());
+        }
+        let ks = self.shared.store.borrow();
+        let mut tier = self.shared.tier.borrow_mut();
+        let tier = tier.as_mut().expect("enable_durable built tier state");
+        for rt in recovered {
+            let spec = ks
+                .ns_get_by_id(rt.ns)
+                .and_then(|spec| spec.tier)
+                .expect("recovered namespace carries a tier block");
+            let permit = tier.admit_install(rt.ns).map_err(|refused| {
+                std::io::Error::other(format!(
+                    "the recovered tiered namespace {} has no grant this cell can install \
+                     ({refused:?})",
+                    rt.ns.0
+                ))
+            })?;
+            tier.install_recovered(permit, &spec, rt.flush, rt.files);
+        }
+        Ok(())
+    }
+
     /// Enables the durable plane for this cell (M2-S08/S10/S11): the
     /// assembly runs recovery first (`recover::open_cell_log`) and hands
     /// the tail-opened rotor plus the recovered manifest here, before the
     /// loop starts. `cell_id` names the shard directory the checkpoint and
-    /// manifest drivers write under.
+    /// manifest drivers write under. `cfg` is the configuration `rotor` was
+    /// recovered under (`begin_recovery` stores that one value): the cell
+    /// builds its staging ring from `cfg.geometry`, and a frame the ring
+    /// seals fits the rotor's segment only because both come from that one
+    /// geometry (ADR-0191 D4).
+    ///
+    /// The durable plane takes the plane's three durable timer owners
+    /// (everysec, fill hold, group hold), which it holds for the cell's life.
     ///
     /// # Errors
-    /// Checkpoint-directory scan failure (boot-time listing).
+    /// Checkpoint-directory scan failure (boot-time listing), with the
+    /// owners handed back to the plane; a second enable, which no caller
+    /// makes, finds them taken.
     pub fn enable_durable(
         &mut self,
         fs: F,
@@ -966,14 +1102,33 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         rotor: SegmentRotor<F>,
         recovered: Option<crate::RecoveredManifest>,
     ) -> std::io::Result<()> {
+        let Some(owners) = self.timers.durable.take() else {
+            return Err(std::io::Error::other("the durable plane is enabled once"));
+        };
         let shard_dir = cfg.data_dir.join(format!("shard-{cell_id}"));
         let ckpt_dir = shard_dir.join("ckpt");
-        let ckpt = crate::ckpt::CkptCell::new(fs.clone(), ckpt_dir.clone(), cell_id, cfg.ckpt)?;
+        let ckpt = match crate::ckpt::CkptCell::new(fs.clone(), ckpt_dir.clone(), cell_id, cfg.ckpt)
+        {
+            Ok(ckpt) => ckpt,
+            Err(err) => {
+                self.timers.durable = Some(owners);
+                return Err(err);
+            }
+        };
+        // The cell's tiered grants (ADR-0148 D2): the node's directory and
+        // this cell's receipts, from the catalog writer's control plane; a
+        // cell with none installs no tiered owner.
+        let grants = self.shared.control.borrow().as_ref().and_then(|control| {
+            let receipts = control.take_tier_receipts(cell_id)?;
+            let directory = Arc::clone(control.tier_directory());
+            Some(crate::tier_cell::CellGrants::new(directory, receipts))
+        });
         *self.shared.tier.borrow_mut() = Some(crate::tier_cell::TierCell::new(
             fs.clone(),
             u32::from(cell_id),
             shard_dir.clone(),
             Rc::clone(&self.shared.census),
+            grants,
         ));
         let manifest = crate::ckpt::ManifestCell::new(
             fs,
@@ -987,17 +1142,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             }),
         );
         *self.shared.durable.borrow_mut() =
-            Some(DurableCell::new(cfg, rotor, ckpt, manifest, &self.shared.census));
+            Some(DurableCell::new(cfg, rotor, ckpt, manifest, &self.shared.census, owners));
         Ok(())
     }
 
-    /// The tiered MAINTAIN half (M4-S26): reconcile the namespace set,
-    /// run the per-namespace drivers (demote → the round's advance →
-    /// release, admission cadence, extent reclaim, retirement unlink),
-    /// then the cell's one turn (the plan pass and the issue pass, which
-    /// offer the round's groups to the device budget — ADR-0178 D3's
-    /// tier row), spawn compaction read chains, tear down dropped
-    /// namespaces, and drain queued cold-read intents into
+    /// The tiered MAINTAIN half (M4-S26): the directory pass (a receipt
+    /// for each grant Retiring that this cell never held, ADR-0148 D3), the
+    /// per-namespace drivers of every Live owner (demote → the round's
+    /// advance → release, admission cadence, extent reclaim, retirement
+    /// unlink), then the cell's one turn (the plan pass and the issue pass,
+    /// which offer the round's groups to the device budget — ADR-0178 D3's
+    /// tier row), spawn compaction read chains, drain the dropped
+    /// namespaces' owners, and drain queued cold-read intents into
     /// `IoOp::TierRead`s — once per reactor iteration (the S10 admission
     /// rule). Zero-cost when no tiered namespace was ever created: one
     /// `None` check.
@@ -1024,13 +1180,21 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let cold = {
             let mut tier_slot = self.shared.tier.borrow_mut();
             let Some(tier) = tier_slot.as_mut() else { return };
-            tier.sync_namespaces(
-                &self.shared.store.borrow(),
-                &mut self.shared.ns_drop_releases.borrow_mut(),
-            );
-            if tier.namespaces.is_empty() && tier.cold.is_none() {
+            tier.directory_pass();
+            if tier.positions_held() == 0 && tier.cold.is_none() {
                 return;
             }
+            // F3: a cell's store holds a tiered table iff its position is
+            // Live with that id; both change in one step of each apply.
+            debug_assert!(
+                {
+                    let ks = self.shared.store.borrow();
+                    let tables = ks.ns_iter().filter(|spec| spec.tier.is_some()).count();
+                    tables == tier.live_count()
+                        && tier.live().all(|t| ks.tiered_store(t.ns).is_some())
+                },
+                "a tiered table without its Live owner, or an owner without its table"
+            );
             // The durable plane is read, never borrowed mutably, while the
             // namespaces' drivers run: each tick of the reclaim marks reads
             // its staged seq, its watermark and ack classes in this step.
@@ -1040,7 +1204,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let mut units = 0u32;
             let mut fatal: Option<String> = None;
             let now_us = cx.now.as_micros();
-            for at in 0..tier.namespaces.len() {
+            for at in 0..tier.live_count() {
                 match tier.maintain_ns(&mut ks, at, durable.as_ref(), transition_idle, now_us) {
                     Ok((used, work)) => {
                         units += used;
@@ -1075,7 +1239,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // M4.5-S37 (ADR-0093 D4): the shadow reconciler's reads —
             // oldest winner first, bounded per table, Foreground once
             // the pinned suffix crosses half its cap.
-            for t in &tier.namespaces {
+            for t in tier.live() {
                 if let Some(table) = ks.tiered_store_mut(t.ns) {
                     let reads = table.shadow_work(inf_store::SHADOW_READS_IN_FLIGHT);
                     shadow_reads.extend(reads.into_iter().map(|read| (t.ns, read)));
@@ -1084,9 +1248,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // ADR-0100 D5: a dropped namespace's files unlink only once
             // the catalog swap carrying the drop is durable.
             let control = self.shared.control.borrow().clone();
-            units += tier.maintain_teardown(|epoch| {
-                control.as_ref().is_none_or(|control| control.persisted(epoch))
-            });
+            let durable = self.shared.durable.borrow();
+            units += tier.maintain_draining(
+                |epoch| control.as_ref().is_none_or(|control| control.persisted(epoch)),
+                |fence| durable.as_ref().is_none_or(|cell| cell.commit.settled_through(fence)),
+            );
+            drop(durable);
             if units > 0 {
                 cx.charge(GroupClass::Maintenance, units);
             }
@@ -1098,11 +1265,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             }
             // Reactor-drive flush observables (M4.5-S31, ADR-0084 D6).
             let stats = &tier.flush_stats;
-            let files_sealed: u64 =
-                tier.namespaces.iter().map(|t| t.flush.sealed().len() as u64).sum();
+            let files_sealed: u64 = tier.live().map(|t| t.flush.sealed().len() as u64).sum();
             let mut gauges = [0u64; TIER_FLUSH_GAUGES];
-            let files_active =
-                tier.namespaces.iter().filter(|t| t.flush.active().is_some()).count() as u64;
+            let files_active = tier.live().filter(|t| t.flush.active().is_some()).count() as u64;
             for (slot, value) in [
                 (TierFlushGauge::Rounds, stats.rounds),
                 (TierFlushGauge::WriteRetries, stats.write_retries),
@@ -1118,10 +1283,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 (TierFlushGauge::PlanWaits, stats.plan_waits),
                 (TierFlushGauge::TurnContended, stats.turn_contended),
                 (TierFlushGauge::RoundsPlanned, stats.rounds_planned),
+                (TierFlushGauge::FileIdsExhausted, stats.file_ids_exhausted),
             ] {
                 gauges[slot as usize] = value;
             }
             self.shared.node.tier_flush.set(gauges);
+            let (capacity, written) = tier.window_bytes();
+            self.shared.node.tier_window_capacity_bytes.set(capacity);
+            self.shared.node.tier_window_written_bytes.set(written);
+            self.shared.node.tier_ns_positions.set(tier.positions_held());
+            self.shared.node.tier_position_conflicts.set(tier.position_conflicts());
             tier.cold.clone()
         };
         // Reactor-drive flush ops (M4.5-S31): pushed outside the tier
@@ -1207,6 +1378,22 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 counters.pool_dry,
                 counters.queue_full,
             ]);
+            let (members, windows) = cold.delivery_pending();
+            let mut gauges = [0u64; COLD_GAUGES];
+            for (slot, value) in [
+                (ColdGauge::DeliveryWork, counters.delivery_work),
+                (ColdGauge::DeliveryWorkTurnMax, u64::from(counters.delivery_work_turn_max)),
+                (ColdGauge::DeliveryPendingMembers, members),
+                (ColdGauge::DeliveryPendingWindows, windows),
+                (ColdGauge::DeliveryDelayP99Us, cold.delivery_delay_percentile_us(99.0)),
+                (ColdGauge::ReceiptsForeign, counters.receipts_foreign),
+                (ColdGauge::LinksStale, counters.links_stale),
+                (ColdGauge::IdentityExhausted, cold.identity_refusals()),
+                (ColdGauge::IdentityPairsUsed, cold.identity_pairs_used()),
+            ] {
+                gauges[slot as usize] = value;
+            }
+            self.shared.node.cold.set(gauges);
         }
     }
 
@@ -1241,6 +1428,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             return Err(IssuerRefused { plane, mismatch, issuer });
         }
         *self.shared.node.memory_board.borrow_mut() = Some(Arc::clone(control.memory_board()));
+        *self.shared.node.ddl_gauges.borrow_mut() = Some(Arc::clone(control.ddl_gauges()));
         *self.shared.control.borrow_mut() = Some(control);
         *self.shared.ckpt_quota.borrow_mut() = Some(issuer.quota);
         self.final_credit = Some(issuer.final_credit);
@@ -1273,6 +1461,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// between scheduler steps.
     pub fn ckpt_waiters_for_sim(&self) -> usize {
         self.shared.ckpt_waiters.waiting()
+    }
+
+    /// Cold-read members this cell's turns have yet to visit (its cold
+    /// host's pending delivery; 0 on a cell with no cold host), for the
+    /// simulator's park test: used only between scheduler steps.
+    pub fn cold_pending_for_sim(&self) -> u64 {
+        let tier = self.shared.tier.borrow();
+        tier.as_ref().and_then(|t| t.cold.as_ref()).map_or(0, |cold| cold.delivery_pending().0)
     }
 
     /// Wires this plane's slot of the doorbell-wakeup park board (the same
@@ -1318,7 +1514,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
         let mut fabric = shared.fabric.borrow_mut();
         let token = fabric.next_token();
-        if fabric.send(to, &Op::AdoptConn { token, fd }).is_err() {
+        // A general send: a refusal, the reserve's included, keeps the
+        // socket local, as a peer without credit always did.
+        if fabric.stage_general(to, &PointOp::adopt_conn(token, fd)).is_err() {
             return false;
         }
         shared.adopt_acks.borrow_mut().push(token.0);
@@ -1371,7 +1569,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 node: Rc::clone(&self.shared.node),
                 close_requested: Cell::new(false),
             },
-            out: Vec::new(),
+            out: ReplyStream::new(Vec::new()),
             send_inflight: false,
             closing: false,
             close_after_flush: false,
@@ -1467,6 +1665,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 finish: false,
                 checkpoint,
                 final_sync_requested: false,
+                hold: None,
             });
         }
     }
@@ -1487,6 +1686,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.stop.as_ref().map_or(StopPhase::Serving, |s| s.phase)
     }
 
+    /// What the cell's stop waits on, as its last drain step named it
+    /// (ADR-0199 D3); `None` while serving, before the first step and once
+    /// `Drained`.
+    #[must_use]
+    pub fn stop_hold(&self) -> Option<StopHold> {
+        self.stop.as_ref().and_then(|s| s.hold)
+    }
+
     /// Whether a stop takes a checkpoint before its final sync (on by
     /// default — the next boot then replays nothing; `infinityd
     /// --shutdown-checkpoint off`).
@@ -1495,36 +1702,52 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// One MAINTAIN step of the drain (ADR-0124 D2). Returns without
-    /// touching anything while serving.
+    /// touching anything while serving; records the wait a step returns
+    /// from, and `Drained` once none is left.
     fn drive_stop(&mut self) {
         let Some(stop) = self.stop.as_mut() else { return };
         if stop.phase == StopPhase::Drained {
             return;
         }
+        match Self::drain_step(stop, &self.shared, self.stop_checkpoint) {
+            Ok(()) => {
+                stop.phase = StopPhase::Drained;
+                stop.hold = None;
+            }
+            Err(hold) => stop.hold = Some(hold),
+        }
+    }
+
+    /// The drain's steps in order (ADR-0124 D2), each wait named by the
+    /// hold it returns (ADR-0199 D3); `Ok` once nothing is left to wait on.
+    fn drain_step(
+        stop: &mut StopDrive,
+        shared: &Shared<O, F>,
+        stop_checkpoint: bool,
+    ) -> Result<(), StopHold> {
         // Step 2: connections flush and close (QUIT's path — bytes read
         // after the mark are dropped; a command in flight finishes).
         if !stop.conns_marked {
             stop.conns_marked = true;
-            self.shared.conns.borrow_mut().for_each_mut(|conn| conn.close_after_flush = true);
+            shared.conns.borrow_mut().for_each_mut(|conn| conn.close_after_flush = true);
         }
-        if self.shared.conns.borrow().live > 0 {
-            return;
+        let live = shared.conns.borrow().live;
+        if live > 0 {
+            return Err(StopHold::Connections { live });
         }
         stop.phase = StopPhase::Quiet;
         if !stop.finish {
-            return;
+            return Err(StopHold::NodeQuiet);
         }
         // Steps 3–4: a durable cell publishes its stop checkpoint, then
         // its final sync lands. A cell still in boot recovery has no
         // durable plane yet: it acked nothing, and its disk is the
         // previous life's — Drained.
-        let mut durable = self.shared.durable.borrow_mut();
+        let mut durable = shared.durable.borrow_mut();
         if let Some(cell) = durable.as_mut() {
-            let control = self.shared.control.borrow();
-            if self.stop_checkpoint
-                && let Some(control) = control.as_ref()
-            {
-                let me = self.shared.cell.0;
+            let control = shared.control.borrow();
+            if stop_checkpoint && let Some(control) = control.as_ref() {
+                let me = shared.cell.0;
                 // ADR-0159 D3: the final credit issues once, after the
                 // all-cells-Quiet barrier, even past ordinary exhaustion.
                 // `set_control` accepted only this cell's credit, so it
@@ -1537,19 +1760,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 if let StopCheckpoint::Requested(epoch) = stop.checkpoint
                     && control.ckpt_board().slot(me).published() < epoch.get()
                 {
-                    return;
+                    return Err(StopHold::StopCheckpoint { epoch: epoch.get() });
                 }
             }
             if !stop.final_sync_requested {
                 stop.final_sync_requested = true;
                 cell.request_final_sync();
-                return;
+                return Err(StopHold::FinalSyncRequested);
             }
-            if !cell.quiescent() {
-                return;
-            }
+            cell.quiescent().map_err(StopHold::Durable)?;
         }
-        stop.phase = StopPhase::Drained;
+        Ok(())
     }
 
     pub fn connections(&self) -> usize {
@@ -1680,12 +1901,35 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         extract_keys(meta, argv).any(|key| !self.shared.router.is_local(key, self.shared.cell))
     }
 
+    /// Starts a connection's one close. A slot already closing returns at
+    /// once, so no caller needs a guard of its own: its `Close` is in flight
+    /// until `Closed`, and a second `close(2)` after the first has freed the
+    /// number may close the socket or file the next accept or open holds.
     fn initiate_close(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
-        if let Some(fd) = self.shared.with_conn(key, |conn| {
-            conn.closing = true;
-            conn.fd
-        }) {
-            cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, key) });
+        /// What the key's slot held when its close was asked for.
+        enum CloseStart {
+            /// Live and now closing: its fd's one `Close` goes out.
+            Started(RawFd),
+            /// Already closing: its `Close` is in flight until `Closed`.
+            AlreadyClosing,
+            /// A vacant slot or a stale generation: no connection to close.
+            Vacant,
+        }
+        let start = self
+            .shared
+            .with_conn(key, |conn| {
+                if conn.closing {
+                    return CloseStart::AlreadyClosing;
+                }
+                conn.closing = true;
+                CloseStart::Started(conn.fd)
+            })
+            .unwrap_or(CloseStart::Vacant);
+        match start {
+            CloseStart::Started(fd) => {
+                cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, key) });
+            }
+            CloseStart::AlreadyClosing | CloseStart::Vacant => {}
         }
     }
 
@@ -1743,6 +1987,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 }
 
+impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Drop for ServerPlane<O, F> {
+    /// The cell stops here: the census is marked `Stopping` before the
+    /// plane's fields drop, so every container of its `Shared` drops after
+    /// the mark (at the plane's last `Rc` or at the last future in the
+    /// loop's executor that holds one). The cell's loop marks it too, in its
+    /// own `Drop`; the mark is idempotent, so the order between the two is
+    /// no one's.
+    fn drop(&mut self) {
+        self.shared.census.mark_stopping();
+    }
+}
+
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// The namespace a fresh connection starts in (M4.5-S40,
     /// `--conn-default-ns`): resolved by name against the catalog at
@@ -1785,3 +2041,15 @@ mod conn_default_tests {
 #[cfg(test)]
 #[path = "move_tests.rs"]
 mod move_tests;
+
+#[cfg(test)]
+#[path = "reply_outcome_tests.rs"]
+mod reply_outcome_tests;
+
+#[cfg(test)]
+#[path = "close_tests.rs"]
+mod close_tests;
+
+#[cfg(test)]
+#[path = "stop_tests.rs"]
+mod stop_tests;

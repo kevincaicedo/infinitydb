@@ -5,8 +5,8 @@
 use inf_sim::{
     BackfillScenario, BootStormScenario, CombinedScenario, DurableScenario, RecoveryScenario,
     Scenario, SidecarScenario, TieredScenario, run_backfill_scenario, run_boot_storm_scenario,
-    run_combined_scenario, run_durable_scenario, run_recovery_scenario, run_scenario,
-    run_sidecar_scenario, run_tiered_scenario,
+    run_combined_scenario, run_durable_scenario, run_ns_drop_window_scenario,
+    run_recovery_scenario, run_scenario, run_sidecar_scenario, run_tiered_scenario,
 };
 
 fn parse_seed(text: &str) -> u64 {
@@ -16,6 +16,7 @@ fn parse_seed(text: &str) -> u64 {
     )
 }
 
+// nextest-long: 70 s
 #[test]
 fn corpus_seeds_replay_green() {
     let text = include_str!("../seeds/corpus.txt");
@@ -84,6 +85,19 @@ fn corpus_seeds_replay_green() {
             ran += 1;
             continue;
         }
+        // ADR-0189 D5: one seed per cut class of the namespace-drop window.
+        if name == "m2-ns-drop-window" {
+            let report = run_ns_drop_window_scenario(seed);
+            assert!(
+                report.ok(),
+                "corpus seed {line} ({:?}) regressed: stalled={} violations={:?}",
+                report.cut,
+                report.stalled,
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
         if name == "boot-storm" {
             let report = run_boot_storm_scenario(&BootStormScenario::m2_boot_storm(seed));
             assert!(
@@ -136,4 +150,60 @@ fn corpus_seeds_replay_green() {
         ran += 1;
     }
     assert!(ran >= 4, "corpus unexpectedly small ({ran} entries)");
+}
+
+/// The drop race's filler leg: the path a seed whose phase-2 keys all
+/// answer from RAM at phase 9 takes (one seed in thousands of the nightly's
+/// sweep), forced. The race writes a filler on one cell until the filler's
+/// first key reads cold, and the DROP meets that read held at the device;
+/// a filler that never pushed its key out of RAM within its bound is the
+/// run's VACUOUS clause.
+#[test]
+fn the_drop_race_filler_leg_meets_its_held_read() {
+    let scenario = TieredScenario::m4_tiered(0xC0FFEE).with_drop_race_filler();
+    let report = run_tiered_scenario(&scenario);
+    assert!(report.ok(), "stalled={} violations={:?}", report.stalled, report.violations);
+    assert!(report.drop_race_fill_batches > 0, "the leg wrote no filler batch");
+    assert_eq!(
+        report.drop_race_probes, report.drop_race_fill_batches,
+        "the leg probes the filler's first key once a batch, and no phase-2 key"
+    );
+    assert_eq!(report.drop_reads_held, 1, "the DROP met the filler key's held read");
+}
+
+/// `m4-tiered` at `0x51ee07f7`, one seed of the nightly's 4,000 from
+/// `0x51EE0000`. Cell 1's page of 16 cold slots enqueues them in one reactor
+/// iteration, and the device takes their 6 merged reads at one entry, though
+/// the page answers 16 scheduler steps after its send: the net hands the
+/// command's 56 bytes to the cell in 12 seeded chunks, a step each, and the
+/// reply takes 3 more. The batching oracle reads the tier reads the cell's
+/// device took once the cell held the whole command, so the arrival's steps
+/// are in no count, and no page of this seed puts 16 reads at its device:
+/// none is judged, and none is set aside.
+// nextest-long: 15 s
+#[test]
+fn a_scan_page_is_judged_by_the_steps_its_reads_took() {
+    let report = run_tiered_scenario(&TieredScenario::m4_tiered(0x51ee_07f7));
+    assert!(report.ok(), "stalled={} violations={:?}", report.stalled, report.violations);
+    assert_eq!(report.scan_pages_judged, 0, "no page of this seed reaches the oracle's floor");
+    assert_eq!(report.scan_pages_set_aside, 0, "no page of this seed reaches the oracle's floor");
+}
+
+/// `m4-tiered` at `0x51ee082d`: the seed where the `SCAN` batching oracle is
+/// seen speaking. It judges 6 pages, none violating, and sets aside 3 whose
+/// cell's device took another reader's tier reads around the page, so both
+/// the verdict and the guard before it are reached on the plain build.
+// nextest-long: 37 s
+#[test]
+fn the_scan_batching_oracle_judges_pages_and_sets_others_aside() {
+    let report = run_tiered_scenario(&TieredScenario::m4_tiered(0x51ee_082d));
+    assert!(report.ok(), "stalled={} violations={:?}", report.stalled, report.violations);
+    let repin = format!(
+        "the seed's pages move with the scenario's draws, so a new count is right only in a \
+         change that also moves this seed's trace hash ({:#018x} here): re-pin it there, and \
+         check the canary's row still judges pages",
+        report.trace_hash
+    );
+    assert_eq!(report.scan_pages_judged, 6, "pages judged: {repin}");
+    assert_eq!(report.scan_pages_set_aside, 3, "pages set aside for another reader: {repin}");
 }

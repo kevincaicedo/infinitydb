@@ -5,28 +5,16 @@
 use super::*;
 
 /// Owned fabric outcome (decoded outcomes borrow ring slots; gate values
-/// must own their bytes).
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// must own their bytes). A leg's reply is an [`OwnedReply`], its outcome
+/// read from the wire's variant at the one decode (ADR-0190 D3).
+#[derive(PartialEq, Eq, Debug)]
 pub enum OwnedOutcome {
     Ok,
-    Bytes(Vec<u8>),
+    Reply(OwnedReply),
     Int(i64),
     Nil,
     Bool(bool),
     Err(ErrCode),
-}
-
-impl OwnedOutcome {
-    pub(super) fn own(outcome: &Outcome<'_>) -> OwnedOutcome {
-        match outcome {
-            Outcome::Ok => OwnedOutcome::Ok,
-            Outcome::Bytes(b) => OwnedOutcome::Bytes(b.to_vec()),
-            Outcome::Int(i) => OwnedOutcome::Int(*i),
-            Outcome::Nil => OwnedOutcome::Nil,
-            Outcome::Bool(b) => OwnedOutcome::Bool(*b),
-            Outcome::Err(e) => OwnedOutcome::Err(*e),
-        }
-    }
 }
 
 // ---- deferred commands --------------------------------------------------------
@@ -132,16 +120,8 @@ impl Conn {
 pub(super) const CONN_SLOT_CAP: u32 = inf_runtime::MAX_SLOT;
 
 /// Redis's reply past `maxclients` (networking.c, measured 8.0.5).
+// reply-outcome-allow: a connection frame copied to a send buffer, no reply (ADR-0123 D1)
 pub(super) const MAXCLIENTS_REFUSAL: &[u8] = b"-ERR max number of clients reached\r\n";
-
-/// The accept-retry wheel key (F-L11-02): after the driver parks the
-/// accept arm on an exhaustion/broken failure, the plane re-arms it at this
-/// cadence — one `accept(2)` per window while the condition persists, never
-/// a spin — so descriptors freed outside the driver (segment files,
-/// checkpoint handles) let queued clients in without waiting for a
-/// connection to close.
-pub(super) const ACCEPT_RETRY_TIMER_KEY: u64 = 0xACCE_0001;
-pub(super) const ACCEPT_RETRY: Nanos = Nanos::from_millis(100);
 
 impl<T> Default for ConnSlab<T> {
     fn default() -> ConnSlab<T> {

@@ -34,14 +34,14 @@ pub(super) async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + C
             };
             let adding = matches!(id, CommandId::Subscribe | CommandId::Psubscribe);
             let names: Vec<&[u8]> = argv[1..].to_vec();
-            let mut frames = shared.take_reply_buf();
+            let mut frames = OpenReply::new(shared.take_reply_buf());
             let now = shared.now.get();
             let Some(changes) = shared.with_conn(key, |conn| {
                 if adding {
-                    pubsub::apply_subscribe(&names, kind, &mut conn.cx, now, &mut frames)
+                    pubsub::apply_subscribe(&names, kind, &mut conn.cx, now, frames.reply())
                 } else {
                     let names = (!names.is_empty()).then_some(names.as_slice());
-                    pubsub::apply_unsubscribe(names, kind, &mut conn.cx, now, &mut frames)
+                    pubsub::apply_unsubscribe(names, kind, &mut conn.cx, now, frames.reply())
                 }
             }) else {
                 return false;
@@ -70,7 +70,7 @@ pub(super) async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + C
             for waiter in waiters {
                 let _ = waiter.await;
             }
-            pending.push_back(PendingReply::Done(frames));
+            pending.push_back(PendingReply::Done(frames.finish()));
         }
         CommandId::Publish => {
             let (channel, payload) = (argv[1], argv[2]);
@@ -89,14 +89,14 @@ pub(super) async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + C
                 let targets = shared.pubsub.borrow().fan_targets(channel, shared.cell.0);
                 let mut waiters = Vec::new();
                 for cell in targets {
-                    let fan = &[&b"INF.PUBFAN"[..], channel, payload];
+                    let fan = PubFanArgv::new(channel, payload, None);
                     if let Ok(waiter) = send_apply(
                         shared,
                         CellId(cell),
                         ApplyOrigin::Program,
                         Protocol::Resp2,
                         0,
-                        fan,
+                        fan.argv(),
                     )
                     .await
                     {
@@ -106,9 +106,7 @@ pub(super) async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + C
                     }
                 }
                 pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal: None });
-                if !self_frames.is_empty() {
-                    pending.push_back(PendingReply::Done(self_frames));
-                }
+                pending.extend(trailing_self_frames(shared, self_frames));
             } else {
                 // ADR-0101 D1: a subscribed publisher tags the forward
                 // with `(conn, seq)` so the owner's fan leg back to this
@@ -259,37 +257,40 @@ pub(super) fn unsubscribe_closed_conn<
 /// RTT-bound — a recorded M1 simplification (no gate measures sustained
 /// publish throughput; revisit with evidence per L4 if a workload demands
 /// overlap).
+///
+/// The reply waits on the fan's legs, so the legs draw on the credit every
+/// general send leaves free toward each peer, through the cell's one fan
+/// reserve: one fan open at a time, one leg toward each peer, so a leg
+/// never waits for a credit an unanswered `INF.PUB` holds and every reply
+/// it waits on is sent at a peer's drain (ADR-0192 D3). An overlapping pump
+/// must keep one leg in flight per peer.
 pub(super) async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: Rc<Shared<O, F>>,
 ) {
+    // One pump runs at a time (`pub_pump_active`), so it finds the reserve.
+    let mut reserve = shared.fan_reserve.take();
+    debug_assert!(reserve.is_some(), "the running owner pump holds the cell's fan reserve");
     loop {
         let Some(item) = shared.pub_queue.borrow_mut().pop_front() else {
+            // Put back in the step that clears the flag, no await between,
+            // so the pump the next drain spawns finds it.
+            shared.fan_reserve.set(reserve);
             shared.pub_pump_active.set(false);
             return;
         };
         let (mut total, _) = deliver_local(&shared, &item.channel, &item.payload, None);
-        let targets = shared.pubsub.borrow().fan_targets(&item.channel, shared.cell.0);
-        let mut waiters = Vec::new();
-        for cell in targets {
-            // ADR-0101 D2: the origin cell's leg echoes the publisher
-            // tag; every other leg keeps the three-arg form.
-            let tagged = item.tag.as_ref().filter(|_| cell == item.origin.0);
-            let fan: &[&[u8]] = match tagged {
-                Some((conn, seq)) => &[&b"INF.PUBFAN"[..], &item.channel, &item.payload, conn, seq],
-                None => &[&b"INF.PUBFAN"[..], &item.channel, &item.payload],
-            };
-            if let Ok(waiter) =
-                send_apply(&shared, CellId(cell), ApplyOrigin::Program, Protocol::Resp2, 0, fan)
-                    .await
-            {
-                note_fan(&shared.node);
-                waiters.push(waiter);
-            }
-        }
-        for waiter in waiters {
-            if let OwnedOutcome::Int(n) = waiter.await {
+        let mut fold = |outcome: OwnedOutcome| {
+            if let OwnedOutcome::Int(n) = outcome {
                 total += n;
             }
+        };
+        match reserve.as_mut() {
+            Some(reserve) => {
+                let mut legs = FanLegs::open(reserve, &shared.node.fabric_reserve_refused_cell);
+                fan_legs(&shared, &item, &mut legs).await;
+                legs.settle(&mut fold).await;
+            }
+            None => fan_unreserved(&shared, &item, &mut fold).await,
         }
         // Publish the reply now — the origin's pump is suspended on it.
         let mut fabric = shared.fabric.borrow_mut();
@@ -298,14 +299,93 @@ pub(super) async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Cl
     }
 }
 
+/// One fan's legs, one per subscriber-bearing peer in ascending order
+/// (`fan_targets`), each on the reserved credit.
+async fn fan_legs<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    item: &OwnerPub,
+    legs: &mut FanLegs<'_>,
+) {
+    let targets = shared.pubsub.borrow().fan_targets(&item.channel, shared.cell.0);
+    for cell in targets {
+        let tag = leg_tag(item, cell);
+        #[cfg(not(inf_canary_fan_draws_general))]
+        let sent =
+            send_fan_leg(shared, legs, CellId(cell), &item.channel, &item.payload, tag).await;
+        // Canary: every leg a general send that waits for a credit, as if
+        // no credit were kept for the fan.
+        #[cfg(inf_canary_fan_draws_general)]
+        let sent = {
+            let fan = PubFanArgv::new(&item.channel, &item.payload, tag);
+            let to = CellId(cell);
+            send_apply(shared, to, ApplyOrigin::Program, Protocol::Resp2, 0, fan.argv())
+                .await
+                .map(|waiter| legs.push(waiter))
+        };
+        if sent.is_ok() {
+            note_fan(&shared.node);
+        }
+    }
+}
+
+/// The fan without the cell's reserve, derived never (the running pump
+/// holds it): each leg a general send and its wait, counted as a refused
+/// leg, the replies folded in leg order.
+async fn fan_unreserved<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    item: &OwnerPub,
+    fold: &mut impl FnMut(OwnedOutcome),
+) {
+    let targets = shared.pubsub.borrow().fan_targets(&item.channel, shared.cell.0);
+    let mut waiters = Vec::new();
+    for cell in targets {
+        let fan = PubFanArgv::new(&item.channel, &item.payload, leg_tag(item, cell));
+        let to = CellId(cell);
+        let refused = &shared.node.fabric_reserve_refused_cell;
+        refused.set(refused.get() + 1);
+        if let Ok(waiter) =
+            send_apply(shared, to, ApplyOrigin::Program, Protocol::Resp2, 0, fan.argv()).await
+        {
+            note_fan(&shared.node);
+            waiters.push(waiter);
+        }
+    }
+    for waiter in waiters {
+        fold(waiter.await);
+    }
+}
+
+/// ADR-0101 D2: the origin cell's leg echoes the publisher tag; every other
+/// leg keeps the three-arg form.
+fn leg_tag(item: &OwnerPub, cell: u16) -> Option<(&[u8], &[u8])> {
+    item.tag
+        .as_ref()
+        .filter(|_| cell == item.origin.0)
+        .map(|(conn, seq)| (conn.as_slice(), seq.as_slice()))
+}
+
+/// A publisher subscribed to its own channel reads its frames after its
+/// count reply (Redis order), as a trailing reply; an empty stash goes back
+/// to the pool and adds none.
+fn trailing_self_frames<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    self_frames: OwnedReply,
+) -> Option<PendingReply> {
+    if self_frames.bytes().is_empty() {
+        shared.recycle_reply_buf(self_frames.into_bytes());
+        return None;
+    }
+    Some(PendingReply::Done(self_frames))
+}
+
 /// PUBSUB introspection over the cell registries: CHANNELS merges the owner
 /// views (KEYS-style header arithmetic), NUMSUB asks each channel's owner,
 /// NUMPAT answers locally (the pattern index is replicated).
-async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+pub(super) async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     argv: &[&[u8]],
-) -> Vec<u8> {
+) -> OwnedReply {
     let sub = argv[1];
     if sub.eq_ignore_ascii_case(b"CHANNELS") && argv.len() <= 3 {
         let pattern = argv.get(2).copied();
@@ -325,39 +405,7 @@ async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 }
             }
         }
-        let mut total = local.len();
-        let mut bodies: Vec<(Vec<u8>, usize)> = Vec::new();
-        for waiter in waiters {
-            match waiter.await {
-                OwnedOutcome::Bytes(bytes) => {
-                    let Some((n, off)) = parse_array_header(&bytes) else {
-                        return bytes; // peer error passthrough
-                    };
-                    total += n;
-                    bodies.push((bytes, off));
-                }
-                OwnedOutcome::Ok
-                | OwnedOutcome::Int(_)
-                | OwnedOutcome::Nil
-                | OwnedOutcome::Bool(_)
-                | OwnedOutcome::Err(_) => {
-                    return error_reply(shared, proto, "ERR cross-cell execution failed");
-                }
-            }
-        }
-        let mut reply = shared.take_reply_buf();
-        {
-            let mut w = RespWriter::new(&mut reply, proto);
-            w.array_header(total);
-            for name in &local {
-                w.bulk(name);
-            }
-        }
-        for (bytes, off) in bodies {
-            reply.extend_from_slice(&bytes[off..]);
-            shared.recycle_reply_buf(bytes);
-        }
-        reply
+        merge_channels(shared, proto, &local, waiters).await
     } else if sub.eq_ignore_ascii_case(b"NUMSUB") {
         enum Count {
             Local(i64),
@@ -382,32 +430,83 @@ async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 }
             }
         }
-        let mut reply = shared.take_reply_buf();
-        RespWriter::new(&mut reply, proto).array_header(parts.len() * 2);
+        let mut reply = OpenReply::new(shared.take_reply_buf());
+        RespWriter::new(reply.reply(), proto).array_header(parts.len() * 2);
         for (name, count) in parts {
             let count = match count {
                 Count::Local(n) => n,
                 Count::Wait(waiter) => match waiter.await {
                     OwnedOutcome::Int(n) => n,
+                    OwnedOutcome::Reply(unused) => {
+                        shared.recycle_reply_buf(unused.into_bytes());
+                        0
+                    }
                     OwnedOutcome::Ok
-                    | OwnedOutcome::Bytes(_)
                     | OwnedOutcome::Nil
                     | OwnedOutcome::Bool(_)
                     | OwnedOutcome::Err(_) => 0,
                 },
             };
-            let mut w = RespWriter::new(&mut reply, proto);
+            let mut w = RespWriter::new(reply.reply(), proto);
             w.bulk(name);
             w.int(count);
         }
-        reply
+        reply.finish()
     } else if sub.eq_ignore_ascii_case(b"NUMPAT") && argv.len() == 2 {
         int_reply(shared, proto, shared.pubsub.borrow().live_pattern_count() as i64)
     } else {
-        let mut reply = shared.take_reply_buf();
-        pubsub::pubsub_subcommand_error(sub, &mut RespWriter::new(&mut reply, proto));
-        reply
+        let mut reply = OpenReply::new(shared.take_reply_buf());
+        pubsub::pubsub_subcommand_error(sub, &mut RespWriter::new(reply.reply(), proto));
+        reply.finish()
     }
+}
+
+/// `PUBSUB CHANNELS`' merge: this cell's names, then each peer's array
+/// body, under one header (KEYS-style header arithmetic). Each peer leg is
+/// read by `read_array_leg`, as `KEYS`'s are: its error is the reply, and a
+/// success without an array header is a malformed peer reply, never the
+/// client's whole answer (ADR-0190 D2, A1.2).
+async fn merge_channels<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    proto: Protocol,
+    local: &[Vec<u8>],
+    waiters: Vec<GateWait<u64, OwnedOutcome>>,
+) -> OwnedReply {
+    let mut total = local.len();
+    let mut bodies = Vec::new();
+    for waiter in waiters {
+        match waiter.await {
+            OwnedOutcome::Reply(reply) => match read_array_leg(shared, proto, reply) {
+                Ok(leg) => {
+                    total += leg.count();
+                    bodies.push(leg);
+                }
+                Err(answer) => return answer,
+            },
+            OwnedOutcome::Ok
+            | OwnedOutcome::Int(_)
+            | OwnedOutcome::Nil
+            | OwnedOutcome::Bool(_)
+            | OwnedOutcome::Err(_) => {
+                return error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED);
+            }
+        }
+    }
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    {
+        let mut w = RespWriter::new(reply.reply(), proto);
+        w.array_header(total);
+        for name in local {
+            w.bulk(name);
+        }
+        for body in &bodies {
+            w.encoded(body.body());
+        }
+    }
+    for body in bodies {
+        shared.recycle_reply_buf(body.into_reply().into_bytes());
+    }
+    reply.finish()
 }
 
 /// Owner-side handling of the internal pub/sub Apply vocabulary. Returns
@@ -418,7 +517,7 @@ pub(super) fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clo
     from: CellId,
     token: FabricToken,
     argv: &[&[u8]],
-    scratch: &mut Vec<u8>,
+    scratch: &mut ReplyStream,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
     pubs: &mut Vec<OwnerPub>,
 ) -> bool {
@@ -432,6 +531,7 @@ pub(super) fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clo
         let tag = (argv.len() == 5).then(|| parse_publisher_tag(argv[3], argv[4])).flatten();
         let (delivered, self_frames) =
             deliver_local(shared, argv[1], argv[2], tag.map(|(conn, _)| conn));
+        let self_frames = self_frames.into_bytes();
         if let Some((conn, seq)) = tag
             && !self_frames.is_empty()
         {
@@ -467,12 +567,14 @@ pub(super) fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clo
         } else if argv[1].eq_ignore_ascii_case(b"CHANNELS") && argv.len() <= 3 {
             let names = shared.pubsub.borrow().live_owned_channels(argv.get(2).copied());
             let start = scratch.len();
-            let mut w = RespWriter::new(scratch, Protocol::Resp2);
+            let reply = scratch.open();
+            let mut w = RespWriter::new(reply, Protocol::Resp2);
             w.array_header(names.len());
             for name in &names {
                 w.bulk(name);
             }
-            staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+            let outcome = reply.outcome();
+            staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
         } else {
             staged.push((from, token, StagedReply::Refused));
         }
@@ -494,9 +596,12 @@ fn deliver_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     channel: &[u8],
     payload: &[u8],
     defer: Option<ConnKey>,
-) -> (i64, Vec<u8>) {
+) -> (i64, OwnedReply) {
     let mut delivered: i64 = 0;
-    let mut deferred = Vec::new();
+    // The publisher's own frames, held back to follow the publish reply:
+    // pushes, whose outcome nothing reads. Opened over an empty buffer, as
+    // the common publisher is not itself subscribed.
+    let mut deferred = OpenReply::new(Vec::new());
     for key in shared.pubsub.borrow().channel_conns(channel) {
         delivered += i64::from(deliver_one(shared, key, defer, &mut deferred, |out, proto| {
             pubsub::write_message(out, proto, channel, payload);
@@ -511,15 +616,15 @@ fn deliver_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     }
     let node = &shared.node;
     node.pubsub_delivered.set(node.pubsub_delivered.get() + delivered.unsigned_abs());
-    (delivered, deferred)
+    (delivered, deferred.finish())
 }
 
 fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     key: ConnKey,
     defer: Option<ConnKey>,
-    deferred: &mut Vec<u8>,
-    write: impl FnOnce(&mut Vec<u8>, Protocol),
+    deferred: &mut OpenReply,
+    write: impl FnOnce(&mut ReplyBuf, Protocol),
 ) -> bool {
     let now_ms = shared.now.get().as_millis();
     let caps = shared.knobs.get().cob_pubsub;
@@ -531,10 +636,10 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             if defer == Some(key) {
                 // The publisher's own frames ride the reply path instead
                 // (emitted right after the receiver count).
-                write(deferred, conn.cx.proto);
+                write(deferred.reply(), conn.cx.proto);
                 return true;
             }
-            write(&mut conn.out, conn.cx.proto);
+            write(conn.out.open(), conn.cx.proto);
             enforce_output_cap(&shared.node, conn, now_ms, caps);
             true
         })

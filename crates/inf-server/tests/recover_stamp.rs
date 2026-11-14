@@ -29,16 +29,20 @@ const TIER_NS: NsId = NsId(17);
 /// `fresh_keyspace` plus a materialized tiered namespace (no MANIFEST —
 /// the first-crash shape: the catalog names it, no checkpoint does).
 fn tiered_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace();
-    ks.ns_create(NsSpec {
-        id: TIER_NS,
-        name: b"hot".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: Some(TierSpec::for_budget(8 << 20)),
-    })
+    ks.ns_create(
+        NsSpec {
+            id: TIER_NS,
+            name: b"hot".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(8 << 20)),
+        },
+        &census,
+    )
     .expect("tiered ns");
     ks
 }
@@ -55,8 +59,8 @@ struct HandLog {
 impl HandLog {
     fn new(fs: &MemFs) -> HandLog {
         let dirs = create_cell_dirs(fs, std::path::Path::new("data/shard-0")).expect("dirs");
-        let rotor =
-            SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg().segment).expect("rotor");
+        let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg().geometry)
+            .expect("rotor");
         drop(rotor);
         HandLog { fs: fs.clone(), log_dir: dirs.log, offset: 0 }
     }

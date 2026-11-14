@@ -5,9 +5,9 @@ use inf_server::{ConnCx, execute_slices};
 use inf_store::{Keyspace, StoreConfig};
 
 fn call(store: &mut Keyspace, cx: &mut ConnCx, argv: &[&[u8]]) -> Vec<u8> {
-    let mut reply = Vec::new();
-    execute_slices(argv, store, cx, Nanos(1), &mut reply);
-    reply
+    let mut reply = inf_wire::OpenReply::new(Vec::new());
+    execute_slices(argv, store, cx, Nanos(1), reply.reply());
+    reply.finish().into_bytes()
 }
 
 /// Malformed optional forms never remove a source; legacy forms still work.

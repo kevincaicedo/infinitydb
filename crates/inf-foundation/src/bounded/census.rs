@@ -8,14 +8,19 @@
 //!
 //! Phases: `Assembling` from construction until the cell's loop takes the
 //! serve mark at its first iteration, `Serving` after it, `Stopping` once
-//! the loop has exited. The mark is a token, [`ServeMark`], minted once
+//! either of the cell's two aggregates that own its containers, its loop or
+//! its plane, is dropped: each marks it in its `Drop` before its fields
+//! drop. The mark is a token, [`ServeMark`], minted once
 //! beside the census and consumed by its one `take`, so a census is marked
 //! at most once. At the mark the census walks its rows: an
 //! `Assembly` row whose live count is below its cap is a violation, and so
 //! is every publish, crossing or registration on an `Assembly` row from
 //! then on. A violation is counted in `cap_assembly_violations`, which the
 //! simulator reads as 0 on every seed, and is a debug assertion carrying the
-//! token `cap-assembly-violated`.
+//! token `cap-assembly-violated`. A capped store dropped whole while the
+//! cell serves, holding backing no step sliced, is counted in
+//! `unsliced_drops`, also 0 on every seed, and asserted with the token
+//! `unsliced-drop`.
 #![cfg_attr(
     not(test),
     deny(
@@ -27,12 +32,13 @@
 )]
 
 use core::fmt;
+use core::num::{NonZeroU16, NonZeroU32};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use super::{Cap, CapError, CapFill};
 use crate::ids::CellId;
-use crate::limits::CAP_CENSUS_ROWS_MAX;
+use crate::limits::{CAP_CENSUS_ROWS_MAX, CAP_CENSUS_SLABS_MAX};
 
 /// Where the cell is in its life, as the census sees it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,15 +47,21 @@ pub enum CensusPhase {
     Assembling,
     /// The serve mark was taken; `Assembly` rows are frozen at their cap.
     Serving,
-    /// The loop has exited: process teardown, where an unsliced drop is
-    /// legal.
+    /// The cell's loop or its plane was dropped, each marking this before
+    /// its fields drop: process teardown, where an unsliced drop is legal.
     Stopping,
 }
 
 /// One row of the census, read as a copy. `high_water` and `crossings` are
 /// per cell, over every instance of the name; `assembly_live` is the live
 /// count of an `Assembly` row's one instance and stays 0 on a `Serving` row,
-/// which reports no publish.
+/// which reports no publish. `capacity_now` is the entries the row's
+/// containers admit now, the minimum over its instances: `entries_max` from
+/// registration, lowered only by a slab that retires a slot at its last
+/// generation. A `Full` is answered only at a live count that a publish
+/// has already raised the high water to, and a retirement lowers
+/// `capacity_now` before any `Full` at the new count, so on every row
+/// `crossings > 0` implies `capacity_now <= high_water`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CapRow {
     pub name: &'static str,
@@ -58,6 +70,7 @@ pub struct CapRow {
     pub high_water: u32,
     pub crossings: u64,
     pub assembly_live: u32,
+    pub capacity_now: u32,
 }
 
 /// The census of one cell's caps. Shared by `Rc` with every capped container
@@ -67,6 +80,31 @@ pub struct CapCensus {
     phase: Cell<CensusPhase>,
     rows: RefCell<[Option<CapRow>; CAP_CENSUS_ROWS_MAX]>,
     cap_assembly_violations: Cell<u32>,
+    unsliced_drops: Cell<u32>,
+    /// Ordinals minted so far; the next store's is one above.
+    instances_minted: Cell<u16>,
+}
+
+/// The identity of one capped store of the node (ADR-0171 A2.1): the high
+/// 16 bits are its cell's `CellId`, the low 16 an ordinal from 1 that the
+/// cell's census mints once per store and never again, so no two stores of
+/// one census share a value, a retired store's included. Across the node the
+/// cell bits separate them while each cell builds its census once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SlabInstance(NonZeroU32);
+
+impl SlabInstance {
+    /// The cell whose census minted this identity.
+    #[must_use]
+    pub fn cell(self) -> CellId {
+        CellId((self.0.get() >> 16) as u16)
+    }
+
+    /// The ordinal within that cell, from 1.
+    #[must_use]
+    pub fn ordinal(self) -> u16 {
+        (self.0.get() & 0xFFFF) as u16
+    }
 }
 
 impl fmt::Debug for CapCensus {
@@ -76,6 +114,7 @@ impl fmt::Debug for CapCensus {
             .field("phase", &self.phase.get())
             .field("rows", &self.rows().count())
             .field("cap_assembly_violations", &self.cap_assembly_violations.get())
+            .field("unsliced_drops", &self.unsliced_drops.get())
             .finish()
     }
 }
@@ -107,11 +146,13 @@ impl ServeMark {
 }
 
 /// A container's handle on its `CapRow`: the index is fixed at registration
-/// and the fill is kept beside it, so a report tests one byte.
+/// and the fill is kept beside it, first, so a removal tests one byte of the
+/// line its container's header starts on; 16 bytes in all.
+#[repr(C)]
 pub(super) struct CapRowHandle {
-    census: Rc<CapCensus>,
-    index: usize,
     fill: CapFill,
+    index: u8,
+    census: Rc<CapCensus>,
 }
 
 impl CapCensus {
@@ -119,11 +160,19 @@ impl CapCensus {
     /// mark, which the cell's loop takes as its first iteration begins. The
     /// one allocation is the `Rc`, at the cell's assembly, before it serves.
     pub fn new(cell: CellId) -> (Rc<CapCensus>, ServeMark) {
+        // Canary: the census is born serving, so every `Assembly` row
+        // registers and fills after the mark.
+        #[cfg(inf_canary_serve_mark_first)]
+        let born = CensusPhase::Serving;
+        #[cfg(not(inf_canary_serve_mark_first))]
+        let born = CensusPhase::Assembling;
         let census = Rc::new(CapCensus {
             cell,
-            phase: Cell::new(CensusPhase::Assembling),
+            phase: Cell::new(born),
             rows: RefCell::new([None; CAP_CENSUS_ROWS_MAX]),
             cap_assembly_violations: Cell::new(0),
+            unsliced_drops: Cell::new(0),
+            instances_minted: Cell::new(0),
         });
         let mark = ServeMark { census: Rc::clone(&census) };
         (census, mark)
@@ -147,6 +196,15 @@ impl CapCensus {
         self.cap_assembly_violations.get()
     }
 
+    /// Capped stores dropped whole while the cell served, each holding a
+    /// chunk or a directory: a release of backing no step sliced. Cell
+    /// scope, one per store (a map is two). A correct host reads 0 on
+    /// every seed.
+    #[must_use]
+    pub fn unsliced_drops(&self) -> u32 {
+        self.unsliced_drops.get()
+    }
+
     /// The serve mark's effect, reached only through [`ServeMark::take`], of
     /// which the census mints one: the phase becomes `Serving` and one walk
     /// of the rows counts and asserts each `Assembly` row under its cap.
@@ -166,9 +224,36 @@ impl CapCensus {
         self.note_violations(short, "under-filled at the serve mark", first);
     }
 
-    /// After the loop has exited: an unsliced drop is process teardown now.
+    /// The cell is stopping: an unsliced drop is process teardown now. Each
+    /// of the cell's two aggregates that own its containers, its loop and
+    /// its plane, calls this in its `Drop` before its fields drop, so every
+    /// container drops after the first of them; the call is idempotent, so
+    /// the order between the two is no one's.
     pub fn mark_stopping(&self) {
         self.phase.set(CensusPhase::Stopping);
+    }
+
+    /// A capped store was dropped holding `items_held` chunks or directories
+    /// (its one `Drop`, under every phase type of a slab or a map). While
+    /// the cell serves that is a release no step sliced: counted first, so
+    /// the count is read after the assertion unwinds, then asserted in a
+    /// debug build unless the thread is already unwinding, so one failure
+    /// stays one panic. While assembling it is an abandoned assembly and
+    /// once stopping it is process teardown: legal, uncounted. A store
+    /// holding nothing frees nothing.
+    pub(super) fn note_store_drop(&self, items_held: u32) {
+        if items_held == 0 || self.phase.get() != CensusPhase::Serving {
+            return;
+        }
+        let total = self.unsliced_drops.get().saturating_add(1);
+        self.unsliced_drops.set(total);
+        // Outside an unwind the assertion fires; inside one it holds.
+        debug_assert!(
+            std::thread::panicking(),
+            "unsliced-drop: a capped store holding {items_held} chunk(s) or directories \
+             was dropped whole while {} serves",
+            self.cell
+        );
     }
 
     /// Every row, copied out in registration order (at most
@@ -213,6 +298,7 @@ impl CapCensus {
                         high_water: 0,
                         crossings: 0,
                         assembly_live: 0,
+                        capacity_now: cap.entries_max(),
                     });
                     index
                 }
@@ -220,7 +306,23 @@ impl CapCensus {
         };
         let late = cap.fill() == CapFill::Assembly && self.phase.get() != CensusPhase::Assembling;
         self.note_violations(u32::from(late), "a registration after the serve mark", index);
-        Ok(CapRowHandle { census: Rc::clone(self), index, fill: cap.fill() })
+        Ok(CapRowHandle { fill: cap.fill(), index: row_index(index), census: Rc::clone(self) })
+    }
+
+    /// The identity of the next capped store built on this census, minted
+    /// as the store is constructed, before anything of it is allocated: the
+    /// one source of a `SlabInstance` (ADR-0171 A2.1). A store takes one, so
+    /// a slab takes one and a map two. Past `CAP_CENSUS_SLABS_MAX` mints it
+    /// is `CapError::Census` and the store builds nothing.
+    pub(super) fn mint_instance(self: &Rc<Self>) -> Result<SlabInstance, CapError> {
+        let minted = self.instances_minted.get();
+        let next = minted.checked_add(1).filter(|_| minted < CAP_CENSUS_SLABS_MAX);
+        let Some(ordinal) = next.and_then(NonZeroU16::new) else {
+            return Err(CapError::Census);
+        };
+        self.instances_minted.set(ordinal.get());
+        let cell = u32::from(self.cell.0) << 16;
+        Ok(SlabInstance(NonZeroU32::from(ordinal) | cell))
     }
 
     /// `count` violations of one kind on the row at `index`: counted first,
@@ -252,12 +354,26 @@ impl CapCensus {
     }
 }
 
+/// A row's index in a handle's byte.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: a row index is below CAP_CENSUS_ROWS_MAX, at most 256 by a const assertion"
+)]
+fn row_index(index: usize) -> u8 {
+    index as u8
+}
+
 impl CapRowHandle {
-    /// The fill the row was declared with: the cap-minus-one canary admits
-    /// one entry fewer on a `Serving` row only.
-    #[cfg(inf_canary_cap_minus_one)]
+    /// The fill the row was declared with: a slab's or a map's removal tests
+    /// it, and the cap-minus-one canary admits one entry fewer on a
+    /// `Serving` row only.
+    #[inline]
     pub(super) fn fill(&self) -> CapFill {
         self.fill
+    }
+
+    fn index(&self) -> usize {
+        usize::from(self.index)
     }
 
     /// The container's live count rose to `live`. A `Serving` container
@@ -271,7 +387,8 @@ impl CapRowHandle {
     #[cold]
     #[inline(never)]
     pub(super) fn report_publish(&self, live: u32) {
-        let (census, index, assembly) = (&*self.census, self.index, self.fill == CapFill::Assembly);
+        let (census, index, assembly) =
+            (&*self.census, self.index(), self.fill == CapFill::Assembly);
         census.with_row(index, |row| {
             row.high_water = row.high_water.max(live);
             if assembly {
@@ -284,17 +401,25 @@ impl CapRowHandle {
 
     /// An `Assembly` container's live count fell to `live` (a slab's `take`,
     /// a map's `remove`); a `Serving` container never calls this, and the
-    /// deque, never `Assembly`, has no caller: the slab's `take` is its first.
-    #[allow(
-        dead_code,
-        reason = "the slab's and the map's removal report; the deque is never Assembly"
-    )]
+    /// deque, never `Assembly`, has no caller.
     #[cold]
     #[inline(never)]
     pub(super) fn report_removal(&self, live: u32) {
         if self.fill == CapFill::Assembly {
-            self.census.with_row(self.index, |row| row.assembly_live = live);
+            self.census.with_row(self.index(), |row| row.assembly_live = live);
         }
+    }
+
+    /// A slab retired a slot at its last generation, so its capacity is
+    /// `capacity_now`: the row keeps the minimum over its instances, the one
+    /// bound every crossing instance satisfies. Reported before any `Full`
+    /// can be answered at the new count.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn report_capacity(&self, capacity_now: u32) {
+        self.census.with_row(self.index(), |row| {
+            row.capacity_now = row.capacity_now.min(capacity_now);
+        });
     }
 
     /// A crossing: `Full` answered, or a merge at the cap. On an `Assembly`
@@ -302,7 +427,7 @@ impl CapRowHandle {
     #[cold]
     #[inline(never)]
     pub(super) fn report_full(&self) {
-        let (census, index) = (&*self.census, self.index);
+        let (census, index) = (&*self.census, self.index());
         census.with_row(index, |row| row.crossings = row.crossings.saturating_add(1));
         let late = self.fill == CapFill::Assembly && census.phase.get() != CensusPhase::Assembling;
         census.note_violations(u32::from(late), "a crossing after the serve mark", index);
@@ -381,7 +506,7 @@ mod tests {
         let (census, _mark) = CapCensus::new(CELL);
         let first = census.register(MARKS).expect("first instance");
         let second = census.register(MARKS).expect("a per-namespace second instance");
-        assert_eq!(first.index, second.index);
+        assert_eq!(first.index(), second.index());
         assert_eq!(census.rows().count(), 1);
         // high_water is the maximum over the instances, crossings the sum.
         fill(&first, 5);
@@ -395,6 +520,7 @@ mod tests {
         assert_eq!(row.assembly_live, 0, "a Serving row keeps no live count");
         assert_eq!(row.entries_max, 16);
         assert_eq!(row.fill, CapFill::Serving);
+        assert_eq!(row.capacity_now, 16, "registration sets the capacity now to the cap");
     }
 
     #[test]
@@ -559,6 +685,81 @@ mod tests {
         assert_eq!(census.cap_assembly_violations(), 0);
         let read = census.row("epoch-marks").expect("row");
         assert_eq!((read.high_water, read.crossings, read.assembly_live), (4, 1, 0));
+    }
+
+    // The unsliced-drop plants: a store dropped holding backing while the
+    // cell serves is counted and asserted; the controls are uncounted.
+
+    /// A capped store's drop accounting as the slab's and the map's storage
+    /// layer makes it: the items it held when it was dropped.
+    struct StoreStub {
+        census: Rc<CapCensus>,
+        items_held: u32,
+    }
+
+    impl Drop for StoreStub {
+        fn drop(&mut self) {
+            self.census.note_store_drop(self.items_held);
+        }
+    }
+
+    fn store(census: &Rc<CapCensus>, items_held: u32) -> StoreStub {
+        StoreStub { census: Rc::clone(census), items_held }
+    }
+
+    #[test]
+    fn a_store_dropped_holding_backing_while_serving_is_asserted_and_counted() {
+        let (census, mark) = CapCensus::new(CELL);
+        mark.take();
+        let held = store(&census, 2);
+        let outcome = catch_unwind(AssertUnwindSafe(|| drop(held)));
+        if cfg!(debug_assertions) {
+            let payload = outcome.expect_err("unsliced-drop: a debug build asserts the drop");
+            let text = panic_text(payload.as_ref());
+            assert!(text.contains("unsliced-drop"), "{text}");
+            assert!(text.contains("cell3"), "{text}");
+        } else {
+            outcome.expect("a release build counts without asserting");
+        }
+        assert_eq!(census.unsliced_drops(), 1, "unsliced-drop: the drop is counted");
+        assert_eq!(census.cap_assembly_violations(), 0);
+    }
+
+    #[test]
+    fn a_store_holding_nothing_frees_nothing_and_is_not_counted() {
+        let (census, mark) = CapCensus::new(CELL);
+        mark.take();
+        drop(store(&census, 0));
+        assert_eq!(census.unsliced_drops(), 0);
+    }
+
+    #[test]
+    fn a_store_dropped_while_assembling_is_an_abandoned_assembly() {
+        let (census, _mark) = CapCensus::new(CELL);
+        drop(store(&census, 3));
+        assert_eq!(census.unsliced_drops(), 0);
+    }
+
+    #[test]
+    fn a_store_dropped_once_stopping_is_process_teardown() {
+        let (census, mark) = CapCensus::new(CELL);
+        mark.take();
+        census.mark_stopping();
+        drop(store(&census, 3));
+        assert_eq!(census.unsliced_drops(), 0);
+    }
+
+    #[test]
+    fn a_store_dropped_while_unwinding_is_counted_and_the_step_panics_once() {
+        let (census, mark) = CapCensus::new(CELL);
+        mark.take();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _held = store(&census, 1);
+            panic!("the step's own failure");
+        }));
+        let payload = outcome.expect_err("the step's failure unwinds");
+        assert_eq!(panic_text(payload.as_ref()), "the step's own failure", "one panic");
+        assert_eq!(census.unsliced_drops(), 1, "unsliced-drop: the drop is counted");
     }
 
     #[test]

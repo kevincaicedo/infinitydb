@@ -1,10 +1,10 @@
 //! `inf-runtime` — the shard-cell runtime (master plan §5, milestone M0-E2):
 //! backend drivers behind one typed contract, the single-threaded cell
-//! executor, typed suspension gates, the timer wheel, scheduler groups, and
-//! the 10-step reactor loop.
+//! executor, typed suspension gates, the fixed timer set with its heap,
+//! scheduler groups, and the 10-step reactor loop.
 //!
 //! This is the only crate allowed to name io_uring/kqueue symbols (§3.3).
-//! `unsafe` is confined to three audited areas — backend FFI, the Rc waker
+//! `unsafe` is confined to three audited areas — backend FFI, the waker
 //! vtable, and type-erased task storage — see `SAFETY.md`.
 //!
 //! Backends: `UringDriver` (Linux, `--features uring`, the performance
@@ -33,6 +33,8 @@ mod driver;
 #[allow(unsafe_code)]
 mod executor;
 pub mod gate;
+pub mod heap;
+pub mod limits;
 #[allow(unsafe_code)]
 pub mod net;
 mod reactor;
@@ -54,8 +56,10 @@ pub use budget::{
     FLOOR_DIVISOR, IoClass, Issue, SealPace,
 };
 pub use cold::{
-    ColdDone, ColdLeak, ColdReadConfig, ColdReadCounters, ColdReads, ColdRefused, ColdWait,
-    ReadClass, TierFileId, UnrepresentableRead,
+    ColdDeliveryBudget, ColdDeliveryProgress, ColdDeliveryState, ColdDone, ColdLeak,
+    ColdPreparationBudget, ColdReadConfig, ColdReadCounters, ColdReadiness, ColdReads, ColdReceipt,
+    ColdRefused, ColdTurn, ColdWait, DeviceId, LogicalId, PairIssuer, ReadClass, TierFileId,
+    UnrepresentableRead,
 };
 pub use driver::{
     AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd,
@@ -63,9 +67,14 @@ pub use driver::{
 };
 pub use executor::{CellExecutor, PollImmediate, TaskId};
 pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};
-pub use reactor::{CellLoop, CellPlane, IterStats, LoopConfig, LoopCx};
+pub use reactor::{
+    CellLoop, CellPlane, IterStats, LoopConfig, LoopCx, ParkCeiling, ParkCeilingTooLong,
+};
 pub use sched::{GroupClass, GroupScheduler};
-pub use timer::{TimerId, TimerWheel};
+pub use timer::{
+    ArmError, Cancelled, Closed, Consumed, OwnerPhase, Reserved, Successor, TimerArm, TimerNotice,
+    TimerOutcome, TimerOwner, TimerSet, Timers,
+};
 pub use token::{CompletionToken, MAX_SLOT, TokenClass};
 
 #[cfg(target_os = "macos")]

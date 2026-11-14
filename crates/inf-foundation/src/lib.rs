@@ -2,9 +2,11 @@
 //!
 //! Types, ids, time/randomness injection seams (L7), stable hashing, CRC16
 //! slot math, varints, the always-on latency histogram, the frozen tripwire
-//! counter names, lifetime identity issuance, and the capped containers cell
-//! code grows through (`bounded`). This crate is dependency-free (Loom
-//! replaces `issue`'s atomics under `--cfg loom` only) and fully safe.
+//! counter names, lifetime identity issuance, the tiered namespace grant
+//! directory and its receipts (`grants`), the capped containers cell code
+//! grows through (`bounded`), and the cell executor's wake bridge (`wake`).
+//! This crate is dependency-free (Loom replaces `issue`'s, `grants`'s and
+//! `wake`'s atomics under `--cfg loom` only) and fully safe.
 #![forbid(unsafe_code)]
 // ADR-0144 D1: a production `match` names every variant of its enum.
 #![cfg_attr(
@@ -24,6 +26,7 @@ mod device;
 pub mod fault;
 mod file_offset;
 mod footprint;
+pub mod grants;
 mod hash;
 mod hist;
 mod ids;
@@ -34,6 +37,7 @@ pub mod rng;
 pub mod time;
 pub mod tripwire;
 pub mod varint;
+pub mod wake;
 
 pub use addr::LogicalAddr;
 pub use crc::{crc16, hashtag};

@@ -57,7 +57,8 @@ pub use read::IckRefSection;
 #[cfg(test)]
 use read::le_u32;
 pub use read::{
-    IckApplyError, IckReadError, IckReader, IckStep, read_ick_counts, read_ick_counts_probed,
+    IckApplyError, IckReadError, IckReader, IckSectionEntry, IckSectionKind, IckStep, IckWalk,
+    SectionFlow, read_ick_counts, read_ick_counts_probed,
 };
 
 pub use read::IckIdxSidecarStep;
@@ -95,7 +96,7 @@ pub const fn ick_align_up(len: usize) -> usize {
 
 /// The section-body bound shared by the writer and the default-configured
 /// loader (ADR-0117 D1): one maximal staging record (the frame bound —
-/// `StagingRing::new` asserts the capacity under it) plus
+/// row 2 of `LogGeometry::new` holds a staging ring's capacity under it) plus
 /// [`ICK_SECTION_SLACK`], so a record at the staging ceiling and its
 /// expiry companion always fit an empty section. `seal_section` asserts
 /// it; the walker seals before a record that would breach it.
@@ -352,6 +353,13 @@ pub fn ick_file_name(id: u64) -> String {
 #[must_use]
 pub fn ick_staging_file_name(id: u64) -> String {
     format!("ckpt-{id:06}.ick.new")
+}
+
+/// Parses `ckpt-NNNNNN.ick.new` → id: the staging name
+/// [`ick_staging_file_name`] writes, by [`parse_ick_file_name`]'s digit rule.
+#[must_use]
+pub(crate) fn parse_ick_staging_file_name(name: &str) -> Option<u64> {
+    parse_ick_file_name(name.strip_suffix(".new")?)
 }
 
 /// Parses `ckpt-NNNNNN.ick` → id (boot scan of the ckpt dir; foreign names
@@ -1865,6 +1873,7 @@ mod tests {
                     sections += 1;
                     assert_eq!(reads, 2, "section {sections}: header + block, nothing else");
                 }
+                IckStep::Parked => panic!("a walk that consumes every item never parks"),
                 IckStep::Done(_) => {
                     assert_eq!(reads, 3, "footer: dispatch header + fixed part + block");
                     break;
@@ -1872,6 +1881,240 @@ mod tests {
             }
         }
         assert_eq!(sections, 5);
+    }
+
+    /// A checkpoint of every class whose sections hold several items: five
+    /// refs, seven images, three live-set and three blob-reference entries
+    /// and a two-entry index sidecar, one section a class.
+    fn write_multi_item_sections(fs: &MemFs, dir: &Path) -> (IckSummary, std::path::PathBuf) {
+        let cfg = CkptConfig { section_bytes: 4096, ..Default::default() };
+        let begin = Lsn::new(crate::lsn::SegmentId(1), 64);
+        let mut w = SyncIckWriter::create_v2(fs.clone(), dir, &cfg, 0, 22, begin, &[16])
+            .expect("create v2");
+        for i in 0..5u64 {
+            w.append_ref(16, 1 << 20, 0x1000 + i, 4096 * (i + 1)).expect("addr ref");
+        }
+        for i in 0..7u8 {
+            let key = [b'k', i];
+            let image = RecordView::StringPostImage { ns: NsId(16), key: &key, value: b"value" };
+            w.append(&image).expect("image");
+        }
+        for id in 0..3u32 {
+            w.append_live_set(16, id, 4096, 0, true).expect("live set");
+        }
+        for i in 0..3u64 {
+            w.append_blob_ref(16, 100 + i, 7 + i, 4096).expect("blob ref");
+        }
+        let meta = IdxSidecarMeta {
+            ns: 16,
+            index_id: 1,
+            generation: 1,
+            key_encoding_version: 1,
+            fixed8: true,
+            maint_rules: TEST_RULES,
+        };
+        w.append_idx_entry(&meta, 0, &7u64.to_be_bytes(), 42).expect("idx entry");
+        w.append_idx_entry(&meta, 1, &8u64.to_be_bytes(), 43).expect("idx entry");
+        w.append_idx_final(&meta, 2).expect("idx final");
+        (w.finish().expect("finish"), dir.join(ick_file_name(22)))
+    }
+
+    /// The walk that parks at every item it can: each record the first
+    /// time it is presented, each entry section after one entry. It logs
+    /// what it consumed, in order, and each section announcement.
+    #[derive(Default)]
+    struct EveryItemParks {
+        log: Vec<String>,
+        entries: Vec<IckSectionEntry>,
+        parked: bool,
+    }
+
+    impl IckWalk<()> for EveryItemParks {
+        fn hybrid(&self) -> bool {
+            true
+        }
+
+        fn enter(&mut self, entry: IckSectionEntry) {
+            self.entries.push(entry);
+        }
+
+        fn record(&mut self, view: RecordView<'_>, bytes: u32) -> Result<SectionFlow, ()> {
+            self.parked = !self.parked;
+            if self.parked {
+                return Ok(SectionFlow::Park);
+            }
+            let mut encoded = Vec::new();
+            view.encode_into(&mut encoded);
+            assert_eq!(encoded.len(), bytes as usize, "a record's announced bytes");
+            self.log.push(format!("record {encoded:?}"));
+            Ok(SectionFlow::Next)
+        }
+
+        fn refs(&mut self, section: IckRefSection<'_>) -> Result<usize, ()> {
+            let first = section.iter().next().expect("an entry");
+            self.log.push(format!("ref {first:?} at {}", section.first_index));
+            Ok(1)
+        }
+
+        fn live_set(&mut self, section: IckLiveSetSection<'_>) -> Result<usize, ()> {
+            let first = section.iter().next().expect("an entry");
+            self.log.push(format!("live {first:?} at {}", section.first_index));
+            Ok(1)
+        }
+
+        fn blob_refs(&mut self, section: IckBlobRefSection<'_>) -> Result<usize, ()> {
+            let first = section.iter().next().expect("an entry");
+            self.log.push(format!("blob {first:?} at {}", section.first_index));
+            Ok(1)
+        }
+
+        fn idx_sidecar(&mut self, step: IckIdxSidecarStep<'_>) -> Result<(), ()> {
+            self.log.push(format!("sidecar {step:?}"));
+            Ok(())
+        }
+    }
+
+    /// A walk parked at every item reads what the whole load reads: every
+    /// record and entry once, in file order, and the same audited summary.
+    /// A resumed section reads no byte again (the block is the reader's),
+    /// folds nothing into the digest again and counts a parked record into
+    /// the presize fold once — the footer's digest and per-namespace audits
+    /// both pass. The whole load's handlers see the same items.
+    #[test]
+    fn a_walk_parked_at_every_item_reads_what_the_whole_load_reads() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let (written, path) = write_multi_item_sections(&fs, dir);
+        assert_eq!(written.sections, 5, "one section a class");
+        let mut whole = Vec::new();
+        let log = std::cell::RefCell::new(&mut whole);
+        let (_, summary) = read_ick_hybrid(
+            &fs,
+            &path,
+            IckReaderConfig::default(),
+            |view| {
+                let mut encoded = Vec::new();
+                view.encode_into(&mut encoded);
+                log.borrow_mut().push(format!("record {encoded:?}"));
+                Ok::<(), ()>(())
+            },
+            |section| {
+                for (at, entry) in section.iter().enumerate() {
+                    log.borrow_mut().push(format!("ref {entry:?} at {at}"));
+                }
+                Ok(())
+            },
+            |section| {
+                for (at, entry) in section.iter().enumerate() {
+                    log.borrow_mut().push(format!("live {entry:?} at {at}"));
+                }
+                Ok(())
+            },
+            |section| {
+                for (at, entry) in section.iter().enumerate() {
+                    log.borrow_mut().push(format!("blob {entry:?} at {at}"));
+                }
+                Ok(())
+            },
+            |step| {
+                log.borrow_mut().push(format!("sidecar {step:?}"));
+                Ok(())
+            },
+        )
+        .expect("the whole load");
+        let mut reader = IckReader::open(&fs, &path, IckReaderConfig::default()).expect("open");
+        let mut walk = EveryItemParks::default();
+        let (mut parks, mut resumed_reads) = (0u32, 0u64);
+        let parked_summary = loop {
+            let (before, announced) = (fs.reads(), walk.entries.len());
+            match reader.next_step_walk(&mut walk).expect("the parked walk") {
+                IckStep::Parked => parks += 1,
+                IckStep::Section { .. } => {}
+                IckStep::Done(summary) => break summary,
+            }
+            // A step that resumed a parked section announced it resumed.
+            if walk.entries.get(announced).is_some_and(|entry| entry.resumed) {
+                resumed_reads += fs.reads() - before;
+            }
+        };
+        assert_eq!(walk.log, whole, "the parked walk consumed what the whole load did");
+        assert_eq!(parked_summary.digest, summary.digest, "the digest folded each section once");
+        assert_eq!(parked_summary.records, summary.records);
+        assert_eq!(parked_summary.entries_per_ns, summary.entries_per_ns, "a record counted once");
+        assert_eq!(parks, 7 + 4 + 2 + 2, "a park at each record and after each entry but a last");
+        assert_eq!(resumed_reads, 0, "a resumed section reads nothing again");
+        let resumed = walk.entries.iter().filter(|entry| entry.resumed).count();
+        assert_eq!(resumed, parks as usize, "each park is announced again, resumed");
+        let refs = walk.entries.iter().rfind(|e| e.kind == IckSectionKind::Refs);
+        let refs = refs.expect("the ref section");
+        assert_eq!((refs.items, refs.items_done), (5, 4), "its last walk resumed at the fifth");
+        assert_eq!(refs.item_bytes_done, 4 * 14, "four entries of fourteen bytes walked before");
+    }
+
+    /// A walk whose entry handlers answer the same count for every view, and
+    /// that consumes every record.
+    struct AnswersEntries(usize);
+
+    impl IckWalk<()> for AnswersEntries {
+        fn hybrid(&self) -> bool {
+            true
+        }
+
+        fn enter(&mut self, _: IckSectionEntry) {}
+
+        fn record(&mut self, _: RecordView<'_>, _: u32) -> Result<SectionFlow, ()> {
+            Ok(SectionFlow::Next)
+        }
+
+        fn refs(&mut self, _: IckRefSection<'_>) -> Result<usize, ()> {
+            Ok(self.0)
+        }
+
+        fn live_set(&mut self, _: IckLiveSetSection<'_>) -> Result<usize, ()> {
+            Ok(self.0)
+        }
+
+        fn blob_refs(&mut self, _: IckBlobRefSection<'_>) -> Result<usize, ()> {
+            Ok(self.0)
+        }
+
+        fn idx_sidecar(&mut self, _: IckIdxSidecarStep<'_>) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    /// Walks the multi-item checkpoint with `walk`, for at most 64 steps.
+    fn walk_multi_item_sections(mut walk: AnswersEntries) {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let (_, path) = write_multi_item_sections(&fs, dir);
+        let mut reader = IckReader::open(&fs, &path, IckReaderConfig::default()).expect("open");
+        for _ in 0..64 {
+            if let IckStep::Done(_) = reader.next_step_walk(&mut walk).expect("a step") {
+                return;
+            }
+        }
+        panic!("the walk made no progress in 64 steps");
+    }
+
+    /// An entry handler's answer is paired with its contract (`IckWalk`):
+    /// none of a view that holds entries would re-park at the same cursor
+    /// with no progress, and one above the view would end the section
+    /// unapplied; each is a handler's defect the debug build stops at.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "an entry handler applied none of its view")]
+    fn an_entry_handler_that_applies_none_of_its_view_is_stopped() {
+        walk_multi_item_sections(AnswersEntries(0));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "an entry handler applied more than its view")]
+    fn an_entry_handler_that_applies_more_than_its_view_is_stopped() {
+        walk_multi_item_sections(AnswersEntries(usize::MAX));
     }
 
     /// Review L03 style row 3: the loader bound is one check in one place.
@@ -2985,5 +3228,9 @@ mod tests {
         assert_eq!(parse_ick_file_name("ckpt-000005.ick.new"), None);
         assert_eq!(parse_ick_file_name("seg-000005.ilog"), None);
         assert_eq!(parse_ick_file_name("ckpt-x.ick"), None);
+        assert_eq!(parse_ick_staging_file_name(&ick_staging_file_name(5)), Some(5));
+        assert_eq!(parse_ick_staging_file_name("ckpt-000005.ick"), None);
+        assert_eq!(parse_ick_staging_file_name("ckpt-x.ick.new"), None);
+        assert_eq!(parse_ick_staging_file_name("MANIFEST.new"), None);
     }
 }

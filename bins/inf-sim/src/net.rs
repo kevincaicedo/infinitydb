@@ -13,10 +13,22 @@ use inf_foundation::FileOffset;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_runtime::{
-    BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken, IoClass, IoOp,
-    RawFd, StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier,
+    AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken,
+    IoClass, IoOp, RawFd, StableBytes, StableBytesMut, SubmitStats, TokenClass, Wait, WriteBarrier,
+    classify_accept_errno,
 };
 use inf_server::SimDisk;
+
+/// How a cell's net hands a connection's pending bytes to a reap.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Delivery {
+    /// A seeded chunk a reap, every scenario's default: frames span reaps,
+    /// so the parser's accumulator is exercised on every run.
+    Chunked,
+    /// The whole pending bytes, up to one receive buffer, a reap: commands
+    /// of one size sent at one step reach the server at one reap.
+    Whole,
+}
 
 /// Fault plants (armed per scenario, fire on seeded draws).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -38,14 +50,19 @@ pub enum Plant {
     /// acked `everysec` op required — must go red.
     StopKill,
     /// One accept-path error (`EMFILE`) on the listener token while
-    /// connections are queued — the F-L11-05 canary (review 2026-08-30):
-    /// an accept failure is a counter, never connection housekeeping;
-    /// the first client (`ConnKey {0, 0}`) must keep being served. Since
-    /// batch 37 (F-L11-02) the model also PARKS the arm the way the real
-    /// backends do: the queued connections stay in the backlog until the
-    /// plane re-arms (its retry timer) or a `Close` returns an fd — a
-    /// plane that never re-arms strands every later client (`STALL`).
+    /// connections are queued: an accept failure is a counter, never
+    /// connection housekeeping, and the first client (`ConnKey {0, 0}`)
+    /// keeps being served. The arm parks as the real backends park an
+    /// exhaustion failure: the queued connections stay in the backlog until
+    /// the plane's retry timer re-arms it or a `Close` returns an fd, so here
+    /// a close may let them in before the retry does. `AcceptBroken` is the
+    /// plant on which only the retry lets them in.
     AcceptError,
+    /// The same accept-path error, of the `Broken` class (`EINVAL`): by the
+    /// driver contract only an `AcceptArm` resumes a broken-parked arm,
+    /// never a `Close`, so the plane's retry timer is the queued clients'
+    /// one way in.
+    AcceptBroken,
     /// One `EIO` on the next read of every tier file, armed on the sim
     /// disk before the cold re-read sweep (`m4-tiered` phase 7; review
     /// 2026-08-30, F-L04-02 / ADR-0119 D2): a device error under a cold
@@ -75,6 +92,81 @@ struct SimConn {
     suppressed: bool,
 }
 
+/// A parked accept arm's class: the two failures the driver contract parks
+/// on. A transient failure delivers nothing and never parks, so it has no
+/// variant here (ADR-0118 D1).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum AcceptPark {
+    /// Descriptor or memory exhaustion: an `AcceptArm`, or any `Close` that
+    /// returns an fd, resumes it.
+    Exhausted,
+    /// A broken listener: only an `AcceptArm` resumes it.
+    Broken,
+}
+
+impl AcceptPark {
+    /// The park the contract's table gives `errno`; `None` for a transient
+    /// failure, which never parks.
+    #[must_use]
+    pub fn of(errno: i32) -> Option<AcceptPark> {
+        match classify_accept_errno(errno) {
+            AcceptFailure::Exhausted => Some(AcceptPark::Exhausted),
+            AcceptFailure::Broken => Some(AcceptPark::Broken),
+            AcceptFailure::Transient => None,
+        }
+    }
+
+    /// Whether a `Close` that returns an fd resumes this park: an exhaustion
+    /// park only, as both real backends do (ADR-0118 D2).
+    #[cfg(not(inf_canary_accept_close_resumes_any))]
+    fn resumes_on_close(self) -> bool {
+        match self {
+            AcceptPark::Exhausted => true,
+            AcceptPark::Broken => false,
+        }
+    }
+
+    /// Canary: a `Close` resumes a park of either class, so a broken
+    /// listener comes back with no retry.
+    #[cfg(inf_canary_accept_close_resumes_any)]
+    fn resumes_on_close(self) -> bool {
+        true
+    }
+}
+
+impl Plant {
+    /// Whether this plant is the accept-retry oracle's leg: a listener that
+    /// only the plane's retry resumes. It alone builds the oracle's watch;
+    /// the match names every plant, so a plant added is classified here.
+    #[must_use]
+    pub fn is_accept_retry_leg(self) -> bool {
+        match self {
+            Plant::AcceptBroken => true,
+            Plant::None
+            | Plant::LostWakeup
+            | Plant::FsyncLies
+            | Plant::StopKill
+            | Plant::AcceptError
+            | Plant::TierReadEio
+            | Plant::TierWriteEio => false,
+        }
+    }
+
+    /// The errno an accept plant delivers, `None` for every other plant.
+    fn accept_errno(self) -> Option<i32> {
+        match self {
+            Plant::AcceptError => Some(libc::EMFILE),
+            Plant::AcceptBroken => Some(libc::EINVAL),
+            Plant::None
+            | Plant::LostWakeup
+            | Plant::FsyncLies
+            | Plant::StopKill
+            | Plant::TierReadEio
+            | Plant::TierWriteEio => None,
+        }
+    }
+}
+
 /// One cell's network endpoint: the listener plus every connection accepted
 /// by this cell. The harness holds the same handle to play the client side.
 #[derive(Debug)]
@@ -82,20 +174,23 @@ pub struct CellNet {
     cell: u16,
     accept_armed: bool,
     accept_token: Option<CompletionToken>,
-    /// Parked after the plant fired: no accepts until `AcceptArm`/`Close`.
-    accept_parked: bool,
-    /// `AcceptArm` ops that resumed a parked arm (the plane's retry witness).
+    /// Parked after the plant fired, with the park's class: no accepts until
+    /// an `AcceptArm`, or a `Close` when the class is `Exhausted`.
+    accept_parked: Option<AcceptPark>,
+    /// Parked arms resumed, by an `AcceptArm` or a `Close`.
     accept_resumes: u64,
+    /// Every `AcceptArm` op this driver received, the first arm included:
+    /// the driver's side of the plane's accept retry.
+    accept_arms: u64,
     backlog: VecDeque<RawFd>,
     conns: BTreeMap<RawFd, SimConn>,
     next_fd: RawFd,
     rng: SplitMix64,
     plant: Plant,
     plant_fired: bool,
-    /// Each reap delivers a connection's whole pending bytes, up to one
-    /// receive buffer, instead of a seeded chunk: commands sent at one
-    /// step arrive at one reap ([`CellNet::deliver_whole`]).
-    whole_chunks: bool,
+    /// What a reap hands each connection's server side
+    /// ([`CellNet::deliver_whole`]).
+    delivery: Delivery,
 }
 
 /// Synthetic listener fd for a cell (never a real fd).
@@ -119,20 +214,33 @@ impl CellNet {
         self.accept_resumes
     }
 
+    /// The parked arm's class, `None` while the arm is up.
+    #[must_use]
+    pub fn accept_parked(&self) -> Option<AcceptPark> {
+        self.accept_parked
+    }
+
+    /// Every `AcceptArm` op the driver received, the first arm included.
+    #[must_use]
+    pub fn accept_arms(&self) -> u64 {
+        self.accept_arms
+    }
+
     pub fn new(cell: u16, seed: u64, plant: Plant) -> Rc<RefCell<CellNet>> {
         Rc::new(RefCell::new(CellNet {
             cell,
             accept_armed: false,
             accept_token: None,
-            accept_parked: false,
+            accept_parked: None,
             accept_resumes: 0,
+            accept_arms: 0,
             backlog: VecDeque::new(),
             conns: BTreeMap::new(),
             next_fd: 0,
             rng: SplitMix64::new(seed ^ 0xD15C_0000 ^ u64::from(cell)),
             plant,
             plant_fired: false,
-            whole_chunks: false,
+            delivery: Delivery::Chunked,
         }))
     }
 
@@ -140,9 +248,17 @@ impl CellNet {
     /// a reap, from now on: commands of one size sent at one step reach
     /// the server at one reap, the burst a stopped-then-resumed process
     /// reads. The seeded chunking stays every other scenario's (no draw is
-    /// taken here, so their traces are unchanged).
-    pub fn deliver_whole(&mut self) {
-        self.whole_chunks = true;
+    /// taken here, so their traces are unchanged). Returns the delivery it
+    /// replaced, which a harness phase that sends one burst whole restores
+    /// at the burst's end ([`Self::restore_delivery`]).
+    pub fn deliver_whole(&mut self) -> Delivery {
+        core::mem::replace(&mut self.delivery, Delivery::Whole)
+    }
+
+    /// Deliver as `delivery` from now on: what [`Self::deliver_whole`]
+    /// replaced, at the end of the burst it was set for.
+    pub fn restore_delivery(&mut self, delivery: Delivery) {
+        self.delivery = delivery;
     }
 
     /// Client side: open a connection to this cell; returns the fd handle.
@@ -199,6 +315,14 @@ impl CellNet {
     pub fn pending_bytes(&self) -> usize {
         self.conns.values().map(|c| c.to_server.len()).sum()
     }
+
+    /// Client→server bytes of the one connection `fd` that the server has
+    /// not taken yet, `None` for an fd this net never opened: a client's
+    /// own share of [`pending_bytes`](Self::pending_bytes), which counts
+    /// every connection of the cell.
+    pub fn unread(&self, fd: RawFd) -> Option<usize> {
+        self.conns.get(&fd).map(|c| c.to_server.len())
+    }
 }
 
 /// `BackendDriver` over a [`CellNet`]. One per cell. Durable scenarios
@@ -223,10 +347,25 @@ pub struct SimDriver {
     /// order: each is submitted at the first driver entry after its hold
     /// lifts, ahead of that entry's own ops.
     held_syncs: Vec<(RawFd, CompletionToken)>,
+    /// Tier reads the disk holds ([`SimDisk::hold_reads`]), submission
+    /// order: each is submitted at the first driver entry after its hold
+    /// lifts, ahead of that entry's own ops.
+    held_reads: Vec<IoOp>,
+    /// The fds of the writes and syncs the last `submit_and_reap` carried
+    /// from the loop: the device's reading of a park's own submit. One
+    /// list, cleared at each submit, its capacity the largest submit's.
+    submitted_io: Vec<RawFd>,
     ops: Vec<IoOp>,
     stats: SubmitStats,
     /// Bytes/ops observed per class (ADR-0088 D8).
     observed: ObservedIo,
+    /// The wait the loop handed the last `submit_and_reap`. The driver never
+    /// blocks on it, since the scheduler owns virtual time, so this is what
+    /// a park asked for: its timeout, read by the oracles.
+    wait: Option<Wait>,
+    /// Each entry's tier writes by namespace directory, when a leg's clause
+    /// reads them ([`SimDriver::tallying_tier_dirs`]).
+    tier_dirs: Option<TierDirTally>,
 }
 
 /// One deferred op: applied AND completed only once the virtual clock
@@ -279,11 +418,41 @@ pub struct ObservedIo {
     pub ops: [u64; IoClass::COUNT],
     pub read_bytes: u64,
     pub read_ops: u64,
+    /// Tier reads the driver completed, a value or an error, counted as it
+    /// hands each completion to the loop: the device's own completion
+    /// marks, which a harness reads between steps against its replies.
+    pub read_completions: u64,
     /// The most tier-class bytes and ops one driver entry carried — what
     /// one MAINTAIN pass submitted for the tier flush, read from the ops'
     /// token class alone (the attainable oracle's disk-side clause).
     pub tier_pass_bytes_max: u64,
     pub tier_pass_ops_max: u64,
+}
+
+/// One namespace directory's tier writes in one driver entry: the writes
+/// whose file has an OS name under `ns-<ns>`, and their bytes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TierDirWrites {
+    pub ns: u32,
+    pub writes: u64,
+    pub bytes: u64,
+}
+
+/// The tier writes of each driver entry by namespace directory: a turn's
+/// shape read from the device's side. A driver op carries an fd and a
+/// token, so each write is keyed by the `ns-<id>` component of an OS name
+/// of the file its fd is open on, read from the sim disk at the entry;
+/// the token's lane, the server's own recycled allocation, is never read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TierDirTally {
+    /// Driver entries so far: the entry [`Self::entry`] belongs to.
+    pub entries: u64,
+    /// The last entry's tier writes, one row a directory, in the order of
+    /// each directory's first write.
+    pub entry: Vec<TierDirWrites>,
+    /// Tier writes over the driver's life whose file has no OS name under
+    /// a `ns-<id>` directory: a shape read from no file.
+    pub unnamed_writes: u64,
 }
 
 impl ObservedIo {
@@ -303,10 +472,34 @@ impl SimDriver {
             clock: None,
             pending_syncs: Vec::new(),
             held_syncs: Vec::new(),
+            held_reads: Vec::new(),
+            submitted_io: Vec::new(),
             ops: Vec::new(),
             stats: SubmitStats::default(),
             observed: ObservedIo::default(),
+            wait: None,
+            tier_dirs: None,
         }
+    }
+
+    /// The same driver, keeping each entry's tier writes by namespace
+    /// directory ([`TierDirTally`]): one pass over the sim disk's OS names
+    /// per tier write, so only a leg whose clause reads the tally asks.
+    #[must_use]
+    pub fn tallying_tier_dirs(self) -> SimDriver {
+        SimDriver { tier_dirs: Some(TierDirTally::default()), ..self }
+    }
+
+    /// The tally of each entry's tier writes by namespace directory, on a
+    /// driver that keeps it.
+    pub fn tier_dirs(&self) -> Option<&TierDirTally> {
+        self.tier_dirs.as_ref()
+    }
+
+    /// The wait the loop handed the last `submit_and_reap`, `None` before
+    /// the first: a park's timeout as the loop asked for it.
+    pub fn last_wait(&self) -> Option<Wait> {
+        self.wait
     }
 
     /// A driver whose file ops execute against `disk` (M2-S18).
@@ -358,12 +551,50 @@ impl SimDriver {
         self.observed
     }
 
-    /// Tier-class bytes and ops pushed and not yet submitted — what a cut
-    /// catches between the plane's push and the next driver entry; the
-    /// accounting oracle adds them to the observed ledger for an exact
-    /// equality.
-    pub fn queued_tier_io(&self) -> (u64, u64) {
+    /// A planted canary's reader: the tier bytes and ops in the driver's own
+    /// queue, which every entry drains, read by the spend's step check in
+    /// place of the cell loop's queue.
+    #[cfg(inf_canary_tier_spend_driver_queue)]
+    pub fn driver_queue_tier_io(&self) -> (u64, u64) {
         tier_io_of(&self.ops)
+    }
+
+    /// Fdatasyncs the disk holds now ([`SimDisk::hold_syncs`]): submitted
+    /// by the plane and kept from the device until the hold lifts — the
+    /// harness's own reading of a held barrier, no product counter.
+    pub fn held_syncs(&self) -> usize {
+        self.held_syncs.len()
+    }
+
+    /// Tier reads the disk holds now ([`SimDisk::hold_reads`]): issued by
+    /// the cell's cold engine and kept from the device until the hold lifts
+    /// — the harness's own reading of a queued read, no product counter.
+    pub fn held_reads(&self) -> usize {
+        self.held_reads.len()
+    }
+
+    /// Whether a write or a sync on a file `named` accepts is submitted
+    /// and not completed: deferred on the device's timeline, or held by
+    /// the disk. Reads do not count. The device's own reading, no product
+    /// counter.
+    pub fn io_in_flight_named(&self, named: fn(&std::path::Path) -> bool) -> bool {
+        let Some(disk) = self.disk.as_ref() else { return false };
+        let pending = self.pending_syncs.iter().filter(|pending| match pending.kind {
+            PendingKind::Fsync | PendingKind::WriteThrough { .. } | PendingKind::Write { .. } => {
+                true
+            }
+            PendingKind::Read { .. } => false,
+        });
+        let mut fds = pending.map(|pending| pending.fd).chain(self.held_syncs.iter().map(|h| h.0));
+        fds.any(|fd| disk.fd_named(fd, named))
+    }
+
+    /// Whether the last `submit_and_reap` carried a write or a sync on a
+    /// file `named` accepts, from the loop's own ops; a held sync it
+    /// released was in flight already and is not counted.
+    pub fn submitted_named(&self, named: fn(&std::path::Path) -> bool) -> bool {
+        let Some(disk) = self.disk.as_ref() else { return false };
+        self.submitted_io.iter().any(|&fd| disk.fd_named(fd, named))
     }
 }
 
@@ -390,8 +621,39 @@ fn release_held_syncs(
     ops.splice(0..0, released);
 }
 
+/// Moves every held tier read whose hold has lifted to the front of `ops`,
+/// in submission order, ahead of the released syncs' turn: a read held
+/// before the drain's own ops is submitted first, as the held syncs are.
+fn release_held_reads(disk: Option<&SimDisk>, held_reads: &mut Vec<IoOp>, ops: &mut Vec<IoOp>) {
+    let Some(disk) = disk else { return };
+    let held = |op: &IoOp| match op {
+        IoOp::TierRead { fd, .. } => disk.read_held(*fd),
+        IoOp::LogWrite { .. }
+        | IoOp::Fdatasync { .. }
+        | IoOp::AcceptArm { .. }
+        | IoOp::RecvArm { .. }
+        | IoOp::RecvDisarm { .. }
+        | IoOp::Send { .. }
+        | IoOp::Close { .. } => false,
+    };
+    if held_reads.iter().all(&held) {
+        return;
+    }
+    let mut released = Vec::new();
+    let mut kept = Vec::with_capacity(held_reads.len());
+    for op in held_reads.drain(..) {
+        if held(&op) {
+            kept.push(op);
+        } else {
+            released.push(op);
+        }
+    }
+    *held_reads = kept;
+    ops.splice(0..0, released);
+}
+
 /// The tier-class bytes and ops among `ops`, by each op's token class.
-fn tier_io_of(ops: &[IoOp]) -> (u64, u64) {
+pub(crate) fn tier_io_of(ops: &[IoOp]) -> (u64, u64) {
     let is_tier = |token: CompletionToken| IoClass::of(token.class()) == Some(IoClass::TierFlush);
     let mut tally = (0u64, 0u64);
     for op in ops {
@@ -412,6 +674,41 @@ fn tier_io_of(ops: &[IoOp]) -> (u64, u64) {
         }
     }
     tally
+}
+
+/// One driver entry's tier writes folded into `tally` by the namespace
+/// directory each write's file sits in.
+fn tally_tier_dirs(disk: Option<&SimDisk>, ops: &[IoOp], tally: &mut TierDirTally) {
+    tally.entries += 1;
+    tally.entry.clear();
+    for op in ops {
+        let IoOp::LogWrite { fd, data, token, .. } = op else { continue };
+        if IoClass::of(token.class()) != Some(IoClass::TierFlush) {
+            continue;
+        }
+        let names = disk.map(|disk| disk.file_fd_names(*fd)).unwrap_or_default();
+        let Some(ns) = names.iter().find_map(|name| ns_dir_of(name)) else {
+            tally.unnamed_writes += 1;
+            continue;
+        };
+        let bytes = u64::from(data.len());
+        match tally.entry.iter_mut().find(|row| row.ns == ns) {
+            Some(row) => {
+                row.writes += 1;
+                row.bytes += bytes;
+            }
+            None => tally.entry.push(TierDirWrites { ns, writes: 1, bytes }),
+        }
+    }
+}
+
+/// The `<id>` of the `ns-<id>` directory right under a `shard-N` directory
+/// that `path` sits in: how the data directory lays out a namespace's
+/// files. `None` for any other path.
+fn ns_dir_of(path: &std::path::Path) -> Option<u32> {
+    let mut parts = path.components().map(|part| part.as_os_str().to_str());
+    parts.find(|part| part.is_some_and(|part| part.starts_with("shard-")))?;
+    parts.next()??.strip_prefix("ns-")?.parse().ok()
 }
 
 /// Queue a deferred op in due order. Write-through and plain-write draws
@@ -503,15 +800,25 @@ impl BackendDriver for SimDriver {
     fn submit_and_reap(
         &mut self,
         pool: &mut BufferPool,
-        _wait: Wait,
+        wait: Wait,
         out: &mut Vec<Completion>,
     ) -> io::Result<usize> {
+        self.wait = Some(wait);
+        self.submitted_io.clear();
+        for op in &self.ops {
+            if let IoOp::LogWrite { fd, .. } | IoOp::Fdatasync { fd, .. } = op {
+                self.submitted_io.push(*fd);
+            }
+        }
         let before = out.len();
         let mut net = self.net.borrow_mut();
         let submitted = self.ops.len() as u64;
         let (tier_bytes, tier_ops) = tier_io_of(&self.ops);
         self.observed.tier_pass_bytes_max = self.observed.tier_pass_bytes_max.max(tier_bytes);
         self.observed.tier_pass_ops_max = self.observed.tier_pass_ops_max.max(tier_ops);
+        if let Some(tally) = self.tier_dirs.as_mut() {
+            tally_tier_dirs(self.disk.as_ref(), &self.ops, tally);
+        }
 
         // M2.5-S14: release fsyncs whose device service time elapsed.
         // The flush is deferred WITH the completion — during the stall
@@ -575,11 +882,12 @@ impl BackendDriver for SimDriver {
         // syncs, which needs `self` free of the `ops` borrow.
         let mut ops = core::mem::take(&mut self.ops);
         release_held_syncs(self.disk.as_ref(), &mut self.held_syncs, &mut ops);
+        release_held_reads(self.disk.as_ref(), &mut self.held_reads, &mut ops);
         for op in ops.drain(..) {
             match op {
                 IoOp::AcceptArm { token, .. } => {
-                    if net.accept_parked {
-                        net.accept_parked = false;
+                    net.accept_arms += 1;
+                    if net.accept_parked.take().is_some() {
                         net.accept_resumes += 1;
                     }
                     net.accept_armed = true;
@@ -613,9 +921,10 @@ impl BackendDriver for SimDriver {
                     }
                     out.push(Completion { token, result: CompletionResult::Closed });
                     // An fd returned: an exhaustion-parked arm resumes
-                    // (the driver contract's own resume path).
-                    if net.accept_parked {
-                        net.accept_parked = false;
+                    // (the driver contract's own resume path); a broken
+                    // listener waits for the consumer's `AcceptArm`.
+                    if net.accept_parked.is_some_and(AcceptPark::resumes_on_close) {
+                        net.accept_parked = None;
                         net.accept_resumes += 1;
                     }
                 }
@@ -719,6 +1028,12 @@ impl BackendDriver for SimDriver {
                         .disk
                         .as_ref()
                         .expect("tiered sim scenarios construct SimDriver::with_disk (M4-S04)");
+                    // A held read reaches the device only once its hold
+                    // lifts: it is observed then, not now.
+                    if disk.read_held(fd) {
+                        self.held_reads.push(IoOp::TierRead { fd, offset, buf, token });
+                        continue;
+                    }
                     self.observed.read_bytes += u64::from(buf.len());
                     self.observed.read_ops += 1;
                     // Bandwidth model (ADR-0088 D8): the read lands at its
@@ -774,23 +1089,33 @@ impl BackendDriver for SimDriver {
         self.ops = ops;
 
         // Accept everything queued (multishot semantics) — unless parked.
-        if net.accept_armed && !net.accept_parked {
+        if net.accept_armed && net.accept_parked.is_none() {
             let token = net.accept_token.expect("armed implies token");
-            // The accept-error plant: the kernel refused a QUEUED accept
-            // (fd limit). The error rides the listener token (the plane
-            // must not route it to a connection, F-L11-05) and the arm
-            // parks with the backlog intact (F-L11-02): only the plane's
-            // re-arm or a `Close` lets the queued clients in.
-            if net.plant == Plant::AcceptError && !net.plant_fired && net.backlog.len() >= 2 {
-                // The limit lands mid-batch: one client is let in first
-                // (F-L11-05's live `{0, 0}`), the rest stay queued.
+            // The accept plants: the kernel refused a QUEUED accept. The
+            // error rides the listener token, never a connection's, and the
+            // arm parks with the backlog intact under the contract's class
+            // for the errno: only the plane's re-arm, or for an exhaustion
+            // park a `Close`, lets the queued clients in. A transient errno
+            // parks nothing, as the contract surfaces none, so a plant of
+            // one never fires.
+            let planted = net
+                .plant
+                .accept_errno()
+                .and_then(|errno| AcceptPark::of(errno).map(|park| (errno, park)));
+            if let Some((errno, park)) = planted
+                && !net.plant_fired
+                && net.backlog.len() >= 2
+            {
+                // The failure lands mid-batch: one client is let in first
+                // (the live `{0, 0}` the error must not tear down), the rest
+                // stay queued.
                 let fd = net.backlog.pop_front().expect("two queued");
                 out.push(Completion { token, result: CompletionResult::Accepted { fd } });
                 net.plant_fired = true;
-                net.accept_parked = true;
+                net.accept_parked = Some(park);
                 out.push(Completion {
                     token,
-                    result: CompletionResult::Error { errno: libc::EMFILE, buf: None },
+                    result: CompletionResult::Error { errno, buf: None },
                 });
             } else {
                 while let Some(fd) = net.backlog.pop_front() {
@@ -804,7 +1129,7 @@ impl BackendDriver for SimDriver {
         // frames exercise the parser's accumulator on every run.
         let fds: Vec<RawFd> = net.conns.keys().copied().collect();
         for fd in fds {
-            let CellNet { conns, rng, plant, plant_fired, whole_chunks, .. } = &mut *net;
+            let CellNet { conns, rng, plant, plant_fired, delivery, .. } = &mut *net;
             let Some(conn) = conns.get_mut(&fd) else { continue };
             if !conn.recv_armed || conn.server_closed || conn.suppressed {
                 continue;
@@ -831,7 +1156,10 @@ impl BackendDriver for SimDriver {
             }
             let Some(buf) = pool.try_lease(LeaseKind::Recv) else { continue };
             let max = conn.to_server.len().min(pool.buf_size());
-            let chunk = if *whole_chunks { max } else { 1 + (rng.next_u64() as usize) % max };
+            let chunk = match delivery {
+                Delivery::Whole => max,
+                Delivery::Chunked => 1 + (rng.next_u64() as usize) % max,
+            };
             let bytes = pool.bytes_mut(buf);
             for (i, b) in conn.to_server.drain(..chunk).enumerate() {
                 bytes[i] = b;
@@ -843,6 +1171,8 @@ impl BackendDriver for SimDriver {
         }
 
         let produced = out.len() - before;
+        let reads = out[before..].iter().filter(|c| c.token.class() == TokenClass::TierRead);
+        self.observed.read_completions += reads.count() as u64;
         self.stats = SubmitStats { syscalls: 1, sqes: submitted, cqes: produced as u64 };
         Ok(produced)
     }
@@ -866,5 +1196,24 @@ impl BackendDriver for SimDriver {
 
     fn submit_stats(&self) -> SubmitStats {
         self.stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ns_dir_of;
+    use std::path::Path;
+
+    /// A tier file is keyed by the `ns-<id>` directory right under its
+    /// shard; a log segment, a namespace-like name outside a shard and a
+    /// malformed id key nothing.
+    #[test]
+    fn a_tier_file_is_keyed_by_its_namespace_directory() {
+        assert_eq!(ns_dir_of(Path::new("node/shard-1/ns-16/cold/tier-000000.itier")), Some(16));
+        assert_eq!(ns_dir_of(Path::new("/data/shard-0/ns-7/cold/tier-000003.itier")), Some(7));
+        assert_eq!(ns_dir_of(Path::new("node/shard-0/seg-000000.ilog")), None);
+        assert_eq!(ns_dir_of(Path::new("ns-3/shard-0/seg-000000.ilog")), None);
+        assert_eq!(ns_dir_of(Path::new("node/shard-0/ns-x/cold/tier-000000.itier")), None);
+        assert_eq!(ns_dir_of(Path::new("node/shard-0")), None);
     }
 }

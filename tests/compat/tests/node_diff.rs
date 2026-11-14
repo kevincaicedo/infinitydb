@@ -34,6 +34,11 @@
 //! Gating: `INFINITYD_BIN` names the binary (set by `just compat` and
 //! CI); unset skips loudly. The redis oracle follows the diff.rs rules.
 
+// nextest-stall-default: each tiered phase writes at most 52 keys, values up
+// to 64 KiB (about 1.5 MiB in all), in a window of at least its 64 MiB
+// MEM-BUDGET per cell; no write parks (ADR-0053 D4), so the stall bound is
+// never read.
+
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;

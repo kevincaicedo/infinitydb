@@ -26,10 +26,11 @@ use inf_alloc::BufferPool;
 use inf_fabric::{CellFabric, Mesh, MeshConfig};
 use inf_foundation::time::{Clock, StdClock};
 use inf_foundation::{CellId, KeyHasher};
+use inf_runtime::limits::PARK_CEILING_MAX;
 use inf_runtime::net::{bound_port, listen_reuseport, pin_current_thread};
-use inf_runtime::{BackendDriver, CellLoop, LoopConfig};
+use inf_runtime::{BackendDriver, CellLoop, LoopConfig, ParkCeiling};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane, StdSegmentFs};
-use inf_store::{Keyspace, StoreConfig};
+use inf_store::{KeyspaceSeed, StoreConfig};
 
 /// How often (iterations) each cell refreshes its INFO stats snapshot.
 const STATS_EVERY: u64 = 1024;
@@ -38,6 +39,16 @@ const STATS_EVERY: u64 = 1024;
 const DEFAULT_CELLS: inf_foundation::CellCount = match inf_foundation::CellCount::new(4) {
     Ok(cells) => cells,
     Err(_) => panic!("four cells is a valid topology"),
+};
+
+/// The shipped fabric mesh: the two `limits` rows, checked when the binary
+/// is built, so a pair the plane's check refuses fails the build.
+const FABRIC_MESH: MeshConfig = match inf_server::checked_mesh_config(
+    inf_server::limits::FABRIC_RING_SLOTS_PER_PEER,
+    inf_server::limits::FABRIC_CREDITS_PER_PEER,
+) {
+    Ok(mesh) => mesh,
+    Err(_) => panic!("the shipped fabric mesh fails the plane's mesh check"),
 };
 
 #[derive(Clone, Debug)]
@@ -50,7 +61,8 @@ struct Args {
     pin_start: Option<usize>,
     pin_stride: u16,
     route_local_only: bool,
-    park_us: Option<u64>,
+    /// `--park-us`, checked at the flag: at most `PARK_CEILING_MAX`.
+    park: Option<ParkCeiling>,
     /// Durable-plane root (M2-S08/S11): `--data-dir` enables the catalog,
     /// per-cell log recovery, checkpoints, and truncation. Absent = the
     /// memory-only node (the M2-S09 zero-cost posture).
@@ -137,6 +149,9 @@ struct Args {
     /// never refuses — it is a pacing point — so this is a latency/memory
     /// trade (resident = 2 × capacity × cells), and shrinking it is the
     /// deliberate way to provoke the pressure regime on a healthy device.
+    /// A segment holds at least one buffer's frame: `--segment-bytes` is at
+    /// least `--log-staging-mib` × 2²⁰ (and under the fua class a multiple
+    /// of 4096), or the node refuses to start before it listens (ADR-0191).
     log_staging_mib: u32,
     /// The graceful stop's bound per cell (ADR-0124 D3; Redis's
     /// `shutdown-timeout` is 10 s). Past it the node exits 1.
@@ -195,7 +210,7 @@ impl Default for Args {
             pin_start: None,
             pin_stride: 2,
             route_local_only: false,
-            park_us: None,
+            park: None,
             data_dir: None,
             ckpt_interval_bytes: inf_server::DEFAULT_CKPT_INTERVAL_BYTES,
             segment_bytes: inf_server::DEFAULT_SEGMENT_BYTES,
@@ -271,8 +286,17 @@ fn parse_args() -> Result<Args, String> {
             "--deasync-dispatch" => args.deasync_dispatch = true,
             "--no-deasync-dispatch" => args.deasync_dispatch = false,
             "--park-us" => {
-                args.park_us =
-                    Some(take("--park-us")?.parse().map_err(|e| format!("--park-us: {e}"))?);
+                let micros: u64 =
+                    take("--park-us")?.parse().map_err(|e| format!("--park-us: {e}"))?;
+                // ADR-0003 A1.2.7: every park a cell loop issues ends within its ceiling, at
+                // most PARK_CEILING_MAX; a longer one is refused here, before any cell starts.
+                let ceiling = ParkCeiling::new(std::time::Duration::from_micros(micros));
+                args.park = Some(ceiling.map_err(|_| {
+                    format!(
+                        "--park-us must be <= {} (the longest park a cell loop takes)",
+                        PARK_CEILING_MAX.as_micros()
+                    )
+                })?);
             }
             "--data-dir" => args.data_dir = Some(take("--data-dir")?.into()),
             "--ckpt-interval-bytes" => {
@@ -410,11 +434,15 @@ fn parse_args() -> Result<Args, String> {
                 args.log_staging_mib = take("--log-staging-mib")?
                     .parse()
                     .map_err(|e| format!("--log-staging-mib: {e}"))?;
-                // 1 MiB holds any wire-legal command's record; 64 MiB is
-                // the frame decoder bound (every written frame must stay
-                // readable by a default-configured reader).
-                if !(1..=64).contains(&args.log_staging_mib) {
-                    return Err("--log-staging-mib is 1..=64 (the frame decoder bound)".into());
+                // 1 MiB holds any wire-legal command's record; the top is
+                // the frame decoder bound (every written frame stays
+                // readable by a default-configured reader), so `mib << 20`
+                // is exact in a u32.
+                let max_mib = inf_server::DEFAULT_MAX_FRAME_LEN >> 20;
+                if !(1..=max_mib).contains(&args.log_staging_mib) {
+                    return Err(format!(
+                        "--log-staging-mib is 1..={max_mib} (the frame decoder bound)"
+                    ));
                 }
             }
             "--shutdown-timeout-ms" => {
@@ -727,6 +755,35 @@ fn check_block_size(props: &inf_server::IoProperties) -> Result<(), String> {
     Ok(())
 }
 
+/// The boot's refusal of a log geometry (ADR-0191 D3): one stderr line
+/// naming both flags, the type's sentence and the move that makes the pair
+/// legal, then exit 2, the usage-error contract of the boot flags. It runs
+/// before any cell, pool or mesh exists and before the node listens.
+/// `floor` is the largest frame the staging ring seals under the class.
+fn refuse_log_geometry(refused: inf_server::LogGeometryError, floor: u32) -> ! {
+    use inf_server::LogGeometryError;
+    let fix = match refused {
+        LogGeometryError::SegmentBelowFrame { frame_bytes, .. } => {
+            format!("raise --segment-bytes to at least {frame_bytes}, or lower --log-staging-mib")
+        }
+        LogGeometryError::SegmentNotAligned { align, .. } => {
+            format!("make --segment-bytes a multiple of {align} of at least {floor}")
+        }
+        LogGeometryError::StagingBelowMinimalFrame { .. }
+        | LogGeometryError::StagingAboveDecoderBound { .. } => {
+            format!(
+                "give --log-staging-mib a value in 1..={}",
+                inf_server::DEFAULT_MAX_FRAME_LEN >> 20
+            )
+        }
+        LogGeometryError::FramesInFlightOutOfRange { max, .. } => {
+            format!("give --frames-in-flight auto or a value in 1..={max}")
+        }
+    };
+    eprintln!("infinityd: --segment-bytes/--log-staging-mib: {refused}; {fix}");
+    std::process::exit(2);
+}
+
 fn short_uuid(uuid: &str) -> String {
     if uuid.is_empty() {
         "(no uuid)".to_owned()
@@ -777,8 +834,7 @@ fn main() {
     // Linux-only (see the cfg block below); on other targets the binding is
     // consumed by `into_iter()` and never needs `mut`.
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut fabrics =
-        Mesh::new(args.cells.get(), MeshConfig { ring_capacity: 4096, data_credits: 1024 });
+    let mut fabrics = Mesh::new(args.cells.get(), FABRIC_MESH);
 
     // Doorbell wakeups (M0-R1, Linux): each cell adopts an eventfd watch;
     // peers wake a parked cell through the park board + LoopWaker. The dev
@@ -931,8 +987,20 @@ fn main() {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let (control, ckpt_issuers) =
-            inf_server::spawn_control(dir.clone(), catalog.as_ref(), args.cells, boot_unix_ms);
+        // A catalog over the node's tiered namespace lifetimes is refused
+        // here, before any cell (ADR-0148 D5): nothing of it is served.
+        let (control, ckpt_issuers) = match inf_server::spawn_control(
+            dir.clone(),
+            catalog.as_ref(),
+            args.cells,
+            boot_unix_ms,
+        ) {
+            Ok(started) => started,
+            Err(refused) => {
+                eprintln!("infinityd: boot refused: {refused}");
+                std::process::exit(1);
+            }
+        };
         // Device-model lifecycle (M4.5-S42, ADR-0091 D1): the file, the
         // device's identity, and — under `auto` — the probe, before any
         // cell starts. A malformed or foreign file is a refusal, never a
@@ -1046,17 +1114,29 @@ fn main() {
                 seal_barriers_per_s / u64::from(args.cells.get())
             );
         }
-        if args.segment_bytes % inf_server::FRAME_ALIGN != 0
-            && io.io_mode == inf_server::SegmentIoMode::Direct
-        {
-            eprintln!(
-                "infinityd: --segment-bytes {} is not a multiple of {} — required by the fua class",
-                args.segment_bytes,
-                inf_server::FRAME_ALIGN
-            );
-            std::process::exit(1);
-        }
-        let boot = (dir, catalog, control, io, seal_barriers_per_s, frames_in_flight, provenance);
+        // ADR-0191 D3: the log's geometry is judged here, where the class
+        // is known, before any cell, pool or mesh exists and before the
+        // node listens. Every cell's ring and rotor are built from it.
+        let staging = inf_server::StagingConfig {
+            capacity_bytes: args.log_staging_mib << 20,
+            frames_in_flight,
+        };
+        let segment = inf_server::SegmentConfig {
+            segment_bytes: args.segment_bytes,
+            io_mode: io.io_mode,
+            fua_max_frame_bytes: io.fua_max_frame_bytes,
+            recycle_slots: args.segment_recycle_slots,
+            prealloc: args.recycle_wait,
+            ..Default::default()
+        };
+        let geometry = match inf_server::LogGeometry::new(staging, segment) {
+            Ok(geometry) => geometry,
+            Err(refused) => refuse_log_geometry(
+                refused,
+                inf_server::max_sealed_frame_bytes(staging, io.io_mode),
+            ),
+        };
+        let boot = (dir, catalog, control, io, seal_barriers_per_s, geometry, provenance);
         (boot, ckpt_issuers)
     });
     // Each cell takes its own checkpoint allowance (ADR-0159 A1.2). The
@@ -1192,8 +1272,10 @@ type Boot = Option<(
     inf_server::IoProperties,
     // The seal pacer's device rate (ADR-0088 D2b arm; 0 = off).
     u64,
-    // K, resolved from the barrier class at boot (ADR-0087 D5 as amended).
-    u8,
+    // The log's checked geometry: the staging ring of K buffers, K resolved
+    // from the barrier class at boot (ADR-0087 D5 as amended), beside the
+    // segment (ADR-0191 D3).
+    inf_server::LogGeometry,
     inf_server::IoProvenance,
 )>;
 
@@ -1300,28 +1382,24 @@ fn cell_main(
     // blocking exception, now sliced). Progress/summary lines come from
     // the control thread's recovery board.
     mark(14); // setup:keyspace
-    let mut ks = Keyspace::new(StoreConfig { hasher, ..StoreConfig::default() });
+    // The node's keyspace is cataloged (ADR-0189 D4): seeded from `META`'s
+    // decode, or the empty catalog of a fresh data directory, so a
+    // namespace entry changes only with the catalog writer's receipt. A
+    // node with no data directory has no catalog writer and answers no DDL.
+    // The plane builds it from this seed on its cell's census.
+    let store_cfg = StoreConfig { hasher, ..StoreConfig::default() };
+    let seed = match &boot {
+        Some((_, catalog, ..)) => KeyspaceSeed::Cataloged {
+            cfg: store_cfg,
+            catalog: catalog.clone().unwrap_or_else(inf_store::NsCatalog::empty),
+        },
+        None => KeyspaceSeed::Uncataloged { cfg: store_cfg, specs: Vec::new() },
+    };
     let mut durable = None;
-    if let Some((dir, catalog, control, io, seal_barriers_per_s, frames_in_flight, provenance)) =
-        &boot
-    {
-        if let Some(catalog) = catalog {
-            ks.seed_catalog(catalog).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
-        }
+    if let Some((dir, _catalog, control, io, seal_barriers_per_s, geometry, provenance)) = &boot {
         let cfg = inf_server::DurableConfig {
             data_dir: dir.clone(),
-            staging: inf_server::StagingConfig {
-                capacity_bytes: args.log_staging_mib << 20,
-                frames_in_flight: *frames_in_flight,
-            },
-            segment: inf_server::SegmentConfig {
-                segment_bytes: args.segment_bytes,
-                io_mode: io.io_mode,
-                fua_max_frame_bytes: io.fua_max_frame_bytes,
-                recycle_slots: args.segment_recycle_slots,
-                prealloc: args.recycle_wait,
-                ..Default::default()
-            },
+            geometry: *geometry,
             // ADR-0088 D4 as amended twice (M4.5-S34 campaign M3; the
             // second amendment): the cap's replay term is `min(qd1, qd4 ÷
             // cells)` when the model carries both read rows, `qd4 ÷
@@ -1372,16 +1450,19 @@ fn cell_main(
         durable = Some((cfg, std::sync::Arc::clone(control)));
     }
     mark(15); // setup:plane
-    let (mut plane, serve_mark) = ServerPlane::new(
+    // A refused seed or timer assembly ends the cell's setup before its
+    // loop exists, and the cell's thread ends the process with its text.
+    let (mut plane, serve_mark, timer_set) = ServerPlane::new(
         CellId(cell),
         args.cells.get(),
         listener.into_raw_fd(), // the driver owns the listener fd now
-        ks,
+        seed,
         fabric,
         Rc::clone(&node),
         NoopObserver,
         args.route_local_only,
-    );
+    )
+    .map_err(std::io::Error::other)?;
     if let Some((cfg, control)) = durable {
         let issuer = ckpt_issuer.ok_or_else(|| {
             std::io::Error::other("a durable boot minted no checkpoint issuer for this cell")
@@ -1416,13 +1497,20 @@ fn cell_main(
     plane.set_park_flags(std::sync::Arc::clone(&wiring.park_flags));
     // Multi-cell dev-tier (kqueue, no wakeups) still parks briefly so a
     // parked peer notices doorbells within the ceiling.
-    let park_us = args.park_us.unwrap_or(if args.cells.get() > 1 { 500 } else { 5_000 });
+    // These defaults are this binary's settings, not bounds: the bound is PARK_CEILING_MAX,
+    // which the flag's check and the ceiling's one constructor hold.
+    let park_us = if args.cells.get() > 1 { 500 } else { 5_000 };
+    let park = match args.park {
+        Some(ceiling) => ceiling,
+        None => ParkCeiling::new(std::time::Duration::from_micros(park_us))
+            .map_err(|refused| std::io::Error::other(refused.to_string()))?,
+    };
     let config = LoopConfig {
-        park_default: Some(std::time::Duration::from_micros(park_us)),
+        park_default: park,
         remote_first_execute: args.remote_first_execute,
         ..Default::default()
     };
-    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark);
+    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set);
 
     mark(16); // setup:loop — the next publish is drive_recovery's phase 1
     let mut iterations: u64 = 0;
@@ -1473,14 +1561,21 @@ fn cell_main(
             if wiring.drained_cells.load(std::sync::atomic::Ordering::Acquire) == args.cells.get() {
                 return Ok(());
             }
+            // Only a cell still draining takes the deadline, so the line
+            // names a cell that holds the stop and the wait that holds it
+            // (ADR-0199 D3); a drained cell keeps iterating for its peers.
             #[allow(
                 clippy::disallowed_methods,
                 reason = "the operator's wall-clock stop bound, never oracle input"
             )]
             let now = std::time::Instant::now();
-            if now > due {
+            if phase != inf_server::StopPhase::Drained && now > due {
+                let hold = plane
+                    .stop_hold()
+                    .map_or_else(|| "no wait named yet".to_owned(), |hold| format!("{hold:?}"));
                 return Err(std::io::Error::other(format!(
-                    "stop drain timed out after {} ms in phase {:?} ({} of {} cells drained)",
+                    "stop drain timed out after {} ms in phase {:?}, held by {hold} ({} of {} \
+                     cells drained)",
                     args.shutdown_timeout_ms,
                     plane.stop_phase(),
                     wiring.drained_cells.load(std::sync::atomic::Ordering::Acquire),

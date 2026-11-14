@@ -38,7 +38,8 @@ impl Keyspace {
     /// bound, checked **before** any mmap — ADR-0062 D4). Command
     /// routing to tiered tables remains the standing wiring obligation;
     /// the flush/demotion drivers and the harnesses reach the table
-    /// through [`tiered_store_mut`](Self::tiered_store_mut).
+    /// through [`tiered_store_mut`](Self::tiered_store_mut). The table's
+    /// capped holders register on `census`, the cell's (ADR-0163 D2).
     ///
     /// # Errors
     /// [`TieredCreateError`] — refusal mutates nothing.
@@ -48,12 +49,13 @@ impl Keyspace {
         config: AddressSpaceConfig,
         demote: DemotionConfig,
         initial_keys: usize,
+        census: &Rc<CapCensus>,
     ) -> Result<(), TieredCreateError> {
         if self.tiered_stores.iter().any(|(nid, _)| *nid == ns) {
             return Err(TieredCreateError::Exists);
         }
         self.tiered_admit_check(config.reserve_bytes as u64)?;
-        let mut table = TieredTable::new(config, demote, initial_keys, self.cfg.hasher)
+        let mut table = TieredTable::new(config, demote, initial_keys, self.cfg.hasher, census)
             .ok_or(TieredCreateError::Unrepresentable)?;
         table.set_promote_enabled(self.tier_promote);
         table.set_shadow_enabled(self.tier_shadow);
@@ -66,7 +68,8 @@ impl Keyspace {
     /// (M4-S19): derives the ring from the spec's budget + slice, applies
     /// every derived config, and enforces the D4 admission bound. Fresh
     /// life at origin zero — recovery-time re-materialization supplies
-    /// its own origin through the recovery path.
+    /// its own origin through the recovery path. The table registers on
+    /// `census`, as [`materialize_tiered`](Self::materialize_tiered).
     ///
     /// # Errors
     /// [`TieredCreateError`] — refusal mutates nothing.
@@ -74,6 +77,7 @@ impl Keyspace {
         &mut self,
         ns: NsId,
         tier: &crate::ns::TierSpec,
+        census: &Rc<CapCensus>,
     ) -> Result<(), TieredCreateError> {
         let demote = tier.demotion_config();
         let reserve_bytes =
@@ -84,7 +88,7 @@ impl Keyspace {
             life_origin: LogicalAddr::ZERO,
         };
         // Index presize: tables grow; a fixed hint keeps creation O(1).
-        self.materialize_tiered(ns, config, demote, 1024)?;
+        self.materialize_tiered(ns, config, demote, 1024, census)?;
         let table = self.tiered_store_mut(ns).expect("materialized above");
         table.set_compaction_config(tier.compaction_config());
         table.set_blob_config(tier.blob_config());

@@ -33,6 +33,9 @@
 //! (`limit − limit/16`, hysteresis) under its own budget so a storm of
 //! writes cannot monopolize the loop (the bounded-everything rule).
 
+use std::rc::Rc;
+
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::time::Nanos;
 use inf_foundation::{KeyHasher, hash64};
 use inf_log::{FsyncClass, NsId, RecordView as LogRecordView};
@@ -42,9 +45,12 @@ use inf_foundation::LogicalAddr;
 use crate::address_space::{AddressSpaceConfig, TieringCounters};
 use crate::catalog::{IndexCatalog, NsCatalog};
 use crate::demote::{DemoteStats, DemotionConfig, EvictionPressure};
+#[cfg(feature = "doc")]
+use crate::doc::ReplyLimit;
 use crate::evict::{EvictStats, EvictionPolicy};
 use crate::index_backfill::{BackfillInfo, BackfillJob, BackfillTickStats};
 use crate::index_registry::{IndexError, IndexId, IndexRegistry, IndexSpec, IndexState};
+use crate::ns::ddl::{DropApplied, DropPersisted};
 use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
 use crate::record::{ExtentRef, InternalDeadline};
 use crate::store::{
@@ -53,7 +59,7 @@ use crate::store::{
 };
 use crate::tiered::TieredTable;
 use crate::tiered::promote::PromotionCounters;
-use crate::tiered::replay::{ReplayRefusal, ReplaySpill};
+use crate::tiered::replay::{DeleteReads, DemoteProgress, Placement, ReplayRefusal, ReplaySpill};
 use crate::tiered::shadow::ShadowCounters;
 use crate::wall::WallAnchor;
 use crate::wheel::ExpiryBudget;
@@ -230,6 +236,56 @@ pub struct Keyspace {
     /// written before the rule); reported on the boot line, never
     /// silent.
     seed_normalized_thresholds: u32,
+    /// Whether this is the node's keyspace, whose namespace entries change
+    /// only with the catalog writer's receipt (ADR-0189 D4).
+    cataloging: Cataloging,
+}
+
+/// What a keyspace is built from (ADR-0189 D4), handed to the host of its
+/// cap census: a plane that serves the keyspace builds the census first,
+/// then the keyspace on it through [`build`](KeyspaceSeed::build), its one
+/// builder, so every capped store of the cell registers on that census.
+#[derive(Clone, Debug)]
+pub enum KeyspaceSeed {
+    /// The node's keyspace: the boot catalog the host decoded from `META`,
+    /// or the empty catalog of a fresh data directory. It is cataloged.
+    Cataloged { cfg: StoreConfig, catalog: NsCatalog },
+    /// A host with no data directory, so no catalog writer: its namespace
+    /// specs, each created uncataloged, in order.
+    Uncataloged { cfg: StoreConfig, specs: Vec<NsSpec> },
+}
+
+impl KeyspaceSeed {
+    /// Builds the keyspace, every capped store of it on `census`.
+    ///
+    /// # Errors
+    /// The first refusal: the catalog's, as [`Keyspace::cataloged`]'s, or a
+    /// spec's, as [`Keyspace::ns_create`]'s. Nothing built is returned.
+    pub fn build(self, census: &Rc<CapCensus>) -> Result<Keyspace, NsError> {
+        match self {
+            KeyspaceSeed::Cataloged { cfg, catalog } => Keyspace::cataloged(cfg, &catalog, census),
+            KeyspaceSeed::Uncataloged { cfg, specs } => {
+                let mut ks = Keyspace::new(cfg);
+                for spec in specs {
+                    ks.ns_create(spec, census)?;
+                }
+                Ok(ks)
+            }
+        }
+    }
+}
+
+/// Whether a keyspace answers to a catalog writer (ADR-0189 D4).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Cataloging {
+    /// The node's keyspace, built from its boot catalog: a namespace entry
+    /// changes only with the catalog writer's receipt, and every mutator
+    /// that takes none answers [`NsError::Cataloged`].
+    Cataloged,
+    /// A model's, a planeless tier's or a test's keyspace: no catalog
+    /// writer answers it, so its mutators take no receipt, and every one
+    /// that takes one answers [`NsError::Uncataloged`].
+    Uncataloged,
 }
 
 /// Whether `rec` may follow an armed displacement marker of `pending_ns`:
@@ -262,6 +318,8 @@ struct TieredEntry<'a> {
 impl Keyspace {
     /// `cfg.evict_seed` seeds the per-db eviction streams (vary it per cell
     /// — L7: all randomness is injected).
+    /// An uncataloged keyspace (ADR-0189 D4): a model's, a planeless
+    /// tier's or a test's, whose namespace mutators take no receipt.
     pub fn new(cfg: StoreConfig) -> Keyspace {
         let mut ks = Keyspace {
             dbs: Default::default(),
@@ -287,10 +345,35 @@ impl Keyspace {
             backfill_docs_total: 0,
             backfill_inserted_total: 0,
             sidecar_info: Default::default(),
+            cataloging: Cataloging::Uncataloged,
         };
         // db0 is eager: it serves every connection that never SELECTs.
         let _ = ks.db_mut(0);
         ks
+    }
+
+    /// The node's keyspace (ADR-0189 D4), seeded from its boot catalog:
+    /// `META`'s decode, or the empty catalog of a fresh data directory. It
+    /// is cataloged, so a namespace entry changes only with the catalog
+    /// writer's receipt, and the uncataloged family,
+    /// [`seed_catalog`](Self::seed_catalog) included, answers
+    /// [`NsError::Cataloged`]. That `catalog` is durable rests on review:
+    /// each boot site passes the decode of the `META` on disk. Every
+    /// tiered table it seeds registers its capped holders on `census`,
+    /// the cell's (ADR-0163 D2).
+    ///
+    /// # Errors
+    /// As [`seed_catalog`](Self::seed_catalog): the first registry-rule or
+    /// admission violation, a boot fail-stop.
+    pub fn cataloged(
+        cfg: StoreConfig,
+        catalog: &NsCatalog,
+        census: &Rc<CapCensus>,
+    ) -> Result<Keyspace, NsError> {
+        let mut ks = Keyspace::new(cfg);
+        ks.seed_from_catalog(catalog, census)?;
+        ks.cataloging = Cataloging::Cataloged;
+        Ok(ks)
     }
 
     /// The store behind database `db`, materializing it on first touch.
@@ -840,9 +923,11 @@ impl Keyspace {
 
     /// Everything [`ns_create`](Self::ns_create) would refuse, without
     /// applying anything (ADR-0103 D3): the registry rules, the tier
-    /// gauntlet, and the reserved-VA admission arithmetic. The one
-    /// apply-time failure it cannot foresee is the OS refusing the ring
-    /// reservation itself.
+    /// gauntlet, and the reserved-VA admission arithmetic. The apply-time
+    /// failures it cannot foresee are the OS refusing the ring reservation
+    /// itself and an admission bound lowered between the check and the
+    /// apply; a node's `CREATE` whose apply is refused after its answer
+    /// rolls back.
     ///
     /// # Errors
     /// The refusal `ns_create` would answer.
@@ -877,15 +962,16 @@ impl Keyspace {
     }
 
     /// Registers `spec` and, for a tiered spec (M4-S19), materializes the
-    /// cell's `TieredTable` under the D4 admission bound. Registration
-    /// and materialization succeed or fail together — an admission
-    /// refusal rolls the registry entry back, leaving nothing behind.
-    pub fn ns_create(&mut self, spec: NsSpec) -> Result<(), NsError> {
+    /// cell's `TieredTable` under the D4 admission bound, its capped
+    /// holders on `census`, the cell's (ADR-0163 D2). Registration and
+    /// materialization succeed or fail together — an admission refusal
+    /// rolls the registry entry back, leaving nothing behind.
+    pub fn ns_create(&mut self, spec: NsSpec, census: &Rc<CapCensus>) -> Result<(), NsError> {
         let tier = spec.tier;
         let (id, name) = (spec.id, spec.name.clone());
         self.named.create(spec)?;
         if let Some(tier) = tier
-            && let Err(e) = self.materialize_tiered_spec(id, &tier)
+            && let Err(e) = self.materialize_tiered_spec(id, &tier, census)
         {
             self.named.drop_ns(&name).expect("just created");
             return Err(match e {
@@ -930,19 +1016,63 @@ impl Keyspace {
         Ok(())
     }
 
-    /// Drops the registry entry **and** its store (with all its data). The
-    /// id is never reused; log records naming it are skipped on replay.
-    /// A tiered namespace's table drops with it (M4-S19, ADR-0062 D7):
-    /// the `Region` unmaps on drop, returning exactly its ring to the D4
-    /// admitted sum — structurally, not by bookkeeping. The plane owns
-    /// the file half of the teardown (tier + blob unlinks after pin
-    /// drain — `inf-store` never does I/O, §3.3).
-    /// Drops a named namespace, returning the spec it had (the DDL
-    /// program reads the mode and id off it — ADR-0100 D3/D4).
+    /// Everything [`ns_drop`](Self::ns_drop) of the namespace `name`
+    /// holds would need, without applying anything (ADR-0189 D5): the
+    /// default databases are immutable and the name must be registered.
     ///
     /// # Errors
-    /// `Unknown` / `DefaultImmutable` from the registry.
-    pub fn ns_drop(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
+    /// `DefaultImmutable` / `Unknown`, as the registry answers a drop.
+    pub fn ns_drop_check(&self, name: &[u8]) -> Result<&NsSpec, NsError> {
+        if crate::ns::is_default_name(name) {
+            return Err(NsError::DefaultImmutable);
+        }
+        self.named.get(name).ok_or(NsError::Unknown)
+    }
+
+    /// Applies an accepted `DROP` on the node's keyspace (ADR-0189 D4):
+    /// the namespace the receipt names leaves the registry **and** its
+    /// store, with all its data, or was never here. The id is never
+    /// reused; log records naming it are skipped on replay. A tiered
+    /// namespace's table drops with it (ADR-0062 D7): the `Region` unmaps,
+    /// returning exactly its ring to the D4 admitted sum. The plane owns
+    /// the file half of the teardown: `inf-store` does no I/O.
+    ///
+    /// # Errors
+    /// [`NsError::Uncataloged`] on a keyspace no catalog writer answers.
+    pub fn ns_drop(&mut self, receipt: &DropPersisted) -> Result<DropApplied, NsError> {
+        if self.cataloging == Cataloging::Uncataloged {
+            return Err(NsError::Uncataloged);
+        }
+        let Some(name) = self.named.get_by_id(receipt.id()).map(|spec| spec.name.clone()) else {
+            return Ok(DropApplied::Absent);
+        };
+        self.drop_named(&name).map(DropApplied::Removed)
+    }
+
+    /// Drops a named namespace on a keyspace no catalog writer answers (a
+    /// model's, a planeless tier's or a test's), returning the spec it had.
+    ///
+    /// # Errors
+    /// `Unknown` / `DefaultImmutable` from the registry;
+    /// [`NsError::Cataloged`] on the node's keyspace, which drops only with
+    /// a receipt ([`ns_drop`](Self::ns_drop)).
+    pub fn ns_drop_uncataloged(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
+        if self.cataloging == Cataloging::Cataloged {
+            return Err(NsError::Cataloged);
+        }
+        self.drop_named(name)
+    }
+
+    /// The planted canary's drop before the catalog writer's answer (the
+    /// order the receipt replaces).
+    #[cfg(inf_canary_ns_apply_before_swap)]
+    pub fn ns_drop_planted(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
+        self.drop_named(name)
+    }
+
+    /// The one drop body: the registry entry, its store, its tiered table
+    /// and its index declarations go together.
+    fn drop_named(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
         let spec = self.named.drop_ns(name)?;
         let id = spec.id;
         self.named_stores.retain(|e| e.id != id);
@@ -1040,6 +1170,22 @@ impl Keyspace {
         self.named_stores.iter().find(|e| e.id == id).map(|e| e.store.as_ref())
     }
 
+    /// The `JSON.*` reply account of named namespace `id` (ADR-0173 D1), read
+    /// without materializing a store: the store's own when it exists, else
+    /// the budget every store of this keyspace is built with. `None` when
+    /// `id` isn't registered (unknown or dropped). A tiered namespace's
+    /// records live in its table, so a cross-cell read of its account must
+    /// leave no `CellStore` beside it, as [`Self::ns_store_mut`] would.
+    #[cfg(feature = "doc")]
+    #[must_use]
+    pub fn ns_doc_reply_limit(&self, id: NsId) -> Option<ReplyLimit> {
+        self.named.get_by_id(id)?;
+        Some(match self.ns_store(id) {
+            Some(store) => store.doc_reply_limit(),
+            None => ReplyLimit::configured(&self.cfg),
+        })
+    }
+
     /// The durability class of namespace `id`: `None` for memory (default
     /// dbs and memory-mode named), `Some` for durable — the one branch the
     /// mutation path pays (L2's degenerate case stays free, M2-S09).
@@ -1089,8 +1235,24 @@ impl Keyspace {
     ///
     /// # Errors
     /// The first registry-rule or admission violation — a failing catalog
-    /// is a fail-stop at boot, never a partial seed.
-    pub fn seed_catalog(&mut self, cat: &NsCatalog) -> Result<(), NsError> {
+    /// is a fail-stop at boot, never a partial seed; [`NsError::Cataloged`]
+    /// on the node's keyspace, which [`cataloged`](Self::cataloged) seeded
+    /// once, from its boot catalog.
+    pub fn seed_catalog(&mut self, cat: &NsCatalog, census: &Rc<CapCensus>) -> Result<(), NsError> {
+        if self.cataloging == Cataloging::Cataloged {
+            return Err(NsError::Cataloged);
+        }
+        self.seed_from_catalog(cat, census)
+    }
+
+    /// The one seeding body of [`seed_catalog`](Self::seed_catalog) and
+    /// [`cataloged`](Self::cataloged): every tiered table it builds
+    /// registers on `census`.
+    fn seed_from_catalog(
+        &mut self,
+        cat: &NsCatalog,
+        census: &Rc<CapCensus>,
+    ) -> Result<(), NsError> {
         self.named = NsRegistry::default();
         self.named_stores.clear();
         self.tiered_stores.clear();
@@ -1120,7 +1282,7 @@ impl Keyspace {
             }
             // `ns_create` materializes tiered entries under the D4 bound
             // — seeding and DDL share one path, so they cannot drift.
-            self.ns_create(spec)?;
+            self.ns_create(spec, census)?;
         }
         for spec in &cat.index.entries {
             if spec.state == IndexState::Dropping {
@@ -1187,6 +1349,15 @@ impl Keyspace {
     /// the maximum representable (never to `now` — clamping forward-lost
     /// deadlines to the past would expire keys that should live).
     ///
+    /// The answer is one of three (ADR-0174 A1.5): consumed; consumed
+    /// after priced boot work — a tiered `DEL` that read the cold slots
+    /// this boot demoted; or `NeedsRoom(ns)`: the record needs room in the
+    /// namespace's window and changed nothing — no marker drained, no slot
+    /// moved, the register as it found it — so its driver runs the
+    /// machine's [`demote_step`](crate::TierReplay::demote_step) under its
+    /// budget and presents it again. Only the two consumed answers carry
+    /// the advance token a walker moves its cursor with.
+    ///
     /// # Errors
     /// Arena/bounds failures from the store and the typed replay refusals
     /// of a tiered namespace (recovery fail-stop).
@@ -1196,15 +1367,27 @@ impl Keyspace {
         now: Nanos,
         anchor: WallAnchor,
         spill: &mut impl ReplaySpill,
-    ) -> Result<ReplayOutcome, ReplayError> {
+    ) -> Result<Replayed, ReplayError> {
         // Tiered namespaces own their records' replay (ADR-0057 D4,
         // routed by M4-S26) — intercepted before the CellStore arms
         // because a tiered namespace also materializes a named CellStore
         // shell, and applying a tiered record there would build state the
         // tiered index never serves (invisible until the first restart).
-        if let Some(outcome) = self.apply_record_tiered(rec, spill)? {
-            return Ok(outcome);
-        }
+        let answer = match self.apply_record_tiered(rec, spill)? {
+            Some(answer) => answer,
+            None => ApplyAnswer::Consumed(self.apply_record_memory(rec, now, anchor)?),
+        };
+        Ok(advance::answer(answer))
+    }
+
+    /// The memory namespaces' replay arms: every record the tiered arms do
+    /// not route.
+    fn apply_record_memory(
+        &mut self,
+        rec: &LogRecordView<'_>,
+        now: Nanos,
+        anchor: WallAnchor,
+    ) -> Result<ReplayOutcome, ReplayError> {
         match *rec {
             LogRecordView::StringPostImage { ns, key, value } => {
                 let Some(store) = self.replay_store(ns) else {
@@ -1352,7 +1535,9 @@ impl Keyspace {
     /// D9): each record enters the table's replay entry with its parked
     /// markers, so the room question and a `DEL`'s reads precede the
     /// marker drain (ADR-0174 D1, R6). Returns `None` when the
-    /// record is not tiered-routed — the caller's CellStore arms own it.
+    /// record is not tiered-routed — the caller's CellStore arms own it. A
+    /// record that needs room leaves the register armed, as a refused one
+    /// does, so it finds the keyspace as it left it when presented again.
     ///
     /// # Errors
     /// Register overflow, marker adjacency violations, and the replay
@@ -1361,7 +1546,7 @@ impl Keyspace {
         &mut self,
         rec: &LogRecordView<'_>,
         spill: &mut impl ReplaySpill,
-    ) -> Result<Option<ReplayOutcome>, ReplayError> {
+    ) -> Result<Option<ApplyAnswer>, ReplayError> {
         // Strict marker adjacency (ADR-0057 D4: markers stage in the same
         // frame immediately before their mutation): while the register is
         // armed, only further markers or the paired mutation — all in the
@@ -1378,7 +1563,7 @@ impl Keyspace {
                 if !self.is_tiered(ns) {
                     // Dropped namespace or a foreign log: the paired
                     // mutation skips the same way — no register entry.
-                    return Ok(Some(ReplayOutcome::SkippedUnknownNs(ns)));
+                    return Ok(Some(ApplyAnswer::Consumed(ReplayOutcome::SkippedUnknownNs(ns))));
                 }
                 if self.pending_displace.len() >= DISPLACE_REGISTER_CAP {
                     return Err(ReplayError::Displacement(
@@ -1386,38 +1571,43 @@ impl Keyspace {
                     ));
                 }
                 self.pending_displace.push((ns, old_addr));
-                Ok(Some(ReplayOutcome::Applied))
+                Ok(Some(ApplyAnswer::Consumed(ReplayOutcome::Applied)))
             }
             LogRecordView::StringPostImage { ns, key, value } => {
                 let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
                 let machine = spill.replay_mut(ns);
-                entry
+                let placed = entry
                     .table
                     .replay_upsert_lent(machine, entry.markers, key, value, entry.hash)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
-                self.pending_displace.clear();
-                Ok(Some(ReplayOutcome::Applied))
+                Ok(Some(self.placed(ns, placed)))
             }
             LogRecordView::Delete { ns, key } => {
                 let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
                 let machine = spill.replay_mut(ns);
-                entry
+                let (_removed, reads) = entry
                     .table
                     .replay_delete_lent(machine, entry.markers, key, entry.hash)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
-                Ok(Some(ReplayOutcome::Applied))
+                // The planted canary answers a `DEL` that read as one that
+                // did not, so its walk asks nothing after the reads.
+                let priced = reads == DeleteReads::Read && !cfg!(inf_canary_recover_del_unasked);
+                Ok(Some(if priced {
+                    ApplyAnswer::ConsumedPriced(ReplayOutcome::Applied)
+                } else {
+                    ApplyAnswer::Consumed(ReplayOutcome::Applied)
+                }))
             }
             LogRecordView::StringExtentRef { ns, key, extent_id, offset, len } => {
                 let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
                 let ext = ExtentRef { extent_id, offset, len };
                 let machine = spill.replay_mut(ns);
-                entry
+                let placed = entry
                     .table
                     .replay_upsert_extent_lent(machine, entry.markers, key, entry.hash, ext)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
-                self.pending_displace.clear();
-                Ok(Some(ReplayOutcome::Applied))
+                Ok(Some(self.placed(ns, placed)))
             }
             // Tiered namespaces carry no expiry and no documents in M4
             // (commands refuse; only a foreign log can contain these) —
@@ -1427,13 +1617,25 @@ impl Keyspace {
             | LogRecordView::DocDelta { ns, .. }
                 if self.is_tiered(ns) =>
             {
-                Ok(Some(ReplayOutcome::SkippedReserved))
+                Ok(Some(ApplyAnswer::Consumed(ReplayOutcome::SkippedReserved)))
             }
             LogRecordView::ExpireAt { .. }
             | LogRecordView::NsOp { .. }
             | LogRecordView::CkptBegin { .. }
             | LogRecordView::DocDelta { .. }
             | LogRecordView::DocFull { .. } => Ok(None),
+        }
+    }
+
+    /// An upsert's answer: placed — its markers drained, so the register
+    /// empties — or waiting for room with the register armed.
+    fn placed(&mut self, ns: NsId, placement: Placement) -> ApplyAnswer {
+        match placement {
+            Placement::Placed(_) => {
+                self.pending_displace.clear();
+                ApplyAnswer::Consumed(ReplayOutcome::Applied)
+            }
+            Placement::NeedsRoom => ApplyAnswer::NeedsRoom(ns),
         }
     }
 
@@ -1718,6 +1920,131 @@ fn fold_store(acc: &mut StateDigest, store: &CellStore, tag: u64, now: Nanos) {
     }
 }
 
+/// What [`Keyspace::apply_record`] answers for one record (ADR-0174
+/// A1.5): three outcomes, one enum. A walker over a frame or a section
+/// moves past the record only on a consumed answer, with its
+/// [`ConsumedRecord`] token; `NeedsRoom` carries none.
+#[must_use = "a record that needs room was not applied"]
+#[derive(Debug)]
+pub enum Replayed {
+    /// The record was applied or skipped.
+    Consumed(ConsumedRecord),
+    /// As `Consumed`, after priced boot work: a tiered `DEL` that read the
+    /// cold slots this boot demoted, which its walker charges and asks its
+    /// budget after.
+    ConsumedPriced(ConsumedRecord),
+    /// The record needs room in this namespace's window and changed
+    /// nothing; its machine's demote step makes the room.
+    NeedsRoom(NsId),
+}
+
+pub use advance::ConsumedRecord;
+
+/// What the replay arms answer before the token is made.
+enum ApplyAnswer {
+    Consumed(ReplayOutcome),
+    ConsumedPriced(ReplayOutcome),
+    NeedsRoom(NsId),
+}
+
+/// The advance token, made in one place: [`answer`](advance::answer), which
+/// [`Keyspace::apply_record`] alone calls on its arms' answer, so a token
+/// exists only for a record `apply_record` consumed.
+mod advance {
+    use super::{ApplyAnswer, ReplayOutcome, Replayed};
+
+    /// The proof that `apply_record` consumed a record: what a walker
+    /// spends to move its cursor past it. Not `Clone`; its field is
+    /// private to this module, whose one maker is [`answer`].
+    #[must_use = "a consumed record's token moves the walker past it"]
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct ConsumedRecord {
+        outcome: ReplayOutcome,
+    }
+
+    impl ConsumedRecord {
+        /// What the record did, for the walker's counters.
+        #[must_use]
+        pub fn outcome(&self) -> ReplayOutcome {
+            self.outcome
+        }
+    }
+
+    /// The answer of `apply_record`, the token's one maker.
+    pub(super) fn answer(answer: ApplyAnswer) -> Replayed {
+        match answer {
+            ApplyAnswer::Consumed(outcome) => Replayed::Consumed(ConsumedRecord { outcome }),
+            ApplyAnswer::ConsumedPriced(outcome) => {
+                Replayed::ConsumedPriced(ConsumedRecord { outcome })
+            }
+            ApplyAnswer::NeedsRoom(ns) => Replayed::NeedsRoom(ns),
+        }
+    }
+}
+
+/// The store tier's driver of one record (ADR-0174 A1): presents `rec`
+/// and, while it answers `NeedsRoom`, runs its namespace's demote step at
+/// `budget_bytes` a call until the step answers `Room`, then presents it
+/// again; it returns what the consumed answer says. Store-tier tests,
+/// benches and the simulator replay through it and keep no loop of their
+/// own; the recovery driver of `inf-server` is the other loop, which adds
+/// the step budget, the cursor and the yield. Every decision is below
+/// both: `apply_record`, the demote step, the room-ask count.
+///
+/// # Errors
+/// `apply_record`'s and the demote step's, the namespace named; a record
+/// waiting for room with no machine to make it is `RoomMoved`.
+pub fn drive_record<S: ReplaySpill>(
+    ks: &mut Keyspace,
+    rec: &LogRecordView<'_>,
+    now: Nanos,
+    anchor: WallAnchor,
+    spill: &mut S,
+    budget_bytes: u64,
+) -> Result<ReplayOutcome, ReplayError> {
+    // A record that does not wait for room, nearly every one, is presented
+    // once with no loop around it: the loop form hoisted the presentation's
+    // invariants into every call (more instructions a record on the image
+    // replay bench), and the loop is the cold rest.
+    match ks.apply_record(rec, now, anchor, spill)? {
+        Replayed::Consumed(token) | Replayed::ConsumedPriced(token) => Ok(token.outcome()),
+        Replayed::NeedsRoom(ns) => drive_room(ks, rec, now, anchor, spill, budget_bytes, ns),
+    }
+}
+
+/// [`drive_record`] once its record answered `NeedsRoom` in `ns`: the
+/// demote step until it answers `Room`, then the record again.
+#[cold]
+#[inline(never)]
+fn drive_room<S: ReplaySpill>(
+    ks: &mut Keyspace,
+    rec: &LogRecordView<'_>,
+    now: Nanos,
+    anchor: WallAnchor,
+    spill: &mut S,
+    budget_bytes: u64,
+    mut ns: NsId,
+) -> Result<ReplayOutcome, ReplayError> {
+    // Bound: a presentation that needs room makes one room ask more, and a
+    // record makes at most four (D2 rule 1); each demote step call walks a
+    // record at least, or completes.
+    loop {
+        let (Some(machine), Some(table)) = (spill.replay_mut(ns), ks.tiered_store_mut(ns)) else {
+            let refusal =
+                ReplayRefusal::RoomMoved { why: "a record waits for room with no machine" };
+            return Err(ReplayError::Replay { ns, refusal });
+        };
+        let refused = |refusal| ReplayError::Replay { ns, refusal };
+        while machine.demote_step(table, budget_bytes).map_err(refused)? == DemoteProgress::More {}
+        ns = match ks.apply_record(rec, now, anchor, spill)? {
+            Replayed::Consumed(token) | Replayed::ConsumedPriced(token) => {
+                return Ok(token.outcome());
+            }
+            Replayed::NeedsRoom(ns) => ns,
+        };
+    }
+}
+
 /// What [`Keyspace::apply_record`] did with one record.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ReplayOutcome {
@@ -1932,9 +2259,10 @@ mod tests {
 
     #[test]
     fn named_stores_are_isolated_and_dropped_with_their_namespace() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
         let now = Nanos(1);
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         ks.db_mut(0).set(b"k", b"db0", SetOptions::default(), now).expect("set db0");
         ks.ns_store_mut(NsId(16))
             .expect("registered")
@@ -1944,19 +2272,83 @@ mod tests {
         assert_eq!(ks.ns_store_mut(NsId(16)).expect("live").get(b"k", now), Some(&b"ledger"[..]));
         assert_eq!(ks.ns_fsync_class(NsId(16)), Some(FsyncClass::Always));
         assert_eq!(ks.ns_fsync_class(NsId(0)), None, "defaults are memory");
-        ks.ns_drop(b"ledger").expect("drop");
+        ks.ns_drop_uncataloged(b"ledger").expect("drop");
         assert!(ks.ns_store_mut(NsId(16)).is_none(), "dropped ids resolve to no store");
+    }
+
+    /// A namespace's reply account is read without materializing its store:
+    /// a tiered namespace keeps none, a plain one gets none from the read,
+    /// a materialized store's account is its own, and an unregistered id has
+    /// none.
+    #[cfg(feature = "doc")]
+    #[test]
+    fn a_namespaces_reply_limit_is_read_without_making_its_store() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        let cfg = StoreConfig { doc_max_reply_bytes: 64, ..StoreConfig::default() };
+        let mut ks = Keyspace::new(cfg);
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
+        ks.ns_create(
+            NsSpec {
+                fsync: Some(FsyncClass::Everysec),
+                tier: Some(crate::ns::TierSpec::for_budget(64 << 20)),
+                ..durable_spec(17, b"cold")
+            },
+            &census,
+        )
+        .expect("tiered create");
+        let configured = CellStore::new(cfg).doc_reply_limit();
+        assert!(configured.admits(64).is_ok(), "the configured budget");
+        assert!(configured.admits(65).is_err(), "the configured budget");
+        assert_eq!(ks.ns_doc_reply_limit(NsId(17)), Some(configured), "tiered");
+        assert!(ks.ns_store(NsId(17)).is_none(), "a tiered namespace keeps no store");
+        assert_eq!(ks.ns_doc_reply_limit(NsId(16)), Some(configured), "plain, unmaterialized");
+        assert!(ks.ns_store(NsId(16)).is_none(), "the read makes no store");
+        ks.ns_store_mut(NsId(16)).expect("registered");
+        assert_eq!(ks.ns_doc_reply_limit(NsId(16)), Some(configured), "the store's own");
+        assert_eq!(ks.ns_doc_reply_limit(NsId(99)), None, "an unregistered id");
     }
 
     #[test]
     fn catalog_seed_and_export_round_trip() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         let cat = ks.export_catalog(17, 1, 1);
         let mut fresh = Keyspace::new(StoreConfig::default());
-        fresh.seed_catalog(&cat).expect("seed");
+        fresh.seed_catalog(&cat, &census).expect("seed");
         assert_eq!(fresh.export_catalog(17, 1, 1), cat);
         assert!(fresh.ns_store_mut(NsId(16)).is_some());
+    }
+
+    /// ADR-0189 D4: the node's keyspace answers the uncataloged family
+    /// with `Cataloged` and drops only with a receipt, which removes the
+    /// namespace and then finds it absent; a model's keyspace answers the
+    /// receipt mutator with `Uncataloged`. Every refusal changes nothing.
+    #[test]
+    fn a_cataloged_keyspace_drops_only_with_a_receipt() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        let mut model = Keyspace::new(StoreConfig::default());
+        model.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
+        let cat = model.export_catalog(17, 1, 1);
+        let mut node =
+            Keyspace::cataloged(StoreConfig::default(), &cat, &census).expect("the boot seed");
+        assert_eq!(node.export_catalog(17, 1, 1), cat, "seeded from the boot catalog");
+        assert_eq!(node.seed_catalog(&cat, &census), Err(NsError::Cataloged));
+        assert_eq!(node.ns_drop_uncataloged(b"ledger"), Err(NsError::Cataloged));
+        assert!(node.ns_get(b"ledger").is_some(), "a refused mutator changed nothing");
+        let (mut epochs, word) = crate::ns::ddl::CatalogEpochs::new();
+        let taken = epochs.take();
+        let published = inf_foundation::grants::GrantDirectory::new().1.publish();
+        epochs.answer(taken, None, crate::ns::ddl::DdlVerdict::Accepted, published);
+        let receipt = DropPersisted::from_leg(NsId(16), 1, &word).expect("the word covers it");
+        assert_eq!(model.ns_drop(&receipt), Err(NsError::Uncataloged));
+        assert!(model.ns_get(b"ledger").is_some(), "a refused mutator changed nothing");
+        match node.ns_drop(&receipt) {
+            Ok(DropApplied::Removed(spec)) => assert_eq!(spec.name, b"ledger".to_vec()),
+            other => panic!("the receipt's namespace is removed: {other:?}"),
+        }
+        assert!(node.ns_store_mut(NsId(16)).is_none(), "its store went with it");
+        assert_eq!(node.ns_drop(&receipt), Ok(DropApplied::Absent), "a second apply finds none");
     }
 
     // ---- M4.5-S03 (ADR-0075): index registry + catalog + accounting ----
@@ -1980,13 +2372,17 @@ mod tests {
     #[cfg(feature = "doc")]
     #[test]
     fn idx_create_gates_by_namespace_mode() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
-        ks.ns_create(NsSpec {
-            fsync: Some(FsyncClass::Everysec),
-            tier: Some(crate::ns::TierSpec::for_budget(64 << 20)),
-            ..durable_spec(17, b"cold")
-        })
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
+        ks.ns_create(
+            NsSpec {
+                fsync: Some(FsyncClass::Everysec),
+                tier: Some(crate::ns::TierSpec::for_budget(64 << 20)),
+                ..durable_spec(17, b"cold")
+            },
+            &census,
+        )
         .expect("tiered create");
         ks.idx_create(idx_spec(1, 1, 0, b"on-db0", IndexState::Declared)).expect("default db");
         ks.idx_create(idx_spec(2, 2, 16, b"on-ledger", IndexState::Declared)).expect("named ns");
@@ -2017,8 +2413,9 @@ mod tests {
     #[cfg(feature = "doc")]
     #[test]
     fn catalog_restart_maps_index_states_per_d4() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         ks.idx_create(idx_spec(1, 10, 16, b"was-ready", IndexState::Declared)).expect("create");
         ks.idx_create(idx_spec(2, 11, 16, b"mid-backfill", IndexState::Declared)).expect("create");
         ks.idx_create(idx_spec(3, 12, 16, b"mid-drop", IndexState::Declared)).expect("create");
@@ -2030,7 +2427,7 @@ mod tests {
         let cat = ks.export_catalog(17, 4, 13);
 
         let mut fresh = Keyspace::new(StoreConfig::default());
-        fresh.seed_catalog(&cat).expect("seed");
+        fresh.seed_catalog(&cat, &census).expect("seed");
         let reg = fresh.idx_registry();
         // The dropping entry resumed its drop: not seeded.
         assert!(reg.get_by_id(IndexId(3)).is_none());
@@ -2059,16 +2456,20 @@ mod tests {
     #[cfg(feature = "doc")]
     #[test]
     fn idx_tree_bytes_count_toward_the_namespace_budget() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(NsSpec {
-            id: NsId(16),
-            name: b"cache".to_vec(),
-            mode: NsMode::Memory,
-            fsync: None,
-            policy: Some(EvictionPolicy::AllKeysRandom),
-            maxmemory: None,
-            tier: None,
-        })
+        ks.ns_create(
+            NsSpec {
+                id: NsId(16),
+                name: b"cache".to_vec(),
+                mode: NsMode::Memory,
+                fsync: None,
+                policy: Some(EvictionPolicy::AllKeysRandom),
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("create");
         ks.idx_create(idx_spec(1, 1, 16, b"by-price", IndexState::Declared)).expect("create");
         // Fill documents-side bytes, then set the budget just above the
@@ -2108,11 +2509,12 @@ mod tests {
     #[cfg(feature = "doc")]
     #[test]
     fn ns_drop_removes_its_index_declarations() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         ks.idx_create(idx_spec(1, 1, 16, b"by-price", IndexState::Declared)).expect("create");
         assert!(ks.ns_has_indexes(NsId(16)));
-        ks.ns_drop(b"ledger").expect("drop");
+        ks.ns_drop_uncataloged(b"ledger").expect("drop");
         assert!(!ks.ns_has_indexes(NsId(16)));
         assert!(ks.idx_registry().get_by_id(IndexId(1)).is_none());
     }
@@ -2123,6 +2525,7 @@ mod tests {
     /// own budget gate armed.
     #[test]
     fn catalog_round_trip_preserves_memory_pressure_enforcement() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
         let spec = NsSpec {
             id: NsId(16),
@@ -2133,10 +2536,10 @@ mod tests {
             maxmemory: Some(1 << 20),
             tier: None,
         };
-        ks.ns_create(spec).expect("create");
+        ks.ns_create(spec, &census).expect("create");
         let cat = ks.export_catalog(17, 1, 1);
         let mut fresh = Keyspace::new(StoreConfig::default());
-        fresh.seed_catalog(&cat).expect("seed");
+        fresh.seed_catalog(&cat, &census).expect("seed");
         let store = fresh.ns_store_mut(NsId(16)).expect("live");
         assert_eq!(store.eviction_policy(), crate::EvictionPolicy::AllKeysRandom);
         assert!(
@@ -2146,15 +2549,18 @@ mod tests {
         // An inheriting store without a budget answers through the global
         // gate instead.
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(NsSpec {
-            id: NsId(16),
-            name: b"plain".to_vec(),
-            mode: NsMode::Memory,
-            fsync: None,
-            policy: None,
-            maxmemory: None,
-            tier: None,
-        })
+        ks.ns_create(
+            NsSpec {
+                id: NsId(16),
+                name: b"plain".to_vec(),
+                mode: NsMode::Memory,
+                fsync: None,
+                policy: None,
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("create");
         assert!(ks.ns_free_for_write(NsId(16), now()).is_none());
     }
@@ -2163,13 +2569,14 @@ mod tests {
     /// budget authority per namespace (`MEM-BUDGET` owns tiered memory).
     #[test]
     fn tiered_spec_with_maxmemory_is_refused() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
         let spec = NsSpec {
             maxmemory: Some(1 << 20),
             tier: Some(crate::TierSpec::for_budget(64 << 20)),
             ..durable_spec(16, b"hot")
         };
-        assert_eq!(ks.ns_create(spec), Err(NsError::MaxmemoryNotAllowedTiered));
+        assert_eq!(ks.ns_create(spec, &census), Err(NsError::MaxmemoryNotAllowedTiered));
         assert_eq!(ks.ns_iter().count(), 0, "refusal mutates nothing");
     }
 
@@ -2178,17 +2585,21 @@ mod tests {
     /// including the already-materialized store's policy and budget.
     #[test]
     fn ns_set_memory_scopes_and_applies_hot() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
-        ks.ns_create(NsSpec {
-            id: NsId(17),
-            name: b"cache".to_vec(),
-            mode: NsMode::Memory,
-            fsync: None,
-            policy: None,
-            maxmemory: None,
-            tier: None,
-        })
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
+        ks.ns_create(
+            NsSpec {
+                id: NsId(17),
+                name: b"cache".to_vec(),
+                mode: NsMode::Memory,
+                fsync: None,
+                policy: None,
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("create");
         assert_eq!(
             ks.ns_set_memory(b"ledger", None, Some(1 << 20)),
@@ -2215,16 +2626,17 @@ mod tests {
 
     #[test]
     fn apply_record_is_a_blind_idempotent_upsert() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
         let now = Nanos::from_millis(10);
         let anchor = WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 };
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
 
         let set = LogRecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v1" };
         for _ in 0..2 {
             // Double apply: replay from an older checkpoint re-covers records.
             assert_eq!(
-                ks.apply_record(&set, now, anchor, &mut NoSpill).expect("apply"),
+                drive_record(&mut ks, &set, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
                 ReplayOutcome::Applied
             );
         }
@@ -2234,7 +2646,7 @@ mod tests {
         let future_unix = anchor.unix_from_internal(Nanos::from_millis(60_000));
         let exp = LogRecordView::ExpireAt { ns: NsId(16), at_unix_ms: future_unix, key: b"k" };
         assert_eq!(
-            ks.apply_record(&exp, now, anchor, &mut NoSpill).expect("apply"),
+            drive_record(&mut ks, &exp, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
             ReplayOutcome::Applied
         );
         assert_eq!(ks.ns_store_mut(NsId(16)).expect("live").get(b"k", now), Some(&b"v1"[..]));
@@ -2246,33 +2658,34 @@ mod tests {
 
         let del = LogRecordView::Delete { ns: NsId(16), key: b"gone" };
         assert_eq!(
-            ks.apply_record(&del, now, anchor, &mut NoSpill).expect("apply"),
+            drive_record(&mut ks, &del, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
             ReplayOutcome::Applied
         );
 
         // Unknown / reserved ids skip, never error (dropped-ns tolerance).
         let foreign = LogRecordView::StringPostImage { ns: NsId(99), key: b"x", value: b"y" };
         assert_eq!(
-            ks.apply_record(&foreign, now, anchor, &mut NoSpill).expect("apply"),
+            drive_record(&mut ks, &foreign, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
             ReplayOutcome::SkippedUnknownNs(NsId(99))
         );
         let reserved = LogRecordView::StringPostImage { ns: NsId(3), key: b"x", value: b"y" };
         assert_eq!(
-            ks.apply_record(&reserved, now, anchor, &mut NoSpill).expect("apply"),
+            drive_record(&mut ks, &reserved, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
             ReplayOutcome::SkippedUnknownNs(NsId(3))
         );
         let nsop = LogRecordView::NsOp { ns: NsId(16), payload: b"reserved" };
         assert_eq!(
-            ks.apply_record(&nsop, now, anchor, &mut NoSpill).expect("apply"),
+            drive_record(&mut ks, &nsop, now, anchor, &mut NoSpill, u64::MAX).expect("apply"),
             ReplayOutcome::SkippedReserved
         );
     }
 
     #[test]
     fn post_image_reads_without_touching_stats() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
         let now = Nanos(1);
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         let store = ks.ns_store_mut(NsId(16)).expect("live");
         store
             .set(
@@ -2340,6 +2753,7 @@ mod tests {
 
     #[test]
     fn digest_distinguishes_value_ttl_db_and_namespace() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let now = Nanos(1);
         let base = |value: &[u8], expire: SetExpire, db: usize| {
             let mut ks = Keyspace::new(StoreConfig::default());
@@ -2358,7 +2772,7 @@ mod tests {
         assert_ne!(reference, base(b"v", SetExpire::Clear, 1), "db identity must bind");
 
         let mut named = Keyspace::new(StoreConfig::default());
-        named.ns_create(durable_spec(16, b"ledger")).expect("create");
+        named.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         named.ns_store_mut(NsId(16)).unwrap().set(b"k", b"v", SetOptions::default(), now).unwrap();
         assert_ne!(reference, named.state_digest(now), "namespace identity must bind");
         assert_eq!(named.state_digest(now).entries, 1);

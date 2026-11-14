@@ -1,12 +1,19 @@
 //! Required binary execution must fail when its candidate is absent.
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
+
+/// The values the harness starts nothing from: unset, empty, not Unicode.
+fn unusable_binaries() -> [Option<&'static OsStr>; 3] {
+    [None, Some(OsStr::new("")), Some(OsStr::from_bytes(b"\xff"))]
+}
 
 #[test]
 fn required_binary_cannot_skip() {
     for flag in ["1", "0", "bogus"] {
-        for binary in [None, Some("")] {
+        for binary in unusable_binaries() {
             let mut child = child_command();
             child.env("INF_COMPAT_REQUIRE_BINARY", flag);
             if let Some(binary) = binary {
@@ -24,9 +31,23 @@ fn required_binary_cannot_skip() {
     }
 }
 
+/// An optional lane skips on every value it cannot start: an empty or a
+/// non-Unicode one as an unset one, never a spawn of a path that names no
+/// binary.
 #[test]
 fn optional_binary_can_skip() {
-    assert!(child_command().output().expect("run child").status.success());
+    for binary in unusable_binaries() {
+        let mut child = child_command();
+        if let Some(binary) = binary {
+            child.env("INFINITYD_BIN", binary);
+        }
+        let output = child.output().expect("run child");
+        assert!(
+            output.status.success(),
+            "INFINITYD_BIN {binary:?} did not skip: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn child_command() -> Command {

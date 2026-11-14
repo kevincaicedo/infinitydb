@@ -16,6 +16,10 @@ use inf_log::{
 };
 use std::path::PathBuf;
 
+#[path = "common/rotor_geometry.rs"]
+mod rotor_geometry;
+use rotor_geometry::geometry;
+
 const SEGMENT_BYTES: u32 = 4096;
 
 /// Canonical v2 stamp for hand-built test frames (epoch 1, covered 0 —
@@ -31,7 +35,7 @@ fn cfg() -> SegmentConfig {
 
 fn mem_rotor(fs: &MemFs) -> SegmentRotor<MemFs> {
     let dirs = create_cell_dirs(fs, &PathBuf::from("data/shard-0")).expect("dirs");
-    SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg()).expect("fresh rotor")
+    SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry(cfg())).expect("fresh rotor")
 }
 
 /// Append one frame with `filler` bytes of value payload; returns its base LSN.
@@ -160,13 +164,26 @@ fn enospc_surfaces_in_maintain_before_writes_need_it() {
     assert_eq!(rotor.active_segment(), SegmentId(1));
 }
 
+/// A frame no segment of the rotor's geometry holds is an invariant
+/// violation, never a typed error the cell turns into a stop while serving
+/// (ADR-0191 D4): the staging ring seals at most its capacity and the
+/// geometry holds a segment of at least that, so only a caller's raw length
+/// reaches the fit assertion. Both reservations make the compare; deleting
+/// it turns these red.
 #[test]
-fn oversized_frame_is_rejected() {
+#[should_panic(expected = "frame exceeds the segment")]
+fn oversized_frame_is_an_invariant_violation() {
     let fs = MemFs::new();
     let mut rotor = mem_rotor(&fs);
-    let err = rotor.begin_frame(SEGMENT_BYTES + 1, 0).expect_err("too large");
-    assert!(matches!(err, LogError::FrameTooLarge { len, max }
-        if len == SEGMENT_BYTES + 1 && max == SEGMENT_BYTES));
+    let _ = rotor.begin_frame(SEGMENT_BYTES + 1, 0);
+}
+
+#[test]
+#[should_panic(expected = "frame exceeds the segment")]
+fn oversized_frame_is_an_invariant_violation_deferred() {
+    let fs = MemFs::new();
+    let mut rotor = mem_rotor(&fs);
+    let _ = rotor.begin_frame_deferred(SEGMENT_BYTES + 1, 0);
 }
 
 #[test]
@@ -190,7 +207,8 @@ fn time_seal_fires_only_when_configured_and_dirty() {
         seal_after_ms: Some(1_000),
         ..Default::default()
     };
-    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, config).expect("rotor");
+    let mut rotor =
+        SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry(config)).expect("rotor");
 
     // Empty active segment never time-seals.
     let report = rotor.maintain(10_000).expect("maintain");
@@ -223,7 +241,7 @@ fn a_time_seal_never_fires_on_the_deferred_tier() {
         ..Default::default()
     };
     let mut rotor =
-        SegmentRotor::create_fresh_deferred(fs.clone(), dirs.log, config).expect("rotor");
+        SegmentRotor::create_fresh_deferred(fs.clone(), dirs.log, geometry(config)).expect("rotor");
     let value = [0xABu8; 100];
     let mut builder = FrameBuilder::new();
     builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: &value });
@@ -254,7 +272,8 @@ fn std_fs_lifecycle_smoke() {
     let dirs = create_cell_dirs(&fs, &shard).expect("dirs");
 
     let config = SegmentConfig { segment_bytes: 8192, ..Default::default() };
-    let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), config).expect("fresh rotor");
+    let mut rotor =
+        SegmentRotor::create_fresh(fs, dirs.log.clone(), geometry(config)).expect("fresh rotor");
     let mut builder = FrameBuilder::new();
     builder.append(&RecordView::StringPostImage { ns: NsId(0), key: b"boot", value: b"one" });
     let slot = rotor.begin_frame(builder.frame_len(), 0).expect("reserve");
@@ -270,8 +289,9 @@ fn std_fs_lifecycle_smoke() {
     // Reboot: scan, reopen at the recovered tail, append a second frame.
     let scan = scan_log_dir(&fs, &dirs.log).expect("scan");
     assert_eq!(scan.segments(), &[SegmentId(0)]);
-    let mut rotor = SegmentRotor::open_existing(fs, dirs.log.clone(), config, &scan, first_end)
-        .expect("reopen");
+    let mut rotor =
+        SegmentRotor::open_existing(fs, dirs.log.clone(), geometry(config), &scan, first_end)
+            .expect("reopen");
     builder.reset();
     builder.append(&RecordView::Delete { ns: NsId(0), key: b"boot" });
     let slot = rotor.begin_frame(builder.frame_len(), 0).expect("reserve");

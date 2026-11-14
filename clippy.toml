@@ -80,6 +80,14 @@ disallowed-methods = [
     { path = "std::os::unix::fs::lchown", reason = "blocking filesystem call (ADR-0144 D5)" },
     { path = "std::os::unix::fs::fchown", reason = "blocking filesystem call (ADR-0144 D5)" },
     { path = "std::os::unix::fs::chroot", reason = "blocking filesystem call (ADR-0144 D5)" },
+    # ADR-0202 D7: a whole listing of a directory whose population no limit
+    # bounds compiles only under a statement allow whose reason reads
+    # `listing: <directory>: <its population and bound>`; a budgeted boot
+    # walk lists through `open_listing`, one bounded batch a unit. Each entry
+    # has an exact-path plant in lint-scope-probe.
+    { path = "inf_log::fs::SegmentFs::list_dir", reason = "a whole directory listing: list one bounded batch at a time through `open_listing` (ADR-0202 D7)" },
+    { path = "inf_log::blob::list_extent_ids", reason = "a whole listing of `cold/`, whose extents no limit bounds (ADR-0202 D7)" },
+    { path = "inf_log::blob::list_quarantined_extent_ids", reason = "a whole listing of `cold/`, whose extents no limit bounds (ADR-0202 D7)" },
 ]
 
 # ADR-0144 A2: a reservation is consumed in the step that made it; held
@@ -93,6 +101,13 @@ disallowed-methods = [
 await-holding-invalid-types = [
     { path = "inf_foundation::bounded::DequeSlot", reason = "a reservation is consumed before any await: a resumed step reserves again (ADR-0144 A2)" },
     { path = "inf_foundation::bounded::Reserved", reason = "the answer to reserve() carries the slot: it is matched in the step that reserved, before any await (ADR-0144 A2)" },
+    { path = "inf_foundation::bounded::SlotReservation", reason = "a slab's reservation is consumed before any await: a resumed step reserves again (ADR-0144 A2)" },
+    { path = "inf_foundation::bounded::SlabReserved", reason = "the answer to a slab's reserve() carries the slot: it is matched in the step that reserved, before any await (ADR-0144 A2)" },
+    { path = "inf_foundation::bounded::Lookup", reason = "a slab lookup borrows its occupant for one step: a resumed step looks up its handle again (ADR-0144 A2)" },
+    { path = "inf_foundation::bounded::LookupMut", reason = "a slab lookup borrows its occupant for one step: a resumed step looks up its handle again (ADR-0144 A2)" },
+    { path = "inf_foundation::bounded::Admission", reason = "the answer to a map's admit() carries its slot: it is matched in the step that admitted, before any await (ADR-0144 A2)" },
+    { path = "inf_foundation::bounded::OccupiedSlot", reason = "a map's present entry is borrowed for one step: a resumed step admits its key again (ADR-0144 A2)" },
+    { path = "inf_foundation::bounded::VacantSlot", reason = "a map's reservation is consumed before any await: a resumed step admits again (ADR-0144 A2)" },
 ]
 
 # INFINITY_STYLE "~70 lines per function" (review 2026-08-30 L18 R1; batch

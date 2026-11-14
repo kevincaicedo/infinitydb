@@ -37,9 +37,9 @@ use inf_foundation::time::Nanos;
 use inf_log::ckpt::{SyncIckWriter, ick_file_name};
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
-    CkptConfig, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentConfig, SegmentId,
-    SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir, segment_file_name,
-    write_manifest,
+    CkptConfig, LogGeometry, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentConfig,
+    SegmentId, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir,
+    segment_file_name, write_manifest,
 };
 use inf_server::{DurableConfig, open_cell_log};
 use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
@@ -111,8 +111,11 @@ fn value_of(i: u64, buf: &mut [u8; VALUE_LEN]) {
 fn durable_config(root: &Path, segment_bytes: u32) -> DurableConfig {
     DurableConfig {
         data_dir: root.to_path_buf(),
-        staging: StagingConfig::with_capacity(128 << 10),
-        segment: SegmentConfig { segment_bytes, ..Default::default() },
+        geometry: LogGeometry::new(
+            StagingConfig::with_capacity(128 << 10),
+            SegmentConfig { segment_bytes, ..Default::default() },
+        )
+        .expect("the bench's log geometry"),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -124,20 +127,24 @@ fn durable_config(root: &Path, segment_bytes: u32) -> DurableConfig {
 }
 
 fn fresh_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let cfg = StoreConfig {
         initial_keys: env_u64("INF_BENCH_PRESIZE", 0) as usize,
         ..Default::default()
     };
     let mut ks = Keyspace::new(cfg);
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"bench".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"bench".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("ns");
     ks
 }
@@ -156,8 +163,8 @@ fn build_image(root: &Path, cfg: &DurableConfig, records: u64, ckpt_at: Option<u
     let fs = StdSegmentFs;
     let shard = root.join(format!("shard-{CELL}"));
     let dirs = create_cell_dirs(&fs, &shard).expect("dirs");
-    let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), cfg.segment).expect("rotor");
-    let mut ring = StagingRing::new(cfg.staging);
+    let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), cfg.geometry).expect("rotor");
+    let mut ring = StagingRing::new(cfg.geometry);
     let mut value = [0u8; VALUE_LEN];
     let mut staged = 0u64;
     let mut begin: Option<Lsn> = None;
@@ -258,8 +265,10 @@ fn timed_recover<F: inf_log::fs::SegmentFs + Clone>(
     anchor: WallAnchor,
     now: Nanos,
 ) -> (f64, inf_server::RecoverStats) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let start = Instant::now();
-    let (rotor, stats, _seed) = open_cell_log(fs, ks, CELL, cfg, anchor, now).expect("recover");
+    let (rotor, stats, _seed) =
+        open_cell_log(fs, ks, CELL, cfg, anchor, now, &census).expect("recover");
     let millis = start.elapsed().as_secs_f64() * 1e3;
     drop(rotor);
     (millis, stats)

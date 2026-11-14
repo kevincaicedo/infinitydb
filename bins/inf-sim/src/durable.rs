@@ -20,6 +20,7 @@
 //! acks, checkpoint epochs, truncation, and the ADR-0017 unlink
 //! resurrection cases all happen inside the deterministic loop.
 
+use crate::driver::Violations;
 use core::cell::RefCell;
 use std::collections::BTreeMap;
 use std::os::fd::RawFd;
@@ -28,7 +29,7 @@ use std::rc::Rc;
 
 use inf_alloc::BufferPool;
 use inf_doc::path::compile;
-use inf_fabric::{Mesh, MeshConfig};
+use inf_fabric::Mesh;
 use inf_foundation::bounded::CapRow;
 use inf_foundation::fault::FaultSpec;
 use inf_foundation::rng::{Entropy, SplitMix64};
@@ -45,10 +46,11 @@ use inf_server::{
     SimDisk, SimDiskConfig, StallConfig, load_catalog_from,
 };
 use inf_store::{
-    IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, NsId, StoreConfig, WallAnchor,
+    IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, KeyspaceSeed, NsId, StoreConfig,
+    WallAnchor,
 };
 
-use crate::harness::node_hasher;
+use crate::harness::{STEP_NS_FLOOR, node_hasher};
 use crate::lift::LiftNs;
 
 use crate::net::{CellNet, Plant, SimDriver, listener_fd};
@@ -57,10 +59,28 @@ use crate::resp::reply_len;
 mod audit;
 #[cfg(test)]
 mod lastsave;
+mod ledger_wedge;
+#[cfg(test)]
+mod marks;
+mod mget_audit;
 #[cfg(test)]
 mod park;
 mod run;
+mod stop_tick;
+mod tier_budget;
+mod timers;
+pub use ledger_wedge::{LedgerWedgeLeg, LedgerWedgeReport};
+pub(crate) use mget_audit::{
+    DOCUMENT_REPLY_BUDGET_BYTES, MgetTally, audit_report, next_audit_command, with_reply_budget,
+};
+pub use mget_audit::{MgetAuditFold, MgetAuditReport, MgetAudits};
 pub use run::run_durable_scenario;
+pub use stop_tick::StopTickReport;
+pub use tier_budget::{
+    TierBudgetCell, TierBudgetCount, TierBudgetLeg, TierBudgetLoad, TierBudgetShape,
+    TierBudgetValues,
+};
+pub use timers::{TimersReport, WakeLeg, WakeReport};
 
 pub(crate) use audit::survival_audit;
 use audit::{
@@ -127,8 +147,9 @@ pub struct DurableScenario {
     /// frames; `everysec` values stay small so the deferral oracle
     /// measures the ack, not the pad.
     pub value_pad_max: u64,
-    /// Max virtual nanoseconds per scheduler step. Sized so runs span
-    /// several simulated seconds — the everysec window is real.
+    /// The seeded part of a scheduler step's advance, exclusive: a step
+    /// advances `STEP_NS_FLOOR` plus a draw in `0..step_ns_max`. Sized so
+    /// runs span several simulated seconds — the everysec window is real.
     pub step_ns_max: u64,
     /// A second power cut lands *during* recovery (interrupted-recovery
     /// idempotence, in-sim).
@@ -288,6 +309,33 @@ pub struct DurableScenario {
     /// the cut. `None` everywhere else: every other trace stays
     /// byte-identical.
     pub epoch_marks: Option<EpochMarksLeg>,
+    /// The ledger-wedge shape (`m2-ledger-wedge`): `Some` holds the first
+    /// pre-zeroed segment's fdatasyncs on the sim disk while the leg's
+    /// writers keep the log rotating, and judges the fsync ledger's
+    /// rotation class by the segment ids that appear inside the hold
+    /// ([`LedgerWedgeLeg`]). `None` everywhere else: every other trace
+    /// stays byte-identical.
+    pub ledger_wedge: Option<LedgerWedgeLeg>,
+    /// The stop-tick shape (`m2-stop-tick`): the graceful stop with its
+    /// checkpoint off, every log fdatasync held from the first
+    /// `finish_stop` until each dirty cell counted a covered tick
+    /// (`stop_tick.rs`). `false` everywhere else: every other trace stays
+    /// byte-identical.
+    pub stop_tick: bool,
+    /// `m2-fill-tick`'s dense leg (`durable/timers.rs`): every connection's
+    /// pending bytes reach the cell whole at each reap, and every everysec
+    /// `SET` value is padded to the leg's length, so closed-loop writers
+    /// fill the 64 KiB fill target in about two steps. `false` everywhere
+    /// else: every other trace stays byte-identical.
+    pub fill_dense: bool,
+    /// TM3, the wake oracle (`durable/timers.rs`): armed only on the leg
+    /// `park_at_once` makes, whose loops run at spin 0. `OFF` everywhere
+    /// else.
+    pub wake: WakeLeg,
+    /// The `JSON.MGET` audits of the document workload (`durable/mget_audit.rs`)
+    /// and the reply budget every cell's stores take. `None` everywhere
+    /// else: every other trace stays byte-identical.
+    pub mget_audits: Option<MgetAudits>,
 }
 
 /// The epoch-marks shape's legs, chosen by name (`--marks-leg`), never by
@@ -368,307 +416,6 @@ impl EpochMarksLeg {
             EpochMarksLeg::Everysec | EpochMarksLeg::Wedge => b"4kb",
         }
     }
-}
-
-/// How many tiered namespaces the tier-budget shape runs:
-/// `1..=TIER_BUDGET_NS_MAX`, the indices the fixed name table covers. The
-/// one constructor checks the range, so every index below a count names
-/// a namespace.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct TierBudgetCount(u8);
-
-impl TierBudgetCount {
-    /// `count` in `1..=TIER_BUDGET_NS_MAX`, else `None`.
-    pub const fn new(count: u8) -> Option<TierBudgetCount> {
-        if count >= 1 && count <= TIER_BUDGET_NS_MAX { Some(TierBudgetCount(count)) } else { None }
-    }
-
-    pub const fn get(self) -> u8 {
-        self.0
-    }
-
-    /// The namespaces' indices, each a valid [`NsClass::TierBudget`] index.
-    pub fn indices(self) -> std::ops::Range<u8> {
-        0..self.0
-    }
-}
-
-/// The tier-budget shape's legs, chosen by name (`--tier-leg`), never by
-/// the seed: every seed of a run drives the one leg named, so a sweep is
-/// one shape and the smoke lane runs each leg on its own row. The list
-/// grows by a variant here and a row there.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TierBudgetLeg {
-    /// Two namespaces at `MAINTAIN-SLICE 8mb` on the reference share: a
-    /// round of eight full groups waits for refills between them, so the
-    /// turn is contended and refuses.
-    TwoAt8mb,
-    /// Eight namespaces at `1mb`, the most a cell carries here: the
-    /// one-plan-per-turn oracle's leg.
-    EightAt1mb,
-    /// One namespace at `1mb` on the reference share: the control leg,
-    /// which reads no contention and no plan passed over.
-    OneAt1mb,
-    /// Two namespaces at the hostile share (the reference box's rate at
-    /// the share a cell holds among 256): the first at `1mb` under a
-    /// burst its flush cannot drain, the second at `64kb` under a light
-    /// steady load, so the second's small groups take their turn between
-    /// the first's — the fair turn's wait-bound oracle's leg, and the
-    /// leg on which a whole round offered at once is above the class cap.
-    TwoAt1mbHostile,
-    /// One namespace at `64mb` with no device model (the regime of
-    /// `--device-probe off`: every offer is `Now`, nothing waits for a
-    /// refill): a 64 MiB round — 67 writes and 3 barriers — is more ops
-    /// than one turn's 64 descriptor visits, so it issues across turns,
-    /// and with the write-fault plant its retry group is built behind a
-    /// run of done writes: the leg of the group builder's cursor rule.
-    /// The window is 72 MiB with nine tenths mutable, so while the fill
-    /// lasts each seal takes the excess above 64.8 MiB, a page or so;
-    /// once the writers are done the harness drops `MUTABLE-FRACTION` to
-    /// 10 permille, the next seal takes the whole 64 MiB slice and the
-    /// next plan stages the round. The write fault is armed once the
-    /// driver has seen a pass of the turn's 64 ops, so the retry is that
-    /// round's.
-    OneAt64mbNoModel,
-}
-
-impl TierBudgetLeg {
-    pub const ALL: [TierBudgetLeg; 5] = [
-        TierBudgetLeg::TwoAt8mb,
-        TierBudgetLeg::EightAt1mb,
-        TierBudgetLeg::OneAt1mb,
-        TierBudgetLeg::TwoAt1mbHostile,
-        TierBudgetLeg::OneAt64mbNoModel,
-    ];
-
-    /// The leg's name on the command line.
-    pub fn name(self) -> &'static str {
-        match self {
-            TierBudgetLeg::TwoAt8mb => "two-8mb",
-            TierBudgetLeg::EightAt1mb => "eight-1mb",
-            TierBudgetLeg::OneAt1mb => "one-1mb",
-            TierBudgetLeg::TwoAt1mbHostile => "two-1mb-hostile",
-            TierBudgetLeg::OneAt64mbNoModel => "one-64mb-no-model",
-        }
-    }
-
-    /// The leg named `name`, if any.
-    pub fn parse(name: &str) -> Option<TierBudgetLeg> {
-        TierBudgetLeg::ALL.into_iter().find(|leg| leg.name() == name)
-    }
-
-    /// The leg's device model: the reference box's (489 MB/s, 40,000
-    /// ops/s), shared by the node's cells, or that box's rate at the
-    /// share a cell holds among 256, carried by the two cells here; the
-    /// no-model leg has none (`DeviceModel::ABSENT`).
-    pub fn model(self) -> inf_runtime::DeviceModel {
-        let divisor = match self {
-            TierBudgetLeg::TwoAt8mb | TierBudgetLeg::EightAt1mb | TierBudgetLeg::OneAt1mb => 1,
-            TierBudgetLeg::TwoAt1mbHostile => 128,
-            TierBudgetLeg::OneAt64mbNoModel => return inf_runtime::DeviceModel::ABSENT,
-        };
-        inf_runtime::DeviceModel {
-            write_bytes_per_s: 489_000_000 / divisor,
-            write_ops_per_s: 40_000 / divisor,
-            read_bytes_per_s: 489_000_000 / divisor,
-            read_ops_per_s: 40_000 / divisor,
-        }
-    }
-
-    /// Whether the leg's oracle requires the turn to have been contended
-    /// and to have refused (the wait-bound oracle's engagement); the
-    /// other legs read the bound without requiring the regime (on the
-    /// reference share a round's groups fit the class cap, so nothing
-    /// waits for a refill).
-    pub fn expects_contention(self) -> bool {
-        matches!(self, TierBudgetLeg::TwoAt1mbHostile)
-    }
-
-    /// Whether the leg's oracle requires a namespace with work to have
-    /// been passed over by the cell's one plan (the one-plan oracle's
-    /// engagement).
-    pub fn expects_plan_waits(self) -> bool {
-        matches!(self, TierBudgetLeg::EightAt1mb)
-    }
-
-    /// The control leg: one namespace, so the turn never contends and
-    /// the plan never passes one over.
-    pub fn is_control(self) -> bool {
-        matches!(self, TierBudgetLeg::OneAt1mb)
-    }
-
-    /// The no-model leg: the budget reads its model absent, every offer
-    /// is `Now`, and the cap and wait-bound oracles have no reading; its
-    /// regime is a round of more ops than one turn's descriptor visits.
-    pub fn model_absent(self) -> bool {
-        matches!(self, TierBudgetLeg::OneAt64mbNoModel)
-    }
-
-    /// The leg's shape. On the reference-share legs, 3 writers per
-    /// namespace with no think time and a 3 MiB window with a tenth of
-    /// it mutable: seal marks land per 1 MiB commit page and a cell seals
-    /// once a namespace's tail is a page past the mutable target. On the
-    /// hostile leg the first namespace's twelve writers burst with no
-    /// think time into a 256 MiB window with one percent of it mutable:
-    /// their frames hold the foreground at the share, so the tier class
-    /// refills at its floor while the sealed backlog outruns it for the
-    /// whole burst, and no writer parks on its tail. The second
-    /// namespace's one writer, also without think time, writes into an
-    /// 8 MiB window at a 64 KiB slice: its small rounds are ready from
-    /// early on, each takes its turn between the first's groups, and the
-    /// window holds what the floor cannot drain during the burst. On the
-    /// no-model leg six writers without think time fill a 72 MiB window
-    /// whose first seal comes at 64.8 MiB: 84,000 commands of about 2 KiB
-    /// each on the tail (two thirds are `SET`s of 1–10 KiB) are 84 MiB a
-    /// cell by key hash, above the seal with a margin.
-    fn shape(self) -> TierBudgetShape {
-        const ONE: TierBudgetCount = match TierBudgetCount::new(1) {
-            Some(count) => count,
-            None => panic!("one tier-budget namespace is within the name table"),
-        };
-        const TWO: TierBudgetCount = match TierBudgetCount::new(2) {
-            Some(count) => count,
-            None => panic!("two tier-budget namespaces are within the name table"),
-        };
-        const EIGHT: TierBudgetCount = match TierBudgetCount::new(TIER_BUDGET_NS_MAX) {
-            Some(count) => count,
-            None => panic!("the name table's size is within itself"),
-        };
-        let reference = |namespaces: TierBudgetCount, maintain_slice: &'static [u8], ops, keys| {
-            let load = TierBudgetLoad {
-                writers: 3,
-                ops_per_writer: ops,
-                keys_per_writer: keys,
-                think_ns_max: 0,
-                mem_budget: b"3mb",
-                mutable_permille: b"100",
-                maintain_slice,
-            };
-            TierBudgetShape { leg: self, namespaces, first: load, rest: load }
-        };
-        match self {
-            TierBudgetLeg::TwoAt8mb => reference(TWO, b"8mb", 1_000, 40),
-            // 2,000 keys a writer: a live set of about 9 MB a cell, above
-            // the 3 MiB window, so the recovered life seals every
-            // namespace at its first MAINTAIN.
-            TierBudgetLeg::EightAt1mb => reference(EIGHT, b"1mb", 1_000, 2_000),
-            TierBudgetLeg::OneAt1mb => reference(ONE, b"1mb", 3_000, 40),
-            TierBudgetLeg::TwoAt1mbHostile => TierBudgetShape {
-                leg: self,
-                namespaces: TWO,
-                first: TierBudgetLoad {
-                    writers: 12,
-                    ops_per_writer: 4_000,
-                    keys_per_writer: 40,
-                    think_ns_max: 0,
-                    mem_budget: b"256mb",
-                    mutable_permille: b"10",
-                    maintain_slice: b"1mb",
-                },
-                rest: TierBudgetLoad {
-                    writers: 1,
-                    ops_per_writer: 6_000,
-                    keys_per_writer: 40,
-                    think_ns_max: 0,
-                    mem_budget: b"8mb",
-                    mutable_permille: b"100",
-                    maintain_slice: b"64kb",
-                },
-            },
-            TierBudgetLeg::OneAt64mbNoModel => {
-                let load = TierBudgetLoad {
-                    writers: 6,
-                    ops_per_writer: 14_000,
-                    keys_per_writer: 40,
-                    think_ns_max: 0,
-                    mem_budget: b"72mb",
-                    mutable_permille: b"900",
-                    maintain_slice: b"64mb",
-                };
-                TierBudgetShape { leg: self, namespaces: ONE, first: load, rest: load }
-            }
-        }
-    }
-}
-
-/// One tier-budget namespace's load and window: its closed-loop writers,
-/// each on a seeded cell, their ops and think time, and its `INF.NS
-/// CREATE` arguments.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct TierBudgetLoad {
-    pub writers: usize,
-    /// Ops per writer (the other classes keep the scenario's
-    /// `ops_per_writer`).
-    pub ops_per_writer: u64,
-    /// Keys per writer: the namespace's live set is the writers' keys,
-    /// so a count whose live set is above the window is what a recovered
-    /// life seals at its first MAINTAIN (the other classes keep the
-    /// scenario's `keys_per_writer`).
-    pub keys_per_writer: u64,
-    /// The longest think time between a writer's commands, drawn per
-    /// command; 0 = none.
-    pub think_ns_max: u64,
-    pub mem_budget: &'static [u8],
-    pub mutable_permille: &'static [u8],
-    /// The `MAINTAIN-SLICE`: the most record bytes one round stages; a
-    /// round issues in groups of at most one group's bytes and ops
-    /// whatever the slice.
-    pub maintain_slice: &'static [u8],
-}
-
-/// How many tiered namespaces the tier-budget shape runs and how each
-/// is loaded (see [`DurableScenario::tier_budget`]); built only by
-/// [`TierBudgetLeg::shape`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct TierBudgetShape {
-    /// The leg this shape is, for the oracles' per-leg reads.
-    pub leg: TierBudgetLeg,
-    /// Tiered namespaces created on the node; every cell materializes
-    /// each one (the DDL fans out).
-    pub namespaces: TierBudgetCount,
-    /// The first namespace's load, and every other's.
-    pub first: TierBudgetLoad,
-    pub rest: TierBudgetLoad,
-}
-
-impl TierBudgetShape {
-    /// The load of the namespace at `index`.
-    pub fn load(&self, index: u8) -> TierBudgetLoad {
-        if index == 0 { self.first } else { self.rest }
-    }
-}
-
-/// One cell's tier-flush class at the cut of a tier-budget run: what the
-/// budget counted against what the sim disk saw, and the flush each
-/// namespace reached. Read from the budget's own ledger and the driver's
-/// observed bytes; `flushed` is each namespace's watermark advance.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TierBudgetCell {
-    pub cell: u16,
-    pub unattainable: u64,
-    pub deferrals: u64,
-    pub spent_bytes: u64,
-    pub spent_ops: u64,
-    pub overrun_bytes: u64,
-    pub driver_bytes: u64,
-    pub driver_ops: u64,
-    /// Tier-class bytes and ops pushed and not yet submitted at the cut.
-    pub queued_bytes: u64,
-    pub queued_ops: u64,
-    /// The most tier-class bytes and ops one driver entry carried.
-    pub pass_bytes_max: u64,
-    pub pass_ops_max: u64,
-    /// The turn's counters as the last MAINTAIN flushed them.
-    pub groups_deferred: u64,
-    pub group_wait_ns_max: u64,
-    pub turn_waits: u64,
-    pub turn_contended: u64,
-    pub plan_waits: u64,
-    pub rounds_planned: u64,
-    pub write_retries: u64,
-    /// `(namespace index, flushed, ro-boundary, tail)` bytes past the
-    /// life origin, per tier-budget namespace materialized on the cell.
-    pub flushed: Vec<(u8, u64, u64, u64)>,
 }
 
 /// The oversized-value pad of ADR-0178's sim arm (see
@@ -836,9 +583,16 @@ fn device_budget_arm(
 /// Builds the scenario's disk: stall-modeled when armed, instant
 /// otherwise. The stall seed derives from the scenario seed (L7).
 pub fn build_disk(seed: u64, stall: Option<&StallConfig>) -> SimDisk {
+    build_disk_with(seed, stall, SimDiskConfig::default())
+}
+
+/// [`build_disk`] over a disk config of the caller's: the one place the
+/// stall seed is mixed, and both arms take `config`, so a mode the caller
+/// asks for reaches the disk with or without a stall model.
+pub fn build_disk_with(seed: u64, stall: Option<&StallConfig>, config: SimDiskConfig) -> SimDisk {
     match stall {
-        Some(cfg) => SimDisk::with_stall(SimDiskConfig::default(), cfg.clone(), seed ^ 0x57A1_1ED0),
-        None => SimDisk::new(),
+        Some(cfg) => SimDisk::with_stall(config, cfg.clone(), seed ^ 0x57A1_1ED0),
+        None => SimDisk::with_config(config),
     }
 }
 
@@ -946,6 +700,11 @@ impl DurableScenario {
             spin_iters: Self::SPIN_ITERS,
             tier_budget: None,
             epoch_marks: None,
+            ledger_wedge: None,
+            stop_tick: false,
+            fill_dense: false,
+            wake: WakeLeg::OFF,
+            mget_audits: None,
         }
     }
 
@@ -1063,6 +822,12 @@ impl DurableScenario {
         let mut stall = m2_stall_config();
         stall.wedge_every_writes = 40;
         stall.wedge_ns = 150_000_000;
+        // Plant: no wedge, so the frame queue never fills and the
+        // scenario's engagement reads it.
+        #[cfg(inf_canary_reorder_wedge_zero)]
+        {
+            stall.wedge_ns = 0;
+        }
         scenario.stall = Some(stall);
         scenario.always_writers = 0;
         scenario.esec_writers = 6;
@@ -1086,10 +851,14 @@ impl DurableScenario {
     /// seal (a FLUSH-class fdatasync on a device whose flush base is
     /// 10 ms while FUA writes complete in 40 µs), so on 64 KiB segments
     /// every rotation opens a window in which dozens of FUA frames land
-    /// and fold nowhere. 48 writers, one command in flight each: the
-    /// pre-fix peak is ~the writer count; the fixed ledger holds at
-    /// `WRITE_THROUGH_WINDOW_ENTRIES`. No stall episodes (the wedge is
-    /// the seal itself); the m2 durability oracle unchanged.
+    /// and fold nowhere. 48 writers, one command in flight each: an
+    /// unbounded ledger peaks at about the writer count. Here the unfolded
+    /// write-through tickets peak at 13–15, under the window of
+    /// `WRITE_THROUGH_WINDOW_ENTRIES` (16): a recycled file keeps one
+    /// sentinel block, leaving 15 frame blocks, and a rotation frame waits
+    /// behind the seal. `m2-ledger-wedge` reaches the window, holding a seal
+    /// while sixteen one-block frames land behind it. No stall episodes (the
+    /// wedge is the seal itself); the m2 durability oracle unchanged.
     #[must_use]
     pub fn m2_fua_pending(seed: u64) -> DurableScenario {
         let mut scenario = DurableScenario::m2_durable(seed);
@@ -1321,6 +1090,11 @@ impl DurableScenario {
             spin_iters: Self::SPIN_ITERS,
             tier_budget: None,
             epoch_marks: None,
+            ledger_wedge: None,
+            stop_tick: false,
+            fill_dense: false,
+            wake: WakeLeg::OFF,
+            mget_audits: None,
         }
     }
 
@@ -1335,12 +1109,13 @@ impl DurableScenario {
     /// target). The m2 durability oracle and the reply oracle run
     /// unchanged; the tier class's own oracles — no offer above the cap,
     /// one pass's tier bytes within the cap and the pool, every ready
-    /// group issued within the fair turn's bound, the spend equal to the
-    /// disk's tier bytes and ops, one plan per cell turn — run on the
-    /// per-cell scrape at the cut, and the run reports the tier class per
-    /// cell. The budget scenario's generic oracles stay off: their
-    /// engagement clause (some background class deferred) is vacuous on
-    /// the legs whose class never waits for a refill.
+    /// group issued within the fair turn's bound — run on the per-cell
+    /// scrape at the cut; the spend equal to the disk's tier bytes and ops
+    /// plus those granted and not yet submitted, and one plan per cell
+    /// turn, are judged at every step boundary; and the run reports the
+    /// tier class per cell. The budget scenario's generic oracles stay
+    /// off: their engagement clause (some background class deferred) is
+    /// vacuous on the legs whose class never waits for a refill.
     #[must_use]
     pub fn m4_tier_budget(seed: u64, leg: TierBudgetLeg) -> DurableScenario {
         let cells: u16 = 2;
@@ -1488,6 +1263,11 @@ impl DurableScenario {
             spin_iters: Self::SPIN_ITERS,
             tier_budget: None,
             epoch_marks: None,
+            ledger_wedge: None,
+            stop_tick: false,
+            fill_dense: false,
+            wake: WakeLeg::OFF,
+            mget_audits: Some(MgetAudits { reply_budget_bytes: DOCUMENT_REPLY_BUDGET_BYTES }),
         }
     }
 }
@@ -1499,15 +1279,18 @@ pub(crate) fn m2_fill_config() -> inf_server::FillConfig {
 
 /// What one seeded run produced. `trace` is the determinism artifact
 /// (every apply event incl. the post-recovery audit reads).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DurableReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
     pub state_hash: u64,
-    pub violations: Vec<String>,
+    pub violations: Violations,
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     pub stalled: bool,
     /// ADR-0124: scheduler steps the clean stop took to drain every cell
     /// (0 without `clean_stop`), and the reboot's tail records applied
@@ -1555,6 +1338,15 @@ pub struct DurableReport {
     /// Reorder-window hold episodes (ADR-0087 D2 as amended), scraped at
     /// the cut — the `m2-reorder-window` oracle's observable.
     pub frame_waits_reorder: u64,
+    /// The fsync ledger's holds and skips, scraped at the cut and summed
+    /// over the cells: frames held for the rotation's unfolded seal, frames
+    /// held for a full ack map, and prealloc or zero-fill barriers skipped
+    /// at their class's budget. The last two are derived never to occur:
+    /// the cut reads them 0 on every seed (tokens `ack-map-held`,
+    /// `ledger-prealloc-deferred`).
+    pub frame_waits_ledger: u64,
+    pub frame_waits_ack_map: u64,
+    pub ledger_prealloc_deferrals: u64,
     /// Checkpoint `Direct` → `Buffered` in-band downgrades (ADR-0088 D3
     /// as amended), scraped at the cut — the `m2-ckpt-refused` oracle's
     /// coverage disclosure.
@@ -1562,6 +1354,14 @@ pub struct DurableReport {
     /// Sections sealed for the ADR-0117 section bound, scraped at the
     /// cut — the section-bound arm's engagement witness (batch 34).
     pub ckpt_bound_splits: u64,
+    /// The simulated disk's call log as the cut found it: the checkpoint
+    /// staging creates and the renames onto a `MANIFEST` the disk logged up
+    /// to the cut, in call order, each under the harness's mark of the cell
+    /// whose iteration made it; and the calls past the log's cap, counted,
+    /// not kept. A carrier matches an injected refusal to the walks that
+    /// follow it here, on the disk's side, never in the cell's counters.
+    pub disk_calls: Vec<inf_log::fs::sim::LoggedCall>,
+    pub disk_calls_unlogged: u64,
     /// The requested plant fired (batch 34 disclosure for the positive
     /// controls — a plant that never fires is a vacuous run).
     pub plant_fired: bool,
@@ -1661,6 +1461,17 @@ pub struct DurableReport {
     /// The epoch-marks shape's reclaim-marks row per cell at the cut (empty
     /// off the shape).
     pub epoch_marks_cells: Vec<EpochMarksCell>,
+    /// The ledger-wedge shape's readings at the cut (`None` off the shape).
+    pub ledger_wedge: Option<LedgerWedgeReport>,
+    /// The stop-tick shape's readings at the end of its stop (`None` off
+    /// the shape).
+    pub stop_tick: Option<StopTickReport>,
+    /// The timers' readings over the traffic phase (`durable/timers.rs`).
+    pub timers: TimersReport,
+    /// TM3's readings over the traffic phase (zeros off its leg).
+    pub wake: WakeReport,
+    /// The `JSON.MGET` audits' engagement (`durable/mget_audit.rs`).
+    pub mget: MgetAuditReport,
 }
 
 /// One cell's reclaim-marks census row at the cut of an epoch-marks run.
@@ -1863,6 +1674,9 @@ pub(crate) struct Writer {
     /// `SET`s this writer built: the ADR-0178 arm pads ordinals ≡ 0 mod
     /// 16, so every armed `always` writer pads its first `SET`.
     pub(crate) sets: u64,
+    /// The `JSON.MGET` audits this writer was answered on, and the one in
+    /// flight (`durable/mget_audit.rs`).
+    pub(crate) mget: MgetTally,
 }
 
 pub(crate) fn encode(argv: &[&[u8]]) -> Vec<u8> {
@@ -1880,6 +1694,51 @@ pub(crate) fn bulk(value: &[u8]) -> Vec<u8> {
     wire.extend_from_slice(value);
     wire.extend_from_slice(b"\r\n");
     wire
+}
+
+/// A tier file, by its name: the predicate a harness hands the sim disk's
+/// tier-read hold.
+pub(crate) fn is_tier_file(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "itier")
+}
+
+/// Steps in a row a cell's held tier reads must stay unchanged, above 0,
+/// before a harness counts a burst's issue as done.
+pub(crate) const HELD_READS_STEADY_STEPS: u64 = 8;
+
+/// What one step of [`steady_held_reads`] answers.
+pub(crate) enum HeldReads {
+    /// A reader still waits on its reply: the watched cell's held tier reads.
+    Waiting(usize),
+    /// Every reader has answered, so nothing is left to wait for.
+    Answered,
+}
+
+/// Runs `step` at most `steps_max` times, each one scheduler step that
+/// answers the watched cell's held tier reads (the sim driver's own count,
+/// no product counter), until that count stays above 0 and unchanged for
+/// [`HELD_READS_STEADY_STEPS`] steps in a row: every read the burst issues
+/// is queued at the device. A step that answers [`HeldReads::Answered`]
+/// ends the wait early. Returns the last count a step read: the steady
+/// count, or at the bound or the early end whatever the last count was (0
+/// when none was read or none held); a `step` error ends the wait.
+pub(crate) fn steady_held_reads<E>(
+    steps_max: u64,
+    mut step: impl FnMut() -> Result<HeldReads, E>,
+) -> Result<usize, E> {
+    let (mut held, mut steady) = (0, 0);
+    for _ in 0..steps_max {
+        let HeldReads::Waiting(now) = step()? else { break };
+        if now > 0 && now == held {
+            steady += 1;
+            if steady == HELD_READS_STEADY_STEPS {
+                break;
+            }
+        } else {
+            (held, steady) = (now, 0);
+        }
+    }
+    Ok(held)
 }
 
 impl Writer {
@@ -1917,6 +1776,7 @@ impl Writer {
             models: BTreeMap::new(),
             corpus_docs_used: 0,
             sets: 0,
+            mget: MgetTally::default(),
         }
     }
 
@@ -1925,6 +1785,11 @@ impl Writer {
     /// extents, overwrites and deletes of cold keys that stage
     /// displacement pairs — every reply exact.
     fn next_tiered_command(&mut self, scenario: &DurableScenario) -> (Vec<u8>, Pending) {
+        if let (NsClass::TierBudget(index), Some(shape)) = (self.class, scenario.tier_budget)
+            && let TierBudgetValues::SetOnlyUnique { value_bytes } = shape.load(index).values
+        {
+            return self.next_unique_set(value_bytes);
+        }
         let keys = match (self.class, scenario.tier_budget) {
             (NsClass::TierBudget(index), Some(shape)) => shape.load(index).keys_per_writer,
             _ => scenario.keys_per_writer,
@@ -1959,6 +1824,24 @@ impl Writer {
             let wire = encode(&[b"DEL", &key]);
             (wire, Pending { key, state_after: None, expect, mutates: true, taints: false })
         }
+    }
+
+    /// A `SET` of a key this writer never wrote (`k:<writer>:<sent>`) to a
+    /// `value_bytes` value stamped with the writer and its count: every
+    /// record lands once and stays live until the cut.
+    fn next_unique_set(&mut self, value_bytes: usize) -> (Vec<u8>, Pending) {
+        let key = format!("k:{}:{}", self.id, self.sent).into_bytes();
+        let stamp = format!("u:{}:{}:", self.id, self.sent).into_bytes();
+        let value: Vec<u8> = stamp.iter().copied().cycle().take(value_bytes).collect();
+        let wire = encode(&[b"SET", &key, &value]);
+        let pending = Pending {
+            key,
+            state_after: Some(value),
+            expect: b"+OK\r\n".to_vec(),
+            mutates: true,
+            taints: false,
+        };
+        (wire, pending)
     }
 
     /// The epoch-marks wedge leg's traffic: the first write of a writer's
@@ -2035,6 +1918,7 @@ impl Writer {
                 String::from_utf8_lossy(&reply)
             ));
         }
+        self.mget.answered();
         if pending.mutates {
             let ops = self.ledger.entry(pending.key.clone()).or_default();
             let rec = ops.last_mut().expect("sent op has a ledger entry");
@@ -2123,6 +2007,11 @@ impl Writer {
                     usize::try_from(self.rng.next_below(scenario.value_pad_max)).expect("fits");
                 value.extend(std::iter::repeat_n(b'p', pad));
             }
+            // The dense fill leg pads its everysec values instead: its
+            // writers must fill the fill target in about two steps.
+            if scenario.fill_dense && self.class == NsClass::Everysec {
+                value.resize(timers::DENSE_VALUE_BYTES, b'd');
+            }
             // ADR-0178's arm: a value whose checkpoint block only an
             // overrun can issue (`always` writers, the run's first quarter,
             // every 16th `SET` from the first — a fixed schedule, so no
@@ -2181,7 +2070,6 @@ pub(crate) struct Node {
     /// What each cell's reactor iteration reported in the last scheduler
     /// step, as `run_iteration` returned it: `None` for a cell that step
     /// did not run (frozen), and before the first step.
-    #[allow(dead_code, reason = "read by the loop-tier tests, through `Node::iter_stats`")]
     iter_stats: Vec<Option<IterStats>>,
     pub(crate) nets: Vec<Rc<RefCell<CellNet>>>,
     pub(crate) control: std::sync::Arc<inf_server::ControlHandle>,
@@ -2204,23 +2092,30 @@ pub(crate) struct Node {
 
 /// One cell's durable configuration for `scenario` (every cell of a node
 /// gets the same one).
+///
+/// The staging ring is `min(4 MiB, segment_bytes)` per buffer, so every
+/// frame it can seal fits one of the scenario's segments (the harness rule,
+/// ADR-0191). A scenario's pair is harness data: a wrong literal fails the
+/// run here, at construction, never as a stop while serving.
 fn durable_config(
     scenario: &DurableScenario,
     data_dir: &std::path::Path,
 ) -> inf_server::DurableConfig {
+    let staging = inf_server::StagingConfig {
+        capacity_bytes: scenario.segment_bytes.min(inf_log::DEFAULT_STAGING_BYTES),
+        frames_in_flight: scenario.frames_in_flight,
+    };
+    let segment = inf_server::SegmentConfig {
+        segment_bytes: scenario.segment_bytes,
+        io_mode: scenario.io_mode,
+        recycle_slots: scenario.recycle_slots,
+        prealloc: scenario.prealloc,
+        ..Default::default()
+    };
     inf_server::DurableConfig {
         data_dir: data_dir.to_path_buf(),
-        staging: inf_server::StagingConfig {
-            frames_in_flight: scenario.frames_in_flight,
-            ..Default::default()
-        },
-        segment: inf_server::SegmentConfig {
-            segment_bytes: scenario.segment_bytes,
-            io_mode: scenario.io_mode,
-            recycle_slots: scenario.recycle_slots,
-            prealloc: scenario.prealloc,
-            ..Default::default()
-        },
+        geometry: inf_server::LogGeometry::new(staging, segment)
+            .expect("a scenario's log geometry"),
         ckpt: inf_server::CkptConfig {
             interval_bytes: scenario.ckpt_interval_bytes,
             stream_bytes_per_sec: scenario
@@ -2268,15 +2163,18 @@ pub(crate) fn boot(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("--cells {e}"))
     })?;
     let catalog = load_catalog_from(disk, &data_dir)?;
+    // A catalog the control plane refuses (ADR-0148 D5) is the boot's typed
+    // error, before any cell exists.
     let (control, inbox, issuers) = inf_server::ControlHandle::detached_with_catalog(
         catalog.as_ref(),
         cell_count,
         // Virtual boot instant (ms): control-plane display only.
         clock.now().as_millis(),
-    );
+    )
+    .map_err(|refused| std::io::Error::new(std::io::ErrorKind::InvalidData, refused.to_string()))?;
     let inf_server::CkptIssuers { host: ckpt_host, cells: cell_issuers } = issuers;
     let mut cell_issuers = cell_issuers.into_iter();
-    let fabrics = Mesh::new(scenario.cells, MeshConfig { ring_capacity: 1024, data_credits: 256 });
+    let fabrics = Mesh::new(scenario.cells, crate::harness::FROZEN_MESH);
     let mut nets = Vec::new();
     let mut cells = Vec::new();
     for (i, fabric) in fabrics.into_iter().enumerate() {
@@ -2284,26 +2182,34 @@ pub(crate) fn boot(
         // The clock rides into the driver for the stall device (M2.5-S14);
         // with no stall model armed this is exactly `with_disk`.
         let driver = SimDriver::with_disk_stall(Rc::clone(&net), disk.clone(), Rc::clone(clock));
+        let driver = if scenario.tier_budget.is_some_and(|shape| shape.leg.is_thief()) {
+            driver.tallying_tier_dirs()
+        } else {
+            driver
+        };
         let pool = BufferPool::new(128, 1024);
         let node_info = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
-        let mut ks =
-            Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
-        if let Some(catalog) = &catalog {
-            ks.seed_catalog(catalog).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
-            })?;
-        }
-        let (mut plane, serve_mark) = SimPlane::new(
+        // The node's keyspace is cataloged (ADR-0189 D4), as `infinityd`'s,
+        // and the plane builds it from this seed on its cell's census.
+        let seed = KeyspaceSeed::Cataloged {
+            cfg: with_reply_budget(
+                scenario,
+                StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() },
+            ),
+            catalog: catalog.clone().unwrap_or_else(inf_store::NsCatalog::empty),
+        };
+        let (mut plane, serve_mark, timer_set) = SimPlane::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
-            ks,
+            seed,
             fabric,
             node_info,
             observer.clone(),
             false,
-        );
+        )
+        .map_err(std::io::Error::other)?;
         let cfg = durable_config(scenario, &data_dir);
         let issuer = cell_issuers.next().ok_or_else(|| {
             std::io::Error::other("the partition minted one checkpoint issuer per cell")
@@ -2312,8 +2218,10 @@ pub(crate) fn boot(
             .set_control(std::sync::Arc::clone(&control), issuer)
             .map_err(|refused| std::io::Error::other(refused.to_string()))?;
         plane.begin_recovery(disk.clone(), &cfg, i as u16, clock.now());
-        let config = LoopConfig { spin_iters: scenario.spin_iters, ..Default::default() };
-        let cell_loop = CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark);
+        let spin_iters = scenario.wake.spin(scenario.spin_iters);
+        let config = LoopConfig { spin_iters, ..Default::default() };
+        let cell_loop =
+            CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark, timer_set);
         nets.push(net);
         cells.push((cell_loop, plane));
     }
@@ -2350,7 +2258,8 @@ impl Drop for Node {
             let tiered_tables =
                 if durable.is_some() { plane.keyspace().tiered_tables() } else { 0 };
             let turn_refused = durable.map(|stats| stats.turn_refused);
-            let facts = crate::census::CellFacts { tiered_tables, turn_refused };
+            let facts =
+                crate::census::CellFacts { server_plane: true, tiered_tables, turn_refused };
             verdict.judge(index, plane.cap_census(), facts);
         }
         self.observer.2.borrow_mut().absorb(verdict);
@@ -2401,6 +2310,10 @@ impl Node {
                 continue;
             }
             let (cell_loop, plane) = &mut self.cells[idx];
+            // Every call the disk logs in this iteration names this cell and
+            // the step's injected time.
+            let cell = inf_foundation::CellId(idx as u16);
+            disk.mark(inf_log::fs::sim::DiskPhase::Cell(cell), clock.now());
             self.iter_stats[idx] = Some(cell_loop.run_iteration(plane).expect("sim iteration"));
             if let Some(err) = plane.take_boot_error() {
                 return Err(err);
@@ -2409,7 +2322,7 @@ impl Node {
         if !self.hold_inbox {
             self.inbox.drain(disk, &self.data_dir)?;
         }
-        clock.advance(Nanos(1_000 + rng.next_u64() % step_ns_max));
+        clock.advance(Nanos(STEP_NS_FLOOR + rng.next_u64() % step_ns_max));
         if !self.observed_ready && self.ready() {
             self.observe_state(b"recovered");
             self.observed_ready = true;
@@ -2419,6 +2332,13 @@ impl Node {
 
     pub(crate) fn ready(&self) -> bool {
         self.control.recovery_board().all_ready()
+    }
+
+    /// Answers at most `requests` queued catalog requests now, whatever
+    /// `hold_inbox` says (the `m2-ns-drop-window` scenario): the writer
+    /// answers the first and holds the next, first in line.
+    pub(crate) fn drain_inbox_requests(&mut self, requests: u32) -> std::io::Result<u32> {
+        self.inbox.drain_requests(&self.disk, &self.data_dir, Some(requests))
     }
 
     /// Read-only plane access for the M3-S23 equivalence oracle — used
@@ -2431,15 +2351,38 @@ impl Node {
         &mut self.cells[cell].1
     }
 
+    /// `cell`'s sim driver, read between scheduler steps: the harness's own
+    /// reading of the ops its device holds.
+    pub(crate) fn driver(&self, cell: usize) -> &SimDriver {
+        self.cells[cell].0.driver()
+    }
+
+    /// The tier reads `cell`'s sim driver has taken in this node's life, read
+    /// between scheduler steps. The driver counts a read as it takes it, a
+    /// held one once its hold lifts, and the count only grows. It carries no
+    /// owner: a reading of it is the cell's, never one command's.
+    pub(crate) fn cell_tier_reads(&self, cell: usize) -> u64 {
+        self.driver(cell).observed_io().read_ops
+    }
+
     /// What `cell`'s reactor iteration reported in the last scheduler step,
     /// `None` when that step did not run the cell (frozen): a skipped cell
     /// has no iteration to read. `parked` is the reactor's own decision,
-    /// made before the driver call: the sim driver ignores the wait, so a
-    /// park shows as this flag and never as elapsed virtual time. Read
-    /// between scheduler steps.
+    /// made before the driver call: the sim driver keeps the wait and never
+    /// blocks on it, so a park shows as this flag and never as elapsed
+    /// virtual time. Read between scheduler steps.
     #[cfg(test)]
     pub(crate) fn iter_stats(&self, cell: usize) -> Option<IterStats> {
         self.iter_stats[cell]
+    }
+
+    /// `cell`'s reactor, its own two readings of its cold turn: the
+    /// iteration whose lend last built the turn (0 before any) and the
+    /// iterations begun, both counted from 1. Read between scheduler steps.
+    #[cfg(test)]
+    pub(crate) fn cold_turn_built_at(&self, cell: usize) -> (u64, u64) {
+        let cell_loop = &self.cells[cell].0;
+        (cell_loop.cold_turn_built_at(), cell_loop.counters()[3])
     }
 
     /// Summed pub/sub registry gauges across cells (combined-scenario
@@ -2462,6 +2405,36 @@ pub(crate) struct MiniClient {
     cell: usize,
     fd: RawFd,
     rx: Vec<u8>,
+}
+
+/// One command's reply and the tier reads its cell's sim driver took while
+/// the command was in flight ([`MiniClient::round_trip`]). Each reading is
+/// the cell's: the driver's count carries no owner, so the verdict that
+/// reads one says when it may stand for the command's (ADR-0208 D1). It holds
+/// no step count: a round trip's steps are the net's chunking of the command
+/// and the reply's own, never work the product did.
+#[derive(Debug)]
+pub(crate) struct RoundTrip {
+    pub(crate) reply: Vec<u8>,
+    /// Reads taken from the send through the step after which the cell held
+    /// every byte of the command. That step's driver entry ran before the
+    /// cell parsed the command, so none of these reads is the command's.
+    pub(crate) cell_reads_before: u64,
+    /// Reads taken after that step, through the step whose end found the
+    /// reply framed.
+    pub(crate) cell_reads: u64,
+    /// The steps among those in which the driver took a read or more, so at
+    /// most `cell_reads`.
+    pub(crate) cell_read_steps: u64,
+}
+
+/// Where a pumped command stands at its cell, read after each step.
+#[derive(Copy, Clone, Debug)]
+enum Arrival {
+    /// Bytes of the command are still in the client's queue to the cell.
+    Sent,
+    /// The cell has taken every byte of it.
+    Whole,
 }
 
 impl MiniClient {
@@ -2492,12 +2465,77 @@ impl MiniClient {
         Ok(None) // stall — the caller records the verdict
     }
 
+    /// [`call`](Self::call)'s round trip, read as it runs: it sends `argv`
+    /// and steps the node to its framed reply, and after each step reads the
+    /// tier reads the cell's driver took in it and this connection's bytes
+    /// the cell has not taken. It takes no draw and sends nothing beyond
+    /// `argv`, so a run's trace is `call`'s. A verdict reads the reply and the
+    /// [`RoundTrip`]'s readings, never the steps: they count the net's chunks
+    /// of the command and the reply's own, so they stay here as the hang
+    /// bound. `None` is a stall after [`STALL_STEPS`] steps, as `call`'s.
+    pub(crate) fn round_trip(
+        &mut self,
+        node: &mut Node,
+        rng: &mut SplitMix64,
+        clock: &Rc<VirtualClock>,
+        disk: &SimDisk,
+        step_ns_max: u64,
+        argv: &[&[u8]],
+    ) -> std::io::Result<Option<RoundTrip>> {
+        node.nets[self.cell].borrow_mut().client_send(self.fd, &encode(argv));
+        let mut arrival = Arrival::Sent;
+        let mut taken = node.cell_tier_reads(self.cell);
+        let (mut cell_reads_before, mut cell_reads, mut cell_read_steps) = (0u64, 0u64, 0u64);
+        for _ in 0..STALL_STEPS {
+            node.step(rng, clock, disk, step_ns_max)?;
+            let now = node.cell_tier_reads(self.cell);
+            let took = now - taken;
+            taken = now;
+            match arrival {
+                Arrival::Sent => {
+                    cell_reads_before += took;
+                    if node.nets[self.cell].borrow().unread(self.fd) == Some(0) {
+                        arrival = Arrival::Whole;
+                    }
+                }
+                Arrival::Whole => {
+                    if took > 0 {
+                        cell_reads += took;
+                        cell_read_steps += 1;
+                    }
+                }
+            }
+            let bytes = node.nets[self.cell].borrow_mut().client_recv(self.fd);
+            self.rx.extend_from_slice(&bytes);
+            if let Some(n) = reply_len(&self.rx) {
+                assert!(
+                    matches!(arrival, Arrival::Whole),
+                    "a reply framed before its cell took the whole command: a cell answers \
+                     only bytes it has taken"
+                );
+                let reply: Vec<u8> = self.rx.drain(..n).collect();
+                return Ok(Some(RoundTrip {
+                    reply,
+                    cell_reads_before,
+                    cell_reads,
+                    cell_read_steps,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     /// Sends `argv` without awaiting its reply — for commands that must
     /// be in flight together with another connection's (the M4.5-S37
     /// overlapping-drain row); the caller steps the node and
     /// [`recv`](Self::recv)s.
     pub(crate) fn send(&mut self, node: &mut Node, argv: &[&[u8]]) {
         node.nets[self.cell].borrow_mut().client_send(self.fd, &encode(argv));
+    }
+
+    /// Closes the client's socket with any reply unread: a disconnect.
+    pub(crate) fn close(self, node: &mut Node) {
+        node.nets[self.cell].borrow_mut().client_close(self.fd);
     }
 
     /// One framed reply if it has arrived (no stepping).
@@ -2556,7 +2594,7 @@ pub(crate) struct AuditTally {
     pub(crate) required_ops: u64,
     pub(crate) allowed_lost_ops: u64,
     pub(crate) audited_keys: u64,
-    pub(crate) violations: Vec<String>,
+    pub(crate) violations: Violations,
 }
 
 impl AuditTally {

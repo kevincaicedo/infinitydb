@@ -62,8 +62,8 @@ every change runs through:
    byte-diffed against Redis in the compatibility corpus. Unsafe code gets
    Miri/Loom coverage. Every new oracle has a canary: a planted bug that
    turns it red.
-5. **Validate.** `just check` and `cargo deny check` green, plus the layer
-   checks for what you touched (see [the validation ladder](#the-validation-ladder)).
+5. **Validate.** `just check` and `just deny` green, plus the layer checks
+   for what you touched (see [the validation ladder](#the-validation-ladder)).
 6. **Commit and open the PR.** One logical change per commit, a short
    one-line message stating the concrete change, and the
    [PR checklist](.github/PULL_REQUEST_TEMPLATE.md) filled in. The PR
@@ -72,7 +72,7 @@ every change runs through:
 
 A change is **done** when it is reachable from the wire at the shipped
 topology (the multi-cell `infinityd`, not only a library tier), its tests
-landed with it, `just check` and `cargo deny check` are green, and a fix
+landed with it, `just check` and `just deny` are green, and a fix
 answers its class question: which type, table or lint makes the sibling
 bug impossible — or why no such class exists.
 
@@ -105,13 +105,74 @@ Requirements:
 - **Linux with `io_uring`** to run the server (kernel 5.15+, 6.1+ recommended).
   macOS builds and tests via `kqueue` for development/correctness, but is not
   a performance target.
+- **`/dev/shm` on a tmpfs that takes `O_DIRECT`** (Linux 6.6 or newer) for
+  `just check` and the workspace tests: the `timer_owners` test keeps its
+  node's data there, and without it the test fails rather than skips. The
+  server itself runs on 5.15.
 - **`redis-server` 8.0.5** on `PATH` (or `INF_COMPAT_ORACLE_ADDR` pointing at
   one): `just check`, the workspace tests and `just compat` byte-diff
   against it, and an absent or different version fails rather than skips.
   The compat corpus raises `maxclients`, so raise the shell's file-descriptor
   limit if needed (`ulimit -n 65536`).
-- [`just`](https://github.com/casey/just) for the task runner, and
-  `cargo-deny` for the dependency-policy check.
+- **Python 3.11 or newer**: every `just` recipe, `just fmt` too, first asks
+  `scripts/target-root.sh` whether this checkout's `target/` is its own
+  (below), and the scripts `just check` runs read TOML with its standard
+  library.
+- **A C++17 compiler** (`c++`, `g++` or `clang++`): `just check` compiles every
+  fuzz target, and their build compiles libFuzzer's C++ runtime.
+- [`just`](https://github.com/casey/just) for the task runner,
+  `cargo-deny` for the dependency-policy check, and
+  [`cargo-nextest`](https://nexte.st) for the tests, at the version
+  `.config/nextest.toml` requires (its `nextest-version`): `cargo install
+  --locked cargo-nextest --version <that version>`. `just check` is red at
+  its second line when nextest is missing or older.
+
+**A checkout builds in its own `target/`.** Before the first plain `cargo`
+command, and before opening the clone in an editor whose language server runs
+cargo, run any `just` recipe or `./scripts/target-root.sh --print`: it marks
+`target/` as this checkout's own. A `target/` that cargo or an editor wrote
+first is refused once, and the build after its clean is cold.
+
+Cargo reads outputs that another checkout wrote as fresh, so code that does
+not compile can pass, and a target triple or a moved target leaves a path into
+`target/<profile>` naming an older build or none. So each checkout builds in
+its own `target/`, a directory, and nothing moves it. Before any recipe runs,
+the justfile's export refuses (exit 2, nothing run) a `CARGO_TARGET_DIR` that
+names another directory, a set `CARGO_BUILD_TARGET` or `CARGO_BUILD_BUILD_DIR`,
+`CARGO_BUILD_TARGET_DIR`, a cargo config that sets `build.target`,
+`build.target-dir` or `build-dir` or holds an `include` (read in the checkout,
+each directory above it and `CARGO_HOME`, as cargo reads them), a link or a
+file at `target`, and a checkout inside another checkout's `target/`. Each
+refusal names what it found and what clears it:
+
+- a shell's `CARGO_TARGET_DIR`: unset it for this checkout (`env -u
+  CARGO_TARGET_DIR just check`); an empty value counts as unset;
+- a global cargo config's `build.target-dir`: remove it, or override it in a
+  git-ignored `.cargo/config.toml` in the checkout holding
+  `[build] target-dir = "target"`;
+- a config's `build-dir` or `build.target`, or `CARGO_BUILD_TARGET`: remove
+  it (no config unsets a triple);
+- outputs wanted on another volume: clone the checkout there.
+
+A `target/` holding outputs that no marker of this checkout names (one that
+cargo or an editor wrote before the first recipe, one copied or moved with its
+checkout, one from before this rule) is refused with one command, `cd
+<checkout> && ./scripts/target-root.sh --clean`, and no path to remove. That
+command runs the same checks, then refuses, removing nothing, a `target/` that
+holds a `.git` (a work tree or a repository) or another checkout's target
+root, or that another live checkout's linked `target` shares; otherwise it
+runs `cargo clean --target-dir <checkout>/target` and marks the empty
+directory. The next build is cold. The recipes that run what they build
+(`sim-smoke`, `sim-canaries`, the sweeps, `compat`, `client-smoke`),
+`inf-compare`'s checker and `inf-bench`'s default `--infinityd-bin` run the
+binaries this checkout built. A line that names a cargo output setting (a name
+above, `--target`, `--config`, `CARGO_HOME` or `.cargo/config`) is a row of
+`scripts/target-dirs.tsv`, which the gates' self-test checks against every
+file git lists, untracked ones included: an untracked file naming one, such as
+a local script or a `.cargo/config.toml`, is red there until it is git-ignored
+or given a row. A limit: a script run alone, outside a recipe, under a cargo
+config's `build-dir` puts its intermediate outputs there, as only the export
+and `--clean` ask cargo for its build directory.
 
 Clone, run the full local ladder (`just check`, described below) and start
 a server:
@@ -165,12 +226,14 @@ bug in the docs: open an issue (or fix it in your first PR).
 ## The validation ladder
 
 Run these before opening a PR — CI runs the same checks. `just check` is
-the required baseline; `cargo deny check` checks dependency licenses and
-advisories:
+the required baseline; `just deny` checks dependency licenses, advisories,
+bans and sources in every lock that holds a third-party crate — the
+workspace's and each fuzz workspace's, as CI does, one `cargo deny` run
+each:
 
 ```bash
 just check
-cargo deny check
+just deny
 ```
 
 `just check` runs `cargo fmt --check`; every mechanical gate under
@@ -180,8 +243,20 @@ shipping features, file length and line width, lint ratchet and scopes,
 documentation links); the gates' own self-test, which runs each gate on
 planted cases and requires each to exit non-zero (a case written with
 `expect_red_because` also requires its cause in the gate's output); clippy
-with `-D warnings`; and the workspace tests. The `check` recipe in the
-[`justfile`](justfile) is the exact list.
+with `-D warnings`; and the tests of the workspace and of two feature sets,
+each test a process of its own under `cargo nextest run`, which runs every
+test binary even after a red, and their doctests under `cargo test --doc`.
+The `check` recipe in the [`justfile`](justfile) is the exact list. While
+you edit one crate, its clippy and `cargo nextest run -p <crate>` are the
+quick loop.
+
+Under nextest a static lock in a test target no longer keeps its tests
+apart, so `.config/nextest.toml` does: a lock that keeps tests apart puts
+its target in a group of one thread, and a test whose verdict reads what
+other tests share (a pinned-memory budget, a live rate, a tight wall-clock
+bound) runs alone, first. Each such lock and test carries a marker in its
+source saying why; `scripts/check-nextest-config.sh` pairs every marker with
+its rule and names what is missing.
 
 Layer-specific checks, run them when you touch the relevant area:
 

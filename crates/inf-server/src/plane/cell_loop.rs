@@ -5,6 +5,27 @@
 use super::*;
 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
+    /// The everysec role's delivery: the durable plane's tick, then the
+    /// successor a second on from the delivery's time (the tick schedules
+    /// from the current injected time; no missed tick is caught up).
+    fn everysec_tick<'n>(&self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> {
+        {
+            let mut durable = self.shared.durable.borrow_mut();
+            let Some(cell) = durable.as_mut() else { return TimerOutcome::Complete };
+            cell.on_everysec_tick();
+        }
+        // Canary: the tick hands back no successor, so it runs once.
+        if cfg!(inf_canary_everysec_no_successor) {
+            return TimerOutcome::Complete;
+        }
+        let deadline = cx.now.saturating_add(Nanos::from_secs(1));
+        let next = cx
+            .timers()
+            .successor(notice, deadline)
+            .expect("the everysec successor arms inside the clock's range");
+        TimerOutcome::Successor(next)
+    }
+
     fn arm_initial_listener(&mut self, cx: &mut LoopCx<'_>) -> bool {
         use crate::cache_boot::CacheBootStatus;
 
@@ -26,6 +47,24 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         });
         true
     }
+
+    /// The turn's cold delivery (ADR-0181 R1, R2) from the iteration's
+    /// allowance: the cold handle is cloned under a short tier borrow, which
+    /// is released before any gate wake or orphan cleanup runs, and the
+    /// allowance is lent only when the host holds ready delivery, so an
+    /// iteration with nothing ready builds no turn. Out of line, so a cell
+    /// with no cold engine carries none of it in its iteration
+    /// (`inf-runtime`'s `cold_path` bench, its server-shaped reactor legs).
+    #[inline(never)]
+    fn deliver_cold(&self, cx: &mut LoopCx<'_>) {
+        let cold = self.shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
+        if let Some(cold) = cold
+            && cold.has_ready_delivery()
+        {
+            let now_us = cx.now.as_micros();
+            let _ = cx.with_cold_delivery_budget(|budget| cold.deliver_ready(budget, now_us));
+        }
+    }
 }
 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for ServerPlane<O, F> {
@@ -42,10 +81,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 let key = Self::key_of(c.token);
                 if len == 0 {
                     cx.pool.release(buf);
-                    let live = self.shared.with_conn(key, |conn| !conn.closing).unwrap_or(false);
-                    if live {
-                        self.initiate_close(cx, key);
-                    }
+                    self.initiate_close(cx, key);
                 } else {
                     self.inbox.push((key, buf, len));
                 }
@@ -130,28 +166,46 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 // Cold-read failure (M4-S26): custody must release —
                 // waiters observe the typed errno and the command layer
                 // answers a typed error, never a crash (operating error).
+                // The receipt is recorded here; the next turn's
+                // `before_execute` delivers its members (ADR-0181 R1).
                 if c.token.class() == TokenClass::TierRead {
                     let tier = self.shared.tier.borrow();
                     let cold = tier
                         .as_ref()
                         .and_then(|t| t.cold.as_ref())
                         .expect("TierRead completion implies a live cold-read engine");
-                    cold.on_completion(
-                        c.token,
-                        CompletionResult::Error { buf: None, errno },
-                        cx.now.as_micros(),
-                    );
+                    record_cold_receipt(cold, c.token, Err(errno), cx.now.as_micros());
                     return;
                 }
-                // Accept-path failures (`EMFILE`/`ENFILE`) belong to the
-                // listener, never to a connection (F-L11-05): count them.
-                // The driver has PARKED the arm (F-L11-02); the retry
-                // wheel re-arms it at a bounded cadence.
+                // Accept-path failures belong to the listener, never to a
+                // connection: count them. The driver delivers one only when
+                // it parks the arm, on an exhaustion or a broken-listener
+                // errno (`classify_accept_errno`); a transient one never
+                // surfaces. The accept-retry owner re-arms the listener a
+                // retry window later, the only way back for a broken one
+                // (ADR-0118 D2). Armed only from Idle: failures inside a
+                // window coalesce into its one arm.
                 if c.token.class() == TokenClass::Accept {
                     self.shared.accept_errors.set(self.shared.accept_errors.get() + 1);
-                    if !self.accept_retry_armed {
-                        self.accept_retry_armed = true;
-                        cx.timers.insert(cx.now + ACCEPT_RETRY, ACCEPT_RETRY_TIMER_KEY);
+                    // Canary: the failure re-arms the listener at once, the
+                    // spin into a persistent failure the window prevents.
+                    #[cfg(inf_canary_accept_retry_at_once)]
+                    cx.push(IoOp::AcceptArm {
+                        listener: self.listener,
+                        token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
+                    });
+                    let owner = &self.timers.accept_retry;
+                    #[cfg(not(inf_canary_accept_retry_late))]
+                    let deadline = cx.now.saturating_add(ACCEPT_RETRY);
+                    // Canary: the retry falls due 2 ms past its window.
+                    #[cfg(inf_canary_accept_retry_late)]
+                    let deadline =
+                        cx.now.saturating_add(ACCEPT_RETRY).saturating_add(Nanos::from_millis(2));
+                    let mut timers = cx.timers();
+                    if timers.phase(owner) == OwnerPhase::Idle {
+                        timers
+                            .arm(owner, deadline)
+                            .expect("the accept retry arms from Idle inside the clock's range");
                     }
                     return;
                 }
@@ -174,16 +228,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     return;
                 }
                 let key = Self::key_of(c.token);
-                let live = self
-                    .shared
-                    .with_conn(key, |conn| {
-                        conn.send_inflight = false;
-                        !conn.closing
-                    })
-                    .unwrap_or(false);
-                if live {
-                    self.initiate_close(cx, key);
-                }
+                self.shared.with_conn(key, |conn| conn.send_inflight = false);
+                self.initiate_close(cx, key);
             }
             // Log + checkpoint file ops (M2-S05/S08/S10): routed by token
             // class into the durable cell — lease release on a write's
@@ -240,36 +286,58 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 }
             }
             CompletionResult::TierRead => {
-                // M4-S26: route into the custody table — waiters wake and
-                // their futures run in this iteration's EXECUTE slice.
+                // M4-S26: route into the custody table — this iteration's
+                // `before_execute` delivers its members, so their futures
+                // run in this iteration's EXECUTE slice (ADR-0181 R1, R2).
                 let tier = self.shared.tier.borrow();
                 let cold = tier
                     .as_ref()
                     .and_then(|t| t.cold.as_ref())
                     .expect("TierRead completion implies a live cold-read engine");
-                cold.on_completion(c.token, CompletionResult::TierRead, cx.now.as_micros());
+                record_cold_receipt(cold, c.token, Ok(()), cx.now.as_micros());
             }
         }
     }
 
-    fn on_timer(&mut self, cx: &mut LoopCx<'_>, key: u64) {
-        if key == EVERYSEC_TIMER_KEY
-            && let Some(cell) = self.shared.durable.borrow_mut().as_mut()
-        {
-            cell.on_everysec_tick(cx);
+    fn on_timer<'n>(&mut self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> {
+        match TimerRole::from_route(notice.route()) {
+            Some(TimerRole::AcceptRetry) => {
+                // Canary: the retry pushes no accept arm, so a listener the
+                // driver parked as broken never accepts again.
+                #[cfg(not(inf_canary_accept_retry_no_rearm))]
+                if self.started {
+                    // Idempotent on an armed listener; resumes a parked
+                    // one of either class. An exhausted or broken listener
+                    // whose failure persists fails again: one more count
+                    // and one more window, one `accept(2)` a window.
+                    cx.push(IoOp::AcceptArm {
+                        listener: self.listener,
+                        token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
+                    });
+                }
+                TimerOutcome::Complete
+            }
+            Some(TimerRole::Everysec) => self.everysec_tick(cx, notice),
+            // The holds need no handler: the wake is the effect, and this
+            // iteration's LOG step seals the held frame.
+            Some(TimerRole::FillHold | TimerRole::GroupHold) => TimerOutcome::Complete,
+            None => {
+                debug_assert!(false, "a notice routed {} names no timer role", notice.route());
+                TimerOutcome::Complete
+            }
         }
-        if key == ACCEPT_RETRY_TIMER_KEY && self.started {
-            // Idempotent on an armed listener; resumes a parked one. A
-            // still-exhausted accept fails again → one more count and one
-            // more window (bounded by wall time, F-L11-02).
-            self.accept_retry_armed = false;
-            cx.push(IoOp::AcceptArm {
-                listener: self.listener,
-                token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
-            });
+    }
+
+    fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
+        // ADR-0181 R2: the turn's cold delivery, before either executor
+        // pass and outside `parse_execute`'s listener-startup and DEBUG
+        // SLEEP returns. A cell with no cold engine pays the engine's
+        // presence test under a short tier borrow; the delivery itself is
+        // out of the iteration's line.
+        let engine = self.shared.tier.borrow().as_ref().is_some_and(|t| t.cold.is_some());
+        if engine {
+            self.deliver_cold(cx);
         }
-        // `FILL_TIMER_KEY` (M4.5-S39a) needs no handler: the wake is the
-        // effect — this iteration's LOG step seals the held frame.
     }
 
     fn before_park(&mut self) -> bool {
@@ -293,6 +361,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         if self.ckpt_observation_owed() && self.shared.ckpt_waiters.any_waiting() {
             return true;
         }
+        // A parked loop never holds ready cold work (ADR-0181 R2, R6):
+        // members a turn's allowance left, or a drain that may issue now,
+        // wait for the next turn, not for a park's timeout, park flags or
+        // none.
+        let tier = self.shared.tier.borrow();
+        let cold = tier.as_ref().and_then(|t| t.cold.as_ref());
+        if cold.is_some_and(|cold| cold.holds_ready_work()) {
+            return true;
+        }
+        drop(tier);
         let Some(flags) = &self.park_flags else { return false };
         let me = usize::from(self.shared.cell.0);
         flags[me].store(true, Ordering::Relaxed);
@@ -322,7 +400,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // stage (one small copy) so the whole pack's store lines prefetch
         // before any op executes — the ADR-0005 pipeline on the batch the
         // fabric naturally provides; order per source pair is unchanged.
-        self.reply_scratch.clear();
+        self.reply_scratch.discard();
         self.staged_replies.clear();
         let apply_prefetch = self.shared.apply_prefetch.get();
         let shared = &self.shared;
@@ -383,17 +461,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         let mut had_replies = false;
         for (to, token, reply) in self.staged_replies.drain(..) {
             had_replies = true;
-            match reply {
-                StagedReply::Bytes(start, end) => {
-                    fabric.reply(to, token, &Outcome::Bytes(&self.reply_scratch[start..end]));
-                }
-                StagedReply::Int(n) => fabric.reply(to, token, &Outcome::Int(n)),
-                StagedReply::Nil => fabric.reply(to, token, &Outcome::Nil),
-                StagedReply::Ok => fabric.reply(to, token, &Outcome::Ok),
-                StagedReply::Refused => {
-                    fabric.reply(to, token, &Outcome::Err(ErrCode::Unknown(0)));
-                }
-            }
+            fabric.reply(to, token, &staged_outcome(self.reply_scratch.as_bytes(), &reply));
         }
         // Publish replies NOW instead of at FABRIC-OUT: the origin is
         // blocked on them, and waiting for step 8 adds most of an iteration
@@ -423,7 +491,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         .waiter(g.seq)
                 };
                 waiter.await;
-                shared.fabric.borrow_mut().reply(g.to, g.token, &Outcome::Bytes(&g.reply));
+                let outcome = wire_reply(g.reply.bytes(), g.reply.outcome());
+                shared.fabric.borrow_mut().reply(g.to, g.token, &outcome);
             });
         }
         // Tiered fabric applies (M4-S26): wake each origin's FIFO pump.
@@ -456,10 +525,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
         if !self.started && !self.arm_initial_listener(cx) {
             return;
-        }
-        if !self.everysec_armed && self.shared.durable.borrow().is_some() {
-            self.everysec_armed = true;
-            cx.timers.insert(cx.now + Nanos::from_secs(1), EVERYSEC_TIMER_KEY);
         }
         self.shared.now.set(cx.now);
         // DEBUG SLEEP stall: connection processing pauses (inbox buffers
@@ -531,8 +596,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                         conn_cx,
                                         out,
                                     );
-                                    let mut w = RespWriter::new(out, conn_cx.proto);
-                                    w.error("LOADING Redis is loading the dataset in memory");
+                                    RespWriter::new(out.open(), conn_cx.proto)
+                                        .error("LOADING Redis is loading the dataset in memory");
                                     continue;
                                 }
                             }
@@ -595,22 +660,22 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                     out,
                                 );
                                 let argv_slices: Vec<&[u8]> = argv.iter().collect();
-                                let before = out.len();
                                 let now = self.shared.now.get();
                                 let scope = ExecScope::of(conn_cx);
+                                let reply = out.open();
                                 execute(
                                     &argv,
                                     &mut self.shared.store.borrow_mut(),
                                     conn_cx,
                                     now,
-                                    out,
+                                    reply,
                                 );
                                 self.shared.observer.borrow_mut().on_execute(
                                     self.shared.cell,
                                     origin,
                                     scope,
                                     &argv_slices,
-                                    &out[before..],
+                                    reply.bytes(),
                                     now,
                                 );
                                 if let Some(dur) = stall_request(&argv_slices) {
@@ -636,10 +701,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 conn_cx,
                                 out,
                             );
-                            let mut w = RespWriter::new(out, conn_cx.proto);
                             // Display, not Debug (batch 45): the Redis
                             // phrasing the compat harness diffs.
-                            w.error(&format!("ERR Protocol error: {e}"));
+                            RespWriter::new(out.open(), conn_cx.proto)
+                                .error(&format!("ERR Protocol error: {e}"));
                             protocol_error = true;
                             break;
                         }
@@ -766,8 +831,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // ---- tiered plane half (M4-S26): namespace sync, the four
         // drivers, the cold-read drain (once per iteration — S10).
         self.tier_maintain(cx);
-        // ---- DDL persist wakes (ADR-0015 D3): one relaxed load per
-        // MAINTAIN; parked DDL pumps wake on epoch edges.
+        // ---- DDL wakes (ADR-0015 D3): two loads per MAINTAIN, the
+        // catalog word and the ticket's generation; parked DDL pumps wake
+        // on either's edge.
         self.maintain_control_wakes();
         // ---- stats flush
         self.maintain_conn_sweep(cx);
@@ -806,8 +872,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     && let Some(buf) = cx.pool.try_lease(LeaseKind::Send)
                 {
                     let n = conn.out.len().min(cx.pool.buf_size());
-                    cx.pool.bytes_mut(buf)[..n].copy_from_slice(&conn.out[..n]);
-                    conn.out.drain(..n);
+                    cx.pool.bytes_mut(buf)[..n].copy_from_slice(&conn.out.as_bytes()[..n]);
+                    conn.out.consume(n);
                     conn.send_inflight = true;
                     cx.push(IoOp::Send {
                         fd: conn.fd,
@@ -873,6 +939,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             if board.all_ready() {
                 // ADR-0174 D6's node fold, once: every cell has published.
                 node.recover_tier_replay.set(board.tier_replay_totals());
+                node.recover_step_facts.set(board.step_facts_totals());
                 node.loading.set(0);
                 self.shared.loading.set(false);
                 self.loading_board = None;
@@ -1100,8 +1167,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// One MAINTAIN concern of `maintain`, in phase order:
-    ///  DDL persist wakes (ADR-0015 D3): one relaxed load per
-    /// MAINTAIN; parked DDL pumps wake on epoch edges.
+    ///  DDL wakes (ADR-0015 D3): two Acquire loads per MAINTAIN, the
+    /// catalog word and the ticket's generation; parked DDL pumps wake on
+    /// either's edge. `INFO` reads the writer's gauges itself.
     fn maintain_control_wakes(&mut self) {
         if let Some(control) = self.shared.control.borrow().as_ref() {
             let epoch = control.persisted_epoch();
@@ -1116,7 +1184,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 self.shared.ddl_gen_seen.set(generation);
                 self.shared.ddl_waiters.wake_all(0);
             }
-            self.shared.node.ns_drop_tombstones.set(control.drop_tombstones() as u64);
         }
     }
 
@@ -1125,7 +1192,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     fn maintain_conn_sweep(&mut self, cx: &mut LoopCx<'_>) {
         let node = &self.shared.node;
         node.recv_dropped.set(self.shared.recv_dropped.get());
+        node.waker_foreign_ops.set(cx.executor.waker_foreign_ops());
         node.accept_errors.set(self.shared.accept_errors.get());
+        node.timers_armed_max.set(u64::from(cx.timers().armed_max()));
         node.fabric_rtt_p50_ns.set(self.shared.rtt_ns.borrow().percentile(50.0));
         {
             let ps = self.shared.pubsub.borrow();
@@ -1154,7 +1223,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 enforce_output_cap(node, conn, now_ms, caps);
             }
             // `timeout` (ADR-0123 D2): idle unsubscribed connections
-            // close; subscribers are exempt, as in Redis.
+            // close; subscribers are exempt, as in Redis. A connection
+            // already closing is skipped so `idle_disconnections` counts
+            // each close once.
             if knobs.timeout_ms != 0
                 && !subscribed
                 && !conn.closing
@@ -1224,6 +1295,9 @@ fn publish_durable_stats(node: &NodeInfo, stats: crate::durable::DurableStats) {
     node.frame_waits_barrier.set(stats.frame_waits_barrier);
     node.frame_waits_rotation.set(stats.frame_waits_rotation);
     node.frame_waits_reorder.set(stats.frame_waits_reorder);
+    node.frame_waits_ledger.set(stats.frame_waits_ledger);
+    node.frame_waits_ack_map.set(stats.frame_waits_ack_map);
+    node.ledger_prealloc_deferrals.set(stats.ledger_prealloc_deferrals);
     node.frame_waits_extent.set(stats.frame_waits_extent);
     node.extent_parks.set(stats.extent_parks);
     node.turn_refused.set(stats.turn_refused);
@@ -1273,4 +1347,18 @@ fn publish_durable_stats(node: &NodeInfo, stats: crate::durable::DurableStats) {
     node.recycle_waits_satisfied.set(stats.recycle_waits_satisfied);
     node.recycle_waits_expired.set(stats.recycle_waits_expired);
     node.recycle_wait_active_bytes_max.set(stats.recycle_wait_active_bytes_max);
+}
+
+/// Records a cold-read receipt the dispatch decided (ADR-0181 R1). A foreign
+/// receipt is the host's to count; the dispatch has nothing more to do with
+/// either answer.
+fn record_cold_receipt(
+    cold: &inf_runtime::ColdReads,
+    token: inf_runtime::CompletionToken,
+    result: Result<(), i32>,
+    now_us: u64,
+) {
+    match cold.record_completion(token, result, now_us) {
+        inf_runtime::ColdReceipt::Recorded | inf_runtime::ColdReceipt::Foreign => {}
+    }
 }

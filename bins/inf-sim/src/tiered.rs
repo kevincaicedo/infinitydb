@@ -35,7 +35,9 @@
 //!    refusal over commands, reads/deletes proceeding at the cap, and
 //!    admission **reopening** when the budget lifts (recovery is
 //!    automatic — the M1-S07 honesty pattern's disk twin).
-//! 9. The S19 drop-race finale: pipelined cold GETs race `INF.NS DROP`;
+//! 9. The drop-race finale: pipelined GETs race `INF.NS DROP` behind
+//!    a first GET whose tier read the device holds across the drop (a
+//!    phase-2 key that reads cold, or a filler key pushed out of RAM);
 //!    every reply is typed, the node answers `PING` after.
 //!
 //! **Shadow-slot arm (M4.5-S37, ADR-0093 D8):** three of every four
@@ -61,6 +63,7 @@
 //! folds into `trace_hash`; `--verify-determinism` runs the scenario
 //! twice and requires trace identity (L7).
 
+use crate::driver::Violations;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -69,13 +72,13 @@ use inf_foundation::fault::FaultSpec;
 use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
-use inf_log::fs::sim::SimDisk;
+use inf_log::fs::sim::{SimDisk, SimDiskConfig};
 use inf_server::StallConfig;
 
 use crate::durable::{
-    DurableScenario, DurableWorkload, MiniClient, Node, NsClass, OpRec, Pending, STALL_STEPS,
-    TraceObserver, Writer, admissible_states, boot, build_disk, bulk, encode, m2_stall_config,
-    required_index,
+    DurableScenario, DurableWorkload, HeldReads, MiniClient, Node, NsClass, OpRec, Pending,
+    STALL_STEPS, TraceObserver, WakeLeg, Writer, admissible_states, boot, build_disk_with, bulk,
+    encode, is_tier_file, m2_stall_config, required_index, steady_held_reads,
 };
 use crate::net::Plant;
 use crate::resp::reply_len;
@@ -208,7 +211,30 @@ pub struct TieredScenario {
     /// acknowledged no aged delete or whose reboot verified none, is
     /// VACUOUS.
     pub replay_above_window: bool,
+    /// The drop race's filler leg: phase 9 probes no phase-2 key and holds
+    /// the read of its filler's first key, the path a seed whose phase-2
+    /// keys all answer from RAM takes. Off on every seed; a test names it
+    /// ([`TieredScenario::with_drop_race_filler`]).
+    pub drop_race_filler: bool,
+    /// The listing-repeat seed class (ADR-0202 D5), seeds ≡ 4 or 13
+    /// (mod 16): the disk returns once more each name removed from a
+    /// listing's last batch (`listing_repeats_removed`), and after phase 8
+    /// each cell writes [`LISTING_RESIDUE_EXTENTS_PER_CELL`] extents to the
+    /// namespace phase 9 drops, so the post-drop reboot's sweep reads its
+    /// `cold/` past one batch and takes each repeat as that name's earlier
+    /// removal. `--listing-repeats` forces it on any seed; a run in it whose
+    /// post-drop reboot served no repeat is `listing-repeats-unengaged`
+    /// (VACUOUS).
+    pub listing_repeats: bool,
 }
+
+/// The listing-repeat class's residue, extents a cell: three listing
+/// batches, derived from the listing's one name bound so it follows that
+/// bound, never a batch size of the simulator's own. A repeat is served
+/// only at the batch after one that answered `More`, so each cell's
+/// post-drop sweep reads three full batches, each followed by a batch of
+/// its repeats.
+const LISTING_RESIDUE_EXTENTS_PER_CELL: usize = 3 * inf_log::limits::LISTING_BATCH_NAMES;
 
 impl TieredScenario {
     #[must_use]
@@ -243,8 +269,32 @@ impl TieredScenario {
             ckpt_direct_refused_after: (seed % 8 == 6).then_some(2),
             tier_read_fault: seed % 8 == 7,
             replay_above_window: false,
+            drop_race_filler: false,
+            listing_repeats: false,
         };
-        if matches!(seed % 16, 2 | 11) { scenario.with_replay_above_window() } else { scenario }
+        // Two disjoint seed classes of sixteen: replay above the window (2,
+        // 11) and the listing repeats (4, 13).
+        match seed % 16 {
+            2 | 11 => scenario.with_replay_above_window(),
+            4 | 13 => scenario.with_listing_repeats(),
+            _ => scenario,
+        }
+    }
+
+    /// The listing-repeat class's knob: the disk's repeat mode, and with it
+    /// the late phases' residue. Applied by the seed class and by the
+    /// binary's flag.
+    #[must_use]
+    pub fn with_listing_repeats(mut self) -> TieredScenario {
+        self.listing_repeats = true;
+        self
+    }
+
+    /// The drop race's filler leg on any seed (the field's doc).
+    #[must_use]
+    pub fn with_drop_race_filler(mut self) -> TieredScenario {
+        self.drop_race_filler = true;
+        self
     }
 
     /// The replay-above-window class's knobs: the interval above any run
@@ -315,6 +365,11 @@ impl TieredScenario {
             spin_iters: DurableScenario::SPIN_ITERS,
             tier_budget: None,
             epoch_marks: None,
+            ledger_wedge: None,
+            stop_tick: false,
+            fill_dense: false,
+            wake: WakeLeg::OFF,
+            mget_audits: None,
         }
     }
 }
@@ -339,10 +394,13 @@ pub struct TieredNodeReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
     pub state_hash: u64,
-    pub violations: Vec<String>,
+    pub violations: Violations,
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     pub stalled: bool,
     /// ADR-0174 D1: per cell, the record bytes of the tiered `SET`s
     /// acknowledged in phase 2 (header + key + value — what the reboot
@@ -395,10 +453,18 @@ pub struct TieredNodeReport {
     /// Armed faults the audit never consumed (disarmed after it).
     pub tier_read_faults_unconsumed: u64,
     /// F-L17-13 (L3): `SCAN` pages that resolved cold slots, and the cold
-    /// intents they enqueued — the batching oracle's coverage (a walk
-    /// that never met a cold page proves nothing about batching).
+    /// intents the cell's `INFO tiering` counted across each: the cell's
+    /// count, not the page's, so it is disclosed and judges nothing.
     pub scan_cold_pages: u64,
     pub scan_cold_reads: u64,
+    /// The `SCAN` batching oracle's pages over every walk of the run
+    /// (ADR-0208 D2): judged (16 tier reads or more at the asked cell's
+    /// device and no other reader there), violating (every driver entry
+    /// that took a read took one), and set aside (16 reads or more beside
+    /// another reader).
+    pub scan_pages_judged: u64,
+    pub scan_pages_violating: u64,
+    pub scan_pages_set_aside: u64,
     /// F-L03-04 / ADR-0117 engagement: checkpoint staging downgrades
     /// (the `EINVAL` seeds) and sections sealed for the bound (the
     /// section-bound seeds), summed over cells at phase 10b.
@@ -413,6 +479,15 @@ pub struct TieredNodeReport {
     pub drop_replies_value: u64,
     /// Drop-race replies that answered typed errors/nils (drop won).
     pub drop_replies_other: u64,
+    /// Drop-race `DROP`s answered while a cold read of the namespace's tier
+    /// files was held at the device: the custody oracle's engagement.
+    pub drop_reads_held: u64,
+    /// Drop-race probe GETs sent with the device's tier reads held, the
+    /// held one included: phase 2's keys in order, then the filler's first.
+    pub drop_race_probes: u64,
+    /// Filler batches the drop race wrote on one cell because every phase-2
+    /// key answered from RAM (0 on a seed where one of them read cold).
+    pub drop_race_fill_batches: u64,
     /// Phase 10 (ADR-0100 D6): the post-drop reboot succeeded; whether a
     /// MANIFEST still named the dropped namespace (the row is inert on a
     /// seed where a checkpoint raced the drop — disclosed).
@@ -479,6 +554,19 @@ pub struct TieredNodeReport {
     pub rebuilt_same_key_twins: u64,
     pub rebuilt_fill_sets: u64,
     pub rebuilt_reboots: u64,
+    /// Phase 7d (issue #11): pairs of GETs of one cold blob key in flight
+    /// together where both reads went cold and the pair promoted the
+    /// record — the pairs whose second read re-resolved onto the promoted
+    /// extent reference.
+    pub promoted_extent_pairs: u64,
+    /// Phase 7e: the rounds its burst was delivered in, 1 for the burst's
+    /// own reads and one more for each round of re-reads.
+    pub burst_rounds: u32,
+    /// The listing-repeat draw this seed ran, and the removed names the
+    /// disk returned again by the end of the post-drop reboot: its
+    /// engagement, read from the disk's own count.
+    pub listing_repeats: bool,
+    pub listing_repeats_served: u64,
 }
 
 impl TieredNodeReport {
@@ -499,22 +587,27 @@ impl TieredNodeReport {
 fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNodeReport {
     let harness = scenario.harness();
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
-    let disk = build_disk(scenario.seed, scenario.stall.as_ref());
+    let config = SimDiskConfig {
+        listing_repeats_removed: scenario.listing_repeats,
+        ..SimDiskConfig::default()
+    };
+    let disk = build_disk_with(scenario.seed, scenario.stall.as_ref(), config);
     if let Some(allowed) = scenario.ckpt_direct_refused_after {
         disk.refuse_direct_writes_after(allowed);
     }
     let mut rng = SplitMix64::new(scenario.seed ^ 0x71E7_ED00);
     let mut report = TieredNodeReport::default();
     let seed = scenario.seed;
-    let fail = |report: &mut TieredNodeReport, what: String| {
+    #[track_caller]
+    fn fail(report: &mut TieredNodeReport, seed: u64, what: String) {
         report.violations.push(format!("seed {seed:#x}: {what}"));
-    };
+    }
 
     // ---- phase 1: boot + tiered DDL -----------------------------------
     let mut node = match boot(&harness, PathBuf::from("node"), &disk, &clock, &observer) {
         Ok(node) => node,
         Err(err) => {
-            fail(&mut report, format!("boot 1 failed: {err}"));
+            fail(&mut report, seed, format!("boot 1 failed: {err}"));
             return finish(report, &observer, &clock);
         }
     };
@@ -541,7 +634,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, create) {
         Ok(Some(ok)) if ok == b"+OK\r\n" => {}
         other => {
-            fail(&mut report, format!("tiered CREATE answered {other:?}"));
+            fail(&mut report, seed, format!("tiered CREATE answered {other:?}"));
             return finish(report, &observer, &clock);
         }
     }
@@ -552,6 +645,9 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     if scenario.dir_open_fault {
         inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
     }
+    // The listing-repeat draw, disclosed as the other arms are: the disk
+    // already carries its mode, and the late phases write its residue.
+    report.listing_repeats = scenario.listing_repeats;
     // The shadow arm (M4.5-S37, ADR-0093 D8): a CONFIG key, fanned to
     // every cell like `tiered-promote-on-read`.
     report.shadow_arm = scenario.shadow;
@@ -560,7 +656,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, knob) {
             Ok(Some(ok)) if ok == b"+OK\r\n" => {}
             other => {
-                fail(&mut report, format!("shadow CONFIG SET answered {other:?}"));
+                fail(&mut report, seed, format!("shadow CONFIG SET answered {other:?}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -570,12 +666,13 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             Ok(v) if v[0] != u64::from(scenario.cells) => {
                 fail(
                     &mut report,
+                    seed,
                     format!("shadow CONFIG SET reached {} of {} cells", v[0], scenario.cells),
                 );
                 return finish(report, &observer, &clock);
             }
             Ok(_) => {}
-            Err(err) => fail(&mut report, format!("post-knob scrape: {err}")),
+            Err(err) => fail(&mut report, seed, format!("post-knob scrape: {err}")),
         }
     }
 
@@ -601,7 +698,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_ns) {
         Ok(Some(ok)) if ok == b"+OK\r\n" => {}
         other => {
-            fail(&mut report, format!("setup USE answered {other:?}"));
+            fail(&mut report, seed, format!("setup USE answered {other:?}"));
             return finish(report, &observer, &clock);
         }
     }
@@ -610,7 +707,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
             Ok(Some(ok)) if ok == b"+OK\r\n" => {}
             other => {
-                fail(&mut report, format!("pre-cut SET pair {i}.0 answered {other:?}"));
+                fail(&mut report, seed, format!("pre-cut SET pair {i}.0 answered {other:?}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -643,7 +740,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
             Ok(Some(ok)) if ok == b"+OK\r\n" => {}
             other => {
-                fail(&mut report, format!("pre-cut SET open key {i} answered {other:?}"));
+                fail(&mut report, seed, format!("pre-cut SET open key {i} answered {other:?}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -654,7 +751,11 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
             Ok(Some(ok)) if ok == b"+OK\r\n" => {}
             other => {
-                fail(&mut report, format!("pre-cut SET open triple {i}.0 answered {other:?}"));
+                fail(
+                    &mut report,
+                    seed,
+                    format!("pre-cut SET open triple {i}.0 answered {other:?}"),
+                );
                 return finish(report, &observer, &clock);
             }
         }
@@ -675,7 +776,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
             Ok(Some(ok)) if ok == b"+OK\r\n" => {}
             other => {
-                fail(&mut report, format!("pre-cut SET rebuilt key {i} answered {other:?}"));
+                fail(&mut report, seed, format!("pre-cut SET rebuilt key {i} answered {other:?}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -699,7 +800,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         match racer.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_ns) {
             Ok(Some(ok)) if ok == b"+OK\r\n" => {}
             other => {
-                fail(&mut report, format!("racer {i} USE answered {other:?}"));
+                fail(&mut report, seed, format!("racer {i} USE answered {other:?}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -714,7 +815,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         match racers[0].call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
             Ok(Some(ok)) if ok == b"+OK\r\n" => {}
             other => {
-                fail(&mut report, format!("race round {round} seed SET answered {other:?}"));
+                fail(&mut report, seed, format!("race round {round} seed SET answered {other:?}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -730,7 +831,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             steps += 1;
             report.scheduler_steps += 1;
             if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
-                fail(&mut report, format!("race round {round}: {err}"));
+                fail(&mut report, seed, format!("race round {round}: {err}"));
                 return finish(report, &observer, &clock);
             }
             for (i, racer) in racers.iter_mut().enumerate() {
@@ -741,6 +842,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                     if reply != b"+OK\r\n" {
                         fail(
                             &mut report,
+                            seed,
                             format!(
                                 "race round {round} racer {i}: SET answered {}",
                                 preview(&reply)
@@ -751,7 +853,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             }
             if steps > STALL_STEPS {
                 report.stalled = true;
-                fail(&mut report, format!("race round {round} stalled"));
+                fail(&mut report, seed, format!("race round {round} stalled"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -762,6 +864,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 if !values.iter().any(|v| bulk(v) == reply) {
                     fail(
                         &mut report,
+                        seed,
                         format!(
                             "race round {round}: final value {} is none of the round's writes",
                             preview(&reply)
@@ -770,7 +873,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 }
             }
             other => {
-                fail(&mut report, format!("race round {round} GET answered {other:?}"));
+                fail(&mut report, seed, format!("race round {round} GET answered {other:?}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -778,7 +881,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     }
     match info_tiering(&mut setup, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
         Ok(text) => report.race_replans = info_field(&text, "tiering_write_replans"),
-        Err(err) => fail(&mut report, format!("race scrape: {err}")),
+        Err(err) => fail(&mut report, seed, format!("race scrape: {err}")),
     }
     // The race keys are outside every later model (the quiescence
     // oracle counts DBSIZE against the writers' ledgers): delete them.
@@ -788,7 +891,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         match racers[0].call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, del) {
             Ok(Some(ok)) if ok == b":1\r\n" => report.commands_done += 1,
             other => {
-                fail(&mut report, format!("race key {round} DEL answered {other:?}"));
+                fail(&mut report, seed, format!("race key {round} DEL answered {other:?}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -842,7 +945,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     for _ in 0..cut_step {
         report.scheduler_steps += 1;
         if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
-            fail(&mut report, format!("traffic phase: {err}"));
+            fail(&mut report, seed, format!("traffic phase: {err}"));
             return finish(report, &observer, &clock);
         }
         let aged_ledgers = scenario.replay_above_window.then_some(aged.as_mut_slice());
@@ -873,6 +976,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 report.stalled = true;
                 fail(
                     &mut report,
+                    seed,
                     format!(
                         "traffic stalled before the cut with in-flight ops ({})",
                         stuck.join(", ")
@@ -896,7 +1000,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
              window before the cut ({:?} bytes)",
             report.acked_record_bytes_per_cell
         );
-        fail(&mut report, message);
+        fail(&mut report, seed, message);
     }
     // Pre-cut coverage scrape (pumps a bounded number of extra steps —
     // part of the deterministic schedule, and the cut still lands with
@@ -907,7 +1011,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             report.shadow_created = info_field(&text, "tiering_shadow_created");
             report.shadow_pending_at_cut = info_field(&text, "tiering_shadow_pending");
         }
-        Err(err) => fail(&mut report, format!("pre-cut scrape: {err}")),
+        Err(err) => fail(&mut report, seed, format!("pre-cut scrape: {err}")),
     }
     // F-L01-02 arm: the refused hold must have left no staged op behind —
     // a write retry after it is the dropped writer's fd reaching the
@@ -926,6 +1030,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                     if retries > 0 {
                         fail(
                             &mut report,
+                            seed,
                             format!(
                                 "DIR-OPEN FAULT VIOLATION cell {cell}: {retries} flush write \
                                  retries before the cut (confirmed {} B, rounds {}, in flight \
@@ -937,7 +1042,9 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                         );
                     }
                 }
-                Err(err) => fail(&mut report, format!("dir-open fault scrape cell {cell}: {err}")),
+                Err(err) => {
+                    fail(&mut report, seed, format!("dir-open fault scrape cell {cell}: {err}"))
+                }
             }
         }
     }
@@ -955,7 +1062,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         let mut node = match boot(&harness, PathBuf::from("node"), &disk, &clock, &observer) {
             Ok(node) => node,
             Err(err) => {
-                fail(&mut report, format!("reboot {boots} refused: {err}"));
+                fail(&mut report, seed, format!("reboot {boots} refused: {err}"));
                 return finish(report, &observer, &clock);
             }
         };
@@ -972,7 +1079,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             }
             if steps > STALL_STEPS {
                 report.stalled = true;
-                fail(&mut report, format!("recovery stalled on boot {boots}"));
+                fail(&mut report, seed, format!("recovery stalled on boot {boots}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -985,7 +1092,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 report.refused_boot = true;
                 eprintln!("refused boot {boots}: {err}");
             } else {
-                fail(&mut report, format!("recovery failed on boot {boots}: {err}"));
+                fail(&mut report, seed, format!("recovery failed on boot {boots}: {err}"));
             }
             return finish(report, &observer, &clock);
         }
@@ -1009,7 +1116,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         &[b"INF.NS", b"USE", NS_NAME],
     );
     if !matches!(reply, Ok(Some(ref ok)) if ok == b"+OK\r\n") {
-        fail(&mut report, format!("acked tiered CREATE lost: audit USE answered {reply:?}"));
+        fail(&mut report, seed, format!("acked tiered CREATE lost: audit USE answered {reply:?}"));
         return finish(report, &observer, &clock);
     }
     // CONFIG keys are not durable (no CONFIG REWRITE in the sim): the
@@ -1021,7 +1128,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, knob) {
             Ok(Some(ok)) if ok == b"+OK\r\n" => {}
             other => {
-                fail(&mut report, format!("post-boot shadow CONFIG SET answered {other:?}"));
+                fail(&mut report, seed, format!("post-boot shadow CONFIG SET answered {other:?}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -1032,6 +1139,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             Ok(v) if v[0] != u64::from(scenario.cells) => {
                 fail(
                     &mut report,
+                    seed,
                     format!(
                         "post-boot shadow CONFIG SET reached {} of {} cells",
                         v[0], scenario.cells
@@ -1040,7 +1148,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 return finish(report, &observer, &clock);
             }
             Ok(_) => {}
-            Err(err) => fail(&mut report, format!("post-boot knob scrape: {err}")),
+            Err(err) => fail(&mut report, seed, format!("post-boot knob scrape: {err}")),
         }
     }
     // ADR-0174 D6: the reboot's tiered replay, folded over the node. In
@@ -1050,7 +1158,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     match support::boot_tier_fold(&mut audit, &mut node, &mut rng, &clock, &disk, scenario) {
         Ok(fold) => report.boot_tier = fold,
         Err(err) => {
-            fail(&mut report, format!("post-boot INFO persistence: {err}"));
+            fail(&mut report, seed, format!("post-boot INFO persistence: {err}"));
             return finish(report, &observer, &clock);
         }
     }
@@ -1063,12 +1171,13 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         let message = format!(
             "ZERO-SET VIOLATION: the reboot made no demote step, yet its fold reads {fold:?}"
         );
-        fail(&mut report, message);
+        fail(&mut report, seed, message);
     }
     let cells_above = report.replay_above_window_cells;
     if cells_above > 0 && scenario.replay_above_window && report.boot_tier[0] == 0 {
         fail(
             &mut report,
+            seed,
             format!(
                 "REPLAY-ABOVE-WINDOW VACUOUS seed {seed:#x}: {cells_above} cell(s) above the \
                  window and the reboot made no demote step"
@@ -1095,7 +1204,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             ) {
                 Ok(Some(reply)) => reply,
                 other => {
-                    fail(&mut report, format!("audit GET {key:?} answered {other:?}"));
+                    fail(&mut report, seed, format!("audit GET {key:?} answered {other:?}"));
                     return finish(report, &observer, &clock);
                 }
             };
@@ -1126,6 +1235,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         if (ages && aged_deletes == 0) || (aged_deletes > 0 && (reads == 0 || verified == 0)) {
             fail(
                 &mut report,
+                seed,
                 format!(
                     "REPLAY-ABOVE-WINDOW VACUOUS seed {seed:#x}: target {regime_target:?}, {} aged \
                      deletes acknowledged, the reboot made {reads} settle reads and verified \
@@ -1145,7 +1255,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, clamp_mutable) {
         Ok(Some(ok)) if ok == b"+OK\r\n" => {}
         other => {
-            fail(&mut report, format!("MUTABLE-FRACTION clamp answered {other:?}"));
+            fail(&mut report, seed, format!("MUTABLE-FRACTION clamp answered {other:?}"));
             return finish(report, &observer, &clock);
         }
     }
@@ -1153,7 +1263,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         match info_tiering(&mut audit, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
             Ok(text) => info_field(&text, "tiering_flush_confirmed_bytes"),
             Err(err) => {
-                fail(&mut report, format!("phase-6 base scrape: {err}"));
+                fail(&mut report, seed, format!("phase-6 base scrape: {err}"));
                 return finish(report, &observer, &clock);
             }
         };
@@ -1180,7 +1290,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     while post_writers.iter().any(|w| w.setup || w.replied < w.quota) {
         report.scheduler_steps += 1;
         if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
-            fail(&mut report, format!("re-pressure phase: {err}"));
+            fail(&mut report, seed, format!("re-pressure phase: {err}"));
             return finish(report, &observer, &clock);
         }
         let progress = pump_writers(
@@ -1196,7 +1306,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             idle_steps += 1;
             if idle_steps >= STALL_STEPS {
                 report.stalled = true;
-                fail(&mut report, "re-pressure traffic stalled".to_string());
+                fail(&mut report, seed, "re-pressure traffic stalled".to_string());
                 return finish(report, &observer, &clock);
             }
         } else {
@@ -1220,7 +1330,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 }
             }
             Err(err) => {
-                fail(&mut report, format!("flush-liveness scrape: {err}"));
+                fail(&mut report, seed, format!("flush-liveness scrape: {err}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -1229,6 +1339,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         let gauge = |key: &str| info_field(&last_text, key);
         fail(
             &mut report,
+            seed,
             format!(
                 "MAINTAIN FLUSH LIVENESS VIOLATION: flush-confirmed bytes stuck at \
                  {flushed_base} after the recovered life overflowed its budget \
@@ -1265,7 +1376,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             &mut report,
         )
     {
-        fail(&mut report, what);
+        fail(&mut report, seed, what);
         return finish(report, &observer, &clock);
     }
 
@@ -1301,7 +1412,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 last_head = head;
             }
             Err(err) => {
-                fail(&mut report, format!("phase-6b settle scrape: {err}"));
+                fail(&mut report, seed, format!("phase-6b settle scrape: {err}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -1313,7 +1424,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
             Ok(Some(ok)) if ok == b"+OK\r\n" => {}
             other => {
-                fail(&mut report, format!("phase-6b SET {key:?} answered {other:?}"));
+                fail(&mut report, seed, format!("phase-6b SET {key:?} answered {other:?}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -1323,7 +1434,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, del) {
                 Ok(Some(reply)) if reply == b":1\r\n" => {}
                 other => {
-                    fail(&mut report, format!("phase-6b DEL {key:?} answered {other:?}"));
+                    fail(&mut report, seed, format!("phase-6b DEL {key:?} answered {other:?}"));
                     return finish(report, &observer, &clock);
                 }
             }
@@ -1338,7 +1449,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             report.phase6b_cold_resolves =
                 info_field(&text, "tiering_cold_resolves").saturating_sub(cold_before);
         }
-        Err(err) => fail(&mut report, format!("phase-6b scrape: {err}")),
+        Err(err) => fail(&mut report, seed, format!("phase-6b scrape: {err}")),
     }
 
     // ---- phase 6c: forced 64-bit collisions through the plane (A7) ------
@@ -1355,7 +1466,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     let base = match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
         Ok(n) => n,
         Err(err) => {
-            fail(&mut report, format!("phase-6c DBSIZE base: {err}"));
+            fail(&mut report, seed, format!("phase-6c DBSIZE base: {err}"));
             return finish(report, &observer, &clock);
         }
     };
@@ -1371,7 +1482,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     let before = match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &COLLIDE_KEYS) {
         Ok(v) => v,
         Err(err) => {
-            fail(&mut report, format!("phase-6c coverage scrape: {err}"));
+            fail(&mut report, seed, format!("phase-6c coverage scrape: {err}"));
             return finish(report, &observer, &clock);
         }
     };
@@ -1407,7 +1518,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 base + 1
             )),
             Err(err) => {
-                fail(&mut report, format!("phase-6c DBSIZE: {err}"));
+                fail(&mut report, seed, format!("phase-6c DBSIZE: {err}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -1424,7 +1535,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 }
             }
             Err(err) => {
-                fail(&mut report, format!("phase-6c SCAN: {err}"));
+                fail(&mut report, seed, format!("phase-6c SCAN: {err}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -1456,7 +1567,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 "COLLISION VIOLATION seed {seed:#x} pair {i}: DBSIZE {n} after DEL, wanted {base}"
             )),
             Err(err) => {
-                fail(&mut report, format!("phase-6c DBSIZE: {err}"));
+                fail(&mut report, seed, format!("phase-6c DBSIZE: {err}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -1474,7 +1585,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             report.collide_dbsize_drains = delta(3);
             report.collide_scan_twins = delta(4);
         }
-        Err(err) => fail(&mut report, format!("phase-6c scrape: {err}")),
+        Err(err) => fail(&mut report, seed, format!("phase-6c scrape: {err}")),
     }
 
     // ---- phase 6d: open-ticket rows under a paused reconciler (A8) -----
@@ -1498,7 +1609,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         report.open_rows = true;
         macro_rules! bail {
             ($($arg:tt)*) => {{
-                fail(&mut report, format!($($arg)*));
+                fail(&mut report, seed, format!($($arg)*));
                 return finish(report, &observer, &clock);
             }};
         }
@@ -1862,7 +1973,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         ) {
             Ok(Some(reply)) => reply,
             other => {
-                fail(&mut report, format!("cold sweep GET {key:?} answered {other:?}"));
+                fail(&mut report, seed, format!("cold sweep GET {key:?} answered {other:?}"));
                 return finish(report, &observer, &clock);
             }
         };
@@ -1882,7 +1993,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             report.cold_resolves = info_field(&text, "tiering_cold_resolves");
             report.flushed_final_bytes = info_field(&text, "tiering_flush_confirmed_bytes");
         }
-        Err(err) => fail(&mut report, format!("post-sweep scrape: {err}")),
+        Err(err) => fail(&mut report, seed, format!("post-sweep scrape: {err}")),
     }
 
     // ---- phase 7b: the shadow quiescence oracle (ADR-0093 I5) -----------
@@ -1903,7 +2014,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 }
             }
             Err(err) => {
-                fail(&mut report, format!("shadow quiescence scrape: {err}"));
+                fail(&mut report, seed, format!("shadow quiescence scrape: {err}"));
                 return finish(report, &observer, &clock);
             }
         }
@@ -1922,6 +2033,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     if gauge("tiering_shadow_pending") != 0 {
         fail(
             &mut report,
+            seed,
             format!(
                 "SHADOW QUIESCENCE VIOLATION: {} tickets still open after 256 MAINTAIN polls \
                  (reads_issued={} read_errors={} pinned_bytes={})",
@@ -1950,7 +2062,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     let total_keys = match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
         Ok(n) => n,
         Err(err) => {
-            fail(&mut report, format!("quiescence DBSIZE: {err}"));
+            fail(&mut report, seed, format!("quiescence DBSIZE: {err}"));
             return finish(report, &observer, &clock);
         }
     };
@@ -1970,6 +2082,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                 if v[0] == 0 {
                     fail(
                         &mut report,
+                        seed,
                         format!(
                             "OPEN-TICKET ROW VACUOUS seed {seed:#x}: no ticket settled without a \
                              read after the reconciler resumed"
@@ -1977,12 +2090,13 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
                     );
                 }
             }
-            Err(err) => fail(&mut report, format!("settled-without-read scrape: {err}")),
+            Err(err) => fail(&mut report, seed, format!("settled-without-read scrape: {err}")),
         }
     }
     if total_keys != live_keys {
         fail(
             &mut report,
+            seed,
             format!(
                 "SHADOW CARDINALITY VIOLATION: DBSIZE {total_keys} over {} cells != {live_keys} \
                  model-live keys (an orphan slot or a lost key)",
@@ -1998,6 +2112,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     if allocated != 0 && live + dead != allocated {
         fail(
             &mut report,
+            seed,
             format!(
                 "SHADOW ACCOUNTING VIOLATION: live {live} + dead {dead} != allocated {allocated}"
             ),
@@ -2018,6 +2133,24 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     };
     // Every verdict ends the same way: the report carries the violations.
     let _verdict = late::run(&mut cx, node, audit, total_keys);
+    // O2 (ADR-0148 D3): the drop race's cold reads, and every other driver
+    // op, ran on open descriptors: a dropped namespace's owner keeps its
+    // handles while a read is pinned on its files.
+    let closed = disk.closed_fd_ops();
+    if closed > 0 {
+        fail(&mut report, seed, format!("CUSTODY: {closed} driver ops named a closed descriptor"));
+    }
+    if report.drop_reads_held == 0 {
+        let (probes, batches) = (report.drop_race_probes, report.drop_race_fill_batches);
+        fail(
+            &mut report,
+            seed,
+            format!(
+                "VACUOUS: no DROP met a cold read held on its tier files ({probes} probe GETs, \
+                 {batches} filler batches)"
+            ),
+        );
+    }
     finish(report, &observer, &clock)
 }
 
@@ -2029,6 +2162,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     let sealed = observer.seal();
     report.state_hash = sealed.state_hash;
     report.cap_rows_checked = sealed.census.rows_checked;
+    report.cap_rows_crossed = sealed.census.rows_crossed;
     report.violations.extend(sealed.census.violations);
     report
 }

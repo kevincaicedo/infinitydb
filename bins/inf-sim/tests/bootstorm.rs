@@ -56,5 +56,5 @@ fn oracle_catches_the_synchronous_boot_path() {
         deferred_before,
         "the deferred path issues zero blocking syncs — barriers ride the driver"
     );
-    assert_eq!(handles.len(), 4, "log, ckpt, shard, parent handles");
+    assert_eq!(handles.into_handles().count(), 4, "log, ckpt, shard, parent handles");
 }

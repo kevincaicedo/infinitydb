@@ -16,7 +16,9 @@
 //!   (token `extent-handles-over`);
 //! - the extent files the sim disk saw created are at most the blob writes
 //!   acknowledged, and the writes of the clients that left: a parked writer
-//!   creates none (`extent-files-over-writes`);
+//!   creates none (`extent-files-over-writes`); on the burst they are
+//!   exactly that many, so a leaver's write lands
+//!   (`extent-files-under-writes`);
 //! - every reply is the exact `+OK` (`extent-reply-wrong`);
 //! - every writer whose extent file was created at the first step that
 //!   created one has its reply by the step that creates the 33rd file: a
@@ -47,6 +49,7 @@
 
 mod cold;
 
+use crate::driver::Violations;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -59,7 +62,7 @@ use inf_log::fs::sim::SimDisk;
 use inf_server::StallConfig;
 
 use crate::durable::{
-    DurableScenario, DurableWorkload, MiniClient, Node, STALL_STEPS, TraceObserver, boot,
+    DurableScenario, DurableWorkload, MiniClient, Node, STALL_STEPS, TraceObserver, WakeLeg, boot,
     build_disk, encode,
 };
 use crate::net::Plant;
@@ -178,7 +181,7 @@ pub struct ExtentWindowReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
     pub state_hash: u64,
-    pub violations: Vec<String>,
+    pub violations: Violations,
     pub scheduler_steps: u64,
     /// The most extent files open at once, by the sim disk's descriptors.
     pub handles_peak: usize,
@@ -186,10 +189,14 @@ pub struct ExtentWindowReport {
     pub files_created: usize,
     /// Blob `SET`s acknowledged `+OK`.
     pub sets_acked: u64,
-    /// Clients that disconnected with a write in flight.
+    /// Clients that disconnected with a blob write in flight, counted as
+    /// each leaves.
     pub writers_left: u64,
     /// Rows the census oracle read (node sum).
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     /// The cell's `extent-window` census row at the end of the traffic.
     pub window_row: Option<CapRow>,
     /// The cell's durable counters at the end of the traffic: frames held
@@ -263,10 +270,12 @@ impl Writer {
         self.left || (self.setup_done && !self.inflight && self.sent >= self.quota)
     }
 
-    /// The client disconnects, its write in flight.
-    fn leave(&mut self, node: &mut Node) {
+    /// The client disconnects, its write in flight, and is counted as it
+    /// leaves: a run the stuck check ends early still owes its write.
+    fn leave(&mut self, node: &mut Node, report: &mut ExtentWindowReport) {
         node.nets[0].borrow_mut().client_close(self.fd);
         self.left = true;
+        report.writers_left += 1;
     }
 }
 
@@ -358,6 +367,11 @@ impl ExtentWindowScenario {
             spin_iters: DurableScenario::SPIN_ITERS,
             tier_budget: None,
             epoch_marks: None,
+            ledger_wedge: None,
+            stop_tick: false,
+            fill_dense: false,
+            wake: WakeLeg::OFF,
+            mget_audits: None,
         }
     }
 }
@@ -371,6 +385,7 @@ pub fn run_extent_window_scenario(scenario: &ExtentWindowScenario) -> ExtentWind
     let sealed = observer.seal();
     report.state_hash = sealed.state_hash;
     report.cap_rows_checked = sealed.census.rows_checked;
+    report.cap_rows_crossed = sealed.census.rows_crossed;
     report.violations.extend(sealed.census.violations);
     report.trace = observer.trace_bytes();
     report.trace_hash = hash64(&report.trace, 0xE57E);
@@ -488,16 +503,17 @@ fn drive(
             return;
         }
         if run.scenario.leg == ExtentWindowLeg::Burst {
-            leavers.step(run.node, writers, creations);
+            leavers.step(run.node, writers, creations, report);
         }
     }
-    report.writers_left = writers.iter().filter(|w| w.left).count() as u64;
 }
 
 /// The burst's two disconnects, each with a write in flight: the highest
 /// writer outside the first cohort once the cohort's files exist (parked
 /// at the queue's tail), and the lowest outside it once the first handout
-/// has turns out (at the queue's head).
+/// has turns out (at the queue's head). A candidate's setup was answered
+/// and its blob `SET` sent, so each client that leaves owes exactly one
+/// extent file whatever the step it leaves at.
 #[derive(Default)]
 struct Leavers {
     parked: Option<usize>,
@@ -505,7 +521,13 @@ struct Leavers {
 }
 
 impl Leavers {
-    fn step(&mut self, node: &mut Node, writers: &mut [Writer], creations: &Creations) {
+    fn step(
+        &mut self,
+        node: &mut Node,
+        writers: &mut [Writer],
+        creations: &Creations,
+        report: &mut ExtentWindowReport,
+    ) {
         let Some(&(first, _)) = creations.log.first() else { return };
         let cohort: BTreeSet<usize> = creations
             .log
@@ -513,10 +535,11 @@ impl Leavers {
             .take_while(|&&(step, _)| step == first)
             .filter_map(|&(_, writer)| writer)
             .collect();
-        let candidate = |w: &&mut Writer| !cohort.contains(&w.id) && !w.left && w.inflight;
+        let candidate =
+            |w: &&mut Writer| !cohort.contains(&w.id) && !w.left && w.setup_done && w.inflight;
         if self.parked.is_none() {
             if let Some(writer) = writers.iter_mut().rev().find(candidate) {
-                writer.leave(node);
+                writer.leave(node, report);
                 self.parked = Some(writer.id);
             }
             return;
@@ -526,7 +549,7 @@ impl Leavers {
             && turns_out > 0
             && let Some(writer) = writers.iter_mut().find(candidate)
         {
-            writer.leave(node);
+            writer.leave(node, report);
             self.at_handout = Some(writer.id);
         }
     }
@@ -660,6 +683,22 @@ fn judge(
             report.writers_left
         ));
     }
+    // On the burst every write is a fresh key's blob, so each acknowledged
+    // write and each leaver's write in flight creates one extent file: a
+    // disconnect cancels no parsed command, so a file short is a write that
+    // did not land.
+    if scenario.leg == ExtentWindowLeg::Burst
+        && (creations.seen.len() as u64) < report.sets_acked + report.writers_left
+    {
+        report.violations.push(format!(
+            "EXTENT WINDOW VIOLATION seed {seed:#x}: extent-files-under-writes — {} extent files \
+             created for {} acknowledged blob writes and {} writes of clients that left: a \
+             write that did not land",
+            creations.seen.len(),
+            report.sets_acked,
+            report.writers_left
+        ));
+    }
     if report.extent_parked > 0 || report.extent_turns_out > 0 {
         report.violations.push(format!(
             "EXTENT WINDOW LIVENESS VIOLATION seed {seed:#x}: writer-left-parked — {} writer(s) \
@@ -693,33 +732,46 @@ fn judge(
 
 /// The cap row's fill, on the window's census row: it held its cap, and
 /// crossed it on the burst (the 17th arrival of one iteration) and never at
-/// exactly the cap.
+/// exactly the cap. At exactly the cap the two clauses are judged apart, so
+/// a window that admits one entry fewer reads both: the row holds 15, and
+/// the 16th arrival finds it full, a crossing. A missing row reads
+/// `cap-row-missing`, the census oracle's token for the same fact, never a
+/// fill clause's.
 fn window_row_oracle(scenario: &ExtentWindowScenario, report: &mut ExtentWindowReport) {
     let seed = scenario.seed;
     let Some(row) = report.window_row else {
         report.violations.push(format!(
-            "VACUOUS seed {seed:#x}: cap-row-unfilled — no `extent-window` row at the end"
+            "VACUOUS seed {seed:#x}: cap-row-missing — no `extent-window` row at the end"
         ));
         return;
     };
     let (held, cap, crossings) = (row.high_water, row.entries_max, row.crossings);
     let unfilled = held < cap;
-    let what = match scenario.leg {
-        ExtentWindowLeg::Burst if unfilled || crossings == 0 => format!(
-            "VACUOUS seed {seed:#x}: cap-row-unfilled — the `extent-window` row held {held} of \
-             {cap} with {crossings} crossing(s): the burst never filled it"
-        ),
-        ExtentWindowLeg::Cap if unfilled => format!(
-            "VACUOUS seed {seed:#x}: cap-row-unfilled — the `extent-window` row held {held} of \
-             {cap}: the writers never filled it"
-        ),
-        ExtentWindowLeg::Cap if crossings > 0 => format!(
-            "EXTENT WINDOW VIOLATION seed {seed:#x}: cap-row-crossed — {crossings} crossing(s) \
-             with exactly {cap} writers"
-        ),
-        ExtentWindowLeg::Burst | ExtentWindowLeg::Cap | ExtentWindowLeg::Cold => return,
-    };
-    report.violations.push(what);
+    match scenario.leg {
+        ExtentWindowLeg::Burst => {
+            if unfilled || crossings == 0 {
+                report.violations.push(format!(
+                    "VACUOUS seed {seed:#x}: cap-row-unfilled — the `extent-window` row held \
+                     {held} of {cap} with {crossings} crossing(s): the burst never filled it"
+                ));
+            }
+        }
+        ExtentWindowLeg::Cap => {
+            if unfilled {
+                report.violations.push(format!(
+                    "VACUOUS seed {seed:#x}: cap-row-unfilled — the `extent-window` row held \
+                     {held} of {cap}: the writers never filled it"
+                ));
+            }
+            if crossings > 0 {
+                report.violations.push(format!(
+                    "EXTENT WINDOW VIOLATION seed {seed:#x}: cap-row-crossed — {crossings} \
+                     crossing(s) with exactly {cap} writers"
+                ));
+            }
+        }
+        ExtentWindowLeg::Cold => {}
+    }
 }
 
 /// The hold rule: each writer whose extent file was created at the first

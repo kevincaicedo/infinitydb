@@ -152,12 +152,17 @@ directed pair of cells. The fabric is the only way cells talk to each other.
 
 **The control thread.** With a data directory, one extra thread persists the
 node catalog (namespace and index definitions). Catalog changes are rare and
-slow, so the file writes and fsyncs live off the data plane. Namespace and
-index ids come from shared atomic counters that the cell issuing the DDL
-bumps. The control thread also deletes truncated log segments and stale
-checkpoint files on behalf of the cells, because freeing a large file's
-pages is slow in the kernel. The main thread samples process gauges (RSS,
-CPU) and waits for the cells to exit.
+slow, so the file writes and fsyncs live off the data plane. The thread
+numbers each catalog request as it takes it from its queue and answers the
+request through that request's own slot once the write carrying it has
+returned (a refused request writes nothing), so a DDL reads only its own
+request's answer, never another's; `CREATE`, `DROP` and a `CREATE`'s
+rollback apply on any cell only after that answer. A namespace id is
+reserved under the DDL ticket and committed by the writer when it accepts
+the `CREATE`; index ids come from shared atomic counters. The control thread also deletes truncated log
+segments and stale checkpoint files on behalf of the cells, because freeing a
+large file's pages is slow in the kernel. The main thread samples process
+gauges (RSS, CPU) and waits for the cells to exit.
 
 **Boot.** `main` parses flags (there is no config file), takes the data
 directory's `LOCK`, loads or creates the key-hash secret, checks the
@@ -205,8 +210,10 @@ threads. Give every key exactly one owning cell and all of those become
 local, single-threaded problems.
 
 This shows up directly in the types. A cell's store is an `Rc<RefCell<...>>`,
-not an `Arc<Mutex<...>>`. Command futures are `!Send`, and the executor's
-wakers use no atomic instructions. Cell code may not name locks, channels,
+not an `Arc<Mutex<...>>`. Command futures are `!Send`. A waker may move to
+another thread, as Rust requires, but on its own cell's thread it runs no
+atomic read-modify-write; only a wake from another thread, which no server
+path makes, pays for one. Cell code may not name locks, channels,
 `tokio`, `sleep`, thread spawning, or the ambient clock or randomness; a
 denylist script and clippy's `disallowed-types` / `disallowed-methods`
 reject them at build time.
@@ -220,8 +227,10 @@ A few things do cross threads, and each is small and off the per-key path:
   `-LOADING` progress, checkpoint publications, index readiness), each
   written by its own cell and read by the others, plus the process gauges
   the main thread publishes;
+- the catalog word, the highest catalog request the control thread has
+  answered, which that thread alone stores and every cell reads;
 - a few multi-writer control counters that any cell may bump: the namespace
-  id, index id and catalog epoch allocators (`fetch_add`), each cell's
+  id and index id allocators (`fetch_add`), each cell's
   checkpoint request slot (`fetch_max`), the boot countdown every cell
   decrements once its caches are reserved, and the node-wide stop and
   quiesce counters;
@@ -630,8 +639,12 @@ total, bounded and fuzzed.
 peer. Sending consumes a credit; draining the reply returns it. A sender out
 of credits parks until a credit returns. Replies need no credit, and each
 ring holds at least twice the credit count, so a reply can always be sent and
-draining never waits for space: there is no cycle in which two cells wait for
-each other.
+draining never waits for space. A reply a cell holds back past the drain that
+read its operation waits only on its own cell's loop, or on operations sent
+from credits no held-back operation can hold, each answered in a drain: general
+traffic leaves one credit toward each peer free, and only the publish fan's
+legs, one in flight toward each peer, take it. So there is no cycle in which
+two cells wait for each other.
 
 **Draining.** FABRIC-IN drains about 1,024 messages per iteration,
 round-robin over peers from a rotating starting point. Slots are consumed
@@ -660,7 +673,9 @@ rows. Each row carries the command's name, arity, flags (`READONLY`,
 `WRITE`, `ADMIN`, `FAST`, `DENYOOM`, `LOADING`, `INTERNAL`) and a key
 specification in Redis's first/last/step form. Lookup is a perfect hash
 computed at compile time: fold the name into two words, two multiplies, one
-probe, one compare. A collision in the hash fails the build.
+probe, then a compare of the length and of the bytes with only the letters'
+case ignored, so only a registry name resolves. A collision in the hash fails
+the build.
 
 The table is the single source of truth: routing reads the key specification
 to find the owner, the executor reads the flags, `COMMAND` renders the table,
@@ -857,6 +872,12 @@ are allocated once and the append path allocates nothing. At LOG, unless a
 hold applies, the current buffer seals into a frame and is leased to the
 in-flight write until its completion returns.
 
+A segment holds at least the largest frame one buffer can seal, so
+`--segment-bytes` is at least `--log-staging-mib` MiB and, under the FUA class
+described below, a multiple of 4 KiB. The node refuses any other pair before it
+listens, naming both flags, rather than stopping at the first frame no segment
+can hold.
+
 Up to K frames may be in flight at once, so the ring has K + 1 buffers. K is
 derived from the barrier class described below: 3 for FUA and 1 for FLUSH,
 at most 8 (`--frames-in-flight` overrides it). Completions can arrive in any
@@ -941,7 +962,10 @@ barrier covers more of them.
 These two are policy holds. A frame is also held for correctness: while a
 due barrier cannot be issued behind frames still in flight, while the
 reorder window is full, while a rotation waits for the old segment's writes
-to finish, or while the next segment is not ready. An optional frame-seal
+to finish, while a rotation waits for the previous rotation's seal to be
+folded into the durable prefix (the log registers one seal at a time, since
+a seal holds its segment's file and covers its end), while the ack map is
+full, or while the next segment is not ready. An optional frame-seal
 pacer (`--seal-pace`, off by default) can also hold a frame queued behind
 frames in flight for at most one barrier window at the device's measured
 barrier rate. Each hold is counted, and every held frame keeps collecting
@@ -1257,7 +1281,13 @@ Commands whose keys live on several cells run as small programs on the pump:
 - `DEL`, `UNLINK`, `EXISTS` and `TOUCH` count local keys directly and send one
   operation per remote key, then sum the results. If any leg fails, the reply
   is that error, never a partial sum.
-- `MGET` and `JSON.MGET` gather values from each owner in key order.
+- `MGET` gathers values from each owner in key order.
+- `JSON.MGET` sends one leg per owning cell, the command over that cell's
+  keys, with at most three legs in flight; a wider gather waits for its
+  oldest leg before it sends the next. The accepting cell charges the whole
+  reply to one `doc-max-reply-bytes` account: a reply over it answers
+  `ERR reply too large` and serves no element, a leg's error is the whole
+  reply, and the legs still in flight are awaited before the reply is sent.
 - `MSET` applies its local pairs, then sends one leg per remote pair and
   replies `OK` when all legs succeed. `MSETNX` across cells checks, then sets.
 - `RENAME` and `RENAMENX` across two owners read a snapshot of the source,
@@ -1282,7 +1312,10 @@ A channel is owned by the cell that owns `slot(channel)`. Subscriber state
 lives on the subscriber's own cell. When a cell gains its first subscriber to
 a channel, or loses its last, it tells the channel's owner. `PUBLISH` goes to
 the owner, which sends one fabric message per cell that has subscribers, not
-one per subscriber. Pattern subscriptions are kept on the subscriber's cell
+one per subscriber. The owner answers after every subscriber cell has
+acknowledged its delivery, and its fan uses the credit general traffic leaves
+free toward each peer, so it never waits behind unanswered publishes, its own
+cell's or a peer's. Pattern subscriptions are kept on the subscriber's cell
 too, and every cell holds a copy of the pattern index: when a cell gains its
 first subscriber to a pattern, or loses its last, it tells every cell. So any
 owner can find the cells with matching pattern subscribers without a global
@@ -1345,12 +1378,13 @@ background I/O is not budgeted and checkpoints are paced at a fixed rate.
 | Key / inline value | 255 B / 16 MiB − 1 | typed error |
 | Queued commands per connection | 1,024 (resume at 64) | stop receiving; TCP pushes back |
 | Remote ops / pending replies per connection, tested before each command | 32 / 256 | the pump dispatches no further command until replies arrive; one command then adds one op per remote key (at most 1,023 under the 1,024-argument cap) or one per other cell it reaches, so at most 31 plus one command's ops are in flight: 1,054 on a node of up to 1,024 cells |
-| Fabric credits per destination | 1,024 | sender waits for a credit |
+| Fabric credits per destination | 1,024 (1,023 for general traffic, one kept for the publish fan) | sender waits for a credit |
 | Fabric drain per iteration | about 1,024 messages (checked between 8-slot chunks, so it can overshoot by one chunk) | the rest next iteration |
 | Resumed futures per iteration | 1,024 | the rest next iteration |
 | Expirations per slice | 4,096 | the rest next slice |
 | Memory | `maxmemory` share; namespace `MAXMEMORY` | `DENYOOM` commands get `-OOM`, after at most 512 inline evictions |
 | Log staging | (K + 1) × 4 MiB | durable writes wait; oversized records refused |
+| Segment size | 256 MiB | below the largest frame the staging ring can seal: the node refuses to start |
 | Log space | the device | segment creation failing with `ENOSPC`: durable writes refused (`NOSPACE`), memory namespaces unaffected; a failed frame or zero-fill write (the usual case, since segments are sparse): the node stops |
 | Output buffer | `client-output-buffer-limit`: normal clients unlimited (as in Redis); subscribers 32 MiB hard, or 8 MiB for 60 s | client disconnected |
 | Cold-read queue | `COLD-READ-QD` (64) and overflow cap | `BUSY` |
@@ -1376,7 +1410,8 @@ sections. Mind the scope: on a node with a data directory, `memory` and
 cell), while `persistence`, `tiering`, `caps` and `tripwires` always describe
 the cell that served the `INFO` command. Multiply before comparing those to
 the process as a whole. `caps` lists the cell's capped containers, one line
-each: its cap, the most entries it has held and how many times it was full.
+each: its cap, the most entries it has held, how many times it was full, and
+its capacity now, which a slab that retires worn-out slots lowers.
 
 The tripwires are always on, and turning them off is only possible in an
 A/B build that proves they cost nothing: SQEs per submit, CQEs per reap,
@@ -1406,9 +1441,12 @@ the attribute and any allow written exactly `allow(unsafe_code)` that is not
 on a whole module; it does not read an allow in another spelling (a reasoned
 `#[allow(unsafe_code, reason = …)]`, `#[expect(unsafe_code)]`, a grouped
 allow). The ring is checked with Loom; the allocator and fabric with Miri.
-The executor's wakers are deliberately not thread-safe: they use no atomics
-(a CI check inspects the waker path for atomic instructions), and command
-futures are `!Send`, which keeps them on their cell's thread.
+The executor's wakers are thread-safe at a small bridge: on their own cell's
+thread they run no atomic read-modify-write (a CI check inspects the waker
+path's machine code for atomic instructions outside the bridge's foreign
+lane), and a wake from another thread is queued for the cell to deliver.
+Command futures are `!Send`, which keeps them on their cell's thread. The
+bridge's lane is checked with Loom and the executor with Miri.
 
 **Untrusted bytes.** Client requests, fabric messages and every on-disk
 format (log frames, segments, checkpoints, MANIFEST, catalog, tier files,
@@ -1488,13 +1526,11 @@ shape the image reproduces. Its rows are data files anyone can review.
 ### Fuzzing, Loom and Miri
 
 Every decoder has a cargo-fuzz target. CI runs a short fuzz of the RESP
-parser on every change. A nightly job fuzzes the wire, fabric, log frame,
-segment, checkpoint, MANIFEST, tier-file, blob-extent and document decoders
-for hours each. The catalog, query-program, index-key and index-sidecar
-targets, and a few server-side ones, exist but are not in the nightly set
-yet. Loom
-model-checks the fabric ring; Miri runs the allocator and fabric tests under
-strict provenance.
+parser on every change. The full CI fuzzes every target for five minutes,
+and a nightly job fuzzes every target for 5.5 hours, one job a target in
+each; both read the targets from the fuzz manifests when they run, so a new
+target is fuzzed from its first run. Loom model-checks the fabric ring; Miri
+runs the allocator and fabric tests under strict provenance.
 
 ### Mechanical checks
 
@@ -1503,14 +1539,19 @@ plus scripts for the rules a compiler cannot see: the crate dependency table,
 the cell denylist and clock ban, fault-point and `fsync` fail-stop rules,
 the panic policy and the inventory of release assertions, `SAFETY.md`
 inventories and unsafe crate roots, test-only features kept out of shipping
-builds, file length and line width, and lint ratchets. Each script is
-self-tested: it must exit non-zero on each of its planted cases. The shell
-cases of `scripts/check-scripts-selftest.sh` also fail on exit 126 or 127
-(a command that could not run); the Python fixtures it runs for the
-dependency table, the `SAFETY.md` inventories and the documentation
-artifacts do not check those codes. `just check` also tests the slim
-`inf-server` library build, and CI builds it and checks that its symbols
-contain no document or query code.
+builds, file length and line width, and lint ratchets. It compiles every
+fuzz target too. Each fuzz crate is a workspace of its own, so its fuzzing
+features never reach a shipping build and the root workspace's clippy and
+tests never compile it; a script checks every target on the pinned toolchain
+with warnings denied, under its committed lock and with `cfg(fuzzing)` set,
+as a fuzz build compiles it, after compiling a probe whose planted errors it
+must report. Each script is self-tested: it must exit non-zero on each of its
+planted cases. The shell cases of `scripts/check-scripts-selftest.sh` also
+fail on exit 126 or 127 (a command that could not run); the Python fixtures
+it runs for the dependency table, the `SAFETY.md` inventories and the
+documentation artifacts do not check those codes. `just check` also tests
+the slim `inf-server` library build, and CI builds it and checks that its
+symbols contain no document or query code.
 
 ### Exit gates
 

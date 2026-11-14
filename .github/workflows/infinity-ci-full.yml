@@ -1,9 +1,10 @@
 # InfinityDB CI — heavy suite (main, weekly, and on demand).
 #
-# Runs the jobs that are too slow for every PR push and were the reason the
-# PR pipeline blew up: the full strict-provenance Miri (inf-alloc + inf-fabric,
-# the M0-S02 acceptance gate — was timing out at 45 min), the full 14-target
-# fuzz smoke (70 min plus build time), and benchmark correctness/compile sanity. Everything else (3-OS
+# Runs the suites past a PR lane's budget: the full strict-provenance Miri
+# (inf-alloc + inf-fabric), longer than a PR job's timeout, the node module's
+# type doctests with their error codes checked on nightly, and the fuzz smoke
+# (every fuzz target for 300 s, one job a target), more runners than a PR run
+# should hold; and benchmark correctness/compile sanity. Everything else (3-OS
 # build matrix, client-smoke, compat-diff, kernel-matrix, loom, sim-smoke)
 # stays on the fast PR lane in infinity-ci.yml, where it costs little.
 #
@@ -11,8 +12,8 @@
 #   • push to main — verify the merged commit.
 #   • schedule — Mondays at 07:23 UTC, on the default branch.
 #   • pull_request labeled `ci-full` — add the label to a PR to run the suite.
-#     `pull_request` uses the workflow file from the PR branch, so this is the
-#     path that works for PR #1 (before this file is on `main`).
+#     `pull_request` uses the workflow file from the PR branch, so this path
+#     works before this file is on `main`.
 #   • issue_comment `/ci-full` on a PR, from a maintainer (author_association
 #     OWNER / MEMBER / COLLABORATOR). GitHub loads comment-triggered workflows
 #     from the DEFAULT branch, so `/ci-full` (and the "Run workflow" button)
@@ -98,7 +99,7 @@ jobs:
             }
 
   miri:
-    # Full M0-S02 gate: strict-provenance Miri on both unsafe leaves.
+    # The full strict-provenance Miri: inf-alloc and inf-fabric, every test.
     needs: authorize
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -119,16 +120,89 @@ jobs:
         run: cargo +nightly miri test -p inf-alloc -p inf-fabric
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
+      # The cell executor's waker is sound on any thread (ADR-0003 A1): its executor, cross-thread
+      # and drop tests, each with the leak check on.
+      - name: miri (inf-runtime's executor and waker tests) strict provenance
+        run: cargo +nightly miri test -p inf-runtime --test executor --test waker_threads --test waker_close
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+      # A consuming foreign waker call forms no reference to its header or the remote stack once
+      # its swap, or its push, may let another thread free them (ADR-0003 A1.2.5). The default
+      # schedule never preempts a call inside that window, so the races run at a pinned
+      # preemption rate over a pinned seed range, each seed a schedule, on one test thread.
+      - name: miri (inf-runtime's waker races) strict provenance, pinned schedules
+        run: cargo +nightly miri test -p inf-runtime --test waker_race -- --test-threads=1
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-preemption-rate=0.002 -Zmiri-many-seeds=0..32
 
-  fuzz-smoke:
-    # Full 14-target smoke, 300 s each. The json_parse / path_program targets
-    # take an explicit writable corpus dir that is gitignored; create it so a
-    # fresh checkout does not fail with "required directory ... does not exist"
-    # (the run #9 fuzz-smoke failure). The committed seed corpora
-    # (fuzz/corpora/*) already exist.
+  node-types:
+    # The node module's types refuse each way out of them, one compile_fail
+    # doctest a way (ADR-0203). `just check` runs them on the pinned toolchain,
+    # whose rustdoc does not check a block's error code, so a block that fails
+    # for another reason (a name its twin renamed) passes there; nightly's
+    # rustdoc checks each code. Red unless every compile_fail fence of the
+    # module ran and passed: a block that did not run is no evidence.
     needs: authorize
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: node-types
+      - name: the node module's compile_fail blocks, error codes checked (nightly)
+        shell: bash
+        run: |
+          set -euo pipefail
+          module=bins/infinityd/tests/support/node.rs
+          fences=$(grep -c '^//! ```compile_fail' "$module" || true)
+          cargo +nightly test --doc -p compat -- harness::node 2>&1 | tee node-types.log
+          ran=$(grep -c ' - harness::node (line [0-9]*) - compile fail \.\.\. ok$' node-types.log || true)
+          echo "node-types: $fences compile_fail fences in $module, $ran passed with codes checked"
+          [ "$fences" -gt 0 ] || { echo "node-types: no compile_fail fence in $module"; exit 1; }
+          [ "$ran" -eq "$fences" ] || { echo "node-types: $ran of $fences blocks passed"; exit 1; }
+
+  fuzz-targets:
+    # The fuzz smoke's matrix: every target the fuzz manifests list, with its
+    # committed seed directories, read from the census at the commit under
+    # test (ADR-0198 D3). A red census fails this step before its output is
+    # written, so no smoke job runs on a partial list, and the census never
+    # prints an empty one.
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.census.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+      - name: the fuzz targets, from the census
+        id: census
+        shell: bash
+        run: |
+          matrix=$(./scripts/check-fuzz-targets.sh --matrix smoke)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  fuzz-smoke:
+    # Every fuzz target for 300 s, one job a target, the nightly's step with a
+    # shorter time (ADR-0198 D3). cargo-fuzz creates its default corpus
+    # directory but refuses a named one that is missing, and a target's
+    # working corpus, fuzz/corpus/<target>, is committed for some targets and
+    # absent from a fresh checkout for the rest, so the job creates it before
+    # the run names it beside the target's seed directories. Each job is
+    # named by its target, unique across the tree, rather than by every
+    # matrix value.
+    name: fuzz-smoke ${{ matrix.target }}
+    needs: [authorize, fuzz-targets]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.fuzz-targets.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
         with:
@@ -137,52 +211,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      - name: fuzz RESP parser (smoke)
-        run: cargo +nightly fuzz run resp_parse -- -max_total_time=300
-        working-directory: crates/inf-wire
-      - name: fuzz fabric codec (smoke)
-        run: cargo +nightly fuzz run fabric_codec -- -max_total_time=300
-        working-directory: crates/inf-fabric
-      - name: fuzz glob matcher (smoke)
-        run: cargo +nightly fuzz run glob_match -- -max_total_time=300
-        working-directory: crates/inf-server
-      - name: fuzz SCAN cursor (smoke)
-        run: cargo +nightly fuzz run scan_cursor -- -max_total_time=300
-        working-directory: crates/inf-server
-      - name: fuzz log frame decoder (smoke, M2-S01)
-        run: cargo +nightly fuzz run frame_decode -- -max_total_time=300
-        working-directory: crates/inf-log
-      - name: fuzz segment reader (smoke, M2-S04)
-        run: cargo +nightly fuzz run segment_read -- -max_total_time=300
-        working-directory: crates/inf-log
-      - name: fuzz .ick loader (smoke, M2-S10)
-        run: cargo +nightly fuzz run ick_decode -- -max_total_time=300
-        working-directory: crates/inf-log
-      - name: fuzz manifest decoder (smoke, M2/M4 — readiness F2)
-        run: cargo +nightly fuzz run manifest_decode -- -max_total_time=300
-        working-directory: crates/inf-log
-      - name: fuzz extent decoder (smoke, M4-S17 — readiness F2)
-        run: cargo +nightly fuzz run extent_decode -- -max_total_time=300
-        working-directory: crates/inf-log
-      - name: fuzz tier-file decoder (smoke; the nightly accrues its hours)
-        run: cargo +nightly fuzz run fuzz_tierfile_decode -- -max_total_time=300
-        working-directory: crates/inf-log
-      - name: fuzz idoc decoder (smoke, M3-S01/S02)
-        run: cargo +nightly fuzz run idoc_decode -- -max_total_time=300
-        working-directory: crates/inf-doc
-      - name: fuzz JSON parser (smoke, M3-S05; seeded from the committed minimized corpus, M3-S07)
-        run: |
-          mkdir -p fuzz/corpus/json_parse
-          cargo +nightly fuzz run json_parse fuzz/corpus/json_parse fuzz/corpora/json -- -max_total_time=300
-        working-directory: crates/inf-doc
-      - name: fuzz path programs (smoke, M3-S08/S09; seeded from the pinned child-len-overflow regression)
-        run: |
-          mkdir -p fuzz/corpus/path_program
-          cargo +nightly fuzz run path_program fuzz/corpus/path_program fuzz/corpora/path_program -- -max_total_time=300
-        working-directory: crates/inf-doc
-      - name: fuzz delta apply (smoke, M3 — readiness F2)
-        run: cargo +nightly fuzz run fuzz_delta_apply -- -max_total_time=300
-        working-directory: crates/inf-doc
+      - name: ensure corpus dir exists
+        run: mkdir -p fuzz/corpus/${{ matrix.target }}
+        working-directory: ${{ matrix.dir }}
+      - name: "fuzz ${{ matrix.target }} (300 s)"
+        run: cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} ${{ matrix.seeds }} -- -max_total_time=300
+        working-directory: ${{ matrix.dir }}
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-smoke-artifacts-${{ matrix.target }}
+          path: ${{ matrix.dir }}/fuzz/artifacts/
+          if-no-files-found: ignore
 
   bench-build:
     # Benchmark sanity — release instrument tests and compilation, also on PRs.
@@ -209,7 +250,7 @@ jobs:
 
   report:
     # Post the outcome back to the PR when invoked via /ci-full or the label.
-    needs: [authorize, miri, fuzz-smoke, bench-build]
+    needs: [authorize, miri, node-types, fuzz-targets, fuzz-smoke, bench-build]
     if: always() && needs.authorize.result != 'skipped' && (github.event_name == 'issue_comment' || github.event_name == 'pull_request')
     runs-on: ubuntu-24.04
     steps:
@@ -218,7 +259,7 @@ jobs:
           script: |
             const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const r = ${{ toJSON(needs) }};
-            const order = ['miri', 'fuzz-smoke', 'bench-build'];
+            const order = ['miri', 'node-types', 'fuzz-targets', 'fuzz-smoke', 'bench-build'];
             const icon = s => s === 'success' ? '✅' : s === 'skipped' ? '⏭️' : '❌';
             const lines = order.map(k => `- ${icon(r[k] && r[k].result)} ${k}: ${r[k] ? r[k].result : 'n/a'}`);
             const anyFail = order.some(k => r[k] && r[k].result !== 'success' && r[k].result !== 'skipped');

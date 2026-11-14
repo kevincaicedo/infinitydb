@@ -16,7 +16,13 @@
 #     file git shows as added or renamed against that copy (a split carries
 #     its counts; a fix does not buy a violation). Moved rows are printed;
 #   * one clippy JSON pass per feature set, counted once per span (cargo
-#     re-emits a crate's diagnostics per feature set — ADR-0125 A1).
+#     re-emits a crate's diagnostics per feature set — ADR-0125 A1);
+#   * both passes keep their own target directory, `lint-ratchet-<key>` under
+#     the checkout's target root (scripts/target-root.sh, ADR-0198 A2): cargo
+#     fingerprints clippy's lint arguments, so passes that shared the recipe's
+#     target with its `-D warnings` clippy would re-check every member twice
+#     on each run, and the key keeps a copied checkout's passes, run alone on
+#     the copied target, from reading the original's.
 #
 # INF_LINT_RATCHET_INPUT=<file> replaces the cargo run with captured
 # `--message-format=json` output (the self-test's fixtures).
@@ -39,9 +45,14 @@ work=$(mktemp -d)
 trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 
 LINTS="-W clippy::too_many_lines -W clippy::cast_possible_truncation -W clippy::cast_sign_loss -W clippy::cast_possible_wrap -W clippy::arithmetic_side_effects --force-warn clippy::disallowed_methods --force-warn clippy::disallowed_types"
+# shellcheck source=target-root.sh
+. "$SCRIPT_DIR/target-root.sh"
 if [ -n "${INF_LINT_RATCHET_INPUT:-}" ]; then
     cp "$INF_LINT_RATCHET_INPUT" "$work/clippy.json"
 else
+    target_root_setup "$(pwd -P)" ||
+        { echo "LINT-RATCHET SCOPE ERROR: scripts/target-root.sh gave no target root"; exit 1; }
+    TARGET_DIR=$(target_root_kept lint-ratchet)
     if ! grep -Eq '^too-many-lines-threshold *= *70$' clippy.toml; then
         echo "LINT-RATCHET SCOPE ERROR: clippy.toml does not pin too-many-lines-threshold = 70"
         exit 1
@@ -49,8 +60,10 @@ else
     # The simulator's lib only builds under its `dst` feature (ADR-0107).
     # shellcheck disable=SC2086
     {
-        cargo clippy --workspace --exclude inf-sim --lib --bins --message-format=json -- $LINTS &&
-        cargo clippy -p inf-sim --features dst --lib --bins --message-format=json -- $LINTS
+        cargo clippy --workspace --exclude inf-sim --lib --bins --message-format=json \
+            --target-dir "$TARGET_DIR" -- $LINTS &&
+        cargo clippy -p inf-sim --features dst --lib --bins --message-format=json \
+            --target-dir "$TARGET_DIR" -- $LINTS
     } >"$work/clippy.json" 2>"$work/clippy.err" || {
         tail -n 40 "$work/clippy.err"
         echo "LINT-RATCHET SCOPE ERROR: cargo clippy failed"

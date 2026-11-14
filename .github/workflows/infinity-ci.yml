@@ -1,17 +1,18 @@
-# InfinityDB CI — pull-request lane (verification ladder, M0-S02).
+# InfinityDB CI — pull-request lane (the verification ladder).
 #
 # Layout: this repository's root IS the Cargo workspace (crates/, bins/,
 # tests/ at the top level). Jobs run from the repo root; there is no nested
 # `infinitydb/` directory on the runner.
 #
-# Split (2026-07-17): only the two slow jobs were the problem — `miri`
-# (45-min timeout) and the 14-target `fuzz-smoke` (~70 min). Those are
-# REDUCED here (a strict-provenance canary on inf-alloc, and a single 60-s
-# fuzz smoke) and run in FULL in `infinity-ci-full.yml` (main pushes / weekly /
-# label `ci-full` / `/ci-full` comment / dispatch). Benchmark sanity also runs on every PR. Every
-# other job — the full 3-OS build matrix, client-smoke, compat-diff,
-# kernel-matrix, loom, sim-smoke — stays here: each runs in a few minutes and
-# they run in parallel, so they cost little wall-clock but keep PR coverage.
+# The two slow suites run REDUCED here and in FULL in `infinity-ci-full.yml`
+# (main pushes / weekly / label `ci-full` / `/ci-full` comment / dispatch):
+# Miri as a strict-provenance canary on inf-alloc, and the fuzz smoke as one
+# target, `resp_parse`, for 60 s, while `build-test` compiles every fuzz
+# target on each of its legs (ADR-0198 D2, D3). Benchmark sanity also runs on
+# every PR. Every other job — the full 3-OS build matrix, client-smoke,
+# compat-diff, kernel-matrix, loom, sim-smoke — stays here: each runs in a few
+# minutes and they run in parallel, so they cost little wall-clock but keep
+# PR coverage.
 name: infinity-ci
 
 on:
@@ -51,9 +52,22 @@ jobs:
         with:
           toolchain: 1.95.0
           components: clippy, rustfmt
+      # The cache saves only on a key it did not restore whole, so a key made
+      # before cargo-nextest was installed here would never keep it: v1 starts
+      # the key again with the binary in ~/.cargo/bin.
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+      # ADR-0200 D4: the tests run under cargo-nextest, the version
+      # .config/nextest.toml requires, installed from its published lock.
+      - name: install cargo-nextest
+        run: cargo install --locked cargo-nextest --version 0.9.150
       - name: fmt
         run: cargo fmt --all --check
+      # ADR-0200 D5: red here, not after the gates, when the installed
+      # nextest is missing or older than the config's floor.
+      - name: nextest meets the config's floor
+        run: cargo nextest show-config version
       - name: documentation identities and relative links (ADR-0106 D15, ADR-0166 D5)
         run: ./scripts/check-doc-artifacts.sh
       - name: dep-DAG law
@@ -66,58 +80,89 @@ jobs:
         run: ./scripts/check-fsync-fail-stop.sh
       - name: panic-policy grep
         run: ./scripts/check-panic-policy.sh
-      # ADR-0107 D2 (review 2026-08-30, Theme 4): release asserts justified
-      # by a claim about a caller are an inventory, gated.
+      # ADR-0190 D4: a reply's outcome is read beside its bytes, never from them.
+      - name: reply-outcome gate (ADR-0190 D4)
+        run: ./scripts/check-reply-outcome.sh
+      # ADR-0203 D3: a test names infinityd only through the node module, whose
+      # starts hold the box's node lock; every ring outside a node is a census row.
+      - name: node-spawn gate (ADR-0203 D3)
+        run: ./scripts/check-node-spawn.sh
+      # ADR-0172 D2: a pre-effect refusal's text is inf_wire::Refusal's alone.
+      - name: refusal-text gate (ADR-0172 D2)
+        run: ./scripts/check-refusal-text.sh
+      # ADR-0107 D2: release asserts justified by a claim about a caller are
+      # an inventory, gated.
       - name: release-assert inventory (ADR-0107 D2)
         run: ./scripts/check-release-asserts.sh
       - name: SAFETY.md inventory
         run: ./scripts/check-safety-inventory.sh
-      # ADR-0106: the gates must go red on a planted violation, or their OK
-      # is a claim (review 2026-08-30 P1/P1c: two had been inert for months).
-      # ADR-0107 (review 2026-08-30, F-L16-01): the DST features never ride
-      # a normal dependency edge — `cargo build --workspace` linked infinityd
-      # against a colliding hasher until this fence existed.
+      # ADR-0107 D1: the DST features never ride a normal dependency edge,
+      # or `cargo build --workspace` would link infinityd against a
+      # colliding hasher.
       - name: shipping-feature fence (ADR-0107)
         run: ./scripts/check-shipping-features.sh
-      - name: check scripts self-test (each gate exits non-zero on its planted case)
-        run: ./scripts/check-scripts-selftest.sh
-      # ADR-0106 first amendment (review 2026-08-30 F-L18-05): the clock
-      # ban is type-resolved; the gate compiles a planted-bypass probe under
-      # the workspace clippy.toml and lists every sanctioned site.
+      # ADR-0198 D2: every fuzz target compiles, warnings denied, under its
+      # committed lock and cfg(fuzzing), on each leg's own cfg; the probe's
+      # planted reds run first, so the gate proves it can see what it guards.
+      - name: fuzz targets compile (ADR-0198)
+        run: ./scripts/check-fuzz-targets.sh
+      # ADR-0106 D7: the clock ban is type-resolved; the gate compiles a
+      # planted-bypass probe under the workspace clippy.toml and lists every
+      # sanctioned site.
       - name: clock ban (type-resolved, planted-bypass probe)
         run: ./scripts/check-clock-ban.sh
-      # ADR-0106 second amendment (review 2026-08-30, F-L20-03): the M0-S06
-      # / ADR-0003 "no atomics in the waker path" AC. Its gate ran in no
-      # recipe and no workflow, and scanned 0 instruction lines per waker.
+      # ADR-0106 D8, ADR-0003 A1: no atomic on the waker's owner lane, read
+      # from the bodies each waker's vtable reaches up to the foreign lane's
+      # boundary, against a planted-bypass probe.
       # Linux only: the Mach-O asm flavor is handled but unverified, and an
       # unverified red on one leg would be noise, not evidence.
       - name: waker-atomics (vtable-resolved, planted-bypass probe)
         if: runner.os == 'Linux'
         run: ./scripts/check-waker-atomics.sh
-      # ADR-0144 (architecture review 2026-09-17, W5): crate roots under the
-      # wildcard deny, the structural suppression audit, the frozen
-      # ADR-0143 exemptions, and the probe whose plants must draw their lint.
+      # ADR-0144: crate roots under the wildcard deny, the structural
+      # suppression audit, the frozen ADR-0143 exemptions, and the probe
+      # whose plants must draw their lint.
       - name: lint scopes (ADR-0144)
         run: ./scripts/check-lint-scopes.sh
-      # Linux only: the baseline is recorded there (cfg-gated files).
+      # Linux only: the baseline is recorded there (cfg-gated files). Its two
+      # clippy passes keep their own target, target/lint-ratchet-<key>, the key
+      # this checkout's (scripts/target-root.sh): in the target the clippy step
+      # uses, their lint arguments would re-check every member twice.
       - name: lint ratchet (ADR-0144 D3; absorbs the fn-length ratchet)
         if: runner.os == 'Linux'
         run: ./scripts/check-lint-ratchet.sh
+      # ADR-0207 D1-D3, ADR-0200 D4, D7: every static lock and every marked
+      # run-alone or long test has its nextest override, this workflow
+      # installs the nextest the config requires, and no test file reads free
+      # space or leaves a tiered namespace's stall bound unstated.
+      - name: nextest config (ADR-0200)
+        run: ./scripts/check-nextest-config.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # ADR-0106: the gates must go red on a planted violation, or their OK
+      # is a claim. It runs after clippy, so a compile or lint red stops the
+      # leg first.
+      - name: check scripts self-test (each gate exits non-zero on its planted case)
+        run: ./scripts/check-scripts-selftest.sh
       - name: build shipping packages
         run: cargo build --workspace --exclude inf-sim
       - name: build simulator (isolated DST features)
         run: cargo build -p inf-sim --features dst
+      # ADR-0200 D1: one process a test, every binary even after a red; the
+      # doctests under cargo test. Compat runs with its pinned oracles in
+      # compat-diff.
       - name: test (compat runs with its pinned oracles in compat-diff)
-        run: cargo test --workspace --exclude compat
+        run: cargo nextest run --no-fail-fast --workspace --exclude compat
         env:
           # memlock_boot may skip only where rings are not charged to
           # RLIMIT_MEMLOCK; on the Linux legs a skip is a failure.
           INF_MEMLOCK_BOOT_REQUIRE: ${{ runner.os == 'Linux' && '1' || '0' }}
+      - name: doctests
+        run: cargo test --doc --workspace --exclude compat
 
   slim-build:
-    # L11 / F-L20-09: workspace feature unification hides missing doc guards.
+    # L11: workspace feature unification hides missing doc guards, so the
+    # slim packages build alone, without their default features.
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -126,9 +171,21 @@ jobs:
         with:
           toolchain: 1.95.0
           components: clippy
+      # The cache saves only on a key it did not restore whole, so a key made
+      # before cargo-nextest was installed here would never keep it: v1 starts
+      # the key again with the binary in ~/.cargo/bin.
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
           key: slim-build
+      # ADR-0200 D4: the tests run under cargo-nextest, the version
+      # .config/nextest.toml requires, installed from its published lock.
+      - name: install cargo-nextest
+        run: cargo install --locked cargo-nextest --version 0.9.150
+      # ADR-0200 D5: red here, not after the gates, when the installed
+      # nextest is missing or older than the config's floor.
+      - name: nextest meets the config's floor
+        run: cargo nextest show-config version
       - name: slim clippy
         run: cargo clippy -p inf-server -p inf-store --no-default-features -- -D warnings
       - name: slim libraries
@@ -146,7 +203,9 @@ jobs:
             exit 1
           fi
       - name: slim tests
-        run: cargo test -p inf-server -p inf-store --no-default-features
+        run: cargo nextest run --no-fail-fast -p inf-server -p inf-store --no-default-features
+      - name: slim doctests
+        run: cargo test --doc -p inf-server -p inf-store --no-default-features
 
   doc-intern-keys:
     runs-on: ubuntu-24.04
@@ -157,13 +216,27 @@ jobs:
         with:
           toolchain: 1.95.0
           components: clippy
+      # The cache saves only on a key it did not restore whole, so a key made
+      # before cargo-nextest was installed here would never keep it: v1 starts
+      # the key again with the binary in ~/.cargo/bin.
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
           key: doc-intern-keys
+      # ADR-0200 D4: the tests run under cargo-nextest, the version
+      # .config/nextest.toml requires, installed from its published lock.
+      - name: install cargo-nextest
+        run: cargo install --locked cargo-nextest --version 0.9.150
+      # ADR-0200 D5: red here, not after the gates, when the installed
+      # nextest is missing or older than the config's floor.
+      - name: nextest meets the config's floor
+        run: cargo nextest show-config version
       - name: interned document clippy
         run: cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings
       - name: interned document tests
-        run: cargo test -p inf-doc -p inf-store --features doc-intern-keys
+        run: cargo nextest run --no-fail-fast -p inf-doc -p inf-store --features doc-intern-keys
+      - name: interned document doctests
+        run: cargo test --doc -p inf-doc -p inf-store --features doc-intern-keys
 
   benchmark-sanity:
     # Correctness and compilation only; hosted runners do not prove perf gates.
@@ -182,30 +255,54 @@ jobs:
       - name: criterion benches compile (no measurements)
         run: cargo bench --workspace --no-run
 
+  deny-manifests:
+    # The manifests cargo-deny reads, from the fuzz census (ADR-0198 D6): the
+    # root and every fuzz manifest, each a workspace with a lock of its own.
+    # The census runs before any toolchain is installed. A red census fails
+    # this step before its output is written, so no cargo-deny job runs on a
+    # partial list, and the census never prints an empty one.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.census.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: the manifests cargo-deny reads
+        id: census
+        shell: bash
+        run: |
+          matrix=$(./scripts/check-fuzz-targets.sh --matrix deny)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   cargo-deny:
+    # Licences, advisories, bans and sources of every lock that holds a
+    # third-party crate, the root's and each fuzz manifest's, one job a
+    # manifest; a probe names none, which the census checks. build-test
+    # compiles every fuzz target, so a fuzz lock's crates (libfuzzer-sys,
+    # and the cc its build script runs) are built on every PR leg.
+    needs: deny-manifests
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.deny-manifests.outputs.matrix) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          manifest-path: Cargo.toml
+          manifest-path: ${{ matrix.manifest }}
 
   miri-canary:
     # REDUCED: strict-provenance Miri on the smallest unsafe leaf (inf-alloc)
-    # only. The FULL Miri (inf-alloc + inf-fabric, all tests) is the M0-S02
-    # acceptance gate and runs in infinity-ci-full — that is the job that was
-    # timing out at 45 min here.
+    # only, inside a PR job's timeout. The FULL Miri (inf-alloc + inf-fabric,
+    # all tests) runs longer than that, in infinity-ci-full.
     #
-    # 2026-08-05 (ADR-0065 D5): inf-alloc alone then blew this budget too —
-    # cancelled at 15 min with 14 of 31 tests done. Two causes, both fixed
-    # rather than papered over with a bigger timeout:
-    #   * the arena alloc/free storm verified every byte of every live range
-    #     through an interpreted loop, and its rare size tier is half a
-    #     megabyte — that ONE test measured > 7.4 min on the dev box. It now
-    #     probes range ends under Miri (full width still runs natively).
-    #   * the buffer-pool lease/release storm had no Miri guard at all
-    #     (100k interpreted iterations); it scales down like the others.
+    # ADR-0065 D5: the budget holds by scaling the storms under Miri, not by
+    # a bigger timeout. The arena alloc/free storm probes each live range's
+    # ends under Miri, where checking every byte through the interpreter
+    # would take minutes (its rare size tier is half a megabyte), and the
+    # full width still runs natively; the buffer-pool lease/release storm
+    # runs fewer iterations under Miri, as the others do.
     # `cargo miri setup` also rebuilds a Miri-instrumented std into
     # ~/.cache/miri on every cold run — cached below, since rust-cache does
     # not cover it by default.
@@ -239,6 +336,11 @@ jobs:
         env:
           RUSTFLAGS: --cfg loom
           LOOM_MAX_PREEMPTIONS: "3"
+      - name: loom models (checkpoint issuance, grants, the wake bridge)
+        run: cargo test -p inf-foundation --release loom_ -- --nocapture
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: "3"
 
   sim-smoke:
     runs-on: ubuntu-24.04
@@ -251,17 +353,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: sim tests (determinism, oracle, planted lost-wakeup)
         run: cargo test -p inf-sim --features dst
-      # F-L19-03 (review of 2026-08-30): the job is named after the recipe
-      # it now runs — every scenario in `inf_sim::SCENARIOS` once at a fixed
-      # seed, determinism-verified (`scripts/sim-smoke.sh` is the one
-      # registry; `bins/inf-sim/tests/lanes.rs` keeps it complete).
+      # The job is named after the recipe it runs — every scenario in
+      # `inf_sim::SCENARIOS` once at a fixed seed, determinism-verified
+      # (`scripts/sim-smoke.sh` is the one registry;
+      # `bins/inf-sim/tests/lanes.rs` keeps it complete).
       - name: every scenario once (scripts/sim-smoke.sh)
         run: ./scripts/sim-smoke.sh
 
   fuzz-smoke:
-    # REDUCED: one decoder, 60 s, to catch gross breakage fast. cargo-fuzz
-    # auto-creates fuzz/corpus/resp_parse, so no seed dir is needed here. The
-    # full 14-target smoke (300 s each) runs in infinity-ci-full.
+    # REDUCED (ADR-0198 D3): one target, `resp_parse`, for 60 s, the first
+    # decoder every client byte crosses; `build-test` compiles every target
+    # and the full smoke runs in infinity-ci-full. cargo-fuzz creates the
+    # default corpus directory, fuzz/corpus/resp_parse, so no seed directory
+    # is named here.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -308,7 +412,7 @@ jobs:
           done
           grep -q 'module:name=ReJSON' <<<"$oracle_info"
           grep -q 'ver=20809' <<<"$oracle_info"
-      - name: build infinityd (the real-node compat candidate — F-L19-09)
+      - name: build infinityd (the real-node compat candidate)
         run: cargo build -p infinityd
       - name: compat-diff matrix + generated-matrix staleness gate
         run: cargo test -p compat -- --nocapture
@@ -319,8 +423,8 @@ jobs:
           INF_COMPAT_REQUIRE_BINARY: '1'
 
   client-smoke:
-    # M1-S03/S14: major Redis client libraries work against infinityd out of
-    # the box. One server serves all four sequentially. Fast (~1-2 min).
+    # Major Redis client libraries work against infinityd out of the box.
+    # One server serves all four sequentially. Fast (~1-2 min).
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -382,7 +486,9 @@ jobs:
         working-directory: tests/client-smoke/java
 
   kernel-matrix:
-    # io_uring feature-probe fallback across kernels (M0-S02). Fast.
+    # The io_uring suite on the features the runner's kernel offers, then
+    # forced onto the degraded fallback an older kernel takes (oneshot recv,
+    # no provided buffers). Fast.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -399,15 +505,15 @@ jobs:
           INF_URING_FORCE_DEGRADED: "1"
 
   website-gates:
-    # M2.5-S05 gates, moved into the PR lane (2026-08-08).
+    # Gates that need no toolchain, on the PR: every workflow's YAML, and
+    # the committed site against a fresh build. `pages.yml` checks the site
+    # on a push to main that matches its `paths:` filter (the site's sources
+    # and the workflow itself) or on a manual dispatch, never on a PR, so a
+    # site stale against its sources fails the deploy after the merge; here
+    # it fails the PR, where the fix is a one-line regeneration commit.
     #
-    # These checks previously ran ONLY in `pages.yml`, which triggers on
-    # push-to-main. A PR that regenerated docs/compat-matrix.md therefore
-    # passed review and merged green, and the drift only surfaced afterwards
-    # as a failed production deploy (PR #2 → website run #1). The same gates
-    # run here, on the PR, where the fix is a one-line regeneration commit.
-    #
-    # Cheap by construction: stdlib python3, no toolchain, no build.
+    # Cheap by construction: python3 and the runner image's PyYAML, no
+    # toolchain, no build.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -415,8 +521,7 @@ jobs:
 
       - name: workflow YAML lint
         # A syntactically invalid workflow is otherwise only discovered when
-        # its schedule fires (infinity-dst-nightly carried an unquoted colon
-        # in a step name for a full nightly cycle). Parse every workflow here.
+        # its schedule fires, so every workflow is parsed here.
         run: |
           python3 - <<'PY'
           import pathlib, sys, yaml

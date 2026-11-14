@@ -68,8 +68,8 @@ fn build_crashed_image(fs: &MemFs, seed: u64, ops: usize, ckpts: u32, tear: bool
     let config = cfg();
     let dirs = create_cell_dirs(fs, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     let mut rng = Rng(seed | 1);
     let mut model: Model = BTreeMap::new();
     let mut pending: Vec<inf_log::StagedAt> = Vec::new();
@@ -213,7 +213,15 @@ fn reference_replay(fs: &MemFs) -> StateDigest {
         let outcome = reader.apply_frames(|frame| {
             for record in frame.records() {
                 let (_, record) = record.expect("valid record in valid frame");
-                ks.apply_record(&record, now(), anchor(), &mut inf_store::NoSpill).expect("apply");
+                inf_store::drive_record(
+                    &mut ks,
+                    &record,
+                    now(),
+                    anchor(),
+                    &mut inf_store::NoSpill,
+                    u64::MAX,
+                )
+                .expect("apply");
             }
             Ok::<(), std::convert::Infallible>(())
         });
@@ -225,9 +233,11 @@ fn reference_replay(fs: &MemFs) -> StateDigest {
 }
 
 fn recover_digest(fs: &MemFs) -> (StateDigest, Lsn, inf_server::RecoverStats) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace();
     let (rotor, stats, _seed) =
-        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now()).expect("recover");
+        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now(), &census)
+            .expect("recover");
     let resume = Lsn::new(rotor.active_segment(), rotor.active_written());
     (ks.state_digest(now()), resume, stats)
 }

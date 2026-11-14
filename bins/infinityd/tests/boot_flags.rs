@@ -22,8 +22,11 @@
 //! the box down. The cases must exit at the parser, before any cell or
 //! mesh allocation, so the cap is invisible to a correct binary.
 #![cfg(target_os = "linux")]
+#[path = "support/node.rs"]
+mod node;
+
+use node::{NodeBinary, Ulimit};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// 4 GiB in KiB — `ulimit -v` units.
 const CHILD_AS_CAP_KIB: u64 = 4 * 1024 * 1024;
@@ -41,10 +44,9 @@ fn scratch(tag: &str) -> PathBuf {
 /// (exit code, stderr). A signal death reports `None`.
 fn boot(tag: &str, flags: &[&str]) -> (Option<i32>, String) {
     let dir = scratch(tag);
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(format!("ulimit -v {CHILD_AS_CAP_KIB} && exec \"$0\" \"$@\""))
-        .arg(env!("CARGO_BIN_EXE_infinityd"))
+    let out = NodeBinary::built()
+        .command()
+        .ulimit(Ulimit::AddressSpaceKib(CHILD_AS_CAP_KIB))
         .args(["--port", "0", "--device-probe", "off", "--data-dir"])
         .arg(&dir)
         .args(flags)
@@ -73,6 +75,12 @@ fn out_of_range_boot_flags_are_usage_errors_not_panics() {
             "--buf-size must be <= 2147483647",
         ),
         ("cells-over", &["--cells", "16385"], "--cells must be <= 16384"),
+        // The longest park a cell loop takes, 100 ms: one microsecond more is refused.
+        ("park-over", &["--park-us", "100001"], "--park-us must be <= 100000"),
+        // The staging buffer's domain: one MiB up to the frame decoder
+        // bound, read from its constant (64 MiB).
+        ("staging-zero", &["--log-staging-mib", "0"], "--log-staging-mib is 1..=64"),
+        ("staging-over", &["--log-staging-mib", "65"], "--log-staging-mib is 1..=64"),
         ("cache-over", &["--doc-path-cache-size", "4097"], "path cache capacity 4097 exceeds 4096"),
         (
             "cache-u32-max",
@@ -97,4 +105,12 @@ fn out_of_range_boot_flags_are_usage_errors_not_panics() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n---\n"));
+}
+
+/// The longest park a cell loop takes, 100 ms, passes the flag's check: the parser reads it
+/// and `--version`, after it, exits 0.
+#[test]
+fn the_longest_park_passes_the_flag() {
+    let (code, stderr) = boot("park-max", &["--park-us", "100000", "--version"]);
+    assert_eq!(code, Some(0), "--park-us 100000 is refused: {stderr}");
 }

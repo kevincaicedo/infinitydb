@@ -47,13 +47,25 @@ fn cell_count() -> inf_foundation::CellCount {
 }
 
 /// Eight cells' registries plus the control handle — the DDL fan's
-/// destination set, driven directly (S10 wires the wire-level verbs).
+/// destination set, driven directly (the wire-level verbs are not driven
+/// here). The
+/// control plane boots from a catalog naming `ledger`, so its counter is
+/// past `ledger`'s id as every `META` it writes must be.
 fn fleet() -> (Vec<Keyspace>, std::sync::Arc<ControlHandle>, inf_server::ControlInbox) {
-    let (control, inbox, _issuers) = ControlHandle::detached(cell_count(), 0);
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+    let seed = inf_store::NsCatalog {
+        next_id: ledger_spec().id.0 + 1,
+        entries: vec![ledger_spec()],
+        index: inf_store::IndexCatalog::default(),
+        dropped: Vec::new(),
+    };
+    let (control, inbox, _issuers) =
+        ControlHandle::detached_with_catalog(Some(&seed), cell_count(), 0)
+            .expect("the catalog boots");
     let mut cells = Vec::new();
     for _ in 0..CELLS {
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(ledger_spec()).expect("ns create");
+        ks.ns_create(ledger_spec(), &census).expect("ns create");
         cells.push(ks);
     }
     (cells, control, inbox)
@@ -154,6 +166,7 @@ fn drop_during_query_fails_the_binding_typed() {
 /// completion restores `ready`.
 #[test]
 fn declarations_survive_restart_through_the_meta_swap() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let dir =
         std::env::temp_dir().join(format!("inf-m45-s03-meta-{}-{}", std::process::id(), line!()));
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -171,22 +184,23 @@ fn declarations_survive_restart_through_the_meta_swap() {
     reg.set_catalog_state(dropping_id, IndexState::Dropping).expect("edge");
     // Persist exactly like the DDL program: export + counters, swap
     // through the (detached) control plane, epoch published.
-    let epoch = control.request_persist(origin.export_catalog(
+    control.request_persist(origin.export_catalog(
         control.next_ns_id(),
         control.next_index_id(),
         control.next_index_generation(),
     ));
     inbox.drain(&StdSegmentFs, &dir).expect("META swap");
-    assert!(control.persisted(epoch), "epoch published after the swap");
+    assert_eq!(control.persisted_epoch(), 1, "the swap answered: the word covers its request");
 
     // "Reboot": load the catalog, re-seed control plane + a fresh cell.
     let loaded = load_catalog(&dir).expect("readable").expect("present");
     let (control2, _inbox2, _issuers2) =
-        ControlHandle::detached_with_catalog(Some(&loaded), cell_count(), 0);
+        ControlHandle::detached_with_catalog(Some(&loaded), cell_count(), 0)
+            .expect("the catalog boots");
     assert!(control2.next_index_id() > dropping_id.0, "ids never regress");
     assert!(control2.next_index_generation() > dropping_generation, "generations never regress");
     let mut fresh = Keyspace::new(StoreConfig::default());
-    fresh.seed_catalog(&loaded).expect("seed");
+    fresh.seed_catalog(&loaded, &census).expect("seed");
     let reg = fresh.idx_registry();
     assert!(reg.get_by_id(dropping_id).is_none(), "dropping resumed its drop");
     let survivor = reg.get_by_id(ready_id).expect("declaration survives");

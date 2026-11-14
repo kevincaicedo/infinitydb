@@ -28,12 +28,13 @@
     )
 )]
 
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use inf_simd::crc32c;
 
-use crate::fs::{SegmentFile, SegmentFs, TierIoMode};
+use crate::fs::{BatchEnd, DirStream, NameBatch, OpenedDir, SegmentFile, SegmentFs, TierIoMode};
 use crate::record::NsId;
 use crate::tier::{
     FrameStaging, TIER_BATCH_FRAMES, TIER_FRAME_BYTES, TIER_FRAME_DATA, TierCorruption,
@@ -750,20 +751,40 @@ impl<File: SegmentFile> ExtentReader<File> {
     }
 }
 
-/// Lists extent ids present in `shard_dir/cold/` — **names only**, no
-/// content reads (the boot sweep's collection pass; ADR-0061 D6). A
-/// missing `cold/` directory is an empty list, not an error.
+/// Lists extent ids present in `shard_dir/cold/`, ascending — **names
+/// only**, no content reads (ADR-0061 D6's collection, for the tests, the
+/// crash matrix and the simulator's oracle). Every batch of the directory's
+/// listing is collected: a whole listing, so a call names `cold/`'s bound
+/// beside it. A missing `cold/` directory is an empty list, not an error.
 ///
 /// # Errors
 /// I/O failures from the directory listing itself.
 pub fn list_extent_ids<F: SegmentFs>(fs: &F, shard_dir: &Path) -> io::Result<Vec<ExtentId>> {
-    let cold_dir = shard_dir.join("cold");
-    let names = match fs.list_dir(&cold_dir) {
-        Ok(names) => names,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+    cold_ids(fs, shard_dir, parse_extent_file_name)
+}
+
+/// The ids `parse` reads from the names of `shard_dir/cold/`, every batch
+/// of its listing, ascending; a name that is not UTF-8 is foreign and
+/// parses as none. An absent directory lists none.
+fn cold_ids<F: SegmentFs>(
+    fs: &F,
+    shard_dir: &Path,
+    parse: fn(&str) -> Option<ExtentId>,
+) -> io::Result<Vec<ExtentId>> {
+    let OpenedDir::Open(mut stream) = fs.open_listing(&shard_dir.join("cold"))? else {
+        return Ok(Vec::new());
     };
-    let mut ids: Vec<ExtentId> = names.iter().filter_map(|n| parse_extent_file_name(n)).collect();
+    let mut batch = NameBatch::new();
+    let mut ids = Vec::new();
+    // Bound: the directory's names; each `More` batch holds one at least.
+    loop {
+        let end = stream.next_batch(&mut batch)?;
+        ids.extend(batch.iter().filter_map(OsStr::to_str).filter_map(parse));
+        match end {
+            BatchEnd::More => {}
+            BatchEnd::End => break,
+        }
+    }
     ids.sort_unstable();
     Ok(ids)
 }
@@ -831,9 +852,10 @@ pub fn unlink_extent_file<F: SegmentFs>(fs: &F, shard_dir: &Path, id: ExtentId) 
     }
 }
 
-/// Lists quarantined extent ids in `shard_dir/cold/` — names only, the
-/// [`list_extent_ids`] rule (ADR-0096 D3: the boot collection pass
-/// partitions the directory; both halves advance the id cursor).
+/// Lists quarantined extent ids in `shard_dir/cold/`, ascending — names
+/// only, the [`list_extent_ids`] rule (ADR-0096 D3: the boot collection
+/// partitions the directory; both halves advance the id cursor), a whole
+/// listing likewise.
 ///
 /// # Errors
 /// I/O failures from the directory listing itself.
@@ -841,16 +863,7 @@ pub fn list_quarantined_extent_ids<F: SegmentFs>(
     fs: &F,
     shard_dir: &Path,
 ) -> io::Result<Vec<ExtentId>> {
-    let cold_dir = shard_dir.join("cold");
-    let names = match fs.list_dir(&cold_dir) {
-        Ok(names) => names,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let mut ids: Vec<ExtentId> =
-        names.iter().filter_map(|n| parse_quarantined_file_name(n)).collect();
-    ids.sort_unstable();
-    Ok(ids)
+    cold_ids(fs, shard_dir, parse_quarantined_file_name)
 }
 
 /// Quarantines one boot-orphan extent file (ADR-0096 D2): an atomic
@@ -917,6 +930,7 @@ pub fn unlink_quarantined_file<F: SegmentFs>(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: a whole listing of a fixture directory")]
 mod tests {
     use super::*;
     use crate::fs::mem::MemFs;

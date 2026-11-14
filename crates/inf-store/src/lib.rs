@@ -51,7 +51,9 @@ pub use catalog::{CatalogError, IndexCatalog, NsCatalog};
 pub use demote::{DemoteStats, DemotionConfig, EvictionPressure, MUTABLE_PERMILLE_DEFAULT};
 pub use doc::DocDomain;
 #[cfg(feature = "doc")]
-pub use doc::{JsonLogDecision, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSetOutcome};
+pub use doc::{
+    JsonLogDecision, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSetOutcome, ReplyLimit,
+};
 pub use evict::{EvictStats, EvictionPolicy};
 pub use extents::{
     BLOB_MAX_BYTES_DEFAULT, BLOB_RECLAIM_PER_SLICE_DEFAULT, BLOB_THRESHOLD_DEFAULT, BlobConfig,
@@ -89,11 +91,12 @@ pub use inf_foundation::LogicalAddr;
 pub use inf_foundation::{KeyHashId, KeyHasher};
 pub use inf_log::{FsyncClass, NsId};
 pub use keyspace::{
-    DEFAULT_DBS, DISPLACE_REGISTER_CAP, EvictBudget, Keyspace, PressureConfig, ReplayError,
-    ReplayOutcome, StateDigest, TIERED_VA_LIMIT_DEFAULT, TieredCreateError, TieredUsage,
+    ConsumedRecord, DEFAULT_DBS, DISPLACE_REGISTER_CAP, EvictBudget, Keyspace, KeyspaceSeed,
+    PressureConfig, ReplayError, ReplayOutcome, Replayed, StateDigest, TIERED_VA_LIMIT_DEFAULT,
+    TieredCreateError, TieredUsage, drive_record,
 };
 pub use live_set::{FileLiveSet, LiveSet};
-pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, valid_ns_name};
+pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, ddl, valid_ns_name};
 pub use ordered::{
     AppendError, Fixed8, KeyScheme, ORDERED_KEY_MAX, OrderedCursor, OrderedMap, OrderedMapError,
     OrderedMapMemory, PkRef, VarKey,
@@ -114,11 +117,12 @@ pub use store::{
 pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
 pub use tiered::promote::PromotionCounters;
 pub use tiered::replay::{
-    BootHandedOver, Displaced, NoSpill, ReplayCounters, ReplayPhase, ReplayRefusal, ReplaySpill,
-    ReplayWork, SettleProgress, TierReplay,
+    BootHandedOver, DemoteProgress, Displaced, NoSpill, ReplayCounters, ReplayPhase, ReplayRefusal,
+    ReplaySpill, ReplayWork, SettleProgress, TierReplay,
 };
+pub use tiered::select::select_whole_records;
 pub use tiered::shadow::{
-    COLLISION_KEY_PREFIX, KeyWindow, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT,
+    COLLISION_KEY_PREFIX, KeyWindow, RebuildStep, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT,
     SHADOW_TICKETS_CAP, SettleError, SettleOutcome, SettleReason, SettleSlot, ShadowCounters,
     ShadowProbe, ShadowRead, ShadowRebuild, ShadowRebuildError, ShadowRefusal, ShadowTicket,
     ShadowVerdict,
@@ -126,12 +130,13 @@ pub use tiered::shadow::{
 #[cfg(feature = "collision-oracle")]
 pub use tiered::shadow::{forced_collision_pair, forced_collision_triple};
 pub use tiered::{
-    LengthBound, LengthRefusal, RELOC_ORIGIN_CAP, RecordParts, StageFailed, TieredLookup,
+    LengthBound, LengthRefusal, RELOC_ORIGIN_CAP, RecordParts, SealedFiles, TieredLookup,
     TieredTable,
 };
 pub use tiered_recover::{
-    RecoveredTier, TierRecoverStats, apply_blob_ref_section, apply_live_set_section,
-    apply_ref_section, recover_tiered_ns,
+    IdChunks, MapEnded, MapStep, MapWork, NsTierMap, RecoveredTier, TierRecoverStats,
+    apply_blob_ref_entries, apply_blob_ref_section, apply_live_set_entries, apply_live_set_section,
+    apply_ref_entries, apply_ref_section, recover_tiered_ns,
 };
 pub use wall::WallAnchor;
 pub use write_accounting::{

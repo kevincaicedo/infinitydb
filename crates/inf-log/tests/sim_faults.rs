@@ -13,6 +13,10 @@ use inf_log::{
     SegmentConfig, SegmentId, SegmentReader, SegmentRotor,
 };
 
+#[path = "common/rotor_geometry.rs"]
+mod rotor_geometry;
+use rotor_geometry::geometry;
+
 fn eio(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(libc::EIO)
 }
@@ -85,7 +89,8 @@ fn recovery_read_eio_is_typed_never_a_torn_tail() {
     let dir = PathBuf::from("log");
     disk.create_dir_all(&dir).expect("dir");
     let cfg = SegmentConfig { segment_bytes: 64 << 10, ..Default::default() };
-    let mut rotor = SegmentRotor::create_fresh(disk.clone(), dir.clone(), cfg).expect("fresh");
+    let mut rotor =
+        SegmentRotor::create_fresh(disk.clone(), dir.clone(), geometry(cfg)).expect("fresh");
     for n in 0..8u8 {
         let mut builder = FrameBuilder::new();
         builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: &[n; 300] });

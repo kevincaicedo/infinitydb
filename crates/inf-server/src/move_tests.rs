@@ -22,10 +22,10 @@ fn malformed_snapshot_never_reaches_destination() {
             rig.seed();
             let mut snapshots = 0;
             let reply = rig.run(command, |args, _| {
-                assert_ne!(args[0], b"SET", "H3 follow-up: malformed snapshot reached destination");
+                assert_ne!(args[0], b"SET", "a malformed snapshot reached the destination");
                 (args[0] == b"INF.PEEK").then(|| {
                     snapshots += 1;
-                    raw.to_vec()
+                    success(raw)
                 })
             });
             assert_eq!(snapshots, 1, "the snapshot must cross the controlled fabric leg");
@@ -44,7 +44,9 @@ fn snapshot_parser_rejects_bad_delimiters_and_trailing_bytes() {
         b"*2\r\n$1\r\nv\r\n:-1\r\n+OK\r\n",
         b"*-1\r\n+OK\r\n",
     ] {
-        assert!(parse_take_reply(raw).is_none(), "H3 follow-up: malformed snapshot accepted");
+        let reply = success(raw);
+        let view = reply.success().expect("a Success leg has a view");
+        assert!(parse_take_reply(view).is_none(), "a malformed snapshot was accepted");
     }
 }
 
@@ -52,8 +54,8 @@ fn snapshot_parser_rejects_bad_delimiters_and_trailing_bytes() {
 #[test]
 fn snapshot_length_overflow_is_rejected() {
     for len in [usize::MAX, usize::MAX - 1, usize::MAX - 20] {
-        let raw = format!("*2\r\n${len}\r\nx\r\n:-1\r\n");
-        assert!(parse_take_reply(raw.as_bytes()).is_none());
+        let reply = success(format!("*2\r\n${len}\r\nx\r\n:-1\r\n").as_bytes());
+        assert!(parse_take_reply(reply.success().expect("a Success leg has a view")).is_none());
     }
 }
 
@@ -114,7 +116,7 @@ fn rename_does_not_count_internal_reads() {
             let before = stats();
             let _ = rig.run(command, |_, _| None);
             let after = stats();
-            assert_eq!(after.keyspace_hits, before.keyspace_hits, "H3 follow-up: internal hits");
+            assert_eq!(after.keyspace_hits, before.keyspace_hits, "a move's reads counted hits");
             assert_eq!(after.keyspace_misses, before.keyspace_misses);
         }
     }
@@ -148,7 +150,7 @@ fn a_client_typed_internal_command_is_unknown_on_the_plane() {
     let rig = Rig::new(0);
     let shared = &rig.planes[0].shared;
     let argv: &[&[u8]] = &[b"INF.PUT", &rig.source, b"v", b"-1"];
-    let mut reply = Vec::new();
+    let mut reply = OpenReply::new(Vec::new());
     shared.execute_owned_into(
         ExecOrigin::Conn(0, 0),
         argv,
@@ -157,8 +159,9 @@ fn a_client_typed_internal_command_is_unknown_on_the_plane() {
         0,
         None,
         false,
-        &mut reply,
+        reply.reply(),
     );
+    let reply = reply.finish().into_bytes();
     assert!(reply.starts_with(b"-ERR unknown command 'INF.PUT'"), "{reply:?}");
     assert_eq!(rig.source(&[b"GET", &rig.source]), b"$-1\r\n", "nothing landed");
     assert_eq!(rig.local(0, argv), b"+OK\r\n", "the program leg runs");
@@ -185,7 +188,7 @@ fn an_unmarked_apply_carrying_an_internal_command_is_unknown() {
             program,
         };
         let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0u64);
+            (ReplyStream::new(Vec::new()), Vec::new(), Vec::new(), Vec::new(), 0u64);
         handle_fabric_op(
             shared,
             shared.now.get(),
@@ -198,8 +201,8 @@ fn an_unmarked_apply_carrying_an_internal_command_is_unknown() {
             &mut orphans,
         );
         let (_, _, reply) = staged.pop().expect("one staged reply");
-        let StagedReply::Bytes(start, end) = reply else { panic!("expected raw reply bytes") };
-        let bytes = scratch[start..end].to_vec();
+        let StagedReply::Bytes(start, end, _) = reply else { panic!("expected raw reply bytes") };
+        let bytes = scratch.as_bytes()[start..end].to_vec();
         replies.push(bytes);
     }
     assert!(replies[0].starts_with(b"-ERR unknown command 'INF.PUT'"), "{:?}", replies[0]);
@@ -224,7 +227,7 @@ fn an_apply_without_arguments_is_refused_not_a_panic() {
             program,
         };
         let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0u64);
+            (ReplyStream::new(Vec::new()), Vec::new(), Vec::new(), Vec::new(), 0u64);
         handle_fabric_op(
             shared,
             shared.now.get(),
@@ -239,6 +242,15 @@ fn an_apply_without_arguments_is_refused_not_a_panic() {
         let (_, _, reply) = staged.pop().expect("one staged reply");
         assert!(matches!(reply, StagedReply::Refused), "program={program}");
     }
+}
+
+/// A peer's hand-made reply for a leg, its outcome stated by the test.
+fn success(bytes: &[u8]) -> OwnedReply {
+    OwnedReply::received(bytes.to_vec(), ReplyOutcome::Success).expect("a non-empty reply")
+}
+
+fn failure(bytes: &[u8]) -> OwnedReply {
+    OwnedReply::received(bytes.to_vec(), ReplyOutcome::Error).expect("a non-empty reply")
 }
 
 /// The destination leg: `INF.PUT` for the renames, `SET` for COPY
@@ -260,16 +272,17 @@ impl Rig {
             .into_iter()
             .enumerate()
             .map(|(cell, fabric)| {
-                let (plane, _serve_mark) = ServerPlane::new(
+                let (plane, _serve_mark, _timer_set) = ServerPlane::new(
                     CellId(cell as u16),
                     2,
                     -1,
-                    Keyspace::new(StoreConfig::default()),
+                    KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
                     fabric,
                     Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
                     NoopObserver,
                     false,
-                );
+                )
+                .expect("the server's timer owners fit their cap");
                 plane
             })
             .collect();
@@ -285,6 +298,10 @@ impl Rig {
     }
 
     fn local(&self, owner: usize, argv: &[&[u8]]) -> Vec<u8> {
+        self.leg(owner, argv).into_bytes()
+    }
+
+    fn leg(&self, owner: usize, argv: &[&[u8]]) -> OwnedReply {
         run_local(&self.planes[owner].shared, ExecOrigin::Conn(0, 0), Protocol::Resp2, 0, 0, argv)
     }
 
@@ -299,7 +316,7 @@ impl Rig {
     fn run(
         &self,
         command: CommandId,
-        mut before: impl FnMut(&[&[u8]], &Self) -> Option<Vec<u8>>,
+        mut before: impl FnMut(&[&[u8]], &Self) -> Option<OwnedReply>,
     ) -> Vec<u8> {
         let verb: &[u8] = match command {
             CommandId::Rename => b"RENAME",
@@ -320,7 +337,7 @@ impl Rig {
         let mut cx = Context::from_waker(Waker::noop());
         for _ in 0..16 {
             if let Poll::Ready(reply) = future.as_mut().poll(&mut cx) {
-                return reply;
+                return reply.into_bytes();
             }
             for plane in &self.planes {
                 plane.shared.fabric.borrow_mut().flush();
@@ -340,16 +357,17 @@ impl Rig {
                 });
                 for (from, token, owned) in requests {
                     let args: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-                    let reply = before(&args, self).unwrap_or_else(|| self.local(owner, &args));
+                    let reply = before(&args, self).unwrap_or_else(|| self.leg(owner, &args));
                     let outcome = if args[0] == b"EXISTS" {
                         // The real plane emits typed counts for EXISTS (count_on).
-                        let count = std::str::from_utf8(&reply[1..reply.len() - 2])
+                        let bytes = reply.bytes();
+                        let count = std::str::from_utf8(&bytes[1..bytes.len() - 2])
                             .expect("integer reply")
                             .parse()
                             .expect("count");
                         OwnedOutcome::Int(count)
                     } else {
-                        OwnedOutcome::Bytes(reply)
+                        OwnedOutcome::Reply(reply)
                     };
                     assert!(
                         self.planes[usize::from(from.0)].shared.gate.complete(token.0, outcome)
@@ -373,7 +391,7 @@ fn destination_refusal_preserves_source() {
             let rig = Rig::new(0);
             rig.seed();
             let before = rig.source(&[b"INF.PEEK", &rig.source]);
-            let reply = rig.run(command, |args, _| is_put(args).then(|| error.to_vec()));
+            let reply = rig.run(command, |args, _| is_put(args).then(|| failure(error)));
             assert_eq!(reply, error);
             assert_eq!(
                 rig.source(&[b"INF.PEEK", &rig.source]),
@@ -425,7 +443,7 @@ fn cleanup_failure_keeps_destination_copy() {
     let rig = Rig::new(1);
     rig.seed();
     let reply = rig.run(CommandId::Rename, |args, _| {
-        (args[0] == b"INF.TAKE").then(|| b"-ERR cross-cell execution failed\r\n".to_vec())
+        (args[0] == b"INF.TAKE").then(|| failure(b"-ERR cross-cell execution failed\r\n"))
     });
     assert_eq!(reply, b"-ERR cross-cell execution failed\r\n");
     assert_eq!(
@@ -512,7 +530,7 @@ fn malformed_put_reply_never_authorizes_source_delete() {
     for response in [b"+OKAY\r\n".as_slice(), b":1\r\n", b"+OK\r\n+OK\r\n"] {
         let rig = Rig::new(0);
         rig.seed();
-        let reply = rig.run(CommandId::Rename, |args, _| (is_put(args)).then(|| response.to_vec()));
+        let reply = rig.run(CommandId::Rename, |args, _| (is_put(args)).then(|| success(response)));
         assert_eq!(reply, b"-ERR cross-cell program reply malformed\r\n");
         assert_eq!(rig.source(&[b"GET", &rig.source]), b"$7\r\npayroll\r\n");
     }

@@ -37,9 +37,9 @@ use inf_foundation::time::Nanos;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
-    CkptConfig, DocLineage, IdxSidecarMeta, Manifest, MutationEffect, NsId, RecordView,
-    SegmentConfig, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, segment_file_name,
-    write_manifest,
+    CkptConfig, DocLineage, IdxSidecarMeta, LogGeometry, Manifest, MutationEffect, NsId,
+    RecordView, SegmentConfig, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs,
+    segment_file_name, write_manifest,
 };
 use inf_server::{DurableConfig, open_cell_log};
 use inf_store::{
@@ -67,8 +67,11 @@ fn env_u64(name: &str, default: u64) -> u64 {
 fn cfg(data_dir: PathBuf) -> DurableConfig {
     DurableConfig {
         data_dir,
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 64 << 20, ..Default::default() },
+        geometry: LogGeometry::new(
+            StagingConfig::default(),
+            SegmentConfig { segment_bytes: 64 << 20, ..Default::default() },
+        )
+        .expect("the bench's log geometry"),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -80,17 +83,21 @@ fn cfg(data_dir: PathBuf) -> DurableConfig {
 }
 
 fn catalog() -> NsCatalog {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut template = Keyspace::new(StoreConfig::default());
     template
-        .ns_create(NsSpec {
-            id: NS,
-            name: b"docs".to_vec(),
-            mode: NsMode::Durable,
-            fsync: Some(FsyncClass::Always),
-            policy: None,
-            maxmemory: None,
-            tier: None,
-        })
+        .ns_create(
+            NsSpec {
+                id: NS,
+                name: b"docs".to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(FsyncClass::Always),
+                policy: None,
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("ns");
     for &(id, path, key_type) in INDEXES {
         template
@@ -135,8 +142,8 @@ fn build_shard(data_dir: &Path, docs: u64, sidecars: bool) -> u64 {
     let config = cfg(data_dir.to_path_buf());
     let dirs = create_cell_dirs(&fs, &shard).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(fs, dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(fs, dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     let mut parser = JsonParser::new();
     let pad = "x".repeat(PAD);
     ring.stage(&MutationEffect::CkptBegin { ckpt_id: 1 }).expect("stage");
@@ -242,8 +249,9 @@ fn build_shard(data_dir: &Path, docs: u64, sidecars: bool) -> u64 {
 }
 
 fn boot(data_dir: &Path) -> (Keyspace, f64) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.seed_catalog(&catalog()).expect("seed");
+    ks.seed_catalog(&catalog(), &census).expect("seed");
     let t = Instant::now();
     open_cell_log(
         StdSegmentFs,
@@ -252,6 +260,7 @@ fn boot(data_dir: &Path) -> (Keyspace, f64) {
         &cfg(data_dir.to_path_buf()),
         WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 },
         Nanos::from_millis(1),
+        &census,
     )
     .expect("boot");
     (ks, t.elapsed().as_secs_f64())

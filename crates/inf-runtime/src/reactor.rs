@@ -7,9 +7,12 @@
 //! ```text
 //!  9+1  SUBMIT+REAP   one driver entry per iteration: flush queued ops,
 //!                     harvest completions (Poll while spinning, Park idle)
-//!   1   dispatch      plane.on_completion per completion; timers fire
+//!   1   dispatch      plane.on_completion per completion, then due timers
+//!                     one notice at a time under the turn's allowance
 //!   2   FABRIC-IN     plane.fabric_in (bounded drain)
-//!  3+4  PARSE+EXECUTE plane.parse_execute under the foreground budget,
+//!  3+4  PARSE+EXECUTE plane.before_execute (the turn's cold delivery, before
+//!                     either executor pass), then
+//!                     plane.parse_execute under the foreground budget,
 //!                     then executor.run_ready for resumed futures
 //!                     (`remote_first_execute` prepends a bounded run_ready
 //!                     + FABRIC-OUT so resumed pumps' remote ops publish
@@ -27,17 +30,21 @@
 //! FABRIC-OUT) in microseconds — `loop_iter_p999_us` is the frozen tripwire.
 
 use std::io;
+use std::rc::Rc;
 use std::time::Duration;
 
 use inf_alloc::BufferPool;
 use inf_foundation::LogHistogram;
-use inf_foundation::bounded::ServeMark;
+use inf_foundation::bounded::{CapCensus, ServeMark};
 use inf_foundation::time::{Clock, Nanos};
 
+use crate::cold::{ColdDeliveryBudget, ColdPreparationBudget};
 use crate::driver::{BackendDriver, Completion, IoOp, Wait};
 use crate::executor::CellExecutor;
+use crate::limits::{PARK_CEILING_MAX, TIMER_DELIVERIES_PER_TURN};
 use crate::sched::{GroupClass, GroupScheduler};
-use crate::timer::TimerWheel;
+use crate::timer::{Consumed, TimerNotice, TimerOutcome, TimerSet, Timers};
+use turn::TurnLedger;
 
 /// Loop tuning. `Default` is the M0 reference shape.
 #[derive(Copy, Clone, Debug)]
@@ -47,8 +54,9 @@ pub struct LoopConfig {
     pub spin_iters: u32,
     /// Max resumed futures polled per iteration (EXECUTE slice bound).
     pub exec_budget: usize,
-    /// Park ceiling when no timer is armed; `None` parks indefinitely.
-    pub park_default: Option<Duration>,
+    /// The longest park: a park ends by the earliest armed timer or this ceiling, whichever
+    /// comes first, so every park carries a timeout.
+    pub park_default: ParkCeiling,
     /// M2.5-S21 A/B knob: run reply-woken futures and publish staged fabric
     /// ops (an extra FABRIC-OUT) *before* PARSE+EXECUTE, so a remote hop
     /// issued by a resumed pump overlaps this iteration's local work instead
@@ -62,9 +70,54 @@ impl Default for LoopConfig {
         LoopConfig {
             spin_iters: 64,
             exec_budget: 1024,
-            park_default: Some(Duration::from_millis(100)),
+            park_default: ParkCeiling::MAX,
             remote_first_execute: false,
         }
+    }
+}
+
+/// The longest park a cell loop takes (ADR-0003 A1.2.7): at most [`PARK_CEILING_MAX`], by its
+/// one constructor. A wake no doorbell rings — a waker used off its cell's thread — is drained by
+/// the `run_ready` of the iteration the park opens, so the ceiling bounds its latency.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ParkCeiling(Duration);
+
+/// A park ceiling above [`PARK_CEILING_MAX`] was asked for.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ParkCeilingTooLong {
+    /// The ceiling asked for.
+    pub asked: Duration,
+}
+
+impl core::fmt::Display for ParkCeilingTooLong {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "a park ceiling of {} µs is above the longest park a cell loop takes, {} µs",
+            self.asked.as_micros(),
+            PARK_CEILING_MAX.as_micros()
+        )
+    }
+}
+
+impl ParkCeiling {
+    /// [`PARK_CEILING_MAX`] itself.
+    pub const MAX: ParkCeiling = ParkCeiling(PARK_CEILING_MAX);
+
+    /// `ceiling`, or the refusal when it is above [`PARK_CEILING_MAX`].
+    ///
+    /// # Errors
+    /// [`ParkCeilingTooLong`] above the maximum.
+    pub const fn new(ceiling: Duration) -> Result<ParkCeiling, ParkCeilingTooLong> {
+        if ceiling.as_nanos() > PARK_CEILING_MAX.as_nanos() {
+            return Err(ParkCeilingTooLong { asked: ceiling });
+        }
+        Ok(ParkCeiling(ceiling))
+    }
+
+    /// The ceiling.
+    pub const fn get(self) -> Duration {
+        self.0
     }
 }
 
@@ -94,9 +147,14 @@ pub struct LoopCx<'a> {
     pub now: Nanos,
     pub pool: &'a mut BufferPool,
     pub executor: &'a mut CellExecutor,
-    pub timers: &'a mut TimerWheel,
+    /// The loop's timer set: steps reach it through [`Self::timers`], which
+    /// cannot deliver, so step 1 alone begins and consumes notices.
+    timers: &'a mut TimerSet,
     ops: &'a mut Vec<IoOp>,
-    sched: &'a mut GroupScheduler,
+    /// The loop's groups and its cold turn slot, behind the one borrow the
+    /// context holds for both: a turn is built at the iteration's first
+    /// lend, never by the context (ADR-0181 R2, R3).
+    turn: &'a mut TurnLedger,
     commands: u64,
     fabric_msgs: u64,
 }
@@ -109,13 +167,13 @@ impl LoopCx<'_> {
 
     /// Remaining budget for `class` this iteration.
     pub fn budget(&self, class: GroupClass) -> u32 {
-        self.sched.budget(class)
+        self.turn.sched.budget(class)
     }
 
     /// Charge `class` for work done; also feeds `cmds_per_iter` when the
     /// class is foreground.
     pub fn charge(&mut self, class: GroupClass, units: u32) {
-        self.sched.charge(class, units);
+        self.turn.sched.charge(class, units);
         if class == GroupClass::Foreground {
             self.commands += u64::from(units);
         }
@@ -125,7 +183,43 @@ impl LoopCx<'_> {
     pub fn note_fabric(&mut self, msgs: u64) {
         self.fabric_msgs += msgs;
     }
+
+    /// The loop's timer set at this turn's time: arm, cancel, close, read,
+    /// and the successor of the notice being answered (ADR-0154 D3).
+    pub fn timers(&mut self) -> Timers<'_> {
+        Timers::new(self.timers, self.now)
+    }
+
+    /// Lends the iteration's cold delivery allowance to the one call
+    /// `serve`, without clone or reset, then charges the Foreground group,
+    /// through the scheduler, the units that call spent (ADR-0181 R2). The
+    /// iteration's first lend of either allowance builds the turn; every
+    /// later lend shares what it left, at any step. The charge is never
+    /// [`Self::charge`], which counts commands.
+    pub fn with_cold_delivery_budget<R>(
+        &mut self,
+        serve: impl FnOnce(&mut ColdDeliveryBudget) -> R,
+    ) -> R {
+        self.turn.lend_delivery(serve)
+    }
+
+    /// The iteration's cold preparation allowance, beside the delivery one
+    /// and apart from it, built with it at the iteration's first lend of
+    /// either (ADR-0181 R3). Its work is MAINTAIN's, which the plane
+    /// charges, so this lend settles nothing.
+    pub fn cold_preparation_budget(&mut self) -> &mut ColdPreparationBudget {
+        self.turn.lend_preparation()
+    }
 }
+
+// What the loop stores into its context as each iteration begins: three `u64` (the time and the
+// two counters) and five borrows, 64 bytes on a 64-bit target. A ninth word is a store on every
+// iteration of every cell, and the edit that adds one fails here; the cold turn is not one of
+// them, since a lend builds it in the loop's own slot (ADR-0181 A1).
+const _: () = assert!(
+    size_of::<LoopCx<'static>>() == 3 * size_of::<u64>() + 5 * size_of::<&mut u8>(),
+    "the loop context is three u64 and five borrows"
+);
 
 impl core::fmt::Debug for LoopCx<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -139,12 +233,27 @@ impl core::fmt::Debug for LoopCx<'_> {
 pub trait CellPlane {
     /// Step 1: one reaped completion (accept/recv/send/close result).
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion);
-    /// A timer armed via `cx.timers` fired with `key`.
-    fn on_timer(&mut self, cx: &mut LoopCx<'_>, key: u64) {
-        let _ = (cx, key);
+    /// Step 1, after the completions: one due arm of the loop's timer set,
+    /// as its notice. The answer is `Complete`, or the successor
+    /// `cx.timers().successor` made for this notice; the loop consumes the
+    /// notice before it begins the next (ADR-0154 D2, D3).
+    fn on_timer<'n>(&mut self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> {
+        let _ = (cx, notice);
+        TimerOutcome::Complete
     }
     /// Step 2: drain inbound fabric rings (bounded).
     fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {
+        let _ = cx;
+    }
+    /// The head of steps 3+4, once an iteration, after FABRIC-IN and before
+    /// either executor pass polls (ADR-0181 R2): the plane serves its turn's
+    /// cold delivery through `cx.with_cold_delivery_budget`, so a task its
+    /// replies woke never runs ahead of the delivery the turn owes. It
+    /// parses no command, submits no I/O, starts no task and renews no
+    /// budget; the lend charges the delivery units its call spent to the
+    /// Foreground group as the call ends. A plane with no cold reads keeps
+    /// this no-op, and a plane with nothing ready lends nothing.
+    fn before_execute(&mut self, cx: &mut LoopCx<'_>) {
         let _ = cx;
     }
     /// Steps 3+4: parse frames and execute commands under
@@ -184,20 +293,23 @@ pub struct CellLoop<D: BackendDriver, C: Clock> {
     /// The cell's serve mark until the first iteration takes it: every step
     /// before that iteration is the cell's assembly (ADR-0163 D2's census).
     serve_mark: Option<ServeMark>,
+    /// The census the mark belongs to, kept after the mark is taken (or
+    /// dropped untaken) so the loop's `Drop` marks it `Stopping`.
+    census: Rc<CapCensus>,
     driver: D,
     clock: C,
     pool: BufferPool,
     executor: CellExecutor,
-    timers: TimerWheel,
-    sched: GroupScheduler,
+    /// The cell's fixed timer set, its owners reserved by the cell's hosts
+    /// before the loop exists; step 1 delivers its due arms.
+    timers: TimerSet,
+    /// The groups, the count of iterations begun and the cold turn slot.
+    turn: TurnLedger,
     config: LoopConfig,
     ops: Vec<IoOp>,
     completions: Vec<Completion>,
-    /// Due timer keys, collected then dispatched (reused across iterations).
-    due: Vec<u64>,
     iter_hist_us: LogHistogram,
     spin_left: u32,
-    iterations: u64,
     /// SQE-carrying enters only (ADR-0007) — the L3 ratio denominator.
     submits: u64,
     /// Every driver enter (incl. zero-SQE harvests) — `cqes_per_reap`.
@@ -212,31 +324,34 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     /// The loop of one cell. `serve_mark` is that cell's census mark, minted
     /// beside the census its containers register with: the loop takes it as
     /// its first iteration begins, so the census serves from then on.
+    /// `timers` is the cell's timer set, built on that census with every
+    /// owner the cell's hosts hold already reserved (ADR-0154 D1): the loop
+    /// alone delivers its arms.
     pub fn new(
         driver: D,
         clock: C,
         pool: BufferPool,
         config: LoopConfig,
         serve_mark: ServeMark,
+        timers: TimerSet,
     ) -> CellLoop<D, C> {
         CellLoop {
+            census: Rc::clone(serve_mark.census()),
             serve_mark: Some(serve_mark),
             driver,
             clock,
             pool,
             executor: CellExecutor::new(1024),
-            timers: TimerWheel::new(),
-            sched: GroupScheduler::m0_default(),
+            timers,
+            turn: TurnLedger::new(GroupScheduler::m0_default()),
             config,
             ops: Vec::with_capacity(256),
             completions: Vec::with_capacity(256),
-            due: Vec::new(),
             iter_hist_us: LogHistogram::new(),
             // The first iteration polls: the plane arms its accept in its
             // first PARSE, after the wait — a park there is a boot stall of
             // one `park_default` (batch 61, lane L11).
             spin_left: config.spin_iters.max(1),
-            iterations: 0,
             submits: 0,
             enters_total: 0,
             sqes_total: 0,
@@ -254,13 +369,8 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     pub fn run_iteration(&mut self, plane: &mut impl CellPlane) -> io::Result<IterStats> {
         self.take_serve_mark();
         // ---- steps 9 (prev iteration's ops) + 1 (reap): ONE driver entry.
-        // A queued task vetoes the park outright (F-L11-07; also what makes
-        // `spin_iters == 0` safe). `before_park` runs only when spin is
-        // exhausted: the plane publishes its parked flag and vetoes the
-        // park if a final doorbell check finds work (the lost-wakeup
-        // handshake, M0-R1).
-        let parked = self.spin_left == 0 && !self.executor.has_ready() && !plane.before_park();
-        let wait = if parked { Wait::Park { timeout: self.park_timeout() } } else { Wait::Poll };
+        let wait = self.idle_wait(plane);
+        let parked = matches!(wait, Wait::Park { .. });
         let submitted = self.ops.len() as u64;
         for op in self.ops.drain(..) {
             self.driver.push(op);
@@ -284,9 +394,11 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             self.cqes_total += reaped as u64;
         }
 
-        // Active time starts after the (possible) park.
+        // Active time starts after the (possible) park. The groups refill
+        // and the iteration count, the cold turn's epoch, advances; nothing
+        // of the turn is built here (ADR-0181 R2).
         let start = self.clock.now();
-        self.sched.refill();
+        self.turn.begin_iteration();
 
         let commands;
         let fabric_msgs;
@@ -298,7 +410,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
                 executor: &mut self.executor,
                 timers: &mut self.timers,
                 ops: &mut self.ops,
-                sched: &mut self.sched,
+                turn: &mut self.turn,
                 commands: 0,
                 fabric_msgs: 0,
             };
@@ -307,16 +419,18 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             for c in self.completions.drain(..) {
                 plane.on_completion(&mut cx, c);
             }
-            // Timers: collect-then-dispatch keeps `cx` exclusive.
-            let due = &mut self.due;
-            due.clear();
-            cx.timers.advance(start, |key| due.push(key));
-            for key in due.drain(..) {
-                plane.on_timer(&mut cx, key);
-            }
+            deliver_due(plane, &mut cx, start);
 
             // ---- step 2: FABRIC-IN.
             plane.fabric_in(&mut cx);
+
+            // ---- steps 3+4's head: the turn's cold delivery, before either
+            // executor pass; each delivery lend charges Foreground through
+            // the scheduler as it ends (a delivery is not a command:
+            // `cmds_per_iter` stays the plane's). Canary: delivery at
+            // `parse_execute`'s head, after the early executor pass.
+            #[cfg(not(inf_canary_cold_delivery_after_execute))]
+            plane.before_execute(&mut cx);
 
             // ---- steps 3+4: PARSE + EXECUTE (foreground budget).
             // Remote-first ordering (M2.5-S21 lever): futures woken by this
@@ -331,6 +445,8 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
                     plane.fabric_out(&mut cx);
                 }
             }
+            #[cfg(inf_canary_cold_delivery_after_execute)]
+            plane.before_execute(&mut cx);
             plane.parse_execute(&mut cx);
             polled = early_polled + cx.executor.run_ready(self.config.exec_budget);
 
@@ -368,11 +484,12 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
 
         let active = self.clock.now().saturating_sub(start);
         // The always-on tripwires (§16). `no-tripwires` exists ONLY for the
-        // M0-S19 A/B artifact proving they cost nothing — never ship it.
+        // M0-S19 A/B artifact proving they cost nothing — never ship it. The
+        // iteration count is not one of them: it is the cold turn's epoch,
+        // advanced as the iteration began, and the tripwires read it.
         #[cfg(not(feature = "no-tripwires"))]
         {
             self.iter_hist_us.record(active.as_micros());
-            self.iterations += 1;
             self.commands_total += commands;
             self.fabric_total += fabric_msgs;
         }
@@ -393,16 +510,51 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         }
     }
 
-    fn park_timeout(&self) -> Option<Duration> {
-        let to_next_timer = self
-            .timers
-            .next_deadline()
-            .map(|deadline| Duration::from_nanos(deadline.saturating_sub(self.clock.now()).0));
-        match (to_next_timer, self.config.park_default) {
-            (Some(t), Some(d)) => Some(t.min(d)),
-            (Some(t), None) => Some(t),
-            (None, d) => d,
+    /// The next driver entry's wait, step 10's idle decision. It polls
+    /// while spinning; with a queued task, which vetoes the park outright,
+    /// so a task woken after `run_ready` is never parked on, at every
+    /// `spin_iters`, 0 included; and with a timer due at one read of the
+    /// clock, beside the task (ADR-0154 D3: a due timer is ready work even
+    /// when the turn's allowance is spent). Then `before_park`: the plane
+    /// publishes its parked flag and vetoes the park if a final doorbell
+    /// check finds work, the lost-wakeup handshake. A park ends by the
+    /// earliest arm, from the same read, or `park_default`. The clock is
+    /// read only with a timer armed.
+    fn idle_wait(&mut self, plane: &mut impl CellPlane) -> Wait {
+        if self.spin_left > 0 || self.executor.has_ready() {
+            return Wait::Poll;
         }
+        let now = (self.timers.armed() > 0).then(|| self.clock.now());
+        let due = now.is_some_and(|now| self.timers.due(now));
+        // Canary: the decision ignores a due timer and parks on it.
+        #[cfg(inf_canary_timer_park_hides_due)]
+        let due = {
+            let _ = due;
+            false
+        };
+        if due || plane.before_park() {
+            return Wait::Poll;
+        }
+        let timeout = self.park_timeout(now);
+        // Canary: with no timer armed the park passes no timeout, so it waits without limit.
+        #[cfg(inf_canary_park_without_ceiling)]
+        if now.is_none() {
+            let _ = timeout;
+            return Wait::Park { timeout: None };
+        }
+        Wait::Park { timeout: Some(timeout) }
+    }
+
+    /// A park's timeout: until the earliest arm from `now`, the decision's
+    /// clock read (`None` with nothing armed), capped by `park_default`, the
+    /// loop's ceiling, which caps every park (ADR-0003 A1.2.7). Not due at
+    /// `now` means its deadline is past `now`, so the timer term is positive
+    /// and exact: the heap walks no tick boundaries.
+    fn park_timeout(&self, now: Option<Nanos>) -> Duration {
+        let ceiling = self.config.park_default.get();
+        now.zip(self.timers.next_deadline())
+            .map(|(now, deadline)| Duration::from_nanos(deadline.saturating_sub(now).0))
+            .map_or(ceiling, |to_next_timer| to_next_timer.min(ceiling))
     }
 
     /// Always-on lifetime iteration histogram (µs). The §6 gate subtracts
@@ -420,7 +572,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             self.submits,
             self.sqes_total,
             self.cqes_total,
-            self.iterations,
+            self.turn.iterations(),
             self.commands_total,
             self.fabric_total,
         ]
@@ -435,10 +587,18 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         [
             (tw::SQES_PER_SUBMIT, per(self.sqes_total, self.submits)),
             (tw::CQES_PER_REAP, per(self.cqes_total, self.enters_total)),
-            (tw::CMDS_PER_ITER, per(self.commands_total, self.iterations)),
-            (tw::FABRIC_MSGS_PER_BATCH, per(self.fabric_total, self.iterations)),
+            (tw::CMDS_PER_ITER, per(self.commands_total, self.turn.iterations())),
+            (tw::FABRIC_MSGS_PER_BATCH, per(self.fabric_total, self.turn.iterations())),
             (tw::LOOP_ITER_P999_US, self.iter_hist_us.percentile(99.9)),
         ]
+    }
+
+    /// The ops the plane pushed during the last iteration, not yet
+    /// submitted: the next iteration's first driver entry takes them whole,
+    /// so between two iterations they wait here and the driver's own queue
+    /// holds none of them. Population: this cell's loop.
+    pub fn next_submit_ops(&self) -> &[IoOp] {
+        &self.ops
     }
 
     pub fn driver(&self) -> &D {
@@ -452,6 +612,63 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     pub fn executor(&self) -> &CellExecutor {
         &self.executor
     }
+
+    /// Timers armed on this cell now: at most the set's positions.
+    pub fn armed_timers(&self) -> u32 {
+        self.timers.armed()
+    }
+
+    /// The iteration whose lend last built this loop's cold turn, counted
+    /// as [`Self::counters`] counts iterations, from 1; 0 while no lend has
+    /// built one. An iteration in which no step lends leaves it as it was.
+    pub fn cold_turn_built_at(&self) -> u64 {
+        self.turn.cold_built_at()
+    }
+}
+
+/// Step 1's timer allowance (ADR-0154 D3): the callbacks the turn may
+/// still begin, the lesser of `TIMER_DELIVERIES_PER_TURN` and the
+/// Maintenance group's budget when step 1 begins. The loop's alone:
+/// private and neither `Copy` nor `Clone`, so no plane step can read, keep
+/// or reset it, and a cancel, a reserve or a successor refills nothing.
+struct Allowance {
+    left: u32,
+}
+
+impl Allowance {
+    fn for_turn(maintenance_budget: u32) -> Allowance {
+        Allowance { left: TIMER_DELIVERIES_PER_TURN.min(maintenance_budget) }
+    }
+
+    /// Spends one unit for a callback about to begin; `false` once spent.
+    fn take(&mut self) -> bool {
+        let Some(left) = self.left.checked_sub(1) else { return false };
+        // Canary: a begun callback spends no unit.
+        #[cfg(not(inf_canary_timer_allowance_unspent))]
+        {
+            self.left = left;
+        }
+        #[cfg(inf_canary_timer_allowance_unspent)]
+        let _ = left;
+        true
+    }
+}
+
+/// Step 1's timers (ADR-0154 D3): the due arms in (deadline, position)
+/// order, one notice at a time — begun, answered by the plane, consumed
+/// before the next — each charged one Maintenance unit, while the turn's
+/// allowance lasts. `due` is the gate: one compare of the minimum, which is
+/// all an iteration with nothing due pays. A timer still due waits for the
+/// next turn's step 1, and the park decision polls on it meanwhile.
+fn deliver_due(plane: &mut impl CellPlane, cx: &mut LoopCx<'_>, now: Nanos) {
+    let mut allowance = Allowance::for_turn(cx.budget(GroupClass::Maintenance));
+    while cx.timers.due(now) && allowance.take() {
+        let Some(notice) = cx.timers.begin(now) else { break };
+        cx.charge(GroupClass::Maintenance, 1);
+        let outcome = plane.on_timer(cx, &notice);
+        let consumed = cx.timers.consume(&notice, outcome);
+        debug_assert_ne!(consumed, Consumed::Stale, "the loop consumes the notice it began");
+    }
 }
 
 impl<D: BackendDriver, C: Clock> core::fmt::Debug for CellLoop<D, C> {
@@ -459,9 +676,119 @@ impl<D: BackendDriver, C: Clock> core::fmt::Debug for CellLoop<D, C> {
         write!(
             f,
             "CellLoop {{ iterations: {}, live_tasks: {}, armed_timers: {} }}",
-            self.iterations,
+            self.turn.iterations(),
             self.executor.live_tasks(),
             self.timers.armed()
         )
+    }
+}
+
+impl<D: BackendDriver, C: Clock> Drop for CellLoop<D, C> {
+    /// The cell stops here: the census is marked `Stopping` before the
+    /// loop's fields (its executor, timers and driver) drop, so a container
+    /// they own drops as process teardown. The cell's plane marks it too,
+    /// in its own `Drop`, and the mark is idempotent, so whichever of the
+    /// two drops first marks and the order between them is no one's.
+    fn drop(&mut self) {
+        self.census.mark_stopping();
+    }
+}
+
+/// The loop's turn accounts (ADR-0181 R2 and R3, as A1.1 to A1.4 amend
+/// them), in a module of their own so that its privacy is the rule: the
+/// slot's budgets are reached only through [`TurnLedger::lend_delivery`],
+/// the call that settles what it lent, and [`TurnLedger::lend_preparation`],
+/// both by way of the slot's one accessor.
+mod turn {
+    use crate::cold::{ColdDeliveryBudget, ColdPreparationBudget, ColdTurn};
+    use crate::sched::{GroupClass, GroupScheduler};
+
+    /// The groups, the count of iterations begun, which is the cold turn's
+    /// epoch, and the cold turn slot with the iteration that built it.
+    pub(super) struct TurnLedger {
+        pub(super) sched: GroupScheduler,
+        /// Iterations begun: advanced once as each begins, by
+        /// [`Self::begin_iteration`] alone, with a wrapping add compared
+        /// for equality. A wrap, 2^64 iterations on (5,800 years at 10^8 a
+        /// second), lets one iteration spend what a turn that old left: at
+        /// most a turn's allowance, never more.
+        iterations: u64,
+        /// The slot: one turn, both budgets, built whole at an iteration's
+        /// first lend; between lends nobody reads or writes it.
+        cold: ColdTurn,
+        /// The iteration that built the slot. It starts at 0, which no
+        /// iteration bears (the first is 1), so no lend spends what the
+        /// construction put there.
+        cold_built_at: u64,
+    }
+
+    impl TurnLedger {
+        pub(super) fn new(sched: GroupScheduler) -> TurnLedger {
+            TurnLedger { sched, iterations: 0, cold: ColdTurn::begin(), cold_built_at: 0 }
+        }
+
+        /// An iteration begins: the groups refill and the epoch advances,
+        /// one add; nothing of the slot is read or written.
+        pub(super) fn begin_iteration(&mut self) {
+            self.sched.refill();
+            self.iterations = self.iterations.wrapping_add(1);
+            // Canary: the loop builds a turn as each iteration begins.
+            #[cfg(inf_canary_cold_turn_eager)]
+            let _ = self.cold_turn();
+        }
+
+        /// Iterations begun.
+        pub(super) fn iterations(&self) -> u64 {
+            self.iterations
+        }
+
+        /// The iteration that last built the slot; 0 before any.
+        pub(super) fn cold_built_at(&self) -> u64 {
+            self.cold_built_at
+        }
+
+        /// The slot's one accessor: the iteration's turn, built whole here
+        /// when another iteration built it, and lent as it stands when this
+        /// one did, a spent allowance included.
+        fn cold_turn(&mut self) -> &mut ColdTurn {
+            let stale = self.cold_built_at != self.iterations;
+            // Canary: every lend builds the turn.
+            #[cfg(inf_canary_cold_turn_per_lend)]
+            let stale = {
+                let _ = stale;
+                true
+            };
+            if stale {
+                self.cold = ColdTurn::begin();
+                self.cold_built_at = self.iterations;
+            }
+            &mut self.cold
+        }
+
+        /// The delivery lend: `serve` spends from the iteration's
+        /// allowance, and Foreground is charged the growth of the budget's
+        /// spent count across the call. The count is never reset, so the
+        /// turn's spent units stay whole and each is charged once.
+        pub(super) fn lend_delivery<R>(
+            &mut self,
+            serve: impl FnOnce(&mut ColdDeliveryBudget) -> R,
+        ) -> R {
+            let budget = self.cold_turn().delivery();
+            let spent_before = budget.spent();
+            let served = serve(budget);
+            // `serve` holds no path back to this ledger, so nothing rebuilt
+            // the turn, and a budget's spent count only grows.
+            let spent = self.cold.delivery().spent() - spent_before;
+            if spent > 0 {
+                self.sched.charge(GroupClass::Foreground, spent);
+            }
+            served
+        }
+
+        /// The preparation lend: the iteration's allowance, built with the
+        /// delivery one at the iteration's first lend of either.
+        pub(super) fn lend_preparation(&mut self) -> &mut ColdPreparationBudget {
+            self.cold_turn().preparation()
+        }
     }
 }

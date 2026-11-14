@@ -20,6 +20,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::tiered_recover::IdChunks;
+
 /// Default out-of-line threshold: exactly the u24 inline ceiling, so the
 /// default changes no existing value's path (ADR-0061 D1). Values at or
 /// above it must take the extent path.
@@ -181,6 +183,12 @@ pub struct ExtentRefs {
     /// `(extent id, value len)` — the len rides the whole queue for the
     /// D5 disk accounting.
     parked: Vec<(u64, u64)>,
+    /// The boot sweep seed's stamp cursor: the prefix of `parked` already
+    /// queued ([`stamp_parked`](Self::stamp_parked)). Nonzero only between
+    /// the seed's stamp steps, after replay ended, when nothing parks or
+    /// registers; every count reads `parked` past it, so a death is counted
+    /// once, parked or queued, at every step.
+    stamped: usize,
     /// Stamped candidates in hand-out order; `reclaim_work` pops at most
     /// `max` from the front under the plane's durable epoch.
     reclaimable: BTreeMap<ReclaimKey, Reclaimable>,
@@ -238,6 +246,7 @@ impl ExtentRefs {
         // re-registration or the boot sweep reclaims a live extent — the
         // same at-least-once physics that makes `replay_ref` idempotent
         // (D4 rule 3), applied to the reclaim queue.
+        debug_assert_eq!(self.stamped, 0, "no record registers inside the boot seed's stamp stage");
         self.parked.retain(|&(id, _)| id != extent_id);
         self.dequeue(extent_id);
         // Release-checked (F-L04-12): a candidate the plane holds is
@@ -302,6 +311,10 @@ impl ExtentRefs {
     /// at or before this epoch, so `epoch ≤ durable` implies the death
     /// is durable; ADR-0061 D5).
     pub fn stamp(&mut self, wal_epoch: u64) {
+        debug_assert_eq!(
+            self.stamped, 0,
+            "the boot seed's stamp stage ends before the cell serves"
+        );
         let parked = std::mem::take(&mut self.parked);
         for &(extent_id, len) in &parked {
             self.enqueue(extent_id, len, wal_epoch, ReclaimOrigin::Death);
@@ -328,19 +341,68 @@ impl ExtentRefs {
         }
     }
 
-    /// Seeds the boot sweep (ADR-0061 D6, disposal per ADR-0096): every
-    /// listed extent id not referenced by any live record is an orphan,
-    /// immediately *eligible* (stamp 0 — nothing durable names it, by
-    /// the replay that just completed) — typed `BootOrphan`, so the
-    /// plane quarantines rather than unlinks. A quarantined id still
-    /// unreferenced is the second verdict (`Quarantined` — the plane
-    /// unlinks its twin); a quarantined id the replayed map *does*
-    /// reference is returned for revival (the caller renames it back
-    /// and counts it — ADR-0096 D3). Advances the id cursor past
-    /// everything listed and stamps any parked replay deaths at 0 (they
-    /// were replayed *from* the log — durable by construction).
+    /// Seeds the boot sweep (ADR-0061 D6, disposal per ADR-0096), whole:
+    /// its three stages in order — the parked replay deaths stamped at 0
+    /// (they were replayed *from* the log — durable by construction), the
+    /// listed ids seeded, the quarantined ids seeded — each over its whole
+    /// list. Returns the quarantined ids the replayed map references, for
+    /// revival. The boot's recovery driver runs the same stages a batch a
+    /// step ([`stamp_parked`](Self::stamp_parked),
+    /// [`seed_listed`](Self::seed_listed),
+    /// [`seed_quarantined`](Self::seed_quarantined)), so the queue takes its
+    /// candidates in one order whatever the batches.
     pub fn sweep_seed(&mut self, listed: &[u64], quarantined: &[u64]) -> Vec<u64> {
-        self.stamp(0);
+        self.stamp_parked(usize::MAX);
+        self.seed_listed(listed);
+        let mut revive = IdChunks::new();
+        self.seed_quarantined(quarantined, &mut revive);
+        revive.to_vec()
+    }
+
+    /// The boot sweep seed's first stage, a batch (ADR-0061 D5, D6): stamps
+    /// at most `max` parked replay deaths at 0, in park order, from where
+    /// the last call stopped — this table's own cursor, so the list is never
+    /// shortened under a later call and each parked death is queued once —
+    /// and answers how many. Once every one is queued the list is cleared,
+    /// its capacity kept. Called after replay ends, before anything parks
+    /// again: the ticket rebuild's deaths park after the stage, and the next
+    /// `stage_wal` stamps them.
+    pub fn stamp_parked(&mut self, max: usize) -> usize {
+        let mut count = 0usize;
+        // Bound: `max` parked deaths, each two ordered-map inserts.
+        while count < max
+            && let Some(&(extent_id, len)) = self.parked.get(self.stamped)
+        {
+            self.enqueue(extent_id, len, 0, ReclaimOrigin::Death);
+            self.stamped += 1;
+            count += 1;
+        }
+        if self.stamped == self.parked.len() {
+            self.parked.clear();
+            self.stamped = 0;
+        }
+        count
+    }
+
+    /// Parked deaths the boot seed has not stamped yet.
+    #[must_use]
+    pub fn parked_unstamped(&self) -> usize {
+        self.unstamped().len()
+    }
+
+    /// The parked deaths past the boot seed's stamp cursor.
+    fn unstamped(&self) -> &[(u64, u64)] {
+        self.parked.get(self.stamped..).unwrap_or_default()
+    }
+
+    /// The boot sweep seed's second stage, over `listed` (a batch of the
+    /// boot listing, in its order): every listed extent id not referenced
+    /// by any live record is an orphan, immediately *eligible* (stamp 0 —
+    /// nothing durable names it, by the replay that just completed) — typed
+    /// `BootOrphan`, so the plane quarantines rather than unlinks. Advances
+    /// the id cursor past everything listed.
+    pub fn seed_listed(&mut self, listed: &[u64]) {
+        // Bound: one candidacy probe and at most one enqueue per listed id.
         for &extent_id in listed {
             self.note_observed_id(extent_id);
             if self.sweep_candidate(extent_id) {
@@ -350,7 +412,16 @@ impl ExtentRefs {
                 self.enqueue(extent_id, 0, 0, ReclaimOrigin::BootOrphan);
             }
         }
-        let mut revive = Vec::new();
+    }
+
+    /// The boot sweep seed's third stage, over `quarantined` (a batch of
+    /// the `.quarantine` listing, in its order): a quarantined id still
+    /// unreferenced is the second verdict (`Quarantined` — the plane
+    /// unlinks its twin); one the replayed map *does* reference is counted
+    /// and appended to `revive`, for the caller to rename back
+    /// (ADR-0096 D3). Advances the id cursor past everything listed.
+    pub fn seed_quarantined(&mut self, quarantined: &[u64], revive: &mut IdChunks) {
+        // Bound: one map probe and one candidacy probe per listed id.
         for &extent_id in quarantined {
             self.note_observed_id(extent_id);
             if self.extents.contains_key(&extent_id) {
@@ -360,7 +431,6 @@ impl ExtentRefs {
                 self.enqueue(extent_id, 0, 0, ReclaimOrigin::Quarantined);
             }
         }
-        revive
     }
 
     /// True when a listed id is neither referenced nor already queued —
@@ -503,14 +573,14 @@ impl ExtentRefs {
         stats.live = self.extents.len() as u64;
         stats.live_bytes = self.extents.values().map(|e| e.len).fold(0, u64::saturating_add);
         stats.reclaimable =
-            (self.parked.len() + self.reclaimable.len() + self.in_reclaim.len()) as u64;
+            (self.unstamped().len() + self.reclaimable.len() + self.in_reclaim.len()) as u64;
         // This accounting feeds admission: overflow must report a full
         // device, never wrap small and manufacture budget headroom.
         stats.disk_bytes = self
             .extents
             .values()
             .map(|e| e.len)
-            .chain(self.parked.iter().map(|&(_, len)| len))
+            .chain(self.unstamped().iter().map(|&(_, len)| len))
             .chain(self.reclaimable.values().map(|r| r.len))
             .chain(self.in_reclaim.iter().map(|&(_, len, _)| len))
             .map(extent_device_bytes)
@@ -645,6 +715,59 @@ mod tests {
         assert_eq!(x.stats().reclaimed, 1);
         assert_eq!(x.refcount(3), 1, "the revived extent's count is untouched");
         assert_eq!(x.allocate_id(), 10, "listed and quarantined names both advance the cursor");
+    }
+
+    /// The boot seed's stages a batch at a time (ADR-0174 A1.3): the queue
+    /// takes the whole seed's candidates in its order, the revive list is the
+    /// whole seed's, and between two batches a parked death counts once,
+    /// parked or queued, never in both.
+    #[test]
+    fn a_seed_stepped_a_batch_at_a_time_queues_what_the_whole_seed_queues() {
+        let build = || {
+            let mut x = ExtentRefs::new();
+            for addr in 0..40u64 {
+                x.register(addr, addr + 1, 64);
+            }
+            // Deaths park in the order replay meets them, not by id.
+            for addr in (0..30u64).rev() {
+                assert_eq!(x.note_death(addr), Some(addr + 1));
+            }
+            x
+        };
+        // Extents 1–30 died (queued at the stamp, so not candidates), 31–40
+        // are live, 41–60 are orphans; 35 and 36 revive, 70 and 71 do not.
+        let listed: Vec<u64> = (1..=60).collect();
+        let quarantined = [35u64, 36, 70, 71];
+        let mut whole = build();
+        let revive_whole = whole.sweep_seed(&listed, &quarantined);
+        let mut stepped = build();
+        assert_eq!(stepped.parked_unstamped(), 30);
+        let (reclaimable, disk_bytes) = (stepped.stats().reclaimable, stepped.stats().disk_bytes);
+        let mut batches = 0;
+        while stepped.parked_unstamped() > 0 {
+            let expect = stepped.parked_unstamped().min(7);
+            assert_eq!(stepped.stamp_parked(7), expect, "a batch stamps what it is given");
+            batches += 1;
+            let stats = stepped.stats();
+            assert_eq!(stats.reclaimable, reclaimable, "a death counts once, parked or queued");
+            assert_eq!(stats.disk_bytes, disk_bytes, "and its bytes once");
+        }
+        assert_eq!(batches, 5, "thirty deaths in batches of seven");
+        assert_eq!(stepped.stamp_parked(7), 0, "nothing left to stamp");
+        for batch in listed.chunks(9) {
+            stepped.seed_listed(batch);
+        }
+        let mut revive = IdChunks::new();
+        for batch in quarantined.chunks(1) {
+            stepped.seed_quarantined(batch, &mut revive);
+        }
+        assert_eq!(revive.to_vec(), revive_whole, "the revive list is the whole seed's");
+        assert_eq!(revive.to_vec(), vec![35, 36]);
+        let order = |x: &mut ExtentRefs| x.reclaim_work(0, usize::MAX);
+        let (stepped_order, whole_order) = (order(&mut stepped), order(&mut whole));
+        assert_eq!(stepped_order.len(), 30 + 20 + 2, "deaths, orphans and second verdicts");
+        assert_eq!(stepped_order, whole_order, "one hand-out order whatever the batches");
+        assert_eq!(stepped.allocate_id(), whole.allocate_id(), "one id cursor");
     }
 
     #[test]

@@ -5,10 +5,11 @@
 //! - **Estimator and scope:** `IterStats::parked` of one cell's reactor
 //!   iteration, kept by [`Node::iter_stats`]: the cell a [`Quiet`] node
 //!   watches, any cell of the node. It is the reactor's own decision (spin
-//!   exhausted, no ready task, no `before_park` veto), made before the
-//!   driver call, so it reads the state the iteration before it left. The
-//!   sim driver ignores the wait, so a park is this flag and never elapsed
-//!   virtual time.
+//!   exhausted, no ready task, no timer due at its clock read, no
+//!   `before_park` veto), made before the driver call, so it reads the
+//!   state the iteration before it left. The
+//!   sim driver keeps the wait it is handed and never blocks on it, so a
+//!   park is this flag and never elapsed virtual time.
 //! - **Resolution:** one reactor iteration. The harness runs each cell
 //!   once per scheduler step, and the publishing iteration is the step in
 //!   which the cell's board slot moved. A step that skips the watched cell
@@ -28,7 +29,10 @@ use inf_foundation::rng::SplitMix64;
 use inf_foundation::time::{Nanos, VirtualClock};
 use inf_server::{SimDisk, StallConfig};
 
-use super::{DurableScenario, MiniClient, Node, TraceObserver, boot, build_disk};
+use super::{
+    DurableScenario, HeldReads, MiniClient, Node, TraceObserver, boot, build_disk, is_tier_file,
+    steady_held_reads,
+};
 
 const SEED: u64 = 0xC0FFEE;
 
@@ -251,6 +255,7 @@ fn an_own_publication_with_a_waiter_does_not_park_before_its_wake() {
 /// `S` sweep phases, until one reaches that window. A sweep that watched
 /// another cell's slot (`inf_canary_ckpt_sweep_own_slot_zero`) parks at
 /// every topology here, as the guard without the term does.
+// nextest-long: 20 s
 #[test]
 fn an_own_publication_on_a_peer_cell_does_not_park_before_its_wake() {
     let mut parked = Vec::new();
@@ -397,4 +402,211 @@ fn a_peers_publication_does_not_hold_the_waiting_cell_awake() {
         client.recv(&mut quiet.node)
     });
     assert_eq!(reply.as_deref(), Some(b"+OK\r\n".as_slice()), "the WAIT answers");
+}
+
+/// The cold-read burst's readers: one `GET` a connection, since a
+/// connection's pipeline holds one cold read at a time. Four turns' worth
+/// of members, so three turns leave members to visit.
+const COLD_READERS: usize = 256;
+/// A cold key's value: small, so one 16 KiB device read covers about 37
+/// adjacent keys and the burst's requests merge.
+const COLD_VALUE_LEN: usize = 400;
+/// The `SET`s pipelined per round trip while the keys are written.
+const COLD_SET_BATCH: usize = 500;
+/// Keys written at most before the window must have given its oldest pages
+/// back: 16 MB, five times the namespace's 3 MiB budget.
+const COLD_KEYS_MAX: usize = 40_000;
+/// Steps the cell may take to park once the burst is answered.
+const COLD_PARK_STEPS_MAX: u32 = 256;
+/// Steps the quiet clause reads after the cell parks.
+const COLD_QUIET_STEPS: u32 = 16;
+
+fn cold_key(i: usize) -> Vec<u8> {
+    format!("c:{i:05}").into_bytes()
+}
+
+/// Key `i`'s value: its index spelled through it, so a value served from
+/// another key's range reads wrong.
+fn cold_value(i: usize) -> Vec<u8> {
+    format!("{i:05}-").into_bytes().repeat(COLD_VALUE_LEN / 6 + 1)[..COLD_VALUE_LEN].to_vec()
+}
+
+/// One field of an `INFO` section's text, as a number (0 when absent).
+fn info_number(info: &[u8], name: &str) -> u64 {
+    String::from_utf8_lossy(info)
+        .lines()
+        .find_map(|line| line.strip_prefix(name).and_then(|rest| rest.strip_prefix(':')))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+impl Quiet {
+    /// `argv` on `client`, stepped until its reply: the reply, or a panic
+    /// naming `what` when it stalls.
+    fn call(&mut self, client: &mut MiniClient, argv: &[&[u8]], what: &str) -> Vec<u8> {
+        let Quiet { node, rng, clock, disk, step_ns_max, .. } = self;
+        match client.call(node, rng, clock, disk, *step_ns_max, argv) {
+            Ok(Some(reply)) => reply,
+            other => panic!("{what} answered {other:?}"),
+        }
+    }
+
+    /// Pipelines `SET`s of keys `range` on `client`, then steps until each
+    /// answered `+OK`.
+    fn set_batch(&mut self, client: &mut MiniClient, range: std::ops::Range<usize>) {
+        let count = range.len();
+        for i in range {
+            client.send(&mut self.node, &[b"SET", &cold_key(i), &cold_value(i)]);
+        }
+        let mut answered = 0;
+        for _ in 0..STEPS_MAX {
+            self.step();
+            while let Some(reply) = client.recv(&mut self.node) {
+                assert_eq!(reply.as_slice(), b"+OK\r\n", "a SET of the cold keys");
+                answered += 1;
+            }
+            if answered == count {
+                return;
+            }
+        }
+        panic!("{answered} of {count} pipelined SETs answered in {STEPS_MAX} steps");
+    }
+}
+
+/// The park veto on the shipped plane (ADR-0181 R2): at `spin_iters: 0`, a
+/// cell whose turn left cold-read members to visit begins no iteration
+/// parked, and it parks once none waits. A 1-cell node makes a tiered
+/// namespace through the wire and writes past its memory budget until its
+/// window gives its oldest pages back, so the first keys are cold; then one
+/// `GET` of a cold key on each of 256 connections, while the device holds
+/// tier reads until every read the burst issues is queued; released at one
+/// driver entry, their receipts make more members ready than one turn's 64
+/// visits. The oracle reads the loop's flag
+/// against the host's pending members as the step before it left them; it
+/// shares no code with the veto's `holds_ready_work`, and the plant leaves
+/// the count alone. Planted (`inf_canary_cold_park_without_delivery`), the
+/// veto ignores ready delivery and an iteration begins parked with members
+/// pending; with the server's own veto deleted, the same. Its quiet clause
+/// (ADR-0181 A1.1): once the last member is visited no step lends, so the
+/// loop's cold turn stays the one the burst's last lend built while the
+/// iteration count grows; a turn built as each iteration begins, or a hook
+/// that lends with nothing ready, moves it.
+#[test]
+fn a_cell_with_cold_members_to_visit_begins_no_iteration_parked() {
+    let mut quiet = Quiet::boot(1, 0, 0);
+    let mut setup = MiniClient::connect(&mut quiet.node, 0);
+    let create: &[&[u8]] = &[
+        b"INF.NS",
+        b"CREATE",
+        b"cold",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+        b"MUTABLE-FRACTION",
+        b"100",
+        b"MAINTAIN-SLICE",
+        b"1mb",
+        b"TIER-IO-MODE",
+        b"buffered",
+    ];
+    assert_eq!(quiet.call(&mut setup, create, "the tiered CREATE"), b"+OK\r\n");
+    let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", b"cold"];
+    assert_eq!(quiet.call(&mut setup, use_ns, "USE"), b"+OK\r\n");
+    let mut written = 0;
+    loop {
+        assert!(written < COLD_KEYS_MAX, "{written} keys made no cold working set");
+        quiet.set_batch(&mut setup, written..written + COLD_SET_BATCH);
+        written += COLD_SET_BATCH;
+        let tiering = quiet.call(&mut setup, &[b"INFO", b"tiering"], "INFO tiering");
+        if info_number(&tiering, "tiering_flush_confirmed_bytes") > 3 << 20
+            && info_number(&tiering, "tiering_region_decommit_pages") > 0
+        {
+            break;
+        }
+    }
+    let mut readers: Vec<MiniClient> = (0..COLD_READERS)
+        .map(|_| {
+            let mut reader = MiniClient::connect(&mut quiet.node, 0);
+            assert_eq!(quiet.call(&mut reader, use_ns, "a reader's USE"), b"+OK\r\n");
+            reader
+        })
+        .collect();
+    // The device holds the burst's tier reads until every read the host
+    // issues is queued there, then lets them go at one driver entry: their
+    // receipts land at one iteration, more members ready than a turn visits.
+    quiet.disk.hold_reads(Some(is_tier_file));
+    for (i, reader) in readers.iter_mut().enumerate() {
+        reader.send(&mut quiet.node, &[b"GET", &cold_key(i)]);
+    }
+    // Every reader waits through the hold: its replies are read after it.
+    let held = steady_held_reads(u64::from(STEPS_MAX), || {
+        quiet.step();
+        Ok::<_, std::convert::Infallible>(HeldReads::Waiting(quiet.node.driver(0).held_reads()))
+    });
+    let Ok(held) = held;
+    assert!(held > 0, "VACUOUS: the burst issued no tier read");
+    quiet.disk.hold_reads(None);
+    let pending = |quiet: &Quiet| quiet.node.plane(0).cold_pending_for_sim();
+    let mut answered = 0;
+    let mut left_pending = 0u32;
+    let mut parked_with_pending = Vec::new();
+    let mut before = pending(&quiet);
+    for step in 0..STEPS_MAX {
+        let parked = quiet.step_watched();
+        if parked && before > 0 {
+            parked_with_pending.push((step, before));
+        }
+        before = pending(&quiet);
+        left_pending += u32::from(before > 0);
+        for (i, reader) in readers.iter_mut().enumerate() {
+            if let Some(reply) = reader.recv(&mut quiet.node) {
+                assert_eq!(reply, super::bulk(&cold_value(i)), "GET c:{i:05}");
+                answered += 1;
+            }
+        }
+        if answered == COLD_READERS && before == 0 {
+            break;
+        }
+    }
+    assert_eq!(answered, COLD_READERS, "the burst's GETs answered in {STEPS_MAX} steps");
+    assert!(
+        parked_with_pending.is_empty(),
+        "an iteration began parked while the step before it left cold-read members to visit, as \
+         (step, members pending): {parked_with_pending:?}"
+    );
+    assert!(left_pending > 0, "VACUOUS: no step left a cold-read member to visit");
+    let (built, iterations) = quiet.node.cold_turn_built_at(0);
+    assert!(built > 0, "VACUOUS: the burst's delivery built no cold turn");
+    let mut built_later = Vec::new();
+    let mut quiet_step = |quiet: &mut Quiet, step: u32| {
+        let parked = quiet.step_watched();
+        let (now, _) = quiet.node.cold_turn_built_at(0);
+        if now != built {
+            built_later.push((step, now));
+        }
+        parked
+    };
+    let parks_before = quiet.parks_read;
+    let mut steps = 0;
+    while steps < COLD_PARK_STEPS_MAX && !quiet_step(&mut quiet, steps) {
+        steps += 1;
+    }
+    assert!(
+        quiet.parks_read > parks_before,
+        "liveness: the cell owed nothing after the burst and read no park in \
+         {COLD_PARK_STEPS_MAX} steps"
+    );
+    for step in steps + 1..=steps + COLD_QUIET_STEPS {
+        quiet_step(&mut quiet, step);
+    }
+    let (_, iterations_after) = quiet.node.cold_turn_built_at(0);
+    assert!(iterations_after > iterations, "VACUOUS: the cell ran no iteration after the burst");
+    assert!(
+        built_later.is_empty(),
+        "a step built a cold turn after the burst's last member was visited, which iteration \
+         {built} built, as (step after it, iteration that built): {built_later:?}"
+    );
 }

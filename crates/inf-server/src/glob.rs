@@ -49,6 +49,7 @@ pub fn glob_match(pattern: &[u8], string: &[u8], nocase: bool) -> bool {
         star = Some((star_p, star_s + 1));
     }
     // String exhausted: only trailing stars may remain.
+    // reply-outcome-allow: a glob pattern's wildcard byte, not a reply
     while p < pattern.len() && pattern[p] == b'*' {
         p += 1;
     }
@@ -77,6 +78,7 @@ fn advance(pattern: &[u8], p: &mut usize, c: u8, nocase: bool) -> Advance {
     match pattern[*p] {
         b'*' => {
             // Collapse runs of stars.
+            // reply-outcome-allow: a glob pattern's wildcard byte, not a reply
             while *p < pattern.len() && pattern[*p] == b'*' {
                 *p += 1;
             }
@@ -146,6 +148,7 @@ fn class_match(pattern: &[u8], start: usize, c: u8, nocase: bool) -> (bool, usiz
             // NB: Redis's range branch does NOT exclude `]` as the range
             // end — `[a-]` is the (reversed) range `]`..`a`, and the class
             // then runs unterminated. Pinned by the unit tests below.
+            // reply-outcome-allow: a glob class's range byte, not a reply
             Some(&lo) if pattern.get(i + 1) == Some(&b'-') && i + 2 < pattern.len() => {
                 let hi = pattern[i + 2];
                 let (a, b) = if lo <= hi { (lo, hi) } else { (hi, lo) };

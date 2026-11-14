@@ -91,42 +91,94 @@ formats. The flag outlives every reader (`'static`). The test raises the
 signal at the test process once; the reset disposition then makes a
 second delivery default, which no test performs.
 
-## 2. Rc waker vtable (`executor.rs`)
+## 2. The waker vtable at a wake bridge (`executor.rs`, ADR-0003 A1)
 
-`RawWakerVTable` whose data pointer is `Rc<TaskHeader>` — refcounts are
-**non-atomic by design** (L1, ADR-0003; verified by
-`scripts/check-waker-atomics.sh` against release asm, in `just check` and
-Linux PR CI since ADR-0106 D8). The gate resolves the four wakers from the
-vtable static, scans each body from `.cfi_startproc` to `.cfi_endproc`, and
-follows direct calls transitively through every callee whose body is in the
-same asm (`Rc::drop_slow`, `VecDeque::grow` today); callees with no body in
-the asm — the allocator shim, `memcpy`/`memmove`, the cold panic/unwind
-edges — are listed on every run, not assumed clean.
+A standard `Waker` is `Send + Sync`, so the vtable's four functions must be
+sound on any thread. A waker's data pointer is its task's **wake header**,
+one allocation (`Box`, 72 bytes): the `inf_foundation::wake::WakeBridge`
+first (`repr(C)`), atomics only, then the owner part (the task's state and
+slot, the executor's shared state's `Rc`, the owner count `o` and the held
+list's links), cell-local `Cell`s. The executor's remote stack is an
+allocation of its own; its shared state (the ready queue, the held list's
+head) is one `Rc` that the executor and every open header hold.
 
-Before ADR-0106 D8 this sentence was not evidence: the gate ran in no
-recipe and no workflow, its `awk` reset at the `.Lfunc_beginN:` label that
-`line-tables-only` debuginfo puts on every body's first line (2 lines and
-**zero instructions** scanned per waker), and its mnemonic set was anchored
-at the line start, so an x86 `lock` prefix — its own tab-separated field —
-could not match. A `compare_exchange_weak` retry loop planted in
-`waker_wake_by_ref` compiled to `lock cmpxchgq` and the gate printed
-"zero atomic instructions".
+Invariants:
 
-This deliberately does not satisfy `Waker`'s documented thread-safety
-contract. Soundness rests on the **thread-locality invariant**: a waker
-clone must never leave the cell thread that created it. Enforcement:
+- **Only the owner thread reaches the owner part.** Each vtable function
+  first compares the bridge's mark with the calling thread's
+  (`owner_part`); a thread forms a reference to the bridge alone unless the
+  marks match. A mark is claimed once per executor-building thread and never
+  reused, 0 names a thread with none, and a closed header's mark is
+  `MARK_CLOSED`, which no thread holds. `CellExecutor` is `!Send` by its
+  `PhantomData<*const ()>` field (a `compile_fail` doctest), so the thread
+  that built it is the one that polls it.
+- **The foreign lane is `inf_foundation::wake`'s.** `executor::foreign`'s
+  five `#[inline(never)]` functions pass the bridge only its own remote stack
+  (`WakeBridge::stack`) and, as its push's node, the header's own address,
+  whose provenance reaches the whole header: the drain reads the owner part
+  through that link, which a pointer derived from a `&WakeBridge` could not
+  do under Stacked Borrows. The executor keeps its stack private: no safe
+  path outside `executor::foreign` hands a `RemoteStack` or a resolvable
+  bridge to the lane's entries.
+- **Decided after the future's drop.** A finished task's header is kept
+  spare, freed or made Held only after its future's drop, so every waker the
+  future owned is counted out first; an owner-lane drop frees only a Held
+  header (`settle_held`). A header is reused or freed while its executor
+  lives only by the owner thread, on `o + c = 0` with `Q` clear, which the
+  drain's clear or a waker's synchronizing move orders after every foreign
+  access.
+- **Nothing the executor's `&mut` covers.** A waker reaches its header, the
+  shared state through its header's `Rc` and the stack through the bridge;
+  the executor reads both through `&` and `Cell`s and never forms `&mut` to
+  a header or to the shared state, so `settle_held`, which unlinks a Held
+  header inside another task's poll, writes nothing of the executor. A
+  function that frees a header takes its raw pointer. A foreign `wake` or
+  `drop` keeps references past the access that may let another thread free
+  the header: it holds `&WakeBridge` and `&RemoteStack` (and
+  `WakeBridge::release_waker`'s `&self`) across its swap, or its push's
+  compare-and-swap, after which the drain or another thread's last drop may
+  free the header and the stack. Those references cover atomics only, as
+  `Arc::drop`'s `&AtomicUsize` does across its decrement, and after that
+  access the call neither reads through them nor copies one, not even into
+  an argument of a function that reads nothing, unless it answered
+  `Released::Last`, which makes it the one freer (ADR-0003 A1.2.5): a
+  reference to freed memory is undefined behavior once it is formed. The
+  rule is review-only, held by an oracle: safe Rust has no type that ends a
+  shared reference's use at an atomic access while its function still
+  holds it, and passing the header's raw address instead would put
+  `unsafe` in `inf-foundation`, which forbids it. Miri's default schedule
+  never preempts a call inside that window, so `tests/waker_race.rs` races
+  two foreign last drops of a closed header, and a foreign `wake` or `drop`
+  against the drain and the executor's drop, at a pinned preemption rate
+  over a pinned seed range (the CI's Miri job); a reference formed after
+  the access is red there.
+- **Close, then the last waker frees.** The executor's drop drains, drops
+  every future (deciding each header), frees its spare header open (kept
+  only while no waker names it and no push holds it, so freed as any quiet
+  header is, with no atomic), closes every header it still holds
+  (counted on the stack, the owner part dropped in place, `MARK_CLOSED`, `o`
+  folded into `c` with `X`), takes the stack a last time, leaving its head
+  closed, and releases its own count of the stack and its `Rc` of the
+  shared state. A closed header is freed by the read-modify-write that
+  leaves it at `c = 0` with `Q` clear, on whichever thread makes it, and the
+  stack by the release of the last count (`Arc`'s protocol). Nothing is kept
+  for the process.
+- **The owner lane runs no atomic read-modify-write or fence**
+  (`scripts/check-waker-atomics.sh` on the release asm, with its probe; its
+  boundary is `executor::foreign`'s five functions, its callee list
+  closed). An owner-lane clone at `LANE_COUNT_MAX` aborts before the count
+  is written, as `Rc` and `Arc` at their bounds.
 
-- Cell code cannot name `std::sync`/`tokio`/`async-std` (deny-list script +
-  clippy config, M0-S06) — there is no sanctioned way to move a waker to
-  another thread.
-- Futures executed by `CellExecutor` are `!Send` by construction and the
-  executor itself is never shared.
-- DST (M0-S20) replays interleavings single-threaded, where the invariant
-  is trivially true.
+Miri (strict provenance, its data-race detector, Stacked Borrows, the leak
+check) runs `tests/executor.rs`, `tests/waker_threads.rs` and
+`tests/waker_close.rs` on its default schedule, and `tests/waker_race.rs`
+on the pinned schedules above; Loom models the lane's protocol on
+`inf_foundation::wake`'s own types. Neither models the kernel, and none of
+this rests on one.
 
-Vtable accounting: `clone` increments, `wake`/`drop` decrement, and
-`wake_by_ref` borrows; `waker_ref` constructs a borrowed view in
-`ManuallyDrop` so the executor's own polls never touch the refcount.
+`waker_ref` builds a borrowed view in `ManuallyDrop`, so the executor's own
+polls take no count; the future pays an owner-lane count only if it clones
+the waker.
 
 ## 3. Type-erased task storage (`executor.rs`)
 

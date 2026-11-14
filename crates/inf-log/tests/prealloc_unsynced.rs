@@ -15,6 +15,10 @@ use inf_log::{
     SegmentConfig, SegmentId, SegmentRotor, scan_log_dir,
 };
 
+#[path = "common/rotor_geometry.rs"]
+mod rotor_geometry;
+use rotor_geometry::geometry;
+
 const SEGMENT_BYTES: u32 = 64 << 10;
 
 fn stamp(seq: u64) -> FrameStamp {
@@ -56,8 +60,8 @@ fn deferred_prealloc_reboots_short_and_reopens_as_the_empty_tail() {
     let disk = SimDisk::new();
     let dir = PathBuf::from("log");
     disk.create_dir_all(&dir).expect("dir");
-    let mut rotor =
-        SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), cfg()).expect("fresh");
+    let mut rotor = SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), geometry(cfg()))
+        .expect("fresh");
     frame(&mut rotor, &disk, 1);
     frame(&mut rotor, &disk, 2);
     let fd = rotor.active_raw_fd().expect("fd");
@@ -75,8 +79,9 @@ fn deferred_prealloc_reboots_short_and_reopens_as_the_empty_tail() {
 
     let scan = scan_log_dir(&disk, &dir).expect("scan");
     assert_eq!(scan.segments(), &[SegmentId(0), SegmentId(1)]);
-    let mut rotor = SegmentRotor::open_existing(disk.clone(), dir.clone(), cfg(), &scan, 0)
-        .expect("the short tail reopens");
+    let mut rotor =
+        SegmentRotor::open_existing(disk.clone(), dir.clone(), geometry(cfg()), &scan, 0)
+            .expect("the short tail reopens");
     assert_eq!(rotor.active_segment(), SegmentId(1));
     frame(&mut rotor, &disk, 3);
     let fd = rotor.active_raw_fd().expect("fd");

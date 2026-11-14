@@ -15,11 +15,10 @@
 //! fdatasync. A record never spans files; sealing cuts only at record
 //! boundaries (the flush pipeline's contract, [`crate::flush`]).
 //!
-//! Recovery reopens an unsealed file through
-//! [`TierWriter::open_existing`] with the **manifested** durable length
-//! as the sole authority (ADR-0056 D5): bytes beyond it are dead-life
-//! garbage, truncated before any new flush — never trusted, never
-//! "recovered". [`inspect_tier_bytes`] is the typed, iterative,
+//! Recovery reseals an unsealed file through [`TierReseal`] with the
+//! **manifested** durable length as the sole authority (ADR-0056 D5):
+//! bytes beyond it are dead-life garbage, truncated before any new flush —
+//! never trusted, never "recovered". [`inspect_tier_bytes`] is the typed, iterative,
 //! bounded decoder for untrusted disk bytes (`fuzz_tierfile_decode`
 //! drives it — L9). fsync failure anywhere on this path is
 //! fatal-by-default (§8.4; ADR-0056 D4) — surfaced typed via
@@ -38,6 +37,13 @@ use inf_simd::crc32c;
 
 use crate::fs::{SegmentFile, SegmentFs, TierIoMode};
 use crate::record::NsId;
+
+mod round;
+
+pub use round::{OpState, RoundEffect, RoundEffects, TierOpView, TierRound};
+pub(crate) use round::{
+    PlannedWrites, PooledWindow, Reservation, WindowKind, WindowNeeds, WindowPool,
+};
 
 /// On-disk frame size — one aligned read unit.
 pub const TIER_FRAME_BYTES: usize = 4096;
@@ -271,6 +277,11 @@ pub fn tier_extract(
 /// device's sequential ceiling).
 pub(crate) const TIER_BATCH_FRAMES: usize = 256; // 1 MiB per device write
 
+/// Record bytes one full batch window carries (`Q` = 256 frames of
+/// `TIER_FRAME_DATA`): a span of `A` record bytes takes at most `⌈A/Q⌉`
+/// batch windows, whatever the partial frame its file already holds.
+pub(crate) const TIER_BATCH_PAYLOAD_BYTES: u64 = (TIER_BATCH_FRAMES * TIER_FRAME_DATA) as u64;
+
 /// A 4 KiB-aligned staging window over a safe over-allocation (ADR-0054
 /// D2): `O_DIRECT` requires the *source buffer* aligned, and both modes
 /// share the one staged write path so alignment holds by construction,
@@ -279,14 +290,14 @@ pub(crate) const TIER_BATCH_FRAMES: usize = 256; // 1 MiB per device write
 /// (1 for header/footer blocks, [`TIER_BATCH_FRAMES`] for the append
 /// batch).
 pub(crate) struct FrameStaging {
-    raw: Box<[u8]>,
+    raw: Vec<u8>,
     at: usize,
     frames: usize,
 }
 
 impl FrameStaging {
     pub(crate) fn new(frames: usize) -> FrameStaging {
-        let raw = vec![0u8; TIER_FRAME_BYTES * (frames + 1)].into_boxed_slice();
+        let raw = vec![0u8; TIER_FRAME_BYTES * (frames + 1)];
         let at = raw.as_ptr().align_offset(TIER_FRAME_BYTES);
         assert!(at < TIER_FRAME_BYTES, "an aligned window fits the over-allocation");
         FrameStaging { raw, at, frames }
@@ -327,245 +338,23 @@ impl FrameStaging {
     }
 }
 
-/// One staged op of a reactor-drive flush round (M4.5-S31, ADR-0084):
-/// the plane converts writes to `IoOp::LogWrite` and barriers to
-/// `IoOp::Fdatasync`. `bytes` borrows the round's pool-owned window —
-/// heap-stable until the round finishes (the driver's `StableBytes`
-/// custody proof).
-pub struct TierOpView<'a> {
-    /// Backend fd the op targets.
-    pub fd: std::os::fd::RawFd,
-    /// `true` = fdatasync barrier (`bytes` is empty).
-    pub is_barrier: bool,
-    /// Absolute file offset of a write.
-    pub offset: u64,
-    /// The aligned window prefix to write (empty for barriers).
-    pub bytes: &'a [u8],
-}
-
-/// A deferred durability fact of one flush round (ADR-0084 D2) —
-/// applied in stage order at the round's last barrier completion,
-/// never at submission (the §3.1 chain). The store's
-/// `complete_flush_round` is the single applier.
-#[derive(Copy, Clone, Debug)]
-pub enum RoundEffect {
-    /// The active writer's `durable_len` advances to `data_len`.
-    DurableTo {
-        /// Data bytes the round's barrier covers.
-        data_len: u64,
-    },
-    /// The oldest pending seal commits to the catalog.
-    SealCommit,
-    /// `flushed` may cross the ADR-0052 D2 gap ending at `to` (the
-    /// covering seal's barrier is in the same round, earlier in order).
-    GapCross {
-        /// First address past the sealed-dead interval.
-        to: u64,
-    },
-}
-
-/// One staged write held by a round until its terminal completion.
-struct StagedWrite {
-    fd: std::os::fd::RawFd,
-    offset: u64,
-    window: PooledWindow,
-    frames: usize,
-}
-
-/// The staged I/O of one reactor-drive flush round (ADR-0084 D2/D3):
-/// windows move here from the writer at stage time and return to the
-/// pool at [`TierRound::recycle`]; ops are viewed by index so the plane
-/// can resubmit identical intents after a write-completion error (the
-/// M4-S21 retained-batch retry at the reactor tier). The reactor drive
-/// requires fd-backed files — fd-less filesystems (`MemFs`) stay on the
-/// seam drive by construction (`TierFlush::set_drive` is a plane call
-/// and the plane's filesystems all carry fds).
-pub struct TierRound {
-    writes: Vec<StagedWrite>,
-    barriers: Vec<std::os::fd::RawFd>,
-    effects: Vec<RoundEffect>,
-}
-
-impl TierRound {
-    pub(crate) fn new() -> TierRound {
-        TierRound { writes: Vec::new(), barriers: Vec::new(), effects: Vec::new() }
-    }
-
-    /// Ops staged for the driver (writes first, barriers after — the
-    /// plane submits barriers only once every write completed).
-    #[must_use]
-    pub fn op_count(&self) -> usize {
-        self.writes.len() + self.barriers.len()
-    }
-
-    /// Leading ops that are data writes (the wave-1 set).
-    #[must_use]
-    pub fn write_count(&self) -> usize {
-        self.writes.len()
-    }
-
-    /// Barrier ops in this round (wave 2) — nonzero exactly when the
-    /// round stages any durability fact.
-    #[must_use]
-    pub fn barrier_count(&self) -> usize {
-        self.barriers.len()
-    }
-
-    /// The op at `index` (stage order: writes, then barriers).
-    ///
-    /// # Panics
-    /// Panics past `op_count` — indices come from this round's tokens.
-    #[must_use]
-    pub fn op(&self, index: usize) -> TierOpView<'_> {
-        if let Some(w) = self.writes.get(index) {
-            return TierOpView {
-                fd: w.fd,
-                is_barrier: false,
-                offset: w.offset,
-                bytes: w.window.staging().filled(w.frames),
-            };
-        }
-        let fd = self.barriers[index - self.writes.len()];
-        TierOpView { fd, is_barrier: true, offset: 0, bytes: &[] }
-    }
-
-    pub(crate) fn push_write(
-        &mut self,
-        fd: std::os::fd::RawFd,
-        offset: u64,
-        window: PooledWindow,
-        frames: usize,
-    ) {
-        self.admit_op();
-        self.writes.push(StagedWrite { fd, offset, window, frames });
-    }
-
-    pub(crate) fn push_barrier(&mut self, fd: std::os::fd::RawFd) {
-        self.admit_op();
-        self.barriers.push(fd);
-    }
-
-    /// The ADR-0084 D3 staging bound: op indices are 8 token bits. A
-    /// validated slice (≤ 64 MiB, ring ≥ slice) stages ≤ ~75 ops; past
-    /// [`ROUND_OPS_MAX`] a completion would alias another op's.
-    fn admit_op(&self) {
-        assert!(
-            self.op_count() < ROUND_OPS_MAX,
-            "tier round exceeds its 8-bit op index (ADR-0084 D3)"
-        );
-    }
-
-    pub(crate) fn push_effect(&mut self, effect: RoundEffect) {
-        self.effects.push(effect);
-    }
-
-    /// Returns every window to the pool and yields the deferred effects
-    /// in stage order; the round is spent. Called at completion (every
-    /// op terminal) — never while the driver may still touch a window.
-    pub(crate) fn recycle(self, pool: &mut WindowPool) -> Vec<RoundEffect> {
-        for w in self.writes {
-            pool.put(w.window);
-        }
-        self.effects
-    }
-}
-
-/// Aligned-window pool for the reactor drive (L5: a named bounded term
-/// — at most [`WINDOWS_OUTSTANDING_CAP`] windows circulate per
-/// pipeline; one round in flight makes the working set
-/// `ceil(slice_bytes / 1 MiB)` batch windows + 3 single blocks).
-pub(crate) struct WindowPool {
-    batch: Vec<FrameStaging>,
-    single: Vec<FrameStaging>,
-    outstanding: u32,
-}
-
-/// A window the pool issued (F-L04-13): the only kind a round may carry,
-/// so every `recycle` returns exactly what `take` counted — the pool's
-/// count cannot go below its issued windows. Made by [`WindowPool::take`]
-/// alone.
-pub(crate) struct PooledWindow(FrameStaging);
-
-impl PooledWindow {
-    pub(crate) fn staging(&self) -> &FrameStaging {
-        &self.0
-    }
-
-    pub(crate) fn staging_mut(&mut self) -> &mut FrameStaging {
-        &mut self.0
-    }
-}
-
 /// The writer's append batch window, typed by the drive that staged into
 /// it: the seam path owns its window outright; the queued path stages
-/// into a pooled one that moves onto the round (F-L04-13 — a seam window
-/// can never be `put`). The drives never interleave (ADR-0084 D2): a
-/// retained seam window is dropped at the first queued frame and at a
-/// drive switch.
+/// into a pooled one whose token moves onto the round (a seam window can
+/// never be returned to the pool). The drives never
+/// interleave (ADR-0084 D2): a retained seam window is dropped at the
+/// first queued frame and at a drive switch.
 enum BatchWindow {
     Seam(FrameStaging),
     Pooled(PooledWindow),
 }
 
-impl BatchWindow {
-    fn staging(&self) -> &FrameStaging {
-        match self {
-            BatchWindow::Seam(w) => w,
-            BatchWindow::Pooled(w) => w.staging(),
-        }
-    }
-
-    fn staging_mut(&mut self) -> &mut FrameStaging {
-        match self {
-            BatchWindow::Seam(w) => w,
-            BatchWindow::Pooled(w) => w.staging_mut(),
-        }
-    }
-}
-
 /// Ops a round may stage (ADR-0084 D3): the plane packs the op index
 /// into 8 token bits (`slot = lane × 256 + op_index`), so a 257th op
-/// would share another op's completion token.
+/// would share another op's completion token. A plan stages at most
+/// `TIER_ROUND_WRITES_MAX + TIER_ROUND_BARRIERS_MAX` (the assertion in
+/// `crate::limits`).
 pub const ROUND_OPS_MAX: usize = 256;
-
-/// Backstop on circulating windows — a round staging more than this is
-/// a programmer error (the token op-index bound is [`ROUND_OPS_MAX`];
-/// see ADR-0084 D3).
-const WINDOWS_OUTSTANDING_CAP: u32 = 256;
-const _: () = assert!(
-    WINDOWS_OUTSTANDING_CAP as usize == ROUND_OPS_MAX,
-    "the window backstop is the round's op bound"
-);
-
-impl WindowPool {
-    pub(crate) fn new() -> WindowPool {
-        WindowPool { batch: Vec::new(), single: Vec::new(), outstanding: 0 }
-    }
-
-    fn take(&mut self, frames: usize) -> PooledWindow {
-        self.outstanding += 1;
-        assert!(self.outstanding <= WINDOWS_OUTSTANDING_CAP, "flush window pool overrun");
-        let free = if frames == TIER_BATCH_FRAMES { &mut self.batch } else { &mut self.single };
-        PooledWindow(free.pop().unwrap_or_else(|| FrameStaging::new(frames)))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn outstanding(&self) -> u32 {
-        self.outstanding
-    }
-
-    fn put(&mut self, window: PooledWindow) {
-        // Release-checked: a `u32` floor a debug assert alone left to wrap
-        // (F-L04-13); the type makes it unreachable, the check names it.
-        self.outstanding = self.outstanding.checked_sub(1).expect("window returned twice");
-        let PooledWindow(window) = window;
-        if window.frames == TIER_BATCH_FRAMES {
-            self.batch.push(window);
-        } else {
-            self.single.push(window);
-        }
-    }
-}
 
 /// Tier-file writer over the injected fs seam (the `SyncIckWriter`
 /// pattern — blocking writes, driven from flush slices and tests, never
@@ -629,6 +418,151 @@ pub struct TierIdentity {
     pub ns: NsId,
     /// First logical address of the file's range.
     pub base: LogicalAddr,
+}
+
+/// An unsealed tier file's reseal in progress (ADR-0056 D5), cut into its
+/// three kinds of unit so a recovery step can stop between frames: its open
+/// ([`open`](Self::open): the open, the header read and check, the truncate
+/// to the manifested frames), its frame reads ([`verify`](Self::verify),
+/// each CRC-checked) and its seal ([`VerifiedTier::seal`]: the `Recovered`
+/// footer and one barrier). It holds the one handle recovery writes the file
+/// through from its open to its seal, the next frame to verify and the frame
+/// count; while a cell recovers, recovery is the file's only writer, so a
+/// frame verified before a stop is the same bytes after it. A cut anywhere
+/// before the seal's barrier leaves the file unsealed, and the next boot
+/// reseals it again.
+pub struct TierReseal<F: SegmentFs> {
+    file: F::File,
+    path: PathBuf,
+    durable_len: u64,
+    /// The retained frames, `ceil(durable_len / TIER_FRAME_DATA)`.
+    frames: u64,
+    /// The next frame to verify, `<= frames`.
+    next: u64,
+    /// The end of the retained frames: the truncation's length and the
+    /// footer's offset.
+    cut: u64,
+    staging: FrameStaging,
+}
+
+/// A reseal whose every retained frame verified: made only by the
+/// [`TierReseal::verify`] call that reads the last one, and consumed by its
+/// [`seal`](Self::seal), so a seal before every frame verified does not
+/// compile.
+pub struct VerifiedTier<F: SegmentFs> {
+    file: F::File,
+    path: PathBuf,
+    durable_len: u64,
+    /// The footer's offset: the end of the retained frames.
+    footer_at: u64,
+    staging: FrameStaging,
+}
+
+/// What a [`TierReseal::verify`] call left.
+pub enum Verify<F: SegmentFs> {
+    /// Frames remain to verify: the reseal at its next frame.
+    More(TierReseal<F>),
+    /// Every retained frame verified.
+    Verified(VerifiedTier<F>),
+}
+
+impl<F: SegmentFs> TierReseal<F> {
+    /// The reseal's open unit: opens the manifested file `id` in `mode`,
+    /// verifies its header against `expect` and truncates it to the
+    /// manifested frames.
+    ///
+    /// # Errors
+    /// I/O failures from the fs seam; `InvalidData` when the header does
+    /// not verify or match `expect`.
+    pub fn open(
+        fs: &F,
+        shard_dir: &Path,
+        id: u32,
+        expect: TierIdentity,
+        durable_len: u64,
+        mode: TierIoMode,
+    ) -> io::Result<TierReseal<F>> {
+        let path = shard_dir.join("cold").join(tier_file_name(id));
+        let mut file = fs.open_tier(&path, mode)?;
+        let mut staging = FrameStaging::new(1);
+        read_block(&file, 0, staging.frame_mut())?;
+        let header = parse_tier_header(staging.frame_mut())
+            .map_err(|e| invalid(&path, format!("tier header: {e}")))?;
+        if header.identity != expect {
+            return Err(invalid(
+                &path,
+                format!(
+                    "tier identity mismatch: {:?} on disk, {expect:?} manifested",
+                    header.identity
+                ),
+            ));
+        }
+        let frames = durable_len.div_ceil(TIER_FRAME_DATA as u64);
+        let cut = TIER_HEADER_BYTES as u64 + frames * TIER_FRAME_BYTES as u64;
+        file.truncate(cut)?;
+        Ok(TierReseal { file, path, durable_len, frames, next: 0, cut, staging })
+    }
+
+    /// The retained frames not verified yet.
+    #[must_use]
+    pub fn frames_left(&self) -> u64 {
+        self.frames.saturating_sub(self.next)
+    }
+
+    /// The reseal's frame reads: CRC-checks the next retained frames, at
+    /// most `max` and at least one while any is left, each one block read
+    /// through the held handle, and answers what is left with the frames it
+    /// read. The call that reads the last frame answers `Verified`.
+    ///
+    /// # Errors
+    /// I/O failures; `InvalidData` when a frame at or below the manifested
+    /// watermark fails its CRC: served-data corruption, since the durable
+    /// copy is authoritative only when it verifies.
+    pub fn verify(mut self, max: u64) -> io::Result<(Verify<F>, u64)> {
+        let end = self.next.saturating_add(max.max(1)).min(self.frames);
+        let read = end.saturating_sub(self.next);
+        // Every retained frame must verify — the §3.1 durable copy is
+        // authoritative only when it does (bounded loop: `max` frames, one
+        // block read each).
+        for frame_index in self.next..end {
+            read_block(&self.file, tier_frame_offset(frame_index), self.staging.frame_mut())?;
+            let frame = self.staging.frame_mut();
+            let stored = u32::from_le_bytes(
+                frame[TIER_FRAME_DATA..TIER_FRAME_BYTES].try_into().expect("4 bytes"),
+            );
+            if crc32c(&frame[..TIER_FRAME_DATA]) != stored {
+                return Err(invalid(
+                    &self.path,
+                    format!("frame {frame_index} fails CRC below the manifested watermark"),
+                ));
+            }
+        }
+        self.next = end;
+        if self.next < self.frames {
+            return Ok((Verify::More(self), read));
+        }
+        let TierReseal { file, path, durable_len, cut, staging, .. } = self;
+        let verified = VerifiedTier { file, path, durable_len, footer_at: cut, staging };
+        Ok((Verify::Verified(verified), read))
+    }
+}
+
+impl<F: SegmentFs> VerifiedTier<F> {
+    /// The reseal's seal: the [`SealReason::Recovered`] footer at the
+    /// manifested length, then one fdatasync, which covers the
+    /// truncation, the footer and the final state — durable before any new
+    /// flush references the range. Answers the file's path.
+    ///
+    /// # Errors
+    /// I/O failures; an fsync-class failure is fatal to the cell, never
+    /// retried (ADR-0056 D4).
+    pub fn seal(mut self) -> io::Result<PathBuf> {
+        let footer = self.staging.frame_mut();
+        encode_tier_footer(footer, self.durable_len, SealReason::Recovered);
+        self.file.write_at(self.footer_at, footer)?;
+        self.file.sync_data()?;
+        Ok(self.path)
+    }
 }
 
 impl<F: SegmentFs> TierWriter<F> {
@@ -696,77 +630,19 @@ impl<F: SegmentFs> TierWriter<F> {
             device_bytes: TIER_HEADER_BYTES as u64,
         })
     }
-
-    /// Reactor-drive creation (M4.5-S31, ADR-0084 D2): the open and the
-    /// once-per-namespace directory creation stay blocking metadata (the
-    /// rotor-prealloc class); the header block and both dir-fsync
-    /// barriers ride the round instead of the seam — the plane's confirm
-    /// waits on them, so nothing durable ever names an un-durable file
-    /// (the segment-create rule, completion-gated).
-    ///
-    /// # Errors
-    /// I/O failures from the open/mkdir metadata calls (the only seam
-    /// I/O on this path).
-    ///
-    /// # Panics
-    /// Returns the writer and its header block; the caller stages the
-    /// block on its round **after** every step that can fail — nothing
-    /// here touches a round, so a refused creation leaves no staged op
-    /// behind (review 2026-08-30, F-L01-02). The caller owns the cold
-    /// directory's existence.
-    ///
-    /// # Panics
-    /// Panics on an fd-less file — the reactor drive is fd-backed by
-    /// construction (D1).
-    #[allow(clippy::too_many_arguments)] // creation names the full identity once
-    pub(crate) fn create_queued(
-        fs: &F,
-        shard_dir: &Path,
-        id: u32,
-        cell: u32,
-        ns: NsId,
-        base: LogicalAddr,
-        mode: TierIoMode,
-        capacity_hint: u64,
-        pool: &mut WindowPool,
-    ) -> io::Result<(TierWriter<F>, PooledWindow)> {
-        let path = shard_dir.join("cold").join(tier_file_name(id));
-        let file = fs.create_tier(&path, mode)?;
-        assert!(file.raw_fd().is_some(), "reactor drive requires fd-backed tier files (ADR-0084)");
-        let mut window = pool.take(1);
-        encode_tier_header(window.staging_mut().frame_mut(), cell, ns, base, capacity_hint);
-        let writer = TierWriter {
-            file,
-            path,
-            base,
-            mode,
-            data_len: 0,
-            tail: vec![0u8; TIER_FRAME_DATA].into_boxed_slice(),
-            tail_snapshot: Vec::with_capacity(TIER_FRAME_DATA),
-            tail_fill: 0,
-            durable_len: 0,
-            staging: FrameStaging::new(1),
-            batch: None,
-            batch_frames: 0,
-            batch_first_frame: 0,
-            // The header block is staged in this round (counted now —
-            // its write either lands or the round retries it whole).
-            device_bytes: TIER_HEADER_BYTES as u64,
-        };
-        Ok((writer, window))
-    }
-
     /// Recovers an **unsealed** tier file to the manifested durable
     /// length and seals it there (ADR-0056 D5 — the recovery pre-flush
-    /// rule): verifies the header against `expect`, **truncates** to
-    /// exactly `header + ceil(durable_len / TIER_FRAME_DATA)` frames
-    /// (torn tails, un-manifested bytes, and stale footers beyond are
-    /// dead-life garbage — dropped, never trusted), CRC-verifies every
-    /// retained frame, writes a [`SealReason::Recovered`] footer at
-    /// `durable_len`, and fdatasyncs. The next flush starts a **new**
-    /// file at the adjacent base — recovery never resumes appends into
-    /// recovered frames, so no claimed byte is ever rewritten in place
-    /// (the torn-rewrite hazard v1 exists to remove).
+    /// rule), whole: the [`TierReseal`] units in their one order — the
+    /// open (the header verified against `expect`, the file **truncated**
+    /// to exactly `header + ceil(durable_len / TIER_FRAME_DATA)` frames:
+    /// torn tails, un-manifested bytes and stale footers beyond are
+    /// dead-life garbage, dropped, never trusted), every retained frame
+    /// CRC-verified, then the [`SealReason::Recovered`] footer at
+    /// `durable_len` and one fdatasync. The boot's recovery driver runs the
+    /// same units a step at a time. The next flush starts a **new** file at
+    /// the adjacent base — recovery never resumes appends into recovered
+    /// frames, so no claimed byte is ever rewritten in place (the
+    /// torn-rewrite hazard v1 exists to remove).
     ///
     /// # Errors
     /// I/O failures from the fs seam; `InvalidData` when the header does
@@ -782,46 +658,14 @@ impl<F: SegmentFs> TierWriter<F> {
         durable_len: u64,
         mode: TierIoMode,
     ) -> io::Result<PathBuf> {
-        let path = shard_dir.join("cold").join(tier_file_name(id));
-        let mut file = fs.open_tier(&path, mode)?;
-        let mut staging = FrameStaging::new(1);
-        read_block(&file, 0, staging.frame_mut())?;
-        let header = parse_tier_header(staging.frame_mut())
-            .map_err(|e| invalid(&path, format!("tier header: {e}")))?;
-        if header.identity != expect {
-            return Err(invalid(
-                &path,
-                format!(
-                    "tier identity mismatch: {:?} on disk, {expect:?} manifested",
-                    header.identity
-                ),
-            ));
-        }
-        let frames = durable_len.div_ceil(TIER_FRAME_DATA as u64);
-        let cut = TIER_HEADER_BYTES as u64 + frames * TIER_FRAME_BYTES as u64;
-        file.truncate(cut)?;
-        // Every retained frame must verify — the §3.1 durable copy is
-        // authoritative only when it does (bounded loop: `frames`).
-        for frame_index in 0..frames {
-            read_block(&file, tier_frame_offset(frame_index), staging.frame_mut())?;
-            let frame = staging.frame_mut();
-            let stored = u32::from_le_bytes(
-                frame[TIER_FRAME_DATA..TIER_FRAME_BYTES].try_into().expect("4 bytes"),
-            );
-            if crc32c(&frame[..TIER_FRAME_DATA]) != stored {
-                return Err(invalid(
-                    &path,
-                    format!("frame {frame_index} fails CRC below the manifested watermark"),
-                ));
+        let mut reseal = TierReseal::open(fs, shard_dir, id, expect, durable_len, mode)?;
+        // Bound: one call verifies every retained frame.
+        loop {
+            match reseal.verify(u64::MAX)?.0 {
+                Verify::More(rest) => reseal = rest,
+                Verify::Verified(verified) => return verified.seal(),
             }
         }
-        let footer = staging.frame_mut();
-        encode_tier_footer(footer, durable_len, SealReason::Recovered);
-        file.write_at(cut, footer)?;
-        // One barrier covers the truncation, the footer, and the final
-        // state — durable before any new flush references the range.
-        file.sync_data()?;
-        Ok(path)
     }
 
     /// First logical address of this file's range.
@@ -985,10 +829,17 @@ impl<F: SegmentFs> TierWriter<F> {
             "batched frames are consecutive"
         );
         let crc = crc32c(&self.tail);
-        let batch = self
-            .batch
-            .get_or_insert_with(|| BatchWindow::Seam(FrameStaging::new(TIER_BATCH_FRAMES)))
-            .staging_mut();
+        let batch = match &mut self.batch {
+            Some(BatchWindow::Seam(window)) => window,
+            // None, or a pooled token the drive rules leave empty here (a
+            // queued spill takes it at every sync and seal).
+            slot => {
+                debug_assert!(slot.is_none(), "a seam frame over a pooled batch window");
+                let window = slot.insert(BatchWindow::Seam(FrameStaging::new(TIER_BATCH_FRAMES)));
+                let BatchWindow::Seam(window) = window else { unreachable!("inserted above") };
+                window
+            }
+        };
         let slot = batch.slot_mut(self.batch_frames);
         slot[..TIER_FRAME_DATA].copy_from_slice(&self.tail);
         slot[TIER_FRAME_DATA..].copy_from_slice(&crc.to_le_bytes());
@@ -1013,12 +864,10 @@ impl<F: SegmentFs> TierWriter<F> {
         let count = self.batch_frames;
         // The borrow is split by hand: `filled` reads the batch window,
         // the write targets the file.
-        let bytes = self
-            .batch
-            .as_ref()
-            .expect("staged frames imply a batch window")
-            .staging()
-            .filled(count);
+        let Some(BatchWindow::Seam(window)) = &self.batch else {
+            panic!("staged seam frames imply a seam batch window");
+        };
+        let bytes = window.filled(count);
         let len = bytes.len() as u64;
         device_write(&mut self.file, offset, bytes)?;
         self.batch_frames = 0;
@@ -1132,15 +981,59 @@ impl<F: SegmentFs> TierWriter<F> {
     // ---- reactor-drive funnels (M4.5-S31, ADR-0084 D1/D2) ----
     //
     // Queued twins of the seam funnels above: no device I/O at stage
-    // time — frames land in pool windows that move onto the round as
-    // positional write intents, and every durability fact defers to a
-    // round effect. Infallible by construction (the seam error surface
-    // is a *completion* concern, handled by the plane per ADR-0084 D4).
+    // time — frames land in the pool windows the round's plan reserved,
+    // each write at the position the plan parsed, and every durability
+    // fact defers to a round effect. Infallible by construction (the seam
+    // error surface is a *completion* concern, handled by the plane per
+    // ADR-0084 D4).
 
     /// The backend fd, asserted present (D1: the reactor drive is
     /// fd-backed by construction; `MemFs` pipelines stay on the seam).
     pub(crate) fn queued_fd(&self) -> std::os::fd::RawFd {
         self.file.raw_fd().expect("reactor drive requires fd-backed tier files (ADR-0084)")
+    }
+
+    /// A writer over a file the round's plan created (creating it was that
+    /// plan's fallible step): its header block is staged as the round's
+    /// write at position 0, from a reserved single window.
+    ///
+    /// # Panics
+    /// Panics on an fd-less file — the reactor drive is fd-backed by
+    /// construction (D1).
+    #[allow(clippy::too_many_arguments)] // the identity is named once, at the file's start
+    pub(crate) fn open_queued(
+        file: F::File,
+        path: PathBuf,
+        base: LogicalAddr,
+        mode: TierIoMode,
+        identity: (u32, NsId, u64),
+        round: &mut TierRound,
+        pool: &mut WindowPool,
+        writes: &mut PlannedWrites,
+    ) -> TierWriter<F> {
+        let (cell, ns, capacity_hint) = identity;
+        let fd = file.raw_fd().expect("reactor drive requires fd-backed tier files (ADR-0084)");
+        let window = pool.take(WindowKind::Single);
+        encode_tier_header(pool.staging_mut(&window).frame_mut(), cell, ns, base, capacity_hint);
+        round.push_write(fd, writes.next(0), window, 1);
+        TierWriter {
+            file,
+            path,
+            base,
+            mode,
+            data_len: 0,
+            tail: vec![0u8; TIER_FRAME_DATA].into_boxed_slice(),
+            tail_snapshot: Vec::with_capacity(TIER_FRAME_DATA),
+            tail_fill: 0,
+            durable_len: 0,
+            staging: FrameStaging::new(1),
+            batch: None,
+            batch_frames: 0,
+            batch_first_frame: 0,
+            // The header block is staged in this round (counted now —
+            // its write either lands or the round retries it whole).
+            device_bytes: TIER_HEADER_BYTES as u64,
+        }
     }
 
     /// Queued twin of [`append`](Self::append). No rewind machinery: a
@@ -1157,6 +1050,7 @@ impl<F: SegmentFs> TierWriter<F> {
         bytes: &[u8],
         round: &mut TierRound,
         pool: &mut WindowPool,
+        writes: &mut PlannedWrites,
     ) {
         assert_eq!(
             addr.to_raw(),
@@ -1171,7 +1065,7 @@ impl<F: SegmentFs> TierWriter<F> {
             self.data_len += take as u64;
             bytes = &bytes[take..];
             if self.tail_fill == TIER_FRAME_DATA {
-                self.stage_full_frame_queued(round, pool);
+                self.stage_full_frame_queued(round, pool, writes);
                 self.tail.fill(0);
                 self.tail_fill = 0;
             }
@@ -1179,9 +1073,15 @@ impl<F: SegmentFs> TierWriter<F> {
     }
 
     /// Queued twin of [`stage_full_frame`](Self::stage_full_frame): the
-    /// batch window comes from the pool and spills onto the round when
-    /// full (one ≥ 1 MiB write intent — L3 unchanged).
-    fn stage_full_frame_queued(&mut self, round: &mut TierRound, pool: &mut WindowPool) {
+    /// batch window is the round plan's, taken at a batch's first frame, and
+    /// spills onto the round when full (one ≥ 1 MiB write intent — L3
+    /// unchanged).
+    fn stage_full_frame_queued(
+        &mut self,
+        round: &mut TierRound,
+        pool: &mut WindowPool,
+        writes: &mut PlannedWrites,
+    ) {
         debug_assert_eq!(self.tail_fill, TIER_FRAME_DATA, "staging a full frame");
         let frame_index = (self.data_len - 1) / TIER_FRAME_DATA as u64;
         if self.batch_frames == 0 {
@@ -1194,32 +1094,38 @@ impl<F: SegmentFs> TierWriter<F> {
         );
         let crc = crc32c(&self.tail);
         let batch = match &mut self.batch {
-            Some(b @ BatchWindow::Pooled(_)) => b,
+            Some(BatchWindow::Pooled(window)) => pool.staging_mut(window),
             // Seam frames under the reactor drive: staged where they are;
             // the spill refuses them (ADR-0084 D2).
-            Some(b @ BatchWindow::Seam(_)) if self.batch_frames > 0 => b,
+            Some(BatchWindow::Seam(window)) if self.batch_frames > 0 => window,
             // None, or a seam window retained empty after its flush.
-            slot => slot.insert(BatchWindow::Pooled(pool.take(TIER_BATCH_FRAMES))),
-        }
-        .staging_mut();
+            slot => {
+                let window = slot.insert(BatchWindow::Pooled(pool.take(WindowKind::Batch)));
+                let BatchWindow::Pooled(window) = window else {
+                    unreachable!("inserted pooled above")
+                };
+                pool.staging_mut(window)
+            }
+        };
         let slot = batch.slot_mut(self.batch_frames);
         slot[..TIER_FRAME_DATA].copy_from_slice(&self.tail);
         slot[TIER_FRAME_DATA..].copy_from_slice(&crc.to_le_bytes());
         self.batch_frames += 1;
         if self.batch_frames == TIER_BATCH_FRAMES {
-            self.spill_batch_queued(round);
+            self.spill_batch_queued(round, writes);
         }
     }
 
-    /// Moves the staged batch window onto the round as one write intent.
-    fn spill_batch_queued(&mut self, round: &mut TierRound) {
+    /// Moves the staged batch window onto the round as one write intent,
+    /// at the round plan's position for it.
+    fn spill_batch_queued(&mut self, round: &mut TierRound, writes: &mut PlannedWrites) {
         if self.batch_frames == 0 {
             return;
         }
         let Some(BatchWindow::Pooled(window)) = self.batch.take() else {
             panic!("staged frames imply a pooled batch window (ADR-0084 D2)");
         };
-        let offset = tier_frame_offset(self.batch_first_frame);
+        let offset = writes.next(tier_frame_offset(self.batch_first_frame));
         let len = (self.batch_frames * TIER_FRAME_BYTES) as u64;
         round.push_write(self.queued_fd(), offset, window, self.batch_frames);
         self.batch_frames = 0;
@@ -1228,13 +1134,19 @@ impl<F: SegmentFs> TierWriter<F> {
 
     /// Stages the partial tail frame as one single-block write intent
     /// (the queued twin of [`write_tail_frame`](Self::write_tail_frame)).
-    fn stage_tail_frame_queued(&mut self, round: &mut TierRound, pool: &mut WindowPool) {
+    fn stage_tail_frame_queued(
+        &mut self,
+        round: &mut TierRound,
+        pool: &mut WindowPool,
+        writes: &mut PlannedWrites,
+    ) {
         let frame_index = (self.data_len - 1) / TIER_FRAME_DATA as u64;
-        let mut window = pool.take(1);
-        let frame = window.staging_mut().frame_mut();
+        let window = pool.take(WindowKind::Single);
+        let frame = pool.staging_mut(&window).frame_mut();
         frame[..TIER_FRAME_DATA].copy_from_slice(&self.tail);
         frame[TIER_FRAME_DATA..].copy_from_slice(&crc32c(&self.tail).to_le_bytes());
-        round.push_write(self.queued_fd(), tier_frame_offset(frame_index), window, 1);
+        let offset = writes.next(tier_frame_offset(frame_index));
+        round.push_write(self.queued_fd(), offset, window, 1);
         self.device_bytes += TIER_FRAME_BYTES as u64;
     }
 
@@ -1242,10 +1154,15 @@ impl<F: SegmentFs> TierWriter<F> {
     /// the partial tail frame, one fdatasync barrier, and the
     /// [`RoundEffect::DurableTo`] fact the completion applies —
     /// `durable_len` moves **only** there (the §3.1 chain).
-    pub(crate) fn sync_queued(&mut self, round: &mut TierRound, pool: &mut WindowPool) {
-        self.spill_batch_queued(round);
+    pub(crate) fn sync_queued(
+        &mut self,
+        round: &mut TierRound,
+        pool: &mut WindowPool,
+        writes: &mut PlannedWrites,
+    ) {
+        self.spill_batch_queued(round, writes);
         if self.tail_fill > 0 {
-            self.stage_tail_frame_queued(round, pool);
+            self.stage_tail_frame_queued(round, pool, writes);
         }
         round.push_barrier(self.queued_fd());
         round.push_effect(RoundEffect::DurableTo { data_len: self.data_len });
@@ -1261,16 +1178,17 @@ impl<F: SegmentFs> TierWriter<F> {
         reason: SealReason,
         round: &mut TierRound,
         pool: &mut WindowPool,
+        writes: &mut PlannedWrites,
     ) -> QueuedSeal<F::File> {
-        self.spill_batch_queued(round);
+        self.spill_batch_queued(round, writes);
         if self.tail_fill > 0 {
-            self.stage_tail_frame_queued(round, pool);
+            self.stage_tail_frame_queued(round, pool, writes);
         }
         let frames = self.data_len.div_ceil(TIER_FRAME_DATA as u64);
         let footer_at = TIER_HEADER_BYTES as u64 + frames * TIER_FRAME_BYTES as u64;
-        let mut window = pool.take(1);
-        encode_tier_footer(window.staging_mut().frame_mut(), self.data_len, reason);
-        round.push_write(self.queued_fd(), footer_at, window, 1);
+        let window = pool.take(WindowKind::Single);
+        encode_tier_footer(pool.staging_mut(&window).frame_mut(), self.data_len, reason);
+        round.push_write(self.queued_fd(), writes.next(footer_at), window, 1);
         self.device_bytes += TIER_FOOTER_BYTES as u64;
         round.push_barrier(self.queued_fd());
         QueuedSeal {
@@ -1626,15 +1544,18 @@ mod tests {
         window
     }
 
-    /// Batch 14 of the 2026-08-30 review: ADR-0084 D3 names a "≤ 256
-    /// ops/round, asserted at staging" bound that was never written; the
-    /// plane packs the op index into 8 token bits, so a 257th op would
-    /// have shared another op's completion token silently.
+    /// The plane packs a round's op index into 8 token bits (ADR-0084 D3):
+    /// the round's holders are capped at the round plan's envelope, 70 writes and
+    /// 4 barriers, which the const assertion in `crate::limits` holds
+    /// under 256, so a fifth barrier is refused at its holder and never
+    /// shares another op's completion token.
     #[test]
-    #[should_panic(expected = "tier round exceeds its 8-bit op index")]
-    fn round_refuses_the_257th_op() {
-        let mut round = TierRound::new();
-        for _ in 0..=ROUND_OPS_MAX {
+    #[should_panic(expected = "a tier round barrier past the round plan's bound")]
+    fn a_round_refuses_a_barrier_past_its_cap() {
+        let (census, _serve_mark) =
+            inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+        let mut round = TierRound::new(&census).expect("the holders");
+        for _ in 0..=crate::limits::TIER_ROUND_BARRIERS_MAX {
             round.push_barrier(0);
         }
     }
@@ -1868,6 +1789,89 @@ mod tests {
             TIER_HEADER_BYTES + 2 * TIER_FRAME_BYTES + TIER_FOOTER_BYTES,
             "un-manifested frames are gone"
         );
+    }
+
+    /// The reseal's three kinds of unit (ADR-0056 D5, cut into steps): a
+    /// reseal verified one frame a call reads each retained frame once,
+    /// answers `Verified` only at the call that reads the last, and seals
+    /// the bytes the whole reseal seals; dropped before its seal, it leaves
+    /// the file unsealed, and a later reseal seals it.
+    #[test]
+    fn a_reseal_a_frame_at_a_time_seals_what_the_whole_reseal_seals() {
+        let base = LogicalAddr::ZERO;
+        let identity = TierIdentity { cell: 0, ns: NsId(17), base };
+        let manifested = 5 * TIER_FRAME_DATA as u64 - 7;
+        let unsealed = |fs: &MemFs| {
+            let mut writer = TierWriter::create(
+                fs,
+                Path::new("shard-0"),
+                11,
+                0,
+                NsId(17),
+                base,
+                TierIoMode::Buffered,
+            )
+            .expect("create");
+            writer.append(base, &vec![0x5A; manifested as usize + 500]).expect("append");
+            writer.sync().expect("sync");
+        };
+        let open = |fs: &MemFs| {
+            TierReseal::open(
+                fs,
+                Path::new("shard-0"),
+                11,
+                identity,
+                manifested,
+                TierIoMode::Buffered,
+            )
+            .expect("the reseal's open")
+        };
+        let whole = MemFs::new();
+        unsealed(&whole);
+        let path = TierWriter::<MemFs>::recover_seal_existing(
+            &whole,
+            Path::new("shard-0"),
+            11,
+            identity,
+            manifested,
+            TierIoMode::Buffered,
+        )
+        .expect("the whole reseal");
+        let stepped = MemFs::new();
+        unsealed(&stepped);
+        let mut reseal = open(&stepped);
+        let reads = stepped.reads();
+        let mut calls = 0;
+        let verified = loop {
+            assert_eq!(reseal.frames_left(), 5 - calls, "one frame a call");
+            calls += 1;
+            match reseal.verify(1).expect("a frame verifies") {
+                (Verify::More(rest), 1) => reseal = rest,
+                (Verify::Verified(verified), 1) => break verified,
+                (_, read) => panic!("a call read {read} frames"),
+            }
+        };
+        assert_eq!(calls, 5, "Verified at the call that reads the last frame");
+        assert_eq!(stepped.reads() - reads, 5, "each retained frame read once");
+        verified.seal().expect("the seal");
+        assert_eq!(stepped.contents(&path), whole.contents(&path), "the whole reseal's bytes");
+        let cut = MemFs::new();
+        unsealed(&cut);
+        let (verify, read) = open(&cut).verify(2).expect("two frames");
+        assert!(matches!(verify, Verify::More(_)) && read == 2, "frames remain");
+        drop(verify); // a cut before the seal
+        let (_, footer) = probe_tier_file(&cut, &path).expect("probe");
+        assert!(footer.is_none(), "the file is still unsealed");
+        TierWriter::<MemFs>::recover_seal_existing(
+            &cut,
+            Path::new("shard-0"),
+            11,
+            identity,
+            manifested,
+            TierIoMode::Buffered,
+        )
+        .expect("the next boot's reseal");
+        assert_eq!(cut.contents(&path), whole.contents(&path), "the next boot seals it");
     }
 
     /// Recovery refuses a wrong identity and a corrupt retained frame —

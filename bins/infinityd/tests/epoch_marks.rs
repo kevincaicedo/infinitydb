@@ -12,11 +12,19 @@
 //! extents. The cap's merge needs a wedged device and is the simulator's.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // harness process, not cell code
 
+// nextest-stall-default: 64 blob SETs and 64 inline overwrites on one cell
+// put a few KiB of record legs in a tiered window of at least its 3 MiB
+// MEM-BUDGET; no write parks (ADR-0053 D4), so the stall bound is never read.
+
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 const CELLS: u16 = 2;
@@ -27,16 +35,9 @@ const BLOB_LEN: usize = 5 << 10;
 const MARKS_HIGH_WATER_MAX: u32 = 6;
 
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Server {
@@ -50,7 +51,8 @@ impl Server {
             .expect("addr")
             .port()
             .to_string();
-        let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+        let child = NodeBinary::built()
+            .command()
             .args(["--port", &port, "--cells", &CELLS.to_string(), "--frames-in-flight", "1"])
             .args(["--accept-handoff", "on", "--device-probe", "off", "--data-dir"])
             .arg(dir)

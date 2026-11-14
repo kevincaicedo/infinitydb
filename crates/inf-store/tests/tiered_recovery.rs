@@ -58,10 +58,17 @@ impl Rig {
     }
 
     fn with_demote(demote: DemotionConfig) -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let fs = MemFs::new();
-        let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
-            .expect("ring");
-        let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
+        let table =
+            TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default(), &census)
+                .expect("ring");
+        let flush = TierFlush::new(
+            fs.clone(),
+            flush_config(NS, FILE_CAPACITY),
+            0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        );
         Rig { table, fs, flush, model: BTreeMap::new(), tail: Vec::new(), begun: false }
     }
 
@@ -367,6 +374,7 @@ fn unified_recovery_round_trips_all_classes() {
         demote,
         2048,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("tier recovery");
     assert_eq!(
@@ -557,9 +565,10 @@ fn walk_pin_clamps_release() {
 /// duplicates and absent removals never move a counter.
 #[test]
 fn ref_apply_idempotent_and_displace_exact() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let demote = DemotionConfig::for_budget(BUDGET, PAGE);
     let mut table =
-        TieredTable::new(space_config(demote, 1 << 20), demote, 64, KeyHasher::default())
+        TieredTable::new(space_config(demote, 1 << 20), demote, 64, KeyHasher::default(), &census)
             .expect("ring");
     // The manifested catalog the refs land in, seeded recovery-shaped.
     table.seed_recovered_files(
@@ -600,9 +609,10 @@ fn ref_apply_idempotent_and_displace_exact() {
 /// address must never remove it.
 #[test]
 fn displacement_never_removes_a_foreign_key_at_a_colliding_address() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let demote = DemotionConfig::for_budget(BUDGET, PAGE);
     let mut table =
-        TieredTable::new(space_config(demote, 1 << 20), demote, 64, KeyHasher::default())
+        TieredTable::new(space_config(demote, 1 << 20), demote, 64, KeyHasher::default(), &census)
             .expect("ring");
     table.seed_recovered_files(
         &[inf_log::TierFileMeta {
@@ -769,6 +779,7 @@ fn a_tail_of_three_windows_replays_into_the_recovered_table() {
         demote,
         2048,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("tier recovery");
     let mut ks = keyspace_with(NS, recovered.table);

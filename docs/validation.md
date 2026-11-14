@@ -32,10 +32,21 @@ Run from the Rust repository root:
 
 ```bash
 just check
-cargo deny check
+just deny
 just compat
 just sim-smoke
 ```
+
+`just check` runs each feature set's tests under cargo-nextest, one process
+a test, every binary even after a red, and their doctests under `cargo test
+--doc` (ADR-0200 D1). It needs nextest at the version `.config/nextest.toml`
+requires (`nextest-version`; `cargo install --locked cargo-nextest --version
+<that version>`, as CI installs it), and is red at its second line when
+nextest is missing or older (D5). Its isolation rules (groups of one thread,
+tests run alone) and its start order (a test of 15 s or more starts by its
+seconds, the longest first) live in that file, each paired with its marker in
+the test's source by `scripts/check-nextest-config.sh` (ADR-0207 D1-D3). The
+layer commands below keep `cargo test`.
 
 `just check`, workspace tests and `just compat` require Redis **8.0.5** on
 PATH or `INF_COMPAT_ORACLE_ADDR` pointing to that version. An absent,
@@ -49,13 +60,69 @@ images; see [CONTRIBUTING](../CONTRIBUTING.md). A local prerequisite failure
 is not a passing gate. Workloads and required sweep sizes remain those of the
 owning gate; a smoke run does not discharge a full campaign.
 
+`just check` and workspace tests also require `/dev/shm` on a tmpfs that
+takes `O_DIRECT`, which is Linux 6.6 or newer: the `timer_owners` test keeps
+its node's data directory there, where no other workload's device latency
+reaches the frames it counts. A missing `/dev/shm`, another filesystem or an
+older kernel fails the test as `MEDIUM`; there is no successful skip. The
+server itself runs on Linux 5.15 or newer.
+
+Every recipe builds in this checkout's own `target/` (ADR-0204 D1), which
+`scripts/target-root.sh` checks and the justfile exports as
+`CARGO_TARGET_DIR`. Cargo reads another checkout's outputs as fresh, and a
+target triple or a moved root leaves a path into `target/<profile>` naming an
+older build, so before any recipe runs the export refuses with exit 2 every
+setting that moves the build: a `CARGO_TARGET_DIR` naming another directory,
+`CARGO_BUILD_TARGET`, `CARGO_BUILD_BUILD_DIR`, `CARGO_BUILD_TARGET_DIR`, a
+cargo config's `build.target`, `build.target-dir`, `build-dir` or `include`,
+a link at `target`, and a checkout inside another's `target/`. It also refuses
+a root holding outputs no marker of this checkout names (cargo or an editor
+first, a copied or moved checkout, a root from before the rule), printing `cd
+<checkout> && ./scripts/target-root.sh --clean` and no path to remove; that
+command refuses a root holding a `.git` or another checkout's root, or one a
+live checkout's linked `target` shares, and otherwise cleans and marks it
+(ADR-0204 D2); the next run builds cold. The gates that keep a target beside
+the recipe's (the lint ratchet, the fuzz-target gate) keep `<name>-<key>`
+under that root, the key 16 hex digits of SHA-256 of the checkout's physical
+path. The fuzz gate's probe builds in a directory of its own each run, and the
+clock-ban, lint-scope and waker-atomics probes build through
+`target_root_cargo_fresh`, which refuses a directory an earlier run filled.
+The recipes that run what they build (`sim-smoke`, `sim-canaries`, the sweeps,
+`compat`, `client-smoke`), `inf-compare`'s checker and `inf-bench`'s default
+`--infinityd-bin` run the binaries this root built. Every line that names a
+cargo output setting is a row of `scripts/target-dirs.tsv` (ADR-0204 D4),
+which the gates' self-test checks against every file git lists, untracked
+ones included. A script run alone, outside a recipe, under a cargo config's
+`build-dir` puts its intermediate outputs there: only the export and
+`--clean` ask cargo for its build directory.
+
+The `dev` profile, and `test` with it, builds `inf-doc` at `opt-level` 1
+(the workspace `Cargo.toml`): its intern-table test walks a 65,535-key
+dictionary in about 10 s instead of 39 s unoptimized. One build serves
+`cargo build` and the tests, so a debug `infinityd` carries an optimized
+`inf-doc`. Debug assertions and overflow checks stay on, and `inf-doc`'s two
+`build_profile` tests are red in any build of the crate without them, a
+`--release` test build included. To step through `inf-doc` unoptimized,
+build with `--config 'profile.dev.package.inf-doc.opt-level=0'`: cargo then
+writes a second set of every unit above `inf-doc` beside the first. A
+changed profile key renames those units, so a root built before the change
+keeps the old ones, gigabytes that nothing reads, until
+`./scripts/target-root.sh --clean`; the next run builds cold.
+
 `cargo test -p crash-matrix` requires Python 3.11+ and runs every node row
 in `m2.toml`, `m4.toml` and `m45.toml` by exact package/target/function.
 Each invocation must pass one non-ignored test and emit its point/verdict
 receipt after the assertions. Missing, ignored or empty carriers and
 invented verdicts fail. Cargo resolves current test binaries offline;
 receipts live only in captured child output. Linux reactor rows are
-explicitly unsupported on other hosts and must pass on Linux CI.
+explicitly unsupported on other hosts and must pass on Linux CI. A
+carrier still running at `crash_matrix::NODE_CARRIER_LIMIT_SECONDS` is
+killed, and one that passes past its budget, half that limit, fails with
+its time; each carrier's time prints beside its verdict, and every carrier
+runs before the verdict, so a red one hides no later row. A carrier whose
+every seed runs a whole scenario caps its seeds (`crash_matrix::NodeSeeds`)
+from one seed's measured cost, at half the budget on the slowest core it
+was timed on, and says so when `CRASH_MATRIX_SEEDS` asks for more.
 
 Run the smallest relevant check while developing, then the required suite:
 
@@ -73,8 +140,8 @@ owning fuzz target. Their commands and prerequisites live in
 
 Full CI runs on every push to `main` and Mondays at 07:23 UTC, as well as
 the `ci-full` PR label, maintainer `/ci-full` comment and manual dispatch.
-It runs strict-provenance Miri on `inf-alloc` and `inf-fabric`, all 14
-existing fuzz smoke targets for 300 seconds each, and benchmark test/build
+It runs strict-provenance Miri on `inf-alloc` and `inf-fabric`, every fuzz
+target for 300 seconds, one job a target, and benchmark test/build
 sanity. Automatic runs use their event SHA and have separate concurrency
 groups. The PR lane retains its smaller Miri and RESP-fuzz canaries;
 the nightly fuzz campaign remains separate. Benchmark sanity on hosted
@@ -157,6 +224,22 @@ Before calling a small loss or gain:
    in the rest of the layout, and alternation cancels order effects and drift.
    Each variant's own code still sits at its own addresses, so its placement
    still differs; pair the timing with step 1's instruction count.
+
+A copy of the old code is other code. Placement does not move an
+instruction count, but the old implementation copied into the benchmark
+crate, or compiled in another crate or beside other code, compiles to
+other instructions: at one source such a copy has counted tens of
+instructions per operation more or fewer than the old build itself. So
+step 1 reads the old count from the old build: two builds of one benchmark
+source, one on each revision, each in its own clean checkout, with the
+benchmark's files and every input its copy compiles from checked identical
+before either builds. A copy in the new build serves step 2's timing only,
+and its offset from the old build at the same source is reported beside it.
+A benchmark binary is not the server binary either: it can be built with
+other features and beside other code, so before a count is read the
+functions it measures are compared, instruction for instruction, with the
+same functions in the server binary built at the same revision, and a count
+read on code that differs is not the server's.
 
 Record which of these the conclusion rests on. A cross-binary timing result
 is context, not the verdict.

@@ -87,6 +87,10 @@ const OUTCOME_INT: u8 = 2;
 const OUTCOME_NIL: u8 = 3;
 const OUTCOME_BOOL: u8 = 4;
 const OUTCOME_ERR: u8 = 5;
+// Tag 6 is reserved for ADR-0150's `StreamReady`.
+/// A leg's reply whose outcome is `Error` (ADR-0190 D3), encoded as
+/// [`OUTCOME_BYTES`] is: one `const` for the encoder and the decoder.
+const OUTCOME_ERROR_REPLY: u8 = 7;
 
 const EXPIRE_NONE: u8 = 0;
 const EXPIRE_AT: u8 = 1;
@@ -147,6 +151,9 @@ pub enum ErrCode {
     Overflow,
     /// Cell memory budget exhausted.
     OutOfMemory,
+    /// A leg answered zero bytes: refused once, by the origin, where it
+    /// builds the owned reply (ADR-0190 D3); every reply writes a frame.
+    EmptyReply,
     /// Forward-compatibility escape hatch: an unrecognized wire code.
     Unknown(u16),
 }
@@ -160,6 +167,7 @@ impl ErrCode {
             ErrCode::NotInt => 2,
             ErrCode::Overflow => 3,
             ErrCode::OutOfMemory => 4,
+            ErrCode::EmptyReply => 5,
             ErrCode::Unknown(raw) => raw,
         }
     }
@@ -172,6 +180,7 @@ impl ErrCode {
             2 => ErrCode::NotInt,
             3 => ErrCode::Overflow,
             4 => ErrCode::OutOfMemory,
+            5 => ErrCode::EmptyReply,
             _ => ErrCode::Unknown(raw),
         }
     }
@@ -182,8 +191,13 @@ impl ErrCode {
 pub enum Outcome<'a> {
     /// Success with no payload.
     Ok,
-    /// Success with a value (borrowed from the encoded frame on decode).
+    /// Success with a value (borrowed from the encoded frame on decode): a
+    /// reply whose outcome is `Success`.
     Bytes(&'a [u8]),
+    /// A reply whose outcome is `Error`, set from the reply's outcome where
+    /// the owner sends and read back into it where the origin decodes, never
+    /// from the bytes (ADR-0190 D3).
+    ErrorReply(&'a [u8]),
     /// Success with an integer.
     Int(i64),
     /// Key/value absent.
@@ -534,6 +548,10 @@ fn encode_outcome(outcome: &Outcome<'_>, out: &mut Vec<u8>) {
             out.push(OUTCOME_BYTES);
             encode_bytes(bytes, out);
         }
+        Outcome::ErrorReply(bytes) => {
+            out.push(OUTCOME_ERROR_REPLY);
+            encode_bytes(bytes, out);
+        }
         Outcome::Int(v) => {
             out.push(OUTCOME_INT);
             out.extend_from_slice(&v.to_le_bytes());
@@ -810,6 +828,7 @@ impl<'a> Reader<'a> {
         match self.u8()? {
             OUTCOME_OK => Ok(Outcome::Ok),
             OUTCOME_BYTES => Ok(Outcome::Bytes(self.bytes()?)),
+            OUTCOME_ERROR_REPLY => Ok(Outcome::ErrorReply(self.bytes()?)),
             OUTCOME_INT => Ok(Outcome::Int(self.i64_le()?)),
             OUTCOME_NIL => Ok(Outcome::Nil),
             OUTCOME_BOOL => match self.u8()? {
@@ -946,12 +965,15 @@ mod tests {
         for outcome in [
             Outcome::Ok,
             Outcome::Bytes(b"value"),
+            Outcome::ErrorReply(b"-ERR boom\r\n"),
+            Outcome::ErrorReply(b""),
             Outcome::Int(-42),
             Outcome::Int(i64::MIN),
             Outcome::Nil,
             Outcome::Bool(true),
             Outcome::Bool(false),
             Outcome::Err(ErrCode::WrongType),
+            Outcome::Err(ErrCode::EmptyReply),
             Outcome::Err(ErrCode::Unknown(999)),
         ] {
             round_trip(&Op::Reply { token: token(9, 1 << 40), outcome });
@@ -1360,6 +1382,7 @@ mod tests {
     enum OwnedOutcome {
         Ok,
         Bytes(Vec<u8>),
+        ErrorReply(Vec<u8>),
         Int(i64),
         Nil,
         Bool(bool),
@@ -1407,6 +1430,7 @@ mod tests {
                     outcome: match outcome {
                         OwnedOutcome::Ok => Outcome::Ok,
                         OwnedOutcome::Bytes(b) => Outcome::Bytes(b),
+                        OwnedOutcome::ErrorReply(b) => Outcome::ErrorReply(b),
                         OwnedOutcome::Int(v) => Outcome::Int(*v),
                         OwnedOutcome::Nil => Outcome::Nil,
                         OwnedOutcome::Bool(b) => Outcome::Bool(*b),
@@ -1470,6 +1494,7 @@ mod tests {
         prop_oneof![
             Just(OwnedOutcome::Ok),
             prop::collection::vec(any::<u8>(), 0..64).prop_map(OwnedOutcome::Bytes),
+            prop::collection::vec(any::<u8>(), 0..64).prop_map(OwnedOutcome::ErrorReply),
             any::<i64>().prop_map(OwnedOutcome::Int),
             Just(OwnedOutcome::Nil),
             any::<bool>().prop_map(OwnedOutcome::Bool),

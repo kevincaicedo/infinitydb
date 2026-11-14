@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! Boot replay's fault rows (ADR-0174 D1, D2, D3, D5) — carried at the
 //! node tier per `m4.toml`:
 //!
@@ -57,6 +61,7 @@ fn flush_config() -> TierFlushConfig {
         mode: TierIoMode::Buffered,
         file_capacity: 256 << 10,
         slice_bytes: PAGE,
+        record_len_max: 16 << 20,
     }
 }
 
@@ -86,11 +91,18 @@ fn maintain(table: &mut TieredTable, flush: &mut TierFlush<MemFs>) {
 /// The crashed life: a checkpoint of nothing, then two windows of tail
 /// records around one key, and that key's `DEL` last.
 fn crashed_life() -> (MemFs, Vec<u8>) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
     let mut table =
-        TieredTable::new(space_config(0), demote(), 4096, KeyHasher::default()).expect("ring");
-    let mut flush = TierFlush::new(fs.clone(), flush_config(), 0);
+        TieredTable::new(space_config(0), demote(), 4096, KeyHasher::default(), &census)
+            .expect("ring");
+    let mut flush = TierFlush::new(
+        fs.clone(),
+        flush_config(),
+        0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+    );
     let hasher = KeyHasher::default();
     let writer = SyncIckWriter::create_v2(
         fs.clone(),
@@ -158,7 +170,8 @@ impl Node {
     }
 
     fn apply(&mut self, record: &RecordView<'_>) -> Result<(), ReplayError> {
-        self.ks.apply_record(record, NOW, ANCHOR, &mut self.spill).map(|_| ())
+        inf_store::drive_record(&mut self.ks, record, NOW, ANCHOR, &mut self.spill, u64::MAX)
+            .map(|_| ())
     }
 }
 
@@ -174,6 +187,7 @@ fn boot(fs: &MemFs) -> Node {
         demote(),
         4096,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("tier recovery");
     let table = std::cell::RefCell::new(boot_seam::keyspace_with(NS, table));

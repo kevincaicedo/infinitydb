@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! M4-S12 recovery-unit crash rows (`m4.toml`, ADR-0057 D5/D6/D8): the
 //! windows between tier flush, MANIFEST v2 publication, and recovery.
 //! Each test injects its named failure, the process "dies" (state
@@ -54,6 +58,7 @@ fn flush_config() -> TierFlushConfig {
         // Small files so the windows span file boundaries.
         file_capacity: 24 << 10,
         slice_bytes: PAGE,
+        record_len_max: 16 << 20,
     }
 }
 
@@ -72,10 +77,16 @@ fn space_config(origin: u64) -> AddressSpaceConfig {
 }
 
 fn rig(fs: &MemFs) -> (TieredTable, TierFlush<MemFs>) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
-    let table =
-        TieredTable::new(space_config(0), demote(), 256, KeyHasher::default()).expect("ring");
-    let flush = TierFlush::new(fs.clone(), flush_config(), 0);
+    let table = TieredTable::new(space_config(0), demote(), 256, KeyHasher::default(), &census)
+        .expect("ring");
+    let flush = TierFlush::new(
+        fs.clone(),
+        flush_config(),
+        0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+    );
     (table, flush)
 }
 
@@ -186,6 +197,7 @@ fn manifest_v2_rename_fail_keeps_old_unit() {
         demote(),
         256,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery");
     assert_eq!(
@@ -268,6 +280,7 @@ fn manifest_v2_dir_fsync_crash_resolves_new_unit() {
         demote(),
         256,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery");
     assert_eq!(recovered.table.space().life_origin().to_raw(), new_flushed);
@@ -329,6 +342,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
         demote(),
         256,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery");
     assert!(
@@ -361,6 +375,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
         demote(),
         256,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery is idempotent");
     assert_eq!(again.stats.files_resealed, 0, "second boot takes the sealed fast path");
@@ -519,6 +534,7 @@ fn s15_covering_swap_abort_serves_from_prior_unit() {
         demote(),
         256,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery");
     for range in &tier.files {
@@ -586,6 +602,7 @@ fn s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims() {
         demote(),
         256,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery");
     assert!(recovered.stats.files_removed >= 1, "boot GC reclaimed the un-named file");

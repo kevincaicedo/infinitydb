@@ -54,8 +54,8 @@ struct HandLog {
 impl HandLog {
     fn new(fs: &MemFs) -> HandLog {
         let dirs = create_cell_dirs(fs, std::path::Path::new("data/shard-0")).expect("dirs");
-        let rotor =
-            SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg().segment).expect("rotor");
+        let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg().geometry)
+            .expect("rotor");
         drop(rotor);
         HandLog { fs: fs.clone(), log_dir: dirs.log }
     }
@@ -239,8 +239,9 @@ struct RotorLog {
 impl RotorLog {
     fn new(fs: &MemFs) -> RotorLog {
         let dirs = create_cell_dirs(fs, std::path::Path::new("data/shard-0")).expect("dirs");
-        let segment = SegmentConfig { recycle_slots: 1, ..cfg().segment };
-        let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, segment).expect("rotor");
+        let segment = SegmentConfig { recycle_slots: 1, ..cfg().geometry.segment() };
+        let rotor =
+            SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry(segment)).expect("rotor");
         RotorLog { rotor, seq: 0 }
     }
 

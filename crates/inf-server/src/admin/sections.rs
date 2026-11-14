@@ -228,6 +228,61 @@ fn memory_section(
     text.push_str("\r\n");
 }
 
+/// ADR-0189 D11, node scope, read from the catalog writer's gauges as
+/// they stand: the tombstone book's word (live, ready, paceable,
+/// blocked), the writer's word, its pending DDL, the notices that retired
+/// none, the cap's paces and refusals, the tiered lifetime bound's refusals
+/// (ADR-0148 D1) and the namespace id space's (ADR-0148 D4).
+fn ddl_gauge_lines(text: &mut String, node: &NodeInfo) {
+    let gauges = node.ddl_gauges.borrow();
+    let Some(g) = gauges.as_deref() else {
+        for field in DDL_GAUGE_FIELDS {
+            push(text, &format!("{field}:0"));
+        }
+        return;
+    };
+    let t = g.tombstones();
+    let (busy, limit) = g.refused_capacity();
+    let (tiered_busy, tiered_limit) = g.tiered_refused();
+    let values = [
+        u64::from(t.live),
+        u64::from(t.ready),
+        u64::from(t.paceable),
+        u64::from(t.blocked),
+        g.catalog_epoch(),
+        g.pending(),
+        g.notices_stale(),
+        g.paced(),
+        g.repaced(),
+        busy,
+        limit,
+        tiered_busy,
+        tiered_limit,
+        g.ns_id_refused_exhausted(),
+    ];
+    for (field, value) in DDL_GAUGE_FIELDS.iter().zip(values) {
+        push(text, &format!("{field}:{value}"));
+    }
+}
+
+/// The catalog writer's `INFO persistence` fields, in render order.
+const DDL_GAUGE_FIELDS: [&str; 14] = [
+    "ns_drop_tombstones",
+    "ns_drop_tombstones_ready",
+    "ns_drop_tombstones_paceable",
+    "ns_drop_tombstones_blocked",
+    "catalog_epoch",
+    "ns_ddl_pending",
+    "ns_ddl_notices_stale",
+    "ns_ddl_paced",
+    "ns_ddl_repaced",
+    "ns_drop_refused_capacity_busy",
+    "ns_drop_refused_capacity_limit",
+    "tiered_ns_refused_busy",
+    "tiered_ns_refused_limit",
+    "ns_id_refused_exhausted",
+];
+
 /// `INFO` — the persistence lines.
 fn persistence_section(text: &mut String, node: &NodeInfo, now: Nanos) {
     push(text, "# Persistence");
@@ -271,9 +326,7 @@ fn persistence_section(text: &mut String, node: &NodeInfo, now: Nanos) {
     #[cfg(inf_canary_info_lastsave_from_observation)]
     let last_save_s = node.lastsave.observed_unix_s();
     push(text, &format!("rdb_last_save_time:{last_save_s}"));
-    // ADR-0100 D7: durable namespaces dropped since every cell last
-    // published a MANIFEST past the drop (node scope).
-    push(text, &format!("ns_drop_tombstones:{}", node.ns_drop_tombstones.get()));
+    ddl_gauge_lines(text, node);
     push(text, "aof_enabled:0");
     push(text, "aof_rewrite_in_progress:0");
     log_gauge_lines(text, node);
@@ -385,6 +438,8 @@ fn tripwires_section(
     push(text, &format!("{}:{p999}", tw::LOOP_ITER_P999_US));
     push(text, &format!("fabric_rtt_p50_ns:{}", node.fabric_rtt_p50_ns.get()));
     push(text, &format!("recv_dropped:{}", node.recv_dropped.get()));
+    // Waker operations made off this cell's thread: 0 while no path moves a waker off its cell.
+    push(text, &format!("waker_foreign_ops:{}", node.waker_foreign_ops.get()));
     let [submits, raw_sqes, raw_cqes, iters, commands, fabric_msgs] = node.raw_counters.get();
     push(text, &format!("raw_submits:{submits}"));
     push(text, &format!("raw_sqes:{raw_sqes}"));
@@ -418,6 +473,9 @@ fn tripwires_section(
     push(text, &format!("expiry_alias_over:{}", stats.expiry_alias_over));
     push(text, &format!("sweep_passes_voided:{}", stats.sweep_passes_voided));
     push(text, &format!("pubsub_fan_msgs:{}", node.pubsub_fan_msgs.get()));
+    // Derived never: a fan leg that found no reserved credit (cell scope).
+    let refused = node.fabric_reserve_refused_cell.get();
+    push(text, &format!("fabric_reserve_refused_cell:{refused}"));
     push(text, &format!("pubsub_delivered:{}", node.pubsub_delivered.get()));
     push(text, &format!("pubsub_state_bytes:{}", node.pubsub_state_bytes.get()));
     push(text, &format!("{}:{}", tw::WIRE_BUFFERS_BYTES, node.wire_buffers_bytes.get()));
@@ -429,6 +487,14 @@ fn tripwires_section(
     push(text, &format!("reply_pool_bytes:{}", node.reply_pool_bytes.get()));
     push(text, &format!("cmd_pool_bytes:{}", node.cmd_pool_bytes.get()));
     push(text, &format!("cold_pool_bytes:{}", node.cold_pool_bytes.get()));
+    // The tier window pools (cell scope): reserved at each pipeline's
+    // build, written only as rounds take windows.
+    push(text, &format!("tier_window_capacity_bytes:{}", node.tier_window_capacity_bytes.get()));
+    push(text, &format!("tier_window_written_bytes:{}", node.tier_window_written_bytes.get()));
+    // The cell's tiered lifetimes (ADR-0148 D3): positions held, and the
+    // conflicts the grant rules make unreachable.
+    push(text, &format!("tier_ns_positions:{}", node.tier_ns_positions.get()));
+    push(text, &format!("tier_position_conflicts:{}", node.tier_position_conflicts.get()));
     push(text, &format!("loop_snapshot_bytes:{}", node.loop_snapshot.reserved_bytes()));
     text.push_str("\r\n");
 }
@@ -545,6 +611,13 @@ fn barrier_gauge_lines(text: &mut String, node: &NodeInfo) {
     push(text, &format!("frame_waits_barrier:{}", node.frame_waits_barrier.get()));
     push(text, &format!("frame_waits_rotation:{}", node.frame_waits_rotation.get()));
     push(text, &format!("frame_waits_reorder:{}", node.frame_waits_reorder.get()));
+    // The fsync ledger's holds (cell scope): a frame held for the
+    // rotation's unfolded seal, and for a full ack map; prealloc or
+    // zero-fill barriers skipped at their class's budget. The last two
+    // are derived never to occur.
+    push(text, &format!("frame_waits_ledger:{}", node.frame_waits_ledger.get()));
+    push(text, &format!("frame_waits_ack_map:{}", node.frame_waits_ack_map.get()));
+    push(text, &format!("ledger_prealloc_deferrals:{}", node.ledger_prealloc_deferrals.get()));
     // ADR-0163 D2 (cell scope): frames held for an outstanding extent
     // barrier, per episode — each episode closes the extent-seal window.
     push(text, &format!("frame_waits_extent:{}", node.frame_waits_extent.get()));
@@ -552,6 +625,9 @@ fn barrier_gauge_lines(text: &mut String, node: &NodeInfo) {
     push(text, &format!("frame_waits_fill:{}", node.frame_waits_fill.get()));
     push(text, &format!("fill_window_us:{}", node.fill_window_us.get()));
     push(text, &format!("fill_target_bytes:{}", node.fill_target_bytes.get()));
+    // The most timers the cell has held armed at once (cell scope, every
+    // cell): the population a hold episode's timer adds to.
+    push(text, &format!("timers_armed_max:{}", node.timers_armed_max.get()));
     // M4.5-S43 (ADR-0092): the FLUSH-class group hold in force and
     // its hold episodes; the adaptive target beside them.
     push(text, &format!("frame_waits_group:{}", node.frame_waits_group.get()));
@@ -699,6 +775,13 @@ fn recover_gauge_lines(text: &mut String, node: &NodeInfo) {
     for (field, value) in names.zip(tier.to_array()) {
         push(text, &format!("{field}:{value}"));
     }
+    // ADR-0174 A1.2, node scope: the largest work one step did on any cell
+    // and the steps and yields inside a unit, summed.
+    let step = node.recover_step_facts.get();
+    let names = crate::recover::StepFacts::FIELDS.iter().map(|(name, _)| name);
+    for (field, value) in names.zip(step.to_array()) {
+        push(text, &format!("{field}:{value}"));
+    }
 }
 
 /// `INFO` — the ckpt gauge lines.
@@ -810,6 +893,23 @@ fn tiering_read_lines(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     // instrument fix — invisible in soak artifacts until now).
     push(text, &format!("cold_pool_dry:{}", split[13]));
     push(text, &format!("cold_queue_full:{}", split[14]));
+    // ADR-0181 R1, R4, R7: the cold host's delivery service — the member
+    // visits it spent, the most in one turn (at most 64), the members and
+    // windows still to visit, and the receipt-to-delivery delay — the
+    // receipts and ready links that named nothing, and its identity
+    // issuer: the requests refused for a spent space and its position.
+    use crate::exec::ColdGauge as C;
+    let cold = node.cold.get();
+    let cold_gauge = |slot: C| cold[slot as usize];
+    push(text, &format!("cold_delivery_work:{}", cold_gauge(C::DeliveryWork)));
+    push(text, &format!("cold_delivery_work_turn_max:{}", cold_gauge(C::DeliveryWorkTurnMax)));
+    push(text, &format!("cold_delivery_pending_members:{}", cold_gauge(C::DeliveryPendingMembers)));
+    push(text, &format!("cold_delivery_pending_windows:{}", cold_gauge(C::DeliveryPendingWindows)));
+    push(text, &format!("cold_delivery_delay_p99_us:{}", cold_gauge(C::DeliveryDelayP99Us)));
+    push(text, &format!("cold_receipt_foreign:{}", cold_gauge(C::ReceiptsForeign)));
+    push(text, &format!("cold_link_stale:{}", cold_gauge(C::LinksStale)));
+    push(text, &format!("cold_identity_exhausted:{}", cold_gauge(C::IdentityExhausted)));
+    push(text, &format!("cold_identity_pairs_used:{}", cold_gauge(C::IdentityPairsUsed)));
     push(text, &format!("tiering_tail_allocs:{}", tiering.tail_allocs));
     push(text, &format!("tiering_seal_holes:{}", tiering.seal_holes));
     push(text, &format!("tiering_seal_hole_bytes:{}", tiering.seal_hole_bytes));
@@ -872,6 +972,7 @@ fn tiering_flush_lines(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tier_plan_waits:{}", gauge(G::PlanWaits)));
     push(text, &format!("tier_turn_contended:{}", gauge(G::TurnContended)));
     push(text, &format!("tier_rounds_planned:{}", gauge(G::RoundsPlanned)));
+    push(text, &format!("tier_file_ids_exhausted:{}", gauge(G::FileIdsExhausted)));
     // M4-S15: copy-forward slices — same zero contract.
     push(text, &format!("tiering_compact_slices:{}", tiering.compact_slices));
 }
@@ -1119,11 +1220,14 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
 /// `INFO caps` — the cell's cap census (ADR-0163 D2), cell scope: one line
 /// per capped container's row, `cap_row_<name>:` with its cap, its fill,
 /// its `high_water` (the most entries any one instance of the row has held
-/// at once, the maximum over the cell's instances) and its `crossings` (the
-/// `Full` answers and cap merges, summed over them), beside the census's
-/// phase and `cap_assembly_violations`, this cell's count. A bare harness
-/// with no census attached renders no section; a node fold is the reader's
-/// sum over the cells.
+/// at once, the maximum over the cell's instances), its `crossings` (the
+/// `Full` answers and cap merges, summed over them) and its `capacity_now`
+/// (the cap, less the slots a slab retired at their last generation: the
+/// minimum over the instances), beside the census's phase,
+/// `cap_assembly_violations` and `cap_unsliced_drops` (capped stores dropped
+/// whole while the cell served), this cell's counts. A bare harness with no
+/// census attached renders no section; a node fold is the reader's sum over
+/// the cells.
 fn caps_section(node: &NodeInfo, text: &mut String) {
     let census = node.cap_census.borrow();
     let Some(census) = census.as_ref() else { return };
@@ -1136,6 +1240,7 @@ fn caps_section(node: &NodeInfo, text: &mut String) {
     };
     push(text, &format!("cap_census_phase:{phase}"));
     push(text, &format!("cap_assembly_violations:{}", census.cap_assembly_violations()));
+    push(text, &format!("cap_unsliced_drops:{}", census.unsliced_drops()));
     push(text, &format!("cap_rows:{}", census.rows().count()));
     for row in census.rows() {
         let fill = match row.fill {
@@ -1145,8 +1250,8 @@ fn caps_section(node: &NodeInfo, text: &mut String) {
         push(
             text,
             &format!(
-                "cap_row_{}:entries_max={},fill={fill},high_water={},crossings={}",
-                row.name, row.entries_max, row.high_water, row.crossings
+                "cap_row_{}:entries_max={},fill={fill},high_water={},crossings={},capacity_now={}",
+                row.name, row.entries_max, row.high_water, row.crossings, row.capacity_now
             ),
         );
     }

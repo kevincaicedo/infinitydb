@@ -276,6 +276,10 @@ impl<F: SegmentFs> CkptCell<F> {
     /// rotor-prealloc metadata class). `.ick.new` orphans from a crashed
     /// walk are left in place; S11's manifest GC owns their removal.
     pub fn new(fs: F, dir: PathBuf, cell: u16, cfg: CkptConfig) -> io::Result<CkptCell<F>> {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "listing: ckpt/: the named checkpoint, ones a cut left and .ick.new orphans"
+        )]
         let next_id = fs
             .list_dir(&dir)?
             .iter()
@@ -955,7 +959,7 @@ impl<F: SegmentFs> ManifestCell<F> {
                 // them). Encoding stays epoch 1 when the set is empty.
                 let mut tiers = Vec::new();
                 if let Some(tc) = tier.as_deref_mut() {
-                    for t in &tc.namespaces {
+                    for t in tc.live() {
                         if let Some(table) = ks.tiered_store(t.ns) {
                             tiers.push(table.tier_manifest(t.ns.0, &t.flush));
                         }
@@ -1042,14 +1046,14 @@ impl<F: SegmentFs> ManifestCell<F> {
                 // pin-gated unlink runs in the tiered MAINTAIN (M4-S26,
                 // ADR-0059 D3 phases 2-3).
                 if let Some(tc) = tier {
-                    for t in &mut tc.namespaces {
-                        let Some(table) = ks.tiered_store_mut(t.ns) else { continue };
+                    tc.for_each_live_mut(|t| {
+                        let Some(table) = ks.tiered_store_mut(t.ns) else { return };
                         for id in table.commit_retirement() {
                             if let Some(meta) = t.flush.detach_sealed(id) {
                                 t.note_retired(meta);
                             }
                         }
-                    }
+                    });
                 }
                 self.floor = Some(manifest.floor());
                 self.named_ckpt = Some(manifest.ckpt_id);
@@ -1070,6 +1074,10 @@ impl<F: SegmentFs> ManifestCell<F> {
     /// One dir listing per publish: every `.ick` the new manifest does not
     /// name and every `.ick.new` orphan joins the bounded unlink queue.
     fn fill_gc_queue(&mut self) {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "listing: ckpt/: the named checkpoint, ones a cut left and .ick.new orphans"
+        )]
         let Ok(names) = self.fs.list_dir(&self.ckpt_dir) else {
             return; // listing failure: orphans wait for the next boot GC
         };
@@ -1128,6 +1136,7 @@ impl<F: SegmentFs> ManifestCell<F> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: a whole listing of a fixture directory")]
 mod tests {
     use super::*;
     use inf_foundation::time::Nanos;
@@ -1292,5 +1301,28 @@ mod tests {
         assert_eq!(held, ABORT_BACKOFF_SLICES);
         assert!(ckpt.should_begin(0, 0), "the manual request survives the backoff");
         assert!(!ckpt.tick_backoff(), "backoff is one-shot per abort");
+    }
+
+    /// With the interval cause off, nothing but the manual latch begins a
+    /// walk: the predicate reads the latch and the two interval thresholds
+    /// alone, so a table whose relocation-origin map stands past its high
+    /// water never gets the covering swap that drains it (ADR-0180 R1, R5).
+    /// The predicate has no input for relocation pressure; given every
+    /// byte and record a cell can log, it still answers `false`.
+    #[test]
+    #[ignore = "at interval_bytes = 0 the trigger answers only the manual latch, so relocation \
+                pressure never begins a walk; red until relocation pressure is a cause of its own \
+                that begins one, at most once every 30 s"]
+    fn relocation_pressure_begins_a_walk_with_the_interval_off() {
+        let fs = SimDisk::new();
+        let dirs = create_cell_dirs(&fs, Path::new("data/shard-0")).expect("dirs");
+        let cfg = CkptConfig { interval_bytes: 0, ..CkptConfig::default() };
+        let ckpt = CkptCell::new(fs.clone(), dirs.ckpt, 0, cfg).expect("cell");
+        assert!(!ckpt.requested, "engagement: no manual request is pending");
+        assert!(
+            ckpt.should_begin(u64::MAX, u64::MAX),
+            "with the interval cause off and no manual request the trigger answers false: \
+             relocation pressure has no cause that begins a walk"
+        );
     }
 }

@@ -6,7 +6,7 @@
 //! the consumers from every peer; the handle moves to the cell's thread and
 //! is never shared (L1).
 //!
-//! ## Credit protocol (deadlock-free by construction)
+//! ## Credit protocol (deadlock-free under one condition on the user)
 //!
 //! - A **data op** (`Read`/`Write`/`Apply`; each op nested in a `Batch`
 //!   counts individually) consumes one credit toward its destination at
@@ -16,10 +16,19 @@
 //! - Every data op is answered by exactly one `Reply`; draining the reply at
 //!   the origin returns its credit.
 //! - **Replies are always sendable**: each directed ring is sized
-//!   `≥ 2 × data_credits`, so even with both directions saturated (D data
-//!   frames from us + D replies owed to the peer's D outstanding ops) the
-//!   ring cannot be full of unsendable traffic, and [`CellFabric::drain`]
-//!   never has to block to make room — there is no wait-for cycle.
+//!   `≥ 2 × data_credits` ([`MeshConfig::has_reply_headroom`], the relation's
+//!   one statement, which [`Mesh::new`] asserts), so even with both
+//!   directions saturated (D data frames from us + D replies owed to the
+//!   peer's D outstanding ops) the ring cannot be full of unsendable traffic,
+//!   and [`CellFabric::drain`] never has to block to make room.
+//!
+//! So a reply sent in the drain pass that read its op never waits. A reply
+//! the user defers past that drain closes no wait-for cycle only under one
+//! condition (ADR-0192 D1): it waits only on its own cell's local resources,
+//! each released by that cell's loop or clock with no fabric op on the path,
+//! or on data ops sent from credits no deferrable op can hold, each answered
+//! in the drain pass that reads it; and no task holds such a local resource
+//! while it waits on a general credit or on the reply to a general op.
 //!
 //! Producer-side memory is exactly bounded: per destination, in-flight data
 //! frames ≤ `data_credits` (each frame consumes ≥ 1 credit) and staged
@@ -52,11 +61,27 @@ use crate::msg::{FabricMsg, FabricToken};
 use crate::ring::{Consumer, Producer, ring};
 
 /// Mesh tuning. `ring_capacity` is per directed pair and must be a power of
-/// two ≥ `2 × data_credits` (the reply-headroom invariant above).
+/// two with reply headroom over `data_credits`: the relation is
+/// [`MeshConfig::has_reply_headroom`], its one statement.
 #[derive(Copy, Clone, Debug)]
 pub struct MeshConfig {
     pub ring_capacity: usize,
     pub data_credits: u32,
+}
+
+impl MeshConfig {
+    /// The ring relation that makes [`CellFabric::reply`] infallible: each
+    /// directed ring holds at least `2 × data_credits` slots, so the peer's
+    /// replies to every outstanding op fit beside this side's data frames.
+    /// Written as a floor division, equal to `ring_capacity ≥ 2 ×
+    /// data_credits` for every integer pair and with no product to
+    /// overflow. [`Mesh::new`] asserts it; a checker of a mesh reads this
+    /// function and keeps no copy, so a change to the relation is one edit
+    /// here (ADR-0192 D5).
+    #[must_use]
+    pub const fn has_reply_headroom(self) -> bool {
+        self.ring_capacity / 2 >= self.data_credits as usize
+    }
 }
 
 impl Default for MeshConfig {
@@ -230,8 +255,8 @@ impl Mesh {
     ///
     /// # Panics
     /// Panics if `cells == 0`, if `ring_capacity` is not a power of two, or
-    /// if the reply-headroom invariant `ring_capacity ≥ 2 × data_credits`
-    /// does not hold (the deadlock-freedom proof depends on it).
+    /// if [`MeshConfig::has_reply_headroom`] does not hold (the
+    /// deadlock-freedom proof depends on it).
     // The mesh has no retained whole — construction hands each cell its
     // handle and disappears (frozen shape, interfaces-m0.md §4).
     #[allow(clippy::new_ret_no_self)]
@@ -239,7 +264,7 @@ impl Mesh {
         assert!(cells > 0, "mesh needs at least one cell");
         assert!(config.data_credits > 0, "data_credits must be non-zero");
         assert!(
-            config.ring_capacity >= 2 * config.data_credits as usize,
+            config.has_reply_headroom(),
             "ring_capacity {} < 2 × data_credits {} — replies must always have headroom",
             config.ring_capacity,
             config.data_credits,
@@ -602,5 +627,21 @@ mod token_tests {
         assert_eq!(t3.seq(), 0, "wrapped, not panicked");
         assert_eq!(t3.origin_cell(), CellId(0));
         assert_ne!(t2, t3);
+    }
+
+    /// The relation's one statement is the doubled-credit rule it replaced,
+    /// at every pair around the boundary: the floor division neither admits
+    /// an odd ring one slot short nor refuses the exact double.
+    #[test]
+    fn reply_headroom_is_twice_the_credits() {
+        for ring_capacity in 0..=520usize {
+            for data_credits in 0..=300u32 {
+                let config = MeshConfig { ring_capacity, data_credits };
+                let doubled = ring_capacity >= 2 * data_credits as usize;
+                assert_eq!(config.has_reply_headroom(), doubled, "{config:?}");
+            }
+        }
+        let widest = MeshConfig { ring_capacity: usize::MAX, data_credits: u32::MAX };
+        assert!(widest.has_reply_headroom(), "no product to overflow");
     }
 }

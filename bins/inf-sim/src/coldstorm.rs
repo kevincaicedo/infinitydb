@@ -21,7 +21,20 @@
 //! observation points. Custody reconciles to zero at the end. Every
 //! event folds into `trace_hash`; `--verify-determinism` requires
 //! two-run identity (L7).
+//!
+//! Every round records the values the harness received, the members
+//! orphaned at delivery (their waiter gone), the values the host delivered,
+//! and the device reads the drains issued, with the most one drain call
+//! issued: the delivery and preparation work the round did. A round is one
+//! host turn, so it visits at most a turn's allowance of members
+//! (`cold-delivery-work-over`, ADR-0181 R1): the values the harness saw
+//! delivered, by its own count, plus the members orphaned.
+//!
+//! That is the `storm` leg, the default. `--cold-leg` names the others
+//! (`legs.rs`): fixed shapes over files of known contents, each with the
+//! same per-round counts.
 
+use crate::driver::Violations;
 use core::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -36,13 +49,19 @@ use inf_log::{
     TIER_FRAME_BYTES, TIER_FRAME_DATA, TierIoMode, TierWriter, tier_extract, tier_frame_offset,
     tier_frame_span,
 };
-use inf_runtime::{BackendDriver, CellExecutor, ColdReads, RawFd, TierFileId, TokenClass, Wait};
+use inf_runtime::limits::COLD_DELIVERIES_PER_TURN;
+use inf_runtime::{
+    BackendDriver, CellExecutor, ColdReads, ColdReceipt, ColdTurn, Completion, CompletionResult,
+    RawFd, TierFileId, TokenClass, Wait,
+};
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId, StoreConfig,
     TieredLookup, TieredTable,
 };
 
 use crate::net::{CellNet, Plant, SimDriver};
+
+mod legs;
 
 const NS: NsId = NsId(99);
 const PAGE: u64 = 4 << 10;
@@ -67,24 +86,169 @@ const WAVE_EVERY: u64 = 32;
 /// Abandon (client-disconnect) probability, per GET, in permille.
 const CANCEL_PERMILLE: u64 = 30;
 
+/// The `m4-cold` legs, the one table `--cold-leg` is parsed against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColdLeg {
+    /// The randomized storm (the module doc), the default.
+    #[default]
+    Storm,
+    /// 65 members of one read, every wait dropped after issue: all
+    /// orphaned at delivery, with no task and no I/O after.
+    CancelAll,
+    /// More reads than the pool's buffers, consumers polling late: every
+    /// buffer leased before a value drops, then no traffic.
+    Held,
+    /// One more request than a class queue holds, offered in one round:
+    /// the last refused and offered again.
+    DeepQueue,
+    /// A class queue of requests on one file, no two of which can join.
+    Stride,
+    /// Rounds of 31-member cohorts of adjacent requests.
+    Dense,
+    /// Reads under the sim disk's read fault, singletons and cohorts.
+    Errors,
+    /// Reads across the point where the issuer's identities run out,
+    /// `--cold-identity-start` placing it inside the run.
+    Identity,
+    /// A stop's shape: values held, reads in flight, both classes queued,
+    /// and an offer of each class after the barrier.
+    Stop,
+}
+
+impl ColdLeg {
+    /// Every leg with its `--cold-leg` name.
+    pub const ALL: [(ColdLeg, &'static str); 9] = [
+        (ColdLeg::Storm, "storm"),
+        (ColdLeg::CancelAll, "cancel-all"),
+        (ColdLeg::Held, "held"),
+        (ColdLeg::DeepQueue, "deep-queue"),
+        (ColdLeg::Stride, "stride"),
+        (ColdLeg::Dense, "dense"),
+        (ColdLeg::Errors, "errors"),
+        (ColdLeg::Identity, "identity"),
+        (ColdLeg::Stop, "stop"),
+    ];
+
+    /// The leg a `--cold-leg` name names.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<ColdLeg> {
+        ColdLeg::ALL.iter().find(|(_, leg_name)| *leg_name == name).map(|(leg, _)| *leg)
+    }
+
+    /// The leg's `--cold-leg` name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        ColdLeg::ALL.iter().find(|(leg, _)| *leg == self).map_or("storm", |(_, name)| *name)
+    }
+}
+
 /// Scenario knobs. `ops` counts every GET + mutation (the AC's 10⁶-op
-/// run sets it explicitly; sim-smoke runs a lighter default).
+/// run sets it explicitly; sim-smoke runs a lighter default) and sizes the
+/// storm alone: every other leg's shape is fixed.
 #[derive(Debug)]
 pub struct ColdStormScenario {
     pub seed: u64,
     pub ops: u64,
+    pub leg: ColdLeg,
+    /// The `identity` leg's issuer position, a pair index below
+    /// [`COLD_IDENTITY_PAIRS_MAX`](inf_runtime::limits::COLD_IDENTITY_PAIRS_MAX);
+    /// no other leg takes one.
+    pub identity_start: Option<u64>,
 }
 
 impl ColdStormScenario {
     #[must_use]
     pub fn m4_cold(seed: u64) -> ColdStormScenario {
-        ColdStormScenario { seed, ops: 20_000 }
+        ColdStormScenario { seed, ops: 20_000, leg: ColdLeg::Storm, identity_start: None }
     }
+}
+
+/// One round's delivery and preparation work, read by the harness: the
+/// values it received (its own count, each one polled to `Ready`), the
+/// members the host orphaned at delivery (the round's `unclaimed`), the
+/// values the host delivered (the sum of its delivery calls' progress), and
+/// the device reads the round's drains issued, with the most one call
+/// issued.
+///
+/// `woken` is the legs' count of their waits woken by a delivery, which the
+/// harness reads on its own waker: a leg's consumer may poll rounds after
+/// its value was delivered, so its `received` is no delivery count. The
+/// storm polls every woken task within its round, so its `received` is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoundCounts {
+    pub received: u32,
+    pub woken: u32,
+    pub orphaned: u32,
+    pub delivered: u32,
+    pub issued: u32,
+    pub issued_drain_max: u32,
+}
+
+impl RoundCounts {
+    /// The counts as one word, for a run's hash.
+    fn fold(self) -> u64 {
+        let words = [
+            self.received,
+            self.woken,
+            self.orphaned,
+            self.delivered,
+            self.issued,
+            self.issued_drain_max,
+        ];
+        words.iter().fold(0u64, |acc, &word| acc.rotate_left(13) ^ u64::from(word))
+    }
+}
+
+/// A round is one host turn (ADR-0181 R1), which visits at most
+/// `COLD_DELIVERIES_PER_TURN` members, live, cancelled or orphaned. A
+/// round's visits are the values the harness saw delivered (`seen`, its own
+/// count) plus the members the round's delivery calls orphaned; a round
+/// above the allowance is `cold-delivery-work-over`, as is a host whose own
+/// turn maximum is. Returns the most one round visited.
+fn judge_delivery_work(
+    report: &mut ColdStormReport,
+    cold: &ColdReads,
+    seen: impl Fn(&RoundCounts) -> u32,
+) -> u32 {
+    let mut most = 0;
+    let mut over: Vec<(usize, u32)> = Vec::new();
+    for (index, counts) in report.rounds.iter().enumerate() {
+        let visited = seen(counts) + counts.orphaned;
+        most = most.max(visited);
+        if visited > COLD_DELIVERIES_PER_TURN && over.len() < 4 {
+            over.push((index + 1, visited));
+        }
+    }
+    for (round, visited) in over {
+        report.violations.push(format!(
+            "cold-delivery-work-over: round {round} visited {visited} members; a turn visits at \
+             most {COLD_DELIVERIES_PER_TURN}"
+        ));
+    }
+    let turn_max = cold.counters().delivery_work_turn_max;
+    if turn_max > COLD_DELIVERIES_PER_TURN {
+        report
+            .violations
+            .push(format!("cold-delivery-work-over: the host spent {turn_max} visits in one turn"));
+    }
+    let (members, windows) = cold.delivery_pending();
+    if (members, windows) != (0, 0) {
+        report.violations.push(format!(
+            "cold-delivery-pending: {members} member(s) of {windows} window(s) undelivered at rest"
+        ));
+    }
+    most
 }
 
 #[derive(Debug, Default)]
 pub struct ColdStormReport {
-    pub violations: Vec<String>,
+    /// The leg the run drove.
+    pub leg: ColdLeg,
+    pub violations: Violations,
+    /// Every round's delivery and preparation work, in order.
+    pub rounds: Vec<RoundCounts>,
+    /// Values received carrying a device error (the `errors` leg's).
+    pub errored_values: u64,
     pub gets: u64,
     pub cold_served: u64,
     pub chunked_reads: u64,
@@ -108,6 +272,12 @@ impl ColdStormReport {
     #[must_use]
     pub fn ok(&self) -> bool {
         self.violations.is_empty()
+    }
+
+    /// The largest of one count over the run's rounds.
+    #[must_use]
+    pub fn round_max(&self, count: impl Fn(&RoundCounts) -> u32) -> u32 {
+        self.rounds.iter().map(count).max().unwrap_or(0)
     }
 }
 
@@ -181,6 +351,8 @@ struct World {
     values: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Injected virtual clock (µs), advanced once per round (L7).
     now_us: u64,
+    /// The round's delivery and preparation work so far.
+    counts: RoundCounts,
     report: ColdStormReport,
 }
 
@@ -193,6 +365,7 @@ impl World {
         self.files.iter().find(|f| addr >= f.base && addr < f.base + f.len)
     }
 
+    #[track_caller]
     fn violation(&mut self, message: String) {
         self.report.violations.push(message);
     }
@@ -294,12 +467,16 @@ fn plan_chunk(world: &Rc<RefCell<World>>, addr: u64, done: usize, remaining: usi
 /// A refused enqueue's plan: a full queue is backpressure (retry next
 /// round); an unrepresentable read is permanent, and no generator here
 /// plans a position above 2^49, so it is a corruption the storm reports
-/// (ADR-0167 D3).
+/// (ADR-0167 D3); and the storm's issuer starts at pair 0, so a spent
+/// identity space is one too.
 fn refused_plan(refused: inf_runtime::ColdRefused) -> Plan {
     match refused {
         inf_runtime::ColdRefused::QueueFull => Plan::Dry,
         inf_runtime::ColdRefused::Unrepresentable(read) => {
             Plan::Corrupt(format!("enqueue refused an unrepresentable read: {read:?}"))
+        }
+        inf_runtime::ColdRefused::IdentityExhausted => {
+            Plan::Corrupt("enqueue refused a spent identity space from pair 0".into())
         }
     }
 }
@@ -372,6 +549,7 @@ async fn cold_get(world: Rc<RefCell<World>>, key: Vec<u8>, cancel_roll: u64) -> 
             break;
         }
         let done = wait.await; // ← suspension: plain data only
+        world.borrow_mut().counts.received += 1;
         if let Err(errno) = done.outcome() {
             world
                 .borrow_mut()
@@ -458,6 +636,7 @@ async fn cold_get(world: Rc<RefCell<World>>, key: Vec<u8>, cancel_roll: u64) -> 
                         Plan::Ram(_) => unreachable!("plan_chunk never resolves"),
                     };
                     let done = wait.await;
+                    world.borrow_mut().counts.received += 1;
                     if let Err(errno) = done.outcome() {
                         world.borrow_mut().violation(format!("staging read errno {errno}"));
                         break 'attempt;
@@ -794,24 +973,86 @@ fn unlink_drained(world: &mut World) {
     world.report.trace_hash = hash64(&unlinks.to_le_bytes(), world.report.trace_hash ^ deferrals);
 }
 
-/// Pump the sim driver and route TierRead completions into the custody
-/// table (the plane's completion-dispatch role).
-fn pump(world: &mut World, recv_pool: &mut BufferPool) {
+/// Pump the sim driver, record its TierRead receipts in the custody table
+/// (the plane's completion-dispatch role) and serve the round's delivery
+/// from its one turn, which both pumps share (ADR-0181 R2).
+fn pump(world: &mut World, recv_pool: &mut BufferPool, turn: &mut ColdTurn) {
+    // Canary: the harness begins a turn at each pump, not each round.
+    #[cfg(inf_canary_cold_turn_budget_per_pump)]
+    {
+        *turn = ColdTurn::begin();
+    }
     // S10: the drain admits queued intents (merge + QD cap + deficit)
     // into the same submit the eager path always rode.
     let cold = world.cold.clone();
-    cold.drain(|op| world.driver.push(op));
+    let issued = cold.drain(|op| world.driver.push(op));
+    world.counts.issued += issued;
+    world.counts.issued_drain_max = world.counts.issued_drain_max.max(issued);
     let mut out = Vec::new();
     world.driver.submit_and_reap(recv_pool, Wait::Poll, &mut out).expect("sim submit");
     for completion in out {
-        assert_eq!(completion.token.class(), TokenClass::TierRead);
-        world.cold.on_completion(completion.token, completion.result, world.now_us);
+        if let ColdReceipt::Foreign = record_receipt(&world.cold, completion, world.now_us) {
+            world.violation("a cold receipt named no issued read".into());
+        }
     }
+    deliver(world, turn);
+}
+
+/// The round's delivery service on its turn's allowance (the plane's
+/// `before_execute` role): the values delivered and the members orphaned,
+/// counted.
+fn deliver(world: &mut World, turn: &mut ColdTurn) {
+    let progress = world.cold.deliver_ready(turn.delivery(), world.now_us);
+    world.counts.delivered += progress.delivered;
+    world.counts.orphaned += progress.unclaimed;
+}
+
+/// Records one `TierRead` completion, its outcome as the dispatch decides
+/// it: a full window, or the op's errno.
+pub(crate) fn record_receipt(cold: &ColdReads, completion: Completion, now_us: u64) -> ColdReceipt {
+    assert_eq!(completion.token.class(), TokenClass::TierRead);
+    let outcome = match completion.result {
+        CompletionResult::TierRead => Ok(()),
+        CompletionResult::Error { errno, .. } => Err(errno),
+        other @ (CompletionResult::Accepted { .. }
+        | CompletionResult::Recv { .. }
+        | CompletionResult::RecvDropped
+        | CompletionResult::Sent { .. }
+        | CompletionResult::LogWritten
+        | CompletionResult::Synced
+        | CompletionResult::Closed) => panic!("a tier read completed as {other:?}"),
+    };
+    cold.record_completion(completion.token, outcome, now_us)
+}
+
+/// Opens the round's counts; returns the host's `unclaimed` so far.
+fn begin_round(world: &mut World) -> u64 {
+    world.counts = RoundCounts::default();
+    world.cold.counters().unclaimed
+}
+
+/// Closes the round's counts: its orphaned members, the sum of its delivery
+/// calls' `unclaimed`, must be the `unclaimed` the host counted since
+/// `unclaimed_before` (a wiring check).
+fn end_round(world: &mut World, unclaimed_before: u64) {
+    let counted = world.cold.counters().unclaimed - unclaimed_before;
+    if counted != u64::from(world.counts.orphaned) {
+        let orphaned = world.counts.orphaned;
+        world.violation(format!(
+            "the round's {orphaned} orphaned members, the host counted {counted}"
+        ));
+    }
+    let counts = world.counts;
+    world.report.rounds.push(counts);
 }
 
 /// Runs the scenario once. Deterministic from the seed (L7).
 #[must_use]
 pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+    if scenario.leg != ColdLeg::Storm {
+        return legs::run_leg(scenario);
+    }
     let mut rng = SplitMix64::new(scenario.seed ^ 0xC01D_5701);
     let demote = DemotionConfig {
         mem_budget_bytes: BUDGET,
@@ -833,6 +1074,7 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
             },
             demote,
             KEYS as usize * 2,
+            &census,
         )
         .is_ok()
     );
@@ -856,6 +1098,7 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
         model: BTreeMap::new(),
         values: BTreeMap::new(),
         now_us: 0,
+        counts: RoundCounts::default(),
         report: ColdStormReport::default(),
     }));
     let mut ex = CellExecutor::new(256);
@@ -867,12 +1110,18 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
     while ops < scenario.ops || ex.live_tasks() > 0 {
         round += 1;
         assert!(round < scenario.ops.max(1) * 4, "storm rounds exploded (liveness)");
-        {
+        // One host turn a round: its delivery allowance serves the ready
+        // work first, then both pumps share what is left (ADR-0181 R2).
+        let mut turn = ColdTurn::begin();
+        let unclaimed_before = {
             let mut world = world.borrow_mut();
             world.now_us = round * ROUND_US;
             let now = world.now_us;
             world.report.state.number(b"round-time-us", now);
-        }
+            let unclaimed_before = begin_round(&mut world);
+            deliver(&mut world, &mut turn);
+            unclaimed_before
+        };
         // Foreground: new GETs (cold-heavy once files exist).
         if ops < scenario.ops {
             for _ in 0..GETS_PER_ROUND {
@@ -907,12 +1156,12 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
                 relocation_wave(world);
             }
             maintain_round(world);
-            pump(world, &mut recv_pool);
+            pump(world, &mut recv_pool, &mut turn);
         }
         ex.run_ready(512); // resume: re-resolve, decode, or restart.
         {
             let world = &mut *world.borrow_mut();
-            pump(world, &mut recv_pool); // chunk continuations
+            pump(world, &mut recv_pool, &mut turn); // chunk continuations
         }
         ex.run_ready(512);
         // Oracle: verify every completed GET against the history model.
@@ -921,6 +1170,7 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
             for answer in answers.borrow_mut().drain(..) {
                 verify_answer(world, answer);
             }
+            end_round(world, unclaimed_before);
         }
     }
 
@@ -929,6 +1179,8 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
     if let Err(leak) = world.cold.reconcile() {
         world.report.violations.push(format!("custody leak: {leak:?}"));
     }
+    let cold = world.cold.clone();
+    judge_delivery_work(&mut world.report, &cold, |counts| counts.received);
     let counters = world.cold.counters();
     world.report.merged_waiters = counters.merged_waiters;
     world.report.queue_high_water = counters.queue_depth_high_water;
@@ -1002,4 +1254,37 @@ fn verify_answer(world: &mut World, answer: GetAnswer) {
             ^ answer.answer.map_or(0, |(v, h)| h ^ u64::from(v))
             ^ u64::from(answer.chunks),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every fixed leg runs its shape at one seed. Each but the stop leg
+    /// engages it and reads clean (custody back, every request answered with
+    /// its file's bytes); the stop leg reads `VACUOUS`, and nothing else,
+    /// while the host has no stop to mark. Each leg's rounds are recorded.
+    #[test]
+    fn every_fixed_leg_runs_its_shape() {
+        for (leg, name) in ColdLeg::ALL {
+            if leg == ColdLeg::Storm {
+                continue;
+            }
+            let identity_start = (leg == ColdLeg::Identity)
+                .then_some(inf_runtime::limits::COLD_IDENTITY_PAIRS_MAX - 2);
+            let scenario =
+                ColdStormScenario { leg, identity_start, ..ColdStormScenario::m4_cold(1) };
+            let report = run_cold_storm_scenario(&scenario);
+            assert_eq!(report.leg, leg);
+            assert!(!report.rounds.is_empty(), "{name}: no round recorded");
+            let vacuous: Vec<&str> =
+                report.violations.iter().filter(|v| v.starts_with("VACUOUS")).collect();
+            if leg == ColdLeg::Stop {
+                assert_eq!(vacuous.len(), 1, "{name}: {:?}", report.violations);
+                assert_eq!(report.violations.len(), 1, "{name}: {:?}", report.violations);
+            } else {
+                assert!(report.ok(), "{name}: {:?}", report.violations);
+            }
+        }
+    }
 }

@@ -161,6 +161,23 @@ impl<T, X> CappedDeque<T, X> {
         self.backing.back_mut()
     }
 
+    /// The entry `index` places from the front, if `index < len`:
+    /// positional, so a holder that names its entries by their order
+    /// reads one without a walk; the deque neither grows nor reorders.
+    #[must_use]
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&T> {
+        self.backing.get(index)
+    }
+
+    /// The entry `index` places from the front, mutably, if `index < len`:
+    /// an in-place edit of a published entry, never a growth path.
+    #[must_use]
+    #[inline]
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        self.backing.get_mut(index)
+    }
+
     /// The front entry returns to its owner; capacity is restored.
     #[inline]
     pub fn pop_front(&mut self) -> Option<T> {
@@ -435,6 +452,28 @@ mod tests {
     }
 
     #[test]
+    fn get_and_get_mut_name_an_entry_by_its_place_and_never_grow() {
+        let (census, mut deque) = deque(FOUR);
+        assert_eq!(deque.get(0), None, "an empty deque has no entry");
+        assert_eq!(deque.get_mut(0), None);
+        for value in [10, 20, 30, 40] {
+            assert!(publish(&mut deque, value));
+        }
+        assert_eq!((deque.get(0), deque.get(3)), (Some(&10), Some(&40)), "front and back");
+        assert_eq!((deque.get(4), deque.get(usize::MAX)), (None, None), "past the length");
+        if let Some(entry) = deque.get_mut(2) {
+            *entry = 33;
+        }
+        assert_eq!(deque.get_mut(4), None, "len is no place");
+        assert_eq!(deque.iter().copied().collect::<Vec<_>>(), [10, 20, 33, 40]);
+        assert_eq!(deque.pop_front(), Some(10));
+        assert_eq!(deque.get(0), Some(&20), "places follow the front");
+        assert_eq!(deque.get(3), None);
+        assert_eq!((deque.len(), deque.high_water()), (3, 4), "an edit is no publish");
+        assert_eq!(census.row("four").expect("row").crossings, 0);
+    }
+
+    #[test]
     fn an_assembly_cap_is_refused_and_registers_no_row() {
         let (census, _serve_mark) = CapCensus::new(CELL);
         let refused = CappedDeque::<u32, Reserve>::new(ASSEMBLY, &census);
@@ -549,13 +588,29 @@ mod tests {
                 2 => assert_eq!(deque.pop_front(), model.pop_front()),
                 _ => {
                     let edit = rng.next_below(1000) as u32;
-                    if let Some(back) = model.back_mut() {
-                        *back = edit;
-                    }
-                    if let Some(back) = deque.back_mut() {
-                        *back = edit;
+                    // Half the edits name the back, half a place from the
+                    // front, `len` included (no entry there).
+                    if rng.next_below(2) == 0 {
+                        if let Some(back) = model.back_mut() {
+                            *back = edit;
+                        }
+                        if let Some(back) = deque.back_mut() {
+                            *back = edit;
+                        }
+                    } else {
+                        let index = rng.next_below(model.len() as u64 + 1) as usize;
+                        assert_eq!(deque.get_mut(index).is_some(), index < model.len());
+                        if let Some(entry) = model.get_mut(index) {
+                            *entry = edit;
+                        }
+                        if let Some(entry) = deque.get_mut(index) {
+                            *entry = edit;
+                        }
                     }
                 }
+            }
+            for index in 0..=6 {
+                assert_eq!(deque.get(index), model.get(index), "seed {seed} place {index}");
             }
             high = high.max(model.len() as u32);
             assert_eq!(deque.len(), model.len(), "seed {seed}");

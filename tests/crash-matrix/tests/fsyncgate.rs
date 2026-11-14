@@ -45,9 +45,9 @@ use inf_foundation::CellId;
 use inf_foundation::fault::FaultSpec;
 use inf_foundation::time::{Clock, StdClock};
 use inf_runtime::net::{bound_port, listen_reuseport};
-use inf_runtime::{BackendDriver, CellLoop, LoopConfig, UringDriver};
+use inf_runtime::{CellLoop, LoopConfig, UringDriver};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
-use inf_store::{Keyspace, StoreConfig};
+use inf_store::{KeyspaceSeed, StoreConfig};
 
 /// Minimal single-cell durable node (the node_e2e assembly, trimmed).
 /// Returns the bound port and the thread handles; the node serves until
@@ -66,7 +66,8 @@ fn start_node(
         .unwrap_or(0);
     let one_cell = inf_foundation::CellCount::new(1).expect("one cell");
     let (control, issuers) =
-        inf_server::spawn_control(data_dir.to_path_buf(), catalog.as_ref(), one_cell, boot_unix_ms);
+        inf_server::spawn_control(data_dir.to_path_buf(), catalog.as_ref(), one_cell, boot_unix_ms)
+            .expect("the catalog boots");
     let issuer = issuers.cells.into_iter().next().expect("one cell's issuer");
     let dir = data_dir.to_path_buf();
     let fabric = Mesh::new(1, MeshConfig { ring_capacity: 1024, data_credits: 256 })
@@ -78,17 +79,16 @@ fn start_node(
         for &(point, spec) in &faults {
             inf_foundation::fault::arm(point, spec);
         }
-        let mut pool = BufferPool::new(256, 4096);
-        let mut driver = UringDriver::new(256).expect("uring");
-        driver.register_pool(&mut pool).expect("register");
-        let mut ks = Keyspace::new(StoreConfig::default());
-        if let Some(catalog) = &catalog {
-            ks.seed_catalog(catalog).expect("seed catalog");
-        }
+        let pool = BufferPool::new(256, 4096);
+        let driver = UringDriver::new(256).expect("uring");
+        // The node's keyspace is cataloged, as `infinityd`'s (ADR-0189 D4).
+        let seed = KeyspaceSeed::Cataloged {
+            cfg: StoreConfig::default(),
+            catalog: catalog.unwrap_or_else(inf_store::NsCatalog::empty),
+        };
         let cfg = inf_server::DurableConfig {
             data_dir: dir,
-            staging: inf_log::StagingConfig::default(),
-            segment: inf_log::SegmentConfig::default(),
+            geometry: inf_log::LogGeometry::default(),
             ckpt: inf_log::CkptConfig { interval_bytes: 0, ..Default::default() },
             recover: Default::default(),
             flush_bound: 1,
@@ -97,21 +97,26 @@ fn start_node(
             fill: Default::default(),
             group: Default::default(),
         };
-        let (mut plane, serve_mark) = ServerPlane::new(
+        let (mut plane, serve_mark, timer_set) = ServerPlane::new(
             CellId(0),
             1,
             listener.into_raw_fd(),
-            ks,
+            seed,
             fabric,
             Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
             NoopObserver,
             false,
-        );
+        )
+        .expect("the server's timer owners fit their cap");
         plane.set_control(Arc::clone(&board), issuer).expect("cell 0's issuer");
         plane.begin_recovery(inf_server::StdSegmentFs, &cfg, 0, StdClock::new().now());
-        let config =
-            LoopConfig { park_default: Some(Duration::from_millis(5)), ..Default::default() };
-        let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark);
+        let config = LoopConfig {
+            park_default: inf_runtime::ParkCeiling::new(Duration::from_millis(5))
+                .expect("a park ceiling within the maximum"),
+            ..Default::default()
+        };
+        let mut cell_loop =
+            CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set);
         while !stop.load(Ordering::Relaxed) {
             cell_loop.run_iteration(&mut plane).expect("iteration");
             if let Some(err) = plane.take_boot_error() {

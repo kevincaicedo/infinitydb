@@ -40,6 +40,10 @@
 //! Gating: `INFINITYD_BIN` (set by `just compat` and CI); unset skips
 //! loudly. No redis oracle is needed — the 1-cell node is the reference.
 
+// nextest-stall-default: the tiered binding replays the scripts' writes, a
+// few KiB per pass, in a window of at least its 64 MiB MEM-BUDGET per cell;
+// no write parks (ADR-0053 D4), so the stall bound is never read.
+
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::TcpStream;

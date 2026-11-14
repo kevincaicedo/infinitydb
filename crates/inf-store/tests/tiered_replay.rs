@@ -75,11 +75,18 @@ struct Life {
 
 impl Life {
     fn new(demote: DemotionConfig) -> Life {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let fs = MemFs::new();
         fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
-        let table = TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default())
-            .expect("ring");
-        let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
+        let table =
+            TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default(), &census)
+                .expect("ring");
+        let flush = TierFlush::new(
+            fs.clone(),
+            flush_config(NS, FILE_CAPACITY),
+            0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        );
         Life {
             fs,
             demote,
@@ -438,13 +445,11 @@ struct Boot {
     end_walk: EndWalk,
 }
 
-/// The span the end-of-replay settle (R10) walks, read from the table at
-/// the end of replay: `[ro, tail)` of a machine that demoted, empty for
-/// one that did not.
+/// What the end-of-replay settle (R10) walks, read from the table at the
+/// end of replay: the records of `[ro, tail)` of a machine that demoted,
+/// none for one that did not.
 #[derive(Copy, Clone, Default)]
 struct EndWalk {
-    /// `tail − ro`.
-    span: u64,
     /// The bytes of the records in the span, live or dead — a hole is
     /// passed by its mark, not walked.
     record_bytes: u64,
@@ -466,7 +471,7 @@ impl EndWalk {
             record_bytes += len;
             at += len;
         }
-        EndWalk { span: tail - ro, record_bytes }
+        EndWalk { record_bytes }
     }
 }
 
@@ -491,6 +496,7 @@ impl Durable {
                 demote,
                 4096,
                 KeyHasher::default(),
+                &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
             )
             .expect("tier recovery");
         let mut ks = keyspace_with(NS, table);
@@ -503,8 +509,8 @@ impl Durable {
             fs: self.fs.clone(),
             ks,
             spill,
-            extents_listed,
-            extents_quarantined,
+            extents_listed: extents_listed.to_vec(),
+            extents_quarantined: extents_quarantined.to_vec(),
             tier,
             end_walk: EndWalk::default(),
         }
@@ -543,7 +549,9 @@ impl Boot {
     /// One record through the shipped dispatcher, the seam's owner
     /// draining after it.
     fn apply(&mut self, record: &RecordView<'_>) -> Result<(), ReplayError> {
-        let applied = self.ks.apply_record(record, NOW, ANCHOR, &mut self.spill).map(|_| ());
+        let applied =
+            inf_store::drive_record(&mut self.ks, record, NOW, ANCHOR, &mut self.spill, u64::MAX)
+                .map(|_| ());
         self.spill.drain();
         applied
     }
@@ -833,18 +841,14 @@ impl Ready {
         self.seal_reason_census();
         assert_eq!(self.handles.len(), self.flush.sealed().len(), "one handle per sealed file");
         assert!(self.flush.active().is_none(), "the hand-over sealed the active file");
-        // The step budget is charged the bytes the end-of-replay settle
-        // walked and no other walk's: a seal walk's bytes are charged once,
-        // as the tier bytes its flush appends (the boot I/O charge, R10).
-        assert!(
-            self.charged.walked_bytes <= self.end_walk.span,
-            "walked bytes {} exceed tail − ro {} at the end of replay",
-            self.charged.walked_bytes,
-            self.end_walk.span
-        );
+        // The step budget is charged every byte a settle walk passed, once
+        // (ADR-0174 A1.2): a demote step's seal walk passes exactly the
+        // records its flush then appends, and the end-of-replay settle the
+        // records of `[ro, tail)`.
         assert_eq!(
-            self.charged.walked_bytes, self.end_walk.record_bytes,
-            "walked bytes are the end settle's records, never a seal walk's"
+            self.charged.walked_bytes,
+            self.end_walk.record_bytes + self.counters.tier_bytes,
+            "walked bytes are the end settle's records and the sealed ones, each once"
         );
     }
 }
@@ -1704,9 +1708,11 @@ fn four_refs_of_one_key_under_one_sealed_winner_refuse_typed() {
 fn a_settle_keeps_or_removes_only_on_a_verified_record_of_its_hash() {
     use inf_log::tier::TierIdentity;
     fn image(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
-        let mut t = TieredTable::new(space_config(demote, 0), demote, 64, KeyHasher::default())
-            .expect("ring");
+        let mut t =
+            TieredTable::new(space_config(demote, 0), demote, 64, KeyHasher::default(), &census)
+                .expect("ring");
         let addr = t.insert(key, value, KeyHasher::default().hash(key)).expect("fits");
         let len = t.record(addr).encoded_len;
         t.record_bytes(addr, len).to_vec()
@@ -2629,6 +2635,7 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
         lowered(),
         4096,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("tier recovery");
     let ks = keyspace_with(NS, recovered.table);
@@ -2644,7 +2651,7 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
             let mut guard = parts.borrow_mut();
             let (ks, spill) = &mut *guard;
             let ro = ks.tiered_store(NS).expect("materialized").space().ro_boundary();
-            match ks.apply_record(&record, NOW, ANCHOR, spill) {
+            match inf_store::drive_record(ks, &record, NOW, ANCHOR, spill, u64::MAX) {
                 Ok(_) => Ok(()),
                 Err(ReplayError::Replay { refusal: ReplayRefusal::SettleRead { .. }, .. }) => {
                     let after = ks.tiered_store(NS).expect("materialized").space().ro_boundary();
@@ -2679,9 +2686,11 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
 /// A table recovered at origin 1 MiB with one manifested file below it
 /// (a ref must name a file's range).
 fn recovered_at_one_mib() -> TieredTable {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let demote = DemotionConfig::for_budget(BUDGET, PAGE);
-    let mut t = TieredTable::new(space_config(demote, 1 << 20), demote, 64, KeyHasher::default())
-        .expect("ring");
+    let mut t =
+        TieredTable::new(space_config(demote, 1 << 20), demote, 64, KeyHasher::default(), &census)
+            .expect("ring");
     t.seed_recovered_files(
         &[TierFileMeta {
             id: 0,
@@ -2722,6 +2731,7 @@ fn a_marker_at_or_above_the_origin_removes_nothing() {
 /// settled ref's origin stayed keyed by the dead address.
 #[test]
 fn a_replayed_overwrite_moves_the_origins_to_the_new_record() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let pre_life = LogicalAddr::from_raw(4096).expect("fits");
     let (k1, k2) = forced_collision_pair(6);
     let hash = KeyHasher::default().hash(&k1);
@@ -2733,8 +2743,9 @@ fn a_replayed_overwrite_moves_the_origins_to_the_new_record() {
     // are k1's older record).
     let image = {
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
-        let mut s = TieredTable::new(space_config(demote, 0), demote, 64, KeyHasher::default())
-            .expect("ring");
+        let mut s =
+            TieredTable::new(space_config(demote, 0), demote, 64, KeyHasher::default(), &census)
+                .expect("ring");
         let addr = s.insert(&k1, b"one-old", hash).expect("fits");
         let len = s.record(addr).encoded_len;
         s.record_bytes(addr, len).to_vec()

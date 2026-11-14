@@ -13,8 +13,9 @@
 //!
 //! The endurance slice test at the bottom runs on the real filesystem
 //! (`StdSegmentFs`): sustained overwrites, disk usage oscillating
-//! within budget, the cold floor advancing, and `statvfs` confirming
-//! the reclaimed space actually returned to the OS.
+//! within budget, the cold floor advancing, and the shared reclaim
+//! oracle (ADR-0200 D7) confirming that nothing this process holds keeps
+//! an unlinked file's blocks.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -34,6 +35,9 @@ use inf_store::{
 
 mod support;
 use support::*;
+
+#[cfg(unix)]
+mod reclaim;
 
 const NS: NsId = NsId(47);
 const FILE_CAPACITY: u64 = 48 << 10;
@@ -64,11 +68,18 @@ struct Rig {
 
 impl Rig {
     fn new() -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
         let fs = MemFs::new();
-        let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
-            .expect("ring");
-        let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
+        let table =
+            TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default(), &census)
+                .expect("ring");
+        let flush = TierFlush::new(
+            fs.clone(),
+            flush_config(NS, FILE_CAPACITY),
+            0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        );
         Rig {
             table,
             fs,
@@ -428,12 +439,19 @@ fn retirement_requires_a_covering_checkpoint_and_survives_abort() {
 /// slice — never a suspension — and flush/release progress resumes it.
 #[test]
 fn stalled_relocation_resumes_after_window_progress() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // A small budget so relocations hit the admission bound quickly.
     let demote = DemotionConfig::for_budget(192 << 10, PAGE);
     let fs = MemFs::new();
-    let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
-        .expect("ring");
-    let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
+    let table =
+        TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default(), &census)
+            .expect("ring");
+    let flush = TierFlush::new(
+        fs.clone(),
+        flush_config(NS, FILE_CAPACITY),
+        0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+    );
     let mut rig = Rig {
         table,
         fs,
@@ -733,6 +751,7 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
         demote,
         2048,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery");
     let mut ks = keyspace_with(NS, recovered.table);
@@ -783,11 +802,15 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
 
 /// The endurance slice (plan AC 1): sustained overwrites on the real
 /// filesystem — disk usage oscillates within budget, the cold floor
-/// advances, unlinked files are gone at the VFS, and `statvfs` confirms
-/// the blocks returned to the OS.
+/// advances, unlinked files are gone at the VFS, and after the last unlink
+/// this process holds none of them: the root's regular files are the
+/// flush's tier files alone, and no descriptor or mapping names an
+/// unlinked file (the shared reclaim oracle, ADR-0200 D7; Linux only for
+/// those two halves, the walk elsewhere).
 #[cfg(unix)]
 #[test]
-fn endurance_slice_disk_oscillates_and_statvfs_reclaims() {
+fn endurance_slice_disk_oscillates_and_reclaims() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     use inf_log::fs::StdSegmentFs;
 
     let root = std::env::temp_dir().join(format!("inf-s15-endurance-{}", std::process::id()));
@@ -815,40 +838,36 @@ fn endurance_slice_disk_oscillates_and_statvfs_reclaims() {
         total
     }
 
-    fn avail_bytes(path: &Path) -> u64 {
-        use std::os::unix::ffi::OsStrExt;
-        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
-        // SAFETY: `statvfs` is a plain-old-data C struct; the all-zero
-        // bit pattern is a valid (if meaningless) value for every field,
-        // and the FFI call below overwrites it before any read.
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        // SAFETY: `c` is a live NUL-terminated path and `stat` is a valid
-        // exclusive out-pointer for the duration of the call.
-        let rc = unsafe { libc::statvfs(c.as_ptr(), &mut stat) };
-        assert_eq!(rc, 0, "statvfs");
-        stat.f_bavail as u64 * stat.f_frsize as u64
-    }
-
     // A small budget so the 1500-key working set demotes cold and the
     // reclaim pipeline actually cycles.
     let demote = DemotionConfig::for_budget(256 << 10, PAGE);
     let config = TierFlushConfig { shard_dir: shard.clone(), ..flush_config(NS, FILE_CAPACITY) };
-    let mut table = TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default())
-        .expect("ring");
+    let mut table =
+        TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default(), &census)
+            .expect("ring");
     table.set_compaction_config(CompactionConfig { dead_ratio_pct: 50, slice_bytes: 1 << 20 });
-    let mut flush = TierFlush::new(StdSegmentFs, config, 0);
+    let mut flush = TierFlush::new(
+        StdSegmentFs,
+        config,
+        0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+    );
 
     let keys = 1500u64;
     let mut seed = 0x0E2D_5EED_u64;
     let mut ckpt_id = 0u64;
     let mut peak = 0u64;
     let mut unlinked_paths: Vec<std::path::PathBuf> = Vec::new();
+    // The plane's custody of the sealed files' handles, its cold-read file
+    // table: parked here as the flush hands them out, each dropped before
+    // its file is unlinked, so a retired file's blocks return at the
+    // unlink, not when the pipeline drops.
+    let mut parked = Vec::new();
     // Exact encoded lengths per key (values are fixed-size, so the
     // length is stable after the first insert — the cold-overwrite
     // death must carry the exact length, ADR-0058).
     let mut encoded: Vec<usize> = vec![0; keys as usize];
     let floor_start = table.cold_floor();
-    let avail_start = avail_bytes(&root);
 
     let maintain = |table: &mut TieredTable, flush: &mut TierFlush<StdSegmentFs>| {
         loop {
@@ -927,8 +946,10 @@ fn endurance_slice_disk_oscillates_and_statvfs_reclaims() {
         table.end_ckpt_walk();
         table.retire_scan(ckpt_id, &flush);
         let _section = table.tier_manifest(NS.0, &flush);
+        parked.extend(flush.take_sealed_handles());
         for id in table.commit_retirement() {
             let meta = flush.detach_sealed(id).expect("retired files are sealed");
+            parked.retain(|(parked_id, _)| *parked_id != id);
             unlink_tier_file(&StdSegmentFs, &meta).expect("unlink");
             unlinked_paths.push(meta.path);
         }
@@ -960,13 +981,10 @@ fn endurance_slice_disk_oscillates_and_statvfs_reclaims() {
     assert!(table.cold_floor() > floor_start, "the cold floor advanced");
     let used_end = dir_bytes(&root);
     assert!(used_end < peak, "final usage sits below the peak (disk oscillates)");
-    // statvfs: the blocks came back to the OS. Generous slack absorbs
-    // unrelated tempfs churn on a shared box; the direction is what the
-    // AC names (space returns, not merely accounting).
-    let avail_end = avail_bytes(&root);
-    let slack = 16u64 << 20;
-    assert!(
-        avail_end + slack >= avail_start.saturating_sub(used_end),
-        "statvfs shows the unlinked bytes returned (start {avail_start}, end {avail_end})"
-    );
+    // Space returns, not merely accounting: what this process still holds
+    // under the root is the flush's tier files, and nothing unlinked.
+    let mut residual: Vec<std::path::PathBuf> =
+        flush.sealed().iter().map(|meta| meta.path.clone()).collect();
+    residual.extend(flush.active().map(|(_, _, _, _, path)| path.to_path_buf()));
+    reclaim::assert_reclaimed(&root, &residual);
 }

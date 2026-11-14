@@ -41,14 +41,14 @@ use inf_foundation::time::{Clock, StdClock};
 use inf_log::ckpt::{SyncIckWriter, ick_file_name};
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
-    CkptConfig, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentConfig, SegmentId,
-    SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir, segment_file_name,
-    write_manifest,
+    CkptConfig, LogGeometry, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentConfig,
+    SegmentId, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir,
+    segment_file_name, write_manifest,
 };
 use inf_runtime::net::listen_reuseport;
 use inf_runtime::{BackendDriver, CellLoop, LoopConfig, UringDriver};
 use inf_server::{DurableConfig, NodeInfo, NoopObserver, ServerPlane};
-use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig};
+use inf_store::{FsyncClass, KeyspaceSeed, NsMode, NsSpec, StoreConfig};
 
 const NS: NsId = NsId(16);
 const VALUE_LEN: usize = 512;
@@ -100,8 +100,11 @@ fn value_of(i: u64, buf: &mut [u8; VALUE_LEN]) {
 fn durable_config(root: &Path) -> DurableConfig {
     DurableConfig {
         data_dir: root.to_path_buf(),
-        staging: StagingConfig::with_capacity(128 << 10),
-        segment: SegmentConfig { segment_bytes: 256 << 20, ..Default::default() },
+        geometry: LogGeometry::new(
+            StagingConfig::with_capacity(128 << 10),
+            SegmentConfig { segment_bytes: 256 << 20, ..Default::default() },
+        )
+        .expect("the bench's log geometry"),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -119,8 +122,8 @@ fn build_cell_image(root: &Path, cfg: &DurableConfig, cell: u16, records: u64) -
     let fs = StdSegmentFs;
     let shard = root.join(format!("shard-{cell}"));
     let dirs = create_cell_dirs(&fs, &shard).expect("dirs");
-    let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), cfg.segment).expect("rotor");
-    let mut ring = StagingRing::new(cfg.staging);
+    let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), cfg.geometry).expect("rotor");
+    let mut ring = StagingRing::new(cfg.geometry);
     let mut value = [0u8; VALUE_LEN];
     let mut staged = 0u64;
     let mut begin: Option<Lsn> = None;
@@ -216,8 +219,7 @@ fn drive_cell(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     node.wall_anchor.set((0, unix_ms));
-    let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
+    let spec = NsSpec {
         id: NS,
         name: b"bench".to_vec(),
         mode: NsMode::Durable,
@@ -225,18 +227,19 @@ fn drive_cell(
         policy: None,
         maxmemory: None,
         tier: None,
-    })
-    .expect("ns");
-    let (mut plane, serve_mark) = ServerPlane::new(
+    };
+    let seed = KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: vec![spec] };
+    let (mut plane, serve_mark, timer_set) = ServerPlane::new(
         CellId(i as u16),
         cells,
         listener.into_raw_fd(),
-        ks,
+        seed,
         fabric,
         node,
         NoopObserver,
         false,
-    );
+    )
+    .expect("the server's timer owners fit their cap");
     plane.set_control(control, issuer).expect("the issuer of this cell");
     // M2.5-S08 A/B arm on the config (ADR-0109): the prefetch wrapper is
     // Recovery-private; the plane's filesystem is the bare tier.
@@ -244,10 +247,11 @@ fn drive_cell(
     cfg.recover.boot_prefetch = boot_prefetch;
     plane.begin_recovery(StdSegmentFs, &cfg, i as u16, StdClock::new().now());
     let config = LoopConfig {
-        park_default: Some(std::time::Duration::from_micros(500)),
+        park_default: inf_runtime::ParkCeiling::new(std::time::Duration::from_micros(500))
+            .expect("a park ceiling within the maximum"),
         ..Default::default()
     };
-    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark);
+    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set);
     while !stop.load(Ordering::Relaxed) {
         cell_loop.run_iteration(&mut plane).expect("iteration");
         if let Some(err) = plane.take_boot_error() {
@@ -273,7 +277,8 @@ fn boot_once(root: &Path, cells: u16) -> f64 {
     let catalog = inf_server::load_catalog(root).expect("catalog");
     let cell_count = inf_foundation::CellCount::new(cells).expect("a valid bench topology");
     let (control, issuers) =
-        inf_server::spawn_control(root.to_path_buf(), catalog.as_ref(), cell_count, boot_unix_ms);
+        inf_server::spawn_control(root.to_path_buf(), catalog.as_ref(), cell_count, boot_unix_ms)
+            .expect("the catalog boots");
     let mut cell_issuers = issuers.cells.into_iter();
     let board = Arc::clone(control.recovery_board());
 

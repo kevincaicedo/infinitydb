@@ -287,6 +287,7 @@ pub(in crate::plane) async fn read_cold_record<
                 Err(ColdRefused::QueueFull) => return Err(ERR_COLD_BUSY),
                 // Permanent (ADR-0167 D3); a 48-bit address cannot reach it.
                 Err(ColdRefused::Unrepresentable(_)) => return Err(ERR_COLD_IO),
+                Err(ColdRefused::IdentityExhausted) => return Err(ERR_COLD_IDENTITY),
             }
         };
         let done = wait.await;
@@ -407,7 +408,12 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     // deferred; charged on every arm that wrote, once the window's
     // reservation has ended.
     let sealed = match registered {
-        ExtentRegistration::Registered(_, sealed) => sealed,
+        ExtentRegistration::Registered(ticket, sealed) => {
+            // The ledger holds the extent's handle until this barrier is
+            // synced: the namespace's drain waits for it (ADR-0148 D3).
+            t.note_extent_barrier(ticket.as_u64());
+            sealed
+        }
         ExtentRegistration::Full => return Err(park_at_full(cell, turn)),
         ExtentRegistration::Refused(refusal) => {
             cell.charge_foreground(inf_runtime::IoClass::BlobWrite, write.value.len() as u64, 1);
@@ -564,17 +570,17 @@ pub(super) fn error_bytes<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     message: &str,
-) -> Vec<u8> {
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).error(message);
-    reply
+) -> OwnedReply {
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    RespWriter::new(reply.reply(), proto).error(message);
+    reply.finish()
 }
 
 fn diskfull_bytes<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     cause: inf_store::DiskFullCause,
-) -> Vec<u8> {
+) -> OwnedReply {
     let message = match cause {
         inf_store::DiskFullCause::Budget { used, budget } => {
             format!("DISKFULL tiered namespace disk budget exhausted (used={used} budget={budget})")
@@ -583,9 +589,9 @@ fn diskfull_bytes<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             "DISKFULL tier device out of space (ENOSPC)".to_string()
         }
     };
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).error(&message);
-    reply
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    RespWriter::new(reply.reply(), proto).error(&message);
+    reply.finish()
 }
 
 /// Drives one value write to completion: resolve → attempt → park loops
@@ -599,8 +605,8 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     class: Option<FsyncClass>,
     key: &[u8],
     proto: Protocol,
-    compute: impl Fn(Option<&[u8]>, Option<u32>) -> Result<Vec<u8>, Vec<u8>>,
-) -> Result<(u64, Option<Vec<u8>>), Vec<u8>> {
+    compute: impl Fn(Option<&[u8]>, Option<u32>) -> Result<Vec<u8>, OwnedReply>,
+) -> Result<(u64, Option<Vec<u8>>), OwnedReply> {
     let hash = shared.hasher.hash(key);
     let deadline = stall_deadline(shared, ns);
     let mut replans: u8 = 0;
@@ -612,7 +618,8 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         let guard = WriteGuard::of(&resolved);
         let (old, old_value): (Displaced, Option<Vec<u8>>) = match resolved {
             Resolved::Miss => (None, None),
-            Resolved::Ram(addr) => {
+            Resolved::Ram(inline) => {
+                let addr = inline.addr();
                 let ks = shared.store.borrow();
                 let table = ks.tiered_store(ns).expect("resolved on this table");
                 let parts = table.record(addr);
@@ -666,7 +673,7 @@ async fn park_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     deadline: Nanos,
     turn: &mut Option<ExtentTurn>,
     proto: Protocol,
-) -> Result<(), Vec<u8>> {
+) -> Result<(), OwnedReply> {
     match park {
         Park::Staging => {
             drop(turn.take());
@@ -749,8 +756,8 @@ pub(super) async fn set_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + '
     // option is the shadow-eligible shape (ADR-0093 D1).
     let plain = !nx && !xx && !get_old;
     let outcome = write_conditional(shared, ns, class, key, proto, nx, xx, value, plain).await;
-    let mut reply = shared.take_reply_buf();
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    let mut w = RespWriter::new(reply.reply(), proto);
     match outcome {
         Ok((seq, old_value, applied)) => {
             if get_old {
@@ -764,15 +771,16 @@ pub(super) async fn set_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + '
                 w.null();
             }
             if applied && class == Some(FsyncClass::Always) {
-                return TieredReply::Gated { reply, seq };
+                return TieredReply::Gated { reply: reply.finish(), seq };
             }
-            TieredReply::Done(reply)
+            TieredReply::Done(reply.finish())
         }
+        // The write's own error reply is the answer, moved; this
+        // reply's buffer recycles (ADR-0190 D1: a whole reply is never
+        // pasted).
         Err(err) => {
-            reply.clear();
-            reply.extend_from_slice(&err);
-            shared.recycle_reply_buf(err);
-            TieredReply::Done(reply)
+            shared.recycle_reply_buf(reply.finish().into_bytes());
+            TieredReply::Done(err)
         }
     }
 }
@@ -789,7 +797,7 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     xx: bool,
     value: &[u8],
     plain: bool,
-) -> Result<(u64, Option<Vec<u8>>, bool), Vec<u8>> {
+) -> Result<(u64, Option<Vec<u8>>, bool), OwnedReply> {
     let hash = shared.hasher.hash(key);
     let deadline = stall_deadline(shared, ns);
     let mut replans: u8 = 0;
@@ -846,7 +854,8 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
             let guard = WriteGuard::of(&resolved);
             match resolved {
                 Resolved::Miss => (None, None, guard),
-                Resolved::Ram(addr) => {
+                Resolved::Ram(inline) => {
+                    let addr = inline.addr();
                     let ks = shared.store.borrow();
                     let table = ks.tiered_store(ns).expect("resolved on this table");
                     let parts = table.record(addr);
@@ -897,12 +906,12 @@ pub(super) async fn setnx<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
         .await
     {
         Ok((seq, _, applied)) => {
-            let mut reply = shared.take_reply_buf();
-            RespWriter::new(&mut reply, proto).int(i64::from(applied));
+            let mut reply = OpenReply::new(shared.take_reply_buf());
+            RespWriter::new(reply.reply(), proto).int(i64::from(applied));
             if applied && class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply, seq }
+                TieredReply::Gated { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply)
+                TieredReply::Done(reply.finish())
             }
         }
         Err(err) => TieredReply::Done(err),
@@ -920,16 +929,16 @@ pub(super) async fn getset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
         .await
     {
         Ok((seq, old_value, _)) => {
-            let mut reply = shared.take_reply_buf();
-            let mut w = RespWriter::new(&mut reply, proto);
+            let mut reply = OpenReply::new(shared.take_reply_buf());
+            let mut w = RespWriter::new(reply.reply(), proto);
             match &old_value {
                 Some(v) => w.bulk(v),
                 None => w.null(),
             }
             if class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply, seq }
+                TieredReply::Gated { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply)
+                TieredReply::Done(reply.finish())
             }
         }
         Err(err) => TieredReply::Done(err),
@@ -1065,12 +1074,12 @@ pub(super) async fn incr<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     };
     match outcome {
         Ok((seq, _)) => {
-            let mut reply = shared.take_reply_buf();
-            RespWriter::new(&mut reply, proto).int(computed.get());
+            let mut reply = OpenReply::new(shared.take_reply_buf());
+            RespWriter::new(reply.reply(), proto).int(computed.get());
             if class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply, seq }
+                TieredReply::Gated { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply)
+                TieredReply::Done(reply.finish())
             }
         }
         Err(err) => TieredReply::Done(err),
@@ -1117,12 +1126,12 @@ pub(super) async fn incrbyfloat<O: PlaneObserver + 'static, F: SegmentFs + Clone
     };
     match outcome {
         Ok((seq, _)) => {
-            let mut reply = shared.take_reply_buf();
-            RespWriter::new(&mut reply, proto).bulk(&rendered.borrow());
+            let mut reply = OpenReply::new(shared.take_reply_buf());
+            RespWriter::new(reply.reply(), proto).bulk(&rendered.borrow());
             if class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply, seq }
+                TieredReply::Gated { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply)
+                TieredReply::Done(reply.finish())
             }
         }
         Err(err) => TieredReply::Done(err),
@@ -1139,8 +1148,8 @@ pub(super) async fn getdel<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     let key = argv.arg(1);
     match delete_one(shared, ns, class, key, proto, true).await {
         Ok(deleted) => {
-            let mut reply = shared.take_reply_buf();
-            let mut w = RespWriter::new(&mut reply, proto);
+            let mut reply = OpenReply::new(shared.take_reply_buf());
+            let mut w = RespWriter::new(reply.reply(), proto);
             match &deleted {
                 Some((_, Some(v))) => w.bulk(v),
                 _ => w.null(),
@@ -1148,9 +1157,9 @@ pub(super) async fn getdel<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
             if let Some((seq, _)) = deleted
                 && class == Some(FsyncClass::Always)
             {
-                TieredReply::Gated { reply, seq }
+                TieredReply::Gated { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply)
+                TieredReply::Done(reply.finish())
             }
         }
         Err(err) => TieredReply::Done(err),
@@ -1176,12 +1185,12 @@ pub(super) async fn del<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             Err(err) => return TieredReply::Done(err),
         }
     }
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).int(removed);
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    RespWriter::new(reply.reply(), proto).int(removed);
     if removed > 0 && class == Some(FsyncClass::Always) {
-        TieredReply::Gated { reply, seq: last_seq }
+        TieredReply::Gated { reply: reply.finish(), seq: last_seq }
     } else {
-        TieredReply::Done(reply)
+        TieredReply::Done(reply.finish())
     }
 }
 
@@ -1199,7 +1208,7 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     key: &[u8],
     proto: Protocol,
     want_value: bool,
-) -> Result<Option<(u64, Option<Vec<u8>>)>, Vec<u8>> {
+) -> Result<Option<(u64, Option<Vec<u8>>)>, OwnedReply> {
     let hash = shared.hasher.hash(key);
     loop {
         let Some(target) = resolve_delete_target(shared, ns, key, hash, want_value, proto).await?
@@ -1329,10 +1338,11 @@ async fn resolve_delete_target<O: PlaneObserver + 'static, F: SegmentFs + Clone 
     hash: u64,
     want_value: bool,
     proto: Protocol,
-) -> Result<Option<DeleteTarget>, Vec<u8>> {
+) -> Result<Option<DeleteTarget>, OwnedReply> {
     let target = match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {
         Resolved::Miss => None,
-        Resolved::Ram(addr) => {
+        Resolved::Ram(inline) => {
+            let addr = inline.addr();
             let ks = shared.store.borrow();
             let table = ks.tiered_store(ns).expect("resolved on this table");
             let parts = table.record(addr);
@@ -1409,7 +1419,7 @@ fn stage_delete<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     target: &DeleteTarget,
     twins: &mut TwinScratch,
     proto: Protocol,
-) -> Result<Staged, Vec<u8>> {
+) -> Result<Staged, OwnedReply> {
     let mut ks = shared.store.borrow_mut();
     let mut durable = shared.durable.borrow_mut();
     let Some(cell) = durable.as_mut() else {
@@ -1538,11 +1548,180 @@ pub(super) async fn mset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         }
         i += 2;
     }
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).simple("OK");
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    RespWriter::new(reply.reply(), proto).simple("OK");
     if class == Some(FsyncClass::Always) {
-        TieredReply::Gated { reply, seq: last_seq }
+        TieredReply::Gated { reply: reply.finish(), seq: last_seq }
     } else {
-        TieredReply::Done(reply)
+        TieredReply::Done(reply.finish())
+    }
+}
+
+#[cfg(test)]
+mod hole_refusal_tests {
+    use std::path::Path;
+
+    use super::*;
+    use inf_fabric::{Mesh, MeshConfig};
+    use inf_log::TierIoMode;
+    use inf_log::blob::{ExtentId, ExtentWriter};
+    use inf_log::fs::mem::MemFs;
+
+    const MIB: u64 = 1 << 20;
+
+    /// A plane serving one tiered namespace, built on the plane's census, whose
+    /// table's window is four 1 MiB pages over an eight-page ring: the head at
+    /// page 5 and three planted pads pending above it (pages 5 and 6, then page
+    /// 7 less `short` bytes), so a record longer than `short` bytes fits the
+    /// window and needs a ring-top hole, a fourth hole mark. The front pad ends
+    /// at page 6.
+    fn plane_at_three_pending_holes(short: u64) -> ServerPlane<NoopObserver, crate::StdSegmentFs> {
+        let tier = inf_store::TierSpec {
+            maintain_slice_bytes: 64 << 10,
+            ..inf_store::TierSpec::for_budget(4 * MIB)
+        };
+        let spec = inf_store::NsSpec {
+            id: NsId(16),
+            name: b"tiered".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: Some(tier),
+        };
+        let fabric = Mesh::new(1, MeshConfig::default()).into_iter().next().expect("one cell");
+        let seed =
+            KeyspaceSeed::Uncataloged { cfg: inf_store::StoreConfig::default(), specs: vec![spec] };
+        let (plane, _serve_mark, _timer_set) =
+            ServerPlane::<NoopObserver, crate::StdSegmentFs>::new(
+                CellId(0),
+                1,
+                -1,
+                seed,
+                fabric,
+                Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+                NoopObserver,
+                false,
+            )
+            .expect("the plane");
+        {
+            let mut ks = plane.shared.store.borrow_mut();
+            let table = ks.tiered_store_mut(NsId(16)).expect("the tiered table");
+            assert_eq!(table.space().ring_bytes(), 8 * MIB, "an eight-page ring");
+            let space = table.space_mut();
+            for len in [4 * MIB, MIB] {
+                assert!(space.plant_hole(len), "a released pad");
+                space.advance_ro_boundary(space.tail());
+                space.advance_flushed(space.tail());
+                space.advance_head(space.tail());
+            }
+            for len in [MIB, MIB, MIB - short] {
+                assert!(space.plant_hole(len), "a pending pad");
+            }
+        }
+        plane
+    }
+
+    /// Seals the tail, then flushes and releases to the front pad's end, the
+    /// `flushed` value that pops its mark.
+    fn flush_past_the_front_hole(table: &mut TieredTable) {
+        let space = table.space_mut();
+        space.advance_ro_boundary(space.tail());
+        let front_end = LogicalAddr::from_raw(6 * MIB).expect("48-bit");
+        space.advance_flushed(front_end);
+        space.advance_head(front_end);
+    }
+
+    /// The `hole-marks` row's crossings on `plane`'s census.
+    fn hole_mark_crossings(plane: &ServerPlane<NoopObserver, crate::StdSegmentFs>) -> u64 {
+        plane.cap_census().row("hole-marks").map_or(0, |row| row.crossings)
+    }
+
+    /// A write whose record needs a fourth hole mark is refused before any
+    /// mutation, and through `write_block_of` the refusal is the tail
+    /// stall's park, with no reply byte, never `ERR_OOM`; once `flushed`
+    /// passes the front hole and the head follows, the same write places.
+    /// The plane census's `hole-marks` row counts the refused ask. A
+    /// 200-byte record needs the ring-top hole past the last 100 bytes.
+    #[test]
+    fn a_write_that_needs_a_fourth_hole_mark_parks_until_the_front_hole_flushes() {
+        let plane = plane_at_three_pending_holes(100);
+        let shared = &plane.shared;
+        let mut ks = shared.store.borrow_mut();
+        let table = ks.tiered_store_mut(NsId(16)).expect("the tiered table");
+        let value = vec![b'v'; 200 - 8 - 1];
+        let hash = table.hash_key(b"k");
+        let before = (table.space().tail(), table.space().counters());
+        let refused = table.insert(b"k", &value, hash).expect_err("a fourth hole mark");
+        assert_eq!(refused, inf_store::OpError::OutOfMemory);
+        assert_eq!((table.space().tail(), table.space().counters()), before, "nothing changed");
+        let block = write_block_of(
+            shared,
+            table,
+            b"k",
+            StallProbe::Inline(&value),
+            refused,
+            Protocol::Resp2,
+        );
+        assert!(matches!(block, WriteBlock::Stall), "the writer parks on the tail stall");
+        let crossings = hole_mark_crossings(&plane);
+        assert!(crossings >= 1, "the refused ask counted: {crossings}");
+        flush_past_the_front_hole(table);
+        let placed = table.insert(b"k", &value, hash).expect("places once the front hole flushed");
+        assert_eq!(placed.to_raw(), 8 * MIB, "past the ring-top hole");
+    }
+
+    /// The blob leg: a `SET` whose value lives in an extent refuses the
+    /// 24-byte reference record where it needs a fourth hole mark (the last
+    /// 20 bytes below the ring top), and the store's refusal reaches
+    /// `write_block_of` through `refused_block` with the extent probe, which
+    /// sizes the stall target from the reference, never the value: the
+    /// writer parks on the front hole's end, with no reply byte, never
+    /// `ERR_OOM`. Once `flushed` passes the front hole the same reference
+    /// places past the ring-top hole.
+    #[test]
+    fn a_blob_write_whose_reference_needs_a_fourth_hole_mark_parks_until_the_front_hole_flushes() {
+        let plane = plane_at_three_pending_holes(20);
+        let shared = &plane.shared;
+        let fs = MemFs::new();
+        let value = vec![0x42u8; 9_000];
+        let mut writer = ExtentWriter::create(
+            &fs,
+            Path::new("shard-0"),
+            ExtentId(1),
+            0,
+            NsId(16),
+            value.len() as u64,
+            TierIoMode::Buffered,
+        )
+        .expect("the extent's file");
+        writer.append_chunk(&value).expect("the extent's chunk");
+        let sealed = writer.finish().expect("the sealed extent");
+        let mut ks = shared.store.borrow_mut();
+        let table = ks.tiered_store_mut(NsId(16)).expect("the tiered table");
+        let hash = table.hash_key(b"b");
+        let before = (table.space().tail(), table.space().counters());
+        let refused = table.insert_extent(b"b", hash, &sealed).expect_err("a fourth hole mark");
+        assert_eq!(refused, inf_store::OpError::OutOfMemory);
+        assert_eq!((table.space().tail(), table.space().counters()), before, "nothing changed");
+        let front_end = LogicalAddr::from_raw(6 * MIB).expect("48-bit");
+        assert_eq!(table.extent_stall_target(b"b"), Some(front_end), "the front hole's end");
+        let write = BlobWrite {
+            ns: NsId(16),
+            class: FsyncClass::Always,
+            key: b"b",
+            hash,
+            value: &value,
+            old: None,
+            proto: Protocol::Resp2,
+        };
+        let block = refused_block(shared, &write, table, ExtentRefusal::Store(refused));
+        assert!(matches!(block, WriteBlock::Stall), "the writer parks on the tail stall");
+        let crossings = hole_mark_crossings(&plane);
+        assert!(crossings >= 1, "the refused ask counted: {crossings}");
+        flush_past_the_front_hole(table);
+        let placed =
+            table.insert_extent(b"b", hash, &sealed).expect("places once the front hole flushed");
+        assert_eq!(placed.to_raw(), 8 * MIB, "past the ring-top hole");
     }
 }

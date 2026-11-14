@@ -1,71 +1,90 @@
 # InfinityDB workspace tasks. Run from infinitydb/ (the published repo root).
 
+# Every recipe builds in this checkout's own target (ADR-0204 D1): cargo reads
+# another checkout's outputs as fresh, and a moved root or a target triple
+# leaves a path into target/<profile> naming an older build, so before any
+# recipe runs scripts/target-root.sh refuses each setting that moves the root,
+# a root a copied or moved checkout carries, and one holding outputs no marker
+# names.
+export CARGO_TARGET_DIR := `./scripts/target-root.sh --print`
+
 default: check
 
 check:
     cargo fmt --all --check
+    # ADR-0200 D5: the tests run under cargo-nextest, at least the version
+    # .config/nextest.toml requires; a missing or older one is red here, in
+    # about a second, not after the gates.
+    cargo nextest show-config version
+    # One stage (scripts/check-stage.sh) runs the gates it names at once, under one
+    # job pool of CARGO_BUILD_JOBS, and prints each one's output whole under its
+    # own header; INF_CHECK_STAGE=serial runs them one at a time. The comments
+    # below are the gates', in the order the line names them.
     # Every relative link in a published Markdown file resolves inside the
     # repository (ADR-0166 D5), beside the document identities.
-    ./scripts/check-doc-artifacts.sh
-    # ADR-0164: the document gates of the combined checkout; a standalone
-    # checkout prints the skip.
-    ./scripts/check-parent-doc-gates.sh
-    ./scripts/check-dep-dag.sh
-    ./scripts/check-cell-denylist.sh
-    ./scripts/check-fault-points.sh
-    ./scripts/check-fsync-fail-stop.sh
-    ./scripts/check-panic-policy.sh
+    # ADR-0190 D4, A2: no production site of inf-server decides a reply's outcome
+    # from its bytes, or names a fabric reply tag outside the functions that set and read it.
+    # ADR-0203 D3: a test names infinityd only through the node module, whose
+    # starts hold the box's node lock; every ring outside a node is a census row.
+    # ADR-0172 D2: a pre-effect refusal's text is inf_wire::Refusal's alone,
+    # so no production line of inf-server spells a refusal class suffix.
     # ADR-0107 D2 (review 2026-08-30, Theme 4): every release assert/expect/
     # panic/unreachable in cell code is a classified inventory row.
-    ./scripts/check-release-asserts.sh
-    ./scripts/check-safety-inventory.sh
     # ADR-0125: the counted disciplines are gates: 3000 production lines per
     # file, 100 columns on every line of the Rust files under crates/, bins/
     # and tests/, and the 70-line function ratchet.
-    ./scripts/check-file-length.sh
-    ./scripts/check-line-width.sh
     # ADR-0144 D3: one ratchet — fn-length, and the cast / arithmetic
     # backlog of the decoder files docs/lint-scopes.tsv lists — judged
     # against the table's approved copies in history.
-    ./scripts/check-lint-ratchet.sh
     # ADR-0144: every `src/lib.rs`, `src/main.rs` and `src/bin/*.rs` root
     # under crates/ and bins/ is under the wildcard deny, an attribute
     # silences a lint of the ADR only as a reasoned allow of one of that
     # lint's classes, the ADR-0143 exemptions are frozen, and the probe's
     # plants draw their lint.
-    ./scripts/check-lint-scopes.sh
     # ADR-0165 D2: every saturating_/wrapping_ call in a deny-arith scope is a
     # counted row of docs/arith-spellings.tsv, reviewed against D1's rows.
-    ./scripts/check-arith-spellings.sh
     # ADR-0121: every `src/lib.rs`, `src/main.rs` and `src/bin/*.rs` root of
     # the workspace forbids or denies unsafe_code, the deny set is the
     # audited-leaf list, and every allow written exactly
     # `allow(unsafe_code)` is module-scoped.
-    ./scripts/check-unsafe-roots.sh
     # ADR-0107 (review 2026-08-30, F-L16-01): no normal dependency edge may
     # request fault-points/collision-oracle — a workspace build would link
     # infinityd against a colliding hasher.
-    ./scripts/check-shipping-features.sh
-    # ADR-0106: the gates above must go red on a planted violation, or
-    # their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
-    ./scripts/check-scripts-selftest.sh
+    # ADR-0198: every fuzz target compiles, on the pinned toolchain with
+    # warnings denied, under its committed lock and cfg(fuzzing), and a probe
+    # of planted reds proves the gate sees each shape it guards.
     # ADR-0106 first amendment (review 2026-08-30 F-L18-05): the ambient-
     # clock ban is clippy's type-resolved disallowed-methods; this gate
     # proves the config is in force on planted bypass spellings; the
     # common lint-scopes audit lists and checks the sanctioned sites.
-    ./scripts/check-clock-ban.sh
     # ADR-0106 second amendment (review 2026-08-30, F-L20-03): the M0-S06
     # AC's own gate ran nowhere and scanned zero instructions per waker.
-    ./scripts/check-waker-atomics.sh
+    # ADR-0207 D1-D3, ADR-0200 D4, D7: every static lock and every marked
+    # run-alone or long test has its nextest override, CI installs the nextest
+    # the config requires, and no test file reads free space or leaves a
+    # tiered namespace's stall bound unstated.
+    ./scripts/check-stage.sh check-doc-artifacts.sh check-dep-dag.sh check-cell-denylist.sh check-fault-points.sh check-fsync-fail-stop.sh check-panic-policy.sh check-reply-outcome.sh check-node-spawn.sh check-refusal-text.sh check-release-asserts.sh check-safety-inventory.sh check-file-length.sh check-line-width.sh check-lint-ratchet.sh check-lint-scopes.sh check-arith-spellings.sh check-unsafe-roots.sh check-shipping-features.sh check-fuzz-targets.sh check-clock-ban.sh check-waker-atomics.sh check-nextest-config.sh
     cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
+    # ADR-0164: the document gates of the combined checkout; a standalone
+    # checkout prints the skip. They run after clippy, so a compile or lint
+    # red comes first.
+    # ADR-0106: the gates above must go red on a planted violation, or
+    # their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
+    # It runs after clippy, so a compile or lint red stops the run first.
+    ./scripts/check-stage.sh check-parent-doc-gates.sh check-scripts-selftest.sh
+    # ADR-0200 D1: each set's tests run under nextest, one process a test,
+    # every binary even after a red; its doctests run under cargo test.
+    cargo nextest run --no-fail-fast --workspace
+    cargo test --doc --workspace
     cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings
-    cargo test -p inf-doc -p inf-store --features doc-intern-keys
+    cargo nextest run --no-fail-fast -p inf-doc -p inf-store --features doc-intern-keys
+    cargo test --doc -p inf-doc -p inf-store --features doc-intern-keys
     # Slim-build lane (L11, ADR-0041 D3): a docless server carries zero
     # document/path code and must keep compiling that way — warnings
     # denied since ADR-0125 A2 (a doc-only const warned here for months).
     cargo clippy -p inf-server -p inf-store --no-default-features -- -D warnings
-    cargo test -p inf-server -p inf-store --no-default-features
+    cargo nextest run --no-fail-fast -p inf-server -p inf-store --no-default-features
+    cargo test --doc -p inf-server -p inf-store --no-default-features
 
 build:
     cargo build --workspace --exclude inf-sim
@@ -80,21 +99,55 @@ fmt:
 dag:
     ./scripts/check-dep-dag.sh
 
+# cargo-deny on every lock that holds a third-party crate, the root's and
+# each fuzz manifest's: the manifests the fuzz census lists (ADR-0198 D6),
+# with the features PR CI's cargo-deny jobs judge (--all-features, the
+# action's default). Every leg runs with no stdin, so none can read the list
+# the loop reads, and its status is read; one red leg fails the recipe, and so
+# do an empty list and a leg count other than the census's rows. The first leg
+# fetches the advisory database and the rest read that copy, so every leg
+# judges one snapshot.
 deny:
-    cargo deny check
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rows=$(./scripts/check-fuzz-targets.sh --matrix deny)
+    list='import json, sys; print("\n".join(r["manifest"] for r in json.load(sys.stdin)["include"]))'
+    manifests=$(python3 -I -c "$list" <<<"$rows")
+    size='import json, sys; print(len(json.load(sys.stdin)["include"]))'
+    count=$(python3 -I -c "$size" <<<"$rows")
+    [ "$count" -gt 0 ] || { echo "deny SCOPE ERROR: the fuzz census listed no manifest"; exit 1; }
+    n=0 red=0 fetch=check
+    while IFS= read -r manifest; do
+        n=$((n + 1))
+        if cargo deny --manifest-path "$manifest" --all-features $fetch </dev/null; then
+            echo "deny: $manifest ok"
+        else
+            status=$?
+            echo "deny: $manifest red (exit $status)"
+            red=$((red + 1))
+        fi
+        fetch="check --disable-fetch"
+    done <<<"$manifests"
+    [ "$n" -eq "$count" ] \
+        || { echo "deny FAILED: ran $n of the $count manifests the census listed"; exit 1; }
+    [ "$red" -eq 0 ] || { echo "deny FAILED: $red of $n manifests red"; exit 1; }
+    echo "deny OK: $n manifests (the root and $((n - 1)) fuzz manifests), each rc 0"
 
-# Loom models: the SPSC ring and checkpoint issuance (PRs touching inf-fabric
-# or inf-foundation's `issue` module must run this).
+# Loom models: the SPSC ring, checkpoint issuance and the wake bridge (PRs
+# touching inf-fabric or inf-foundation's `issue` or `wake` module must run
+# this).
 loom:
     RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p inf-fabric --release loom_
-    # ADR-0159 A1.6/A1.7: the checkpoint issuance orderings, checked on the
-    # product's own `issue` types.
+    # ADR-0159 A1.6/A1.7 and ADR-0003 A1.7: the checkpoint issuance orderings
+    # and the wake bridge's lane, checked on the product's own `issue` and
+    # `wake` types.
     RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p inf-foundation --release loom_
 
-# Compat-diff requires Redis 8.0.5 on PATH or INF_COMPAT_ORACLE_ADDR.
+# Compat-diff requires Redis 8.0.5 on PATH or INF_COMPAT_ORACLE_ADDR. The
+# server it diffs is the one it builds, in this checkout's target root.
 compat:
     cargo build -p infinityd
-    INF_COMPAT_REQUIRE_BINARY=1 INFINITYD_BIN={{justfile_directory()}}/target/debug/infinityd cargo test -p compat -- --nocapture
+    INF_COMPAT_REQUIRE_BINARY=1 INFINITYD_BIN={{quote(CARGO_TARGET_DIR + "/debug/infinityd")}} cargo test -p compat -- --nocapture
 
 # Deterministic simulator smoke scenarios, each twice, comparing traces.
 # m4-steel is the M4-S04 steel-thread twin (tiered lifecycle + cold reads
@@ -137,21 +190,23 @@ durable-sweep seeds="10000" base="0xD5EE0000":
 budget-sweep seeds="1000" base="0xB0D6E700":
     ./scripts/run-sweep.sh m2-device-budget {{seeds}} {{base}}
 
-# Barrier-class transition sweep (ADR-0086 D4 / ADR-0031 D5 as amended,
-# 2026-08-21): two lives per seed — FLUSH → FUA on even seeds (a packed
-# tail reopened under a Direct rotor after a dirty cut), FUA → FLUSH on
-# odd — under the m2 durability oracle, with the stale-residue recovery
-# rule exercised by the no-checkpoint half. Usage:
+# Barrier-class transition sweep: two lives per seed under the m2
+# durability oracle. FLUSH → FUA on even seeds reopens a packed tail under
+# a Direct rotor after a dirty cut, which resumes Buffered at its own
+# offset, never padded to alignment (ADR-0086 D4); FUA → FLUSH runs on odd
+# seeds. The no-checkpoint half exercises the stale-residue rule: a
+# discarded life's frames in sealed slack are residue, never a hole
+# (ADR-0031 D5). Usage:
 #   just transition-sweep [seeds] [base]
 transition-sweep seeds="4000" base="0x7A4E0000":
     ./scripts/run-sweep.sh m2-mode-transition {{seeds}} {{base}}
 
-# Completion-ledger reorder-window sweep (ADR-0087 D2 as amended,
-# 2026-08-22): every 40th plain write wedged 150 ms on a K ≥ 2 pipeline
-# of everysec-only frames, so the ledger's reorder window fills and the
-# next frame holds — the window must engage on every seed (oracle), the
-# ledger's bound is release-asserted, the m2 durability oracle holds.
-# Usage:
+# Completion-ledger reorder-window sweep: the ledger queues at most a
+# reorder window of frames and holds the next one while it is full
+# (ADR-0087 D2). Every 40th plain write wedged 150 ms on a K ≥ 2 pipeline
+# of everysec-only frames, so the window fills and the next frame holds —
+# the window must engage on every seed (oracle), the ledger's bound is
+# release-asserted, the m2 durability oracle holds. Usage:
 #   just reorder-sweep [seeds] [base]
 reorder-sweep seeds="2000" base="0x2E0D0000":
     ./scripts/run-sweep.sh m2-reorder-window {{seeds}} {{base}}
@@ -196,7 +251,7 @@ client-smoke port="6379":
     set -euo pipefail
     cargo build --release -p infinityd
     docker build -t infinitydb-client-smoke -f deploy/client-smoke/Dockerfile tests/client-smoke
-    ./target/release/infinityd --port {{port}} >/tmp/infinityd-client-smoke.log 2>&1 &
+    {{quote(CARGO_TARGET_DIR + "/release/infinityd")}} --port {{port}} >/tmp/infinityd-client-smoke.log 2>&1 &
     pid=$!
     trap 'kill "$pid" 2>/dev/null || true' EXIT
     for i in $(seq 1 50); do redis-cli -p {{port}} ping 2>/dev/null | grep -q PONG && break || sleep 0.2; done
