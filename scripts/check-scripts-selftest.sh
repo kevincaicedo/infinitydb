@@ -3071,10 +3071,12 @@ asm=$( { waker_body waker_drop 'callq\thelper_fn' 'retq'
          waker_vtable; } | waker_asm waker-hop )
 expect red "waker: an atomic one call hop out of a waker is red" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 # A conditional branch to a symbol is an edge, as a jump is: x86-64's conditional tail call
-# (`jne <sym>`, with or without LLVM's `# TAILCALL` comment) and aarch64's four spellings. To a
-# local label it stays in the body (the cases above).
+# (`jne <sym>`, with or without LLVM's `# TAILCALL` comment), aarch64's four spellings and its
+# compare-and-branch (`cb<cc>`, `cbb<cc>`, `cbh<cc>`, register or immediate). To a local label it
+# stays in the body (the cases above).
 for insn in 'jne\thelper_fn' 'je\thelper_fn # TAILCALL' 'b.ne\thelper_fn' 'cbnz\tx0, helper_fn' \
-    'tbnz\tw8, #0, helper_fn'; do
+    'tbnz\tw8, #0, helper_fn' 'cbgt\tx0, x1, helper_fn' 'cbbeq\tw0, w1, helper_fn' \
+    'cbhhs\tw0, w1, helper_fn' 'cbne\tx0, #5, helper_fn'; do
     asm=$( { waker_body waker_drop 'testq\t%rdi, %rdi' "$insn" 'retq'
              for f in waker_clone waker_wake waker_wake_by_ref; do waker_body "$f" 'retq'; done
              waker_body helper_fn 'lock\t\txaddq\t%rax, (%rcx)' 'retq'
@@ -3083,14 +3085,35 @@ for insn in 'jne\thelper_fn' 'je\thelper_fn # TAILCALL' 'b.ne\thelper_fn' 'cbnz\
         "ATOMIC on the waker's owner lane: waker_drop>helper_fn" \
         env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 done
+# A branch behind a known x86 prefix word is read as its mnemonic: a jump or a call past `bnd`,
+# a `j<cc>` past a segment-override hint.
+for insn in 'bnd\tjmp\thelper_fn' 'bnd\tcallq\thelper_fn' 'ds\tjne\thelper_fn'; do
+    asm=$( { waker_body waker_drop 'testq\t%rdi, %rdi' "$insn" 'retq'
+             for f in waker_clone waker_wake waker_wake_by_ref; do waker_body "$f" 'retq'; done
+             waker_body helper_fn 'lock\t\txaddq\t%rax, (%rcx)' 'retq'
+             waker_vtable; } | waker_asm waker-prefix )
+    expect_red_because "waker: an atomic behind a prefixed branch '$insn' is red" \
+        "ATOMIC on the waker's owner lane: waker_drop>helper_fn" \
+        env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+done
 # A control transfer the scanner has no edge rule for is red, never assumed clean: x86's `loop`
-# forms and aarch64's pointer-authenticated branches.
-for insn in 'loopne\thelper_fn' 'braa\tx8, x9'; do
+# forms and `xbegin`, aarch64's pointer-authenticated branches, and a transfer behind a word the
+# prefix table does not hold.
+for insn in 'loopne\thelper_fn' 'braa\tx8, x9' 'xbegin\thelper_fn' 'foo\tcallq\thelper_fn'; do
     asm=$( { waker_body waker_wake 'movq\t%rdi, %rax' "$insn" 'retq'
              for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
              waker_vtable; } | waker_asm waker-unread )
     expect_red_because "waker: a transfer the scan reads no edge for, '$insn', is red" \
         "UNREAD BRANCH on the waker path: waker_wake" \
+        env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+done
+# The controls of those rules: a known prefix before a non-transfer, aarch64's landing pad whose
+# operand spells `jc` (no target follows it), and x86's `cbtw`, which is no compare-and-branch.
+for insn in 'rep\tstosq\t%rax, %es:(%rdi)' 'bti\tjc' 'cbtw'; do
+    asm=$( { waker_body waker_wake 'movq\t%rdi, %rax' "$insn" 'retq'
+             for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+             waker_vtable; } | waker_asm waker-prefix-clean )
+    expect green "waker: '$insn' is no transfer and no atomic" \
         env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 done
 # The same atomic in a function the vtable never reaches must NOT be reported.
@@ -3109,10 +3132,11 @@ asm=$( { printf '\t.type\twaker_clone,@function\nwaker_clone:\n.Lfunc_begin_x:\n
          waker_vtable; } | waker_asm waker-empty )
 expect red "waker: a body that scans zero instructions is a scope error" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 # An indirect call leaves the scan for a body no fact names: red, never an
-# unfollowed edge. An indirect jump (x86's jump table `jmpq *%rax`, on the
-# real waker path today) is counted on the scope line, and a call through the
-# GOT — Rust's no-PLT spelling of an extern — is a direct edge.
-for insn in 'callq\t*%rax' 'callq\t*8(%rax)' 'blr\tx8'; do
+# unfollowed edge, behind CET's `notrack` too. An indirect jump (x86's jump
+# table `jmpq *%rax`, on the real waker path today) is counted on the scope
+# line, and a call through the GOT — Rust's no-PLT spelling of an extern — is
+# a direct edge.
+for insn in 'callq\t*%rax' 'callq\t*8(%rax)' 'blr\tx8' 'notrack\tcallq\t*%rax'; do
     asm=$( { waker_body waker_wake 'movq\t%rdi, %rax' "$insn" 'retq'
              for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
              waker_vtable; } | waker_asm waker-icall )
@@ -3126,6 +3150,12 @@ expect_output "waker: an indirect jump is counted on the scope line" \
     "1 callees with no body (each listed), 1 indirect jumps" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 expect_output "waker: a call through the GOT is a direct, disclosed edge" \
     "listed callees (no body in this asm): memcpy" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+asm=$( { waker_body waker_wake 'notrack\tjmpq\t*%rax' 'retq'
+         for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+         waker_vtable; } | waker_asm waker-notrack-ijump )
+expect_output "waker: an indirect jump past \`notrack\` is counted on the scope line" \
+    "0 callees with no body (each listed), 1 indirect jumps" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 # The probe's contract (scripts/waker-atomics-probe/src/lib.rs) judged against
 # a fixture of its asm. The arm64 Linux shape — CAS and fetch-add as helper
 # calls, the SeqCst store as `stlr` — is green; a fetch-add plant that reports
