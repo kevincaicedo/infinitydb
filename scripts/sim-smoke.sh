@@ -109,6 +109,9 @@ rows=(
   "m4-tiered --plant tier-read-eio"
   "m4-tiered --replay-above-window --verify-determinism"
   "m4-tiered --listing-repeats --verify-determinism"
+  # m4-tiered at a seed whose cold burst takes a second round: a reader's candidate held another
+  # key's record, so it reads again after its resume, and the next round releases that read.
+  "m4-tiered --seed 0x51ee0630 --verify-determinism"
   "m4-tier-budget --tier-leg two-8mb --verify-determinism"
   "m4-tier-budget --tier-leg eight-1mb --verify-determinism"
   "m4-tier-budget --tier-leg one-1mb --verify-determinism"
