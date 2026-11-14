@@ -14,10 +14,16 @@
 //! The rule: B − B₀ ≤ 2 instructions where a placement crosses nothing
 //! (`plain`), ≤ 10 where it commits a page (`crossing`), ≤ 20 where it makes
 //! a ring-top hole (`hole`), ≤ 22 where a full window refuses it (`refused`)
-//! and ≤ 26 where that record needs a ring-top hole (`refused-hole`). Each
-//! bound's own red is `table-<shape>-plus-<bound + 1>`, the base's leg with
-//! one instruction a placement more than the bound, read as a B on the
-//! base's build: it must read over the bound.
+//! and ≤ 26 where that record needs a ring-top hole (`refused-hole`); at the
+//! other refusals, ≤ 7 where the record would end past the 48-bit space
+//! (`refused-end`), ≤ 14 where it is longer than the window
+//! (`refused-long`), ≤ 63 where the tail pads to the ring top
+//! (`refused-pad`), ≤ 64 where that pad does not fit the window
+//! (`refused-pad-need`) and ≤ 31 where the tail pads to its commit page's
+//! end (`refused-page-pad`). Each bound's own red is
+//! `table-<shape>-plus-<bound + 1>`, the base's leg with one instruction a
+//! placement more than the bound, read as a B on the base's build: it must
+//! read over the bound.
 //!
 //! The judged shapes: `plain`, a 64-byte record (the commit page and the
 //! stride bucket unchanged, one crossing in 16,384 placements); `crossing`,
@@ -35,13 +41,15 @@
 //! ring needs the hole; `refused-hole` places one filler and one record and
 //! never releases.
 //!
-//! Five more legs read the other refusals a live placement meets, one
-//! answer each: `refused-end` (the record would end past the 48-bit space),
-//! `refused-long` (a record longer than the window), `refused-pad` (a
-//! record past the ring top whose need lies above the tail, so the tail
-//! pads to the ring top), `refused-pad-need` (the same record where that
-//! pad does not fit the window) and `refused-page-pad` (a record within a
-//! page of the window, so the tail pads to its commit page's end).
+//! The other five judged shapes are the other refusals a live placement
+//! meets, one answer each: `refused-end`, a 1 MiB record that would end past
+//! the 48-bit space, at a window filled as `refused` fills it under an
+//! origin 64.5 MiB below the end of the space; `refused-long`, a record
+//! longer than the window; `refused-pad`, a record past the ring top whose
+//! need lies above the tail, so the tail pads to the ring top;
+//! `refused-pad-need`, the same record where that pad does not fit the
+//! window; and `refused-page-pad`, a record within a page of the window, so
+//! the tail pads to its commit page's end.
 //!
 //! The estimator: callgrind's inclusive count of the op function per call,
 //! its plant and one placement, at 10⁵ ops (`crossing`, `hole`) or 10⁶ (the
@@ -157,12 +165,15 @@ impl Shape {
         }
     }
 
-    /// The life's origin: half a page below the end of the 48-bit space at
-    /// `refused-end`, so a 1 MiB record at the tail would end past it.
+    /// The life's origin: 64.5 MiB below the end of the 48-bit space at
+    /// `refused-end`, so that the window's 64 records fill it and leave half
+    /// a page, past which the next 1 MiB record would end.
     fn origin(self) -> LogicalAddr {
         match self {
             Shape::RefusedEnd => {
-                LogicalAddr::from_raw(LogicalAddr::MAX_RAW + 1 - MIB / 2).expect("a 48-bit origin")
+                let below_end = 64 * MIB + MIB / 2;
+                LogicalAddr::from_raw(LogicalAddr::MAX_RAW + 1 - below_end)
+                    .expect("a 48-bit origin")
             }
             Shape::Plain
             | Shape::Crossing
@@ -237,7 +248,7 @@ enum Build {
 }
 
 /// Each leg: its name, its version, its shape and its plant in `nop`s.
-const LEGS: [(&str, Version, Shape, u8); 25] = [
+const LEGS: [(&str, Version, Shape, u8); 35] = [
     ("table-plain", Version::Table, Shape::Plain, 0),
     ("table-plain-plus-one", Version::Table, Shape::Plain, 1),
     ("table-plain-plus-three", Version::Table, Shape::Plain, 3),
@@ -259,10 +270,20 @@ const LEGS: [(&str, Version, Shape, u8); 25] = [
     ("table-refused-hole-plus-twenty-seven", Version::Table, Shape::RefusedHole, 27),
     ("parent-refused-hole", Version::Parent, Shape::RefusedHole, 0),
     ("table-refused-end", Version::Table, Shape::RefusedEnd, 0),
+    ("table-refused-end-plus-one", Version::Table, Shape::RefusedEnd, 1),
+    ("table-refused-end-plus-eight", Version::Table, Shape::RefusedEnd, 8),
     ("table-refused-long", Version::Table, Shape::RefusedLong, 0),
+    ("table-refused-long-plus-one", Version::Table, Shape::RefusedLong, 1),
+    ("table-refused-long-plus-fifteen", Version::Table, Shape::RefusedLong, 15),
     ("table-refused-pad", Version::Table, Shape::RefusedPad, 0),
+    ("table-refused-pad-plus-one", Version::Table, Shape::RefusedPad, 1),
+    ("table-refused-pad-plus-sixty-four", Version::Table, Shape::RefusedPad, 64),
     ("table-refused-pad-need", Version::Table, Shape::RefusedPadNeed, 0),
+    ("table-refused-pad-need-plus-one", Version::Table, Shape::RefusedPadNeed, 1),
+    ("table-refused-pad-need-plus-sixty-five", Version::Table, Shape::RefusedPadNeed, 65),
     ("table-refused-page-pad", Version::Table, Shape::RefusedPagePad, 0),
+    ("table-refused-page-pad-plus-one", Version::Table, Shape::RefusedPagePad, 1),
+    ("table-refused-page-pad-plus-thirty-two", Version::Table, Shape::RefusedPagePad, 32),
 ];
 
 /// The plants: `NOPS` instructions per op, each a `nop` with no operand,
@@ -431,7 +452,9 @@ fn fill_to<P: Placer>(placer: &mut P, tail: u64) -> u64 {
 /// placements it made.
 fn prepare<P: Placer>(placer: &mut P, shape: Shape, len: usize) -> u64 {
     match shape {
-        Shape::Refused => {
+        // `refused-end` fills to the end of the space, where its window is
+        // full too.
+        Shape::Refused | Shape::RefusedEnd => {
             let mut filled = 0;
             while fill(placer, len).is_some() {
                 filled += 1;
@@ -459,7 +482,7 @@ fn prepare<P: Placer>(placer: &mut P, shape: Shape, len: usize) -> u64 {
             placer.release();
             1
         }
-        Shape::RefusedEnd | Shape::RefusedLong => 0,
+        Shape::RefusedLong => 0,
         Shape::Plain | Shape::Crossing | Shape::Hole => {
             unreachable!("a placing shape prepares in its own loop")
         }
@@ -583,10 +606,15 @@ fn run_leg<P: Placer>(
         0 => drive::<P, 0>(placer, shape, ops, build, census),
         1 => drive::<P, 1>(placer, shape, ops, build, census),
         3 => drive::<P, 3>(placer, shape, ops, build, census),
+        8 => drive::<P, 8>(placer, shape, ops, build, census),
         11 => drive::<P, 11>(placer, shape, ops, build, census),
+        15 => drive::<P, 15>(placer, shape, ops, build, census),
         21 => drive::<P, 21>(placer, shape, ops, build, census),
         23 => drive::<P, 23>(placer, shape, ops, build, census),
         27 => drive::<P, 27>(placer, shape, ops, build, census),
+        32 => drive::<P, 32>(placer, shape, ops, build, census),
+        64 => drive::<P, 64>(placer, shape, ops, build, census),
+        65 => drive::<P, 65>(placer, shape, ops, build, census),
         other => panic!("no leg plants {other}"),
     }
 }
