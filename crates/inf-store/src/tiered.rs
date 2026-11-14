@@ -1416,10 +1416,15 @@ mod tests {
     /// record a page, the watermarks driven by the seal steps. The marks
     /// hold at most half the cap and one more and cross nothing; then each
     /// seal step lands on a record start and seals at most its slice and
-    /// one stride.
+    /// one stride. Last, each window's stride is the least that buckets its
+    /// ring into half the cap, from the window's own arithmetic: a wider one
+    /// passes every clause above, and a seal step's overrun, which the tail
+    /// stall's liveness reads, grows with it.
     #[test]
     fn the_stride_keeps_the_seal_marks_under_their_cap_at_every_window() {
+        const PAGE: u64 = 4 << 10;
         let half = u64::from(SEAL_MARKS_MAX) / 2;
+        let mut strides = Vec::new();
         for pages in [half - 1, half, half + 1, 4 * u64::from(SEAL_MARKS_MAX)] {
             let census = CapCensus::new(inf_foundation::CellId(0)).0;
             let mut table = paged_table(pages, &census);
@@ -1427,6 +1432,10 @@ mod tests {
             let crossings = census.row(SEAL_MARKS.name()).map_or(0, |row| row.crossings);
             assert_eq!(crossings, 0, "stride-short — {crossings} crossing(s) at {pages} pages");
             let stride = table.seal_marks.stride_bytes();
+            // The ring is the window's next power of two: its pages over half
+            // the cap, at least one page.
+            let least = PAGE * (pages.next_power_of_two() / half).max(1);
+            strides.push((pages, stride, least));
             let ro = table.space().ro_boundary();
             let mut model = Vec::new();
             let mut last_bucket = None;
@@ -1458,6 +1467,12 @@ mod tests {
                 steps += 1;
             }
             assert!(steps > 0, "VACUOUS: {pages} pages sealed nothing");
+        }
+        for (pages, stride, least) in strides {
+            assert_eq!(
+                stride, least,
+                "stride-wide — {pages} pages: {stride} B, the least {least} B"
+            );
         }
     }
 
