@@ -22,8 +22,13 @@ const LEDGER: &[u8] = b"ledger";
 const LEDGER_NOT_FOUND: &str = "-ERR namespace 'ledger' not found";
 
 /// Runs the ignored test `child` of this binary as its own process on
-/// `dir`; returns its exit code and its stderr.
+/// `dir`; returns its exit code and its stderr. The child boots `dir`, so
+/// the boot's check runs here first, on this process's mark of `dir`. The
+/// child's own end is a process exit this process cannot read: a child
+/// writes through `FSYNC always`, or the parent reads only what a barrier
+/// the child observed covers.
 fn run_child(child: &str, dir: &std::path::Path) -> (Option<i32>, String) {
+    dir_marks::judge_previous_end(Some(dir.to_path_buf()));
     let exe = std::env::current_exe().expect("the test binary");
     let mut process = Command::new(exe)
         .args(["--exact", child, "--ignored", "--nocapture", "--test-threads=1"])
@@ -170,4 +175,22 @@ fn a_drop_stopped_after_its_origin_applied_is_gone_after_a_restart() {
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
     receipt::verified("ns_drop_after_apply", "namespace-gone-after-restart");
+}
+
+/// The boot's check reaches a child's boot: over a directory whose last
+/// life in this process crash-stopped above its durable watermark, with no
+/// statement, `run_child` panics `VACUOUS` before it spawns. The child it
+/// names does not exist, so a spawn would run no test and return.
+#[test]
+fn a_child_boot_after_an_unstated_crash_loss_is_refused_before_its_spawn() {
+    let dir = temp_data_dir("ns-fail-stop-crash-loss");
+    let (node, c) = dir_marks::crash_loss_life(&dir);
+    drop(c);
+    node.stop();
+    let text = match std::panic::catch_unwind(|| run_child("ns_fail_stop::no_such_child", &dir)) {
+        Ok(_) => panic!("run_child spawned a child over an unstated crash loss"),
+        Err(payload) => dir_marks::panic_text(payload.as_ref()).unwrap_or_default(),
+    };
+    assert!(text.starts_with("VACUOUS: the previous life's crash-equivalent stop"), "{text}");
+    std::fs::remove_dir_all(&dir).ok();
 }

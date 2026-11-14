@@ -28,6 +28,13 @@
 //! The writer waits for the longest node-holding span of one test it
 //! overlaps, so a lane that runs beside another runs at most 10 test threads.
 //!
+//! A node's end here is a signal to its process, which no check of this
+//! module reads: after a `SIGKILL`, an `everysec` acknowledgment promises
+//! nothing. A test that boots a killed node's directory again reads only
+//! what that life made durable, a write through `FSYNC always` or one an
+//! `INF.CKPT WAIT` after it covers, or says beside the kill why its reads
+//! do not depend on the rest.
+//!
 //! The module is included once per test binary: each `bins/infinityd` test
 //! target names it once by `#[path]`, and compat's tests reach it through
 //! `compat::harness`, never by a `#[path]` of their own. Its in-process

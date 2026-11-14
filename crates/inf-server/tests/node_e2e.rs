@@ -1,10 +1,12 @@
 #![allow(
     clippy::disallowed_methods,
-    reason = "test target: harness deadlines and timings, not cell code"
+    reason = "test target: harness deadlines and timings, and a data directory's canonical \
+              path, not cell code"
 )]
 #![allow(
     clippy::disallowed_types,
-    reason = "test target: the drain message reads each cell's stop hold"
+    reason = "test target: the drain message reads each cell's stop hold, and the boot's \
+              check keeps one process map of each data directory's mark"
 )]
 //! End-to-end node assembly test (Linux + uring): two real cells on real
 //! threads behind one SO_REUSEPORT port, driven over TCP — local fast path,
@@ -197,9 +199,16 @@ struct Node {
     /// Each cell's stop hold as it last read it, beside its phase: the wait
     /// a drain that times out names.
     stop_holds: StopHolds,
-    /// Each cell thread returns the tiered namespaces it ran at the
-    /// product's `TAIL-STALL-TIMEOUT` default ([`note_product_tail_stall`]).
-    handles: Vec<std::thread::JoinHandle<NsNames>>,
+    /// Each cell thread returns its end: the tiered namespaces it ran at the
+    /// product's `TAIL-STALL-TIMEOUT` default ([`note_product_tail_stall`])
+    /// and its log's tail. Joining them marks the node's directory.
+    handles: dir_marks::CellThreads,
+    /// The data directory as the boot's check judged it (`None`: volatile),
+    /// which every end of the node marks.
+    judged: dir_marks::Judged,
+    /// The loss a crash-equivalent end of this node states, with its reason
+    /// ([`Node::expect_crash_loss`]).
+    crash_loss: std::cell::Cell<Option<&'static str>>,
     /// Control handle of a durable node (manual checkpoint trigger — the
     /// surface `INF.CKPT` rides at S20).
     control: Option<Arc<inf_server::ControlHandle>>,
@@ -342,7 +351,7 @@ impl Node {
     /// stays on disk (process-kill physics).
     fn kill_without_catalog_drain(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let at_default = self.join_cells();
+        let at_default = self.join_cells(dir_marks::NodeEnd::Crash);
         let pump = self.catalog_pump.take().expect("a held-catalog node");
         pump.stop.store(true, Ordering::Relaxed);
         pump.handle.join().expect("catalog pump thread");
@@ -444,15 +453,7 @@ impl Node {
             if control.recovery_board().all_ready() {
                 return Ok(node);
             }
-            if let Some(at) = node.handles.iter().position(std::thread::JoinHandle::is_finished) {
-                let refusal = match node.handles.remove(at).join() {
-                    Ok(_) => "a cell thread exited during recovery".to_owned(),
-                    Err(payload) => payload
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                        .unwrap_or_else(|| "a cell thread panicked".to_owned()),
-                };
+            if let Some(refusal) = node.handles.join_finished() {
                 node.stop();
                 return Err(refusal);
             }
@@ -782,6 +783,8 @@ impl Node {
         extras: NodeExtras,
     ) -> Node {
         assert!(held_clock.is_none() || data_dir.is_none(), "a held clock boots a volatile node");
+        // The boot's check takes the directory: what follows opens only the judged one.
+        let judged = dir_marks::judge_previous_end(data_dir);
         let stop = Arc::new(AtomicBool::new(false));
         let mut process_sampler = inf_server::ProcessSampler::default();
         process_sampler.sample();
@@ -815,7 +818,7 @@ impl Node {
             None => inf_server::CkptSpace::full(cell_count),
             Some(h) => inf_server::CkptSpace::with_headroom(cell_count, h).expect("space fits"),
         };
-        let boot = data_dir.map(|dir| {
+        let boot = judged.dir().map(std::path::Path::to_path_buf).map(|dir| {
             let catalog = inf_server::load_catalog(&dir).expect("readable catalog");
             let boot_unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1032,7 +1035,7 @@ impl Node {
                         }
                     }
                 }
-                at_default
+                dir_marks::CellEnd::read(i as u16, plane.durable_stats(), at_default)
             }));
         }
         let control = boot.map(|(_, _, control)| control);
@@ -1045,7 +1048,9 @@ impl Node {
             drained,
             stop_phases,
             stop_holds,
-            handles,
+            handles: dir_marks::CellThreads::new(handles),
+            judged,
+            crash_loss: Default::default(),
             control,
             ckpt_host: std::cell::RefCell::new(ckpt_host),
             catalog_pump,
@@ -1065,7 +1070,7 @@ impl Node {
                 // its boot error (fail-stop): report that now, with
                 // the refusal on stderr, instead of a 30 s timeout.
                 assert!(
-                    !node.handles.iter().any(std::thread::JoinHandle::is_finished),
+                    !node.handles.any_finished(),
                     "a cell thread exited during recovery (fail-stop — see stderr)"
                 );
                 assert!(Instant::now() < deadline, "recovery did not finish in 30s");
@@ -1144,20 +1149,33 @@ impl Node {
 
     /// The durable stop without a checkpoint (`--shutdown-checkpoint
     /// off`): the ADR-0124 drain and final sync, so every acknowledged
-    /// write is in the log and the next boot replays it. [`Node::stop`] is
-    /// crash-equivalent — an everysec ack promises nothing there — so a
-    /// test that reads acknowledged everysec writes after a restart stops
-    /// with this, or writes through an `always` namespace.
+    /// write is in the log and the next boot replays it. The drain also
+    /// completes a checkpoint in flight, so a test whose subject is that
+    /// checkpoint unpublished keeps the crash stop and states its loss.
+    /// [`Node::stop`] is crash-equivalent (an everysec ack promises nothing
+    /// there): the next boot of its directory fails `VACUOUS` when a cell's
+    /// log was above its durable watermark, unless
+    /// [`Node::expect_crash_loss`] stated the loss.
     fn stop_synced(self) {
         self.stop_checkpoint.store(false, Ordering::Relaxed);
         self.stop_gracefully();
     }
 
     /// Crash-equivalent: the cells stop where they are (no drain, no final
-    /// sync; queued frame writes die with the ring). See [`Node::stop_synced`].
+    /// sync; queued frame writes die with the ring). Its end marks the
+    /// directory: a cell whose log is above its durable watermark makes the
+    /// next boot of the directory fail `VACUOUS`, unless the loss was
+    /// stated. After the graceful stop's drain it marks the directory clean.
+    /// See [`Node::stop_synced`].
     fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let at_default = self.join_cells();
+        // The graceful stop calls this once every cell is `Drained`.
+        let end = if self.graceful.load(Ordering::Relaxed) {
+            dir_marks::NodeEnd::Drained
+        } else {
+            dir_marks::NodeEnd::Crash
+        };
+        let at_default = self.join_cells(end);
         // The control thread is detached (`spawn_control`) and outlives the
         // join above: delegated unlinks (truncated segments, stale `.ick`s —
         // ADR-0017) drain asynchronously. A restart on the same data dir
@@ -1199,11 +1217,20 @@ impl Node {
         self.assert_tail_stall_stated(&at_default);
     }
 
-    /// Joins every cell thread (the caller set `stop`), each with the
-    /// tiered namespaces it ran at the product's `TAIL-STALL-TIMEOUT`
-    /// default, in cell order.
-    fn join_cells(&mut self) -> Vec<NsNames> {
-        self.handles.drain(..).map(|handle| handle.join().expect("cell thread")).collect()
+    /// Joins every cell thread (the caller set `stop`) and marks the node's
+    /// directory with `end` and the stated loss; returns each cell's tiered
+    /// namespaces at the product's `TAIL-STALL-TIMEOUT` default.
+    fn join_cells(&mut self, end: dir_marks::NodeEnd) -> Vec<NsNames> {
+        self.handles.join(end, &self.judged, self.crash_loss.get())
+    }
+
+    /// States that this node's crash-equivalent end may lose what its log
+    /// holds above the durable watermark, and why the test's next life does
+    /// not depend on it: the next boot of the directory is not refused. A
+    /// second call replaces the reason. A drained end refuses a statement.
+    fn expect_crash_loss(&self, reason: &'static str) {
+        assert!(self.judged.dir().is_some(), "a volatile node has no directory to lose");
+        self.crash_loss.set(Some(reason));
     }
 
     /// The test's subject is the product's `TAIL-STALL-TIMEOUT` default on
@@ -1236,13 +1263,13 @@ impl Node {
 }
 
 /// A node ends through [`Node::stop`] (directly or through a graceful
-/// stop) or [`Node::kill_without_catalog_drain`]; each joins the cells and
-/// then runs the stop's checks. A node dropped with its cells running
-/// skipped those checks, and its cells would run on beside every later
-/// test of the binary, so the drop stops and joins them, then fails the
-/// test. A test already failing only signals its threads to exit (a join
-/// could wait on a wedged cell), so its first failure stays the one
-/// reported.
+/// stop) or [`Node::kill_without_catalog_drain`]; each joins the cells,
+/// which marks the node's directory, and then runs the stop's checks. A
+/// node dropped with its cells running skipped those checks, and its cells
+/// would run on beside every later test of the binary, so the drop stops
+/// and joins them, a crash-equivalent end, then fails the test. A test
+/// already failing only signals its threads to exit (a join could wait on
+/// a wedged cell), so its first failure stays the one reported.
 impl Drop for Node {
     fn drop(&mut self) {
         if let Some(pump) = &self.catalog_pump {
@@ -1255,7 +1282,7 @@ impl Drop for Node {
         if std::thread::panicking() {
             return;
         }
-        self.join_cells();
+        self.join_cells(dir_marks::NodeEnd::Crash);
         if let Some(pump) = self.catalog_pump.take() {
             pump.handle.join().expect("catalog pump thread");
         }
@@ -3371,7 +3398,7 @@ fn tiered_namespace_lifecycle_survives_restart() {
     let refusal = read_line(&mut c);
     assert!(refusal.starts_with(b"-ERR TIER-IO-MODE is create-only"), "{refusal:?}");
     drop(c);
-    node.stop();
+    node.stop_synced();
 
     // Restart: the catalog v2 tier block re-seeds and re-materializes,
     // reloaded value included.
@@ -4320,6 +4347,7 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
         #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
         std::thread::sleep(std::time::Duration::from_millis(1500));
         drop(c);
+        node.expect_crash_loss("a delete the stop loses revives its key: the reads count with >=");
         node.stop();
     }
     let mut blob_entries = 0usize;
@@ -5312,6 +5340,7 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
     assert!(info.contains("ckpts_aborted:0"), "no aborts: {info}");
     assert!(info.contains("ckpt_buffer_bytes:0"), "buffer domain freed at completion: {info}");
     drop(c);
+    node.expect_crash_loss("the next life reads only keys the published checkpoint covers");
     node.stop();
 
     #[cfg(feature = "doc")]
@@ -8925,13 +8954,35 @@ fn dropped_tiered_namespace_reboots_without_a_checkpoint() {
     let dir = temp_data_dir("drop-reboot");
     let node = Node::start_durable(2, &dir);
     seed_tiered_namespace_with_checkpoint(&node, &dir, 64);
+    // Every clock held before the drop: no tick fires after each cell's
+    // first iteration on it, so the drop's cleanup checkpoint keeps its
+    // begin marker above the watermark and its MANIFEST swap waits for the
+    // watermark to cover that marker. The cut below finds it unpublished
+    // however late this thread reaches the stop.
+    node.clock_gates.iter().for_each(|gate| gate.hold());
     let mut c = node.connect();
     c.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     drop(c);
+    // A synced stop's drain would publish that checkpoint.
+    node.expect_crash_loss(
+        "the cut is the subject: the stop loses the cleanup checkpoint's begin marker, and the \
+         reboot reads META and the MANIFEST the drop left",
+    );
     node.stop();
 
     // No checkpoint since the drop: every MANIFEST still names ns 16.
+    for cell in 0..2u16 {
+        let shard = dir.join(format!("shard-{cell}"));
+        let manifest = inf_log::read_manifest(&inf_log::fs::StdSegmentFs, &shard)
+            .expect("manifest reads")
+            .expect("checkpoint published");
+        assert!(
+            manifest.tiers.iter().any(|t| t.ns == 16),
+            "VACUOUS: cell {cell}'s MANIFEST lost ns 16's tier section before the reboot: a \
+             checkpoint published after the drop, so the boot has no residue to explain"
+        );
+    }
     let node = Node::start_durable(2, &dir);
     let mut c = node.connect();
     let tiering = info_text(&mut c, b"tiering");
@@ -9814,7 +9865,7 @@ fn concurrent_namespace_ddl_leaves_every_cell_agreeing() {
     );
     // And META agrees with the cells: a restart serves it on every cell
     // or on none, matching the pre-restart verdict.
-    node.stop();
+    node.stop_synced();
     let node = Node::start_durable(4, &dir);
     for cell in 0..4u16 {
         let mut c = conn_on_cell(&node, cell);
@@ -11077,6 +11128,10 @@ fn drop_wait_scenario(kind: DropWaitNs, checkpoint: DropWaitCheckpoint, tag: &st
     }
     let origin_use = in_flight.origin_use.clone();
     drop(in_flight);
+    node.expect_crash_loss(
+        "the cut is the subject: the next life reads keys an always ack or the seed's published \
+         checkpoint covered",
+    );
     node.kill_without_catalog_drain();
     let mut context = format!(
         "namespace '{}' ({kind:?}), un-acked DROP from cell 0, its catalog swap never durable, \
@@ -11438,3 +11493,9 @@ mod ns_cap;
 /// their own.
 #[path = "node_e2e/ns_fail_stop.rs"]
 mod ns_fail_stop;
+
+/// The boot's check on a data directory's previous life, in a file of its
+/// own: a crash-equivalent end over a log above its durable watermark
+/// refuses the next boot of the directory unless the test stated the loss.
+#[path = "node_e2e/dir_marks.rs"]
+mod dir_marks;
