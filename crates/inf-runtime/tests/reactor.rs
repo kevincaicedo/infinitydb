@@ -1026,3 +1026,25 @@ fn every_lend_of_an_iteration_shares_one_turn() {
     assert_eq!(lp.cold_turn_built_at(), 2, "the last turn is iteration 2's");
     assert_eq!(cold.reconcile(), Ok(()), "every orphan returned its share");
 }
+
+/// An iteration in which no step lends builds no turn and pays nothing for
+/// one (ADR-0181 R2): three iterations of a plane that lends nothing leave
+/// the loop's cold turn unbuilt. A loop that builds a turn as each
+/// iteration begins reads the third iteration's.
+#[test]
+fn an_iteration_that_lends_nothing_builds_no_turn() {
+    struct Lendless;
+    impl CellPlane for Lendless {
+        fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
+            panic!("the fixture issues no op: {c:?}");
+        }
+        fn parse_execute(&mut self, _cx: &mut LoopCx<'_>) {}
+        fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+    }
+    let mut lp = test_loop(LoopConfig { spin_iters: 0, ..LoopConfig::default() });
+    for _ in 0..3 {
+        lp.run_iteration(&mut Lendless).expect("iteration");
+    }
+    assert_eq!(lp.counters()[3], 3, "VACUOUS: three iterations did not run");
+    assert_eq!(lp.cold_turn_built_at(), 0, "an iteration that lent nothing built a turn");
+}

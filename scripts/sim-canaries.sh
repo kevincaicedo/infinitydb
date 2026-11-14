@@ -964,6 +964,11 @@ rows=(
   # ADR-0181 R2 (A1.1): every lend of a native iteration, at any step, shares one turn, built at
   # its first lend. Planted, every lend builds the turn, so one iteration visits more than 64.
   "inf_canary_cold_turn_per_lend crate-test inf-runtime test:reactor every_lend_of_an_iteration_shares_one_turn share one turn"
+  # ADR-0181 R2 (A1.1): a native iteration in which no step lends builds no turn. Planted, the
+  # loop builds one as each iteration begins: the loop's stamp moves with no lend, and on the
+  # shipped plane over the sim driver it moves after a burst's last member is visited.
+  "inf_canary_cold_turn_eager crate-test inf-runtime test:reactor an_iteration_that_lends_nothing_builds_no_turn lent nothing built a turn"
+  "inf_canary_cold_turn_eager crate-test inf-sim lib a_cell_with_cold_members_to_visit_begins_no_iteration_parked built a cold turn after the burst's last member"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

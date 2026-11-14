@@ -732,6 +732,9 @@ mod turn {
         pub(super) fn begin_iteration(&mut self) {
             self.sched.refill();
             self.iterations = self.iterations.wrapping_add(1);
+            // Canary: the loop builds a turn as each iteration begins.
+            #[cfg(inf_canary_cold_turn_eager)]
+            let _ = self.cold_turn();
         }
 
         /// Iterations begun.
