@@ -212,6 +212,15 @@ impl LoopCx<'_> {
     }
 }
 
+// What the loop stores into its context as each iteration begins: three `u64` (the time and the
+// two counters) and five borrows, 64 bytes on a 64-bit target. A ninth word is a store on every
+// iteration of every cell, and the edit that adds one fails here; the cold turn is not one of
+// them, since a lend builds it in the loop's own slot (ADR-0181 A1).
+const _: () = assert!(
+    size_of::<LoopCx<'static>>() == 3 * size_of::<u64>() + 5 * size_of::<&mut u8>(),
+    "the loop context is three u64 and five borrows"
+);
+
 impl core::fmt::Debug for LoopCx<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "LoopCx {{ now: {}, queued_ops: {} }}", self.now, self.ops.len())
