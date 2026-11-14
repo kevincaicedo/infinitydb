@@ -986,6 +986,12 @@ rows=(
   # no new receipt precedes leaves the host's last ready member unvisited, and at the regression
   # seed the round's re-read is held while that member waits.
   "inf_canary_cold_ready_left_to_receipt m4-tiered cold-burst-unvisited --seed 0x51ee0630"
+  # Past a round's bound phase 7e judges the host's pending count at every step to the next
+  # release: the count the wait begins with and each step's own. Planted, the host's last ready
+  # member waits until the 15th delivery turn after its receipt's own, so it is visited on the
+  # shortest wait's last step; or until the 7th, the wait's first step.
+  "inf_canary_cold_ready_left_fifteen_turns m4-tiered cold-burst-unvisited --seed 0x51ee0630"
+  "inf_canary_cold_ready_left_seven_turns m4-tiered cold-burst-unvisited --seed 0x51ee0630"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

@@ -50,3 +50,14 @@ pub const COLD_DELIVERIES_PER_TURN: u32 = 64;
 /// allowance, and no drain spends it until the budgeted preparation pass, whose crossing is pace,
 /// the queued requests not yet inspected waiting for the next turn.
 pub const COLD_PREPARATION_WORK_PER_TURN: u32 = 64;
+
+/// Canary: the delivery turns after a receipt's own that a planted host lets pass before it
+/// visits its last ready member, 7: phase 7e's first wait step at its 256 readers, one past
+/// its round's bound of ⌈256 / 64⌉ + 2 steps. The plant in `cold` and the scenario's assertion
+/// read this one const, so a moved delay fails the planted build.
+#[cfg(inf_canary_cold_ready_left_seven_turns)]
+pub const COLD_READY_LEFT_TURNS: u64 = 7;
+/// Canary: the same, 15: the last step of phase 7e's shortest wait, its first step and the
+/// held reads' 8 steady steps past the bound.
+#[cfg(inf_canary_cold_ready_left_fifteen_turns)]
+pub const COLD_READY_LEFT_TURNS: u64 = 15;

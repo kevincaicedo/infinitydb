@@ -908,6 +908,20 @@ const fn burst_bound(readers: u64) -> u64 {
     readers.div_ceil(inf_runtime::limits::COLD_DELIVERIES_PER_TURN as u64) + 2
 }
 
+// Canary: the planted host's delay is the wait step its row names, at the
+// burst's readers; a moved const would be caught on another step, silently.
+// Seven turns: the wait's first step, one past round 1's bound.
+#[cfg(inf_canary_cold_ready_left_seven_turns)]
+const _: () =
+    assert!(inf_runtime::limits::COLD_READY_LEFT_TURNS == burst_bound(BURST_READERS as u64) + 1);
+// Fifteen turns: the shortest wait's last step, its first step and the held
+// reads' steady steps past the bound.
+#[cfg(inf_canary_cold_ready_left_fifteen_turns)]
+const _: () = assert!(
+    inf_runtime::limits::COLD_READY_LEFT_TURNS
+        == burst_bound(BURST_READERS as u64) + 1 + crate::durable::HELD_READS_STEADY_STEPS
+);
+
 /// Steps until every burst reader's reply is in, in rounds: the first
 /// releases the `held` reads of the burst, and each round's replies are
 /// judged against its own receipt. Past a round's bound with readers left,

@@ -661,6 +661,10 @@ struct ColdState {
     /// Canary: a receipt was recorded since the last delivery call.
     #[cfg(inf_canary_cold_ready_left_to_receipt)]
     fresh_receipt: bool,
+    /// Canary: delivery calls since the last receipt, the receipt's own
+    /// call 0.
+    #[cfg(any(inf_canary_cold_ready_left_seven_turns, inf_canary_cold_ready_left_fifteen_turns))]
+    turns_since_receipt: u64,
     /// Per-file pin count over queued + in-flight + undropped `ColdDone`
     /// custody (§3.3). Entries exist only while nonzero.
     pins: HashMap<TierFileId, u32, BuildIntHasher>,
@@ -871,6 +875,11 @@ impl ColdReads {
                 renewals: 0,
                 #[cfg(inf_canary_cold_ready_left_to_receipt)]
                 fresh_receipt: false,
+                #[cfg(any(
+                    inf_canary_cold_ready_left_seven_turns,
+                    inf_canary_cold_ready_left_fifteen_turns
+                ))]
+                turns_since_receipt: 0,
                 pins: HashMap::default(),
                 counters: ColdReadCounters::default(),
                 qd_hist: LogHistogram::new(),
@@ -1280,6 +1289,13 @@ impl ColdReads {
         {
             state.fresh_receipt = true;
         }
+        #[cfg(any(
+            inf_canary_cold_ready_left_seven_turns,
+            inf_canary_cold_ready_left_fifteen_turns
+        ))]
+        {
+            state.turns_since_receipt = 0;
+        }
         Self::link_ready(state, token);
         ColdReceipt::Recorded
     }
@@ -1308,7 +1324,31 @@ impl ColdReads {
         // member unvisited, until a later receipt's turn.
         #[cfg(inf_canary_cold_ready_left_to_receipt)]
         let fresh = core::mem::take(&mut self.state.borrow_mut().fresh_receipt);
+        // Canary: a call after a receipt's own, and before the
+        // `COLD_READY_LEFT_TURNS`-th, leaves the last ready member unvisited.
+        #[cfg(any(
+            inf_canary_cold_ready_left_seven_turns,
+            inf_canary_cold_ready_left_fifteen_turns
+        ))]
+        let turn_after_receipt = {
+            let mut state = self.state.borrow_mut();
+            let turn = state.turns_since_receipt;
+            state.turns_since_receipt = turn + 1;
+            turn
+        };
         loop {
+            #[cfg(any(
+                inf_canary_cold_ready_left_seven_turns,
+                inf_canary_cold_ready_left_fifteen_turns
+            ))]
+            {
+                if (1..crate::limits::COLD_READY_LEFT_TURNS).contains(&turn_after_receipt)
+                    && self.state.borrow().pending_members == 1
+                {
+                    progress.state = ColdDeliveryState::Ready;
+                    break;
+                }
+            }
             #[cfg(inf_canary_cold_ready_left_to_receipt)]
             {
                 if !fresh && self.state.borrow().pending_members == 1 {
