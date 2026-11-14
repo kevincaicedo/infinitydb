@@ -635,6 +635,8 @@ impl AddressSpace {
     /// below the tail (the hole is shorter than the record, which is at
     /// most the window); in case (b) to the next commit-page boundary,
     /// which commits nothing.
+    // Each of its three callers takes the answer whole; inlined, a placement pays no call.
+    #[inline(always)]
     fn classify(&mut self, prospect: Prospect) -> Room {
         if prospect.start.is_none() {
             return Room::End;
