@@ -1,13 +1,6 @@
-#![allow(
-    clippy::disallowed_types,
-    reason = "benchmark: leg A's executor copy keeps its std ready queue, outside cell code"
-)]
 //! The waker's A/B by instructions (L4, ADR-0003 A1.5, ADR-0205): four waker paths of the cell
-//! executor, each on three legs, from one binary.
+//! executor, each on two legs, from one binary.
 //!
-//! - A: the executor with an `Rc` waker, a bench-only copy in `waker_ab/executor_a.rs`. Compiled
-//!   in this crate beside the steps that call it, the copy is other code than the product's own
-//!   build of the same source, so A is a control, never a base: B − A is reported, never judged.
 //! - B: the product, `inf_runtime::CellExecutor`.
 //! - P: B's operation with each waker operation in it also driven through a wake bridge of its
 //!   own, [`ForeignLane`], by `inf_foundation::wake`'s foreign entries, and drained once per op:
@@ -30,14 +23,12 @@
 //!
 //! The instrument: exact user-space instructions, cycles and locked loads per op,
 //! `(I(n) − I(0)) / n` at `n` = 10⁷, read outside this binary by `perf stat` on one pinned
-//! performance core, the legs of a row in the order A B P B A, twice. A row's verdict is B less
-//! the B of a second build of this same source on the product before the change: two builds,
-//! each in its own clean checkout, whose bench files and every input leg A compiles from are
-//! checked identical before either builds. A run counts only when its controls hold:
+//! performance core, the legs of a row in the order B P B, twice. A row's verdict is B less the
+//! B of a second build of this same source on the product before the change: two builds, each
+//! in its own clean checkout, whose bench files are checked identical before either builds. A
+//! run counts only when its controls hold:
 //!
-//! - the same binary against itself: A's two legs, and B's, agree within 0.05 per op, at a
-//!   resolution of 0.01; across the two builds A agrees within 0.05 too, a control that can
-//!   show that the builds differ, never that they are the same;
+//! - the same binary against itself: B's legs agree within 0.05 per op, at a resolution of 0.01;
 //! - B runs no locked instruction on any row; one that does is attributed by precise samples
 //!   before any number is read;
 //! - liveness: each P leg reads its bridge's own count of foreign operations and its delivered
@@ -57,10 +48,6 @@
 //!   taskset -c <core> perf stat -e instructions:u,cycles:u,mem_inst_retired.lock_loads:u \
 //!       -x, -- <binary> --variant <leg>-<row> --ops <n>
 
-#[allow(dead_code, reason = "leg A is the whole executor; the rows drive four of its paths")]
-#[path = "waker_ab/executor_a.rs"]
-mod executor_a;
-
 use std::cell::Cell;
 use std::future::Future;
 use std::hint::black_box;
@@ -70,63 +57,17 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use inf_foundation::wake::{RemoteStack, ThreadMark, WakeBridge};
-use inf_runtime::FabricGate;
+use inf_runtime::{CellExecutor, FabricGate, PollImmediate};
 
 /// Tasks each leg's executor reserves room for: the rows keep at most one.
 const TASKS: usize = 64;
 
-/// The two executors behind one static interface, so a row's step is one generic function.
-trait Executor {
-    fn with_capacity(capacity: usize) -> Self;
-    /// Whether the first poll completed the future (true) or parked it (false).
-    fn poll_immediate<F: Future<Output = ()> + 'static>(&mut self, fut: F) -> bool;
-    fn run_ready(&mut self, budget: usize) -> usize;
-    fn live_tasks(&self) -> usize;
-}
-
-impl Executor for executor_a::CellExecutor {
-    fn with_capacity(capacity: usize) -> Self {
-        executor_a::CellExecutor::new(capacity)
-    }
-
-    #[inline(always)]
-    fn poll_immediate<F: Future<Output = ()> + 'static>(&mut self, fut: F) -> bool {
-        match executor_a::CellExecutor::poll_immediate(self, fut) {
-            executor_a::PollImmediate::Completed => true,
-            executor_a::PollImmediate::Suspended(_) => false,
-        }
-    }
-
-    #[inline(always)]
-    fn run_ready(&mut self, budget: usize) -> usize {
-        executor_a::CellExecutor::run_ready(self, budget)
-    }
-
-    fn live_tasks(&self) -> usize {
-        executor_a::CellExecutor::live_tasks(self)
-    }
-}
-
-impl Executor for inf_runtime::CellExecutor {
-    fn with_capacity(capacity: usize) -> Self {
-        inf_runtime::CellExecutor::new(capacity)
-    }
-
-    #[inline(always)]
-    fn poll_immediate<F: Future<Output = ()> + 'static>(&mut self, fut: F) -> bool {
-        match inf_runtime::CellExecutor::poll_immediate(self, fut) {
-            inf_runtime::PollImmediate::Completed => true,
-            inf_runtime::PollImmediate::Suspended(_) => false,
-        }
-    }
-
-    #[inline(always)]
-    fn run_ready(&mut self, budget: usize) -> usize {
-        inf_runtime::CellExecutor::run_ready(self, budget)
-    }
-
-    fn live_tasks(&self) -> usize {
-        inf_runtime::CellExecutor::live_tasks(self)
+/// Whether the first poll completed the future (true) or parked it (false).
+#[inline(always)]
+fn first_poll_completed(outcome: PollImmediate) -> bool {
+    match outcome {
+        PollImmediate::Completed => true,
+        PollImmediate::Suspended(_) => false,
     }
 }
 
@@ -144,7 +85,7 @@ trait Foreign {
     fn delivered(&self) -> u64;
 }
 
-/// A's and B's foreign half: nothing, compiled away.
+/// B's foreign half: nothing, compiled away.
 struct NoForeign;
 
 impl Foreign for NoForeign {
@@ -272,19 +213,19 @@ impl Future for Parked {
 }
 
 /// An executor with one parked task, the waker its first poll handed out and its poll count.
-struct ParkedCell<E> {
-    exec: E,
+struct ParkedCell {
+    exec: CellExecutor,
     waker: Waker,
     polls: Rc<Cell<u64>>,
 }
 
-impl<E: Executor> ParkedCell<E> {
-    fn new() -> Result<ParkedCell<E>, String> {
-        let mut exec = E::with_capacity(TASKS);
+impl ParkedCell {
+    fn new() -> Result<ParkedCell, String> {
+        let mut exec = CellExecutor::new(TASKS);
         let slot = Rc::new(Cell::new(None));
         let polls = Rc::new(Cell::new(0));
         let task = Parked { waker: Rc::clone(&slot), polls: Rc::clone(&polls) };
-        if exec.poll_immediate(task) {
+        if first_poll_completed(exec.poll_immediate(task)) {
             return Err("the parked task completed on its first poll".into());
         }
         let waker = slot.take().ok_or("the parked task's first poll handed out no waker")?;
@@ -293,21 +234,21 @@ impl<E: Executor> ParkedCell<E> {
 }
 
 /// The fast row's owner: the executor and the counter its command bumps.
-struct FastCell<E> {
-    exec: E,
+struct FastCell {
+    exec: CellExecutor,
     counter: Rc<Cell<u64>>,
 }
 
 #[inline(never)]
-fn step_fast<E: Executor>(cell: &mut FastCell<E>) -> bool {
+fn step_fast(cell: &mut FastCell) -> bool {
     let counter = Rc::clone(&cell.counter);
-    cell.exec.poll_immediate(async move {
+    first_poll_completed(cell.exec.poll_immediate(async move {
         command(black_box(&counter));
-    })
+    }))
 }
 
 #[inline(never)]
-fn step_clone_drop<E: Executor, L: Foreign>(cell: &mut ParkedCell<E>, lane: &mut L) {
+fn step_clone_drop<L: Foreign>(cell: &mut ParkedCell, lane: &mut L) {
     let clone = black_box(&cell.waker).clone();
     lane.on_clone();
     drop(black_box(clone));
@@ -316,22 +257,22 @@ fn step_clone_drop<E: Executor, L: Foreign>(cell: &mut ParkedCell<E>, lane: &mut
 }
 
 /// The suspend row's owner: the executor, the gate, the next token and the value delivered last.
-struct SuspendCell<E> {
-    exec: E,
+struct SuspendCell {
+    exec: CellExecutor,
     gate: FabricGate<u64>,
     token: u64,
     sink: Rc<Cell<u64>>,
 }
 
 #[inline(never)]
-fn step_suspend<E: Executor, L: Foreign>(cell: &mut SuspendCell<E>, lane: &mut L) -> usize {
+fn step_suspend<L: Foreign>(cell: &mut SuspendCell, lane: &mut L) -> usize {
     cell.token += 1;
     let token = cell.token;
     let waiter = cell.gate.waiter(token);
     let sink = Rc::clone(&cell.sink);
-    let completed = cell.exec.poll_immediate(async move {
+    let completed = first_poll_completed(cell.exec.poll_immediate(async move {
         sink.set(waiter.await);
-    });
+    }));
     lane.on_clone();
     black_box(completed);
     cell.gate.complete(token, token);
@@ -342,7 +283,7 @@ fn step_suspend<E: Executor, L: Foreign>(cell: &mut SuspendCell<E>, lane: &mut L
 }
 
 #[inline(never)]
-fn step_wake_run<E: Executor, L: Foreign>(cell: &mut ParkedCell<E>, lane: &mut L) -> usize {
+fn step_wake_run<L: Foreign>(cell: &mut ParkedCell, lane: &mut L) -> usize {
     cell.waker.wake_by_ref();
     lane.on_wake_by_ref();
     let polled = cell.exec.run_ready(1);
@@ -359,8 +300,8 @@ fn usize_count(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
 }
 
-fn drive_fast<E: Executor>(ops: u64) -> Result<(), String> {
-    let mut cell = FastCell { exec: E::with_capacity(TASKS), counter: Rc::new(Cell::new(0)) };
+fn drive_fast(ops: u64) -> Result<(), String> {
+    let mut cell = FastCell { exec: CellExecutor::new(TASKS), counter: Rc::new(Cell::new(0)) };
     let mut completed = 0u64;
     for _ in 0..ops {
         completed += u64::from(step_fast(black_box(&mut cell)));
@@ -370,8 +311,8 @@ fn drive_fast<E: Executor>(ops: u64) -> Result<(), String> {
     expect("fast live tasks", usize_count(cell.exec.live_tasks()), 0)
 }
 
-fn drive_clone_drop<E: Executor, L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
-    let mut cell = ParkedCell::<E>::new()?;
+fn drive_clone_drop<L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
+    let mut cell = ParkedCell::new()?;
     let mut lane = L::new();
     for _ in 0..ops {
         step_clone_drop(black_box(&mut cell), &mut lane);
@@ -382,9 +323,9 @@ fn drive_clone_drop<E: Executor, L: Foreign>(ops: u64, per_op: u64) -> Result<()
     expect("clone-drop delivered", lane.delivered(), ops * per_op)
 }
 
-fn drive_suspend<E: Executor, L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
+fn drive_suspend<L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
     let mut cell = SuspendCell {
-        exec: E::with_capacity(TASKS),
+        exec: CellExecutor::new(TASKS),
         gate: FabricGate::new(),
         token: 0,
         sink: Rc::new(Cell::new(0)),
@@ -402,8 +343,8 @@ fn drive_suspend<E: Executor, L: Foreign>(ops: u64, per_op: u64) -> Result<(), S
     expect("suspend delivered", lane.delivered(), ops * per_op)
 }
 
-fn drive_wake_run<E: Executor, L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
-    let mut cell = ParkedCell::<E>::new()?;
+fn drive_wake_run<L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
+    let mut cell = ParkedCell::new()?;
     let mut lane = L::new();
     let mut polled = 0u64;
     for _ in 0..ops {
@@ -418,7 +359,6 @@ fn drive_wake_run<E: Executor, L: Foreign>(ops: u64, per_op: u64) -> Result<(), 
 
 #[derive(Clone, Copy)]
 enum Leg {
-    A,
     B,
     P,
     /// P's checks over [`SkippedLane`]: the liveness clause's planted red.
@@ -434,30 +374,26 @@ enum Row {
 }
 
 /// The one table of variant names: `--variant` is parsed against it.
-const VARIANTS: [(&str, Leg, Row); 13] = [
-    ("a-fast", Leg::A, Row::Fast),
+const VARIANTS: [(&str, Leg, Row); 9] = [
     ("b-fast", Leg::B, Row::Fast),
     ("p-fast", Leg::P, Row::Fast),
-    ("a-clone-drop", Leg::A, Row::CloneDrop),
     ("b-clone-drop", Leg::B, Row::CloneDrop),
     ("p-clone-drop", Leg::P, Row::CloneDrop),
-    ("a-suspend", Leg::A, Row::Suspend),
     ("b-suspend", Leg::B, Row::Suspend),
     ("p-suspend", Leg::P, Row::Suspend),
-    ("a-wake-run", Leg::A, Row::WakeRun),
     ("b-wake-run", Leg::B, Row::WakeRun),
     ("p-wake-run", Leg::P, Row::WakeRun),
     ("p-skip-suspend", Leg::PSkip, Row::Suspend),
 ];
 
 /// `per_op` is the leg's: each foreign operation and delivery a P leg's row implies per op, 1
-/// for P and its planted leg, 0 for A and B.
-fn run_row<E: Executor, L: Foreign>(row: Row, ops: u64, per_op: u64) -> Result<(), String> {
+/// for P and its planted leg, 0 for B.
+fn run_row<L: Foreign>(row: Row, ops: u64, per_op: u64) -> Result<(), String> {
     match row {
-        Row::Fast => drive_fast::<E>(ops),
-        Row::CloneDrop => drive_clone_drop::<E, L>(ops, per_op),
-        Row::Suspend => drive_suspend::<E, L>(ops, per_op),
-        Row::WakeRun => drive_wake_run::<E, L>(ops, per_op),
+        Row::Fast => drive_fast(ops),
+        Row::CloneDrop => drive_clone_drop::<L>(ops, per_op),
+        Row::Suspend => drive_suspend::<L>(ops, per_op),
+        Row::WakeRun => drive_wake_run::<L>(ops, per_op),
     }
 }
 
@@ -488,10 +424,9 @@ fn parse() -> Result<(Leg, Row, u64), String> {
 
 fn main() -> ExitCode {
     let outcome = parse().and_then(|(leg, row, ops)| match leg {
-        Leg::A => run_row::<executor_a::CellExecutor, NoForeign>(row, ops, 0),
-        Leg::B => run_row::<inf_runtime::CellExecutor, NoForeign>(row, ops, 0),
-        Leg::P => run_row::<inf_runtime::CellExecutor, ForeignLane>(row, ops, 1),
-        Leg::PSkip => run_row::<inf_runtime::CellExecutor, SkippedLane>(row, ops, 1),
+        Leg::B => run_row::<NoForeign>(row, ops, 0),
+        Leg::P => run_row::<ForeignLane>(row, ops, 1),
+        Leg::PSkip => run_row::<SkippedLane>(row, ops, 1),
     });
     match outcome {
         Ok(()) => ExitCode::SUCCESS,

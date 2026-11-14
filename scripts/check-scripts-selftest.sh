@@ -3254,20 +3254,17 @@ expect_red_because "waker boundary: the live-boundary switch outside fixture mod
     "INF_WAKER_LIVE=off outside fixture mode" env INF_WAKER_LIVE=off $WAKER_LIVE
 # The source census (ADR-0003 A1.6): `RawWakerVTable` named in code outside the census's entries
 # is red, and so is an entry that names it nowhere; comments and string literals are not code.
-census_root() { # <name>: a fixture root whose two entries each name it in code
+census_root() { # <name>: a fixture root whose one entry names it in code
     local root="$work/census-$1"
-    mkdir -p "$root/crates/inf-runtime/src" "$root/crates/inf-runtime/benches/waker_ab" \
-        "$root/crates/x/src" "$root/bins" "$root/tests"
+    mkdir -p "$root/crates/inf-runtime/src" "$root/crates/x/src" "$root/bins" "$root/tests"
     printf 'static V: RawWakerVTable = v();\n' >"$root/crates/inf-runtime/src/executor.rs"
-    printf 'use core::task::RawWakerVTable;\n' \
-        >"$root/crates/inf-runtime/benches/waker_ab/executor_a.rs"
     printf '// RawWakerVTable\n/* RawWakerVTable */ fn f() -> &str { "RawWakerVTable" }\n' \
         >"$root/crates/x/src/lib.rs"
     echo "$root"
 }
 root=$(census_root clean)
 expect_output "waker census: a name in comments and strings is no name in code" \
-    "census: 3 .rs files read, entries:" \
+    "census: 2 .rs files read, entries:" \
     env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
 root=$(census_root outside)
 printf 'pub static W: core::task::RawWakerVTable = w();\n' >>"$root/crates/x/src/lib.rs"
@@ -3275,10 +3272,9 @@ expect_red_because "waker census: a file outside its entries naming the vtable t
     "WAKER CENSUS: crates/x/src/lib.rs names RawWakerVTable outside the census's entries" \
     env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
 root=$(census_root unnamed)
-printf '// RawWakerVTable, in a comment only\n' \
-    >"$root/crates/inf-runtime/benches/waker_ab/executor_a.rs"
+printf '// RawWakerVTable, in a comment only\n' >"$root/crates/inf-runtime/src/executor.rs"
 expect_red_because "waker census: an entry that names the vtable type nowhere is red" \
-    "WAKER CENSUS: crates/inf-runtime/benches/waker_ab/executor_a.rs is an entry that names RawWakerVTable nowhere" \
+    "WAKER CENSUS: crates/inf-runtime/src/executor.rs is an entry that names RawWakerVTable nowhere" \
     env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
 }
 

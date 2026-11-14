@@ -418,7 +418,6 @@ fi
 # the copy, its verdicts recorded.
 CENSUS_ENTRIES=(
     "crates/inf-runtime/src/executor.rs|the executor's waker vtable"
-    "crates/inf-runtime/benches/waker_ab/executor_a.rs|the waker A/B's leg A, until its verdicts are recorded"
 )
 # A Rust file's code: comments (line and nested block), string literals (plain, byte and raw)
 # and char literals blanked; lifetimes stay. One line out per line in.
