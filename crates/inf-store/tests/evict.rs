@@ -289,12 +289,14 @@ fn ns_gated_set(ks: &mut Keyspace, id: u32, key: &str, len: usize) -> Result<(),
 /// node-level `maxmemory` set at all.
 #[test]
 fn named_ns_storm_holds_its_own_budget_and_leaves_db0_alone() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh();
     for i in 0..100 {
         set(&mut ks, &format!("db0:{i}"), 128);
     }
     const VALUE: usize = 256;
-    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysRandom))).expect("create");
+    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysRandom)), &census)
+        .expect("create");
     for i in 0..200 {
         ns_set(&mut ks, 16, &format!("seed:{i}"), VALUE);
     }
@@ -329,8 +331,9 @@ fn named_ns_storm_holds_its_own_budget_and_leaves_db0_alone() {
 /// shape evicted the numbered dbs dry and then answered OOM.
 #[test]
 fn inheriting_named_ns_joins_the_global_hand() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh();
-    ks.ns_create(memory_ns(16, b"grower", None)).expect("create");
+    ks.ns_create(memory_ns(16, b"grower", None), &census).expect("create");
     pressure(&mut ks, EvictionPolicy::AllKeysRandom, 0);
     for i in 0..50 {
         set(&mut ks, &format!("db0:{i}"), 64);
@@ -358,6 +361,7 @@ fn inheriting_named_ns_joins_the_global_hand() {
 /// hand skips them, and every durable key survives global pressure.
 #[test]
 fn durable_named_store_never_joins_any_hand() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh();
     let durable = NsSpec {
         id: NsId(16),
@@ -368,7 +372,7 @@ fn durable_named_store_never_joins_any_hand() {
         maxmemory: None,
         tier: None,
     };
-    ks.ns_create(durable).expect("create");
+    ks.ns_create(durable, &census).expect("create");
     for i in 0..100 {
         ns_set(&mut ks, 16, &format!("keep:{i}"), 256);
     }
@@ -399,8 +403,10 @@ fn durable_named_store_never_joins_any_hand() {
 /// alone — no writes arrive, and the store settles at its low watermark.
 #[test]
 fn maintain_drives_budgeted_ns_to_its_low_watermark() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh();
-    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysLru))).expect("create");
+    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysLru)), &census)
+        .expect("create");
     for i in 0..500 {
         ns_set(&mut ks, 16, &format!("fill:{i}"), 200);
     }
@@ -436,9 +442,11 @@ fn maintain_drives_budgeted_ns_to_its_low_watermark() {
 /// (ADR-0068 D3).
 #[test]
 fn node_policy_push_reaches_inheriting_stores_only() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh();
-    ks.ns_create(memory_ns(16, b"inheriting", None)).expect("create");
-    ks.ns_create(memory_ns(17, b"explicit", Some(EvictionPolicy::AllKeysLfu))).expect("create");
+    ks.ns_create(memory_ns(16, b"inheriting", None), &census).expect("create");
+    ks.ns_create(memory_ns(17, b"explicit", Some(EvictionPolicy::AllKeysLfu)), &census)
+        .expect("create");
     ns_set(&mut ks, 16, "k", 8);
     ns_set(&mut ks, 17, "k", 8);
     pressure(&mut ks, EvictionPolicy::AllKeysLru, 0);
@@ -456,9 +464,11 @@ fn node_policy_push_reaches_inheriting_stores_only() {
 /// under every enforcement leg at once.
 #[test]
 fn eviction_accounting_reconciles_across_named_stores() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh();
-    ks.ns_create(memory_ns(16, b"budgeted", Some(EvictionPolicy::AllKeysRandom))).expect("create");
-    ks.ns_create(memory_ns(17, b"inheriting", None)).expect("create");
+    ks.ns_create(memory_ns(16, b"budgeted", Some(EvictionPolicy::AllKeysRandom)), &census)
+        .expect("create");
+    ks.ns_create(memory_ns(17, b"inheriting", None), &census).expect("create");
     pressure(&mut ks, EvictionPolicy::AllKeysRandom, 0);
     for i in 0..150 {
         set(&mut ks, &format!("db0:{i}"), 128);
@@ -532,8 +542,10 @@ fn eviction_and_wheel_stay_consistent() {
 /// alone, then the drained pool answered OOM forever.
 #[test]
 fn budgeted_ns_under_its_own_budget_does_not_evict_numbered_dbs() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh();
-    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysRandom))).expect("create");
+    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysRandom)), &census)
+        .expect("create");
     for i in 0..100 {
         set(&mut ks, &format!("db0:{i}"), 200);
     }
@@ -570,8 +582,10 @@ fn budgeted_ns_under_its_own_budget_does_not_evict_numbered_dbs() {
 /// into the budgeted namespace.
 #[test]
 fn pool_pressure_reclaims_from_the_pool_only() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh();
-    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysRandom))).expect("create");
+    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysRandom)), &census)
+        .expect("create");
     for i in 0..200 {
         ns_set(&mut ks, 16, &format!("c:{i}"), 200);
     }
@@ -606,19 +620,23 @@ fn pool_pressure_reclaims_from_the_pool_only() {
 /// batch-56 tree by design — no A1 extension is needed.
 #[test]
 fn tiered_shells_carry_no_resident_bytes_into_the_pool() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     const NS: NsId = NsId(31);
     const BUDGET: u64 = 256 << 10;
     const PAGE: u64 = 4 << 10;
     let mut ks = fresh();
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"tiered".to_vec(),
-        mode: NsMode::Durable,
-        fsync: None,
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"tiered".to_vec(),
+            mode: NsMode::Durable,
+            fsync: None,
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("register");
     let demote = DemotionConfig::for_budget(BUDGET, PAGE);
     let ring = demote.ring_reserve_bytes().expect("valid budget");
@@ -631,6 +649,7 @@ fn tiered_shells_carry_no_resident_bytes_into_the_pool() {
         },
         demote,
         1024,
+        &census,
     )
     .expect("materialize");
     for i in 0..100 {

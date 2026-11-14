@@ -438,6 +438,7 @@ mod tests {
     /// one-byte strings back to back below the life origin, each indexed as
     /// the boot's checkpoint refs it.
     fn cold_table(budget: u64, records: u32) -> (TieredTable, Vec<Cold>) {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let images: Vec<Vec<u8>> = (0..records)
             .map(|index| {
                 let key = format!("key-{index:06}");
@@ -460,8 +461,9 @@ mod tests {
             page_bytes: PAGE as usize,
             life_origin: LogicalAddr::from_raw(cold_bytes.next_multiple_of(PAGE)).expect("48-bit"),
         };
-        let mut table = TieredTable::new(config, demote, images.len(), KeyHasher::default())
-            .expect("the ring reserves");
+        let mut table =
+            TieredTable::new(config, demote, images.len(), KeyHasher::default(), &census)
+                .expect("the ring reserves");
         let file = TierFileMeta {
             id: 0,
             base: LogicalAddr::ZERO,

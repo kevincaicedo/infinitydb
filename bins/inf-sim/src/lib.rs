@@ -100,7 +100,7 @@ pub use nscreate::{NsCreateWindowReport, run_ns_create_window_scenario};
 pub use nsddl::{NsDdlRaceReport, run_ns_ddl_race_scenario};
 pub use nsdrop::{DropCut, NsDropWindowReport, run_ns_drop_window_scenario};
 pub use nslifetimes::{LifetimesLeg, NsLifetimesReport, run_ns_lifetimes_scenario};
-pub use pressure::{PressureReport, PressureScenario, run_pressure_scenario};
+pub use pressure::{PressureLeg, PressureReport, PressureScenario, run_pressure_scenario};
 pub use recovery::{
     RecoveryReport, RecoveryScenario, SealCensus, SeedClass, SpecVariant, run_recovery_scenario,
 };
@@ -144,7 +144,7 @@ pub const SCENARIOS: &[ScenarioRow] = &[
     ScenarioRow::sweeps("m3-document"),
     ScenarioRow::single("boot-storm"),
     ScenarioRow::single("m4-steel"),
-    ScenarioRow::single("m4-pressure"),
+    ScenarioRow::single("m4-pressure").with_default_leg(LegValue::Pressure(PressureLeg::Budget)),
     ScenarioRow::single("m4-cold").with_default_leg(LegValue::Cold(ColdLeg::Storm)),
     ScenarioRow::sweeps("m4-recovery"),
     ScenarioRow::single("m4-diskfull"),
@@ -253,7 +253,7 @@ impl ScenarioRow {
     }
 }
 
-/// The leg column's kinds: the seven legged scenarios' leg flags.
+/// The leg column's kinds: the eight legged scenarios' leg flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leg {
     TierBudget,
@@ -262,18 +262,20 @@ pub enum Leg {
     ExtentWindow,
     Cold,
     Lifetimes,
+    Pressure,
     PubTarget,
 }
 
 impl Leg {
     /// Every leg kind, in the order the help text lists their flags.
-    pub const ALL: [Leg; 7] = [
+    pub const ALL: [Leg; 8] = [
         Leg::TierBudget,
         Leg::EpochMarks,
         Leg::ExtentWindow,
         Leg::LedgerWedge,
         Leg::Cold,
         Leg::Lifetimes,
+        Leg::Pressure,
         Leg::PubTarget,
     ];
 
@@ -292,6 +294,7 @@ impl Leg {
             Leg::ExtentWindow => ExtentWindowLeg::parse(name).map(LegValue::ExtentWindow),
             Leg::Cold => ColdLeg::parse(name).map(LegValue::Cold),
             Leg::Lifetimes => LifetimesLeg::parse(name).map(LegValue::Lifetimes),
+            Leg::Pressure => PressureLeg::parse(name).map(LegValue::Pressure),
             Leg::PubTarget => PubTarget::parse(name).map(LegValue::PubTarget),
         };
         value.ok_or_else(|| {
@@ -309,6 +312,7 @@ impl Leg {
             Leg::ExtentWindow => "--window-leg",
             Leg::Cold => "--cold-leg",
             Leg::Lifetimes => "--lifetimes-leg",
+            Leg::Pressure => "--pressure-leg",
             Leg::PubTarget => "--pub-target",
         }
     }
@@ -324,6 +328,7 @@ impl Leg {
             Leg::ExtentWindow => ExtentWindowLeg::ALL.iter().map(|leg| leg.name()).collect(),
             Leg::Cold => ColdLeg::ALL.iter().map(|(_, name)| *name).collect(),
             Leg::Lifetimes => LifetimesLeg::NAMES.to_vec(),
+            Leg::Pressure => PressureLeg::ALL.iter().map(|leg| leg.name()).collect(),
             Leg::PubTarget => PubTarget::ALL.iter().map(|target| target.name()).collect(),
         }
     }
@@ -339,6 +344,7 @@ pub enum LegValue {
     ExtentWindow(ExtentWindowLeg),
     Cold(ColdLeg),
     Lifetimes(LifetimesLeg),
+    Pressure(PressureLeg),
     PubTarget(PubTarget),
 }
 
@@ -352,6 +358,7 @@ impl LegValue {
             LegValue::ExtentWindow(_) => Leg::ExtentWindow,
             LegValue::Cold(_) => Leg::Cold,
             LegValue::Lifetimes(_) => Leg::Lifetimes,
+            LegValue::Pressure(_) => Leg::Pressure,
             LegValue::PubTarget(_) => Leg::PubTarget,
         }
     }
@@ -366,6 +373,7 @@ impl LegValue {
             | LegValue::LedgerWedge(_)
             | LegValue::ExtentWindow(_)
             | LegValue::Lifetimes(_)
+            | LegValue::Pressure(_)
             | LegValue::PubTarget(_) => None,
         }
     }
@@ -380,7 +388,8 @@ impl LegValue {
             | LegValue::LedgerWedge(_)
             | LegValue::ExtentWindow(_)
             | LegValue::Cold(_)
-            | LegValue::Lifetimes(_) => None,
+            | LegValue::Lifetimes(_)
+            | LegValue::Pressure(_) => None,
         }
     }
 }

@@ -57,6 +57,7 @@ impl Rig {
     /// frame is rewritten, and therefore the tier leg of write
     /// amplification.
     fn new(slice_bytes: u64, file_capacity: u64) -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let fs = MemFs::new();
         let demote = DemotionConfig { slice_bytes, ..DemotionConfig::for_budget(BUDGET, PAGE) };
         let mut ks = Keyspace::new(StoreConfig::default());
@@ -70,6 +71,7 @@ impl Rig {
                 },
                 demote,
                 2048,
+                &census,
             )
             .is_ok()
         );

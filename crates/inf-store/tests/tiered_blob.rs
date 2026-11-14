@@ -100,6 +100,7 @@ impl Rig {
     }
 
     fn with_budget(budget: u64) -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(budget, PAGE);
         let mut table = TieredTable::new(
             AddressSpaceConfig {
@@ -110,6 +111,7 @@ impl Rig {
             demote,
             2048,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         table.set_blob_config(BlobConfig { threshold_bytes: THRESHOLD, max_bytes: 1 << 20 });

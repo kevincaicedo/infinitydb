@@ -44,6 +44,7 @@ impl LogBuilder {
 /// truncates the torn tail (M2-S14) and serves everything before it.
 #[test]
 fn torn_frame_then_crash_recovers_minus_the_torn_frame() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     fault::disarm_all();
     let fs = MemFs::new();
     let config = cfg();
@@ -58,7 +59,8 @@ fn torn_frame_then_crash_recovers_minus_the_torn_frame() {
 
     let mut ks = fresh_keyspace();
     let (mut rotor, stats, _seed) =
-        open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now()).expect("recovers");
+        open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now(), &census)
+            .expect("recovers");
     assert_eq!(stats.torn_truncated_at, Some(torn_base), "tail truncated at the torn frame");
     assert_eq!(get(&mut ks, b"a").as_deref(), Some(b"1".as_slice()));
     assert_eq!(get(&mut ks, b"b").as_deref(), Some(b"2".as_slice()));
@@ -71,6 +73,7 @@ fn torn_frame_then_crash_recovers_minus_the_torn_frame() {
 /// at the seal boundary with zero loss and no torn truncation.
 #[test]
 fn power_cut_after_seal_recovers_at_the_seal_boundary() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     fault::disarm_all();
     let fs = MemFs::new();
     let config = cfg_with(SegmentConfig { segment_bytes: 4096, ..Default::default() });
@@ -101,7 +104,8 @@ fn power_cut_after_seal_recovers_at_the_seal_boundary() {
 
     let mut ks = fresh_keyspace();
     let (mut rotor, stats, _seed) =
-        open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now()).expect("recovers");
+        open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now(), &census)
+            .expect("recovers");
     assert_eq!(stats.torn_truncated_at, None, "a sealed end is clean, never torn");
     for key in &keys {
         assert!(get(&mut ks, key).is_some(), "sealed frame for {key:?} survives");

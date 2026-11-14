@@ -44,6 +44,7 @@ fn writer(fs: &MemFs, id: u32) -> TierWriter<MemFs> {
 
 /// A small tiered table + pipeline pair for the pipeline-level rows.
 fn table_and_flush(fs: &MemFs) -> (Keyspace, TierFlush<MemFs>) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let demote = DemotionConfig::for_budget(4 << 20, PAGE);
     let ring = demote.ring_reserve_bytes().expect("valid budget");
     let mut ks = Keyspace::new(StoreConfig::default());
@@ -57,6 +58,7 @@ fn table_and_flush(fs: &MemFs) -> (Keyspace, TierFlush<MemFs>) {
             },
             demote,
             128,
+            &census,
         )
         .is_ok()
     );

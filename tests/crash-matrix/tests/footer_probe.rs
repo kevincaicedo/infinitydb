@@ -40,17 +40,21 @@ fn cfg() -> DurableConfig {
 }
 
 fn keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     for (id, name) in [(FULL, &b"ledger"[..]), (EMPTY, &b"fresh"[..])] {
-        ks.ns_create(NsSpec {
-            id,
-            name: name.to_vec(),
-            mode: NsMode::Durable,
-            fsync: Some(FsyncClass::Always),
-            policy: None,
-            maxmemory: None,
-            tier: None,
-        })
+        ks.ns_create(
+            NsSpec {
+                id,
+                name: name.to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(FsyncClass::Always),
+                policy: None,
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("ns");
     }
     ks
@@ -114,6 +118,7 @@ fn build_shard(fs: &MemFs, populated: &[NsId]) {
 }
 
 fn boot(fs: &MemFs) -> inf_server::RecoverStats {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = keyspace();
     let (_rotor, stats, manifest) = open_cell_log(
         fs.clone(),
@@ -122,6 +127,7 @@ fn boot(fs: &MemFs) -> inf_server::RecoverStats {
         &cfg(),
         WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 },
         Nanos::from_millis(1),
+        &census,
     )
     .expect("boot");
     assert_eq!(manifest.map(|m| m.ckpt_id), Some(1));

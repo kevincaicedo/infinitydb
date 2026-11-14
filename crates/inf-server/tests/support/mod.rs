@@ -61,16 +61,20 @@ pub fn cfg_with(segment: SegmentConfig) -> DurableConfig {
 
 /// A keyspace with the one `always` durable namespace the fixtures write.
 pub fn fresh_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"ledger".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("ns");
     ks
 }
@@ -91,7 +95,8 @@ pub fn recover_with(
     ks: &mut Keyspace,
     cfg: &DurableConfig,
 ) -> std::io::Result<(SegmentRotor<MemFs>, RecoverStats)> {
-    open_cell_log(fs.clone(), ks, CELL, cfg, anchor(), now())
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+    open_cell_log(fs.clone(), ks, CELL, cfg, anchor(), now(), &census)
         .map(|(rotor, stats, _seed)| (rotor, stats))
 }
 

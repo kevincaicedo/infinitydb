@@ -66,16 +66,20 @@ fn gate_doc() -> Vec<u8> {
 }
 
 fn keyspace(documents: usize) -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig { initial_keys: documents, ..Default::default() });
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"bench".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"bench".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("namespace");
     ks
 }

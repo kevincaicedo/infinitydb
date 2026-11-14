@@ -74,16 +74,20 @@ fn cfg(root: &Path, boot_prefetch: bool) -> DurableConfig {
 }
 
 fn fresh_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"ledger".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("ns");
     ks
 }
@@ -177,9 +181,17 @@ fn assert_a_live_prefetch_thread_is_counted() {
 /// Recovers the log at `root` with the given arm; returns the digest and
 /// the number of prefetch threads spawned during the run.
 fn recover(root: &Path, boot_prefetch: bool) -> (StateDigest, u64) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let before = boot_prefetch_threads_spawned();
     let mut ks = fresh_keyspace();
-    let mut rec = Recovery::new(StdSegmentFs, CELL, &cfg(root, boot_prefetch), anchor(), now());
+    let mut rec = Recovery::new(
+        StdSegmentFs,
+        CELL,
+        &cfg(root, boot_prefetch),
+        anchor(),
+        now(),
+        std::rc::Rc::clone(&census),
+    );
     while rec.step(&mut ks, u64::MAX).expect("step") == RecoveryProgress::Working {}
     // The typed half: the rotor the plane inherits is over the bare tier.
     let (rotor, _stats, _seed): (SegmentRotor<StdSegmentFs>, _, _) = rec.finish();

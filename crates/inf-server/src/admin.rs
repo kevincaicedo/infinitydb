@@ -365,7 +365,7 @@ pub(crate) fn inf_ns(
             );
         }
         let id = next_local_ns_id(ks);
-        match ks.ns_create(draft.with_id(id)) {
+        match ks.ns_create(draft.with_id(id), &planeless_census(node)) {
             Ok(()) => w.simple("OK"),
             Err(e) => ns_error(e, w),
         }
@@ -904,6 +904,19 @@ fn parse_tier_key(
 /// (Node ids come from the control allocator; this tier never persists.)
 fn next_local_ns_id(ks: &Keyspace) -> u32 {
     ks.ns_iter().map(|s| s.id.0 + 1).max().unwrap_or(inf_store::FIRST_NAMED_NS_ID)
+}
+
+/// The cap census a planeless `CREATE` builds on (ADR-0163 D2): the cell's,
+/// which a plane attaches to `node` at its construction; on a host with no
+/// plane, one this host builds once, on its first create, and attaches there,
+/// never marked. Every table of the keyspace then lands on one census, though
+/// a planeless create is memory-only and registers nothing.
+fn planeless_census(node: &NodeInfo) -> std::rc::Rc<inf_foundation::bounded::CapCensus> {
+    let mut attached = node.cap_census.borrow_mut();
+    let census = attached.get_or_insert_with(|| {
+        inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(node.cell.get())).0
+    });
+    std::rc::Rc::clone(census)
 }
 
 // ---- CLIENT ------------------------------------------------------------------
@@ -1565,6 +1578,7 @@ mod tests {
     /// `used_memory` and out of the pool; a peer's publication adds in.
     #[test]
     fn info_memory_renders_the_maxmemory_comparable() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         for i in 0..8u32 {
@@ -1575,15 +1589,18 @@ mod tests {
             );
         }
         store
-            .ns_create(inf_store::NsSpec {
-                id: inf_store::NsId(16),
-                name: b"cache".to_vec(),
-                mode: inf_store::NsMode::Memory,
-                fsync: None,
-                policy: Some(EvictionPolicy::AllKeysRandom),
-                maxmemory: Some(64 << 20),
-                tier: None,
-            })
+            .ns_create(
+                inf_store::NsSpec {
+                    id: inf_store::NsId(16),
+                    name: b"cache".to_vec(),
+                    mode: inf_store::NsMode::Memory,
+                    fsync: None,
+                    policy: Some(EvictionPolicy::AllKeysRandom),
+                    maxmemory: Some(64 << 20),
+                    tier: None,
+                },
+                &census,
+            )
             .expect("create");
         let cache = store.ns_store_mut(inf_store::NsId(16)).expect("registered");
         for i in 0..64u32 {
@@ -1731,6 +1748,7 @@ mod tests {
     /// cell aggregate is the exact sum of those lines.
     #[test]
     fn info_tiering_renders_per_namespace_watermarks_and_write_counters() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
@@ -1748,6 +1766,7 @@ mod tests {
                     },
                     demote,
                     64,
+                    &census,
                 )
                 .is_ok()
         );
@@ -1781,6 +1800,7 @@ mod tests {
     /// zero (the §3.3 degenerate contract, asserted above).
     #[test]
     fn info_tiering_ram_hit_split_renders_absent_not_zero_when_tiered() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId};
 
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
@@ -1798,6 +1818,7 @@ mod tests {
                     },
                     demote,
                     64,
+                    &census,
                 )
                 .is_ok()
         );
@@ -1870,6 +1891,7 @@ mod tests {
     /// averaged away.
     #[test]
     fn info_tiering_reports_write_amplification_per_namespace() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         use inf_log::{LogGeometry, MutationEffect, StagingRing};
         use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
@@ -1890,6 +1912,7 @@ mod tests {
                         },
                         demote,
                         64,
+                        &census,
                     )
                     .is_ok()
             );
@@ -2014,6 +2037,7 @@ mod tests {
     /// tier block read back through `INF.NS INFO`.
     #[test]
     fn inf_ns_tiering_surface() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         // Tier keys without MEM-BUDGET refuse typed (the discriminator).
@@ -2042,15 +2066,18 @@ mod tests {
         // drive the rest of the surface against it.
         let tier = TierSpec::for_budget(8 << 20);
         store
-            .ns_create(NsSpec {
-                id: inf_store::NsId(16),
-                name: b"tiered".to_vec(),
-                mode: NsMode::Durable,
-                fsync: None,
-                policy: None,
-                maxmemory: None,
-                tier: Some(tier),
-            })
+            .ns_create(
+                NsSpec {
+                    id: inf_store::NsId(16),
+                    name: b"tiered".to_vec(),
+                    mode: NsMode::Durable,
+                    fsync: None,
+                    policy: None,
+                    maxmemory: None,
+                    tier: Some(tier),
+                },
+                &census,
+            )
             .expect("create");
         // M4-S26: the D8 refusal is lifted — USE succeeds; the planeless
         // exec fallback still refuses data commands (plane-resident).
@@ -2102,6 +2129,7 @@ mod tests {
     /// refusals on durable namespaces and for tier keys on memory ones.
     #[test]
     fn inf_ns_memory_pressure_surface() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let r = run(
@@ -2140,15 +2168,18 @@ mod tests {
         // Durable namespaces refuse both keys typed (planeless memory-only
         // CREATE means the durable entry registers directly).
         store
-            .ns_create(NsSpec {
-                id: inf_store::NsId(31),
-                name: b"ledger".to_vec(),
-                mode: NsMode::Durable,
-                fsync: None,
-                policy: None,
-                maxmemory: None,
-                tier: None,
-            })
+            .ns_create(
+                NsSpec {
+                    id: inf_store::NsId(31),
+                    name: b"ledger".to_vec(),
+                    mode: NsMode::Durable,
+                    fsync: None,
+                    policy: None,
+                    maxmemory: None,
+                    tier: None,
+                },
+                &census,
+            )
             .expect("create");
         let r = run(&mut cx, &mut store, &[b"INF.NS", b"SET", b"ledger", b"MAXMEMORY", b"1mb"]);
         assert!(r.starts_with(b"-ERR durable namespaces do not evict"), "{r:?}");
@@ -2161,6 +2192,7 @@ mod tests {
     /// counted in exactly one leg).
     #[test]
     fn info_tiering_splits_the_blob_write_amplification_leg() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         use std::path::Path;
 
         use inf_log::TierIoMode;
@@ -2183,6 +2215,7 @@ mod tests {
                     },
                     demote,
                     64,
+                    &census,
                 )
                 .is_ok()
         );

@@ -29,16 +29,20 @@ const TIER_NS: NsId = NsId(17);
 /// `fresh_keyspace` plus a materialized tiered namespace (no MANIFEST —
 /// the first-crash shape: the catalog names it, no checkpoint does).
 fn tiered_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace();
-    ks.ns_create(NsSpec {
-        id: TIER_NS,
-        name: b"hot".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: Some(TierSpec::for_budget(8 << 20)),
-    })
+    ks.ns_create(
+        NsSpec {
+            id: TIER_NS,
+            name: b"hot".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(8 << 20)),
+        },
+        &census,
+    )
     .expect("tiered ns");
     ks
 }

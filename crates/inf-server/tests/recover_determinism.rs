@@ -233,9 +233,11 @@ fn reference_replay(fs: &MemFs) -> StateDigest {
 }
 
 fn recover_digest(fs: &MemFs) -> (StateDigest, Lsn, inf_server::RecoverStats) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace();
     let (rotor, stats, _seed) =
-        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now()).expect("recover");
+        open_cell_log(fs.clone(), &mut ks, CELL, &cfg(), anchor(), now(), &census)
+            .expect("recover");
     let resume = Lsn::new(rotor.active_segment(), rotor.active_written());
     (ks.state_digest(now()), resume, stats)
 }

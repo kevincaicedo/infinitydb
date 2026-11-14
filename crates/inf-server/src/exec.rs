@@ -137,8 +137,9 @@ pub struct NodeState {
     /// that never created a tiered namespace.
     pub cold: Cell<[u64; COLD_GAUGES]>,
     /// The cell's cap census (ADR-0163 D2), attached by the plane at its
-    /// construction: INFO's `# Caps` renders it, cell scope. A bare harness
-    /// that attaches none renders no `# Caps` section.
+    /// construction, or on a host with no plane by its first planeless
+    /// `CREATE`: INFO's `# Caps` renders it, cell scope. A bare harness that
+    /// attaches none renders no `# Caps` section.
     pub cap_census: RefCell<Option<Rc<inf_foundation::bounded::CapCensus>>>,
     /// Raw lifetime counters (submits, sqes, cqes, iterations, commands,
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.

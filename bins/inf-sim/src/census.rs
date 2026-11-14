@@ -12,12 +12,19 @@
 //!   `cap-assembly-violated`), and the census left `Assembling`: a census
 //!   never marked means the cell's loop took no serve mark, or marked
 //!   another census (token `census-never-marked`).
+//! - **The marks' derived rule**: the seal marks' and the hole marks' rows
+//!   cross nothing (`crossings = 0`): the stride keeps the seal marks under
+//!   half their cap, and the window's arithmetic keeps the hole marks under
+//!   theirs. A crossing is a derivation the run disproved (tokens
+//!   `seal-marks-crossed`, `hole-marks-crossed`).
 //! - **The window's turn rule**: a cell's durable plane counts no turn
 //!   that found the extent-seal window full (`turn_refused = 0`, the
 //!   release form of `len + w ≤ 16`; token `turn-refused`).
 //! - Liveness: a server cell has its timer owners' row, which its plane
 //!   builds before its loop exists; a cell holding a tiered namespace has
-//!   the reclaim marks' row; and a cell whose durable plane is built has
+//!   the reclaim marks', the seal marks' and the hole marks' rows, which its
+//!   tables register on the plane's census; and a cell whose durable plane
+//!   is built has
 //!   the extent-seal window's row (token `cap-row-missing`); the rows
 //!   checked are summed on the report line (`cap_rows_checked`), so a run
 //!   whose census read nothing is visible.
@@ -32,6 +39,10 @@ use inf_foundation::bounded::{CapCensus, CapRow, CensusPhase};
 /// The reclaim marks' census row, which every cell with a tiered namespace
 /// registers.
 const EPOCH_MARKS_ROW: &str = "epoch-marks";
+/// The seal marks' and the hole marks' census rows, which every tiered
+/// table registers on its cell's census when it is built.
+const SEAL_MARKS_ROW: &str = inf_store::limits::SEAL_MARKS.name();
+const HOLE_MARKS_ROW: &str = inf_store::limits::HOLE_MARKS.name();
 /// The extent-seal window's census row, which every cell's durable plane
 /// registers when it is built.
 const EXTENT_WINDOW_ROW: &str = "extent-window";
@@ -90,12 +101,16 @@ impl CensusVerdict {
             ));
         }
         let tiered_tables = facts.tiered_tables;
-        if tiered_tables > 0 && census.row(EPOCH_MARKS_ROW).is_none() {
-            self.violations.push(format!(
-                "CAP CENSUS VIOLATION cell {cell}: cap-row-missing — {tiered_tables} tiered \
-                 namespace(s) and no `{EPOCH_MARKS_ROW}` row"
-            ));
+        for row in [EPOCH_MARKS_ROW, SEAL_MARKS_ROW, HOLE_MARKS_ROW] {
+            if tiered_tables > 0 && census.row(row).is_none() {
+                self.violations.push(format!(
+                    "CAP CENSUS VIOLATION cell {cell}: cap-row-missing — {tiered_tables} tiered \
+                     namespace(s) and no `{row}` row"
+                ));
+            }
         }
+        marks_crossed(cell, census, SEAL_MARKS_ROW, "seal-marks-crossed", &mut self.violations);
+        marks_crossed(cell, census, HOLE_MARKS_ROW, "hole-marks-crossed", &mut self.violations);
         let Some(refused) = facts.turn_refused else { return };
         if census.row(EXTENT_WINDOW_ROW).is_none() {
             self.violations.push(format!(
@@ -127,6 +142,24 @@ impl CensusVerdict {
         self.rows_checked += other.rows_checked;
         self.rows_crossed += other.rows_crossed;
         self.violations.extend(other.violations);
+    }
+}
+
+/// The marks' derived rule on one row: a crossing is red, under `token`.
+fn marks_crossed(
+    cell: usize,
+    census: &CapCensus,
+    row: &str,
+    token: &str,
+    violations: &mut Violations,
+) {
+    let Some(row) = census.row(row) else { return };
+    if row.crossings > 0 {
+        violations.push(format!(
+            "CAP CENSUS VIOLATION cell {cell}: {token} — row `{}` crossed {} time(s), derived \
+             never to occur",
+            row.name, row.crossings
+        ));
     }
 }
 
@@ -179,8 +212,13 @@ mod tests {
             CellFacts { tiered_tables: 1, turn_refused: None, ..CellFacts::default() },
         );
         assert_eq!(verdict.rows_checked, 0);
-        assert_eq!(verdict.violations.len(), 1, "{:?}", verdict.violations);
-        assert!(verdict.violations[0].contains("cap-row-missing"), "{:?}", verdict.violations);
+        assert_eq!(verdict.violations.len(), 3, "{:?}", verdict.violations);
+        for (violation, row) in
+            verdict.violations.iter().zip([EPOCH_MARKS_ROW, SEAL_MARKS_ROW, HOLE_MARKS_ROW])
+        {
+            assert!(violation.contains("cap-row-missing"), "{violation}");
+            assert!(violation.contains(row), "{violation}");
+        }
         let mut durable = CensusVerdict::default();
         durable.judge(
             0,
@@ -240,6 +278,46 @@ mod tests {
         assert!(green.violations.is_empty(), "{:?}", green.violations);
     }
 
+    /// The marks' derived rule: a seal-marks row that merged at its cap and
+    /// a hole-marks row that refused at its cap are each red by their own
+    /// token; rows that never crossed are green.
+    #[test]
+    fn a_marks_row_that_crossed_is_red_by_its_token() {
+        struct Mark;
+        impl Lossy for Mark {}
+        struct Later;
+        impl Merge<Mark> for Later {
+            fn merge(back: &mut Mark, new: Mark) {
+                *back = new;
+            }
+        }
+        let facts = CellFacts { tiered_tables: 1, ..CellFacts::default() };
+        let (census, serve_mark) = CapCensus::new(CellId(5));
+        serve_mark.take();
+        let epoch = Cap::entries::<16>("epoch-marks", CapFill::Serving);
+        let _epoch = CappedDeque::<u64, Reserve>::new(epoch, &census).expect("built");
+        let seal = inf_store::limits::SEAL_MARKS;
+        let mut marks = CappedDeque::<Mark, Coalesce<Later>>::new(seal, &census).expect("built");
+        let mut holes = CappedDeque::<u64, Reserve>::new(inf_store::limits::HOLE_MARKS, &census)
+            .expect("built");
+        let mut green = CensusVerdict::default();
+        green.judge(5, &census, facts);
+        assert!(green.violations.is_empty(), "{:?}", green.violations);
+        for _ in 0..=seal.entries_max() {
+            marks.push(Mark);
+        }
+        for _ in 0..=inf_store::limits::HOLE_MARKS_MAX {
+            if let Reserved::Slot(slot) = holes.reserve() {
+                slot.publish(1);
+            }
+        }
+        let mut red = CensusVerdict::default();
+        red.judge(5, &census, facts);
+        assert_eq!(red.violations.len(), 2, "{:?}", red.violations);
+        assert!(red.violations[0].contains("seal-marks-crossed"), "{:?}", red.violations);
+        assert!(red.violations[1].contains("hole-marks-crossed"), "{:?}", red.violations);
+    }
+
     /// The assembly rule's liveness: a census its cell's loop never marked
     /// is red, by the token only that violation carries.
     #[test]
@@ -270,6 +348,8 @@ mod tests {
         serve_mark.take();
         let mut marks = CappedDeque::<Mark, Coalesce<Later>>::new(MARKS, &census).expect("built");
         let mut pairs = CappedDeque::<u8, Reserve>::new(PAIRS, &census).expect("built");
+        let _seal = CappedDeque::<u64, Reserve>::new(inf_store::limits::SEAL_MARKS, &census);
+        let _hole = CappedDeque::<u64, Reserve>::new(inf_store::limits::HOLE_MARKS, &census);
         for _ in 0..20 {
             marks.push(Mark);
         }
@@ -284,7 +364,7 @@ mod tests {
             &census,
             CellFacts { tiered_tables: 1, turn_refused: None, ..CellFacts::default() },
         );
-        assert_eq!(verdict.rows_checked, 2);
+        assert_eq!(verdict.rows_checked, 4);
         assert!(verdict.violations.is_empty(), "full rows are within their caps: {verdict:?}");
         // A row past its cap: no correct container writes one, so a row
         // read with a planted high water stands in for the cap-plus-one plant.

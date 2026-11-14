@@ -65,8 +65,8 @@ use inf_server::{
     execute_slices, fold_live_entries, glob_match,
 };
 use inf_store::{
-    ExpireCond, ExpiryBudget, FIRST_NAMED_NS_ID, KeyHasher, Keyspace, NsId, NsMode, NsSpec,
-    SetOptions, StoreConfig, WheelNodesMax,
+    ExpireCond, ExpiryBudget, FIRST_NAMED_NS_ID, KeyHasher, Keyspace, KeyspaceSeed, NsId, NsMode,
+    NsSpec, SetOptions, StoreConfig, WheelNodesMax,
 };
 use inf_wire::{CommandId, Protocol, lookup};
 
@@ -564,9 +564,9 @@ struct Oracle {
 /// control plane, so `INF.NS CREATE` is not available to the sim; the DDL
 /// program has its own DST, `m2-ns-create-window`). Ids start at
 /// `FIRST_NAMED_NS_ID`, names are `ns0`, `ns1`, …
-pub(crate) fn seed_namespaces(ks: &mut Keyspace, namespaces: u16) {
-    for i in 0..namespaces {
-        ks.ns_create(NsSpec {
+pub(crate) fn namespace_specs(namespaces: u16) -> Vec<NsSpec> {
+    (0..namespaces)
+        .map(|i| NsSpec {
             id: NsId(FIRST_NAMED_NS_ID + u32::from(i)),
             name: format!("ns{i}").into_bytes(),
             mode: NsMode::Memory,
@@ -575,8 +575,7 @@ pub(crate) fn seed_namespaces(ks: &mut Keyspace, namespaces: u16) {
             maxmemory: None,
             tier: None,
         })
-        .expect("seeded namespace names are valid and unique");
-    }
+        .collect()
 }
 
 /// Appends the apply scope to a trace record (shared by every observer so
@@ -638,8 +637,11 @@ pub(crate) fn node_hasher(seed: u64) -> KeyHasher {
 
 impl Oracle {
     fn new(keys: usize, namespaces: u16) -> Oracle {
-        let mut model = Keyspace::new(StoreConfig { initial_keys: keys, ..Default::default() });
-        seed_namespaces(&mut model, namespaces);
+        let cfg = StoreConfig { initial_keys: keys, ..Default::default() };
+        // The model's keyspace is no plane's: its host builds its census.
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        let seed = KeyspaceSeed::Uncataloged { cfg, specs: namespace_specs(namespaces) };
+        let model = seed.build(&census).expect("seeded namespace names are valid and unique");
         Oracle {
             model,
             shadow: shadow::Shadow::default(),
@@ -1415,19 +1417,21 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         // defaulted filesystem parameter (M2-S19).
         // Surface scenarios seed their memory namespaces into every cell
         // before it serves — the catalog seed a durable node's boot performs.
-        let mut keyspace = Keyspace::new(StoreConfig {
-            hasher: node_hasher(scenario.seed),
-            wheel_nodes_max: scenario.wheel_nodes_max.unwrap_or_default(),
-            ..Default::default()
-        });
-        seed_namespaces(&mut keyspace, scenario.namespaces);
+        let seed = KeyspaceSeed::Uncataloged {
+            cfg: StoreConfig {
+                hasher: node_hasher(scenario.seed),
+                wheel_nodes_max: scenario.wheel_nodes_max.unwrap_or_default(),
+                ..Default::default()
+            },
+            specs: namespace_specs(scenario.namespaces),
+        };
         // A refused timer assembly ends the run with its text, never a
         // derived `Debug`: the text carries the refusal's token.
         let (plane, serve_mark, timer_set) = ServerPlane::<_, inf_server::StdSegmentFs>::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
-            keyspace,
+            seed,
             fabric,
             node,
             oracle.clone(),

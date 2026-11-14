@@ -49,10 +49,12 @@ struct Rig {
 
 impl Rig {
     fn new() -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
         let fs = MemFs::new();
-        let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
-            .expect("ring");
+        let table =
+            TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default(), &census)
+                .expect("ring");
         let flush = TierFlush::new(
             fs.clone(),
             flush_config(NS, FILE_CAPACITY),

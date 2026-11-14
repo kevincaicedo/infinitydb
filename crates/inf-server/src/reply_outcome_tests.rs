@@ -12,8 +12,7 @@ use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::KeySlot;
 use inf_foundation::fault::FaultSpec;
 use inf_store::{
-    AddrClass, Keyspace, LogicalAddr, NsSpec, ShadowProbe, ShadowVerdict, StoreConfig, TierSpec,
-    TieredTable,
+    AddrClass, LogicalAddr, NsSpec, ShadowProbe, ShadowVerdict, StoreConfig, TierSpec, TieredTable,
 };
 
 use crate::fault::SHADOW_TWIN_READ_FAIL;
@@ -49,7 +48,7 @@ impl Cells {
                     CellId(cell as u16),
                     2,
                     -1,
-                    Keyspace::new(StoreConfig::default()),
+                    KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
                     fabric,
                     Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
                     NoopObserver,
@@ -280,6 +279,7 @@ fn reply_outcome_dbsize_drain_error_is_the_reply() {
 const TIERED: NsId = NsId(16);
 
 fn tiered_namespace(cells: &Cells) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     for plane in &cells.planes {
         let spec = NsSpec {
             id: TIERED,
@@ -290,7 +290,7 @@ fn tiered_namespace(cells: &Cells) {
             maxmemory: None,
             tier: Some(TierSpec::for_budget(64 << 20)),
         };
-        plane.shared.store.borrow_mut().ns_create(spec).expect("a fresh tiered namespace");
+        plane.shared.store.borrow_mut().ns_create(spec, &census).expect("a fresh tiered namespace");
     }
 }
 

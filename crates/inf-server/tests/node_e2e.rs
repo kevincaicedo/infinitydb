@@ -30,7 +30,7 @@ use inf_foundation::time::{Clock, Nanos, StdClock};
 use inf_runtime::net::{bound_port, listen_reuseport};
 use inf_runtime::{CellLoop, LoopConfig, UringDriver};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
-use inf_store::{Keyspace, SlotRouter, StoreConfig};
+use inf_store::{KeyspaceSeed, SlotRouter, StoreConfig};
 
 /// The checkpoint trigger a test node boots with (ADR-0088 D4). The
 /// product derives its interval from the last checkpoint's size, which
@@ -927,13 +927,13 @@ impl Node {
                 };
                 node.wall_anchor.set((0, unix_ms));
                 // A durable node's keyspace is cataloged, as `infinityd`'s.
-                let ks = match &boot {
-                    Some((_, catalog, _)) => {
-                        let empty = inf_store::NsCatalog::empty();
-                        let catalog = catalog.as_ref().unwrap_or(&empty);
-                        Keyspace::cataloged(extras.store, catalog).expect("seed catalog")
-                    }
-                    None => Keyspace::new(extras.store),
+                let cfg = extras.store;
+                let seed = match &boot {
+                    Some((_, catalog, _)) => KeyspaceSeed::Cataloged {
+                        cfg,
+                        catalog: catalog.clone().unwrap_or_else(inf_store::NsCatalog::empty),
+                    },
+                    None => KeyspaceSeed::Uncataloged { cfg, specs: Vec::new() },
                 };
                 let mut durable = None;
                 if let Some((dir, _catalog, control)) = &boot {
@@ -962,7 +962,7 @@ impl Node {
                     CellId(i as u16),
                     cells,
                     listener.into_raw_fd(),
-                    ks,
+                    seed,
                     fabric,
                     node,
                     Recorder { cell: i as u16, log: extras.log.clone() },
@@ -7075,7 +7075,7 @@ fn unwired_plane(
         CellId(cell),
         cells,
         listener.into_raw_fd(),
-        Keyspace::new(StoreConfig::default()),
+        KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
         fabric,
         Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
         NoopObserver,

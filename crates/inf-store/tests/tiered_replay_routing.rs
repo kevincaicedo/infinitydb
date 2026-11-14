@@ -19,16 +19,20 @@ const NOW: Nanos = Nanos(1_000_000);
 const ANCHOR: WallAnchor = WallAnchor { internal_ms: 0, unix_ms: 0 };
 
 fn tiered_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"tiered".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Everysec),
-        policy: None,
-        maxmemory: None,
-        tier: Some(TierSpec::for_budget(8 << 20)),
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"tiered".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Everysec),
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(8 << 20)),
+        },
+        &census,
+    )
     .expect("create tiered namespace");
     ks
 }
@@ -261,6 +265,7 @@ fn in_place_set_replays_without_its_displacement_marker() {
 /// is why moved overwrites keep their current-address marker.
 #[test]
 fn origin_marker_repairs_the_cold_ref_and_its_absence_leaks() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr};
     // A recovered-life table: pre-life (manifested) addresses below the
     // origin are cold refs, exactly what `apply_ref` restores. The
@@ -271,6 +276,7 @@ fn origin_marker_repairs_the_cold_ref_and_its_absence_leaks() {
         DemotionConfig::for_budget(1 << 16, 1 << 12),
         64,
         KeyHasher::default(),
+        &census,
     )
     .expect("reservation");
     table.seed_recovered_files(

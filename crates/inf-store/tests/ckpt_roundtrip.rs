@@ -27,6 +27,7 @@ const ANCHOR: WallAnchor = WallAnchor { internal_ms: 0, unix_ms: 0 };
 const NOW: Nanos = Nanos::from_millis(10_000);
 
 fn durable_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     let catalog = NsCatalog {
         next_id: NS + 1,
@@ -42,7 +43,7 @@ fn durable_keyspace() -> Keyspace {
         index: Default::default(),
         dropped: Vec::new(),
     };
-    ks.seed_catalog(&catalog).expect("seed");
+    ks.seed_catalog(&catalog, &census).expect("seed");
     ks
 }
 

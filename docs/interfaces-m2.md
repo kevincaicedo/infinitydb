@@ -1344,8 +1344,16 @@ instances, so a row that crossed holds `capacity_now ≤ high_water`).
 Instances of one cap name share one row.
 `ServerPlane::new` builds the census once, with its cell's id, beside its
 one `ServeMark`; the cell's loop takes the mark as its first iteration
-begins (the census goes `Assembling` → `Serving`). On that census, before it
-writes the cell's `NodeInfo`, it builds the cell's timer set, whose
+begins (the census goes `Assembling` → `Serving`). On that census it first
+builds the keyspace it serves, from the keyspace's seed: the boot catalog,
+or a host's namespace specs where no catalog writer runs. So every capped
+store the seed builds registers on that census, after the census exists
+and before the timer set and any write to `NodeInfo`; a refused seed
+returns no plane, leaves `NodeInfo` unwritten, and drops what it built
+while the census is `Assembling`. A keyspace no plane owns takes a census
+its host builds once. Recovery builds on the census its host passes
+(`Recovery::new`, `open_cell_log`) and builds none of its own. Then, before
+it writes the cell's `NodeInfo`, it builds the cell's timer set, whose
 `timer-owners` row is an `Assembly` row it fills whole; a refused build
 returns no plane, and the census is dropped while `Assembling`, an abandoned
 assembly that counts nothing. At the mark an

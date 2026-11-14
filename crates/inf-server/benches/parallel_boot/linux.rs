@@ -48,7 +48,7 @@ use inf_log::{
 use inf_runtime::net::listen_reuseport;
 use inf_runtime::{BackendDriver, CellLoop, LoopConfig, UringDriver};
 use inf_server::{DurableConfig, NodeInfo, NoopObserver, ServerPlane};
-use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig};
+use inf_store::{FsyncClass, KeyspaceSeed, NsMode, NsSpec, StoreConfig};
 
 const NS: NsId = NsId(16);
 const VALUE_LEN: usize = 512;
@@ -219,8 +219,7 @@ fn drive_cell(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     node.wall_anchor.set((0, unix_ms));
-    let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
+    let spec = NsSpec {
         id: NS,
         name: b"bench".to_vec(),
         mode: NsMode::Durable,
@@ -228,13 +227,13 @@ fn drive_cell(
         policy: None,
         maxmemory: None,
         tier: None,
-    })
-    .expect("ns");
+    };
+    let seed = KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: vec![spec] };
     let (mut plane, serve_mark, timer_set) = ServerPlane::new(
         CellId(i as u16),
         cells,
         listener.into_raw_fd(),
-        ks,
+        seed,
         fabric,
         node,
         NoopObserver,

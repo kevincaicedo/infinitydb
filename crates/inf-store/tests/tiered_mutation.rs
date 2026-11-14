@@ -66,6 +66,7 @@ struct Harness {
 
 impl Harness {
     fn new(life_origin: LogicalAddr) -> Harness {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         Harness {
             table: TieredTable::new(
                 AddressSpaceConfig {
@@ -76,6 +77,7 @@ impl Harness {
                 DemotionConfig::for_budget(RING, PAGE),
                 64,
                 KeyHasher::default(),
+                &census,
             )
             .expect("reservation"),
             oracle: HashMap::new(),

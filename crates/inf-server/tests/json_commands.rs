@@ -666,6 +666,7 @@ fn filter_rejection_names_the_plan() {
 
 #[test]
 fn durable_namespace_json_surface_is_reachable_after_s17() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut db = Db::new();
     let spec = NsSpec {
         id: inf_store::NsId(inf_store::FIRST_NAMED_NS_ID),
@@ -676,7 +677,7 @@ fn durable_namespace_json_surface_is_reachable_after_s17() {
         maxmemory: None,
         tier: None,
     };
-    db.ks.ns_create(spec).expect("namespace registers");
+    db.ks.ns_create(spec, &census).expect("namespace registers");
     db.cx.ns = inf_server::ConnNamespace::Named(inf_store::NsId(inf_store::FIRST_NAMED_NS_ID));
     assert_reply(&mut db, &["JSON.SET", "k", "$", "{}"], "+OK\r\n");
     assert_reply(&mut db, &["JSON.GET", "k"], &bulk("{}"));
@@ -974,6 +975,7 @@ fn strlen_legacy_missing_path_answers_the_path_error() {
 
 #[test]
 fn new_write_commands_run_in_durable_namespaces_after_s17() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut db = Db::new();
     let spec = NsSpec {
         id: inf_store::NsId(inf_store::FIRST_NAMED_NS_ID),
@@ -984,7 +986,7 @@ fn new_write_commands_run_in_durable_namespaces_after_s17() {
         maxmemory: None,
         tier: None,
     };
-    db.ks.ns_create(spec).expect("namespace registers");
+    db.ks.ns_create(spec, &census).expect("namespace registers");
     db.cx.ns = inf_server::ConnNamespace::Named(inf_store::NsId(inf_store::FIRST_NAMED_NS_ID));
     assert_reply(&mut db, &["JSON.MERGE", "k", "$", r#"{"a":[1]}"#], "+OK\r\n");
     assert_reply(&mut db, &["JSON.ARRAPPEND", "k", "$.a", "2"], "*1\r\n:2\r\n");

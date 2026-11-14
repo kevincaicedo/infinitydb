@@ -281,16 +281,20 @@ pub fn config(segment_bytes: u32) -> DurableConfig {
 
 #[must_use]
 pub fn fresh_keyspace(policy: FsyncClass) -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(policy),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"ledger".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(policy),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("ns");
     ks
 }
@@ -645,9 +649,10 @@ pub struct Recovered {
 
 #[must_use]
 pub fn recover(fs: &MemFs, class: FsyncClass, segment_bytes: u32) -> Recovered {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace(class);
     let (rotor, stats, unit) =
-        open_cell_log(fs.clone(), &mut ks, CELL, &config(segment_bytes), anchor(), now())
+        open_cell_log(fs.clone(), &mut ks, CELL, &config(segment_bytes), anchor(), now(), &census)
             .expect("matrix rows recover; fail-stop rows assert separately");
     let resume = Lsn::new(rotor.active_segment(), rotor.active_written());
     let digest = ks.state_digest(now());

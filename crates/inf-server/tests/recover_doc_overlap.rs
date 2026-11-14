@@ -49,22 +49,27 @@ fn config() -> DurableConfig {
 }
 
 fn keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"docs".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"docs".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("namespace");
     ks
 }
 
 #[test]
 fn fuzzy_checkpoint_overlap_counts_stale_and_missing_deltas() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = MemFs::new();
     let cfg = config();
     let dirs = create_cell_dirs(&fs, Path::new("data/shard-0")).expect("dirs");
@@ -186,7 +191,7 @@ fn fuzzy_checkpoint_overlap_counts_stale_and_missing_deltas() {
 
     let mut recovered = keyspace();
     let (_rotor, stats, _manifest) =
-        open_cell_log(fs, &mut recovered, 0, &cfg, ANCHOR, NOW).expect("boot recovery");
+        open_cell_log(fs, &mut recovered, 0, &cfg, ANCHOR, NOW, &census).expect("boot recovery");
     assert_eq!(stats.doc_deltas_skipped_stale, 2);
     assert_eq!(stats.doc_deltas_skipped_missing, 1);
 

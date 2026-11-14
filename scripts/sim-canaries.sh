@@ -889,6 +889,22 @@ rows=(
   # A closed header's last drop frees it with Q set: the last take then
   # reaches the freed bridge.
   "inf_canary_closed_free_ignores_queue loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
+  # A tiered table's seal marks: the stride planted at one commit page, so
+  # a ring past the cap's reach fills the marks and the back mark takes
+  # later starts, which the stride test reads as a crossing at its widest
+  # window.
+  "inf_canary_seal_mark_stride_one crate-test inf-store lib the_stride_keeps_the_seal_marks_under_their_cap_at_every_window stride-short"
+  # The first plant at a tiered table's marks' cap edges, at the unit tier:
+  # no leg fills them (the stride keeps the seal marks at half their cap,
+  # the window's arithmetic the hole marks at two of three). One short, the
+  # 8,192nd seal mark merges into the back and the third planted hole is
+  # refused, each read by its edge test's own token.
+  "inf_canary_cap_minus_one crate-test inf-store lib the_seal_marks_cap_admits_its_last_mark_and_merges_the_next seal-marks-edge-short"
+  "inf_canary_cap_minus_one crate-test inf-store lib the_hole_marks_cap_admits_three_and_refuses_a_fourth hole-marks-edge-short"
+  # The same stride plant at the pressure storm's wide ring, whose engagement
+  # is the stride above one commit page: planted at one page, the leg's stride
+  # clause is VACUOUS by its own name.
+  "inf_canary_seal_mark_stride_one m4-pressure pressure-stride-unengaged --pressure-leg wide-ring"
   # The executor's lanes (ADR-0003 A1): each plant breaks one rule of the wake header, and
   # the test that holds the rule goes red at its own assertion.
   # The lane compare answers the owner part on every thread: a foreign wake counts nothing.

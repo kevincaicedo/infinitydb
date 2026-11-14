@@ -33,6 +33,9 @@
 //! (`limit − limit/16`, hysteresis) under its own budget so a storm of
 //! writes cannot monopolize the loop (the bounded-everything rule).
 
+use std::rc::Rc;
+
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::time::Nanos;
 use inf_foundation::{KeyHasher, hash64};
 use inf_log::{FsyncClass, NsId, RecordView as LogRecordView};
@@ -238,6 +241,40 @@ pub struct Keyspace {
     cataloging: Cataloging,
 }
 
+/// What a keyspace is built from (ADR-0189 D4), handed to the host of its
+/// cap census: a plane that serves the keyspace builds the census first,
+/// then the keyspace on it through [`build`](KeyspaceSeed::build), its one
+/// builder, so every capped store of the cell registers on that census.
+#[derive(Clone, Debug)]
+pub enum KeyspaceSeed {
+    /// The node's keyspace: the boot catalog the host decoded from `META`,
+    /// or the empty catalog of a fresh data directory. It is cataloged.
+    Cataloged { cfg: StoreConfig, catalog: NsCatalog },
+    /// A host with no data directory, so no catalog writer: its namespace
+    /// specs, each created uncataloged, in order.
+    Uncataloged { cfg: StoreConfig, specs: Vec<NsSpec> },
+}
+
+impl KeyspaceSeed {
+    /// Builds the keyspace, every capped store of it on `census`.
+    ///
+    /// # Errors
+    /// The first refusal: the catalog's, as [`Keyspace::cataloged`]'s, or a
+    /// spec's, as [`Keyspace::ns_create`]'s. Nothing built is returned.
+    pub fn build(self, census: &Rc<CapCensus>) -> Result<Keyspace, NsError> {
+        match self {
+            KeyspaceSeed::Cataloged { cfg, catalog } => Keyspace::cataloged(cfg, &catalog, census),
+            KeyspaceSeed::Uncataloged { cfg, specs } => {
+                let mut ks = Keyspace::new(cfg);
+                for spec in specs {
+                    ks.ns_create(spec, census)?;
+                }
+                Ok(ks)
+            }
+        }
+    }
+}
+
 /// Whether a keyspace answers to a catalog writer (ADR-0189 D4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Cataloging {
@@ -321,14 +358,20 @@ impl Keyspace {
     /// writer's receipt, and the uncataloged family,
     /// [`seed_catalog`](Self::seed_catalog) included, answers
     /// [`NsError::Cataloged`]. That `catalog` is durable rests on review:
-    /// each boot site passes the decode of the `META` on disk.
+    /// each boot site passes the decode of the `META` on disk. Every
+    /// tiered table it seeds registers its capped holders on `census`,
+    /// the cell's (ADR-0163 D2).
     ///
     /// # Errors
     /// As [`seed_catalog`](Self::seed_catalog): the first registry-rule or
     /// admission violation, a boot fail-stop.
-    pub fn cataloged(cfg: StoreConfig, catalog: &NsCatalog) -> Result<Keyspace, NsError> {
+    pub fn cataloged(
+        cfg: StoreConfig,
+        catalog: &NsCatalog,
+        census: &Rc<CapCensus>,
+    ) -> Result<Keyspace, NsError> {
         let mut ks = Keyspace::new(cfg);
-        ks.seed_from_catalog(catalog)?;
+        ks.seed_from_catalog(catalog, census)?;
         ks.cataloging = Cataloging::Cataloged;
         Ok(ks)
     }
@@ -919,15 +962,16 @@ impl Keyspace {
     }
 
     /// Registers `spec` and, for a tiered spec (M4-S19), materializes the
-    /// cell's `TieredTable` under the D4 admission bound. Registration
-    /// and materialization succeed or fail together — an admission
-    /// refusal rolls the registry entry back, leaving nothing behind.
-    pub fn ns_create(&mut self, spec: NsSpec) -> Result<(), NsError> {
+    /// cell's `TieredTable` under the D4 admission bound, its capped
+    /// holders on `census`, the cell's (ADR-0163 D2). Registration and
+    /// materialization succeed or fail together — an admission refusal
+    /// rolls the registry entry back, leaving nothing behind.
+    pub fn ns_create(&mut self, spec: NsSpec, census: &Rc<CapCensus>) -> Result<(), NsError> {
         let tier = spec.tier;
         let (id, name) = (spec.id, spec.name.clone());
         self.named.create(spec)?;
         if let Some(tier) = tier
-            && let Err(e) = self.materialize_tiered_spec(id, &tier)
+            && let Err(e) = self.materialize_tiered_spec(id, &tier, census)
         {
             self.named.drop_ns(&name).expect("just created");
             return Err(match e {
@@ -1194,16 +1238,21 @@ impl Keyspace {
     /// is a fail-stop at boot, never a partial seed; [`NsError::Cataloged`]
     /// on the node's keyspace, which [`cataloged`](Self::cataloged) seeded
     /// once, from its boot catalog.
-    pub fn seed_catalog(&mut self, cat: &NsCatalog) -> Result<(), NsError> {
+    pub fn seed_catalog(&mut self, cat: &NsCatalog, census: &Rc<CapCensus>) -> Result<(), NsError> {
         if self.cataloging == Cataloging::Cataloged {
             return Err(NsError::Cataloged);
         }
-        self.seed_from_catalog(cat)
+        self.seed_from_catalog(cat, census)
     }
 
     /// The one seeding body of [`seed_catalog`](Self::seed_catalog) and
-    /// [`cataloged`](Self::cataloged).
-    fn seed_from_catalog(&mut self, cat: &NsCatalog) -> Result<(), NsError> {
+    /// [`cataloged`](Self::cataloged): every tiered table it builds
+    /// registers on `census`.
+    fn seed_from_catalog(
+        &mut self,
+        cat: &NsCatalog,
+        census: &Rc<CapCensus>,
+    ) -> Result<(), NsError> {
         self.named = NsRegistry::default();
         self.named_stores.clear();
         self.tiered_stores.clear();
@@ -1233,7 +1282,7 @@ impl Keyspace {
             }
             // `ns_create` materializes tiered entries under the D4 bound
             // — seeding and DDL share one path, so they cannot drift.
-            self.ns_create(spec)?;
+            self.ns_create(spec, census)?;
         }
         for spec in &cat.index.entries {
             if spec.state == IndexState::Dropping {
@@ -2210,9 +2259,10 @@ mod tests {
 
     #[test]
     fn named_stores_are_isolated_and_dropped_with_their_namespace() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
         let now = Nanos(1);
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         ks.db_mut(0).set(b"k", b"db0", SetOptions::default(), now).expect("set db0");
         ks.ns_store_mut(NsId(16))
             .expect("registered")
@@ -2233,14 +2283,18 @@ mod tests {
     #[cfg(feature = "doc")]
     #[test]
     fn a_namespaces_reply_limit_is_read_without_making_its_store() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let cfg = StoreConfig { doc_max_reply_bytes: 64, ..StoreConfig::default() };
         let mut ks = Keyspace::new(cfg);
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
-        ks.ns_create(NsSpec {
-            fsync: Some(FsyncClass::Everysec),
-            tier: Some(crate::ns::TierSpec::for_budget(64 << 20)),
-            ..durable_spec(17, b"cold")
-        })
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
+        ks.ns_create(
+            NsSpec {
+                fsync: Some(FsyncClass::Everysec),
+                tier: Some(crate::ns::TierSpec::for_budget(64 << 20)),
+                ..durable_spec(17, b"cold")
+            },
+            &census,
+        )
         .expect("tiered create");
         let configured = CellStore::new(cfg).doc_reply_limit();
         assert!(configured.admits(64).is_ok(), "the configured budget");
@@ -2256,11 +2310,12 @@ mod tests {
 
     #[test]
     fn catalog_seed_and_export_round_trip() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         let cat = ks.export_catalog(17, 1, 1);
         let mut fresh = Keyspace::new(StoreConfig::default());
-        fresh.seed_catalog(&cat).expect("seed");
+        fresh.seed_catalog(&cat, &census).expect("seed");
         assert_eq!(fresh.export_catalog(17, 1, 1), cat);
         assert!(fresh.ns_store_mut(NsId(16)).is_some());
     }
@@ -2271,12 +2326,14 @@ mod tests {
     /// receipt mutator with `Uncataloged`. Every refusal changes nothing.
     #[test]
     fn a_cataloged_keyspace_drops_only_with_a_receipt() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut model = Keyspace::new(StoreConfig::default());
-        model.ns_create(durable_spec(16, b"ledger")).expect("create");
+        model.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         let cat = model.export_catalog(17, 1, 1);
-        let mut node = Keyspace::cataloged(StoreConfig::default(), &cat).expect("the boot seed");
+        let mut node =
+            Keyspace::cataloged(StoreConfig::default(), &cat, &census).expect("the boot seed");
         assert_eq!(node.export_catalog(17, 1, 1), cat, "seeded from the boot catalog");
-        assert_eq!(node.seed_catalog(&cat), Err(NsError::Cataloged));
+        assert_eq!(node.seed_catalog(&cat, &census), Err(NsError::Cataloged));
         assert_eq!(node.ns_drop_uncataloged(b"ledger"), Err(NsError::Cataloged));
         assert!(node.ns_get(b"ledger").is_some(), "a refused mutator changed nothing");
         let (mut epochs, word) = crate::ns::ddl::CatalogEpochs::new();
@@ -2315,13 +2372,17 @@ mod tests {
     #[cfg(feature = "doc")]
     #[test]
     fn idx_create_gates_by_namespace_mode() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
-        ks.ns_create(NsSpec {
-            fsync: Some(FsyncClass::Everysec),
-            tier: Some(crate::ns::TierSpec::for_budget(64 << 20)),
-            ..durable_spec(17, b"cold")
-        })
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
+        ks.ns_create(
+            NsSpec {
+                fsync: Some(FsyncClass::Everysec),
+                tier: Some(crate::ns::TierSpec::for_budget(64 << 20)),
+                ..durable_spec(17, b"cold")
+            },
+            &census,
+        )
         .expect("tiered create");
         ks.idx_create(idx_spec(1, 1, 0, b"on-db0", IndexState::Declared)).expect("default db");
         ks.idx_create(idx_spec(2, 2, 16, b"on-ledger", IndexState::Declared)).expect("named ns");
@@ -2352,8 +2413,9 @@ mod tests {
     #[cfg(feature = "doc")]
     #[test]
     fn catalog_restart_maps_index_states_per_d4() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         ks.idx_create(idx_spec(1, 10, 16, b"was-ready", IndexState::Declared)).expect("create");
         ks.idx_create(idx_spec(2, 11, 16, b"mid-backfill", IndexState::Declared)).expect("create");
         ks.idx_create(idx_spec(3, 12, 16, b"mid-drop", IndexState::Declared)).expect("create");
@@ -2365,7 +2427,7 @@ mod tests {
         let cat = ks.export_catalog(17, 4, 13);
 
         let mut fresh = Keyspace::new(StoreConfig::default());
-        fresh.seed_catalog(&cat).expect("seed");
+        fresh.seed_catalog(&cat, &census).expect("seed");
         let reg = fresh.idx_registry();
         // The dropping entry resumed its drop: not seeded.
         assert!(reg.get_by_id(IndexId(3)).is_none());
@@ -2394,16 +2456,20 @@ mod tests {
     #[cfg(feature = "doc")]
     #[test]
     fn idx_tree_bytes_count_toward_the_namespace_budget() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(NsSpec {
-            id: NsId(16),
-            name: b"cache".to_vec(),
-            mode: NsMode::Memory,
-            fsync: None,
-            policy: Some(EvictionPolicy::AllKeysRandom),
-            maxmemory: None,
-            tier: None,
-        })
+        ks.ns_create(
+            NsSpec {
+                id: NsId(16),
+                name: b"cache".to_vec(),
+                mode: NsMode::Memory,
+                fsync: None,
+                policy: Some(EvictionPolicy::AllKeysRandom),
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("create");
         ks.idx_create(idx_spec(1, 1, 16, b"by-price", IndexState::Declared)).expect("create");
         // Fill documents-side bytes, then set the budget just above the
@@ -2443,8 +2509,9 @@ mod tests {
     #[cfg(feature = "doc")]
     #[test]
     fn ns_drop_removes_its_index_declarations() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         ks.idx_create(idx_spec(1, 1, 16, b"by-price", IndexState::Declared)).expect("create");
         assert!(ks.ns_has_indexes(NsId(16)));
         ks.ns_drop_uncataloged(b"ledger").expect("drop");
@@ -2458,6 +2525,7 @@ mod tests {
     /// own budget gate armed.
     #[test]
     fn catalog_round_trip_preserves_memory_pressure_enforcement() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
         let spec = NsSpec {
             id: NsId(16),
@@ -2468,10 +2536,10 @@ mod tests {
             maxmemory: Some(1 << 20),
             tier: None,
         };
-        ks.ns_create(spec).expect("create");
+        ks.ns_create(spec, &census).expect("create");
         let cat = ks.export_catalog(17, 1, 1);
         let mut fresh = Keyspace::new(StoreConfig::default());
-        fresh.seed_catalog(&cat).expect("seed");
+        fresh.seed_catalog(&cat, &census).expect("seed");
         let store = fresh.ns_store_mut(NsId(16)).expect("live");
         assert_eq!(store.eviction_policy(), crate::EvictionPolicy::AllKeysRandom);
         assert!(
@@ -2481,15 +2549,18 @@ mod tests {
         // An inheriting store without a budget answers through the global
         // gate instead.
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(NsSpec {
-            id: NsId(16),
-            name: b"plain".to_vec(),
-            mode: NsMode::Memory,
-            fsync: None,
-            policy: None,
-            maxmemory: None,
-            tier: None,
-        })
+        ks.ns_create(
+            NsSpec {
+                id: NsId(16),
+                name: b"plain".to_vec(),
+                mode: NsMode::Memory,
+                fsync: None,
+                policy: None,
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("create");
         assert!(ks.ns_free_for_write(NsId(16), now()).is_none());
     }
@@ -2498,13 +2569,14 @@ mod tests {
     /// budget authority per namespace (`MEM-BUDGET` owns tiered memory).
     #[test]
     fn tiered_spec_with_maxmemory_is_refused() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
         let spec = NsSpec {
             maxmemory: Some(1 << 20),
             tier: Some(crate::TierSpec::for_budget(64 << 20)),
             ..durable_spec(16, b"hot")
         };
-        assert_eq!(ks.ns_create(spec), Err(NsError::MaxmemoryNotAllowedTiered));
+        assert_eq!(ks.ns_create(spec, &census), Err(NsError::MaxmemoryNotAllowedTiered));
         assert_eq!(ks.ns_iter().count(), 0, "refusal mutates nothing");
     }
 
@@ -2513,17 +2585,21 @@ mod tests {
     /// including the already-materialized store's policy and budget.
     #[test]
     fn ns_set_memory_scopes_and_applies_hot() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
-        ks.ns_create(NsSpec {
-            id: NsId(17),
-            name: b"cache".to_vec(),
-            mode: NsMode::Memory,
-            fsync: None,
-            policy: None,
-            maxmemory: None,
-            tier: None,
-        })
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
+        ks.ns_create(
+            NsSpec {
+                id: NsId(17),
+                name: b"cache".to_vec(),
+                mode: NsMode::Memory,
+                fsync: None,
+                policy: None,
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("create");
         assert_eq!(
             ks.ns_set_memory(b"ledger", None, Some(1 << 20)),
@@ -2550,10 +2626,11 @@ mod tests {
 
     #[test]
     fn apply_record_is_a_blind_idempotent_upsert() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
         let now = Nanos::from_millis(10);
         let anchor = WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 };
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
 
         let set = LogRecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v1" };
         for _ in 0..2 {
@@ -2605,9 +2682,10 @@ mod tests {
 
     #[test]
     fn post_image_reads_without_touching_stats() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks = Keyspace::new(StoreConfig::default());
         let now = Nanos(1);
-        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         let store = ks.ns_store_mut(NsId(16)).expect("live");
         store
             .set(
@@ -2675,6 +2753,7 @@ mod tests {
 
     #[test]
     fn digest_distinguishes_value_ttl_db_and_namespace() {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let now = Nanos(1);
         let base = |value: &[u8], expire: SetExpire, db: usize| {
             let mut ks = Keyspace::new(StoreConfig::default());
@@ -2693,7 +2772,7 @@ mod tests {
         assert_ne!(reference, base(b"v", SetExpire::Clear, 1), "db identity must bind");
 
         let mut named = Keyspace::new(StoreConfig::default());
-        named.ns_create(durable_spec(16, b"ledger")).expect("create");
+        named.ns_create(durable_spec(16, b"ledger"), &census).expect("create");
         named.ns_store_mut(NsId(16)).unwrap().set(b"k", b"v", SetOptions::default(), now).unwrap();
         assert_ne!(reference, named.state_digest(now), "namespace identity must bind");
         assert_eq!(named.state_digest(now).entries, 1);

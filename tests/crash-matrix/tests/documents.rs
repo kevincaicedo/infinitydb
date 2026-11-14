@@ -49,16 +49,20 @@ fn config(segment_bytes: u32) -> DurableConfig {
 }
 
 fn keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"docs".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"docs".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("namespace");
     ks
 }
@@ -162,9 +166,10 @@ impl<F: SegmentFs + Clone> LogBuilder<F> {
 }
 
 fn recover<F: SegmentFs + Clone + 'static>(fs: F, cfg: &DurableConfig) -> (Keyspace, RecoverStats) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = keyspace();
     let (_rotor, stats, _manifest) =
-        open_cell_log(fs, &mut ks, CELL, cfg, ANCHOR, NOW).expect("document recovery");
+        open_cell_log(fs, &mut ks, CELL, cfg, ANCHOR, NOW, &census).expect("document recovery");
     (ks, stats)
 }
 

@@ -54,6 +54,7 @@ struct Harness {
 
 impl Harness {
     fn new() -> Harness {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
         let ring = demote.ring_reserve_bytes().expect("valid budget");
         assert_eq!(ring as u64, (BUDGET + PAGE).next_power_of_two(), "ADR-0052 D1 derivation");
@@ -68,6 +69,7 @@ impl Harness {
                 },
                 demote,
                 1024,
+                &census,
             )
             .is_ok()
         );

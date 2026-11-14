@@ -388,19 +388,25 @@ fn main() {
         std::process::exit(exit.code());
     }
     // The M4-S07 throttled-device backpressure scenario (budget bound,
-    // typed stall timeouts, deadlock freedom — ADR-0053).
-    if scenario_name == "m4-pressure" {
-        let run_one =
-            |seed| inf_sim::run_pressure_scenario(&inf_sim::PressureScenario::m4_pressure(seed));
+    // typed stall timeouts, deadlock freedom — ADR-0053); its leg arrives as
+    // its type from the leg check (the 256 KiB budget when unnamed).
+    if let ("m4-pressure", Some(LegValue::Pressure(pressure_leg))) = (scenario_name.as_str(), leg) {
+        let run_one = |seed| {
+            let mut scenario = inf_sim::PressureScenario::m4_pressure(seed);
+            scenario.leg = pressure_leg;
+            inf_sim::run_pressure_scenario(&scenario)
+        };
         let exit = driver::run_single(seed, determinism, run_one, |report| {
             println!(
-                "inf-sim: scenario m4-pressure seed {seed:#x}: {} stalls (p50 {} µs, p99 {} µs), \
-                 {} timeouts, peak committed {} B, hash {:#018x}",
+                "inf-sim: scenario m4-pressure leg {} seed {seed:#x}: {} stalls (p50 {} µs, p99 \
+                 {} µs), {} timeouts, peak committed {} B, seal-mark stride {} B, hash {:#018x}",
+                pressure_leg.name(),
                 report.stalls,
                 report.stall_p50_ns / 1_000,
                 report.stall_p99_ns / 1_000,
                 report.stall_timeouts,
                 report.peak_committed_bytes,
+                report.seal_mark_stride_bytes,
                 report.trace_hash
             );
             Ok(())
