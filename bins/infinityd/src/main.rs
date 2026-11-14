@@ -191,6 +191,10 @@ struct Args {
     /// ≥ +4% floor — the async machinery was already near-zero-cost (L6).
     /// Kept default-off as the A/B instrument for the S19 8-cell re-read.
     deasync_dispatch: bool,
+    /// The uring driver's selections (ADR-0209 D2): the shipped config until
+    /// `main` decodes the process environment, once, before any cell thread.
+    #[cfg(target_os = "linux")]
+    uring: inf_runtime::UringConfig,
 }
 
 /// `--device-probe auto|off` (M4.5-S42, ADR-0091 D1).
@@ -242,6 +246,8 @@ impl Default for Args {
             fabric_apply_prefetch: true,
             parse_batch_prefetch: true,
             deasync_dispatch: false,
+            #[cfg(target_os = "linux")]
+            uring: inf_runtime::UringConfig::from_lookup(|_| None),
         }
     }
 }
@@ -811,6 +817,13 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // The uring driver's selections, decoded here on the main thread before
+    // any cell thread exists: no cell reads the process environment
+    // (ADR-0209 D2).
+    #[cfg(target_os = "linux")]
+    {
+        args.uring = uring_selections();
+    }
     // The graceful stop (ADR-0124 D1): one flag every cell polls.
     let stop = match inf_runtime::signal::install_stop_flag() {
         Ok(flag) => flag,
@@ -1324,7 +1337,7 @@ fn cell_main(
     mark(11); // setup:pool
     let mut pool = BufferPool::new(args.buffers, args.buf_size);
     mark(12); // setup:driver
-    let mut driver = make_driver()
+    let mut driver = make_driver(args)
         .map_err(|e| std::io::Error::new(e.kind(), format!("driver setup (ring create): {e}")))?;
     // io_uring charges a ring and its registered buffers to the user's one
     // RLIMIT_MEMLOCK budget. The registration probe degrades on refusal, but
@@ -1344,6 +1357,8 @@ fn cell_main(
     let _ = wake_fd;
     if cell == 0 {
         eprintln!("infinityd: capabilities {:?}", driver.capabilities());
+        #[cfg(target_os = "linux")]
+        eprintln!("infinityd: uring selections {}", args.uring);
     }
     // The listener publishes the cell, so it binds after the ring and pool
     // are reserved: a boot that fails above refuses a connection instead of
@@ -1593,18 +1608,28 @@ fn cell_main(
     }
 }
 
+/// The uring driver's selections from the process environment: the three
+/// variables `UringConfig::from_lookup` names, each selecting when present,
+/// read once at boot (ADR-0209 D2).
 #[cfg(target_os = "linux")]
-fn make_driver() -> std::io::Result<inf_runtime::UringDriver> {
-    inf_runtime::UringDriver::new(4096)
+fn uring_selections() -> inf_runtime::UringConfig {
+    #[allow(clippy::disallowed_methods, reason = "boot: decoded before any cell thread exists")]
+    let config = inf_runtime::UringConfig::from_lookup(std::env::var_os);
+    config
+}
+
+#[cfg(target_os = "linux")]
+fn make_driver(args: &Args) -> std::io::Result<inf_runtime::UringDriver> {
+    inf_runtime::UringDriver::new(4096, args.uring)
 }
 
 #[cfg(target_os = "macos")]
-fn make_driver() -> std::io::Result<inf_runtime::KqueueDriver> {
+fn make_driver(_args: &Args) -> std::io::Result<inf_runtime::KqueueDriver> {
     inf_runtime::KqueueDriver::new()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn make_driver() -> std::io::Result<never::NoBackend> {
+fn make_driver(_args: &Args) -> std::io::Result<never::NoBackend> {
     Err(std::io::Error::other("no backend: build with --features uring on Linux"))
 }
 

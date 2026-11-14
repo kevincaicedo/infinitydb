@@ -80,7 +80,8 @@ fn start_node(
             inf_foundation::fault::arm(point, spec);
         }
         let pool = BufferPool::new(256, 4096);
-        let driver = UringDriver::new(256).expect("uring");
+        let driver = UringDriver::new(256, inf_runtime::UringConfig::from_lookup(std::env::var_os))
+            .expect("uring");
         // The node's keyspace is cataloged, as `infinityd`'s (ADR-0189 D4).
         let seed = KeyspaceSeed::Cataloged {
             cfg: StoreConfig::default(),

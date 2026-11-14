@@ -123,6 +123,7 @@ crates/inf-runtime/tests/accept_exhaustion.rs|test|1|0
 crates/inf-runtime/tests/close_fd_reuse.rs|test|1|0
 crates/inf-runtime/tests/cold_hardened.rs|test|1|1
 crates/inf-runtime/tests/driver_conformance.rs|test|1|0
+crates/inf-runtime/tests/env_read_once.rs|test|1|0
 crates/inf-runtime/tests/file_ops.rs|test|1|0
 crates/inf-runtime/tests/steel_thread.rs|test|1|0
 crates/inf-server/tests/node_e2e.rs|test|1|0

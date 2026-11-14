@@ -211,7 +211,8 @@ fn drive_cell(
     stop: &AtomicBool,
 ) {
     let mut pool = BufferPool::new(256, 4096);
-    let mut driver = UringDriver::new(256).expect("uring");
+    let mut driver = UringDriver::new(256, inf_runtime::UringConfig::from_lookup(std::env::var_os))
+        .expect("uring");
     driver.register_pool(&mut pool).expect("register");
     let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
     let unix_ms = std::time::SystemTime::now()

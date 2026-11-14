@@ -55,7 +55,8 @@ fn main() {
     let rc = unsafe { libc::fallocate(fd, 0, 0, FILE_BYTES as i64) };
     assert_eq!(rc, 0, "fallocate: {}", std::io::Error::last_os_error());
 
-    let mut driver = UringDriver::new(64).expect("io_uring");
+    let mut driver = UringDriver::new(64, inf_runtime::UringConfig::from_lookup(std::env::var_os))
+        .expect("io_uring");
     let mut pool = BufferPool::new(4, 1024);
     println!("# log_fsync — one LogWrite + linked fdatasync per iteration (uring, dev tier)");
     println!(

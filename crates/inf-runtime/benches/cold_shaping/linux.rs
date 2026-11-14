@@ -156,7 +156,8 @@ fn coalesce_leg(
     seed: u64,
 ) -> (u64, u64, u64) {
     drop_page_cache(path);
-    let mut driver = UringDriver::new(128).expect("io_uring");
+    let mut driver = UringDriver::new(128, inf_runtime::UringConfig::from_lookup(std::env::var_os))
+        .expect("io_uring");
     let mut pool = AlignedPool::new(POOL_BUFFERS, WINDOW_FRAMES * TIER_FRAME_BYTES);
     driver.register_tier_pool(&mut pool).expect("registration");
     let cold = ColdReads::with_config(
@@ -364,7 +365,9 @@ pub fn run() {
             // Loaded leg: uniform cold flood held at the cap, RAM hits
             // interleaved between pumps (one cell, one thread — L1).
             drop_page_cache(writer.path());
-            let mut driver = UringDriver::new(128).expect("io_uring");
+            let mut driver =
+                UringDriver::new(128, inf_runtime::UringConfig::from_lookup(std::env::var_os))
+                    .expect("io_uring");
             let mut pool = AlignedPool::new(POOL_BUFFERS, WINDOW_FRAMES * TIER_FRAME_BYTES);
             driver.register_tier_pool(&mut pool).expect("registration");
             let cold = ColdReads::with_config(
