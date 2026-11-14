@@ -969,6 +969,13 @@ rows=(
   # shipped plane over the sim driver it moves after a burst's last member is visited.
   "inf_canary_cold_turn_eager crate-test inf-runtime test:reactor an_iteration_that_lends_nothing_builds_no_turn lent nothing built a turn"
   "inf_canary_cold_turn_eager crate-test inf-sim lib a_cell_with_cold_members_to_visit_begins_no_iteration_parked built a cold turn after the burst's last member"
+  # ADR-0181 R1: a turn visits 64 cold-read members, so m4-tiered's phase 7e answers a burst of
+  # ready members within ⌈members / 64⌉ + 2 steps of its receipt. Planted, a turn visits 8, and
+  # each of the scenario's four smoke forms answers late.
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late"
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --plant tier-read-eio"
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --replay-above-window"
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --listing-repeats"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

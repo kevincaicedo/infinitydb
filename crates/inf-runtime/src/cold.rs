@@ -290,8 +290,13 @@ impl ColdTurn {
     /// and [`COLD_PREPARATION_WORK_PER_TURN`] preparation units.
     #[must_use]
     pub fn begin() -> ColdTurn {
+        // Canary: a turn visits 8 members.
+        #[cfg(inf_canary_cold_turn_of_eight)]
+        let deliveries = COLD_DELIVERIES_PER_TURN / 8;
+        #[cfg(not(inf_canary_cold_turn_of_eight))]
+        let deliveries = COLD_DELIVERIES_PER_TURN;
         ColdTurn {
-            delivery: ColdDeliveryBudget { remaining: COLD_DELIVERIES_PER_TURN, spent: 0 },
+            delivery: ColdDeliveryBudget { remaining: deliveries, spent: 0 },
             preparation: ColdPreparationBudget {
                 remaining: COLD_PREPARATION_WORK_PER_TURN,
                 spent: 0,
