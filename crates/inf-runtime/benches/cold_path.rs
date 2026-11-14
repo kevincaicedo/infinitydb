@@ -49,15 +49,11 @@
 //!   holds the hook's tier slot and hands the loop context to a step out of
 //!   line at `fabric_in` and again at `parse_execute`, as a server cell's
 //!   steps take it before the hook and after it. The context escapes before
-//!   the hook, so the loop's turn stores and its spent-unit test stay in
-//!   both legs, as on a server cell.
-//! - `reactor-iteration-server-late`: the control that A of the hook's row
-//!   is a server's: the same plane with the default `before_execute` and
-//!   both hand-outs at `parse_execute`, after the hook. There the compiler
-//!   proves that no unit was spent and deletes the loop's spent-unit test,
-//!   so a faithful A reads at least 2 over it (the test is at least a
-//!   compare and a branch), and a pair whose context first leaves after
-//!   the hook reads 0 or less.
+//!   the hook, as on a server cell, so the compiler keeps the context's
+//!   setup in both legs.
+//! - `reactor-iteration-server-late`: the same plane with the default
+//!   `before_execute` and both hand-outs at `parse_execute`, after the
+//!   hook; reported beside A, it judges nothing.
 //!
 //! Beside them, the rate legs (`cold_path/rates.rs`), reported and never
 //! judged: one container operation a step, on the capped map and slab B
@@ -593,7 +589,7 @@ fn deliver_cold(shared: &SharedTier, cx: &mut LoopCx<'_>) {
     let cold = shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
     if let Some(cold) = cold {
         let now_us = cx.now.as_micros();
-        let _ = cold.deliver_ready(cx.cold_delivery_budget(), now_us);
+        let _ = cx.with_cold_delivery_budget(|budget| cold.deliver_ready(budget, now_us));
     }
 }
 

@@ -21,7 +21,8 @@ io-uring = { workspace = true, optional = true }
 [features]
 uring = ["dep:io-uring"]
 # M0-S19 A/B artifact only: compiles the always-on tripwire counters out to
-# prove they cost nothing. Never enabled in shipping builds.
+# prove they cost nothing; the iteration count stays, the cold turn's epoch
+# (ADR-0181 A1.3). Never enabled in shipping builds.
 no-tripwires = []
 
 [dev-dependencies]

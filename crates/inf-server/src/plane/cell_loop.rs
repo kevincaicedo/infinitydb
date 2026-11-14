@@ -58,7 +58,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let cold = self.shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
         if let Some(cold) = cold {
             let now_us = cx.now.as_micros();
-            let _ = cold.deliver_ready(cx.cold_delivery_budget(), now_us);
+            let _ = cx.with_cold_delivery_budget(|budget| cold.deliver_ready(budget, now_us));
         }
     }
 }

@@ -373,6 +373,19 @@ impl Arena {
 > `drain_budgeted`, `ColdWait`'s cancellation notice, the retry timer and
 > the fixed storage.
 
+> **Accepted 2026-11-13, built — ADR-0181 A1:** the native cold turn is
+> built at an iteration's first lend, never as the iteration begins. The
+> loop keeps one private turn slot beside its groups and stamps it with
+> the iteration count, which advances as each iteration begins and is
+> always on; a lend whose slot another iteration built builds both
+> budgets whole, and every later lend of the iteration shares what they
+> left, at any step. The delivery lend is a call,
+> `with_cold_delivery_budget(|budget| …)`, that charges the Foreground
+> group the units its call spent as it returns; the preparation lend
+> settles nothing. An iteration in which no step lends builds no turn and
+> stores none, and the server's hook lends only when its host holds
+> ready delivery.
+
 > **Accepted 2026-09-22, implementation open — ADR-0153:** cold-pool
 > construction and native registration establishes a fallible chunked pool
 > and owned driver binding/release lifecycle. Registration remains on the
@@ -500,12 +513,12 @@ pub struct LoopCx<'a> {            // ops pushed here ride the NEXT single submi
     pub pool: &'a mut BufferPool, pub executor: &'a mut CellExecutor,
     // timers(&mut self) -> Timers<'_>: arm, cancel, close, phase, successor, armed_max
     // push(IoOp) · budget(GroupClass) · charge(GroupClass, units) · note_fabric(msgs)
-    // Private delivery and preparation budgets initialized once per native iteration.
+    // A private cold turn, both budgets, built at an iteration's first lend.
 }
 pub struct ColdDeliveryBudget { remaining: u32, spent: u32 } // private, non-Copy; no public reset/constructor
 pub struct ColdPreparationBudget { remaining: u32, spent: u32 } // same restrictions, separate allowance
 impl LoopCx<'_> {
-    pub fn cold_delivery_budget(&mut self) -> &mut ColdDeliveryBudget;
+    pub fn with_cold_delivery_budget<R>(&mut self, serve: impl FnOnce(&mut ColdDeliveryBudget) -> R) -> R;
     pub fn cold_preparation_budget(&mut self) -> &mut ColdPreparationBudget;
 }
 pub struct CellLoop<D: BackendDriver, C: Clock>;

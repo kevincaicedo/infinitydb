@@ -274,11 +274,11 @@ impl Default for PairIssuer {
 
 /// One host turn's cold-read allowances (ADR-0181 R1–R3): the delivery
 /// budget and the preparation budget, built together by
-/// [`ColdTurn::begin`], their one constructor. The native reactor begins one
-/// per iteration and lends both through `LoopCx`; a standalone host begins
-/// one per turn it declares, its pumps sharing it. Neither budget is `Copy`
-/// or `Clone`, and no caller can renew one, so every call of a turn spends
-/// from the same allowance.
+/// [`ColdTurn::begin`], their one constructor. The native reactor builds
+/// one at an iteration's first lend of either and lends both through
+/// `LoopCx`; a standalone host begins one per turn it declares, its pumps
+/// sharing it. Neither budget is `Copy` or `Clone`, and no caller can renew
+/// one, so every call of a turn spends from the same allowance.
 #[derive(Debug)]
 pub struct ColdTurn {
     delivery: ColdDeliveryBudget,
@@ -310,9 +310,9 @@ impl ColdTurn {
     }
 }
 
-// What a turn holds is what every iteration of every cell stores into its loop context: two
-// budgets of two `u32` each, 16 bytes, and nothing to drop, so beginning a turn is four stores
-// and ending it none (ADR-0181 R2).
+// What a turn holds is what a build stores, at a native iteration's first lend: two budgets of
+// two `u32` each, 16 bytes, and nothing to drop, so building a turn is four stores and ending it
+// none (ADR-0181 R2).
 const _: () = assert!(size_of::<ColdTurn>() == 16, "a turn is two budgets of two u32 each");
 const _: () = assert!(!core::mem::needs_drop::<ColdTurn>(), "a turn holds nothing to drop");
 
