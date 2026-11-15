@@ -2728,14 +2728,19 @@ canary_lane "$dir" "inf_canary_toothless $row"
 expect_red_because "canaries: a lane copy whose planted test stays green is red" "NOT CAUGHT" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
 expect green "canaries: the red row's planted build was made" grep -qx "cold canary-inf_canary_toothless" "$dir/planted-dirs"
 expect red "canaries: the red row's planted directory is removed" test -e "$dir/target/canary-inf_canary_toothless"
-# The removal is refused, red, for a cfg not spelled inf_canary_<name>: a
-# directory `canary-<cfg>` could then be the Loom tree or lie outside the root.
-dir="$work/canary-disk-guard"
-mkdir -p "$dir"
+# A row's cfg is inf_canary_<name>, a name of letters, digits and `_`, read
+# before the first build: it names the row's planted directory, and a `/..` in
+# it would name a path outside the root, here a file beside it.
+dir="$work/canary-disk-spelling"
+mkdir -p "$dir/outside"
+: >"$dir/outside/sentinel"
 lane_cargo "$dir/cargo"
-canary_lane "$dir" "loom $row"
-expect_red_because "canaries: a cfg not spelled inf_canary_<name> keeps its directory, red" "is not removed: a planted directory is canary-inf_canary_<name>" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
-expect green "canaries: the refused directory is still there" test -d "$dir/target/canary-loom"
+for bad in inf_canary_a/../../outside inf_canary_a.b inf_canary_ loom; do
+    canary_lane "$dir" "inf_canary_b fake-scenario TOKEN" "$bad $row"
+    expect_red_because "canaries: a row whose cfg is '$bad' is refused before the first build" "malformed row: $bad crate-test" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+done
+expect red "canaries: no planted build ran for a misspelt cfg" test -e "$dir/planted-dirs"
+expect green "canaries: the file beside the root is untouched" test -e "$dir/outside/sentinel"
 # A removal that fails is red: the stub leaves a directory its owner cannot
 # write in, which only root could remove.
 if [ "$(id -u)" -ne 0 ]; then

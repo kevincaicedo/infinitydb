@@ -1107,12 +1107,17 @@ crate_package_ok() {
   [[ "$1" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]]
 }
 
-# row_ok <row>: the row's words are its kind's: `<cfg> crate-test
+# row_ok <row>: the row starts with its cfg, `inf_canary_<name>` with a name
+# of letters, digits and `_`, as the cfg names the row's planted directory
+# under the root: another spelling could name a path outside it or another
+# directory of it. Its words are its kind's: `<cfg> crate-test
 # <package[/features]> <lib|test:NAME> <test> [witness…]`, `<cfg> loom
 # <package> <test> <witness>`, or a scenario's `<cfg> <scenario> <expected>
 # [flags…]`.
+cfg_spelled='^inf_canary_[A-Za-z0-9_]+ '
 row_ok() {
   local parts
+  [[ "$1" =~ $cfg_spelled ]] || return 1
   # shellcheck disable=SC2206
   parts=($1)
   case "${parts[1]:-}" in
@@ -1564,16 +1569,9 @@ for ((index = ${#rows[@]} - 1; index >= 0; index--)); do
 done
 
 # remove_planted <cfg>: the cfg's planted directory, through the root's own
-# removal; refused or failed, the row's cfg is red. A cfg that is not
-# `inf_canary_<name>` is refused first: another spelling could name the Loom
-# tree or a path outside the root.
+# removal (row_ok spelled the cfg); refused or failed, it is red.
 remove_planted() {
   local dir=$TARGET_ROOT/canary-$1 removed
-  if ! [[ "$1" =~ ^inf_canary_[A-Za-z0-9_]+$ ]]; then
-    echo "   red: $dir is not removed: a planted directory is canary-inf_canary_<name>"
-    fail=1
-    return
-  fi
   if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then return 0; fi
   if removed=$(target_root_remove "$dir" 2>&1); then
     echo "== canary $1: its rows judged, $removed removed"
