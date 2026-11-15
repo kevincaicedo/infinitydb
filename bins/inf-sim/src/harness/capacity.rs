@@ -99,6 +99,26 @@ impl CloseLeg {
         CloseLeg::DeferredQuit,
     ];
 
+    /// The legs red at this tree. Each runs in one ignored test of `reds`,
+    /// which fails while the leg is red and fails when it reads green, so a
+    /// green leg leaves this table for its `scripts/sim-smoke.sh` row, where
+    /// it runs with its twin; `tests/lanes.rs` holds every leg to one of the
+    /// two.
+    pub const PINNED_RED: &'static [CloseLeg] = &[
+        CloseLeg::Tasks,
+        CloseLeg::Fan,
+        CloseLeg::Close,
+        CloseLeg::Rearm,
+        CloseLeg::EofWithData,
+        CloseLeg::SubscribeFin,
+        CloseLeg::RegistryFin,
+        CloseLeg::QuitSubscriber,
+        CloseLeg::Stall,
+        CloseLeg::HalfClose,
+        CloseLeg::HalfCloseEofWithData,
+        CloseLeg::HalfCloseReset,
+    ];
+
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -1188,79 +1208,88 @@ fn deferred_quit_leg(seed: u64) -> Rig {
     rig
 }
 
-/// The legs red at this tree, each pinned until the change that makes it
-/// green adds its `scripts/sim-smoke.sh` row (`tests/lanes.rs` holds every
-/// leg to one of the two lanes). Each runs at the smoke seed.
+/// The legs of `CloseLeg::PINNED_RED`, one ignored test each, at the smoke
+/// seed.
 #[cfg(test)]
 mod reds {
     use super::{CapacityScenario, CloseLeg, run_capacity_scenario};
 
-    fn leg_green(leg: CloseLeg) {
+    /// Runs a pinned leg. Red, it fails with the leg's violations, the defect
+    /// its test's ignore reason names; green, it fails too, since a green leg
+    /// leaves `CloseLeg::PINNED_RED` for its smoke row: an ignore removed
+    /// never runs a leg in this lane, unchecked by its twin.
+    fn pinned_red(leg: CloseLeg) {
+        let name = leg.name();
+        assert!(CloseLeg::PINNED_RED.contains(&leg), "--close-leg {name}: not a pinned red");
         let report = run_capacity_scenario(&CapacityScenario::m0_capacity(0xC0FFEE, leg));
         let violations: Vec<&str> = report.violations.iter().collect();
-        assert!(violations.is_empty(), "m0-capacity --close-leg {}: {violations:?}", leg.name());
+        assert!(violations.is_empty(), "m0-capacity --close-leg {name}: {violations:?}");
+        panic!(
+            "m0-capacity --close-leg {name} reads green: it leaves CloseLeg::PINNED_RED for its \
+             scripts/sim-smoke.sh row"
+        );
     }
 
     #[test]
     #[ignore = "a closed subscriber's deltas are a task of their own, alive after its slot \
                 freed; red until a connection's one task ships them from a draining slot"]
     fn the_tasks_leg_holds_no_task_past_its_share() {
-        leg_green(CloseLeg::Tasks);
+        pinned_red(CloseLeg::Tasks);
     }
 
     #[test]
     #[ignore = "a fan sends a leg per remote key past the connection's window of 32; red until \
                 each leg takes one of the connection's gate units"]
     fn the_fan_leg_holds_a_window_per_connection() {
-        leg_green(CloseLeg::Fan);
+        pinned_red(CloseLeg::Fan);
     }
 
     #[test]
     #[ignore = "Closed drops a reset connection's queue; red until a draining slot runs it"]
     fn the_close_leg_runs_every_queued_command() {
-        leg_green(CloseLeg::Close);
+        pinned_red(CloseLeg::Close);
     }
 
     #[test]
     #[ignore = "an end of stream closes the slot at once, so replies after it are lost; red \
                 until the end of stream moves the slot to a flush that answers them"]
     fn the_rearm_leg_answers_every_reply() {
-        leg_green(CloseLeg::Rearm);
+        pinned_red(CloseLeg::Rearm);
     }
 
     #[test]
     #[ignore = "bytes reaped beside their end of stream are released unparsed; red until the \
                 end of stream keeps the parser"]
     fn the_eof_with_data_leg_runs_and_answers_its_set() {
-        leg_green(CloseLeg::EofWithData);
+        pinned_red(CloseLeg::EofWithData);
     }
 
     #[test]
     #[ignore = "an end of stream closes the slot at once, so replies after it are lost; red \
                 until the end of stream moves the slot to a flush that answers them"]
     fn the_subscribe_leg_answers_its_fin() {
-        leg_green(CloseLeg::SubscribeFin);
+        pinned_red(CloseLeg::SubscribeFin);
     }
 
     #[test]
     #[ignore = "an end of stream closes the slot at once, so replies after it are lost; red \
                 until the end of stream moves the slot to a flush that answers them"]
     fn the_registry_leg_answers_its_fin() {
-        leg_green(CloseLeg::RegistryFin);
+        pinned_red(CloseLeg::RegistryFin);
     }
 
     #[test]
     #[ignore = "a marked subscriber is written deliveries after its QUIT; red until a flushing \
                 slot takes no delivery"]
     fn the_quit_subscriber_leg_reads_nothing_after_its_ok() {
-        leg_green(CloseLeg::QuitSubscriber);
+        pinned_red(CloseLeg::QuitSubscriber);
     }
 
     #[test]
     #[ignore = "a stalled cell releases at the vacant slot the bytes of connections closed \
                 during the stall; red until a slot keeps its parser past Closed"]
     fn the_stall_leg_runs_what_each_client_sent() {
-        leg_green(CloseLeg::Stall);
+        pinned_red(CloseLeg::Stall);
     }
 
     #[test]
@@ -1268,20 +1297,20 @@ mod reds {
                 stream, so no send follows it and the oracle reads green unengaged; red until \
                 the leg engages a send after its end of stream"]
     fn the_half_close_leg_answers_every_reply() {
-        leg_green(CloseLeg::HalfClose);
+        pinned_red(CloseLeg::HalfClose);
     }
 
     #[test]
     #[ignore = "an end of stream reaped with its bytes closes the slot first; red until the end \
                 of stream keeps the parser and answers what was read"]
     fn the_half_close_leg_answers_a_shared_reap() {
-        leg_green(CloseLeg::HalfCloseEofWithData);
+        pinned_red(CloseLeg::HalfCloseEofWithData);
     }
 
     #[test]
     #[ignore = "an end of stream closes the slot and Closed drops the queue; red until the \
                 queue runs to its end after a reset"]
     fn the_half_close_reset_leg_runs_its_queue() {
-        leg_green(CloseLeg::HalfCloseReset);
+        pinned_red(CloseLeg::HalfCloseReset);
     }
 }
