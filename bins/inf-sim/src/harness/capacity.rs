@@ -266,14 +266,17 @@ impl Rig {
         for (i, fabric) in Mesh::new(CELLS, FROZEN_MESH).into_iter().enumerate() {
             let cell = u16::try_from(i).expect("a u16 cell");
             let net = CellNet::new(cell, seed, Plant::None);
-            let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
-            node.rng_state.set(seed ^ (0xCA9A_0000 + i as u64));
+            // `maxclients` is the node's boot capacity, as `infinityd
+            // --maxclients` sets it (ADR-0123 A1).
+            let mut config = inf_server::ConfigStore::default();
             if maxclients != 0 {
-                node.config
-                    .borrow_mut()
-                    .set(b"maxclients", maxclients.to_string().as_bytes())
-                    .expect("maxclients is hot");
+                let cells = inf_foundation::CellCount::new(CELLS).expect("three cells");
+                let capacity = inf_server::BootCapacity::new(maxclients, cells)
+                    .expect("a leg's boot capacity");
+                config = config.with_boot_capacity(capacity);
             }
+            let node = Rc::new(NodeInfo::try_new(config).expect("fixture cache allocation"));
+            node.rng_state.set(seed ^ (0xCA9A_0000 + i as u64));
             let seed_store = KeyspaceSeed::Uncataloged {
                 cfg: StoreConfig { hasher: node_hasher(seed), ..Default::default() },
                 specs: namespaces.to_vec(),
