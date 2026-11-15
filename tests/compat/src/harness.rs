@@ -213,6 +213,13 @@ fn connect_external(addr: &str) -> TcpStream {
     stream
 }
 
+/// The connection capacity both engines boot with: `redis-server
+/// --maxclients` and `infinityd --maxclients`, and the in-process
+/// candidate's boot capacity (ADR-0123 A1), so the corpus's raises within
+/// it compare byte for byte and a raise past it is the documented
+/// deviation.
+pub const BOOT_MAXCLIENTS: u32 = 20_000;
+
 fn spawn_redis() -> (ProcessGuard, TcpStream) {
     let port = reserve_port();
     // A scratch working directory per oracle (found 2026-09-01 while
@@ -234,7 +241,7 @@ fn spawn_redis() -> (ProcessGuard, TcpStream) {
             "--bind",
             "127.0.0.1",
             "--maxclients",
-            "20000",
+            &BOOT_MAXCLIENTS.to_string(),
             "--enable-debug-command",
             "yes",
         ])
@@ -507,6 +514,8 @@ pub fn spawn_infinityd_at(
             dir.to_str().expect("utf-8 scratch path"),
             "--device-probe",
             "off",
+            "--maxclients",
+            &BOOT_MAXCLIENTS.to_string(),
         ])
         .stdout(Stdio::null())
         .stderr(log)

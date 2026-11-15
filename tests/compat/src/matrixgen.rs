@@ -327,7 +327,11 @@ pub static DECLARED: &[Declared] = &[
         "typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 \
              MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next \
              MAINTAIN (ADR-0122); `maxclients` is divided per cell like `maxmemory` (a full cell \
-             refuses with Redis's error while a sibling may have headroom), `timeout` closes idle \
+             refuses with Redis's error while a sibling may have headroom) and is at most the \
+             boot capacity `--maxclients` (default 10,000): a raise above it answers `-ERR \
+             maxclients exceeds boot capacity; restart with --maxclients` and changes no key of \
+             the `CONFIG SET`, and below the cell count every cell keeps one slot (ADR-0123 \
+             A1); `timeout` closes idle \
              unsubscribed connections at MAINTAIN resolution, `tcp-keepalive` applies to \
              connections accepted after the change (ADR-0123); `client-output-buffer-limit` \
              enforces `normal` and `pubsub`, the `slave` class is accepted and inert until M9 \

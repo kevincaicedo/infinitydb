@@ -49,7 +49,16 @@ impl Candidate {
     }
 
     fn with_clock(clock: CandidateClock) -> Candidate {
-        let cx = ConnCx::try_default().expect("fixture cache allocation");
+        // The candidate is a one-cell node booted at the oracle's capacity.
+        let cells = inf_foundation::CellCount::new(1).expect("one cell");
+        let capacity = inf_server::BootCapacity::new(crate::harness::BOOT_MAXCLIENTS, cells)
+            .expect("the compat boot capacity fits one cell");
+        let config = inf_server::ConfigStore::default().with_boot_capacity(capacity);
+        let node = inf_server::NodeInfo::try_new(config).expect("fixture cache allocation");
+        let cx = ConnCx {
+            node: std::rc::Rc::new(node),
+            ..ConnCx::try_default().expect("fixture cache allocation")
+        };
         // Wall anchor at the candidate's epoch: EXPIREAT/EXAT/EXPIRETIME
         // convert through the same Unix instants the redis-server oracle
         // sees, so absolute-time cases diff within `IntWithin` tolerances.

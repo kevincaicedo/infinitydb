@@ -617,6 +617,12 @@ pub static MATRIX: &[Case] = &[
     c(&["CONFIG", "GET", "maxclients"]),
     c(&["CONFIG", "SET", "maxclients", "10000"]),
     skip(&["CONFIG", "SET", "maxclients", "0"], "error detail text differs; both reject"),
+    // ADR-0123 A1: a node's connection slots are fixed at boot, so a raise
+    // past `--maxclients` is refused whole, where Redis raises it.
+    skip(
+        &["CONFIG", "SET", "maxclients", "20001"],
+        "past the boot capacity the node refuses the raise whole (ADR-0123 A1)",
+    ),
     skip(&["CONFIG", "SET", "timeout", "-1"], "error detail text differs; both reject"),
     skip(&["CONFIG", "SET", "tcp-keepalive", "-1"], "error detail text differs; both reject"),
     c(&["CONFIG", "SET", "client-output-buffer-limit", "normal 64mb 16mb 10"]),
