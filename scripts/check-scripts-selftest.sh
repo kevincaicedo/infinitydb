@@ -8331,6 +8331,19 @@ tr_remove() { # <checkout> <dir>: setup, then the removal; stdout to $TRW/out, s
         '. "$1/scripts/target-root.sh" && target_root_setup "$1" && target_root_remove "$2"' \
         tr_remove "$1" "$2" >"$TRW/out" 2>"$TRW/err"
 }
+tr_remove_leaf_case() { # <checkout> <suffix>: <root><suffix> refused on an unmarked root, nothing removed
+    local status=0
+    [ ! -e "$1/target/.checkout-path" ] && [ ! -e "$1/.git" ] && [ ! -e "$1/target/.git" ] ||
+        { echo "the fixture root is marked or holds a .git: the walk could refuse it"; return 1; }
+    mkdir -p "$1/target/debug"
+    : >"$1/target/debug/kept"
+    tr_remove "$1" "$1/target$2" || status=$?
+    [ "$status" -eq 2 ] && [ ! -s "$TRW/out" ] && grep -q "is not a directory directly below" "$TRW/err" &&
+        [ -e "$1/target/debug/kept" ] && [ -e "$1/scripts/target-root.sh" ] && return 0
+    echo "target_root_remove $1/target$2: exit $status, want 2 and nothing removed:"
+    cat "$TRW/out" "$TRW/err"
+    return 1
+}
 tr_remove_refused() { # <dir> <pattern> [<path>]: exit 2 naming the pattern, nothing printed or removed
     local status=0
     tr_remove "$TR_RM" "$1" || status=$?
@@ -8359,6 +8372,14 @@ expect green "target-root: target_root_remove refuses a directory deeper than th
     tr_remove_refused "$TR_RM/target/debug/deps" "is not a directory directly below"
 expect green "target-root: target_root_remove refuses the root itself" \
     tr_remove_refused "$TR_RM/target" "is not a directory directly below"
+# The root's own spellings below it, `<root>/`, `<root>/.` and `<root>/..` (an
+# empty variable in "$TARGET_ROOT/$x" is the first), name the root and the
+# checkout: refused by the leaf alone, as this root is unmarked and holds no
+# .git, so the walk would find nothing to refuse.
+for tr_leaf in / /. /..; do
+    expect green "target-root: target_root_remove refuses the root spelled <root>$tr_leaf, unmarked" \
+        tr_remove_leaf_case "$TR_RM" "$tr_leaf"
+done
 mkdir -p "$TR_RM/target/canary-g/wt" "$TR_RM/target/canary-m" "$TRW/linked-away"
 : >"$TR_RM/target/canary-g/wt/.git"
 : >"$TR_RM/target/canary-m/.checkout-path"
@@ -8668,6 +8689,12 @@ tr_remove_below_case() { # <helper dir>: the removal refuses a path that climbs 
 }
 tr_control remove-walk tr_remove_walk_case
 tr_control remove-below tr_remove_below_case
+tr_leaf_slash_case() { tr_remove_leaf_case "$1" /; }
+tr_leaf_dot_case() { tr_remove_leaf_case "$1" /.; }
+tr_leaf_dotdot_case() { tr_remove_leaf_case "$1" /..; }
+tr_control leaf-slash tr_leaf_slash_case
+tr_control leaf-dot tr_leaf_dot_case
+tr_control leaf-dotdot tr_leaf_dotdot_case
 tr_fresh_case() { # <helper dir>: its fresh build refuses a directory an earlier run filled
     local status=0
     env bash -c '. "$1/scripts/target-root.sh"; target_root_cargo_fresh "$2" "$3"' sh "$1" "$TR_FR/full" \
@@ -8685,6 +8712,10 @@ tr_mutant remove-walk 's/^    hit = walk_hit(path, False)$/    hit = None/' tr_r
     "removes a directory of the root that holds a work tree"
 tr_mutant remove-below 's/^    if leaf in ("", ".", "..") or os.path.realpath(parent) != os.path.realpath(root):$/    if False:/' \
     tr_remove_below_case "takes a path that climbs out of the root"
+tr_leaf_drop='s/^    if leaf in ("", ".", "..") or os.path.realpath(parent) != os.path.realpath(root):$/    if os.path.realpath(parent) != os.path.realpath(root):/'
+tr_mutant leaf-slash "$tr_leaf_drop" tr_leaf_slash_case "removes the root spelled <root>/"
+tr_mutant leaf-dot "$tr_leaf_drop" tr_leaf_dot_case "empties the root spelled <root>/."
+tr_mutant leaf-dotdot "$tr_leaf_drop" tr_leaf_dotdot_case "starts on the checkout around the root, <root>/.."
 tr_mutant outputs 's/^        if others:$/        if False:/' tr_outputs_case "stamps a root holding outputs"
 tr_mutant build-dir 's/^    if os.path.realpath(path) != os.path.realpath(root):$/    if False:/' tr_split_case \
     "skips the build directory"
