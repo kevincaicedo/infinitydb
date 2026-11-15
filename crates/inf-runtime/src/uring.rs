@@ -1025,6 +1025,12 @@ impl UringDriver {
                 let rearm = owns_arm
                     && result > 0
                     && self.recvs.get(&fd).is_some_and(|a| !a.disarmed && !a.paused);
+                // Canary: a zero result, the end of stream, re-arms the receive too.
+                #[cfg(inf_canary_uring_eof_rearms)]
+                let rearm = rearm
+                    || (owns_arm
+                        && result == 0
+                        && self.recvs.get(&fd).is_some_and(|a| !a.disarmed && !a.paused));
                 if rearm {
                     self.arm_recv_sqe(fd, token, pool);
                 }

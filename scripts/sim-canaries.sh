@@ -1023,6 +1023,10 @@ rows=(
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.
   "inf_canary_uring_cqe_order_reversed crate-test inf-runtime/uring test:driver_conformance multishot_recv_posts_data_before_eof eof-before-data"
+  # The end of stream ends the receive: io_uring re-arms a finished multishot receive only after
+  # a positive result. Planted, a zero result re-arms it too, and the half-closed socket posts
+  # a second zero-length Recv.
+  "inf_canary_uring_eof_rearms crate-test inf-runtime/uring test:driver_conformance eof_ends_the_receive recv-after-eof"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
