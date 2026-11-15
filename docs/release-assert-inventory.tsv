@@ -517,9 +517,8 @@ I	1	crates/inf-server/src/plane.rs	expect	enable_durable built tier state	`enabl
 I	1	crates/inf-server/src/plane/conn.rs	expect	ends table	the block was written by `stage_argv_block` with `argc` 4-byte ends after the header
 I	1	crates/inf-server/src/plane/fabric.rs	expect	ends table	the block was written by `stage_argv_block` with `argc` 4-byte ends after the header
 I	1	crates/inf-server/src/plane/fabric.rs	expect	front exists	`front().is_some_and(..)` on the line above
-I	1	crates/inf-server/src/plane/cell_loop.rs	expect	gated reply implies durable plane	a gated reply carries a durable seq minted by the durable cell, which exists for the plane's life once enabled
 I	1	crates/inf-server/src/plane/dispatch.rs	expect	guarded	`conn_ns.is_some()` is part of the arm's guard
-I	1	crates/inf-server/src/plane/conn.rs	expect	header	the block was written by `OwnedCmd::from_argv_into` with a 4-byte header
+I	1	crates/inf-server/src/plane/conn.rs	expect	header	the block was written by `OwnedCmd::from_argv_into`, or for a parked fabric entry by `stage_argv_block` (`OwnedCmd::from_staged`), with a 4-byte header
 I	1	crates/inf-server/src/plane/cell_loop.rs	expect	log completion without durable plane	`LogWrite`/`Fsync`/`ZeroFillWrite` tokens are minted by the durable cell, which exists for the plane's life once enabled
 I	1	crates/inf-server/src/plane/cell_loop.rs	expect	LogWritten without durable plane	`LogWrite` tokens are minted by the durable cell, which exists for the plane's life once enabled
 I	1	crates/inf-server/src/plane/cell_loop.rs	expect	manifest completion without durable plane	`ManifestSync` tokens are minted by the durable cell's manifest driver, which exists for the plane's life once enabled
@@ -530,7 +529,7 @@ I	1	crates/inf-server/src/plane/scatter.rs	unreachable	the outer match took Int 
 C	1	crates/inf-server/src/plane.rs	expect	set_control before begin_recovery	assembly order: `bins/infinityd/src/main.rs:main` and every harness call `set_control` first (`crates/inf-server/src/plane.rs:ServerPlane::begin_recovery` documents the panic)
 I	1	crates/inf-server/src/plane/ns_ddl.rs	expect	staged above	`stage_durable_effects` returned a seq on the line above, which requires the durable cell
 I	1	crates/inf-server/src/plane/shared.rs	expect	staged above	`stage_durable_effects` returned a seq on the line above, which requires the durable cell
-C	2	crates/inf-server/src/plane/fabric.rs	expect	stage scratch fits u32	the parse stage's scratch holds one recv buffer's parsed frames: `--buf-size` ≤ i32::MAX (`bins/infinityd/src/main.rs:parse_args`) and each frame ≤ `max_frame_bytes` (`crates/inf-wire/src/parser.rs:parse_multibulk`). The apply stage's scratch holds every staged `Apply` of one fabric drain (up to `FABRIC_DRAIN_MAX` frames plus overshoot), admitted by argument count and not by bytes
+C	2	crates/inf-server/src/plane/fabric.rs	expect	stage scratch fits u32	the parse stage's scratch holds one recv buffer's parsed frames: `--buf-size` ≤ i32::MAX (`bins/infinityd/src/main.rs:parse_args`) and each frame ≤ `max_frame_bytes` (`crates/inf-wire/src/parser.rs:parse_multibulk`). The apply stage's scratch holds every staged `Apply` of one fabric drain (up to `FABRIC_DRAIN_MAX` frames plus overshoot), admitted by argument count and not by bytes; a parked entry's own buffer holds one fabric frame's argv
 I	1	crates/inf-server/src/plane/cell_loop.rs	expect	Synced without durable plane	`Fsync`/`CkptSync`/`ManifestSync` tokens are minted by the durable cell, which exists for the plane's life once enabled
 I	1	crates/inf-server/src/plane/ns_ddl.rs	expect	tiered implies the durable plane	a tiered namespace is a configuration of `MODE durable` (ADR-0062 D1), registered on a plane whose `enable_durable` ran
 I	1	crates/inf-server/src/plane/pumps.rs	expect	tiered implies the durable plane	a tiered namespace is a configuration of `MODE durable` (ADR-0062 D1), registered on a plane whose `enable_durable` ran

@@ -1,6 +1,6 @@
 //! Runtime bounds owned by the server. Every crossing names its behavior here.
 
-use inf_foundation::bounded::{Cap, CapFill};
+use inf_foundation::bounded::{Cap, CapError, CapFill};
 use inf_foundation::time::Nanos;
 
 /// Reclaim marks one tiered namespace holds on its cell: ADR-0061 D5's
@@ -319,6 +319,69 @@ pub const FAN_RESERVE_PER_PEER: u32 = 1;
 /// `checked_mesh_config`. Crossing: a send past the window parks for a
 /// returned credit.
 pub const FABRIC_CREDITS_PER_PEER: u32 = 1024;
+
+/// Data credits per directed cell pair at most (ADR-0177 D6): the ceiling
+/// of `d`, the credits a mesh gives each peer, which bounds the work one
+/// cell parks for one peer. Unit: data credits per directed cell pair.
+/// Owner: `checked_mesh_config`, the one check of a mesh, and the three
+/// per-origin deques' caps below. Crossing: a mesh with more is refused when
+/// it is checked (a `const` mesh fails the build), and a plane built over
+/// one refuses its assembly.
+pub const FABRIC_CREDITS_PER_PEER_MAX: u32 = 1_536;
+
+/// Bytes one entry of a per-origin deque takes at most (ADR-0177 D6): the
+/// request or reply bytes sit behind one pointer, so `d` entries of a peer
+/// fit one deque's backing at the ceiling of credits. Unit: bytes per
+/// entry. Owner: the three entry types, each held to it by a const
+/// assertion. Crossing: none at run time; a wider entry fails the build.
+pub const PARKED_ENTRY_BYTES_MAX: usize = 40;
+
+const _: () = assert!(FABRIC_CREDITS_PER_PEER <= FABRIC_CREDITS_PER_PEER_MAX);
+const _: () = assert!(
+    FABRIC_CREDITS_PER_PEER_MAX as usize * PARKED_ENTRY_BYTES_MAX
+        <= inf_foundation::limits::DEQUE_BACKING_BYTES_MAX
+);
+
+/// Namespace applies one cell parks for one origin (ADR-0177 D6): FABRIC-IN
+/// diverts or parks an apply to its origin's pump. The ceiling of the
+/// per-origin cap `d` (`per_origin`), under the census name `ns-applies`,
+/// filled while serving. Unit: entries per origin. Owner: the plane's
+/// `ns_applies`. Crossing: before any effect the op is answered `Refused`
+/// (`ERR cross-cell execution failed` to its client) and
+/// `fabric_parked_refused` counts it; derived never, as an origin holds at
+/// most `d` un-replied ops.
+pub const NS_APPLIES: Cap =
+    Cap::entries::<FABRIC_CREDITS_PER_PEER_MAX>("ns-applies", CapFill::Serving);
+
+/// `INF.PUB`s one cell parks for one origin's publishers (ADR-0177 D6),
+/// fanned out by the owner pump in rotation over the origins: the ceiling of
+/// `d`, census name `owner-pubs`. Unit, owner (`owner_pubs`) and crossing:
+/// as [`NS_APPLIES`].
+pub const OWNER_PUBS: Cap =
+    Cap::entries::<FABRIC_CREDITS_PER_PEER_MAX>("owner-pubs", CapFill::Serving);
+
+/// `always` verdicts one cell holds for one origin until its fsync
+/// watermark covers them (ADR-0177 D3, D6): a placeholder before the
+/// apply's first effect, filled after it, published by the `gated` task.
+/// The ceiling of `d`, census name `gated`. Unit, owner (`gated`) and
+/// crossing: as [`NS_APPLIES`].
+pub const GATED_VERDICTS: Cap =
+    Cap::entries::<FABRIC_CREDITS_PER_PEER_MAX>("gated", CapFill::Serving);
+
+/// One per-origin deque's cap over a mesh's `data_credits` (ADR-0177 D1,
+/// D6): `ceiling`'s name, `data_credits` entries.
+///
+/// # Errors
+/// `CapError::Layout` when `data_credits` is 0 or above the ceiling.
+pub(crate) const fn per_origin(ceiling: &Cap, data_credits: u32) -> Result<Cap, CapError> {
+    Cap::derived(ceiling, data_credits)
+}
+
+/// Verdicts the `gated` task publishes in one poll (ADR-0177 D3). Unit:
+/// replies per poll. Owner: the `gated` task, inside a poll, so charged to
+/// Foreground. Crossing: the task yields and is polled again in ready
+/// order, so an origin's verdicts never hold the loop past one poll.
+pub const GATED_REPLIES_PER_POLL: usize = 1_024;
 
 /// Ring slots per directed cell pair of the shipped binary's mesh: a power
 /// of two with reply headroom over [`FABRIC_CREDITS_PER_PEER`]. Unit: ring

@@ -113,12 +113,12 @@ impl Cells {
 fn wake_ns_pumps(shared: &Rc<Shared<NoopObserver, StdSegmentFs>>) -> usize {
     let (origins, applies) = {
         let (queues, active) = (shared.ns_applies.borrow(), shared.ns_pump_active.borrow());
-        let origins: Vec<u16> = (0..shared.cells)
-            .filter(|&origin| {
-                !queues[usize::from(origin)].is_empty() && !active[usize::from(origin)]
-            })
+        let origins: Vec<u16> = queues
+            .origins_waiting()
+            .filter(|origin| !active[usize::from(origin.0)])
+            .map(|origin| origin.0)
             .collect();
-        let applies: usize = origins.iter().map(|&origin| queues[usize::from(origin)].len()).sum();
+        let applies: usize = origins.iter().map(|&origin| queues.len_for(CellId(origin))).sum();
         (origins, applies)
     };
     let mut cx = Context::from_waker(Waker::noop());
@@ -135,8 +135,7 @@ fn drain(
     shared: &Shared<NoopObserver, StdSegmentFs>,
     answer: &mut impl FnMut(&[&[u8]]) -> Option<Outcome<'static>>,
 ) {
-    let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
-        (ReplyStream::new(Vec::new()), Vec::new(), Vec::new(), Vec::new(), 0u64);
+    let (mut scratch, mut staged, mut orphans) = (ReplyStream::new(Vec::new()), Vec::new(), 0u64);
     let mut answered = Vec::new();
     let now = shared.now.get();
     shared.fabric.borrow_mut().drain(64, |from, op| {
@@ -146,19 +145,12 @@ fn drain(
             answered.push((from, *token, outcome));
             return;
         }
-        handle_fabric_op(
-            shared,
-            now,
-            from,
-            op,
-            &mut scratch,
-            &mut staged,
-            &mut pubs,
-            &mut gated,
-            &mut orphans,
-        );
+        handle_fabric_op(shared, now, from, op, &mut scratch, &mut staged, &mut orphans);
     });
-    assert!(gated.is_empty() && pubs.is_empty(), "no durable or publish leg in these rows");
+    assert!(
+        !shared.gated.borrow().waits() && !shared.owner_pubs.borrow().waits(),
+        "no durable or publish leg in these rows"
+    );
     // The cell loop's own shipping of each staged reply (the tag from the
     // reply's outcome).
     let mut fabric = shared.fabric.borrow_mut();
@@ -697,21 +689,10 @@ fn reply_outcome_read_of_an_empty_value_stages_zero_bytes() {
     let key = cells.key_on(1);
     assert_eq!(cells.local(1, &[b"SET", &key, b""]), b"+OK\r\n");
     let shared = &cells.planes[1].shared;
-    let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
-        (ReplyStream::new(Vec::new()), Vec::new(), Vec::new(), Vec::new(), 0u64);
+    let (mut scratch, mut staged, mut orphans) = (ReplyStream::new(Vec::new()), Vec::new(), 0u64);
     let read = Op::Read { token: FabricToken(1), slot: KeySlot::of_key(&key), key: &key };
     let now = shared.now.get();
-    handle_fabric_op(
-        shared,
-        now,
-        CellId(0),
-        read,
-        &mut scratch,
-        &mut staged,
-        &mut pubs,
-        &mut gated,
-        &mut orphans,
-    );
+    handle_fabric_op(shared, now, CellId(0), read, &mut scratch, &mut staged, &mut orphans);
     let [(_, _, reply)] = staged.as_slice() else { panic!("one staged reply: {}", staged.len()) };
     assert!(matches!(staged_outcome(scratch.as_bytes(), reply), Outcome::Bytes(b"")));
 }

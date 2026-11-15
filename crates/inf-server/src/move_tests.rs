@@ -187,8 +187,8 @@ fn an_unmarked_apply_carrying_an_internal_command_is_unknown() {
             args,
             program,
         };
-        let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
-            (ReplyStream::new(Vec::new()), Vec::new(), Vec::new(), Vec::new(), 0u64);
+        let (mut scratch, mut staged, mut orphans) =
+            (ReplyStream::new(Vec::new()), Vec::new(), 0u64);
         handle_fabric_op(
             shared,
             shared.now.get(),
@@ -196,8 +196,6 @@ fn an_unmarked_apply_carrying_an_internal_command_is_unknown() {
             op,
             &mut scratch,
             &mut staged,
-            &mut pubs,
-            &mut gated,
             &mut orphans,
         );
         let (_, _, reply) = staged.pop().expect("one staged reply");
@@ -226,8 +224,8 @@ fn an_apply_without_arguments_is_refused_not_a_panic() {
             args: ApplyArgs::EMPTY,
             program,
         };
-        let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
-            (ReplyStream::new(Vec::new()), Vec::new(), Vec::new(), Vec::new(), 0u64);
+        let (mut scratch, mut staged, mut orphans) =
+            (ReplyStream::new(Vec::new()), Vec::new(), 0u64);
         handle_fabric_op(
             shared,
             shared.now.get(),
@@ -235,8 +233,6 @@ fn an_apply_without_arguments_is_refused_not_a_panic() {
             op,
             &mut scratch,
             &mut staged,
-            &mut pubs,
-            &mut gated,
             &mut orphans,
         );
         let (_, _, reply) = staged.pop().expect("one staged reply");

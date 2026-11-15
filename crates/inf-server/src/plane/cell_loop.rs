@@ -409,8 +409,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         let stage = &mut self.apply_stage;
         let stage_bytes = &mut self.apply_stage_bytes;
         let mut orphans: u64 = 0;
-        let mut pubs: Vec<OwnerPub> = Vec::new();
-        let mut gated: Vec<GatedReply> = Vec::new();
         let now = cx.now;
         let drained = shared.fabric.borrow_mut().drain(FABRIC_DRAIN_MAX, |from, op| {
             if apply_prefetch {
@@ -423,31 +421,19 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     stage_bytes,
                     scratch,
                     staged,
-                    &mut pubs,
-                    &mut gated,
                     &mut orphans,
                 );
             } else {
-                handle_fabric_op(
-                    shared,
-                    now,
-                    from,
-                    op,
-                    scratch,
-                    staged,
-                    &mut pubs,
-                    &mut gated,
-                    &mut orphans,
-                );
+                handle_fabric_op(shared, now, from, op, scratch, staged, &mut orphans);
             }
         });
-        flush_apply_stage(shared, stage, stage_bytes, scratch, staged, &mut pubs);
-        // M4.5-S29: gated verdicts the tiered apply pumps queued since the
-        // last pass join this pass's deferred-reply spawns below. They must
-        // drain even on a fabric-quiet iteration — their producers ran in
-        // run_ready, not in this drain.
-        gated.extend(self.shared.pump_gated.borrow_mut().drain(..));
-        if drained == 0 && gated.is_empty() {
+        flush_apply_stage(shared, stage, stage_bytes, scratch, staged);
+        // ADR-0177 D3: a verdict waiting with the `gated` task not running
+        // makes the task, even on a fabric-quiet iteration: an apply pump
+        // fills its verdict in run_ready, not in this drain, and a task
+        // cannot wake another (the lag is this one iteration).
+        let gated_due = !self.shared.gated_pump_active.get() && self.shared.gated.borrow().waits();
+        if drained == 0 && !gated_due {
             return;
         }
         if drained > 0 {
@@ -476,33 +462,29 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         drop(fabric);
         self.admit_adopted(cx);
         // Owner-side `always` applies (M2-S08, ADR-0015 D6): the fabric
-        // reply itself is deferred — a future awaits this cell's ack gate,
-        // then publishes the reply (flushed by the next FABRIC-OUT). The
-        // client-visible ack never precedes the owning cell's fsync.
-        for g in gated {
+        // reply itself is deferred — the cell's one `gated` task awaits
+        // this cell's ack gate, then publishes every reply it covers
+        // (flushed by the next FABRIC-OUT). The client-visible ack never
+        // precedes the owning cell's fsync. Made on demand, as the pumps
+        // below are (ADR-0177 D3); this drain's inline verdicts count too.
+        if !self.shared.gated_pump_active.get() && self.shared.gated.borrow().waits() {
+            self.shared.gated_pump_active.set(true);
             let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(async move {
-                let waiter = {
-                    let durable = shared.durable.borrow();
-                    durable
-                        .as_ref()
-                        .expect("gated reply implies durable plane")
-                        .ack_gate
-                        .waiter(g.seq)
-                };
-                waiter.await;
-                let outcome = wire_reply(g.reply.bytes(), g.reply.outcome());
-                shared.fabric.borrow_mut().reply(g.to, g.token, &outcome);
-            });
+            let _ = cx.executor.poll_immediate(gated_pump(shared));
         }
         // Tiered fabric applies (M4-S26): wake each origin's FIFO pump.
         let tier_pending: Vec<u16> = {
             let queues = self.shared.ns_applies.borrow();
             let active = self.shared.ns_pump_active.borrow();
-            (0..queues.len())
-                .filter(|&i| !queues[i].is_empty() && !active[i])
-                .map(|i| i as u16)
-                .collect()
+            if queues.waits() {
+                queues
+                    .origins_waiting()
+                    .filter(|origin| !active[usize::from(origin.0)])
+                    .map(|origin| origin.0)
+                    .collect()
+            } else {
+                Vec::new()
+            }
         };
         for origin in tier_pending {
             self.shared.ns_pump_active.borrow_mut()[usize::from(origin)] = true;
@@ -510,15 +492,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             let _ = cx.executor.poll_immediate(ns_apply_pump(shared, origin));
         }
         // Fabric-origin PUBLISHes fan out on this cell's owner pump (one
-        // long-lived FIFO future — arrival order is delivery order). The
-        // reply to each publisher ships when its fan acks return.
-        if !pubs.is_empty() {
-            self.shared.pub_queue.borrow_mut().extend(pubs);
-            if !self.shared.pub_pump_active.get() {
-                self.shared.pub_pump_active.set(true);
-                let shared = Rc::clone(&self.shared);
-                let _ = cx.executor.poll_immediate(owner_pub_pump(shared));
-            }
+        // long-lived future over the origins' FIFOs — each origin's arrival
+        // order is its delivery order). The reply to each publisher ships
+        // when its fan acks return.
+        if !self.shared.pub_pump_active.get() && self.shared.owner_pubs.borrow().waits() {
+            self.shared.pub_pump_active.set(true);
+            let shared = Rc::clone(&self.shared);
+            let _ = cx.executor.poll_immediate(owner_pub_pump(shared));
         }
     }
 

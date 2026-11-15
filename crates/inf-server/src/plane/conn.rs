@@ -49,6 +49,19 @@ impl OwnedCmd {
         OwnedCmd { buf }
     }
 
+    /// A flat command over `buf`, which holds one block `stage_argv_block`
+    /// wrote at offset 0 (the same layout): one flat copy behind one
+    /// pointer, as a parked fabric entry holds its request (ADR-0177 D6).
+    pub(super) fn from_staged(buf: Vec<u8>) -> OwnedCmd {
+        OwnedCmd { buf }
+    }
+
+    /// The flat copy's length in bytes, its header included: what it holds,
+    /// not its buffer's capacity.
+    pub(super) fn len_bytes(&self) -> u64 {
+        self.buf.len() as u64
+    }
+
     pub(super) fn argc(&self) -> usize {
         u32::from_le_bytes(self.buf[..4].try_into().expect("header")) as usize
     }

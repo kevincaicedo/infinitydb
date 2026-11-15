@@ -45,7 +45,9 @@ use inf_fabric::{
     ApplyArgs, CellFabric, ErrCode, FabricToken, MAX_APPLY_ARGS, MAX_INLINE_APPLY_ARGS, Op,
     Outcome, SendError,
 };
-use inf_foundation::bounded::{CapCensus, ServeMark};
+use inf_foundation::bounded::{
+    Cap, CapCensus, CapError, CappedDeque, Reserve, Reserved, ServeMark,
+};
 use inf_foundation::time::Nanos;
 use inf_foundation::{CellId, LogHistogram};
 #[cfg(feature = "doc")]
@@ -100,7 +102,8 @@ pub use credit::{MeshConfigRefused, checked_mesh_config};
 use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
 use fabric::{
     GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op,
-    parse_stageable, stage_argv_block_argv, stage_or_handle, staged_outcome, wire_reply,
+    parse_stageable, stage_argv_block, stage_argv_block_argv, stage_or_handle, staged_outcome,
+    wire_reply,
 };
 #[cfg(feature = "doc")]
 pub use json_gather::parse_json_mget_leg;
@@ -112,7 +115,7 @@ use publish::{
     dispatch_pubsub, enforce_output_cap, flush_sub_deltas, handle_pubsub_apply, owner_pub_pump,
     unsubscribe_closed_conn,
 };
-use pumps::{compact_pump, ns_apply_pump, shadow_pump};
+use pumps::{compact_pump, gated_pump, ns_apply_pump, shadow_pump};
 use scatter::{
     CROSS_CELL_EXECUTION_FAILED, CountedFold, ScatterScope, error_reply, extract_keys_iter,
     extract_keys_slices, int_reply, keyspace_level, ns_dbsize_local, parse_publisher_tag,
@@ -120,7 +123,10 @@ use scatter::{
     read_array_leg, run_local, simple_reply, stages, u64_decimal,
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
-use shared::{DurableAdmission, NsApplyOutcome, apply_drop, handle_ns_apply, tier_to_fan};
+use shared::{
+    DurableAdmission, NsApplyOutcome, Parked, ParkedDeques, ParkedFull, PeerDeques, apply_drop,
+    handle_ns_apply, tier_to_fan,
+};
 
 /// ADR-0189 D4's fail-stop: a namespace change `META` holds that this cell
 /// cannot apply, or a leg the origin reads as refused. A cell left on the
@@ -143,8 +149,8 @@ use crate::durable::{DrainHold, DurableCell, DurableConfig};
 #[cfg(feature = "doc")]
 use crate::exec::DocLogAdmission;
 use crate::exec::{
-    COLD_GAUGES, ColdGauge, ConnCx, ConnNamespace, NodeInfo, TIER_FLUSH_GAUGES, TierFlushGauge,
-    execute, execute_slices, stall_request, unavailable_default_allows,
+    COLD_GAUGES, ColdGauge, ConnCx, ConnNamespace, NodeInfo, NodeState, TIER_FLUSH_GAUGES,
+    TierFlushGauge, execute, execute_slices, stall_request, unavailable_default_allows,
 };
 use crate::limits::ACCEPT_RETRY;
 use crate::pubsub::{self, PubSubCell, SubKind};
@@ -181,26 +187,130 @@ pub(super) struct ConnSlab<T = Conn> {
 
 /// One fabric-origin namespace apply parked for its origin's FIFO pump
 /// (M4-S26 tiered; M4.5-S27 added flat durable applies under staging
-/// pressure — the suspension-capable sibling of the gated-reply future).
+/// pressure). Its origin is its deque's; its argv one flat copy behind one
+/// pointer (ADR-0177 D6).
 pub(super) struct NsApply {
     token: FabricToken,
+    args: OwnedCmd,
     ns: NsId,
     proto: Protocol,
-    args: Vec<Vec<u8>>,
     /// The frame's program mark (ADR-0115), carried to the pump.
     program: bool,
 }
 
-/// One fabric-origin PUBLISH parked at the owner cell.
+/// One fabric-origin PUBLISH parked at the owner cell: its origin is its
+/// deque's, and its frame `[channel, payload]` or `[channel, payload,
+/// conn, seq]` one flat copy (ADR-0177 D6). The publisher tag `(conn, seq)`
+/// is the origin's (ADR-0101 D1/D2): opaque here, echoed on the origin
+/// cell's fan leg only.
 pub(super) struct OwnerPub {
-    origin: CellId,
     token: FabricToken,
-    channel: Vec<u8>,
-    payload: Vec<u8>,
-    /// The publisher tag `(conn, seq)` as the origin sent it (ADR-0101
-    /// D1/D2): opaque here, echoed on the origin cell's fan leg only.
-    tag: Option<(Vec<u8>, Vec<u8>)>,
+    frame: OwnedCmd,
 }
+
+impl OwnerPub {
+    fn channel(&self) -> &[u8] {
+        self.frame.arg(0)
+    }
+
+    fn payload(&self) -> &[u8] {
+        self.frame.arg(1)
+    }
+
+    /// The publisher tag, when the frame carries one.
+    fn tag(&self) -> Option<(&[u8], &[u8])> {
+        (self.frame.argc() == 4).then(|| (self.frame.arg(2), self.frame.arg(3)))
+    }
+}
+
+/// One origin's `always` verdict slot (ADR-0177 D3, D6): a placeholder from
+/// before the apply's first effect, then the reply that waits for this
+/// cell's fsync watermark to cover its `seq`.
+pub(super) enum Gated {
+    Placeholder,
+    Verdict(GatedVerdict),
+}
+
+/// A gated reply: the fabric token it answers, its record's `seq`, and its
+/// bytes and outcome (ADR-0190 D1), the bytes behind one pointer.
+pub(super) struct GatedVerdict {
+    token: FabricToken,
+    seq: u64,
+    reply: Box<[u8]>,
+    outcome: ReplyOutcome,
+}
+
+impl GatedVerdict {
+    /// The verdict of `reply`, gated on `seq`. A buffer exactly its bytes
+    /// (a reply detached from FABRIC-IN's scratch) becomes the verdict's
+    /// without a copy; a larger one (a pump's pooled buffer) is copied once,
+    /// exact, and goes back to the cell's pool.
+    fn new<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        shared: &Shared<O, F>,
+        token: FabricToken,
+        seq: u64,
+        reply: OwnedReply,
+    ) -> GatedVerdict {
+        let outcome = reply.outcome();
+        let buf = reply.into_bytes();
+        let bytes = if buf.len() == buf.capacity() {
+            buf.into_boxed_slice()
+        } else {
+            let exact = Box::<[u8]>::from(buf.as_slice());
+            shared.recycle_reply_buf(buf);
+            exact
+        };
+        GatedVerdict { token, seq, reply: bytes, outcome }
+    }
+
+    fn parked_bytes(&self) -> u64 {
+        self.reply.len() as u64
+    }
+}
+
+impl Parked for NsApply {
+    fn parked_bytes(&self) -> u64 {
+        self.args.len_bytes()
+    }
+
+    fn waits(&self) -> bool {
+        true
+    }
+}
+
+impl Parked for OwnerPub {
+    fn parked_bytes(&self) -> u64 {
+        self.frame.len_bytes()
+    }
+
+    fn waits(&self) -> bool {
+        true
+    }
+}
+
+impl Parked for Gated {
+    fn parked_bytes(&self) -> u64 {
+        match self {
+            Gated::Placeholder => 0,
+            Gated::Verdict(verdict) => verdict.parked_bytes(),
+        }
+    }
+
+    /// A placeholder is its apply's, still running; a verdict waits for the
+    /// `gated` task.
+    fn waits(&self) -> bool {
+        match self {
+            Gated::Placeholder => false,
+            Gated::Verdict(_) => true,
+        }
+    }
+}
+
+// ADR-0177 D6: a peer's `d` entries fit one deque's backing at the ceiling of
+// credits, so each entry stays within `PARKED_ENTRY_BYTES_MAX`.
+const _: () = assert!(core::mem::size_of::<NsApply>() <= crate::limits::PARKED_ENTRY_BYTES_MAX);
+const _: () = assert!(core::mem::size_of::<OwnerPub>() <= crate::limits::PARKED_ENTRY_BYTES_MAX);
+const _: () = assert!(core::mem::size_of::<Gated>() <= crate::limits::PARKED_ENTRY_BYTES_MAX);
 
 #[allow(clippy::disallowed_types, reason = "container: A")]
 pub(super) struct Conn {
@@ -245,14 +355,6 @@ pub(super) struct Conn {
 pub(super) struct ConnKey {
     slot: u32,
     generation: u32,
-}
-
-/// One owner-side `always` reply deferred on the fsync watermark.
-pub(super) struct GatedReply {
-    to: CellId,
-    token: FabricToken,
-    seq: u64,
-    reply: OwnedReply,
 }
 
 #[allow(clippy::disallowed_types, reason = "container: E")]
@@ -320,9 +422,11 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// Pub/sub registries (M1-S10): local subscriber lists, owner-side
     /// per-cell counts, the replicated pattern index.
     pubsub: RefCell<PubSubCell<ConnKey>>,
-    /// Fabric-origin PUBLISHes awaiting this cell's owner pump (FIFO — the
-    /// queue preserves per-publisher delivery order across fan-outs).
-    pub_queue: RefCell<VecDeque<OwnerPub>>,
+    /// Fabric-origin PUBLISHes awaiting this cell's owner pump: per origin,
+    /// FIFO, so per-publisher delivery order holds across fan-outs (a
+    /// publisher's frames come from one origin); the pump takes the origins
+    /// in rotation (ADR-0177 D6).
+    owner_pubs: RefCell<PeerDeques<OwnerPub>>,
     pub_pump_active: Cell<bool>,
     /// The cell's one publish-fan reserve (ADR-0192 D3): parked here while
     /// no owner pump runs; the pump takes it at its start and puts it back
@@ -358,19 +462,21 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// M4.5-S27 (ADR-0083 D1): flat durable-namespace applies join the
     /// same per-origin queue under staging pressure — pacing instead of
     /// the owner-side `-BUSY` refusal — and whenever the pump already
-    /// holds this origin's work (FIFO = apply order). Bounded by the
-    /// origins' fabric windows, never a new unbounded queue.
-    ns_applies: RefCell<Vec<VecDeque<NsApply>>>,
+    /// holds this origin's work (FIFO = apply order). Each origin's deque
+    /// is over its data credits `d` (ADR-0177 D6).
+    ns_applies: RefCell<PeerDeques<NsApply>>,
     ns_pump_active: RefCell<Vec<bool>>,
-    /// Gated `always` verdicts the apply pumps produced (M4.5-S29):
-    /// each is a fabric reply awaiting this cell's fsync watermark. The
-    /// pump queues the verdict and moves on — holding its FIFO across the
-    /// durability wait serialized every fabric origin to one write per
-    /// fsync (the S29 flat-scaling defect). FABRIC-IN drains this into
-    /// the same deferred-reply futures the synchronous drain spawns
-    /// (ADR-0015 D6 — the client-visible ack still never precedes this
-    /// cell's fsync). Bounded by the origins' fabric windows.
-    pump_gated: RefCell<VecDeque<GatedReply>>,
+    /// Gated `always` verdicts, per origin in `seq` order (ADR-0177 D3,
+    /// D6): an apply, inline or on its origin's pump, takes a placeholder
+    /// before its first effect and fills it with its verdict, then moves on
+    /// (holding the FIFO across the durability wait serialized every origin
+    /// to one write per fsync, M4.5-S29). The one `gated` task publishes
+    /// every verdict the watermark covers (ADR-0015 D6: the client-visible
+    /// ack never precedes this cell's fsync).
+    gated: RefCell<PeerDeques<Gated>>,
+    /// The `gated` task is made on demand and runs until no verdict waits;
+    /// FABRIC-IN makes it when a verdict waits and it is not running.
+    gated_pump_active: Cell<bool>,
     /// Node control-thread handle (id allocation + catalog persistence).
     control: RefCell<Option<Arc<ControlHandle>>>,
     /// DDL pumps parked on catalog persistence (ADR-0015 D3).
@@ -734,6 +840,9 @@ pub enum PlaneBuildError {
     Seed(inf_store::NsError),
     /// The timer assembly was refused.
     Timers(TimerAssemblyError),
+    /// A per-origin deque was refused (ADR-0177 D6): the mesh's credits
+    /// past their ceiling, or the allocator.
+    Parked(inf_foundation::bounded::CapError),
 }
 
 impl core::fmt::Display for PlaneBuildError {
@@ -743,6 +852,7 @@ impl core::fmt::Display for PlaneBuildError {
             // refusal's `Debug`, which names the variant and its fields.
             PlaneBuildError::Seed(refused) => write!(f, "{refused:?}"),
             PlaneBuildError::Timers(refused) => write!(f, "{refused}"),
+            PlaneBuildError::Parked(refused) => write!(f, "a per-origin deque: {refused}"),
         }
     }
 }
@@ -762,10 +872,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// ADR-0154 D1, ADR-0189 D4).
     ///
     /// # Errors
-    /// The seed's refusal or the timer assembly's: no plane, `node`
-    /// unwritten, and what was built dropped while the census assembles.
-    /// The timer assembly's is derived never on a correct build but for the
-    /// allocator's refusal.
+    /// The seed's refusal, the timer assembly's or a per-origin deque's: no
+    /// plane, `node` unwritten, and what was built dropped while the census
+    /// assembles. The timer assembly's is derived never on a correct build
+    /// but for the allocator's refusal; a deque's, but for the allocator's
+    /// and a mesh past `FABRIC_CREDITS_PER_PEER_MAX` that no mesh check
+    /// passed.
     #[allow(clippy::too_many_arguments)] // construction-time wiring, not an API surface
     #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new(
@@ -781,6 +893,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let (census, serve_mark) = CapCensus::new(cell);
         let store = seed.build(&census).map_err(PlaneBuildError::Seed)?;
         let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
+        let parked = ParkedDeques::build(cell, cells, fabric.data_credits(), &census)
+            .map_err(PlaneBuildError::Parked)?;
         node.cell.set(cell.0);
         node.cells.set(cells);
         node.cap_census.replace(Some(Rc::clone(&census)));
@@ -817,7 +931,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 adopted: RefCell::new(Vec::new()),
                 adopt_acks: RefCell::new(Vec::new()),
                 pubsub: RefCell::new(PubSubCell::new(cells)),
-                pub_queue: RefCell::new(VecDeque::new()),
+                owner_pubs: RefCell::new(parked.owner_pubs),
                 pub_pump_active: Cell::new(false),
                 fan_reserve: Cell::new(Some(fan_reserve)),
                 knobs: Cell::new(knobs),
@@ -825,9 +939,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 durable: RefCell::new(None),
                 census,
                 tier: RefCell::new(None),
-                ns_applies: RefCell::new((0..cells).map(|_| VecDeque::new()).collect::<Vec<_>>()),
+                ns_applies: RefCell::new(parked.ns_applies),
                 ns_pump_active: RefCell::new(vec![false; usize::from(cells)]),
-                pump_gated: RefCell::new(VecDeque::new()),
+                gated: RefCell::new(parked.gated),
+                gated_pump_active: Cell::new(false),
                 control: RefCell::new(None),
                 ddl_waiters: WaitList::new(),
                 ckpt_waiters: WaitList::new(),

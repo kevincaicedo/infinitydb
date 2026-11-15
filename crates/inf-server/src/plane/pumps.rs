@@ -1,8 +1,14 @@
-//! Maintenance pumps: namespace apply (flat and tiered), the shadow-slot
-//! settle pump (ADR-0093), and the compaction pump — each a resumable
-//! future that yields between bounded slices (L6).
+//! Maintenance pumps: namespace apply (flat and tiered), the `gated` task
+//! that publishes `always` verdicts (ADR-0177 D3), the shadow-slot settle
+//! pump (ADR-0093), and the compaction pump — each a resumable future that
+//! yields between bounded slices (L6).
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
 use super::*;
+use crate::limits::GATED_REPLIES_PER_POLL;
 
 /// One origin cell's namespace-apply pump (M4-S26; generalized by
 /// M4.5-S27): applies arrive in fabric FIFO order and execute strictly
@@ -16,94 +22,123 @@ pub(super) async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clo
     shared: Rc<Shared<O, F>>,
     origin: u16,
 ) {
+    let from = CellId(origin);
     loop {
         let next = {
             let mut queues = shared.ns_applies.borrow_mut();
-            let item = queues[usize::from(origin)].pop_front();
+            let item = queues.pop_front(from, &shared.node);
             if item.is_none() {
                 shared.ns_pump_active.borrow_mut()[usize::from(origin)] = false;
             }
             item
         };
         let Some(item) = next else { return };
-        let argv: Vec<&[u8]> = item.args.iter().map(Vec::as_slice).collect();
-        // A scattered `DBSIZE` leg (the origin's `Counted` shape): this
-        // cell's exact count as a typed integer — the tiered drain runs
-        // here, on the pump, exactly as a local `DBSIZE` would — or the
-        // drain's error reply, tagged from its outcome (ADR-0190 D3), for
-        // the origin to relay.
-        if argv.len() == 1 && argv[0].eq_ignore_ascii_case(b"DBSIZE") {
-            let origin_cell = ExecOrigin::Fabric(CellId(origin));
-            match ns_dbsize_local(&shared, origin_cell, item.ns, item.proto).await {
-                Ok(n) => {
-                    shared.fabric.borrow_mut().reply(CellId(origin), item.token, &Outcome::Int(n));
-                }
-                Err(reply) => {
-                    shared.fabric.borrow_mut().reply(
-                        CellId(origin),
-                        item.token,
-                        &wire_reply(reply.bytes(), reply.outcome()),
-                    );
-                    shared.recycle_reply_buf(reply.into_bytes());
-                }
+        apply_parked(&shared, from, &item).await;
+        shared.recycle_cmd_buf(item.args.into_buf());
+    }
+}
+
+/// One parked apply of `from`'s, on its pump: the scattered `DBSIZE` leg,
+/// an ordinary apply, or a tiered one, whose verdict, when it is an
+/// `always` write's, waits in the origin's gated deque (ADR-0177 D3).
+async fn apply_parked<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    from: CellId,
+    item: &NsApply,
+) {
+    let origin = from.0;
+    let argv = item.args.slices();
+    // A scattered `DBSIZE` leg (the origin's `Counted` shape): this
+    // cell's exact count as a typed integer — the tiered drain runs
+    // here, on the pump, exactly as a local `DBSIZE` would — or the
+    // drain's error reply, tagged from its outcome (ADR-0190 D3), for
+    // the origin to relay.
+    if argv.len() == 1 && argv[0].eq_ignore_ascii_case(b"DBSIZE") {
+        let origin_cell = ExecOrigin::Fabric(from);
+        match ns_dbsize_local(shared, origin_cell, item.ns, item.proto).await {
+            Ok(n) => {
+                shared.fabric.borrow_mut().reply(from, item.token, &Outcome::Int(n));
             }
-            continue;
-        }
-        // Flat durable applies ride the same FIFO under staging pressure
-        // (M4.5-S27, ADR-0083 D1); the tier is re-resolved here because
-        // the owner stays authoritative and DDL can retier a namespace
-        // while an apply is queued. A keyspace-level command on a tiered
-        // namespace takes the ordinary path here exactly as it does on
-        // the connection's cell (`keyspace_level` — ADR-0108).
-        let ordinary = !shared.store.borrow().is_tiered(item.ns)
-            || lookup(argv[0]).is_some_and(|meta| keyspace_level(meta, &argv));
-        if ordinary {
-            apply_flat_one(&shared, origin, item.ns, &argv, item.proto, item.token, item.program)
-                .await;
-            continue;
-        }
-        match apply_tiered_one(&shared, origin, item.ns, &argv, item.proto).await {
-            tiered::TieredReply::Done(reply) => {
+            Err(reply) => {
                 shared.fabric.borrow_mut().reply(
-                    CellId(origin),
+                    from,
                     item.token,
                     &wire_reply(reply.bytes(), reply.outcome()),
                 );
                 shared.recycle_reply_buf(reply.into_bytes());
             }
-            // M4.5-S29: the durability wait leaves the pump. Holding the
-            // FIFO across it serialized each origin to one `always` write
-            // per fsync window — the flat-scaling defect. Staging already
-            // happened (in FIFO order, no await since), so apply order is
-            // intact; the reply ships from FABRIC-IN's deferred-reply
-            // future once the watermark covers `seq`, and the origin
-            // matches it by token — per-connection reply order is the
-            // origin's pending-FIFO's job, not this queue's.
-            tiered::TieredReply::Gated { reply, seq } => {
-                shared
-                    .durable
-                    .borrow_mut()
-                    .as_mut()
-                    .expect("tiered implies the durable plane")
-                    .note_gated_ack();
-                shared.pump_gated.borrow_mut().push_back(GatedReply {
-                    to: CellId(origin),
-                    token: item.token,
-                    seq,
-                    reply,
-                });
-            }
+        }
+        return;
+    }
+    // Flat durable applies ride the same FIFO under staging pressure
+    // (M4.5-S27, ADR-0083 D1); the tier is re-resolved here because
+    // the owner stays authoritative and DDL can retier a namespace
+    // while an apply is queued. A keyspace-level command on a tiered
+    // namespace takes the ordinary path here exactly as it does on
+    // the connection's cell (`keyspace_level` — ADR-0108).
+    let ordinary = !shared.store.borrow().is_tiered(item.ns)
+        || lookup(argv[0]).is_some_and(|meta| keyspace_level(meta, &argv));
+    if ordinary {
+        apply_flat_one(shared, origin, item.ns, &argv, item.proto, item.token, item.program).await;
+        return;
+    }
+    // The verdict's slot before the tiered apply's first effect, held
+    // across its cold reads (ADR-0177 D6).
+    let placeholder = match shared.gate_placeholder(from, item.ns, &argv) {
+        Ok(placeholder) => placeholder,
+        Err(ParkedFull) => return refuse_parked(shared, from, item.token),
+    };
+    match apply_tiered_one(shared, origin, item.ns, &argv, item.proto).await {
+        tiered::TieredReply::Done(reply) => {
+            shared.gate_cancel(placeholder);
+            shared.fabric.borrow_mut().reply(
+                from,
+                item.token,
+                &wire_reply(reply.bytes(), reply.outcome()),
+            );
+            shared.recycle_reply_buf(reply.into_bytes());
+        }
+        // M4.5-S29: the durability wait leaves the pump. Holding the
+        // FIFO across it serialized each origin to one `always` write
+        // per fsync window — the flat-scaling defect. Staging already
+        // happened (in FIFO order, no await since), so apply order is
+        // intact; the `gated` task ships the reply once the watermark
+        // covers `seq`, and the origin matches it by token —
+        // per-connection reply order is the origin's pending-FIFO's job,
+        // not this queue's.
+        tiered::TieredReply::Gated { reply, seq } => {
+            shared
+                .durable
+                .borrow_mut()
+                .as_mut()
+                .expect("tiered implies the durable plane")
+                .note_gated_ack();
+            let verdict = GatedVerdict::new(shared, item.token, seq, reply);
+            shared.gate_fill(from, placeholder, verdict);
         }
     }
+}
+
+/// An op whose verdict a full gated deque refused before any effect:
+/// answered `Refused`, the cross-cell error its client reads (derived
+/// never, ADR-0177 D6).
+fn refuse_parked<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    from: CellId,
+    token: FabricToken,
+) {
+    shared.fabric.borrow_mut().reply(from, token, &staged_outcome(&[], &StagedReply::Refused));
 }
 
 /// One fabric-origin flat-namespace apply on the pump (M4.5-S27,
 /// ADR-0083 D1): admission parks on `drained` — pacing, the same shape
 /// the local pump has always had — and on admission success execution
 /// and staging run with no await between, so apply order is the pump's
-/// FIFO. A gated `always` verdict queues for FABRIC-IN's deferred-reply
-/// spawn exactly like the tiered arm (ADR-0082: never awaited in FIFO
-/// custody). `execute_ns_owned` counts the gated ack itself.
+/// FIFO. A gated `always` verdict fills the placeholder it took before
+/// that effect, for the `gated` task, exactly like the tiered arm
+/// (ADR-0082: never awaited in FIFO custody); a parked attempt gives its
+/// placeholder back before it waits. `execute_ns_owned` counts the gated
+/// ack itself.
 async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: u16,
@@ -113,13 +148,18 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     token: FabricToken,
     program: bool,
 ) {
+    let from = CellId(origin);
     loop {
+        let placeholder = match shared.gate_placeholder(from, ns, argv) {
+            Ok(placeholder) => placeholder,
+            Err(ParkedFull) => return refuse_parked(shared, from, token),
+        };
         let mut reply = OpenReply::new(shared.take_reply_buf());
-        let applied =
-            shared.execute_ns_owned(CellId(origin), argv, proto, ns, program, reply.reply());
+        let applied = shared.execute_ns_owned(from, argv, proto, ns, program, reply.reply());
         let reply = reply.finish();
         match applied {
             NsApplyOutcome::Park => {
+                shared.gate_cancel(placeholder);
                 shared.recycle_reply_buf(reply.into_bytes());
                 let wait = {
                     let mut durable = shared.durable.borrow_mut();
@@ -130,21 +170,85 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 wait.await;
             }
             NsApplyOutcome::Reply => {
+                shared.gate_cancel(placeholder);
                 let outcome = wire_reply(reply.bytes(), reply.outcome());
-                shared.fabric.borrow_mut().reply(CellId(origin), token, &outcome);
+                shared.fabric.borrow_mut().reply(from, token, &outcome);
                 shared.recycle_reply_buf(reply.into_bytes());
                 return;
             }
             NsApplyOutcome::Gated(seq) => {
-                shared.pump_gated.borrow_mut().push_back(GatedReply {
-                    to: CellId(origin),
-                    token,
-                    seq,
-                    reply,
-                });
+                let verdict = GatedVerdict::new(shared, token, seq, reply);
+                shared.gate_fill(from, placeholder, verdict);
                 return;
             }
         }
+    }
+}
+
+/// The cell's `gated` task (ADR-0177 D3): it publishes every verdict this
+/// cell's fsync watermark covers, front by front in each origin's `seq`
+/// order and the origins in rotation, at most `GATED_REPLIES_PER_POLL` a
+/// poll, then yields; with verdicts above the watermark it awaits the
+/// smallest of them (a later fill only adds a larger `seq`, its effect
+/// having run after); with none it ends, and FABRIC-IN makes it again when
+/// a verdict waits. ADR-0015 D6: the client-visible ack never precedes
+/// this cell's fsync. One task holds one watermark wait, never one a
+/// verdict.
+pub(super) async fn gated_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: Rc<Shared<O, F>>,
+) {
+    loop {
+        let watermark =
+            shared.durable.borrow().as_ref().map(|durable| durable.ack_gate.watermark());
+        // A verdict is gated only by a durable plane; without one nothing
+        // waits, as the deques read.
+        let Some(watermark) = watermark else {
+            debug_assert!(
+                !shared.gated.borrow().waits(),
+                "a gated verdict implies a durable plane"
+            );
+            shared.gated_pump_active.set(false);
+            return;
+        };
+        let (published, pending) = {
+            let mut gated = shared.gated.borrow_mut();
+            let mut fabric = shared.fabric.borrow_mut();
+            gated.take_covered(watermark, GATED_REPLIES_PER_POLL, &shared.node, |to, verdict| {
+                fabric.reply(to, verdict.token, &wire_reply(&verdict.reply, verdict.outcome));
+            })
+        };
+        if published == GATED_REPLIES_PER_POLL {
+            YieldOnce::default().await;
+            continue;
+        }
+        let Some(seq) = pending else {
+            shared.gated_pump_active.set(false);
+            return;
+        };
+        let wait = shared.durable.borrow().as_ref().map(|durable| durable.ack_gate.waiter(seq));
+        if let Some(wait) = wait {
+            wait.await;
+        }
+    }
+}
+
+/// Yields once: the task wakes itself and returns `Pending`, so the
+/// executor polls it again behind every task already queued.
+#[derive(Default)]
+struct YieldOnce {
+    yielded: bool,
+}
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.yielded {
+            return Poll::Ready(());
+        }
+        self.yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 

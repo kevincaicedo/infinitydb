@@ -476,6 +476,11 @@ fn tripwires_section(
     // Derived never: a fan leg that found no reserved credit (cell scope).
     let refused = node.fabric_reserve_refused_cell.get();
     push(text, &format!("fabric_reserve_refused_cell:{refused}"));
+    // The work parked for peers (ADR-0177 D6): bytes now, their high water
+    // and the ops refused at a full deque, derived never (cell scope).
+    push(text, &format!("fabric_parked_bytes:{}", node.fabric_parked_bytes.get()));
+    push(text, &format!("fabric_parked_bytes_max:{}", node.fabric_parked_bytes_max.get()));
+    push(text, &format!("fabric_parked_refused:{}", node.fabric_parked_refused.get()));
     push(text, &format!("pubsub_delivered:{}", node.pubsub_delivered.get()));
     push(text, &format!("pubsub_state_bytes:{}", node.pubsub_state_bytes.get()));
     push(text, &format!("{}:{}", tw::WIRE_BUFFERS_BYTES, node.wire_buffers_bytes.get()));

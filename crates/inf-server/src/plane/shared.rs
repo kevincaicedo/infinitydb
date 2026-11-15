@@ -29,6 +29,59 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         }
     }
 
+    /// The placeholder an apply of `argv` to `ns` from `origin` takes
+    /// before its first effect (ADR-0177 D6): a write to an `always`
+    /// namespace, the verdicts `execute_ns_owned` and the tiered writes
+    /// gate on this cell's watermark, so `Ok(None)` for every other apply.
+    /// A namespace's fsync class is fixed at its creation, so the reading
+    /// holds across the apply's suspensions. `Err` at a full deque.
+    pub(super) fn gate_placeholder(
+        &self,
+        origin: CellId,
+        ns: NsId,
+        argv: &[&[u8]],
+    ) -> Result<Option<GatedPlaceholder>, ParkedFull> {
+        let always = self.store.borrow().ns_fsync_class(ns) == Some(FsyncClass::Always);
+        let write = argv
+            .first()
+            .and_then(|name| lookup(name))
+            .is_some_and(|meta| meta.flags.contains(CmdFlags::WRITE));
+        if !(always && write) {
+            return Ok(None);
+        }
+        self.gated.borrow_mut().placeholder(origin, &self.node).map(Some)
+    }
+
+    /// The apply was gated: `verdict` takes its placeholder's place. With no
+    /// placeholder (a write the reading above called not gated, derived
+    /// never) it is kept at the back, where its `seq` order allows it.
+    pub(super) fn gate_fill(
+        &self,
+        origin: CellId,
+        placeholder: Option<GatedPlaceholder>,
+        verdict: GatedVerdict,
+    ) {
+        debug_assert!(
+            placeholder.is_some(),
+            "a gated write took its placeholder before its effect"
+        );
+        let mut gated = self.gated.borrow_mut();
+        match placeholder {
+            Some(placeholder) => gated.fill(placeholder, verdict, &self.node),
+            None => {
+                let kept = gated.publish_with(origin, &self.node, || Gated::Verdict(verdict));
+                debug_assert!(kept.is_ok(), "an origin's gated deque holds its un-replied ops");
+            }
+        }
+    }
+
+    /// The apply was not gated: its placeholder, if it took one, goes.
+    pub(super) fn gate_cancel(&self, placeholder: Option<GatedPlaceholder>) {
+        if let Some(placeholder) = placeholder {
+            self.gated.borrow_mut().cancel(placeholder, &self.node);
+        }
+    }
+
     pub(super) fn with_conn<R>(&self, key: ConnKey, f: impl FnOnce(&mut Conn) -> R) -> Option<R> {
         self.conns.borrow_mut().get_mut(key).map(f)
     }
@@ -994,4 +1047,444 @@ fn tier_from_fan(bytes: &[u8]) -> Result<Option<inf_store::TierSpec>, inf_store:
     };
     tier.validate().map_err(NsError::InvalidTierConfig)?;
     Ok(Some(tier))
+}
+
+// ---- work parked for a peer (ADR-0177 D3, D6) ---------------------------------
+
+/// A parked entry: the request or reply bytes behind it (lengths, not
+/// capacities, as `fabric_parked_bytes` sums them), and whether it is work
+/// a task owes, where a placeholder is its own apply's, still running.
+pub(super) trait Parked {
+    fn parked_bytes(&self) -> u64;
+    fn waits(&self) -> bool;
+}
+
+/// A full per-origin deque: the op is answered `Refused` before any effect
+/// and `fabric_parked_refused` counts it. Derived never: every entry holds an
+/// un-replied data op of its origin, which has at most `d`.
+#[derive(Debug)]
+pub(super) struct ParkedFull;
+
+/// One `CappedDeque` per peer, each over the peer's data credits `d`
+/// (ADR-0177 D6), indexed by origin; a cell parks nothing for itself. Every
+/// entry enters through [`PeerDeques::publish_with`] and leaves through a
+/// pop, each of which moves the cell's `fabric_parked_bytes` by the entry's
+/// bytes, so the gauge is the deques' sum by construction; `waiting` counts
+/// the entries of every origin that wait for a task, so whether any does
+/// is one load.
+pub(super) struct PeerDeques<T> {
+    cell: CellId,
+    deques: Vec<CappedDeque<T, Reserve>>,
+    waiting: usize,
+    /// The origin `pop_rotating` reads first.
+    rotation: usize,
+}
+
+impl<T: Parked> PeerDeques<T> {
+    /// A deque of `cap` for each of the `cells − 1` peers of `cell`, each
+    /// on the cell's census (one row, `cap`'s name).
+    pub(super) fn new(
+        cell: CellId,
+        cells: u16,
+        cap: Cap,
+        census: &Rc<CapCensus>,
+    ) -> Result<PeerDeques<T>, CapError> {
+        let peers = usize::from(cells.saturating_sub(1));
+        let mut deques = Vec::new();
+        deques.try_reserve_exact(peers).map_err(|_| CapError::Alloc)?;
+        for _ in 0..peers {
+            deques.push(CappedDeque::new(cap, census)?);
+        }
+        Ok(PeerDeques { cell, deques, waiting: 0, rotation: 0 })
+    }
+
+    /// The deque of `origin`: cells below this one keep their id, cells
+    /// above it shift down by one.
+    fn index(&self, origin: CellId) -> usize {
+        debug_assert_ne!(origin, self.cell, "a cell parks no work for itself");
+        let id = usize::from(origin.0);
+        if origin.0 > self.cell.0 { id - 1 } else { id }
+    }
+
+    fn origin(&self, index: usize) -> CellId {
+        let id = u16::try_from(index).unwrap_or(u16::MAX);
+        if id >= self.cell.0 { CellId(id + 1) } else { CellId(id) }
+    }
+
+    /// Whether an entry of some origin waits for a task.
+    pub(super) fn waits(&self) -> bool {
+        self.waiting > 0
+    }
+
+    /// Whether `origin` has no entry parked.
+    pub(super) fn is_empty_for(&self, origin: CellId) -> bool {
+        self.deques[self.index(origin)].is_empty()
+    }
+
+    /// Entries parked for `origin`.
+    #[cfg(test)]
+    pub(super) fn len_for(&self, origin: CellId) -> usize {
+        self.deques[self.index(origin)].len()
+    }
+
+    /// Origins with an entry parked, in id order: at most `cells − 1`.
+    pub(super) fn origins_waiting(&self) -> impl Iterator<Item = CellId> + '_ {
+        (0..self.deques.len()).filter(|&i| !self.deques[i].is_empty()).map(|i| self.origin(i))
+    }
+
+    /// Reserves `origin`'s next entry, then builds it with `make`, so
+    /// nothing is copied for an op a full deque refuses. `Full` changes
+    /// nothing but `fabric_parked_refused` and the row's crossings.
+    pub(super) fn publish_with(
+        &mut self,
+        origin: CellId,
+        node: &NodeState,
+        make: impl FnOnce() -> T,
+    ) -> Result<(), ParkedFull> {
+        let index = self.index(origin);
+        match self.deques[index].reserve() {
+            Reserved::Slot(slot) => {
+                let entry = make();
+                parked_added(node, entry.parked_bytes());
+                self.waiting += usize::from(entry.waits());
+                slot.publish(entry);
+                Ok(())
+            }
+            Reserved::Full => {
+                node.fabric_parked_refused.set(node.fabric_parked_refused.get() + 1);
+                Err(ParkedFull)
+            }
+        }
+    }
+
+    /// `origin`'s oldest entry, its bytes subtracted from the gauge.
+    pub(super) fn pop_front(&mut self, origin: CellId, node: &NodeState) -> Option<T> {
+        let index = self.index(origin);
+        let entry = self.deques[index].pop_front()?;
+        self.popped(node, &entry);
+        Some(entry)
+    }
+
+    /// `origin`'s newest entry, its bytes subtracted from the gauge.
+    pub(super) fn pop_back(&mut self, origin: CellId, node: &NodeState) -> Option<T> {
+        let index = self.index(origin);
+        let entry = self.deques[index].pop_back()?;
+        self.popped(node, &entry);
+        Some(entry)
+    }
+
+    /// The oldest entry of the first origin with one, from the rotation's
+    /// cursor: at most `cells − 1` origins read, and the cursor moves past
+    /// the one served, so every origin is served in turn.
+    pub(super) fn pop_rotating(&mut self, node: &NodeState) -> Option<(CellId, T)> {
+        let peers = self.deques.len();
+        for step in 0..peers {
+            let index = (self.rotation + step) % peers;
+            if let Some(entry) = self.deques[index].pop_front() {
+                self.rotation = (index + 1) % peers;
+                self.popped(node, &entry);
+                return Some((self.origin(index), entry));
+            }
+        }
+        None
+    }
+
+    fn popped(&mut self, node: &NodeState, entry: &T) {
+        if entry.waits() {
+            debug_assert!(self.waiting > 0, "a waiting entry was counted");
+            self.waiting = self.waiting.saturating_sub(1);
+        }
+        parked_removed(node, entry.parked_bytes());
+    }
+}
+
+/// `bytes` more parked on the cell: the gauge and its high water.
+fn parked_added(node: &NodeState, bytes: u64) {
+    let now = node.fabric_parked_bytes.get() + bytes;
+    node.fabric_parked_bytes.set(now);
+    if now > node.fabric_parked_bytes_max.get() {
+        node.fabric_parked_bytes_max.set(now);
+    }
+}
+
+/// `bytes` fewer parked on the cell.
+fn parked_removed(node: &NodeState, bytes: u64) {
+    let now = node.fabric_parked_bytes.get();
+    debug_assert!(now >= bytes, "the gauge holds every parked entry's bytes");
+    node.fabric_parked_bytes.set(now.saturating_sub(bytes));
+}
+
+/// The three per-origin deques a plane parks its peers' work in (ADR-0177
+/// D6), built with the plane, before anything serves, on its census.
+pub(super) struct ParkedDeques {
+    pub(super) ns_applies: PeerDeques<NsApply>,
+    pub(super) owner_pubs: PeerDeques<OwnerPub>,
+    pub(super) gated: PeerDeques<Gated>,
+}
+
+impl ParkedDeques {
+    /// Each deque of each peer over the mesh's `data_credits`.
+    pub(super) fn build(
+        cell: CellId,
+        cells: u16,
+        data_credits: u32,
+        census: &Rc<CapCensus>,
+    ) -> Result<ParkedDeques, CapError> {
+        let cap = |ceiling: &Cap| crate::limits::per_origin(ceiling, data_credits);
+        Ok(ParkedDeques {
+            ns_applies: PeerDeques::new(cell, cells, cap(&crate::limits::NS_APPLIES)?, census)?,
+            owner_pubs: PeerDeques::new(cell, cells, cap(&crate::limits::OWNER_PUBS)?, census)?,
+            gated: PeerDeques::new(cell, cells, cap(&crate::limits::GATED_VERDICTS)?, census)?,
+        })
+    }
+}
+
+/// The proof that its holder published the placeholder at the back of
+/// `origin`'s gated deque, before its apply's first effect; consumed by
+/// [`PeerDeques::fill`] or [`PeerDeques::cancel`]. It holds no borrow, so it
+/// crosses the apply's suspension; the back stays its own there because an
+/// origin has one apply in progress at a time (the divert rule).
+#[must_use = "a placeholder is filled with its verdict or cancelled"]
+pub(super) struct GatedPlaceholder {
+    origin: CellId,
+}
+
+impl PeerDeques<Gated> {
+    /// Publishes a placeholder at the back of `origin`'s deque.
+    pub(super) fn placeholder(
+        &mut self,
+        origin: CellId,
+        node: &NodeState,
+    ) -> Result<GatedPlaceholder, ParkedFull> {
+        self.publish_with(origin, node, || Gated::Placeholder)?;
+        Ok(GatedPlaceholder { origin })
+    }
+
+    /// The apply was gated: its placeholder becomes `verdict`, which the
+    /// `gated` task publishes once the watermark covers its `seq`.
+    pub(super) fn fill(
+        &mut self,
+        placeholder: GatedPlaceholder,
+        verdict: GatedVerdict,
+        node: &NodeState,
+    ) {
+        let index = self.index(placeholder.origin);
+        // An origin has one apply in progress at a time, so its placeholder
+        // is the back of its deque (E11).
+        debug_assert!(
+            matches!(self.deques[index].back(), Some(Gated::Placeholder)),
+            "a filled placeholder is the back of its origin's deque"
+        );
+        let bytes = verdict.parked_bytes();
+        if let Some(back @ Gated::Placeholder) = self.deques[index].back_mut() {
+            *back = Gated::Verdict(verdict);
+            parked_added(node, bytes);
+            self.waiting += 1;
+            return;
+        }
+        // Past a broken E11 the verdict is still kept, at the back, which its
+        // `seq` order allows: its effect ran after every earlier one.
+        let kept = self.publish_with(placeholder.origin, node, || Gated::Verdict(verdict));
+        debug_assert!(kept.is_ok(), "an origin's gated deque holds its un-replied ops");
+    }
+
+    /// The apply was not gated (a reply, a park or a refusal): its
+    /// placeholder goes, and the deque is as it was before the apply.
+    pub(super) fn cancel(&mut self, placeholder: GatedPlaceholder, node: &NodeState) {
+        let taken = self.pop_back(placeholder.origin, node);
+        debug_assert!(
+            matches!(taken, Some(Gated::Placeholder)),
+            "a cancelled placeholder is the back of its origin's deque"
+        );
+    }
+
+    /// Pops every verdict at a front that `watermark` covers, at most
+    /// `budget`, from the rotation's cursor, handing each to `publish` with
+    /// its origin; returns how many it published and the smallest `seq` of
+    /// a verdict left at a front. A placeholder holds its origin's queue:
+    /// nothing behind it is reached (it is always the back).
+    pub(super) fn take_covered(
+        &mut self,
+        watermark: u64,
+        budget: usize,
+        node: &NodeState,
+        mut publish: impl FnMut(CellId, GatedVerdict),
+    ) -> (usize, Option<u64>) {
+        let peers = self.deques.len();
+        let mut published = 0;
+        let mut pending: Option<u64> = None;
+        for step in 0..peers {
+            let index = (self.rotation + step) % peers;
+            while let Some(Gated::Verdict(front)) = self.deques[index].front() {
+                let covered = front.seq <= watermark;
+                if !covered {
+                    pending = Some(pending.map_or(front.seq, |seq| seq.min(front.seq)));
+                    break;
+                }
+                if published == budget {
+                    self.rotation = index;
+                    return (published, pending);
+                }
+                let origin = self.origin(index);
+                if let Some(Gated::Verdict(verdict)) = self.pop_front(origin, node) {
+                    publish(origin, verdict);
+                    published += 1;
+                }
+            }
+        }
+        (published, pending)
+    }
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "test-only: the std model the per-origin deques are checked against"
+)]
+#[cfg(test)]
+mod parked_tests {
+    use std::collections::VecDeque;
+
+    use inf_foundation::rng::{Entropy, SplitMix64};
+
+    use super::*;
+
+    /// A parked entry of `self.0` bytes, waiting.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Bytes(u64);
+
+    impl Parked for Bytes {
+        fn parked_bytes(&self) -> u64 {
+            self.0
+        }
+
+        fn waits(&self) -> bool {
+            true
+        }
+    }
+
+    fn deques<T: Parked>(cell: u16, cells: u16, entries: u32) -> PeerDeques<T> {
+        let (census, _serve_mark) = CapCensus::new(CellId(cell));
+        let cap = crate::limits::per_origin(&crate::limits::NS_APPLIES, entries).expect("cap");
+        PeerDeques::new(CellId(cell), cells, cap, &census).expect("built")
+    }
+
+    fn verdict(seq: u64, bytes: usize) -> GatedVerdict {
+        GatedVerdict {
+            token: FabricToken(seq),
+            seq,
+            reply: vec![b'+'; bytes].into_boxed_slice(),
+            outcome: ReplyOutcome::Success,
+        }
+    }
+
+    /// Every peer has its own deque and the cell none; the rotation serves
+    /// each origin in turn; a full deque refuses before it builds the entry
+    /// and counts the refusal; the gauge moves by each entry's bytes.
+    #[test]
+    fn each_peer_has_a_deque_served_in_rotation_and_a_full_one_builds_nothing() {
+        let node = NodeState::default();
+        let mut parked = deques::<Bytes>(1, 4, 2);
+        assert!(!parked.waits());
+        for origin in [0u16, 2, 3, 0] {
+            parked
+                .publish_with(CellId(origin), &node, || Bytes(u64::from(origin) + 10))
+                .expect("room");
+        }
+        assert_eq!(node.fabric_parked_bytes.get(), 10 + 12 + 13 + 10);
+        assert_eq!(parked.origins_waiting().collect::<Vec<_>>(), [CellId(0), CellId(2), CellId(3)]);
+        let full = parked.publish_with(CellId(0), &node, || panic!("a full deque builds nothing"));
+        assert!(full.is_err());
+        assert_eq!(node.fabric_parked_refused.get(), 1);
+        let order: Vec<u16> = core::iter::from_fn(|| parked.pop_rotating(&node))
+            .map(|(origin, _)| origin.0)
+            .collect();
+        assert_eq!(order, [0, 2, 3, 0], "origins in turn, each in arrival order");
+        assert!(!parked.waits());
+        assert_eq!(node.fabric_parked_bytes.get(), 0, "every pop subtracted its bytes");
+        assert_eq!(node.fabric_parked_bytes_max.get(), 45, "the high water stays");
+    }
+
+    /// A seeded history of publishes and pops at both ends against one
+    /// `VecDeque` per origin: after every op the entries, the gauge (the
+    /// models' byte sum) and its high water agree.
+    #[test]
+    fn a_seeded_history_keeps_the_gauge_at_the_models_byte_sum() {
+        for seed in 0..32 {
+            let node = NodeState::default();
+            let mut parked = deques::<Bytes>(2, 5, 3);
+            let mut model: Vec<VecDeque<u64>> = vec![VecDeque::new(); 5];
+            let (mut high, mut refused) = (0u64, 0u64);
+            let mut rng = SplitMix64::new(seed);
+            for _ in 0..400 {
+                let origin = [0u16, 1, 3, 4][rng.next_below(4) as usize];
+                let queue = &mut model[usize::from(origin)];
+                match rng.next_below(4) {
+                    0 | 1 => {
+                        let bytes = rng.next_below(64);
+                        let took =
+                            parked.publish_with(CellId(origin), &node, || Bytes(bytes)).is_ok();
+                        assert_eq!(took, queue.len() < 3, "seed {seed}");
+                        if took {
+                            queue.push_back(bytes);
+                        } else {
+                            refused += 1;
+                        }
+                    }
+                    2 => {
+                        let got = parked.pop_front(CellId(origin), &node).map(|b| b.0);
+                        assert_eq!(got, queue.pop_front(), "seed {seed}");
+                    }
+                    _ => {
+                        let got = parked.pop_back(CellId(origin), &node).map(|b| b.0);
+                        assert_eq!(got, queue.pop_back(), "seed {seed}");
+                    }
+                }
+                let sum: u64 = model.iter().flatten().sum();
+                high = high.max(sum);
+                assert_eq!(node.fabric_parked_bytes.get(), sum, "seed {seed}");
+                assert_eq!(node.fabric_parked_bytes_max.get(), high, "seed {seed}");
+                assert_eq!(parked.waits(), model.iter().any(|q| !q.is_empty()), "seed {seed}");
+            }
+            assert_eq!(node.fabric_parked_refused.get(), refused, "seed {seed}");
+        }
+    }
+
+    /// The gated deque (ADR-0177 D3, D6): a placeholder waits for nothing,
+    /// fills with its verdict or goes; the watermark publishes each
+    /// origin's covered fronts in `seq` order and stops at a placeholder;
+    /// the smallest uncovered front is the one awaited; a budget ends a
+    /// pass with the rest left.
+    #[test]
+    fn gated_verdicts_publish_under_the_watermark_in_seq_order() {
+        let node = NodeState::default();
+        let mut gated = deques::<Gated>(1, 3, 4);
+        let first = gated.placeholder(CellId(0), &node).expect("room");
+        assert!(!gated.waits(), "a placeholder is its apply's, still running");
+        gated.fill(first, verdict(5, 10), &node);
+        let other = gated.placeholder(CellId(2), &node).expect("room");
+        gated.fill(other, verdict(3, 7), &node);
+        let running = gated.placeholder(CellId(0), &node).expect("room");
+        assert_eq!(node.fabric_parked_bytes.get(), 17, "a placeholder is no bytes");
+        let mut sent = Vec::new();
+        let (published, pending) =
+            gated.take_covered(4, 1_024, &node, |to, v| sent.push((to.0, v.seq)));
+        assert_eq!((published, pending, sent.as_slice()), (1, Some(5), &[(2u16, 3u64)][..]));
+        let (published, pending) =
+            gated.take_covered(9, 1_024, &node, |to, v| sent.push((to.0, v.seq)));
+        assert_eq!((published, pending), (1, None), "the placeholder holds origin 0's queue");
+        assert_eq!(sent, [(2, 3), (0, 5)]);
+        gated.cancel(running, &node);
+        assert!(!gated.waits());
+        assert_eq!(node.fabric_parked_bytes.get(), 0);
+        for seq in [10, 11, 12] {
+            let slot = gated.placeholder(CellId(2), &node).expect("room");
+            gated.fill(slot, verdict(seq, 1), &node);
+        }
+        let (published, _) = gated.take_covered(u64::MAX, 2, &node, |_, _| {});
+        assert_eq!(published, 2, "the budget ends the pass");
+        let (published, pending) =
+            gated.take_covered(u64::MAX, 2, &node, |_, v| assert_eq!(v.seq, 12));
+        assert_eq!((published, pending), (1, None));
+        assert_eq!(node.fabric_parked_refused.get(), 0);
+    }
 }
