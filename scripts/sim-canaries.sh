@@ -1572,11 +1572,15 @@ scenario_row() {
 # whatever the table's order. The removal is the root's own,
 # target_root_remove: a directory directly below this checkout's root that
 # holds no work tree and no other root, the walk of ADR-0204 D2.
-seen_cfgs=" " cfg_order=() grouped=()
+seen_cfgs=" "
+cfg_order=() grouped=()
 for row in "${rows[@]}"; do
   case "$seen_cfgs" in
     *" ${row%% *} "*) ;;
-    *) cfg_order+=("${row%% *}") seen_cfgs="$seen_cfgs${row%% *} " ;;
+    *)
+      cfg_order+=("${row%% *}")
+      seen_cfgs="$seen_cfgs${row%% *} "
+      ;;
   esac
 done
 for row_cfg in "${cfg_order[@]}"; do
