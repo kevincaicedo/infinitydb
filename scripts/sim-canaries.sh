@@ -57,8 +57,10 @@
 # A row's label, `<cfg> <kind> <subject>`, heads every line about it (one
 # cfg owns many rows): the kind `crate-test`, `loom` or `scenario`, the
 # subject the test's name, or the scenario and its flags. Every row is read
-# before the first build: a wrong arity for its kind, an empty feature list
-# or a target neither `lib` nor `test:NAME` is a scope error.
+# before the first build: a cfg that is not `inf_canary_<name>`, the name of
+# letters, digits and `_` (the cfg names the row's planted directory), a
+# wrong arity for its kind, an empty feature list or a target neither `lib`
+# nor `test:NAME` is a scope error.
 # A run that exits 0 and judged nothing is neither caught nor NOT CAUGHT:
 # a crate test or Loom model with no verdict line for its test (cargo built
 # no such test on this host), a scenario whose log has a line beginning
@@ -72,8 +74,11 @@
 # its ring) is named as io_uring unavailable on this host.
 # A row's red never stops another: every build and run of every kind is
 # judged, and the lane's verdict waits for the last row.
-# A planted cfg builds in `target/canary-<cfg>`, which goes once its last
-# row is judged, or at exit when a signal stops the run; SIGKILL leaves it.
+# Rows run grouped by cfg, each cfg at its first row's place in the table
+# and its rows in the table's order, so the output's order is not the
+# table's; each row keeps its own verdict. A planted cfg builds in
+# `target/canary-<cfg>`, which goes once its last row is judged, or at exit
+# when a signal stops the run; SIGKILL leaves it.
 # CARGO_ENCODED_RUSTFLAGS is unset for the whole lane: cargo reads it before
 # RUSTFLAGS, so a set one would drop every plant's `--cfg` without a word.
 # Usage: scripts/sim-canaries.sh [seed]
