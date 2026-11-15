@@ -738,6 +738,43 @@ fn close_posts_no_recv_after_closed() {
     drop(client);
 }
 
+/// A close ends the receive on the shipped ring, deferred task work
+/// included: the client's 64 bytes wait in the socket before the receive
+/// is armed, and the receive and the `Close` ride one enter after the
+/// write, so the receive's first attempt finds the bytes and posts them,
+/// then the close's cancel ends it, and the driver dispatches the reap in
+/// the ring's order. The ring is the environment's, so the degraded leg
+/// reads the oneshot receive.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+#[test]
+fn close_with_receive_posts_no_recv_after_closed() {
+    let mut rig = Rig::new(8);
+    let mut client = rig.connect();
+    let conn = rig.accept_one(&client);
+    multishot_receive(&rig);
+    let recv = recv_token(5);
+    let close = CompletionToken::new(TokenClass::Close, 5, 0);
+    client.write_all(&[0x5A; 64]).expect("client write");
+    wait_readable(conn);
+    rig.driver.push(IoOp::RecvArm { fd: conn, token: recv });
+    rig.driver.push(IoOp::Close { fd: conn, token: close });
+    let seen = events_through_closed(&mut rig, recv, close);
+    judge_close_order(&seen);
+    assert_eq!(rig.pool.reconcile(), Ok(()), "every buffer returned");
+    drop(client);
+}
+
+/// Waits, at most 5 s, until `fd` has bytes to read: the client's write
+/// is in the server's socket before the test arms a receive.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+fn wait_readable(fd: i32) {
+    let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    // SAFETY: `poll` is one valid, initialized pollfd that outlives the call.
+    let ready = unsafe { libc::poll(&mut poll, 1, 5_000) };
+    assert_eq!(ready, 1, "the client's bytes reached the server's socket in 5 s");
+    assert_ne!(poll.revents & libc::POLLIN, 0, "readable: {:#x}", poll.revents);
+}
+
 /// The end of stream ends the receive, on every backend (ADR-0196 A1.3): no
 /// `Recv` follows the zero-length one for the token while the fd stays
 /// open (`recv-after-eof`), and the half-closed peer still reads what the
