@@ -5,15 +5,25 @@
 //!
 //! - `harness`: the loop and a step that stores its key and returns, the
 //!   share every rate leg carries.
-//! - `map-get-0`, `-6`, `-9`, `-14`: on the capped map the fixed stores
-//!   build on, a get of one live key in a map of 2^d even keys, a perfect
-//!   tree of depth d (one key at 0: the root leaf).
-//! - `map-admit-remove-empty`, `-6`, `-9`, `-14`: an admit of a vacant odd
-//!   key between two live ones (the split at its neighbour's leaf; at
-//!   `empty`, the map's first key), its publish and its remove.
+//! - `map-get-0`, `-1`, `-2`, `-6`, `-9`, `-14`: on the capped map the fixed
+//!   stores build on, a get of one live key in a map of 2^d even keys, a
+//!   perfect tree of depth d (one key at 0: the root leaf).
+//! - `map-admit-remove-empty`, `-1`, `-2`, `-6`, `-9`, `-14`: an admit of a
+//!   vacant odd key between two live ones (the split at its neighbour's
+//!   leaf; at `empty`, the map's first key), its publish and its remove.
+//! - `map-get-pair-first-1`, `-9`, `-14`, `map-get-pair-second-1`, `-9`,
+//!   `-14`, `map-admit-remove-pair-first-1`, `map-admit-remove-pair-second-1`:
+//!   the same on a map of 128-bit keys, a pair of words, the rate key in the
+//!   first word and zero in the second, or the reverse, so every split tests
+//!   a bit of that word.
 //! - `slab-cycle`, `slab-get`: on a capped slab of 256 queued-request-sized
 //!   slots (120 B) holding 255, a reserve, publish and take, or a get
 //!   through a held handle.
+//! - `slab-get-retire`, `slab-get-mut`, `slab-cycle-retire`: the same slots
+//!   on a slab of the executor's task slabs' generation and policy (a `u64`
+//!   that retires its slot at the last value), a get, a `get_mut` or a
+//!   cycle; and their `-2` twins on 16,448 slots holding 16,447, the fewest
+//!   past one directory level's 16,384, so every op walks a second level.
 //! - `hash-get-6`, `-9`, `-14`, `hash-insert-remove-6`, `-9`, `-14`: on the
 //!   per-file pin table of the host before its fixed stores (std's map under
 //!   the host's integer hasher, the hash of every key it holds), a probe of
@@ -27,9 +37,10 @@ use std::hint::black_box;
 use std::rc::Rc;
 
 use inf_foundation::bounded::{
-    Admission, Built, Cap, CapCensus, CapFill, CappedMap, CappedSlab, Lookup, MapBuilt,
-    SlabReserved, SlotId, Taken, WrapWithProof,
+    Admission, Built, Cap, CapCensus, CapFill, CappedMap, CappedSlab, ExactKey, Lookup, LookupMut,
+    MapBuilt, Retire, SlabReserved, SlotId, Taken, WrapWithProof,
 };
+use inf_foundation::limits::{MAP_CHUNK_SLOTS_MAX, MAP_DIRECTORY_CHILDREN_MAX};
 use inf_foundation::{BuildIntHasher, CellId, FileOffset};
 use inf_runtime::{CompletionToken, TokenClass};
 
@@ -43,12 +54,37 @@ pub enum RateLeg {
     MapGet { depth: u32 },
     MapAdmitRemove { depth: u32 },
     MapAdmitRemoveEmpty,
+    PairGet { depth: u32, word: PairWord },
+    PairAdmitRemove { depth: u32, word: PairWord },
     SlabCycle,
     SlabGet,
+    RetireSlab { op: RetireOp, levels: SlabLevels },
     HashGet { depth: u32 },
     HashInsertRemove { depth: u32 },
     DequePushOrPop,
     VecPushOrPop,
+}
+
+/// The word of a pair key that holds the rate key: the other word is zero.
+#[derive(Clone, Copy)]
+pub enum PairWord {
+    First,
+    Second,
+}
+
+/// The operation a retiring slab's leg drives.
+#[derive(Clone, Copy)]
+pub enum RetireOp {
+    Get,
+    GetMut,
+    Cycle,
+}
+
+/// The directory levels of a retiring slab's leg: one, or two.
+#[derive(Clone, Copy)]
+pub enum SlabLevels {
+    One,
+    Two,
 }
 
 /// The rate legs' loop: `ops` steps over the keys `2 · (op & mask)`, with
@@ -76,8 +112,11 @@ pub fn drive<const NOPS: u8>(leg: RateLeg, ops: u64) -> u64 {
         RateLeg::MapGet { depth } => drive_map::<NOPS>(Some(depth), false, ops),
         RateLeg::MapAdmitRemove { depth } => drive_map::<NOPS>(Some(depth), true, ops),
         RateLeg::MapAdmitRemoveEmpty => drive_map::<NOPS>(None, true, ops),
+        RateLeg::PairGet { depth, word } => drive_pair::<NOPS>(depth, word, false, ops),
+        RateLeg::PairAdmitRemove { depth, word } => drive_pair::<NOPS>(depth, word, true, ops),
         RateLeg::SlabCycle => drive_slab::<NOPS>(true, ops),
         RateLeg::SlabGet => drive_slab::<NOPS>(false, ops),
+        RateLeg::RetireSlab { op, levels } => drive_retire_slab::<NOPS>(op, levels, ops),
         RateLeg::HashGet { depth } => drive_hash::<NOPS>(depth, false, ops),
         RateLeg::HashInsertRemove { depth } => drive_hash::<NOPS>(depth, true, ops),
         RateLeg::DequePushOrPop => drive_deque::<NOPS>(ops),
@@ -102,22 +141,30 @@ fn drive_harness<const NOPS: u8>(ops: u64) -> u64 {
 
 /// The map legs' caps: their live keys and the one the admit leg adds.
 const MAP_0: Cap = Cap::entries::<2>("bench-map-0", CapFill::Serving);
+const MAP_1: Cap = Cap::entries::<3>("bench-map-1", CapFill::Serving);
+const MAP_2: Cap = Cap::entries::<5>("bench-map-2", CapFill::Serving);
 const MAP_6: Cap = Cap::entries::<65>("bench-map-6", CapFill::Serving);
 const MAP_9: Cap = Cap::entries::<513>("bench-map-9", CapFill::Serving);
 const MAP_14: Cap = Cap::entries::<16_385>("bench-map-14", CapFill::Serving);
 
-/// A map of the 2^`depth` even keys below 2^(`depth` + 1), a perfect tree of
-/// depth `depth`, or an empty map at `None`, built by steps before the loop.
-fn even_keys(depth: Option<u32>) -> (CappedMap<u64, u32>, Rc<CapCensus>) {
+/// A map of the 2^`depth` even keys below 2^(`depth` + 1), each as `key_of`
+/// makes it, a perfect tree of depth `depth`, or an empty map at `None`,
+/// built by steps before the loop.
+fn even_keys<K: ExactKey>(
+    depth: Option<u32>,
+    key_of: impl Fn(u64) -> K,
+) -> (CappedMap<K, u32>, Rc<CapCensus>) {
     let cap = match depth {
         None | Some(0) => MAP_0,
+        Some(1) => MAP_1,
+        Some(2) => MAP_2,
         Some(6) => MAP_6,
         Some(9) => MAP_9,
         Some(14) => MAP_14,
         Some(other) => unreachable!("no map leg at depth {other}"),
     };
     let (census, _serve_mark) = CapCensus::new(CellId(0));
-    let mut builder = CappedMap::<u64, u32>::builder(cap, &census).expect("registered");
+    let mut builder = CappedMap::<K, u32>::builder(cap, &census).expect("registered");
     let mut map = loop {
         match builder.step() {
             MapBuilt::More(next) => builder = next,
@@ -127,19 +174,19 @@ fn even_keys(depth: Option<u32>) -> (CappedMap<u64, u32>, Rc<CapCensus>) {
     };
     let live = depth.map_or(0, |depth| 1u64 << depth);
     for key in (0..2 * live).step_by(2) {
-        let Admission::Vacant(slot) = map.admit(key) else { panic!("a fresh key") };
+        let Admission::Vacant(slot) = map.admit(key_of(key)) else { panic!("a fresh key") };
         slot.publish(1);
     }
     (map, census)
 }
 
 #[inline(never)]
-fn step_map_get(map: &mut CappedMap<u64, u32>, key: u64) -> u64 {
+fn step_map_get<K: ExactKey>(map: &mut CappedMap<K, u32>, key: K) -> u64 {
     map.get(key).copied().map_or(0, u64::from)
 }
 
 #[inline(never)]
-fn step_map_admit_remove(map: &mut CappedMap<u64, u32>, key: u64) -> u64 {
+fn step_map_admit_remove<K: ExactKey>(map: &mut CappedMap<K, u32>, key: K) -> u64 {
     let Admission::Vacant(slot) = map.admit(key) else { panic!("a vacant key") };
     slot.publish(2);
     map.remove(key).map_or(0, u64::from)
@@ -149,14 +196,35 @@ fn step_map_admit_remove(map: &mut CappedMap<u64, u32>, key: u64) -> u64 {
 /// beside one (the map's first key on the empty map), the keys walked in
 /// turn.
 fn drive_map<const NOPS: u8>(depth: Option<u32>, admit: bool, ops: u64) -> u64 {
-    let (mut map, _census) = even_keys(depth);
+    drive_map_of::<NOPS, u64>(depth, admit, ops, |key| key)
+}
+
+/// The same on a map of pair keys, the rate key in `word`.
+fn drive_pair<const NOPS: u8>(depth: u32, word: PairWord, admit: bool, ops: u64) -> u64 {
+    match word {
+        PairWord::First => {
+            drive_map_of::<NOPS, (u64, u64)>(Some(depth), admit, ops, |key| (key, 0))
+        }
+        PairWord::Second => {
+            drive_map_of::<NOPS, (u64, u64)>(Some(depth), admit, ops, |key| (0, key))
+        }
+    }
+}
+
+fn drive_map_of<const NOPS: u8, K: ExactKey>(
+    depth: Option<u32>,
+    admit: bool,
+    ops: u64,
+    key_of: impl Fn(u64) -> K + Copy,
+) -> u64 {
+    let (mut map, _census) = even_keys(depth, key_of);
     let live = map.len();
     let mask = depth.map_or(0, |depth| (1u64 << depth) - 1);
     let map = black_box(&mut map);
     let accumulator = if admit {
-        rate_loop::<NOPS>(ops, mask, |key| step_map_admit_remove(map, key + 1))
+        rate_loop::<NOPS>(ops, mask, |key| step_map_admit_remove(map, key_of(key + 1)))
     } else {
-        rate_loop::<NOPS>(ops, mask, |key| step_map_get(map, key))
+        rate_loop::<NOPS>(ops, mask, |key| step_map_get(map, key_of(key)))
     };
     // Engagement, after the counted loop: every op found or placed its key
     // and the map holds its live keys alone.
@@ -224,6 +292,93 @@ fn drive_slab<const NOPS: u8>(cycle: bool, ops: u64) -> u64 {
     // slab holds its occupants alone.
     assert_eq!(accumulator, ops, "every op reached its slot");
     assert_eq!(slab.len(), 255, "the slab holds its occupants");
+    accumulator
+}
+
+/// The executor's task slabs' instantiation, at the intent slot's payload,
+/// so a twin of the slab legs differs from its `u32` leg in the generation's
+/// width and policy alone.
+type RetireSlab = CappedSlab<IntentSlot, u64, Retire>;
+const RETIRE_256: Cap = Cap::entries::<256>("bench-retire-256", CapFill::Serving);
+/// 257 chunks of 64: the fewest slots past one directory level's.
+const RETIRE_16448: Cap = Cap::entries::<16_448>("bench-retire-16448", CapFill::Serving);
+
+/// The slots one directory level covers: its children's chunks.
+const ONE_LEVEL_SLOTS: usize = MAP_CHUNK_SLOTS_MAX * MAP_DIRECTORY_CHILDREN_MAX;
+// The one-level legs' slab is one directory over its chunks and the `-2`
+// legs' slab two, so each op of a `-2` leg walks one link more than its
+// twin's: a smaller cap does not compile.
+const _: () = assert!(RETIRE_256.entries_max() as usize > MAP_CHUNK_SLOTS_MAX);
+const _: () = assert!(RETIRE_256.entries_max() as usize <= ONE_LEVEL_SLOTS);
+const _: () = assert!(RETIRE_16448.entries_max() as usize > ONE_LEVEL_SLOTS);
+const _: () =
+    assert!(RETIRE_16448.entries_max() as usize <= ONE_LEVEL_SLOTS * MAP_DIRECTORY_CHILDREN_MAX);
+
+/// A retiring slab of `cap` holding all but one slot, built by steps before
+/// the loop, and the handle of its first occupant.
+fn retire_slab(cap: Cap) -> (RetireSlab, SlotId<u64>, Rc<CapCensus>) {
+    let (census, _serve_mark) = CapCensus::new(CellId(0));
+    let mut builder = RetireSlab::builder(cap, &census).expect("registered");
+    let mut slab = loop {
+        match builder.step() {
+            Built::More(next) => builder = next,
+            Built::Live(slab) => break slab,
+            Built::Refused(_, refused) => panic!("{refused}"),
+        }
+    };
+    let mut first = None;
+    for value in 0..u64::from(cap.entries_max() - 1) {
+        let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
+        let id = slot.publish([value; 15]);
+        first.get_or_insert(id);
+    }
+    (slab, first.expect("an occupant"), census)
+}
+
+#[inline(never)]
+fn step_slab_cycle_retire(slab: &mut RetireSlab, key: u64) -> u64 {
+    let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
+    let id = slot.publish([key; 15]);
+    match slab.take(id) {
+        Taken::Value(value) => u64::from(value[14] == key),
+        Taken::Stale | Taken::Vacant => panic!("the slot just published"),
+    }
+}
+
+#[inline(never)]
+fn step_slab_get_retire(slab: &mut RetireSlab, id: SlotId<u64>) -> u64 {
+    match slab.get(id) {
+        Lookup::Live(value) => value[14] + 1,
+        Lookup::Stale | Lookup::Vacant => panic!("a live occupant"),
+    }
+}
+
+#[inline(never)]
+fn step_slab_get_mut(slab: &mut RetireSlab, id: SlotId<u64>) -> u64 {
+    match slab.get_mut(id) {
+        LookupMut::Live(value) => value[14] + 1,
+        LookupMut::Stale | LookupMut::Vacant => panic!("a live occupant"),
+    }
+}
+
+/// A reserve, publish and take of the retiring slab's one free slot, or a
+/// get or a `get_mut` of its first occupant, at one or two levels.
+fn drive_retire_slab<const NOPS: u8>(op: RetireOp, levels: SlabLevels, ops: u64) -> u64 {
+    let cap = match levels {
+        SlabLevels::One => RETIRE_256,
+        SlabLevels::Two => RETIRE_16448,
+    };
+    let (mut slab, first, _census) = retire_slab(cap);
+    let slab = black_box(&mut slab);
+    let accumulator = match op {
+        RetireOp::Get => rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get_retire(slab, first)),
+        RetireOp::GetMut => rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get_mut(slab, first)),
+        RetireOp::Cycle => rate_loop::<NOPS>(ops, MASK_14, |key| step_slab_cycle_retire(slab, key)),
+    };
+    // Engagement, after the counted loop: every op reached its slot and the
+    // slab holds its occupants alone.
+    assert_eq!(accumulator, ops, "every op reached its slot");
+    assert_eq!(slab.len(), cap.entries_max() - 1, "the slab holds its occupants");
     accumulator
 }
 

@@ -124,7 +124,7 @@ use inf_runtime::{
 };
 
 use cold::{ColdReadConfig, ColdReads, ColdWait, ReadClass, TierFileId};
-use rates::RateLeg;
+use rates::{PairWord, RateLeg, RetireOp, SlabLevels};
 
 /// One pool buffer, the server's cold window: four 4 KiB frames.
 const BUFFER_BYTES: usize = 4 * inf_alloc::TIER_READ_ALIGN;
@@ -169,8 +169,30 @@ enum ReactorPlane {
     ServerLend,
 }
 
+/// The pair-key rate legs, by the word the rate key is in.
+const PAIR_GET_FIRST_1: RateLeg = RateLeg::PairGet { depth: 1, word: PairWord::First };
+const PAIR_GET_FIRST_9: RateLeg = RateLeg::PairGet { depth: 9, word: PairWord::First };
+const PAIR_GET_FIRST_14: RateLeg = RateLeg::PairGet { depth: 14, word: PairWord::First };
+const PAIR_ADMIT_FIRST_1: RateLeg = RateLeg::PairAdmitRemove { depth: 1, word: PairWord::First };
+const PAIR_GET_SECOND_1: RateLeg = RateLeg::PairGet { depth: 1, word: PairWord::Second };
+const PAIR_GET_SECOND_9: RateLeg = RateLeg::PairGet { depth: 9, word: PairWord::Second };
+const PAIR_GET_SECOND_14: RateLeg = RateLeg::PairGet { depth: 14, word: PairWord::Second };
+const PAIR_ADMIT_SECOND_1: RateLeg = RateLeg::PairAdmitRemove { depth: 1, word: PairWord::Second };
+
+/// The retiring slab's rate legs, by operation and directory levels.
+const RETIRE_GET_1: RateLeg = RateLeg::RetireSlab { op: RetireOp::Get, levels: SlabLevels::One };
+const RETIRE_GET_MUT_1: RateLeg =
+    RateLeg::RetireSlab { op: RetireOp::GetMut, levels: SlabLevels::One };
+const RETIRE_CYCLE_1: RateLeg =
+    RateLeg::RetireSlab { op: RetireOp::Cycle, levels: SlabLevels::One };
+const RETIRE_GET_2: RateLeg = RateLeg::RetireSlab { op: RetireOp::Get, levels: SlabLevels::Two };
+const RETIRE_GET_MUT_2: RateLeg =
+    RateLeg::RetireSlab { op: RetireOp::GetMut, levels: SlabLevels::Two };
+const RETIRE_CYCLE_2: RateLeg =
+    RateLeg::RetireSlab { op: RetireOp::Cycle, levels: SlabLevels::Two };
+
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 75] = [
+const LEGS: [(&str, Leg, u8); 111] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -212,6 +234,10 @@ const LEGS: [(&str, Leg, u8); 75] = [
     ("harness-plus-one", Leg::Rate(RateLeg::Harness), 1),
     ("map-get-0", Leg::Rate(RateLeg::MapGet { depth: 0 }), 0),
     ("map-get-0-plus-one", Leg::Rate(RateLeg::MapGet { depth: 0 }), 1),
+    ("map-get-1", Leg::Rate(RateLeg::MapGet { depth: 1 }), 0),
+    ("map-get-1-plus-one", Leg::Rate(RateLeg::MapGet { depth: 1 }), 1),
+    ("map-get-2", Leg::Rate(RateLeg::MapGet { depth: 2 }), 0),
+    ("map-get-2-plus-one", Leg::Rate(RateLeg::MapGet { depth: 2 }), 1),
     ("map-get-6", Leg::Rate(RateLeg::MapGet { depth: 6 }), 0),
     ("map-get-6-plus-one", Leg::Rate(RateLeg::MapGet { depth: 6 }), 1),
     ("map-get-9", Leg::Rate(RateLeg::MapGet { depth: 9 }), 0),
@@ -220,16 +246,48 @@ const LEGS: [(&str, Leg, u8); 75] = [
     ("map-get-14-plus-one", Leg::Rate(RateLeg::MapGet { depth: 14 }), 1),
     ("map-admit-remove-empty", Leg::Rate(RateLeg::MapAdmitRemoveEmpty), 0),
     ("map-admit-remove-empty-plus-one", Leg::Rate(RateLeg::MapAdmitRemoveEmpty), 1),
+    ("map-admit-remove-1", Leg::Rate(RateLeg::MapAdmitRemove { depth: 1 }), 0),
+    ("map-admit-remove-1-plus-one", Leg::Rate(RateLeg::MapAdmitRemove { depth: 1 }), 1),
+    ("map-admit-remove-2", Leg::Rate(RateLeg::MapAdmitRemove { depth: 2 }), 0),
+    ("map-admit-remove-2-plus-one", Leg::Rate(RateLeg::MapAdmitRemove { depth: 2 }), 1),
     ("map-admit-remove-6", Leg::Rate(RateLeg::MapAdmitRemove { depth: 6 }), 0),
     ("map-admit-remove-6-plus-one", Leg::Rate(RateLeg::MapAdmitRemove { depth: 6 }), 1),
     ("map-admit-remove-9", Leg::Rate(RateLeg::MapAdmitRemove { depth: 9 }), 0),
     ("map-admit-remove-9-plus-one", Leg::Rate(RateLeg::MapAdmitRemove { depth: 9 }), 1),
     ("map-admit-remove-14", Leg::Rate(RateLeg::MapAdmitRemove { depth: 14 }), 0),
     ("map-admit-remove-14-plus-one", Leg::Rate(RateLeg::MapAdmitRemove { depth: 14 }), 1),
+    ("map-get-pair-first-1", Leg::Rate(PAIR_GET_FIRST_1), 0),
+    ("map-get-pair-first-1-plus-one", Leg::Rate(PAIR_GET_FIRST_1), 1),
+    ("map-get-pair-first-9", Leg::Rate(PAIR_GET_FIRST_9), 0),
+    ("map-get-pair-first-9-plus-one", Leg::Rate(PAIR_GET_FIRST_9), 1),
+    ("map-get-pair-first-14", Leg::Rate(PAIR_GET_FIRST_14), 0),
+    ("map-get-pair-first-14-plus-one", Leg::Rate(PAIR_GET_FIRST_14), 1),
+    ("map-get-pair-second-1", Leg::Rate(PAIR_GET_SECOND_1), 0),
+    ("map-get-pair-second-1-plus-one", Leg::Rate(PAIR_GET_SECOND_1), 1),
+    ("map-get-pair-second-9", Leg::Rate(PAIR_GET_SECOND_9), 0),
+    ("map-get-pair-second-9-plus-one", Leg::Rate(PAIR_GET_SECOND_9), 1),
+    ("map-get-pair-second-14", Leg::Rate(PAIR_GET_SECOND_14), 0),
+    ("map-get-pair-second-14-plus-one", Leg::Rate(PAIR_GET_SECOND_14), 1),
+    ("map-admit-remove-pair-first-1", Leg::Rate(PAIR_ADMIT_FIRST_1), 0),
+    ("map-admit-remove-pair-first-1-plus-one", Leg::Rate(PAIR_ADMIT_FIRST_1), 1),
+    ("map-admit-remove-pair-second-1", Leg::Rate(PAIR_ADMIT_SECOND_1), 0),
+    ("map-admit-remove-pair-second-1-plus-one", Leg::Rate(PAIR_ADMIT_SECOND_1), 1),
     ("slab-cycle", Leg::Rate(RateLeg::SlabCycle), 0),
     ("slab-cycle-plus-one", Leg::Rate(RateLeg::SlabCycle), 1),
     ("slab-get", Leg::Rate(RateLeg::SlabGet), 0),
     ("slab-get-plus-one", Leg::Rate(RateLeg::SlabGet), 1),
+    ("slab-get-retire", Leg::Rate(RETIRE_GET_1), 0),
+    ("slab-get-retire-plus-one", Leg::Rate(RETIRE_GET_1), 1),
+    ("slab-get-mut", Leg::Rate(RETIRE_GET_MUT_1), 0),
+    ("slab-get-mut-plus-one", Leg::Rate(RETIRE_GET_MUT_1), 1),
+    ("slab-cycle-retire", Leg::Rate(RETIRE_CYCLE_1), 0),
+    ("slab-cycle-retire-plus-one", Leg::Rate(RETIRE_CYCLE_1), 1),
+    ("slab-get-retire-2", Leg::Rate(RETIRE_GET_2), 0),
+    ("slab-get-retire-2-plus-one", Leg::Rate(RETIRE_GET_2), 1),
+    ("slab-get-mut-2", Leg::Rate(RETIRE_GET_MUT_2), 0),
+    ("slab-get-mut-2-plus-one", Leg::Rate(RETIRE_GET_MUT_2), 1),
+    ("slab-cycle-retire-2", Leg::Rate(RETIRE_CYCLE_2), 0),
+    ("slab-cycle-retire-2-plus-one", Leg::Rate(RETIRE_CYCLE_2), 1),
     ("hash-get-6", Leg::Rate(RateLeg::HashGet { depth: 6 }), 0),
     ("hash-get-6-plus-one", Leg::Rate(RateLeg::HashGet { depth: 6 }), 1),
     ("hash-get-9", Leg::Rate(RateLeg::HashGet { depth: 9 }), 0),
