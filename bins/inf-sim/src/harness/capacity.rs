@@ -25,9 +25,9 @@ use inf_foundation::time::{Nanos, VirtualClock};
 use inf_foundation::{CellId, hash64};
 use inf_runtime::{CellLoop, LoopConfig};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane, StdSegmentFs};
-use inf_store::{KeyspaceSeed, SlotRouter, StoreConfig};
+use inf_store::{KeyspaceSeed, NsSpec, SlotRouter, StoreConfig};
 
-use super::{FROZEN_MESH, STEP_NS_FLOOR, node_hasher};
+use super::{FROZEN_MESH, STEP_NS_FLOOR, namespace_specs, node_hasher};
 use crate::driver::Violations;
 use crate::net::{CellNet, Plant, SimDriver, listener_fd};
 use crate::resp::reply_len;
@@ -77,11 +77,14 @@ pub enum CloseLeg {
     /// A held `DEL`, `QUIT` and 10 `SET`s in one buffer: the `DEL`'s count
     /// and the `QUIT`'s `+OK`, then the close; no `SET` runs.
     DeferredQuit,
+    /// `INF.NS USE`, 10 `SET`s, a malformed frame and 10 more in one buffer:
+    /// 11 `+OK`s, then the protocol error, then the close.
+    ProtocolOrder,
 }
 
 impl CloseLeg {
     /// Every leg, in the order the help text lists them.
-    pub const ALL: [CloseLeg; 15] = [
+    pub const ALL: [CloseLeg; 16] = [
         CloseLeg::Tasks,
         CloseLeg::Fan,
         CloseLeg::Close,
@@ -97,6 +100,7 @@ impl CloseLeg {
         CloseLeg::HalfCloseEofWithData,
         CloseLeg::HalfCloseReset,
         CloseLeg::DeferredQuit,
+        CloseLeg::ProtocolOrder,
     ];
 
     /// The legs red at this tree. Each runs in one ignored test of `reds`,
@@ -117,6 +121,7 @@ impl CloseLeg {
         CloseLeg::HalfClose,
         CloseLeg::HalfCloseEofWithData,
         CloseLeg::HalfCloseReset,
+        CloseLeg::ProtocolOrder,
     ];
 
     #[must_use]
@@ -137,6 +142,7 @@ impl CloseLeg {
             CloseLeg::HalfCloseEofWithData => "half-close-eof-with-data",
             CloseLeg::HalfCloseReset => "half-close-reset",
             CloseLeg::DeferredQuit => "deferred-quit",
+            CloseLeg::ProtocolOrder => "protocol-order",
         }
     }
 
@@ -195,6 +201,10 @@ const HALF_CLOSE_STEPS_MAX: u64 = 4_096;
 /// The pump's window of remote legs, and the queue's high water.
 const WINDOW: usize = 32;
 const HIGH_WATER: usize = 1_024;
+/// A cell's receive buffers: their count and their size, the most bytes one
+/// reap hands PARSE for one connection.
+const RECV_BUFFERS: usize = 128;
+const RECV_BUFFER_BYTES: usize = 1_024;
 
 /// One scripted client of the leg.
 #[derive(Debug, Default)]
@@ -240,6 +250,12 @@ impl Rig {
     /// Three cells, each with `maxclients` (0: the default) and the seeded
     /// step size.
     fn new(seed: u64, maxclients: u32, step_ns_max: u64) -> Rig {
+        Rig::with_namespaces(seed, maxclients, step_ns_max, &[])
+    }
+
+    /// The same, each cell's keyspace also holding `namespaces`, created
+    /// uncataloged at boot.
+    fn with_namespaces(seed: u64, maxclients: u32, step_ns_max: u64, namespaces: &[NsSpec]) -> Rig {
         let clock = Rc::new(VirtualClock::new(Nanos(1)));
         let mut cells = Vec::new();
         let mut nets = Vec::new();
@@ -256,7 +272,7 @@ impl Rig {
             }
             let seed_store = KeyspaceSeed::Uncataloged {
                 cfg: StoreConfig { hasher: node_hasher(seed), ..Default::default() },
-                specs: Vec::new(),
+                specs: namespaces.to_vec(),
             };
             let (plane, serve_mark, timer_set) = Plane::new(
                 CellId(cell),
@@ -271,7 +287,7 @@ impl Rig {
             .unwrap_or_else(|refused| panic!("cell {i}'s assembly refused: {refused}"));
             let config = LoopConfig { spin_iters: 4, ..Default::default() };
             let driver = SimDriver::new(Rc::clone(&net));
-            let pool = BufferPool::new(128, 1024);
+            let pool = BufferPool::new(RECV_BUFFERS, RECV_BUFFER_BYTES);
             let cell_loop =
                 CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark, timer_set);
             nets.push(net);
@@ -540,6 +556,7 @@ pub fn run_capacity_scenario(scenario: &CapacityScenario) -> CapacityReport {
         CloseLeg::HalfCloseEofWithData => half_close_leg(seed, true),
         CloseLeg::HalfCloseReset => half_close_reset_leg(seed),
         CloseLeg::DeferredQuit => deferred_quit_leg(seed),
+        CloseLeg::ProtocolOrder => protocol_order_leg(seed),
     };
     rig.report(leg)
 }
@@ -1208,6 +1225,90 @@ fn deferred_quit_leg(seed: u64) -> Rig {
     rig
 }
 
+/// A frame whose bulk length is not a number: a protocol error.
+const MALFORMED: &[u8] = b"*1\r\n$x\r\n";
+/// Its reply, Redis's text, after which the server closes the connection.
+const PROTOCOL_ERROR: &[u8] = b"-ERR Protocol error: invalid bulk length\r\n";
+
+/// `INF.NS USE` of a memory namespace, 10 `SET`s of keys cell 0 owns, a
+/// malformed frame and 10 more `SET`s, in one buffer. A namespace-bound
+/// connection's every command rides its pump, so PARSE meets the error while
+/// the pump owes the 11 replies before it. The client reads the 11 `+OK`s,
+/// then the error, then the close (`reply-order`); the first 10 land
+/// (`pre-error-unrun`) and the last 10 never run (`post-error-ran`).
+/// Engagement: the `SET`s before the error landed in the namespace, so they
+/// ran namespace-bound, else `VACUOUS protocol-order-unengaged`.
+fn protocol_order_leg(seed: u64) -> Rig {
+    const SETS: usize = 10;
+    let namespace = namespace_specs(1);
+    let name = namespace[0].name.clone();
+    let mut rig = Rig::with_namespaces(seed, 0, 15_000, &namespace);
+    let reader = rig.admitted(X);
+    let bound = rig.call(reader, &[b"INF.NS", b"USE", &name]) == b"+OK\r\n";
+    let client = rig.admitted(X);
+    let before = names_on(X, "po-before", SETS);
+    let after = names_on(X, "po-after", SETS);
+    let mut bytes = encode(&[b"INF.NS", b"USE", &name]);
+    bytes.extend(sets(&before));
+    bytes.extend_from_slice(MALFORMED);
+    bytes.extend(sets(&after));
+    rig.send_one_buffer(client, &bytes);
+    rig.until("the client's close", |rig| rig.ended(client));
+    rig.settle();
+    let mut owed = oks(SETS + 1);
+    owed.push(PROTOCOL_ERROR.to_vec());
+    rig.judge_order(client, 1, &owed, "the client");
+    let landed = rig.existing(reader, &before);
+    rig.read("landed", landed as u64);
+    let ran = rig.existing(reader, &after);
+    rig.read("post_error_ran", ran as u64);
+    if landed < SETS {
+        rig.violate(format!("pre-error-unrun: {landed} of the {SETS} SETs before the error ran"));
+    }
+    if ran > 0 {
+        rig.violate(format!("post-error-ran: {ran} of the {SETS} SETs behind the error ran"));
+    }
+    rig.expect_vacant(X, 1);
+    if !(bound && landed > 0) {
+        let text = "VACUOUS protocol-order-unengaged: no SET before the error ran namespace-bound";
+        rig.violate(text.to_string());
+    }
+    rig
+}
+
+impl Rig {
+    /// Sends `bytes` from client `id` as one receive buffer: the net hands
+    /// them to the server whole, at one reap, then goes back to its seeded
+    /// chunking.
+    fn send_one_buffer(&mut self, id: usize, bytes: &[u8]) {
+        let length = bytes.len();
+        assert!(length <= RECV_BUFFER_BYTES, "{length} bytes fit no receive buffer");
+        let cell = self.clients[id].cell;
+        let delivery = self.nets[cell].borrow_mut().deliver_whole();
+        self.send(id, bytes);
+        self.until("the buffer's reap", |rig| {
+            rig.nets[cell].borrow().unread(rig.fd(id)) == Some(0)
+        });
+        self.nets[cell].borrow_mut().restore_delivery(delivery);
+    }
+
+    /// The replies client `id` read after its first `skip` are exactly
+    /// `owed`, in order, else `reply-order`, naming the first that differs.
+    fn judge_order(&mut self, id: usize, skip: usize, owed: &[Vec<u8>], who: &str) {
+        let client = &self.clients[id];
+        let read = &client.replies[skip.min(client.replies.len())..];
+        let Some(at) = (0..read.len().max(owed.len())).find(|&n| read.get(n) != owed.get(n)) else {
+            return;
+        };
+        let text = |reply: Option<&Vec<u8>>| reply.map(|r| String::from_utf8_lossy(r).into_owned());
+        let (got, want) = (text(read.get(at)), text(owed.get(at)));
+        self.violate(format!(
+            "reply-order: {who}'s reply {at} of {} read {got:?}, owed {want:?}",
+            read.len()
+        ));
+    }
+}
+
 /// The legs of `CloseLeg::PINNED_RED`, one ignored test each, at the smoke
 /// seed.
 #[cfg(test)]
@@ -1312,5 +1413,12 @@ mod reds {
                 queue runs to its end after a reset"]
     fn the_half_close_reset_leg_runs_its_queue() {
         pinned_red(CloseLeg::HalfCloseReset);
+    }
+
+    #[test]
+    #[ignore = "PARSE writes a protocol error into the connection's output at once, ahead of the \
+                replies its pump still owes; red until PARSE queues its own replies behind them"]
+    fn the_protocol_order_leg_answers_the_error_after_its_owed_replies() {
+        pinned_red(CloseLeg::ProtocolOrder);
     }
 }
