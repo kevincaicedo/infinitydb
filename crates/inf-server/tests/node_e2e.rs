@@ -236,12 +236,14 @@ struct Node {
 type NsNames = std::collections::BTreeSet<Vec<u8>>;
 
 /// What a node is assembled with beyond its shape: the store configuration
-/// every cell's keyspace takes, and the log its cells' observers record into
-/// (`None`: they record nothing).
+/// every cell's keyspace takes, the log its cells' observers record into
+/// (`None`: they record nothing), and the boot capacity's `--maxclients`
+/// (`None`: the default, 10,000).
 #[derive(Clone, Default)]
 struct NodeExtras {
     store: StoreConfig,
     log: Option<ExecLog>,
+    maxclients: Option<u32>,
 }
 
 /// One command a cell executed, as its observer saw it: the cell, the cell a
@@ -362,6 +364,30 @@ impl Node {
         Node::start_with(cells, None, CkptTrigger::Manual)
     }
 
+    /// A volatile node of `cells` cells booted with `--maxclients`
+    /// `maxclients` (ADR-0123 A1).
+    fn start_maxclients(cells: u16, maxclients: u32) -> Node {
+        Node::start_cfg_default(
+            cells,
+            None,
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            Default::default(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            NodeExtras { maxclients: Some(maxclients), ..NodeExtras::default() },
+        )
+    }
+
     /// A volatile node of `cells` cells whose keyspaces take `store` and
     /// whose cells record every execution into the returned log.
     fn start_recorded(cells: u16, store: StoreConfig) -> (Node, ExecLog) {
@@ -393,7 +419,7 @@ impl Node {
             None,
             None,
             Vec::new(),
-            NodeExtras { store, log: Some(Arc::clone(&log)) },
+            NodeExtras { store, log: Some(Arc::clone(&log)), maxclients: None },
         );
         (node, log)
     }
@@ -917,7 +943,14 @@ impl Node {
                 let driver =
                     UringDriver::new(256, inf_runtime::UringConfig::from_lookup(std::env::var_os))
                         .expect("uring");
-                let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
+                let mut config = inf_server::ConfigStore::default();
+                if let Some(maxclients) = extras.maxclients {
+                    let cells = inf_foundation::CellCount::new(cells).expect("a node's cells");
+                    let capacity = inf_server::BootCapacity::new(maxclients, cells)
+                        .expect("a test node's boot capacity");
+                    config = config.with_boot_capacity(capacity);
+                }
+                let node = Rc::new(NodeInfo::try_new(config).expect("fixture cache allocation"));
                 node.process_board.replace(Some(process_board));
                 node.run_id.set(run_id);
                 *node.conn_default_ns.borrow_mut() = default_ns;
@@ -10334,6 +10367,41 @@ fn maxclients_refuses_the_next_connection_like_redis() {
     assert_closed(&mut refused, "refused connection");
     assert!(held.len() <= 2, "{} connections admitted under maxclients 2", held.len());
     drop(held);
+    node.stop();
+}
+
+/// ADR-0123 A1 at the wire, two cells: a node's connection slots are fixed
+/// at boot, so `CONFIG SET maxclients` above `--maxclients` is refused whole
+/// with A1's bytes and neither key of the pair changes, at `B` above the
+/// cell count (4) and below it (1, where each cell keeps one slot); a
+/// restart with a larger `--maxclients` takes the same raise.
+#[test]
+fn maxclients_past_the_boot_capacity_is_refused_whole_and_a_restart_takes_it() {
+    const REFUSAL: &[u8] = b"-ERR maxclients exceeds boot capacity; restart with --maxclients\r\n";
+    let get = |stream: &mut TcpStream, key: &str, value: &str| {
+        stream.write_all(&cmd(&[b"CONFIG", b"GET", key.as_bytes()])).expect("write");
+        let want = format!("*2\r\n${}\r\n{key}\r\n${}\r\n{value}\r\n", key.len(), value.len());
+        read_exactly(stream, want.as_bytes());
+    };
+    for boot in [4u32, 1] {
+        let node = Node::start_maxclients(2, boot);
+        let mut admin = node.connect();
+        let above = (boot + 1).to_string();
+        let raise =
+            [&b"CONFIG"[..], b"SET", b"maxclients", above.as_bytes(), b"maxmemory", b"100mb"];
+        admin.write_all(&cmd(&raise)).expect("write");
+        read_exactly(&mut admin, REFUSAL);
+        get(&mut admin, "maxclients", &boot.to_string());
+        get(&mut admin, "maxmemory", "0");
+        drop(admin);
+        node.stop();
+    }
+    let node = Node::start_maxclients(2, 8);
+    let mut admin = node.connect();
+    admin.write_all(&cmd(&[b"CONFIG", b"SET", b"maxclients", b"5"])).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    get(&mut admin, "maxclients", "5");
+    drop(admin);
     node.stop();
 }
 
