@@ -214,9 +214,11 @@ not an `Arc<Mutex<...>>`. Command futures are `!Send`. A waker may move to
 another thread, as Rust requires, but on its own cell's thread it runs no
 atomic read-modify-write; only a wake from another thread, which no server
 path makes, pays for one. Cell code may not name locks, channels,
-`tokio`, `sleep`, thread spawning, or the ambient clock or randomness; a
+`tokio`, `sleep`, thread spawning, the ambient clock or randomness, or
+the process environment, whose every read takes a process-wide lock; a
 denylist script and clippy's `disallowed-types` / `disallowed-methods`
-reject them at build time.
+reject them at build time. A setting the environment carries is read
+once at boot, before any cell starts, and handed to the cell.
 
 A few things do cross threads, and each is small and off the per-key path:
 
@@ -1493,11 +1495,14 @@ contents at quiescence; no acknowledged `always` write lost across crashes;
 after seeded power cuts, every live key of a tiered namespace serving its
 exact bytes and every deleted key gone; document replay equivalence; index
 backfill and saved-index equivalence. An oracle's canary is a planted bug
-that must turn it red: a build flag that `just sim-canaries` compiles in, or
-a plant a test arms at run time (the durable scenario's lying `fsync` among
-them). Not every oracle has one: no lane plants a bug for the boot-storm
-scenario's ready-path oracle. `--verify-determinism` runs a seed twice and
-compares the traces and a hash of the final state, disk included.
+that must turn it red: a build flag that `just sim-canaries` compiles into the
+simulator or into a crate's own test, built with the features that test
+needs, or a plant a test arms at run time (the durable scenario's lying
+`fsync` among them). On Linux every canary runs; elsewhere a canary whose
+evidence exists only on Linux is named as not run. Not every oracle has one:
+no lane plants a bug for the boot-storm scenario's ready-path oracle.
+`--verify-determinism` runs a seed twice and compares the traces and a hash of
+the final state, disk included.
 
 Every CI run executes every scenario once (`just sim-smoke`); sweeps run
 thousands of seeds per scenario (`just durable-sweep` and friends); a nightly

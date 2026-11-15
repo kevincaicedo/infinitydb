@@ -852,14 +852,18 @@ Distinct names and types for distinct quantities:
   buffers, log frames). Initialize every transmitted byte and serialize
   only the valid length, never spare capacity or struct padding: a
   checksum faithfully protects stale bytes emitted by accident.
-- **Time, randomness, disk, network and fabric effects are injected
-  (L7).** Cell code holds no lock and never sleeps, and ambient
-  `Instant::now()` or `rand::random()` there is a denylist violation
-  (`scripts/check-cell-denylist.sh`: no locks, sleep or ambient time in
-  cells), and for clocks a clippy error under any spelling
-  (`UNIX_EPOCH.elapsed()` and `_rdtsc` included): it breaks the
-  simulator's authority over the universe, the most valuable testing
-  asset we own.
+- **Time, randomness, the process environment, disk, network and fabric
+  effects are injected (L7).** Cell code holds no lock and never sleeps,
+  and ambient `Instant::now()`, `rand::random()` or `std::env::var_os`
+  there is a denylist violation (`scripts/check-cell-denylist.sh`: no
+  locks, sleep, ambient time or environment in cells; libc's `getenv`,
+  `setenv` and `putenv` spellings are its alone), and for clocks and
+  `std::env` a clippy error under any spelling (`UNIX_EPOCH.elapsed()`
+  and `_rdtsc` included): it breaks the simulator's authority over the
+  universe, the most valuable testing asset we own. Every environment
+  read also takes std's process-wide lock and scans the whole block, so
+  a selection the environment carries is decoded once, before any cell
+  starts, and passed in; no allow admits a read in cell code (ADR-0209).
 - **Hashing is deterministic too.** A new cell container is a capped
   type (above), and a cell-resident `HashMap` or `HashSet` not yet
   migrated never carries `std`'s per-process `RandomState`: it keeps

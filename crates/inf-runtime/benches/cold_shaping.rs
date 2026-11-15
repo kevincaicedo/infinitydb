@@ -2,6 +2,10 @@
     clippy::disallowed_types,
     reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
 )]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the ring decodes the bench's environment, not cell code (ADR-0209 D3)"
+)]
 //! M4-S10 cold-read shaping: coalescing A/B + QD-cap saturation (ADR-0055) — target root.
 //!
 //! The body drives `UringDriver` + a registered `AlignedPool` +

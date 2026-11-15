@@ -187,14 +187,9 @@ fn the_recipe_and_the_pr_job_run_the_smoke_script() {
 #[test]
 fn every_canary_cfg_has_a_driver() {
     let cargo = read("../../Cargo.toml");
-    let line = cargo.lines().find(|l| l.contains("check-cfg")).expect("a check-cfg list");
-    let cfgs: Vec<&str> = line
-        .split("cfg(")
-        .skip(1)
-        .map(|s| s.split(')').next().expect("cfg name"))
-        .filter(|s| s.starts_with("inf_canary_"))
-        .collect();
-    assert!(!cfgs.is_empty(), "no inf_canary_* cfg in {line}");
+    let cfgs: Vec<&str> =
+        check_cfg_names(&cargo).into_iter().filter(|s| s.starts_with("inf_canary_")).collect();
+    assert!(!cfgs.is_empty(), "no inf_canary_* cfg in Cargo.toml's check-cfg list");
     let driver = read("../../scripts/sim-canaries.sh");
     for cfg in cfgs {
         assert!(
@@ -202,4 +197,70 @@ fn every_canary_cfg_has_a_driver() {
             "{cfg} is admitted by check-cfg but scripts/sim-canaries.sh never plants it"
         );
     }
+}
+
+/// The names `Cargo.toml`'s `check-cfg` array admits: one `'cfg(<name>)',`
+/// a line, the name lowercase letters, digits and `_`, from the line that
+/// ends `check-cfg = [` to the `]` that closes it. Any other line inside is
+/// refused, so a name never hides on a line that holds another.
+fn check_cfg_names(cargo: &str) -> Vec<&str> {
+    let mut lines = cargo.lines().skip_while(|l| !l.trim_end().ends_with("check-cfg = ["));
+    assert!(lines.next().is_some(), "no line of Cargo.toml ends `check-cfg = [`");
+    let mut names = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if line.starts_with(']') {
+            assert!(!names.is_empty(), "the check-cfg list is empty");
+            return names;
+        }
+        let name = line
+            .strip_prefix("'cfg(")
+            .and_then(|rest| rest.strip_suffix(")',"))
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .unwrap_or_else(|| panic!("a check-cfg line holds one name, `'cfg(<name>)',`: {line}"));
+        names.push(name);
+    }
+    panic!("the check-cfg list has no closing `]`");
+}
+
+/// The first two adjacent names out of byte order, a repeat included.
+fn first_out_of_order<'a>(names: &[&'a str]) -> Option<(&'a str, &'a str)> {
+    names.windows(2).find(|pair| pair[0] >= pair[1]).map(|pair| (pair[0], pair[1]))
+}
+
+/// The `check-cfg` list is one name a line in byte order, so two changes
+/// that each admit a cfg touch different lines and merge without a
+/// conflict.
+#[test]
+fn the_check_cfg_list_is_one_name_a_line_in_order() {
+    let cargo = read("../../Cargo.toml");
+    let names = check_cfg_names(&cargo);
+    if let Some((before, after)) = first_out_of_order(&names) {
+        panic!("check-cfg lists {before} before {after}: each name goes in its byte-order place");
+    }
+}
+
+/// The order check's plants: two names swapped, and one repeated.
+#[test]
+fn the_check_cfg_order_check_sees_a_swap_and_a_repeat() {
+    let swapped = "x = { check-cfg = [\n    'cfg(inf_b)',\n    'cfg(inf_a)',\n] }\n";
+    assert_eq!(first_out_of_order(&check_cfg_names(swapped)), Some(("inf_b", "inf_a")));
+    let repeated = "x = { check-cfg = [\n    'cfg(inf_a)',\n    'cfg(inf_a)',\n] }\n";
+    assert_eq!(first_out_of_order(&check_cfg_names(repeated)), Some(("inf_a", "inf_a")));
+    let sorted = "x = { check-cfg = [\n    'cfg(inf_a)',\n    'cfg(inf_b)',\n] }\n";
+    assert_eq!(check_cfg_names(sorted), ["inf_a", "inf_b"]);
+    assert_eq!(first_out_of_order(&check_cfg_names(sorted)), None);
+}
+
+/// The reader's plant: two names on one line are refused, never read as
+/// one name or as none.
+#[test]
+#[should_panic(expected = "a check-cfg line holds one name")]
+fn two_check_cfg_names_on_one_line_are_refused() {
+    check_cfg_names("x = { check-cfg = [\n    'cfg(inf_a)', 'cfg(inf_b)',\n] }\n");
 }

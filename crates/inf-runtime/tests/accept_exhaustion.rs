@@ -26,8 +26,14 @@ fn make_driver() -> impl BackendDriver {
 }
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
+#[path = "support/uring_env.rs"]
+mod uring_env;
+
+#[cfg(all(target_os = "linux", feature = "uring"))]
 fn make_driver() -> impl BackendDriver {
-    inf_runtime::UringDriver::new(256).expect("io_uring")
+    let driver = inf_runtime::UringDriver::new(256, uring_env::config()).expect("io_uring");
+    uring_env::assert_engaged(&driver.capabilities());
+    driver
 }
 
 const ACCEPT_TOKEN: u32 = 1;

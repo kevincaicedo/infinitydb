@@ -1,4 +1,8 @@
 #![allow(
+    clippy::disallowed_methods,
+    reason = "test target: the campaign's size and seed come from its environment (ADR-0209 D3)"
+)]
+#![allow(
     clippy::disallowed_types,
     reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
 )]

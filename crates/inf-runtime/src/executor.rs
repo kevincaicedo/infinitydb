@@ -1129,6 +1129,7 @@ impl core::fmt::Debug for CellExecutor {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: a child test reads its role")]
 mod tests {
     //! The owner lane's bound, which no public path reaches before 2⁶⁰ clones.
 

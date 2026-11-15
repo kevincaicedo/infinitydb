@@ -914,7 +914,9 @@ impl Node {
                 // op consumes, and its pinned pages would hold most of an
                 // 8 MiB RLIMIT_MEMLOCK, so a sibling test node's ring
                 // creation fails with ENOMEM. The rings alone fit.
-                let driver = UringDriver::new(256).expect("uring");
+                let driver =
+                    UringDriver::new(256, inf_runtime::UringConfig::from_lookup(std::env::var_os))
+                        .expect("uring");
                 let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
                 node.process_board.replace(Some(process_board));
                 node.run_id.set(run_id);

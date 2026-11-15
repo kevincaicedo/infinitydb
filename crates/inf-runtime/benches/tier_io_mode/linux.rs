@@ -202,7 +202,8 @@ fn run_leg(
         drop_page_cache(path);
     }
     let cgroup_before = cgroup_file_bytes();
-    let mut driver = UringDriver::new(64).expect("io_uring");
+    let mut driver = UringDriver::new(64, inf_runtime::UringConfig::from_lookup(std::env::var_os))
+        .expect("io_uring");
     let mut pool = AlignedPool::new(POOL_BUFFERS, WINDOW_FRAMES * TIER_FRAME_BYTES);
     driver.register_tier_pool(&mut pool).expect("registration");
     let cold = ColdReads::with_config(

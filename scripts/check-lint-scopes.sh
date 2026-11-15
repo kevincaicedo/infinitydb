@@ -752,9 +752,23 @@ if diagnostics:
         container = code == "disallowed_types" and path in CONTAINER_PATHS
         # ADR-0202 D7: clippy.toml's `inf_log::` entries are whole listings.
         listing = path.startswith("inf_log::")
-        classes = ({"fs-seam", "boot", "control-thread"} if fs else
-                   {"clock"} if clock else {"container"} if container else
-                   {"listing"} if listing else set())
+        # ADR-0209 D3: the process environment, a named row with no class, so
+        # no allow sanctions a cell production read or write of it.
+        environment = path.startswith("std::env::") or path in {
+            "libc::getenv", "libc::setenv", "libc::unsetenv", "libc::putenv"
+        }
+        if environment:
+            classes = set()
+        elif fs:
+            classes = {"fs-seam", "boot", "control-thread"}
+        elif clock:
+            classes = {"clock"}
+        elif container:
+            classes = {"container"}
+        elif listing:
+            classes = {"listing"}
+        else:
+            classes = set()
         for span in d["spans"]:
             file, line = span["file_name"], span["line_start"]
             if Path(file).is_absolute() and Path(file).is_relative_to(Path.cwd()):
@@ -770,6 +784,11 @@ if diagnostics:
             if not any(file == f and first <= line <= last and code in lints and cls in classes
                        for f, first, last, lints, cls in api_sites):
                 reported.add((file, line, path))
+                if environment:
+                    errors.append(f"{file}:{line}: {path} reads or writes the process environment in "
+                                  "cell code, which no allow admits (ADR-0209 D3): decode before any "
+                                  "cell starts and pass the selection in")
+                    continue
                 why = (f" — {CONTAINER_REASON[path]}; a new `container:` allow is red too: the exemption "
                        "table only shrinks" if container else "")
                 errors.append(f"{file}:{line}: {path} lacks a narrow allow of its own API class{why}")

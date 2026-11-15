@@ -18,7 +18,7 @@
 #![cfg(any(target_os = "macos", all(target_os = "linux", feature = "uring")))]
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::IntoRawFd;
 use std::time::{Duration, Instant};
 
@@ -33,8 +33,20 @@ fn make_driver() -> impl BackendDriver {
 }
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
+#[path = "support/uring_env.rs"]
+mod uring_env;
+
+#[cfg(all(target_os = "linux", feature = "uring"))]
 fn make_driver() -> impl BackendDriver {
-    inf_runtime::UringDriver::new(256).expect("io_uring")
+    make_ring(uring_env::config())
+}
+
+/// The file's one ring constructor: `config`'s selections, checked engaged.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+fn make_ring(config: inf_runtime::UringConfig) -> inf_runtime::UringDriver {
+    let driver = inf_runtime::UringDriver::new(256, config).expect("io_uring");
+    uring_env::assert_engaged(&driver.capabilities());
+    driver
 }
 
 struct Rig {
@@ -56,6 +68,8 @@ trait DriverObj {
         wait: Wait,
         out: &mut Vec<Completion>,
     ) -> std::io::Result<usize>;
+    #[cfg(all(target_os = "linux", feature = "uring"))]
+    fn caps(&self) -> inf_runtime::Capabilities;
 }
 
 impl<D: BackendDriver> DriverObj for D {
@@ -70,17 +84,31 @@ impl<D: BackendDriver> DriverObj for D {
     ) -> std::io::Result<usize> {
         BackendDriver::submit_and_reap(self, pool, wait, out)
     }
+    #[cfg(all(target_os = "linux", feature = "uring"))]
+    fn caps(&self) -> inf_runtime::Capabilities {
+        BackendDriver::capabilities(self)
+    }
 }
 
 const ACCEPT_TOKEN: u32 = 1;
 
 impl Rig {
     fn new(pool_buffers: usize) -> Rig {
+        Rig::over(Box::new(make_driver()), pool_buffers)
+    }
+
+    /// A rig over a ring built from `config` by the file's `make_ring`.
+    #[cfg(all(target_os = "linux", feature = "uring"))]
+    fn with_ring(pool_buffers: usize, config: inf_runtime::UringConfig) -> Rig {
+        Rig::over(Box::new(make_ring(config)), pool_buffers)
+    }
+
+    fn over(driver: Box<dyn DriverObj>, pool_buffers: usize) -> Rig {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let listener_fd = listener.into_raw_fd(); // driver owns it now
         let mut rig = Rig {
-            driver: Box::new(make_driver()),
+            driver,
             pool: BufferPool::new(pool_buffers, 4096),
             out: Vec::new(),
             listener_fd,
@@ -120,6 +148,19 @@ impl Rig {
             }
             assert!(Instant::now() < deadline, "timed out; saw: {seen:?}");
         }
+    }
+
+    /// One enter: what a single `submit_and_reap` posted, in its order.
+    fn reap_once(&mut self) -> Vec<Completion> {
+        self.out.clear();
+        self.driver
+            .submit_and_reap(
+                &mut self.pool,
+                Wait::Park { timeout: Some(Duration::from_millis(20)) },
+                &mut self.out,
+            )
+            .expect("submit_and_reap");
+        std::mem::take(&mut self.out)
     }
 
     fn accept_one(&mut self, client: &TcpStream) -> i32 {
@@ -499,6 +540,303 @@ fn close_with_unread_input_is_a_fin_not_a_reset() {
     assert_eq!(rig.pool.reconcile(), Ok(()));
 }
 
+/// What one reap posted for the connection under test, in the reap's order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Event {
+    Data(u32),
+    End,
+    Dropped,
+    Closed,
+}
+
+/// `reaped`'s completions for the receive `recv` and the close `close` as
+/// events, each `Recv`'s buffer returned to the pool; another token's
+/// completion is skipped. A receive or close that fails is no event of
+/// these tests' contracts, so it fails the test.
+fn events_of(
+    pool: &mut BufferPool,
+    reaped: Vec<Completion>,
+    recv: CompletionToken,
+    close: CompletionToken,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    for c in reaped {
+        if c.token != recv && c.token != close {
+            continue;
+        }
+        match c.result {
+            CompletionResult::Recv { buf, len } => {
+                pool.release(buf);
+                events.push(if len == 0 { Event::End } else { Event::Data(len) });
+            }
+            CompletionResult::RecvDropped => events.push(Event::Dropped),
+            CompletionResult::Closed => events.push(Event::Closed),
+            other => panic!("an unexpected completion for {:?}: {other:?}", c.token),
+        }
+    }
+    events
+}
+
+/// Whether a test of the multishot receive reads it on this ring. A ring
+/// the environment degrades (the kernel matrix's degraded leg, whose mode
+/// `make_ring` checked engaged) takes the oneshot receive, and the test
+/// reads the same order there; a probed ring the kernel gave no multishot
+/// receive cannot be judged, and a skip that exits 0 is no instrument.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+fn multishot_receive(rig: &Rig) -> bool {
+    let caps = rig.driver.caps();
+    if caps.multishot_recv {
+        return true;
+    }
+    assert!(
+        uring_env::degraded_selected(),
+        "VACUOUS multishot-unsupported: a probed ring without multishot receive: {caps:?}"
+    );
+    false
+}
+
+/// The peer's bytes come before its end of stream (ADR-0196 D1): the
+/// client writes 64 B and shuts its write side before the driver's next
+/// enter, so a multishot receive posts the data and the zero-length `Recv`
+/// in one reap, and the driver's order inside one reap is the subject. A
+/// zero-length `Recv` ahead of the bytes is `eof-before-data`. A kernel
+/// that split them across reaps reached no shared reap: the order is still
+/// read, then the run is `VACUOUS`, never green. The oneshot receive posts
+/// one completion an arm and re-arms on the next submit, so it has no
+/// shared reap to reach: its order alone is read.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+#[test]
+fn multishot_recv_posts_data_before_eof() {
+    const ENTERS_MAX: usize = 8;
+    let mut rig = Rig::new(8);
+    let mut client = rig.connect();
+    let conn = rig.accept_one(&client);
+    let multishot = multishot_receive(&rig);
+    let recv = recv_token(3);
+    let close = CompletionToken::new(TokenClass::Close, 3, 0);
+    rig.driver.push(IoOp::RecvArm { fd: conn, token: recv });
+    client.write_all(&[0x5A; 64]).expect("client write");
+    client.shutdown(Shutdown::Write).expect("client FIN");
+
+    let mut seen: Vec<(usize, Event)> = Vec::new();
+    for enter in 0..ENTERS_MAX {
+        let reaped = rig.reap_once();
+        let events = events_of(&mut rig.pool, reaped, recv, close);
+        seen.extend(events.into_iter().map(|event| (enter, event)));
+        if seen.iter().any(|&(_, event)| event == Event::End) {
+            break;
+        }
+    }
+    let end = seen
+        .iter()
+        .position(|&(_, event)| event == Event::End)
+        .unwrap_or_else(|| panic!("no end of stream in {ENTERS_MAX} enters: {seen:?}"));
+    let before: u32 = seen[..end]
+        .iter()
+        .map(|&(_, event)| if let Event::Data(len) = event { len } else { 0 })
+        .sum();
+    assert_eq!(
+        before, 64,
+        "eof-before-data: {before} of the 64 bytes written before the FIN came first: {seen:?}"
+    );
+    assert!(
+        seen[..end].iter().all(|&(_, event)| matches!(event, Event::Data(_))),
+        "only the bytes precede the end of stream: {seen:?}"
+    );
+    if multishot {
+        let (data_enter, end_enter) = (seen[end - 1].0, seen[end].0);
+        assert_eq!(
+            data_enter, end_enter,
+            "VACUOUS single-reap-unreached: the kernel posted the bytes in enter {data_enter} and \
+             the end of stream in enter {end_enter}"
+        );
+    }
+
+    rig.driver.push(IoOp::Close { fd: conn, token: close });
+    rig.pump_until(|c| matches!(c.result, CompletionResult::Closed));
+    assert_eq!(rig.pool.reconcile(), Ok(()), "every buffer returned");
+}
+
+/// The events of `recv` and `close` from the next enter until `Closed`,
+/// then two enters more, each tagged with its enter: a `Recv` the driver
+/// posts after `Closed` is read wherever it lands.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+fn events_through_closed(
+    rig: &mut Rig,
+    recv: CompletionToken,
+    close: CompletionToken,
+) -> Vec<(usize, Event)> {
+    const ENTERS_AFTER_CLOSED: usize = 2;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen: Vec<(usize, Event)> = Vec::new();
+    let mut enter = 0;
+    while !seen.iter().any(|&(_, event)| event == Event::Closed) {
+        assert!(Instant::now() < deadline, "no Closed in 5 s: {seen:?}");
+        let reaped = rig.reap_once();
+        let events = events_of(&mut rig.pool, reaped, recv, close);
+        seen.extend(events.into_iter().map(|event| (enter, event)));
+        enter += 1;
+    }
+    for _ in 0..ENTERS_AFTER_CLOSED {
+        let reaped = rig.reap_once();
+        let events = events_of(&mut rig.pool, reaped, recv, close);
+        seen.extend(events.into_iter().map(|event| (enter, event)));
+        enter += 1;
+    }
+    seen
+}
+
+/// The close-order oracle (ADR-0196 D1): the driver queues the fd's
+/// cancels before the close and posts `Closed` after them, so no `Recv`
+/// with bytes follows `Closed` (`recv-after-closed`). Engagement: the
+/// client's 64 bytes posted before `Closed`, else
+/// `recv-before-close-unreached`, `VACUOUS`, never green.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+fn judge_close_order(seen: &[(usize, Event)]) {
+    let closed = seen.iter().position(|&(_, event)| event == Event::Closed).expect("Closed");
+    let after: Vec<&(usize, Event)> =
+        seen[closed..].iter().filter(|(_, event)| matches!(event, Event::Data(_))).collect();
+    assert!(after.is_empty(), "recv-after-closed: bytes posted after Closed: {seen:?}");
+    assert!(
+        seen[..closed].iter().any(|&(_, event)| event == Event::Data(64)),
+        "VACUOUS recv-before-close-unreached: no 64-byte Recv before Closed: {seen:?}"
+    );
+}
+
+/// A close ends the receive, where the kernel posts completions between
+/// enters: a ring set up without deferred task work
+/// (`SetupFlags::NoDeferTaskrun`, a boot selection). The receive is armed
+/// and submitted before the client writes, so the bytes' `Recv` is in the
+/// ring as the write returns, and the `Close` rides the next enter. This
+/// order is this regime's alone: under deferred task work, with the
+/// receive submitted before the bytes arrive, the kernel posts them at the
+/// next enter's task work, after the cancel the `Close` queues there ended
+/// the receive, and that enter reaps `Closed` alone. The ring's mode is
+/// still the environment's, so the degraded leg reads the oneshot receive.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+#[test]
+fn close_posts_no_recv_after_closed() {
+    use inf_runtime::SetupFlags;
+    let config = uring_env::config().with_setup(SetupFlags::NoDeferTaskrun);
+    let mut rig = Rig::with_ring(8, config);
+    assert!(!rig.driver.caps().defer_taskrun, "the no-DEFER_TASKRUN tier");
+    let mut client = rig.connect();
+    let conn = rig.accept_one(&client);
+    multishot_receive(&rig);
+    let recv = recv_token(4);
+    let close = CompletionToken::new(TokenClass::Close, 4, 0);
+    rig.driver.push(IoOp::RecvArm { fd: conn, token: recv });
+    let armed = rig.reap_once();
+    let early = events_of(&mut rig.pool, armed, recv, close);
+    assert!(early.is_empty(), "nothing is posted before the client writes: {early:?}");
+
+    client.write_all(&[0x5A; 64]).expect("client write");
+    rig.driver.push(IoOp::Close { fd: conn, token: close });
+    let seen = events_through_closed(&mut rig, recv, close);
+    judge_close_order(&seen);
+    assert_eq!(rig.pool.reconcile(), Ok(()), "every buffer returned");
+    drop(client);
+}
+
+/// A close ends the receive on the shipped ring, deferred task work
+/// included: the client's 64 bytes wait in the socket before the receive
+/// is armed, and the receive and the `Close` ride one enter after the
+/// write, so the receive's first attempt finds the bytes and posts them,
+/// then the close's cancel ends it, and the driver dispatches the reap in
+/// the ring's order. The ring is the environment's, so the degraded leg
+/// reads the oneshot receive.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+#[test]
+fn close_with_receive_posts_no_recv_after_closed() {
+    let mut rig = Rig::new(8);
+    let mut client = rig.connect();
+    let conn = rig.accept_one(&client);
+    multishot_receive(&rig);
+    let recv = recv_token(5);
+    let close = CompletionToken::new(TokenClass::Close, 5, 0);
+    client.write_all(&[0x5A; 64]).expect("client write");
+    wait_readable(conn);
+    rig.driver.push(IoOp::RecvArm { fd: conn, token: recv });
+    rig.driver.push(IoOp::Close { fd: conn, token: close });
+    let seen = events_through_closed(&mut rig, recv, close);
+    judge_close_order(&seen);
+    assert_eq!(rig.pool.reconcile(), Ok(()), "every buffer returned");
+    drop(client);
+}
+
+/// Waits, at most 5 s, until `fd` has bytes to read: the client's write
+/// is in the server's socket before the test arms a receive.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+fn wait_readable(fd: i32) {
+    let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    // SAFETY: `poll` is one valid, initialized pollfd that outlives the call.
+    let ready = unsafe { libc::poll(&mut poll, 1, 5_000) };
+    assert_eq!(ready, 1, "the client's bytes reached the server's socket in 5 s");
+    assert_ne!(poll.revents & libc::POLLIN, 0, "readable: {:#x}", poll.revents);
+}
+
+/// The end of stream ends the receive, on every backend (ADR-0196 A1.3): no
+/// `Recv` follows the zero-length one for the token while the fd stays
+/// open (`recv-after-eof`), and the half-closed peer still reads what the
+/// server sends it, then its end of stream at the `Close`.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "red on kqueue: a zero read leaves the level-triggered filter armed"
+)]
+fn eof_ends_the_receive() {
+    const ENTERS_OPEN: usize = 8;
+    let mut rig = Rig::new(8);
+    let mut client = rig.connect();
+    let conn = rig.accept_one(&client);
+    let recv = recv_token(6);
+    let close = CompletionToken::new(TokenClass::Close, 6, 0);
+    rig.driver.push(IoOp::RecvArm { fd: conn, token: recv });
+    client.write_all(&[0x5A; 64]).expect("client write");
+    client.shutdown(Shutdown::Write).expect("client FIN");
+
+    let reaped = rig.pump_until(|c| {
+        c.token == recv && matches!(c.result, CompletionResult::Recv { len: 0, .. })
+    });
+    let mut seen = events_of(&mut rig.pool, reaped, recv, close);
+    let end = seen.iter().position(|&event| event == Event::End).expect("the end of stream");
+    let bytes: u32 =
+        seen[..end].iter().map(|&event| if let Event::Data(len) = event { len } else { 0 }).sum();
+    assert_eq!(bytes, 64, "the bytes before the end of stream: {seen:?}");
+    for _ in 0..ENTERS_OPEN {
+        let reaped = rig.reap_once();
+        seen.extend(events_of(&mut rig.pool, reaped, recv, close));
+    }
+    assert_eq!(
+        seen.len(),
+        end + 1,
+        "recv-after-eof: a receive event after the zero-length Recv, the fd open: {seen:?}"
+    );
+
+    let reply = rig.pool.try_lease(LeaseKind::Send).expect("send lease");
+    rig.pool.bytes_mut(reply)[..64].fill(0xA5);
+    rig.driver.push(IoOp::Send { fd: conn, buf: reply, len: 64, token: send_token(6) });
+    let reaped = rig.pump_until(|c| matches!(c.result, CompletionResult::Sent { .. }));
+    for c in reaped {
+        match c.result {
+            CompletionResult::Sent { buf } => rig.pool.release(buf),
+            _ => seen.extend(events_of(&mut rig.pool, vec![c], recv, close)),
+        }
+    }
+    let mut echoed = [0u8; 64];
+    client.read_exact(&mut echoed).expect("the half-closed client reads the reply");
+    assert_eq!(echoed, [0xA5; 64]);
+
+    rig.driver.push(IoOp::Close { fd: conn, token: close });
+    let reaped = rig.pump_until(|c| matches!(c.result, CompletionResult::Closed));
+    seen.extend(events_of(&mut rig.pool, reaped, recv, close));
+    assert_eq!(seen.len(), end + 2, "recv-after-eof: the events to Closed: {seen:?}");
+    let mut rest = Vec::new();
+    let read = client.read_to_end(&mut rest).expect("the client reads its end of stream");
+    assert_eq!(read, 0, "nothing after the reply, then the end of stream: {rest:?}");
+    assert_eq!(rig.pool.reconcile(), Ok(()), "every buffer returned");
+}
+
 /// Reads whatever the peer has already delivered and stops at the first
 /// empty poll (the driver is not running, so nothing more can arrive).
 fn drain_client(client: &mut TcpStream) {
@@ -533,5 +871,130 @@ fn set_sndbuf(fd: i32, size: libc::c_int) {
             (&raw const size).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
+    }
+}
+
+/// The `sqes_per_submit` tripwire's canary, in tree (ADR-0209 D5): 16
+/// closes of fresh sockets, each one SQE with nothing in flight on its fd,
+/// read at the driver and through a cell loop under each submit policy.
+/// The driver leg reads the loop's two inputs (`SubmitStats`); the loop leg
+/// reads the loop's own fold. A restock of P provided buffers may ride the
+/// first call: batched reads (P + 16) / 2 >= 8 SQEs an enter, per-SQE
+/// (P + 16) / (P + 18) < 1.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+mod submit_policy {
+    use std::net::UdpSocket;
+    use std::os::fd::IntoRawFd;
+
+    use inf_alloc::BufferPool;
+    use inf_foundation::CellId;
+    use inf_foundation::bounded::{Cap, CapCensus, CapFill};
+    use inf_foundation::time::StdClock;
+    use inf_runtime::{
+        BackendDriver, CellLoop, CellPlane, Completion, CompletionResult, CompletionToken, IoOp,
+        LoopConfig, LoopCx, SubmitPolicy, SubmitStats, TimerSet, TokenClass, Wait,
+    };
+
+    use super::{make_ring, uring_env};
+
+    const CLOSES: u32 = 16;
+    const OWNERS: Cap = Cap::entries::<1>("submit-policy-owners", CapFill::Serving);
+    /// The loop leg's hang bound: the closes complete within a few
+    /// iterations, so this bound ends a hang and decides nothing.
+    const ITERATIONS_MAX: u32 = 10_000;
+
+    fn closes() -> Vec<IoOp> {
+        (0..CLOSES)
+            .map(|slot| {
+                let fd = UdpSocket::bind("127.0.0.1:0").expect("socket").into_raw_fd();
+                IoOp::Close { fd, token: CompletionToken::new(TokenClass::Close, slot, 0) }
+            })
+            .collect()
+    }
+
+    /// The driver leg: the stats of the call that carries the closes, after
+    /// a warm-up call (`submit_and_reap` resets them at each call).
+    fn measured_call(policy: SubmitPolicy) -> SubmitStats {
+        let mut driver = make_ring(uring_env::config().with_submit(policy));
+        let mut pool = BufferPool::new(16, 4096);
+        let mut out = Vec::new();
+        driver.submit_and_reap(&mut pool, Wait::Poll, &mut out).expect("warm-up");
+        for op in closes() {
+            driver.push(op);
+        }
+        out.clear();
+        driver.submit_and_reap(&mut pool, Wait::Poll, &mut out).expect("the measured call");
+        driver.submit_stats()
+    }
+
+    #[test]
+    fn a_batched_ring_enters_once_for_every_queued_sqe() {
+        let stats = measured_call(SubmitPolicy::Batched);
+        assert!(stats.sqes >= u64::from(CLOSES), "every close rode the call: {stats:?}");
+        assert_eq!(stats.syscalls, 1, "one enter for the call's SQEs: {stats:?}");
+    }
+
+    #[test]
+    fn a_per_sqe_ring_enters_before_every_chain() {
+        let stats = measured_call(SubmitPolicy::PerSqe);
+        assert!(stats.sqes >= u64::from(CLOSES), "every close rode the call: {stats:?}");
+        // Every queued chain is a single SQE (a close, or a restock), so the
+        // call enters once for each and once more for its reap.
+        assert_eq!(stats.syscalls, stats.sqes + 1, "an enter before every SQE: {stats:?}");
+    }
+
+    /// Pushes the closes once, in its first PARSE, and counts their `Closed`.
+    struct ClosePlane {
+        pending: Vec<IoOp>,
+        closed: u32,
+    }
+
+    impl CellPlane for ClosePlane {
+        fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
+            if matches!(c.result, CompletionResult::Closed) {
+                self.closed += 1;
+            }
+        }
+        fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
+            for op in self.pending.drain(..) {
+                cx.push(op);
+            }
+        }
+        fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+    }
+
+    /// The loop leg: `tripwires()`'s `sqes_per_submit` (x1000) once every
+    /// close completed.
+    fn sqes_per_submit(policy: SubmitPolicy) -> u64 {
+        let (census, serve_mark) = CapCensus::new(CellId(0));
+        let timers = TimerSet::build(OWNERS, &census).expect("the leg's timer set");
+        let driver = make_ring(uring_env::config().with_submit(policy));
+        let pool = BufferPool::new(16, 4096);
+        let config = LoopConfig::default();
+        let mut cell = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timers);
+        let mut plane = ClosePlane { pending: closes(), closed: 0 };
+        let mut iterations = 0;
+        while plane.closed < CLOSES {
+            assert!(iterations < ITERATIONS_MAX, "{} of {CLOSES} closes completed", plane.closed);
+            cell.run_iteration(&mut plane).expect("an iteration");
+            iterations += 1;
+        }
+        let (name, value) = cell.tripwires()[0];
+        assert_eq!(name, inf_foundation::tripwire::SQES_PER_SUBMIT);
+        value
+    }
+
+    #[test]
+    #[cfg(not(feature = "no-tripwires"))]
+    fn the_tripwire_reads_a_batched_loop_at_eight_sqes_an_enter_or_more() {
+        let ratio = sqes_per_submit(SubmitPolicy::Batched);
+        assert!(ratio >= 8_000, "sqes_per_submit x1000 = {ratio}: batching is not exercised");
+    }
+
+    #[test]
+    #[cfg(not(feature = "no-tripwires"))]
+    fn the_tripwire_trips_on_a_per_sqe_loop() {
+        let ratio = sqes_per_submit(SubmitPolicy::PerSqe);
+        assert!(ratio < 1_000, "sqes_per_submit x1000 = {ratio}: the canary did not trip");
     }
 }

@@ -80,4 +80,4 @@ pub use token::{CompletionToken, MAX_SLOT, TokenClass};
 #[cfg(target_os = "macos")]
 pub use kqueue::KqueueDriver;
 #[cfg(all(target_os = "linux", feature = "uring"))]
-pub use uring::UringDriver;
+pub use uring::{RingMode, SetupFlags, SubmitPolicy, UringConfig, UringDriver};
