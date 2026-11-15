@@ -20,7 +20,7 @@ both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
-**Corpus:** 689 compared executions · 76 documented deviations · 0 tolerated failures.
+**Corpus:** 690 compared executions · 77 documented deviations · 0 tolerated failures.
 **Surface:** 91 commands — 47 full · 39 partial · 0 stub · 2 extension · 3 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
@@ -91,7 +91,7 @@ live keys.
 | `EXPIRETIME` | full | M1 | readonly fast | 2 | 5 | 5 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PEXPIRETIME` | full | M1 | readonly fast | 2 | 4 | 4 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `SELECT` | full | M1 | fast | 2 | 7 | 5 |  |
-| `CONFIG` | partial | M1 | admin | -2 | 40 | 37 | typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next MAINTAIN (ADR-0122); `maxclients` is divided per cell like `maxmemory` (a full cell refuses with Redis's error while a sibling may have headroom), `timeout` closes idle unsubscribed connections at MAINTAIN resolution, `tcp-keepalive` applies to connections accepted after the change (ADR-0123); `client-output-buffer-limit` enforces `normal` and `pubsub`, the `slave` class is accepted and inert until M9 replicas exist; `save`/`appendonly` are accepted and inert (no RDB/AOF); `doc-path-cache-size` is BootOnly, 0–4,096 entries per cell (default 1,024; 0 disables caching), set by `--doc-path-cache-size`; larger boot requests are refused and slim builds omit the key (ADR-0146) |
+| `CONFIG` | partial | M1 | admin | -2 | 41 | 38 | typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next MAINTAIN (ADR-0122); `maxclients` is divided per cell like `maxmemory` (a full cell refuses with Redis's error while a sibling may have headroom) and is at most the boot capacity `--maxclients` (default 10,000): a raise above it answers `-ERR maxclients exceeds boot capacity; restart with --maxclients` and changes no key of the `CONFIG SET`, and below the cell count every cell keeps one slot (ADR-0123 A1); `timeout` closes idle unsubscribed connections at MAINTAIN resolution, `tcp-keepalive` applies to connections accepted after the change (ADR-0123); `client-output-buffer-limit` enforces `normal` and `pubsub`, the `slave` class is accepted and inert until M9 replicas exist; `save`/`appendonly` are accepted and inert (no RDB/AOF); `doc-path-cache-size` is BootOnly, 0–4,096 entries per cell (default 1,024; 0 disables caching), set by `--doc-path-cache-size`; larger boot requests are refused and slim builds omit the key (ADR-0146) |
 | `CLIENT` | partial | M1 | admin | -2 | 5 | 3 | KILL supports the ID filter form; LIST/INFO report the tracked fields (id, name, age, resp, db, sub, psub) — addr/fd are placeholders until peername capture, and idle/cmd/tot-*/buffer gauges are untracked zeros |
 | `LOLWUT` | partial | M1 | readonly | -1 | 0 | 0 | the whole reply is version art (nothing byte-comparable by design) |
 | `SUBSCRIBE` | full | M1 | fast | -2 | 5 | 4 |  |
@@ -176,6 +176,7 @@ bytes or post-state differ by an understood, reviewed design decision.
 - InfinityDB returns the typed M1 key subset
 - error detail text differs; both reject
 - error text shape differs slightly
+- past the boot capacity the node refuses the raise whole (ADR-0123 A1)
 
 ### `CLIENT`
 

@@ -31,7 +31,7 @@ use inf_runtime::GateWait;
 use inf_store::SlotRouter;
 
 use super::OwnedOutcome;
-use crate::limits::FAN_RESERVE_PER_PEER;
+use crate::limits::{FABRIC_CREDITS_PER_PEER_MAX, FAN_RESERVE_PER_PEER};
 
 /// Why a mesh the plane would run on was refused; each variant names the
 /// numbers it refused.
@@ -40,6 +40,9 @@ pub enum MeshConfigRefused {
     /// No general window: every credit toward a peer would be the publish
     /// fan's reserve or less.
     BelowFanReserve { data_credits: u32, floor: u32 },
+    /// More credits than a peer's parked work is sized for (ADR-0177 D6):
+    /// [`FABRIC_CREDITS_PER_PEER_MAX`](crate::limits::FABRIC_CREDITS_PER_PEER_MAX).
+    AboveCeiling { data_credits: u32, ceiling: u32 },
     /// The fabric's rings are power-of-two sized.
     RingNotPowerOfTwo { ring_capacity: usize },
     /// The ring cannot hold the peer's replies beside this side's frames.
@@ -53,6 +56,11 @@ impl fmt::Display for MeshConfigRefused {
                 f,
                 "data_credits {data_credits} leaves no general window beside the publish fan's \
                  reserved credit: at least {floor}"
+            ),
+            MeshConfigRefused::AboveCeiling { data_credits, ceiling } => write!(
+                f,
+                "data_credits {data_credits} passes the {ceiling} credits a peer's parked work is \
+                 sized for"
             ),
             MeshConfigRefused::RingNotPowerOfTwo { ring_capacity } => {
                 write!(f, "ring_capacity {ring_capacity} is not a power of two")
@@ -88,6 +96,12 @@ pub const fn checked_mesh_config(
         return Err(MeshConfigRefused::BelowFanReserve {
             data_credits,
             floor: FAN_RESERVE_PER_PEER + 1,
+        });
+    }
+    if data_credits > FABRIC_CREDITS_PER_PEER_MAX {
+        return Err(MeshConfigRefused::AboveCeiling {
+            data_credits,
+            ceiling: FABRIC_CREDITS_PER_PEER_MAX,
         });
     }
     if !ring_capacity.is_power_of_two() {
@@ -540,5 +554,12 @@ mod tests {
         );
         let boundary = MeshConfig { ring_capacity: 8, data_credits: 4 };
         assert_eq!(checked_mesh_config(8, 4).is_ok(), boundary.has_reply_headroom());
+        // The ceiling of a peer's parked work (ADR-0177 D6): 1,536 credits
+        // pass, 1,537 are refused before the ring relation is read.
+        assert!(checked_mesh_config(4096, 1_536).is_ok());
+        assert_eq!(
+            checked_mesh_config(4096, 1_537).err(),
+            Some(MeshConfigRefused::AboveCeiling { data_credits: 1_537, ceiling: 1_536 })
+        );
     }
 }

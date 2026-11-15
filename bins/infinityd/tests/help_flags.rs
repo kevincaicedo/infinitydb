@@ -19,7 +19,7 @@ const NOT_IN_HELP: &[(&str, &str)] = &[
 
 /// How many distinct flags `parse_args` holds: the scan's scope check. A
 /// change that adds or removes a flag changes this count with it.
-const PARSED_FLAG_COUNT: usize = 41;
+const PARSED_FLAG_COUNT: usize = 42;
 
 /// The body of `parse_args`, from its signature to its closing brace.
 fn parse_args_source() -> &'static str {

@@ -1,7 +1,8 @@
 //! Capped-container op sequences against std models (ADR-0151 D6, ADR-0171
 //! D5). The first byte picks the family. Deques: a `Reserve` deque beside a
-//! `VecDeque` the target caps by hand, a `Coalesce` deque beside one the
-//! target merges by hand, equal after every op and at every place (`get`,
+//! `VecDeque` the target caps by hand, popped at either end, a `Coalesce`
+//! deque beside one the target merges by hand, equal after every op and at
+//! every place (`get`,
 //! and `get_mut` edits at a place or the back); the census row's
 //! `high_water` and `crossings` equal the models' at the end; `len` never
 //! passes the cap; a layout past 64 KiB is refused. Slabs: a slab of either
@@ -138,6 +139,9 @@ fn deques(head: u8, ops: &[u8]) {
                     reserve_model.crossings += 1;
                 }
             },
+            // Odd values take the back (a placeholder taken back), even
+            // ones the front.
+            2 if value & 1 == 1 => assert_eq!(reserve.pop_back(), reserve_model.entries.pop_back()),
             2 => assert_eq!(reserve.pop_front(), reserve_model.entries.pop_front()),
             3 => {
                 marks.push(Mark(value));

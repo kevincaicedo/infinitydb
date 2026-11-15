@@ -51,7 +51,9 @@ pub const EXIT_DURABLE_FAILSTOP: i32 = 3;
 pub use cache_boot::{CacheBootGroup, CacheBootPermit};
 pub use ckpt::{CkptStats, ManifestStats};
 pub use clients::{ClientInfo, ClientRegistry};
-pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
+pub use config::{
+    BootCapacity, BootCapacityRefused, ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass,
+};
 pub use control::{
     BoardObservation, BoardSweep, CellIssuer, CellRecoverySlot, CheckpointEpoch, CkptBoard,
     CkptCredit, CkptFinalCredit, CkptIssuers, CkptQuota, CkptSpace, CkptTarget, ControlBootRefused,

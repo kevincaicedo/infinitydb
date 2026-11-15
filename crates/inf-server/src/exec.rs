@@ -228,6 +228,15 @@ pub struct NodeState {
     pub pubsub_fan_msgs: Cell<u64>,
     pub pubsub_delivered: Cell<u64>,
     pub cob_disconnections: Cell<u64>,
+    /// The work this cell parks for its peers (ADR-0177 D6; cell scope,
+    /// `# Tripwires`): the lengths, not the capacities, of the request and
+    /// reply bytes behind the entries now in the three per-origin deques
+    /// (`fabric_parked_bytes`), added as an entry is filled and subtracted
+    /// as it is popped; their high water since boot; and the ops answered
+    /// `Refused` at a full deque, derived never (`fabric_parked_refused`).
+    pub fabric_parked_bytes: Cell<u64>,
+    pub fabric_parked_bytes_max: Cell<u64>,
+    pub fabric_parked_refused: Cell<u64>,
     /// Publish fan legs this cell's owner pump could not stage on the
     /// credit general sends leave free, each then sent as a general op
     /// (ADR-0192 D3). Cell scope; 0 by the reserve's proof, so any other

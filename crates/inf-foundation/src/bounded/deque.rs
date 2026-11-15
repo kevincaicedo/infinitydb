@@ -184,6 +184,15 @@ impl<T, X> CappedDeque<T, X> {
         self.backing.pop_front()
     }
 
+    /// The back entry returns to its owner; capacity is restored: how a
+    /// holder takes back an entry it published for work that then did not
+    /// go ahead (a placeholder, ADR-0177 D6), leaving the deque as it was
+    /// before that publish.
+    #[inline]
+    pub fn pop_back(&mut self) -> Option<T> {
+        self.backing.pop_back()
+    }
+
     /// Front to back, at most `entries_max` entries.
     pub fn iter(&self) -> impl Iterator<Item = &T> + '_ {
         self.backing.iter()
@@ -440,6 +449,25 @@ mod tests {
     }
 
     #[test]
+    fn pop_back_takes_the_last_entry_and_restores_capacity() {
+        let (census, mut one) = deque(ONE);
+        assert_eq!(one.pop_back(), None, "an empty deque has no back");
+        assert!(publish(&mut one, 7));
+        assert!(!publish(&mut one, 8), "full at one");
+        assert_eq!(one.pop_back(), Some(7));
+        assert!(one.is_empty());
+        assert!(publish(&mut one, 9), "a pop at the back restores capacity");
+        let (_census, mut four) = deque(FOUR);
+        for value in [1, 2, 3] {
+            assert!(publish(&mut four, value));
+        }
+        assert_eq!(four.pop_back(), Some(3));
+        assert_eq!(four.iter().copied().collect::<Vec<_>>(), [1, 2], "the front is untouched");
+        assert_eq!((four.len(), four.high_water()), (2, 3), "a pop leaves the high water");
+        assert_eq!(census.row("one").expect("row").crossings, 1);
+    }
+
+    #[test]
     fn back_mut_edits_the_last_entry() {
         let (_census, mut deque) = deque(FOUR);
         assert_eq!(deque.back_mut(), None);
@@ -574,7 +602,7 @@ mod tests {
         let (mut full, mut high) = (0u64, 0u32);
         let mut rng = SplitMix64::new(seed);
         for value in 0..ops {
-            match rng.next_below(4) {
+            match rng.next_below(5) {
                 0 | 1 => {
                     let took = publish(&mut deque, value);
                     if model.len() < 6 {
@@ -586,6 +614,7 @@ mod tests {
                     }
                 }
                 2 => assert_eq!(deque.pop_front(), model.pop_front()),
+                3 => assert_eq!(deque.pop_back(), model.pop_back()),
                 _ => {
                     let edit = rng.next_below(1000) as u32;
                     // Half the edits name the back, half a place from the

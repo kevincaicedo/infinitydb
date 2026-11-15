@@ -74,7 +74,7 @@ ADR0143_EXEMPTIONS_MAX=15
 # is red), and only a lower number may replace it. The approved copies read
 # it from this one line, so it stays spelled `NAME=<digits>` alone. The
 # capped-backing allows are exact: 1, on `struct CappedDeque` (ADR-0151 D6).
-CONTAINER_EXEMPTIONS_MAX=83
+CONTAINER_EXEMPTIONS_MAX=77
 CAPPED_BACKING_SITES=1
 # ADR-0201 D1: the first move line, the later expiry each record's rows may
 # move up to (a ceiling) where the second line below names no date for it.
@@ -479,13 +479,15 @@ def audit(path, exempt_sites):
         production = production_lines(path)
         for i in test_decls.get(str(path), ()):
             production[i] = ""
-        if path.name != "limits.rs" and "Cap::entries" in "\n".join(production):
+        joined = "\n".join(production)
+        if path.name != "limits.rs" and ("Cap::entries" in joined or "Cap::derived" in joined):
             code = {(n, c) for n, c, _ in scope_table.code_chars(production)}
             for n, line in enumerate(production):
-                for m in re.finditer(r"\bCap::entries\b", line):
+                for m in re.finditer(r"\bCap::(entries|derived)\b", line):
                     if (n, m.start()) in code:
-                        errors.append(f"{path}:{n + 1}: `Cap::entries` outside a `limits.rs` — a cap is a "
-                                      "named const of its crate's `limits` module (ADR-0163 D2)")
+                        errors.append(f"{path}:{n + 1}: `Cap::{m.group(1)}` outside a `limits.rs` — a cap "
+                                      "is a named const of its crate's `limits` module, or derived from one "
+                                      "there (ADR-0163 D2, ADR-0177 D1)")
         if "Lossy" in "\n".join(production):
             for n, line in enumerate(blanked(production)):
                 m = LOSSY.match(line)

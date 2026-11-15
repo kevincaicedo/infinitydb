@@ -2093,6 +2093,9 @@ pub(crate) struct Node {
     /// deterministic form of a stalled origin (a park, an I/O stall)
     /// whose DDL fan legs are then overtaken by another cell's.
     pub(crate) frozen: Option<(usize, u64)>,
+    /// Each cell's node state, for the counters a life's end reads beside
+    /// the census.
+    nodes: Vec<Rc<NodeInfo>>,
 }
 
 /// One cell's durable configuration for `scenario` (every cell of a node
@@ -2150,6 +2153,19 @@ pub(crate) fn boot(
     clock: &Rc<VirtualClock>,
     observer: &TraceObserver,
 ) -> std::io::Result<Node> {
+    boot_meshed(scenario, crate::harness::FROZEN_MESH, data_dir, disk, clock, observer)
+}
+
+/// [`boot`] over `mesh`: a leg whose oracle reads a peer's credits
+/// (`m0-capacity`'s small-credit leg) names its own.
+pub(crate) fn boot_meshed(
+    scenario: &DurableScenario,
+    mesh: inf_fabric::MeshConfig,
+    data_dir: PathBuf,
+    disk: &SimDisk,
+    clock: &Rc<VirtualClock>,
+    observer: &TraceObserver,
+) -> std::io::Result<Node> {
     observer.1.update(|state| {
         state.number(b"boot", clock.now().0);
         state.disk(disk);
@@ -2179,9 +2195,10 @@ pub(crate) fn boot(
     .map_err(|refused| std::io::Error::new(std::io::ErrorKind::InvalidData, refused.to_string()))?;
     let inf_server::CkptIssuers { host: ckpt_host, cells: cell_issuers } = issuers;
     let mut cell_issuers = cell_issuers.into_iter();
-    let fabrics = Mesh::new(scenario.cells, crate::harness::FROZEN_MESH);
+    let fabrics = Mesh::new(scenario.cells, mesh);
     let mut nets = Vec::new();
     let mut cells = Vec::new();
+    let mut nodes = Vec::new();
     for (i, fabric) in fabrics.into_iter().enumerate() {
         let net = CellNet::new(i as u16, scenario.seed, scenario.plant);
         // The clock rides into the driver for the stall device (M2.5-S14);
@@ -2195,6 +2212,7 @@ pub(crate) fn boot(
         let pool = BufferPool::new(128, 1024);
         let node_info = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
+        nodes.push(Rc::clone(&node_info));
         // The node's keyspace is cataloged (ADR-0189 D4), as `infinityd`'s,
         // and the plane builds it from this seed on its cell's census.
         let seed = KeyspaceSeed::Cataloged {
@@ -2231,6 +2249,7 @@ pub(crate) fn boot(
         cells.push((cell_loop, plane));
     }
     Ok(Node {
+        nodes,
         iter_stats: vec![None; cells.len()],
         cells,
         nets,
@@ -2263,9 +2282,21 @@ impl Drop for Node {
             let tiered_tables =
                 if durable.is_some() { plane.keyspace().tiered_tables() } else { 0 };
             let turn_refused = durable.map(|stats| stats.turn_refused);
+            let peers = u16::try_from(self.cells.len() - 1).expect("a node's cells fit a u16");
             let facts =
-                crate::census::CellFacts { server_plane: true, tiered_tables, turn_refused };
+                crate::census::CellFacts { server_plane: true, peers, tiered_tables, turn_refused };
             verdict.judge(index, plane.cap_census(), facts);
+        }
+        // The work parked for a peer (ADR-0177 D6): no op refused at a full
+        // per-origin deque on any cell, derived never as an origin holds at
+        // most its credits' un-replied ops.
+        for (index, node) in self.nodes.iter().enumerate() {
+            let refused = node.fabric_parked_refused.get();
+            if refused != 0 {
+                verdict
+                    .violations
+                    .push(format!("PARKED REFUSED: cell {index}, {refused} ops, at a life's end"));
+            }
         }
         // The nets' own invariants join the life's verdict, which every
         // durable run reads, so they are never dropped with the node.

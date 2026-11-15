@@ -40,26 +40,118 @@ struct IdleClient {
 pub(super) struct IdlePhase {
     wanted: usize,
     clients: Vec<IdleClient>,
+    /// The hot raise past the boot capacity, on a scenario that boots one.
+    raise: Option<HotRaise>,
     started: bool,
     done: bool,
 }
 
+/// `CONFIG SET maxclients <B + 1> maxmemory 100mb` from one client of cell
+/// 0 (ADR-0123 A1): its slots are fixed at boot, so the raise is refused
+/// whole with A1's bytes, and `CONFIG GET` then reads both keys unchanged.
+/// The bytes are written here from the decision's text, not read from the
+/// server, so the probe shares the wire format alone with the plane.
+struct HotRaise {
+    fd: RawFd,
+    rx: Vec<u8>,
+    /// The exchanges still to read, each the bytes its request must answer,
+    /// in order; the first is the raise's.
+    expected: Vec<(Vec<u8>, Vec<u8>)>,
+    answered: usize,
+}
+
+/// A raise past the boot capacity's answer, ADR-0123 A1's bytes.
+const BOOT_CAPACITY_REFUSAL: &[u8] =
+    b"-ERR maxclients exceeds boot capacity; restart with --maxclients\r\n";
+
+impl HotRaise {
+    /// The probe of a node booted at `maxclients`, its requests sent.
+    fn start(nets: &[Rc<RefCell<CellNet>>], maxclients: u32) -> HotRaise {
+        let boot = maxclients.to_string();
+        let above = (u64::from(maxclients) + 1).to_string();
+        let get_maxclients = format!("*2\r\n$10\r\nmaxclients\r\n${}\r\n{boot}\r\n", boot.len());
+        let expected = vec![
+            (
+                encode(&[
+                    b"CONFIG".to_vec(),
+                    b"SET".to_vec(),
+                    b"maxclients".to_vec(),
+                    above.into_bytes(),
+                    b"maxmemory".to_vec(),
+                    b"100mb".to_vec(),
+                ]),
+                BOOT_CAPACITY_REFUSAL.to_vec(),
+            ),
+            (
+                encode(&[b"CONFIG".to_vec(), b"GET".to_vec(), b"maxclients".to_vec()]),
+                get_maxclients.into_bytes(),
+            ),
+            (
+                encode(&[b"CONFIG".to_vec(), b"GET".to_vec(), b"maxmemory".to_vec()]),
+                b"*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n".to_vec(),
+            ),
+        ];
+        let mut net = nets[0].borrow_mut();
+        let fd = net.connect();
+        for (request, _) in &expected {
+            net.client_send(fd, request);
+        }
+        HotRaise { fd, rx: Vec::new(), expected, answered: 0 }
+    }
+
+    fn done(&self) -> bool {
+        self.answered == self.expected.len()
+    }
+
+    /// Reads what reached the probe; each framed reply is held to its
+    /// expected bytes, and the client closes after the last.
+    fn step(&mut self, nets: &[Rc<RefCell<CellNet>>], violations: &mut Violations) {
+        if self.done() {
+            return;
+        }
+        let mut net = nets[0].borrow_mut();
+        self.rx.extend_from_slice(&net.client_recv(self.fd));
+        while !self.done()
+            && let Some(n) = reply_len(&self.rx)
+        {
+            let reply: Vec<u8> = self.rx.drain(..n).collect();
+            let want = &self.expected[self.answered].1;
+            if &reply != want {
+                violations.push(format!(
+                    "hot-raise: reply {} to a raise past the boot capacity read {:?}, want {:?}",
+                    self.answered,
+                    String::from_utf8_lossy(&reply),
+                    String::from_utf8_lossy(want)
+                ));
+            }
+            self.answered += 1;
+        }
+        if self.done() {
+            net.client_close(self.fd);
+        }
+    }
+}
+
 impl IdlePhase {
     pub(super) fn new(wanted: usize) -> IdlePhase {
-        IdlePhase { wanted, clients: Vec::new(), started: false, done: wanted == 0 }
+        IdlePhase { wanted, clients: Vec::new(), raise: None, started: false, done: wanted == 0 }
     }
 
     /// A monotone step counter for the stall detector: state transitions
-    /// plus one per client waiting inside its deadline window.
+    /// plus one per client waiting inside its deadline window, and the hot
+    /// raise's replies.
     pub(super) fn progress(&self) -> u64 {
-        self.clients
-            .iter()
-            .map(|c| match c.state {
-                IdleState::Fresh => 0,
-                IdleState::Active { .. } => 1,
-                IdleState::Refused | IdleState::Closed { .. } => 2,
-            })
-            .sum()
+        let raise = self.raise.as_ref().map_or(0, |raise| raise.answered as u64);
+        raise
+            + self
+                .clients
+                .iter()
+                .map(|c| match c.state {
+                    IdleState::Fresh => 0,
+                    IdleState::Active { .. } => 1,
+                    IdleState::Refused | IdleState::Closed { .. } => 2,
+                })
+                .sum::<u64>()
     }
 
     pub(super) fn refused_per_cell(&self) -> Vec<(usize, u64)> {
@@ -89,6 +181,9 @@ pub(super) fn drive_idle_phase(
             return false;
         }
         idle.started = true;
+        if scenario.maxclients != 0 {
+            idle.raise = Some(HotRaise::start(nets, scenario.maxclients));
+        }
         for i in 0..idle.wanted * 2 {
             let kind = if i % 2 == 0 { IdleKind::Plain } else { IdleKind::Subscriber };
             let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
@@ -182,9 +277,13 @@ pub(super) fn drive_idle_phase(
             IdleState::Refused | IdleState::Closed { .. } => {}
         }
     }
-    idle.done = idle
-        .clients
-        .iter()
-        .all(|c| matches!(c.state, IdleState::Refused | IdleState::Closed { .. }));
+    if let Some(raise) = idle.raise.as_mut() {
+        raise.step(nets, violations);
+    }
+    idle.done = idle.raise.as_ref().is_none_or(HotRaise::done)
+        && idle
+            .clients
+            .iter()
+            .all(|c| matches!(c.state, IdleState::Refused | IdleState::Closed { .. }));
     idle.done
 }

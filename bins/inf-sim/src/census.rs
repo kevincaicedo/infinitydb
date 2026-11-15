@@ -21,7 +21,10 @@
 //!   that found the extent-seal window full (`turn_refused = 0`, the
 //!   release form of `len + w ≤ 16`; token `turn-refused`).
 //! - Liveness: a server cell has its timer owners' row, which its plane
-//!   builds before its loop exists; a cell holding a tiered namespace has
+//!   builds before its loop exists, and on a node of more than one cell the
+//!   rows of its three per-origin deques (ADR-0177 D6: `ns-applies`,
+//!   `owner-pubs`, `gated`), which it builds for each peer; a cell holding a
+//!   tiered namespace has
 //!   the reclaim marks', the seal marks' and the hole marks' rows, which its
 //!   tables register on the plane's census; and a cell whose durable plane
 //!   is built has
@@ -48,6 +51,13 @@ const HOLE_MARKS_ROW: &str = inf_store::limits::HOLE_MARKS.name();
 const EXTENT_WINDOW_ROW: &str = "extent-window";
 /// The timer owners' census row, which every server plane registers.
 const TIMER_OWNERS_ROW: &str = inf_server::limits::SERVER_TIMER_OWNERS.name();
+/// The rows of the work a server plane parks for its peers, one deque per
+/// peer under each (ADR-0177 D6).
+const PARKED_ROWS: [&str; 3] = [
+    inf_server::limits::NS_APPLIES.name(),
+    inf_server::limits::OWNER_PUBS.name(),
+    inf_server::limits::GATED_VERDICTS.name(),
+];
 
 /// What a cell's planes hold at the end of a life, beside its census.
 #[derive(Clone, Copy, Debug, Default)]
@@ -55,6 +65,9 @@ pub(crate) struct CellFacts {
     /// The cell is a server plane, which builds its timer set and its
     /// owners before its loop exists.
     pub(crate) server_plane: bool,
+    /// The node's other cells, for each of which a server plane parks work
+    /// in its three per-origin deques.
+    pub(crate) peers: u16,
     /// Tiered namespaces the cell's tier plane serves (none before the
     /// cell's recovery has built that plane).
     pub(crate) tiered_tables: usize,
@@ -99,6 +112,15 @@ impl CensusVerdict {
                 "CAP CENSUS VIOLATION cell {cell}: cap-row-missing — a server plane and no \
                  `{TIMER_OWNERS_ROW}` row"
             ));
+        }
+        for row in PARKED_ROWS {
+            if facts.server_plane && facts.peers > 0 && census.row(row).is_none() {
+                self.violations.push(format!(
+                    "CAP CENSUS VIOLATION cell {cell}: cap-row-missing — a server plane with {} \
+                     peer(s) and no `{row}` row",
+                    facts.peers
+                ));
+            }
         }
         let tiered_tables = facts.tiered_tables;
         for row in [EPOCH_MARKS_ROW, SEAL_MARKS_ROW, HOLE_MARKS_ROW] {
@@ -230,6 +252,48 @@ mod tests {
         let mut control = CensusVerdict::default();
         control.judge(0, &census, CellFacts::default());
         assert!(control.violations.is_empty(), "no tiered namespace, no row owed");
+    }
+
+    /// The per-origin deques' liveness (ADR-0177 D6): a server plane with
+    /// peers and without the three rows is red, one violation a row; with
+    /// them, or with no peer, green.
+    #[test]
+    fn a_server_cell_with_peers_without_its_parked_rows_is_red() {
+        const TIMERS: Cap = Cap::entries::<1>("timer-owners", CapFill::Serving);
+        let facts = CellFacts { server_plane: true, peers: 2, ..CellFacts::default() };
+        let (bare, serve_mark) = CapCensus::new(CellId(1));
+        let _owners = CappedSlab::<u8, u64, Retire>::builder(TIMERS, &bare).expect("built");
+        serve_mark.take();
+        let mut red = CensusVerdict::default();
+        red.judge(1, &bare, facts);
+        assert_eq!(red.violations.len(), 3, "{:?}", red.violations);
+        for (violation, row) in red.violations.iter().zip(PARKED_ROWS) {
+            assert!(
+                violation.contains("cap-row-missing") && violation.contains(row),
+                "{violation}"
+            );
+        }
+        let mut alone = CensusVerdict::default();
+        alone.judge(1, &bare, CellFacts { peers: 0, ..facts });
+        assert!(alone.violations.is_empty(), "{:?}", alone.violations);
+        let (census, serve_mark) = CapCensus::new(CellId(1));
+        let _owners = CappedSlab::<u8, u64, Retire>::builder(TIMERS, &census).expect("built");
+        let deques: Vec<_> = PARKED_ROWS
+            .iter()
+            .map(|&name| {
+                let cap = match name {
+                    "ns-applies" => inf_server::limits::NS_APPLIES,
+                    "owner-pubs" => inf_server::limits::OWNER_PUBS,
+                    _ => inf_server::limits::GATED_VERDICTS,
+                };
+                CappedDeque::<u8, Reserve>::new(cap, &census).expect("built")
+            })
+            .collect();
+        serve_mark.take();
+        let mut green = CensusVerdict::default();
+        green.judge(1, &census, facts);
+        assert!(green.violations.is_empty(), "{:?}", green.violations);
+        drop(deques);
     }
 
     /// The timer owners' liveness: a server plane's census without the

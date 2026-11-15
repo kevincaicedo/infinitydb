@@ -49,6 +49,19 @@ impl OwnedCmd {
         OwnedCmd { buf }
     }
 
+    /// A flat command over `buf`, which holds one block `stage_argv_block`
+    /// wrote at offset 0 (the same layout): one flat copy behind one
+    /// pointer, as a parked fabric entry holds its request (ADR-0177 D6).
+    pub(super) fn from_staged(buf: Vec<u8>) -> OwnedCmd {
+        OwnedCmd { buf }
+    }
+
+    /// The flat copy's length in bytes, its header included: what it holds,
+    /// not its buffer's capacity.
+    pub(super) fn len_bytes(&self) -> u64 {
+        self.buf.len() as u64
+    }
+
     pub(super) fn argc(&self) -> usize {
         u32::from_le_bytes(self.buf[..4].try_into().expect("header")) as usize
     }
@@ -116,8 +129,9 @@ impl Conn {
 /// The slot every connection key is below: the completion token carries
 /// the slot in 24 bits (`inf_runtime::MAX_SLOT`), and the top value is
 /// reserved for the accept the slab refused (see `on_completion`'s
-/// `Accepted` arm) so its `Close` completion routes to no connection.
-pub(super) const CONN_SLOT_CAP: u32 = inf_runtime::MAX_SLOT;
+/// `Accepted` arm) so its `Close` completion routes to no connection. The
+/// boot capacity's ceiling is the same bound (`limits::CONN_TASKS_MAX`).
+pub(super) const CONN_SLOT_CAP: u32 = crate::limits::CONN_TASKS_MAX;
 
 /// Redis's reply past `maxclients` (networking.c, measured 8.0.5).
 // reply-outcome-allow: a connection frame copied to a send buffer, no reply (ADR-0123 D1)

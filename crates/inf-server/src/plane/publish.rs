@@ -271,14 +271,15 @@ pub(super) async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Cl
     let mut reserve = shared.fan_reserve.take();
     debug_assert!(reserve.is_some(), "the running owner pump holds the cell's fan reserve");
     loop {
-        let Some(item) = shared.pub_queue.borrow_mut().pop_front() else {
+        // The origins in rotation, each one's publishes in arrival order.
+        let Some((origin, item)) = shared.owner_pubs.borrow_mut().pop_rotating(&shared.node) else {
             // Put back in the step that clears the flag, no await between,
             // so the pump the next drain spawns finds it.
             shared.fan_reserve.set(reserve);
             shared.pub_pump_active.set(false);
             return;
         };
-        let (mut total, _) = deliver_local(&shared, &item.channel, &item.payload, None);
+        let (mut total, _) = deliver_local(&shared, item.channel(), item.payload(), None);
         let mut fold = |outcome: OwnedOutcome| {
             if let OwnedOutcome::Int(n) = outcome {
                 total += n;
@@ -287,15 +288,17 @@ pub(super) async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Cl
         match reserve.as_mut() {
             Some(reserve) => {
                 let mut legs = FanLegs::open(reserve, &shared.node.fabric_reserve_refused_cell);
-                fan_legs(&shared, &item, &mut legs).await;
+                fan_legs(&shared, origin, &item, &mut legs).await;
                 legs.settle(&mut fold).await;
             }
-            None => fan_unreserved(&shared, &item, &mut fold).await,
+            None => fan_unreserved(&shared, origin, &item, &mut fold).await,
         }
         // Publish the reply now — the origin's pump is suspended on it.
         let mut fabric = shared.fabric.borrow_mut();
-        fabric.reply(item.origin, item.token, &Outcome::Int(total));
+        fabric.reply(origin, item.token, &Outcome::Int(total));
         fabric.flush();
+        drop(fabric);
+        shared.recycle_cmd_buf(item.frame.into_buf());
     }
 }
 
@@ -303,20 +306,21 @@ pub(super) async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Cl
 /// (`fan_targets`), each on the reserved credit.
 async fn fan_legs<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    origin: CellId,
     item: &OwnerPub,
     legs: &mut FanLegs<'_>,
 ) {
-    let targets = shared.pubsub.borrow().fan_targets(&item.channel, shared.cell.0);
+    let targets = shared.pubsub.borrow().fan_targets(item.channel(), shared.cell.0);
     for cell in targets {
-        let tag = leg_tag(item, cell);
+        let tag = leg_tag(item, origin, cell);
         #[cfg(not(inf_canary_fan_draws_general))]
         let sent =
-            send_fan_leg(shared, legs, CellId(cell), &item.channel, &item.payload, tag).await;
+            send_fan_leg(shared, legs, CellId(cell), item.channel(), item.payload(), tag).await;
         // Canary: every leg a general send that waits for a credit, as if
         // no credit were kept for the fan.
         #[cfg(inf_canary_fan_draws_general)]
         let sent = {
-            let fan = PubFanArgv::new(&item.channel, &item.payload, tag);
+            let fan = PubFanArgv::new(item.channel(), item.payload(), tag);
             let to = CellId(cell);
             send_apply(shared, to, ApplyOrigin::Program, Protocol::Resp2, 0, fan.argv())
                 .await
@@ -333,13 +337,14 @@ async fn fan_legs<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 /// leg, the replies folded in leg order.
 async fn fan_unreserved<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    origin: CellId,
     item: &OwnerPub,
     fold: &mut impl FnMut(OwnedOutcome),
 ) {
-    let targets = shared.pubsub.borrow().fan_targets(&item.channel, shared.cell.0);
+    let targets = shared.pubsub.borrow().fan_targets(item.channel(), shared.cell.0);
     let mut waiters = Vec::new();
     for cell in targets {
-        let fan = PubFanArgv::new(&item.channel, &item.payload, leg_tag(item, cell));
+        let fan = PubFanArgv::new(item.channel(), item.payload(), leg_tag(item, origin, cell));
         let to = CellId(cell);
         let refused = &shared.node.fabric_reserve_refused_cell;
         refused.set(refused.get() + 1);
@@ -357,11 +362,8 @@ async fn fan_unreserved<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
 
 /// ADR-0101 D2: the origin cell's leg echoes the publisher tag; every other
 /// leg keeps the three-arg form.
-fn leg_tag(item: &OwnerPub, cell: u16) -> Option<(&[u8], &[u8])> {
-    item.tag
-        .as_ref()
-        .filter(|_| cell == item.origin.0)
-        .map(|(conn, seq)| (conn.as_slice(), seq.as_slice()))
+fn leg_tag(item: &OwnerPub, origin: CellId, cell: u16) -> Option<(&[u8], &[u8])> {
+    item.tag().filter(|_| cell == origin.0)
 }
 
 /// A publisher subscribed to its own channel reads its frames after its
@@ -519,7 +521,6 @@ pub(super) fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clo
     argv: &[&[u8]],
     scratch: &mut ReplyStream,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
-    pubs: &mut Vec<OwnerPub>,
 ) -> bool {
     let name = argv[0];
     if name.eq_ignore_ascii_case(b"INF.PUBFAN") && matches!(argv.len(), 3 | 5) {
@@ -541,14 +542,19 @@ pub(super) fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clo
         true
     } else if name.eq_ignore_ascii_case(b"INF.PUB") && matches!(argv.len(), 3 | 5) {
         // Owner leg of a remote PUBLISH: park for the owner pump (the
-        // fabric is mutably borrowed by this drain; fan-out needs sends).
-        pubs.push(OwnerPub {
-            origin: from,
-            token,
-            channel: argv[1].to_vec(),
-            payload: argv[2].to_vec(),
-            tag: (argv.len() == 5).then(|| (argv[3].to_vec(), argv[4].to_vec())),
+        // fabric is mutably borrowed by this drain; fan-out needs sends),
+        // its origin's deque reserving before the frame's one flat copy
+        // (ADR-0177 D6); a full deque, derived never, refuses before any
+        // effect.
+        let parked = shared.owner_pubs.borrow_mut().publish_with(from, &shared.node, || {
+            let mut buf = shared.take_cmd_buf();
+            buf.clear();
+            stage_argv_block(&mut buf, &argv[1..]);
+            OwnerPub { token, frame: OwnedCmd::from_staged(buf) }
         });
+        if let Err(ParkedFull) = parked {
+            staged.push((from, token, StagedReply::Refused));
+        }
         true
     } else if name.eq_ignore_ascii_case(b"INF.SUBD") && argv.len() == 4 {
         match SubKind::from_wire_tag(argv[1]) {

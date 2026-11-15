@@ -694,8 +694,13 @@ impl PlaneObserver for SharedOracle {
         oracle.trace.extend_from_slice(&(reply.len() as u32).to_le_bytes());
         oracle.trace.extend_from_slice(reply);
 
-        // Scatter legs belong to the audit oracle (see `is_scatter_class`).
-        if lookup(argv[0]).is_some_and(|meta| is_scatter_class(meta.id)) {
+        // Scatter legs belong to the audit oracle (see `is_scatter_class`),
+        // and `CONFIG` to the hot-raise probe: its replies read the node's
+        // configuration, which a replay on a fresh model connection does
+        // not hold.
+        if lookup(argv[0])
+            .is_some_and(|meta| is_scatter_class(meta.id) || meta.id == CommandId::Config)
+        {
             oracle.replays_skipped += 1;
             return;
         }
@@ -1397,16 +1402,18 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         let pool = BufferPool::new(128, 1024);
         // Sim wall anchor stays (0, 0): wall time == virtual time, fully
         // deterministic; the RANDOMKEY stream is seeded from the scenario.
-        let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
-        node.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
-        // ADR-0123: the admission and idle knobs are boot config here
-        // (the plane reads them at assembly — D5).
+        // ADR-0123: the admission and idle knobs are boot config here (the
+        // plane reads them at assembly — D5); `maxclients` is the node's boot
+        // capacity, as `infinityd --maxclients` sets it (A1).
+        let mut config = inf_server::ConfigStore::default();
         if scenario.maxclients != 0 {
-            node.config
-                .borrow_mut()
-                .set(b"maxclients", scenario.maxclients.to_string().as_bytes())
-                .expect("maxclients is hot");
+            let cells = inf_foundation::CellCount::new(scenario.cells).expect("a scenario's cells");
+            let capacity = inf_server::BootCapacity::new(scenario.maxclients, cells)
+                .expect("a scenario's boot capacity");
+            config = config.with_boot_capacity(capacity);
         }
+        let node = Rc::new(NodeInfo::try_new(config).expect("fixture cache allocation"));
+        node.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
         if scenario.timeout_secs != 0 {
             node.config
                 .borrow_mut()
@@ -1892,6 +1899,16 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         }
     }
 
+    // The work parked for a peer (ADR-0177 D6): no op refused at a full
+    // per-origin deque on any cell, derived never as an origin holds at
+    // most its credits' un-replied ops.
+    for (i, node) in nodes.iter().enumerate() {
+        let refused = node.fabric_parked_refused.get();
+        if refused != 0 {
+            violations.push(format!("PARKED REFUSED: cell {i}, {refused} ops"));
+        }
+    }
+
     // The waker's wiring check (ADR-0003 A1.4): every cell's `waker_foreign_ops`, the gauge
     // INFO's `# Tripwires` renders, reads 0. The simulator runs every cell's loop on one thread,
     // so a waker used from another cell's step takes the owner lane and is not counted: a
@@ -1930,6 +1947,20 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         if report.refused_clients == 0 {
             violations
                 .push("admission: no client was refused — the bound was never reached".into());
+        }
+        // The hot raise past the boot capacity changed no key on any cell
+        // (ADR-0123 A1): the raise's cell read it over the wire, the rest
+        // here, where no client of theirs asked.
+        let boot = scenario.maxclients.to_string();
+        for (i, node) in nodes.iter().enumerate() {
+            let config = node.config.borrow();
+            let (maxclients, maxmemory) = (config.get("maxclients"), config.get("maxmemory"));
+            if maxclients != Some(boot.as_str()) || maxmemory != Some("0") {
+                violations.push(format!(
+                    "hot-raise: cell {i} reads maxclients {maxclients:?} and maxmemory \
+                     {maxmemory:?} after a raise past its boot capacity {boot}"
+                ));
+            }
         }
     }
     if scenario.idle_clients != 0 && !report.stalled {
@@ -2041,6 +2072,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     for (index, (_, plane)) in cells.iter().enumerate() {
         let facts = crate::census::CellFacts {
             server_plane: true,
+            peers: scenario.cells - 1,
             tiered_tables: plane.keyspace().tiered_tables(),
             turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
         };

@@ -1085,10 +1085,43 @@ ordered_rows=(
   # earlier on a ring without deferred task work.
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_with_receive_posts_no_recv_after_closed recv-after-closed"
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_posts_no_recv_after_closed recv-after-closed"
+  # The divert parks an origin's durable apply behind its pump while the pump is applying or
+  # holds its work (ADR-0083 D1), so an origin has one open gated slot, its back (ADR-0177 D6).
+  # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
+  # origin holds its slot on a held cold read, and the flat write's open stops the cell.
+  "inf_canary_divert_queue_only m0-capacity second-open-slot --close-leg gated-cold"
+  # An `always` write whose verdict is an error reply leaves at once, not gated (ADR-0177 D6).
+  # Planted, the error waits as a verdict for the next record's `seq`, and so for the hold.
+  "inf_canary_error_reply_gated m0-capacity error-held --close-leg gated-error"
+  # An `always` apply whose verdict is a reply gives its placeholder back (ADR-0177 D6), so its
+  # origin's next apply opens a slot. Planted, an error reply leaves the placeholder at the
+  # origin's back, and the next write's open stops the cell.
+  "inf_canary_gated_error_keeps_placeholder m0-capacity second-open-slot --close-leg gated-error"
+  # The gated task publishes an `always` verdict only once the owner's fsync watermark covers
+  # its record (ADR-0177 D3). Planted, it publishes every filled front, so a remote `always`
+  # write is acknowledged before it is durable and the power cut loses it. The lane seed's cut
+  # meets no such ack; this named seed's does.
+  "inf_canary_gated_ignores_watermark m2-durable DURABILITY --seed 0xc1000c"
+  # The same plant on a peer's credits' worth of remote `always` writes while the owner's
+  # fsync is held: no barrier completes, so at every seed the acks are read under the hold.
+  "inf_canary_gated_ignores_watermark m0-capacity acked-under-hold --close-leg gated-hold"
   # The net's own invariant: no chunk of an fd is posted after its end of stream. Its close
   # legs' shared reap posts a closed client's last chunk and its EOF in one reap, data first;
   # planted, the EOF goes first and the chunk after it.
   "inf_canary_net_data_after_eof crate-test inf-sim lib a_shared_reap_posts_the_chunk_before_the_end_of_stream net-data-after-eof"
+  # The parked-bytes gauge sums the bytes behind the entries in the per-origin deques: a pop
+  # subtracts its entry's (ADR-0177 D6). Planted, a pop subtracts nothing, so the peer that
+  # parked the small-credit leg's applies reads its gauge above 0 once every reply is in.
+  "inf_canary_parked_bytes_kept m0-capacity parked-bytes-kept --close-leg small-credit"
+  # A per-origin deque holds its origin's credits, so the general window an origin fills is
+  # never refused (ADR-0177 D6). Planted, it holds two fewer, and the window's last is refused.
+  "inf_canary_parked_cap_short m0-capacity parked-refused --close-leg small-credit"
+  # A per-origin deque holds its origin's credits' worth of ops, so none is refused (ADR-0177
+  # D6); the durable driver reads the refusals at each life's end. Planted, a deque holds one.
+  "inf_canary_parked_deque_of_one m2-durable PARKED"
+  # A general send keeps one credit free for the publish fan (ADR-0192 D2), so an origin parks
+  # at most 7 applies at a peer of 8 credits. Planted, the guard is gone and all 8 arrive.
+  "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.
