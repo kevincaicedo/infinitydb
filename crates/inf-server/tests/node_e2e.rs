@@ -10362,6 +10362,33 @@ fn timeout_closes_idle_connections_but_not_subscribers() {
     node.stop();
 }
 
+/// `DEBUG SLEEP 3` under `timeout 1` on two cells: the issuer is owed its
+/// `+OK` until the sleep ends, so no sweep may close it before; it reads the
+/// `+OK`, then the server closes it a timeout later (ADR-0193 D1, D2). The
+/// stall's own sweep judges a connection from the later of its clock and the
+/// stall's end, so the close comes after the reply, never in its place.
+#[test]
+#[ignore = "timeout judges a connection by its receive clock while its cell sleeps, so the \
+            issuer of DEBUG SLEEP 3 under timeout 1 is closed with its +OK unsent; red until a \
+            connection the server owes a reply is never judged and a stall's end restarts its \
+            clock"]
+fn timeout_answers_a_reply_its_cell_held() {
+    let node = Node::start(2);
+    let mut admin = node.connect();
+    admin.write_all(&cmd(&[b"CONFIG", b"SET", b"timeout", b"1"])).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    let mut issuer = node.connect();
+    issuer.write_all(&cmd(&[b"DEBUG", b"SLEEP", b"3"])).expect("write");
+    let delivered = read_to_close(&mut issuer, "the issuer of DEBUG SLEEP 3 under timeout 1");
+    assert_eq!(
+        delivered,
+        b"+OK\r\n",
+        "the issuer read {:?} before its close",
+        String::from_utf8_lossy(&delivered)
+    );
+    node.stop();
+}
+
 /// Batch 50 (review 2026-08-30, F-L15-05 `tcp-keepalive`): accepted
 /// sockets carry `SO_KEEPALIVE` with the configured idle time (default
 /// 300 s), visible as the kernel's keepalive timer on the server-side
