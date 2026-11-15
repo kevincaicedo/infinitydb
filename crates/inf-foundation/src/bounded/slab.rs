@@ -286,7 +286,9 @@ impl<T, G: Generation, P: GenerationPolicy> CappedSlab<T, G, P> {
     /// A free slot when one can serve; `Full` when every slot that can
     /// serve is live (the row's crossings up by one); `Exhausted` when every
     /// slot has retired.
-    #[inline]
+    // Inlined where it is called, so its answer stays in registers: out of
+    // line it is returned through memory, a store and a load a word.
+    #[inline(always)]
     pub fn reserve(&mut self) -> SlabReserved<'_, T, G, P> {
         if !self.has_room() {
             return if self.store.capacity_now() == 0 {
@@ -532,7 +534,10 @@ trait SlotBorrow<G> {
 /// store's walk to the handle's index, never runs for it; no slot is
 /// `Vacant`; a slot's occupant at `generation` is `Live`; any other slot is
 /// `Stale`.
-#[inline]
+// Folded into each operation, so a benchmark's step and the server's call
+// sites compile the lookup in one shape and a count read on the bench is the
+// server's code (ADR-0205 A2.1).
+#[inline(always)]
 fn named<G, S: SlotBorrow<G>>(
     foreign: bool,
     slot: impl FnOnce() -> Option<S>,

@@ -29,7 +29,9 @@ use core::mem;
 use std::rc::Rc;
 
 use super::census::{CapCensus, CapRowHandle};
-use super::store::{BuildStep, FreeSlot, RetireStep as StoreRetire, Slot, SlotStore};
+use super::store::{
+    BuildStep, FreeSlot, LevelWalk, RetireStep as StoreRetire, Slot, SlotAccess, SlotStore,
+};
 use super::{Cap, CapError, CapFill};
 use crate::ids::CellId;
 
@@ -355,19 +357,10 @@ impl<K: ExactKey, V> CappedMap<K, V> {
     /// (its fill byte, tested once). An absent key changes nothing.
     #[inline]
     pub fn remove(&mut self, key: K) -> Option<V> {
-        let mut node = self.root?;
-        let (mut parent, mut grandparent) = (None, None);
-        let leaf = loop {
-            match node {
-                Node::Leaf(index) => break index,
-                Node::Branch(index) => {
-                    let branch = self.branch(index);
-                    let side = usize::from(key.bit(branch.bit));
-                    grandparent = parent;
-                    parent = Some((index, side));
-                    node = branch.children[side];
-                }
-            }
+        let root = self.root?;
+        let (leaf, parent, grandparent) = match root {
+            Node::Leaf(index) => (index, None, None),
+            Node::Branch(first) => self.branches.walk_with(Lineage { first, key }),
         };
         if self.leaf(leaf).key != key {
             return None;
@@ -402,15 +395,9 @@ impl<K: ExactKey, V> CappedMap<K, V> {
     /// the leaves, so the walk visits at most `K::BITS` branches.
     #[inline]
     fn nearest(&self, root: Node, key: K) -> u32 {
-        let mut node = root;
-        loop {
-            match node {
-                Node::Leaf(index) => return index,
-                Node::Branch(index) => {
-                    let branch = self.branch(index);
-                    node = branch.children[usize::from(key.bit(branch.bit))];
-                }
-            }
+        match root {
+            Node::Leaf(index) => index,
+            Node::Branch(first) => nearest_walk(&self.branches, first, key),
         }
     }
 
@@ -419,20 +406,10 @@ impl<K: ExactKey, V> CappedMap<K, V> {
     /// branch at a later bit, and the branch and side whose link names it
     /// (`None`: the root names it). At most `K::BITS` visits.
     fn split_point(&self, root: Node, key: K, bit: u32) -> (Option<(u32, usize)>, Node) {
-        let (mut parent, mut node) = (None, root);
-        while let Node::Branch(index) = node {
-            let branch = self.branch(index);
-            // The nearest leaf agrees with `key` above `bit`, so no branch
-            // on the shared path tests `bit` itself.
-            debug_assert_ne!(branch.bit, bit, "a split bit on the shared path");
-            if branch.bit > bit {
-                break;
-            }
-            let side = usize::from(key.bit(branch.bit));
-            parent = Some((index, side));
-            node = branch.children[side];
+        match root {
+            Node::Leaf(_) => (None, root),
+            Node::Branch(first) => self.branches.walk_with(SplitPoint { first, key, bit }),
         }
-        (parent, node)
     }
 
     /// The admission compare, `live < N`: the slab's form, on the map's own
@@ -497,7 +474,9 @@ impl<K: ExactKey, V> CappedMap<K, V> {
         Admission::Vacant(VacantSlot { key, leaf, place, live, high_water, row })
     }
 
-    #[inline]
+    /// One branch outside a walk: `remove`'s sibling, its one caller, read
+    /// beside its walk.
+    #[inline(always)]
     fn branch(&self, index: u32) -> &Branch {
         live(self.branches.slot(index))
     }
@@ -505,6 +484,99 @@ impl<K: ExactKey, V> CappedMap<K, V> {
     #[inline]
     fn leaf(&self, index: u32) -> &Leaf<K, V> {
         live(self.leaves.slot(index))
+    }
+}
+
+/// `nearest`'s walk from branch `first`, out of line: one copy a key type,
+/// called by every get and admit with the store, the index and the key as
+/// arguments, so a key of two words passes in two registers.
+#[inline(never)]
+fn nearest_walk<K: ExactKey>(branches: &SlotStore<Branch, ()>, first: u32, key: K) -> u32 {
+    branches.walk_with(Nearest { first, key })
+}
+
+/// `nearest`'s walk, on the branch store's root level.
+struct Nearest<K> {
+    first: u32,
+    key: K,
+}
+
+impl<K: ExactKey> LevelWalk<Branch, ()> for Nearest<K> {
+    type Output = u32;
+
+    // One copy in each root level's arm of `walk_with`: the level is matched
+    // once, outside the visit loop.
+    #[inline(always)]
+    fn walk<A: SlotAccess<Branch, ()>>(self, access: &A) -> u32 {
+        let mut node = Node::Branch(self.first);
+        loop {
+            match node {
+                Node::Leaf(index) => return index,
+                Node::Branch(index) => {
+                    let branch = live(access.slot(index));
+                    node = branch.children[usize::from(self.key.bit(branch.bit))];
+                }
+            }
+        }
+    }
+}
+
+/// `split_point`'s walk.
+struct SplitPoint<K> {
+    first: u32,
+    key: K,
+    bit: u32,
+}
+
+impl<K: ExactKey> LevelWalk<Branch, ()> for SplitPoint<K> {
+    type Output = (Option<(u32, usize)>, Node);
+
+    // As `Nearest`'s, one copy in each root level's arm of `walk_with`.
+    #[inline(always)]
+    fn walk<A: SlotAccess<Branch, ()>>(self, access: &A) -> Self::Output {
+        let (mut parent, mut node) = (None, Node::Branch(self.first));
+        while let Node::Branch(index) = node {
+            let branch = live(access.slot(index));
+            debug_assert_ne!(branch.bit, self.bit, "a split bit on the shared path");
+            if branch.bit > self.bit {
+                break;
+            }
+            let side = usize::from(self.key.bit(branch.bit));
+            parent = Some((index, side));
+            node = branch.children[side];
+        }
+        (parent, node)
+    }
+}
+
+/// `remove`'s walk: the leaf, its parent and grandparent with their sides.
+struct Lineage<K> {
+    first: u32,
+    key: K,
+}
+
+type Parent = Option<(u32, usize)>;
+
+impl<K: ExactKey> LevelWalk<Branch, ()> for Lineage<K> {
+    type Output = (u32, Parent, Parent);
+
+    // As `Nearest`'s, one copy in each root level's arm of `walk_with`.
+    #[inline(always)]
+    fn walk<A: SlotAccess<Branch, ()>>(self, access: &A) -> Self::Output {
+        let mut node = Node::Branch(self.first);
+        let (mut parent, mut grandparent) = (None, None);
+        loop {
+            match node {
+                Node::Leaf(index) => return (index, parent, grandparent),
+                Node::Branch(index) => {
+                    let branch = live(access.slot(index));
+                    let side = usize::from(self.key.bit(branch.bit));
+                    grandparent = parent;
+                    parent = Some((index, side));
+                    node = branch.children[side];
+                }
+            }
+        }
     }
 }
 
@@ -737,7 +809,7 @@ mod tests {
 
     use super::*;
     use crate::bounded::{CapRow, CensusPhase, ServeMark};
-    use crate::limits::{CAP_CENSUS_SLABS_MAX, MAP_KEY_BITS_MAX};
+    use crate::limits::{CAP_CENSUS_SLABS_MAX, MAP_KEY_BITS_MAX, directory_levels};
     use crate::rng::{Entropy, SplitMix64};
 
     const CELL: CellId = CellId(9);
@@ -878,10 +950,16 @@ mod tests {
     /// The model: a `BTreeMap<K, V>` sharing no code with the map. Admits
     /// with publish or replace, removals, writes through `get_mut` and
     /// dropped admissions on keys drawn from `keys`, each checked against
-    /// the model; after every op the tree is judged whole and every key of
-    /// the pool read back; at the end the row's high water, crossings and
-    /// capacity equal the model's.
-    fn model_run<K: ExactKey + Ord>(cap: Cap, keys: &[K], seed: u64, ops: u32) -> Reach {
+    /// the model; after every `ops_per_judge` ops and after the last, the
+    /// tree is judged whole and every key of the pool read back; at the end
+    /// the row's high water, crossings and capacity equal the model's.
+    fn model_run<K: ExactKey + Ord>(
+        cap: Cap,
+        keys: &[K],
+        seed: u64,
+        ops: u32,
+        ops_per_judge: u32,
+    ) -> Reach {
         let (census, _mark) = census();
         let (mut map, _) = built::<K, u64>(cap, &census);
         let mut model: BTreeMap<K, u64> = BTreeMap::new();
@@ -935,6 +1013,9 @@ mod tests {
                     Admission::Occupied(_) => {}
                 },
             }
+            if (op + 1) % ops_per_judge != 0 && op + 1 != ops {
+                continue;
+            }
             judge(&map, &model);
             for key in keys {
                 assert_eq!(map.get(*key), model.get(key), "{key:?}: get");
@@ -978,7 +1059,7 @@ mod tests {
         {
             let seed = 0x3A9 + index as u64;
             let keys = pool_u64(seed, 2 * cap.entries_max() as usize + 3);
-            let reach = model_run(cap, &keys, seed, 3_000);
+            let reach = model_run(cap, &keys, seed, 3_000, 1);
             assert!(reach.full > 0, "{cap:?} never reached its cap: {reach:?}");
             total.occupied += reach.occupied;
             total.vacant += reach.vacant;
@@ -986,6 +1067,23 @@ mod tests {
             total.removed += reach.removed;
         }
         assert!(total.occupied > 0 && total.vacant > 0 && total.removed > 0, "{total:?}");
+    }
+
+    /// Both stores at two directory levels: 16,386 leaves and 16,385
+    /// branches are past the 16,384 slots one level holds, so every walk and
+    /// slot access follows a second link. The run reaches the cap, so every
+    /// slot serves; each op is checked against the model as it runs, and
+    /// the tree is judged whole every 4,096 ops.
+    #[test]
+    fn the_map_equals_its_model_at_two_directory_levels() {
+        let cap = Cap::entries::<16_386>("m-16386", CapFill::Serving);
+        let entries = u64::from(cap.entries_max());
+        assert_eq!(directory_levels(entries), 2, "the leaf store's levels");
+        assert_eq!(directory_levels(entries - 1), 2, "the branch store's levels");
+        let keys = pool_u64(0x3B0, 2 * cap.entries_max() as usize + 3);
+        let reach = model_run(cap, &keys, 0x3B0, 60_000, 4_096);
+        assert!(reach.full > 0, "{cap:?} never reached its cap: {reach:?}");
+        assert!(reach.occupied > 0 && reach.removed > 0, "{reach:?}");
     }
 
     /// Every key type of the sealed set under the model: the widest words
@@ -1003,11 +1101,11 @@ mod tests {
         let narrow: Vec<u8> = (0..=u8::MAX).collect();
         let cells: Vec<CellId> = (0..120).map(|id| CellId(id * 547)).collect();
         let cap = Cap::entries::<64>("keys", CapFill::Serving);
-        assert!(model_run(cap, &wide_pool, 1, 2_000).full > 0);
-        assert!(model_run(cap, &pairs, 2, 2_000).full > 0);
-        assert!(model_run(cap, &narrow, 3, 2_000).full > 0);
-        assert!(model_run(cap, &cells, 4, 2_000).full > 0);
-        let reach = model_run(Cap::entries::<2>("unit", CapFill::Serving), &[()], 5, 500);
+        assert!(model_run(cap, &wide_pool, 1, 2_000, 1).full > 0);
+        assert!(model_run(cap, &pairs, 2, 2_000, 1).full > 0);
+        assert!(model_run(cap, &narrow, 3, 2_000, 1).full > 0);
+        assert!(model_run(cap, &cells, 4, 2_000, 1).full > 0);
+        let reach = model_run(Cap::entries::<2>("unit", CapFill::Serving), &[()], 5, 500, 1);
         assert_eq!(reach.full, 0, "the unit key is one key");
         assert!(reach.occupied > 0 && reach.vacant > 0 && reach.removed > 0, "{reach:?}");
     }
