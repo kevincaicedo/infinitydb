@@ -97,8 +97,8 @@ pub enum CloseLeg {
     /// tier reads are held, then a flat `always` `SET`: the `SET` parks
     /// behind the suspended apply, and both verdicts wait for the fsync.
     GatedCold,
-    /// An `always` `INCR` that errors, read under the held fsync, then the 8
-    /// `SET`s of `GatedHold`.
+    /// An `always` `INCR` that errors, read under the held fsync, then a
+    /// flat `always` `SET`, acked after the hold.
     GatedError,
 }
 

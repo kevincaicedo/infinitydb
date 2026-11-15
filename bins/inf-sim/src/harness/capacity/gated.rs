@@ -13,9 +13,8 @@
 //!   pump opens its slot and suspends on the held read; then another client
 //!   of X `SET`s a key of the flat namespace, which only the pump-active term
 //!   of the divert parks behind it.
-//! - `gated-error`: a client of X `INCR`s a key Y holds as text: its error is
-//!   a reply, read under the hold, and its slot is given back; then the 8
-//!   `SET`s of `gated-hold`.
+//! - `gated-error`: a client of X `INCR`s a key Y holds as text, its error a
+//!   reply read under the hold; then a `SET` in the flat namespace.
 //!
 //! Each clause a token: `frame-barrier-unheld`, `writes-unstaged`,
 //! `verdicts-unparked`, `gated-unpolled`, `cold-read-unheld` and
@@ -411,6 +410,7 @@ fn error(
     }
     owner.close(&mut run.node);
     let mut incr = run.client_in(X, FLAT)?;
+    let mut setter = [run.client_in(X, FLAT)?];
     run.disk.hold_barriers(Some(any_file));
     incr.send(&mut run.node, &[b"INCR", &text]);
     let mut error = None;
@@ -429,11 +429,13 @@ fn error(
         )),
         None => violations.push("error-held: the INCR's error waited for the hold".into()),
     }
-    incr.close(&mut run.node);
     let before = appended(run);
-    let mut clients = send_sets(run)?;
-    let early = step_held(run, &mut clients, before, GENERAL_WINDOW)?;
+    let name = padded_names_on(CELLS, Y, "gh", 1).remove(0);
+    setter[0].send(&mut run.node, &[b"SET", &name, b"1"]);
+    let early = step_held(run, &mut setter, before, 1)?;
     readings.push(("gated_high_water", high_water(run, "gated")));
     none_acked(&early, violations);
-    lifted(run, &mut clients, early, &[&b"+OK\r\n"[..]; SETS], violations)
+    lifted(run, &mut setter, early, &[&b"+OK\r\n"[..]], violations)?;
+    incr.close(&mut run.node);
+    Ok(())
 }

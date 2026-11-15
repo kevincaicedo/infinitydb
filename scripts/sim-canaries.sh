@@ -1083,6 +1083,9 @@ ordered_rows=(
   # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
   # origin holds its slot on a held cold read, and the flat write's open stops the cell.
   "inf_canary_divert_queue_only m0-capacity second-open-slot --close-leg gated-cold"
+  # An `always` write whose verdict is an error reply leaves at once, not gated (ADR-0177 D6).
+  # Planted, the error waits as a verdict for the next record's `seq`, and so for the hold.
+  "inf_canary_error_reply_gated m0-capacity error-held --close-leg gated-error"
   # An `always` apply whose verdict is a reply gives its placeholder back (ADR-0177 D6), so its
   # origin's next apply opens a slot. Planted, an error reply leaves the placeholder at the
   # origin's back, and the next write's open stops the cell.

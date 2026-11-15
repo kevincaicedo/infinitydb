@@ -204,6 +204,15 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                     let verdict = GatedVerdict::new(shared, token, seq, reply.detach());
                     shared.gate_fill(placeholder, verdict);
                 }
+                // Canary: an `always` write's error waits as a verdict for
+                // the next record's `seq`, not leaving at once.
+                #[cfg(inf_canary_error_reply_gated)]
+                NsApplyOutcome::Reply if placeholder.is_some() => {
+                    use crate::durable::ack_class::AckClasses;
+                    let next = shared.durable.borrow().as_ref().map_or(0, |d| d.staged_seq() + 1);
+                    let verdict = GatedVerdict::new(shared, token, next, reply.detach());
+                    shared.gate_fill(placeholder, verdict);
+                }
                 NsApplyOutcome::Reply => {
                     #[cfg(not(inf_canary_gated_error_keeps_placeholder))]
                     shared.gate_cancel(placeholder);
