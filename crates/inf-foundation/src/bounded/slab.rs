@@ -534,7 +534,10 @@ trait SlotBorrow<G> {
 /// store's walk to the handle's index, never runs for it; no slot is
 /// `Vacant`; a slot's occupant at `generation` is `Live`; any other slot is
 /// `Stale`.
-#[inline]
+// Folded into each operation, so a benchmark's step and the server's call
+// sites compile the lookup in one shape and a count read on the bench is the
+// server's code (ADR-0205 A2.1).
+#[inline(always)]
 fn named<G, S: SlotBorrow<G>>(
     foreign: bool,
     slot: impl FnOnce() -> Option<S>,
