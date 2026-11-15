@@ -688,8 +688,10 @@ const PLANE_START_TASKS: usize = CELLS as usize + 1;
 /// acks, in three waves of the share, then 48 clients churn through cells 0
 /// and 1. The most tasks a cell held at any step stays within its share and
 /// its plane-start pumps; at HEAD each closed subscriber's delta is a task
-/// of its own. Engagement: the first wave confirmed, then closed while cell
-/// 2 was held.
+/// of its own. Once quiet no cell counts a pattern: every closed
+/// subscriber's delta reached every peer.
+/// Engagement: the first wave confirmed, then closed while cell 2 was held,
+/// cell 0 owing a delta after the closes, else `VACUOUS tasks-unengaged`.
 fn tasks_leg(seed: u64) -> Rig {
     let mut rig = Rig::new(seed, (SHARE * usize::from(CELLS)) as u32, 15_000);
     rig.tasks_most = Some(vec![0; usize::from(CELLS)]);
@@ -705,6 +707,8 @@ fn tasks_leg(seed: u64) -> Rig {
         rig.fin(id);
     }
     let closed = rig.until("the first wave's closes", |rig| first.iter().all(|&id| rig.ended(id)));
+    let owed = rig.plane(X).suspended();
+    rig.read("deltas_owed", owed as u64);
     for wave in 1..3 {
         let ids: Vec<usize> = (0..SHARE).map(|_| rig.connect(X)).collect();
         for (n, &id) in ids.iter().enumerate() {
@@ -738,10 +742,29 @@ fn tasks_leg(seed: u64) -> Rig {
     for cell in 0..usize::from(CELLS) {
         rig.expect_vacant(cell, 0);
     }
-    if !(confirmed && closed) {
-        rig.violate("VACUOUS tasks-unengaged: the first wave never closed held".to_string());
+    rig.expect_no_pattern();
+    if !(confirmed && closed && owed >= 1) {
+        let text = "VACUOUS tasks-unengaged: the first wave never closed owing a held delta";
+        rig.violate(text.to_string());
     }
     rig
+}
+
+impl Rig {
+    /// No cell counts a pattern, each read over the wire by a fresh client
+    /// of its own (`PUBSUB NUMPAT`), else `pattern-count-after-close`.
+    fn expect_no_pattern(&mut self) {
+        for cell in 0..usize::from(CELLS) {
+            let probe = self.admitted(cell);
+            let count = integer(&self.call(probe, &[b"PUBSUB", b"NUMPAT"]));
+            self.read("patterns", count.unwrap_or(u64::MAX));
+            if count != Some(0) {
+                self.violate(format!(
+                    "pattern-count-after-close: cell {cell} counts {count:?} patterns once quiet"
+                ));
+            }
+        }
+    }
 }
 
 /// The share's clients on cell 0 each send a `DEL` of 100 keys cell 1 owns
