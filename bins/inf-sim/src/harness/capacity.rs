@@ -87,7 +87,7 @@ pub enum CloseLeg {
     /// 11 `+OK`s, then the protocol error, then the close.
     ProtocolOrder,
     /// 8 tiered `SET`s of 4,096 B toward a peer on a mesh of 8 credits: the
-    /// peer parks them, and its parked bytes are back at 0 once quiet.
+    /// peer parks 7 of them, and its parked bytes are back at 0 once quiet.
     SmallCredit,
 }
 
