@@ -287,6 +287,22 @@ pub const BOOT_FILE_OP_CHARGE_BYTES: u64 = 128 << 10;
 /// window for each failed retry.
 pub const ACCEPT_RETRY: Nanos = Nanos::from_millis(100);
 
+/// `--maxclients`'s default, the boot capacity `B` of a node assembled
+/// without one (ADR-0123 A1): connections per node. Owner: the assembly,
+/// which checks it with every boot value through `BootCapacity::new`.
+/// Crossing: none of its own; `CONFIG SET maxclients` above the node's `B`
+/// is refused whole with `BOOT_CAPACITY_REFUSAL`.
+pub const MAXCLIENTS_BOOT_DEFAULT: u32 = 10_000;
+
+/// Connection slots one cell holds at most (ADR-0123 A1): the ceiling of
+/// `C = max(1, B / cells)`, the connection token's slot range (2^24 − 1).
+/// Unit: connection slots, and from ADR-0177 D2 `conn` tasks, per cell.
+/// Owner: `BootCapacity::new`. Crossing: a boot value whose `C` passes it
+/// is refused before any cell is built.
+pub const CONN_TASKS_MAX: u32 = inf_runtime::MAX_SLOT;
+
+const _: () = assert!(MAXCLIENTS_BOOT_DEFAULT >= 1 && MAXCLIENTS_BOOT_DEFAULT <= CONN_TASKS_MAX);
+
 /// Data credits the plane keeps free toward each peer for the owner pump's
 /// publish fan (ADR-0192 D2): a general send stages only while more than
 /// this many credits toward its peer are free, so at least one stays free

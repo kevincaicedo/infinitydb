@@ -52,7 +52,96 @@ struct Entry {
 pub enum ConfigSetError {
     Unknown(String),
     Immutable(String),
-    Invalid { key: String, value: String },
+    Invalid {
+        key: String,
+        value: String,
+    },
+    /// A `maxclients` above the node's boot capacity (ADR-0123 A1): its
+    /// slots are fixed at boot, so the value is refused whole and the
+    /// caller answers [`BOOT_CAPACITY_REFUSAL`].
+    BootCapacity {
+        requested: u32,
+        capacity: u32,
+    },
+}
+
+/// The reply to a `CONFIG SET maxclients` above the boot capacity, ADR-0123
+/// A1's bytes: a value refused, not a reservation, so no key of the same
+/// `CONFIG SET` changes.
+pub const BOOT_CAPACITY_REFUSAL: &str =
+    "ERR maxclients exceeds boot capacity; restart with --maxclients";
+
+/// The node's connection capacity, fixed at boot (ADR-0123 A1): the boot
+/// value `B` of `--maxclients` and each cell's slot count
+/// `C = max(1, B / cells)`. Its one constructor is the check, so a value
+/// the embedding, the binary or the simulator hands a cell is one this
+/// check passed; every cell of a node gets the same one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BootCapacity {
+    maxclients: u32,
+    per_cell: u32,
+}
+
+/// Why a boot capacity was refused, before any cell is built.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BootCapacityRefused {
+    /// `B` is 0: the bound is `1..=u32::MAX`, Redis's.
+    Zero,
+    /// `C` passes [`CONN_TASKS_MAX`](crate::limits::CONN_TASKS_MAX), the
+    /// connection token's slot range.
+    PerCellOverCeiling { per_cell: u32, ceiling: u32 },
+}
+
+impl core::fmt::Display for BootCapacityRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            BootCapacityRefused::Zero => f.write_str("--maxclients is 1..=4294967295, got 0"),
+            BootCapacityRefused::PerCellOverCeiling { per_cell, ceiling } => write!(
+                f,
+                "--maxclients gives each cell {per_cell} connection slots, past the ceiling of \
+                 {ceiling} a cell's connection token addresses"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BootCapacityRefused {}
+
+impl BootCapacity {
+    /// `B` = `maxclients` for a node of `cells`, checked: `B` in
+    /// `1..=u32::MAX` and `C = max(1, B / cells)` at most
+    /// [`CONN_TASKS_MAX`](crate::limits::CONN_TASKS_MAX).
+    ///
+    /// # Errors
+    /// [`BootCapacityRefused`], before anything is built.
+    pub const fn new(
+        maxclients: u32,
+        cells: inf_foundation::CellCount,
+    ) -> Result<BootCapacity, BootCapacityRefused> {
+        if maxclients == 0 {
+            return Err(BootCapacityRefused::Zero);
+        }
+        // `cells` is nonzero by its type; below it each cell keeps one slot.
+        let share = maxclients / cells.get() as u32;
+        let per_cell = if share == 0 { 1 } else { share };
+        let ceiling = crate::limits::CONN_TASKS_MAX;
+        if per_cell > ceiling {
+            return Err(BootCapacityRefused::PerCellOverCeiling { per_cell, ceiling });
+        }
+        Ok(BootCapacity { maxclients, per_cell })
+    }
+
+    /// `B`: the node value `CONFIG SET maxclients` may not pass.
+    #[must_use]
+    pub const fn maxclients(self) -> u32 {
+        self.maxclients
+    }
+
+    /// `C`: the connection slots each cell holds.
+    #[must_use]
+    pub const fn per_cell(self) -> u32 {
+        self.per_cell
+    }
 }
 
 /// A validated, normalized pair ready for [`ConfigStore::apply`] — the
@@ -100,6 +189,9 @@ const NON_NEGATIVE_I32: (i64, i64) = (0, i32::MAX as i64);
 #[derive(Debug)]
 pub struct ConfigStore {
     entries: Vec<Entry>,
+    /// The boot capacity's `B` (ADR-0123 A1): `maxclients` above it is
+    /// refused whole. 10,000 until [`ConfigStore::with_boot_capacity`].
+    maxclients_boot: u32,
     #[cfg(feature = "doc")]
     path_cache_capacity: inf_doc::limits::ProgramCacheCapacity,
     /// Bumped on every successful SET — the plane's MAINTAIN sweep compares
@@ -128,6 +220,8 @@ impl Default for ConfigStore {
             ),
             // ADR-0123 D1: the node bound, divided per cell like
             // `maxmemory`; the accept path refuses past the share.
+            // ADR-0123 A1: at most the boot capacity, which `validate`
+            // reads; the default is the boot default.
             e("maxclients", ReloadClass::HotPerCell, Kind::Int(1, i64::from(u32::MAX)), "10000"),
             e("maxmemory", ReloadClass::HotPerCell, Kind::Memory, "0"),
             e(
@@ -199,6 +293,7 @@ impl Default for ConfigStore {
         entries.sort_unstable_by_key(|entry| entry.key);
         ConfigStore {
             entries,
+            maxclients_boot: crate::limits::MAXCLIENTS_BOOT_DEFAULT,
             version: 0,
             #[cfg(feature = "doc")]
             path_cache_capacity: inf_doc::limits::ProgramCacheCapacity::default(),
@@ -218,6 +313,20 @@ impl ConfigStore {
             }
         }
         config
+    }
+
+    /// Assemble boot configuration with the node's boot capacity (ADR-0123
+    /// A1): `maxclients` starts at `B` and may not be set above it.
+    #[must_use]
+    pub fn with_boot_capacity(mut self, capacity: BootCapacity) -> Self {
+        self.maxclients_boot = capacity.maxclients();
+        let value = capacity.maxclients().to_string();
+        for entry in &mut self.entries {
+            if entry.key == "maxclients" {
+                entry.value.clone_from(&value);
+            }
+        }
+        self
     }
 
     #[cfg(feature = "doc")]
@@ -265,15 +374,16 @@ impl ConfigStore {
                     key: key_str.clone(),
                     value: text.clone(),
                 })?,
-            Kind::Int(min, max) => text
-                .parse::<i64>()
-                .ok()
-                .filter(|v| (min..=max).contains(v))
-                .map(|v| v.to_string())
-                .ok_or_else(|| ConfigSetError::Invalid {
-                    key: key_str.clone(),
-                    value: text.clone(),
-                })?,
+            Kind::Int(min, max) => {
+                let value =
+                    text.parse::<i64>().ok().filter(|v| (min..=max).contains(v)).ok_or_else(
+                        || ConfigSetError::Invalid { key: key_str.clone(), value: text.clone() },
+                    )?;
+                if entry.key == "maxclients" {
+                    self.within_boot_capacity(value)?;
+                }
+                value.to_string()
+            }
             Kind::Enum(tokens) => {
                 let lower = text.to_lowercase();
                 if !tokens.contains(&lower.as_str()) {
@@ -286,6 +396,18 @@ impl ConfigStore {
                 .ok_or(ConfigSetError::Invalid { key: key_str, value: text })?,
         };
         Ok(ValidatedSet { index, normalized })
+    }
+
+    /// A `maxclients` value inside `1..=u32::MAX` against the boot
+    /// capacity: above `B` it is [`ConfigSetError::BootCapacity`].
+    fn within_boot_capacity(&self, value: i64) -> Result<(), ConfigSetError> {
+        let capacity = self.maxclients_boot;
+        if value <= i64::from(capacity) {
+            return Ok(());
+        }
+        // The row's bound is `1..=u32::MAX`, so the narrowing is exact.
+        let requested = u32::try_from(value).unwrap_or(u32::MAX);
+        Err(ConfigSetError::BootCapacity { requested, capacity })
     }
 
     /// Applies a validated pair. Infallible by construction — validation
@@ -552,6 +674,56 @@ mod tests {
         assert!(matches!(cfg.set(b"timeout", b"2147483648"), Err(ConfigSetError::Invalid { .. })));
         assert_eq!(cfg.set(b"tcp-keepalive", b"0"), Ok(ReloadClass::HotPerCell));
         assert!(matches!(cfg.set(b"tcp-keepalive", b"-1"), Err(ConfigSetError::Invalid { .. })));
+    }
+
+    /// ADR-0123 A1: `maxclients` is hot within the boot capacity. At `B`
+    /// and below it applies; at `B + 1` and `u32::MAX` it is refused with
+    /// both values named and nothing changes; the default capacity is
+    /// 10,000.
+    #[test]
+    fn maxclients_is_hot_within_the_boot_capacity() {
+        let cells = inf_foundation::CellCount::new(2).expect("two cells");
+        let capacity = BootCapacity::new(100, cells).expect("fits");
+        assert_eq!((capacity.maxclients(), capacity.per_cell()), (100, 50));
+        let mut cfg = ConfigStore::default().with_boot_capacity(capacity);
+        assert_eq!(cfg.get("maxclients"), Some("100"), "the boot value is the first value");
+        assert_eq!(cfg.set(b"maxclients", b"1"), Ok(ReloadClass::HotPerCell));
+        assert_eq!(cfg.set(b"maxclients", b"100"), Ok(ReloadClass::HotPerCell));
+        let version = cfg.version();
+        for (above, requested) in [(&b"101"[..], 101), (b"4294967295", u32::MAX)] {
+            assert_eq!(
+                cfg.set(b"maxclients", above),
+                Err(ConfigSetError::BootCapacity { requested, capacity: 100 })
+            );
+        }
+        assert_eq!(cfg.get("maxclients"), Some("100"));
+        assert_eq!(cfg.version(), version, "a refused raise bumps no version");
+        assert!(matches!(cfg.set(b"maxclients", b"0"), Err(ConfigSetError::Invalid { .. })));
+        let mut default = ConfigStore::default();
+        assert_eq!(default.set(b"maxclients", b"10000"), Ok(ReloadClass::HotPerCell));
+        assert!(matches!(
+            default.set(b"maxclients", b"10001"),
+            Err(ConfigSetError::BootCapacity { requested: 10_001, capacity: 10_000 })
+        ));
+    }
+
+    /// ADR-0123 A1's boot check: `B` 0 is refused; `C = max(1, B / cells)`,
+    /// so `B < cells` gives each cell one slot; a `C` of the ceiling builds
+    /// and one past it is refused.
+    #[test]
+    fn a_boot_capacity_is_checked_at_zero_below_the_cells_and_at_the_ceiling() {
+        let one = inf_foundation::CellCount::new(1).expect("one cell");
+        let three = inf_foundation::CellCount::new(3).expect("three cells");
+        assert_eq!(BootCapacity::new(0, one), Err(BootCapacityRefused::Zero));
+        let below = BootCapacity::new(2, three).expect("B below the cells");
+        assert_eq!((below.maxclients(), below.per_cell()), (2, 1));
+        let ceiling = crate::limits::CONN_TASKS_MAX;
+        assert_eq!(BootCapacity::new(ceiling, one).map(BootCapacity::per_cell), Ok(ceiling));
+        assert_eq!(
+            BootCapacity::new(ceiling + 1, one),
+            Err(BootCapacityRefused::PerCellOverCeiling { per_cell: ceiling + 1, ceiling })
+        );
+        assert!(BootCapacity::new(u32::MAX, three).is_err(), "C = 1,431,655,765");
     }
 
     /// ADR-0123 D1/D4/D5: the plane's cached knobs — the per-cell

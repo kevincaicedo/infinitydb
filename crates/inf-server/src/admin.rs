@@ -259,6 +259,11 @@ pub(crate) fn config(
                              value '{value}'"
                     ));
                 }
+                // ADR-0123 A1: above the boot capacity, refused whole.
+                Err(ConfigSetError::BootCapacity { .. }) => {
+                    drop(cfg);
+                    return w.error(crate::config::BOOT_CAPACITY_REFUSAL);
+                }
             }
             i += 2;
         }
@@ -1128,12 +1133,8 @@ mod tests {
     /// slots, tasks and gate holders are reserved for `--maxclients`, so a
     /// hot raise above the boot value is refused whole with A1's text and
     /// changes nothing, the second key of the same `CONFIG SET` included.
-    /// The node here booted at the default, 10,000. At HEAD `maxclients` is
-    /// hot up to 2^32 - 1 and the raise answers `+OK`.
+    /// The node here booted at the default, 10,000.
     #[test]
-    #[ignore = "maxclients is hot up to 2^32 - 1, so CONFIG SET raises it past every capacity the \
-                node built at boot and answers +OK; red until a raise above the boot value is \
-                refused whole with ADR-0123 A1's reply and no key changes"]
     fn config_set_maxclients_above_the_boot_capacity_is_refused_whole() {
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());

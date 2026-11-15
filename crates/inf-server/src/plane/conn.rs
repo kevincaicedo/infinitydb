@@ -116,8 +116,9 @@ impl Conn {
 /// The slot every connection key is below: the completion token carries
 /// the slot in 24 bits (`inf_runtime::MAX_SLOT`), and the top value is
 /// reserved for the accept the slab refused (see `on_completion`'s
-/// `Accepted` arm) so its `Close` completion routes to no connection.
-pub(super) const CONN_SLOT_CAP: u32 = inf_runtime::MAX_SLOT;
+/// `Accepted` arm) so its `Close` completion routes to no connection. The
+/// boot capacity's ceiling is the same bound (`limits::CONN_TASKS_MAX`).
+pub(super) const CONN_SLOT_CAP: u32 = crate::limits::CONN_TASKS_MAX;
 
 /// Redis's reply past `maxclients` (networking.c, measured 8.0.5).
 // reply-outcome-allow: a connection frame copied to a send buffer, no reply (ADR-0123 D1)
