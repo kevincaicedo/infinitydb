@@ -2735,6 +2735,12 @@ expect_output "canaries: a lane copy with a Loom row catches it" "sim-canaries: 
 expect green "canaries: the Loom plant built in its cfg's directory" grep -qx "cold canary-inf_canary_m" "$dir/planted-dirs"
 expect green "canaries: no planted directory is left after the Loom row" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
 expect green "canaries: the plain Loom tree stays" test -d "$dir/target/loom"
+# The lane traps HUP, INT and TERM into an exit, so the exit trap's removal
+# waits for the build in the foreground to end: no stub can see that order,
+# so each of the three lines is read from the script, once.
+for trap_line in "trap 'exit 129' HUP" "trap 'exit 130' INT" "trap 'exit 143' TERM"; do
+    expect green "canaries: the lane holds the line $trap_line once" test "$(grep -cxF -- "$trap_line" "$CANARY")" -eq 1
+done
 # A run stopped by a signal removes the planted directory of the cfg it was
 # running: the stub sends the lane SIGTERM from the planted build.
 dir="$work/canary-disk-interrupted"

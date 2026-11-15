@@ -72,6 +72,8 @@
 # its ring) is named as io_uring unavailable on this host.
 # A row's red never stops another: every build and run of every kind is
 # judged, and the lane's verdict waits for the last row.
+# A planted cfg builds in `target/canary-<cfg>`, which goes once its last
+# row is judged, or at exit when a signal stops the run; SIGKILL leaves it.
 # CARGO_ENCODED_RUSTFLAGS is unset for the whole lane: cargo reads it before
 # RUSTFLAGS, so a set one would drop every plant's `--cfg` without a word.
 # Usage: scripts/sim-canaries.sh [seed]
@@ -1223,8 +1225,12 @@ case "$work" in
   *) echo "sim-canaries: mktemp failed"; exit 2 ;;
 esac
 # On any exit the work directory goes, and so does the planted directory of
-# the cfg whose rows were running (remove_planted, below): an interrupted run
-# leaves no planted build behind. A signal exits, so every bash runs the trap.
+# the cfg whose rows were running (remove_planted, below), so a run a signal
+# stops leaves no planted build behind. The signals are trapped for the
+# order: bash runs a trapped signal's action once the build in the
+# foreground has ended, so the removal never runs beside a cargo still
+# writing into the directory, where an untrapped signal runs the exit trap
+# at once. SIGKILL runs no trap and leaves the build.
 planted_cfg=
 trap 'case "$work" in */sim-canaries.??????) rm -rf -- "$work" ;; esac
   [ -z "$planted_cfg" ] || remove_planted "$planted_cfg"' EXIT
