@@ -197,3 +197,60 @@ fn a_kill_after_the_eof_close_before_closed_closes_nothing_again() {
     rig.run(2);
     assert_eq!(rig.closes(), [FD], "a connection already closing was closed twice");
 }
+
+// ---- a close runs the bytes the client handed over (ADR-0196, ADR-0123 A2) ----
+
+use super::wire_rig::{Rig as Node, frame};
+
+/// The client whose close each test drives, and a second client of the
+/// same cell that reads the store back over the wire.
+const CLIENT: RawFd = 60;
+const READER: RawFd = 61;
+
+/// `GET key` from the reader, run until its reply arrives.
+fn read_back(node: &mut Node, cell: usize, key: &[u8]) -> Vec<u8> {
+    let before = node.written(cell, READER).len();
+    node.send(cell, READER, &frame(&[b"GET", key]));
+    node.rounds(4);
+    node.written(cell, READER)[before..].to_vec()
+}
+
+/// A client's `DEL` of 32 keys cell 1 owns fills its pump's window of
+/// remote legs while cell 1 is frozen, so the `SET` and the `INCR` behind
+/// it stay queued; then the client's socket is reset (the peer is gone)
+/// and its `Closed` is reaped before cell 1 answers. Every queued command
+/// still runs, unanswered (ADR-0123 A2): the key reads 2. At HEAD `Closed`
+/// drops the connection with its queue, so the key is never written.
+#[test]
+#[ignore = "Closed drops a connection with its queue, so commands the client handed over \
+            before a reset never run; red until a draining slot keeps its queue and its pump \
+            runs every queued command unanswered before the slot vacates"]
+fn a_reset_connection_runs_its_queued_commands() {
+    let mut node = Node::new(2);
+    node.accept(0, CLIENT);
+    node.accept(0, READER);
+    node.freeze(1, true);
+    let held = node.keys_on(1, "held", REMOTE_WINDOW);
+    let key = node.key_on(0, "queued");
+    let mut argv: Vec<&[u8]> = vec![b"DEL"];
+    argv.extend(held.iter().map(Vec::as_slice));
+    let mut bytes = frame(&argv);
+    bytes.extend(frame(&[b"SET", &key, b"1"]));
+    bytes.extend(frame(&[b"INCR", &key]));
+    node.send(0, CLIENT, &bytes);
+    node.rounds(2);
+    let mut queued = 0;
+    node.cells[0].plane.shared.conns.borrow_mut().for_each_mut(|conn| queued += conn.queue.len());
+    assert_eq!(queued, 2, "engagement: the SET and the INCR are queued behind the held DEL");
+    node.reset(0, CLIENT);
+    node.rounds(2);
+    assert!(node.closed(0).contains(&CLIENT), "engagement: the reset's Closed was reaped");
+    node.freeze(1, false);
+    node.rounds(8);
+    assert_eq!(
+        read_back(&mut node, 0, &key),
+        b"$1\r\n2\r\n",
+        "the SET and the INCR queued before the reset did not both run"
+    );
+    assert!(node.written(0, CLIENT).is_empty(), "a reset client is answered nothing");
+}

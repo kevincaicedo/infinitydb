@@ -15,6 +15,9 @@ use inf_foundation::time::VirtualClock;
 use inf_runtime::{BackendDriver, Capabilities, CellLoop, LoopConfig, SubmitStats, Wait};
 use inf_store::StoreConfig;
 
+/// Linux's `ECONNRESET`: the receive error of a peer that reset its socket.
+const ECONNRESET: i32 = 104;
+
 /// The buffers of a cell's pool and their size.
 const POOL_BUFFERS: usize = 256;
 const BUFFER_BYTES: usize = 4096;
@@ -26,6 +29,8 @@ enum Delivery {
     Data(RawFd, Vec<u8>),
     /// A zero-length receive: the peer's end of stream.
     Eof(RawFd),
+    /// A receive error: the peer reset the connection.
+    Reset(RawFd),
 }
 
 #[derive(Default)]
@@ -114,6 +119,10 @@ impl BackendDriver for ScriptDriver {
                         buf: pool.try_lease(LeaseKind::Recv).expect("the fixture pool has room"),
                         len: 0,
                     },
+                },
+                Delivery::Reset(fd) => Completion {
+                    token: script.recv_token(fd),
+                    result: CompletionResult::Error { errno: ECONNRESET, buf: None },
                 },
             });
         }
@@ -226,6 +235,12 @@ impl Rig {
         self.deliver(cell, Delivery::Eof(fd));
     }
 
+    /// Queues a receive error on `fd` for the cell's next reap: the peer is
+    /// gone.
+    pub(super) fn reset(&self, cell: usize, fd: RawFd) {
+        self.deliver(cell, Delivery::Reset(fd));
+    }
+
     /// Every byte the plane sent on `fd`.
     pub(super) fn written(&self, cell: usize, fd: RawFd) -> Vec<u8> {
         let script = self.cells[cell].reactor.driver().script.borrow();
@@ -238,6 +253,15 @@ impl Rig {
         self.cells[cell].reactor.driver().script.borrow().closed.clone()
     }
 
+    /// A key that `owner` owns, named after `stem`.
+    pub(super) fn key_on(&self, owner: u16, stem: &str) -> Vec<u8> {
+        let router = &self.cells[0].plane.shared.router;
+        (0..10_000)
+            .map(|n| format!("{stem}:{n}").into_bytes())
+            .find(|key| router.cell_of(SlotRouter::slot_of(key)) == CellId(owner))
+            .expect("every owner is reachable")
+    }
+
     /// `count` distinct keys that `owner` owns, named after `stem`.
     pub(super) fn keys_on(&self, owner: u16, stem: &str, count: usize) -> Vec<Vec<u8>> {
         let router = &self.cells[0].plane.shared.router;
@@ -246,7 +270,6 @@ impl Rig {
             .filter(|key| router.cell_of(SlotRouter::slot_of(key)) == CellId(owner));
         keys.take(count).collect()
     }
-
 }
 
 /// `argv` as one RESP multibulk frame.
