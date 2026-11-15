@@ -122,6 +122,7 @@ const WIDE_CHUNK: usize = match chunk_slots_for(CappedSlab::<Wide, u64, Retire>:
     Some(slots) => slots,
     None => panic!("no chunk holds the wide slot"),
 };
+const _: () = assert!(CappedSlab::<Wide, u64, Retire>::SLOT_BYTES == 2_992, "a 2,992 B slot");
 const _: () = assert!(WIDE_CHUNK == 16, "a 2,992 B slot takes chunks of 16");
 /// 1,024 wide slots: one directory and 64 chunks of 16.
 const WIDE_ITEMS: u64 = 65;
@@ -242,17 +243,20 @@ fn no_wide_slab_allocator_call_after_live_across_churn_under_either_policy() {
 
 #[test]
 fn a_slab_retires_one_backing_allocation_per_step() {
-    retires_one_backing_allocation_per_step::<u64, 64>(CellId(3), SLAB_ITEMS);
+    retires_one_backing_allocation_per_step::<u64, u32, 64>(CellId(3), SLAB_ITEMS);
 }
 
 #[test]
 fn a_wide_slab_retires_one_backing_allocation_per_step() {
-    retires_one_backing_allocation_per_step::<Wide, WIDE_CHUNK>(CellId(8), WIDE_ITEMS);
+    retires_one_backing_allocation_per_step::<Wide, u64, WIDE_CHUNK>(CellId(8), WIDE_ITEMS);
 }
 
-fn retires_one_backing_allocation_per_step<T, const C: usize>(cell: CellId, items: u64) {
+fn retires_one_backing_allocation_per_step<T, G: Generation, const C: usize>(
+    cell: CellId,
+    items: u64,
+) {
     let (census, _serve_mark) = CapCensus::new(cell);
-    let mut retiring = slab::<T, u32, Retire, C>(&census, items).retire();
+    let mut retiring = slab::<T, G, Retire, C>(&census, items).retire();
     let mut steps = 0;
     loop {
         let before = ALLOC.thread_freed_bytes();
@@ -277,18 +281,21 @@ fn retires_one_backing_allocation_per_step<T, const C: usize>(cell: CellId, item
 /// and the prefix built before it retires by steps, one per item it holds.
 #[test]
 fn a_refused_slab_build_step_retires_its_prefix_by_steps() {
-    refused_build_steps_retire_their_prefix::<u64, 64>(CellId(4), SLAB_ITEMS);
+    refused_build_steps_retire_their_prefix::<u64, u32, 64>(CellId(4), SLAB_ITEMS);
 }
 
 #[test]
 fn a_refused_wide_slab_build_step_retires_its_prefix_by_steps() {
-    refused_build_steps_retire_their_prefix::<Wide, WIDE_CHUNK>(CellId(9), WIDE_ITEMS);
+    refused_build_steps_retire_their_prefix::<Wide, u64, WIDE_CHUNK>(CellId(9), WIDE_ITEMS);
 }
 
-fn refused_build_steps_retire_their_prefix<T, const C: usize>(cell: CellId, items: u64) {
+fn refused_build_steps_retire_their_prefix<T, G: Generation, const C: usize>(
+    cell: CellId,
+    items: u64,
+) {
     let (census, _serve_mark) = CapCensus::new(cell);
     for refused_at in 0..items {
-        let mut builder = CappedSlab::<T, u32, Retire, C>::builder(SLAB, &census).expect("row");
+        let mut builder = CappedSlab::<T, G, Retire, C>::builder(SLAB, &census).expect("row");
         for _ in 0..refused_at {
             builder = match builder.step() {
                 Built::More(next) => next,
