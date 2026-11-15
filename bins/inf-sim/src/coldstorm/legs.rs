@@ -26,7 +26,7 @@ use inf_runtime::{
 use super::{
     ColdLeg, ColdStormReport, ColdStormScenario, RoundCounts, judge_delivery_work, record_receipt,
 };
-use crate::net::{CellNet, Plant, SimDriver};
+use crate::net::{CellNet, Plant, SimDriver, drain_violations};
 
 /// The legs' device depth: the default `COLD-READ-QD`, so the pool holds 64
 /// buffers and each class queue 256 requests.
@@ -408,6 +408,7 @@ impl Fixture {
         if let Err(leak) = self.cold.reconcile() {
             self.report.violations.push(format!("custody leak: {leak:?}"));
         }
+        drain_violations(core::slice::from_ref(self.driver.net()), &mut self.report.violations);
         let counts = self.cold.counters();
         if counts.enqueued != counts.issued + counts.merged_waiters + counts.cancelled_queued {
             self.report.violations.push(format!("admission identity broken: {counts:?}"));

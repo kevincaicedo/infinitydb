@@ -2053,3 +2053,11 @@ mod close_tests;
 #[cfg(test)]
 #[path = "stop_tests.rs"]
 mod stop_tests;
+
+#[cfg(test)]
+#[path = "wire_rig.rs"]
+mod wire_rig;
+
+#[cfg(test)]
+#[path = "capacity_tests.rs"]
+mod capacity_tests;

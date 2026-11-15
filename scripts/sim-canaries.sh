@@ -1074,6 +1074,10 @@ ordered_rows=(
   # earlier on a ring without deferred task work.
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_with_receive_posts_no_recv_after_closed recv-after-closed"
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_posts_no_recv_after_closed recv-after-closed"
+  # The net's own invariant: no chunk of an fd is posted after its end of stream. Its close
+  # legs' shared reap posts a closed client's last chunk and its EOF in one reap, data first;
+  # planted, the EOF goes first and the chunk after it.
+  "inf_canary_net_data_after_eof crate-test inf-sim lib a_shared_reap_posts_the_chunk_before_the_end_of_stream net-data-after-eof"
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.

@@ -151,6 +151,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_listing_residue_unscaled)',
     'cfg(inf_canary_listing_resume_rewinds)',
     'cfg(inf_canary_log_geometry_unchecked)',
+    'cfg(inf_canary_net_data_after_eof)',
     'cfg(inf_canary_ns_answer_before_swap)',
     'cfg(inf_canary_ns_apply_before_swap)',
     'cfg(inf_canary_ns_cap_from_gauges)',

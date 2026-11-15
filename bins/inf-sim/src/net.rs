@@ -19,6 +19,8 @@ use inf_runtime::{
 };
 use inf_server::SimDisk;
 
+use crate::driver::Violations;
+
 /// How a cell's net hands a connection's pending bytes to a reap.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Delivery {
@@ -90,6 +92,26 @@ struct SimConn {
     recv_token: Option<CompletionToken>,
     /// Lost-wakeup plant fired here: delivery suppressed until new bytes.
     suppressed: bool,
+    /// The client is gone (a reset, [`CellNet::client_reset`]): the net
+    /// posts a receive error where a FIN would post the EOF, and answers
+    /// every later `Send` `ECONNRESET`.
+    client_reset: bool,
+    /// The net posted this fd's end of stream: no chunk and no receive arm
+    /// may follow it.
+    eof_posted: bool,
+    /// The plane disarmed this fd's receive at least once.
+    disarmed: bool,
+    /// The plane re-armed this fd's receive after a disarm while the client
+    /// had already sent its FIN.
+    rearmed_after_fin: bool,
+    /// `Send`s the net received for this fd after it posted the fd's EOF.
+    sends_after_eof: u64,
+    /// Reaps that posted a chunk of this fd and its EOF together.
+    shared_reaps: u64,
+    /// The EOF was posted after `rearmed_after_fin`.
+    ended_after_rearm: bool,
+    /// The net posted a chunk of this fd after its EOF (`net-data-after-eof`).
+    data_after_eof: bool,
 }
 
 /// A parked accept arm's class: the two failures the driver contract parks
@@ -191,6 +213,14 @@ pub struct CellNet {
     /// What a reap hands each connection's server side
     /// ([`CellNet::deliver_whole`]).
     delivery: Delivery,
+    /// The close legs' capability: a closed client's last chunk and its EOF
+    /// are posted in one reap ([`CellNet::set_eof_with_data`]).
+    eof_with_data: bool,
+    /// `Send`s answered `ECONNRESET` because their client was reset.
+    reset_send_errors: u64,
+    /// The net's own invariants that a reap broke, as their tokens:
+    /// `net-data-after-eof` and `recv-armed-after-eof`.
+    violations: Vec<String>,
 }
 
 /// Synthetic listener fd for a cell (never a real fd).
@@ -241,6 +271,9 @@ impl CellNet {
             plant,
             plant_fired: false,
             delivery: Delivery::Chunked,
+            eof_with_data: false,
+            reset_send_errors: 0,
+            violations: Vec::new(),
         }))
     }
 
@@ -322,6 +355,88 @@ impl CellNet {
     /// every connection of the cell.
     pub fn unread(&self, fd: RawFd) -> Option<usize> {
         self.conns.get(&fd).map(|c| c.to_server.len())
+    }
+
+    /// Client side: the client is gone, its socket reset. What it sent stays
+    /// queued for the server, it reads nothing more, and once the server has
+    /// taken every byte the net posts the receive error a reset raises
+    /// (`ECONNRESET`) where a FIN would post the EOF. With no receive armed
+    /// (after its EOF) the server learns it from its next `Send`, which
+    /// answers `ECONNRESET` too.
+    pub fn client_reset(&mut self, fd: RawFd) {
+        if let Some(conn) = self.conns.get_mut(&fd) {
+            conn.client_closed = true;
+            conn.client_reset = true;
+            conn.suppressed = false;
+            conn.to_client.clear();
+        }
+    }
+
+    /// From now on, a closed client's last chunk, up to one receive buffer,
+    /// and its EOF are posted in one reap, data first: the reap a multishot
+    /// receive gives bytes and a FIN that reached the kernel together. Off
+    /// in every scenario but the close legs, it takes no draw.
+    pub fn set_eof_with_data(&mut self, on: bool) {
+        self.eof_with_data = on;
+    }
+
+    /// Whether the net posted `fd`'s end of stream.
+    #[must_use]
+    pub fn eof_posted(&self, fd: RawFd) -> bool {
+        self.conns.get(&fd).is_some_and(|c| c.eof_posted)
+    }
+
+    /// Whether the plane disarmed `fd`'s receive and has not re-armed it.
+    #[must_use]
+    pub fn recv_disarmed(&self, fd: RawFd) -> bool {
+        self.conns.get(&fd).is_some_and(|c| c.disarmed && !c.recv_armed)
+    }
+
+    /// `Send`s the net received for `fd` after it posted the fd's EOF.
+    #[must_use]
+    pub fn sends_after_eof(&self, fd: RawFd) -> u64 {
+        self.conns.get(&fd).map_or(0, |c| c.sends_after_eof)
+    }
+
+    /// Reaps that posted a chunk and the EOF of one fd, over every fd.
+    #[must_use]
+    pub fn eof_shared_reaps(&self) -> u64 {
+        self.conns.values().map(|c| c.shared_reaps).sum()
+    }
+
+    /// EOFs posted for an fd re-armed after a disarm while its client had
+    /// sent its FIN, over every fd.
+    #[must_use]
+    pub fn eof_after_rearm(&self) -> u64 {
+        self.conns.values().filter(|c| c.ended_after_rearm).count() as u64
+    }
+
+    /// `Send`s answered `ECONNRESET` because their client was reset.
+    #[must_use]
+    pub fn reset_send_errors(&self) -> u64 {
+        self.reset_send_errors
+    }
+
+    /// The net's broken invariants since the last call, as their tokens.
+    pub fn take_violations(&mut self) -> Vec<String> {
+        for (fd, conn) in &mut self.conns {
+            if core::mem::take(&mut conn.data_after_eof) {
+                self.violations
+                    .push(format!("net-data-after-eof: fd {fd} was posted a chunk after its EOF"));
+            }
+        }
+        core::mem::take(&mut self.violations)
+    }
+}
+
+/// Moves every net's broken invariants into `violations`. A harness that
+/// judges a run drains its nets where it reads its own violations, so a
+/// refused re-arm or a chunk posted after an EOF is never dropped with them.
+pub(crate) fn drain_violations(nets: &[Rc<RefCell<CellNet>>], violations: &mut Violations) {
+    for net in nets {
+        for broken in net.borrow_mut().take_violations() {
+            violations.push(broken);
+        }
     }
 }
 
@@ -465,6 +580,11 @@ impl ObservedIo {
 }
 
 impl SimDriver {
+    /// The net this driver serves, whose invariants its harness drains.
+    pub(crate) fn net(&self) -> &Rc<RefCell<CellNet>> {
+        &self.net
+    }
+
     pub fn new(net: Rc<RefCell<CellNet>>) -> SimDriver {
         SimDriver {
             net,
@@ -792,6 +912,97 @@ fn stable_mut_slice(buf: &StableBytesMut) -> &mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len() as usize) }
 }
 
+/// Applies a `RecvArm`. The end of stream ends a receive (ADR-0196 A1.3),
+/// so the net refuses an arm for an fd whose EOF it posted, its invariant
+/// `recv-armed-after-eof`.
+fn arm_recv(fd: RawFd, conn: &mut SimConn, token: CompletionToken, violations: &mut Vec<String>) {
+    if conn.eof_posted {
+        violations.push(format!("recv-armed-after-eof: fd {fd} was armed after its EOF"));
+        return;
+    }
+    if conn.client_closed && conn.disarmed && !conn.recv_armed {
+        conn.rearmed_after_fin = true;
+    }
+    conn.recv_armed = true;
+    conn.recv_token = Some(token);
+}
+
+/// Takes a `Send` for a connection the server has not closed: its bytes
+/// reach the client, or a reset client answers `ECONNRESET`.
+fn take_send(
+    conn: &mut SimConn,
+    pool: &BufferPool,
+    buf: inf_alloc::BufferId,
+    len: u32,
+    reset_send_errors: &mut u64,
+) -> CompletionResult {
+    if conn.eof_posted {
+        conn.sends_after_eof += 1;
+    }
+    if conn.client_reset {
+        *reset_send_errors += 1;
+        return CompletionResult::Error { errno: libc::ECONNRESET, buf: Some(buf) };
+    }
+    conn.to_client.extend_from_slice(&pool.bytes(buf)[..len as usize]);
+    CompletionResult::Sent { buf }
+}
+
+/// Posts a closed client's end once the server has taken its bytes: the
+/// receive error of a reset, or the EOF, a zero-length receive with a leased
+/// buffer (the contract), which a dry pool leaves for a later reap.
+fn post_end(
+    conn: &mut SimConn,
+    token: CompletionToken,
+    pool: &mut BufferPool,
+    out: &mut Vec<Completion>,
+) {
+    if conn.client_reset {
+        conn.recv_armed = false;
+        let result = CompletionResult::Error { errno: libc::ECONNRESET, buf: None };
+        out.push(Completion { token, result });
+        return;
+    }
+    let Some(buf) = pool.try_lease(LeaseKind::Recv) else { return };
+    conn.recv_armed = false;
+    conn.eof_posted = true;
+    conn.ended_after_rearm = conn.rearmed_after_fin;
+    out.push(Completion { token, result: CompletionResult::Recv { buf, len: 0 } });
+}
+
+/// The shared reap of a closed client (`eof_with_data`): its remaining bytes,
+/// up to one receive buffer, and, when they were the last, its end in the
+/// same reap, data first. A reset client's end is its receive error.
+fn post_with_end(
+    conn: &mut SimConn,
+    token: CompletionToken,
+    pool: &mut BufferPool,
+    out: &mut Vec<Completion>,
+) {
+    let Some(buf) = pool.try_lease(LeaseKind::Recv) else { return };
+    let chunk = conn.to_server.len().min(pool.buf_size());
+    let bytes = pool.bytes_mut(buf);
+    for (i, b) in conn.to_server.drain(..chunk).enumerate() {
+        bytes[i] = b;
+    }
+    let data = Completion { token, result: CompletionResult::Recv { buf, len: chunk as u32 } };
+    if !conn.to_server.is_empty() {
+        out.push(data);
+        return;
+    }
+    // Canary: the end is posted before the chunk it follows.
+    #[cfg(inf_canary_net_data_after_eof)]
+    post_end(conn, token, pool, out);
+    conn.data_after_eof |= conn.eof_posted;
+    out.push(data);
+    let posted = out.len();
+    if !conn.eof_posted {
+        post_end(conn, token, pool, out);
+    }
+    if out.len() > posted {
+        conn.shared_reaps += 1;
+    }
+}
+
 impl BackendDriver for SimDriver {
     fn push(&mut self, op: IoOp) {
         self.ops.push(op);
@@ -894,21 +1105,22 @@ impl BackendDriver for SimDriver {
                     net.accept_token = Some(token);
                 }
                 IoOp::RecvArm { fd, token } => {
-                    if let Some(conn) = net.conns.get_mut(&fd) {
-                        conn.recv_armed = true;
-                        conn.recv_token = Some(token);
+                    let CellNet { conns, violations, .. } = &mut *net;
+                    if let Some(conn) = conns.get_mut(&fd) {
+                        arm_recv(fd, conn, token, violations);
                     }
                 }
                 IoOp::RecvDisarm { fd } => {
                     if let Some(conn) = net.conns.get_mut(&fd) {
                         conn.recv_armed = false;
+                        conn.disarmed = true;
                     }
                 }
                 IoOp::Send { fd, buf, len, token } => {
-                    let result = match net.conns.get_mut(&fd) {
+                    let CellNet { conns, reset_send_errors, .. } = &mut *net;
+                    let result = match conns.get_mut(&fd) {
                         Some(conn) if !conn.server_closed => {
-                            conn.to_client.extend_from_slice(&pool.bytes(buf)[..len as usize]);
-                            CompletionResult::Sent { buf }
+                            take_send(conn, pool, buf, len, reset_send_errors)
                         }
                         _ => CompletionResult::Error { errno: libc::EPIPE, buf: Some(buf) },
                     };
@@ -1129,7 +1341,7 @@ impl BackendDriver for SimDriver {
         // frames exercise the parser's accumulator on every run.
         let fds: Vec<RawFd> = net.conns.keys().copied().collect();
         for fd in fds {
-            let CellNet { conns, rng, plant, plant_fired, delivery, .. } = &mut *net;
+            let CellNet { conns, rng, plant, plant_fired, delivery, eof_with_data, .. } = &mut *net;
             let Some(conn) = conns.get_mut(&fd) else { continue };
             if !conn.recv_armed || conn.server_closed || conn.suppressed {
                 continue;
@@ -1137,15 +1349,12 @@ impl BackendDriver for SimDriver {
             let token = conn.recv_token.expect("armed implies token");
             if conn.to_server.is_empty() {
                 if conn.client_closed {
-                    // EOF: zero-length recv with a leased buffer (contract).
-                    if let Some(buf) = pool.try_lease(LeaseKind::Recv) {
-                        conn.recv_armed = false;
-                        out.push(Completion {
-                            token,
-                            result: CompletionResult::Recv { buf, len: 0 },
-                        });
-                    }
+                    post_end(conn, token, pool, out);
                 }
+                continue;
+            }
+            if *eof_with_data && conn.client_closed {
+                post_with_end(conn, token, pool, out);
                 continue;
             }
             // The lost-wakeup plant: one seeded readiness edge vanishes.
@@ -1164,6 +1373,7 @@ impl BackendDriver for SimDriver {
             for (i, b) in conn.to_server.drain(..chunk).enumerate() {
                 bytes[i] = b;
             }
+            conn.data_after_eof |= conn.eof_posted;
             out.push(Completion {
                 token,
                 result: CompletionResult::Recv { buf, len: chunk as u32 },
@@ -1196,6 +1406,57 @@ impl BackendDriver for SimDriver {
 
     fn submit_stats(&self) -> SubmitStats {
         self.stats
+    }
+}
+
+#[cfg(test)]
+mod close_capability_tests {
+    use super::{CellNet, Plant, SimDriver, listener_fd};
+    use inf_alloc::BufferPool;
+    use inf_runtime::{
+        BackendDriver, Completion, CompletionResult, CompletionToken, IoOp, TokenClass, Wait,
+    };
+    use std::rc::Rc;
+
+    /// The lengths of the receives a reap posted.
+    fn received(out: &[Completion]) -> Vec<u32> {
+        out.iter()
+            .filter_map(|completion| match completion.result {
+                CompletionResult::Recv { len, .. } => Some(len),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// With `eof_with_data` on, a closed client's last chunk and its end of
+    /// stream are posted in one reap, the chunk first, and the net's own
+    /// invariant `net-data-after-eof` holds.
+    #[test]
+    fn a_shared_reap_posts_the_chunk_before_the_end_of_stream() {
+        let net = CellNet::new(0, 1, Plant::None);
+        let mut driver = SimDriver::new(Rc::clone(&net));
+        let mut pool = BufferPool::new(4, 1024);
+        let fd = net.borrow_mut().connect();
+        let accept = CompletionToken::new(TokenClass::Accept, 0, 0);
+        driver.push(IoOp::AcceptArm { listener: listener_fd(0), token: accept });
+        let mut out = Vec::new();
+        driver.submit_and_reap(&mut pool, Wait::Poll, &mut out).expect("reap");
+        assert!(matches!(out[..], [Completion { result: CompletionResult::Accepted { .. }, .. }]));
+        driver.push(IoOp::RecvArm { fd, token: CompletionToken::new(TokenClass::Recv, 1, 0) });
+        let ping = b"*1\r\n$4\r\nPING\r\n";
+        {
+            let mut net = net.borrow_mut();
+            net.set_eof_with_data(true);
+            net.client_send(fd, ping);
+            net.client_close(fd);
+        }
+        out.clear();
+        driver.submit_and_reap(&mut pool, Wait::Poll, &mut out).expect("reap");
+        let violations = net.borrow_mut().take_violations();
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(received(&out), [ping.len() as u32, 0], "the chunk, then the end, in one reap");
+        assert_eq!(net.borrow().eof_shared_reaps(), 1);
+        assert!(net.borrow().eof_posted(fd));
     }
 }
 

@@ -75,6 +75,7 @@ use crate::resp::{Reply, SubFrame, parse_reply, parse_sub_frame, reply_len};
 
 pub mod accept_retry;
 mod audit;
+pub mod capacity;
 mod idle;
 mod pub_cross;
 pub mod shadow;
@@ -2064,6 +2065,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         state.keyspace(&plane.keyspace(), clock.now());
     }
     report.state_hash = state.value();
+    crate::net::drain_violations(&nets, &mut violations);
     // Appended, never assigned: a check that wrote the report's list before
     // this point keeps its line.
     report.oracle_violations.extend(oracle.violations.clone());

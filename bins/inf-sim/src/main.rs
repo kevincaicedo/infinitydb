@@ -20,10 +20,12 @@ use inf_sim::coldstorm::ColdLeg;
 use inf_sim::driver::{self, Exit, Fold, Shard, Sweep, Verify};
 use inf_sim::net::Plant;
 use inf_sim::{
+    CloseLeg, Leg, LegValue, RecoveryScenario, ScenarioRow, SeedClass, SpecVariant, Sweeps,
+};
+use inf_sim::{
     CombinedScenario, DurableScenario, EpochMarksLeg, ExtentWindowLeg, LedgerWedgeLeg, Scenario,
     TierBudgetLeg, run_combined_scenario, run_durable_scenario, run_scenario,
 };
-use inf_sim::{Leg, LegValue, RecoveryScenario, ScenarioRow, SeedClass, SpecVariant, Sweeps};
 
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -277,6 +279,10 @@ fn main() {
     // m4-extent-window's leg arrives as its type from the leg check.
     if let ("m4-extent-window", Some(LegValue::ExtentWindow(leg))) = (scenario_name.as_str(), leg) {
         std::process::exit(run_extent_window(seed, leg, determinism).code());
+    }
+    // m0-capacity's leg arrives as its type from the leg check (`tasks` when unnamed).
+    if let ("m0-capacity", Some(LegValue::Close(leg))) = (scenario_name.as_str(), leg) {
+        std::process::exit(run_capacity(seed, leg, determinism).code());
     }
 
     // The M2-S19 durable scenario has its own runner (power cuts, the
@@ -1133,6 +1139,25 @@ fn print_census(rows_checked: u64, rows_crossed: u64) {
 /// timing against the park's retry deadline (node sums, ns).
 fn print_accept_retry(report: &inf_sim::harness::accept_retry::RetryReport) {
     println!("inf-sim: accept_retry {report}");
+}
+
+/// `m0-capacity`: one named leg, its readings and its verdict.
+fn run_capacity(seed: u64, leg: CloseLeg, verify: Verify) -> Exit {
+    let run_one =
+        |seed| inf_sim::run_capacity_scenario(&inf_sim::CapacityScenario::m0_capacity(seed, leg));
+    driver::run_single(seed, verify, run_one, |report| {
+        let readings: Vec<String> =
+            report.readings.iter().map(|(name, value)| format!("{name}={value}")).collect();
+        println!(
+            "inf-sim: scenario m0-capacity leg {} seed {seed:#x}: {} steps, readings [{}], hash \
+             {:#018x}",
+            leg.name(),
+            report.scheduler_steps,
+            readings.join(" "),
+            report.trace_hash
+        );
+        Ok(())
+    })
 }
 
 /// `m4-extent-window`: one seeded leg, its disk-side counts and its verdict.

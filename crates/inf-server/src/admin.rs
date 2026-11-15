@@ -1124,6 +1124,42 @@ mod tests {
         assert!(reply.starts_with(b"-ERR CONFIG SET failed"), "{reply:?}");
     }
 
+    /// A node fixes its connection capacity at boot (ADR-0123 A1): its
+    /// slots, tasks and gate holders are reserved for `--maxclients`, so a
+    /// hot raise above the boot value is refused whole with A1's text and
+    /// changes nothing, the second key of the same `CONFIG SET` included.
+    /// The node here booted at the default, 10,000. At HEAD `maxclients` is
+    /// hot up to 2^32 - 1 and the raise answers `+OK`.
+    #[test]
+    #[ignore = "maxclients is hot up to 2^32 - 1, so CONFIG SET raises it past every capacity the \
+                node built at boot and answers +OK; red until a raise above the boot value is \
+                refused whole with ADR-0123 A1's reply and no key changes"]
+    fn config_set_maxclients_above_the_boot_capacity_is_refused_whole() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        let reply = run(
+            &mut cx,
+            &mut store,
+            &[b"CONFIG", b"SET", b"maxclients", b"10001", b"maxmemory", b"100mb"],
+        );
+        assert_eq!(
+            reply,
+            b"-ERR maxclients exceeds boot capacity; restart with --maxclients\r\n",
+            "a raise above the boot capacity answered {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert_eq!(
+            run(&mut cx, &mut store, &[b"CONFIG", b"GET", b"maxclients"]),
+            b"*2\r\n$10\r\nmaxclients\r\n$5\r\n10000\r\n",
+            "the refused raise changed maxclients"
+        );
+        assert_eq!(
+            run(&mut cx, &mut store, &[b"CONFIG", b"GET", b"maxmemory"]),
+            b"*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n",
+            "the refused CONFIG SET applied its second key"
+        );
+    }
+
     /// Review of 2026-08-30 (H1 / F-L17-12, ADR-0098): `CONFIG SET` is
     /// all-or-nothing (Redis 7 multi-pair semantics, oracle-verified
     /// 2026-09-01 on redis-server 8.0.5) — an erroring pair leaves every

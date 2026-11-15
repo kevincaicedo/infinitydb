@@ -95,6 +95,7 @@ pub use durable::{
 pub use extent_window::{
     ExtentWindowLeg, ExtentWindowReport, ExtentWindowScenario, run_extent_window_scenario,
 };
+pub use harness::capacity::{CapacityReport, CapacityScenario, CloseLeg, run_capacity_scenario};
 pub use harness::{PubTarget, Scenario, SimReport, run_scenario};
 pub use nscreate::{NsCreateWindowReport, run_ns_create_window_scenario};
 pub use nsddl::{NsDdlRaceReport, run_ns_ddl_race_scenario};
@@ -123,6 +124,7 @@ pub const SCENARIOS: &[ScenarioRow] = &[
     ScenarioRow::single("m0-surface"),
     ScenarioRow::single("m0-fabric-fairness"),
     ScenarioRow::single("m0-admission"),
+    ScenarioRow::single("m0-capacity").with_default_leg(LegValue::Close(CloseLeg::Tasks)),
     ScenarioRow::single("m1-cache"),
     ScenarioRow::sweeps("m2-durable"),
     ScenarioRow::sweeps("m2-clean-stop"),
@@ -253,7 +255,7 @@ impl ScenarioRow {
     }
 }
 
-/// The leg column's kinds: the eight legged scenarios' leg flags.
+/// The leg column's kinds: the nine legged scenarios' leg flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leg {
     TierBudget,
@@ -264,11 +266,12 @@ pub enum Leg {
     Lifetimes,
     Pressure,
     PubTarget,
+    Close,
 }
 
 impl Leg {
     /// Every leg kind, in the order the help text lists their flags.
-    pub const ALL: [Leg; 8] = [
+    pub const ALL: [Leg; 9] = [
         Leg::TierBudget,
         Leg::EpochMarks,
         Leg::ExtentWindow,
@@ -277,6 +280,7 @@ impl Leg {
         Leg::Lifetimes,
         Leg::Pressure,
         Leg::PubTarget,
+        Leg::Close,
     ];
 
     /// The leg kind whose flag `flag` is.
@@ -296,6 +300,7 @@ impl Leg {
             Leg::Lifetimes => LifetimesLeg::parse(name).map(LegValue::Lifetimes),
             Leg::Pressure => PressureLeg::parse(name).map(LegValue::Pressure),
             Leg::PubTarget => PubTarget::parse(name).map(LegValue::PubTarget),
+            Leg::Close => CloseLeg::parse(name).map(LegValue::Close),
         };
         value.ok_or_else(|| {
             format!("unknown {} {name}; the legs are {}", self.flag(), self.names().join("|"))
@@ -314,6 +319,7 @@ impl Leg {
             Leg::Lifetimes => "--lifetimes-leg",
             Leg::Pressure => "--pressure-leg",
             Leg::PubTarget => "--pub-target",
+            Leg::Close => "--close-leg",
         }
     }
 
@@ -330,6 +336,7 @@ impl Leg {
             Leg::Lifetimes => LifetimesLeg::NAMES.to_vec(),
             Leg::Pressure => PressureLeg::ALL.iter().map(|leg| leg.name()).collect(),
             Leg::PubTarget => PubTarget::ALL.iter().map(|target| target.name()).collect(),
+            Leg::Close => CloseLeg::ALL.iter().map(|leg| leg.name()).collect(),
         }
     }
 }
@@ -346,6 +353,7 @@ pub enum LegValue {
     Lifetimes(LifetimesLeg),
     Pressure(PressureLeg),
     PubTarget(PubTarget),
+    Close(CloseLeg),
 }
 
 impl LegValue {
@@ -360,6 +368,7 @@ impl LegValue {
             LegValue::Lifetimes(_) => Leg::Lifetimes,
             LegValue::Pressure(_) => Leg::Pressure,
             LegValue::PubTarget(_) => Leg::PubTarget,
+            LegValue::Close(_) => Leg::Close,
         }
     }
 
@@ -374,7 +383,8 @@ impl LegValue {
             | LegValue::ExtentWindow(_)
             | LegValue::Lifetimes(_)
             | LegValue::Pressure(_)
-            | LegValue::PubTarget(_) => None,
+            | LegValue::PubTarget(_)
+            | LegValue::Close(_) => None,
         }
     }
 
@@ -389,7 +399,24 @@ impl LegValue {
             | LegValue::ExtentWindow(_)
             | LegValue::Cold(_)
             | LegValue::Lifetimes(_)
-            | LegValue::Pressure(_) => None,
+            | LegValue::Pressure(_)
+            | LegValue::Close(_) => None,
+        }
+    }
+
+    /// `m0-capacity`'s leg, when this value is one.
+    #[must_use]
+    pub const fn close(self) -> Option<CloseLeg> {
+        match self {
+            LegValue::Close(leg) => Some(leg),
+            LegValue::TierBudget(_)
+            | LegValue::EpochMarks(_)
+            | LegValue::LedgerWedge(_)
+            | LegValue::ExtentWindow(_)
+            | LegValue::Cold(_)
+            | LegValue::Lifetimes(_)
+            | LegValue::Pressure(_)
+            | LegValue::PubTarget(_) => None,
         }
     }
 }

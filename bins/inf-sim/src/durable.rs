@@ -58,6 +58,8 @@ use crate::resp::reply_len;
 
 mod audit;
 #[cfg(test)]
+mod idle;
+#[cfg(test)]
 mod lastsave;
 mod ledger_wedge;
 #[cfg(test)]
@@ -1500,8 +1502,9 @@ pub(crate) struct TraceObserver(
 );
 
 /// A run's observer once every node has been dropped: the state hash (the
-/// determinism artifact) and the cap census verdict of every cell of every
-/// life, which each node recorded as it was dropped.
+/// determinism artifact) and the verdict of every life, which each node
+/// recorded as it was dropped: its cells' cap census and its nets' own
+/// invariants.
 pub(crate) struct Sealed {
     pub(crate) state_hash: u64,
     pub(crate) census: crate::census::CensusVerdict,
@@ -2243,9 +2246,9 @@ pub(crate) fn boot(
 }
 
 impl Drop for Node {
-    /// The end of a life: its state observed, and every cell's cap census
+    /// The end of a life: its state observed, every cell's cap census
     /// judged after the cell's last iteration (the cap bound, the assembly
-    /// rule and their liveness).
+    /// rule and their liveness), and its nets' invariants drained.
     fn drop(&mut self) {
         self.observe_state(b"node-end");
         let mut verdict = crate::census::CensusVerdict::default();
@@ -2262,6 +2265,9 @@ impl Drop for Node {
                 crate::census::CellFacts { server_plane: true, tiered_tables, turn_refused };
             verdict.judge(index, plane.cap_census(), facts);
         }
+        // The nets' own invariants join the life's verdict, which every
+        // durable run reads, so they are never dropped with the node.
+        crate::net::drain_violations(&self.nets, &mut verdict.violations);
         self.observer.2.borrow_mut().absorb(verdict);
     }
 }

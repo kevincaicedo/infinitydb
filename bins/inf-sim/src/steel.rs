@@ -42,7 +42,7 @@ use inf_store::{
     StoreConfig, TieredLookup, TieredTable,
 };
 
-use crate::net::{CellNet, Plant, SimDriver};
+use crate::net::{CellNet, Plant, SimDriver, drain_violations};
 
 const NS: NsId = NsId(77);
 const RING: usize = 1 << 20;
@@ -455,6 +455,7 @@ fn run_life(
     if ctx.pool.reconcile().is_err() {
         report.violations.push("aligned-pool lease leak".into());
     }
+    drain_violations(core::slice::from_ref(ctx.driver.net()), &mut report.violations);
     (tail, flush.next_file_id())
 }
 

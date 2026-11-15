@@ -13,6 +13,8 @@
 
 use std::collections::BTreeSet;
 
+use inf_sim::CloseLeg;
+
 fn read(rel: &str) -> String {
     let path = format!("{}/{rel}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
@@ -86,6 +88,75 @@ fn every_scenario_has_a_smoke_row_and_every_row_names_a_scenario() {
     assert!(unrun.is_empty(), "scenarios with no row in scripts/sim-smoke.sh: {unrun:?}");
     let unknown: Vec<&&str> = in_rows.iter().filter(|s| !registry.contains(**s)).collect();
     assert!(unknown.is_empty(), "sim-smoke.sh rows naming no scenario: {unknown:?}");
+}
+
+/// The `--close-leg` value of every `m0-capacity` row of the smoke runner.
+fn capacity_smoke_legs() -> BTreeSet<String> {
+    let script = read("../../scripts/sim-smoke.sh");
+    let body = script.split("rows=(").nth(1).expect("rows=( … ) in sim-smoke.sh");
+    let body = body.split(')').next().expect("closing paren");
+    body.lines()
+        .map(|line| line.trim().trim_matches('"'))
+        .filter(|row| row.split_whitespace().next() == Some("m0-capacity"))
+        .filter_map(|row| row.split("--close-leg ").nth(1))
+        .map(|rest| rest.split_whitespace().next().expect("a leg name").to_string())
+        .collect()
+}
+
+/// The legs that break the one-lane rule, each as `<leg>: <why>`: a leg on
+/// a smoke row and in `pinned` or on neither, and a pinned leg no test of
+/// `source` runs.
+fn one_lane_breaks(rows: &BTreeSet<String>, pinned: &[CloseLeg], source: &str) -> Vec<String> {
+    let mut breaks = Vec::new();
+    for leg in CloseLeg::ALL {
+        let row = rows.contains(leg.name());
+        let red = pinned.contains(&leg);
+        if row == red {
+            breaks.push(format!("{}: smoke row {row}, pinned red {red}", leg.name()));
+        }
+        if red && !source.contains(&format!("pinned_red(CloseLeg::{leg:?});")) {
+            breaks.push(format!("{}: pinned red with no test that runs it", leg.name()));
+        }
+    }
+    breaks
+}
+
+/// Every `m0-capacity` leg runs in exactly one lane: a smoke row, or
+/// `CloseLeg::PINNED_RED` with the ignored test that runs it, so a leg can
+/// be born neither unrun nor twice. A pinned test fails whatever its leg
+/// reads, so an ignore removed cannot move a leg into a third lane.
+#[test]
+fn every_capacity_leg_has_a_smoke_row_or_a_pinned_red() {
+    let rows = capacity_smoke_legs();
+    let source = read("src/harness/capacity.rs");
+    let breaks = one_lane_breaks(&rows, CloseLeg::PINNED_RED, &source);
+    assert!(breaks.is_empty(), "m0-capacity legs outside one lane: {breaks:?}");
+    let known: BTreeSet<&str> = CloseLeg::ALL.iter().map(|leg| leg.name()).collect();
+    let unknown: Vec<&String> = rows.iter().filter(|leg| !known.contains(leg.as_str())).collect();
+    assert!(unknown.is_empty(), "sim-smoke.sh rows naming no m0-capacity leg: {unknown:?}");
+}
+
+/// The one-lane rule's plants, each against this tree's rows, table and
+/// source: a pinned leg given a smoke row, a pinned leg dropped from the
+/// table, and a pinned leg whose test is gone each break it.
+#[test]
+fn the_one_lane_rule_refuses_each_plant() {
+    let rows = capacity_smoke_legs();
+    let source = read("src/harness/capacity.rs");
+    let leg = CloseLeg::PINNED_RED[0];
+    let broke =
+        |breaks: Vec<String>| breaks.iter().any(|b| b.starts_with(&format!("{}: ", leg.name())));
+    let mut both = rows.clone();
+    both.insert(leg.name().to_string());
+    assert!(broke(one_lane_breaks(&both, CloseLeg::PINNED_RED, &source)), "a leg in both lanes");
+    let unpinned: Vec<CloseLeg> =
+        CloseLeg::PINNED_RED.iter().copied().filter(|pinned| *pinned != leg).collect();
+    assert!(broke(one_lane_breaks(&rows, &unpinned, &source)), "a leg in neither lane");
+    let untested = source.replace(&format!("pinned_red(CloseLeg::{leg:?});"), "");
+    assert!(
+        broke(one_lane_breaks(&rows, CloseLeg::PINNED_RED, &untested)),
+        "a pinned leg untested"
+    );
 }
 
 #[test]
