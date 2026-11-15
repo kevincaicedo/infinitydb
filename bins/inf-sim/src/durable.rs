@@ -58,6 +58,8 @@ use crate::resp::reply_len;
 
 mod audit;
 #[cfg(test)]
+mod idle;
+#[cfg(test)]
 mod lastsave;
 mod ledger_wedge;
 #[cfg(test)]

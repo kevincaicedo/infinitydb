@@ -45,7 +45,7 @@ pub(super) struct Quiet {
     rng: SplitMix64,
     pub(super) clock: Rc<VirtualClock>,
     disk: SimDisk,
-    step_ns_max: u64,
+    pub(super) step_ns_max: u64,
     /// The cell whose reactor the instrument reads.
     watched: u16,
     /// Iterations of the watched cell the instrument read, and how many
@@ -443,7 +443,7 @@ fn info_number(info: &[u8], name: &str) -> u64 {
 impl Quiet {
     /// `argv` on `client`, stepped until its reply: the reply, or a panic
     /// naming `what` when it stalls.
-    fn call(&mut self, client: &mut MiniClient, argv: &[&[u8]], what: &str) -> Vec<u8> {
+    pub(super) fn call(&mut self, client: &mut MiniClient, argv: &[&[u8]], what: &str) -> Vec<u8> {
         let Quiet { node, rng, clock, disk, step_ns_max, .. } = self;
         match client.call(node, rng, clock, disk, *step_ns_max, argv) {
             Ok(Some(reply)) => reply,
