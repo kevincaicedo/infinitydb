@@ -424,10 +424,16 @@ const BIG_REPLY_BYTES: usize = "$1048576\r\n".len() + (1 << 20) + 2;
 fn a_slow_half_closed_reader_reads_every_reply() {
     let server = Server::spawn(2, "hc5");
     let (delivered, end, during, after) = slow_half_closed_reader(&server, false);
-    assert_eq!(delivered.len(), 8 * BIG_REPLY_BYTES, "hc5: the bytes read before the end");
-    assert_eq!(end, End::Fin, "hc5: closed by a FIN after its replies");
-    assert!(during, "hc8: the half-closed client's row left CLIENT LIST with replies unsent");
-    assert!(!after, "hc8: the closed client's row is still listed");
+    // One verdict over the four readings, so a failing run reports them all:
+    // the bytes and the end, and the row while replies are unsent and after.
+    let owed = 8 * BIG_REPLY_BYTES;
+    let read = delivered.len();
+    assert!(
+        read == owed && end == End::Fin && during && !after,
+        "hc5: {read} of {owed} bytes read, then {end:?} (owed every byte, then Fin); hc8: the \
+         row listed while replies are unsent {during} (owed true), after the end {after} (owed \
+         false)"
+    );
 }
 
 /// HC10: the same client sends `QUIT` before its FIN: the eight replies,
