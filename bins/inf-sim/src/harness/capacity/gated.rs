@@ -336,20 +336,22 @@ fn cold(
 }
 
 /// Writes keys Y owns in the tiered namespace, from a client of Y, until
-/// Y's window gave its oldest pages back; returns the first, now cold.
+/// Y's window gave its oldest pages back; returns the oldest written, now
+/// cold. A write parked past its tail-stall timeout answers the typed
+/// `STALLED` verdict unapplied (ADR-0053 D4), and is sent again.
 fn fill_cold(run: &mut Run) -> Result<Vec<u8>, String> {
     let router = inf_store::SlotRouter::new_contiguous(CELLS);
     let mut keys = (0..).map(|i: usize| format!("c:{i:05}").into_bytes()).filter(move |name| {
         usize::from(router.cell_of(inf_store::SlotRouter::slot_of(name)).0) == Y
     });
-    let first = keys.next().ok_or("no cold key")?;
     let mut writer = run.client_in(Y, COLD)?;
     let value = vec![b'c'; COLD_VALUE_LEN];
-    let mut written = 0;
-    let mut batch = vec![first.clone()];
+    let (mut written, mut stalled) = (0, 0);
+    let mut oldest = None;
+    let mut batch: Vec<Vec<u8>> = Vec::new();
     loop {
-        if written >= COLD_KEYS_MAX {
-            return Err(format!("{written} keys made no cold working set"));
+        if written + stalled >= COLD_KEYS_MAX {
+            return Err(format!("{written} keys ({stalled} stalled) made no cold working set"));
         }
         while batch.len() < COLD_SET_BATCH {
             batch.push(keys.next().ok_or("no cold key")?);
@@ -357,14 +359,20 @@ fn fill_cold(run: &mut Run) -> Result<Vec<u8>, String> {
         for name in &batch {
             writer.send(&mut run.node, &[b"SET", name, &value]);
         }
+        let mut retry = Vec::new();
         let mut answered = 0;
         for _ in 0..STALL_STEPS {
             while let Some(reply) = writer.recv(&mut run.node) {
-                if reply != b"+OK\r\n" {
-                    return Err(format!(
-                        "a cold fill SET read {:?}",
-                        String::from_utf8_lossy(&reply)
-                    ));
+                let name = batch.get(answered).ok_or("a cold fill reply past its batch")?;
+                if reply == b"+OK\r\n" {
+                    oldest.get_or_insert_with(|| name.clone());
+                    written += 1;
+                } else if reply.starts_with(b"-STALLED ") {
+                    retry.push(name.clone());
+                    stalled += 1;
+                } else {
+                    let reply = String::from_utf8_lossy(&reply);
+                    return Err(format!("a cold fill SET read {reply:?}"));
                 }
                 answered += 1;
             }
@@ -373,15 +381,17 @@ fn fill_cold(run: &mut Run) -> Result<Vec<u8>, String> {
             }
             run.step().map_err(|err| format!("step failed: {err}"))?;
         }
-        written += batch.len();
-        batch.clear();
+        if answered < batch.len() {
+            return Err(format!("{answered} of {} cold fill SETs answered", batch.len()));
+        }
+        batch = retry;
         let tiering = run.call_on(&mut writer, &[b"INFO", b"tiering"])?;
         let field = |name: &str| info_field(&tiering, name);
         if field("tiering_flush_confirmed_bytes") > 3 << 20
             && field("tiering_region_decommit_pages") > 0
         {
             writer.close(&mut run.node);
-            return Ok(first);
+            return oldest.ok_or_else(|| "no cold fill SET applied".to_owned());
         }
     }
 }
