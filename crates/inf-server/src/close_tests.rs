@@ -315,3 +315,128 @@ fn a_stalled_entry_runs_after_its_connection_closed() {
         "the SET reaped before the reset did not run after the stall"
     );
 }
+
+// ---- PARSE's own replies leave in the order the connection owes them ----
+
+/// A frame whose bulk length is not a number: a protocol error.
+const MALFORMED: &[u8] = b"*1\r\n$x\r\n";
+/// The protocol error's reply, Redis's text, after which the slot closes.
+const PROTOCOL_ERROR: &str = "-ERR Protocol error: invalid bulk length\r\n";
+
+/// A reading of the client's slot on `cell`.
+fn client_slot<R>(node: &Node, cell: usize, read: impl Fn(&Conn) -> R) -> R {
+    let mut seen = None;
+    node.cells[cell].plane.shared.conns.borrow_mut().for_each_mut(|conn| {
+        if conn.fd == CLIENT {
+            seen = Some(read(conn));
+        }
+    });
+    seen.expect("the client's slot is occupied")
+}
+
+/// That PARSE met the protocol error while the client's pump owed a reply:
+/// the slot is marked to close after its flush and its pump is still active.
+fn assert_error_met_owed(node: &Node, cell: usize) {
+    assert!(client_slot(node, cell, |conn| conn.close_after_flush), "engagement: the error parsed");
+    assert!(
+        client_slot(node, cell, |conn| conn.pump_active),
+        "engagement: the pump owed a reply when PARSE met the error"
+    );
+}
+
+/// The client's bytes on `cell` as text, for an order the message prints.
+fn written_text(node: &Node, cell: usize) -> String {
+    String::from_utf8_lossy(&node.written(cell, CLIENT)).into_owned()
+}
+
+/// A `SET` of a key cell 1 owns, then a malformed frame, in one buffer;
+/// cell 1 is frozen while PARSE runs, so the `SET`'s reply is owed when PARSE
+/// meets the error. The client reads the `+OK`, then the error, then the
+/// close. At HEAD PARSE writes the error into the output at once, so it
+/// leaves first.
+#[test]
+#[ignore = "PARSE writes a protocol error into the connection's output at once, ahead of the \
+            replies its pump still owes; red until PARSE queues its own replies behind them"]
+fn protocol_error_answers_after_deferred() {
+    let mut node = Node::new(2);
+    node.accept(0, CLIENT);
+    let key = node.key_on(1, "owed");
+    let mut bytes = frame(&[b"SET", &key, b"v"]);
+    bytes.extend_from_slice(MALFORMED);
+    node.freeze(1, true);
+    node.send(0, CLIENT, &bytes);
+    node.rounds(2);
+    assert_error_met_owed(&node, 0);
+    node.freeze(1, false);
+    node.rounds(8);
+    assert!(node.closed(0).contains(&CLIENT), "the protocol error closes the connection");
+    let owed = format!("+OK\r\n{PROTOCOL_ERROR}");
+    assert_eq!(written_text(&node, 0), owed, "reply-order: the error left before the owed +OK");
+}
+
+/// A `SET` of a key cell 1 owns while cell 1 holds its reply, then, in a
+/// later buffer, a malformed frame: the held `+OK` once cell 1 answers, then
+/// the error, then the close. At HEAD the error leaves while the `+OK` is
+/// held.
+#[test]
+#[ignore = "PARSE writes a protocol error into the connection's output at once, ahead of the \
+            replies its pump still owes; red until PARSE queues its own replies behind them"]
+fn protocol_error_in_a_later_buffer_answers_after_a_held_reply() {
+    let mut node = Node::new(2);
+    node.accept(0, CLIENT);
+    let key = node.key_on(1, "held");
+    node.freeze(1, true);
+    node.send(0, CLIENT, &frame(&[b"SET", &key, b"v"]));
+    node.rounds(2);
+    assert!(node.written(0, CLIENT).is_empty(), "engagement: cell 1 holds the SET's reply");
+    node.send(0, CLIENT, MALFORMED);
+    node.rounds(2);
+    assert_error_met_owed(&node, 0);
+    node.freeze(1, false);
+    node.rounds(8);
+    assert!(node.closed(0).contains(&CLIENT), "the protocol error closes the connection");
+    let owed = format!("+OK\r\n{PROTOCOL_ERROR}");
+    assert_eq!(written_text(&node, 0), owed, "reply-order: the error left before the held +OK");
+}
+
+/// Control: a malformed frame with nothing owed is answered at once, then
+/// the connection closes.
+#[test]
+fn protocol_error_with_nothing_owed_answers_at_once() {
+    let mut node = Node::new(2);
+    node.accept(0, CLIENT);
+    node.send(0, CLIENT, MALFORMED);
+    node.rounds(1);
+    assert!(client_slot(&node, 0, |conn| conn.close_after_flush), "engagement: the error parsed");
+    assert!(!client_slot(&node, 0, |conn| conn.pump_active), "engagement: nothing was owed");
+    node.rounds(4);
+    assert!(node.closed(0).contains(&CLIENT), "the protocol error closes the connection");
+    assert_eq!(written_text(&node, 0), PROTOCOL_ERROR, "the error alone, then the close");
+}
+
+/// The error owed behind a `SET` cell 1 holds, both in one buffer, then the
+/// client's socket is reset before either reply is sent: nothing is sent,
+/// and the `SET` still runs. At HEAD the error is sent at once, before the
+/// reset.
+#[test]
+#[ignore = "PARSE writes a protocol error into the connection's output at once, ahead of the \
+            replies its pump still owes; red until PARSE queues its own replies behind them"]
+fn a_reset_before_the_owed_replies_leave_sends_nothing() {
+    let mut node = Node::new(2);
+    node.accept(0, CLIENT);
+    node.accept(0, READER);
+    let key = node.key_on(1, "reset");
+    let mut bytes = frame(&[b"SET", &key, b"v"]);
+    bytes.extend_from_slice(MALFORMED);
+    node.freeze(1, true);
+    node.send(0, CLIENT, &bytes);
+    node.rounds(2);
+    assert_error_met_owed(&node, 0);
+    node.reset(0, CLIENT);
+    node.rounds(2);
+    assert!(node.closed(0).contains(&CLIENT), "engagement: the reset's Closed was reaped");
+    node.freeze(1, false);
+    node.rounds(8);
+    assert_eq!(read_back(&mut node, 0, &key), b"$1\r\nv\r\n", "the SET before the error ran");
+    assert_eq!(written_text(&node, 0), "", "a client reset before its replies leave reads none");
+}
