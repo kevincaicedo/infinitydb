@@ -30,8 +30,8 @@ use inf_foundation::time::{Nanos, VirtualClock};
 use inf_server::{SimDisk, StallConfig};
 
 use super::{
-    DurableScenario, HeldReads, MiniClient, Node, TraceObserver, boot, build_disk, is_tier_file,
-    steady_held_reads,
+    DurableScenario, HeldReads, MiniClient, Node, TraceObserver, boot_meshed, build_disk,
+    is_tier_file, steady_held_reads,
 };
 
 const SEED: u64 = 0xC0FFEE;
@@ -57,15 +57,27 @@ pub(super) struct Quiet {
 impl Quiet {
     /// Boots a `cells`-cell node and watches cell `watched`.
     pub(super) fn boot(cells: u16, spin_iters: u32, watched: u16) -> Quiet {
+        Quiet::boot_on(SEED, crate::harness::FROZEN_MESH, cells, spin_iters, watched)
+    }
+
+    /// [`Quiet::boot`] at `seed`, over `mesh`.
+    pub(super) fn boot_on(
+        seed: u64,
+        mesh: inf_fabric::MeshConfig,
+        cells: u16,
+        spin_iters: u32,
+        watched: u16,
+    ) -> Quiet {
         assert!(watched < cells, "the watched cell is on the node");
         let clock = Rc::new(VirtualClock::new(Nanos(1)));
-        let disk = build_disk(SEED, Some(&StallConfig::write_reorder()));
-        let scenario = DurableScenario { cells, spin_iters, ..DurableScenario::m2_durable(SEED) };
+        let disk = build_disk(seed, Some(&StallConfig::write_reorder()));
+        let scenario = DurableScenario { cells, spin_iters, ..DurableScenario::m2_durable(seed) };
         let observer = TraceObserver::default();
-        let node = boot(&scenario, PathBuf::from("node"), &disk, &clock, &observer).expect("boot");
+        let node = boot_meshed(&scenario, mesh, PathBuf::from("node"), &disk, &clock, &observer)
+            .expect("boot");
         let mut quiet = Quiet {
             node,
-            rng: SplitMix64::new(SEED),
+            rng: SplitMix64::new(seed),
             clock,
             disk,
             step_ns_max: scenario.step_ns_max,
@@ -412,16 +424,16 @@ const COLD_READERS: usize = 256;
 /// adjacent keys and the burst's requests merge.
 const COLD_VALUE_LEN: usize = 400;
 /// The `SET`s pipelined per round trip while the keys are written.
-const COLD_SET_BATCH: usize = 500;
+pub(super) const COLD_SET_BATCH: usize = 500;
 /// Keys written at most before the window must have given its oldest pages
 /// back: 16 MB, five times the namespace's 3 MiB budget.
-const COLD_KEYS_MAX: usize = 40_000;
+pub(super) const COLD_KEYS_MAX: usize = 40_000;
 /// Steps the cell may take to park once the burst is answered.
 const COLD_PARK_STEPS_MAX: u32 = 256;
 /// Steps the quiet clause reads after the cell parks.
 const COLD_QUIET_STEPS: u32 = 16;
 
-fn cold_key(i: usize) -> Vec<u8> {
+pub(super) fn cold_key(i: usize) -> Vec<u8> {
     format!("c:{i:05}").into_bytes()
 }
 
@@ -432,7 +444,7 @@ fn cold_value(i: usize) -> Vec<u8> {
 }
 
 /// One field of an `INFO` section's text, as a number (0 when absent).
-fn info_number(info: &[u8], name: &str) -> u64 {
+pub(super) fn info_number(info: &[u8], name: &str) -> u64 {
     String::from_utf8_lossy(info)
         .lines()
         .find_map(|line| line.strip_prefix(name).and_then(|rest| rest.strip_prefix(':')))
@@ -453,7 +465,7 @@ impl Quiet {
 
     /// Pipelines `SET`s of keys `range` on `client`, then steps until each
     /// answered `+OK`.
-    fn set_batch(&mut self, client: &mut MiniClient, range: std::ops::Range<usize>) {
+    pub(super) fn set_batch(&mut self, client: &mut MiniClient, range: std::ops::Range<usize>) {
         let count = range.len();
         for i in range {
             client.send(&mut self.node, &[b"SET", &cold_key(i), &cold_value(i)]);
