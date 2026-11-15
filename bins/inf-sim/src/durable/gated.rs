@@ -1,13 +1,11 @@
-//! An owner's `always` verdicts for a peer (ADR-0177 D3, D6): each waits in
-//! its origin's gated deque, published only once the owner's fsync watermark
-//! covers it, in its origin's `seq` order. Three inputs on two cells, X the
-//! origin of every write and Y the owner of every key: a peer's credits' worth
-//! of writes under a held fsync; a tiered write suspended on a cold read
-//! between its placeholder and its verdict, with a flat write of the same
-//! origin behind it; and a verdict that is an error reply, with a write after
-//! it. The oracles read the clients' bytes; the device's held barriers and
-//! reads, the census rows of Y's deques and Y's `INFO tripwires` are their
-//! engagement and the deques' end state.
+//! A tiered `always` verdict keeps its place across a cold read (ADR-0177
+//! D6): the owner's pump takes the verdict's slot before the write's first
+//! effect, suspends on the cold read and fills it after, while FABRIC-IN
+//! diverts the origin's next durable write behind it. Two cells, X the
+//! origin of every write and Y the owner of every key; the oracles read the
+//! clients' bytes, the device's held reads and barriers and the census rows
+//! of Y's deques are their engagement. The `m0-capacity` gated legs hold the
+//! other inputs at the shipped topology's simulator.
 
 use std::path::Path;
 
@@ -19,16 +17,11 @@ use super::park::{COLD_KEYS_MAX, COLD_SET_BATCH, Quiet, STEPS_MAX, cold_key, inf
 /// The origin and the owner.
 const X: usize = 0;
 const Y: usize = 1;
-/// A mesh of 8 data credits a peer: a general send keeps one free for the
-/// publish fan, so an origin holds 7 un-replied ops toward a peer.
+/// A mesh of 8 data credits a peer, the gated legs' own.
 const SMALL_MESH: inf_fabric::MeshConfig = crate::harness::scenario_mesh(1024, 8);
-const UNREPLIED_MAX: usize = 7;
 /// Steps a held phase runs before its clauses read it, so every op it sent
 /// reached the owner and waits there.
 const SETTLE_STEPS: u32 = 64;
-/// The seeds the held-fsync input runs at: its clause holds whatever the
-/// schedule, and the planted build breaks it at each.
-const SEEDS: [u64; 4] = [0xC0FFEE, 0x1, 0x2, 0x3];
 
 /// Holds every barrier, and every read, on every file.
 fn any_file(_: &Path) -> bool {
@@ -107,59 +100,6 @@ fn quiet_deques(quiet: &mut Quiet) {
     for cell in [X, Y] {
         assert_eq!(tripwire(quiet, cell, "fabric_parked_refused"), 0, "parked-refused on {cell}");
     }
-}
-
-/// A peer's credits' worth of `always` writes from one origin while the
-/// owner's fsync is held: 7 clients of X, one `SET` each to a key Y owns,
-/// sent at one step and delivered whole. No client reads an ack before the
-/// hold lifts (`acked-under-hold`, the oracle, read at every seed before it
-/// judges); every client reads `+OK`. Engagement, each else its `VACUOUS`
-/// line: the device held a frame barrier, and Y's gated deque for X held the
-/// verdicts. Planted (`inf_canary_gated_ignores_watermark`), the `gated` task
-/// publishes every filled verdict, and the acks are read under the hold, at
-/// every seed.
-#[test]
-fn a_peers_always_verdicts_wait_for_the_owners_fsync() {
-    let mut early = Vec::new();
-    for seed in SEEDS {
-        let mut quiet = Quiet::boot_on(seed, SMALL_MESH, 2, 0, Y as u16);
-        create_always(&mut quiet, b"acks");
-        let mut writers: Vec<MiniClient> =
-            (0..UNREPLIED_MAX).map(|_| client_in(&mut quiet, X, b"acks")).collect();
-        quiet.disk.hold_barriers(Some(any_file));
-        let delivery = quiet.node.nets[X].borrow_mut().deliver_whole();
-        for (writer, name) in writers.iter_mut().zip(names_on(Y, "acks", UNREPLIED_MAX)) {
-            writer.send(&mut quiet.node, &[b"SET", &name, b"1"]);
-        }
-        for _ in 0..SETTLE_STEPS {
-            quiet.step();
-        }
-        quiet.node.nets[X].borrow_mut().restore_delivery(delivery);
-        let held = quiet.node.driver(Y).held_barriers();
-        assert!(held.frames() > 0, "VACUOUS frame-barrier-unheld at seed {seed:#x}: {held:?}");
-        let parked = high_water(&quiet, Y, "gated");
-        assert!(parked > 0, "VACUOUS verdicts-unparked at seed {seed:#x}: Y's gated row read 0");
-        let mut waiting = Vec::new();
-        for (index, mut writer) in writers.into_iter().enumerate() {
-            match writer.recv(&mut quiet.node) {
-                Some(reply) => early.push(format!("seed {seed:#x} writer {index}: {reply:?}")),
-                None => waiting.push(writer),
-            }
-        }
-        quiet.disk.hold_barriers(None);
-        for (index, reply) in replies(&mut quiet, &mut waiting).into_iter().enumerate() {
-            assert_eq!(reply.as_deref(), Some(&b"+OK\r\n"[..]), "writer {index} at seed {seed:#x}");
-        }
-        for _ in 0..SETTLE_STEPS {
-            quiet.step();
-        }
-        quiet_deques(&mut quiet);
-    }
-    assert!(
-        early.is_empty(),
-        "acked-under-hold: {} ack(s) read before the owner's fsync: {early:?}",
-        early.len()
-    );
 }
 
 /// A tiered `always` write suspended on a cold read between its placeholder
@@ -247,38 +187,6 @@ fn a_tiered_verdict_keeps_its_place_across_a_cold_read() {
     let appended = read[0].as_deref().map(|reply| reply.first() == Some(&b':'));
     assert_eq!(appended, Some(true), "the APPEND's reply: {:?}", read[0]);
     assert_eq!(read[1].as_deref(), Some(&b"+OK\r\n"[..]), "the SET's reply");
-    for _ in 0..SETTLE_STEPS {
-        quiet.step();
-    }
-    quiet_deques(&mut quiet);
-}
-
-/// A verdict that is an error reply gives its placeholder back: a client of
-/// X `INCR`s a key Y holds as text, answered at once with Redis's error, and
-/// another client of X then `SET`s a key on Y, answered once Y's fsync
-/// covers it. Planted (`inf_canary_gated_error_keeps_placeholder`), the
-/// error leaves its placeholder at the front of Y's gated deque for X, and
-/// the later write's verdict waits behind it for good
-/// (`verdict-behind-an-error`).
-#[test]
-fn an_error_verdict_gives_its_placeholder_back() {
-    let mut quiet = Quiet::boot_on(0xC0FFEE, SMALL_MESH, 2, 0, Y as u16);
-    create_always(&mut quiet, b"errs");
-    let mut owner = client_in(&mut quiet, Y, b"errs");
-    let names = names_on(Y, "errs", 2);
-    let set: &[&[u8]] = &[b"SET", &names[0], b"text"];
-    assert_eq!(quiet.call(&mut owner, set, "the owner's SET"), b"+OK\r\n");
-    let mut incr = client_in(&mut quiet, X, b"errs");
-    let error = quiet.call(&mut incr, &[b"INCR", &names[0]], "the INCR");
-    assert_eq!(error, b"-ERR value is not an integer or out of range\r\n");
-    let mut after = [client_in(&mut quiet, X, b"errs")];
-    after[0].send(&mut quiet.node, &[b"SET", &names[1], b"1"]);
-    let read = replies(&mut quiet, &mut after);
-    assert_eq!(
-        read[0].as_deref(),
-        Some(&b"+OK\r\n"[..]),
-        "verdict-behind-an-error: a write after an error verdict was not answered"
-    );
     for _ in 0..SETTLE_STEPS {
         quiet.step();
     }

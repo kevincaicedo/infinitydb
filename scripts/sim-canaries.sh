@@ -1080,16 +1080,16 @@ ordered_rows=(
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_posts_no_recv_after_closed recv-after-closed"
   # An `always` apply whose verdict is a reply gives its placeholder back (ADR-0177 D6), so its
   # origin's later verdicts are reached. Planted, an error reply leaves the placeholder at the
-  # origin's front, and the next write's verdict waits behind it for good.
-  "inf_canary_gated_error_keeps_placeholder crate-test inf-sim lib an_error_verdict_gives_its_placeholder_back verdict-behind-an-error"
+  # origin's front, and the writes after it wait behind it once the fsync hold lifts.
+  "inf_canary_gated_error_keeps_placeholder m0-capacity reply-stalled-after-lift --close-leg gated-error"
   # The gated task publishes an `always` verdict only once the owner's fsync watermark covers
   # its record (ADR-0177 D3). Planted, it publishes every filled front, so a remote `always`
   # write is acknowledged before it is durable and the power cut loses it. The lane seed's cut
   # meets no such ack; this named seed's does.
   "inf_canary_gated_ignores_watermark m2-durable DURABILITY --seed 0xc1000c"
-  # The same plant on a peer's credits' worth of remote `always` writes under a held fsync,
-  # where every seed's acks are read before the owner's fsync.
-  "inf_canary_gated_ignores_watermark crate-test inf-sim lib a_peers_always_verdicts_wait_for_the_owners_fsync acked-under-hold"
+  # The same plant on a peer's credits' worth of remote `always` writes while the owner's
+  # fsync is held: no barrier completes, so at every seed the acks are read under the hold.
+  "inf_canary_gated_ignores_watermark m0-capacity acked-under-hold --close-leg gated-hold"
   # The net's own invariant: no chunk of an fd is posted after its end of stream. Its close
   # legs' shared reap posts a closed client's last chunk and its EOF in one reap, data first;
   # planted, the EOF goes first and the chunk after it.
