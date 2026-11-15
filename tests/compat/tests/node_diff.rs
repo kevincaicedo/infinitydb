@@ -1147,6 +1147,93 @@ fn timeout_teardown(server: &TcpStream, key: &str) {
     cmd(&mut fresh, &mut buf, &["DEL", key]);
 }
 
+/// Sets the receive buffer of `stream` to `bytes`.
+fn receive_buffer(stream: &TcpStream, bytes: libc::c_int) {
+    use std::os::fd::AsRawFd;
+    let len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).expect("an int");
+    // SAFETY: `stream` owns an open socket for the call's whole duration, and
+    // `bytes` is a live int that setsockopt only reads; no pointer outlives it.
+    let status = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::from_ref(&bytes).cast(),
+            len,
+        )
+    };
+    assert_eq!(status, 0, "SO_RCVBUF: {}", std::io::Error::last_os_error());
+}
+
+/// R6's shape: `GET` of the large value read at 1 MiB per 250 ms through a
+/// 256 KiB receive buffer under `timeout 1`. The bytes read before the
+/// server's close, and whether it closed within `timeout` + 2 s of the last.
+fn slow_reader(server: &mut TcpStream, key: &str) -> (usize, bool) {
+    use std::time::{Duration, Instant};
+    timeout_setup(server, key);
+    let mut reader = sibling(server);
+    receive_buffer(&reader, 256 * 1024);
+    reader.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let wire = encode_command(&["GET".to_string(), key.to_string()]);
+    reader.write_all(&wire).expect("write");
+    let mut read = 0usize;
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut ended = false;
+    while read < large_reply_bytes() && !ended {
+        let mut period = 0usize;
+        while period < (1 << 20) && read < large_reply_bytes() {
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    ended = true;
+                    break;
+                }
+                Ok(n) => {
+                    read += n;
+                    period += n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                    ended = true;
+                    break;
+                }
+                Err(e) => panic!("the slow reader's read failed after {read} bytes: {e}"),
+            }
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let last = Instant::now();
+    let closed = ended || {
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).is_ok() && rest.is_empty()
+    };
+    let in_time = last.elapsed() <= Duration::from_secs(3);
+    timeout_teardown(server, key);
+    (read, closed && in_time)
+}
+
+/// A slow reader is answered whole on both engines, then closed: the node
+/// counts a reply it sends as activity, so `timeout` judges the read's
+/// gaps, never the request's age (ADR-0193 D3). Redis's largest gap between
+/// two writes is 0.501 s here, the node's the reader's 0.25 s pace.
+#[test]
+#[ignore = "timeout judges a connection by its receive clock alone, so the node closes a slow \
+            reader a timeout after its request with most of the reply unsent; red until a reply \
+            sent is activity and a connection the server owes bytes is never judged"]
+fn timeout_spares_a_slow_reader_like_redis() {
+    let Some((_node_guard, mut node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (_oracle_guard, mut oracle) = oracle();
+    let want = large_reply_bytes();
+    let (oracle_read, oracle_closed) = slow_reader(&mut oracle, "timeout:slow");
+    assert_eq!(oracle_read, want, "redis: the slow reader's bytes");
+    assert!(oracle_closed, "redis: the slow reader was closed after its reply");
+    let (node_read, node_closed) = slow_reader(&mut node, "timeout:slow");
+    assert_eq!(node_read, want, "node: the slow reader's bytes, as redis");
+    assert!(node_closed, "node: the slow reader was closed after its reply, as redis");
+}
+
 /// R7's and R8's shape: `GET` of the large value, with `QUIT` behind it when
 /// `quit`, written once and never read. The seconds from the write until
 /// `CLIENT LIST` no longer holds the client.

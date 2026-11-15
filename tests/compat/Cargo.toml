@@ -14,5 +14,10 @@ inf-store.workspace = true
 inf-server.workspace = true
 serde_json.workspace = true
 
+# The timeout shapes read a large reply through a small receive buffer
+# (`SO_RCVBUF`), which std's sockets do not expose.
+[dev-dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

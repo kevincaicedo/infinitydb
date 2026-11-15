@@ -147,6 +147,7 @@ dependencies = [
  "inf-server",
  "inf-store",
  "inf-wire",
+ "libc",
  "serde_json",
 ]
 
