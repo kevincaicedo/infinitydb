@@ -847,6 +847,15 @@ impl UringDriver {
                         CloseWait { token, close_seen: false, close_result: 0, sends_left },
                     );
                     self.backlog_sqe(opcode::Close::new(Fd(fd)).build().user_data(close_id));
+                    // Canary: `Closed` is posted as the close is queued, ahead of the
+                    // completions the next reap brings.
+                    #[cfg(inf_canary_close_posts_closed_early)]
+                    if let Some(wait) = self.closing.remove(&close_id) {
+                        out.push(Completion {
+                            token: wait.token,
+                            result: CompletionResult::Closed,
+                        });
+                    }
                 }
                 IoOp::LogWrite { fd, offset, data, token, barrier } => {
                     self.arm_log_write(fd, offset, data, token, 0, barrier);
@@ -1025,6 +1034,12 @@ impl UringDriver {
                 let rearm = owns_arm
                     && result > 0
                     && self.recvs.get(&fd).is_some_and(|a| !a.disarmed && !a.paused);
+                // Canary: a zero result, the end of stream, re-arms the receive too.
+                #[cfg(inf_canary_uring_eof_rearms)]
+                let rearm = rearm
+                    || (owns_arm
+                        && result == 0
+                        && self.recvs.get(&fd).is_some_and(|a| !a.disarmed && !a.paused));
                 if rearm {
                     self.arm_recv_sqe(fd, token, pool);
                 }
@@ -1360,6 +1375,9 @@ impl BackendDriver for UringDriver {
             .completion()
             .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags()))
             .collect();
+        // Canary: the reap's completions are dispatched last first.
+        #[cfg(inf_canary_uring_cqe_order_reversed)]
+        let cqes = cqes.into_iter().rev();
         for (id, result, flags) in cqes {
             self.dispatch_cqe(id, result, flags, pool, out);
         }

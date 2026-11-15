@@ -27,13 +27,19 @@ pub fn config() -> UringConfig {
     UringConfig::from_lookup(std::env::var_os)
 }
 
+/// Whether the test's environment selects the degraded mode, read from the
+/// variable itself, not through the decoder.
+#[allow(clippy::disallowed_methods, reason = "test-only: the test's environment, not cell code")]
+pub fn degraded_selected() -> bool {
+    std::env::var_os("INF_URING_FORCE_DEGRADED").is_some()
+}
+
 /// Checks that `caps`, a test ring's, engaged the mode the environment
 /// selects. With `INF_URING_FORCE_DEGRADED` present the ring is degraded:
 /// no multishot accept, no multishot recv. Absent, a kernel at 5.19 or
 /// later gives multishot accept.
-#[allow(clippy::disallowed_methods, reason = "test-only: the test's environment, not cell code")]
 pub fn assert_engaged(caps: &Capabilities) {
-    if std::env::var_os("INF_URING_FORCE_DEGRADED").is_some() {
+    if degraded_selected() {
         assert!(!caps.multishot_accept, "a degraded leg's ring accepts multishot: {caps:?}");
         assert!(!caps.multishot_recv, "a degraded leg's ring receives multishot: {caps:?}");
     } else if kernel_release() >= MULTISHOT_ACCEPT_FROM {
