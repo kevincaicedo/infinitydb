@@ -37,6 +37,9 @@ enum Kind {
     /// given `<class> <hard> <soft> <secs>` groups onto the current value;
     /// GET reports all three classes in canonical order, like Redis.
     OutputBufferLimit,
+    /// Connections per node: an integer in Redis's `1..=u32::MAX`, at most
+    /// the store's boot capacity (ADR-0123 A1).
+    Clients,
 }
 
 #[derive(Debug)]
@@ -68,7 +71,7 @@ pub enum ConfigSetError {
 /// The reply to a `CONFIG SET maxclients` above the boot capacity, ADR-0123
 /// A1's bytes: a value refused, not a reservation, so no key of the same
 /// `CONFIG SET` changes.
-pub const BOOT_CAPACITY_REFUSAL: &str =
+pub(crate) const BOOT_CAPACITY_REFUSAL: &str =
     "ERR maxclients exceeds boot capacity; restart with --maxclients";
 
 /// The node's connection capacity, fixed at boot (ADR-0123 A1): the boot
@@ -108,6 +111,16 @@ impl core::fmt::Display for BootCapacityRefused {
 impl std::error::Error for BootCapacityRefused {}
 
 impl BootCapacity {
+    /// The boot capacity of a store assembled without one: `B` = 10,000 on
+    /// one cell. A store reads only `B`; checked when the crate is built.
+    const DEFAULT: BootCapacity = match inf_foundation::CellCount::new(1) {
+        Ok(one) => match BootCapacity::new(crate::limits::MAXCLIENTS_BOOT_DEFAULT, one) {
+            Ok(capacity) => capacity,
+            Err(_) => panic!("the default boot capacity fits one cell"),
+        },
+        Err(_) => panic!("one cell is a cell count"),
+    };
+
     /// `B` = `maxclients` for a node of `cells`, checked: `B` in
     /// `1..=u32::MAX` and `C = max(1, B / cells)` at most
     /// [`CONN_TASKS_MAX`](crate::limits::CONN_TASKS_MAX).
@@ -141,6 +154,17 @@ impl BootCapacity {
     #[must_use]
     pub const fn per_cell(self) -> u32 {
         self.per_cell
+    }
+
+    /// A `maxclients` value already inside Redis's `1..=u32::MAX`, against
+    /// `B`: above it, [`ConfigSetError::BootCapacity`].
+    fn admits(self, value: i64) -> Result<(), ConfigSetError> {
+        if value <= i64::from(self.maxclients) {
+            return Ok(());
+        }
+        // Inside `1..=u32::MAX`, so the narrowing is exact.
+        let requested = u32::try_from(value).unwrap_or(u32::MAX);
+        Err(ConfigSetError::BootCapacity { requested, capacity: self.maxclients })
     }
 }
 
@@ -189,9 +213,10 @@ const NON_NEGATIVE_I32: (i64, i64) = (0, i32::MAX as i64);
 #[derive(Debug)]
 pub struct ConfigStore {
     entries: Vec<Entry>,
-    /// The boot capacity's `B` (ADR-0123 A1): `maxclients` above it is
-    /// refused whole. 10,000 until [`ConfigStore::with_boot_capacity`].
-    maxclients_boot: u32,
+    /// The node's boot capacity (ADR-0123 A1): a `Kind::Clients` value above
+    /// its `B` is refused whole. 10,000 until
+    /// [`ConfigStore::with_boot_capacity`].
+    boot: BootCapacity,
     #[cfg(feature = "doc")]
     path_cache_capacity: inf_doc::limits::ProgramCacheCapacity,
     /// Bumped on every successful SET — the plane's MAINTAIN sweep compares
@@ -220,9 +245,9 @@ impl Default for ConfigStore {
             ),
             // ADR-0123 D1: the node bound, divided per cell like
             // `maxmemory`; the accept path refuses past the share.
-            // ADR-0123 A1: at most the boot capacity, which `validate`
-            // reads; the default is the boot default.
-            e("maxclients", ReloadClass::HotPerCell, Kind::Int(1, i64::from(u32::MAX)), "10000"),
+            // ADR-0123 A1: at most the boot capacity; the default is the
+            // boot default.
+            e("maxclients", ReloadClass::HotPerCell, Kind::Clients, "10000"),
             e("maxmemory", ReloadClass::HotPerCell, Kind::Memory, "0"),
             e(
                 "maxmemory-policy",
@@ -293,7 +318,7 @@ impl Default for ConfigStore {
         entries.sort_unstable_by_key(|entry| entry.key);
         ConfigStore {
             entries,
-            maxclients_boot: crate::limits::MAXCLIENTS_BOOT_DEFAULT,
+            boot: BootCapacity::DEFAULT,
             version: 0,
             #[cfg(feature = "doc")]
             path_cache_capacity: inf_doc::limits::ProgramCacheCapacity::default(),
@@ -319,10 +344,10 @@ impl ConfigStore {
     /// A1): `maxclients` starts at `B` and may not be set above it.
     #[must_use]
     pub fn with_boot_capacity(mut self, capacity: BootCapacity) -> Self {
-        self.maxclients_boot = capacity.maxclients();
+        self.boot = capacity;
         let value = capacity.maxclients().to_string();
         for entry in &mut self.entries {
-            if entry.key == "maxclients" {
+            if matches!(entry.kind, Kind::Clients) {
                 entry.value.clone_from(&value);
             }
         }
@@ -374,14 +399,25 @@ impl ConfigStore {
                     key: key_str.clone(),
                     value: text.clone(),
                 })?,
-            Kind::Int(min, max) => {
-                let value =
-                    text.parse::<i64>().ok().filter(|v| (min..=max).contains(v)).ok_or_else(
-                        || ConfigSetError::Invalid { key: key_str.clone(), value: text.clone() },
-                    )?;
-                if entry.key == "maxclients" {
-                    self.within_boot_capacity(value)?;
-                }
+            Kind::Int(min, max) => text
+                .parse::<i64>()
+                .ok()
+                .filter(|v| (min..=max).contains(v))
+                .map(|v| v.to_string())
+                .ok_or_else(|| ConfigSetError::Invalid {
+                    key: key_str.clone(),
+                    value: text.clone(),
+                })?,
+            Kind::Clients => {
+                let value = text
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|v| (1..=i64::from(u32::MAX)).contains(v))
+                    .ok_or_else(|| ConfigSetError::Invalid {
+                        key: key_str.clone(),
+                        value: text.clone(),
+                    })?;
+                self.boot.admits(value)?;
                 value.to_string()
             }
             Kind::Enum(tokens) => {
@@ -396,18 +432,6 @@ impl ConfigStore {
                 .ok_or(ConfigSetError::Invalid { key: key_str, value: text })?,
         };
         Ok(ValidatedSet { index, normalized })
-    }
-
-    /// A `maxclients` value inside `1..=u32::MAX` against the boot
-    /// capacity: above `B` it is [`ConfigSetError::BootCapacity`].
-    fn within_boot_capacity(&self, value: i64) -> Result<(), ConfigSetError> {
-        let capacity = self.maxclients_boot;
-        if value <= i64::from(capacity) {
-            return Ok(());
-        }
-        // The row's bound is `1..=u32::MAX`, so the narrowing is exact.
-        let requested = u32::try_from(value).unwrap_or(u32::MAX);
-        Err(ConfigSetError::BootCapacity { requested, capacity })
     }
 
     /// Applies a validated pair. Infallible by construction — validation

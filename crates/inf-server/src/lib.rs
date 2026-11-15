@@ -52,8 +52,7 @@ pub use cache_boot::{CacheBootGroup, CacheBootPermit};
 pub use ckpt::{CkptStats, ManifestStats};
 pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{
-    BOOT_CAPACITY_REFUSAL, BootCapacity, BootCapacityRefused, ConfigSetError, ConfigStore,
-    MAXMEMORY_POLICIES, ReloadClass,
+    BootCapacity, BootCapacityRefused, ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass,
 };
 pub use control::{
     BoardObservation, BoardSweep, CellIssuer, CellRecoverySlot, CheckpointEpoch, CkptBoard,
