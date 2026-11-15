@@ -2682,6 +2682,9 @@ if [ -n "${RUSTFLAGS:-}" ]; then
     echo "$state ${dir##*/}" $(cd "${dir%/*}" && ls -d canary-* 2>/dev/null) >>"$(dirname "$0")/planted-dirs"
 fi
 mkdir -p "$dir/release"
+case "${RUSTFLAGS:-}" in
+    *inf_canary_locked*) mkdir -p "$dir/release/locked" && : >"$dir/release/locked/unit" && chmod a-w "$dir/release/locked" ;;
+esac
 case "$1:${RUSTFLAGS:-}" in
     build:) printf '#!/usr/bin/env bash\necho "inf-sim: scenario fake-scenario: green"\n' >"$dir/release/inf-sim" ;;
     build:*) printf '#!/usr/bin/env bash\necho "inf-sim: ORACLE VIOLATION: TOKEN VIOLATION seed 0x1 cell 0: the rule broke"\nexit 1\n' >"$dir/release/inf-sim" ;;
@@ -2733,6 +2736,17 @@ lane_cargo "$dir/cargo"
 canary_lane "$dir" "loom $row"
 expect_red_because "canaries: a cfg not spelled inf_canary_<name> keeps its directory, red" "is not removed: a planted directory is canary-inf_canary_<name>" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
 expect green "canaries: the refused directory is still there" test -d "$dir/target/canary-loom"
+# A removal that fails is red: the stub leaves a directory its owner cannot
+# write in, which only root could remove.
+if [ "$(id -u)" -ne 0 ]; then
+dir="$work/canary-disk-locked"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "inf_canary_locked $row"
+expect_red_because "canaries: a planted directory the removal cannot remove is red" "is not removed: target-root: removing" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: the locked directory is what stayed" test -d "$dir/target/canary-inf_canary_locked/release/locked"
+chmod -R u+w "$dir/target"
+fi
 # ADR-0107 D1: the simulator's tests compile only with its `dst` feature,
 # so a crate-test row on `inf-sim` passes it and no other package's row
 # does — the stub answers only when it sees the feature.

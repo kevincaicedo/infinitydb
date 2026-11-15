@@ -1549,8 +1549,9 @@ scenario_row() {
 # builds in `canary-<cfg>` under the root, crate tests and simulator alike,
 # removed once its last row of this run (or shard) is judged, caught or red;
 # a cfg whose rows stand apart in the table's first part keeps it until its
-# last. The root is this checkout's own (ADR-0204 D1), so the removal
-# reaches no other checkout's build. last_of_cfg[i] is 1 where row i is its
+# last. The removal is the root's own, target_root_remove: a directory
+# directly below this checkout's root that holds no work tree and no other
+# root, the walk of ADR-0204 D2. last_of_cfg[i] is 1 where row i is its
 # cfg's last, read from the last row up before the first build.
 last_of_cfg=() seen_cfgs=" "
 for ((index = ${#rows[@]} - 1; index >= 0; index--)); do
@@ -1562,22 +1563,22 @@ for ((index = ${#rows[@]} - 1; index >= 0; index--)); do
   esac
 done
 
-# remove_planted <cfg>: removes the cfg's planted directory, and refuses, red,
-# one that is not `canary-inf_canary_<name>` under an absolute root: another
-# spelling could name the Loom tree or a path outside the root.
+# remove_planted <cfg>: the cfg's planted directory, through the root's own
+# removal; refused or failed, the row's cfg is red. A cfg that is not
+# `inf_canary_<name>` is refused first: another spelling could name the Loom
+# tree or a path outside the root.
 remove_planted() {
-  local dir=$TARGET_ROOT/canary-$1
-  if [[ "$TARGET_ROOT" != /?* || ! "$1" =~ ^inf_canary_[A-Za-z0-9_]+$ ]]; then
-    echo "   red: $dir is not removed: a planted directory is canary-inf_canary_<name> under" \
-      "an absolute root"
+  local dir=$TARGET_ROOT/canary-$1 removed
+  if ! [[ "$1" =~ ^inf_canary_[A-Za-z0-9_]+$ ]]; then
+    echo "   red: $dir is not removed: a planted directory is canary-inf_canary_<name>"
     fail=1
     return
   fi
-  [ -d "$dir" ] || return 0
-  if rm -rf -- "$dir"; then
-    echo "== canary $1: its last row judged, $dir removed"
+  if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then return 0; fi
+  if removed=$(target_root_remove "$dir" 2>&1); then
+    echo "== canary $1: its rows judged, $removed removed"
   else
-    echo "   red: $dir could not be removed, and a cfg's planted build goes after its last row"
+    echo "   red: $dir is not removed: $removed"
     fail=1
   fi
 }
