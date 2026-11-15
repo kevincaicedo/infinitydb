@@ -41,6 +41,15 @@ const DEFAULT_CELLS: inf_foundation::CellCount = match inf_foundation::CellCount
     Err(_) => panic!("four cells is a valid topology"),
 };
 
+/// The boot capacity when `--maxclients` is absent, at the default cells:
+/// checked when the binary is built (ADR-0123 A1).
+const DEFAULT_BOOT_CAPACITY: inf_server::BootCapacity =
+    match inf_server::BootCapacity::new(inf_server::limits::MAXCLIENTS_BOOT_DEFAULT, DEFAULT_CELLS)
+    {
+        Ok(capacity) => capacity,
+        Err(_) => panic!("the default maxclients fits the default cells"),
+    };
+
 /// The shipped fabric mesh: the two `limits` rows, checked when the binary
 /// is built, so a pair the plane's check refuses fails the build.
 const FABRIC_MESH: MeshConfig = match inf_server::checked_mesh_config(
@@ -56,6 +65,9 @@ struct Args {
     port: u16,
     /// The boot topology (ADR-0159 A1.1): checked once, at the flag.
     cells: inf_foundation::CellCount,
+    /// `--maxclients` against `--cells` (ADR-0123 A1): checked once, after
+    /// every flag is read, before any cell is built.
+    boot_capacity: inf_server::BootCapacity,
     buffers: usize,
     buf_size: usize,
     pin_start: Option<usize>,
@@ -209,6 +221,7 @@ impl Default for Args {
         Args {
             port: 6379,
             cells: DEFAULT_CELLS,
+            boot_capacity: DEFAULT_BOOT_CAPACITY,
             buffers: 4096,
             buf_size: 4096,
             pin_start: None,
@@ -254,6 +267,7 @@ impl Default for Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args::default();
+    let mut maxclients = inf_server::limits::MAXCLIENTS_BOOT_DEFAULT;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut take = |name: &str| it.next().ok_or_else(|| format!("{name} requires a value"));
@@ -269,6 +283,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--buffers" => {
                 args.buffers = take("--buffers")?.parse().map_err(|e| format!("--buffers: {e}"))?;
+            }
+            "--maxclients" => {
+                maxclients =
+                    take("--maxclients")?.parse().map_err(|e| format!("--maxclients: {e}"))?;
             }
             "--buf-size" => {
                 args.buf_size =
@@ -476,7 +494,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
+                    "infinityd [--port 6379] [--cells 4] [--maxclients 10000] \
+                     [--buffers 4096] [--buf-size 4096] \
                      [--pin-start CORE] [--pin-stride 2] [--route-local-only] [--data-dir PATH] \
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--segment-recycle-slots 1] \
                      [--no-segment-recycle] [--recycle-wait off|quarter|eighth] \
@@ -499,6 +518,10 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown flag {other}")),
         }
     }
+    // ADR-0123 A1: the boot capacity, against the cells the flags chose,
+    // before any cell or listener exists.
+    args.boot_capacity = inf_server::BootCapacity::new(maxclients, args.cells)
+        .map_err(|refused| refused.to_string())?;
     // The operator values that reach a cell-crate constructor are bounded
     // here, where a violation is a usage error — never at the constructor's
     // release assert (ADR-0107 D2: `buffer_pool.rs` / `router.rs` C rows
@@ -1327,7 +1350,8 @@ fn cell_main(
     if let Some(cpu) = args.cell_cpu(cell).map_err(std::io::Error::other)? {
         pin_current_thread(cpu)?;
     }
-    let config = inf_server::ConfigStore::with_path_cache_capacity(args.doc_path_cache_capacity);
+    let config = inf_server::ConfigStore::with_path_cache_capacity(args.doc_path_cache_capacity)
+        .with_boot_capacity(args.boot_capacity);
     let node = boot_node_info(config, cache_permit)?;
     mark(11); // setup:pool
     let mut pool = BufferPool::new(args.buffers, args.buf_size);

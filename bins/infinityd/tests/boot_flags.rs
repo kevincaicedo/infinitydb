@@ -75,6 +75,16 @@ fn out_of_range_boot_flags_are_usage_errors_not_panics() {
             "--buf-size must be <= 2147483647",
         ),
         ("cells-over", &["--cells", "16385"], "--cells must be <= 16384"),
+        // ADR-0123 A1: the boot capacity is 1..=u32::MAX connections, and a
+        // cell's share at most the 2^24 − 1 slots its connection token
+        // addresses: refused before any cell is built.
+        ("maxclients-zero", &["--maxclients", "0"], "--maxclients is 1..=4294967295, got 0"),
+        ("maxclients-over-u32", &["--maxclients", "4294967296"], "--maxclients: "),
+        (
+            "maxclients-share-over",
+            &["--cells", "1", "--maxclients", "16777216"],
+            "each cell 16777216 connection slots, past the ceiling of 16777215",
+        ),
         // The longest park a cell loop takes, 100 ms: one microsecond more is refused.
         ("park-over", &["--park-us", "100001"], "--park-us must be <= 100000"),
         // The staging buffer's domain: one MiB up to the frame decoder
