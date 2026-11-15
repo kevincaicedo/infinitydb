@@ -606,6 +606,54 @@ fn walk_pair_mut<T, G: SlotGeneration, L: Level<T, G>>(
     }
 }
 
+/// One store's slots, read through a root level fixed for the reader's
+/// life: a walk matches the root once and reads every visit through this.
+pub(super) trait SlotAccess<T, G> {
+    fn slot(&self, index: u32) -> Option<&Slot<T, G>>;
+}
+
+/// A walk over one store, run on the store's root level as a type.
+pub(super) trait LevelWalk<T, G> {
+    type Output;
+    fn walk<A: SlotAccess<T, G>>(self, access: &A) -> Self::Output;
+}
+
+struct RootAccess<'a, L>(&'a L);
+
+struct NoSlots;
+
+impl<T, G> SlotAccess<T, G> for NoSlots {
+    #[inline]
+    fn slot(&self, _: u32) -> Option<&Slot<T, G>> {
+        None
+    }
+}
+
+impl<T, G: SlotGeneration, L: Level<T, G>> SlotAccess<T, G> for RootAccess<'_, L> {
+    #[inline]
+    fn slot(&self, index: u32) -> Option<&Slot<T, G>> {
+        walk(self.0, index)
+    }
+}
+
+impl<T, G: SlotGeneration> SlotStore<T, G> {
+    /// `walker` on this store's root level, matched once: the walk borrows
+    /// the store, so its root, and with it the level every visit reads,
+    /// cannot change until the walk returns. Inlined into its caller, so
+    /// the caller's own attribute places the walk.
+    #[inline(always)]
+    pub(super) fn walk_with<W: LevelWalk<T, G>>(&self, walker: W) -> W::Output {
+        match &self.root {
+            Root::Empty => walker.walk(&NoSlots),
+            Root::Chunk(level) => walker.walk(&RootAccess(&**level)),
+            Root::One(level) => walker.walk(&RootAccess(&**level)),
+            Root::Two(level) => walker.walk(&RootAccess(&**level)),
+            Root::Three(level) => walker.walk(&RootAccess(&**level)),
+            Root::Four(level) => walker.walk(&RootAccess(&**level)),
+        }
+    }
+}
+
 /// `items_held` after a build step allocated one item.
 #[allow(
     clippy::arithmetic_side_effects,
