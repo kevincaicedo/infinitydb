@@ -286,7 +286,9 @@ impl<T, G: Generation, P: GenerationPolicy> CappedSlab<T, G, P> {
     /// A free slot when one can serve; `Full` when every slot that can
     /// serve is live (the row's crossings up by one); `Exhausted` when every
     /// slot has retired.
-    #[inline]
+    // Inlined where it is called, so its answer stays in registers: out of
+    // line it is returned through memory, a store and a load a word.
+    #[inline(always)]
     pub fn reserve(&mut self) -> SlabReserved<'_, T, G, P> {
         if !self.has_room() {
             return if self.store.capacity_now() == 0 {
