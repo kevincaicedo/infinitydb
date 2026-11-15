@@ -2568,8 +2568,11 @@ expect green "shipping: test-support declared, and requested on a dev edge only"
 group_sim_canaries() {
 # ADR-0139: `sim-canaries.sh` judges a crate-test row by the named test's
 # own verdict line. A stub cargo prints a canned test log: with RUSTFLAGS
-# set it is the planted build, without it the plain one.
+# set it is the planted build, without it the plain one. Every case is
+# judged on Linux, the lane's authoritative host, unless it names another,
+# so no case reads the runner's own host.
 CANARY=./scripts/sim-canaries.sh
+export INF_CANARY_HOST=Linux
 canary_fixture() {
     local name=$1 planted=$2 plain=$3 dir
     [ -n "$name" ] && [ -n "$work" ] || { echo "canary_fixture: empty name or work dir" >&2; exit 2; }
@@ -2611,7 +2614,7 @@ dir=$(canary_fixture canary-shard "$failed_line" "$ok_line")
 printf 'inf_canary_%s crate-test fake test:suite the_row\n' a b a c >"$dir/rows"
 expect_output "canaries: shard 0/2 runs the first and third cfg, a cfg's rows together" "shard 0/2: 3 of 4 rows (3 cfgs)" env INF_CANARY_SHARD=0/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 expect_output "canaries: shard 1/2 runs the second cfg alone" "shard 1/2: 1 of 4 rows (3 cfgs)" env INF_CANARY_SHARD=1/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
-expect_output "canaries: the shard's rows are the ones judged" "== canary inf_canary_b:" env INF_CANARY_SHARD=1/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: the shard's rows are the ones judged" "== canary inf_canary_b crate-test the_row:" env INF_CANARY_SHARD=1/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 expect green "canaries: a shard's caught rows are green" env INF_CANARY_SHARD=1/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 expect red "canaries: a shard index at its count is a scope failure" env INF_CANARY_SHARD=2/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 expect red "canaries: a malformed shard is a scope failure" env INF_CANARY_SHARD=1/02 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
@@ -2655,11 +2658,87 @@ dir=$(canary_fixture canary-package-feature "$failed_line" "$ok_line")
 echo "inf_canary_fixture crate-test fake/uring,extra test:suite the_row" >"$dir/rows"
 expect green "canaries: a row's package features reach both legs" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture crate-test fake test:suite the_row" >"$dir/rows"
-expect_red_because "canaries: a row without the test's feature runs no test" "the plain build does not pass" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_red_because "canaries: on Linux a row without the test's feature judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture crate-test the_row (no test the_row ran)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 for token in fake/ fake/uring, fake/,uring fake//uring; do
     echo "inf_canary_fixture crate-test $token test:suite the_row" >"$dir/rows"
     expect_red_because "canaries: a crate-test package token '$token' is malformed" "malformed row" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 done
+# Every row is read before the first build: a malformed row anywhere in the
+# table is refused before cargo runs, here a stub that marks any build.
+dir=$(canary_fixture canary-prepass "$failed_line" "$ok_line")
+printf '#!/usr/bin/env bash\n[ "${1:-}" = --version ] || touch "$(dirname "$0")/built"\nexit 0\n' >"$dir/cargo"
+for bad in "inf_canary_b crate-test fake lab the_row" "inf_canary_b crate-test fake test: the_row" "inf_canary_b fake-scenario" "inf_canary_b loom fake the_row"; do
+    printf '%s\n' "inf_canary_a crate-test fake test:suite the_row" "$bad" >"$dir/rows"
+    expect_red_because "canaries: the row '$bad' is refused before the first build" "malformed row: $bad" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+done
+expect red "canaries: nothing was built before a malformed row was refused" test -e "$dir/built"
+# A row's label, `<cfg> <kind> <subject>`, heads every line about the row.
+dir=$(canary_fixture canary-label "$failed_line" "$ok_line")
+expect_output "canaries: a crate-test row's lines carry its label" "== canary inf_canary_fixture crate-test the_row: fake test:suite on the plain build must stay green" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: on Linux the lane prints its host's kernel first" "^host: Linux " env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# Cargo reads CARGO_ENCODED_RUSTFLAGS before RUSTFLAGS, so a set one would
+# drop every plant's cfg: the lane unsets it. The stub refuses the variable.
+dir=$(canary_fixture canary-encoded-rustflags "$failed_line" "$ok_line")
+{
+    echo '#!/usr/bin/env bash'
+    echo '[ -z "${CARGO_ENCODED_RUSTFLAGS+set}" ] || { echo "error: CARGO_ENCODED_RUSTFLAGS outranks RUSTFLAGS"; exit 101; }'
+    echo 'if [ -n "${RUSTFLAGS:-}" ]; then'
+    echo "$failed_line"
+    echo 'else'
+    echo "$ok_line"
+    echo 'fi'
+} >"$dir/cargo"
+expect red "canaries: the stub cargo refuses CARGO_ENCODED_RUSTFLAGS" env CARGO_ENCODED_RUSTFLAGS="--cfg=x" "$dir/cargo" test
+expect green "canaries: the lane unsets CARGO_ENCODED_RUSTFLAGS before any build" env CARGO_ENCODED_RUSTFLAGS="--cfg=x" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# A run that exits 0 and judged nothing (no test of the row's name ran: the
+# host's build does not compile it) is red on Linux, the lane's host, and
+# named as not run on another, where the lane passes only beside a caught
+# row. The stub compiles the test only with `--features uring`.
+dir=$(canary_fixture canary-host "$failed_line" "$ok_line")
+{
+    echo '#!/usr/bin/env bash'
+    echo 'case " $* " in'
+    echo '  *" --features uring "*) ;;'
+    echo '  *) echo "running 0 tests"; exit 0 ;;'
+    echo 'esac'
+    echo 'if [ -n "${RUSTFLAGS:-}" ]; then'
+    echo "$failed_line"
+    echo 'else'
+    echo "$ok_line"
+    echo 'fi'
+} >"$dir/cargo"
+echo "inf_canary_fixture crate-test fake/uring test:suite the_row" >"$dir/rows"
+expect green "canaries: a uring row's feature builds its test" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+printf '%s\n' "inf_canary_caught crate-test fake/uring test:suite the_row" "inf_canary_fixture crate-test fake test:suite the_row" >"$dir/rows"
+expect green "canaries: off Linux a row that judged nothing is not run beside a caught row" env INF_CANARY_HOST=Darwin INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: the row not run is named by its label and reason" "NOT RUN on Darwin: inf_canary_fixture crate-test the_row (no test the_row ran)" env INF_CANARY_HOST=Darwin INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: the summary counts and names the rows not run" "1 canaries caught, 1 not run on Darwin (inf_canary_fixture crate-test the_row), plain builds green" env INF_CANARY_HOST=Darwin INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_red_because "canaries: on Linux the same table is red" "red: judged nothing on the lane's host: inf_canary_fixture crate-test the_row" env INF_CANARY_HOST=Linux INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+echo "inf_canary_fixture crate-test fake test:suite the_row" >"$dir/rows"
+expect_red_because "canaries: off Linux a lane whose every row judged nothing gives no verdict" "SCOPE ERROR — no row ran on Darwin" env INF_CANARY_HOST=Darwin INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# A non-zero exit is never judged nothing: cargo refusing a feature is red
+# on every host, and never named as not run.
+dir=$(canary_fixture canary-unknown-feature "$failed_line" "$ok_line")
+printf '#!/usr/bin/env bash\necho "error: package fake does not contain this feature: urng"\nexit 101\n' >"$dir/cargo"
+echo "inf_canary_fixture crate-test fake/urng test:suite the_row" >"$dir/rows"
+expect_red_because "canaries: off Linux cargo refusing a feature is red for another reason" "red for another reason" env INF_CANARY_HOST=Darwin INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+cp "$work/log" "$dir/run.log"
+expect red "canaries: cargo refusing a feature is never named as not run" grep -q "NOT RUN" "$dir/run.log"
+# On a row whose features name `uring`, a panic whose message begins
+# `io_uring` (the test could not build its ring) is named, on either leg.
+uring_panic='echo "thread the_row panicked at tests/suite.rs:37:10:"; echo "io_uring: Os { code: 1, kind: PermissionDenied }"; echo "test the_row ... FAILED"; exit 101'
+dir=$(canary_fixture canary-uring-plain "$uring_panic" "$uring_panic")
+echo "inf_canary_fixture crate-test fake/uring test:suite the_row" >"$dir/rows"
+expect_red_because "canaries: a ring the plain leg could not build is io_uring unavailable" "red: io_uring unavailable on this host (io_uring: Os { code: 1" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(canary_fixture canary-uring-planted "$uring_panic" "$ok_line")
+echo "inf_canary_fixture crate-test fake/uring test:suite the_row" >"$dir/rows"
+expect_red_because "canaries: a ring the planted leg could not build is no catch" "red: io_uring unavailable on this host" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# INF_CANARY_HOST is the self-test's stub route: without a rows file, or
+# beside a cargo that answers as cargo does, it is refused before any build.
+dir=$(canary_fixture canary-host-real-cargo "$failed_line" "$ok_line")
+expect_red_because "canaries: a host knob without a rows file is a scope failure" "INF_CANARY_HOST is the self-test's stub route and needs INF_CANARY_ROWS_FILE" env INF_CANARY_HOST=Darwin INF_CANARY_CARGO="$dir/cargo" $CANARY
+printf '#!/usr/bin/env bash\ncase "${1:-}" in --version) echo "cargo 1.95.0 (0123abcd 2026-03-01)" ;; esac\nexit 0\n' >"$dir/cargo"
+expect_red_because "canaries: a host knob beside a cargo answering as cargo is a scope failure" "INF_CANARY_HOST is the self-test's stub route, and this cargo is a real one" env INF_CANARY_HOST=Darwin INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 # A test with more than one way to fail: a crate-test row's witness is a
 # phrase of the oracle's own assertion, and the planted log must carry it.
 # A red on the test's engagement check (`VACUOUS`) is never a catch, with
@@ -2761,7 +2840,65 @@ printf '%s\n' "inf_canary_fixture fake-scenario TOKEN-VIOLATION-NAME" "inf_canar
 expect_red_because "canaries: a second row on a leg is judged on the leg's one control" "no catch possible: the plain build prints the substring 'TOKEN'" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 expect_output "canaries: the leg's control runs once" "on the plain build: green above, not run again" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 dir=$(sim_fixture sim-control-red TOKEN "$violation; exit 1" 'echo "inf-sim: ORACLE VIOLATION: seed 0x1: the plain run broke"; exit 1')
-expect_red_because "canaries: a scenario row whose plain build is red has no control" "the plain build is red (a canary needs a green control)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect_red_because "canaries: a scenario row whose plain build is red has no control" "the plain build does not pass 'fake-scenario' (a canary needs a green control)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# A scenario row's label is the scenario and its flags.
+dir=$(sim_fixture sim-label TOKEN "$violation; exit 1")
+echo "inf_canary_fixture fake-scenario TOKEN --sweep 4" >"$dir/rows"
+expect_output "canaries: a scenario row's lines carry its label" "== canary inf_canary_fixture scenario fake-scenario --sweep 4: on the plain build must stay green" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# A scenario that withheld its verdict (a line beginning `WITHHELD:`, exit
+# 0) judged nothing: red on Linux, not run elsewhere beside a caught row.
+dir=$(sim_fixture sim-withheld TOKEN 'echo "WITHHELD: the clause reads /proc, absent here"; exit 0')
+expect_red_because "canaries: on Linux a withheld scenario is judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture scenario fake-scenario (WITHHELD: the clause reads /proc, absent here)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+mkdir -p "$dir/target/canary-inf_canary_other/release"
+printf '#!/usr/bin/env bash\n%s\n' "$violation; exit 1" >"$dir/target/canary-inf_canary_other/release/inf-sim"
+chmod +x "$dir/target/canary-inf_canary_other/release/inf-sim"
+printf '%s\n' "inf_canary_fixture fake-scenario TOKEN" "inf_canary_other fake-scenario TOKEN" >"$dir/rows"
+expect green "canaries: off Linux a withheld scenario is not run beside a caught row" env INF_CANARY_HOST=Darwin INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect_output "canaries: the withheld scenario is named in the summary" "1 canaries caught, 1 not run on Darwin (inf_canary_fixture scenario fake-scenario)" env INF_CANARY_HOST=Darwin INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# A row's red never stops another. The stub cargo answers a build by its
+# leg (RUSTFLAGS set: the planted one) and a crate test as a caught row.
+mixed_cargo() {
+    local file=$1 planted=$2 plain=$3
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'case "${1:-}" in'
+        echo '  build)'
+        echo '    if [ -n "${RUSTFLAGS:-}" ]; then'
+        echo "      $planted"
+        echo '    fi'
+        echo "    $plain"
+        echo '    ;;'
+        echo '  test)'
+        echo '    if [ -n "${RUSTFLAGS:-}" ]; then'
+        echo "      $failed_line"
+        echo '    fi'
+        echo "    $ok_line"
+        echo '    ;;'
+        echo 'esac'
+        echo 'exit 0'
+    } >"$file"
+    chmod +x "$file"
+}
+built_mark='touch "$(dirname "$0")/planted-built"'
+dir=$(sim_fixture sim-planted-build-red TOKEN "$violation; exit 1")
+mixed_cargo "$dir/cargo" 'echo "error: could not compile inf-sim"; exit 101' 'exit 0'
+printf '%s\n' "inf_canary_a fake-scenario TOKEN" "inf_canary_b crate-test fake test:suite the_row" >"$dir/rows"
+expect_red_because "canaries: a scenario row whose planted build fails is red" "red for another reason (the planted build failed" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect_output "canaries: the row after a failed planted build is still judged" "caught: test the_row ... FAILED" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(sim_fixture sim-plain-build-red TOKEN "$violation; exit 1")
+mixed_cargo "$dir/cargo" "$built_mark; exit 0" 'echo "error: could not compile inf-sim"; exit 101'
+printf '%s\n' "inf_canary_a fake-scenario TOKEN" "inf_canary_b fake-scenario TOKEN --sweep 4" "inf_canary_c crate-test fake test:suite the_row" >"$dir/rows"
+expect_red_because "canaries: a failed plain simulator build is red" "red for another reason (the plain build failed" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "canaries: every scenario row reads the failed plain build" test "$(grep -c 'the plain build failed' "$dir/run.log")" -eq 2
+expect red "canaries: no planted simulator is built without a plain one" test -e "$dir/planted-built"
+expect green "canaries: the crate-test row after a failed plain build is caught" grep -q "caught: test the_row ... FAILED" "$dir/run.log"
+dir=$(sim_fixture sim-shared-leg-red TOKEN "$violation; exit 1" 'echo run >>"$(dirname "$0")/../../plain-runs"; echo "inf-sim: ORACLE VIOLATION: seed 0x1: the plain run broke"; exit 1')
+printf '%s\n' "inf_canary_a fake-scenario TOKEN" "inf_canary_b fake-scenario TOKEN" >"$dir/rows"
+expect_red_because "canaries: rows sharing a red plain leg are red" "the plain build does not pass 'fake-scenario'" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "canaries: each row sharing the leg reads its red" test "$(grep -c 'the plain build does not pass' "$dir/run.log")" -eq 2
+expect green "canaries: the shared red plain leg ran once" test "$(wc -l <"$dir/plain-runs")" -eq 1
 # INF_CANARY_CONTROLS_ONLY=1 runs every row's control and judges no plant:
 # the sweep of the control rule over the table.
 dir=$(sim_fixture sim-controls-only TOKEN 'touch "$(dirname "$0")/planted-ran"; exit 0')
@@ -2821,6 +2958,8 @@ dir=$(loom_fixture loom-witness-printed "$witness_line" 'echo "test the_row ... 
 expect_red_because "canaries: a loom witness the plain loom run prints is no catch" "no catch possible: the plain build prints the witness 'WITNESS:'" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture loom fake the_row" >"$work/canary-short-loom-row"
 expect red "canaries: a loom row without its witness is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-short-loom-row" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(loom_fixture loom-judged-nothing 'echo "running 0 tests"; exit 0' "$ok_line")
+expect_red_because "canaries: on Linux a loom model the planted build never ran is judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture loom the_row (no test the_row ran)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 }
 
 # --------------------------------------------------- release-assert inventory

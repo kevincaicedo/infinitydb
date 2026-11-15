@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Planted-bug canaries (ADR-0090 D5; F-L19-03 addendum, F-L19-04): each
+# Planted-bug canaries (ADR-0090 D5): each
 # `--cfg inf_canary_*` disables one load-bearing rule in the product,
 # removes from a harness leg what its engagement clause needs (a vacuity
 # plant), or breaks the simulator's model of a contract that a leg's oracle
@@ -54,6 +54,26 @@
 # planted log naming it says nothing of the oracle, and the row is refused
 # before its plant is built. A crate-test or loom control runs with
 # `--show-output`, so a passing test's own prints are read too.
+# A row's label, `<cfg> <kind> <subject>`, heads every line about it (one
+# cfg owns many rows): the kind `crate-test`, `loom` or `scenario`, the
+# subject the test's name, or the scenario and its flags. Every row is read
+# before the first build: a wrong arity for its kind, an empty feature list
+# or a target neither `lib` nor `test:NAME` is a scope error.
+# A run that exits 0 and judged nothing is neither caught nor NOT CAUGHT:
+# a crate test or Loom model with no verdict line for its test (cargo built
+# no such test on this host), a scenario whose log has a line beginning
+# `WITHHELD:`. Linux is the lane's authoritative host (the shipped backend
+# and the nightly run there), and there such a row is red; on another host
+# it is NOT RUN, named in the summary, and the lane passes when every other
+# row does and one was caught (ADR-0106 D18's rule for a host-bound plant).
+# A non-zero exit is never judged nothing: a compile error, or cargo
+# refusing a feature, is red on every host. On a row whose features name
+# `uring`, a panic whose message begins `io_uring` (the test could not build
+# its ring) is named as io_uring unavailable on this host.
+# A row's red never stops another: every build and run of every kind is
+# judged, and the lane's verdict waits for the last row.
+# CARGO_ENCODED_RUSTFLAGS is unset for the whole lane: cargo reads it before
+# RUSTFLAGS, so a set one would drop every plant's `--cfg` without a word.
 # Usage: scripts/sim-canaries.sh [seed]
 # INF_CANARY_CONTROLS_ONLY=1 runs every row's control alone and judges no
 # plant: the sweep of that rule over the table, much cheaper than the lane.
@@ -67,9 +87,12 @@
 # from (`target`; a stub cargo builds nothing there). INF_CANARY_SIM_TARGET
 # beside a real cargo (no INF_CANARY_CARGO, or one whose `--version` answers
 # as cargo does) is a scope error: a row judges the simulators its own build
-# wrote in this checkout's root (ADR-0204).
+# wrote in this checkout's root (ADR-0204). INF_CANARY_HOST replaces
+# `uname -s`, and only there: without INF_CANARY_ROWS_FILE, or beside a real
+# cargo, it is a scope error, so a real run is judged on its own host.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+unset CARGO_ENCODED_RUSTFLAGS
 seed=${1:-0xC0FFEE}
 CARGO=${INF_CANARY_CARGO:-cargo}
 sim_target=${INF_CANARY_SIM_TARGET:-target}
@@ -81,6 +104,12 @@ case "$controls_only" in
     exit 1
     ;;
 esac
+if [ -n "${INF_CANARY_HOST:-}" ] && [ -z "${INF_CANARY_ROWS_FILE:-}" ]; then
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_HOST is the self-test's stub route and needs" \
+    "INF_CANARY_ROWS_FILE: unset INF_CANARY_HOST, so the table is judged on this host"
+  exit 1
+fi
+host=${INF_CANARY_HOST:-$(uname -s)}
 
 rows=(
   # ADR-0090 D5: the segment-blind scanner takes a foreign segment's
@@ -1034,6 +1063,46 @@ if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   while IFS= read -r line; do [ -n "$line" ] && rows+=("$line"); done < "$INF_CANARY_ROWS_FILE"
 fi
 [ "${#rows[@]}" -gt 0 ] || { echo "sim-canaries: SCOPE ERROR — no canary rows"; exit 1; }
+
+# crate_package_ok <package[/features]>: the row's package token is a
+# package name, alone or with a `/` and a comma-separated list of feature
+# names; an empty list (`pkg/`) or an empty name in it is malformed.
+crate_package_ok() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]]
+}
+
+# row_ok <row>: the row's words are its kind's: `<cfg> crate-test
+# <package[/features]> <lib|test:NAME> <test> [witness…]`, `<cfg> loom
+# <package> <test> <witness>`, or a scenario's `<cfg> <scenario> <expected>
+# [flags…]`.
+row_ok() {
+  local parts
+  # shellcheck disable=SC2206
+  parts=($1)
+  case "${parts[1]:-}" in
+    crate-test)
+      [ "${#parts[@]}" -ge 5 ] && crate_package_ok "${parts[2]}" \
+        && [[ "${parts[3]}" =~ ^(lib|test:[A-Za-z0-9_-]+)$ ]]
+      ;;
+    loom) [ "${#parts[@]}" -eq 5 ] ;;
+    *) [ "${#parts[@]}" -ge 3 ] ;;
+  esac
+}
+
+# row_label <row words…>: `<cfg> <kind> <subject>`, the subject a crate
+# test's or Loom model's name, or a scenario with its flags.
+row_label() {
+  case "$2" in
+    crate-test) echo "$1 crate-test $5" ;;
+    loom) echo "$1 loom $4" ;;
+    *) echo "$1 scenario $2${4:+ ${*:4}}" ;;
+  esac
+}
+
+# The pre-pass: every row of the table is read before the first build.
+for row in "${rows[@]}"; do
+  row_ok "$row" || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
+done
 if [ -n "${INF_CANARY_SHARD:-}" ]; then
   if ! [[ "$INF_CANARY_SHARD" =~ ^(0|[1-9][0-9]*)/([1-9][0-9]*)$ ]] \
       || [ "${BASH_REMATCH[1]}" -ge "${BASH_REMATCH[2]}" ]; then
@@ -1061,24 +1130,34 @@ fi
 # shellcheck source=target-root.sh
 . scripts/target-root.sh
 target_root_setup "$(pwd -P)"
-# The simulator directory knob is the self-test's stub route: a real cargo
-# builds into the root, so a row read elsewhere would judge another build.
-# A cargo is real when none is named, or when it answers `--version` as cargo
-# does: the real one or a wrapper passing through to it.
-if [ -n "${INF_CANARY_SIM_TARGET:-}" ]; then
-  cargo_answer=
-  if [ -n "${INF_CANARY_CARGO:-}" ]; then cargo_answer=$("$CARGO" --version 2>/dev/null || true); fi
-  case "${INF_CANARY_CARGO:+named}:$cargo_answer" in
-    : | named:"cargo "[0-9]*)
-      echo "sim-canaries: SCOPE ERROR — INF_CANARY_SIM_TARGET is the self-test's stub route, and" \
-        "this cargo is a real one: unset INF_CANARY_SIM_TARGET, so each row reads what it built" \
-        "in $TARGET_ROOT"
-      exit 1
-      ;;
+# The simulator directory and the host are the self-test's stub routes: a
+# real cargo builds into the root and runs on this host, so a row read
+# elsewhere would judge another build, and one judged as another host's
+# could read a red as not run. A cargo is real when none is named, or when
+# it answers `--version` as cargo does: the real one or a wrapper passing
+# through to it.
+cargo_is_real() {
+  local answer=
+  if [ -n "${INF_CANARY_CARGO:-}" ]; then answer=$("$CARGO" --version 2>/dev/null || true); fi
+  case "${INF_CANARY_CARGO:+named}:$answer" in
+    : | named:"cargo "[0-9]*) return 0 ;;
   esac
+  return 1
+}
+if [ -n "${INF_CANARY_SIM_TARGET:-}" ] && cargo_is_real; then
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_SIM_TARGET is the self-test's stub route, and" \
+    "this cargo is a real one: unset INF_CANARY_SIM_TARGET, so each row reads what it built" \
+    "in $TARGET_ROOT"
+  exit 1
+fi
+if [ -n "${INF_CANARY_HOST:-}" ] && cargo_is_real; then
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_HOST is the self-test's stub route, and this" \
+    "cargo is a real one: unset INF_CANARY_HOST, so each row is judged on this host"
+  exit 1
 fi
 
-fail=0
+fail=0 caught=0 controls_green=0
+not_run=()
 work=$(mktemp -d "${TMPDIR:-/tmp}/sim-canaries.XXXXXX")
 case "$work" in
   */sim-canaries.??????) [ -d "$work" ] || { echo "sim-canaries: mktemp failed"; exit 2; } ;;
@@ -1110,44 +1189,110 @@ refuse_printed() {
   fail=1
 }
 
-# crate_package_ok <package[/features]>: the row's package token is a
-# package name, alone or with a `/` and a comma-separated list of feature
-# names; an empty list (`pkg/`) or an empty name in it is malformed.
-crate_package_ok() {
-  [[ "$1" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]]
+# judged_nothing <kind> <exit status> <log> [<test name>]: zero, printing
+# the reason, when a run that exited 0 judged nothing: a crate test or Loom
+# model with no verdict line for its test, a scenario whose log has a line
+# beginning `WITHHELD:`. A non-zero exit is never judged nothing.
+judged_nothing() {
+  local line
+  [ "$2" -eq 0 ] || return 1
+  case "$1" in
+    crate-test | loom)
+      if grep -Eq -- "^test ([A-Za-z0-9_]+::)*$4 \\.\\.\\. " "$3"; then return 1; fi
+      echo "no test $4 ran"
+      ;;
+    scenario)
+      line=$(tr -d '\000-\010\013-\037\177' <"$3" | LC_ALL=C awk '
+        /^WITHHELD:/ { print substr($0, 1, 160); found = 1; exit }
+        END { exit !found }') || return 1
+      echo "$line"
+      ;;
+  esac
 }
 
-# crate_test <cfg> <package[/features]> <lib|test:NAME> <test name> <witness, or empty>
+# nothing_judged <label> <reason>: the row's verdict on a run that judged
+# nothing: red on Linux, the lane's host; elsewhere not run, and named.
+nothing_judged() {
+  if [ "$host" = Linux ]; then
+    echo "   red: judged nothing on the lane's host: $1 ($2)"
+    fail=1
+  else
+    echo "   NOT RUN on $host: $1 ($2)"
+    not_run+=("$1")
+  fi
+}
+
+# uring_unavailable <package[/features]> <log>: on a row whose features name
+# `uring`, prints the message line of a panic that begins `io_uring` (the
+# test could not build its ring: seccomp, an old kernel); non-zero when the
+# row names no such feature or the log holds no such panic.
+uring_unavailable() {
+  case ",${1#*/}," in
+    *,uring,*) [ "$1" != "${1%%/*}" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  tr -d '\000-\010\013-\037\177' <"$2" | LC_ALL=C awk '
+    after_panic && /^io_uring/ { print substr($0, 1, 160); found = 1; exit }
+    { after_panic = ($0 ~ /panicked at /) }
+    END { exit !found }'
+}
+
+# plain_red <what> <log>: the row's verdict when its plain leg is not green.
+plain_red() {
+  echo "   red for another reason: the plain build does not pass $1 (a canary needs a green" \
+    "control):"
+  tail -5 "$2"
+  fail=1
+}
+
+# crate_test <label> <cfg> <package[/features]> <lib|test:NAME> <test name>
+# <witness, or empty>
 crate_test() {
-  local cfg=$1 spec=$2 target=$3 name=$4 witness=$5 package=${2%%/*} target_args
+  local label=$1 cfg=$2 spec=$3 target=$4 name=$5 witness=$6 package=${3%%/*} target_args
+  local status reason printed
   case "$target" in
     lib) target_args=(--lib) ;;
-    test:*) target_args=(--test "${target#test:}") ;;
-    *) echo "   SCOPE ERROR: target '$target' is neither lib nor test:NAME"; fail=1; return ;;
+    *) target_args=(--test "${target#test:}") ;;
   esac
   if [ "$package" = inf-sim ]; then target_args+=(--features dst); fi
   # One argument list for both legs: the plain control runs the test the
   # planted build is judged by.
   if [ "$spec" != "$package" ]; then target_args+=(--features "${spec#*/}"); fi
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
-  echo "== canary $cfg: $spec $target $name on the plain build must stay green"
-  if ! "$CARGO" test -p "$package" "${target_args[@]}" --target-dir "$TARGET_ROOT" -- "$name" \
-      --show-output > "$control" 2>&1 \
-      || ! grep -Eq -- "${verdict}ok" "$control"; then
-    echo "   the plain build does not pass '$name' (a canary needs a green control):"
-    tail -5 "$control"
+  echo "== canary $label: $spec $target on the plain build must stay green"
+  status=0
+  "$CARGO" test -p "$package" "${target_args[@]}" --target-dir "$TARGET_ROOT" -- "$name" \
+    --show-output > "$control" 2>&1 || status=$?
+  if reason=$(judged_nothing crate-test "$status" "$control" "$name"); then
+    nothing_judged "$label" "$reason"
+    return
+  fi
+  if [ "$status" -ne 0 ] && printed=$(uring_unavailable "$spec" "$control"); then
+    echo "   red: io_uring unavailable on this host ($printed)"
     fail=1
+    return
+  fi
+  if [ "$status" -ne 0 ] || ! grep -Eq -- "${verdict}ok" "$control"; then
+    plain_red "'$name'" "$control"
     return
   fi
   if [ -n "$witness" ] && printed=$(control_names "$witness" "$control"); then
     refuse_printed witness "$witness"
     return
   fi
+  controls_green=$((controls_green + 1))
   if [ "$controls_only" -eq 1 ]; then return; fi
-  echo "== canary $cfg: $spec $target $name on the planted build must go red"
-  if RUSTFLAGS="--cfg $cfg" "$CARGO" test -p "$package" "${target_args[@]}" \
-      --target-dir "$TARGET_ROOT/canary-crate" -- "$name" > "$log" 2>&1; then
+  echo "== canary $label: $spec $target on the planted build must go red"
+  status=0
+  RUSTFLAGS="--cfg $cfg" "$CARGO" test -p "$package" "${target_args[@]}" \
+    --target-dir "$TARGET_ROOT/canary-crate" -- "$name" > "$log" 2>&1 || status=$?
+  if reason=$(judged_nothing crate-test "$status" "$log" "$name"); then
+    nothing_judged "$label" "$reason"
+  elif [ "$status" -eq 0 ]; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
+    fail=1
+  elif printed=$(uring_unavailable "$spec" "$log"); then
+    echo "   red: io_uring unavailable on this host ($printed)"
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
     echo "   red for another reason (expected 'test $name ... FAILED'):"
@@ -1163,34 +1308,46 @@ crate_test() {
     fail=1
   elif [ -n "$witness" ]; then
     echo "   caught: $(grep -F -m1 -- "$witness" "$log" | cut -c1-160)"
+    caught=$((caught + 1))
   else
     echo "   caught: $(grep -E -m1 -- "${verdict}FAILED" "$log")"
+    caught=$((caught + 1))
   fi
 }
 
-# loom_test <cfg> <package> <test name> <witness>: the model under
+# loom_test <label> <cfg> <package> <test name> <witness>: the model under
 # `--cfg loom`, planted and plain, each in its own target dir (RUSTFLAGS
 # differ).
 loom_test() {
-  local cfg=$1 package=$2 name=$3 witness=$4
+  local label=$1 cfg=$2 package=$3 name=$4 witness=$5 status reason printed
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
-  echo "== canary $cfg: $package loom $name on the plain loom build must stay green"
-  if ! RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" --release \
-      --lib --target-dir "$TARGET_ROOT/loom" -- "$name" --show-output > "$control" 2>&1 \
-      || ! grep -Eq -- "${verdict}ok" "$control"; then
-    echo "   the plain loom build does not pass '$name' (a canary needs a green control):"
-    tail -5 "$control"
-    fail=1
+  echo "== canary $label: $package on the plain loom build must stay green"
+  status=0
+  RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" --release \
+    --lib --target-dir "$TARGET_ROOT/loom" -- "$name" --show-output > "$control" 2>&1 \
+    || status=$?
+  if reason=$(judged_nothing loom "$status" "$control" "$name"); then
+    nothing_judged "$label" "$reason"
+    return
+  fi
+  if [ "$status" -ne 0 ] || ! grep -Eq -- "${verdict}ok" "$control"; then
+    plain_red "the loom model '$name'" "$control"
     return
   fi
   if printed=$(control_names "$witness" "$control"); then
     refuse_printed witness "$witness"
     return
   fi
+  controls_green=$((controls_green + 1))
   if [ "$controls_only" -eq 1 ]; then return; fi
-  echo "== canary $cfg: $package loom $name on the planted build must go red"
-  if RUSTFLAGS="--cfg loom --cfg $cfg" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" \
-      --release --lib --target-dir "$TARGET_ROOT/canary-loom" -- "$name" > "$log" 2>&1; then
+  echo "== canary $label: $package on the planted loom build must go red"
+  status=0
+  RUSTFLAGS="--cfg loom --cfg $cfg" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" \
+    --release --lib --target-dir "$TARGET_ROOT/canary-loom" -- "$name" > "$log" 2>&1 \
+    || status=$?
+  if reason=$(judged_nothing loom "$status" "$log" "$name"); then
+    nothing_judged "$label" "$reason"
+  elif [ "$status" -eq 0 ]; then
     echo "   NOT CAUGHT: the planted build ran green (the model has no teeth)"
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
@@ -1203,6 +1360,7 @@ loom_test() {
     fail=1
   else
     echo "   caught: $(grep -F -m1 -- "$witness" "$log" | cut -c1-160)"
+    caught=$((caught + 1))
   fi
 }
 
@@ -1233,64 +1391,86 @@ token_catches() {
     END { exit !kept }'
 }
 
+# The plain simulator: 0 not built yet, 1 built, 2 its build failed (every
+# scenario row then reads that red, and no planted simulator is built).
 sim_built=0
 # A plain leg is the scenario, its flags and the seed, not the plant: rows
 # that share one share its run and its log (three rows run m4-recovery
 # --replay-above-window at the lane seed, about 34 s each). A leg's log is
-# `leg-<index>.log`, its index its place in `control_legs`, matched whole.
+# `leg-<index>.log`, its index its place in `control_legs`, matched whole;
+# `control_state` holds the leg's verdict at the same index: `green`, `red`,
+# or `nothing` with the reason after a space.
 control_legs=()
-start=$SECONDS
-for row in "${rows[@]}"; do
-  # shellcheck disable=SC2206
-  parts=($row)
-  cfg=${parts[0]}
-  if [ "${parts[1]}" = crate-test ]; then
-    [ "${#parts[@]}" -ge 5 ] && crate_package_ok "${parts[2]}" \
-      || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
-    crate_test "$cfg" "${parts[2]}" "${parts[3]}" "${parts[4]}" "${parts[*]:5}"
-    continue
-  fi
-  if [ "${parts[1]}" = loom ]; then
-    [ "${#parts[@]}" -eq 5 ] || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
-    loom_test "$cfg" "${parts[2]}" "${parts[3]}" "${parts[4]}"
-    continue
-  fi
-  name=${parts[1]}; expect=${parts[2]}; flags=("${parts[@]:3}")
+control_state=()
+
+# scenario_row <label> <cfg> <scenario> <expected> [flags…]
+scenario_row() {
+  local label=$1 cfg=$2 name=$3 expect=$4 leg index j status reason printed catches planted
+  local -a flags
+  flags=("${@:5}")
   if [ "$sim_built" -eq 0 ]; then
-    "$CARGO" build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT"
     sim_built=1
+    "$CARGO" build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT" \
+      || sim_built=2
   fi
-  plain=$sim_target/release/inf-sim
+  if [ "$sim_built" -eq 2 ]; then
+    echo "== canary $label: the plain inf-sim build"
+    echo "   red for another reason (the plain build failed; its output is above)"
+    fail=1
+    return
+  fi
   leg="$name ${flags[*]:-}" index=-1
   for j in ${control_legs[@]+"${!control_legs[@]}"}; do
     if [ "${control_legs[$j]}" = "$leg" ]; then index=$j; break; fi
   done
   if [ "$index" -ge 0 ]; then
-    echo "== canary $cfg: $leg on the plain build: green above, not run again"
+    echo "== canary $label: on the plain build: ${control_state[$index]%% *} above, not run again"
   else
-    echo "== canary $cfg: $leg on the plain build must stay green"
+    echo "== canary $label: on the plain build must stay green"
     index=${#control_legs[@]}
-    if ! "$plain" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} \
-        > "$work/leg-$index.log" 2>&1; then
-      echo "   the plain build is red (a canary needs a green control):"
-      tail -5 "$work/leg-$index.log"
-      fail=1
-      continue
-    fi
     control_legs+=("$leg")
+    status=0
+    "$sim_target/release/inf-sim" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} \
+      > "$work/leg-$index.log" 2>&1 || status=$?
+    if reason=$(judged_nothing scenario "$status" "$work/leg-$index.log"); then
+      control_state+=("nothing $reason")
+    elif [ "$status" -ne 0 ]; then
+      control_state+=(red)
+    else
+      control_state+=(green)
+    fi
   fi
+  case "${control_state[$index]}" in
+    nothing\ *)
+      nothing_judged "$label" "${control_state[$index]#nothing }"
+      return
+      ;;
+    red)
+      plain_red "'${leg% }'" "$work/leg-$index.log"
+      return
+      ;;
+  esac
   if printed=$(control_names "$expect" "$work/leg-$index.log"); then
     refuse_printed substring "$expect"
-    continue
+    return
   fi
-  if [ "$controls_only" -eq 1 ]; then continue; fi
-  canary_root="$sim_target/canary-$cfg"
-  echo "== canary $cfg: building inf-sim with --cfg $cfg into $TARGET_ROOT/canary-$cfg"
-  RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
-    --target-dir "$TARGET_ROOT/canary-$cfg"
-  planted="$canary_root/release/inf-sim"
-  echo "== canary $cfg: $name ${flags[*]:-} (lane seed $seed) on the planted build must go red"
-  if "$planted" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > "$log" 2>&1; then
+  controls_green=$((controls_green + 1))
+  if [ "$controls_only" -eq 1 ]; then return; fi
+  echo "== canary $label: building inf-sim with --cfg $cfg into $TARGET_ROOT/canary-$cfg"
+  if ! RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
+      --target-dir "$TARGET_ROOT/canary-$cfg"; then
+    echo "   red for another reason (the planted build failed; its output is above)"
+    fail=1
+    return
+  fi
+  planted="$sim_target/canary-$cfg/release/inf-sim"
+  echo "== canary $label: lane seed $seed on the planted build must go red"
+  status=0
+  "$planted" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > "$log" 2>&1 \
+    || status=$?
+  if reason=$(judged_nothing scenario "$status" "$log"); then
+    nothing_judged "$label" "$reason"
+  elif [ "$status" -eq 0 ]; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
     fail=1
   elif ! grep -q -- "$expect" "$log"; then
@@ -1305,12 +1485,37 @@ for row in "${rows[@]}"; do
     fail=1
   else
     echo "   caught: $(cut -c1-160 <<<"${catches%%$'\n'*}")"
+    caught=$((caught + 1))
   fi
+}
+
+if [ "$host" = Linux ]; then echo "host: Linux $(uname -r)"; fi
+start=$SECONDS
+for row in "${rows[@]}"; do
+  # shellcheck disable=SC2206
+  parts=($row)
+  label=$(row_label "${parts[@]}")
+  case "${parts[1]}" in
+    crate-test)
+      crate_test "$label" "${parts[0]}" "${parts[2]}" "${parts[3]}" "${parts[4]}" "${parts[*]:5}"
+      ;;
+    loom) loom_test "$label" "${parts[0]}" "${parts[2]}" "${parts[3]}" "${parts[4]}" ;;
+    *) scenario_row "$label" "${parts[0]}" "${parts[@]:1}" ;;
+  esac
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi
+judged=$caught
+if [ "$controls_only" -eq 1 ]; then judged=$controls_green; fi
+if [ "$judged" -eq 0 ]; then echo "sim-canaries: SCOPE ERROR — no row ran on $host"; exit 1; fi
+not_run_text=
+if [ "${#not_run[@]}" -gt 0 ]; then
+  not_run_text=$(printf '; %s' "${not_run[@]}")
+  not_run_text=", ${#not_run[@]} not run on $host (${not_run_text#; })"
+fi
 if [ "$controls_only" -eq 1 ]; then
-  echo "sim-canaries: controls only: ${#rows[@]} rows' controls green, none printing its row's" \
-    "substring or witness, no plant judged, in $((SECONDS - start)) s (seed $seed)"
+  echo "sim-canaries: controls only: $judged rows' controls green$not_run_text, none printing its" \
+    "row's substring or witness, no plant judged, in $((SECONDS - start)) s (seed $seed)"
   exit 0
 fi
-echo "sim-canaries: ${#rows[@]} canaries caught, plain builds green in $((SECONDS - start)) s (seed $seed)"
+echo "sim-canaries: $judged canaries caught$not_run_text, plain builds green in" \
+  "$((SECONDS - start)) s (seed $seed)"
