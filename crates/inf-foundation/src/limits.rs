@@ -102,9 +102,9 @@ const _: () = assert!(
 /// The most slots one chunk of a slab's or a map's storage holds (ADR-0151
 /// D5): one chunk is one allocation, built or retired in one step, and a
 /// store's chunk holds the count `chunk_slots_for` answers for its slot's
-/// bytes, this many for a slot of at most 1,024 B (ADR-0194 A1). Owner: the storage. Crossing: the
-/// next slots take the next chunk, built by a later step; a slot no chunk
-/// holds is `CapError::Layout`.
+/// bytes, this many for a slot of at most 1,024 B (ADR-0194 A1). Owner: the
+/// storage. Crossing: the next slots take the next chunk, built by a later
+/// step; a slot no chunk holds is `CapError::Layout`.
 pub const MAP_CHUNK_SLOTS_MAX: usize = 64;
 
 /// The slots one chunk of a capped store holds for a slot of `slot_bytes`
