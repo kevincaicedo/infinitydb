@@ -238,6 +238,15 @@ impl Rig {
         self.cells[cell].reactor.driver().script.borrow().closed.clone()
     }
 
+    /// `count` distinct keys that `owner` owns, named after `stem`.
+    pub(super) fn keys_on(&self, owner: u16, stem: &str, count: usize) -> Vec<Vec<u8>> {
+        let router = &self.cells[0].plane.shared.router;
+        let keys = (0..1_000_000)
+            .map(|n| format!("{stem}:{n}").into_bytes())
+            .filter(|key| router.cell_of(SlotRouter::slot_of(key)) == CellId(owner));
+        keys.take(count).collect()
+    }
+
 }
 
 /// `argv` as one RESP multibulk frame.

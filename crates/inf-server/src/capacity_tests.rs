@@ -69,3 +69,32 @@ fn a_closed_subscriber_leaves_no_task_beside_its_slot() {
         plane_start_tasks(2)
     );
 }
+
+/// One client on cell 0 sends a `DEL` of 100 keys cell 1 owns, and cell 1
+/// is frozen: no leg is answered. A connection holds at most its window of
+/// gate holders, so the gate holds at most 32 (ADR-0177 D4, the windowed
+/// fan); at HEAD the pump checks its window before the whole command and
+/// then sends a leg for every remote key.
+#[test]
+#[ignore = "a fan checks the connection's window of 32 remote legs once, before the command, \
+            then sends a leg and takes a gate holder per remote key; red until each leg takes \
+            one of the connection's 32 gate units and a sender with none settles its oldest leg"]
+fn a_remote_del_holds_at_most_its_window_of_gate_holders() {
+    const KEYS: usize = 100;
+    let mut rig = Rig::new(2);
+    rig.accept(0, fd(0));
+    rig.freeze(1, true);
+    let keys = rig.keys_on(1, "fan", KEYS);
+    let mut argv: Vec<&[u8]> = vec![b"DEL"];
+    argv.extend(keys.iter().map(Vec::as_slice));
+    rig.send(0, fd(0), &frame(&argv));
+    rig.rounds(4);
+    let held = rig.cells[0].plane.shared.gate.pending();
+    assert!(held >= 1, "engagement: the DEL sent no leg to the frozen owner");
+    assert!(
+        held <= REMOTE_WINDOW,
+        "the gate holds {held} waiters for one connection's DEL of {KEYS} remote keys, past its \
+         window of {REMOTE_WINDOW}"
+    );
+    assert!(rig.written(0, fd(0)).is_empty(), "no reply before the owner answers");
+}
