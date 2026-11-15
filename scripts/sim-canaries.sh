@@ -1015,6 +1015,10 @@ rows=(
   # the_scan_batching_oracle_judges_pages_and_sets_others_aside holds both), and planted, its
   # judged pages are red.
   "inf_canary_scan_chunk_of_one m4-tiered scan-one-read-an-entry --seed 0x51ee082d"
+  # The net's own invariant: no chunk of an fd is posted after its end of stream. Its close
+  # legs' shared reap posts a closed client's last chunk and its EOF in one reap, data first;
+  # planted, the EOF goes first and the chunk after it.
+  "inf_canary_net_data_after_eof crate-test inf-sim lib a_shared_reap_posts_the_chunk_before_the_end_of_stream net-data-after-eof"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

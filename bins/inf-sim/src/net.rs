@@ -971,6 +971,9 @@ fn post_with_end(
         out.push(data);
         return;
     }
+    // Canary: the end is posted before the chunk it follows.
+    #[cfg(inf_canary_net_data_after_eof)]
+    post_end(conn, token, pool, out);
     conn.data_after_eof |= conn.eof_posted;
     out.push(data);
     let posted = out.len();
