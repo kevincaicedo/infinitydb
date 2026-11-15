@@ -854,7 +854,9 @@ fn close_leg(seed: u64) -> Rig {
     rig.expect_landed(reader, &names, "closed-queue-unrun", "the reset client");
     let answered = rig.nets[X].borrow().reset_send_errors();
     if answered != 0 {
-        rig.violate(format!("bytes-after-close: {answered} replies were sent to a reset client"));
+        rig.violate(format!(
+            "reply-to-reset-client: {answered} replies were sent to a reset client"
+        ));
     }
     rig.expect_vacant(X, 1);
     if !engaged {
