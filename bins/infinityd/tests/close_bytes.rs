@@ -534,3 +534,31 @@ fn a_stall_runs_the_bytes_of_connections_closed_during_it() {
     assert!(!list.contains("name=ghost "), "a closed client's name is listed: {list}");
     assert!(!list.contains("name=ghost2 "), "a reset client's name is listed: {list}");
 }
+
+/// A `SET` of a key of each cell, then a frame whose bulk length is not a
+/// number, written in one piece while the node is stopped, so the three
+/// reach it at one reap: whichever cell holds the connection, one `SET` is
+/// remote and its reply is owed when PARSE meets the error (`foo` is slot
+/// 12,182, cell 1's; `bar` slot 5,061, cell 0's). The two `+OK`s, then the
+/// error, then the end; both keys are set.
+#[test]
+#[ignore = "PARSE writes a protocol error into the connection's output at once, ahead of the \
+            replies its pump still owes; red until PARSE queues its own replies behind them"]
+fn protocol_error_after_deferred() {
+    let server = Server::spawn(2, "protocol-order");
+    let mut client = server.connect();
+    let mut bytes = wire(&[b"SET", b"foo", b"1"]);
+    bytes.extend(wire(&[b"SET", b"bar", b"1"]));
+    bytes.extend_from_slice(b"*1\r\n$x\r\n");
+    server.stop();
+    client.write_all(&bytes).expect("write");
+    server.resume();
+    let (delivered, end) = read_to_end(&mut client, "the client");
+    assert_all_land(&server, None, &["foo".to_string(), "bar".to_string()], "the two SETs");
+    assert_eq!(
+        String::from_utf8_lossy(&delivered),
+        "+OK\r\n+OK\r\n-ERR Protocol error: invalid bulk length\r\n",
+        "reply-order: the replies owed before the error, then the error"
+    );
+    assert_eq!(end, End::Fin, "closed by a FIN after the error");
+}
