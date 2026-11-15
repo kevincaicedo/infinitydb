@@ -24,7 +24,8 @@
 #     log whose every line carrying the substring is a clause it does not
 #     name (`<substring> VACUOUS`, `<substring> leg VACUOUS`, a clause's
 #     text) is red for another reason;
-#   `<cfg> crate-test <package> <lib|test:NAME> <test name> [witness…]` —
+#   `<cfg> crate-test <package>[/<feature>[,<feature>…]] <lib|test:NAME>
+#     <test name> [witness…]` —
 #     a crate's own test, for a rule whose oracle lives below the simulator
 #     (the store-tier index rows, ADR-0139). The planted build must report
 #     exactly that test `FAILED`; a build that is red for any other
@@ -35,7 +36,10 @@
 #     assertion that the planted log must also carry, for a test with more
 #     than one way to fail. A row on `inf-sim` builds with `--features
 #     dst`, as every simulator recipe does (ADR-0107 D1): its tests do not
-#     compile without it;
+#     compile without it. The features after the package's `/` are the
+#     package's own that the test needs (`inf-runtime/uring`: its io_uring
+#     driver and tests exist only under them), passed to both builds, so
+#     the plain and the planted leg run the same test;
 #   `<cfg> loom <package> <test name> <witness>` — a Loom model in the
 #     package's library, for a memory ordering no other oracle can see
 #     (ADR-0159 A1.6): built `--cfg loom --cfg <cfg>` in release, judged
@@ -1098,17 +1102,27 @@ refuse_printed() {
   fail=1
 }
 
-# crate_test <cfg> <package> <lib|test:NAME> <test name> <witness, or empty>
+# crate_package_ok <package[/features]>: the row's package token is a
+# package name, alone or with a `/` and a comma-separated list of feature
+# names; an empty list (`pkg/`) or an empty name in it is malformed.
+crate_package_ok() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]]
+}
+
+# crate_test <cfg> <package[/features]> <lib|test:NAME> <test name> <witness, or empty>
 crate_test() {
-  local cfg=$1 package=$2 target=$3 name=$4 witness=$5 target_args
+  local cfg=$1 spec=$2 target=$3 name=$4 witness=$5 package=${2%%/*} target_args
   case "$target" in
     lib) target_args=(--lib) ;;
     test:*) target_args=(--test "${target#test:}") ;;
     *) echo "   SCOPE ERROR: target '$target' is neither lib nor test:NAME"; fail=1; return ;;
   esac
   if [ "$package" = inf-sim ]; then target_args+=(--features dst); fi
+  # One argument list for both legs: the plain control runs the test the
+  # planted build is judged by.
+  if [ "$spec" != "$package" ]; then target_args+=(--features "${spec#*/}"); fi
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
-  echo "== canary $cfg: $package $target $name on the plain build must stay green"
+  echo "== canary $cfg: $spec $target $name on the plain build must stay green"
   if ! "$CARGO" test -p "$package" "${target_args[@]}" --target-dir "$TARGET_ROOT" -- "$name" \
       --show-output > "$control" 2>&1 \
       || ! grep -Eq -- "${verdict}ok" "$control"; then
@@ -1122,7 +1136,7 @@ crate_test() {
     return
   fi
   if [ "$controls_only" -eq 1 ]; then return; fi
-  echo "== canary $cfg: $package $target $name on the planted build must go red"
+  echo "== canary $cfg: $spec $target $name on the planted build must go red"
   if RUSTFLAGS="--cfg $cfg" "$CARGO" test -p "$package" "${target_args[@]}" \
       --target-dir "$TARGET_ROOT/canary-crate" -- "$name" > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
@@ -1223,7 +1237,8 @@ for row in "${rows[@]}"; do
   parts=($row)
   cfg=${parts[0]}
   if [ "${parts[1]}" = crate-test ]; then
-    [ "${#parts[@]}" -ge 5 ] || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
+    [ "${#parts[@]}" -ge 5 ] && crate_package_ok "${parts[2]}" \
+      || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
     crate_test "$cfg" "${parts[2]}" "${parts[3]}" "${parts[4]}" "${parts[*]:5}"
     continue
   fi

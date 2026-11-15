@@ -2635,6 +2635,31 @@ dir=$(canary_fixture canary-sim-dst "$failed_line" "$ok_line")
 expect red "canaries: a row on another package does not carry the dst feature" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture crate-test inf-sim lib the_row" >"$dir/rows"
 expect green "canaries: a row on inf-sim builds with the dst feature" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# A test that exists only under its own package's feature (the io_uring
+# driver's): the row names it after a `/`, and both legs build with it. The
+# stub compiles no such test without the feature, as cargo does for a file
+# gated on it, so a leg that dropped the feature runs nothing.
+dir=$(canary_fixture canary-package-feature "$failed_line" "$ok_line")
+{
+    echo '#!/usr/bin/env bash'
+    echo 'case " $* " in'
+    echo '  *" -p fake --test suite --features uring,extra "*) ;;'
+    echo '  *) echo "running 0 tests"; exit 0 ;;'
+    echo 'esac'
+    echo 'if [ -n "${RUSTFLAGS:-}" ]; then'
+    echo "$failed_line"
+    echo 'else'
+    echo "$ok_line"
+    echo 'fi'
+} >"$dir/cargo"
+echo "inf_canary_fixture crate-test fake/uring,extra test:suite the_row" >"$dir/rows"
+expect green "canaries: a row's package features reach both legs" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+echo "inf_canary_fixture crate-test fake test:suite the_row" >"$dir/rows"
+expect_red_because "canaries: a row without the test's feature runs no test" "the plain build does not pass" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+for token in fake/ fake/uring, fake/,uring fake//uring; do
+    echo "inf_canary_fixture crate-test $token test:suite the_row" >"$dir/rows"
+    expect_red_because "canaries: a crate-test package token '$token' is malformed" "malformed row" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+done
 # A test with more than one way to fail: a crate-test row's witness is a
 # phrase of the oracle's own assertion, and the planted log must carry it.
 # A red on the test's engagement check (`VACUOUS`) is never a catch, with
