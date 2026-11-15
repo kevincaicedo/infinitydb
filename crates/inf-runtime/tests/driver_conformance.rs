@@ -94,11 +94,21 @@ const ACCEPT_TOKEN: u32 = 1;
 
 impl Rig {
     fn new(pool_buffers: usize) -> Rig {
+        Rig::over(Box::new(make_driver()), pool_buffers)
+    }
+
+    /// A rig over a ring built from `config` by the file's `make_ring`.
+    #[cfg(all(target_os = "linux", feature = "uring"))]
+    fn with_ring(pool_buffers: usize, config: inf_runtime::UringConfig) -> Rig {
+        Rig::over(Box::new(make_ring(config)), pool_buffers)
+    }
+
+    fn over(driver: Box<dyn DriverObj>, pool_buffers: usize) -> Rig {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let listener_fd = listener.into_raw_fd(); // driver owns it now
         let mut rig = Rig {
-            driver: Box::new(make_driver()),
+            driver,
             pool: BufferPool::new(pool_buffers, 4096),
             out: Vec::new(),
             listener_fd,
@@ -647,33 +657,16 @@ fn multishot_recv_posts_data_before_eof() {
     assert_eq!(rig.pool.reconcile(), Ok(()), "every buffer returned");
 }
 
-/// A close ends the receive (ADR-0196 D1): the driver queues the fd's
-/// cancels before the close and posts `Closed` after it, so no `Recv` with
-/// bytes follows `Closed` (`recv-after-closed`). The client writes 64 B
-/// into an armed receive and the `Close` rides the next enter, the data's
-/// own. Engagement: the bytes reaped before or in `Closed`'s reap, else
-/// `recv-before-close-unreached`, `VACUOUS`, never green. On Linux 7.0 the
-/// cancel the `Close` queues in the bytes' own enter ends the receive
-/// before the kernel posts them, so the engagement is never reached: the
-/// test stays ignored until its shape reaches it.
+/// The events of `recv` and `close` from the next enter until `Closed`,
+/// then two enters more, each tagged with its enter: a `Recv` the driver
+/// posts after `Closed` is read wherever it lands.
 #[cfg(all(target_os = "linux", feature = "uring"))]
-#[test]
-#[ignore = "VACUOUS: the close's cancel ends the receive before the bytes post"]
-fn close_posts_no_recv_after_closed() {
+fn events_through_closed(
+    rig: &mut Rig,
+    recv: CompletionToken,
+    close: CompletionToken,
+) -> Vec<(usize, Event)> {
     const ENTERS_AFTER_CLOSED: usize = 2;
-    let mut rig = Rig::new(8);
-    let mut client = rig.connect();
-    let conn = rig.accept_one(&client);
-    multishot_receive(&rig);
-    let recv = recv_token(4);
-    let close = CompletionToken::new(TokenClass::Close, 4, 0);
-    rig.driver.push(IoOp::RecvArm { fd: conn, token: recv });
-    let armed = rig.reap_once();
-    let early = events_of(&mut rig.pool, armed, recv, close);
-    assert!(early.is_empty(), "nothing is posted before the client writes: {early:?}");
-
-    client.write_all(&[0x5A; 64]).expect("client write");
-    rig.driver.push(IoOp::Close { fd: conn, token: close });
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen: Vec<(usize, Event)> = Vec::new();
     let mut enter = 0;
@@ -690,15 +683,57 @@ fn close_posts_no_recv_after_closed() {
         seen.extend(events.into_iter().map(|event| (enter, event)));
         enter += 1;
     }
+    seen
+}
+
+/// The close-order oracle (ADR-0196 D1): the driver queues the fd's
+/// cancels before the close and posts `Closed` after them, so no `Recv`
+/// with bytes follows `Closed` (`recv-after-closed`). Engagement: the
+/// client's 64 bytes posted before `Closed`, else
+/// `recv-before-close-unreached`, `VACUOUS`, never green.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+fn judge_close_order(seen: &[(usize, Event)]) {
     let closed = seen.iter().position(|&(_, event)| event == Event::Closed).expect("Closed");
     let after: Vec<&(usize, Event)> =
         seen[closed..].iter().filter(|(_, event)| matches!(event, Event::Data(_))).collect();
     assert!(after.is_empty(), "recv-after-closed: bytes posted after Closed: {seen:?}");
-    let closed_enter = seen[closed].0;
     assert!(
-        seen.iter().any(|&(at, event)| event == Event::Data(64) && at <= closed_enter),
-        "VACUOUS recv-before-close-unreached: no 64-byte Recv by Closed's enter: {seen:?}"
+        seen[..closed].iter().any(|&(_, event)| event == Event::Data(64)),
+        "VACUOUS recv-before-close-unreached: no 64-byte Recv before Closed: {seen:?}"
     );
+}
+
+/// A close ends the receive, where the kernel posts completions between
+/// enters: a ring set up without deferred task work
+/// (`SetupFlags::NoDeferTaskrun`, a boot selection). The receive is armed
+/// and submitted before the client writes, so the bytes' `Recv` is in the
+/// ring as the write returns, and the `Close` rides the next enter. This
+/// order is this regime's alone: under deferred task work, with the
+/// receive submitted before the bytes arrive, the kernel posts them at the
+/// next enter's task work, after the cancel the `Close` queues there ended
+/// the receive, and that enter reaps `Closed` alone. The ring's mode is
+/// still the environment's, so the degraded leg reads the oneshot receive.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+#[test]
+fn close_posts_no_recv_after_closed() {
+    use inf_runtime::SetupFlags;
+    let config = uring_env::config().with_setup(SetupFlags::NoDeferTaskrun);
+    let mut rig = Rig::with_ring(8, config);
+    assert!(!rig.driver.caps().defer_taskrun, "the no-DEFER_TASKRUN tier");
+    let mut client = rig.connect();
+    let conn = rig.accept_one(&client);
+    multishot_receive(&rig);
+    let recv = recv_token(4);
+    let close = CompletionToken::new(TokenClass::Close, 4, 0);
+    rig.driver.push(IoOp::RecvArm { fd: conn, token: recv });
+    let armed = rig.reap_once();
+    let early = events_of(&mut rig.pool, armed, recv, close);
+    assert!(early.is_empty(), "nothing is posted before the client writes: {early:?}");
+
+    client.write_all(&[0x5A; 64]).expect("client write");
+    rig.driver.push(IoOp::Close { fd: conn, token: close });
+    let seen = events_through_closed(&mut rig, recv, close);
+    judge_close_order(&seen);
     assert_eq!(rig.pool.reconcile(), Ok(()), "every buffer returned");
     drop(client);
 }
