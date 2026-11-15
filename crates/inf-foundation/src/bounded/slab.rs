@@ -253,15 +253,16 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
 {
     /// A slab of `cap` on `census`, to build by steps: the layout is checked
     /// (a chunk count other than the one `chunk_slots_for` answers for the
-    /// slot's bytes, or a chunk or a directory past one backing allocation,
-    /// is `Layout`, and no row is registered), then the row is registered,
-    /// then the instance minted (`Census` past its mints; the row stays).
-    /// Nothing is allocated until the first step.
+    /// slot's bytes, a chunk or a directory past one backing allocation, or
+    /// a build of more chunks and directories than a `u32` counts, is
+    /// `Layout`, and no row is registered), then the row is registered, then
+    /// the instance minted (`Census` past its mints; the row stays). Nothing
+    /// is allocated until the first step.
     pub fn builder(
         cap: Cap,
         census: &Rc<CapCensus>,
     ) -> Result<SlabBuilder<T, G, P, CHUNK_SLOTS>, CapError> {
-        if !SlotStore::<T, G, CHUNK_SLOTS>::layout_fits() {
+        if !SlotStore::<T, G, CHUNK_SLOTS>::layout_fits(cap.entries_max()) {
             return Err(CapError::Layout);
         }
         let row = census.register(cap)?;
@@ -890,6 +891,52 @@ mod tests {
         // 65,544 B: past one allocation at a chunk of one slot.
         a_wide_slab_at_another_chunk_is_refused::<8191, 1>(&census);
         assert_eq!(census.unsliced_drops(), 0);
+    }
+
+    /// The chunks and directories a store of `slots` slots in chunks of `chunk` builds, by the
+    /// layout's own arithmetic, written here: ⌈slots ÷ chunk⌉ chunks, and per directory level
+    /// above them ⌈chunks ÷ 256^k⌉ directories, up to the one root.
+    fn items(slots: u64, chunk: u64) -> u64 {
+        let chunks = slots.div_ceil(chunk);
+        let (mut total, mut level, mut covered) = (chunks, chunks, chunk);
+        while covered < slots {
+            covered *= 256;
+            level = level.div_ceil(256);
+            total += level;
+        }
+        total
+    }
+
+    /// A store counts its chunks and directories in a `u32`, so a cap whose layout builds more
+    /// than `u32::MAX` items is `Layout` at its builder, before a row registers. At a chunk of
+    /// one slot (a slot past 32 KiB) a `u32::MAX` cap builds 2^32 − 1 chunks and 16,843,009
+    /// directories; the largest that fits is 4,278,190,079 slots. At 64 slots a chunk a
+    /// `u32::MAX` cap builds 67,372,037 items, at two slots 2,155,905,153: both build.
+    #[test]
+    fn a_cap_whose_chunks_and_directories_pass_a_u32_is_layout() {
+        const FITS: u32 = 4_278_190_079;
+        assert!(items(u64::from(FITS), 1) <= u64::from(u32::MAX));
+        assert!(items(u64::from(FITS) + 1, 1) > u64::from(u32::MAX));
+        assert!(items(u64::from(u32::MAX), 2) <= u64::from(u32::MAX));
+        let (census, _mark) = census();
+        let fill = CapFill::Serving;
+        let over = Cap::entries::<{ FITS + 1 }>("items-over", fill);
+        let refused = CappedSlab::<[u64; 8190], u64, Retire, 1>::builder(over, &census);
+        assert_eq!(refused.map(|_| ()).err(), Some(CapError::Layout), "items-overflow-admitted");
+        let refused = CappedSlab::<[u64; 8190], u64, Retire, 1>::builder(
+            Cap::entries::<{ u32::MAX }>("items-max", fill),
+            &census,
+        );
+        assert_eq!(refused.map(|_| ()).err(), Some(CapError::Layout), "items-overflow-admitted");
+        assert_eq!(census.rows().count(), 0, "a refused layout registered a row");
+        // Nothing is allocated until a step, so these builders only check and mint.
+        let fits = Cap::entries::<FITS>("items-fit", fill);
+        assert!(CappedSlab::<[u64; 8190], u64, Retire, 1>::builder(fits, &census).is_ok());
+        let wide = Cap::entries::<{ u32::MAX }>("items-two", fill);
+        assert!(CappedSlab::<[u64; 4094], u64, Retire, 2>::builder(wide, &census).is_ok());
+        let narrow = Cap::entries::<{ u32::MAX }>("items-64", fill);
+        assert!(CappedSlab::<u64, u64, Retire>::builder(narrow, &census).is_ok());
+        census.mark_stopping();
     }
 
     #[test]

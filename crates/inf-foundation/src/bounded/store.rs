@@ -392,25 +392,50 @@ pub(super) struct SlotStore<T, G, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX
 }
 
 impl<T, G: SlotGeneration, const CHUNK_SLOTS: usize> SlotStore<T, G, CHUNK_SLOTS> {
-    /// Whether this store's chunk holds the slots `chunk_slots_for` answers
-    /// for its slot's bytes, no more and no fewer (ADR-0194 A1), and a chunk
-    /// and a directory each fit one backing allocation. Checked before
-    /// anything is registered or minted.
-    pub(super) fn layout_fits() -> bool {
+    /// Whether a store of `capacity` slots has this layout: its chunk holds
+    /// the slots `chunk_slots_for` answers for its slot's bytes, no more and
+    /// no fewer (ADR-0194 A1), a chunk and a directory each fit one backing
+    /// allocation, and a `u32` counts the chunks and directories its build
+    /// allocates (`items_for`). Checked before anything is registered or
+    /// minted.
+    pub(super) fn layout_fits(capacity: u32) -> bool {
         let slot = size_of::<Slot<T, G>>();
         let chunk = slot.checked_mul(CHUNK_SLOTS);
         let directory = size_of::<Option<Box<Chunk<T, G, CHUNK_SLOTS>>>>()
             .checked_mul(MAP_DIRECTORY_CHILDREN_MAX);
         let fits =
             |bytes: Option<usize>| bytes.is_some_and(|b| b <= MAP_BACKING_ALLOCATION_BYTES_MAX);
-        chunk_slots_for(slot) == Some(CHUNK_SLOTS) && fits(chunk) && fits(directory)
+        chunk_slots_for(slot) == Some(CHUNK_SLOTS)
+            && fits(chunk)
+            && fits(directory)
+            && Self::items_for(capacity).is_some()
+    }
+
+    /// The chunks and directories the build of `capacity` slots allocates,
+    /// when a `u32` counts them (the store's `items_held`): ⌈N ÷ c⌉ chunks
+    /// and, per directory level above them, ⌈chunks ÷ 256^k⌉ directories. At
+    /// a chunk of 64 a `u32` cap's build is at most 2^26 chunks and
+    /// 2^18 + 2^10 + 2^2 + 1 directories, at a chunk of 2 at most 2^31
+    /// chunks and 8,421,505 directories; at a chunk of one slot more than
+    /// 4,278,190,079 slots pass `u32::MAX` items, so such a cap is `None`.
+    fn items_for(capacity: u32) -> Option<u32> {
+        let chunk = u64::try_from(CHUNK_SLOTS).ok().filter(|chunk| *chunk > 0)?;
+        let chunks = u64::from(capacity).div_ceil(chunk);
+        let (mut items, mut level) = (chunks, chunks);
+        // At most `MAP_DIRECTORY_LEVELS_MAX` levels for a chunk of one slot or more.
+        for _ in 0..directory_levels(u64::from(capacity), CHUNK_SLOTS) {
+            level = level.div_ceil(MAP_DIRECTORY_CHILDREN_MAX as u64);
+            items = items.checked_add(level)?;
+        }
+        u32::try_from(items).ok()
     }
 
     /// A store of `capacity` slots on `census`, which mints its instance
     /// now; nothing is allocated until its first build step. A shape no
-    /// allocation can hold is `Layout`; a census past its mints is `Census`.
+    /// allocation can hold, or whose items a `u32` does not count, is
+    /// `Layout`; a census past its mints is `Census`.
     pub(super) fn new(capacity: u32, census: &Rc<CapCensus>) -> Result<Self, CapError> {
-        if !Self::layout_fits() {
+        if !Self::layout_fits(capacity) {
             return Err(CapError::Layout);
         }
         let instance = census.mint_instance()?;
@@ -677,9 +702,11 @@ impl<T, G: SlotGeneration, const CHUNK_SLOTS: usize> SlotStore<T, G, CHUNK_SLOTS
 /// `items_held` after a build step allocated one item.
 #[allow(
     clippy::arithmetic_side_effects,
-    reason = "bound: items_held is below the layout's item count before the step — at most 2^26 \
-              chunks and 2^18 + 2^10 + 2^2 + 1 directories, fixed by the capacity the builder \
-              took — so + 1 stays far below u32::MAX (ADR-0165 D1's bound row)"
+    reason = "bound: items_held is below the layout's item count before the step, and `new` \
+              admits a capacity only when that count fits a u32 (`SlotStore::items_for`: at \
+              a chunk of 64 at most 2^26 chunks and 2^18 + 2^10 + 2^2 + 1 directories, at a \
+              chunk of one slot a refusal past 4,278,190,079 slots), so + 1 stays within u32 \
+              (ADR-0165 D1's bound row)"
 )]
 fn items_grown(items_held: u32) -> u32 {
     items_held + 1

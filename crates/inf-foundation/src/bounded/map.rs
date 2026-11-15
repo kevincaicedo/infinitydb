@@ -268,14 +268,18 @@ enum Link<'a> {
 
 impl<K: ExactKey, V> CappedMap<K, V> {
     /// A map of `cap` on `census`, to build by steps: both stores' layouts
-    /// are checked (a chunk or a directory past one backing allocation is
-    /// `Layout`, and no row is registered), then the map's one row is
+    /// are checked (a chunk or a directory past one backing allocation, or a
+    /// build of more items than a `u32` counts, is `Layout`, and no row is
+    /// registered), then the map's one row is
     /// registered, then the leaf store of `N` slots and the branch store of
     /// `N − 1` are constructed, each minting its instance (`Census` past the
     /// census's mints; the row stays). Nothing is allocated until the first
     /// step.
     pub fn builder(cap: Cap, census: &Rc<CapCensus>) -> Result<MapBuilder<K, V>, CapError> {
-        if !SlotStore::<Leaf<K, V>, ()>::layout_fits() || !SlotStore::<Branch, ()>::layout_fits() {
+        let entries = cap.entries_max();
+        if !SlotStore::<Leaf<K, V>, ()>::layout_fits(entries)
+            || !SlotStore::<Branch, ()>::layout_fits(branches_for(entries))
+        {
             return Err(CapError::Layout);
         }
         let row = census.register(cap)?;
