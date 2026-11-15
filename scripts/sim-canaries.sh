@@ -1551,22 +1551,26 @@ scenario_row() {
 # A planted cfg's build serves its own rows alone: its RUSTFLAGS give every
 # unit a hash of its own, so no other cfg reuses an artifact, and kept, the
 # builds outgrow the disk (over 100 GB for the whole table). So each cfg
-# builds in `canary-<cfg>` under the root, crate tests and simulator alike,
-# removed once its last row of this run (or shard) is judged, caught or red;
-# a cfg whose rows stand apart in the table's first part keeps it until its
-# last. The removal is the root's own, target_root_remove: a directory
-# directly below this checkout's root that holds no work tree and no other
-# root, the walk of ADR-0204 D2. last_of_cfg[i] is 1 where row i is its
-# cfg's last, read from the last row up before the first build.
-last_of_cfg=() seen_cfgs=" "
-for ((index = ${#rows[@]} - 1; index >= 0; index--)); do
-  # shellcheck disable=SC2206
-  parts=(${rows[$index]})
+# builds in `canary-<cfg>` under the root, whatever its rows' kinds; its rows
+# run together, cfgs in the order of their first rows and a cfg's rows in
+# the table's, each judged as its own; and the directory goes once the last
+# of them is judged, caught or red: one planted cfg's build at a time,
+# whatever the table's order. The removal is the root's own,
+# target_root_remove: a directory directly below this checkout's root that
+# holds no work tree and no other root, the walk of ADR-0204 D2.
+seen_cfgs=" " cfg_order=() grouped=()
+for row in "${rows[@]}"; do
   case "$seen_cfgs" in
-    *" ${parts[0]} "*) last_of_cfg[$index]=0 ;;
-    *) last_of_cfg[$index]=1 seen_cfgs="$seen_cfgs${parts[0]} " ;;
+    *" ${row%% *} "*) ;;
+    *) cfg_order+=("${row%% *}") seen_cfgs="$seen_cfgs${row%% *} " ;;
   esac
 done
+for row_cfg in "${cfg_order[@]}"; do
+  for row in "${rows[@]}"; do
+    if [ "${row%% *}" = "$row_cfg" ]; then grouped+=("$row"); fi
+  done
+done
+rows=("${grouped[@]}")
 
 # remove_planted <cfg>: the cfg's planted directory, through the root's own
 # removal (row_ok spelled the cfg); refused or failed, it is red.
@@ -1594,7 +1598,8 @@ for index in "${!rows[@]}"; do
     loom) loom_test "$label" "${parts[0]}" "${parts[2]}" "${parts[3]}" "${parts[4]}" ;;
     *) scenario_row "$label" "${parts[0]}" "${parts[@]:1}" ;;
   esac
-  if [ "${last_of_cfg[$index]}" -eq 1 ]; then remove_planted "${parts[0]}"; fi
+  next=${rows[$((index + 1))]:-}
+  if [ "${next%% *}" != "${parts[0]}" ]; then remove_planted "${parts[0]}"; fi
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi
 judged=$caught

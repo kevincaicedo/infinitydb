@@ -2659,9 +2659,9 @@ expect green "canaries: the other shard runs the rest, green" env -u CARGO_TARGE
 cp "$work/log" "$dir/shard-1.log"
 expect red "canaries: the other shard runs no row of the split cfg" grep -q "^== canary inf_canary_a " "$dir/shard-1.log"
 # The lane's disk bound: a planted cfg builds in `canary-<cfg>` under the
-# root, crate tests and simulator alike, and that directory goes once the
-# cfg's last row of the run is judged, caught or red; a cfg whose rows stand
-# apart keeps it until its last. The stub cargo makes each build's directory
+# root, whatever its rows' kinds, a cfg's rows run together, and that
+# directory goes once the last of them is judged, caught or red, so a cfg
+# whose rows stand apart in the table builds once. The stub cargo makes each build's directory
 # where it is told, as cargo does, and logs for a planted one (its RUSTFLAGS
 # name a cfg) whether the directory was there before (warm) or not (cold),
 # then the planted directories the root held.
@@ -2706,6 +2706,8 @@ expect green "canaries: the lane built in two planted directories" test "$(awk '
 expect green "canaries: no planted directory is left under the root after the lane" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
 expect green "canaries: the split cfg is built once, its directory there at its second row" test "$(awk '$2 == "canary-inf_canary_a" { printf "%s ", $1 }' "$dir/planted-dirs")" = "cold warm "
 expect green "canaries: a cfg's directory goes at its last row, not at the lane's end" grep -qx "warm canary-inf_canary_a canary-inf_canary_a" "$dir/planted-dirs"
+expect green "canaries: the split cfg's rows run back to back, cfgs in their first rows' order" test "$(awk '{ printf "%s ", $2 }' "$dir/planted-dirs")" = "canary-inf_canary_a canary-inf_canary_a canary-inf_canary_b "
+expect green "canaries: each planted build finds no other cfg's directory alive" awk 'NF > 3 || (NF == 3 && $3 != $2) { bad = 1 } END { exit bad }' "$dir/planted-dirs"
 # A shard removes its own cfgs' directories and no other's.
 mkdir -p "$dir/target/canary-inf_canary_b" && : >"$dir/target/canary-inf_canary_b/other-shard" && : >"$dir/planted-dirs"
 expect_output "canaries: shard 0 of the lane copy catches the split cfg's two rows" "sim-canaries: 2 canaries caught" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_SHARD=0/2 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
