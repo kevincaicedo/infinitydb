@@ -2619,25 +2619,38 @@ expect green "canaries: a shard's caught rows are green" env INF_CANARY_SHARD=1/
 expect red "canaries: a shard index at its count is a scope failure" env INF_CANARY_SHARD=2/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 expect red "canaries: a malformed shard is a scope failure" env INF_CANARY_SHARD=1/02 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 expect red "canaries: a shard past the last cfg holds no row" env INF_CANARY_SHARD=3/4 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# canary_lane <dir> <row>… [-- <row>…]: a copy of the lane in the fixture
+# checkout <dir>, which builds in a root of its own there: the rows before
+# `--` are the table's first part, where a cfg's rows may stand apart, and
+# the rows after it the ordered part.
+canary_lane() {
+    local dir=$1
+    shift
+    [ -n "$dir" ] && [ -d "$dir" ] && [ "$#" -gt 0 ] || { echo "canary_lane: no checkout or no row" >&2; exit 2; }
+    mkdir -p "$dir/scripts"
+    cp ./scripts/target-root.sh "$dir/scripts/target-root.sh"
+    printf '%s\n' "$@" | awk '
+        BEGIN { part = 0 }
+        NR == FNR { if ($0 == "--") part = 1; else table[part, ++n[part]] = $0; next }
+        $0 == "rows=(" || $0 == "ordered_rows=(" {
+            print
+            part = $0 == "rows=(" ? 0 : 1
+            for (i = 1; i <= n[part]; i++) printf "  \"%s\"\n", table[part, i]
+            skip = 1
+            next
+        }
+        skip && $0 == ")" { skip = 0 }
+        skip { next }
+        /^historical_rows=/ { print "historical_rows=" (n[0] + 0); next }
+        { print }' - "$CANARY" >"$dir/scripts/sim-canaries.sh"
+}
 # A fixture's table is ordered whole, so a cfg the table splits lives in the
 # historical part alone (eleven cfgs hold rows apart there): a copy of the
 # lane whose historical part is `a b c a` and whose ordered part is `d`.
 # Shards count cfgs, never runs of rows, so both rows of `a` run in shard 0.
 dir=$(canary_fixture canary-shard-split "$failed_line" "$ok_line")
-mkdir -p "$dir/scripts"
-cp ./scripts/target-root.sh "$dir/scripts/target-root.sh"
-awk -v row="crate-test fake test:suite the_row" '
-    $0 == "rows=(" || $0 == "ordered_rows=(" {
-        print
-        n = split($0 == "rows=(" ? "a b c a" : "d", cfgs, " ")
-        for (i = 1; i <= n; i++) printf "  \"inf_canary_%s %s\"\n", cfgs[i], row
-        skip = 1
-        next
-    }
-    skip && $0 == ")" { skip = 0 }
-    skip { next }
-    /^historical_rows=/ { print "historical_rows=4"; next }
-    { print }' "$CANARY" >"$dir/scripts/sim-canaries.sh"
+row="crate-test fake test:suite the_row"
+canary_lane "$dir" "inf_canary_a $row" "inf_canary_b $row" "inf_canary_c $row" "inf_canary_a $row" -- "inf_canary_d $row"
 expect_output "canaries: a split cfg's rows are one shard's" "shard 0/2: 3 of 5 rows (4 cfgs)" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_SHARD=0/2 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
 cp "$work/log" "$dir/shard-0.log"
 expect green "canaries: the shard holding a split cfg catches both its rows" test "$(grep -c '^   caught: test the_row ... FAILED' "$dir/shard-0.log")" -eq 3
@@ -2645,6 +2658,132 @@ expect green "canaries: both rows of the split cfg run in its shard" test "$(gre
 expect green "canaries: the other shard runs the rest, green" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_SHARD=1/2 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
 cp "$work/log" "$dir/shard-1.log"
 expect red "canaries: the other shard runs no row of the split cfg" grep -q "^== canary inf_canary_a " "$dir/shard-1.log"
+# The lane's disk bound: a planted cfg builds in `canary-<cfg>` under the
+# root, whatever its rows' kinds, a cfg's rows run together, and that
+# directory goes once the last of them is judged, caught or red, so a cfg
+# whose rows stand apart in the table builds once. The stub cargo makes each build's directory
+# where it is told, as cargo does, and logs for a planted one (its RUSTFLAGS
+# name a cfg) whether the directory was there before (warm) or not (cold),
+# then the planted directories the root held.
+lane_cargo() {
+    [ -n "$1" ] || { echo "lane_cargo: no path" >&2; exit 2; }
+    cat >"$1" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" != --version ] || exit 0
+dir= previous=
+for arg in "$@"; do
+    [ "$previous" != --target-dir ] || dir=$arg
+    previous=$arg
+done
+[ -n "$dir" ] || { echo "stub cargo: no target directory"; exit 2; }
+planted=no
+case "${RUSTFLAGS:-}" in *inf_canary_*) planted=yes ;; esac
+if [ "$planted" = yes ]; then
+    state=cold
+    [ ! -d "$dir" ] || state=warm
+    echo "$state ${dir##*/}" $(cd "${dir%/*}" && ls -d canary-* 2>/dev/null) >>"$(dirname "$0")/planted-dirs"
+fi
+mkdir -p "$dir/release"
+case "${RUSTFLAGS:-}" in
+    *inf_canary_locked*) mkdir -p "$dir/release/locked" && : >"$dir/release/locked/unit" && chmod a-w "$dir/release/locked" ;;
+    *inf_canary_interrupted*) kill -TERM "$PPID" ;;
+esac
+case "$1:$planted:${RUSTFLAGS:-}" in
+    build:no:*) printf '#!/usr/bin/env bash\necho "inf-sim: scenario fake-scenario: green"\n' >"$dir/release/inf-sim" ;;
+    build:yes:*) printf '#!/usr/bin/env bash\necho "inf-sim: ORACLE VIOLATION: TOKEN VIOLATION seed 0x1 cell 0: the rule broke"\nexit 1\n' >"$dir/release/inf-sim" ;;
+    test:no:* | test:yes:*inf_canary_toothless*) echo "test the_row ... ok"; exit 0 ;;
+    test:yes:*) echo "panicked: WITNESS: a stale effect"; echo "test the_row ... FAILED"; exit 101 ;;
+esac
+chmod +x "$dir/release/inf-sim"
+EOF
+    chmod +x "$1"
+}
+dir="$work/canary-disk"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "inf_canary_a $row" "inf_canary_b fake-scenario TOKEN" "inf_canary_a $row"
+expect_output "canaries: a lane over a split cfg and another catches its three rows" "sim-canaries: 3 canaries caught" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: the lane built in two planted directories" test "$(awk '{ print $2 }' "$dir/planted-dirs" | sort -u | tr '\n' ' ')" = "canary-inf_canary_a canary-inf_canary_b "
+expect green "canaries: no planted directory is left under the root after the lane" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
+expect green "canaries: the split cfg is built once, its directory there at its second row" test "$(awk '$2 == "canary-inf_canary_a" { printf "%s ", $1 }' "$dir/planted-dirs")" = "cold warm "
+expect green "canaries: a cfg's directory goes at its last row, not at the lane's end" grep -qx "warm canary-inf_canary_a canary-inf_canary_a" "$dir/planted-dirs"
+expect green "canaries: the split cfg's rows run back to back, cfgs in their first rows' order" test "$(awk '{ printf "%s ", $2 }' "$dir/planted-dirs")" = "canary-inf_canary_a canary-inf_canary_a canary-inf_canary_b "
+expect green "canaries: each planted build finds no other cfg's directory alive" awk 'NF > 3 || (NF == 3 && $3 != $2) { bad = 1 } END { exit bad }' "$dir/planted-dirs"
+# A shard removes its own cfgs' directories and no other's.
+mkdir -p "$dir/target/canary-inf_canary_b" && : >"$dir/target/canary-inf_canary_b/other-shard" && : >"$dir/planted-dirs"
+expect_output "canaries: shard 0 of the lane copy catches the split cfg's two rows" "sim-canaries: 2 canaries caught" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_SHARD=0/2 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: a shard keeps the other shard's planted directory" test -e "$dir/target/canary-inf_canary_b/other-shard"
+expect green "canaries: the shard built its own cfg alone" test "$(awk '{ print $2 }' "$dir/planted-dirs" | sort -u)" = canary-inf_canary_a
+expect red "canaries: a shard removes the directory of its own cfg" test -e "$dir/target/canary-inf_canary_a"
+expect_output "canaries: shard 1 of the lane copy catches the other cfg's row" "sim-canaries: 1 canaries caught" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_SHARD=1/2 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect red "canaries: the other shard removes its own cfg's directory" test -e "$dir/target/canary-inf_canary_b"
+# Controls-only builds no plant, and the table check builds and removes
+# nothing.
+: >"$dir/planted-dirs"
+expect_output "canaries: controls-only over the lane copy reads three controls" "controls only: 3 rows' controls green" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CONTROLS_ONLY=1 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect red "canaries: controls-only builds no planted directory" test -s "$dir/planted-dirs"
+mkdir -p "$dir/target/canary-inf_canary_a"
+expect_output "canaries: the table check of the lane copy reads its three rows" "table only: 3 rows well formed" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: the table check removes no planted directory" test -d "$dir/target/canary-inf_canary_a"
+# A Loom row's plant builds in its cfg's directory too, and goes the same way;
+# the plain Loom tree stays warm.
+dir="$work/canary-disk-loom"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "inf_canary_m loom fake the_row WITNESS:"
+expect_output "canaries: a lane copy with a Loom row catches it" "sim-canaries: 1 canaries caught" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: the Loom plant built in its cfg's directory" grep -qx "cold canary-inf_canary_m" "$dir/planted-dirs"
+expect green "canaries: no planted directory is left after the Loom row" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
+expect green "canaries: the plain Loom tree stays" test -d "$dir/target/loom"
+# The lane traps HUP, INT and TERM into an exit, so the exit trap's removal
+# waits for the build in the foreground to end: no stub can see that order,
+# so each of the three lines is read from the script, once.
+for trap_line in "trap 'exit 129' HUP" "trap 'exit 130' INT" "trap 'exit 143' TERM"; do
+    expect green "canaries: the lane holds the line $trap_line once" test "$(grep -cxF -- "$trap_line" "$CANARY")" -eq 1
+done
+# A run stopped by a signal removes the planted directory of the cfg it was
+# running: the stub sends the lane SIGTERM from the planted build.
+dir="$work/canary-disk-interrupted"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "inf_canary_interrupted $row"
+expect red "canaries: a lane copy stopped by SIGTERM in a planted build is red" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+cp "$work/log" "$dir/run.log"
+expect red "canaries: the stopped lane gave no verdict" grep -q "^sim-canaries:" "$dir/run.log"
+expect green "canaries: the stopped cfg's planted build was made" grep -qx "cold canary-inf_canary_interrupted" "$dir/planted-dirs"
+expect red "canaries: the stopped cfg's planted directory is removed at exit" test -e "$dir/target/canary-inf_canary_interrupted"
+# A red row's directory goes too: its log is the lane's output, not the root.
+dir="$work/canary-disk-red"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "inf_canary_toothless $row"
+expect_red_because "canaries: a lane copy whose planted test stays green is red" "NOT CAUGHT" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: the red row's planted build was made" grep -qx "cold canary-inf_canary_toothless" "$dir/planted-dirs"
+expect red "canaries: the red row's planted directory is removed" test -e "$dir/target/canary-inf_canary_toothless"
+# A row's cfg is inf_canary_<name>, a name of letters, digits and `_`, read
+# before the first build: it names the row's planted directory, and a `/..` in
+# it would name a path outside the root, here a file beside it.
+dir="$work/canary-disk-spelling"
+mkdir -p "$dir/outside"
+: >"$dir/outside/sentinel"
+lane_cargo "$dir/cargo"
+for bad in inf_canary_a/../../outside inf_canary_a.b inf_canary_ loom; do
+    canary_lane "$dir" "inf_canary_b fake-scenario TOKEN" "$bad $row"
+    expect_red_because "canaries: a row whose cfg is '$bad' is refused before the first build" "malformed row: $bad crate-test" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+done
+expect red "canaries: no planted build ran for a misspelt cfg" test -e "$dir/planted-dirs"
+expect green "canaries: the file beside the root is untouched" test -e "$dir/outside/sentinel"
+# A removal that fails is red: the stub leaves a directory its owner cannot
+# write in, which only root could remove.
+if [ "$(id -u)" -ne 0 ]; then
+dir="$work/canary-disk-locked"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "inf_canary_locked $row"
+expect_red_because "canaries: a planted directory the removal cannot remove is red" "is not removed: target-root: removing" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: the locked directory is what stayed" test -d "$dir/target/canary-inf_canary_locked/release/locked"
+chmod -R u+w "$dir/target"
+fi
 # ADR-0107 D1: the simulator's tests compile only with its `dst` feature,
 # so a crate-test row on `inf-sim` passes it and no other package's row
 # does — the stub answers only when it sees the feature.
@@ -8184,6 +8323,85 @@ tr_gone_writer() { # the marker names a checkout that is gone: a copy's root, cl
 }
 expect green "target-root: a root a gone checkout marked prints --clean, which cleans and marks it" \
     tr_gone_writer
+# target_root_remove: a directory directly below the root goes, after the walk
+# --clean makes; any other path, a link, and a directory holding a work tree or
+# another root are refused with nothing removed.
+TR_RM="$TRW/remove me"
+tr_checkout "$TR_RM"
+TR_PRM=$(tr_phys "$TR_RM")
+mkdir -p "$TR_RM/target/debug" "$TR_RM/outside"
+: >"$TR_RM/target/debug/kept"
+: >"$TR_RM/outside/sentinel"
+tr_remove() { # <checkout> <dir>: setup, then the removal; stdout to $TRW/out, stderr to $TRW/err
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET bash -c \
+        '. "$1/scripts/target-root.sh" && target_root_setup "$1" && target_root_remove "$2"' \
+        tr_remove "$1" "$2" >"$TRW/out" 2>"$TRW/err"
+}
+tr_remove_leaf_case() { # <checkout> <suffix>: <root><suffix> refused on an unmarked root, nothing removed
+    local status=0
+    [ ! -e "$1/target/.checkout-path" ] && [ ! -e "$1/.git" ] && [ ! -e "$1/target/.git" ] ||
+        { echo "the fixture root is marked or holds a .git: the walk could refuse it"; return 1; }
+    mkdir -p "$1/target/debug"
+    : >"$1/target/debug/kept"
+    tr_remove "$1" "$1/target$2" || status=$?
+    [ "$status" -eq 2 ] && [ ! -s "$TRW/out" ] && grep -q "is not a directory directly below" "$TRW/err" &&
+        [ -e "$1/target/debug/kept" ] && [ -e "$1/scripts/target-root.sh" ] && return 0
+    echo "target_root_remove $1/target$2: exit $status, want 2 and nothing removed:"
+    cat "$TRW/out" "$TRW/err"
+    return 1
+}
+tr_remove_refused() { # <dir> <pattern> [<path>]: exit 2 naming the pattern, nothing printed or removed
+    local status=0
+    tr_remove "$TR_RM" "$1" || status=$?
+    [ "$status" -eq 2 ] && [ ! -s "$TRW/out" ] && grep -q -- "$2" "$TRW/err" &&
+        [ -e "$TR_RM/outside/sentinel" ] && [ -e "$TR_RM/target/debug/kept" ] &&
+        { [ -z "${3:-}" ] || [ -e "$3" ]; } && return 0
+    echo "target_root_remove exit $status, want 2 naming '$2':"
+    cat "$TRW/out" "$TRW/err"
+    return 1
+}
+tr_remove_one() { # a directory below the root goes, printed by its physical path
+    local status=0
+    mkdir -p "$TR_RM/target/canary-x/debug/deps"
+    : >"$TR_RM/target/canary-x/debug/deps/unit"
+    tr_remove "$TR_RM" "$TR_RM/target/canary-x" || status=$?
+    [ "$status" -eq 0 ] && [ "$(cat "$TRW/out")" = "$TR_PRM/target/canary-x" ] &&
+        [ ! -e "$TR_RM/target/canary-x" ] && [ -e "$TR_RM/target/debug/kept" ] ||
+        { echo "exit $status"; cat "$TRW/out" "$TRW/err"; return 1; }
+}
+expect green "target-root: target_root_remove removes a directory below the root and prints it" tr_remove_one
+tr_remove_absent() { tr_remove "$TR_RM" "$TR_RM/target/canary-absent" && [ ! -s "$TRW/out" ]; }
+expect green "target-root: target_root_remove of an absent directory prints nothing" tr_remove_absent
+expect green "target-root: target_root_remove refuses a path that climbs out of the root" \
+    tr_remove_refused "$TR_RM/target/canary-x/../../outside" "is not a directory directly below this checkout's root"
+expect green "target-root: target_root_remove refuses a directory deeper than the root's own" \
+    tr_remove_refused "$TR_RM/target/debug/deps" "is not a directory directly below"
+expect green "target-root: target_root_remove refuses the root itself" \
+    tr_remove_refused "$TR_RM/target" "is not a directory directly below"
+# The root's own spellings below it, `<root>/`, `<root>/.` and `<root>/..` (an
+# empty variable in "$TARGET_ROOT/$x" is the first), name the root and the
+# checkout: refused by the leaf alone, as this root is unmarked and holds no
+# .git, so the walk would find nothing to refuse.
+for tr_leaf in / /. /..; do
+    expect green "target-root: target_root_remove refuses the root spelled <root>$tr_leaf, unmarked" \
+        tr_remove_leaf_case "$TR_RM" "$tr_leaf"
+done
+mkdir -p "$TR_RM/target/canary-g/wt" "$TR_RM/target/canary-m" "$TRW/linked-away"
+: >"$TR_RM/target/canary-g/wt/.git"
+: >"$TR_RM/target/canary-m/.checkout-path"
+: >"$TRW/linked-away/file"
+ln -s "$TRW/linked-away" "$TR_RM/target/canary-l"
+expect green "target-root: target_root_remove refuses a directory holding a .git, the walk --clean makes" \
+    tr_remove_refused "$TR_RM/target/canary-g" "holds $TR_PRM/target/canary-g/wt/.git, a work tree or a repository" \
+    "$TR_RM/target/canary-g/wt/.git"
+expect green "target-root: target_root_remove refuses a directory that is another root, marker at its top" \
+    tr_remove_refused "$TR_RM/target/canary-m" "holds $TR_PRM/target/canary-m/.checkout-path, another checkout" \
+    "$TR_RM/target/canary-m/.checkout-path"
+expect green "target-root: target_root_remove refuses a link, removing neither it nor its target" \
+    tr_remove_refused "$TR_RM/target/canary-l" "is not a directory (a link or a file)" "$TRW/linked-away/file"
+expect green "target-root: the refused link is still there" test -L "$TR_RM/target/canary-l"
+expect_red_because "target-root: target_root_remove before setup is refused" "target_root_setup has not run" \
+    bash -c '. "$1/scripts/target-root.sh" && target_root_remove "$1/target/canary-x"' tr_remove "$TR_RM"
 # --print: where cargo says the builds land, the variable removed.
 TR_M="$TRW/meta"
 tr_checkout "$TR_M"
@@ -8461,6 +8679,28 @@ tr_walk_mutant_case() { # <helper dir>: --clean refuses a root holding a work tr
     tr_clean_refused "$1" - "a work tree or a repository" && [ -e "$1/target/debug/wt/.git" ]
 }
 tr_control walk tr_walk_mutant_case
+tr_remove_walk_case() { # <helper dir>: the removal refuses a directory of the root holding a work tree
+    local status=0
+    mkdir -p "$1/target/canary-w/wt"
+    : >"$1/target/canary-w/wt/.git"
+    tr_remove "$1" "$1/target/canary-w" || status=$?
+    [ "$status" -eq 2 ] && [ -e "$1/target/canary-w/wt/.git" ]
+}
+tr_remove_below_case() { # <helper dir>: the removal refuses a path that climbs out of the root
+    local status=0
+    mkdir -p "$1/target/canary-x" "$1/outside"
+    : >"$1/outside/sentinel"
+    tr_remove "$1" "$1/target/canary-x/../../outside" || status=$?
+    [ "$status" -eq 2 ] && [ -e "$1/outside/sentinel" ]
+}
+tr_control remove-walk tr_remove_walk_case
+tr_control remove-below tr_remove_below_case
+tr_leaf_slash_case() { tr_remove_leaf_case "$1" /; }
+tr_leaf_dot_case() { tr_remove_leaf_case "$1" /.; }
+tr_leaf_dotdot_case() { tr_remove_leaf_case "$1" /..; }
+tr_control leaf-slash tr_leaf_slash_case
+tr_control leaf-dot tr_leaf_dot_case
+tr_control leaf-dotdot tr_leaf_dotdot_case
 tr_fresh_case() { # <helper dir>: its fresh build refuses a directory an earlier run filled
     local status=0
     env bash -c '. "$1/scripts/target-root.sh"; target_root_cargo_fresh "$2" "$3"' sh "$1" "$TR_FR/full" \
@@ -8472,8 +8712,16 @@ tr_mutant fresh 's/^    if \[ -d "\$dir" \] && \[ -n "\$(ls -A "\$dir")" \]; the
     "builds in a directory an earlier run filled"
 tr_mutant marker 's/^if writer is not None and writer != phys + "\\n":$/if False:/' tr_copy_case \
     "skips the marker's checkout"
-tr_mutant walk 's/^            if name == ".git" or (name == MARKER and here != root):$/            if False:/' \
+tr_mutant walk 's/^            if name == ".git" or (name == MARKER and not (own_marker and here == top)):$/            if False:/' \
     tr_walk_mutant_case "removes a root that holds a work tree"
+tr_mutant remove-walk 's/^    hit = walk_hit(path, False)$/    hit = None/' tr_remove_walk_case \
+    "removes a directory of the root that holds a work tree"
+tr_mutant remove-below 's/^    if leaf in ("", ".", "..") or os.path.realpath(parent) != os.path.realpath(root):$/    if False:/' \
+    tr_remove_below_case "takes a path that climbs out of the root"
+tr_leaf_drop='s/^    if leaf in ("", ".", "..") or os.path.realpath(parent) != os.path.realpath(root):$/    if os.path.realpath(parent) != os.path.realpath(root):/'
+tr_mutant leaf-slash "$tr_leaf_drop" tr_leaf_slash_case "removes the root spelled <root>/"
+tr_mutant leaf-dot "$tr_leaf_drop" tr_leaf_dot_case "empties the root spelled <root>/."
+tr_mutant leaf-dotdot "$tr_leaf_drop" tr_leaf_dotdot_case "starts on the checkout around the root, <root>/.."
 tr_mutant outputs 's/^        if others:$/        if False:/' tr_outputs_case "stamps a root holding outputs"
 tr_mutant build-dir 's/^    if os.path.realpath(path) != os.path.realpath(root):$/    if False:/' tr_split_case \
     "skips the build directory"

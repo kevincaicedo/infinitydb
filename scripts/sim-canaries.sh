@@ -57,8 +57,10 @@
 # A row's label, `<cfg> <kind> <subject>`, heads every line about it (one
 # cfg owns many rows): the kind `crate-test`, `loom` or `scenario`, the
 # subject the test's name, or the scenario and its flags. Every row is read
-# before the first build: a wrong arity for its kind, an empty feature list
-# or a target neither `lib` nor `test:NAME` is a scope error.
+# before the first build: a cfg that is not `inf_canary_<name>`, the name of
+# letters, digits and `_` (the cfg names the row's planted directory), a
+# wrong arity for its kind, an empty feature list or a target neither `lib`
+# nor `test:NAME` is a scope error.
 # A run that exits 0 and judged nothing is neither caught nor NOT CAUGHT:
 # a crate test or Loom model with no verdict line for its test (cargo built
 # no such test on this host), a scenario whose log has a line beginning
@@ -72,6 +74,11 @@
 # its ring) is named as io_uring unavailable on this host.
 # A row's red never stops another: every build and run of every kind is
 # judged, and the lane's verdict waits for the last row.
+# Rows run grouped by cfg, each cfg at its first row's place in the table
+# and its rows in the table's order, so the output's order is not the
+# table's; each row keeps its own verdict. A planted cfg builds in
+# `target/canary-<cfg>`, which goes once its last row is judged, or at exit
+# when a signal stops the run; SIGKILL leaves it.
 # CARGO_ENCODED_RUSTFLAGS is unset for the whole lane: cargo reads it before
 # RUSTFLAGS, so a set one would drop every plant's `--cfg` without a word.
 # Usage: scripts/sim-canaries.sh [seed]
@@ -1111,12 +1118,17 @@ crate_package_ok() {
   [[ "$1" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]]
 }
 
-# row_ok <row>: the row's words are its kind's: `<cfg> crate-test
+# row_ok <row>: the row starts with its cfg, `inf_canary_<name>` with a name
+# of letters, digits and `_`, as the cfg names the row's planted directory
+# under the root: another spelling could name a path outside it or another
+# directory of it. Its words are its kind's: `<cfg> crate-test
 # <package[/features]> <lib|test:NAME> <test> [witness…]`, `<cfg> loom
 # <package> <test> <witness>`, or a scenario's `<cfg> <scenario> <expected>
 # [flags…]`.
+cfg_spelled='^inf_canary_[A-Za-z0-9_]+ '
 row_ok() {
   local parts
+  [[ "$1" =~ $cfg_spelled ]] || return 1
   # shellcheck disable=SC2206
   parts=($1)
   case "${parts[1]:-}" in
@@ -1221,7 +1233,19 @@ case "$work" in
   */sim-canaries.??????) [ -d "$work" ] || { echo "sim-canaries: mktemp failed"; exit 2; } ;;
   *) echo "sim-canaries: mktemp failed"; exit 2 ;;
 esac
-trap 'case "$work" in */sim-canaries.??????) rm -rf -- "$work" ;; esac' EXIT
+# On any exit the work directory goes, and so does the planted directory of
+# the cfg whose rows were running (remove_planted, below), so a run a signal
+# stops leaves no planted build behind. The signals are trapped for the
+# order: bash runs a trapped signal's action once the build in the
+# foreground has ended, so the removal never runs beside a cargo still
+# writing into the directory, where an untrapped signal runs the exit trap
+# at once. SIGKILL runs no trap and leaves the build.
+planted_cfg=
+trap 'case "$work" in */sim-canaries.??????) rm -rf -- "$work" ;; esac
+  [ -z "$planted_cfg" ] || remove_planted "$planted_cfg"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 log=$work/planted.log
 control=$work/control.log
 
@@ -1343,7 +1367,7 @@ crate_test() {
   echo "== canary $label: $spec $target on the planted build must go red"
   status=0
   RUSTFLAGS="--cfg $cfg" "$CARGO" test -p "$package" "${target_args[@]}" \
-    --target-dir "$TARGET_ROOT/canary-crate" -- "$name" > "$log" 2>&1 || status=$?
+    --target-dir "$TARGET_ROOT/canary-$cfg" -- "$name" > "$log" 2>&1 || status=$?
   if reason=$(judged_nothing crate-test "$status" "$log" "$name"); then
     nothing_judged "$label" "$reason"
   elif [ "$status" -eq 0 ]; then
@@ -1401,7 +1425,7 @@ loom_test() {
   echo "== canary $label: $package on the planted loom build must go red"
   status=0
   RUSTFLAGS="--cfg loom --cfg $cfg" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" \
-    --release --lib --target-dir "$TARGET_ROOT/canary-loom" -- "$name" > "$log" 2>&1 \
+    --release --lib --target-dir "$TARGET_ROOT/canary-$cfg" -- "$name" > "$log" 2>&1 \
     || status=$?
   if reason=$(judged_nothing loom "$status" "$log" "$name"); then
     nothing_judged "$label" "$reason"
@@ -1547,11 +1571,53 @@ scenario_row() {
   fi
 }
 
+# A planted cfg's build serves its own rows alone: its RUSTFLAGS give every
+# unit a hash of its own, so no other cfg reuses an artifact, and kept, the
+# builds outgrow the disk (over 100 GB for the whole table). So each cfg
+# builds in `canary-<cfg>` under the root, whatever its rows' kinds; its rows
+# run together, cfgs in the order of their first rows and a cfg's rows in
+# the table's, each judged as its own; and the directory goes once the last
+# of them is judged, caught or red: one planted cfg's build at a time,
+# whatever the table's order. The removal is the root's own,
+# target_root_remove: a directory directly below this checkout's root that
+# holds no work tree and no other root, the walk of ADR-0204 D2.
+seen_cfgs=" "
+cfg_order=() grouped=()
+for row in "${rows[@]}"; do
+  case "$seen_cfgs" in
+    *" ${row%% *} "*) ;;
+    *)
+      cfg_order+=("${row%% *}")
+      seen_cfgs="$seen_cfgs${row%% *} "
+      ;;
+  esac
+done
+for row_cfg in "${cfg_order[@]}"; do
+  for row in "${rows[@]}"; do
+    if [ "${row%% *}" = "$row_cfg" ]; then grouped+=("$row"); fi
+  done
+done
+rows=("${grouped[@]}")
+
+# remove_planted <cfg>: the cfg's planted directory, through the root's own
+# removal (row_ok spelled the cfg); refused or failed, it is red.
+remove_planted() {
+  local dir=$TARGET_ROOT/canary-$1 removed
+  if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then return 0; fi
+  if removed=$(target_root_remove "$dir" 2>&1); then
+    echo "== canary $1: its planted build $removed removed"
+  else
+    echo "   red: $dir is not removed: $removed"
+    fail=1
+  fi
+}
+
 if [ "$host" = Linux ]; then echo "host: Linux $(uname -r)"; fi
 start=$SECONDS
-for row in "${rows[@]}"; do
+for index in "${!rows[@]}"; do
   # shellcheck disable=SC2206
-  parts=($row)
+  parts=(${rows[$index]})
+  planted_cfg=${parts[0]}
   label=$(row_label "${parts[@]}")
   case "${parts[1]}" in
     crate-test)
@@ -1560,6 +1626,11 @@ for row in "${rows[@]}"; do
     loom) loom_test "$label" "${parts[0]}" "${parts[2]}" "${parts[3]}" "${parts[4]}" ;;
     *) scenario_row "$label" "${parts[0]}" "${parts[@]:1}" ;;
   esac
+  next=${rows[$((index + 1))]:-}
+  if [ "${next%% *}" != "${parts[0]}" ]; then
+    remove_planted "${parts[0]}"
+    planted_cfg=
+  fi
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi
 judged=$caught
