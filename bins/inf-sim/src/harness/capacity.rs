@@ -34,6 +34,7 @@ use crate::net::{CellNet, Plant, SimDriver, drain_violations, listener_fd};
 use crate::resp::reply_len;
 use crate::state::StateHash;
 
+mod gated;
 mod small_credit;
 
 /// The legs, each one row of `scripts/sim-smoke.sh` or one pinned red.
@@ -89,11 +90,20 @@ pub enum CloseLeg {
     /// 8 tiered `SET`s of 4,096 B toward a peer on a mesh of 8 credits: the
     /// peer parks 7 of them, and its parked bytes are back at 0 once quiet.
     SmallCredit,
+    /// 8 `always` `SET`s toward a peer while its fsync is held: no ack before
+    /// the hold lifts, every ack after it.
+    GatedHold,
+    /// A tiered `always` `APPEND` to a peer's cold key while its fsync is
+    /// held: the verdict waits across the cold read and the hold.
+    GatedCold,
+    /// An `always` `INCR` that errors, read under the held fsync, then the 8
+    /// `SET`s of `GatedHold`.
+    GatedError,
 }
 
 impl CloseLeg {
     /// Every leg, in the order the help text lists them.
-    pub const ALL: [CloseLeg; 17] = [
+    pub const ALL: [CloseLeg; 20] = [
         CloseLeg::Tasks,
         CloseLeg::Fan,
         CloseLeg::Close,
@@ -111,6 +121,9 @@ impl CloseLeg {
         CloseLeg::DeferredQuit,
         CloseLeg::ProtocolOrder,
         CloseLeg::SmallCredit,
+        CloseLeg::GatedHold,
+        CloseLeg::GatedCold,
+        CloseLeg::GatedError,
     ];
 
     /// The legs red at this tree. Each runs in one ignored test of `reds`,
@@ -154,6 +167,9 @@ impl CloseLeg {
             CloseLeg::DeferredQuit => "deferred-quit",
             CloseLeg::ProtocolOrder => "protocol-order",
             CloseLeg::SmallCredit => "small-credit",
+            CloseLeg::GatedHold => "gated-hold",
+            CloseLeg::GatedCold => "gated-cold",
+            CloseLeg::GatedError => "gated-error",
         }
     }
 
@@ -621,6 +637,9 @@ pub fn run_capacity_scenario(scenario: &CapacityScenario) -> CapacityReport {
         CloseLeg::ProtocolOrder => protocol_order_leg(seed),
         // A durable node on its own mesh, judged by its own oracles.
         CloseLeg::SmallCredit => return small_credit::small_credit_leg(seed),
+        CloseLeg::GatedHold => return gated::gated_hold_leg(seed),
+        CloseLeg::GatedCold => return gated::gated_cold_leg(seed),
+        CloseLeg::GatedError => return gated::gated_error_leg(seed),
     };
     rig.report(leg)
 }
