@@ -319,6 +319,13 @@ impl CellFabric {
         self.cells
     }
 
+    /// The data credits the mesh gives each directed pair: the most data ops
+    /// toward one peer that are sent and not yet answered.
+    #[inline]
+    pub fn data_credits(&self) -> u32 {
+        self.config.data_credits
+    }
+
     /// Mints the next reply-routing token (origin = this cell).
     #[inline]
     pub fn next_token(&mut self) -> FabricToken {
