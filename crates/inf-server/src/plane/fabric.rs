@@ -163,10 +163,9 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // this batch.
             let divert = {
                 let store = shared.store.borrow();
-                store.is_tiered(NsId(ns))
-                    || (store.ns_fsync_class(NsId(ns)).is_some()
-                        && (shared.ns_pump_active.borrow()[usize::from(from.0)]
-                            || !shared.ns_applies.borrow().is_empty_for(from)))
+                let behind = shared.ns_pump_active.borrow()[usize::from(from.0)]
+                    || !shared.ns_applies.borrow().is_empty_for(from);
+                store.is_tiered(NsId(ns)) || (store.ns_fsync_class(NsId(ns)).is_some() && behind)
             };
             if divert {
                 park_ns_apply(shared, from, token, NsId(ns), proto, argv, program, staged);
@@ -200,7 +199,8 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // An `always` write's verdict waits on the watermark, so its
             // slot is published before the apply's first effect (ADR-0177
             // D6): no step after an effect can be refused.
-            let placeholder = match shared.gate_placeholder(from, NsId(ns), argv) {
+            let read = NsApplyRead::of(shared, NsId(ns), argv);
+            let placeholder = match shared.gate_placeholder(from, read) {
                 Ok(placeholder) => placeholder,
                 Err(ParkedFull) => {
                     staged.push((from, token, StagedReply::Refused));
@@ -209,10 +209,10 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             };
             let start = scratch.len();
             let reply = scratch.open();
-            match shared.execute_ns_owned(from, argv, proto, NsId(ns), program, reply) {
+            match shared.execute_ns_owned(from, argv, read, proto, NsId(ns), program, reply) {
                 NsApplyOutcome::Gated(seq) => {
                     let verdict = GatedVerdict::new(shared, token, seq, reply.detach());
-                    shared.gate_fill(from, placeholder, verdict);
+                    shared.gate_fill(placeholder, verdict);
                 }
                 NsApplyOutcome::Reply => {
                     shared.gate_cancel(placeholder);

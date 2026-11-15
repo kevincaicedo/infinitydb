@@ -124,8 +124,8 @@ use scatter::{
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
 use shared::{
-    DurableAdmission, NsApplyOutcome, Parked, ParkedDeques, ParkedFull, PeerDeques, apply_drop,
-    handle_ns_apply, tier_to_fan,
+    DurableAdmission, NsApplyOutcome, NsApplyRead, Parked, ParkedDeques, ParkedFull, PeerDeques,
+    apply_drop, handle_ns_apply, tier_to_fan,
 };
 
 /// ADR-0189 D4's fail-stop: a namespace change `META` holds that this cell

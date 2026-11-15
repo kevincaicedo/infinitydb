@@ -29,50 +29,28 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         }
     }
 
-    /// The placeholder an apply of `argv` to `ns` from `origin` takes
-    /// before its first effect (ADR-0177 D6): a write to an `always`
-    /// namespace, the verdicts `execute_ns_owned` and the tiered writes
-    /// gate on this cell's watermark, so `Ok(None)` for every other apply.
-    /// A namespace's fsync class is fixed at its creation, so the reading
-    /// holds across the apply's suspensions. `Err` at a full deque.
+    /// The placeholder an apply from `origin` takes before its first effect
+    /// (ADR-0177 D6), when its reading gates its verdict on this cell's
+    /// watermark; `Ok(None)` for every other apply, `Err` at a full deque.
     pub(super) fn gate_placeholder(
         &self,
         origin: CellId,
-        ns: NsId,
-        argv: &[&[u8]],
+        read: NsApplyRead,
     ) -> Result<Option<GatedPlaceholder>, ParkedFull> {
-        let always = self.store.borrow().ns_fsync_class(ns) == Some(FsyncClass::Always);
-        let write = argv
-            .first()
-            .and_then(|name| lookup(name))
-            .is_some_and(|meta| meta.flags.contains(CmdFlags::WRITE));
-        if !(always && write) {
+        if !read.gates() {
             return Ok(None);
         }
         self.gated.borrow_mut().placeholder(origin, &self.node).map(Some)
     }
 
-    /// The apply was gated: `verdict` takes its placeholder's place. With no
-    /// placeholder (a write the reading above called not gated, derived
-    /// never) it is kept at the back, where its `seq` order allows it.
-    pub(super) fn gate_fill(
-        &self,
-        origin: CellId,
-        placeholder: Option<GatedPlaceholder>,
-        verdict: GatedVerdict,
-    ) {
-        debug_assert!(
-            placeholder.is_some(),
-            "a gated write took its placeholder before its effect"
-        );
-        let mut gated = self.gated.borrow_mut();
-        match placeholder {
-            Some(placeholder) => gated.fill(placeholder, verdict, &self.node),
-            None => {
-                let kept = gated.publish_with(origin, &self.node, || Gated::Verdict(verdict));
-                debug_assert!(kept.is_ok(), "an origin's gated deque holds its un-replied ops");
-            }
-        }
+    /// The apply was gated: `verdict` takes its placeholder's place. A gated
+    /// verdict with no placeholder stops the cell: its reading gated it, so
+    /// the placeholder was taken on that reading, and a verdict kept without
+    /// its slot would have no place in its origin's `seq` order.
+    pub(super) fn gate_fill(&self, placeholder: Option<GatedPlaceholder>, verdict: GatedVerdict) {
+        let placeholder =
+            placeholder.expect("a gated write took its placeholder before its effect");
+        self.gated.borrow_mut().fill(placeholder, verdict, &self.node);
     }
 
     /// The apply was not gated: its placeholder, if it took one, goes.
@@ -572,18 +550,19 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     /// Owner-side named-namespace apply (the `ApplyNs` handler): admission,
     /// execution, emission — and for `always` writes the deferred-reply
     /// verdict (the fabric reply waits for this cell's fsync watermark).
+    #[allow(clippy::too_many_arguments)] // one apply's fields, as its two callers hold them
     pub(super) fn execute_ns_owned(
         &self,
         from: CellId,
         argv: &[&[u8]],
+        read: NsApplyRead,
         proto: Protocol,
         ns: NsId,
         program: bool,
         out: &mut ReplyBuf,
     ) -> NsApplyOutcome {
-        let meta = lookup(argv[0]);
-        let class = self.store.borrow().ns_fsync_class(ns);
-        let is_write = meta.is_some_and(|m| m.flags.contains(CmdFlags::WRITE));
+        let NsApplyRead { meta, class } = read;
+        let is_write = read.is_write();
         if let (Some(meta), Some(_)) = (meta, class)
             && is_write
         {
@@ -643,7 +622,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             && let (Some(meta), Some(class)) = (meta, class)
             && stages(out.outcome(), meta.id)
             && let Some(seq) = self.stage_durable_effects(ns, meta, argv, class)
-            && class == FsyncClass::Always
+            && read.gates()
         {
             self.durable.borrow_mut().as_mut().expect("staged above").note_gated_ack();
             outcome = NsApplyOutcome::Gated(seq);
@@ -721,6 +700,44 @@ pub(super) enum DurableAdmission {
     Admit,
     Park,
     Refuse(&'static str),
+}
+
+/// What one `ApplyNs` is, read once before its first effect: the command's
+/// registry row and the namespace's fsync class. A namespace's class is fixed
+/// at its creation, so the reading holds across the apply's suspensions;
+/// the placeholder and the owner's execution take this one reading.
+#[derive(Clone, Copy)]
+pub(super) struct NsApplyRead {
+    meta: Option<&'static inf_wire::CommandMeta>,
+    class: Option<FsyncClass>,
+}
+
+impl NsApplyRead {
+    /// The reading of an apply of `argv` to `ns` on `shared`'s store.
+    pub(super) fn of<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        shared: &Shared<O, F>,
+        ns: NsId,
+        argv: &[&[u8]],
+    ) -> NsApplyRead {
+        let class = shared.store.borrow().ns_fsync_class(ns);
+        NsApplyRead { meta: argv.first().and_then(|name| lookup(name)), class }
+    }
+
+    /// The command's registry row.
+    pub(super) fn meta(self) -> Option<&'static inf_wire::CommandMeta> {
+        self.meta
+    }
+
+    fn is_write(self) -> bool {
+        self.meta.is_some_and(|meta| meta.flags.contains(CmdFlags::WRITE))
+    }
+
+    /// The one predicate of a verdict that waits for this cell's watermark
+    /// (ADR-0015 D6): a write to an `always` namespace, the class read
+    /// first.
+    pub(super) fn gates(self) -> bool {
+        self.class == Some(FsyncClass::Always) && self.is_write()
+    }
 }
 
 /// Owner-side verdict for one `ApplyNs`.
@@ -1273,33 +1290,36 @@ impl PeerDeques<Gated> {
         node: &NodeState,
     ) {
         let index = self.index(placeholder.origin);
-        // An origin has one apply in progress at a time, so its placeholder
-        // is the back of its deque (E11).
-        debug_assert!(
-            matches!(self.deques[index].back(), Some(Gated::Placeholder)),
+        let bytes = verdict.parked_bytes();
+        // FABRIC-IN diverts an origin's durable apply to its pump while the
+        // pump holds the origin's work, and the pump runs one apply at a
+        // time, so an origin has one apply in progress and its placeholder
+        // is the back of its deque. Past that, a verdict filled elsewhere
+        // leaves a placeholder no fill reaches, and the origin's replies
+        // wedge behind it: the cell stops.
+        let back = self.deques[index].back_mut();
+        assert!(
+            matches!(back, Some(Gated::Placeholder)),
             "a filled placeholder is the back of its origin's deque"
         );
-        let bytes = verdict.parked_bytes();
-        if let Some(back @ Gated::Placeholder) = self.deques[index].back_mut() {
+        if let Some(back) = back {
             *back = Gated::Verdict(verdict);
             parked_added(node, bytes);
             self.waiting += 1;
-            return;
         }
-        // Past a broken E11 the verdict is still kept, at the back, which its
-        // `seq` order allows: its effect ran after every earlier one.
-        let kept = self.publish_with(placeholder.origin, node, || Gated::Verdict(verdict));
-        debug_assert!(kept.is_ok(), "an origin's gated deque holds its un-replied ops");
     }
 
     /// The apply was not gated (a reply, a park or a refusal): its
     /// placeholder goes, and the deque is as it was before the apply.
+    /// It is the back of its origin's deque for `fill`'s reason; past that a
+    /// pop would drop another apply's verdict, so the cell stops first.
     pub(super) fn cancel(&mut self, placeholder: GatedPlaceholder, node: &NodeState) {
-        let taken = self.pop_back(placeholder.origin, node);
-        debug_assert!(
-            matches!(taken, Some(Gated::Placeholder)),
+        let index = self.index(placeholder.origin);
+        assert!(
+            matches!(self.deques[index].back(), Some(Gated::Placeholder)),
             "a cancelled placeholder is the back of its origin's deque"
         );
+        self.pop_back(placeholder.origin, node);
     }
 
     /// Pops every verdict at a front that `watermark` covers, at most
@@ -1458,6 +1478,34 @@ mod parked_tests {
             }
             assert_eq!(node.fabric_parked_refused.get(), refused, "seed {seed}");
         }
+    }
+
+    /// Two of one origin's applies in progress, which the divert rule rules
+    /// out: the earlier one's fill finds the other's verdict at the back,
+    /// and the cell stops rather than wedge the origin behind a placeholder
+    /// no fill reaches.
+    #[test]
+    #[should_panic(expected = "a filled placeholder is the back of its origin's deque")]
+    fn a_fill_behind_another_apply_stops_the_cell() {
+        let node = NodeState::default();
+        let mut gated = deques::<Gated>(1, 3, 4);
+        let earlier = gated.placeholder(CellId(0), &node).expect("room");
+        let later = gated.placeholder(CellId(0), &node).expect("room");
+        gated.fill(later, verdict(2, 1), &node);
+        gated.fill(earlier, verdict(1, 1), &node);
+    }
+
+    /// The same, at a cancel: the pop would drop the other apply's verdict,
+    /// so the cell stops first.
+    #[test]
+    #[should_panic(expected = "a cancelled placeholder is the back of its origin's deque")]
+    fn a_cancel_behind_another_apply_stops_the_cell() {
+        let node = NodeState::default();
+        let mut gated = deques::<Gated>(1, 3, 4);
+        let earlier = gated.placeholder(CellId(0), &node).expect("room");
+        let later = gated.placeholder(CellId(0), &node).expect("room");
+        gated.fill(later, verdict(2, 1), &node);
+        gated.cancel(earlier, &node);
     }
 
     /// The gated deque (ADR-0177 D3, D6): a placeholder waits for nothing,

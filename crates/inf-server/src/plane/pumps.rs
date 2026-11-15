@@ -76,15 +76,16 @@ async fn apply_parked<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     // while an apply is queued. A keyspace-level command on a tiered
     // namespace takes the ordinary path here exactly as it does on
     // the connection's cell (`keyspace_level` — ADR-0108).
+    let read = NsApplyRead::of(shared, item.ns, &argv);
     let ordinary = !shared.store.borrow().is_tiered(item.ns)
-        || lookup(argv[0]).is_some_and(|meta| keyspace_level(meta, &argv));
+        || read.meta().is_some_and(|meta| keyspace_level(meta, &argv));
     if ordinary {
-        apply_flat_one(shared, origin, item.ns, &argv, item.proto, item.token, item.program).await;
+        apply_flat_one(shared, from, item, &argv, read).await;
         return;
     }
     // The verdict's slot before the tiered apply's first effect, held
     // across its cold reads (ADR-0177 D6).
-    let placeholder = match shared.gate_placeholder(from, item.ns, &argv) {
+    let placeholder = match shared.gate_placeholder(from, read) {
         Ok(placeholder) => placeholder,
         Err(ParkedFull) => return refuse_parked(shared, from, item.token),
     };
@@ -114,7 +115,7 @@ async fn apply_parked<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 .expect("tiered implies the durable plane")
                 .note_gated_ack();
             let verdict = GatedVerdict::new(shared, item.token, seq, reply);
-            shared.gate_fill(from, placeholder, verdict);
+            shared.gate_fill(placeholder, verdict);
         }
     }
 }
@@ -141,21 +142,19 @@ fn refuse_parked<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 /// ack itself.
 async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
-    origin: u16,
-    ns: NsId,
+    from: CellId,
+    item: &NsApply,
     argv: &[&[u8]],
-    proto: Protocol,
-    token: FabricToken,
-    program: bool,
+    read: NsApplyRead,
 ) {
-    let from = CellId(origin);
+    let (ns, proto, token, program) = (item.ns, item.proto, item.token, item.program);
     loop {
-        let placeholder = match shared.gate_placeholder(from, ns, argv) {
+        let placeholder = match shared.gate_placeholder(from, read) {
             Ok(placeholder) => placeholder,
             Err(ParkedFull) => return refuse_parked(shared, from, token),
         };
         let mut reply = OpenReply::new(shared.take_reply_buf());
-        let applied = shared.execute_ns_owned(from, argv, proto, ns, program, reply.reply());
+        let applied = shared.execute_ns_owned(from, argv, read, proto, ns, program, reply.reply());
         let reply = reply.finish();
         match applied {
             NsApplyOutcome::Park => {
@@ -178,7 +177,7 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             }
             NsApplyOutcome::Gated(seq) => {
                 let verdict = GatedVerdict::new(shared, token, seq, reply);
-                shared.gate_fill(from, placeholder, verdict);
+                shared.gate_fill(placeholder, verdict);
                 return;
             }
         }
