@@ -2611,8 +2611,8 @@ expect red "canaries: a malformed crate-test row is a scope failure" env INF_CAN
 # The nightly matrix shards the lane by cfg (INF_CANARY_SHARD=I/K): a
 # cfg's rows stay in one shard, and the shards together run every row.
 dir=$(canary_fixture canary-shard "$failed_line" "$ok_line")
-printf 'inf_canary_%s crate-test fake test:suite the_row\n' a b a c >"$dir/rows"
-expect_output "canaries: shard 0/2 runs the first and third cfg, a cfg's rows together" "shard 0/2: 3 of 4 rows (3 cfgs)" env INF_CANARY_SHARD=0/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+printf 'inf_canary_%s crate-test fake test:suite the_row\n' a a b c >"$dir/rows"
+expect_output "canaries: shard 0/2 runs the first and third cfg, both rows of the first" "shard 0/2: 3 of 4 rows (3 cfgs)" env INF_CANARY_SHARD=0/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 expect_output "canaries: shard 1/2 runs the second cfg alone" "shard 1/2: 1 of 4 rows (3 cfgs)" env INF_CANARY_SHARD=1/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 expect_output "canaries: the shard's rows are the ones judged" "== canary inf_canary_b crate-test the_row:" env INF_CANARY_SHARD=1/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 expect green "canaries: a shard's caught rows are green" env INF_CANARY_SHARD=1/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
@@ -2672,6 +2672,21 @@ for bad in "inf_canary_b crate-test fake lab the_row" "inf_canary_b crate-test f
     expect_red_because "canaries: the row '$bad' is refused before the first build" "malformed row: $bad" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 done
 expect red "canaries: nothing was built before a malformed row was refused" test -e "$dir/built"
+# The table's order (a placement rule, so two changes that each add a row
+# touch different lines): the rows that predate it keep their order and
+# their count, and every other row sits in its cfg's byte-order place. The
+# real table is read whole and nothing is built.
+expect green "canaries: the table is well formed and in its order" env -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 $CANARY
+expect_output "canaries: the table check says what it read" "table only: [0-9]* rows well formed, the last [0-9]* ordered by cfg" env -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 $CANARY
+expect_red_because "canaries: a table knob other than 0 or 1 is a scope failure" "INF_CANARY_TABLE_ONLY wants 0 or 1" env -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=yes $CANARY
+dir=$(canary_fixture canary-order "$failed_line" "$ok_line")
+printf '%s\n' "inf_canary_b crate-test fake test:suite the_row" "inf_canary_a crate-test fake test:suite the_row" >"$dir/rows"
+expect_red_because "canaries: a row before a cfg that sorts ahead of it is out of place" "a row out of its cfg's place: inf_canary_a crate-test fake test:suite the_row (after inf_canary_b)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+mkdir -p "$dir/scripts"
+awk '{ print } $0 == "rows=(" { print "  \"inf_canary_zz m0-smoke divergence\"" }' "$CANARY" >"$dir/scripts/sim-canaries.sh"
+expect_red_because "canaries: a new row among the rows that predate the order is refused" "the table's first part holds [0-9]* rows, not" env -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 bash "$dir/scripts/sim-canaries.sh"
+awk '{ print } $0 == "ordered_rows=(" { print "  \"inf_canary_zz m0-smoke divergence\"" }' "$CANARY" >"$dir/scripts/sim-canaries.sh"
+expect_red_because "canaries: a new row ahead of its cfg's place in the ordered part is refused" "a row out of its cfg's place" env -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 bash "$dir/scripts/sim-canaries.sh"
 # A row's label, `<cfg> <kind> <subject>`, heads every line about the row.
 dir=$(canary_fixture canary-label "$failed_line" "$ok_line")
 expect_output "canaries: a crate-test row's lines carry its label" "== canary inf_canary_fixture crate-test the_row: fake test:suite on the plain build must stay green" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY

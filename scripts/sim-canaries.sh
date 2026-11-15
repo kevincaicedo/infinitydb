@@ -77,6 +77,9 @@
 # Usage: scripts/sim-canaries.sh [seed]
 # INF_CANARY_CONTROLS_ONLY=1 runs every row's control alone and judges no
 # plant: the sweep of that rule over the table, much cheaper than the lane.
+# INF_CANARY_TABLE_ONLY=1 reads the table alone (every row well formed, the
+# ordered part in its order) and builds and runs nothing: `just check`'s
+# reading of the table, through the gates' self-test.
 # Sharding: INF_CANARY_SHARD=I/K runs the rows of every K-th cfg from the
 # I-th, cfgs counted by their first row in the table, so a cfg's planted
 # build is made in one shard and the K shards run every row exactly once
@@ -101,6 +104,14 @@ case "$controls_only" in
   0 | 1) ;;
   *)
     echo "sim-canaries: SCOPE ERROR — INF_CANARY_CONTROLS_ONLY wants 0 or 1, got '$controls_only'"
+    exit 1
+    ;;
+esac
+table_only=${INF_CANARY_TABLE_ONLY:-0}
+case "$table_only" in
+  0 | 1) ;;
+  *)
+    echo "sim-canaries: SCOPE ERROR — INF_CANARY_TABLE_ONLY wants 0 or 1, got '$table_only'"
     exit 1
     ;;
 esac
@@ -1048,6 +1059,14 @@ rows=(
   # the_scan_batching_oracle_judges_pages_and_sets_others_aside holds both), and planted, its
   # judged pages are red.
   "inf_canary_scan_chunk_of_one m4-tiered scan-one-read-an-entry --seed 0x51ee082d"
+)
+# The rows above keep the order they were added in and take no new row:
+# `historical_rows` counts them, and falls only as one is deleted. The rows
+# below are ordered by cfg name (byte order, a cfg's rows together), and a
+# new row joins them in its cfg's place, so two changes that each add a row
+# touch different lines and merge without a conflict.
+historical_rows=295
+ordered_rows=(
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.
@@ -1058,10 +1077,16 @@ rows=(
   "inf_canary_uring_eof_rearms crate-test inf-runtime/uring test:driver_conformance eof_ends_the_receive recv-after-eof"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
+  # A fixture's table is ordered whole.
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
-  rows=()
-  while IFS= read -r line; do [ -n "$line" ] && rows+=("$line"); done < "$INF_CANARY_ROWS_FILE"
+  rows=() ordered_rows=()
+  while IFS= read -r line; do [ -n "$line" ] && ordered_rows+=("$line"); done < "$INF_CANARY_ROWS_FILE"
+elif [ "${#rows[@]}" -ne "$historical_rows" ]; then
+  echo "sim-canaries: SCOPE ERROR — the table's first part holds ${#rows[@]} rows, not" \
+    "$historical_rows: a new row goes in the ordered part, in its cfg's place"
+  exit 1
 fi
+rows+=(${ordered_rows[@]+"${ordered_rows[@]}"})
 [ "${#rows[@]}" -gt 0 ] || { echo "sim-canaries: SCOPE ERROR — no canary rows"; exit 1; }
 
 # crate_package_ok <package[/features]>: the row's package token is a
@@ -1099,10 +1124,28 @@ row_label() {
   esac
 }
 
+# rows_out_of_order <row…>: prints the first row whose cfg sorts before the
+# cfg of the row above it, in byte order; non-zero when there is none.
+rows_out_of_order() {
+  printf '%s\n' "$@" | LC_ALL=C awk '
+    NR > 1 && $1 < cfg { print $0 " (after " cfg ")"; found = 1; exit }
+    { cfg = $1 }
+    END { exit !found }'
+}
+
 # The pre-pass: every row of the table is read before the first build.
 for row in "${rows[@]}"; do
   row_ok "$row" || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
 done
+if [ "${#ordered_rows[@]}" -gt 0 ] && misplaced=$(rows_out_of_order "${ordered_rows[@]}"); then
+  echo "sim-canaries: SCOPE ERROR — a row out of its cfg's place: $misplaced"
+  exit 1
+fi
+if [ "$table_only" -eq 1 ]; then
+  echo "sim-canaries: table only: ${#rows[@]} rows well formed, the last ${#ordered_rows[@]}" \
+    "ordered by cfg; nothing built or run"
+  exit 0
+fi
 if [ -n "${INF_CANARY_SHARD:-}" ]; then
   if ! [[ "$INF_CANARY_SHARD" =~ ^(0|[1-9][0-9]*)/([1-9][0-9]*)$ ]] \
       || [ "${BASH_REMATCH[1]}" -ge "${BASH_REMATCH[2]}" ]; then
