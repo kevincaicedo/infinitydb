@@ -880,6 +880,15 @@ mod tests {
         a_wide_slab_serves_every_slot::<510, 16>(Cap::entries::<32>("w-4096", fill), 3, &census);
         a_wide_slab_serves_every_slot::<511, 8>(Cap::entries::<16>("w-4104", fill), 3, &census);
         a_wide_slab_serves_every_slot::<8190, 1>(Cap::entries::<2>("w-65536", fill), 3, &census);
+        // Each threshold and the slot one word past it: chunks of 32, 16, 8, 4, 2 and 1.
+        a_wide_slab_serves_every_slot::<254, 32>(Cap::entries::<64>("w-2048", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<255, 16>(Cap::entries::<32>("w-2056", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<1022, 8>(Cap::entries::<16>("w-8192", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<1023, 4>(Cap::entries::<8>("w-8200", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<2046, 4>(Cap::entries::<8>("w-16384", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<2047, 2>(Cap::entries::<4>("w-16392", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<4094, 2>(Cap::entries::<4>("w-32768", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<4095, 1>(Cap::entries::<2>("w-32776", fill), 3, &census);
         let two_levels = Cap::entries::<5008>("w-2992-5008", fill);
         a_wide_slab_serves_every_slot::<372, 16>(two_levels, 316, &census);
         a_wide_slab_at_another_chunk_is_refused::<126, 32>(&census);
@@ -888,9 +897,40 @@ mod tests {
         a_wide_slab_at_another_chunk_is_refused::<372, 32>(&census);
         a_wide_slab_at_another_chunk_is_refused::<372, 8>(&census);
         a_wide_slab_at_another_chunk_is_refused::<8190, 2>(&census);
+        a_wide_slab_at_another_chunk_is_refused::<1023, 8>(&census);
+        a_wide_slab_at_another_chunk_is_refused::<2047, 4>(&census);
+        a_wide_slab_at_another_chunk_is_refused::<4095, 2>(&census);
         // 65,544 B: past one allocation at a chunk of one slot.
         a_wide_slab_at_another_chunk_is_refused::<8191, 1>(&census);
         assert_eq!(census.unsliced_drops(), 0);
+    }
+
+    /// The rule at each power-of-two threshold of the slot's bytes, as ADR-0194 A1 writes it,
+    /// `min(64, 2^⌊log₂(65,536 ÷ s)⌋)`: a threshold keeps its chunk and one byte past it halves.
+    #[test]
+    fn chunk_slots_for_halves_one_byte_past_each_threshold() {
+        use crate::limits::chunk_slots_for;
+        for (bytes, chunk) in [
+            (0, Some(64)),
+            (1, Some(64)),
+            (1_024, Some(64)),
+            (1_025, Some(32)),
+            (2_048, Some(32)),
+            (2_049, Some(16)),
+            (4_096, Some(16)),
+            (4_097, Some(8)),
+            (8_192, Some(8)),
+            (8_193, Some(4)),
+            (16_384, Some(4)),
+            (16_385, Some(2)),
+            (32_768, Some(2)),
+            (32_769, Some(1)),
+            (65_536, Some(1)),
+            (65_537, None),
+            (usize::MAX, None),
+        ] {
+            assert_eq!(chunk_slots_for(bytes), chunk, "{bytes} B a slot");
+        }
     }
 
     /// The chunks and directories a store of `slots` slots in chunks of `chunk` builds, by the
