@@ -1,10 +1,11 @@
 //! `m0-capacity`'s small-credit leg: the work one cell parks for a peer
 //! (ADR-0177 D6), on a mesh of 8 data credits a peer. 8 clients of X each
 //! send one `SET` of a 4,096 B value, to a key Y owns, in a tiered `always`
-//! namespace, in one step, so every apply reaches Y's fabric drain as a tiered apply that
-//! Y diverts to the apply pump it makes on demand for X, and every verdict
-//! waits in Y's gated deque for X until Y's watermark covers it. The oracles read the wire alone: every
-//! `SET` answers `+OK`, and Y's `INFO tripwires` reads its parked bytes'
+//! namespace, in one step, so every apply reaches Y's fabric drain as a
+//! tiered apply that Y diverts to the apply pump it makes on demand for X,
+//! and every verdict waits in Y's gated deque for X until Y's watermark
+//! covers it. The oracles read the wire alone: every `SET` answers `+OK`,
+//! and Y's `INFO tripwires` reads its parked bytes'
 //! high water above 0 (else `VACUOUS`: nothing was parked), its parked bytes
 //! back at 0 once every reply is in (the gauge the pops move), and no op
 //! refused at a full deque on any cell (derived never). The census reads
