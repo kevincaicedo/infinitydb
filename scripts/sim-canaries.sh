@@ -1078,10 +1078,19 @@ ordered_rows=(
   # earlier on a ring without deferred task work.
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_with_receive_posts_no_recv_after_closed recv-after-closed"
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_posts_no_recv_after_closed recv-after-closed"
+  # The gated task publishes an `always` verdict only once the owner's fsync watermark covers
+  # its record (ADR-0177 D3). Planted, it publishes every filled front, so a remote `always`
+  # write is acknowledged before it is durable and the power cut loses it. The lane seed's cut
+  # meets no such ack; this named seed's does.
+  "inf_canary_gated_ignores_watermark m2-durable DURABILITY --seed 0xc1000c"
   # The net's own invariant: no chunk of an fd is posted after its end of stream. Its close
   # legs' shared reap posts a closed client's last chunk and its EOF in one reap, data first;
   # planted, the EOF goes first and the chunk after it.
   "inf_canary_net_data_after_eof crate-test inf-sim lib a_shared_reap_posts_the_chunk_before_the_end_of_stream net-data-after-eof"
+  # The parked-bytes gauge sums the bytes behind the entries in the per-origin deques: a pop
+  # subtracts its entry's (ADR-0177 D6). Planted, a pop subtracts nothing, so the peer that
+  # parked the small-credit leg's applies reads its gauge above 0 once every reply is in.
+  "inf_canary_parked_bytes_kept m0-capacity parked-bytes-kept --close-leg small-credit"
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.

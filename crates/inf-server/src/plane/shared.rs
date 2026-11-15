@@ -1194,7 +1194,11 @@ impl<T: Parked> PeerDeques<T> {
             debug_assert!(self.waiting > 0, "a waiting entry was counted");
             self.waiting = self.waiting.saturating_sub(1);
         }
+        #[cfg(not(inf_canary_parked_bytes_kept))]
         parked_removed(node, entry.parked_bytes());
+        // Canary: a pop subtracts nothing, so the gauge keeps every byte.
+        #[cfg(inf_canary_parked_bytes_kept)]
+        let _ = (node, entry);
     }
 }
 
@@ -1316,7 +1320,14 @@ impl PeerDeques<Gated> {
         for step in 0..peers {
             let index = (self.rotation + step) % peers;
             while let Some(Gated::Verdict(front)) = self.deques[index].front() {
+                #[cfg(not(inf_canary_gated_ignores_watermark))]
                 let covered = front.seq <= watermark;
+                // Canary: every filled front is published, durable or not.
+                #[cfg(inf_canary_gated_ignores_watermark)]
+                let covered = {
+                    let _ = watermark;
+                    true
+                };
                 if !covered {
                     pending = Some(pending.map_or(front.seq, |seq| seq.min(front.seq)));
                     break;
