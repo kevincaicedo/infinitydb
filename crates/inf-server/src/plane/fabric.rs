@@ -163,8 +163,14 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // this batch.
             let divert = {
                 let store = shared.store.borrow();
+                #[cfg(not(inf_canary_ns_apply_skips_divert))]
                 let behind = shared.ns_pump_active.borrow()[usize::from(from.0)]
                     || !shared.ns_applies.borrow().is_empty_for(from);
+                // Canary: a flat durable apply runs inline while its
+                // origin's pump holds work, so two of that origin's applies
+                // are in progress at once.
+                #[cfg(inf_canary_ns_apply_skips_divert)]
+                let behind = false;
                 store.is_tiered(NsId(ns)) || (store.ns_fsync_class(NsId(ns)).is_some() && behind)
             };
             if divert {
@@ -215,7 +221,12 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                     shared.gate_fill(placeholder, verdict);
                 }
                 NsApplyOutcome::Reply => {
+                    #[cfg(not(inf_canary_gated_error_keeps_placeholder))]
                     shared.gate_cancel(placeholder);
+                    // Canary: a verdict that is a reply, an error's among
+                    // them, leaves its placeholder at its origin's front.
+                    #[cfg(inf_canary_gated_error_keeps_placeholder)]
+                    let _ = placeholder;
                     let outcome = reply.outcome();
                     staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
                 }

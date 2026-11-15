@@ -372,7 +372,16 @@ pub const GATED_VERDICTS: Cap =
 /// # Errors
 /// `CapError::Layout` when `data_credits` is 0 or above the ceiling.
 pub(crate) const fn per_origin(ceiling: &Cap, data_credits: u32) -> Result<Cap, CapError> {
-    Cap::derived(ceiling, data_credits)
+    #[cfg(not(inf_canary_parked_deque_of_one))]
+    let entries = data_credits;
+    // Canary: one entry an origin, under the credits a peer may have
+    // un-replied, so a second parked op is refused.
+    #[cfg(inf_canary_parked_deque_of_one)]
+    let entries = {
+        let _ = data_credits;
+        1
+    };
+    Cap::derived(ceiling, entries)
 }
 
 /// Verdicts the `gated` task publishes in one poll (ADR-0177 D3). Unit:
