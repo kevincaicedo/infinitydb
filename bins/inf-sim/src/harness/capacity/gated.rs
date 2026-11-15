@@ -136,14 +136,16 @@ fn read_into(run: &mut Run, clients: &mut [MiniClient], replies: &mut [Option<Ve
     }
 }
 
-/// The hold's engagement once the burst is in: the device held a frame
-/// barrier, Y appended the batch, Y's gated deque for X parked its verdicts
-/// (`verdicts` of them, or over is red), and with no ack read Y parks a
-/// watermark wait.
+/// The hold's engagement once the burst is in: the device held a barrier of
+/// either class (a frame's on Buffered seeds, a standalone fdatasync on
+/// Direct ones), Y appended the batch, Y's gated deque for X parked its
+/// verdicts (`verdicts` of them, or over is red), and with no ack read Y
+/// parks a watermark wait.
 fn engaged(run: &Run, before: u64, verdicts: u64, violations: &mut Violations) {
-    let held = run.node.driver(Y).held_barriers();
-    if held.frames() == 0 {
-        violations.push(format!("VACUOUS frame-barrier-unheld: no frame barrier held ({held:?})"));
+    let driver = run.node.driver(Y);
+    if driver.held_syncs() == 0 {
+        let held = driver.held_barriers();
+        violations.push(format!("VACUOUS frame-barrier-unheld: no barrier held ({held:?})"));
     }
     let staged = appended(run) - before;
     if staged < verdicts {
