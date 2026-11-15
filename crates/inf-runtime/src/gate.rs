@@ -519,3 +519,31 @@ impl Drop for WatermarkWait {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 1,000 waits on one key, each polled once, so it is queued with its
+    /// waker stored, then dropped before any wake. A wait's entry is its
+    /// future's, so its drop unlinks it and the list is empty after the
+    /// last (ADR-0177 D5). At HEAD a dropped wait is only marked cancelled,
+    /// and its entry stays queued until a later wake of the key reaches it.
+    #[test]
+    #[ignore = "a wait dropped while queued is marked cancelled and stays in its key's queue \
+                until a later wake of that key walks past it, so a key nobody wakes keeps every \
+                dropped entry; red until a wait's node is unlinked by its own drop"]
+    fn a_wait_dropped_while_queued_leaves_no_entry() {
+        const WAITS: usize = 1_000;
+        let list: WaitList<u32> = WaitList::new();
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..WAITS {
+            let mut wait = list.wait(7);
+            assert!(Pin::new(&mut wait).poll(&mut cx).is_pending(), "engagement: queued");
+            drop(wait);
+        }
+        assert_eq!(list.waiting(), 0, "no dropped wait is a live waiter");
+        let entries: usize = list.queues.borrow().values().map(|queue| queue.len()).sum();
+        assert_eq!(entries, 0, "{entries} entries stay queued after {WAITS} waits were dropped");
+    }
+}
