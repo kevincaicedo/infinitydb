@@ -1067,6 +1067,13 @@ rows=(
 # touch different lines and merge without a conflict.
 historical_rows=295
 ordered_rows=(
+  # A close ends the receive: the io_uring driver queues the fd's cancels before the close and
+  # posts Closed after them, so no Recv with bytes follows Closed. Planted, Close posts Closed
+  # as it queues the close, ahead of the reap that brings the bytes. One row a shape: the
+  # receive and the close in one enter on the shipped ring, and the receive armed an enter
+  # earlier on a ring without deferred task work.
+  "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_with_receive_posts_no_recv_after_closed recv-after-closed"
+  "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_posts_no_recv_after_closed recv-after-closed"
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.

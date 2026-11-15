@@ -847,6 +847,15 @@ impl UringDriver {
                         CloseWait { token, close_seen: false, close_result: 0, sends_left },
                     );
                     self.backlog_sqe(opcode::Close::new(Fd(fd)).build().user_data(close_id));
+                    // Canary: `Closed` is posted as the close is queued, ahead of the
+                    // completions the next reap brings.
+                    #[cfg(inf_canary_close_posts_closed_early)]
+                    if let Some(wait) = self.closing.remove(&close_id) {
+                        out.push(Completion {
+                            token: wait.token,
+                            result: CompletionResult::Closed,
+                        });
+                    }
                 }
                 IoOp::LogWrite { fd, offset, data, token, barrier } => {
                     self.arm_log_write(fd, offset, data, token, 0, barrier);

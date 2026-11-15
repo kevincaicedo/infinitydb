@@ -87,6 +87,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_ckpt_pin_at_watermark)',
     'cfg(inf_canary_ckpt_sweep_own_slot_zero)',
     'cfg(inf_canary_close_keeps_owner_part)',
+    'cfg(inf_canary_close_posts_closed_early)',
     'cfg(inf_canary_closed_free_ignores_queue)',
     'cfg(inf_canary_closed_header_kept)',
     'cfg(inf_canary_cold_burst_one_round)',
