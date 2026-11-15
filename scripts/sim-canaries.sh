@@ -1103,9 +1103,15 @@ ordered_rows=(
   # subtracts its entry's (ADR-0177 D6). Planted, a pop subtracts nothing, so the peer that
   # parked the small-credit leg's applies reads its gauge above 0 once every reply is in.
   "inf_canary_parked_bytes_kept m0-capacity parked-bytes-kept --close-leg small-credit"
+  # A per-origin deque holds its origin's credits, so the general window an origin fills is
+  # never refused (ADR-0177 D6). Planted, it holds two fewer, and the window's last is refused.
+  "inf_canary_parked_cap_short m0-capacity parked-refused --close-leg small-credit"
   # A per-origin deque holds its origin's credits' worth of ops, so none is refused (ADR-0177
   # D6); the durable driver reads the refusals at each life's end. Planted, a deque holds one.
   "inf_canary_parked_deque_of_one m2-durable PARKED"
+  # A general send keeps one credit free for the publish fan (ADR-0192 D2), so an origin parks
+  # at most 7 applies at a peer of 8 credits. Planted, the guard is gone and all 8 arrive.
+  "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.

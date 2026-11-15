@@ -372,7 +372,7 @@ pub const GATED_VERDICTS: Cap =
 /// # Errors
 /// `CapError::Layout` when `data_credits` is 0 or above the ceiling.
 pub(crate) const fn per_origin(ceiling: &Cap, data_credits: u32) -> Result<Cap, CapError> {
-    #[cfg(not(inf_canary_parked_deque_of_one))]
+    #[cfg(not(any(inf_canary_parked_deque_of_one, inf_canary_parked_cap_short)))]
     let entries = data_credits;
     // Canary: one entry an origin, under the credits a peer may have
     // un-replied, so a second parked op is refused.
@@ -381,6 +381,10 @@ pub(crate) const fn per_origin(ceiling: &Cap, data_credits: u32) -> Result<Cap, 
         let _ = data_credits;
         1
     };
+    // Canary: two entries short of the credits, one under the general
+    // window an origin may fill.
+    #[cfg(inf_canary_parked_cap_short)]
+    let entries = data_credits.saturating_sub(2);
     Cap::derived(ceiling, entries)
 }
 
