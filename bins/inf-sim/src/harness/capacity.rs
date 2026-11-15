@@ -74,11 +74,14 @@ pub enum CloseLeg {
     /// A held `DEL`, 1,000 `SET`s and a FIN, then a reset once the EOF is
     /// posted: every `SET` lands and nothing is answered.
     HalfCloseReset,
+    /// A held `DEL`, `QUIT` and 10 `SET`s in one buffer: the `DEL`'s count
+    /// and the `QUIT`'s `+OK`, then the close; no `SET` runs.
+    DeferredQuit,
 }
 
 impl CloseLeg {
     /// Every leg, in the order the help text lists them.
-    pub const ALL: [CloseLeg; 14] = [
+    pub const ALL: [CloseLeg; 15] = [
         CloseLeg::Tasks,
         CloseLeg::Fan,
         CloseLeg::Close,
@@ -93,6 +96,7 @@ impl CloseLeg {
         CloseLeg::HalfClose,
         CloseLeg::HalfCloseEofWithData,
         CloseLeg::HalfCloseReset,
+        CloseLeg::DeferredQuit,
     ];
 
     #[must_use]
@@ -112,6 +116,7 @@ impl CloseLeg {
             CloseLeg::HalfClose => "half-close",
             CloseLeg::HalfCloseEofWithData => "half-close-eof-with-data",
             CloseLeg::HalfCloseReset => "half-close-reset",
+            CloseLeg::DeferredQuit => "deferred-quit",
         }
     }
 
@@ -514,6 +519,7 @@ pub fn run_capacity_scenario(scenario: &CapacityScenario) -> CapacityReport {
         CloseLeg::HalfClose => half_close_leg(seed, false),
         CloseLeg::HalfCloseEofWithData => half_close_leg(seed, true),
         CloseLeg::HalfCloseReset => half_close_reset_leg(seed),
+        CloseLeg::DeferredQuit => deferred_quit_leg(seed),
     };
     rig.report(leg)
 }
@@ -1134,6 +1140,50 @@ fn half_close_reset_leg(seed: u64) -> Rig {
     rig.expect_vacant(X, 1);
     if rig.nets[X].borrow().reset_send_errors() == 0 {
         rig.violate("VACUOUS reset-drain-unengaged: no Send met the reset".to_string());
+    }
+    rig
+}
+
+/// The `DEL` of a window of keys cell 1 holds, then `QUIT`, then 10 `SET`s
+/// of keys cell 0 owns, in one buffer, so the `QUIT` runs on the pump behind
+/// the held `DEL`; cell 1's replies are released once the buffer is taken.
+/// Nothing behind a `QUIT` runs (`post-quit-ran`), its `+OK` follows the
+/// `DEL`'s count and the socket closes (ADR-0196 D6.2). Engagement: cell 1
+/// held the `DEL`'s legs and the client had read nothing after the buffer was
+/// taken, else `VACUOUS deferred-quit-unengaged`.
+fn deferred_quit_leg(seed: u64) -> Rig {
+    const SETS: usize = 10;
+    let mut rig = Rig::new(seed, 0, 15_000);
+    let reader = rig.admitted(X);
+    let client = rig.admitted(X);
+    let names = names_on(X, "deferred-quit", SETS);
+    let mut rest = encode(&[b"QUIT"]);
+    rest.extend(sets(&names));
+    rig.held = Some(Y);
+    rig.send(client, &Rig::held_pipeline(Y, &rest));
+    rig.until("the client's bytes taken", |rig| {
+        rig.nets[X].borrow().unread(rig.fd(client)) == Some(0)
+    });
+    for _ in 0..64 {
+        rig.step();
+    }
+    let held = rig.plane(X).suspended();
+    rig.read("held_legs", held as u64);
+    let engaged = held >= WINDOW && rig.clients[client].replies.len() == 1;
+    rig.held = None;
+    rig.until("the quitting client's close", |rig| rig.ended(client));
+    rig.settle();
+    let ran = rig.existing(reader, &names);
+    rig.read("post_quit_ran", ran as u64);
+    if ran > 0 {
+        rig.violate(format!("post-quit-ran: {ran} of the {SETS} SETs behind the QUIT ran"));
+    }
+    let owed = [DEL_NONE.to_vec(), b"+OK\r\n".to_vec()];
+    rig.judge_replies(client, 1, &owed, "the quitting client");
+    rig.expect_vacant(X, 1);
+    if !engaged {
+        let text = "VACUOUS deferred-quit-unengaged: the QUIT met no held DEL ahead of it";
+        rig.violate(text.to_string());
     }
     rig
 }

@@ -74,6 +74,7 @@ rows=(
   # drawn from the seed; every other leg is a pinned red in its source until it is green.
   "m0-capacity --close-leg subscribe-reset --verify-determinism"
   "m0-capacity --close-leg registry-reset --verify-determinism"
+  "m0-capacity --close-leg deferred-quit --verify-determinism"
   "m1-cache"
   "m2-durable"
   "m2-clean-stop"
