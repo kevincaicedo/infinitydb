@@ -75,6 +75,7 @@ use crate::resp::{Reply, SubFrame, parse_reply, parse_sub_frame, reply_len};
 
 pub mod accept_retry;
 mod audit;
+pub mod capacity;
 mod idle;
 mod pub_cross;
 pub mod shadow;

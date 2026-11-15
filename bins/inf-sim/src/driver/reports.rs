@@ -4,10 +4,10 @@
 
 use super::{SeedReport, SimSeconds, Verdict, Violations};
 use crate::{
-    BackfillReport, BootStormReport, ColdStormReport, CombinedReport, DiskfullReport,
-    DurableReport, ExtentWindowReport, NsCreateWindowReport, NsDdlRaceReport, NsDropWindowReport,
-    NsLifetimesReport, PressureReport, RecoveryReport, SidecarReport, SimReport, SteelReport,
-    TieredNodeReport, WakeReport,
+    BackfillReport, BootStormReport, CapacityReport, ColdStormReport, CombinedReport,
+    DiskfullReport, DurableReport, ExtentWindowReport, NsCreateWindowReport, NsDdlRaceReport,
+    NsDropWindowReport, NsLifetimesReport, PressureReport, RecoveryReport, SidecarReport,
+    SimReport, SteelReport, TieredNodeReport, WakeReport,
 };
 
 impl SeedReport for SimReport {
@@ -210,6 +210,7 @@ macro_rules! hashed {
 }
 
 hashed!(
+    CapacityReport,
     SteelReport,
     BackfillReport,
     SidecarReport,

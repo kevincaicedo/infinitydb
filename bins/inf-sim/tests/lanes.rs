@@ -88,6 +88,40 @@ fn every_scenario_has_a_smoke_row_and_every_row_names_a_scenario() {
     assert!(unknown.is_empty(), "sim-smoke.sh rows naming no scenario: {unknown:?}");
 }
 
+/// The `--close-leg` value of every `m0-capacity` row of the smoke runner.
+fn capacity_smoke_legs() -> BTreeSet<String> {
+    let script = read("../../scripts/sim-smoke.sh");
+    let body = script.split("rows=(").nth(1).expect("rows=( … ) in sim-smoke.sh");
+    let body = body.split(')').next().expect("closing paren");
+    body.lines()
+        .map(|line| line.trim().trim_matches('"'))
+        .filter(|row| row.split_whitespace().next() == Some("m0-capacity"))
+        .filter_map(|row| row.split("--close-leg ").nth(1))
+        .map(|rest| rest.split_whitespace().next().expect("a leg name").to_string())
+        .collect()
+}
+
+/// Every `m0-capacity` leg runs in exactly one lane: a smoke row, or a
+/// pinned red in its source (an ignored test that runs the leg), so a leg
+/// can be born neither unrun nor twice.
+#[test]
+fn every_capacity_leg_has_a_smoke_row_or_a_pinned_red() {
+    let rows = capacity_smoke_legs();
+    let source = read("src/harness/capacity.rs");
+    for leg in inf_sim::CloseLeg::ALL {
+        let row = rows.contains(leg.name());
+        let pinned = source.contains(&format!("leg_green(CloseLeg::{leg:?});"));
+        assert!(
+            row != pinned,
+            "m0-capacity --close-leg {}: smoke row {row}, pinned red {pinned}; a leg runs in one",
+            leg.name()
+        );
+    }
+    let known: BTreeSet<&str> = inf_sim::CloseLeg::ALL.iter().map(|leg| leg.name()).collect();
+    let unknown: Vec<&String> = rows.iter().filter(|leg| !known.contains(leg.as_str())).collect();
+    assert!(unknown.is_empty(), "sim-smoke.sh rows naming no m0-capacity leg: {unknown:?}");
+}
+
 #[test]
 fn the_recipe_and_the_pr_job_run_the_smoke_script() {
     let justfile = read("../../justfile");

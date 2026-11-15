@@ -70,6 +70,10 @@ rows=(
   "m0-surface --cells 4 --verify-determinism"
   "m0-fabric-fairness"
   "m0-admission"
+  # m0-capacity runs each close leg green on this tree on its own row, a leg named, never
+  # drawn from the seed; every other leg is a pinned red in its source until it is green.
+  "m0-capacity --close-leg subscribe-reset --verify-determinism"
+  "m0-capacity --close-leg registry-reset --verify-determinism"
   "m1-cache"
   "m2-durable"
   "m2-clean-stop"
