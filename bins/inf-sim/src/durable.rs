@@ -2150,6 +2150,19 @@ pub(crate) fn boot(
     clock: &Rc<VirtualClock>,
     observer: &TraceObserver,
 ) -> std::io::Result<Node> {
+    boot_meshed(scenario, crate::harness::FROZEN_MESH, data_dir, disk, clock, observer)
+}
+
+/// [`boot`] over `mesh`: a leg whose oracle reads a peer's credits
+/// (`m0-capacity`'s small-credit leg) names its own.
+pub(crate) fn boot_meshed(
+    scenario: &DurableScenario,
+    mesh: inf_fabric::MeshConfig,
+    data_dir: PathBuf,
+    disk: &SimDisk,
+    clock: &Rc<VirtualClock>,
+    observer: &TraceObserver,
+) -> std::io::Result<Node> {
     observer.1.update(|state| {
         state.number(b"boot", clock.now().0);
         state.disk(disk);
@@ -2179,7 +2192,7 @@ pub(crate) fn boot(
     .map_err(|refused| std::io::Error::new(std::io::ErrorKind::InvalidData, refused.to_string()))?;
     let inf_server::CkptIssuers { host: ckpt_host, cells: cell_issuers } = issuers;
     let mut cell_issuers = cell_issuers.into_iter();
-    let fabrics = Mesh::new(scenario.cells, crate::harness::FROZEN_MESH);
+    let fabrics = Mesh::new(scenario.cells, mesh);
     let mut nets = Vec::new();
     let mut cells = Vec::new();
     for (i, fabric) in fabrics.into_iter().enumerate() {
@@ -2263,8 +2276,9 @@ impl Drop for Node {
             let tiered_tables =
                 if durable.is_some() { plane.keyspace().tiered_tables() } else { 0 };
             let turn_refused = durable.map(|stats| stats.turn_refused);
+            let peers = u16::try_from(self.cells.len() - 1).expect("a node's cells fit a u16");
             let facts =
-                crate::census::CellFacts { server_plane: true, tiered_tables, turn_refused };
+                crate::census::CellFacts { server_plane: true, peers, tiered_tables, turn_refused };
             verdict.judge(index, plane.cap_census(), facts);
         }
         // The nets' own invariants join the life's verdict, which every

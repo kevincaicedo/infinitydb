@@ -34,6 +34,8 @@ use crate::net::{CellNet, Plant, SimDriver, drain_violations, listener_fd};
 use crate::resp::reply_len;
 use crate::state::StateHash;
 
+mod small_credit;
+
 /// The legs, each one row of `scripts/sim-smoke.sh` or one pinned red.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseLeg {
@@ -84,11 +86,14 @@ pub enum CloseLeg {
     /// `INF.NS USE`, 10 `SET`s, a malformed frame and 10 more in one buffer:
     /// 11 `+OK`s, then the protocol error, then the close.
     ProtocolOrder,
+    /// 8 tiered `SET`s of 4,096 B toward a peer on a mesh of 8 credits: the
+    /// peer parks them, and its parked bytes are back at 0 once quiet.
+    SmallCredit,
 }
 
 impl CloseLeg {
     /// Every leg, in the order the help text lists them.
-    pub const ALL: [CloseLeg; 16] = [
+    pub const ALL: [CloseLeg; 17] = [
         CloseLeg::Tasks,
         CloseLeg::Fan,
         CloseLeg::Close,
@@ -105,6 +110,7 @@ impl CloseLeg {
         CloseLeg::HalfCloseReset,
         CloseLeg::DeferredQuit,
         CloseLeg::ProtocolOrder,
+        CloseLeg::SmallCredit,
     ];
 
     /// The legs red at this tree. Each runs in one ignored test of `reds`,
@@ -147,6 +153,7 @@ impl CloseLeg {
             CloseLeg::HalfCloseReset => "half-close-reset",
             CloseLeg::DeferredQuit => "deferred-quit",
             CloseLeg::ProtocolOrder => "protocol-order",
+            CloseLeg::SmallCredit => "small-credit",
         }
     }
 
@@ -248,6 +255,8 @@ struct Rig {
     /// The most tasks each cell's executor held after any step, while the
     /// leg reads them.
     tasks_most: Option<Vec<usize>>,
+    /// Each cell's node state, for the gauges a leg reads beside the wire.
+    nodes: Vec<Rc<NodeInfo>>,
 }
 
 impl Rig {
@@ -263,6 +272,7 @@ impl Rig {
         let clock = Rc::new(VirtualClock::new(Nanos(1)));
         let mut cells = Vec::new();
         let mut nets = Vec::new();
+        let mut nodes = Vec::new();
         for (i, fabric) in Mesh::new(CELLS, FROZEN_MESH).into_iter().enumerate() {
             let cell = u16::try_from(i).expect("a u16 cell");
             let net = CellNet::new(cell, seed, Plant::None);
@@ -277,6 +287,7 @@ impl Rig {
             }
             let node = Rc::new(NodeInfo::try_new(config).expect("fixture cache allocation"));
             node.rng_state.set(seed ^ (0xCA9A_0000 + i as u64));
+            nodes.push(Rc::clone(&node));
             let seed_store = KeyspaceSeed::Uncataloged {
                 cfg: StoreConfig { hasher: node_hasher(seed), ..Default::default() },
                 specs: namespaces.to_vec(),
@@ -314,6 +325,7 @@ impl Rig {
             violations: Violations::default(),
             readings: Vec::new(),
             tasks_most: None,
+            nodes,
         };
         for _ in 0..8 {
             rig.step();
@@ -479,6 +491,24 @@ impl Rig {
         count
     }
 
+    /// The parked-bytes gauge's control (ADR-0177 D6): a leg that parks no
+    /// work for a peer reads both the gauge and its high water at 0 on
+    /// every cell.
+    fn parked_nothing(&mut self) {
+        for cell in 0..self.nodes.len() {
+            let (now, max) = (
+                self.nodes[cell].fabric_parked_bytes.get(),
+                self.nodes[cell].fabric_parked_bytes_max.get(),
+            );
+            if now != 0 || max != 0 {
+                self.violate(format!(
+                    "parked-bytes-control: cell {cell} parked nothing and reads \
+                     fabric_parked_bytes {now}, its high water {max}"
+                ));
+            }
+        }
+    }
+
     /// The connection slots `cell` holds now.
     fn occupied(&self, cell: usize) -> usize {
         self.plane(cell).connections()
@@ -488,10 +518,19 @@ impl Rig {
     /// iteration (the cap bound, the assembly rule and their liveness), and
     /// the state hash over the readings and every cell's keyspace.
     fn report(mut self, leg: CloseLeg) -> CapacityReport {
+        // No op refused at a full per-origin deque (ADR-0177 D6; derived
+        // never).
+        for cell in 0..self.nodes.len() {
+            let refused = self.nodes[cell].fabric_parked_refused.get();
+            if refused != 0 {
+                self.violate(format!("parked-refused: cell {cell}, {refused} op(s)"));
+            }
+        }
         let mut census = CensusVerdict::default();
         for (index, (_, plane)) in self.cells.iter().enumerate() {
             let facts = CellFacts {
                 server_plane: true,
+                peers: CELLS - 1,
                 tiered_tables: plane.keyspace().tiered_tables(),
                 turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
             };
@@ -580,6 +619,8 @@ pub fn run_capacity_scenario(scenario: &CapacityScenario) -> CapacityReport {
         CloseLeg::HalfCloseReset => half_close_reset_leg(seed),
         CloseLeg::DeferredQuit => deferred_quit_leg(seed),
         CloseLeg::ProtocolOrder => protocol_order_leg(seed),
+        // A durable node on its own mesh, judged by its own oracles.
+        CloseLeg::SmallCredit => return small_credit::small_credit_leg(seed),
     };
     rig.report(leg)
 }
@@ -1306,6 +1347,7 @@ fn deferred_quit_leg(seed: u64) -> Rig {
     let owed = [DEL_NONE.to_vec(), b"+OK\r\n".to_vec()];
     rig.judge_replies(client, 1, &owed, "the quitting client");
     rig.expect_vacant(X, 1);
+    rig.parked_nothing();
     if !engaged {
         let text = "VACUOUS deferred-quit-unengaged: the QUIT met no held DEL ahead of it";
         rig.violate(text.to_string());

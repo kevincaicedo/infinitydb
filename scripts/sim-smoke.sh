@@ -75,6 +75,7 @@ rows=(
   "m0-capacity --close-leg subscribe-reset --verify-determinism"
   "m0-capacity --close-leg registry-reset --verify-determinism"
   "m0-capacity --close-leg deferred-quit --verify-determinism"
+  "m0-capacity --close-leg small-credit --verify-determinism"
   "m1-cache"
   "m2-durable"
   "m2-clean-stop"
