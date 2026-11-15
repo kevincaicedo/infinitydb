@@ -1079,9 +1079,9 @@ ordered_rows=(
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_with_receive_posts_no_recv_after_closed recv-after-closed"
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_posts_no_recv_after_closed recv-after-closed"
   # An `always` apply whose verdict is a reply gives its placeholder back (ADR-0177 D6), so its
-  # origin's later verdicts are reached. Planted, an error reply leaves the placeholder at the
-  # origin's front, and the writes after it wait behind it once the fsync hold lifts.
-  "inf_canary_gated_error_keeps_placeholder m0-capacity reply-stalled-after-lift --close-leg gated-error"
+  # origin's next apply opens a slot. Planted, an error reply leaves the placeholder at the
+  # origin's back, and the next write's open stops the cell.
+  "inf_canary_gated_error_keeps_placeholder m0-capacity second-open-slot --close-leg gated-error"
   # The gated task publishes an `always` verdict only once the owner's fsync watermark covers
   # its record (ADR-0177 D3). Planted, it publishes every filled front, so a remote `always`
   # write is acknowledged before it is durable and the power cut loses it. The lane seed's cut
@@ -1095,10 +1095,10 @@ ordered_rows=(
   # planted, the EOF goes first and the chunk after it.
   "inf_canary_net_data_after_eof crate-test inf-sim lib a_shared_reap_posts_the_chunk_before_the_end_of_stream net-data-after-eof"
   # FABRIC-IN diverts an origin's durable apply to the origin's pump while the pump holds its
-  # work, so an origin has one apply in progress and its gated placeholder is the back of its
-  # deque (ADR-0177 D6). Planted, a flat write runs inline while a tiered write of the same
-  # origin is suspended on a cold read, and the tiered write's fill stops the cell.
-  "inf_canary_ns_apply_skips_divert crate-test inf-sim lib a_tiered_verdict_keeps_its_place_across_a_cold_read a filled placeholder is the back of its origin's deque"
+  # work, so an origin has one open gated slot, its back (ADR-0177 D6). Planted, a flat write
+  # runs inline while a tiered write of the same origin is suspended on a cold read, and the
+  # flat write's open stops the cell.
+  "inf_canary_ns_apply_skips_divert crate-test inf-sim lib a_tiered_verdict_keeps_its_place_across_a_cold_read second-open-slot"
   # The parked-bytes gauge sums the bytes behind the entries in the per-origin deques: a pop
   # subtracts its entry's (ADR-0177 D6). Planted, a pop subtracts nothing, so the peer that
   # parked the small-credit leg's applies reads its gauge above 0 once every reply is in.

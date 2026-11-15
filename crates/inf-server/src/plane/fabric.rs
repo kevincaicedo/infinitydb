@@ -152,28 +152,12 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
                 return;
             }
-            // A tiered apply can suspend on a cold read — it always
-            // defers to the origin's FIFO pump instead of the synchronous
-            // drain (M4-S26). A flat *durable*-namespace apply joins the
-            // same pump whenever the pump already holds (or is applying)
-            // this origin's work — FIFO is the apply-order currency, so
-            // nothing may overtake a parked apply (M4.5-S27, ADR-0083
-            // D1). Memory namespaces never queue behind durable pressure
+            // FIFO is the apply-order currency: a tiered apply, or a durable
+            // one behind its origin's pump, joins the pump (ADR-0083 D1).
+            // Memory namespaces never queue behind durable pressure
             // (namespace isolation). `fabric_in` wakes the pump after
             // this batch.
-            let divert = {
-                let store = shared.store.borrow();
-                #[cfg(not(inf_canary_ns_apply_skips_divert))]
-                let behind = shared.ns_pump_active.borrow()[usize::from(from.0)]
-                    || !shared.ns_applies.borrow().is_empty_for(from);
-                // Canary: a flat durable apply runs inline while its
-                // origin's pump holds work, so two of that origin's applies
-                // are in progress at once.
-                #[cfg(inf_canary_ns_apply_skips_divert)]
-                let behind = false;
-                store.is_tiered(NsId(ns)) || (store.ns_fsync_class(NsId(ns)).is_some() && behind)
-            };
-            if divert {
+            if shared.diverts_to_pump(from, NsId(ns)) {
                 park_ns_apply(shared, from, token, NsId(ns), proto, argv, program, staged);
                 return;
             }

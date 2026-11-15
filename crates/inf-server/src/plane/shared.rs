@@ -60,6 +60,24 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         }
     }
 
+    /// The divert, ADR-0083 D1's one statement: an apply from `from` in `ns`
+    /// joins `from`'s FIFO pump instead of running inline when `ns` is tiered
+    /// (it can suspend on a cold read, M4-S26), or durable while the pump is
+    /// applying or holds `from`'s work. Nothing overtakes an apply in
+    /// progress, so an origin has one open gated slot, its back (ADR-0177
+    /// D6), which the gated deque's `second-open-slot` check holds.
+    pub(super) fn diverts_to_pump(&self, from: CellId, ns: NsId) -> bool {
+        let store = self.store.borrow();
+        #[cfg(not(inf_canary_ns_apply_skips_divert))]
+        let behind = self.ns_pump_active.borrow()[usize::from(from.0)]
+            || !self.ns_applies.borrow().is_empty_for(from);
+        // Canary: a flat durable apply runs inline while its origin's pump
+        // holds work, so two of that origin's applies are in progress.
+        #[cfg(inf_canary_ns_apply_skips_divert)]
+        let behind = false;
+        store.is_tiered(ns) || (store.ns_fsync_class(ns).is_some() && behind)
+    }
+
     pub(super) fn with_conn<R>(&self, key: ConnKey, f: impl FnOnce(&mut Conn) -> R) -> Option<R> {
         self.conns.borrow_mut().get_mut(key).map(f)
     }
@@ -1264,19 +1282,28 @@ impl ParkedDeques {
 /// `origin`'s gated deque, before its apply's first effect; consumed by
 /// [`PeerDeques::fill`] or [`PeerDeques::cancel`]. It holds no borrow, so it
 /// crosses the apply's suspension; the back stays its own there because an
-/// origin has one apply in progress at a time (the divert rule).
+/// origin has one apply in progress at a time ([`Shared::diverts_to_pump`]),
+/// which [`PeerDeques::placeholder`] checks.
 #[must_use = "a placeholder is filled with its verdict or cancelled"]
 pub(super) struct GatedPlaceholder {
     origin: CellId,
 }
 
 impl PeerDeques<Gated> {
-    /// Publishes a placeholder at the back of `origin`'s deque.
+    /// Publishes a placeholder at the back of `origin`'s deque. The divert
+    /// keeps one apply of an origin in progress, so its back is no
+    /// placeholder here; past that a second apply overtook the first, and
+    /// the cell stops before the second's first effect.
     pub(super) fn placeholder(
         &mut self,
         origin: CellId,
         node: &NodeState,
     ) -> Result<GatedPlaceholder, ParkedFull> {
+        let index = self.index(origin);
+        assert!(
+            !matches!(self.deques[index].back(), Some(Gated::Placeholder)),
+            "second-open-slot: a second apply of one origin in progress"
+        );
         self.publish_with(origin, node, || Gated::Placeholder)?;
         Ok(GatedPlaceholder { origin })
     }
@@ -1291,12 +1318,10 @@ impl PeerDeques<Gated> {
     ) {
         let index = self.index(placeholder.origin);
         let bytes = verdict.parked_bytes();
-        // FABRIC-IN diverts an origin's durable apply to its pump while the
-        // pump holds the origin's work, and the pump runs one apply at a
-        // time, so an origin has one apply in progress and its placeholder
-        // is the back of its deque. Past that, a verdict filled elsewhere
-        // leaves a placeholder no fill reaches, and the origin's replies
-        // wedge behind it: the cell stops.
+        // An origin has one open slot, its back (`placeholder`'s check), so
+        // this placeholder is the back of its deque. Past that, a verdict
+        // filled elsewhere leaves a placeholder no fill reaches, and the
+        // origin's replies wedge behind it: the cell stops.
         let back = self.deques[index].back_mut();
         assert!(
             matches!(back, Some(Gated::Placeholder)),
@@ -1480,31 +1505,42 @@ mod parked_tests {
         }
     }
 
-    /// Two of one origin's applies in progress, which the divert rule rules
-    /// out: the earlier one's fill finds the other's verdict at the back,
-    /// and the cell stops rather than wedge the origin behind a placeholder
-    /// no fill reaches.
+    /// A second apply of one origin opening its slot while the first holds
+    /// its own, which the divert rules out: the cell stops before the
+    /// second's first effect.
+    #[test]
+    #[should_panic(expected = "second-open-slot: a second apply of one origin in progress")]
+    fn a_second_open_slot_of_one_origin_stops_the_cell() {
+        let node = NodeState::default();
+        let mut gated = deques::<Gated>(1, 3, 4);
+        let _earlier = gated.placeholder(CellId(0), &node).expect("room");
+        let _later = gated.placeholder(CellId(0), &node);
+    }
+
+    /// A verdict published behind an open slot, past `placeholder`'s check:
+    /// the slot's fill finds the verdict at the back, and the cell stops
+    /// rather than wedge the origin behind a placeholder no fill reaches.
     #[test]
     #[should_panic(expected = "a filled placeholder is the back of its origin's deque")]
-    fn a_fill_behind_another_apply_stops_the_cell() {
+    fn a_fill_behind_another_verdict_stops_the_cell() {
         let node = NodeState::default();
         let mut gated = deques::<Gated>(1, 3, 4);
         let earlier = gated.placeholder(CellId(0), &node).expect("room");
-        let later = gated.placeholder(CellId(0), &node).expect("room");
-        gated.fill(later, verdict(2, 1), &node);
+        let other = || Gated::Verdict(verdict(2, 1));
+        gated.publish_with(CellId(0), &node, other).expect("room");
         gated.fill(earlier, verdict(1, 1), &node);
     }
 
-    /// The same, at a cancel: the pop would drop the other apply's verdict,
-    /// so the cell stops first.
+    /// The same, at a cancel: the pop would drop the other verdict, so the
+    /// cell stops first.
     #[test]
     #[should_panic(expected = "a cancelled placeholder is the back of its origin's deque")]
-    fn a_cancel_behind_another_apply_stops_the_cell() {
+    fn a_cancel_behind_another_verdict_stops_the_cell() {
         let node = NodeState::default();
         let mut gated = deques::<Gated>(1, 3, 4);
         let earlier = gated.placeholder(CellId(0), &node).expect("room");
-        let later = gated.placeholder(CellId(0), &node).expect("room");
-        gated.fill(later, verdict(2, 1), &node);
+        let other = || Gated::Verdict(verdict(2, 1));
+        gated.publish_with(CellId(0), &node, other).expect("room");
         gated.cancel(earlier, &node);
     }
 
