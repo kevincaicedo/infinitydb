@@ -809,7 +809,9 @@ mod tests {
 
     use super::*;
     use crate::bounded::{CapRow, CensusPhase, ServeMark};
-    use crate::limits::{CAP_CENSUS_SLABS_MAX, MAP_KEY_BITS_MAX, directory_levels};
+    use crate::limits::{
+        CAP_CENSUS_SLABS_MAX, MAP_CHUNK_SLOTS_MAX, MAP_KEY_BITS_MAX, directory_levels,
+    };
     use crate::rng::{Entropy, SplitMix64};
 
     const CELL: CellId = CellId(9);
@@ -1078,8 +1080,9 @@ mod tests {
     fn the_map_equals_its_model_at_two_directory_levels() {
         let cap = Cap::entries::<16_386>("m-16386", CapFill::Serving);
         let entries = u64::from(cap.entries_max());
-        assert_eq!(directory_levels(entries), 2, "the leaf store's levels");
-        assert_eq!(directory_levels(entries - 1), 2, "the branch store's levels");
+        // A map's two stores hold chunks of 64 slots.
+        assert_eq!(directory_levels(entries, MAP_CHUNK_SLOTS_MAX), 2, "the leaf store's levels");
+        assert_eq!(directory_levels(entries - 1, MAP_CHUNK_SLOTS_MAX), 2, "the branch store's");
         let keys = pool_u64(0x3B0, 2 * cap.entries_max() as usize + 3);
         let reach = model_run(cap, &keys, 0x3B0, 60_000, 4_096);
         assert!(reach.full > 0, "{cap:?} never reached its cap: {reach:?}");

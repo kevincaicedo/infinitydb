@@ -11,7 +11,11 @@
 //! A slab is built and retired one chunk or directory per step
 //! ([`SlabBuilder`], [`SlabRetiring`]); once `Live` it allocates nothing:
 //! growth is `reserve` then `publish`, and `Full` holds no value and changes
-//! nothing but its census row's crossings.
+//! nothing but its census row's crossings. A chunk holds `CHUNK_SLOTS`
+//! slots, 64 by default: the count `chunk_slots_for` answers for the slot's
+//! bytes, a parameter because a count read from `size_of` cannot be an array
+//! length on stable Rust, so a slab of wide slots names its count where it is
+//! declared, and the builder refuses any other (ADR-0194 A1).
 #![cfg_attr(
     not(test),
     deny(
@@ -30,6 +34,7 @@ use std::rc::Rc;
 use super::census::{CapCensus, CapRowHandle, SlabInstance};
 use super::store::{BuildStep, FreeSlot, RetireStep as StoreRetire, Slot, SlotStore};
 use super::{Cap, CapError, CapFill};
+use crate::limits::MAP_CHUNK_SLOTS_MAX;
 
 mod sealed {
     pub trait Sealed {}
@@ -197,53 +202,66 @@ pub struct SlotReservation<'a, T, G, P> {
 /// loads (the fill byte, the counts, the instance, the free head and the
 /// root) lie in one line when the slab starts on one.
 #[repr(C)]
-pub struct CappedSlab<T, G, P> {
+pub struct CappedSlab<T, G, P, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
     row: CapRowHandle,
     live: u32,
     high_water: u32,
-    store: SlotStore<T, G>,
+    store: SlotStore<T, G, CHUNK_SLOTS>,
     policy: PhantomData<P>,
 }
 
 /// A slab being built, one chunk or directory per step; it serves nothing.
 /// Its instance is minted, so a handle that must name its owner can read it
 /// before the slab is live.
-pub struct SlabBuilder<T, G, P> {
+pub struct SlabBuilder<T, G, P, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
     row: CapRowHandle,
-    store: SlotStore<T, G>,
+    store: SlotStore<T, G, CHUNK_SLOTS>,
     policy: PhantomData<P>,
 }
 
 /// A slab being retired, or a refused build's prefix: one chunk or
 /// directory freed per step, children before their directory.
-pub struct SlabRetiring<T, G, P> {
-    store: SlotStore<T, G>,
+pub struct SlabRetiring<T, G, P, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
+    store: SlotStore<T, G, CHUNK_SLOTS>,
     policy: PhantomData<P>,
 }
 
 /// The answer of a build step.
-pub enum Built<T, G, P> {
-    More(SlabBuilder<T, G, P>),
-    Live(CappedSlab<T, G, P>),
+pub enum Built<T, G, P, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
+    More(SlabBuilder<T, G, P, CHUNK_SLOTS>),
+    Live(CappedSlab<T, G, P, CHUNK_SLOTS>),
     /// A step's allocation was refused: nothing was served, and what was
     /// built retires by steps.
-    Refused(SlabRetiring<T, G, P>, CapError),
+    Refused(SlabRetiring<T, G, P, CHUNK_SLOTS>, CapError),
 }
 
 /// The answer of a retire step.
-pub enum Retiring<T, G, P> {
-    More(SlabRetiring<T, G, P>),
+pub enum Retiring<T, G, P, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
+    More(SlabRetiring<T, G, P, CHUNK_SLOTS>),
     Done,
 }
 
-impl<T, G: Generation, P: GenerationPolicy> CappedSlab<T, G, P> {
+impl<T, G: Generation, P, const CHUNK_SLOTS: usize> CappedSlab<T, G, P, CHUNK_SLOTS> {
+    /// The bytes of one slot of this slab, its value and its generation and
+    /// state beside it: a site that builds a slab of wide slots reads its
+    /// chunk count from this (`chunk_slots_for`) without naming the slot.
+    pub const SLOT_BYTES: usize = mem::size_of::<Slot<T, G>>();
+}
+
+impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
+    CappedSlab<T, G, P, CHUNK_SLOTS>
+{
     /// A slab of `cap` on `census`, to build by steps: the layout is checked
-    /// (a chunk or a directory past one backing allocation is `Layout`, and
-    /// no row is registered), then the row is registered, then the instance
-    /// minted (`Census` past its mints; the row stays). Nothing is allocated
-    /// until the first step.
-    pub fn builder(cap: Cap, census: &Rc<CapCensus>) -> Result<SlabBuilder<T, G, P>, CapError> {
-        if !SlotStore::<T, G>::layout_fits() {
+    /// (a chunk count other than the one `chunk_slots_for` answers for the
+    /// slot's bytes, or a chunk or a directory past one backing allocation,
+    /// is `Layout`, and no row is registered), then the row is registered,
+    /// then the instance minted (`Census` past its mints; the row stays).
+    /// Nothing is allocated until the first step.
+    pub fn builder(
+        cap: Cap,
+        census: &Rc<CapCensus>,
+    ) -> Result<SlabBuilder<T, G, P, CHUNK_SLOTS>, CapError> {
+        if !SlotStore::<T, G, CHUNK_SLOTS>::layout_fits() {
             return Err(CapError::Layout);
         }
         let row = census.register(cap)?;
@@ -370,7 +388,7 @@ impl<T, G: Generation, P: GenerationPolicy> CappedSlab<T, G, P> {
     }
 
     /// Retirement of the whole slab, by steps.
-    pub fn retire(self) -> SlabRetiring<T, G, P> {
+    pub fn retire(self) -> SlabRetiring<T, G, P, CHUNK_SLOTS> {
         SlabRetiring { store: self.store, policy: PhantomData }
     }
 
@@ -463,7 +481,9 @@ impl<T, G: Generation, P> SlotReservation<'_, T, G, P> {
     }
 }
 
-impl<T, G: Generation, P: GenerationPolicy> SlabBuilder<T, G, P> {
+impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
+    SlabBuilder<T, G, P, CHUNK_SLOTS>
+{
     /// The identity the slab will stamp in its handles, minted when the
     /// builder was made.
     #[must_use]
@@ -473,7 +493,7 @@ impl<T, G: Generation, P: GenerationPolicy> SlabBuilder<T, G, P> {
 
     /// One build step: one chunk or one directory allocated. `Live` once
     /// the last chunk is built; a refused allocation retires what was built.
-    pub fn step(mut self) -> Built<T, G, P> {
+    pub fn step(mut self) -> Built<T, G, P, CHUNK_SLOTS> {
         match self.store.build_step() {
             Ok(BuildStep::More) => Built::More(self),
             Ok(BuildStep::Done) => Built::Live(CappedSlab {
@@ -490,11 +510,11 @@ impl<T, G: Generation, P: GenerationPolicy> SlabBuilder<T, G, P> {
     }
 }
 
-impl<T, G: Generation, P> SlabRetiring<T, G, P> {
+impl<T, G: Generation, P, const CHUNK_SLOTS: usize> SlabRetiring<T, G, P, CHUNK_SLOTS> {
     /// One retire step: the last chunk or directory freed, with the
     /// occupants of a chunk. One canary drops the rest whole at the first
     /// step instead, an unsliced drop.
-    pub fn step(mut self) -> Retiring<T, G, P> {
+    pub fn step(mut self) -> Retiring<T, G, P, CHUNK_SLOTS> {
         #[cfg(inf_canary_unsliced_drop)]
         {
             drop(self);
@@ -638,11 +658,19 @@ mod tests {
         CapCensus::new(CELL)
     }
 
-    /// A slab of `cap`, built by steps; the steps it took.
+    /// A slab of `cap` in chunks of 64, built by steps; the steps it took.
     fn built<T, G: Generation, P: GenerationPolicy>(
         cap: Cap,
         census: &Rc<CapCensus>,
     ) -> (CappedSlab<T, G, P>, u32) {
+        built_in(cap, census)
+    }
+
+    /// A slab of `cap` in chunks of `C`, built by steps; the steps it took.
+    fn built_in<T, G: Generation, P: GenerationPolicy, const C: usize>(
+        cap: Cap,
+        census: &Rc<CapCensus>,
+    ) -> (CappedSlab<T, G, P, C>, u32) {
         let mut builder = CappedSlab::builder(cap, census).expect("registered");
         let mut steps = 0;
         loop {
@@ -656,7 +684,7 @@ mod tests {
     }
 
     /// Retires a slab by steps; the steps it took.
-    fn retired<T, G: Generation, P>(mut retiring: SlabRetiring<T, G, P>) -> u32 {
+    fn retired<T, G: Generation, P, const C: usize>(mut retiring: SlabRetiring<T, G, P, C>) -> u32 {
         let mut steps = 0;
         loop {
             steps += 1;
@@ -667,8 +695,8 @@ mod tests {
         }
     }
 
-    fn publish<T, G: Generation, P: GenerationPolicy>(
-        slab: &mut CappedSlab<T, G, P>,
+    fn publish<T, G: Generation, P: GenerationPolicy, const C: usize>(
+        slab: &mut CappedSlab<T, G, P, C>,
         value: T,
     ) -> Option<SlotId<G>> {
         match slab.reserve() {
@@ -685,14 +713,36 @@ mod tests {
             .expect("a panic message")
     }
 
-    /// The level thresholds: one chunk, then each directory level's span.
+    /// The level thresholds in the store's own chunk: one chunk, then each
+    /// directory level's span, `256 × c` slots under one level; at a chunk of
+    /// one slot four levels cover every `u32` index (256⁴ = 2³²).
     #[test]
     fn directory_levels_cover_every_u32_index() {
-        assert_eq!(crate::limits::directory_levels(64), 0);
-        assert_eq!(crate::limits::directory_levels(65), 1);
-        assert_eq!(crate::limits::directory_levels(16_384), 1);
-        assert_eq!(crate::limits::directory_levels(16_385), 2);
-        assert_eq!(crate::limits::directory_levels(u64::from(u32::MAX)), 4);
+        use crate::limits::{MAP_DIRECTORY_LEVELS_MAX, directory_levels as levels};
+        for (slots, chunk, expected) in [
+            (64, 64, 0),
+            (65, 64, 1),
+            (16_384, 64, 1),
+            (16_385, 64, 2),
+            (u64::from(u32::MAX), 64, 4),
+            (16, 16, 0),
+            (17, 16, 1),
+            (4_096, 16, 1),
+            (4_097, 16, 2),
+            (5_008, 16, 2),
+            (1, 1, 0),
+            (2, 1, 1),
+            (256, 1, 1),
+            (257, 1, 2),
+            (1 << 24, 1, 3),
+            ((1 << 24) + 1, 1, 4),
+            (u64::from(u32::MAX), 1, 4),
+            (0, 0, 0),
+        ] {
+            assert_eq!(levels(slots, chunk), expected, "{slots} slots in chunks of {chunk}");
+        }
+        assert!(levels(1, 0) > MAP_DIRECTORY_LEVELS_MAX, "a chunk of no slots covers none");
+        assert_eq!(MAP_DIRECTORY_LEVELS_MAX, 4);
     }
 
     #[test]
@@ -707,9 +757,10 @@ mod tests {
 
     #[test]
     fn a_build_and_a_retirement_take_one_item_per_step() {
-        // One chunk and no directory up to 64 slots; a directory and its
-        // chunks to 16,384 (10^3: 16 chunks and one directory); two levels
-        // past that (16,385: 257 chunks, two directories and the root).
+        // At 64 slots a chunk, a slot of at most 1,024 B: one chunk and no
+        // directory up to 64 slots; a directory and its chunks to 16,384
+        // (10^3: 16 chunks and one directory); two levels past that (16,385:
+        // 257 chunks, two directories and the root).
         let (census, _mark) = census();
         for (cap, steps) in [
             (Cap::entries::<1>("s-1", CapFill::Serving), 1),
@@ -733,6 +784,112 @@ mod tests {
         let refused = CappedSlab::<[u8; 1100], u32, Retire>::builder(cap, &census);
         assert_eq!(refused.map(|_| ()).err(), Some(CapError::Layout));
         assert_eq!(census.rows().count(), 0);
+    }
+
+    /// A wide payload of `K` words, `value` in the first and the last.
+    fn words<const K: usize>(value: u64) -> [u64; K] {
+        let mut words = [0; K];
+        words[0] = value;
+        words[K - 1] = value;
+        words
+    }
+
+    /// The bytes one backing allocation holds, written here as the rule's
+    /// arithmetic reads them, not taken from the limits the code reads.
+    const ALLOCATION_BYTES: usize = 65_536;
+
+    /// A slab of `[u64; K]` payloads at a `u64` generation, in chunks of `C`,
+    /// which the rule's own arithmetic picks: its slot is the payload and
+    /// 16 B, `C` of them fit one allocation, and under 64 twice `C` do not.
+    /// It builds `cap`, `steps` items, and every slot serves and reads back.
+    fn a_wide_slab_serves_every_slot<const K: usize, const C: usize>(
+        cap: Cap,
+        steps: u32,
+        census: &Rc<CapCensus>,
+    ) {
+        let slot = mem::size_of::<Slot<[u64; K], u64>>();
+        assert_eq!(slot, 8 * K + 16, "a slot is its payload and 16 B");
+        assert_eq!(CappedSlab::<[u64; K], u64, Retire, C>::SLOT_BYTES, slot);
+        assert!(C * slot <= ALLOCATION_BYTES, "{slot} B: {C} slots pass one allocation");
+        if C < 64 {
+            assert!(2 * C * slot > ALLOCATION_BYTES, "{slot} B: twice {C} slots fit one");
+        }
+        let mut builder = match CappedSlab::<[u64; K], u64, Retire, C>::builder(cap, census) {
+            Ok(builder) => builder,
+            Err(refused) => {
+                panic!("wide-slot-refused: a {slot} B slot in chunks of {C}: {refused}")
+            }
+        };
+        let mut built = 1;
+        let mut slab = loop {
+            match builder.step() {
+                Built::More(next) => builder = next,
+                Built::Live(slab) => break slab,
+                Built::Refused(_, refused) => panic!("{slot} B: a build step refused: {refused}"),
+            }
+            built += 1;
+        };
+        assert_eq!(built, steps, "{slot} B, {cap:?}: one item a step");
+        let mut ids = Vec::new();
+        for value in 0..u64::from(cap.entries_max()) {
+            match slab.reserve() {
+                SlabReserved::Slot(free) => ids.push(free.publish(words::<K>(value))),
+                SlabReserved::Full | SlabReserved::Exhausted => {
+                    panic!("{slot} B, {cap:?}: slot {value} unreachable")
+                }
+            }
+        }
+        assert!(matches!(slab.reserve(), SlabReserved::Full), "{slot} B: past the cap");
+        for (value, id) in (0..).zip(&ids) {
+            let found = matches!(slab.get(*id), Lookup::Live(words) if words[0] == value);
+            assert!(found, "{slot} B: slot {} reads another value", id.index);
+            assert!(matches!(slab.get(*id), Lookup::Live(words) if words[K - 1] == value));
+        }
+        assert_eq!(retired(slab.retire()), steps, "{slot} B: one item a retire step");
+    }
+
+    /// A slab of `[u64; K]` payloads at a `u64` generation in chunks of `C`
+    /// is refused `Layout` and registers nothing: `C` is not the chunk its
+    /// slot takes.
+    fn a_wide_slab_at_another_chunk_is_refused<const K: usize, const C: usize>(
+        census: &Rc<CapCensus>,
+    ) {
+        let rows = census.rows().count();
+        let cap = Cap::entries::<4>("wide-refused", CapFill::Serving);
+        let refused = CappedSlab::<[u64; K], u64, Retire, C>::builder(cap, census);
+        let slot = mem::size_of::<Slot<[u64; K], u64>>();
+        assert_eq!(refused.map(|_| ()).err(), Some(CapError::Layout), "{slot} B at {C}");
+        assert_eq!(census.rows().count(), rows, "{slot} B at {C}: a row registered");
+    }
+
+    /// ADR-0194 A1: a slot of `s` bytes takes the largest power-of-two chunk,
+    /// at most 64 slots, that one 64 KiB allocation holds, and its builder
+    /// takes no other count. Each width builds at two chunks (a directory
+    /// and two chunks: three steps) and serves every slot; the 2,992 B slot
+    /// also at 5,008 slots, two levels at 16 a chunk (one level spans 4,096),
+    /// 313 chunks under two directories and the root. A slot past 64 KiB has
+    /// no chunk. Planted, every width takes 64 and a wide slot is refused.
+    #[test]
+    fn a_slot_takes_the_largest_chunk_one_allocation_holds() {
+        let (census, _mark) = census();
+        let fill = CapFill::Serving;
+        a_wide_slab_serves_every_slot::<126, 64>(Cap::entries::<128>("w-1024", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<127, 32>(Cap::entries::<64>("w-1032", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<372, 16>(Cap::entries::<32>("w-2992", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<510, 16>(Cap::entries::<32>("w-4096", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<511, 8>(Cap::entries::<16>("w-4104", fill), 3, &census);
+        a_wide_slab_serves_every_slot::<8190, 1>(Cap::entries::<2>("w-65536", fill), 3, &census);
+        let two_levels = Cap::entries::<5008>("w-2992-5008", fill);
+        a_wide_slab_serves_every_slot::<372, 16>(two_levels, 316, &census);
+        a_wide_slab_at_another_chunk_is_refused::<126, 32>(&census);
+        a_wide_slab_at_another_chunk_is_refused::<127, 64>(&census);
+        a_wide_slab_at_another_chunk_is_refused::<127, 16>(&census);
+        a_wide_slab_at_another_chunk_is_refused::<372, 32>(&census);
+        a_wide_slab_at_another_chunk_is_refused::<372, 8>(&census);
+        a_wide_slab_at_another_chunk_is_refused::<8190, 2>(&census);
+        // 65,544 B: past one allocation at a chunk of one slot.
+        a_wide_slab_at_another_chunk_is_refused::<8191, 1>(&census);
+        assert_eq!(census.unsliced_drops(), 0);
     }
 
     #[test]
@@ -917,17 +1074,53 @@ mod tests {
         handles.iter().enumerate().filter(|(_, id)| wanted(id)).nth(nth).map_or(uniform, |(i, _)| i)
     }
 
-    fn model_publish<G: Generation + ModelGeneration, P: GenerationPolicy>(
-        slab: &mut CappedSlab<u64, G, P>,
+    /// A value the model holds as its `u64`: a narrow slot's own, or a wide
+    /// slot's payload.
+    trait ModelValue: PartialEq + fmt::Debug {
+        fn of(value: u64) -> Self;
+        fn value(&self) -> u64;
+    }
+
+    impl ModelValue for u64 {
+        fn of(value: u64) -> u64 {
+            value
+        }
+
+        fn value(&self) -> u64 {
+            *self
+        }
+    }
+
+    /// A payload of `K` words carrying its value in the first and the last,
+    /// so a slot of `8 × K + 16` bytes at a `u64` generation.
+    #[derive(PartialEq, Debug)]
+    struct Wide<const K: usize>([u64; K]);
+
+    impl<const K: usize> ModelValue for Wide<K> {
+        fn of(value: u64) -> Wide<K> {
+            Wide(words(value))
+        }
+
+        fn value(&self) -> u64 {
+            assert_eq!(self.0[0], self.0[K - 1], "a payload's two words disagree");
+            self.0[0]
+        }
+    }
+
+    fn model_publish<T: ModelValue, G, P, const C: usize>(
+        slab: &mut CappedSlab<T, G, P, C>,
         model: &mut Model<G>,
         handles: &mut Vec<SlotId<G>>,
         value: u64,
-    ) {
+    ) where
+        G: Generation + ModelGeneration,
+        P: GenerationPolicy,
+    {
         let instance = slab.instance();
         match slab.reserve() {
             SlabReserved::Slot(slot) => {
                 assert!((model.live.len() as u64) < u64::from(model.capacity), "a slot to serve");
-                let id = slot.publish(value);
+                let id = slot.publish(T::of(value));
                 assert_eq!(id.instance, instance);
                 assert!((id.index as usize) < model.next.len(), "an index past the cap");
                 let next = model.next_generation(id.index).expect("a retired slot served again");
@@ -945,32 +1138,38 @@ mod tests {
         }
     }
 
-    fn model_take<G: Generation + ModelGeneration, P: GenerationPolicy + ModelPolicy>(
-        slab: &mut CappedSlab<u64, G, P>,
+    fn model_take<T: ModelValue, G, P, const C: usize>(
+        slab: &mut CappedSlab<T, G, P, C>,
         model: &mut Model<G>,
         id: SlotId<G>,
-    ) {
+    ) where
+        G: Generation + ModelGeneration,
+        P: GenerationPolicy + ModelPolicy,
+    {
         model.note(&id, Access::Take);
         match model.live.remove(&(id.index, id.generation)) {
             Some(expected) => {
-                assert_eq!(slab.take(id), Taken::Value(expected));
+                assert_eq!(slab.take(id), Taken::Value(T::of(expected)));
                 model.vacate(id.index, id.generation, P::AT_LAST);
             }
             None => assert_eq!(slab.take(id), Taken::Stale, "{id:?}: a stale take"),
         }
     }
 
-    fn model_write<G: Generation + ModelGeneration, P: GenerationPolicy>(
-        slab: &mut CappedSlab<u64, G, P>,
+    fn model_write<T: ModelValue, G, P, const C: usize>(
+        slab: &mut CappedSlab<T, G, P, C>,
         model: &mut Model<G>,
         id: SlotId<G>,
         value: u64,
-    ) {
+    ) where
+        G: Generation + ModelGeneration,
+        P: GenerationPolicy,
+    {
         model.note(&id, Access::GetMut);
         match (slab.get_mut(id), model.live.get_mut(&(id.index, id.generation))) {
             (LookupMut::Live(found), Some(expected)) => {
-                assert_eq!(*found, *expected);
-                *found = value;
+                assert_eq!(found.value(), *expected);
+                *found = T::of(value);
                 *expected = value;
             }
             (LookupMut::Stale, None) => {}
@@ -981,17 +1180,20 @@ mod tests {
     /// The test hook on `handles[at]`: a live occupant moves to the model's
     /// last generation with its handle; any other handle is `Stale` and
     /// keeps its generation.
-    fn model_place_last<G: Generation + ModelGeneration, P: GenerationPolicy>(
-        slab: &mut CappedSlab<u64, G, P>,
+    fn model_place_last<T: ModelValue, G, P, const C: usize>(
+        slab: &mut CappedSlab<T, G, P, C>,
         model: &mut Model<G>,
         handles: &mut [SlotId<G>],
         at: usize,
-    ) {
+    ) where
+        G: Generation + ModelGeneration,
+        P: GenerationPolicy,
+    {
         let before = handles[at];
         model.note(&before, Access::Hook);
         let held = model.live.remove(&(before.index, before.generation));
         match (slab.place_generation_last(&mut handles[at]), held) {
-            (LookupMut::Live(found), Some(expected)) => assert_eq!(*found, expected),
+            (LookupMut::Live(found), Some(expected)) => assert_eq!(found.value(), expected),
             (LookupMut::Stale, None) => {}
             (found, expected) => panic!("{before:?}: the hook {found:?}, model {expected:?}"),
         }
@@ -1021,8 +1223,18 @@ mod tests {
         G: Generation + ModelGeneration,
         P: GenerationPolicy + ModelPolicy,
     {
+        model_run_in::<u64, G, P, MAP_CHUNK_SLOTS_MAX>(cap, seed, ops)
+    }
+
+    /// `model_run` on a slab of `T` in chunks of `C`.
+    fn model_run_in<T, G, P, const C: usize>(cap: Cap, seed: u64, ops: u32) -> Reach
+    where
+        T: ModelValue,
+        G: Generation + ModelGeneration,
+        P: GenerationPolicy + ModelPolicy,
+    {
         let (census, _mark) = census();
-        let (mut slab, _) = built::<u64, G, P>(cap, &census);
+        let (mut slab, _) = built_in::<T, G, P, C>(cap, &census);
         let mut model = Model {
             live: BTreeMap::new(),
             next: vec![Some(G::ZERO); cap.entries_max() as usize],
@@ -1052,7 +1264,7 @@ mod tests {
             for id in &handles {
                 model.note(id, Access::Get);
                 match (model.live.get(&(id.index, id.generation)), slab.get(*id)) {
-                    (Some(expected), Lookup::Live(found)) => assert_eq!(found, expected),
+                    (Some(expected), Lookup::Live(found)) => assert_eq!(found.value(), *expected),
                     (None, Lookup::Stale) => {}
                     (expected, found) => panic!("{id:?}: get {found:?}, model {expected:?}"),
                 }
@@ -1097,6 +1309,36 @@ mod tests {
             let wraps = model_run::<u32, WrapWithProof>(cap, seed + 2, 3_000);
             add(&mut wrapped, wraps.free_at_generation);
             let wraps = model_run::<u64, WrapWithProof>(cap, seed + 3, 3_000);
+            add(&mut wrapped, wraps.free_at_generation);
+        }
+        // Get, GetMut, Take, Hook.
+        assert!(retired.iter().all(|count| *count > 0), "a retired slot unread: {retired:?}");
+        assert!(wrapped.iter().all(|count| *count > 0), "a wrapped slot unread: {wrapped:?}");
+    }
+
+    /// The model at a wide slot (ADR-0194 A1): 2,992 B at a `u64` generation,
+    /// 16 slots a chunk, across that chunk's edges and a directory over 19
+    /// chunks, under both policies, with the same engagement.
+    #[test]
+    fn a_wide_slab_equals_its_model_across_its_chunk_and_directory_edges() {
+        type Payload = Wide<372>;
+        assert_eq!(mem::size_of::<Slot<Payload, u64>>(), 2_992);
+        let (mut retired, mut wrapped) = ([0; 4], [0; 4]);
+        for (index, cap) in [
+            Cap::entries::<1>("w-1", CapFill::Serving),
+            Cap::entries::<2>("w-2", CapFill::Serving),
+            Cap::entries::<15>("w-15", CapFill::Serving),
+            Cap::entries::<16>("w-16", CapFill::Serving),
+            Cap::entries::<17>("w-17", CapFill::Serving),
+            Cap::entries::<300>("w-300", CapFill::Serving),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seed = 0x3D1D + 2 * index as u64;
+            let retires = model_run_in::<Payload, u64, Retire, 16>(cap, seed, 3_000);
+            add(&mut retired, retires.retired);
+            let wraps = model_run_in::<Payload, u64, WrapWithProof, 16>(cap, seed + 1, 3_000);
             add(&mut wrapped, wraps.free_at_generation);
         }
         // Get, GetMut, Take, Hook.

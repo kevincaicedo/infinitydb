@@ -4,7 +4,8 @@
 //! planted at each constructor call, and at each of a slab's or a map's
 //! build steps, builds nothing that is not retired by steps; a slab's and a
 //! map's build and retirement allocate and free one chunk or directory per
-//! step, across both of a map's stores. Counted here,
+//! step, across both of a map's stores. The slab's rows run at a narrow slot
+//! and at a wide one, 2,992 B in chunks of 16 (ADR-0194 A1). Counted here,
 //! from an `inf-runtime` integration test, so `inf-foundation` stays
 //! dependency-free: the counting allocator is `inf-alloc`'s. Counts are per
 //! thread (a process-wide delta captures harness noise it cannot attribute).
@@ -22,7 +23,7 @@ use inf_foundation::bounded::{
     Coalesce, Generation, GenerationPolicy, Lookup, LookupMut, Lossy, MapBuilt, MapRetired, Merge,
     Reserve, Reserved, Retire, Retiring, SlabReserved, SlotId, Taken, WrapWithProof,
 };
-use inf_foundation::limits::MAP_BACKING_ALLOCATION_BYTES_MAX;
+use inf_foundation::limits::{MAP_BACKING_ALLOCATION_BYTES_MAX, chunk_slots_for};
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator::new();
@@ -110,11 +111,68 @@ const SLAB: Cap = Cap::entries::<1024>("alloc-slab", CapFill::Serving);
 /// 1,024 slots: one directory and 16 chunks of 64.
 const SLAB_ITEMS: u64 = 17;
 
-/// A slab of `SLAB` built by steps, each step one allocation.
-fn slab<G: Generation, P: GenerationPolicy>(
+/// A wide slot's payload, 372 words: a slot of 2,992 B at a `u64`
+/// generation, the widest of the executor's task classes as first measured.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Wide([u64; 372]);
+
+/// The wide slot's chunk, the count the rule answers for its slot's bytes,
+/// picked where the slab is declared as a site that builds one picks it.
+const WIDE_CHUNK: usize = match chunk_slots_for(CappedSlab::<Wide, u64, Retire>::SLOT_BYTES) {
+    Some(slots) => slots,
+    None => panic!("no chunk holds the wide slot"),
+};
+const _: () = assert!(WIDE_CHUNK == 16, "a 2,992 B slot takes chunks of 16");
+/// 1,024 wide slots: one directory and 64 chunks of 16.
+const WIDE_ITEMS: u64 = 65;
+
+/// A slab's payload in the census, carrying one `u64`.
+trait Payload: PartialEq + std::fmt::Debug {
+    fn of(value: u64) -> Self;
+    fn value(&self) -> u64;
+    fn flip(&mut self);
+}
+
+impl Payload for u64 {
+    fn of(value: u64) -> u64 {
+        value
+    }
+
+    fn value(&self) -> u64 {
+        *self
+    }
+
+    fn flip(&mut self) {
+        *self ^= 1;
+    }
+}
+
+impl Payload for Wide {
+    fn of(value: u64) -> Wide {
+        let mut words = [0; 372];
+        words[0] = value;
+        words[371] = value;
+        Wide(words)
+    }
+
+    fn value(&self) -> u64 {
+        assert_eq!(self.0[0], self.0[371], "the payload's two words disagree");
+        self.0[0]
+    }
+
+    fn flip(&mut self) {
+        self.0[0] ^= 1;
+        self.0[371] ^= 1;
+    }
+}
+
+/// A slab of `SLAB` in chunks of `C` built by steps, each step one
+/// allocation, `items` steps in all.
+fn slab<T, G: Generation, P: GenerationPolicy, const C: usize>(
     census: &std::rc::Rc<CapCensus>,
-) -> CappedSlab<u64, G, P> {
-    let mut builder = CappedSlab::<u64, G, P>::builder(SLAB, census).expect("registered");
+    items: u64,
+) -> CappedSlab<T, G, P, C> {
+    let mut builder = CappedSlab::<T, G, P, C>::builder(SLAB, census).expect("registered");
     let mut steps = 0;
     loop {
         let before = ALLOC.thread_allocations();
@@ -124,7 +182,7 @@ fn slab<G: Generation, P: GenerationPolicy>(
         match step {
             Built::More(next) => builder = next,
             Built::Live(slab) => {
-                assert_eq!(steps, SLAB_ITEMS);
+                assert_eq!(steps, items);
                 return slab;
             }
             Built::Refused(_, refused) => panic!("{refused}"),
@@ -134,31 +192,31 @@ fn slab<G: Generation, P: GenerationPolicy>(
 
 /// Reserve, publish, read, write and take across 100,000 ops, reaching
 /// `Full` on every pass: no allocator call once the slab is live.
-fn churn<G: Generation, P: GenerationPolicy>() {
+fn churn<T: Payload, G: Generation, P: GenerationPolicy, const C: usize>(items: u64) {
     let (census, _serve_mark) = CapCensus::new(CellId(2));
-    let mut slab = slab::<G, P>(&census);
+    let mut slab = slab::<T, G, P, C>(&census, items);
     let mut held: VecDeque<SlotId<G>> = VecDeque::with_capacity(2048);
     let before = ALLOC.thread_allocations();
     let mut accumulator = 0u64;
     for i in 0..CHURN {
         match slab.reserve() {
-            SlabReserved::Slot(slot) => held.push_back(slot.publish(i)),
+            SlabReserved::Slot(slot) => held.push_back(slot.publish(T::of(i))),
             SlabReserved::Full => {}
             SlabReserved::Exhausted => panic!("no slot retires in this churn"),
         }
         if let Some(&id) = held.back() {
             if let LookupMut::Live(value) = slab.get_mut(id) {
-                *value ^= 1;
+                value.flip();
             }
             if let Lookup::Live(value) = slab.get(id) {
-                accumulator ^= *value;
+                accumulator ^= value.value();
             }
         }
         if i % 3 == 0
             && let Some(id) = held.pop_front()
         {
             if let Taken::Value(value) = slab.take(id) {
-                accumulator ^= value;
+                accumulator ^= value.value();
             }
             assert_eq!(slab.take(id), Taken::Stale, "a taken handle is stale");
         }
@@ -172,14 +230,29 @@ fn churn<G: Generation, P: GenerationPolicy>() {
 
 #[test]
 fn no_slab_allocator_call_after_live_across_churn_under_either_policy() {
-    churn::<u32, Retire>();
-    churn::<u64, WrapWithProof>();
+    churn::<u64, u32, Retire, 64>(SLAB_ITEMS);
+    churn::<u64, u64, WrapWithProof, 64>(SLAB_ITEMS);
+}
+
+#[test]
+fn no_wide_slab_allocator_call_after_live_across_churn_under_either_policy() {
+    churn::<Wide, u64, Retire, WIDE_CHUNK>(WIDE_ITEMS);
+    churn::<Wide, u64, WrapWithProof, WIDE_CHUNK>(WIDE_ITEMS);
 }
 
 #[test]
 fn a_slab_retires_one_backing_allocation_per_step() {
-    let (census, _serve_mark) = CapCensus::new(CellId(3));
-    let mut retiring = slab::<u32, Retire>(&census).retire();
+    retires_one_backing_allocation_per_step::<u64, 64>(CellId(3), SLAB_ITEMS);
+}
+
+#[test]
+fn a_wide_slab_retires_one_backing_allocation_per_step() {
+    retires_one_backing_allocation_per_step::<Wide, WIDE_CHUNK>(CellId(8), WIDE_ITEMS);
+}
+
+fn retires_one_backing_allocation_per_step<T, const C: usize>(cell: CellId, items: u64) {
+    let (census, _serve_mark) = CapCensus::new(cell);
+    let mut retiring = slab::<T, u32, Retire, C>(&census, items).retire();
     let mut steps = 0;
     loop {
         let before = ALLOC.thread_freed_bytes();
@@ -196,7 +269,7 @@ fn a_slab_retires_one_backing_allocation_per_step() {
             Retiring::Done => break,
         }
     }
-    assert_eq!(steps, SLAB_ITEMS);
+    assert_eq!(steps, items);
     assert_eq!(census.unsliced_drops(), 0);
 }
 
@@ -204,9 +277,18 @@ fn a_slab_retires_one_backing_allocation_per_step() {
 /// and the prefix built before it retires by steps, one per item it holds.
 #[test]
 fn a_refused_slab_build_step_retires_its_prefix_by_steps() {
-    let (census, _serve_mark) = CapCensus::new(CellId(4));
-    for refused_at in 0..SLAB_ITEMS {
-        let mut builder = CappedSlab::<u64, u32, Retire>::builder(SLAB, &census).expect("row");
+    refused_build_steps_retire_their_prefix::<u64, 64>(CellId(4), SLAB_ITEMS);
+}
+
+#[test]
+fn a_refused_wide_slab_build_step_retires_its_prefix_by_steps() {
+    refused_build_steps_retire_their_prefix::<Wide, WIDE_CHUNK>(CellId(9), WIDE_ITEMS);
+}
+
+fn refused_build_steps_retire_their_prefix<T, const C: usize>(cell: CellId, items: u64) {
+    let (census, _serve_mark) = CapCensus::new(cell);
+    for refused_at in 0..items {
+        let mut builder = CappedSlab::<T, u32, Retire, C>::builder(SLAB, &census).expect("row");
         for _ in 0..refused_at {
             builder = match builder.step() {
                 Built::More(next) => next,

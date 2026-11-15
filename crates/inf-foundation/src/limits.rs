@@ -99,12 +99,44 @@ const _: () = assert!(
     "a slot index fits SlotId's u32 index below the free chain's end"
 );
 
-/// Slots per chunk of a slab's or a map's storage (ADR-0151 D5): one chunk
-/// is one allocation, built or retired in one step. Owner: the storage.
-/// Crossing: the next slots take the next chunk, built by a later step; a
-/// chunk whose slots times their stride passes
-/// `MAP_BACKING_ALLOCATION_BYTES_MAX` is `CapError::Layout`.
+/// The most slots one chunk of a slab's or a map's storage holds (ADR-0151
+/// D5): one chunk is one allocation, built or retired in one step, and a
+/// store's chunk holds the count `chunk_slots_for` answers for its slot's
+/// bytes, this many for a slot of at most 1,024 B (ADR-0194 A1). Owner: the storage. Crossing: the
+/// next slots take the next chunk, built by a later step; a slot no chunk
+/// holds is `CapError::Layout`.
 pub const MAP_CHUNK_SLOTS_MAX: usize = 64;
+
+/// The slots one chunk of a capped store holds for a slot of `slot_bytes`
+/// bytes (ADR-0194 A1): the most, a power of two up to
+/// `MAP_CHUNK_SLOTS_MAX`, whose bytes fit one backing allocation,
+/// `min(64, 2^⌊log₂(65,536 ÷ slot_bytes)⌋)`: 64 up to 1,024 B a slot, 32 up
+/// to 2,048, halving per doubling, 1 up to 65,536. Owner: the slab's and the
+/// map's storage, whose builder takes a chunk of exactly this count. Crossing:
+/// `None` past `MAP_BACKING_ALLOCATION_BYTES_MAX` bytes a slot; that slot, and
+/// a store built at any other count, is `CapError::Layout` at construction,
+/// before anything is registered. One canary answers 64 at every width.
+#[must_use]
+pub const fn chunk_slots_for(slot_bytes: usize) -> Option<usize> {
+    #[cfg(inf_canary_chunk_slots_fixed)]
+    {
+        let _ = slot_bytes;
+        Some(MAP_CHUNK_SLOTS_MAX)
+    }
+    #[cfg(not(inf_canary_chunk_slots_fixed))]
+    {
+        let mut slots = MAP_CHUNK_SLOTS_MAX;
+        while slots > 0 {
+            if let Some(bytes) = slots.checked_mul(slot_bytes)
+                && bytes <= MAP_BACKING_ALLOCATION_BYTES_MAX
+            {
+                return Some(slots);
+            }
+            slots /= 2;
+        }
+        None
+    }
+}
 
 /// Children per directory of a slab's or a map's storage (ADR-0151 D5).
 /// Owner: the storage. Crossing: the next children take a sibling
@@ -112,28 +144,37 @@ pub const MAP_CHUNK_SLOTS_MAX: usize = 64;
 pub const MAP_DIRECTORY_CHILDREN_MAX: usize = 256;
 
 // A slot index splits into a chunk offset and one child per directory level
-// by shifts and masks, which is exact only for powers of two.
+// by shifts and masks, which is exact only for powers of two; every chunk
+// `chunk_slots_for` answers halves down from `MAP_CHUNK_SLOTS_MAX`, so it is
+// one too.
 const _: () = assert!(MAP_CHUNK_SLOTS_MAX.is_power_of_two(), "a chunk's slots are a power of two");
 const _: () = assert!(
     MAP_DIRECTORY_CHILDREN_MAX.is_power_of_two(),
     "a directory's children are a power of two"
 );
 
-/// Directory levels above a store's chunks (ADR-0151 D5), derived from the
-/// slot range and the chunk and fan-out constants: the fewest levels whose
-/// chunks cover `MAP_SLOT_COUNT_MAX`, 4 (64 × 256⁴ slots). A store of
-/// `n` slots takes `directory_levels(n)`; a slot access follows that many
-/// links, one up to 16,384 slots. Owner: the storage. Crossing: a store
-/// needing more levels than its root can hold is `CapError::Layout`, which
-/// this derivation and a const assertion beside the store's root (four
-/// directory levels) make unreachable for any `u32` cap.
-pub const MAP_DIRECTORY_LEVELS_MAX: u32 = directory_levels(MAP_SLOT_COUNT_MAX);
+/// Directory levels above a store's chunks (ADR-0151 D5, ADR-0194 A1),
+/// derived from the slot range and the fan-out at the smallest chunk any
+/// slot takes, one slot: the fewest levels whose chunks cover
+/// `MAP_SLOT_COUNT_MAX`, 4 (256⁴ = 2³² slots). A store of `n` slots in
+/// chunks of `c` takes `directory_levels(n, c)`, never more at a larger
+/// chunk; a slot access follows that many links, one up to `256 × c` slots.
+/// Owner: the storage. Crossing: a store needing more levels than its root
+/// can hold is `CapError::Layout`, which this derivation and a const
+/// assertion beside the store's root (four directory levels) make
+/// unreachable for any `u32` cap at any chunk.
+pub const MAP_DIRECTORY_LEVELS_MAX: u32 = directory_levels(MAP_SLOT_COUNT_MAX, 1);
 
-/// The directory levels a store of `slots` slots needs: the fewest whose
-/// chunks cover it (0 for one chunk, at most 64 slots).
+/// The directory levels a store of `slots` slots in chunks of `chunk_slots`
+/// needs: the fewest whose chunks cover it (0 for one chunk, at most
+/// `chunk_slots` slots). A chunk of no slots covers none at any depth, so a
+/// store of slots in it needs more levels than any root holds.
 #[must_use]
-pub const fn directory_levels(slots: u64) -> u32 {
-    let mut covered = MAP_CHUNK_SLOTS_MAX as u64;
+pub const fn directory_levels(slots: u64, chunk_slots: usize) -> u32 {
+    if chunk_slots == 0 {
+        return if slots == 0 { 0 } else { u32::MAX };
+    }
+    let mut covered = chunk_slots as u64;
     let mut levels = 0;
     while covered < slots {
         covered = covered.saturating_mul(MAP_DIRECTORY_CHILDREN_MAX as u64);
