@@ -247,6 +247,8 @@ const LINKED_SYNC: u32 = 2;
 const PLAIN: u32 = 3;
 const THROUGH: u32 = 4;
 const SYNC: u32 = 5;
+const SEGMENT_SYNC: u32 = 6;
+const DIR_SYNC: u32 = 7;
 
 /// The step of the grid a stall run reads its completions on.
 const GRID: Nanos = Nanos(1_000);
@@ -363,6 +365,78 @@ fn standalone_alone_is_held(disk: &SimDisk, fd: i32) {
     assert_eq!(posted, vec![(SYNC, Posted::Synced)], "held-order: the sync at its lift");
 }
 
+/// The ops two entries leave held post at the lift in submission order
+/// across the entries, the earlier entry's first, and ahead of the lifting
+/// entry's own op.
+fn held_entries_release_in_order(disk: &SimDisk, fd: i32) {
+    let (mut driver, mut pool) = driver_on(disk);
+    disk.hold_barriers(Some(is_segment));
+    let [linked, through, sync] = barriers(fd);
+    let posted = entry(&mut driver, &mut pool, vec![linked]);
+    assert!(posted.is_empty(), "held-entry-order: the first entry's op posted {posted:?}");
+    let posted = entry(&mut driver, &mut pool, vec![through, sync]);
+    assert!(posted.is_empty(), "held-entry-order: the second entry's ops posted {posted:?}");
+    disk.hold_barriers(None);
+    let posted = entry(&mut driver, &mut pool, vec![write(fd, 512, PLAIN, WriteBarrier::None)]);
+    let order = vec![
+        (LINKED, Posted::Written),
+        (LINKED_SYNC, Posted::Synced),
+        (THROUGH, Posted::Written),
+        (SYNC, Posted::Synced),
+        (PLAIN, Posted::Written),
+    ];
+    assert_eq!(posted, order, "held-entry-order: the lift posts each entry's held ops in turn");
+}
+
+/// Re-arming a narrower hold, `hold_syncs` over `hold_barriers`, releases
+/// the held writes at the next entry: each held op is read by its own kind
+/// against the hold armed now, so the standalone sync alone stays held.
+fn a_narrowed_rearm_releases_the_held_writes(disk: &SimDisk, fd: i32) {
+    let (mut driver, mut pool) = driver_on(disk);
+    disk.hold_barriers(Some(is_segment));
+    let posted = entry(&mut driver, &mut pool, four(fd));
+    assert_eq!(posted, vec![(PLAIN, Posted::Written)], "narrowed-rearm: the broad hold's premise");
+    disk.hold_syncs(Some(is_segment));
+    let posted = entry(&mut driver, &mut pool, Vec::new());
+    let writes =
+        vec![(LINKED, Posted::Written), (LINKED_SYNC, Posted::Synced), (THROUGH, Posted::Written)];
+    assert_eq!(posted, writes, "narrowed-rearm-held: a sync hold kept a held write");
+    let kinds = HeldBarriers { standalone: 1, ..HeldBarriers::default() };
+    assert_eq!(driver.held_barriers(), kinds, "narrowed-rearm-held: the sync alone held");
+    disk.hold_syncs(None);
+    let posted = entry(&mut driver, &mut pool, Vec::new());
+    assert_eq!(posted, vec![(SYNC, Posted::Synced)], "narrowed-rearm-held: the sync at its lift");
+}
+
+/// A hold keeps the barriers on the files its predicate names alone: every
+/// barrier on a file it does not name, or on a directory, posts at once,
+/// while a sync on the named segment in the same entry is held.
+fn a_barrier_on_an_unnamed_fd_passes(disk: &SimDisk, fd: i32, dir_fd: i32) {
+    let manifest = disk.create_segment(&Path::new(DIR).join("MANIFEST-000001"), 4096);
+    let manifest = manifest.expect("create");
+    let manifest_fd = manifest.raw_fd().expect("sim fd");
+    let (mut driver, mut pool) = driver_on(disk);
+    disk.hold_barriers(Some(is_segment));
+    let mut ops = Vec::from(barriers(manifest_fd));
+    ops.push(IoOp::Fdatasync { fd: dir_fd, token: token(TokenClass::Fsync, DIR_SYNC) });
+    ops.push(IoOp::Fdatasync { fd, token: token(TokenClass::Fsync, SEGMENT_SYNC) });
+    let posted = entry(&mut driver, &mut pool, ops);
+    let passed = vec![
+        (LINKED, Posted::Written),
+        (LINKED_SYNC, Posted::Synced),
+        (THROUGH, Posted::Written),
+        (SYNC, Posted::Synced),
+        (DIR_SYNC, Posted::Synced),
+    ];
+    assert_eq!(posted, passed, "unnamed-barrier-held: a hold kept a barrier it does not name");
+    let kinds = HeldBarriers { standalone: 1, ..HeldBarriers::default() };
+    assert_eq!(driver.held_barriers(), kinds, "unnamed-barrier-held: the segment's sync held");
+    disk.hold_barriers(None);
+    let posted = entry(&mut driver, &mut pool, Vec::new());
+    let lifted = vec![(SEGMENT_SYNC, Posted::Synced)];
+    assert_eq!(posted, lifted, "unnamed-barrier-held: the segment's sync at its lift");
+}
+
 /// Every completion a stall run posts from the entry carrying `ops` on: the
 /// instant of the reap that posted it and its token's slot. The clock steps
 /// on the grid a reap at a time, so a completion reads at the first grid
@@ -450,13 +524,18 @@ fn a_closed_hold_answers_at_once() {
 }
 
 /// The device contract of a hold, read from the completions the driver
-/// posts: each scope keeps its barriers whole, observed and drawn only at
-/// the lift, in submission order; a plain write always passes.
+/// posts: each scope keeps its barriers whole, on the files it names,
+/// observed and drawn only at the lift, in submission order across
+/// entries; a narrower re-arm releases what it no longer holds; a plain
+/// write always passes.
 #[test]
 fn a_barrier_hold_keeps_every_barrier_until_it_lifts() {
-    let (disk, _handles, fd, _dir_fd) = disk_with_segment();
+    let (disk, _handles, fd, dir_fd) = disk_with_segment();
     every_barrier_is_held(&disk, fd);
     standalone_alone_is_held(&disk, fd);
+    held_entries_release_in_order(&disk, fd);
+    a_narrowed_rearm_releases_the_held_writes(&disk, fd);
+    a_barrier_on_an_unnamed_fd_passes(&disk, fd, dir_fd);
     a_held_op_draws_at_its_lift();
     a_closed_hold_answers_at_once();
 }
