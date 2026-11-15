@@ -28,9 +28,11 @@ use inf_server::{NodeInfo, NoopObserver, ServerPlane, StdSegmentFs};
 use inf_store::{KeyspaceSeed, NsSpec, SlotRouter, StoreConfig};
 
 use super::{FROZEN_MESH, STEP_NS_FLOOR, namespace_specs, node_hasher};
+use crate::census::{CellFacts, CensusVerdict};
 use crate::driver::Violations;
 use crate::net::{CellNet, Plant, SimDriver, drain_violations, listener_fd};
 use crate::resp::reply_len;
+use crate::state::StateHash;
 
 /// The legs, each one row of `scripts/sim-smoke.sh` or one pinned red.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -477,17 +479,37 @@ impl Rig {
         self.plane(cell).connections()
     }
 
-    /// The leg's report.
-    fn report(self, leg: CloseLeg) -> CapacityReport {
-        let mut state = Vec::new();
+    /// The leg's report: every cell's cap census judged after its last
+    /// iteration (the cap bound, the assembly rule and their liveness), and
+    /// the state hash over the readings and every cell's keyspace.
+    fn report(mut self, leg: CloseLeg) -> CapacityReport {
+        let mut census = CensusVerdict::default();
+        for (index, (_, plane)) in self.cells.iter().enumerate() {
+            let facts = CellFacts {
+                server_plane: true,
+                tiered_tables: plane.keyspace().tiered_tables(),
+                turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
+            };
+            census.judge(index, plane.cap_census(), facts);
+        }
+        self.read("cap_rows_checked", census.rows_checked);
+        self.read("cap_rows_crossed", census.rows_crossed);
+        self.violations.extend(census.violations);
+        let now = self.clock_now();
+        let mut state = StateHash::default();
         for (name, value) in &self.readings {
-            state.extend_from_slice(name.as_bytes());
-            state.extend_from_slice(&value.to_le_bytes());
+            state.number(name.as_bytes(), *value);
+        }
+        state.number(b"finish", now.0);
+        state.number(b"steps", self.steps);
+        for (index, (_, plane)) in self.cells.iter().enumerate() {
+            state.number(b"cell", index as u64);
+            state.keyspace(&plane.keyspace(), now);
         }
         CapacityReport {
             leg,
             trace_hash: hash64(&self.trace, self.seed),
-            state_hash: hash64(&state, self.seed),
+            state_hash: state.value(),
             violations: self.violations,
             scheduler_steps: self.steps,
             readings: self.readings,
