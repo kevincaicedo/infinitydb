@@ -131,8 +131,9 @@ impl Cap {
 pub enum CapError {
     /// The allocator refused the backing.
     Alloc,
-    /// `entries × stride` passes the backing's byte bound, or the shape is
-    /// not representable on this host.
+    /// `entries × stride` passes the backing's byte bound, a slab's chunk is
+    /// not the count its slot's bytes take (`chunk_slots_for`), or the shape
+    /// is not representable on this host.
     Layout,
     /// The census refused the row: a name registered with a second cap value
     /// or a second fill, an `Assembly` name registered twice, a name past

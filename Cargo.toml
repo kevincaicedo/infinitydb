@@ -79,6 +79,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_barrier_hold_standalone_only)',
     'cfg(inf_canary_cap_admits_at_cap)',
     'cfg(inf_canary_cap_minus_one)',
+    'cfg(inf_canary_chunk_slots_fixed)',
     'cfg(inf_canary_ckpt_form_unlatched)',
     'cfg(inf_canary_ckpt_image_listed)',
     'cfg(inf_canary_ckpt_own_loaded_at_cursor)',

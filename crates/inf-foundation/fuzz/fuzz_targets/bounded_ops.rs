@@ -6,7 +6,8 @@
 //! and `get_mut` edits at a place or the back); the census row's
 //! `high_water` and `crossings` equal the models' at the end; `len` never
 //! passes the cap; a layout past 64 KiB is refused. Slabs: a slab of either
-//! generation policy beside a `BTreeMap<(index, generation), value>`, with
+//! generation policy, its slot narrow or 2,992 B wide in chunks of 16
+//! (ADR-0194 A1), beside a `BTreeMap<(index, generation), value>`, with
 //! reserves, publishes, dropped reservations, reads, writes and takes of
 //! live and stale handles; every handle read back against the model after
 //! every op, and the row's high water, crossings and capacity equal the
@@ -39,6 +40,7 @@ use inf_foundation::bounded::{
     MapRetired, Merge, Reserve, Reserved, Retire, Retiring, SlabReserved, SlotId, Taken,
     WrapWithProof,
 };
+use inf_foundation::limits::{MAP_CHUNK_SLOTS_MAX, chunk_slots_for};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -101,10 +103,15 @@ impl<T> Model<T> {
 
 fuzz_target!(|data: &[u8]| {
     let Some((&head, ops)) = data.split_first() else { return };
+    // The head's low three bits pick a cap, the next three the family, and
+    // its seventh a slab's wide slot.
+    let wide = head & 0x40 != 0;
     match (head >> 3) & 7 {
         0 | 1 => deques(head, ops),
-        2 => slab::<u32, Retire>(head, ops),
-        3 => slab::<u64, WrapWithProof>(head, ops),
+        2 if wide => slab::<Wide, u64, Retire, WIDE_CHUNK>(head, ops),
+        2 => slab::<u16, u32, Retire, MAP_CHUNK_SLOTS_MAX>(head, ops),
+        3 if wide => slab::<Wide, u64, WrapWithProof, WIDE_CHUNK>(head, ops),
+        3 => slab::<u16, u64, WrapWithProof, MAP_CHUNK_SLOTS_MAX>(head, ops),
         4 | 5 => map::<u64>(head, ops),
         _ => map::<(u64, u64)>(head, ops),
     }
@@ -236,8 +243,9 @@ fn deques(head: u8, ops: &[u8]) {
     assert_eq!(marks.high_water(), marks_model.high_water);
 }
 
-// A chunk holds 64 slots and a directory 256 chunks: one chunk, a chunk
-// edge, and a directory over three chunks.
+// A narrow slot's chunk holds 64 slots and a wide one's 16, and a directory
+// 256 chunks: one chunk, a chunk edge at 64 for either, and a directory over
+// three chunks or nine.
 // Ops a slab run reads: every op reads back every handle minted, so the run
 // is quadratic in this bound.
 const SLAB_OPS_MAX: usize = 512;
@@ -252,12 +260,55 @@ const SLAB_CAPS: [Cap; 8] = [
     Cap::entries::<130>("fuzz-slab", CapFill::Serving),
 ];
 
+/// A slab's value as the model holds it: a narrow slot's `u16`, or a wide
+/// slot's payload carrying it in its first and last words.
+trait SlabValue: PartialEq + Debug {
+    fn of(value: u16) -> Self;
+    fn value(&self) -> u16;
+}
+
+impl SlabValue for u16 {
+    fn of(value: u16) -> u16 {
+        value
+    }
+
+    fn value(&self) -> u16 {
+        *self
+    }
+}
+
+/// 372 words: a slot of 2,992 B at a `u64` generation.
+#[derive(PartialEq, Debug)]
+struct Wide([u64; 372]);
+
+impl SlabValue for Wide {
+    fn of(value: u16) -> Wide {
+        let mut words = [0; 372];
+        words[0] = u64::from(value);
+        words[371] = u64::from(value);
+        Wide(words)
+    }
+
+    fn value(&self) -> u16 {
+        assert_eq!(self.0[0], self.0[371], "a payload's two words disagree");
+        u16::try_from(self.0[0]).expect("a model value is a u16")
+    }
+}
+
+/// The wide slot's chunk, the count the rule answers for its slot's bytes,
+/// picked where the slab is declared, as a site that builds one picks it.
+const WIDE_CHUNK: usize = match chunk_slots_for(CappedSlab::<Wide, u64, Retire>::SLOT_BYTES) {
+    Some(slots) => slots,
+    None => panic!("no chunk holds the wide slot"),
+};
+const _: () = assert!(WIDE_CHUNK == 16, "a 2,992 B slot takes chunks of 16");
+
 /// Builds a slab by steps: the steps it took.
-fn built<G: Generation, P: GenerationPolicy>(
+fn built<T, G: Generation, P: GenerationPolicy, const C: usize>(
     cap: Cap,
     census: &Rc<CapCensus>,
-) -> (CappedSlab<u16, G, P>, u32) {
-    let mut builder = CappedSlab::<u16, G, P>::builder(cap, census).expect("fits");
+) -> (CappedSlab<T, G, P, C>, u32) {
+    let mut builder = CappedSlab::<T, G, P, C>::builder(cap, census).expect("fits");
     let mut steps = 0;
     loop {
         steps += 1;
@@ -294,10 +345,15 @@ impl ModelGeneration for u64 {
     }
 }
 
-fn slab<G: Generation + ModelGeneration, P: GenerationPolicy>(head: u8, ops: &[u8]) {
+fn slab<T, G, P, const C: usize>(head: u8, ops: &[u8])
+where
+    T: SlabValue,
+    G: Generation + ModelGeneration,
+    P: GenerationPolicy,
+{
     let cap = SLAB_CAPS[usize::from(head & 7)];
     let (census, _serve_mark) = CapCensus::new(CellId(u16::from(head)));
-    let (mut slab, build_steps) = built::<G, P>(cap, &census);
+    let (mut slab, build_steps) = built::<T, G, P, C>(cap, &census);
     let mut model: BTreeMap<(u32, G), u16> = BTreeMap::new();
     // The generation each index's next occupant takes (absent: never used,
     // the first).
@@ -314,7 +370,7 @@ fn slab<G: Generation + ModelGeneration, P: GenerationPolicy>(head: u8, ops: &[u
             0 | 1 => match slab.reserve() {
                 SlabReserved::Slot(slot) => {
                     assert!((model.len() as u32) < capacity, "a slot past the capacity");
-                    let id = slot.publish(value);
+                    let id = slot.publish(T::of(value));
                     let (index, generation) = (id.index(), id.generation());
                     assert!(index < cap.entries_max(), "an index past the cap");
                     let expected = next.get(&index).copied().unwrap_or(G::ZERO);
@@ -342,14 +398,14 @@ fn slab<G: Generation + ModelGeneration, P: GenerationPolicy>(head: u8, ops: &[u
                     assert_eq!(slab.take(id), Taken::Stale, "a stale handle");
                     continue;
                 };
-                assert_eq!(slab.take(id), Taken::Value(expected));
+                assert_eq!(slab.take(id), Taken::Value(T::of(expected)));
                 next.insert(index, generation.successor());
             }
             6 if !handles.is_empty() => {
                 let id = handles[pick % handles.len()];
                 match (slab.get_mut(id), model.get_mut(&(id.index(), id.generation()))) {
                     (LookupMut::Live(found), Some(expected)) => {
-                        *found = value;
+                        *found = T::of(value);
                         *expected = value;
                     }
                     (LookupMut::Stale, None) => {}
@@ -364,7 +420,7 @@ fn slab<G: Generation + ModelGeneration, P: GenerationPolicy>(head: u8, ops: &[u
         assert_eq!(slab.capacity_now(), capacity);
         for id in &handles {
             match (slab.get(*id), model.get(&(id.index(), id.generation()))) {
-                (Lookup::Live(found), Some(expected)) => assert_eq!(found, expected),
+                (Lookup::Live(found), Some(expected)) => assert_eq!(found.value(), *expected),
                 (Lookup::Stale, None) => {}
                 (Lookup::Live(_) | Lookup::Stale | Lookup::Vacant, _) => {
                     panic!("get disagrees with the model")

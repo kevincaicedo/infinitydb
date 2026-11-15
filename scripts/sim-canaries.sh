@@ -1078,6 +1078,10 @@ ordered_rows=(
   # linked sync and a write-through write, each whole until the hold lifts. Planted,
   # hold_barriers keeps standalone syncs alone, and the frame barriers complete while held.
   "inf_canary_barrier_hold_standalone_only crate-test inf-sim test:disk a_barrier_hold_keeps_every_barrier_until_it_lifts barrier-completed-while-held"
+  # A slot takes the largest power-of-two chunk one 64 KiB allocation holds, at most 64 slots,
+  # and the builder takes no other count (ADR-0194 A1). Planted, chunk_slots_for answers 64 at
+  # every width, the fixed chunk, and a slab of 1,032 B slots in chunks of 32 is refused.
+  "inf_canary_chunk_slots_fixed crate-test inf-foundation lib a_slot_takes_the_largest_chunk_one_allocation_holds wide-slot-refused"
   # A close ends the receive: the io_uring driver queues the fd's cancels before the close and
   # posts Closed after them, so no Recv with bytes follows Closed. Planted, Close posts Closed
   # as it queues the close, ahead of the reap that brings the bytes. One row a shape: the

@@ -268,14 +268,18 @@ enum Link<'a> {
 
 impl<K: ExactKey, V> CappedMap<K, V> {
     /// A map of `cap` on `census`, to build by steps: both stores' layouts
-    /// are checked (a chunk or a directory past one backing allocation is
-    /// `Layout`, and no row is registered), then the map's one row is
+    /// are checked (a chunk or a directory past one backing allocation, or a
+    /// build of more items than a `u32` counts, is `Layout`, and no row is
+    /// registered), then the map's one row is
     /// registered, then the leaf store of `N` slots and the branch store of
     /// `N − 1` are constructed, each minting its instance (`Census` past the
     /// census's mints; the row stays). Nothing is allocated until the first
     /// step.
     pub fn builder(cap: Cap, census: &Rc<CapCensus>) -> Result<MapBuilder<K, V>, CapError> {
-        if !SlotStore::<Leaf<K, V>, ()>::layout_fits() || !SlotStore::<Branch, ()>::layout_fits() {
+        let entries = cap.entries_max();
+        if !SlotStore::<Leaf<K, V>, ()>::layout_fits(entries)
+            || !SlotStore::<Branch, ()>::layout_fits(branches_for(entries))
+        {
             return Err(CapError::Layout);
         }
         let row = census.register(cap)?;
@@ -809,7 +813,9 @@ mod tests {
 
     use super::*;
     use crate::bounded::{CapRow, CensusPhase, ServeMark};
-    use crate::limits::{CAP_CENSUS_SLABS_MAX, MAP_KEY_BITS_MAX, directory_levels};
+    use crate::limits::{
+        CAP_CENSUS_SLABS_MAX, MAP_CHUNK_SLOTS_MAX, MAP_KEY_BITS_MAX, directory_levels,
+    };
     use crate::rng::{Entropy, SplitMix64};
 
     const CELL: CellId = CellId(9);
@@ -1078,8 +1084,9 @@ mod tests {
     fn the_map_equals_its_model_at_two_directory_levels() {
         let cap = Cap::entries::<16_386>("m-16386", CapFill::Serving);
         let entries = u64::from(cap.entries_max());
-        assert_eq!(directory_levels(entries), 2, "the leaf store's levels");
-        assert_eq!(directory_levels(entries - 1), 2, "the branch store's levels");
+        // A map's two stores hold chunks of 64 slots.
+        assert_eq!(directory_levels(entries, MAP_CHUNK_SLOTS_MAX), 2, "the leaf store's levels");
+        assert_eq!(directory_levels(entries - 1, MAP_CHUNK_SLOTS_MAX), 2, "the branch store's");
         let keys = pool_u64(0x3B0, 2 * cap.entries_max() as usize + 3);
         let reach = model_run(cap, &keys, 0x3B0, 60_000, 4_096);
         assert!(reach.full > 0, "{cap:?} never reached its cap: {reach:?}");

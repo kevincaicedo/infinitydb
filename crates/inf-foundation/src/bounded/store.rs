@@ -1,12 +1,14 @@
-//! The storage of a capped slab and of a capped map's two stores (ADR-0171
-//! D3, ADR-0151 D5): slots in fixed chunks of `MAP_CHUNK_SLOTS_MAX`, behind
+//! The storage of a capped slab and of a capped map's two stores (ADR-0194
+//! D3 with A1, ADR-0151 D5): slots in chunks of `CHUNK_SLOTS`, the count
+//! `chunk_slots_for` answers for the slot's bytes (64 up to 1,024 B), behind
 //! at most `MAP_DIRECTORY_LEVELS_MAX` levels of directories of
-//! `MAP_DIRECTORY_CHILDREN_MAX` children, each chunk and each directory one
-//! allocation of at most `MAP_BACKING_ALLOCATION_BYTES_MAX` bytes. A store
-//! is built one item per step, a directory before its children, and retired
-//! one item per step, children before their directory, so neither a build
-//! nor a retirement is one large allocation or free. The free chain is
-//! intrusive in the slots, so nothing is allocated once the store is built.
+//! `MAP_DIRECTORY_CHILDREN_MAX` children, the depth derived from the store's
+//! own chunk, each chunk and each directory one allocation of at most
+//! `MAP_BACKING_ALLOCATION_BYTES_MAX` bytes. A store is built one item per
+//! step, a directory before its children, and retired one item per step,
+//! children before their directory, so neither a build nor a retirement is
+//! one large allocation or free. The free chain is intrusive in the slots,
+//! so nothing is allocated once the store is built.
 //!
 //! The store knows indices only: no census row, no fill and no handle. The
 //! slab's public layer compares a handle's instance and generation before
@@ -31,18 +33,30 @@ use super::census::{CapCensus, SlabInstance};
 use super::slab::Generation;
 use crate::limits::{
     MAP_BACKING_ALLOCATION_BYTES_MAX, MAP_CHUNK_SLOTS_MAX, MAP_DIRECTORY_CHILDREN_MAX,
-    MAP_DIRECTORY_LEVELS_MAX, directory_levels,
+    MAP_DIRECTORY_LEVELS_MAX, chunk_slots_for, directory_levels,
 };
 
-/// log2 of the slots of one chunk, and of the children of one directory:
-/// both counts are powers of two (const assertions in `limits` hold that),
-/// so a slot index splits into a directory path and a chunk offset by shifts
-/// and masks.
-const CHUNK_SLOTS_LOG2: u32 = MAP_CHUNK_SLOTS_MAX.trailing_zeros();
+/// log2 of the children of one directory, a power of two (a const assertion
+/// in `limits` holds that), so a slot index splits into a directory path by
+/// shifts and a mask.
 const CHILDREN_LOG2: u32 = MAP_DIRECTORY_CHILDREN_MAX.trailing_zeros();
-const CHUNK_SLOTS: u32 = 1 << CHUNK_SLOTS_LOG2;
-const OFFSET_MASK: u32 = CHUNK_SLOTS - 1;
 const CHILD_MASK: u32 = (1 << CHILDREN_LOG2) - 1;
+
+/// A chunk of `CHUNK_SLOTS` slots: a slot index splits into its chunk offset
+/// by a shift and a mask, exact only for a power of two. Every count a store
+/// is built at is one (`chunk_slots_for` answers no other), and an instance
+/// at another fails to compile where it reads these, so each is a constant
+/// of its instantiation.
+struct ChunkShape<const CHUNK_SLOTS: usize>;
+
+impl<const CHUNK_SLOTS: usize> ChunkShape<CHUNK_SLOTS> {
+    const SLOTS_LOG2: u32 = {
+        assert!(CHUNK_SLOTS.is_power_of_two(), "an instance's chunk slots are a power of two");
+        CHUNK_SLOTS.trailing_zeros()
+    };
+    const SLOTS: u32 = 1 << Self::SLOTS_LOG2;
+    const OFFSET_MASK: u32 = Self::SLOTS - 1;
+}
 
 /// The free chain's end: no slot index reaches it, since a store holds at
 /// most `MAP_SLOT_COUNT_MAX` = `u32::MAX` slots.
@@ -84,28 +98,29 @@ pub(super) enum Slot<T, G> {
     Closed,
 }
 
-type Chunk<T, G> = [Slot<T, G>; MAP_CHUNK_SLOTS_MAX];
+type Chunk<T, G, const C: usize> = [Slot<T, G>; C];
 type Directory<L> = [Option<Box<L>>; MAP_DIRECTORY_CHILDREN_MAX];
-type One<T, G> = Directory<Chunk<T, G>>;
-type Two<T, G> = Directory<One<T, G>>;
-type Three<T, G> = Directory<Two<T, G>>;
-type Four<T, G> = Directory<Three<T, G>>;
+type One<T, G, const C: usize> = Directory<Chunk<T, G, C>>;
+type Two<T, G, const C: usize> = Directory<One<T, G, C>>;
+type Three<T, G, const C: usize> = Directory<Two<T, G, C>>;
+type Four<T, G, const C: usize> = Directory<Three<T, G, C>>;
 
 // The root's directory variants, `One` to `Four`, hold every level a `u32`
-// cap needs, so `Root::allocate`'s `Layout` arm is never reached.
+// cap needs at the smallest chunk, so at every chunk, and `Root::allocate`'s
+// `Layout` arm is never reached.
 const _: () =
     assert!(MAP_DIRECTORY_LEVELS_MAX == 4, "the root holds every directory level a u32 cap needs");
 
 /// The root, by its directory levels: the variant is the level count, so an
 /// access matches it once and then follows exactly that many links.
-enum Root<T, G> {
+enum Root<T, G, const C: usize> {
     /// Nothing built yet, a capacity of zero, or everything retired.
     Empty,
-    Chunk(Box<Chunk<T, G>>),
-    One(Box<One<T, G>>),
-    Two(Box<Two<T, G>>),
-    Three(Box<Three<T, G>>),
-    Four(Box<Four<T, G>>),
+    Chunk(Box<Chunk<T, G, C>>),
+    One(Box<One<T, G, C>>),
+    Two(Box<Two<T, G, C>>),
+    Three(Box<Three<T, G, C>>),
+    Four(Box<Four<T, G, C>>),
 }
 
 /// What one build step allocated.
@@ -175,29 +190,30 @@ trait Level<T, G: SlotGeneration>: Sized {
     fn retire(&mut self) -> Retired;
 }
 
-impl<T, G: SlotGeneration> Level<T, G> for Chunk<T, G> {
-    const SPAN_LOG2: u32 = CHUNK_SLOTS_LOG2;
+impl<T, G: SlotGeneration, const C: usize> Level<T, G> for Chunk<T, G, C> {
+    const SPAN_LOG2: u32 = ChunkShape::<C>::SLOTS_LOG2;
 
     #[inline]
     fn slot(&self, index: u32) -> Option<&Slot<T, G>> {
-        self.get((index & OFFSET_MASK) as usize)
+        self.get((index & ChunkShape::<C>::OFFSET_MASK) as usize)
     }
 
     #[inline]
     fn slot_mut(&mut self, index: u32) -> Option<&mut Slot<T, G>> {
-        self.get_mut((index & OFFSET_MASK) as usize)
+        self.get_mut((index & ChunkShape::<C>::OFFSET_MASK) as usize)
     }
 
     #[inline]
     fn slot_pair_mut(&mut self, first: u32, second: u32) -> Option<[&mut Slot<T, G>; 2]> {
-        let offsets = [(first & OFFSET_MASK) as usize, (second & OFFSET_MASK) as usize];
+        let mask = ChunkShape::<C>::OFFSET_MASK;
+        let offsets = [(first & mask) as usize, (second & mask) as usize];
         self.get_disjoint_mut(offsets).ok()
     }
 
     fn allocate(first: u32, capacity: u32) -> Result<Box<Self>, CapError> {
         let mut slots = Vec::new();
-        slots.try_reserve_exact(MAP_CHUNK_SLOTS_MAX).map_err(|_| CapError::Alloc)?;
-        for offset in 0..CHUNK_SLOTS {
+        slots.try_reserve_exact(C).map_err(|_| CapError::Alloc)?;
+        for offset in 0..ChunkShape::<C>::SLOTS {
             // `first` is a multiple of the chunk's slots, so the offset is
             // its low bits.
             let index = first | offset;
@@ -212,7 +228,7 @@ impl<T, G: SlotGeneration> Level<T, G> for Chunk<T, G> {
     }
 
     fn grown(first: u32, capacity: u32) -> Grown {
-        if capacity.checked_sub(first).is_some_and(|rest| rest <= CHUNK_SLOTS) {
+        if capacity.checked_sub(first).is_some_and(|rest| rest <= ChunkShape::<C>::SLOTS) {
             Grown::LastChunk
         } else {
             Grown::Chunk
@@ -317,12 +333,13 @@ fn covers(index: u32, span_log2: u32) -> bool {
     u64::from(index) >> span_log2 == 0
 }
 
-impl<T, G: SlotGeneration> Root<T, G> {
+impl<T, G: SlotGeneration, const C: usize> Root<T, G, C> {
     /// The root of a store of `capacity` slots, allocated empty, with what
-    /// it grew; a capacity whose levels pass the root's is `Layout`.
-    fn allocate(capacity: u32) -> Result<(Root<T, G>, Grown), CapError> {
-        Ok(match directory_levels(u64::from(capacity)) {
-            0 => (Root::Chunk(Chunk::allocate(0, capacity)?), Chunk::<T, G>::grown(0, capacity)),
+    /// it grew; its levels are those its own chunk needs, and a capacity
+    /// whose levels pass the root's is `Layout`.
+    fn allocate(capacity: u32) -> Result<(Root<T, G, C>, Grown), CapError> {
+        Ok(match directory_levels(u64::from(capacity), C) {
+            0 => (Root::Chunk(Chunk::allocate(0, capacity)?), Chunk::<T, G, C>::grown(0, capacity)),
             1 => (Root::One(One::allocate(0, capacity)?), Grown::Directory),
             2 => (Root::Two(Two::allocate(0, capacity)?), Grown::Directory),
             3 => (Root::Three(Three::allocate(0, capacity)?), Grown::Directory),
@@ -357,15 +374,15 @@ impl<T, G: SlotGeneration> FreeSlot<'_, T, G> {
 /// A free slot borrowed with another slot of the same store, for one step.
 pub(super) type FreeBeside<'a, T, G> = (FreeSlot<'a, T, G>, &'a mut Slot<T, G>);
 
-/// The slot storage of one slab, or of one store of a map: hot fields
-/// first (the instance, the free head and the root, which every reserve,
-/// take and lookup loads), then the cold counts and the census its drop
-/// reports to. 40 bytes.
+/// The slot storage of one slab, or of one store of a map, in chunks of
+/// `CHUNK_SLOTS` slots: hot fields first (the instance, the free head and the
+/// root, which every reserve, take and lookup loads), then the cold counts
+/// and the census its drop reports to. 40 bytes.
 #[repr(C)]
-pub(super) struct SlotStore<T, G> {
+pub(super) struct SlotStore<T, G, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
     instance: SlabInstance,
     free_head: u32,
-    root: Root<T, G>,
+    root: Root<T, G, CHUNK_SLOTS>,
     /// Slots that can still serve: the capacity built, less the slots
     /// retired at their last generation.
     capacity_now: u32,
@@ -374,23 +391,51 @@ pub(super) struct SlotStore<T, G> {
     census: Rc<CapCensus>,
 }
 
-impl<T, G: SlotGeneration> SlotStore<T, G> {
-    /// Whether a chunk and a directory of this store each fit one backing
-    /// allocation. Checked before anything is registered or minted.
-    pub(super) fn layout_fits() -> bool {
-        let chunk = size_of::<Slot<T, G>>().checked_mul(MAP_CHUNK_SLOTS_MAX);
-        let directory =
-            size_of::<Option<Box<Chunk<T, G>>>>().checked_mul(MAP_DIRECTORY_CHILDREN_MAX);
+impl<T, G: SlotGeneration, const CHUNK_SLOTS: usize> SlotStore<T, G, CHUNK_SLOTS> {
+    /// Whether a store of `capacity` slots has this layout: its chunk holds
+    /// the slots `chunk_slots_for` answers for its slot's bytes, no more and
+    /// no fewer (ADR-0194 A1), a chunk and a directory each fit one backing
+    /// allocation, and a `u32` counts the chunks and directories its build
+    /// allocates (`items_for`). Checked before anything is registered or
+    /// minted.
+    pub(super) fn layout_fits(capacity: u32) -> bool {
+        let slot = size_of::<Slot<T, G>>();
+        let chunk = slot.checked_mul(CHUNK_SLOTS);
+        let directory = size_of::<Option<Box<Chunk<T, G, CHUNK_SLOTS>>>>()
+            .checked_mul(MAP_DIRECTORY_CHILDREN_MAX);
         let fits =
             |bytes: Option<usize>| bytes.is_some_and(|b| b <= MAP_BACKING_ALLOCATION_BYTES_MAX);
-        fits(chunk) && fits(directory)
+        chunk_slots_for(slot) == Some(CHUNK_SLOTS)
+            && fits(chunk)
+            && fits(directory)
+            && Self::items_for(capacity).is_some()
+    }
+
+    /// The chunks and directories the build of `capacity` slots allocates,
+    /// when a `u32` counts them (the store's `items_held`): ⌈N ÷ c⌉ chunks
+    /// and, per directory level above them, ⌈chunks ÷ 256^k⌉ directories. At
+    /// a chunk of 64 a `u32` cap's build is at most 2^26 chunks and
+    /// 2^18 + 2^10 + 2^2 + 1 directories, at a chunk of 2 at most 2^31
+    /// chunks and 8,421,505 directories; at a chunk of one slot more than
+    /// 4,278,190,079 slots pass `u32::MAX` items, so such a cap is `None`.
+    fn items_for(capacity: u32) -> Option<u32> {
+        let chunk = u64::try_from(CHUNK_SLOTS).ok().filter(|chunk| *chunk > 0)?;
+        let chunks = u64::from(capacity).div_ceil(chunk);
+        let (mut items, mut level) = (chunks, chunks);
+        // At most `MAP_DIRECTORY_LEVELS_MAX` levels for a chunk of one slot or more.
+        for _ in 0..directory_levels(u64::from(capacity), CHUNK_SLOTS) {
+            level = level.div_ceil(MAP_DIRECTORY_CHILDREN_MAX as u64);
+            items = items.checked_add(level)?;
+        }
+        u32::try_from(items).ok()
     }
 
     /// A store of `capacity` slots on `census`, which mints its instance
     /// now; nothing is allocated until its first build step. A shape no
-    /// allocation can hold is `Layout`; a census past its mints is `Census`.
+    /// allocation can hold, or whose items a `u32` does not count, is
+    /// `Layout`; a census past its mints is `Census`.
     pub(super) fn new(capacity: u32, census: &Rc<CapCensus>) -> Result<Self, CapError> {
-        if !Self::layout_fits() {
+        if !Self::layout_fits(capacity) {
             return Err(CapError::Layout);
         }
         let instance = census.mint_instance()?;
@@ -535,7 +580,7 @@ impl<T, G: SlotGeneration> SlotStore<T, G> {
     }
 }
 
-impl<T, G> Drop for SlotStore<T, G> {
+impl<T, G, const CHUNK_SLOTS: usize> Drop for SlotStore<T, G, CHUNK_SLOTS> {
     /// The store's one `Drop`, under every phase of a slab and each store of
     /// a map: a store dropped holding a chunk or a directory while its cell
     /// serves is a release no step sliced, which the census counts and a
@@ -547,8 +592,8 @@ impl<T, G> Drop for SlotStore<T, G> {
 
 /// Slot `index` under `root`, mutably.
 #[inline]
-fn root_slot_mut<T, G: SlotGeneration>(
-    root: &mut Root<T, G>,
+fn root_slot_mut<T, G: SlotGeneration, const C: usize>(
+    root: &mut Root<T, G, C>,
     index: u32,
 ) -> Option<&mut Slot<T, G>> {
     match root {
@@ -563,8 +608,8 @@ fn root_slot_mut<T, G: SlotGeneration>(
 
 /// Slots `first` and `second` under `root`, both mutably.
 #[inline]
-fn root_slot_pair_mut<T, G: SlotGeneration>(
-    root: &mut Root<T, G>,
+fn root_slot_pair_mut<T, G: SlotGeneration, const C: usize>(
+    root: &mut Root<T, G, C>,
     first: u32,
     second: u32,
 ) -> Option<[&mut Slot<T, G>; 2]> {
@@ -636,7 +681,7 @@ impl<T, G: SlotGeneration, L: Level<T, G>> SlotAccess<T, G> for RootAccess<'_, L
     }
 }
 
-impl<T, G: SlotGeneration> SlotStore<T, G> {
+impl<T, G: SlotGeneration, const CHUNK_SLOTS: usize> SlotStore<T, G, CHUNK_SLOTS> {
     /// `walker` on this store's root level, matched once: the walk borrows
     /// the store, so its root, and with it the level every visit reads,
     /// cannot change until the walk returns. Inlined into its caller, so
@@ -657,9 +702,11 @@ impl<T, G: SlotGeneration> SlotStore<T, G> {
 /// `items_held` after a build step allocated one item.
 #[allow(
     clippy::arithmetic_side_effects,
-    reason = "bound: items_held is below the layout's item count before the step — at most 2^26 \
-              chunks and 2^18 + 2^10 + 2^2 + 1 directories, fixed by the capacity the builder \
-              took — so + 1 stays far below u32::MAX (ADR-0165 D1's bound row)"
+    reason = "bound: items_held is below the layout's item count before the step, and `new` \
+              admits a capacity only when that count fits a u32 (`SlotStore::items_for`: at \
+              a chunk of 64 at most 2^26 chunks and 2^18 + 2^10 + 2^2 + 1 directories, at a \
+              chunk of one slot a refusal past 4,278,190,079 slots), so + 1 stays within u32 \
+              (ADR-0165 D1's bound row)"
 )]
 fn items_grown(items_held: u32) -> u32 {
     items_held + 1
