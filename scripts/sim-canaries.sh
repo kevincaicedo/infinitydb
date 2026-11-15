@@ -1402,7 +1402,7 @@ loom_test() {
   echo "== canary $label: $package on the planted loom build must go red"
   status=0
   RUSTFLAGS="--cfg loom --cfg $cfg" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" \
-    --release --lib --target-dir "$TARGET_ROOT/canary-loom" -- "$name" > "$log" 2>&1 \
+    --release --lib --target-dir "$TARGET_ROOT/canary-$cfg" -- "$name" > "$log" 2>&1 \
     || status=$?
   if reason=$(judged_nothing loom "$status" "$log" "$name"); then
     nothing_judged "$label" "$reason"

@@ -2662,9 +2662,9 @@ expect red "canaries: the other shard runs no row of the split cfg" grep -q "^==
 # root, crate tests and simulator alike, and that directory goes once the
 # cfg's last row of the run is judged, caught or red; a cfg whose rows stand
 # apart keeps it until its last. The stub cargo makes each build's directory
-# where it is told, as cargo does, and logs for a planted one whether the
-# directory was there before (warm) or not (cold), then the planted
-# directories the root held.
+# where it is told, as cargo does, and logs for a planted one (its RUSTFLAGS
+# name a cfg) whether the directory was there before (warm) or not (cold),
+# then the planted directories the root held.
 lane_cargo() {
     [ -n "$1" ] || { echo "lane_cargo: no path" >&2; exit 2; }
     cat >"$1" <<'EOF'
@@ -2676,7 +2676,9 @@ for arg in "$@"; do
     previous=$arg
 done
 [ -n "$dir" ] || { echo "stub cargo: no target directory"; exit 2; }
-if [ -n "${RUSTFLAGS:-}" ]; then
+planted=no
+case "${RUSTFLAGS:-}" in *inf_canary_*) planted=yes ;; esac
+if [ "$planted" = yes ]; then
     state=cold
     [ ! -d "$dir" ] || state=warm
     echo "$state ${dir##*/}" $(cd "${dir%/*}" && ls -d canary-* 2>/dev/null) >>"$(dirname "$0")/planted-dirs"
@@ -2685,11 +2687,11 @@ mkdir -p "$dir/release"
 case "${RUSTFLAGS:-}" in
     *inf_canary_locked*) mkdir -p "$dir/release/locked" && : >"$dir/release/locked/unit" && chmod a-w "$dir/release/locked" ;;
 esac
-case "$1:${RUSTFLAGS:-}" in
-    build:) printf '#!/usr/bin/env bash\necho "inf-sim: scenario fake-scenario: green"\n' >"$dir/release/inf-sim" ;;
-    build:*) printf '#!/usr/bin/env bash\necho "inf-sim: ORACLE VIOLATION: TOKEN VIOLATION seed 0x1 cell 0: the rule broke"\nexit 1\n' >"$dir/release/inf-sim" ;;
-    test: | test:*inf_canary_toothless*) echo "test the_row ... ok"; exit 0 ;;
-    test:*) echo "test the_row ... FAILED"; exit 101 ;;
+case "$1:$planted:${RUSTFLAGS:-}" in
+    build:no:*) printf '#!/usr/bin/env bash\necho "inf-sim: scenario fake-scenario: green"\n' >"$dir/release/inf-sim" ;;
+    build:yes:*) printf '#!/usr/bin/env bash\necho "inf-sim: ORACLE VIOLATION: TOKEN VIOLATION seed 0x1 cell 0: the rule broke"\nexit 1\n' >"$dir/release/inf-sim" ;;
+    test:no:* | test:yes:*inf_canary_toothless*) echo "test the_row ... ok"; exit 0 ;;
+    test:yes:*) echo "panicked: WITNESS: a stale effect"; echo "test the_row ... FAILED"; exit 101 ;;
 esac
 chmod +x "$dir/release/inf-sim"
 EOF
@@ -2720,6 +2722,16 @@ expect red "canaries: controls-only builds no planted directory" test -s "$dir/p
 mkdir -p "$dir/target/canary-inf_canary_a"
 expect_output "canaries: the table check of the lane copy reads its three rows" "table only: 3 rows well formed" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
 expect green "canaries: the table check removes no planted directory" test -d "$dir/target/canary-inf_canary_a"
+# A Loom row's plant builds in its cfg's directory too, and goes the same way;
+# the plain Loom tree stays warm.
+dir="$work/canary-disk-loom"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "inf_canary_m loom fake the_row WITNESS:"
+expect_output "canaries: a lane copy with a Loom row catches it" "sim-canaries: 1 canaries caught" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: the Loom plant built in its cfg's directory" grep -qx "cold canary-inf_canary_m" "$dir/planted-dirs"
+expect green "canaries: no planted directory is left after the Loom row" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
+expect green "canaries: the plain Loom tree stays" test -d "$dir/target/loom"
 # A red row's directory goes too: its log is the lane's output, not the root.
 dir="$work/canary-disk-red"
 mkdir -p "$dir"
