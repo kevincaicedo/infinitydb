@@ -1067,6 +1067,10 @@ rows=(
 # touch different lines and merge without a conflict.
 historical_rows=295
 ordered_rows=(
+  # A barrier hold keeps every barrier on the files it names: a standalone sync, a write's
+  # linked sync and a write-through write, each whole until the hold lifts. Planted,
+  # hold_barriers keeps standalone syncs alone, and the frame barriers complete while held.
+  "inf_canary_barrier_hold_standalone_only crate-test inf-sim lib a_barrier_hold_keeps_every_barrier_until_it_lifts barrier-completed-while-held"
   # A close ends the receive: the io_uring driver queues the fd's cancels before the close and
   # posts Closed after them, so no Recv with bytes follows Closed. Planted, Close posts Closed
   # as it queues the close, ahead of the reap that brings the bytes. One row a shape: the

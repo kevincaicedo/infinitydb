@@ -12,6 +12,7 @@ use inf_alloc::{BufferPool, LeaseKind};
 use inf_foundation::FileOffset;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
+use inf_log::fs::sim::BarrierKind;
 use inf_runtime::{
     AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken,
     IoClass, IoOp, RawFd, StableBytes, StableBytesMut, SubmitStats, TokenClass, Wait, WriteBarrier,
@@ -458,10 +459,11 @@ pub struct SimDriver {
     /// Deferred fsync CQEs, due-time order (the disk's serial timeline
     /// keeps due times monotone, so pushes append in order).
     pending_syncs: Vec<PendingSync>,
-    /// Fdatasyncs the disk holds ([`SimDisk::hold_syncs`]), submission
-    /// order: each is submitted at the first driver entry after its hold
-    /// lifts, ahead of that entry's own ops.
-    held_syncs: Vec<(RawFd, CompletionToken)>,
+    /// Barrier ops the disk holds ([`SimDisk::hold_syncs`],
+    /// [`SimDisk::hold_barriers`]), each whole, submission order: each is
+    /// submitted at the first driver entry after its hold lifts, ahead of
+    /// that entry's own ops, and is observed and drawn only then.
+    held_syncs: Vec<IoOp>,
     /// Tier reads the disk holds ([`SimDisk::hold_reads`]), submission
     /// order: each is submitted at the first driver entry after its hold
     /// lifts, ahead of that entry's own ops.
@@ -679,11 +681,25 @@ impl SimDriver {
         tier_io_of(&self.ops)
     }
 
-    /// Fdatasyncs the disk holds now ([`SimDisk::hold_syncs`]): submitted
-    /// by the plane and kept from the device until the hold lifts — the
+    /// Barrier ops the disk holds now, every kind together: submitted by
+    /// the plane and kept from the device until the hold lifts — the
     /// harness's own reading of a held barrier, no product counter.
     pub fn held_syncs(&self) -> usize {
         self.held_syncs.len()
+    }
+
+    /// The barrier ops the disk holds now, counted by kind: the harness's
+    /// own reading of which barriers a hold keeps, no product counter.
+    pub fn held_barriers(&self) -> HeldBarriers {
+        let mut held = HeldBarriers::default();
+        for kind in self.held_syncs.iter().filter_map(barrier_of) {
+            match kind {
+                BarrierKind::Standalone => held.standalone += 1,
+                BarrierKind::Linked => held.linked += 1,
+                BarrierKind::WriteThrough => held.write_through += 1,
+            }
+        }
+        held
     }
 
     /// Tier reads the disk holds now ([`SimDisk::hold_reads`]): issued by
@@ -705,7 +721,8 @@ impl SimDriver {
             }
             PendingKind::Read { .. } => false,
         });
-        let mut fds = pending.map(|pending| pending.fd).chain(self.held_syncs.iter().map(|h| h.0));
+        let held = self.held_syncs.iter().filter_map(barrier_fd);
+        let mut fds = pending.map(|pending| pending.fd).chain(held);
         fds.any(|fd| disk.fd_named(fd, named))
     }
 
@@ -718,26 +735,92 @@ impl SimDriver {
     }
 }
 
-/// Moves every held fdatasync whose hold has lifted to the front of `ops`,
-/// in submission order, so the driver entry submits it first. A free
-/// function over the fields, so the drain's `net` borrow stays disjoint.
-fn release_held_syncs(
-    disk: Option<&SimDisk>,
-    held_syncs: &mut Vec<(RawFd, CompletionToken)>,
-    ops: &mut Vec<IoOp>,
-) {
+/// Barrier ops held whole by the disk, counted by kind
+/// ([`SimDriver::held_barriers`]): one driver's, so one cell's.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldBarriers {
+    /// Standalone fdatasyncs.
+    pub standalone: usize,
+    /// Writes with their linked fdatasync.
+    pub linked: usize,
+    /// Write-through writes.
+    pub write_through: usize,
+}
+
+impl HeldBarriers {
+    /// The held writes that carry a frame's barrier: a linked sync or a
+    /// write-through write.
+    #[must_use]
+    pub fn frames(self) -> usize {
+        self.linked + self.write_through
+    }
+}
+
+/// The barrier `op` carries to the device, `None` for an op that carries
+/// none: the one place an op's barrier is read, so a new op that carries
+/// one cannot pass a hold unread.
+fn barrier_of(op: &IoOp) -> Option<BarrierKind> {
+    match op {
+        IoOp::Fdatasync { .. } => Some(BarrierKind::Standalone),
+        IoOp::LogWrite { barrier, .. } => match barrier {
+            WriteBarrier::LinkedFsync { .. } => Some(BarrierKind::Linked),
+            WriteBarrier::WriteThrough => Some(BarrierKind::WriteThrough),
+            WriteBarrier::None => None,
+        },
+        IoOp::AcceptArm { .. }
+        | IoOp::RecvArm { .. }
+        | IoOp::RecvDisarm { .. }
+        | IoOp::Send { .. }
+        | IoOp::Close { .. }
+        | IoOp::TierRead { .. } => None,
+    }
+}
+
+/// The file descriptor of a write or a sync, the ops that may carry a
+/// barrier.
+fn barrier_fd(op: &IoOp) -> Option<RawFd> {
+    let (IoOp::LogWrite { fd, .. } | IoOp::Fdatasync { fd, .. }) = op else { return None };
+    Some(*fd)
+}
+
+/// Whether the disk holds `op` now: it carries a barrier the armed hold's
+/// scope admits, on a file the hold names. With no hold armed the disk
+/// reads nothing more, and an op with no barrier reads the disk not at all.
+fn held_now(disk: &SimDisk, op: &IoOp) -> bool {
+    let (Some(kind), Some(fd)) = (barrier_of(op), barrier_fd(op)) else { return false };
+    disk.barrier_held(fd, kind)
+}
+
+/// The one hold check of a driver entry, before the op's arm: an op the
+/// disk holds goes whole onto the held list, so nothing of it is observed
+/// or drawn until its hold lifts; any other op is handed back to its arm.
+fn hold_or_pass(disk: Option<&SimDisk>, held_syncs: &mut Vec<IoOp>, op: IoOp) -> Option<IoOp> {
+    if disk.is_some_and(|disk| held_now(disk, &op)) {
+        held_syncs.push(op);
+        return None;
+    }
+    Some(op)
+}
+
+/// Moves every held barrier op whose hold has lifted, or whose fd has
+/// closed, to the front of `ops`, in submission order, so the driver entry
+/// submits it first. A free function over the fields, so the drain's `net`
+/// borrow stays disjoint.
+fn release_held_syncs(disk: Option<&SimDisk>, held_syncs: &mut Vec<IoOp>, ops: &mut Vec<IoOp>) {
     let Some(disk) = disk else { return };
-    if held_syncs.iter().all(|&(fd, _)| disk.sync_held(fd)) {
+    if held_syncs.iter().all(|op| held_now(disk, op)) {
         return;
     }
     let mut released = Vec::new();
-    held_syncs.retain(|&(fd, token)| {
-        let held = disk.sync_held(fd);
-        if !held {
-            released.push(IoOp::Fdatasync { fd, token });
+    let mut kept = Vec::with_capacity(held_syncs.len());
+    for op in held_syncs.drain(..) {
+        if held_now(disk, &op) {
+            kept.push(op);
+        } else {
+            released.push(op);
         }
-        held
-    });
+    }
+    *held_syncs = kept;
     ops.splice(0..0, released);
 }
 
@@ -1095,6 +1178,9 @@ impl BackendDriver for SimDriver {
         release_held_syncs(self.disk.as_ref(), &mut self.held_syncs, &mut ops);
         release_held_reads(self.disk.as_ref(), &mut self.held_reads, &mut ops);
         for op in ops.drain(..) {
+            let Some(op) = hold_or_pass(self.disk.as_ref(), &mut self.held_syncs, op) else {
+                continue;
+            };
             match op {
                 IoOp::AcceptArm { token, .. } => {
                     net.accept_arms += 1;
@@ -1270,12 +1356,6 @@ impl BackendDriver for SimDriver {
                         .disk
                         .as_ref()
                         .expect("durable sim scenarios construct SimDriver::with_disk (M2-S18)");
-                    // A held barrier reaches the device only once its hold
-                    // lifts: it is observed then, not now.
-                    if disk.sync_held(fd) {
-                        self.held_syncs.push((fd, token));
-                        continue;
-                    }
                     self.observed.note(token, 0);
                     // Stall device (M2.5-S14): standalone fsyncs (barrier
                     // dirs, everysec ticks) defer exactly like linked ones.
@@ -1457,6 +1537,236 @@ mod close_capability_tests {
         assert_eq!(received(&out), [ping.len() as u32, 0], "the chunk, then the end, in one reap");
         assert_eq!(net.borrow().eof_shared_reaps(), 1);
         assert!(net.borrow().eof_posted(fd));
+    }
+}
+
+#[cfg(test)]
+mod hold_tests {
+    use super::{CellNet, HeldBarriers, Plant, SimDriver};
+    use inf_alloc::BufferPool;
+    use inf_foundation::FileOffset;
+    use inf_foundation::time::{Nanos, VirtualClock};
+    use inf_log::fs::sim::SimFile;
+    use inf_log::fs::{SegmentFile, SegmentFs};
+    use inf_runtime::{
+        BackendDriver, CompletionResult, CompletionToken, IoOp, StableBytes, TokenClass, Wait,
+        WriteBarrier,
+    };
+    use inf_server::{SimDisk, SimDiskConfig, StallConfig};
+    use std::path::Path;
+    use std::rc::Rc;
+
+    const DIR: &str = "shard-0/log";
+    /// The token slots of the four ops, by the op they ride.
+    const LINKED: u32 = 1;
+    const LINKED_SYNC: u32 = 2;
+    const PLAIN: u32 = 3;
+    const THROUGH: u32 = 4;
+    const SYNC: u32 = 5;
+
+    fn token(class: TokenClass, slot: u32) -> CompletionToken {
+        CompletionToken::new(class, slot, 1)
+    }
+
+    /// What a completion posted, as the device contract names it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Posted {
+        Written,
+        Synced,
+        Errno(i32),
+        Other,
+    }
+
+    fn is_segment(name: &Path) -> bool {
+        name.extension().is_some_and(|ext| ext == "ilog")
+    }
+
+    /// A frame payload that outlives its op, as the plane's frame lease does.
+    fn stable(bytes: &'static [u8]) -> StableBytes {
+        // SAFETY: `'static` bytes stay live, at one address and unmodified
+        // forever, so past the op's terminal completion.
+        unsafe { StableBytes::new(bytes) }
+    }
+
+    /// One segment on `disk`, its name committed: the handle keeps the fd
+    /// open, and dropping it closes the fd.
+    fn segment_on(disk: &SimDisk) -> (SimFile, i32) {
+        disk.create_dir_all(Path::new(DIR)).expect("dirs");
+        let segment = disk.create_segment(&Path::new(DIR).join("seg-000000.ilog"), 4096);
+        let segment = segment.expect("segment");
+        disk.sync_dir(Path::new(DIR)).expect("commit the name");
+        let fd = segment.raw_fd().expect("sim fd");
+        (segment, fd)
+    }
+
+    fn write(fd: i32, at: u32, slot: u32, barrier: WriteBarrier) -> IoOp {
+        let offset = FileOffset::from_u32_bytes(at);
+        let token = token(TokenClass::LogWrite, slot);
+        IoOp::LogWrite { fd, offset, data: stable(b"frame"), token, barrier }
+    }
+
+    /// The three barrier ops: a write with its linked sync, a write-through
+    /// write and a standalone sync.
+    fn barriers(fd: i32) -> [IoOp; 3] {
+        let fsync_token = token(TokenClass::Fsync, LINKED_SYNC);
+        [
+            write(fd, 0, LINKED, WriteBarrier::LinkedFsync { fsync_token }),
+            write(fd, 1024, THROUGH, WriteBarrier::WriteThrough),
+            IoOp::Fdatasync { fd, token: token(TokenClass::Fsync, SYNC) },
+        ]
+    }
+
+    /// The entry of four ops: the barrier ops with a plain write among them.
+    fn four(fd: i32) -> Vec<IoOp> {
+        let [linked, through, sync] = barriers(fd);
+        vec![linked, write(fd, 512, PLAIN, WriteBarrier::None), through, sync]
+    }
+
+    /// One driver entry carrying `ops`: what it posted, in order.
+    fn entry(driver: &mut SimDriver, pool: &mut BufferPool, ops: Vec<IoOp>) -> Vec<(u32, Posted)> {
+        for op in ops {
+            driver.push(op);
+        }
+        let mut out = Vec::new();
+        driver.submit_and_reap(pool, Wait::Poll, &mut out).expect("reap");
+        let posted = |result| match result {
+            CompletionResult::LogWritten => Posted::Written,
+            CompletionResult::Synced => Posted::Synced,
+            CompletionResult::Error { errno, .. } => Posted::Errno(errno),
+            _ => Posted::Other,
+        };
+        out.into_iter().map(|done| (done.token.slot(), posted(done.result))).collect()
+    }
+
+    /// Every op the device took, every class together.
+    fn observed_ops(driver: &SimDriver) -> u64 {
+        driver.observed_io().ops.iter().sum()
+    }
+
+    /// `hold_barriers` keeps every barrier whole and lets a plain write
+    /// pass; at the lift the held ops post in submission order.
+    fn every_barrier_is_held(disk: &SimDisk, fd: i32) {
+        let mut driver = SimDriver::with_disk(CellNet::new(0, 7, Plant::None), disk.clone());
+        let mut pool = BufferPool::new(8, 512);
+        disk.hold_barriers(Some(is_segment));
+        let posted = entry(&mut driver, &mut pool, four(fd));
+        let plain = vec![(PLAIN, Posted::Written)];
+        assert_eq!(posted, plain, "barrier-completed-while-held: the hold kept a barrier short");
+        let kinds = HeldBarriers { standalone: 1, linked: 1, write_through: 1 };
+        assert_eq!(driver.held_barriers(), kinds, "held-by-kind: the hold keeps each barrier");
+        assert_eq!(observed_ops(&driver), 1, "held-observed: a held op reached the device");
+        disk.hold_barriers(None);
+        let posted = entry(&mut driver, &mut pool, Vec::new());
+        let order = vec![
+            (LINKED, Posted::Written),
+            (LINKED_SYNC, Posted::Synced),
+            (THROUGH, Posted::Written),
+            (SYNC, Posted::Synced),
+        ];
+        assert_eq!(posted, order, "held-order: the lift posts the held ops in submission order");
+        assert_eq!(driver.held_barriers(), HeldBarriers::default(), "held-order: none left held");
+        assert_eq!(observed_ops(&driver), 5, "held-order: each held op observed at its lift");
+    }
+
+    /// `hold_syncs` keeps the standalone sync alone: the frame barriers pass.
+    fn standalone_alone_is_held(disk: &SimDisk, fd: i32) {
+        let mut driver = SimDriver::with_disk(CellNet::new(0, 7, Plant::None), disk.clone());
+        let mut pool = BufferPool::new(8, 512);
+        disk.hold_syncs(Some(is_segment));
+        let posted = entry(&mut driver, &mut pool, four(fd));
+        let passed = vec![
+            (LINKED, Posted::Written),
+            (LINKED_SYNC, Posted::Synced),
+            (PLAIN, Posted::Written),
+            (THROUGH, Posted::Written),
+        ];
+        assert_eq!(posted, passed, "standalone-scope-widened: a sync hold kept a frame barrier");
+        let kinds = HeldBarriers { standalone: 1, ..HeldBarriers::default() };
+        assert_eq!(driver.held_barriers(), kinds, "standalone-scope-widened: held by kind");
+        disk.hold_syncs(None);
+        let posted = entry(&mut driver, &mut pool, Vec::new());
+        assert_eq!(posted, vec![(SYNC, Posted::Synced)], "held-order: the sync at its lift");
+    }
+
+    /// The due times the stall model drew for the driver's deferred ops.
+    fn dues(driver: &SimDriver) -> Vec<(Nanos, u32)> {
+        driver.pending_syncs.iter().map(|pending| (pending.due, pending.token.slot())).collect()
+    }
+
+    /// Under the stall model a held op draws nothing while held: its due
+    /// time is drawn at the lift, equal to an unarmed run's that submits
+    /// the same ops at that instant on the same device.
+    fn a_held_op_draws_at_its_lift() {
+        const STALL_SEED: u64 = 0x5eed;
+        let stall = StallConfig {
+            base_ns: 40_000,
+            tail_permille: 500,
+            tail_mult: 4,
+            through_base_ns: 20_000,
+            write_base_ns: 8_000,
+            ..StallConfig::instant()
+        };
+        let lift = Nanos(1_000_000);
+        let run = |armed: bool| {
+            let disk = SimDisk::with_stall(SimDiskConfig::default(), stall.clone(), STALL_SEED);
+            let (_segment, fd) = segment_on(&disk);
+            let clock = Rc::new(VirtualClock::new(Nanos(1_000)));
+            let net = CellNet::new(0, 7, Plant::None);
+            let mut driver = SimDriver::with_disk_stall(net, disk.clone(), Rc::clone(&clock));
+            let mut pool = BufferPool::new(8, 512);
+            if armed {
+                disk.hold_barriers(Some(is_segment));
+                let posted = entry(&mut driver, &mut pool, barriers(fd).into());
+                assert!(posted.is_empty(), "held-draw-early: a held op posted {posted:?}");
+                assert!(dues(&driver).is_empty(), "held-draw-early: a held op drew its due time");
+                clock.set(lift);
+                disk.hold_barriers(None);
+                entry(&mut driver, &mut pool, Vec::new());
+            } else {
+                clock.set(lift);
+                entry(&mut driver, &mut pool, barriers(fd).into());
+            }
+            dues(&driver)
+        };
+        let unarmed = run(false);
+        assert_eq!(unarmed.len(), 3, "held-draw-early: the stall model defers each barrier");
+        assert_eq!(run(true), unarmed, "held-draw-early: a held op drew before its lift");
+    }
+
+    /// A held op whose fd closes in the hold names no file, so the next
+    /// entry submits it at once and the closed descriptor answers: the
+    /// write `EBADF`, its linked sync `ECANCELED`.
+    fn a_closed_hold_answers_at_once() {
+        let disk = SimDisk::new();
+        let (segment, fd) = segment_on(&disk);
+        let mut driver = SimDriver::with_disk(CellNet::new(0, 7, Plant::None), disk.clone());
+        let mut pool = BufferPool::new(8, 512);
+        disk.hold_barriers(Some(is_segment));
+        let [linked, _, _] = barriers(fd);
+        let posted = entry(&mut driver, &mut pool, vec![linked]);
+        assert!(posted.is_empty(), "closed-hold-answer: the held write posted {posted:?}");
+        drop(segment);
+        let posted = entry(&mut driver, &mut pool, Vec::new());
+        let answer = vec![
+            (LINKED, Posted::Errno(libc::EBADF)),
+            (LINKED_SYNC, Posted::Errno(libc::ECANCELED)),
+        ];
+        assert_eq!(posted, answer, "closed-hold-answer: the closed descriptor's answer");
+        assert_eq!(driver.held_syncs(), 0, "closed-hold-answer: nothing left held");
+        disk.hold_barriers(None);
+    }
+
+    /// The device contract of a hold, read from the completions the driver
+    /// posts: each scope keeps its barriers whole, observed and drawn only
+    /// at the lift, in submission order; a plain write always passes.
+    #[test]
+    fn a_barrier_hold_keeps_every_barrier_until_it_lifts() {
+        let disk = SimDisk::new();
+        let (_segment, fd) = segment_on(&disk);
+        every_barrier_is_held(&disk, fd);
+        standalone_alone_is_held(&disk, fd);
+        a_held_op_draws_at_its_lift();
+        a_closed_hold_answers_at_once();
     }
 }
 
