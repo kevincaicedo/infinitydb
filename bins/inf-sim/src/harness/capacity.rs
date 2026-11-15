@@ -1197,10 +1197,7 @@ fn deferred_quit_leg(seed: u64) -> Rig {
     let mut rest = encode(&[b"QUIT"]);
     rest.extend(sets(&names));
     rig.held = Some(Y);
-    rig.send(client, &Rig::held_pipeline(Y, &rest));
-    rig.until("the client's bytes taken", |rig| {
-        rig.nets[X].borrow().unread(rig.fd(client)) == Some(0)
-    });
+    rig.send_one_buffer(client, &Rig::held_pipeline(Y, &rest));
     for _ in 0..64 {
         rig.step();
     }
