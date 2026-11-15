@@ -623,6 +623,8 @@ pub static MATRIX: &[Case] = &[
         &["CONFIG", "SET", "maxclients", "20001"],
         "past the boot capacity the node refuses the raise whole (ADR-0123 A1)",
     ),
+    // Both engines back at one value after the deviation.
+    c(&["CONFIG", "SET", "maxclients", "10000"]),
     skip(&["CONFIG", "SET", "timeout", "-1"], "error detail text differs; both reject"),
     skip(&["CONFIG", "SET", "tcp-keepalive", "-1"], "error detail text differs; both reject"),
     c(&["CONFIG", "SET", "client-output-buffer-limit", "normal 64mb 16mb 10"]),
