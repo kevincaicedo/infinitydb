@@ -160,6 +160,7 @@ pub(super) struct RigCell {
 /// A node of `cells` cells on one fabric and one virtual clock.
 pub(super) struct Rig {
     pub(super) cells: Vec<RigCell>,
+    pub(super) clock: Rc<VirtualClock>,
 }
 
 impl Rig {
@@ -190,7 +191,7 @@ impl Rig {
             );
             RigCell { reactor, plane, frozen: false }
         });
-        let mut rig = Rig { cells: built.collect() };
+        let mut rig = Rig { cells: built.collect(), clock };
         rig.rounds(2);
         rig
     }

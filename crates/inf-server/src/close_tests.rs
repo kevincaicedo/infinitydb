@@ -201,6 +201,7 @@ fn a_kill_after_the_eof_close_before_closed_closes_nothing_again() {
 // ---- a close runs the bytes the client handed over (ADR-0196, ADR-0123 A2) ----
 
 use super::wire_rig::{Rig as Node, frame};
+use inf_foundation::time::Clock;
 
 /// The client whose close each test drives, and a second client of the
 /// same cell that reads the store back over the wire.
@@ -278,4 +279,39 @@ fn half_close_answers_replies() {
         "the SET read before the end of stream was not answered"
     );
     assert_eq!(read_back(&mut node, 0, b"half"), b"$6\r\nclosed\r\n", "the SET did not run");
+}
+
+/// A client's `SET` is reaped while another client's `DEBUG SLEEP` stalls
+/// the cell, so its inbox entry waits for the stall's end; the client is
+/// reset and its `Closed` dispatched during the stall. The bytes it handed
+/// over still run when the stall ends (ADR-0196 D2). At HEAD `Closed`
+/// removes the connection, and the entry meets a vacant slot at PARSE.
+#[test]
+#[ignore = "a stalled cell keeps a connection's received bytes in its inbox past the connection's \
+            Closed, and PARSE then releases them at the vacant slot; red until a draining slot \
+            keeps its parser and parses the entries reaped before its close"]
+fn a_stalled_entry_runs_after_its_connection_closed() {
+    const SLEEPER: RawFd = 62;
+    let mut node = Node::new(1);
+    node.accept(0, CLIENT);
+    node.accept(0, SLEEPER);
+    node.accept(0, READER);
+    node.send(0, SLEEPER, &frame(&[b"DEBUG", b"SLEEP", b"1"]));
+    node.rounds(1);
+    let stalled = node.cells[0].plane.shared.stall_until.get();
+    assert!(stalled > node.clock.now(), "engagement: DEBUG SLEEP stalls the cell");
+    node.send(0, CLIENT, &frame(&[b"SET", b"stalled", b"ran"]));
+    node.rounds(1);
+    assert_eq!(node.cells[0].plane.inbox.len(), 1, "engagement: the SET waits in the inbox");
+    node.reset(0, CLIENT);
+    node.rounds(2);
+    assert!(node.closed(0).contains(&CLIENT), "engagement: the Closed came during the stall");
+    assert!(node.cells[0].plane.shared.stall_until.get() > node.clock.now(), "still stalled");
+    node.clock.advance(Nanos::from_secs(2));
+    node.rounds(2);
+    assert_eq!(
+        read_back(&mut node, 0, b"stalled"),
+        b"$3\r\nran\r\n",
+        "the SET reaped before the reset did not run after the stall"
+    );
 }
