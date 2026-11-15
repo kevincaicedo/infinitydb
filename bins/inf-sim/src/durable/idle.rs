@@ -1,16 +1,18 @@
 //! `timeout` judges a connection only when the server owes it nothing
-//! (ADR-0193 D1): a client whose command is held at a frozen peer or by a
-//! stalled cell is answered first, and its idle clock runs from its reply
-//! (a reply sent is activity, D3) and from the stall's end (D2). Each test
-//! boots a quiet durable node, sets `timeout 1` over the wire, and reads
-//! its clients' bytes and the server's closes from the net with the node's
-//! virtual clock: no code shared with the sweep.
+//! (ADR-0193 D1): a client whose command is held at a frozen peer, on a held
+//! fsync or by a stalled cell is answered first, and its idle clock runs
+//! from its reply (a reply sent is activity, D3) and from the stall's end
+//! (D2). Each test boots a quiet durable node, sets `timeout 1` over the
+//! wire, and reads its clients' bytes and the server's closes from the net
+//! with the node's virtual clock: no code shared with the sweep.
 //!
 //! The window a close must fall in is the idle oracle's: from the step the
 //! client reads its last reply, `[timeout - step_ns_max - 1 ms, timeout +
 //! 4 * step_ns_max + 1 ms]`. Each test checks its engagement: the hold
 //! outlasted `timeout` while the client was owed a reply, else `VACUOUS
 //! hold-under-timeout`.
+
+use std::path::Path;
 
 use inf_foundation::time::{Clock, Nanos};
 use inf_runtime::RawFd;
@@ -200,6 +202,68 @@ fn timeout_spares_a_command_held_at_a_frozen_peer() {
     step_until_answered(&mut quiet, &mut [("the held client", &mut client)]);
     assert_eq!(client.replies, [b"$-1\r\n".to_vec()], "the held GET's reply");
     judge_reaped(&mut quiet, &mut [("the held client", &mut client)]);
+}
+
+/// Holds every barrier on every file.
+fn any_file(_: &Path) -> bool {
+    true
+}
+
+/// Steps until the device holds a write's barrier (a write with its linked
+/// sync, or a write-through write: the barriers an `always` frame rides)
+/// while `who` waits on its write, for at most half the timeout: the hold's
+/// engagement on the device's side, else `VACUOUS frame-barrier-unheld`.
+fn step_until_frame_held(quiet: &mut Quiet, who: &mut Watched, name: &str) {
+    let until = Nanos(quiet.clock.now().0 + TIMEOUT.0 / 2);
+    while quiet.node.driver(who.cell).held_barriers().frames() == 0 && quiet.clock.now() < until {
+        step(quiet, &mut [(name, &mut *who)]);
+    }
+    let held = quiet.node.driver(who.cell).held_barriers();
+    assert!(
+        held.frames() > 0,
+        "VACUOUS frame-barrier-unheld: no frame barrier was held while {name} waited ({held:?})"
+    );
+}
+
+/// A `SET` of an `always` namespace while the device holds every barrier for
+/// twice the timeout, then 1,100 pipelined `SET`s behind it (the queue
+/// passes its high water of 1,024 and the receive is disarmed): the client
+/// is owed replies throughout, so no sweep closes it; once the hold lifts it
+/// reads all 1,101 `+OK`s and is reaped a timeout after. Engagement: the
+/// device held the write's frame barrier, else `VACUOUS
+/// frame-barrier-unheld`, and the hold outlasted the timeout.
+#[test]
+#[ignore = "timeout judges a connection by its receive clock alone, so a client whose always \
+            write waits on a held fsync is closed before its ack; red until a connection the \
+            server owes a reply is never judged and a reply sent is activity"]
+fn timeout_spares_an_always_write_held_on_its_fsync() {
+    const PIPELINED: usize = 1_100;
+    let mut quiet = Quiet::boot(1, DurableScenario::SPIN_ITERS, 0);
+    set_timeout(&mut quiet);
+    let mut setup = MiniClient::connect(&mut quiet.node, 0);
+    let create: &[&[u8]] =
+        &[b"INF.NS", b"CREATE", b"acks", b"MODE", b"durable", b"FSYNC", b"always"];
+    assert_eq!(quiet.call(&mut setup, create, "the always CREATE"), b"+OK\r\n");
+    let mut client = Watched::connect(&mut quiet, 0);
+    client.send(&mut quiet, &[b"INF.NS", b"USE", b"acks"]);
+    step_until_answered(&mut quiet, &mut [("the writer", &mut client)]);
+    quiet.disk.hold_barriers(Some(any_file));
+    let sent = quiet.clock.now();
+    client.send(&mut quiet, &[b"SET", b"held", b"0"]);
+    step_until_frame_held(&mut quiet, &mut client, "the writer");
+    step_until(&mut quiet, Nanos(sent.0 + 2 * TIMEOUT.0), &mut [("the writer", &mut client)]);
+    assert_hold_engaged(Nanos(quiet.clock.now().0 - sent.0), &client, "the writer");
+    for n in 0..PIPELINED {
+        let key = format!("held:{n}");
+        client.send(&mut quiet, &[b"SET", key.as_bytes(), b"1"]);
+    }
+    let behind = quiet.clock.now();
+    step_until(&mut quiet, Nanos(behind.0 + TIMEOUT.0 / 2), &mut [("the writer", &mut client)]);
+    quiet.disk.hold_barriers(None);
+    step_until_answered(&mut quiet, &mut [("the writer", &mut client)]);
+    let oks = client.replies.iter().filter(|reply| reply.as_slice() == b"+OK\r\n").count();
+    assert_eq!(oks, PIPELINED + 2, "the USE, the held SET and every pipelined SET answered +OK");
+    judge_reaped(&mut quiet, &mut [("the writer", &mut client)]);
 }
 
 /// `DEBUG SLEEP 3` under `timeout 1`. During the sleep a third client sends a
