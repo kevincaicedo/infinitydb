@@ -2658,6 +2658,81 @@ expect green "canaries: both rows of the split cfg run in its shard" test "$(gre
 expect green "canaries: the other shard runs the rest, green" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_SHARD=1/2 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
 cp "$work/log" "$dir/shard-1.log"
 expect red "canaries: the other shard runs no row of the split cfg" grep -q "^== canary inf_canary_a " "$dir/shard-1.log"
+# The lane's disk bound: a planted cfg builds in `canary-<cfg>` under the
+# root, crate tests and simulator alike, and that directory goes once the
+# cfg's last row of the run is judged, caught or red; a cfg whose rows stand
+# apart keeps it until its last. The stub cargo makes each build's directory
+# where it is told, as cargo does, and logs for a planted one whether the
+# directory was there before (warm) or not (cold), then the planted
+# directories the root held.
+lane_cargo() {
+    [ -n "$1" ] || { echo "lane_cargo: no path" >&2; exit 2; }
+    cat >"$1" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" != --version ] || exit 0
+dir= previous=
+for arg in "$@"; do
+    [ "$previous" != --target-dir ] || dir=$arg
+    previous=$arg
+done
+[ -n "$dir" ] || { echo "stub cargo: no target directory"; exit 2; }
+if [ -n "${RUSTFLAGS:-}" ]; then
+    state=cold
+    [ ! -d "$dir" ] || state=warm
+    echo "$state ${dir##*/}" $(cd "${dir%/*}" && ls -d canary-* 2>/dev/null) >>"$(dirname "$0")/planted-dirs"
+fi
+mkdir -p "$dir/release"
+case "$1:${RUSTFLAGS:-}" in
+    build:) printf '#!/usr/bin/env bash\necho "inf-sim: scenario fake-scenario: green"\n' >"$dir/release/inf-sim" ;;
+    build:*) printf '#!/usr/bin/env bash\necho "inf-sim: ORACLE VIOLATION: TOKEN VIOLATION seed 0x1 cell 0: the rule broke"\nexit 1\n' >"$dir/release/inf-sim" ;;
+    test: | test:*inf_canary_toothless*) echo "test the_row ... ok"; exit 0 ;;
+    test:*) echo "test the_row ... FAILED"; exit 101 ;;
+esac
+chmod +x "$dir/release/inf-sim"
+EOF
+    chmod +x "$1"
+}
+dir="$work/canary-disk"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "inf_canary_a $row" "inf_canary_b fake-scenario TOKEN" "inf_canary_a $row"
+expect_output "canaries: a lane over a split cfg and another catches its three rows" "sim-canaries: 3 canaries caught" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: the lane built in two planted directories" test "$(awk '{ print $2 }' "$dir/planted-dirs" | sort -u | tr '\n' ' ')" = "canary-inf_canary_a canary-inf_canary_b "
+expect green "canaries: no planted directory is left under the root after the lane" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
+expect green "canaries: the split cfg is built once, its directory there at its second row" test "$(awk '$2 == "canary-inf_canary_a" { printf "%s ", $1 }' "$dir/planted-dirs")" = "cold warm "
+expect green "canaries: a cfg's directory goes at its last row, not at the lane's end" grep -qx "warm canary-inf_canary_a canary-inf_canary_a" "$dir/planted-dirs"
+# A shard removes its own cfgs' directories and no other's.
+mkdir -p "$dir/target/canary-inf_canary_b" && : >"$dir/target/canary-inf_canary_b/other-shard" && : >"$dir/planted-dirs"
+expect_output "canaries: shard 0 of the lane copy catches the split cfg's two rows" "sim-canaries: 2 canaries caught" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_SHARD=0/2 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: a shard keeps the other shard's planted directory" test -e "$dir/target/canary-inf_canary_b/other-shard"
+expect green "canaries: the shard built its own cfg alone" test "$(awk '{ print $2 }' "$dir/planted-dirs" | sort -u)" = canary-inf_canary_a
+expect red "canaries: a shard removes the directory of its own cfg" test -e "$dir/target/canary-inf_canary_a"
+expect_output "canaries: shard 1 of the lane copy catches the other cfg's row" "sim-canaries: 1 canaries caught" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_SHARD=1/2 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect red "canaries: the other shard removes its own cfg's directory" test -e "$dir/target/canary-inf_canary_b"
+# Controls-only builds no plant, and the table check builds and removes
+# nothing.
+: >"$dir/planted-dirs"
+expect_output "canaries: controls-only over the lane copy reads three controls" "controls only: 3 rows' controls green" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CONTROLS_ONLY=1 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect red "canaries: controls-only builds no planted directory" test -s "$dir/planted-dirs"
+mkdir -p "$dir/target/canary-inf_canary_a"
+expect_output "canaries: the table check of the lane copy reads its three rows" "table only: 3 rows well formed" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: the table check removes no planted directory" test -d "$dir/target/canary-inf_canary_a"
+# A red row's directory goes too: its log is the lane's output, not the root.
+dir="$work/canary-disk-red"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "inf_canary_toothless $row"
+expect_red_because "canaries: a lane copy whose planted test stays green is red" "NOT CAUGHT" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: the red row's planted build was made" grep -qx "cold canary-inf_canary_toothless" "$dir/planted-dirs"
+expect red "canaries: the red row's planted directory is removed" test -e "$dir/target/canary-inf_canary_toothless"
+# The removal is refused, red, for a cfg not spelled inf_canary_<name>: a
+# directory `canary-<cfg>` could then be the Loom tree or lie outside the root.
+dir="$work/canary-disk-guard"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "loom $row"
+expect_red_because "canaries: a cfg not spelled inf_canary_<name> keeps its directory, red" "is not removed: a planted directory is canary-inf_canary_<name>" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect green "canaries: the refused directory is still there" test -d "$dir/target/canary-loom"
 # ADR-0107 D1: the simulator's tests compile only with its `dst` feature,
 # so a crate-test row on `inf-sim` passes it and no other package's row
 # does — the stub answers only when it sees the feature.

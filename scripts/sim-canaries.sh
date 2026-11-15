@@ -1339,7 +1339,7 @@ crate_test() {
   echo "== canary $label: $spec $target on the planted build must go red"
   status=0
   RUSTFLAGS="--cfg $cfg" "$CARGO" test -p "$package" "${target_args[@]}" \
-    --target-dir "$TARGET_ROOT/canary-crate" -- "$name" > "$log" 2>&1 || status=$?
+    --target-dir "$TARGET_ROOT/canary-$cfg" -- "$name" > "$log" 2>&1 || status=$?
   if reason=$(judged_nothing crate-test "$status" "$log" "$name"); then
     nothing_judged "$label" "$reason"
   elif [ "$status" -eq 0 ]; then
@@ -1543,11 +1543,50 @@ scenario_row() {
   fi
 }
 
+# A planted cfg's build serves its own rows alone: its RUSTFLAGS give every
+# unit a hash of its own, so no other cfg reuses an artifact, and kept, the
+# builds outgrow the disk (over 100 GB for the whole table). So each cfg
+# builds in `canary-<cfg>` under the root, crate tests and simulator alike,
+# removed once its last row of this run (or shard) is judged, caught or red;
+# a cfg whose rows stand apart in the table's first part keeps it until its
+# last. The root is this checkout's own (ADR-0204 D1), so the removal
+# reaches no other checkout's build. last_of_cfg[i] is 1 where row i is its
+# cfg's last, read from the last row up before the first build.
+last_of_cfg=() seen_cfgs=" "
+for ((index = ${#rows[@]} - 1; index >= 0; index--)); do
+  # shellcheck disable=SC2206
+  parts=(${rows[$index]})
+  case "$seen_cfgs" in
+    *" ${parts[0]} "*) last_of_cfg[$index]=0 ;;
+    *) last_of_cfg[$index]=1 seen_cfgs="$seen_cfgs${parts[0]} " ;;
+  esac
+done
+
+# remove_planted <cfg>: removes the cfg's planted directory, and refuses, red,
+# one that is not `canary-inf_canary_<name>` under an absolute root: another
+# spelling could name the Loom tree or a path outside the root.
+remove_planted() {
+  local dir=$TARGET_ROOT/canary-$1
+  if [[ "$TARGET_ROOT" != /?* || ! "$1" =~ ^inf_canary_[A-Za-z0-9_]+$ ]]; then
+    echo "   red: $dir is not removed: a planted directory is canary-inf_canary_<name> under" \
+      "an absolute root"
+    fail=1
+    return
+  fi
+  [ -d "$dir" ] || return 0
+  if rm -rf -- "$dir"; then
+    echo "== canary $1: its last row judged, $dir removed"
+  else
+    echo "   red: $dir could not be removed, and a cfg's planted build goes after its last row"
+    fail=1
+  fi
+}
+
 if [ "$host" = Linux ]; then echo "host: Linux $(uname -r)"; fi
 start=$SECONDS
-for row in "${rows[@]}"; do
+for index in "${!rows[@]}"; do
   # shellcheck disable=SC2206
-  parts=($row)
+  parts=(${rows[$index]})
   label=$(row_label "${parts[@]}")
   case "${parts[1]}" in
     crate-test)
@@ -1556,6 +1595,7 @@ for row in "${rows[@]}"; do
     loom) loom_test "$label" "${parts[0]}" "${parts[2]}" "${parts[3]}" "${parts[4]}" ;;
     *) scenario_row "$label" "${parts[0]}" "${parts[@]:1}" ;;
   esac
+  if [ "${last_of_cfg[$index]}" -eq 1 ]; then remove_planted "${parts[0]}"; fi
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi
 judged=$caught
