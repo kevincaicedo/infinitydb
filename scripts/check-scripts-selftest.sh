@@ -2619,25 +2619,38 @@ expect green "canaries: a shard's caught rows are green" env INF_CANARY_SHARD=1/
 expect red "canaries: a shard index at its count is a scope failure" env INF_CANARY_SHARD=2/2 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 expect red "canaries: a malformed shard is a scope failure" env INF_CANARY_SHARD=1/02 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 expect red "canaries: a shard past the last cfg holds no row" env INF_CANARY_SHARD=3/4 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# canary_lane <dir> <row>… [-- <row>…]: a copy of the lane in the fixture
+# checkout <dir>, which builds in a root of its own there: the rows before
+# `--` are the table's first part, where a cfg's rows may stand apart, and
+# the rows after it the ordered part.
+canary_lane() {
+    local dir=$1
+    shift
+    [ -n "$dir" ] && [ -d "$dir" ] && [ "$#" -gt 0 ] || { echo "canary_lane: no checkout or no row" >&2; exit 2; }
+    mkdir -p "$dir/scripts"
+    cp ./scripts/target-root.sh "$dir/scripts/target-root.sh"
+    printf '%s\n' "$@" | awk '
+        BEGIN { part = 0 }
+        NR == FNR { if ($0 == "--") part = 1; else table[part, ++n[part]] = $0; next }
+        $0 == "rows=(" || $0 == "ordered_rows=(" {
+            print
+            part = $0 == "rows=(" ? 0 : 1
+            for (i = 1; i <= n[part]; i++) printf "  \"%s\"\n", table[part, i]
+            skip = 1
+            next
+        }
+        skip && $0 == ")" { skip = 0 }
+        skip { next }
+        /^historical_rows=/ { print "historical_rows=" (n[0] + 0); next }
+        { print }' - "$CANARY" >"$dir/scripts/sim-canaries.sh"
+}
 # A fixture's table is ordered whole, so a cfg the table splits lives in the
 # historical part alone (eleven cfgs hold rows apart there): a copy of the
 # lane whose historical part is `a b c a` and whose ordered part is `d`.
 # Shards count cfgs, never runs of rows, so both rows of `a` run in shard 0.
 dir=$(canary_fixture canary-shard-split "$failed_line" "$ok_line")
-mkdir -p "$dir/scripts"
-cp ./scripts/target-root.sh "$dir/scripts/target-root.sh"
-awk -v row="crate-test fake test:suite the_row" '
-    $0 == "rows=(" || $0 == "ordered_rows=(" {
-        print
-        n = split($0 == "rows=(" ? "a b c a" : "d", cfgs, " ")
-        for (i = 1; i <= n; i++) printf "  \"inf_canary_%s %s\"\n", cfgs[i], row
-        skip = 1
-        next
-    }
-    skip && $0 == ")" { skip = 0 }
-    skip { next }
-    /^historical_rows=/ { print "historical_rows=4"; next }
-    { print }' "$CANARY" >"$dir/scripts/sim-canaries.sh"
+row="crate-test fake test:suite the_row"
+canary_lane "$dir" "inf_canary_a $row" "inf_canary_b $row" "inf_canary_c $row" "inf_canary_a $row" -- "inf_canary_d $row"
 expect_output "canaries: a split cfg's rows are one shard's" "shard 0/2: 3 of 5 rows (4 cfgs)" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_SHARD=0/2 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
 cp "$work/log" "$dir/shard-0.log"
 expect green "canaries: the shard holding a split cfg catches both its rows" test "$(grep -c '^   caught: test the_row ... FAILED' "$dir/shard-0.log")" -eq 3
