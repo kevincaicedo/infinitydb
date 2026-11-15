@@ -59,7 +59,7 @@ use inf_store::{
     TieredLookup, TieredTable,
 };
 
-use crate::net::{CellNet, Plant, SimDriver};
+use crate::net::{CellNet, Plant, SimDriver, drain_violations};
 
 mod legs;
 
@@ -1217,6 +1217,7 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
     if world.report.unlink_deferrals == 0 {
         world.report.violations.push("no unlink deferral observed under flood".into());
     }
+    drain_violations(core::slice::from_ref(world.driver.net()), &mut world.report.violations);
     let mut report = std::mem::take(&mut world.report);
     report.state.number(b"finish-time-us", world.now_us);
     report.state.keyspace(&world.ks, inf_foundation::time::Nanos(world.now_us * 1000));

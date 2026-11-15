@@ -19,6 +19,8 @@ use inf_runtime::{
 };
 use inf_server::SimDisk;
 
+use crate::driver::Violations;
+
 /// How a cell's net hands a connection's pending bytes to a reap.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Delivery {
@@ -427,6 +429,17 @@ impl CellNet {
     }
 }
 
+/// Moves every net's broken invariants into `violations`. A harness that
+/// judges a run drains its nets where it reads its own violations, so a
+/// refused re-arm or a chunk posted after an EOF is never dropped with them.
+pub(crate) fn drain_violations(nets: &[Rc<RefCell<CellNet>>], violations: &mut Violations) {
+    for net in nets {
+        for broken in net.borrow_mut().take_violations() {
+            violations.push(broken);
+        }
+    }
+}
+
 /// `BackendDriver` over a [`CellNet`]. One per cell. Durable scenarios
 /// attach a [`SimDisk`] (M2-S18, ADR-0020 D7): `LogWrite`/`Fdatasync`
 /// execute against its volatile/durable layers — a write completes
@@ -567,6 +580,11 @@ impl ObservedIo {
 }
 
 impl SimDriver {
+    /// The net this driver serves, whose invariants its harness drains.
+    pub(crate) fn net(&self) -> &Rc<RefCell<CellNet>> {
+        &self.net
+    }
+
     pub fn new(net: Rc<RefCell<CellNet>>) -> SimDriver {
         SimDriver {
             net,

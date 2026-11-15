@@ -29,7 +29,7 @@ use inf_store::{KeyspaceSeed, NsSpec, SlotRouter, StoreConfig};
 
 use super::{FROZEN_MESH, STEP_NS_FLOOR, namespace_specs, node_hasher};
 use crate::driver::Violations;
-use crate::net::{CellNet, Plant, SimDriver, listener_fd};
+use crate::net::{CellNet, Plant, SimDriver, drain_violations, listener_fd};
 use crate::resp::reply_len;
 
 /// The legs, each one row of `scripts/sim-smoke.sh` or one pinned red.
@@ -348,11 +348,7 @@ impl Rig {
         for id in 0..self.clients.len() {
             self.observe(id);
         }
-        for net in &self.nets {
-            for broken in net.borrow_mut().take_violations() {
-                self.violations.push(broken);
-            }
-        }
+        drain_violations(&self.nets, &mut self.violations);
         self.clock.advance(Nanos(STEP_NS_FLOOR + self.rng.next_u64() % self.step_ns_max));
         self.steps += 1;
     }
