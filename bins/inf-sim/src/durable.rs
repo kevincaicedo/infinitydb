@@ -71,6 +71,8 @@ mod run;
 mod stop_tick;
 mod tier_budget;
 mod timers;
+#[cfg(test)]
+mod watermark;
 pub use ledger_wedge::{LedgerWedgeLeg, LedgerWedgeReport};
 pub(crate) use mget_audit::{
     DOCUMENT_REPLY_BUDGET_BYTES, MgetTally, audit_report, next_audit_command, with_reply_budget,

@@ -1463,6 +1463,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.ckpt_waiters.waiting()
     }
 
+    /// Waits parked on this cell's durability watermark (`always` acks; 0
+    /// on a cell with no durable plane), for the simulator's loop-tier
+    /// tests: used only between scheduler steps.
+    pub fn ack_waiters_for_sim(&self) -> usize {
+        self.shared.durable.borrow().as_ref().map_or(0, |cell| cell.ack_gate.waiting())
+    }
+
     /// Cold-read members this cell's turns have yet to visit (its cold
     /// host's pending delivery; 0 on a cell with no cold host), for the
     /// simulator's park test: used only between scheduler steps.
