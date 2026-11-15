@@ -201,3 +201,47 @@ fn timeout_spares_a_command_held_at_a_frozen_peer() {
     assert_eq!(client.replies, [b"$-1\r\n".to_vec()], "the held GET's reply");
     judge_reaped(&mut quiet, &mut [("the held client", &mut client)]);
 }
+
+/// `DEBUG SLEEP 3` under `timeout 1`. During the sleep a third client sends a
+/// 160 KiB `SET`, more than the cell's pool of 128 buffers of 1 KiB, so the
+/// inbox holds the pool; then a second client, answered 0.8 s before, sends
+/// `PING`, which waits in the net as the kernel holds a paused receive. Every
+/// request of the stalled cell is answered after the stall, and each client
+/// is reaped a timeout after its reply (ADR-0193 D2, D5). Engagement: the
+/// second client's bytes are still in the net when the stall ends, else
+/// `VACUOUS pool-not-dry`.
+#[test]
+#[ignore = "timeout judges a connection by its receive clock while its cell is stalled, so the \
+            sweep closes clients whose requests the stall holds unread; red until a connection \
+            is judged from the later of its clock and the stall's end"]
+fn timeout_spares_the_replies_of_a_stalled_cell() {
+    const BIG_BYTES: usize = 160 * 1024;
+    let mut quiet = Quiet::boot(1, DurableScenario::SPIN_ITERS, 0);
+    set_timeout(&mut quiet);
+    let mut second = Watched::connect(&mut quiet, 0);
+    second.send(&mut quiet, &[b"PING"]);
+    step_until_answered(&mut quiet, &mut [("the second client", &mut second)]);
+    let answered = second.replied_at.expect("PONG");
+    let mut issuer = Watched::connect(&mut quiet, 0);
+    issuer.send(&mut quiet, &[b"DEBUG", b"SLEEP", b"3"]);
+    let mut third = Watched::connect(&mut quiet, 0);
+    let mut clients = [
+        ("the issuer", &mut issuer),
+        ("the second client", &mut second),
+        ("the third client", &mut third),
+    ];
+    step_until(&mut quiet, Nanos(answered.0 + 400_000_000), &mut clients);
+    let big = vec![b'v'; BIG_BYTES];
+    clients[2].1.send(&mut quiet, &[b"SET", b"big", &big]);
+    step_until(&mut quiet, Nanos(answered.0 + 800_000_000), &mut clients);
+    clients[1].1.send(&mut quiet, &[b"PING"]);
+    let stall_end = Nanos(answered.0 + 3 * TIMEOUT.0);
+    step_until(&mut quiet, stall_end, &mut clients);
+    let unread = quiet.node.nets[0].borrow().unread(clients[1].1.fd).unwrap_or(0);
+    assert!(unread > 0, "VACUOUS pool-not-dry: the second client's PING was taken in the stall");
+    step_until_answered(&mut quiet, &mut clients);
+    assert_eq!(clients[0].1.replies.last().map(Vec::as_slice), Some(b"+OK\r\n".as_slice()));
+    assert_eq!(clients[1].1.replies.last().map(Vec::as_slice), Some(b"+PONG\r\n".as_slice()));
+    assert_eq!(clients[2].1.replies.last().map(Vec::as_slice), Some(b"+OK\r\n".as_slice()));
+    judge_reaped(&mut quiet, &mut clients);
+}
