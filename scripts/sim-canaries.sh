@@ -1222,7 +1222,15 @@ case "$work" in
   */sim-canaries.??????) [ -d "$work" ] || { echo "sim-canaries: mktemp failed"; exit 2; } ;;
   *) echo "sim-canaries: mktemp failed"; exit 2 ;;
 esac
-trap 'case "$work" in */sim-canaries.??????) rm -rf -- "$work" ;; esac' EXIT
+# On any exit the work directory goes, and so does the planted directory of
+# the cfg whose rows were running (remove_planted, below): an interrupted run
+# leaves no planted build behind. A signal exits, so every bash runs the trap.
+planted_cfg=
+trap 'case "$work" in */sim-canaries.??????) rm -rf -- "$work" ;; esac
+  [ -z "$planted_cfg" ] || remove_planted "$planted_cfg"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 log=$work/planted.log
 control=$work/control.log
 
@@ -1578,7 +1586,7 @@ remove_planted() {
   local dir=$TARGET_ROOT/canary-$1 removed
   if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then return 0; fi
   if removed=$(target_root_remove "$dir" 2>&1); then
-    echo "== canary $1: its rows judged, $removed removed"
+    echo "== canary $1: its planted build $removed removed"
   else
     echo "   red: $dir is not removed: $removed"
     fail=1
@@ -1590,6 +1598,7 @@ start=$SECONDS
 for index in "${!rows[@]}"; do
   # shellcheck disable=SC2206
   parts=(${rows[$index]})
+  planted_cfg=${parts[0]}
   label=$(row_label "${parts[@]}")
   case "${parts[1]}" in
     crate-test)
@@ -1599,7 +1608,10 @@ for index in "${!rows[@]}"; do
     *) scenario_row "$label" "${parts[0]}" "${parts[@]:1}" ;;
   esac
   next=${rows[$((index + 1))]:-}
-  if [ "${next%% *}" != "${parts[0]}" ]; then remove_planted "${parts[0]}"; fi
+  if [ "${next%% *}" != "${parts[0]}" ]; then
+    remove_planted "${parts[0]}"
+    planted_cfg=
+  fi
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi
 judged=$caught

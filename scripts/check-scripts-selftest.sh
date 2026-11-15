@@ -2686,6 +2686,7 @@ fi
 mkdir -p "$dir/release"
 case "${RUSTFLAGS:-}" in
     *inf_canary_locked*) mkdir -p "$dir/release/locked" && : >"$dir/release/locked/unit" && chmod a-w "$dir/release/locked" ;;
+    *inf_canary_interrupted*) kill -TERM "$PPID" ;;
 esac
 case "$1:$planted:${RUSTFLAGS:-}" in
     build:no:*) printf '#!/usr/bin/env bash\necho "inf-sim: scenario fake-scenario: green"\n' >"$dir/release/inf-sim" ;;
@@ -2734,6 +2735,17 @@ expect_output "canaries: a lane copy with a Loom row catches it" "sim-canaries: 
 expect green "canaries: the Loom plant built in its cfg's directory" grep -qx "cold canary-inf_canary_m" "$dir/planted-dirs"
 expect green "canaries: no planted directory is left after the Loom row" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
 expect green "canaries: the plain Loom tree stays" test -d "$dir/target/loom"
+# A run stopped by a signal removes the planted directory of the cfg it was
+# running: the stub sends the lane SIGTERM from the planted build.
+dir="$work/canary-disk-interrupted"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "inf_canary_interrupted $row"
+expect red "canaries: a lane copy stopped by SIGTERM in a planted build is red" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+cp "$work/log" "$dir/run.log"
+expect red "canaries: the stopped lane gave no verdict" grep -q "^sim-canaries:" "$dir/run.log"
+expect green "canaries: the stopped cfg's planted build was made" grep -qx "cold canary-inf_canary_interrupted" "$dir/planted-dirs"
+expect red "canaries: the stopped cfg's planted directory is removed at exit" test -e "$dir/target/canary-inf_canary_interrupted"
 # A red row's directory goes too: its log is the lane's output, not the root.
 dir="$work/canary-disk-red"
 mkdir -p "$dir"
