@@ -1118,3 +1118,110 @@ fn deadline_millisecond_read_matches_redis() {
     );
     assert_eq!(node_gets, oracle_gets, "node serves the value at PTTL 0, as redis");
 }
+
+// ---- `timeout` and a client the server is still answering (ADR-0193) ----
+
+/// The large value of the timeout shapes: 12 MiB, so a 256 KiB receive
+/// buffer holds a small part of its reply.
+const TIMEOUT_VALUE_BYTES: usize = 12 << 20;
+
+/// Every byte of a `GET` of the large value: its header and payload.
+fn large_reply_bytes() -> usize {
+    format!("${TIMEOUT_VALUE_BYTES}\r\n").len() + TIMEOUT_VALUE_BYTES + 2
+}
+
+/// Sets `timeout 1` and stores the large value under `key`.
+fn timeout_setup(server: &mut TcpStream, key: &str) {
+    let mut buf = Vec::new();
+    assert_eq!(cmd(server, &mut buf, &["CONFIG", "SET", "timeout", "1"]), b"+OK\r\n");
+    let value = "v".repeat(TIMEOUT_VALUE_BYTES);
+    assert_eq!(cmd(server, &mut buf, &["SET", key, &value]), b"+OK\r\n");
+}
+
+/// Restores a pinned oracle's `timeout` and drops the large value, from a
+/// fresh connection (the setup's own was reaped).
+fn timeout_teardown(server: &TcpStream, key: &str) {
+    let mut fresh = sibling(server);
+    let mut buf = Vec::new();
+    assert_eq!(cmd(&mut fresh, &mut buf, &["CONFIG", "SET", "timeout", "0"]), b"+OK\r\n");
+    cmd(&mut fresh, &mut buf, &["DEL", key]);
+}
+
+/// R7's and R8's shape: `GET` of the large value, with `QUIT` behind it when
+/// `quit`, written once and never read. The seconds from the write until
+/// `CLIENT LIST` no longer holds the client.
+fn non_reader(server: &mut TcpStream, key: &str, quit: bool) -> f64 {
+    use std::time::{Duration, Instant};
+    timeout_setup(server, key);
+    let mut client = sibling(server);
+    let mut buf = Vec::new();
+    let id = cmd(&mut client, &mut buf, &["CLIENT", "ID"]);
+    let id = String::from_utf8_lossy(&id).trim_start_matches(':').trim_end().to_string();
+    let mut wire = encode_command(&["GET".to_string(), key.to_string()]);
+    if quit {
+        wire.extend(encode_command(&["QUIT".to_string()]));
+    }
+    client.write_all(&wire).expect("write");
+    let sent = Instant::now();
+    let mut probe = sibling(server);
+    let mut probe_buf = Vec::new();
+    loop {
+        let list = cmd(&mut probe, &mut probe_buf, &["CLIENT", "LIST"]);
+        let listed =
+            String::from_utf8_lossy(&list).lines().any(|l| l.contains(&format!("id={id} ")));
+        if !listed {
+            break;
+        }
+        assert!(sent.elapsed() < Duration::from_secs(10), "the non-reader was never closed");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let gone = sent.elapsed().as_secs_f64();
+    drop(client);
+    timeout_teardown(server, key);
+    gone
+}
+
+/// A client that never reads its large reply is reaped within `timeout` + 2 s
+/// of its request on both engines (Redis: R7), at HEAD and after the change:
+/// a reply the client never takes is no activity.
+#[test]
+fn timeout_reaps_a_non_reader_like_redis() {
+    let Some((_node_guard, mut node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (_oracle_guard, mut oracle) = oracle();
+    let redis = non_reader(&mut oracle, "timeout:non-reader", false);
+    assert!(redis <= 3.0, "redis reaped the non-reader {redis:.2} s after its request");
+    let ours = non_reader(&mut node, "timeout:non-reader", false);
+    assert!(ours <= 3.0, "node reaped the non-reader {ours:.2} s after its request, past 3 s");
+}
+
+/// The same with `QUIT` behind the `GET`, the one way `timeout` reaches a
+/// slot flushing its replies before a close: closed within `timeout` + 2 s
+/// on both engines (Redis: R8), the node's `idle_disconnections` + 1.
+#[test]
+fn timeout_reaps_a_flushing_non_reader_like_redis() {
+    let Some((_node_guard, mut node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (_oracle_guard, mut oracle) = oracle();
+    let redis = non_reader(&mut oracle, "timeout:flushing", true);
+    assert!(redis <= 3.0, "redis closed the flushing non-reader {redis:.2} s after its request");
+    let idle = |server: &TcpStream| -> u64 {
+        let mut probe = sibling(server);
+        let mut buf = Vec::new();
+        let stats = cmd(&mut probe, &mut buf, &["INFO", "stats"]);
+        String::from_utf8_lossy(&stats)
+            .lines()
+            .find_map(|line| line.strip_prefix("idle_disconnections:"))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("INFO stats names idle_disconnections")
+    };
+    let before = idle(&node);
+    let ours = non_reader(&mut node, "timeout:flushing", true);
+    assert!(ours <= 3.0, "node closed the flushing non-reader {ours:.2} s after its request");
+    assert!(idle(&node) > before, "node: the close was not the timeout's");
+}
