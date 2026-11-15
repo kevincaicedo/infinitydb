@@ -254,3 +254,28 @@ fn a_reset_connection_runs_its_queued_commands() {
     );
     assert!(node.written(0, CLIENT).is_empty(), "a reset client is answered nothing");
 }
+
+/// A `SET` and the peer's end of stream reach the cell in one completion
+/// pass, before PARSE runs. The command the client sent before its FIN is
+/// run and answered, then the connection closes (ADR-0196 A1). At HEAD the
+/// end of stream marks the slot closing in the same pass, so PARSE
+/// releases the entry unparsed and RESPOND sends nothing.
+#[test]
+#[ignore = "an end of stream reaped beside its connection's last bytes closes the slot first, so \
+            PARSE releases the bytes unparsed and nothing is answered; red until the end of \
+            stream keeps the parser, answers what was read before it, and closes after the replies"]
+fn half_close_answers_replies() {
+    let mut node = Node::new(1);
+    node.accept(0, CLIENT);
+    node.accept(0, READER);
+    node.send(0, CLIENT, &frame(&[b"SET", b"half", b"closed"]));
+    node.eof(0, CLIENT);
+    node.rounds(4);
+    assert!(node.closed(0).contains(&CLIENT), "engagement: the half-closed client was closed");
+    assert_eq!(
+        node.written(0, CLIENT),
+        b"+OK\r\n",
+        "the SET read before the end of stream was not answered"
+    );
+    assert_eq!(read_back(&mut node, 0, b"half"), b"$6\r\nclosed\r\n", "the SET did not run");
+}
