@@ -544,6 +544,7 @@ dependencies = [
  "inf-runtime",
  "inf-server",
  "inf-store",
+ "libc",
 ]
 
 [[package]]
