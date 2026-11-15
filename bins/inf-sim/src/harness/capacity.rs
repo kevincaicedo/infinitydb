@@ -93,8 +93,9 @@ pub enum CloseLeg {
     /// 8 `always` `SET`s toward a peer while its fsync is held: no ack before
     /// the hold lifts, every ack after it.
     GatedHold,
-    /// A tiered `always` `APPEND` to a peer's cold key while its fsync is
-    /// held: the verdict waits across the cold read and the hold.
+    /// A tiered `always` `APPEND` to a peer's cold key while its fsync and
+    /// tier reads are held, then a flat `always` `SET`: the `SET` parks
+    /// behind the suspended apply, and both verdicts wait for the fsync.
     GatedCold,
     /// An `always` `INCR` that errors, read under the held fsync, then the 8
     /// `SET`s of `GatedHold`.

@@ -58,8 +58,6 @@ use crate::resp::reply_len;
 
 mod audit;
 #[cfg(test)]
-mod gated;
-#[cfg(test)]
 mod idle;
 #[cfg(test)]
 mod lastsave;

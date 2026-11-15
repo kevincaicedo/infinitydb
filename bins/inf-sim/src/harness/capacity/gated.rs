@@ -7,33 +7,40 @@
 //! - `gated-hold`: 8 clients of X each send one `SET` of a key of one length
 //!   in a flat `always` namespace, in one step, delivered whole; 7 reach Y,
 //!   whose fills park 7 verdicts for X.
-//! - `gated-cold`: a tiered `always` namespace on Y, written past its window
-//!   until its oldest keys are cold; one client of X `APPEND`s to a cold key,
-//!   so Y's pump takes its slot, suspends on the cold read and fills after.
+//! - `gated-cold`, the overtake: Y has a tiered `always` namespace with a
+//!   key made cold before the holds, and the flat one. With the device also
+//!   holding Y's tier reads, a client of X `APPEND`s to the cold key, so Y's
+//!   pump opens its slot and suspends on the held read; then another client
+//!   of X `SET`s a key of the flat namespace, which only the pump-active term
+//!   of the divert parks behind it.
 //! - `gated-error`: a client of X `INCR`s a key Y holds as text: its error is
 //!   a reply, read under the hold, and its slot is given back; then the 8
 //!   `SET`s of `gated-hold`.
 //!
 //! Each clause a token: `frame-barrier-unheld`, `writes-unstaged`,
-//! `verdicts-unparked`, `gated-unpolled` and `cold-read-unissued` are
-//! engagement (`VACUOUS`); `acked-under-hold` (no write's ack is read
-//! before the lift), `error-held` (the error is), `reply-stalled-after-lift`
-//! (every reply after it), `parked-bytes-kept` and `parked-refused` (the
-//! deques' end state) are the oracles. They read the leg's own clients, its
-//! hold and the census rows, never the product's verdict.
+//! `verdicts-unparked`, `gated-unpolled`, `cold-read-unheld` and
+//! `overtook-held-apply` are engagement (`VACUOUS`); `acked-under-hold` (no
+//! write's ack is read before the lift), `error-held` (the error is),
+//! `reply-stalled-after-lift` and `reply-wrong-after-lift` (every reply after
+//! it, exact), `parked-bytes-kept` and `parked-refused` (the deques' end
+//! state) are the oracles. They read the leg's own clients, its holds and the
+//! census rows, never the product's verdict. An overtake stops Y's cell at
+//! its gated deque's `second-open-slot` check before any clause reads it.
 
 use std::path::Path;
 
 use inf_foundation::hash64;
 
-use super::small_credit::{GENERAL_WINDOW, Run, SETTLE_STEPS, padded_names_on, tiered_create};
+use super::small_credit::{
+    GENERAL_WINDOW, Run, SETTLE_STEPS, flat_bytes, padded_names_on, tiered_create,
+};
 use super::{CapacityReport, CloseLeg, X, Y};
 use crate::driver::Violations;
-use crate::durable::{MiniClient, STALL_STEPS, TraceObserver};
+use crate::durable::{MiniClient, STALL_STEPS, TraceObserver, is_tier_file};
 
 /// The node's cells.
 const CELLS: u16 = 2;
-/// The flat `always` namespace of `gated-hold` and `gated-error`.
+/// The flat `always` namespace of every gated leg.
 const FLAT: &[u8] = b"gh";
 /// The tiered `always` namespace of `gated-cold`.
 const COLD: &[u8] = b"gc";
@@ -183,8 +190,8 @@ fn step_held(
     Ok(early)
 }
 
-/// After the lift: every client reads its reply, the deques end empty and
-/// no op was refused.
+/// After the barrier lift: every client reads its reply, exact, the deques
+/// end empty and no op was refused.
 fn lifted(
     run: &mut Run,
     clients: &mut [MiniClient],
@@ -202,9 +209,9 @@ fn lifted(
     }
     for (index, (reply, want)) in replies.iter().zip(want).enumerate() {
         match reply {
-            Some(reply) if reply.starts_with(want) => {}
+            Some(reply) if reply == want => {}
             Some(reply) => violations.push(format!(
-                "client {index} read {:?} after the lift, want {:?}",
+                "reply-wrong-after-lift: client {index} read {:?}, want {:?}",
                 String::from_utf8_lossy(reply),
                 String::from_utf8_lossy(want)
             )),
@@ -287,19 +294,46 @@ fn cold(
         return Err(format!("CREATE answered {:?}", String::from_utf8_lossy(&created)));
     }
     let key = fill_cold(run)?;
-    let mut appender = [run.client_in(X, COLD)?];
+    create_flat(run)?;
+    let mut clients = [run.client_in(X, COLD)?, run.client_in(X, FLAT)?];
+    let mut early = vec![None; clients.len()];
     run.disk.hold_barriers(Some(any_file));
-    let before = appended(run);
-    let reads = run.node.cell_tier_reads(Y);
-    appender[0].send(&mut run.node, &[b"APPEND", &key, b"+"]);
-    let early = step_held(run, &mut appender, before, 1)?;
-    let issued = run.node.cell_tier_reads(Y) - reads;
-    readings.push(("cold_reads_issued", issued));
-    if issued == 0 {
-        violations.push("VACUOUS cold-read-unissued: Y issued no cold read for the APPEND".into());
+    run.disk.hold_reads(Some(is_tier_file));
+    clients[0].send(&mut run.node, &[b"APPEND", &key, b"+"]);
+    for _ in 0..STALL_STEPS {
+        read_into(run, &mut clients, &mut early);
+        if early.iter().any(Option::is_some) || run.node.driver(Y).held_reads() > 0 {
+            break;
+        }
+        run.step().map_err(|err| format!("step failed: {err}"))?;
+    }
+    if run.node.driver(Y).held_reads() == 0 {
+        violations.push("VACUOUS cold-read-unheld: Y held no tier read for the APPEND".into());
+    }
+    let name = padded_names_on(CELLS, Y, "gh", 1).remove(0);
+    let set: [&[u8]; 3] = [b"SET", &name, b"1"];
+    clients[1].send(&mut run.node, &set);
+    for _ in 0..SETTLE_STEPS {
+        run.step().map_err(|err| format!("step failed: {err}"))?;
+        read_into(run, &mut clients, &mut early);
+    }
+    let parked = run.tripwire(Y, "fabric_parked_bytes")?;
+    readings.push(("fabric_parked_bytes_held", parked));
+    if parked != flat_bytes(&set) {
+        violations.push(format!(
+            "VACUOUS overtook-held-apply: Y parked {parked} B under the held read, not the \
+             SET's {} B",
+            flat_bytes(&set)
+        ));
+    }
+    run.disk.hold_reads(None);
+    for _ in 0..SETTLE_STEPS {
+        run.step().map_err(|err| format!("step failed: {err}"))?;
+        read_into(run, &mut clients, &mut early);
     }
     none_acked(&early, violations);
-    lifted(run, &mut appender, early, &[&b":"[..]], violations)
+    let appended = format!(":{}\r\n", COLD_VALUE_LEN + 1).into_bytes();
+    lifted(run, &mut clients, early, &[appended.as_slice(), &b"+OK\r\n"[..]], violations)
 }
 
 /// Writes keys Y owns in the tiered namespace, from a client of Y, until

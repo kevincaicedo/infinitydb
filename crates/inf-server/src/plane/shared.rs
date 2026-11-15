@@ -68,13 +68,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     /// D6), which the gated deque's `second-open-slot` check holds.
     pub(super) fn diverts_to_pump(&self, from: CellId, ns: NsId) -> bool {
         let store = self.store.borrow();
-        #[cfg(not(inf_canary_ns_apply_skips_divert))]
+        #[cfg(not(inf_canary_divert_queue_only))]
         let behind = self.ns_pump_active.borrow()[usize::from(from.0)]
             || !self.ns_applies.borrow().is_empty_for(from);
-        // Canary: a flat durable apply runs inline while its origin's pump
-        // holds work, so two of that origin's applies are in progress.
-        #[cfg(inf_canary_ns_apply_skips_divert)]
-        let behind = false;
+        // Canary: the queue alone diverts, so a flat durable apply runs
+        // inline while its origin's pump holds an apply on a cold read.
+        #[cfg(inf_canary_divert_queue_only)]
+        let behind = !self.ns_applies.borrow().is_empty_for(from);
         store.is_tiered(ns) || (store.ns_fsync_class(ns).is_some() && behind)
     }
 

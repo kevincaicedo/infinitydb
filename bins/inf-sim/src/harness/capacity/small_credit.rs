@@ -95,7 +95,7 @@ pub(super) fn padded_names_on(cells: u16, owner: usize, stem: &str, count: usize
 
 /// A parked apply's bytes: the flat copy of its argv, `[argc:u32]`, an end
 /// `u32` an argument, then the arguments.
-fn flat_bytes(argv: &[&[u8]]) -> u64 {
+pub(super) fn flat_bytes(argv: &[&[u8]]) -> u64 {
     let args: usize = argv.iter().map(|arg| arg.len()).sum();
     (4 + 4 * argv.len() + args) as u64
 }
