@@ -1360,6 +1360,9 @@ impl BackendDriver for UringDriver {
             .completion()
             .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags()))
             .collect();
+        // Canary: the reap's completions are dispatched last first.
+        #[cfg(inf_canary_uring_cqe_order_reversed)]
+        let cqes = cqes.into_iter().rev();
         for (id, result, flags) in cqes {
             self.dispatch_cqe(id, result, flags, pool, out);
         }

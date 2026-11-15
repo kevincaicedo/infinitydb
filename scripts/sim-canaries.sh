@@ -1019,6 +1019,10 @@ rows=(
   # the_scan_batching_oracle_judges_pages_and_sets_others_aside holds both), and planted, its
   # judged pages are red.
   "inf_canary_scan_chunk_of_one m4-tiered scan-one-read-an-entry --seed 0x51ee082d"
+  # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
+  # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
+  # the reap is dispatched last first, and the end of stream comes before the bytes.
+  "inf_canary_uring_cqe_order_reversed crate-test inf-runtime/uring test:driver_conformance multishot_recv_posts_data_before_eof eof-before-data"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
