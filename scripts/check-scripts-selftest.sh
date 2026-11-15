@@ -5499,6 +5499,14 @@ lc_reset
 printf '%s\n' 'pub const CAP: u32 = Cap::entries("x", 1);' >"$root/crates/fake/src/limits.rs"
 expect green "lint-scopes: containers — Cap::entries in a limits.rs (control)" lc_run "$root"
 lc_reset
+lc_append 'pub fn cap(n: u32) -> Result<Cap, CapError> { Cap::derived(&CEILING, n) }'
+expect_red_because "lint-scopes: containers — Cap::derived outside a limits.rs" \
+    "\`Cap::derived\` outside a \`limits.rs\`" lc_run "$root"
+lc_reset
+printf '%s\n' 'pub fn cap(n: u32) -> Result<Cap, CapError> { Cap::derived(&CEILING, n) }' \
+    >"$root/crates/fake/src/limits.rs"
+expect green "lint-scopes: containers — Cap::derived in a limits.rs (control)" lc_run "$root"
+lc_reset
 lc_edit 's|        let map: HashMap<u8, u8> = HashMap::new();|        let map: HashMap<u8, u8> = Default::default();|' "$LC_A"
 expect_red_because "lint-scopes: containers — fewer than the row" \
     "\`fn Owner::build\` holds 1 container span(s), its row says 2 — lower the row to 1" lc_run "$root"

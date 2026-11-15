@@ -84,6 +84,26 @@ impl Cap {
         Cap { name, entries, fill }
     }
 
+    /// `n` entries under `ceiling`'s name and fill, for a cap its host
+    /// computes from boot configuration (ADR-0177 D1): `1 <= n <=` the
+    /// ceiling's entries, else `CapError::Layout`, returned before the cell
+    /// serves. Spelled only in a `limits.rs`, as `Cap::entries` is, so every
+    /// derived cap is still a nonzero `Cap` a named `limits` const bounds,
+    /// and its census row carries the derived value under the ceiling's
+    /// name.
+    ///
+    /// # Errors
+    /// `CapError::Layout` when `n` is 0 or above the ceiling's entries.
+    pub const fn derived(ceiling: &Cap, n: u32) -> Result<Cap, CapError> {
+        if n > ceiling.entries.get() {
+            return Err(CapError::Layout);
+        }
+        match NonZeroU32::new(n) {
+            Some(entries) => Ok(Cap { name: ceiling.name, entries, fill: ceiling.fill }),
+            None => Err(CapError::Layout),
+        }
+    }
+
     /// The row's name on the cell's census.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -197,6 +217,26 @@ mod tests {
         const ONE: Cap = Cap::entries::<1>("one", CapFill::Assembly);
         assert_eq!(ONE.entries_max(), 1);
         assert_eq!(ONE.fill(), CapFill::Assembly);
+    }
+
+    /// A derived cap: 0, 1, the ceiling − 1, the ceiling and the ceiling + 1
+    /// against a ceiling of 16, and `u32::MAX`; the name and the fill are
+    /// the ceiling's.
+    #[test]
+    fn a_derived_cap_takes_the_ceilings_name_and_fill_within_its_entries() {
+        const CEILING: Cap = Cap::entries::<16>("per-origin", CapFill::Serving);
+        for n in [1, 15, 16] {
+            let cap = Cap::derived(&CEILING, n).expect("within the ceiling");
+            assert_eq!(
+                (cap.name(), cap.entries_max(), cap.fill()),
+                ("per-origin", n, CapFill::Serving)
+            );
+        }
+        for n in [0, 17, u32::MAX] {
+            assert_eq!(Cap::derived(&CEILING, n), Err(CapError::Layout), "n = {n}");
+        }
+        const ASSEMBLY: Cap = Cap::entries::<1>("one", CapFill::Assembly);
+        assert_eq!(Cap::derived(&ASSEMBLY, 1).map(Cap::fill), Ok(CapFill::Assembly));
     }
 
     #[test]
