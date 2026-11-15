@@ -61,6 +61,15 @@
 #                                 -u …`, `env RUSTFLAGS=…`) inside the argv,
 #                                 and env, a program, sets the variable
 #                                 whatever the calling shell holds read-only.
+#   target_root_remove <dir>      after setup, checks 1-4, then removes <dir>,
+#                                 a directory directly below the root (by its
+#                                 parent's physical path) that holds no .git
+#                                 and no .checkout-path at or below it (the
+#                                 walk --clean makes), and prints it; nothing
+#                                 when it is absent. Exit 2, nothing removed,
+#                                 on any other path, a link or a file, or a
+#                                 walk that finds one; exit 1 when the
+#                                 removal failed partway.
 # Setup runs no cargo, so a script run alone under a cargo config's build-dir
 # puts its intermediate outputs there; the export below refuses one.
 #
@@ -111,6 +120,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -181,6 +191,30 @@ def config_read(phys):
     return files
 
 
+def walk_hit(top, own_marker):
+    """The first .git at or below top, or .checkout-path at or below it (below its top when
+    own_marker: the root's own marker sits at its top). The walk follows no link."""
+    def unreadable(err):
+        refuse(f"target-root: cannot read {err.filename} while walking {top} ({err.strerror}), "
+               "so what removing it would remove is unknown")
+    if not os.path.isdir(top):
+        return None
+    for here, dirs, files in os.walk(top, onerror=unreadable):
+        for name in dirs + files:
+            if name == ".git" or (name == MARKER and not (own_marker and here == top)):
+                return os.path.join(here, name)
+    return None
+
+
+def hit_refusal(top, hit, after):
+    what = ("a work tree or a repository" if os.path.basename(hit) == ".git"
+            else "another checkout's target root")
+    whose = "this root" if top == root else "it"
+    refuse(f"target-root: {top} holds {hit}, {what}: removing {whose} would remove it. Move "
+           f"it out of the root (a work tree: git worktree move <it> <a directory outside "
+           f"{root}>), then {after}")
+
+
 for name in ("CARGO_BUILD_BUILD_DIR", "CARGO_BUILD_TARGET"):
     if name in os.environ:
         refuse(f"target-root: {name} is set ({os.environ[name]!r}): "
@@ -232,6 +266,30 @@ if mode == "setup":
     print(key)
     print(phys)
     print(root)
+    sys.exit(0)
+
+# remove <dir>: a directory directly below the root, by its parent's physical path, after the
+# walk --clean makes; the checks, the walk and the removal run in one process.
+if mode == "remove":
+    parent, leaf = os.path.split(sys.argv[4])
+    if leaf in ("", ".", "..") or os.path.realpath(parent) != os.path.realpath(root):
+        refuse(f"target-root: {sys.argv[4]} is not a directory directly below this checkout's "
+               f"root {root}; nothing removed")
+    path = os.path.join(root, leaf)
+    if os.path.islink(path) or (os.path.lexists(path) and not os.path.isdir(path)):
+        refuse(f"target-root: {path} is not a directory (a link or a file); nothing removed")
+    if not os.path.lexists(path):
+        sys.exit(0)
+    hit = walk_hit(path, False)
+    if hit:
+        hit_refusal(path, hit, "remove it again")
+    try:
+        shutil.rmtree(path)
+    except OSError as err:
+        print(f"target-root: removing {path} failed at {err.filename} ({err.strerror}); what "
+              "was not reached is left", file=sys.stderr)
+        sys.exit(1)
+    print(path)
     sys.exit(0)
 
 # --print and --clean: where cargo says this checkout's builds land.
@@ -295,28 +353,6 @@ def shares_root(writer):
     return None
 
 
-def walk_hit():
-    """The first .git at or below the root, or .checkout-path below its top."""
-    def unreadable(err):
-        refuse(f"target-root: cannot read {err.filename} while walking {root} ({err.strerror}), "
-               "so what removing the root would remove is unknown")
-    if not os.path.isdir(root):
-        return None
-    for here, dirs, files in os.walk(root, onerror=unreadable):
-        for name in dirs + files:
-            if name == ".git" or (name == MARKER and here != root):
-                return os.path.join(here, name)
-    return None
-
-
-def hit_refusal(hit, after):
-    what = ("a work tree or a repository" if os.path.basename(hit) == ".git"
-            else "another checkout's target root")
-    refuse(f"target-root: {root} holds {hit}, {what}: removing this root would remove it. Move "
-           f"it out of the root (a work tree: git worktree move <it> <a directory outside "
-           f"{root}>), then {after}")
-
-
 def sharer_refusal(other):
     refuse(f"target-root: {root} is also the target of the checkout at {other} (its target is a "
            "link or a mount to this directory, the same device and inode): removing it would "
@@ -340,9 +376,9 @@ def tag():
 
 
 if mode == "clean":
-    hit = walk_hit()
+    hit = walk_hit(root, True)
     if hit:
-        hit_refusal(hit, "run this command again")
+        hit_refusal(root, hit, "run this command again")
     writer = written_for()
     if writer is not None and writer != phys + "\n" and shares_root(writer):
         sharer_refusal(shares_root(writer))
@@ -375,9 +411,9 @@ if writer is None:
         others = sorted(e for e in os.listdir(root)
                         if e not in allowed and not e.startswith(TEMPORARY))
         if others:
-            hit = walk_hit()
+            hit = walk_hit(root, True)
             if hit:
-                hit_refusal(hit, "run the recipe again, which prints the command that cleans it")
+                hit_refusal(root, hit, "run the recipe again, which prints the command that cleans it")
             shown = ", ".join(others[:5]) + (f" and {len(others) - 5} more" if len(others) > 5
                                               else "")
             refuse(f"target-root: {root} holds {shown} but no marker naming this checkout: "
@@ -451,6 +487,12 @@ target_root_cargo_fresh() {
         return 2
     fi
     env CARGO_TARGET_DIR="$dir" "$@"
+}
+
+target_root_remove() {
+    [ -n "${TARGET_ROOT_CHECKOUT:-}" ] || { echo "target-root: target_root_setup has not run" >&2; return 2; }
+    [ "$#" -eq 1 ] && [ -n "$1" ] || { echo "target-root: usage: target_root_remove <dir>" >&2; return 2; }
+    target_root_py remove "$TARGET_ROOT_CHECKOUT" "$TARGET_ROOT_KEPT" "$1"
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

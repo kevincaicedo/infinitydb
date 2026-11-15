@@ -8272,6 +8272,64 @@ tr_gone_writer() { # the marker names a checkout that is gone: a copy's root, cl
 }
 expect green "target-root: a root a gone checkout marked prints --clean, which cleans and marks it" \
     tr_gone_writer
+# target_root_remove: a directory directly below the root goes, after the walk
+# --clean makes; any other path, a link, and a directory holding a work tree or
+# another root are refused with nothing removed.
+TR_RM="$TRW/remove me"
+tr_checkout "$TR_RM"
+TR_PRM=$(tr_phys "$TR_RM")
+mkdir -p "$TR_RM/target/debug" "$TR_RM/outside"
+: >"$TR_RM/target/debug/kept"
+: >"$TR_RM/outside/sentinel"
+tr_remove() { # <checkout> <dir>: setup, then the removal; stdout to $TRW/out, stderr to $TRW/err
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_BUILD_DIR -u CARGO_BUILD_TARGET bash -c \
+        '. "$1/scripts/target-root.sh" && target_root_setup "$1" && target_root_remove "$2"' \
+        tr_remove "$1" "$2" >"$TRW/out" 2>"$TRW/err"
+}
+tr_remove_refused() { # <dir> <pattern> [<path>]: exit 2 naming the pattern, nothing printed or removed
+    local status=0
+    tr_remove "$TR_RM" "$1" || status=$?
+    [ "$status" -eq 2 ] && [ ! -s "$TRW/out" ] && grep -q -- "$2" "$TRW/err" &&
+        [ -e "$TR_RM/outside/sentinel" ] && [ -e "$TR_RM/target/debug/kept" ] &&
+        { [ -z "${3:-}" ] || [ -e "$3" ]; } && return 0
+    echo "target_root_remove exit $status, want 2 naming '$2':"
+    cat "$TRW/out" "$TRW/err"
+    return 1
+}
+tr_remove_one() { # a directory below the root goes, printed by its physical path
+    local status=0
+    mkdir -p "$TR_RM/target/canary-x/debug/deps"
+    : >"$TR_RM/target/canary-x/debug/deps/unit"
+    tr_remove "$TR_RM" "$TR_RM/target/canary-x" || status=$?
+    [ "$status" -eq 0 ] && [ "$(cat "$TRW/out")" = "$TR_PRM/target/canary-x" ] &&
+        [ ! -e "$TR_RM/target/canary-x" ] && [ -e "$TR_RM/target/debug/kept" ] ||
+        { echo "exit $status"; cat "$TRW/out" "$TRW/err"; return 1; }
+}
+expect green "target-root: target_root_remove removes a directory below the root and prints it" tr_remove_one
+tr_remove_absent() { tr_remove "$TR_RM" "$TR_RM/target/canary-absent" && [ ! -s "$TRW/out" ]; }
+expect green "target-root: target_root_remove of an absent directory prints nothing" tr_remove_absent
+expect green "target-root: target_root_remove refuses a path that climbs out of the root" \
+    tr_remove_refused "$TR_RM/target/canary-x/../../outside" "is not a directory directly below this checkout's root"
+expect green "target-root: target_root_remove refuses a directory deeper than the root's own" \
+    tr_remove_refused "$TR_RM/target/debug/deps" "is not a directory directly below"
+expect green "target-root: target_root_remove refuses the root itself" \
+    tr_remove_refused "$TR_RM/target" "is not a directory directly below"
+mkdir -p "$TR_RM/target/canary-g/wt" "$TR_RM/target/canary-m" "$TRW/linked-away"
+: >"$TR_RM/target/canary-g/wt/.git"
+: >"$TR_RM/target/canary-m/.checkout-path"
+: >"$TRW/linked-away/file"
+ln -s "$TRW/linked-away" "$TR_RM/target/canary-l"
+expect green "target-root: target_root_remove refuses a directory holding a .git, the walk --clean makes" \
+    tr_remove_refused "$TR_RM/target/canary-g" "holds $TR_PRM/target/canary-g/wt/.git, a work tree or a repository" \
+    "$TR_RM/target/canary-g/wt/.git"
+expect green "target-root: target_root_remove refuses a directory that is another root, marker at its top" \
+    tr_remove_refused "$TR_RM/target/canary-m" "holds $TR_PRM/target/canary-m/.checkout-path, another checkout" \
+    "$TR_RM/target/canary-m/.checkout-path"
+expect green "target-root: target_root_remove refuses a link, removing neither it nor its target" \
+    tr_remove_refused "$TR_RM/target/canary-l" "is not a directory (a link or a file)" "$TRW/linked-away/file"
+expect green "target-root: the refused link is still there" test -L "$TR_RM/target/canary-l"
+expect_red_because "target-root: target_root_remove before setup is refused" "target_root_setup has not run" \
+    bash -c '. "$1/scripts/target-root.sh" && target_root_remove "$1/target/canary-x"' tr_remove "$TR_RM"
 # --print: where cargo says the builds land, the variable removed.
 TR_M="$TRW/meta"
 tr_checkout "$TR_M"
@@ -8549,6 +8607,22 @@ tr_walk_mutant_case() { # <helper dir>: --clean refuses a root holding a work tr
     tr_clean_refused "$1" - "a work tree or a repository" && [ -e "$1/target/debug/wt/.git" ]
 }
 tr_control walk tr_walk_mutant_case
+tr_remove_walk_case() { # <helper dir>: the removal refuses a directory of the root holding a work tree
+    local status=0
+    mkdir -p "$1/target/canary-w/wt"
+    : >"$1/target/canary-w/wt/.git"
+    tr_remove "$1" "$1/target/canary-w" || status=$?
+    [ "$status" -eq 2 ] && [ -e "$1/target/canary-w/wt/.git" ]
+}
+tr_remove_below_case() { # <helper dir>: the removal refuses a path that climbs out of the root
+    local status=0
+    mkdir -p "$1/target/canary-x" "$1/outside"
+    : >"$1/outside/sentinel"
+    tr_remove "$1" "$1/target/canary-x/../../outside" || status=$?
+    [ "$status" -eq 2 ] && [ -e "$1/outside/sentinel" ]
+}
+tr_control remove-walk tr_remove_walk_case
+tr_control remove-below tr_remove_below_case
 tr_fresh_case() { # <helper dir>: its fresh build refuses a directory an earlier run filled
     local status=0
     env bash -c '. "$1/scripts/target-root.sh"; target_root_cargo_fresh "$2" "$3"' sh "$1" "$TR_FR/full" \
@@ -8560,8 +8634,12 @@ tr_mutant fresh 's/^    if \[ -d "\$dir" \] && \[ -n "\$(ls -A "\$dir")" \]; the
     "builds in a directory an earlier run filled"
 tr_mutant marker 's/^if writer is not None and writer != phys + "\\n":$/if False:/' tr_copy_case \
     "skips the marker's checkout"
-tr_mutant walk 's/^            if name == ".git" or (name == MARKER and here != root):$/            if False:/' \
+tr_mutant walk 's/^            if name == ".git" or (name == MARKER and not (own_marker and here == top)):$/            if False:/' \
     tr_walk_mutant_case "removes a root that holds a work tree"
+tr_mutant remove-walk 's/^    hit = walk_hit(path, False)$/    hit = None/' tr_remove_walk_case \
+    "removes a directory of the root that holds a work tree"
+tr_mutant remove-below 's/^    if leaf in ("", ".", "..") or os.path.realpath(parent) != os.path.realpath(root):$/    if False:/' \
+    tr_remove_below_case "takes a path that climbs out of the root"
 tr_mutant outputs 's/^        if others:$/        if False:/' tr_outputs_case "stamps a root holding outputs"
 tr_mutant build-dir 's/^    if os.path.realpath(path) != os.path.realpath(root):$/    if False:/' tr_split_case \
     "skips the build directory"
