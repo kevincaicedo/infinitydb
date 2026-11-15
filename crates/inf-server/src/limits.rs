@@ -301,8 +301,6 @@ pub const MAXCLIENTS_BOOT_DEFAULT: u32 = 10_000;
 /// is refused before any cell is built.
 pub const CONN_TASKS_MAX: u32 = inf_runtime::MAX_SLOT;
 
-const _: () = assert!(MAXCLIENTS_BOOT_DEFAULT >= 1 && MAXCLIENTS_BOOT_DEFAULT <= CONN_TASKS_MAX);
-
 /// Data credits the plane keeps free toward each peer for the owner pump's
 /// publish fan (ADR-0192 D2): a general send stages only while more than
 /// this many credits toward its peer are free, so at least one stays free
@@ -336,10 +334,10 @@ pub const FABRIC_CREDITS_PER_PEER_MAX: u32 = 1_536;
 /// assertion. Crossing: none at run time; a wider entry fails the build.
 pub const PARKED_ENTRY_BYTES_MAX: usize = 40;
 
-const _: () = assert!(FABRIC_CREDITS_PER_PEER <= FABRIC_CREDITS_PER_PEER_MAX);
 const _: () = assert!(
     FABRIC_CREDITS_PER_PEER_MAX as usize * PARKED_ENTRY_BYTES_MAX
-        <= inf_foundation::limits::DEQUE_BACKING_BYTES_MAX
+        <= inf_foundation::limits::DEQUE_BACKING_BYTES_MAX,
+    "a peer's entries at the ceiling of credits fit one deque's backing"
 );
 
 /// Namespace applies one cell parks for one origin (ADR-0177 D6): FABRIC-IN

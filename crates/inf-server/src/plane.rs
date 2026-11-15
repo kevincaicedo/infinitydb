@@ -308,9 +308,18 @@ impl Parked for Gated {
 
 // ADR-0177 D6: a peer's `d` entries fit one deque's backing at the ceiling of
 // credits, so each entry stays within `PARKED_ENTRY_BYTES_MAX`.
-const _: () = assert!(core::mem::size_of::<NsApply>() <= crate::limits::PARKED_ENTRY_BYTES_MAX);
-const _: () = assert!(core::mem::size_of::<OwnerPub>() <= crate::limits::PARKED_ENTRY_BYTES_MAX);
-const _: () = assert!(core::mem::size_of::<Gated>() <= crate::limits::PARKED_ENTRY_BYTES_MAX);
+const _: () = assert!(
+    core::mem::size_of::<NsApply>() <= crate::limits::PARKED_ENTRY_BYTES_MAX,
+    "a parked namespace apply fits a parked entry"
+);
+const _: () = assert!(
+    core::mem::size_of::<OwnerPub>() <= crate::limits::PARKED_ENTRY_BYTES_MAX,
+    "a parked publish fits a parked entry"
+);
+const _: () = assert!(
+    core::mem::size_of::<Gated>() <= crate::limits::PARKED_ENTRY_BYTES_MAX,
+    "a gated verdict fits a parked entry"
+);
 
 #[allow(clippy::disallowed_types, reason = "container: A")]
 pub(super) struct Conn {
