@@ -2,7 +2,7 @@
 
 `inf-sim` is not an unsafe-leaf crate; it carries three audited `unsafe`
 constructions, following the `inf-server::log_bytes` precedent
-(ADR-0015 D4), and one in a test module.
+(ADR-0015 D4).
 
 ## 1. `net.rs::stable_slice` — reading a `StableBytes` op payload
 
@@ -60,17 +60,3 @@ constructions, following the `inf-server::log_bytes` precedent
   twin) and the S08 production path once cold reads wire into commands.
 - **Tests:** the `m4-steel` scenario itself — every run reconciles the
   aligned pool to zero leases and `--verify-determinism` replays it.
-
-## 4. `net.rs::hold_tests::stable` — a test's `StableBytes` payload
-
-- **What:** `StableBytes::new(bytes)` over `'static` bytes, the payload of
-  the `IoOp::LogWrite`s the driver's hold test submits. Test-only
-  (`#[cfg(test)]`): no shipped build carries it.
-- **Why it is sound:** `'static` bytes stay live, at one address and
-  unmodified for the whole process, so the constructor's contract (live,
-  stable, unmodified until the op's terminal completion) holds for any op
-  that carries them, however long a hold keeps it.
-- **Who else does this:** `tests/disk.rs`'s `stable`, the same constructor
-  over `'static` bytes for the driver's disk tests.
-- **Tests:** it is the test's own input; `stable_slice`, the first entry,
-  reads it back inside `submit_and_reap`.
