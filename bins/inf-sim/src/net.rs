@@ -12,6 +12,7 @@ use inf_alloc::{BufferPool, LeaseKind};
 use inf_foundation::FileOffset;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
+use inf_log::fs::sim::BarrierKind;
 use inf_runtime::{
     AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken,
     IoClass, IoOp, RawFd, StableBytes, StableBytesMut, SubmitStats, TokenClass, Wait, WriteBarrier,
@@ -458,10 +459,12 @@ pub struct SimDriver {
     /// Deferred fsync CQEs, due-time order (the disk's serial timeline
     /// keeps due times monotone, so pushes append in order).
     pending_syncs: Vec<PendingSync>,
-    /// Fdatasyncs the disk holds ([`SimDisk::hold_syncs`]), submission
-    /// order: each is submitted at the first driver entry after its hold
-    /// lifts, ahead of that entry's own ops.
-    held_syncs: Vec<(RawFd, CompletionToken)>,
+    /// Barrier ops the disk holds ([`SimDisk::hold_syncs`],
+    /// [`SimDisk::hold_barriers`]), each whole with the barrier kind read
+    /// once at its hold, submission order: each is submitted at the first
+    /// driver entry after its hold lifts, ahead of that entry's own ops, and
+    /// is observed and drawn only then.
+    held_syncs: Vec<(BarrierKind, IoOp)>,
     /// Tier reads the disk holds ([`SimDisk::hold_reads`]), submission
     /// order: each is submitted at the first driver entry after its hold
     /// lifts, ahead of that entry's own ops.
@@ -679,11 +682,27 @@ impl SimDriver {
         tier_io_of(&self.ops)
     }
 
-    /// Fdatasyncs the disk holds now ([`SimDisk::hold_syncs`]): submitted
-    /// by the plane and kept from the device until the hold lifts — the
+    /// Barrier ops the disk holds now, every kind together: submitted by
+    /// the plane and kept from the device until the hold lifts — the
     /// harness's own reading of a held barrier, no product counter.
     pub fn held_syncs(&self) -> usize {
-        self.held_syncs.len()
+        let held = self.held_barriers();
+        held.standalone + held.frames()
+    }
+
+    /// The barrier ops the disk holds now, counted by the kind each was held
+    /// as: the harness's own reading of which barriers a hold keeps, no
+    /// product counter.
+    pub fn held_barriers(&self) -> HeldBarriers {
+        let mut held = HeldBarriers::default();
+        for (kind, _) in &self.held_syncs {
+            match kind {
+                BarrierKind::Standalone => held.standalone += 1,
+                BarrierKind::Linked => held.linked += 1,
+                BarrierKind::WriteThrough => held.write_through += 1,
+            }
+        }
+        held
     }
 
     /// Tier reads the disk holds now ([`SimDisk::hold_reads`]): issued by
@@ -705,7 +724,8 @@ impl SimDriver {
             }
             PendingKind::Read { .. } => false,
         });
-        let mut fds = pending.map(|pending| pending.fd).chain(self.held_syncs.iter().map(|h| h.0));
+        let held = self.held_syncs.iter().filter_map(|(_, op)| barrier_fd(op));
+        let mut fds = pending.map(|pending| pending.fd).chain(held);
         fds.any(|fd| disk.fd_named(fd, named))
     }
 
@@ -718,26 +738,103 @@ impl SimDriver {
     }
 }
 
-/// Moves every held fdatasync whose hold has lifted to the front of `ops`,
-/// in submission order, so the driver entry submits it first. A free
+/// Barrier ops held whole by the disk, counted by kind
+/// ([`SimDriver::held_barriers`]): one driver's, so one cell's.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldBarriers {
+    /// Standalone fdatasyncs.
+    pub standalone: usize,
+    /// Writes with their linked fdatasync.
+    pub linked: usize,
+    /// Write-through writes.
+    pub write_through: usize,
+}
+
+impl HeldBarriers {
+    /// The held writes that carry a frame's barrier: a linked sync or a
+    /// write-through write.
+    #[must_use]
+    pub fn frames(self) -> usize {
+        self.linked + self.write_through
+    }
+}
+
+/// The barrier `op` carries to the device, `None` for an op that carries
+/// none: the one place an op's barrier is read, so a new op that carries
+/// one cannot pass a hold unread.
+fn barrier_of(op: &IoOp) -> Option<BarrierKind> {
+    match op {
+        IoOp::Fdatasync { .. } => Some(BarrierKind::Standalone),
+        IoOp::LogWrite { barrier, .. } => match barrier {
+            WriteBarrier::LinkedFsync { .. } => Some(BarrierKind::Linked),
+            WriteBarrier::WriteThrough => Some(BarrierKind::WriteThrough),
+            WriteBarrier::None => None,
+        },
+        IoOp::AcceptArm { .. }
+        | IoOp::RecvArm { .. }
+        | IoOp::RecvDisarm { .. }
+        | IoOp::Send { .. }
+        | IoOp::Close { .. }
+        | IoOp::TierRead { .. } => None,
+    }
+}
+
+/// The file descriptor of a write or a sync, the ops that may carry a
+/// barrier.
+fn barrier_fd(op: &IoOp) -> Option<RawFd> {
+    let (IoOp::LogWrite { fd, .. } | IoOp::Fdatasync { fd, .. }) = op else { return None };
+    Some(*fd)
+}
+
+/// Whether the disk holds `op`, a barrier of `kind`, now: the armed hold's
+/// scope admits the kind, on a file the hold names. With no hold armed the
+/// disk reads nothing more.
+fn held_now(disk: &SimDisk, kind: BarrierKind, op: &IoOp) -> bool {
+    barrier_fd(op).is_some_and(|fd| disk.barrier_held(fd, kind))
+}
+
+/// The one hold check of a driver entry, before the op's arm: an op the
+/// disk holds goes whole onto the held list with its barrier kind, read
+/// here once, so nothing of it is observed or drawn until its hold lifts;
+/// any other op is handed back to its arm. An op with no barrier reads the
+/// disk not at all.
+fn hold_or_pass(
+    disk: Option<&SimDisk>,
+    held_syncs: &mut Vec<(BarrierKind, IoOp)>,
+    op: IoOp,
+) -> Option<IoOp> {
+    let (Some(disk), Some(kind)) = (disk, barrier_of(&op)) else { return Some(op) };
+    if !held_now(disk, kind, &op) {
+        return Some(op);
+    }
+    held_syncs.push((kind, op));
+    None
+}
+
+/// Moves every held barrier op whose hold has lifted, or whose fd has
+/// closed, to the front of `ops`, in submission order, so the driver entry
+/// submits it first. Each is read by the kind it was held as. A free
 /// function over the fields, so the drain's `net` borrow stays disjoint.
 fn release_held_syncs(
     disk: Option<&SimDisk>,
-    held_syncs: &mut Vec<(RawFd, CompletionToken)>,
+    held_syncs: &mut Vec<(BarrierKind, IoOp)>,
     ops: &mut Vec<IoOp>,
 ) {
     let Some(disk) = disk else { return };
-    if held_syncs.iter().all(|&(fd, _)| disk.sync_held(fd)) {
+    let still_held = |(kind, op): &(BarrierKind, IoOp)| held_now(disk, *kind, op);
+    if held_syncs.iter().all(still_held) {
         return;
     }
     let mut released = Vec::new();
-    held_syncs.retain(|&(fd, token)| {
-        let held = disk.sync_held(fd);
-        if !held {
-            released.push(IoOp::Fdatasync { fd, token });
+    let mut kept = Vec::with_capacity(held_syncs.len());
+    for held in held_syncs.drain(..) {
+        if still_held(&held) {
+            kept.push(held);
+        } else {
+            released.push(held.1);
         }
-        held
-    });
+    }
+    *held_syncs = kept;
     ops.splice(0..0, released);
 }
 
@@ -1095,6 +1192,9 @@ impl BackendDriver for SimDriver {
         release_held_syncs(self.disk.as_ref(), &mut self.held_syncs, &mut ops);
         release_held_reads(self.disk.as_ref(), &mut self.held_reads, &mut ops);
         for op in ops.drain(..) {
+            let Some(op) = hold_or_pass(self.disk.as_ref(), &mut self.held_syncs, op) else {
+                continue;
+            };
             match op {
                 IoOp::AcceptArm { token, .. } => {
                     net.accept_arms += 1;
@@ -1270,12 +1370,6 @@ impl BackendDriver for SimDriver {
                         .disk
                         .as_ref()
                         .expect("durable sim scenarios construct SimDriver::with_disk (M2-S18)");
-                    // A held barrier reaches the device only once its hold
-                    // lifts: it is observed then, not now.
-                    if disk.sync_held(fd) {
-                        self.held_syncs.push((fd, token));
-                        continue;
-                    }
                     self.observed.note(token, 0);
                     // Stall device (M2.5-S14): standalone fsyncs (barrier
                     // dirs, everysec ticks) defer exactly like linked ones.

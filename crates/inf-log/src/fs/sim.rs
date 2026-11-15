@@ -741,6 +741,49 @@ fn apply_meta(names: &mut BTreeMap<PathBuf, u64>, op: &MetaOp) {
     }
 }
 
+/// Which barriers a hold keeps from the device.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HoldScope {
+    /// Standalone fdatasyncs alone ([`SimDisk::hold_syncs`]).
+    Standalone,
+    /// Every barrier: standalone fdatasyncs, writes with a linked
+    /// fdatasync and write-through writes ([`SimDisk::hold_barriers`]).
+    EveryBarrier,
+}
+
+impl HoldScope {
+    /// Whether a hold of this scope keeps a barrier of `kind`.
+    #[must_use]
+    pub fn admits(self, kind: BarrierKind) -> bool {
+        match self {
+            HoldScope::EveryBarrier => true,
+            HoldScope::Standalone => match kind {
+                BarrierKind::Standalone => true,
+                BarrierKind::Linked | BarrierKind::WriteThrough => false,
+            },
+        }
+    }
+}
+
+/// The barrier one driver op carries to the device, as a hold reads it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BarrierKind {
+    /// A standalone fdatasync.
+    Standalone,
+    /// A write with its linked fdatasync.
+    Linked,
+    /// A write-through write: the write is the barrier.
+    WriteThrough,
+}
+
+/// The disk's one hold: the files its predicate names and the barriers its
+/// scope keeps. Arming a hold replaces the one armed before.
+#[derive(Copy, Clone, Debug)]
+struct SyncHold {
+    named: fn(&Path) -> bool,
+    scope: HoldScope,
+}
+
 #[derive(Debug, Default)]
 struct DiskState {
     cfg: SimDiskConfig,
@@ -793,9 +836,10 @@ struct DiskState {
     stall: Option<StallModel>,
     /// Per-file faults consumed (F-L04-02): the engagement witness.
     faults_fired: u64,
-    /// `Some`: fdatasyncs on files whose name the predicate accepts are
-    /// held by the driver until the hold lifts ([`SimDisk::hold_syncs`]).
-    hold_syncs: Option<fn(&Path) -> bool>,
+    /// `Some`: the barriers its scope admits, on files whose name its
+    /// predicate accepts, are held by the driver until the hold lifts
+    /// ([`SimDisk::hold_syncs`], [`SimDisk::hold_barriers`]).
+    hold: Option<SyncHold>,
     /// `Some`: tier reads on files whose name the predicate accepts are
     /// held by the driver until the hold lifts ([`SimDisk::hold_reads`]).
     hold_reads: Option<fn(&Path) -> bool>,
@@ -1073,12 +1117,35 @@ impl SimDisk {
         self.state.borrow().os_names.keys().filter(|name| named(name)).cloned().collect()
     }
 
-    /// Holds every fdatasync on a file whose OS name `named` accepts until
-    /// the hold is lifted with `None`: a device that keeps one class of
-    /// barrier in its queue, the driver submitting the op only once the
-    /// hold lifts. With no hold armed every trace is unchanged.
+    /// Holds every standalone fdatasync on a file whose OS name `named`
+    /// accepts until the hold is lifted with `None`: a device that keeps one
+    /// class of barrier in its queue, the driver submitting the op only once
+    /// the hold lifts. A write's linked sync and a write-through write pass.
+    /// Arming replaces any hold armed before; with none armed every trace is
+    /// unchanged.
     pub fn hold_syncs(&self, named: Option<fn(&Path) -> bool>) {
-        self.state.borrow_mut().hold_syncs = named;
+        self.arm_hold(named, HoldScope::Standalone);
+    }
+
+    /// Holds every barrier on a file whose OS name `named` accepts until the
+    /// hold is lifted with `None`: a standalone fdatasync, a write with its
+    /// linked fdatasync and a write-through write are each kept whole, the
+    /// driver submitting the op only once the hold lifts, so nothing of it
+    /// is observed or drawn while it is held. A write with no barrier
+    /// passes. Arming replaces any hold armed before.
+    pub fn hold_barriers(&self, named: Option<fn(&Path) -> bool>) {
+        // Premise plant: the hold keeps standalone syncs alone, the hold the
+        // driver test's oracle reads as too narrow.
+        let scope = if cfg!(inf_canary_barrier_hold_standalone_only) {
+            HoldScope::Standalone
+        } else {
+            HoldScope::EveryBarrier
+        };
+        self.arm_hold(named, scope);
+    }
+
+    fn arm_hold(&self, named: Option<fn(&Path) -> bool>, scope: HoldScope) {
+        self.state.borrow_mut().hold = named.map(|named| SyncHold { named, scope });
     }
 
     /// Holds every tier read on a file whose OS name `named` accepts until
@@ -1100,12 +1167,13 @@ impl SimDisk {
         self.fd_named(fd, named)
     }
 
-    /// Whether an fdatasync on the driver file fd `fd` is held now: a hold
-    /// is armed and its predicate accepts a name of the fd's inode.
+    /// Whether a barrier of `kind` on the driver file fd `fd` is held now: a
+    /// hold is armed, its scope admits the kind and its predicate accepts a
+    /// name of the fd's inode. With no hold armed it reads nothing more.
     #[must_use]
-    pub fn sync_held(&self, fd: i32) -> bool {
-        let Some(named) = self.state.borrow().hold_syncs else { return false };
-        self.fd_named(fd, named)
+    pub fn barrier_held(&self, fd: i32, kind: BarrierKind) -> bool {
+        let Some(hold) = self.state.borrow().hold else { return false };
+        hold.scope.admits(kind) && self.fd_named(fd, hold.named)
     }
 
     /// Whether the driver file fd `fd` is open on an inode that has an OS
@@ -2233,8 +2301,8 @@ mod model_tests {
     }
 
     /// The family accessors read the model's own tables: open descriptors
-    /// by the name of their inode, names by the predicate, and a sync held
-    /// by the name behind its fd until the hold lifts.
+    /// by the name of their inode, names by the predicate, and a barrier
+    /// held by the name behind its fd and the hold's scope until it lifts.
     #[test]
     fn a_named_family_counts_its_open_files_and_holds_its_syncs() {
         fn is_blob(name: &Path) -> bool {
@@ -2249,14 +2317,25 @@ mod model_tests {
         assert_eq!(disk.open_files_named(is_blob), 2);
         assert_eq!(disk.names_where(is_blob).len(), 2);
         let (blob_fd, seg_fd) = (one.raw_fd().expect("fd"), seg.raw_fd().expect("fd"));
-        assert!(!disk.sync_held(blob_fd), "no hold armed");
+        let held = |fd, kind| disk.barrier_held(fd, kind);
+        assert!(!held(blob_fd, BarrierKind::Standalone), "no hold armed");
         disk.hold_syncs(Some(is_blob));
-        assert!(disk.sync_held(blob_fd));
-        assert!(!disk.sync_held(seg_fd), "the hold names one family");
+        assert!(held(blob_fd, BarrierKind::Standalone));
+        assert!(!held(seg_fd, BarrierKind::Standalone), "the hold names one family");
+        assert!(!held(blob_fd, BarrierKind::Linked), "a sync hold keeps standalone syncs alone");
+        assert!(!held(blob_fd, BarrierKind::WriteThrough), "and passes a write-through write");
         drop(two);
         assert_eq!(disk.open_files_named(is_blob), 1, "a closed handle leaves the count");
         disk.hold_syncs(None);
-        assert!(!disk.sync_held(blob_fd), "the hold lifted");
+        assert!(!held(blob_fd, BarrierKind::Standalone), "the hold lifted");
+        disk.hold_barriers(Some(is_blob));
+        for kind in [BarrierKind::Standalone, BarrierKind::Linked, BarrierKind::WriteThrough] {
+            assert!(held(blob_fd, kind), "a barrier hold keeps a {kind:?} barrier");
+        }
+        assert!(!held(seg_fd, BarrierKind::Linked), "a barrier hold names one family");
+        disk.hold_syncs(Some(is_blob));
+        assert!(!held(blob_fd, BarrierKind::Linked), "arming a sync hold replaces it");
+        disk.hold_syncs(None);
         assert!(disk.fd_named(blob_fd, is_blob), "an fd names its inode's family");
         assert!(!disk.fd_named(seg_fd, is_blob), "and no other");
         assert!(!disk.fd_named(-1, is_blob), "a fd the model never issued names nothing");

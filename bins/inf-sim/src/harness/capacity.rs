@@ -69,9 +69,11 @@ pub enum CloseLeg {
     /// Four clients that end their streams while another's `DEBUG SLEEP`
     /// stalls their cell: what each sent before its end runs.
     Stall,
-    /// 5,000 pipelined `SET`s and a FIN: 5,000 `+OK`s, then the close.
+    /// A held `DEL`, 1,000 `SET`s and a FIN, the peer released once the EOF
+    /// is posted: the `DEL`'s count and 1,000 `+OK`s, then the close.
     HalfClose,
-    /// The same, its last chunk and FIN reaped together.
+    /// 5,000 pipelined `SET`s and a FIN, the last chunk and the FIN reaped
+    /// together: 5,000 `+OK`s, then the close.
     HalfCloseEofWithData,
     /// A held `DEL`, 1,000 `SET`s and a FIN, then a reset once the EOF is
     /// posted: every `SET` lands and nothing is answered.
@@ -570,8 +572,8 @@ pub fn run_capacity_scenario(scenario: &CapacityScenario) -> CapacityReport {
         CloseLeg::RegistryFin => registry_leg(seed, Form::Fin),
         CloseLeg::QuitSubscriber => quit_subscriber_leg(seed),
         CloseLeg::Stall => stall_leg(seed),
-        CloseLeg::HalfClose => half_close_leg(seed, false),
-        CloseLeg::HalfCloseEofWithData => half_close_leg(seed, true),
+        CloseLeg::HalfClose => half_close_leg(seed),
+        CloseLeg::HalfCloseEofWithData => half_close_shared_leg(seed),
         CloseLeg::HalfCloseReset => half_close_reset_leg(seed),
         CloseLeg::DeferredQuit => deferred_quit_leg(seed),
         CloseLeg::ProtocolOrder => protocol_order_leg(seed),
@@ -852,7 +854,9 @@ fn close_leg(seed: u64) -> Rig {
     rig.expect_landed(reader, &names, "closed-queue-unrun", "the reset client");
     let answered = rig.nets[X].borrow().reset_send_errors();
     if answered != 0 {
-        rig.violate(format!("bytes-after-close: {answered} replies were sent to a reset client"));
+        rig.violate(format!(
+            "reply-to-reset-client: {answered} replies were sent to a reset client"
+        ));
     }
     rig.expect_vacant(X, 1);
     if !engaged {
@@ -1169,16 +1173,46 @@ fn stall_leg(seed: u64) -> Rig {
     rig
 }
 
-/// 5,000 pipelined `SET`s of keys the three cells own and a FIN (the queue
-/// passes its high water on the way, so the receive is disarmed and re-armed),
-/// with or without the shared reap: every `SET` lands, the client reads 5,000
+/// A held `DEL`, 1,000 `SET`s of keys the three cells own and a FIN, under
+/// the high water so no disarm withholds the EOF; cell 1's replies are
+/// released once the net posted the EOF, so the window holds every reply
+/// past it. Every `SET` lands, the client reads the `DEL`'s count and 1,000
 /// `+OK`s in order, then the close. Engagement: the fd took a `Send` after
 /// its EOF, else `VACUOUS half-close-unengaged`.
-fn half_close_leg(seed: u64, eof_with_data: bool) -> Rig {
+fn half_close_leg(seed: u64) -> Rig {
+    const SETS: usize = 1_000;
+    let mut rig = Rig::new(seed, 0, 15_000);
+    let reader = rig.admitted(X);
+    let client = rig.admitted(X);
+    let names = names_anywhere("half", SETS);
+    rig.held = Some(Y);
+    rig.send(client, &Rig::held_pipeline(Y, &sets(&names)));
+    rig.fin(client);
+    rig.until("the client's EOF", |rig| rig.nets[X].borrow().eof_posted(rig.fd(client)));
+    rig.held = None;
+    rig.until("the half-closed client's close", |rig| rig.ended(client));
+    rig.settle();
+    rig.expect_landed(reader, &names, "half-close-queue-unrun", "the half-closed client");
+    let mut owed = vec![DEL_NONE.to_vec()];
+    owed.extend(oks(SETS));
+    rig.judge_replies(client, 1, &owed, "the half-closed client");
+    rig.expect_vacant(X, 1);
+    rig.expect_sent_after_eof(client);
+    rig
+}
+
+/// 5,000 pipelined `SET`s of keys the three cells own and a FIN, the net
+/// posting the last chunk and the EOF in one reap (the queue passes its high
+/// water on the way, so the receive is disarmed and re-armed): every `SET`
+/// lands, the client reads 5,000 `+OK`s in order, then the close.
+/// Engagement: the fd took a `Send` after its EOF, else `VACUOUS
+/// half-close-unengaged`, and a reap posted a chunk with its EOF, else
+/// `VACUOUS eof-shared-unengaged`.
+fn half_close_shared_leg(seed: u64) -> Rig {
     const SETS: usize = 5_000;
     let mut rig = Rig::new(seed, 0, 15_000);
     let reader = rig.admitted(X);
-    rig.nets[X].borrow_mut().set_eof_with_data(eof_with_data);
+    rig.nets[X].borrow_mut().set_eof_with_data(true);
     let client = rig.connect(X);
     let names = names_anywhere("half", SETS);
     rig.send(client, &sets(&names));
@@ -1188,10 +1222,23 @@ fn half_close_leg(seed: u64, eof_with_data: bool) -> Rig {
     rig.expect_landed(reader, &names, "half-close-queue-unrun", "the half-closed client");
     rig.judge_replies(client, 0, &oks(SETS), "the half-closed client");
     rig.expect_vacant(X, 1);
-    if rig.nets[X].borrow().sends_after_eof(rig.fd(client)) == 0 {
-        rig.violate("VACUOUS half-close-unengaged: no Send followed the client's EOF".to_string());
+    rig.expect_sent_after_eof(client);
+    if rig.nets[X].borrow().eof_shared_reaps() == 0 {
+        let text = "VACUOUS eof-shared-unengaged: no reap posted a chunk and its EOF";
+        rig.violate(text.to_string());
     }
     rig
+}
+
+impl Rig {
+    /// The half-close forms' engagement: the fd took a `Send` after its
+    /// EOF, else `VACUOUS half-close-unengaged`.
+    fn expect_sent_after_eof(&mut self, id: usize) {
+        if self.nets[X].borrow().sends_after_eof(self.fd(id)) == 0 {
+            let text = "VACUOUS half-close-unengaged: no Send followed the client's EOF";
+            self.violate(text.to_string());
+        }
+    }
 }
 
 /// A held `DEL`, 1,000 `SET`s of keys the three cells own and a FIN; once
@@ -1432,9 +1479,9 @@ mod reds {
     }
 
     #[test]
-    #[ignore = "VACUOUS at this tree: every reply leaves before the net posts the end of \
-                stream, so no send follows it and the oracle reads green unengaged; red until \
-                the leg engages a send after its end of stream"]
+    #[ignore = "an end of stream closes the slot and Closed drops the queue behind a held \
+                reply, so what the client sent is neither run nor answered; red until a \
+                half-closed slot runs its queue and sends every reply after the end of stream"]
     fn the_half_close_leg_answers_every_reply() {
         pinned_red(CloseLeg::HalfClose);
     }

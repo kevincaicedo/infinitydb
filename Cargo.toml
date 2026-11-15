@@ -76,6 +76,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_ack_map_window_only)',
     'cfg(inf_canary_alias_blind)',
     'cfg(inf_canary_alias_no_rehash)',
+    'cfg(inf_canary_barrier_hold_standalone_only)',
     'cfg(inf_canary_cap_admits_at_cap)',
     'cfg(inf_canary_cap_minus_one)',
     'cfg(inf_canary_ckpt_form_unlatched)',

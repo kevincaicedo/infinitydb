@@ -44,7 +44,7 @@ pub(super) struct Quiet {
     pub(super) node: Node,
     rng: SplitMix64,
     pub(super) clock: Rc<VirtualClock>,
-    disk: SimDisk,
+    pub(super) disk: SimDisk,
     pub(super) step_ns_max: u64,
     /// The cell whose reactor the instrument reads.
     watched: u16,
