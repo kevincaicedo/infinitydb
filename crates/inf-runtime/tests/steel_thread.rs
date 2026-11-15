@@ -43,6 +43,16 @@ use inf_store::{
     TieredLookup, TieredTable,
 };
 
+#[path = "support/uring_env.rs"]
+mod uring_env;
+
+/// The file's one ring: the test environment's selections, checked engaged.
+fn make_ring(entries: u32) -> UringDriver {
+    let driver = UringDriver::new(entries, uring_env::config()).expect("io_uring");
+    uring_env::assert_engaged(&driver.capabilities());
+    driver
+}
+
 const NS: NsId = NsId(42);
 const RING: usize = 1 << 21; // 2 MiB — fits the corpus incl. the big record
 const PAGE: usize = 1 << 12;
@@ -421,7 +431,7 @@ fn build_demoted_corpus(
     let ctx = Rc::new(RefCell::new(Ctx {
         ks,
         pool: AlignedPool::new(4, POOL_BUF),
-        driver: UringDriver::new(64).expect("io_uring"),
+        driver: make_ring(64),
         gate: IoGate::new(),
         tier_fd: writer.raw_fd().expect("std fs has real fds"),
         tier_base: base.to_raw(),

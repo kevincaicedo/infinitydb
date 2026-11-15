@@ -33,8 +33,20 @@ fn make_driver() -> impl BackendDriver {
 }
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
+#[path = "support/uring_env.rs"]
+mod uring_env;
+
+#[cfg(all(target_os = "linux", feature = "uring"))]
 fn make_driver() -> impl BackendDriver {
-    inf_runtime::UringDriver::new(256).expect("io_uring")
+    make_ring(uring_env::config())
+}
+
+/// The file's one ring constructor: `config`'s selections, checked engaged.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+fn make_ring(config: inf_runtime::UringConfig) -> inf_runtime::UringDriver {
+    let driver = inf_runtime::UringDriver::new(256, config).expect("io_uring");
+    uring_env::assert_engaged(&driver.capabilities());
+    driver
 }
 
 struct Rig {
@@ -533,5 +545,130 @@ fn set_sndbuf(fd: i32, size: libc::c_int) {
             (&raw const size).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
+    }
+}
+
+/// The `sqes_per_submit` tripwire's canary, in tree (ADR-0209 D5): 16
+/// closes of fresh sockets, each one SQE with nothing in flight on its fd,
+/// read at the driver and through a cell loop under each submit policy.
+/// The driver leg reads the loop's two inputs (`SubmitStats`); the loop leg
+/// reads the loop's own fold. A restock of P provided buffers may ride the
+/// first call: batched reads (P + 16) / 2 >= 8 SQEs an enter, per-SQE
+/// (P + 16) / (P + 18) < 1.
+#[cfg(all(target_os = "linux", feature = "uring"))]
+mod submit_policy {
+    use std::net::UdpSocket;
+    use std::os::fd::IntoRawFd;
+
+    use inf_alloc::BufferPool;
+    use inf_foundation::CellId;
+    use inf_foundation::bounded::{Cap, CapCensus, CapFill};
+    use inf_foundation::time::StdClock;
+    use inf_runtime::{
+        BackendDriver, CellLoop, CellPlane, Completion, CompletionResult, CompletionToken, IoOp,
+        LoopConfig, LoopCx, SubmitPolicy, SubmitStats, TimerSet, TokenClass, Wait,
+    };
+
+    use super::{make_ring, uring_env};
+
+    const CLOSES: u32 = 16;
+    const OWNERS: Cap = Cap::entries::<1>("submit-policy-owners", CapFill::Serving);
+    /// The loop leg's hang bound: the closes complete within a few
+    /// iterations, so this bound ends a hang and decides nothing.
+    const ITERATIONS_MAX: u32 = 10_000;
+
+    fn closes() -> Vec<IoOp> {
+        (0..CLOSES)
+            .map(|slot| {
+                let fd = UdpSocket::bind("127.0.0.1:0").expect("socket").into_raw_fd();
+                IoOp::Close { fd, token: CompletionToken::new(TokenClass::Close, slot, 0) }
+            })
+            .collect()
+    }
+
+    /// The driver leg: the stats of the call that carries the closes, after
+    /// a warm-up call (`submit_and_reap` resets them at each call).
+    fn measured_call(policy: SubmitPolicy) -> SubmitStats {
+        let mut driver = make_ring(uring_env::config().with_submit(policy));
+        let mut pool = BufferPool::new(16, 4096);
+        let mut out = Vec::new();
+        driver.submit_and_reap(&mut pool, Wait::Poll, &mut out).expect("warm-up");
+        for op in closes() {
+            driver.push(op);
+        }
+        out.clear();
+        driver.submit_and_reap(&mut pool, Wait::Poll, &mut out).expect("the measured call");
+        driver.submit_stats()
+    }
+
+    #[test]
+    fn a_batched_ring_enters_once_for_every_queued_sqe() {
+        let stats = measured_call(SubmitPolicy::Batched);
+        assert!(stats.sqes >= u64::from(CLOSES), "every close rode the call: {stats:?}");
+        assert_eq!(stats.syscalls, 1, "one enter for the call's SQEs: {stats:?}");
+    }
+
+    #[test]
+    fn a_per_sqe_ring_enters_before_every_chain() {
+        let stats = measured_call(SubmitPolicy::PerSqe);
+        assert!(stats.sqes >= u64::from(CLOSES), "every close rode the call: {stats:?}");
+        // Every queued chain is a single SQE (a close, or a restock), so the
+        // call enters once for each and once more for its reap.
+        assert_eq!(stats.syscalls, stats.sqes + 1, "an enter before every SQE: {stats:?}");
+    }
+
+    /// Pushes the closes once, in its first PARSE, and counts their `Closed`.
+    struct ClosePlane {
+        pending: Vec<IoOp>,
+        closed: u32,
+    }
+
+    impl CellPlane for ClosePlane {
+        fn on_completion(&mut self, _cx: &mut LoopCx<'_>, c: Completion) {
+            if matches!(c.result, CompletionResult::Closed) {
+                self.closed += 1;
+            }
+        }
+        fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
+            for op in self.pending.drain(..) {
+                cx.push(op);
+            }
+        }
+        fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+    }
+
+    /// The loop leg: `tripwires()`'s `sqes_per_submit` (x1000) once every
+    /// close completed.
+    fn sqes_per_submit(policy: SubmitPolicy) -> u64 {
+        let (census, serve_mark) = CapCensus::new(CellId(0));
+        let timers = TimerSet::build(OWNERS, &census).expect("the leg's timer set");
+        let driver = make_ring(uring_env::config().with_submit(policy));
+        let pool = BufferPool::new(16, 4096);
+        let config = LoopConfig::default();
+        let mut cell = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timers);
+        let mut plane = ClosePlane { pending: closes(), closed: 0 };
+        let mut iterations = 0;
+        while plane.closed < CLOSES {
+            assert!(iterations < ITERATIONS_MAX, "{} of {CLOSES} closes completed", plane.closed);
+            cell.run_iteration(&mut plane).expect("an iteration");
+            iterations += 1;
+        }
+        let (name, value) = cell.tripwires()[0];
+        assert_eq!(name, inf_foundation::tripwire::SQES_PER_SUBMIT);
+        value
+    }
+
+    #[test]
+    #[cfg(not(feature = "no-tripwires"))]
+    fn the_tripwire_reads_a_batched_loop_at_eight_sqes_an_enter_or_more() {
+        let ratio = sqes_per_submit(SubmitPolicy::Batched);
+        assert!(ratio >= 8_000, "sqes_per_submit x1000 = {ratio}: batching is not exercised");
+    }
+
+    #[test]
+    #[cfg(not(feature = "no-tripwires"))]
+    fn the_tripwire_trips_on_a_per_sqe_loop() {
+        let ratio = sqes_per_submit(SubmitPolicy::PerSqe);
+        assert!(ratio < 1_000, "sqes_per_submit x1000 = {ratio}: the canary did not trip");
     }
 }

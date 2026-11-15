@@ -6,15 +6,24 @@
 //! ## Modes (boot-time probe → [`Capabilities`], logged at startup)
 //! - **Modern** (≥ 6.0): `SINGLE_ISSUER | DEFER_TASKRUN`, multishot accept,
 //!   multishot recv over a provided-buffer group.
-//! - **Degraded** (5.15-class kernels, or `INF_URING_FORCE_DEGRADED=1`):
-//!   oneshot accept/recv re-armed internally with explicit driver-leased
-//!   buffers. Identical observable contract — the kernel-matrix CI job
-//!   asserts the correctness suite passes in both modes.
-//! - `INF_URING_NO_DEFER_TASKRUN=1` (diagnostic): start the setup-flag
+//! - **Degraded** (5.15-class kernels, or [`RingMode::Degraded`]): oneshot
+//!   accept/recv re-armed internally with explicit driver-leased buffers.
+//!   Identical observable contract — the kernel-matrix CI job asserts the
+//!   correctness suite passes in both modes.
+//! - [`SetupFlags::NoDeferTaskrun`] (diagnostic): start the setup-flag
 //!   fallback chain below `DEFER_TASKRUN`, the tier a pre-6.1 kernel lands
 //!   on. Without deferred task work the kernel posts CQEs between enters,
 //!   so a send's completion can land after its fd's close was queued —
 //!   the regime `tests/close_fd_reuse.rs` pins.
+//!
+//! ## Selections (ADR-0209 D1, D2)
+//! A ring's mode, setup chain and [`SubmitPolicy`] are its constructor's
+//! [`UringConfig`], fixed for the ring's life. This crate reads no process
+//! environment: [`UringConfig::from_lookup`] is the one decoder of the
+//! three variables (`INF_URING_FORCE_DEGRADED`, `INF_URING_NO_DEFER_TASKRUN`,
+//! `INF_URING_SUBMIT_PER_OP`; present with any value selects), and its
+//! caller decodes before any cell starts. A cell that read them in its loop
+//! took std's process-wide environment lock on every iteration.
 //!
 //! ## Buffer lifecycle (the Vortex proof, carried)
 //! Modern mode **stages** recv buffers into the kernel's provided group —
@@ -30,11 +39,14 @@
 //! (no consumer leaks) must hold after any storm (conformance suite).
 //!
 //! ## Validation status
-//! Conformance suite green on Linux 7.0 in probed and `INF_URING_FORCE_DEGRADED`
-//! modes (2026-06-11); kernel-matrix CI legs and reference-box performance.
+//! The conformance suite runs in both modes: the kernel-matrix CI job's
+//! degraded leg sets `INF_URING_FORCE_DEGRADED`, each test ring decodes it,
+//! and each test checks that its ring engaged the mode it selects.
 
 #[allow(clippy::disallowed_types, reason = "container: D")]
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
+use std::fmt;
 use std::io;
 
 use inf_alloc::{AlignedPool, BufferId, BufferPool, LeaseKind};
@@ -171,11 +183,134 @@ struct CloseWait {
     sends_left: u32,
 }
 
+/// How a ring accepts and receives.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RingMode {
+    /// Multishot accept and recv where the kernel's version allows them.
+    Probed,
+    /// Oneshot accept and recv whatever the kernel offers.
+    Degraded,
+}
+
+/// Where the setup-flag fallback chain starts.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SetupFlags {
+    /// `SINGLE_ISSUER | DEFER_TASKRUN`, stepping down on `EINVAL`.
+    DeferTaskrun,
+    /// `SINGLE_ISSUER` alone: the tier a pre-6.1 kernel lands on.
+    NoDeferTaskrun,
+}
+
+/// When the driver enters the kernel to submit.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SubmitPolicy {
+    /// One `io_uring_enter` for everything a `submit_and_reap` queued (L3).
+    Batched,
+    /// An enter before every queued chain: a deliberate regression, the
+    /// `sqes_per_submit` tripwire's canary (ADR-0209 D5).
+    PerSqe,
+}
+
+/// A ring's three selections (ADR-0209 D1). The driver keeps the config
+/// its constructor took, with no setter, so a selection is fixed for the
+/// ring's life. Outside this crate a config comes only from
+/// [`UringConfig::from_lookup`], so a ring's mode is always its lookup's
+/// answer: there is no override for the mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UringConfig {
+    mode: RingMode,
+    setup: SetupFlags,
+    submit: SubmitPolicy,
+}
+
+impl UringConfig {
+    /// The selections with no variable set: today's shipped behaviour.
+    pub(crate) const SHIPPED: UringConfig = UringConfig {
+        mode: RingMode::Probed,
+        setup: SetupFlags::DeferTaskrun,
+        submit: SubmitPolicy::Batched,
+    };
+
+    /// The one decoder (ADR-0209 D2): asks `lookup` once for each of the
+    /// three variables, and a variable present with any value, empty
+    /// included, selects. `std::env::var_os` is a lookup; the caller runs
+    /// it before any cell starts.
+    pub fn from_lookup(lookup: impl Fn(&'static str) -> Option<OsString>) -> UringConfig {
+        let mode = match lookup("INF_URING_FORCE_DEGRADED") {
+            Some(_) => RingMode::Degraded,
+            None => RingMode::Probed,
+        };
+        let setup = match lookup("INF_URING_NO_DEFER_TASKRUN") {
+            Some(_) => SetupFlags::NoDeferTaskrun,
+            None => SetupFlags::DeferTaskrun,
+        };
+        let submit = match lookup("INF_URING_SUBMIT_PER_OP") {
+            Some(_) => SubmitPolicy::PerSqe,
+            None => SubmitPolicy::Batched,
+        };
+        UringConfig { mode, setup, submit }
+    }
+
+    /// This config with its setup chain starting at `setup`.
+    #[must_use]
+    pub fn with_setup(self, setup: SetupFlags) -> UringConfig {
+        UringConfig { setup, ..self }
+    }
+
+    /// This config submitting under `submit`.
+    #[must_use]
+    pub fn with_submit(self, submit: SubmitPolicy) -> UringConfig {
+        UringConfig { submit, ..self }
+    }
+}
+
+/// The boot line's form: each selection that differs from the shipped
+/// one, space-separated, or `shipped` when none does.
+impl fmt::Display for UringConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shipped = UringConfig::SHIPPED;
+        let mode = match self.mode {
+            RingMode::Probed => "mode=probed",
+            RingMode::Degraded => "mode=degraded",
+        };
+        let setup = match self.setup {
+            SetupFlags::DeferTaskrun => "setup=defer-taskrun",
+            SetupFlags::NoDeferTaskrun => "setup=no-defer-taskrun",
+        };
+        let submit = match self.submit {
+            SubmitPolicy::Batched => "submit=batched",
+            SubmitPolicy::PerSqe => "submit=per-sqe",
+        };
+        let differing = [
+            (self.mode != shipped.mode, mode),
+            (self.setup != shipped.setup, setup),
+            (self.submit != shipped.submit, submit),
+        ];
+        let mut none_written = true;
+        for (differs, text) in differing {
+            if !differs {
+                continue;
+            }
+            if !none_written {
+                f.write_str(" ")?;
+            }
+            f.write_str(text)?;
+            none_written = false;
+        }
+        if none_written {
+            f.write_str("shipped")?;
+        }
+        Ok(())
+    }
+}
+
 /// io_uring [`BackendDriver`]. See module docs.
 #[allow(clippy::disallowed_types, reason = "container: D")]
 pub struct UringDriver {
     ring: IoUring,
     caps: Capabilities,
+    /// The ring's selections, fixed at construction (ADR-0209 D1).
+    config: UringConfig,
     pending_ops: Vec<IoOp>,
     /// SQEs that did not fit the SQ; flushed first next submit.
     backlog: VecDeque<SqeChain>,
@@ -226,14 +361,14 @@ impl TierFixed {
 }
 
 impl UringDriver {
-    /// Build a ring with `entries` SQ slots, probing setup flags and
-    /// features with graceful degradation.
+    /// Build a ring with `entries` SQ slots under `config`'s selections,
+    /// probing setup flags and features with graceful degradation.
     ///
     /// # Errors
     /// Only if no io_uring at all can be created (kernel too old, seccomp).
     #[allow(clippy::disallowed_types, reason = "container: D")]
-    pub fn new(entries: u32) -> io::Result<UringDriver> {
-        let force_degraded = std::env::var_os("INF_URING_FORCE_DEGRADED").is_some();
+    pub fn new(entries: u32, config: UringConfig) -> io::Result<UringDriver> {
+        let force_degraded = config.mode == RingMode::Degraded;
 
         // Setup-flag fallback chain: the builder flags are 6.0/6.1 features,
         // and an old kernel rejects them with EINVAL. Only EINVAL retries
@@ -241,7 +376,7 @@ impl UringDriver {
         // pressure was the M2.5-S01 mechanism-2 capture) must propagate
         // untouched, never silently strip performance flags from one cell.
         let mut single_issuer = true;
-        let mut defer_taskrun = std::env::var_os("INF_URING_NO_DEFER_TASKRUN").is_none();
+        let mut defer_taskrun = config.setup == SetupFlags::DeferTaskrun;
         let ring = loop {
             let mut builder = IoUring::builder();
             if single_issuer {
@@ -284,6 +419,7 @@ impl UringDriver {
                 defer_taskrun,
                 performance_tier: true,
             },
+            config,
             pending_ops: Vec::with_capacity(64),
             backlog: VecDeque::new(),
             states: HashMap::default(),
@@ -334,9 +470,10 @@ impl UringDriver {
     }
 
     fn flush_backlog(&mut self) -> io::Result<()> {
-        // M0-S19 deliberate-regression canary: submit after every SQE so the
-        // `sqes_per_submit` tripwire must trip in the gate report. Test-only.
-        let submit_per_op = std::env::var_os("INF_URING_SUBMIT_PER_OP").is_some();
+        // The deliberate-regression canary: an enter before every chain, so
+        // the `sqes_per_submit` tripwire must trip (ADR-0209 D5). A field
+        // the ring owns, fixed at construction: no environment read here.
+        let submit_per_op = self.config.submit == SubmitPolicy::PerSqe;
         while let Some(chain) = self.backlog.pop_front() {
             if submit_per_op {
                 self.ring.submitter().submit()?;
@@ -1369,4 +1506,105 @@ fn kernel_version() -> (u32, u32) {
     let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
     let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
     (major, minor)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The decoder's table (ADR-0209 D2). Each row's expected config is
+    //! written from the predicates the driver read the environment with
+    //! before the decoder existed: a variable selects when the lookup holds
+    //! its exact name, whatever its value. The lookup is a fixed list, never
+    //! the process environment.
+    use std::cell::Cell;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    use super::{RingMode, SetupFlags, SubmitPolicy, UringConfig};
+
+    const DEGRADED: &str = "INF_URING_FORCE_DEGRADED";
+    const NO_DEFER: &str = "INF_URING_NO_DEFER_TASKRUN";
+    const PER_OP: &str = "INF_URING_SUBMIT_PER_OP";
+
+    /// A lookup's fixed contents: each variable's name and value bytes.
+    type Vars = Vec<(&'static str, Vec<u8>)>;
+
+    fn config(mode: RingMode, setup: SetupFlags, submit: SubmitPolicy) -> UringConfig {
+        UringConfig { mode, setup, submit }
+    }
+
+    /// The decoder over `vars`, and how many times it asked for each name.
+    fn decode(vars: &[(&str, Vec<u8>)]) -> (UringConfig, Vec<(&'static str, u32)>) {
+        let asked: Vec<(&'static str, Cell<u32>)> =
+            [DEGRADED, NO_DEFER, PER_OP].into_iter().map(|name| (name, Cell::new(0))).collect();
+        let decoded = UringConfig::from_lookup(|name| {
+            let count = &asked.iter().find(|(n, _)| *n == name).expect("one of the three").1;
+            count.set(count.get() + 1);
+            vars.iter().find(|(n, _)| *n == name).map(|(_, v)| OsString::from_vec(v.clone()))
+        });
+        (decoded, asked.into_iter().map(|(name, count)| (name, count.get())).collect())
+    }
+
+    #[test]
+    fn each_variable_selects_alone_and_absence_keeps_the_shipped_config() {
+        use RingMode::{Degraded, Probed};
+        use SetupFlags::{DeferTaskrun, NoDeferTaskrun};
+        use SubmitPolicy::{Batched, PerSqe};
+        let one = |name: &'static str| vec![(name, b"1".to_vec())];
+        let all: Vars =
+            [DEGRADED, NO_DEFER, PER_OP].into_iter().map(|n| (n, b"1".to_vec())).collect();
+        let rows: [(&str, Vars, UringConfig); 5] = [
+            ("none", Vec::new(), config(Probed, DeferTaskrun, Batched)),
+            ("degraded alone", one(DEGRADED), config(Degraded, DeferTaskrun, Batched)),
+            ("no-defer alone", one(NO_DEFER), config(Probed, NoDeferTaskrun, Batched)),
+            ("per-op alone", one(PER_OP), config(Probed, DeferTaskrun, PerSqe)),
+            ("all three", all, config(Degraded, NoDeferTaskrun, PerSqe)),
+        ];
+        for (label, vars, expected) in rows {
+            let (decoded, asked) = decode(&vars);
+            assert_eq!(decoded, expected, "{label}");
+            assert_eq!(asked, [(DEGRADED, 1), (NO_DEFER, 1), (PER_OP, 1)], "{label}: once each");
+        }
+        assert_eq!(decode(&[]).0, UringConfig::SHIPPED, "no variable is the shipped config");
+    }
+
+    #[test]
+    fn any_value_selects_and_only_the_exact_name_counts() {
+        let degraded = config(RingMode::Degraded, SetupFlags::DeferTaskrun, SubmitPolicy::Batched);
+        let values: [(&str, Vec<u8>); 5] = [
+            ("empty", Vec::new()),
+            ("zero", b"0".to_vec()),
+            ("false", b"false".to_vec()),
+            ("non-UTF-8", vec![0xff, 0xfe, 0x80]),
+            ("128 KiB", vec![b'x'; 128 * 1024]),
+        ];
+        for (label, value) in values {
+            assert_eq!(decode(&[(DEGRADED, value)]).0, degraded, "a present value, {label}");
+        }
+        let near = ["INF_URING_FORCE_DEGRADED_X", "inf_uring_force_degraded", "INF_URING_FORCE"];
+        for name in near {
+            assert_eq!(decode(&[(name, b"1".to_vec())]).0, UringConfig::SHIPPED, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_overrides_change_their_own_selection_only() {
+        let degraded = decode(&[(DEGRADED, b"1".to_vec())]).0;
+        let adjusted =
+            degraded.with_setup(SetupFlags::NoDeferTaskrun).with_submit(SubmitPolicy::PerSqe);
+        let expected = config(RingMode::Degraded, SetupFlags::NoDeferTaskrun, SubmitPolicy::PerSqe);
+        assert_eq!(adjusted, expected, "the mode is the lookup's answer still");
+        let back = adjusted.with_setup(SetupFlags::DeferTaskrun).with_submit(SubmitPolicy::Batched);
+        assert_eq!(back, degraded);
+    }
+
+    #[test]
+    fn the_boot_line_names_what_differs_from_shipped() {
+        let shipped = UringConfig::SHIPPED;
+        assert_eq!(shipped.to_string(), "shipped");
+        assert_eq!(shipped.with_submit(SubmitPolicy::PerSqe).to_string(), "submit=per-sqe");
+        let all = decode(&[(DEGRADED, Vec::new()), (NO_DEFER, Vec::new()), (PER_OP, Vec::new())]).0;
+        assert_eq!(all.to_string(), "mode=degraded setup=no-defer-taskrun submit=per-sqe");
+        let two = shipped.with_setup(SetupFlags::NoDeferTaskrun).with_submit(SubmitPolicy::PerSqe);
+        assert_eq!(two.to_string(), "setup=no-defer-taskrun submit=per-sqe");
+    }
 }

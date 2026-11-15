@@ -50,6 +50,16 @@ use inf_store::{
     TieredTable,
 };
 
+#[path = "support/uring_env.rs"]
+mod uring_env;
+
+/// The file's one ring: the test environment's selections, checked engaged.
+fn make_ring(entries: u32) -> UringDriver {
+    let driver = UringDriver::new(entries, uring_env::config()).expect("io_uring");
+    uring_env::assert_engaged(&driver.capabilities());
+    driver
+}
+
 const NS: NsId = NsId(43);
 const RING: usize = 1 << 21;
 const PAGE: usize = 1 << 12;
@@ -314,7 +324,7 @@ fn build_demoted_corpus(
     table.space_mut().advance_flushed(tail);
     table.space_mut().advance_head(tail);
 
-    let mut driver = UringDriver::new(64).expect("io_uring");
+    let mut driver = make_ring(64);
     // The registered pool (M4-S08): fixed-buffer registration; reads on
     // pool buffers upgrade to the fixed opcode transparently.
     let mut pool = AlignedPool::new(POOL_BUFFERS, POOL_BUF);

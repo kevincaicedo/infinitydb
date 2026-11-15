@@ -57,6 +57,20 @@ def listing(path):
     return path.startswith("inf_log::")
 
 
+# ADR-0209 D3, A1.2: every `std::env` entry, and libc's environment spellings
+# (`libc::` with `env` in the name; a `libc::` prefix alone would count the
+# clock ban's three libc entries too). The family is exactly 12: each of the 8
+# `std::env` entries has an exact-path plant, and RESOLVED_ONLY's four, which
+# a probe that names no third-party crate cannot plant (A1.1, a deviation from
+# ADR-0106 D7.5), are each in the config and resolve, and no plant names one.
+# A fifth libc environment entry has no plant, so it is red as any other.
+RESOLVED_ONLY = {"libc::getenv", "libc::setenv", "libc::unsetenv", "libc::putenv"}
+
+
+def environment(path):
+    return path.startswith("std::env::") or re.fullmatch(r"libc::\w*env\w*", path) is not None
+
+
 cfg = tomllib.loads(config.read_text())
 # Clippy's help for an unresolved entry is `allow-invalid = true`, which
 # silences it on every architecture: an inert entry would stay green
@@ -76,6 +90,7 @@ for key in ("disallowed-methods", "disallowed-types", "await-holding-invalid-typ
 # directory listing is an `inf_log::` method of its own family (ADR-0202 D7).
 CENSUS = (("disallowed-methods", "disallowed_methods", filesystem, "filesystem", 37),
           ("disallowed-methods", "disallowed_methods", listing, "listing", 3),
+          ("disallowed-methods", "disallowed_methods", environment, "environment", 12),
           ("disallowed-types", "disallowed_types", filesystem, "filesystem", 5),
           ("disallowed-types", "disallowed_types", container, "container", 3),
           ("await-holding-invalid-types", "await_holding_invalid_type", slot, "slot type", 9))
@@ -88,7 +103,13 @@ for key, lint, family, label, count in CENSUS:
     unstable = {p for p in UNSTABLE if family(p)} if lint == "disallowed_methods" else set()
     for path in sorted(unstable - set(paths)):
         errors.append(f"unstable path {path} has no config entry")
-    for path in sorted(set(paths) - witnesses - unstable):
+    resolved_only = RESOLVED_ONLY if family is environment else set()
+    for path in sorted(resolved_only - set(paths)):
+        errors.append(f"resolved-only path {path} has no config entry")
+    for path in sorted(witnesses & resolved_only):
+        errors.append(f"plant path {path} names a resolved-only entry: libc's four take no plant "
+                      "in a probe that names no third-party crate (ADR-0209 A1)")
+    for path in sorted(set(paths) - witnesses - unstable - resolved_only):
         errors.append(f"config path {path} has no exact-path plant")
     for path in sorted(witnesses - set(paths)):
         errors.append(f"plant path {path} has no config entry")
@@ -148,9 +169,9 @@ for at, codes in sorted(seen.items()):
         errors.append(f"{at}: unmarked diagnostic {sorted(codes)}")
 # nine decoder/enum, 41 stable APIs, two alias/UFCS bypasses, 11 containers,
 # nine slot types across an await, three discarded publishes, three whole
-# listings
-if len(plants) < 78:
-    errors.append(f"{len(plants)} plants; expected at least 78")
+# listings, eight std::env functions and two of their bypasses
+if len(plants) < 88:
+    errors.append(f"{len(plants)} plants; expected at least 88")
 if messages == 0:
     errors.append("clippy produced no diagnostics; the probe did not run")
 
@@ -222,7 +243,8 @@ if errors:
         print(f"lint-scopes probe: {disclosed[2:]}")
     sys.exit(1)
 print(f"lint-scopes probe OK: {len(plants)} exact lint/path plants, "
-      f"{len(controls)} clean controls; 36 stable filesystem methods, three whole listings, five "
-      f"filesystem types, three containers and nine slot types across an await covered{disclosed}")
+      f"{len(controls)} clean controls; 36 stable filesystem methods, three whole listings, eight "
+      f"std::env functions (four libc environment entries resolved-only), five filesystem types, "
+      f"three containers and nine slot types across an await covered{disclosed}")
 print("lint-scopes unstable probe OK: 1/1 pinned-stable refusal (E0658 fs_set_times); "
       "all 37 filesystem method bans retained")

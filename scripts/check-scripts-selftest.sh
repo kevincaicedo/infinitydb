@@ -820,6 +820,24 @@ do
     expect red "deny-list: planted '$snippet'" env INF_CHECK_ROOT="$root" $DENY
 done
 
+# ADR-0209 D4: every spelling of the environment pattern is red in production
+# code, and a denylist-allow marker with a reason admits none of them.
+for call in 'std::env::var("X")' 'std::env::var_os("X")' 'std::env::vars()' \
+    'std::env::vars_os()' 'std::env::set_var("X", "1")' 'std::env::remove_var("X")' \
+    'std::env::temp_dir()' 'std::env::home_dir()' 'libc::getenv(p)' 'libc::secure_getenv(p)' \
+    'libc::setenv(p, p, 1)' 'libc::unsetenv(p)' 'libc::putenv(p)' 'libc::clearenv()'
+do
+    root=$(fixture planted <<<"pub fn t() { let _ = $call; }")
+    expect_red_because "deny-list: the environment read '$call'" \
+        "DENY-LISTED in cell code: crates/fake/src/lib.rs:1:" env INF_CHECK_ROOT="$root" $DENY
+    root=$(fixture planted <<<"pub fn t() { let _ = $call; } // denylist-allow: a fixture reason")
+    expect_red_because "deny-list: a marker does not admit '$call'" \
+        "no denylist-allow marker admits it" env INF_CHECK_ROOT="$root" $DENY
+done
+root=$(fixture planted <<<'pub fn t() { let _ = (std::env::args(), std::env::consts::OS); }')
+expect green "deny-list: the argument vector and the target constants are not the environment" \
+    env INF_CHECK_ROOT="$root" $DENY
+
 # The same hit inside a test-only module is not cell code.
 IFS= read -r -d '' body <<'EOF' || true
 pub fn ok() {}
@@ -1661,7 +1679,15 @@ while IFS="$(printf '\t')" read -r class path rings regs; do
     {
         printf '// A %s row of the ring census.\nfn census(config: u32) {\n' "$class"
         n=0
-        while [ "$n" -lt "$rings" ]; do printf '    let _ = UringDriver::new(config);\n'; n=$((n + 1)); done
+        while [ "$n" -lt "$rings" ]; do
+            printf '    let _ = UringDriver::new(config);\n'
+            # ADR-0209 D5: an inf-runtime test file checks each ring engaged.
+            case $path in
+            crates/inf-runtime/tests/*/*) ;;
+            crates/inf-runtime/tests/*.rs) printf '    uring_env::assert_engaged(&caps);\n' ;;
+            esac
+            n=$((n + 1))
+        done
         n=0
         while [ "$n" -lt "$regs" ]; do printf '    driver.register_pool(&mut pool);\n'; n=$((n + 1)); done
         printf '}\n'
@@ -1950,6 +1976,30 @@ ns_reset
 ns_put "$P" <<<'fn f() { let _ = UringDriver::new_probe(config); }'
 expect green "node-spawn: the census's constructor is bounded on its right (another function)" \
     ns "$NS_ROOT"
+ns_reset
+# ADR-0209 D5: each ring an inf-runtime test file builds is checked engaged,
+# by the qualified call outside a comment.
+NSE=crates/inf-runtime/tests/file_ops.rs
+printf 'fn census(config: u32) {\n    let _ = UringDriver::new(config);\n}\n' >"$NS_ROOT/$NSE"
+expect_red_because "node-spawn: an inf-runtime test ring with no engagement call is red" \
+    "ring census: $NSE builds 1 ring(s) and checks 0 engaged; call uring_env::assert_engaged(" \
+    ns "$NS_ROOT"
+ns_reset
+printf 'fn census(config: u32) {\n    let _ = UringDriver::new(config);\n    // uring_env::assert_engaged(&caps);\n}\n' \
+    >"$NS_ROOT/$NSE"
+expect_red_because "node-spawn: an engagement call inside a comment alone is red" \
+    "ring census: $NSE builds 1 ring(s) and checks 0 engaged" ns "$NS_ROOT"
+ns_reset
+printf 'use uring_env::assert_engaged;\nfn census(config: u32) {\n    let _ = UringDriver::new(config);\n    assert_engaged(&caps);\n}\n' \
+    >"$NS_ROOT/$NSE"
+expect_red_because "node-spawn: an engagement call imported by use reads as missing" \
+    "a call imported by use reads as missing" ns "$NS_ROOT"
+ns_reset
+printf 'fn census(config: u32) {\n    let driver = UringDriver::new(config);\n    uring_env::assert_engaged(&driver.capabilities());\n}\n' \
+    >"$NS_ROOT/$NSE"
+expect green "node-spawn: one engagement call per inf-runtime test ring is green" ns "$NS_ROOT"
+expect_output "node-spawn: the OK line counts the checked rings" \
+    "inf-runtime test ring(s) checked engaged" ns "$NS_ROOT"
 ns_reset
 
 # Rule 5 (ADR-0203 D3 as A2 amends it): a plant appended to the module, red at
@@ -4219,6 +4269,24 @@ ls_api_diag std::fs::read 2
 expect red "lint-scopes: clock function cannot hide a filesystem call" ls_api_run
 ls_api_diag std::thread::sleep 2
 expect red "lint-scopes: clock function cannot hide a blocking sleep" ls_api_run
+# ADR-0209 D3: the process environment has no allow class in cell code,
+# so neither a boot: statement nor a clock: function sanctions a read of it.
+ls_case green "boot statement over an environment read fixture" 'pub fn f() {
+    #[allow(clippy::disallowed_methods, reason = "boot: a selection read at boot")]
+    let _ = std::env::var_os("X");
+}'
+ls_api_diag std::env::var_os 2
+expect_red_because "lint-scopes: a boot allow cannot hide an environment read" \
+    "std::env::var_os reads or writes the process environment in cell code" ls_api_run
+ls_api_diag libc::setenv 2
+expect_red_because "lint-scopes: a boot allow cannot hide libc's environment write" \
+    "libc::setenv reads or writes the process environment in cell code" ls_api_run
+ls_case green "clock function over an environment read fixture" '#[allow(clippy::disallowed_methods, reason = "clock: injected origin")]
+pub fn f() {
+    let _ = std::env::var_os("X");
+}'
+ls_api_diag std::env::var_os 2
+expect red "lint-scopes: a clock function cannot hide an environment read" ls_api_run
 # ADR-0202 D7: a whole listing is allowed only under `listing:`, and
 # `listing:` admits no other API.
 ls_case green "listing statement fixture" 'pub fn f(fs: &F) {
@@ -5393,6 +5461,54 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unreachable-api"
 sed 's|std::fs::write|std::fs::no_such_fn|' clippy.toml >"$work/probe-unreachable-api/clippy.toml"
 expect_red_because "lint-scopes: an unreachable config entry is red" \
     'unresolved config entry: `std::fs::no_such_fn`' ls_probe "$work/probe-unreachable-api"
+}
+
+# ADR-0209 D3, A1.2: the judge's environment census holds 12 entries, the 8
+# std::env entries each with an exact-path plant and libc's four
+# resolved-only. Each case is a mutated copy of the probe or of its config.
+group_lint_scopes_probe_environment() {
+ls_setup
+root=$(ls_root ls-probe)
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-env-unplanted"
+sed -i.bak '/pub fn temp_dir/,/^}/d' "$work/probe-env-unplanted/src/environment.rs"
+expect_red_because "lint-scopes: a std::env entry without a plant is red" \
+    "config path std::env::temp_dir has no exact-path plant" ls_probe "$work/probe-env-unplanted"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-env-unconfigured"
+grep -v 'path = "std::env::home_dir"' clippy.toml >"$work/probe-env-unconfigured/clippy.toml"
+expect_red_because "lint-scopes: a std::env plant whose entry is gone draws nothing" \
+    "did NOT draw clippy::disallowed_methods std::env::home_dir" ls_probe "$work/probe-env-unconfigured"
+expect_output "lint-scopes: ... and the census of 11 is red" \
+    "config needs 12 distinct environment disallowed-methods, found 11" \
+    ls_probe "$work/probe-env-unconfigured"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-env-unlisted"
+sed -i.bak 's|std::env::args(); // CONTROL|std::env::args(); // PLANT clippy::disallowed_methods std::env::args|' \
+    "$work/probe-env-unlisted/src/environment.rs"
+expect_red_because "lint-scopes: a std::env plant with no config entry is red" \
+    "plant path std::env::args has no config entry" ls_probe "$work/probe-env-unlisted"
+}
+
+# ADR-0209 A1: libc's four environment entries are resolved-only, a fixed set.
+group_lint_scopes_probe_libc() {
+ls_setup
+root=$(ls_root ls-probe)
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-libc-misspelled"
+sed 's|path = "libc::getenv"|path = "libc::getenvx"|' clippy.toml >"$work/probe-libc-misspelled/clippy.toml"
+expect_red_because "lint-scopes: a libc entry that does not resolve is red" \
+    'unresolved config entry: `libc::getenvx`' ls_probe "$work/probe-libc-misspelled"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-libc-fifth"
+awk '{ print } /path = "libc::putenv"/ { print "    { path = \"libc::clearenv\", reason = \"a fifth\" }," }' \
+    clippy.toml >"$work/probe-libc-fifth/clippy.toml"
+expect_red_because "lint-scopes: a fifth libc environment entry, which has no plant, is red" \
+    "config needs 12 distinct environment disallowed-methods, found 13" ls_probe "$work/probe-libc-fifth"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-libc-planted"
+sed -i.bak 's|std::env::var("X"); // PLANT clippy::disallowed_methods std::env::var$|std::env::var("X"); // PLANT clippy::disallowed_methods libc::getenv|' \
+    "$work/probe-libc-planted/src/environment.rs"
+expect_red_because "lint-scopes: a plant naming a resolved-only libc entry is red" \
+    "plant path libc::getenv names a resolved-only entry" ls_probe "$work/probe-libc-planted"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-libc-missing"
+grep -v 'path = "libc::unsetenv"' clippy.toml >"$work/probe-libc-missing/clippy.toml"
+expect_red_because "lint-scopes: a resolved-only libc entry missing from the config is red" \
+    "resolved-only path libc::unsetenv has no config entry" ls_probe "$work/probe-libc-missing"
 }
 
 group_lint_scopes_probe_arch() {

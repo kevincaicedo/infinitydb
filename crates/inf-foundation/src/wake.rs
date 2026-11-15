@@ -825,6 +825,7 @@ impl Drained {
 }
 
 #[cfg(all(test, not(loom)))]
+#[allow(clippy::disallowed_methods, reason = "test-only: a child test reads its role")]
 mod tests {
     //! The bridge's contract on one thread at a time, its marks, and the bound's fail-stop. The
     //! interleavings are the Loom models' (the `loom_tests` module below).

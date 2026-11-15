@@ -437,7 +437,9 @@ impl NodeBinary {
     /// The path the variable `var` names when it is set (a test pointed at
     /// another build), else [`NodeBinary::built`].
     pub fn built_or(var: &str) -> Self {
-        match std::env::var_os(var) {
+        #[allow(clippy::disallowed_methods, reason = "test support: the test names its build")]
+        let named = std::env::var_os(var);
+        match named {
             Some(path) => Self { path: PathBuf::from(path) },
             None => Self::built(),
         }
@@ -449,7 +451,9 @@ impl NodeBinary {
     /// or refuses when the lane is required, and never starts a path that
     /// names no binary.
     pub fn from_infinityd_bin() -> Option<Self> {
-        match std::env::var("INFINITYD_BIN") {
+        #[allow(clippy::disallowed_methods, reason = "test support: the recipe names the binary")]
+        let named = std::env::var("INFINITYD_BIN");
+        match named {
             Ok(path) if !path.is_empty() => Some(Self { path: PathBuf::from(path) }),
             Ok(_) | Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => None,
         }
@@ -627,6 +631,7 @@ impl NodeLock<BoxWide> {
     /// The box's lock, per user: under `XDG_RUNTIME_DIR` when it is set,
     /// else under the temp directory, named with the user's uid.
     pub fn box_wide() -> Self {
+        #[allow(clippy::disallowed_methods, reason = "test support: the user's runtime directory")]
         let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
             Some(runtime) if !runtime.is_empty() => PathBuf::from(runtime).join(LEAF),
             _ => {
