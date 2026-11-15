@@ -440,3 +440,44 @@ fn a_reset_before_the_owed_replies_leave_sends_nothing() {
     assert_eq!(read_back(&mut node, 0, &key), b"$1\r\nv\r\n", "the SET before the error ran");
     assert_eq!(written_text(&node, 0), "", "a client reset before its replies leave reads none");
 }
+
+/// A plane loading its dataset and a namespace-bound connection: `ECHO a`,
+/// which runs while loading and rides the pump, then `GET k`, which is
+/// refused while loading, in one buffer. The `ECHO`'s reply is owed when
+/// PARSE refuses the `GET`, so the client reads `a`, then the refusal. At
+/// HEAD PARSE writes the refusal into the output at once, so it leaves
+/// first. The pump runs the `ECHO` inside PARSE's pass, so the slot's pump
+/// is idle again by the pass's end; engagement reads the route's input
+/// instead: the slot bound to a namespace, which defers every command, and
+/// the plane still loading after the pass.
+#[test]
+#[ignore = "PARSE writes a loading refusal into the connection's output at once, ahead of the \
+            replies its pump still owes; red until PARSE queues its own replies behind them"]
+fn loading_answers_after_deferred() {
+    let namespace = inf_store::NsSpec {
+        id: NsId(inf_store::FIRST_NAMED_NS_ID),
+        name: b"loading".to_vec(),
+        mode: NsMode::Memory,
+        fsync: None,
+        policy: None,
+        maxmemory: None,
+        tier: None,
+    };
+    let mut node = Node::with_namespaces(1, &[namespace]);
+    node.accept(0, CLIENT);
+    node.send(0, CLIENT, &frame(&[b"INF.NS", b"USE", b"loading"]));
+    node.rounds(4);
+    assert_eq!(written_text(&node, 0), "+OK\r\n", "engagement: the client's USE was answered");
+    assert!(
+        client_slot(&node, 0, |conn| conn.cx.ns.named().is_some()),
+        "engagement: the slot is namespace-bound, so every command it sends defers"
+    );
+    node.cells[0].plane.shared.loading.set(true);
+    let mut bytes = frame(&[b"ECHO", b"a"]);
+    bytes.extend(frame(&[b"GET", b"k"]));
+    node.send(0, CLIENT, &bytes);
+    node.rounds(4);
+    assert!(node.cells[0].plane.shared.loading.get(), "engagement: the plane is still loading");
+    let owed = "+OK\r\n$1\r\na\r\n-LOADING Redis is loading the dataset in memory\r\n";
+    assert_eq!(written_text(&node, 0), owed, "reply-order: the refusal left before the owed reply");
+}

@@ -166,6 +166,12 @@ pub(super) struct Rig {
 impl Rig {
     /// Every cell built and run until its listener is armed.
     pub(super) fn new(cells: u16) -> Rig {
+        Rig::with_namespaces(cells, &[])
+    }
+
+    /// The same, every cell's keyspace also holding `namespaces`, created
+    /// uncataloged at boot.
+    pub(super) fn with_namespaces(cells: u16, namespaces: &[inf_store::NsSpec]) -> Rig {
         let clock = Rc::new(VirtualClock::default());
         let fabrics = Mesh::new(cells, MeshConfig::default());
         let built = fabrics.into_iter().enumerate().map(|(cell, fabric)| {
@@ -174,7 +180,10 @@ impl Rig {
                 CellId(u16::try_from(cell).expect("a u16 cell")),
                 cells,
                 -1,
-                KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
+                KeyspaceSeed::Uncataloged {
+                    cfg: StoreConfig::default(),
+                    specs: namespaces.to_vec(),
+                },
                 fabric,
                 node,
                 NoopObserver,
