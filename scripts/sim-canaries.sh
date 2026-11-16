@@ -1186,6 +1186,10 @@ ordered_rows=(
   # reads its queue empty with nothing pending (ADR-0177 D2). Planted, PARSE queues the command
   # and wakes nothing, so a deferred command's client waits for a reply no task makes.
   "inf_canary_parked_pump_not_woken m0-adversarial STALL --cells 4"
+  # A slab's release drops its occupant where it lies, after the counts and the free chain are
+  # written (ADR-0194 D1's second note). Planted, it moves the occupant out as a take does and
+  # drops it off its slot, at another address than the one the slab lent.
+  "inf_canary_release_moves_occupant crate-test inf-foundation lib release_drops_the_occupant_where_it_lies release-moved"
   # A general send keeps one credit free for the publish fan (ADR-0192 D2), so an origin parks
   # at most 7 applies at a peer of 8 credits. Planted, the guard is gone and all 8 arrive.
   "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"

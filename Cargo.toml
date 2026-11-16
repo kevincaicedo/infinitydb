@@ -206,6 +206,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_recover_skip_on_resume)',
     'cfg(inf_canary_recover_sweep_gone_counted)',
     'cfg(inf_canary_recover_twice_on_resume)',
+    'cfg(inf_canary_release_moves_occupant)',
     'cfg(inf_canary_reorder_wedge_zero)',
     'cfg(inf_canary_replay_blob_release_skip)',
     'cfg(inf_canary_replay_charge_dropped)',
