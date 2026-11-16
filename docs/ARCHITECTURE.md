@@ -1392,11 +1392,8 @@ background I/O is not budgeted and checkpoints are paced at a fixed rate.
 | Cold-read queue | `COLD-READ-QD` (64) and overflow cap | `BUSY` |
 | Document depth / body size / reply | 128 containers / 16,777,192 bytes / 128 MiB | typed error; nothing changes |
 
-Two things are unbounded by default:
+One thing is unbounded by default:
 
-- **The executor's task slab.** It reserves 1,024 task slots but can grow
-  beyond them. Reserved capacity for tasks and gates is designed and not yet
-  built.
 - **A normal client's output buffer.** As in Redis, the default
   `client-output-buffer-limit` puts no cap on clients that are not
   subscribed. A client that pipelines many requests and never reads its
@@ -1612,9 +1609,9 @@ order and grouping are in [roadmap.md](roadmap.md).
   `FLUSHALL` is refused. On a named namespace, `FLUSHDB` and `COPY` are
   refused, and so is a multi-key command whose keys live on more than one
   cell, except `JSON.MGET`.
-- **Bounds still open.** A hard cap on executor tasks, a foreground budget
-  that bounds the commands one iteration parses and runs inline, and
-  incremental index growth to replace stop-and-copy.
+- **Bounds still open.** A foreground budget that bounds the commands one
+  iteration parses and runs inline, and incremental index growth to replace
+  stop-and-copy.
 
 ## References
 
