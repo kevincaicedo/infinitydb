@@ -319,17 +319,22 @@ const PROTOCOL_ERROR: &str = "-ERR Protocol error: invalid bulk length\r\n";
 
 /// A reading of the client's slot on `cell`, while it holds its descriptor.
 fn client_slot<R>(node: &Node, cell: usize, read: impl Fn(&Conn) -> R) -> R {
+    fd_slot(node, cell, CLIENT, read)
+}
+
+/// A reading of `fd`'s slot on `cell`, while it holds its descriptor.
+fn fd_slot<R>(node: &Node, cell: usize, fd: RawFd, read: impl Fn(&Conn) -> R) -> R {
     let mut seen = None;
     node.cells[cell].plane.shared.conns.borrow_mut().for_each_mut(|conn| {
-        let fd = match &conn.slot {
+        let held = match &conn.slot {
             ConnSlot::Active { link, .. } | ConnSlot::Flushing { link, .. } => Some(link.fd),
             ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => None,
         };
-        if fd == Some(CLIENT) {
+        if held == Some(fd) {
             seen = Some(read(conn));
         }
     });
-    seen.expect("the client's slot is occupied")
+    seen.expect("the slot holds its descriptor")
 }
 
 /// Whether the plane's mark moved the slot to a flush.
@@ -483,4 +488,129 @@ fn loading_answers_after_deferred() {
     assert!(node.cells[0].plane.shared.loading.get(), "engagement: the plane is still loading");
     let owed = "+OK\r\n$1\r\na\r\n-LOADING Redis is loading the dataset in memory\r\n";
     assert_eq!(written_text(&node, 0), owed, "reply-order: the refusal left before the owed reply");
+}
+
+// ---- a half-closed or marked slot's count and receive (ADR-0196 A1.2, A1.3) ----
+
+/// A client of the subscriber's cell that publishes to it.
+const PUBLISHER: RawFd = 63;
+/// A second subscriber, the marked control.
+const MARKED: RawFd = 64;
+
+/// `PUBLISH channel payload` from the publisher, run until its reply
+/// arrives: the receiver count's frame.
+fn publish(node: &mut Node, channel: &[u8], payload: &[u8]) -> Vec<u8> {
+    let before = node.written(0, PUBLISHER).len();
+    node.send(0, PUBLISHER, &frame(&[b"PUBLISH", channel, payload]));
+    node.rounds(4);
+    node.written(0, PUBLISHER)[before..].to_vec()
+}
+
+/// The slot's state and, flushing, its stream.
+fn stream_of(conn: &Conn) -> &'static str {
+    match &conn.slot {
+        ConnSlot::Active { .. } => "active",
+        ConnSlot::Flushing { stream: PeerStream::Open, .. } => "open",
+        ConnSlot::Flushing { stream: PeerStream::Ended { by: ClosedBy::Peer { .. } }, .. } => {
+            "peer"
+        }
+        ConnSlot::Flushing { stream: PeerStream::Ended { by: ClosedBy::Plane }, .. } => "ended",
+        ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => "closed",
+    }
+}
+
+/// The bytes staged in the slot's `out`.
+fn out_len(conn: &Conn) -> usize {
+    match &conn.slot {
+        ConnSlot::Active { link, .. } | ConnSlot::Flushing { link, .. } => link.out.len(),
+        ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => 0,
+    }
+}
+
+/// A subscriber counts as a receiver until the server reads its end of
+/// stream (ADR-0196 A1.2). (a) A subscriber's end of stream is reaped while
+/// a send of it is in flight, and PARSE's next take lets its run-out end the
+/// parser (`Flushing` `Ended`): a `PUBLISH` then counts it 0, and nothing is
+/// written to it. (b) A subscriber marked by `QUIT` with its `+OK` unsent is
+/// counted 1, the control, then 0 once its end of stream is read. Each
+/// closes once its sends complete.
+#[test]
+fn half_closed_subscriber_not_counted() {
+    let mut node = Node::new(1);
+    for fd in [CLIENT, MARKED] {
+        node.accept(0, fd);
+        node.send(0, fd, &frame(&[b"SUBSCRIBE", b"ch"]));
+    }
+    node.accept(0, PUBLISHER);
+    node.rounds(4);
+    for fd in [CLIENT, MARKED] {
+        node.hold_sends(0, fd, true);
+    }
+    assert_eq!(publish(&mut node, b"ch", b"m1"), b":2\r\n", "engagement: both subscribers count");
+    // (a) the end of stream, then the run-out.
+    node.eof(0, CLIENT);
+    node.rounds(2);
+    let stream = client_slot(&node, 0, stream_of);
+    assert_eq!(stream, "ended", "VACUOUS run-out-unreached: the slot is {stream}, not ended");
+    let staged = client_slot(&node, 0, out_len);
+    // (b) the control: marked, its stream still open.
+    node.send(0, MARKED, &frame(&[b"QUIT"]));
+    node.rounds(2);
+    assert_eq!(fd_slot(&node, 0, MARKED, stream_of), "open", "engagement: the QUIT marked it");
+    let marked_staged = fd_slot(&node, 0, MARKED, out_len);
+    assert_eq!(
+        publish(&mut node, b"ch", b"m2"),
+        b":1\r\n",
+        "count-after-eof: the half-closed subscriber counted, or the marked one did not"
+    );
+    assert_eq!(client_slot(&node, 0, out_len), staged, "a message written after the end of stream");
+    assert_eq!(fd_slot(&node, 0, MARKED, out_len), marked_staged, "a message written after QUIT");
+    node.eof(0, MARKED);
+    node.rounds(2);
+    assert_eq!(fd_slot(&node, 0, MARKED, stream_of), "ended", "the marked stream ended");
+    assert_eq!(
+        publish(&mut node, b"ch", b"m3"),
+        b":0\r\n",
+        "count-after-eof: the marked subscriber counted after its end of stream"
+    );
+    for fd in [CLIENT, MARKED] {
+        node.hold_sends(0, fd, false);
+    }
+    node.rounds(6);
+    for fd in [CLIENT, MARKED] {
+        assert!(node.closed(0).contains(&fd), "a flushed subscriber closes");
+        let text = String::from_utf8_lossy(&node.written(0, fd)).into_owned();
+        assert!(text.contains("m1") && !text.contains("m2") && !text.contains("m3"), "{text:?}");
+    }
+}
+
+/// The mark of an active slot whose receive is disarmed, as the high water
+/// leaves it, pushes one `RecvArm` (ADR-0196 A1.3), so the marked slot reads
+/// its end of stream; the end of stream then ends its stream.
+#[test]
+fn mark_rearms_a_disarmed_receive() {
+    let mut node = Node::new(1);
+    node.accept(0, CLIENT);
+    let arms = node.recv_arms(0, CLIENT);
+    node.cells[0].plane.shared.conns.borrow_mut().for_each_mut(|conn| {
+        if let ConnSlot::Active { recv, .. } = &mut conn.slot {
+            *recv = RecvArm::Disarmed;
+        }
+    });
+    node.hold_sends(0, CLIENT, true);
+    node.send(0, CLIENT, &frame(&[b"QUIT"]));
+    node.rounds(2);
+    assert_eq!(client_slot(&node, 0, stream_of), "open", "engagement: the QUIT marked the slot");
+    assert_eq!(
+        node.recv_arms(0, CLIENT),
+        arms + 1,
+        "no-rearm-at-mark: the mark left a disarmed receive unarmed"
+    );
+    node.eof(0, CLIENT);
+    node.rounds(2);
+    assert_eq!(client_slot(&node, 0, stream_of), "ended", "the end of stream ends the stream");
+    node.hold_sends(0, CLIENT, false);
+    node.rounds(4);
+    assert_eq!(written_text(&node, 0), "+OK\r\n", "the QUIT's +OK, then the close");
+    assert!(node.closed(0).contains(&CLIENT), "the marked slot closes once its +OK is sent");
 }

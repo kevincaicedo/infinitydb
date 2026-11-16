@@ -46,6 +46,8 @@ struct Script {
     closes: Vec<(RawFd, CompletionToken)>,
     /// Every descriptor whose `Closed` was delivered, in order.
     closed: Vec<RawFd>,
+    /// Descriptors whose sends stay in flight, uncompleted, until released.
+    held_sends: Vec<RawFd>,
 }
 
 impl Script {
@@ -90,6 +92,10 @@ impl BackendDriver for ScriptDriver {
     ) -> std::io::Result<usize> {
         let script = self.script.get_mut();
         for (fd, buf, len, token) in core::mem::take(&mut script.sends) {
+            if script.held_sends.contains(&fd) {
+                script.sends.push((fd, buf, len, token));
+                continue;
+            }
             let bytes = pool.bytes(buf)[..len as usize].to_vec();
             script.written_mut(fd).extend_from_slice(&bytes);
             out.push(Completion { token, result: CompletionResult::Sent { buf } });
@@ -252,6 +258,22 @@ impl Rig {
     /// gone.
     pub(super) fn reset(&self, cell: usize, fd: RawFd) {
         self.deliver(cell, Delivery::Reset(fd));
+    }
+
+    /// While held, `fd`'s sends stay in flight on `cell`, so its slot
+    /// keeps a send outstanding; released, they complete at the next reap.
+    pub(super) fn hold_sends(&self, cell: usize, fd: RawFd, held: bool) {
+        let mut script = self.cells[cell].reactor.driver().script.borrow_mut();
+        script.held_sends.retain(|&kept| kept != fd);
+        if held {
+            script.held_sends.push(fd);
+        }
+    }
+
+    /// The receive arms the plane pushed for `fd` on `cell`.
+    pub(super) fn recv_arms(&self, cell: usize, fd: RawFd) -> usize {
+        let script = self.cells[cell].reactor.driver().script.borrow();
+        script.armed.iter().filter(|(armed, _)| *armed == fd).count()
     }
 
     /// Every byte the plane sent on `fd`.

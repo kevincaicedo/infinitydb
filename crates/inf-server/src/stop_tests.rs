@@ -99,3 +99,71 @@ fn the_loop_dropped_first_marks_the_census_stopping() {
     drop(plane);
     assert_eq!(census.phase(), CensusPhase::Stopping);
 }
+
+// ---- the stop's mark ends every reader (ADR-0124 D2, ADR-0196 A1.1) ----
+
+use super::wire_rig::{Rig as Node, frame};
+use inf_foundation::time::Clock;
+
+const SLEEPER: RawFd = 70;
+const HALF: RawFd = 71;
+const GONE: RawFd = 72;
+
+/// During a `DEBUG SLEEP`, one client's `SET k1` and its end of stream are
+/// reaped (`Flushing` `Peer`, its entry held by the stall) and another's
+/// `SET k2` and a reset (`Draining` `Peer` at `Closed`, its entry held);
+/// with `stop`, the stop is requested before the sleep ends. Then the sleep
+/// ends.
+fn held_readers(stop: bool) -> Node {
+    let mut node = Node::new(1);
+    for fd in [SLEEPER, HALF, GONE] {
+        node.accept(0, fd);
+    }
+    node.send(0, SLEEPER, &frame(&[b"DEBUG", b"SLEEP", b"1"]));
+    node.rounds(1);
+    let stalled = node.cells[0].plane.shared.stall_until.get();
+    assert!(stalled > node.clock.now(), "engagement: DEBUG SLEEP stalls the cell");
+    node.send(0, HALF, &frame(&[b"SET", b"k1", b"v"]));
+    node.eof(0, HALF);
+    node.send(0, GONE, &frame(&[b"SET", b"k2", b"v"]));
+    node.reset(0, GONE);
+    node.rounds(2);
+    assert_eq!(node.cells[0].plane.inbox.len(), 2, "engagement: both entries wait in the inbox");
+    assert!(node.closed(0).contains(&GONE), "engagement: the reset's Closed came in the stall");
+    if stop {
+        node.cells[0].plane.request_stop();
+        node.rounds(1);
+    }
+    node.clock.advance(Nanos::from_secs(2));
+    node.rounds(8);
+    node
+}
+
+/// Whether `key` holds a value on the node's one cell.
+fn landed(node: &Node, key: &[u8]) -> bool {
+    let now = node.clock.now();
+    node.cells[0].plane.shared.store.borrow_mut().db_mut(0).exists(key, now)
+}
+
+/// The stop's one walk ends every parser (ADR-0196 A1.1): what is parsed
+/// and queued runs, what is not yet parsed is released. Neither held `SET`
+/// runs once the sleep ends, every slot vacates and the stop reaches
+/// `Quiet`.
+#[test]
+fn stop_ends_every_reader() {
+    let node = held_readers(true);
+    for key in [&b"k1"[..], b"k2"] {
+        assert!(!landed(&node, key), "set-after-stop: a held SET ran after the stop's mark");
+    }
+    assert_eq!(node.cells[0].plane.connections(), 0, "every slot vacates");
+    assert_eq!(node.cells[0].plane.stop_phase(), StopPhase::Quiet, "the stop reaches Quiet");
+}
+
+/// The control: with no stop, both held `SET`s run once the sleep ends.
+#[test]
+fn every_held_reader_runs_with_no_stop() {
+    let node = held_readers(false);
+    for key in [&b"k1"[..], b"k2"] {
+        assert!(landed(&node, key), "a held SET did not run with no stop");
+    }
+}
