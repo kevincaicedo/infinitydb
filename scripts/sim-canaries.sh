@@ -1153,9 +1153,10 @@ ordered_rows=(
   "inf_canary_conn_slot_frees_at_closed m0-capacity conn-tasks-unequal --close-leg close"
   # The `conn` class's slots are the cell's share (ADR-0177 D2) and its bytes E-store's F7 bill.
   # Planted, it is built over (1 + k) C slots, k from its stride: the idle node's resident
-  # memory a cell rises by k x C x s_conn, 2,500 x 3,064 B at 4 cells (k = 1), over F7's
-  # 256 KiB, which the plain node's three boots stay within.
-  "inf_canary_conn_slots_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 7660000 --control-bytes-cell 262144 --plant-row conn-tasks"
+  # memory a cell rises by k x C x s_conn, 2,500 x 3,048 B at 4 cells (k = 1), over F7's
+  # 256 KiB, which the plain node's three boots stay within. The bytes are that product at the
+  # stride the plane's layout test prints; a stride that moves moves them with it.
+  "inf_canary_conn_slots_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 7620000 --control-bytes-cell 262144 --plant-row conn-tasks"
   # A finished conn task's header is reclaimed once no waker names it, so a settled node holds no
   # Retired conn header (O1's leak clause). Planted, the pump keeps a clone of its own waker past
   # its return: the reset client's header stays Retired with every per-step clause green.
