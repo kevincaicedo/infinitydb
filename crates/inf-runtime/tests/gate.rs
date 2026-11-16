@@ -61,9 +61,7 @@ fn every_value_reaches_its_own_wait_past_the_generation_field() {
     }
     let gate = gate.borrow();
     assert_eq!(gate.stale(), 0, "gate_stale: no completion missed its holder");
-    assert!(
-        gate.wrapped_takes() >= u64::from(HOLDERS),
-        "VACUOUS: {} takes past the field, fewer than one a holder",
-        gate.wrapped_takes()
-    );
+    // Each slot starts two generations below the field, so its first two takes are below it and
+    // every later one past it: the tap counts exactly those, no more.
+    assert_eq!(gate.wrapped_takes(), (ROUNDS - 2) * u64::from(HOLDERS), "the takes past the field");
 }

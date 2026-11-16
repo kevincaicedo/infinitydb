@@ -20,7 +20,12 @@ const ROUNDS: usize = 8;
 /// Each cell's reader pipelines `ROUNDS` `MGET`s of 32 keys the next cell owns, each key set
 /// to its own name first; every reply is that array, exact and in order.
 pub(super) fn holder_near_wrap_leg(seed: u64) -> Rig {
-    let mut rig = Rig::with_setup(seed, 0, 15_000, &[], NEAR_WRAP_MESH, Some(FIRST_GENERATION));
+    near_wrap_at(seed, Some(FIRST_GENERATION))
+}
+
+/// The leg with every cell's holders free at `first_generation`, the plane's default at `None`.
+fn near_wrap_at(seed: u64, first_generation: Option<u32>) -> Rig {
+    let mut rig = Rig::with_setup(seed, 0, 15_000, &[], NEAR_WRAP_MESH, first_generation);
     let cells = usize::from(CELLS);
     let keys: Vec<Vec<Vec<u8>>> = (0..cells)
         .map(|cell| names_on((cell + 1) % cells, &format!("wrap:{cell}"), LEGS))
@@ -92,4 +97,22 @@ fn wrapped_takes(rig: &Rig, cell: usize) -> u64 {
 #[cfg(not(feature = "dst"))]
 fn wrapped_takes(_: &Rig, _: usize) -> u64 {
     0
+}
+
+#[cfg(all(test, feature = "dst"))]
+mod tests {
+    use super::super::CloseLeg;
+    use super::near_wrap_at;
+
+    /// The leg's control: at the default first generation no slot reaches the key's field, so
+    /// every cell's tap reads no take past it and the leg is `VACUOUS`, its replies still exact.
+    /// A tap that counts every take reads green here.
+    #[test]
+    fn the_leg_at_the_default_generation_is_unengaged() {
+        let report = near_wrap_at(0xC0FFEE, None).report(CloseLeg::HolderNearWrap);
+        let violations: Vec<&str> = report.violations.iter().collect();
+        let unengaged = violations.iter().filter(|v| v.contains("VACUOUS key-wrap-unengaged"));
+        assert_eq!(unengaged.count(), usize::from(super::super::CELLS), "{violations:?}");
+        assert!(!violations.iter().any(|v| v.contains("fan-reply-lost")), "{violations:?}");
+    }
 }
