@@ -503,3 +503,58 @@ fn a_zero_sized_and_an_over_aligned_future_run_in_their_slots() {
         assert_eq!(executor.live_tasks(), 0);
     }
 }
+
+/// Wakes a clone of its waker on its first poll and is Pending, then Ready; it records its own
+/// address at each poll and at its drop. `Unpin`, so a move of it is sound and seen.
+struct Recorder {
+    polls: Rc<Cell<u32>>,
+    at: Rc<RefCell<Vec<usize>>>,
+}
+
+impl Future for Recorder {
+    type Output = ();
+
+    #[allow(clippy::waker_clone_wake, reason = "the input is a clone woken, counted in and out")]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.at.borrow_mut().push(core::ptr::from_ref::<Self>(&self) as usize);
+        self.polls.set(self.polls.get() + 1);
+        if self.polls.get() == 1 {
+            cx.waker().clone().wake();
+            return Poll::Pending;
+        }
+        Poll::Ready(())
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        self.at.borrow_mut().push(core::ptr::from_ref::<Self>(self) as usize);
+    }
+}
+
+const RECORDERS: Cap = Cap::entries::<2>("test-recorders", CapFill::Serving);
+
+/// The first poll runs on the occupant its publish lends, in its slot (ADR-0194 D1's note): one
+/// address from the first poll to the drop, and the wake it raised kept, so the Pending task is
+/// queued once. The class is the recorder's own, of two slots: a box would hide a move.
+#[test]
+fn the_first_poll_runs_in_its_slot_and_keeps_its_wake() {
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let class = layout.class(&|recorder: Recorder| recorder, RECORDERS).expect("one class");
+    let mut executor = layout.build().expect("no class refuses");
+    let (polls, at) = (Rc::new(Cell::new(0)), Rc::new(RefCell::new(Vec::new())));
+    let TaskAdmission::Granted(permit) = executor.reserve::<Recorder>(class) else {
+        panic!("the class has room");
+    };
+    let recorder = Recorder { polls: Rc::clone(&polls), at: Rc::clone(&at) };
+    let outcome = permit.poll_immediate(|| recorder);
+    assert!(matches!(outcome, PollImmediate::Suspended(_)), "the first poll is Pending");
+    assert_eq!(executor.run_ready(1), 1, "first-poll-wake-lost: the wake in the first poll");
+    assert_eq!(polls.get(), 2, "polled twice");
+    let at = at.borrow();
+    assert_eq!(at.len(), 3, "two polls and the drop");
+    assert!(at.iter().all(|address| *address == at[0]), "first-poll-moved: {at:x?}");
+    assert_eq!(executor.live_tasks(), 0);
+    assert_eq!(executor.class_tasks(class), 0);
+}

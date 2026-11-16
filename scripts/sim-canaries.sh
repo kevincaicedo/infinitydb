@@ -1095,6 +1095,13 @@ ordered_rows=(
   # An `always` write whose verdict is an error reply leaves at once, not gated (ADR-0177 D6).
   # Planted, the error waits as a verdict for the next record's `seq`, and so for the hold.
   "inf_canary_error_reply_gated m0-capacity error-held --close-leg gated-error"
+  # The first poll runs on the occupant its publish lends, in its slot (ADR-0194 D1's note), and
+  # a wake it raises is kept. Planted, the cell moves to another slot before the Pending arm links
+  # it, and the future reads a second address.
+  "inf_canary_first_poll_off_slot crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-moved"
+  # Planted, a Pending first poll leaves its header Idle and unlinked, and the wake it raised is
+  # lost.
+  "inf_canary_first_poll_wake_dropped crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-wake-lost"
   # An `always` apply whose verdict is a reply gives its placeholder back (ADR-0177 D6), so its
   # origin's next apply opens a slot. Planted, an error reply leaves the placeholder at the
   # origin's back, and the next write's open stops the cell.

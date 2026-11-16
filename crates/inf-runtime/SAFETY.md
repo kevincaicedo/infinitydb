@@ -204,9 +204,14 @@ the executor's drop for a live task (`drop_future`), after its header is
 marked Dropping; each runs only while the header's state says the future
 is live, and the state moves on before the slot is reached again. The slot
 then holds a husk, which the slab's `take` returns and drops with no glue.
-The executor reaches a class's slab only through a safe `Any` downcast to
-its concrete type, never through an erased pointer; a zero-sized or
-over-aligned future takes the slab's own slot layout (`tests/executor.rs`
-runs both, at 4 KiB alignment). The first poll's access to the slot
-`publish` filled is a lookup by the handle it returned
-(`first_poll_slot`), safe code.
+The first poll runs on the occupant `publish_mut` lends, in the slot, and
+every later poll and the in-place drop reach it through `get_mut` of the
+handle: one address from the placement to the drop, since a Live slot lies
+where it is until `take` moves it out (ADR-0194 D1's note, D3).
+`tests/executor.rs`'s `the_first_poll_runs_in_its_slot_and_keeps_its_wake`
+reads that address at each poll and at the drop. The husk `Done` has a tag
+of its own (`repr(u8)`), so `take` moves the tag out, never a dropped
+future's bytes. The executor reaches a class's slab only through a safe
+`Any` downcast to its concrete type, never through an erased pointer; a
+zero-sized or over-aligned future takes the slab's own slot layout
+(`tests/executor.rs` runs both, at 4 KiB alignment).

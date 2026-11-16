@@ -87,6 +87,8 @@ const PLANT_SETTLE_HELD_SKIPPED: bool = cfg!(inf_canary_settle_held_skipped);
 const PLANT_REUSED_WITH_WAKERS: bool = cfg!(inf_canary_header_reused_with_wakers);
 /// `reserve` skips the class slab's `SlabInstance` compare.
 const PLANT_INSTANCE_BLIND: bool = cfg!(inf_canary_task_class_instance_blind);
+/// A Pending first poll leaves its header Idle and unlinked, even when the poll woke it.
+const PLANT_FIRST_POLL_WAKE_DROPPED: bool = cfg!(inf_canary_first_poll_wake_dropped);
 
 /// Identifies a task while it is live: its class and its slot's handle, whose generation makes a
 /// stale id detectable (`CellExecutor::is_live`) and whose instance names the slab that minted it.
@@ -259,11 +261,15 @@ impl Future for Park {
     }
 }
 
-/// A class slot's value: the future, placed before its first poll and dropped in place; the slot
-/// keeps the husk until the task's decision frees or retires it, so the slab never drops a
-/// future (it is no `Drop` of this type's).
-struct TaskCell<F> {
-    future: ManuallyDrop<F>,
+/// A class slot's value. `Live` holds the future, placed before its first poll, polled where it
+/// lies and dropped there; `Done` is the husk after that drop, which the slot keeps until the
+/// task's decision frees or retires it. `Done` has a tag of its own (`repr(u8)`: no niche of the
+/// future encodes it), so `take`'s move of a husk out of its slot is its tag (ADR-0194 D1's
+/// note). Neither variant has drop glue: the slab never drops a future.
+#[repr(u8)]
+enum TaskCell<F> {
+    Live(ManuallyDrop<F>),
+    Done,
 }
 
 /// A class slab: one slot store of the class's one future type, at the chunk its slot's bytes
@@ -475,9 +481,14 @@ impl<F: Future<Output = ()> + 'static, const C: usize> ClassObject for ClassSlab
     }
 
     fn drop_future(&mut self, slot: SlotId<u64>) {
+        let cell = self.occupant(slot);
+        let TaskCell::Live(future) = cell else {
+            unreachable!("a live header's slot holds its future")
+        };
         // SAFETY: the header's state says the future is live; it is dropped once, here, and the
-        // state moves on before anything reads it again.
-        unsafe { ManuallyDrop::drop(&mut self.occupant(slot).future) };
+        // cell is its husk before anything reads it again.
+        unsafe { ManuallyDrop::drop(future) };
+        *cell = TaskCell::Done;
     }
 
     fn reclaim(&mut self, slot: SlotId<u64>) {
@@ -511,29 +522,42 @@ unsafe fn poll_in_place<F: Future<Output = ()>>(
     header: Header,
     cx: &mut Context<'_>,
 ) -> Poll<()> {
+    let TaskCell::Live(future) = cell else {
+        unreachable!("a live header's slot holds its future")
+    };
     // SAFETY: the future was placed in its slot before its first poll, and a slab never moves a
     // value it holds (its chunks are fixed allocations): the slot is its address until it is
     // dropped in place below; it is live, per the contract.
-    let future = unsafe { Pin::new_unchecked(&mut *cell.future) };
-    let poll = future.poll(cx);
+    let pinned = unsafe { Pin::new_unchecked(&mut **future) };
+    let poll = pinned.poll(cx);
     if poll.is_ready() {
         // SAFETY: per the contract.
         unsafe { owner(header) }.state.set(TaskState::Finished);
         // SAFETY: the future is live and finished; dropped in place once, here.
-        unsafe { ManuallyDrop::drop(&mut cell.future) };
+        unsafe { ManuallyDrop::drop(future) };
+        *cell = TaskCell::Done;
     }
     poll
 }
 
-/// The first poll's access to the slot `publish` just filled. Interim: a lookup by the handle
-/// `publish` returned; the decision on reaching the slot without a lookup changes this function
-/// alone.
-#[inline(always)]
-fn first_poll_slot<F: Future<Output = ()> + 'static, const C: usize>(
+/// KE27's plant: at a Pending first poll the cell moves to another slot of its class and the
+/// header is re-pointed to it before the Pending arm links the header, the move the lend rules
+/// out. Sound only for an `Unpin` future, so its one row runs a test of one.
+#[cfg(inf_canary_first_poll_off_slot)]
+fn move_off_slot<F: Future<Output = ()> + 'static, const C: usize>(
     class: &mut ClassSlab<F, C>,
+    header: Header,
     slot: SlotId<u64>,
-) -> &mut TaskCell<F> {
-    class.occupant(slot)
+) -> SlotId<u64> {
+    let SlabReserved::Slot(reservation) = class.slab.reserve() else { return slot };
+    let (moved, _) = reservation.publish_mut(TaskCell::Done);
+    let Taken::Value(cell) = class.slab.take(slot) else { return slot };
+    if let LookupMut::Live(at) = class.slab.get_mut(moved) {
+        *at = cell;
+    }
+    // SAFETY: the slot's own header: open, on this thread.
+    unsafe { owner(header) }.slot.set(Some(moved));
+    moved
 }
 
 // ---- The header array ---------------------------------------------------------------------------
@@ -1221,7 +1245,7 @@ impl CellExecutor {
         let Some(slab) = class_slab::<F, C>(object) else {
             unreachable!("a permit's class is of its future type")
         };
-        let (header, slot) = place(slab, self.array, *base, make);
+        let (header, slot, _) = place(slab, self.array, *base, make);
         // SAFETY: the header is open, on this thread, and on no list.
         unsafe {
             owner(header).state.set(TaskState::Queued);
@@ -1241,11 +1265,13 @@ impl CellExecutor {
         let Some(slab) = class_slab::<F, C>(object) else {
             unreachable!("a permit's class is of its future type")
         };
-        let (header, slot) = place(slab, self.array, *base, make);
+        // The first poll runs on the occupant the publish lends: the slot's own address, with no
+        // lookup (ADR-0194 D1's note).
+        let (header, slot, cell) = place(slab, self.array, *base, make);
         let waker = waker_ref(header);
         let mut cx = Context::from_waker(&waker);
         // SAFETY: the slot's own header, open, on this thread; its future was just placed.
-        match unsafe { poll_in_place(first_poll_slot(slab, slot), header, &mut cx) } {
+        match unsafe { poll_in_place(cell, header, &mut cx) } {
             Poll::Ready(()) => {
                 // SAFETY: the header is open, on this thread; its future was dropped in place.
                 if unsafe { finished(header, retired) } {
@@ -1254,8 +1280,15 @@ impl CellExecutor {
                 PollImmediate::Completed
             }
             Poll::Pending => {
-                // SAFETY: the header is open, on this thread.
-                unsafe { suspended(header) };
+                #[cfg(inf_canary_first_poll_off_slot)]
+                let slot = move_off_slot(slab, header, slot);
+                if PLANT_FIRST_POLL_WAKE_DROPPED {
+                    // SAFETY: the header is open, on this thread.
+                    unsafe { owner(header) }.state.set(TaskState::Idle);
+                } else {
+                    // SAFETY: the header is open, on this thread.
+                    unsafe { suspended(header) };
+                }
                 PollImmediate::Suspended(TaskId { class, slot })
             }
         }
@@ -1482,19 +1515,19 @@ fn class_slab<F: Future<Output = ()> + 'static, const C: usize>(
     object.downcast_mut::<ClassSlab<F, C>>()
 }
 
-/// The slot a permit holds, its future placed in it before any poll; the header it names, bound
-/// to it and marked Running.
+/// The slot a permit holds, its future placed in it before any poll, and the occupant the publish
+/// lends; the header it names, bound to it and marked Running.
 #[inline(always)]
 fn place<F: Future<Output = ()> + 'static, const C: usize>(
     slab: &mut ClassSlab<F, C>,
     array: NonNull<ArrayHead>,
     base: u32,
     make: impl FnOnce() -> F,
-) -> (Header, SlotId<u64>) {
+) -> (Header, SlotId<u64>, &mut TaskCell<F>) {
     let SlabReserved::Slot(reservation) = slab.slab.reserve() else {
         unreachable!("a permit's slot was free in the step that granted it")
     };
-    let slot = reservation.publish(TaskCell { future: ManuallyDrop::new(make()) });
+    let (slot, cell) = reservation.publish_mut(TaskCell::Live(ManuallyDrop::new(make())));
     // SAFETY: the slot's index is below its class's cap, so its header lies in the array.
     let header = unsafe { header_at(array, base + slot.index()) };
     // SAFETY: the executor holds its headers: open, on this thread.
@@ -1502,7 +1535,7 @@ fn place<F: Future<Output = ()> + 'static, const C: usize>(
     debug_assert_eq!(owner.state.get(), TaskState::Free, "a free slot's header is Free");
     owner.slot.set(Some(slot));
     owner.state.set(TaskState::Running);
-    (header, slot)
+    (header, slot, cell)
 }
 
 /// A finished task's decision, its future dropped in place, so every waker it owned is counted
