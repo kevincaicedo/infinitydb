@@ -135,12 +135,20 @@ jobs:
       # The class slab's shared door forgets the kept lend: a unit test borrows the spare's chunk
       # shared between two first polls, which Tree Borrows refuses for a lend kept past it. A run
       # of its own a model: a test-name filter on the commands above would apply to every file.
+      # A filter that matches no test exits 0 having run nothing, so each step is red unless its
+      # output reads one test passed.
       - name: miri (inf-runtime's shared-door unit test) strict provenance
-        run: cargo +nightly miri test -p inf-runtime --lib -- --exact executor::tests::the_shared_door_forgets_the_lend
+        run: |
+          set -o pipefail
+          cargo +nightly miri test -p inf-runtime --lib -- --exact executor::tests::the_shared_door_forgets_the_lend 2>&1 | tee "$RUNNER_TEMP/shared-door.log"
+          grep -q 'test result: ok\. 1 passed;' "$RUNNER_TEMP/shared-door.log"
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
       - name: miri (inf-runtime's shared-door unit test) strict provenance, tree borrows
-        run: cargo +nightly miri test -p inf-runtime --lib -- --exact executor::tests::the_shared_door_forgets_the_lend
+        run: |
+          set -o pipefail
+          cargo +nightly miri test -p inf-runtime --lib -- --exact executor::tests::the_shared_door_forgets_the_lend 2>&1 | tee "$RUNNER_TEMP/shared-door.log"
+          grep -q 'test result: ok\. 1 passed;' "$RUNNER_TEMP/shared-door.log"
         env:
           MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-tree-borrows
       # A consuming foreign waker call forms no reference to its header or the remote stack once
