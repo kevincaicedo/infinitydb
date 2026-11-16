@@ -327,9 +327,8 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     /// `timers` is the cell's timer set, built on that census with every
     /// owner the cell's hosts hold already reserved (ADR-0154 D1): the loop
     /// alone delivers its arms. `executor` is the cell's executor, built
-    /// from its layout on that census (ADR-0177 D2); the cell's setup makes
-    /// its plane-start tasks through [`CellLoop::executor_mut`] before the
-    /// first iteration.
+    /// from its layout on that census (ADR-0177 D2), with the plane-start
+    /// tasks the cell's setup made on it before handing it to the loop.
     pub fn new(
         driver: D,
         clock: C,
@@ -615,13 +614,6 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
 
     pub fn executor(&self) -> &CellExecutor {
         &self.executor
-    }
-
-    /// The executor, for the cell's setup: the tasks made before the loop's
-    /// first iteration, which the census holds to the serve mark (ADR-0177
-    /// D2's plane start).
-    pub fn executor_mut(&mut self) -> &mut CellExecutor {
-        &mut self.executor
     }
 
     /// Timers armed on this cell now: at most the set's positions.

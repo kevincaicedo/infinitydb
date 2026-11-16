@@ -1,9 +1,12 @@
 //! The cell executor (ADR-0003, ADR-0177 D2): single-threaded and `!Send`. Every task belongs to
 //! a class, a fixed slab of the class's one future type, built before its cell serves: the
 //! future is placed in its slot before its first poll, never moves, and is dropped in place. A
-//! future Ready on its first poll returns its slot at once (the fast path: a slot taken and
-//! returned, no allocation); one that suspends stays where it was placed and resumes when woken,
-//! by a waker (typed gates, [`crate::gate`]) or by its owner through [`CellExecutor::wake`].
+//! first poll runs in its class's **spare**, one live slot holding a husk that no task holds and
+//! no id names, reached through the address the slab last lent while nothing else has borrowed
+//! the slab ([`class`]). A future Ready on its first poll leaves that slot the spare (the fast
+//! path: no slab call, no allocation); one that suspends takes it as its own and resumes there
+//! when woken, by a waker (typed gates, [`crate::gate`]) or by its owner through
+//! [`CellExecutor::wake`].
 //!
 //! # The header array
 //!
@@ -41,8 +44,8 @@
 //! (`waker_foreign_ops`). `SAFETY.md` holds the audit of this module's `unsafe`.
 
 use core::alloc::Layout;
-use core::any::{Any, TypeId};
-use core::cell::Cell;
+use core::any::TypeId;
+use core::cell::{Cell, UnsafeCell};
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
@@ -53,8 +56,8 @@ use std::alloc::{alloc, dealloc};
 use std::rc::Rc;
 
 use inf_foundation::bounded::{
-    Built, Cap, CapCensus, CapError, CappedSlab, LookupMut, Retire, Retiring, SlabBuilder,
-    SlabInstance, SlabReserved, SlotId, Taken,
+    Built, Cap, CapCensus, CapError, CappedSlab, LookupMut, Released, Retire, Retiring,
+    SlabBuilder, SlabInstance, SlotId,
 };
 use inf_foundation::limits::{LANE_COUNT_MAX, chunk_slots_for};
 use inf_foundation::wake::{
@@ -89,6 +92,10 @@ const PLANT_REUSED_WITH_WAKERS: bool = cfg!(inf_canary_header_reused_with_wakers
 const PLANT_INSTANCE_BLIND: bool = cfg!(inf_canary_task_class_instance_blind);
 /// A Pending first poll leaves its header Idle and unlinked, even when the poll woke it.
 const PLANT_FIRST_POLL_WAKE_DROPPED: bool = cfg!(inf_canary_first_poll_wake_dropped);
+/// A Pending first poll takes the spare's handle for its id but leaves the spare set.
+const PLANT_SPARE_KEPT_PAST_SUSPEND: bool = cfg!(inf_canary_spare_kept_past_suspend);
+/// An id's lookup skips the index's bound against its class's slots.
+const PLANT_ID_INDEX_UNBOUNDED: bool = cfg!(inf_canary_task_id_index_unbounded);
 
 /// Identifies a task while it is live: its class and its slot's handle, whose generation makes a
 /// stale id detectable (`CellExecutor::is_live`) and whose instance names the slab that minted it.
@@ -110,8 +117,8 @@ impl TaskId {
 /// Outcome of [`TaskPermit::poll_immediate`].
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PollImmediate {
-    /// The future finished on its first poll — the fast path: its slot returned, no waker
-    /// survives.
+    /// The future finished on its first poll — the fast path: its slot stays its class's spare,
+    /// or, while a waker the future left names its header, is held Retired.
     Completed,
     /// The future suspended in its slot; it resumes via its waker or its owner's
     /// [`CellExecutor::wake`] and [`CellExecutor::run_ready`].
@@ -155,22 +162,22 @@ task_factory!(A, B, C);
 
 /// A task class's handle (ADR-0177 D2): `Copy` and erased, so a host that cannot name its
 /// future's type keeps it. Only [`ExecutorLayout::class`] makes one; it carries its class slab's
-/// `SlabInstance`, so [`CellExecutor::reserve`] answers `Foreign` for a class of another future
-/// type or of another executor, two built alike included (ADR-0171 A2.1).
+/// `SlabInstance`, so [`CellExecutor::reserve`] answers `Foreign` for a class of another
+/// executor, two built alike included (ADR-0171 A2.1), and for another future type by the
+/// `TypeId` the class's entry stores.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct TaskClass {
     index: u32,
-    future: TypeId,
     instance: SlabInstance,
 }
 
 /// The answer to [`CellExecutor::reserve`]: a permit for one task of the class, or why none.
 #[must_use = "a permit makes a task or is dropped; a refusal is the caller's crossing"]
 pub enum TaskAdmission<'a, F> {
-    /// One slot of the class is the permit's until it makes the task or drops.
+    /// The class's spare is the permit's until it makes the task or drops.
     Granted(TaskPermit<'a, F>),
-    /// Every slot of the class that can serve holds a task; nothing was taken, and the class's
-    /// census row counts the crossing.
+    /// Every slot of the class that can serve holds a task and none is its spare; nothing was
+    /// taken, and the class's census row counts the crossing.
     Full,
     /// Every slot of the class has retired: the cell's fail-stop (ADR-0177 D7).
     Exhausted,
@@ -179,49 +186,118 @@ pub enum TaskAdmission<'a, F> {
     Foreign,
 }
 
-/// An exclusive permit for one task of a class: it borrows the executor, so it is used in the
-/// step that reserved it and cannot cross an `await` (ADR-0144 A2's list names it). Dropped,
-/// it leaves the slot free and no future was built.
+/// An exclusive permit for one task of a class: its class's spare, lent. It borrows the
+/// executor, so it is used in the step that reserved it and cannot cross an `await` (ADR-0144
+/// A2's list names it). Dropped, its slot stays the class's spare and no future was built. Five
+/// words, kept in registers where `reserve` and its use inline.
 #[must_use = "a permit makes a task or is dropped; it carries none"]
 pub struct TaskPermit<'a, F> {
-    executor: &'a mut CellExecutor,
+    /// The spare's occupant, the husk, where it lies.
+    cell: &'a mut TaskCell<F>,
+    /// The spare's handle: a task takes it with `take()`, so no id carries it before then.
+    spare: &'a mut Option<SlotId<u64>>,
+    /// The class's Retired count.
+    retired: &'a mut u32,
+    /// The spare's header: Free and on no list.
+    header: Header,
     class: u32,
-    future: PhantomData<fn() -> F>,
 }
 
 impl<F: Future<Output = ()> + 'static> TaskPermit<'_, F> {
-    /// Makes the task now: `make` runs, its future is placed in its slot before any poll and is
-    /// polled by the next [`CellExecutor::run_ready`].
+    /// Makes the task now: `make` runs, its future is placed in the spare's slot before any poll,
+    /// the slot becomes the task's, and the task is polled by the next
+    /// [`CellExecutor::run_ready`].
+    #[inline(always)]
     pub fn spawn_local(self, make: impl FnOnce() -> F) -> TaskId {
-        let TaskPermit { executor, class, .. } = self;
-        match const { chunk_of::<F>() } {
-            64 => executor.spawn_at::<F, 64>(class, make),
-            32 => executor.spawn_at::<F, 32>(class, make),
-            16 => executor.spawn_at::<F, 16>(class, make),
-            8 => executor.spawn_at::<F, 8>(class, make),
-            4 => executor.spawn_at::<F, 4>(class, make),
-            2 => executor.spawn_at::<F, 2>(class, make),
-            1 => executor.spawn_at::<F, 1>(class, make),
-            _ => unreachable!("a class past 64 KiB a slot is never built"),
-        }
+        let TaskPermit { cell, spare, header, class, .. } = self;
+        // The husk has no drop glue: the write drops nothing.
+        *cell = TaskCell::Live(UnsafeCell::new(ManuallyDrop::new(make())));
+        let Some(slot) = spare.take() else { unreachable!("a permit holds its class's spare") };
+        // SAFETY: the spare's header: open, on this thread, and on no list.
+        let owner = unsafe { owner(header) };
+        owner.slot.set(Some(slot));
+        owner.state.set(TaskState::Queued);
+        // SAFETY: as above.
+        unsafe { link_ready(header) };
+        TaskId { class, slot }
     }
 
-    /// Makes the task and polls it once in place (the fast path, L6): Ready, its future is
-    /// dropped in place and no runnable entry exists; Pending, the task stays where it was
-    /// placed and resumes when woken.
+    /// Makes the task and polls it once in place, in the spare's slot (the fast path, L6):
+    /// Ready, its future is dropped in place and the slot stays the spare, or is Retired while a
+    /// waker the future left names its header; Pending, the slot is the task's, which resumes
+    /// there when woken.
+    #[inline(always)]
     pub fn poll_immediate(self, make: impl FnOnce() -> F) -> PollImmediate {
-        let TaskPermit { executor, class, .. } = self;
-        match const { chunk_of::<F>() } {
-            64 => executor.poll_at::<F, 64>(class, make),
-            32 => executor.poll_at::<F, 32>(class, make),
-            16 => executor.poll_at::<F, 16>(class, make),
-            8 => executor.poll_at::<F, 8>(class, make),
-            4 => executor.poll_at::<F, 4>(class, make),
-            2 => executor.poll_at::<F, 2>(class, make),
-            1 => executor.poll_at::<F, 1>(class, make),
-            _ => unreachable!("a class past 64 KiB a slot is never built"),
+        let TaskPermit { cell, spare, retired, header, class } = self;
+        // The husk has no drop glue: the write drops nothing.
+        *cell = TaskCell::Live(UnsafeCell::new(ManuallyDrop::new(make())));
+        // SAFETY: the spare's header: open, on this thread, and on no list.
+        unsafe { owner(header) }.state.set(TaskState::Running);
+        let waker = waker_ref(header);
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: the slot's own header, Running; its future was just placed in the slot.
+        match unsafe { poll_in_place(cell, header, &mut cx) } {
+            // SAFETY: as above; the future was dropped in place, so its wakers are counted out.
+            Poll::Ready(()) if PLANT_REUSED_WITH_WAKERS || unsafe { quiet(header) } => {
+                // No id names the slot's generation: it stays the spare, unadvanced.
+                // SAFETY: as above.
+                unsafe { owner(header) }.state.set(TaskState::Free);
+                PollImmediate::Completed
+            }
+            // SAFETY: as above.
+            Poll::Ready(()) => unsafe { first_retired(header, spare, retired) },
+            // SAFETY: as above; the header is on no list.
+            Poll::Pending => unsafe { first_pending(header, spare, class) },
         }
     }
+}
+
+/// A first poll Ready while a waker the future left names its header (E's Retired row, off the
+/// fast path): the spare's handle leaves it for the Retired header, which holds the slot until
+/// that waker's drop links its reclaim.
+///
+/// # Safety
+/// `header` is the spare's, open, on the owner thread, its future just dropped in place.
+#[cold]
+#[inline(never)]
+unsafe fn first_retired(
+    header: Header,
+    spare: &mut Option<SlotId<u64>>,
+    retired: &mut u32,
+) -> PollImmediate {
+    // SAFETY: per the contract.
+    let owner = unsafe { owner(header) };
+    owner.slot.set(spare.take());
+    owner.state.set(TaskState::Retired);
+    *retired += 1;
+    PollImmediate::Completed
+}
+
+/// A first poll Pending (off the fast path): the spare's handle leaves it as the task's id and
+/// its header's slot, and the header is Idle, or Queued when the poll woke it. One canary leaves
+/// the spare set, so the next first poll writes over the suspended task.
+///
+/// # Safety
+/// `header` is the spare's, open, on the owner thread, and on no list.
+#[cold]
+#[inline(never)]
+unsafe fn first_pending(
+    header: Header,
+    spare: &mut Option<SlotId<u64>>,
+    class: u32,
+) -> PollImmediate {
+    let held = if PLANT_SPARE_KEPT_PAST_SUSPEND { *spare } else { spare.take() };
+    let Some(slot) = held else { unreachable!("a permit holds its class's spare") };
+    // SAFETY: per the contract.
+    let owner = unsafe { owner(header) };
+    owner.slot.set(Some(slot));
+    if PLANT_FIRST_POLL_WAKE_DROPPED {
+        owner.state.set(TaskState::Idle);
+    } else {
+        // SAFETY: per the contract.
+        unsafe { suspended(header) };
+    }
+    PollImmediate::Suspended(TaskId { class, slot })
 }
 
 /// The answer to [`CellExecutor::wake`].
@@ -262,19 +338,128 @@ impl Future for Park {
 }
 
 /// A class slot's value. `Live` holds the future, placed before its first poll, polled where it
-/// lies and dropped there; `Done` is the husk after that drop, which the slot keeps until the
-/// task's decision frees or retires it. `Done` has a tag of its own (`repr(u8)`: no niche of the
-/// future encodes it), so `take`'s move of a husk out of its slot is its tag (ADR-0194 D1's
-/// note). Neither variant has drop glue: the slab never drops a future.
-#[repr(u8)]
+/// lies and dropped there; `Done` is the husk after that drop, which the slot keeps as its
+/// class's spare or until the task's decision releases it, dropped where it lies (ADR-0194 D1's
+/// second note). Neither variant has drop glue: the slab never drops a future.
+///
+/// The future is in an `UnsafeCell`: a suspended future may hold `&mut` into itself across an
+/// `await`, and a slab lookup reborrows a whole chunk shared (a slice's length, a shared walk),
+/// which, over bytes outside an `UnsafeCell`, is a read that the aliasing model lets invalidate
+/// that `&mut` in every slot of the chunk. Inside the cell a shared reborrow freezes nothing, so
+/// a lookup of one slot leaves every future in its chunk as it was (this crate's `SAFETY.md`).
 enum TaskCell<F> {
-    Live(ManuallyDrop<F>),
+    Live(UnsafeCell<ManuallyDrop<F>>),
     Done,
 }
 
 /// A class slab: one slot store of the class's one future type, at the chunk its slot's bytes
 /// take (ADR-0194 A1), its generation `u64` and retired at its last (ADR-0177 D7).
 type ClassStore<F, const C: usize> = CappedSlab<TaskCell<F>, u64, Retire, C>;
+
+/// A class's slab with its spare and the kept lend, behind this module's two doors. The spare is
+/// one Live slot holding the husk, its header Free and on no list, its generation carried by no
+/// `TaskId`; a class has at most one. The **kept lend** is the spare's occupant as the slab last
+/// lent it, kept while nothing else borrows the slab: the slab, the spare and the lend are
+/// private here, every other borrow of the slab, shared or mutable, passes [`ClassSlab::slab`]
+/// or [`ClassSlab::slab_mut`], and each forgets the lend first. So a consecutive first poll
+/// reaches its slot with no walk, and the lend is never used past a borrow that could invalidate
+/// it (this crate's `SAFETY.md`).
+mod class {
+    use core::cell::Cell;
+    use core::ptr::NonNull;
+
+    use inf_foundation::bounded::{LookupMut, SlabReserved, SlotId};
+
+    use super::{ClassStore, TaskCell};
+
+    pub(super) struct ClassSlab<F, const C: usize> {
+        slab: ClassStore<F, C>,
+        spare: Option<SlotId<u64>>,
+        lent: Cell<Option<NonNull<TaskCell<F>>>>,
+    }
+
+    /// The spare lent to one permit: its slot's index, the occupant where it lies, and the
+    /// spare's handle, which the permit's task takes.
+    pub(super) struct Lend<'a, F> {
+        pub(super) index: u32,
+        pub(super) cell: &'a mut TaskCell<F>,
+        pub(super) spare: &'a mut Option<SlotId<u64>>,
+    }
+
+    /// The answer to [`ClassSlab::lend`]: the spare, or the slab's refusal, nothing taken.
+    pub(super) enum Lent<'a, F> {
+        Spare(Lend<'a, F>),
+        Full,
+        Exhausted,
+    }
+
+    impl<F, const C: usize> ClassSlab<F, C> {
+        /// A built class slab, with no spare and nothing lent.
+        pub(super) fn new(slab: ClassStore<F, C>) -> ClassSlab<F, C> {
+            ClassSlab { slab, spare: None, lent: Cell::new(None) }
+        }
+
+        /// The door for a shared borrow of the slab: the lend is forgotten first, since a shared
+        /// reborrow of a chunk would leave it valid for reads alone.
+        #[inline(always)]
+        pub(super) fn slab(&self) -> &ClassStore<F, C> {
+            self.lent.set(None);
+            &self.slab
+        }
+
+        /// The door for a mutable borrow of the slab: the lend is forgotten first.
+        #[inline(always)]
+        pub(super) fn slab_mut(&mut self) -> &mut ClassStore<F, C> {
+            self.lent.set(None);
+            &mut self.slab
+        }
+
+        /// Whether the class holds its spare, which its slab counts live and no task holds.
+        #[inline]
+        pub(super) fn has_spare(&self) -> bool {
+            self.spare.is_some()
+        }
+
+        /// The spare, lent for one permit: through the kept lend, with no slab call; else by
+        /// `get_mut` of the spare's handle; else, with no spare, the slab's `reserve` and
+        /// `publish_mut` of the husk, whose handle becomes the spare (counted and reported as
+        /// any publish). Each of the last two keeps its lend. `Full` and `Exhausted` take
+        /// nothing.
+        #[inline(always)]
+        pub(super) fn lend(&mut self) -> Lent<'_, F> {
+            let (index, lent) = match (self.spare, self.lent.get()) {
+                (Some(spare), Some(kept)) => (spare.index(), kept),
+                (Some(spare), None) => match self.slab_mut().get_mut(spare) {
+                    LookupMut::Live(cell) => (spare.index(), NonNull::from(cell)),
+                    LookupMut::Stale | LookupMut::Vacant => {
+                        unreachable!("a class's spare is a live slot of its slab")
+                    }
+                },
+                (None, _) => match self.slab_mut().reserve() {
+                    SlabReserved::Slot(reservation) => {
+                        let (spare, cell) = reservation.publish_mut(TaskCell::Done);
+                        let lent = NonNull::from(cell);
+                        self.spare = Some(spare);
+                        (spare.index(), lent)
+                    }
+                    SlabReserved::Full => return Lent::Full,
+                    SlabReserved::Exhausted => return Lent::Exhausted,
+                },
+            };
+            self.lent.set(Some(lent));
+            // SAFETY: `lent` is the spare's occupant as the slab lent it, by this call's
+            // `get_mut` or `publish_mut` or by an earlier one's: no borrow of the slab, shared
+            // or mutable, has been made since, for every one passes `slab` or `slab_mut`, which
+            // forget the lend, and this `&mut self` excludes any other. A Live slot lies where
+            // it is until a take, a release or a retire step (ADR-0194 D1's notes), each of
+            // which passes a door. The `&mut` lives for the permit's borrow of the executor.
+            let cell = unsafe { &mut *lent.as_ptr() };
+            Lent::Spare(Lend { index, cell, spare: &mut self.spare })
+        }
+    }
+}
+
+use class::{ClassSlab, Lend, Lent};
 
 /// The chunk a class of future `F` is built at: `chunk_slots_for` over its slot's bytes, or 0
 /// past one 64 KiB allocation, where no class is built.
@@ -338,7 +523,7 @@ impl ExecutorLayout {
         let index = u32::try_from(self.classes.len()).map_err(|_| CapError::Layout)?;
         let (builder, instance) = class_builder::<Fac::Future>(cap, &self.census)?;
         self.classes.push(builder);
-        Ok(TaskClass { index, future: TypeId::of::<Fac::Future>(), instance })
+        Ok(TaskClass { index, instance })
     }
 
     /// The slot bytes of a class of the future `factory` makes, and the slots one chunk of its
@@ -366,8 +551,9 @@ impl ExecutorLayout {
             headers = headers
                 .checked_add(cap)
                 .ok_or(ExecutorInitError { row: HEADER_ARRAY_ROW, error: CapError::Layout })?;
-            let object = builder.build().map_err(|error| ExecutorInitError { row, error })?;
-            classes.push(ClassEntry { object, instance, base, retired: 0 });
+            let (object, slab_type) =
+                builder.build().map_err(|error| ExecutorInitError { row, error })?;
+            classes.push(ClassEntry { object, slab_type, instance, base, slots: cap, retired: 0 });
         }
         let mark = ThreadMark::claim();
         let array = HeaderArray::build(&classes, headers, mark)?;
@@ -380,8 +566,11 @@ trait ClassBuild {
     fn row(&self) -> &'static str;
     fn cap(&self) -> u32;
     fn instance(&self) -> SlabInstance;
-    /// The slab, built step by step; a refused step retires what was built, by steps.
-    fn build(self: Box<Self>) -> Result<Box<dyn ClassObject>, CapError>;
+    /// The slab, built step by step, as its class's object with the `TypeId` of the object's
+    /// concrete type, `ClassSlab<F, C>`, beside it: one call answers both, so no code pairs an
+    /// object with another's id (`class_slab`'s cast). A refused step retires what was built, by
+    /// steps.
+    fn build(self: Box<Self>) -> Result<(Box<dyn ClassObject>, TypeId), CapError>;
 }
 
 /// The builder of a class of future `F` at chunk `C`.
@@ -430,12 +619,15 @@ impl<F: Future<Output = ()> + 'static, const C: usize> ClassBuild for ClassBuild
         self.builder.instance()
     }
 
-    fn build(self: Box<Self>) -> Result<Box<dyn ClassObject>, CapError> {
+    fn build(self: Box<Self>) -> Result<(Box<dyn ClassObject>, TypeId), CapError> {
         let mut builder = self.builder;
         loop {
             match builder.step() {
                 Built::More(next) => builder = next,
-                Built::Live(slab) => return Ok(Box::new(ClassSlab { slab })),
+                Built::Live(slab) => {
+                    let object: Box<dyn ClassObject> = Box::new(ClassSlab::new(slab));
+                    return Ok((object, TypeId::of::<ClassSlab<F, C>>()));
+                }
                 Built::Refused(mut retiring, refused) => loop {
                     match retiring.step() {
                         Retiring::More(next) => retiring = next,
@@ -448,8 +640,8 @@ impl<F: Future<Output = ()> + 'static, const C: usize> ClassBuild for ClassBuild
 }
 
 /// A live class, erased: a poll from the ready list is one indirect call, as a type-erased
-/// task's always was.
-trait ClassObject: Any {
+/// task's always was. Its every method reaches the slab through a door of [`class`].
+trait ClassObject {
     /// Polls the occupant `slot` names once, in place; Ready, `header` is marked Finished and
     /// the future dropped in place.
     ///
@@ -460,21 +652,20 @@ trait ClassObject: Any {
     fn drop_future(&mut self, slot: SlotId<u64>);
     /// Frees a finished occupant's slot: its generation advances, or it retires.
     fn reclaim(&mut self, slot: SlotId<u64>);
-    /// Whether `slot` names this class's current occupant.
-    fn holds(&self, slot: SlotId<u64>) -> bool;
-    /// Slots held: Reserved, Active and Retired.
+    /// Slots its tasks hold, Active and Retired: the spare is none of them.
     fn len(&self) -> u32;
-}
-
-/// A class slab and its occupants' futures, behind its erased object.
-struct ClassSlab<F, const C: usize> {
-    slab: ClassStore<F, C>,
+    /// KE27's plant: before a task's activation its cell moves to another slot of its class
+    /// (`reserve`, `publish` of the husk, `take`, a write through `get_mut`) and its header is
+    /// re-pointed there, the move the in-place rule rules out. Sound only for an `Unpin`
+    /// future, so its one row runs a test of one; answers the slot the task is in.
+    #[cfg(inf_canary_first_poll_off_slot)]
+    fn move_off_slot(&mut self, header: Header, slot: SlotId<u64>) -> SlotId<u64>;
 }
 
 impl<F: Future<Output = ()> + 'static, const C: usize> ClassSlab<F, C> {
     /// The live occupant `slot` names: a header names its slot only while it holds it.
     fn occupant(&mut self, slot: SlotId<u64>) -> &mut TaskCell<F> {
-        match self.slab.get_mut(slot) {
+        match self.slab_mut().get_mut(slot) {
             LookupMut::Live(cell) => cell,
             LookupMut::Stale | LookupMut::Vacant => {
                 unreachable!("a header names its slot only while the slot holds its task")
@@ -496,26 +687,39 @@ impl<F: Future<Output = ()> + 'static, const C: usize> ClassObject for ClassSlab
         };
         // SAFETY: the header's state says the future is live; it is dropped once, here, and the
         // cell is its husk before anything reads it again.
-        unsafe { ManuallyDrop::drop(future) };
+        unsafe { ManuallyDrop::drop(future.get_mut()) };
         *cell = TaskCell::Done;
     }
 
     fn reclaim(&mut self, slot: SlotId<u64>) {
-        match self.slab.take(slot) {
-            // The husk: its future was dropped in place, and `TaskCell` drops nothing.
-            Taken::Value(_) => {}
-            Taken::Stale | Taken::Vacant => {
+        // The husk is released where it lies: its future was dropped in place, and `TaskCell`
+        // has no drop glue, so nothing moves and nothing drops.
+        match self.slab_mut().release(slot) {
+            Released::Dropped => {}
+            Released::Stale | Released::Vacant => {
                 unreachable!("a finished header names its slot until the slot is reclaimed")
             }
         }
     }
 
-    fn holds(&self, slot: SlotId<u64>) -> bool {
-        matches!(self.slab.get(slot), inf_foundation::bounded::Lookup::Live(_))
+    fn len(&self) -> u32 {
+        // The spare is live in the slab and held by no task: at most one, and live when set.
+        self.slab().len() - u32::from(self.has_spare())
     }
 
-    fn len(&self) -> u32 {
-        self.slab.len()
+    #[cfg(inf_canary_first_poll_off_slot)]
+    fn move_off_slot(&mut self, header: Header, slot: SlotId<u64>) -> SlotId<u64> {
+        use inf_foundation::bounded::{SlabReserved, Taken};
+        let slab = self.slab_mut();
+        let SlabReserved::Slot(reservation) = slab.reserve() else { return slot };
+        let moved = reservation.publish(TaskCell::Done);
+        let Taken::Value(cell) = slab.take(slot) else { return slot };
+        if let LookupMut::Live(at) = slab.get_mut(moved) {
+            *at = cell;
+        }
+        // SAFETY: the slot's own header: open, on this thread.
+        unsafe { owner(header) }.slot.set(Some(moved));
+        moved
     }
 }
 
@@ -537,36 +741,16 @@ unsafe fn poll_in_place<F: Future<Output = ()>>(
     // SAFETY: the future was placed in its slot before its first poll, and a slab never moves a
     // value it holds (its chunks are fixed allocations): the slot is its address until it is
     // dropped in place below; it is live, per the contract.
-    let pinned = unsafe { Pin::new_unchecked(&mut **future) };
+    let pinned = unsafe { Pin::new_unchecked(&mut **future.get_mut()) };
     let poll = pinned.poll(cx);
     if poll.is_ready() {
         // SAFETY: per the contract.
         unsafe { owner(header) }.state.set(TaskState::Finished);
         // SAFETY: the future is live and finished; dropped in place once, here.
-        unsafe { ManuallyDrop::drop(future) };
+        unsafe { ManuallyDrop::drop(future.get_mut()) };
         *cell = TaskCell::Done;
     }
     poll
-}
-
-/// KE27's plant: at a Pending first poll the cell moves to another slot of its class and the
-/// header is re-pointed to it before the Pending arm links the header, the move the lend rules
-/// out. Sound only for an `Unpin` future, so its one row runs a test of one.
-#[cfg(inf_canary_first_poll_off_slot)]
-fn move_off_slot<F: Future<Output = ()> + 'static, const C: usize>(
-    class: &mut ClassSlab<F, C>,
-    header: Header,
-    slot: SlotId<u64>,
-) -> SlotId<u64> {
-    let SlabReserved::Slot(reservation) = class.slab.reserve() else { return slot };
-    let (moved, _) = reservation.publish_mut(TaskCell::Done);
-    let Taken::Value(cell) = class.slab.take(slot) else { return slot };
-    if let LookupMut::Live(at) = class.slab.get_mut(moved) {
-        *at = cell;
-    }
-    // SAFETY: the slot's own header: open, on this thread.
-    unsafe { owner(header) }.slot.set(Some(moved));
-    moved
 }
 
 // ---- The header array ---------------------------------------------------------------------------
@@ -714,6 +898,8 @@ impl HeaderArray {
 /// `array` is live and `index` is below its `len`.
 #[inline(always)]
 unsafe fn header_at(array: NonNull<ArrayHead>, index: u32) -> Header {
+    // SAFETY: per the contract the array is live; `len` is written at the build and never again.
+    debug_assert!(index < unsafe { (*array.as_ptr()).len }, "a header's index lies in its array");
     // SAFETY: per the contract the offset lies inside the allocation, and `array` carries the
     // provenance of all of it.
     unsafe { array.byte_add(HEADERS_OFFSET).cast::<WakeHeader>().add(index as usize) }
@@ -765,6 +951,11 @@ unsafe fn link_ready(header: Header) {
         let array = array_of(header);
         let head = array.as_ref();
         let index = owner(header).index;
+        debug_assert!(
+            matches!(owner(header).state.get(), TaskState::Queued | TaskState::Reclaiming),
+            "a linked header is Queued or Reclaiming"
+        );
+        debug_assert_ne!(head.ready_tail.get(), index, "a header is linked at most once");
         owner(header).ready_next.set(NO_HEADER);
         match head.ready_tail.get() {
             NO_HEADER => head.ready_head.set(index),
@@ -1176,12 +1367,16 @@ pub struct CellExecutor {
     not_send: PhantomData<*const ()>,
 }
 
-/// A live class: its slab behind its object, the slab's identity, its first header in the array
-/// and its Retired count.
+/// A live class: its slab behind its object, the `TypeId` of the object's concrete type (written
+/// with the object by `ClassBuild::build` and never after), the slab's identity, its first header
+/// in the array and its Retired count.
 struct ClassEntry {
     object: Box<dyn ClassObject>,
+    slab_type: TypeId,
     instance: SlabInstance,
     base: u32,
+    /// The class's slots, its headers from `base`.
+    slots: u32,
     /// Retired and Reclaiming headers: finished tasks whose slots stay held.
     retired: u32,
 }
@@ -1195,7 +1390,9 @@ impl CellExecutor {
     /// A permit for one task of `class`, whose future type the permit's use fixes: `Foreign`
     /// for another executor's class or another future type, `Full` when every slot of the class
     /// holds a task (the class's census row counts it), `Exhausted` when every slot retired.
-    /// Nothing is taken until the permit makes the task.
+    /// The permit is the class's spare, made from a free slot when the class has none; nothing
+    /// else is taken until the permit makes the task.
+    #[inline(always)]
     pub fn reserve<F: Future<Output = ()> + 'static>(
         &mut self,
         class: TaskClass,
@@ -1217,103 +1414,34 @@ impl CellExecutor {
         &mut self,
         class: TaskClass,
     ) -> TaskAdmission<'_, F> {
-        let Some(entry) = self.classes.get_mut(class.index as usize) else {
+        let CellExecutor { classes, array, .. } = self;
+        let Some(entry) = classes.get_mut(class.index as usize) else {
             return TaskAdmission::Foreign;
         };
+        let ClassEntry { object, slab_type, instance, base, retired, .. } = entry;
         // Another executor's class first, by its slab's identity, then another future type.
-        if !PLANT_INSTANCE_BLIND && entry.instance != class.instance {
+        if !PLANT_INSTANCE_BLIND && *instance != class.instance {
             return TaskAdmission::Foreign;
         }
-        if class.future != TypeId::of::<F>() {
-            return TaskAdmission::Foreign;
-        }
-        let Some(slab) = class_slab::<F, C>(&mut entry.object) else {
+        let Some(slab) = class_slab::<F, C>(*slab_type, object) else {
             return TaskAdmission::Foreign;
         };
-        // The slab's own admission decides, so its census row counts a crossing and its
-        // canaries reach the class; the slot it takes is left free, and the permit takes it in
-        // this same step.
-        match slab.slab.reserve() {
-            SlabReserved::Slot(_) => {}
-            SlabReserved::Full => return TaskAdmission::Full,
-            SlabReserved::Exhausted => return TaskAdmission::Exhausted,
-        }
-        TaskAdmission::Granted(TaskPermit {
-            executor: self,
-            class: class.index,
-            future: PhantomData,
-        })
-    }
-
-    fn spawn_at<F: Future<Output = ()> + 'static, const C: usize>(
-        &mut self,
-        class: u32,
-        make: impl FnOnce() -> F,
-    ) -> TaskId {
-        let ClassEntry { object, base, .. } = &mut self.classes[class as usize];
-        let Some(slab) = class_slab::<F, C>(object) else {
-            unreachable!("a permit's class is of its future type")
+        // The slab's own admission decides a class with no spare, so its census row counts a
+        // crossing and its canaries reach the class.
+        let Lend { index, cell, spare } = match slab.lend() {
+            Lent::Spare(lend) => lend,
+            Lent::Full => return TaskAdmission::Full,
+            Lent::Exhausted => return TaskAdmission::Exhausted,
         };
-        let (header, slot, _) = place(slab, self.array, *base, make);
-        // SAFETY: the header is open, on this thread, and on no list.
-        unsafe {
-            owner(header).state.set(TaskState::Queued);
-            link_ready(header);
-        }
-        TaskId { class, slot }
-    }
-
-    /// The fast path: placed, polled once in place, and on Ready decided in the same step, on
-    /// the class's own slab.
-    fn poll_at<F: Future<Output = ()> + 'static, const C: usize>(
-        &mut self,
-        class: u32,
-        make: impl FnOnce() -> F,
-    ) -> PollImmediate {
-        let ClassEntry { object, base, retired, .. } = &mut self.classes[class as usize];
-        let Some(slab) = class_slab::<F, C>(object) else {
-            unreachable!("a permit's class is of its future type")
-        };
-        // The first poll runs on the occupant the publish lends: the slot's own address, with no
-        // lookup (ADR-0194 D1's note).
-        let (header, slot, cell) = place(slab, self.array, *base, make);
-        let waker = waker_ref(header);
-        let mut cx = Context::from_waker(&waker);
-        // SAFETY: the slot's own header, open, on this thread; its future was just placed.
-        match unsafe { poll_in_place(cell, header, &mut cx) } {
-            Poll::Ready(()) => {
-                // SAFETY: the header is open, on this thread; its future was dropped in place.
-                if unsafe { finished(header, retired) } {
-                    let _ = slab.slab.take(slot);
-                }
-                PollImmediate::Completed
-            }
-            Poll::Pending => {
-                #[cfg(inf_canary_first_poll_off_slot)]
-                let slot = move_off_slot(slab, header, slot);
-                if PLANT_FIRST_POLL_WAKE_DROPPED {
-                    // SAFETY: the header is open, on this thread.
-                    unsafe { owner(header) }.state.set(TaskState::Idle);
-                } else {
-                    // SAFETY: the header is open, on this thread.
-                    unsafe { suspended(header) };
-                }
-                PollImmediate::Suspended(TaskId { class, slot })
-            }
-        }
+        // SAFETY: the spare's index is below its class's cap, so its header lies in the array.
+        let header = unsafe { header_at(*array, *base + index) };
+        TaskAdmission::Granted(TaskPermit { cell, spare, retired, header, class: class.index })
     }
 
     /// Moves an Idle task to the ready list's tail (ADR-0177 D2): its owner queued work for it.
     /// A queued or running task's wakes coalesce; a stale or vacant id changes nothing.
     pub fn wake(&mut self, id: TaskId) -> Woken {
-        let Some(entry) = self.classes.get(id.class as usize) else {
-            return Woken::Stale;
-        };
-        if !entry.object.holds(id.slot) {
-            return Woken::Stale;
-        }
-        // SAFETY: the slot's index is below its class's cap.
-        let header = unsafe { header_at(self.array, entry.base + id.slot.index()) };
+        let Some(header) = self.header_of(id) else { return Woken::Stale };
         // SAFETY: the executor holds its headers: open, on this thread.
         let state = unsafe { owner(header) }.state.get();
         match state {
@@ -1350,6 +1478,25 @@ impl CellExecutor {
     #[must_use]
     pub fn class_retired(&self, class: TaskClass) -> u32 {
         self.entry(class).map_or(0, |entry| entry.retired)
+    }
+
+    /// The header of the task `id` names, while its task holds its slot: the class slab's
+    /// `SlabInstance` compared first, so another cell's handle is `None`, and the index's bound
+    /// against the class's slots, since two censuses of one cell mint equal instances (ADR-0194
+    /// D5), so a slab built alike on another may have minted it past this class's headers; then
+    /// the header's own handle, set while its task holds the slot and cleared when the slot is
+    /// released, compared whole. No slab is reached.
+    fn header_of(&self, id: TaskId) -> Option<Header> {
+        let entry = self.classes.get(id.class as usize)?;
+        let past = id.slot.index() >= entry.slots && !PLANT_ID_INDEX_UNBOUNDED;
+        if id.slot.instance() != entry.instance || past {
+            return None;
+        }
+        // SAFETY: the index is below the class's slots, so the header lies in the class's run of
+        // the array.
+        let header = unsafe { header_at(self.array, entry.base + id.slot.index()) };
+        // SAFETY: the executor holds its headers: open, on this thread.
+        (unsafe { owner(header) }.slot.get() == Some(id.slot)).then_some(header)
     }
 
     /// The class `class` names, if this executor made it.
@@ -1401,6 +1548,8 @@ impl CellExecutor {
         let waker = waker_ref(header);
         let mut cx = Context::from_waker(&waker);
         let entry = &mut self.classes[owner.class as usize];
+        #[cfg(inf_canary_first_poll_off_slot)]
+        let slot = entry.object.move_off_slot(header, slot);
         // SAFETY: as above; a queued header's future is live.
         match unsafe { entry.object.poll(slot, header, &mut cx) } {
             Poll::Ready(()) => {
@@ -1414,7 +1563,8 @@ impl CellExecutor {
         }
     }
 
-    /// A Retired header no waker names any more: its slot frees and its generation advances.
+    /// A Retired header no waker names any more: its slot is released, the husk dropped where it
+    /// lies, and its generation advances.
     fn reclaim(&mut self, header: Header) {
         // SAFETY: the executor holds its headers: open, on this thread.
         let owner = unsafe { owner(header) };
@@ -1486,13 +1636,9 @@ impl CellExecutor {
     /// Whether `id` still names a live task (slots are recycled; stale ids compare against the
     /// slot's generation and the slab's instance).
     pub fn is_live(&self, id: TaskId) -> bool {
-        let Some(entry) = self.classes.get(id.class as usize) else { return false };
-        if !entry.object.holds(id.slot) {
-            return false;
-        }
-        // SAFETY: the slot's index is below its class's cap; the header is open, on this thread.
-        let state =
-            unsafe { owner(header_at(self.array, entry.base + id.slot.index())) }.state.get();
+        let Some(header) = self.header_of(id) else { return false };
+        // SAFETY: the executor holds its headers: open, on this thread.
+        let state = unsafe { owner(header) }.state.get();
         matches!(
             state,
             TaskState::Idle | TaskState::Queued | TaskState::Running | TaskState::RunningWoken
@@ -1515,36 +1661,21 @@ impl CellExecutor {
     }
 }
 
-/// A class's slab, if it is of future `F` at chunk `C`.
+/// A class's slab, if it is of future `F` at chunk `C`: the entry's stored `TypeId` compared, no
+/// virtual call (ADR-0177 D2's recorded type).
 #[inline(always)]
 fn class_slab<F: Future<Output = ()> + 'static, const C: usize>(
+    slab_type: TypeId,
     object: &mut Box<dyn ClassObject>,
 ) -> Option<&mut ClassSlab<F, C>> {
-    let object: &mut dyn Any = &mut **object;
-    object.downcast_mut::<ClassSlab<F, C>>()
-}
-
-/// The slot a permit holds, its future placed in it before any poll, and the occupant the publish
-/// lends; the header it names, bound to it and marked Running.
-#[inline(always)]
-fn place<F: Future<Output = ()> + 'static, const C: usize>(
-    slab: &mut ClassSlab<F, C>,
-    array: NonNull<ArrayHead>,
-    base: u32,
-    make: impl FnOnce() -> F,
-) -> (Header, SlotId<u64>, &mut TaskCell<F>) {
-    let SlabReserved::Slot(reservation) = slab.slab.reserve() else {
-        unreachable!("a permit's slot was free in the step that granted it")
-    };
-    let (slot, cell) = reservation.publish_mut(TaskCell::Live(ManuallyDrop::new(make())));
-    // SAFETY: the slot's index is below its class's cap, so its header lies in the array.
-    let header = unsafe { header_at(array, base + slot.index()) };
-    // SAFETY: the executor holds its headers: open, on this thread.
-    let owner = unsafe { owner(header) };
-    debug_assert_eq!(owner.state.get(), TaskState::Free, "a free slot's header is Free");
-    owner.slot.set(Some(slot));
-    owner.state.set(TaskState::Running);
-    (header, slot, cell)
+    if slab_type != TypeId::of::<ClassSlab<F, C>>() {
+        return None;
+    }
+    let object: *mut dyn ClassObject = &mut **object;
+    // SAFETY: `slab_type` is the `TypeId` of the object's concrete type: `ClassBuild::build`
+    // returned the two together and nothing writes either after, so the object is a
+    // `ClassSlab<F, C>`, and the pointer, from the `&mut` this borrow holds, is its address.
+    Some(unsafe { &mut *object.cast::<ClassSlab<F, C>>() })
 }
 
 /// A finished task's decision, its future dropped in place, so every waker it owned is counted
@@ -1695,6 +1826,41 @@ mod tests {
     /// The probe's one future type, boxed: the test's closure has no name to register.
     type Probe = Pin<Box<dyn Future<Output = ()>>>;
     const ONE: Cap = Cap::entries::<1>("test-probe", CapFill::Serving);
+
+    /// An executor of one probe class, its one header Free and on no list.
+    fn one_header() -> CellExecutor {
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(0));
+        let mut layout = ExecutorLayout::new(&census);
+        let _class = layout.class(&|f: Probe| f, ONE).expect("one class");
+        layout.build().expect("no class refuses")
+    }
+
+    /// The link's check: only a Queued or Reclaiming header is linked.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a linked header is Queued or Reclaiming")]
+    fn a_free_header_is_never_linked() {
+        let executor = one_header();
+        // SAFETY: the one class's one header: open, on this thread, and on no list.
+        unsafe { link_ready(header_at(executor.array, 0)) };
+    }
+
+    /// The link's check: a header at the ready list's tail is not linked again.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a header is linked at most once")]
+    fn a_header_is_never_linked_twice() {
+        let executor = one_header();
+        // SAFETY: the one class's one header: open, on this thread, and on no list.
+        let header = unsafe { header_at(executor.array, 0) };
+        // SAFETY: as above.
+        unsafe { owner(header) }.state.set(TaskState::Queued);
+        // SAFETY: as above; the second link is the one the check refuses.
+        unsafe {
+            link_ready(header);
+            link_ready(header);
+        }
+    }
 
     /// An owner-lane clone at `LANE_COUNT_MAX` aborts the process before the count is written;
     /// one below the bound reaches it. A test-only start count stands in for 2⁶⁰ clones: the test

@@ -1187,9 +1187,9 @@ ordered_rows=(
   # An `always` write whose verdict is an error reply leaves at once, not gated (ADR-0177 D6).
   # Planted, the error waits as a verdict for the next record's `seq`, and so for the hold.
   "inf_canary_error_reply_gated m0-capacity error-held --close-leg gated-error"
-  # The first poll runs on the occupant its publish lends, in its slot (ADR-0194 D1's note), and
-  # a wake it raises is kept. Planted, the cell moves to another slot before the Pending arm links
-  # it, and the future reads a second address.
+  # The first poll runs in its class's spare, in its slot, where every later poll and the drop
+  # find it (ADR-0194 D1's note), and a wake it raises is kept. Planted, the cell moves to another
+  # slot of its class at the task's next activation, and the future reads a second address.
   "inf_canary_first_poll_off_slot crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-moved"
   # Planted, a Pending first poll leaves its header Idle and unlinked, and the wake it raised is
   # lost.
@@ -1274,9 +1274,17 @@ ordered_rows=(
   # precedes the close's 1→0 in one task. Planted, the removal runs at Closed, before the drain,
   # and the owner keeps counting the closed client.
   "inf_canary_registry_dropped_at_closed m0-capacity sub-count-after-close --close-leg subscribe-reset"
+  # A slab's release drops its occupant where it lies, after the counts and the free chain are
+  # written (ADR-0194 D1's second note). Planted, it moves the occupant out as a take does and
+  # drops it off its slot, at another address than the one the slab lent.
+  "inf_canary_release_moves_occupant crate-test inf-foundation lib release_drops_the_occupant_where_it_lies release-moved"
   # A general send keeps one credit free for the publish fan (ADR-0192 D2), so an origin parks
   # at most 7 applies at a peer of 8 credits. Planted, the guard is gone and all 8 arrive.
   "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"
+  # A Pending first poll takes its class's spare as its task's slot, so no id names the spare
+  # (ADR-0177 D2). Planted, the task takes the spare's handle but the spare stays set, and the
+  # next first poll writes over the suspended task, at its address.
+  "inf_canary_spare_kept_past_suspend crate-test inf-runtime test:executor the_spare_serves_no_task_an_id_names spare-under-id"
   # The stop's mark ends every parser (ADR-0196 A1.1). Planted, it reaches active slots alone,
   # and a SET held past the stop runs.
   "inf_canary_stop_skips_peer_reader crate-test inf-server lib stop_ends_every_reader set-after-stop"
@@ -1284,6 +1292,10 @@ ordered_rows=(
   # A2.1). Planted, the compare is skipped, and another executor's class, built alike, is
   # granted.
   "inf_canary_task_class_instance_blind crate-test inf-runtime test:executor a_class_and_a_task_of_one_executor_are_foreign_to_another_built_alike not Granted on the other"
+  # An id's lookup reads its task's header after the class's instance compare and the index's
+  # bound against the class's slots: two censuses of one cell mint equal instances (ADR-0194
+  # D5). Planted, the bound is skipped, and another executor's id reads past the header array.
+  "inf_canary_task_id_index_unbounded crate-test inf-runtime test:executor an_id_another_class_minted_past_this_class_is_stale a header's index lies in its array"
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.

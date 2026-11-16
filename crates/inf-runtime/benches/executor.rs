@@ -5,13 +5,20 @@
 //! so the slow path has a tracked baseline from day one. The fast path is read at three
 //! shapes: the bench's class, and a future padded so its slot takes 16 a chunk, its class at
 //! 2,500 and at 10,000 slots (two directory levels); `poll_immediate_ready_twice` is the read's
-//! liveness leg, two first polls an iteration.
+//! liveness leg, two first polls an iteration. The padded future is written by hand on the
+//! bench class's body, one `command_direct` call, so the shapes differ only in the slot's width
+//! and depth. `poll_direct` and `poll_direct_padded` poll each future once in a stack slot under
+//! a no-op waker, from the factory its executor legs use: read beside the executor's legs, never
+//! subtracted from them (the padded one pays its stack slot's store and reload, which the
+//! executor's slot does not).
 
 use std::cell::Cell;
 use std::future::Future;
 use std::hint::black_box;
 use std::mem::MaybeUninit;
+use std::pin::{Pin, pin};
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use inf_foundation::CellId;
@@ -65,12 +72,31 @@ async fn command_task(counter: Rc<Cell<u64>>) {
     command_direct(black_box(&counter));
 }
 
-/// The fast path's command as a padded task: its pad lives across a ready await.
-async fn padded_task(counter: Rc<Cell<u64>>) {
-    let pad = MaybeUninit::<[u8; PAD_BYTES]>::uninit();
-    core::future::ready(()).await;
-    black_box(&pad);
-    command_direct(black_box(&counter));
+/// The fast path's command as a padded task, written by hand so its body is the bench class's
+/// own (one `command_direct` call) and only its size differs: the pad, never written, takes its
+/// slot to 16 a chunk.
+struct PaddedTask {
+    counter: Option<Rc<Cell<u64>>>,
+    pad: MaybeUninit<[u8; PAD_BYTES]>,
+}
+
+/// The padded class's factory, for its executor legs and its direct poll alike.
+fn padded_task(counter: Rc<Cell<u64>>) -> PaddedTask {
+    PaddedTask { counter: Some(counter), pad: MaybeUninit::uninit() }
+}
+
+impl Future for PaddedTask {
+    type Output = ();
+
+    #[inline]
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        black_box(&this.pad);
+        if let Some(counter) = this.counter.take() {
+            command_direct(black_box(&counter));
+        }
+        Poll::Ready(())
+    }
 }
 
 /// The slow path's task: it awaits its gate's value and keeps it.
@@ -105,6 +131,20 @@ fn bench_fast_path(c: &mut Criterion) {
             };
             let outcome = permit.poll_immediate(|| command_task(counter));
             assert!(matches!(outcome, PollImmediate::Completed));
+        });
+    });
+    group.bench_function("poll_direct", |b| {
+        b.iter(|| {
+            let mut cx = Context::from_waker(Waker::noop());
+            let future = pin!(command_task(Rc::clone(&counter)));
+            assert!(future.poll(&mut cx).is_ready());
+        });
+    });
+    group.bench_function("poll_direct_padded", |b| {
+        b.iter(|| {
+            let mut cx = Context::from_waker(Waker::noop());
+            let future = pin!(padded_task(Rc::clone(&counter)));
+            assert!(future.poll(&mut cx).is_ready());
         });
     });
     group.bench_function("poll_immediate_ready_twice", |b| {

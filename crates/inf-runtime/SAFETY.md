@@ -182,8 +182,9 @@ Invariants:
 
 Miri (strict provenance, its data-race detector, Stacked Borrows, the leak
 check) runs `tests/executor.rs`, `tests/waker_threads.rs` and
-`tests/waker_close.rs` on its default schedule, and `tests/waker_race.rs`
-on the pinned schedules above; Loom models the lane's protocol on
+`tests/waker_close.rs` on its default schedule, and again under Tree
+Borrows (`-Zmiri-tree-borrows`), and `tests/waker_race.rs` on the pinned
+schedules above; Loom models the lane's protocol on
 `inf_foundation::wake`'s own types. Neither models the kernel, and none of
 this rests on one.
 
@@ -194,24 +195,71 @@ the waker.
 ## 3. Futures in their class's slab (`executor.rs`, ADR-0177 D2)
 
 Each task class is a `CappedSlab` of one concrete future type,
-`TaskCell<F>` (`ManuallyDrop<F>`), built before the cell serves. A future
-is written into its slot by `publish` **before its first poll** and never
-moves: a slab's chunks are fixed allocations, never moved or reallocated
-while the slab lives, so `Pin::new_unchecked` over the slot's future is
-sound until the future is dropped. It is dropped in place exactly once:
-by `poll_in_place` on `Ready`, after its header is marked Finished, or by
-the executor's drop for a live task (`drop_future`), after its header is
+`TaskCell<F>` (`UnsafeCell<ManuallyDrop<F>>`), built before the cell serves. A future
+is written into its slot **before its first poll** and never moves: a
+slab's chunks are fixed allocations, never moved or reallocated while the
+slab lives, so `Pin::new_unchecked` over the slot's future is sound until
+the future is dropped. It is dropped in place exactly once: by
+`poll_in_place` on `Ready`, after its header is marked Finished, or by the
+executor's drop for a live task (`drop_future`), after its header is
 marked Dropping; each runs only while the header's state says the future
 is live, and the state moves on before the slot is reached again. The slot
-then holds a husk, which the slab's `take` returns and drops with no glue.
-The first poll runs on the occupant `publish_mut` lends, in the slot, and
-every later poll and the in-place drop reach it through `get_mut` of the
-handle: one address from the placement to the drop, since a Live slot lies
-where it is until `take` moves it out (ADR-0194 D1's note, D3).
-`tests/executor.rs`'s `the_first_poll_runs_in_its_slot_and_keeps_its_wake`
-reads that address at each poll and at the drop. The husk `Done` has a tag
-of its own (`repr(u8)`), so `take` moves the tag out, never a dropped
-future's bytes. The executor reaches a class's slab only through a safe
-`Any` downcast to its concrete type, never through an erased pointer; a
-zero-sized or over-aligned future takes the slab's own slot layout
-(`tests/executor.rs` runs both, at 4 KiB alignment).
+then holds a husk, `Done`, which has no drop glue: the class's spare keeps
+it, or the slab's `release` frees the slot and drops the husk where it lies
+(ADR-0194 D1's second note); the executor calls `take` on no task's slot.
+
+**The future in an `UnsafeCell`.** A suspended async future may hold
+`&mut` into itself across an `await` (a local lent to a callee), and the
+slab reaches a slot through a shared reborrow of its whole chunk (a slice's
+length, a shared walk). Over bytes outside an `UnsafeCell` that reborrow is
+a read of every slot in the chunk, which Stacked Borrows lets invalidate
+such a `&mut` in a neighbouring slot, so the task's next poll would use a
+dead reference. Inside the cell a shared reborrow freezes nothing, so a
+lookup of one slot leaves every future in its chunk as it was.
+`tests/executor.rs`'s `self_referential_futures_resume_in_their_slots` and
+`self_referential_futures_woken_by_their_wakers_resume_in_their_slots` place
+unboxed, `!Unpin` futures suspended on such a reference and reach their
+slots and their neighbours' between polls; Miri reads both under Stacked
+Borrows and under `-Zmiri-tree-borrows`.
+
+**The first poll in the class's spare.** A class's spare is one Live slot
+holding the husk, its header Free and on no list, its generation in no
+`TaskId`; a class has at most one. A permit is the spare: its future is
+written over the husk (no drop glue: the write drops nothing) and polled
+there; Ready and quiet, the slot stays the spare; otherwise the spare's
+handle leaves it by `take()` for the task's id or the Retired header, before
+either exists. From the first poll to the in-place drop the future is at
+one address: the spare's slot, which every later poll reaches by `get_mut`
+of the handle (a Live slot lies where it is until a take, a release or a
+retire step, ADR-0194 D1's notes). `tests/executor.rs`'s
+`the_first_poll_runs_in_its_slot_and_keeps_its_wake` reads that address at
+each poll and at the drop, and `the_spare_serves_no_task_an_id_names` that
+a suspended task's slot is never the spare.
+
+**The kept lend** (`executor::class`). The spare is reached through the
+occupant's address the slab last lent (`get_mut` of the spare, or
+`publish_mut` of the husk), kept in a `Cell` beside it, so consecutive first
+polls walk no directory. A `&mut` is made from the kept pointer only while
+no borrow of the class slab, shared or mutable, has been made since the
+slab lent it: the slab, the spare and the pointer are private to the
+module, every other borrow passes `slab(&self)` or `slab_mut(&mut self)`,
+and each forgets the pointer first. A shared borrow forgets it too: a
+reborrow of a whole chunk through `&` leaves an earlier write-capable
+pointer usable for reads alone (Tree Borrows freezes it). The `&mut` lives
+for the permit, which borrows the executor `&mut`, so nothing else reaches
+the slab meanwhile. A wake and a last waker's drop during a poll touch only
+the header array, never a class slab, and so do `wake(id)` and `is_live`,
+which compare the class slab's instance and read the task's header. Miri
+reads the sequence under Stacked Borrows and under `-Zmiri-tree-borrows`:
+`tests/executor.rs`'s `the_spare_lend_survives_every_other_borrow` (a spawn
+and its run, a reclaim, an id's lookups, a Pending first poll and its
+completion, each between fast first polls) and
+`the_kept_lend_across_an_id_lookup_and_a_shared_borrow`.
+
+**The class's concrete type.** The executor reaches a class's slab by a
+cast of its erased object to `ClassSlab<F, C>` after comparing the `TypeId`
+the class's entry stores with that type's: `ClassBuild::build` returns the
+object and the `TypeId` of its concrete type together, in one call, and
+nothing writes either after the build, so the compare names the object's
+type with no virtual call. A zero-sized or over-aligned future takes the
+slab's own slot layout (`tests/executor.rs` runs both, at 4 KiB alignment).
