@@ -2,6 +2,8 @@
 //! and what a caller observes when it is crossed (INFINITY_STYLE "Put a
 //! limit on everything").
 
+use inf_foundation::bounded::{Cap, CapFill};
+
 /// Timer callbacks a cell's loop begins in one turn (ADR-0154 D3): 64.
 /// Owner: [`CellLoop`](crate::CellLoop), which in step 1 begins each with
 /// [`TimerSet::begin`](crate::TimerSet::begin), settles it with
@@ -69,3 +71,18 @@ pub const COLD_READY_LEFT_TURNS: u64 = 15;
 /// `ExecutorLayout::class`, before the executor is built, so the cell does
 /// not serve.
 pub const TASK_CLASSES_MAX: usize = 16;
+
+/// Holders one cell's fabric gate may number (ADR-0177 D4): 2^24, the key's
+/// index field. Owner: the fabric gate, whose word adapter is built from its
+/// holder slab. Crossing: a typed refusal at boot — a plane whose `H` passes
+/// it is `CapError::Layout` before the cell serves.
+pub const GATE_HOLDERS_MAX: u32 = 1 << inf_foundation::limits::GATE_KEY_INDEX_BITS;
+
+/// The fabric gate's holder slab (ADR-0177 D4): its ceiling, under which a
+/// cell's `H = Σ T_j × W_j + (cells − 1) × d` is derived. Census name
+/// `fabric-gate-holders`, filled while serving. Unit: holders per cell.
+/// Owner: the fabric gate. Crossing: pace — a send that finds every holder
+/// taken parks on the gate's room until one frees (derived never: units bound
+/// the waiting holders and the peers' credits the orphans).
+pub const GATE_HOLDERS: Cap =
+    Cap::entries::<GATE_HOLDERS_MAX>("fabric-gate-holders", CapFill::Serving);

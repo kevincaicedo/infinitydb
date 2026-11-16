@@ -379,7 +379,7 @@ fn drive_clone_drop<L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
 fn drive_suspend<L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
     let (exec, class) = executor_of(&suspend_task);
     let gate: &'static RefCell<FabricGate<u64>> =
-        Box::leak(Box::new(RefCell::new(FabricGate::build(0, 1))));
+        Box::leak(Box::new(RefCell::new(one_holder_gate())));
     let units: &'static GateUnits = Box::leak(Box::new(gate.borrow().units(1).expect("a unit")));
     let mut cell =
         SuspendCell { exec, class, gate, units, delivered: 0, sink: Rc::new(Cell::new(0)) };
@@ -488,4 +488,11 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// A gate of one unit over one holder, on a census of its own.
+fn one_holder_gate() -> FabricGate<u64> {
+    const HOLDERS: Cap = Cap::entries::<1>("bench-gate-holders", CapFill::Serving);
+    let (census, _mark) = CapCensus::new(CellId(0));
+    FabricGate::build(0, 1, Some(HOLDERS), &census).expect("the bench's gate")
 }

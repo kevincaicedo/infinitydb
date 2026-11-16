@@ -40,10 +40,17 @@ async fn fabric_wait<V>(gate: Rc<RefCell<FabricGate<V>>>, key: Rc<Cell<u64>>) ->
     wait.await
 }
 
-/// A fabric gate of `units` units, and the cell its wait's key is published in.
+/// A fabric gate of `units` units over as many holders, on a census of its
+/// own, and the cell its wait's key is published in.
 fn fabric_gate<V>(units: u32) -> (Rc<RefCell<FabricGate<V>>>, Rc<Cell<u64>>) {
-    (Rc::new(RefCell::new(FabricGate::build(0, units))), Rc::new(Cell::new(0)))
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let holders = Cap::derived(&TEST_GATE_HOLDERS, units).expect("a test gate's holders");
+    let gate = FabricGate::build(0, units, Some(holders), &census).expect("a test gate");
+    (Rc::new(RefCell::new(gate)), Rc::new(Cell::new(0)))
 }
+
+/// The tests' gate holders' ceiling.
+const TEST_GATE_HOLDERS: Cap = Cap::entries::<64>("test-gate-holders", CapFill::Serving);
 
 /// A registered wait on a keyed gate.
 fn keyed_wait<K: GateKey, V>(gate: &KeyedGate<K, V>, key: K) -> KeyedWait<K, V> {

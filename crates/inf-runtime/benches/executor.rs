@@ -22,6 +22,8 @@ use std::hint::black_box;
 use std::rc::Rc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use inf_foundation::CellId;
+use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_runtime::{
     CellExecutor, FabricAdmission, FabricGate, GateUnits, GateWait, PollImmediate, TaskAdmission,
     TaskClass, TaskFactory,
@@ -118,7 +120,7 @@ fn bench_suspend_resume(c: &mut Criterion) {
     // A task's wait borrows its gate and units, so the bench's live for the
     // run: the spawned future is `'static`.
     let gate: &'static RefCell<FabricGate<u64>> =
-        Box::leak(Box::new(RefCell::new(FabricGate::build(0, 1))));
+        Box::leak(Box::new(RefCell::new(one_holder_gate())));
     let units: &'static GateUnits = Box::leak(Box::new(gate.borrow().units(1).expect("a unit")));
     let sink = Rc::new(Cell::new(0u64));
     group.bench_function("suspend_complete_resume", |b| {
@@ -148,3 +150,10 @@ fn bench_suspend_resume(c: &mut Criterion) {
 
 criterion_group!(benches, bench_fast_path, bench_suspend_resume);
 criterion_main!(benches);
+
+/// A gate of one unit over one holder, on a census of its own.
+fn one_holder_gate() -> FabricGate<u64> {
+    const HOLDERS: Cap = Cap::entries::<1>("bench-gate-holders", CapFill::Serving);
+    let (census, _mark) = CapCensus::new(CellId(0));
+    FabricGate::build(0, 1, Some(HOLDERS), &census).expect("the bench's gate")
+}

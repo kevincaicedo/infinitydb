@@ -530,6 +530,35 @@ pub(crate) const fn gate_units(caps: &PlaneTaskCaps) -> u32 {
     }
 }
 
+/// A cell's fabric gate holders (ADR-0177 D4): `H = Σ T_j × W_j + (cells −
+/// 1) × d`, the units its tasks hold and one orphan for each op a peer may
+/// leave unanswered; `None` at one cell, which sends no request.
+///
+/// # Errors
+/// `CapError::Layout` when `H` passes `GATE_HOLDERS_MAX`, before the cell
+/// serves.
+pub(crate) const fn gate_holders(
+    caps: &PlaneTaskCaps,
+    cells: u16,
+    data_credits: u32,
+) -> Result<Option<Cap>, CapError> {
+    if cells <= 1 {
+        return Ok(None);
+    }
+    let holders = gate_units(caps) as u64 + (cells as u64 - 1) * data_credits as u64;
+    // Canary: the gate is built over twice its holders, which the idle
+    // node's resident set must show.
+    #[cfg(inf_canary_gate_holders_doubled)]
+    let holders = 2 * holders;
+    if holders > u32::MAX as u64 {
+        return Err(CapError::Layout);
+    }
+    match Cap::derived(&inf_runtime::limits::GATE_HOLDERS, holders as u32) {
+        Ok(cap) => Ok(Some(cap)),
+        Err(refused) => Err(refused),
+    }
+}
+
 /// Verdicts the `gated` task publishes in one poll (ADR-0177 D3). Unit:
 /// replies per poll. Owner: the `gated` task, inside a poll, so charged to
 /// Foreground. Crossing: the task yields and is polled again in ready

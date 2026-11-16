@@ -268,6 +268,13 @@ mod tests {
                 caps.conn.entries_max(),
                 executor.header_array_bytes()
             );
+            let holders = crate::limits::gate_holders(&caps, cells, 1_024)
+                .expect("the default gate")
+                .map_or(0, |holders| holders.entries_max());
+            println!(
+                "every_class_registers_at_its_chunk: {cells} cells: H {holders}, holder {} B",
+                FabricGate::<OwnedOutcome>::HOLDER_SLOT_BYTES
+            );
         }
     }
 }

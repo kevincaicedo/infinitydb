@@ -33,6 +33,10 @@ use std::rc::Rc;
 // operations (register, complete, waiter poll); the S21 cycle split
 // attributed ~2.2% of natural-leg cycles to `DefaultHasher` (M2.5 Phase H).
 use inf_foundation::BuildIntHasher;
+use inf_foundation::bounded::{
+    Built, Cap, CapCensus, CapError, CappedSlab, LookupMut, NamedReservation, Retiring,
+    SlabBuilder, SlabReserved, SlotId, SlotWord, Taken, WordLookup, WrapWithProof,
+};
 use inf_foundation::limits::{GATE_KEY_GENERATION_BITS, GATE_KEY_INDEX_BITS};
 
 use crate::driver::CompletionResult;
@@ -191,18 +195,32 @@ const _: () = assert!(GATE_KEY_ORIGIN_SHIFT + u16::BITS == u64::BITS, "origin:16
 /// The bits below the tag: the generation and index fields.
 const GATE_KEY_FIELDS: u64 = (1 << GATE_KEY_TAG_BIT) - 1;
 
+/// A gate's holders: one slot a request, its generation wrapping under
+/// ADR-0177 D4's proof (D7).
+type HolderSlab<V> = CappedSlab<Holder<V>, u32, WrapWithProof>;
+
+/// The fabric key's adapter: a holder's index and its generation's low
+/// bits, built from the gate's own slab (ADR-0194 D6 with A2).
+type GateWord = SlotWord<u32, WrapWithProof, GATE_KEY_INDEX_BITS, GATE_KEY_GENERATION_BITS>;
+
+/// A fabric gate's holder slab and the one adapter its keys pass through.
+struct FabricHolders<V> {
+    slab: HolderSlab<V>,
+    word: GateWord,
+}
+
 /// The fabric round-trip gate (ADR-0177 D4): it mints the key a request
-/// carries, `origin:16 | tag:1 | generation:23 | index:24`, and holds the
-/// waiter's state under it. Its owner keeps it in a `RefCell`, which every
-/// [`GateWait`] borrows for its life; [`reserve`](Self::reserve) takes the
-/// gate mutably, so a [`GatePermit`] exists only inside its owner's borrow,
-/// one synchronous step.
+/// carries, `origin:16 | tag:1 | generation:23 | index:24`, from the slab
+/// handle of the holder it reserves, and holds the waiter's state there.
+/// Its owner keeps it in a `RefCell`, which every [`GateWait`] borrows for
+/// its life; [`reserve`](Self::reserve) takes the gate mutably, so a
+/// [`GatePermit`] exists only inside its owner's borrow, one synchronous
+/// step.
 pub struct FabricGate<V, C: Cleanup<V> = DropValue> {
-    holders: HolderMap<V>,
+    /// `None` on a node of one cell, which sends no request.
+    holders: Option<FabricHolders<V>>,
     /// The origin cell's bits and the tag: every key's high bits.
     high: u64,
-    /// The next key's generation and index fields.
-    next: u64,
     units: Rc<UnitBook>,
     /// Completions for no holder of this gate (`gate_stale`).
     stale: u64,
@@ -226,20 +244,44 @@ pub enum FabricAdmission<'g, 'u, V, C: Cleanup<V> = DropValue> {
 }
 
 impl<V, C: Cleanup<V>> FabricGate<V, C> {
-    /// The gate of cell `origin`, issuing at most `units_max` units: the
-    /// holders its tasks may have waiting, `Σ T_j × W_j` (ADR-0177 D4).
-    pub fn build(origin: u16, units_max: u32) -> FabricGate<V, C> {
-        FabricGate {
-            holders: HolderMap::default(),
+    /// The gate of cell `origin`, issuing at most `units_max` units, the
+    /// holders its tasks may have waiting (`Σ T_j × W_j`), over `holders`
+    /// slots, `H`, which add the orphans a peer's un-replied ops may hold
+    /// (ADR-0177 D4); `None` builds no holder at a node of one cell. Built
+    /// whole before the cell serves.
+    ///
+    /// # Errors
+    /// `CapError` from the slab's build or its census row; `Layout` past
+    /// the key's index field. Nothing is served.
+    pub fn build(
+        origin: u16,
+        units_max: u32,
+        holders: Option<Cap>,
+        census: &Rc<CapCensus>,
+    ) -> Result<FabricGate<V, C>, CapError> {
+        let holders = match holders {
+            None => None,
+            Some(cap) => {
+                debug_assert!(cap.entries_max() >= units_max, "H counts every unit");
+                let slab = build_holders(CappedSlab::builder(cap, census)?)?;
+                let word = GateWord::for_slab(&slab)?;
+                Some(FabricHolders { slab, word })
+            }
+        };
+        Ok(FabricGate {
+            holders,
             high: (u64::from(origin) << GATE_KEY_ORIGIN_SHIFT) | (1 << GATE_KEY_TAG_BIT),
-            next: 0,
             units: Rc::new(UnitBook { issued: Cell::new(0), max: units_max }),
             stale: 0,
             full: 0,
             room: WaitList::new(),
             _cleanup: PhantomData,
-        }
+        })
     }
+
+    /// A holder slot's bytes: the stride the idle bill counts a holder at,
+    /// in chunks of 64 slots (ADR-0177 D8 with A1).
+    pub const HOLDER_SLOT_BYTES: usize = HolderSlab::<V>::SLOT_BYTES;
 
     /// A task's `count` units, or `None` when the gate has issued every unit
     /// its holders bound: the task is not admitted.
@@ -253,61 +295,89 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
     }
 
     /// Reserves a holder for one request under one of `units`, and mints its
-    /// key. The permit is registered after a successful send or dropped,
-    /// which returns the unit and the holder.
+    /// key from the holder's handle before it is published (ADR-0194 A2's
+    /// named reservation). The permit is registered after a successful send
+    /// or dropped, which returns the unit and frees the holder at its next
+    /// generation, so the key it minted names no later occupant.
     pub fn reserve<'g, 'u>(&'g mut self, units: &'u GateUnits) -> FabricAdmission<'g, 'u, V, C> {
         debug_assert!(Rc::ptr_eq(&units.book, &self.units), "a task's units are its gate's");
         if !units.take() {
             return FabricAdmission::NoUnit;
         }
-        let key = self.high | self.next;
-        self.next = (self.next + 1) & GATE_KEY_FIELDS;
-        FabricAdmission::Granted(GatePermit { gate: self, units, key, armed: true })
+        let FabricGate { holders, high, full, room, .. } = self;
+        let reservation =
+            match holders.as_mut().map(|holders| (holders.slab.reserve(), &holders.word)) {
+                Some((SlabReserved::Slot(slot), word)) => (slot.named(), word),
+                Some((SlabReserved::Full | SlabReserved::Exhausted, _)) | None => {
+                    units.give();
+                    *full += 1;
+                    return FabricAdmission::Full;
+                }
+            };
+        let (reservation, word) = reservation;
+        let Some(fields) = word.encode(reservation.id()) else {
+            unreachable!("the gate's adapter is built from its own slab")
+        };
+        FabricAdmission::Granted(GatePermit {
+            reservation: Some(reservation),
+            room,
+            units,
+            key: *high | fields,
+            _cleanup: PhantomData,
+        })
     }
 
     /// Delivers `value` to the holder `key` names, waking its waiter if it is
-    /// suspended. A key of another origin, without the tag, of no holder, or
-    /// of a holder already delivered gives `value` to the cleanup and counts
-    /// `stale`; an orphaned holder's one completion frees it.
+    /// suspended. A key of another origin, without the tag, of no live
+    /// holder, or of a holder already delivered gives `value` to the cleanup
+    /// and counts `stale`; an orphaned holder's one completion frees it.
     pub fn complete(gate: &RefCell<Self>, key: u64, value: V) -> Delivery {
-        let mut this = gate.borrow_mut();
-        let high = this.high;
-        let holder = match this.holders.map.get_mut(&key) {
-            Some(holder) if key & !GATE_KEY_FIELDS == high => holder,
-            Some(_) | None => {
-                this.stale += 1;
-                drop(this);
-                C::orphan(value);
-                return Delivery::Orphan;
+        let (delivery, waker, orphan) = gate.borrow_mut().settle(key, value);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        if let Some(value) = orphan {
+            C::orphan(value);
+        }
+        delivery
+    }
+
+    /// One completion's transition inside the gate's borrow: what it did,
+    /// the waker to wake and the value to clean up, both outside it.
+    fn settle(&mut self, key: u64, value: V) -> (Delivery, Option<Waker>, Option<V>) {
+        let FabricGate { holders, high, stale, room, .. } = self;
+        let own = key & !GATE_KEY_FIELDS == *high;
+        let Some(FabricHolders { slab, word }) = holders.as_mut().filter(|_| own) else {
+            *stale += 1;
+            return (Delivery::Orphan, None, Some(value));
+        };
+        let (id, holder) = match slab.get_mut_by_word(word, key & GATE_KEY_FIELDS) {
+            WordLookup::Live(id, holder) => (id, holder),
+            WordLookup::Stale | WordLookup::Vacant => {
+                *stale += 1;
+                return (Delivery::Orphan, None, Some(value));
             }
         };
         match &holder.state {
             HolderState::Registered | HolderState::Waiting(_) => {}
             // A second completion: the parked value stays the waiter's.
             HolderState::Delivered(_) => {
-                this.stale += 1;
-                drop(this);
-                C::orphan(value);
-                return Delivery::Orphan;
+                *stale += 1;
+                return (Delivery::Orphan, None, Some(value));
             }
             // The waiter was dropped: this is its request's one completion.
             HolderState::Orphaned => {
-                this.holders.map.remove(&key);
-                let room = this.room.clone();
-                drop(this);
-                C::orphan(value);
+                let _freed = slab.take(id);
                 room.wake_one(());
-                return Delivery::Orphan;
+                return (Delivery::Orphan, None, Some(value));
             }
         }
         match core::mem::replace(&mut holder.state, HolderState::Delivered(value)) {
-            HolderState::Waiting(waker) => {
-                drop(this);
-                waker.wake();
+            HolderState::Waiting(waker) => (Delivery::Delivered, Some(waker), None),
+            HolderState::Registered | HolderState::Delivered(_) | HolderState::Orphaned => {
+                (Delivery::Delivered, None, None)
             }
-            HolderState::Registered | HolderState::Delivered(_) | HolderState::Orphaned => {}
         }
-        Delivery::Delivered
     }
 
     /// The wait a sender parks on when [`reserve`](Self::reserve) answers
@@ -318,7 +388,7 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
 
     /// Holders taken: registered, waiting, delivered or orphaned.
     pub fn holders(&self) -> usize {
-        self.holders.map.len()
+        self.holders.as_ref().map_or(0, |holders| holders.slab.len() as usize)
     }
 
     /// Completions that found no holder waiting (`gate_stale`): derived never.
@@ -332,21 +402,63 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
     }
 }
 
-impl<V, C: Cleanup<V>> core::fmt::Debug for FabricGate<V, C> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FabricGate {{ holders: {} }}", self.holders.map.len())
+/// Steps a holder slab's build to its end; a refused build retires its
+/// prefix by steps before it answers.
+fn build_holders<V>(
+    mut builder: SlabBuilder<Holder<V>, u32, WrapWithProof>,
+) -> Result<HolderSlab<V>, CapError> {
+    loop {
+        builder = match builder.step() {
+            Built::More(next) => next,
+            Built::Live(slab) => return Ok(slab),
+            Built::Refused(mut retiring, refused) => loop {
+                retiring = match retiring.step() {
+                    Retiring::More(next) => next,
+                    Retiring::Done => return Err(refused),
+                };
+            },
+        };
     }
 }
 
-/// One reserved holder and one unit, under the gate's key for it. Held only
-/// inside its owner's borrow of the gate: it cannot cross an `await`
-/// (ADR-0144 A2's list).
+/// A dropped wait's holder: orphaned until its request's one completion
+/// frees it, or freed now with the value that completion parked. Returns
+/// the waker it stored and that value, both dropped outside the gate's
+/// borrow.
+fn orphan<V>(
+    slab: &mut HolderSlab<V>,
+    room: &WaitList<()>,
+    slot: SlotId<u32>,
+) -> (Option<Waker>, Option<V>) {
+    let LookupMut::Live(holder) = slab.get_mut(slot) else { return (None, None) };
+    let prior = core::mem::replace(&mut holder.state, HolderState::Orphaned);
+    match prior {
+        HolderState::Delivered(value) => {
+            let _freed = slab.take(slot);
+            room.wake_one(());
+            (None, Some(value))
+        }
+        HolderState::Waiting(waker) => (Some(waker), None),
+        HolderState::Registered | HolderState::Orphaned => (None, None),
+    }
+}
+
+impl<V, C: Cleanup<V>> core::fmt::Debug for FabricGate<V, C> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "FabricGate {{ holders: {} }}", self.holders())
+    }
+}
+
+/// One reserved holder, named before its publish, and one unit, under the
+/// gate's key for it. Held only inside its owner's borrow of the gate: it
+/// cannot cross an `await` (ADR-0144 A2's list).
 pub struct GatePermit<'g, 'u, V, C: Cleanup<V> = DropValue> {
-    gate: &'g mut FabricGate<V, C>,
+    /// The holder's slot until the permit registers or drops.
+    reservation: Option<NamedReservation<'g, Holder<V>, u32>>,
+    room: &'g WaitList<()>,
     units: &'u GateUnits,
     key: u64,
-    /// The unit and the holder are still the permit's.
-    armed: bool,
+    _cleanup: PhantomData<fn(V) -> C>,
 }
 
 impl<'u, V, C: Cleanup<V>> GatePermit<'_, 'u, V, C> {
@@ -358,18 +470,23 @@ impl<'u, V, C: Cleanup<V>> GatePermit<'_, 'u, V, C> {
     /// Publishes the holder once the request was sent: the key is routable.
     /// `gate` is the cell this permit's gate lives in.
     pub fn register(mut self, gate: &'u RefCell<FabricGate<V, C>>) -> GateWait<'u, V, C> {
-        debug_assert!(core::ptr::eq(gate.as_ptr(), &raw const *self.gate), "the permit's gate");
-        self.gate.holders.map.insert(self.key, Holder::registered(false));
-        self.armed = false;
-        GateWait { gate, units: self.units, key: self.key, done: false }
+        let Some(reservation) = self.reservation.take() else {
+            unreachable!("a permit registers once, consuming itself")
+        };
+        let slot = reservation.publish(Holder::registered(false));
+        GateWait { gate, units: self.units, slot, done: false }
     }
 }
 
 impl<V, C: Cleanup<V>> Drop for GatePermit<'_, '_, V, C> {
     fn drop(&mut self) {
-        // Never registered (the send was refused): nothing names the key.
-        if self.armed {
+        // Never registered (the send was refused): the named reservation's
+        // drop advances its slot's generation, so the key names no later
+        // occupant, and the holder and the unit return.
+        if let Some(reservation) = self.reservation.take() {
+            drop(reservation);
             self.units.give();
+            self.room.wake_one(());
         }
     }
 }
@@ -380,7 +497,7 @@ impl<V, C: Cleanup<V>> Drop for GatePermit<'_, '_, V, C> {
 pub struct GateWait<'u, V, C: Cleanup<V> = DropValue> {
     gate: &'u RefCell<FabricGate<V, C>>,
     units: &'u GateUnits,
-    key: u64,
+    slot: SlotId<u32>,
     done: bool,
 }
 
@@ -393,7 +510,9 @@ impl<V, C: Cleanup<V>> Future for GateWait<'_, V, C> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<V> {
         let this = Pin::into_inner(self);
         let mut gate = this.gate.borrow_mut();
-        let Some(holder) = gate.holders.map.get_mut(&this.key) else { polled_after_completion() };
+        let FabricGate { holders, room, .. } = &mut *gate;
+        let Some(FabricHolders { slab, .. }) = holders.as_mut() else { polled_after_completion() };
+        let LookupMut::Live(holder) = slab.get_mut(this.slot) else { polled_after_completion() };
         match &holder.state {
             HolderState::Delivered(_) => {}
             HolderState::Registered | HolderState::Waiting(_) => {
@@ -402,16 +521,15 @@ impl<V, C: Cleanup<V>> Future for GateWait<'_, V, C> {
             }
             HolderState::Orphaned => polled_after_completion(),
         }
-        let Some(Holder { state: HolderState::Delivered(value), .. }) =
-            gate.holders.map.remove(&this.key)
+        let Taken::Value(Holder { state: HolderState::Delivered(value), .. }) =
+            slab.take(this.slot)
         else {
             polled_after_completion()
         };
-        let room = gate.room.clone();
+        room.wake_one(());
         drop(gate);
         this.done = true;
         this.units.give();
-        room.wake_one(());
         Poll::Ready(value)
     }
 }
@@ -422,23 +540,16 @@ impl<V, C: Cleanup<V>> Drop for GateWait<'_, V, C> {
             return;
         }
         let mut gate = self.gate.borrow_mut();
-        let prior = match gate.holders.map.get_mut(&self.key) {
-            Some(holder) => core::mem::replace(&mut holder.state, HolderState::Orphaned),
-            None => HolderState::Orphaned,
-        };
-        let freed = match prior {
-            // The value is here: the request is terminal, so the holder frees.
-            HolderState::Delivered(value) => {
-                gate.holders.map.remove(&self.key);
-                Some((value, gate.room.clone()))
-            }
-            HolderState::Registered | HolderState::Waiting(_) | HolderState::Orphaned => None,
+        let FabricGate { holders, room, .. } = &mut *gate;
+        let (waker, value) = match holders.as_mut() {
+            Some(FabricHolders { slab, .. }) => orphan(slab, room, self.slot),
+            None => (None, None),
         };
         drop(gate);
         self.units.give();
-        if let Some((value, room)) = freed {
+        drop(waker);
+        if let Some(value) = value {
             C::orphan(value);
-            room.wake_one(());
         }
     }
 }

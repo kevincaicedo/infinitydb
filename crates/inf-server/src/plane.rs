@@ -939,6 +939,9 @@ pub enum PlaneBuildError {
     /// A plane-start pump found its class full at assembly: the class's
     /// cap is short of the plane's own demand.
     Assembly(inf_foundation::bounded::AssemblyFull),
+    /// The fabric gate's holders were refused (ADR-0177 D4): `H` past its
+    /// ceiling, or the allocator.
+    Gate(inf_foundation::bounded::CapError),
 }
 
 impl core::fmt::Display for PlaneBuildError {
@@ -952,6 +955,7 @@ impl core::fmt::Display for PlaneBuildError {
             PlaneBuildError::Tasks(refused) => write!(f, "the plane's task classes: {refused}"),
             PlaneBuildError::Executor(refused) => write!(f, "{refused}"),
             PlaneBuildError::Assembly(refused) => write!(f, "{refused}"),
+            PlaneBuildError::Gate(refused) => write!(f, "the fabric gate: {refused}"),
         }
     }
 }
@@ -1002,6 +1006,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
         let parked = ParkedDeques::build(cell, cells, fabric.data_credits(), &census)
             .map_err(PlaneBuildError::Parked)?;
+        let holders = crate::limits::gate_holders(&caps, cells, fabric.data_credits())
+            .map_err(PlaneBuildError::Gate)?;
+        let gate = FabricGate::build(cell.0, crate::limits::gate_units(&caps), holders, &census)
+            .map_err(PlaneBuildError::Gate)?;
         node.cell.set(cell.0);
         node.cells.set(cells);
         node.cap_census.replace(Some(Rc::clone(&census)));
@@ -1020,7 +1028,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 store: RefCell::new(store),
                 fabric: RefCell::new(fabric),
                 conns: RefCell::new(ConnSlab::default()),
-                gate: RefCell::new(FabricGate::build(cell.0, crate::limits::gate_units(&caps))),
+                gate: RefCell::new(gate),
                 credit_waiters: WaitList::new(),
                 observer: RefCell::new(observer),
                 node,
