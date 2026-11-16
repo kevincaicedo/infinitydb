@@ -397,6 +397,18 @@ pub(crate) const fn per_origin(ceiling: &Cap, data_credits: u32) -> Result<Cap, 
 /// with Redis's `maxclients` frame and a close, before anything ran.
 pub const CONN_TASKS: Cap = Cap::entries::<CONN_TASKS_MAX>("conn-tasks", CapFill::Serving);
 
+/// KE21's plant (E-store's F7): the `conn` class over `(1 + k) C` slots,
+/// `k = ⌈512 KiB ÷ (C × s)⌉` from the class's stride `s`, so its rise passes
+/// F7's 256 KiB whatever the stride.
+#[cfg(inf_canary_conn_slots_doubled)]
+pub(crate) fn conn_slots_doubled(cap: Cap, stride: usize) -> Result<Cap, CapError> {
+    let share = u64::from(cap.entries_max());
+    let bytes = share * u64::try_from(stride).map_err(|_| CapError::Layout)?;
+    let k = (512 * 1024u64).div_ceil(bytes.max(1));
+    let entries = u32::try_from(share * (1 + k)).map_err(|_| CapError::Layout)?;
+    Cap::derived(&CONN_TASKS, entries)
+}
+
 /// Cells one node runs at most: the key slots one cell owns at least one
 /// of. Unit: cells per node. Owner: `CellCount::new`, which refuses more.
 pub const CELLS_MAX: u32 = inf_foundation::SLOT_COUNT as u32;
