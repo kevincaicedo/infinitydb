@@ -1125,6 +1125,9 @@ ordered_rows=(
   # A close runs the queue to its end (ADR-0123 A2): a draining slot holds it. Planted, Closed
   # drops the queue, and the reset client's queued SETs never run.
   "inf_canary_closed_conn_queue_dropped m0-capacity closed-queue-unrun --close-leg close"
+  # Closed wakes a parked pump, so its draining slot retires and frees its conn task. Planted,
+  # the wake is skipped, and a closed connection keeps its task and its slot.
+  "inf_canary_closed_pump_not_woken crate-test inf-server lib a_closed_connection_frees_its_conn_task conn-task-kept"
   # A half-closed slot parses the bytes reaped beside its end of stream (ADR-0196 A1.1). Planted,
   # PARSE releases a flushing or closing Peer entry unparsed, and the SET sent before the FIN
   # never runs.
@@ -1156,6 +1159,10 @@ ordered_rows=(
   # A draining Peer parser parses the entries a stall held past Closed (ADR-0196 D2). Planted,
   # PARSE releases them, and the reset client's SETs never run.
   "inf_canary_draining_releases_held_entry m0-capacity pre-eof-unrun --close-leg stall"
+  # A draining slot vacates only after its 1→0 deltas are acknowledged, so the stop's barrier
+  # counts it until then. Planted, the slot vacates first, and the stop passes with deltas in
+  # flight.
+  "inf_canary_draining_vacates_before_acks crate-test inf-server lib the_stop_waits_for_a_draining_slots_acks quiet-before-acks"
   # The end of stream keeps the parser and answers what was read before it (ADR-0196 A1.1).
   # Planted, it closes the slot at once, and the half-closed client misses its replies: one row
   # with the last chunk and the FIN in one reap, one behind a held reply.

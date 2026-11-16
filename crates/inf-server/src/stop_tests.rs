@@ -167,3 +167,33 @@ fn every_held_reader_runs_with_no_stop() {
         assert!(landed(&node, key), "a held SET did not run with no stop");
     }
 }
+
+/// The stop's barrier counts a draining slot until its pump's 1→0 deltas
+/// are acknowledged (ADR-0177 D2): a subscriber of a channel cell 1 owns is
+/// reset while cell 1 is frozen, so its deltas wait, and cell 0's stop holds
+/// at its connections until cell 1 answers, then reaches `Quiet`.
+#[test]
+fn the_stop_waits_for_a_draining_slots_acks() {
+    let mut node = Node::new(2);
+    node.accept(0, HALF);
+    let channel = node.key_on(1, "drain");
+    node.send(0, HALF, &frame(&[b"SUBSCRIBE", &channel]));
+    node.rounds(8);
+    assert!(!node.written(0, HALF).is_empty(), "engagement: the subscription confirmed");
+    node.freeze(1, true);
+    node.reset(0, HALF);
+    node.rounds(4);
+    assert!(node.closed(0).contains(&HALF), "engagement: the reset's Closed was reaped");
+    assert!(node.cells[0].plane.shared.gate.pending() >= 1, "engagement: a delta is unanswered");
+    node.cells[0].plane.request_stop();
+    node.rounds(4);
+    assert_eq!(
+        node.cells[0].plane.stop_phase(),
+        StopPhase::Draining,
+        "quiet-before-acks: the stop passed a draining slot whose deltas are unanswered"
+    );
+    node.freeze(1, false);
+    node.rounds(8);
+    assert_eq!(node.cells[0].plane.connections(), 0, "the draining slot vacates once answered");
+    assert_eq!(node.cells[0].plane.stop_phase(), StopPhase::Quiet, "the stop reaches Quiet");
+}

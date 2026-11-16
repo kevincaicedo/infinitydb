@@ -660,3 +660,26 @@ fn a_set_after_quit_does_not_run() {
     assert!(node.closed(0).contains(&CLIENT), "the QUIT closes the connection");
     assert_eq!(written_text(&node, 0), "+OK\r\n", "the QUIT's +OK alone, then the close");
 }
+
+/// A connection whose pump is parked is closed by a reset: `Closed` wakes
+/// the pump, so its draining slot retires and frees its `conn` task, and
+/// the cell holds neither once quiet (O1). A pump left parked at `Closed`
+/// keeps its task and its slot for good, and after `C` such closes every
+/// accept is refused.
+#[test]
+fn a_closed_connection_frees_its_conn_task() {
+    let mut node = Node::new(1);
+    node.accept(0, CLIENT);
+    let owners = |node: &Node| node.cells[0].plane.conn_owners(node.cells[0].reactor.executor());
+    assert_eq!(owners(&node).tasks, 1, "engagement: the connection's pump is alive");
+    assert!(client_slot(&node, 0, |conn| conn.pump_parked), "engagement: its pump is parked");
+    node.reset(0, CLIENT);
+    node.rounds(4);
+    assert!(node.closed(0).contains(&CLIENT), "engagement: the Closed was reaped");
+    let after = owners(&node);
+    assert_eq!(
+        (after.tasks, after.slots),
+        (0, 0),
+        "conn-task-kept: a closed connection's task or slot outlived its close"
+    );
+}

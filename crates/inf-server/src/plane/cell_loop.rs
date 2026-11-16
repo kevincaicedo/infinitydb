@@ -588,9 +588,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         #[cfg(inf_canary_conn_slot_frees_at_closed)]
         let _ = self.shared.conns.borrow_mut().remove(key);
         self.shared.node.clients.borrow_mut().unregister(id);
+        // Canary: the parked pump is not woken at `Closed`, so its draining
+        // slot never retires.
+        #[cfg(not(inf_canary_closed_pump_not_woken))]
         if let Some(pump) = pump {
             let _ = cx.executor.wake(pump);
         }
+        #[cfg(inf_canary_closed_pump_not_woken)]
+        let _ = pump;
     }
 
     #[inline(never)]

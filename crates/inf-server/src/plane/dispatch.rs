@@ -321,7 +321,12 @@ pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     key: ConnKey,
 ) {
     let Some(notes) = serve_conn(&shared, key).await else { return };
+    // Canary: the slot vacates before its deltas are acknowledged, so the
+    // stop's barrier stops counting it with its deltas in flight.
+    #[cfg(inf_canary_draining_vacates_before_acks)]
+    let _ = shared.conns.borrow_mut().remove(key);
     flush_sub_deltas(&shared, notes).await;
+    #[cfg(not(inf_canary_draining_vacates_before_acks))]
     let _ = shared.conns.borrow_mut().remove(key);
 }
 
