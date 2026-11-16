@@ -308,7 +308,7 @@ const RETIRE_256: Cap = Cap::entries::<256>("bench-retire-256", CapFill::Serving
 const RETIRE_16448: Cap = Cap::entries::<16_448>("bench-retire-16448", CapFill::Serving);
 
 /// The slots one directory level covers: its children's chunks.
-const ONE_LEVEL_SLOTS: usize = MAP_CHUNK_SLOTS_MAX * MAP_DIRECTORY_CHILDREN_MAX;
+pub(super) const ONE_LEVEL_SLOTS: usize = MAP_CHUNK_SLOTS_MAX * MAP_DIRECTORY_CHILDREN_MAX;
 // The one-level legs' slab is one directory over its chunks and the `-2`
 // legs' slab two, so each op of a `-2` leg walks one link more than its
 // twin's: a smaller cap does not compile.

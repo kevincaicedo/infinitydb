@@ -10,11 +10,20 @@
 //!   reserve, publish and take of its free slot (a holder returns its value
 //!   at its take); and their `-2` twins on 16,448 slots holding 16,447, the
 //!   fewest past one directory level, so every op walks a second level.
+//! - `slab-node-get`, `-get-mut`: the same on a slab of 48 B wait nodes,
+//!   256 slots holding 255, one level (a node's cycle ends at the slab's
+//!   in-place release, which its own leg reads once the slab has it).
 //! - `map-admit-remove-counter-2496`, `-159744`: on the capped map of `u64`
 //!   keys, that many live keys from one counter: the next counter key
-//!   admitted and the oldest removed, so the window keeps its count and each
-//!   op splits and unlinks at the tree's depth; both stores one directory
-//!   level at 2,496, two at 159,744.
+//!   admitted, then a live key drawn uniformly removed, its place in the
+//!   array of live keys taken by the admitted one (`draw_and_swap`, a
+//!   SplitMix64 draw of a fixed seed). Eight times the live count of such
+//!   ops run before the counted loop, so the live set is the draw's steady
+//!   one; both stores one directory level at 2,496, two at 159,744.
+//! - `map-admit-remove-counter-draw-2496`, `-159744`: the same draw and
+//!   array at each count with no map, the removed key returned in the map
+//!   calls' place: the instructions a counter leg spends outside its map,
+//!   which its route term subtracts.
 //! - `hash-gate-get-10`, `-16`, `hash-gate-insert-remove-10`, `-16`: std's
 //!   map at the fabric gate's widths (a `u64` key and a 48 B slot) under the
 //!   integer hasher, 2^d even keys: a probe of a live one, or an insert and
@@ -45,6 +54,22 @@
 //! `-plus-hundred`, 100 `nop`s a wait. Those representations allocate a
 //! waiter on every wait, and the allocator's path moves with the plant's
 //! code by a few instructions, so their plant is read at a hundred.
+//!
+//! Two readings outside the count:
+//!
+//! - a heap leg writes its round's moves, its dry pass's (a round with a
+//!   counting hook before the counted loop, the same at every op count), as
+//!   `dry-pass-moves <moves>` on stderr, and asserts every round after the
+//!   loop places as many;
+//! - `--walk-depth` on a counter leg replays its seed on its map for `--ops`
+//!   ops after its warm-up, in a process the count never runs, prints the
+//!   mean branch depth of the keys its ops admit and remove in the live
+//!   set's tree, each branch a first-difference bit of the keys under it,
+//!   and then gets every key its array holds from its map. Its `-window`
+//!   variant (`map-admit-remove-counter-2496-window`, `-159744-window`)
+//!   replays the sliding window, the oldest key removed, whose depths are
+//!   shallower than the draw's: a reading of the window is the walk depth's
+//!   planted red, and the window is read by its walk depth alone.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -60,21 +85,23 @@ use inf_foundation::bounded::{
     SlabReserved, SlotId, Taken, WrapWithProof,
 };
 use inf_foundation::limits::{MAP_CHUNK_SLOTS_MAX, directory_levels};
+use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::{BuildIntHasher, CellId};
 use inf_runtime::heap::{ArrayBuilt, FixedArray, HeapEntry, IndexedHeap};
 
 use super::plant;
-use super::rates::{MASK_14, SlabLevels, rate_loop};
+use super::rates::{MASK_14, ONE_LEVEL_SLOTS, SlabLevels, rate_loop};
 
 /// A wait leg: the store and operation its step drives.
 #[derive(Clone, Copy)]
 pub enum WaitLeg {
     Holder { op: HolderOp, levels: SlabLevels },
-    RouteCounter { routes: Routes },
-    HashGate { depth: u32, insert: bool },
+    Node { op: NodeOp },
+    RouteCounter { routes: Routes, shape: RouteShape },
+    HashGate { depth: u32, op: HashOp },
     HeapMark { order: Order, waits: Waits },
     BtreeMark { order: Order, waits: Waits },
-    ListWaitWake { keyed: bool },
+    ListWaitWake { key: ListKey },
     MarkWaitFor,
 }
 
@@ -86,11 +113,45 @@ pub enum HolderOp {
     Cycle,
 }
 
+/// The operation a wait node leg drives.
+#[derive(Clone, Copy)]
+pub enum NodeOp {
+    Get,
+    GetMut,
+}
+
 /// A counter leg's live routes: the keyed gate's default and its ceiling.
 #[derive(Clone, Copy)]
 pub enum Routes {
     Default,
     Ceiling,
+}
+
+/// What a counter leg does with its draw.
+#[derive(Clone, Copy)]
+pub enum RouteShape {
+    /// The next counter key admitted, a drawn live key removed: the route
+    /// term with its draw.
+    Draw,
+    /// The draw alone, no map: the term a counter leg subtracts.
+    Twin,
+    /// The sliding window, the oldest key removed: read by its walk depth
+    /// alone, the walk depth's planted red.
+    Window,
+}
+
+/// The operation a hashed gate table's leg drives.
+#[derive(Clone, Copy)]
+pub enum HashOp {
+    Get,
+    InsertRemove,
+}
+
+/// A wait list's key: a list of one unit key, or of `u32` keys.
+#[derive(Clone, Copy)]
+pub enum ListKey {
+    Unit,
+    Word,
 }
 
 /// The LSN order a round pushes its waits in.
@@ -100,51 +161,70 @@ pub enum Order {
     Falling,
 }
 
-/// A round's waits: the wait nodes at one cell, at four, and the most.
+/// A round's waits: the wait nodes at one cell (962) and at four (2,825), and
+/// the most one directory level of the heap's entries holds (16,384).
 #[derive(Clone, Copy)]
 pub enum Waits {
     OneCell,
     FourCells,
-    Most,
+    OneDirectory,
 }
+
+const _: () = assert!(ONE_LEVEL_SLOTS == 16_384, "the heap legs' names carry 16,384");
 
 impl Waits {
     fn count(self) -> u64 {
         match self {
             Waits::OneCell => 962,
             Waits::FourCells => 2_825,
-            Waits::Most => 16_384,
+            Waits::OneDirectory => ONE_LEVEL_SLOTS as u64,
         }
     }
 }
 
 /// Drives `ops` steps of `leg` with `nops` planted: per op on the single-op
-/// legs, per wait on the round legs. A plant the leg does not take panics:
-/// the table of legs names each leg's plant once.
+/// legs, per wait on the round legs. A plant the leg does not take panics,
+/// and so does the window, which is read by its walk depth alone: the table
+/// of legs names each leg's plant once.
 #[inline(never)]
 pub fn drive(leg: WaitLeg, nops: u8, ops: u64) -> u64 {
     match (leg, nops) {
         (WaitLeg::Holder { op, levels }, 0) => drive_holder::<0>(op, levels, ops),
         (WaitLeg::Holder { op, levels }, 1) => drive_holder::<1>(op, levels, ops),
-        (WaitLeg::RouteCounter { routes }, 0) => drive_route_counter::<0>(routes, ops),
-        (WaitLeg::RouteCounter { routes }, 1) => drive_route_counter::<1>(routes, ops),
-        (WaitLeg::HashGate { depth, insert }, 0) => drive_hash_gate::<0>(depth, insert, ops),
-        (WaitLeg::HashGate { depth, insert }, 1) => drive_hash_gate::<1>(depth, insert, ops),
+        (WaitLeg::Node { op }, 0) => drive_node::<0>(op, ops),
+        (WaitLeg::Node { op }, 1) => drive_node::<1>(op, ops),
+        (WaitLeg::RouteCounter { routes, shape: RouteShape::Draw }, 0) => {
+            drive_route_counter::<0>(routes, ops)
+        }
+        (WaitLeg::RouteCounter { routes, shape: RouteShape::Draw }, 1) => {
+            drive_route_counter::<1>(routes, ops)
+        }
+        (WaitLeg::RouteCounter { routes, shape: RouteShape::Twin }, 0) => {
+            drive_route_twin::<0>(routes, ops)
+        }
+        (WaitLeg::RouteCounter { routes, shape: RouteShape::Twin }, 1) => {
+            drive_route_twin::<1>(routes, ops)
+        }
+        (WaitLeg::RouteCounter { shape: RouteShape::Window, .. }, _) => {
+            panic!("the window is read by its walk depth alone (--walk-depth)")
+        }
+        (WaitLeg::HashGate { depth, op }, 0) => drive_hash_gate::<0>(depth, op, ops),
+        (WaitLeg::HashGate { depth, op }, 1) => drive_hash_gate::<1>(depth, op, ops),
         (WaitLeg::HeapMark { order, waits }, 0) => drive_heap_mark::<0>(order, waits, ops),
         (WaitLeg::HeapMark { order, waits }, 1) => drive_heap_mark::<1>(order, waits, ops),
         (WaitLeg::BtreeMark { order, waits }, 0) => drive_btree_mark::<0>(order, waits, ops),
         (WaitLeg::BtreeMark { order, waits }, 100) => drive_btree_mark::<100>(order, waits, ops),
-        (WaitLeg::ListWaitWake { keyed: false }, 0) => drive_list::<0, ()>((), ops),
-        (WaitLeg::ListWaitWake { keyed: false }, 100) => drive_list::<100, ()>((), ops),
-        (WaitLeg::ListWaitWake { keyed: true }, 0) => drive_list::<0, u32>(7, ops),
-        (WaitLeg::ListWaitWake { keyed: true }, 100) => drive_list::<100, u32>(7, ops),
+        (WaitLeg::ListWaitWake { key: ListKey::Unit }, 0) => drive_list::<0, ()>((), ops),
+        (WaitLeg::ListWaitWake { key: ListKey::Unit }, 100) => drive_list::<100, ()>((), ops),
+        (WaitLeg::ListWaitWake { key: ListKey::Word }, 0) => drive_list::<0, u32>(7, ops),
+        (WaitLeg::ListWaitWake { key: ListKey::Word }, 100) => drive_list::<100, u32>(7, ops),
         (WaitLeg::MarkWaitFor, 0) => drive_mark_wait_for::<0>(ops),
         (WaitLeg::MarkWaitFor, 100) => drive_mark_wait_for::<100>(ops),
         (_, other) => panic!("no wait leg plants {other} nops"),
     }
 }
 
-// ---- the fabric gate's holder slab --------------------------------------------------------
+// ---- the fabric gate's holder slab and the wait node slab ---------------------------------------
 
 /// A holder's slot: 56 B, the gate's holder of a reply.
 type HolderSlot = [u64; 7];
@@ -153,18 +233,29 @@ const HOLDERS_256: Cap = Cap::entries::<256>("bench-holders-256", CapFill::Servi
 /// 257 chunks of 64: the fewest slots past one directory level's.
 const HOLDERS_16448: Cap = Cap::entries::<16_448>("bench-holders-16448", CapFill::Serving);
 
+/// A wait node's slot: 48 B, its list links, LSN and heap position.
+type NodeSlot = [u64; 6];
+type NodeSlab = CappedSlab<NodeSlot, u32, WrapWithProof>;
+const NODES_256: Cap = Cap::entries::<256>("bench-nodes-256", CapFill::Serving);
+
 // The store's own derivation of its root's level: one directory over the
 // chunks for the one-level legs, two for the `-2` legs, so each op of a `-2`
 // leg walks one link more than its twin's; another cap does not compile.
 const _: () = assert!(directory_levels(HOLDERS_256.entries_max() as u64, MAP_CHUNK_SLOTS_MAX) == 1);
 const _: () =
     assert!(directory_levels(HOLDERS_16448.entries_max() as u64, MAP_CHUNK_SLOTS_MAX) == 2);
+const _: () = assert!(directory_levels(NODES_256.entries_max() as u64, MAP_CHUNK_SLOTS_MAX) == 1);
 
-/// A holder slab of `cap` holding all but one slot, built by steps before the
-/// loop, and the handle of its first occupant.
-fn holder_slab(cap: Cap) -> (HolderSlab, SlotId<u32>, Rc<CapCensus>) {
+/// A wrapping `u32` slab of `cap` holding all but one slot, each occupant
+/// `fill` of its ordinal, built by steps before the loop, and the handle of
+/// its first occupant.
+fn occupied<T>(
+    cap: Cap,
+    fill: impl Fn(u64) -> T,
+) -> (CappedSlab<T, u32, WrapWithProof>, SlotId<u32>, Rc<CapCensus>) {
     let (census, _serve_mark) = CapCensus::new(CellId(0));
-    let mut builder = HolderSlab::builder(cap, &census).expect("registered");
+    let mut builder =
+        CappedSlab::<T, u32, WrapWithProof>::builder(cap, &census).expect("registered");
     let mut slab = loop {
         match builder.step() {
             Built::More(next) => builder = next,
@@ -175,23 +266,23 @@ fn holder_slab(cap: Cap) -> (HolderSlab, SlotId<u32>, Rc<CapCensus>) {
     let mut first = None;
     for value in 0..u64::from(cap.entries_max() - 1) {
         let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
-        let id = slot.publish([value; 7]);
+        let id = slot.publish(fill(value));
         first.get_or_insert(id);
     }
     (slab, first.expect("an occupant"), census)
 }
 
 #[inline(never)]
-fn step_holder_get(slab: &mut HolderSlab, id: SlotId<u32>) -> u64 {
-    match slab.get(id) {
+fn step_holder_get(slab: &mut HolderSlab, id: &SlotId<u32>) -> u64 {
+    match slab.get(*id) {
         Lookup::Live(value) => value[6] + 1,
         Lookup::Stale | Lookup::Vacant => panic!("a live occupant"),
     }
 }
 
 #[inline(never)]
-fn step_holder_get_mut(slab: &mut HolderSlab, id: SlotId<u32>) -> u64 {
-    match slab.get_mut(id) {
+fn step_holder_get_mut(slab: &mut HolderSlab, id: &SlotId<u32>) -> u64 {
+    match slab.get_mut(*id) {
         LookupMut::Live(value) => value[6] + 1,
         LookupMut::Stale | LookupMut::Vacant => panic!("a live occupant"),
     }
@@ -214,8 +305,14 @@ fn drive_holder<const NOPS: u8>(op: HolderOp, levels: SlabLevels, ops: u64) -> u
         SlabLevels::One => HOLDERS_256,
         SlabLevels::Two => HOLDERS_16448,
     };
-    let (mut slab, first, _census) = holder_slab(cap);
+    let (mut slab, first, _census) = occupied(cap, |value| [value; 7]);
     let slab = black_box(&mut slab);
+    // The handle by reference: a by-value handle (12 B) reaches the step
+    // through a stack copy, which the loop may rebuild every op (two stores
+    // the harness's loop does not carry, as when the builder inlines); by
+    // reference the loop passes one address, and the step reads the handle
+    // through a pointer either way.
+    let first = &first;
     let accumulator = match op {
         HolderOp::Get => rate_loop::<NOPS>(ops, MASK_14, |_| step_holder_get(slab, first)),
         HolderOp::GetMut => rate_loop::<NOPS>(ops, MASK_14, |_| step_holder_get_mut(slab, first)),
@@ -228,9 +325,42 @@ fn drive_holder<const NOPS: u8>(op: HolderOp, levels: SlabLevels, ops: u64) -> u
     accumulator
 }
 
+#[inline(never)]
+fn step_node_get(slab: &mut NodeSlab, id: &SlotId<u32>) -> u64 {
+    match slab.get(*id) {
+        Lookup::Live(value) => value[5] + 1,
+        Lookup::Stale | Lookup::Vacant => panic!("a live node"),
+    }
+}
+
+#[inline(never)]
+fn step_node_get_mut(slab: &mut NodeSlab, id: &SlotId<u32>) -> u64 {
+    match slab.get_mut(*id) {
+        LookupMut::Live(value) => value[5] + 1,
+        LookupMut::Stale | LookupMut::Vacant => panic!("a live node"),
+    }
+}
+
+/// A get or a `get_mut` of the node slab's first occupant: a poll's read of
+/// its node, and a wake's or a hook's write.
+fn drive_node<const NOPS: u8>(op: NodeOp, ops: u64) -> u64 {
+    let (mut slab, first, _census) = occupied(NODES_256, |value| [value; 6]);
+    let slab = black_box(&mut slab);
+    // The handle by reference, as the holder legs pass theirs.
+    let first = &first;
+    let accumulator = match op {
+        NodeOp::Get => rate_loop::<NOPS>(ops, MASK_14, |_| step_node_get(slab, first)),
+        NodeOp::GetMut => rate_loop::<NOPS>(ops, MASK_14, |_| step_node_get_mut(slab, first)),
+    };
+    // Engagement, after the counted loop: every op reached its node and the
+    // slab holds its occupants alone.
+    assert_eq!(accumulator, ops, "every op reached its node");
+    assert_eq!(slab.len(), NODES_256.entries_max() - 1, "the slab holds its occupants");
+    accumulator
+}
 // ---- the keyed gate's route map, from one counter ---------------------------------------------
 
-/// The live routes and the one an op admits before it removes the oldest.
+/// The live routes and the one an op admits before it removes a drawn one.
 const ROUTES_2496: Cap = Cap::entries::<2_497>("bench-routes-2496", CapFill::Serving);
 const ROUTES_159744: Cap = Cap::entries::<159_745>("bench-routes-159744", CapFill::Serving);
 
@@ -245,18 +375,71 @@ const _: () =
 const _: () =
     assert!(directory_levels(ROUTES_159744.entries_max() as u64 - 1, MAP_CHUNK_SLOTS_MAX) == 2);
 
-/// A window of live routes from one counter: `[oldest, oldest + live)`.
-struct RouteWindow {
-    map: CappedMap<u64, u32>,
-    oldest: u64,
-    live: u64,
+/// The draw's fixed seed: every counter leg, its twin and its walk depth
+/// replay one stream.
+const ROUTE_SEED: u64 = 11;
+/// The ops run before the counted loop, in live counts: a live key outlives
+/// them with probability e⁻⁸, so the live set is the draw's steady one.
+const ROUTE_WARM_UP: u64 = 8;
+
+impl Routes {
+    fn cap(self) -> Cap {
+        match self {
+            Routes::Default => ROUTES_2496,
+            Routes::Ceiling => ROUTES_159744,
+        }
+    }
+
+    /// The live routes: all but the slot an op admits into before its
+    /// remove.
+    fn live(self) -> u64 {
+        u64::from(self.cap().entries_max() - 1)
+    }
 }
 
-/// The window of `cap` less one live keys, `0..cap - 1`, built by steps
-/// before the loop.
-fn route_window(cap: Cap) -> (RouteWindow, Rc<CapCensus>) {
+/// The live keys in an array, the stream that draws the next one removed,
+/// and the next counter key.
+struct RouteDraw {
+    keys: Box<[u64]>,
+    rng: SplitMix64,
+    next: u64,
+}
+
+impl RouteDraw {
+    /// The keys `0..live`, live, and the stream at its seed.
+    fn new(live: u64) -> RouteDraw {
+        RouteDraw { keys: (0..live).collect(), rng: SplitMix64::new(ROUTE_SEED), next: live }
+    }
+
+    /// The live keys' sum, a scan of the array whose instructions do not
+    /// depend on the keys.
+    fn sum(&self) -> u64 {
+        self.keys.iter().fold(0, |sum, key| sum.wrapping_add(*key))
+    }
+}
+
+/// The draw every counter leg and its twin run, one body (inlined into each
+/// step, so the twin's subtraction removes the same instructions): an index
+/// `(x × N) >> 64` of the stream's next output over the `N` live keys, the
+/// key there returned and `next` written in its place.
+#[inline(always)]
+fn draw_and_swap(keys: &mut [u64], rng: &mut SplitMix64, next: u64) -> u64 {
+    let live = keys.len() as u128;
+    let index = ((u128::from(rng.next_u64()) * live) >> 64) as usize;
+    std::mem::replace(&mut keys[index], next)
+}
+
+/// A counter leg's state: the map of live routes and its draw.
+struct RouteCounter {
+    map: CappedMap<u64, u32>,
+    draw: RouteDraw,
+}
+
+/// The routes `0..live` of `routes`, live in the map and the draw's array,
+/// built by steps before the loop.
+fn route_counter(routes: Routes) -> (RouteCounter, Rc<CapCensus>) {
     let (census, _serve_mark) = CapCensus::new(CellId(0));
-    let mut builder = CappedMap::<u64, u32>::builder(cap, &census).expect("registered");
+    let mut builder = CappedMap::<u64, u32>::builder(routes.cap(), &census).expect("registered");
     let mut map = loop {
         match builder.step() {
             MapBuilt::More(next) => builder = next,
@@ -264,42 +447,184 @@ fn route_window(cap: Cap) -> (RouteWindow, Rc<CapCensus>) {
             MapBuilt::Refused(_, refused) => panic!("{refused}"),
         }
     };
-    let live = u64::from(cap.entries_max() - 1);
-    for key in 0..live {
+    for key in 0..routes.live() {
         let Admission::Vacant(slot) = map.admit(key) else { panic!("a fresh key") };
         slot.publish(1);
     }
-    (RouteWindow { map, oldest: 0, live }, census)
+    (RouteCounter { map, draw: RouteDraw::new(routes.live()) }, census)
 }
 
 #[inline(never)]
-fn step_route_counter(window: &mut RouteWindow) -> u64 {
-    let next = window.oldest + window.live;
-    let Admission::Vacant(slot) = window.map.admit(next) else { panic!("the next key is vacant") };
+fn step_route_counter(routes: &mut RouteCounter) -> u64 {
+    let next = routes.draw.next;
+    routes.draw.next = next + 1;
+    let Admission::Vacant(slot) = routes.map.admit(next) else { panic!("the next key is vacant") };
     slot.publish(1);
-    let removed = window.map.remove(window.oldest).map_or(0, u64::from);
-    window.oldest += 1;
-    1 + removed
+    let removed = draw_and_swap(&mut routes.draw.keys, &mut routes.draw.rng, next);
+    1 + routes.map.remove(removed).map_or(0, u64::from)
 }
 
-/// The next counter key admitted and the oldest removed, each op.
+/// The next counter key admitted and a drawn live key removed, each op,
+/// after the warm-up.
 fn drive_route_counter<const NOPS: u8>(routes: Routes, ops: u64) -> u64 {
-    let cap = match routes {
-        Routes::Default => ROUTES_2496,
-        Routes::Ceiling => ROUTES_159744,
-    };
-    let (mut window, _census) = route_window(cap);
-    let window = black_box(&mut window);
-    let accumulator = rate_loop::<NOPS>(ops, MASK_14, |_| step_route_counter(window));
-    // Engagement, after the counted loop: every op placed its key and
-    // removed the oldest, and the map holds the window from the counter.
-    let (oldest, live) = (window.oldest, window.live);
+    let (mut counter, _census) = route_counter(routes);
+    let live = routes.live();
+    // The warm-up, the same at every op count: so its instructions leave the
+    // count.
+    let warm_ops = ROUTE_WARM_UP * live;
+    let warmed = (0..warm_ops).fold(0u64, |sum, _| sum + step_route_counter(&mut counter));
+    assert_eq!(warmed, 2 * warm_ops, "every warm-up op admitted and removed a key");
+    let counter = black_box(&mut counter);
+    let accumulator = rate_loop::<NOPS>(ops, MASK_14, |_| step_route_counter(counter));
+    // Engagement, after the counted loop: every op admitted its key and
+    // removed a live one, and the map holds the live count. A get of every
+    // key the array holds runs after the walk depth's replay of these ops
+    // instead: its instructions follow the tree's depth, which differs
+    // between I(0)'s tree and I(n)'s (+0.57 an op at 159,744 at n = 10⁶).
     assert_eq!(accumulator, 2 * ops, "every op admitted and removed a key");
-    assert_eq!(u64::from(window.map.len()), live, "the map holds its window");
-    assert!(window.map.get(oldest).is_some(), "the window's oldest key is live");
-    assert!(window.map.get(oldest + live - 1).is_some(), "the window's newest key is live");
-    assert!(oldest == 0 || window.map.get(oldest - 1).is_none(), "the oldest left is gone");
+    assert_eq!(u64::from(counter.map.len()), live, "the map holds the live routes");
     accumulator
+}
+
+#[inline(never)]
+fn step_route_twin(draw: &mut RouteDraw) -> u64 {
+    let next = draw.next;
+    draw.next = next + 1;
+    draw_and_swap(&mut draw.keys, &mut draw.rng, next)
+}
+
+/// The counter legs' draw alone, each op, after the same warm-up: the
+/// removed key returned to the loop's accumulator in the map calls' place.
+fn drive_route_twin<const NOPS: u8>(routes: Routes, ops: u64) -> u64 {
+    let live = routes.live();
+    let mut draw = RouteDraw::new(live);
+    for _ in 0..ROUTE_WARM_UP * live {
+        step_route_twin(&mut draw);
+    }
+    let (sum_before, first) = (draw.sum(), draw.next);
+    let draw = black_box(&mut draw);
+    let accumulator = rate_loop::<NOPS>(ops, MASK_14, |_| step_route_twin(draw));
+    // Engagement, after the counted loop: the keys removed are the keys live
+    // before it and those it admitted, `first..first + ops`, less the keys
+    // live after it, so every op drew a live key and wrote its own.
+    let admitted = (first..first + ops).fold(0u64, u64::wrapping_add);
+    let removed = sum_before.wrapping_add(admitted).wrapping_sub(draw.sum());
+    assert_eq!(accumulator, removed, "every op removed a live key and admitted its own");
+    assert_eq!(draw.next, first + ops, "every op admitted the next key");
+    accumulator
+}
+
+/// The live keys counted in each aligned block of every power-of-two size,
+/// the sorted copy the walk depth reads: a key's branch depth in the map's
+/// tree is the number of bits `b` at which the block of 2^b keys beside it
+/// (the key's bits above `b`, bit `b` flipped) holds a live key, each such
+/// bit a branch on its path, the first-difference bit of the keys under it.
+struct BlockCounts {
+    levels: Vec<Vec<u32>>,
+}
+
+impl BlockCounts {
+    /// Every count zero, for keys below `end`.
+    fn new(end: u64) -> BlockCounts {
+        let bits = u64::BITS - end.leading_zeros();
+        let blocks = |bit: u32| usize::try_from((end >> bit) + 2).expect("a level's blocks");
+        BlockCounts { levels: (0..=bits).map(|bit| vec![0; blocks(bit)]).collect() }
+    }
+
+    fn insert(&mut self, key: u64) {
+        for (bit, level) in self.levels.iter_mut().enumerate() {
+            level[usize::try_from(key >> bit).expect("a block")] += 1;
+        }
+    }
+
+    fn remove(&mut self, key: u64) {
+        for (bit, level) in self.levels.iter_mut().enumerate() {
+            level[usize::try_from(key >> bit).expect("a block")] -= 1;
+        }
+    }
+
+    fn depth(&self, key: u64) -> u64 {
+        let beside = |bit: usize| usize::try_from((key >> bit) ^ 1).expect("a block");
+        let held =
+            |(bit, level): (usize, &Vec<u32>)| level.get(beside(bit)).is_some_and(|c| *c > 0);
+        self.levels.iter().enumerate().filter(|entry| held(*entry)).count() as u64
+    }
+}
+
+/// The mean branch depths of the keys a counter leg's ops admit and remove.
+pub struct WalkDepth {
+    pub admit: f64,
+    pub remove: f64,
+}
+
+/// A counter leg's walk depth over `ops` ops after its warm-up, its own keys
+/// replayed from its seed, or its window's: read outside the count, in a
+/// process the count never runs.
+pub fn walk_depth(leg: WaitLeg, ops: u64) -> Result<WalkDepth, String> {
+    let WaitLeg::RouteCounter { routes, shape } = leg else {
+        return Err("--walk-depth reads a counter leg or its window".to_owned());
+    };
+    if ops == 0 {
+        return Err("--walk-depth reads a mean over --ops above 0".to_owned());
+    }
+    let (admit, remove) = match shape {
+        RouteShape::Draw => walk_depth_draw(routes, ops),
+        RouteShape::Window => walk_depth_window(routes.live(), ops),
+        RouteShape::Twin => {
+            return Err("the draw's twin holds no map; its counter leg reads the walk depth".into());
+        }
+    };
+    let mean = |total: u64| total as f64 / ops as f64;
+    Ok(WalkDepth { admit: mean(admit), remove: mean(remove) })
+}
+
+/// The counter leg's ops replayed on its own map, the same warm-up and
+/// draws, beside a second draw of the seed that names each op's keys: the
+/// depth of each admitted key once it is live and of each removed key
+/// before its remove, summed over the `ops` after the warm-up. Then the
+/// leg's engagement that reads the tree: the two draws hold one array, and
+/// every key in it is live in the map.
+fn walk_depth_draw(routes: Routes, ops: u64) -> (u64, u64) {
+    let (live, warm_ops) = (routes.live(), ROUTE_WARM_UP * routes.live());
+    let (mut counter, _census) = route_counter(routes);
+    let mut keys = RouteDraw::new(live);
+    let mut blocks = BlockCounts::new(live + warm_ops + ops);
+    (0..live).for_each(|key| blocks.insert(key));
+    let (mut admit, mut remove) = (0, 0);
+    for op in 0..warm_ops + ops {
+        let next = keys.next;
+        keys.next = next + 1;
+        blocks.insert(next);
+        let removed = draw_and_swap(&mut keys.keys, &mut keys.rng, next);
+        assert_eq!(step_route_counter(&mut counter), 2, "the leg's op admitted and removed");
+        if op >= warm_ops {
+            admit += blocks.depth(next);
+            remove += blocks.depth(removed);
+        }
+        blocks.remove(removed);
+    }
+    assert!(keys.keys == counter.draw.keys, "the replay drew the leg's keys");
+    assert_eq!(u64::from(counter.map.len()), live, "the map holds the live routes");
+    let gone = counter.draw.keys.iter().filter(|key| counter.map.get(**key).is_none()).count();
+    assert_eq!(gone, 0, "every key the array holds is live");
+    (admit, remove)
+}
+
+/// The sliding window's ops: the next counter key admitted and the oldest
+/// removed, its live set always `live` keys in a row, so it needs no
+/// warm-up.
+fn walk_depth_window(live: u64, ops: u64) -> (u64, u64) {
+    let mut blocks = BlockCounts::new(live + ops);
+    (0..live).for_each(|key| blocks.insert(key));
+    let (mut admit, mut remove) = (0, 0);
+    for oldest in 0..ops {
+        let next = oldest + live;
+        blocks.insert(next);
+        admit += blocks.depth(next);
+        remove += blocks.depth(oldest);
+        blocks.remove(oldest);
+    }
+    (admit, remove)
 }
 
 // ---- the fabric gate's table before its fixed stores, at its widths --------------------------
@@ -331,19 +656,23 @@ fn step_hash_gate_insert_remove(table: &mut GateTable, key: u64) -> u64 {
 
 /// A probe of a live even token, or an insert and a remove of the odd token
 /// beside one, the tokens walked in turn.
-fn drive_hash_gate<const NOPS: u8>(depth: u32, insert: bool, ops: u64) -> u64 {
+fn drive_hash_gate<const NOPS: u8>(depth: u32, op: HashOp, ops: u64) -> u64 {
     let mut table = even_tokens(depth);
     let live = table.len();
     let mask = (1u64 << depth) - 1;
     let table = black_box(&mut table);
-    let accumulator = if insert {
-        rate_loop::<NOPS>(ops, mask, |key| step_hash_gate_insert_remove(table, key + 1))
-    } else {
-        rate_loop::<NOPS>(ops, mask, |key| step_hash_gate_get(table, key))
+    let accumulator = match op {
+        HashOp::Get => rate_loop::<NOPS>(ops, mask, |key| step_hash_gate_get(table, key)),
+        HashOp::InsertRemove => {
+            rate_loop::<NOPS>(ops, mask, |key| step_hash_gate_insert_remove(table, key + 1))
+        }
     };
     // Engagement, after the counted loop: every op found or placed its token
     // and the table holds its live tokens alone.
-    let per_op = if insert { 2 } else { 1 };
+    let per_op = match op {
+        HashOp::Get => 1,
+        HashOp::InsertRemove => 2,
+    };
     assert_eq!(accumulator, ops * per_op, "every op reached its token");
     assert_eq!(table.len(), live, "the table holds its live tokens");
     accumulator
@@ -369,8 +698,7 @@ impl HeapEntry for WaitEntry {
 
 const _: () = assert!(size_of::<WaitEntry>() == 24, "a wait entry is 24 B");
 
-/// The wait node slab's slot, whose handle every entry carries.
-type NodeSlab = CappedSlab<[u64; 6], u32, WrapWithProof>;
+/// The heap rounds' one node, whose handle every entry carries.
 const NODES_1: Cap = Cap::entries::<1>("bench-nodes-1", CapFill::Serving);
 
 /// The heap's rounds: the heap, the handle each entry carries, the LSN the
@@ -440,9 +768,40 @@ fn heap_round<const WAIT_NOPS: u8>(
     woken
 }
 
+// The round's step and its plant's, each one body (a generic step would be
+// two bodies under one name, which the site's-shape control refuses to read).
 #[inline(never)]
-fn step_heap_mark<const WAIT_NOPS: u8>(rounds: &mut HeapRounds) -> u64 {
-    heap_round::<WAIT_NOPS>(rounds, |_, _| {})
+fn step_heap_mark(rounds: &mut HeapRounds) -> u64 {
+    heap_round::<0>(rounds, |_, _| {})
+}
+
+#[inline(never)]
+fn step_heap_mark_plus_wait(rounds: &mut HeapRounds) -> u64 {
+    heap_round::<1>(rounds, |_, _| {})
+}
+
+/// A dropped wait's removal at its position, the last entry sifted into its
+/// place: the heap's `remove` at the wait entry's instance, its own step.
+#[inline(never)]
+fn step_heap_remove(heap: &mut IndexedHeap<WaitEntry>, position: u32) -> u64 {
+    u64::from(heap.remove(position, |_, _| {}).is_some())
+}
+
+/// A round of drops: the round's waits pushed, then each removed from the
+/// middle of the heap until none is left. Returns the waits removed.
+fn heap_drop_round(rounds: &mut HeapRounds) -> u64 {
+    let (base, waits, node) = (rounds.base, rounds.waits, rounds.node);
+    for index in 0..waits {
+        let lsn = base + 1 + index;
+        rounds.heap.push(WaitEntry { lsn, node }, |_, _| {}).expect("room for every wait");
+    }
+    let mut removed = 0;
+    while !rounds.heap.is_empty() {
+        let middle = rounds.heap.len() / 2;
+        removed += step_heap_remove(&mut rounds.heap, middle);
+    }
+    rounds.base = base + waits;
+    removed
 }
 
 /// A round's moves: the entries its sifts place, heard by a counting hook.
@@ -457,14 +816,21 @@ fn heap_round_moves(rounds: &mut HeapRounds) -> u64 {
 fn drive_heap_mark<const WAIT_NOPS: u8>(order: Order, waits: Waits, ops: u64) -> u64 {
     let (mut rounds, _nodes, _census) = heap_rounds(order, waits);
     // The dry pass: a round with a counting hook, before the counted loop.
+    // Its moves go to the run's log, where the rows' hook term reads them.
     let dry_moves = heap_round_moves(&mut rounds);
+    eprintln!("dry-pass-moves {dry_moves}");
     let rounds = black_box(&mut rounds);
-    let accumulator = rate_loop::<0>(ops, MASK_14, |_| step_heap_mark::<WAIT_NOPS>(rounds));
-    // Engagement, after the counted loop: every wait woken, the heap empty,
-    // and a round from here places the entries the dry pass placed.
+    let accumulator = match WAIT_NOPS {
+        0 => rate_loop::<0>(ops, MASK_14, |_| step_heap_mark(rounds)),
+        _ => rate_loop::<0>(ops, MASK_14, |_| step_heap_mark_plus_wait(rounds)),
+    };
+    // Engagement, after the counted loop, the same at every op count: every
+    // wait woken, the heap empty, a round from here places the entries the
+    // dry pass placed, and a round of drops removes every wait it pushed.
     assert_eq!(accumulator, ops * rounds.waits, "every wait woken");
     assert!(rounds.heap.is_empty(), "every entry popped");
     assert_eq!(heap_round_moves(rounds), dry_moves, "a round's moves are its dry pass's");
+    assert_eq!(heap_drop_round(rounds), rounds.waits, "every dropped wait removed");
     accumulator
 }
 

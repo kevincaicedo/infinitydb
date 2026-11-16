@@ -103,6 +103,10 @@
 //!   cargo bench -p inf-runtime --bench cold_path --no-run
 //!   taskset -c <core> perf stat -e instructions:u -x, -- <binary> \
 //!       --variant <v> --ops <n>
+//!
+//! A counter leg's walk depth is read without `perf`, in its own process:
+//! `<binary> --variant <v> --ops <n> --walk-depth` prints the mean branch
+//! depths of the keys its `n` counted ops admit and remove.
 
 #[path = "cold_path/cold.rs"]
 #[allow(dead_code, reason = "the host is copied whole; each leg drives part of it")]
@@ -136,7 +140,7 @@ use inf_runtime::{
 
 use cold::{ColdReadConfig, ColdReads, ColdWait, ReadClass, TierFileId};
 use rates::{PairWord, RateLeg, RetireOp, SlabLevels};
-use waits::{HolderOp, Order, Routes, WaitLeg, Waits};
+use waits::{HashOp, HolderOp, ListKey, NodeOp, Order, RouteShape, Routes, WaitLeg, Waits};
 
 /// One pool buffer, the server's cold window: four 4 KiB frames.
 const BUFFER_BYTES: usize = 4 * inf_alloc::TIER_READ_ALIGN;
@@ -208,8 +212,14 @@ const RETIRE_CYCLE_2: RateLeg =
 const fn holder(op: HolderOp, levels: SlabLevels) -> Leg {
     Leg::Wait(WaitLeg::Holder { op, levels })
 }
-const fn hash_gate(depth: u32, insert: bool) -> Leg {
-    Leg::Wait(WaitLeg::HashGate { depth, insert })
+const fn node(op: NodeOp) -> Leg {
+    Leg::Wait(WaitLeg::Node { op })
+}
+const fn route(routes: Routes, shape: RouteShape) -> Leg {
+    Leg::Wait(WaitLeg::RouteCounter { routes, shape })
+}
+const fn hash_gate(depth: u32, op: HashOp) -> Leg {
+    Leg::Wait(WaitLeg::HashGate { depth, op })
 }
 const fn heap_mark(order: Order, waits: Waits) -> Leg {
     Leg::Wait(WaitLeg::HeapMark { order, waits })
@@ -217,14 +227,16 @@ const fn heap_mark(order: Order, waits: Waits) -> Leg {
 const fn btree_mark(order: Order, waits: Waits) -> Leg {
     Leg::Wait(WaitLeg::BtreeMark { order, waits })
 }
-const ROUTES_DEFAULT: Leg = Leg::Wait(WaitLeg::RouteCounter { routes: Routes::Default });
-const ROUTES_CEILING: Leg = Leg::Wait(WaitLeg::RouteCounter { routes: Routes::Ceiling });
-const LIST_UNIT: Leg = Leg::Wait(WaitLeg::ListWaitWake { keyed: false });
-const LIST_KEY: Leg = Leg::Wait(WaitLeg::ListWaitWake { keyed: true });
+const ROUTES_DEFAULT: Leg = route(Routes::Default, RouteShape::Draw);
+const ROUTES_CEILING: Leg = route(Routes::Ceiling, RouteShape::Draw);
+const DRAW_DEFAULT: Leg = route(Routes::Default, RouteShape::Twin);
+const DRAW_CEILING: Leg = route(Routes::Ceiling, RouteShape::Twin);
+const LIST_UNIT: Leg = Leg::Wait(WaitLeg::ListWaitWake { key: ListKey::Unit });
+const LIST_KEY: Leg = Leg::Wait(WaitLeg::ListWaitWake { key: ListKey::Word });
 const MARK_WAIT_FOR: Leg = Leg::Wait(WaitLeg::MarkWaitFor);
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 165] = [
+const LEGS: [(&str, Leg, u8); 175] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -348,42 +360,52 @@ const LEGS: [(&str, Leg, u8); 165] = [
     ("slab-holder-get-mut-2-plus-one", holder(HolderOp::GetMut, SlabLevels::Two), 1),
     ("slab-holder-cycle-2", holder(HolderOp::Cycle, SlabLevels::Two), 0),
     ("slab-holder-cycle-2-plus-one", holder(HolderOp::Cycle, SlabLevels::Two), 1),
+    ("slab-node-get", node(NodeOp::Get), 0),
+    ("slab-node-get-plus-one", node(NodeOp::Get), 1),
+    ("slab-node-get-mut", node(NodeOp::GetMut), 0),
+    ("slab-node-get-mut-plus-one", node(NodeOp::GetMut), 1),
     ("map-admit-remove-counter-2496", ROUTES_DEFAULT, 0),
     ("map-admit-remove-counter-2496-plus-one", ROUTES_DEFAULT, 1),
     ("map-admit-remove-counter-159744", ROUTES_CEILING, 0),
     ("map-admit-remove-counter-159744-plus-one", ROUTES_CEILING, 1),
-    ("hash-gate-get-10", hash_gate(10, false), 0),
-    ("hash-gate-get-10-plus-one", hash_gate(10, false), 1),
-    ("hash-gate-get-16", hash_gate(16, false), 0),
-    ("hash-gate-get-16-plus-one", hash_gate(16, false), 1),
-    ("hash-gate-insert-remove-10", hash_gate(10, true), 0),
-    ("hash-gate-insert-remove-10-plus-one", hash_gate(10, true), 1),
-    ("hash-gate-insert-remove-16", hash_gate(16, true), 0),
-    ("hash-gate-insert-remove-16-plus-one", hash_gate(16, true), 1),
+    ("map-admit-remove-counter-draw-2496", DRAW_DEFAULT, 0),
+    ("map-admit-remove-counter-draw-2496-plus-one", DRAW_DEFAULT, 1),
+    ("map-admit-remove-counter-draw-159744", DRAW_CEILING, 0),
+    ("map-admit-remove-counter-draw-159744-plus-one", DRAW_CEILING, 1),
+    ("map-admit-remove-counter-2496-window", route(Routes::Default, RouteShape::Window), 0),
+    ("map-admit-remove-counter-159744-window", route(Routes::Ceiling, RouteShape::Window), 0),
+    ("hash-gate-get-10", hash_gate(10, HashOp::Get), 0),
+    ("hash-gate-get-10-plus-one", hash_gate(10, HashOp::Get), 1),
+    ("hash-gate-get-16", hash_gate(16, HashOp::Get), 0),
+    ("hash-gate-get-16-plus-one", hash_gate(16, HashOp::Get), 1),
+    ("hash-gate-insert-remove-10", hash_gate(10, HashOp::InsertRemove), 0),
+    ("hash-gate-insert-remove-10-plus-one", hash_gate(10, HashOp::InsertRemove), 1),
+    ("hash-gate-insert-remove-16", hash_gate(16, HashOp::InsertRemove), 0),
+    ("hash-gate-insert-remove-16-plus-one", hash_gate(16, HashOp::InsertRemove), 1),
     ("heap-mark-rising-962", heap_mark(Order::Rising, Waits::OneCell), 0),
     ("heap-mark-rising-962-plus-wait", heap_mark(Order::Rising, Waits::OneCell), 1),
     ("heap-mark-rising-2825", heap_mark(Order::Rising, Waits::FourCells), 0),
     ("heap-mark-rising-2825-plus-wait", heap_mark(Order::Rising, Waits::FourCells), 1),
-    ("heap-mark-rising-16384", heap_mark(Order::Rising, Waits::Most), 0),
-    ("heap-mark-rising-16384-plus-wait", heap_mark(Order::Rising, Waits::Most), 1),
+    ("heap-mark-rising-16384", heap_mark(Order::Rising, Waits::OneDirectory), 0),
+    ("heap-mark-rising-16384-plus-wait", heap_mark(Order::Rising, Waits::OneDirectory), 1),
     ("heap-mark-falling-962", heap_mark(Order::Falling, Waits::OneCell), 0),
     ("heap-mark-falling-962-plus-wait", heap_mark(Order::Falling, Waits::OneCell), 1),
     ("heap-mark-falling-2825", heap_mark(Order::Falling, Waits::FourCells), 0),
     ("heap-mark-falling-2825-plus-wait", heap_mark(Order::Falling, Waits::FourCells), 1),
-    ("heap-mark-falling-16384", heap_mark(Order::Falling, Waits::Most), 0),
-    ("heap-mark-falling-16384-plus-wait", heap_mark(Order::Falling, Waits::Most), 1),
+    ("heap-mark-falling-16384", heap_mark(Order::Falling, Waits::OneDirectory), 0),
+    ("heap-mark-falling-16384-plus-wait", heap_mark(Order::Falling, Waits::OneDirectory), 1),
     ("btree-mark-rising-962", btree_mark(Order::Rising, Waits::OneCell), 0),
     ("btree-mark-rising-962-plus-hundred", btree_mark(Order::Rising, Waits::OneCell), 100),
     ("btree-mark-rising-2825", btree_mark(Order::Rising, Waits::FourCells), 0),
     ("btree-mark-rising-2825-plus-hundred", btree_mark(Order::Rising, Waits::FourCells), 100),
-    ("btree-mark-rising-16384", btree_mark(Order::Rising, Waits::Most), 0),
-    ("btree-mark-rising-16384-plus-hundred", btree_mark(Order::Rising, Waits::Most), 100),
+    ("btree-mark-rising-16384", btree_mark(Order::Rising, Waits::OneDirectory), 0),
+    ("btree-mark-rising-16384-plus-hundred", btree_mark(Order::Rising, Waits::OneDirectory), 100),
     ("btree-mark-falling-962", btree_mark(Order::Falling, Waits::OneCell), 0),
     ("btree-mark-falling-962-plus-hundred", btree_mark(Order::Falling, Waits::OneCell), 100),
     ("btree-mark-falling-2825", btree_mark(Order::Falling, Waits::FourCells), 0),
     ("btree-mark-falling-2825-plus-hundred", btree_mark(Order::Falling, Waits::FourCells), 100),
-    ("btree-mark-falling-16384", btree_mark(Order::Falling, Waits::Most), 0),
-    ("btree-mark-falling-16384-plus-hundred", btree_mark(Order::Falling, Waits::Most), 100),
+    ("btree-mark-falling-16384", btree_mark(Order::Falling, Waits::OneDirectory), 0),
+    ("btree-mark-falling-16384-plus-hundred", btree_mark(Order::Falling, Waits::OneDirectory), 100),
     ("list-wait-wake-unit", LIST_UNIT, 0),
     ("list-wait-wake-unit-plus-hundred", LIST_UNIT, 100),
     ("list-wait-wake-key", LIST_KEY, 0),
@@ -392,19 +414,32 @@ const LEGS: [(&str, Leg, u8); 165] = [
     ("mark-wait-for-plus-hundred", MARK_WAIT_FOR, 100),
 ];
 
+/// What a run reads: the leg's count, or a counter leg's walk depth.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    Count,
+    WalkDepth,
+}
+
 struct Args {
     leg: Leg,
     nops: u8,
     ops: u64,
+    reading: Reading,
 }
 
 fn parse() -> Result<Args, String> {
     let mut leg = None;
     let mut ops = None;
+    let mut reading = Reading::Count;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         if flag == "--bench" {
             continue; // cargo bench passes it to a harness-free binary
+        }
+        if flag == "--walk-depth" {
+            reading = Reading::WalkDepth;
+            continue;
         }
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
@@ -420,7 +455,10 @@ fn parse() -> Result<Args, String> {
         }
     }
     let (leg, nops) = leg.ok_or("--variant is required")?;
-    Ok(Args { leg, nops, ops: ops.ok_or("--ops is required")? })
+    if reading == Reading::WalkDepth && nops != 0 {
+        return Err("--walk-depth reads a leg, never its plant".to_owned());
+    }
+    Ok(Args { leg, nops, ops: ops.ok_or("--ops is required")?, reading })
 }
 
 /// The plants: `NOPS` operand-free `nop`s at the top of a loop body that
@@ -885,6 +923,22 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if args.reading == Reading::WalkDepth {
+        let Leg::Wait(leg) = args.leg else {
+            eprintln!("cold_path: --walk-depth reads a counter leg or its window");
+            return ExitCode::from(2);
+        };
+        return match waits::walk_depth(leg, args.ops) {
+            Ok(depth) => {
+                println!("walk-depth admit={:.4} remove={:.4}", depth.admit, depth.remove);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("cold_path: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let result = match (args.leg, args.nops) {
         (Leg::Reactor(plane), nops) => drive_reactor_planted(plane, nops, args.ops),
         (Leg::Rate(leg), 0) => rates::drive::<0>(leg, args.ops),
