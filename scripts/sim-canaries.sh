@@ -1109,10 +1109,21 @@ ordered_rows=(
   # The same plant on a peer's credits' worth of remote `always` writes while the owner's
   # fsync is held: no barrier completes, so at every seed the acks are read under the hold.
   "inf_canary_gated_ignores_watermark m0-capacity acked-under-hold --close-leg gated-hold"
+  # The `gated` task is one task of its cell, made at plane start before the cell serves; its
+  # class's one slot is full at assembly (ADR-0177 D2). Planted, plane start makes a second, and
+  # the class refuses it there.
+  "inf_canary_gated_pump_extra m0-smoke gated-tasks-full-at-assembly"
   # The net's own invariant: no chunk of an fd is posted after its end of stream. Its close
   # legs' shared reap posts a closed client's last chunk and its EOF in one reap, data first;
   # planted, the EOF goes first and the chunk after it.
   "inf_canary_net_data_after_eof crate-test inf-sim lib a_shared_reap_posts_the_chunk_before_the_end_of_stream net-data-after-eof"
+  # A cell makes one ns-apply pump per peer at plane start, the class's `N - 1` slots full at
+  # assembly (ADR-0177 D2). Planted, plane start makes one more, and the class refuses it there.
+  "inf_canary_ns_apply_pump_extra m0-smoke ns-apply-tasks-full-at-assembly"
+  # The owner pump is one task of its cell, made at plane start before the cell serves; its
+  # class's one slot is full at assembly (ADR-0177 D2). Planted, plane start makes a second, and
+  # the class refuses it there.
+  "inf_canary_owner_pub_pump_extra m0-smoke owner-pub-tasks-full-at-assembly"
   # The parked-bytes gauge sums the bytes behind the entries in the per-origin deques: a pop
   # subtracts its entry's (ADR-0177 D6). Planted, a pop subtracts nothing, so the peer that
   # parked the small-credit leg's applies reads its gauge above 0 once every reply is in.
@@ -1123,6 +1134,10 @@ ordered_rows=(
   # A per-origin deque holds its origin's credits' worth of ops, so none is refused (ADR-0177
   # D6); the durable driver reads the refusals at each life's end. Planted, a deque holds one.
   "inf_canary_parked_deque_of_one m2-durable PARKED"
+  # A command queued for a connection's parked pump wakes it by id: the pump parks only after it
+  # reads its queue empty with nothing pending (ADR-0177 D2). Planted, PARSE queues the command
+  # and wakes nothing, so a deferred command's client waits for a reply no task makes.
+  "inf_canary_parked_pump_not_woken m0-adversarial STALL --cells 4"
   # A general send keeps one credit free for the publish fan (ADR-0192 D2), so an origin parks
   # at most 7 applies at a peer of 8 credits. Planted, the guard is gone and all 8 arrive.
   "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"

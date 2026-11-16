@@ -129,8 +129,21 @@ pub(super) fn start_peer_pumps<O: PlaneObserver + 'static, F: SegmentFs + Clone 
         let pump_shared = Rc::clone(shared);
         ns_apply.push(permit.spawn_local(move || ns_apply_pump(pump_shared, origin)));
     }
+    // Canary: plane start makes one `ns-apply` pump more than the class's `N - 1` slots.
+    #[cfg(inf_canary_ns_apply_pump_extra)]
+    {
+        let permit = granted(executor.reserve(ns_class)).ok_or(AssemblyFull::new(ns_cap))?;
+        let (pump_shared, own) = (Rc::clone(shared), shared.cell.0);
+        ns_apply.push(permit.spawn_local(move || ns_apply_pump(pump_shared, own)));
+    }
     let owner_pub = start_one(executor, peers.owner_pub, || owner_pub_pump(Rc::clone(shared)))?;
+    // Canary: plane start makes a second `owner-pub` pump.
+    #[cfg(inf_canary_owner_pub_pump_extra)]
+    start_one(executor, peers.owner_pub, || owner_pub_pump(Rc::clone(shared)))?;
     let gated = start_one(executor, peers.gated, || gated_pump(Rc::clone(shared)))?;
+    // Canary: plane start makes a second `gated` pump.
+    #[cfg(inf_canary_gated_pump_extra)]
+    start_one(executor, peers.gated, || gated_pump(Rc::clone(shared)))?;
     Ok(Some(PeerPumps { ns_apply, owner_pub, gated }))
 }
 

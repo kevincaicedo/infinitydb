@@ -706,10 +706,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 // A command queued for a parked pump wakes it; the flag
                 // clears in this step, and the pump reads its queue in the
                 // poll the wake queues.
+                #[cfg(not(inf_canary_parked_pump_not_woken))]
                 if queued && conn.pump_parked {
                     conn.pump_parked = false;
                     wake_pump = Some(conn.pump);
                 }
+                // Canary: the command is queued and its parked pump is never
+                // woken, so the client waits for a reply nothing makes.
+                #[cfg(inf_canary_parked_pump_not_woken)]
+                let _ = (queued, &mut wake_pump);
             }
             cx.pool.release(buf);
             cx.charge(GroupClass::Foreground, commands);
