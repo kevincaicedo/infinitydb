@@ -755,6 +755,13 @@ pub struct ServerPlane<
     /// Reusable FABRIC-IN scratch: replies staged while the fabric is
     /// borrowed by `drain`, sent the moment it ends.
     staged_replies: Vec<(CellId, FabricToken, StagedReply)>,
+    /// A test node's reply order: each drain's replies newest first, so an
+    /// origin's fan reads its legs' replies out of send order; and the
+    /// largest drain so reversed, the hook's engagement.
+    #[cfg(test)]
+    reverse_replies: bool,
+    #[cfg(test)]
+    reversed_batch_max: usize,
     /// Doorbell-wakeup park board (M0-R1): this cell sets `[cell]` in the
     /// park handshake; peers read it at flush. Single-writer per slot — the
     /// same blessed class as the fabric doorbells, NOT shared mutable
@@ -1103,6 +1110,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             parse_stage: Vec::new(),
             parse_stage_bytes: Vec::new(),
             staged_replies: Vec::new(),
+            #[cfg(test)]
+            reverse_replies: false,
+            #[cfg(test)]
+            reversed_batch_max: 0,
             park_flags: None,
             expiry_lag: 0,
             // MAX forces one push on the first MAINTAIN (boot-time config).
@@ -2374,3 +2385,7 @@ mod wire_rig;
 #[cfg(test)]
 #[path = "capacity_tests.rs"]
 mod capacity_tests;
+
+#[cfg(test)]
+#[path = "window_tests.rs"]
+mod window_tests;

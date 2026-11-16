@@ -267,6 +267,18 @@ impl Rig {
         self.cells[cell].frozen = frozen;
     }
 
+    /// While reversed, `cell` answers each fabric drain's operations newest
+    /// first: its peers read their replies out of send order.
+    pub(super) fn reverse_replies(&mut self, cell: usize, reversed: bool) {
+        self.cells[cell].plane.reverse_replies = reversed;
+    }
+
+    /// The most replies one of `cell`'s drains answered newest first since
+    /// the last read.
+    pub(super) fn take_reversed_batch_max(&mut self, cell: usize) -> usize {
+        core::mem::take(&mut self.cells[cell].plane.reversed_batch_max)
+    }
+
     fn deliver(&self, cell: usize, delivery: Delivery) {
         self.cells[cell].reactor.driver().script.borrow_mut().deliver.push(delivery);
     }

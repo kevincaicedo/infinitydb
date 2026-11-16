@@ -1000,6 +1000,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         for _ in 0..orphans {
             fabric.note_orphan_reply();
         }
+        #[cfg(test)]
+        if self.reverse_replies {
+            self.staged_replies.reverse();
+            self.reversed_batch_max = self.reversed_batch_max.max(self.staged_replies.len());
+        }
         let mut had_replies = false;
         for (to, token, reply) in self.staged_replies.drain(..) {
             had_replies = true;
