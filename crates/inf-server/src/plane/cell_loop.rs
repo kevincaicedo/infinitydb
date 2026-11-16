@@ -152,6 +152,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let pump_busy = !conn.pump_parked;
             let now_ms = cx.now.as_millis();
             let Conn { cx: conn_cx, slot, .. } = &mut *conn;
+            // Canary: PARSE releases a `Peer` entry unparsed, flushing or
+            // closing.
+            #[cfg(inf_canary_closing_inbox_released)]
+            if let ConnSlot::Flushing { .. } | ConnSlot::Closing { .. } = slot {
+                return 0;
+            }
+            // Canary: PARSE releases a draining `Peer` entry unparsed.
+            #[cfg(inf_canary_draining_releases_held_entry)]
+            if let ConnSlot::Draining { .. } = slot {
+                return 0;
+            }
             let (parser, out) = match slot {
                 ConnSlot::Active { link, parser, .. }
                 | ConnSlot::Flushing {
@@ -426,9 +437,29 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// parse and are answered; no `Close` is pushed. The slot's pump is
     /// woken, so its empty read runs the run-out.
     fn end_of_stream(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
-        let takes = self.shared.inbox_takes.get();
-        if let Some(pump) = self.shared.with_conn(key, |conn| conn.end_of_stream(takes)).flatten() {
-            let _ = cx.executor.wake(pump);
+        // Canary: the end of stream initiates the close at once, as the
+        // peer's departure: Active → Closing `Peer`.
+        #[cfg(inf_canary_eof_closes_at_once)]
+        return self.peer_gone(cx, key);
+        #[cfg(not(inf_canary_eof_closes_at_once))]
+        {
+            let takes = self.shared.inbox_takes.get();
+            let wake = self.shared.with_conn(key, |conn| conn.end_of_stream(takes)).flatten();
+            // Canary: the end-of-stream arm re-arms the half-closed slot's
+            // receive.
+            #[cfg(inf_canary_rearm_after_eof)]
+            if let Some(Some(fd)) = self.shared.with_conn(key, |conn| match &conn.slot {
+                ConnSlot::Flushing { link, stream: PeerStream::Ended { .. } } => Some(link.fd),
+                ConnSlot::Active { .. }
+                | ConnSlot::Flushing { stream: PeerStream::Open, .. }
+                | ConnSlot::Closing { .. }
+                | ConnSlot::Draining { .. } => None,
+            }) {
+                cx.push(IoOp::RecvArm { fd, token: Self::token(TokenClass::Recv, key) });
+            }
+            if let Some(pump) = wake {
+                let _ = cx.executor.wake(pump);
+            }
         }
     }
 
@@ -439,7 +470,21 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     fn on_closed(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
         let takes = self.shared.inbox_takes.get();
         let moved = self.shared.with_conn(key, |conn| {
-            conn.closed(takes).then(|| (conn.cx.id, conn.take_parked_pump()))
+            let moved = conn.closed(takes);
+            // Canary: `Closed` drops the queue, as a removed slot did.
+            #[cfg(inf_canary_closed_conn_queue_dropped)]
+            if moved {
+                for cmd in conn.queue.drain(..) {
+                    self.shared.recycle_cmd_buf(cmd.into_buf());
+                }
+            }
+            // Canary: the registry removal and the 1→0 capture at `Closed`,
+            // before the drain.
+            #[cfg(inf_canary_registry_dropped_at_closed)]
+            if moved {
+                conn.closed_notes = Some(unsubscribe_closed_conn(&self.shared, key, &mut conn.cx));
+            }
+            moved.then(|| (conn.cx.id, conn.take_parked_pump()))
         });
         let Some(Some((id, pump))) = moved else { return };
         self.shared.node.clients.borrow_mut().unregister(id);
@@ -1013,7 +1058,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         Self::send_out(cx, key, link);
                     }
                     ConnSlot::Flushing { link, .. } => Self::send_out(cx, key, link),
-                    ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => return None,
+                    ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => {
+                        // Canary: a closing slot is sent bytes from a copy of
+                        // its descriptor.
+                        #[cfg(inf_canary_closing_slot_sends)]
+                        if let (ConnSlot::Closing { .. }, Some(fd)) = (&conn.slot, conn.closing_fd)
+                        {
+                            let mut link = Link::new(fd, 0);
+                            RespWriter::new(link.out.open(), Protocol::Resp2).simple("OK");
+                            Self::send_out(cx, key, &mut link);
+                        }
+                        return None;
+                    }
                 }
                 // A flushing slot closes once every reply it owed is sent.
                 conn.flush_end()

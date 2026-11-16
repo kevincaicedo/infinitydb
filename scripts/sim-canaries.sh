@@ -1122,6 +1122,19 @@ ordered_rows=(
   # earlier on a ring without deferred task work.
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_with_receive_posts_no_recv_after_closed recv-after-closed"
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_posts_no_recv_after_closed recv-after-closed"
+  # A close runs the queue to its end (ADR-0123 A2): a draining slot holds it. Planted, Closed
+  # drops the queue, and the reset client's queued SETs never run.
+  "inf_canary_closed_conn_queue_dropped m0-capacity closed-queue-unrun --close-leg close"
+  # A half-closed slot parses the bytes reaped beside its end of stream (ADR-0196 A1.1). Planted,
+  # PARSE releases a flushing or closing Peer entry unparsed, and the SET sent before the FIN
+  # never runs.
+  "inf_canary_closing_inbox_released m0-capacity pre-eof-unrun --close-leg eof-with-data"
+  # A closing slot holds no descriptor, so nothing is sent after its Close (X1). Planted, it keeps
+  # a copy and RESPOND sends to it; the net reads bytes for a closed fd.
+  "inf_canary_closing_slot_sends m0-capacity bytes-after-close --close-leg close"
+  # A client row is inserted only through the plane's admission. Planted, SETNAME and the
+  # state mirror insert, and a command run after Closed puts the closed client back.
+  "inf_canary_command_registers_client m0-capacity ghost-client-row --close-leg registry-reset"
   # The `conn` class's slots are the cell's share (ADR-0177 D2) and its bytes E-store's F7 bill.
   # Planted, it is built over (1 + k) C slots, k from its stride: the idle node's resident
   # memory a cell rises by k x C x s_conn, 2,500 x 3,056 B at 4 cells (k = 1), over F7's
@@ -1132,6 +1145,18 @@ ordered_rows=(
   # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
   # origin holds its slot on a held cold read, and the flat write's open stops the cell.
   "inf_canary_divert_queue_only m0-capacity second-open-slot --close-leg gated-cold"
+  # A Peer parser ends at the run-out once a take of the inbox completed since its stamp
+  # (ADR-0196 D2). Planted, the run-out's test reads false, and the FIN-only client's slot never
+  # closes.
+  "inf_canary_draining_reader_never_ends m0-capacity half-close-unclosed --close-leg stall"
+  # A draining Peer parser parses the entries a stall held past Closed (ADR-0196 D2). Planted,
+  # PARSE releases them, and the reset client's SETs never run.
+  "inf_canary_draining_releases_held_entry m0-capacity pre-eof-unrun --close-leg stall"
+  # The end of stream keeps the parser and answers what was read before it (ADR-0196 A1.1).
+  # Planted, it closes the slot at once, and the half-closed client misses its replies: one row
+  # with the last chunk and the FIN in one reap, one behind a held reply.
+  "inf_canary_eof_closes_at_once m0-capacity half-close-unanswered --close-leg half-close-eof-with-data"
+  "inf_canary_eof_closes_at_once m0-capacity half-close-unanswered --close-leg half-close"
   # An `always` write whose verdict is an error reply leaves at once, not gated (ADR-0177 D6).
   # Planted, the error waits as a verdict for the next record's `seq`, and so for the hold.
   "inf_canary_error_reply_gated m0-capacity error-held --close-leg gated-error"
@@ -1142,6 +1167,9 @@ ordered_rows=(
   # Planted, a Pending first poll leaves its header Idle and unlinked, and the wake it raised is
   # lost.
   "inf_canary_first_poll_wake_dropped crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-wake-lost"
+  # A flushing slot is written no message published after its mark (ADR-0196 D4). Planted, the
+  # delivery writes into it, and a message follows the subscriber's +OK.
+  "inf_canary_flushing_takes_delivery m0-capacity push-after-quit --close-leg quit-subscriber"
   # An `always` apply whose verdict is a reply drops its gated ticket, which releases its slot
   # (ADR-0177 D6), so its origin's next apply opens one. Planted, the drop releases nothing, the
   # error's slot stays at the origin's back, and the next write's open stops the cell.
@@ -1158,9 +1186,18 @@ ordered_rows=(
   # class's one slot is full at assembly (ADR-0177 D2). Planted, plane start makes a second, and
   # the class refuses it there.
   "inf_canary_gated_pump_extra m0-smoke gated-tasks-full-at-assembly"
+  # A subscriber counts as a receiver until the server reads its end of stream (ADR-0196 A1.2).
+  # Planted, the count reads the parser, not the stream, so a half-closed one is counted.
+  "inf_canary_half_closed_counted crate-test inf-server lib half_closed_subscriber_not_counted count-after-eof"
   # A finished task's slot is freed only when no waker names its header (ADR-0177 D2, E's
   # Retired row). Planted, it is freed under a clone, and the stale clone wakes the next task.
   "inf_canary_header_reused_with_wakers crate-test inf-runtime test:waker_threads a_retired_slot_is_never_reused_while_a_waker_names_its_header no stale clone activates the new occupant"
+  # The plane's mark ends the parser at once (QUIT's rule). Planted, it is a side flag beside a
+  # live parser, and the SETs reaped after a QUIT run.
+  "inf_canary_mark_applied_late m0-capacity post-quit-ran --close-leg stall"
+  # The mark of a slot whose receive is disarmed pushes one RecvArm (ADR-0196 A1.3). Planted, it
+  # pushes none.
+  "inf_canary_mark_keeps_disarmed crate-test inf-server lib mark_rearms_a_disarmed_receive no-rearm-at-mark"
   # The net's own invariant: no chunk of an fd is posted after its end of stream. Its close
   # legs' shared reap posts a closed client's last chunk and its EOF in one reap, data first;
   # planted, the EOF goes first and the chunk after it.
@@ -1186,9 +1223,22 @@ ordered_rows=(
   # reads its queue empty with nothing pending (ADR-0177 D2). Planted, PARSE queues the command
   # and wakes nothing, so a deferred command's client waits for a reply no task makes.
   "inf_canary_parked_pump_not_woken m0-adversarial STALL --cells 4"
+  # A QUIT the pump runs empties the queue behind it. Planted, the queue is kept, and the SETs
+  # behind the QUIT run.
+  "inf_canary_quit_keeps_queue m0-capacity post-quit-ran --close-leg deferred-quit"
+  # The end of stream ends the receive (ADR-0196 A1.3). Planted, the end-of-stream arm re-arms
+  # the half-closed slot, and the net refuses an arm after its EOF.
+  "inf_canary_rearm_after_eof m0-capacity recv-armed-after-eof --close-leg half-close"
+  # The registries drop a connection when its queue is empty, so a queued SUBSCRIBE's 0→1
+  # precedes the close's 1→0 in one task. Planted, the removal runs at Closed, before the drain,
+  # and the owner keeps counting the closed client.
+  "inf_canary_registry_dropped_at_closed m0-capacity sub-count-after-close --close-leg subscribe-reset"
   # A general send keeps one credit free for the publish fan (ADR-0192 D2), so an origin parks
   # at most 7 applies at a peer of 8 credits. Planted, the guard is gone and all 8 arrive.
   "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"
+  # The stop's mark ends every parser (ADR-0196 A1.1). Planted, it reaches active slots alone,
+  # and a SET held past the stop runs.
+  "inf_canary_stop_skips_peer_reader crate-test inf-server lib stop_ends_every_reader set-after-stop"
   # A class handle carries its slab's `SlabInstance`, which `reserve` compares first (ADR-0171
   # A2.1). Planted, the compare is skipped, and another executor's class, built alike, is
   # granted.

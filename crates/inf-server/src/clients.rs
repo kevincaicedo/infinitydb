@@ -74,6 +74,13 @@ impl ClientRegistry {
         );
     }
 
+    /// Canary: an inserting update, the one a command's context would need
+    /// to put a closed client back.
+    #[cfg(inf_canary_command_registers_client)]
+    fn ensure(&mut self, id: u64) {
+        self.clients.entry(id).or_default();
+    }
+
     pub fn unregister(&mut self, id: u64) {
         self.clients.remove(&id);
     }
@@ -85,6 +92,8 @@ impl ClientRegistry {
     /// Mirrors the connection's db and subscription counts (F-L15-09);
     /// nothing for an id with no row: an update, never an insert.
     pub fn note_conn_state(&mut self, id: u64, db: u16, sub: u32, psub: u32) {
+        #[cfg(inf_canary_command_registers_client)]
+        self.ensure(id);
         if let Some(c) = self.clients.get_mut(&id) {
             c.db = db;
             c.sub = sub;
@@ -94,6 +103,8 @@ impl ClientRegistry {
 
     /// `CLIENT SETNAME`'s write; nothing for an id with no row.
     pub fn set_name(&mut self, id: u64, name: &[u8]) {
+        #[cfg(inf_canary_command_registers_client)]
+        self.ensure(id);
         if let Some(c) = self.clients.get_mut(&id) {
             c.name = name.to_vec();
         }

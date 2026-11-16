@@ -399,6 +399,18 @@ impl Conn {
     /// its queue empty, becomes `Closing` `Plane`. Returns the descriptor
     /// whose one `Close` goes out.
     pub(super) fn flush_end(&mut self) -> Option<RawFd> {
+        // Canary: the side-flag mark's flush end, on an active slot.
+        #[cfg(inf_canary_mark_applied_late)]
+        if self.late_mark
+            && let ConnSlot::Active { link, .. } = &self.slot
+            && link.out.is_empty()
+            && !link.send_inflight
+            && self.pump_parked
+        {
+            let fd = link.fd;
+            self.slot = ConnSlot::Closing { by: ClosedBy::Plane };
+            return Some(fd);
+        }
         let ConnSlot::Flushing { link, stream } = &self.slot else { return None };
         let no_parser = match stream {
             PeerStream::Open | PeerStream::Ended { by: ClosedBy::Plane } => true,
@@ -434,6 +446,13 @@ impl Conn {
     /// A1.3: an active slot whose receive was not armed), so the marked
     /// slot reaps and releases what follows and reads its end of stream.
     pub(super) fn mark(&mut self) -> bool {
+        // Canary: the mark is a side flag and the slot stays active, so its
+        // parser reads what follows the mark.
+        #[cfg(inf_canary_mark_applied_late)]
+        if let ConnSlot::Active { .. } = self.slot {
+            self.late_mark = true;
+            return false;
+        }
         let (owed, slot) = match self.take_slot() {
             ConnSlot::Active { link, parser: _, recv } => {
                 (recv != RecvArm::Armed, ConnSlot::Flushing { link, stream: PeerStream::Open })
@@ -453,7 +472,9 @@ impl Conn {
             }
         };
         self.slot = slot;
-        owed
+        // Canary: the mark moves a disarmed receive out of `Active` with no
+        // `RecvArm`.
+        owed && !cfg!(inf_canary_mark_keeps_disarmed)
     }
 
     /// A `Peer` run-out at the pump's empty read, `Flushing` or `Draining`
@@ -470,7 +491,8 @@ impl Conn {
             | ConnSlot::Closing { .. } => return None,
         };
         let ClosedBy::Peer { taken_at, .. } = by else { return None };
-        if inbox_takes == *taken_at {
+        // Canary: the run-out's test reads false, so the parser never ends.
+        if inbox_takes == *taken_at || cfg!(inf_canary_draining_reader_never_ends) {
             return Some(RunOut::Wait);
         }
         end_reader(by);

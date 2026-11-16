@@ -123,6 +123,13 @@ fn quiesce<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     }
     // A draining slot's run-out ended its parser above, or it waits.
     if let ConnSlot::Draining { by: ClosedBy::Plane } = conn.slot {
+        // Canary: the deltas captured at `Closed`, and no removal here.
+        #[cfg(inf_canary_registry_dropped_at_closed)]
+        {
+            let _ = key;
+            return Popped::Retire(conn.closed_notes.take().unwrap_or_default());
+        }
+        #[cfg(not(inf_canary_registry_dropped_at_closed))]
         return Popped::Retire(unsubscribe_closed_conn(shared, key, &mut conn.cx));
     }
     conn.pump_parked = true;
@@ -1172,6 +1179,8 @@ pub(super) fn close_after_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone
     key: ConnKey,
 ) {
     shared.with_conn(key, |conn| {
+        // Canary: the pump's `QUIT` keeps the queue behind it.
+        #[cfg(not(inf_canary_quit_keeps_queue))]
         for cmd in conn.queue.drain(..) {
             shared.recycle_cmd_buf(cmd.into_buf());
         }

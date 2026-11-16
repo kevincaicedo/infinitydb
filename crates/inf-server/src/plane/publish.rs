@@ -673,10 +673,22 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 // A flushing slot is written nothing that arrives after its
                 // mark or its end of stream, and counts as a receiver until
                 // the server reads its end of stream (ADR-0196 D4, A1.2).
+                // Canary: the delivery is written into a flushing slot.
+                #[cfg(inf_canary_flushing_takes_delivery)]
+                ConnSlot::Flushing { link, .. } => {
+                    write(link.out.open(), proto);
+                    true
+                }
+                #[cfg(not(inf_canary_flushing_takes_delivery))]
                 ConnSlot::Flushing { stream, .. } => {
                     let node = &shared.node;
                     let dropped = node.flushing_deliveries_dropped.get() + 1;
                     node.flushing_deliveries_dropped.set(dropped);
+                    // Canary: the count reads the parser, not the stream, so
+                    // a flushing `Ended` slot whose parser ended is counted.
+                    #[cfg(inf_canary_half_closed_counted)]
+                    return !matches!(stream, PeerStream::Ended { by: ClosedBy::Peer { .. } });
+                    #[cfg(not(inf_canary_half_closed_counted))]
                     match stream {
                         PeerStream::Open => true,
                         PeerStream::Ended { .. } => false,

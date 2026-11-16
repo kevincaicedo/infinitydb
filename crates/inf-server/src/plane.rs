@@ -347,6 +347,15 @@ pub(super) struct Conn {
     /// own reply. Never advances for unsubscribed publishers.
     publish_seq: u64,
     slot: ConnSlot,
+    /// Canary: a closing slot's descriptor copy, which RESPOND sends to.
+    #[cfg(inf_canary_closing_slot_sends)]
+    closing_fd: Option<RawFd>,
+    /// Canary: the mark as a side flag beside a live parser.
+    #[cfg(inf_canary_mark_applied_late)]
+    late_mark: bool,
+    /// Canary: the 1→0 deltas captured at `Closed`, before the drain.
+    #[cfg(inf_canary_registry_dropped_at_closed)]
+    closed_notes: Option<SubNotes>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -1786,6 +1795,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 parser: ConnParser::new(parser_limits),
                 recv: RecvArm::Armed,
             },
+            #[cfg(inf_canary_closing_slot_sends)]
+            closing_fd: None,
+            #[cfg(inf_canary_mark_applied_late)]
+            late_mark: false,
+            #[cfg(inf_canary_registry_dropped_at_closed)]
+            closed_notes: None,
         });
         let Some(key) = inserted else {
             // Admission bound (batch 12): the slab is full below
@@ -1992,6 +2007,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let ConnSlab { slots, gens, .. } = &mut *conns;
         for (slot, entry) in slots.iter_mut().enumerate() {
             let Some(conn) = entry.as_mut() else { continue };
+            // Canary: the stop's mark reaches active slots alone, so a
+            // `Peer` parser keeps its held bytes past the stop.
+            #[cfg(inf_canary_stop_skips_peer_reader)]
+            if !matches!(conn.slot, ConnSlot::Active { .. }) {
+                continue;
+            }
             if conn.mark() {
                 rearms.push(ConnKey { slot: slot as u32, generation: gens[slot] });
             }
@@ -2146,6 +2167,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// Pushes the `Close` of the descriptor a transition to `Closing` gave.
     fn push_close(&self, cx: &mut LoopCx<'_>, key: ConnKey, fd: Option<RawFd>) {
         if let Some(fd) = fd {
+            // Canary: the closing slot keeps a copy of its descriptor.
+            #[cfg(inf_canary_closing_slot_sends)]
+            self.shared.with_conn(key, |conn| conn.closing_fd = Some(fd));
             cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, key) });
         }
     }

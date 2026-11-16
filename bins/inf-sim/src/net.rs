@@ -1217,12 +1217,21 @@ impl BackendDriver for SimDriver {
                     }
                 }
                 IoOp::Send { fd, buf, len, token } => {
-                    let CellNet { conns, reset_send_errors, .. } = &mut *net;
+                    let CellNet { conns, reset_send_errors, violations, .. } = &mut *net;
                     let result = match conns.get_mut(&fd) {
                         Some(conn) if !conn.server_closed => {
                             take_send(conn, pool, buf, len, reset_send_errors)
                         }
-                        _ => CompletionResult::Error { errno: libc::EPIPE, buf: Some(buf) },
+                        // The server pushed this fd's `Close` before the send:
+                        // a closing slot holds no descriptor to send from, so
+                        // the plane sent bytes it had no socket for.
+                        Some(_) => {
+                            violations.push(format!(
+                                "bytes-after-close: fd {fd} was sent {len} B after its Close"
+                            ));
+                            CompletionResult::Error { errno: libc::EPIPE, buf: Some(buf) }
+                        }
+                        None => CompletionResult::Error { errno: libc::EPIPE, buf: Some(buf) },
                     };
                     out.push(Completion { token, result });
                 }
