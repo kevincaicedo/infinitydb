@@ -236,7 +236,7 @@ const LIST_KEY: Leg = Leg::Wait(WaitLeg::ListWaitWake { key: ListKey::Word });
 const MARK_WAIT_FOR: Leg = Leg::Wait(WaitLeg::MarkWaitFor);
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 175] = [
+const LEGS: [(&str, Leg, u8); 183] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -360,6 +360,14 @@ const LEGS: [(&str, Leg, u8); 175] = [
     ("slab-holder-get-mut-2-plus-one", holder(HolderOp::GetMut, SlabLevels::Two), 1),
     ("slab-holder-cycle-2", holder(HolderOp::Cycle, SlabLevels::Two), 0),
     ("slab-holder-cycle-2-plus-one", holder(HolderOp::Cycle, SlabLevels::Two), 1),
+    ("slab-holder-cycle-named", holder(HolderOp::CycleNamed, SlabLevels::One), 0),
+    ("slab-holder-cycle-named-plus-one", holder(HolderOp::CycleNamed, SlabLevels::One), 1),
+    ("slab-holder-cycle-named-2", holder(HolderOp::CycleNamed, SlabLevels::Two), 0),
+    ("slab-holder-cycle-named-2-plus-one", holder(HolderOp::CycleNamed, SlabLevels::Two), 1),
+    ("slab-holder-word", holder(HolderOp::Word, SlabLevels::One), 0),
+    ("slab-holder-word-plus-one", holder(HolderOp::Word, SlabLevels::One), 1),
+    ("slab-holder-word-2", holder(HolderOp::Word, SlabLevels::Two), 0),
+    ("slab-holder-word-2-plus-one", holder(HolderOp::Word, SlabLevels::Two), 1),
     ("slab-node-get", node(NodeOp::Get), 0),
     ("slab-node-get-plus-one", node(NodeOp::Get), 1),
     ("slab-node-get-mut", node(NodeOp::GetMut), 0),

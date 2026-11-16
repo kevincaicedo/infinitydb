@@ -10,6 +10,12 @@
 //!   reserve, publish and take of its free slot (a holder returns its value
 //!   at its take); and their `-2` twins on 16,448 slots holding 16,447, the
 //!   fewest past one directory level, so every op walks a second level.
+//! - `slab-holder-cycle-named`, `-2`: the holder cycle as the fabric gate
+//!   runs it: a reserve named before its publish (its handle read), the
+//!   publish and the take.
+//! - `slab-holder-word`, `-2`: a reply's resolve, `get_mut_by_word` of the
+//!   first occupant's word at the fabric key's layout (24 index bits, the
+//!   low 23 of the generation).
 //! - `slab-node-get`, `-get-mut`: the same on a slab of 48 B wait nodes,
 //!   256 slots holding 255, one level (a node's cycle ends at the slab's
 //!   in-place release, which its own leg reads once the slab has it).
@@ -82,9 +88,11 @@ use std::task::{Context, Poll, Waker};
 
 use inf_foundation::bounded::{
     Admission, Built, Cap, CapCensus, CapFill, CappedMap, CappedSlab, Lookup, LookupMut, MapBuilt,
-    SlabReserved, SlotId, Taken, WrapWithProof,
+    SlabReserved, SlotId, SlotWord, Taken, WordLookup, WrapWithProof,
 };
-use inf_foundation::limits::{MAP_CHUNK_SLOTS_MAX, directory_levels};
+use inf_foundation::limits::{
+    GATE_KEY_GENERATION_BITS, GATE_KEY_INDEX_BITS, MAP_CHUNK_SLOTS_MAX, directory_levels,
+};
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::{BuildIntHasher, CellId};
 use inf_runtime::heap::{ArrayBuilt, FixedArray, HeapEntry, IndexedHeap};
@@ -111,6 +119,8 @@ pub enum HolderOp {
     Get,
     GetMut,
     Cycle,
+    CycleNamed,
+    Word,
 }
 
 /// The operation a wait node leg drives.
@@ -289,6 +299,29 @@ fn step_holder_get_mut(slab: &mut HolderSlab, id: &SlotId<u32>) -> u64 {
 }
 
 #[inline(never)]
+fn step_holder_cycle_named(slab: &mut HolderSlab, key: u64) -> u64 {
+    let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
+    let named = slot.named();
+    let named_id = named.id();
+    let id = named.publish([key; 7]);
+    match slab.take(id) {
+        Taken::Value(value) => u64::from(value[6] == key && id == named_id),
+        Taken::Stale | Taken::Vacant => panic!("the slot just published"),
+    }
+}
+
+/// The fabric key's adapter (ADR-0177 D4; ADR-0194 D6 with A2).
+type HolderKey = SlotWord<u32, WrapWithProof, GATE_KEY_INDEX_BITS, GATE_KEY_GENERATION_BITS>;
+
+#[inline(never)]
+fn step_holder_word(slab: &mut HolderSlab, adapter: &HolderKey, bits: &u64) -> u64 {
+    match slab.get_mut_by_word(adapter, *bits) {
+        WordLookup::Live(_, value) => value[6] + 1,
+        WordLookup::Stale | WordLookup::Vacant => panic!("a live occupant"),
+    }
+}
+
+#[inline(never)]
 fn step_holder_cycle(slab: &mut HolderSlab, key: u64) -> u64 {
     let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
     let id = slot.publish([key; 7]);
@@ -313,10 +346,21 @@ fn drive_holder<const NOPS: u8>(op: HolderOp, levels: SlabLevels, ops: u64) -> u
     // reference the loop passes one address, and the step reads the handle
     // through a pointer either way.
     let first = &first;
+    // The adapter and the first occupant's word, made before the loop, as the
+    // gate makes its adapter at its build and a reply carries its word.
+    let adapter = HolderKey::for_slab(slab).expect("the holder slab numbers in 24 bits");
+    let bits = &adapter.encode(*first).expect("this slab's handle");
+    let adapter = &adapter;
     let accumulator = match op {
         HolderOp::Get => rate_loop::<NOPS>(ops, MASK_14, |_| step_holder_get(slab, first)),
         HolderOp::GetMut => rate_loop::<NOPS>(ops, MASK_14, |_| step_holder_get_mut(slab, first)),
         HolderOp::Cycle => rate_loop::<NOPS>(ops, MASK_14, |key| step_holder_cycle(slab, key)),
+        HolderOp::CycleNamed => {
+            rate_loop::<NOPS>(ops, MASK_14, |key| step_holder_cycle_named(slab, key))
+        }
+        HolderOp::Word => {
+            rate_loop::<NOPS>(ops, MASK_14, |_| step_holder_word(slab, adapter, bits))
+        }
     };
     // Engagement, after the counted loop: every op reached its slot and the
     // slab holds its occupants alone.
