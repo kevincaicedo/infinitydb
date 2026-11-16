@@ -184,7 +184,10 @@ fn the_stop_waits_for_a_draining_slots_acks() {
     node.reset(0, HALF);
     node.rounds(4);
     assert!(node.closed(0).contains(&HALF), "engagement: the reset's Closed was reaped");
-    assert!(node.cells[0].plane.shared.gate.pending() >= 1, "engagement: a delta is unanswered");
+    assert!(
+        node.cells[0].plane.shared.gate.borrow().holders() >= 1,
+        "engagement: a delta is unanswered"
+    );
     node.cells[0].plane.request_stop();
     node.rounds(4);
     assert_eq!(

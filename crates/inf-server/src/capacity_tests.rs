@@ -54,7 +54,7 @@ fn a_closed_subscriber_leaves_no_task_beside_its_slot() {
     }
     rig.rounds(8);
     assert_eq!(rig.closed(0).len(), SUBSCRIBERS, "engagement: every subscriber's close completed");
-    let held = rig.cells[0].plane.shared.gate.pending();
+    let held = rig.cells[0].plane.shared.gate.borrow().holders();
     assert!(held >= SUBSCRIBERS, "engagement: {held} deltas are unanswered, not {SUBSCRIBERS}");
     let live = rig.cells[0].reactor.executor().live_tasks();
     let occupied = rig.cells[0].plane.connections();
@@ -73,9 +73,6 @@ fn a_closed_subscriber_leaves_no_task_beside_its_slot() {
 /// fan); at HEAD the pump checks its window before the whole command and
 /// then sends a leg for every remote key.
 #[test]
-#[ignore = "a fan checks the connection's window of 32 remote legs once, before the command, \
-            then sends a leg and takes a gate holder per remote key; red until each leg takes \
-            one of the connection's 32 gate units and a sender with none settles its oldest leg"]
 fn a_remote_del_holds_at_most_its_window_of_gate_holders() {
     const KEYS: usize = 100;
     let mut rig = Rig::new(2);
@@ -86,12 +83,13 @@ fn a_remote_del_holds_at_most_its_window_of_gate_holders() {
     argv.extend(keys.iter().map(Vec::as_slice));
     rig.send(0, fd(0), &frame(&argv));
     rig.rounds(4);
-    let held = rig.cells[0].plane.shared.gate.pending();
+    let held = rig.cells[0].plane.shared.gate.borrow().holders();
     assert!(held >= 1, "engagement: the DEL sent no leg to the frozen owner");
+    let window = crate::limits::GATE_UNITS_PER_CONN_TASK as usize;
     assert!(
-        held <= REMOTE_WINDOW,
+        held <= window,
         "the gate holds {held} waiters for one connection's DEL of {KEYS} remote keys, past its \
-         window of {REMOTE_WINDOW}"
+         window of {window}"
     );
     assert!(rig.written(0, fd(0)).is_empty(), "no reply before the owner answers");
 }

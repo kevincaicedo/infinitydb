@@ -24,6 +24,17 @@ impl CountedFold {
         CountedFold { acc, error: refusal }
     }
 
+    /// Adds contributions counted locally.
+    pub(super) fn add(&mut self, local: i64) {
+        self.acc = self.acc.saturating_add(local);
+    }
+
+    /// A leg that could not be sent: it is the reply, over any leg's error.
+    /// Returns the error it replaced, for the caller to recycle.
+    pub(super) fn refuse(&mut self, refusal: OwnedReply) -> Option<OwnedReply> {
+        self.error.replace(refusal)
+    }
+
     /// Fold one leg. Returns a reply the fold did not keep (an error
     /// after the first), for the caller to recycle.
     pub(super) fn leg(&mut self, outcome: OwnedOutcome, proto: Protocol) -> Option<OwnedReply> {
@@ -182,8 +193,10 @@ pub(super) fn run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
 
 /// One program step: execute `argv` on `cell` (locally or via Apply) and
 /// return its reply, the outcome beside the bytes.
+#[allow(clippy::too_many_arguments)] // the program's dispatch context, not an API surface
 async fn run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     origin: ExecOrigin,
     cell: CellId,
     proto: Protocol,
@@ -194,9 +207,9 @@ async fn run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     if cell.0 == shared.cell.0 {
         return run_local(shared, origin, proto, id, db, argv);
     }
-    match send_apply(shared, cell, ApplyOrigin::Program, proto, db, argv).await {
+    match send_apply(shared, units, cell, ApplyOrigin::Program, proto, db, argv).await {
         Ok(waiter) => render_outcome(shared, waiter.await, proto),
-        Err(refusal) => refusal,
+        Err(refused) => refused.into_reply(shared, proto),
     }
 }
 
@@ -305,18 +318,21 @@ pub(super) async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clon
 /// Ship one scatter leg to `to` under `scope` and return the reply
 /// waiter (`Apply` for the numbered database, `ApplyNs` for a named
 /// namespace). `Err` carries the refusal reply.
-pub(super) async fn scatter_send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+pub(super) async fn scatter_send<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     to: CellId,
     proto: Protocol,
     db: u16,
     scope: ScatterScope,
     argv: &[&[u8]],
-) -> Result<GateWait<u64, OwnedOutcome>, OwnedReply> {
+) -> Sent<'u> {
     match scope {
-        ScatterScope::Db => send_apply(shared, to, ApplyOrigin::Client, proto, db, argv).await,
+        ScatterScope::Db => {
+            send_apply(shared, units, to, ApplyOrigin::Client, proto, db, argv).await
+        }
         ScatterScope::Ns(ns) => {
-            send_apply_ns(shared, to, ApplyOrigin::Client, proto, ns, argv).await
+            send_apply_ns(shared, units, to, ApplyOrigin::Client, proto, ns, argv).await
         }
     }
 }
@@ -325,21 +341,18 @@ pub(super) async fn scatter_send<O: PlaneObserver + 'static, F: SegmentFs + Clon
 /// `scope`: the owner executes it and its reply is the client's, staged as
 /// one remote op of the connection's window. The one single-owner send of
 /// both dispatch sites and of a `JSON.MGET` whose keys share an owner.
-pub(super) async fn send_whole<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+pub(super) async fn send_whole<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     owner: CellId,
     proto: Protocol,
     db: u16,
     scope: ScatterScope,
     argv: &[&[u8]],
-    inflight: &mut usize,
-) -> PendingReply {
-    match scatter_send(shared, owner, proto, db, scope, argv).await {
-        Ok(waiter) => {
-            *inflight += 1;
-            PendingReply::Remote { waiter, proto }
-        }
-        Err(refusal) => PendingReply::Done(refusal),
+) -> PendingReply<'u> {
+    match scatter_send(shared, units, owner, proto, db, scope, argv).await {
+        Ok(waiter) => PendingReply::Remote { waiter, proto },
+        Err(refused) => PendingReply::Done(refused.into_reply(shared, proto)),
     }
 }
 
@@ -347,6 +360,7 @@ pub(super) async fn send_whole<O: PlaneObserver + 'static, F: SegmentFs + Clone 
 #[allow(clippy::too_many_arguments)] // internal dispatch funnel
 async fn scatter_run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     origin: ExecOrigin,
     cell: CellId,
     proto: Protocol,
@@ -356,22 +370,24 @@ async fn scatter_run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     argv: &[&[u8]],
 ) -> OwnedReply {
     match scope {
-        ScatterScope::Db => run_on(shared, origin, cell, proto, id, db, argv).await,
+        ScatterScope::Db => run_on(shared, units, origin, cell, proto, id, db, argv).await,
         ScatterScope::Ns(ns) => {
             if cell.0 == shared.cell.0 {
                 return ns_run_local(shared, origin, proto, id, db, ns, argv).await;
             }
-            match send_apply_ns(shared, cell, ApplyOrigin::Program, proto, ns, argv).await {
+            match send_apply_ns(shared, units, cell, ApplyOrigin::Program, proto, ns, argv).await {
                 Ok(waiter) => render_outcome(shared, waiter.await, proto),
-                Err(refusal) => refusal,
+                Err(refused) => refused.into_reply(shared, proto),
             }
         }
     }
 }
 
 /// One typed counted step (EXISTS/DEL shape) on `cell`.
+#[allow(clippy::too_many_arguments)] // the program's dispatch context, not an API surface
 async fn count_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     origin: ExecOrigin,
     cell: CellId,
     proto: Protocol,
@@ -382,7 +398,9 @@ async fn count_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     if cell.0 == shared.cell.0 {
         return Ok(shared.apply_counted(origin, name, key, db));
     }
-    match send_apply(shared, cell, ApplyOrigin::Program, Protocol::Resp2, db, &[name, key]).await {
+    match send_apply(shared, units, cell, ApplyOrigin::Program, Protocol::Resp2, db, &[name, key])
+        .await
+    {
         Ok(waiter) => match waiter.await {
             OwnedOutcome::Int(n) => Ok(n),
             OwnedOutcome::Reply(reply) => {
@@ -393,7 +411,7 @@ async fn count_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 Err(error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED))
             }
         },
-        Err(refusal) => Err(refusal),
+        Err(refused) => Err(refused.into_reply(shared, proto)),
     }
 }
 
@@ -402,6 +420,7 @@ async fn count_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 /// transactions; single-cell MSETNX stays exact.
 pub(super) async fn program_msetnx<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -414,7 +433,7 @@ pub(super) async fn program_msetnx<O: PlaneObserver + 'static, F: SegmentFs + Cl
     let mut i = 1;
     while i < argv.len() {
         let owner = shared.router.cell_of(SlotRouter::slot_of(argv[i]));
-        match count_on(shared, origin, owner, proto, db, b"EXISTS", argv[i]).await {
+        match count_on(shared, units, origin, owner, proto, db, b"EXISTS", argv[i]).await {
             Ok(0) => {}
             Ok(_) => return int_reply(shared, proto, 0),
             Err(error) => return error,
@@ -424,9 +443,17 @@ pub(super) async fn program_msetnx<O: PlaneObserver + 'static, F: SegmentFs + Cl
     let mut i = 1;
     while i < argv.len() {
         let owner = shared.router.cell_of(SlotRouter::slot_of(argv[i]));
-        let reply =
-            run_on(shared, origin, owner, Protocol::Resp2, id, db, &[b"SET", argv[i], argv[i + 1]])
-                .await;
+        let reply = run_on(
+            shared,
+            units,
+            origin,
+            owner,
+            Protocol::Resp2,
+            id,
+            db,
+            &[b"SET", argv[i], argv[i + 1]],
+        )
+        .await;
         if reply.is_error() {
             return reply;
         }
@@ -440,8 +467,10 @@ pub(super) async fn program_msetnx<O: PlaneObserver + 'static, F: SegmentFs + Cl
 /// the source last (ADR-0110). A refused put cannot destroy the source;
 /// failed cleanup may retain a copy. Full cross-cell atomicity belongs to M6.
 #[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column scatter")]
+#[allow(clippy::too_many_arguments)] // the program's dispatch context, not an API surface
 pub(super) async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -455,7 +484,7 @@ pub(super) async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clon
         Ok(options) => options,
         Err(error) => return error_reply(shared, proto, error),
     };
-    let snapshot = match move_read(shared, origin, id, db, source, cmd).await {
+    let snapshot = match move_read(shared, units, origin, id, db, source, cmd).await {
         Ok(snapshot) => snapshot,
         Err(error) => return error,
     };
@@ -470,7 +499,7 @@ pub(super) async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clon
     if cmd == CommandId::Renamenx {
         // Preserve the existing-target no-op even under OOM. SET NX below
         // still owns the condition if another writer arrives after this read.
-        match count_on(shared, origin, target_owner, proto, db, b"EXISTS", target).await {
+        match count_on(shared, units, origin, target_owner, proto, db, b"EXISTS", target).await {
             Ok(0) => {}
             Ok(_) => return int_reply(shared, proto, 0),
             Err(error) => return error,
@@ -479,7 +508,8 @@ pub(super) async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clon
     let mut deadline_buf = [0u8; 20];
     let expiry = (deadline >= 0).then(|| crate::exec::fmt_u64(&mut deadline_buf, deadline as u64));
     let put = move_put_args(cmd, target, &value, expiry, replace);
-    let reply = run_on(shared, origin, target_owner, Protocol::Resp2, id, target_db, &put).await;
+    let reply =
+        run_on(shared, units, origin, target_owner, Protocol::Resp2, id, target_db, &put).await;
     if reply.is_error() {
         return reply;
     }
@@ -496,7 +526,7 @@ pub(super) async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clon
         return int_reply(shared, proto, 1);
     }
     if let Err(error) =
-        move_remove(shared, origin, id, db, source, &value, expiry.unwrap_or(b"-1")).await
+        move_remove(shared, units, origin, id, db, source, &value, expiry.unwrap_or(b"-1")).await
     {
         return error;
     }
@@ -536,6 +566,7 @@ fn move_put_args<'a>(
 /// The non-destructive read leg owns its snapshot before it can suspend again.
 async fn move_read<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     origin: ExecOrigin,
     id: u64,
     db: u16,
@@ -548,7 +579,7 @@ async fn move_read<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     } else {
         &[b"INF.PEEK", source, b"ABS", b"NOSTATS"]
     };
-    let raw = run_on(shared, origin, owner, Protocol::Resp2, id, db, args).await;
+    let raw = run_on(shared, units, origin, owner, Protocol::Resp2, id, db, args).await;
     let snapshot = match raw.success() {
         Ok(view) => parse_take_reply(view),
         Err(ErrorPassthrough) => return Err(raw),
@@ -559,8 +590,10 @@ async fn move_read<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 
 /// Only an exact match at the source authorizes removal after a successful
 /// put. A failure leaves the destination alone: another writer may own it.
+#[allow(clippy::too_many_arguments)] // the program's dispatch context, not an API surface
 async fn move_remove<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     origin: ExecOrigin,
     id: u64,
     db: u16,
@@ -571,6 +604,7 @@ async fn move_remove<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     let source_owner = shared.router.cell_of(SlotRouter::slot_of(source));
     let reply = run_on(
         shared,
+        units,
         origin,
         source_owner,
         Protocol::Resp2,
@@ -627,8 +661,10 @@ fn move_options(cmd: CommandId, argv: &[&[u8]], db: u16) -> Result<(u16, bool), 
 
 /// Scattered KEYS: local sweep + one Apply per peer, arrays merged by
 /// header arithmetic (bodies concatenate untouched).
+#[allow(clippy::too_many_arguments)] // the program's dispatch context, not an API surface
 pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -645,16 +681,23 @@ pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clon
         Err(answer) => return answer,
     };
     let mut total = local.count();
-    let mut waiters = Vec::new();
+    let mut legs = OrderedLegs::new();
     for cell in peer_cells(shared) {
-        match scatter_send(shared, cell, proto, db, scope, argv).await {
-            Ok(waiter) => waiters.push(waiter),
-            Err(refusal) => return refusal,
+        let sent = loop {
+            let sent = scatter_send(shared, units, cell, proto, db, scope, argv).await;
+            if matches!(sent, Err(SendRefused::NoUnit)) && legs.settle_oldest().await {
+                continue;
+            }
+            break sent;
+        };
+        match sent {
+            Ok(waiter) => legs.push(waiter),
+            Err(refused) => return refused.into_reply(shared, proto),
         }
     }
     let mut bodies: Vec<ArrayLeg> = Vec::new();
-    for waiter in waiters {
-        match waiter.await {
+    while let Some(outcome) = legs.next_outcome().await {
+        match outcome {
             OwnedOutcome::Reply(reply) => match read_array_leg(shared, proto, reply) {
                 Ok(leg) => {
                     total += leg.count();
@@ -690,8 +733,10 @@ pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clon
 /// Scattered SCAN: the cursor packs `{cell:16 | per-cell cursor:48}`; one
 /// cell serves each call, the cursor hops to the next cell when a cell's
 /// local scan wraps.
+#[allow(clippy::too_many_arguments)] // the program's dispatch context, not an API surface
 pub(super) async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -710,7 +755,8 @@ pub(super) async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clon
     let local_cursor = crate::exec::fmt_u64(&mut cursor_buf, cursor & SCAN_LOCAL_MASK);
     let mut sub: Vec<&[u8]> = argv.to_vec();
     sub[1] = local_cursor;
-    let raw = scatter_run_on(shared, origin, CellId(target), proto, id, db, scope, &sub).await;
+    let raw =
+        scatter_run_on(shared, units, origin, CellId(target), proto, id, db, scope, &sub).await;
     let leg = match read_scan_leg(shared, proto, raw) {
         Ok(leg) => leg,
         Err(answer) => return answer,
@@ -737,11 +783,13 @@ pub(super) async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clon
 
 /// Scattered RANDOMKEY: two-level random — a random starting cell, then the
 /// first non-empty cell in rotation answers (documented deviation).
+#[allow(clippy::too_many_arguments)] // the program's dispatch context, not an API surface
 pub(super) async fn program_randomkey<
     O: PlaneObserver + 'static,
     F: SegmentFs + Clone + 'static,
 >(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -752,7 +800,7 @@ pub(super) async fn program_randomkey<
     let start = (crate::exec::next_rand(&shared.node) % u64::from(shared.cells)) as u16;
     for i in 0..shared.cells {
         let cell = CellId((start + i) % shared.cells);
-        let raw = scatter_run_on(shared, origin, cell, proto, id, db, scope, argv).await;
+        let raw = scatter_run_on(shared, units, origin, cell, proto, id, db, scope, argv).await;
         if raw.bytes() != b"$-1\r\n" && raw.bytes() != b"_\r\n" {
             return raw;
         }

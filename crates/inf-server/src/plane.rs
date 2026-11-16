@@ -9,8 +9,8 @@
 //! - **Local commands** (every key owned by this cell, or no keys) execute
 //!   synchronously inside PARSE+EXECUTE — the L6 fast path pays nothing.
 //! - **Remote commands** run on a per-connection *pump* future. The pump
-//!   dispatches commands in pipeline order with up to [`REMOTE_WINDOW`]
-//!   remote ops in flight at once (the M0-E8 cross-cell remediation:
+//!   dispatches commands in pipeline order with one remote op in flight per
+//!   unit of its task's gate units at once (the M0-E8 cross-cell remediation:
 //!   one-hop-at-a-time execution was the 85% penalty), then emits replies
 //!   strictly in command order — out-of-order completions park in the
 //!   [`FabricGate`] until their turn. Sends always leave from the single
@@ -56,8 +56,9 @@ use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
 use inf_runtime::{CellExecutor, ExecutorLayout, GroupClass, TaskId, park};
 use inf_runtime::{
-    CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoClass, IoOp,
-    Issue, LoopCx, OwnerPhase, RawFd, TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList,
+    CellPlane, Completion, CompletionResult, CompletionToken, Delivery, FabricAdmission,
+    FabricGate, GateUnits, GateWait, IoClass, IoOp, Issue, LoopCx, OwnerPhase, RawFd, TimerNotice,
+    TimerOutcome, TimerSet, TokenClass, WaitList,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
@@ -103,17 +104,19 @@ use conn::{
 };
 use credit::{FanLegs, FanReserve, PlaneFabric, PointOp, PubFanArgv};
 pub use credit::{MeshConfigRefused, checked_mesh_config};
-use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
+use dispatch::{
+    CountedLegs, Legs, OrderedLegs, PendingReply, close_after_reply, is_scatter, pump,
+    render_outcome,
+};
 use fabric::{
-    GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op,
-    parse_stageable, stage_argv_block, stage_argv_block_argv, stage_or_handle, staged_outcome,
-    wire_reply,
+    StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op, parse_stageable,
+    stage_argv_block, stage_argv_block_argv, stage_or_handle, staged_outcome, wire_reply,
 };
 #[cfg(feature = "doc")]
 pub use json_gather::parse_json_mget_leg;
 use ns_ddl::{
-    SendNow, dispatch_ns, program_ckpt, program_ns_ddl, send_apply, send_apply_ns, send_fan_leg,
-    try_send_apply,
+    SendNow, SendRefused, Sent, dispatch_ns, program_ckpt, program_ns_ddl, send_apply,
+    send_apply_ns, send_fan_leg, try_send_apply,
 };
 use publish::{
     SubNotes, dispatch_pubsub, enforce_output_cap, flush_sub_deltas, handle_pubsub_apply,
@@ -415,7 +418,10 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     store: RefCell<Keyspace>,
     fabric: RefCell<PlaneFabric>,
     conns: RefCell<ConnSlab>,
-    gate: FabricGate<OwnedOutcome>,
+    /// The fabric gate (ADR-0177 D4): it mints every request's key and
+    /// holds its waiter; each send borrows it for one synchronous step, and
+    /// each reply's waiter for its life.
+    gate: RefCell<FabricGate<OwnedOutcome>>,
     credit_waiters: WaitList<CellId>,
     observer: RefCell<O>,
     node: Rc<NodeInfo>,
@@ -604,16 +610,12 @@ const PENDING_HIGH_WATER: usize = 1024;
 const PENDING_LOW_WATER: usize = 64;
 /// Max fabric ops drained per FABRIC-IN step (bounded drain).
 const FABRIC_DRAIN_MAX: usize = 1024;
-/// Remote ops one connection may have in flight at once. Replies that land
-/// out of order park in the `FabricGate` (≤ one value each) until emitted,
-/// so this also bounds parked-reply memory per connection.
-const REMOTE_WINDOW: usize = 32;
 /// Replies (of any kind) awaiting in-order emission per connection; locals
 /// executed eagerly behind a slow remote stage their bytes here.
 const PENDING_REPLIES_MAX: usize = 256;
 /// Reply-pool bounds: buffers kept per cell, and the largest buffer worth
 /// keeping (anything bigger is freed, so one giant value can't pin memory).
-/// Sized to the parked-reply working set — up to `conns × REMOTE_WINDOW`
+/// Sized to the parked-reply working set — up to `conns × GATE_UNITS_PER_CONN_TASK`
 /// `Bytes` gate values hold pool buffers at once on the natural-routing
 /// leg; at 256 the pool exhausted and the overflow paid malloc/free per
 /// reply (M2.5 Phase H allocator lever). Worst-case retention is
@@ -1018,7 +1020,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 store: RefCell::new(store),
                 fabric: RefCell::new(fabric),
                 conns: RefCell::new(ConnSlab::default()),
-                gate: FabricGate::new(),
+                gate: RefCell::new(FabricGate::build(cell.0, crate::limits::gate_units(&caps))),
                 credit_waiters: WaitList::new(),
                 observer: RefCell::new(observer),
                 node,
@@ -2065,7 +2067,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// Outstanding async work: pending fabric replies + credit waiters.
     /// Quiescence (sim) means zero.
     pub fn suspended(&self) -> usize {
-        self.shared.gate.pending() + self.shared.credit_waiters.waiting()
+        self.shared.gate.borrow().holders() + self.shared.credit_waiters.waiting()
     }
 
     /// This cell's fabric counters (the DST's drain-fairness oracle,

@@ -34,8 +34,9 @@ use inf_log::{
     TierIoMode, tier_extract, tier_frame_offset, tier_frame_span,
 };
 use inf_runtime::{
-    BackendDriver, CellExecutor, CompletionResult, CompletionToken, ExecutorLayout, GateWait,
-    IoGate, IoOp, PollImmediate, RawFd, StableBytesMut, TaskAdmission, TaskClass, TokenClass, Wait,
+    BackendDriver, CellExecutor, CompletionResult, CompletionToken, ExecutorLayout, IoGate, IoOp,
+    KeyedAdmission, KeyedWait, PollImmediate, RawFd, StableBytesMut, TaskAdmission, TaskClass,
+    TokenClass, Wait,
 };
 use inf_store::{
     AddrClass, AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId,
@@ -121,7 +122,7 @@ impl Ctx {
     }
 }
 
-type Waiter = GateWait<CompletionToken, CompletionResult>;
+type Waiter = KeyedWait<CompletionToken, CompletionResult>;
 type Answer = Option<(Vec<u8>, u32, bool)>;
 
 enum Planned {
@@ -166,7 +167,10 @@ fn plan(ctx: &Rc<RefCell<Ctx>>, key: &[u8], hash: u64, exclude: &[LogicalAddr]) 
                 buf: stable,
                 token,
             });
-            let waiter = ctx.gate.waiter(token);
+            let KeyedAdmission::Granted(permit) = ctx.gate.reserve(token) else {
+                unreachable!("the steel thread mints each token once, into an unbounded gate");
+            };
+            let waiter = permit.register();
             Planned::Fetch { buf, addr, frame_count, skip, waiter }
         }
     }

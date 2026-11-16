@@ -198,8 +198,9 @@ fn execute_ns_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 #[allow(clippy::too_many_arguments)] // the pump dispatch context
 #[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column ns_program")]
 #[allow(clippy::disallowed_types, reason = "container: A")]
-pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+pub(super) async fn dispatch_ns<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     key: ConnKey,
     origin: ExecOrigin,
     meta: &'static inf_wire::CommandMeta,
@@ -208,8 +209,7 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
     id: u64,
     db: u16,
     ns: NsId,
-    pending: &mut VecDeque<PendingReply>,
-    inflight: &mut usize,
+    pending: &mut VecDeque<PendingReply<'u>>,
 ) -> bool {
     // The registry is authoritative: a dropped namespace answers a typed
     // error before any routing.
@@ -235,7 +235,7 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
             #[cfg(feature = "doc")]
             if meta.id == CommandId::JsonMget {
                 let target = GatherTarget { origin, proto, id, db, scope: ScatterScope::Ns(ns) };
-                pending.push_back(json_gather(shared, target, meta, argv, inflight).await);
+                pending.push_back(json_gather(shared, units, target, meta, argv).await);
                 return true;
             }
             // Every other multi-key command that spans cells is refused in
@@ -249,7 +249,7 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
         }
         if owner.0 != shared.cell.0 {
             let scope = ScatterScope::Ns(ns);
-            pending.push_back(send_whole(shared, owner, proto, db, scope, argv, inflight).await);
+            pending.push_back(send_whole(shared, units, owner, proto, db, scope, argv).await);
             return true;
         }
     }
@@ -269,21 +269,26 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
                 return true;
             }
         };
-        let mut waiters = Vec::new();
-        let mut refusal = None;
+        let mut legs = CountedLegs::new(acc, proto);
         for cell in peer_cells(shared) {
-            match send_apply_ns(shared, cell, ApplyOrigin::Client, proto, ns, &[b"DBSIZE"]).await {
-                Ok(waiter) => {
-                    waiters.push(waiter);
-                    *inflight += 1;
+            let sent = loop {
+                let (leg, origin): ([&[u8]; 1], _) = ([b"DBSIZE"], ApplyOrigin::Client);
+                let sent = send_apply_ns(shared, units, cell, origin, proto, ns, &leg).await;
+                if matches!(sent, Err(SendRefused::NoUnit)) && legs.settle_oldest(shared).await {
+                    continue;
                 }
-                Err(reply) => {
-                    refusal = Some(reply);
+                break sent;
+            };
+            match sent {
+                Ok(waiter) => legs.push(waiter),
+                Err(refused) => {
+                    let reply = refused.into_reply(shared, proto);
+                    legs.refuse(shared, reply);
                     break;
                 }
             }
         }
-        pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal });
+        pending.push_back(PendingReply::Counted(legs));
         return true;
     }
     // Node-wide iteration + the random probe (review of 2026-08-30, C1 /
@@ -299,9 +304,13 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
     {
         let scope = ScatterScope::Ns(ns);
         let reply = match meta.id {
-            CommandId::Keys => program_keys(shared, origin, proto, id, db, scope, argv).await,
-            CommandId::Scan => program_scan(shared, origin, proto, id, db, scope, argv).await,
-            _ => program_randomkey(shared, origin, proto, id, db, scope, argv).await,
+            CommandId::Keys => {
+                program_keys(shared, units, origin, proto, id, db, scope, argv).await
+            }
+            CommandId::Scan => {
+                program_scan(shared, units, origin, proto, id, db, scope, argv).await
+            }
+            _ => program_randomkey(shared, units, origin, proto, id, db, scope, argv).await,
         };
         pending.push_back(PendingReply::Done(reply));
         return true;
@@ -526,6 +535,7 @@ async fn wait_for_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
 /// reads the writer's answer through its own token (ADR-0189 D2).
 pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -554,15 +564,15 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
         shared.ddl_waiters.wait(0).await;
     };
     if argv[1].eq_ignore_ascii_case(b"CREATE") {
-        return program_ns_create(shared, &control, &ticket, proto, argv).await;
+        return program_ns_create(shared, units, &control, &ticket, proto, argv).await;
     }
     if argv[1].eq_ignore_ascii_case(b"SET") {
-        return program_ns_set(shared, &control, proto, argv).await;
+        return program_ns_set(shared, units, &control, proto, argv).await;
     }
     if argv.len() != 3 {
         return error_reply(shared, proto, "ERR wrong number of arguments for 'INF.NS|DROP'");
     }
-    program_ns_drop(shared, &control, proto, argv[2]).await
+    program_ns_drop(shared, units, &control, proto, argv[2]).await
 }
 
 /// The reply of a namespace error.
@@ -620,6 +630,7 @@ fn drop_fan(name: &[u8], receipt: &DropPersisted, mode: NsMode) -> [Vec<u8>; 6] 
 /// export it, so the node stops rather than answer.
 async fn fan_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     proto: Protocol,
     name: &[u8],
     receipt: &DropPersisted,
@@ -628,7 +639,7 @@ async fn fan_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let fan = drop_fan(name, receipt, mode);
     let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();
     for cell in peer_cells(shared) {
-        let mut outcome = fan_leg(shared, proto, cell, &fan_argv).await;
+        let mut outcome = fan_leg(shared, units, proto, cell, &fan_argv).await;
         // Crash-matrix point: the origin reads an applied leg as refused
         // (test builds only).
         if inf_foundation::fault::fire(crate::fault::NS_LEG_READ_REFUSED) {
@@ -794,6 +805,7 @@ async fn await_answer<R: Receipt, O: PlaneObserver + 'static, F: SegmentFs + Clo
 /// the ticket and spent only by the writer's acceptance (ADR-0148 D4).
 async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     control: &Arc<ControlHandle>,
     ticket: &DdlTicket,
     proto: Protocol,
@@ -860,13 +872,13 @@ async fn program_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
         // refusing the ring reservation, or an admission bound lowered on
         // this cell during the wait): `META` names the namespace, so the
         // `CREATE` rolls back before it answers (ADR-0148 D5).
-        rollback_create(shared, control, proto, rollback, notice).await;
+        rollback_create(shared, units, control, proto, rollback, notice).await;
         return refusal;
     }
     let fan = create_fan(&spec);
     let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();
-    if let Some(error) = fan_all_or_first_error(shared, proto, &fan_argv).await {
-        rollback_create(shared, control, proto, rollback, notice).await;
+    if let Some(error) = fan_all_or_first_error(shared, units, proto, &fan_argv).await {
+        rollback_create(shared, units, control, proto, rollback, notice).await;
         return error;
     }
     notice.post(None);
@@ -899,6 +911,7 @@ fn admit_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 /// published before the swap omits it.
 async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     control: &Arc<ControlHandle>,
     proto: Protocol,
     name: &[u8],
@@ -959,7 +972,7 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     if inf_foundation::fault::fire(crate::fault::NS_DROP_AFTER_APPLY) {
         return error_reply(shared, proto, "ERR fault: ns_drop_after_apply");
     }
-    fan_drop(shared, proto, name, &receipt, spec.mode).await;
+    fan_drop(shared, units, proto, name, &receipt, spec.mode).await;
     notice.post(cleanup.stamp_epoch());
     simple_reply(shared, proto, "OK")
 }
@@ -1006,6 +1019,7 @@ struct Rollback<'a> {
 /// D2). Runs under the DDL ticket.
 async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     control: &Arc<ControlHandle>,
     proto: Protocol,
     rollback: Rollback<'_>,
@@ -1026,7 +1040,7 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     if let Err(e) = apply_drop(shared, &receipt) {
         drop_apply_fail_stop(shared, &receipt, &e);
     }
-    fan_drop(shared, proto, name, &receipt, mode).await;
+    fan_drop(shared, units, proto, name, &receipt, mode).await;
     notice.post(cleanup.stamp_epoch());
 }
 
@@ -1037,6 +1051,7 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
 /// every cell's export already carries the new configuration.
 async fn program_ns_set<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     control: &Arc<ControlHandle>,
     proto: Protocol,
     argv: &[&[u8]],
@@ -1067,7 +1082,7 @@ async fn program_ns_set<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     let mut fan = vec![b"INF.NSFAN".to_vec(), b"SET".to_vec(), name];
     fan.extend(fan_tail);
     let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();
-    if let Some(error) = fan_all_or_first_error(shared, proto, &fan_argv).await {
+    if let Some(error) = fan_all_or_first_error(shared, units, proto, &fan_argv).await {
         return error;
     }
     let export = shared.store.borrow().export_catalog(
@@ -1095,12 +1110,13 @@ enum LegOutcome {
 /// time (ADR-0108 D2); a leg that could not be sent is a refused leg.
 async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     proto: Protocol,
     fan: &[&[u8]],
 ) -> Option<OwnedReply> {
     let mut failure: Option<OwnedReply> = None;
     for cell in peer_cells(shared) {
-        match fan_leg(shared, proto, cell, fan).await {
+        match fan_leg(shared, units, proto, cell, fan).await {
             LegOutcome::Applied => {}
             LegOutcome::Refused(reply) if failure.is_none() => failure = Some(reply),
             LegOutcome::Refused(reply) => shared.recycle_reply_buf(reply.into_bytes()),
@@ -1116,13 +1132,14 @@ async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone
 /// every arm renders for a shape its fold cannot take (ADR-0190 D2).
 async fn fan_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
+    units: &GateUnits,
     proto: Protocol,
     cell: CellId,
     fan: &[&[u8]],
 ) -> LegOutcome {
-    let waiter = match send_apply(shared, cell, ApplyOrigin::Program, proto, 0, fan).await {
+    let waiter = match send_apply(shared, units, cell, ApplyOrigin::Program, proto, 0, fan).await {
         Ok(waiter) => waiter,
-        Err(refusal) => return LegOutcome::Refused(refusal),
+        Err(refused) => return LegOutcome::Refused(refused.into_reply(shared, proto)),
     };
     match waiter.await {
         OwnedOutcome::Ok => LegOutcome::Applied,
@@ -1144,84 +1161,170 @@ fn too_many_args_reply(proto: Protocol) -> OwnedReply {
     reply.finish()
 }
 
+/// Why a send left no wait.
+#[derive(Debug)]
+pub(super) enum SendRefused {
+    /// The argv exceeds the codec's argument cap; carries the refusal.
+    Reply(OwnedReply),
+    /// The task has every unit out (ADR-0177 D4): a fan settles its oldest
+    /// leg and sends again. A command's first leg always finds one, since
+    /// a pump dispatches a command only while a unit is free.
+    NoUnit,
+}
+
+impl SendRefused {
+    /// A single leg's refusal, the reply its command answers. `NoUnit` is
+    /// derived never for a single leg: the window gives its unit.
+    pub(super) fn into_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        self,
+        shared: &Shared<O, F>,
+        proto: Protocol,
+    ) -> OwnedReply {
+        match self {
+            SendRefused::Reply(reply) => reply,
+            SendRefused::NoUnit => {
+                debug_assert!(false, "a command's first leg has a unit");
+                error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED)
+            }
+        }
+    }
+}
+
+/// A send's reply waiter, or why there is none.
+pub(super) type Sent<'u> = Result<GateWait<'u, OwnedOutcome>, SendRefused>;
+
+/// What one stage attempt did.
+enum Stage {
+    Sent,
+    /// No credit toward the peer: the permit drops and the send parks.
+    NoCredit,
+    /// The argv exceeds the codec's argument cap.
+    TooWide,
+}
+
+impl From<Result<(), SendError>> for Stage {
+    fn from(sent: Result<(), SendError>) -> Stage {
+        match sent {
+            Ok(()) => Stage::Sent,
+            Err(SendError::NoCredit { .. }) => Stage::NoCredit,
+        }
+    }
+}
+
+/// The one send (ADR-0177 D4): a holder and one of the task's `units`
+/// reserved, the request staged under the key the gate minted, then the
+/// holder registered (`stage` only stages into the outbound pack — the peer
+/// cannot observe the op until FABRIC-OUT publishes it, after this
+/// synchronous step — so no reply precedes the registration). A refused
+/// stage drops the permit, which returns the unit and the holder, and parks
+/// for a returned credit before it reserves again: a parked send holds
+/// nothing of the gate. A full gate (derived never) parks on its room.
+async fn send_op<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
+    to: CellId,
+    proto: Protocol,
+    mut stage: impl FnMut(FabricToken) -> Stage,
+) -> Sent<'u> {
+    loop {
+        let full = {
+            let mut gate = shared.gate.borrow_mut();
+            match gate.reserve(units) {
+                FabricAdmission::Granted(permit) => match stage(FabricToken(permit.key())) {
+                    Stage::Sent => return Ok(permit.register(&shared.gate)),
+                    Stage::NoCredit => false,
+                    Stage::TooWide => return Err(SendRefused::Reply(too_many_args_reply(proto))),
+                },
+                FabricAdmission::NoUnit => return Err(SendRefused::NoUnit),
+                FabricAdmission::Full => true,
+            }
+        };
+        if full {
+            let room = shared.gate.borrow().room();
+            room.await;
+        } else {
+            shared.credit_waiters.wait(to).await;
+        }
+    }
+}
+
 /// Ship `argv` to `to` as an `ApplyNs` (named-namespace op — ADR-0015 D1)
 /// and return the reply waiter. Mirrors [`send_apply`]; never RTT-recorded
-/// (`always` replies are owner-deferred and would mispair the queue).
-pub(super) async fn send_apply_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+/// (`always` replies are owner-deferred and would mispair the queue). A
+/// general send: refused while it would take the publish fan's reserved
+/// credit, it parks for a returned credit as at the window's end.
+#[allow(clippy::too_many_arguments)] // the send funnel's one context
+pub(super) async fn send_apply_ns<
+    'u,
+    O: PlaneObserver + 'static,
+    F: SegmentFs + Clone + 'static,
+>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     to: CellId,
     origin: ApplyOrigin,
     proto: Protocol,
     ns: NsId,
     argv: &[&[u8]],
-) -> Result<GateWait<u64, OwnedOutcome>, OwnedReply> {
+) -> Sent<'u> {
     let program = origin == ApplyOrigin::Program;
     let Some(args) = ApplyArgs::new(argv) else {
-        return Err(too_many_args_reply(proto));
+        return Err(SendRefused::Reply(too_many_args_reply(proto)));
     };
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
-    let (token, waiter) = {
-        let mut fabric = shared.fabric.borrow_mut();
-        let token = fabric.next_token();
-        (token, shared.gate.waiter(token.0))
-    };
-    let op = PointOp::apply_ns(token, slot, cmd_byte(proto, 0), ns.0, args, program);
-    // A general send: refused while it would take the publish fan's
-    // reserved credit, it parks for a returned credit as at the window's end.
-    loop {
-        let sent = shared.fabric.borrow_mut().stage_general(to, &op);
-        match sent {
-            Ok(()) => break,
-            Err(SendError::NoCredit { .. }) => shared.credit_waiters.wait(to).await,
-        }
-    }
-    Ok(waiter)
+    send_op(shared, units, to, proto, |token| {
+        let op = PointOp::apply_ns(token, slot, cmd_byte(proto, 0), ns.0, args.clone(), program);
+        Stage::from(shared.fabric.borrow_mut().stage_general(to, &op))
+    })
+    .await
 }
 
 /// Outcome of a synchronous [`try_send_apply`] first attempt (de-async
 /// fast path, ADR-0030 D4).
-pub(super) enum SendNow {
+pub(super) enum SendNow<'u> {
     /// Staged on the first attempt; the reply waiter is registered.
-    Sent(GateWait<u64, OwnedOutcome>),
+    Sent(GateWait<'u, OwnedOutcome>),
     /// The argv exceeds the codec's argument cap; carries the refusal.
     Refused(OwnedReply),
-    /// No fabric credit on the first attempt — the caller falls back to
-    /// the async path, which waits for credits. The drawn token is
-    /// abandoned: a skipped monotonic value, never registered and never
-    /// sent, so no reply or RTT pairing can ever reference it.
+    /// No fabric credit on the first attempt, or no unit or holder free —
+    /// the caller falls back to the async path, which waits for credits.
+    /// The permit dropped: its key names no holder, and nothing was sent.
     NoCredit,
 }
 
-/// Synchronous first-attempt [`send_apply`]: token draw + stage in one
-/// fabric borrow, waiter registered only after a successful stage (safe
-/// for the same reason as `send_apply`'s post-staging registration — the
-/// peer cannot observe the op until FABRIC-OUT publishes it, after this
-/// synchronous stretch). A general send: refused while it would take the
-/// publish fan's reserved credit, it answers [`SendNow::NoCredit`].
-pub(super) fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+/// Synchronous first-attempt [`send_apply`]: the holder's reservation, its
+/// key and the stage in one step, the waiter registered only after a
+/// successful stage (safe for the same reason as [`send_op`]'s). A general
+/// send: refused while it would take the publish fan's reserved credit, it
+/// answers [`SendNow::NoCredit`].
+#[allow(clippy::too_many_arguments)] // the send funnel's one context
+pub(super) fn try_send_apply<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     to: CellId,
     origin: ApplyOrigin,
     proto: Protocol,
     db: u16,
     argv: &[&[u8]],
-) -> SendNow {
+) -> SendNow<'u> {
     let program = origin == ApplyOrigin::Program;
     let Some(args) = ApplyArgs::new(argv) else {
         return SendNow::Refused(too_many_args_reply(proto));
     };
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
     let cmd = cmd_byte(proto, db);
-    let (token, sent) = {
-        let mut fabric = shared.fabric.borrow_mut();
-        let token = fabric.next_token();
-        let sent = fabric.stage_general(to, &PointOp::apply(token, slot, cmd, args, program));
-        (token, sent)
+    let mut gate = shared.gate.borrow_mut();
+    let permit = match gate.reserve(units) {
+        FabricAdmission::Granted(permit) => permit,
+        FabricAdmission::NoUnit | FabricAdmission::Full => return SendNow::NoCredit,
     };
-    if sent.is_err() {
+    let token = FabricToken(permit.key());
+    let op = PointOp::apply(token, slot, cmd, args, program);
+    if shared.fabric.borrow_mut().stage_general(to, &op).is_err() {
         return SendNow::NoCredit;
     }
-    let waiter = shared.gate.waiter(token.0);
+    let waiter = permit.register(&shared.gate);
+    drop(gate);
     if argv.first().copied() != Some(&b"INF.PUB"[..]) {
         shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
     }
@@ -1234,37 +1337,39 @@ pub(super) fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 
 /// fan's reserved credit, it parks for a returned credit as at the window's
 /// end. The send time is queued for delivery-side RTT recording. `Err`
 /// carries the refusal reply when the argv exceeds the codec's argument
-/// cap.
-pub(super) async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+/// cap, or `NoUnit` when the task has every unit out.
+#[allow(clippy::too_many_arguments)] // the send funnel's one context
+pub(super) async fn send_apply<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     to: CellId,
     origin: ApplyOrigin,
     proto: Protocol,
     db: u16,
     argv: &[&[u8]],
-) -> Result<GateWait<u64, OwnedOutcome>, OwnedReply> {
+) -> Sent<'u> {
     let program = origin == ApplyOrigin::Program;
     let Some(args) = ApplyArgs::new(argv) else {
-        return Err(too_many_args_reply(proto));
+        return Err(SendRefused::Reply(too_many_args_reply(proto)));
     };
     // Routing is the `to` cell; the slot field is advisory (keyless scatter
     // applies carry the empty-key slot).
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
     let cmd = cmd_byte(proto, db);
-    // Token draw + first send attempt share one fabric borrow (M2.5
-    // Phase H).
-    let (token, op, sent) = {
-        let mut fabric = shared.fabric.borrow_mut();
-        let token = fabric.next_token();
-        let op = PointOp::apply(token, slot, cmd, args, program);
-        let sent = fabric.stage_general(to, &op);
-        (token, op, sent)
-    };
+    let mut sent_token = FabricToken(0);
+    let waiter = send_op(shared, units, to, proto, |token| {
+        let op = PointOp::apply(token, slot, cmd, args.clone(), program);
+        sent_token = token;
+        Stage::from(shared.fabric.borrow_mut().stage_general(to, &op))
+    })
+    .await?;
     // RTT pairing relies on in-order replies; `INF.PUB` replies are deferred
     // by the owner pump (fan acks first), so its hops are not RTT samples —
     // the fan legs (`INF.PUBFAN`) cover pub/sub in the histogram instead.
-    let sample_rtt = argv.first().copied() != Some(&b"INF.PUB"[..]);
-    Ok(finish_send(shared, to, token, &op, sent, sample_rtt).await)
+    if argv.first().copied() != Some(&b"INF.PUB"[..]) {
+        shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((sent_token.0, shared.now.get()));
+    }
+    Ok(waiter)
 }
 
 /// Stages one publish fan leg, `INF.PUBFAN channel payload` with the
@@ -1275,59 +1380,37 @@ pub(super) async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone 
 /// general op, the path and wait of any other send; its waiter joins the
 /// fan's all the same. Retrying the leg path is never the fallback: a leg
 /// out of peer order can never stage there. `Err` is the argument cap's
-/// refusal, which a leg's five slices never reach.
-pub(super) async fn send_fan_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
-    legs: &mut FanLegs<'_>,
+/// refusal, which a leg's five slices never reach, or `NoUnit`, which the
+/// owner pump's one unit per peer never reaches.
+#[allow(clippy::too_many_arguments)] // the send funnel's one context
+pub(super) async fn send_fan_leg<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
+    legs: &mut FanLegs<'_, 'u>,
     to: CellId,
     channel: &[u8],
     payload: &[u8],
     tag: Option<(&[u8], &[u8])>,
-) -> Result<(), OwnedReply> {
+) -> Result<(), SendRefused> {
     let fan = PubFanArgv::new(channel, payload, tag);
-    let (token, op, staged) = {
+    let cmd = cmd_byte(Protocol::Resp2, 0);
+    let mut first = true;
+    let mut sent_token = FabricToken(0);
+    let waiter = send_op(shared, units, to, Protocol::Resp2, |token| {
+        let Some(op) = fan.op(token, cmd) else { return Stage::TooWide };
+        sent_token = token;
         let mut fabric = shared.fabric.borrow_mut();
-        let token = fabric.next_token();
-        let Some(op) = fan.op(token, cmd_byte(Protocol::Resp2, 0)) else {
-            return Err(too_many_args_reply(Protocol::Resp2));
-        };
-        let staged = fabric.stage_fan_leg(legs, to, &op);
-        (token, op, staged)
-    };
-    let op = op.into_general();
-    let sent = match staged {
-        Ok(()) => Ok(()),
-        Err(_refused) => shared.fabric.borrow_mut().stage_general(to, &op),
-    };
-    legs.push(finish_send(shared, to, token, &op, sent, true).await);
+        // The fan's own credit on the first attempt; a refused leg, and
+        // every retry, the general path.
+        if core::mem::take(&mut first) && fabric.stage_fan_leg(legs, to, &op).is_ok() {
+            return Stage::Sent;
+        }
+        Stage::from(fabric.stage_general(to, &op.into_general()))
+    })
+    .await?;
+    shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((sent_token.0, shared.now.get()));
+    legs.push(waiter);
     Ok(())
-}
-
-/// What a send shares once its first stage ran: the reply waiter,
-/// registered after the stage (`send` only stages into the outbound pack —
-/// the peer cannot observe the op until FABRIC-OUT publishes it, after this
-/// synchronous stretch — so no reply can precede the registration, and the
-/// gate parks any value arriving before the waiter's first poll
-/// regardless); then, while the general path refuses, a park on the cell's
-/// credit waiters and a retry, woken by each returned credit; then the RTT
-/// sample.
-async fn finish_send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
-    to: CellId,
-    token: FabricToken,
-    op: &PointOp<'_>,
-    mut sent: Result<(), SendError>,
-    sample_rtt: bool,
-) -> GateWait<u64, OwnedOutcome> {
-    let waiter = shared.gate.waiter(token.0);
-    while let Err(SendError::NoCredit { .. }) = sent {
-        shared.credit_waiters.wait(to).await;
-        sent = shared.fabric.borrow_mut().stage_general(to, op);
-    }
-    if sample_rtt {
-        shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
-    }
-    waiter
 }
 
 /// `Apply`'s `cmd` byte: `{db:4 | proto:4}` (ADR-0009) — SELECT travels

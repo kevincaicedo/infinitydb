@@ -8,7 +8,7 @@ use inf_foundation::bounded::{AssemblyFull, Cap, CapError};
 use inf_runtime::{CellExecutor, ExecutorLayout, TaskAdmission, TaskClass, TaskId, TaskPermit};
 
 use super::*;
-use crate::limits::{PeerTaskCaps, PlaneTaskCaps};
+use crate::limits::{GATE_UNITS_PER_CONN_TASK, PeerTaskCaps, PlaneTaskCaps};
 
 /// The six classes' handles and their caps, one field of `Shared`.
 pub(super) struct PlaneTasks {
@@ -120,17 +120,19 @@ fn granted<Fut>(admission: TaskAdmission<'_, Fut>) -> Option<TaskPermit<'_, Fut>
 
 /// Admits a connection and makes its pump in one step (ADR-0123 A1, ADR-0177 D2): the `conn`
 /// permit first, so a full class refuses the accept before anything is installed; then the
-/// slot, whose key the pump serves; the pump's first poll finds no command and parks. `None`
-/// when the class or the slab is full: nothing was installed or made.
+/// task's gate units (ADR-0177 D4), which leave and return with it; then the slot, whose key
+/// the pump serves; the pump's first poll finds no command and parks. `None` when the class,
+/// the gate's units or the slab is full: nothing was installed or made.
 pub(super) fn admit_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     executor: &mut CellExecutor,
     shared: &Rc<Shared<O, F>>,
     conn: impl FnOnce(TaskId) -> Conn,
 ) -> Option<ConnKey> {
     let permit = granted(executor.reserve(shared.tasks.conn.0))?;
+    let units = shared.gate.borrow().units(GATE_UNITS_PER_CONN_TASK)?;
     shared.conns.borrow_mut().insert_with(|key| {
         let pump_shared = Rc::clone(shared);
-        conn(permit.spawn_local(move || pump(pump_shared, key)))
+        conn(permit.spawn_local(move || pump(pump_shared, key, units)))
     })
 }
 
@@ -158,10 +160,20 @@ pub(super) fn start_peer_pumps<O: PlaneObserver + 'static, F: SegmentFs + Clone 
         let (pump_shared, own) = (Rc::clone(shared), shared.cell.0);
         ns_apply.push(permit.spawn_local(move || ns_apply_pump(pump_shared, own)));
     }
-    let owner_pub = start_one(executor, peers.owner_pub, || owner_pub_pump(Rc::clone(shared)))?;
+    // The owner pump's units: one leg toward each peer (ADR-0177 D2).
+    let owner_units = || {
+        let units = shared.gate.borrow().units(u32::from(shared.cells) - 1);
+        units.ok_or(AssemblyFull::new(peers.owner_pub.1))
+    };
+    let units = owner_units()?;
+    let owner_pub =
+        start_one(executor, peers.owner_pub, || owner_pub_pump(Rc::clone(shared), units))?;
     // Canary: plane start makes a second `owner-pub` pump.
     #[cfg(inf_canary_owner_pub_pump_extra)]
-    start_one(executor, peers.owner_pub, || owner_pub_pump(Rc::clone(shared)))?;
+    {
+        let units = owner_units()?;
+        start_one(executor, peers.owner_pub, || owner_pub_pump(Rc::clone(shared), units))?;
+    }
     let gated = start_one(executor, peers.gated, || gated_pump(Rc::clone(shared)))?;
     // Canary: plane start makes a second `gated` pump.
     #[cfg(inf_canary_gated_pump_extra)]

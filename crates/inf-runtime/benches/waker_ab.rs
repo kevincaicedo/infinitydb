@@ -48,7 +48,7 @@
 //!   taskset -c <core> perf stat -e instructions:u,cycles:u,mem_inst_retired.lock_loads:u \
 //!       -x, -- <binary> --variant <leg>-<row> --ops <n>
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::hint::black_box;
 use std::pin::Pin;
@@ -60,8 +60,8 @@ use inf_foundation::CellId;
 use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::wake::{RemoteStack, ThreadMark, WakeBridge};
 use inf_runtime::{
-    CellExecutor, ExecutorLayout, FabricGate, GateWait, PollImmediate, TaskAdmission, TaskClass,
-    TaskFactory,
+    CellExecutor, ExecutorLayout, FabricAdmission, FabricGate, GateUnits, GateWait, PollImmediate,
+    TaskAdmission, TaskClass, TaskFactory,
 };
 
 /// Tasks each leg's executor holds: the rows keep at most one.
@@ -233,7 +233,7 @@ async fn fast_task(counter: Rc<Cell<u64>>) {
 }
 
 /// The suspend row's task: it awaits its gate's value and keeps it.
-async fn suspend_task(waiter: GateWait<u64, u64>, sink: Rc<Cell<u64>>) {
+async fn suspend_task(waiter: GateWait<'static, u64>, sink: Rc<Cell<u64>>) {
     sink.set(waiter.await);
 }
 
@@ -302,22 +302,32 @@ fn step_clone_drop<L: Foreign>(cell: &mut ParkedCell, lane: &mut L) {
 struct SuspendCell {
     exec: CellExecutor,
     class: TaskClass,
-    gate: FabricGate<u64>,
-    token: u64,
+    /// A task's wait borrows its gate and units, so the bench's live for
+    /// the run: the spawned future is `'static`.
+    gate: &'static RefCell<FabricGate<u64>>,
+    units: &'static GateUnits,
+    /// The ops delivered: the value each delivers.
+    delivered: u64,
     sink: Rc<Cell<u64>>,
 }
 
 #[inline(never)]
 fn step_suspend<L: Foreign>(cell: &mut SuspendCell, lane: &mut L) -> usize {
-    cell.token += 1;
-    let token = cell.token;
-    let waiter = cell.gate.waiter(token);
+    let (token, waiter) = {
+        let mut open = cell.gate.borrow_mut();
+        let FabricAdmission::Granted(permit) = open.reserve(cell.units) else {
+            panic!("the row's one wait is done");
+        };
+        let token = permit.key();
+        (token, permit.register(cell.gate))
+    };
     let sink = Rc::clone(&cell.sink);
     let completed =
         first_poll_completed(poll_once(&mut cell.exec, cell.class, || suspend_task(waiter, sink)));
     lane.on_clone();
     black_box(completed);
-    cell.gate.complete(token, token);
+    cell.delivered += 1;
+    FabricGate::complete(cell.gate, token, cell.delivered);
     lane.on_wake();
     let polled = cell.exec.run_ready(1);
     lane.on_drain();
@@ -368,8 +378,11 @@ fn drive_clone_drop<L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
 
 fn drive_suspend<L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
     let (exec, class) = executor_of(&suspend_task);
+    let gate: &'static RefCell<FabricGate<u64>> =
+        Box::leak(Box::new(RefCell::new(FabricGate::build(0, 1))));
+    let units: &'static GateUnits = Box::leak(Box::new(gate.borrow().units(1).expect("a unit")));
     let mut cell =
-        SuspendCell { exec, class, gate: FabricGate::new(), token: 0, sink: Rc::new(Cell::new(0)) };
+        SuspendCell { exec, class, gate, units, delivered: 0, sink: Rc::new(Cell::new(0)) };
     let mut lane = L::new();
     let mut polled = 0u64;
     for _ in 0..ops {
@@ -378,7 +391,7 @@ fn drive_suspend<L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
     expect("suspend polls in run_ready", polled, ops)?;
     expect("suspend value delivered last", cell.sink.get(), ops)?;
     expect("suspend live tasks", usize_count(cell.exec.live_tasks()), 0)?;
-    expect("suspend gate entries", usize_count(cell.gate.pending()), 0)?;
+    expect("suspend gate entries", usize_count(cell.gate.borrow().holders()), 0)?;
     expect("suspend foreign ops", lane.foreign_ops(), ops * 2 * per_op)?;
     expect("suspend delivered", lane.delivered(), ops * per_op)
 }

@@ -55,10 +55,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use inf_foundation::CellId;
+use inf_foundation::limits::{GATE_KEY_GENERATION_BITS, GATE_KEY_INDEX_BITS};
 
 use crate::codec::{Op, Outcome, encode};
 use crate::msg::{FabricMsg, FabricToken};
 use crate::ring::{Consumer, Producer, ring};
+
+/// The largest sequence [`CellFabric::next_token`] mints: every bit below a
+/// gate key's tag, the sequence's top bit (ADR-0177 D4: `tag:1 |
+/// generation:23 | index:24`).
+const HANDOFF_SEQ_MAX: u64 = (1 << (GATE_KEY_INDEX_BITS + GATE_KEY_GENERATION_BITS)) - 1;
+
+const _: () = assert!(
+    HANDOFF_SEQ_MAX.trailing_ones() + 1 == FabricToken::MAX_SEQ.trailing_ones(),
+    "the tag is the sequence's top bit"
+);
 
 /// Mesh tuning. `ring_capacity` is per directed pair and must be a power of
 /// two with reply headroom over `data_credits`: the relation is
@@ -326,17 +337,16 @@ impl CellFabric {
         self.config.data_credits
     }
 
-    /// Mints the next reply-routing token (origin = this cell).
+    /// Mints the next reply-routing token (origin = this cell): the accept
+    /// hand-off's. A fabric gate mints its own keys with the sequence's top
+    /// bit set (ADR-0177 D4), so these stay below it.
     #[inline]
     pub fn next_token(&mut self) -> FabricToken {
         let token = FabricToken::new(self.cell, self.next_seq);
-        // Wrap at the token's 48-bit sequence width (`FabricToken::MAX_SEQ`):
-        // uniqueness is required among in-flight ops only (≤ the ring
-        // capacities), so a wrapped sequence never collides with a live
-        // one. Before batch 12 this counter ran unbounded into
-        // `FabricToken::new`'s assert — a cell-lifetime send count as a
-        // release panic.
-        self.next_seq = (self.next_seq + 1) & FabricToken::MAX_SEQ;
+        // Wrap below the gate key's tag bit: uniqueness is required among
+        // in-flight ops only (≤ the ring capacities), so a wrapped sequence
+        // never collides with a live one, and never reads as a gate key.
+        self.next_seq = (self.next_seq + 1) & HANDOFF_SEQ_MAX;
         token
     }
 
@@ -618,19 +628,18 @@ impl core::fmt::Debug for CellFabric {
 mod token_tests {
     use super::*;
 
-    /// Batch 12 of the 2026-08-30 review: the per-cell sequence wraps at
-    /// 48 bits instead of running into `FabricToken::new`'s assert after
-    /// 2^48 sends (under a year at 10 M/s).
+    /// The per-cell sequence wraps below the gate key's tag bit instead of
+    /// running into `FabricToken::new`'s assert, or into a gate's keys.
     #[test]
-    fn next_token_wraps_at_the_48_bit_width() {
+    fn next_token_wraps_below_the_gate_tag() {
         let mut cells = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 8 });
         let a = &mut cells[0];
-        a.next_seq = FabricToken::MAX_SEQ - 1;
+        a.next_seq = HANDOFF_SEQ_MAX - 1;
         let t1 = a.next_token();
         let t2 = a.next_token();
         let t3 = a.next_token();
-        assert_eq!(t1.seq(), FabricToken::MAX_SEQ - 1);
-        assert_eq!(t2.seq(), FabricToken::MAX_SEQ);
+        assert_eq!(t1.seq(), HANDOFF_SEQ_MAX - 1);
+        assert_eq!(t2.seq(), HANDOFF_SEQ_MAX);
         assert_eq!(t3.seq(), 0, "wrapped, not panicked");
         assert_eq!(t3.origin_cell(), CellId(0));
         assert_ne!(t2, t3);

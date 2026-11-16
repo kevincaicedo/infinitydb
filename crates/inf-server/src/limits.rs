@@ -507,6 +507,29 @@ pub(crate) const fn plane_task_caps(
     Ok(PlaneTaskCaps { conn, peers, compact: COMPACT_TASKS, shadow: SHADOW_TASKS })
 }
 
+/// Live holders one connection task may have on its cell's fabric gate
+/// (ADR-0177 D2, D4): its remote ops in flight. Replies that land out of
+/// order park in their holders until emitted, so this also bounds a
+/// connection's parked replies. Unit: gate units per `conn` task. Owner:
+/// the fabric gate, which issues them with the task at its admission.
+/// Crossing: pace — a pump dispatches a command only while a unit is free,
+/// and a fan with every unit out settles its oldest leg before it sends
+/// the next, so a fan wider than this runs in windows.
+pub const GATE_UNITS_PER_CONN_TASK: u32 = 32;
+
+/// The units a cell's fabric gate issues to its tasks (ADR-0177 D2, D4):
+/// `Σ T_j × W_j`, 32 a `conn` slot and `cells − 1` for the `owner-pub`
+/// pump; the other classes send nothing.
+pub(crate) const fn gate_units(caps: &PlaneTaskCaps) -> u32 {
+    let conn = caps.conn.entries_max() * GATE_UNITS_PER_CONN_TASK;
+    match &caps.peers {
+        None => conn,
+        // The `owner-pub` pump's one unit per peer: the `ns-apply` class's
+        // `cells − 1` slots.
+        Some(peers) => conn + peers.ns_apply.entries_max(),
+    }
+}
+
 /// Verdicts the `gated` task publishes in one poll (ADR-0177 D3). Unit:
 /// replies per poll. Owner: the `gated` task, inside a poll, so charged to
 /// Foreground. Crossing: the task yields and is polled again in ready

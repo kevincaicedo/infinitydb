@@ -1064,7 +1064,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // RESPOND, so the hop RTT overlaps local work instead of
         // following it (the request-path sibling of the M0-R1 "publish
         // replies NOW" finding; remote throughput is window/RTT-bound at
-        // REMOTE_WINDOW, so RTT saved converts directly). One extra
+        // a connection's gate units, so RTT saved converts directly). One extra
         // Release store + doorbell per destination per iteration; step 8
         // stays for late stagers.
         if self.early_fabric_flush {

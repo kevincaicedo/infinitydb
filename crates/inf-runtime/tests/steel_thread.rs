@@ -34,8 +34,8 @@ use inf_log::{
     tier_frame_span,
 };
 use inf_runtime::{
-    BackendDriver, CompletionResult, CompletionToken, GateWait, IoGate, IoOp, PollImmediate, RawFd,
-    StableBytesMut, TokenClass, UringDriver, Wait,
+    BackendDriver, CompletionResult, CompletionToken, IoGate, IoOp, KeyedAdmission, KeyedWait,
+    PollImmediate, RawFd, StableBytesMut, TokenClass, UringDriver, Wait,
 };
 use inf_store::KeyHasher;
 use inf_store::{
@@ -64,7 +64,7 @@ const PAGE: usize = 1 << 12;
 /// exercises the exact second read.
 const POOL_BUF: usize = 16 * TIER_FRAME_BYTES;
 
-type Waiter = GateWait<CompletionToken, CompletionResult>;
+type Waiter = KeyedWait<CompletionToken, CompletionResult>;
 type Answer = Option<(Vec<u8>, u32, bool)>;
 
 struct Ctx {
@@ -151,7 +151,10 @@ fn plan_first_window(
                 buf: stable,
                 token,
             });
-            let waiter = ctx.gate.waiter(token);
+            let KeyedAdmission::Granted(permit) = ctx.gate.reserve(token) else {
+                panic!("the test mints each token once, into an unbounded gate");
+            };
+            let waiter = permit.register();
             Planned::Fetch(WindowPlan { buf, addr, frame_count, skip }, waiter)
         }
     }
@@ -216,7 +219,10 @@ fn resume_first_window(
                 buf: stable,
                 token,
             });
-            let waiter = ctx.gate.waiter(token);
+            let KeyedAdmission::Granted(permit) = ctx.gate.reserve(token) else {
+                panic!("the test mints each token once, into an unbounded gate");
+            };
+            let waiter = permit.register();
             Resumed::Oversized { boxed, waiter, addr, skip, len }
         }
     }

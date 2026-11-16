@@ -103,7 +103,8 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // The drained reply already returned one data credit; wake one
             // sender blocked on that destination.
             shared.credit_waiters.wake_one(from);
-            if !shared.gate.complete(token.0, owned_outcome(shared, outcome)) {
+            let outcome = owned_outcome(shared, outcome);
+            if FabricGate::complete(&shared.gate, token.0, outcome) == Delivery::Orphan {
                 *orphans += 1;
             }
         }
@@ -647,12 +648,6 @@ pub(super) fn flush_apply_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone
     }
     stage.clear();
     stage_bytes.clear();
-}
-
-/// One `MGET` position: rendered locally at dispatch, or one remote `GET`.
-pub(super) enum GatherPart {
-    Done(OwnedReply),
-    Wait(GateWait<u64, OwnedOutcome>),
 }
 
 /// The wire form of a staged reply (ADR-0190 D3): the tag is set from the
