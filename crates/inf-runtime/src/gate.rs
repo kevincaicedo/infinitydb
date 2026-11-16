@@ -777,6 +777,9 @@ impl<K: GateKey, V, C: Cleanup<V>> KeyedGate<K, V, C> {
         Ok(KeyedGate { core: Rc::new(RefCell::new(core)), _key: PhantomData })
     }
 
+    /// A holder slot's bytes, the stride the keyed gate's holders take.
+    pub const HOLDER_SLOT_BYTES: usize = HolderSlab::<V>::SLOT_BYTES;
+
     /// Routes `key` to a free holder, published registered: the permit
     /// holds the gate until it registers, one synchronous step, and a
     /// permit dropped unregistered takes both back. A present route is

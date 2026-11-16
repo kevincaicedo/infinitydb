@@ -3059,6 +3059,16 @@ mod tests {
         }
     }
 
+    /// The cold gate's holder slot: the keyed rows price its slab ops on the
+    /// holder legs' 64 B slot while it stays within 7 words more, 120 B;
+    /// past that its own legs are owed at its stride.
+    #[test]
+    fn the_cold_gates_holder_slot_fits_the_legs_it_is_priced_on() {
+        let slot = KeyedGate::<LogicalId, ColdDone>::HOLDER_SLOT_BYTES;
+        eprintln!("stride cold holder: {slot} B (bound 120 B)");
+        assert!(slot <= 120, "the cold gate's holder slot is {slot} B, above 120 B");
+    }
+
     /// The receipt-facing state a foreign receipt must leave as it was: the
     /// device QD, the ready list's ends and pending counts, the readiness,
     /// each window's phase, cursor, members and link, and each shared
