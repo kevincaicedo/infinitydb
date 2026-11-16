@@ -10,9 +10,12 @@
 //! and depth. `poll_direct` and `poll_direct_padded` poll each future once in a stack slot under
 //! a no-op waker, from the factory its executor legs use: read beside the executor's legs, never
 //! subtracted from them (the padded one pays its stack slot's store and reload, which the
-//! executor's slot does not). The futures, their factories and the fast step are
-//! `support/fast.rs`'s, which `executor_counts.rs` reads by instructions, so the time and the
-//! counts read one future and one step.
+//! executor's slot does not). `padded_2500_after_own_read` is the planted re-lend: the padded fast
+//! op after `class_tasks` of its own class, whose slab borrow forgets the kept lend, so the op
+//! re-lends by `get_mut`; `padded_2500_after_other_read` is its control, the same op after
+//! `class_tasks` of the executor's other class, which keeps the lend. The futures, factories and
+//! fast step are `support/fast.rs`'s; this one binary is timed, counted (`perf stat`, instructions
+//! per near call) and listed (`perf record`), so every reading of a shape reads one loop.
 
 use std::cell::Cell;
 use std::hint::black_box;
@@ -27,8 +30,8 @@ use inf_runtime::{
 mod fast;
 
 use fast::{
-    PADDED_2500, PADDED_10000, TASKS, command_direct, command_task, executor_with, padded_task,
-    poll_direct, ready_once,
+    PADDED_2500, PADDED_10000, TASKS, command_direct, command_task, executor_padded_and_other,
+    executor_with, padded_task, poll_direct, ready_once,
 };
 
 /// An executor of one class, the future `factory` makes, on a census of its own.
@@ -86,6 +89,21 @@ fn bench_fast_path(c: &mut Criterion) {
                 ready_once(&mut ex, class, || padded_task(counter));
             });
         });
+        assert_eq!(ex.live_tasks(), 0);
+    }
+
+    let (mut ex, padded, other) = executor_padded_and_other();
+    for (name, read) in
+        [("padded_2500_after_own_read", padded), ("padded_2500_after_other_read", other)]
+    {
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(ex.class_tasks(read));
+                let counter = Rc::clone(&counter);
+                ready_once(&mut ex, padded, || padded_task(counter));
+            });
+        });
+        assert_eq!(ex.class_tasks(padded), 0);
         assert_eq!(ex.live_tasks(), 0);
     }
 

@@ -1,8 +1,7 @@
-//! The fast path's bench support, one module for `executor.rs` (criterion's time an iteration)
-//! and `executor_counts.rs` (instructions an op by `perf stat`), so the two read one future, one
-//! factory and one step: the bench class's future and the padded one on the same body, their
-//! classes, and the fast op, `reserve` then `permit.poll_immediate` of a future Ready on its first
-//! poll.
+//! The fast path's bench support: the bench class's future and the padded one on the same body,
+//! their factories and classes, and the fast op, `reserve` then `permit.poll_immediate` of a
+//! future Ready on its first poll. One module, so every leg of `executor.rs` that times, counts
+//! and lists a shape reads the same future and the same step.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -37,6 +36,16 @@ pub fn executor_with<Args, Fac: TaskFactory<Args>>(
     let mut layout = ExecutorLayout::new(&census);
     let class = layout.class(factory, cap).expect("one class");
     (layout.build().expect("no class refuses"), class)
+}
+
+/// An executor of the padded class at 2,500 slots and the bench class beside it: the planted
+/// re-lend reads its padded class, its control the other class.
+pub fn executor_padded_and_other() -> (CellExecutor, TaskClass, TaskClass) {
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let padded = layout.class(&padded_task, PADDED_2500).expect("the padded class");
+    let other = layout.class(&command_task, TASKS).expect("the other class");
+    (layout.build().expect("no class refuses"), padded, other)
 }
 
 /// The fast op: one task of `class`, made by `make`, Ready on its first poll.
