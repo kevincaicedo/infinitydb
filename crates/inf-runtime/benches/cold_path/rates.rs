@@ -271,8 +271,8 @@ fn step_slab_cycle(slab: &mut IntentSlab, key: u64) -> u64 {
 }
 
 #[inline(never)]
-fn step_slab_get(slab: &mut IntentSlab, id: SlotId<u32>) -> u64 {
-    match slab.get(id) {
+fn step_slab_get(slab: &mut IntentSlab, id: &SlotId<u32>) -> u64 {
+    match slab.get(*id) {
         Lookup::Live(value) => value[14] + 1,
         Lookup::Stale | Lookup::Vacant => panic!("a live occupant"),
     }
@@ -286,7 +286,7 @@ fn drive_slab<const NOPS: u8>(cycle: bool, ops: u64) -> u64 {
     let accumulator = if cycle {
         rate_loop::<NOPS>(ops, MASK_14, |key| step_slab_cycle(slab, key))
     } else {
-        rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get(slab, first))
+        rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get(slab, &first))
     };
     // Engagement, after the counted loop: every op reached its slot and the
     // slab holds its occupants alone.
@@ -346,16 +346,16 @@ fn step_slab_cycle_retire(slab: &mut RetireSlab, key: u64) -> u64 {
 }
 
 #[inline(never)]
-fn step_slab_get_retire(slab: &mut RetireSlab, id: SlotId<u64>) -> u64 {
-    match slab.get(id) {
+fn step_slab_get_retire(slab: &mut RetireSlab, id: &SlotId<u64>) -> u64 {
+    match slab.get(*id) {
         Lookup::Live(value) => value[14] + 1,
         Lookup::Stale | Lookup::Vacant => panic!("a live occupant"),
     }
 }
 
 #[inline(never)]
-fn step_slab_get_mut(slab: &mut RetireSlab, id: SlotId<u64>) -> u64 {
-    match slab.get_mut(id) {
+fn step_slab_get_mut(slab: &mut RetireSlab, id: &SlotId<u64>) -> u64 {
+    match slab.get_mut(*id) {
         LookupMut::Live(value) => value[14] + 1,
         LookupMut::Stale | LookupMut::Vacant => panic!("a live occupant"),
     }
@@ -371,8 +371,8 @@ fn drive_retire_slab<const NOPS: u8>(op: RetireOp, levels: SlabLevels, ops: u64)
     let (mut slab, first, _census) = retire_slab(cap);
     let slab = black_box(&mut slab);
     let accumulator = match op {
-        RetireOp::Get => rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get_retire(slab, first)),
-        RetireOp::GetMut => rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get_mut(slab, first)),
+        RetireOp::Get => rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get_retire(slab, &first)),
+        RetireOp::GetMut => rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get_mut(slab, &first)),
         RetireOp::Cycle => rate_loop::<NOPS>(ops, MASK_14, |key| step_slab_cycle_retire(slab, key)),
     };
     // Engagement, after the counted loop: every op reached its slot and the
