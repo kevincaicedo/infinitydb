@@ -1241,6 +1241,14 @@ ordered_rows=(
   # arm, where the escaped clone must keep the finished task Retired.
   "inf_canary_header_reused_with_wakers crate-test inf-runtime test:waker_threads a_retired_slot_is_never_reused_while_a_waker_names_its_header no stale clone activates the new occupant"
   "inf_canary_header_reused_with_wakers crate-test inf-runtime test:executor escaped_waker_clone_on_fast_path_is_harmless the escaped clone keeps the finished task Retired"
+  # A keyed wait dropped under its queue's hold keeps its slot until the hold is released
+  # (ADR-0177 D4), so the hold reads that slot and no later occupant. Planted, the drop frees the
+  # slot at once, and the gate holds one slot fewer than the model.
+  "inf_canary_keyed_hold_frees_on_drop crate-test inf-runtime lib the_keyed_gate_holds_what_its_model_holds slots-held"
+  # A dropped keyed wait takes its route and its stored waker in the same step (ADR-0177 D4).
+  # Planted, the drop leaves both: the hold reads it waiting, the routes fill, and a gate of 8
+  # answers full.
+  "inf_canary_keyed_route_kept_on_drop crate-test inf-runtime lib a_dropped_keyed_wait_leaves_no_route route-kept-on-drop"
   # MAINTAIN takes a compaction or shadow read only by spending a slot of its class's room, and
   # counts a namespace the room cannot serve (ADR-0177 D2), which no simulated run reaches: every
   # life's census reads the count 0. Planted, the room reads short at every pass, and the

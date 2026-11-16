@@ -201,7 +201,8 @@ fn full_state(cold: &ColdReads, round: u32, storage: &mut Round) {
             it is built and nothing on its read path allocates"]
 fn no_allocator_call_after_the_cold_host_is_live() {
     let config = ColdReadConfig { qd_cap: DEPTH, overflow_cap: CLASS_QUEUE, ..Default::default() };
-    let cold = ColdReads::with_config(AlignedPool::new(DEPTH, BUFFER_BYTES), config);
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+    let cold = ColdReads::with_config(AlignedPool::new(DEPTH, BUFFER_BYTES), config, &census);
     let width = COHORT + SINGLES;
     let mut storage = Round {
         waits: Vec::with_capacity(width),

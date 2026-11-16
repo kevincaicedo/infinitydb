@@ -209,6 +209,7 @@ fn run_leg(
     let cold = ColdReads::with_config(
         pool,
         ColdReadConfig { qd_cap: QD, merge: false, ..ColdReadConfig::default() },
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
     let file = TierFileId::new(0);
     let mut rng = SplitMix64(seed);

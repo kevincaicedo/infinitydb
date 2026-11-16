@@ -157,7 +157,12 @@ impl Fixture {
         let wakes = Arc::new(WakeCount::default());
         let waker = Waker::from(Arc::clone(&wakes));
         Fixture {
-            cold: ColdReads::with_issuer(pool, config, issuer),
+            cold: ColdReads::with_issuer(
+                pool,
+                config,
+                issuer,
+                &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+            ),
             driver: SimDriver::with_disk(net, disk.clone()),
             disk,
             recv_pool: BufferPool::new(2, 4096),

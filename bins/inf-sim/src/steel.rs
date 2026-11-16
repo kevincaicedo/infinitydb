@@ -168,7 +168,7 @@ fn plan(ctx: &Rc<RefCell<Ctx>>, key: &[u8], hash: u64, exclude: &[LogicalAddr]) 
                 token,
             });
             let KeyedAdmission::Granted(permit) = ctx.gate.reserve(token) else {
-                unreachable!("the steel thread mints each token once, into an unbounded gate");
+                unreachable!("the steel thread mints each token once and reads one at a time");
             };
             let waiter = permit.register();
             Planned::Fetch { buf, addr, frame_count, skip, waiter }
@@ -258,6 +258,13 @@ async fn get_task(ctx: Rc<RefCell<Ctx>>, key: Vec<u8>, sink: Rc<RefCell<Option<A
     let answer = steel_get(ctx, key).await;
     *sink.borrow_mut() = Some(answer);
 }
+
+/// The steel thread's I/O gate: one read is in flight at a time, so its routes and holders never
+/// fill.
+const IO_GATE_HOLDERS: inf_foundation::bounded::Cap = inf_foundation::bounded::Cap::entries::<64>(
+    "io-gate-holders",
+    inf_foundation::bounded::CapFill::Serving,
+);
 
 /// The steel thread's executor of one class, its `GET` task, on a census of its own.
 fn get_executor() -> (CellExecutor, TaskClass) {
@@ -381,7 +388,7 @@ fn run_life(
         ks,
         pool: AlignedPool::new(2, POOL_BUF),
         driver: SimDriver::with_disk(CellNet::new(0, 0xD15C_0000, Plant::None), disk.clone()),
-        gate: IoGate::new(),
+        gate: IoGate::build(IO_GATE_HOLDERS, &census).expect("the steel thread's gate"),
         tiers,
         _tier_handles: handles,
         next_token: 1,

@@ -163,6 +163,7 @@ fn coalesce_leg(
     let cold = ColdReads::with_config(
         pool,
         ColdReadConfig { qd_cap: QD_CAP, merge, ..ColdReadConfig::default() },
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
     let file = TierFileId::new(0);
     let zipf = Zipf::new(records, 0.99);
@@ -373,6 +374,7 @@ pub fn run() {
             let cold = ColdReads::with_config(
                 pool,
                 ColdReadConfig { qd_cap: QD_CAP, ..ColdReadConfig::default() },
+                &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
             );
             let file = TierFileId::new(0);
             let mut flood_rng = SplitMix64(0x5EED_3000 + rep);

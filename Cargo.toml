@@ -169,6 +169,8 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_json_reply_framing_uncharged)',
     'cfg(inf_canary_json_reply_uncharged)',
     'cfg(inf_canary_keepup_truncates)',
+    'cfg(inf_canary_keyed_hold_frees_on_drop)',
+    'cfg(inf_canary_keyed_route_kept_on_drop)',
     'cfg(inf_canary_lastsave_cell_stale)',
     'cfg(inf_canary_lastsave_floor_skipped)',
     'cfg(inf_canary_lazy_participation)',

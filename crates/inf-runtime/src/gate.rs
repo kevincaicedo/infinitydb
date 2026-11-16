@@ -34,8 +34,9 @@ use std::rc::Rc;
 // attributed ~2.2% of natural-leg cycles to `DefaultHasher` (M2.5 Phase H).
 use inf_foundation::BuildIntHasher;
 use inf_foundation::bounded::{
-    Built, Cap, CapCensus, CapError, CappedSlab, LookupMut, NamedReservation, Retiring,
-    SlabBuilder, SlabReserved, SlotId, SlotWord, Taken, WordLookup, WrapWithProof,
+    Admission, Built, Cap, CapCensus, CapError, CappedMap, CappedSlab, Lookup, LookupMut,
+    MapBuilder, MapBuilt, MapRetired, NamedReservation, Retiring, SlabBuilder, SlabReserved,
+    SlotId, SlotWord, Taken, WordLookup, WrapWithProof,
 };
 use inf_foundation::limits::{GATE_KEY_GENERATION_BITS, GATE_KEY_INDEX_BITS};
 
@@ -95,18 +96,6 @@ struct Holder<V> {
 impl<V> Holder<V> {
     const fn registered(held: bool) -> Holder<V> {
         Holder { state: HolderState::Registered, held }
-    }
-}
-
-/// A gate's holders by key word, until its holder slab replaces the map.
-#[allow(clippy::disallowed_types, reason = "container: E")]
-struct HolderMap<V> {
-    map: HashMap<u64, Holder<V>, BuildIntHasher>,
-}
-
-impl<V> Default for HolderMap<V> {
-    fn default() -> Self {
-        HolderMap { map: Default::default() }
     }
 }
 
@@ -574,8 +563,15 @@ impl GateKey for CompletionToken {
     }
 }
 
+/// A keyed gate's routes and holders (ADR-0177 D4): the fabric gate's
+/// holder slab and state enum, in front of which a capped map routes a
+/// key's exact word to its holder's handle. A route exists exactly while
+/// its holder awaits a value: it leaves in the step that delivers or drops.
 struct KeyedCore<V> {
-    holders: HolderMap<V>,
+    routes: CappedMap<u64, SlotId<u32>>,
+    holders: HolderSlab<V>,
+    /// Reserves that found every route or holder taken (`cold_gate_full`).
+    full: u64,
 }
 
 /// A keyed gate's key type and fixed cleanup, which no field holds.
@@ -597,86 +593,166 @@ pub enum KeyedAdmission<'g, K: GateKey, V, C: Cleanup<V> = DropValue> {
     Granted(KeyedPermit<'g, K, V, C>),
     /// A waiter is registered under the key.
     Duplicate,
-    /// Every holder is taken.
+    /// Every route or holder is taken (`cold_gate_full`).
     Full,
 }
 
-impl<K: GateKey, V, C: Cleanup<V>> Default for KeyedGate<K, V, C> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<K: GateKey, V, C: Cleanup<V>> KeyedGate<K, V, C> {
-    pub fn new() -> KeyedGate<K, V, C> {
-        KeyedGate {
-            core: Rc::new(RefCell::new(KeyedCore { holders: HolderMap::default() })),
-            _key: PhantomData,
-        }
+    /// A gate of `cap` routes and holders on `census`: the holder slab and
+    /// the route map share the cap's one row (ADR-0177 D4). Built whole by
+    /// steps; nothing is served until it returns.
+    ///
+    /// # Errors
+    /// `CapError` from either build or the census; a refused route build
+    /// retires the built holders by steps first.
+    pub fn build(cap: Cap, census: &Rc<CapCensus>) -> Result<KeyedGate<K, V, C>, CapError> {
+        let holders = build_holders(CappedSlab::builder(cap, census)?)?;
+        let routes = match CappedMap::builder(cap, census).and_then(build_routes) {
+            Ok(routes) => routes,
+            Err(refused) => {
+                retire_holders(holders);
+                return Err(refused);
+            }
+        };
+        let core = KeyedCore { routes, holders, full: 0 };
+        Ok(KeyedGate { core: Rc::new(RefCell::new(core)), _key: PhantomData })
     }
 
-    /// Reserves `key`'s route and a holder. The permit holds the gate until
-    /// it registers, one synchronous step.
+    /// Routes `key` to a free holder, published registered: the permit
+    /// holds the gate until it registers, one synchronous step, and a
+    /// permit dropped unregistered takes both back. A present route is
+    /// `Duplicate`; no free route or holder is `Full`, counted, and nothing
+    /// is taken.
     pub fn reserve(&self, key: K) -> KeyedAdmission<'_, K, V, C> {
-        let core = self.core.borrow_mut();
-        if core.holders.map.contains_key(&key.word()) {
-            return KeyedAdmission::Duplicate;
-        }
-        KeyedAdmission::Granted(KeyedPermit { gate: self, core, key })
+        let mut core = self.core.borrow_mut();
+        let word = key.word();
+        let KeyedCore { routes, holders, full } = &mut *core;
+        let route = match routes.admit(word) {
+            Admission::Vacant(route) => route,
+            Admission::Occupied(_) => return KeyedAdmission::Duplicate,
+            Admission::Full => {
+                *full += 1;
+                return KeyedAdmission::Full;
+            }
+        };
+        let slot = match holders.reserve() {
+            SlabReserved::Slot(slot) => slot.publish(Holder::registered(false)),
+            // The vacant route drops unpublished: the map is as it was.
+            SlabReserved::Full | SlabReserved::Exhausted => {
+                *full += 1;
+                return KeyedAdmission::Full;
+            }
+        };
+        route.publish(slot);
+        KeyedAdmission::Granted(KeyedPermit { gate: self, core, slot: Some(slot), word })
     }
 
-    /// Delivers `value` to `key`'s waiter, waking it if it is suspended. No
-    /// waiter registered under `key`, or one delivered already, gives
-    /// `value` to the cleanup.
+    /// Delivers `value` to `key`'s waiter, waking it if it is suspended,
+    /// and takes the route in the same step. No route for `key`, a second
+    /// completion among them, gives `value` to the cleanup.
     pub fn complete(&self, key: K, value: V) -> Delivery {
         let mut core = self.core.borrow_mut();
-        let Some(holder) = core.holders.map.get_mut(&key.word()) else {
+        let KeyedCore { routes, holders, .. } = &mut *core;
+        let Some(slot) = routes.remove(key.word()) else {
             drop(core);
             C::orphan(value);
             return Delivery::Orphan;
         };
-        match &holder.state {
-            HolderState::Registered | HolderState::Waiting(_) => {}
-            HolderState::Delivered(_) | HolderState::Orphaned => {
+        let holder = match holders.get_mut(slot) {
+            LookupMut::Live(holder) if awaits(&holder.state) => holder,
+            LookupMut::Live(_) | LookupMut::Stale | LookupMut::Vacant => {
+                debug_assert!(false, "a route names a holder awaiting its value");
                 drop(core);
                 C::orphan(value);
                 return Delivery::Orphan;
             }
-        }
-        match core::mem::replace(&mut holder.state, HolderState::Delivered(value)) {
-            HolderState::Waiting(waker) => {
-                drop(core);
-                waker.wake();
-            }
-            HolderState::Registered | HolderState::Delivered(_) | HolderState::Orphaned => {}
+        };
+        let prior = core::mem::replace(&mut holder.state, HolderState::Delivered(value));
+        drop(core);
+        if let HolderState::Waiting(waker) = prior {
+            waker.wake();
         }
         Delivery::Delivered
     }
 
     /// Whether the wait `hold` pins is still registered or waiting: one read
-    /// of the holder, never another key's.
+    /// of the slot the hold pins, never the route and never another
+    /// occupant.
     pub fn waiting(&self, hold: &GateHold) -> bool {
-        matches!(
-            self.core.borrow().holders.map.get(&hold.word).map(|holder| &holder.state),
-            Some(HolderState::Registered | HolderState::Waiting(_))
-        )
+        match self.core.borrow().holders.get(hold.slot) {
+            Lookup::Live(holder) => awaits(&holder.state),
+            Lookup::Stale | Lookup::Vacant => false,
+        }
     }
 
     /// Releases `hold` when its request leaves the queue: an orphaned holder
     /// frees now, a live one when its wait is done.
     pub fn release(&self, hold: GateHold) {
         let mut core = self.core.borrow_mut();
-        let Some(holder) = core.holders.map.get_mut(&hold.word) else { return };
+        let LookupMut::Live(holder) = core.holders.get_mut(hold.slot) else {
+            debug_assert!(false, "a hold pins its holder");
+            return;
+        };
         debug_assert!(holder.held, "a hold pins its holder");
         holder.held = false;
         if matches!(holder.state, HolderState::Orphaned) {
-            core.holders.map.remove(&hold.word);
+            let _freed = core.holders.take(hold.slot);
         }
     }
 
     /// Holders taken: registered, waiting, delivered or held (tests, gauges).
     pub fn pending(&self) -> usize {
-        self.core.borrow().holders.map.len()
+        self.core.borrow().holders.len() as usize
+    }
+
+    /// Routes present: one for each holder that awaits its value.
+    pub fn routes(&self) -> usize {
+        self.core.borrow().routes.len() as usize
+    }
+
+    /// Reserves that found every route or holder taken (`cold_gate_full`):
+    /// derived never where the cap is its product.
+    pub fn full(&self) -> u64 {
+        self.core.borrow().full
+    }
+}
+
+/// Whether a holder's wait still awaits its value: registered or waiting.
+fn awaits<V>(state: &HolderState<V>) -> bool {
+    match state {
+        HolderState::Registered | HolderState::Waiting(_) => true,
+        HolderState::Delivered(_) | HolderState::Orphaned => false,
+    }
+}
+
+/// Steps a route map's build to its end; a refused build retires its
+/// prefix by steps before it answers.
+fn build_routes(
+    mut builder: MapBuilder<u64, SlotId<u32>>,
+) -> Result<CappedMap<u64, SlotId<u32>>, CapError> {
+    loop {
+        builder = match builder.step() {
+            MapBuilt::More(next) => next,
+            MapBuilt::Live(routes) => return Ok(routes),
+            MapBuilt::Refused(mut retiring, refused) => loop {
+                retiring = match retiring.step() {
+                    MapRetired::More(next) => next,
+                    MapRetired::Done => return Err(refused),
+                };
+            },
+        };
+    }
+}
+
+/// Retires a built holder slab by steps: a refused gate build frees what it
+/// built without a whole drop.
+fn retire_holders<V>(holders: HolderSlab<V>) {
+    let mut retiring = holders.retire();
+    loop {
+        retiring = match retiring.step() {
+            Retiring::More(next) => next,
+            Retiring::Done => return,
+        };
     }
 }
 
@@ -693,47 +769,80 @@ impl<K: GateKey, V, C: Cleanup<V>> core::fmt::Debug for KeyedGate<K, V, C> {
     }
 }
 
-/// A reserved route and holder for one key, holding the gate until it
-/// registers: it cannot cross an `await` (ADR-0144 A2's list).
+/// A route and holder for one key, published registered, holding the gate
+/// until it registers: it cannot cross an `await` (ADR-0144 A2's list).
 pub struct KeyedPermit<'g, K: GateKey, V, C: Cleanup<V> = DropValue> {
     gate: &'g KeyedGate<K, V, C>,
     core: RefMut<'g, KeyedCore<V>>,
-    key: K,
+    /// The holder's handle until the permit registers or drops.
+    slot: Option<SlotId<u32>>,
+    word: u64,
 }
 
 impl<K: GateKey, V, C: Cleanup<V>> KeyedPermit<'_, K, V, C> {
-    /// Publishes the route and its holder: the key is routable.
+    /// The wait on the route and holder `reserve` published: the key is
+    /// routable from here.
     pub fn register(mut self) -> KeyedWait<K, V, C> {
-        let word = self.key.word();
-        self.core.holders.map.insert(word, Holder::registered(false));
-        KeyedWait { core: Rc::clone(&self.gate.core), word, done: false, _key: PhantomData }
+        let Some(slot) = self.slot.take() else {
+            unreachable!("a keyed permit registers once, consuming itself")
+        };
+        KeyedWait {
+            core: Rc::clone(&self.gate.core),
+            slot,
+            word: self.word,
+            done: false,
+            _key: PhantomData,
+        }
     }
 
     /// [`register`](Self::register) for a request its producer queues before
     /// issuing: the [`GateHold`] is a second claim on the holder, kept with
     /// the queued request and given back by [`KeyedGate::release`].
     pub fn register_held(mut self) -> (KeyedWait<K, V, C>, GateHold) {
-        let word = self.key.word();
-        self.core.holders.map.insert(word, Holder::registered(true));
-        let wait =
-            KeyedWait { core: Rc::clone(&self.gate.core), word, done: false, _key: PhantomData };
-        (wait, GateHold { word })
+        let Some(slot) = self.slot.take() else {
+            unreachable!("a keyed permit registers once, consuming itself")
+        };
+        if let LookupMut::Live(holder) = self.core.holders.get_mut(slot) {
+            holder.held = true;
+        }
+        let wait = KeyedWait {
+            core: Rc::clone(&self.gate.core),
+            slot,
+            word: self.word,
+            done: false,
+            _key: PhantomData,
+        };
+        (wait, GateHold { slot })
+    }
+}
+
+impl<K: GateKey, V, C: Cleanup<V>> Drop for KeyedPermit<'_, K, V, C> {
+    fn drop(&mut self) {
+        // Never registered: the route and the holder `reserve` published
+        // return, and nothing awaited them.
+        if let Some(slot) = self.slot.take() {
+            let KeyedCore { routes, holders, .. } = &mut *self.core;
+            let _route = routes.remove(self.word);
+            let _freed = holders.take(slot);
+        }
     }
 }
 
 /// A queue's claim on a keyed holder (ADR-0177 D4): move-only, consumed by
-/// [`KeyedGate::release`]. While it is out the holder stays, so
-/// [`KeyedGate::waiting`] reads that holder and no other.
+/// [`KeyedGate::release`]. While it is out the holder's slot stays, so
+/// [`KeyedGate::waiting`] reads that slot and no later occupant.
 #[must_use = "a hold is released when its request leaves the queue"]
 #[derive(Debug)]
 pub struct GateHold {
-    word: u64,
+    slot: SlotId<u32>,
 }
 
 /// Future returned by a keyed registration. Dropped before its value, the
 /// route returns at once and the holder with it, or at its hold's release.
 pub struct KeyedWait<K: GateKey, V, C: Cleanup<V> = DropValue> {
     core: Rc<RefCell<KeyedCore<V>>>,
+    slot: SlotId<u32>,
+    /// The route's key, which the wait's drop takes while it awaits.
     word: u64,
     done: bool,
     _key: KeyedMarker<K, V, C>,
@@ -748,7 +857,9 @@ impl<K: GateKey, V, C: Cleanup<V>> Future for KeyedWait<K, V, C> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<V> {
         let this = Pin::into_inner(self);
         let mut core = this.core.borrow_mut();
-        let Some(holder) = core.holders.map.get_mut(&this.word) else { polled_after_completion() };
+        let LookupMut::Live(holder) = core.holders.get_mut(this.slot) else {
+            polled_after_completion()
+        };
         match &holder.state {
             HolderState::Delivered(_) => {}
             HolderState::Registered | HolderState::Waiting(_) => {
@@ -757,16 +868,17 @@ impl<K: GateKey, V, C: Cleanup<V>> Future for KeyedWait<K, V, C> {
             }
             HolderState::Orphaned => polled_after_completion(),
         }
-        let value = if holder.held {
-            // The hold keeps the holder until its release; the route leaves.
+        let state = if holder.held {
+            // The hold keeps the slot until its release; the route left at
+            // the delivery.
             core::mem::replace(&mut holder.state, HolderState::Orphaned)
         } else {
-            let Some(Holder { state, .. }) = core.holders.map.remove(&this.word) else {
+            let Taken::Value(Holder { state, .. }) = core.holders.take(this.slot) else {
                 polled_after_completion()
             };
             state
         };
-        let HolderState::Delivered(value) = value else { polled_after_completion() };
+        let HolderState::Delivered(value) = state else { polled_after_completion() };
         this.done = true;
         Poll::Ready(value)
     }
@@ -774,16 +886,26 @@ impl<K: GateKey, V, C: Cleanup<V>> Future for KeyedWait<K, V, C> {
 
 impl<K: GateKey, V, C: Cleanup<V>> Drop for KeyedWait<K, V, C> {
     fn drop(&mut self) {
-        if self.done {
+        // Canary: a dropped wait leaves its route, and its holder with the
+        // waker, so `waiting` answers yes for it and the routes fill.
+        if self.done || cfg!(inf_canary_keyed_route_kept_on_drop) {
             return;
         }
         let mut core = self.core.borrow_mut();
-        let Some(holder) = core.holders.map.get_mut(&self.word) else { return };
+        let KeyedCore { routes, holders, .. } = &mut *core;
+        let LookupMut::Live(holder) = holders.get_mut(self.slot) else { return };
         let prior = core::mem::replace(&mut holder.state, HolderState::Orphaned);
-        if !holder.held {
-            core.holders.map.remove(&self.word);
+        // Canary: a held wait frees its slot at the drop, before its hold's
+        // release, so the hold can read the slot's next occupant.
+        let held = holder.held && !cfg!(inf_canary_keyed_hold_frees_on_drop);
+        if awaits(&prior) {
+            let _route = routes.remove(self.word);
+        }
+        if !held {
+            let _freed = holders.take(self.slot);
         }
         drop(core);
+        // The waker and a delivered value drop outside the gate's borrow.
         match prior {
             HolderState::Delivered(value) => C::orphan(value),
             HolderState::Registered | HolderState::Waiting(_) | HolderState::Orphaned => {}
@@ -1135,6 +1257,214 @@ impl Drop for WatermarkWait {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use inf_foundation::bounded::CapFill;
+    use inf_foundation::rng::Entropy;
+
+    /// A keyed gate of `cap` on a census of its own.
+    fn keyed_gate<V>(cap: Cap) -> KeyedGate<u64, V> {
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(0));
+        KeyedGate::build(cap, &census).expect("the test gate")
+    }
+
+    /// 1,000 keyed waits, each polled once, so its waker is stored, then
+    /// dropped before any value. A dropped wait takes its route in the same
+    /// step (ADR-0177 D4), so the hold reads no wait, the gate keeps no route
+    /// and a gate of 8 never fills. Planted, the drop leaves the route and
+    /// the holder with its waker (KE12).
+    #[test]
+    fn a_dropped_keyed_wait_leaves_no_route() {
+        const WAITS: u64 = 1_000;
+        let gate: KeyedGate<u64, u64> =
+            keyed_gate(Cap::entries::<1_024>("test-keyed-holders", CapFill::Serving));
+        let mut cx = Context::from_waker(Waker::noop());
+        for key in 0..WAITS {
+            let KeyedAdmission::Granted(permit) = gate.reserve(key) else {
+                panic!("route-kept-on-drop: key {key} found no room after {key} dropped waits");
+            };
+            let (mut wait, hold) = permit.register_held();
+            assert!(Pin::new(&mut wait).poll(&mut cx).is_pending(), "engagement: the waker stored");
+            drop(wait);
+            assert!(!gate.waiting(&hold), "route-kept-on-drop: key {key}'s dropped wait waits");
+            gate.release(hold);
+        }
+        assert_eq!(gate.routes(), 0, "route-kept-on-drop: routes after {WAITS} dropped waits");
+        assert_eq!(gate.pending(), 0, "route-kept-on-drop: holders after {WAITS} dropped waits");
+        let small: KeyedGate<u64, u64> =
+            keyed_gate(Cap::entries::<8>("test-keyed-holders", CapFill::Serving));
+        for key in 0..WAITS {
+            if let KeyedAdmission::Granted(permit) = small.reserve(key) {
+                let mut wait = permit.register();
+                assert!(Pin::new(&mut wait).poll(&mut cx).is_pending(), "engagement: stored");
+            }
+        }
+        assert_eq!(small.full(), 0, "route-kept-on-drop: cold_gate_full at a cap of 8");
+    }
+
+    /// A model holder: what its wait awaits, whether a hold pins it.
+    #[derive(Debug)]
+    struct ModelHolder {
+        state: ModelState,
+        held: bool,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ModelState {
+        Awaiting,
+        Delivered(u64),
+        Orphaned,
+    }
+
+    /// The keyed gate's table (ADR-0149 D4 with ADR-0177 D4's hold) as a
+    /// model of its own: holders by id, routes by key, no code shared.
+    #[derive(Default)]
+    struct Model {
+        holders: BTreeMap<u32, ModelHolder>,
+        routes: BTreeMap<u64, u32>,
+        next: u32,
+        full: u64,
+    }
+
+    impl Model {
+        fn free(&mut self, id: u32) {
+            self.holders.remove(&id);
+        }
+
+        /// A wait leaves: its route if it awaits, its holder unless held.
+        fn drop_wait(&mut self, id: u32, key: u64) {
+            let Some(holder) = self.holders.get_mut(&id) else { return };
+            if holder.state == ModelState::Awaiting {
+                self.routes.remove(&key);
+            }
+            holder.state = ModelState::Orphaned;
+            if !holder.held {
+                self.free(id);
+            }
+        }
+    }
+
+    /// Seeded operations on a keyed gate of 8 over 12 keys, against
+    /// [`Model`]: every answer, and after every step the holders and routes
+    /// held, equal the model's. A wait dropped under its hold keeps its
+    /// slot until the release (ADR-0177 D4). Planted, that drop frees the
+    /// slot, so the gate holds one slot fewer than the model, and the old
+    /// hold could read the slot's next occupant (KE13).
+    #[test]
+    fn the_keyed_gate_holds_what_its_model_holds() {
+        const CAP: usize = 8;
+        const KEYS: u64 = 12;
+        let gate: KeyedGate<u64, u64> =
+            keyed_gate(Cap::entries::<{ CAP as u32 }>("test-keyed-holders", CapFill::Serving));
+        let mut model = Model::default();
+        let mut waits: Vec<(KeyedWait<u64, u64>, u32, u64)> = Vec::new();
+        let mut holds: Vec<(GateHold, u32)> = Vec::new();
+        let mut rng = inf_foundation::rng::SplitMix64::new(0x6B65_7965_6400_0013);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut held_drops = 0u32;
+        for step in 0..20_000u32 {
+            let pick = |rng: &mut inf_foundation::rng::SplitMix64, n: usize| {
+                usize::try_from(rng.next_u64() % n as u64).expect("a small index")
+            };
+            match rng.next_u64() % 6 {
+                0 => {
+                    let key = rng.next_u64() % KEYS;
+                    let held = rng.next_u64() & 1 == 1;
+                    let expected = if model.routes.contains_key(&key) {
+                        "duplicate"
+                    } else if model.holders.len() == CAP {
+                        model.full += 1;
+                        "full"
+                    } else {
+                        "granted"
+                    };
+                    match gate.reserve(key) {
+                        KeyedAdmission::Granted(permit) => {
+                            assert_eq!(expected, "granted", "step {step}: key {key} granted");
+                            let id = model.next;
+                            model.next += 1;
+                            model
+                                .holders
+                                .insert(id, ModelHolder { state: ModelState::Awaiting, held });
+                            model.routes.insert(key, id);
+                            if held {
+                                let (wait, hold) = permit.register_held();
+                                waits.push((wait, id, key));
+                                holds.push((hold, id));
+                            } else {
+                                waits.push((permit.register(), id, key));
+                            }
+                        }
+                        KeyedAdmission::Duplicate => {
+                            assert_eq!(expected, "duplicate", "step {step}: key {key} a duplicate");
+                        }
+                        KeyedAdmission::Full => {
+                            assert_eq!(expected, "full", "step {step}: key {key} full");
+                        }
+                    }
+                }
+                1 => {
+                    let key = rng.next_u64() % KEYS;
+                    let value = rng.next_u64();
+                    let expected = match model.routes.remove(&key) {
+                        Some(id) => {
+                            let holder = model.holders.get_mut(&id).expect("a route's holder");
+                            holder.state = ModelState::Delivered(value);
+                            Delivery::Delivered
+                        }
+                        None => Delivery::Orphan,
+                    };
+                    assert_eq!(gate.complete(key, value), expected, "step {step}: key {key}");
+                }
+                2 if !waits.is_empty() => {
+                    let at = pick(&mut rng, waits.len());
+                    let id = waits[at].1;
+                    let polled = Pin::new(&mut waits[at].0).poll(&mut cx);
+                    let holder = model.holders.get_mut(&id).expect("a live wait's holder");
+                    match core::mem::replace(&mut holder.state, ModelState::Orphaned) {
+                        ModelState::Delivered(value) => {
+                            assert_eq!(polled, Poll::Ready(value), "step {step}: delivered");
+                            if !holder.held {
+                                model.free(id);
+                            }
+                            drop(waits.swap_remove(at));
+                        }
+                        state => {
+                            assert_eq!(polled, Poll::Pending, "step {step}: {state:?}");
+                            holder.state = state;
+                        }
+                    }
+                }
+                3 if !waits.is_empty() => {
+                    let at = pick(&mut rng, waits.len());
+                    let (wait, id, key) = waits.swap_remove(at);
+                    if model.holders.get(&id).is_some_and(|holder| holder.held) {
+                        held_drops += 1;
+                    }
+                    drop(wait);
+                    model.drop_wait(id, key);
+                }
+                4 if !holds.is_empty() => {
+                    let (hold, id) = holds.swap_remove(pick(&mut rng, holds.len()));
+                    gate.release(hold);
+                    let holder = model.holders.get_mut(&id).expect("a hold's holder");
+                    holder.held = false;
+                    if holder.state == ModelState::Orphaned {
+                        model.free(id);
+                    }
+                }
+                5 if !holds.is_empty() => {
+                    let (hold, id) = &holds[pick(&mut rng, holds.len())];
+                    let awaits = model.holders[id].state == ModelState::Awaiting;
+                    assert_eq!(gate.waiting(hold), awaits, "step {step}: holder {id} waiting");
+                }
+                _ => {}
+            }
+            assert_eq!(gate.pending(), model.holders.len(), "slots-held: step {step}");
+            assert_eq!(gate.routes(), model.routes.len(), "routes-held: step {step}");
+            assert_eq!(gate.full(), model.full, "full-counted: step {step}");
+        }
+        assert!(held_drops > 0, "VACUOUS: no wait was dropped under its hold");
+        assert!(model.full > 0, "VACUOUS: the gate never filled");
+    }
 
     /// 1,000 waits on one key, each polled once, so it is queued with its
     /// waker stored, then dropped before any wake. A wait's entry is its

@@ -86,3 +86,21 @@ pub const GATE_HOLDERS_MAX: u32 = 1 << inf_foundation::limits::GATE_KEY_INDEX_BI
 /// the waiting holders and the peers' credits the orphans).
 pub const GATE_HOLDERS: Cap =
     Cap::entries::<GATE_HOLDERS_MAX>("fabric-gate-holders", CapFill::Serving);
+
+/// Routes, and holders, one cell's cold gate may number (ADR-0177 D4): 65,536, the ceiling the
+/// cell's own cap is clamped to. Owner: [`ColdReads`](crate::ColdReads), which builds the gate
+/// beside its pool. Crossing: none of its own — the cap below is clamped to it, so no namespace
+/// is refused for its `COLD-READ-QD`.
+pub const COLD_GATE_HOLDERS_MAX: u32 = 1 << 16;
+
+/// The cold gate's routes and holder slab (ADR-0177 D4): one cap for both, the smaller of
+/// [`COLD_GATE_HOLDERS_MAX`] and `overflow_cap × (2 + P)`, `P` the pool's buffers (16,896 at the
+/// defaults). Census name `cold-gate-holders`, one row for the slab and the map, filled while
+/// serving. Unit: routes, and holders, per cell with a tiered namespace. Owner: `ColdReads`.
+/// Crossing: a typed refusal — `enqueue` answers
+/// [`ColdRefused::QueueFull`](crate::ColdRefused::QueueFull) before the intent is queued, the pin
+/// taken or the issuer advanced, counted in `queue_full` and `cold_gate_full`. Derived never
+/// while the cap is its product: every queued intent holds one holder, and every other holder is
+/// a member's of one of `P` reads of at most `overflow_cap` members.
+pub const COLD_GATE_HOLDERS: Cap =
+    Cap::entries::<COLD_GATE_HOLDERS_MAX>("cold-gate-holders", CapFill::Serving);

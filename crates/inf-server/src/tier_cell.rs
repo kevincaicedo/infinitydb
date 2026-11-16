@@ -949,6 +949,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             self.cold = Some(ColdReads::with_config(
                 pool,
                 ColdReadConfig { qd_cap: qd, overflow_cap: 4 * qd, ..ColdReadConfig::default() },
+                &self.census,
             ));
         }
         let dir = self.shard_dir.join(format!("ns-{}", ns.0));

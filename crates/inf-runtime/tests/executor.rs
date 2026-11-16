@@ -52,10 +52,19 @@ fn fabric_gate<V>(units: u32) -> (Rc<RefCell<FabricGate<V>>>, Rc<Cell<u64>>) {
 /// The tests' gate holders' ceiling.
 const TEST_GATE_HOLDERS: Cap = Cap::entries::<64>("test-gate-holders", CapFill::Serving);
 
+/// The tests' keyed gates' routes and holders: past any test's open waits.
+const TEST_KEYED_HOLDERS: Cap = Cap::entries::<256>("test-keyed-holders", CapFill::Serving);
+
+/// A keyed gate of [`TEST_KEYED_HOLDERS`] on a census of its own.
+fn keyed_gate<K: GateKey, V>() -> KeyedGate<K, V> {
+    let (census, _mark) = CapCensus::new(CellId(0));
+    KeyedGate::build(TEST_KEYED_HOLDERS, &census).expect("the test gate")
+}
+
 /// A registered wait on a keyed gate.
 fn keyed_wait<K: GateKey, V>(gate: &KeyedGate<K, V>, key: K) -> KeyedWait<K, V> {
     let KeyedAdmission::Granted(permit) = gate.reserve(key) else {
-        panic!("a fresh key on an unbounded gate");
+        panic!("a fresh key on a gate with room");
     };
     permit.register()
 }
@@ -212,7 +221,7 @@ fn escaped_waker_clone_on_fast_path_is_harmless() {
 #[test]
 fn io_gate_routes_by_completion_token() {
     let mut ex = TestExecutor::new();
-    let gate = IoGate::new();
+    let gate: IoGate = keyed_gate();
     let token = CompletionToken::new(TokenClass::Recv, 3, 9);
     let waiter = keyed_wait(&gate, token);
     let seen = Rc::new(RefCell::new(false));
@@ -352,7 +361,7 @@ proptest! {
         budget in 1usize..8,
     ) {
         let mut ex = TestExecutor::new();
-        let gate: KeyedGate<u64, u64> = KeyedGate::new();
+        let gate: KeyedGate<u64, u64> = keyed_gate();
         let done: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
 
         for key in 0..n_tasks as u64 {
@@ -398,7 +407,7 @@ proptest! {
     #[test]
     fn mixed_fast_and_slow_paths_reconcile(ops in proptest::collection::vec(0u8..4, 1..200)) {
         let mut ex = TestExecutor::new();
-        let gate: KeyedGate<u64, ()> = KeyedGate::new();
+        let gate: KeyedGate<u64, ()> = keyed_gate();
         let mut next_key = 0u64;
         let mut open = Vec::new();
         let counter = Rc::new(RefCell::new(0u64));

@@ -72,6 +72,7 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use inf_alloc::{AlignedBufId, AlignedPool};
+use inf_foundation::bounded::{Cap, CapCensus};
 use inf_foundation::limits::DRIVER_OP_BYTES_MAX;
 use inf_foundation::{BuildIntHasher, FileOffset, FileOffsetRefused, LogHistogram};
 
@@ -79,7 +80,8 @@ use crate::budget::Issue;
 use crate::driver::{IoOp, RawFd, StableBytesMut};
 use crate::gate::{Delivery, GateHold, GateKey, KeyedAdmission, KeyedGate, KeyedWait};
 use crate::limits::{
-    COLD_DELIVERIES_PER_TURN, COLD_IDENTITY_PAIRS_MAX, COLD_PREPARATION_WORK_PER_TURN,
+    COLD_DELIVERIES_PER_TURN, COLD_GATE_HOLDERS, COLD_GATE_HOLDERS_MAX, COLD_IDENTITY_PAIRS_MAX,
+    COLD_PREPARATION_WORK_PER_TURN,
 };
 use crate::token::{CompletionToken, MAX_SLOT, TokenClass};
 
@@ -845,13 +847,29 @@ pub struct ColdReads {
     gate: KeyedGate<LogicalId, ColdDone>,
 }
 
+/// The cold gate's cap: `overflow_cap × (2 + P)`, `P` the pool's buffers, clamped to its
+/// ceiling (ADR-0177 D4). Every queued intent of both classes holds one holder, and every other
+/// holder is a member's of one of the `P` reads in flight or delivered, each of at most
+/// `overflow_cap` members; the clamp refuses no namespace for its read depth.
+fn cold_gate_cap(overflow_cap: usize, buffers: usize) -> Cap {
+    let product = (overflow_cap as u64).saturating_mul((buffers as u64).saturating_add(2));
+    let holders = product.clamp(1, u64::from(COLD_GATE_HOLDERS_MAX)) as u32;
+    let Ok(cap) = Cap::derived(&COLD_GATE_HOLDERS, holders) else {
+        unreachable!("the cold gate's cap is clamped to 1..=its ceiling")
+    };
+    cap
+}
+
 impl ColdReads {
     /// Takes ownership of the registered aligned pool (register it with
     /// the driver first — `BackendDriver::register_tier_pool`) under the
     /// default shaping config.
+    ///
+    /// # Panics
+    /// As [`with_config`](Self::with_config).
     #[must_use]
-    pub fn new(pool: AlignedPool) -> ColdReads {
-        ColdReads::with_config(pool, ColdReadConfig::default())
+    pub fn new(pool: AlignedPool, census: &Rc<CapCensus>) -> ColdReads {
+        ColdReads::with_config(pool, ColdReadConfig::default(), census)
     }
 
     /// [`new`](Self::new) with explicit shaping knobs (ADR-0055).
@@ -861,10 +879,17 @@ impl ColdReads {
     /// zero-limit config is a misconfiguration, not a throttle — and on a
     /// pool buffer wider than [`DRIVER_OP_BYTES_MAX`]: the buffer is the
     /// read-window maximum, and a device read's length is a `u32`
-    /// (ADR-0167 D1).
+    /// (ADR-0167 D1). A refused build of the gate's holders or routes on
+    /// `census` is the cell's fail-stop, as the pool's allocation is: the
+    /// gate is built at the cell's first tiered namespace, while it serves
+    /// (ADR-0177 D4).
     #[must_use]
     #[allow(clippy::disallowed_types, reason = "container: C")]
-    pub fn with_config(pool: AlignedPool, config: ColdReadConfig) -> ColdReads {
+    pub fn with_config(
+        pool: AlignedPool,
+        config: ColdReadConfig,
+        census: &Rc<CapCensus>,
+    ) -> ColdReads {
         assert!(config.qd_cap > 0, "qd_cap must admit at least one device read");
         assert!(config.overflow_cap > 0, "overflow_cap must queue at least one intent");
         assert!(config.grants_foreground > 0, "foreground grants must be nonzero");
@@ -874,6 +899,8 @@ impl ColdReads {
             "cold-read pool buffer exceeds a driver op's byte range"
         );
         let grants = [config.grants_foreground, config.grants_maintain];
+        let gate = KeyedGate::build(cold_gate_cap(config.overflow_cap, pool.capacity()), census)
+            .unwrap_or_else(|refused| panic!("the cold gate's holders were refused: {refused}"));
         ColdReads {
             state: Rc::new(RefCell::new(ColdState {
                 pool,
@@ -907,7 +934,7 @@ impl ColdReads {
                 issuer: PairIssuer::new(),
                 identity_refusals: 0,
             })),
-            gate: KeyedGate::new(),
+            gate,
         }
     }
 
@@ -918,8 +945,13 @@ impl ColdReads {
     /// # Panics
     /// As [`with_config`](Self::with_config).
     #[must_use]
-    pub fn with_issuer(pool: AlignedPool, config: ColdReadConfig, issuer: PairIssuer) -> ColdReads {
-        let cold = ColdReads::with_config(pool, config);
+    pub fn with_issuer(
+        pool: AlignedPool,
+        config: ColdReadConfig,
+        issuer: PairIssuer,
+        census: &Rc<CapCensus>,
+    ) -> ColdReads {
+        let cold = ColdReads::with_config(pool, config, census);
         cold.state.borrow_mut().issuer = issuer;
         cold
     }
@@ -1599,6 +1631,14 @@ impl ColdReads {
         self.state.borrow().identity_refusals
     }
 
+    /// `enqueue`s the gate refused for no free route or holder
+    /// (`cold_gate_full`, cell scope, cumulative): derived never while its
+    /// cap is its product (ADR-0177 D4).
+    #[must_use]
+    pub fn gate_full(&self) -> u64 {
+        self.gate.full()
+    }
+
     /// The in-flight device-read cap (ADR-0055 D2) — the most intents one
     /// command should have queued before it suspends (`SCAN`'s chunk).
     #[must_use]
@@ -1755,11 +1795,18 @@ mod tests {
     const FRAME: u64 = inf_alloc::TIER_READ_ALIGN as u64;
 
     fn path(buffers: usize) -> ColdReads {
-        ColdReads::new(AlignedPool::new(buffers, BUF))
+        ColdReads::new(
+            AlignedPool::new(buffers, BUF),
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        )
     }
 
     fn shaped(buffers: usize, config: ColdReadConfig) -> ColdReads {
-        ColdReads::with_config(AlignedPool::new(buffers, BUF), config)
+        ColdReads::with_config(
+            AlignedPool::new(buffers, BUF),
+            config,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        )
     }
 
     /// Enqueue at t=0, foreground (the common shape in these tests).
