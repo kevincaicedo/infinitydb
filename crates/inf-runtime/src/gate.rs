@@ -1383,7 +1383,7 @@ mod tests {
         (key, permit.register(gate))
     }
 
-    /// E §1, Registered or Waiting × the waiter dropped → Orphaned, then
+    /// The holder table: Registered or Waiting × the waiter dropped → Orphaned, then
     /// Orphaned × `complete` → Free: the slot waits for its request's one
     /// completion, which frees it as an orphan and counts nothing stale.
     #[test]
@@ -1401,7 +1401,7 @@ mod tests {
         assert_eq!(gate.borrow().stale(), 0, "an orphan's one completion is not stale");
     }
 
-    /// E §1, Delivered × `complete` → unchanged: a second completion of one
+    /// The holder table: Delivered × `complete` → unchanged, a second completion of one
     /// key is an orphan and stale, and the parked value stays the waiter's.
     #[test]
     fn a_second_completion_leaves_the_parked_value() {
@@ -1416,7 +1416,7 @@ mod tests {
         assert_eq!(gate.borrow().holders(), 0);
     }
 
-    /// E §1, a key of another origin or without the tag → unchanged: an
+    /// The holder table: a key of another origin or without the tag → unchanged, an
     /// orphan, counted stale, and the holder it would alias still waits.
     #[test]
     fn a_foreign_or_untagged_key_completes_nothing() {
@@ -1434,7 +1434,7 @@ mod tests {
         assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(3));
     }
 
-    /// E §1, Reserved × the permit dropped → Free at the next generation: the
+    /// The holder table: Reserved × the permit dropped → Free at the next generation, the
     /// dropped permit's key names no later occupant of its slot, `Stale`.
     #[test]
     fn a_dropped_permits_key_is_stale_at_the_next_occupant() {
@@ -1459,7 +1459,7 @@ mod tests {
         assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(2));
     }
 
-    /// E §1's refusals: a task with every unit out is `NoUnit`; a gate whose
+    /// The holder table's refusals: a task with every unit out is `NoUnit`; a gate whose
     /// every holder is taken (here by orphans, whose units came back) is
     /// `Full`, counted; and `units` refuses past the units the gate issues.
     #[test]
@@ -1491,7 +1491,7 @@ mod tests {
     }
 
     /// Seeded operations on a fabric gate of 8 holders and 8 units, against
-    /// a `BTreeMap<key, state>` that shares no code with it (E §6's model):
+    /// a `BTreeMap<key, state>` that shares no code with it (ADR-0177 D4's table):
     /// reserves registered or dropped, completions of live, finished and
     /// never-minted keys, polls and drops. Every answer, and after every step
     /// the holders taken and the `stale` and `full` counts, equal the
