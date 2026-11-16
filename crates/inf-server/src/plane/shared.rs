@@ -1371,8 +1371,9 @@ impl Drop for GatedTicket {
         }
         let mut deques = book.deques.borrow_mut();
         let index = deques.index(self.origin);
+        let back = deques.deques[index].back();
         assert!(
-            matches!(deques.deques[index].back(), Some(Gated::Open { ticket }) if *ticket == self.ticket),
+            matches!(back, Some(Gated::Open { ticket }) if *ticket == self.ticket),
             "a released ticket's slot is the back of its origin's deque"
         );
         deques.pop_back(self.origin, &book.node);
