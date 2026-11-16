@@ -40,6 +40,17 @@ impl PeerPumps {
     }
 }
 
+/// KE21's plant (E-store's F7): the `conn` class over `(1 + k) C` slots, `k = ⌈512 KiB ÷ (C ×
+/// s)⌉` from the class's stride `s`, so its rise passes F7's 256 KiB whatever the stride.
+#[cfg(inf_canary_conn_slots_doubled)]
+fn conn_slots_doubled(cap: Cap, stride: usize) -> Result<Cap, CapError> {
+    let share = u64::from(cap.entries_max());
+    let bytes = share * u64::try_from(stride).map_err(|_| CapError::Layout)?;
+    let k = (512 * 1024u64).div_ceil(bytes.max(1));
+    let entries = u32::try_from(share * (1 + k)).map_err(|_| CapError::Layout)?;
+    Cap::derived(&crate::limits::CONN_TASKS, entries)
+}
+
 /// `origin`'s place among `cell`'s peers: the cells in order, `cell` left out.
 fn peer_index(cell: CellId, origin: CellId) -> usize {
     debug_assert_ne!(cell, origin, "a cell is not its own peer");
@@ -53,7 +64,14 @@ impl PlaneTasks {
         layout: &mut ExecutorLayout,
         caps: &PlaneTaskCaps,
     ) -> Result<PlaneTasks, CapError> {
+        #[cfg(not(inf_canary_conn_slots_doubled))]
         let conn = layout.class(&pump::<O, F>, caps.conn)?;
+        // Canary: the class is built over `(1 + k) C` slots, `k` from its own stride.
+        #[cfg(inf_canary_conn_slots_doubled)]
+        let conn = layout.class(
+            &pump::<O, F>,
+            conn_slots_doubled(caps.conn, ExecutorLayout::slot_shape(&pump::<O, F>).0)?,
+        )?;
         let peers = match &caps.peers {
             None => None,
             Some(PeerTaskCaps { ns_apply, owner_pub, gated }) => Some(PeerTasks {

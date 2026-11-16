@@ -105,6 +105,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_cold_turn_of_eight)',
     'cfg(inf_canary_cold_turn_per_lend)',
     'cfg(inf_canary_cold_window_staged_len)',
+    'cfg(inf_canary_conn_slots_doubled)',
     'cfg(inf_canary_copy_abort_after_death)',
     'cfg(inf_canary_cover_by_hash)',
     'cfg(inf_canary_death_scratch_kept)',
