@@ -97,6 +97,9 @@ const PLANT_SPARE_KEPT_PAST_SUSPEND: bool = cfg!(inf_canary_spare_kept_past_susp
 /// A first poll that unwinds leaves the spare's handle in the spare and its header without one,
 /// so nothing that drops futures reaches its future.
 const PLANT_FIRST_POLL_UNWIND_UNOWNED: bool = cfg!(inf_canary_first_poll_unwind_unowned);
+/// The executor's drop stops at a future's drop that unwinds: the later futures stay live while
+/// the slabs holding them are freed.
+const PLANT_DROP_STOPS_AT_UNWIND: bool = cfg!(inf_canary_executor_drop_stops_at_unwind);
 /// An id's lookup skips the index's bound against its class's slots.
 const PLANT_ID_INDEX_UNBOUNDED: bool = cfg!(inf_canary_task_id_index_unbounded);
 
@@ -1805,10 +1808,11 @@ unsafe fn settle_drained(header: Header, delivery: Delivery) {
 
 impl Drop for CellExecutor {
     /// The executor's drop (ADR-0003 A1.3): it drains; marks every header Closing, so a waker its
-    /// futures drop changes nothing but counts, and drops each live future in place; closes every
-    /// header a waker still names or a push still holds; drops the class slabs, which hold husks
-    /// only; takes the stack a last time, leaving its head closed; then releases its own count of
-    /// the array. Nothing is kept for the process: the array lives until its last count's release.
+    /// futures drop changes nothing but counts, and drops each live future in place, resuming
+    /// past one whose drop unwinds ([`DropResume`]); closes every header a waker still names or a
+    /// push still holds; drops the class slabs, which hold no live future; takes the stack a
+    /// last time, leaving its head closed; then releases its own count of the array. Nothing is
+    /// kept for the process: the array lives until its last count's release.
     fn drop(&mut self) {
         self.drain_remote();
         // SAFETY: the executor holds its array.
@@ -1824,16 +1828,23 @@ impl Drop for CellExecutor {
             );
             owner.state.set(if live { TaskState::Dropping } else { TaskState::Closing });
         }
-        for index in 0..len {
-            // SAFETY: as above.
-            let owner = unsafe { owner(header_at(self.array, index)) };
-            if owner.state.get() == TaskState::Dropping
-                && let Some(slot) = owner.slot.get()
-            {
-                self.classes[owner.class as usize].object.drop_future(slot);
-                owner.state.set(TaskState::Closing);
-            }
-        }
+        let mut resume = DropResume { executor: &mut *self, at: 0, len };
+        resume.drop_futures();
+        core::mem::forget(resume);
+        // SAFETY: the executor's drop, once, every live future dropped.
+        unsafe { self.close_and_release(len) };
+    }
+}
+
+impl CellExecutor {
+    /// The executor's drop past its futures: closes every header a waker still names or a push
+    /// still holds; drops the class slabs; takes the stack a last time, leaving its head closed;
+    /// then releases the executor's own count of the array.
+    ///
+    /// # Safety
+    /// Called once, by the executor's drop, after every live future of its `len` headers was
+    /// dropped: the executor reaches nothing of its array after this call.
+    unsafe fn close_and_release(&mut self, len: u32) {
         for index in 0..len {
             // SAFETY: `index < len`; open, on this thread.
             let header = unsafe { header_at(self.array, index) };
@@ -1852,8 +1863,56 @@ impl Drop for CellExecutor {
                 Settled::Kept => {}
             }
         }
-        // SAFETY: the executor's own count, held until here.
+        // SAFETY: the executor's own count, held until here: per the contract, released once.
         unsafe { release_array(self.array) };
+    }
+}
+
+/// The executor's drop past a future's drop that unwinds: armed across the loop that drops the
+/// live futures and forgotten when the loop ends, so its drop runs only on an unwind out of a
+/// future's drop. That header is marked Closing, its cell keeping the dropped bytes under
+/// `ManuallyDrop`, never dropped again; each later live future is dropped in place; then the
+/// executor's drop finishes, so no slab is freed under a live future, and the unwind continues.
+/// A future's drop that unwinds in the resumed loop aborts the process: a panic in a destructor
+/// during an unwind.
+struct DropResume<'a> {
+    executor: &'a mut CellExecutor,
+    /// The header the loop is at: its future, if live, is the one being dropped.
+    at: u32,
+    len: u32,
+}
+
+impl DropResume<'_> {
+    /// Each live future in place, from header `at` on: a Dropping header's, then the header is
+    /// Closing.
+    fn drop_futures(&mut self) {
+        while self.at < self.len {
+            // SAFETY: `at < len`; open, on this thread.
+            let owner = unsafe { owner(header_at(self.executor.array, self.at)) };
+            if owner.state.get() == TaskState::Dropping
+                && let Some(slot) = owner.slot.get()
+            {
+                self.executor.classes[owner.class as usize].object.drop_future(slot);
+                owner.state.set(TaskState::Closing);
+            }
+            self.at += 1;
+        }
+    }
+}
+
+impl Drop for DropResume<'_> {
+    fn drop(&mut self) {
+        if PLANT_DROP_STOPS_AT_UNWIND {
+            return;
+        }
+        // SAFETY: the loop unwound at `at`, so `at < len`; open, on this thread. Its future was
+        // dropped (its drop ran and unwound): Closing, it is never reached again.
+        unsafe { owner(header_at(self.executor.array, self.at)) }.state.set(TaskState::Closing);
+        self.at += 1;
+        self.drop_futures();
+        // SAFETY: the executor's drop, once: the forgotten guard runs none of this, and every
+        // live future is dropped.
+        unsafe { self.executor.close_and_release(self.len) };
     }
 }
 

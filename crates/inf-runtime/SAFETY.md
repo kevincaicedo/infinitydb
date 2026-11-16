@@ -163,17 +163,23 @@ Invariants:
   (the CI's Miri job); a reference formed after the access is red there.
 - **Close, then the last count frees.** The executor's drop drains; closes
   every header to wakers (Dropping or Closing) before any future drops,
-  then drops each live future in place; closes every header a waker still
-  names or a push still holds (counted on the stack, its `o` read,
-  `MARK_CLOSED`, `o` folded into `c` with `X`); drops its class slabs,
-  which hold husks only; takes the stack a last time, leaving its head
-  closed; and releases its own count. The array, with the stack in it, is
-  freed by the release of its last count (`Arc`'s protocol): the
-  executor's own, or a closed header's, released by the read-modify-write
-  that leaves it at `c = 0` with `Q` clear, on whichever thread makes it.
-  The freer drops the head and every header in place and deallocates the
-  layout the head's count gives, written at the build and never again.
-  Nothing is kept for the process.
+  then drops each live future in place, and resumes past one whose drop
+  unwinds: that header is marked Closing, its cell keeping the dropped
+  bytes under `ManuallyDrop`, the later futures are dropped and the steps
+  below run, and then the unwind continues; a second unwind aborts the
+  process, the language's rule for a panic in a destructor during an
+  unwind. It closes every header a waker still names or a push still holds
+  (counted on the stack, its `o` read, `MARK_CLOSED`, `o` folded into `c`
+  with `X`); drops its class slabs, which then hold no live future: a first
+  poll that unwound gave its slot to its header first (the first poll in
+  the class's spare, below) and is among the futures dropped; takes the
+  stack a last time, leaving its head closed; and releases its own count.
+  The array, with the stack in it, is freed by the release of its last
+  count (`Arc`'s protocol): the executor's own, or a closed header's,
+  released by the read-modify-write that leaves it at `c = 0` with `Q`
+  clear, on whichever thread makes it. The freer drops the head and every
+  header in place and deallocates the layout the head's count gives,
+  written at the build and never again. Nothing is kept for the process.
 - **The owner lane runs no atomic read-modify-write or fence**
   (`scripts/check-waker-atomics.sh` on the release asm, with its probe; its
   boundary is `executor::foreign`'s five functions, its callee list

@@ -131,6 +131,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_epoch_mark_keeps_old_seq)',
     'cfg(inf_canary_error_reply_gated)',
     'cfg(inf_canary_everysec_no_successor)',
+    'cfg(inf_canary_executor_drop_stops_at_unwind)',
     'cfg(inf_canary_extent_window_arrival_blind)',
     'cfg(inf_canary_extent_window_handout_at_fold)',
     'cfg(inf_canary_extent_window_no_wake)',

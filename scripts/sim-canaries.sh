@@ -1188,6 +1188,10 @@ ordered_rows=(
   # An `always` write whose verdict is an error reply leaves at once, not gated (ADR-0177 D6).
   # Planted, the error waits as a verdict for the next record's `seq`, and so for the hold.
   "inf_canary_error_reply_gated m0-capacity error-held --close-leg gated-error"
+  # The executor's drop drops every live future in place and resumes past one whose drop
+  # unwinds, then closes, frees and releases as it would have. Planted, the drop stops at that
+  # future, and the slabs are freed under the live futures after it.
+  "inf_canary_executor_drop_stops_at_unwind crate-test inf-runtime test:executor the_executors_drop_resumes_past_an_unwinding_drop drop-unwind-stopped"
   # The first poll runs in its class's spare, in its slot, where every later poll and the drop
   # find it (ADR-0194 D1's note), and a wake it raises is kept. Planted, the cell moves to another
   # slot of its class at the task's next activation, and the future reads a second address.

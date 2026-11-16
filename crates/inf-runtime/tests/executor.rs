@@ -915,13 +915,17 @@ struct Registry {
     kept: RefCell<Option<Waker>>,
 }
 
-/// What a registering future does at its first poll.
+/// What a registering future does at its first poll, and at its drop.
 #[derive(Clone, Copy)]
 enum Act {
     Ready,
     Panic,
     /// Keeps a clone of its waker in the registry, then panics.
     PanicKeepingWaker,
+    /// Keeps a clone of its waker in the registry and is Pending.
+    PendingKeepingWaker,
+    /// Pending; its drop panics.
+    PendingPanickingInDrop,
 }
 
 /// A `!Unpin` future that registers its own address at its poll and unregisters it at its drop,
@@ -951,6 +955,11 @@ impl Future for Registering {
                 *registry.kept.borrow_mut() = Some(cx.waker().clone());
                 panic!("the future's first poll panics, a clone of its waker kept")
             }
+            Act::PendingKeepingWaker => {
+                *registry.kept.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            Act::PendingPanickingInDrop => Poll::Pending,
         }
     }
 }
@@ -960,6 +969,9 @@ impl Drop for Registering {
         let at = core::ptr::from_ref::<Self>(self) as usize;
         self.registry.registered.borrow_mut().retain(|registered| *registered != at);
         self.registry.drops.set(self.registry.drops.get() + 1);
+        if matches!(self.act, Act::PendingPanickingInDrop) {
+            panic!("the future's drop panics");
+        }
     }
 }
 
@@ -1057,5 +1069,28 @@ fn a_first_poll_that_unwinds_with_a_waker_kept() {
     assert_eq!(registry.drops.get(), 1, "first-poll-unwind-unowned: the future never dropped");
     let left = registry.registered.borrow();
     assert!(left.is_empty(), "first-poll-unwind-unowned: a registration outlived it: {left:x?}");
+    drop(kept);
+}
+
+/// The executor's drop with two suspended tasks, the first's drop panicking: the drop resumes
+/// past it, drops the second in place, which unregisters it, and closes the header the second's
+/// kept waker names; then the unwind leaves the drop. The waker, dropped after, releases that
+/// header, which Miri's leak check reads; a drop that skipped the close and freed the array
+/// would make that release a use after free. Stopped at the panic, the drop never reaches the
+/// second future, and frees its slab under it.
+#[test]
+fn the_executors_drop_resumes_past_an_unwinding_drop() {
+    let (mut executor, class) = registering();
+    let registry = Rc::new(Registry::default());
+    let first = poll_registering(&mut executor, class, Act::PendingPanickingInDrop, &registry);
+    assert!(matches!(first, PollImmediate::Suspended(_)), "the first suspends");
+    let second = poll_registering(&mut executor, class, Act::PendingKeepingWaker, &registry);
+    assert!(matches!(second, PollImmediate::Suspended(_)), "the second suspends");
+    let kept = registry.kept.borrow_mut().take().expect("the waker the second kept");
+    let unwound = catch_unwind(AssertUnwindSafe(move || drop(executor)));
+    assert!(unwound.is_err(), "the first future's drop panics out of the executor's drop");
+    assert_eq!(registry.drops.get(), 2, "drop-unwind-stopped: a future never dropped");
+    let left = registry.registered.borrow();
+    assert!(left.is_empty(), "drop-unwind-stopped: a registration outlived it: {left:x?}");
     drop(kept);
 }
