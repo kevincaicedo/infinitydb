@@ -65,15 +65,11 @@ impl Server {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("data dir");
         let stderr = dir.join("stderr");
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("probe bind")
-            .local_addr()
-            .expect("addr")
-            .port()
-            .to_string();
+        // `--port 0`: the node binds a port of the kernel's choosing and
+        // prints it, so no probe's port is lost to a concurrent binder.
         let child = NodeBinary::built()
             .command()
-            .args(["--port", &port, "--cells", &cells.to_string()])
+            .args(["--port", "0", "--cells", &cells.to_string()])
             .args(["--accept-handoff", "on", "--device-probe", "off", "--data-dir"])
             .arg(dir.join("data"))
             .stdout(Stdio::null())
