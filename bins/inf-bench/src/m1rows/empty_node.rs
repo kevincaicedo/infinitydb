@@ -31,7 +31,7 @@ use walk::{DirWalk, walk_allocated};
 
 /// The rows' topology, the shipped default. Another cell count withholds
 /// the rows (a note): every bill is written for four cells.
-const EMPTY_NODE_CELLS: u16 = 4;
+pub(crate) const EMPTY_NODE_CELLS: u16 = 4;
 
 /// Seconds from the first `+PONG` to the window's first sample. Fixed:
 /// boot work still running then falls into the window and is measured.
@@ -42,7 +42,7 @@ const EMPTY_NODE_IDLE_WINDOW_S: u64 = 10;
 
 /// infinityd's receive pool per cell: `--buffers` (default) buffers of
 /// `--buf-size` (default) bytes, one page each.
-const RECEIVE_BUFFERS_DEFAULT: u64 = 4096;
+pub(crate) const RECEIVE_BUFFERS_DEFAULT: u64 = 4096;
 const RECEIVE_BUFFER_BYTES: u64 = 4096;
 
 /// Pages one registered buffer of at most a page can span; io_uring
@@ -230,16 +230,26 @@ fn environment_notes(m: &mut Measurements, ctx: &Context<'_>, root: &Path, fstyp
 /// A memory leg's RSS on a node whose every cell registered its receive
 /// pool (VmPin over [`pin_proven_floor`]). Built only by `prove`.
 #[derive(Clone, Copy, Debug)]
-struct PinnedRss {
+pub(crate) struct PinnedRss {
     rss_bytes: u64,
 }
 
 /// VmPin at or under the floor: registration degraded on some cell
 /// (`RLIMIT_MEMLOCK`, an old kernel) and its pool was never touched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PinUnproven {
+pub(crate) struct PinUnproven {
     pinned_bytes: u64,
     floor_bytes: u64,
+}
+
+impl PinUnproven {
+    pub(crate) fn pinned_bytes(self) -> u64 {
+        self.pinned_bytes
+    }
+
+    pub(crate) fn floor_bytes(self) -> u64 {
+        self.floor_bytes
+    }
 }
 
 impl std::fmt::Display for PinUnproven {
@@ -261,13 +271,21 @@ fn pin_proven_floor(cells: u64, buffers: u64) -> Option<u64> {
 }
 
 impl PinnedRss {
-    fn prove(sample: &ProcSample, cells: u64, buffers: u64) -> Result<PinnedRss, PinUnproven> {
+    pub(crate) fn prove(
+        sample: &ProcSample,
+        cells: u64,
+        buffers: u64,
+    ) -> Result<PinnedRss, PinUnproven> {
         let floor_bytes = pin_proven_floor(cells, buffers).unwrap_or(u64::MAX);
         if sample.pinned_bytes() > floor_bytes {
             Ok(PinnedRss { rss_bytes: sample.rss_bytes() })
         } else {
             Err(PinUnproven { pinned_bytes: sample.pinned_bytes(), floor_bytes })
         }
+    }
+
+    pub(crate) fn rss_bytes(self) -> u64 {
+        self.rss_bytes
     }
 
     fn mib(self) -> f64 {
@@ -379,7 +397,7 @@ struct ControlLeg(MemoryLeg);
 
 impl ControlLeg {
     fn boot(ctx: &Context<'_>) -> Result<ControlLeg, String> {
-        memory_leg(ctx, MemoryArm::Control).map(ControlLeg)
+        memory_leg(ctx.infinityd, MemoryArm::Control).map(ControlLeg)
     }
 }
 
@@ -389,13 +407,14 @@ struct PlantLeg(MemoryLeg);
 
 impl PlantLeg {
     fn boot(ctx: &Context<'_>, plant: MemoryPlant) -> Result<PlantLeg, String> {
-        memory_leg(ctx, MemoryArm::Plant(plant)).map(PlantLeg)
+        memory_leg(ctx.infinityd, MemoryArm::Plant(plant)).map(PlantLeg)
     }
 }
 
-/// One memory leg's facts, wrapped as a [`ControlLeg`] or a [`PlantLeg`].
+/// One memory leg's facts, wrapped as a [`ControlLeg`] or a [`PlantLeg`],
+/// or read by the `idle-resident` instrument through its accessors.
 #[derive(Debug)]
-struct MemoryLeg {
+pub(crate) struct MemoryLeg {
     rss: Result<PinnedRss, PinUnproven>,
     rss_bytes: u64,
     pinned_bytes: u64,
@@ -403,16 +422,49 @@ struct MemoryLeg {
     boot: Duration,
     loading_replies: u64,
     memlock: String,
-    /// The server's own INFO fields, per cell, raw (after the window).
-    attribution: String,
+    /// Every cell's INFO, in cell order, read after the window: the
+    /// attribution notes and the cap census rows come from it.
+    cells: CellInfos,
 }
 
-/// Spawn → first `+PONG` → settle → window → SIGKILL (memory-only:
-/// nothing to keep).
-fn memory_leg(ctx: &Context<'_>, arm: MemoryArm) -> Result<MemoryLeg, String> {
+/// Every cell's INFO fields, in cell order, or why the scrape failed.
+type CellInfos = Result<Vec<BTreeMap<String, String>>, String>;
+
+impl MemoryLeg {
+    /// VmRSS at the window's end, with the node's registration proven.
+    pub(crate) fn rss(&self) -> Result<PinnedRss, PinUnproven> {
+        self.rss
+    }
+
+    /// VmPin at the window's end.
+    pub(crate) fn pinned_bytes(&self) -> u64 {
+        self.pinned_bytes
+    }
+
+    /// The node's `RLIMIT_MEMLOCK`, as `/proc/<pid>/limits` gives it.
+    pub(crate) fn memlock(&self) -> &str {
+        &self.memlock
+    }
+
+    /// Every cell's INFO after the window, in cell order.
+    pub(crate) fn cells(&self) -> &CellInfos {
+        &self.cells
+    }
+}
+
+/// `empty_idle_rss`'s memory leg at the shipped defaults on `infinityd`:
+/// the one implementation gate-run m1's control legs and the `idle-resident`
+/// instrument both boot.
+pub(crate) fn idle_leg(infinityd: &str) -> Result<MemoryLeg, String> {
+    memory_leg(infinityd, MemoryArm::Control)
+}
+
+/// Spawn → first `+PONG` → settle → window → INFO per cell → SIGKILL
+/// (memory-only: nothing to keep).
+fn memory_leg(infinityd: &str, arm: MemoryArm) -> Result<MemoryLeg, String> {
     let args = arm.args();
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (mut guard, spawned_at) = launch_infinityd(ctx.infinityd, EMPTY_NODE_CELLS, &refs)?;
+    let (mut guard, spawned_at) = launch_infinityd(infinityd, EMPTY_NODE_CELLS, &refs)?;
     let serving = serve(&mut guard, spawned_at)?;
     let pid = guard.pid();
     let memlock = read_memlock_limit(pid).unwrap_or_else(|e| format!("unreadable ({e})"));
@@ -427,7 +479,7 @@ fn memory_leg(ctx: &Context<'_>, arm: MemoryArm) -> Result<MemoryLeg, String> {
         boot: serving.boot(),
         loading_replies: serving.loading_replies(),
         memlock,
-        attribution: info_attribution(guard.port, &MEMORY_ATTRIBUTION_FIELDS),
+        cells: crate::gaterun::scrape_cells(guard.port, EMPTY_NODE_CELLS),
     })
 }
 
@@ -450,8 +502,8 @@ const BOOT_ATTRIBUTION_FIELDS: [&str; 8] = [
 /// The server's own INFO fields, one value per cell in cell order, taken
 /// after the window: cross-check notes that attribute an excess, never an
 /// estimator. A missing field reads `absent`, never a 0.
-fn info_attribution(port: u16, fields: &[&str]) -> String {
-    let infos = match crate::gaterun::scrape_cells(port, EMPTY_NODE_CELLS) {
+fn info_attribution(cells: &CellInfos, fields: &[&str]) -> String {
+    let infos = match cells {
         Ok(infos) => infos,
         Err(e) => return format!("INFO unavailable ({e})"),
     };
@@ -554,7 +606,10 @@ fn durable_boot<'a>(
         loading_replies: serving.loading_replies(),
         cpu_pct: idle.cpu_pct()?,
         walk,
-        attribution: info_attribution(guard.port, &BOOT_ATTRIBUTION_FIELDS),
+        attribution: info_attribution(
+            &crate::gaterun::scrape_cells(guard.port, EMPTY_NODE_CELLS),
+            &BOOT_ATTRIBUTION_FIELDS,
+        ),
     };
     drop(serving);
     let clean = guard
@@ -800,7 +855,7 @@ fn log_memory(log: &mut String, label: &str, leg: &MemoryLeg) {
         leg.cpu_pct,
         leg.memlock
     ));
-    log.push_str(&format!("  INFO {}\n", leg.attribution));
+    log.push_str(&format!("  INFO {}\n", info_attribution(&leg.cells, &MEMORY_ATTRIBUTION_FIELDS)));
 }
 
 /// The boot and dir plants (D is stopped and never booted again after
