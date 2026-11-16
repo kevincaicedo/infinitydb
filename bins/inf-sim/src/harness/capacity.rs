@@ -979,12 +979,6 @@ fn fan_leg(seed: u64) -> Rig {
     rig.until("the fans' replies", |rig| {
         fanners.iter().all(|&id| rig.clients[id].replies.len() > 1)
     });
-    // Named here, beside the replies a full gate stalls, and again by the
-    // report's census with every cell's counters.
-    let full = rig.plane(X).gate_full();
-    if full != 0 {
-        rig.violate(format!("gate-full: cell {X}, {full} reserve(s) on a full gate by the fans"));
-    }
     let count = format!(":{KEYS}\r\n").into_bytes();
     for &id in &fanners {
         rig.judge_replies(id, 1, core::slice::from_ref(&count), "a fan");
