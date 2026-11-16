@@ -126,6 +126,12 @@ jobs:
         run: cargo +nightly miri test -p inf-runtime --test executor --test waker_threads --test waker_close
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
+      # A suspended future may hold `&mut` into itself in its class slot, and a first poll runs
+      # through the address its slab last lent: the same tests under Tree Borrows as well.
+      - name: miri (inf-runtime's executor and waker tests) strict provenance, tree borrows
+        run: cargo +nightly miri test -p inf-runtime --test executor --test waker_threads --test waker_close
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-tree-borrows
       # A consuming foreign waker call forms no reference to its header or the remote stack once
       # its swap, or its push, may let another thread free them (ADR-0003 A1.2.5). The default
       # schedule never preempts a call inside that window, so the races run at a pinned

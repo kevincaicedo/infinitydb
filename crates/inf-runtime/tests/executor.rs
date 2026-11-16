@@ -13,7 +13,7 @@ use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_runtime::gate::{KeyedGate, ListWait};
 use inf_runtime::{
     CellExecutor, CompletionToken, ExecutorLayout, FabricGate, IoGate, PollImmediate,
-    TaskAdmission, TaskClass, TokenClass, WaitList, WatermarkGate, Woken,
+    TaskAdmission, TaskClass, TaskId, TokenClass, WaitList, WatermarkGate, Woken, park,
 };
 use proptest::prelude::*;
 
@@ -557,4 +557,125 @@ fn the_first_poll_runs_in_its_slot_and_keeps_its_wake() {
     assert!(at.iter().all(|address| *address == at[0]), "first-poll-moved: {at:x?}");
     assert_eq!(executor.live_tasks(), 0);
     assert_eq!(executor.class_tasks(class), 0);
+}
+
+// ---- Self-referential futures in their slots ---------------------------------------------------
+
+/// Holds `&mut` into its caller's local across a park, as an async fn the plane runs does.
+async fn bump(local: &mut [u64; 4]) {
+    park().await;
+    local[0] += 1;
+    local[3] += 7;
+}
+
+/// A `!Unpin` future placed unboxed in its slot, suspended holding `&mut` into itself.
+async fn self_referential(seen: Rc<Cell<u64>>) {
+    let mut local = [0u64; 4];
+    bump(&mut local).await;
+    seen.set(local[0] + local[3]);
+}
+
+const SELF_REFERENTIAL: Cap = Cap::entries::<4>("test-self-referential", CapFill::Serving);
+
+/// An executor of one class of `self_referential` futures, unboxed.
+fn self_referential_class() -> (CellExecutor, TaskClass) {
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let class = layout.class(&self_referential, SELF_REFERENTIAL).expect("one class");
+    (layout.build().expect("no class refuses"), class)
+}
+
+/// One `self_referential` task of `class`, polled once in place: it parks.
+fn park_self_referential(ex: &mut CellExecutor, class: TaskClass, seen: &Rc<Cell<u64>>) -> TaskId {
+    let TaskAdmission::Granted(permit) = ex.reserve(class) else { panic!("the class has room") };
+    let seen = Rc::clone(seen);
+    let outcome = permit.poll_immediate(move || self_referential(seen));
+    let PollImmediate::Suspended(id) = outcome else { panic!("it parks: {outcome:?}") };
+    id
+}
+
+/// Unboxed self-referential tasks in one chunk, suspended holding `&mut` into themselves, while
+/// the executor reaches their slots and their neighbours': each one's own `wake(id)` and its
+/// poll, a neighbour's `wake(id)`, `is_live` and the class's count, and a third task's first
+/// poll between them. Each resumes and reads its own `&mut` (8). Miri reads the
+/// sequence under Stacked and Tree Borrows: a lookup's shared reborrow of the chunk leaves the
+/// futures, which are in an `UnsafeCell`, as they were.
+#[test]
+fn self_referential_futures_resume_in_their_slots() {
+    let (mut ex, class) = self_referential_class();
+    let (a, b) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let id_a = park_self_referential(&mut ex, class, &a);
+    let id_b = park_self_referential(&mut ex, class, &b);
+    assert!(ex.is_live(id_a) && ex.is_live(id_b));
+    assert_eq!(ex.class_tasks(class), 2);
+    assert_eq!(ex.wake(id_b), Woken::Queued, "a neighbour's wake");
+    assert_eq!(ex.run_ready(4), 1);
+    assert_eq!(b.get(), 8, "b resumed through its own &mut");
+    let c = Rc::new(Cell::new(0));
+    let id_c = park_self_referential(&mut ex, class, &c);
+    assert_eq!(ex.wake(id_a), Woken::Queued, "its own wake, after a neighbour's poll");
+    assert_eq!(ex.run_ready(4), 1);
+    assert_eq!(a.get(), 8, "a resumed through its own &mut");
+    assert_eq!(ex.wake(id_c), Woken::Queued);
+    assert_eq!(ex.run_ready(4), 1);
+    assert_eq!(c.get(), 8);
+    assert_eq!(ex.live_tasks(), 0);
+}
+
+/// Leaves its waker in `slot` and is Pending once.
+struct Export {
+    slot: Rc<RefCell<Option<Waker>>>,
+    done: bool,
+}
+
+impl Future for Export {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.done {
+            return Poll::Ready(());
+        }
+        self.done = true;
+        *self.slot.borrow_mut() = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// `bump`, suspended on its own waker rather than a park.
+async fn bump_on_waker(local: &mut [u64; 4], slot: Rc<RefCell<Option<Waker>>>) {
+    Export { slot, done: false }.await;
+    local[0] += 1;
+    local[3] += 7;
+}
+
+/// `self_referential`, woken by the waker it left.
+async fn self_referential_on_waker(seen: Rc<Cell<u64>>, slot: Rc<RefCell<Option<Waker>>>) {
+    let mut local = [0u64; 4];
+    bump_on_waker(&mut local, slot).await;
+    seen.set(local[0] + local[3]);
+}
+
+/// The same, woken by their own wakers, so only the polls reach the slots, while a neighbour is
+/// placed, polled and freed in the same chunk.
+#[test]
+fn self_referential_futures_woken_by_their_wakers_resume_in_their_slots() {
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let class = layout.class(&self_referential_on_waker, SELF_REFERENTIAL).expect("one class");
+    let mut ex = layout.build().expect("no class refuses");
+    let mut parked = Vec::new();
+    for _ in 0..2 {
+        let (seen, slot) = (Rc::new(Cell::new(0)), Rc::new(RefCell::new(None)));
+        let TaskAdmission::Granted(permit) = ex.reserve(class) else { panic!("room") };
+        let (s, w) = (Rc::clone(&seen), Rc::clone(&slot));
+        let _ = permit.spawn_local(move || self_referential_on_waker(s, w));
+        assert_eq!(ex.run_ready(4), 1, "it parks on its waker");
+        parked.push((seen, slot));
+    }
+    for (seen, slot) in parked.iter().rev() {
+        slot.borrow_mut().take().expect("the waker it left").wake();
+        assert_eq!(ex.run_ready(4), 1);
+        assert_eq!(seen.get(), 8);
+    }
+    assert_eq!(ex.live_tasks(), 0);
 }

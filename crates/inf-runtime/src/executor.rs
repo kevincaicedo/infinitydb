@@ -42,7 +42,7 @@
 
 use core::alloc::Layout;
 use core::any::{Any, TypeId};
-use core::cell::Cell;
+use core::cell::{Cell, UnsafeCell};
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
@@ -266,9 +266,15 @@ impl Future for Park {
 /// task's decision frees or retires it. `Done` has a tag of its own (`repr(u8)`: no niche of the
 /// future encodes it), so `take`'s move of a husk out of its slot is its tag (ADR-0194 D1's
 /// note). Neither variant has drop glue: the slab never drops a future.
+///
+/// The future is in an `UnsafeCell`: a suspended future may hold `&mut` into itself across an
+/// `await`, and a slab lookup reborrows a whole chunk shared (a slice's length, a shared walk),
+/// which, over bytes outside an `UnsafeCell`, is a read that the aliasing model lets invalidate
+/// that `&mut` in every slot of the chunk. Inside the cell a shared reborrow freezes nothing, so
+/// a lookup of one slot leaves every future in its chunk as it was (`SAFETY.md` §3).
 #[repr(u8)]
 enum TaskCell<F> {
-    Live(ManuallyDrop<F>),
+    Live(UnsafeCell<ManuallyDrop<F>>),
     Done,
 }
 
@@ -496,7 +502,7 @@ impl<F: Future<Output = ()> + 'static, const C: usize> ClassObject for ClassSlab
         };
         // SAFETY: the header's state says the future is live; it is dropped once, here, and the
         // cell is its husk before anything reads it again.
-        unsafe { ManuallyDrop::drop(future) };
+        unsafe { ManuallyDrop::drop(future.get_mut()) };
         *cell = TaskCell::Done;
     }
 
@@ -537,13 +543,13 @@ unsafe fn poll_in_place<F: Future<Output = ()>>(
     // SAFETY: the future was placed in its slot before its first poll, and a slab never moves a
     // value it holds (its chunks are fixed allocations): the slot is its address until it is
     // dropped in place below; it is live, per the contract.
-    let pinned = unsafe { Pin::new_unchecked(&mut **future) };
+    let pinned = unsafe { Pin::new_unchecked(&mut **future.get_mut()) };
     let poll = pinned.poll(cx);
     if poll.is_ready() {
         // SAFETY: per the contract.
         unsafe { owner(header) }.state.set(TaskState::Finished);
         // SAFETY: the future is live and finished; dropped in place once, here.
-        unsafe { ManuallyDrop::drop(future) };
+        unsafe { ManuallyDrop::drop(future.get_mut()) };
         *cell = TaskCell::Done;
     }
     poll
@@ -1536,7 +1542,8 @@ fn place<F: Future<Output = ()> + 'static, const C: usize>(
     let SlabReserved::Slot(reservation) = slab.slab.reserve() else {
         unreachable!("a permit's slot was free in the step that granted it")
     };
-    let (slot, cell) = reservation.publish_mut(TaskCell::Live(ManuallyDrop::new(make())));
+    let (slot, cell) =
+        reservation.publish_mut(TaskCell::Live(UnsafeCell::new(ManuallyDrop::new(make()))));
     // SAFETY: the slot's index is below its class's cap, so its header lies in the array.
     let header = unsafe { header_at(array, base + slot.index()) };
     // SAFETY: the executor holds its headers: open, on this thread.

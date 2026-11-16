@@ -182,8 +182,9 @@ Invariants:
 
 Miri (strict provenance, its data-race detector, Stacked Borrows, the leak
 check) runs `tests/executor.rs`, `tests/waker_threads.rs` and
-`tests/waker_close.rs` on its default schedule, and `tests/waker_race.rs`
-on the pinned schedules above; Loom models the lane's protocol on
+`tests/waker_close.rs` on its default schedule, and again under Tree
+Borrows (`-Zmiri-tree-borrows`), and `tests/waker_race.rs` on the pinned
+schedules above; Loom models the lane's protocol on
 `inf_foundation::wake`'s own types. Neither models the kernel, and none of
 this rests on one.
 
@@ -194,7 +195,7 @@ the waker.
 ## 3. Futures in their class's slab (`executor.rs`, ADR-0177 D2)
 
 Each task class is a `CappedSlab` of one concrete future type,
-`TaskCell<F>` (`ManuallyDrop<F>`), built before the cell serves. A future
+`TaskCell<F>` (`UnsafeCell<ManuallyDrop<F>>`), built before the cell serves. A future
 is written into its slot by `publish` **before its first poll** and never
 moves: a slab's chunks are fixed allocations, never moved or reallocated
 while the slab lives, so `Pin::new_unchecked` over the slot's future is
@@ -215,3 +216,17 @@ future's bytes. The executor reaches a class's slab only through a safe
 `Any` downcast to its concrete type, never through an erased pointer; a
 zero-sized or over-aligned future takes the slab's own slot layout
 (`tests/executor.rs` runs both, at 4 KiB alignment).
+
+**The future in an `UnsafeCell`.** A suspended async future may hold
+`&mut` into itself across an `await` (a local lent to a callee), and the
+slab reaches a slot through a shared reborrow of its whole chunk (a slice's
+length, a shared walk). Over bytes outside an `UnsafeCell` that reborrow is
+a read of every slot in the chunk, which Stacked Borrows lets invalidate
+such a `&mut` in a neighbouring slot, so the task's next poll would use a
+dead reference. Inside the cell a shared reborrow freezes nothing, so a
+lookup of one slot leaves every future in its chunk as it was.
+`tests/executor.rs`'s `self_referential_futures_resume_in_their_slots` and
+`self_referential_futures_woken_by_their_wakers_resume_in_their_slots` place
+unboxed, `!Unpin` futures suspended on such a reference and reach their
+slots and their neighbours' between polls; Miri reads both under Stacked
+Borrows and under `-Zmiri-tree-borrows`.
