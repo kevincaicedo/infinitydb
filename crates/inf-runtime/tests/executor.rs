@@ -504,11 +504,25 @@ fn a_zero_sized_and_an_over_aligned_future_run_in_their_slots() {
     }
 }
 
-/// Wakes a clone of its waker on its first poll and is Pending, then Ready; it records its own
-/// address at each poll and at its drop. `Unpin`, so a move of it is sound and seen.
+/// Ready at its `ready_at`-th poll; before it, wakes a clone of its waker and is Pending. It
+/// records its own address at each poll and at its drop. `Unpin`, so a move of it is sound and
+/// seen.
 struct Recorder {
     polls: Rc<Cell<u32>>,
     at: Rc<RefCell<Vec<usize>>>,
+    ready_at: u32,
+}
+
+impl Recorder {
+    /// Pending once, woken by its own clone, then Ready.
+    fn twice(polls: &Rc<Cell<u32>>, at: &Rc<RefCell<Vec<usize>>>) -> Recorder {
+        Recorder { polls: Rc::clone(polls), at: Rc::clone(at), ready_at: 2 }
+    }
+
+    /// Ready on its first poll.
+    fn once(at: &Rc<RefCell<Vec<usize>>>) -> Recorder {
+        Recorder { polls: Rc::default(), at: Rc::clone(at), ready_at: 1 }
+    }
 }
 
 impl Future for Recorder {
@@ -518,7 +532,7 @@ impl Future for Recorder {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         self.at.borrow_mut().push(core::ptr::from_ref::<Self>(&self) as usize);
         self.polls.set(self.polls.get() + 1);
-        if self.polls.get() == 1 {
+        if self.polls.get() < self.ready_at {
             cx.waker().clone().wake();
             return Poll::Pending;
         }
@@ -534,21 +548,34 @@ impl Drop for Recorder {
 
 const RECORDERS: Cap = Cap::entries::<2>("test-recorders", CapFill::Serving);
 
-/// The first poll runs on the occupant its publish lends, in its slot (ADR-0194 D1's note): one
-/// address from the first poll to the drop, and the wake it raised kept, so the Pending task is
-/// queued once. The class is the recorder's own, of two slots: a box would hide a move.
-#[test]
-fn the_first_poll_runs_in_its_slot_and_keeps_its_wake() {
+/// An executor of one class of recorders, of two slots (a box would hide a move), and its
+/// census.
+fn recorders() -> (CellExecutor, TaskClass, Rc<CapCensus>) {
     let (census, _mark) = CapCensus::new(CellId(0));
     let mut layout = ExecutorLayout::new(&census);
     let class = layout.class(&|recorder: Recorder| recorder, RECORDERS).expect("one class");
-    let mut executor = layout.build().expect("no class refuses");
-    let (polls, at) = (Rc::new(Cell::new(0)), Rc::new(RefCell::new(Vec::new())));
+    (layout.build().expect("no class refuses"), class, census)
+}
+
+/// One recorder made a task of `class` and polled once in place.
+fn poll_recorder(
+    executor: &mut CellExecutor,
+    class: TaskClass,
+    recorder: Recorder,
+) -> PollImmediate {
     let TaskAdmission::Granted(permit) = executor.reserve::<Recorder>(class) else {
         panic!("the class has room");
     };
-    let recorder = Recorder { polls: Rc::clone(&polls), at: Rc::clone(&at) };
-    let outcome = permit.poll_immediate(|| recorder);
+    permit.poll_immediate(|| recorder)
+}
+
+/// The first poll runs in its class's spare, in its slot (ADR-0194 D1's note): one address from
+/// the first poll to the drop, and the wake it raised kept, so the Pending task is queued once.
+#[test]
+fn the_first_poll_runs_in_its_slot_and_keeps_its_wake() {
+    let (mut executor, class, _census) = recorders();
+    let (polls, at) = (Rc::new(Cell::new(0)), Rc::new(RefCell::new(Vec::new())));
+    let outcome = poll_recorder(&mut executor, class, Recorder::twice(&polls, &at));
     assert!(matches!(outcome, PollImmediate::Suspended(_)), "the first poll is Pending");
     assert_eq!(executor.run_ready(1), 1, "first-poll-wake-lost: the wake in the first poll");
     assert_eq!(polls.get(), 2, "polled twice");
@@ -557,6 +584,161 @@ fn the_first_poll_runs_in_its_slot_and_keeps_its_wake() {
     assert!(at.iter().all(|address| *address == at[0]), "first-poll-moved: {at:x?}");
     assert_eq!(executor.live_tasks(), 0);
     assert_eq!(executor.class_tasks(class), 0);
+}
+
+/// A Pending first poll takes the spare as its task's slot before its id exists, so the next
+/// first poll runs in another slot: the two addresses differ (read before any poll of the first),
+/// the first's id stays live, and the class counts one task, then none once it completes.
+#[test]
+fn the_spare_serves_no_task_an_id_names() {
+    let (mut executor, class, _census) = recorders();
+    let (polls, first) = (Rc::new(Cell::new(0)), Rc::new(RefCell::new(Vec::new())));
+    let outcome = poll_recorder(&mut executor, class, Recorder::twice(&polls, &first));
+    let PollImmediate::Suspended(id) = outcome else { panic!("the first is Pending: {outcome:?}") };
+    let second = Rc::new(RefCell::new(Vec::new()));
+    let outcome = poll_recorder(&mut executor, class, Recorder::once(&second));
+    assert_eq!(outcome, PollImmediate::Completed);
+    let (first_at, second_at) = (first.borrow()[0], second.borrow()[0]);
+    assert_ne!(first_at, second_at, "spare-under-id: a suspended task's slot was the spare");
+    assert!(executor.is_live(id), "the first task stays live");
+    assert_eq!(executor.class_tasks(class), 1, "one task; the spare is none");
+    assert_eq!(executor.run_ready(1), 1, "the first task's own wake polls it");
+    assert_eq!(polls.get(), 2);
+    assert!(!executor.is_live(id));
+    assert_eq!(executor.class_tasks(class), 0);
+    assert_eq!(executor.live_tasks(), 0);
+}
+
+/// Each other use of the class between fast first polls: a Pending first poll, an id's lookups
+/// (`is_live`, `wake`), a run that polls a task, a spawn and its
+/// run, a Retired task's reclaim, and the Pending task's completion; each that borrows the slab
+/// forgets the kept lend. Each fast op is counted by its future; Miri reads the whole sequence
+/// under both aliasing models.
+#[test]
+fn the_spare_lend_survives_every_other_borrow() {
+    let mut ex = TestExecutor::new();
+    let gate: FabricGate<u64> = FabricGate::new();
+    let hits = Rc::new(Cell::new(0u64));
+    let fast = |ex: &mut TestExecutor| {
+        let hits = Rc::clone(&hits);
+        let outcome = ex.poll_immediate(async move { hits.set(hits.get() + 1) });
+        assert_eq!(outcome, PollImmediate::Completed);
+    };
+    fast(&mut ex);
+    fast(&mut ex);
+    let waiter = gate.waiter(1);
+    let sink = Rc::clone(&hits);
+    let outcome = ex.poll_immediate(async move {
+        let value = waiter.await;
+        sink.set(sink.get() + value);
+    });
+    let PollImmediate::Suspended(id) = outcome else { panic!("the waiter suspends") };
+    fast(&mut ex);
+    assert!(ex.is_live(id));
+    fast(&mut ex);
+    assert_eq!(ex.wake(id), Woken::Queued);
+    fast(&mut ex);
+    assert_eq!(ex.run_ready(8), 1, "the woken task polls and parks again");
+    fast(&mut ex);
+    let spawned = Rc::clone(&hits);
+    ex.spawn_local(async move { spawned.set(spawned.get() + 1_000) });
+    fast(&mut ex);
+    assert_eq!(ex.run_ready(8), 1);
+    fast(&mut ex);
+    let stolen = Rc::new(RefCell::new(None));
+    assert_eq!(ex.poll_immediate(WakerThief(Rc::clone(&stolen))), PollImmediate::Completed);
+    assert_eq!(ex.retired(), 1);
+    fast(&mut ex);
+    drop(stolen.borrow_mut().take());
+    assert_eq!(ex.run_ready(8), 1, "the Retired task's reclaim");
+    fast(&mut ex);
+    assert!(gate.complete(1, 1_000_000));
+    fast(&mut ex);
+    assert_eq!(ex.run_ready(8), 1, "the waiter completes");
+    fast(&mut ex);
+    fast(&mut ex);
+    assert_eq!(hits.get(), 13 + 1_000 + 1_000_000, "thirteen fast ops, the spawn and the waiter");
+    assert_eq!(ex.live_tasks(), 0);
+    assert_eq!(ex.retired(), 0);
+    assert_eq!(ex.class_tasks(ex.class()), 0);
+}
+
+/// Fast ops on one class with an id's lookup and a shared borrow of the slab between them: each
+/// borrows the slab shared and forgets the lend, so the next fast op lends the spare again (a lend
+/// kept past a shared reborrow of its chunk would be good for reads alone under Tree Borrows).
+#[test]
+fn the_kept_lend_across_an_id_lookup_and_a_shared_borrow() {
+    let mut ex = TestExecutor::new();
+    let gate: FabricGate<u64> = FabricGate::new();
+    let hits = Rc::new(Cell::new(0u64));
+    let waiter = gate.waiter(1);
+    let outcome = ex.poll_immediate(async move {
+        let _ = waiter.await;
+    });
+    let PollImmediate::Suspended(id) = outcome else { panic!("the waiter suspends") };
+    let fast = |ex: &mut TestExecutor| {
+        let hits = Rc::clone(&hits);
+        let outcome = ex.poll_immediate(async move { hits.set(hits.get() + 1) });
+        assert_eq!(outcome, PollImmediate::Completed);
+    };
+    for _ in 0..3 {
+        fast(&mut ex);
+        assert!(ex.is_live(id));
+        fast(&mut ex);
+        assert_eq!(ex.class_tasks(ex.class()), 1, "the waiter; the spare is none");
+    }
+    assert!(gate.complete(1, 1));
+    assert_eq!(ex.run_ready(8), 1);
+    assert_eq!(hits.get(), 6);
+    assert_eq!(ex.live_tasks(), 0);
+}
+
+/// A permit dropped unused leaves its slot the class's spare, which the next first poll runs in:
+/// one address for every fast op, with a dropped permit before each, and no task counted.
+#[test]
+fn a_dropped_permit_leaves_the_spare() {
+    let (mut executor, class, _census) = recorders();
+    let at = Rc::new(RefCell::new(Vec::new()));
+    for _ in 0..3 {
+        let admission = executor.reserve::<Recorder>(class);
+        assert!(matches!(admission, TaskAdmission::Granted(_)), "the class has room");
+        drop(admission);
+        assert_eq!(executor.class_tasks(class), 0, "a dropped permit holds no task");
+        let outcome = poll_recorder(&mut executor, class, Recorder::once(&at));
+        assert_eq!(outcome, PollImmediate::Completed);
+        assert_eq!(executor.class_tasks(class), 0);
+    }
+    let at = at.borrow();
+    assert_eq!(at.len(), 6, "three polls and three drops");
+    assert!(at.iter().all(|address| *address == at[0]), "one slot, the spare: {at:x?}");
+}
+
+/// A class at its cap with its spare: `T - 1` suspended tasks and the spare, so a permit is
+/// granted, and its Pending task takes the last slot; then `T` suspended and no spare, so the
+/// next `reserve` is `Full`, counted on the class's row, nothing taken or published.
+#[test]
+fn the_class_at_its_cap_with_its_spare() {
+    let (mut executor, class, census) = recorders();
+    let (first, second) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let at = Rc::new(RefCell::new(Vec::new()));
+    let outcome = poll_recorder(&mut executor, class, Recorder::twice(&first, &at));
+    assert!(matches!(outcome, PollImmediate::Suspended(_)), "T - 1 = 1 suspended");
+    let outcome = poll_recorder(&mut executor, class, Recorder::once(&at));
+    assert_eq!(outcome, PollImmediate::Completed, "the spare made from the last free slot");
+    assert_eq!(executor.class_tasks(class), 1);
+    let outcome = poll_recorder(&mut executor, class, Recorder::twice(&second, &at));
+    assert!(matches!(outcome, PollImmediate::Suspended(_)), "the spare granted: T suspended");
+    assert_eq!(executor.class_tasks(class), 2);
+    let row = census.row(RECORDERS.name()).expect("the class's row");
+    assert_eq!((row.high_water, row.crossings), (2, 0));
+    let admission = executor.reserve::<Recorder>(class);
+    assert!(matches!(admission, TaskAdmission::Full), "no spare and no free slot");
+    drop(admission);
+    let row = census.row(RECORDERS.name()).expect("the class's row");
+    assert_eq!((row.high_water, row.crossings), (2, 1), "the crossing counted, nothing taken");
+    assert_eq!(executor.class_tasks(class), 2);
+    assert_eq!(executor.run_ready(4), 2, "each task's own wake polls it");
+    assert_eq!(executor.live_tasks(), 0);
 }
 
 // ---- Self-referential futures in their slots ---------------------------------------------------
@@ -596,8 +778,8 @@ fn park_self_referential(ex: &mut CellExecutor, class: TaskClass, seen: &Rc<Cell
 
 /// Unboxed self-referential tasks in one chunk, suspended holding `&mut` into themselves, while
 /// the executor reaches their slots and their neighbours': each one's own `wake(id)` and its
-/// poll, a neighbour's `wake(id)`, `is_live` and the class's count, and a third task's first
-/// poll between them. Each resumes and reads its own `&mut` (8). Miri reads the
+/// poll, a neighbour's `wake(id)`, `is_live` and the class's count, and a fast op's first poll
+/// in the class's spare between them. Each resumes and reads its own `&mut` (8). Miri reads the
 /// sequence under Stacked and Tree Borrows: a lookup's shared reborrow of the chunk leaves the
 /// futures, which are in an `UnsafeCell`, as they were.
 #[test]

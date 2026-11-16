@@ -242,6 +242,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_settle_on_dead)',
     'cfg(inf_canary_sidecar_rules_ignored)',
     'cfg(inf_canary_slab_instance_blind)',
+    'cfg(inf_canary_spare_kept_past_suspend)',
     'cfg(inf_canary_stop_tick_short_hold)',
     'cfg(inf_canary_stop_tick_unheld)',
     'cfg(inf_canary_sweep_owed_by_own_refusals)',

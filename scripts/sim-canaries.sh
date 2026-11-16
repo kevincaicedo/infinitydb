@@ -1135,9 +1135,9 @@ ordered_rows=(
   # An `always` write whose verdict is an error reply leaves at once, not gated (ADR-0177 D6).
   # Planted, the error waits as a verdict for the next record's `seq`, and so for the hold.
   "inf_canary_error_reply_gated m0-capacity error-held --close-leg gated-error"
-  # The first poll runs on the occupant its publish lends, in its slot (ADR-0194 D1's note), and
-  # a wake it raises is kept. Planted, the cell moves to another slot before the Pending arm links
-  # it, and the future reads a second address.
+  # The first poll runs in its class's spare, in its slot, where every later poll and the drop
+  # find it (ADR-0194 D1's note), and a wake it raises is kept. Planted, the cell moves to another
+  # slot of its class at the task's next activation, and the future reads a second address.
   "inf_canary_first_poll_off_slot crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-moved"
   # Planted, a Pending first poll leaves its header Idle and unlinked, and the wake it raised is
   # lost.
@@ -1193,6 +1193,10 @@ ordered_rows=(
   # A general send keeps one credit free for the publish fan (ADR-0192 D2), so an origin parks
   # at most 7 applies at a peer of 8 credits. Planted, the guard is gone and all 8 arrive.
   "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"
+  # A Pending first poll takes its class's spare as its task's slot, so no id names the spare
+  # (ADR-0177 D2). Planted, the task takes the spare's handle but the spare stays set, and the
+  # next first poll writes over the suspended task, at its address.
+  "inf_canary_spare_kept_past_suspend crate-test inf-runtime test:executor the_spare_serves_no_task_an_id_names spare-under-id"
   # A class handle carries its slab's `SlabInstance`, which `reserve` compares first (ADR-0171
   # A2.1). Planted, the compare is skipped, and another executor's class, built alike, is
   # granted.
