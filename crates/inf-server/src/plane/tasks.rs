@@ -232,7 +232,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{cells} cells: class-refused: {error}"));
             assert_eq!(executor.class_tasks(tasks.conn), 0, "{cells} cells");
             println!(
-                "every_class_registers_at_its_chunk: {cells} cells: conn {} slots, header array {} B",
+                "every_class_registers_at_its_chunk: {cells} cells: conn {}, header array {} B",
                 caps.conn.entries_max(),
                 executor.header_array_bytes()
             );
