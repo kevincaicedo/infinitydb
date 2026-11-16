@@ -562,21 +562,25 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     /// Owner-side named-namespace apply (the `ApplyNs` handler): admission,
     /// execution, emission — and for `always` writes the deferred-reply
     /// verdict (the fabric reply waits for this cell's fsync watermark).
+    /// `read` is the reading `gate` was opened on: it supplies the row and
+    /// its WRITE bit, the gate the class the apply stages with and `settle`
+    /// judges, as the tiered arm stages.
     #[allow(clippy::too_many_arguments)] // one apply's fields, as its two callers hold them
     pub(super) fn execute_ns_owned(
         &self,
         from: CellId,
         argv: &[&[u8]],
+        read: NsApplyRead,
         gate: ApplyGate<GatedTicket>,
         proto: Protocol,
         ns: NsId,
         program: bool,
         out: &mut ReplyBuf,
     ) -> NsApplyOutcome {
-        let read = gate.read;
-        let NsApplyRead { meta, class } = read;
+        debug_assert!(read.class() == gate.class(), "an apply stages under its gate's class");
+        let meta = read.meta();
         let is_write = read.is_write();
-        if let (Some(meta), Some(_)) = (meta, class)
+        if let (Some(meta), Some(_)) = (meta, gate.class())
             && is_write
         {
             match self.durable_admission(ns, meta, argv) {
@@ -630,7 +634,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         // at the reply's start (ADR-0190 D2) — a byte count, never a read
         // of the encoding.
         debug_assert!(!out.bytes().is_empty(), "every command writes at least one frame");
-        let outcome = self.settle_ns_apply(gate, ns, argv, out);
+        let outcome = self.settle_ns_apply(read, gate, ns, argv, out);
         #[cfg(feature = "doc")]
         if let Some((keys, _)) = &bracket {
             self.store.borrow_mut().idx_bracket_commit(ns, keys);
@@ -639,18 +643,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     }
 
     /// An executed `ApplyNs`'s end (ADR-0177 D6): a write whose reply stages
-    /// stages its durable effects, then its gate settles on the staged `seq`,
-    /// and a gated verdict counts its ack.
+    /// stages its durable effects with its gate's class, then the gate
+    /// settles on the staged `seq`, and a gated verdict counts its ack.
     fn settle_ns_apply(
         &self,
+        read: NsApplyRead,
         gate: ApplyGate<GatedTicket>,
         ns: NsId,
         argv: &[&[u8]],
         out: &ReplyBuf,
     ) -> NsApplyOutcome {
-        let NsApplyRead { meta, class } = gate.read;
-        let staged = if gate.read.is_write()
-            && let (Some(meta), Some(class)) = (meta, class)
+        let staged = if read.is_write()
+            && let (Some(meta), Some(class)) = (read.meta(), gate.class())
             && stages(out.outcome(), meta.id)
         {
             self.stage_durable_effects(ns, meta, argv, class)
@@ -777,7 +781,7 @@ impl NsApplyRead {
         self.meta
     }
 
-    /// The namespace's fsync class: the one a staged effect is staged with.
+    /// The namespace's fsync class, the one the apply's gate keeps.
     pub(super) fn class(self) -> Option<FsyncClass> {
         self.class
     }
@@ -795,14 +799,16 @@ impl NsApplyRead {
 }
 
 /// One apply's gating decision (ADR-0015 D6, ADR-0177 D6), from its one
-/// reading, taken before its first effect: the reading, and what the
-/// apply's verdict waits behind when the reading gates it (an `always`
-/// write): a peer origin's [`GatedTicket`], a client's [`ClientAck`], and on
-/// a read-only leg nothing (`Infallible`). Its fields are private, so the
-/// constructors below are the only ones, and a `Gated` outcome holds what it
-/// waits behind.
+/// reading, taken before its first effect: the reading's fsync class, the
+/// one the apply stages with, and what the apply's verdict waits behind when
+/// the reading gates it (an `always` write): a peer origin's [`GatedTicket`],
+/// a client's [`ClientAck`], and on a read-only leg nothing (`Infallible`).
+/// Its fields are private, so the constructors below are the only ones, and
+/// a `Gated` outcome holds what it waits behind. It keeps the class, not the
+/// reading: a future that holds the gate beside the command's row holds the
+/// row once.
 pub(super) struct ApplyGate<G> {
-    read: NsApplyRead,
+    class: Option<FsyncClass>,
     waits: Option<G>,
 }
 
@@ -821,14 +827,14 @@ impl ApplyGate<GatedTicket> {
         read: NsApplyRead,
     ) -> Result<ApplyGate<GatedTicket>, ParkedFull> {
         let waits = if read.gates() { Some(GatedBook::open(book, origin)?) } else { None };
-        Ok(ApplyGate { read, waits })
+        Ok(ApplyGate { class: read.class, waits })
     }
 }
 
 impl ApplyGate<ClientAck> {
     /// A client's command: its reply waits on its own waiter iff `read` gates.
     pub(super) fn client(read: NsApplyRead) -> ApplyGate<ClientAck> {
-        ApplyGate { read, waits: read.gates().then_some(ClientAck) }
+        ApplyGate { class: read.class, waits: read.gates().then_some(ClientAck) }
     }
 }
 
@@ -836,29 +842,30 @@ impl ApplyGate<Infallible> {
     /// A read-only leg (a scatter program's): `None` when `read` gates, which
     /// the leg refuses before any effect; its gate has nothing to wait behind.
     pub(super) fn read_only(read: NsApplyRead) -> Option<ApplyGate<Infallible>> {
-        (!read.gates()).then_some(ApplyGate { read, waits: None })
+        (!read.gates()).then_some(ApplyGate { class: read.class, waits: None })
     }
 }
 
 impl<G> ApplyGate<G> {
-    /// The apply's one reading.
-    pub(super) fn read(&self) -> NsApplyRead {
-        self.read
+    /// The namespace's fsync class from the apply's one reading: the one its
+    /// effects stage with, and the one `settle` judges.
+    pub(super) fn class(&self) -> Option<FsyncClass> {
+        self.class
     }
 
     /// The apply's end: `staged` is the `seq` of the effect it staged, if
     /// any. `Some` iff it staged and its gate waits, with what it waits
     /// behind; otherwise the wait drops (a ticket releases its slot). A
-    /// staged `seq` under an `always` reading whose gate does not wait is a
+    /// staged `seq` under an `always` class whose gate does not wait is a
     /// command that stages without the registry's WRITE bit: its reply would
     /// leave before its fsync, so the cell stops first.
     pub(super) fn settle(self, staged: Option<u64>) -> Option<(u64, G)> {
-        let ApplyGate { read, waits } = self;
+        let ApplyGate { class, waits } = self;
         let seq = staged?;
         if let Some(gate) = waits {
             return Some((seq, gate));
         }
-        assert!(read.class != Some(FsyncClass::Always), "a staged `always` write's gate waits");
+        assert!(class != Some(FsyncClass::Always), "a staged `always` write's gate waits");
         None
     }
 }

@@ -230,8 +230,8 @@ impl WriteGuard {
 }
 
 /// One tiered command, executed to a complete reply under its apply's gate:
-/// it stages with the gate's reading's fsync class (tiered ⊆ durable —
-/// ADR-0062 D1), and a staged write's reply is gated when the gate waits.
+/// it stages with the gate's fsync class (tiered ⊆ durable — ADR-0062 D1),
+/// and a staged write's reply is gated when the gate waits.
 /// One future, so the gate is held across the command beside its arguments
 /// and never copied into a second frame.
 pub(super) async fn dispatch_tiered<O, F, G>(
@@ -249,7 +249,7 @@ where
 {
     let started = shared.now.get();
     let cold_before = cold_issued(shared);
-    let outcome = run_command(shared, ns, meta, argv, proto, gate.read().class()).await;
+    let outcome = run_command(shared, ns, meta, argv, proto, gate.class()).await;
     note_served(shared, origin, ns, argv, (started, cold_before), &outcome);
     let (reply, staged) = match outcome {
         TierWrite::Done(reply) => (reply, None),

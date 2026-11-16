@@ -165,7 +165,8 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             Err(ParkedFull) => return refuse_parked(shared, from, token),
         };
         let mut reply = OpenReply::new(shared.take_reply_buf());
-        let applied = shared.execute_ns_owned(from, argv, gate, proto, ns, program, reply.reply());
+        let applied =
+            shared.execute_ns_owned(from, argv, read, gate, proto, ns, program, reply.reply());
         let reply = reply.finish();
         match applied {
             NsApplyOutcome::Park => {

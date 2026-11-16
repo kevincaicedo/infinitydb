@@ -199,7 +199,7 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             };
             let start = scratch.len();
             let reply = scratch.open();
-            match shared.execute_ns_owned(from, argv, gate, proto, NsId(ns), program, reply) {
+            match shared.execute_ns_owned(from, argv, read, gate, proto, NsId(ns), program, reply) {
                 NsApplyOutcome::Gated(seq, ticket) => {
                     let verdict = GatedVerdict::new(shared, token, seq, reply.detach());
                     ticket.fill(verdict);
