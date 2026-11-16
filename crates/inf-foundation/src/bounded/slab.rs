@@ -181,6 +181,14 @@ pub enum Released {
     Vacant,
 }
 
+/// What `vacated` left of a slot's transition for its off-path step.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Vacated {
+    Written,
+    Assembling,
+    Retiring,
+}
+
 /// The answer to `reserve()`: a slot, `Full` (every slot that can serve is
 /// live: no value taken, the row's crossings up by one), or `Exhausted`
 /// (every slot retired: the site's typed refusal). It carries the slot's
@@ -379,15 +387,17 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     #[inline]
     pub fn take(&mut self, id: SlotId<G>) -> Taken<T> {
         let foreign = self.foreign(&id);
-        let CappedSlab { row, live, store, .. } = self;
         let lent = named(
             foreign,
-            || store.slot_chain_mut(id.index).map(|(slot, chain)| Vacate(slot, chain)),
+            || self.store.slot_chain_mut(id.index).map(|(slot, chain)| Vacate(slot, chain)),
             id.generation,
         );
         match lent {
             Named::Live((value, slot, chain)) => {
-                Self::vacated(slot, chain, id, live, row);
+                let left = Self::vacated(slot, chain, id, &mut self.live, &self.row);
+                if left != Vacated::Written {
+                    self.vacated_off_path(id, left);
+                }
                 Taken::Value(value)
             }
             Named::Stale => Taken::Stale,
@@ -418,15 +428,17 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
         #[cfg(not(inf_canary_release_moves_occupant))]
         {
             let foreign = self.foreign(&id);
-            let CappedSlab { row, live, store, .. } = self;
             let lent = named(
                 foreign,
-                || store.slot_chain_mut(id.index).map(|(slot, chain)| InPlace(slot, chain)),
+                || self.store.slot_chain_mut(id.index).map(|(slot, chain)| InPlace(slot, chain)),
                 id.generation,
             );
             match lent {
                 Named::Live((slot, chain)) => {
-                    Self::vacated(slot, chain, id, live, row);
+                    let left = Self::vacated(slot, chain, id, &mut self.live, &self.row);
+                    if left != Vacated::Written {
+                        self.vacated_off_path(id, left);
+                    }
                     Released::Dropped
                 }
                 Named::Stale => Released::Stale,
@@ -500,12 +512,14 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     }
 
     /// D1's take transition on a slot `named` found live at `id`'s
-    /// generation, the one body of `take` and `release`: the live count, an
-    /// `Assembly` row's removal report, the policy's advance with the free
-    /// head linked or the slot's retirement with the row's capacity report,
-    /// and the slot's write last, which drops an occupant still in it
-    /// (`release`'s) where it lies. Each arm writes the slot itself, so no
-    /// slot-sized value is built apart.
+    /// generation, the one body of `take` and `release`, in this order: the
+    /// live count, an `Assembly` row's removal report, the policy's advance
+    /// with the free head linked or the slot's retirement with the row's
+    /// capacity report, and the slot's write last, which drops an occupant
+    /// still in it (`release`'s) where it lies. A serving slab's advance is
+    /// written here; a report and a retirement are left, the slot unwritten,
+    /// for `vacated_off_path` once the lookup's borrow ends, so the serving
+    /// path holds nothing across a call.
     #[inline(always)]
     fn vacated(
         slot: &mut Slot<T, G>,
@@ -513,17 +527,50 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
         id: SlotId<G>,
         live: &mut u32,
         row: &CapRowHandle,
-    ) {
+    ) -> Vacated {
         *live = live_taken(*live);
         if row.fill() == CapFill::Assembly {
-            row.report_removal(*live);
+            return Vacated::Assembling;
         }
+        Self::advanced(slot, chain, id)
+    }
+
+    /// The policy's advance with the free head linked and the slot's write,
+    /// or, at the last generation, the retirement left to the caller. The arm
+    /// writes the slot itself, so no slot-sized value is built apart.
+    #[inline(always)]
+    fn advanced(slot: &mut Slot<T, G>, chain: Chain<'_>, id: SlotId<G>) -> Vacated {
         match P::advance(id.generation) {
             Some(generation) => {
                 let next = chain.free(id.index);
                 *slot = Slot::Free { generation, next };
+                Vacated::Written
             }
-            None => Self::retired(slot, chain, row),
+            None => Vacated::Retiring,
+        }
+    }
+
+    /// The rest of a vacated slot off the serving path, the slot found again
+    /// by its index once the lookup's borrow ended (the caller found it live
+    /// a step ago): an `Assembly` row's removal reported, then the advance,
+    /// and a retirement.
+    #[cold]
+    #[inline(never)]
+    fn vacated_off_path(&mut self, id: SlotId<G>, left: Vacated) {
+        let mut left = left;
+        if left == Vacated::Assembling {
+            self.row.report_removal(self.live);
+            let found = self.store.slot_chain_mut(id.index);
+            debug_assert!(found.is_some(), "a vacated slot is in its store");
+            let Some((slot, chain)) = found else { return };
+            left = Self::advanced(slot, chain, id);
+        }
+        if left == Vacated::Retiring {
+            let CappedSlab { row, store, .. } = self;
+            let found = store.slot_chain_mut(id.index);
+            debug_assert!(found.is_some(), "a vacated slot is in its store");
+            let Some((slot, chain)) = found else { return };
+            Self::retired(slot, chain, row);
         }
     }
 
@@ -1657,6 +1704,15 @@ mod tests {
         assert_eq!((slab.len(), slab.capacity_now()), (0, 1));
         assert_eq!(census.row("released").expect("row").capacity_now, 1);
         assert!(matches!(slab.get(id), Lookup::Stale), "a closed slot's handle");
+
+        // An `Assembly` slab's release reports the removal to its row.
+        let assembling = Cap::entries::<2>("released-assembly", CapFill::Assembly);
+        let (mut owners, _) = built::<DroppedAt, u32, Retire>(assembling, &census);
+        let kept = publish(&mut owners, DroppedAt(Rc::new(Cell::new(0)))).expect("room");
+        let _also = publish(&mut owners, DroppedAt(Rc::new(Cell::new(0)))).expect("room");
+        assert_eq!(owners.release(kept), Released::Dropped);
+        let row = census.row("released-assembly").expect("row");
+        assert_eq!((owners.len(), row.assembly_live), (1, 1), "the removal reported");
 
         // A drop that panics runs last: the counts and the chain are written.
         let (mut panics, _) = built::<PanicsOnDrop, u32, Retire>(cap, &census);

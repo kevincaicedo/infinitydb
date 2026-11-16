@@ -351,10 +351,10 @@ impl<T, G: SlotGeneration, const C: usize> Root<T, G, C> {
 
 /// A free slot the store's head names, borrowed for one step: `occupy`
 /// makes it live and moves the head to the next free slot. It borrows the
-/// slot and its chain together, so nothing changes between the two.
+/// slot and the head together, so nothing changes between the two.
 pub(super) struct FreeSlot<'a, T, G> {
     slot: &'a mut Slot<T, G>,
-    chain: Chain<'a>,
+    free_head: &'a mut u32,
     index: u32,
     generation: G,
     next: u32,
@@ -402,9 +402,9 @@ impl<'a, T, G: SlotGeneration> FreeSlot<'a, T, G> {
     /// there (ADR-0194 D1's notes).
     #[inline]
     pub(super) fn occupy_mut(self, value: T) -> (u32, G, &'a mut T) {
-        let FreeSlot { slot, chain, index, generation, next } = self;
+        let FreeSlot { slot, free_head, index, generation, next } = self;
         *slot = Slot::Live { generation, value };
-        *chain.free_head = next;
+        *free_head = next;
         match slot {
             Slot::Live { value, .. } => (index, generation, value),
             Slot::Free { .. } | Slot::Closed => unreachable!("a slot just made live is live"),
@@ -564,10 +564,10 @@ impl<T, G: SlotGeneration, const CHUNK_SLOTS: usize> SlotStore<T, G, CHUNK_SLOTS
     #[inline]
     pub(super) fn reserve(&mut self) -> Option<FreeSlot<'_, T, G>> {
         let index = self.free_head;
-        let SlotStore { root, free_head, capacity_now, .. } = self;
+        let SlotStore { root, free_head, .. } = self;
         let slot = root_slot_mut(root, index)?;
         let Slot::Free { generation, next } = *slot else { return None };
-        Some(FreeSlot { slot, chain: Chain { free_head, capacity_now }, index, generation, next })
+        Some(FreeSlot { slot, free_head, index, generation, next })
     }
 
     /// As `reserve`, with slot `other` borrowed beside the free one for the
@@ -577,11 +577,10 @@ impl<T, G: SlotGeneration, const CHUNK_SLOTS: usize> SlotStore<T, G, CHUNK_SLOTS
     #[inline]
     pub(super) fn reserve_beside(&mut self, other: u32) -> Option<FreeBeside<'_, T, G>> {
         let index = self.free_head;
-        let SlotStore { root, free_head, capacity_now, .. } = self;
+        let SlotStore { root, free_head, .. } = self;
         let [slot, beside] = root_slot_pair_mut(root, index, other)?;
         let Slot::Free { generation, next } = *slot else { return None };
-        let chain = Chain { free_head, capacity_now };
-        Some((FreeSlot { slot, chain, index, generation, next }, beside))
+        Some((FreeSlot { slot, free_head, index, generation, next }, beside))
     }
 
     #[inline]
@@ -602,7 +601,8 @@ impl<T, G: SlotGeneration, const CHUNK_SLOTS: usize> SlotStore<T, G, CHUNK_SLOTS
     }
 
     /// Slot `index` mutably, with the chain beside it, for one step: the
-    /// split borrow `reserve` makes, for a slab's `take` and `release`.
+    /// split borrow `reserve` makes of the slot and the head, for a slab's
+    /// `take` and `release`.
     #[inline]
     pub(super) fn slot_chain_mut(&mut self, index: u32) -> Option<(&mut Slot<T, G>, Chain<'_>)> {
         let SlotStore { root, free_head, capacity_now, .. } = self;
