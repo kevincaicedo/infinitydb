@@ -252,9 +252,10 @@ impl<F: Future<Output = ()> + 'static> TaskPermit<'_, F> {
     }
 }
 
-/// A first poll Ready while a waker the future left names its header (E's Retired row, off the
-/// fast path): the spare's handle leaves it for the Retired header, which holds the slot until
-/// that waker's drop links its reclaim.
+/// A first poll Ready while a waker the future left names its header, off the fast path: a
+/// finished task whose header a waker names stays Retired (ADR-0177 D2), so the spare's handle
+/// leaves it for the Retired header, which holds the slot until that waker's drop links its
+/// reclaim.
 ///
 /// # Safety
 /// `header` is the spare's, open, on the owner thread, its future just dropped in place.
