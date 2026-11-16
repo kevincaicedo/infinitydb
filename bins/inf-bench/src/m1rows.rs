@@ -28,6 +28,9 @@ mod empty_node;
 mod memory;
 
 pub(crate) use empty_node::EmptyNodeValues;
+#[cfg(test)]
+pub(crate) use empty_node::RECEIVE_BUFFERS_DEFAULT;
+pub(crate) use empty_node::{EMPTY_NODE_CELLS, MemoryLeg, PinUnproven, PinnedRss, idle_leg};
 
 fn control(port: u16, argv: &[&[u8]]) -> Result<Vec<u8>, String> {
     let mut conn = connect("127.0.0.1", port)?;

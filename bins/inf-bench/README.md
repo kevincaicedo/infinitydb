@@ -28,6 +28,7 @@ inf-bench gate-run m0|m1|m2|m4 [flags]
 inf-bench zipfian [flags]
 inf-bench mixed-audit [flags]          # mixed-node coexistence audit
 inf-bench ycsb [flags]                 # YCSB rows, split latency reporting
+inf-bench idle-resident [flags]        # idle resident memory, one build against another
 ```
 
 ### `ycsb`
@@ -173,6 +174,47 @@ inf-bench zipfian --keyspace 1000000 --ops 5000000 --maxmemory-mb 512 --theta 0.
 
 It writes a `.artifacts/m1/<stamp>-zipfian/report.md` artifact and exits
 non-zero if InfinityDB trails Redis by more than the threshold.
+
+### `idle-resident`
+
+The idle node's resident memory, one build of `infinityd` (the candidate)
+against another (the base), in bytes a cell. Each boot is the empty-node
+rows' memory leg: four cells at the shipped defaults, the first `+PONG`, a
+5 s settle and a 10 s window, then `VmRSS` divided by the cells. Six boots
+run one node at a time in the order base, candidate, candidate, base, base,
+candidate; the reading is the candidate's median less the base's.
+
+```bash
+inf-bench idle-resident --preflight
+inf-bench idle-resident --base OLD --candidate NEW --control-bytes-cell 262144 \
+  --budget-bytes-cell 3145728 [--caps-row ROW[,ROW]]
+inf-bench idle-resident --base PLAIN --candidate PLANTED --control-bytes-cell 262144 \
+  --plant-bytes-cell 3145728 --plant-row ROW[,ROW] [--pinned-bytes-cell BYTES]
+```
+
+A budget is over when the reading passes it; a plant is caught when the
+reading rises over nine tenths of its bytes. A plant at or under ten times
+the control is refused before any boot: with each arm's boots within the
+control, the reading is off by at most the control, so only above ten
+controls does a fully resident plant read over nine tenths while a plant four
+fifths resident, or the same build against itself, reads under it.
+
+Before any verdict the run checks, in order: the host (Linux, a readable
+`/proc`, transparent huge pages not `always`); the arguments; every boot
+serving with its capacity census `serving` on every cell; every boot's
+receive pools registered (`VmPin` over the floor); every `--caps-row` and
+`--plant-row` present on every cell of every candidate boot; `VmPin` within
+a page inside an arm and, across the arms, within the control of the
+declared `--pinned-bytes-cell` (0 unless declared); every `--plant-row`'s
+cap changed on every cell; and each arm's spread within the control. The
+first that fails decides, and the run prints its line.
+
+It prints the host, one line a boot, the control's spreads and one verdict
+line: `IDLE-RESIDENT-OVER:` and exit 1, `IDLE-RESIDENT-WITHIN:` and exit 0, or
+exit 2 with `WITHHELD:` (the host or a boot outside the instrument's scope)
+or `NO VERDICT:`. Those three codes are its only ones. The planted-bug
+canaries run it on a planted node against the plain one; it reads `/proc`,
+so off Linux it withholds.
 
 ## Tier honesty (L10)
 

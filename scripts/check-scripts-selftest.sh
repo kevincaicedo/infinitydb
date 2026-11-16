@@ -3142,6 +3142,304 @@ dir=$(loom_fixture loom-judged-nothing 'echo "running 0 tests"; exit 0' "$ok_lin
 expect_red_because "canaries: on Linux a loom model the planted build never ran is judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture loom the_row (no test the_row ran)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 }
 
+# ---------------------------------------- planted-bug canary driver: nodes
+group_sim_canaries_binary() {
+# A binary row builds the shipped node twice and judges the planted one
+# against the plain one through an inf-bench instrument. The stub nodes and
+# the stub inf-bench stand at INF_CANARY_SIM_TARGET; the stub cargo answers
+# only the build lines the lane must pass, each with RUSTFLAGS set, and
+# logs every call, as the stub bench does, so a case reads their order.
+# Each hook file holds what one call does. Every case is judged on Linux
+# unless it names another host.
+CANARY=./scripts/sim-canaries.sh
+export INF_CANARY_HOST=Linux
+bin_root=$(pwd -P)/target
+bin_flags='--plant-bytes-cell 3145728 --control-bytes-cell 262144 --plant-row fixture_row'
+bin_caught='echo "boot 1/6 base: 25165824 B a cell"; echo "control: spreads 4096 (base), 8192 (candidate), within 262144 (bytes a cell)"; echo "T-OVER: reading 3200000 B a cell"; exit 1'
+binary_fixture() {
+    local name=$1 dir
+    [ -n "$name" ] && [ -n "$work" ] || { echo "binary_fixture: empty name or work dir" >&2; exit 2; }
+    dir="$work/$name"
+    mkdir -p "$dir/target/canary-plain/release"
+    echo "inf_canary_fixture binary idle-resident T-OVER $bin_flags" >"$dir/rows"
+    printf '%s\n' 'echo "host: Linux stub"; exit 0' >"$dir/on-preflight"
+    printf '%s\n' "$bin_caught" >"$dir/on-run"
+    printf '%s\n' "cp \"$dir/bench\" \"$dir/target/canary-plain/release/inf-bench\"; exit 0" >"$dir/on-bench"
+    printf '%s\n' 'exit 0' >"$dir/on-plain"
+    printf '%s\n' 'exit 0' >"$dir/on-planted"
+    {
+        echo '#!/usr/bin/env bash'
+        echo "here='$dir'"
+        echo 'case "$*" in'
+        echo '  "idle-resident --preflight") echo "bench preflight" >>"$here/calls"; . "$here/on-preflight" ;;'
+        echo "  \"idle-resident --base $dir/target/canary-plain/release/infinityd --candidate $dir/target/canary-inf_canary_\"*\"/release/infinityd $bin_flags\")"
+        echo '    echo "bench run" >>"$here/calls"; . "$here/on-run" ;;'
+        echo '  *) echo "stub inf-bench: unexpected arguments: $*"; exit 3 ;;'
+        echo 'esac'
+    } >"$dir/bench"
+    {
+        echo '#!/usr/bin/env bash'
+        echo "here='$dir'"
+        echo '[ -z "${CARGO_ENCODED_RUSTFLAGS+set}" ] || { echo "error: CARGO_ENCODED_RUSTFLAGS outranks RUSTFLAGS"; exit 101; }'
+        echo 'if [ "${1:-}" = test ]; then'
+        echo '  if [ -n "${RUSTFLAGS:-}" ]; then echo "test the_row ... FAILED"; exit 101; fi'
+        echo '  echo "test the_row ... ok"; exit 0'
+        echo 'fi'
+        echo '[ "${RUSTFLAGS+set}" = set ] || { echo "stub cargo: a build without RUSTFLAGS: $*"; exit 99; }'
+        echo 'case "$RUSTFLAGS|$*" in'
+        echo "  \"|build --release -p inf-bench --target-dir $bin_root/canary-plain\")"
+        echo '    echo "cargo inf-bench" >>"$here/calls"; . "$here/on-bench" ;;'
+        echo "  \"|build --release -p infinityd --target-dir $bin_root/canary-plain\")"
+        echo '    echo "cargo plain" >>"$here/calls"; . "$here/on-plain" ;;'
+        echo '  "--cfg inf_canary_"*)'
+        echo '    cfg=${RUSTFLAGS#--cfg }'
+        echo "    [ \"\$*\" = \"build --release -p infinityd --target-dir $bin_root/canary-\$cfg\" ] \\"
+        echo '      || { echo "stub cargo: unexpected planted build: $*"; exit 99; }'
+        echo '    echo "cargo planted $cfg" >>"$here/calls"; . "$here/on-planted" ;;'
+        echo '  *) echo "stub cargo: unexpected build: RUSTFLAGS=$RUSTFLAGS $*"; exit 99 ;;'
+        echo 'esac'
+    } >"$dir/cargo"
+    chmod +x "$dir/bench" "$dir/cargo"
+    echo "$dir"
+}
+dir=$(binary_fixture binary-caught)
+expect green "canaries: a binary row whose instrument reads its token is a catch, the lane building inf-bench" env -u INF_CANARY_BENCH INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "canaries: the binary catch quotes the token's line and its build and run seconds" grep -q "caught: T-OVER: reading 3200000 B a cell ([0-9]* s + [0-9]* s)" "$dir/run.log"
+expect green "canaries: a binary row's lines carry its label" grep -q "== canary inf_canary_fixture binary idle-resident: the planted node against the plain one must read T-OVER" "$dir/run.log"
+expect green "canaries: inf-bench builds first, then the preflight, then the plain and the planted node" test "$(cat "$dir/calls")" = "$(printf '%s\n' 'cargo inf-bench' 'bench preflight' 'cargo plain' 'cargo planted inf_canary_fixture' 'bench run')"
+: >"$dir/calls"
+expect green "canaries: a binary row's builds ignore CARGO_ENCODED_RUSTFLAGS, which the lane unsets" env -u INF_CANARY_BENCH CARGO_ENCODED_RUSTFLAGS="--cfg=x" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect red "canaries: the node stub cargo refuses CARGO_ENCODED_RUSTFLAGS" env CARGO_ENCODED_RUSTFLAGS="--cfg=x" RUSTFLAGS= "$dir/cargo" build --release -p infinityd --target-dir "$bin_root/canary-plain"
+expect red "canaries: the node stub cargo refuses a node build without RUSTFLAGS" env -u RUSTFLAGS "$dir/cargo" build --release -p infinityd --target-dir "$bin_root/canary-plain"
+expect red "canaries: the node stub cargo refuses a node build with a feature" env RUSTFLAGS= "$dir/cargo" build --release -p infinityd --features uring --target-dir "$bin_root/canary-plain"
+dir=$(binary_fixture binary-toothless)
+printf '%s\n' 'echo "T-WITHIN: reading 0 B a cell"; exit 0' >"$dir/on-run"
+expect_red_because "canaries: a binary row read within is NOT CAUGHT" "NOT CAUGHT: the instrument read the planted node within" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(binary_fixture binary-token-inside)
+printf '%s\n' 'echo "inf-bench: unknown subcommand x: T-OVER: quoted"; exit 1' >"$dir/on-run"
+expect_red_because "canaries: exit 1 with the token only inside another line is no catch" "red for another reason (exit 1, expected 1 and a line beginning 'T-OVER:')" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(binary_fixture binary-no-verdict)
+printf '%s\n' "echo \"NO VERDICT: control spread 300000 B a cell on the base arm, over the control's 262144 B a cell\"; exit 2" >"$dir/on-run"
+expect_red_because "canaries: an instrument that gave no verdict is red, its reason quoted" "red for another reason (the instrument gave no verdict): NO VERDICT: control spread 300000" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# Caught needs exit 1: a line beginning the token on any other exit (a
+# token every run prints would otherwise read caught) is red.
+for code in 2 101; do
+    dir=$(binary_fixture "binary-token-exit-$code")
+    printf '%s\n' "echo \"T-OVER: reading 3200000 B a cell\"; exit $code" >"$dir/on-run"
+    expect red "canaries: a token line on exit $code is no catch" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+    cp "$work/log" "$dir/run.log"
+    expect red "canaries: a token line on exit $code is never counted caught" grep -q "caught:" "$dir/run.log"
+done
+# Judged nothing is exit 2 and a line beginning `WITHHELD:`, both halves:
+# off Linux an exit-0 run with such a line is NOT CAUGHT, and exit 2 with
+# the word inside another line is a red, neither of them NOT RUN.
+dir=$(binary_fixture binary-withheld-exit-0)
+printf '%s\n' 'echo "WITHHELD: a line the planted run printed"; exit 0' >"$dir/on-run"
+expect_red_because "canaries: off Linux exit 0 with a WITHHELD line is NOT CAUGHT" "NOT CAUGHT: the instrument read the planted node within" env INF_CANARY_HOST=Darwin INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(binary_fixture binary-withheld-mid-line)
+printf '%s\n' 'echo "NO VERDICT: a boot failed: WITHHELD: quoted from the node"; exit 2' >"$dir/on-run"
+expect_red_because "canaries: off Linux exit 2 with WITHHELD inside a line is red" "red for another reason (the instrument gave no verdict): NO VERDICT: a boot failed: WITHHELD: quoted" env INF_CANARY_HOST=Darwin INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# A planted run whose token line comes first, two megabytes before its
+# end: caught, as the token's reader reads the log whole.
+dir=$(binary_fixture binary-token-long)
+printf '%s\n' 'echo "T-OVER: reading 3200000 B a cell"' "awk 'BEGIN { for (i = 0; i < 40000; i++) print \"filler line \" i \" of a long instrument log\" }'" 'exit 1' >"$dir/on-run"
+expect green "canaries: a long instrument log with its token line first is a catch" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# A preflight that withholds its verdict on its first line, two megabytes
+# before its end: judged nothing, as any reader of the lane reads it whole.
+dir=$(binary_fixture binary-preflight-long)
+printf '%s\n' 'echo "WITHHELD: the instrument reads /proc: Linux only"' "awk 'BEGIN { for (i = 0; i < 40000; i++) print \"filler line \" i \" of a long preflight log\" }'" 'exit 2' >"$dir/on-preflight"
+expect_red_because "canaries: a long preflight log withheld on its first line is judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture binary idle-resident (WITHHELD: the instrument reads /proc: Linux only)" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(binary_fixture binary-withheld-off-linux)
+printf '%s\n' 'echo "WITHHELD: the instrument reads /proc: Linux only"; exit 2' >"$dir/on-preflight"
+printf '%s\n' 'exit 99' >"$dir/on-plain"
+printf '%s\n' 'exit 99' >"$dir/on-planted"
+printf '%s\n' "inf_canary_caught crate-test fake test:suite the_row" "inf_canary_fixture binary idle-resident T-OVER $bin_flags" >"$dir/rows"
+expect green "canaries: off Linux a withheld preflight is not run beside a caught row" env INF_CANARY_HOST=Darwin INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "canaries: the withheld binary row is named with its reason" grep -q "NOT RUN on Darwin: inf_canary_fixture binary idle-resident (WITHHELD: the instrument reads /proc: Linux only)" "$dir/run.log"
+expect green "canaries: the summary names the binary row not run" grep -q "1 canaries caught, 1 not run on Darwin (inf_canary_fixture binary idle-resident)" "$dir/run.log"
+expect red "canaries: a withheld preflight builds no node" grep -q "cargo" "$dir/calls"
+expect_red_because "canaries: on Linux a withheld preflight is judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture binary idle-resident (WITHHELD:" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(binary_fixture binary-withheld-run)
+printf '%s\n' 'echo "WITHHELD: registration unproven (VmPin 0, floor 100663296, memlock 65536 bytes)"; exit 2' >"$dir/on-run"
+expect_red_because "canaries: on Linux a run withheld on its boots is judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture binary idle-resident (WITHHELD: registration unproven" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(binary_fixture binary-planted-build-red)
+printf '%s\n' 'echo "error: could not compile infinityd"; exit 101' >"$dir/on-planted"
+expect_red_because "canaries: a binary row whose planted node build fails is red" "red for another reason (the planted build failed" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect red "canaries: no instrument runs without a planted node" grep -q "bench run" "$dir/calls"
+for row in "idle-resident" "idle-resident --plant-bytes-cell 3145728 --control-bytes-cell 262144" "idle-resident T-OVER --budget-bytes-cell 1 --control-bytes-cell 262144" "idle-resident T-OVER --control-bytes-cell 262144 --plant-row fixture_row" "idle-resident T-OVER --plant-bytes-cell 3145728 --budget-bytes-cell 1"; do
+    echo "inf_canary_fixture binary $row" >"$dir/rows"
+        expect_red_because "canaries: a binary row '$row' is malformed" "malformed row: inf_canary_fixture binary $row" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+done
+dir=$(binary_fixture binary-two-cfgs)
+printf '%s\n' '[ ! -e "$here/plain-built" ] || exit 99' 'touch "$here/plain-built"; exit 0' >"$dir/on-plain"
+printf '%s\n' "inf_canary_a binary idle-resident T-OVER $bin_flags" "inf_canary_b binary idle-resident T-OVER $bin_flags" >"$dir/rows"
+expect green "canaries: two binary rows on two cfgs build the plain node once" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "canaries: both binary rows are caught" test "$(grep -c 'caught: T-OVER:' "$dir/run.log")" -eq 2
+expect green "canaries: one preflight serves an instrument's rows" test "$(grep -c 'bench preflight' "$dir/calls")" -eq 1
+dir=$(binary_fixture binary-plain-build-red)
+printf '%s\n' 'echo "error: could not compile infinityd"; exit 101' >"$dir/on-plain"
+printf '%s\n' "inf_canary_a binary idle-resident T-OVER $bin_flags" "inf_canary_b binary idle-resident T-OVER $bin_flags" "inf_canary_c crate-test fake test:suite the_row" >"$dir/rows"
+expect_red_because "canaries: a failed plain node build is red" "red for another reason (the plain build failed" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "canaries: every binary row reads the failed plain node build" test "$(grep -c 'the plain build failed' "$dir/run.log")" -eq 2
+expect red "canaries: no planted node is built without a plain one" grep -q "cargo planted" "$dir/calls"
+expect green "canaries: the crate-test row after a failed plain node build is caught" grep -q "caught: test the_row ... FAILED" "$dir/run.log"
+dir=$(binary_fixture binary-bench-build-red)
+printf '%s\n' 'echo "error: could not compile inf-bench"; exit 101' >"$dir/on-bench"
+expect_red_because "canaries: a failed inf-bench build is red for its rows" "red for another reason (the inf-bench build failed" env -u INF_CANARY_BENCH INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect red "canaries: no preflight or node follows a failed inf-bench build" grep -q "bench preflight\|cargo plain" "$dir/calls"
+dir=$(binary_fixture binary-preflight-red)
+printf '%s\n' 'echo "inf-bench: unknown subcommand idle-resident"; exit 1' >"$dir/on-preflight"
+expect_red_because "canaries: a preflight exiting 1 is red for another reason" "red for another reason (the preflight exited 1)" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+expect red "canaries: a red preflight builds no node" grep -q "cargo" "$dir/calls"
+# Under INF_CANARY_CONTROLS_ONLY a binary row is named and not run: its
+# control runs only inside its planted run.
+dir=$(binary_fixture binary-controls-only)
+printf '%s\n' "inf_canary_caught crate-test fake test:suite the_row" "inf_canary_fixture binary idle-resident T-OVER $bin_flags" >"$dir/rows"
+expect_output "canaries: controls-only names a binary row and counts the other's control" "controls only: 1 rows' controls green" env INF_CANARY_CONTROLS_ONLY=1 INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "canaries: controls-only says why the binary row is not run" grep -q "inf_canary_fixture binary idle-resident: its control is the plain node inside its planted run: not run here" "$dir/run.log"
+expect red "canaries: controls-only runs no instrument and builds no node" test -s "$dir/calls"
+# INF_CANARY_BENCH is the self-test's stub route: without a rows file, or
+# beside a cargo that answers as cargo does, it is refused before any build.
+expect_red_because "canaries: a named inf-bench without a rows file is a scope failure" "INF_CANARY_BENCH is the self-test's stub route and needs INF_CANARY_ROWS_FILE" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_HOST= INF_CANARY_CARGO="$dir/cargo" $CANARY
+printf '#!/usr/bin/env bash\ncase "${1:-}" in --version) echo "cargo 1.95.0 (0123abcd 2026-03-01)" ;; esac\nexit 0\n' >"$dir/real-cargo"
+chmod +x "$dir/real-cargo"
+expect_red_because "canaries: a named inf-bench beside a cargo answering as cargo is a scope failure" "INF_CANARY_BENCH is the self-test's stub route, and this cargo is a real one" env INF_CANARY_HOST= INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/real-cargo" $CANARY
+}
+
+# ------------------------------- planted-bug canary driver: long logs, readers
+group_sim_canaries_long_logs() {
+# Under pipefail an awk that exits as soon as it finds its line kills its
+# writer (tr, printf) with SIGPIPE once the input outgrows the pipe's
+# buffer, and the reader's verdict becomes the writer's 141. Each reader of
+# the lane is planted here with its line first and two megabytes after it,
+# and the lane's script is read for an awk program that exits outside its
+# END block, which is the shape that cuts a writer short.
+CANARY=./scripts/sim-canaries.sh
+export INF_CANARY_HOST=Linux
+filler='awk '\''BEGIN { for (i = 0; i < 40000; i++) print "filler line " i " of a long log, past any pipe buffer" }'\'''
+long_fixture() {
+    local name=$1 dir
+    [ -n "$name" ] && [ -n "$work" ] || { echo "long_fixture: empty name or work dir" >&2; exit 2; }
+    dir="$work/$name"
+    mkdir -p "$dir/target/release" "$dir/target/canary-inf_canary_fixture/release"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/cargo"
+    chmod +x "$dir/cargo"
+    echo "$dir"
+}
+# A scenario whose log withholds its verdict on its first line.
+dir=$(long_fixture long-withheld)
+echo "inf_canary_fixture fake-scenario TOKEN" >"$dir/rows"
+for sim in "$dir/target/release/inf-sim" "$dir/target/canary-inf_canary_fixture/release/inf-sim"; do
+    printf '#!/usr/bin/env bash\necho "WITHHELD: the clause reads /proc"\n%s\nexit 0\n' "$filler" >"$sim"
+    chmod +x "$sim"
+done
+expect_red_because "canaries: a long log withheld on its first line is judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture scenario fake-scenario (WITHHELD: the clause reads /proc)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# A uring crate test whose ring panics first, two megabytes before its
+# verdict line.
+dir=$(long_fixture long-uring)
+echo "inf_canary_fixture crate-test fake/uring test:suite the_row" >"$dir/rows"
+printf '#!/usr/bin/env bash\necho "thread the_row panicked at tests/suite.rs:37:10:"\necho "io_uring: Os { code: 1, kind: PermissionDenied }"\n%s\necho "test the_row ... FAILED"\nexit 101\n' "$filler" >"$dir/cargo"
+expect_red_because "canaries: a long log whose ring panicked first is io_uring unavailable" "red: io_uring unavailable on this host (io_uring: Os { code: 1" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# A long table whose second row is out of its cfg's place: two megabytes
+# of rows, past the buffer awk reads its pipe in.
+dir=$(long_fixture long-table)
+{
+    echo "inf_canary_b crate-test fake test:suite the_row"
+    echo "inf_canary_a crate-test fake test:suite the_row"
+    awk 'BEGIN { for (i = 0; i < 40000; i++) printf "inf_canary_c%05d crate-test fake test:suite the_row\n", i }'
+} >"$dir/rows"
+expect_red_because "canaries: a long table's early misplaced row is refused" "a row out of its cfg's place: inf_canary_a crate-test fake test:suite the_row (after inf_canary_b)" env INF_CANARY_TABLE_ONLY=1 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# awk_readers_whole <script>: zero when no awk program in the script calls
+# `exit` before its END block; else each such line, non-zero. Every awk in
+# sim-canaries.sh reads a pipe, so that is the shape that cuts its writer.
+# A program starts at the first `'` after the word `awk` that a blank comes
+# before, so options (`-v t="$1"`, `-F:`, `-F'\t'`) come first; it ends at
+# its next `'`; from its `END {` on, an `exit` is the verdict's. A comment
+# line outside a program is not read.
+awk_readers_whole() {
+    LC_ALL=C awk '
+        # The index of the program text after line[from..], or 0.
+        function program_at(line, from,    i, ch, n) {
+            n = length(line)
+            for (i = from; i <= n; i++) {
+                ch = substr(line, i, 1)
+                if (ch == "\"") {
+                    i = index_from(line, "\"", i + 1)
+                    if (i == 0) return 0
+                } else if (ch == "'\''") {
+                    if (substr(line, i - 1, 1) ~ /[ \t]/) return i + 1
+                    i = index_from(line, "'\''", i + 1)
+                    if (i == 0) return 0
+                } else if (ch == "|" || ch == ";") {
+                    return 0
+                }
+            }
+            return 0
+        }
+        function index_from(line, ch, from,    at) {
+            at = index(substr(line, from), ch)
+            return at ? from + at - 1 : 0
+        }
+        {
+            text = $0
+            if (!inawk) {
+                if (text ~ /^[ \t]*#/) next
+                if (!match(text, /(^|[^A-Za-z0-9_.-])awk[ \t]/)) next
+                start = program_at(text, RSTART + RLENGTH - 1)
+                if (start == 0) next
+                text = substr(text, start)
+                inawk = 1
+                seen_end = 0
+            }
+            close_at = index(text, "'\''")
+            body = close_at ? substr(text, 1, close_at - 1) : text
+            if (!seen_end && match(body, /END[ \t]*[{]/)) {
+                body = substr(body, 1, RSTART - 1)
+                seen_end = 1
+            } else if (seen_end) {
+                body = ""
+            }
+            if (body ~ /(^|[^A-Za-z_])exit([^A-Za-z_]|$)/) {
+                print FILENAME ":" FNR ": " $0
+                found = 1
+            }
+            if (close_at) inawk = 0
+        }
+        END { exit found }' "$1"
+}
+expect green "canaries: every awk reader of the lane reads its pipe whole" awk_readers_whole "$CANARY"
+dir=$(long_fixture long-reader-lint)
+{
+    echo "reader() {"
+    echo "  tr -d x <\"\$1\" | awk '"
+    echo "    /^WITHHELD:/ { print; found = 1; exit }"
+    echo "    END { exit !found }'"
+    echo "}"
+    echo "short() { printf '%s\\n' \"\$@\" | awk 'NR > 1 { exit }'; }"
+} >"$dir/early.sh"
+expect red "canaries: the reader check sees an awk that exits before its END" awk_readers_whole "$dir/early.sh"
+expect_output "canaries: the reader check names each early exit, one-line programs too" "early.sh:6: short()" awk_readers_whole "$dir/early.sh"
+# Each shape of an early exit is its own plant: beside its END on one line,
+# after a `-v`, after `-F:`, after a quoted `-F'\t'`.
+printf '%s\n' "one() { tr -d x <\"\$1\" | awk '/x/ { found = 1; exit } END { exit !found }'; }" >"$dir/beside-end.sh"
+expect red "canaries: the reader check sees an exit beside END on one line" awk_readers_whole "$dir/beside-end.sh"
+printf '%s\n' "two() {" "  tr -d x <\"\$2\" | LC_ALL=C awk -v TOKEN=\"\$1:\" '" "    index(\$0, TOKEN) == 1 { print; found = 1; exit }" "    END { exit !found }'" "}" >"$dir/option-v.sh"
+expect red "canaries: the reader check sees an exit in an awk with -v before its program" awk_readers_whole "$dir/option-v.sh"
+printf '%s\n' "three() { tr -d x <\"\$1\" | awk -F: '\$1 == \"x\" { print \$2; exit }'; }" >"$dir/option-f.sh"
+expect red "canaries: the reader check sees an exit in an awk with -F: before its program" awk_readers_whole "$dir/option-f.sh"
+printf '%s\n' "four() { tr -d x <\"\$1\" | awk -F'\\t' '\$1 == \"x\" { print \$2; exit }'; }" >"$dir/option-f-quoted.sh"
+expect red "canaries: the reader check sees an exit after a quoted -F argument" awk_readers_whole "$dir/option-f-quoted.sh"
+# The whole-input shapes stay green: an exit in END on the same line, after
+# a -v; and a comment naming awk with a quote.
+printf '%s\n' "# an awk's early exit cuts its writer: 'exit' here is prose" "five() { tr -d x <\"\$1\" | awk -v t=1 '!found && /x/ { found = 1 } END { exit !found }'; }" >"$dir/whole.sh"
+expect green "canaries: the reader check passes an exit in END and a comment" awk_readers_whole "$dir/whole.sh"
+}
+
 # --------------------------------------------------- release-assert inventory
 group_release_asserts() {
 # ADR-0107 D2: a fixture crate with one release assert and one expect, and

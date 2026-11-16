@@ -250,7 +250,7 @@ fn memory_leg_fixture(rss: Result<PinnedRss, PinUnproven>, cpu_pct: f64) -> Memo
         boot: Duration::ZERO,
         loading_replies: 0,
         memlock: String::new(),
-        attribution: String::new(),
+        cells: Ok(Vec::new()),
     }
 }
 
