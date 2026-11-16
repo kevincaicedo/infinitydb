@@ -125,8 +125,8 @@ use scatter::{
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
 use shared::{
-    DurableAdmission, NsApplyOutcome, NsApplyRead, Parked, ParkedDeques, ParkedFull, PeerDeques,
-    apply_drop, handle_ns_apply, tier_to_fan,
+    DurableAdmission, GatedBook, NsApplyOutcome, NsApplyRead, Parked, ParkedDeques, ParkedFull,
+    PeerDeques, apply_drop, gated_fill, handle_ns_apply, tier_to_fan,
 };
 use tasks::{PeerPumps, PlaneTasks};
 
@@ -225,11 +225,11 @@ impl OwnerPub {
     }
 }
 
-/// One origin's `always` verdict slot (ADR-0177 D3, D6): a placeholder from
-/// before the apply's first effect, then the reply that waits for this
-/// cell's fsync watermark to cover its `seq`.
+/// One origin's `always` verdict slot (ADR-0177 D3, D6): `Open` from before
+/// the apply's first effect, named by its [`GatedTicket`]'s number, then the
+/// reply that waits for this cell's fsync watermark to cover its `seq`.
 pub(super) enum Gated {
-    Placeholder,
+    Open { ticket: u32 },
     Verdict(GatedVerdict),
 }
 
@@ -293,16 +293,16 @@ impl Parked for OwnerPub {
 impl Parked for Gated {
     fn parked_bytes(&self) -> u64 {
         match self {
-            Gated::Placeholder => 0,
+            Gated::Open { .. } => 0,
             Gated::Verdict(verdict) => verdict.parked_bytes(),
         }
     }
 
-    /// A placeholder is its apply's, still running; a verdict waits for the
+    /// An open slot is its apply's, still running; a verdict waits for the
     /// `gated` task.
     fn waits(&self) -> bool {
         match self {
-            Gated::Placeholder => false,
+            Gated::Open { .. } => false,
             Gated::Verdict(_) => true,
         }
     }
@@ -488,13 +488,13 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// holds the origin's order, which the divert reads.
     ns_pump_parked: RefCell<Vec<bool>>,
     /// Gated `always` verdicts, per origin in `seq` order (ADR-0177 D3,
-    /// D6): an apply, inline or on its origin's pump, takes a placeholder
-    /// before its first effect and fills it with its verdict, then moves on
+    /// D6): an apply, inline or on its origin's pump, opens its slot before
+    /// its first effect and fills it with its verdict, then moves on
     /// (holding the FIFO across the durability wait serialized every origin
     /// to one write per fsync, M4.5-S29). The one `gated` task publishes
     /// every verdict the watermark covers (ADR-0015 D6: the client-visible
     /// ack never precedes this cell's fsync).
-    gated: RefCell<PeerDeques<Gated>>,
+    gated: Rc<GatedBook>,
     /// The `gated` task, made at plane start and never ending, found no
     /// verdict pending and parked; FABRIC-IN wakes it when one waits.
     gated_pump_parked: Cell<bool>,
@@ -950,6 +950,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         // ADR-0123 D5: the connection knobs before the first accept.
         let knobs = crate::config::conn_knobs(&node.config.borrow(), cells);
         let (fabric, fan_reserve) = PlaneFabric::new(fabric);
+        let gated = Rc::new(GatedBook::new(parked.gated, Rc::clone(&node)));
         let plane = ServerPlane {
             shared: Rc::new(Shared {
                 cell,
@@ -990,7 +991,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 tier: RefCell::new(None),
                 ns_applies: RefCell::new(parked.ns_applies),
                 ns_pump_parked: RefCell::new(vec![false; usize::from(cells)]),
-                gated: RefCell::new(parked.gated),
+                gated,
                 gated_pump_parked: Cell::new(false),
                 tasks,
                 peer_pumps: core::cell::OnceCell::new(),

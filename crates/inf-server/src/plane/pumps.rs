@@ -86,15 +86,15 @@ async fn apply_parked<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         apply_flat_one(shared, from, item, &argv, read).await;
         return;
     }
-    // The verdict's slot before the tiered apply's first effect, held
-    // across its cold reads (ADR-0177 D6).
-    let placeholder = match shared.gate_placeholder(from, read) {
-        Ok(placeholder) => placeholder,
+    // The verdict's slot before the tiered apply's first effect, its ticket
+    // held across the cold reads (ADR-0177 D6).
+    let ticket = match shared.gate_open(from, read) {
+        Ok(ticket) => ticket,
         Err(ParkedFull) => return refuse_parked(shared, from, item.token),
     };
     match apply_tiered_one(shared, origin, item.ns, &argv, item.proto).await {
         tiered::TieredReply::Done(reply) => {
-            shared.gate_cancel(placeholder);
+            drop(ticket);
             shared.fabric.borrow_mut().reply(
                 from,
                 item.token,
@@ -118,7 +118,7 @@ async fn apply_parked<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 .expect("tiered implies the durable plane")
                 .note_gated_ack();
             let verdict = GatedVerdict::new(shared, item.token, seq, reply);
-            shared.gate_fill(placeholder, verdict);
+            gated_fill(ticket, verdict);
         }
     }
 }
@@ -152,8 +152,8 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
 ) {
     let (ns, proto, token, program) = (item.ns, item.proto, item.token, item.program);
     loop {
-        let placeholder = match shared.gate_placeholder(from, read) {
-            Ok(placeholder) => placeholder,
+        let ticket = match shared.gate_open(from, read) {
+            Ok(ticket) => ticket,
             Err(ParkedFull) => return refuse_parked(shared, from, token),
         };
         let mut reply = OpenReply::new(shared.take_reply_buf());
@@ -161,7 +161,7 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
         let reply = reply.finish();
         match applied {
             NsApplyOutcome::Park => {
-                shared.gate_cancel(placeholder);
+                drop(ticket);
                 shared.recycle_reply_buf(reply.into_bytes());
                 let wait = {
                     let mut durable = shared.durable.borrow_mut();
@@ -172,7 +172,7 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 wait.await;
             }
             NsApplyOutcome::Reply => {
-                shared.gate_cancel(placeholder);
+                drop(ticket);
                 let outcome = wire_reply(reply.bytes(), reply.outcome());
                 shared.fabric.borrow_mut().reply(from, token, &outcome);
                 shared.recycle_reply_buf(reply.into_bytes());
@@ -180,7 +180,7 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             }
             NsApplyOutcome::Gated(seq) => {
                 let verdict = GatedVerdict::new(shared, token, seq, reply);
-                shared.gate_fill(placeholder, verdict);
+                gated_fill(ticket, verdict);
                 return;
             }
         }
@@ -205,18 +205,14 @@ pub(super) async fn gated_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone 
         // A verdict is gated only by a durable plane; without one nothing
         // waits, as the deques read.
         let Some(watermark) = watermark else {
-            debug_assert!(
-                !shared.gated.borrow().waits(),
-                "a gated verdict implies a durable plane"
-            );
+            debug_assert!(!shared.gated.waits(), "a gated verdict implies a durable plane");
             shared.gated_pump_parked.set(true);
             park().await;
             continue;
         };
         let (published, pending) = {
-            let mut gated = shared.gated.borrow_mut();
             let mut fabric = shared.fabric.borrow_mut();
-            gated.take_covered(watermark, GATED_REPLIES_PER_POLL, &shared.node, |to, verdict| {
+            shared.gated.take_covered(watermark, GATED_REPLIES_PER_POLL, |to, verdict| {
                 fabric.reply(to, verdict.token, &wire_reply(&verdict.reply, verdict.outcome));
             })
         };

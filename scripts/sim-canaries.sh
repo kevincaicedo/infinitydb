@@ -1102,10 +1102,10 @@ ordered_rows=(
   # Planted, a Pending first poll leaves its header Idle and unlinked, and the wake it raised is
   # lost.
   "inf_canary_first_poll_wake_dropped crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-wake-lost"
-  # An `always` apply whose verdict is a reply gives its placeholder back (ADR-0177 D6), so its
-  # origin's next apply opens a slot. Planted, an error reply leaves the placeholder at the
-  # origin's back, and the next write's open stops the cell.
-  "inf_canary_gated_error_keeps_placeholder m0-capacity second-open-slot --close-leg gated-error"
+  # An `always` apply whose verdict is a reply drops its gated ticket, which releases its slot
+  # (ADR-0177 D6), so its origin's next apply opens one. Planted, the drop releases nothing, the
+  # error's slot stays at the origin's back, and the next write's open stops the cell.
+  "inf_canary_gated_drop_kept m0-capacity second-open-slot --close-leg gated-error"
   # The gated task publishes an `always` verdict only once the owner's fsync watermark covers
   # its record (ADR-0177 D3). Planted, it publishes every filled front, so a remote `always`
   # write is acknowledged before it is durable and the power cut loses it. The lane seed's cut

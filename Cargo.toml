@@ -129,7 +129,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_foreign_segment)',
     'cfg(inf_canary_forget_in_place)',
     'cfg(inf_canary_gate_covered)',
-    'cfg(inf_canary_gated_error_keeps_placeholder)',
+    'cfg(inf_canary_gated_drop_kept)',
     'cfg(inf_canary_gated_ignores_watermark)',
     'cfg(inf_canary_gated_pump_extra)',
     'cfg(inf_canary_grant_clears_rest)',

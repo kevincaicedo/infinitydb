@@ -148,7 +148,7 @@ fn drain(
         handle_fabric_op(shared, now, from, op, &mut scratch, &mut staged, &mut orphans);
     });
     assert!(
-        !shared.gated.borrow().waits() && !shared.owner_pubs.borrow().waits(),
+        !shared.gated.waits() && !shared.owner_pubs.borrow().waits(),
         "no durable or publish leg in these rows"
     );
     // The cell loop's own shipping of each staged reply (the tag from the

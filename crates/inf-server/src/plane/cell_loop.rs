@@ -67,7 +67,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let Some(Some(pumps)) = self.shared.peer_pumps.get() else {
             return;
         };
-        if self.shared.gated_pump_parked.get() && self.shared.gated.borrow().waits() {
+        if self.shared.gated_pump_parked.get() && self.shared.gated.waits() {
             self.shared.gated_pump_parked.set(false);
             let _ = cx.executor.wake(pumps.gated);
         }
@@ -470,7 +470,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // the task, even on a fabric-quiet iteration: an apply pump fills
         // its verdict in run_ready, not in this drain, and a task cannot
         // wake another (the lag is this one iteration).
-        let gated_due = self.shared.gated_pump_parked.get() && self.shared.gated.borrow().waits();
+        let gated_due = self.shared.gated_pump_parked.get() && self.shared.gated.waits();
         if drained == 0 && !gated_due {
             return;
         }
