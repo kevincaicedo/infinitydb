@@ -64,6 +64,10 @@
 //! leg that runs their loop alone. A rate leg's reading less the harness's
 //! is its operation's instructions, and the map legs' differences across
 //! depths are a branch visit's: the rates each row's bound is evaluated at.
+//! And the wait legs (`cold_path/waits.rs`), on the same loop, reported and
+//! never judged: the fixed stores the gates and the wait lists take, one
+//! operation or one round of waits a step, beside the representations they
+//! replace; a round leg's reading less the harness's is read a wait.
 //!
 //! The instrument: exact user-space instructions per op, `(I(n) − I(0)) /
 //! n`, read outside this binary (`perf stat -e instructions:u`) on one
@@ -71,10 +75,15 @@
 //! A run counts only when its controls, each a leg of this binary, hold:
 //!
 //! - the same binary against itself: each leg run twice agrees within 0.05
-//!   per op at a resolution of 0.01;
+//!   per op at a resolution of 0.01, a round leg within 0.01 a wait at
+//!   0.001;
 //! - liveness: each leg's `-plus-one` variant reads the leg + 1.00, ± 0.05:
 //!   one `nop` per op at the top of the driving loop's body, outside the
-//!   measured step;
+//!   measured step; a heap round's `-plus-wait`, one `nop` a wait, reads
+//!   the leg plus 1.00 a wait, ± 0.01; and the legs whose representation
+//!   allocates a waiter on each wait, `-plus-hundred`, 100 `nop`s a wait,
+//!   the leg plus 100 a wait, ± 3, as the allocator's path moves a few
+//!   instructions with the plant's code;
 //! - the hook's row's verdict plant: `reactor-iteration-server-hook-plus-four`
 //!   to `-plus-ten`, B of the row with four to ten `nop`s an iteration, the
 //!   same way. A run reads the one its reading names, `p` = max(4, 11 − the
@@ -103,6 +112,8 @@ mod cold;
 mod gate;
 #[path = "cold_path/rates.rs"]
 mod rates;
+#[path = "cold_path/waits.rs"]
+mod waits;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -125,6 +136,7 @@ use inf_runtime::{
 
 use cold::{ColdReadConfig, ColdReads, ColdWait, ReadClass, TierFileId};
 use rates::{PairWord, RateLeg, RetireOp, SlabLevels};
+use waits::{HolderOp, Order, Routes, WaitLeg, Waits};
 
 /// One pool buffer, the server's cold window: four 4 KiB frames.
 const BUFFER_BYTES: usize = 4 * inf_alloc::TIER_READ_ALIGN;
@@ -151,6 +163,7 @@ enum Leg {
     Deep { stride: bool },
     Reactor(ReactorPlane),
     Rate(RateLeg),
+    Wait(WaitLeg),
 }
 
 /// A reactor leg's plane: the hook's row is read on two pairs of them.
@@ -191,8 +204,27 @@ const RETIRE_GET_MUT_2: RateLeg =
 const RETIRE_CYCLE_2: RateLeg =
     RateLeg::RetireSlab { op: RetireOp::Cycle, levels: SlabLevels::Two };
 
+/// The wait legs, by store, operation and size.
+const fn holder(op: HolderOp, levels: SlabLevels) -> Leg {
+    Leg::Wait(WaitLeg::Holder { op, levels })
+}
+const fn hash_gate(depth: u32, insert: bool) -> Leg {
+    Leg::Wait(WaitLeg::HashGate { depth, insert })
+}
+const fn heap_mark(order: Order, waits: Waits) -> Leg {
+    Leg::Wait(WaitLeg::HeapMark { order, waits })
+}
+const fn btree_mark(order: Order, waits: Waits) -> Leg {
+    Leg::Wait(WaitLeg::BtreeMark { order, waits })
+}
+const ROUTES_DEFAULT: Leg = Leg::Wait(WaitLeg::RouteCounter { routes: Routes::Default });
+const ROUTES_CEILING: Leg = Leg::Wait(WaitLeg::RouteCounter { routes: Routes::Ceiling });
+const LIST_UNIT: Leg = Leg::Wait(WaitLeg::ListWaitWake { keyed: false });
+const LIST_KEY: Leg = Leg::Wait(WaitLeg::ListWaitWake { keyed: true });
+const MARK_WAIT_FOR: Leg = Leg::Wait(WaitLeg::MarkWaitFor);
+
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 111] = [
+const LEGS: [(&str, Leg, u8); 165] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -304,6 +336,60 @@ const LEGS: [(&str, Leg, u8); 111] = [
     ("deque-push-or-pop-plus-one", Leg::Rate(RateLeg::DequePushOrPop), 1),
     ("vec-push-or-pop", Leg::Rate(RateLeg::VecPushOrPop), 0),
     ("vec-push-or-pop-plus-one", Leg::Rate(RateLeg::VecPushOrPop), 1),
+    ("slab-holder-get", holder(HolderOp::Get, SlabLevels::One), 0),
+    ("slab-holder-get-plus-one", holder(HolderOp::Get, SlabLevels::One), 1),
+    ("slab-holder-get-mut", holder(HolderOp::GetMut, SlabLevels::One), 0),
+    ("slab-holder-get-mut-plus-one", holder(HolderOp::GetMut, SlabLevels::One), 1),
+    ("slab-holder-cycle", holder(HolderOp::Cycle, SlabLevels::One), 0),
+    ("slab-holder-cycle-plus-one", holder(HolderOp::Cycle, SlabLevels::One), 1),
+    ("slab-holder-get-2", holder(HolderOp::Get, SlabLevels::Two), 0),
+    ("slab-holder-get-2-plus-one", holder(HolderOp::Get, SlabLevels::Two), 1),
+    ("slab-holder-get-mut-2", holder(HolderOp::GetMut, SlabLevels::Two), 0),
+    ("slab-holder-get-mut-2-plus-one", holder(HolderOp::GetMut, SlabLevels::Two), 1),
+    ("slab-holder-cycle-2", holder(HolderOp::Cycle, SlabLevels::Two), 0),
+    ("slab-holder-cycle-2-plus-one", holder(HolderOp::Cycle, SlabLevels::Two), 1),
+    ("map-admit-remove-counter-2496", ROUTES_DEFAULT, 0),
+    ("map-admit-remove-counter-2496-plus-one", ROUTES_DEFAULT, 1),
+    ("map-admit-remove-counter-159744", ROUTES_CEILING, 0),
+    ("map-admit-remove-counter-159744-plus-one", ROUTES_CEILING, 1),
+    ("hash-gate-get-10", hash_gate(10, false), 0),
+    ("hash-gate-get-10-plus-one", hash_gate(10, false), 1),
+    ("hash-gate-get-16", hash_gate(16, false), 0),
+    ("hash-gate-get-16-plus-one", hash_gate(16, false), 1),
+    ("hash-gate-insert-remove-10", hash_gate(10, true), 0),
+    ("hash-gate-insert-remove-10-plus-one", hash_gate(10, true), 1),
+    ("hash-gate-insert-remove-16", hash_gate(16, true), 0),
+    ("hash-gate-insert-remove-16-plus-one", hash_gate(16, true), 1),
+    ("heap-mark-rising-962", heap_mark(Order::Rising, Waits::OneCell), 0),
+    ("heap-mark-rising-962-plus-wait", heap_mark(Order::Rising, Waits::OneCell), 1),
+    ("heap-mark-rising-2825", heap_mark(Order::Rising, Waits::FourCells), 0),
+    ("heap-mark-rising-2825-plus-wait", heap_mark(Order::Rising, Waits::FourCells), 1),
+    ("heap-mark-rising-16384", heap_mark(Order::Rising, Waits::Most), 0),
+    ("heap-mark-rising-16384-plus-wait", heap_mark(Order::Rising, Waits::Most), 1),
+    ("heap-mark-falling-962", heap_mark(Order::Falling, Waits::OneCell), 0),
+    ("heap-mark-falling-962-plus-wait", heap_mark(Order::Falling, Waits::OneCell), 1),
+    ("heap-mark-falling-2825", heap_mark(Order::Falling, Waits::FourCells), 0),
+    ("heap-mark-falling-2825-plus-wait", heap_mark(Order::Falling, Waits::FourCells), 1),
+    ("heap-mark-falling-16384", heap_mark(Order::Falling, Waits::Most), 0),
+    ("heap-mark-falling-16384-plus-wait", heap_mark(Order::Falling, Waits::Most), 1),
+    ("btree-mark-rising-962", btree_mark(Order::Rising, Waits::OneCell), 0),
+    ("btree-mark-rising-962-plus-hundred", btree_mark(Order::Rising, Waits::OneCell), 100),
+    ("btree-mark-rising-2825", btree_mark(Order::Rising, Waits::FourCells), 0),
+    ("btree-mark-rising-2825-plus-hundred", btree_mark(Order::Rising, Waits::FourCells), 100),
+    ("btree-mark-rising-16384", btree_mark(Order::Rising, Waits::Most), 0),
+    ("btree-mark-rising-16384-plus-hundred", btree_mark(Order::Rising, Waits::Most), 100),
+    ("btree-mark-falling-962", btree_mark(Order::Falling, Waits::OneCell), 0),
+    ("btree-mark-falling-962-plus-hundred", btree_mark(Order::Falling, Waits::OneCell), 100),
+    ("btree-mark-falling-2825", btree_mark(Order::Falling, Waits::FourCells), 0),
+    ("btree-mark-falling-2825-plus-hundred", btree_mark(Order::Falling, Waits::FourCells), 100),
+    ("btree-mark-falling-16384", btree_mark(Order::Falling, Waits::Most), 0),
+    ("btree-mark-falling-16384-plus-hundred", btree_mark(Order::Falling, Waits::Most), 100),
+    ("list-wait-wake-unit", LIST_UNIT, 0),
+    ("list-wait-wake-unit-plus-hundred", LIST_UNIT, 100),
+    ("list-wait-wake-key", LIST_KEY, 0),
+    ("list-wait-wake-key-plus-hundred", LIST_KEY, 100),
+    ("mark-wait-for", MARK_WAIT_FOR, 0),
+    ("mark-wait-for-plus-hundred", MARK_WAIT_FOR, 100),
 ];
 
 struct Args {
@@ -497,8 +583,8 @@ fn drive_host<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
         | Leg::Singleton { depth, background }
         | Leg::Cohort { depth, background } => (depth, background),
         Leg::Deep { .. } => (1, 0),
-        Leg::Reactor(_) | Leg::Rate(_) => {
-            unreachable!("a reactor or rate leg drives its own state")
+        Leg::Reactor(_) | Leg::Rate(_) | Leg::Wait(_) => {
+            unreachable!("a reactor, rate or wait leg drives its own state")
         }
     };
     // The class queue: four times the depth, as the server sizes it, or the
@@ -522,8 +608,8 @@ fn drive_host<const NOPS: u8>(leg: Leg, ops: u64) -> u64 {
             Leg::Singleton { .. } => step_singleton(cell),
             Leg::Cohort { .. } => step_cohort(cell),
             Leg::Deep { stride } => step_deep(cell, stride, op),
-            Leg::Reactor(_) | Leg::Rate(_) => {
-                unreachable!("a reactor or rate leg drives its own state")
+            Leg::Reactor(_) | Leg::Rate(_) | Leg::Wait(_) => {
+                unreachable!("a reactor, rate or wait leg drives its own state")
             }
         };
         accumulator = accumulator.wrapping_add(effect);
@@ -545,8 +631,8 @@ fn engaged(leg: Leg, cell: &HostCell, ops: u64) {
             (ops, ops * members, ops * (members - 1), 0, ops * u64::from(background > 0))
         }
         Leg::Deep { .. } => (ops, ops, 0, 0, 0),
-        Leg::Reactor(_) | Leg::Rate(_) => {
-            unreachable!("a reactor or rate leg drives its own state")
+        Leg::Reactor(_) | Leg::Rate(_) | Leg::Wait(_) => {
+            unreachable!("a reactor, rate or wait leg drives its own state")
         }
     };
     assert_eq!(counts.issued, issued, "the leg's reads issued");
@@ -803,6 +889,7 @@ fn main() -> ExitCode {
         (Leg::Reactor(plane), nops) => drive_reactor_planted(plane, nops, args.ops),
         (Leg::Rate(leg), 0) => rates::drive::<0>(leg, args.ops),
         (Leg::Rate(leg), _) => rates::drive::<1>(leg, args.ops),
+        (Leg::Wait(leg), nops) => waits::drive(leg, nops, args.ops),
         (leg, 0) => drive_host::<0>(leg, args.ops),
         (leg, _) => drive_host::<1>(leg, args.ops),
     };

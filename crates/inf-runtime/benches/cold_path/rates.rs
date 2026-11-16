@@ -88,10 +88,14 @@ pub enum SlabLevels {
 }
 
 /// The rate legs' loop: `ops` steps over the keys `2 · (op & mask)`, with
-/// `NOPS` planted per op. Every rate leg and the harness run it, so the
-/// harness reads the loop's own share of each.
+/// `NOPS` planted per op. Every rate leg, every wait leg and the harness
+/// run it, so the harness reads the loop's own share of each.
 #[inline(always)]
-fn rate_loop<const NOPS: u8>(ops: u64, mask: u64, mut step: impl FnMut(u64) -> u64) -> u64 {
+pub(super) fn rate_loop<const NOPS: u8>(
+    ops: u64,
+    mask: u64,
+    mut step: impl FnMut(u64) -> u64,
+) -> u64 {
     let mut accumulator = 0u64;
     for op in 0..ops {
         plant::<NOPS>();
@@ -101,7 +105,7 @@ fn rate_loop<const NOPS: u8>(ops: u64, mask: u64, mut step: impl FnMut(u64) -> u
 }
 
 /// The keys the depth-14 legs walk: the harness walks the same.
-const MASK_14: u64 = (1 << 14) - 1;
+pub(super) const MASK_14: u64 = (1 << 14) - 1;
 
 /// Drives `ops` steps of `leg` with `NOPS` planted per op, then checks what
 /// they did.
