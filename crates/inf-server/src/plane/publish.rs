@@ -674,15 +674,15 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     enforce_output_cap(&shared.node, link, id, now_ms, caps);
                     true
                 }
-                // A flushing slot is written nothing that arrives after its
-                // mark or its end of stream, and counts as a receiver until
-                // the server reads its end of stream (ADR-0196 D4, A1.2).
                 // Canary: the delivery is written into a flushing slot.
                 #[cfg(inf_canary_flushing_takes_delivery)]
                 ConnSlot::Flushing { link, .. } => {
                     write(link.out.open(), proto);
                     true
                 }
+                // A flushing slot is written nothing that arrives after its
+                // mark or its end of stream, and counts as a receiver until
+                // the server reads its end of stream (ADR-0196 D4, A1.2).
                 #[cfg(not(inf_canary_flushing_takes_delivery))]
                 ConnSlot::Flushing { stream, .. } => {
                     let node = &shared.node;
