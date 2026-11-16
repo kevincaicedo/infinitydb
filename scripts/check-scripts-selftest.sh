@@ -6453,7 +6453,7 @@ root=$(ls_root ls-probe)
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-unconfigured"
 grep -v 'path = "inf_foundation::bounded::DequeSlot"' clippy.toml >"$work/probe-await-unconfigured/clippy.toml"
 expect_red_because "lint-scopes: a config without the slot type" \
-    "config needs 9 distinct slot type await-holding-invalid-types, found 8" ls_probe "$work/probe-await-unconfigured"
+    "config needs 11 distinct slot type await-holding-invalid-types, found 10" ls_probe "$work/probe-await-unconfigured"
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-unconfigured-answer"
 grep -v 'path = "inf_foundation::bounded::Reserved"' clippy.toml >"$work/probe-await-unconfigured-answer/clippy.toml"
 expect_red_because "lint-scopes: a config without the answer that carries the slot" \
