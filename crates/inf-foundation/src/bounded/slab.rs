@@ -549,7 +549,7 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     /// the new count. An `Assembly` slab reports the removal (its fill byte,
     /// tested once). A stale or foreign handle changes nothing. `release`'s
     /// body with the value moved out first.
-    #[inline]
+    #[inline(always)]
     pub fn take(&mut self, id: SlotId<G>) -> Taken<T> {
         let foreign = self.foreign(&id);
         let lent = named(
