@@ -454,6 +454,12 @@ pub(crate) struct TierCell<F: SegmentFs> {
     pub(crate) flush_stats: TierFlushStats,
     /// The cell's turn: one per cell, the two cell-wide orders.
     turn: TierTurn,
+    /// The namespace the last MAINTAIN pass of each task class paced first:
+    /// the next pass of that class starts at it, by id (ADR-0177 D2's
+    /// progress rule for a paced namespace). A pass that paces none leaves
+    /// it; a dropped one hands the start to the first id above it.
+    compact_paced: Option<NsId>,
+    shadow_paced: Option<NsId>,
     /// The cell's cap census: each namespace's reclaim marks register
     /// their row on it.
     census: Rc<CapCensus>,
@@ -548,6 +554,80 @@ pub(crate) struct CompactRead {
     pub file_id: u32,
     pub addr: LogicalAddr,
     pub len: u64,
+}
+
+/// One MAINTAIN pass's room in a task class (ADR-0177 D2): the class's free
+/// slots, read once a pass. A read is taken only by spending a slot of it,
+/// so the read's spawn meets a slot in the same step; a namespace with work
+/// the room cannot serve is paced: counted on `waits` (the cell's
+/// `tier_maint_task_waits`, a statistic) and left for a later pass.
+pub(crate) struct TaskRoom<'a> {
+    left: u32,
+    /// Namespaces this pass paced: the pass reads it to name its first.
+    paced: u32,
+    waits: &'a Cell<u64>,
+}
+
+impl<'a> TaskRoom<'a> {
+    /// A room of `left` slots, its paces counted on `waits`.
+    pub(crate) fn new(left: u32, waits: &'a Cell<u64>) -> TaskRoom<'a> {
+        TaskRoom { left, paced: 0, waits }
+    }
+
+    /// The slots still free this pass.
+    pub(crate) fn left(&self) -> u32 {
+        self.left
+    }
+
+    /// `n` reads taken, each a slot of the room: never more than are left.
+    pub(crate) fn spend(&mut self, n: u32) {
+        debug_assert!(n <= self.left, "a read taken past its room: {n} of {}", self.left);
+        self.left = self.left.saturating_sub(n);
+    }
+
+    /// A namespace with work this pass leaves for a later one: counted, the
+    /// count saturating.
+    pub(crate) fn pace(&mut self) {
+        self.paced += 1;
+        self.waits.set(self.waits.get().saturating_add(1));
+    }
+}
+
+/// What one MAINTAIN pass of the namespaces' drivers returns to the plane:
+/// the budget units to charge, every compaction read it took (those taken
+/// before a fatal error too: the plane spawns them, and the fail-stop is
+/// the durable plane's flag) and the fatal error that ended it.
+pub(crate) struct TierPass {
+    pub units: u32,
+    pub reads: Vec<CompactRead>,
+    pub fatal: Option<TierFlushError>,
+}
+
+/// The `compact` class's crossing at one namespace with work (ADR-0177 D2):
+/// the read is taken only by spending a slot of the pass's room, and marked
+/// in flight with it; with no slot left the namespace is paced and nothing
+/// is marked, so no namespace waits on a chain no task runs.
+fn take_compact(
+    room: &mut TaskRoom<'_>,
+    inflight: &mut bool,
+    read: CompactRead,
+) -> Option<CompactRead> {
+    // Canary: the read is taken and marked first, then the room asked, its
+    // answer ignored.
+    if cfg!(inf_canary_compact_take_before_permit) {
+        *inflight = true;
+        if room.left() > 0 {
+            room.spend(1);
+        }
+        return Some(read);
+    }
+    if room.left() == 0 {
+        room.pace();
+        return None;
+    }
+    room.spend(1);
+    *inflight = true;
+    Some(read)
 }
 
 impl<F: SegmentFs> TierNs<F> {
@@ -807,6 +887,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             cold_us: LogHistogram::new(),
             flush_stats: TierFlushStats::default(),
             turn: TierTurn::default(),
+            compact_paced: None,
+            shadow_paced: None,
             census,
         }
     }
@@ -939,9 +1021,10 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     /// unlink and compaction. Returns `(budget units used, compaction
     /// read to issue)` — the caller charges Maintenance and spawns the
     /// read chain (it owns the executor; this module owns no
-    /// `Rc<Shared>`). `durable` is the cell's durable plane, read in this
-    /// step for the extent-reclaim marks: its staged seq, its watermark and
-    /// the ack class of a seq (ADR-0061 D5).
+    /// `Rc<Shared>`), the read taken by spending a slot of `room`.
+    /// `durable` is the cell's durable plane, read in this step for the
+    /// extent-reclaim marks: its staged seq, its watermark and the ack
+    /// class of a seq (ADR-0061 D5).
     pub fn maintain_ns(
         &mut self,
         ks: &mut Keyspace,
@@ -949,7 +1032,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         durable: Option<&impl AckClasses>,
         transition_idle: bool,
         now_us: u64,
-        may_compact: bool,
+        room: &mut TaskRoom<'_>,
     ) -> Result<(u32, Option<CompactRead>), TierFlushError> {
         let cold = self.cold.clone();
         let stats = &mut self.flush_stats;
@@ -1009,20 +1092,100 @@ impl<F: SegmentFs + Clone> TierCell<F> {
 
         // ---- compaction (ADR-0059): one read chain in flight; the
         // caller spawns it with `ReadClass::Maintain`, under a permit of
-        // the `compact` class, whose room `may_compact` reads (ADR-0177
-        // D2): without it nothing is marked in flight.
+        // the `compact` class, whose slot `room` holds (ADR-0177 D2). The
+        // work is read with or without room: a paced namespace keeps the
+        // store's candidate, the state it holds between two chains.
         let mut compact = None;
-        if !t.compact_inflight && may_compact {
+        if !t.compact_inflight {
             let pressure = table.compaction_pressure(t.flush.disk_bytes());
             let slice = table.compaction_config().slice_bytes;
             if let inf_store::CompactionWork::Read { file_id, addr, len } =
                 table.compaction_work(&t.flush, pressure, slice)
             {
-                t.compact_inflight = true;
-                compact = Some(CompactRead { pos: t.pos, ns: t.ns, file_id, addr, len });
+                let read = CompactRead { pos: t.pos, ns: t.ns, file_id, addr, len };
+                compact = take_compact(room, &mut t.compact_inflight, read);
             }
         }
         Ok((units, compact))
+    }
+
+    /// One MAINTAIN pass of the namespaces' drivers ([`maintain_ns`] each),
+    /// from the Live namespace the last pass first paced, by id, wrapping:
+    /// a paced namespace is served before those after it. The fatal error
+    /// of a tier fsync (ADR-0056 D4) ends the pass; another error ends its
+    /// namespace's visit only.
+    ///
+    /// [`maintain_ns`]: Self::maintain_ns
+    pub fn maintain_pass(
+        &mut self,
+        ks: &mut Keyspace,
+        durable: Option<&impl AckClasses>,
+        transition_idle: bool,
+        now_us: u64,
+        room: &mut TaskRoom<'_>,
+    ) -> TierPass {
+        let n = self.live.len();
+        let start = self.compact_paced.map_or(0, |id| self.rotation_at(id));
+        let mut pass = TierPass { units: 0, reads: Vec::new(), fatal: None };
+        let mut first_paced = None;
+        for i in 0..n {
+            let at = (start + i) % n;
+            let paced = room.paced;
+            match self.maintain_ns(ks, at, durable, transition_idle, now_us, room) {
+                Ok((used, read)) => {
+                    pass.units += used;
+                    pass.reads.extend(read);
+                }
+                Err(err) if err.is_fatal() => {
+                    pass.fatal = Some(err);
+                    break;
+                }
+                Err(_) => {}
+            }
+            if first_paced.is_none() && room.paced > paced {
+                first_paced = Some(NsId(live_id(&self.positions, self.live[at])));
+            }
+        }
+        if first_paced.is_some() {
+            self.compact_paced = first_paced;
+        }
+        pass
+    }
+
+    /// One MAINTAIN pass of the shadow reconciler's reads (ADR-0093 D4):
+    /// each Live table hands at most [`inf_store::SHADOW_READS_IN_FLIGHT`]
+    /// and the room's slots, from the namespace the last pass first paced,
+    /// by id, wrapping. A table the room cut short with a read still owed
+    /// is paced.
+    pub fn shadow_pass(
+        &mut self,
+        ks: &mut Keyspace,
+        room: &mut TaskRoom<'_>,
+    ) -> Vec<(NsId, inf_store::ShadowRead)> {
+        let n = self.live.len();
+        let start = self.shadow_paced.map_or(0, |id| self.rotation_at(id));
+        let mut reads = Vec::new();
+        let mut first_paced = None;
+        for i in 0..n {
+            let ns = NsId(live_id(&self.positions, self.live[(start + i) % n]));
+            let Some(table) = ks.tiered_store_mut(ns) else { continue };
+            let max = inf_store::SHADOW_READS_IN_FLIGHT.min(room.left() as usize);
+            let taken = table.shadow_work(max);
+            // At most `max`, itself at most the room's `u32` slots.
+            room.spend(taken.len() as u32);
+            // Below the table's own bound the stop was the room's.
+            if (room.left() as usize) < inf_store::SHADOW_READS_IN_FLIGHT
+                && table.shadow_read_owed()
+            {
+                room.pace();
+                first_paced = first_paced.or(Some(ns));
+            }
+            reads.extend(taken.into_iter().map(|read| (ns, read)));
+        }
+        if first_paced.is_some() {
+            self.shadow_paced = first_paced;
+        }
+        reads
     }
 
     /// The cell's turn, once per MAINTAIN after every namespace's advance:

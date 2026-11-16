@@ -1398,6 +1398,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// rule). Zero-cost when no tiered namespace was ever created: one
     /// `None` check.
     fn tier_maintain(&mut self, cx: &mut LoopCx<'_>) {
+        use crate::tier_cell::TaskRoom;
         /// The plane's flush admission: a short borrow of the durable
         /// cell per offer (the tier borrow is held by the caller; the
         /// durable cell is not — no nested `RefCell` conflict). Every
@@ -1414,12 +1415,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 }
             }
         }
-        let mut compact_reads: Vec<crate::tier_cell::CompactRead> = Vec::new();
-        let mut shadow_reads: Vec<(NsId, inf_store::ShadowRead)> = Vec::new();
-        // ADR-0177 D2: a read is taken only while its class has a slot for
-        // its task, so no namespace is marked in flight with none to run it.
-        let mut compact_room = self.shared.tasks.compact_room(cx.executor);
-        let mut shadow_room = self.shared.tasks.shadow_room(cx.executor) as usize;
+        let compact_reads: Vec<crate::tier_cell::CompactRead>;
+        let shadow_reads: Vec<(NsId, inf_store::ShadowRead)>;
+        // ADR-0177 D2: a read is taken only by spending a slot of its class's
+        // room, read once a pass, so no namespace is marked in flight with
+        // none to run it; a namespace the room cannot serve is counted.
+        let waits = &self.shared.node.tier_maint_task_waits;
+        let mut compact_room = TaskRoom::new(self.shared.tasks.compact_room(cx.executor), waits);
+        let mut shadow_room = TaskRoom::new(self.shared.tasks.shadow_room(cx.executor), waits);
         let mut flush_ops: Vec<IoOp> = Vec::new();
         let cold = {
             let mut tier_slot = self.shared.tier.borrow_mut();
@@ -1445,36 +1448,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let durable = self.shared.durable.borrow();
             let transition_idle = durable.as_ref().is_some_and(DurableCell::ckpt_transition_idle);
             let mut ks = self.shared.store.borrow_mut();
-            let mut units = 0u32;
-            let mut fatal: Option<String> = None;
             let now_us = cx.now.as_micros();
-            for at in 0..tier.live_count() {
-                let may_compact = compact_room > 0;
-                match tier.maintain_ns(
-                    &mut ks,
-                    at,
-                    durable.as_ref(),
-                    transition_idle,
-                    now_us,
-                    may_compact,
-                ) {
-                    Ok((used, work)) => {
-                        units += used;
-                        if work.is_some() {
-                            compact_room = compact_room.saturating_sub(1);
-                        }
-                        compact_reads.extend(work);
-                    }
-                    // A tier fsync failure is fatal: fsync failure is
-                    // fail-stop (ADR-0056 D4).
-                    Err(err) if err.is_fatal() => {
-                        fatal = Some(err.to_string());
-                        break;
-                    }
-                    Err(_) => {}
-                }
-            }
+            let pass = tier.maintain_pass(
+                &mut ks,
+                durable.as_ref(),
+                transition_idle,
+                now_us,
+                &mut compact_room,
+            );
             drop(durable);
+            let mut units = pass.units;
+            compact_reads = pass.reads;
+            // A tier fsync failure is fatal: fsync failure is fail-stop
+            // (ADR-0056 D4).
+            let mut fatal = pass.fatal.map(|err| err.to_string());
             // ADR-0178 D3: the cell's turn offers each ready group to the
             // durable cell's device budget at its exact device size (the
             // tier cell has no budget of its own — one owner per fact).
@@ -1494,14 +1481,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // M4.5-S37 (ADR-0093 D4): the shadow reconciler's reads —
             // oldest winner first, bounded per table, Foreground once
             // the pinned suffix crosses half its cap.
-            for t in tier.live() {
-                if let Some(table) = ks.tiered_store_mut(t.ns) {
-                    let max = inf_store::SHADOW_READS_IN_FLIGHT.min(shadow_room);
-                    let reads = table.shadow_work(max);
-                    shadow_room -= reads.len();
-                    shadow_reads.extend(reads.into_iter().map(|read| (t.ns, read)));
-                }
-            }
+            shadow_reads = tier.shadow_pass(&mut ks, &mut shadow_room);
             // ADR-0100 D5: a dropped namespace's files unlink only once
             // the catalog swap carrying the drop is durable.
             let control = self.shared.control.borrow().clone();
@@ -1558,20 +1538,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         for op in flush_ops {
             cx.push(op);
         }
+        // Each read was taken by spending a slot of its room, read in this
+        // step with nothing else reserving either class: each spawn meets a
+        // slot (ADR-0177 D2).
         for read in compact_reads {
             if !tasks::spawn_compact(cx.executor, &self.shared, read) {
-                self.shared
-                    .node
-                    .tier_maint_task_waits
-                    .set(self.shared.node.tier_maint_task_waits.get().saturating_add(1));
+                unreachable!("MAINTAIN spawns a read only for a slot its room spent");
             }
         }
         for (ns, read) in shadow_reads {
             if !tasks::spawn_shadow(cx.executor, &self.shared, ns, read) {
-                self.shared
-                    .node
-                    .tier_maint_task_waits
-                    .set(self.shared.node.tier_maint_task_waits.get().saturating_add(1));
+                unreachable!("MAINTAIN spawns a read only for a slot its room spent");
             }
         }
         // Extent-seal fdatasyncs (ADR-0061 D3): each barrier is in the

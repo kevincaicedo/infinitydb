@@ -438,8 +438,8 @@ pub const GATED_TASKS: Cap = Cap::entries::<1>("gated-tasks", CapFill::Assembly)
 /// `K`, ADR-0148 D1's lifetimes): 64. Unit: compaction chains per cell.
 /// Owner: MAINTAIN, which takes a namespace's compaction read only while
 /// the class has room. Crossing: pace — the read is not taken, nothing is
-/// marked in flight, `tier_maint_task_waits` counts it, and a later
-/// MAINTAIN takes it.
+/// marked in flight, `tier_maint_task_waits` counts it, and the next
+/// MAINTAIN starts at the first namespace it paced.
 pub const TIER_MAINT_NAMESPACES: u32 = 64;
 
 /// `compact` tasks one cell holds (ADR-0177 D2): one read chain per tiered

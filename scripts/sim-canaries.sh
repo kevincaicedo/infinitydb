@@ -1138,6 +1138,10 @@ ordered_rows=(
   # A client row is inserted only through the plane's admission. Planted, SETNAME and the
   # state mirror insert, and a command run after Closed puts the closed client back.
   "inf_canary_command_registers_client m0-capacity ghost-client-row --close-leg registry-reset"
+  # A compaction read is taken only by spending a slot of its pass's room, so no namespace is
+  # marked in flight with no task to run its chain (ADR-0177 D2). Planted, the read is taken
+  # and marked first, the room asked after, and a one-slot pass marks its second namespace.
+  "inf_canary_compact_take_before_permit crate-test inf-server lib a_full_compact_room_paces_and_marks_nothing compact-mark-without-slot"
   # A slot stays occupied until its pump returns, so the conn tasks alive equal the occupied
   # slots at every step (O1). Planted, the slot is vacated at Closed, before its pump returns,
   # and O1 reads fewer slots than tasks.

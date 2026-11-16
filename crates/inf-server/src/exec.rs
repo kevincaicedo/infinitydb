@@ -169,9 +169,10 @@ pub struct NodeState {
     /// Render-only, cell scope.
     pub tier_ns_positions: Cell<u64>,
     pub tier_position_conflicts: Cell<u64>,
-    /// MAINTAIN reads not made because their task class was full (ADR-0177
-    /// D2's `compact` and `shadow` crossing): derived never while a cell
-    /// holds at most 64 tiered namespaces. Cell scope; a statistic.
+    /// Namespaces a MAINTAIN pass left for a later one because their task
+    /// class had no room (ADR-0177 D2's `compact` and `shadow` crossing,
+    /// counted at the room): at the shipped caps reached only while a
+    /// finished task's slot is still held. Cell scope; a statistic.
     pub tier_maint_task_waits: Cell<u64>,
     pub connections: Cell<u64>,
     pub recv_dropped: Cell<u64>,

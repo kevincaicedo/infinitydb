@@ -135,6 +135,9 @@ fn census() -> Rc<CapCensus> {
     CapCensus::new(inf_foundation::CellId(0)).0
 }
 
+/// A task class room no test's MAINTAIN exhausts.
+const ROOMY: u32 = 64;
+
 /// No durable plane: MAINTAIN ticks no reclaim mark.
 const NO_DURABLE: Option<&crate::durable::DurableCell<SimDisk>> = None;
 
@@ -727,15 +730,205 @@ fn a_refused_plan_stages_nothing_and_plans_again_next_turn() {
 /// The pipeline `create_ns` builds for `NsId(16)` on `cell`, at a file
 /// capacity of `file_capacity` data bytes and `slice_bytes`.
 fn flush_config(cell: &TierCell<SimDisk>, file_capacity: u64, slice_bytes: u64) -> TierFlushConfig {
+    flush_config_of(cell, NsId(16), file_capacity, slice_bytes)
+}
+
+/// [`flush_config`] for the namespace `ns`.
+fn flush_config_of(
+    cell: &TierCell<SimDisk>,
+    ns: NsId,
+    file_capacity: u64,
+    slice_bytes: u64,
+) -> TierFlushConfig {
     TierFlushConfig {
-        shard_dir: cell.shard_dir.join("ns-16"),
+        shard_dir: cell.shard_dir.join(format!("ns-{}", ns.0)),
         cell: cell.cell,
-        ns: NsId(16),
+        ns,
         mode: spec().tier_io_mode,
         file_capacity,
         slice_bytes,
         record_len_max: spec().record_len_max(),
     }
+}
+
+/// The room's fixture (ADR-0177 D2): namespaces 16 and 17 on a `SimDisk`
+/// cell, each on a 4 KiB-capacity pipeline, flushed to sealed cold files and
+/// released, each sealed file a compaction candidate (`dead_ratio_pct` 0).
+/// No durable plane: the room is a local count, what the plane's room reads
+/// of a class's free slots.
+fn compaction_fixture() -> (TierCell<SimDisk>, Keyspace) {
+    let cell_census = census();
+    let mut cell =
+        TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), Rc::clone(&cell_census));
+    let tier = TierSpec { maintain_slice_bytes: 6 << 10, ..spec() };
+    let mut ks = Keyspace::new(StoreConfig::default());
+    for (at, ns) in [NsId(16), NsId(17)].into_iter().enumerate() {
+        cell.create_ns(ns, &tier);
+        let config = flush_config_of(&cell, ns, 4 << 10, 6 << 10);
+        let fs = cell.fs.clone();
+        let t = cell.nth_mut(at);
+        t.flush = TierFlush::new(fs, config, 0, &cell_census);
+        t.flush.set_drive(TierDrive::Reactor);
+        sealed_backlog_on(&mut ks, ns, 1 << 20, 12 << 10);
+    }
+    for turn in 0..256u64 {
+        let ops = pass(&mut cell, &mut ks, turn, &mut NoBudget);
+        let idle = ops.is_empty() && cell.live().all(|t| t.round.is_none());
+        complete_ops(&mut cell, ops);
+        if idle {
+            break;
+        }
+    }
+    for ns in [NsId(16), NsId(17)] {
+        let table = ks.tiered_store_mut(ns).expect("materialized");
+        while table.release_slice() > 0 {}
+        let config = table.compaction_config();
+        table.set_compaction_config(inf_store::CompactionConfig { dead_ratio_pct: 0, ..config });
+    }
+    assert!(cell.live().all(|t| !t.flush.sealed().is_empty()), "each namespace sealed a file");
+    (cell, ks)
+}
+
+/// The namespaces a pass's compaction reads name, in order.
+fn read_namespaces(pass: &TierPass) -> Vec<NsId> {
+    pass.reads.iter().map(|read| read.ns).collect()
+}
+
+/// R1, R2 (ADR-0177 D2): with one `compact` slot the pass takes 16's read,
+/// paces 17 — counted once, nothing marked in flight — and spends the room.
+/// Control: with two slots both read and nothing is counted. Taking a read
+/// before asking the room marks 17 in flight with no slot for its task.
+#[test]
+fn a_full_compact_room_paces_and_marks_nothing() {
+    let (mut cell, mut ks) = compaction_fixture();
+    let waits = Cell::new(0);
+    let mut room = TaskRoom::new(2, &waits);
+    let pass = cell.maintain_pass(&mut ks, NO_DURABLE, false, 0, &mut room);
+    assert_eq!(
+        read_namespaces(&pass),
+        [NsId(16), NsId(17)],
+        "VACUOUS: both namespaces answer a compaction read with room"
+    );
+    assert_eq!((waits.get(), room.left()), (0, 0), "control: room for both, nothing paced");
+
+    let (mut cell, mut ks) = compaction_fixture();
+    let waits = Cell::new(0);
+    let mut room = TaskRoom::new(1, &waits);
+    let pass = cell.maintain_pass(&mut ks, NO_DURABLE, false, 0, &mut room);
+    assert!(
+        !cell.nth(1).compact_inflight,
+        "compact-mark-without-slot: namespace 17 is marked in flight and no slot was spent for it"
+    );
+    assert_eq!(read_namespaces(&pass), [NsId(16)], "one read, 16's");
+    assert_eq!(waits.get(), 1, "the paced namespace is counted once");
+    assert_eq!(room.left(), 0, "the read spent the room");
+}
+
+/// R4 (ADR-0177 D2): each pass starts at the namespace the last one paced
+/// first, so with one slot and each chain ended before the next pass the
+/// reads alternate 16, 17, 16, every pass pacing the other.
+#[test]
+fn a_compact_room_rotates_by_id() {
+    let (mut cell, mut ks) = compaction_fixture();
+    let waits = Cell::new(0);
+    let mut served = Vec::new();
+    for _ in 0..3 {
+        let mut room = TaskRoom::new(1, &waits);
+        let pass = cell.maintain_pass(&mut ks, NO_DURABLE, false, 0, &mut room);
+        let &[read] = pass.reads.as_slice() else {
+            panic!("one read a pass: {:?}", pass.reads);
+        };
+        served.push(read.ns);
+        cell.chain_back(read.pos, read.ns);
+    }
+    assert_eq!(served, [NsId(16), NsId(17), NsId(16)], "the paced namespace is served next");
+    assert_eq!(waits.get(), 3, "each pass paced the other namespace");
+}
+
+/// A tiered table on `ks` for `ns` holding `tickets` unissued shadow
+/// tickets (ADR-0093 D2's write): each key written, sealed, flushed and
+/// released cold, then written again as the winner over its one cold twin.
+fn shadow_tickets_on(ks: &mut Keyspace, ns: NsId, tickets: u32) {
+    const PAGE: u64 = 4 << 10;
+    let demote = DemotionConfig::for_budget(1 << 20, PAGE);
+    let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
+    let space = AddressSpaceConfig {
+        reserve_bytes,
+        page_bytes: PAGE as usize,
+        life_origin: LogicalAddr::ZERO,
+    };
+    assert!(ks.materialize_tiered(ns, space, demote, 2048, &census()).is_ok());
+    let table = ks.tiered_store_mut(ns).expect("materialized");
+    table.set_shadow_enabled(true);
+    let hasher = KeyHasher::default();
+    let keys: Vec<Vec<u8>> = (0..tickets).map(|i| format!("shadow:{i}").into_bytes()).collect();
+    for key in &keys {
+        table.insert(key, b"cold", hasher.hash(key)).expect("fits the window");
+    }
+    let tail = table.space().tail();
+    table.space_mut().advance_ro_boundary(tail);
+    table.space_mut().advance_flushed(tail);
+    let ceiling = table.space().release_ceiling();
+    table.space_mut().advance_head(LogicalAddr::from_raw(ceiling).expect("48-bit"));
+    for key in &keys {
+        let hash = hasher.hash(key);
+        let inf_store::ShadowProbe::One(cold) = table.shadow_probe(key, hash) else {
+            panic!("one exact cold candidate");
+        };
+        let record_len = inf_store::TieredTable::RECORD_HEADER_LEN + key.len() + 4;
+        table.shadow_admit(hash, cold, record_len).expect("admitted");
+        let winner = table.insert(key, b"warm", hash).expect("fits the window");
+        table.register_shadow(hash, cold, winner);
+    }
+}
+
+/// The reads one shadow pass hands over a room of `room` slots on a cell
+/// whose namespace 16 holds `tickets` unissued tickets, and the namespaces
+/// it paced.
+fn one_shadow_pass(tickets: u32, room: u32) -> (usize, u64) {
+    let mut cell = TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    cell.create_ns(NsId(16), &spec());
+    let mut ks = Keyspace::new(StoreConfig::default());
+    shadow_tickets_on(&mut ks, NsId(16), tickets);
+    let waits = Cell::new(0);
+    let reads = cell.shadow_pass(&mut ks, &mut TaskRoom::new(room, &waits));
+    (reads.len(), waits.get())
+}
+
+/// R2 (ADR-0177 D2): a table the room cut short with a read still owed is
+/// paced, once; a table that stopped at its own bound of four reads in
+/// flight, or ran out of tickets, is not.
+#[test]
+fn a_short_shadow_room_paces_its_namespace() {
+    assert_eq!(one_shadow_pass(3, 2), (2, 1), "room 2: two reads, the third owed");
+    assert_eq!(one_shadow_pass(3, 0), (0, 1), "room 0: no read, all three owed");
+    assert_eq!(one_shadow_pass(3, 4), (3, 0), "room 4: every ticket read");
+    assert_eq!(one_shadow_pass(6, 8), (4, 0), "control: the table's own bound is not counted");
+}
+
+/// R4 (ADR-0177 D2): with four slots a pass and three tickets a table, the
+/// first pass reads 16's three and 17's one and paces 17; with the reads
+/// failed back, the second starts at 17.
+#[test]
+fn a_shadow_room_rotates_by_id() {
+    let mut cell = TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    cell.create_ns(NsId(16), &spec());
+    cell.create_ns(NsId(17), &spec());
+    let mut ks = Keyspace::new(StoreConfig::default());
+    shadow_tickets_on(&mut ks, NsId(16), 3);
+    shadow_tickets_on(&mut ks, NsId(17), 3);
+    let waits = Cell::new(0);
+    let mut per_pass = Vec::new();
+    for _ in 0..2 {
+        let reads = cell.shadow_pass(&mut ks, &mut TaskRoom::new(4, &waits));
+        let count = |ns: NsId| reads.iter().filter(|(of, _)| *of == ns).count();
+        per_pass.push((count(NsId(16)), count(NsId(17))));
+        for (ns, read) in reads {
+            ks.tiered_store_mut(ns).expect("materialized").shadow_read_failed(read.ticket.cold);
+        }
+    }
+    assert_eq!(per_pass, [(3, 1), (1, 3)], "the second pass starts at 17, which the first paced");
+    assert_eq!(waits.get(), 2, "each pass paced one namespace");
 }
 
 /// The turn's two rules (T3): a refused group makes its namespace the
@@ -906,7 +1099,14 @@ fn a_stalled_writer_is_woken_at_a_visit_whose_plan_is_refused() {
     let parked = cell.nth(0).stall_waiters.wait(());
     assert!(cell.nth(0).stall_waiters.any_waiting(), "engagement: a writer is parked");
     inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
-    let visited = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, true);
+    let visited = cell.maintain_ns(
+        &mut ks,
+        0,
+        NO_DURABLE,
+        false,
+        0,
+        &mut TaskRoom::new(ROOMY, &Cell::new(0)),
+    );
     let mut ops = Vec::new();
     let planned = cell.turn(&mut ks, 0, &mut ops, &mut NoBudget);
     inf_foundation::fault::disarm_all();
@@ -1305,7 +1505,15 @@ fn tick_marks(class_of: fn(u64, u64) -> AckClass, ticks: u64) -> (TierCell<MemFs
             .stage_wal(&mut ring, &inf_log::MutationEffect::Delete { ns: NsId(16), key: b"k" })
             .expect("room");
         let durable = HeldWatermark { staged, class_of };
-        cell.maintain_ns(&mut ks, 0, Some(&durable), false, staged, true).expect("maintain");
+        cell.maintain_ns(
+            &mut ks,
+            0,
+            Some(&durable),
+            false,
+            staged,
+            &mut TaskRoom::new(ROOMY, &Cell::new(0)),
+        )
+        .expect("maintain");
     }
     let marks = cell.nth(0).epoch_marks.len();
     (cell, marks)
@@ -1642,14 +1850,24 @@ fn on_disk(cell: &TierCell<SimDisk>, path: &std::path::Path) -> bool {
 fn a_failed_unlink_is_retried_until_the_file_is_gone() {
     let (mut cell, mut ks, paths) = retired_files(1);
     inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
-    let first = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, true).map(|_| ());
+    let first = cell
+        .maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
+        .map(|_| ());
     let fired = inf_foundation::fault::fired(inf_log::fault::TIER_UNLINK_FAIL);
     inf_foundation::fault::disarm_all();
     assert!(first.is_ok(), "a failed unlink is not fatal");
     assert_eq!(fired, 1, "engagement: the unlink failed once");
     assert!(on_disk(&cell, &paths[0]), "engagement: the failed unlink left the file");
     for turn in 1..=8u64 {
-        cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, turn * 2_000, true).expect("MAINTAIN");
+        cell.maintain_ns(
+            &mut ks,
+            0,
+            NO_DURABLE,
+            false,
+            turn * 2_000,
+            &mut TaskRoom::new(ROOMY, &Cell::new(0)),
+        )
+        .expect("MAINTAIN");
     }
     assert!(
         !on_disk(&cell, &paths[0]),
@@ -1684,7 +1902,9 @@ fn a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four() {
             cold.enqueue(-1, file, 0, inf_log::TIER_FRAME_BYTES, class, 0).expect("queued")
         })
         .collect();
-    let (units, _) = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, true).expect("MAINTAIN");
+    let (units, _) = cell
+        .maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
+        .expect("MAINTAIN");
     let pinned_left = paths[..PINNED as usize].iter().filter(|path| on_disk(&cell, path)).count();
     let last_unlinked = !on_disk(&cell, &paths[PINNED as usize]);
     drop(waits);
@@ -1711,7 +1931,8 @@ fn a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four() {
             closes and unlinks it"]
 fn the_cell_leaves_tier_file_unlinks_to_the_control_thread() {
     let (mut cell, mut ks, paths) = retired_files(1);
-    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, true).expect("MAINTAIN");
+    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
+        .expect("MAINTAIN");
     let retired_unlinked = !on_disk(&cell, &paths[0]);
     let (mut cell, _ks, _) = flushed_namespace();
     let active = cell.nth(0).flush.active().map(|(.., path)| path.to_path_buf());
@@ -1782,16 +2003,19 @@ fn same_numbered_retired_files(id: u32) -> (TierCell<SimDisk>, Keyspace, [PathBu
 fn a_cold_read_defers_only_its_own_namespaces_file() {
     const FILE: u32 = 3;
     let (mut cell, mut ks, _) = same_numbered_retired_files(FILE);
-    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0, true).expect("MAINTAIN");
+    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
+        .expect("MAINTAIN");
     assert!(cell.nth(1).retired.is_empty(), "the control: 17's file 3 retires unread");
     let (mut cell, mut ks, paths) = same_numbered_retired_files(FILE);
     let cold = cell.cold.clone().expect("the cell's cold engine");
     let class = inf_runtime::ReadClass::Foreground;
     let file = TierFileId::new(FILE);
     let wait = cold.enqueue(-1, file, 0, TIER_FRAME_BYTES, class, 0).expect("the read queued");
-    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, true).expect("MAINTAIN");
+    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
+        .expect("MAINTAIN");
     let own_kept = cell.nth(0).retired.len();
-    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0, true).expect("MAINTAIN");
+    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
+        .expect("MAINTAIN");
     let other_kept = cell.nth(1).retired.len();
     drop(wait);
     assert_eq!(own_kept, 1, "engagement: the read keeps namespace 16's file 3 retiring");
