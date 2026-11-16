@@ -281,6 +281,7 @@ mod tests {
     /// The chunks and directories a slab of `cap` slots in chunks of `chunk` builds: ⌈cap ÷ c⌉
     /// chunks and, per directory level above them, ⌈chunks ÷ 256^k⌉ directories, none for one
     /// chunk (ADR-0194 A1).
+    #[cfg(feature = "doc")]
     fn chunks_and_directories(cap: u32, chunk: usize) -> (u64, u64) {
         let chunks = u64::from(cap).div_ceil(chunk as u64);
         let (mut directories, mut level) = (0, chunks);
@@ -293,12 +294,14 @@ mod tests {
 
     /// One slab's resident bill at the build: every slot of each chunk and each 2 KiB
     /// directory written (ADR-0177 D8 with A1.1).
+    #[cfg(feature = "doc")]
     fn slab_bill(cap: u32, stride: usize, chunk: usize) -> u64 {
         let (chunks, directories) = chunks_and_directories(cap, chunk);
         chunks * chunk as u64 * stride as u64 + directories * 2_048
     }
 
     /// The `--plant-bytes-cell` value of `cfg`'s row in the canary table.
+    #[cfg(feature = "doc")]
     fn plant_bytes(table: &str, cfg: &str) -> u64 {
         let row = table
             .lines()
@@ -313,8 +316,10 @@ mod tests {
     /// strides the build reads (ADR-0177 D8 with A1): the fixed terms, each task class's
     /// slab and the fabric gate's holders. The gate row's threshold and both `binary` canaries'
     /// planted bytes (`conn` slots and gate holders doubled) are these strides' products, so a
-    /// stride that moves turns this red until the three move with it.
+    /// stride that moves turns this red until the three move with it. The bill is the shipped
+    /// node's, built with its default features: a slim build's strides are its own.
     #[test]
+    #[cfg(feature = "doc")]
     fn the_idle_bill_and_its_plants_follow_the_strides() {
         const CELLS: u16 = 4;
         const MIB: f64 = 1_048_576.0;
