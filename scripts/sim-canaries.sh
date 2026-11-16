@@ -1201,6 +1201,10 @@ ordered_rows=(
   # A2.1). Planted, the compare is skipped, and another executor's class, built alike, is
   # granted.
   "inf_canary_task_class_instance_blind crate-test inf-runtime test:executor a_class_and_a_task_of_one_executor_are_foreign_to_another_built_alike not Granted on the other"
+  # An id's lookup reads its task's header after the class's instance compare and the index's
+  # bound against the class's slots: two censuses of one cell mint equal instances (ADR-0194
+  # D5). Planted, the bound is skipped, and another executor's id reads past the header array.
+  "inf_canary_task_id_index_unbounded crate-test inf-runtime test:executor an_id_another_class_minted_past_this_class_is_stale a header's index lies in its array"
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.

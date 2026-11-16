@@ -247,6 +247,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_stop_tick_unheld)',
     'cfg(inf_canary_sweep_owed_by_own_refusals)',
     'cfg(inf_canary_task_class_instance_blind)',
+    'cfg(inf_canary_task_id_index_unbounded)',
     'cfg(inf_canary_thief_premise_short)',
     'cfg(inf_canary_tier_barrier_early)',
     'cfg(inf_canary_tier_group_whole_round)',

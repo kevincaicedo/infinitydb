@@ -248,8 +248,8 @@ reborrow of a whole chunk through `&` leaves an earlier write-capable
 pointer usable for reads alone (Tree Borrows freezes it). The `&mut` lives
 for the permit, which borrows the executor `&mut`, so nothing else reaches
 the slab meanwhile. A wake and a last waker's drop during a poll touch only
-the header array, never a class slab; `wake(id)` and `is_live` look the
-handle up in the slab through `slab`, which forgets the lend. Miri
+the header array, never a class slab, and so do `wake(id)` and `is_live`,
+which compare the class slab's instance and read the task's header. Miri
 reads the sequence under Stacked Borrows and under `-Zmiri-tree-borrows`:
 `tests/executor.rs`'s `the_spare_lend_survives_every_other_borrow` (a spawn
 and its run, a reclaim, an id's lookups, a Pending first poll and its

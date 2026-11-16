@@ -56,7 +56,7 @@ use std::alloc::{alloc, dealloc};
 use std::rc::Rc;
 
 use inf_foundation::bounded::{
-    Built, Cap, CapCensus, CapError, CappedSlab, Lookup, LookupMut, Released, Retire, Retiring,
+    Built, Cap, CapCensus, CapError, CappedSlab, LookupMut, Released, Retire, Retiring,
     SlabBuilder, SlabInstance, SlotId,
 };
 use inf_foundation::limits::{LANE_COUNT_MAX, chunk_slots_for};
@@ -94,6 +94,8 @@ const PLANT_INSTANCE_BLIND: bool = cfg!(inf_canary_task_class_instance_blind);
 const PLANT_FIRST_POLL_WAKE_DROPPED: bool = cfg!(inf_canary_first_poll_wake_dropped);
 /// A Pending first poll takes the spare's handle for its id but leaves the spare set.
 const PLANT_SPARE_KEPT_PAST_SUSPEND: bool = cfg!(inf_canary_spare_kept_past_suspend);
+/// An id's lookup skips the index's bound against its class's slots.
+const PLANT_ID_INDEX_UNBOUNDED: bool = cfg!(inf_canary_task_id_index_unbounded);
 
 /// Identifies a task while it is live: its class and its slot's handle, whose generation makes a
 /// stale id detectable (`CellExecutor::is_live`) and whose instance names the slab that minted it.
@@ -551,7 +553,7 @@ impl ExecutorLayout {
                 .ok_or(ExecutorInitError { row: HEADER_ARRAY_ROW, error: CapError::Layout })?;
             let (object, slab_type) =
                 builder.build().map_err(|error| ExecutorInitError { row, error })?;
-            classes.push(ClassEntry { object, slab_type, instance, base, retired: 0 });
+            classes.push(ClassEntry { object, slab_type, instance, base, slots: cap, retired: 0 });
         }
         let mark = ThreadMark::claim();
         let array = HeaderArray::build(&classes, headers, mark)?;
@@ -650,8 +652,6 @@ trait ClassObject {
     fn drop_future(&mut self, slot: SlotId<u64>);
     /// Frees a finished occupant's slot: its generation advances, or it retires.
     fn reclaim(&mut self, slot: SlotId<u64>);
-    /// Whether `slot` names this class's current occupant.
-    fn holds(&self, slot: SlotId<u64>) -> bool;
     /// Slots its tasks hold, Active and Retired: the spare is none of them.
     fn len(&self) -> u32;
     /// KE27's plant: before a task's activation its cell moves to another slot of its class
@@ -700,10 +700,6 @@ impl<F: Future<Output = ()> + 'static, const C: usize> ClassObject for ClassSlab
                 unreachable!("a finished header names its slot until the slot is reclaimed")
             }
         }
-    }
-
-    fn holds(&self, slot: SlotId<u64>) -> bool {
-        matches!(self.slab().get(slot), Lookup::Live(_))
     }
 
     fn len(&self) -> u32 {
@@ -902,6 +898,8 @@ impl HeaderArray {
 /// `array` is live and `index` is below its `len`.
 #[inline(always)]
 unsafe fn header_at(array: NonNull<ArrayHead>, index: u32) -> Header {
+    // SAFETY: per the contract the array is live; `len` is written at the build and never again.
+    debug_assert!(index < unsafe { (*array.as_ptr()).len }, "a header's index lies in its array");
     // SAFETY: per the contract the offset lies inside the allocation, and `array` carries the
     // provenance of all of it.
     unsafe { array.byte_add(HEADERS_OFFSET).cast::<WakeHeader>().add(index as usize) }
@@ -1372,6 +1370,8 @@ struct ClassEntry {
     slab_type: TypeId,
     instance: SlabInstance,
     base: u32,
+    /// The class's slots, its headers from `base`.
+    slots: u32,
     /// Retired and Reclaiming headers: finished tasks whose slots stay held.
     retired: u32,
 }
@@ -1476,15 +1476,22 @@ impl CellExecutor {
     }
 
     /// The header of the task `id` names, while its task holds its slot: the class slab's
-    /// lookup of the handle (its instance, index and generation), then the header at its index.
+    /// `SlabInstance` compared first, so another cell's handle is `None`, and the index's bound
+    /// against the class's slots, since two censuses of one cell mint equal instances (ADR-0194
+    /// D5), so a slab built alike on another may have minted it past this class's headers; then
+    /// the header's own handle, set while its task holds the slot and cleared when the slot is
+    /// released, compared whole. No slab is reached.
     fn header_of(&self, id: TaskId) -> Option<Header> {
         let entry = self.classes.get(id.class as usize)?;
-        if !entry.object.holds(id.slot) {
+        let past = id.slot.index() >= entry.slots && !PLANT_ID_INDEX_UNBOUNDED;
+        if id.slot.instance() != entry.instance || past {
             return None;
         }
-        // SAFETY: the slab holds the slot, so its index is below its class's cap and the header
-        // lies in the class's run of the array.
-        Some(unsafe { header_at(self.array, entry.base + id.slot.index()) })
+        // SAFETY: the index is below the class's slots, so the header lies in the class's run of
+        // the array.
+        let header = unsafe { header_at(self.array, entry.base + id.slot.index()) };
+        // SAFETY: the executor holds its headers: open, on this thread.
+        (unsafe { owner(header) }.slot.get() == Some(id.slot)).then_some(header)
     }
 
     /// The class `class` names, if this executor made it.

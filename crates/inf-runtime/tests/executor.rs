@@ -610,7 +610,7 @@ fn the_spare_serves_no_task_an_id_names() {
 }
 
 /// Each other use of the class between fast first polls: a Pending first poll, an id's lookups
-/// (`is_live`, `wake`), a run that polls a task, a spawn and its
+/// (`is_live`, `wake`, which read the header alone), a run that polls a task, a spawn and its
 /// run, a Retired task's reclaim, and the Pending task's completion; each that borrows the slab
 /// forgets the kept lend. Each fast op is counted by its future; Miri reads the whole sequence
 /// under both aliasing models.
@@ -663,9 +663,10 @@ fn the_spare_lend_survives_every_other_borrow() {
     assert_eq!(ex.class_tasks(ex.class()), 0);
 }
 
-/// Fast ops on one class with an id's lookup and a shared borrow of the slab between them: each
-/// borrows the slab shared and forgets the lend, so the next fast op lends the spare again (a lend
-/// kept past a shared reborrow of its chunk would be good for reads alone under Tree Borrows).
+/// Fast ops on one class with an id's lookup and a shared borrow of the slab between them: the
+/// lookup reads the task's header alone, so the lend is kept across it; the count borrows the
+/// slab shared and forgets the lend, so the next fast op lends the spare again (a lend kept past
+/// a shared reborrow of its chunk would be good for reads alone under Tree Borrows).
 #[test]
 fn the_kept_lend_across_an_id_lookup_and_a_shared_borrow() {
     let mut ex = TestExecutor::new();
@@ -739,6 +740,45 @@ fn the_class_at_its_cap_with_its_spare() {
     assert_eq!(executor.class_tasks(class), 2);
     assert_eq!(executor.run_ready(4), 2, "each task's own wake polls it");
     assert_eq!(executor.live_tasks(), 0);
+}
+
+/// A handle another executor's class minted, whose slot index lies past this executor's class
+/// of one slot, is `Stale` to `wake` and not live to `is_live`, its index never used. Two test
+/// executors on censuses of one cell mint one instance (ADR-0194 D5), so the index's bound
+/// against the class's slots refuses it here, and another cell's id is refused by the instance.
+/// With the bound skipped, the lookup reads a header past the array, which the array's own
+/// check (and Miri) sees.
+#[test]
+fn an_id_another_class_minted_past_this_class_is_stale() {
+    let mut wide = TestExecutor::new();
+    let ids: Vec<_> = (0..3).map(|_| wide.spawn_local(core::future::pending::<()>())).collect();
+    assert_eq!(wide.run_ready(8), 3, "each task parks");
+    let mut narrow = TestExecutor::one();
+    let mut other_cell = TestExecutor::at(1);
+    for id in ids {
+        assert!(wide.is_live(id));
+        assert!(!narrow.is_live(id), "another class's id: not live here");
+        assert_eq!(narrow.wake(id), Woken::Stale);
+        assert!(!other_cell.is_live(id), "another cell's id");
+        assert_eq!(other_cell.wake(id), Woken::Stale);
+    }
+    assert!(!narrow.has_ready() && !other_cell.has_ready());
+}
+
+/// A stale id, its slot's next occupant live, is `Stale` and wakes nothing: the header's handle
+/// names the occupant's generation, not the id's.
+#[test]
+fn a_stale_id_wakes_nothing_of_its_slots_next_occupant() {
+    let mut ex = TestExecutor::one();
+    let first = ex.spawn_local(async {});
+    assert_eq!(ex.run_ready(4), 1, "the first task completes");
+    let next = ex.spawn_local(core::future::pending::<()>());
+    assert_eq!(ex.run_ready(4), 1, "the next task parks in the same slot");
+    assert_eq!(first.generation() + 1, next.generation());
+    assert!(!ex.is_live(first));
+    assert_eq!(ex.wake(first), Woken::Stale);
+    assert!(!ex.has_ready(), "nothing queued");
+    assert_eq!(ex.wake(next), Woken::Queued);
 }
 
 // ---- Self-referential futures in their slots ---------------------------------------------------
