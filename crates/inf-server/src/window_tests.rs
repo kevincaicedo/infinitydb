@@ -180,3 +180,47 @@ fn an_ordered_fan_past_its_window_reads_each_owners_count() {
     command(&mut rig, 0, CLIENT, &numsub, &want);
     assert_window_reversed(&mut rig, "PUBSUB NUMSUB");
 }
+
+/// The cell's recorded hops: the fabric gate's round-trip samples.
+fn hops(rig: &Rig, cell: usize) -> u64 {
+    rig.cells[cell].plane.shared.gate.borrow().round_trips().count()
+}
+
+/// The hop RTT gate's samples are the hops the peer answers as it applies: a remote `DEL` of 40
+/// keys adds 40 on the sending cell, past its window and answered newest first; a remote
+/// `PUBLISH`'s `INF.PUB`, whose reply waits on the owner's fan, and a namespace's `ApplyNs`,
+/// whose reply can wait on the owner's fsync, add none.
+#[test]
+fn a_cell_samples_each_applied_hop_and_no_deferred_one() {
+    const KEYS: usize = 40;
+    let namespace = inf_store::NsSpec {
+        id: NsId(inf_store::FIRST_NAMED_NS_ID),
+        name: b"hops".to_vec(),
+        mode: NsMode::Memory,
+        fsync: None,
+        policy: None,
+        maxmemory: None,
+        tier: None,
+    };
+    let mut rig = Rig::with_namespaces(2, &[namespace]);
+    rig.accept(0, CLIENT);
+    rig.reverse_replies(1, true);
+    let keys = rig.keys_on(1, "hops", KEYS);
+    let mut del: Vec<&[u8]> = vec![b"DEL"];
+    del.extend(keys.iter().map(Vec::as_slice));
+    let before = hops(&rig, 0);
+    command(&mut rig, 0, CLIENT, &del, b":0\r\n");
+    assert_window_reversed(&mut rig, "DEL");
+    assert_eq!(hops(&rig, 0) - before, KEYS as u64, "one sample a remote DEL's leg");
+    let channel = rig.key_on(1, "hops-channel");
+    let before = hops(&rig, 0);
+    command(&mut rig, 0, CLIENT, &[b"PUBLISH", &channel, b"m"], b":0\r\n");
+    assert_eq!(hops(&rig, 0), before, "INF.PUB is no hop sample");
+    command(&mut rig, 0, CLIENT, &[b"INF.NS", b"USE", b"hops"], b"+OK\r\n");
+    let key = rig.key_on(1, "hops-ns");
+    command(&mut rig, 0, CLIENT, &[b"SET", &key, b"v"], b"+OK\r\n");
+    assert_eq!(hops(&rig, 0), before, "an ApplyNs is no hop sample");
+    let owner = rig.cells[1].plane.shared.store.borrow();
+    let held = owner.ns_store(NsId(inf_store::FIRST_NAMED_NS_ID)).map_or(0, |store| store.len());
+    assert_eq!(held, 1, "engagement: the namespaced SET applied on the key's owner");
+}
