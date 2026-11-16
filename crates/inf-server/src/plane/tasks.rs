@@ -77,11 +77,11 @@ impl PlaneTasks {
         Ok(PlaneTasks { conn: (conn, caps.conn), peers, compact, shadow })
     }
 
-    /// The `conn` tasks alive and the class's slots, the cell's share `C`:
-    /// O1's first owner and its bound.
-    pub(super) fn conn_tasks(&self, executor: &CellExecutor) -> (u32, u32) {
+    /// The `conn` tasks held (alive and Retired), the Retired among them, and
+    /// the class's slots, the cell's share `C`: O1's first owner and its bound.
+    pub(super) fn conn_tasks(&self, executor: &CellExecutor) -> (u32, u32, u32) {
         let (class, cap) = self.conn;
-        (executor.class_tasks(class), cap.entries_max())
+        (executor.class_tasks(class), executor.class_retired(class), cap.entries_max())
     }
 
     /// Compaction chains MAINTAIN may still start this pass.

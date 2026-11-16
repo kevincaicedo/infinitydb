@@ -1142,6 +1142,11 @@ ordered_rows=(
   # marked in flight with no task to run its chain (ADR-0177 D2). Planted, the read is taken
   # and marked first, the room asked after, and a one-slot pass marks its second namespace.
   "inf_canary_compact_take_before_permit crate-test inf-server lib a_full_compact_room_paces_and_marks_nothing compact-mark-without-slot"
+  # A connection's slot and task end only after its close, so a client that has read a reply
+  # and is not closed holds both (O1's third clause). Planted, a pump whose queue is empty after
+  # its first reply returns and vacates its slot, the socket left open, and the admitted reader
+  # outnumbers its cell's slots.
+  "inf_canary_conn_owner_lost m0-capacity conn-under-clients --close-leg close"
   # A slot stays occupied until its pump returns, so the conn tasks alive equal the occupied
   # slots at every step (O1). Planted, the slot is vacated at Closed, before its pump returns,
   # and O1 reads fewer slots than tasks.
@@ -1151,6 +1156,10 @@ ordered_rows=(
   # memory a cell rises by k x C x s_conn, 2,500 x 3,064 B at 4 cells (k = 1), over F7's
   # 256 KiB, which the plain node's three boots stay within.
   "inf_canary_conn_slots_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 7660000 --control-bytes-cell 262144 --plant-row conn-tasks"
+  # A finished conn task's header is reclaimed once no waker names it, so a settled node holds no
+  # Retired conn header (O1's leak clause). Planted, the pump keeps a clone of its own waker past
+  # its return: the reset client's header stays Retired with every per-step clause green.
+  "inf_canary_conn_waker_kept m0-capacity conn-retired-kept --close-leg close"
   # The divert parks an origin's durable apply behind its pump while the pump is applying or
   # holds its work (ADR-0083 D1), so an origin has one open gated slot, its back (ADR-0177 D6).
   # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
@@ -1160,6 +1169,9 @@ ordered_rows=(
   # (ADR-0196 D2). Planted, the run-out's test reads false, and the FIN-only client's slot never
   # closes.
   "inf_canary_draining_reader_never_ends m0-capacity half-close-unclosed --close-leg stall"
+  # The same plant read by O1's leak half: the FIN-only client's task and slot are kept together,
+  # so the per-step clauses stay green and the settled cell holds a slot its leg did not keep.
+  "inf_canary_draining_reader_never_ends m0-capacity slot-not-vacant --close-leg stall"
   # A draining Peer parser parses the entries a stall held past Closed (ADR-0196 D2). Planted,
   # PARSE releases them, and the reset client's SETs never run.
   "inf_canary_draining_releases_held_entry m0-capacity pre-eof-unrun --close-leg stall"

@@ -671,14 +671,14 @@ fn a_closed_connection_frees_its_conn_task() {
     let mut node = Node::new(1);
     node.accept(0, CLIENT);
     let owners = |node: &Node| node.cells[0].plane.conn_owners(node.cells[0].reactor.executor());
-    assert_eq!(owners(&node).tasks, 1, "engagement: the connection's pump is alive");
+    assert_eq!(owners(&node).held, 1, "engagement: the connection's pump is alive");
     assert!(client_slot(&node, 0, |conn| conn.pump_parked), "engagement: its pump is parked");
     node.reset(0, CLIENT);
     node.rounds(4);
     assert!(node.closed(0).contains(&CLIENT), "engagement: the Closed was reaped");
     let after = owners(&node);
     assert_eq!(
-        (after.tasks, after.slots),
+        (after.held, after.slots),
         (0, 0),
         "conn-task-kept: a closed connection's task or slot outlived its close"
     );

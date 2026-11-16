@@ -852,30 +852,20 @@ pub enum StopPhase {
     Drained,
 }
 
-/// A cell's connection owners, as [`ServerPlane::conn_owners`] reads them.
+/// A cell's connection owners, as [`ServerPlane::conn_owners`] reads them:
+/// raw counts, which the simulator compares (ADR-0177 D2's O1).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ConnOwners {
-    /// `conn` tasks alive: the executor's count.
-    pub tasks: u32,
+    /// `conn` tasks whose slots the executor holds: alive, and Retired (a
+    /// finished task whose slot a waker or a queued wake still names, until
+    /// the `run_ready` that reclaims it).
+    pub held: u32,
+    /// Of `held`, the Retired.
+    pub retired: u32,
     /// Occupied connection slots: the slab's count.
     pub slots: usize,
     /// The `conn` class's slots, the cell's connection share `C`.
     pub share: u32,
-}
-
-impl ConnOwners {
-    /// O1's breach, if any: the two owners unequal, or either past `C`.
-    #[must_use]
-    pub fn breach(&self) -> Option<String> {
-        let ConnOwners { tasks, slots, share } = *self;
-        if usize::try_from(tasks).ok() != Some(slots) {
-            return Some(format!("conn-tasks-unequal: {tasks} conn tasks alive, {slots} slots"));
-        }
-        if tasks > share {
-            return Some(format!("conn-over-share: {tasks} conn tasks, share {share}"));
-        }
-        None
-    }
 }
 
 /// What a cell's stop waits on (ADR-0199 D3): the wait the drain's last
@@ -2056,13 +2046,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.conns.borrow().live
     }
 
-    /// O1's two owners (ADR-0177 D2): the `conn` tasks alive on `executor`,
-    /// this cell's, and the occupied connection slots, with the class's
-    /// slots `C` that bound both. A connection's pump lives exactly as long
-    /// as its slot is occupied, so the first two are equal at every step.
+    /// O1's two owners (ADR-0177 D2): the `conn` tasks `executor`, this
+    /// cell's, holds and how many of them are Retired, and the occupied
+    /// connection slots, with the class's slots `C` that bound both. A
+    /// connection's slot vacates as its pump returns, so the tasks alive
+    /// equal the slots at every step; the simulator judges it.
     pub fn conn_owners(&self, executor: &CellExecutor) -> ConnOwners {
-        let (tasks, share) = self.shared.tasks.conn_tasks(executor);
-        ConnOwners { tasks, slots: self.connections(), share }
+        let (held, retired, share) = self.shared.tasks.conn_tasks(executor);
+        ConnOwners { held, retired, slots: self.connections(), share }
     }
 
     /// Outstanding async work: pending fabric replies + credit waiters.

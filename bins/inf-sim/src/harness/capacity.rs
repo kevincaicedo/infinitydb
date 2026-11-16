@@ -27,7 +27,8 @@ use inf_runtime::{CellLoop, LoopConfig};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane, StdSegmentFs};
 use inf_store::{KeyspaceSeed, NsSpec, SlotRouter, StoreConfig};
 
-use super::{FROZEN_MESH, STEP_NS_FLOOR, namespace_specs, node_hasher};
+use super::owners::OwnersJudge;
+use super::{FROZEN_MESH, REFUSAL_FRAME, STEP_NS_FLOOR, namespace_specs, node_hasher};
 use crate::census::{CellFacts, CensusVerdict};
 use crate::driver::Violations;
 use crate::net::{CellNet, Plant, SimDriver, drain_violations, listener_fd};
@@ -260,8 +261,8 @@ struct Rig {
     tasks_most: Option<Vec<usize>>,
     /// Each cell's node state, for the gauges a leg reads beside the wire.
     nodes: Vec<Rc<NodeInfo>>,
-    /// The cells whose O1 breach is recorded, once each.
-    owners_breached: Vec<bool>,
+    /// O1's judge: each cell's first breach, recorded once.
+    owners: OwnersJudge,
 }
 
 impl Rig {
@@ -340,7 +341,7 @@ impl Rig {
             readings: Vec::new(),
             tasks_most: None,
             nodes,
-            owners_breached: vec![false; usize::from(CELLS)],
+            owners: OwnersJudge::new(usize::from(CELLS)),
         };
         for _ in 0..8 {
             rig.step();
@@ -388,18 +389,22 @@ impl Rig {
         self.steps += 1;
     }
 
-    /// O1 on every step (ADR-0177 D2): on each cell the `conn` tasks alive
-    /// equal the occupied connection slots, both within the share. Two
-    /// owners report and the harness compares; each cell's first breach is
-    /// recorded.
+    /// O1 on every step (ADR-0177 D2): each cell's raw owners judged
+    /// beside the leg's clients that hold a slot by their own reading (a
+    /// frame read other than the `maxclients` refusal) and whose
+    /// server-side close the net has not posted, read live: the rig judges
+    /// before it observes this step's closes.
     fn judge_owners(&mut self) {
-        for (cell, (cell_loop, plane)) in self.cells.iter().enumerate() {
-            let Some(breach) = plane.conn_owners(cell_loop.executor()).breach() else { continue };
-            if !self.owners_breached[cell] {
-                self.owners_breached[cell] = true;
-                let step = self.steps;
-                self.violations.push(format!("O1 {breach} on cell {cell} at step {step}"));
+        let mut held = vec![0usize; self.cells.len()];
+        for client in &self.clients {
+            let framed = client.replies.first().is_some_and(|reply| reply != REFUSAL_FRAME);
+            if framed && !self.nets[client.cell].borrow().closed(client.fd) {
+                held[client.cell] += 1;
             }
+        }
+        let at = format!("step {}", self.steps);
+        for (cell, (cell_loop, plane)) in self.cells.iter().enumerate() {
+            self.owners.step(cell, plane.conn_owners(cell_loop.executor()), Some(held[cell]), &at);
         }
     }
 
@@ -503,11 +508,16 @@ impl Rig {
             && self.cells.iter().all(|(_, plane)| plane.suspended() == 0)
     }
 
-    /// Steps until quiet, then 64 more so closes and drains complete.
+    /// Steps until quiet, then 64 more so closes and drains complete; then
+    /// O1's leak clause: no `conn` header stays Retired.
     fn settle(&mut self) {
         self.until("quiescence", Rig::quiet);
         for _ in 0..64 {
             self.step();
+        }
+        let at = format!("settle, step {}", self.steps);
+        for (cell, (cell_loop, plane)) in self.cells.iter().enumerate() {
+            self.owners.settled(cell, plane.conn_owners(cell_loop.executor()), &at);
         }
     }
 
@@ -557,6 +567,7 @@ impl Rig {
     /// iteration (the cap bound, the assembly rule and their liveness), and
     /// the state hash over the readings and every cell's keyspace.
     fn report(mut self, leg: CloseLeg) -> CapacityReport {
+        self.violations.extend(self.owners.take_violations());
         // No op refused at a full per-origin deque (ADR-0177 D6; derived
         // never).
         for cell in 0..self.nodes.len() {

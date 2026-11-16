@@ -2096,6 +2096,9 @@ pub(crate) struct Node {
     /// Each cell's node state, for the counters a life's end reads beside
     /// the census.
     nodes: Vec<Rc<NodeInfo>>,
+    /// O1's judge (ADR-0177 D2), on every step of the life: each cell's
+    /// first breach, joined to the life's verdict at its end.
+    owners: crate::harness::owners::OwnersJudge,
 }
 
 /// One cell's durable configuration for `scenario` (every cell of a node
@@ -2253,6 +2256,7 @@ pub(crate) fn boot_meshed(
     Ok(Node {
         nodes,
         iter_stats: vec![None; cells.len()],
+        owners: crate::harness::owners::OwnersJudge::new(cells.len()),
         cells,
         nets,
         control,
@@ -2300,9 +2304,11 @@ impl Drop for Node {
                     .push(format!("PARKED REFUSED: cell {index}, {refused} ops, at a life's end"));
             }
         }
-        // The nets' own invariants join the life's verdict, which every
-        // durable run reads, so they are never dropped with the node.
+        // The nets' own invariants and O1's breaches join the life's
+        // verdict, which every durable run reads, so they are never dropped
+        // with the node.
         crate::net::drain_violations(&self.nets, &mut verdict.violations);
+        verdict.violations.extend(self.owners.take_violations());
         self.observer.2.borrow_mut().absorb(verdict);
     }
 }
@@ -2359,6 +2365,13 @@ impl Node {
             if let Some(err) = plane.take_boot_error() {
                 return Err(err);
             }
+        }
+        // O1's clauses 1 and 2 on every cell (ADR-0177 D2): a durable life's
+        // clients are its legs' own, so clause 3 is the general harness's
+        // and the capacity rig's.
+        let at = clock.now();
+        for (cell, (cell_loop, plane)) in self.cells.iter().enumerate() {
+            self.owners.step(cell, plane.conn_owners(cell_loop.executor()), None, &at);
         }
         if !self.hold_inbox {
             self.inbox.drain(disk, &self.data_dir)?;

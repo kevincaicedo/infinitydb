@@ -328,6 +328,14 @@ pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     flush_sub_deltas(&shared, notes).await;
     #[cfg(not(inf_canary_draining_vacates_before_acks))]
     let _ = shared.conns.borrow_mut().remove(key);
+    // Canary: the pump keeps a clone of its own waker past its return, so
+    // its header stays Retired and holds its class slot for good.
+    #[cfg(inf_canary_conn_waker_kept)]
+    core::future::poll_fn(|cx| {
+        core::mem::forget(cx.waker().clone());
+        core::task::Poll::Ready(())
+    })
+    .await;
 }
 
 /// The pump's serving loop: dispatch commands in pipeline order with up to
@@ -347,6 +355,9 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let mut inflight: usize = 0;
     // A command held back by the conn-state barrier.
     let mut held: Option<OwnedCmd> = None;
+    // Canary: whether the pump wrote a reply, for the plant below.
+    #[cfg(inf_canary_conn_owner_lost)]
+    let mut replied = false;
     loop {
         // ---- dispatch: fill the window in pipeline order.
         while pending.len() < PENDING_REPLIES_MAX && inflight < REMOTE_WINDOW {
@@ -361,6 +372,14 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     }
                     Popped::Empty => break,
                     Popped::Park => {
+                        // Canary: a pump whose queue is empty after its first
+                        // reply returns and its slot vacates with it, the
+                        // socket left open, so both owners lose a client
+                        // that still holds its connection.
+                        #[cfg(inf_canary_conn_owner_lost)]
+                        if replied {
+                            return Some(SubNotes::default());
+                        }
                         park().await;
                         continue;
                     }
@@ -412,6 +431,10 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         match emitted {
             Emitted::Written | Emitted::Dropped => {}
             Emitted::Vacant => return None,
+        }
+        #[cfg(inf_canary_conn_owner_lost)]
+        {
+            replied |= matches!(emitted, Emitted::Written);
         }
     }
 }
