@@ -2589,34 +2589,56 @@ expect green "shipping: test-support declared, and requested on a dev edge only"
 
 # The resolver pass reads `cargo tree`, which no fixture root reaches: a stub
 # `cargo` on PATH answers each `-i <package>` with the package resolved and,
-# on the workspace's graph, the planted `<package>:<feature>` (SHIP_PLANT)
-# enabled. The manifests are the tree's own. One red per fenced feature, so a
-# misspelled `FENCED` row matches nothing and reads OK no more.
+# only when `-e` carries `features`, a planted feature enabled: on the
+# workspace's graph `<package>:<feature>` (SHIP_PLANT), on one shipping
+# package's own graph `<shipping package>/<package>:<feature>`
+# (SHIP_PLANT_ONE, read under `-p`). The manifests are the tree's own. One
+# red per fenced feature on the workspace's graph, so a misspelled `FENCED`
+# row matches nothing and reads OK no more, and one per shipping package on
+# its own graph, so its arm's pattern and package list go red when broken.
 mkdir -p "$work/ship-cargo"
 cat >"$work/ship-cargo/cargo" <<'STUB'
 #!/usr/bin/env bash
-package="" workspace=0
+package="" shipping="" edges="" workspace=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -i) package=$2; shift ;;
+        -p) shipping=$2; shift ;;
+        -e) edges=$2; shift ;;
         --workspace) workspace=1 ;;
     esac
     shift
 done
 echo "$package v0.0.0 (/fixture)"
+case ",$edges," in
+    *,features,*) ;;
+    *) exit 0 ;;
+esac
 if [ "$workspace" -eq 1 ] && [ "${SHIP_PLANT%%:*}" = "$package" ]; then
     echo "├── $package feature \"${SHIP_PLANT#*:}\""
+fi
+one=${SHIP_PLANT_ONE#*/}
+if [ -n "$shipping" ] && [ "${SHIP_PLANT_ONE%%/*}" = "$shipping" ] \
+    && [ "${one%%:*}" = "$package" ]; then
+    echo "├── $package feature \"${one#*:}\""
 fi
 STUB
 chmod +x "$work/ship-cargo/cargo"
 expect green "shipping: the resolver pass reads a clean graph" \
-    env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT= $SHIP
+    env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT= SHIP_PLANT_ONE= $SHIP
 for plant in inf-foundation:collision-oracle inf-foundation:fault-points \
     inf-store:collision-oracle inf-store:test-support inf-runtime:fault-points \
     inf-server:fault-points; do
     expect_red_because "shipping: the resolver pass reads $plant enabled" \
         "enables a banned ${plant%%:*} feature" \
-        env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT="$plant" $SHIP
+        env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT="$plant" \
+        SHIP_PLANT_ONE= $SHIP
+done
+for shipping in infinityd inf; do
+    expect_red_because "shipping: $shipping's own graph resolves inf-server:fault-points" \
+        "$shipping alone resolves a banned inf-server feature" \
+        env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT= \
+        SHIP_PLANT_ONE="$shipping/inf-server:fault-points" $SHIP
 done
 }
 
