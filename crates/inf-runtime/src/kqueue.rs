@@ -133,12 +133,7 @@ impl KqueueDriver {
                     self.recvs.insert(fd, RecvState { token, disarmed: false, paused: false });
                     self.push_change(fd, libc::EVFILT_READ, libc::EV_ADD | libc::EV_ENABLE);
                 }
-                IoOp::RecvDisarm { fd } => {
-                    if let Some(state) = self.recvs.get_mut(&fd) {
-                        state.disarmed = true;
-                        self.push_change(fd, libc::EVFILT_READ, libc::EV_DISABLE);
-                    }
-                }
+                IoOp::RecvDisarm { fd } => self.disarm_recv(fd),
                 IoOp::Send { fd, buf, len, token } => {
                     self.queue_send(fd, buf, len, token, pool, out);
                 }
@@ -466,6 +461,16 @@ impl KqueueDriver {
         }
     }
 
+    /// Quiets `fd`'s receive until a `RecvArm`: the consumer's
+    /// `RecvDisarm`, and the end of stream, which ends the receive (the
+    /// zero-length `Recv` is its arm's last, ADR-0196 A1.3).
+    fn disarm_recv(&mut self, fd: RawFd) {
+        if let Some(state) = self.recvs.get_mut(&fd) {
+            state.disarmed = true;
+            self.push_change(fd, libc::EVFILT_READ, libc::EV_DISABLE);
+        }
+    }
+
     /// One bounded read at readiness; level-triggering refires while data
     /// remains (per-connection fairness without per-fd loops).
     fn recv_one(&mut self, fd: RawFd, pool: &mut BufferPool, out: &mut Vec<Completion>) {
@@ -489,7 +494,12 @@ impl KqueueDriver {
         let n = unsafe { libc::read(fd, target.as_mut_ptr().cast(), capacity) };
         self.stats.syscalls += 1;
         if n >= 0 {
-            // n == 0 ⇒ EOF, delivered with the buffer per the contract.
+            // n == 0 ⇒ EOF, delivered with the buffer per the contract, and
+            // the receive's last completion: an `EV_EOF` socket reads ready
+            // at every wait, so the level-triggered filter is disabled.
+            if n == 0 {
+                self.disarm_recv(fd);
+            }
             out.push(Completion { token, result: CompletionResult::Recv { buf, len: n as u32 } });
             return;
         }

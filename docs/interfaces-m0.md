@@ -441,7 +441,7 @@ pub enum CompletionResult {
     Accepted { fd: RawFd },
     Recv { buf: BufferId, len: u32 },      // len == 0 ⇒ peer closed (EOF): the arm's last
                                             // completion; no Recv for the fd follows it until a
-                                            // RecvArm (ADR-0196 A1.3), not built
+                                            // RecvArm (ADR-0196 A1.3)
     RecvDropped,                            // pool dry; recv paused, re-arm needed
     Sent { buf: BufferId },
     Closed,
