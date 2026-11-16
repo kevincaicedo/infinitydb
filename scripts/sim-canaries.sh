@@ -1347,6 +1347,9 @@ ordered_rows=(
   # (ADR-0194 D6 with A2). Planted, the whole generation is compared with the field, and from
   # a slot's 2²³-th use its word reads Stale.
   "inf_canary_word_resolve_unmasked crate-test inf-foundation lib a_word_resolves_its_slot_past_the_field_width key-stale-past-width"
+  # The same plant at the shipped topology: every cell's fabric holders start two uses short of
+  # the key's generation field, so a fan's word past it resolves stale and its reply is lost.
+  "inf_canary_word_resolve_unmasked m0-capacity fan-reply-lost --close-leg holder-near-wrap"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   # A fixture's table is ordered whole.

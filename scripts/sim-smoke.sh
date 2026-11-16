@@ -92,6 +92,7 @@ rows=(
   "m0-capacity --close-leg gated-hold --verify-determinism"
   "m0-capacity --close-leg gated-cold --verify-determinism"
   "m0-capacity --close-leg gated-error --verify-determinism"
+  "m0-capacity --close-leg holder-near-wrap --verify-determinism"
   "m1-cache"
   "m2-durable"
   "m2-clean-stop"

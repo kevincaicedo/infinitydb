@@ -937,6 +937,24 @@ pub enum PlaneBuildError {
     Gate(inf_foundation::bounded::CapError),
 }
 
+/// The plane's fabric gate (ADR-0177 D4); under `fault-points` with its
+/// holder slots at the first generation `config` names.
+fn build_gate(
+    config: &crate::config::ConfigStore,
+    origin: u16,
+    units: u32,
+    holders: Option<inf_foundation::bounded::Cap>,
+    census: &Rc<CapCensus>,
+) -> Result<FabricGate<OwnedOutcome>, inf_foundation::bounded::CapError> {
+    #[cfg(feature = "fault-points")]
+    if let Some(first) = config.gate_first_generation() {
+        return FabricGate::build_at_generation(origin, units, holders, census, first);
+    }
+    #[cfg(not(feature = "fault-points"))]
+    let _ = config;
+    FabricGate::build(origin, units, holders, census)
+}
+
 impl core::fmt::Display for PlaneBuildError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -1001,7 +1019,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
         let parked = ParkedDeques::build(cell, cells, fabric.data_credits(), &census)
             .map_err(PlaneBuildError::Parked)?;
-        let gate = FabricGate::build(cell.0, crate::limits::gate_units(&caps), holders, &census)
+        let units = crate::limits::gate_units(&caps);
+        let gate = build_gate(&node.config.borrow(), cell.0, units, holders, &census)
             .map_err(PlaneBuildError::Gate)?;
         node.cell.set(cell.0);
         node.cells.set(cells);
@@ -2051,6 +2070,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
 
     pub fn connections(&self) -> usize {
         self.shared.conns.borrow().live
+    }
+
+    /// Takes of fabric holders past the key's generation field: the
+    /// near-wrap leg's engagement (`fault-points` only).
+    #[cfg(feature = "fault-points")]
+    pub fn gate_wrapped_takes(&self) -> u64 {
+        self.shared.gate.borrow().wrapped_takes()
     }
 
     /// The fabric gate's reserves that found every holder taken

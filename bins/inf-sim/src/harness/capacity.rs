@@ -36,6 +36,7 @@ use crate::resp::reply_len;
 use crate::state::StateHash;
 
 mod gated;
+mod near_wrap;
 mod small_credit;
 
 /// The legs, each one row of `scripts/sim-smoke.sh` or one pinned red.
@@ -101,11 +102,16 @@ pub enum CloseLeg {
     /// An `always` `INCR` that errors, read under the held fsync, then a
     /// flat `always` `SET`, acked after the hold.
     GatedError,
+    /// Every cell's fabric holders built at the generation two short of the
+    /// key's 23-bit field, on a mesh of 8 credits: rounds of `MGET`s of 32
+    /// keys a peer owns, each a fan of 32 legs, carry every slot's word past
+    /// the field. Every reply is exact and in order.
+    HolderNearWrap,
 }
 
 impl CloseLeg {
     /// Every leg, in the order the help text lists them.
-    pub const ALL: [CloseLeg; 20] = [
+    pub const ALL: [CloseLeg; 21] = [
         CloseLeg::Tasks,
         CloseLeg::Fan,
         CloseLeg::Close,
@@ -126,6 +132,7 @@ impl CloseLeg {
         CloseLeg::GatedHold,
         CloseLeg::GatedCold,
         CloseLeg::GatedError,
+        CloseLeg::HolderNearWrap,
     ];
 
     /// The legs red at this tree. Each runs in one ignored test of `reds`,
@@ -158,6 +165,7 @@ impl CloseLeg {
             CloseLeg::GatedHold => "gated-hold",
             CloseLeg::GatedCold => "gated-cold",
             CloseLeg::GatedError => "gated-error",
+            CloseLeg::HolderNearWrap => "holder-near-wrap",
         }
     }
 
@@ -275,11 +283,24 @@ impl Rig {
     /// The same, each cell's keyspace also holding `namespaces`, created
     /// uncataloged at boot.
     fn with_namespaces(seed: u64, maxclients: u32, step_ns_max: u64, namespaces: &[NsSpec]) -> Rig {
+        Rig::with_setup(seed, maxclients, step_ns_max, namespaces, FROZEN_MESH, None)
+    }
+
+    /// The same on `mesh`, each cell's fabric holders built free at
+    /// `first_generation` when one is named.
+    fn with_setup(
+        seed: u64,
+        maxclients: u32,
+        step_ns_max: u64,
+        namespaces: &[NsSpec],
+        mesh: inf_fabric::MeshConfig,
+        first_generation: Option<u32>,
+    ) -> Rig {
         let clock = Rc::new(VirtualClock::new(Nanos(1)));
         let mut cells = Vec::new();
         let mut nets = Vec::new();
         let mut nodes = Vec::new();
-        for (i, fabric) in Mesh::new(CELLS, FROZEN_MESH).into_iter().enumerate() {
+        for (i, fabric) in Mesh::new(CELLS, mesh).into_iter().enumerate() {
             let cell = u16::try_from(i).expect("a u16 cell");
             let net = CellNet::new(cell, seed, Plant::None);
             // `maxclients` is the node's boot capacity, as `infinityd
@@ -291,6 +312,14 @@ impl Rig {
                     .expect("a leg's boot capacity");
                 config = config.with_boot_capacity(capacity);
             }
+            // The plane's gate hook is `inf-server`'s `fault-points`, which
+            // `dst` forwards; the simulator runs only with `dst`.
+            #[cfg(feature = "dst")]
+            if let Some(first) = first_generation {
+                config = config.with_gate_first_generation(first);
+            }
+            #[cfg(not(feature = "dst"))]
+            let _ = first_generation;
             let (node, admission) = NodeInfo::try_new(config).expect("fixture cache allocation");
             let node = Rc::new(node);
             node.rng_state.set(seed ^ (0xCA9A_0000 + i as u64));
@@ -690,6 +719,7 @@ pub fn run_capacity_scenario(scenario: &CapacityScenario) -> CapacityReport {
         CloseLeg::GatedHold => return gated::gated_hold_leg(seed),
         CloseLeg::GatedCold => return gated::gated_cold_leg(seed),
         CloseLeg::GatedError => return gated::gated_error_leg(seed),
+        CloseLeg::HolderNearWrap => near_wrap::holder_near_wrap_leg(seed),
     };
     rig.report(leg)
 }
