@@ -242,6 +242,12 @@ pub struct NodeState {
     pub fabric_parked_bytes: Cell<u64>,
     pub fabric_parked_bytes_max: Cell<u64>,
     pub fabric_parked_refused: Cell<u64>,
+    /// The fabric gate's derived-never counters (ADR-0177 D4; cell scope,
+    /// `# Tripwires`), published at the stats flush: reserves that found
+    /// every holder taken (`gate_full`) and completions for no holder that
+    /// awaits one (`gate_stale`).
+    pub gate_full: Cell<u64>,
+    pub gate_stale: Cell<u64>,
     /// Publish fan legs this cell's owner pump could not stage on the
     /// credit general sends leave free, each then sent as a general op
     /// (ADR-0192 D3). Cell scope; 0 by the reserve's proof, so any other

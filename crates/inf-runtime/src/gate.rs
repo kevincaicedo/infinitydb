@@ -161,6 +161,10 @@ impl GateUnits {
     }
 
     fn take(&self) -> bool {
+        // Canary: `reserve` grants without a unit, so a fan is never windowed.
+        if cfg!(inf_canary_gate_units_unbounded) {
+            return true;
+        }
         let free = self.free.get();
         if free == 0 {
             return false;
@@ -170,6 +174,9 @@ impl GateUnits {
     }
 
     fn give(&self) {
+        if cfg!(inf_canary_gate_units_unbounded) {
+            return;
+        }
         let free = self.free.get();
         debug_assert!(free < self.count, "a unit returns only after it was taken");
         self.free.set(free + 1);
@@ -467,6 +474,21 @@ fn orphan<V>(
 ) -> (Option<Waker>, Option<V>) {
     let LookupMut::Live(holder) = slab.get_mut(slot) else { return (None, None) };
     let prior = core::mem::replace(&mut holder.state, HolderState::Orphaned);
+    // Canary: the holder frees at its waiter's drop, with no Orphaned state,
+    // so its request's late completion finds the slot at its next generation.
+    if cfg!(inf_canary_gate_frees_on_drop) {
+        let _freed = slab.take(slot);
+        room.wake_one(());
+        return match prior {
+            HolderState::Delivered(value) => (None, Some(value)),
+            HolderState::Waiting(waker) | HolderState::WaitingTimed(waker, _) => {
+                (Some(waker), None)
+            }
+            HolderState::Registered | HolderState::RegisteredTimed(_) | HolderState::Orphaned => {
+                (None, None)
+            }
+        };
+    }
     match prior {
         HolderState::Delivered(value) => {
             let _freed = slab.take(slot);

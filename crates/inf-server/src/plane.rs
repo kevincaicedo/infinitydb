@@ -2052,6 +2052,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.conns.borrow().live
     }
 
+    /// The fabric gate's reserves that found every holder taken
+    /// (`gate_full`): derived never (ADR-0177 D4, E7).
+    pub fn gate_full(&self) -> u64 {
+        self.shared.gate.borrow().full()
+    }
+
+    /// The fabric gate's completions for no holder that awaits one
+    /// (`gate_stale`): derived never (ADR-0177 D4, E8).
+    pub fn gate_stale(&self) -> u64 {
+        self.shared.gate.borrow().stale()
+    }
+
     /// O1's two owners (ADR-0177 D2): the `conn` tasks `executor`, this
     /// cell's, holds and how many of them are Retired, and the occupied
     /// connection slots, with the class's slots `C` that bound both. A

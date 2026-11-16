@@ -489,6 +489,10 @@ fn tripwires_section(
     push(text, &format!("fabric_parked_bytes:{}", node.fabric_parked_bytes.get()));
     push(text, &format!("fabric_parked_bytes_max:{}", node.fabric_parked_bytes_max.get()));
     push(text, &format!("fabric_parked_refused:{}", node.fabric_parked_refused.get()));
+    // The fabric gate's reserves on a full gate and completions for no
+    // waiting holder, each derived never (ADR-0177 D4; cell scope).
+    push(text, &format!("gate_full:{}", node.gate_full.get()));
+    push(text, &format!("gate_stale:{}", node.gate_stale.get()));
     push(text, &format!("pubsub_delivered:{}", node.pubsub_delivered.get()));
     push(text, &format!("pubsub_state_bytes:{}", node.pubsub_state_bytes.get()));
     push(text, &format!("{}:{}", tw::WIRE_BUFFERS_BYTES, node.wire_buffers_bytes.get()));

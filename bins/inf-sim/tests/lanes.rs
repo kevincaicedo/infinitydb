@@ -137,26 +137,34 @@ fn every_capacity_leg_has_a_smoke_row_or_a_pinned_red() {
 }
 
 /// The one-lane rule's plants, each against this tree's rows, table and
-/// source: a pinned leg given a smoke row, a pinned leg dropped from the
-/// table, and a pinned leg whose test is gone each break it.
+/// source with one leg pinned (the table's first, or the fan leg moved into
+/// it while the table is empty): a pinned leg given a smoke row, a pinned
+/// leg dropped from the table, and a pinned leg whose test is gone each
+/// break it, and the pinned leg in its one lane does not.
 #[test]
 fn the_one_lane_rule_refuses_each_plant() {
-    let rows = capacity_smoke_legs();
-    let source = read("src/harness/capacity.rs");
-    let leg = CloseLeg::PINNED_RED[0];
+    let leg = CloseLeg::PINNED_RED.first().copied().unwrap_or(CloseLeg::Fan);
+    let mut pinned = CloseLeg::PINNED_RED.to_vec();
+    if pinned.is_empty() {
+        pinned.push(leg);
+    }
+    let mut rows = capacity_smoke_legs();
+    rows.remove(leg.name());
+    let call = format!("pinned_red(CloseLeg::{leg:?});");
+    let mut source = read("src/harness/capacity.rs");
+    if !source.contains(&call) {
+        source.push_str(&call);
+    }
     let broke =
         |breaks: Vec<String>| breaks.iter().any(|b| b.starts_with(&format!("{}: ", leg.name())));
+    assert!(!broke(one_lane_breaks(&rows, &pinned, &source)), "the control: one lane");
     let mut both = rows.clone();
     both.insert(leg.name().to_string());
-    assert!(broke(one_lane_breaks(&both, CloseLeg::PINNED_RED, &source)), "a leg in both lanes");
-    let unpinned: Vec<CloseLeg> =
-        CloseLeg::PINNED_RED.iter().copied().filter(|pinned| *pinned != leg).collect();
+    assert!(broke(one_lane_breaks(&both, &pinned, &source)), "a leg in both lanes");
+    let unpinned: Vec<CloseLeg> = pinned.iter().copied().filter(|other| *other != leg).collect();
     assert!(broke(one_lane_breaks(&rows, &unpinned, &source)), "a leg in neither lane");
-    let untested = source.replace(&format!("pinned_red(CloseLeg::{leg:?});"), "");
-    assert!(
-        broke(one_lane_breaks(&rows, CloseLeg::PINNED_RED, &untested)),
-        "a pinned leg untested"
-    );
+    let untested = source.replace(&call, "");
+    assert!(broke(one_lane_breaks(&rows, &pinned, &untested)), "a pinned leg untested");
 }
 
 #[test]

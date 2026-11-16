@@ -1515,7 +1515,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         node.waker_foreign_ops.set(cx.executor.waker_foreign_ops());
         node.accept_errors.set(self.shared.accept_errors.get());
         node.timers_armed_max.set(u64::from(cx.timers().armed_max()));
-        node.fabric_rtt_p50_ns.set(self.shared.gate.borrow().round_trips().percentile(50.0));
+        {
+            let gate = self.shared.gate.borrow();
+            node.fabric_rtt_p50_ns.set(gate.round_trips().percentile(50.0));
+            node.gate_full.set(gate.full());
+            node.gate_stale.set(gate.stale());
+        }
         {
             let ps = self.shared.pubsub.borrow();
             node.pubsub_channels.set(ps.live_owned_channel_count());

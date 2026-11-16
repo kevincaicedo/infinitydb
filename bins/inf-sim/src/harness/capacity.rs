@@ -133,7 +133,7 @@ impl CloseLeg {
     /// green leg leaves this table for its `scripts/sim-smoke.sh` row, where
     /// it runs with its twin; `tests/lanes.rs` holds every leg to one of the
     /// two.
-    pub const PINNED_RED: &'static [CloseLeg] = &[CloseLeg::Fan];
+    pub const PINNED_RED: &'static [CloseLeg] = &[];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -576,6 +576,21 @@ impl Rig {
                 self.violate(format!("parked-refused: cell {cell}, {refused} op(s)"));
             }
         }
+        // The fabric gate filled no reserve and met no completion for a
+        // holder that does not await one (ADR-0177 D4; F4, derived never).
+        for cell in 0..self.cells.len() {
+            let (full, stale) = (self.plane(cell).gate_full(), self.plane(cell).gate_stale());
+            self.read("gate_full", full);
+            self.read("gate_stale", stale);
+            if full != 0 {
+                self.violate(format!("gate-full: cell {cell}, {full} reserve(s) on a full gate"));
+            }
+            if stale != 0 {
+                self.violate(format!(
+                    "gate-stale: cell {cell}, {stale} completion(s) for no holder"
+                ));
+            }
+        }
         let mut census = CensusVerdict::default();
         for (index, (_, plane)) in self.cells.iter().enumerate() {
             let facts = CellFacts {
@@ -885,21 +900,28 @@ impl Rig {
     }
 }
 
-/// The share's clients on cell 0 each send a `DEL` of 100 keys cell 1 owns
-/// while cell 1 is held: the remote legs the cell holds (gate waiters and
-/// credit waits) stay within the share's windows of 32; at HEAD each sends a
-/// leg per key. Then every reply is the exact count.
+/// The share's clients on cell 0 each send a `DEL` of 1,023 keys cell 1 owns, each client its
+/// own keys, set first, while cell 1 is held: the remote legs the cell holds (gate waiters and
+/// credit waits) stay within the share's windows of 32, then every reply is the exact count. A
+/// fan with no window holds a holder for each leg until it has sent its last, so the share's
+/// fans pass the gate's holders (`gate-full`).
 fn fan_leg(seed: u64) -> Rig {
-    const KEYS: usize = 100;
+    const KEYS: usize = 1_023;
     let mut rig = Rig::new(seed, (SHARE * usize::from(CELLS)) as u32, 15_000);
     let fanners: Vec<usize> = (0..SHARE).map(|_| rig.admitted(X)).collect();
+    let writer = rig.admitted(Y);
+    let keys: Vec<Vec<Vec<u8>>> =
+        (0..SHARE).map(|n| names_on(Y, &format!("fan:{n}"), KEYS)).collect();
+    for names in &keys {
+        let owed = rig.clients[writer].replies.len() + names.len();
+        rig.send(writer, &sets(names));
+        rig.until("the fan keys' SETs", |rig| rig.clients[writer].replies.len() >= owed);
+    }
     rig.held = Some(Y);
-    let keys = names_on(Y, "fan", KEYS);
-    let mut argv: Vec<&[u8]> = vec![b"DEL"];
-    argv.extend(keys.iter().map(Vec::as_slice));
-    let del = encode(&argv);
-    for &id in &fanners {
-        rig.send(id, &del);
+    for (&id, names) in fanners.iter().zip(&keys) {
+        let mut argv: Vec<&[u8]> = vec![b"DEL"];
+        argv.extend(names.iter().map(Vec::as_slice));
+        rig.send(id, &encode(&argv));
     }
     rig.until("the fans' bytes taken", |rig| {
         fanners.iter().all(|&id| rig.nets[X].borrow().unread(rig.fd(id)) == Some(0))
@@ -919,8 +941,15 @@ fn fan_leg(seed: u64) -> Rig {
     rig.until("the fans' replies", |rig| {
         fanners.iter().all(|&id| rig.clients[id].replies.len() > 1)
     });
+    // Named here, beside the replies a full gate stalls, and again with
+    // every cell's counters in the report.
+    let full = rig.plane(X).gate_full();
+    if full != 0 {
+        rig.violate(format!("gate-full: cell {X}, {full} reserve(s) on a full gate by the fans"));
+    }
+    let count = format!(":{KEYS}\r\n").into_bytes();
     for &id in &fanners {
-        rig.judge_replies(id, 1, &[DEL_NONE.to_vec()], "a fan");
+        rig.judge_replies(id, 1, core::slice::from_ref(&count), "a fan");
     }
     rig.settle();
     if held == 0 {
@@ -1519,6 +1548,7 @@ mod reds {
     /// its test's ignore reason names; green, it fails too, since a green leg
     /// leaves `CloseLeg::PINNED_RED` for its smoke row: an ignore removed
     /// never runs a leg in this lane, unchecked by its twin.
+    #[allow(dead_code, reason = "no leg is pinned red at this tree; a red leg's test calls it")]
     fn pinned_red(leg: CloseLeg) {
         let name = leg.name();
         assert!(CloseLeg::PINNED_RED.contains(&leg), "--close-leg {name}: not a pinned red");
@@ -1529,12 +1559,5 @@ mod reds {
             "m0-capacity --close-leg {name} reads green: it leaves CloseLeg::PINNED_RED for its \
              scripts/sim-smoke.sh row"
         );
-    }
-
-    #[test]
-    #[ignore = "a fan sends a leg per remote key past the connection's window of 32; red until \
-                each leg takes one of the connection's gate units"]
-    fn the_fan_leg_holds_a_window_per_connection() {
-        pinned_red(CloseLeg::Fan);
     }
 }

@@ -1211,11 +1211,20 @@ ordered_rows=(
   # A flushing slot is written no message published after its mark (ADR-0196 D4). Planted, the
   # delivery writes into it, and a message follows the subscriber's +OK.
   "inf_canary_flushing_takes_delivery m0-capacity push-after-quit --close-leg quit-subscriber"
+  # A fabric holder whose waiter drops waits, Orphaned, for its request's one completion, so no
+  # completion finds a later occupant (ADR-0177 D4). Planted, it frees at the drop. No wire path
+  # drops a wait while its request is out (a closing pump finishes its command), so the crate test
+  # of the holder table's Orphaned row is the oracle.
+  "inf_canary_gate_frees_on_drop crate-test inf-runtime lib an_orphaned_holder_frees_at_its_late_completion orphan-freed-at-drop"
   # The fabric gate's holders are resident from its build (ADR-0177 D8 with A1), billed by F7.
   # Planted, the gate is built over 2 H: the idle node's resident memory a cell rises by H x
   # s_h, 83,075 x 48 B at 4 cells, over F7's 256 KiB. The bytes are that product at the stride
   # the plane's layout test prints; a stride that moves moves them with it.
   "inf_canary_gate_holders_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 3987600 --control-bytes-cell 262144 --plant-row fabric-gate-holders"
+  # A fabric reserve takes one of its task's units, so a fan wider than 32 legs runs in windows
+  # and the share's fans stay within the gate's holders (ADR-0177 D4). Planted, it grants
+  # without a unit: each fan holds a holder a leg until its last is sent, and the gate fills.
+  "inf_canary_gate_units_unbounded m0-capacity gate-full --close-leg fan"
   # An `always` apply whose verdict is a reply drops its gated ticket, which releases its slot
   # (ADR-0177 D6), so its origin's next apply opens one. Planted, the drop releases nothing, the
   # error's slot stays at the origin's back, and the next write's open stops the cell.
