@@ -303,23 +303,7 @@ impl Rig {
         for (i, fabric) in Mesh::new(CELLS, mesh).into_iter().enumerate() {
             let cell = u16::try_from(i).expect("a u16 cell");
             let net = CellNet::new(cell, seed, Plant::None);
-            // `maxclients` is the node's boot capacity, as `infinityd
-            // --maxclients` sets it (ADR-0123 A1).
-            let mut config = inf_server::ConfigStore::default();
-            if maxclients != 0 {
-                let cells = inf_foundation::CellCount::new(CELLS).expect("three cells");
-                let capacity = inf_server::BootCapacity::new(maxclients, cells)
-                    .expect("a leg's boot capacity");
-                config = config.with_boot_capacity(capacity);
-            }
-            // The plane's gate hook is `inf-server`'s `fault-points`, which
-            // `dst` forwards; the simulator runs only with `dst`.
-            #[cfg(feature = "dst")]
-            if let Some(first) = first_generation {
-                config = config.with_gate_first_generation(first);
-            }
-            #[cfg(not(feature = "dst"))]
-            let _ = first_generation;
+            let config = leg_config(maxclients, first_generation);
             let (node, admission) = NodeInfo::try_new(config).expect("fixture cache allocation");
             let node = Rc::new(node);
             node.rng_state.set(seed ^ (0xCA9A_0000 + i as u64));
@@ -680,6 +664,27 @@ fn names_on(owner: usize, stem: &str, count: usize) -> Vec<Vec<u8>> {
         .filter(|name| router.cell_of(SlotRouter::slot_of(name)).0 as usize == owner)
         .take(count)
         .collect()
+}
+
+/// A leg node's configuration: `maxclients` its boot capacity, as `infinityd --maxclients`
+/// sets it (ADR-0123 A1), and the fabric holders' first generation when one is named.
+fn leg_config(maxclients: u32, first_generation: Option<u32>) -> inf_server::ConfigStore {
+    let mut config = inf_server::ConfigStore::default();
+    if maxclients != 0 {
+        let cells = inf_foundation::CellCount::new(CELLS).expect("three cells");
+        let capacity =
+            inf_server::BootCapacity::new(maxclients, cells).expect("a leg's boot capacity");
+        config = config.with_boot_capacity(capacity);
+    }
+    // The plane's gate hook is `inf-server`'s `fault-points`, which `dst` forwards; the
+    // simulator runs only with `dst`.
+    #[cfg(feature = "dst")]
+    if let Some(first) = first_generation {
+        config = config.with_gate_first_generation(first);
+    }
+    #[cfg(not(feature = "dst"))]
+    let _ = first_generation;
+    config
 }
 
 /// `count` names spread over every cell, after `stem`.
