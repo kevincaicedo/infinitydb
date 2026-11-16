@@ -221,12 +221,9 @@ fn read_back(node: &mut Node, cell: usize, key: &[u8]) -> Vec<u8> {
 /// remote legs while cell 1 is frozen, so the `SET` and the `INCR` behind
 /// it stay queued; then the client's socket is reset (the peer is gone)
 /// and its `Closed` is reaped before cell 1 answers. Every queued command
-/// still runs, unanswered (ADR-0123 A2): the key reads 2. At HEAD `Closed`
-/// drops the connection with its queue, so the key is never written.
+/// still runs, unanswered (ADR-0123 A2): the key reads 2. A `Closed` that
+/// dropped the connection with its queue would never write the key.
 #[test]
-#[ignore = "Closed drops a connection with its queue, so commands the client handed over \
-            before a reset never run; red until a draining slot keeps its queue and its pump \
-            runs every queued command unanswered before the slot vacates"]
 fn a_reset_connection_runs_its_queued_commands() {
     let mut node = Node::new(2);
     node.accept(0, CLIENT);
@@ -259,13 +256,10 @@ fn a_reset_connection_runs_its_queued_commands() {
 
 /// A `SET` and the peer's end of stream reach the cell in one completion
 /// pass, before PARSE runs. The command the client sent before its FIN is
-/// run and answered, then the connection closes (ADR-0196 A1). At HEAD the
-/// end of stream marks the slot closing in the same pass, so PARSE
-/// releases the entry unparsed and RESPOND sends nothing.
+/// run and answered, then the connection closes (ADR-0196 A1). An end of
+/// stream that closed the slot in the same pass would leave PARSE to
+/// release the entry unparsed and RESPOND to send nothing.
 #[test]
-#[ignore = "an end of stream reaped beside its connection's last bytes closes the slot first, so \
-            PARSE releases the bytes unparsed and nothing is answered; red until the end of \
-            stream keeps the parser, answers what was read before it, and closes after the replies"]
 fn half_close_answers_replies() {
     let mut node = Node::new(1);
     node.accept(0, CLIENT);
@@ -285,12 +279,9 @@ fn half_close_answers_replies() {
 /// A client's `SET` is reaped while another client's `DEBUG SLEEP` stalls
 /// the cell, so its inbox entry waits for the stall's end; the client is
 /// reset and its `Closed` dispatched during the stall. The bytes it handed
-/// over still run when the stall ends (ADR-0196 D2). At HEAD `Closed`
-/// removes the connection, and the entry meets a vacant slot at PARSE.
+/// over still run when the stall ends (ADR-0196 D2). A `Closed` that
+/// removed the connection would leave the entry a vacant slot at PARSE.
 #[test]
-#[ignore = "a stalled cell keeps a connection's received bytes in its inbox past the connection's \
-            Closed, and PARSE then releases them at the vacant slot; red until a draining slot \
-            keeps its parser and parses the entries reaped before its close"]
 fn a_stalled_entry_runs_after_its_connection_closed() {
     const SLEEPER: RawFd = 62;
     let mut node = Node::new(1);
@@ -324,21 +315,30 @@ const MALFORMED: &[u8] = b"*1\r\n$x\r\n";
 /// The protocol error's reply, Redis's text, after which the slot closes.
 const PROTOCOL_ERROR: &str = "-ERR Protocol error: invalid bulk length\r\n";
 
-/// A reading of the client's slot on `cell`.
+/// A reading of the client's slot on `cell`, while it holds its descriptor.
 fn client_slot<R>(node: &Node, cell: usize, read: impl Fn(&Conn) -> R) -> R {
     let mut seen = None;
     node.cells[cell].plane.shared.conns.borrow_mut().for_each_mut(|conn| {
-        if conn.fd == CLIENT {
+        let fd = match &conn.slot {
+            ConnSlot::Active { link, .. } | ConnSlot::Flushing { link, .. } => Some(link.fd),
+            ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => None,
+        };
+        if fd == Some(CLIENT) {
             seen = Some(read(conn));
         }
     });
     seen.expect("the client's slot is occupied")
 }
 
+/// Whether the plane's mark moved the slot to a flush.
+fn marked(conn: &Conn) -> bool {
+    matches!(conn.slot, ConnSlot::Flushing { .. })
+}
+
 /// That PARSE met the protocol error while the client's pump owed a reply:
 /// the slot is marked to close after its flush and its pump is still active.
 fn assert_error_met_owed(node: &Node, cell: usize) {
-    assert!(client_slot(node, cell, |conn| conn.close_after_flush), "engagement: the error parsed");
+    assert!(client_slot(node, cell, marked), "engagement: the error parsed");
     assert!(
         client_slot(node, cell, |conn| !conn.pump_parked),
         "engagement: the pump owed a reply when PARSE met the error"
@@ -408,7 +408,7 @@ fn protocol_error_with_nothing_owed_answers_at_once() {
     node.accept(0, CLIENT);
     node.send(0, CLIENT, MALFORMED);
     node.rounds(1);
-    assert!(client_slot(&node, 0, |conn| conn.close_after_flush), "engagement: the error parsed");
+    assert!(client_slot(&node, 0, marked), "engagement: the error parsed");
     assert!(client_slot(&node, 0, |conn| conn.pump_parked), "engagement: nothing was owed");
     node.rounds(4);
     assert!(node.closed(0).contains(&CLIENT), "the protocol error closes the connection");

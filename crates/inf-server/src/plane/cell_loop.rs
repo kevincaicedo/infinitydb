@@ -4,6 +4,40 @@
 
 use super::*;
 
+/// PARSE's staged fast-path batch (M2.5 Phase H, ADR-0029 lever 2) over
+/// one take of the inbox: flushed at each barrier and at each buffer's end.
+struct Staging<'s> {
+    enabled: bool,
+    stage: &'s mut Vec<StagedParse>,
+    bytes: &'s mut Vec<u8>,
+}
+
+impl Staging<'_> {
+    fn flush<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+        origin: ExecOrigin,
+        conn_cx: &mut ConnCx,
+        out: &mut ReplyStream,
+    ) {
+        flush_parse_stage(shared, self.stage, self.bytes, origin, conn_cx, out);
+    }
+}
+
+/// What one buffer's parse did: its commands, and whether a `QUIT` or a
+/// protocol error stopped it (the slot is then marked).
+struct BufferParsed {
+    commands: u32,
+    stop: bool,
+}
+
+/// Whether a parsed command lets the buffer go on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Next,
+    Quit,
+}
+
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// The everysec role's delivery: the durable plane's tick, then the
     /// successor a second on from the delivery's time (the tick schedules
@@ -88,6 +122,332 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
     }
 
+    /// One inbox entry, by PARSE's one match on its slot: the four states
+    /// that hold a parser (Active, and Flushing, Closing and Draining
+    /// `Peer`) parse it by one function, the rest release it (ADR-0196 D1,
+    /// D2, A1.1). A closing or draining parser's inline replies render into
+    /// a recycled buffer, discarded at the entry's end: the slot holds no
+    /// `out`. Returns the commands parsed.
+    fn parse_entry(
+        &self,
+        cx: &mut LoopCx<'_>,
+        key: ConnKey,
+        buf: BufferId,
+        len: u32,
+        staging: &mut Staging<'_>,
+    ) -> u32 {
+        // Commands that defer to the connection's pump: the first that
+        // must, and everything after it (replies are ordered per
+        // connection).
+        let mut deferred: Vec<OwnedCmd> = Vec::new();
+        // The parked pump to wake once the deferred commands are queued.
+        let mut wake_pump: Option<TaskId> = None;
+        let mut dropped_out: Option<ReplyStream> = None;
+        let mut draining = false;
+        let commands = {
+            let mut conns = self.shared.conns.borrow_mut();
+            let Some(conn) = conns.get_mut(key) else { return 0 };
+            // While the pump is not parked it owns the connection's
+            // order: every command defers behind what it holds.
+            let pump_busy = !conn.pump_parked;
+            let now_ms = cx.now.as_millis();
+            let Conn { cx: conn_cx, slot, .. } = &mut *conn;
+            let (parser, out) = match slot {
+                ConnSlot::Active { link, parser, .. }
+                | ConnSlot::Flushing {
+                    link,
+                    stream: PeerStream::Ended { by: ClosedBy::Peer { parser, .. } },
+                } => {
+                    link.last_active_ms = now_ms;
+                    (parser, &mut link.out)
+                }
+                ConnSlot::Closing { by: ClosedBy::Peer { parser, .. } } => {
+                    (parser, dropped_out.insert(ReplyStream::new(self.shared.take_reply_buf())))
+                }
+                ConnSlot::Draining { by: ClosedBy::Peer { parser, .. } } => {
+                    draining = true;
+                    (parser, dropped_out.insert(ReplyStream::new(self.shared.take_reply_buf())))
+                }
+                ConnSlot::Flushing {
+                    stream: PeerStream::Open | PeerStream::Ended { by: ClosedBy::Plane },
+                    ..
+                }
+                | ConnSlot::Closing { by: ClosedBy::Plane }
+                | ConnSlot::Draining { by: ClosedBy::Plane } => return 0,
+            };
+            let data = &cx.pool.bytes(buf)[..len as usize];
+            let parsed = self.parse_buffer(
+                key,
+                parser,
+                conn_cx,
+                out,
+                data,
+                pump_busy,
+                &mut deferred,
+                staging,
+            );
+            if parsed.stop && conn.mark() {
+                self.shared.mark_rearms.borrow_mut().push(key);
+            }
+            let queued = !deferred.is_empty();
+            if let Some(fd) = conn.enqueue(deferred) {
+                cx.push(IoOp::RecvDisarm { fd });
+            }
+            // A command queued for a parked pump wakes it; the flag
+            // clears in this step, and the pump reads its queue in the
+            // poll the wake queues.
+            #[cfg(not(inf_canary_parked_pump_not_woken))]
+            if queued {
+                wake_pump = conn.take_parked_pump();
+            }
+            // Canary: the command is queued and its parked pump is never
+            // woken, so the client waits for a reply nothing makes.
+            #[cfg(inf_canary_parked_pump_not_woken)]
+            let _ = (queued, &mut wake_pump);
+            parsed.commands
+        };
+        if let Some(out) = dropped_out {
+            self.shared.recycle_reply_buf(out.into_vec());
+        }
+        if draining {
+            let node = &self.shared.node;
+            node.closed_reader_entries.set(node.closed_reader_entries.get() + 1);
+        }
+        if let Some(pump) = wake_pump {
+            let _ = cx.executor.wake(pump);
+        }
+        commands
+    }
+
+    /// One received buffer through the slot's parser, the one function
+    /// every parsing state runs (L13): inline commands execute into `out`,
+    /// deferred ones collect in `deferred` behind the first that must
+    /// defer, and a `QUIT` or a protocol error ends the buffer (Redis
+    /// discards what follows either).
+    #[allow(clippy::too_many_arguments, reason = "the parse funnel: the slot's split borrows")]
+    fn parse_buffer(
+        &self,
+        key: ConnKey,
+        parser: &mut ConnParser,
+        conn_cx: &mut ConnCx,
+        out: &mut ReplyStream,
+        data: &[u8],
+        pump_busy: bool,
+        deferred: &mut Vec<OwnedCmd>,
+        staging: &mut Staging<'_>,
+    ) -> BufferParsed {
+        let origin = ExecOrigin::Conn(key.slot, key.generation);
+        let mut parsed = BufferParsed { commands: 0, stop: false };
+        let mut iter = parser.feed(data);
+        while let Some(next) = iter.next() {
+            match next {
+                Parsed::Command(argv) | Parsed::Inline(argv) => {
+                    parsed.commands += 1;
+                    let flow =
+                        self.run_parsed(&argv, conn_cx, out, origin, pump_busy, deferred, staging);
+                    if flow == Flow::Quit {
+                        parsed.stop = true;
+                        break;
+                    }
+                }
+                Parsed::Incomplete => {}
+                Parsed::ProtocolError(e) => {
+                    staging.flush(&self.shared, origin, conn_cx, out);
+                    // Display, not Debug (batch 45): the Redis
+                    // phrasing the compat harness diffs.
+                    RespWriter::new(out.open(), conn_cx.proto)
+                        .error(&format!("ERR Protocol error: {e}"));
+                    parsed.stop = true;
+                    break;
+                }
+            }
+        }
+        // End of buffer: the staged batch executes with its record
+        // lines prefetched (§7.3 phase 2 across the whole batch).
+        staging.flush(&self.shared, origin, conn_cx, out);
+        drop(iter);
+        parsed
+    }
+
+    /// One parsed command: refused while loading, deferred to the pump,
+    /// staged, or executed inline.
+    #[allow(clippy::too_many_arguments, reason = "the parse funnel: the slot's split borrows")]
+    fn run_parsed(
+        &self,
+        argv: &ArgvRef<'_>,
+        conn_cx: &mut ConnCx,
+        out: &mut ReplyStream,
+        origin: ExecOrigin,
+        pump_busy: bool,
+        deferred: &mut Vec<OwnedCmd>,
+        staging: &mut Staging<'_>,
+    ) -> Flow {
+        let meta = lookup(argv.arg(0));
+        if self.loading_refuses(meta) {
+            // The error reply keeps pipeline order: staged commands
+            // answer first.
+            staging.flush(&self.shared, origin, conn_cx, out);
+            RespWriter::new(out.open(), conn_cx.proto)
+                .error("LOADING Redis is loading the dataset in memory");
+            return Flow::Next;
+        }
+        // Named-namespace commands always ride the pump (M2-S08): durable
+        // acks suspend, staging admission may park, and emission lives
+        // there — one `Option` load on the memory fast path.
+        let defer = pump_busy
+            || !deferred.is_empty()
+            || conn_cx.ns.named().is_some()
+            || conn_cx.ns.unavailable()
+            || self.needs_fabric(argv);
+        if defer {
+            // Pump replies emit after the fast-path replies already in
+            // `out` — flush so the staged batch keeps its pipeline position.
+            staging.flush(&self.shared, origin, conn_cx, out);
+            deferred.push(OwnedCmd::from_argv_into(argv, self.shared.take_cmd_buf()));
+            return Flow::Next;
+        }
+        if staging.enabled && parse_stageable(meta, argv) {
+            self.stage_parsed(argv, conn_cx, staging);
+            return Flow::Next;
+        }
+        staging.flush(&self.shared, origin, conn_cx, out);
+        self.execute_inline(argv, conn_cx, out, origin)
+    }
+
+    /// M2-S15 `-LOADING` gate: while the node loads, only LOADING-flagged
+    /// commands run; the rest answer exactly Redis's error (oracle capture
+    /// artifact). Unknown commands keep their normal error — Redis
+    /// resolves the command first. The board re-check serves commands that
+    /// arrive in the same iteration the last cell flips ready.
+    fn loading_refuses(&self, meta: Option<&inf_wire::CommandMeta>) -> bool {
+        if !self.shared.loading.get()
+            || meta.is_none_or(|meta| meta.flags.contains(CmdFlags::LOADING))
+        {
+            return false;
+        }
+        if self.loading_board.as_deref().is_some_and(RecoveryBoard::all_ready) {
+            self.shared.loading.set(false);
+            return false;
+        }
+        true
+    }
+
+    /// M2.5 Phase H (ADR-0029 lever 2): stages the fast-path command — flat
+    /// argv copy + key hash + phase-1 index-line prefetch; the batch
+    /// executes at the next barrier or end of buffer with its record lines
+    /// prefetched.
+    fn stage_parsed(&self, argv: &ArgvRef<'_>, conn_cx: &ConnCx, staging: &mut Staging<'_>) {
+        let (hash, has_key) = match argv.len() >= 2 {
+            true => {
+                let hash = self.shared.hasher.hash(argv.arg(1));
+                if let Some(store) = self.shared.store.borrow().db(usize::from(conn_cx.db)) {
+                    store.prefetch(hash);
+                }
+                (hash, true)
+            }
+            false => (0, false),
+        };
+        let off = stage_argv_block_argv(staging.bytes, argv);
+        staging.stage.push(StagedParse { off, hash, has_key });
+    }
+
+    /// An inline command executed into `out`: `Flow::Quit` when it was
+    /// `QUIT`, which stops the buffer (Redis discards anything pipelined
+    /// after `QUIT`); the slot is marked and closes once the `+OK` flushed.
+    fn execute_inline(
+        &self,
+        argv: &ArgvRef<'_>,
+        conn_cx: &mut ConnCx,
+        out: &mut ReplyStream,
+        origin: ExecOrigin,
+    ) -> Flow {
+        let argv_slices: Vec<&[u8]> = argv.iter().collect();
+        let now = self.shared.now.get();
+        let scope = ExecScope::of(conn_cx);
+        let reply = out.open();
+        execute(argv, &mut self.shared.store.borrow_mut(), conn_cx, now, reply);
+        self.shared.observer.borrow_mut().on_execute(
+            self.shared.cell,
+            origin,
+            scope,
+            &argv_slices,
+            reply.bytes(),
+            now,
+        );
+        if let Some(dur) = stall_request(&argv_slices) {
+            self.shared.stall_until.set(now.saturating_add(dur));
+        }
+        if conn_cx.close_requested.get() {
+            conn_cx.close_requested.set(false);
+            return Flow::Quit;
+        }
+        Flow::Next
+    }
+
+    /// One `Send` from a slot's staged output, when a send buffer is free
+    /// and no send is in flight.
+    fn send_out(cx: &mut LoopCx<'_>, key: ConnKey, link: &mut Link) {
+        if link.out.is_empty() || link.send_inflight {
+            return;
+        }
+        let Some(buf) = cx.pool.try_lease(LeaseKind::Send) else { return };
+        let n = link.out.len().min(cx.pool.buf_size());
+        cx.pool.bytes_mut(buf)[..n].copy_from_slice(&link.out.as_bytes()[..n]);
+        link.out.consume(n);
+        link.send_inflight = true;
+        cx.push(IoOp::Send {
+            fd: link.fd,
+            buf,
+            len: n as u32,
+            token: Self::token(TokenClass::Send, key),
+        });
+    }
+
+    /// The marks' owed `RecvArm`s (ADR-0196 A1.3): one for each marked
+    /// slot still `Flushing` `Open`, which has not read its end of stream.
+    fn push_mark_rearms(&self, cx: &mut LoopCx<'_>) {
+        let keys = core::mem::take(&mut *self.shared.mark_rearms.borrow_mut());
+        for key in keys {
+            let fd = self.shared.with_conn(key, |conn| match &conn.slot {
+                ConnSlot::Flushing { link, stream: PeerStream::Open } => Some(link.fd),
+                ConnSlot::Flushing { stream: PeerStream::Ended { .. }, .. }
+                | ConnSlot::Active { .. }
+                | ConnSlot::Closing { .. }
+                | ConnSlot::Draining { .. } => None,
+            });
+            if let Some(Some(fd)) = fd {
+                cx.push(IoOp::RecvArm { fd, token: Self::token(TokenClass::Recv, key) });
+            }
+        }
+    }
+
+    /// The peer's end of stream on `key` (ADR-0196 A1.1): a mark of the
+    /// flush shape that keeps the parser, so the entries reaped before it
+    /// parse and are answered; no `Close` is pushed. The slot's pump is
+    /// woken, so its empty read runs the run-out.
+    fn end_of_stream(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
+        let takes = self.shared.inbox_takes.get();
+        if let Some(pump) = self.shared.with_conn(key, |conn| conn.end_of_stream(takes)).flatten() {
+            let _ = cx.executor.wake(pump);
+        }
+    }
+
+    /// `Closed` on `key`, or a `Close`-class error: the closing slot moves
+    /// into `Draining` with its queue and its `Peer` parser; the client
+    /// leaves `CLIENT LIST` for good and `active`; the local registries are
+    /// not touched (the drain's end drops them); the pump is woken.
+    fn on_closed(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
+        let takes = self.shared.inbox_takes.get();
+        let moved = self.shared.with_conn(key, |conn| {
+            conn.closed(takes).then(|| (conn.cx.id, conn.take_parked_pump()))
+        });
+        let Some(Some((id, pump))) = moved else { return };
+        self.shared.node.clients.borrow_mut().unregister(id);
+        if let Some(pump) = pump {
+            let _ = cx.executor.wake(pump);
+        }
+    }
+
     #[inline(never)]
     fn deliver_cold(&self, cx: &mut LoopCx<'_>) {
         let cold = self.shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
@@ -114,7 +474,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 let key = Self::key_of(c.token);
                 if len == 0 {
                     cx.pool.release(buf);
-                    self.initiate_close(cx, key);
+                    self.end_of_stream(cx, key);
                 } else {
                     self.inbox.push((key, buf, len));
                 }
@@ -129,31 +489,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     self.close_refused(cx, c.token);
                     return;
                 }
+                // A send in flight when its slot closed returns its buffer
+                // alone: a closing or draining slot holds no send.
                 let key = Self::key_of(c.token);
-                self.shared.with_conn(key, |conn| conn.send_inflight = false);
-            }
-            CompletionResult::Closed => {
-                let key = Self::key_of(c.token);
-                let removed = self.shared.conns.borrow_mut().remove(key);
-                if let Some(conn) = &removed {
-                    self.shared.node.clients.borrow_mut().unregister(conn.cx.id);
-                }
-                // Pub/sub cleanup (M1-S10): drop the connection from the
-                // local registries; its pump ships the 1→0 transitions to
-                // the channel owners / every cell (patterns) before it
-                // returns, one task with its own earlier subscribes
-                // (ADR-0177 D2). A parked pump is woken to find its slot
-                // gone; a busy one finds it at its next lookup.
-                if let Some(conn) = removed {
-                    let notes = unsubscribe_closed_conn(&self.shared, key, &conn.cx);
-                    if !notes.is_empty() {
-                        self.shared.closed_subs.borrow_mut().push((key, notes));
+                self.shared.with_conn(key, |conn| {
+                    if let Some(link) = conn.link_mut() {
+                        link.send_inflight = false;
                     }
-                    if conn.pump_parked {
-                        let _ = cx.executor.wake(conn.pump);
-                    }
-                }
+                });
             }
+            CompletionResult::Closed => self.on_closed(cx, Self::key_of(c.token)),
             CompletionResult::Error { buf, errno } => {
                 if let Some(buf) = buf {
                     cx.pool.release(buf);
@@ -265,9 +610,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 ) {
                     return;
                 }
+                // `close(2)` releases the descriptor whatever it returns, so
+                // a `Close`-class error is the op's terminal completion, as
+                // `Closed` is; a receive or send error is the peer gone.
                 let key = Self::key_of(c.token);
-                self.shared.with_conn(key, |conn| conn.send_inflight = false);
-                self.initiate_close(cx, key);
+                if c.token.class() == TokenClass::Close {
+                    self.on_closed(cx, key);
+                } else {
+                    self.peer_gone(cx, key);
+                }
             }
             // Log + checkpoint file ops (M2-S05/S08/S10): routed by token
             // class into the durable cell — lease release on a write's
@@ -509,222 +860,29 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         self.shared.now.set(cx.now);
         // DEBUG SLEEP stall: connection processing pauses (inbox buffers
         // hold; pool pressure degrades to RecvDropped, never blocks the
-        // thread); FABRIC-IN keeps serving peers.
+        // thread); FABRIC-IN keeps serving peers. A stalled PARSE takes
+        // nothing, so the take count does not move.
         if cx.now < self.shared.stall_until.get() {
             return;
         }
 
-        let stage_enabled = self.shared.parse_prefetch.get();
         let mut stage = core::mem::take(&mut self.parse_stage);
         let mut stage_bytes = core::mem::take(&mut self.parse_stage_bytes);
+        let mut staging = Staging {
+            enabled: self.shared.parse_prefetch.get(),
+            stage: &mut stage,
+            bytes: &mut stage_bytes,
+        };
         let inbox = core::mem::take(&mut self.inbox);
         for (key, buf, len) in inbox {
-            let mut commands: u32 = 0;
-            // Commands that defer to the connection's pump: the first that
-            // must, and everything after it (replies are ordered per
-            // connection).
-            let mut deferred: Vec<OwnedCmd> = Vec::new();
-            // The parked pump to wake once the deferred commands are queued.
-            let mut wake_pump: Option<TaskId> = None;
-            let mut protocol_error = false;
-            let mut quit = false;
-            {
-                let mut conns = self.shared.conns.borrow_mut();
-                let Some(conn) = conns.get_mut(key) else {
-                    cx.pool.release(buf);
-                    continue;
-                };
-                if conn.closing || conn.close_after_flush {
-                    cx.pool.release(buf);
-                    continue;
-                }
-                conn.last_active_ms = cx.now.as_millis();
-                let data = &cx.pool.bytes(buf)[..len as usize];
-                // While the pump is not parked it owns the connection's
-                // order: every command defers behind what it holds.
-                let pump_busy = !conn.pump_parked;
-                // Field split: the parser iterator borrows `conn.parser`
-                // while execution writes `conn.out`/`conn.cx`.
-                let Conn { parser, cx: conn_cx, out, .. } = &mut *conn;
-                let origin = ExecOrigin::Conn(key.slot, key.generation);
-                let mut iter = parser.feed(data);
-                while let Some(parsed) = iter.next() {
-                    match parsed {
-                        Parsed::Command(argv) | Parsed::Inline(argv) => {
-                            commands += 1;
-                            let meta = lookup(argv.arg(0));
-                            // M2-S15 `-LOADING` gate: while the node loads,
-                            // only LOADING-flagged commands run; the rest
-                            // answer exactly Redis's error (oracle capture
-                            // artifact). Unknown commands keep their normal
-                            // error — Redis resolves the command first. The
-                            // board re-check serves commands that arrive in
-                            // the same iteration the last cell flips ready.
-                            if self.shared.loading.get()
-                                && meta.is_some_and(|meta| !meta.flags.contains(CmdFlags::LOADING))
-                            {
-                                if self
-                                    .loading_board
-                                    .as_deref()
-                                    .is_some_and(RecoveryBoard::all_ready)
-                                {
-                                    self.shared.loading.set(false);
-                                } else {
-                                    // The error reply keeps pipeline order:
-                                    // staged commands answer first.
-                                    flush_parse_stage(
-                                        &self.shared,
-                                        &mut stage,
-                                        &mut stage_bytes,
-                                        origin,
-                                        conn_cx,
-                                        out,
-                                    );
-                                    RespWriter::new(out.open(), conn_cx.proto)
-                                        .error("LOADING Redis is loading the dataset in memory");
-                                    continue;
-                                }
-                            }
-                            // Named-namespace commands always ride the pump
-                            // (M2-S08): durable acks suspend, staging
-                            // admission may park, and emission lives there —
-                            // one `Option` load on the memory fast path.
-                            let defer = pump_busy
-                                || !deferred.is_empty()
-                                || conn_cx.ns.named().is_some()
-                                || conn_cx.ns.unavailable()
-                                || self.needs_fabric(&argv);
-                            if defer {
-                                // Pump replies emit after the fast-path
-                                // replies already in `out` — flush so the
-                                // staged batch keeps its pipeline position.
-                                flush_parse_stage(
-                                    &self.shared,
-                                    &mut stage,
-                                    &mut stage_bytes,
-                                    origin,
-                                    conn_cx,
-                                    out,
-                                );
-                                let owned =
-                                    OwnedCmd::from_argv_into(&argv, self.shared.take_cmd_buf());
-                                deferred.push(owned);
-                            } else if stage_enabled && parse_stageable(meta, &argv) {
-                                // M2.5 Phase H (ADR-0029 lever 2): stage the
-                                // fast-path command — flat argv copy + key
-                                // hash + phase-1 index-line prefetch; the
-                                // batch executes at the next barrier or end
-                                // of buffer with its record lines prefetched.
-                                let (hash, has_key) = match argv.len() >= 2 {
-                                    true => {
-                                        let hash = self.shared.hasher.hash(argv.arg(1));
-                                        if let Some(store) =
-                                            self.shared.store.borrow().db(usize::from(conn_cx.db))
-                                        {
-                                            store.prefetch(hash);
-                                        }
-                                        (hash, true)
-                                    }
-                                    false => (0, false),
-                                };
-                                let off = stage_argv_block_argv(&mut stage_bytes, &argv);
-                                stage.push(StagedParse { off, hash, has_key });
-                            } else {
-                                flush_parse_stage(
-                                    &self.shared,
-                                    &mut stage,
-                                    &mut stage_bytes,
-                                    origin,
-                                    conn_cx,
-                                    out,
-                                );
-                                let argv_slices: Vec<&[u8]> = argv.iter().collect();
-                                let now = self.shared.now.get();
-                                let scope = ExecScope::of(conn_cx);
-                                let reply = out.open();
-                                execute(
-                                    &argv,
-                                    &mut self.shared.store.borrow_mut(),
-                                    conn_cx,
-                                    now,
-                                    reply,
-                                );
-                                self.shared.observer.borrow_mut().on_execute(
-                                    self.shared.cell,
-                                    origin,
-                                    scope,
-                                    &argv_slices,
-                                    reply.bytes(),
-                                    now,
-                                );
-                                if let Some(dur) = stall_request(&argv_slices) {
-                                    self.shared.stall_until.set(now.saturating_add(dur));
-                                }
-                                // QUIT: stop processing this buffer (Redis
-                                // discards anything pipelined after QUIT) and
-                                // close once the +OK reply has flushed.
-                                if conn_cx.close_requested.get() {
-                                    conn_cx.close_requested.set(false);
-                                    quit = true;
-                                    break;
-                                }
-                            }
-                        }
-                        Parsed::Incomplete => {}
-                        Parsed::ProtocolError(e) => {
-                            flush_parse_stage(
-                                &self.shared,
-                                &mut stage,
-                                &mut stage_bytes,
-                                origin,
-                                conn_cx,
-                                out,
-                            );
-                            // Display, not Debug (batch 45): the Redis
-                            // phrasing the compat harness diffs.
-                            RespWriter::new(out.open(), conn_cx.proto)
-                                .error(&format!("ERR Protocol error: {e}"));
-                            protocol_error = true;
-                            break;
-                        }
-                    }
-                }
-                // End of buffer: the staged batch executes with its record
-                // lines prefetched (§7.3 phase 2 across the whole batch).
-                flush_parse_stage(&self.shared, &mut stage, &mut stage_bytes, origin, conn_cx, out);
-                drop(iter);
-                let conn = conns.get_mut(key).expect("conn checked above");
-                if protocol_error || quit {
-                    conn.close_after_flush = true;
-                }
-                let queued = !deferred.is_empty();
-                conn.queue.extend(deferred);
-                if conn.queue.len() >= PENDING_HIGH_WATER && !conn.recv_disarmed {
-                    conn.recv_disarmed = true;
-                    cx.push(IoOp::RecvDisarm { fd: conn.fd });
-                }
-                // A command queued for a parked pump wakes it; the flag
-                // clears in this step, and the pump reads its queue in the
-                // poll the wake queues.
-                #[cfg(not(inf_canary_parked_pump_not_woken))]
-                if queued && conn.pump_parked {
-                    conn.pump_parked = false;
-                    wake_pump = Some(conn.pump);
-                }
-                // Canary: the command is queued and its parked pump is never
-                // woken, so the client waits for a reply nothing makes.
-                #[cfg(inf_canary_parked_pump_not_woken)]
-                let _ = (queued, &mut wake_pump);
-            }
+            let commands = self.parse_entry(cx, key, buf, len, &mut staging);
             cx.pool.release(buf);
             cx.charge(GroupClass::Foreground, commands);
-            if let Some(pump) = wake_pump {
-                let _ = cx.executor.wake(pump);
-            }
         }
         debug_assert!(stage.is_empty(), "parse stage flushed before buffer release");
         self.parse_stage = stage;
         self.parse_stage_bytes = stage_bytes;
+        self.shared.note_inbox_take();
     }
 
     fn maintain(&mut self, cx: &mut LoopCx<'_>) {
@@ -839,51 +997,28 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         if cx.now < self.shared.stall_until.get() {
             return;
         }
+        self.push_mark_rearms(cx);
         let keys = self.shared.conns.borrow().keys();
         for key in keys {
-            let mut close_now = false;
-            self.shared.with_conn(key, |conn| {
-                if conn.closing {
-                    return;
-                }
-                if conn.rearm_recv {
-                    conn.rearm_recv = false;
-                    if conn.recv_disarmed {
-                        conn.recv_disarmed = false;
-                        cx.push(IoOp::RecvArm {
-                            fd: conn.fd,
-                            token: Self::token(TokenClass::Recv, key),
-                        });
+            let close = self.shared.with_conn(key, |conn| {
+                match &mut conn.slot {
+                    ConnSlot::Active { link, recv, .. } => {
+                        if *recv == RecvArm::RearmDue {
+                            *recv = RecvArm::Armed;
+                            cx.push(IoOp::RecvArm {
+                                fd: link.fd,
+                                token: Self::token(TokenClass::Recv, key),
+                            });
+                        }
+                        Self::send_out(cx, key, link);
                     }
+                    ConnSlot::Flushing { link, .. } => Self::send_out(cx, key, link),
+                    ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => return None,
                 }
-                if !conn.out.is_empty()
-                    && !conn.send_inflight
-                    && let Some(buf) = cx.pool.try_lease(LeaseKind::Send)
-                {
-                    let n = conn.out.len().min(cx.pool.buf_size());
-                    cx.pool.bytes_mut(buf)[..n].copy_from_slice(&conn.out.as_bytes()[..n]);
-                    conn.out.consume(n);
-                    conn.send_inflight = true;
-                    cx.push(IoOp::Send {
-                        fd: conn.fd,
-                        buf,
-                        len: n as u32,
-                        token: Self::token(TokenClass::Send, key),
-                    });
-                }
-                // The pump parked after reading its queue empty with
-                // nothing pending: every reply it owed is in `out`.
-                if conn.close_after_flush
-                    && conn.out.is_empty()
-                    && !conn.send_inflight
-                    && conn.pump_parked
-                {
-                    close_now = true;
-                }
+                // A flushing slot closes once every reply it owed is sent.
+                conn.flush_end()
             });
-            if close_now {
-                self.initiate_close(cx, key);
-            }
+            self.push_close(cx, key, close.flatten());
         }
     }
 
@@ -1008,7 +1143,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             ids.into_iter().filter_map(|id| clients.conn_key(id)).collect::<Vec<u64>>()
         };
         for key in kills.into_iter().map(ConnKey::unpack) {
-            self.initiate_close(cx, key);
+            self.close_at_once(cx, key);
         }
         // ---- pressure config push (M1-E3, hot-per-cell within one MAINTAIN
         // round): one u64 version compare per iteration; a real push only
@@ -1030,7 +1165,23 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let limits = crate::config::parser_limits(&self.shared.node.config.borrow());
             if limits != self.shared.parser_limits.get() {
                 self.shared.parser_limits.set(limits);
-                self.shared.conns.borrow_mut().for_each_mut(|conn| conn.parser.set_limits(limits));
+                self.shared.conns.borrow_mut().for_each_mut(|conn| match &mut conn.slot {
+                    ConnSlot::Active { parser, .. }
+                    | ConnSlot::Flushing {
+                        stream: PeerStream::Ended { by: ClosedBy::Peer { parser, .. } },
+                        ..
+                    }
+                    | ConnSlot::Closing { by: ClosedBy::Peer { parser, .. } }
+                    | ConnSlot::Draining { by: ClosedBy::Peer { parser, .. } } => {
+                        parser.set_limits(limits);
+                    }
+                    ConnSlot::Flushing {
+                        stream: PeerStream::Open | PeerStream::Ended { by: ClosedBy::Plane },
+                        ..
+                    }
+                    | ConnSlot::Closing { by: ClosedBy::Plane }
+                    | ConnSlot::Draining { by: ClosedBy::Plane } => {}
+                });
             }
         }
     }
@@ -1196,35 +1347,49 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let knobs = self.shared.knobs.get();
         let now_ms = cx.now.as_millis();
         let mut conns = self.shared.conns.borrow_mut();
-        node.connections.set(conns.live as u64);
         let mut bytes = 0usize;
+        let mut draining = 0u64;
         let mut idle: Vec<ConnKey> = Vec::new();
         let ConnSlab { slots, gens, .. } = &mut *conns;
         for (slot, entry) in slots.iter_mut().enumerate() {
             let Some(conn) = entry.as_mut() else { continue };
             bytes += conn.state_bytes();
+            let Conn { cx: conn_cx, slot: state, .. } = conn;
+            // `timeout` and the output cap read the two states that hold
+            // the descriptor and `out`; a closing or draining slot is
+            // skipped, so `idle_disconnections` counts each close once.
+            let link = match state {
+                ConnSlot::Active { link, .. } | ConnSlot::Flushing { link, .. } => link,
+                ConnSlot::Closing { .. } => continue,
+                ConnSlot::Draining { .. } => {
+                    draining += 1;
+                    continue;
+                }
+            };
             // The output-buffer class follows the subscription state
             // (Redis's CLIENT_PUBSUB flag; ADR-0123 D4). Soft-cap aging
             // continues between deliveries (M1-S11): a stalled client
             // over the soft limit dies on schedule even when nothing
             // more is written to it.
-            let subscribed = !conn.cx.sub_channels.is_empty() || !conn.cx.sub_patterns.is_empty();
+            let subscribed = !conn_cx.sub_channels.is_empty() || !conn_cx.sub_patterns.is_empty();
             let caps = if subscribed { knobs.cob_pubsub } else { knobs.cob_normal };
-            if conn.cob_soft_since_ms != 0 || caps != (0, 0, 0) {
-                enforce_output_cap(node, conn, now_ms, caps);
+            if link.cob_soft_since_ms != 0 || caps != (0, 0, 0) {
+                enforce_output_cap(node, link, conn_cx.id, now_ms, caps);
             }
             // `timeout` (ADR-0123 D2): idle unsubscribed connections
-            // close; subscribers are exempt, as in Redis. A connection
-            // already closing is skipped so `idle_disconnections` counts
-            // each close once.
+            // close, a flushing one as an active one (ADR-0193 D1);
+            // subscribers are exempt, as in Redis.
             if knobs.timeout_ms != 0
                 && !subscribed
-                && !conn.closing
-                && now_ms.saturating_sub(conn.last_active_ms) >= knobs.timeout_ms
+                && now_ms.saturating_sub(link.last_active_ms) >= knobs.timeout_ms
             {
                 idle.push(ConnKey { slot: slot as u32, generation: gens[slot] });
             }
         }
+        // `active` (ADR-0123 A1): Active, Flushing and Closing slots; a
+        // draining slot is the third population, read beside it.
+        node.connections.set(conns.live as u64 - draining);
+        node.draining_connections.set(draining);
         node.conn_state_bytes.set(bytes as u64);
         drop(conns);
         // Recycle-pool residency (v0.4.0-alpha RSS-attribution gauges):
@@ -1234,7 +1399,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let shared = Rc::clone(&self.shared);
         for key in idle {
             shared.node.idle_disconnections.set(shared.node.idle_disconnections.get() + 1);
-            self.initiate_close(cx, key);
+            self.close_at_once(cx, key);
         }
     }
 }

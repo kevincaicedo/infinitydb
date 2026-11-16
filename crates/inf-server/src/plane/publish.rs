@@ -227,26 +227,28 @@ pub(super) async fn flush_sub_deltas<O: PlaneObserver + 'static, F: SegmentFs + 
     }
 }
 
-/// Removes a closed connection from the local registries, returning the
-/// cell-level transitions to notify.
+/// Removes a draining connection from the local registries once its queue
+/// is empty, returning the cell-level transitions to notify. The names
+/// move out of the context's two lists, the ones that went 1→0 into the
+/// notes, so nothing is copied.
 pub(super) fn unsubscribe_closed_conn<
     O: PlaneObserver + 'static,
     F: SegmentFs + Clone + 'static,
 >(
-    shared: &Rc<Shared<O, F>>,
+    shared: &Shared<O, F>,
     key: ConnKey,
-    cx: &ConnCx,
+    cx: &mut ConnCx,
 ) -> SubNotes {
     let mut notes = Vec::new();
     let mut ps = shared.pubsub.borrow_mut();
-    for channel in &cx.sub_channels {
-        if ps.local_remove(SubKind::Channel, channel, key) {
-            notes.push((SubKind::Channel, channel.clone(), -1));
+    for channel in cx.sub_channels.drain(..) {
+        if ps.local_remove(SubKind::Channel, &channel, key) {
+            notes.push((SubKind::Channel, channel, -1));
         }
     }
-    for pattern in &cx.sub_patterns {
-        if ps.local_remove(SubKind::Pattern, pattern, key) {
-            notes.push((SubKind::Pattern, pattern.clone(), -1));
+    for pattern in cx.sub_patterns.drain(..) {
+        if ps.local_remove(SubKind::Pattern, &pattern, key) {
+            notes.push((SubKind::Pattern, pattern, -1));
         }
     }
     notes
@@ -542,7 +544,18 @@ pub(super) fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clo
         if let Some((conn, seq)) = tag
             && !self_frames.is_empty()
         {
-            shared.with_conn(conn, |c| c.self_push.push((seq, self_frames)));
+            // The stash is a writer into the connection's output: a slot
+            // that cannot send drops the frames.
+            let dropped = shared.with_conn(conn, |c| match c.link_mut() {
+                Some(link) => {
+                    link.self_push.push((seq, self_frames));
+                    None
+                }
+                None => Some(self_frames),
+            });
+            if let Some(Some(frames)) = dropped {
+                shared.recycle_reply_buf(frames);
+            }
         }
         staged.push((from, token, StagedReply::Int(delivered)));
         true
@@ -642,18 +655,35 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let caps = shared.knobs.get().cob_pubsub;
     shared
         .with_conn(key, |conn| {
-            if conn.closing {
-                return false;
-            }
-            if defer == Some(key) {
+            let (proto, id) = (conn.cx.proto, conn.cx.id);
+            match &mut conn.slot {
+                // A closing or draining slot is not a receiver.
+                ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => false,
                 // The publisher's own frames ride the reply path instead
-                // (emitted right after the receiver count).
-                write(deferred.reply(), conn.cx.proto);
-                return true;
+                // (emitted right after the receiver count), in Active and
+                // Flushing alike (ADR-0101).
+                ConnSlot::Active { .. } | ConnSlot::Flushing { .. } if defer == Some(key) => {
+                    write(deferred.reply(), proto);
+                    true
+                }
+                ConnSlot::Active { link, .. } => {
+                    write(link.out.open(), proto);
+                    enforce_output_cap(&shared.node, link, id, now_ms, caps);
+                    true
+                }
+                // A flushing slot is written nothing that arrives after its
+                // mark or its end of stream, and counts as a receiver until
+                // the server reads its end of stream (ADR-0196 D4, A1.2).
+                ConnSlot::Flushing { stream, .. } => {
+                    let node = &shared.node;
+                    let dropped = node.flushing_deliveries_dropped.get() + 1;
+                    node.flushing_deliveries_dropped.set(dropped);
+                    match stream {
+                        PeerStream::Open => true,
+                        PeerStream::Ended { .. } => false,
+                    }
+                }
             }
-            write(conn.out.open(), conn.cx.proto);
-            enforce_output_cap(&shared.node, conn, now_ms, caps);
-            true
         })
         .unwrap_or(false)
 }
@@ -665,7 +695,8 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 /// connection (with its buffered output) frees on close.
 pub(super) fn enforce_output_cap(
     node: &NodeInfo,
-    conn: &mut Conn,
+    conn: &mut Link,
+    id: u64,
     now_ms: u64,
     caps: (u64, u64, u64),
 ) {
@@ -684,7 +715,7 @@ pub(super) fn enforce_output_cap(
         conn.cob_soft_since_ms = 0;
         false
     };
-    if (over_hard || soft_expired) && node.clients.borrow_mut().request_kill(conn.cx.id) {
+    if (over_hard || soft_expired) && node.clients.borrow_mut().request_kill(id) {
         conn.cob_kill_sent = true;
         node.cob_disconnections.set(node.cob_disconnections.get() + 1);
     }

@@ -97,7 +97,10 @@ mod json_gather;
 mod split;
 
 pub use conn::OwnedOutcome;
-use conn::{CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
+use conn::{
+    CONN_SLOT_CAP, ClosedBy, ConnSlot, Emitted, Link, MAXCLIENTS_REFUSAL, OwnedCmd, PeerStream,
+    RecvArm, RunOut,
+};
 use credit::{FanLegs, FanReserve, PlaneFabric, PointOp, PubFanArgv};
 pub use credit::{MeshConfigRefused, checked_mesh_config};
 use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
@@ -323,48 +326,27 @@ const _: () = assert!(
     "a gated verdict fits a parked entry"
 );
 
+/// A connection's slab entry: its context, its queue and its pump, which
+/// every occupied state holds, and its state (ADR-0123 A2, ADR-0196 A1).
 #[allow(clippy::disallowed_types, reason = "container: A")]
 pub(super) struct Conn {
-    fd: RawFd,
-    parser: ConnParser,
     cx: ConnCx,
-    /// Staged reply bytes awaiting RESPOND, one reply opened at a time.
-    out: ReplyStream,
-    /// One in-flight Send max: two outstanding sends on one socket have no
-    /// kernel ordering guarantee.
-    send_inflight: bool,
-    closing: bool,
-    close_after_flush: bool,
+    /// The commands PARSE deferred, which the pump dequeues in pipeline
+    /// order in every occupied state: a close runs them to the end.
+    queue: VecDeque<OwnedCmd>,
     /// The connection's pump (ADR-0177 D2), made at its admission; it
     /// lives until the connection's slot retires.
     pump: TaskId,
     /// The pump read the queue empty with nothing pending and parked:
-    /// whoever queues a command for it wakes it by id. While clear, the
-    /// pump owns the connection's execution order.
+    /// whoever queues a command for it, or moves its slot, wakes it by id.
+    /// While clear, the pump owns the connection's execution order.
     pump_parked: bool,
-    queue: VecDeque<OwnedCmd>,
-    recv_disarmed: bool,
-    rearm_recv: bool,
-    /// Injected-clock ms since the staged output first exceeded the pub/sub
-    /// soft cap (M1-S11); 0 = under the soft limit.
-    cob_soft_since_ms: u64,
-    /// The output-cap kill was already requested (idempotent counter guard).
-    cob_kill_sent: bool,
-    /// Injected-clock ms of the last received buffer (accept counts);
-    /// the `timeout` reaper's input (ADR-0123 D2) — one store per
-    /// `Recv`, never per command.
-    last_active_ms: u64,
     /// Remote-publish sequence (ADR-0101 D1): a subscribed connection's
     /// forwarded `PUBLISH` carries `(key, seq)` so the owner's fan leg
     /// back to this cell can pair the publisher's own frames with its
     /// own reply. Never advances for unsubscribed publishers.
     publish_seq: u64,
-    /// The publisher's own frames a tagged fan leg delivered, keyed by
-    /// sequence; the pump emits each right after that publish's count
-    /// reply (ADR-0101 D3/D4). Bounded by the in-flight window and
-    /// empty for every connection that is not a self-subscribed
-    /// publisher.
-    self_push: Vec<(u64, Vec<u8>)>,
+    slot: ConnSlot,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -503,11 +485,22 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     tasks: PlaneTasks,
     /// The peer pumps' ids, set at plane start; `None` at one cell.
     peer_pumps: core::cell::OnceCell<Option<PeerPumps>>,
-    /// The 1→0 subscription deltas of each closed connection whose pump has
-    /// not yet returned: the pump ships its own before it returns, so its
-    /// earlier subscribes and these leave in one task's order (ADR-0177
-    /// D2). At most one entry a `conn` task.
-    closed_subs: RefCell<Vec<(ConnKey, SubNotes)>>,
+    /// PARSE's completed takes of the inbox (ADR-0196 D2): each adds 1
+    /// after the last entry it took, wrapping, compared with `!=` only. A
+    /// `Peer` run-out ends its parser once the count moved past the take
+    /// count stamped when the slot entered its `Peer` state.
+    inbox_takes: Cell<u64>,
+    /// The pumps whose `Peer` run-out found no take since its stamp, each
+    /// waiting for PARSE's next take, which wakes them all.
+    reader_waiters: WaitList<u8>,
+    /// How many pumps wait on `reader_waiters`: PARSE's guard, so a take
+    /// with none waiting pays one load and one branch. A gauge, cell scope.
+    reader_waiting: Cell<u64>,
+    /// The marked slots whose receive is owed one `RecvArm` (ADR-0196
+    /// A1.3): a pump's `QUIT` and the stop's mark have no loop context to
+    /// push it, so RESPOND pushes it for each key still `Flushing` `Open`.
+    /// At most one entry a mark, so at most the occupied slots.
+    mark_rearms: RefCell<Vec<ConnKey>>,
     /// Node control-thread handle (id allocation + catalog persistence).
     control: RefCell<Option<Arc<ControlHandle>>>,
     /// DDL pumps parked on catalog persistence (ADR-0015 D3).
@@ -822,7 +815,7 @@ pub enum StopPhase {
 /// so a stop that cannot end says why, beside its phase.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum StopHold {
-    /// Connections still flushing and closing.
+    /// Connection slots still occupied: flushing, closing or draining.
     Connections { live: usize },
     /// This cell is `Quiet`; the assembly has not yet seen every cell
     /// `Quiet` ([`ServerPlane::finish_stop`]).
@@ -840,7 +833,7 @@ pub enum StopHold {
 /// The drain's own state (one `Option` check per MAINTAIN while serving).
 struct StopDrive {
     phase: StopPhase,
-    /// Every live connection has been marked `close_after_flush`.
+    /// Every occupied slot has had the stop's mark.
     conns_marked: bool,
     /// The assembly saw every cell `Quiet` (`finish_stop`).
     finish: bool,
@@ -995,7 +988,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 gated_pump_parked: Cell::new(false),
                 tasks,
                 peer_pumps: core::cell::OnceCell::new(),
-                closed_subs: RefCell::new(Vec::new()),
+                inbox_takes: Cell::new(0),
+                reader_waiters: WaitList::new(),
+                reader_waiting: Cell::new(0),
+                mark_rearms: RefCell::new(Vec::new()),
                 control: RefCell::new(None),
                 ddl_waiters: WaitList::new(),
                 ckpt_waiters: WaitList::new(),
@@ -1765,8 +1761,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let node = Rc::clone(&self.shared.node);
         let now_ms = cx.now.as_millis();
         let inserted = tasks::admit_conn(cx.executor, &self.shared, |pump| Conn {
-            fd,
-            parser: ConnParser::new(parser_limits),
             cx: ConnCx {
                 proto: Protocol::Resp2,
                 id: 0,
@@ -1778,20 +1772,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 node,
                 close_requested: Cell::new(false),
             },
-            out: ReplyStream::new(Vec::new()),
-            send_inflight: false,
-            closing: false,
-            close_after_flush: false,
+            queue: VecDeque::new(),
             pump,
             pump_parked: false,
-            queue: VecDeque::new(),
-            recv_disarmed: false,
-            rearm_recv: false,
-            cob_soft_since_ms: 0,
-            cob_kill_sent: false,
-            last_active_ms: now_ms,
             publish_seq: 0,
-            self_push: Vec::new(),
+            slot: ConnSlot::Active {
+                link: Link::new(fd, now_ms),
+                parser: ConnParser::new(parser_limits),
+                recv: RecvArm::Armed,
+            },
         });
         let Some(key) = inserted else {
             // Admission bound (batch 12): the slab is full below
@@ -1937,14 +1926,19 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         stop_checkpoint: bool,
     ) -> Result<(), StopHold> {
         // Step 2: connections flush and close (QUIT's path — bytes read
-        // after the mark are dropped; a command in flight finishes).
+        // after the mark are dropped; a command in flight finishes). The
+        // stop's one walk marks every slot: an active one flushes, and a
+        // `Peer` parser of any other state ends, so what is parsed and
+        // queued runs and what is not yet parsed is released (ADR-0196
+        // A1.1).
         if !stop.conns_marked {
             stop.conns_marked = true;
-            shared.conns.borrow_mut().for_each_mut(|conn| conn.close_after_flush = true);
+            Self::mark_every_slot(shared);
         }
-        // A closed connection's pump still shipping its 1→0 deltas sends
-        // fabric ops, so it ends before the node-wide barrier too.
-        let live = shared.conns.borrow().live + shared.closed_subs.borrow().len();
+        // A draining slot's pump still running its queue or shipping its
+        // 1→0 deltas sends fabric ops; its slot stays occupied until the
+        // pump returns, so it ends before the node-wide barrier too.
+        let live = shared.conns.borrow().live;
         if live > 0 {
             return Err(StopHold::Connections { live });
         }
@@ -1984,6 +1978,19 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             cell.quiescent().map_err(StopHold::Durable)?;
         }
         Ok(())
+    }
+
+    /// The stop's mark of every occupied slot (ADR-0124 D2, ADR-0196 A1.1).
+    fn mark_every_slot(shared: &Shared<O, F>) {
+        let mut rearms = shared.mark_rearms.borrow_mut();
+        let mut conns = shared.conns.borrow_mut();
+        let ConnSlab { slots, gens, .. } = &mut *conns;
+        for (slot, entry) in slots.iter_mut().enumerate() {
+            let Some(conn) = entry.as_mut() else { continue };
+            if conn.mark() {
+                rearms.push(ConnKey { slot: slot as u32, generation: gens[slot] });
+            }
+        }
     }
 
     pub fn connections(&self) -> usize {
@@ -2114,35 +2121,27 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         extract_keys(meta, argv).any(|key| !self.shared.router.is_local(key, self.shared.cell))
     }
 
-    /// Starts a connection's one close. A slot already closing returns at
-    /// once, so no caller needs a guard of its own: its `Close` is in flight
-    /// until `Closed`, and a second `close(2)` after the first has freed the
-    /// number may close the socket or file the next accept or open holds.
-    fn initiate_close(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
-        /// What the key's slot held when its close was asked for.
-        enum CloseStart {
-            /// Live and now closing: its fd's one `Close` goes out.
-            Started(RawFd),
-            /// Already closing: its `Close` is in flight until `Closed`.
-            AlreadyClosing,
-            /// A vacant slot or a stale generation: no connection to close.
-            Vacant,
-        }
-        let start = self
-            .shared
-            .with_conn(key, |conn| {
-                if conn.closing {
-                    return CloseStart::AlreadyClosing;
-                }
-                conn.closing = true;
-                CloseStart::Started(conn.fd)
-            })
-            .unwrap_or(CloseStart::Vacant);
-        match start {
-            CloseStart::Started(fd) => {
-                cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, key) });
-            }
-            CloseStart::AlreadyClosing | CloseStart::Vacant => {}
+    /// The plane's immediate close of `key` (`timeout`, the `CLIENT KILL`
+    /// sweep): an active or flushing slot's one `Close` goes out. A slot
+    /// already closing holds no descriptor, so nothing can close it twice.
+    fn close_at_once(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
+        let fd = self.shared.with_conn(key, Conn::close_at_once).flatten();
+        self.push_close(cx, key, fd);
+    }
+
+    /// The peer of `key` is gone (a receive or send error): the slot's one
+    /// `Close` goes out, its `Peer` parser kept for the entries reaped
+    /// before the error.
+    fn peer_gone(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
+        let takes = self.shared.inbox_takes.get();
+        let fd = self.shared.with_conn(key, |conn| conn.peer_gone(takes)).flatten();
+        self.push_close(cx, key, fd);
+    }
+
+    /// Pushes the `Close` of the descriptor a transition to `Closing` gave.
+    fn push_close(&self, cx: &mut LoopCx<'_>, key: ConnKey, fd: Option<RawFd>) {
+        if let Some(fd) = fd {
+            cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, key) });
         }
     }
 

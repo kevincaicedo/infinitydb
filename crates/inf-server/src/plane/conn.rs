@@ -107,22 +107,374 @@ impl ConnKey {
     }
 }
 
+// ---- the connection slot's states (ADR-0123 A2, ADR-0196 and its A1) ----------
+
+/// A connection slot's state. `out` and the descriptor live only in
+/// `Active` and `Flushing`, so a `Closing` or `Draining` slot has nothing
+/// to send; a parser lives only in `Active` and in a [`ClosedBy::Peer`], so
+/// a state that must not parse has nothing to feed. The queue, the context
+/// and the pump are the slab entry's ([`Conn`]): every occupied state runs
+/// the queue to its end.
+pub(super) enum ConnSlot {
+    /// Serving: received bytes parse, replies are sent.
+    Active { link: Link, parser: ConnParser, recv: RecvArm },
+    /// A close of the flush shape: still sending what the commands read
+    /// before the plane's mark or the peer's end of stream owe.
+    Flushing { link: Link, stream: PeerStream },
+    /// The descriptor's `Close` is in flight: queued commands run, every
+    /// reply is dropped.
+    Closing { by: ClosedBy },
+    /// The descriptor is closed: the queue runs to its end, then the local
+    /// registries drop the connection and its pump ships the deltas.
+    Draining { by: ClosedBy },
+}
+
+/// What a slot that can still send holds: the descriptor, the staged
+/// replies and the inputs of the output cap and of `timeout`.
+pub(super) struct Link {
+    pub(super) fd: RawFd,
+    /// Staged reply bytes awaiting RESPOND, one reply opened at a time.
+    pub(super) out: ReplyStream,
+    /// One in-flight Send max: two outstanding sends on one socket have no
+    /// kernel ordering guarantee.
+    pub(super) send_inflight: bool,
+    /// Injected-clock ms since the staged output first exceeded the pub/sub
+    /// soft cap (M1-S11); 0 = under the soft limit.
+    pub(super) cob_soft_since_ms: u64,
+    /// The output-cap kill was already requested (idempotent counter guard).
+    pub(super) cob_kill_sent: bool,
+    /// Injected-clock ms of the last received buffer (accept counts); the
+    /// `timeout` reaper's input (ADR-0123 D2): one store per buffer PARSE
+    /// takes, never per command.
+    pub(super) last_active_ms: u64,
+    /// The publisher's own frames a tagged fan leg delivered, keyed by
+    /// sequence; the pump emits each right after that publish's count
+    /// reply (ADR-0101 D3/D4). Bounded by the in-flight window and empty
+    /// for every connection that is not a self-subscribed publisher.
+    pub(super) self_push: Vec<(u64, Vec<u8>)>,
+}
+
+impl Link {
+    pub(super) fn new(fd: RawFd, now_ms: u64) -> Link {
+        Link {
+            fd,
+            out: ReplyStream::new(Vec::new()),
+            send_inflight: false,
+            cob_soft_since_ms: 0,
+            cob_kill_sent: false,
+            last_active_ms: now_ms,
+            self_push: Vec::new(),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.out.capacity() + self.self_push.iter().map(|(_, f)| f.capacity() + 32).sum::<usize>()
+    }
+}
+
+/// A flushing slot's stream: `Open` while the peer may still send (the
+/// plane marked the slot), `Ended` once its end of stream was read. A
+/// parser in `Flushing` implies an ended stream, and the end of stream
+/// outlives the parser's end, so a delivery's count reads it.
+pub(super) enum PeerStream {
+    Open,
+    Ended { by: ClosedBy },
+}
+
+/// Whether a closing slot still holds a parser (ADR-0196 D2, A1.1): `Peer`
+/// keeps it for the bytes read before the end of stream or before
+/// `Closed`; `Plane` parses nothing.
+pub(super) enum ClosedBy {
+    /// `taken_at` is the cell's inbox take count when the slot entered its
+    /// `Peer` state: once a take has completed since, every entry a receive
+    /// returned before then has been parsed. Compared with `!=` only: a
+    /// wrap back to it makes one run-out wait one more take.
+    Peer {
+        parser: ConnParser,
+        taken_at: u64,
+    },
+    Plane,
+}
+
+impl ClosedBy {
+    /// The same selector with a `Peer`'s take count stamped anew: every
+    /// entry into a `Peer` state stamps it.
+    fn stamped(self, inbox_takes: u64) -> ClosedBy {
+        match self {
+            ClosedBy::Peer { parser, taken_at: _ } => {
+                ClosedBy::Peer { parser, taken_at: inbox_takes }
+            }
+            ClosedBy::Plane => ClosedBy::Plane,
+        }
+    }
+
+    fn buffered(&self) -> usize {
+        match self {
+            ClosedBy::Peer { parser, .. } => parser.buffered(),
+            ClosedBy::Plane => 0,
+        }
+    }
+}
+
+/// The one way a `Peer` parser ends (ADR-0196 D3): its partial frame and
+/// any unparsed bytes are dropped, and the selector parses nothing more.
+pub(super) fn end_reader(by: &mut ClosedBy) {
+    *by = ClosedBy::Plane;
+}
+
+/// An active slot's receive arm: `Disarmed` at the queue's high water,
+/// `RearmDue` once the pump drains to the low water, re-armed by RESPOND.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RecvArm {
+    Armed,
+    Disarmed,
+    RearmDue,
+}
+
+/// What a writer into `out` did with its bytes: a slot that can send takes
+/// them, a closing or draining slot drops them, and a vacant slot or
+/// another generation has no connection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Emitted {
+    Written,
+    Dropped,
+    Vacant,
+}
+
+/// What a `Peer` run-out found (ADR-0196 D2, A1.1).
+pub(super) enum RunOut {
+    /// A take completed since the slot entered its `Peer` state: the
+    /// parser ended and the selector is `Plane`.
+    Ended,
+    /// No take since: the pump waits for PARSE's next.
+    Wait,
+}
+
 impl Conn {
     pub(super) fn state_bytes(&self) -> usize {
+        let slot = match &self.slot {
+            ConnSlot::Active { link, parser, .. } => link.bytes() + parser.buffered(),
+            ConnSlot::Flushing { link, stream: PeerStream::Ended { by } } => {
+                link.bytes() + by.buffered()
+            }
+            ConnSlot::Flushing { link, stream: PeerStream::Open } => link.bytes(),
+            ConnSlot::Closing { by } | ConnSlot::Draining { by } => by.buffered(),
+        };
         size_of::<Conn>()
-            + self.parser.buffered()
-            + self.out.capacity()
+            + slot
             + self.queue.iter().map(OwnedCmd::mem).sum::<usize>()
             + self.cx.sub_channels.iter().map(|c| c.len() + 24).sum::<usize>()
             + self.cx.sub_patterns.iter().map(|p| p.len() + 24).sum::<usize>()
-            + self.self_push.iter().map(|(_, f)| f.capacity() + 32).sum::<usize>()
+    }
+
+    /// The descriptor and staged output of a slot that can still send.
+    pub(super) fn link_mut(&mut self) -> Option<&mut Link> {
+        match &mut self.slot {
+            ConnSlot::Active { link, .. } | ConnSlot::Flushing { link, .. } => Some(link),
+            ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => None,
+        }
+    }
+
+    /// The pump's emit: `Written` where `out` lives, else `Dropped`.
+    pub(super) fn emit(&mut self, reply: &OwnedReply) -> Emitted {
+        match self.link_mut() {
+            Some(link) => {
+                link.out.emit(reply);
+                Emitted::Written
+            }
+            None => Emitted::Dropped,
+        }
     }
 
     /// Takes the stashed self-frames of remote publish `seq`, if the
     /// tagged fan leg delivered any (ADR-0101 D4).
     pub(super) fn take_self_push(&mut self, seq: u64) -> Option<Vec<u8>> {
-        let at = self.self_push.iter().position(|(s, _)| *s == seq)?;
-        Some(self.self_push.swap_remove(at).1)
+        let link = self.link_mut()?;
+        let at = link.self_push.iter().position(|(s, _)| *s == seq)?;
+        Some(link.self_push.swap_remove(at).1)
+    }
+
+    /// Queues the commands one buffer deferred. An active slot whose queue
+    /// reached the high water disarms its receive: returns the descriptor
+    /// whose `RecvDisarm` goes out. No other state holds a receive to
+    /// disarm, so a `Peer` parser's queue grows only by the bytes read
+    /// before its end.
+    pub(super) fn enqueue(&mut self, deferred: Vec<OwnedCmd>) -> Option<RawFd> {
+        self.queue.extend(deferred);
+        match &mut self.slot {
+            ConnSlot::Active { link, recv, .. }
+                if *recv == RecvArm::Armed && self.queue.len() >= PENDING_HIGH_WATER =>
+            {
+                *recv = RecvArm::Disarmed;
+                Some(link.fd)
+            }
+            ConnSlot::Active { .. }
+            | ConnSlot::Flushing { .. }
+            | ConnSlot::Closing { .. }
+            | ConnSlot::Draining { .. } => None,
+        }
+    }
+
+    /// The pump to wake, clearing its park flag in the same step.
+    pub(super) fn take_parked_pump(&mut self) -> Option<TaskId> {
+        core::mem::replace(&mut self.pump_parked, false).then_some(self.pump)
+    }
+
+    /// Moves the slot's state out for a transition, leaving a stateless
+    /// placeholder that the caller overwrites in the same step.
+    fn take_slot(&mut self) -> ConnSlot {
+        core::mem::replace(&mut self.slot, ConnSlot::Closing { by: ClosedBy::Plane })
+    }
+
+    /// The peer's end of stream (ADR-0196 A1.1): an active slot becomes
+    /// `Flushing` `Peer`, keeping its parser for the entries reaped before
+    /// it and its `out` for their replies; nothing is pushed, and the
+    /// receive has ended, so `recv` leaves with `Active`. A marked slot's
+    /// stream ends (`Open` → `Ended`, no longer a receiver). Returns the
+    /// pump to wake, so its empty read runs the run-out.
+    pub(super) fn end_of_stream(&mut self, inbox_takes: u64) -> Option<TaskId> {
+        self.slot = match self.take_slot() {
+            ConnSlot::Active { link, parser, recv: _ } => {
+                let by = ClosedBy::Peer { parser, taken_at: inbox_takes };
+                self.slot = ConnSlot::Flushing { link, stream: PeerStream::Ended { by } };
+                return self.take_parked_pump();
+            }
+            ConnSlot::Flushing { link, stream: PeerStream::Open } => {
+                ConnSlot::Flushing { link, stream: PeerStream::Ended { by: ClosedBy::Plane } }
+            }
+            // A second zero-length receive (the receive has ended) or a
+            // closing slot's: nothing changes.
+            other @ (ConnSlot::Flushing { stream: PeerStream::Ended { .. }, .. }
+            | ConnSlot::Closing { .. }
+            | ConnSlot::Draining { .. }) => other,
+        };
+        None
+    }
+
+    /// The peer is gone (a receive or send error): an active or flushing
+    /// slot becomes `Closing`, its unsent bytes dropped, a `Peer` parser
+    /// moving with its take count stamped. Returns the descriptor whose
+    /// one `Close` goes out; a closing or draining slot returns none.
+    pub(super) fn peer_gone(&mut self, inbox_takes: u64) -> Option<RawFd> {
+        let (fd, slot) = match self.take_slot() {
+            ConnSlot::Active { link, parser, recv: _ } => {
+                let by = ClosedBy::Peer { parser, taken_at: inbox_takes };
+                (Some(link.fd), ConnSlot::Closing { by })
+            }
+            ConnSlot::Flushing { link, stream: PeerStream::Open } => {
+                (Some(link.fd), ConnSlot::Closing { by: ClosedBy::Plane })
+            }
+            ConnSlot::Flushing { link, stream: PeerStream::Ended { by } } => {
+                (Some(link.fd), ConnSlot::Closing { by: by.stamped(inbox_takes) })
+            }
+            other @ (ConnSlot::Closing { .. } | ConnSlot::Draining { .. }) => (None, other),
+        };
+        self.slot = slot;
+        fd
+    }
+
+    /// The plane's immediate close (`timeout`, the `CLIENT KILL` sweep,
+    /// which the output cap feeds): an active or flushing slot becomes
+    /// `Closing` `Plane`, its parser and unsent bytes dropped. Returns the
+    /// descriptor whose one `Close` goes out.
+    pub(super) fn close_at_once(&mut self) -> Option<RawFd> {
+        let (fd, slot) = match self.take_slot() {
+            ConnSlot::Active { link, .. } => {
+                (Some(link.fd), ConnSlot::Closing { by: ClosedBy::Plane })
+            }
+            ConnSlot::Flushing { link, stream } => {
+                if let PeerStream::Ended { mut by } = stream {
+                    end_reader(&mut by);
+                }
+                (Some(link.fd), ConnSlot::Closing { by: ClosedBy::Plane })
+            }
+            other @ (ConnSlot::Closing { .. } | ConnSlot::Draining { .. }) => (None, other),
+        };
+        self.slot = slot;
+        fd
+    }
+
+    /// RESPOND's flush end: a flushing slot whose stream holds no parser,
+    /// with `out` sent, no send in flight and its pump parked after reading
+    /// its queue empty, becomes `Closing` `Plane`. Returns the descriptor
+    /// whose one `Close` goes out.
+    pub(super) fn flush_end(&mut self) -> Option<RawFd> {
+        let ConnSlot::Flushing { link, stream } = &self.slot else { return None };
+        let no_parser = match stream {
+            PeerStream::Open | PeerStream::Ended { by: ClosedBy::Plane } => true,
+            PeerStream::Ended { by: ClosedBy::Peer { .. } } => false,
+        };
+        if !no_parser || !link.out.is_empty() || link.send_inflight || !self.pump_parked {
+            return None;
+        }
+        let fd = link.fd;
+        self.slot = ConnSlot::Closing { by: ClosedBy::Plane };
+        Some(fd)
+    }
+
+    /// `Closed`, the `Close` op's terminal completion: `Closing` becomes
+    /// `Draining`, a `Peer` parser moving with its take count stamped (an
+    /// entry of the connection may wait in the inbox). Returns whether the
+    /// slot moved.
+    pub(super) fn closed(&mut self, inbox_takes: u64) -> bool {
+        let (moved, slot) = match self.take_slot() {
+            ConnSlot::Closing { by } => (true, ConnSlot::Draining { by: by.stamped(inbox_takes) }),
+            other @ (ConnSlot::Active { .. }
+            | ConnSlot::Flushing { .. }
+            | ConnSlot::Draining { .. }) => (false, other),
+        };
+        self.slot = slot;
+        moved
+    }
+
+    /// The plane's mark of the flush shape (`QUIT`, a protocol error, the
+    /// stop's mark): an active slot becomes `Flushing` `Open`, its parser
+    /// dropped with its partial frame; a `Peer` parser of any other state
+    /// ends. Returns whether the receive is owed one `RecvArm` (ADR-0196
+    /// A1.3: an active slot whose receive was not armed), so the marked
+    /// slot reaps and releases what follows and reads its end of stream.
+    pub(super) fn mark(&mut self) -> bool {
+        let (owed, slot) = match self.take_slot() {
+            ConnSlot::Active { link, parser: _, recv } => {
+                (recv != RecvArm::Armed, ConnSlot::Flushing { link, stream: PeerStream::Open })
+            }
+            ConnSlot::Flushing { link, stream: PeerStream::Ended { mut by } } => {
+                end_reader(&mut by);
+                (false, ConnSlot::Flushing { link, stream: PeerStream::Ended { by } })
+            }
+            open @ ConnSlot::Flushing { stream: PeerStream::Open, .. } => (false, open),
+            ConnSlot::Closing { mut by } => {
+                end_reader(&mut by);
+                (false, ConnSlot::Closing { by })
+            }
+            ConnSlot::Draining { mut by } => {
+                end_reader(&mut by);
+                (false, ConnSlot::Draining { by })
+            }
+        };
+        self.slot = slot;
+        owed
+    }
+
+    /// A `Peer` run-out at the pump's empty read, `Flushing` or `Draining`
+    /// (ADR-0196 D2, A1.1): once a take of the inbox has completed since
+    /// `taken_at`, every entry reaped before the slot entered its `Peer`
+    /// state has been parsed, so the parser ends. `None` for a slot that
+    /// holds no `Peer` parser.
+    pub(super) fn run_out(&mut self, inbox_takes: u64) -> Option<RunOut> {
+        let by = match &mut self.slot {
+            ConnSlot::Flushing { stream: PeerStream::Ended { by }, .. }
+            | ConnSlot::Draining { by } => by,
+            ConnSlot::Active { .. }
+            | ConnSlot::Flushing { stream: PeerStream::Open, .. }
+            | ConnSlot::Closing { .. } => return None,
+        };
+        let ClosedBy::Peer { taken_at, .. } = by else { return None };
+        if inbox_takes == *taken_at {
+            return Some(RunOut::Wait);
+        }
+        end_reader(by);
+        Some(RunOut::Ended)
     }
 }
 

@@ -249,6 +249,18 @@ pub struct NodeState {
     /// Idle connections closed by `timeout` (ADR-0123 D2; `INFO stats
     /// idle_disconnections`, cell scope).
     pub idle_disconnections: Cell<u64>,
+    /// A close's drain (ADR-0123 A2, ADR-0196; `INFO stats`, cell scope):
+    /// commands dequeued from a closing or draining slot; inbox entries a
+    /// draining slot's parser parsed; `Peer` run-outs that found no take of
+    /// the inbox since their stamp and waited; deliveries a flushing slot
+    /// answered with nothing written. Lifetime counters, statistics only.
+    pub closed_queue_commands: Cell<u64>,
+    pub closed_reader_entries: Cell<u64>,
+    pub reader_take_waits: Cell<u64>,
+    pub flushing_deliveries_dropped: Cell<u64>,
+    /// Draining slots: ADR-0123 A1's third population, beside `active`
+    /// (`connected_clients`); a gauge, cell scope, flushed by MAINTAIN.
+    pub draining_connections: Cell<u64>,
     /// `JSON.*` replies this cell refused over `doc-max-reply-bytes` and
     /// the reply bytes those refusals built and discarded — the CPU the
     /// limit cost (ADR-0099 A1; `INFO stats`, cell scope). Lifetime counters that saturate at

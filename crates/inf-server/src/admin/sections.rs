@@ -168,6 +168,7 @@ fn server_section(text: &mut String, node: &NodeInfo, now: Nanos) {
 fn clients_section(text: &mut String, node: &NodeInfo) {
     push(text, "# Clients");
     push(text, &format!("connected_clients:{}", node.connections.get()));
+    push(text, &format!("draining_connections:{}", node.draining_connections.get()));
     push(text, "cluster_connections:0");
     let maxclients = node.config.borrow().get("maxclients").unwrap_or("10000").to_string();
     push(text, &format!("maxclients:{maxclients}"));
@@ -385,6 +386,12 @@ fn stats_section(
     // ADR-0123 D2: idle closes under `timeout` (cell scope, like the
     // output-cap kills above).
     push(text, &format!("idle_disconnections:{}", node.idle_disconnections.get()));
+    // ADR-0123 A2, ADR-0196: a close's drain (cell scope).
+    push(text, &format!("closed_queue_commands:{}", node.closed_queue_commands.get()));
+    push(text, &format!("closed_reader_entries:{}", node.closed_reader_entries.get()));
+    push(text, &format!("reader_take_waits:{}", node.reader_take_waits.get()));
+    let dropped = node.flushing_deliveries_dropped.get();
+    push(text, &format!("flushing_deliveries_dropped:{dropped}"));
     // ADR-0099 A1: JSON replies refused over the reply budget (cell scope).
     #[cfg(feature = "doc")]
     {

@@ -67,6 +67,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         self.conns.borrow_mut().get_mut(key).map(f)
     }
 
+    /// PARSE completed a whole take of the inbox: the count moves after
+    /// the take's last entry, so a pump polled inside PARSE's loop reads it
+    /// unmoved and waits (ADR-0196 D2). The pumps waiting on it wake; with
+    /// none waiting a take pays one add, one load and one branch.
+    pub(super) fn note_inbox_take(&self) {
+        self.inbox_takes.set(self.inbox_takes.get().wrapping_add(1));
+        if self.reader_waiting.get() > 0 {
+            self.reader_waiters.wake_all(0);
+        }
+    }
+
     /// Executes owned argv locally (queued and remote-`Apply` paths),
     /// appending the reply to `out` (callers reuse scratch buffers — the
     /// owner side of a remote `Apply` is zero-allocation, M0-E8), and
