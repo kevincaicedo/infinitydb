@@ -1167,6 +1167,10 @@ ordered_rows=(
   # Planted, a Pending first poll leaves its header Idle and unlinked, and the wake it raised is
   # lost.
   "inf_canary_first_poll_wake_dropped crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-wake-lost"
+  # A flushing publisher's own frames ride its publish's reply (ADR-0101 D4): the defer branch
+  # comes before the flushing slot's answer. Planted, the answer comes first, and the own
+  # message is dropped.
+  "inf_canary_flushing_drops_own_frame crate-test inf-server lib own_frame_rides_reply_after_protocol_error own-frame-dropped"
   # A flushing slot is written no message published after its mark (ADR-0196 D4). Planted, the
   # delivery writes into it, and a message follows the subscriber's +OK.
   "inf_canary_flushing_takes_delivery m0-capacity push-after-quit --close-leg quit-subscriber"
@@ -1223,6 +1227,11 @@ ordered_rows=(
   # reads its queue empty with nothing pending (ADR-0177 D2). Planted, PARSE queues the command
   # and wakes nothing, so a deferred command's client waits for a reply no task makes.
   "inf_canary_parked_pump_not_woken m0-adversarial STALL --cells 4"
+  # A reply PARSE writes itself (-LOADING, a protocol error) leaves after every reply the
+  # connection owed before it: the route queues it behind them. Planted, it is written into out
+  # whatever the route, ahead of the owed replies: the plane test and the DST leg.
+  "inf_canary_parse_reply_around_queue crate-test inf-server lib protocol_error_answers_after_deferred reply-order"
+  "inf_canary_parse_reply_around_queue m0-capacity reply-order --close-leg protocol-order"
   # A QUIT the pump runs empties the queue behind it. Planted, the queue is kept, and the SETs
   # behind the QUIT run.
   "inf_canary_quit_keeps_queue m0-capacity post-quit-ran --close-leg deferred-quit"

@@ -258,6 +258,10 @@ pub struct NodeState {
     pub closed_reader_entries: Cell<u64>,
     pub reader_take_waits: Cell<u64>,
     pub flushing_deliveries_dropped: Cell<u64>,
+    /// Replies PARSE wrote while the pump owed the connection earlier ones
+    /// (a `-LOADING` refusal, a protocol error), queued behind them so they
+    /// leave in pipeline order (`INFO stats`, cell scope).
+    pub parse_replies_queued: Cell<u64>,
     /// Draining slots: ADR-0123 A1's third population, beside `active`
     /// (`connected_clients`); a gauge, cell scope, flushed by MAINTAIN.
     pub draining_connections: Cell<u64>,

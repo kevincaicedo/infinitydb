@@ -360,11 +360,9 @@ fn written_text(node: &Node, cell: usize) -> String {
 /// A `SET` of a key cell 1 owns, then a malformed frame, in one buffer;
 /// cell 1 is frozen while PARSE runs, so the `SET`'s reply is owed when PARSE
 /// meets the error. The client reads the `+OK`, then the error, then the
-/// close. At HEAD PARSE writes the error into the output at once, so it
-/// leaves first.
+/// close. A PARSE that wrote the error into the output at once would send
+/// it first.
 #[test]
-#[ignore = "PARSE writes a protocol error into the connection's output at once, ahead of the \
-            replies its pump still owes; red until PARSE queues its own replies behind them"]
 fn protocol_error_answers_after_deferred() {
     let mut node = Node::new(2);
     node.accept(0, CLIENT);
@@ -384,11 +382,9 @@ fn protocol_error_answers_after_deferred() {
 
 /// A `SET` of a key cell 1 owns while cell 1 holds its reply, then, in a
 /// later buffer, a malformed frame: the held `+OK` once cell 1 answers, then
-/// the error, then the close. At HEAD the error leaves while the `+OK` is
-/// held.
+/// the error, then the close. An error written into the output at once
+/// would leave while the `+OK` is held.
 #[test]
-#[ignore = "PARSE writes a protocol error into the connection's output at once, ahead of the \
-            replies its pump still owes; red until PARSE queues its own replies behind them"]
 fn protocol_error_in_a_later_buffer_answers_after_a_held_reply() {
     let mut node = Node::new(2);
     node.accept(0, CLIENT);
@@ -424,11 +420,9 @@ fn protocol_error_with_nothing_owed_answers_at_once() {
 
 /// The error owed behind a `SET` cell 1 holds, both in one buffer, then the
 /// client's socket is reset before either reply is sent: nothing is sent,
-/// and the `SET` still runs. At HEAD the error is sent at once, before the
-/// reset.
+/// and the `SET` still runs. An error written into the output at once
+/// would be sent before the reset.
 #[test]
-#[ignore = "PARSE writes a protocol error into the connection's output at once, ahead of the \
-            replies its pump still owes; red until PARSE queues its own replies behind them"]
 fn a_reset_before_the_owed_replies_leave_sends_nothing() {
     let mut node = Node::new(2);
     node.accept(0, CLIENT);
@@ -452,15 +446,13 @@ fn a_reset_before_the_owed_replies_leave_sends_nothing() {
 /// A plane loading its dataset and a namespace-bound connection: `ECHO a`,
 /// which runs while loading and rides the pump, then `GET k`, which is
 /// refused while loading, in one buffer. The `ECHO`'s reply is owed when
-/// PARSE refuses the `GET`, so the client reads `a`, then the refusal. At
-/// HEAD PARSE writes the refusal into the output at once, so it leaves
-/// first. The pump runs the `ECHO` inside PARSE's pass, so the slot's pump
-/// is idle again by the pass's end; engagement reads the route's input
+/// PARSE refuses the `GET`, so the client reads `a`, then the refusal. A
+/// refusal written into the output at once would leave first. The pump
+/// runs the `ECHO` inside PARSE's pass, so the slot's pump is idle again by
+/// the pass's end; engagement reads the route's input
 /// instead: the slot bound to a namespace, which defers every command, and
 /// the plane still loading after the pass.
 #[test]
-#[ignore = "PARSE writes a loading refusal into the connection's output at once, ahead of the \
-            replies its pump still owes; red until PARSE queues its own replies behind them"]
 fn loading_answers_after_deferred() {
     let namespace = inf_store::NsSpec {
         id: NsId(inf_store::FIRST_NAMED_NS_ID),
@@ -613,4 +605,32 @@ fn mark_rearms_a_disarmed_receive() {
     node.rounds(4);
     assert_eq!(written_text(&node, 0), "+OK\r\n", "the QUIT's +OK, then the close");
     assert!(node.closed(0).contains(&CLIENT), "the marked slot closes once its +OK is sent");
+}
+
+/// A RESP3 client subscribed to a channel cell 1 owns sends `PUBLISH` to it
+/// and a malformed frame in one buffer. The publisher's own message rides
+/// its publish's reply (ADR-0101 D4), though the slot is flushing when it
+/// arrives, then the protocol error leaves after both, then the close.
+#[test]
+fn own_frame_rides_reply_after_protocol_error() {
+    let mut node = Node::new(2);
+    node.accept(0, CLIENT);
+    let channel = node.key_on(1, "own");
+    node.send(0, CLIENT, &frame(&[b"HELLO", b"3"]));
+    node.send(0, CLIENT, &frame(&[b"SUBSCRIBE", &channel]));
+    node.rounds(8);
+    let confirmed = written_text(&node, 0);
+    assert!(confirmed.ends_with(":1\r\n"), "engagement: the subscription confirmed: {confirmed:?}");
+    let mut bytes = frame(&[b"PUBLISH", &channel, b"m"]);
+    bytes.extend_from_slice(MALFORMED);
+    node.send(0, CLIENT, &bytes);
+    node.rounds(12);
+    assert!(node.closed(0).contains(&CLIENT), "the protocol error closes the connection");
+    let name = String::from_utf8_lossy(&channel).into_owned();
+    let length = name.len();
+    let message = format!(">3\r\n$7\r\nmessage\r\n${length}\r\n{name}\r\n$1\r\nm\r\n");
+    let tail = written_text(&node, 0)[confirmed.len()..].to_string();
+    assert!(tail.contains(&message), "own-frame-dropped: the own message is missing: {tail:?}");
+    let owed = format!(":1\r\n{message}{PROTOCOL_ERROR}");
+    assert_eq!(tail, owed, "reply-order: the count, the own message, then the error");
 }

@@ -85,6 +85,7 @@ rows=(
   "m0-capacity --close-leg half-close-eof-with-data --verify-determinism"
   "m0-capacity --close-leg half-close-reset --verify-determinism"
   "m0-capacity --close-leg deferred-quit --verify-determinism"
+  "m0-capacity --close-leg protocol-order --verify-determinism"
   "m0-capacity --close-leg small-credit --verify-determinism"
   "m0-capacity --close-leg gated-hold --verify-determinism"
   "m0-capacity --close-leg gated-cold --verify-determinism"

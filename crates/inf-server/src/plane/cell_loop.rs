@@ -24,6 +24,99 @@ impl Staging<'_> {
     }
 }
 
+/// What a parsing slot's replies are written into: an open slot's `out`, or
+/// a closing or draining parser's recycled sink, discarded at the entry's
+/// end.
+enum Sink<'a> {
+    Out(&'a mut ReplyStream),
+    Dropped(&'a mut ReplyStream),
+}
+
+impl Sink<'_> {
+    fn stream(&mut self) -> &mut ReplyStream {
+        match self {
+            Sink::Out(out) | Sink::Dropped(out) => out,
+        }
+    }
+}
+
+/// Where a reply PARSE writes goes: `Out`, the one borrow of the slot's
+/// output PARSE takes, when the pump owes the connection nothing; else
+/// `Owed`, behind the replies owed before it.
+enum ReplyRoute<'a> {
+    Out(&'a mut ReplyStream),
+    Owed,
+}
+
+/// One entry's parse: the slot's sink, whether the pump owed the connection
+/// a reply when the entry began, and the entries the buffer queues.
+struct ParseInto<'a> {
+    sink: Sink<'a>,
+    pump_busy: bool,
+    deferred: Vec<Queued>,
+}
+
+impl ParseInto<'_> {
+    /// The reply route, read by the three writes PARSE makes (an inline
+    /// command, `-LOADING`, a protocol error): `Owed` while the pump owes
+    /// the connection a reply or a command of this buffer deferred, else
+    /// the sink. Returns it beside the queue the entry fills.
+    fn route(&mut self) -> (ReplyRoute<'_>, &mut Vec<Queued>) {
+        let route = if self.pump_busy || !self.deferred.is_empty() {
+            ReplyRoute::Owed
+        } else {
+            ReplyRoute::Out(self.sink.stream())
+        };
+        (route, &mut self.deferred)
+    }
+}
+
+/// PARSE's one match on an entry's slot (ADR-0196 D1, D2, A1.1): the
+/// parser and the sink of a slot that holds one, and whether it is a
+/// draining slot's; `None` for a slot that releases the entry. An active or
+/// half-closed slot writes into its `out`, and its received buffer stores
+/// `timeout`'s clock; a closing or draining parser renders into a recycled
+/// sink, made by `make_sink`.
+fn parse_target<'s>(
+    slot: &'s mut ConnSlot,
+    dropped_out: &'s mut Option<ReplyStream>,
+    now_ms: u64,
+    make_sink: impl FnOnce() -> ReplyStream,
+) -> Option<(&'s mut ConnParser, Sink<'s>, bool)> {
+    // Canary: PARSE releases a `Peer` entry unparsed, flushing or closing.
+    #[cfg(inf_canary_closing_inbox_released)]
+    if let ConnSlot::Flushing { .. } | ConnSlot::Closing { .. } = slot {
+        return None;
+    }
+    // Canary: PARSE releases a draining `Peer` entry unparsed.
+    #[cfg(inf_canary_draining_releases_held_entry)]
+    if let ConnSlot::Draining { .. } = slot {
+        return None;
+    }
+    match slot {
+        ConnSlot::Active { link, parser, .. }
+        | ConnSlot::Flushing {
+            link,
+            stream: PeerStream::Ended { by: ClosedBy::Peer { parser, .. } },
+        } => {
+            link.last_active_ms = now_ms;
+            Some((parser, Sink::Out(&mut link.out), false))
+        }
+        ConnSlot::Closing { by: ClosedBy::Peer { parser, .. } } => {
+            Some((parser, Sink::Dropped(dropped_out.insert(make_sink())), false))
+        }
+        ConnSlot::Draining { by: ClosedBy::Peer { parser, .. } } => {
+            Some((parser, Sink::Dropped(dropped_out.insert(make_sink())), true))
+        }
+        ConnSlot::Flushing {
+            stream: PeerStream::Open | PeerStream::Ended { by: ClosedBy::Plane },
+            ..
+        }
+        | ConnSlot::Closing { by: ClosedBy::Plane }
+        | ConnSlot::Draining { by: ClosedBy::Plane } => None,
+    }
+}
+
 /// What one buffer's parse did: its commands, and whether a `QUIT` or a
 /// protocol error stopped it (the slot is then marked).
 struct BufferParsed {
@@ -136,15 +229,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         len: u32,
         staging: &mut Staging<'_>,
     ) -> u32 {
-        // Commands that defer to the connection's pump: the first that
-        // must, and everything after it (replies are ordered per
-        // connection).
-        let mut deferred: Vec<OwnedCmd> = Vec::new();
         // The parked pump to wake once the deferred commands are queued.
         let mut wake_pump: Option<TaskId> = None;
         let mut dropped_out: Option<ReplyStream> = None;
-        let mut draining = false;
-        let commands = {
+        let (commands, draining) = {
             let mut conns = self.shared.conns.borrow_mut();
             let Some(conn) = conns.get_mut(key) else { return 0 };
             // While the pump is not parked it owns the connection's
@@ -152,51 +240,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let pump_busy = !conn.pump_parked;
             let now_ms = cx.now.as_millis();
             let Conn { cx: conn_cx, slot, .. } = &mut *conn;
-            // Canary: PARSE releases a `Peer` entry unparsed, flushing or
-            // closing.
-            #[cfg(inf_canary_closing_inbox_released)]
-            if let ConnSlot::Flushing { .. } | ConnSlot::Closing { .. } = slot {
+            let make_sink = || ReplyStream::new(self.shared.take_reply_buf());
+            let Some((parser, sink, draining)) =
+                parse_target(slot, &mut dropped_out, now_ms, make_sink)
+            else {
                 return 0;
-            }
-            // Canary: PARSE releases a draining `Peer` entry unparsed.
-            #[cfg(inf_canary_draining_releases_held_entry)]
-            if let ConnSlot::Draining { .. } = slot {
-                return 0;
-            }
-            let (parser, out) = match slot {
-                ConnSlot::Active { link, parser, .. }
-                | ConnSlot::Flushing {
-                    link,
-                    stream: PeerStream::Ended { by: ClosedBy::Peer { parser, .. } },
-                } => {
-                    link.last_active_ms = now_ms;
-                    (parser, &mut link.out)
-                }
-                ConnSlot::Closing { by: ClosedBy::Peer { parser, .. } } => {
-                    (parser, dropped_out.insert(ReplyStream::new(self.shared.take_reply_buf())))
-                }
-                ConnSlot::Draining { by: ClosedBy::Peer { parser, .. } } => {
-                    draining = true;
-                    (parser, dropped_out.insert(ReplyStream::new(self.shared.take_reply_buf())))
-                }
-                ConnSlot::Flushing {
-                    stream: PeerStream::Open | PeerStream::Ended { by: ClosedBy::Plane },
-                    ..
-                }
-                | ConnSlot::Closing { by: ClosedBy::Plane }
-                | ConnSlot::Draining { by: ClosedBy::Plane } => return 0,
             };
+            let mut into = ParseInto { sink, pump_busy, deferred: Vec::new() };
             let data = &cx.pool.bytes(buf)[..len as usize];
-            let parsed = self.parse_buffer(
-                key,
-                parser,
-                conn_cx,
-                out,
-                data,
-                pump_busy,
-                &mut deferred,
-                staging,
-            );
+            let parsed = self.parse_buffer(key, parser, conn_cx, &mut into, data, staging);
+            let ParseInto { deferred, .. } = into;
             if parsed.stop && conn.mark() {
                 self.shared.mark_rearms.borrow_mut().push(key);
             }
@@ -215,7 +268,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // woken, so the client waits for a reply nothing makes.
             #[cfg(inf_canary_parked_pump_not_woken)]
             let _ = (queued, &mut wake_pump);
-            parsed.commands
+            (parsed.commands, draining)
         };
         if let Some(out) = dropped_out {
             self.shared.recycle_reply_buf(out.into_vec());
@@ -232,19 +285,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
 
     /// One received buffer through the slot's parser, the one function
     /// every parsing state runs (L13): inline commands execute into `out`,
-    /// deferred ones collect in `deferred` behind the first that must
-    /// defer, and a `QUIT` or a protocol error ends the buffer (Redis
-    /// discards what follows either).
-    #[allow(clippy::too_many_arguments, reason = "the parse funnel: the slot's split borrows")]
+    /// deferred ones queue behind the first that must defer, and a `QUIT`
+    /// or a protocol error ends the buffer (Redis discards what follows
+    /// either).
     fn parse_buffer(
         &self,
         key: ConnKey,
         parser: &mut ConnParser,
         conn_cx: &mut ConnCx,
-        out: &mut ReplyStream,
+        into: &mut ParseInto<'_>,
         data: &[u8],
-        pump_busy: bool,
-        deferred: &mut Vec<OwnedCmd>,
         staging: &mut Staging<'_>,
     ) -> BufferParsed {
         let origin = ExecOrigin::Conn(key.slot, key.generation);
@@ -254,20 +304,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             match next {
                 Parsed::Command(argv) | Parsed::Inline(argv) => {
                     parsed.commands += 1;
-                    let flow =
-                        self.run_parsed(&argv, conn_cx, out, origin, pump_busy, deferred, staging);
-                    if flow == Flow::Quit {
+                    if self.run_parsed(&argv, conn_cx, into, origin, staging) == Flow::Quit {
                         parsed.stop = true;
                         break;
                     }
                 }
                 Parsed::Incomplete => {}
                 Parsed::ProtocolError(e) => {
-                    staging.flush(&self.shared, origin, conn_cx, out);
                     // Display, not Debug (batch 45): the Redis
                     // phrasing the compat harness diffs.
-                    RespWriter::new(out.open(), conn_cx.proto)
-                        .error(&format!("ERR Protocol error: {e}"));
+                    let error = format!("ERR Protocol error: {e}");
+                    self.parse_reply(conn_cx, into, origin, staging, &error);
                     parsed.stop = true;
                     break;
                 }
@@ -275,46 +322,59 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
         // End of buffer: the staged batch executes with its record
         // lines prefetched (§7.3 phase 2 across the whole batch).
-        staging.flush(&self.shared, origin, conn_cx, out);
+        match into.route() {
+            (ReplyRoute::Out(out), _) => staging.flush(&self.shared, origin, conn_cx, out),
+            // Nothing is staged once the pump owes a reply: the first
+            // deferral flushed the batch.
+            (ReplyRoute::Owed, _) => {
+                debug_assert!(staging.stage.is_empty(), "staged past a deferral")
+            }
+        }
         drop(iter);
         parsed
     }
 
     /// One parsed command: refused while loading, deferred to the pump,
     /// staged, or executed inline.
-    #[allow(clippy::too_many_arguments, reason = "the parse funnel: the slot's split borrows")]
     fn run_parsed(
         &self,
         argv: &ArgvRef<'_>,
         conn_cx: &mut ConnCx,
-        out: &mut ReplyStream,
+        into: &mut ParseInto<'_>,
         origin: ExecOrigin,
-        pump_busy: bool,
-        deferred: &mut Vec<OwnedCmd>,
         staging: &mut Staging<'_>,
     ) -> Flow {
         let meta = lookup(argv.arg(0));
         if self.loading_refuses(meta) {
-            // The error reply keeps pipeline order: staged commands
-            // answer first.
-            staging.flush(&self.shared, origin, conn_cx, out);
-            RespWriter::new(out.open(), conn_cx.proto)
-                .error("LOADING Redis is loading the dataset in memory");
+            self.parse_reply(
+                conn_cx,
+                into,
+                origin,
+                staging,
+                "LOADING Redis is loading the dataset in memory",
+            );
             return Flow::Next;
         }
+        let (route, deferred) = into.route();
+        let out = match route {
+            ReplyRoute::Out(out) => out,
+            ReplyRoute::Owed => {
+                deferred.push(Queued::Command(OwnedCmd::from_argv_into(
+                    argv,
+                    self.shared.take_cmd_buf(),
+                )));
+                return Flow::Next;
+            }
+        };
         // Named-namespace commands always ride the pump (M2-S08): durable
         // acks suspend, staging admission may park, and emission lives
         // there — one `Option` load on the memory fast path.
-        let defer = pump_busy
-            || !deferred.is_empty()
-            || conn_cx.ns.named().is_some()
-            || conn_cx.ns.unavailable()
-            || self.needs_fabric(argv);
-        if defer {
+        if conn_cx.ns.named().is_some() || conn_cx.ns.unavailable() || self.needs_fabric(argv) {
             // Pump replies emit after the fast-path replies already in
             // `out` — flush so the staged batch keeps its pipeline position.
             staging.flush(&self.shared, origin, conn_cx, out);
-            deferred.push(OwnedCmd::from_argv_into(argv, self.shared.take_cmd_buf()));
+            deferred
+                .push(Queued::Command(OwnedCmd::from_argv_into(argv, self.shared.take_cmd_buf())));
             return Flow::Next;
         }
         if staging.enabled && parse_stageable(meta, argv) {
@@ -323,6 +383,43 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
         staging.flush(&self.shared, origin, conn_cx, out);
         self.execute_inline(argv, conn_cx, out, origin)
+    }
+
+    /// A reply PARSE writes itself, `-LOADING` or a protocol error, by the
+    /// route: into `out` after the staged batch when the pump owes the
+    /// connection nothing, else rendered once into a recycled buffer and
+    /// queued behind the replies owed before it, so it leaves in pipeline
+    /// order. A closing or draining parser's reply is dropped: the slot
+    /// writes no `out`, so the route is not read.
+    fn parse_reply(
+        &self,
+        conn_cx: &mut ConnCx,
+        into: &mut ParseInto<'_>,
+        origin: ExecOrigin,
+        staging: &mut Staging<'_>,
+        error: &str,
+    ) {
+        if let Sink::Dropped(_) = into.sink {
+            return;
+        }
+        // Canary: the reply is written into `out` whatever the route.
+        #[cfg(inf_canary_parse_reply_around_queue)]
+        let (route, deferred) = (ReplyRoute::Out(into.sink.stream()), &mut into.deferred);
+        #[cfg(not(inf_canary_parse_reply_around_queue))]
+        let (route, deferred) = into.route();
+        match route {
+            ReplyRoute::Out(out) => {
+                staging.flush(&self.shared, origin, conn_cx, out);
+                RespWriter::new(out.open(), conn_cx.proto).error(error);
+            }
+            ReplyRoute::Owed => {
+                let mut reply = OpenReply::new(self.shared.take_reply_buf());
+                RespWriter::new(reply.reply(), conn_cx.proto).error(error);
+                deferred.push(Queued::Reply(reply.finish()));
+                let node = &self.shared.node;
+                node.parse_replies_queued.set(node.parse_replies_queued.get() + 1);
+            }
+        }
     }
 
     /// M2-S15 `-LOADING` gate: while the node loads, only LOADING-flagged
@@ -474,8 +571,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // Canary: `Closed` drops the queue, as a removed slot did.
             #[cfg(inf_canary_closed_conn_queue_dropped)]
             if moved {
-                for cmd in conn.queue.drain(..) {
-                    self.shared.recycle_cmd_buf(cmd.into_buf());
+                for entry in conn.queue.drain(..) {
+                    entry.recycle(&self.shared);
                 }
             }
             // Canary: the registry removal and the 1→0 capture at `Closed`,

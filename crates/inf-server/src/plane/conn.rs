@@ -83,7 +83,7 @@ impl OwnedCmd {
         (0..self.argc()).map(|i| self.arg(i)).collect()
     }
 
-    fn mem(&self) -> usize {
+    pub(super) fn mem(&self) -> usize {
         self.buf.capacity()
     }
 
@@ -262,7 +262,7 @@ impl Conn {
         };
         size_of::<Conn>()
             + slot
-            + self.queue.iter().map(OwnedCmd::mem).sum::<usize>()
+            + self.queue.iter().map(Queued::mem).sum::<usize>()
             + self.cx.sub_channels.iter().map(|c| c.len() + 24).sum::<usize>()
             + self.cx.sub_patterns.iter().map(|p| p.len() + 24).sum::<usize>()
     }
@@ -299,7 +299,7 @@ impl Conn {
     /// whose `RecvDisarm` goes out. No other state holds a receive to
     /// disarm, so a `Peer` parser's queue grows only by the bytes read
     /// before its end.
-    pub(super) fn enqueue(&mut self, deferred: Vec<OwnedCmd>) -> Option<RawFd> {
+    pub(super) fn enqueue(&mut self, deferred: Vec<Queued>) -> Option<RawFd> {
         self.queue.extend(deferred);
         match &mut self.slot {
             ConnSlot::Active { link, recv, .. }

@@ -56,6 +56,9 @@ pub(super) enum PendingReply {
 /// What the pump found when it asked the connection for more work.
 pub(super) enum Popped {
     Cmd(OwnedCmd),
+    /// A reply PARSE queued behind the replies owed before it: it takes
+    /// its place in the window as one executed at dispatch.
+    Reply(OwnedReply),
     /// Queue empty but replies are still pending — keep emitting.
     Empty,
     /// Queue empty and nothing pending: the pump parked itself inside the
@@ -87,13 +90,14 @@ fn pop_or_quiesce<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             *recv = RecvArm::RearmDue;
         }
         match next {
-            Some(cmd) => {
+            Some(Queued::Command(cmd)) => {
                 if let ConnSlot::Closing { .. } | ConnSlot::Draining { .. } = conn.slot {
                     let node = &shared.node;
                     node.closed_queue_commands.set(node.closed_queue_commands.get() + 1);
                 }
                 Popped::Cmd(cmd)
             }
+            Some(Queued::Reply(reply)) => Popped::Reply(reply),
             None if pending_empty => quiesce(shared, key, conn, takes),
             None => Popped::Empty,
         }
@@ -345,6 +349,11 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 Some(cmd) => cmd,
                 None => match pop_or_quiesce(&shared, key, pending.is_empty()) {
                     Popped::Cmd(cmd) => cmd,
+                    // No barrier: a conn-state command is read from commands.
+                    Popped::Reply(reply) => {
+                        pending.push_back(PendingReply::Done(reply));
+                        continue;
+                    }
                     Popped::Empty => break,
                     Popped::Park => {
                         park().await;
@@ -1181,8 +1190,8 @@ pub(super) fn close_after_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone
     shared.with_conn(key, |conn| {
         // Canary: the pump's `QUIT` keeps the queue behind it.
         #[cfg(not(inf_canary_quit_keeps_queue))]
-        for cmd in conn.queue.drain(..) {
-            shared.recycle_cmd_buf(cmd.into_buf());
+        for entry in conn.queue.drain(..) {
+            entry.recycle(shared);
         }
         if conn.mark() {
             shared.mark_rearms.borrow_mut().push(key);

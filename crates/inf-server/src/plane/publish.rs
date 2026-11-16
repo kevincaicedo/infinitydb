@@ -658,6 +658,10 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             match &mut conn.slot {
                 // A closing or draining slot is not a receiver.
                 ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => false,
+                // Canary: a flushing slot's answer before the defer branch,
+                // so the publisher's own frames are dropped.
+                #[cfg(inf_canary_flushing_drops_own_frame)]
+                ConnSlot::Flushing { stream, .. } => matches!(stream, PeerStream::Open),
                 // The publisher's own frames ride the reply path instead
                 // (emitted right after the receiver count), in Active and
                 // Flushing alike (ADR-0101).

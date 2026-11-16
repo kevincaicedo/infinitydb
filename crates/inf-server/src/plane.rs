@@ -326,14 +326,44 @@ const _: () = assert!(
     "a gated verdict fits a parked entry"
 );
 
+/// A connection queue's entry: a command PARSE deferred to the pump, or a
+/// reply PARSE wrote while the pump owed the connection earlier replies (a
+/// `-LOADING` refusal, a protocol error), queued so it leaves after them.
+enum Queued {
+    Command(OwnedCmd),
+    Reply(OwnedReply),
+}
+
+impl Queued {
+    /// The heap bytes the entry holds.
+    fn mem(&self) -> usize {
+        match self {
+            Queued::Command(cmd) => cmd.mem(),
+            Queued::Reply(reply) => reply.bytes().len(),
+        }
+    }
+
+    /// Returns the entry's buffer to its pool.
+    fn recycle<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        self,
+        shared: &Shared<O, F>,
+    ) {
+        match self {
+            Queued::Command(cmd) => shared.recycle_cmd_buf(cmd.into_buf()),
+            Queued::Reply(reply) => shared.recycle_reply_buf(reply.into_bytes()),
+        }
+    }
+}
+
 /// A connection's slab entry: its context, its queue and its pump, which
 /// every occupied state holds, and its state (ADR-0123 A2, ADR-0196 A1).
 #[allow(clippy::disallowed_types, reason = "container: A")]
 pub(super) struct Conn {
     cx: ConnCx,
-    /// The commands PARSE deferred, which the pump dequeues in pipeline
-    /// order in every occupied state: a close runs them to the end.
-    queue: VecDeque<OwnedCmd>,
+    /// The commands PARSE deferred, and the replies it wrote while the pump
+    /// owed earlier ones, which the pump dequeues in pipeline order in
+    /// every occupied state: a close runs them to the end.
+    queue: VecDeque<Queued>,
     /// The connection's pump (ADR-0177 D2), made at its admission; it
     /// lives until the connection's slot retires.
     pump: TaskId,

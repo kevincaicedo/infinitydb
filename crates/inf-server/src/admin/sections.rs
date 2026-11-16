@@ -392,6 +392,7 @@ fn stats_section(
     push(text, &format!("reader_take_waits:{}", node.reader_take_waits.get()));
     let dropped = node.flushing_deliveries_dropped.get();
     push(text, &format!("flushing_deliveries_dropped:{dropped}"));
+    push(text, &format!("parse_replies_queued:{}", node.parse_replies_queued.get()));
     // ADR-0099 A1: JSON replies refused over the reply budget (cell scope).
     #[cfg(feature = "doc")]
     {

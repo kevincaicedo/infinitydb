@@ -132,8 +132,7 @@ impl CloseLeg {
     /// green leg leaves this table for its `scripts/sim-smoke.sh` row, where
     /// it runs with its twin; `tests/lanes.rs` holds every leg to one of the
     /// two.
-    pub const PINNED_RED: &'static [CloseLeg] =
-        &[CloseLeg::Tasks, CloseLeg::Fan, CloseLeg::ProtocolOrder];
+    pub const PINNED_RED: &'static [CloseLeg] = &[CloseLeg::Tasks, CloseLeg::Fan];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -1437,8 +1436,10 @@ fn protocol_order_leg(seed: u64) -> Rig {
         rig.violate(format!("post-error-ran: {ran} of the {SETS} SETs behind the error ran"));
     }
     rig.expect_vacant(X, 1);
-    if !(bound && landed > 0) {
-        let text = "VACUOUS protocol-order-unengaged: no SET before the error ran namespace-bound";
+    let queued = rig.drain_count("parse_replies_queued", |n| n.parse_replies_queued.get());
+    if !(bound && landed > 0 && queued >= 1) {
+        let text = "VACUOUS protocol-order-unengaged: no SET before the error ran namespace-bound, \
+                    or PARSE queued no reply behind the owed ones";
         rig.violate(text.to_string());
     }
     rig
@@ -1511,12 +1512,5 @@ mod reds {
                 each leg takes one of the connection's gate units"]
     fn the_fan_leg_holds_a_window_per_connection() {
         pinned_red(CloseLeg::Fan);
-    }
-
-    #[test]
-    #[ignore = "PARSE writes a protocol error into the connection's output at once, ahead of the \
-                replies its pump still owes; red until PARSE queues its own replies behind them"]
-    fn the_protocol_order_leg_answers_the_error_after_its_owed_replies() {
-        pinned_red(CloseLeg::ProtocolOrder);
     }
 }
