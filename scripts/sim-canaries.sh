@@ -1212,10 +1212,14 @@ ordered_rows=(
   # delivery writes into it, and a message follows the subscriber's +OK.
   "inf_canary_flushing_takes_delivery m0-capacity push-after-quit --close-leg quit-subscriber"
   # A fabric holder whose waiter drops waits, Orphaned, for its request's one completion, so no
-  # completion finds a later occupant (ADR-0177 D4). Planted, it frees at the drop. No wire path
-  # drops a wait while its request is out (a closing pump finishes its command), so the crate test
-  # of the holder table's Orphaned row is the oracle.
+  # completion finds a later occupant (ADR-0177 D4). Planted, it frees at the drop. The crate test
+  # polls a wait to Waiting, drops it and counts the holders beside the key it kept. The scenario
+  # reaches the row from the wire: a fan of reads answers at its first failed leg and drops the
+  # rest, so a namespace KEYS whose first peer lacks the namespace drops the held peer's wait
+  # with its request out; planted, the late reply finds the slot at its next generation, and the
+  # report reads the stale completion.
   "inf_canary_gate_frees_on_drop crate-test inf-runtime lib an_orphaned_holder_frees_at_its_late_completion orphan-freed-at-drop"
+  "inf_canary_gate_frees_on_drop m0-capacity gate-stale --close-leg orphan"
   # The fabric gate's holders are resident from its build (ADR-0177 D8 with A1), billed by F7.
   # Planted, the gate is built over 2 H: the idle node's resident memory a cell rises by H x
   # s_h, 83,075 x 48 B at 4 cells, over F7's 256 KiB. The bytes are that product at the stride

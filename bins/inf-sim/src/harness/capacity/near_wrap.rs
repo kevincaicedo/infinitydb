@@ -25,7 +25,8 @@ pub(super) fn holder_near_wrap_leg(seed: u64) -> Rig {
 
 /// The leg with every cell's holders free at `first_generation`, the plane's default at `None`.
 fn near_wrap_at(seed: u64, first_generation: Option<u32>) -> Rig {
-    let mut rig = Rig::with_setup(seed, 0, 15_000, &[], NEAR_WRAP_MESH, first_generation);
+    let none: [&[_]; CELLS as usize] = [&[]; CELLS as usize];
+    let mut rig = Rig::with_setup(seed, 0, 15_000, none, NEAR_WRAP_MESH, first_generation);
     let cells = usize::from(CELLS);
     let keys: Vec<Vec<Vec<u8>>> = (0..cells)
         .map(|cell| names_on((cell + 1) % cells, &format!("wrap:{cell}"), LEGS))

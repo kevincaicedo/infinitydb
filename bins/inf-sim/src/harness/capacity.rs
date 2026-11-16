@@ -37,6 +37,7 @@ use crate::state::StateHash;
 
 mod gated;
 mod near_wrap;
+mod orphan;
 mod small_credit;
 
 /// The legs, each one row of `scripts/sim-smoke.sh` or one pinned red.
@@ -107,11 +108,15 @@ pub enum CloseLeg {
     /// keys a peer owns, each a fan of 32 legs, carry every slot's word past
     /// the field. Every reply is exact and in order.
     HolderNearWrap,
+    /// A namespace `KEYS` on cell 0 whose first peer lacks the namespace,
+    /// its second held: the reply is the first peer's error, and the
+    /// dropped leg's holder waits, Orphaned, for its late reply.
+    Orphan,
 }
 
 impl CloseLeg {
     /// Every leg, in the order the help text lists them.
-    pub const ALL: [CloseLeg; 21] = [
+    pub const ALL: [CloseLeg; 22] = [
         CloseLeg::Tasks,
         CloseLeg::Fan,
         CloseLeg::Close,
@@ -133,6 +138,7 @@ impl CloseLeg {
         CloseLeg::GatedCold,
         CloseLeg::GatedError,
         CloseLeg::HolderNearWrap,
+        CloseLeg::Orphan,
     ];
 
     /// The legs red at this tree. Each runs in one ignored test of `reds`,
@@ -166,6 +172,7 @@ impl CloseLeg {
             CloseLeg::GatedCold => "gated-cold",
             CloseLeg::GatedError => "gated-error",
             CloseLeg::HolderNearWrap => "holder-near-wrap",
+            CloseLeg::Orphan => "orphan",
         }
     }
 
@@ -259,6 +266,8 @@ struct Rig {
     step_ns_max: u64,
     /// The cell whose iterations are skipped: its replies are held.
     held: Option<usize>,
+    /// Each cell's loop iterations the harness ran.
+    iterations: Vec<u64>,
     clients: Vec<Client>,
     steps: u64,
     trace: Vec<u8>,
@@ -283,16 +292,18 @@ impl Rig {
     /// The same, each cell's keyspace also holding `namespaces`, created
     /// uncataloged at boot.
     fn with_namespaces(seed: u64, maxclients: u32, step_ns_max: u64, namespaces: &[NsSpec]) -> Rig {
-        Rig::with_setup(seed, maxclients, step_ns_max, namespaces, FROZEN_MESH, None)
+        let each = [namespaces; CELLS as usize];
+        Rig::with_setup(seed, maxclients, step_ns_max, each, FROZEN_MESH, None)
     }
 
-    /// The same on `mesh`, each cell's fabric holders built free at
-    /// `first_generation` when one is named.
+    /// The same with each cell's own `namespaces`, in cell order, on
+    /// `mesh`, each cell's fabric holders built free at `first_generation`
+    /// when one is named.
     fn with_setup(
         seed: u64,
         maxclients: u32,
         step_ns_max: u64,
-        namespaces: &[NsSpec],
+        namespaces: [&[NsSpec]; CELLS as usize],
         mesh: inf_fabric::MeshConfig,
         first_generation: Option<u32>,
     ) -> Rig {
@@ -310,7 +321,7 @@ impl Rig {
             nodes.push(Rc::clone(&node));
             let seed_store = KeyspaceSeed::Uncataloged {
                 cfg: StoreConfig { hasher: node_hasher(seed), ..Default::default() },
-                specs: namespaces.to_vec(),
+                specs: namespaces[i].to_vec(),
             };
             let (plane, serve_mark, timer_set, executor) = Plane::new(
                 CellId(cell),
@@ -347,6 +358,7 @@ impl Rig {
             rng: SplitMix64::new(seed ^ 0xCA9A_C17E),
             step_ns_max,
             held: None,
+            iterations: vec![0; usize::from(CELLS)],
             clients: Vec::new(),
             steps: 0,
             trace: Vec::new(),
@@ -387,6 +399,7 @@ impl Rig {
             }
             let (cell_loop, plane) = &mut self.cells[index];
             cell_loop.run_iteration(plane).expect("sim iteration");
+            self.iterations[index] += 1;
         }
         if let Some(most) = self.tasks_most.as_mut() {
             for (cell, (cell_loop, _)) in self.cells.iter().enumerate() {
@@ -725,6 +738,7 @@ pub fn run_capacity_scenario(scenario: &CapacityScenario) -> CapacityReport {
         CloseLeg::GatedCold => return gated::gated_cold_leg(seed),
         CloseLeg::GatedError => return gated::gated_error_leg(seed),
         CloseLeg::HolderNearWrap => near_wrap::holder_near_wrap_leg(seed),
+        CloseLeg::Orphan => orphan::orphan_leg(seed),
     };
     rig.report(leg)
 }
