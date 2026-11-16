@@ -1307,8 +1307,9 @@ pub(super) async fn send_apply_ns<
         return Err(SendRefused::Reply(too_many_args_reply(proto)));
     };
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
+    let mut op = PointOp::apply_ns(FabricToken(0), slot, cmd_byte(proto, 0), ns.0, args, program);
     send_op(shared, units, to, proto, Hop::Unrecorded, |token| {
-        let op = PointOp::apply_ns(token, slot, cmd_byte(proto, 0), ns.0, args.clone(), program);
+        op.stamp(token);
         Stage::from(shared.fabric.borrow_mut().stage_general(to, &op))
     })
     .await
@@ -1388,8 +1389,9 @@ pub(super) async fn send_apply<'u, O: PlaneObserver + 'static, F: SegmentFs + Cl
     // applies carry the empty-key slot).
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
     let cmd = cmd_byte(proto, db);
+    let mut op = PointOp::apply(FabricToken(0), slot, cmd, args, program);
     send_op(shared, units, to, proto, apply_hop(argv), |token| {
-        let op = PointOp::apply(token, slot, cmd, args.clone(), program);
+        op.stamp(token);
         Stage::from(shared.fabric.borrow_mut().stage_general(to, &op))
     })
     .await

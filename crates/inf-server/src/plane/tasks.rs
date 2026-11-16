@@ -361,6 +361,8 @@ mod tests {
             (written - threshold).abs() < 1e-9,
             "empty_idle_rss's threshold {written} is not the bill's {threshold} at these strides"
         );
+        let sum = format!("Σ {bill:.3} MiB");
+        assert!(gates.contains(&sum), "the bill's comment does not read `{sum}` at these strides");
         let canaries = include_str!("../../../../scripts/sim-canaries.sh");
         let conn_stride = ExecutorLayout::slot_shape(&pump::<O, F>).0 as u64;
         let conn_plant = u64::from(caps.conn.entries_max()) * conn_stride;

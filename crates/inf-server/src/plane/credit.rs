@@ -282,6 +282,20 @@ impl<'a> PointOp<'a> {
     pub(super) fn adopt_conn(token: FabricToken, fd: u32) -> PointOp<'static> {
         PointOp(Op::AdoptConn { token, fd })
     }
+
+    /// The op under `token`, the key of this attempt's holder: a send that
+    /// parked for a credit stamps its next key on the op it built once, so
+    /// its arguments are never built or copied again.
+    pub(super) fn stamp(&mut self, token: FabricToken) {
+        match &mut self.0 {
+            Op::Apply { token: at, .. }
+            | Op::ApplyNs { token: at, .. }
+            | Op::AdoptConn { token: at, .. } => *at = token,
+            Op::Read { .. } | Op::Write { .. } | Op::Batch { .. } | Op::Reply { .. } => {
+                debug_assert!(false, "a point op is an apply, an apply-ns or an adopt");
+            }
+        }
+    }
 }
 
 /// The argv of one publish fan leg, `INF.PUBFAN channel payload`, with the
