@@ -996,7 +996,7 @@ impl Node {
                     };
                     durable = Some((cfg, Arc::clone(control)));
                 }
-                let (mut plane, serve_mark, timer_set) = ServerPlane::new(
+                let (mut plane, serve_mark, timer_set, executor) = ServerPlane::new(
                     CellId(i as u16),
                     cells,
                     listener.into_raw_fd(),
@@ -1033,7 +1033,7 @@ impl Node {
                     None => CellClock::Running(gate.start()),
                 };
                 let mut cell_loop =
-                    CellLoop::new(driver, clock, pool, config, serve_mark, timer_set);
+                    CellLoop::new(driver, clock, pool, config, serve_mark, timer_set, executor);
                 let (mut counted_quiet, mut counted) = (false, false);
                 let mut at_default = NsNames::new();
                 while !stop.load(Ordering::Relaxed) {
@@ -7135,7 +7135,7 @@ fn unwired_plane(
     fabric: inf_fabric::CellFabric,
 ) -> ServerPlane<NoopObserver, inf_server::StdSegmentFs> {
     let listener = listen_reuseport(0).expect("listen");
-    let (plane, _serve_mark, _timer_set) = ServerPlane::new(
+    let (plane, _serve_mark, _timer_set, _executor) = ServerPlane::new(
         CellId(cell),
         cells,
         listener.into_raw_fd(),

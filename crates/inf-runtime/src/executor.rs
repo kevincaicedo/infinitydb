@@ -32,6 +32,7 @@
 //! `SAFETY.md` holds the audit of this module's `unsafe`.
 
 use core::alloc::Layout;
+use core::any::TypeId;
 use core::cell::{Cell, RefCell};
 use core::future::Future;
 use core::marker::PhantomData;
@@ -44,8 +45,11 @@ use std::alloc::{alloc, dealloc, handle_alloc_error};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use inf_foundation::bounded::{Cap, CapCensus, CapError};
 use inf_foundation::limits::LANE_COUNT_MAX;
 use inf_foundation::wake::{Closing, Delivery, RemoteStack, Settled, ThreadMark, WakeBridge};
+
+use crate::limits::TASK_CLASSES_MAX;
 
 /// Slot value while a task header is not (yet) bound to a slab slot.
 const UNASSIGNED: u32 = u32::MAX;
@@ -87,6 +91,204 @@ pub enum PollImmediate {
     /// The future suspended and was promoted to a task slot; it resumes via
     /// its waker (typed gates) and [`CellExecutor::run_ready`].
     Suspended(TaskId),
+}
+
+// ---- Task classes (ADR-0177 D2) ----------------------------------------------------------------
+
+/// What a class's factory makes, read from the factory's type alone: a function or closure of one
+/// to three arguments whose call returns the class's future. `ExecutorLayout::class` reads the
+/// future's type through it and never calls the factory.
+pub trait TaskFactory<Args>: factory::Sealed<Args> {
+    /// The future one call of the factory returns: the class's one future type.
+    type Future: Future<Output = ()> + 'static;
+}
+
+mod factory {
+    /// Sealed: only the arities below are factories.
+    pub trait Sealed<Args> {}
+}
+
+macro_rules! task_factory {
+    ($($arg:ident),+) => {
+        impl<Fun, Fut, $($arg),+> factory::Sealed<($($arg,)+)> for Fun
+        where
+            Fun: Fn($($arg),+) -> Fut,
+        {
+        }
+        impl<Fun, Fut, $($arg),+> TaskFactory<($($arg,)+)> for Fun
+        where
+            Fun: Fn($($arg),+) -> Fut,
+            Fut: Future<Output = ()> + 'static,
+        {
+            type Future = Fut;
+        }
+    };
+}
+task_factory!(A);
+task_factory!(A, B);
+task_factory!(A, B, C);
+
+/// A task class's handle (ADR-0177 D2): `Copy` and erased, so a host that cannot name its
+/// future's type keeps it. Only [`ExecutorLayout::class`] makes one; [`CellExecutor::reserve`]
+/// answers `Foreign` for a handle of another future type or another layout's index.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct TaskClass {
+    index: u32,
+    future: TypeId,
+}
+
+/// The answer to [`CellExecutor::reserve`]: a permit for one task of the class, or why none.
+#[must_use = "a permit makes a task or is dropped; a refusal is the caller's crossing"]
+pub enum TaskAdmission<'a, F> {
+    /// One slot of the class is the permit's until it makes the task or drops.
+    Granted(TaskPermit<'a, F>),
+    /// Every slot of the class that can serve holds a task; nothing was taken.
+    Full,
+    /// Every slot of the class has retired: the cell's fail-stop (ADR-0177 D7).
+    Exhausted,
+    /// The handle names another executor's class or another future type: an assembly defect,
+    /// never load; nothing was taken.
+    Foreign,
+}
+
+/// An exclusive permit for one task of a class: it borrows the executor, so it is used in the
+/// step that reserved it and cannot cross an `await` (ADR-0144 A2's list names it). Dropped,
+/// it leaves the slot free and no future was built.
+#[must_use = "a permit makes a task or is dropped; it carries none"]
+pub struct TaskPermit<'a, F> {
+    executor: &'a mut CellExecutor,
+    class: u32,
+    future: PhantomData<fn() -> F>,
+}
+
+impl<F: Future<Output = ()> + 'static> TaskPermit<'_, F> {
+    /// Makes the task now: `make` runs, its future is placed before any poll and is polled by
+    /// the next [`CellExecutor::run_ready`].
+    pub fn spawn_local(self, make: impl FnOnce() -> F) -> TaskId {
+        self.executor.spawn_in(self.class, make())
+    }
+
+    /// Makes the task and polls it once in place (the fast path, L6): Ready, and no runnable
+    /// entry exists; Pending, and the task stays where it was placed and resumes when woken.
+    pub fn poll_immediate(self, make: impl FnOnce() -> F) -> PollImmediate {
+        self.executor.poll_in(self.class, make())
+    }
+}
+
+/// The answer to [`CellExecutor::wake`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Woken {
+    /// The task was Idle and is now at the ready list's tail.
+    Queued,
+    /// The task was queued or running already: the wakes coalesce.
+    AlreadyRunnable,
+    /// The id names no live task of this executor: nothing changed.
+    Stale,
+}
+
+/// A leaf future that suspends once and stores no waker (ADR-0177 D2): its task is woken by its
+/// owner's [`CellExecutor::wake`], never by a waker.
+#[must_use = "a park suspends only when awaited"]
+#[derive(Debug, Default)]
+pub struct Park {
+    parked: bool,
+}
+
+/// Suspends the calling task once, until its owner wakes it by id.
+pub fn park() -> Park {
+    Park { parked: false }
+}
+
+impl Future for Park {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.parked {
+            Poll::Ready(())
+        } else {
+            self.parked = true;
+            Poll::Pending
+        }
+    }
+}
+
+/// The classes a cell's executor serves, registered on the cell's census before the executor is
+/// built, so a layout is its cell's own (ADR-0177 D2).
+pub struct ExecutorLayout {
+    census: Rc<CapCensus>,
+    classes: Vec<ClassSpec>,
+}
+
+/// One registered class: its cap and its future's type.
+struct ClassSpec {
+    cap: Cap,
+    future: TypeId,
+}
+
+/// Why an executor was not built: the class whose storage refused, and how.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExecutorInitError {
+    /// The refused class's census row (its cap's name).
+    pub row: &'static str,
+    /// The refusal.
+    pub error: CapError,
+}
+
+impl core::fmt::Display for ExecutorInitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "the executor's class {} was not built: {}", self.row, self.error)
+    }
+}
+
+impl std::error::Error for ExecutorInitError {}
+
+impl ExecutorLayout {
+    /// An empty layout on `census`, the cell's own.
+    #[must_use]
+    pub fn new(census: &Rc<CapCensus>) -> ExecutorLayout {
+        ExecutorLayout { census: Rc::clone(census), classes: Vec::new() }
+    }
+
+    /// Registers a class of `cap` tasks of the future `factory` makes, and returns its handle.
+    /// The factory is read for its type and never called.
+    ///
+    /// # Errors
+    /// `CapError::Layout` past [`TASK_CLASSES_MAX`] classes.
+    pub fn class<Args, Fac: TaskFactory<Args>>(
+        &mut self,
+        factory: &Fac,
+        cap: Cap,
+    ) -> Result<TaskClass, CapError> {
+        let _ = factory;
+        if self.classes.len() >= TASK_CLASSES_MAX {
+            return Err(CapError::Layout);
+        }
+        let index = u32::try_from(self.classes.len()).map_err(|_| CapError::Layout)?;
+        let future = TypeId::of::<Fac::Future>();
+        self.classes.push(ClassSpec { cap, future });
+        Ok(TaskClass { index, future })
+    }
+
+    /// The executor of this layout's classes, built before its cell serves.
+    ///
+    /// # Errors
+    /// [`ExecutorInitError`] naming the class whose storage refused.
+    pub fn build(self) -> Result<CellExecutor, ExecutorInitError> {
+        let ExecutorLayout { census, classes } = self;
+        let _ = census;
+        let classes = classes
+            .into_iter()
+            .map(|spec| ClassState { cap: spec.cap.entries_max(), future: spec.future, live: 0 })
+            .collect();
+        Ok(CellExecutor::with_classes(classes))
+    }
+}
+
+/// A class as the executor holds it: its cap, its future's type and its tasks alive.
+struct ClassState {
+    cap: u32,
+    future: TypeId,
+    live: u32,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -656,6 +858,8 @@ struct TaskEntry {
     fut: RawFut,
     header: Header,
     generation: u64,
+    /// The class whose count this task holds.
+    class: u32,
 }
 
 /// Single-threaded task executor for one cell. See module docs.
@@ -664,9 +868,13 @@ struct TaskEntry {
 ///
 /// ```compile_fail,E0277
 /// fn on_another_thread<T: Send>(_: T) {}
-/// on_another_thread(inf_runtime::CellExecutor::new(8));
+/// let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+/// let executor = inf_runtime::ExecutorLayout::new(&census).build().expect("no class refuses");
+/// on_another_thread(executor);
 /// ```
 pub struct CellExecutor {
+    /// The layout's classes, indexed by [`TaskClass`]'s index.
+    classes: Vec<ClassState>,
     entries: Vec<Option<TaskEntry>>,
     free: Vec<u32>,
     shared: Rc<ExecShared>,
@@ -687,13 +895,13 @@ pub struct CellExecutor {
 }
 
 impl CellExecutor {
-    /// `capacity` reserves slab and queue space up front; the slab may still
-    /// grow beyond it at M0 (a hard cap with backpressure arrives with the
-    /// connection budget work).
+    /// The executor of a layout's classes ([`ExecutorLayout::build`]).
     #[allow(clippy::disallowed_types, reason = "container: E")]
-    pub fn new(capacity: usize) -> CellExecutor {
+    fn with_classes(classes: Vec<ClassState>) -> CellExecutor {
+        let capacity = classes.iter().map(|class| class.cap as usize).sum::<usize>();
         let stack = NonNull::from(Box::leak(Box::new(RemoteStack::new())));
         CellExecutor {
+            classes,
             entries: Vec::with_capacity(capacity),
             free: Vec::new(),
             shared: Rc::new(ExecShared {
@@ -734,11 +942,69 @@ impl CellExecutor {
         NonNull::from(Box::leak(header))
     }
 
+    /// A permit for one task of `class`, whose future type the permit's use fixes: `Foreign`
+    /// for another layout's class or another future type, `Full` when every slot of the class
+    /// holds a task. Nothing is taken until the permit makes the task.
+    pub fn reserve<F: Future<Output = ()> + 'static>(
+        &mut self,
+        class: TaskClass,
+    ) -> TaskAdmission<'_, F> {
+        let Some(state) = self.classes.get(class.index as usize) else {
+            return TaskAdmission::Foreign;
+        };
+        if state.future != class.future || class.future != TypeId::of::<F>() {
+            return TaskAdmission::Foreign;
+        }
+        if state.live >= state.cap {
+            return TaskAdmission::Full;
+        }
+        TaskAdmission::Granted(TaskPermit {
+            executor: self,
+            class: class.index,
+            future: PhantomData,
+        })
+    }
+
+    /// Moves an Idle task to the ready list's tail (ADR-0177 D2): its owner queued work for it.
+    /// A queued or running task's wakes coalesce; a stale or vacant id changes nothing.
+    pub fn wake(&mut self, id: TaskId) -> Woken {
+        let Some(entry) = self.entries.get(id.slot as usize).and_then(Option::as_ref) else {
+            return Woken::Stale;
+        };
+        if entry.generation != id.generation {
+            return Woken::Stale;
+        }
+        // SAFETY: the entry holds its header: open, on this thread.
+        let owner = unsafe { owner(entry.header) };
+        match owner.state.get() {
+            TaskState::Idle => {
+                wake_task(owner);
+                Woken::Queued
+            }
+            TaskState::Running => {
+                wake_task(owner);
+                Woken::AlreadyRunnable
+            }
+            TaskState::Queued | TaskState::RunningWoken => Woken::AlreadyRunnable,
+            TaskState::Dead | TaskState::Held => Woken::Stale,
+        }
+    }
+
+    /// Tasks of `class` alive (`conn-tasks`' count beside the slots it serves): suspended,
+    /// queued or running. Zero for a handle this executor did not make.
+    #[must_use]
+    pub fn class_tasks(&self, class: TaskClass) -> u32 {
+        self.classes
+            .get(class.index as usize)
+            .filter(|state| state.future == class.future)
+            .map_or(0, |state| state.live)
+    }
+
     /// Fast path (L6): poll `fut` once, in place. Ready ⇒ done — no task
     /// slot, no waker registered, no allocation (the state machine lives in
     /// a reusable scratch buffer). Pending ⇒ the future is promoted to a
-    /// task slot and resumes via [`Self::run_ready`] once woken.
-    pub fn poll_immediate<F: Future<Output = ()> + 'static>(&mut self, fut: F) -> PollImmediate {
+    /// task slot of `class` and resumes via [`Self::run_ready`] once woken.
+    fn poll_in<F: Future<Output = ()> + 'static>(&mut self, class: u32, fut: F) -> PollImmediate {
         let header = self.spare_header.take().unwrap_or_else(|| self.new_header());
         // SAFETY: the executor holds the header: open, on this thread.
         let owner = unsafe { owner(header) };
@@ -785,7 +1051,7 @@ impl CellExecutor {
                     poll_fn: poll_shim::<F>,
                     drop_fn: drop_shim::<F>,
                 };
-                PollImmediate::Suspended(self.insert(raw, header))
+                PollImmediate::Suspended(self.insert(raw, header, class))
             }
         }
     }
@@ -812,9 +1078,9 @@ impl CellExecutor {
         }
     }
 
-    /// Spawn a future as a task (the slow path — allocates storage and a
+    /// Spawn a future as a task of `class` (the slow path — allocates storage and a
     /// slot). It runs from the next [`Self::run_ready`] slice.
-    pub fn spawn_local<F: Future<Output = ()> + 'static>(&mut self, fut: F) -> TaskId {
+    fn spawn_in<F: Future<Output = ()> + 'static>(&mut self, class: u32, fut: F) -> TaskId {
         let layout = Layout::new::<F>();
         let ptr = allocate(layout);
         // SAFETY: freshly allocated for `F`'s layout.
@@ -825,12 +1091,12 @@ impl CellExecutor {
         // `RunningWoken` makes `insert` queue the task for its first poll.
         // SAFETY: a header this executor just made: open, on this thread.
         unsafe { owner(header) }.state.set(TaskState::RunningWoken);
-        self.insert(raw, header)
+        self.insert(raw, header, class)
     }
 
     /// Bind a suspended/new future to a slab slot. Resolves a wake that
     /// raced the first poll (`RunningWoken`) by queueing immediately.
-    fn insert(&mut self, fut: RawFut, header: Header) -> TaskId {
+    fn insert(&mut self, fut: RawFut, header: Header, class: u32) -> TaskId {
         let slot = match self.free.pop() {
             Some(s) => s,
             None => {
@@ -854,8 +1120,12 @@ impl CellExecutor {
         }
         self.next_generation += 1;
         let generation = self.next_generation;
-        self.entries[slot as usize] = Some(TaskEntry { fut, header, generation });
+        self.entries[slot as usize] = Some(TaskEntry { fut, header, generation, class });
         self.live += 1;
+        // The permit's reserve read `live < cap` in this step, so the count stays at or below
+        // the class's cap.
+        let state = &mut self.classes[class as usize];
+        state.live += 1;
         TaskId { slot, generation }
     }
 
@@ -947,6 +1217,7 @@ impl CellExecutor {
             self.grow_free(slot);
         }
         self.live -= 1;
+        self.classes[entry.class as usize].live -= 1;
         // The future drops in place here (drop_in_place + dealloc): every waker it owned is
         // counted out before the decision.
         drop(entry.fut);
@@ -1133,7 +1404,13 @@ impl core::fmt::Debug for CellExecutor {
 mod tests {
     //! The owner lane's bound, which no public path reaches before 2⁶⁰ clones.
 
+    use inf_foundation::bounded::CapFill;
+
     use super::*;
+
+    /// The probe's one future type, boxed: the test's closure has no name to register.
+    type Probe = Pin<Box<dyn Future<Output = ()>>>;
+    const ONE: Cap = Cap::entries::<1>("test-probe", CapFill::Serving);
 
     /// An owner-lane clone at `LANE_COUNT_MAX` aborts the process before the count is written;
     /// one below the bound reaches it. A test-only start count stands in for 2⁶⁰ clones: the test
@@ -1149,20 +1426,28 @@ mod tests {
         /// `SIGABRT`'s number on every supported host.
         const SIGABRT: i32 = 6;
         let start = if std::env::var(CHILD).is_ok() { LANE_COUNT_MAX } else { LANE_COUNT_MAX - 1 };
-        let mut executor = CellExecutor::new(1);
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(0));
+        let mut layout = ExecutorLayout::new(&census);
+        let class = layout.class(&|f: Probe| f, ONE).expect("one class");
+        let mut executor = layout.build().expect("no class refuses");
         let header = executor.new_header();
         // SAFETY: a header this executor just made: open, on this thread.
         unsafe { owner(header) }.owner_count.set(start);
         executor.spare_header = Some(header);
         let reached = Rc::new(Cell::new(0));
         let seen = Rc::clone(&reached);
-        let outcome = executor.poll_immediate(core::future::poll_fn(move |cx| {
-            let clone = cx.waker().clone();
-            // SAFETY: the polled task's header, on this thread.
-            seen.set(unsafe { owner(header) }.owner_count.get());
-            drop(clone);
-            Poll::Ready(())
-        }));
+        let TaskAdmission::Granted(permit) = executor.reserve::<Probe>(class) else {
+            panic!("the probe's class has its one slot");
+        };
+        let outcome = permit.poll_immediate(|| {
+            Box::pin(core::future::poll_fn(move |cx| {
+                let clone = cx.waker().clone();
+                // SAFETY: the polled task's header, on this thread.
+                seen.set(unsafe { owner(header) }.owner_count.get());
+                drop(clone);
+                Poll::Ready(())
+            }))
+        });
         if std::env::var(CHILD).is_ok() {
             return;
         }

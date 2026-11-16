@@ -971,7 +971,9 @@ mod submit_policy {
         let driver = make_ring(uring_env::config().with_submit(policy));
         let pool = BufferPool::new(16, 4096);
         let config = LoopConfig::default();
-        let mut cell = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timers);
+        let executor = inf_runtime::ExecutorLayout::new(&census).build().expect("no class");
+        let mut cell =
+            CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timers, executor);
         let mut plane = ClosePlane { pending: closes(), closed: 0 };
         let mut iterations = 0;
         while plane.closed < CLOSES {

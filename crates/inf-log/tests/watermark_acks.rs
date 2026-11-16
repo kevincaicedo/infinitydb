@@ -19,10 +19,10 @@ use std::rc::Rc;
 
 use inf_alloc::BufferPool;
 use inf_foundation::CellId;
-use inf_foundation::bounded::CapCensus;
+use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::time::{Nanos, VirtualClock};
 use inf_log::{FsyncClass, LogGeometry, SegmentConfig, StagingConfig};
-use inf_runtime::{CellExecutor, CellLoop, LoopConfig, WatermarkGate};
+use inf_runtime::{CellLoop, ExecutorLayout, LoopConfig, TaskAdmission, WatermarkGate};
 use support::{DurablePlane, IoMode, ScriptedDriver, test_dir};
 
 /// Deterministic xorshift64* (L7: no ambient randomness).
@@ -57,6 +57,7 @@ fn run_schedule(seed: u64, dir: &Path) {
         LoopConfig::default(),
         serve_mark,
         timer_set,
+        support::loop_executor(&census),
     );
     // Small segments: rotation + seal fsyncs interleave with linked ones.
     let staging = StagingConfig::with_capacity(16 << 10);
@@ -121,16 +122,25 @@ fn no_ack_before_covering_fsync_across_random_schedules() {
 fn wake_storm_50k_drains_under_the_execute_budget() {
     const WAITERS: u64 = 50_000;
     const BUDGET: usize = 1024;
-    let mut executor = CellExecutor::new(4096);
+    /// The storm's waiters, all alive at once.
+    const STORM: Cap = Cap::entries::<{ WAITERS as u32 }>("storm-waiters", CapFill::Serving);
+    async fn storm_waiter(gate: WatermarkGate, lsn: u64, order: Rc<RefCell<Vec<u64>>>) {
+        gate.waiter(lsn).await;
+        order.borrow_mut().push(lsn);
+    }
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let class = layout.class(&storm_waiter, STORM).expect("the storm's class");
+    let mut executor = layout.build().expect("no class refuses");
     let gate = WatermarkGate::new();
     let order = Rc::new(RefCell::new(Vec::with_capacity(WAITERS as usize)));
     for lsn in 1..=WAITERS {
         let gate = gate.clone();
         let order = Rc::clone(&order);
-        executor.spawn_local(async move {
-            gate.waiter(lsn).await;
-            order.borrow_mut().push(lsn);
-        });
+        let TaskAdmission::Granted(permit) = executor.reserve(class) else {
+            panic!("the storm's class holds every waiter");
+        };
+        permit.spawn_local(move || storm_waiter(gate, lsn, order));
     }
     // Futures suspend on first poll (spawn queues them once).
     while executor.run_ready(BUDGET) == BUDGET {}

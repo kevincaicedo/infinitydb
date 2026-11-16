@@ -31,6 +31,9 @@ use inf_runtime::{
     Wait,
 };
 
+#[path = "support/tasks.rs"]
+mod tasks;
+
 /// The runtime fixture's timer positions: one, which the timer test
 /// reserves; the tests that arm no timer leave it unreserved, so it fills
 /// while serving (a test host's cap).
@@ -105,6 +108,7 @@ fn test_loop_owning(
         config,
         serve_mark,
         timers,
+        tasks::loop_executor(&census),
     );
     (lp, owners)
 }
@@ -237,6 +241,7 @@ fn the_first_iteration_takes_the_serve_mark() {
         LoopConfig::default(),
         serve_mark,
         timers,
+        tasks::loop_executor(&census),
     );
     assert_eq!(census.phase(), CensusPhase::Assembling, "constructing the loop is assembly");
     let mut plane = BusyThenIdle { busy_left: 1 };
@@ -386,10 +391,13 @@ impl CellPlane for PhaseOrderPlane {
         self.calls.borrow_mut().push("parse_execute");
         if !self.spawned {
             self.spawned = true;
-            cx.executor.spawn_local(ParkedReply {
-                waker: std::rc::Rc::clone(&self.waker),
-                done: std::rc::Rc::clone(&self.done),
-            });
+            tasks::spawn(
+                cx.executor,
+                ParkedReply {
+                    waker: std::rc::Rc::clone(&self.waker),
+                    done: std::rc::Rc::clone(&self.done),
+                },
+            );
         }
     }
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
@@ -450,10 +458,13 @@ impl CellPlane for WakeInMaintain {
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
         if !self.spawned {
             self.spawned = true;
-            cx.executor.spawn_local(ParkedReply {
-                waker: std::rc::Rc::clone(&self.waker),
-                done: std::rc::Rc::clone(&self.done),
-            });
+            tasks::spawn(
+                cx.executor,
+                ParkedReply {
+                    waker: std::rc::Rc::clone(&self.waker),
+                    done: std::rc::Rc::clone(&self.done),
+                },
+            );
         }
     }
     fn maintain(&mut self, _cx: &mut LoopCx<'_>) {
@@ -565,6 +576,7 @@ fn sixty_five_due_timers_take_two_turns_and_no_park() {
             config,
             serve_mark,
             timers,
+            tasks::loop_executor(&census),
         );
         let mut plane = DueCohort { owners, armed: false, begun: 0 };
         let mut begun = Vec::new();
@@ -618,7 +630,7 @@ impl CellPlane for DeliveryOrderPlane {
         assert!(!self.spawned, "the fixture admits one task");
         self.spawned = true;
         let trace = Rc::clone(&self.trace);
-        cx.executor.spawn_local(async move {
+        tasks::spawn(cx.executor, async move {
             trace.borrow_mut().push(OrderMark::Poll);
         });
     }
@@ -723,14 +735,17 @@ impl CellPlane for ExportParked {
         self.spawned = true;
         let slot = std::sync::Arc::clone(&self.waker);
         let polls = Rc::clone(&self.polls);
-        cx.executor.spawn_local(core::future::poll_fn(move |cx| {
-            polls.set(polls.get() + 1);
-            if polls.get() > 1 {
-                return std::task::Poll::Ready(());
-            }
-            *slot.lock().expect("the waker slot") = Some(cx.waker().clone());
-            std::task::Poll::Pending
-        }));
+        tasks::spawn(
+            cx.executor,
+            core::future::poll_fn(move |cx| {
+                polls.set(polls.get() + 1);
+                if polls.get() > 1 {
+                    return std::task::Poll::Ready(());
+                }
+                *slot.lock().expect("the waker slot") = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }),
+        );
     }
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
 }
@@ -764,6 +779,7 @@ fn an_idle_park_carries_its_ceiling() {
         config,
         serve_mark,
         timers,
+        tasks::loop_executor(&census),
     );
     let first = lp.run_iteration(&mut plane).expect("iteration");
     assert_eq!((first.parked, first.polled), (false, 1), "the task is spawned and parks");

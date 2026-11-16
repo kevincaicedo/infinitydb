@@ -61,3 +61,11 @@ pub const COLD_READY_LEFT_TURNS: u64 = 7;
 /// held reads' 8 steady steps past the bound.
 #[cfg(inf_canary_cold_ready_left_fifteen_turns)]
 pub const COLD_READY_LEFT_TURNS: u64 = 15;
+
+/// Task classes one cell's executor registers (ADR-0177 D2): 16. Owner: the
+/// executor's layout ([`ExecutorLayout`](crate::ExecutorLayout)), which a cell
+/// builds before it serves. A cell's plane registers six; tests and the
+/// simulator's assemblies fewer. Crossing: `CapError::Layout` from
+/// `ExecutorLayout::class`, before the executor is built, so the cell does
+/// not serve.
+pub const TASK_CLASSES_MAX: usize = 16;

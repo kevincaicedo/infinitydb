@@ -34,14 +34,18 @@ use inf_log::{
     tier_frame_span,
 };
 use inf_runtime::{
-    BackendDriver, CellExecutor, CompletionResult, CompletionToken, GateWait, IoGate, IoOp,
-    PollImmediate, RawFd, StableBytesMut, TokenClass, UringDriver, Wait,
+    BackendDriver, CompletionResult, CompletionToken, GateWait, IoGate, IoOp, PollImmediate, RawFd,
+    StableBytesMut, TokenClass, UringDriver, Wait,
 };
 use inf_store::KeyHasher;
 use inf_store::{
     AddrClass, AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig,
     TieredLookup, TieredTable,
 };
+
+#[path = "support/tasks.rs"]
+mod tasks;
+use tasks::TestExecutor;
 
 #[path = "support/uring_env.rs"]
 mod uring_env;
@@ -292,7 +296,7 @@ async fn steel_get(ctx: Rc<RefCell<Ctx>>, key: Vec<u8>) -> Answer {
 /// bounded, never spinning past the answer.
 fn pump_until<T>(
     ctx: &Rc<RefCell<Ctx>>,
-    ex: &mut CellExecutor,
+    ex: &mut TestExecutor,
     done: &Rc<RefCell<Option<T>>>,
 ) -> T {
     let mut recv_pool = BufferPool::new(2, 4096); // signature-required; unused by TierRead
@@ -327,7 +331,7 @@ fn pump_until<T>(
 /// suspended when `expect_suspend` says so.
 fn run_get(
     ctx: &Rc<RefCell<Ctx>>,
-    ex: &mut CellExecutor,
+    ex: &mut TestExecutor,
     key: &[u8],
     expect_suspend: bool,
 ) -> Answer {
@@ -447,7 +451,7 @@ fn steel_thread_write_flush_demote_cold_read() {
     let dir = std::env::temp_dir().join(format!("inf-steel-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp shard dir");
     let (ctx, corpus, _writer) = build_demoted_corpus(&dir);
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
 
     // Cold reads: every record served byte-exact through real suspension.
     for key in &corpus.small_keys {
@@ -519,7 +523,7 @@ fn cold_read_histogram() {
         .join(format!("inf-steel-hist-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp shard dir");
     let (ctx, corpus, _writer) = build_demoted_corpus(&dir);
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
 
     let fd = ctx.borrow().tier_fd;
     let mut lat_us: Vec<f64> = Vec::new();

@@ -949,6 +949,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         durable: Option<&impl AckClasses>,
         transition_idle: bool,
         now_us: u64,
+        may_compact: bool,
     ) -> Result<(u32, Option<CompactRead>), TierFlushError> {
         let cold = self.cold.clone();
         let stats = &mut self.flush_stats;
@@ -1007,9 +1008,11 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         units += unlink_retired(&self.fs, cold.as_ref(), t);
 
         // ---- compaction (ADR-0059): one read chain in flight; the
-        // caller spawns it with `ReadClass::Maintain`.
+        // caller spawns it with `ReadClass::Maintain`, under a permit of
+        // the `compact` class, whose room `may_compact` reads (ADR-0177
+        // D2): without it nothing is marked in flight.
         let mut compact = None;
-        if !t.compact_inflight {
+        if !t.compact_inflight && may_compact {
             let pressure = table.compaction_pressure(t.flush.disk_bytes());
             let slice = table.compaction_config().slice_bytes;
             if let inf_store::CompactionWork::Read { file_id, addr, len } =

@@ -169,6 +169,10 @@ pub struct NodeState {
     /// Render-only, cell scope.
     pub tier_ns_positions: Cell<u64>,
     pub tier_position_conflicts: Cell<u64>,
+    /// MAINTAIN reads not made because their task class was full (ADR-0177
+    /// D2's `compact` and `shadow` crossing): derived never while a cell
+    /// holds at most 64 tiered namespaces. Cell scope; a statistic.
+    pub tier_maint_task_waits: Cell<u64>,
     pub connections: Cell<u64>,
     pub recv_dropped: Cell<u64>,
     /// The cell executor's `waker_foreign_ops`: waker operations made off the cell's thread,

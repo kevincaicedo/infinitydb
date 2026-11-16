@@ -43,6 +43,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use inf_foundation::CellId;
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_log::fs::sim::SimDisk;
@@ -50,7 +52,7 @@ use inf_log::{
     TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, tier_extract, tier_frame_offset,
     tier_frame_span,
 };
-use inf_runtime::{CellExecutor, WatermarkGate, WatermarkWait};
+use inf_runtime::{CellExecutor, ExecutorLayout, TaskAdmission, WatermarkGate, WatermarkWait};
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId, StoreConfig,
     TieredLookup, TieredTable,
@@ -737,10 +739,17 @@ pub fn run_pressure_scenario(scenario: &PressureScenario) -> PressureReport {
     let mut report = PressureReport::default();
     let world = build_world(scenario.leg, scenario.seed);
     let mut fleet = TierFleet::new();
-    let mut ex = CellExecutor::new(64);
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let writers = layout.class(&writer_storm, crate::limits::PRESSURE_WRITERS);
+    let writers = writers.expect("the leg's one class");
+    let mut ex = layout.build().expect("the leg's executor");
     for writer in 0..WRITERS {
         let world = Rc::clone(&world);
-        let _ = ex.poll_immediate(writer_storm(world, writer, scenario.seed ^ 0x5701_2233));
+        let TaskAdmission::Granted(permit) = ex.reserve(writers) else {
+            panic!("the leg's class holds every writer");
+        };
+        let _ = permit.poll_immediate(|| writer_storm(world, writer, scenario.seed ^ 0x5701_2233));
     }
     let mut round = 0u64;
     loop {

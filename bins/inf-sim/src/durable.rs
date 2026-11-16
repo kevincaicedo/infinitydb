@@ -2222,7 +2222,7 @@ pub(crate) fn boot_meshed(
             ),
             catalog: catalog.clone().unwrap_or_else(inf_store::NsCatalog::empty),
         };
-        let (mut plane, serve_mark, timer_set) = SimPlane::new(
+        let (mut plane, serve_mark, timer_set, executor) = SimPlane::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
@@ -2244,7 +2244,7 @@ pub(crate) fn boot_meshed(
         let spin_iters = scenario.wake.spin(scenario.spin_iters);
         let config = LoopConfig { spin_iters, ..Default::default() };
         let cell_loop =
-            CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark, timer_set);
+            CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark, timer_set, executor);
         nets.push(net);
         cells.push((cell_loop, plane));
     }

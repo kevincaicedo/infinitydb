@@ -388,6 +388,113 @@ pub(crate) const fn per_origin(ceiling: &Cap, data_credits: u32) -> Result<Cap, 
     Cap::derived(ceiling, entries)
 }
 
+/// `conn` tasks one cell holds (ADR-0177 D2): one per connection slot that
+/// is not vacant, made in the step that admits its connection and ending
+/// when that slot retires. The ceiling of the class's cap `C`, the cell's
+/// connection share (`conn_tasks`), census name `conn-tasks`, filled while
+/// serving. Unit: tasks per cell. Owner: the cell's executor, through the
+/// plane's task table (`plane/tasks.rs`). Crossing: the accept is refused
+/// with Redis's `maxclients` frame and a close, before anything ran.
+pub const CONN_TASKS: Cap = Cap::entries::<CONN_TASKS_MAX>("conn-tasks", CapFill::Serving);
+
+/// Cells one node runs at most: the key slots one cell owns at least one
+/// of. Unit: cells per node. Owner: `CellCount::new`, which refuses more.
+pub const CELLS_MAX: u32 = inf_foundation::SLOT_COUNT as u32;
+
+/// `ns-apply` tasks one cell holds (ADR-0177 D2): one long-lived pump per
+/// peer, made at plane start, before the cell serves, and never ending. The
+/// ceiling of `N − 1`, census name `ns-apply-tasks`, filled whole at
+/// assembly. Unit: tasks per cell. Owner: the plane's task table. Crossing:
+/// none while serving; a plane start that asks past it ends the assembly
+/// with `ns-apply-tasks-full-at-assembly`.
+pub const NS_APPLY_TASKS: Cap =
+    Cap::entries::<{ CELLS_MAX - 1 }>("ns-apply-tasks", CapFill::Assembly);
+
+/// `owner-pub` tasks one cell holds (ADR-0177 D2): the one long-lived owner
+/// publish pump of a cell with peers, made at plane start. Census name
+/// `owner-pub-tasks`, filled whole at assembly. Unit, owner and crossing:
+/// as [`NS_APPLY_TASKS`].
+pub const OWNER_PUB_TASKS: Cap = Cap::entries::<1>("owner-pub-tasks", CapFill::Assembly);
+
+/// `gated` tasks one cell holds (ADR-0177 D2, D3): the one long-lived task
+/// that publishes the cell's `always` verdicts, made at plane start. Census
+/// name `gated-tasks`, filled whole at assembly. Unit, owner and crossing:
+/// as [`NS_APPLY_TASKS`].
+pub const GATED_TASKS: Cap = Cap::entries::<1>("gated-tasks", CapFill::Assembly);
+
+/// Tiered namespaces whose compaction one cell runs at once (ADR-0177 D2's
+/// `K`, ADR-0148 D1's lifetimes): 64. Unit: compaction chains per cell.
+/// Owner: MAINTAIN, which takes a namespace's compaction read only while
+/// the class has room. Crossing: pace — the read is not taken, nothing is
+/// marked in flight, `tier_maint_task_waits` counts it, and a later
+/// MAINTAIN takes it.
+pub const TIER_MAINT_NAMESPACES: u32 = 64;
+
+/// `compact` tasks one cell holds (ADR-0177 D2): one read chain per tiered
+/// namespace, made by MAINTAIN under a permit and ending at the chain's end.
+/// Census name `compact-tasks`, filled while serving. Unit: tasks per cell.
+/// Owner and crossing: [`TIER_MAINT_NAMESPACES`]'s.
+pub const COMPACT_TASKS: Cap =
+    Cap::entries::<TIER_MAINT_NAMESPACES>("compact-tasks", CapFill::Serving);
+
+/// `shadow` tasks one cell holds (ADR-0177 D2): four shadow reads in flight
+/// per tiered namespace (`inf_store::SHADOW_READS_IN_FLIGHT`), each made by
+/// MAINTAIN under a permit and ending at its read's end. Census name
+/// `shadow-tasks`, filled while serving. Unit: tasks per cell. Owner and
+/// crossing: [`TIER_MAINT_NAMESPACES`]'s.
+pub const SHADOW_TASKS: Cap =
+    Cap::entries::<{ 4 * TIER_MAINT_NAMESPACES }>("shadow-tasks", CapFill::Serving);
+
+const _: () = assert!(
+    inf_store::SHADOW_READS_IN_FLIGHT as u32 * TIER_MAINT_NAMESPACES == SHADOW_TASKS.entries_max(),
+    "the shadow class holds every tiered namespace's reads in flight"
+);
+
+/// The plane's task classes' caps on one cell (ADR-0177 D2): `conn` at the
+/// cell's connection share; the three peer pumps' at `cells − 1`, 1 and 1,
+/// none at one cell; `compact` and `shadow` at their consts.
+pub(crate) struct PlaneTaskCaps {
+    pub(crate) conn: Cap,
+    pub(crate) peers: Option<PeerTaskCaps>,
+    pub(crate) compact: Cap,
+    pub(crate) shadow: Cap,
+}
+
+/// The peer pumps' caps of a cell with peers.
+pub(crate) struct PeerTaskCaps {
+    pub(crate) ns_apply: Cap,
+    pub(crate) owner_pub: Cap,
+    pub(crate) gated: Cap,
+}
+
+/// The caps of a cell holding `conn_share` connection slots of a node of
+/// `cells` cells (ADR-0177 D1: each a derived `Cap` under its ceiling).
+///
+/// # Errors
+/// `CapError::Layout` when the share is 0 or above `CONN_TASKS_MAX`, or the
+/// cells are 0 or above `CELLS_MAX`.
+pub(crate) const fn plane_task_caps(
+    conn_share: u32,
+    cells: u16,
+) -> Result<PlaneTaskCaps, CapError> {
+    let conn = match Cap::derived(&CONN_TASKS, conn_share) {
+        Ok(conn) => conn,
+        Err(refused) => return Err(refused),
+    };
+    let peers = match cells {
+        0 => return Err(CapError::Layout),
+        1 => None,
+        cells => {
+            let ns_apply = match Cap::derived(&NS_APPLY_TASKS, cells as u32 - 1) {
+                Ok(cap) => cap,
+                Err(refused) => return Err(refused),
+            };
+            Some(PeerTaskCaps { ns_apply, owner_pub: OWNER_PUB_TASKS, gated: GATED_TASKS })
+        }
+    };
+    Ok(PlaneTaskCaps { conn, peers, compact: COMPACT_TASKS, shadow: SHADOW_TASKS })
+}
+
 /// Verdicts the `gated` task publishes in one poll (ADR-0177 D3). Unit:
 /// replies per poll. Owner: the `gated` task, inside a poll, so charged to
 /// Foreground. Crossing: the task yields and is polled again in ready

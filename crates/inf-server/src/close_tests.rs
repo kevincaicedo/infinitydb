@@ -108,7 +108,7 @@ struct Rig {
 impl Rig {
     fn admitted() -> Rig {
         let fabric = Mesh::new(1, MeshConfig::default()).into_iter().next().expect("one cell");
-        let (mut plane, serve_mark, timer_set) = ServerPlane::new(
+        let (mut plane, serve_mark, timer_set, executor) = ServerPlane::new(
             CellId(0),
             1,
             -1,
@@ -126,6 +126,7 @@ impl Rig {
             LoopConfig::default(),
             serve_mark,
             timer_set,
+            executor,
         );
         reactor.driver().script.borrow_mut().deliver.push(Delivery::Accepted(FD));
         for _ in 0..2 {
@@ -339,7 +340,7 @@ fn client_slot<R>(node: &Node, cell: usize, read: impl Fn(&Conn) -> R) -> R {
 fn assert_error_met_owed(node: &Node, cell: usize) {
     assert!(client_slot(node, cell, |conn| conn.close_after_flush), "engagement: the error parsed");
     assert!(
-        client_slot(node, cell, |conn| conn.pump_active),
+        client_slot(node, cell, |conn| !conn.pump_parked),
         "engagement: the pump owed a reply when PARSE met the error"
     );
 }
@@ -408,7 +409,7 @@ fn protocol_error_with_nothing_owed_answers_at_once() {
     node.send(0, CLIENT, MALFORMED);
     node.rounds(1);
     assert!(client_slot(&node, 0, |conn| conn.close_after_flush), "engagement: the error parsed");
-    assert!(!client_slot(&node, 0, |conn| conn.pump_active), "engagement: nothing was owed");
+    assert!(client_slot(&node, 0, |conn| conn.pump_parked), "engagement: nothing was owed");
     node.rounds(4);
     assert!(node.closed(0).contains(&CLIENT), "the protocol error closes the connection");
     assert_eq!(written_text(&node, 0), PROTOCOL_ERROR, "the error alone, then the close");

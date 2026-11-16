@@ -15,9 +15,9 @@ use crate::limits::GATED_REPLIES_PER_POLL;
 /// in that order — a suspended cold read (tiered) or a staging park
 /// (flat under pressure, ADR-0083 D1) holds the queue behind it, which
 /// is exactly what preserves the origin's per-connection command
-/// ordering. Deactivates when its
-/// queue drains (the flag and the emptiness check share one borrow, so
-/// a concurrent enqueue always observes a live pump or respawns one).
+/// ordering. Made at plane start and never ending (ADR-0177 D2): it parks
+/// when its queue drains (the flag and the emptiness check share one
+/// borrow, so an enqueue after it always finds the flag and wakes it).
 pub(super) async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: Rc<Shared<O, F>>,
     origin: u16,
@@ -28,11 +28,14 @@ pub(super) async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clo
             let mut queues = shared.ns_applies.borrow_mut();
             let item = queues.pop_front(from, &shared.node);
             if item.is_none() {
-                shared.ns_pump_active.borrow_mut()[usize::from(origin)] = false;
+                shared.ns_pump_parked.borrow_mut()[usize::from(origin)] = true;
             }
             item
         };
-        let Some(item) = next else { return };
+        let Some(item) = next else {
+            park().await;
+            continue;
+        };
         apply_parked(&shared, from, &item).await;
         shared.recycle_cmd_buf(item.args.into_buf());
     }
@@ -189,10 +192,10 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
 /// order and the origins in rotation, at most `GATED_REPLIES_PER_POLL` a
 /// poll, then yields; with verdicts above the watermark it awaits the
 /// smallest of them (a later fill only adds a larger `seq`, its effect
-/// having run after); with none it ends, and FABRIC-IN makes it again when
-/// a verdict waits. ADR-0015 D6: the client-visible ack never precedes
-/// this cell's fsync. One task holds one watermark wait, never one a
-/// verdict.
+/// having run after); with none it parks, and FABRIC-IN wakes it when a
+/// verdict waits. Made at plane start, it never ends (ADR-0177 D2).
+/// ADR-0015 D6: the client-visible ack never precedes this cell's fsync.
+/// One task holds one watermark wait, never one a verdict.
 pub(super) async fn gated_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: Rc<Shared<O, F>>,
 ) {
@@ -206,8 +209,9 @@ pub(super) async fn gated_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone 
                 !shared.gated.borrow().waits(),
                 "a gated verdict implies a durable plane"
             );
-            shared.gated_pump_active.set(false);
-            return;
+            shared.gated_pump_parked.set(true);
+            park().await;
+            continue;
         };
         let (published, pending) = {
             let mut gated = shared.gated.borrow_mut();
@@ -221,8 +225,9 @@ pub(super) async fn gated_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone 
             continue;
         }
         let Some(seq) = pending else {
-            shared.gated_pump_active.set(false);
-            return;
+            shared.gated_pump_parked.set(true);
+            park().await;
+            continue;
         };
         let wait = shared.durable.borrow().as_ref().map(|durable| durable.ack_gate.waiter(seq));
         if let Some(wait) = wait {

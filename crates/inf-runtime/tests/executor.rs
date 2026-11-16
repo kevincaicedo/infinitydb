@@ -10,14 +10,17 @@ use std::task::{Context, Poll, Waker};
 
 use inf_runtime::gate::{KeyedGate, ListWait};
 use inf_runtime::{
-    CellExecutor, CompletionToken, FabricGate, IoGate, PollImmediate, TokenClass, WaitList,
-    WatermarkGate,
+    CompletionToken, FabricGate, IoGate, PollImmediate, TokenClass, WaitList, WatermarkGate,
 };
 use proptest::prelude::*;
 
+#[path = "support/tasks.rs"]
+mod tasks;
+use tasks::TestExecutor;
+
 #[test]
 fn ready_future_never_allocates_a_task_slot() {
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
     let hits = Rc::new(RefCell::new(0));
     for _ in 0..100 {
         let hits = Rc::clone(&hits);
@@ -32,7 +35,7 @@ fn ready_future_never_allocates_a_task_slot() {
 
 #[test]
 fn suspended_future_promotes_resumes_and_frees() {
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
     let gate: FabricGate<u64> = FabricGate::new();
     let seen = Rc::new(RefCell::new(Vec::new()));
 
@@ -58,7 +61,7 @@ fn suspended_future_promotes_resumes_and_frees() {
 
 #[test]
 fn delivery_before_first_poll_keeps_the_fast_path() {
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
     let gate: FabricGate<&'static str> = FabricGate::new();
     let waiter = gate.waiter(1);
     // Reply lands before the future ever polls (same-iteration delivery).
@@ -75,7 +78,7 @@ fn delivery_before_first_poll_keeps_the_fast_path() {
 
 #[test]
 fn spawn_local_runs_under_budget() {
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
     let ran = Rc::new(RefCell::new(0));
     for _ in 0..10 {
         let ran = Rc::clone(&ran);
@@ -109,7 +112,7 @@ impl Future for YieldOnce {
 
 #[test]
 fn wake_during_poll_requeues_without_losing_the_task() {
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
     let done = Rc::new(RefCell::new(false));
     let flag = Rc::clone(&done);
     let outcome = ex.poll_immediate(async move {
@@ -137,7 +140,7 @@ impl Future for WakerThief {
 
 #[test]
 fn escaped_waker_clone_on_fast_path_is_harmless() {
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
     let stolen = Rc::new(RefCell::new(None));
     let outcome = ex.poll_immediate(WakerThief(Rc::clone(&stolen)));
     assert_eq!(outcome, PollImmediate::Completed);
@@ -149,7 +152,7 @@ fn escaped_waker_clone_on_fast_path_is_harmless() {
 
 #[test]
 fn io_gate_routes_by_completion_token() {
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
     let gate = IoGate::new();
     let token = CompletionToken::new(TokenClass::Recv, 3, 9);
     let waiter = gate.waiter(token);
@@ -168,7 +171,7 @@ fn io_gate_routes_by_completion_token() {
 
 #[test]
 fn waitlist_is_fifo_and_wake_one_wakes_exactly_one() {
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
     let list: WaitList<u32> = WaitList::new();
     let order = Rc::new(RefCell::new(Vec::new()));
     for i in 0..3u32 {
@@ -233,7 +236,7 @@ fn waitlist_any_waiting_is_true_exactly_when_a_live_waiter_is_queued() {
 
 #[test]
 fn watermark_gate_wakes_at_or_below() {
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
     let gate = WatermarkGate::new();
     let acked = Rc::new(RefCell::new(Vec::new()));
     for lsn in [5u64, 10, 15] {
@@ -289,7 +292,7 @@ proptest! {
         schedule in proptest::collection::vec(proptest::option::of(0usize..24), 1..96),
         budget in 1usize..8,
     ) {
-        let mut ex = CellExecutor::new(32);
+        let mut ex = TestExecutor::new();
         let gate: KeyedGate<u64, u64> = KeyedGate::new();
         let done: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -333,7 +336,7 @@ proptest! {
     /// zero and scratch reuse never corrupts a live future.
     #[test]
     fn mixed_fast_and_slow_paths_reconcile(ops in proptest::collection::vec(0u8..4, 1..200)) {
-        let mut ex = CellExecutor::new(32);
+        let mut ex = TestExecutor::new();
         let gate: KeyedGate<u64, ()> = KeyedGate::new();
         let mut next_key = 0u64;
         let mut open = Vec::new();

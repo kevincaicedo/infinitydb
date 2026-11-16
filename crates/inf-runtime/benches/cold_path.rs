@@ -722,7 +722,8 @@ fn drive_loop<const NOPS: u8, P: CellPlane>(ops: u64, mut plane: P, turns: Turns
     let config = LoopConfig { spin_iters: u32::MAX, ..LoopConfig::default() };
     let pool = BufferPool::new(1, 1024);
     let clock = VirtualClock::new(Nanos(1));
-    let mut lp = CellLoop::new(IdleDriver, clock, pool, config, serve_mark, timers);
+    let executor = inf_runtime::ExecutorLayout::new(&census).build().expect("no class");
+    let mut lp = CellLoop::new(IdleDriver, clock, pool, config, serve_mark, timers, executor);
     let lp = black_box(&mut lp);
     let mut accumulator = 0u64;
     for _ in 0..ops {

@@ -1435,20 +1435,21 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         };
         // A refused timer assembly ends the run with its text, never a
         // derived `Debug`: the text carries the refusal's token.
-        let (plane, serve_mark, timer_set) = ServerPlane::<_, inf_server::StdSegmentFs>::new(
-            CellId(i as u16),
-            scenario.cells,
-            listener_fd(i as u16),
-            seed,
-            fabric,
-            node,
-            oracle.clone(),
-            false,
-        )
-        .unwrap_or_else(|refused| panic!("cell {i}'s assembly refused: {refused}"));
+        let (plane, serve_mark, timer_set, executor) =
+            ServerPlane::<_, inf_server::StdSegmentFs>::new(
+                CellId(i as u16),
+                scenario.cells,
+                listener_fd(i as u16),
+                seed,
+                fabric,
+                node,
+                oracle.clone(),
+                false,
+            )
+            .unwrap_or_else(|refused| panic!("cell {i}'s assembly refused: {refused}"));
         let config = LoopConfig { spin_iters: 4, ..Default::default() };
         let cell_loop =
-            CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark, timer_set);
+            CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark, timer_set, executor);
         nets.push(net);
         cells.push((cell_loop, plane));
     }

@@ -54,7 +54,7 @@ impl BackendDriver for Idle {
 /// One serving cell: its loop, its plane and the test's own census handle.
 fn serving_cell() -> (CellLoop<Idle, VirtualClock>, ServerPlane, Rc<CapCensus>) {
     let fabric = Mesh::new(1, MeshConfig::default()).into_iter().next().expect("one cell");
-    let (mut plane, serve_mark, timer_set) = ServerPlane::new(
+    let (mut plane, serve_mark, timer_set, executor) = ServerPlane::new(
         CellId(0),
         1,
         -1,
@@ -73,6 +73,7 @@ fn serving_cell() -> (CellLoop<Idle, VirtualClock>, ServerPlane, Rc<CapCensus>) 
         LoopConfig::default(),
         serve_mark,
         timer_set,
+        executor,
     );
     reactor.run_iteration(&mut plane).expect("the idle driver never fails");
     assert_eq!(census.phase(), CensusPhase::Serving, "the first iteration took the mark");

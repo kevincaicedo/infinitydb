@@ -208,16 +208,19 @@ async fn send_sub_delta<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     }
 }
 
-/// Close-path subscription cleanup: ships the 1→0 deltas and consumes the
-/// acks (nothing awaits them, but every fabric op replies — credit and
-/// orphan-tripwire hygiene).
+/// A closed connection's cell-level 1→0 transitions: kind, name and delta.
+pub(super) type SubNotes = Vec<(SubKind, Vec<u8>, i32)>;
+
+/// Close-path subscription cleanup, on the closed connection's own pump:
+/// ships the 1→0 deltas and consumes the acks (nothing awaits them, but
+/// every fabric op replies — credit and orphan-tripwire hygiene).
 pub(super) async fn flush_sub_deltas<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: Rc<Shared<O, F>>,
-    notes: Vec<(SubKind, Vec<u8>, i32)>,
+    shared: &Rc<Shared<O, F>>,
+    notes: SubNotes,
 ) {
     let mut waiters = Vec::new();
     for (kind, name, delta) in &notes {
-        send_sub_delta(&shared, *kind, name, *delta, &mut waiters).await;
+        send_sub_delta(shared, *kind, name, *delta, &mut waiters).await;
     }
     for waiter in waiters {
         let _ = waiter.await;
@@ -233,7 +236,7 @@ pub(super) fn unsubscribe_closed_conn<
     shared: &Rc<Shared<O, F>>,
     key: ConnKey,
     cx: &ConnCx,
-) -> Vec<(SubKind, Vec<u8>, i32)> {
+) -> SubNotes {
     let mut notes = Vec::new();
     let mut ps = shared.pubsub.borrow_mut();
     for channel in &cx.sub_channels {
@@ -267,17 +270,20 @@ pub(super) fn unsubscribe_closed_conn<
 pub(super) async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: Rc<Shared<O, F>>,
 ) {
-    // One pump runs at a time (`pub_pump_active`), so it finds the reserve.
+    // The cell's one owner pump, made at plane start and never ending,
+    // takes the reserve at its first poll and holds it across every park
+    // (ADR-0192 D3: the owner pump holds it while it runs).
     let mut reserve = shared.fan_reserve.take();
-    debug_assert!(reserve.is_some(), "the running owner pump holds the cell's fan reserve");
+    debug_assert!(reserve.is_some(), "the cell's one owner pump holds its fan reserve");
     loop {
         // The origins in rotation, each one's publishes in arrival order.
-        let Some((origin, item)) = shared.owner_pubs.borrow_mut().pop_rotating(&shared.node) else {
-            // Put back in the step that clears the flag, no await between,
-            // so the pump the next drain spawns finds it.
-            shared.fan_reserve.set(reserve);
-            shared.pub_pump_active.set(false);
-            return;
+        let next = shared.owner_pubs.borrow_mut().pop_rotating(&shared.node);
+        let Some((origin, item)) = next else {
+            // Parked in the step that read every origin empty:
+            // FABRIC-IN wakes it when it queues a publish.
+            shared.pub_pump_parked.set(true);
+            park().await;
+            continue;
         };
         let (mut total, _) = deliver_local(&shared, item.channel(), item.payload(), None);
         let mut fold = |outcome: OwnedOutcome| {

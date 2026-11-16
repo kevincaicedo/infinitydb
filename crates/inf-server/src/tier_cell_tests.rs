@@ -906,7 +906,7 @@ fn a_stalled_writer_is_woken_at_a_visit_whose_plan_is_refused() {
     let parked = cell.nth(0).stall_waiters.wait(());
     assert!(cell.nth(0).stall_waiters.any_waiting(), "engagement: a writer is parked");
     inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
-    let visited = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0);
+    let visited = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, true);
     let mut ops = Vec::new();
     let planned = cell.turn(&mut ks, 0, &mut ops, &mut NoBudget);
     inf_foundation::fault::disarm_all();
@@ -1305,7 +1305,7 @@ fn tick_marks(class_of: fn(u64, u64) -> AckClass, ticks: u64) -> (TierCell<MemFs
             .stage_wal(&mut ring, &inf_log::MutationEffect::Delete { ns: NsId(16), key: b"k" })
             .expect("room");
         let durable = HeldWatermark { staged, class_of };
-        cell.maintain_ns(&mut ks, 0, Some(&durable), false, staged).expect("maintain");
+        cell.maintain_ns(&mut ks, 0, Some(&durable), false, staged, true).expect("maintain");
     }
     let marks = cell.nth(0).epoch_marks.len();
     (cell, marks)
@@ -1642,14 +1642,14 @@ fn on_disk(cell: &TierCell<SimDisk>, path: &std::path::Path) -> bool {
 fn a_failed_unlink_is_retried_until_the_file_is_gone() {
     let (mut cell, mut ks, paths) = retired_files(1);
     inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
-    let first = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0).map(|_| ());
+    let first = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, true).map(|_| ());
     let fired = inf_foundation::fault::fired(inf_log::fault::TIER_UNLINK_FAIL);
     inf_foundation::fault::disarm_all();
     assert!(first.is_ok(), "a failed unlink is not fatal");
     assert_eq!(fired, 1, "engagement: the unlink failed once");
     assert!(on_disk(&cell, &paths[0]), "engagement: the failed unlink left the file");
     for turn in 1..=8u64 {
-        cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, turn * 2_000).expect("MAINTAIN");
+        cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, turn * 2_000, true).expect("MAINTAIN");
     }
     assert!(
         !on_disk(&cell, &paths[0]),
@@ -1684,7 +1684,7 @@ fn a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four() {
             cold.enqueue(-1, file, 0, inf_log::TIER_FRAME_BYTES, class, 0).expect("queued")
         })
         .collect();
-    let (units, _) = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0).expect("MAINTAIN");
+    let (units, _) = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, true).expect("MAINTAIN");
     let pinned_left = paths[..PINNED as usize].iter().filter(|path| on_disk(&cell, path)).count();
     let last_unlinked = !on_disk(&cell, &paths[PINNED as usize]);
     drop(waits);
@@ -1711,7 +1711,7 @@ fn a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four() {
             closes and unlinks it"]
 fn the_cell_leaves_tier_file_unlinks_to_the_control_thread() {
     let (mut cell, mut ks, paths) = retired_files(1);
-    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0).expect("MAINTAIN");
+    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, true).expect("MAINTAIN");
     let retired_unlinked = !on_disk(&cell, &paths[0]);
     let (mut cell, _ks, _) = flushed_namespace();
     let active = cell.nth(0).flush.active().map(|(.., path)| path.to_path_buf());
@@ -1782,16 +1782,16 @@ fn same_numbered_retired_files(id: u32) -> (TierCell<SimDisk>, Keyspace, [PathBu
 fn a_cold_read_defers_only_its_own_namespaces_file() {
     const FILE: u32 = 3;
     let (mut cell, mut ks, _) = same_numbered_retired_files(FILE);
-    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0).expect("MAINTAIN");
+    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0, true).expect("MAINTAIN");
     assert!(cell.nth(1).retired.is_empty(), "the control: 17's file 3 retires unread");
     let (mut cell, mut ks, paths) = same_numbered_retired_files(FILE);
     let cold = cell.cold.clone().expect("the cell's cold engine");
     let class = inf_runtime::ReadClass::Foreground;
     let file = TierFileId::new(FILE);
     let wait = cold.enqueue(-1, file, 0, TIER_FRAME_BYTES, class, 0).expect("the read queued");
-    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0).expect("MAINTAIN");
+    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, true).expect("MAINTAIN");
     let own_kept = cell.nth(0).retired.len();
-    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0).expect("MAINTAIN");
+    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0, true).expect("MAINTAIN");
     let other_kept = cell.nth(1).retired.len();
     drop(wait);
     assert_eq!(own_kept, 1, "engagement: the read keeps namespace 16's file 3 retiring");

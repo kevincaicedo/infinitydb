@@ -50,6 +50,7 @@ fn cell(
         },
         serve_mark,
         timer_set,
+        support::loop_executor(&census),
     );
     // A 64 KiB ring, or one segment's worth on smaller segments: a frame
     // the ring seals always fits a segment (the harness rule, ADR-0191).
@@ -241,6 +242,7 @@ fn four_frames_in_flight_pipeline_rotates_drained_and_replays_identically() {
         },
         serve_mark,
         timer_set,
+        support::loop_executor(&census),
     );
     // Four frames in flight, each buffer one 8 KiB segment's worth.
     let staging = StagingConfig { capacity_bytes: 8 << 10, frames_in_flight: 4 };

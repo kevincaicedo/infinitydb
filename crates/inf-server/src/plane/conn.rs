@@ -150,21 +150,27 @@ impl<T> Default for ConnSlab<T> {
 }
 
 impl<T> ConnSlab<T> {
-    /// Admits `conn` into a free or fresh slot; `None` when every slot
-    /// below the cap is live — the admission bound (batch 12 of the
-    /// 2026-08-30 review): before it, the 2^24-th concurrent connection
-    /// on a cell was a release assert, i.e. a client-driven node kill.
-    pub(super) fn insert(&mut self, conn: T) -> Option<ConnKey> {
-        if let Some(slot) = self.free.pop() {
-            self.live += 1;
-            self.slots[slot as usize] = Some(conn);
-            return Some(ConnKey { slot, generation: self.gens[slot as usize] });
+    /// Admits the connection `make` builds from its own key, so whatever serves the key (its
+    /// pump) is made in the step that installs it; `None` when every slot below the cap is
+    /// live (the admission bound: a 2^24-th connection on a cell is refused, never a release
+    /// assert), and `make` is not called.
+    pub(super) fn insert_with(&mut self, make: impl FnOnce(ConnKey) -> T) -> Option<ConnKey> {
+        let key = match self.free.last() {
+            Some(&slot) => ConnKey { slot, generation: self.gens[slot as usize] },
+            None => {
+                let slot = u32::try_from(self.slots.len()).ok().filter(|&slot| slot < self.cap)?;
+                ConnKey { slot, generation: 0 }
+            }
+        };
+        let conn = make(key);
+        if self.free.pop().is_some() {
+            self.slots[key.slot as usize] = Some(conn);
+        } else {
+            self.slots.push(Some(conn));
+            self.gens.push(0);
         }
-        let slot = u32::try_from(self.slots.len()).ok().filter(|&slot| slot < self.cap)?;
         self.live += 1;
-        self.slots.push(Some(conn));
-        self.gens.push(0);
-        Some(ConnKey { slot, generation: 0 })
+        Some(key)
     }
 
     pub(super) fn get_mut(&mut self, key: ConnKey) -> Option<&mut T> {
@@ -208,26 +214,33 @@ impl<T> ConnSlab<T> {
 mod conn_slab_tests {
     use super::{CONN_SLOT_CAP, ConnKey, ConnSlab};
 
-    /// Batch 12 of the 2026-08-30 review: the slab refuses the accept
-    /// past its cap instead of asserting (the 2^24-th connection was a
-    /// release `assert!` — a client-driven node kill). A tiny cap stands
-    /// in for `CONN_SLOT_CAP`; the arithmetic is the same.
+    /// The slab refuses the accept past its cap instead of asserting, and
+    /// `make` runs only for a slot it grants, with that slot's key. A tiny
+    /// cap stands in for `CONN_SLOT_CAP`; the arithmetic is the same.
     #[test]
     fn slab_refuses_past_the_cap_and_readmits_on_release() {
-        let mut slab: ConnSlab<u8> = ConnSlab { cap: 3, ..ConnSlab::default() };
-        let a = slab.insert(1).expect("slot 0");
-        let b = slab.insert(2).expect("slot 1");
-        let c = slab.insert(3).expect("slot 2");
+        let mut slab: ConnSlab<u32> = ConnSlab { cap: 3, ..ConnSlab::default() };
+        let keyed = |slab: &mut ConnSlab<u32>, value: u32| {
+            slab.insert_with(|key| {
+                assert_eq!(key.generation, if value == 5 { 1 } else { 0 }, "make sees its key");
+                value
+            })
+        };
+        let a = keyed(&mut slab, 1).expect("slot 0");
+        let b = keyed(&mut slab, 2).expect("slot 1");
+        let c = keyed(&mut slab, 3).expect("slot 2");
         assert_eq!((a.slot, b.slot, c.slot), (0, 1, 2));
         assert_eq!(slab.live, 3);
-        assert!(slab.insert(4).is_none(), "the cap refuses, never panics");
+        let refused = slab.insert_with(|_| panic!("a refused accept builds nothing"));
+        assert!(refused.is_none(), "the cap refuses, never panics");
         assert_eq!(slab.live, 3, "a refused accept is not live");
         assert_eq!(slab.remove(b), Some(2));
-        let reused = slab.insert(5).expect("released slot readmits");
+        let reused = keyed(&mut slab, 5).expect("released slot readmits");
         assert_eq!(reused.slot, 1);
         assert_eq!(reused.generation, 1, "the generation moved so the old key is dead");
         assert!(slab.get_mut(b).is_none());
-        assert!(slab.insert(6).is_none());
+        assert_eq!(slab.get_mut(reused).copied(), Some(5));
+        assert!(keyed(&mut slab, 6).is_none());
     }
 
     #[test]

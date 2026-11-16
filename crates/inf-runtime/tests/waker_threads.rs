@@ -23,7 +23,11 @@ use std::sync::{Arc, Barrier, mpsc};
 use std::task::{Context, Poll, Waker};
 
 use inf_alloc::CountingAllocator;
-use inf_runtime::{CellExecutor, PollImmediate};
+use inf_runtime::PollImmediate;
+
+#[path = "support/tasks.rs"]
+mod tasks;
+use tasks::TestExecutor;
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator::new();
@@ -54,10 +58,10 @@ impl Future for ExportWaker {
 }
 
 /// An executor holding one parked `ExportWaker` task, its poll count and the waker it exported.
-fn parked_task() -> (CellExecutor, Rc<Cell<u32>>, Waker) {
+fn parked_task() -> (TestExecutor, Rc<Cell<u32>>, Waker) {
     let (to, from) = mpsc::channel();
     let polls = Rc::new(Cell::new(0));
-    let mut executor = CellExecutor::new(1);
+    let mut executor = TestExecutor::new();
     let outcome = executor.poll_immediate(ExportWaker { to: Some(to), polls: Rc::clone(&polls) });
     assert!(matches!(outcome, PollImmediate::Suspended(_)), "the task parks on its first poll");
     let waker = from.recv().expect("the first poll exports its waker");
@@ -149,7 +153,7 @@ impl<F: FnMut(&Waker) + Unpin> Future for ReadyAfter<F> {
 /// spare would be reused under it.
 #[test]
 fn a_foreign_clone_keeps_a_finished_tasks_header() {
-    let mut executor = CellExecutor::new(1);
+    let mut executor = TestExecutor::new();
     let kept: Rc<RefCell<Option<ManuallyDrop<Waker>>>> = Rc::default();
     let keep = Rc::clone(&kept);
     let outcome = executor.poll_immediate(ReadyAfter {
@@ -188,7 +192,7 @@ impl Future for CountPolls {
 /// would hand the wake to the next task, which would then be polled twice.
 #[test]
 fn a_foreign_wake_queued_for_a_finished_task_never_polls_the_next() {
-    let mut executor = CellExecutor::new(2);
+    let mut executor = TestExecutor::new();
     let outcome = executor.poll_immediate(ReadyAfter {
         during: |waker: &Waker| {
             std::thread::scope(|scope| {
@@ -223,7 +227,7 @@ impl Future for UntilDone {
 }
 
 /// A parked `UntilDone` task, its flags and the waker its first poll's view cloned.
-fn parked_until_done(executor: &mut CellExecutor) -> (Rc<Cell<bool>>, Rc<Cell<u32>>, Waker) {
+fn parked_until_done(executor: &mut TestExecutor) -> (Rc<Cell<bool>>, Rc<Cell<u32>>, Waker) {
     let done = Rc::new(Cell::new(false));
     let polls = Rc::new(Cell::new(0));
     let (to, from) = mpsc::channel();
@@ -258,7 +262,7 @@ impl<F: Future<Output = ()> + Unpin> Future for ExportFirst<F> {
 /// at its release, on the owner thread, once.
 #[test]
 fn clone_and_drop_churn_across_threads_counts_exactly() {
-    let mut executor = CellExecutor::new(1);
+    let mut executor = TestExecutor::new();
     let (done, polls, waker) = parked_until_done(&mut executor);
     let made_here: Vec<Waker> = (0..CHURN).map(|_| waker.clone()).collect();
     std::thread::spawn(move || drop(made_here)).join().expect("the other thread drops them");
@@ -287,7 +291,7 @@ fn clone_and_drop_churn_across_threads_counts_exactly() {
 /// drains the wake and polls the task, so the wake is not lost.
 #[test]
 fn a_foreign_wake_during_a_pending_poll_is_polled_at_the_next_run_ready() {
-    let mut executor = CellExecutor::new(1);
+    let mut executor = TestExecutor::new();
     let polls = Rc::new(Cell::new(0));
     let counted = Rc::clone(&polls);
     let outcome = executor.poll_immediate(core::future::poll_fn(move |cx| {
@@ -349,9 +353,12 @@ impl Drop for KeepsOwnClone {
 /// same, and the executor's drop returns everything it allocated.
 #[test]
 fn a_future_that_keeps_its_own_waker_clone_is_freed_once() {
-    let block = u64::try_from(size_of::<KeepsOwnClone>()).expect("a size");
+    // The future's block: the test class's box of it, and the box's pointer where the task's
+    // storage holds it.
+    let block =
+        u64::try_from(size_of::<KeepsOwnClone>() + size_of::<tasks::Boxed>()).expect("a size");
     // Leg 1: released by run_ready.
-    let mut executor = CellExecutor::new(1);
+    let mut executor = TestExecutor::new();
     executor.spawn_local(KeepsOwnClone { own: None, finish: true, polls: 0 });
     assert_eq!(executor.run_ready(1), 1, "the first poll keeps the clone and requeues");
     let before = ALLOC.thread_freed_bytes();
@@ -366,7 +373,7 @@ fn a_future_that_keeps_its_own_waker_clone_is_freed_once() {
     // Leg 2: dropped by the executor's drop, still pending.
     let allocated = ALLOC.thread_bytes();
     let freed = ALLOC.thread_freed_bytes();
-    let mut executor = CellExecutor::new(1);
+    let mut executor = TestExecutor::new();
     executor.spawn_local(KeepsOwnClone { own: None, finish: false, polls: 0 });
     assert_eq!(executor.run_ready(1), 1, "the first poll keeps the clone and parks");
     let made = ALLOC.thread_bytes() - allocated;
@@ -396,7 +403,7 @@ fn two_executors_on_one_thread_both_take_the_owner_lane() {
 }
 
 /// Exports clones of its waker into `keeper` and completes on its first poll: its header is Held.
-fn finish_keeping_a_clone(executor: &mut CellExecutor, keeper: &Rc<RefCell<Vec<Waker>>>) {
+fn finish_keeping_a_clone(executor: &mut TestExecutor, keeper: &Rc<RefCell<Vec<Waker>>>) {
     let keep = Rc::clone(keeper);
     let outcome = executor.poll_immediate(ReadyAfter {
         during: move |waker: &Waker| keep.borrow_mut().push(waker.clone()),
@@ -427,7 +434,7 @@ fn drop_the_head_inside_a_poll(
 #[test]
 fn a_waker_dropped_during_another_tasks_poll_frees_the_first_held_header() {
     for by_run_ready in [true, false] {
-        let mut executor = CellExecutor::new(4);
+        let mut executor = TestExecutor::new();
         let keeper: Rc<RefCell<Vec<Waker>>> = Rc::default();
         finish_keeping_a_clone(&mut executor, &keeper);
         finish_keeping_a_clone(&mut executor, &keeper);

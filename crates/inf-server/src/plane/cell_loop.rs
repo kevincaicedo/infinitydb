@@ -55,6 +55,39 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// iteration with nothing ready builds no turn. Out of line, so a cell
     /// with no cold engine carries none of it in its iteration
     /// (`inf-runtime`'s `cold_path` bench, its server-shaped reactor legs).
+    /// Wakes each parked peer pump whose queue FABRIC-IN filled (ADR-0177
+    /// D2): the flag clears in the step that wakes, and the pump reads
+    /// its queue in the poll that follows, so no wake is lost. Owner-side
+    /// `always` applies (ADR-0015 D6): the fabric reply is deferred, and the
+    /// cell's one `gated` task publishes every reply the watermark covers
+    /// (flushed by the next FABRIC-OUT). Tiered and paced applies run on
+    /// each origin's FIFO pump; fabric-origin `PUBLISH`es fan out on the
+    /// owner pump, one long-lived task over the origins' FIFOs.
+    fn wake_peer_pumps(&self, cx: &mut LoopCx<'_>) {
+        let Some(Some(pumps)) = self.shared.peer_pumps.get() else {
+            return;
+        };
+        if self.shared.gated_pump_parked.get() && self.shared.gated.borrow().waits() {
+            self.shared.gated_pump_parked.set(false);
+            let _ = cx.executor.wake(pumps.gated);
+        }
+        {
+            let queues = self.shared.ns_applies.borrow();
+            if queues.waits() {
+                let mut parked = self.shared.ns_pump_parked.borrow_mut();
+                for origin in queues.origins_waiting() {
+                    if core::mem::replace(&mut parked[usize::from(origin.0)], false) {
+                        let _ = cx.executor.wake(pumps.ns_apply(self.shared.cell, origin));
+                    }
+                }
+            }
+        }
+        if self.shared.pub_pump_parked.get() && self.shared.owner_pubs.borrow().waits() {
+            self.shared.pub_pump_parked.set(false);
+            let _ = cx.executor.wake(pumps.owner_pub);
+        }
+    }
+
     #[inline(never)]
     fn deliver_cold(&self, cx: &mut LoopCx<'_>) {
         let cold = self.shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
@@ -106,13 +139,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     self.shared.node.clients.borrow_mut().unregister(conn.cx.id);
                 }
                 // Pub/sub cleanup (M1-S10): drop the connection from the
-                // local registries; 1→0 transitions notify the channel
-                // owners / every cell (patterns) off the close path.
+                // local registries; its pump ships the 1→0 transitions to
+                // the channel owners / every cell (patterns) before it
+                // returns, one task with its own earlier subscribes
+                // (ADR-0177 D2). A parked pump is woken to find its slot
+                // gone; a busy one finds it at its next lookup.
                 if let Some(conn) = removed {
                     let notes = unsubscribe_closed_conn(&self.shared, key, &conn.cx);
                     if !notes.is_empty() {
-                        let shared = Rc::clone(&self.shared);
-                        let _ = cx.executor.poll_immediate(flush_sub_deltas(shared, notes));
+                        self.shared.closed_subs.borrow_mut().push((key, notes));
+                    }
+                    if conn.pump_parked {
+                        let _ = cx.executor.wake(conn.pump);
                     }
                 }
             }
@@ -428,11 +466,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             }
         });
         flush_apply_stage(shared, stage, stage_bytes, scratch, staged);
-        // ADR-0177 D3: a verdict waiting with the `gated` task not running
-        // makes the task, even on a fabric-quiet iteration: an apply pump
-        // fills its verdict in run_ready, not in this drain, and a task
-        // cannot wake another (the lag is this one iteration).
-        let gated_due = !self.shared.gated_pump_active.get() && self.shared.gated.borrow().waits();
+        // ADR-0177 D3: a verdict waiting with the `gated` task parked wakes
+        // the task, even on a fabric-quiet iteration: an apply pump fills
+        // its verdict in run_ready, not in this drain, and a task cannot
+        // wake another (the lag is this one iteration).
+        let gated_due = self.shared.gated_pump_parked.get() && self.shared.gated.borrow().waits();
         if drained == 0 && !gated_due {
             return;
         }
@@ -461,45 +499,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         }
         drop(fabric);
         self.admit_adopted(cx);
-        // Owner-side `always` applies (M2-S08, ADR-0015 D6): the fabric
-        // reply itself is deferred — the cell's one `gated` task awaits
-        // this cell's ack gate, then publishes every reply it covers
-        // (flushed by the next FABRIC-OUT). The client-visible ack never
-        // precedes the owning cell's fsync. Made on demand, as the pumps
-        // below are (ADR-0177 D3); this drain's inline verdicts count too.
-        if !self.shared.gated_pump_active.get() && self.shared.gated.borrow().waits() {
-            self.shared.gated_pump_active.set(true);
-            let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(gated_pump(shared));
-        }
-        // Tiered fabric applies (M4-S26): wake each origin's FIFO pump.
-        let tier_pending: Vec<u16> = {
-            let queues = self.shared.ns_applies.borrow();
-            let active = self.shared.ns_pump_active.borrow();
-            if queues.waits() {
-                queues
-                    .origins_waiting()
-                    .filter(|origin| !active[usize::from(origin.0)])
-                    .map(|origin| origin.0)
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        };
-        for origin in tier_pending {
-            self.shared.ns_pump_active.borrow_mut()[usize::from(origin)] = true;
-            let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(ns_apply_pump(shared, origin));
-        }
-        // Fabric-origin PUBLISHes fan out on this cell's owner pump (one
-        // long-lived future over the origins' FIFOs — each origin's arrival
-        // order is its delivery order). The reply to each publisher ships
-        // when its fan acks return.
-        if !self.shared.pub_pump_active.get() && self.shared.owner_pubs.borrow().waits() {
-            self.shared.pub_pump_active.set(true);
-            let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(owner_pub_pump(shared));
-        }
+        self.wake_peer_pumps(cx);
     }
 
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
@@ -520,10 +520,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         let inbox = core::mem::take(&mut self.inbox);
         for (key, buf, len) in inbox {
             let mut commands: u32 = 0;
-            // First command that must defer to a pump (everything after it
-            // defers too — replies are ordered per connection).
+            // Commands that defer to the connection's pump: the first that
+            // must, and everything after it (replies are ordered per
+            // connection).
             let mut deferred: Vec<OwnedCmd> = Vec::new();
-            let mut spawn_first: Option<OwnedCmd> = None;
+            // The parked pump to wake once the deferred commands are queued.
+            let mut wake_pump: Option<TaskId> = None;
             let mut protocol_error = false;
             let mut quit = false;
             {
@@ -538,7 +540,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 }
                 conn.last_active_ms = cx.now.as_millis();
                 let data = &cx.pool.bytes(buf)[..len as usize];
-                let pump_was_active = conn.pump_active;
+                // While the pump is not parked it owns the connection's
+                // order: every command defers behind what it holds.
+                let pump_busy = !conn.pump_parked;
                 // Field split: the parser iterator borrows `conn.parser`
                 // while execution writes `conn.out`/`conn.cx`.
                 let Conn { parser, cx: conn_cx, out, .. } = &mut *conn;
@@ -585,8 +589,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                             // (M2-S08): durable acks suspend, staging
                             // admission may park, and emission lives there —
                             // one `Option` load on the memory fast path.
-                            let defer = pump_was_active
-                                || spawn_first.is_some()
+                            let defer = pump_busy
                                 || !deferred.is_empty()
                                 || conn_cx.ns.named().is_some()
                                 || conn_cx.ns.unavailable()
@@ -605,11 +608,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 );
                                 let owned =
                                     OwnedCmd::from_argv_into(&argv, self.shared.take_cmd_buf());
-                                if pump_was_active || spawn_first.is_some() {
-                                    deferred.push(owned);
-                                } else {
-                                    spawn_first = Some(owned);
-                                }
+                                deferred.push(owned);
                             } else if stage_enabled && parse_stageable(meta, &argv) {
                                 // M2.5 Phase H (ADR-0029 lever 2): stage the
                                 // fast-path command — flat argv copy + key
@@ -698,19 +697,24 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 if protocol_error || quit {
                     conn.close_after_flush = true;
                 }
+                let queued = !deferred.is_empty();
                 conn.queue.extend(deferred);
                 if conn.queue.len() >= PENDING_HIGH_WATER && !conn.recv_disarmed {
                     conn.recv_disarmed = true;
                     cx.push(IoOp::RecvDisarm { fd: conn.fd });
                 }
-                if spawn_first.is_some() {
-                    conn.pump_active = true;
+                // A command queued for a parked pump wakes it; the flag
+                // clears in this step, and the pump reads its queue in the
+                // poll the wake queues.
+                if queued && conn.pump_parked {
+                    conn.pump_parked = false;
+                    wake_pump = Some(conn.pump);
                 }
             }
             cx.pool.release(buf);
             cx.charge(GroupClass::Foreground, commands);
-            if let Some(first) = spawn_first {
-                self.spawn_pump(cx, key, first);
+            if let Some(pump) = wake_pump {
+                let _ = cx.executor.wake(pump);
             }
         }
         debug_assert!(stage.is_empty(), "parse stage flushed before buffer release");
@@ -862,10 +866,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         token: Self::token(TokenClass::Send, key),
                     });
                 }
+                // The pump parked after reading its queue empty with
+                // nothing pending: every reply it owed is in `out`.
                 if conn.close_after_flush
                     && conn.out.is_empty()
                     && !conn.send_inflight
-                    && !conn.pump_active
+                    && conn.pump_parked
                 {
                     close_now = true;
                 }

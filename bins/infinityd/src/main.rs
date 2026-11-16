@@ -1486,7 +1486,7 @@ fn cell_main(
     mark(15); // setup:plane
     // A refused seed or timer assembly ends the cell's setup before its
     // loop exists, and the cell's thread ends the process with its text.
-    let (mut plane, serve_mark, timer_set) = ServerPlane::new(
+    let (mut plane, serve_mark, timer_set, executor) = ServerPlane::new(
         CellId(cell),
         args.cells.get(),
         listener.into_raw_fd(), // the driver owns the listener fd now
@@ -1544,7 +1544,8 @@ fn cell_main(
         remote_first_execute: args.remote_first_execute,
         ..Default::default()
     };
-    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set);
+    let mut cell_loop =
+        CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set, executor);
 
     mark(16); // setup:loop — the next publish is drive_recovery's phase 1
     let mut iterations: u64 = 0;

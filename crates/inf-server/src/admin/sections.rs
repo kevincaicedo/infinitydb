@@ -500,6 +500,8 @@ fn tripwires_section(
     // conflicts the grant rules make unreachable.
     push(text, &format!("tier_ns_positions:{}", node.tier_ns_positions.get()));
     push(text, &format!("tier_position_conflicts:{}", node.tier_position_conflicts.get()));
+    // MAINTAIN reads its full task class left for a later pass (ADR-0177 D2).
+    push(text, &format!("tier_maint_task_waits:{}", node.tier_maint_task_waits.get()));
     push(text, &format!("loop_snapshot_bytes:{}", node.loop_snapshot.reserved_bytes()));
     text.push_str("\r\n");
 }

@@ -58,8 +58,10 @@ pub(super) enum Popped {
     Cmd(OwnedCmd),
     /// Queue empty but replies are still pending — keep emitting.
     Empty,
-    /// Queue empty, nothing pending (pump deactivated inside the conn
-    /// borrow) or the connection is gone: the pump is done.
+    /// Queue empty and nothing pending: the pump parked itself inside the
+    /// conn borrow, so a command queued after it wakes it by id.
+    Park,
+    /// The connection is gone: the pump ends.
     Finished,
 }
 
@@ -71,7 +73,7 @@ fn pop_or_quiesce<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let Some(next) = shared.with_conn(key, |conn| {
         let next = conn.queue.pop_front();
         if next.is_none() && pending_empty {
-            conn.pump_active = false;
+            conn.pump_parked = true;
         }
         if conn.recv_disarmed && conn.queue.len() <= PENDING_LOW_WATER {
             conn.rearm_recv = true;
@@ -82,7 +84,7 @@ fn pop_or_quiesce<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     };
     match next {
         Some(cmd) => Popped::Cmd(cmd),
-        None if pending_empty => Popped::Finished,
+        None if pending_empty => Popped::Park,
         None => Popped::Empty,
     }
 }
@@ -257,21 +259,41 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     }
 }
 
-/// The per-connection pump: dispatch commands in pipeline order with up to
-/// [`REMOTE_WINDOW`] remote ops in flight, emit replies strictly in command
-/// order. Suspends only on the front reply's gate and on fabric credits;
-/// out-of-order completions park in the gate until their turn.
-#[allow(clippy::disallowed_types, reason = "container: A")]
+/// A connection's pump (ADR-0177 D2): made in the step that admits the
+/// connection, it serves the connection until its slot is gone, then ships
+/// the connection's 1→0 subscription deltas, which `Closed` left it, and
+/// returns, so one task sends the connection's subscribes and their undoing
+/// in order.
 pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: Rc<Shared<O, F>>,
     key: ConnKey,
-    first: OwnedCmd,
 ) {
+    serve_conn(&shared, key).await;
+    let notes = {
+        let mut closed = shared.closed_subs.borrow_mut();
+        closed.iter().position(|(at, _)| *at == key).map(|at| closed.swap_remove(at).1)
+    };
+    if let Some(notes) = notes {
+        flush_sub_deltas(&shared, notes).await;
+    }
+}
+
+/// The pump's serving loop: dispatch commands in pipeline order with up to
+/// [`REMOTE_WINDOW`] remote ops in flight, emit replies strictly in command
+/// order. Suspends on the front reply's gate, on fabric credits, and parked
+/// when the queue is empty with nothing pending; out-of-order completions
+/// park in the gate until their turn. Returns when the connection is gone.
+#[allow(clippy::disallowed_types, reason = "container: A")]
+async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    key: ConnKey,
+) {
+    let shared = Rc::clone(shared);
     let mut pending: VecDeque<PendingReply> = VecDeque::new();
     // Remote ops sent and not yet awaited (Counted holds several).
     let mut inflight: usize = 0;
     // A command held back by the conn-state barrier.
-    let mut held: Option<OwnedCmd> = Some(first);
+    let mut held: Option<OwnedCmd> = None;
     loop {
         // ---- dispatch: fill the window in pipeline order.
         while pending.len() < PENDING_REPLIES_MAX && inflight < REMOTE_WINDOW {
@@ -280,6 +302,10 @@ pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
                 None => match pop_or_quiesce(&shared, key, pending.is_empty()) {
                     Popped::Cmd(cmd) => cmd,
                     Popped::Empty => break,
+                    Popped::Park => {
+                        park().await;
+                        continue;
+                    }
                     Popped::Finished => return,
                 },
             };

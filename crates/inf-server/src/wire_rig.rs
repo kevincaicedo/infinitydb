@@ -176,7 +176,7 @@ impl Rig {
         let fabrics = Mesh::new(cells, MeshConfig::default());
         let built = fabrics.into_iter().enumerate().map(|(cell, fabric)| {
             let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
-            let (plane, serve_mark, timer_set) = ServerPlane::new(
+            let (plane, serve_mark, timer_set, executor) = ServerPlane::new(
                 CellId(u16::try_from(cell).expect("a u16 cell")),
                 cells,
                 -1,
@@ -197,6 +197,7 @@ impl Rig {
                 LoopConfig::default(),
                 serve_mark,
                 timer_set,
+                executor,
             );
             RigCell { reactor, plane, frozen: false }
         });

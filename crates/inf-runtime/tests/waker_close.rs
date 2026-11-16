@@ -18,7 +18,11 @@ use std::task::{Context, Poll, Waker};
 
 use inf_alloc::CountingAllocator;
 use inf_foundation::wake::RemoteStack;
-use inf_runtime::{CellExecutor, PollImmediate};
+use inf_runtime::PollImmediate;
+
+#[path = "support/tasks.rs"]
+mod tasks;
+use tasks::TestExecutor;
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator::new();
@@ -49,7 +53,7 @@ impl Future for Export {
 }
 
 /// Parks one `Export` task on `executor` and returns the waker it exported.
-fn park(executor: &mut CellExecutor, out: &Rc<Cell<Option<Waker>>>) -> Waker {
+fn park(executor: &mut TestExecutor, out: &Rc<Cell<Option<Waker>>>) -> Waker {
     let outcome = executor.poll_immediate(Export { out: Rc::clone(out) });
     assert!(matches!(outcome, PollImmediate::Suspended(_)), "the task parks");
     out.take().expect("the first poll exports its waker")
@@ -61,7 +65,7 @@ fn park(executor: &mut CellExecutor, out: &Rc<Cell<Option<Waker>>>) -> Waker {
 #[test]
 fn a_waker_another_thread_holds_past_the_executor_is_freed_there() {
     let out = Rc::default();
-    let mut executor = CellExecutor::new(1);
+    let mut executor = TestExecutor::new();
     let waker = park(&mut executor, &out);
     let (to, from) = mpsc::sync_channel::<()>(0);
     let holder = std::thread::spawn(move || {
@@ -78,15 +82,17 @@ fn a_waker_another_thread_holds_past_the_executor_is_freed_there() {
 }
 
 /// Builds an executor with two parked tasks, its two exported wakers, and the bytes the build
-/// allocated on this thread (nothing else allocates in the window).
-fn two_parked() -> (CellExecutor, Waker, Waker, u64) {
-    let before = ALLOC.thread_bytes();
+/// retains on this thread: requested less freed, so what the layout's build frees in the
+/// window (its census, its class list) is no part of it (nothing else allocates there).
+fn two_parked() -> (TestExecutor, Waker, Waker, u64) {
+    let (requested, freed) = (ALLOC.thread_bytes(), ALLOC.thread_freed_bytes());
     // Inside the window: the futures hold its `Rc`, which their drop frees.
     let out = Rc::default();
-    let mut executor = CellExecutor::new(2);
+    let mut executor = TestExecutor::new();
     let first = park(&mut executor, &out);
     let second = park(&mut executor, &out);
-    (executor, first, second, ALLOC.thread_bytes() - before)
+    let retained = (ALLOC.thread_bytes() - requested) - (ALLOC.thread_freed_bytes() - freed);
+    (executor, first, second, retained)
 }
 
 /// Two headers closed under wakers the owner thread keeps past the executor's drop, their last
@@ -152,7 +158,7 @@ fn held_past_drop(
     let mut executor = None;
     let mut waker = None;
     let built = kept_across(|| {
-        let mut built = CellExecutor::new(1);
+        let mut built = TestExecutor::new();
         waker = Some(park(&mut built, out));
         executor = Some(built);
     });
@@ -168,7 +174,7 @@ fn held_past_drop(
 /// open: the spare is in the window too.
 fn none_left(out: &Rc<Cell<Option<Waker>>>) -> i128 {
     kept_across(|| {
-        let mut executor = CellExecutor::new(1);
+        let mut executor = TestExecutor::new();
         drop(park(&mut executor, out));
         let outcome = executor.poll_immediate(async {});
         assert_eq!(outcome, PollImmediate::Completed, "a first poll that completes keeps a spare");

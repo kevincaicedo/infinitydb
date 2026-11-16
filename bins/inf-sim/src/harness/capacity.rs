@@ -309,7 +309,7 @@ impl Rig {
                 cfg: StoreConfig { hasher: node_hasher(seed), ..Default::default() },
                 specs: namespaces.to_vec(),
             };
-            let (plane, serve_mark, timer_set) = Plane::new(
+            let (plane, serve_mark, timer_set, executor) = Plane::new(
                 CellId(cell),
                 CELLS,
                 listener_fd(cell),
@@ -323,8 +323,15 @@ impl Rig {
             let config = LoopConfig { spin_iters: 4, ..Default::default() };
             let driver = SimDriver::new(Rc::clone(&net));
             let pool = BufferPool::new(RECV_BUFFERS, RECV_BUFFER_BYTES);
-            let cell_loop =
-                CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark, timer_set);
+            let cell_loop = CellLoop::new(
+                driver,
+                Rc::clone(&clock),
+                pool,
+                config,
+                serve_mark,
+                timer_set,
+                executor,
+            );
             nets.push(net);
             cells.push((cell_loop, plane));
         }

@@ -268,7 +268,7 @@ impl Rig {
             .into_iter()
             .enumerate()
             .map(|(cell, fabric)| {
-                let (plane, _serve_mark, _timer_set) = ServerPlane::new(
+                let (plane, _serve_mark, _timer_set, _executor) = ServerPlane::new(
                     CellId(cell as u16),
                     2,
                     -1,

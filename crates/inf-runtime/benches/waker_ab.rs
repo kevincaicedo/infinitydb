@@ -56,11 +56,39 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use inf_foundation::CellId;
+use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::wake::{RemoteStack, ThreadMark, WakeBridge};
-use inf_runtime::{CellExecutor, FabricGate, PollImmediate};
+use inf_runtime::{
+    CellExecutor, ExecutorLayout, FabricGate, GateWait, PollImmediate, TaskAdmission, TaskClass,
+    TaskFactory,
+};
 
-/// Tasks each leg's executor reserves room for: the rows keep at most one.
-const TASKS: usize = 64;
+/// Tasks each leg's executor holds: the rows keep at most one.
+const TASKS: Cap = Cap::entries::<64>("waker-ab-tasks", CapFill::Serving);
+
+/// An executor of one class, the future `factory` makes, on a census of its own.
+fn executor_of<Args, Fac: TaskFactory<Args>>(factory: &Fac) -> (CellExecutor, TaskClass) {
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let class = layout.class(factory, TASKS).expect("one class");
+    (layout.build().expect("no class refuses"), class)
+}
+
+/// `make`'s future polled once in place as a task of `class`.
+#[inline(always)]
+fn poll_once<F: Future<Output = ()> + 'static>(
+    exec: &mut CellExecutor,
+    class: TaskClass,
+    make: impl FnOnce() -> F,
+) -> PollImmediate {
+    match exec.reserve::<F>(class) {
+        TaskAdmission::Granted(permit) => permit.poll_immediate(make),
+        TaskAdmission::Full | TaskAdmission::Exhausted | TaskAdmission::Foreign => {
+            panic!("the leg's class refused its task")
+        }
+    }
+}
 
 /// Whether the first poll completed the future (true) or parked it (false).
 #[inline(always)]
@@ -194,6 +222,21 @@ fn command(counter: &Cell<u64>) {
     counter.set(counter.get().wrapping_add(1));
 }
 
+/// The parked row's factory: the task itself.
+fn parked(task: Parked) -> Parked {
+    task
+}
+
+/// The fast row's task.
+async fn fast_task(counter: Rc<Cell<u64>>) {
+    command(black_box(&counter));
+}
+
+/// The suspend row's task: it awaits its gate's value and keeps it.
+async fn suspend_task(waiter: GateWait<u64, u64>, sink: Rc<Cell<u64>>) {
+    sink.set(waiter.await);
+}
+
 /// A task that stays Pending, counts its polls and hands a clone of its waker out on its first.
 struct Parked {
     waker: Rc<Cell<Option<Waker>>>,
@@ -221,11 +264,11 @@ struct ParkedCell {
 
 impl ParkedCell {
     fn new() -> Result<ParkedCell, String> {
-        let mut exec = CellExecutor::new(TASKS);
+        let (mut exec, class) = executor_of(&parked);
         let slot = Rc::new(Cell::new(None));
         let polls = Rc::new(Cell::new(0));
         let task = Parked { waker: Rc::clone(&slot), polls: Rc::clone(&polls) };
-        if first_poll_completed(exec.poll_immediate(task)) {
+        if first_poll_completed(poll_once(&mut exec, class, || task)) {
             return Err("the parked task completed on its first poll".into());
         }
         let waker = slot.take().ok_or("the parked task's first poll handed out no waker")?;
@@ -236,15 +279,14 @@ impl ParkedCell {
 /// The fast row's owner: the executor and the counter its command bumps.
 struct FastCell {
     exec: CellExecutor,
+    class: TaskClass,
     counter: Rc<Cell<u64>>,
 }
 
 #[inline(never)]
 fn step_fast(cell: &mut FastCell) -> bool {
     let counter = Rc::clone(&cell.counter);
-    first_poll_completed(cell.exec.poll_immediate(async move {
-        command(black_box(&counter));
-    }))
+    first_poll_completed(poll_once(&mut cell.exec, cell.class, || fast_task(counter)))
 }
 
 #[inline(never)]
@@ -259,6 +301,7 @@ fn step_clone_drop<L: Foreign>(cell: &mut ParkedCell, lane: &mut L) {
 /// The suspend row's owner: the executor, the gate, the next token and the value delivered last.
 struct SuspendCell {
     exec: CellExecutor,
+    class: TaskClass,
     gate: FabricGate<u64>,
     token: u64,
     sink: Rc<Cell<u64>>,
@@ -270,9 +313,8 @@ fn step_suspend<L: Foreign>(cell: &mut SuspendCell, lane: &mut L) -> usize {
     let token = cell.token;
     let waiter = cell.gate.waiter(token);
     let sink = Rc::clone(&cell.sink);
-    let completed = first_poll_completed(cell.exec.poll_immediate(async move {
-        sink.set(waiter.await);
-    }));
+    let completed =
+        first_poll_completed(poll_once(&mut cell.exec, cell.class, || suspend_task(waiter, sink)));
     lane.on_clone();
     black_box(completed);
     cell.gate.complete(token, token);
@@ -301,7 +343,8 @@ fn usize_count(count: usize) -> u64 {
 }
 
 fn drive_fast(ops: u64) -> Result<(), String> {
-    let mut cell = FastCell { exec: CellExecutor::new(TASKS), counter: Rc::new(Cell::new(0)) };
+    let (exec, class) = executor_of(&fast_task);
+    let mut cell = FastCell { exec, class, counter: Rc::new(Cell::new(0)) };
     let mut completed = 0u64;
     for _ in 0..ops {
         completed += u64::from(step_fast(black_box(&mut cell)));
@@ -324,12 +367,9 @@ fn drive_clone_drop<L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
 }
 
 fn drive_suspend<L: Foreign>(ops: u64, per_op: u64) -> Result<(), String> {
-    let mut cell = SuspendCell {
-        exec: CellExecutor::new(TASKS),
-        gate: FabricGate::new(),
-        token: 0,
-        sink: Rc::new(Cell::new(0)),
-    };
+    let (exec, class) = executor_of(&suspend_task);
+    let mut cell =
+        SuspendCell { exec, class, gate: FabricGate::new(), token: 0, sink: Rc::new(Cell::new(0)) };
     let mut lane = L::new();
     let mut polled = 0u64;
     for _ in 0..ops {
