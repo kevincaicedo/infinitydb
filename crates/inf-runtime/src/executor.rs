@@ -536,7 +536,7 @@ fn first_poll_slot<F: Future<Output = ()> + 'static, const C: usize>(
     class.occupant(slot)
 }
 
-// ---- The header array ----------------------------------------------------------------------------
+// ---- The header array ---------------------------------------------------------------------------
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum TaskState {
