@@ -462,12 +462,23 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     }
 }
 
-impl<T, G: Generation, P> SlotReservation<'_, T, G, P> {
+impl<'a, T, G: Generation, P> SlotReservation<'a, T, G, P> {
     /// The value takes the slot, and its handle is returned. Cannot allocate
     /// or refuse: the slot was free and the reservation held it.
     #[inline]
     pub fn publish(self, value: T) -> SlotId<G> {
-        let (index, generation) = self.slot.occupy(value);
+        self.publish_mut(value).0
+    }
+
+    /// `publish`, with the occupant lent for the reservation's borrow
+    /// (ADR-0194 D1's note): a site that uses the value in the step that
+    /// published it walks no directory, and the lend and each later
+    /// `get_mut` of the handle name one address. Inlined always, as
+    /// `reserve` is: out of line, its answer would return through memory.
+    #[must_use = "the handle is the slot's one name"]
+    #[inline(always)]
+    pub fn publish_mut(self, value: T) -> (SlotId<G>, &'a mut T) {
+        let (index, generation, occupant) = self.slot.occupy_mut(value);
         let live = live_published(*self.live);
         *self.live = live;
         // An `Assembly` slab keeps its own high water at 0, so this one
@@ -478,7 +489,7 @@ impl<T, G: Generation, P> SlotReservation<'_, T, G, P> {
             }
             self.row.report_publish(live);
         }
-        SlotId { index, generation, instance: self.instance }
+        (SlotId { index, generation, instance: self.instance }, occupant)
     }
 }
 
@@ -1083,6 +1094,8 @@ mod tests {
     struct Reach {
         free_at_generation: [u64; 4],
         retired: [u64; 4],
+        /// Publishes through `publish_mut` whose lend wrote a second value.
+        lent: u64,
     }
 
     /// The model of one slab: its occupants by `(index, generation)`, by
@@ -1194,11 +1207,14 @@ mod tests {
         }
     }
 
+    /// A publish; through `publish_mut` when `lend`, whose lend then writes
+    /// a second value in the same step, which the model holds.
     fn model_publish<T: ModelValue, G, P, const C: usize>(
         slab: &mut CappedSlab<T, G, P, C>,
         model: &mut Model<G>,
         handles: &mut Vec<SlotId<G>>,
         value: u64,
+        lend: bool,
     ) where
         G: Generation + ModelGeneration,
         P: GenerationPolicy,
@@ -1207,7 +1223,16 @@ mod tests {
         match slab.reserve() {
             SlabReserved::Slot(slot) => {
                 assert!((model.live.len() as u64) < u64::from(model.capacity), "a slot to serve");
-                let id = slot.publish(T::of(value));
+                let (id, value) = if lend {
+                    let (id, occupant) = slot.publish_mut(T::of(value));
+                    assert_eq!(occupant.value(), value, "the lend is the occupant");
+                    let second = value | 1 << 20;
+                    *occupant = T::of(second);
+                    model.reach.lent += 1;
+                    (id, second)
+                } else {
+                    (slot.publish(T::of(value)), value)
+                };
                 assert_eq!(id.instance, instance);
                 assert!((id.index as usize) < model.next.len(), "an index past the cap");
                 let next = model.next_generation(id.index).expect("a retired slot served again");
@@ -1336,13 +1361,14 @@ mod tests {
             let value = u64::from(op);
             let kind = rng.next_below(16);
             if kind < 8 || handles.is_empty() {
-                model_publish(&mut slab, &mut model, &mut handles, value);
+                model_publish(&mut slab, &mut model, &mut handles, value, false);
             } else {
                 let at = pick(&mut rng, &handles, &model);
                 match kind {
                     8..=10 => model_take(&mut slab, &mut model, handles[at]),
                     11 | 12 => model_write(&mut slab, &mut model, handles[at], value),
                     13 => model_place_last(&mut slab, &mut model, &mut handles, at),
+                    14 => model_publish(&mut slab, &mut model, &mut handles, value, true),
                     _ => {}
                 }
             }
@@ -1366,6 +1392,12 @@ mod tests {
         model.reach
     }
 
+    /// `run`, its publishes through `publish_mut` added to `total`.
+    fn lent(total: &mut u64, run: Reach) -> Reach {
+        *total += run.lent;
+        run
+    }
+
     fn add(sum: &mut [u64; 4], run: [u64; 4]) {
         for (total, count) in sum.iter_mut().zip(run) {
             *total += count;
@@ -1378,7 +1410,7 @@ mod tests {
     /// handle's generation while free (`WrapWithProof` runs).
     #[test]
     fn the_slab_equals_its_model_across_chunk_and_directory_edges() {
-        let (mut retired, mut wrapped) = ([0; 4], [0; 4]);
+        let (mut retired, mut wrapped, mut lends) = ([0; 4], [0; 4], 0);
         for (index, cap) in [
             Cap::entries::<1>("m-1", CapFill::Serving),
             Cap::entries::<2>("m-2", CapFill::Serving),
@@ -1391,16 +1423,20 @@ mod tests {
         .enumerate()
         {
             let seed = 0x51AB + 4 * index as u64;
-            add(&mut retired, model_run::<u32, Retire>(cap, seed, 3_000).retired);
-            add(&mut retired, model_run::<u64, Retire>(cap, seed + 1, 3_000).retired);
-            let wraps = model_run::<u32, WrapWithProof>(cap, seed + 2, 3_000);
+            add(&mut retired, lent(&mut lends, model_run::<u32, Retire>(cap, seed, 3_000)).retired);
+            add(
+                &mut retired,
+                lent(&mut lends, model_run::<u64, Retire>(cap, seed + 1, 3_000)).retired,
+            );
+            let wraps = lent(&mut lends, model_run::<u32, WrapWithProof>(cap, seed + 2, 3_000));
             add(&mut wrapped, wraps.free_at_generation);
-            let wraps = model_run::<u64, WrapWithProof>(cap, seed + 3, 3_000);
+            let wraps = lent(&mut lends, model_run::<u64, WrapWithProof>(cap, seed + 3, 3_000));
             add(&mut wrapped, wraps.free_at_generation);
         }
         // Get, GetMut, Take, Hook.
         assert!(retired.iter().all(|count| *count > 0), "a retired slot unread: {retired:?}");
         assert!(wrapped.iter().all(|count| *count > 0), "a wrapped slot unread: {wrapped:?}");
+        assert!(lends > 0, "no publish through publish_mut");
     }
 
     /// The model at a wide slot (ADR-0194 A1): 2,992 B at a `u64` generation,
@@ -1410,7 +1446,7 @@ mod tests {
     fn a_wide_slab_equals_its_model_across_its_chunk_and_directory_edges() {
         type Payload = Wide<372>;
         assert_eq!(mem::size_of::<Slot<Payload, u64>>(), 2_992);
-        let (mut retired, mut wrapped) = ([0; 4], [0; 4]);
+        let (mut retired, mut wrapped, mut lends) = ([0; 4], [0; 4], 0);
         for (index, cap) in [
             Cap::entries::<1>("w-1", CapFill::Serving),
             Cap::entries::<2>("w-2", CapFill::Serving),
@@ -1423,14 +1459,19 @@ mod tests {
         .enumerate()
         {
             let seed = 0x3D1D + 2 * index as u64;
-            let retires = model_run_in::<Payload, u64, Retire, 16>(cap, seed, 3_000);
+            let retires =
+                lent(&mut lends, model_run_in::<Payload, u64, Retire, 16>(cap, seed, 3_000));
             add(&mut retired, retires.retired);
-            let wraps = model_run_in::<Payload, u64, WrapWithProof, 16>(cap, seed + 1, 3_000);
+            let wraps = lent(
+                &mut lends,
+                model_run_in::<Payload, u64, WrapWithProof, 16>(cap, seed + 1, 3_000),
+            );
             add(&mut wrapped, wraps.free_at_generation);
         }
         // Get, GetMut, Take, Hook.
         assert!(retired.iter().all(|count| *count > 0), "a retired slot unread: {retired:?}");
         assert!(wrapped.iter().all(|count| *count > 0), "a wrapped slot unread: {wrapped:?}");
+        assert!(lends > 0, "no publish through publish_mut");
     }
 
     /// Two instances on one census, built and populated by the same ops,

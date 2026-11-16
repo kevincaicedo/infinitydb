@@ -360,14 +360,26 @@ pub(super) struct FreeSlot<'a, T, G> {
     next: u32,
 }
 
-impl<T, G: SlotGeneration> FreeSlot<'_, T, G> {
+impl<'a, T, G: SlotGeneration> FreeSlot<'a, T, G> {
     /// The slot holds `value` at the generation it was free with; its index
     /// and that generation are returned. Cannot allocate or refuse.
     #[inline]
     pub(super) fn occupy(self, value: T) -> (u32, G) {
-        *self.slot = Slot::Live { generation: self.generation, value };
-        *self.free_head = self.next;
-        (self.index, self.generation)
+        let (index, generation, _) = self.occupy_mut(value);
+        (index, generation)
+    }
+
+    /// `occupy`, with the occupant lent for the slot's borrow, at the
+    /// address it lies at until a take moves it out (ADR-0194 D1's note).
+    #[inline]
+    pub(super) fn occupy_mut(self, value: T) -> (u32, G, &'a mut T) {
+        let FreeSlot { slot, free_head, index, generation, next } = self;
+        *slot = Slot::Live { generation, value };
+        *free_head = next;
+        match slot {
+            Slot::Live { value, .. } => (index, generation, value),
+            Slot::Free { .. } | Slot::Closed => unreachable!("a slot just made live is live"),
+        }
     }
 }
 
