@@ -951,6 +951,11 @@ unsafe fn link_ready(header: Header) {
         let array = array_of(header);
         let head = array.as_ref();
         let index = owner(header).index;
+        debug_assert!(
+            matches!(owner(header).state.get(), TaskState::Queued | TaskState::Reclaiming),
+            "a linked header is Queued or Reclaiming"
+        );
+        debug_assert_ne!(head.ready_tail.get(), index, "a header is linked at most once");
         owner(header).ready_next.set(NO_HEADER);
         match head.ready_tail.get() {
             NO_HEADER => head.ready_head.set(index),
@@ -1821,6 +1826,41 @@ mod tests {
     /// The probe's one future type, boxed: the test's closure has no name to register.
     type Probe = Pin<Box<dyn Future<Output = ()>>>;
     const ONE: Cap = Cap::entries::<1>("test-probe", CapFill::Serving);
+
+    /// An executor of one probe class, its one header Free and on no list.
+    fn one_header() -> CellExecutor {
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(0));
+        let mut layout = ExecutorLayout::new(&census);
+        let _class = layout.class(&|f: Probe| f, ONE).expect("one class");
+        layout.build().expect("no class refuses")
+    }
+
+    /// The link's check: only a Queued or Reclaiming header is linked.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a linked header is Queued or Reclaiming")]
+    fn a_free_header_is_never_linked() {
+        let executor = one_header();
+        // SAFETY: the one class's one header: open, on this thread, and on no list.
+        unsafe { link_ready(header_at(executor.array, 0)) };
+    }
+
+    /// The link's check: a header at the ready list's tail is not linked again.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a header is linked at most once")]
+    fn a_header_is_never_linked_twice() {
+        let executor = one_header();
+        // SAFETY: the one class's one header: open, on this thread, and on no list.
+        let header = unsafe { header_at(executor.array, 0) };
+        // SAFETY: as above.
+        unsafe { owner(header) }.state.set(TaskState::Queued);
+        // SAFETY: as above; the second link is the one the check refuses.
+        unsafe {
+            link_ready(header);
+            link_ready(header);
+        }
+    }
 
     /// An owner-lane clone at `LANE_COUNT_MAX` aborts the process before the count is written;
     /// one below the bound reaches it. A test-only start count stands in for 2⁶⁰ clones: the test
