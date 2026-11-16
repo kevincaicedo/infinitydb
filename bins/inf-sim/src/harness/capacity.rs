@@ -132,7 +132,7 @@ impl CloseLeg {
     /// green leg leaves this table for its `scripts/sim-smoke.sh` row, where
     /// it runs with its twin; `tests/lanes.rs` holds every leg to one of the
     /// two.
-    pub const PINNED_RED: &'static [CloseLeg] = &[CloseLeg::Tasks, CloseLeg::Fan];
+    pub const PINNED_RED: &'static [CloseLeg] = &[CloseLeg::Fan];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -260,6 +260,8 @@ struct Rig {
     tasks_most: Option<Vec<usize>>,
     /// Each cell's node state, for the gauges a leg reads beside the wire.
     nodes: Vec<Rc<NodeInfo>>,
+    /// The cells whose O1 breach is recorded, once each.
+    owners_breached: Vec<bool>,
 }
 
 impl Rig {
@@ -338,6 +340,7 @@ impl Rig {
             readings: Vec::new(),
             tasks_most: None,
             nodes,
+            owners_breached: vec![false; usize::from(CELLS)],
         };
         for _ in 0..8 {
             rig.step();
@@ -376,12 +379,28 @@ impl Rig {
                 most[cell] = most[cell].max(cell_loop.executor().live_tasks());
             }
         }
+        self.judge_owners();
         for id in 0..self.clients.len() {
             self.observe(id);
         }
         drain_violations(&self.nets, &mut self.violations);
         self.clock.advance(Nanos(STEP_NS_FLOOR + self.rng.next_u64() % self.step_ns_max));
         self.steps += 1;
+    }
+
+    /// O1 on every step (ADR-0177 D2): on each cell the `conn` tasks alive
+    /// equal the occupied connection slots, both within the share. Two
+    /// owners report and the harness compares; each cell's first breach is
+    /// recorded.
+    fn judge_owners(&mut self) {
+        for (cell, (cell_loop, plane)) in self.cells.iter().enumerate() {
+            let Some(breach) = plane.conn_owners(cell_loop.executor()).breach() else { continue };
+            if !self.owners_breached[cell] {
+                self.owners_breached[cell] = true;
+                let step = self.steps;
+                self.violations.push(format!("O1 {breach} on cell {cell} at step {step}"));
+            }
+        }
     }
 
     /// Reads what reached client `id`, frames its replies and notes the
@@ -1498,13 +1517,6 @@ mod reds {
             "m0-capacity --close-leg {name} reads green: it leaves CloseLeg::PINNED_RED for its \
              scripts/sim-smoke.sh row"
         );
-    }
-
-    #[test]
-    #[ignore = "a closed subscriber's deltas are a task of their own, alive after its slot \
-                freed; red until a connection's one task ships them from a draining slot"]
-    fn the_tasks_leg_holds_no_task_past_its_share() {
-        pinned_red(CloseLeg::Tasks);
     }
 
     #[test]

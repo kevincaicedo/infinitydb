@@ -12,7 +12,7 @@ use crate::limits::{PeerTaskCaps, PlaneTaskCaps};
 
 /// The six classes' handles and their caps, one field of `Shared`.
 pub(super) struct PlaneTasks {
-    conn: TaskClass,
+    conn: (TaskClass, Cap),
     peers: Option<PeerTasks>,
     compact: (TaskClass, Cap),
     shadow: (TaskClass, Cap),
@@ -74,7 +74,14 @@ impl PlaneTasks {
         };
         let compact = (layout.class(&compact_pump::<O, F>, caps.compact)?, caps.compact);
         let shadow = (layout.class(&shadow_pump::<O, F>, caps.shadow)?, caps.shadow);
-        Ok(PlaneTasks { conn, peers, compact, shadow })
+        Ok(PlaneTasks { conn: (conn, caps.conn), peers, compact, shadow })
+    }
+
+    /// The `conn` tasks alive and the class's slots, the cell's share `C`:
+    /// O1's first owner and its bound.
+    pub(super) fn conn_tasks(&self, executor: &CellExecutor) -> (u32, u32) {
+        let (class, cap) = self.conn;
+        (executor.class_tasks(class), cap.entries_max())
     }
 
     /// Compaction chains MAINTAIN may still start this pass.
@@ -115,7 +122,7 @@ pub(super) fn admit_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     shared: &Rc<Shared<O, F>>,
     conn: impl FnOnce(TaskId) -> Conn,
 ) -> Option<ConnKey> {
-    let permit = granted(executor.reserve(shared.tasks.conn))?;
+    let permit = granted(executor.reserve(shared.tasks.conn.0))?;
     shared.conns.borrow_mut().insert_with(|key| {
         let pump_shared = Rc::clone(shared);
         conn(permit.spawn_local(move || pump(pump_shared, key)))
@@ -240,7 +247,7 @@ mod tests {
             let executor = layout
                 .build()
                 .unwrap_or_else(|error| panic!("{cells} cells: class-refused: {error}"));
-            assert_eq!(executor.class_tasks(tasks.conn), 0, "{cells} cells");
+            assert_eq!(executor.class_tasks(tasks.conn.0), 0, "{cells} cells");
             println!(
                 "every_class_registers_at_its_chunk: {cells} cells: conn {}, header array {} B",
                 caps.conn.entries_max(),

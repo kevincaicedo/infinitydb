@@ -345,9 +345,11 @@ impl CellNet {
         self.conns.get(&fd).is_none_or(|c| c.server_closed)
     }
 
-    /// Total undelivered client→server bytes (progress accounting).
+    /// Total undelivered client→server bytes of the connections the server
+    /// has not closed (progress accounting): a closed fd's bytes are never
+    /// taken, a refused accept's among them.
     pub fn pending_bytes(&self) -> usize {
-        self.conns.values().map(|c| c.to_server.len()).sum()
+        self.conns.values().filter(|c| !c.server_closed).map(|c| c.to_server.len()).sum()
     }
 
     /// Client→server bytes of the one connection `fd` that the server has

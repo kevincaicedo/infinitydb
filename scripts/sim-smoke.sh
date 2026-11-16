@@ -72,6 +72,7 @@ rows=(
   "m0-admission"
   # m0-capacity runs each close leg green on this tree on its own row, a leg named, never
   # drawn from the seed; every other leg is a pinned red in its source until it is green.
+  "m0-capacity --close-leg tasks --verify-determinism"
   "m0-capacity --close-leg close --verify-determinism"
   "m0-capacity --close-leg rearm --verify-determinism"
   "m0-capacity --close-leg eof-with-data --verify-determinism"

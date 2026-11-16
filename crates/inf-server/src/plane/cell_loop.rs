@@ -584,6 +584,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             moved.then(|| (conn.cx.id, conn.take_parked_pump()))
         });
         let Some(Some((id, pump))) = moved else { return };
+        // Canary: the slot is vacated at `Closed`, before its pump returns.
+        #[cfg(inf_canary_conn_slot_frees_at_closed)]
+        let _ = self.shared.conns.borrow_mut().remove(key);
         self.shared.node.clients.borrow_mut().unregister(id);
         if let Some(pump) = pump {
             let _ = cx.executor.wake(pump);

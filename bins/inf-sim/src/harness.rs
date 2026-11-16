@@ -1597,6 +1597,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         .is_accept_retry_leg()
         .then(|| accept_retry::RetryWatch::new(cells.len(), scenario.step_ns_bound()));
 
+    let mut owners_breached = vec![false; cells.len()];
     loop {
         report.scheduler_steps += 1;
         oracle.0.borrow_mut().state.number(b"step", clock.now().0);
@@ -1611,6 +1612,19 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         for &i in &order {
             let (cell_loop, plane) = &mut cells[i];
             cell_loop.run_iteration(plane).expect("sim iteration");
+        }
+        // O1 on every step (ADR-0177 D2): each cell's `conn` tasks alive
+        // equal its occupied connection slots, both within its share; each
+        // cell's first breach is recorded.
+        for (i, (cell_loop, plane)) in cells.iter().enumerate() {
+            if owners_breached[i] {
+                continue;
+            }
+            if let Some(breach) = plane.conn_owners(cell_loop.executor()).breach() {
+                owners_breached[i] = true;
+                violations
+                    .push(format!("O1 {breach} on cell {i} at step {}", report.scheduler_steps));
+            }
         }
         if let Some(watch) = &mut retry_watch {
             watch.sample(clock.now(), &nets);

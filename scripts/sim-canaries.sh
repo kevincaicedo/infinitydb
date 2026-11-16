@@ -1135,6 +1135,10 @@ ordered_rows=(
   # A client row is inserted only through the plane's admission. Planted, SETNAME and the
   # state mirror insert, and a command run after Closed puts the closed client back.
   "inf_canary_command_registers_client m0-capacity ghost-client-row --close-leg registry-reset"
+  # A slot stays occupied until its pump returns, so the conn tasks alive equal the occupied
+  # slots at every step (O1). Planted, the slot is vacated at Closed, before its pump returns,
+  # and O1 reads fewer slots than tasks.
+  "inf_canary_conn_slot_frees_at_closed m0-capacity conn-tasks-unequal --close-leg close"
   # The `conn` class's slots are the cell's share (ADR-0177 D2) and its bytes E-store's F7 bill.
   # Planted, it is built over (1 + k) C slots, k from its stride: the idle node's resident
   # memory a cell rises by k x C x s_conn, 2,500 x 3,064 B at 4 cells (k = 1), over F7's
