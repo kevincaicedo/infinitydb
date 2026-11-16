@@ -270,9 +270,9 @@ pub(super) enum ScatterScope {
 /// This cell's leg of a namespace-scoped scatter program: the tiered
 /// arm for a tiered namespace (its `SCAN` walks the tiered index and
 /// its unsupported commands answer their typed errors), the ordinary
-/// namespace execution otherwise. Read-only programs only — a gated
-/// (durable-write) verdict here is a dispatch bug, answered as a typed
-/// error rather than an unfenced ack.
+/// namespace execution otherwise. Read-only programs only: a reading that
+/// gates (an `always` write) answers the cross-cell error before any
+/// effect, and the leg's gate has nothing to wait behind.
 pub(super) async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
@@ -288,13 +288,12 @@ pub(super) async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clon
     };
     if tiered {
         let meta = lookup(argv[0]).expect("scatter programs dispatch registered commands");
-        match tiered::dispatch_tiered(shared, origin, ns, meta, argv, proto, class).await {
+        let Some(gate) = ApplyGate::read_only(NsApplyRead::new(meta, class)) else {
+            return error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED);
+        };
+        match tiered::dispatch_tiered(shared, origin, ns, meta, argv, proto, gate).await {
             tiered::TieredReply::Done(reply) => reply,
-            tiered::TieredReply::Gated { reply, .. } => {
-                debug_assert!(false, "read-only scatter leg staged a durable effect");
-                shared.recycle_reply_buf(reply.into_bytes());
-                error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED)
-            }
+            tiered::TieredReply::Gated { gate, .. } => match gate {},
         }
     } else {
         let mut reply = OpenReply::new(shared.take_reply_buf());

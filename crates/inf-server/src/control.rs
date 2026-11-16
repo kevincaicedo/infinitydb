@@ -3839,7 +3839,7 @@ mod tests {
             ControlHandle::detached(cells(2), 0).expect("the catalog boots");
         let mut quota = issuers.cells.into_iter().next().expect("cell 0").quota;
         let board = handle.ckpt_board();
-        let node = NodeInfo::try_default().expect("fixture cache allocation");
+        let (node, _) = NodeInfo::try_default().expect("fixture cache allocation");
         let mut sweep = BoardSweep::new(CellId(0));
         assert_eq!((node.lastsave.unix_s(), info_rdb_last_save_time(&node)), (0, 0));
         // One completed sweep over an older publication: both surfaces

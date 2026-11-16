@@ -725,7 +725,7 @@ pub(super) async fn set_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + '
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     let key = argv.arg(1);
     let value = argv.arg(2);
     let (mut nx, mut xx, mut get_old) = (false, false, false);
@@ -770,17 +770,17 @@ pub(super) async fn set_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + '
             } else {
                 w.null();
             }
-            if applied && class == Some(FsyncClass::Always) {
-                return TieredReply::Gated { reply: reply.finish(), seq };
+            if applied {
+                return TierWrite::Staged { reply: reply.finish(), seq };
             }
-            TieredReply::Done(reply.finish())
+            TierWrite::Done(reply.finish())
         }
         // The write's own error reply is the answer, moved; this
         // reply's buffer recycles (ADR-0190 D1: a whole reply is never
         // pasted).
         Err(err) => {
             shared.recycle_reply_buf(reply.finish().into_bytes());
-            TieredReply::Done(err)
+            TierWrite::Done(err)
         }
     }
 }
@@ -901,20 +901,20 @@ pub(super) async fn setnx<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     match write_conditional(shared, ns, class, argv.arg(1), proto, true, false, argv.arg(2), false)
         .await
     {
         Ok((seq, _, applied)) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
             RespWriter::new(reply.reply(), proto).int(i64::from(applied));
-            if applied && class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply: reply.finish(), seq }
+            if applied {
+                TierWrite::Staged { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply.finish())
+                TierWrite::Done(reply.finish())
             }
         }
-        Err(err) => TieredReply::Done(err),
+        Err(err) => TierWrite::Done(err),
     }
 }
 
@@ -924,7 +924,7 @@ pub(super) async fn getset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     match write_conditional(shared, ns, class, argv.arg(1), proto, false, false, argv.arg(2), false)
         .await
     {
@@ -935,13 +935,9 @@ pub(super) async fn getset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
                 Some(v) => w.bulk(v),
                 None => w.null(),
             }
-            if class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply: reply.finish(), seq }
-            } else {
-                TieredReply::Done(reply.finish())
-            }
+            TierWrite::Staged { reply: reply.finish(), seq }
         }
-        Err(err) => TieredReply::Done(err),
+        Err(err) => TierWrite::Done(err),
     }
 }
 
@@ -951,7 +947,7 @@ pub(super) async fn append<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     let suffix = argv.arg(2).to_vec();
     let Some(max) = blob_max(shared, ns) else {
         return done_error(shared, proto, "ERR the selected namespace was dropped");
@@ -969,7 +965,7 @@ pub(super) async fn append<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
         Ok(value)
     })
     .await;
-    int_write_reply(shared, proto, class, outcome, |old| {
+    int_write_reply(shared, proto, outcome, |old| {
         (old.map_or(0, |v| v.len()) + suffix.len()) as i64
     })
 }
@@ -980,7 +976,7 @@ pub(super) async fn setrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     let Some(offset) = parse_i64(argv.arg(2)) else {
         return done_error(shared, proto, "ERR value is not an integer or out of range");
     };
@@ -1015,7 +1011,7 @@ pub(super) async fn setrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 
         Ok(value)
     })
     .await;
-    int_write_reply(shared, proto, class, outcome, |old| old.map_or(0, |v| v.len()).max(end) as i64)
+    int_write_reply(shared, proto, outcome, |old| old.map_or(0, |v| v.len()).max(end) as i64)
 }
 
 #[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column handler")]
@@ -1026,7 +1022,7 @@ pub(super) async fn incr<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     let delta = match id {
         CommandId::Incr => 1,
         CommandId::Decr => -1,
@@ -1076,13 +1072,9 @@ pub(super) async fn incr<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         Ok((seq, _)) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
             RespWriter::new(reply.reply(), proto).int(computed.get());
-            if class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply: reply.finish(), seq }
-            } else {
-                TieredReply::Done(reply.finish())
-            }
+            TierWrite::Staged { reply: reply.finish(), seq }
         }
-        Err(err) => TieredReply::Done(err),
+        Err(err) => TierWrite::Done(err),
     }
 }
 
@@ -1092,7 +1084,7 @@ pub(super) async fn incrbyfloat<O: PlaneObserver + 'static, F: SegmentFs + Clone
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     let Some(delta) = std::str::from_utf8(argv.arg(2)).ok().and_then(|s| s.parse::<f64>().ok())
     else {
         return done_error(shared, proto, "ERR value is not a valid float");
@@ -1128,13 +1120,9 @@ pub(super) async fn incrbyfloat<O: PlaneObserver + 'static, F: SegmentFs + Clone
         Ok((seq, _)) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
             RespWriter::new(reply.reply(), proto).bulk(&rendered.borrow());
-            if class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply: reply.finish(), seq }
-            } else {
-                TieredReply::Done(reply.finish())
-            }
+            TierWrite::Staged { reply: reply.finish(), seq }
         }
-        Err(err) => TieredReply::Done(err),
+        Err(err) => TierWrite::Done(err),
     }
 }
 
@@ -1144,7 +1132,7 @@ pub(super) async fn getdel<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     let key = argv.arg(1);
     match delete_one(shared, ns, class, key, proto, true).await {
         Ok(deleted) => {
@@ -1154,15 +1142,13 @@ pub(super) async fn getdel<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
                 Some((_, Some(v))) => w.bulk(v),
                 _ => w.null(),
             }
-            if let Some((seq, _)) = deleted
-                && class == Some(FsyncClass::Always)
-            {
-                TieredReply::Gated { reply: reply.finish(), seq }
+            if let Some((seq, _)) = deleted {
+                TierWrite::Staged { reply: reply.finish(), seq }
             } else {
-                TieredReply::Done(reply.finish())
+                TierWrite::Done(reply.finish())
             }
         }
-        Err(err) => TieredReply::Done(err),
+        Err(err) => TierWrite::Done(err),
     }
 }
 
@@ -1172,7 +1158,7 @@ pub(super) async fn del<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     let mut removed = 0i64;
     let mut last_seq = 0;
     for key in &argv[1..] {
@@ -1182,15 +1168,15 @@ pub(super) async fn del<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 last_seq = seq;
             }
             Ok(None) => {}
-            Err(err) => return TieredReply::Done(err),
+            Err(err) => return TierWrite::Done(err),
         }
     }
     let mut reply = OpenReply::new(shared.take_reply_buf());
     RespWriter::new(reply.reply(), proto).int(removed);
-    if removed > 0 && class == Some(FsyncClass::Always) {
-        TieredReply::Gated { reply: reply.finish(), seq: last_seq }
+    if removed > 0 {
+        TierWrite::Staged { reply: reply.finish(), seq: last_seq }
     } else {
-        TieredReply::Done(reply.finish())
+        TierWrite::Done(reply.finish())
     }
 }
 
@@ -1523,7 +1509,7 @@ pub(super) async fn mset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     if argv.len() < 3 || !(argv.len() - 1).is_multiple_of(2) {
         return done_error(shared, proto, "ERR wrong number of arguments for 'mset' command");
     }
@@ -1544,17 +1530,13 @@ pub(super) async fn mset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         .await
         {
             Ok((seq, _, _)) => last_seq = seq,
-            Err(err) => return TieredReply::Done(err),
+            Err(err) => return TierWrite::Done(err),
         }
         i += 2;
     }
     let mut reply = OpenReply::new(shared.take_reply_buf());
     RespWriter::new(reply.reply(), proto).simple("OK");
-    if class == Some(FsyncClass::Always) {
-        TieredReply::Gated { reply: reply.finish(), seq: last_seq }
-    } else {
-        TieredReply::Done(reply.finish())
-    }
+    TierWrite::Staged { reply: reply.finish(), seq: last_seq }
 }
 
 #[cfg(test)]
@@ -1592,14 +1574,16 @@ mod hole_refusal_tests {
         let fabric = Mesh::new(1, MeshConfig::default()).into_iter().next().expect("one cell");
         let seed =
             KeyspaceSeed::Uncataloged { cfg: inf_store::StoreConfig::default(), specs: vec![spec] };
-        let (plane, _serve_mark, _timer_set) =
+        let (fixture_node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
+        let (plane, _serve_mark, _timer_set, _executor) =
             ServerPlane::<NoopObserver, crate::StdSegmentFs>::new(
                 CellId(0),
                 1,
                 -1,
                 seed,
                 fabric,
-                Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+                Rc::new(fixture_node),
+                admission,
                 NoopObserver,
                 false,
             )

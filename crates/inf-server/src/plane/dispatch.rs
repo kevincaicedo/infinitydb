@@ -56,10 +56,22 @@ pub(super) enum PendingReply {
 /// What the pump found when it asked the connection for more work.
 pub(super) enum Popped {
     Cmd(OwnedCmd),
+    /// A reply PARSE queued behind the replies owed before it: it takes
+    /// its place in the window as one executed at dispatch.
+    Reply(OwnedReply),
     /// Queue empty but replies are still pending — keep emitting.
     Empty,
-    /// Queue empty, nothing pending (pump deactivated inside the conn
-    /// borrow) or the connection is gone: the pump is done.
+    /// Queue empty and nothing pending: the pump parked itself inside the
+    /// conn borrow, so a command queued after it, or a move of its slot,
+    /// wakes it by id.
+    Park,
+    /// A `Peer` run-out found no take of the inbox since its stamp: the
+    /// pump waits for PARSE's next take, then reads the slot again.
+    TakeWait,
+    /// A draining slot read empty with no parser: the local registries
+    /// dropped the connection in this step, and these are its 1→0 deltas.
+    Retire(SubNotes),
+    /// The slot is vacant or another generation's: the pump ends.
     Finished,
 }
 
@@ -68,23 +80,71 @@ fn pop_or_quiesce<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     key: ConnKey,
     pending_empty: bool,
 ) -> Popped {
-    let Some(next) = shared.with_conn(key, |conn| {
+    let takes = shared.inbox_takes.get();
+    let popped = shared.with_conn(key, |conn| {
         let next = conn.queue.pop_front();
-        if next.is_none() && pending_empty {
-            conn.pump_active = false;
+        if let ConnSlot::Active { recv, .. } = &mut conn.slot
+            && *recv == RecvArm::Disarmed
+            && conn.queue.len() <= PENDING_LOW_WATER
+        {
+            *recv = RecvArm::RearmDue;
         }
-        if conn.recv_disarmed && conn.queue.len() <= PENDING_LOW_WATER {
-            conn.rearm_recv = true;
+        match next {
+            Some(Queued::Command(cmd)) => {
+                if let ConnSlot::Closing { .. } | ConnSlot::Draining { .. } = conn.slot {
+                    let node = &shared.node;
+                    node.closed_queue_commands.set(node.closed_queue_commands.get() + 1);
+                }
+                Popped::Cmd(cmd)
+            }
+            Some(Queued::Reply(reply)) => Popped::Reply(reply),
+            None if pending_empty => quiesce(shared, key, conn, takes),
+            None => Popped::Empty,
         }
-        next
-    }) else {
-        return Popped::Finished;
-    };
-    match next {
-        Some(cmd) => Popped::Cmd(cmd),
-        None if pending_empty => Popped::Finished,
-        None => Popped::Empty,
+    });
+    popped.unwrap_or(Popped::Finished)
+}
+
+/// The pump's empty read with nothing pending, by the slot's state: a
+/// `Peer` slot runs its run-out first (ADR-0196 D2, A1.1); a draining slot
+/// with no parser drops the connection from the local registries, in this
+/// borrow after its last dequeue, so a queued `SUBSCRIBE`'s 0→1 precedes
+/// the close's 1→0 in one task (ADR-0177 D2); any other parks.
+fn quiesce<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    key: ConnKey,
+    conn: &mut Conn,
+    takes: u64,
+) -> Popped {
+    match conn.run_out(takes) {
+        Some(RunOut::Wait) => {
+            let node = &shared.node;
+            node.reader_take_waits.set(node.reader_take_waits.get() + 1);
+            shared.reader_waiting.set(shared.reader_waiting.get() + 1);
+            return Popped::TakeWait;
+        }
+        Some(RunOut::Ended) | None => {}
     }
+    // Canary: a pump whose queue is empty after its first reply left returns
+    // and its slot vacates with it, the socket left open, so both owners
+    // lose a client that still holds its connection.
+    #[cfg(inf_canary_conn_owner_lost)]
+    if conn.owner_lost {
+        return Popped::Retire(SubNotes::default());
+    }
+    // A draining slot's run-out ended its parser above, or it waits.
+    if let ConnSlot::Draining { by: ClosedBy::Plane } = conn.slot {
+        // Canary: the deltas captured at `Closed`, and no removal here.
+        #[cfg(inf_canary_registry_dropped_at_closed)]
+        {
+            let _ = key;
+            return Popped::Retire(conn.closed_notes.take().unwrap_or_default());
+        }
+        #[cfg(not(inf_canary_registry_dropped_at_closed))]
+        return Popped::Retire(unsubscribe_closed_conn(shared, key, &mut conn.cx));
+    }
+    conn.pump_parked = true;
+    Popped::Park
 }
 
 /// Commands that mutate connection execution state must observe — and be
@@ -257,21 +317,51 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     }
 }
 
-/// The per-connection pump: dispatch commands in pipeline order with up to
-/// [`REMOTE_WINDOW`] remote ops in flight, emit replies strictly in command
-/// order. Suspends only on the front reply's gate and on fabric credits;
-/// out-of-order completions park in the gate until their turn.
-#[allow(clippy::disallowed_types, reason = "container: A")]
+/// A connection's pump (ADR-0177 D2): made in the step that admits the
+/// connection, it serves the connection in every occupied state, running
+/// the queue to its end at a close (ADR-0123 A2); at a draining slot's
+/// last empty read it ships the connection's 1→0 subscription deltas, so
+/// one task sends the connection's subscribes and their undoing in order,
+/// then vacates the slot and returns: the slot and its task free together.
 pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: Rc<Shared<O, F>>,
     key: ConnKey,
-    first: OwnedCmd,
 ) {
+    let Some(notes) = serve_conn(&shared, key).await else { return };
+    // Canary: the slot vacates before its deltas are acknowledged, so the
+    // stop's barrier stops counting it with its deltas in flight.
+    #[cfg(inf_canary_draining_vacates_before_acks)]
+    let _ = shared.conns.borrow_mut().remove(key);
+    flush_sub_deltas(&shared, notes).await;
+    #[cfg(not(inf_canary_draining_vacates_before_acks))]
+    let _ = shared.conns.borrow_mut().remove(key);
+    // Canary: the pump keeps a clone of its own waker past its return, so
+    // its header stays Retired and holds its class slot for good.
+    #[cfg(inf_canary_conn_waker_kept)]
+    core::future::poll_fn(|cx| {
+        core::mem::forget(cx.waker().clone());
+        core::task::Poll::Ready(())
+    })
+    .await;
+}
+
+/// The pump's serving loop: dispatch commands in pipeline order with up to
+/// [`REMOTE_WINDOW`] remote ops in flight, emit replies strictly in command
+/// order. Suspends on the front reply's gate, on fabric credits, and parked
+/// when the queue is empty with nothing pending; out-of-order completions
+/// park in the gate until their turn. Returns a draining slot's deltas once
+/// its queue is empty, or `None` when the slot is vacant.
+#[allow(clippy::disallowed_types, reason = "container: A")]
+async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    key: ConnKey,
+) -> Option<SubNotes> {
+    let shared = Rc::clone(shared);
     let mut pending: VecDeque<PendingReply> = VecDeque::new();
     // Remote ops sent and not yet awaited (Counted holds several).
     let mut inflight: usize = 0;
     // A command held back by the conn-state barrier.
-    let mut held: Option<OwnedCmd> = Some(first);
+    let mut held: Option<OwnedCmd> = None;
     loop {
         // ---- dispatch: fill the window in pipeline order.
         while pending.len() < PENDING_REPLIES_MAX && inflight < REMOTE_WINDOW {
@@ -279,8 +369,23 @@ pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
                 Some(cmd) => cmd,
                 None => match pop_or_quiesce(&shared, key, pending.is_empty()) {
                     Popped::Cmd(cmd) => cmd,
+                    // No barrier: a conn-state command is read from commands.
+                    Popped::Reply(reply) => {
+                        pending.push_back(PendingReply::Done(reply));
+                        continue;
+                    }
                     Popped::Empty => break,
-                    Popped::Finished => return,
+                    Popped::Park => {
+                        park().await;
+                        continue;
+                    }
+                    Popped::TakeWait => {
+                        shared.reader_waiters.wait(0).await;
+                        shared.reader_waiting.set(shared.reader_waiting.get() - 1);
+                        continue;
+                    }
+                    Popped::Retire(notes) => return Some(notes),
+                    Popped::Finished => return None,
                 },
             };
             if is_conn_state(&cmd) && !pending.is_empty() {
@@ -293,14 +398,14 @@ pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
             let handled = if shared.deasync_dispatch.get() {
                 match dispatch_one_fast(&shared, key, &cmd, &mut pending, &mut inflight) {
                     FastDispatch::Handled => true,
-                    FastDispatch::ConnGone => return,
+                    FastDispatch::ConnGone => return None,
                     FastDispatch::Fallback => false,
                 }
             } else {
                 false
             };
             if !handled && !dispatch_one(&shared, key, &cmd, &mut pending, &mut inflight).await {
-                return; // connection is gone
+                return None; // the slot is vacant
             }
             // The command's flat buffer recycles once dispatched (waiters
             // own their inputs via `ApplyArgs`/reply slots — nothing
@@ -314,11 +419,14 @@ pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         let Some(front) = pending.pop_front() else {
             continue; // barrier held with pending drained: dispatch it now
         };
+        // A closing or draining slot drops the reply and the pump goes on;
+        // only a vacant slot ends it.
         let reply = settle_reply(&shared, key, front, &mut inflight).await;
-        let written = shared.with_conn(key, |conn| conn.out.emit(&reply));
+        let emitted = shared.with_conn(key, |conn| conn.emit(&reply)).unwrap_or(Emitted::Vacant);
         shared.recycle_reply_buf(reply.into_bytes());
-        if written.is_none() {
-            return;
+        match emitted {
+            Emitted::Written | Emitted::Dropped => {}
+            Emitted::Vacant => return None,
         }
     }
 }
@@ -1091,16 +1199,22 @@ fn dispatch_mirror<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 
 /// `QUIT` through the pump (review of 2026-08-30, F-L13-08): the
 /// connection closes once the replies ahead of it have flushed, and
-/// nothing queued behind it runs — the inline path's `break`, for the
-/// pump. Later input is dropped at the read (`close_after_flush`).
+/// nothing queued behind it runs, in every state — the inline path's
+/// `break`, for the pump. The slot is marked: an active one flushes and
+/// parses nothing more, a `Peer` parser ends (ADR-0196 D3); a receive the
+/// mark owes is RESPOND's to push, as the pump has no loop context.
 pub(super) fn close_after_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     key: ConnKey,
 ) {
     shared.with_conn(key, |conn| {
-        conn.close_after_flush = true;
-        for cmd in conn.queue.drain(..) {
-            shared.recycle_cmd_buf(cmd.into_buf());
+        // Canary: the pump's `QUIT` keeps the queue behind it.
+        #[cfg(not(inf_canary_quit_keeps_queue))]
+        for entry in conn.queue.drain(..) {
+            entry.recycle(shared);
+        }
+        if conn.mark() {
+            shared.mark_rearms.borrow_mut().push(key);
         }
     });
 }

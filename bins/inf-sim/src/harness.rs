@@ -77,6 +77,7 @@ pub mod accept_retry;
 mod audit;
 pub mod capacity;
 mod idle;
+pub(crate) mod owners;
 mod pub_cross;
 pub mod shadow;
 
@@ -96,6 +97,58 @@ pub(super) struct Auditor {
     rx: Vec<u8>,
     bound: bool,
     closed: bool,
+    /// It has read a reply: it holds a slot by its own reading.
+    framed: bool,
+}
+
+/// O1 in the general harness (ADR-0177 D2): the judge, and the runner's
+/// last reading of its clients that hold a slot (each that has read a frame
+/// other than the `maxclients` refusal) as their cells and fds. A client's
+/// admission is monotone, so the audit and teardown iterations reuse the
+/// last reading; each client's close is read live from the net.
+pub(super) struct OwnersWatch {
+    judge: owners::OwnersJudge,
+    admitted: Vec<(usize, RawFd)>,
+}
+
+impl OwnersWatch {
+    fn new(cells: usize) -> OwnersWatch {
+        OwnersWatch { judge: owners::OwnersJudge::new(cells), admitted: Vec::new() }
+    }
+
+    /// Reads which of the runner's clients hold a slot.
+    fn read_clients(
+        &mut self,
+        clients: &[SimClient],
+        subs: &[SimSubscriber],
+        auditors: &[Auditor],
+        idle: &IdlePhase,
+    ) {
+        self.admitted.clear();
+        let framed_clients = clients.iter().filter(|c| c.replied > 0).map(|c| (c.cell, c.fd));
+        self.admitted.extend(framed_clients);
+        self.admitted.extend(subs.iter().filter(|s| s.framed()).map(|s| (s.cell, s.fd)));
+        self.admitted.extend(auditors.iter().filter(|a| a.framed).map(|a| (a.cell, a.fd)));
+        idle.admitted(&mut self.admitted);
+    }
+
+    /// O1's per-step clauses on every cell, `owners` in cell order.
+    pub(super) fn judge(
+        &mut self,
+        owners: impl Iterator<Item = inf_server::ConnOwners>,
+        nets: &[Rc<RefCell<CellNet>>],
+        at: &dyn std::fmt::Display,
+    ) {
+        let mut held = vec![0usize; nets.len()];
+        for &(cell, fd) in &self.admitted {
+            if !nets[cell].borrow().closed(fd) {
+                held[cell] += 1;
+            }
+        }
+        for (cell, owners) in owners.enumerate() {
+            self.judge.step(cell, owners, Some(held[cell]), at);
+        }
+    }
 }
 
 /// Scenario config (the DSL v0: a struct, not a language).
@@ -1277,6 +1330,12 @@ pub(crate) struct SimSubscriber {
 }
 
 impl SimSubscriber {
+    /// It has read a frame (a confirmation): it holds a slot by its own
+    /// reading.
+    pub(crate) fn framed(&self) -> bool {
+        !matches!(self.state, SubState::Subscribing(left) if left == self.subscriptions())
+    }
+
     pub(crate) fn watches(&self, chan: u64) -> bool {
         match &self.plan {
             SubPlan::Channels(set) => set.contains(&chan),
@@ -1412,7 +1471,8 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                 .expect("a scenario's boot capacity");
             config = config.with_boot_capacity(capacity);
         }
-        let node = Rc::new(NodeInfo::try_new(config).expect("fixture cache allocation"));
+        let (node, admission) = NodeInfo::try_new(config).expect("fixture cache allocation");
+        let node = Rc::new(node);
         node.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
         if scenario.timeout_secs != 0 {
             node.config
@@ -1435,20 +1495,22 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         };
         // A refused timer assembly ends the run with its text, never a
         // derived `Debug`: the text carries the refusal's token.
-        let (plane, serve_mark, timer_set) = ServerPlane::<_, inf_server::StdSegmentFs>::new(
-            CellId(i as u16),
-            scenario.cells,
-            listener_fd(i as u16),
-            seed,
-            fabric,
-            node,
-            oracle.clone(),
-            false,
-        )
-        .unwrap_or_else(|refused| panic!("cell {i}'s assembly refused: {refused}"));
+        let (plane, serve_mark, timer_set, executor) =
+            ServerPlane::<_, inf_server::StdSegmentFs>::new(
+                CellId(i as u16),
+                scenario.cells,
+                listener_fd(i as u16),
+                seed,
+                fabric,
+                node,
+                admission,
+                oracle.clone(),
+                false,
+            )
+            .unwrap_or_else(|refused| panic!("cell {i}'s assembly refused: {refused}"));
         let config = LoopConfig { spin_iters: 4, ..Default::default() };
         let cell_loop =
-            CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark, timer_set);
+            CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark, timer_set, executor);
         nets.push(net);
         cells.push((cell_loop, plane));
     }
@@ -1517,7 +1579,15 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         for scope in ClientScope::all(scenario.namespaces) {
             let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
             let fd = nets[cell].borrow_mut().connect();
-            auditors.push(Auditor { scope, cell, fd, rx: Vec::new(), bound: false, closed: false });
+            auditors.push(Auditor {
+                scope,
+                cell,
+                fd,
+                rx: Vec::new(),
+                bound: false,
+                closed: false,
+                framed: false,
+            });
         }
     }
     let mut audit_state = AuditState::Idle;
@@ -1594,6 +1664,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         .is_accept_retry_leg()
         .then(|| accept_retry::RetryWatch::new(cells.len(), scenario.step_ns_bound()));
 
+    let mut watch = OwnersWatch::new(cells.len());
     loop {
         report.scheduler_steps += 1;
         oracle.0.borrow_mut().state.number(b"step", clock.now().0);
@@ -1609,6 +1680,11 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             let (cell_loop, plane) = &mut cells[i];
             cell_loop.run_iteration(plane).expect("sim iteration");
         }
+        // O1 on every step (ADR-0177 D2), judged here from each cell's raw
+        // owners and the runner's own reading of its clients.
+        watch.read_clients(&clients, &subs, &auditors, &idle);
+        let owners = cells.iter().map(|(cell_loop, plane)| plane.conn_owners(cell_loop.executor()));
+        watch.judge(owners, &nets, &format_args!("step {}", report.scheduler_steps));
         if let Some(watch) = &mut retry_watch {
             watch.sample(clock.now(), &nets);
         }
@@ -1748,6 +1824,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                         &label,
                         &mut report,
                         &mut violations,
+                        &mut watch,
                     );
                     next_audit_at += scenario.audit_every;
                     audit_state = AuditState::Idle;
@@ -1773,6 +1850,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                     "final audit",
                     &mut report,
                     &mut violations,
+                    &mut watch,
                 );
                 final_audit_done = true;
                 for auditor in &mut auditors {
@@ -1842,11 +1920,15 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             && nets.iter().all(|n| n.borrow().pending_bytes() == 0)
             && cells.iter().all(|(_, plane)| plane.suspended() == 0);
         if all_done {
-            // Run teardown iterations so server-side closes complete.
+            // Run teardown iterations so server-side closes complete, O1
+            // judged at each.
             for _ in 0..32 {
                 for (cell_loop, plane) in &mut cells {
                     cell_loop.run_iteration(plane).expect("teardown iteration");
                 }
+                let owners =
+                    cells.iter().map(|(cell_loop, plane)| plane.conn_owners(cell_loop.executor()));
+                watch.judge(owners, &nets, &"a teardown iteration");
             }
             break;
         }
@@ -2028,6 +2110,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                     plane.connections()
                 ));
             }
+            // O1's leak clause (ADR-0177 D2): no `conn` header stays Retired.
+            let owners = plane.conn_owners(cells[i].0.executor());
+            watch.judge.settled(i, owners, &"quiescence");
         }
         audit::small_cap_engagement(scenario, &cells, &mut violations);
         {
@@ -2075,6 +2160,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             peers: scenario.cells - 1,
             tiered_tables: plane.keyspace().tiered_tables(),
             turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
+            maint_paced: nodes[index].tier_maint_task_waits.get(),
         };
         census.judge(index, plane.cap_census(), facts);
     }
@@ -2098,6 +2184,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     }
     report.state_hash = state.value();
     crate::net::drain_violations(&nets, &mut violations);
+    violations.extend(watch.judge.take_violations());
     // Appended, never assigned: a check that wrote the report's list before
     // this point keeps its line.
     report.oracle_violations.extend(oracle.violations.clone());

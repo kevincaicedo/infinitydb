@@ -34,8 +34,8 @@ use inf_log::{
     TierIoMode, tier_extract, tier_frame_offset, tier_frame_span,
 };
 use inf_runtime::{
-    BackendDriver, CellExecutor, CompletionResult, CompletionToken, GateWait, IoGate, IoOp,
-    PollImmediate, RawFd, StableBytesMut, TokenClass, Wait,
+    BackendDriver, CellExecutor, CompletionResult, CompletionToken, ExecutorLayout, GateWait,
+    IoGate, IoOp, PollImmediate, RawFd, StableBytesMut, TaskAdmission, TaskClass, TokenClass, Wait,
 };
 use inf_store::{
     AddrClass, AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId,
@@ -249,15 +249,33 @@ fn pump_until<T>(
     panic!("m4-steel pump exceeded its bound");
 }
 
-fn run_get(ctx: &Rc<RefCell<Ctx>>, ex: &mut CellExecutor, key: &[u8]) -> (Answer, bool) {
+/// One steel `GET` as a task: its answer kept for the caller.
+async fn get_task(ctx: Rc<RefCell<Ctx>>, key: Vec<u8>, sink: Rc<RefCell<Option<Answer>>>) {
+    let answer = steel_get(ctx, key).await;
+    *sink.borrow_mut() = Some(answer);
+}
+
+/// The steel thread's executor of one class, its `GET` task, on a census of its own.
+fn get_executor() -> (CellExecutor, TaskClass) {
+    let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let gets = layout.class(&get_task, crate::limits::STEEL_GETS).expect("the steel's class");
+    (layout.build().expect("the steel's executor"), gets)
+}
+
+fn run_get(
+    ctx: &Rc<RefCell<Ctx>>,
+    (ex, gets): &mut (CellExecutor, TaskClass),
+    key: &[u8],
+) -> (Answer, bool) {
     let done: Rc<RefCell<Option<Answer>>> = Rc::new(RefCell::new(None));
     let sink = Rc::clone(&done);
     let fut_ctx = Rc::clone(ctx);
     let key = key.to_vec();
-    let outcome = ex.poll_immediate(async move {
-        let answer = steel_get(fut_ctx, key).await;
-        *sink.borrow_mut() = Some(answer);
-    });
+    let TaskAdmission::Granted(permit) = ex.reserve(*gets) else {
+        panic!("the steel's class holds its one GET");
+    };
+    let outcome = permit.poll_immediate(|| get_task(fut_ctx, key, sink));
     match outcome {
         PollImmediate::Completed => {
             (done.borrow_mut().take().expect("completed future stored its answer"), false)
@@ -364,7 +382,7 @@ fn run_life(
         _tier_handles: handles,
         next_token: 1,
     }));
-    let mut ex = CellExecutor::new(8);
+    let mut ex = get_executor();
 
     // Cold-read every model key; content + version compared (never
     // addresses — §3.1).

@@ -179,15 +179,19 @@ fn audit_roundtrip(
     nets: &[Rc<RefCell<CellNet>>],
     auditor: &mut Auditor,
     wire: &[u8],
+    watch: &mut OwnersWatch,
 ) -> Result<Vec<u8>, String> {
     nets[auditor.cell].borrow_mut().client_send(auditor.fd, wire);
     for _ in 0..STALL_STEPS {
         for (cell_loop, plane) in cells.iter_mut() {
             cell_loop.run_iteration(plane).expect("audit iteration");
         }
+        let owners = cells.iter().map(|(cell_loop, plane)| plane.conn_owners(cell_loop.executor()));
+        watch.judge(owners, nets, &"an audit iteration");
         let rx = nets[auditor.cell].borrow_mut().client_recv(auditor.fd);
         auditor.rx.extend_from_slice(&rx);
         if let Some(n) = reply_len(&auditor.rx) {
+            auditor.framed = true;
             return Ok(auditor.rx.drain(..n).collect());
         }
     }
@@ -230,6 +234,7 @@ pub(super) fn run_audit(
     label: &str,
     report: &mut SimReport,
     violations: &mut Violations,
+    watch: &mut OwnersWatch,
 ) {
     let now = clock.now();
     report.audits += 1;
@@ -250,7 +255,7 @@ pub(super) fn run_audit(
         if !auditor.bound
             && let Some(bind) = auditor.scope.bind_wire()
         {
-            match audit_roundtrip(cells, nets, auditor, &bind) {
+            match audit_roundtrip(cells, nets, auditor, &bind, watch) {
                 Ok(reply) if reply == b"+OK\r\n" => {}
                 Ok(reply) => violations
                     .push(format!("{who}: binding refused: {:?}", String::from_utf8_lossy(&reply))),
@@ -262,7 +267,7 @@ pub(super) fn run_audit(
         let expected: BTreeSet<Vec<u8>> =
             model.keys().filter(|(s, _)| *s == scope).map(|(_, k)| k.clone()).collect();
         // DBSIZE: the scope's node-wide count.
-        match audit_roundtrip(cells, nets, auditor, &encode(&[b"DBSIZE".to_vec()])) {
+        match audit_roundtrip(cells, nets, auditor, &encode(&[b"DBSIZE".to_vec()]), watch) {
             Ok(reply) => {
                 let want = Reply::Int(expected.len() as i64);
                 let got = parse_reply(&reply);
@@ -284,7 +289,7 @@ pub(super) fn run_audit(
                 b"COUNT".to_vec(),
                 count.to_string().into_bytes(),
             ];
-            let reply = match audit_roundtrip(cells, nets, auditor, &encode(&argv)) {
+            let reply = match audit_roundtrip(cells, nets, auditor, &encode(&argv), watch) {
                 Ok(reply) => parse_reply(&reply),
                 Err(e) => {
                     violations.push(format!("{who}: {e}"));
@@ -335,7 +340,13 @@ pub(super) fn run_audit(
         let glob = auditor.scope.glob(rng.next_u64() % 10);
         let want: BTreeSet<Vec<u8>> =
             expected.iter().filter(|k| glob_match(&glob, k, false)).cloned().collect();
-        match audit_roundtrip(cells, nets, auditor, &encode(&[b"KEYS".to_vec(), glob.clone()])) {
+        match audit_roundtrip(
+            cells,
+            nets,
+            auditor,
+            &encode(&[b"KEYS".to_vec(), glob.clone()]),
+            watch,
+        ) {
             Ok(reply) => match parse_reply(&reply) {
                 Reply::Array(items) if bulk_set(&items).is_some_and(|got| got == want) => {}
                 other @ (Reply::Simple(_)
@@ -352,7 +363,7 @@ pub(super) fn run_audit(
             Err(e) => violations.push(format!("{who}: {e}")),
         }
         // RANDOMKEY: membership (the two-level draw is the recorded deviation).
-        match audit_roundtrip(cells, nets, auditor, &encode(&[b"RANDOMKEY".to_vec()])) {
+        match audit_roundtrip(cells, nets, auditor, &encode(&[b"RANDOMKEY".to_vec()]), watch) {
             Ok(reply) => match parse_reply(&reply) {
                 Reply::Nil if expected.is_empty() => {}
                 Reply::Bulk(key) if expected.contains(&key) => {}
@@ -397,7 +408,7 @@ pub(super) fn run_audit(
             }
         }
         let expected = expected.finish().into_bytes();
-        match audit_roundtrip(cells, nets, auditor, &encode(&argv)) {
+        match audit_roundtrip(cells, nets, auditor, &encode(&argv), watch) {
             Ok(reply) if reply == expected => {}
             Ok(reply) => violations.push(format!(
                 "{who}: {:?} answered {:?}, model {:?}",

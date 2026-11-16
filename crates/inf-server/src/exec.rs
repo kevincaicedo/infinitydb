@@ -28,7 +28,7 @@ use inf_store::{
 use inf_wire::{ArgvRef, CmdFlags, CommandId, Protocol, ReplyBuf, RespWriter, arity_ok, lookup};
 
 use crate::admin;
-use crate::clients::ClientRegistry;
+use crate::clients::{ClientAdmission, ClientRegistry};
 use crate::config::{ConfigStore, DATABASES};
 use crate::glob::glob_match;
 #[cfg(feature = "doc")]
@@ -169,6 +169,11 @@ pub struct NodeState {
     /// Render-only, cell scope.
     pub tier_ns_positions: Cell<u64>,
     pub tier_position_conflicts: Cell<u64>,
+    /// Namespaces a MAINTAIN pass left for a later one because their task
+    /// class had no room (ADR-0177 D2's `compact` and `shadow` crossing,
+    /// counted at the room): at the shipped caps reached only while a
+    /// finished task's slot is still held. Cell scope; a statistic.
+    pub tier_maint_task_waits: Cell<u64>,
     pub connections: Cell<u64>,
     pub recv_dropped: Cell<u64>,
     /// The cell executor's `waker_foreign_ops`: waker operations made off the cell's thread,
@@ -245,6 +250,22 @@ pub struct NodeState {
     /// Idle connections closed by `timeout` (ADR-0123 D2; `INFO stats
     /// idle_disconnections`, cell scope).
     pub idle_disconnections: Cell<u64>,
+    /// A close's drain (ADR-0123 A2, ADR-0196; `INFO stats`, cell scope):
+    /// commands dequeued from a closing or draining slot; inbox entries a
+    /// draining slot's parser parsed; `Peer` run-outs that found no take of
+    /// the inbox since their stamp and waited; deliveries a flushing slot
+    /// answered with nothing written. Lifetime counters, statistics only.
+    pub closed_queue_commands: Cell<u64>,
+    pub closed_reader_entries: Cell<u64>,
+    pub reader_take_waits: Cell<u64>,
+    pub flushing_deliveries_dropped: Cell<u64>,
+    /// Replies PARSE wrote while the pump owed the connection earlier ones
+    /// (a `-LOADING` refusal, a protocol error), queued behind them so they
+    /// leave in pipeline order (`INFO stats`, cell scope).
+    pub parse_replies_queued: Cell<u64>,
+    /// Draining slots: ADR-0123 A1's third population, beside `active`
+    /// (`connected_clients`); a gauge, cell scope, flushed by MAINTAIN.
+    pub draining_connections: Cell<u64>,
     /// `JSON.*` replies this cell refused over `doc-max-reply-bytes` and
     /// the reply bytes those refusals built and discarded — the CPU the
     /// limit cost (ADR-0099 A1; `INFO stats`, cell scope). Lifetime counters that saturate at
@@ -471,8 +492,10 @@ pub struct NodeState {
     /// Read-only process gauges; the process supervisor alone samples the OS.
     /// Bare deterministic harnesses render zeros until they attach a board.
     pub process_board: RefCell<Option<std::sync::Arc<crate::ProcessBoard>>>,
-    /// CLIENT registry for this cell's connections (single-threaded).
-    pub clients: RefCell<ClientRegistry>,
+    /// CLIENT registry for this cell's connections (single-threaded),
+    /// shared with the [`ClientAdmission`] minted with it, which alone
+    /// inserts a row; every reader of the node can update one only.
+    pub clients: Rc<RefCell<ClientRegistry>>,
     /// Typed CONFIG store (M1-S03 freeze: keys + hot-reload classes).
     pub config: RefCell<ConfigStore>,
     /// Per-cell recycled JSON parser (M3-S11): scratch buffers survive
@@ -562,19 +585,26 @@ pub(crate) fn memory_gauges_of(
 
 impl NodeInfo {
     /// Assemble this cell's state from validated boot configuration before accepting
-    /// connections. A refused cache reservation publishes no node or config.
-    pub fn try_new(config: ConfigStore) -> Result<Self, std::collections::TryReserveError> {
+    /// connections. A refused cache reservation publishes no node or config. The
+    /// client registry is minted here with its one admission, returned beside the
+    /// node for the plane that accepts this cell's connections; a node built with
+    /// no plane drops it.
+    pub fn try_new(
+        config: ConfigStore,
+    ) -> Result<(Self, ClientAdmission), std::collections::TryReserveError> {
         #[cfg(feature = "doc")]
         let path_cache = inf_doc::ProgramCache::try_new(config.path_cache_capacity())?;
-        Ok(Self {
-            state: NodeState { config: RefCell::new(config), ..NodeState::default() },
+        let (clients, admission) = ClientRegistry::with_admission();
+        let node = Self {
+            state: NodeState { config: RefCell::new(config), clients, ..NodeState::default() },
             cache_boot: crate::cache_boot::CacheBootReadiness::Standalone,
             #[cfg(feature = "doc")]
             path_cache: RefCell::new(path_cache),
-        })
+        };
+        Ok((node, admission))
     }
 
-    pub fn try_default() -> Result<Self, std::collections::TryReserveError> {
+    pub fn try_default() -> Result<(Self, ClientAdmission), std::collections::TryReserveError> {
         Self::try_new(ConfigStore::default())
     }
 
@@ -669,21 +699,16 @@ pub struct ConnCx {
 impl ConnCx {
     /// Mirrors db and subscription counts into the cell's client registry
     /// (F-L15-09) — called where they change, so `CLIENT LIST` from any
-    /// connection reads tracked state. `program` contexts (fabric legs)
-    /// are never clients and never register.
-    pub(crate) fn publish_client_state(&self, now: Nanos) {
+    /// connection reads tracked state; an update, so an id whose row
+    /// left the registry gains none. `program` contexts (fabric legs) are
+    /// never clients.
+    pub(crate) fn publish_client_state(&self) {
         if self.program {
             return;
         }
         let sub = u32::try_from(self.sub_channels.len()).unwrap_or(u32::MAX);
         let psub = u32::try_from(self.sub_patterns.len()).unwrap_or(u32::MAX);
-        self.node.clients.borrow_mut().note_conn_state(
-            self.id,
-            now.as_millis(),
-            self.db,
-            sub,
-            psub,
-        );
+        self.node.clients.borrow_mut().note_conn_state(self.id, self.db, sub, psub);
     }
 }
 
@@ -691,7 +716,11 @@ impl ConnCx {
     /// Standalone connection state for embedded command harnesses. Production
     /// connections share their plane's already constructed NodeInfo.
     pub fn try_default() -> Result<ConnCx, std::collections::TryReserveError> {
-        let node = Rc::new(NodeInfo::try_default()?);
+        let (node, admission) = NodeInfo::try_default()?;
+        // Id 1's row, as a connection's at admission: no plane key, the
+        // placeholder address, created at 0.
+        admission.register(1, None, "0.0.0.0:0".to_string(), 0);
+        let node = Rc::new(node);
         Ok(ConnCx {
             proto: Protocol::Resp2,
             id: 1,
@@ -827,7 +856,7 @@ pub fn execute(
         // ---- keyspace-level commands (M1-E3/E4) ----
         CommandId::Select => {
             let mut w = RespWriter::new(out, cx.proto);
-            select(argv, ks, cx, now, &mut w);
+            select(argv, ks, cx, &mut w);
         }
         CommandId::Flushall => {
             let mut w = RespWriter::new(out, cx.proto);
@@ -865,7 +894,7 @@ pub fn execute(
         CommandId::InfNs => {
             let node = Rc::clone(&cx.node);
             let mut w = RespWriter::new(out, cx.proto);
-            admin::inf_ns(argv, ks, cx, &node, now, &mut w);
+            admin::inf_ns(argv, ks, cx, &node, &mut w);
         }
         // ---- pub/sub (M1-S10): conn-state ops here; registries, delivery,
         // and fan-out are plane state, so inside a node the plane intercepts
@@ -879,7 +908,7 @@ pub fn execute(
                 pubsub::SubKind::Pattern
             };
             let names: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
-            pubsub::apply_subscribe(&names, kind, cx, now, out);
+            pubsub::apply_subscribe(&names, kind, cx, out);
         }
         CommandId::Unsubscribe | CommandId::Punsubscribe => {
             let kind = if meta.id == CommandId::Unsubscribe {
@@ -889,7 +918,7 @@ pub fn execute(
             };
             let names: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
             let names = if names.is_empty() { None } else { Some(names.as_slice()) };
-            pubsub::apply_unsubscribe(names, kind, cx, now, out);
+            pubsub::apply_unsubscribe(names, kind, cx, out);
         }
         CommandId::Publish => pubsub::publish_fallback(argv.arg(1), argv.arg(2), cx, out),
         CommandId::Pubsub => {
@@ -968,7 +997,7 @@ fn execute_db(
             }
         }
         CommandId::Echo => w.bulk(argv.arg(1)),
-        CommandId::Hello => admin::hello(argv, cx, now, out),
+        CommandId::Hello => admin::hello(argv, cx, out),
         // QUIT: acknowledge, then ask the plane to close after the reply
         // flushes (Redis `quitCommand`). Allowed in RESP2 subscriber mode.
         CommandId::Quit => {
@@ -1769,20 +1798,14 @@ fn object_subcommand_error(sub: &[u8], w: &mut RespWriter<'_>) {
 /// `SELECT 0..15` maps to the default namespaces (M1-S08). The selection
 /// is connection state — the plane serializes it in pipeline order exactly
 /// like HELLO's protocol switch (a conn-state barrier).
-fn select(
-    argv: &(impl Argv + ?Sized),
-    ks: &mut Keyspace,
-    cx: &mut ConnCx,
-    now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+fn select(argv: &(impl Argv + ?Sized), ks: &mut Keyspace, cx: &mut ConnCx, w: &mut RespWriter<'_>) {
     match parse_i64(argv.arg(1)) {
         Ok(n) if (0..i64::from(DATABASES)).contains(&n) => {
             cx.db = n as u16;
             cx.ns = ConnNamespace::Default; // explicit escape from a required default
             // Materialize eagerly: a SELECTed db is about to be used.
             let _ = ks.db_mut(n as usize);
-            cx.publish_client_state(now);
+            cx.publish_client_state();
             w.simple("OK");
         }
         Ok(_) => w.error("ERR DB index is out of range"),

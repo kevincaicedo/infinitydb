@@ -54,11 +54,14 @@ impl Candidate {
         let capacity = inf_server::BootCapacity::new(crate::harness::BOOT_MAXCLIENTS, cells)
             .expect("the compat boot capacity fits one cell");
         let config = inf_server::ConfigStore::default().with_boot_capacity(capacity);
-        let node = inf_server::NodeInfo::try_new(config).expect("fixture cache allocation");
+        let (node, admission) =
+            inf_server::NodeInfo::try_new(config).expect("fixture cache allocation");
         let cx = ConnCx {
             node: std::rc::Rc::new(node),
             ..ConnCx::try_default().expect("fixture cache allocation")
         };
+        // The candidate's one client, admitted at its construction.
+        admission.register(cx.id, None, "0.0.0.0:0".to_string(), 0);
         // Wall anchor at the candidate's epoch: EXPIREAT/EXAT/EXPIRETIME
         // convert through the same Unix instants the redis-server oracle
         // sees, so absolute-time cases diff within `IntWithin` tolerances.

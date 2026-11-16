@@ -320,9 +320,10 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
     // totality is asserted by a table-iterating test.
     let keyspace_level = keyspace_level(meta, argv);
     if !keyspace_level && shared.store.borrow().is_tiered(ns) {
-        match tiered::dispatch_tiered(shared, origin, ns, meta, argv, proto, class).await {
+        let gate = ApplyGate::client(NsApplyRead::new(meta, class));
+        match tiered::dispatch_tiered(shared, origin, ns, meta, argv, proto, gate).await {
             tiered::TieredReply::Done(reply) => pending.push_back(PendingReply::Done(reply)),
-            tiered::TieredReply::Gated { reply, seq } => {
+            tiered::TieredReply::Gated { reply, seq, gate: ClientAck } => {
                 let waiter = {
                     let mut durable = shared.durable.borrow_mut();
                     let cell = durable.as_mut().expect("tiered implies the durable plane");
@@ -382,13 +383,11 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
     if close {
         close_after_reply(shared, key);
     }
-    let gated = if is_write
+    let staged = if is_write
         && stages(reply.outcome(), meta.id)
         && let Some(class) = class
-        && let Some(seq) = shared.stage_durable_effects(ns, meta, argv, class)
-        && class == FsyncClass::Always
     {
-        Some(seq)
+        shared.stage_durable_effects(ns, meta, argv, class)
     } else {
         None
     };
@@ -396,7 +395,8 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
     if bracket.is_some() {
         shared.store.borrow_mut().idx_bracket_commit(ns, &keys);
     }
-    if let Some(seq) = gated {
+    if let Some((seq, ClientAck)) = ApplyGate::client(NsApplyRead::new(meta, class)).settle(staged)
+    {
         let waiter = {
             let mut durable = shared.durable.borrow_mut();
             let cell = durable.as_mut().expect("staged above");

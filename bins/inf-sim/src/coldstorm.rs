@@ -51,8 +51,8 @@ use inf_log::{
 };
 use inf_runtime::limits::COLD_DELIVERIES_PER_TURN;
 use inf_runtime::{
-    BackendDriver, CellExecutor, ColdReads, ColdReceipt, ColdTurn, Completion, CompletionResult,
-    RawFd, TierFileId, TokenClass, Wait,
+    BackendDriver, ColdReads, ColdReceipt, ColdTurn, Completion, CompletionResult, RawFd,
+    TierFileId, TokenClass, Wait,
 };
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId, StoreConfig,
@@ -484,6 +484,17 @@ fn refused_plan(refused: inf_runtime::ColdRefused) -> Plan {
 /// The hardened GET: fetch-verify-retry with re-resolution after every
 /// resume, bounded chunked staging for oversized records, and bounded
 /// restarts when relocation moves the record mid-read.
+/// One storm `GET` as a task, its key and its cancel roll: its answer kept for the round's
+/// check.
+async fn storm_get(
+    world: Rc<RefCell<World>>,
+    (key, cancel_roll): (Vec<u8>, u64),
+    sink: Rc<RefCell<Vec<GetAnswer>>>,
+) {
+    let answer = cold_get(world, key, cancel_roll).await;
+    sink.borrow_mut().push(answer);
+}
+
 async fn cold_get(world: Rc<RefCell<World>>, key: Vec<u8>, cancel_roll: u64) -> GetAnswer {
     let hash = world.borrow().ks.hasher().hash(&key);
     let from_seq = world.borrow().model.get(&key).map_or(0, |h| h.seq);
@@ -1101,7 +1112,11 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
         counts: RoundCounts::default(),
         report: ColdStormReport::default(),
     }));
-    let mut ex = CellExecutor::new(256);
+    let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+    let mut layout = inf_runtime::ExecutorLayout::new(&census);
+    let gets = layout.class(&storm_get, crate::limits::COLDSTORM_GETS);
+    let gets = gets.expect("the storm's one class");
+    let mut ex = layout.build().expect("the storm's executor");
     let mut recv_pool = BufferPool::new(2, 4096);
     let answers: Rc<RefCell<Vec<GetAnswer>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -1135,10 +1150,10 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
                 let cancel_roll = rng.next_u64() % 1000;
                 let world_rc = Rc::clone(&world);
                 let sink = Rc::clone(&answers);
-                let _ = ex.poll_immediate(async move {
-                    let answer = cold_get(world_rc, key, cancel_roll).await;
-                    sink.borrow_mut().push(answer);
-                });
+                let inf_runtime::TaskAdmission::Granted(permit) = ex.reserve(gets) else {
+                    panic!("the storm's class holds every GET in flight");
+                };
+                let _ = permit.poll_immediate(|| storm_get(world_rc, (key, cancel_roll), sink));
             }
         }
         ex.run_ready(512); // issue: cold reads go in flight, pins held.

@@ -268,13 +268,16 @@ impl Rig {
             .into_iter()
             .enumerate()
             .map(|(cell, fabric)| {
-                let (plane, _serve_mark, _timer_set) = ServerPlane::new(
+                let (fixture_node, admission) =
+                    NodeInfo::try_default().expect("fixture cache allocation");
+                let (plane, _serve_mark, _timer_set, _executor) = ServerPlane::new(
                     CellId(cell as u16),
                     2,
                     -1,
                     KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
                     fabric,
-                    Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+                    Rc::new(fixture_node),
+                    admission,
                     NoopObserver,
                     false,
                 )

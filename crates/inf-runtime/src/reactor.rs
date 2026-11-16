@@ -326,7 +326,9 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     /// its first iteration begins, so the census serves from then on.
     /// `timers` is the cell's timer set, built on that census with every
     /// owner the cell's hosts hold already reserved (ADR-0154 D1): the loop
-    /// alone delivers its arms.
+    /// alone delivers its arms. `executor` is the cell's executor, built
+    /// from its layout on that census (ADR-0177 D2), with the plane-start
+    /// tasks the cell's setup made on it before handing it to the loop.
     pub fn new(
         driver: D,
         clock: C,
@@ -334,6 +336,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         config: LoopConfig,
         serve_mark: ServeMark,
         timers: TimerSet,
+        executor: CellExecutor,
     ) -> CellLoop<D, C> {
         CellLoop {
             census: Rc::clone(serve_mark.census()),
@@ -341,7 +344,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             driver,
             clock,
             pool,
-            executor: CellExecutor::new(1024),
+            executor,
             timers,
             turn: TurnLedger::new(GroupScheduler::m0_default()),
             config,

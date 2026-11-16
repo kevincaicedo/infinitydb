@@ -37,7 +37,7 @@ pub use map::{
     VacantSlot,
 };
 pub use slab::{
-    Built, CappedSlab, Generation, GenerationPolicy, Lookup, LookupMut, Retire, Retiring,
+    Built, CappedSlab, Generation, GenerationPolicy, Lookup, LookupMut, Released, Retire, Retiring,
     SlabBuilder, SlabReserved, SlabRetiring, SlotId, SlotReservation, Taken, WrapWithProof,
 };
 

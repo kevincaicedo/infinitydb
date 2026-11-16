@@ -340,6 +340,13 @@ impl ConfigStore {
         config
     }
 
+    /// `C` for one of `cells` cells: `max(1, B / cells)`, the connection
+    /// slots, and `conn` tasks, each cell holds from boot (ADR-0123 A1,
+    /// ADR-0177 D2). `cells` is the node's checked count, never 0.
+    pub(crate) fn boot_share(&self, cells: u16) -> u32 {
+        (self.boot.maxclients() / u32::from(cells.max(1))).max(1)
+    }
+
     /// Assemble boot configuration with the node's boot capacity (ADR-0123
     /// A1): `maxclients` starts at `B` and may not be set above it.
     #[must_use]

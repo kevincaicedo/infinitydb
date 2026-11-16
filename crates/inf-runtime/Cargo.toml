@@ -65,6 +65,13 @@ name = "waker_ab"
 harness = false
 test = false
 
+# The executor's A/B by instructions (ADR-0205): each row a task path of the
+# cell executor, one binary, `--variant <leg>-<row> --ops <n>`.
+[[bench]]
+name = "executor_ab"
+harness = false
+test = false
+
 # M0-S04 echo gate (Linux + uring only; skipped without the feature).
 [[bench]]
 name = "uring_echo"

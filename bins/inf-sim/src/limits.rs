@@ -1,5 +1,7 @@
 //! Bounds owned by the simulator. Every crossing names its behaviour here.
 
+use inf_foundation::bounded::{Cap, CapFill};
+
 /// Escaped bytes of one printed violation text, counted after control
 /// characters are escaped. Owner: the driver's one line writer
 /// (`driver::write_text`), which every single-run violation line, every
@@ -28,3 +30,19 @@ pub const READINGS_BYTES_MAX: usize = 64;
 /// stderr is its record and takes every failing seed, each line cut by
 /// `VIOLATION_TEXT_BYTES_MAX`.
 pub const FAILING_SEEDS_PRINTED_MAX: u64 = 5;
+
+/// Cold reads the steel thread's executor holds at once (ADR-0177 D2: no
+/// task without a class): its one class, a `GET` whose tier read may
+/// suspend. Owner: `steel::run`, which makes one at a time. Crossing: a
+/// reserve past it panics the run, a harness defect.
+pub const STEEL_GETS: Cap = Cap::entries::<8>("steel-gets", CapFill::Serving);
+
+/// Writers the pressure leg's executor holds: its one class, a writer
+/// storm, eight of which run for the leg's life. Owner:
+/// `pressure::run_pressure_scenario`. Crossing: as [`STEEL_GETS`].
+pub const PRESSURE_WRITERS: Cap = Cap::entries::<64>("pressure-writers", CapFill::Serving);
+
+/// Cold `GET`s the cold storm's executor holds at once: its one class.
+/// Owner: `coldstorm::run`, whose rounds keep at most this many in
+/// flight. Crossing: as [`STEEL_GETS`].
+pub const COLDSTORM_GETS: Cap = Cap::entries::<256>("coldstorm-gets", CapFill::Serving);

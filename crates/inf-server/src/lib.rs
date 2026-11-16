@@ -50,7 +50,7 @@ pub const EXIT_DURABLE_FAILSTOP: i32 = 3;
 
 pub use cache_boot::{CacheBootGroup, CacheBootPermit};
 pub use ckpt::{CkptStats, ManifestStats};
-pub use clients::{ClientInfo, ClientRegistry};
+pub use clients::{ClientAdmission, ClientInfo, ClientRegistry};
 pub use config::{
     BootCapacity, BootCapacityRefused, ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass,
 };
@@ -113,8 +113,8 @@ pub use key_hash::{
 };
 pub use loop_snapshot::LoopSnapshot;
 pub use plane::{
-    ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneBuildError, PlaneObserver, ServerPlane,
-    StopHold, StopPhase, TimerAssemblyError, TimerRole, fold_live_entries,
+    ConnOwners, ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneBuildError, PlaneObserver,
+    ServerPlane, StopHold, StopPhase, TimerAssemblyError, TimerRole, fold_live_entries,
 };
 pub use plane::{MeshConfigRefused, checked_mesh_config};
 pub use readahead::boot_prefetch_threads_spawned;

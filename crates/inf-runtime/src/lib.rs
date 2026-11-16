@@ -65,7 +65,10 @@ pub use driver::{
     AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd,
     StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier, classify_accept_errno,
 };
-pub use executor::{CellExecutor, PollImmediate, TaskId};
+pub use executor::{
+    CellExecutor, ExecutorInitError, ExecutorLayout, Park, PollImmediate, TaskAdmission, TaskClass,
+    TaskFactory, TaskId, TaskPermit, Woken, park,
+};
 pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};
 pub use reactor::{
     CellLoop, CellPlane, IterStats, LoopConfig, LoopCx, ParkCeiling, ParkCeilingTooLong,

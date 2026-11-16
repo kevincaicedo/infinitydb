@@ -27,9 +27,10 @@ use inf_log::{
     StagedAt, StagingRing, SyncReason, create_cell_dirs,
 };
 use inf_runtime::{
-    BackendDriver, Capabilities, CellPlane, Completion, CompletionResult, CompletionToken, IoOp,
-    LoopCx, RawFd, Reserved, StableBytes, SubmitStats, TimerNotice, TimerOutcome, TimerOwner,
-    TimerSet, TokenClass, Wait, WatermarkGate, WriteBarrier,
+    BackendDriver, Capabilities, CellExecutor, CellPlane, Completion, CompletionResult,
+    CompletionToken, ExecutorLayout, IoOp, LoopCx, RawFd, Reserved, StableBytes, SubmitStats,
+    TaskAdmission, TaskClass, TimerNotice, TimerOutcome, TimerOwner, TimerSet, TokenClass, Wait,
+    WatermarkGate, WriteBarrier,
 };
 
 /// Fresh per-test directory under the system temp dir (the pattern the S02
@@ -342,6 +343,31 @@ impl BackendDriver for ScriptedDriver {
 const FIXTURE_OWNERS: Cap = Cap::entries::<1>("log-fixture-owners", CapFill::Serving);
 const NS: NsId = NsId(7);
 
+/// The fixture loop's `always` acks alive at once: a test host's cap.
+const FIXTURE_ACKS: Cap = Cap::entries::<65_536>("log-fixture-acks", CapFill::Serving);
+
+thread_local! {
+    /// The ack class of the executor this thread's fixture loop was built with.
+    static ACK_CLASS: core::cell::Cell<Option<TaskClass>> = const { core::cell::Cell::new(None) };
+}
+
+/// The fixture loop's executor on `census`: one class, the `always` ack task the plane spawns
+/// for each staged record (ADR-0177 D2: no task without a class).
+pub fn loop_executor(census: &Rc<CapCensus>) -> CellExecutor {
+    let mut layout = ExecutorLayout::new(census);
+    let class = layout.class(&ack_task, FIXTURE_ACKS).expect("the fixture's ack class");
+    ACK_CLASS.with(|slot| slot.set(Some(class)));
+    layout.build().expect("no class refuses")
+}
+
+/// One `always` record's ack: it waits for the watermark to cover its LSN, then records it.
+async fn ack_task(gate: WatermarkGate, lsn: Lsn, acks: Rc<RefCell<Vec<(Lsn, u64)>>>) {
+    gate.waiter(lsn.to_u64()).await;
+    let watermark = gate.watermark();
+    assert!(watermark >= lsn.to_u64(), "S06 oracle: ack for {lsn} before the watermark covered it");
+    acks.borrow_mut().push((lsn, watermark));
+}
+
 /// The fixture cell's timer set on `census` and its everysec owner,
 /// reserved before the loop exists; the plane takes the owner.
 pub fn everysec_timers(census: &Rc<CapCensus>) -> (TimerSet, TimerOwner) {
@@ -560,15 +586,11 @@ impl CellPlane for DurablePlane {
                 let lsn = lease.lsn_of(at);
                 let gate = self.gate.clone();
                 let acks = Rc::clone(&self.acks);
-                cx.executor.spawn_local(async move {
-                    gate.waiter(lsn.to_u64()).await;
-                    let watermark = gate.watermark();
-                    assert!(
-                        watermark >= lsn.to_u64(),
-                        "S06 oracle: ack for {lsn} before the watermark covered it"
-                    );
-                    acks.borrow_mut().push((lsn, watermark));
-                });
+                let class = ACK_CLASS.with(core::cell::Cell::get).expect("a fixture loop");
+                let TaskAdmission::Granted(permit) = cx.executor.reserve(class) else {
+                    panic!("the fixture's ack class refused a task");
+                };
+                permit.spawn_local(move || ack_task(gate, lsn, acks));
             }
             let bytes = self.staging.leased_frame(&lease);
             // SAFETY: the FrameLease is held in the ledger's frame queue

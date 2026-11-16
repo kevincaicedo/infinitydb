@@ -41,14 +41,18 @@ use inf_log::{
     tier_frame_span,
 };
 use inf_runtime::{
-    BackendDriver, CellExecutor, ColdReads, ColdReceipt, ColdTurn, ColdWait, Completion,
-    CompletionResult, PollImmediate, RawFd, ReadClass, TierFileId, TokenClass, UringDriver, Wait,
+    BackendDriver, ColdReads, ColdReceipt, ColdTurn, ColdWait, Completion, CompletionResult,
+    PollImmediate, RawFd, ReadClass, TierFileId, TokenClass, UringDriver, Wait,
 };
 use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig, TieredLookup,
     TieredTable,
 };
+
+#[path = "support/tasks.rs"]
+mod tasks;
+use tasks::TestExecutor;
 
 #[path = "support/uring_env.rs"]
 mod uring_env;
@@ -225,7 +229,7 @@ async fn hardened_get(ctx: Rc<RefCell<Ctx>>, key: Vec<u8>) -> Answer {
 
 /// Pump: submit + reap, routing TierRead completions into the custody
 /// table; then run resumed futures.
-fn pump(ctx: &Rc<RefCell<Ctx>>, ex: &mut CellExecutor) {
+fn pump(ctx: &Rc<RefCell<Ctx>>, ex: &mut TestExecutor) {
     let mut recv_pool = BufferPool::new(2, 4096);
     let mut out = Vec::new();
     {
@@ -248,7 +252,7 @@ fn pump(ctx: &Rc<RefCell<Ctx>>, ex: &mut CellExecutor) {
 
 fn pump_until<T>(
     ctx: &Rc<RefCell<Ctx>>,
-    ex: &mut CellExecutor,
+    ex: &mut TestExecutor,
     done: &Rc<RefCell<Option<T>>>,
 ) -> T {
     for _ in 0..1000 {
@@ -344,7 +348,7 @@ fn build_demoted_corpus(
 
 fn spawn_get(
     ctx: &Rc<RefCell<Ctx>>,
-    ex: &mut CellExecutor,
+    ex: &mut TestExecutor,
     key: &[u8],
 ) -> (Rc<RefCell<Option<Answer>>>, bool) {
     let done: Rc<RefCell<Option<Answer>>> = Rc::new(RefCell::new(None));
@@ -364,7 +368,7 @@ fn cold_reads_share_the_cell_with_hot_commands() {
     let dir = std::env::temp_dir().join(format!("inf-cold-hardened-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp shard dir");
     let (ctx, corpus, _writer) = build_demoted_corpus(&dir);
-    let mut ex = CellExecutor::new(16);
+    let mut ex = TestExecutor::new();
 
     // Issue a cold GET; it suspends with its intent queued (S10), and
     // the drain step admits it to the device.
@@ -428,7 +432,7 @@ fn cancellation_and_unlink_discipline_on_uring() {
     let dir = std::env::temp_dir().join(format!("inf-cold-cancel-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp shard dir");
     let (ctx, corpus, writer) = build_demoted_corpus(&dir);
-    let mut ex = CellExecutor::new(16);
+    let mut ex = TestExecutor::new();
     let file = TierFileId::new(0);
 
     // Leg 1 — cancel before completion: issue a raw read, drop the

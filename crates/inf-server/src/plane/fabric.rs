@@ -190,8 +190,8 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // slot is published before the apply's first effect (ADR-0177
             // D6): no step after an effect can be refused.
             let read = NsApplyRead::of(shared, NsId(ns), argv);
-            let placeholder = match shared.gate_placeholder(from, read) {
-                Ok(placeholder) => placeholder,
+            let gate = match shared.gate_open(from, read) {
+                Ok(gate) => gate,
                 Err(ParkedFull) => {
                     staged.push((from, token, StagedReply::Refused));
                     return;
@@ -199,27 +199,14 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             };
             let start = scratch.len();
             let reply = scratch.open();
-            match shared.execute_ns_owned(from, argv, read, proto, NsId(ns), program, reply) {
-                NsApplyOutcome::Gated(seq) => {
+            match shared.execute_ns_owned(from, argv, read, gate, proto, NsId(ns), program, reply) {
+                NsApplyOutcome::Gated(seq, ticket) => {
                     let verdict = GatedVerdict::new(shared, token, seq, reply.detach());
-                    shared.gate_fill(placeholder, verdict);
-                }
-                // Canary: an `always` write's error waits as a verdict for
-                // the next record's `seq`, not leaving at once.
-                #[cfg(inf_canary_error_reply_gated)]
-                NsApplyOutcome::Reply if placeholder.is_some() => {
-                    use crate::durable::ack_class::AckClasses;
-                    let next = shared.durable.borrow().as_ref().map_or(0, |d| d.staged_seq() + 1);
-                    let verdict = GatedVerdict::new(shared, token, next, reply.detach());
-                    shared.gate_fill(placeholder, verdict);
+                    ticket.fill(verdict);
                 }
                 NsApplyOutcome::Reply => {
-                    #[cfg(not(inf_canary_gated_error_keeps_placeholder))]
-                    shared.gate_cancel(placeholder);
-                    // Canary: a verdict that is a reply, an error's among
-                    // them, leaves its placeholder at its origin's front.
-                    #[cfg(inf_canary_gated_error_keeps_placeholder)]
-                    let _ = placeholder;
+                    // The error, or a reply not gated, leaves at once: its
+                    // slot was released at the apply's settle.
                     let outcome = reply.outcome();
                     staged.push((from, token, StagedReply::Bytes(start, scratch.len(), outcome)));
                 }
@@ -227,7 +214,6 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 // apply parks on the pump and paces instead of refusing
                 // with `-BUSY` (M4.5-S27, ADR-0083 D1).
                 NsApplyOutcome::Park => {
-                    shared.gate_cancel(placeholder);
                     reply.clear();
                     park_ns_apply(shared, from, token, NsId(ns), proto, argv, program, staged);
                 }
@@ -756,17 +742,20 @@ mod fabric_batch_depth {
         const DEPTH: usize = 100_000;
         let mut fabrics = Mesh::new(2, MeshConfig::default());
         let fabric = fabrics.remove(0);
-        let (plane, _serve_mark, _timer_set) = ServerPlane::<_, crate::StdSegmentFs>::new(
-            CellId(0),
-            2,
-            -1,
-            KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
-            fabric,
-            Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
-            NoopObserver,
-            false,
-        )
-        .expect("the server's timer owners fit their cap");
+        let (fixture_node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
+        let (plane, _serve_mark, _timer_set, _executor) =
+            ServerPlane::<_, crate::StdSegmentFs>::new(
+                CellId(0),
+                2,
+                -1,
+                KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
+                fabric,
+                Rc::new(fixture_node),
+                admission,
+                NoopObserver,
+                false,
+            )
+            .expect("the server's timer owners fit their cap");
         let shared = &plane.shared;
         let key: &[u8] = b"k";
         let nested = |depth: usize| {

@@ -24,17 +24,14 @@ use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
 
 use inf_alloc::CountingAllocator;
-use inf_foundation::wake::RemoteStack;
-use inf_runtime::{CellExecutor, PollImmediate};
+use inf_runtime::PollImmediate;
+
+#[path = "support/tasks.rs"]
+mod tasks;
+use tasks::TestExecutor;
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator::new();
-
-/// A wake header's bytes: the bridge's four words and the owner part's five (the executor's
-/// `const` assertion holds it).
-const HEADER_BYTES: u64 = 72;
-/// A remote stack's bytes.
-const STACK_BYTES: u64 = size_of::<RemoteStack>() as u64;
 
 /// Races of a closed header's two last drops: 10⁴ natively, 64 for each seed under Miri.
 const CLOSED_RACES: usize = if cfg!(miri) { 64 } else { 10_000 };
@@ -61,7 +58,7 @@ impl Future for ExportOnce {
 }
 
 /// Parks one `ExportOnce` task on `executor` and returns the waker it exported.
-fn park(executor: &mut CellExecutor, out: &Rc<Cell<Option<Waker>>>) -> Waker {
+fn park(executor: &mut TestExecutor, out: &Rc<Cell<Option<Waker>>>) -> Waker {
     let outcome = executor.poll_immediate(ExportOnce { out: Some(Rc::clone(out)) });
     assert!(matches!(outcome, PollImmediate::Suspended(_)), "the task parks");
     out.take().expect("the first poll exports its waker")
@@ -129,17 +126,18 @@ impl Rival {
 }
 
 /// Two threads drop a closed header's last two wakers at once. The swap that leaves `c = 0`
-/// frees the header and then, the header's count being the stack's last, the stack; the other
-/// swap answered `Kept`, and its call may still be running while both are freed. Between them
-/// the two drops free the header and the stack, each once.
+/// releases the header's count, the array's last, which frees the array and the stack in it; the
+/// other swap answered `Kept`, and its call may still be running while both are freed. Between
+/// them the two drops free the array, once.
 #[test]
 fn two_foreign_last_drops_of_a_closed_header_free_it_once() {
     let rival = Rival::spawn();
     let out = Rc::default();
     for _ in 0..CLOSED_RACES {
-        let mut executor = CellExecutor::new(1);
+        let mut executor = TestExecutor::new();
         let first = park(&mut executor, &out);
         let second = first.clone();
+        let array = i128::try_from(executor.header_array_bytes()).expect("a size");
         // The drop closes the header with both wakers folded into its foreign count: every later
         // operation on it, on either thread, takes the foreign lane.
         drop(executor);
@@ -148,8 +146,8 @@ fn two_foreign_last_drops_of_a_closed_header_free_it_once() {
         let there = rival.kept();
         assert_eq!(
             here + there,
-            -i128::from(HEADER_BYTES + STACK_BYTES),
-            "the two drops free the header and the stack, each once ({here} here, {there} there)"
+            -array,
+            "the two drops free the array and its stack, once ({here} here, {there} there)"
         );
     }
     rival.stop();
@@ -169,7 +167,7 @@ fn a_consuming_foreign_call_races_the_drain_and_the_executors_drop() {
         let mut executor = None;
         let mut waker = None;
         let built = kept_across(|| {
-            let mut parked = CellExecutor::new(1);
+            let mut parked = TestExecutor::new();
             waker = Some(park(&mut parked, &out));
             executor = Some(parked);
         });

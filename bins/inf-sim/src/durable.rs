@@ -2096,6 +2096,9 @@ pub(crate) struct Node {
     /// Each cell's node state, for the counters a life's end reads beside
     /// the census.
     nodes: Vec<Rc<NodeInfo>>,
+    /// O1's judge (ADR-0177 D2), on every step of the life: each cell's
+    /// first breach, joined to the life's verdict at its end.
+    owners: crate::harness::owners::OwnersJudge,
 }
 
 /// One cell's durable configuration for `scenario` (every cell of a node
@@ -2210,7 +2213,8 @@ pub(crate) fn boot_meshed(
             driver
         };
         let pool = BufferPool::new(128, 1024);
-        let node_info = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
+        let (node_info, admission) = NodeInfo::try_default().expect("fixture cache allocation");
+        let node_info = Rc::new(node_info);
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
         nodes.push(Rc::clone(&node_info));
         // The node's keyspace is cataloged (ADR-0189 D4), as `infinityd`'s,
@@ -2222,13 +2226,14 @@ pub(crate) fn boot_meshed(
             ),
             catalog: catalog.clone().unwrap_or_else(inf_store::NsCatalog::empty),
         };
-        let (mut plane, serve_mark, timer_set) = SimPlane::new(
+        let (mut plane, serve_mark, timer_set, executor) = SimPlane::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
             seed,
             fabric,
             node_info,
+            admission,
             observer.clone(),
             false,
         )
@@ -2244,13 +2249,14 @@ pub(crate) fn boot_meshed(
         let spin_iters = scenario.wake.spin(scenario.spin_iters);
         let config = LoopConfig { spin_iters, ..Default::default() };
         let cell_loop =
-            CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark, timer_set);
+            CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark, timer_set, executor);
         nets.push(net);
         cells.push((cell_loop, plane));
     }
     Ok(Node {
         nodes,
         iter_stats: vec![None; cells.len()],
+        owners: crate::harness::owners::OwnersJudge::new(cells.len()),
         cells,
         nets,
         control,
@@ -2283,8 +2289,14 @@ impl Drop for Node {
                 if durable.is_some() { plane.keyspace().tiered_tables() } else { 0 };
             let turn_refused = durable.map(|stats| stats.turn_refused);
             let peers = u16::try_from(self.cells.len() - 1).expect("a node's cells fit a u16");
-            let facts =
-                crate::census::CellFacts { server_plane: true, peers, tiered_tables, turn_refused };
+            let maint_paced = self.nodes[index].tier_maint_task_waits.get();
+            let facts = crate::census::CellFacts {
+                server_plane: true,
+                peers,
+                tiered_tables,
+                turn_refused,
+                maint_paced,
+            };
             verdict.judge(index, plane.cap_census(), facts);
         }
         // The work parked for a peer (ADR-0177 D6): no op refused at a full
@@ -2298,9 +2310,11 @@ impl Drop for Node {
                     .push(format!("PARKED REFUSED: cell {index}, {refused} ops, at a life's end"));
             }
         }
-        // The nets' own invariants join the life's verdict, which every
-        // durable run reads, so they are never dropped with the node.
+        // The nets' own invariants and O1's breaches join the life's
+        // verdict, which every durable run reads, so they are never dropped
+        // with the node.
         crate::net::drain_violations(&self.nets, &mut verdict.violations);
+        verdict.violations.extend(self.owners.take_violations());
         self.observer.2.borrow_mut().absorb(verdict);
     }
 }
@@ -2357,6 +2371,13 @@ impl Node {
             if let Some(err) = plane.take_boot_error() {
                 return Err(err);
             }
+        }
+        // O1's clauses 1 and 2 on every cell (ADR-0177 D2): a durable life's
+        // clients are its legs' own, so clause 3 is the general harness's
+        // and the capacity rig's.
+        let at = clock.now();
+        for (cell, (cell_loop, plane)) in self.cells.iter().enumerate() {
+            self.owners.step(cell, plane.conn_owners(cell_loop.executor()), None, &at);
         }
         if !self.hold_inbox {
             self.inbox.drain(disk, &self.data_dir)?;

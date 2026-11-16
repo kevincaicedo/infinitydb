@@ -27,12 +27,9 @@ fn fd(n: usize) -> RawFd {
 /// close takes its pattern from one subscriber to none and owes cell 1 a
 /// delta. Cell 1 is frozen before the closes: the deltas stay unanswered.
 /// The tasks alive on cell 0 are then at most its occupied connection slots
-/// and its plane-start pumps (O1); at HEAD every closed subscriber's delta
-/// is a task of its own, alive after its connection left the slab.
+/// and its plane-start pumps (O1): each closed subscriber's deltas ship
+/// from its own pump, whose draining slot stays occupied until the acks.
 #[test]
-#[ignore = "a closed subscriber's deltas are a new task per close, alive after its connection \
-            left the slab until the peer acknowledges them; red until a connection's one task \
-            ships its deltas from a draining slot that stays occupied until the last ack"]
 fn a_closed_subscriber_leaves_no_task_beside_its_slot() {
     const SUBSCRIBERS: usize = 200;
     let mut rig = Rig::new(2);

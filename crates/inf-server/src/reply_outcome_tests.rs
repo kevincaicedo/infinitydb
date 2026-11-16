@@ -44,13 +44,16 @@ impl Cells {
             .into_iter()
             .enumerate()
             .map(|(cell, fabric)| {
-                let (plane, _serve_mark, _timer_set) = ServerPlane::new(
+                let (fixture_node, admission) =
+                    NodeInfo::try_default().expect("fixture cache allocation");
+                let (plane, _serve_mark, _timer_set, _executor) = ServerPlane::new(
                     CellId(cell as u16),
                     2,
                     -1,
                     KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
                     fabric,
-                    Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+                    Rc::new(fixture_node),
+                    admission,
                     NoopObserver,
                     false,
                 )
@@ -107,25 +110,25 @@ impl Cells {
 
 /// The cell loop's wake of each origin's ns-apply pump after a FABRIC-IN
 /// pass, where a tiered apply waits in its origin's FIFO. The harness runs
-/// no executor, so a pump must finish in one poll: no leg here suspends,
-/// since no cold read reaches a device. Returns the applies the woken
-/// pumps took: a pump that finished took its whole queue.
+/// no executor, so a pump's one poll must drain its queue and park: no leg
+/// here suspends, since no cold read reaches a device. Returns the applies
+/// the woken pumps took: a pump that parked took its whole queue.
 fn wake_ns_pumps(shared: &Rc<Shared<NoopObserver, StdSegmentFs>>) -> usize {
     let (origins, applies) = {
-        let (queues, active) = (shared.ns_applies.borrow(), shared.ns_pump_active.borrow());
-        let origins: Vec<u16> = queues
-            .origins_waiting()
-            .filter(|origin| !active[usize::from(origin.0)])
-            .map(|origin| origin.0)
-            .collect();
+        let queues = shared.ns_applies.borrow();
+        let origins: Vec<u16> = queues.origins_waiting().map(|origin| origin.0).collect();
         let applies: usize = origins.iter().map(|&origin| queues.len_for(CellId(origin))).sum();
         (origins, applies)
     };
     let mut cx = Context::from_waker(Waker::noop());
     for origin in origins {
-        shared.ns_pump_active.borrow_mut()[usize::from(origin)] = true;
+        shared.ns_pump_parked.borrow_mut()[usize::from(origin)] = false;
         let pump = pin!(ns_apply_pump(Rc::clone(shared), origin));
-        assert!(pump.poll(&mut cx).is_ready(), "the ns-apply pump suspended: no device here");
+        assert!(pump.poll(&mut cx).is_pending(), "the ns-apply pump never ends");
+        assert!(
+            shared.ns_pump_parked.borrow()[usize::from(origin)],
+            "the ns-apply pump suspended before its queue drained: no device here"
+        );
     }
     applies
 }
@@ -148,7 +151,7 @@ fn drain(
         handle_fabric_op(shared, now, from, op, &mut scratch, &mut staged, &mut orphans);
     });
     assert!(
-        !shared.gated.borrow().waits() && !shared.owner_pubs.borrow().waits(),
+        !shared.gated.waits() && !shared.owner_pubs.borrow().waits(),
         "no durable or publish leg in these rows"
     );
     // The cell loop's own shipping of each staged reply (the tag from the
@@ -419,7 +422,9 @@ fn reply_outcome_tiered_scan_refusal_is_the_reply() {
     let meta = lookup(leg[0]).expect("a registered command");
     let class = peer.store.borrow().ns_fsync_class(TIERED);
     let origin = ExecOrigin::Fabric(CellId(0));
-    let own = tiered::dispatch_tiered(peer, origin, TIERED, meta, leg, Protocol::Resp2, class);
+    let gate =
+        peer.gate_open(CellId(0), NsApplyRead::new(meta, class)).expect("a read opens no slot");
+    let own = tiered::dispatch_tiered(peer, origin, TIERED, meta, leg, Protocol::Resp2, gate);
     let tiered::TieredReply::Done(expected) = cells.drive(own, no_answer) else {
         panic!("a read is never gated on a durable write");
     };

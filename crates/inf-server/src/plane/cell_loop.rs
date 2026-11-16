@@ -4,6 +4,133 @@
 
 use super::*;
 
+/// PARSE's staged fast-path batch (M2.5 Phase H, ADR-0029 lever 2) over
+/// one take of the inbox: flushed at each barrier and at each buffer's end.
+struct Staging<'s> {
+    enabled: bool,
+    stage: &'s mut Vec<StagedParse>,
+    bytes: &'s mut Vec<u8>,
+}
+
+impl Staging<'_> {
+    fn flush<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+        origin: ExecOrigin,
+        conn_cx: &mut ConnCx,
+        out: &mut ReplyStream,
+    ) {
+        flush_parse_stage(shared, self.stage, self.bytes, origin, conn_cx, out);
+    }
+}
+
+/// What a parsing slot's replies are written into: an open slot's `out`, or
+/// a closing or draining parser's recycled sink, discarded at the entry's
+/// end.
+enum Sink<'a> {
+    Out(&'a mut ReplyStream),
+    Dropped(&'a mut ReplyStream),
+}
+
+impl Sink<'_> {
+    fn stream(&mut self) -> &mut ReplyStream {
+        match self {
+            Sink::Out(out) | Sink::Dropped(out) => out,
+        }
+    }
+}
+
+/// Where a reply PARSE writes goes: `Out`, the one borrow of the slot's
+/// output PARSE takes, when the pump owes the connection nothing; else
+/// `Owed`, behind the replies owed before it.
+enum ReplyRoute<'a> {
+    Out(&'a mut ReplyStream),
+    Owed,
+}
+
+/// One entry's parse: the slot's sink, whether the pump owed the connection
+/// a reply when the entry began, and the entries the buffer queues.
+struct ParseInto<'a> {
+    sink: Sink<'a>,
+    pump_busy: bool,
+    deferred: Vec<Queued>,
+}
+
+impl ParseInto<'_> {
+    /// The reply route, read by the three writes PARSE makes (an inline
+    /// command, `-LOADING`, a protocol error): `Owed` while the pump owes
+    /// the connection a reply or a command of this buffer deferred, else
+    /// the sink. Returns it beside the queue the entry fills.
+    fn route(&mut self) -> (ReplyRoute<'_>, &mut Vec<Queued>) {
+        let route = if self.pump_busy || !self.deferred.is_empty() {
+            ReplyRoute::Owed
+        } else {
+            ReplyRoute::Out(self.sink.stream())
+        };
+        (route, &mut self.deferred)
+    }
+}
+
+/// PARSE's one match on an entry's slot (ADR-0196 D1, D2, A1.1): the
+/// parser and the sink of a slot that holds one, and whether it is a
+/// draining slot's; `None` for a slot that releases the entry. An active or
+/// half-closed slot writes into its `out`, and its received buffer stores
+/// `timeout`'s clock; a closing or draining parser renders into a recycled
+/// sink, made by `make_sink`.
+fn parse_target<'s>(
+    slot: &'s mut ConnSlot,
+    dropped_out: &'s mut Option<ReplyStream>,
+    now_ms: u64,
+    make_sink: impl FnOnce() -> ReplyStream,
+) -> Option<(&'s mut ConnParser, Sink<'s>, bool)> {
+    // Canary: PARSE releases a `Peer` entry unparsed, flushing or closing.
+    #[cfg(inf_canary_closing_inbox_released)]
+    if let ConnSlot::Flushing { .. } | ConnSlot::Closing { .. } = slot {
+        return None;
+    }
+    // Canary: PARSE releases a draining `Peer` entry unparsed.
+    #[cfg(inf_canary_draining_releases_held_entry)]
+    if let ConnSlot::Draining { .. } = slot {
+        return None;
+    }
+    match slot {
+        ConnSlot::Active { link, parser, .. }
+        | ConnSlot::Flushing {
+            link,
+            stream: PeerStream::Ended { by: ClosedBy::Peer { parser, .. } },
+        } => {
+            link.last_active_ms = now_ms;
+            Some((parser, Sink::Out(&mut link.out), false))
+        }
+        ConnSlot::Closing { by: ClosedBy::Peer { parser, .. } } => {
+            Some((parser, Sink::Dropped(dropped_out.insert(make_sink())), false))
+        }
+        ConnSlot::Draining { by: ClosedBy::Peer { parser, .. } } => {
+            Some((parser, Sink::Dropped(dropped_out.insert(make_sink())), true))
+        }
+        ConnSlot::Flushing {
+            stream: PeerStream::Open | PeerStream::Ended { by: ClosedBy::Plane },
+            ..
+        }
+        | ConnSlot::Closing { by: ClosedBy::Plane }
+        | ConnSlot::Draining { by: ClosedBy::Plane } => None,
+    }
+}
+
+/// What one buffer's parse did: its commands, and whether a `QUIT` or a
+/// protocol error stopped it (the slot is then marked).
+struct BufferParsed {
+    commands: u32,
+    stop: bool,
+}
+
+/// Whether a parsed command lets the buffer go on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Next,
+    Quit,
+}
+
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// The everysec role's delivery: the durable plane's tick, then the
     /// successor a second on from the delivery's time (the tick schedules
@@ -55,6 +182,422 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// iteration with nothing ready builds no turn. Out of line, so a cell
     /// with no cold engine carries none of it in its iteration
     /// (`inf-runtime`'s `cold_path` bench, its server-shaped reactor legs).
+    /// Wakes each parked peer pump whose queue FABRIC-IN filled (ADR-0177
+    /// D2): the flag clears in the step that wakes, and the pump reads
+    /// its queue in the poll that follows, so no wake is lost. Owner-side
+    /// `always` applies (ADR-0015 D6): the fabric reply is deferred, and the
+    /// cell's one `gated` task publishes every reply the watermark covers
+    /// (flushed by the next FABRIC-OUT). Tiered and paced applies run on
+    /// each origin's FIFO pump; fabric-origin `PUBLISH`es fan out on the
+    /// owner pump, one long-lived task over the origins' FIFOs.
+    fn wake_peer_pumps(&self, cx: &mut LoopCx<'_>) {
+        let Some(Some(pumps)) = self.shared.peer_pumps.get() else {
+            return;
+        };
+        if self.shared.gated_pump_parked.get() && self.shared.gated.waits() {
+            self.shared.gated_pump_parked.set(false);
+            let _ = cx.executor.wake(pumps.gated);
+        }
+        {
+            let queues = self.shared.ns_applies.borrow();
+            if queues.waits() {
+                let mut parked = self.shared.ns_pump_parked.borrow_mut();
+                for origin in queues.origins_waiting() {
+                    if core::mem::replace(&mut parked[usize::from(origin.0)], false) {
+                        let _ = cx.executor.wake(pumps.ns_apply(self.shared.cell, origin));
+                    }
+                }
+            }
+        }
+        if self.shared.pub_pump_parked.get() && self.shared.owner_pubs.borrow().waits() {
+            self.shared.pub_pump_parked.set(false);
+            let _ = cx.executor.wake(pumps.owner_pub);
+        }
+    }
+
+    /// One inbox entry, by PARSE's one match on its slot: the four states
+    /// that hold a parser (Active, and Flushing, Closing and Draining
+    /// `Peer`) parse it by one function, the rest release it (ADR-0196 D1,
+    /// D2, A1.1). A closing or draining parser's inline replies render into
+    /// a recycled buffer, discarded at the entry's end: the slot holds no
+    /// `out`. Returns the commands parsed.
+    fn parse_entry(
+        &self,
+        cx: &mut LoopCx<'_>,
+        key: ConnKey,
+        buf: BufferId,
+        len: u32,
+        staging: &mut Staging<'_>,
+    ) -> u32 {
+        // The parked pump to wake once the deferred commands are queued.
+        let mut wake_pump: Option<TaskId> = None;
+        let mut dropped_out: Option<ReplyStream> = None;
+        let (commands, draining) = {
+            let mut conns = self.shared.conns.borrow_mut();
+            let Some(conn) = conns.get_mut(key) else { return 0 };
+            // While the pump is not parked it owns the connection's
+            // order: every command defers behind what it holds.
+            let pump_busy = !conn.pump_parked;
+            let now_ms = cx.now.as_millis();
+            let Conn { cx: conn_cx, slot, .. } = &mut *conn;
+            let make_sink = || ReplyStream::new(self.shared.take_reply_buf());
+            let Some((parser, sink, draining)) =
+                parse_target(slot, &mut dropped_out, now_ms, make_sink)
+            else {
+                return 0;
+            };
+            let mut into = ParseInto { sink, pump_busy, deferred: Vec::new() };
+            let data = &cx.pool.bytes(buf)[..len as usize];
+            let parsed = self.parse_buffer(key, parser, conn_cx, &mut into, data, staging);
+            let ParseInto { deferred, .. } = into;
+            if parsed.stop && conn.mark() {
+                self.shared.mark_rearms.borrow_mut().push(key);
+            }
+            let queued = !deferred.is_empty();
+            if let Some(fd) = conn.enqueue(deferred) {
+                cx.push(IoOp::RecvDisarm { fd });
+            }
+            // A command queued for a parked pump wakes it; the flag
+            // clears in this step, and the pump reads its queue in the
+            // poll the wake queues.
+            #[cfg(not(inf_canary_parked_pump_not_woken))]
+            if queued {
+                wake_pump = conn.take_parked_pump();
+            }
+            // Canary: the command is queued and its parked pump is never
+            // woken, so the client waits for a reply nothing makes.
+            #[cfg(inf_canary_parked_pump_not_woken)]
+            let _ = (queued, &mut wake_pump);
+            (parsed.commands, draining)
+        };
+        if let Some(out) = dropped_out {
+            self.shared.recycle_reply_buf(out.into_vec());
+        }
+        if draining {
+            let node = &self.shared.node;
+            node.closed_reader_entries.set(node.closed_reader_entries.get() + 1);
+        }
+        if let Some(pump) = wake_pump {
+            let _ = cx.executor.wake(pump);
+        }
+        commands
+    }
+
+    /// One received buffer through the slot's parser, the one function
+    /// every parsing state runs (L13): inline commands execute into `out`,
+    /// deferred ones queue behind the first that must defer, and a `QUIT`
+    /// or a protocol error ends the buffer (Redis discards what follows
+    /// either).
+    fn parse_buffer(
+        &self,
+        key: ConnKey,
+        parser: &mut ConnParser,
+        conn_cx: &mut ConnCx,
+        into: &mut ParseInto<'_>,
+        data: &[u8],
+        staging: &mut Staging<'_>,
+    ) -> BufferParsed {
+        let origin = ExecOrigin::Conn(key.slot, key.generation);
+        let mut parsed = BufferParsed { commands: 0, stop: false };
+        let mut iter = parser.feed(data);
+        while let Some(next) = iter.next() {
+            match next {
+                Parsed::Command(argv) | Parsed::Inline(argv) => {
+                    parsed.commands += 1;
+                    if self.run_parsed(&argv, conn_cx, into, origin, staging) == Flow::Quit {
+                        parsed.stop = true;
+                        break;
+                    }
+                }
+                Parsed::Incomplete => {}
+                Parsed::ProtocolError(e) => {
+                    // Display, not Debug: the Redis phrasing the compat
+                    // harness diffs.
+                    let error = format!("ERR Protocol error: {e}");
+                    self.parse_reply(conn_cx, into, origin, staging, &error);
+                    parsed.stop = true;
+                    break;
+                }
+            }
+        }
+        // End of buffer: the staged batch executes with its record
+        // lines prefetched across the whole batch.
+        match into.route() {
+            (ReplyRoute::Out(out), _) => staging.flush(&self.shared, origin, conn_cx, out),
+            // Nothing is staged once the pump owes a reply: the first
+            // deferral flushed the batch.
+            (ReplyRoute::Owed, _) => {
+                debug_assert!(staging.stage.is_empty(), "staged past a deferral")
+            }
+        }
+        drop(iter);
+        parsed
+    }
+
+    /// One parsed command: refused while loading, deferred to the pump,
+    /// staged, or executed inline.
+    fn run_parsed(
+        &self,
+        argv: &ArgvRef<'_>,
+        conn_cx: &mut ConnCx,
+        into: &mut ParseInto<'_>,
+        origin: ExecOrigin,
+        staging: &mut Staging<'_>,
+    ) -> Flow {
+        let meta = lookup(argv.arg(0));
+        if self.loading_refuses(meta) {
+            self.parse_reply(
+                conn_cx,
+                into,
+                origin,
+                staging,
+                "LOADING Redis is loading the dataset in memory",
+            );
+            return Flow::Next;
+        }
+        let (route, deferred) = into.route();
+        let out = match route {
+            ReplyRoute::Out(out) => out,
+            ReplyRoute::Owed => {
+                deferred.push(Queued::Command(OwnedCmd::from_argv_into(
+                    argv,
+                    self.shared.take_cmd_buf(),
+                )));
+                return Flow::Next;
+            }
+        };
+        // Named-namespace commands always ride the pump (M2-S08): durable
+        // acks suspend, staging admission may park, and emission lives
+        // there — one `Option` load on the memory fast path.
+        if conn_cx.ns.named().is_some() || conn_cx.ns.unavailable() || self.needs_fabric(argv) {
+            // Pump replies emit after the fast-path replies already in
+            // `out` — flush so the staged batch keeps its pipeline position.
+            staging.flush(&self.shared, origin, conn_cx, out);
+            deferred
+                .push(Queued::Command(OwnedCmd::from_argv_into(argv, self.shared.take_cmd_buf())));
+            return Flow::Next;
+        }
+        if staging.enabled && parse_stageable(meta, argv) {
+            self.stage_parsed(argv, conn_cx, staging);
+            return Flow::Next;
+        }
+        staging.flush(&self.shared, origin, conn_cx, out);
+        self.execute_inline(argv, conn_cx, out, origin)
+    }
+
+    /// A reply PARSE writes itself, `-LOADING` or a protocol error, by the
+    /// route: into `out` after the staged batch when the pump owes the
+    /// connection nothing, else rendered once into a recycled buffer and
+    /// queued behind the replies owed before it, so it leaves in pipeline
+    /// order. A closing or draining parser's reply is dropped: the slot
+    /// writes no `out`, so the route is not read.
+    fn parse_reply(
+        &self,
+        conn_cx: &mut ConnCx,
+        into: &mut ParseInto<'_>,
+        origin: ExecOrigin,
+        staging: &mut Staging<'_>,
+        error: &str,
+    ) {
+        if let Sink::Dropped(_) = into.sink {
+            return;
+        }
+        // Canary: the reply is written into `out` whatever the route.
+        #[cfg(inf_canary_parse_reply_around_queue)]
+        let (route, deferred) = (ReplyRoute::Out(into.sink.stream()), &mut into.deferred);
+        #[cfg(not(inf_canary_parse_reply_around_queue))]
+        let (route, deferred) = into.route();
+        match route {
+            ReplyRoute::Out(out) => {
+                staging.flush(&self.shared, origin, conn_cx, out);
+                RespWriter::new(out.open(), conn_cx.proto).error(error);
+            }
+            ReplyRoute::Owed => {
+                let mut reply = OpenReply::new(self.shared.take_reply_buf());
+                RespWriter::new(reply.reply(), conn_cx.proto).error(error);
+                deferred.push(Queued::Reply(reply.finish()));
+                let node = &self.shared.node;
+                node.parse_replies_queued.set(node.parse_replies_queued.get() + 1);
+            }
+        }
+    }
+
+    /// M2-S15 `-LOADING` gate: while the node loads, only LOADING-flagged
+    /// commands run; the rest answer exactly Redis's error (oracle capture
+    /// artifact). Unknown commands keep their normal error — Redis
+    /// resolves the command first. The board re-check serves commands that
+    /// arrive in the same iteration the last cell flips ready.
+    fn loading_refuses(&self, meta: Option<&inf_wire::CommandMeta>) -> bool {
+        if !self.shared.loading.get()
+            || meta.is_none_or(|meta| meta.flags.contains(CmdFlags::LOADING))
+        {
+            return false;
+        }
+        if self.loading_board.as_deref().is_some_and(RecoveryBoard::all_ready) {
+            self.shared.loading.set(false);
+            return false;
+        }
+        true
+    }
+
+    /// M2.5 Phase H (ADR-0029 lever 2): stages the fast-path command — flat
+    /// argv copy + key hash + phase-1 index-line prefetch; the batch
+    /// executes at the next barrier or end of buffer with its record lines
+    /// prefetched.
+    fn stage_parsed(&self, argv: &ArgvRef<'_>, conn_cx: &ConnCx, staging: &mut Staging<'_>) {
+        let (hash, has_key) = match argv.len() >= 2 {
+            true => {
+                let hash = self.shared.hasher.hash(argv.arg(1));
+                if let Some(store) = self.shared.store.borrow().db(usize::from(conn_cx.db)) {
+                    store.prefetch(hash);
+                }
+                (hash, true)
+            }
+            false => (0, false),
+        };
+        let off = stage_argv_block_argv(staging.bytes, argv);
+        staging.stage.push(StagedParse { off, hash, has_key });
+    }
+
+    /// An inline command executed into `out`: `Flow::Quit` when it was
+    /// `QUIT`, which stops the buffer (Redis discards anything pipelined
+    /// after `QUIT`); the slot is marked and closes once the `+OK` flushed.
+    fn execute_inline(
+        &self,
+        argv: &ArgvRef<'_>,
+        conn_cx: &mut ConnCx,
+        out: &mut ReplyStream,
+        origin: ExecOrigin,
+    ) -> Flow {
+        let argv_slices: Vec<&[u8]> = argv.iter().collect();
+        let now = self.shared.now.get();
+        let scope = ExecScope::of(conn_cx);
+        let reply = out.open();
+        execute(argv, &mut self.shared.store.borrow_mut(), conn_cx, now, reply);
+        self.shared.observer.borrow_mut().on_execute(
+            self.shared.cell,
+            origin,
+            scope,
+            &argv_slices,
+            reply.bytes(),
+            now,
+        );
+        if let Some(dur) = stall_request(&argv_slices) {
+            self.shared.stall_until.set(now.saturating_add(dur));
+        }
+        if conn_cx.close_requested.get() {
+            conn_cx.close_requested.set(false);
+            return Flow::Quit;
+        }
+        Flow::Next
+    }
+
+    /// One `Send` from a slot's staged output, when a send buffer is free
+    /// and no send is in flight.
+    fn send_out(cx: &mut LoopCx<'_>, key: ConnKey, link: &mut Link) {
+        if link.out.is_empty() || link.send_inflight {
+            return;
+        }
+        let Some(buf) = cx.pool.try_lease(LeaseKind::Send) else { return };
+        let n = link.out.len().min(cx.pool.buf_size());
+        cx.pool.bytes_mut(buf)[..n].copy_from_slice(&link.out.as_bytes()[..n]);
+        link.out.consume(n);
+        link.send_inflight = true;
+        cx.push(IoOp::Send {
+            fd: link.fd,
+            buf,
+            len: n as u32,
+            token: Self::token(TokenClass::Send, key),
+        });
+    }
+
+    /// The marks' owed `RecvArm`s (ADR-0196 A1.3): one for each marked
+    /// slot still `Flushing` `Open`, which has not read its end of stream.
+    fn push_mark_rearms(&self, cx: &mut LoopCx<'_>) {
+        let keys = core::mem::take(&mut *self.shared.mark_rearms.borrow_mut());
+        for key in keys {
+            let fd = self.shared.with_conn(key, |conn| match &conn.slot {
+                ConnSlot::Flushing { link, stream: PeerStream::Open } => Some(link.fd),
+                ConnSlot::Flushing { stream: PeerStream::Ended { .. }, .. }
+                | ConnSlot::Active { .. }
+                | ConnSlot::Closing { .. }
+                | ConnSlot::Draining { .. } => None,
+            });
+            if let Some(Some(fd)) = fd {
+                cx.push(IoOp::RecvArm { fd, token: Self::token(TokenClass::Recv, key) });
+            }
+        }
+    }
+
+    /// The peer's end of stream on `key` (ADR-0196 A1.1): a mark of the
+    /// flush shape that keeps the parser, so the entries reaped before it
+    /// parse and are answered; no `Close` is pushed. The slot's pump is
+    /// woken, so its empty read runs the run-out.
+    fn end_of_stream(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
+        // Canary: the end of stream initiates the close at once, as the
+        // peer's departure: Active → Closing `Peer`.
+        #[cfg(inf_canary_eof_closes_at_once)]
+        return self.peer_gone(cx, key);
+        #[cfg(not(inf_canary_eof_closes_at_once))]
+        {
+            let takes = self.shared.inbox_takes.get();
+            let wake = self.shared.with_conn(key, |conn| conn.end_of_stream(takes)).flatten();
+            // Canary: the end-of-stream arm re-arms the half-closed slot's
+            // receive.
+            #[cfg(inf_canary_rearm_after_eof)]
+            if let Some(Some(fd)) = self.shared.with_conn(key, |conn| match &conn.slot {
+                ConnSlot::Flushing { link, stream: PeerStream::Ended { .. } } => Some(link.fd),
+                ConnSlot::Active { .. }
+                | ConnSlot::Flushing { stream: PeerStream::Open, .. }
+                | ConnSlot::Closing { .. }
+                | ConnSlot::Draining { .. } => None,
+            }) {
+                cx.push(IoOp::RecvArm { fd, token: Self::token(TokenClass::Recv, key) });
+            }
+            if let Some(pump) = wake {
+                let _ = cx.executor.wake(pump);
+            }
+        }
+    }
+
+    /// `Closed` on `key`, or a `Close`-class error: the closing slot moves
+    /// into `Draining` with its queue and its `Peer` parser; the client
+    /// leaves `CLIENT LIST` for good and `active`; the local registries are
+    /// not touched (the drain's end drops them); the pump is woken.
+    fn on_closed(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
+        let takes = self.shared.inbox_takes.get();
+        let moved = self.shared.with_conn(key, |conn| {
+            let moved = conn.closed(takes);
+            // Canary: `Closed` drops the queue, as a removed slot did.
+            #[cfg(inf_canary_closed_conn_queue_dropped)]
+            if moved {
+                for entry in conn.queue.drain(..) {
+                    entry.recycle(&self.shared);
+                }
+            }
+            // Canary: the registry removal and the 1→0 capture at `Closed`,
+            // before the drain.
+            #[cfg(inf_canary_registry_dropped_at_closed)]
+            if moved {
+                conn.closed_notes = Some(unsubscribe_closed_conn(&self.shared, key, &mut conn.cx));
+            }
+            moved.then(|| (conn.cx.id, conn.take_parked_pump()))
+        });
+        let Some(Some((id, pump))) = moved else { return };
+        // Canary: the slot is vacated at `Closed`, before its pump returns.
+        #[cfg(inf_canary_conn_slot_frees_at_closed)]
+        let _ = self.shared.conns.borrow_mut().remove(key);
+        self.shared.node.clients.borrow_mut().unregister(id);
+        // Canary: the parked pump is not woken at `Closed`, so its draining
+        // slot never retires.
+        #[cfg(not(inf_canary_closed_pump_not_woken))]
+        if let Some(pump) = pump {
+            let _ = cx.executor.wake(pump);
+        }
+        #[cfg(inf_canary_closed_pump_not_woken)]
+        let _ = pump;
+    }
+
     #[inline(never)]
     fn deliver_cold(&self, cx: &mut LoopCx<'_>) {
         let cold = self.shared.tier.borrow().as_ref().and_then(|t| t.cold.clone());
@@ -81,7 +624,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 let key = Self::key_of(c.token);
                 if len == 0 {
                     cx.pool.release(buf);
-                    self.initiate_close(cx, key);
+                    self.end_of_stream(cx, key);
                 } else {
                     self.inbox.push((key, buf, len));
                 }
@@ -96,34 +639,41 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     self.close_refused(cx, c.token);
                     return;
                 }
+                // A send in flight when its slot closed returns its buffer
+                // alone: a closing or draining slot holds no send.
                 let key = Self::key_of(c.token);
-                self.shared.with_conn(key, |conn| conn.send_inflight = false);
-            }
-            CompletionResult::Closed => {
-                let key = Self::key_of(c.token);
-                let removed = self.shared.conns.borrow_mut().remove(key);
-                if let Some(conn) = &removed {
-                    self.shared.node.clients.borrow_mut().unregister(conn.cx.id);
-                }
-                // Pub/sub cleanup (M1-S10): drop the connection from the
-                // local registries; 1→0 transitions notify the channel
-                // owners / every cell (patterns) off the close path.
-                if let Some(conn) = removed {
-                    let notes = unsubscribe_closed_conn(&self.shared, key, &conn.cx);
-                    if !notes.is_empty() {
-                        let shared = Rc::clone(&self.shared);
-                        let _ = cx.executor.poll_immediate(flush_sub_deltas(shared, notes));
+                self.shared.with_conn(key, |conn| {
+                    if let Some(link) = conn.link_mut() {
+                        link.send_inflight = false;
                     }
+                });
+                // Canary: once a reply has left an active slot whose pump is
+                // parked on an empty queue, the pump is woken to drop both
+                // owners, the socket left open.
+                #[cfg(inf_canary_conn_owner_lost)]
+                if let Some(Some(pump)) = self.shared.with_conn(key, |conn| {
+                    let sent = match &conn.slot {
+                        ConnSlot::Active { link, .. } => link.out.is_empty(),
+                        ConnSlot::Flushing { .. }
+                        | ConnSlot::Closing { .. }
+                        | ConnSlot::Draining { .. } => false,
+                    };
+                    let idle = sent && conn.queue.is_empty() && !conn.owner_lost;
+                    conn.owner_lost |= idle;
+                    if idle { conn.take_parked_pump() } else { None }
+                }) {
+                    let _ = cx.executor.wake(pump);
                 }
             }
+            CompletionResult::Closed => self.on_closed(cx, Self::key_of(c.token)),
             CompletionResult::Error { buf, errno } => {
                 if let Some(buf) = buf {
                     cx.pool.release(buf);
                 }
                 // Tier-flush op failures (M4.5-S31, ADR-0084 D4) are the
                 // round's to classify at the next MAINTAIN — ENOSPC
-                // latches admission and retries; a failed barrier is the
-                // §8.4 fatal class there. Never connection housekeeping.
+                // latches admission and retries; a failed barrier is
+                // fatal there (fail-stop). Never connection housekeeping.
                 if matches!(c.token.class(), TokenClass::TierFlushWrite | TokenClass::TierFlushSync)
                 {
                     let mut tier = self.shared.tier.borrow_mut();
@@ -131,7 +681,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     tier.on_flush_completion(c.token, Some(errno));
                     return;
                 }
-                // Log-op failures are fail-stop territory (§8.4), never
+                // Log-op failures are fail-stop territory, never
                 // connection housekeeping. A zero-fill write failing is
                 // the same class: the device refused a log write.
                 if matches!(
@@ -227,9 +777,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 ) {
                     return;
                 }
+                // `close(2)` releases the descriptor whatever it returns, so
+                // a `Close`-class error is the op's terminal completion, as
+                // `Closed` is; a receive or send error is the peer gone.
                 let key = Self::key_of(c.token);
-                self.shared.with_conn(key, |conn| conn.send_inflight = false);
-                self.initiate_close(cx, key);
+                if c.token.class() == TokenClass::Close {
+                    self.on_closed(cx, key);
+                } else {
+                    self.peer_gone(cx, key);
+                }
             }
             // Log + checkpoint file ops (M2-S05/S08/S10): routed by token
             // class into the durable cell — lease release on a write's
@@ -428,11 +984,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             }
         });
         flush_apply_stage(shared, stage, stage_bytes, scratch, staged);
-        // ADR-0177 D3: a verdict waiting with the `gated` task not running
-        // makes the task, even on a fabric-quiet iteration: an apply pump
-        // fills its verdict in run_ready, not in this drain, and a task
-        // cannot wake another (the lag is this one iteration).
-        let gated_due = !self.shared.gated_pump_active.get() && self.shared.gated.borrow().waits();
+        // ADR-0177 D3: a verdict waiting with the `gated` task parked wakes
+        // the task, even on a fabric-quiet iteration: an apply pump fills
+        // its verdict in run_ready, not in this drain, and a task cannot
+        // wake another (the lag is this one iteration).
+        let gated_due = self.shared.gated_pump_parked.get() && self.shared.gated.waits();
         if drained == 0 && !gated_due {
             return;
         }
@@ -461,45 +1017,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         }
         drop(fabric);
         self.admit_adopted(cx);
-        // Owner-side `always` applies (M2-S08, ADR-0015 D6): the fabric
-        // reply itself is deferred — the cell's one `gated` task awaits
-        // this cell's ack gate, then publishes every reply it covers
-        // (flushed by the next FABRIC-OUT). The client-visible ack never
-        // precedes the owning cell's fsync. Made on demand, as the pumps
-        // below are (ADR-0177 D3); this drain's inline verdicts count too.
-        if !self.shared.gated_pump_active.get() && self.shared.gated.borrow().waits() {
-            self.shared.gated_pump_active.set(true);
-            let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(gated_pump(shared));
-        }
-        // Tiered fabric applies (M4-S26): wake each origin's FIFO pump.
-        let tier_pending: Vec<u16> = {
-            let queues = self.shared.ns_applies.borrow();
-            let active = self.shared.ns_pump_active.borrow();
-            if queues.waits() {
-                queues
-                    .origins_waiting()
-                    .filter(|origin| !active[usize::from(origin.0)])
-                    .map(|origin| origin.0)
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        };
-        for origin in tier_pending {
-            self.shared.ns_pump_active.borrow_mut()[usize::from(origin)] = true;
-            let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(ns_apply_pump(shared, origin));
-        }
-        // Fabric-origin PUBLISHes fan out on this cell's owner pump (one
-        // long-lived future over the origins' FIFOs — each origin's arrival
-        // order is its delivery order). The reply to each publisher ships
-        // when its fan acks return.
-        if !self.shared.pub_pump_active.get() && self.shared.owner_pubs.borrow().waits() {
-            self.shared.pub_pump_active.set(true);
-            let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(owner_pub_pump(shared));
-        }
+        self.wake_peer_pumps(cx);
     }
 
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
@@ -509,213 +1027,29 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         self.shared.now.set(cx.now);
         // DEBUG SLEEP stall: connection processing pauses (inbox buffers
         // hold; pool pressure degrades to RecvDropped, never blocks the
-        // thread); FABRIC-IN keeps serving peers.
+        // thread); FABRIC-IN keeps serving peers. A stalled PARSE takes
+        // nothing, so the take count does not move.
         if cx.now < self.shared.stall_until.get() {
             return;
         }
 
-        let stage_enabled = self.shared.parse_prefetch.get();
         let mut stage = core::mem::take(&mut self.parse_stage);
         let mut stage_bytes = core::mem::take(&mut self.parse_stage_bytes);
+        let mut staging = Staging {
+            enabled: self.shared.parse_prefetch.get(),
+            stage: &mut stage,
+            bytes: &mut stage_bytes,
+        };
         let inbox = core::mem::take(&mut self.inbox);
         for (key, buf, len) in inbox {
-            let mut commands: u32 = 0;
-            // First command that must defer to a pump (everything after it
-            // defers too — replies are ordered per connection).
-            let mut deferred: Vec<OwnedCmd> = Vec::new();
-            let mut spawn_first: Option<OwnedCmd> = None;
-            let mut protocol_error = false;
-            let mut quit = false;
-            {
-                let mut conns = self.shared.conns.borrow_mut();
-                let Some(conn) = conns.get_mut(key) else {
-                    cx.pool.release(buf);
-                    continue;
-                };
-                if conn.closing || conn.close_after_flush {
-                    cx.pool.release(buf);
-                    continue;
-                }
-                conn.last_active_ms = cx.now.as_millis();
-                let data = &cx.pool.bytes(buf)[..len as usize];
-                let pump_was_active = conn.pump_active;
-                // Field split: the parser iterator borrows `conn.parser`
-                // while execution writes `conn.out`/`conn.cx`.
-                let Conn { parser, cx: conn_cx, out, .. } = &mut *conn;
-                let origin = ExecOrigin::Conn(key.slot, key.generation);
-                let mut iter = parser.feed(data);
-                while let Some(parsed) = iter.next() {
-                    match parsed {
-                        Parsed::Command(argv) | Parsed::Inline(argv) => {
-                            commands += 1;
-                            let meta = lookup(argv.arg(0));
-                            // M2-S15 `-LOADING` gate: while the node loads,
-                            // only LOADING-flagged commands run; the rest
-                            // answer exactly Redis's error (oracle capture
-                            // artifact). Unknown commands keep their normal
-                            // error — Redis resolves the command first. The
-                            // board re-check serves commands that arrive in
-                            // the same iteration the last cell flips ready.
-                            if self.shared.loading.get()
-                                && meta.is_some_and(|meta| !meta.flags.contains(CmdFlags::LOADING))
-                            {
-                                if self
-                                    .loading_board
-                                    .as_deref()
-                                    .is_some_and(RecoveryBoard::all_ready)
-                                {
-                                    self.shared.loading.set(false);
-                                } else {
-                                    // The error reply keeps pipeline order:
-                                    // staged commands answer first.
-                                    flush_parse_stage(
-                                        &self.shared,
-                                        &mut stage,
-                                        &mut stage_bytes,
-                                        origin,
-                                        conn_cx,
-                                        out,
-                                    );
-                                    RespWriter::new(out.open(), conn_cx.proto)
-                                        .error("LOADING Redis is loading the dataset in memory");
-                                    continue;
-                                }
-                            }
-                            // Named-namespace commands always ride the pump
-                            // (M2-S08): durable acks suspend, staging
-                            // admission may park, and emission lives there —
-                            // one `Option` load on the memory fast path.
-                            let defer = pump_was_active
-                                || spawn_first.is_some()
-                                || !deferred.is_empty()
-                                || conn_cx.ns.named().is_some()
-                                || conn_cx.ns.unavailable()
-                                || self.needs_fabric(&argv);
-                            if defer {
-                                // Pump replies emit after the fast-path
-                                // replies already in `out` — flush so the
-                                // staged batch keeps its pipeline position.
-                                flush_parse_stage(
-                                    &self.shared,
-                                    &mut stage,
-                                    &mut stage_bytes,
-                                    origin,
-                                    conn_cx,
-                                    out,
-                                );
-                                let owned =
-                                    OwnedCmd::from_argv_into(&argv, self.shared.take_cmd_buf());
-                                if pump_was_active || spawn_first.is_some() {
-                                    deferred.push(owned);
-                                } else {
-                                    spawn_first = Some(owned);
-                                }
-                            } else if stage_enabled && parse_stageable(meta, &argv) {
-                                // M2.5 Phase H (ADR-0029 lever 2): stage the
-                                // fast-path command — flat argv copy + key
-                                // hash + phase-1 index-line prefetch; the
-                                // batch executes at the next barrier or end
-                                // of buffer with its record lines prefetched.
-                                let (hash, has_key) = match argv.len() >= 2 {
-                                    true => {
-                                        let hash = self.shared.hasher.hash(argv.arg(1));
-                                        if let Some(store) =
-                                            self.shared.store.borrow().db(usize::from(conn_cx.db))
-                                        {
-                                            store.prefetch(hash);
-                                        }
-                                        (hash, true)
-                                    }
-                                    false => (0, false),
-                                };
-                                let off = stage_argv_block_argv(&mut stage_bytes, &argv);
-                                stage.push(StagedParse { off, hash, has_key });
-                            } else {
-                                flush_parse_stage(
-                                    &self.shared,
-                                    &mut stage,
-                                    &mut stage_bytes,
-                                    origin,
-                                    conn_cx,
-                                    out,
-                                );
-                                let argv_slices: Vec<&[u8]> = argv.iter().collect();
-                                let now = self.shared.now.get();
-                                let scope = ExecScope::of(conn_cx);
-                                let reply = out.open();
-                                execute(
-                                    &argv,
-                                    &mut self.shared.store.borrow_mut(),
-                                    conn_cx,
-                                    now,
-                                    reply,
-                                );
-                                self.shared.observer.borrow_mut().on_execute(
-                                    self.shared.cell,
-                                    origin,
-                                    scope,
-                                    &argv_slices,
-                                    reply.bytes(),
-                                    now,
-                                );
-                                if let Some(dur) = stall_request(&argv_slices) {
-                                    self.shared.stall_until.set(now.saturating_add(dur));
-                                }
-                                // QUIT: stop processing this buffer (Redis
-                                // discards anything pipelined after QUIT) and
-                                // close once the +OK reply has flushed.
-                                if conn_cx.close_requested.get() {
-                                    conn_cx.close_requested.set(false);
-                                    quit = true;
-                                    break;
-                                }
-                            }
-                        }
-                        Parsed::Incomplete => {}
-                        Parsed::ProtocolError(e) => {
-                            flush_parse_stage(
-                                &self.shared,
-                                &mut stage,
-                                &mut stage_bytes,
-                                origin,
-                                conn_cx,
-                                out,
-                            );
-                            // Display, not Debug (batch 45): the Redis
-                            // phrasing the compat harness diffs.
-                            RespWriter::new(out.open(), conn_cx.proto)
-                                .error(&format!("ERR Protocol error: {e}"));
-                            protocol_error = true;
-                            break;
-                        }
-                    }
-                }
-                // End of buffer: the staged batch executes with its record
-                // lines prefetched (§7.3 phase 2 across the whole batch).
-                flush_parse_stage(&self.shared, &mut stage, &mut stage_bytes, origin, conn_cx, out);
-                drop(iter);
-                let conn = conns.get_mut(key).expect("conn checked above");
-                if protocol_error || quit {
-                    conn.close_after_flush = true;
-                }
-                conn.queue.extend(deferred);
-                if conn.queue.len() >= PENDING_HIGH_WATER && !conn.recv_disarmed {
-                    conn.recv_disarmed = true;
-                    cx.push(IoOp::RecvDisarm { fd: conn.fd });
-                }
-                if spawn_first.is_some() {
-                    conn.pump_active = true;
-                }
-            }
+            let commands = self.parse_entry(cx, key, buf, len, &mut staging);
             cx.pool.release(buf);
             cx.charge(GroupClass::Foreground, commands);
-            if let Some(first) = spawn_first {
-                self.spawn_pump(cx, key, first);
-            }
         }
         debug_assert!(stage.is_empty(), "parse stage flushed before buffer release");
         self.parse_stage = stage;
         self.parse_stage_bytes = stage_bytes;
+        self.shared.note_inbox_take();
     }
 
     fn maintain(&mut self, cx: &mut LoopCx<'_>) {
@@ -830,49 +1164,39 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         if cx.now < self.shared.stall_until.get() {
             return;
         }
+        self.push_mark_rearms(cx);
         let keys = self.shared.conns.borrow().keys();
         for key in keys {
-            let mut close_now = false;
-            self.shared.with_conn(key, |conn| {
-                if conn.closing {
-                    return;
-                }
-                if conn.rearm_recv {
-                    conn.rearm_recv = false;
-                    if conn.recv_disarmed {
-                        conn.recv_disarmed = false;
-                        cx.push(IoOp::RecvArm {
-                            fd: conn.fd,
-                            token: Self::token(TokenClass::Recv, key),
-                        });
+            let close = self.shared.with_conn(key, |conn| {
+                match &mut conn.slot {
+                    ConnSlot::Active { link, recv, .. } => {
+                        if *recv == RecvArm::RearmDue {
+                            *recv = RecvArm::Armed;
+                            cx.push(IoOp::RecvArm {
+                                fd: link.fd,
+                                token: Self::token(TokenClass::Recv, key),
+                            });
+                        }
+                        Self::send_out(cx, key, link);
+                    }
+                    ConnSlot::Flushing { link, .. } => Self::send_out(cx, key, link),
+                    ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => {
+                        // Canary: a closing slot is sent bytes from a copy of
+                        // its descriptor.
+                        #[cfg(inf_canary_closing_slot_sends)]
+                        if let (ConnSlot::Closing { .. }, Some(fd)) = (&conn.slot, conn.closing_fd)
+                        {
+                            let mut link = Link::new(fd, 0);
+                            RespWriter::new(link.out.open(), Protocol::Resp2).simple("OK");
+                            Self::send_out(cx, key, &mut link);
+                        }
+                        return None;
                     }
                 }
-                if !conn.out.is_empty()
-                    && !conn.send_inflight
-                    && let Some(buf) = cx.pool.try_lease(LeaseKind::Send)
-                {
-                    let n = conn.out.len().min(cx.pool.buf_size());
-                    cx.pool.bytes_mut(buf)[..n].copy_from_slice(&conn.out.as_bytes()[..n]);
-                    conn.out.consume(n);
-                    conn.send_inflight = true;
-                    cx.push(IoOp::Send {
-                        fd: conn.fd,
-                        buf,
-                        len: n as u32,
-                        token: Self::token(TokenClass::Send, key),
-                    });
-                }
-                if conn.close_after_flush
-                    && conn.out.is_empty()
-                    && !conn.send_inflight
-                    && !conn.pump_active
-                {
-                    close_now = true;
-                }
+                // A flushing slot closes once every reply it owed is sent.
+                conn.flush_end()
             });
-            if close_now {
-                self.initiate_close(cx, key);
-            }
+            self.push_close(cx, key, close.flatten());
         }
     }
 
@@ -997,7 +1321,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             ids.into_iter().filter_map(|id| clients.conn_key(id)).collect::<Vec<u64>>()
         };
         for key in kills.into_iter().map(ConnKey::unpack) {
-            self.initiate_close(cx, key);
+            self.close_at_once(cx, key);
         }
         // ---- pressure config push (M1-E3, hot-per-cell within one MAINTAIN
         // round): one u64 version compare per iteration; a real push only
@@ -1019,7 +1343,23 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let limits = crate::config::parser_limits(&self.shared.node.config.borrow());
             if limits != self.shared.parser_limits.get() {
                 self.shared.parser_limits.set(limits);
-                self.shared.conns.borrow_mut().for_each_mut(|conn| conn.parser.set_limits(limits));
+                self.shared.conns.borrow_mut().for_each_mut(|conn| match &mut conn.slot {
+                    ConnSlot::Active { parser, .. }
+                    | ConnSlot::Flushing {
+                        stream: PeerStream::Ended { by: ClosedBy::Peer { parser, .. } },
+                        ..
+                    }
+                    | ConnSlot::Closing { by: ClosedBy::Peer { parser, .. } }
+                    | ConnSlot::Draining { by: ClosedBy::Peer { parser, .. } } => {
+                        parser.set_limits(limits);
+                    }
+                    ConnSlot::Flushing {
+                        stream: PeerStream::Open | PeerStream::Ended { by: ClosedBy::Plane },
+                        ..
+                    }
+                    | ConnSlot::Closing { by: ClosedBy::Plane }
+                    | ConnSlot::Draining { by: ClosedBy::Plane } => {}
+                });
             }
         }
     }
@@ -1185,35 +1525,49 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let knobs = self.shared.knobs.get();
         let now_ms = cx.now.as_millis();
         let mut conns = self.shared.conns.borrow_mut();
-        node.connections.set(conns.live as u64);
         let mut bytes = 0usize;
+        let mut draining = 0u64;
         let mut idle: Vec<ConnKey> = Vec::new();
         let ConnSlab { slots, gens, .. } = &mut *conns;
         for (slot, entry) in slots.iter_mut().enumerate() {
             let Some(conn) = entry.as_mut() else { continue };
             bytes += conn.state_bytes();
+            let Conn { cx: conn_cx, slot: state, .. } = conn;
+            // `timeout` and the output cap read the two states that hold
+            // the descriptor and `out`; a closing or draining slot is
+            // skipped, so `idle_disconnections` counts each close once.
+            let link = match state {
+                ConnSlot::Active { link, .. } | ConnSlot::Flushing { link, .. } => link,
+                ConnSlot::Closing { .. } => continue,
+                ConnSlot::Draining { .. } => {
+                    draining += 1;
+                    continue;
+                }
+            };
             // The output-buffer class follows the subscription state
             // (Redis's CLIENT_PUBSUB flag; ADR-0123 D4). Soft-cap aging
             // continues between deliveries (M1-S11): a stalled client
             // over the soft limit dies on schedule even when nothing
             // more is written to it.
-            let subscribed = !conn.cx.sub_channels.is_empty() || !conn.cx.sub_patterns.is_empty();
+            let subscribed = !conn_cx.sub_channels.is_empty() || !conn_cx.sub_patterns.is_empty();
             let caps = if subscribed { knobs.cob_pubsub } else { knobs.cob_normal };
-            if conn.cob_soft_since_ms != 0 || caps != (0, 0, 0) {
-                enforce_output_cap(node, conn, now_ms, caps);
+            if link.cob_soft_since_ms != 0 || caps != (0, 0, 0) {
+                enforce_output_cap(node, link, conn_cx.id, now_ms, caps);
             }
             // `timeout` (ADR-0123 D2): idle unsubscribed connections
-            // close; subscribers are exempt, as in Redis. A connection
-            // already closing is skipped so `idle_disconnections` counts
-            // each close once.
+            // close, a flushing one as an active one (ADR-0193 D1);
+            // subscribers are exempt, as in Redis.
             if knobs.timeout_ms != 0
                 && !subscribed
-                && !conn.closing
-                && now_ms.saturating_sub(conn.last_active_ms) >= knobs.timeout_ms
+                && now_ms.saturating_sub(link.last_active_ms) >= knobs.timeout_ms
             {
                 idle.push(ConnKey { slot: slot as u32, generation: gens[slot] });
             }
         }
+        // `active` (ADR-0123 A1): Active, Flushing and Closing slots; a
+        // draining slot is the third population, read beside it.
+        node.connections.set(conns.live as u64 - draining);
+        node.draining_connections.set(draining);
         node.conn_state_bytes.set(bytes as u64);
         drop(conns);
         // Recycle-pool residency (v0.4.0-alpha RSS-attribution gauges):
@@ -1223,7 +1577,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let shared = Rc::clone(&self.shared);
         for key in idle {
             shared.node.idle_disconnections.set(shared.node.idle_disconnections.get() + 1);
-            self.initiate_close(cx, key);
+            self.close_at_once(cx, key);
         }
     }
 }

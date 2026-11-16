@@ -27,7 +27,8 @@ use inf_runtime::{CellLoop, LoopConfig};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane, StdSegmentFs};
 use inf_store::{KeyspaceSeed, NsSpec, SlotRouter, StoreConfig};
 
-use super::{FROZEN_MESH, STEP_NS_FLOOR, namespace_specs, node_hasher};
+use super::owners::OwnersJudge;
+use super::{FROZEN_MESH, REFUSAL_FRAME, STEP_NS_FLOOR, namespace_specs, node_hasher};
 use crate::census::{CellFacts, CensusVerdict};
 use crate::driver::Violations;
 use crate::net::{CellNet, Plant, SimDriver, drain_violations, listener_fd};
@@ -132,21 +133,7 @@ impl CloseLeg {
     /// green leg leaves this table for its `scripts/sim-smoke.sh` row, where
     /// it runs with its twin; `tests/lanes.rs` holds every leg to one of the
     /// two.
-    pub const PINNED_RED: &'static [CloseLeg] = &[
-        CloseLeg::Tasks,
-        CloseLeg::Fan,
-        CloseLeg::Close,
-        CloseLeg::Rearm,
-        CloseLeg::EofWithData,
-        CloseLeg::SubscribeFin,
-        CloseLeg::RegistryFin,
-        CloseLeg::QuitSubscriber,
-        CloseLeg::Stall,
-        CloseLeg::HalfClose,
-        CloseLeg::HalfCloseEofWithData,
-        CloseLeg::HalfCloseReset,
-        CloseLeg::ProtocolOrder,
-    ];
+    pub const PINNED_RED: &'static [CloseLeg] = &[CloseLeg::Fan];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -274,6 +261,8 @@ struct Rig {
     tasks_most: Option<Vec<usize>>,
     /// Each cell's node state, for the gauges a leg reads beside the wire.
     nodes: Vec<Rc<NodeInfo>>,
+    /// O1's judge: each cell's first breach, recorded once.
+    owners: OwnersJudge,
 }
 
 impl Rig {
@@ -302,20 +291,22 @@ impl Rig {
                     .expect("a leg's boot capacity");
                 config = config.with_boot_capacity(capacity);
             }
-            let node = Rc::new(NodeInfo::try_new(config).expect("fixture cache allocation"));
+            let (node, admission) = NodeInfo::try_new(config).expect("fixture cache allocation");
+            let node = Rc::new(node);
             node.rng_state.set(seed ^ (0xCA9A_0000 + i as u64));
             nodes.push(Rc::clone(&node));
             let seed_store = KeyspaceSeed::Uncataloged {
                 cfg: StoreConfig { hasher: node_hasher(seed), ..Default::default() },
                 specs: namespaces.to_vec(),
             };
-            let (plane, serve_mark, timer_set) = Plane::new(
+            let (plane, serve_mark, timer_set, executor) = Plane::new(
                 CellId(cell),
                 CELLS,
                 listener_fd(cell),
                 seed_store,
                 fabric,
                 node,
+                admission,
                 NoopObserver,
                 false,
             )
@@ -323,8 +314,15 @@ impl Rig {
             let config = LoopConfig { spin_iters: 4, ..Default::default() };
             let driver = SimDriver::new(Rc::clone(&net));
             let pool = BufferPool::new(RECV_BUFFERS, RECV_BUFFER_BYTES);
-            let cell_loop =
-                CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark, timer_set);
+            let cell_loop = CellLoop::new(
+                driver,
+                Rc::clone(&clock),
+                pool,
+                config,
+                serve_mark,
+                timer_set,
+                executor,
+            );
             nets.push(net);
             cells.push((cell_loop, plane));
         }
@@ -343,6 +341,7 @@ impl Rig {
             readings: Vec::new(),
             tasks_most: None,
             nodes,
+            owners: OwnersJudge::new(usize::from(CELLS)),
         };
         for _ in 0..8 {
             rig.step();
@@ -381,12 +380,32 @@ impl Rig {
                 most[cell] = most[cell].max(cell_loop.executor().live_tasks());
             }
         }
+        self.judge_owners();
         for id in 0..self.clients.len() {
             self.observe(id);
         }
         drain_violations(&self.nets, &mut self.violations);
         self.clock.advance(Nanos(STEP_NS_FLOOR + self.rng.next_u64() % self.step_ns_max));
         self.steps += 1;
+    }
+
+    /// O1 on every step (ADR-0177 D2): each cell's raw owners judged
+    /// beside the leg's clients that hold a slot by their own reading (a
+    /// frame read other than the `maxclients` refusal) and whose
+    /// server-side close the net has not posted, read live: the rig judges
+    /// before it observes this step's closes.
+    fn judge_owners(&mut self) {
+        let mut held = vec![0usize; self.cells.len()];
+        for client in &self.clients {
+            let framed = client.replies.first().is_some_and(|reply| reply != REFUSAL_FRAME);
+            if framed && !self.nets[client.cell].borrow().closed(client.fd) {
+                held[client.cell] += 1;
+            }
+        }
+        let at = format!("step {}", self.steps);
+        for (cell, (cell_loop, plane)) in self.cells.iter().enumerate() {
+            self.owners.step(cell, plane.conn_owners(cell_loop.executor()), Some(held[cell]), &at);
+        }
     }
 
     /// Reads what reached client `id`, frames its replies and notes the
@@ -489,11 +508,16 @@ impl Rig {
             && self.cells.iter().all(|(_, plane)| plane.suspended() == 0)
     }
 
-    /// Steps until quiet, then 64 more so closes and drains complete.
+    /// Steps until quiet, then 64 more so closes and drains complete; then
+    /// O1's leak clause: no `conn` header stays Retired.
     fn settle(&mut self) {
         self.until("quiescence", Rig::quiet);
         for _ in 0..64 {
             self.step();
+        }
+        let at = format!("settle, step {}", self.steps);
+        for (cell, (cell_loop, plane)) in self.cells.iter().enumerate() {
+            self.owners.settled(cell, plane.conn_owners(cell_loop.executor()), &at);
         }
     }
 
@@ -526,6 +550,14 @@ impl Rig {
         }
     }
 
+    /// A close's drain counter of cell X, read beside the wire (`INFO
+    /// stats`' own lines): the leg's engagement and a reading it prints.
+    fn drain_count(&mut self, name: &'static str, read: fn(&NodeInfo) -> u64) -> u64 {
+        let value = read(&self.nodes[X]);
+        self.read(name, value);
+        value
+    }
+
     /// The connection slots `cell` holds now.
     fn occupied(&self, cell: usize) -> usize {
         self.plane(cell).connections()
@@ -535,6 +567,7 @@ impl Rig {
     /// iteration (the cap bound, the assembly rule and their liveness), and
     /// the state hash over the readings and every cell's keyspace.
     fn report(mut self, leg: CloseLeg) -> CapacityReport {
+        self.violations.extend(self.owners.take_violations());
         // No op refused at a full per-origin deque (ADR-0177 D6; derived
         // never).
         for cell in 0..self.nodes.len() {
@@ -550,6 +583,7 @@ impl Rig {
                 peers: CELLS - 1,
                 tiered_tables: plane.keyspace().tiered_tables(),
                 turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
+                maint_paced: self.nodes[index].tier_maint_task_waits.get(),
             };
             census.judge(index, plane.cap_census(), facts);
         }
@@ -923,8 +957,10 @@ fn close_leg(seed: u64) -> Rig {
         ));
     }
     rig.expect_vacant(X, 1);
-    if !engaged {
-        let text = "VACUOUS closed-queue-unengaged: the held peer answered before the close";
+    let drained = rig.drain_count("closed_queue_commands", |n| n.closed_queue_commands.get());
+    if !engaged || drained < names.len() as u64 {
+        let text = "VACUOUS closed-queue-unengaged: the held peer answered before the close, or \
+                    the queue was not dequeued from a closed slot";
         rig.violate(text.to_string());
     }
     rig
@@ -1037,6 +1073,8 @@ fn subscribe_leg(seed: u64, form: Form) -> Rig {
         rig.judge_replies(client, 1, &owed, "the subscribing client");
     }
     rig.expect_vacant(X, 0);
+    let drained = rig.drain_count("closed_queue_commands", |n| n.closed_queue_commands.get());
+    let engaged = engaged && (form == Form::Fin || drained > names.len() as u64);
     if !engaged {
         let token = match form {
             Form::Reset => "closed-queue-unengaged",
@@ -1075,6 +1113,8 @@ fn registry_leg(seed: u64, form: Form) -> Rig {
             [DEL_NONE.to_vec(), b"+OK\r\n".to_vec(), b"+OK\r\n".to_vec(), subscribed(&channel)];
         rig.judge_replies(client, 2, &owed, "the registry client");
     }
+    let drained = rig.drain_count("closed_queue_commands", |n| n.closed_queue_commands.get());
+    let engaged = engaged && (form == Form::Fin || drained >= 3);
     if !engaged {
         let token = match form {
             Form::Reset => "registry-unengaged",
@@ -1150,7 +1190,9 @@ fn quit_subscriber_leg(seed: u64) -> Rig {
         rig.violate(format!("publish-count-over: {over} PUBLISHes counted more than one receiver"));
     }
     rig.settle();
-    let engaged = ok_at.is_some_and(|(_, at)| at > quit_sent);
+    let dropped =
+        rig.drain_count("flushing_deliveries_dropped", |n| n.flushing_deliveries_dropped.get());
+    let engaged = ok_at.is_some_and(|(_, at)| at > quit_sent) && dropped >= 1;
     if !engaged {
         let text = "VACUOUS quit-sub-unengaged: no PUBLISH between the QUIT and its +OK";
         rig.violate(text.to_string());
@@ -1230,8 +1272,11 @@ fn stall_leg(seed: u64) -> Rig {
     let net = rig.nets[X].borrow();
     let sent = net.sends_after_eof(rig.fd(b)) > 0 && net.sends_after_eof(rig.fd(e)) > 0;
     drop(net);
-    if !(eofs_in_sleep && sent) {
-        let text = "VACUOUS stall-close-unengaged: B's and E's ends were not read in the sleep";
+    let entries = rig.drain_count("closed_reader_entries", |n| n.closed_reader_entries.get());
+    let waits = rig.drain_count("reader_take_waits", |n| n.reader_take_waits.get());
+    if !(eofs_in_sleep && sent && entries >= 1 && waits >= 3) {
+        let text = "VACUOUS stall-close-unengaged: B's and E's ends were not read in the sleep, \
+                    or no held entry parsed past Closed and no run-out waited for a take";
         rig.violate(text.to_string());
     }
     rig
@@ -1327,8 +1372,11 @@ fn half_close_reset_leg(seed: u64) -> Rig {
     rig.settle();
     rig.expect_landed(reader, &names, "reset-drain-unrun", "the reset client");
     rig.expect_vacant(X, 1);
-    if rig.nets[X].borrow().reset_send_errors() == 0 {
-        rig.violate("VACUOUS reset-drain-unengaged: no Send met the reset".to_string());
+    let drained = rig.drain_count("closed_queue_commands", |n| n.closed_queue_commands.get());
+    if rig.nets[X].borrow().reset_send_errors() == 0 || drained == 0 {
+        let text = "VACUOUS reset-drain-unengaged: no Send met the reset, or no command was \
+                    dequeued from a closed slot";
+        rig.violate(text.to_string());
     }
     rig
 }
@@ -1419,8 +1467,10 @@ fn protocol_order_leg(seed: u64) -> Rig {
         rig.violate(format!("post-error-ran: {ran} of the {SETS} SETs behind the error ran"));
     }
     rig.expect_vacant(X, 1);
-    if !(bound && landed > 0) {
-        let text = "VACUOUS protocol-order-unengaged: no SET before the error ran namespace-bound";
+    let queued = rig.drain_count("parse_replies_queued", |n| n.parse_replies_queued.get());
+    if !(bound && landed > 0 && queued >= 1) {
+        let text = "VACUOUS protocol-order-unengaged: no SET before the error ran namespace-bound, \
+                    or PARSE queued no reply behind the owed ones";
         rig.violate(text.to_string());
     }
     rig
@@ -1482,93 +1532,9 @@ mod reds {
     }
 
     #[test]
-    #[ignore = "a closed subscriber's deltas are a task of their own, alive after its slot \
-                freed; red until a connection's one task ships them from a draining slot"]
-    fn the_tasks_leg_holds_no_task_past_its_share() {
-        pinned_red(CloseLeg::Tasks);
-    }
-
-    #[test]
     #[ignore = "a fan sends a leg per remote key past the connection's window of 32; red until \
                 each leg takes one of the connection's gate units"]
     fn the_fan_leg_holds_a_window_per_connection() {
         pinned_red(CloseLeg::Fan);
-    }
-
-    #[test]
-    #[ignore = "Closed drops a reset connection's queue; red until a draining slot runs it"]
-    fn the_close_leg_runs_every_queued_command() {
-        pinned_red(CloseLeg::Close);
-    }
-
-    #[test]
-    #[ignore = "an end of stream closes the slot at once, so replies after it are lost; red \
-                until the end of stream moves the slot to a flush that answers them"]
-    fn the_rearm_leg_answers_every_reply() {
-        pinned_red(CloseLeg::Rearm);
-    }
-
-    #[test]
-    #[ignore = "bytes reaped beside their end of stream are released unparsed; red until the \
-                end of stream keeps the parser"]
-    fn the_eof_with_data_leg_runs_and_answers_its_set() {
-        pinned_red(CloseLeg::EofWithData);
-    }
-
-    #[test]
-    #[ignore = "an end of stream closes the slot at once, so replies after it are lost; red \
-                until the end of stream moves the slot to a flush that answers them"]
-    fn the_subscribe_leg_answers_its_fin() {
-        pinned_red(CloseLeg::SubscribeFin);
-    }
-
-    #[test]
-    #[ignore = "an end of stream closes the slot at once, so replies after it are lost; red \
-                until the end of stream moves the slot to a flush that answers them"]
-    fn the_registry_leg_answers_its_fin() {
-        pinned_red(CloseLeg::RegistryFin);
-    }
-
-    #[test]
-    #[ignore = "a marked subscriber is written deliveries after its QUIT; red until a flushing \
-                slot takes no delivery"]
-    fn the_quit_subscriber_leg_reads_nothing_after_its_ok() {
-        pinned_red(CloseLeg::QuitSubscriber);
-    }
-
-    #[test]
-    #[ignore = "a stalled cell releases at the vacant slot the bytes of connections closed \
-                during the stall; red until a slot keeps its parser past Closed"]
-    fn the_stall_leg_runs_what_each_client_sent() {
-        pinned_red(CloseLeg::Stall);
-    }
-
-    #[test]
-    #[ignore = "an end of stream closes the slot and Closed drops the queue behind a held \
-                reply, so what the client sent is neither run nor answered; red until a \
-                half-closed slot runs its queue and sends every reply after the end of stream"]
-    fn the_half_close_leg_answers_every_reply() {
-        pinned_red(CloseLeg::HalfClose);
-    }
-
-    #[test]
-    #[ignore = "an end of stream reaped with its bytes closes the slot first; red until the end \
-                of stream keeps the parser and answers what was read"]
-    fn the_half_close_leg_answers_a_shared_reap() {
-        pinned_red(CloseLeg::HalfCloseEofWithData);
-    }
-
-    #[test]
-    #[ignore = "an end of stream closes the slot and Closed drops the queue; red until the \
-                queue runs to its end after a reset"]
-    fn the_half_close_reset_leg_runs_its_queue() {
-        pinned_red(CloseLeg::HalfCloseReset);
-    }
-
-    #[test]
-    #[ignore = "PARSE writes a protocol error into the connection's output at once, ahead of the \
-                replies its pump still owes; red until PARSE queues its own replies behind them"]
-    fn the_protocol_order_leg_answers_the_error_after_its_owed_replies() {
-        pinned_red(CloseLeg::ProtocolOrder);
     }
 }

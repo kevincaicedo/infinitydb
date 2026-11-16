@@ -35,13 +35,12 @@ pub(super) async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + C
             let adding = matches!(id, CommandId::Subscribe | CommandId::Psubscribe);
             let names: Vec<&[u8]> = argv[1..].to_vec();
             let mut frames = OpenReply::new(shared.take_reply_buf());
-            let now = shared.now.get();
             let Some(changes) = shared.with_conn(key, |conn| {
                 if adding {
-                    pubsub::apply_subscribe(&names, kind, &mut conn.cx, now, frames.reply())
+                    pubsub::apply_subscribe(&names, kind, &mut conn.cx, frames.reply())
                 } else {
                     let names = (!names.is_empty()).then_some(names.as_slice());
-                    pubsub::apply_unsubscribe(names, kind, &mut conn.cx, now, frames.reply())
+                    pubsub::apply_unsubscribe(names, kind, &mut conn.cx, frames.reply())
                 }
             }) else {
                 return false;
@@ -208,42 +207,47 @@ async fn send_sub_delta<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     }
 }
 
-/// Close-path subscription cleanup: ships the 1→0 deltas and consumes the
-/// acks (nothing awaits them, but every fabric op replies — credit and
-/// orphan-tripwire hygiene).
+/// A closed connection's cell-level 1→0 transitions: kind, name and delta.
+pub(super) type SubNotes = Vec<(SubKind, Vec<u8>, i32)>;
+
+/// Close-path subscription cleanup, on the closed connection's own pump:
+/// ships the 1→0 deltas and consumes the acks (nothing awaits them, but
+/// every fabric op replies — credit and orphan-tripwire hygiene).
 pub(super) async fn flush_sub_deltas<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: Rc<Shared<O, F>>,
-    notes: Vec<(SubKind, Vec<u8>, i32)>,
+    shared: &Rc<Shared<O, F>>,
+    notes: SubNotes,
 ) {
     let mut waiters = Vec::new();
     for (kind, name, delta) in &notes {
-        send_sub_delta(&shared, *kind, name, *delta, &mut waiters).await;
+        send_sub_delta(shared, *kind, name, *delta, &mut waiters).await;
     }
     for waiter in waiters {
         let _ = waiter.await;
     }
 }
 
-/// Removes a closed connection from the local registries, returning the
-/// cell-level transitions to notify.
+/// Removes a draining connection from the local registries once its queue
+/// is empty, returning the cell-level transitions to notify. The names
+/// move out of the context's two lists, the ones that went 1→0 into the
+/// notes, so nothing is copied.
 pub(super) fn unsubscribe_closed_conn<
     O: PlaneObserver + 'static,
     F: SegmentFs + Clone + 'static,
 >(
-    shared: &Rc<Shared<O, F>>,
+    shared: &Shared<O, F>,
     key: ConnKey,
-    cx: &ConnCx,
-) -> Vec<(SubKind, Vec<u8>, i32)> {
+    cx: &mut ConnCx,
+) -> SubNotes {
     let mut notes = Vec::new();
     let mut ps = shared.pubsub.borrow_mut();
-    for channel in &cx.sub_channels {
-        if ps.local_remove(SubKind::Channel, channel, key) {
-            notes.push((SubKind::Channel, channel.clone(), -1));
+    for channel in cx.sub_channels.drain(..) {
+        if ps.local_remove(SubKind::Channel, &channel, key) {
+            notes.push((SubKind::Channel, channel, -1));
         }
     }
-    for pattern in &cx.sub_patterns {
-        if ps.local_remove(SubKind::Pattern, pattern, key) {
-            notes.push((SubKind::Pattern, pattern.clone(), -1));
+    for pattern in cx.sub_patterns.drain(..) {
+        if ps.local_remove(SubKind::Pattern, &pattern, key) {
+            notes.push((SubKind::Pattern, pattern, -1));
         }
     }
     notes
@@ -267,17 +271,20 @@ pub(super) fn unsubscribe_closed_conn<
 pub(super) async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: Rc<Shared<O, F>>,
 ) {
-    // One pump runs at a time (`pub_pump_active`), so it finds the reserve.
+    // The cell's one owner pump, made at plane start and never ending,
+    // takes the reserve at its first poll and holds it across every park
+    // (ADR-0192 D3: the owner pump holds it while it runs).
     let mut reserve = shared.fan_reserve.take();
-    debug_assert!(reserve.is_some(), "the running owner pump holds the cell's fan reserve");
+    debug_assert!(reserve.is_some(), "the cell's one owner pump holds its fan reserve");
     loop {
         // The origins in rotation, each one's publishes in arrival order.
-        let Some((origin, item)) = shared.owner_pubs.borrow_mut().pop_rotating(&shared.node) else {
-            // Put back in the step that clears the flag, no await between,
-            // so the pump the next drain spawns finds it.
-            shared.fan_reserve.set(reserve);
-            shared.pub_pump_active.set(false);
-            return;
+        let next = shared.owner_pubs.borrow_mut().pop_rotating(&shared.node);
+        let Some((origin, item)) = next else {
+            // Parked in the step that read every origin empty:
+            // FABRIC-IN wakes it when it queues a publish.
+            shared.pub_pump_parked.set(true);
+            park().await;
+            continue;
         };
         let (mut total, _) = deliver_local(&shared, item.channel(), item.payload(), None);
         let mut fold = |outcome: OwnedOutcome| {
@@ -536,7 +543,18 @@ pub(super) fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clo
         if let Some((conn, seq)) = tag
             && !self_frames.is_empty()
         {
-            shared.with_conn(conn, |c| c.self_push.push((seq, self_frames)));
+            // The stash is a writer into the connection's output: a slot
+            // that cannot send drops the frames.
+            let dropped = shared.with_conn(conn, |c| match c.link_mut() {
+                Some(link) => {
+                    link.self_push.push((seq, self_frames));
+                    None
+                }
+                None => Some(self_frames),
+            });
+            if let Some(Some(frames)) = dropped {
+                shared.recycle_reply_buf(frames);
+            }
         }
         staged.push((from, token, StagedReply::Int(delivered)));
         true
@@ -636,18 +654,51 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let caps = shared.knobs.get().cob_pubsub;
     shared
         .with_conn(key, |conn| {
-            if conn.closing {
-                return false;
-            }
-            if defer == Some(key) {
+            let (proto, id) = (conn.cx.proto, conn.cx.id);
+            match &mut conn.slot {
+                // A closing or draining slot is not a receiver.
+                ConnSlot::Closing { .. } | ConnSlot::Draining { .. } => false,
+                // Canary: a flushing slot's answer before the defer branch,
+                // so the publisher's own frames are dropped.
+                #[cfg(inf_canary_flushing_drops_own_frame)]
+                ConnSlot::Flushing { stream, .. } => matches!(stream, PeerStream::Open),
                 // The publisher's own frames ride the reply path instead
-                // (emitted right after the receiver count).
-                write(deferred.reply(), conn.cx.proto);
-                return true;
+                // (emitted right after the receiver count), in Active and
+                // Flushing alike (ADR-0101).
+                ConnSlot::Active { .. } | ConnSlot::Flushing { .. } if defer == Some(key) => {
+                    write(deferred.reply(), proto);
+                    true
+                }
+                ConnSlot::Active { link, .. } => {
+                    write(link.out.open(), proto);
+                    enforce_output_cap(&shared.node, link, id, now_ms, caps);
+                    true
+                }
+                // Canary: the delivery is written into a flushing slot.
+                #[cfg(inf_canary_flushing_takes_delivery)]
+                ConnSlot::Flushing { link, .. } => {
+                    write(link.out.open(), proto);
+                    true
+                }
+                // A flushing slot is written nothing that arrives after its
+                // mark or its end of stream, and counts as a receiver until
+                // the server reads its end of stream (ADR-0196 D4, A1.2).
+                #[cfg(not(inf_canary_flushing_takes_delivery))]
+                ConnSlot::Flushing { stream, .. } => {
+                    let node = &shared.node;
+                    let dropped = node.flushing_deliveries_dropped.get() + 1;
+                    node.flushing_deliveries_dropped.set(dropped);
+                    // Canary: the count reads the parser, not the stream, so
+                    // a flushing `Ended` slot whose parser ended is counted.
+                    #[cfg(inf_canary_half_closed_counted)]
+                    return !matches!(stream, PeerStream::Ended { by: ClosedBy::Peer { .. } });
+                    #[cfg(not(inf_canary_half_closed_counted))]
+                    match stream {
+                        PeerStream::Open => true,
+                        PeerStream::Ended { .. } => false,
+                    }
+                }
             }
-            write(conn.out.open(), conn.cx.proto);
-            enforce_output_cap(&shared.node, conn, now_ms, caps);
-            true
         })
         .unwrap_or(false)
 }
@@ -659,7 +710,8 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 /// connection (with its buffered output) frees on close.
 pub(super) fn enforce_output_cap(
     node: &NodeInfo,
-    conn: &mut Conn,
+    conn: &mut Link,
+    id: u64,
     now_ms: u64,
     caps: (u64, u64, u64),
 ) {
@@ -678,7 +730,7 @@ pub(super) fn enforce_output_cap(
         conn.cob_soft_since_ms = 0;
         false
     };
-    if (over_hard || soft_expired) && node.clients.borrow_mut().request_kill(conn.cx.id) {
+    if (over_hard || soft_expired) && node.clients.borrow_mut().request_kill(id) {
         conn.cob_kill_sent = true;
         node.cob_disconnections.set(node.cob_disconnections.get() + 1);
     }

@@ -26,7 +26,7 @@ pub(crate) use sections::info;
 
 // ---- shared data definitions (behaviour lives in the child modules) ----------
 
-pub(crate) fn hello(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, out: &mut ReplyBuf) {
+pub(crate) fn hello(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, out: &mut ReplyBuf) {
     let mut requested = cx.proto;
     if argv.len() >= 2 {
         match parse_i64(argv.arg(1)) {
@@ -45,11 +45,7 @@ pub(crate) fn hello(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, ou
         return;
     }
     cx.proto = requested;
-    {
-        let mut clients = cx.node.clients.borrow_mut();
-        clients.ensure(cx.id, now.as_millis());
-        clients.set_resp(cx.id, if requested == Protocol::Resp3 { 3 } else { 2 });
-    }
+    cx.node.clients.borrow_mut().set_resp(cx.id, if requested == Protocol::Resp3 { 3 } else { 2 });
     let mut w = RespWriter::new(out, cx.proto);
     w.map_header(7);
     w.bulk(b"server");
@@ -351,7 +347,6 @@ pub(crate) fn inf_ns(
     ks: &mut Keyspace,
     cx: &mut ConnCx,
     node: &NodeInfo,
-    now: Nanos,
     w: &mut RespWriter<'_>,
 ) {
     let sub = argv.arg(1);
@@ -384,7 +379,7 @@ pub(crate) fn inf_ns(
             cx.db = db as u16;
             cx.ns = crate::exec::ConnNamespace::Default;
             let _ = ks.db_mut(db);
-            cx.publish_client_state(now);
+            cx.publish_client_state();
             return w.simple("OK");
         }
         let Some(spec) = ks.ns_get(name) else {
@@ -930,7 +925,6 @@ pub(crate) fn client(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, o
     let proto = cx.proto;
     let mut w = RespWriter::new(out, proto);
     let sub = argv.arg(1);
-    cx.node.clients.borrow_mut().ensure(cx.id, now.as_millis());
     if sub.eq_ignore_ascii_case(b"ID") {
         w.int(cx.id as i64);
     } else if sub.eq_ignore_ascii_case(b"GETNAME") {
@@ -952,7 +946,7 @@ pub(crate) fn client(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, o
             return w
                 .error("ERR Client names cannot contain spaces, newlines or special characters.");
         }
-        cx.node.clients.borrow_mut().ensure(cx.id, now.as_millis()).name = name.to_vec();
+        cx.node.clients.borrow_mut().set_name(cx.id, name);
         w.simple("OK");
     } else if sub.eq_ignore_ascii_case(b"LIST") {
         let mut id_filter: Option<Vec<u64>> = None;
@@ -1096,7 +1090,7 @@ mod tests {
     /// redis oracle) refused writes with -OOM. Red pre-fix.
     #[test]
     fn nonzero_maxmemory_never_fans_to_the_unlimited_sentinel() {
-        let node = NodeInfo::try_default().expect("fixture cache allocation");
+        let (node, _) = NodeInfo::try_default().expect("fixture cache allocation");
         node.cells.set(4);
         let mut ks = Keyspace::new(StoreConfig::default());
         for (configured, per_cell) in [(1u64, 1u64), (2, 1), (5, 1), (100, 25), (0, 0)] {

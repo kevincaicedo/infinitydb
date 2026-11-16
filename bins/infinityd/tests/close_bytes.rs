@@ -65,15 +65,11 @@ impl Server {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("data dir");
         let stderr = dir.join("stderr");
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("probe bind")
-            .local_addr()
-            .expect("addr")
-            .port()
-            .to_string();
+        // `--port 0`: the node binds a port of the kernel's choosing and
+        // prints it, so no probe's port is lost to a concurrent binder.
         let child = NodeBinary::built()
             .command()
-            .args(["--port", &port, "--cells", &cells.to_string()])
+            .args(["--port", "0", "--cells", &cells.to_string()])
             .args(["--accept-handoff", "on", "--device-probe", "off", "--data-dir"])
             .arg(dir.join("data"))
             .stdout(Stdio::null())
@@ -277,6 +273,23 @@ fn client_list(server: &Server) -> String {
     String::from_utf8(call(&mut probe, &[b"CLIENT", b"LIST"])).expect("CLIENT LIST is text")
 }
 
+/// `CLIENT LIST` of the cell that holds client `id` (an id is `cell << 48 |
+/// seq`): the list is the cell's own, so a probe is read only once it lands
+/// on that cell, at most 64 tries.
+fn client_list_of(server: &Server, id: &str) -> String {
+    let cell = id.parse::<u64>().expect("a client id") >> 48;
+    for _ in 0..64 {
+        let mut probe = server.connect();
+        let own = call(&mut probe, &[b"CLIENT", b"ID"]);
+        let own = std::str::from_utf8(&own).expect("text").trim_start_matches(':').trim_end();
+        if own.parse::<u64>().expect("a client id") >> 48 == cell {
+            let list = call(&mut probe, &[b"CLIENT", b"LIST"]);
+            return String::from_utf8(list).expect("CLIENT LIST is text");
+        }
+    }
+    panic!("no probe of 64 reached cell {cell}");
+}
+
 /// Whether `CLIENT LIST` holds a row of client `id`.
 fn has_row(list: &str, id: &str) -> bool {
     list.lines().any(|line| line.contains(&format!("id={id} ")))
@@ -286,9 +299,6 @@ fn has_row(list: &str, id: &str) -> bool {
 /// at one reap: the command is run and answered, then the connection
 /// closes, and a fresh client reads the value.
 #[test]
-#[ignore = "a connection's last bytes and its end of stream reaped together close the slot \
-            first, so the bytes are released unparsed; red until the end of stream keeps the \
-            parser and the commands read before it are run and answered"]
 fn a_set_written_with_its_fin_is_run_and_answered() {
     let server = Server::spawn(2, "pre-eof");
     let mut writer = server.connect();
@@ -307,9 +317,6 @@ fn a_set_written_with_its_fin_is_run_and_answered() {
 /// the data's reap may come iterations before the FIN's, so this reading is
 /// the wire's witness, not the deterministic red (HC2 is).
 #[test]
-#[ignore = "an end of stream closes the slot at once and RESPOND skips a closing slot, so the \
-            replies of commands read before the FIN are lost when they share an iteration; red \
-            until the end of stream moves the slot to a flush that answers them first"]
 fn a_half_closed_pipeline_is_answered_then_closed() {
     let server = Server::spawn(2, "hc1");
     for (prefix, count) in [("hc1-small", 100), ("hc1-large", 5_000)] {
@@ -332,9 +339,6 @@ fn a_half_closed_pipeline_is_answered_then_closed() {
 /// HC2: the same with the node stopped until the FIN is written, so the
 /// data and the FIN share one reap: the deterministic red of the half-close.
 #[test]
-#[ignore = "an end of stream reaped with its connection's data closes the slot before PARSE, so \
-            none of the commands read before it is answered; red until the end of stream moves \
-            the slot to a flush that answers them first"]
 fn a_half_closed_pipeline_reaped_with_its_fin_is_answered() {
     let server = Server::spawn(2, "hc2");
     for (prefix, count) in [("hc2-small", 100), ("hc2-large", 5_000)] {
@@ -360,9 +364,6 @@ fn a_half_closed_pipeline_reaped_with_its_fin_is_answered() {
 /// `QUIT` are answered, then a FIN (ADR-0196 D6.2); nothing behind the
 /// `QUIT` runs.
 #[test]
-#[ignore = "an end of stream closes the slot at once, so the replies read before it, the QUIT's \
-            included, are lost when they share an iteration; red until the end of stream moves \
-            the slot to a flush that answers them first"]
 fn a_quit_inside_a_half_closed_pipeline_ends_it() {
     let server = Server::spawn(2, "hc4");
     let before = names("hc4-a", 1_500);
@@ -404,10 +405,10 @@ fn slow_half_closed_reader(server: &Server, quit: bool) -> (Vec<u8>, End, bool, 
     client.write_all(&bytes).expect("write");
     client.shutdown(Shutdown::Write).expect("FIN");
     std::thread::sleep(Duration::from_millis(200));
-    let during = has_row(&client_list(server), &id);
+    let during = has_row(&client_list_of(server, &id), &id);
     std::thread::sleep(Duration::from_millis(300));
     let (delivered, end) = read_to_end(&mut client, "the slow reader");
-    let after = has_row(&client_list(server), &id);
+    let after = has_row(&client_list_of(server, &id), &id);
     (delivered, end, during, after)
 }
 
@@ -418,9 +419,6 @@ const BIG_REPLY_BYTES: usize = "$1048576\r\n".len() + (1 << 20) + 2;
 /// stream (D6.4: Redis drops them at 1,064,944); the client's row is listed
 /// while its replies are unsent and gone after its end (D6.5).
 #[test]
-#[ignore = "an end of stream closes the slot at once, so replies a slow reader has not taken are \
-            lost and its row leaves CLIENT LIST before them; red until the end of stream moves \
-            the slot to a flush that sends every reply first"]
 fn a_slow_half_closed_reader_reads_every_reply() {
     let server = Server::spawn(2, "hc5");
     let (delivered, end, during, after) = slow_half_closed_reader(&server, false);
@@ -439,9 +437,6 @@ fn a_slow_half_closed_reader_reads_every_reply() {
 /// HC10: the same client sends `QUIT` before its FIN: the eight replies,
 /// then the `QUIT`'s `+OK` (D6.4: Redis drops it), then the end.
 #[test]
-#[ignore = "an end of stream closes the slot at once, so replies a slow reader has not taken, the \
-            QUIT's included, are lost; red until the end of stream moves the slot to a flush \
-            that sends every reply first"]
 fn a_slow_reader_that_quits_before_its_fin_reads_every_reply() {
     let server = Server::spawn(2, "hc10");
     let (delivered, end, during, after) = slow_half_closed_reader(&server, true);
@@ -455,9 +450,6 @@ fn a_slow_reader_that_quits_before_its_fin_reads_every_reply() {
 /// HC9: 100 `SET`s, then a reset (`SO_LINGER` 0), with the node stopped:
 /// every name is set though no reply can reach the client.
 #[test]
-#[ignore = "a reset reaped with its connection's data closes the slot before PARSE, so the bytes \
-            the client sent are released unparsed; red until a gone peer's received bytes are \
-            parsed and run unanswered"]
 fn a_reset_pipeline_is_run_unanswered() {
     let server = Server::spawn(2, "hc9");
     let names = names("hc9", 100);
@@ -475,9 +467,6 @@ fn a_reset_pipeline_is_run_unanswered() {
 /// 1,000 `SET`s, then a reset with the node stopped. The queue still runs
 /// after `Closed`, unanswered.
 #[test]
-#[ignore = "Closed drops a connection with its queue and a reset reaped with the data releases \
-            the bytes unparsed, so commands a gone client sent never run; red until the parser \
-            and the queue run to their end at every close"]
 fn a_namespace_bound_reset_runs_its_queue() {
     let server = Server::spawn(2, "queue");
     let mut setup = server.connect();
@@ -503,9 +492,6 @@ fn a_namespace_bound_reset_runs_its_queue() {
 /// A's `+OK` every name is set, B reads its 101 `+OK`s then the end, and
 /// neither name is a `CLIENT LIST` row (ADR-0196 HC3, A1's HC9).
 #[test]
-#[ignore = "a stalled cell keeps a connection's received bytes in its inbox past the connection's \
-            Closed, and PARSE then releases them at the vacant slot; red until the slot keeps its \
-            parser past Closed and parses the entries reaped before it"]
 fn a_stall_runs_the_bytes_of_connections_closed_during_it() {
     let server = Server::spawn(1, "stall");
     let mut sleeper = server.connect();
@@ -548,8 +534,6 @@ fn a_stall_runs_the_bytes_of_connections_closed_during_it() {
 /// 12,182, cell 1's; `bar` slot 5,061, cell 0's). The two `+OK`s, then the
 /// error, then the end; both keys are set.
 #[test]
-#[ignore = "PARSE writes a protocol error into the connection's output at once, ahead of the \
-            replies its pump still owes; red until PARSE queues its own replies behind them"]
 fn protocol_error_after_deferred() {
     let server = Server::spawn(2, "protocol-order");
     let mut client = server.connect();

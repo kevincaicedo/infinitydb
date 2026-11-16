@@ -992,21 +992,19 @@ rows=(
   # the test that holds the rule goes red at its own assertion.
   # The lane compare answers the owner part on every thread: a foreign wake counts nothing.
   "inf_canary_waker_owner_unchecked crate-test inf-runtime test:waker_threads a_wake_from_another_thread_takes_the_foreign_lane one foreign wake, counted"
-  # Reuse reads `o` and not the lane word: a header a foreign clone names is kept spare.
+  # Reuse reads `o` and not the lane word: a slot whose header a foreign clone names is freed.
   "inf_canary_wake_reuse_owner_count_only crate-test inf-runtime test:waker_threads a_foreign_clone_keeps_a_finished_tasks_header a foreign clone keeps the finished task's header"
-  # A completing first poll recycles its header with a wake queued: the next task is polled twice.
+  # A completing first poll frees its slot with a wake queued: the next task is polled twice.
   "inf_canary_ready_ignores_queued crate-test inf-runtime test:waker_threads a_foreign_wake_queued_for_a_finished_task_never_polls_the_next the next task was polled once"
   # The swap that leaves a closed header unnamed and unqueued frees nothing.
-  "inf_canary_closed_header_kept crate-test inf-runtime test:waker_close an_executor_dropped_before_its_threads_last_wakers_frees_each_at_its_drop its header, freed"
+  "inf_canary_closed_header_kept crate-test inf-runtime test:waker_close an_executor_dropped_before_its_threads_last_wakers_frees_each_at_its_drop the array, freed whole"
   "inf_canary_closed_header_kept crate-test inf-runtime test:waker_close executors_created_and_dropped_keep_nothing allocated less freed over both threads"
   # The owner lane's half of the count's bound: an owner clone at the bound does not abort.
   "inf_canary_wake_count_unbounded crate-test inf-runtime lib an_owner_lane_clone_at_the_bound_aborts not by SIGABRT"
-  # An owner-lane drop frees a Dead, undecided header: inside the future's own drop.
-  "inf_canary_settle_on_dead crate-test inf-runtime test:waker_threads a_future_that_keeps_its_own_waker_clone_is_freed_once freed nothing"
-  # An owner-lane drop of a Held header's last waker does not settle it.
-  "inf_canary_settle_held_skipped crate-test inf-runtime test:waker_threads a_waker_dropped_during_another_tasks_poll_frees_the_first_held_header freed inside the poll"
-  # `close` keeps the owner part: its `Rc` holds the shared state past the executor's drop.
-  "inf_canary_close_keeps_owner_part crate-test inf-runtime test:waker_close an_executor_dropped_before_its_threads_last_wakers_frees_each_at_its_drop released at drop"
+  # An owner-lane drop settles a Finished, undecided header: inside the future's own drop.
+  "inf_canary_settle_on_dead crate-test inf-runtime test:waker_threads a_future_that_keeps_its_own_waker_clone_is_freed_once linked no reclaim"
+  # An owner-lane drop of a Retired header's last waker does not settle it.
+  "inf_canary_settle_held_skipped crate-test inf-runtime test:waker_threads a_waker_dropped_during_another_tasks_poll_frees_the_first_held_header reclaimed"
   # ADR-0003 A1.2.7: every park a cell loop issues carries a timeout of at most its ceiling;
   # planted, a park with no timer armed passes none and waits without limit.
   "inf_canary_park_without_ceiling crate-test inf-runtime test:reactor an_idle_park_carries_its_ceiling at most its ceiling"
@@ -1097,14 +1095,14 @@ rows=(
   # names the next. At the seed the plain build judges 6 pages and sets 3 aside (the corpus test
   # the_scan_batching_oracle_judges_pages_and_sets_others_aside holds both), and planted, its
   # judged pages are red.
-  "inf_canary_scan_chunk_of_one m4-tiered scan-one-read-an-entry --seed 0x51ee082d"
+  "inf_canary_scan_chunk_of_one m4-tiered scan-one-read-an-entry --seed 0x51ee082e"
 )
 # The rows above keep the order they were added in and take no new row:
 # `historical_rows` counts them, and falls only as one is deleted. The rows
 # below are ordered by cfg name (byte order, a cfg's rows together), and a
 # new row joins them in its cfg's place, so two changes that each add a row
 # touch different lines and merge without a conflict.
-historical_rows=295
+historical_rows=294
 ordered_rows=(
   # A barrier hold keeps every barrier on the files it names: a standalone sync, a write's
   # linked sync and a write-through write, each whole until the hold lifts. Planted,
@@ -1114,6 +1112,9 @@ ordered_rows=(
   # and the builder takes no other count (ADR-0194 A1). Planted, chunk_slots_for answers 64 at
   # every width, the fixed chunk, and a slab of 1,032 B slots in chunks of 32 is refused.
   "inf_canary_chunk_slots_fixed crate-test inf-foundation lib a_slot_takes_the_largest_chunk_one_allocation_holds wide-slot-refused"
+  # The same plant on the shipped classes (ADR-0194 A1): `conn`'s slot at 64 a chunk is past
+  # one allocation, so the node's layout refuses its class at boot.
+  "inf_canary_chunk_slots_fixed crate-test inf-server lib every_class_registers_at_its_chunk class-refused"
   # A close ends the receive: the io_uring driver queues the fd's cancels before the close and
   # posts Closed after them, so no Recv with bytes follows Closed. Planted, Close posts Closed
   # as it queues the close, ahead of the reap that brings the bytes. One row a shape: the
@@ -1121,18 +1122,99 @@ ordered_rows=(
   # earlier on a ring without deferred task work.
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_with_receive_posts_no_recv_after_closed recv-after-closed"
   "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_posts_no_recv_after_closed recv-after-closed"
+  # A close runs the queue to its end (ADR-0123 A2): a draining slot holds it. Planted, Closed
+  # drops the queue, and the reset client's queued SETs never run.
+  "inf_canary_closed_conn_queue_dropped m0-capacity closed-queue-unrun --close-leg close"
+  # Closed wakes a parked pump, so its draining slot retires and frees its conn task. Planted,
+  # the wake is skipped, and a closed connection keeps its task and its slot.
+  "inf_canary_closed_pump_not_woken crate-test inf-server lib a_closed_connection_frees_its_conn_task conn-task-kept"
+  # A half-closed slot parses the bytes reaped beside its end of stream (ADR-0196 A1.1). Planted,
+  # PARSE releases a flushing or closing Peer entry unparsed, and the SET sent before the FIN
+  # never runs.
+  "inf_canary_closing_inbox_released m0-capacity pre-eof-unrun --close-leg eof-with-data"
+  # A closing slot holds no descriptor, so nothing is sent after its Close (X1). Planted, it keeps
+  # a copy and RESPOND sends to it; the net reads bytes for a closed fd.
+  "inf_canary_closing_slot_sends m0-capacity bytes-after-close --close-leg close"
+  # A client row is inserted only through the plane's admission. Planted, SETNAME and the
+  # state mirror insert, and a command run after Closed puts the closed client back.
+  "inf_canary_command_registers_client m0-capacity ghost-client-row --close-leg registry-reset"
+  # A compaction read is taken only by spending a slot of its pass's room, so no namespace is
+  # marked in flight with no task to run its chain (ADR-0177 D2). Planted, the read is taken
+  # and marked first, the room asked after, and a one-slot pass marks its second namespace.
+  "inf_canary_compact_take_before_permit crate-test inf-server lib a_full_compact_room_paces_and_marks_nothing compact-mark-without-slot"
+  # A connection's slot and task end only after its close, so a client that has read a reply
+  # and is not closed holds both (O1's third clause). Planted, a pump whose queue is empty after
+  # its first reply returns and vacates its slot, the socket left open, and the admitted reader
+  # outnumbers its cell's slots.
+  "inf_canary_conn_owner_lost m0-capacity conn-under-clients --close-leg close"
+  # A slot stays occupied until its pump returns, so the conn tasks alive equal the occupied
+  # slots at every step (O1). Planted, the slot is vacated at Closed, before its pump returns,
+  # and O1 reads fewer slots than tasks.
+  "inf_canary_conn_slot_frees_at_closed m0-capacity conn-tasks-unequal --close-leg close"
+  # The `conn` class's slots are the cell's share (ADR-0177 D2) and its bytes E-store's F7 bill.
+  # Planted, it is built over (1 + k) C slots, k from its stride: the idle node's resident
+  # memory a cell rises by k x C x s_conn, 2,500 x 3,048 B at 4 cells (k = 1), over F7's
+  # 256 KiB, which the plain node's three boots stay within. The bytes are that product at the
+  # stride the plane's layout test prints; a stride that moves moves them with it.
+  "inf_canary_conn_slots_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 7620000 --control-bytes-cell 262144 --plant-row conn-tasks"
+  # A finished conn task's header is reclaimed once no waker names it, so a settled node holds no
+  # Retired conn header (O1's leak clause). Planted, the pump keeps a clone of its own waker past
+  # its return: the reset client's header stays Retired with every per-step clause green.
+  "inf_canary_conn_waker_kept m0-capacity conn-retired-kept --close-leg close"
   # The divert parks an origin's durable apply behind its pump while the pump is applying or
   # holds its work (ADR-0083 D1), so an origin has one open gated slot, its back (ADR-0177 D6).
   # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
   # origin holds its slot on a held cold read, and the flat write's open stops the cell.
   "inf_canary_divert_queue_only m0-capacity second-open-slot --close-leg gated-cold"
+  # A Peer parser ends at the run-out once a take of the inbox completed since its stamp
+  # (ADR-0196 D2). Planted, the run-out's test reads false, and the FIN-only client's slot never
+  # closes.
+  "inf_canary_draining_reader_never_ends m0-capacity half-close-unclosed --close-leg stall"
+  # The same plant read by O1's leak half: the FIN-only client's task and slot are kept together,
+  # so the per-step clauses stay green and the settled cell holds a slot its leg did not keep.
+  "inf_canary_draining_reader_never_ends m0-capacity slot-not-vacant --close-leg stall"
+  # A draining Peer parser parses the entries a stall held past Closed (ADR-0196 D2). Planted,
+  # PARSE releases them, and the reset client's SETs never run.
+  "inf_canary_draining_releases_held_entry m0-capacity pre-eof-unrun --close-leg stall"
+  # A draining slot vacates only after its 1→0 deltas are acknowledged, so the stop's barrier
+  # counts it until then. Planted, the slot vacates first, and the stop passes with deltas in
+  # flight.
+  "inf_canary_draining_vacates_before_acks crate-test inf-server lib the_stop_waits_for_a_draining_slots_acks quiet-before-acks"
+  # The end of stream keeps the parser and answers what was read before it (ADR-0196 A1.1).
+  # Planted, it closes the slot at once, and the half-closed client misses its replies: one row
+  # with the last chunk and the FIN in one reap, one behind a held reply.
+  "inf_canary_eof_closes_at_once m0-capacity half-close-unanswered --close-leg half-close-eof-with-data"
+  "inf_canary_eof_closes_at_once m0-capacity half-close-unanswered --close-leg half-close"
   # An `always` write whose verdict is an error reply leaves at once, not gated (ADR-0177 D6).
   # Planted, the error waits as a verdict for the next record's `seq`, and so for the hold.
   "inf_canary_error_reply_gated m0-capacity error-held --close-leg gated-error"
-  # An `always` apply whose verdict is a reply gives its placeholder back (ADR-0177 D6), so its
-  # origin's next apply opens a slot. Planted, an error reply leaves the placeholder at the
-  # origin's back, and the next write's open stops the cell.
-  "inf_canary_gated_error_keeps_placeholder m0-capacity second-open-slot --close-leg gated-error"
+  # The executor's drop drops every live future in place and resumes past one whose drop
+  # unwinds, then closes, frees and releases as it would have. Planted, the drop stops at that
+  # future, and the slabs are freed under the live futures after it.
+  "inf_canary_executor_drop_stops_at_unwind crate-test inf-runtime test:executor the_executors_drop_resumes_past_an_unwinding_drop drop-unwind-stopped"
+  # The first poll runs in its class's spare, in its slot, where every later poll and the drop
+  # find it (ADR-0194 D1's note), and a wake it raises is kept. Planted, the cell moves to another
+  # slot of its class at the task's next activation, and the future reads a second address.
+  "inf_canary_first_poll_off_slot crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-moved"
+  # A first poll that unwinds hands the spare's handle to its task's header, so the executor's
+  # drop drops its future in place, and the next first poll makes another slot its spare.
+  # Planted, the spare keeps the handle and the header has none: nothing counts the task, and
+  # the executor's drop never reaches its future.
+  "inf_canary_first_poll_unwind_unowned crate-test inf-runtime test:executor a_first_poll_that_unwinds_holds_its_slot_until_the_drop first-poll-unwind-unowned"
+  # Planted, a Pending first poll leaves its header Idle and unlinked, and the wake it raised is
+  # lost.
+  "inf_canary_first_poll_wake_dropped crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-wake-lost"
+  # A flushing publisher's own frames ride its publish's reply (ADR-0101 D4): the defer branch
+  # comes before the flushing slot's answer. Planted, the answer comes first, and the own
+  # message is dropped.
+  "inf_canary_flushing_drops_own_frame crate-test inf-server lib own_frame_rides_reply_after_protocol_error own-frame-dropped"
+  # A flushing slot is written no message published after its mark (ADR-0196 D4). Planted, the
+  # delivery writes into it, and a message follows the subscriber's +OK.
+  "inf_canary_flushing_takes_delivery m0-capacity push-after-quit --close-leg quit-subscriber"
+  # An `always` apply whose verdict is a reply drops its gated ticket, which releases its slot
+  # (ADR-0177 D6), so its origin's next apply opens one. Planted, the drop releases nothing, the
+  # error's slot stays at the origin's back, and the next write's open stops the cell.
+  "inf_canary_gated_drop_kept m0-capacity second-open-slot --close-leg gated-error"
   # The gated task publishes an `always` verdict only once the owner's fsync watermark covers
   # its record (ADR-0177 D3). Planted, it publishes every filled front, so a remote `always`
   # write is acknowledged before it is durable and the power cut loses it. The lane seed's cut
@@ -1141,10 +1223,41 @@ ordered_rows=(
   # The same plant on a peer's credits' worth of remote `always` writes while the owner's
   # fsync is held: no barrier completes, so at every seed the acks are read under the hold.
   "inf_canary_gated_ignores_watermark m0-capacity acked-under-hold --close-leg gated-hold"
+  # The `gated` task is one task of its cell, made at plane start before the cell serves; its
+  # class's one slot is full at assembly (ADR-0177 D2). Planted, plane start makes a second, and
+  # the class refuses it there.
+  "inf_canary_gated_pump_extra m0-smoke gated-tasks-full-at-assembly"
+  # A subscriber counts as a receiver until the server reads its end of stream (ADR-0196 A1.2).
+  # Planted, the count reads the parser, not the stream, so a half-closed one is counted.
+  "inf_canary_half_closed_counted crate-test inf-server lib half_closed_subscriber_not_counted count-after-eof"
+  # A finished task's slot is freed only when no waker names its header: it stays Retired
+  # until that waker's drop (ADR-0177 D2). Planted, it is freed under a clone, and the stale
+  # clone wakes the next task; the second row reaches the plant on a first poll Ready, the fast
+  # arm, where the escaped clone must keep the finished task Retired.
+  "inf_canary_header_reused_with_wakers crate-test inf-runtime test:waker_threads a_retired_slot_is_never_reused_while_a_waker_names_its_header no stale clone activates the new occupant"
+  "inf_canary_header_reused_with_wakers crate-test inf-runtime test:executor escaped_waker_clone_on_fast_path_is_harmless the escaped clone keeps the finished task Retired"
+  # MAINTAIN takes a compaction or shadow read only by spending a slot of its class's room, and
+  # counts a namespace the room cannot serve (ADR-0177 D2), which no simulated run reaches: every
+  # life's census reads the count 0. Planted, the room reads short at every pass, and the
+  # namespaces with shadow reads owed are paced.
+  "inf_canary_maint_room_short m4-tiered maint-paced"
+  # The plane's mark ends the parser at once (QUIT's rule). Planted, it is a side flag beside a
+  # live parser, and a SET reaped after a QUIT, while its +OK is unsent, runs.
+  "inf_canary_mark_applied_late crate-test inf-server lib a_set_after_quit_does_not_run post-quit-ran"
+  # The mark of a slot whose receive is disarmed pushes one RecvArm (ADR-0196 A1.3). Planted, it
+  # pushes none.
+  "inf_canary_mark_keeps_disarmed crate-test inf-server lib mark_rearms_a_disarmed_receive no-rearm-at-mark"
   # The net's own invariant: no chunk of an fd is posted after its end of stream. Its close
   # legs' shared reap posts a closed client's last chunk and its EOF in one reap, data first;
   # planted, the EOF goes first and the chunk after it.
   "inf_canary_net_data_after_eof crate-test inf-sim lib a_shared_reap_posts_the_chunk_before_the_end_of_stream net-data-after-eof"
+  # A cell makes one ns-apply pump per peer at plane start, the class's `N - 1` slots full at
+  # assembly (ADR-0177 D2). Planted, plane start makes one more, and the class refuses it there.
+  "inf_canary_ns_apply_pump_extra m0-smoke ns-apply-tasks-full-at-assembly"
+  # The owner pump is one task of its cell, made at plane start before the cell serves; its
+  # class's one slot is full at assembly (ADR-0177 D2). Planted, plane start makes a second, and
+  # the class refuses it there.
+  "inf_canary_owner_pub_pump_extra m0-smoke owner-pub-tasks-full-at-assembly"
   # The parked-bytes gauge sums the bytes behind the entries in the per-origin deques: a pop
   # subtracts its entry's (ADR-0177 D6). Planted, a pop subtracts nothing, so the peer that
   # parked the small-credit leg's applies reads its gauge above 0 once every reply is in.
@@ -1155,9 +1268,47 @@ ordered_rows=(
   # A per-origin deque holds its origin's credits' worth of ops, so none is refused (ADR-0177
   # D6); the durable driver reads the refusals at each life's end. Planted, a deque holds one.
   "inf_canary_parked_deque_of_one m2-durable PARKED"
+  # A command queued for a connection's parked pump wakes it by id: the pump parks only after it
+  # reads its queue empty with nothing pending (ADR-0177 D2). Planted, PARSE queues the command
+  # and wakes nothing, so a deferred command's client waits for a reply no task makes.
+  "inf_canary_parked_pump_not_woken m0-adversarial STALL --cells 4"
+  # A reply PARSE writes itself (-LOADING, a protocol error) leaves after every reply the
+  # connection owed before it: the route queues it behind them. Planted, it is written into out
+  # whatever the route, ahead of the owed replies: the plane test and the DST leg.
+  "inf_canary_parse_reply_around_queue crate-test inf-server lib protocol_error_answers_after_deferred reply-order"
+  "inf_canary_parse_reply_around_queue m0-capacity reply-order --close-leg protocol-order"
+  # A QUIT the pump runs empties the queue behind it. Planted, the queue is kept, and the SETs
+  # behind the QUIT run.
+  "inf_canary_quit_keeps_queue m0-capacity post-quit-ran --close-leg deferred-quit"
+  # The end of stream ends the receive (ADR-0196 A1.3). Planted, the end-of-stream arm re-arms
+  # the half-closed slot, and the net refuses an arm after its EOF.
+  "inf_canary_rearm_after_eof m0-capacity recv-armed-after-eof --close-leg half-close"
+  # The registries drop a connection when its queue is empty, so a queued SUBSCRIBE's 0→1
+  # precedes the close's 1→0 in one task. Planted, the removal runs at Closed, before the drain,
+  # and the owner keeps counting the closed client.
+  "inf_canary_registry_dropped_at_closed m0-capacity sub-count-after-close --close-leg subscribe-reset"
+  # A slab's release drops its occupant where it lies, after the counts and the free chain are
+  # written (ADR-0194 D1's second note). Planted, it moves the occupant out as a take does and
+  # drops it off its slot, at another address than the one the slab lent.
+  "inf_canary_release_moves_occupant crate-test inf-foundation lib release_drops_the_occupant_where_it_lies release-moved"
   # A general send keeps one credit free for the publish fan (ADR-0192 D2), so an origin parks
   # at most 7 applies at a peer of 8 credits. Planted, the guard is gone and all 8 arrive.
   "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"
+  # A Pending first poll takes its class's spare as its task's slot, so no id names the spare
+  # (ADR-0177 D2). Planted, the task takes the spare's handle but the spare stays set, and the
+  # next first poll writes over the suspended task, at its address.
+  "inf_canary_spare_kept_past_suspend crate-test inf-runtime test:executor the_spare_serves_no_task_an_id_names spare-under-id"
+  # The stop's mark ends every parser (ADR-0196 A1.1). Planted, it reaches active slots alone,
+  # and a SET held past the stop runs.
+  "inf_canary_stop_skips_peer_reader crate-test inf-server lib stop_ends_every_reader set-after-stop"
+  # A class handle carries its slab's `SlabInstance`, which `reserve` compares first (ADR-0171
+  # A2.1). Planted, the compare is skipped, and another executor's class, built alike, is
+  # granted.
+  "inf_canary_task_class_instance_blind crate-test inf-runtime test:executor a_class_and_a_task_of_one_executor_are_foreign_to_another_built_alike not Granted on the other"
+  # An id's lookup reads its task's header after the class's instance compare and the index's
+  # bound against the class's slots: two censuses of one cell mint equal instances (ADR-0194
+  # D5). Planted, the bound is skipped, and another executor's id reads past the header array.
+  "inf_canary_task_id_index_unbounded crate-test inf-runtime test:executor an_id_another_class_minted_past_this_class_is_stale a header's index lies in its array"
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.

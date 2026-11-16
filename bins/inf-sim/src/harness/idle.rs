@@ -133,6 +133,20 @@ impl HotRaise {
 }
 
 impl IdlePhase {
+    /// Pushes the idle clients, and the hot-raise probe, that have read a
+    /// reply (a frame other than the refusal), as their cells and fds.
+    pub(super) fn admitted(&self, out: &mut Vec<(usize, RawFd)>) {
+        let replied = |c: &&IdleClient| {
+            matches!(c.state, IdleState::Active { .. } | IdleState::Closed { .. })
+        };
+        out.extend(self.clients.iter().filter(replied).map(|c| (c.cell, c.fd)));
+        if let Some(raise) = &self.raise
+            && raise.answered > 0
+        {
+            out.push((0, raise.fd));
+        }
+    }
+
     pub(super) fn new(wanted: usize) -> IdlePhase {
         IdlePhase { wanted, clients: Vec::new(), raise: None, started: false, done: wanted == 0 }
     }

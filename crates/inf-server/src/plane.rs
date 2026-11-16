@@ -54,7 +54,7 @@ use inf_foundation::{CellId, LogHistogram};
 use inf_log::DocLineage;
 use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
-use inf_runtime::GroupClass;
+use inf_runtime::{CellExecutor, ExecutorLayout, GroupClass, TaskId, park};
 use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoClass, IoOp,
     Issue, LoopCx, OwnerPhase, RawFd, TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList,
@@ -87,6 +87,7 @@ mod scatter;
 #[path = "seed_tests.rs"]
 mod seed_tests;
 mod shared;
+mod tasks;
 mod tiered;
 mod timers;
 // The owner split's one caller is the JSON gather, so both carry its feature.
@@ -96,7 +97,10 @@ mod json_gather;
 mod split;
 
 pub use conn::OwnedOutcome;
-use conn::{CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
+use conn::{
+    CONN_SLOT_CAP, ClosedBy, ConnSlot, Emitted, Link, MAXCLIENTS_REFUSAL, OwnedCmd, PeerStream,
+    RecvArm, RunOut,
+};
 use credit::{FanLegs, FanReserve, PlaneFabric, PointOp, PubFanArgv};
 pub use credit::{MeshConfigRefused, checked_mesh_config};
 use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
@@ -112,8 +116,8 @@ use ns_ddl::{
     try_send_apply,
 };
 use publish::{
-    dispatch_pubsub, enforce_output_cap, flush_sub_deltas, handle_pubsub_apply, owner_pub_pump,
-    unsubscribe_closed_conn,
+    SubNotes, dispatch_pubsub, enforce_output_cap, flush_sub_deltas, handle_pubsub_apply,
+    owner_pub_pump, unsubscribe_closed_conn,
 };
 use pumps::{compact_pump, gated_pump, ns_apply_pump, shadow_pump};
 use scatter::{
@@ -124,9 +128,10 @@ use scatter::{
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
 use shared::{
-    DurableAdmission, NsApplyOutcome, NsApplyRead, Parked, ParkedDeques, ParkedFull, PeerDeques,
-    apply_drop, handle_ns_apply, tier_to_fan,
+    ApplyGate, ClientAck, DurableAdmission, GatedBook, NsApplyOutcome, NsApplyRead, Parked,
+    ParkedDeques, ParkedFull, PeerDeques, apply_drop, handle_ns_apply, tier_to_fan,
 };
+use tasks::{PeerPumps, PlaneTasks};
 
 /// ADR-0189 D4's fail-stop: a namespace change `META` holds that this cell
 /// cannot apply, or a leg the origin reads as refused. A cell left on the
@@ -223,11 +228,11 @@ impl OwnerPub {
     }
 }
 
-/// One origin's `always` verdict slot (ADR-0177 D3, D6): a placeholder from
-/// before the apply's first effect, then the reply that waits for this
-/// cell's fsync watermark to cover its `seq`.
+/// One origin's `always` verdict slot (ADR-0177 D3, D6): `Open` from before
+/// the apply's first effect, named by its [`GatedTicket`]'s number, then the
+/// reply that waits for this cell's fsync watermark to cover its `seq`.
 pub(super) enum Gated {
-    Placeholder,
+    Open { ticket: u32 },
     Verdict(GatedVerdict),
 }
 
@@ -291,16 +296,16 @@ impl Parked for OwnerPub {
 impl Parked for Gated {
     fn parked_bytes(&self) -> u64 {
         match self {
-            Gated::Placeholder => 0,
+            Gated::Open { .. } => 0,
             Gated::Verdict(verdict) => verdict.parked_bytes(),
         }
     }
 
-    /// A placeholder is its apply's, still running; a verdict waits for the
+    /// An open slot is its apply's, still running; a verdict waits for the
     /// `gated` task.
     fn waits(&self) -> bool {
         match self {
-            Gated::Placeholder => false,
+            Gated::Open { .. } => false,
             Gated::Verdict(_) => true,
         }
     }
@@ -321,43 +326,70 @@ const _: () = assert!(
     "a gated verdict fits a parked entry"
 );
 
+/// A connection queue's entry: a command PARSE deferred to the pump, or a
+/// reply PARSE wrote while the pump owed the connection earlier replies (a
+/// `-LOADING` refusal, a protocol error), queued so it leaves after them.
+enum Queued {
+    Command(OwnedCmd),
+    Reply(OwnedReply),
+}
+
+impl Queued {
+    /// The heap bytes the entry holds.
+    fn mem(&self) -> usize {
+        match self {
+            Queued::Command(cmd) => cmd.mem(),
+            Queued::Reply(reply) => reply.bytes().len(),
+        }
+    }
+
+    /// Returns the entry's buffer to its pool.
+    fn recycle<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        self,
+        shared: &Shared<O, F>,
+    ) {
+        match self {
+            Queued::Command(cmd) => shared.recycle_cmd_buf(cmd.into_buf()),
+            Queued::Reply(reply) => shared.recycle_reply_buf(reply.into_bytes()),
+        }
+    }
+}
+
+/// A connection's slab entry: its context, its queue and its pump, which
+/// every occupied state holds, and its state (ADR-0123 A2, ADR-0196 A1).
 #[allow(clippy::disallowed_types, reason = "container: A")]
 pub(super) struct Conn {
-    fd: RawFd,
-    parser: ConnParser,
     cx: ConnCx,
-    /// Staged reply bytes awaiting RESPOND, one reply opened at a time.
-    out: ReplyStream,
-    /// One in-flight Send max: two outstanding sends on one socket have no
-    /// kernel ordering guarantee.
-    send_inflight: bool,
-    closing: bool,
-    close_after_flush: bool,
-    /// A pump future owns this connection's execution order.
-    pump_active: bool,
-    queue: VecDeque<OwnedCmd>,
-    recv_disarmed: bool,
-    rearm_recv: bool,
-    /// Injected-clock ms since the staged output first exceeded the pub/sub
-    /// soft cap (M1-S11); 0 = under the soft limit.
-    cob_soft_since_ms: u64,
-    /// The output-cap kill was already requested (idempotent counter guard).
-    cob_kill_sent: bool,
-    /// Injected-clock ms of the last received buffer (accept counts);
-    /// the `timeout` reaper's input (ADR-0123 D2) — one store per
-    /// `Recv`, never per command.
-    last_active_ms: u64,
+    /// The commands PARSE deferred, and the replies it wrote while the pump
+    /// owed earlier ones, which the pump dequeues in pipeline order in
+    /// every occupied state: a close runs them to the end.
+    queue: VecDeque<Queued>,
+    /// The connection's pump (ADR-0177 D2), made at its admission; it
+    /// lives until the connection's slot retires.
+    pump: TaskId,
+    /// The pump read the queue empty with nothing pending and parked:
+    /// whoever queues a command for it, or moves its slot, wakes it by id.
+    /// While clear, the pump owns the connection's execution order.
+    pump_parked: bool,
     /// Remote-publish sequence (ADR-0101 D1): a subscribed connection's
     /// forwarded `PUBLISH` carries `(key, seq)` so the owner's fan leg
     /// back to this cell can pair the publisher's own frames with its
     /// own reply. Never advances for unsubscribed publishers.
     publish_seq: u64,
-    /// The publisher's own frames a tagged fan leg delivered, keyed by
-    /// sequence; the pump emits each right after that publish's count
-    /// reply (ADR-0101 D3/D4). Bounded by the in-flight window and
-    /// empty for every connection that is not a self-subscribed
-    /// publisher.
-    self_push: Vec<(u64, Vec<u8>)>,
+    slot: ConnSlot,
+    /// Canary: a closing slot's descriptor copy, which RESPOND sends to.
+    #[cfg(inf_canary_closing_slot_sends)]
+    closing_fd: Option<RawFd>,
+    /// Canary: the mark as a side flag beside a live parser.
+    #[cfg(inf_canary_mark_applied_late)]
+    late_mark: bool,
+    /// Canary: the 1→0 deltas captured at `Closed`, before the drain.
+    #[cfg(inf_canary_registry_dropped_at_closed)]
+    closed_notes: Option<SubNotes>,
+    /// Canary: the connection's owners were dropped after its first reply
+    /// left, its socket left open.
+    #[cfg(inf_canary_conn_owner_lost)]
+    owner_lost: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -436,10 +468,12 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// publisher's frames come from one origin); the pump takes the origins
     /// in rotation (ADR-0177 D6).
     owner_pubs: RefCell<PeerDeques<OwnerPub>>,
-    pub_pump_active: Cell<bool>,
-    /// The cell's one publish-fan reserve (ADR-0192 D3): parked here while
-    /// no owner pump runs; the pump takes it at its start and puts it back
-    /// in the step that clears `pub_pump_active`.
+    /// The owner pump read every origin's publishes empty and parked:
+    /// FABRIC-IN wakes it when it queues one.
+    pub_pump_parked: Cell<bool>,
+    /// The cell's one publish-fan reserve (ADR-0192 D3): the owner pump,
+    /// made at plane start and never ending, takes it at its first poll and
+    /// holds it for the cell's life, so one fan is open at a time.
     fan_reserve: Cell<Option<FanReserve>>,
     /// The connection knobs (ADR-0123 D5): `maxclients` share, `timeout`,
     /// `tcp-keepalive`, both output-buffer classes — read at assembly,
@@ -474,18 +508,42 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// holds this origin's work (FIFO = apply order). Each origin's deque
     /// is over its data credits `d` (ADR-0177 D6).
     ns_applies: RefCell<PeerDeques<NsApply>>,
-    ns_pump_active: RefCell<Vec<bool>>,
+    /// Per origin, its pump read the origin's queue empty and parked:
+    /// FABRIC-IN wakes it when it queues an apply. While clear the pump
+    /// holds the origin's order, which the divert reads.
+    ns_pump_parked: RefCell<Vec<bool>>,
     /// Gated `always` verdicts, per origin in `seq` order (ADR-0177 D3,
-    /// D6): an apply, inline or on its origin's pump, takes a placeholder
-    /// before its first effect and fills it with its verdict, then moves on
+    /// D6): an apply, inline or on its origin's pump, opens its slot before
+    /// its first effect and fills it with its verdict, then moves on
     /// (holding the FIFO across the durability wait serialized every origin
     /// to one write per fsync, M4.5-S29). The one `gated` task publishes
     /// every verdict the watermark covers (ADR-0015 D6: the client-visible
     /// ack never precedes this cell's fsync).
-    gated: RefCell<PeerDeques<Gated>>,
-    /// The `gated` task is made on demand and runs until no verdict waits;
-    /// FABRIC-IN makes it when a verdict waits and it is not running.
-    gated_pump_active: Cell<bool>,
+    gated: Rc<GatedBook>,
+    /// The `gated` task, made at plane start and never ending, found no
+    /// verdict pending and parked; FABRIC-IN wakes it when one waits.
+    gated_pump_parked: Cell<bool>,
+    /// The plane's task classes (ADR-0177 D2): each task the plane makes is
+    /// reserved through them, in `plane/tasks.rs`.
+    tasks: PlaneTasks,
+    /// The peer pumps' ids, set at plane start; `None` at one cell.
+    peer_pumps: core::cell::OnceCell<Option<PeerPumps>>,
+    /// PARSE's completed takes of the inbox (ADR-0196 D2): each adds 1
+    /// after the last entry it took, wrapping, compared with `!=` only. A
+    /// `Peer` run-out ends its parser once the count moved past the take
+    /// count stamped when the slot entered its `Peer` state.
+    inbox_takes: Cell<u64>,
+    /// The pumps whose `Peer` run-out found no take since its stamp, each
+    /// waiting for PARSE's next take, which wakes them all.
+    reader_waiters: WaitList<u8>,
+    /// How many pumps wait on `reader_waiters`: PARSE's guard, so a take
+    /// with none waiting pays one load and one branch. A gauge, cell scope.
+    reader_waiting: Cell<u64>,
+    /// The marked slots whose receive is owed one `RecvArm` (ADR-0196
+    /// A1.3): a pump's `QUIT` and the stop's mark have no loop context to
+    /// push it, so RESPOND pushes it for each key still `Flushing` `Open`.
+    /// At most one entry a mark, so at most the occupied slots.
+    mark_rearms: RefCell<Vec<ConnKey>>,
     /// Node control-thread handle (id allocation + catalog persistence).
     control: RefCell<Option<Arc<ControlHandle>>>,
     /// DDL pumps parked on catalog persistence (ADR-0015 D3).
@@ -682,6 +740,9 @@ pub struct ServerPlane<
 > {
     shared: Rc<Shared<O, F>>,
     listener: RawFd,
+    /// The one handle that inserts a client row: an accept registers its
+    /// client through it, and no command's context holds it.
+    admission: crate::ClientAdmission,
     started: bool,
     /// Recv completions staged from step 1 for PARSE+EXECUTE (step 3+4).
     inbox: Vec<(ConnKey, BufferId, u32)>,
@@ -795,12 +856,28 @@ pub enum StopPhase {
     Drained,
 }
 
+/// A cell's connection owners, as [`ServerPlane::conn_owners`] reads them:
+/// raw counts, which the simulator compares (ADR-0177 D2's O1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ConnOwners {
+    /// `conn` tasks whose slots the executor holds: alive, and Retired (a
+    /// finished task whose slot a waker or a queued wake still names, until
+    /// the `run_ready` that reclaims it).
+    pub held: u32,
+    /// Of `held`, the Retired.
+    pub retired: u32,
+    /// Occupied connection slots: the slab's count.
+    pub slots: usize,
+    /// The `conn` class's slots, the cell's connection share `C`.
+    pub share: u32,
+}
+
 /// What a cell's stop waits on (ADR-0199 D3): the wait the drain's last
 /// MAINTAIN step returned from. Every wait of the drive names its variant,
 /// so a stop that cannot end says why, beside its phase.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum StopHold {
-    /// Connections still flushing and closing.
+    /// Connection slots still occupied: flushing, closing or draining.
     Connections { live: usize },
     /// This cell is `Quiet`; the assembly has not yet seen every cell
     /// `Quiet` ([`ServerPlane::finish_stop`]).
@@ -818,7 +895,7 @@ pub enum StopHold {
 /// The drain's own state (one `Option` check per MAINTAIN while serving).
 struct StopDrive {
     phase: StopPhase,
-    /// Every live connection has been marked `close_after_flush`.
+    /// Every occupied slot has had the stop's mark.
     conns_marked: bool,
     /// The assembly saw every cell `Quiet` (`finish_stop`).
     finish: bool,
@@ -852,6 +929,14 @@ pub enum PlaneBuildError {
     /// A per-origin deque was refused (ADR-0177 D6): the mesh's credits
     /// past their ceiling, or the allocator.
     Parked(inf_foundation::bounded::CapError),
+    /// The task classes' caps or their registration were refused
+    /// (ADR-0177 D1, D2): a connection share past its ceiling.
+    Tasks(inf_foundation::bounded::CapError),
+    /// The executor's storage was refused (ADR-0177 D2).
+    Executor(inf_runtime::ExecutorInitError),
+    /// A plane-start pump found its class full at assembly: the class's
+    /// cap is short of the plane's own demand.
+    Assembly(inf_foundation::bounded::AssemblyFull),
 }
 
 impl core::fmt::Display for PlaneBuildError {
@@ -862,6 +947,9 @@ impl core::fmt::Display for PlaneBuildError {
             PlaneBuildError::Seed(refused) => write!(f, "{refused:?}"),
             PlaneBuildError::Timers(refused) => write!(f, "{refused}"),
             PlaneBuildError::Parked(refused) => write!(f, "a per-origin deque: {refused}"),
+            PlaneBuildError::Tasks(refused) => write!(f, "the plane's task classes: {refused}"),
+            PlaneBuildError::Executor(refused) => write!(f, "{refused}"),
+            PlaneBuildError::Assembly(refused) => write!(f, "{refused}"),
         }
     }
 }
@@ -870,7 +958,8 @@ impl std::error::Error for PlaneBuildError {}
 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// `listener` must be a listening fd this plane's driver will own.
-    /// Returns the plane, its cell's serve mark and its cell's timer set:
+    /// Returns the plane, its cell's serve mark, its cell's timer set and its
+    /// cell's executor, its plane-start pumps made (ADR-0177 D2):
     /// the cap census is built here, once, with `cell`; then on it the
     /// keyspace from `seed` ([`KeyspaceSeed::build`], its one builder), so
     /// every capped store of the cell registers on that census; then the set
@@ -896,10 +985,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         seed: KeyspaceSeed,
         fabric: CellFabric,
         node: Rc<NodeInfo>,
+        admission: crate::ClientAdmission,
         observer: O,
         route_local_only: bool,
-    ) -> Result<(ServerPlane<O, F>, ServeMark, TimerSet), PlaneBuildError> {
+    ) -> Result<(ServerPlane<O, F>, ServeMark, TimerSet, CellExecutor), PlaneBuildError> {
         let (census, serve_mark) = CapCensus::new(cell);
+        let share = node.config.borrow().boot_share(cells);
+        let caps = crate::limits::plane_task_caps(share, cells).map_err(PlaneBuildError::Tasks)?;
+        let mut layout = ExecutorLayout::new(&census);
+        let tasks =
+            PlaneTasks::register::<O, F>(&mut layout, &caps).map_err(PlaneBuildError::Tasks)?;
+        let mut executor = layout.build().map_err(PlaneBuildError::Executor)?;
         let store = seed.build(&census).map_err(PlaneBuildError::Seed)?;
         let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
         let parked = ParkedDeques::build(cell, cells, fabric.data_credits(), &census)
@@ -910,6 +1006,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         // ADR-0123 D5: the connection knobs before the first accept.
         let knobs = crate::config::conn_knobs(&node.config.borrow(), cells);
         let (fabric, fan_reserve) = PlaneFabric::new(fabric);
+        let gated = Rc::new(GatedBook::new(parked.gated, Rc::clone(&node)));
         let plane = ServerPlane {
             shared: Rc::new(Shared {
                 cell,
@@ -941,7 +1038,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 adopt_acks: RefCell::new(Vec::new()),
                 pubsub: RefCell::new(PubSubCell::new(cells)),
                 owner_pubs: RefCell::new(parked.owner_pubs),
-                pub_pump_active: Cell::new(false),
+                pub_pump_parked: Cell::new(false),
                 fan_reserve: Cell::new(Some(fan_reserve)),
                 knobs: Cell::new(knobs),
                 parser_limits: Cell::new(ParserLimits::default()),
@@ -949,9 +1046,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 census,
                 tier: RefCell::new(None),
                 ns_applies: RefCell::new(parked.ns_applies),
-                ns_pump_active: RefCell::new(vec![false; usize::from(cells)]),
-                gated: RefCell::new(parked.gated),
-                gated_pump_active: Cell::new(false),
+                ns_pump_parked: RefCell::new(vec![false; usize::from(cells)]),
+                gated,
+                gated_pump_parked: Cell::new(false),
+                tasks,
+                peer_pumps: core::cell::OnceCell::new(),
+                inbox_takes: Cell::new(0),
+                reader_waiters: WaitList::new(),
+                reader_waiting: Cell::new(0),
+                mark_rearms: RefCell::new(Vec::new()),
                 control: RefCell::new(None),
                 ddl_waiters: WaitList::new(),
                 ckpt_waiters: WaitList::new(),
@@ -971,6 +1074,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 blind_overwrite_ceiling: Cell::new(false),
             }),
             listener,
+            admission,
             started: false,
             inbox: Vec::new(),
             reply_scratch: ReplyStream::new(Vec::new()),
@@ -995,7 +1099,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             stop: None,
             stop_checkpoint: true,
         };
-        Ok((plane, serve_mark, timer_set))
+        // Plane start (ADR-0177 D2): the peer pumps, in the cell's setup,
+        // before its loop exists; each parks at its first poll.
+        let peer_pumps = tasks::start_peer_pumps(&mut executor, &plane.shared)
+            .map_err(PlaneBuildError::Assembly)?;
+        let set = plane.shared.peer_pumps.set(peer_pumps);
+        debug_assert!(set.is_ok(), "plane start runs once");
+        Ok((plane, serve_mark, timer_set, executor))
     }
 
     /// Starts loop-resident boot recovery (M2-S15): the cell serves from
@@ -1282,6 +1392,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// rule). Zero-cost when no tiered namespace was ever created: one
     /// `None` check.
     fn tier_maintain(&mut self, cx: &mut LoopCx<'_>) {
+        use crate::tier_cell::TaskRoom;
         /// The plane's flush admission: a short borrow of the durable
         /// cell per offer (the tier borrow is held by the caller; the
         /// durable cell is not — no nested `RefCell` conflict). Every
@@ -1298,8 +1409,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 }
             }
         }
-        let mut compact_reads: Vec<crate::tier_cell::CompactRead> = Vec::new();
-        let mut shadow_reads: Vec<(NsId, inf_store::ShadowRead)> = Vec::new();
+        let compact_reads: Vec<crate::tier_cell::CompactRead>;
+        let shadow_reads: Vec<(NsId, inf_store::ShadowRead)>;
+        // ADR-0177 D2: a read is taken only by spending a slot of its class's
+        // room, read once a pass, so no namespace is marked in flight with
+        // none to run it; a namespace the room cannot serve is counted.
+        let waits = &self.shared.node.tier_maint_task_waits;
+        let mut compact_room = TaskRoom::new(self.shared.tasks.compact_room(cx.executor), waits);
+        let mut shadow_room = TaskRoom::new(self.shared.tasks.shadow_room(cx.executor), waits);
         let mut flush_ops: Vec<IoOp> = Vec::new();
         let cold = {
             let mut tier_slot = self.shared.tier.borrow_mut();
@@ -1325,25 +1442,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let durable = self.shared.durable.borrow();
             let transition_idle = durable.as_ref().is_some_and(DurableCell::ckpt_transition_idle);
             let mut ks = self.shared.store.borrow_mut();
-            let mut units = 0u32;
-            let mut fatal: Option<String> = None;
             let now_us = cx.now.as_micros();
-            for at in 0..tier.live_count() {
-                match tier.maintain_ns(&mut ks, at, durable.as_ref(), transition_idle, now_us) {
-                    Ok((used, work)) => {
-                        units += used;
-                        compact_reads.extend(work);
-                    }
-                    // A tier fsync failure is fatal: fsync failure is
-                    // fail-stop (ADR-0056 D4).
-                    Err(err) if err.is_fatal() => {
-                        fatal = Some(err.to_string());
-                        break;
-                    }
-                    Err(_) => {}
-                }
-            }
+            let pass = tier.maintain_pass(
+                &mut ks,
+                durable.as_ref(),
+                transition_idle,
+                now_us,
+                &mut compact_room,
+            );
             drop(durable);
+            let mut units = pass.units;
+            compact_reads = pass.reads;
+            // A tier fsync failure is fatal: fsync failure is fail-stop
+            // (ADR-0056 D4).
+            let mut fatal = pass.fatal.map(|err| err.to_string());
             // ADR-0178 D3: the cell's turn offers each ready group to the
             // durable cell's device budget at its exact device size (the
             // tier cell has no budget of its own — one owner per fact).
@@ -1363,12 +1475,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // M4.5-S37 (ADR-0093 D4): the shadow reconciler's reads —
             // oldest winner first, bounded per table, Foreground once
             // the pinned suffix crosses half its cap.
-            for t in tier.live() {
-                if let Some(table) = ks.tiered_store_mut(t.ns) {
-                    let reads = table.shadow_work(inf_store::SHADOW_READS_IN_FLIGHT);
-                    shadow_reads.extend(reads.into_iter().map(|read| (t.ns, read)));
-                }
-            }
+            shadow_reads = tier.shadow_pass(&mut ks, &mut shadow_room);
             // ADR-0100 D5: a dropped namespace's files unlink only once
             // the catalog swap carrying the drop is durable.
             let control = self.shared.control.borrow().clone();
@@ -1425,13 +1532,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         for op in flush_ops {
             cx.push(op);
         }
+        // Each read was taken by spending a slot of its room, read in this
+        // step with nothing else reserving either class: each spawn meets a
+        // slot (ADR-0177 D2).
         for read in compact_reads {
-            let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(compact_pump(shared, read));
+            if !tasks::spawn_compact(cx.executor, &self.shared, read) {
+                unreachable!("MAINTAIN spawns a read only for a slot its room spent");
+            }
         }
         for (ns, read) in shadow_reads {
-            let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(shadow_pump(shared, ns, read));
+            if !tasks::spawn_shadow(cx.executor, &self.shared, ns, read) {
+                unreachable!("MAINTAIN spawns a read only for a slot its room spent");
+            }
         }
         // Extent-seal fdatasyncs (ADR-0061 D3): each barrier is in the
         // ledger and its extent-seal window entry; the op rides the driver
@@ -1686,9 +1798,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             return;
         }
         let ns = self.conn_default_ns();
-        let inserted = self.shared.conns.borrow_mut().insert(Conn {
-            fd,
-            parser: ConnParser::new(self.shared.parser_limits.get()),
+        let parser_limits = self.shared.parser_limits.get();
+        let node = Rc::clone(&self.shared.node);
+        let now_ms = cx.now.as_millis();
+        let inserted = tasks::admit_conn(cx.executor, &self.shared, |pump| Conn {
             cx: ConnCx {
                 proto: Protocol::Resp2,
                 id: 0,
@@ -1697,27 +1810,32 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 ns,
                 sub_channels: Vec::new(),
                 sub_patterns: Vec::new(),
-                node: Rc::clone(&self.shared.node),
+                node,
                 close_requested: Cell::new(false),
             },
-            out: ReplyStream::new(Vec::new()),
-            send_inflight: false,
-            closing: false,
-            close_after_flush: false,
-            pump_active: false,
             queue: VecDeque::new(),
-            recv_disarmed: false,
-            rearm_recv: false,
-            cob_soft_since_ms: 0,
-            cob_kill_sent: false,
-            last_active_ms: cx.now.as_millis(),
+            pump,
+            pump_parked: false,
             publish_seq: 0,
-            self_push: Vec::new(),
+            slot: ConnSlot::Active {
+                link: Link::new(fd, now_ms),
+                parser: ConnParser::new(parser_limits),
+                recv: RecvArm::Armed,
+            },
+            #[cfg(inf_canary_closing_slot_sends)]
+            closing_fd: None,
+            #[cfg(inf_canary_mark_applied_late)]
+            late_mark: false,
+            #[cfg(inf_canary_registry_dropped_at_closed)]
+            closed_notes: None,
+            #[cfg(inf_canary_conn_owner_lost)]
+            owner_lost: false,
         });
         let Some(key) = inserted else {
             // Admission bound (batch 12): the slab is full below
-            // the token slot width — the same refusal as the
-            // `maxclients` share.
+            // the token slot width, or the `conn` class is full (a closed
+            // connection's pump still ending holds its task) — the same
+            // refusal as the `maxclients` share.
             self.refuse_accept(cx, fd);
             return;
         };
@@ -1738,9 +1856,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         node.total_connections.set(node.total_connections.get() + 1);
         // Peer address capture is a recorded deviation (CLIENT LIST
         // placeholder) until the accept path carries peernames.
-        node.clients.borrow_mut().register(
+        self.admission.register(
             id,
-            key.packed(),
+            Some(key.packed()),
             "0.0.0.0:0".to_string(),
             cx.now.as_millis(),
         );
@@ -1857,11 +1975,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         stop_checkpoint: bool,
     ) -> Result<(), StopHold> {
         // Step 2: connections flush and close (QUIT's path — bytes read
-        // after the mark are dropped; a command in flight finishes).
+        // after the mark are dropped; a command in flight finishes). The
+        // stop's one walk marks every slot: an active one flushes, and a
+        // `Peer` parser of any other state ends, so what is parsed and
+        // queued runs and what is not yet parsed is released (ADR-0196
+        // A1.1).
         if !stop.conns_marked {
             stop.conns_marked = true;
-            shared.conns.borrow_mut().for_each_mut(|conn| conn.close_after_flush = true);
+            Self::mark_every_slot(shared);
         }
+        // A draining slot's pump still running its queue or shipping its
+        // 1→0 deltas sends fabric ops; its slot stays occupied until the
+        // pump returns, so it ends before the node-wide barrier too.
         let live = shared.conns.borrow().live;
         if live > 0 {
             return Err(StopHold::Connections { live });
@@ -1904,8 +2029,37 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         Ok(())
     }
 
+    /// The stop's mark of every occupied slot (ADR-0124 D2, ADR-0196 A1.1).
+    fn mark_every_slot(shared: &Shared<O, F>) {
+        let mut rearms = shared.mark_rearms.borrow_mut();
+        let mut conns = shared.conns.borrow_mut();
+        let ConnSlab { slots, gens, .. } = &mut *conns;
+        for (slot, entry) in slots.iter_mut().enumerate() {
+            let Some(conn) = entry.as_mut() else { continue };
+            // Canary: the stop's mark reaches active slots alone, so a
+            // `Peer` parser keeps its held bytes past the stop.
+            #[cfg(inf_canary_stop_skips_peer_reader)]
+            if !matches!(conn.slot, ConnSlot::Active { .. }) {
+                continue;
+            }
+            if conn.mark() {
+                rearms.push(ConnKey { slot: slot as u32, generation: gens[slot] });
+            }
+        }
+    }
+
     pub fn connections(&self) -> usize {
         self.shared.conns.borrow().live
+    }
+
+    /// O1's two owners (ADR-0177 D2): the `conn` tasks `executor`, this
+    /// cell's, holds and how many of them are Retired, and the occupied
+    /// connection slots, with the class's slots `C` that bound both. A
+    /// connection's slot vacates as its pump returns, so the tasks alive
+    /// equal the slots at every step; the simulator judges it.
+    pub fn conn_owners(&self, executor: &CellExecutor) -> ConnOwners {
+        let (held, retired, share) = self.shared.tasks.conn_tasks(executor);
+        ConnOwners { held, retired, slots: self.connections(), share }
     }
 
     /// Outstanding async work: pending fabric replies + credit waiters.
@@ -2032,35 +2186,30 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         extract_keys(meta, argv).any(|key| !self.shared.router.is_local(key, self.shared.cell))
     }
 
-    /// Starts a connection's one close. A slot already closing returns at
-    /// once, so no caller needs a guard of its own: its `Close` is in flight
-    /// until `Closed`, and a second `close(2)` after the first has freed the
-    /// number may close the socket or file the next accept or open holds.
-    fn initiate_close(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
-        /// What the key's slot held when its close was asked for.
-        enum CloseStart {
-            /// Live and now closing: its fd's one `Close` goes out.
-            Started(RawFd),
-            /// Already closing: its `Close` is in flight until `Closed`.
-            AlreadyClosing,
-            /// A vacant slot or a stale generation: no connection to close.
-            Vacant,
-        }
-        let start = self
-            .shared
-            .with_conn(key, |conn| {
-                if conn.closing {
-                    return CloseStart::AlreadyClosing;
-                }
-                conn.closing = true;
-                CloseStart::Started(conn.fd)
-            })
-            .unwrap_or(CloseStart::Vacant);
-        match start {
-            CloseStart::Started(fd) => {
-                cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, key) });
-            }
-            CloseStart::AlreadyClosing | CloseStart::Vacant => {}
+    /// The plane's immediate close of `key` (`timeout`, the `CLIENT KILL`
+    /// sweep): an active or flushing slot's one `Close` goes out. A slot
+    /// already closing holds no descriptor, so nothing can close it twice.
+    fn close_at_once(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
+        let fd = self.shared.with_conn(key, Conn::close_at_once).flatten();
+        self.push_close(cx, key, fd);
+    }
+
+    /// The peer of `key` is gone (a receive or send error): the slot's one
+    /// `Close` goes out, its `Peer` parser kept for the entries reaped
+    /// before the error.
+    fn peer_gone(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
+        let takes = self.shared.inbox_takes.get();
+        let fd = self.shared.with_conn(key, |conn| conn.peer_gone(takes)).flatten();
+        self.push_close(cx, key, fd);
+    }
+
+    /// Pushes the `Close` of the descriptor a transition to `Closing` gave.
+    fn push_close(&self, cx: &mut LoopCx<'_>, key: ConnKey, fd: Option<RawFd>) {
+        if let Some(fd) = fd {
+            // Canary: the closing slot keeps a copy of its descriptor.
+            #[cfg(inf_canary_closing_slot_sends)]
+            self.shared.with_conn(key, |conn| conn.closing_fd = Some(fd));
+            cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, key) });
         }
     }
 
@@ -2109,12 +2258,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let fd = token.generation() as RawFd;
         let refused = ConnKey { slot: CONN_SLOT_CAP, generation: 0 };
         cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, refused) });
-    }
-
-    /// Spawn the per-connection windowed pump with its first command.
-    fn spawn_pump(&self, cx: &mut LoopCx<'_>, key: ConnKey, first: OwnedCmd) {
-        let shared = Rc::clone(&self.shared);
-        let _ = cx.executor.poll_immediate(pump(shared, key, first));
     }
 }
 

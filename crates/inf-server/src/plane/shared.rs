@@ -2,6 +2,8 @@
 //! tier, durable cell, pools, tripwires, and the owned-command execution
 //! path (`execute_owned_into`) with its durability staging and admission.
 
+use core::convert::Infallible;
+
 use super::*;
 
 // ---- shared cell state (futures hold an Rc) -----------------------------------
@@ -29,35 +31,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         }
     }
 
-    /// The placeholder an apply from `origin` takes before its first effect
-    /// (ADR-0177 D6), when its reading gates its verdict on this cell's
-    /// watermark; `Ok(None)` for every other apply, `Err` at a full deque.
-    pub(super) fn gate_placeholder(
+    /// The gate an apply from `origin` runs under ([`ApplyGate::open`]): its
+    /// slot opened before its first effect when its reading gates its
+    /// verdict on this cell's watermark (ADR-0177 D6), `Err` at a full deque.
+    pub(super) fn gate_open(
         &self,
         origin: CellId,
         read: NsApplyRead,
-    ) -> Result<Option<GatedPlaceholder>, ParkedFull> {
-        if !read.gates() {
-            return Ok(None);
-        }
-        self.gated.borrow_mut().placeholder(origin, &self.node).map(Some)
-    }
-
-    /// The apply was gated: `verdict` takes its placeholder's place. A gated
-    /// verdict with no placeholder stops the cell: its reading gated it, so
-    /// the placeholder was taken on that reading, and a verdict kept without
-    /// its slot would have no place in its origin's `seq` order.
-    pub(super) fn gate_fill(&self, placeholder: Option<GatedPlaceholder>, verdict: GatedVerdict) {
-        let placeholder =
-            placeholder.expect("a gated write took its placeholder before its effect");
-        self.gated.borrow_mut().fill(placeholder, verdict, &self.node);
-    }
-
-    /// The apply was not gated: its placeholder, if it took one, goes.
-    pub(super) fn gate_cancel(&self, placeholder: Option<GatedPlaceholder>) {
-        if let Some(placeholder) = placeholder {
-            self.gated.borrow_mut().cancel(placeholder, &self.node);
-        }
+    ) -> Result<ApplyGate<GatedTicket>, ParkedFull> {
+        ApplyGate::open(&self.gated, origin, read)
     }
 
     /// The divert, ADR-0083 D1's one statement: an apply from `from` in `ns`
@@ -68,8 +50,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     /// D6), which the gated deque's `second-open-slot` check holds.
     pub(super) fn diverts_to_pump(&self, from: CellId, ns: NsId) -> bool {
         let store = self.store.borrow();
+        // The origin's pump holds its order while it is not parked.
         #[cfg(not(inf_canary_divert_queue_only))]
-        let behind = self.ns_pump_active.borrow()[usize::from(from.0)]
+        let behind = !self.ns_pump_parked.borrow()[usize::from(from.0)]
             || !self.ns_applies.borrow().is_empty_for(from);
         // Canary: the queue alone diverts, so a flat durable apply runs
         // inline while its origin's pump holds an apply on a cold read.
@@ -80,6 +63,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
 
     pub(super) fn with_conn<R>(&self, key: ConnKey, f: impl FnOnce(&mut Conn) -> R) -> Option<R> {
         self.conns.borrow_mut().get_mut(key).map(f)
+    }
+
+    /// PARSE completed a whole take of the inbox: the count moves after
+    /// the take's last entry, so a pump polled inside PARSE's loop reads it
+    /// unmoved and waits (ADR-0196 D2). The pumps waiting on it wake; with
+    /// none waiting a take pays one add, one load and one branch.
+    pub(super) fn note_inbox_take(&self) {
+        self.inbox_takes.set(self.inbox_takes.get().wrapping_add(1));
+        if self.reader_waiting.get() > 0 {
+            self.reader_waiters.wake_all(0);
+        }
     }
 
     /// Executes owned argv locally (queued and remote-`Apply` paths),
@@ -568,20 +562,25 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     /// Owner-side named-namespace apply (the `ApplyNs` handler): admission,
     /// execution, emission — and for `always` writes the deferred-reply
     /// verdict (the fabric reply waits for this cell's fsync watermark).
+    /// `read` is the reading `gate` was opened on: it supplies the row and
+    /// its WRITE bit, the gate the class the apply stages with and `settle`
+    /// judges, as the tiered arm stages.
     #[allow(clippy::too_many_arguments)] // one apply's fields, as its two callers hold them
     pub(super) fn execute_ns_owned(
         &self,
         from: CellId,
         argv: &[&[u8]],
         read: NsApplyRead,
+        gate: ApplyGate<GatedTicket>,
         proto: Protocol,
         ns: NsId,
         program: bool,
         out: &mut ReplyBuf,
     ) -> NsApplyOutcome {
-        let NsApplyRead { meta, class } = read;
+        debug_assert!(read.class() == gate.class(), "an apply stages under its gate's class");
+        let meta = read.meta();
         let is_write = read.is_write();
-        if let (Some(meta), Some(_)) = (meta, class)
+        if let (Some(meta), Some(_)) = (meta, gate.class())
             && is_write
         {
             match self.durable_admission(ns, meta, argv) {
@@ -635,21 +634,48 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         // at the reply's start (ADR-0190 D2) — a byte count, never a read
         // of the encoding.
         debug_assert!(!out.bytes().is_empty(), "every command writes at least one frame");
-        let mut outcome = NsApplyOutcome::Reply;
-        if is_write
-            && let (Some(meta), Some(class)) = (meta, class)
-            && stages(out.outcome(), meta.id)
-            && let Some(seq) = self.stage_durable_effects(ns, meta, argv, class)
-            && read.gates()
-        {
-            self.durable.borrow_mut().as_mut().expect("staged above").note_gated_ack();
-            outcome = NsApplyOutcome::Gated(seq);
-        }
+        let outcome = self.settle_ns_apply(read, gate, ns, argv, out);
         #[cfg(feature = "doc")]
         if let Some((keys, _)) = &bracket {
             self.store.borrow_mut().idx_bracket_commit(ns, keys);
         }
         outcome
+    }
+
+    /// An executed `ApplyNs`'s end (ADR-0177 D6): a write whose reply stages
+    /// stages its durable effects with its gate's class, then the gate
+    /// settles on the staged `seq`, and a gated verdict counts its ack.
+    fn settle_ns_apply(
+        &self,
+        read: NsApplyRead,
+        gate: ApplyGate<GatedTicket>,
+        ns: NsId,
+        argv: &[&[u8]],
+        out: &ReplyBuf,
+    ) -> NsApplyOutcome {
+        let staged = if read.is_write()
+            && let (Some(meta), Some(class)) = (read.meta(), gate.class())
+            && stages(out.outcome(), meta.id)
+        {
+            self.stage_durable_effects(ns, meta, argv, class)
+        } else {
+            None
+        };
+        // Canary: an `always` write's error waits as a verdict for the next
+        // record's `seq`, not leaving at once.
+        #[cfg(inf_canary_error_reply_gated)]
+        let staged = staged.or_else(|| {
+            use crate::durable::ack_class::AckClasses;
+            let next = self.durable.borrow().as_ref().map(|durable| durable.staged_seq() + 1);
+            next.filter(|_| gate.waits.is_some())
+        });
+        match gate.settle(staged) {
+            Some((seq, ticket)) => {
+                self.durable.borrow_mut().as_mut().expect("staged above").note_gated_ack();
+                NsApplyOutcome::Gated(seq, ticket)
+            }
+            None => NsApplyOutcome::Reply,
+        }
     }
 
     /// Durable-write admission — one typed verdict for every path
@@ -741,9 +767,23 @@ impl NsApplyRead {
         NsApplyRead { meta: argv.first().and_then(|name| lookup(name)), class }
     }
 
+    /// The reading of a command whose row and namespace class the caller
+    /// read in this step.
+    pub(super) fn new(
+        meta: &'static inf_wire::CommandMeta,
+        class: Option<FsyncClass>,
+    ) -> NsApplyRead {
+        NsApplyRead { meta: Some(meta), class }
+    }
+
     /// The command's registry row.
     pub(super) fn meta(self) -> Option<&'static inf_wire::CommandMeta> {
         self.meta
+    }
+
+    /// The namespace's fsync class, the one the apply's gate keeps.
+    pub(super) fn class(self) -> Option<FsyncClass> {
+        self.class
     }
 
     fn is_write(self) -> bool {
@@ -758,12 +798,84 @@ impl NsApplyRead {
     }
 }
 
+/// One apply's gating decision (ADR-0015 D6, ADR-0177 D6), from its one
+/// reading: the reading's fsync class, the one the apply stages with, and
+/// what the apply's verdict waits behind when the reading gates it (an
+/// `always` write): a peer origin's [`GatedTicket`], a client's
+/// [`ClientAck`], and on a read-only leg nothing (`Infallible`). Its fields
+/// are private, so the constructors below are the only ones, and a `Gated`
+/// outcome holds what it waits behind. It keeps the class, not the reading:
+/// a future that holds the gate beside the command's row holds the row once.
+pub(super) struct ApplyGate<G> {
+    class: Option<FsyncClass>,
+    waits: Option<G>,
+}
+
+/// A client's gated reply waits on its own ack-gate waiter, made at its arm
+/// (ADR-0015 D6): the gate carries no slot.
+pub(super) struct ClientAck;
+
+impl ApplyGate<GatedTicket> {
+    /// A peer origin's apply: its slot at the back of `origin`'s gated deque
+    /// opened now, before the apply's first effect, iff `read` gates (ADR-0177
+    /// D6); `Err` at a full deque. A gate that settles to nothing drops its
+    /// ticket, which releases the slot.
+    pub(super) fn open(
+        book: &Rc<GatedBook>,
+        origin: CellId,
+        read: NsApplyRead,
+    ) -> Result<ApplyGate<GatedTicket>, ParkedFull> {
+        let waits = if read.gates() { Some(GatedBook::open(book, origin)?) } else { None };
+        Ok(ApplyGate { class: read.class, waits })
+    }
+}
+
+impl ApplyGate<ClientAck> {
+    /// A client's command: its reply waits on its own waiter iff `read` gates.
+    pub(super) fn client(read: NsApplyRead) -> ApplyGate<ClientAck> {
+        ApplyGate { class: read.class, waits: read.gates().then_some(ClientAck) }
+    }
+}
+
+impl ApplyGate<Infallible> {
+    /// A read-only leg (a scatter program's): `None` when `read` gates, which
+    /// the leg refuses before any effect; its gate has nothing to wait behind.
+    pub(super) fn read_only(read: NsApplyRead) -> Option<ApplyGate<Infallible>> {
+        (!read.gates()).then_some(ApplyGate { class: read.class, waits: None })
+    }
+}
+
+impl<G> ApplyGate<G> {
+    /// The namespace's fsync class from the apply's one reading: the one its
+    /// effects stage with, and the one `settle` judges.
+    pub(super) fn class(&self) -> Option<FsyncClass> {
+        self.class
+    }
+
+    /// The apply's end: `staged` is the `seq` of the effect it staged, if
+    /// any. `Some` iff it staged and its gate waits, with what it waits
+    /// behind; otherwise the wait drops (a ticket releases its slot). A
+    /// staged `seq` under an `always` class whose gate does not wait is a
+    /// command that stages without the registry's WRITE bit: its reply would
+    /// leave before its fsync, so the cell stops first.
+    pub(super) fn settle(self, staged: Option<u64>) -> Option<(u64, G)> {
+        let ApplyGate { class, waits } = self;
+        let seq = staged?;
+        if let Some(gate) = waits {
+            return Some((seq, gate));
+        }
+        assert!(class != Some(FsyncClass::Always), "a staged `always` write's gate waits");
+        None
+    }
+}
+
 /// Owner-side verdict for one `ApplyNs`.
 pub(super) enum NsApplyOutcome {
     /// The reply is staged in the scratch range — ship it now.
     Reply,
-    /// `always` write: ship the reply only once seq is durable.
-    Gated(u64),
+    /// `always` write: ship the reply only once seq is durable; the verdict
+    /// goes into the ticket's slot.
+    Gated(u64, GatedTicket),
     /// Staging pressure (M4.5-S27, ADR-0083 D1): nothing executed or
     /// staged — the apply parks on the origin's FIFO pump and retries
     /// when the drain wakes it, instead of refusing with `-BUSY`.
@@ -1278,75 +1390,123 @@ impl ParkedDeques {
     }
 }
 
-/// The proof that its holder published the placeholder at the back of
-/// `origin`'s gated deque, before its apply's first effect; consumed by
-/// [`PeerDeques::fill`] or [`PeerDeques::cancel`]. It holds no borrow, so it
-/// crosses the apply's suspension; the back stays its own there because an
-/// origin has one apply in progress at a time ([`Shared::diverts_to_pump`]),
-/// which [`PeerDeques::placeholder`] checks.
-#[must_use = "a placeholder is filled with its verdict or cancelled"]
-pub(super) struct GatedPlaceholder {
-    origin: CellId,
+/// The gated deques, the next ticket of each origin and the node's gauge
+/// (ADR-0177 D6): the one `Rc` each [`GatedTicket`] holds, so a ticket's drop
+/// releases its slot with nothing else borrowed.
+pub(super) struct GatedBook {
+    deques: RefCell<PeerDeques<Gated>>,
+    /// Per origin, in the deques' order, the number its next slot takes.
+    next: Box<[Cell<u32>]>,
+    node: Rc<NodeInfo>,
 }
 
-impl PeerDeques<Gated> {
-    /// Publishes a placeholder at the back of `origin`'s deque. The divert
-    /// keeps one apply of an origin in progress, so its back is no
-    /// placeholder here; past that a second apply overtook the first, and
-    /// the cell stops before the second's first effect.
-    pub(super) fn placeholder(
-        &mut self,
-        origin: CellId,
-        node: &NodeState,
-    ) -> Result<GatedPlaceholder, ParkedFull> {
-        let index = self.index(origin);
-        assert!(
-            !matches!(self.deques[index].back(), Some(Gated::Placeholder)),
-            "second-open-slot: a second apply of one origin in progress"
-        );
-        self.publish_with(origin, node, || Gated::Placeholder)?;
-        Ok(GatedPlaceholder { origin })
+impl GatedBook {
+    pub(super) fn new(deques: PeerDeques<Gated>, node: Rc<NodeInfo>) -> GatedBook {
+        let next = (0..deques.deques.len()).map(|_| Cell::new(0)).collect();
+        GatedBook { deques: RefCell::new(deques), next, node }
     }
 
-    /// The apply was gated: its placeholder becomes `verdict`, which the
-    /// `gated` task publishes once the watermark covers its `seq`.
-    pub(super) fn fill(
-        &mut self,
-        placeholder: GatedPlaceholder,
-        verdict: GatedVerdict,
-        node: &NodeState,
-    ) {
-        let index = self.index(placeholder.origin);
-        let bytes = verdict.parked_bytes();
-        // An origin has one open slot, its back (`placeholder`'s check), so
-        // this placeholder is the back of its deque. Past that, a verdict
-        // filled elsewhere leaves a placeholder no fill reaches, and the
-        // origin's replies wedge behind it: the cell stops.
-        let back = self.deques[index].back_mut();
+    /// Opens a slot at the back of `origin`'s deque and returns its ticket.
+    /// The divert keeps one apply of an origin in progress, so its back is
+    /// not open here; past that a second apply overtook the first, and the
+    /// cell stops before the second's first effect.
+    pub(super) fn open(book: &Rc<GatedBook>, origin: CellId) -> Result<GatedTicket, ParkedFull> {
+        let mut deques = book.deques.borrow_mut();
+        let index = deques.index(origin);
         assert!(
-            matches!(back, Some(Gated::Placeholder)),
-            "a filled placeholder is the back of its origin's deque"
+            !matches!(deques.deques[index].back(), Some(Gated::Open { .. })),
+            "second-open-slot: a second apply of one origin in progress"
+        );
+        let ticket = book.next[index].get();
+        deques.publish_with(origin, &book.node, || Gated::Open { ticket })?;
+        book.next[index].set(ticket.wrapping_add(1));
+        Ok(GatedTicket { book: Rc::clone(book), origin, ticket, filled: false })
+    }
+
+    /// Whether a verdict waits for the `gated` task.
+    pub(super) fn waits(&self) -> bool {
+        self.deques.borrow().waits()
+    }
+
+    /// [`PeerDeques::take_covered`] on the gated deques.
+    pub(super) fn take_covered(
+        &self,
+        watermark: u64,
+        budget: usize,
+        publish: impl FnMut(CellId, GatedVerdict),
+    ) -> (usize, Option<u64>) {
+        self.deques.borrow_mut().take_covered(watermark, budget, &self.node, publish)
+    }
+}
+
+/// An open gated slot at the back of its origin's deque (ADR-0177 D6): made
+/// only by [`GatedBook::open`], not `Clone`, filled once by [`GatedTicket::fill`]
+/// or released by its drop, which leaves the deque as it was before the
+/// apply. It holds no borrow, so it crosses the apply's suspension; the back
+/// stays its own because an origin has one apply in progress at a time
+/// ([`Shared::diverts_to_pump`]). Its `u32` wraps: it is compared with its
+/// origin's one open slot only.
+#[must_use = "a ticket is filled with its verdict, or its drop releases the slot"]
+pub(super) struct GatedTicket {
+    book: Rc<GatedBook>,
+    origin: CellId,
+    ticket: u32,
+    /// Set first by `fill`: the drop of a filled ticket releases nothing.
+    filled: bool,
+}
+
+impl GatedTicket {
+    /// The apply was gated: its slot becomes `verdict`, which the `gated`
+    /// task publishes once the watermark covers its `seq`. The slot is the
+    /// back of its origin's deque (`open`'s check); past that the verdict
+    /// would wedge its origin behind a slot no fill reaches: the cell stops.
+    /// The ticket is disarmed before the compare, so a failed compare
+    /// unwinds through a drop that releases nothing: one panic.
+    pub(super) fn fill(mut self, verdict: GatedVerdict) {
+        self.filled = true;
+        let book = &self.book;
+        let mut deques = book.deques.borrow_mut();
+        let index = deques.index(self.origin);
+        let bytes = verdict.parked_bytes();
+        let back = deques.deques[index].back_mut();
+        assert!(
+            matches!(back, Some(Gated::Open { ticket }) if *ticket == self.ticket),
+            "a filled ticket's slot is the back of its origin's deque"
         );
         if let Some(back) = back {
             *back = Gated::Verdict(verdict);
-            parked_added(node, bytes);
-            self.waiting += 1;
+            parked_added(&book.node, bytes);
+            deques.waiting += 1;
         }
     }
+}
 
-    /// The apply was not gated (a reply, a park or a refusal): its
-    /// placeholder goes, and the deque is as it was before the apply.
-    /// It is the back of its origin's deque for `fill`'s reason; past that a
-    /// pop would drop another apply's verdict, so the cell stops first.
-    pub(super) fn cancel(&mut self, placeholder: GatedPlaceholder, node: &NodeState) {
-        let index = self.index(placeholder.origin);
+impl Drop for GatedTicket {
+    /// The apply was not gated (a reply, a park, a refusal, an arm that
+    /// forgot, teardown): its slot goes, and the deque is as it was before
+    /// the apply. Past the compare a pop would drop another apply's verdict,
+    /// so the cell stops first.
+    fn drop(&mut self) {
+        if self.filled {
+            return;
+        }
+        // Canary: the drop releases nothing, and the slot stays open.
+        if cfg!(inf_canary_gated_drop_kept) {
+            return;
+        }
+        let book = &self.book;
+        let mut deques = book.deques.borrow_mut();
+        let index = deques.index(self.origin);
+        let back = deques.deques[index].back();
         assert!(
-            matches!(self.deques[index].back(), Some(Gated::Placeholder)),
-            "a cancelled placeholder is the back of its origin's deque"
+            matches!(back, Some(Gated::Open { ticket }) if *ticket == self.ticket),
+            "a released ticket's slot is the back of its origin's deque"
         );
-        self.pop_back(placeholder.origin, node);
+        deques.pop_back(self.origin, &book.node);
     }
+}
 
+impl PeerDeques<Gated> {
     /// Pops every verdict at a front that `watermark` covers, at most
     /// `budget`, from the rotation's cursor, handing each to `publish` with
     /// its origin; returns how many it published and the smallest `seq` of
@@ -1505,81 +1665,228 @@ mod parked_tests {
         }
     }
 
+    /// A gated book on cell 1 of `cells`, each origin's deque `entries` long.
+    fn book(cells: u16, entries: u32) -> Rc<GatedBook> {
+        let (node, _) = NodeInfo::try_default().expect("fixture cache allocation");
+        let node = Rc::new(node);
+        Rc::new(GatedBook::new(deques::<Gated>(1, cells, entries), node))
+    }
+
     /// A second apply of one origin opening its slot while the first holds
     /// its own, which the divert rules out: the cell stops before the
     /// second's first effect.
     #[test]
     #[should_panic(expected = "second-open-slot: a second apply of one origin in progress")]
     fn a_second_open_slot_of_one_origin_stops_the_cell() {
-        let node = NodeState::default();
-        let mut gated = deques::<Gated>(1, 3, 4);
-        let _earlier = gated.placeholder(CellId(0), &node).expect("room");
-        let _later = gated.placeholder(CellId(0), &node);
+        let book = book(3, 4);
+        let _earlier = GatedBook::open(&book, CellId(0)).expect("room");
+        let _later = GatedBook::open(&book, CellId(0));
     }
 
-    /// A verdict published behind an open slot, past `placeholder`'s check:
-    /// the slot's fill finds the verdict at the back, and the cell stops
-    /// rather than wedge the origin behind a placeholder no fill reaches.
+    /// A verdict published behind an open slot, past `open`'s check: the
+    /// ticket's fill finds the verdict at the back, and the cell stops rather
+    /// than wedge the origin behind a slot no fill reaches.
     #[test]
-    #[should_panic(expected = "a filled placeholder is the back of its origin's deque")]
+    #[should_panic(expected = "a filled ticket's slot is the back of its origin's deque")]
     fn a_fill_behind_another_verdict_stops_the_cell() {
-        let node = NodeState::default();
-        let mut gated = deques::<Gated>(1, 3, 4);
-        let earlier = gated.placeholder(CellId(0), &node).expect("room");
+        let book = book(3, 4);
+        let earlier = GatedBook::open(&book, CellId(0)).expect("room");
         let other = || Gated::Verdict(verdict(2, 1));
-        gated.publish_with(CellId(0), &node, other).expect("room");
-        gated.fill(earlier, verdict(1, 1), &node);
+        book.deques.borrow_mut().publish_with(CellId(0), &book.node, other).expect("room");
+        earlier.fill(verdict(1, 1));
     }
 
-    /// The same, at a cancel: the pop would drop the other verdict, so the
+    /// The same, at a release: the pop would drop the other verdict, so the
     /// cell stops first.
     #[test]
-    #[should_panic(expected = "a cancelled placeholder is the back of its origin's deque")]
-    fn a_cancel_behind_another_verdict_stops_the_cell() {
-        let node = NodeState::default();
-        let mut gated = deques::<Gated>(1, 3, 4);
-        let earlier = gated.placeholder(CellId(0), &node).expect("room");
+    #[should_panic(expected = "a released ticket's slot is the back of its origin's deque")]
+    fn a_release_behind_another_verdict_stops_the_cell() {
+        let book = book(3, 4);
+        let earlier = GatedBook::open(&book, CellId(0)).expect("room");
         let other = || Gated::Verdict(verdict(2, 1));
-        gated.publish_with(CellId(0), &node, other).expect("room");
-        gated.cancel(earlier, &node);
+        book.deques.borrow_mut().publish_with(CellId(0), &book.node, other).expect("room");
+        drop(earlier);
     }
 
-    /// The gated deque (ADR-0177 D3, D6): a placeholder waits for nothing,
-    /// fills with its verdict or goes; the watermark publishes each
-    /// origin's covered fronts in `seq` order and stops at a placeholder;
-    /// the smallest uncovered front is the one awaited; a budget ends a
-    /// pass with the rest left.
+    /// A `Gated` outcome carries what it waits behind, and a staged `always`
+    /// write waits (ADR-0015 D6, ADR-0177 D6): over class × read or write ×
+    /// staged or not, a gate settles to its wait iff its reading is an
+    /// `always` write and the apply staged; an unstaged waiting gate releases
+    /// its slot, so the origin's deque is its before-state. A client's gate
+    /// reads the same predicate.
+    #[test]
+    fn a_gate_settles_only_a_staged_write_of_a_gating_reading() {
+        let book = book(3, 4);
+        let classes = [None, Some(FsyncClass::Everysec), Some(FsyncClass::Always)];
+        for class in classes {
+            for meta in [lookup(b"GET"), lookup(b"SET")] {
+                for staged in [None, Some(7)] {
+                    let read = NsApplyRead { meta, class };
+                    let case = format!("{class:?}, write {}, staged {staged:?}", read.is_write());
+                    if class == Some(FsyncClass::Always) && !read.is_write() && staged.is_some() {
+                        continue; // the fail-stop, its own test below
+                    }
+                    let waits = class == Some(FsyncClass::Always) && read.is_write();
+                    let gate = ApplyGate::open(&book, CellId(0), read).expect("room");
+                    match gate.settle(staged) {
+                        Some((seq, ticket)) => {
+                            assert!(waits && staged == Some(seq), "{case}: settled to a wait");
+                            drop(ticket);
+                        }
+                        None => assert!(!(waits && staged.is_some()), "{case}: no wait"),
+                    }
+                    let deques = book.deques.borrow();
+                    let index = deques.index(CellId(0));
+                    assert!(deques.deques[index].is_empty(), "{case}: the before-state");
+                    drop(deques);
+                    let client = ApplyGate::client(read).settle(staged);
+                    assert_eq!(client.is_some(), waits && staged.is_some(), "{case}: a client");
+                }
+            }
+        }
+    }
+
+    /// A staged `always` write waits (ADR-0015 D6): a staged `always` reading
+    /// that is not a write (a command that stages without the registry's
+    /// WRITE bit) stops the cell before its reply leaves.
+    #[test]
+    #[should_panic(expected = "a staged `always` write's gate waits")]
+    fn a_staged_always_reading_that_is_not_a_write_stops_the_cell() {
+        let read = NsApplyRead { meta: lookup(b"GET"), class: Some(FsyncClass::Always) };
+        let _ = ApplyGate::client(read).settle(Some(1));
+    }
+
+    /// The gated deque (ADR-0177 D3, D6): an open slot waits for nothing,
+    /// fills with its verdict or is released by its ticket's drop; the
+    /// watermark publishes each origin's covered fronts in `seq` order and
+    /// stops at an open slot; the smallest uncovered front is the one
+    /// awaited; a budget ends a pass with the rest left.
     #[test]
     fn gated_verdicts_publish_under_the_watermark_in_seq_order() {
-        let node = NodeState::default();
-        let mut gated = deques::<Gated>(1, 3, 4);
-        let first = gated.placeholder(CellId(0), &node).expect("room");
-        assert!(!gated.waits(), "a placeholder is its apply's, still running");
-        gated.fill(first, verdict(5, 10), &node);
-        let other = gated.placeholder(CellId(2), &node).expect("room");
-        gated.fill(other, verdict(3, 7), &node);
-        let running = gated.placeholder(CellId(0), &node).expect("room");
-        assert_eq!(node.fabric_parked_bytes.get(), 17, "a placeholder is no bytes");
+        let book = book(3, 4);
+        let first = GatedBook::open(&book, CellId(0)).expect("room");
+        assert!(!book.waits(), "an open slot is its apply's, still running");
+        first.fill(verdict(5, 10));
+        GatedBook::open(&book, CellId(2)).expect("room").fill(verdict(3, 7));
+        let running = GatedBook::open(&book, CellId(0)).expect("room");
+        assert_eq!(book.node.fabric_parked_bytes.get(), 17, "an open slot is no bytes");
         let mut sent = Vec::new();
-        let (published, pending) =
-            gated.take_covered(4, 1_024, &node, |to, v| sent.push((to.0, v.seq)));
+        let (published, pending) = book.take_covered(4, 1_024, |to, v| sent.push((to.0, v.seq)));
         assert_eq!((published, pending, sent.as_slice()), (1, Some(5), &[(2u16, 3u64)][..]));
-        let (published, pending) =
-            gated.take_covered(9, 1_024, &node, |to, v| sent.push((to.0, v.seq)));
-        assert_eq!((published, pending), (1, None), "the placeholder holds origin 0's queue");
+        let (published, pending) = book.take_covered(9, 1_024, |to, v| sent.push((to.0, v.seq)));
+        assert_eq!((published, pending), (1, None), "the open slot holds origin 0's queue");
         assert_eq!(sent, [(2, 3), (0, 5)]);
-        gated.cancel(running, &node);
-        assert!(!gated.waits());
-        assert_eq!(node.fabric_parked_bytes.get(), 0);
+        drop(running);
+        assert!(!book.waits());
+        assert_eq!(book.node.fabric_parked_bytes.get(), 0);
         for seq in [10, 11, 12] {
-            let slot = gated.placeholder(CellId(2), &node).expect("room");
-            gated.fill(slot, verdict(seq, 1), &node);
+            GatedBook::open(&book, CellId(2)).expect("room").fill(verdict(seq, 1));
         }
-        let (published, _) = gated.take_covered(u64::MAX, 2, &node, |_, _| {});
+        let (published, _) = book.take_covered(u64::MAX, 2, |_, _| {});
         assert_eq!(published, 2, "the budget ends the pass");
-        let (published, pending) =
-            gated.take_covered(u64::MAX, 2, &node, |_, v| assert_eq!(v.seq, 12));
+        let (published, pending) = book.take_covered(u64::MAX, 2, |_, v| assert_eq!(v.seq, 12));
         assert_eq!((published, pending), (1, None));
-        assert_eq!(node.fabric_parked_refused.get(), 0);
+        assert_eq!(book.node.fabric_parked_refused.get(), 0);
+    }
+
+    /// One origin's slot in the model: open under its ticket's number, or a
+    /// verdict's `seq` and bytes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Slot {
+        Open(u32),
+        Verdict(u64, u64),
+    }
+
+    /// A seeded history of tickets opened, filled and dropped over three
+    /// origins at `d` = 8 (the plain build's cap: the credits), against one
+    /// `VecDeque` per origin: after every step each deque equals its model,
+    /// the gauge is the model's verdict bytes, and each pass publishes the
+    /// model's covered fronts. A ticket dropped at any step releases its
+    /// slot, so the origin's next open is not refused for it.
+    #[test]
+    fn a_seeded_history_of_tickets_keeps_each_origin_at_its_model() {
+        let origins = [CellId(0), CellId(2), CellId(3)];
+        for seed in 0..32 {
+            let book = book(4, 8);
+            let mut model: [VecDeque<Slot>; 3] = Default::default();
+            let mut tickets: [Option<GatedTicket>; 3] = Default::default();
+            let mut numbers = [0u32; 3];
+            let (mut seq, mut watermark, mut refused) = (0u64, 0u64, 0u64);
+            let mut rng = SplitMix64::new(seed);
+            for _ in 0..600 {
+                let at = rng.next_below(3) as usize;
+                match rng.next_below(5) {
+                    0 | 1 if tickets[at].is_none() => {
+                        let opened = GatedBook::open(&book, origins[at]);
+                        assert_eq!(opened.is_ok(), model[at].len() < 8, "seed {seed}");
+                        match opened {
+                            Ok(ticket) => {
+                                model[at].push_back(Slot::Open(numbers[at]));
+                                numbers[at] = numbers[at].wrapping_add(1);
+                                tickets[at] = Some(ticket);
+                            }
+                            Err(ParkedFull) => refused += 1,
+                        }
+                    }
+                    2 => {
+                        if let Some(ticket) = tickets[at].take() {
+                            seq += 1;
+                            let bytes = 1 + rng.next_below(64);
+                            ticket.fill(verdict(seq, bytes as usize));
+                            *model[at].back_mut().expect("its slot") = Slot::Verdict(seq, bytes);
+                        }
+                    }
+                    3 => {
+                        if let Some(ticket) = tickets[at].take() {
+                            drop(ticket);
+                            assert!(matches!(model[at].pop_back(), Some(Slot::Open(_))));
+                        }
+                    }
+                    _ => {
+                        watermark += rng.next_below(4);
+                        let mut sent = Vec::new();
+                        let _ = book.take_covered(watermark, usize::MAX, |to, v| {
+                            sent.push((to, v.seq));
+                        });
+                        let mut expected = Vec::new();
+                        for (index, queue) in model.iter_mut().enumerate() {
+                            while let Some(&Slot::Verdict(front, _)) = queue.front()
+                                && front <= watermark
+                            {
+                                expected.push((origins[index], front));
+                                queue.pop_front();
+                            }
+                        }
+                        sent.sort_unstable();
+                        expected.sort_unstable();
+                        assert_eq!(sent, expected, "seed {seed}: the pass's published set");
+                    }
+                }
+                let deques = book.deques.borrow();
+                for (index, queue) in model.iter().enumerate() {
+                    let held: Vec<Slot> = deques.deques[deques.index(origins[index])]
+                        .iter()
+                        .map(|slot| match slot {
+                            Gated::Open { ticket } => Slot::Open(*ticket),
+                            Gated::Verdict(v) => Slot::Verdict(v.seq, v.parked_bytes()),
+                        })
+                        .collect();
+                    assert_eq!(held, Vec::from(queue.clone()), "seed {seed}: origin {index}");
+                }
+                let bytes: u64 = model
+                    .iter()
+                    .flatten()
+                    .map(|slot| if let Slot::Verdict(_, b) = slot { *b } else { 0 })
+                    .sum();
+                assert_eq!(book.node.fabric_parked_bytes.get(), bytes, "seed {seed}: the gauge");
+                let waits = model.iter().flatten().any(|slot| matches!(slot, Slot::Verdict(..)));
+                assert_eq!(book.waits(), waits, "seed {seed}");
+            }
+            drop(tickets);
+            let _ = book.take_covered(u64::MAX, usize::MAX, |_, _| {});
+            assert!(!book.waits(), "seed {seed}");
+            assert_eq!(book.node.fabric_parked_bytes.get(), 0, "seed {seed}");
+            assert_eq!(book.node.fabric_parked_refused.get(), refused, "seed {seed}");
+        }
     }
 }

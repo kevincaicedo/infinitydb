@@ -488,11 +488,12 @@ const MEMORY_ATTRIBUTION_FIELDS: [&str; 3] =
     ["used_memory", "used_memory_rss", "wire_buffers_bytes"];
 
 /// INFO fields that attribute a warm-boot or directory excess by phase.
-const BOOT_ATTRIBUTION_FIELDS: [&str; 8] = [
+const BOOT_ATTRIBUTION_FIELDS: [&str; 9] = [
     "recover_start_us",
     "recover_ckpt_us",
     "recover_replay_us",
     "recover_audit_us",
+    "recover_audit_bytes",
     "recover_finish_us",
     "recover_total_us",
     "zero_fill_bytes",

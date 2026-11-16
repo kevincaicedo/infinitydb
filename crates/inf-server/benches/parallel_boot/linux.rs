@@ -214,7 +214,8 @@ fn drive_cell(
     let mut driver = UringDriver::new(256, inf_runtime::UringConfig::from_lookup(std::env::var_os))
         .expect("uring");
     driver.register_pool(&mut pool).expect("register");
-    let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
+    let (node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
+    let node = Rc::new(node);
     let unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -230,13 +231,14 @@ fn drive_cell(
         tier: None,
     };
     let seed = KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: vec![spec] };
-    let (mut plane, serve_mark, timer_set) = ServerPlane::new(
+    let (mut plane, serve_mark, timer_set, executor) = ServerPlane::new(
         CellId(i as u16),
         cells,
         listener.into_raw_fd(),
         seed,
         fabric,
         node,
+        admission,
         NoopObserver,
         false,
     )
@@ -252,7 +254,8 @@ fn drive_cell(
             .expect("a park ceiling within the maximum"),
         ..Default::default()
     };
-    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set);
+    let mut cell_loop =
+        CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set, executor);
     while !stop.load(Ordering::Relaxed) {
         cell_loop.run_iteration(&mut plane).expect("iteration");
         if let Some(err) = plane.take_boot_error() {

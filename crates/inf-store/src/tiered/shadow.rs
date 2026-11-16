@@ -940,19 +940,9 @@ impl TieredTable {
         }
         let foreground = self.shadow_pinned_bytes() >= self.shadow_pin_cap_bytes() / 2;
         let mut out = Vec::with_capacity(free);
-        for (_, cold) in self.shadow.by_winner.keys() {
-            if self.shadow.in_flight.contains(cold) {
-                continue;
-            }
-            let ticket = self.shadow.ticket(*cold).expect("by_winner and by_cold agree");
-            if ticket.verified_len.is_some() {
-                continue;
-            }
-            out.push(ShadowRead { ticket, foreground });
-            if out.len() == free {
-                break;
-            }
-        }
+        out.extend(
+            self.unissued_tickets().take(free).map(|ticket| ShadowRead { ticket, foreground }),
+        );
         for read in &out {
             self.shadow.in_flight.push(read.ticket.cold.to_raw());
         }
@@ -961,6 +951,44 @@ impl TieredTable {
             self.shadow.counters.reads_foreground += out.len() as u64;
         }
         out
+    }
+
+    /// The tickets [`shadow_work`](Self::shadow_work) offers, oldest winner
+    /// first: unverified and not in flight. The owe predicate's walk too.
+    fn unissued_tickets(&self) -> impl Iterator<Item = ShadowTicket> + '_ {
+        self.shadow
+            .by_winner
+            .keys()
+            .filter(|(_, cold)| !self.shadow.in_flight.contains(cold))
+            .map(|(_, cold)| self.shadow.ticket(*cold).expect("by_winner and by_cold agree"))
+            .filter(|ticket| ticket.verified_len.is_none())
+    }
+
+    /// Whether [`shadow_work`](Self::shadow_work) would hand one more read
+    /// now: the reconciler on, fewer than [`SHADOW_READS_IN_FLIGHT`] in
+    /// flight, and an unverified ticket not in flight. O(1), from two
+    /// counts: a read is issued only for an unverified ticket and leaves
+    /// `in_flight` before its ticket is verified or dropped, so the
+    /// unissued unverified tickets number `unverified - in_flight`. A
+    /// MAINTAIN pass whose room cut the work short reads it to count the
+    /// namespace it leaves for a later pass (ADR-0177 D2).
+    #[must_use]
+    pub fn shadow_read_owed(&self) -> bool {
+        let in_flight = self.shadow.in_flight.len();
+        debug_assert!(in_flight <= self.shadow.unverified, "an in-flight read is unverified");
+        self.shadow.reconcile
+            && in_flight < SHADOW_READS_IN_FLIGHT
+            && self.shadow.unverified > in_flight
+    }
+
+    /// [`shadow_read_owed`](Self::shadow_read_owed) by a walk of the tickets
+    /// `shadow_work` offers, O(open tickets): the predicate's reference, for
+    /// tests.
+    #[must_use]
+    pub fn shadow_read_owed_by_walk(&self) -> bool {
+        self.shadow.reconcile
+            && self.shadow.in_flight.len() < SHADOW_READS_IN_FLIGHT
+            && self.unissued_tickets().next().is_some()
     }
 
     /// Settles every verified ticket whose obstacle is gone (no walk

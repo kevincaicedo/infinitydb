@@ -1867,3 +1867,92 @@ fn a_flushed_winner_is_imaged_by_the_walk_not_referenced() {
          images {images:?}"
     );
 }
+
+/// ADR-0177 D2's shadow crossing reads `shadow_read_owed`: whether the
+/// reconciler would hand one more read now. The O(1) predicate is false at
+/// four reads in flight and with every unverified ticket in flight, true
+/// below four with one unissued; over a seeded history of reads, failed
+/// reads, verifications without a settle, resolutions (each a ticket's
+/// drop) and new tickets it equals the walk of the offered tickets, and the
+/// test's own in-flight reads stay within the unverified tickets.
+#[test]
+fn the_owe_bit_equals_the_walk_of_the_offered_tickets() {
+    let mut h = Harness::new();
+    for i in 0..6u32 {
+        h.insert(format!("k:{i}").as_bytes(), b"v");
+    }
+    h.drain_to_cold();
+    for i in 0..2u32 {
+        h.shadow_set(format!("k:{i}").as_bytes(), b"w");
+    }
+    assert_eq!(h.table.shadow_work(16).len(), 2, "both tickets read");
+    assert!(!h.table.shadow_read_owed(), "every unverified ticket is in flight");
+    for i in 2..6u32 {
+        h.shadow_set(format!("k:{i}").as_bytes(), b"w");
+    }
+    assert!(h.table.shadow_read_owed(), "below four in flight, four unissued");
+    assert_eq!(h.table.shadow_work(16).len(), 2, "up to the in-flight bound");
+    assert!(!h.table.shadow_read_owed(), "four in flight, two unissued");
+    assert!(!h.table.shadow_read_owed_by_walk(), "the walk agrees at four in flight");
+
+    let mut h = Harness::new();
+    let keys: Vec<Vec<u8>> = (0..24u32).map(|i| format!("h:{i}").into_bytes()).collect();
+    for key in &keys {
+        h.insert(key, b"v");
+    }
+    h.drain_to_cold();
+    let mut open = 0usize;
+    let mut in_flight: Vec<(u64, LogicalAddr)> = Vec::new();
+    let mut state = 0x5EED_0B1Eu64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let (mut issued, mut failed, mut resolved, mut verified) = (0, 0, 0, 0);
+    for step in 0..2_000u32 {
+        match next() % 6 {
+            0 if open < keys.len() => {
+                h.shadow_set(&keys[open], b"w");
+                open += 1;
+            }
+            1 => {
+                let reads = h.table.shadow_work((next() % 6) as usize);
+                issued += reads.len();
+                in_flight.extend(reads.iter().map(|r| (r.ticket.hash, r.ticket.cold)));
+            }
+            2 if !in_flight.is_empty() => {
+                let (_, cold) = in_flight.swap_remove((next() as usize) % in_flight.len());
+                h.table.shadow_read_failed(cold);
+                failed += 1;
+            }
+            3 | 4 if !in_flight.is_empty() => {
+                let (hash, cold) = in_flight.swap_remove((next() as usize) % in_flight.len());
+                let image = h.tier[&cold.to_raw()].clone();
+                if next() % 2 == 0 {
+                    h.table.resolve_shadow(hash, cold, &image);
+                    resolved += 1;
+                } else {
+                    h.table.verify_shadow(hash, cold, &image);
+                    verified += 1;
+                }
+            }
+            _ => {}
+        }
+        assert!(
+            in_flight.len() <= h.table.shadow_unverified(),
+            "step {step}: in flight ≤ unverified"
+        );
+        assert_eq!(
+            h.table.shadow_read_owed(),
+            h.table.shadow_read_owed_by_walk(),
+            "step {step}: the owe bit against the walk"
+        );
+    }
+    assert!(
+        issued > 0 && failed > 0 && resolved > 0 && verified > 0 && open == keys.len(),
+        "VACUOUS: issued {issued}, failed {failed}, resolved {resolved}, verified {verified}, \
+         tickets {open}"
+    );
+}
