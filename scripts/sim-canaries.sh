@@ -1221,9 +1221,12 @@ ordered_rows=(
   # A subscriber counts as a receiver until the server reads its end of stream (ADR-0196 A1.2).
   # Planted, the count reads the parser, not the stream, so a half-closed one is counted.
   "inf_canary_half_closed_counted crate-test inf-server lib half_closed_subscriber_not_counted count-after-eof"
-  # A finished task's slot is freed only when no waker names its header (ADR-0177 D2, E's
-  # Retired row). Planted, it is freed under a clone, and the stale clone wakes the next task.
+  # A finished task's slot is freed only when no waker names its header: it stays Retired
+  # until that waker's drop (ADR-0177 D2). Planted, it is freed under a clone, and the stale
+  # clone wakes the next task; the second row reaches the plant on a first poll Ready, the fast
+  # arm, where the escaped clone must keep the finished task Retired.
   "inf_canary_header_reused_with_wakers crate-test inf-runtime test:waker_threads a_retired_slot_is_never_reused_while_a_waker_names_its_header no stale clone activates the new occupant"
+  "inf_canary_header_reused_with_wakers crate-test inf-runtime test:executor escaped_waker_clone_on_fast_path_is_harmless the escaped clone keeps the finished task Retired"
   # MAINTAIN takes a compaction or shadow read only by spending a slot of its class's room, and
   # counts a namespace the room cannot serve (ADR-0177 D2), which no simulated run reaches: every
   # life's census reads the count 0. Planted, the room reads short at every pass, and the
