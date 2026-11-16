@@ -37,8 +37,9 @@ pub use map::{
     VacantSlot,
 };
 pub use slab::{
-    Built, CappedSlab, Generation, GenerationPolicy, Lookup, LookupMut, Released, Retire, Retiring,
-    SlabBuilder, SlabReserved, SlabRetiring, SlotId, SlotReservation, Taken, WrapWithProof,
+    Built, CappedSlab, Generation, GenerationPolicy, Lookup, LookupMut, NamedReservation, Released,
+    Retire, Retiring, SlabBuilder, SlabReserved, SlabRetiring, SlotId, SlotReservation, SlotWord,
+    Taken, WordLookup, WrapWithProof,
 };
 
 /// When a container's host fills it: while the cell serves, or whole before

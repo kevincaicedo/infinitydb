@@ -376,6 +376,13 @@ impl CapRowHandle {
         usize::from(self.index)
     }
 
+    /// The entries the row was registered with: its container's cap, every
+    /// instance of one name registering the same. A slab's word adapter
+    /// reads it once, at its build, to bound the index a word may name.
+    pub(super) fn entries_max(&self) -> u32 {
+        self.census.rows.borrow()[self.index()].map_or(0, |row| row.entries_max)
+    }
+
     /// The container's live count rose to `live`. A `Serving` container
     /// reports only when its own high water rises; an `Assembly` one never
     /// raises its own, so it reports every publish, and the row keeps its

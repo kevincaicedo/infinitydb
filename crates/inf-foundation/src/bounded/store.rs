@@ -173,17 +173,22 @@ trait Level<T, G: SlotGeneration>: Sized {
     fn slot_pair_mut(&mut self, first: u32, second: u32) -> Option<[&mut Slot<T, G>; 2]>;
 
     /// The item whose slots start at `first`, in one allocation: a chunk
-    /// with its slots below `capacity` free and chained in index order and
-    /// the rest closed, or a directory with no child.
-    fn allocate(first: u32, capacity: u32) -> Result<Box<Self>, CapError>;
+    /// with its slots below `capacity` free at `generation` and chained in
+    /// index order and the rest closed, or a directory with no child.
+    fn allocate(first: u32, capacity: u32, generation: G) -> Result<Box<Self>, CapError>;
 
     /// What allocating the item whose slots start at `first` grew.
     fn grown(first: u32, capacity: u32) -> Grown;
 
     /// One build step under this item, whose slots start at `first`: the
-    /// next missing item in pre-order allocated, or `None` when this item
-    /// is complete.
-    fn build(&mut self, first: u32, capacity: u32) -> Result<Option<Grown>, CapError>;
+    /// next missing item in pre-order allocated, its slots free at
+    /// `generation`, or `None` when this item is complete.
+    fn build(
+        &mut self,
+        first: u32,
+        capacity: u32,
+        generation: G,
+    ) -> Result<Option<Grown>, CapError>;
 
     /// One retire step under this item: its last, deepest item freed, or
     /// `Bare` when it holds none.
@@ -210,7 +215,7 @@ impl<T, G: SlotGeneration, const C: usize> Level<T, G> for Chunk<T, G, C> {
         self.get_disjoint_mut(offsets).ok()
     }
 
-    fn allocate(first: u32, capacity: u32) -> Result<Box<Self>, CapError> {
+    fn allocate(first: u32, capacity: u32, generation: G) -> Result<Box<Self>, CapError> {
         let mut slots = Vec::new();
         slots.try_reserve_exact(C).map_err(|_| CapError::Alloc)?;
         for offset in 0..ChunkShape::<C>::SLOTS {
@@ -219,7 +224,7 @@ impl<T, G: SlotGeneration, const C: usize> Level<T, G> for Chunk<T, G, C> {
             let index = first | offset;
             slots.push(if index < capacity {
                 let next = index.checked_add(1).filter(|next| *next < capacity).unwrap_or(END);
-                Slot::Free { generation: G::FIRST, next }
+                Slot::Free { generation, next }
             } else {
                 Slot::Closed
             });
@@ -235,7 +240,7 @@ impl<T, G: SlotGeneration, const C: usize> Level<T, G> for Chunk<T, G, C> {
         }
     }
 
-    fn build(&mut self, _: u32, _: u32) -> Result<Option<Grown>, CapError> {
+    fn build(&mut self, _: u32, _: u32, _: G) -> Result<Option<Grown>, CapError> {
         Ok(None)
     }
 
@@ -267,7 +272,7 @@ impl<T, G: SlotGeneration, L: Level<T, G>> Level<T, G> for Directory<L> {
         Some([one.as_deref_mut()?.slot_mut(first)?, two.as_deref_mut()?.slot_mut(second)?])
     }
 
-    fn allocate(_: u32, _: u32) -> Result<Box<Self>, CapError> {
+    fn allocate(_: u32, _: u32, _: G) -> Result<Box<Self>, CapError> {
         let mut children = Vec::new();
         children.try_reserve_exact(MAP_DIRECTORY_CHILDREN_MAX).map_err(|_| CapError::Alloc)?;
         children.resize_with(MAP_DIRECTORY_CHILDREN_MAX, || None);
@@ -278,14 +283,19 @@ impl<T, G: SlotGeneration, L: Level<T, G>> Level<T, G> for Directory<L> {
         Grown::Directory
     }
 
-    fn build(&mut self, first: u32, capacity: u32) -> Result<Option<Grown>, CapError> {
+    fn build(
+        &mut self,
+        first: u32,
+        capacity: u32,
+        generation: G,
+    ) -> Result<Option<Grown>, CapError> {
         // The children built are a prefix: the last one may still be
         // incomplete, and the next one starts after it.
         let held = self.partition_point(Option::is_some);
         if let Some(last) = held.checked_sub(1)
             && let Some(child_first) = child_first(first, last, L::SPAN_LOG2, capacity)
             && let Some(child) = self.get_mut(last).and_then(|entry| entry.as_deref_mut())
-            && let Some(grown) = child.build(child_first, capacity)?
+            && let Some(grown) = child.build(child_first, capacity, generation)?
         {
             return Ok(Some(grown));
         }
@@ -293,7 +303,7 @@ impl<T, G: SlotGeneration, L: Level<T, G>> Level<T, G> for Directory<L> {
             return Ok(None);
         };
         let Some(entry) = self.get_mut(held) else { return Ok(None) };
-        *entry = Some(L::allocate(child_first, capacity)?);
+        *entry = Some(L::allocate(child_first, capacity, generation)?);
         Ok(Some(L::grown(child_first, capacity)))
     }
 
@@ -334,16 +344,21 @@ fn covers(index: u32, span_log2: u32) -> bool {
 }
 
 impl<T, G: SlotGeneration, const C: usize> Root<T, G, C> {
-    /// The root of a store of `capacity` slots, allocated empty, with what
-    /// it grew; its levels are those its own chunk needs, and a capacity
-    /// whose levels pass the root's is `Layout`.
-    fn allocate(capacity: u32) -> Result<(Root<T, G, C>, Grown), CapError> {
+    /// The root of a store of `capacity` slots, allocated empty (a root
+    /// chunk's slots free at `generation`), with what it grew; its levels
+    /// are those its own chunk needs, and a capacity whose levels pass the
+    /// root's is `Layout`.
+    fn allocate(capacity: u32, generation: G) -> Result<(Root<T, G, C>, Grown), CapError> {
+        let at = generation;
         Ok(match directory_levels(u64::from(capacity), C) {
-            0 => (Root::Chunk(Chunk::allocate(0, capacity)?), Chunk::<T, G, C>::grown(0, capacity)),
-            1 => (Root::One(One::allocate(0, capacity)?), Grown::Directory),
-            2 => (Root::Two(Two::allocate(0, capacity)?), Grown::Directory),
-            3 => (Root::Three(Three::allocate(0, capacity)?), Grown::Directory),
-            4 => (Root::Four(Four::allocate(0, capacity)?), Grown::Directory),
+            0 => (
+                Root::Chunk(Chunk::allocate(0, capacity, at)?),
+                Chunk::<T, G, C>::grown(0, capacity),
+            ),
+            1 => (Root::One(One::allocate(0, capacity, at)?), Grown::Directory),
+            2 => (Root::Two(Two::allocate(0, capacity, at)?), Grown::Directory),
+            3 => (Root::Three(Three::allocate(0, capacity, at)?), Grown::Directory),
+            4 => (Root::Four(Four::allocate(0, capacity, at)?), Grown::Directory),
             _ => return Err(CapError::Layout),
         })
     }
@@ -389,6 +404,26 @@ impl Chain<'_> {
 }
 
 impl<'a, T, G: SlotGeneration> FreeSlot<'a, T, G> {
+    /// The slot's index.
+    #[inline]
+    pub(super) fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// The generation the slot is free at: its next occupant's.
+    #[inline]
+    pub(super) fn generation(&self) -> G {
+        self.generation
+    }
+
+    /// The slot stays free at the chain's head, now at `generation`: the
+    /// head still names it and its link is unchanged, so this is one store.
+    #[inline]
+    pub(super) fn free_at(self, generation: G) {
+        let FreeSlot { slot, next, .. } = self;
+        *slot = Slot::Free { generation, next };
+    }
+
     /// The slot holds `value` at the generation it was free with; its index
     /// and that generation are returned. Cannot allocate or refuse.
     #[inline]
@@ -496,19 +531,28 @@ impl<T, G: SlotGeneration, const CHUNK_SLOTS: usize> SlotStore<T, G, CHUNK_SLOTS
     /// built; a store of no capacity is done with nothing built. A refused
     /// allocation leaves what was built, which retires by steps.
     pub(super) fn build_step(&mut self) -> Result<BuildStep, CapError> {
+        self.build_step_from(G::FIRST)
+    }
+
+    /// `build_step`, a chunk it builds holding its slots free at
+    /// `generation`: `G::FIRST` but where a slab's test hook starts its
+    /// slots at another generation, so a test reaches a generation's high
+    /// values without that many uses.
+    pub(super) fn build_step_from(&mut self, generation: G) -> Result<BuildStep, CapError> {
         let capacity = self.capacity_now;
+        let at = generation;
         let grown = match &mut self.root {
             Root::Empty if capacity == 0 => return Ok(BuildStep::Done),
             Root::Empty => {
-                let (root, grown) = Root::allocate(capacity)?;
+                let (root, grown) = Root::allocate(capacity, at)?;
                 self.root = root;
                 Some(grown)
             }
             Root::Chunk(_) => None,
-            Root::One(directory) => directory.build(0, capacity)?,
-            Root::Two(directory) => directory.build(0, capacity)?,
-            Root::Three(directory) => directory.build(0, capacity)?,
-            Root::Four(directory) => directory.build(0, capacity)?,
+            Root::One(directory) => directory.build(0, capacity, at)?,
+            Root::Two(directory) => directory.build(0, capacity, at)?,
+            Root::Three(directory) => directory.build(0, capacity, at)?,
+            Root::Four(directory) => directory.build(0, capacity, at)?,
         };
         let Some(grown) = grown else { return Ok(BuildStep::Done) };
         self.items_held = items_grown(self.items_held);

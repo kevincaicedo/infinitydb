@@ -1247,6 +1247,10 @@ ordered_rows=(
   # The mark of a slot whose receive is disarmed pushes one RecvArm (ADR-0196 A1.3). Planted, it
   # pushes none.
   "inf_canary_mark_keeps_disarmed crate-test inf-server lib mark_rearms_a_disarmed_receive no-rearm-at-mark"
+  # A named reservation dropped unpublished advances its slot's generation (ADR-0194 D1 with
+  # A2), so the handle it named names no later occupant. Planted, the drop keeps the
+  # generation, and the next named reservation of the slot names the same handle.
+  "inf_canary_named_drop_keeps_generation crate-test inf-foundation lib a_dropped_named_reservation_names_no_later_occupant id-reused"
   # The net's own invariant: no chunk of an fd is posted after its end of stream. Its close
   # legs' shared reap posts a closed client's last chunk and its EOF in one reap, data first;
   # planted, the EOF goes first and the chunk after it.
@@ -1317,6 +1321,10 @@ ordered_rows=(
   # a positive result. Planted, a zero result re-arms it too, and the half-closed socket posts
   # a second zero-length Recv.
   "inf_canary_uring_eof_rearms crate-test inf-runtime/uring test:driver_conformance eof_ends_the_receive recv-after-eof"
+  # A word resolves its slot by the generation bits it carries, the low bits of the occupant's
+  # (ADR-0194 D6 with A2). Planted, the whole generation is compared with the field, and from
+  # a slot's 2²³-th use its word reads Stale.
+  "inf_canary_word_resolve_unmasked crate-test inf-foundation lib a_word_resolves_its_slot_past_the_field_width key-stale-past-width"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   # A fixture's table is ordered whole.
