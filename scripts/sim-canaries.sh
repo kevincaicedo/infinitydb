@@ -1197,8 +1197,8 @@ ordered_rows=(
   # Retired row). Planted, it is freed under a clone, and the stale clone wakes the next task.
   "inf_canary_header_reused_with_wakers crate-test inf-runtime test:waker_threads a_retired_slot_is_never_reused_while_a_waker_names_its_header no stale clone activates the new occupant"
   # The plane's mark ends the parser at once (QUIT's rule). Planted, it is a side flag beside a
-  # live parser, and the SETs reaped after a QUIT run.
-  "inf_canary_mark_applied_late m0-capacity post-quit-ran --close-leg stall"
+  # live parser, and a SET reaped after a QUIT, while its +OK is unsent, runs.
+  "inf_canary_mark_applied_late crate-test inf-server lib a_set_after_quit_does_not_run post-quit-ran"
   # The mark of a slot whose receive is disarmed pushes one RecvArm (ADR-0196 A1.3). Planted, it
   # pushes none.
   "inf_canary_mark_keeps_disarmed crate-test inf-server lib mark_rearms_a_disarmed_receive no-rearm-at-mark"

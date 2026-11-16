@@ -634,3 +634,29 @@ fn own_frame_rides_reply_after_protocol_error() {
     let owed = format!(":1\r\n{message}{PROTOCOL_ERROR}");
     assert_eq!(tail, owed, "reply-order: the count, the own message, then the error");
 }
+
+/// An inline `QUIT` marks the slot at once, so a `SET` in the next buffer,
+/// reaped while the `+OK` is still unsent, is released unparsed (Redis
+/// discards what follows `QUIT`). A mark kept as a flag beside a live parser
+/// would run it.
+#[test]
+fn a_set_after_quit_does_not_run() {
+    let mut node = Node::new(1);
+    node.accept(0, CLIENT);
+    node.accept(0, READER);
+    node.hold_sends(0, CLIENT, true);
+    node.send(0, CLIENT, &frame(&[b"QUIT"]));
+    node.rounds(2);
+    node.send(0, CLIENT, &frame(&[b"SET", b"after", b"quit"]));
+    node.rounds(2);
+    assert_eq!(client_slot(&node, 0, out_len), 0, "engagement: the +OK is in flight, unsent");
+    node.hold_sends(0, CLIENT, false);
+    node.rounds(4);
+    assert!(node.closed(0).contains(&CLIENT), "the QUIT closes the connection");
+    assert_eq!(written_text(&node, 0), "+OK\r\n", "the QUIT's +OK alone, then the close");
+    assert_eq!(
+        read_back(&mut node, 0, b"after"),
+        b"$-1\r\n",
+        "post-quit-ran: a SET after QUIT ran"
+    );
+}
