@@ -2586,6 +2586,38 @@ inf-store = { workspace = true, features = ["test-support"] }
 EOF
 root=$(printf '%s' "$body" | manifest ship-test-support-dev)
 expect green "shipping: test-support declared, and requested on a dev edge only" env INF_CHECK_ROOT="$root" $SHIP
+
+# The resolver pass reads `cargo tree`, which no fixture root reaches: a stub
+# `cargo` on PATH answers each `-i <package>` with the package resolved and,
+# on the workspace's graph, the planted `<package>:<feature>` (SHIP_PLANT)
+# enabled. The manifests are the tree's own. One red per fenced feature, so a
+# misspelled `FENCED` row matches nothing and reads OK no more.
+mkdir -p "$work/ship-cargo"
+cat >"$work/ship-cargo/cargo" <<'STUB'
+#!/usr/bin/env bash
+package="" workspace=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -i) package=$2; shift ;;
+        --workspace) workspace=1 ;;
+    esac
+    shift
+done
+echo "$package v0.0.0 (/fixture)"
+if [ "$workspace" -eq 1 ] && [ "${SHIP_PLANT%%:*}" = "$package" ]; then
+    echo "├── $package feature \"${SHIP_PLANT#*:}\""
+fi
+STUB
+chmod +x "$work/ship-cargo/cargo"
+expect green "shipping: the resolver pass reads a clean graph" \
+    env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT= $SHIP
+for plant in inf-foundation:collision-oracle inf-foundation:fault-points \
+    inf-store:collision-oracle inf-store:test-support inf-runtime:fault-points \
+    inf-server:fault-points; do
+    expect_red_because "shipping: the resolver pass reads $plant enabled" \
+        "enables a banned ${plant%%:*} feature" \
+        env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT="$plant" $SHIP
+done
 }
 
 # ------------------------------------------------ planted-bug canary driver
