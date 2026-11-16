@@ -40,6 +40,9 @@ use inf_foundation::bounded::{
 };
 use inf_foundation::limits::{GATE_KEY_GENERATION_BITS, GATE_KEY_INDEX_BITS};
 
+use inf_foundation::LogHistogram;
+use inf_foundation::time::Nanos;
+
 use crate::driver::CompletionResult;
 use crate::token::CompletionToken;
 
@@ -78,8 +81,13 @@ pub enum Delivery {
 enum HolderState<V> {
     /// Registered; the waiter has not suspended yet.
     Registered,
+    /// Registered for a recorded hop, its request sent at this time: the
+    /// round trip is recorded at the completion.
+    RegisteredTimed(Nanos),
     /// The waiter suspended: wake this when the value arrives.
     Waiting(Waker),
+    /// The waiter of a recorded hop suspended, its request sent at this time.
+    WaitingTimed(Waker, Nanos),
     /// The value arrived before the waiter took it.
     Delivered(V),
     /// The waiter is gone and the slot still has a claim on it: a fabric
@@ -103,6 +111,22 @@ impl<V> Holder<V> {
 #[cold]
 fn polled_after_completion() -> ! {
     panic!("GateWait polled after completion")
+}
+
+/// The waiter's poll before its value: stores `waker` in a holder whose
+/// wait awaits it, keeping a recorded hop's send time; false for a holder
+/// that does not await.
+fn store_waker<V>(state: &mut HolderState<V>, waker: &Waker) -> bool {
+    let sent = match state {
+        HolderState::Registered | HolderState::Waiting(_) => None,
+        HolderState::RegisteredTimed(sent) | HolderState::WaitingTimed(_, sent) => Some(*sent),
+        HolderState::Delivered(_) | HolderState::Orphaned => return false,
+    };
+    *state = match sent {
+        None => HolderState::Waiting(waker.clone()),
+        Some(sent) => HolderState::WaitingTimed(waker.clone(), sent),
+    };
+    true
 }
 
 // ---- GateUnits ---------------------------------------------------------------
@@ -217,6 +241,9 @@ pub struct FabricGate<V, C: Cleanup<V> = DropValue> {
     full: u64,
     /// Senders parked on a full gate, one woken per holder freed.
     room: WaitList<()>,
+    /// Recorded hops' round trips, nanoseconds, each taken at its
+    /// completion from the send time its holder kept (the hop RTT gate).
+    round_trips: LogHistogram,
     _cleanup: PhantomData<fn(V) -> C>,
 }
 
@@ -264,6 +291,7 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
             stale: 0,
             full: 0,
             room: WaitList::new(),
+            round_trips: LogHistogram::new(),
             _cleanup: PhantomData,
         })
     }
@@ -317,11 +345,13 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
     }
 
     /// Delivers `value` to the holder `key` names, waking its waiter if it is
-    /// suspended. A key of another origin, without the tag, of no live
-    /// holder, or of a holder already delivered gives `value` to the cleanup
-    /// and counts `stale`; an orphaned holder's one completion frees it.
-    pub fn complete(gate: &RefCell<Self>, key: u64, value: V) -> Delivery {
-        let (delivery, waker, orphan) = gate.borrow_mut().settle(key, value);
+    /// suspended; a recorded hop's round trip, from its send to `now`, is
+    /// recorded in the same step. A key of another origin, without the tag,
+    /// of no live holder, or of a holder already delivered gives `value` to
+    /// the cleanup and counts `stale`; an orphaned holder's one completion
+    /// frees it.
+    pub fn complete(gate: &RefCell<Self>, key: u64, value: V, now: Nanos) -> Delivery {
+        let (delivery, waker, orphan) = gate.borrow_mut().settle(key, value, now);
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -333,8 +363,8 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
 
     /// One completion's transition inside the gate's borrow: what it did,
     /// the waker to wake and the value to clean up, both outside it.
-    fn settle(&mut self, key: u64, value: V) -> (Delivery, Option<Waker>, Option<V>) {
-        let FabricGate { holders, high, stale, room, .. } = self;
+    fn settle(&mut self, key: u64, value: V, now: Nanos) -> (Delivery, Option<Waker>, Option<V>) {
+        let FabricGate { holders, high, stale, room, round_trips, .. } = self;
         let own = key & !GATE_KEY_FIELDS == *high;
         let Some(FabricHolders { slab, word }) = holders.as_mut().filter(|_| own) else {
             *stale += 1;
@@ -348,7 +378,10 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
             }
         };
         match &holder.state {
-            HolderState::Registered | HolderState::Waiting(_) => {}
+            HolderState::Registered
+            | HolderState::RegisteredTimed(_)
+            | HolderState::Waiting(_)
+            | HolderState::WaitingTimed(..) => {}
             // A second completion: the parked value stays the waiter's.
             HolderState::Delivered(_) => {
                 *stale += 1;
@@ -361,12 +394,19 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
                 return (Delivery::Orphan, None, Some(value));
             }
         }
-        match core::mem::replace(&mut holder.state, HolderState::Delivered(value)) {
-            HolderState::Waiting(waker) => (Delivery::Delivered, Some(waker), None),
-            HolderState::Registered | HolderState::Delivered(_) | HolderState::Orphaned => {
-                (Delivery::Delivered, None, None)
-            }
+        let (waker, sent) =
+            match core::mem::replace(&mut holder.state, HolderState::Delivered(value)) {
+                HolderState::Waiting(waker) => (Some(waker), None),
+                HolderState::WaitingTimed(waker, sent) => (Some(waker), Some(sent)),
+                HolderState::RegisteredTimed(sent) => (None, Some(sent)),
+                HolderState::Registered | HolderState::Delivered(_) | HolderState::Orphaned => {
+                    (None, None)
+                }
+            };
+        if let Some(sent) = sent {
+            round_trips.record(now.saturating_sub(sent).0);
         }
+        (Delivery::Delivered, waker, None)
     }
 
     /// The wait a sender parks on when [`reserve`](Self::reserve) answers
@@ -388,6 +428,12 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
     /// Reserves that found every holder taken (`gate_full`): derived never.
     pub fn full(&self) -> u64 {
         self.full
+    }
+
+    /// Recorded hops' round trips, nanoseconds, each taken at its
+    /// completion (`fabric_rtt_p50_ns`).
+    pub fn round_trips(&self) -> &LogHistogram {
+        &self.round_trips
     }
 }
 
@@ -427,8 +473,10 @@ fn orphan<V>(
             room.wake_one(());
             (None, Some(value))
         }
-        HolderState::Waiting(waker) => (Some(waker), None),
-        HolderState::Registered | HolderState::Orphaned => (None, None),
+        HolderState::Waiting(waker) | HolderState::WaitingTimed(waker, _) => (Some(waker), None),
+        HolderState::Registered | HolderState::RegisteredTimed(_) | HolderState::Orphaned => {
+            (None, None)
+        }
     }
 }
 
@@ -458,11 +506,30 @@ impl<'u, V, C: Cleanup<V>> GatePermit<'_, 'u, V, C> {
 
     /// Publishes the holder once the request was sent: the key is routable.
     /// `gate` is the cell this permit's gate lives in.
-    pub fn register(mut self, gate: &'u RefCell<FabricGate<V, C>>) -> GateWait<'u, V, C> {
+    pub fn register(self, gate: &'u RefCell<FabricGate<V, C>>) -> GateWait<'u, V, C> {
+        self.publish(gate, HolderState::Registered)
+    }
+
+    /// [`register`](Self::register) for a recorded hop sent at `sent`: its
+    /// holder keeps the send time, and the gate records the round trip at
+    /// the completion, whatever order the replies arrive in.
+    pub fn register_timed(
+        self,
+        gate: &'u RefCell<FabricGate<V, C>>,
+        sent: Nanos,
+    ) -> GateWait<'u, V, C> {
+        self.publish(gate, HolderState::RegisteredTimed(sent))
+    }
+
+    fn publish(
+        mut self,
+        gate: &'u RefCell<FabricGate<V, C>>,
+        state: HolderState<V>,
+    ) -> GateWait<'u, V, C> {
         let Some(reservation) = self.reservation.take() else {
             unreachable!("a permit registers once, consuming itself")
         };
-        let slot = reservation.publish(Holder::registered(false));
+        let slot = reservation.publish(Holder { state, held: false });
         GateWait { gate, units: self.units, slot, done: false }
     }
 }
@@ -502,13 +569,16 @@ impl<V, C: Cleanup<V>> Future for GateWait<'_, V, C> {
         let FabricGate { holders, room, .. } = &mut *gate;
         let Some(FabricHolders { slab, .. }) = holders.as_mut() else { polled_after_completion() };
         let LookupMut::Live(holder) = slab.get_mut(this.slot) else { polled_after_completion() };
+        if store_waker(&mut holder.state, cx.waker()) {
+            return Poll::Pending;
+        }
         match &holder.state {
             HolderState::Delivered(_) => {}
-            HolderState::Registered | HolderState::Waiting(_) => {
-                holder.state = HolderState::Waiting(cx.waker().clone());
-                return Poll::Pending;
-            }
-            HolderState::Orphaned => polled_after_completion(),
+            HolderState::Registered
+            | HolderState::RegisteredTimed(_)
+            | HolderState::Waiting(_)
+            | HolderState::WaitingTimed(..)
+            | HolderState::Orphaned => polled_after_completion(),
         }
         let Taken::Value(Holder { state: HolderState::Delivered(value), .. }) =
             slab.take(this.slot)
@@ -669,7 +739,7 @@ impl<K: GateKey, V, C: Cleanup<V>> KeyedGate<K, V, C> {
         };
         let prior = core::mem::replace(&mut holder.state, HolderState::Delivered(value));
         drop(core);
-        if let HolderState::Waiting(waker) = prior {
+        if let HolderState::Waiting(waker) | HolderState::WaitingTimed(waker, _) = prior {
             waker.wake();
         }
         Delivery::Delivered
@@ -720,7 +790,10 @@ impl<K: GateKey, V, C: Cleanup<V>> KeyedGate<K, V, C> {
 /// Whether a holder's wait still awaits its value: registered or waiting.
 fn awaits<V>(state: &HolderState<V>) -> bool {
     match state {
-        HolderState::Registered | HolderState::Waiting(_) => true,
+        HolderState::Registered
+        | HolderState::RegisteredTimed(_)
+        | HolderState::Waiting(_)
+        | HolderState::WaitingTimed(..) => true,
         HolderState::Delivered(_) | HolderState::Orphaned => false,
     }
 }
@@ -860,13 +933,16 @@ impl<K: GateKey, V, C: Cleanup<V>> Future for KeyedWait<K, V, C> {
         let LookupMut::Live(holder) = core.holders.get_mut(this.slot) else {
             polled_after_completion()
         };
+        if store_waker(&mut holder.state, cx.waker()) {
+            return Poll::Pending;
+        }
         match &holder.state {
             HolderState::Delivered(_) => {}
-            HolderState::Registered | HolderState::Waiting(_) => {
-                holder.state = HolderState::Waiting(cx.waker().clone());
-                return Poll::Pending;
-            }
-            HolderState::Orphaned => polled_after_completion(),
+            HolderState::Registered
+            | HolderState::RegisteredTimed(_)
+            | HolderState::Waiting(_)
+            | HolderState::WaitingTimed(..)
+            | HolderState::Orphaned => polled_after_completion(),
         }
         let state = if holder.held {
             // The hold keeps the slot until its release; the route left at
@@ -908,7 +984,11 @@ impl<K: GateKey, V, C: Cleanup<V>> Drop for KeyedWait<K, V, C> {
         // The waker and a delivered value drop outside the gate's borrow.
         match prior {
             HolderState::Delivered(value) => C::orphan(value),
-            HolderState::Registered | HolderState::Waiting(_) | HolderState::Orphaned => {}
+            HolderState::Registered
+            | HolderState::RegisteredTimed(_)
+            | HolderState::Waiting(_)
+            | HolderState::WaitingTimed(..)
+            | HolderState::Orphaned => {}
         }
     }
 }
@@ -1259,6 +1339,53 @@ mod tests {
     use super::*;
     use inf_foundation::bounded::CapFill;
     use inf_foundation::rng::Entropy;
+
+    /// A fabric gate of 8 holders on a census of its own, at cell 1.
+    fn fabric_gate(units: u32) -> RefCell<FabricGate<u64>> {
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+        let holders = Cap::entries::<8>("test-gate-holders", CapFill::Serving);
+        RefCell::new(FabricGate::build(1, units, Some(holders), &census).expect("the test gate"))
+    }
+
+    /// A recorded hop's holder keeps its send time, and the gate records its
+    /// round trip at the completion, whatever order the replies arrive in
+    /// and whether or not its waiter suspended first; an unrecorded hop
+    /// records nothing.
+    #[test]
+    fn a_recorded_hop_is_timed_at_its_completion() {
+        let gate = fabric_gate(4);
+        let units = gate.borrow().units(3).expect("three units");
+        let mut cx = Context::from_waker(Waker::noop());
+        let send = |sent: Option<u64>| {
+            let mut borrowed = gate.borrow_mut();
+            let FabricAdmission::Granted(permit) = borrowed.reserve(&units) else {
+                panic!("a unit and a holder are free");
+            };
+            let key = permit.key();
+            let wait = match sent {
+                Some(sent) => permit.register_timed(&gate, Nanos(sent)),
+                None => permit.register(&gate),
+            };
+            (key, wait)
+        };
+        let (suspended_key, mut suspended) = send(Some(100));
+        let (parked_key, mut parked) = send(Some(1_000));
+        let (plain_key, mut plain) = send(None);
+        assert!(Pin::new(&mut suspended).poll(&mut cx).is_pending(), "engagement: suspended");
+        // The replies arrive out of their send order.
+        assert_eq!(FabricGate::complete(&gate, plain_key, 3, Nanos(9_000)), Delivery::Delivered);
+        assert_eq!(FabricGate::complete(&gate, parked_key, 2, Nanos(1_700)), Delivery::Delivered);
+        assert_eq!(FabricGate::complete(&gate, suspended_key, 1, Nanos(350)), Delivery::Delivered);
+        let (count, sum) = {
+            let gate = gate.borrow();
+            (gate.round_trips().count(), gate.round_trips().sum())
+        };
+        assert_eq!(count, 2, "the two recorded hops, and not the plain one");
+        assert_eq!(sum, 250 + 700, "each from its own send");
+        assert_eq!(Pin::new(&mut suspended).poll(&mut cx), Poll::Ready(1));
+        assert_eq!(Pin::new(&mut parked).poll(&mut cx), Poll::Ready(2));
+        assert_eq!(Pin::new(&mut plain).poll(&mut cx), Poll::Ready(3));
+    }
 
     /// A keyed gate of `cap` on a census of its own.
     fn keyed_gate<V>(cap: Cap) -> KeyedGate<u64, V> {

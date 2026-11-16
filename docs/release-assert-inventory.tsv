@@ -534,7 +534,6 @@ I	1	crates/inf-server/src/plane/shared.rs	expect	emission requires the durable p
 I	1	crates/inf-server/src/plane.rs	expect	enable_durable built tier state	`enable_durable` returned `Ok` on the line above, and it constructs the tier state
 I	1	crates/inf-server/src/plane/conn.rs	expect	ends table	the block was written by `stage_argv_block` with `argc` 4-byte ends after the header
 I	1	crates/inf-server/src/plane/fabric.rs	expect	ends table	the block was written by `stage_argv_block` with `argc` 4-byte ends after the header
-I	1	crates/inf-server/src/plane/fabric.rs	expect	front exists	`front().is_some_and(..)` on the line above
 I	1	crates/inf-server/src/plane/dispatch.rs	expect	guarded	`conn_ns.is_some()` is part of the arm's guard
 I	1	crates/inf-server/src/plane/conn.rs	expect	header	the block was written by `OwnedCmd::from_argv_into`, or for a parked fabric entry by `stage_argv_block` (`OwnedCmd::from_staged`), with a 4-byte header
 I	1	crates/inf-server/src/plane/cell_loop.rs	expect	log completion without durable plane	`LogWrite`/`Fsync`/`ZeroFillWrite` tokens are minted by the durable cell, which exists for the plane's life once enabled

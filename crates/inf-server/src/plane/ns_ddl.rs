@@ -1211,6 +1211,38 @@ impl From<Result<(), SendError>> for Stage {
     }
 }
 
+/// Whether a send's round trip is a hop sample (the hop RTT gate): its
+/// holder keeps the send time, and the gate records the round trip at the
+/// completion, whatever order the replies arrive in.
+#[derive(Clone, Copy)]
+pub(super) enum Hop {
+    /// The peer answers as it applies the op: a sample.
+    Recorded,
+    /// The owner defers the answer (`INF.PUB`'s fan acks first, an `always`
+    /// verdict after its fsync): no sample.
+    Unrecorded,
+}
+
+/// Registers `permit`'s holder after its request was staged at `now`.
+fn register_hop<'u>(
+    permit: GatePermit<'_, 'u, OwnedOutcome>,
+    gate: &'u RefCell<FabricGate<OwnedOutcome>>,
+    hop: Hop,
+    now: Nanos,
+) -> GateWait<'u, OwnedOutcome> {
+    match hop {
+        Hop::Recorded => permit.register_timed(gate, now),
+        Hop::Unrecorded => permit.register(gate),
+    }
+}
+
+/// The hop an `Apply` of `argv` makes: `INF.PUB`'s reply waits for the
+/// owner's fan acks, so its round trip is no hop sample; the fan legs
+/// (`INF.PUBFAN`) sample pub/sub instead.
+fn apply_hop(argv: &[&[u8]]) -> Hop {
+    if argv.first().copied() == Some(&b"INF.PUB"[..]) { Hop::Unrecorded } else { Hop::Recorded }
+}
+
 /// The one send (ADR-0177 D4): a holder and one of the task's `units`
 /// reserved, the request staged under the key the gate minted, then the
 /// holder registered (`stage` only stages into the outbound pack — the peer
@@ -1224,6 +1256,7 @@ async fn send_op<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     units: &'u GateUnits,
     to: CellId,
     proto: Protocol,
+    hop: Hop,
     mut stage: impl FnMut(FabricToken) -> Stage,
 ) -> Sent<'u> {
     loop {
@@ -1231,7 +1264,9 @@ async fn send_op<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
             let mut gate = shared.gate.borrow_mut();
             match gate.reserve(units) {
                 FabricAdmission::Granted(permit) => match stage(FabricToken(permit.key())) {
-                    Stage::Sent => return Ok(permit.register(&shared.gate)),
+                    Stage::Sent => {
+                        return Ok(register_hop(permit, &shared.gate, hop, shared.now.get()));
+                    }
                     Stage::NoCredit => false,
                     Stage::TooWide => return Err(SendRefused::Reply(too_many_args_reply(proto))),
                 },
@@ -1249,8 +1284,8 @@ async fn send_op<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
 }
 
 /// Ship `argv` to `to` as an `ApplyNs` (named-namespace op — ADR-0015 D1)
-/// and return the reply waiter. Mirrors [`send_apply`]; never RTT-recorded
-/// (`always` replies are owner-deferred and would mispair the queue). A
+/// and return the reply waiter. Mirrors [`send_apply`]; never a hop sample
+/// (an `always` reply waits for the owner's fsync). A
 /// general send: refused while it would take the publish fan's reserved
 /// credit, it parks for a returned credit as at the window's end.
 #[allow(clippy::too_many_arguments)] // the send funnel's one context
@@ -1272,7 +1307,7 @@ pub(super) async fn send_apply_ns<
         return Err(SendRefused::Reply(too_many_args_reply(proto)));
     };
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
-    send_op(shared, units, to, proto, |token| {
+    send_op(shared, units, to, proto, Hop::Unrecorded, |token| {
         let op = PointOp::apply_ns(token, slot, cmd_byte(proto, 0), ns.0, args.clone(), program);
         Stage::from(shared.fabric.borrow_mut().stage_general(to, &op))
     })
@@ -1323,11 +1358,8 @@ pub(super) fn try_send_apply<'u, O: PlaneObserver + 'static, F: SegmentFs + Clon
     if shared.fabric.borrow_mut().stage_general(to, &op).is_err() {
         return SendNow::NoCredit;
     }
-    let waiter = permit.register(&shared.gate);
+    let waiter = register_hop(permit, &shared.gate, apply_hop(argv), shared.now.get());
     drop(gate);
-    if argv.first().copied() != Some(&b"INF.PUB"[..]) {
-        shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
-    }
     SendNow::Sent(waiter)
 }
 
@@ -1335,7 +1367,7 @@ pub(super) fn try_send_apply<'u, O: PlaneObserver + 'static, F: SegmentFs + Clon
 /// for fabric credits when exhausted (backpressure, never unbounded
 /// queueing). A general send: refused while it would take the publish
 /// fan's reserved credit, it parks for a returned credit as at the window's
-/// end. The send time is queued for delivery-side RTT recording. `Err`
+/// end. Its holder keeps the send time for the hop's round trip. `Err`
 /// carries the refusal reply when the argv exceeds the codec's argument
 /// cap, or `NoUnit` when the task has every unit out.
 #[allow(clippy::too_many_arguments)] // the send funnel's one context
@@ -1356,20 +1388,11 @@ pub(super) async fn send_apply<'u, O: PlaneObserver + 'static, F: SegmentFs + Cl
     // applies carry the empty-key slot).
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
     let cmd = cmd_byte(proto, db);
-    let mut sent_token = FabricToken(0);
-    let waiter = send_op(shared, units, to, proto, |token| {
+    send_op(shared, units, to, proto, apply_hop(argv), |token| {
         let op = PointOp::apply(token, slot, cmd, args.clone(), program);
-        sent_token = token;
         Stage::from(shared.fabric.borrow_mut().stage_general(to, &op))
     })
-    .await?;
-    // RTT pairing relies on in-order replies; `INF.PUB` replies are deferred
-    // by the owner pump (fan acks first), so its hops are not RTT samples —
-    // the fan legs (`INF.PUBFAN`) cover pub/sub in the histogram instead.
-    if argv.first().copied() != Some(&b"INF.PUB"[..]) {
-        shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((sent_token.0, shared.now.get()));
-    }
-    Ok(waiter)
+    .await
 }
 
 /// Stages one publish fan leg, `INF.PUBFAN channel payload` with the
@@ -1395,10 +1418,8 @@ pub(super) async fn send_fan_leg<'u, O: PlaneObserver + 'static, F: SegmentFs + 
     let fan = PubFanArgv::new(channel, payload, tag);
     let cmd = cmd_byte(Protocol::Resp2, 0);
     let mut first = true;
-    let mut sent_token = FabricToken(0);
-    let waiter = send_op(shared, units, to, Protocol::Resp2, |token| {
+    let waiter = send_op(shared, units, to, Protocol::Resp2, Hop::Recorded, |token| {
         let Some(op) = fan.op(token, cmd) else { return Stage::TooWide };
-        sent_token = token;
         let mut fabric = shared.fabric.borrow_mut();
         // The fan's own credit on the first attempt; a refused leg, and
         // every retry, the general path.
@@ -1408,7 +1429,6 @@ pub(super) async fn send_fan_leg<'u, O: PlaneObserver + 'static, F: SegmentFs + 
         Stage::from(fabric.stage_general(to, &op.into_general()))
     })
     .await?;
-    shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((sent_token.0, shared.now.get()));
     legs.push(waiter);
     Ok(())
 }

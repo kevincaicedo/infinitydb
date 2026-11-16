@@ -45,11 +45,11 @@ use inf_fabric::{
     ApplyArgs, CellFabric, ErrCode, FabricToken, MAX_APPLY_ARGS, MAX_INLINE_APPLY_ARGS, Op,
     Outcome, SendError,
 };
+use inf_foundation::CellId;
 use inf_foundation::bounded::{
     Cap, CapCensus, CapError, CappedDeque, Reserve, Reserved, ServeMark,
 };
 use inf_foundation::time::Nanos;
-use inf_foundation::{CellId, LogHistogram};
 #[cfg(feature = "doc")]
 use inf_log::DocLineage;
 use inf_log::fs::{SegmentFs, StdSegmentFs};
@@ -57,8 +57,8 @@ use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
 use inf_runtime::{CellExecutor, ExecutorLayout, GroupClass, TaskId, park};
 use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, Delivery, FabricAdmission,
-    FabricGate, GateUnits, GateWait, IoClass, IoOp, Issue, LoopCx, OwnerPhase, RawFd, TimerNotice,
-    TimerOutcome, TimerSet, TokenClass, WaitList,
+    FabricGate, GatePermit, GateUnits, GateWait, IoClass, IoOp, Issue, LoopCx, OwnerPhase, RawFd,
+    TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
@@ -401,7 +401,6 @@ pub(super) struct ConnKey {
     generation: u32,
 }
 
-#[allow(clippy::disallowed_types, reason = "container: E")]
 pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     cell: CellId,
     cells: u16,
@@ -427,12 +426,6 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     node: Rc<NodeInfo>,
     /// Loop-granularity clock for futures (set each step from `cx.now`).
     now: Cell<Nanos>,
-    /// Fabric token round-trip latency, nanoseconds (hop RTT gate).
-    rtt_ns: RefCell<LogHistogram>,
-    /// Per-destination `(token, send time)` FIFO: replies return in send
-    /// order per cell pair, so RTT is recorded at *delivery* (FABRIC-IN),
-    /// not when the windowed pump finally awaits the parked value.
-    rtt_sent: RefCell<Vec<VecDeque<(u64, Nanos)>>>,
     /// Recycled reply buffers (gate values, pump-local replies) — the
     /// remote path's per-op heap traffic was a top M0-R1 cost. Bounded by
     /// [`REPLY_POOL_MAX`]/[`REPLY_POOL_BUF_CAP`].
@@ -983,7 +976,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// and a mesh past `FABRIC_CREDITS_PER_PEER_MAX` that no mesh check
     /// passed.
     #[allow(clippy::too_many_arguments)] // construction-time wiring, not an API surface
-    #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new(
         cell: CellId,
         cells: u16,
@@ -1033,8 +1025,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 observer: RefCell::new(observer),
                 node,
                 now: Cell::new(Nanos(0)),
-                rtt_ns: RefCell::new(LogHistogram::new()),
-                rtt_sent: RefCell::new(vec![VecDeque::new(); usize::from(cells)]),
                 reply_pool: RefCell::new(Vec::new()),
                 cmd_pool: RefCell::new(Vec::new()),
                 reply_pool_bytes: Cell::new(0),

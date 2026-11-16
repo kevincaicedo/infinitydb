@@ -374,7 +374,10 @@ impl Rig {
                         OwnedOutcome::Reply(reply)
                     };
                     let gate = &self.planes[usize::from(from.0)].shared.gate;
-                    assert_eq!(FabricGate::complete(gate, token.0, outcome), Delivery::Delivered);
+                    assert_eq!(
+                        FabricGate::complete(gate, token.0, outcome, Nanos(0)),
+                        Delivery::Delivered
+                    );
                 }
             }
         }

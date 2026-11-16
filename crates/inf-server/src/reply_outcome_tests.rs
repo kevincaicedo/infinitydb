@@ -990,7 +990,12 @@ fn gathered_in(cells: &Cells, answers: &[LegAnswer], order: &[usize]) -> (OwnedR
         let mut ready = None;
         for &leg in order {
             assert!(ready.is_none(), "the fold ended before every leg answered");
-            let delivery = FabricGate::complete(&gate, keys[leg], answers[leg].outcome());
+            let delivery = FabricGate::complete(
+                &gate,
+                keys[leg],
+                answers[leg].outcome(),
+                inf_foundation::time::Nanos(0),
+            );
             assert_eq!(delivery, Delivery::Delivered, "a live waiter");
             if let Poll::Ready(reply) = finish.as_mut().poll(&mut cx) {
                 ready = Some(reply);

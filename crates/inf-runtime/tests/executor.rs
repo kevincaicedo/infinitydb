@@ -103,7 +103,10 @@ fn suspended_future_promotes_resumes_and_frees() {
     assert_eq!(ex.live_tasks(), 1);
     assert_eq!(ex.run_ready(64), 0, "nothing ready before completion");
 
-    assert_eq!(FabricGate::complete(&gate, key.get(), 42), Delivery::Delivered);
+    assert_eq!(
+        FabricGate::complete(&gate, key.get(), 42, inf_foundation::time::Nanos(0)),
+        Delivery::Delivered
+    );
     assert_eq!(ex.run_ready(64), 1);
     assert_eq!(*seen.borrow(), vec![42]);
     assert_eq!(ex.live_tasks(), 0, "completed task must free its slot");
@@ -129,7 +132,10 @@ fn delivery_before_first_poll_keeps_the_fast_path() {
             let waiter = permit.register(&gate);
             drop(open);
             // Reply lands before the waiter ever polls (same-iteration delivery).
-            assert_eq!(FabricGate::complete(&gate, key, "early"), Delivery::Delivered);
+            assert_eq!(
+                FabricGate::complete(&gate, key, "early", inf_foundation::time::Nanos(0)),
+                Delivery::Delivered
+            );
             waiter
         };
         *sink.borrow_mut() = Some(waiter.await);
@@ -714,7 +720,10 @@ fn the_spare_lend_survives_every_other_borrow() {
     drop(stolen.borrow_mut().take());
     assert_eq!(ex.run_ready(8), 1, "the Retired task's reclaim");
     fast(&mut ex);
-    assert_eq!(FabricGate::complete(&gate, key.get(), 1_000_000), Delivery::Delivered);
+    assert_eq!(
+        FabricGate::complete(&gate, key.get(), 1_000_000, inf_foundation::time::Nanos(0)),
+        Delivery::Delivered
+    );
     fast(&mut ex);
     assert_eq!(ex.run_ready(8), 1, "the waiter completes");
     fast(&mut ex);
@@ -751,7 +760,10 @@ fn the_kept_lend_across_an_id_lookup_and_a_shared_borrow() {
         fast(&mut ex);
         assert_eq!(ex.class_tasks(ex.class()), 1, "the waiter; the spare is none");
     }
-    assert_eq!(FabricGate::complete(&gate, key.get(), 1), Delivery::Delivered);
+    assert_eq!(
+        FabricGate::complete(&gate, key.get(), 1, inf_foundation::time::Nanos(0)),
+        Delivery::Delivered
+    );
     assert_eq!(ex.run_ready(8), 1);
     assert_eq!(hits.get(), 6);
     assert_eq!(ex.live_tasks(), 0);

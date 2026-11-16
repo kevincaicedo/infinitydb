@@ -139,7 +139,7 @@ fn bench_suspend_resume(c: &mut Criterion) {
             };
             let outcome = permit.poll_immediate(|| waiter_task(waiter, sink));
             assert!(matches!(outcome, PollImmediate::Suspended(_)));
-            FabricGate::complete(gate, token, token);
+            FabricGate::complete(gate, token, token, inf_foundation::time::Nanos(0));
             ex.run_ready(1);
         });
     });
