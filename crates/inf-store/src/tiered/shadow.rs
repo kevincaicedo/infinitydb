@@ -983,7 +983,7 @@ impl TieredTable {
 
     /// [`shadow_read_owed`](Self::shadow_read_owed) by a walk of the tickets
     /// `shadow_work` offers, O(open tickets): the predicate's reference, for
-    /// tests and the DST oracle.
+    /// tests.
     #[must_use]
     pub fn shadow_read_owed_by_walk(&self) -> bool {
         self.shadow.reconcile

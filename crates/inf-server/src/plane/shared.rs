@@ -799,14 +799,13 @@ impl NsApplyRead {
 }
 
 /// One apply's gating decision (ADR-0015 D6, ADR-0177 D6), from its one
-/// reading, taken before its first effect: the reading's fsync class, the
-/// one the apply stages with, and what the apply's verdict waits behind when
-/// the reading gates it (an `always` write): a peer origin's [`GatedTicket`],
-/// a client's [`ClientAck`], and on a read-only leg nothing (`Infallible`).
-/// Its fields are private, so the constructors below are the only ones, and
-/// a `Gated` outcome holds what it waits behind. It keeps the class, not the
-/// reading: a future that holds the gate beside the command's row holds the
-/// row once.
+/// reading: the reading's fsync class, the one the apply stages with, and
+/// what the apply's verdict waits behind when the reading gates it (an
+/// `always` write): a peer origin's [`GatedTicket`], a client's
+/// [`ClientAck`], and on a read-only leg nothing (`Infallible`). Its fields
+/// are private, so the constructors below are the only ones, and a `Gated`
+/// outcome holds what it waits behind. It keeps the class, not the reading:
+/// a future that holds the gate beside the command's row holds the row once.
 pub(super) struct ApplyGate<G> {
     class: Option<FsyncClass>,
     waits: Option<G>,
@@ -1709,11 +1708,12 @@ mod parked_tests {
         drop(earlier);
     }
 
-    /// R5 (ADR-0015 D6, ADR-0177 D6): over class × read or write × staged or
-    /// not, a gate settles to its wait iff its reading is an `always` write
-    /// and the apply staged; an unstaged waiting gate releases its slot, so
-    /// the origin's deque is its before-state. A client's gate reads the
-    /// same predicate.
+    /// A `Gated` outcome carries what it waits behind, and a staged `always`
+    /// write waits (ADR-0015 D6, ADR-0177 D6): over class × read or write ×
+    /// staged or not, a gate settles to its wait iff its reading is an
+    /// `always` write and the apply staged; an unstaged waiting gate releases
+    /// its slot, so the origin's deque is its before-state. A client's gate
+    /// reads the same predicate.
     #[test]
     fn a_gate_settles_only_a_staged_write_of_a_gating_reading() {
         let book = book(3, 4);
@@ -1746,9 +1746,9 @@ mod parked_tests {
         }
     }
 
-    /// R5: a staged `always` reading that is not a write (a command that
-    /// stages without the registry's WRITE bit) stops the cell before its
-    /// reply leaves.
+    /// A staged `always` write waits (ADR-0015 D6): a staged `always` reading
+    /// that is not a write (a command that stages without the registry's
+    /// WRITE bit) stops the cell before its reply leaves.
     #[test]
     #[should_panic(expected = "a staged `always` write's gate waits")]
     fn a_staged_always_reading_that_is_not_a_write_stops_the_cell() {

@@ -9,11 +9,13 @@
 //! hold a slot by the runner's own reading at most both. A client holds a
 //! slot once it has read a frame other than the `maxclients` refusal (its
 //! slot and task were made at admission, before any frame but the refusal)
-//! until the net posts its server-side close, which follows the pump's
-//! return. At a settled node no `conn` header stays Retired: a header kept
-//! Retired for good (a waker kept past its pump's return) holds its class
-//! slot, and after `C` of them every accept is refused, while every
-//! per-step clause stays green.
+//! until the net posts its server-side close. That close comes first: the
+//! net posts it at the server's `Close` op, and the slot vacates only when
+//! the pump returns after reading `Closed`, so a client leaves the count no
+//! later than its slot does. At a settled node no `conn` header stays
+//! Retired: a header kept Retired for good (a waker kept past its pump's
+//! return) holds its class slot, and after `C` of them every accept is
+//! refused, while every per-step clause stays green.
 
 use inf_server::ConnOwners;
 

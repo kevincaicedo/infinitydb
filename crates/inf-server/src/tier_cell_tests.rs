@@ -794,8 +794,10 @@ fn read_namespaces(pass: &TierPass) -> Vec<NsId> {
     pass.reads.iter().map(|read| read.ns).collect()
 }
 
-/// R1, R2 (ADR-0177 D2): with one `compact` slot the pass takes 16's read,
-/// paces 17 — counted once, nothing marked in flight — and spends the room.
+/// A compaction read is taken only by spending a slot of its pass's room, and
+/// a namespace the room cannot serve is counted once and left unmarked
+/// (ADR-0177 D2): with one `compact` slot the pass takes 16's read, paces 17
+/// — counted once, nothing marked in flight — and spends the room.
 /// Control: with two slots both read and nothing is counted. Taking a read
 /// before asking the room marks 17 in flight with no slot for its task.
 #[test]
@@ -824,8 +826,8 @@ fn a_full_compact_room_paces_and_marks_nothing() {
     assert_eq!(room.left(), 0, "the read spent the room");
 }
 
-/// R4 (ADR-0177 D2): each pass starts at the namespace the last one paced
-/// first, so with one slot and each chain ended before the next pass the
+/// Each pass starts at the namespace the last one paced first (ADR-0177
+/// D2), so with one slot and each chain ended before the next pass the
 /// reads alternate 16, 17, 16, every pass pacing the other.
 #[test]
 fn a_compact_room_rotates_by_id() {
@@ -895,9 +897,10 @@ fn one_shadow_pass(tickets: u32, room: u32) -> (usize, u64) {
     (reads.len(), waits.get())
 }
 
-/// R2 (ADR-0177 D2): a table the room cut short with a read still owed is
-/// paced, once; a table that stopped at its own bound of four reads in
-/// flight, or ran out of tickets, is not.
+/// A namespace the room cannot serve is counted once a pass (ADR-0177 D2): a
+/// table the room cut short with a read still owed is paced, once; a table
+/// that stopped at its own bound of four reads in flight, or ran out of
+/// tickets, is not.
 #[test]
 fn a_short_shadow_room_paces_its_namespace() {
     assert_eq!(one_shadow_pass(3, 2), (2, 1), "room 2: two reads, the third owed");
@@ -906,9 +909,10 @@ fn a_short_shadow_room_paces_its_namespace() {
     assert_eq!(one_shadow_pass(6, 8), (4, 0), "control: the table's own bound is not counted");
 }
 
-/// R4 (ADR-0177 D2): with four slots a pass and three tickets a table, the
-/// first pass reads 16's three and 17's one and paces 17; with the reads
-/// failed back, the second starts at 17.
+/// Each pass starts at the namespace the last one paced first (ADR-0177
+/// D2): with four slots a pass and three tickets a table, the first pass
+/// reads 16's three and 17's one and paces 17; with the reads failed back,
+/// the second starts at 17.
 #[test]
 fn a_shadow_room_rotates_by_id() {
     let mut cell = TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
