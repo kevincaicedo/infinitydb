@@ -11,7 +11,7 @@
 # A canary the fleet never plants
 # proves nothing; `bins/inf-sim/tests/lanes.rs` fails when a cfg in the
 # workspace's `check-cfg` list has no row here.
-# Three row kinds:
+# Four row kinds:
 #   `<cfg> <scenario> <expected violation substring> [flags…]` — an
 #     `inf-sim` scenario (a sweep where one seed may not reach the rule).
 #     A row whose flags carry their own `--seed` runs at that seed whatever
@@ -47,28 +47,50 @@
 #     control. The planted log must also carry `<witness>`, a whitespace-
 #     free piece of the model's own assertion: a Loom budget panic, the
 #     model's VACUOUS check or an `expect` also fail the test, and none of
-#     them is the oracle seeing the stale effect.
-# Every row runs its plain control first, and the control's own output
-# must not carry the row's substring or witness: a line every run prints —
+#     them is the oracle seeing the stale effect;
+#   `<cfg> binary <instrument> <token> <flags…>` — the shipped node built
+#     twice and read by an `inf-bench` instrument, for a plant whose
+#     evidence is the node's resident memory, which no test inside the node
+#     sees. The plain node builds once a lane and the planted one once a
+#     cfg, each `cargo build --release -p infinityd` alone with RUSTFLAGS
+#     set (empty on the plain one), so the node is built as it ships and the
+#     plant is its cfg alone; `inf-bench` builds once a lane by its own
+#     command into the plain node's directory, first, and each instrument's
+#     `--preflight` runs once a lane before any node builds. The row runs
+#     `inf-bench <instrument> --base <plain> --candidate <planted>
+#     <flags…>` and is caught when that exits 1 with a line beginning
+#     `<token>:`. The plain node is the run's own control, its same-binary
+#     boots within the row's control (the instrument's exit 1 needs them),
+#     so no plain leg runs apart, and none runs under
+#     INF_CANARY_CONTROLS_ONLY: the row is named there and not run. The
+#     flags are a plant's: without `--plant-bytes-cell`, or with
+#     `--budget-bytes-cell`, the row is a scope error. Exit 0 is NOT CAUGHT;
+#     any exit but 1 with the token, or 2 withheld (below), is red for
+#     another reason.
+# Every row of the other kinds runs its plain control first, and the
+# control's own output must not carry the row's substring or witness: a line every run prints —
 # a summary, a header, a report — carries it on any red as well, so a
 # planted log naming it says nothing of the oracle, and the row is refused
 # before its plant is built. A crate-test or loom control runs with
 # `--show-output`, so a passing test's own prints are read too.
 # A row's label, `<cfg> <kind> <subject>`, heads every line about it (one
-# cfg owns many rows): the kind `crate-test`, `loom` or `scenario`, the
-# subject the test's name, or the scenario and its flags. Every row is read
-# before the first build: a cfg that is not `inf_canary_<name>`, the name of
-# letters, digits and `_` (the cfg names the row's planted directory), a
-# wrong arity for its kind, an empty feature list or a target neither `lib`
-# nor `test:NAME` is a scope error.
-# A run that exits 0 and judged nothing is neither caught nor NOT CAUGHT:
-# a crate test or Loom model with no verdict line for its test (cargo built
-# no such test on this host), a scenario whose log has a line beginning
-# `WITHHELD:`. Linux is the lane's authoritative host (the shipped backend
-# and the nightly run there), and there such a row is red; on another host
-# it is NOT RUN, named in the summary, and the lane passes when every other
-# row does and one was caught (ADR-0106 D18's rule for a host-bound plant).
-# A non-zero exit is never judged nothing: a compile error, or cargo
+# cfg owns many rows): the kind `crate-test`, `loom`, `scenario` or
+# `binary`, the subject the test's name, the scenario and its flags, or the
+# instrument. Every row is read before the first build: a cfg that is not
+# `inf_canary_<name>`, the name of letters, digits and `_` (the cfg names
+# the row's planted directory), a wrong arity for its kind, an empty feature
+# list, a target neither `lib` nor `test:NAME`, or an instrument or token
+# spelled otherwise than letters, digits, `_` and `-` is a scope error.
+# A run that judged nothing is neither caught nor NOT CAUGHT: a crate test
+# or Loom model that exits 0 with no verdict line for its test (cargo built
+# no such test on this host), a scenario that exits 0 with a line beginning
+# `WITHHELD:`, an instrument (a preflight, a binary row's run) that exits 2
+# with a line beginning `WITHHELD:` (the host or the node is outside its
+# scope). Linux is the lane's authoritative host (the shipped backend and
+# the nightly run there), and there such a row is red; on another host it
+# is NOT RUN, named in the summary, and the lane passes when every other row
+# does and one was caught (ADR-0106 D18's rule for a host-bound plant).
+# No other non-zero exit is judged nothing: a compile error, or cargo
 # refusing a feature, is red on every host. On a row whose features name
 # `uring`, a panic whose message begins `io_uring` (the test could not build
 # its ring) is named as io_uring unavailable on this host.
@@ -92,9 +114,13 @@
 # build is made in one shard and the K shards run every row exactly once
 # (the nightly's matrix: the whole lane outlasts one runner's job limit).
 # Fixture mode (scripts/check-scripts-selftest.sh): INF_CANARY_ROWS_FILE
-# replaces the row table, INF_CANARY_CARGO the cargo binary and
-# INF_CANARY_SIM_TARGET the directory a scenario row's simulators are read
-# from (`target`; a stub cargo builds nothing there). INF_CANARY_SIM_TARGET
+# replaces the row table, INF_CANARY_CARGO the cargo binary,
+# INF_CANARY_SIM_TARGET the directory every run path is read from, a
+# scenario row's simulators and a binary row's nodes and `inf-bench`
+# (`target`; a stub cargo builds nothing there), and INF_CANARY_BENCH the
+# `inf-bench` a binary row runs, which the lane then does not build.
+# INF_CANARY_BENCH, like INF_CANARY_HOST below, is a scope error without
+# INF_CANARY_ROWS_FILE or beside a real cargo. INF_CANARY_SIM_TARGET
 # beside a real cargo (no INF_CANARY_CARGO, or one whose `--version` answers
 # as cargo does) is a scope error: a row judges the simulators its own build
 # wrote in this checkout's root (ADR-0204). INF_CANARY_HOST replaces
@@ -125,6 +151,12 @@ esac
 if [ -n "${INF_CANARY_HOST:-}" ] && [ -z "${INF_CANARY_ROWS_FILE:-}" ]; then
   echo "sim-canaries: SCOPE ERROR — INF_CANARY_HOST is the self-test's stub route and needs" \
     "INF_CANARY_ROWS_FILE: unset INF_CANARY_HOST, so the table is judged on this host"
+  exit 1
+fi
+if [ -n "${INF_CANARY_BENCH:-}" ] && [ -z "${INF_CANARY_ROWS_FILE:-}" ]; then
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_BENCH is the self-test's stub route and needs" \
+    "INF_CANARY_ROWS_FILE: unset INF_CANARY_BENCH, so each binary row runs the inf-bench" \
+    "the lane builds"
   exit 1
 fi
 host=${INF_CANARY_HOST:-$(uname -s)}
@@ -1185,14 +1217,30 @@ crate_package_ok() {
   [[ "$1" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]]
 }
 
+# binary_flags_ok <flag…>: a binary row's flags are a plant's: they name
+# `--plant-bytes-cell` and never `--budget-bytes-cell`. A plant's bytes
+# separate it from the plain node's same-binary boots, so a caught row has
+# its control green by construction; a budget names no such separation.
+binary_flags_ok() {
+  local flag plant=0
+  for flag in "$@"; do
+    case "$flag" in
+      --plant-bytes-cell) plant=1 ;;
+      --budget-bytes-cell) return 1 ;;
+    esac
+  done
+  [ "$plant" -eq 1 ]
+}
+
 # row_ok <row>: the row starts with its cfg, `inf_canary_<name>` with a name
 # of letters, digits and `_`, as the cfg names the row's planted directory
 # under the root: another spelling could name a path outside it or another
 # directory of it. Its words are its kind's: `<cfg> crate-test
 # <package[/features]> <lib|test:NAME> <test> [witness…]`, `<cfg> loom
-# <package> <test> <witness>`, or a scenario's `<cfg> <scenario> <expected>
-# [flags…]`.
+# <package> <test> <witness>`, `<cfg> binary <instrument> <token>
+# <flags…>`, or a scenario's `<cfg> <scenario> <expected> [flags…]`.
 cfg_spelled='^inf_canary_[A-Za-z0-9_]+ '
+binary_word='^[A-Za-z0-9][A-Za-z0-9_-]*$'
 row_ok() {
   local parts
   [[ "$1" =~ $cfg_spelled ]] || return 1
@@ -1204,25 +1252,34 @@ row_ok() {
         && [[ "${parts[3]}" =~ ^(lib|test:[A-Za-z0-9_-]+)$ ]]
       ;;
     loom) [ "${#parts[@]}" -eq 5 ] ;;
+    binary)
+      [ "${#parts[@]}" -ge 5 ] && [[ "${parts[2]}" =~ $binary_word ]] \
+        && [[ "${parts[3]}" =~ $binary_word ]] && binary_flags_ok "${parts[@]:4}"
+      ;;
     *) [ "${#parts[@]}" -ge 3 ] ;;
   esac
 }
 
 # row_label <row words…>: `<cfg> <kind> <subject>`, the subject a crate
-# test's or Loom model's name, or a scenario with its flags.
+# test's or Loom model's name, a binary row's instrument, or a scenario with
+# its flags.
 row_label() {
   case "$2" in
     crate-test) echo "$1 crate-test $5" ;;
     loom) echo "$1 loom $4" ;;
+    binary) echo "$1 binary $3" ;;
     *) echo "$1 scenario $2${4:+ ${*:4}}" ;;
   esac
 }
 
 # rows_out_of_order <row…>: prints the first row whose cfg sorts before the
-# cfg of the row above it, in byte order; non-zero when there is none.
+# cfg of the row above it, in byte order; non-zero when there is none. Every
+# reader of a pipe here reads it whole: under pipefail an awk that exits
+# early kills its writer with SIGPIPE on a long input, and the pipeline's
+# status is then the writer's 141, not the reader's verdict.
 rows_out_of_order() {
   printf '%s\n' "$@" | LC_ALL=C awk '
-    NR > 1 && $1 < cfg { print $0 " (after " cfg ")"; found = 1; exit }
+    !found && NR > 1 && $1 < cfg { print $0 " (after " cfg ")"; found = 1 }
     { cfg = $1 }
     END { exit !found }'
 }
@@ -1292,6 +1349,12 @@ if [ -n "${INF_CANARY_HOST:-}" ] && cargo_is_real; then
     "cargo is a real one: unset INF_CANARY_HOST, so each row is judged on this host"
   exit 1
 fi
+if [ -n "${INF_CANARY_BENCH:-}" ] && cargo_is_real; then
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_BENCH is the self-test's stub route, and this" \
+    "cargo is a real one: unset INF_CANARY_BENCH, so each binary row runs the inf-bench" \
+    "its own build made"
+  exit 1
+fi
 
 fail=0 caught=0 controls_green=0
 not_run=()
@@ -1339,23 +1402,25 @@ refuse_printed() {
 }
 
 # judged_nothing <kind> <exit status> <log> [<test name>]: zero, printing
-# the reason, when a run that exited 0 judged nothing: a crate test or Loom
-# model with no verdict line for its test, a scenario whose log has a line
-# beginning `WITHHELD:`. A non-zero exit is never judged nothing.
+# the reason, when a run judged nothing: a crate test or Loom model that
+# exited 0 with no verdict line for its test, a scenario that exited 0 with
+# a line beginning `WITHHELD:`, an instrument (kind `binary`: a preflight or
+# a binary row's run) that exited 2 with one. Any other exit is never
+# judged nothing.
 judged_nothing() {
   local line
-  [ "$2" -eq 0 ] || return 1
-  case "$1" in
-    crate-test | loom)
+  case "$1:$2" in
+    crate-test:0 | loom:0)
       if grep -Eq -- "^test ([A-Za-z0-9_]+::)*$4 \\.\\.\\. " "$3"; then return 1; fi
       echo "no test $4 ran"
       ;;
-    scenario)
+    scenario:0 | binary:2)
       line=$(tr -d '\000-\010\013-\037\177' <"$3" | LC_ALL=C awk '
-        /^WITHHELD:/ { print substr($0, 1, 160); found = 1; exit }
+        !found && /^WITHHELD:/ { print substr($0, 1, 160); found = 1 }
         END { exit !found }') || return 1
       echo "$line"
       ;;
+    *) return 1 ;;
   esac
 }
 
@@ -1381,7 +1446,7 @@ uring_unavailable() {
     *) return 1 ;;
   esac
   tr -d '\000-\010\013-\037\177' <"$2" | LC_ALL=C awk '
-    after_panic && /^io_uring/ { print substr($0, 1, 160); found = 1; exit }
+    !found && after_panic && /^io_uring/ { print substr($0, 1, 160); found = 1 }
     { after_panic = ($0 ~ /panicked at /) }
     END { exit !found }'
 }
@@ -1638,6 +1703,149 @@ scenario_row() {
   fi
 }
 
+# The binary rows' shared builds, each once a lane, beside the plain node:
+# 0 not built yet, 1 built, 2 its build failed (every binary row then reads
+# that red, and no node is built for it). `inf-bench` is the named stub's
+# in a fixture and is not built then.
+bench_built=0 node_built=0
+bench=${INF_CANARY_BENCH:-$sim_target/canary-plain/release/inf-bench}
+plain_node=$sim_target/canary-plain/release/infinityd
+# Each instrument's preflight, once a lane: its name in `preflight_names`
+# and, at the same index, its verdict in `preflight_state`, `ok`, `red` or
+# `nothing` with the reason after a space; its log `preflight-<index>.log`.
+preflight_names=()
+preflight_state=()
+
+# binary_preflights: before the first row, `inf-bench` built once (when no
+# stub is named) and each binary row's instrument preflighted once, so a
+# host outside an instrument's scope builds no node at all.
+binary_preflights() {
+  local row name j index status reason
+  local -a parts
+  for row in "${rows[@]}"; do
+    # shellcheck disable=SC2206
+    parts=($row)
+    [ "${parts[1]}" = binary ] || continue
+    name=${parts[2]} index=-1
+    for j in ${preflight_names[@]+"${!preflight_names[@]}"}; do
+      if [ "${preflight_names[$j]}" = "$name" ]; then index=$j; break; fi
+    done
+    [ "$index" -lt 0 ] || continue
+    if [ "$bench_built" -eq 0 ]; then
+      bench_built=1
+      if [ -z "${INF_CANARY_BENCH:-}" ]; then
+        echo "== binary rows: building inf-bench into $TARGET_ROOT/canary-plain"
+        RUSTFLAGS= "$CARGO" build --release -p inf-bench --target-dir "$TARGET_ROOT/canary-plain" \
+          || bench_built=2
+      fi
+    fi
+    index=${#preflight_names[@]}
+    preflight_names+=("$name")
+    if [ "$bench_built" -eq 2 ]; then preflight_state+=(unbuilt); continue; fi
+    echo "== binary rows: $name --preflight"
+    status=0
+    "$bench" "$name" --preflight > "$work/preflight-$index.log" 2>&1 || status=$?
+    tr -d '\000-\010\013-\037\177' <"$work/preflight-$index.log" \
+      | LC_ALL=C awk 'NR <= 3 { print "   " substr($0, 1, 160) }'
+    if reason=$(judged_nothing binary "$status" "$work/preflight-$index.log"); then
+      preflight_state+=("nothing $reason")
+    elif [ "$status" -eq 0 ]; then
+      preflight_state+=(ok)
+    else
+      preflight_state+=("red $status")
+    fi
+  done
+}
+
+# token_line <token> <log>: the first line that begins `<token>:`, read as
+# bytes with the control bytes dropped, 160 of them; non-zero when none. A
+# token inside another line (an error quoting it) is no verdict.
+token_line() {
+  tr -d '\000-\010\013-\037\177' <"$2" | TOKEN="$1:" LC_ALL=C awk '
+    !found && index($0, ENVIRON["TOKEN"]) == 1 { print substr($0, 1, 160); found = 1 }
+    END { exit !found }'
+}
+
+# binary_row <label> <cfg> <instrument> <token> [flags…]
+binary_row() {
+  local label=$1 cfg=$2 name=$3 token=$4 index=-1 j state status reason line built_at ran_at
+  local -a flags
+  flags=("${@:5}")
+  if [ "$controls_only" -eq 1 ]; then
+    echo "== canary $label: its control is the plain node inside its planted run: not run here"
+    return
+  fi
+  for j in ${preflight_names[@]+"${!preflight_names[@]}"}; do
+    if [ "${preflight_names[$j]}" = "$name" ]; then index=$j; break; fi
+  done
+  state=unbuilt
+  if [ "$index" -ge 0 ]; then state=${preflight_state[$index]}; fi
+  case "$state" in
+    unbuilt)
+      echo "== canary $label: the inf-bench build"
+      echo "   red for another reason (the inf-bench build failed; its output is above)"
+      fail=1
+      return
+      ;;
+    nothing\ *)
+      nothing_judged "$label" "${state#nothing }"
+      return
+      ;;
+    red\ *)
+      echo "== canary $label: $name --preflight"
+      echo "   red for another reason (the preflight exited ${state#red }):"
+      tail -5 "$work/preflight-$index.log"
+      fail=1
+      return
+      ;;
+  esac
+  if [ "$node_built" -eq 0 ]; then
+    node_built=1
+    echo "== binary rows: building the plain infinityd into $TARGET_ROOT/canary-plain"
+    RUSTFLAGS= "$CARGO" build --release -p infinityd --target-dir "$TARGET_ROOT/canary-plain" \
+      || node_built=2
+  fi
+  if [ "$node_built" -eq 2 ]; then
+    echo "== canary $label: the plain infinityd build"
+    echo "   red for another reason (the plain build failed; its output is above)"
+    fail=1
+    return
+  fi
+  echo "== canary $label: building infinityd with --cfg $cfg into $TARGET_ROOT/canary-$cfg"
+  built_at=$SECONDS
+  if ! RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p infinityd \
+      --target-dir "$TARGET_ROOT/canary-$cfg"; then
+    echo "   red for another reason (the planted build failed; its output is above)"
+    fail=1
+    return
+  fi
+  echo "== canary $label: the planted node against the plain one must read $token"
+  ran_at=$SECONDS
+  status=0
+  "$bench" "$name" --base "$plain_node" --candidate "$sim_target/canary-$cfg/release/infinityd" \
+    "${flags[@]}" > "$log" 2>&1 || status=$?
+  if reason=$(judged_nothing binary "$status" "$log"); then
+    nothing_judged "$label" "$reason"
+  elif [ "$status" -eq 0 ]; then
+    echo "   NOT CAUGHT: the instrument read the planted node within (the plant has no teeth):"
+    tail -3 "$log"
+    fail=1
+  elif [ "$status" -eq 1 ] && line=$(token_line "$token" "$log"); then
+    echo "   caught: $line ($((ran_at - built_at)) s + $((SECONDS - ran_at)) s)"
+    caught=$((caught + 1))
+  elif [ "$status" -eq 2 ]; then
+    line=$(tr -d '\000-\010\013-\037\177' <"$log" | LC_ALL=C awk '
+      !found && /^NO VERDICT:/ { print substr($0, 1, 160); found = 1 }
+      END { if (!found) print "no NO VERDICT line" }')
+    echo "   red for another reason (the instrument gave no verdict): $line"
+    fail=1
+  else
+    echo "   red for another reason (exit $status, expected 1 and a line beginning '$token:'):"
+    tail -5 "$log"
+    fail=1
+  fi
+}
+
 # A planted cfg's build serves its own rows alone: its RUSTFLAGS give every
 # unit a hash of its own, so no other cfg reuses an artifact, and kept, the
 # builds outgrow the disk (over 100 GB for the whole table). So each cfg
@@ -1681,6 +1889,7 @@ remove_planted() {
 
 if [ "$host" = Linux ]; then echo "host: Linux $(uname -r)"; fi
 start=$SECONDS
+if [ "$controls_only" -eq 0 ]; then binary_preflights; fi
 for index in "${!rows[@]}"; do
   # shellcheck disable=SC2206
   parts=(${rows[$index]})
@@ -1691,6 +1900,7 @@ for index in "${!rows[@]}"; do
       crate_test "$label" "${parts[0]}" "${parts[2]}" "${parts[3]}" "${parts[4]}" "${parts[*]:5}"
       ;;
     loom) loom_test "$label" "${parts[0]}" "${parts[2]}" "${parts[3]}" "${parts[4]}" ;;
+    binary) binary_row "$label" "${parts[0]}" "${parts[@]:2}" ;;
     *) scenario_row "$label" "${parts[0]}" "${parts[@]:1}" ;;
   esac
   next=${rows[$((index + 1))]:-}

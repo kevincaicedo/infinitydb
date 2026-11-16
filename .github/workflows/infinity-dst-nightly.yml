@@ -80,10 +80,13 @@ jobs:
   # ticket), hours on a 4-vCPU runner: past one job's limit. Eight shards
   # split it by cfg, so a cfg's planted build is made in one shard and the
   # eight together run every row once (`INF_CANARY_SHARD`, self-tested in
-  # check-scripts-selftest.sh). Not yet timed on a live runner.
+  # check-scripts-selftest.sh). Not yet timed on a live runner: the runner's
+  # time sets the bound, never a dev box's, so a shard runs to the hosted
+  # runner's job limit, 360 minutes, until a live run is timed; the bound is
+  # then 1.5 times the slowest shard's time, at most 360.
   canaries:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:

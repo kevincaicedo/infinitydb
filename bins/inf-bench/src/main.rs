@@ -19,6 +19,9 @@
 //! - `doc-corpus` — seeded M3 JSON reference-corpus generator (M3-S20).
 //! - `blob-set` — the blob `SET` throughput instrument: a load-response
 //!   curve on one cell with a same-binary control leg.
+//! - `idle-resident` — the idle node's resident memory, one build against
+//!   another, in bytes a cell: a resident-delta verdict whose exit code is
+//!   the verdict's alone (0 within, 1 over, 2 no verdict).
 //!
 //! Tooling tier: `std::thread` and blocking sockets are fine here; this
 //! binary never runs on the data plane. It deliberately does not depend on
@@ -39,6 +42,7 @@ mod envcheck;
 mod finehist;
 mod gaterun;
 mod gates;
+mod idle_resident;
 mod load;
 mod loop_histogram;
 mod m1rows;
@@ -46,6 +50,7 @@ mod m2rows;
 mod m45rows;
 mod m4rows;
 mod mixedaudit;
+mod resident_delta;
 mod resp;
 mod writeamp;
 mod ycsb;
@@ -95,6 +100,15 @@ USAGE:
                     the control, the server's extent counter as the
                     liveness; data-root must not be tmpfs. Run the binary
                     under `taskset -c <loadgen cpus>`)
+    inf-bench idle-resident --preflight
+    inf-bench idle-resident --base PATH --candidate PATH --control-bytes-cell BYTES
+                   (--budget-bytes-cell BYTES | --plant-bytes-cell BYTES --plant-row ROW[,ROW])
+                   [--caps-row ROW[,ROW]] [--pinned-bytes-cell BYTES]
+                   (the idle node's VmRSS a cell, candidate against base: six
+                    boots of four cells at the defaults in the order A B B A
+                    A B, each arm's three within the control; a plant must
+                    rise over 9/10 of its bytes and move its census rows.
+                    Exit 0 within, 1 over, 2 no verdict; Linux only)
     inf-bench zipfian [--keyspace N] [--ops N] [--warmup N] [--theta F] [--seed N]
                    [--maxmemory-mb N] [--value-size BYTES] [--cells N] [--window N]
                    [--threshold-pp F] [--infinityd-bin PATH] [--redis-bin PATH]
@@ -136,6 +150,11 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let rest = &args[1..];
+    if cmd == "idle-resident" {
+        // A verdict's codes, never the generic failure's: 1 means over.
+        let ended = idle_resident::cmd_idle_resident(rest);
+        return ExitCode::from(resident_delta::exit_code(&ended));
+    }
     let outcome = match cmd.as_str() {
         "env-check" => envcheck::cmd_env_check(rest),
         "load" => load::cmd_load(rest),
