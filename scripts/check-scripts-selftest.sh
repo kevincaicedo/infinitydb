@@ -2491,6 +2491,30 @@ IFS= read -r -d '' body <<'EOF' || true
 [package]
 name = "fake"
 
+[dependencies]
+inf-runtime = { workspace = true, features = ["fault-points"] }
+EOF
+root=$(printf '%s' "$body" | manifest ship-runtime)
+expect red "shipping: a normal edge requests inf-runtime's fault-points forwarder" env INF_CHECK_ROOT="$root" $SHIP
+
+IFS= read -r -d '' body <<'EOF' || true
+[package]
+name = "fake"
+
+[features]
+default = ["near-wrap"]
+near-wrap = ["inf-server/fault-points"]
+
+[dependencies]
+inf-server = { workspace = true }
+EOF
+root=$(printf '%s' "$body" | manifest ship-server)
+expect red "shipping: a default reaches inf-server's fault-points forwarder" env INF_CHECK_ROOT="$root" $SHIP
+
+IFS= read -r -d '' body <<'EOF' || true
+[package]
+name = "fake"
+
 [dependencies.inf-foundation]
 workspace = true
 features = ["fault-points"]

@@ -29,6 +29,11 @@ doc = ["inf-store/doc", "dep:inf-doc"]
 # costs the tiered SET path. Never in a shipping build; `infinityd
 # --blind-overwrite-ceiling` exists only with it.
 bench-diagnostics = []
+# The plane's first generation for its fabric gate's holders, so the
+# simulator's near-wrap leg reaches the key's generation field. Off in every
+# shipping build (scripts/check-shipping-features.sh); `inf-sim`'s `dst`
+# requests it.
+fault-points = ["inf-runtime/fault-points"]
 
 [lints]
 workspace = true

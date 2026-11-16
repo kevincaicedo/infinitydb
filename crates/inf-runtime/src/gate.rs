@@ -219,6 +219,9 @@ const GATE_KEY_FIELDS: u64 = (1 << GATE_KEY_TAG_BIT) - 1;
 /// ADR-0177 D4's proof (D7).
 type HolderSlab<V> = CappedSlab<Holder<V>, u32, WrapWithProof>;
 
+/// A holder slab being built.
+type HolderBuilder<V> = SlabBuilder<Holder<V>, u32, WrapWithProof>;
+
 /// The fabric key's adapter: a holder's index and its generation's low
 /// bits, built from the gate's own slab (ADR-0194 D6 with A2).
 type GateWord = SlotWord<u32, WrapWithProof, GATE_KEY_INDEX_BITS, GATE_KEY_GENERATION_BITS>;
@@ -227,6 +230,26 @@ type GateWord = SlotWord<u32, WrapWithProof, GATE_KEY_INDEX_BITS, GATE_KEY_GENER
 struct FabricHolders<V> {
     slab: HolderSlab<V>,
     word: GateWord,
+    /// Takes of occupants at a generation past the key's field (the
+    /// simulator's near-wrap tap; `fault-points` only).
+    #[cfg(feature = "fault-points")]
+    wrapped_takes: u64,
+}
+
+impl<V> FabricHolders<V> {
+    /// Frees the holder `slot` names, its occupant returned. Under
+    /// `fault-points` a take of an occupant whose generation passed the
+    /// key's field is counted: it reads the generation publish stamped on
+    /// the handle, which no encode writes, so an encode fault cannot fake
+    /// a wrap.
+    fn take(&mut self, slot: SlotId<u32>) -> Taken<Holder<V>> {
+        let taken = self.slab.take(slot);
+        #[cfg(feature = "fault-points")]
+        if matches!(taken, Taken::Value(_)) && slot.generation() >= 1 << GATE_KEY_GENERATION_BITS {
+            self.wrapped_takes += 1;
+        }
+        taken
+    }
 }
 
 /// The fabric round-trip gate (ADR-0177 D4): it mints the key a request
@@ -282,13 +305,48 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
         holders: Option<Cap>,
         census: &Rc<CapCensus>,
     ) -> Result<FabricGate<V, C>, CapError> {
+        FabricGate::build_with(origin, units_max, holders, census, |builder| builder)
+    }
+
+    /// [`build`](Self::build) with every holder slot free at
+    /// `first_generation`, so a test or the simulator reaches the key's
+    /// generation field without that many uses of a slot (`fault-points`
+    /// only).
+    ///
+    /// # Errors
+    /// As [`build`](Self::build).
+    #[cfg(feature = "fault-points")]
+    pub fn build_at_generation(
+        origin: u16,
+        units_max: u32,
+        holders: Option<Cap>,
+        census: &Rc<CapCensus>,
+        first_generation: u32,
+    ) -> Result<FabricGate<V, C>, CapError> {
+        FabricGate::build_with(origin, units_max, holders, census, |builder| {
+            builder.first_generation(first_generation)
+        })
+    }
+
+    fn build_with(
+        origin: u16,
+        units_max: u32,
+        holders: Option<Cap>,
+        census: &Rc<CapCensus>,
+        configure: impl FnOnce(HolderBuilder<V>) -> HolderBuilder<V>,
+    ) -> Result<FabricGate<V, C>, CapError> {
         let holders = match holders {
             None => None,
             Some(cap) => {
                 debug_assert!(cap.entries_max() >= units_max, "H counts every unit");
-                let slab = build_holders(CappedSlab::builder(cap, census)?)?;
+                let slab = build_holders(configure(CappedSlab::builder(cap, census)?))?;
                 let word = GateWord::for_slab(&slab)?;
-                Some(FabricHolders { slab, word })
+                Some(FabricHolders {
+                    slab,
+                    word,
+                    #[cfg(feature = "fault-points")]
+                    wrapped_takes: 0,
+                })
             }
         };
         Ok(FabricGate {
@@ -373,11 +431,11 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
     fn settle(&mut self, key: u64, value: V, now: Nanos) -> (Delivery, Option<Waker>, Option<V>) {
         let FabricGate { holders, high, stale, room, round_trips, .. } = self;
         let own = key & !GATE_KEY_FIELDS == *high;
-        let Some(FabricHolders { slab, word }) = holders.as_mut().filter(|_| own) else {
+        let Some(fabric) = holders.as_mut().filter(|_| own) else {
             *stale += 1;
             return (Delivery::Orphan, None, Some(value));
         };
-        let (id, holder) = match slab.get_mut_by_word(word, key & GATE_KEY_FIELDS) {
+        let (id, holder) = match fabric.slab.get_mut_by_word(&fabric.word, key & GATE_KEY_FIELDS) {
             WordLookup::Live(id, holder) => (id, holder),
             WordLookup::Stale | WordLookup::Vacant => {
                 *stale += 1;
@@ -396,7 +454,7 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
             }
             // The waiter was dropped: this is its request's one completion.
             HolderState::Orphaned => {
-                let _freed = slab.take(id);
+                let _freed = fabric.take(id);
                 room.wake_one(());
                 return (Delivery::Orphan, None, Some(value));
             }
@@ -442,6 +500,13 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
     pub fn round_trips(&self) -> &LogHistogram {
         &self.round_trips
     }
+
+    /// Takes of holders whose generation passed the key's 23-bit field:
+    /// the near-wrap leg's engagement (`fault-points` only).
+    #[cfg(feature = "fault-points")]
+    pub fn wrapped_takes(&self) -> u64 {
+        self.holders.as_ref().map_or(0, |holders| holders.wrapped_takes)
+    }
 }
 
 /// Steps a holder slab's build to its end; a refused build retires its
@@ -468,16 +533,16 @@ fn build_holders<V>(
 /// the waker it stored and that value, both dropped outside the gate's
 /// borrow.
 fn orphan<V>(
-    slab: &mut HolderSlab<V>,
+    fabric: &mut FabricHolders<V>,
     room: &WaitList<()>,
     slot: SlotId<u32>,
 ) -> (Option<Waker>, Option<V>) {
-    let LookupMut::Live(holder) = slab.get_mut(slot) else { return (None, None) };
+    let LookupMut::Live(holder) = fabric.slab.get_mut(slot) else { return (None, None) };
     let prior = core::mem::replace(&mut holder.state, HolderState::Orphaned);
     // Canary: the holder frees at its waiter's drop, with no Orphaned state,
     // so its request's late completion finds the slot at its next generation.
     if cfg!(inf_canary_gate_frees_on_drop) {
-        let _freed = slab.take(slot);
+        let _freed = fabric.take(slot);
         room.wake_one(());
         return match prior {
             HolderState::Delivered(value) => (None, Some(value)),
@@ -491,7 +556,7 @@ fn orphan<V>(
     }
     match prior {
         HolderState::Delivered(value) => {
-            let _freed = slab.take(slot);
+            let _freed = fabric.take(slot);
             room.wake_one(());
             (None, Some(value))
         }
@@ -589,8 +654,10 @@ impl<V, C: Cleanup<V>> Future for GateWait<'_, V, C> {
         let this = Pin::into_inner(self);
         let mut gate = this.gate.borrow_mut();
         let FabricGate { holders, room, .. } = &mut *gate;
-        let Some(FabricHolders { slab, .. }) = holders.as_mut() else { polled_after_completion() };
-        let LookupMut::Live(holder) = slab.get_mut(this.slot) else { polled_after_completion() };
+        let Some(fabric) = holders.as_mut() else { polled_after_completion() };
+        let LookupMut::Live(holder) = fabric.slab.get_mut(this.slot) else {
+            polled_after_completion()
+        };
         if store_waker(&mut holder.state, cx.waker()) {
             return Poll::Pending;
         }
@@ -603,7 +670,7 @@ impl<V, C: Cleanup<V>> Future for GateWait<'_, V, C> {
             | HolderState::Orphaned => polled_after_completion(),
         }
         let Taken::Value(Holder { state: HolderState::Delivered(value), .. }) =
-            slab.take(this.slot)
+            fabric.take(this.slot)
         else {
             polled_after_completion()
         };
@@ -623,7 +690,7 @@ impl<V, C: Cleanup<V>> Drop for GateWait<'_, V, C> {
         let mut gate = self.gate.borrow_mut();
         let FabricGate { holders, room, .. } = &mut *gate;
         let (waker, value) = match holders.as_mut() {
-            Some(FabricHolders { slab, .. }) => orphan(slab, room, self.slot),
+            Some(fabric) => orphan(fabric, room, self.slot),
             None => (None, None),
         };
         drop(gate);

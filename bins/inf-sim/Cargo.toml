@@ -31,6 +31,8 @@ dst = [
     "inf-foundation/fault-points",
     # The collision-key builders live behind inf-store's forwarder (batch 47).
     "inf-store/collision-oracle",
+    # The fabric gate's first generation and wrap count (the near-wrap leg).
+    "inf-server/fault-points",
 ]
 
 [dependencies]
