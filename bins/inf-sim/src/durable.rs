@@ -2210,7 +2210,8 @@ pub(crate) fn boot_meshed(
             driver
         };
         let pool = BufferPool::new(128, 1024);
-        let node_info = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
+        let (node_info, admission) = NodeInfo::try_default().expect("fixture cache allocation");
+        let node_info = Rc::new(node_info);
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
         nodes.push(Rc::clone(&node_info));
         // The node's keyspace is cataloged (ADR-0189 D4), as `infinityd`'s,
@@ -2229,6 +2230,7 @@ pub(crate) fn boot_meshed(
             seed,
             fabric,
             node_info,
+            admission,
             observer.clone(),
             false,
         )

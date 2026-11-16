@@ -1412,7 +1412,8 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                 .expect("a scenario's boot capacity");
             config = config.with_boot_capacity(capacity);
         }
-        let node = Rc::new(NodeInfo::try_new(config).expect("fixture cache allocation"));
+        let (node, admission) = NodeInfo::try_new(config).expect("fixture cache allocation");
+        let node = Rc::new(node);
         node.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
         if scenario.timeout_secs != 0 {
             node.config
@@ -1443,6 +1444,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                 seed,
                 fabric,
                 node,
+                admission,
                 oracle.clone(),
                 false,
             )

@@ -75,7 +75,8 @@ fn plane(permit: crate::CacheBootPermit) -> (TestLoop, ServerPlane) {
 
 /// The cell on `clock`, which the test steps.
 fn plane_on(permit: crate::CacheBootPermit, clock: Rc<VirtualClock>) -> (TestLoop, ServerPlane) {
-    let node = NodeInfo::try_default().unwrap().into_boot_group(permit);
+    let (node, admission) = NodeInfo::try_default().unwrap();
+    let node = node.into_boot_group(permit);
     let fabric =
         Mesh::new(2, MeshConfig { ring_capacity: 8, data_credits: 4 }).into_iter().next().unwrap();
     let (plane, serve_mark, timer_set, executor) = ServerPlane::new(
@@ -85,6 +86,7 @@ fn plane_on(permit: crate::CacheBootPermit, clock: Rc<VirtualClock>) -> (TestLoo
         KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
         fabric,
         node,
+        admission,
         NoopObserver,
         false,
     )
@@ -110,7 +112,7 @@ fn delayed_cache_never_arms_a_peer_listener() {
         assert_eq!(reactor.driver().arms, 0, "peer cache is still pending");
         assert!(plane.take_boot_error().is_none());
     }
-    let _peer = NodeInfo::try_default().unwrap().into_boot_group(second);
+    let _peer = NodeInfo::try_default().unwrap().0.into_boot_group(second);
     for _ in 0..4 {
         reactor.run_iteration(&mut plane).unwrap();
     }
@@ -125,7 +127,7 @@ fn cache_refusal_never_arms_a_peer_listener() {
         let (mut reactor, mut plane) = plane(first);
         let config = crate::ConfigStore::default();
         let guard = ALLOC.refuse_after(skip).unwrap();
-        let result = NodeInfo::try_new(config).map(|node| node.into_boot_group(second));
+        let result = NodeInfo::try_new(config).map(|(node, _)| node.into_boot_group(second));
         let triggered = guard.was_triggered();
         drop(guard);
         assert!(triggered, "cache reservation was not reached");

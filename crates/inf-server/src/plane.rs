@@ -697,6 +697,9 @@ pub struct ServerPlane<
 > {
     shared: Rc<Shared<O, F>>,
     listener: RawFd,
+    /// The one handle that inserts a client row: an accept registers its
+    /// client through it, and no command's context holds it.
+    admission: crate::ClientAdmission,
     started: bool,
     /// Recv completions staged from step 1 for PARSE+EXECUTE (step 3+4).
     inbox: Vec<(ConnKey, BufferId, u32)>,
@@ -923,6 +926,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         seed: KeyspaceSeed,
         fabric: CellFabric,
         node: Rc<NodeInfo>,
+        admission: crate::ClientAdmission,
         observer: O,
         route_local_only: bool,
     ) -> Result<(ServerPlane<O, F>, ServeMark, TimerSet, CellExecutor), PlaneBuildError> {
@@ -1011,6 +1015,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 blind_overwrite_ceiling: Cell::new(false),
             }),
             listener,
+            admission,
             started: false,
             inbox: Vec::new(),
             reply_scratch: ReplyStream::new(Vec::new()),
@@ -1807,9 +1812,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         node.total_connections.set(node.total_connections.get() + 1);
         // Peer address capture is a recorded deviation (CLIENT LIST
         // placeholder) until the accept path carries peernames.
-        node.clients.borrow_mut().register(
+        self.admission.register(
             id,
-            key.packed(),
+            Some(key.packed()),
             "0.0.0.0:0".to_string(),
             cx.now.as_millis(),
         );

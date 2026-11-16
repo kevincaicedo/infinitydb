@@ -98,13 +98,15 @@ fn start_node(
             fill: Default::default(),
             group: Default::default(),
         };
+        let (fixture_node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
         let (mut plane, serve_mark, timer_set, executor) = ServerPlane::new(
             CellId(0),
             1,
             listener.into_raw_fd(),
             seed,
             fabric,
-            Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+            Rc::new(fixture_node),
+            admission,
             NoopObserver,
             false,
         )

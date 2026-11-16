@@ -1314,10 +1314,10 @@ type Boot = Option<(
 fn boot_node_info(
     config: inf_server::ConfigStore,
     permit: inf_server::CacheBootPermit,
-) -> std::io::Result<Rc<NodeInfo>> {
-    let node = NodeInfo::try_new(config)
+) -> std::io::Result<(Rc<NodeInfo>, inf_server::ClientAdmission)> {
+    let (node, admission) = NodeInfo::try_new(config)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
-    Ok(node.into_boot_group(permit))
+    Ok((node.into_boot_group(permit), admission))
 }
 
 /// The resources transferred once to their owning cell at thread launch.
@@ -1352,7 +1352,7 @@ fn cell_main(
     }
     let config = inf_server::ConfigStore::with_path_cache_capacity(args.doc_path_cache_capacity)
         .with_boot_capacity(args.boot_capacity);
-    let node = boot_node_info(config, cache_permit)?;
+    let (node, admission) = boot_node_info(config, cache_permit)?;
     mark(11); // setup:pool
     let mut pool = BufferPool::new(args.buffers, args.buf_size);
     mark(12); // setup:driver
@@ -1493,6 +1493,7 @@ fn cell_main(
         seed,
         fabric,
         Rc::clone(&node),
+        admission,
         NoopObserver,
         args.route_local_only,
     )

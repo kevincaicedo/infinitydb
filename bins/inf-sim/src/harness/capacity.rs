@@ -302,7 +302,8 @@ impl Rig {
                     .expect("a leg's boot capacity");
                 config = config.with_boot_capacity(capacity);
             }
-            let node = Rc::new(NodeInfo::try_new(config).expect("fixture cache allocation"));
+            let (node, admission) = NodeInfo::try_new(config).expect("fixture cache allocation");
+            let node = Rc::new(node);
             node.rng_state.set(seed ^ (0xCA9A_0000 + i as u64));
             nodes.push(Rc::clone(&node));
             let seed_store = KeyspaceSeed::Uncataloged {
@@ -316,6 +317,7 @@ impl Rig {
                 seed_store,
                 fabric,
                 node,
+                admission,
                 NoopObserver,
                 false,
             )

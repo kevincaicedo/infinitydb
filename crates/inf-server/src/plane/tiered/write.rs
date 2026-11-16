@@ -1592,6 +1592,7 @@ mod hole_refusal_tests {
         let fabric = Mesh::new(1, MeshConfig::default()).into_iter().next().expect("one cell");
         let seed =
             KeyspaceSeed::Uncataloged { cfg: inf_store::StoreConfig::default(), specs: vec![spec] };
+        let (fixture_node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
         let (plane, _serve_mark, _timer_set, _executor) =
             ServerPlane::<NoopObserver, crate::StdSegmentFs>::new(
                 CellId(0),
@@ -1599,7 +1600,8 @@ mod hole_refusal_tests {
                 -1,
                 seed,
                 fabric,
-                Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+                Rc::new(fixture_node),
+                admission,
                 NoopObserver,
                 false,
             )

@@ -108,13 +108,15 @@ struct Rig {
 impl Rig {
     fn admitted() -> Rig {
         let fabric = Mesh::new(1, MeshConfig::default()).into_iter().next().expect("one cell");
+        let (fixture_node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
         let (mut plane, serve_mark, timer_set, executor) = ServerPlane::new(
             CellId(0),
             1,
             -1,
             KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
             fabric,
-            Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+            Rc::new(fixture_node),
+            admission,
             NoopObserver,
             false,
         )

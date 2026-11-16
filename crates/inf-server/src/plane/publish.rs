@@ -35,13 +35,12 @@ pub(super) async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + C
             let adding = matches!(id, CommandId::Subscribe | CommandId::Psubscribe);
             let names: Vec<&[u8]> = argv[1..].to_vec();
             let mut frames = OpenReply::new(shared.take_reply_buf());
-            let now = shared.now.get();
             let Some(changes) = shared.with_conn(key, |conn| {
                 if adding {
-                    pubsub::apply_subscribe(&names, kind, &mut conn.cx, now, frames.reply())
+                    pubsub::apply_subscribe(&names, kind, &mut conn.cx, frames.reply())
                 } else {
                     let names = (!names.is_empty()).then_some(names.as_slice());
-                    pubsub::apply_unsubscribe(names, kind, &mut conn.cx, now, frames.reply())
+                    pubsub::apply_unsubscribe(names, kind, &mut conn.cx, frames.reply())
                 }
             }) else {
                 return false;

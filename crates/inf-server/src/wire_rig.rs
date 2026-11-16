@@ -175,7 +175,8 @@ impl Rig {
         let clock = Rc::new(VirtualClock::default());
         let fabrics = Mesh::new(cells, MeshConfig::default());
         let built = fabrics.into_iter().enumerate().map(|(cell, fabric)| {
-            let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
+            let (node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
+            let node = Rc::new(node);
             let (plane, serve_mark, timer_set, executor) = ServerPlane::new(
                 CellId(u16::try_from(cell).expect("a u16 cell")),
                 cells,
@@ -186,6 +187,7 @@ impl Rig {
                 },
                 fabric,
                 node,
+                admission,
                 NoopObserver,
                 false,
             )

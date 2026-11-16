@@ -1552,7 +1552,8 @@ mod parked_tests {
 
     /// A gated book on cell 1 of `cells`, each origin's deque `entries` long.
     fn book(cells: u16, entries: u32) -> Rc<GatedBook> {
-        let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
+        let (node, _) = NodeInfo::try_default().expect("fixture cache allocation");
+        let node = Rc::new(node);
         Rc::new(GatedBook::new(deques::<Gated>(1, cells, entries), node))
     }
 

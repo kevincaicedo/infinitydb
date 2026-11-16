@@ -753,6 +753,7 @@ mod fabric_batch_depth {
         const DEPTH: usize = 100_000;
         let mut fabrics = Mesh::new(2, MeshConfig::default());
         let fabric = fabrics.remove(0);
+        let (fixture_node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
         let (plane, _serve_mark, _timer_set, _executor) =
             ServerPlane::<_, crate::StdSegmentFs>::new(
                 CellId(0),
@@ -760,7 +761,8 @@ mod fabric_batch_depth {
                 -1,
                 KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
                 fabric,
-                Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+                Rc::new(fixture_node),
+                admission,
                 NoopObserver,
                 false,
             )

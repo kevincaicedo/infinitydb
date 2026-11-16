@@ -54,13 +54,15 @@ impl BackendDriver for Idle {
 /// One serving cell: its loop, its plane and the test's own census handle.
 fn serving_cell() -> (CellLoop<Idle, VirtualClock>, ServerPlane, Rc<CapCensus>) {
     let fabric = Mesh::new(1, MeshConfig::default()).into_iter().next().expect("one cell");
+    let (fixture_node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
     let (mut plane, serve_mark, timer_set, executor) = ServerPlane::new(
         CellId(0),
         1,
         -1,
         KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() },
         fabric,
-        Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+        Rc::new(fixture_node),
+        admission,
         NoopObserver,
         false,
     )
