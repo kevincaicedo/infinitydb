@@ -23,10 +23,10 @@
 //!   pass's two heads), and the drawn wait's `release` before its `complete`. Its P leg probes
 //!   through the route instead (`reserve` of a live key, answered `Duplicate`).
 //!
-//! The fast and deferred rows' class holds `<slots>` tasks, 2,500 or 10,000, and its future is padded so its slot
-//! takes the chunk of the `conn` class's (16 slots of 2,049 to 4,096 B), so the class walks the
-//! product's depth: one directory level at 2,500 slots, two at 10,000. The pad is a local held
-//! uninitialized across an await: the future is that large, and nothing writes the pad.
+//! The fast and deferred rows' class holds `<slots>` tasks, 2,500 or 10,000, and its future is
+//! padded so its slot takes the chunk of the `conn` class's (16 slots of 2,049 to 4,096 B), so the
+//! class walks the product's depth: one directory level at 2,500 slots, two at 10,000. The pad is a
+//! local held uninitialized across an await: the future is that large, and nothing writes the pad.
 //!
 //! Each op is one `#[inline(never)]` step through `&mut` of a long-lived owner, as the cell's loop
 //! drives its executor. After its loop each leg checks what its ops left behind and exits 1 when
@@ -241,7 +241,7 @@ fn drive_deferred(cap: Cap, ops: u64, step: fn(&mut DeferredCell) -> usize) -> R
     Ok(())
 }
 
-// ---- The slice's interface -----------------------------------------------------------------------
+// ---- The slice's interface ----------------------------------------------------------------------
 
 /// The fabric gate of one origin over `holders` slots, every unit its holders bound issuable.
 fn fabric_gate(holders: Cap) -> Result<FabricGate<u64>, String> {
@@ -262,7 +262,7 @@ fn keyed_gate(cap: Cap) -> Result<KeyedGate<u64, u64>, String> {
     KeyedGate::build(cap, &census).map_err(|e| format!("the row's keyed gate: {e}"))
 }
 
-// ---- The suspend rows ----------------------------------------------------------------------------
+// ---- The suspend rows ---------------------------------------------------------------------------
 
 /// The suspend rows' gates: 1,024 and 16,384 holders at one directory level, 65,536 at two.
 const HOLDERS_1024: Cap = Cap::entries::<1_024>("executor-ab-holders-1024", CapFill::Serving);
@@ -356,7 +356,7 @@ fn drive_suspend(holders: Cap, ops: u64, step: fn(&mut SuspendCell) -> bool) -> 
     Ok(())
 }
 
-// ---- The keyed rows ------------------------------------------------------------------------------
+// ---- The keyed rows -----------------------------------------------------------------------------
 
 /// The keyed rows' live routes, and their gates' caps: one more, the slot an op admits into
 /// before it completes a drawn route. 2,496 is the cold gate's default, 159,744 its ceiling.
