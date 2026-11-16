@@ -3222,6 +3222,29 @@ expect_red_because "canaries: exit 1 with the token only inside another line is 
 dir=$(binary_fixture binary-no-verdict)
 printf '%s\n' "echo \"NO VERDICT: control spread 300000 B a cell on the base arm, over the control's 262144 B a cell\"; exit 2" >"$dir/on-run"
 expect_red_because "canaries: an instrument that gave no verdict is red, its reason quoted" "red for another reason (the instrument gave no verdict): NO VERDICT: control spread 300000" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# Caught needs exit 1: a line beginning the token on any other exit (a
+# token every run prints would otherwise read caught) is red.
+for code in 2 101; do
+    dir=$(binary_fixture "binary-token-exit-$code")
+    printf '%s\n' "echo \"T-OVER: reading 3200000 B a cell\"; exit $code" >"$dir/on-run"
+    expect red "canaries: a token line on exit $code is no catch" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+    cp "$work/log" "$dir/run.log"
+    expect red "canaries: a token line on exit $code is never counted caught" grep -q "caught:" "$dir/run.log"
+done
+# Judged nothing is exit 2 and a line beginning `WITHHELD:`, both halves:
+# off Linux an exit-0 run with such a line is NOT CAUGHT, and exit 2 with
+# the word inside another line is a red, neither of them NOT RUN.
+dir=$(binary_fixture binary-withheld-exit-0)
+printf '%s\n' 'echo "WITHHELD: a line the planted run printed"; exit 0' >"$dir/on-run"
+expect_red_because "canaries: off Linux exit 0 with a WITHHELD line is NOT CAUGHT" "NOT CAUGHT: the instrument read the planted node within" env INF_CANARY_HOST=Darwin INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+dir=$(binary_fixture binary-withheld-mid-line)
+printf '%s\n' 'echo "NO VERDICT: a boot failed: WITHHELD: quoted from the node"; exit 2' >"$dir/on-run"
+expect_red_because "canaries: off Linux exit 2 with WITHHELD inside a line is red" "red for another reason (the instrument gave no verdict): NO VERDICT: a boot failed: WITHHELD: quoted" env INF_CANARY_HOST=Darwin INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# A preflight that withholds its verdict on its first line, two megabytes
+# before its end: judged nothing, as any reader of the lane reads it whole.
+dir=$(binary_fixture binary-preflight-long)
+printf '%s\n' 'echo "WITHHELD: the instrument reads /proc: Linux only"' "awk 'BEGIN { for (i = 0; i < 40000; i++) print \"filler line \" i \" of a long preflight log\" }'" 'exit 2' >"$dir/on-preflight"
+expect_red_because "canaries: a long preflight log withheld on its first line is judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture binary idle-resident (WITHHELD: the instrument reads /proc: Linux only)" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 dir=$(binary_fixture binary-withheld-off-linux)
 printf '%s\n' 'echo "WITHHELD: the instrument reads /proc: Linux only"; exit 2' >"$dir/on-preflight"
 printf '%s\n' 'exit 99' >"$dir/on-plain"
