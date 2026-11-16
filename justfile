@@ -82,6 +82,11 @@ check:
     # The fabric key past its generation field: `--workspace` leaves inf-runtime's
     # `fault-points` off, so its one test runs here (ADR-0194 A2).
     cargo nextest run --no-fail-fast -p inf-runtime --features fault-points --test gate
+    # The near-wrap leg's control, under `cfg(all(test, feature = "dst"))`: the workspace's
+    # build carries `dst` through crash-matrix's dev edge to inf-sim, so the workspace's nextest
+    # line runs it too. Named here alone, it is red when no test matches: a build that drops it
+    # reads red, never a green that ran nothing (ADR-0194 A2).
+    cargo nextest run --no-fail-fast --workspace --no-tests=fail -E 'package(inf-sim) & test(=harness::capacity::near_wrap::tests::the_leg_at_the_default_generation_is_unengaged)'
     # Slim-build lane (L11, ADR-0041 D3): a docless server carries zero
     # document/path code and must keep compiling that way — warnings
     # denied since ADR-0125 A2 (a doc-only const warned here for months).
