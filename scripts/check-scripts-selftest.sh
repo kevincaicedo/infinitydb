@@ -3240,6 +3240,11 @@ expect_red_because "canaries: off Linux exit 0 with a WITHHELD line is NOT CAUGH
 dir=$(binary_fixture binary-withheld-mid-line)
 printf '%s\n' 'echo "NO VERDICT: a boot failed: WITHHELD: quoted from the node"; exit 2' >"$dir/on-run"
 expect_red_because "canaries: off Linux exit 2 with WITHHELD inside a line is red" "red for another reason (the instrument gave no verdict): NO VERDICT: a boot failed: WITHHELD: quoted" env INF_CANARY_HOST=Darwin INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# A planted run whose token line comes first, two megabytes before its
+# end: caught, as the token's reader reads the log whole.
+dir=$(binary_fixture binary-token-long)
+printf '%s\n' 'echo "T-OVER: reading 3200000 B a cell"' "awk 'BEGIN { for (i = 0; i < 40000; i++) print \"filler line \" i \" of a long instrument log\" }'" 'exit 1' >"$dir/on-run"
+expect green "canaries: a long instrument log with its token line first is a catch" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
 # A preflight that withholds its verdict on its first line, two megabytes
 # before its end: judged nothing, as any reader of the lane reads it whole.
 dir=$(binary_fixture binary-preflight-long)
@@ -3350,21 +3355,56 @@ dir=$(long_fixture long-table)
 } >"$dir/rows"
 expect_red_because "canaries: a long table's early misplaced row is refused" "a row out of its cfg's place: inf_canary_a crate-test fake test:suite the_row (after inf_canary_b)" env INF_CANARY_TABLE_ONLY=1 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 # awk_readers_whole <script>: zero when no awk program in the script calls
-# `exit` outside its END block; else each such line, non-zero. Every awk in
+# `exit` before its END block; else each such line, non-zero. Every awk in
 # sim-canaries.sh reads a pipe, so that is the shape that cuts its writer.
+# A program starts at the first `'` after the word `awk` that a blank comes
+# before, so options (`-v t="$1"`, `-F:`, `-F'\t'`) come first; it ends at
+# its next `'`; from its `END {` on, an `exit` is the verdict's. A comment
+# line outside a program is not read.
 awk_readers_whole() {
     LC_ALL=C awk '
+        # The index of the program text after line[from..], or 0.
+        function program_at(line, from,    i, ch, n) {
+            n = length(line)
+            for (i = from; i <= n; i++) {
+                ch = substr(line, i, 1)
+                if (ch == "\"") {
+                    i = index_from(line, "\"", i + 1)
+                    if (i == 0) return 0
+                } else if (ch == "'\''") {
+                    if (substr(line, i - 1, 1) ~ /[ \t]/) return i + 1
+                    i = index_from(line, "'\''", i + 1)
+                    if (i == 0) return 0
+                } else if (ch == "|" || ch == ";") {
+                    return 0
+                }
+            }
+            return 0
+        }
+        function index_from(line, ch, from,    at) {
+            at = index(substr(line, from), ch)
+            return at ? from + at - 1 : 0
+        }
         {
             text = $0
             if (!inawk) {
-                at = index(text, "awk '\''")
-                if (at == 0) next
-                text = substr(text, at + 5)
+                if (text ~ /^[ \t]*#/) next
+                if (!match(text, /(^|[^A-Za-z0-9_.-])awk[ \t]/)) next
+                start = program_at(text, RSTART + RLENGTH - 1)
+                if (start == 0) next
+                text = substr(text, start)
                 inawk = 1
+                seen_end = 0
             }
             close_at = index(text, "'\''")
             body = close_at ? substr(text, 1, close_at - 1) : text
-            if (body ~ /(^|[^A-Za-z_])exit([^A-Za-z_]|$)/ && body !~ /END[ \t]*[{]/) {
+            if (!seen_end && match(body, /END[ \t]*[{]/)) {
+                body = substr(body, 1, RSTART - 1)
+                seen_end = 1
+            } else if (seen_end) {
+                body = ""
+            }
+            if (body ~ /(^|[^A-Za-z_])exit([^A-Za-z_]|$)/) {
                 print FILENAME ":" FNR ": " $0
                 found = 1
             }
@@ -3384,6 +3424,20 @@ dir=$(long_fixture long-reader-lint)
 } >"$dir/early.sh"
 expect red "canaries: the reader check sees an awk that exits before its END" awk_readers_whole "$dir/early.sh"
 expect_output "canaries: the reader check names each early exit, one-line programs too" "early.sh:6: short()" awk_readers_whole "$dir/early.sh"
+# Each shape of an early exit is its own plant: beside its END on one line,
+# after a `-v`, after `-F:`, after a quoted `-F'\t'`.
+printf '%s\n' "one() { tr -d x <\"\$1\" | awk '/x/ { found = 1; exit } END { exit !found }'; }" >"$dir/beside-end.sh"
+expect red "canaries: the reader check sees an exit beside END on one line" awk_readers_whole "$dir/beside-end.sh"
+printf '%s\n' "two() {" "  tr -d x <\"\$2\" | LC_ALL=C awk -v TOKEN=\"\$1:\" '" "    index(\$0, TOKEN) == 1 { print; found = 1; exit }" "    END { exit !found }'" "}" >"$dir/option-v.sh"
+expect red "canaries: the reader check sees an exit in an awk with -v before its program" awk_readers_whole "$dir/option-v.sh"
+printf '%s\n' "three() { tr -d x <\"\$1\" | awk -F: '\$1 == \"x\" { print \$2; exit }'; }" >"$dir/option-f.sh"
+expect red "canaries: the reader check sees an exit in an awk with -F: before its program" awk_readers_whole "$dir/option-f.sh"
+printf '%s\n' "four() { tr -d x <\"\$1\" | awk -F'\\t' '\$1 == \"x\" { print \$2; exit }'; }" >"$dir/option-f-quoted.sh"
+expect red "canaries: the reader check sees an exit after a quoted -F argument" awk_readers_whole "$dir/option-f-quoted.sh"
+# The whole-input shapes stay green: an exit in END on the same line, after
+# a -v; and a comment naming awk with a quote.
+printf '%s\n' "# an awk's early exit cuts its writer: 'exit' here is prose" "five() { tr -d x <\"\$1\" | awk -v t=1 '!found && /x/ { found = 1 } END { exit !found }'; }" >"$dir/whole.sh"
+expect green "canaries: the reader check passes an exit in END and a comment" awk_readers_whole "$dir/whole.sh"
 }
 
 # --------------------------------------------------- release-assert inventory
