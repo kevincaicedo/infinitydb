@@ -590,8 +590,9 @@ impl Rig {
     }
 
     /// The leg's report: every cell's cap census judged after its last
-    /// iteration (the cap bound, the assembly rule and their liveness), and
-    /// the state hash over the readings and every cell's keyspace.
+    /// iteration (the cap bound, the assembly rule, their liveness and the
+    /// gates' derived counts), and the state hash over the readings and
+    /// every cell's keyspace.
     fn report(mut self, leg: CloseLeg) -> CapacityReport {
         self.violations.extend(self.owners.take_violations());
         // No op refused at a full per-origin deque (ADR-0177 D6; derived
@@ -602,21 +603,6 @@ impl Rig {
                 self.violate(format!("parked-refused: cell {cell}, {refused} op(s)"));
             }
         }
-        // The fabric gate filled no reserve and met no completion for a
-        // holder that does not await one (ADR-0177 D4; F4, derived never).
-        for cell in 0..self.cells.len() {
-            let (full, stale) = (self.plane(cell).gate_full(), self.plane(cell).gate_stale());
-            self.read("gate_full", full);
-            self.read("gate_stale", stale);
-            if full != 0 {
-                self.violate(format!("gate-full: cell {cell}, {full} reserve(s) on a full gate"));
-            }
-            if stale != 0 {
-                self.violate(format!(
-                    "gate-stale: cell {cell}, {stale} completion(s) for no holder"
-                ));
-            }
-        }
         let mut census = CensusVerdict::default();
         for (index, (_, plane)) in self.cells.iter().enumerate() {
             let facts = CellFacts {
@@ -625,6 +611,9 @@ impl Rig {
                 tiered_tables: plane.keyspace().tiered_tables(),
                 turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
                 maint_paced: self.nodes[index].tier_maint_task_waits.get(),
+                gate_full: plane.gate_full(),
+                gate_stale: plane.gate_stale(),
+                cold_gate_full: plane.cold_gate_full(),
             };
             census.judge(index, plane.cap_census(), facts);
         }
@@ -990,8 +979,8 @@ fn fan_leg(seed: u64) -> Rig {
     rig.until("the fans' replies", |rig| {
         fanners.iter().all(|&id| rig.clients[id].replies.len() > 1)
     });
-    // Named here, beside the replies a full gate stalls, and again with
-    // every cell's counters in the report.
+    // Named here, beside the replies a full gate stalls, and again by the
+    // report's census with every cell's counters.
     let full = rig.plane(X).gate_full();
     if full != 0 {
         rig.violate(format!("gate-full: cell {X}, {full} reserve(s) on a full gate by the fans"));

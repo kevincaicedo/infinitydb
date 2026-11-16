@@ -2275,7 +2275,8 @@ pub(crate) fn boot_meshed(
 impl Drop for Node {
     /// The end of a life: its state observed, every cell's cap census
     /// judged after the cell's last iteration (the cap bound, the assembly
-    /// rule and their liveness), and its nets' invariants drained.
+    /// rule, their liveness and the gates' derived counts), and its nets'
+    /// invariants drained.
     fn drop(&mut self) {
         self.observe_state(b"node-end");
         let mut verdict = crate::census::CensusVerdict::default();
@@ -2296,6 +2297,9 @@ impl Drop for Node {
                 tiered_tables,
                 turn_refused,
                 maint_paced,
+                gate_full: plane.gate_full(),
+                gate_stale: plane.gate_stale(),
+                cold_gate_full: plane.cold_gate_full(),
             };
             verdict.judge(index, plane.cap_census(), facts);
         }
@@ -2308,28 +2312,6 @@ impl Drop for Node {
                 verdict
                     .violations
                     .push(format!("PARKED REFUSED: cell {index}, {refused} ops, at a life's end"));
-            }
-        }
-        // The fabric gate (ADR-0177 D4): no reserve found every holder
-        // taken, and no completion named a holder that does not await one;
-        // the cold gate refused no read for a full gate. Each derived never,
-        // read from the plane at the life's end.
-        for (index, (_, plane)) in self.cells.iter().enumerate() {
-            let cold_full = plane.cold_gate_full();
-            if cold_full != 0 {
-                let line =
-                    format!("COLD GATE FULL: cell {index}, {cold_full} reads, at a life's end");
-                verdict.violations.push(line);
-            }
-            let (full, stale) = (plane.gate_full(), plane.gate_stale());
-            if full != 0 {
-                let line = format!("GATE FULL: cell {index}, {full} reserves, at a life's end");
-                verdict.violations.push(line);
-            }
-            if stale != 0 {
-                let line =
-                    format!("GATE STALE: cell {index}, {stale} completions, at a life's end");
-                verdict.violations.push(line);
             }
         }
         // The nets' own invariants and O1's breaches join the life's

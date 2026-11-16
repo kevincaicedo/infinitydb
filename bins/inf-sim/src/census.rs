@@ -28,6 +28,15 @@
 //!   simulated run reaches, so a pace there is a room read short. The
 //!   count's liveness is the room's crate test, which reads 1 at a one-slot
 //!   room.
+//! - **The gates' derived rules** (ADR-0177 D4): no reserve of the fabric
+//!   gate found every holder taken (`gate_full = 0`, token `gate-full`), no
+//!   completion found no holder awaiting it (`gate_stale = 0`, token
+//!   `gate-stale`), and the cold gate refused no read for a full route or
+//!   holder table (`cold_gate_full = 0`, token `cold-gate-full`). Each is
+//!   derived never: the fabric gate's holders cover every task's units and
+//!   the orphans its peers' credits allow, an Orphaned holder waits for its
+//!   one late completion, and the cold gate's, while its cap is its product
+//!   and not its ceiling, cover every read its pool can hold.
 //! - Liveness: a server cell has its timer owners' row, which its plane
 //!   builds before its loop exists, and on a node of more than one cell the
 //!   rows of its three per-origin deques (ADR-0177 D6: `ns-applies`,
@@ -67,8 +76,9 @@ const PARKED_ROWS: [&str; 3] = [
     inf_server::limits::GATED_VERDICTS.name(),
 ];
 
-/// What a cell's planes hold at the end of a life, beside its census.
-#[derive(Clone, Copy, Debug, Default)]
+/// What a cell's planes hold at the end of a life, beside its census. No
+/// `Default`: a site that builds the facts names every one it read.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct CellFacts {
     /// The cell is a server plane, which builds its timer set and its
     /// owners before its loop exists.
@@ -85,6 +95,13 @@ pub(crate) struct CellFacts {
     /// Namespaces the cell's MAINTAIN passes left for a later pass because
     /// their task class had no room (`tier_maint_task_waits`).
     pub(crate) maint_paced: u64,
+    /// The fabric gate's reserves that found every holder taken.
+    pub(crate) gate_full: u64,
+    /// The fabric gate's completions for no holder that awaits one.
+    pub(crate) gate_stale: u64,
+    /// The cold gate's reads refused for no free route or holder (0 on a
+    /// cell with no cold engine).
+    pub(crate) cold_gate_full: u64,
 }
 
 /// The census verdict of one run: every cell of every life it judged.
@@ -145,6 +162,7 @@ impl CensusVerdict {
         marks_crossed(cell, census, SEAL_MARKS_ROW, "seal-marks-crossed", &mut self.violations);
         marks_crossed(cell, census, HOLE_MARKS_ROW, "hole-marks-crossed", &mut self.violations);
         maint_paced(cell, facts.maint_paced, &mut self.violations);
+        gates_derived(cell, &facts, &mut self.violations);
         let Some(refused) = facts.turn_refused else { return };
         if census.row(EXTENT_WINDOW_ROW).is_none() {
             self.violations.push(format!(
@@ -207,6 +225,39 @@ fn maint_paced(cell: usize, paced: u64, violations: &mut Violations) {
     }
 }
 
+/// The gates' derived rules: each count above 0 is red, under its token.
+fn gates_derived(cell: usize, facts: &CellFacts, violations: &mut Violations) {
+    // Derived never: the fabric gate's holders cover every task's units and
+    // the orphans its peers' credits allow (ADR-0177 D4).
+    if facts.gate_full > 0 {
+        violations.push(format!(
+            "FABRIC GATE VIOLATION cell {cell}: gate-full — {} reserve(s) found every holder \
+             taken",
+            facts.gate_full
+        ));
+    }
+    // Derived never: an Orphaned holder waits for its request's one
+    // completion, so no completion finds a later occupant (ADR-0177 D4).
+    if facts.gate_stale > 0 {
+        violations.push(format!(
+            "FABRIC GATE VIOLATION cell {cell}: gate-stale — {} completion(s) for no holder \
+             that awaits one",
+            facts.gate_stale
+        ));
+    }
+    // Derived never while the cap is its product, `overflow_cap × (2 + P)`
+    // unclamped: every queued read holds one holder and every other is a
+    // member's of one of the pool's `P` reads (ADR-0177 D4). A clamped cap
+    // can refuse, and that red is the clamp's, not a lost holder.
+    if facts.cold_gate_full > 0 {
+        violations.push(format!(
+            "COLD GATE VIOLATION cell {cell}: cold-gate-full — {} read(s) refused for no free \
+             route or holder",
+            facts.cold_gate_full
+        ));
+    }
+}
+
 /// The cap bound on one row: its high water above its cap is red.
 fn over_cap(cell: usize, row: &CapRow, violations: &mut Violations) {
     if row.high_water > row.entries_max {
@@ -243,6 +294,21 @@ mod tests {
 
     use super::*;
 
+    /// A cell that holds nothing beside its census: no server plane, no
+    /// tiered namespace, no durable plane and every count 0.
+    fn bare() -> CellFacts {
+        CellFacts {
+            server_plane: false,
+            peers: 0,
+            tiered_tables: 0,
+            turn_refused: None,
+            maint_paced: 0,
+            gate_full: 0,
+            gate_stale: 0,
+            cold_gate_full: 0,
+        }
+    }
+
     /// The liveness red: a cell with a tiered namespace and an empty census
     /// (no reclaim marks' row) fails, though neither rule has a row to read.
     #[test]
@@ -250,11 +316,7 @@ mod tests {
         let (census, serve_mark) = CapCensus::new(CellId(0));
         serve_mark.take();
         let mut verdict = CensusVerdict::default();
-        verdict.judge(
-            0,
-            &census,
-            CellFacts { tiered_tables: 1, turn_refused: None, ..CellFacts::default() },
-        );
+        verdict.judge(0, &census, CellFacts { tiered_tables: 1, turn_refused: None, ..bare() });
         assert_eq!(verdict.rows_checked, 0);
         assert_eq!(verdict.violations.len(), 3, "{:?}", verdict.violations);
         for (violation, row) in
@@ -264,15 +326,11 @@ mod tests {
             assert!(violation.contains(row), "{violation}");
         }
         let mut durable = CensusVerdict::default();
-        durable.judge(
-            0,
-            &census,
-            CellFacts { tiered_tables: 0, turn_refused: Some(0), ..CellFacts::default() },
-        );
+        durable.judge(0, &census, CellFacts { tiered_tables: 0, turn_refused: Some(0), ..bare() });
         assert_eq!(durable.violations.len(), 1, "{:?}", durable.violations);
         assert!(durable.violations[0].contains("extent-window"), "{:?}", durable.violations);
         let mut control = CensusVerdict::default();
-        control.judge(0, &census, CellFacts::default());
+        control.judge(0, &census, bare());
         assert!(control.violations.is_empty(), "no tiered namespace, no row owed");
     }
 
@@ -282,7 +340,7 @@ mod tests {
     #[test]
     fn a_server_cell_with_peers_without_its_parked_rows_is_red() {
         const TIMERS: Cap = Cap::entries::<1>("timer-owners", CapFill::Serving);
-        let facts = CellFacts { server_plane: true, peers: 2, ..CellFacts::default() };
+        let facts = CellFacts { server_plane: true, peers: 2, ..bare() };
         let (bare, serve_mark) = CapCensus::new(CellId(1));
         let _owners = CappedSlab::<u8, u64, Retire>::builder(TIMERS, &bare).expect("built");
         serve_mark.take();
@@ -322,7 +380,7 @@ mod tests {
     /// `timer-owners` row is red; with the row its assembly builds, green.
     #[test]
     fn a_server_cell_without_its_timer_owners_row_is_red() {
-        let facts = CellFacts { server_plane: true, ..CellFacts::default() };
+        let facts = CellFacts { server_plane: true, ..bare() };
         let (bare, serve_mark) = CapCensus::new(CellId(1));
         serve_mark.take();
         let mut red = CensusVerdict::default();
@@ -348,19 +406,11 @@ mod tests {
         serve_mark.take();
         let _window = CappedDeque::<u64, Reserve>::new(WINDOW, &census).expect("built");
         let mut red = CensusVerdict::default();
-        red.judge(
-            3,
-            &census,
-            CellFacts { tiered_tables: 0, turn_refused: Some(1), ..CellFacts::default() },
-        );
+        red.judge(3, &census, CellFacts { tiered_tables: 0, turn_refused: Some(1), ..bare() });
         assert_eq!(red.violations.len(), 1, "{:?}", red.violations);
         assert!(red.violations[0].contains("turn-refused"), "{:?}", red.violations);
         let mut green = CensusVerdict::default();
-        green.judge(
-            3,
-            &census,
-            CellFacts { tiered_tables: 0, turn_refused: Some(0), ..CellFacts::default() },
-        );
+        green.judge(3, &census, CellFacts { tiered_tables: 0, turn_refused: Some(0), ..bare() });
         assert!(green.violations.is_empty(), "{:?}", green.violations);
     }
 
@@ -371,11 +421,35 @@ mod tests {
         let (census, serve_mark) = CapCensus::new(CellId(2));
         serve_mark.take();
         let mut red = CensusVerdict::default();
-        red.judge(2, &census, CellFacts { maint_paced: 1, ..CellFacts::default() });
+        red.judge(2, &census, CellFacts { maint_paced: 1, ..bare() });
         assert_eq!(red.violations.len(), 1, "{:?}", red.violations);
         assert!(red.violations[0].contains("maint-paced"), "{:?}", red.violations);
         let mut green = CensusVerdict::default();
-        green.judge(2, &census, CellFacts { maint_paced: 0, ..CellFacts::default() });
+        green.judge(2, &census, CellFacts { maint_paced: 0, ..bare() });
+        assert!(green.violations.is_empty(), "{:?}", green.violations);
+    }
+
+    /// The gates' derived rules: each count planted at 1 is red, alone, by its own token; every
+    /// count at 0 is green. The cold gate's token ends in the fabric gate's, so each red is read
+    /// whole between the cell and the dash.
+    #[test]
+    fn a_gate_count_above_zero_is_red_by_its_token() {
+        let (census, serve_mark) = CapCensus::new(CellId(2));
+        serve_mark.take();
+        let planted = [
+            (CellFacts { gate_full: 1, ..bare() }, "gate-full"),
+            (CellFacts { gate_stale: 1, ..bare() }, "gate-stale"),
+            (CellFacts { cold_gate_full: 1, ..bare() }, "cold-gate-full"),
+        ];
+        for (facts, token) in planted {
+            let mut red = CensusVerdict::default();
+            red.judge(2, &census, facts);
+            assert_eq!(red.violations.len(), 1, "{token}: {:?}", red.violations);
+            let named = format!("cell 2: {token} —");
+            assert!(red.violations[0].contains(&named), "{token}: {:?}", red.violations);
+        }
+        let mut green = CensusVerdict::default();
+        green.judge(2, &census, bare());
         assert!(green.violations.is_empty(), "{:?}", green.violations);
     }
 
@@ -392,7 +466,7 @@ mod tests {
                 *back = new;
             }
         }
-        let facts = CellFacts { tiered_tables: 1, ..CellFacts::default() };
+        let facts = CellFacts { tiered_tables: 1, ..bare() };
         let (census, serve_mark) = CapCensus::new(CellId(5));
         serve_mark.take();
         let epoch = Cap::entries::<16>("epoch-marks", CapFill::Serving);
@@ -425,7 +499,7 @@ mod tests {
     fn a_census_never_marked_is_red() {
         let (census, _serve_mark) = CapCensus::new(CellId(2));
         let mut verdict = CensusVerdict::default();
-        verdict.judge(2, &census, CellFacts::default());
+        verdict.judge(2, &census, bare());
         assert_eq!(verdict.violations.len(), 1);
         assert!(verdict.violations[0].contains("census-never-marked"));
         assert!(!verdict.violations[0].contains("cap-assembly-violated"));
@@ -460,11 +534,7 @@ mod tests {
             }
         }
         let mut verdict = CensusVerdict::default();
-        verdict.judge(
-            1,
-            &census,
-            CellFacts { tiered_tables: 1, turn_refused: None, ..CellFacts::default() },
-        );
+        verdict.judge(1, &census, CellFacts { tiered_tables: 1, turn_refused: None, ..bare() });
         assert_eq!(verdict.rows_checked, 4);
         assert!(verdict.violations.is_empty(), "full rows are within their caps: {verdict:?}");
         // A row past its cap: no correct container writes one, so a row
@@ -518,7 +588,7 @@ mod tests {
             slot.publish(9);
         }
         let mut verdict = CensusVerdict::default();
-        verdict.judge(4, &census, CellFacts::default());
+        verdict.judge(4, &census, bare());
         assert!(verdict.violations.is_empty(), "{:?}", verdict.violations);
         let row = census.row("retire-slab").expect("row");
         let shape = (row.entries_max, row.capacity_now, row.high_water, row.crossings);
@@ -554,7 +624,7 @@ mod tests {
             key += 1 << 40;
         }
         let mut verdict = CensusVerdict::default();
-        verdict.judge(6, &census, CellFacts::default());
+        verdict.judge(6, &census, bare());
         assert!(verdict.violations.is_empty(), "{:?}", verdict.violations);
         let row = census.row("crossing-map").expect("row");
         let shape = (row.entries_max, row.capacity_now, row.high_water, row.crossings);
