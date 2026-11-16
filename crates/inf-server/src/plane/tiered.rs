@@ -72,12 +72,24 @@ const ERR_BLOB_READ: &str = "ERR blob extent read failed (tier I/O error)";
 const ERR_TOO_LARGE: &str = "ERR value exceeds BLOB-MAX for this namespace";
 const ERR_OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 
-/// Outcome of one tiered command.
-pub(super) enum TieredReply {
+/// Outcome of one tiered command under its apply's gate (ADR-0015 D6).
+pub(super) enum TieredReply<G> {
     Done(OwnedReply),
     /// An `always`-class write: the reply may only ship once the fsync
     /// watermark covers `seq` (§8.2 — ack after fsync).
+    /// `gate` is what it waits behind.
     Gated {
+        reply: OwnedReply,
+        seq: u64,
+        gate: G,
+    },
+}
+
+/// What one tiered command did: its producers report, its gate decides.
+pub(super) enum TierWrite {
+    Done(OwnedReply),
+    /// A write that staged its durable effect at `seq`, in any class.
+    Staged {
         reply: OwnedReply,
         seq: u64,
     },
@@ -217,20 +229,50 @@ impl WriteGuard {
     }
 }
 
-/// One tiered command, executed to a complete reply. `class` is the
-/// namespace's fsync class (tiered ⊆ durable — ADR-0062 D1).
-pub(super) async fn dispatch_tiered<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+/// One tiered command, executed to a complete reply under its apply's gate:
+/// it stages with the gate's reading's fsync class (tiered ⊆ durable —
+/// ADR-0062 D1), and a staged write's reply is gated when the gate waits.
+/// One future, so the gate is held across the command beside its arguments
+/// and never copied into a second frame.
+pub(super) async fn dispatch_tiered<O, F, G>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     ns: NsId,
     meta: &'static inf_wire::CommandMeta,
     argv: &[&[u8]],
     proto: Protocol,
-    class: Option<FsyncClass>,
-) -> TieredReply {
+    gate: ApplyGate<G>,
+) -> TieredReply<G>
+where
+    O: PlaneObserver + 'static,
+    F: SegmentFs + Clone + 'static,
+{
     let started = shared.now.get();
     let cold_before = cold_issued(shared);
-    let outcome = run_command(shared, ns, meta, argv, proto, class).await;
+    let outcome = run_command(shared, ns, meta, argv, proto, gate.read().class()).await;
+    note_served(shared, origin, ns, argv, (started, cold_before), &outcome);
+    let (reply, staged) = match outcome {
+        TierWrite::Done(reply) => (reply, None),
+        TierWrite::Staged { reply, seq } => (reply, Some(seq)),
+    };
+    match gate.settle(staged) {
+        Some((seq, gate)) => TieredReply::Gated { reply, seq, gate },
+        None => TieredReply::Done(reply),
+    }
+}
+
+/// A served tiered command's service time and execution, recorded after its
+/// reply is complete; `before` is the loop clock and the cold reads issued
+/// when it began.
+fn note_served<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    origin: ExecOrigin,
+    ns: NsId,
+    argv: &[&[u8]],
+    before: (Nanos, u64),
+    outcome: &TierWrite,
+) {
+    let (started, cold_before) = before;
     // Split service histograms (ADR-0064 D3): µs on the loop clock,
     // lane-tagged by whether this command issued any cold read. The
     // loop clock is frozen per reactor iteration, so a command that
@@ -248,8 +290,8 @@ pub(super) async fn dispatch_tiered<O: PlaneObserver + 'static, F: SegmentFs + C
             tier.ram_hit_us.record(elapsed);
         }
     }
-    let reply_bytes = match &outcome {
-        TieredReply::Done(r) | TieredReply::Gated { reply: r, .. } => r.bytes(),
+    let reply_bytes = match outcome {
+        TierWrite::Done(r) | TierWrite::Staged { reply: r, .. } => r.bytes(),
     };
     shared.observer.borrow_mut().on_execute(
         shared.cell,
@@ -259,7 +301,6 @@ pub(super) async fn dispatch_tiered<O: PlaneObserver + 'static, F: SegmentFs + C
         reply_bytes,
         shared.now.get(),
     );
-    outcome
 }
 
 fn cold_issued<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -281,7 +322,7 @@ async fn run_command<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     match meta.id {
         CommandId::Get => read_value(shared, ns, argv.arg(1), proto).await,
         CommandId::Mget => mget(shared, ns, argv, proto).await,
@@ -325,10 +366,10 @@ fn done_error<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     message: &str,
-) -> TieredReply {
+) -> TierWrite {
     let mut reply = OpenReply::new(shared.take_reply_buf());
     RespWriter::new(reply.reply(), proto).error(message);
-    TieredReply::Done(reply.finish())
+    TierWrite::Done(reply.finish())
 }
 
 // ---- resolution (the hardened fetch-verify-retry shape) ----
@@ -674,7 +715,7 @@ async fn read_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     key: &[u8],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let hash = shared.hasher.hash(key);
     let mut reply = OpenReply::new(shared.take_reply_buf());
     let mut w = RespWriter::new(reply.reply(), proto);
@@ -700,7 +741,7 @@ async fn read_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => w.bulk(&value),
         Resolved::Fail(message) => w.error(message),
     }
-    TieredReply::Done(reply.finish())
+    TierWrite::Done(reply.finish())
 }
 
 async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -708,7 +749,7 @@ async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     argv: &[&[u8]],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let mut reply = OpenReply::new(shared.take_reply_buf());
     RespWriter::new(reply.reply(), proto).array_header(argv.len() - 1);
     for key in &argv[1..] {
@@ -730,11 +771,11 @@ async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             Resolved::Fail(message) => {
                 reply.clear();
                 RespWriter::new(reply.reply(), proto).error(message);
-                return TieredReply::Done(reply.finish());
+                return TierWrite::Done(reply.finish());
             }
         }
     }
-    TieredReply::Done(reply.finish())
+    TierWrite::Done(reply.finish())
 }
 
 async fn exists<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -742,7 +783,7 @@ async fn exists<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     argv: &[&[u8]],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let mut count = 0i64;
     for key in &argv[1..] {
         let hash = shared.hasher.hash(key);
@@ -758,7 +799,7 @@ async fn exists<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     }
     let mut reply = OpenReply::new(shared.take_reply_buf());
     RespWriter::new(reply.reply(), proto).int(count);
-    TieredReply::Done(reply.finish())
+    TierWrite::Done(reply.finish())
 }
 
 async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -766,7 +807,7 @@ async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     key: &[u8],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let hash = shared.hasher.hash(key);
     let mut reply = OpenReply::new(shared.take_reply_buf());
     let mut w = RespWriter::new(reply.reply(), proto);
@@ -783,7 +824,7 @@ async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         }
         Resolved::Fail(message) => w.error(message),
     }
-    TieredReply::Done(reply.finish())
+    TierWrite::Done(reply.finish())
 }
 
 async fn type_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -791,7 +832,7 @@ async fn type_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     key: &[u8],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let hash = shared.hasher.hash(key);
     let mut reply = OpenReply::new(shared.take_reply_buf());
     let mut w = RespWriter::new(reply.reply(), proto);
@@ -800,7 +841,7 @@ async fn type_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         Resolved::Miss => w.simple("none"),
         Resolved::Fail(message) => w.error(message),
     }
-    TieredReply::Done(reply.finish())
+    TierWrite::Done(reply.finish())
 }
 
 async fn ttl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -808,7 +849,7 @@ async fn ttl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     key: &[u8],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let hash = shared.hasher.hash(key);
     let mut reply = OpenReply::new(shared.take_reply_buf());
     let mut w = RespWriter::new(reply.reply(), proto);
@@ -818,7 +859,7 @@ async fn ttl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         Resolved::Miss => w.int(-2),
         Resolved::Fail(message) => w.error(message),
     }
-    TieredReply::Done(reply.finish())
+    TierWrite::Done(reply.finish())
 }
 
 async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -826,7 +867,7 @@ async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     argv: &[&[u8]],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let (Some(start), Some(end)) = (parse_i64(argv.arg(2)), parse_i64(argv.arg(3))) else {
         return done_error(shared, proto, "ERR value is not an integer or out of range");
     };
@@ -855,7 +896,7 @@ async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => slice_of(&value, &mut w),
         Resolved::Fail(message) => w.error(message),
     }
-    TieredReply::Done(reply.finish())
+    TierWrite::Done(reply.finish())
 }
 
 async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -863,7 +904,7 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     argv: &[&[u8]],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let Some(cursor) = crate::exec::parse_cursor(argv.arg(1)) else {
         return done_error(shared, proto, "ERR invalid cursor");
     };
@@ -987,7 +1028,7 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     for key in &keys {
         w.bulk(key);
     }
-    TieredReply::Done(reply.finish())
+    TierWrite::Done(reply.finish())
 }
 
 /// `DBSIZE` on a tiered namespace (ADR-0093 A3): exact under open
@@ -1004,14 +1045,14 @@ async fn dbsize<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     match dbsize_count(shared, ns, proto).await {
         Ok(len) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
             RespWriter::new(reply.reply(), proto).int(len as i64);
-            TieredReply::Done(reply.finish())
+            TierWrite::Done(reply.finish())
         }
-        Err(reply) => TieredReply::Done(reply),
+        Err(reply) => TierWrite::Done(reply),
     }
 }
 
@@ -1296,21 +1337,16 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
 fn int_write_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
-    class: Option<FsyncClass>,
     outcome: Result<(u64, Option<Vec<u8>>), OwnedReply>,
     int_of: impl FnOnce(Option<&[u8]>) -> i64,
-) -> TieredReply {
+) -> TierWrite {
     match outcome {
         Ok((seq, old_value)) => {
             let mut reply = OpenReply::new(shared.take_reply_buf());
             RespWriter::new(reply.reply(), proto).int(int_of(old_value.as_deref()));
-            if class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply: reply.finish(), seq }
-            } else {
-                TieredReply::Done(reply.finish())
-            }
+            TierWrite::Staged { reply: reply.finish(), seq }
         }
-        Err(err) => TieredReply::Done(err),
+        Err(err) => TierWrite::Done(err),
     }
 }
 

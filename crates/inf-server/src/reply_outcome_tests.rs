@@ -422,7 +422,9 @@ fn reply_outcome_tiered_scan_refusal_is_the_reply() {
     let meta = lookup(leg[0]).expect("a registered command");
     let class = peer.store.borrow().ns_fsync_class(TIERED);
     let origin = ExecOrigin::Fabric(CellId(0));
-    let own = tiered::dispatch_tiered(peer, origin, TIERED, meta, leg, Protocol::Resp2, class);
+    let gate =
+        peer.gate_open(CellId(0), NsApplyRead::new(meta, class)).expect("a read opens no slot");
+    let own = tiered::dispatch_tiered(peer, origin, TIERED, meta, leg, Protocol::Resp2, gate);
     let tiered::TieredReply::Done(expected) = cells.drive(own, no_answer) else {
         panic!("a read is never gated on a durable write");
     };

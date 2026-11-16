@@ -2,6 +2,8 @@
 //! tier, durable cell, pools, tripwires, and the owned-command execution
 //! path (`execute_owned_into`) with its durability staging and admission.
 
+use core::convert::Infallible;
+
 use super::*;
 
 // ---- shared cell state (futures hold an Rc) -----------------------------------
@@ -29,19 +31,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         }
     }
 
-    /// The ticket an apply from `origin` opens its slot with before its
-    /// first effect (ADR-0177 D6), when its reading gates its verdict on this
-    /// cell's watermark; `Ok(None)` for every other apply, `Err` at a full
-    /// deque. An apply not gated after all drops it, which releases the slot.
+    /// The gate an apply from `origin` runs under ([`ApplyGate::open`]): its
+    /// slot opened before its first effect when its reading gates its
+    /// verdict on this cell's watermark (ADR-0177 D6), `Err` at a full deque.
     pub(super) fn gate_open(
         &self,
         origin: CellId,
         read: NsApplyRead,
-    ) -> Result<Option<GatedTicket>, ParkedFull> {
-        if !read.gates() {
-            return Ok(None);
-        }
-        GatedBook::open(&self.gated, origin).map(Some)
+    ) -> Result<ApplyGate<GatedTicket>, ParkedFull> {
+        ApplyGate::open(&self.gated, origin, read)
     }
 
     /// The divert, ADR-0083 D1's one statement: an apply from `from` in `ns`
@@ -569,12 +567,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         &self,
         from: CellId,
         argv: &[&[u8]],
-        read: NsApplyRead,
+        gate: ApplyGate<GatedTicket>,
         proto: Protocol,
         ns: NsId,
         program: bool,
         out: &mut ReplyBuf,
     ) -> NsApplyOutcome {
+        let read = gate.read;
         let NsApplyRead { meta, class } = read;
         let is_write = read.is_write();
         if let (Some(meta), Some(_)) = (meta, class)
@@ -631,21 +630,48 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         // at the reply's start (ADR-0190 D2) — a byte count, never a read
         // of the encoding.
         debug_assert!(!out.bytes().is_empty(), "every command writes at least one frame");
-        let mut outcome = NsApplyOutcome::Reply;
-        if is_write
-            && let (Some(meta), Some(class)) = (meta, class)
-            && stages(out.outcome(), meta.id)
-            && let Some(seq) = self.stage_durable_effects(ns, meta, argv, class)
-            && read.gates()
-        {
-            self.durable.borrow_mut().as_mut().expect("staged above").note_gated_ack();
-            outcome = NsApplyOutcome::Gated(seq);
-        }
+        let outcome = self.settle_ns_apply(gate, ns, argv, out);
         #[cfg(feature = "doc")]
         if let Some((keys, _)) = &bracket {
             self.store.borrow_mut().idx_bracket_commit(ns, keys);
         }
         outcome
+    }
+
+    /// An executed `ApplyNs`'s end (ADR-0177 D6): a write whose reply stages
+    /// stages its durable effects, then its gate settles on the staged `seq`,
+    /// and a gated verdict counts its ack.
+    fn settle_ns_apply(
+        &self,
+        gate: ApplyGate<GatedTicket>,
+        ns: NsId,
+        argv: &[&[u8]],
+        out: &ReplyBuf,
+    ) -> NsApplyOutcome {
+        let NsApplyRead { meta, class } = gate.read;
+        let staged = if gate.read.is_write()
+            && let (Some(meta), Some(class)) = (meta, class)
+            && stages(out.outcome(), meta.id)
+        {
+            self.stage_durable_effects(ns, meta, argv, class)
+        } else {
+            None
+        };
+        // Canary: an `always` write's error waits as a verdict for the next
+        // record's `seq`, not leaving at once.
+        #[cfg(inf_canary_error_reply_gated)]
+        let staged = staged.or_else(|| {
+            use crate::durable::ack_class::AckClasses;
+            let next = self.durable.borrow().as_ref().map(|durable| durable.staged_seq() + 1);
+            next.filter(|_| gate.waits.is_some())
+        });
+        match gate.settle(staged) {
+            Some((seq, ticket)) => {
+                self.durable.borrow_mut().as_mut().expect("staged above").note_gated_ack();
+                NsApplyOutcome::Gated(seq, ticket)
+            }
+            None => NsApplyOutcome::Reply,
+        }
     }
 
     /// Durable-write admission — one typed verdict for every path
@@ -737,9 +763,23 @@ impl NsApplyRead {
         NsApplyRead { meta: argv.first().and_then(|name| lookup(name)), class }
     }
 
+    /// The reading of a command whose row and namespace class the caller
+    /// read in this step.
+    pub(super) fn new(
+        meta: &'static inf_wire::CommandMeta,
+        class: Option<FsyncClass>,
+    ) -> NsApplyRead {
+        NsApplyRead { meta: Some(meta), class }
+    }
+
     /// The command's registry row.
     pub(super) fn meta(self) -> Option<&'static inf_wire::CommandMeta> {
         self.meta
+    }
+
+    /// The namespace's fsync class: the one a staged effect is staged with.
+    pub(super) fn class(self) -> Option<FsyncClass> {
+        self.class
     }
 
     fn is_write(self) -> bool {
@@ -754,12 +794,82 @@ impl NsApplyRead {
     }
 }
 
+/// One apply's gating decision (ADR-0015 D6, ADR-0177 D6), from its one
+/// reading, taken before its first effect: the reading, and what the
+/// apply's verdict waits behind when the reading gates it (an `always`
+/// write): a peer origin's [`GatedTicket`], a client's [`ClientAck`], and on
+/// a read-only leg nothing (`Infallible`). Its fields are private, so the
+/// constructors below are the only ones, and a `Gated` outcome holds what it
+/// waits behind.
+pub(super) struct ApplyGate<G> {
+    read: NsApplyRead,
+    waits: Option<G>,
+}
+
+/// A client's gated reply waits on its own ack-gate waiter, made at its arm
+/// (ADR-0015 D6): the gate carries no slot.
+pub(super) struct ClientAck;
+
+impl ApplyGate<GatedTicket> {
+    /// A peer origin's apply: its slot at the back of `origin`'s gated deque
+    /// opened now, before the apply's first effect, iff `read` gates (ADR-0177
+    /// D6); `Err` at a full deque. A gate that settles to nothing drops its
+    /// ticket, which releases the slot.
+    pub(super) fn open(
+        book: &Rc<GatedBook>,
+        origin: CellId,
+        read: NsApplyRead,
+    ) -> Result<ApplyGate<GatedTicket>, ParkedFull> {
+        let waits = if read.gates() { Some(GatedBook::open(book, origin)?) } else { None };
+        Ok(ApplyGate { read, waits })
+    }
+}
+
+impl ApplyGate<ClientAck> {
+    /// A client's command: its reply waits on its own waiter iff `read` gates.
+    pub(super) fn client(read: NsApplyRead) -> ApplyGate<ClientAck> {
+        ApplyGate { read, waits: read.gates().then_some(ClientAck) }
+    }
+}
+
+impl ApplyGate<Infallible> {
+    /// A read-only leg (a scatter program's): `None` when `read` gates, which
+    /// the leg refuses before any effect; its gate has nothing to wait behind.
+    pub(super) fn read_only(read: NsApplyRead) -> Option<ApplyGate<Infallible>> {
+        (!read.gates()).then_some(ApplyGate { read, waits: None })
+    }
+}
+
+impl<G> ApplyGate<G> {
+    /// The apply's one reading.
+    pub(super) fn read(&self) -> NsApplyRead {
+        self.read
+    }
+
+    /// The apply's end: `staged` is the `seq` of the effect it staged, if
+    /// any. `Some` iff it staged and its gate waits, with what it waits
+    /// behind; otherwise the wait drops (a ticket releases its slot). A
+    /// staged `seq` under an `always` reading whose gate does not wait is a
+    /// command that stages without the registry's WRITE bit: its reply would
+    /// leave before its fsync, so the cell stops first.
+    pub(super) fn settle(self, staged: Option<u64>) -> Option<(u64, G)> {
+        let ApplyGate { read, waits } = self;
+        let seq = staged?;
+        if let Some(gate) = waits {
+            return Some((seq, gate));
+        }
+        assert!(read.class != Some(FsyncClass::Always), "a staged `always` write's gate waits");
+        None
+    }
+}
+
 /// Owner-side verdict for one `ApplyNs`.
 pub(super) enum NsApplyOutcome {
     /// The reply is staged in the scratch range — ship it now.
     Reply,
-    /// `always` write: ship the reply only once seq is durable.
-    Gated(u64),
+    /// `always` write: ship the reply only once seq is durable; the verdict
+    /// goes into the ticket's slot.
+    Gated(u64, GatedTicket),
     /// Staging pressure (M4.5-S27, ADR-0083 D1): nothing executed or
     /// staged — the apply parks on the origin's FIFO pump and retries
     /// when the drain wakes it, instead of refusing with `-BUSY`.
@@ -1304,7 +1414,7 @@ impl GatedBook {
         let ticket = book.next[index].get();
         deques.publish_with(origin, &book.node, || Gated::Open { ticket })?;
         book.next[index].set(ticket.wrapping_add(1));
-        Ok(GatedTicket { book: Some(Rc::clone(book)), origin, ticket })
+        Ok(GatedTicket { book: Rc::clone(book), origin, ticket, filled: false })
     }
 
     /// Whether a verdict waits for the `gated` task.
@@ -1332,10 +1442,11 @@ impl GatedBook {
 /// origin's one open slot only.
 #[must_use = "a ticket is filled with its verdict, or its drop releases the slot"]
 pub(super) struct GatedTicket {
-    /// `None` once filled: the drop then releases nothing.
-    book: Option<Rc<GatedBook>>,
+    book: Rc<GatedBook>,
     origin: CellId,
     ticket: u32,
+    /// Set first by `fill`: the drop of a filled ticket releases nothing.
+    filled: bool,
 }
 
 impl GatedTicket {
@@ -1343,8 +1454,11 @@ impl GatedTicket {
     /// task publishes once the watermark covers its `seq`. The slot is the
     /// back of its origin's deque (`open`'s check); past that the verdict
     /// would wedge its origin behind a slot no fill reaches: the cell stops.
+    /// The ticket is disarmed before the compare, so a failed compare
+    /// unwinds through a drop that releases nothing: one panic.
     pub(super) fn fill(mut self, verdict: GatedVerdict) {
-        let Some(book) = self.book.take() else { return };
+        self.filled = true;
+        let book = &self.book;
         let mut deques = book.deques.borrow_mut();
         let index = deques.index(self.origin);
         let bytes = verdict.parked_bytes();
@@ -1361,25 +1475,20 @@ impl GatedTicket {
     }
 }
 
-/// A gated apply's verdict into its ticket's slot. A gated verdict with no
-/// ticket stops the cell: its reading gated it, so the slot was opened on that
-/// reading, and a verdict without its slot has no place in its origin's `seq`
-/// order.
-pub(super) fn gated_fill(ticket: Option<GatedTicket>, verdict: GatedVerdict) {
-    ticket.expect("a gated write opened its slot before its effect").fill(verdict);
-}
-
 impl Drop for GatedTicket {
     /// The apply was not gated (a reply, a park, a refusal, an arm that
     /// forgot, teardown): its slot goes, and the deque is as it was before
     /// the apply. Past the compare a pop would drop another apply's verdict,
     /// so the cell stops first.
     fn drop(&mut self) {
-        let Some(book) = self.book.take() else { return };
+        if self.filled {
+            return;
+        }
         // Canary: the drop releases nothing, and the slot stays open.
         if cfg!(inf_canary_gated_drop_kept) {
             return;
         }
+        let book = &self.book;
         let mut deques = book.deques.borrow_mut();
         let index = deques.index(self.origin);
         let back = deques.deques[index].back();
@@ -1591,6 +1700,53 @@ mod parked_tests {
         let other = || Gated::Verdict(verdict(2, 1));
         book.deques.borrow_mut().publish_with(CellId(0), &book.node, other).expect("room");
         drop(earlier);
+    }
+
+    /// R5 (ADR-0015 D6, ADR-0177 D6): over class × read or write × staged or
+    /// not, a gate settles to its wait iff its reading is an `always` write
+    /// and the apply staged; an unstaged waiting gate releases its slot, so
+    /// the origin's deque is its before-state. A client's gate reads the
+    /// same predicate.
+    #[test]
+    fn a_gate_settles_only_a_staged_write_of_a_gating_reading() {
+        let book = book(3, 4);
+        let classes = [None, Some(FsyncClass::Everysec), Some(FsyncClass::Always)];
+        for class in classes {
+            for meta in [lookup(b"GET"), lookup(b"SET")] {
+                for staged in [None, Some(7)] {
+                    let read = NsApplyRead { meta, class };
+                    let case = format!("{class:?}, write {}, staged {staged:?}", read.is_write());
+                    if class == Some(FsyncClass::Always) && !read.is_write() && staged.is_some() {
+                        continue; // the fail-stop, its own test below
+                    }
+                    let waits = class == Some(FsyncClass::Always) && read.is_write();
+                    let gate = ApplyGate::open(&book, CellId(0), read).expect("room");
+                    match gate.settle(staged) {
+                        Some((seq, ticket)) => {
+                            assert!(waits && staged == Some(seq), "{case}: settled to a wait");
+                            drop(ticket);
+                        }
+                        None => assert!(!(waits && staged.is_some()), "{case}: no wait"),
+                    }
+                    let deques = book.deques.borrow();
+                    let index = deques.index(CellId(0));
+                    assert!(deques.deques[index].is_empty(), "{case}: the before-state");
+                    drop(deques);
+                    let client = ApplyGate::client(read).settle(staged);
+                    assert_eq!(client.is_some(), waits && staged.is_some(), "{case}: a client");
+                }
+            }
+        }
+    }
+
+    /// R5: a staged `always` reading that is not a write (a command that
+    /// stages without the registry's WRITE bit) stops the cell before its
+    /// reply leaves.
+    #[test]
+    #[should_panic(expected = "a staged `always` write's gate waits")]
+    fn a_staged_always_reading_that_is_not_a_write_stops_the_cell() {
+        let read = NsApplyRead { meta: lookup(b"GET"), class: Some(FsyncClass::Always) };
+        let _ = ApplyGate::client(read).settle(Some(1));
     }
 
     /// The gated deque (ADR-0177 D3, D6): an open slot waits for nothing,

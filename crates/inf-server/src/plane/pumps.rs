@@ -49,7 +49,6 @@ async fn apply_parked<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     from: CellId,
     item: &NsApply,
 ) {
-    let origin = from.0;
     let argv = item.args.slices();
     // A scattered `DBSIZE` leg (the origin's `Counted` shape): this
     // cell's exact count as a typed integer — the tiered drain runs
@@ -88,13 +87,22 @@ async fn apply_parked<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     }
     // The verdict's slot before the tiered apply's first effect, its ticket
     // held across the cold reads (ADR-0177 D6).
-    let ticket = match shared.gate_open(from, read) {
-        Ok(ticket) => ticket,
+    let gate = match shared.gate_open(from, read) {
+        Ok(gate) => gate,
         Err(ParkedFull) => return refuse_parked(shared, from, item.token),
     };
-    match apply_tiered_one(shared, origin, item.ns, &argv, item.proto).await {
+    let applied = match tiered_meta(shared, read, &argv, item.proto) {
+        Ok(meta) => {
+            let origin = ExecOrigin::Fabric(from);
+            tiered::dispatch_tiered(shared, origin, item.ns, meta, &argv, item.proto, gate).await
+        }
+        Err(reply) => {
+            drop(gate);
+            tiered::TieredReply::Done(reply)
+        }
+    };
+    match applied {
         tiered::TieredReply::Done(reply) => {
-            drop(ticket);
             shared.fabric.borrow_mut().reply(
                 from,
                 item.token,
@@ -110,7 +118,7 @@ async fn apply_parked<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         // covers `seq`, and the origin matches it by token —
         // per-connection reply order is the origin's pending-FIFO's job,
         // not this queue's.
-        tiered::TieredReply::Gated { reply, seq } => {
+        tiered::TieredReply::Gated { reply, seq, gate: ticket } => {
             shared
                 .durable
                 .borrow_mut()
@@ -118,7 +126,7 @@ async fn apply_parked<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 .expect("tiered implies the durable plane")
                 .note_gated_ack();
             let verdict = GatedVerdict::new(shared, item.token, seq, reply);
-            gated_fill(ticket, verdict);
+            ticket.fill(verdict);
         }
     }
 }
@@ -152,16 +160,15 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
 ) {
     let (ns, proto, token, program) = (item.ns, item.proto, item.token, item.program);
     loop {
-        let ticket = match shared.gate_open(from, read) {
-            Ok(ticket) => ticket,
+        let gate = match shared.gate_open(from, read) {
+            Ok(gate) => gate,
             Err(ParkedFull) => return refuse_parked(shared, from, token),
         };
         let mut reply = OpenReply::new(shared.take_reply_buf());
-        let applied = shared.execute_ns_owned(from, argv, read, proto, ns, program, reply.reply());
+        let applied = shared.execute_ns_owned(from, argv, gate, proto, ns, program, reply.reply());
         let reply = reply.finish();
         match applied {
             NsApplyOutcome::Park => {
-                drop(ticket);
                 shared.recycle_reply_buf(reply.into_bytes());
                 let wait = {
                     let mut durable = shared.durable.borrow_mut();
@@ -172,15 +179,14 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 wait.await;
             }
             NsApplyOutcome::Reply => {
-                drop(ticket);
                 let outcome = wire_reply(reply.bytes(), reply.outcome());
                 shared.fabric.borrow_mut().reply(from, token, &outcome);
                 shared.recycle_reply_buf(reply.into_bytes());
                 return;
             }
-            NsApplyOutcome::Gated(seq) => {
+            NsApplyOutcome::Gated(seq, ticket) => {
                 let verdict = GatedVerdict::new(shared, token, seq, reply);
-                gated_fill(ticket, verdict);
+                ticket.fill(verdict);
                 return;
             }
         }
@@ -252,30 +258,25 @@ impl Future for YieldOnce {
     }
 }
 
-/// One fabric-origin tiered apply: validate and execute through the
-/// tiered arm. An `always` write returns its gated verdict — the caller
+/// One fabric-origin tiered apply's validation before the tiered arm runs
+/// it, in the pump's own future (no second frame holds the gate): its
+/// registry row, from the apply's one reading, and its arity, else the
+/// error reply. An `always` write's gated verdict goes to the caller, which
 /// queues it for the deferred-reply future (§8.2: the client-visible ack
 /// never precedes the owner's fsync), never awaiting it in FIFO custody.
-async fn apply_tiered_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+fn tiered_meta<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
-    origin: u16,
-    ns: NsId,
+    read: NsApplyRead,
     argv: &[&[u8]],
     proto: Protocol,
-) -> tiered::TieredReply {
-    let Some(meta) = lookup(argv[0]) else {
-        return tiered::TieredReply::Done(error_reply(shared, proto, "ERR unknown command"));
+) -> Result<&'static inf_wire::CommandMeta, OwnedReply> {
+    let Some(meta) = read.meta() else {
+        return Err(error_reply(shared, proto, "ERR unknown command"));
     };
     if !arity_ok(meta, argv.len()) {
-        return tiered::TieredReply::Done(error_reply(
-            shared,
-            proto,
-            "ERR wrong number of arguments",
-        ));
+        return Err(error_reply(shared, proto, "ERR wrong number of arguments"));
     }
-    let class = shared.store.borrow().ns_fsync_class(ns);
-    let origin_cell = ExecOrigin::Fabric(CellId(origin));
-    tiered::dispatch_tiered(shared, origin_cell, ns, meta, argv, proto, class).await
+    Ok(meta)
 }
 
 /// One shadow reconciliation read (M4.5-S37, ADR-0093 D4): the ticket's

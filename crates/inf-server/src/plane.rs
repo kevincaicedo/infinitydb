@@ -128,8 +128,8 @@ use scatter::{
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
 use shared::{
-    DurableAdmission, GatedBook, NsApplyOutcome, NsApplyRead, Parked, ParkedDeques, ParkedFull,
-    PeerDeques, apply_drop, gated_fill, handle_ns_apply, tier_to_fan,
+    ApplyGate, ClientAck, DurableAdmission, GatedBook, NsApplyOutcome, NsApplyRead, Parked,
+    ParkedDeques, ParkedFull, PeerDeques, apply_drop, handle_ns_apply, tier_to_fan,
 };
 use tasks::{PeerPumps, PlaneTasks};
 
