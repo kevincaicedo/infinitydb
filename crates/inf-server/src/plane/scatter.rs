@@ -693,6 +693,11 @@ pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clon
         }
     }
     let mut bodies: Vec<ArrayLeg> = Vec::new();
+    // A fan of reads that has its answer returns it and drops the legs still out: each wait
+    // gives its unit back at the drop and leaves its holder, Orphaned, until that request's one
+    // reply (ADR-0177 D4). A fan that writes settles every leg it sent before it answers, so a
+    // stop's barrier, which waits for no connection to be left, finds no write in flight
+    // (ADR-0124 D2).
     while let Some(outcome) = legs.next_outcome().await {
         match outcome {
             OwnedOutcome::Reply(reply) => match read_array_leg(shared, proto, reply) {
