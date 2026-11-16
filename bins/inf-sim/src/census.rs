@@ -20,6 +20,14 @@
 //! - **The window's turn rule**: a cell's durable plane counts no turn
 //!   that found the extent-seal window full (`turn_refused = 0`, the
 //!   release form of `len + w ≤ 16`; token `turn-refused`).
+//! - **The MAINTAIN room's rule**: no MAINTAIN pass left a namespace with
+//!   work for a later one because its task class had no room
+//!   (`tier_maint_task_waits = 0`, ADR-0177 D2; token `maint-paced`).
+//!   Either class fills only once some 64 tiered namespaces of one cell hold
+//!   its slots (a `compact` chain or four `shadow` reads each), which no
+//!   simulated run reaches, so a pace there is a room read short. The
+//!   count's liveness is the room's crate test, which reads 1 at a one-slot
+//!   room.
 //! - Liveness: a server cell has its timer owners' row, which its plane
 //!   builds before its loop exists, and on a node of more than one cell the
 //!   rows of its three per-origin deques (ADR-0177 D6: `ns-applies`,
@@ -74,6 +82,9 @@ pub(crate) struct CellFacts {
     /// The cell's durable plane, once built: its turns that found the
     /// extent-seal window full.
     pub(crate) turn_refused: Option<u64>,
+    /// Namespaces the cell's MAINTAIN passes left for a later pass because
+    /// their task class had no room (`tier_maint_task_waits`).
+    pub(crate) maint_paced: u64,
 }
 
 /// The census verdict of one run: every cell of every life it judged.
@@ -133,6 +144,7 @@ impl CensusVerdict {
         }
         marks_crossed(cell, census, SEAL_MARKS_ROW, "seal-marks-crossed", &mut self.violations);
         marks_crossed(cell, census, HOLE_MARKS_ROW, "hole-marks-crossed", &mut self.violations);
+        maint_paced(cell, facts.maint_paced, &mut self.violations);
         let Some(refused) = facts.turn_refused else { return };
         if census.row(EXTENT_WINDOW_ROW).is_none() {
             self.violations.push(format!(
@@ -181,6 +193,16 @@ fn marks_crossed(
             "CAP CENSUS VIOLATION cell {cell}: {token} — row `{}` crossed {} time(s), derived \
              never to occur",
             row.name, row.crossings
+        ));
+    }
+}
+
+/// The MAINTAIN room's rule: a namespace paced for want of room is red.
+fn maint_paced(cell: usize, paced: u64, violations: &mut Violations) {
+    if paced > 0 {
+        violations.push(format!(
+            "MAINT ROOM VIOLATION cell {cell}: maint-paced — {paced} namespace(s) left for a \
+             later MAINTAIN pass at a task class no simulated run fills"
         ));
     }
 }
@@ -339,6 +361,21 @@ mod tests {
             &census,
             CellFacts { tiered_tables: 0, turn_refused: Some(0), ..CellFacts::default() },
         );
+        assert!(green.violations.is_empty(), "{:?}", green.violations);
+    }
+
+    /// The MAINTAIN room's rule: one namespace paced is red by its token, none
+    /// is green.
+    #[test]
+    fn a_paced_namespace_is_red() {
+        let (census, serve_mark) = CapCensus::new(CellId(2));
+        serve_mark.take();
+        let mut red = CensusVerdict::default();
+        red.judge(2, &census, CellFacts { maint_paced: 1, ..CellFacts::default() });
+        assert_eq!(red.violations.len(), 1, "{:?}", red.violations);
+        assert!(red.violations[0].contains("maint-paced"), "{:?}", red.violations);
+        let mut green = CensusVerdict::default();
+        green.judge(2, &census, CellFacts { maint_paced: 0, ..CellFacts::default() });
         assert!(green.violations.is_empty(), "{:?}", green.violations);
     }
 

@@ -583,6 +583,7 @@ impl Rig {
                 peers: CELLS - 1,
                 tiered_tables: plane.keyspace().tiered_tables(),
                 turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
+                maint_paced: self.nodes[index].tier_maint_task_waits.get(),
             };
             census.judge(index, plane.cap_census(), facts);
         }

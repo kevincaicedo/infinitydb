@@ -1223,6 +1223,11 @@ ordered_rows=(
   # A finished task's slot is freed only when no waker names its header (ADR-0177 D2, E's
   # Retired row). Planted, it is freed under a clone, and the stale clone wakes the next task.
   "inf_canary_header_reused_with_wakers crate-test inf-runtime test:waker_threads a_retired_slot_is_never_reused_while_a_waker_names_its_header no stale clone activates the new occupant"
+  # MAINTAIN takes a compaction or shadow read only by spending a slot of its class's room, and
+  # counts a namespace the room cannot serve (ADR-0177 D2), which no simulated run reaches: every
+  # life's census reads the count 0. Planted, the room reads short at every pass, and the
+  # namespaces with shadow reads owed are paced.
+  "inf_canary_maint_room_short m4-tiered maint-paced"
   # The plane's mark ends the parser at once (QUIT's rule). Planted, it is a side flag beside a
   # live parser, and a SET reaped after a QUIT, while its +OK is unsent, runs.
   "inf_canary_mark_applied_late crate-test inf-server lib a_set_after_quit_does_not_run post-quit-ran"

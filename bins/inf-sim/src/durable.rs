@@ -2289,8 +2289,14 @@ impl Drop for Node {
                 if durable.is_some() { plane.keyspace().tiered_tables() } else { 0 };
             let turn_refused = durable.map(|stats| stats.turn_refused);
             let peers = u16::try_from(self.cells.len() - 1).expect("a node's cells fit a u16");
-            let facts =
-                crate::census::CellFacts { server_plane: true, peers, tiered_tables, turn_refused };
+            let maint_paced = self.nodes[index].tier_maint_task_waits.get();
+            let facts = crate::census::CellFacts {
+                server_plane: true,
+                peers,
+                tiered_tables,
+                turn_refused,
+                maint_paced,
+            };
             verdict.judge(index, plane.cap_census(), facts);
         }
         // The work parked for a peer (ADR-0177 D6): no op refused at a full

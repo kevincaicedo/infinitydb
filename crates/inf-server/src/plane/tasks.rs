@@ -97,6 +97,11 @@ impl PlaneTasks {
 
 /// The slots of `class` no task holds.
 fn room(executor: &CellExecutor, (class, cap): (TaskClass, Cap)) -> u32 {
+    // Canary: the room reads short at every pass, none free, so MAINTAIN paces
+    // every namespace with work.
+    if cfg!(inf_canary_maint_room_short) {
+        return 0;
+    }
     cap.entries_max().saturating_sub(executor.class_tasks(class))
 }
 
