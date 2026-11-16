@@ -104,3 +104,22 @@ pub const COLD_GATE_HOLDERS_MAX: u32 = 1 << 16;
 /// a member's of one of `P` reads of at most `overflow_cap` members.
 pub const COLD_GATE_HOLDERS: Cap =
     Cap::entries::<COLD_GATE_HOLDERS_MAX>("cold-gate-holders", CapFill::Serving);
+
+/// A cell's cold gate cap (ADR-0177 D4): `overflow_cap × (2 + P)`, `P` the pool's buffers, clamped
+/// to [`COLD_GATE_HOLDERS_MAX`]. Every queued intent of both classes holds one holder, and every
+/// other holder is a member's of one of the `P` reads in flight or delivered, each of at most
+/// `overflow_cap` members; the clamp refuses no namespace for its read depth.
+pub(crate) const fn cold_gate_holders(overflow_cap: usize, buffers: usize) -> Cap {
+    let product = (overflow_cap as u64).saturating_mul((buffers as u64).saturating_add(2));
+    let holders = if product == 0 {
+        1
+    } else if product > COLD_GATE_HOLDERS_MAX as u64 {
+        COLD_GATE_HOLDERS_MAX
+    } else {
+        product as u32
+    };
+    match Cap::derived(&COLD_GATE_HOLDERS, holders) {
+        Ok(cap) => cap,
+        Err(_) => panic!("the cold gate's cap is clamped to 1..=its ceiling"),
+    }
+}
