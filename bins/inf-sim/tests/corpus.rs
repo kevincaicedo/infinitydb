@@ -189,14 +189,14 @@ fn a_scan_page_is_judged_by_the_steps_its_reads_took() {
     assert_eq!(report.scan_pages_set_aside, 0, "no page of this seed reaches the oracle's floor");
 }
 
-/// `m4-tiered` at `0x51ee082d`: the seed where the `SCAN` batching oracle is
+/// `m4-tiered` at `0x51ee082e`: the seed where the `SCAN` batching oracle is
 /// seen speaking. It judges 6 pages, none violating, and sets aside 3 whose
 /// cell's device took another reader's tier reads around the page, so both
 /// the verdict and the guard before it are reached on the plain build.
 // nextest-long: 37 s
 #[test]
 fn the_scan_batching_oracle_judges_pages_and_sets_others_aside() {
-    let report = run_tiered_scenario(&TieredScenario::m4_tiered(0x51ee_082d));
+    let report = run_tiered_scenario(&TieredScenario::m4_tiered(0x51ee_082e));
     assert!(report.ok(), "stalled={} violations={:?}", report.stalled, report.violations);
     let repin = format!(
         "the seed's pages move with the scenario's draws, so a new count is right only in a \

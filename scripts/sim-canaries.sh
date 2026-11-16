@@ -1065,7 +1065,7 @@ rows=(
   # names the next. At the seed the plain build judges 6 pages and sets 3 aside (the corpus test
   # the_scan_batching_oracle_judges_pages_and_sets_others_aside holds both), and planted, its
   # judged pages are red.
-  "inf_canary_scan_chunk_of_one m4-tiered scan-one-read-an-entry --seed 0x51ee082d"
+  "inf_canary_scan_chunk_of_one m4-tiered scan-one-read-an-entry --seed 0x51ee082e"
 )
 # The rows above keep the order they were added in and take no new row:
 # `historical_rows` counts them, and falls only as one is deleted. The rows
