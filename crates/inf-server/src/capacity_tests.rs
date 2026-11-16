@@ -93,3 +93,45 @@ fn a_remote_del_holds_at_most_its_window_of_gate_holders() {
     );
     assert!(rig.written(0, fd(0)).is_empty(), "no reply before the owner answers");
 }
+
+/// A node's fabric gate holds at most the key's index field, 2^24 holders (ADR-0177 D4): `H`
+/// at the field builds, one past it is `Layout`, before anything is built.
+#[test]
+fn the_gates_holders_stop_at_the_keys_index_field() {
+    let caps = crate::limits::plane_task_caps(1, 2).expect("one slot a cell");
+    let units = crate::limits::gate_units(&caps);
+    let credits = inf_runtime::limits::GATE_HOLDERS_MAX - units;
+    let at = crate::limits::gate_holders(&caps, 2, credits).expect("H = 2^24");
+    let at = at.expect("a gate at two cells");
+    assert_eq!(at.entries_max(), inf_runtime::limits::GATE_HOLDERS_MAX);
+    let past = crate::limits::gate_holders(&caps, 2, credits + 1);
+    assert!(matches!(past, Err(CapError::Layout)), "H = 2^24 + 1 is refused");
+}
+
+/// A node whose `H` passes the key's index field builds no plane: `PlaneBuildError::Gate`
+/// from the plane's build, before its executor allocates a slot. At two cells `C` = 2^19 + 1
+/// connection slots of 32 units pass 2^24 alone.
+#[test]
+fn a_node_whose_holders_pass_the_field_builds_no_plane() {
+    let cells = inf_foundation::CellCount::new(2).expect("two cells");
+    let capacity = crate::config::BootCapacity::new((1 << 20) + 2, cells).expect("C fits");
+    let config = crate::config::ConfigStore::default().with_boot_capacity(capacity);
+    let (node, admission) = NodeInfo::try_new(config).expect("fixture cache allocation");
+    let fabric = inf_fabric::Mesh::new(2, inf_fabric::MeshConfig::default());
+    let fabric = fabric.into_iter().nth(1).expect("cell 1");
+    let cfg = inf_store::StoreConfig::default();
+    let seed = KeyspaceSeed::Uncataloged { cfg, specs: Vec::new() };
+    let built: Result<(ServerPlane, _, _, _), _> = ServerPlane::new(
+        CellId(1),
+        2,
+        -1,
+        seed,
+        fabric,
+        Rc::new(node),
+        admission,
+        NoopObserver,
+        false,
+    );
+    let refused = built.err().expect("H past the field refuses the plane");
+    assert_eq!(refused, PlaneBuildError::Gate(CapError::Layout));
+}

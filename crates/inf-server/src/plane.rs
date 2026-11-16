@@ -990,6 +990,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let (census, serve_mark) = CapCensus::new(cell);
         let share = node.config.borrow().boot_share(cells);
         let caps = crate::limits::plane_task_caps(share, cells).map_err(PlaneBuildError::Tasks)?;
+        // `H` is checked against the key's index field before anything is built.
+        let holders = crate::limits::gate_holders(&caps, cells, fabric.data_credits())
+            .map_err(PlaneBuildError::Gate)?;
         let mut layout = ExecutorLayout::new(&census);
         let tasks =
             PlaneTasks::register::<O, F>(&mut layout, &caps).map_err(PlaneBuildError::Tasks)?;
@@ -998,8 +1001,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
         let parked = ParkedDeques::build(cell, cells, fabric.data_credits(), &census)
             .map_err(PlaneBuildError::Parked)?;
-        let holders = crate::limits::gate_holders(&caps, cells, fabric.data_credits())
-            .map_err(PlaneBuildError::Gate)?;
         let gate = FabricGate::build(cell.0, crate::limits::gate_units(&caps), holders, &census)
             .map_err(PlaneBuildError::Gate)?;
         node.cell.set(cell.0);
