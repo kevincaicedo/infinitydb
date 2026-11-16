@@ -105,8 +105,8 @@ use conn::{
 use credit::{FanLegs, FanReserve, PlaneFabric, PointOp, PubFanArgv};
 pub use credit::{MeshConfigRefused, checked_mesh_config};
 use dispatch::{
-    CountedLegs, Legs, OrderedLegs, PendingReply, close_after_reply, is_scatter, pump,
-    render_outcome,
+    CountedLegs, LegWindow, Legs, OrderedLegs, PendingReply, close_after_reply, is_scatter, pump,
+    render_outcome, send_windowed,
 };
 use fabric::{
     StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op, parse_stageable,

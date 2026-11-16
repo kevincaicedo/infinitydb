@@ -4,6 +4,8 @@
 //! and `dispatch_one` — the command-family switch every remote command
 //! enters through.
 
+use core::convert::Infallible;
+
 #[cfg(feature = "doc")]
 use super::json_gather::{GatherTarget, JsonGather, json_gather};
 use super::scatter::send_whole;
@@ -45,10 +47,53 @@ pub(super) enum PendingReply<'u> {
     Durable { waiter: inf_runtime::WatermarkWait, reply: OwnedReply },
 }
 
-/// A fan's legs in flight, oldest first (ADR-0177 D4). Each holds one of
-/// its task's units, so a send that finds none settles the fan's oldest leg
-/// and sends again: a fan wider than the task's units runs in windows, and
-/// at most the task's units of its legs are ever out.
+/// A fan's legs out, oldest first (ADR-0177 D4): each holds one of its
+/// task's units, so settling the oldest gives one back.
+pub(super) trait LegWindow {
+    /// What ends the fan at a settle, before its last leg is sent:
+    /// `Infallible` where every outcome waits for its reply's turn.
+    type Stop;
+
+    /// Settles the oldest leg out, its outcome kept or folded; `Ok(false)`
+    /// when no leg is out.
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+    ) -> Result<bool, Self::Stop>;
+}
+
+/// The one windowed send (ADR-0177 D4): `send` runs, and while the task has
+/// every unit out the window's oldest leg settles and `send` runs again, so
+/// a fan wider than its task's units runs in windows and at most its units
+/// of legs are ever out. What is left is the send's own answer: a waiter,
+/// the codec's refusal, or `NoUnit` with no leg of the window out, derived
+/// never (a pump dispatches a command only while a unit is free, and a leg
+/// settled gives its unit back). Each caller answers a refusal by its own
+/// type; `Err` is a settle that ended the fan.
+pub(super) async fn send_windowed<W, T, O, F>(
+    window: &mut W,
+    shared: &Shared<O, F>,
+    mut send: impl AsyncFnMut(&mut W) -> Result<T, SendRefused>,
+) -> Result<Result<T, SendRefused>, W::Stop>
+where
+    W: LegWindow,
+    O: PlaneObserver + 'static,
+    F: SegmentFs + Clone + 'static,
+{
+    loop {
+        match send(window).await {
+            Err(SendRefused::NoUnit) => {
+                if !window.settle_oldest(shared).await? {
+                    return Ok(Err(SendRefused::NoUnit));
+                }
+            }
+            sent => return Ok(sent),
+        }
+    }
+}
+
+/// A fan's legs in flight, oldest first (ADR-0177 D4), whose outcomes
+/// nothing reads: settling one drops its outcome.
 pub(super) struct Legs<'u> {
     waiters: Vec<GateWait<'u, OwnedOutcome>>,
 }
@@ -68,6 +113,17 @@ impl<'u> Legs<'u> {
             return None;
         }
         Some(self.waiters.remove(0).await)
+    }
+}
+
+impl LegWindow for Legs<'_> {
+    type Stop = Infallible;
+
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        _shared: &Shared<O, F>,
+    ) -> Result<bool, Infallible> {
+        Ok(self.oldest().await.is_some())
     }
 }
 
@@ -97,17 +153,6 @@ impl<'u> OrderedLegs<'u> {
         self.legs.push(OrderedLeg::Out(waiter));
     }
 
-    /// Settles the oldest leg out, keeping its outcome; `false` when none is.
-    pub(super) async fn settle_oldest(&mut self) -> bool {
-        while let Some(leg) = self.legs.get_mut(self.settled) {
-            self.settled += 1;
-            let OrderedLeg::Out(waiter) = leg else { continue };
-            *leg = OrderedLeg::In(waiter.await);
-            return true;
-        }
-        false
-    }
-
     /// The next leg's outcome in leg order; `None` past the last.
     pub(super) async fn next_outcome(&mut self) -> Option<OwnedOutcome> {
         let leg = self.legs.get_mut(self.read)?;
@@ -118,6 +163,24 @@ impl<'u> OrderedLegs<'u> {
             OrderedLeg::In(outcome) => Some(outcome),
             OrderedLeg::Read => None,
         }
+    }
+}
+
+impl LegWindow for OrderedLegs<'_> {
+    type Stop = Infallible;
+
+    /// Settles the oldest leg out, keeping its outcome for its turn.
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        _shared: &Shared<O, F>,
+    ) -> Result<bool, Infallible> {
+        while let Some(leg) = self.legs.get_mut(self.settled) {
+            self.settled += 1;
+            let OrderedLeg::Out(waiter) = leg else { continue };
+            *leg = OrderedLeg::In(waiter.await);
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -167,35 +230,22 @@ impl<'u> CountedLegs<'u> {
         db: u16,
         argv: &[&[u8]],
     ) -> bool {
-        loop {
-            match send_apply(shared, units, to, origin, self.proto, db, argv).await {
-                Ok(waiter) => {
-                    self.push(waiter);
-                    return true;
-                }
-                Err(SendRefused::NoUnit) if self.settle_oldest(shared).await => {}
-                Err(refused) => {
-                    let reply = refused.into_reply(shared, self.proto);
-                    self.refuse(shared, reply);
-                    return false;
-                }
+        let proto = self.proto;
+        let Ok(sent) = send_windowed(self, shared, async |_| {
+            send_apply(shared, units, to, origin, proto, db, argv).await
+        })
+        .await;
+        match sent {
+            Ok(waiter) => {
+                self.push(waiter);
+                true
+            }
+            Err(refused) => {
+                let reply = refused.into_reply(shared, proto);
+                self.refuse(shared, reply);
+                false
             }
         }
-    }
-
-    /// Folds the oldest leg; `false` when no leg is out.
-    pub(super) async fn settle_oldest<
-        O: PlaneObserver + 'static,
-        F: SegmentFs + Clone + 'static,
-    >(
-        &mut self,
-        shared: &Shared<O, F>,
-    ) -> bool {
-        let Some(outcome) = self.legs.oldest().await else { return false };
-        if let Some(unused) = self.fold.leg(outcome, self.proto) {
-            shared.recycle_reply_buf(unused.into_bytes());
-        }
-        true
     }
 
     /// Every leg settled, so nothing is orphaned in flight; the fold decides
@@ -205,11 +255,27 @@ impl<'u> CountedLegs<'u> {
         mut self,
         shared: &Shared<O, F>,
     ) -> OwnedReply {
-        while self.settle_oldest(shared).await {}
+        while let Ok(true) = self.settle_oldest(shared).await {}
         match self.fold.finish() {
             Err(error) => error,
             Ok(total) => int_reply(shared, self.proto, total),
         }
+    }
+}
+
+impl LegWindow for CountedLegs<'_> {
+    type Stop = Infallible;
+
+    /// Folds the oldest leg.
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+    ) -> Result<bool, Infallible> {
+        let Some(outcome) = self.legs.oldest().await else { return Ok(false) };
+        if let Some(unused) = self.fold.leg(outcome, self.proto) {
+            shared.recycle_reply_buf(unused.into_bytes());
+        }
+        Ok(true)
     }
 }
 
@@ -254,31 +320,47 @@ impl<'u> AllOkLegs<'u> {
         db: u16,
         argv: &[&[u8]],
     ) -> bool {
-        loop {
-            match send_apply(shared, units, to, origin, self.proto, db, argv).await {
-                Ok(waiter) => {
-                    self.push(waiter);
-                    return true;
-                }
-                Err(SendRefused::NoUnit) if self.settle_oldest(shared).await => {}
-                Err(refused) => {
-                    let reply = refused.into_reply(shared, self.proto);
-                    self.refuse(shared, reply);
-                    return false;
-                }
+        let proto = self.proto;
+        let Ok(sent) = send_windowed(self, shared, async |_| {
+            send_apply(shared, units, to, origin, proto, db, argv).await
+        })
+        .await;
+        match sent {
+            Ok(waiter) => {
+                self.push(waiter);
+                true
+            }
+            Err(refused) => {
+                let reply = refused.into_reply(shared, proto);
+                self.refuse(shared, reply);
+                false
             }
         }
     }
 
-    /// Settles the oldest leg; `false` when no leg is out.
-    pub(super) async fn settle_oldest<
-        O: PlaneObserver + 'static,
-        F: SegmentFs + Clone + 'static,
-    >(
+    /// Every leg settled, so nothing is orphaned in flight; the reply is
+    /// the first failure or `+OK`.
+    async fn finish<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        mut self,
+        shared: &Shared<O, F>,
+    ) -> OwnedReply {
+        while let Ok(true) = self.settle_oldest(shared).await {}
+        match self.failure {
+            Some(error) => error,
+            None => simple_reply(shared, self.proto, "OK"),
+        }
+    }
+}
+
+impl LegWindow for AllOkLegs<'_> {
+    type Stop = Infallible;
+
+    /// Settles the oldest leg, keeping the first failure.
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         &mut self,
         shared: &Shared<O, F>,
-    ) -> bool {
-        let Some(outcome) = self.legs.oldest().await else { return false };
+    ) -> Result<bool, Infallible> {
+        let Some(outcome) = self.legs.oldest().await else { return Ok(false) };
         // A leg failed by its outcome, never by its bytes: an error reply,
         // or a fabric refusal (ADR-0190 D2).
         let failed = match outcome {
@@ -297,20 +379,7 @@ impl<'u> AllOkLegs<'u> {
             (false, Some(unused)) => shared.recycle_reply_buf(unused.into_bytes()),
             (false, None) => {}
         }
-        true
-    }
-
-    /// Every leg settled, so nothing is orphaned in flight; the reply is
-    /// the first failure or `+OK`.
-    async fn finish<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-        mut self,
-        shared: &Shared<O, F>,
-    ) -> OwnedReply {
-        while self.settle_oldest(shared).await {}
-        match self.failure {
-            Some(error) => error,
-            None => simple_reply(shared, self.proto, "OK"),
-        }
+        Ok(true)
     }
 }
 
@@ -340,32 +409,13 @@ impl<'u> GatherLegs<'u> {
         self.parts.push(part);
     }
 
-    /// Settles the oldest remote position; `false` when none waits.
-    pub(super) async fn settle_oldest(&mut self) -> bool {
-        while let Some(part) = self.parts.get_mut(self.next) {
-            self.next += 1;
-            let GatherPart::Wait(waiter) = part else { continue };
-            let element = match waiter.await {
-                OwnedOutcome::Reply(element) => Some(element),
-                OwnedOutcome::Ok
-                | OwnedOutcome::Int(_)
-                | OwnedOutcome::Nil
-                | OwnedOutcome::Bool(_)
-                | OwnedOutcome::Err(_) => None,
-            };
-            *part = GatherPart::Settled(element);
-            return true;
-        }
-        false
-    }
-
     /// Every position in argv order, each element pasted after the array
     /// header.
     async fn finish<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         mut self,
         shared: &Shared<O, F>,
     ) -> OwnedReply {
-        while self.settle_oldest().await {}
+        while let Ok(true) = self.settle_oldest(shared).await {}
         let mut reply = OpenReply::new(shared.take_reply_buf());
         RespWriter::new(reply.reply(), self.proto).array_header(self.parts.len());
         for part in self.parts {
@@ -384,6 +434,32 @@ impl<'u> GatherLegs<'u> {
             }
         }
         reply.finish()
+    }
+}
+
+impl LegWindow for GatherLegs<'_> {
+    type Stop = Infallible;
+
+    /// Settles the oldest remote position into its element.
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        _shared: &Shared<O, F>,
+    ) -> Result<bool, Infallible> {
+        while let Some(part) = self.parts.get_mut(self.next) {
+            self.next += 1;
+            let GatherPart::Wait(waiter) = part else { continue };
+            let element = match waiter.await {
+                OwnedOutcome::Reply(element) => Some(element),
+                OwnedOutcome::Ok
+                | OwnedOutcome::Int(_)
+                | OwnedOutcome::Nil
+                | OwnedOutcome::Bool(_)
+                | OwnedOutcome::Err(_) => None,
+            };
+            *part = GatherPart::Settled(element);
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -1219,13 +1295,10 @@ async fn gather_mget<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
             continue;
         }
         let to = shared.router.cell_of(SlotRouter::slot_of(k));
-        let sent = loop {
-            let sent = send_apply(shared, units, to, ApplyOrigin::Client, proto, db, &get).await;
-            if matches!(sent, Err(SendRefused::NoUnit)) && legs.settle_oldest().await {
-                continue;
-            }
-            break sent;
-        };
+        let Ok(sent) = send_windowed(&mut legs, shared, async |_| {
+            send_apply(shared, units, to, ApplyOrigin::Client, proto, db, &get).await
+        })
+        .await;
         legs.push(match sent {
             Ok(waiter) => GatherPart::Wait(waiter),
             Err(refused) => GatherPart::Done(refused.into_reply(shared, proto)),
@@ -1281,18 +1354,10 @@ pub(super) async fn program_mset<'u, O: PlaneObserver + 'static, F: SegmentFs + 
                     continue;
                 }
                 let to = shared.router.cell_of(SlotRouter::slot_of(pair[1]));
-                let sent = loop {
-                    let sent =
-                        send_apply(shared, units, to, ApplyOrigin::Client, proto, db, &pair).await;
-                    if matches!(sent, Err(SendRefused::NoUnit)) && legs.settle_oldest(shared).await
-                    {
-                        continue;
-                    }
-                    break sent;
-                };
-                // A three-slice leg is within the codec's argument cap.
-                if let Ok(waiter) = sent {
-                    legs.push(waiter);
+                // A leg that cannot be sent is the reply, never a `+OK` over
+                // an unwritten pair; the fan sends no more.
+                if !legs.send(shared, units, to, ApplyOrigin::Client, db, &pair).await {
+                    break;
                 }
             }
             PendingReply::AllOk(legs)

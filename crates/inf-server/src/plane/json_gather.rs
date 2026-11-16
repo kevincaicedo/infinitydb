@@ -102,6 +102,23 @@ pub(super) struct Open<'u> {
     limit: ReplyLimit,
 }
 
+/// The open gather as a send's window: a settled leg's verdict ends it.
+struct OpenWindow<'a, 'u> {
+    open: &'a mut Open<'u>,
+    proto: Protocol,
+}
+
+impl LegWindow for OpenWindow<'_, '_> {
+    type Stop = End;
+
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+    ) -> Result<bool, End> {
+        self.open.settle_oldest(shared, self.proto).await
+    }
+}
+
 /// A leg its reader accepted: the reply and where its elements begin. Only
 /// [`read_json_mget_leg`] builds one.
 #[derive(Debug)]
@@ -249,17 +266,14 @@ impl<'u> Open<'u> {
             let GatherTarget { db, scope, .. } = target;
             // With every unit of the task out, the oldest leg settles first
             // (ADR-0177 D4): the gather's own window is the units' share.
-            let sent = loop {
-                match scatter_send(shared, units, leg.owner, proto, db, scope, &leg_argv).await {
-                    Err(SendRefused::NoUnit) => match self.settle_oldest(shared, proto).await {
-                        Ok(true) => {}
-                        Ok(false) => break Err(SendRefused::NoUnit),
-                        Err(end) => {
-                            return JsonGather::draining(proto, self.end(shared, proto, end));
-                        }
-                    },
-                    sent => break sent,
-                }
+            let window = &mut OpenWindow { open: &mut self, proto };
+            let sent = send_windowed(window, shared, async |_| {
+                scatter_send(shared, units, leg.owner, proto, db, scope, &leg_argv).await
+            })
+            .await;
+            let sent = match sent {
+                Ok(sent) => sent,
+                Err(end) => return JsonGather::draining(proto, self.end(shared, proto, end)),
             };
             let waiter = match sent {
                 Ok(waiter) => waiter,
@@ -301,6 +315,7 @@ impl<'u> Open<'u> {
     }
 
     /// Awaits and settles the oldest leg in flight; `Ok(false)` when none is.
+    /// `Err` is the verdict a settled leg's outcome gave.
     async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         &mut self,
         shared: &Shared<O, F>,

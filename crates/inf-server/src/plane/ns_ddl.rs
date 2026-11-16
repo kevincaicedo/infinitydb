@@ -271,14 +271,11 @@ pub(super) async fn dispatch_ns<'u, O: PlaneObserver + 'static, F: SegmentFs + C
         };
         let mut legs = CountedLegs::new(acc, proto);
         for cell in peer_cells(shared) {
-            let sent = loop {
-                let (leg, origin): ([&[u8]; 1], _) = ([b"DBSIZE"], ApplyOrigin::Client);
-                let sent = send_apply_ns(shared, units, cell, origin, proto, ns, &leg).await;
-                if matches!(sent, Err(SendRefused::NoUnit)) && legs.settle_oldest(shared).await {
-                    continue;
-                }
-                break sent;
-            };
+            let (leg, origin): ([&[u8]; 1], _) = ([b"DBSIZE"], ApplyOrigin::Client);
+            let Ok(sent) = send_windowed(&mut legs, shared, async |_| {
+                send_apply_ns(shared, units, cell, origin, proto, ns, &leg).await
+            })
+            .await;
             match sent {
                 Ok(waiter) => legs.push(waiter),
                 Err(refused) => {

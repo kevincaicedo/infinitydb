@@ -197,7 +197,7 @@ mod tests {
         // The empty-node rows: each threshold is the design's own bill, the
         // row a measured baseline (`informational`), never an achieved target.
         for (id, threshold, step, source) in [
-            ("empty_idle_rss", 148.28, 1.0 / 256.0, "loadgen:empty_idle_rss_mib"),
+            ("empty_idle_rss", 146.20, 1.0 / 256.0, "loadgen:empty_idle_rss_mib"),
             ("empty_data_dir_bytes", 128.0, 4.0, "loadgen:empty_data_dir_kib"),
             ("empty_warm_boot", 200.0, 1.0, "loadgen:empty_warm_boot_ms"),
             ("empty_idle_cpu", 5.0, 0.1, "loadgen:empty_idle_cpu_pct"),

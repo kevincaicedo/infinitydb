@@ -683,13 +683,10 @@ pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clon
     let mut total = local.count();
     let mut legs = OrderedLegs::new();
     for cell in peer_cells(shared) {
-        let sent = loop {
-            let sent = scatter_send(shared, units, cell, proto, db, scope, argv).await;
-            if matches!(sent, Err(SendRefused::NoUnit)) && legs.settle_oldest().await {
-                continue;
-            }
-            break sent;
-        };
+        let Ok(sent) = send_windowed(&mut legs, shared, async |_| {
+            scatter_send(shared, units, cell, proto, db, scope, argv).await
+        })
+        .await;
         match sent {
             Ok(waiter) => legs.push(waiter),
             Err(refused) => return refused.into_reply(shared, proto),
