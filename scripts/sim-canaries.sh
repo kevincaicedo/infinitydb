@@ -1243,10 +1243,13 @@ row_label() {
 }
 
 # rows_out_of_order <row…>: prints the first row whose cfg sorts before the
-# cfg of the row above it, in byte order; non-zero when there is none.
+# cfg of the row above it, in byte order; non-zero when there is none. Every
+# reader of a pipe here reads it whole: under pipefail an awk that exits
+# early kills its writer with SIGPIPE on a long input, and the pipeline's
+# status is then the writer's 141, not the reader's verdict.
 rows_out_of_order() {
   printf '%s\n' "$@" | LC_ALL=C awk '
-    NR > 1 && $1 < cfg { print $0 " (after " cfg ")"; found = 1; exit }
+    !found && NR > 1 && $1 < cfg { print $0 " (after " cfg ")"; found = 1 }
     { cfg = $1 }
     END { exit !found }'
 }
@@ -1413,7 +1416,7 @@ uring_unavailable() {
     *) return 1 ;;
   esac
   tr -d '\000-\010\013-\037\177' <"$2" | LC_ALL=C awk '
-    after_panic && /^io_uring/ { print substr($0, 1, 160); found = 1; exit }
+    !found && after_panic && /^io_uring/ { print substr($0, 1, 160); found = 1 }
     { after_panic = ($0 ~ /panicked at /) }
     END { exit !found }'
 }

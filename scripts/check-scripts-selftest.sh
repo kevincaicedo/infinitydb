@@ -3306,6 +3306,86 @@ chmod +x "$dir/real-cargo"
 expect_red_because "canaries: a named inf-bench beside a cargo answering as cargo is a scope failure" "INF_CANARY_BENCH is the self-test's stub route, and this cargo is a real one" env INF_CANARY_HOST= INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/real-cargo" $CANARY
 }
 
+# ------------------------------- planted-bug canary driver: long logs, readers
+group_sim_canaries_long_logs() {
+# Under pipefail an awk that exits as soon as it finds its line kills its
+# writer (tr, printf) with SIGPIPE once the input outgrows the pipe's
+# buffer, and the reader's verdict becomes the writer's 141. Each reader of
+# the lane is planted here with its line first and two megabytes after it,
+# and the lane's script is read for an awk program that exits outside its
+# END block, which is the shape that cuts a writer short.
+CANARY=./scripts/sim-canaries.sh
+export INF_CANARY_HOST=Linux
+filler='awk '\''BEGIN { for (i = 0; i < 40000; i++) print "filler line " i " of a long log, past any pipe buffer" }'\'''
+long_fixture() {
+    local name=$1 dir
+    [ -n "$name" ] && [ -n "$work" ] || { echo "long_fixture: empty name or work dir" >&2; exit 2; }
+    dir="$work/$name"
+    mkdir -p "$dir/target/release" "$dir/target/canary-inf_canary_fixture/release"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/cargo"
+    chmod +x "$dir/cargo"
+    echo "$dir"
+}
+# A scenario whose log withholds its verdict on its first line.
+dir=$(long_fixture long-withheld)
+echo "inf_canary_fixture fake-scenario TOKEN" >"$dir/rows"
+for sim in "$dir/target/release/inf-sim" "$dir/target/canary-inf_canary_fixture/release/inf-sim"; do
+    printf '#!/usr/bin/env bash\necho "WITHHELD: the clause reads /proc"\n%s\nexit 0\n' "$filler" >"$sim"
+    chmod +x "$sim"
+done
+expect_red_because "canaries: a long log withheld on its first line is judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture scenario fake-scenario (WITHHELD: the clause reads /proc)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+# A uring crate test whose ring panics first, two megabytes before its
+# verdict line.
+dir=$(long_fixture long-uring)
+echo "inf_canary_fixture crate-test fake/uring test:suite the_row" >"$dir/rows"
+printf '#!/usr/bin/env bash\necho "thread the_row panicked at tests/suite.rs:37:10:"\necho "io_uring: Os { code: 1, kind: PermissionDenied }"\n%s\necho "test the_row ... FAILED"\nexit 101\n' "$filler" >"$dir/cargo"
+expect_red_because "canaries: a long log whose ring panicked first is io_uring unavailable" "red: io_uring unavailable on this host (io_uring: Os { code: 1" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# A long table whose second row is out of its cfg's place: two megabytes
+# of rows, past the buffer awk reads its pipe in.
+dir=$(long_fixture long-table)
+{
+    echo "inf_canary_b crate-test fake test:suite the_row"
+    echo "inf_canary_a crate-test fake test:suite the_row"
+    awk 'BEGIN { for (i = 0; i < 40000; i++) printf "inf_canary_c%05d crate-test fake test:suite the_row\n", i }'
+} >"$dir/rows"
+expect_red_because "canaries: a long table's early misplaced row is refused" "a row out of its cfg's place: inf_canary_a crate-test fake test:suite the_row (after inf_canary_b)" env INF_CANARY_TABLE_ONLY=1 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# awk_readers_whole <script>: zero when no awk program in the script calls
+# `exit` outside its END block; else each such line, non-zero. Every awk in
+# sim-canaries.sh reads a pipe, so that is the shape that cuts its writer.
+awk_readers_whole() {
+    LC_ALL=C awk '
+        {
+            text = $0
+            if (!inawk) {
+                at = index(text, "awk '\''")
+                if (at == 0) next
+                text = substr(text, at + 5)
+                inawk = 1
+            }
+            close_at = index(text, "'\''")
+            body = close_at ? substr(text, 1, close_at - 1) : text
+            if (body ~ /(^|[^A-Za-z_])exit([^A-Za-z_]|$)/ && body !~ /END[ \t]*[{]/) {
+                print FILENAME ":" FNR ": " $0
+                found = 1
+            }
+            if (close_at) inawk = 0
+        }
+        END { exit found }' "$1"
+}
+expect green "canaries: every awk reader of the lane reads its pipe whole" awk_readers_whole "$CANARY"
+dir=$(long_fixture long-reader-lint)
+{
+    echo "reader() {"
+    echo "  tr -d x <\"\$1\" | awk '"
+    echo "    /^WITHHELD:/ { print; found = 1; exit }"
+    echo "    END { exit !found }'"
+    echo "}"
+    echo "short() { printf '%s\\n' \"\$@\" | awk 'NR > 1 { exit }'; }"
+} >"$dir/early.sh"
+expect red "canaries: the reader check sees an awk that exits before its END" awk_readers_whole "$dir/early.sh"
+expect_output "canaries: the reader check names each early exit, one-line programs too" "early.sh:6: short()" awk_readers_whole "$dir/early.sh"
+}
+
 # --------------------------------------------------- release-assert inventory
 group_release_asserts() {
 # ADR-0107 D2: a fixture crate with one release assert and one expect, and
