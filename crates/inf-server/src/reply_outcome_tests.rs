@@ -1086,3 +1086,84 @@ fn reply_outcome_json_mget_sum_over_the_account_is_refused() {
     assert!(reply.is_error());
     assert_eq!(shared.node.json_reply_refusals_cell.get() - before, 1, "one refusal, on this cell");
 }
+
+/// A stub fan's window: `out` legs out, each settle taking the oldest, and `stop` ending the
+/// fan at its next settle.
+struct StubWindow {
+    out: usize,
+    settles: usize,
+    stop: bool,
+}
+
+/// What ends a stub fan at a settle.
+struct StubStop;
+
+impl LegWindow for StubWindow {
+    type Stop = StubStop;
+
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        _shared: &Shared<O, F>,
+    ) -> Result<bool, StubStop> {
+        if self.stop {
+            return Err(StubStop);
+        }
+        if self.out == 0 {
+            return Ok(false);
+        }
+        self.out -= 1;
+        self.settles += 1;
+        Ok(true)
+    }
+}
+
+/// `send_windowed` over a stub window of `out` legs, its sends answering `script` in turn
+/// (`None` is `NoUnit`), polled once: nothing here suspends. Returns the answer, the sends
+/// run and the settles taken; a send past the script is a loop the window never ends.
+fn windowed(
+    shared: &Shared<NoopObserver, StdSegmentFs>,
+    out: usize,
+    stop: bool,
+    script: &[Option<u32>],
+) -> (Result<Result<u32, SendRefused>, StubStop>, usize, usize) {
+    let mut window = StubWindow { out, settles: 0, stop };
+    let mut sends = 0;
+    let answer = {
+        let fan = send_windowed(&mut window, shared, async |_| {
+            let answer = *script.get(sends).expect("a send past the script: the window looped");
+            sends += 1;
+            answer.ok_or(SendRefused::NoUnit)
+        });
+        let mut fan = pin!(fan);
+        let mut cx = Context::from_waker(Waker::noop());
+        let Poll::Ready(answer) = fan.as_mut().poll(&mut cx) else {
+            panic!("a stub window never suspends");
+        };
+        answer
+    };
+    (answer, sends, window.settles)
+}
+
+/// The windowed send's four exits (ADR-0177 D4), each with the sends it ran and the settles it
+/// took: a unit free sends at once; `NoUnit` with a leg out settles the oldest and sends again;
+/// `NoUnit` with no leg out is the refusal, answered after one send, never another turn of the
+/// loop; and a settle that ends the fan is the answer, with no send after it. A loop that
+/// re-sent with nothing out runs past its script and panics; one that dropped the refusal for
+/// a turn, or sent after a `Stop`, reads another shape.
+#[test]
+fn windowed_send_answers_each_of_its_four_exits() {
+    let cells = Cells::new();
+    let shared = cells.origin();
+    let (answer, sends, settles) = windowed(shared, 0, false, &[Some(7)]);
+    assert!(matches!(answer, Ok(Ok(7))), "sent at the first try");
+    assert_eq!((sends, settles), (1, 0), "sent at the first try");
+    let (answer, sends, settles) = windowed(shared, 1, false, &[None, Some(8)]);
+    assert!(matches!(answer, Ok(Ok(8))), "sent after one settle");
+    assert_eq!((sends, settles), (2, 1), "sent after one settle");
+    let (answer, sends, settles) = windowed(shared, 0, false, &[None]);
+    assert!(matches!(answer, Ok(Err(SendRefused::NoUnit))), "no unit, nothing out");
+    assert_eq!((sends, settles), (1, 0), "no unit, nothing out");
+    let (answer, sends, settles) = windowed(shared, 1, true, &[None]);
+    assert!(matches!(answer, Err(StubStop)), "a settle that stops the fan");
+    assert_eq!((sends, settles), (1, 0), "a settle that stops the fan");
+}
