@@ -526,10 +526,9 @@ impl<T> Default for ConnSlab<T> {
 impl<T> ConnSlab<T> {
     /// Admits the connection `make` builds from its own key, so whatever serves the key (its
     /// pump) is made in the step that installs it; `None` when every slot
-    /// below the cap is live — the admission bound (batch 12 of the
-    /// 2026-08-30 review): before it, the 2^24-th concurrent connection
-    /// on a cell was a release assert, i.e. a client-driven node kill. Then `make` is not
-    /// called.
+    /// below the cap is live — the admission bound, so no client can drive a cell to the
+    /// slab's 2^24-th slot, a release assert and so a client-driven node kill. Then `make`
+    /// is not called.
     pub(super) fn insert_with(&mut self, make: impl FnOnce(ConnKey) -> T) -> Option<ConnKey> {
         let key = match self.free.last() {
             Some(&slot) => ConnKey { slot, generation: self.gens[slot as usize] },
@@ -590,10 +589,9 @@ impl<T> ConnSlab<T> {
 mod conn_slab_tests {
     use super::{CONN_SLOT_CAP, ConnKey, ConnSlab};
 
-    /// Batch 12 of the 2026-08-30 review: the slab refuses the accept
-    /// past its cap instead of asserting, and `make` runs only for a slot it
-    /// grants, with that slot's key. A tiny cap stands in for
-    /// `CONN_SLOT_CAP`; the arithmetic is the same.
+    /// The slab refuses the accept past its cap instead of asserting, and `make` runs only
+    /// for a slot it grants, with that slot's key. A tiny cap stands in for `CONN_SLOT_CAP`;
+    /// the arithmetic is the same.
     #[test]
     fn slab_refuses_past_the_cap_and_readmits_on_release() {
         let mut slab: ConnSlab<u32> = ConnSlab { cap: 3, ..ConnSlab::default() };

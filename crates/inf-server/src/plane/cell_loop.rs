@@ -311,8 +311,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 }
                 Parsed::Incomplete => {}
                 Parsed::ProtocolError(e) => {
-                    // Display, not Debug (batch 45): the Redis
-                    // phrasing the compat harness diffs.
+                    // Display, not Debug: the Redis phrasing the compat
+                    // harness diffs.
                     let error = format!("ERR Protocol error: {e}");
                     self.parse_reply(conn_cx, into, origin, staging, &error);
                     parsed.stop = true;
@@ -321,7 +321,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             }
         }
         // End of buffer: the staged batch executes with its record
-        // lines prefetched (§7.3 phase 2 across the whole batch).
+        // lines prefetched across the whole batch.
         match into.route() {
             (ReplyRoute::Out(out), _) => staging.flush(&self.shared, origin, conn_cx, out),
             // Nothing is staged once the pump owes a reply: the first
@@ -672,8 +672,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 }
                 // Tier-flush op failures (M4.5-S31, ADR-0084 D4) are the
                 // round's to classify at the next MAINTAIN — ENOSPC
-                // latches admission and retries; a failed barrier is the
-                // §8.4 fatal class there. Never connection housekeeping.
+                // latches admission and retries; a failed barrier is
+                // fatal there (fail-stop). Never connection housekeeping.
                 if matches!(c.token.class(), TokenClass::TierFlushWrite | TokenClass::TierFlushSync)
                 {
                     let mut tier = self.shared.tier.borrow_mut();
@@ -681,7 +681,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     tier.on_flush_completion(c.token, Some(errno));
                     return;
                 }
-                // Log-op failures are fail-stop territory (§8.4), never
+                // Log-op failures are fail-stop territory, never
                 // connection housekeeping. A zero-fill write failing is
                 // the same class: the device refused a log write.
                 if matches!(
