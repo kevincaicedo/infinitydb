@@ -220,29 +220,13 @@ struct Boot {
 }
 
 impl Boot {
-    /// The leg's facts; a census not `serving` on every cell is a failed
-    /// boot.
+    /// The leg's facts; its census read by [`census`].
     fn from_leg(leg: &MemoryLeg, names: &[String]) -> Result<Boot, NoVerdictReason> {
-        let cells =
-            leg.cells().as_ref().map_err(|e| NoVerdictReason::Boot(format!("INFO: {e}")))?;
-        let mut rows = Vec::with_capacity(cells.len());
-        for (index, info) in cells.iter().enumerate() {
-            let phase = info.get("cap_census_phase").map_or("absent", String::as_str);
-            if phase != "serving" {
-                let why = format!("cell {index}'s cap_census_phase is {phase}, not serving");
-                return Err(NoVerdictReason::Boot(why));
-            }
-            let read = |name: &String| {
-                let value = info.get(&format!("cap_row_{name}"))?;
-                Some((name.clone(), entries_max(value)?))
-            };
-            rows.push(names.iter().filter_map(read).collect());
-        }
         Ok(Boot {
             rss: leg.rss(),
             pinned_bytes: leg.pinned_bytes(),
             memlock: leg.memlock().to_string(),
-            rows,
+            rows: census(leg.cells(), names)?,
         })
     }
 
@@ -270,6 +254,32 @@ impl Boot {
 /// VmRSS divided by the cells, floor: every cell builds the same reserve.
 fn bytes_cell(rss: PinnedRss) -> u64 {
     rss.rss_bytes() / u64::from(EMPTY_NODE_CELLS)
+}
+
+/// Every cell's named census rows, from its INFO after the window: per
+/// cell, each row's `entries_max`, a row the cell does not carry, or
+/// carries without one, absent (so a candidate missing it is `Vacuous`).
+/// A failed scrape, or a cell whose census is not `serving`, is a failed
+/// boot.
+fn census(
+    cells: &Result<Vec<BTreeMap<String, String>>, String>,
+    names: &[String],
+) -> Result<Vec<BTreeMap<String, u64>>, NoVerdictReason> {
+    let cells = cells.as_ref().map_err(|e| NoVerdictReason::Boot(format!("INFO: {e}")))?;
+    let mut rows = Vec::with_capacity(cells.len());
+    for (index, info) in cells.iter().enumerate() {
+        let phase = info.get("cap_census_phase").map_or("absent", String::as_str);
+        if phase != "serving" {
+            let why = format!("cell {index}'s cap_census_phase is {phase}, not serving");
+            return Err(NoVerdictReason::Boot(why));
+        }
+        let read = |name: &String| {
+            let value = info.get(&format!("cap_row_{name}"))?;
+            Some((name.clone(), entries_max(value)?))
+        };
+        rows.push(names.iter().filter_map(read).collect());
+    }
+    Ok(rows)
 }
 
 /// `entries_max=<n>,fill=…`: the census row's cap.
@@ -615,7 +625,11 @@ mod tests {
             })
         })
         .expect("every boot served");
-        assert_eq!(order, LEG_ORDER);
+        // The literal order: a blocked one (A A A B B B) puts the box's drift
+        // on one arm, and the reading is then off by twice the control.
+        let interleaved =
+            [Arm::Base, Arm::Candidate, Arm::Candidate, Arm::Base, Arm::Base, Arm::Candidate];
+        assert_eq!(order, interleaved);
         assert!(matches!(evaluate(&ran, &options(plant(3 * MIB))), ResidentVerdict::Over(_)));
         for wide in [Arm::Base, Arm::Candidate] {
             let mut noisy = arms(4 * MIB);
@@ -641,6 +655,50 @@ mod tests {
         });
         assert!(matches!(failed, Err(NoVerdictReason::Boot(_))), "a failed boot decides");
         assert_eq!(booted, 2, "and ends the run");
+    }
+
+    /// A cell's INFO: the census phase and `caps_row` at `entries_max` 64.
+    fn info(phase: &str, caps_row: &str) -> BTreeMap<String, String> {
+        [
+            ("cell", "0"),
+            ("cap_census_phase", phase),
+            ("cap_row_caps_row", caps_row),
+            ("cap_row_plant_row", "entries_max=128,fill=serving"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+    }
+
+    /// V4's census clause and V6's row read, on the scraped INFO alone.
+    #[test]
+    fn a_cell_not_serving_fails_its_boot_and_a_row_without_its_cap_is_vacuous() {
+        let names = vec!["caps_row".to_string(), "plant_row".to_string()];
+        let serving = "entries_max=64,fill=serving";
+        let cells = |second: BTreeMap<String, String>| {
+            Ok((0..CELLS)
+                .map(|cell| if cell == 1 { second.clone() } else { info("serving", serving) })
+                .collect())
+        };
+        let rows = census(&cells(info("serving", serving)), &names).expect("every cell serving");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[1].get("caps_row"), Some(&64));
+        assert_eq!(rows[1].get("plant_row"), Some(&128));
+        let loading = census(&cells(info("loading", serving)), &names);
+        let Err(NoVerdictReason::Boot(why)) = &loading else { panic!("{loading:?}") };
+        assert!(why.contains("cell 1's cap_census_phase is loading"), "{why}");
+        let mut unphased = info("serving", serving);
+        unphased.remove("cap_census_phase");
+        assert!(matches!(census(&cells(unphased), &names), Err(NoVerdictReason::Boot(_))));
+        let failed = census(&Err("scraped 3/4 cells".into()), &names);
+        assert!(matches!(failed, Err(NoVerdictReason::Boot(_))), "{failed:?}");
+        let rows = census(&cells(info("serving", "fill=serving")), &names).expect("serving");
+        assert_eq!(rows[1].get("caps_row"), None, "no entries_max: the row is absent");
+        let mut boots = arms(4 * MIB);
+        boots.candidate[0].rows = rows;
+        let verdict = evaluate(&boots, &options(plant(3 * MIB)));
+        let vacuous = |reason: &NoVerdictReason| matches!(reason, NoVerdictReason::Vacuous(_));
+        assert!(is_reason(&verdict, vacuous), "{verdict:?}");
     }
 
     #[test]

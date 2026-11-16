@@ -448,6 +448,17 @@ mod tests {
         assert!(PlantThreshold::new(u64::MAX, Control::of_bytes_cell(u64::MAX)).is_err());
     }
 
+    /// The plant's bound is strict: a reading of exactly nine tenths of the
+    /// plant (`10 r = 9 n`) is within, one byte more is over.
+    #[test]
+    fn a_plant_read_at_exactly_nine_tenths_is_within_and_one_byte_more_is_over() {
+        let n = 10 * CONTROL + 10;
+        let exact = n / 10 * 9;
+        assert_eq!(exact * 10, n * 9, "n is a multiple of ten");
+        assert!(is_within(&judge(reading(25 << 20, exact), &spreads(0, 0), plant(n))));
+        assert!(is_over(&judge(reading(25 << 20, exact + 1), &spreads(0, 0), plant(n))));
+    }
+
     #[test]
     fn a_budget_is_within_at_its_bound_and_over_one_byte_past() {
         let budget = Mode::Budget { budget_bytes_cell: 3 << 20 };
