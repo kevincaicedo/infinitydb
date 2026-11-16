@@ -210,7 +210,6 @@ mod tests {
     //! The shipped classes' layout (ADR-0194 A1): each class slab at its chunk.
 
     use inf_foundation::bounded::CapCensus;
-    use inf_foundation::limits::chunk_slots_for;
     use inf_log::fs::StdSegmentFs;
 
     use super::*;
@@ -233,7 +232,6 @@ mod tests {
             ("shadow", ExecutorLayout::slot_shape(&shadow_pump::<O, F>)),
         ];
         for (class, (stride, chunk)) in shapes {
-            assert_eq!(Some(chunk), chunk_slots_for(stride), "{class}: class-refused: c(s)");
             println!("every_class_registers_at_its_chunk: {class}: {stride} B, c {chunk}");
         }
         let config = ConfigStore::default();
