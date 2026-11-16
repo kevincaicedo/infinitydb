@@ -1657,6 +1657,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 (ColdGauge::LinksStale, counters.links_stale),
                 (ColdGauge::IdentityExhausted, cold.identity_refusals()),
                 (ColdGauge::IdentityPairsUsed, cold.identity_pairs_used()),
+                (ColdGauge::GateFull, cold.cold_gate_full()),
             ] {
                 gauges[slot as usize] = value;
             }
@@ -2094,6 +2095,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// (`gate_full`): derived never (ADR-0177 D4, E7).
     pub fn gate_full(&self) -> u64 {
         self.shared.gate.borrow().full()
+    }
+
+    /// The cold gate's requests refused for no free route or holder
+    /// (`cold_gate_full`): derived never while its cap is its product
+    /// (ADR-0177 D4); 0 on a cell with no cold engine. Not the fabric gate's
+    /// `gate_full`.
+    pub fn cold_gate_full(&self) -> u64 {
+        let tier = self.shared.tier.borrow();
+        tier.as_ref().and_then(|tier| tier.cold.as_ref()).map_or(0, |cold| cold.cold_gate_full())
     }
 
     /// The fabric gate's completions for no holder that awaits one

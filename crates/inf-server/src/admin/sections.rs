@@ -929,6 +929,7 @@ fn tiering_read_lines(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("cold_link_stale:{}", cold_gauge(C::LinksStale)));
     push(text, &format!("cold_identity_exhausted:{}", cold_gauge(C::IdentityExhausted)));
     push(text, &format!("cold_identity_pairs_used:{}", cold_gauge(C::IdentityPairsUsed)));
+    push(text, &format!("cold_gate_full:{}", cold_gauge(C::GateFull)));
     push(text, &format!("tiering_tail_allocs:{}", tiering.tail_allocs));
     push(text, &format!("tiering_seal_holes:{}", tiering.seal_holes));
     push(text, &format!("tiering_seal_hole_bytes:{}", tiering.seal_hole_bytes));

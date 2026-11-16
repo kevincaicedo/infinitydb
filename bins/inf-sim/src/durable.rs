@@ -2312,8 +2312,15 @@ impl Drop for Node {
         }
         // The fabric gate (ADR-0177 D4): no reserve found every holder
         // taken, and no completion named a holder that does not await one;
-        // both derived never, read from the plane at the life's end.
+        // the cold gate refused no read for a full gate. Each derived never,
+        // read from the plane at the life's end.
         for (index, (_, plane)) in self.cells.iter().enumerate() {
+            let cold_full = plane.cold_gate_full();
+            if cold_full != 0 {
+                let line =
+                    format!("COLD GATE FULL: cell {index}, {cold_full} reads, at a life's end");
+                verdict.violations.push(line);
+            }
             let (full, stale) = (plane.gate_full(), plane.gate_stale());
             if full != 0 {
                 let line = format!("GATE FULL: cell {index}, {full} reserves, at a life's end");

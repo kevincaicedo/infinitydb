@@ -99,10 +99,13 @@ pub enum ColdGauge {
     IdentityExhausted,
     /// The identity issuer's position: pairs spent or skipped.
     IdentityPairsUsed,
+    /// Requests the cold gate refused for no free route or holder,
+    /// cumulative: derived never while its cap is its product.
+    GateFull,
 }
 
 /// The number of [`ColdGauge`] slots.
-pub const COLD_GAUGES: usize = ColdGauge::IdentityPairsUsed as usize + 1;
+pub const COLD_GAUGES: usize = ColdGauge::GateFull as usize + 1;
 
 /// Default-initializable state surfaced through the command layer (M0-S19 + M1-S03):
 /// the frozen tripwire snapshot, the memory-attribution domains the store

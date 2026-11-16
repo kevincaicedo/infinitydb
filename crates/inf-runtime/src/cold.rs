@@ -1625,7 +1625,7 @@ impl ColdReads {
     /// (`cold_gate_full`, cell scope, cumulative): derived never while its
     /// cap is its product (ADR-0177 D4).
     #[must_use]
-    pub fn gate_full(&self) -> u64 {
+    pub fn cold_gate_full(&self) -> u64 {
         self.gate.full()
     }
 
@@ -3243,5 +3243,76 @@ mod tests {
         }
         drop(ops);
         assert_eq!(cold.reconcile(), Ok(()), "every value dropped: custody is back");
+    }
+
+    /// A cold host's whole draw on its gate at once: `reads` reads in flight
+    /// or delivered, each of `overflow_cap` members (one file a read), their
+    /// values unpolled, so every member's holder is held.
+    fn fill_reads(cold: &ColdReads, reads: usize, overflow_cap: usize) -> Vec<ColdWait> {
+        let mut members = Vec::with_capacity(reads * overflow_cap);
+        let mut ops = Vec::with_capacity(reads);
+        for read in 0..reads {
+            let fd = 1_000 + RawFd::try_from(read).expect("a small descriptor");
+            let file = TierFileId::new(10_000 + u32::try_from(read).expect("a small file"));
+            members.extend((0..overflow_cap).map(|_| ask(cold, fd, file, 0, 8)));
+            let issued = drain_ops(cold);
+            assert_eq!(issued.len(), 1, "read {read}: one window of {overflow_cap} members");
+            ops.extend(issued);
+        }
+        for op in ops {
+            let token = complete(op, 0x5A);
+            assert_eq!(deliver_all(cold, token, Ok(()), 1), overflow_cap as u32);
+        }
+        members
+    }
+
+    /// E §6's worst case at the default shape (ADR-0177 D4): `P` = 64 reads of
+    /// `overflow_cap` = 256 members delivered and unpolled, and both class
+    /// queues full, hold every one of the cap's 16,896 holders; the gate
+    /// refuses none. A cap one term short refuses here.
+    #[test]
+    fn the_cold_gates_worst_case_fills_its_cap_and_refuses_none() {
+        let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+        let config = ColdReadConfig::default();
+        let (reads, overflow_cap) = (64, config.overflow_cap);
+        let cold = ColdReads::with_config(AlignedPool::new(reads, BUF), config, &census);
+        let mut held = fill_reads(&cold, reads, overflow_cap);
+        for (class, file) in [(ReadClass::Foreground, 20_000), (ReadClass::Maintain, 20_001)] {
+            let file = TierFileId::new(file);
+            for at in 0..overflow_cap as u64 {
+                let wait = cold.enqueue(7, file, at * 4 * FRAME, 8, class, 2);
+                held.push(wait.expect("both queues fill with no refusal"));
+            }
+        }
+        let row = census.row("cold-gate-holders").expect("the cold gate's census row");
+        assert_eq!(row.high_water, 16_896, "every holder of the cap held at once");
+        assert_eq!(cold.cold_gate_full(), 0, "cold_gate_full: the worst case refuses none");
+        assert_eq!(cold.counters().queue_full, 0);
+        drop(held);
+    }
+
+    /// At `COLD-READ-QD` 128's shape (`P` 128, `overflow_cap` 512) the product
+    /// passes the ceiling, so the cap is 65,536 and 128 reads of 512 members
+    /// fill it: the next request is refused `QueueFull` at the gate, counted in
+    /// `queue_full` and `cold_gate_full`, and leaves nothing else (ADR-0177 D4):
+    /// no intent queued, no pin, the issuer where it was.
+    #[test]
+    fn a_full_cold_gate_refuses_like_a_full_queue() {
+        let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+        let config = ColdReadConfig { qd_cap: 128, overflow_cap: 512, ..ColdReadConfig::default() };
+        let cold = ColdReads::with_config(AlignedPool::new(128, BUF), config, &census);
+        let held = fill_reads(&cold, 128, 512);
+        let row = census.row("cold-gate-holders").expect("the cold gate's census row");
+        assert_eq!(row.high_water, 65_536, "engagement: the cap's every holder is held");
+        let file = TierFileId::new(30_000);
+        let before = footprint(&cold, file);
+        let refused = cold.enqueue(9, file, 0, 8, ReadClass::Foreground, 3);
+        assert!(matches!(refused, Err(ColdRefused::QueueFull)), "a full gate refuses");
+        let after = footprint(&cold, file);
+        let counted = ColdReadCounters { queue_full: before.0.queue_full + 1, ..before.0 };
+        assert_eq!(after.0, counted, "queue_full counts the refusal, nothing else moves");
+        assert_eq!((after.1, after.2, after.3), (before.1, before.2, before.3), "nothing queued");
+        assert_eq!(cold.cold_gate_full(), 1, "cold_gate_full counts the refusal");
+        drop(held);
     }
 }

@@ -123,3 +123,25 @@ pub(crate) const fn cold_gate_holders(overflow_cap: usize, buffers: usize) -> Ca
         Err(_) => panic!("the cold gate's cap is clamped to 1..=its ceiling"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{COLD_GATE_HOLDERS_MAX, cold_gate_holders};
+
+    /// The cold gate's cap is `overflow_cap × (2 + P)` below its ceiling and the ceiling at and
+    /// past it: the default shape, the last read depth under the ceiling, the first at it, the
+    /// saturating corner and an empty product.
+    #[test]
+    fn the_cold_gates_cap_is_its_product_clamped_to_its_ceiling() {
+        for (overflow_cap, buffers, holders) in [
+            (256, 64, 16_896),
+            (508, 127, 65_532),
+            (512, 128, COLD_GATE_HOLDERS_MAX),
+            (usize::MAX, usize::MAX, COLD_GATE_HOLDERS_MAX),
+            (0, 64, 1),
+        ] {
+            let cap = cold_gate_holders(overflow_cap, buffers);
+            assert_eq!(cap.entries_max(), holders, "({overflow_cap}, {buffers})");
+        }
+    }
+}

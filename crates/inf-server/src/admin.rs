@@ -1879,6 +1879,7 @@ mod tests {
             "cold_link_stale:0",
             "cold_identity_exhausted:0",
             "cold_identity_pairs_used:0",
+            "cold_gate_full:0",
         ] {
             assert!(text.contains(field), "{field}: {text}");
         }
