@@ -1793,9 +1793,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             self_push: Vec::new(),
         });
         let Some(key) = inserted else {
-            // The `conn` class is full (a closed connection's pump still
-            // ending holds its task), or the slab is full below the token
-            // slot width: the same refusal as the `maxclients` share.
+            // Admission bound (batch 12): the slab is full below
+            // the token slot width, or the `conn` class is full (a closed
+            // connection's pump still ending holds its task) — the same
+            // refusal as the `maxclients` share.
             self.refuse_accept(cx, fd);
             return;
         };
