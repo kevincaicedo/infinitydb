@@ -88,10 +88,14 @@ pub enum SlabLevels {
 }
 
 /// The rate legs' loop: `ops` steps over the keys `2 · (op & mask)`, with
-/// `NOPS` planted per op. Every rate leg and the harness run it, so the
-/// harness reads the loop's own share of each.
+/// `NOPS` planted per op. Every rate leg, every wait leg and the harness
+/// run it, so the harness reads the loop's own share of each.
 #[inline(always)]
-fn rate_loop<const NOPS: u8>(ops: u64, mask: u64, mut step: impl FnMut(u64) -> u64) -> u64 {
+pub(super) fn rate_loop<const NOPS: u8>(
+    ops: u64,
+    mask: u64,
+    mut step: impl FnMut(u64) -> u64,
+) -> u64 {
     let mut accumulator = 0u64;
     for op in 0..ops {
         plant::<NOPS>();
@@ -101,7 +105,7 @@ fn rate_loop<const NOPS: u8>(ops: u64, mask: u64, mut step: impl FnMut(u64) -> u
 }
 
 /// The keys the depth-14 legs walk: the harness walks the same.
-const MASK_14: u64 = (1 << 14) - 1;
+pub(super) const MASK_14: u64 = (1 << 14) - 1;
 
 /// Drives `ops` steps of `leg` with `NOPS` planted per op, then checks what
 /// they did.
@@ -304,7 +308,7 @@ const RETIRE_256: Cap = Cap::entries::<256>("bench-retire-256", CapFill::Serving
 const RETIRE_16448: Cap = Cap::entries::<16_448>("bench-retire-16448", CapFill::Serving);
 
 /// The slots one directory level covers: its children's chunks.
-const ONE_LEVEL_SLOTS: usize = MAP_CHUNK_SLOTS_MAX * MAP_DIRECTORY_CHILDREN_MAX;
+pub(super) const ONE_LEVEL_SLOTS: usize = MAP_CHUNK_SLOTS_MAX * MAP_DIRECTORY_CHILDREN_MAX;
 // The one-level legs' slab is one directory over its chunks and the `-2`
 // legs' slab two, so each op of a `-2` leg walks one link more than its
 // twin's: a smaller cap does not compile.
