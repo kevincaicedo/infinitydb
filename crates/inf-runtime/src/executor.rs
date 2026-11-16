@@ -346,7 +346,7 @@ impl Future for Park {
 /// `await`, and a slab lookup reborrows a whole chunk shared (a slice's length, a shared walk),
 /// which, over bytes outside an `UnsafeCell`, is a read that the aliasing model lets invalidate
 /// that `&mut` in every slot of the chunk. Inside the cell a shared reborrow freezes nothing, so
-/// a lookup of one slot leaves every future in its chunk as it was (`SAFETY.md` §3).
+/// a lookup of one slot leaves every future in its chunk as it was (this crate's `SAFETY.md`).
 enum TaskCell<F> {
     Live(UnsafeCell<ManuallyDrop<F>>),
     Done,
@@ -363,7 +363,7 @@ type ClassStore<F, const C: usize> = CappedSlab<TaskCell<F>, u64, Retire, C>;
 /// private here, every other borrow of the slab, shared or mutable, passes [`ClassSlab::slab`]
 /// or [`ClassSlab::slab_mut`], and each forgets the lend first. So a consecutive first poll
 /// reaches its slot with no walk, and the lend is never used past a borrow that could invalidate
-/// it (`SAFETY.md` §3).
+/// it (this crate's `SAFETY.md`).
 mod class {
     use core::cell::Cell;
     use core::ptr::NonNull;
