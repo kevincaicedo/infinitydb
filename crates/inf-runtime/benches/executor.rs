@@ -10,105 +10,35 @@
 //! and depth. `poll_direct` and `poll_direct_padded` poll each future once in a stack slot under
 //! a no-op waker, from the factory its executor legs use: read beside the executor's legs, never
 //! subtracted from them (the padded one pays its stack slot's store and reload, which the
-//! executor's slot does not).
+//! executor's slot does not). The futures, their factories and the fast step are
+//! `support/fast.rs`'s, which `executor_counts.rs` reads by instructions, so the time and the
+//! counts read one future and one step.
 
 use std::cell::Cell;
-use std::future::Future;
 use std::hint::black_box;
-use std::mem::MaybeUninit;
-use std::pin::{Pin, pin};
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use inf_foundation::CellId;
-use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_runtime::{
-    CellExecutor, ExecutorLayout, FabricGate, GateWait, PollImmediate, TaskAdmission, TaskClass,
-    TaskFactory,
+    CellExecutor, FabricGate, GateWait, PollImmediate, TaskAdmission, TaskClass, TaskFactory,
 };
 
-/// Tasks each bench's executor holds: at most one is alive at a time.
-const TASKS: Cap = Cap::entries::<64>("bench-tasks", CapFill::Serving);
+#[path = "support/fast.rs"]
+mod fast;
 
-/// The pad that puts a padded class's slot at 16 slots a chunk: a future of about 2,900 B.
-const PAD_BYTES: usize = 2_900;
-/// The padded classes, at one directory level and at two.
-const PADDED_2500: Cap = Cap::entries::<2_500>("bench-padded-2500", CapFill::Serving);
-const PADDED_10000: Cap = Cap::entries::<10_000>("bench-padded-10000", CapFill::Serving);
+use fast::{
+    PADDED_2500, PADDED_10000, TASKS, command_direct, command_task, executor_with, padded_task,
+    poll_direct, ready_once,
+};
 
 /// An executor of one class, the future `factory` makes, on a census of its own.
 fn executor_of<Args, Fac: TaskFactory<Args>>(factory: &Fac) -> (CellExecutor, TaskClass) {
     executor_with(factory, TASKS)
 }
 
-/// An executor of one class of `cap` tasks, the future `factory` makes.
-fn executor_with<Args, Fac: TaskFactory<Args>>(
-    factory: &Fac,
-    cap: Cap,
-) -> (CellExecutor, TaskClass) {
-    let (census, _mark) = CapCensus::new(CellId(0));
-    let mut layout = ExecutorLayout::new(&census);
-    let class = layout.class(factory, cap).expect("one class");
-    (layout.build().expect("no class refuses"), class)
-}
-
-/// One task of `class`, made by `make`, Ready on its first poll.
-#[inline(always)]
-fn ready_once<F: Future<Output = ()> + 'static>(
-    ex: &mut CellExecutor,
-    class: TaskClass,
-    make: impl FnOnce() -> F,
-) {
-    let TaskAdmission::Granted(permit) = ex.reserve::<F>(class) else {
-        panic!("the bench's class has room");
-    };
-    let outcome = permit.poll_immediate(make);
-    assert!(matches!(outcome, PollImmediate::Completed));
-}
-
-/// The fast path's command as a task.
-async fn command_task(counter: Rc<Cell<u64>>) {
-    command_direct(black_box(&counter));
-}
-
-/// The fast path's command as a padded task, written by hand so its body is the bench class's
-/// own (one `command_direct` call) and only its size differs: the pad, never written, takes its
-/// slot to 16 a chunk.
-struct PaddedTask {
-    counter: Option<Rc<Cell<u64>>>,
-    pad: MaybeUninit<[u8; PAD_BYTES]>,
-}
-
-/// The padded class's factory, for its executor legs and its direct poll alike.
-fn padded_task(counter: Rc<Cell<u64>>) -> PaddedTask {
-    PaddedTask { counter: Some(counter), pad: MaybeUninit::uninit() }
-}
-
-impl Future for PaddedTask {
-    type Output = ();
-
-    #[inline]
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-        black_box(&this.pad);
-        if let Some(counter) = this.counter.take() {
-            command_direct(black_box(&counter));
-        }
-        Poll::Ready(())
-    }
-}
-
 /// The slow path's task: it awaits its gate's value and keeps it.
 async fn waiter_task(waiter: GateWait<u64, u64>, sink: Rc<Cell<u64>>) {
     sink.set(waiter.await);
-}
-
-/// The "command" both sides run: a tiny read-modify-write, the shape of a
-/// fast-path GET hitting cell-local state.
-#[inline(never)]
-fn command_direct(counter: &Cell<u64>) {
-    counter.set(counter.get().wrapping_add(1));
 }
 
 fn bench_fast_path(c: &mut Criterion) {
@@ -126,26 +56,14 @@ fn bench_fast_path(c: &mut Criterion) {
     group.bench_function("poll_immediate_ready", |b| {
         b.iter(|| {
             let counter = Rc::clone(&counter);
-            let TaskAdmission::Granted(permit) = ex.reserve(class) else {
-                panic!("the bench's class has room");
-            };
-            let outcome = permit.poll_immediate(|| command_task(counter));
-            assert!(matches!(outcome, PollImmediate::Completed));
+            ready_once(&mut ex, class, || command_task(counter));
         });
     });
     group.bench_function("poll_direct", |b| {
-        b.iter(|| {
-            let mut cx = Context::from_waker(Waker::noop());
-            let future = pin!(command_task(Rc::clone(&counter)));
-            assert!(future.poll(&mut cx).is_ready());
-        });
+        b.iter(|| poll_direct(command_task(Rc::clone(&counter))));
     });
     group.bench_function("poll_direct_padded", |b| {
-        b.iter(|| {
-            let mut cx = Context::from_waker(Waker::noop());
-            let future = pin!(padded_task(Rc::clone(&counter)));
-            assert!(future.poll(&mut cx).is_ready());
-        });
+        b.iter(|| poll_direct(padded_task(Rc::clone(&counter))));
     });
     group.bench_function("poll_immediate_ready_twice", |b| {
         b.iter(|| {

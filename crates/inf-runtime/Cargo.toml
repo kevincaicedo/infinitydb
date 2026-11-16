@@ -72,6 +72,13 @@ name = "executor_ab"
 harness = false
 test = false
 
+# The fast path's executor share by instructions (ADR-0003's gate read on padded shapes): one
+# leg a process, `--leg <name> --ops <n>`, read by `perf stat`.
+[[bench]]
+name = "executor_counts"
+harness = false
+test = false
+
 # M0-S04 echo gate (Linux + uring only; skipped without the feature).
 [[bench]]
 name = "uring_echo"
