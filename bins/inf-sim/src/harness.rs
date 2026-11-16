@@ -1990,6 +1990,18 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             violations.push(format!("PARKED REFUSED: cell {i}, {refused} ops"));
         }
     }
+    // The fabric gate (ADR-0177 D4): no reserve found every holder taken,
+    // and no completion named a holder that does not await one; both
+    // derived never, read from the plane, not the stats flush's copies.
+    for (i, (_, plane)) in cells.iter().enumerate() {
+        let (full, stale) = (plane.gate_full(), plane.gate_stale());
+        if full != 0 {
+            violations.push(format!("GATE FULL: cell {i}, {full} reserves"));
+        }
+        if stale != 0 {
+            violations.push(format!("GATE STALE: cell {i}, {stale} completions"));
+        }
+    }
 
     // The waker's wiring check (ADR-0003 A1.4): every cell's `waker_foreign_ops`, the gauge
     // INFO's `# Tripwires` renders, reads 0. The simulator runs every cell's loop on one thread,

@@ -2310,6 +2310,21 @@ impl Drop for Node {
                     .push(format!("PARKED REFUSED: cell {index}, {refused} ops, at a life's end"));
             }
         }
+        // The fabric gate (ADR-0177 D4): no reserve found every holder
+        // taken, and no completion named a holder that does not await one;
+        // both derived never, read from the plane at the life's end.
+        for (index, (_, plane)) in self.cells.iter().enumerate() {
+            let (full, stale) = (plane.gate_full(), plane.gate_stale());
+            if full != 0 {
+                let line = format!("GATE FULL: cell {index}, {full} reserves, at a life's end");
+                verdict.violations.push(line);
+            }
+            if stale != 0 {
+                let line =
+                    format!("GATE STALE: cell {index}, {stale} completions, at a life's end");
+                verdict.violations.push(line);
+            }
+        }
         // The nets' own invariants and O1's breaches join the life's
         // verdict, which every durable run reads, so they are never dropped
         // with the node.
