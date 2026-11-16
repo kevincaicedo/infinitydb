@@ -11,8 +11,8 @@
 //!
 //! The executor answers a waker operation on two lanes (ADR-0003 A1): on its own thread the owner
 //! lane, on any other the foreign lane, which counts `waker_foreign_ops` and queues a wake for the
-//! next `run_ready`. A finished task's header is Held while a waker names it or a foreign wake for
-//! it is queued; the counting allocator reads where each header's bytes return.
+//! next `run_ready`. A finished task is Retired, its slot held, while a waker names its header or
+//! a foreign wake for it is queued; the last such waker's drop links its reclaim.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -31,10 +31,6 @@ use tasks::TestExecutor;
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator::new();
-
-/// A wake header's bytes: the bridge's four words and the owner part's five (the executor's
-/// `const` assertion holds it).
-const HEADER_BYTES: u64 = 72;
 
 /// Clones and drops each churn leg makes across threads: 10⁵ natively, 10² under Miri.
 const CHURN: usize = if cfg!(miri) { 100 } else { 100_000 };
@@ -148,9 +144,9 @@ impl<F: FnMut(&Waker) + Unpin> Future for ReadyAfter<F> {
 }
 
 /// A scoped thread clones the borrowed view of the polled waker and keeps the clone; the first
-/// poll is Ready. The foreign clone names the header, so it is Held, not kept spare, and the
-/// clone's drop frees it. The clone stays in a `ManuallyDrop` until the check: a header taken
-/// spare would be reused under it.
+/// poll is Ready. The foreign clone names the header, so the task is Retired, its slot held, and
+/// the clone's drop on the owner thread links its reclaim, which the next `run_ready` takes. The
+/// clone stays in a `ManuallyDrop` until the check: a slot freed would be reused under it.
 #[test]
 fn a_foreign_clone_keeps_a_finished_tasks_header() {
     let mut executor = TestExecutor::new();
@@ -166,10 +162,12 @@ fn a_foreign_clone_keeps_a_finished_tasks_header() {
     });
     assert_eq!(outcome, PollImmediate::Completed);
     assert_eq!(executor.waker_foreign_ops(), 1, "the scoped thread's clone is foreign");
-    assert_eq!(executor.held_headers(), 1, "a foreign clone keeps the finished task's header");
+    assert_eq!(executor.retired(), 1, "a foreign clone keeps the finished task's header");
     let clone = kept.borrow_mut().take().expect("the clone was kept");
     drop(ManuallyDrop::into_inner(clone));
-    assert_eq!(executor.held_headers(), 0, "the clone's drop on the owner thread frees it");
+    assert!(executor.has_ready(), "the clone's drop on the owner thread links the reclaim");
+    assert_eq!(executor.run_ready(4), 1, "one entry: the reclaim");
+    assert_eq!(executor.retired(), 0, "the reclaim freed the slot");
 }
 
 /// A task that counts its polls and stays Pending.
@@ -187,9 +185,9 @@ impl Future for CountPolls {
 }
 
 /// A scoped thread wakes the task while it polls, and the poll is Ready: the queued wake keeps
-/// the header Held (not spare), so the next first poll takes a new header and the drain delivers
-/// the wake to the finished one, which it then frees. A header recycled with its wake queued
-/// would hand the wake to the next task, which would then be polled twice.
+/// the task Retired (its slot held), so the next first poll takes another slot and the drain
+/// delivers the wake to the finished one, whose reclaim it then links. A slot freed with its
+/// header's wake queued would hand the wake to the next task, which would then be polled twice.
 #[test]
 fn a_foreign_wake_queued_for_a_finished_task_never_polls_the_next() {
     let mut executor = TestExecutor::new();
@@ -207,8 +205,8 @@ fn a_foreign_wake_queued_for_a_finished_task_never_polls_the_next() {
     assert!(executor.has_ready(), "the queued wake is ready work");
     let polled = executor.run_ready(4);
     assert_eq!(polls.get(), 1, "the next task was polled once, by its own first poll");
-    assert_eq!(polled, 0, "the drain wakes no task: the woken one is finished");
-    assert_eq!(executor.held_headers(), 0, "the drain freed the finished header");
+    assert_eq!(polled, 1, "the drain wakes no task: the one entry is the finished one's reclaim");
+    assert_eq!(executor.retired(), 0, "the reclaim freed the finished task's slot");
 }
 
 /// A task that completes once `done` is set, else stays Pending; it counts its polls.
@@ -266,7 +264,7 @@ fn clone_and_drop_churn_across_threads_counts_exactly() {
     let (done, polls, waker) = parked_until_done(&mut executor);
     let made_here: Vec<Waker> = (0..CHURN).map(|_| waker.clone()).collect();
     std::thread::spawn(move || drop(made_here)).join().expect("the other thread drops them");
-    assert_eq!(executor.held_headers(), 0, "the task is live: no header is Held");
+    assert_eq!(executor.retired(), 0, "the task is live: none is Retired");
     let shared = waker.clone();
     let made_there = std::thread::spawn(move || {
         let made: Vec<Waker> = (0..CHURN).map(|_| shared.clone()).collect();
@@ -283,7 +281,7 @@ fn clone_and_drop_churn_across_threads_counts_exactly() {
     assert_eq!(executor.run_ready(4), 1, "the woken task finishes");
     assert_eq!(polls.get(), 2);
     assert_eq!(executor.live_tasks(), 0);
-    assert_eq!(executor.held_headers(), 0, "no waker names it: freed at its release, not Held");
+    assert_eq!(executor.retired(), 0, "no waker names it: freed at its release, not Retired");
     assert!(!executor.has_ready(), "the foreign drops' entry was drained");
 }
 
@@ -312,8 +310,8 @@ fn a_foreign_wake_during_a_pending_poll_is_polled_at_the_next_run_ready() {
 }
 
 /// Keeps a clone of its own waker in its state; completes on its second poll (`finish`) or
-/// never. Its drop reads the thread's freed bytes around the drop of that clone: the clone is
-/// counted out while the header is Dead and undecided, which frees nothing.
+/// never. Its drop drops that clone, so the clone is counted out while the header is Finished
+/// and undecided.
 struct KeepsOwnClone {
     own: Option<Waker>,
     finish: bool,
@@ -338,37 +336,39 @@ impl Future for KeepsOwnClone {
 
 impl Drop for KeepsOwnClone {
     fn drop(&mut self) {
-        let before = ALLOC.thread_freed_bytes();
         drop(self.own.take());
-        assert_eq!(
-            ALLOC.thread_freed_bytes(),
-            before,
-            "the future's own clone dropped while its header is undecided freed nothing"
-        );
     }
 }
 
-/// A future keeps a clone of its own waker. Released by `run_ready`, its drop counts the clone
-/// out first, and the header's bytes return once, after it; dropped by the executor's drop, the
-/// same, and the executor's drop returns everything it allocated.
+/// A future keeps a clone of its own waker, in a class of one slot. Released by `run_ready`, its
+/// drop counts the clone out while the header is undecided, so the clone's drop links no reclaim
+/// and the decision frees the slot after it, its generation advanced exactly once: the next task
+/// takes that slot at the next generation, and nothing is left on the ready list. Dropped by the
+/// executor's drop, the same, and the executor's drop returns everything it allocated.
 #[test]
 fn a_future_that_keeps_its_own_waker_clone_is_freed_once() {
-    // The future's block: the test class's box of it, and the box's pointer where the task's
-    // storage holds it.
-    let block =
-        u64::try_from(size_of::<KeepsOwnClone>() + size_of::<tasks::Boxed>()).expect("a size");
+    // The future's block: the test class's box of it, which the release frees; the header array
+    // is freed only with the executor.
+    let block = u64::try_from(size_of::<KeepsOwnClone>()).expect("a size");
     // Leg 1: released by run_ready.
-    let mut executor = TestExecutor::new();
-    executor.spawn_local(KeepsOwnClone { own: None, finish: true, polls: 0 });
+    let mut executor = TestExecutor::one();
+    let first = executor.spawn_local(KeepsOwnClone { own: None, finish: true, polls: 0 });
     assert_eq!(executor.run_ready(1), 1, "the first poll keeps the clone and requeues");
     let before = ALLOC.thread_freed_bytes();
     assert_eq!(executor.run_ready(1), 1, "the second poll completes");
-    assert_eq!(
-        ALLOC.thread_freed_bytes() - before,
-        HEADER_BYTES + block,
-        "the release frees the future's block and, after its drop, the header, once"
+    assert_eq!(ALLOC.thread_freed_bytes() - before, block, "the release frees the block once");
+    assert!(
+        !executor.has_ready(),
+        "the future's own clone, dropped inside its drop before the decision, linked no reclaim"
     );
-    assert_eq!(executor.held_headers(), 0);
+    assert_eq!(executor.retired(), 0, "the decision freed the slot");
+    let next = executor.spawn_local(async {});
+    assert_eq!(
+        next.generation(),
+        first.generation() + 1,
+        "the slot's generation advanced exactly once, after the decision"
+    );
+    assert_eq!(executor.run_ready(1), 1);
     drop(executor);
     // Leg 2: dropped by the executor's drop, still pending.
     let allocated = ALLOC.thread_bytes();
@@ -402,7 +402,7 @@ fn two_executors_on_one_thread_both_take_the_owner_lane() {
     assert_eq!(second.waker_foreign_ops(), 0, "one thread, one mark: no foreign operation");
 }
 
-/// Exports clones of its waker into `keeper` and completes on its first poll: its header is Held.
+/// Exports a clone of its waker into `keeper` and completes on its first poll: it is Retired.
 fn finish_keeping_a_clone(executor: &mut TestExecutor, keeper: &Rc<RefCell<Vec<Waker>>>) {
     let keep = Rc::clone(keeper);
     let outcome = executor.poll_immediate(ReadyAfter {
@@ -411,26 +411,23 @@ fn finish_keeping_a_clone(executor: &mut TestExecutor, keeper: &Rc<RefCell<Vec<W
     assert_eq!(outcome, PollImmediate::Completed);
 }
 
-/// Drops the last clone `keeper` holds inside its poll and reads the freed bytes around it.
-fn drop_the_head_inside_a_poll(
+/// Drops the last clone `keeper` holds inside its poll.
+fn drop_the_last_inside_a_poll(
     keeper: &Rc<RefCell<Vec<Waker>>>,
-    freed_inside: &Rc<Cell<u64>>,
-) -> impl Future<Output = ()> + 'static {
+) -> impl Future<Output = ()> + use<> {
     let keeper = Rc::clone(keeper);
-    let freed_inside = Rc::clone(freed_inside);
     core::future::poll_fn(move |_cx| {
-        let before = ALLOC.thread_freed_bytes();
         drop(keeper.borrow_mut().pop());
-        freed_inside.set(ALLOC.thread_freed_bytes() - before);
         Poll::Ready(())
     })
 }
 
-/// Two finished tasks' headers are Held, each named by a clone a third task keeps. The third
-/// drops the clone of the held list's head inside its own poll, polled by `run_ready` and by
-/// `poll_immediate`: the header is unlinked and freed inside that poll, through its own `Rc` of
-/// the shared state, never through the executor the poll borrows. The executor's drop then
-/// closes the remaining node, which the last clone's drop frees.
+/// Two finished tasks are Retired, each named by a clone the test keeps. A third task drops one
+/// clone inside its own poll, polled by `run_ready` and by `poll_immediate`: the reclaim entry is
+/// linked inside that poll, a write of the ready list's tail in the header array, never through
+/// the executor the poll borrows; the slot stays Retired through the poll and is freed by the
+/// `run_ready` after it. The executor's drop then closes the other header, whose last clone's
+/// drop frees the array.
 #[test]
 fn a_waker_dropped_during_another_tasks_poll_frees_the_first_held_header() {
     for by_run_ready in [true, false] {
@@ -438,23 +435,52 @@ fn a_waker_dropped_during_another_tasks_poll_frees_the_first_held_header() {
         let keeper: Rc<RefCell<Vec<Waker>>> = Rc::default();
         finish_keeping_a_clone(&mut executor, &keeper);
         finish_keeping_a_clone(&mut executor, &keeper);
-        assert_eq!(executor.held_headers(), 2, "both finished headers are Held");
-        let freed_inside = Rc::new(Cell::new(0));
-        let third = drop_the_head_inside_a_poll(&keeper, &freed_inside);
+        assert_eq!(executor.retired(), 2, "both finished tasks are Retired");
+        let third = drop_the_last_inside_a_poll(&keeper);
         if by_run_ready {
             executor.spawn_local(third);
             assert_eq!(executor.run_ready(1), 1);
         } else {
             assert_eq!(executor.poll_immediate(third), PollImmediate::Completed);
         }
-        assert_eq!(
-            freed_inside.get(),
-            HEADER_BYTES,
-            "by_run_ready {by_run_ready}: the header's bytes were freed inside the poll"
+        assert_eq!(executor.retired(), 2, "by_run_ready {by_run_ready}: Retired through the poll");
+        assert!(
+            executor.has_ready(),
+            "by_run_ready {by_run_ready}: the dropped clone linked its entry, to be reclaimed next"
         );
-        assert_eq!(executor.held_headers(), 1, "the other header stays Held");
+        assert_eq!(executor.run_ready(4), 1, "the reclaim, at the run_ready after the poll");
+        assert_eq!(executor.retired(), 1, "one reclaimed; the other stays Retired");
         drop(executor);
         assert_eq!(keeper.borrow().len(), 1);
         drop(keeper);
     }
+}
+
+/// A finished task's slot is never reused while a waker names its header, in a class of one
+/// slot: the slot stays held (the class is full) until the clone's drop, and the reclaim frees
+/// it; the next task then holds it alone. A slot freed under the clone would give the header to
+/// the next task, which the stale clone would then wake.
+#[test]
+fn a_retired_slot_is_never_reused_while_a_waker_names_its_header() {
+    let mut executor = TestExecutor::one();
+    let keeper: Rc<RefCell<Vec<Waker>>> = Rc::default();
+    finish_keeping_a_clone(&mut executor, &keeper);
+    let polls = Rc::new(Cell::new(0));
+    let next = CountPolls { polls: Rc::clone(&polls) };
+    match executor.try_poll_immediate(next) {
+        None => {
+            assert_eq!(executor.retired(), 1, "the Retired task holds the one slot");
+            drop(keeper.borrow_mut().pop());
+            assert_eq!(executor.run_ready(4), 1, "the clone's drop linked the reclaim");
+            let next = CountPolls { polls: Rc::clone(&polls) };
+            let placed = executor.try_poll_immediate(next);
+            assert!(matches!(placed, Some(PollImmediate::Suspended(_))), "the slot is free now");
+        }
+        Some(_) => {
+            let stale = keeper.borrow_mut().pop().expect("the finished task's clone");
+            stale.wake();
+            executor.run_ready(4);
+        }
+    }
+    assert_eq!(polls.get(), 1, "no stale clone activates the new occupant");
 }

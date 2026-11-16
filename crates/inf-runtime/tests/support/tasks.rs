@@ -16,8 +16,11 @@ use inf_runtime::{CellExecutor, ExecutorLayout, PollImmediate, TaskAdmission, Ta
 /// The class's one future type.
 pub type Boxed = Pin<Box<dyn Future<Output = ()>>>;
 
-/// Tasks a test executor's class holds at once.
-pub const TEST_TASKS: Cap = Cap::entries::<4096>("test-tasks", CapFill::Serving);
+/// Tasks a test executor's class holds at once: each slot and its header are built at the
+/// executor's build, so the class stays small enough for Miri to build in every test.
+pub const TEST_TASKS: Cap = Cap::entries::<256>("test-tasks", CapFill::Serving);
+/// A class of one slot, which its next task can only reuse.
+pub const TEST_ONE: Cap = Cap::entries::<1>("test-one", CapFill::Serving);
 
 /// An executor of one boxed class and that class's handle; it derefs to the executor.
 pub struct TestExecutor {
@@ -28,20 +31,54 @@ pub struct TestExecutor {
 impl TestExecutor {
     /// On a census of its own.
     pub fn new() -> TestExecutor {
-        let (census, _mark) = CapCensus::new(CellId(0));
+        TestExecutor::at(0)
+    }
+
+    /// On a census of its own, cell `cell`'s: two at distinct cells are two cells' executors.
+    pub fn at(cell: u16) -> TestExecutor {
+        let (census, _mark) = CapCensus::new(CellId(cell));
         TestExecutor::on(&census)
     }
 
     /// On `census`.
     pub fn on(census: &Rc<CapCensus>) -> TestExecutor {
+        TestExecutor::of(census, TEST_TASKS)
+    }
+
+    /// Of one slot, on a census of its own.
+    pub fn one() -> TestExecutor {
+        let (census, _mark) = CapCensus::new(CellId(0));
+        TestExecutor::of(&census, TEST_ONE)
+    }
+
+    fn of(census: &Rc<CapCensus>, cap: Cap) -> TestExecutor {
         let mut layout = ExecutorLayout::new(census);
-        let class = layout.class(&|future: Boxed| future, TEST_TASKS).expect("one class");
+        let class = layout.class(&|future: Boxed| future, cap).expect("one class");
         TestExecutor { executor: layout.build().expect("no class refuses"), class }
+    }
+
+    /// `future` polled once in place as a task of the class, or `None` when the class is full.
+    pub fn try_poll_immediate(
+        &mut self,
+        future: impl Future<Output = ()> + 'static,
+    ) -> Option<PollImmediate> {
+        match self.executor.reserve::<Boxed>(self.class) {
+            TaskAdmission::Granted(permit) => Some(permit.poll_immediate(|| Box::pin(future))),
+            TaskAdmission::Full => None,
+            TaskAdmission::Exhausted | TaskAdmission::Foreign => {
+                panic!("the test class refused a task")
+            }
+        }
     }
 
     /// The class's handle.
     pub fn class(&self) -> TaskClass {
         self.class
+    }
+
+    /// The class's Retired count.
+    pub fn retired(&self) -> u32 {
+        self.executor.class_retired(self.class)
     }
 
     /// `future` polled once in place as a task of the class.

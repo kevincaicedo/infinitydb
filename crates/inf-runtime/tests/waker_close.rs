@@ -2,12 +2,13 @@
     clippy::disallowed_types,
     reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
 )]
-//! What an executor's drop leaves behind (ADR-0003 A1.3): it frees every future, its spare
-//! header, the scratch block and its shared state inside the drop, and closes each header a waker
-//! still names. A closed header is freed by its last waker's drop, on whichever thread drops it,
-//! and the remote stack with the last closed header it counts: nothing is kept for the process,
-//! however many executors it creates and drops. The counting allocator reads each byte back, per
-//! thread; Miri runs these too, its leak check on.
+//! What an executor's drop leaves behind (ADR-0003 A1.3): it frees every future and its class
+//! slabs inside the drop, and closes each header a waker still names. The header array, with the
+//! remote stack in it, is freed whole by the release of its last count: the executor's own when
+//! no waker outlives it, else the drop of the last waker that names a header in it, on whichever
+//! thread drops it. Nothing is kept for the process, however many executors it creates and drops.
+//! The counting allocator reads each byte back, per thread; Miri runs these too, its leak check
+//! on.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -17,7 +18,6 @@ use std::sync::mpsc;
 use std::task::{Context, Poll, Waker};
 
 use inf_alloc::CountingAllocator;
-use inf_foundation::wake::RemoteStack;
 use inf_runtime::PollImmediate;
 
 #[path = "support/tasks.rs"]
@@ -26,12 +26,6 @@ use tasks::TestExecutor;
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator::new();
-
-/// A wake header's bytes: the bridge's four words and the owner part's five (the executor's
-/// `const` assertion holds it).
-const HEADER_BYTES: u64 = 72;
-/// A remote stack's bytes.
-const STACK_BYTES: u64 = size_of::<RemoteStack>() as u64;
 
 /// Executors each repetition creates and drops: 10³ natively, 10² under Miri.
 const EXECUTORS: usize = if cfg!(miri) { 100 } else { 1_000 };
@@ -59,14 +53,19 @@ fn park(executor: &mut TestExecutor, out: &Rc<Cell<Option<Waker>>>) -> Waker {
     out.take().expect("the first poll exports its waker")
 }
 
+/// The executor's header array, the remote stack in it.
+fn array_bytes(executor: &TestExecutor) -> u64 {
+    u64::try_from(executor.header_array_bytes()).expect("a size")
+}
+
 /// A thread holds a waker past its executor's drop. Its wake does nothing (no executor is left
-/// to poll), and its drop frees the closed header and, the header being the stack's last count,
-/// the stack, on that thread.
+/// to poll), and its drop, the array's last count, frees the array and its stack on that thread.
 #[test]
 fn a_waker_another_thread_holds_past_the_executor_is_freed_there() {
     let out = Rc::default();
     let mut executor = TestExecutor::new();
     let waker = park(&mut executor, &out);
+    let array = array_bytes(&executor);
     let (to, from) = mpsc::sync_channel::<()>(0);
     let holder = std::thread::spawn(move || {
         from.recv().expect("the executor is dropped first");
@@ -78,7 +77,7 @@ fn a_waker_another_thread_holds_past_the_executor_is_freed_there() {
     drop(executor);
     to.send(()).expect("the holder waits");
     let freed = holder.join().expect("the holding thread");
-    assert_eq!(freed, HEADER_BYTES + STACK_BYTES, "the header and the stack, freed on that thread");
+    assert_eq!(freed, array, "the array and its stack, freed on that thread");
 }
 
 /// Builds an executor with two parked tasks, its two exported wakers, and the bytes the build
@@ -96,30 +95,32 @@ fn two_parked() -> (TestExecutor, Waker, Waker, u64) {
 }
 
 /// Two headers closed under wakers the owner thread keeps past the executor's drop, their last
-/// wakers dropped in either order. The executor's drop returns all it allocated but the two
-/// headers and the stack (the futures' blocks and the shared state among it: released at drop);
-/// each later drop returns its header, and the second the stack too.
+/// wakers dropped in either order. The executor's drop returns all it allocated but the header
+/// array (the futures' blocks and the class slab among it: released at drop); the first later
+/// drop returns nothing, the other closed header holding the array, and the second the array
+/// whole, its stack with it, once.
 #[test]
 fn an_executor_dropped_before_its_threads_last_wakers_frees_each_at_its_drop() {
     for first_dropped_first in [true, false] {
         let (executor, first, second, allocated) = two_parked();
+        let array = array_bytes(&executor);
         let before = ALLOC.thread_freed_bytes();
         drop(executor);
         assert_eq!(
             ALLOC.thread_freed_bytes() - before,
-            allocated - 2 * HEADER_BYTES - STACK_BYTES,
-            "released at drop: the futures and the shared state, all but the closed headers"
+            allocated - array,
+            "released at drop: the futures and the class slab, all but the header array"
         );
         let (one, two) = if first_dropped_first { (first, second) } else { (second, first) };
         let before = ALLOC.thread_freed_bytes();
         drop(one);
-        assert_eq!(ALLOC.thread_freed_bytes() - before, HEADER_BYTES, "its header, freed");
+        assert_eq!(ALLOC.thread_freed_bytes() - before, 0, "an earlier drop frees nothing");
         let before = ALLOC.thread_freed_bytes();
         drop(two);
         assert_eq!(
             ALLOC.thread_freed_bytes() - before,
-            HEADER_BYTES + STACK_BYTES,
-            "its header and, the last count, the stack"
+            array,
+            "the last waker-named header's drop: the array, freed whole with its stack"
         );
     }
 }
@@ -170,20 +171,20 @@ fn held_past_drop(
 }
 
 /// One executor's life with no waker left past its drop: the bytes it kept. After the parked
-/// task, a first poll that completes leaves the executor a spare header, which its drop frees
-/// open: the spare is in the window too.
+/// task, a first poll that completes frees its slot at once: the executor's drop releases the
+/// array with its own count.
 fn none_left(out: &Rc<Cell<Option<Waker>>>) -> i128 {
     kept_across(|| {
         let mut executor = TestExecutor::new();
         drop(park(&mut executor, out));
         let outcome = executor.poll_immediate(async {});
-        assert_eq!(outcome, PollImmediate::Completed, "a first poll that completes keeps a spare");
+        assert_eq!(outcome, PollImmediate::Completed, "a first poll that completes");
         drop(executor);
     })
 }
 
 /// Executors created and dropped in one process keep nothing: each dropped under a waker another
-/// thread holds and then drops, and again with no waker left and a spare header. Allocated less
+/// thread holds and then drops, and again with no waker left. Allocated less
 /// freed, summed over both threads across each executor's build and drop and each held waker's
 /// drop, is 0.
 #[test]

@@ -2,15 +2,18 @@
 //! correctness under randomized interleavings vs a reference model, and
 //! zero-leak slab accounting.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use inf_foundation::CellId;
+use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_runtime::gate::{KeyedGate, ListWait};
 use inf_runtime::{
-    CompletionToken, FabricGate, IoGate, PollImmediate, TokenClass, WaitList, WatermarkGate,
+    CellExecutor, CompletionToken, ExecutorLayout, FabricGate, IoGate, PollImmediate,
+    TaskAdmission, TaskClass, TokenClass, WaitList, WatermarkGate, Woken,
 };
 use proptest::prelude::*;
 
@@ -127,7 +130,8 @@ fn wake_during_poll_requeues_without_losing_the_task() {
 }
 
 /// A future that leaks a waker clone and then completes immediately —
-/// the executor must tolerate the escaped clone (dead wakes are no-ops).
+/// the executor must tolerate the escaped clone (a Retired task's wakes are
+/// no-ops; the clone's drop links its reclaim, charged to the next slice).
 struct WakerThief(Rc<RefCell<Option<Waker>>>);
 
 impl Future for WakerThief {
@@ -145,9 +149,13 @@ fn escaped_waker_clone_on_fast_path_is_harmless() {
     let outcome = ex.poll_immediate(WakerThief(Rc::clone(&stolen)));
     assert_eq!(outcome, PollImmediate::Completed);
     let waker = stolen.borrow_mut().take().expect("clone escaped");
-    waker.wake(); // dead header: must be a silent no-op
+    assert_eq!(ex.retired(), 1, "the escaped clone keeps the finished task Retired");
+    waker.wake_by_ref(); // Retired: must be a silent no-op
     assert_eq!(ex.live_tasks(), 0);
-    assert_eq!(ex.run_ready(64), 0, "dead wake must not queue anything");
+    assert!(!ex.has_ready(), "a Retired task's wake must not queue anything");
+    waker.wake(); // the last clone: its drop links the reclaim
+    assert_eq!(ex.run_ready(64), 1, "one reclaim entry, no activation");
+    assert_eq!(ex.retired(), 0);
 }
 
 #[test]
@@ -376,5 +384,122 @@ proptest! {
         while ex.run_ready(16) > 0 {}
         prop_assert_eq!(ex.live_tasks(), 0);
         prop_assert_eq!(gate.pending(), 0);
+    }
+}
+
+/// Two executors built alike, each layout on its own cell's census, mint the same class index
+/// and `TypeId`: a class of one reserved on the other is `Foreign`, and a `TaskId` of one given
+/// to the other's `wake` is `Stale`; nothing is taken or woken on either (ADR-0171 A2.1).
+#[test]
+fn a_class_and_a_task_of_one_executor_are_foreign_to_another_built_alike() {
+    let mut one = TestExecutor::at(0);
+    let mut other = TestExecutor::at(1);
+    let id = one.spawn_local(core::future::pending::<()>());
+    assert_eq!(one.run_ready(1), 1, "the task parks");
+    let admission = other.reserve::<tasks::Boxed>(one.class());
+    assert!(
+        matches!(admission, TaskAdmission::Foreign),
+        "a class of one executor: Foreign, not Granted on the other, built alike"
+    );
+    drop(admission);
+    assert_eq!(other.wake(id), Woken::Stale, "a task of one executor is Stale on the other");
+    assert!(!one.has_ready() && !other.has_ready(), "nothing woken on either");
+    assert_eq!(other.class_tasks(other.class()), 0, "nothing taken on the other");
+    assert_eq!(other.class_tasks(one.class()), 0, "the other reads no count for one's class");
+    assert_eq!(one.class_tasks(one.class()), 1, "one's task stays");
+}
+
+/// A future of no bytes: it completes on its second poll, counted in a thread-local, since it
+/// holds nothing.
+struct ZeroSized;
+
+thread_local! {
+    static ZERO_SIZED_POLLS: Cell<u32> = const { Cell::new(0) };
+}
+
+impl Future for ZeroSized {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let polls = ZERO_SIZED_POLLS.with(|polls| {
+            polls.set(polls.get() + 1);
+            polls.get()
+        });
+        if polls == 1 {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        Poll::Ready(())
+    }
+}
+
+/// A future aligned past any allocator's default: it reads its own address at each poll and
+/// completes on its second.
+#[repr(align(4096))]
+struct OverAligned {
+    seen: Rc<RefCell<Vec<usize>>>,
+}
+
+impl Future for OverAligned {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let at = core::ptr::from_ref::<Self>(&self) as usize;
+        let mut seen = self.seen.borrow_mut();
+        seen.push(at);
+        if seen.len() == 1 {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        Poll::Ready(())
+    }
+}
+
+const ODD_TASKS: Cap = Cap::entries::<2>("test-odd-futures", CapFill::Serving);
+
+/// An executor of one class of `F`, which `factory` makes.
+fn of_one<F: Future<Output = ()> + 'static>(
+    factory: &impl Fn(F) -> F,
+) -> (CellExecutor, TaskClass) {
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let class = layout.class(factory, ODD_TASKS).expect("one class");
+    (layout.build().expect("no class refuses"), class)
+}
+
+/// A zero-sized future and one aligned to 4 KiB, each its class's one type, unboxed: each is
+/// placed in its slot before its first poll, woken by its own waker, polled at the address it was
+/// placed at (the aligned one at its alignment), and dropped in place, by `poll_immediate` and by
+/// `spawn_local`.
+#[test]
+fn a_zero_sized_and_an_over_aligned_future_run_in_their_slots() {
+    let (mut executor, class) = of_one(&|future: ZeroSized| future);
+    let TaskAdmission::Granted(permit) = executor.reserve::<ZeroSized>(class) else {
+        panic!("the class has room");
+    };
+    assert!(matches!(permit.poll_immediate(|| ZeroSized), PollImmediate::Suspended(_)));
+    assert_eq!(executor.run_ready(4), 1, "the zero-sized future's own wake polls it");
+    assert_eq!(ZERO_SIZED_POLLS.with(Cell::get), 2);
+    assert_eq!(executor.live_tasks(), 0);
+
+    let (mut executor, class) = of_one(&|future: OverAligned| future);
+    for immediate in [true, false] {
+        let seen: Rc<RefCell<Vec<usize>>> = Rc::default();
+        let TaskAdmission::Granted(permit) = executor.reserve::<OverAligned>(class) else {
+            panic!("the class has room");
+        };
+        let make = || OverAligned { seen: Rc::clone(&seen) };
+        if immediate {
+            assert!(matches!(permit.poll_immediate(make), PollImmediate::Suspended(_)));
+        } else {
+            permit.spawn_local(make);
+            assert_eq!(executor.run_ready(1), 1, "the first poll");
+        }
+        assert_eq!(executor.run_ready(4), 1, "the aligned future's own wake polls it");
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2, "immediate {immediate}: two polls");
+        assert_eq!(seen[0], seen[1], "immediate {immediate}: polled where it was placed");
+        assert_eq!(seen[0] % 4096, 0, "immediate {immediate}: at its alignment");
+        assert_eq!(executor.live_tasks(), 0);
     }
 }
