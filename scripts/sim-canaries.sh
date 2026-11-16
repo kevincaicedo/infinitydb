@@ -1137,9 +1137,9 @@ ordered_rows=(
   "inf_canary_command_registers_client m0-capacity ghost-client-row --close-leg registry-reset"
   # The `conn` class's slots are the cell's share (ADR-0177 D2) and its bytes E-store's F7 bill.
   # Planted, it is built over (1 + k) C slots, k from its stride: the idle node's resident
-  # memory a cell rises by k x C x s_conn, 2,500 x 3,056 B at 4 cells (k = 1), over F7's
+  # memory a cell rises by k x C x s_conn, 2,500 x 3,064 B at 4 cells (k = 1), over F7's
   # 256 KiB, which the plain node's three boots stay within.
-  "inf_canary_conn_slots_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 7640000 --control-bytes-cell 262144 --plant-row conn-tasks"
+  "inf_canary_conn_slots_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 7660000 --control-bytes-cell 262144 --plant-row conn-tasks"
   # The divert parks an origin's durable apply behind its pump while the pump is applying or
   # holds its work (ADR-0083 D1), so an origin has one open gated slot, its back (ADR-0177 D6).
   # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
