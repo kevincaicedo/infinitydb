@@ -1801,7 +1801,9 @@ mod tests {
     /// held, equal the model's. A wait dropped under its hold keeps its
     /// slot until the release (ADR-0177 D4). Planted, that drop frees the
     /// slot, so the gate holds one slot fewer than the model, and the old
-    /// hold could read the slot's next occupant (KE13).
+    /// hold could read the slot's next occupant. A granted permit
+    /// dropped unregistered takes back the route and holder `reserve`
+    /// published: the model holds neither.
     #[test]
     fn the_keyed_gate_holds_what_its_model_holds() {
         const CAP: usize = 8;
@@ -1814,6 +1816,7 @@ mod tests {
         let mut rng = inf_foundation::rng::SplitMix64::new(0x6B65_7965_6400_0013);
         let mut cx = Context::from_waker(Waker::noop());
         let mut held_drops = 0u32;
+        let mut permit_drops = 0u32;
         for step in 0..20_000u32 {
             let pick = |rng: &mut inf_foundation::rng::SplitMix64, n: usize| {
                 usize::try_from(rng.next_u64() % n as u64).expect("a small index")
@@ -1822,6 +1825,7 @@ mod tests {
                 0 => {
                     let key = rng.next_u64() % KEYS;
                     let held = rng.next_u64() & 1 == 1;
+                    let unregistered = rng.next_u64().is_multiple_of(4);
                     let expected = if model.routes.contains_key(&key) {
                         "duplicate"
                     } else if model.holders.len() == CAP {
@@ -1831,6 +1835,11 @@ mod tests {
                         "granted"
                     };
                     match gate.reserve(key) {
+                        KeyedAdmission::Granted(permit) if unregistered => {
+                            assert_eq!(expected, "granted", "step {step}: key {key} granted");
+                            drop(permit);
+                            permit_drops += 1;
+                        }
                         KeyedAdmission::Granted(permit) => {
                             assert_eq!(expected, "granted", "step {step}: key {key} granted");
                             let id = model.next;
@@ -1917,6 +1926,7 @@ mod tests {
             assert_eq!(gate.full(), model.full, "full-counted: step {step}");
         }
         assert!(held_drops > 0, "VACUOUS: no wait was dropped under its hold");
+        assert!(permit_drops > 0, "VACUOUS: no granted permit was dropped");
         assert!(model.full > 0, "VACUOUS: the gate never filled");
     }
 
