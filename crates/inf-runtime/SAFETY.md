@@ -189,8 +189,9 @@ Invariants:
 Miri (strict provenance, its data-race detector, Stacked Borrows, the leak
 check) runs `tests/executor.rs`, `tests/waker_threads.rs` and
 `tests/waker_close.rs` on its default schedule, and again under Tree
-Borrows (`-Zmiri-tree-borrows`), and `tests/waker_race.rs` on the pinned
-schedules above; Loom models the lane's protocol on
+Borrows (`-Zmiri-tree-borrows`); the unit test
+`executor::tests::the_shared_door_forgets_the_lend` under both models, in
+runs of its own; and `tests/waker_race.rs` on the pinned schedules above; Loom models the lane's protocol on
 `inf_foundation::wake`'s own types. Neither models the kernel, and none of
 this rests on one.
 

@@ -478,6 +478,13 @@ mod class {
             self.spare.is_some()
         }
 
+        /// The spare's handle, for the unit test that borrows the spare's chunk through the
+        /// shared door.
+        #[cfg(test)]
+        pub(super) fn spare(&self) -> Option<SlotId<u64>> {
+            self.spare
+        }
+
         /// The spare, lent for one permit: through the kept lend, with no slab call; else by
         /// `get_mut` of the spare's handle; else, with no spare, the slab's `reserve` and
         /// `publish_mut` of the husk, whose handle becomes the spare (counted and reported as
@@ -1934,7 +1941,7 @@ impl core::fmt::Debug for CellExecutor {
 mod tests {
     //! The owner lane's bound, which no public path reaches before 2⁶⁰ clones.
 
-    use inf_foundation::bounded::CapFill;
+    use inf_foundation::bounded::{CapFill, Lookup};
 
     use super::*;
 
@@ -1975,6 +1982,39 @@ mod tests {
             link_ready(header);
             link_ready(header);
         }
+    }
+
+    /// The shared door forgets the kept lend: a fast op lends the spare, the spare's chunk is then
+    /// borrowed shared through `slab()` (a lookup of the spare), and the next fast op lends the
+    /// spare again. A lend kept past that shared reborrow of its chunk is good for reads alone
+    /// under Tree Borrows, which refuses the next fast op's write through it; Stacked Borrows
+    /// accepts it. Miri runs this test under both models; natively it reads the two ops.
+    #[test]
+    fn the_shared_door_forgets_the_lend() {
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(0));
+        let mut layout = ExecutorLayout::new(&census);
+        let class = layout.class(&|f: Probe| f, ONE).expect("one class");
+        let mut executor = layout.build().expect("no class refuses");
+        let hits = Rc::new(Cell::new(0u32));
+        let fast = |executor: &mut CellExecutor| {
+            let TaskAdmission::Granted(permit) = executor.reserve::<Probe>(class) else {
+                panic!("the probe's class has its spare");
+            };
+            let hit = Rc::clone(&hits);
+            let outcome = permit.poll_immediate(|| Box::pin(async move { hit.set(hit.get() + 1) }));
+            assert_eq!(outcome, PollImmediate::Completed, "Ready on its first poll");
+        };
+        fast(&mut executor);
+        let entry = &mut executor.classes[0];
+        let slab = class_slab::<Probe, { chunk_of::<Probe>() }>(entry.slab_type, &mut entry.object)
+            .expect("the probe's class");
+        let spare = slab.spare().expect("a fast op leaves its slot the spare");
+        let Lookup::Live(TaskCell::Done) = slab.slab().get(spare) else {
+            panic!("the spare is live and holds the husk");
+        };
+        fast(&mut executor);
+        assert_eq!(hits.get(), 2, "two fast ops");
+        assert_eq!(executor.live_tasks(), 0);
     }
 
     /// An owner-lane clone at `LANE_COUNT_MAX` aborts the process before the count is written;

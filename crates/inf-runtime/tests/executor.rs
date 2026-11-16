@@ -666,9 +666,10 @@ fn the_spare_lend_survives_every_other_borrow() {
 }
 
 /// Fast ops on one class with an id's lookup and a shared borrow of the slab between them: the
-/// lookup reads the task's header alone, so the lend is kept across it; the count borrows the
-/// slab shared and forgets the lend, so the next fast op lends the spare again (a lend kept past
-/// a shared reborrow of its chunk would be good for reads alone under Tree Borrows).
+/// lookup reads the task's header alone, so the lend is kept across it; the count passes the
+/// slab's shared door, which forgets the lend, so the next fast op lends the spare again. The
+/// count reads no chunk, so this test cannot see the door's forget: the unit test
+/// `executor::tests::the_shared_door_forgets_the_lend` borrows the spare's chunk through it.
 #[test]
 fn the_kept_lend_across_an_id_lookup_and_a_shared_borrow() {
     let mut ex = TestExecutor::new();
