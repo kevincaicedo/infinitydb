@@ -101,11 +101,16 @@ place (its index and class, written once at the array's build); then the
 owner part (the task's state, its slot's handle, the owner count `o` and
 the ready list's link), cell-local `Cell`s. The array is one allocation:
 the remote stack first, the ready list's two ends and the headers' count,
-then the headers, parallel to the class slabs. Every header pointer is
-derived from the array's, so a waker's data pointer and a push's node carry
-the provenance of the whole allocation, and `array_of` steps back from a
-header to the array by its index on any thread. `WakeBridge` and
-`RemoteStack` are const-asserted `Sync`.
+then the headers, parallel to the class slabs: class `j`'s slot `i` is
+header `base_j + i`, `i` below the class's slots, so `base_j + i < len`.
+`wake(id)` and `is_live` compare an id's index with its class's slots
+before they form the header's pointer; the instance compare tells another
+cell's slab apart and bounds nothing, since two censuses of one cell mint
+equal instances (ADR-0194 D5). Every header pointer is derived from the
+array's, so a waker's data pointer and a push's node carry the provenance
+of the whole allocation, and `array_of` steps back from a header to the
+array by its index on any thread. `WakeBridge` and `RemoteStack` are
+const-asserted `Sync`.
 
 Invariants:
 
@@ -191,9 +196,9 @@ check) runs `tests/executor.rs`, `tests/waker_threads.rs` and
 `tests/waker_close.rs` on its default schedule, and again under Tree
 Borrows (`-Zmiri-tree-borrows`); the unit test
 `executor::tests::the_shared_door_forgets_the_lend` under both models, in
-runs of its own; and `tests/waker_race.rs` on the pinned schedules above; Loom models the lane's protocol on
-`inf_foundation::wake`'s own types. Neither models the kernel, and none of
-this rests on one.
+runs of its own; and `tests/waker_race.rs` on the pinned schedules above;
+Loom models the lane's protocol on `inf_foundation::wake`'s own types.
+Neither models the kernel, and none of this rests on one.
 
 `waker_ref` builds a borrowed view in `ManuallyDrop`, so the executor's own
 polls take no count; the future pays an owner-lane count only if it clones
@@ -240,10 +245,11 @@ written over the husk (no drop glue: the write drops nothing) and polled
 there; Ready and quiet, the slot stays the spare; otherwise the spare's
 handle leaves it by `take()`: for the task's id or the Retired header, before
 either exists, or, when the poll unwinds with the future live, for the
-task's header, before the unwind leaves the poll. From the first poll to the in-place drop the future is at
-one address: the spare's slot, which every later poll reaches by `get_mut`
-of the handle (a Live slot lies where it is until a take, a release or a
-retire step, ADR-0194 D1's notes). `tests/executor.rs`'s
+task's header, before the unwind leaves the poll. From the first poll to
+the in-place drop the future is at one address: the spare's slot, which
+every later poll reaches by `get_mut` of the handle (a Live slot lies where
+it is until a take, a release or a retire step, ADR-0194 D1's notes).
+`tests/executor.rs`'s
 `the_first_poll_runs_in_its_slot_and_keeps_its_wake` reads that address at
 each poll and at the drop, and `the_spare_serves_no_task_an_id_names` that
 a suspended task's slot is never the spare.
@@ -261,8 +267,9 @@ pointer usable for reads alone (Tree Borrows freezes it). The `&mut` lives
 for the permit, which borrows the executor `&mut`, so nothing else reaches
 the slab meanwhile. A wake and a last waker's drop during a poll touch only
 the header array, never a class slab, and so do `wake(id)` and `is_live`,
-which compare the class slab's instance and read the task's header. Miri
-reads the sequence under Stacked Borrows and under `-Zmiri-tree-borrows`:
+which compare the class slab's instance and the id's index under the
+header bound above, then read the task's header. Miri reads the sequence
+under Stacked Borrows and under `-Zmiri-tree-borrows`:
 `tests/executor.rs`'s `the_spare_lend_survives_every_other_borrow` (a spawn
 and its run, a reclaim, an id's lookups, a Pending first poll and its
 completion, each between fast first polls) and
