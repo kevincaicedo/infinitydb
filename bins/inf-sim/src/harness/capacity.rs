@@ -541,7 +541,7 @@ impl Rig {
     }
 
     /// A close's drain counter of cell X, read beside the wire (`INFO
-    /// stats`' own lines): the leg's engagement and the ticket's reading.
+    /// stats`' own lines): the leg's engagement and a reading it prints.
     fn drain_count(&mut self, name: &'static str, read: fn(&NodeInfo) -> u64) -> u64 {
         let value = read(&self.nodes[X]);
         self.read(name, value);

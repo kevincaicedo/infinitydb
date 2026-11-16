@@ -649,14 +649,14 @@ fn a_set_after_quit_does_not_run() {
     node.rounds(2);
     node.send(0, CLIENT, &frame(&[b"SET", b"after", b"quit"]));
     node.rounds(2);
-    assert_eq!(client_slot(&node, 0, out_len), 0, "engagement: the +OK is in flight, unsent");
-    node.hold_sends(0, CLIENT, false);
-    node.rounds(4);
-    assert!(node.closed(0).contains(&CLIENT), "the QUIT closes the connection");
-    assert_eq!(written_text(&node, 0), "+OK\r\n", "the QUIT's +OK alone, then the close");
+    assert!(node.written(0, CLIENT).is_empty(), "engagement: the +OK is still unsent");
     assert_eq!(
         read_back(&mut node, 0, b"after"),
         b"$-1\r\n",
         "post-quit-ran: a SET after QUIT ran"
     );
+    node.hold_sends(0, CLIENT, false);
+    node.rounds(4);
+    assert!(node.closed(0).contains(&CLIENT), "the QUIT closes the connection");
+    assert_eq!(written_text(&node, 0), "+OK\r\n", "the QUIT's +OK alone, then the close");
 }
