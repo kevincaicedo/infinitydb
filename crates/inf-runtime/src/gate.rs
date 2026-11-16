@@ -1347,6 +1347,244 @@ mod tests {
         RefCell::new(FabricGate::build(1, units, Some(holders), &census).expect("the test gate"))
     }
 
+    /// One registered wait on `gate` under `units`, and the key its request
+    /// carries.
+    fn fabric_wait<'u>(
+        gate: &'u RefCell<FabricGate<u64>>,
+        units: &'u GateUnits,
+    ) -> (u64, GateWait<'u, u64>) {
+        let mut borrowed = gate.borrow_mut();
+        let FabricAdmission::Granted(permit) = borrowed.reserve(units) else {
+            panic!("a unit and a holder are free");
+        };
+        let key = permit.key();
+        (key, permit.register(gate))
+    }
+
+    /// E §1, Registered or Waiting × the waiter dropped → Orphaned, then
+    /// Orphaned × `complete` → Free: the slot waits for its request's one
+    /// completion, which frees it as an orphan and counts nothing stale.
+    #[test]
+    fn an_orphaned_holder_frees_at_its_late_completion() {
+        let gate = fabric_gate(4);
+        let units = gate.borrow().units(1).expect("a unit");
+        let mut cx = Context::from_waker(Waker::noop());
+        let (key, mut wait) = fabric_wait(&gate, &units);
+        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending(), "engagement: waiting");
+        drop(wait);
+        assert_eq!(units.free(), 1, "the unit returns at the drop");
+        assert_eq!(gate.borrow().holders(), 1, "orphan-freed-at-drop: the slot waits, Orphaned");
+        assert_eq!(FabricGate::complete(&gate, key, 7, Nanos(1)), Delivery::Orphan);
+        assert_eq!(gate.borrow().holders(), 0, "the late completion frees it");
+        assert_eq!(gate.borrow().stale(), 0, "an orphan's one completion is not stale");
+    }
+
+    /// E §1, Delivered × `complete` → unchanged: a second completion of one
+    /// key is an orphan and stale, and the parked value stays the waiter's.
+    #[test]
+    fn a_second_completion_leaves_the_parked_value() {
+        let gate = fabric_gate(4);
+        let units = gate.borrow().units(1).expect("a unit");
+        let mut cx = Context::from_waker(Waker::noop());
+        let (key, mut wait) = fabric_wait(&gate, &units);
+        assert_eq!(FabricGate::complete(&gate, key, 1, Nanos(1)), Delivery::Delivered);
+        assert_eq!(FabricGate::complete(&gate, key, 2, Nanos(2)), Delivery::Orphan);
+        assert_eq!(gate.borrow().stale(), 1);
+        assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(1), "the first value");
+        assert_eq!(gate.borrow().holders(), 0);
+    }
+
+    /// E §1, a key of another origin or without the tag → unchanged: an
+    /// orphan, counted stale, and the holder it would alias still waits.
+    #[test]
+    fn a_foreign_or_untagged_key_completes_nothing() {
+        let gate = fabric_gate(4);
+        let units = gate.borrow().units(1).expect("a unit");
+        let mut cx = Context::from_waker(Waker::noop());
+        let (key, mut wait) = fabric_wait(&gate, &units);
+        let foreign = key ^ (1 << GATE_KEY_ORIGIN_SHIFT);
+        let untagged = key & !(1 << GATE_KEY_TAG_BIT);
+        assert_eq!(FabricGate::complete(&gate, foreign, 1, Nanos(1)), Delivery::Orphan);
+        assert_eq!(FabricGate::complete(&gate, untagged, 2, Nanos(1)), Delivery::Orphan);
+        assert_eq!(gate.borrow().stale(), 2);
+        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending(), "the holder still waits");
+        assert_eq!(FabricGate::complete(&gate, key, 3, Nanos(1)), Delivery::Delivered);
+        assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(3));
+    }
+
+    /// E §1, Reserved × the permit dropped → Free at the next generation: the
+    /// dropped permit's key names no later occupant of its slot, `Stale`.
+    #[test]
+    fn a_dropped_permits_key_is_stale_at_the_next_occupant() {
+        let gate = fabric_gate(4);
+        let units = gate.borrow().units(1).expect("a unit");
+        let mut cx = Context::from_waker(Waker::noop());
+        let dropped = {
+            let mut borrowed = gate.borrow_mut();
+            let FabricAdmission::Granted(permit) = borrowed.reserve(&units) else {
+                panic!("a unit and a holder are free");
+            };
+            permit.key()
+        };
+        assert_eq!(units.free(), 1, "the dropped permit's unit returns");
+        let (key, mut wait) = fabric_wait(&gate, &units);
+        assert_eq!(key & 0xFF_FFFF, dropped & 0xFF_FFFF, "engagement: the same slot");
+        assert_ne!(key, dropped, "at its next generation");
+        assert_eq!(FabricGate::complete(&gate, dropped, 1, Nanos(1)), Delivery::Orphan);
+        assert_eq!(gate.borrow().stale(), 1, "the dropped key is stale");
+        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending(), "the occupant still waits");
+        assert_eq!(FabricGate::complete(&gate, key, 2, Nanos(1)), Delivery::Delivered);
+        assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(2));
+    }
+
+    /// E §1's refusals: a task with every unit out is `NoUnit`; a gate whose
+    /// every holder is taken (here by orphans, whose units came back) is
+    /// `Full`, counted; and `units` refuses past the units the gate issues.
+    #[test]
+    fn no_unit_full_and_units_past_the_max_are_refused() {
+        let gate = fabric_gate(8);
+        let one = gate.borrow().units(1).expect("a unit");
+        let (_key, kept) = fabric_wait(&gate, &one);
+        assert!(matches!(gate.borrow_mut().reserve(&one), FabricAdmission::NoUnit));
+        drop(kept);
+        let seven = gate.borrow().units(7).expect("the other seven");
+        assert!(gate.borrow().units(1).is_none(), "every unit is issued");
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..7 {
+            let (_key, mut wait) = fabric_wait(&gate, &seven);
+            assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+        }
+        assert_eq!(gate.borrow().holders(), 8, "eight orphans hold every slot");
+        assert!(matches!(gate.borrow_mut().reserve(&seven), FabricAdmission::Full));
+        assert_eq!(gate.borrow().full(), 1);
+        assert_eq!(seven.free(), 7, "a refused reserve keeps no unit");
+    }
+
+    /// A model fabric holder: what its key's request awaits.
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum FabricModel {
+        Awaiting,
+        Delivered(u64),
+        Orphaned,
+    }
+
+    /// Seeded operations on a fabric gate of 8 holders and 8 units, against
+    /// a `BTreeMap<key, state>` that shares no code with it (E §6's model):
+    /// reserves registered or dropped, completions of live, finished and
+    /// never-minted keys, polls and drops. Every answer, and after every step
+    /// the holders taken and the `stale` and `full` counts, equal the
+    /// model's.
+    #[test]
+    fn the_fabric_gate_holds_what_its_model_holds() {
+        const CAP: usize = 8;
+        let gate = fabric_gate(CAP as u32);
+        let units = gate.borrow().units(CAP as u32).expect("every unit");
+        let mut model: BTreeMap<u64, FabricModel> = BTreeMap::new();
+        let mut finished: Vec<u64> = Vec::new();
+        let (mut stale, mut full) = (0u64, 0u64);
+        let mut waits: Vec<(u64, GateWait<'_, u64>)> = Vec::new();
+        let mut rng = inf_foundation::rng::SplitMix64::new(0x6761_7465_0000_00E6);
+        let mut cx = Context::from_waker(Waker::noop());
+        let (mut orphan_frees, mut seconds) = (0u32, 0u32);
+        for step in 0..20_000u32 {
+            let roll = rng.next_u64();
+            match roll % 5 {
+                0 => {
+                    let units_out = waits.len();
+                    let mut borrowed = gate.borrow_mut();
+                    match borrowed.reserve(&units) {
+                        FabricAdmission::Granted(permit) => {
+                            assert!(units_out < CAP && model.len() < CAP, "step {step}: granted");
+                            let key = permit.key();
+                            assert!(!model.contains_key(&key), "step {step}: a key minted twice");
+                            if roll & 8 == 0 {
+                                drop(permit);
+                                finished.push(key);
+                            } else {
+                                waits.push((key, permit.register(&gate)));
+                                model.insert(key, FabricModel::Awaiting);
+                            }
+                        }
+                        FabricAdmission::NoUnit => {
+                            assert_eq!(units_out, CAP, "step {step}: NoUnit");
+                        }
+                        FabricAdmission::Full => {
+                            assert_eq!(model.len(), CAP, "step {step}: Full");
+                            full += 1;
+                        }
+                    }
+                }
+                1 => {
+                    let pool = model.len() + finished.len();
+                    if pool == 0 {
+                        continue;
+                    }
+                    let at = usize::try_from(rng.next_u64() % pool as u64).expect("small");
+                    let key = match model.keys().nth(at) {
+                        Some(key) => *key,
+                        None => finished[at - model.len()],
+                    };
+                    let value = rng.next_u64();
+                    let expected = match model.get(&key).copied() {
+                        Some(FabricModel::Awaiting) => {
+                            model.insert(key, FabricModel::Delivered(value));
+                            Delivery::Delivered
+                        }
+                        Some(FabricModel::Orphaned) => {
+                            model.remove(&key);
+                            finished.push(key);
+                            orphan_frees += 1;
+                            Delivery::Orphan
+                        }
+                        Some(FabricModel::Delivered(_)) | None => {
+                            seconds += 1;
+                            stale += 1;
+                            Delivery::Orphan
+                        }
+                    };
+                    let got = FabricGate::complete(&gate, key, value, Nanos(1));
+                    assert_eq!(got, expected, "step {step}: key {key:#x}");
+                }
+                2 if !waits.is_empty() => {
+                    let at = usize::try_from(rng.next_u64() % waits.len() as u64).expect("small");
+                    let key = waits[at].0;
+                    let polled = Pin::new(&mut waits[at].1).poll(&mut cx);
+                    match model[&key] {
+                        FabricModel::Delivered(value) => {
+                            assert_eq!(polled, Poll::Ready(value), "step {step}");
+                            model.remove(&key);
+                            finished.push(key);
+                            drop(waits.swap_remove(at));
+                        }
+                        state => assert_eq!(polled, Poll::Pending, "step {step}: {state:?}"),
+                    }
+                }
+                3 if !waits.is_empty() => {
+                    let at = usize::try_from(rng.next_u64() % waits.len() as u64).expect("small");
+                    let (key, wait) = waits.swap_remove(at);
+                    drop(wait);
+                    match model[&key] {
+                        FabricModel::Awaiting => {
+                            model.insert(key, FabricModel::Orphaned);
+                        }
+                        FabricModel::Delivered(_) | FabricModel::Orphaned => {
+                            model.remove(&key);
+                            finished.push(key);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            assert_eq!(gate.borrow().holders(), model.len(), "fabric-slots: step {step}");
+            assert_eq!(gate.borrow().stale(), stale, "fabric-stale: step {step}");
+            assert_eq!(gate.borrow().full(), full, "fabric-full: step {step}");
+            assert_eq!(units.free() as usize, CAP - waits.len(), "fabric-units: step {step}");
+        }
+        assert!(orphan_frees > 0, "VACUOUS: no orphan met its late completion");
+        assert!(seconds > 0, "VACUOUS: no completion was stale");
+        assert!(full > 0, "VACUOUS: the gate never filled");
+    }
+
     /// A recorded hop's holder keeps its send time, and the gate records its
     /// round trip at the completion, whatever order the replies arrive in
     /// and whether or not its waiter suspended first; an unrecorded hop
