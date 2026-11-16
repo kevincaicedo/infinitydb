@@ -386,6 +386,10 @@ pub(super) struct Conn {
     /// Canary: the 1→0 deltas captured at `Closed`, before the drain.
     #[cfg(inf_canary_registry_dropped_at_closed)]
     closed_notes: Option<SubNotes>,
+    /// Canary: the connection's owners were dropped after its first reply
+    /// left, its socket left open.
+    #[cfg(inf_canary_conn_owner_lost)]
+    owner_lost: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -1824,6 +1828,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             late_mark: false,
             #[cfg(inf_canary_registry_dropped_at_closed)]
             closed_notes: None,
+            #[cfg(inf_canary_conn_owner_lost)]
+            owner_lost: false,
         });
         let Some(key) = inserted else {
             // Admission bound (batch 12): the slab is full below

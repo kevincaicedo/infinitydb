@@ -125,6 +125,13 @@ fn quiesce<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         }
         Some(RunOut::Ended) | None => {}
     }
+    // Canary: a pump whose queue is empty after its first reply left returns
+    // and its slot vacates with it, the socket left open, so both owners
+    // lose a client that still holds its connection.
+    #[cfg(inf_canary_conn_owner_lost)]
+    if conn.owner_lost {
+        return Popped::Retire(SubNotes::default());
+    }
     // A draining slot's run-out ended its parser above, or it waits.
     if let ConnSlot::Draining { by: ClosedBy::Plane } = conn.slot {
         // Canary: the deltas captured at `Closed`, and no removal here.
@@ -355,9 +362,6 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let mut inflight: usize = 0;
     // A command held back by the conn-state barrier.
     let mut held: Option<OwnedCmd> = None;
-    // Canary: whether the pump wrote a reply, for the plant below.
-    #[cfg(inf_canary_conn_owner_lost)]
-    let mut replied = false;
     loop {
         // ---- dispatch: fill the window in pipeline order.
         while pending.len() < PENDING_REPLIES_MAX && inflight < REMOTE_WINDOW {
@@ -372,14 +376,6 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     }
                     Popped::Empty => break,
                     Popped::Park => {
-                        // Canary: a pump whose queue is empty after its first
-                        // reply returns and its slot vacates with it, the
-                        // socket left open, so both owners lose a client
-                        // that still holds its connection.
-                        #[cfg(inf_canary_conn_owner_lost)]
-                        if replied {
-                            return Some(SubNotes::default());
-                        }
                         park().await;
                         continue;
                     }
@@ -431,10 +427,6 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         match emitted {
             Emitted::Written | Emitted::Dropped => {}
             Emitted::Vacant => return None,
-        }
-        #[cfg(inf_canary_conn_owner_lost)]
-        {
-            replied |= matches!(emitted, Emitted::Written);
         }
     }
 }

@@ -647,6 +647,23 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         link.send_inflight = false;
                     }
                 });
+                // Canary: once a reply has left an active slot whose pump is
+                // parked on an empty queue, the pump is woken to drop both
+                // owners, the socket left open.
+                #[cfg(inf_canary_conn_owner_lost)]
+                if let Some(Some(pump)) = self.shared.with_conn(key, |conn| {
+                    let sent = match &conn.slot {
+                        ConnSlot::Active { link, .. } => link.out.is_empty(),
+                        ConnSlot::Flushing { .. }
+                        | ConnSlot::Closing { .. }
+                        | ConnSlot::Draining { .. } => false,
+                    };
+                    let idle = sent && conn.queue.is_empty() && !conn.owner_lost;
+                    conn.owner_lost |= idle;
+                    if idle { conn.take_parked_pump() } else { None }
+                }) {
+                    let _ = cx.executor.wake(pump);
+                }
             }
             CompletionResult::Closed => self.on_closed(cx, Self::key_of(c.token)),
             CompletionResult::Error { buf, errno } => {
