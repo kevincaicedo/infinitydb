@@ -387,7 +387,7 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
         );
         match lent {
             Named::Live((value, slot, chain)) => {
-                vacated::<T, G, P>(slot, chain, id, live, row);
+                Self::vacated(slot, chain, id, live, row);
                 Taken::Value(value)
             }
             Named::Stale => Taken::Stale,
@@ -426,7 +426,7 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
             );
             match lent {
                 Named::Live((slot, chain)) => {
-                    vacated::<T, G, P>(slot, chain, id, live, row);
+                    Self::vacated(slot, chain, id, live, row);
                     Released::Dropped
                 }
                 Named::Stale => Released::Stale,
@@ -498,43 +498,44 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
         self.row.report_full();
         SlabReserved::Full
     }
-}
 
-/// D1's take transition on a slot `named` found live at `id`'s generation,
-/// the one body of `take` and `release`: the live count, an `Assembly` row's
-/// removal report, the policy's advance with the free head linked or the
-/// slot's retirement with the row's capacity report, and the slot's write
-/// last, which drops an occupant still in it (`release`'s) where it lies.
-/// Each arm writes the slot itself, so no slot-sized value is built apart.
-#[inline(always)]
-fn vacated<T, G: Generation, P: GenerationPolicy>(
-    slot: &mut Slot<T, G>,
-    chain: Chain<'_>,
-    id: SlotId<G>,
-    live: &mut u32,
-    row: &CapRowHandle,
-) {
-    *live = live_taken(*live);
-    if row.fill() == CapFill::Assembly {
-        row.report_removal(*live);
-    }
-    match P::advance(id.generation) {
-        Some(generation) => {
-            let next = chain.free(id.index);
-            *slot = Slot::Free { generation, next };
+    /// D1's take transition on a slot `named` found live at `id`'s
+    /// generation, the one body of `take` and `release`: the live count, an
+    /// `Assembly` row's removal report, the policy's advance with the free
+    /// head linked or the slot's retirement with the row's capacity report,
+    /// and the slot's write last, which drops an occupant still in it
+    /// (`release`'s) where it lies. Each arm writes the slot itself, so no
+    /// slot-sized value is built apart.
+    #[inline(always)]
+    fn vacated(
+        slot: &mut Slot<T, G>,
+        chain: Chain<'_>,
+        id: SlotId<G>,
+        live: &mut u32,
+        row: &CapRowHandle,
+    ) {
+        *live = live_taken(*live);
+        if row.fill() == CapFill::Assembly {
+            row.report_removal(*live);
         }
-        None => closed(slot, chain, row),
+        match P::advance(id.generation) {
+            Some(generation) => {
+                let next = chain.free(id.index);
+                *slot = Slot::Free { generation, next };
+            }
+            None => Self::retired(slot, chain, row),
+        }
     }
-}
 
-/// A slot retired at its last generation, off the hot path: the store serves
-/// one fewer, the row keeps the minimum capacity over its instances, and the
-/// slot is closed last.
-#[cold]
-#[inline(never)]
-fn closed<T, G>(slot: &mut Slot<T, G>, chain: Chain<'_>, row: &CapRowHandle) {
-    row.report_capacity(chain.close());
-    *slot = Slot::Closed;
+    /// A slot retired at its last generation, off the hot path: the store
+    /// serves one fewer, the row keeps the minimum capacity over its
+    /// instances, and the slot is closed last.
+    #[cold]
+    #[inline(never)]
+    fn retired(slot: &mut Slot<T, G>, chain: Chain<'_>, row: &CapRowHandle) {
+        row.report_capacity(chain.close());
+        *slot = Slot::Closed;
+    }
 }
 
 impl<'a, T, G: Generation, P> SlotReservation<'a, T, G, P> {
