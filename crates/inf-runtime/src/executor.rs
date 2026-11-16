@@ -94,6 +94,9 @@ const PLANT_INSTANCE_BLIND: bool = cfg!(inf_canary_task_class_instance_blind);
 const PLANT_FIRST_POLL_WAKE_DROPPED: bool = cfg!(inf_canary_first_poll_wake_dropped);
 /// A Pending first poll takes the spare's handle for its id but leaves the spare set.
 const PLANT_SPARE_KEPT_PAST_SUSPEND: bool = cfg!(inf_canary_spare_kept_past_suspend);
+/// A first poll that unwinds leaves the spare's handle in the spare and its header without one,
+/// so nothing that drops futures reaches its future.
+const PLANT_FIRST_POLL_UNWIND_UNOWNED: bool = cfg!(inf_canary_first_poll_unwind_unowned);
 /// An id's lookup skips the index's bound against its class's slots.
 const PLANT_ID_INDEX_UNBOUNDED: bool = cfg!(inf_canary_task_id_index_unbounded);
 
@@ -225,7 +228,8 @@ impl<F: Future<Output = ()> + 'static> TaskPermit<'_, F> {
     /// Makes the task and polls it once in place, in the spare's slot (the fast path, L6):
     /// Ready, its future is dropped in place and the slot stays the spare, or is Retired while a
     /// waker the future left names its header; Pending, the slot is the task's, which resumes
-    /// there when woken.
+    /// there when woken. A poll that unwinds leaves the future live where it lies and the slot
+    /// its header's, as a queued poll that unwinds does, so the executor's drop drops it there.
     #[inline(always)]
     pub fn poll_immediate(self, make: impl FnOnce() -> F) -> PollImmediate {
         let TaskPermit { cell, spare, retired, header, class } = self;
@@ -235,8 +239,13 @@ impl<F: Future<Output = ()> + 'static> TaskPermit<'_, F> {
         unsafe { owner(header) }.state.set(TaskState::Running);
         let waker = waker_ref(header);
         let mut cx = Context::from_waker(&waker);
+        // Armed across the one call that may unwind with the future live, and forgotten as soon
+        // as it returns, so no arm below runs any of it.
+        let unwind = FirstPollUnwind { spare: &mut *spare, header };
         // SAFETY: the slot's own header, Running; its future was just placed in the slot.
-        match unsafe { poll_in_place(cell, header, &mut cx) } {
+        let poll = unsafe { poll_in_place(cell, header, &mut cx) };
+        core::mem::forget(unwind);
+        match poll {
             // SAFETY: as above; the future was dropped in place, so its wakers are counted out.
             Poll::Ready(()) if PLANT_REUSED_WITH_WAKERS || unsafe { quiet(header) } => {
                 // No id names the slot's generation: it stays the spare, unadvanced.
@@ -299,6 +308,51 @@ unsafe fn first_pending(
         unsafe { suspended(header) };
     }
     PollImmediate::Suspended(TaskId { class, slot })
+}
+
+/// The first poll's unwind: armed across `poll_in_place` alone and forgotten when it returns, so
+/// its drop runs only on an unwind out of that call. While the first poll runs, no header names
+/// the slot (the spare's handle is still the spare's), so an unwind that left it so would leave
+/// the future live where nothing drops it: the next first poll would write over it, or the
+/// slabs be freed under it, and Pin's drop guarantee would be broken. Two words, kept in
+/// registers; the drop calls one cold body.
+struct FirstPollUnwind<'a> {
+    spare: &'a mut Option<SlotId<u64>>,
+    header: Header,
+}
+
+impl Drop for FirstPollUnwind<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // SAFETY: the permit's header: open, on this thread, and on no list (a wake during the
+        // first poll marks it RunningWoken and links nothing).
+        unsafe { first_poll_unwound(self.spare, self.header) };
+    }
+}
+
+/// An unwind out of the first poll's call, off every path that returns. Finished, the future's
+/// drop ran and unwound: the cell holds no live future, and the spare stays. In any other state
+/// the future is live in its slot: the spare's handle leaves it for the header, as
+/// `first_pending` takes it, so the task is one the executor's drop drops in place. No id is
+/// made and nothing is linked: no poll of the task returns, so a wake of it marks it
+/// RunningWoken and never queues it.
+///
+/// # Safety
+/// `header` is the permit's: open, on the owner thread, and on no list.
+#[cold]
+#[inline(never)]
+unsafe fn first_poll_unwound(spare: &mut Option<SlotId<u64>>, header: Header) {
+    // SAFETY: per the contract.
+    let owner = unsafe { owner(header) };
+    let state = owner.state.get();
+    debug_assert!(
+        matches!(state, TaskState::Running | TaskState::RunningWoken | TaskState::Finished),
+        "a first poll unwinds Running, RunningWoken or Finished, not {state:?}"
+    );
+    if state == TaskState::Finished || PLANT_FIRST_POLL_UNWIND_UNOWNED {
+        return;
+    }
+    owner.slot.set(spare.take());
 }
 
 /// The answer to [`CellExecutor::wake`].
@@ -741,7 +795,8 @@ unsafe fn poll_in_place<F: Future<Output = ()>>(
     };
     // SAFETY: the future was placed in its slot before its first poll, and a slab never moves a
     // value it holds (its chunks are fixed allocations): the slot is its address until it is
-    // dropped in place below; it is live, per the contract.
+    // dropped in place below or, when its poll unwinds, by the executor's drop; it is live, per
+    // the contract.
     let pinned = unsafe { Pin::new_unchecked(&mut **future.get_mut()) };
     let poll = pinned.poll(cx);
     if poll.is_ready() {

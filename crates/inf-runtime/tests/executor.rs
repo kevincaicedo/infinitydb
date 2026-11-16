@@ -4,6 +4,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::marker::PhantomPinned;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -900,4 +902,160 @@ fn self_referential_futures_woken_by_their_wakers_resume_in_their_slots() {
         assert_eq!(seen.get(), 8);
     }
     assert_eq!(ex.live_tasks(), 0);
+}
+
+/// What registering futures leave beside them for the test to read: the addresses their polls
+/// registered and their drops unregistered, the polls that found their own address registered
+/// already (a future placed over a live one), their drops, and a waker one of them kept.
+#[derive(Default)]
+struct Registry {
+    registered: RefCell<Vec<usize>>,
+    written_over: Cell<u32>,
+    drops: Cell<u32>,
+    kept: RefCell<Option<Waker>>,
+}
+
+/// What a registering future does at its first poll.
+#[derive(Clone, Copy)]
+enum Act {
+    Ready,
+    Panic,
+    /// Keeps a clone of its waker in the registry, then panics.
+    PanicKeepingWaker,
+}
+
+/// A `!Unpin` future that registers its own address at its poll and unregisters it at its drop,
+/// as an intrusive waiter does, which only Pin's drop guarantee makes sound: a registration left
+/// after the executor's drop, or a poll that finds its address registered, is that guarantee
+/// broken. Unboxed, so its address is its slot's.
+struct Registering {
+    act: Act,
+    registry: Rc<Registry>,
+    _pinned: PhantomPinned,
+}
+
+impl Future for Registering {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let at = core::ptr::from_ref::<Self>(self.as_ref().get_ref()) as usize;
+        let registry = &self.registry;
+        if registry.registered.borrow().contains(&at) {
+            registry.written_over.set(registry.written_over.get() + 1);
+        }
+        registry.registered.borrow_mut().push(at);
+        match self.act {
+            Act::Ready => Poll::Ready(()),
+            Act::Panic => panic!("the future's first poll panics"),
+            Act::PanicKeepingWaker => {
+                *registry.kept.borrow_mut() = Some(cx.waker().clone());
+                panic!("the future's first poll panics, a clone of its waker kept")
+            }
+        }
+    }
+}
+
+impl Drop for Registering {
+    fn drop(&mut self) {
+        let at = core::ptr::from_ref::<Self>(self) as usize;
+        self.registry.registered.borrow_mut().retain(|registered| *registered != at);
+        self.registry.drops.set(self.registry.drops.get() + 1);
+    }
+}
+
+const REGISTERING: Cap = Cap::entries::<2>("test-registering", CapFill::Serving);
+
+/// An executor of one class of registering futures, unboxed, of two slots.
+fn registering() -> (CellExecutor, TaskClass) {
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let class = layout.class(&|future: Registering| future, REGISTERING).expect("one class");
+    (layout.build().expect("no class refuses"), class)
+}
+
+/// One registering future made a task of `class` and polled once in place.
+fn poll_registering(
+    executor: &mut CellExecutor,
+    class: TaskClass,
+    act: Act,
+    registry: &Rc<Registry>,
+) -> PollImmediate {
+    let TaskAdmission::Granted(permit) = executor.reserve::<Registering>(class) else {
+        panic!("the class has room");
+    };
+    let registry = Rc::clone(registry);
+    permit.poll_immediate(move || Registering { act, registry, _pinned: PhantomPinned })
+}
+
+/// The same, its first poll's panic caught past the permit's call.
+fn poll_registering_unwinds(
+    executor: &mut CellExecutor,
+    class: TaskClass,
+    act: Act,
+    registry: &Rc<Registry>,
+) {
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        poll_registering(executor, class, act, registry);
+    }));
+    assert!(unwound.is_err(), "the first poll panics");
+}
+
+/// A first poll that unwinds leaves its future live in its slot, the slot its task's: the class
+/// counts the task and nothing is dropped until the executor's drop drops the future in place,
+/// which unregisters it. With the spare left holding the slot, nothing counts the task and the
+/// executor's drop never reaches its future.
+#[test]
+fn a_first_poll_that_unwinds_holds_its_slot_until_the_drop() {
+    let (mut executor, class) = registering();
+    let registry = Rc::new(Registry::default());
+    poll_registering_unwinds(&mut executor, class, Act::Panic, &registry);
+    assert_eq!(executor.live_tasks(), 1, "first-poll-unwind-unowned: the task is live");
+    assert_eq!(executor.class_tasks(class), 1, "first-poll-unwind-unowned: no slot held");
+    assert_eq!(registry.drops.get(), 0, "the unwind drops nothing");
+    drop(executor);
+    assert_eq!(registry.drops.get(), 1, "first-poll-unwind-unowned: the future never dropped");
+    let left = registry.registered.borrow();
+    assert!(left.is_empty(), "first-poll-unwind-unowned: a registration outlived it: {left:x?}");
+}
+
+/// After a first poll that unwinds, the next first poll runs in another slot, which the class
+/// makes its spare: no future is placed over the live one. The executor's drop then drops the
+/// unwound future: each future dropped once, no registration left.
+#[test]
+fn a_first_poll_that_unwinds_is_not_written_over() {
+    let (mut executor, class) = registering();
+    let registry = Rc::new(Registry::default());
+    poll_registering_unwinds(&mut executor, class, Act::Panic, &registry);
+    let outcome = poll_registering(&mut executor, class, Act::Ready, &registry);
+    assert_eq!(outcome, PollImmediate::Completed);
+    let over = registry.written_over.get();
+    assert_eq!(over, 0, "first-poll-unwind-unowned: a future placed over a live one");
+    assert_eq!(registry.drops.get(), 1, "the fast op's future, dropped in place");
+    assert_eq!(executor.class_tasks(class), 1, "the unwound task's slot; the spare is none");
+    drop(executor);
+    assert_eq!(registry.drops.get(), 2, "first-poll-unwind-unowned: a future never dropped");
+    let left = registry.registered.borrow();
+    assert!(left.is_empty(), "first-poll-unwind-unowned: a registration outlived it: {left:x?}");
+}
+
+/// A first poll that unwinds after cloning its waker: a wake of the clone marks the task woken
+/// and links nothing, since no poll of it returns, so `run_ready` polls nothing. The executor's
+/// drop drops the future in place and closes the header the clone names; the clone's drop, after
+/// the executor's, releases it, which Miri's leak check reads.
+#[test]
+fn a_first_poll_that_unwinds_with_a_waker_kept() {
+    let (mut executor, class) = registering();
+    let registry = Rc::new(Registry::default());
+    poll_registering_unwinds(&mut executor, class, Act::PanicKeepingWaker, &registry);
+    let kept = registry.kept.borrow_mut().take().expect("the waker the first poll kept");
+    kept.wake_by_ref();
+    assert_eq!(executor.run_ready(4), 0, "a wake of the unwound task activates nothing");
+    assert!(!executor.has_ready());
+    assert_eq!(executor.class_tasks(class), 1, "first-poll-unwind-unowned: no slot held");
+    assert_eq!(registry.drops.get(), 0, "the unwind drops nothing");
+    drop(executor);
+    assert_eq!(registry.drops.get(), 1, "first-poll-unwind-unowned: the future never dropped");
+    let left = registry.registered.borrow();
+    assert!(left.is_empty(), "first-poll-unwind-unowned: a registration outlived it: {left:x?}");
+    drop(kept);
 }

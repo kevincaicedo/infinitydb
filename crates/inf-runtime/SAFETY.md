@@ -203,7 +203,11 @@ the future is dropped. It is dropped in place exactly once: by
 `poll_in_place` on `Ready`, after its header is marked Finished, or by the
 executor's drop for a live task (`drop_future`), after its header is
 marked Dropping; each runs only while the header's state says the future
-is live, and the state moves on before the slot is reached again. The slot
+is live, and the state moves on before the slot is reached again. A poll
+whose call unwinds leaves its future live where it lies, with its header
+naming the slot: a queued poll's header names it already, and a first
+poll's is given the spare's handle before the unwind leaves the poll, so
+either is a live task, which the executor's drop drops in place. The slot
 then holds a husk, `Done`, which has no drop glue: the class's spare keeps
 it, or the slab's `release` frees the slot and drops the husk where it lies
 (ADR-0194 D1's second note); the executor calls `take` on no task's slot.
@@ -227,8 +231,9 @@ holding the husk, its header Free and on no list, its generation in no
 `TaskId`; a class has at most one. A permit is the spare: its future is
 written over the husk (no drop glue: the write drops nothing) and polled
 there; Ready and quiet, the slot stays the spare; otherwise the spare's
-handle leaves it by `take()` for the task's id or the Retired header, before
-either exists. From the first poll to the in-place drop the future is at
+handle leaves it by `take()`: for the task's id or the Retired header, before
+either exists, or, when the poll unwinds with the future live, for the
+task's header, before the unwind leaves the poll. From the first poll to the in-place drop the future is at
 one address: the spare's slot, which every later poll reaches by `get_mut`
 of the handle (a Live slot lies where it is until a take, a release or a
 retire step, ADR-0194 D1's notes). `tests/executor.rs`'s

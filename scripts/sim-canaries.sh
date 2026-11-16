@@ -1192,6 +1192,11 @@ ordered_rows=(
   # find it (ADR-0194 D1's note), and a wake it raises is kept. Planted, the cell moves to another
   # slot of its class at the task's next activation, and the future reads a second address.
   "inf_canary_first_poll_off_slot crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-moved"
+  # A first poll that unwinds hands the spare's handle to its task's header, so the executor's
+  # drop drops its future in place, and the next first poll makes another slot its spare.
+  # Planted, the spare keeps the handle and the header has none: nothing counts the task, and
+  # the executor's drop never reaches its future.
+  "inf_canary_first_poll_unwind_unowned crate-test inf-runtime test:executor a_first_poll_that_unwinds_holds_its_slot_until_the_drop first-poll-unwind-unowned"
   # Planted, a Pending first poll leaves its header Idle and unlinked, and the wake it raised is
   # lost.
   "inf_canary_first_poll_wake_dropped crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-wake-lost"
