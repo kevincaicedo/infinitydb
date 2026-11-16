@@ -31,6 +31,9 @@ enum Delivery {
     Eof(RawFd),
     /// A receive error: the peer reset the connection.
     Reset(RawFd),
+    /// The `Closed` of `fd`'s held close, after the completions delivered
+    /// before it in the same reap.
+    Closed(RawFd),
 }
 
 #[derive(Default)]
@@ -48,6 +51,13 @@ struct Script {
     closed: Vec<RawFd>,
     /// Descriptors whose sends stay in flight, uncompleted, until released.
     held_sends: Vec<RawFd>,
+    /// Descriptors whose sends fail with `ECONNRESET`, their bytes unwritten:
+    /// the peer is gone while the receive is armed.
+    failed_sends: Vec<RawFd>,
+    /// Descriptors whose closes stay in flight until a `Closed` delivery.
+    held_closes: Vec<RawFd>,
+    /// The closes held, with their tokens.
+    closes_held: Vec<(RawFd, CompletionToken)>,
 }
 
 impl Script {
@@ -96,11 +106,20 @@ impl BackendDriver for ScriptDriver {
                 script.sends.push((fd, buf, len, token));
                 continue;
             }
+            if script.failed_sends.contains(&fd) {
+                let result = CompletionResult::Error { errno: ECONNRESET, buf: Some(buf) };
+                out.push(Completion { token, result });
+                continue;
+            }
             let bytes = pool.bytes(buf)[..len as usize].to_vec();
             script.written_mut(fd).extend_from_slice(&bytes);
             out.push(Completion { token, result: CompletionResult::Sent { buf } });
         }
         for (fd, token) in core::mem::take(&mut script.closes) {
+            if script.held_closes.contains(&fd) {
+                script.closes_held.push((fd, token));
+                continue;
+            }
             script.closed.push(fd);
             out.push(Completion { token, result: CompletionResult::Closed });
         }
@@ -130,6 +149,12 @@ impl BackendDriver for ScriptDriver {
                     token: script.recv_token(fd),
                     result: CompletionResult::Error { errno: ECONNRESET, buf: None },
                 },
+                Delivery::Closed(fd) => {
+                    let at = script.closes_held.iter().position(|(held, _)| *held == fd);
+                    let (_, token) = script.closes_held.remove(at.expect("a held close of fd"));
+                    script.closed.push(fd);
+                    Completion { token, result: CompletionResult::Closed }
+                }
             });
         }
         Ok(out.len())
@@ -178,6 +203,20 @@ impl Rig {
     /// The same, every cell's keyspace also holding `namespaces`, created
     /// uncataloged at boot.
     pub(super) fn with_namespaces(cells: u16, namespaces: &[inf_store::NsSpec]) -> Rig {
+        Rig::with_config(cells, namespaces, LoopConfig::default())
+    }
+
+    /// [`new`](Self::new) with the loop's remote-first ordering on: futures
+    /// woken in an iteration's completions run before its PARSE.
+    pub(super) fn remote_first(cells: u16) -> Rig {
+        Rig::with_config(
+            cells,
+            &[],
+            LoopConfig { remote_first_execute: true, ..LoopConfig::default() },
+        )
+    }
+
+    fn with_config(cells: u16, namespaces: &[inf_store::NsSpec], config: LoopConfig) -> Rig {
         let clock = Rc::new(VirtualClock::default());
         let fabrics = Mesh::new(cells, MeshConfig::default());
         let built = fabrics.into_iter().enumerate().map(|(cell, fabric)| {
@@ -202,7 +241,7 @@ impl Rig {
                 ScriptDriver::default(),
                 Rc::clone(&clock),
                 BufferPool::new(POOL_BUFFERS, BUFFER_BYTES),
-                LoopConfig::default(),
+                config,
                 serve_mark,
                 timer_set,
                 executor,
@@ -268,6 +307,23 @@ impl Rig {
         if held {
             script.held_sends.push(fd);
         }
+    }
+
+    /// From now on `fd`'s sends on `cell` fail: the peer is gone.
+    pub(super) fn fail_sends(&self, cell: usize, fd: RawFd) {
+        self.cells[cell].reactor.driver().script.borrow_mut().failed_sends.push(fd);
+    }
+
+    /// From now on `fd`'s closes on `cell` stay in flight until
+    /// [`deliver_closed`](Self::deliver_closed) delivers each.
+    pub(super) fn hold_closes(&self, cell: usize, fd: RawFd) {
+        self.cells[cell].reactor.driver().script.borrow_mut().held_closes.push(fd);
+    }
+
+    /// Queues the `Closed` of `fd`'s held close for the cell's next reap,
+    /// after what was queued before it.
+    pub(super) fn deliver_closed(&self, cell: usize, fd: RawFd) {
+        self.deliver(cell, Delivery::Closed(fd));
     }
 
     /// The receive arms the plane pushed for `fd` on `cell`.

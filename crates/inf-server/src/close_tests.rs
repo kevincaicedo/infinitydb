@@ -310,6 +310,46 @@ fn a_stalled_entry_runs_after_its_connection_closed() {
     );
 }
 
+/// With the loop's remote-first ordering on, a pump woken by `Closed` runs
+/// before that iteration's PARSE. The client's reply fails to send (the peer
+/// is gone with its receive still armed), so its slot closes with its parser,
+/// stamped at that reap; PARSE takes the inbox once more; then a `SET` the
+/// receive returned and the `Closed` are reaped together. `Closed` stamps the
+/// parser anew (ADR-0196 D2), so the pump's run-out, polled before PARSE,
+/// waits for PARSE's take and the `SET` runs. A `Closed` that kept the older
+/// stamp would end the parser at once and leave PARSE to release the entry.
+#[test]
+fn closed_restamps_the_parser_a_remote_first_pump_waits_on() {
+    let mut node = Node::remote_first(1);
+    node.accept(0, CLIENT);
+    node.accept(0, READER);
+    node.fail_sends(0, CLIENT);
+    node.hold_closes(0, CLIENT);
+    node.send(0, CLIENT, &frame(&[b"PING"]));
+    node.rounds(3);
+    let closing = |node: &Node| {
+        let mut closing = 0;
+        node.cells[0].plane.shared.conns.borrow_mut().for_each_mut(|conn| {
+            closing +=
+                usize::from(matches!(conn.slot, ConnSlot::Closing { by: ClosedBy::Peer { .. } }));
+        });
+        closing
+    };
+    assert_eq!(closing(&node), 1, "engagement: the failed send closes the slot with its parser");
+    let waits_before = node.cells[0].plane.shared.node.reader_take_waits.get();
+    node.send(0, CLIENT, &frame(&[b"SET", b"restamped", b"ran"]));
+    node.deliver_closed(0, CLIENT);
+    node.rounds(4);
+    assert!(node.closed(0).contains(&CLIENT), "engagement: the held Closed was reaped");
+    let waits_after = node.cells[0].plane.shared.node.reader_take_waits.get();
+    assert_eq!(
+        read_back(&mut node, 0, b"restamped"),
+        b"$3\r\nran\r\n",
+        "closed-stamp-kept: the SET reaped with the Closed was released unparsed"
+    );
+    assert!(waits_after > waits_before, "the run-out polled before PARSE waited for its take");
+}
+
 // ---- PARSE's own replies leave in the order the connection owes them ----
 
 /// A frame whose bulk length is not a number: a protocol error.
