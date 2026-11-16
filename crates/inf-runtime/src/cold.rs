@@ -3266,7 +3266,7 @@ mod tests {
         members
     }
 
-    /// E §6's worst case at the default shape (ADR-0177 D4): `P` = 64 reads of
+    /// The cap's worst case at the default shape (ADR-0177 D4): `P` = 64 reads of
     /// `overflow_cap` = 256 members delivered and unpolled, and both class
     /// queues full, hold every one of the cap's 16,896 holders; the gate
     /// refuses none. A cap one term short refuses here.
