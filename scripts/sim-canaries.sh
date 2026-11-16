@@ -1080,6 +1080,9 @@ ordered_rows=(
   # and the builder takes no other count (ADR-0194 A1). Planted, chunk_slots_for answers 64 at
   # every width, the fixed chunk, and a slab of 1,032 B slots in chunks of 32 is refused.
   "inf_canary_chunk_slots_fixed crate-test inf-foundation lib a_slot_takes_the_largest_chunk_one_allocation_holds wide-slot-refused"
+  # The same plant on the shipped classes (ADR-0194 A1): `conn`'s slot at 64 a chunk is past
+  # one allocation, so the node's layout refuses its class at boot.
+  "inf_canary_chunk_slots_fixed crate-test inf-server lib every_class_registers_at_its_chunk class-refused"
   # A close ends the receive: the io_uring driver queues the fd's cancels before the close and
   # posts Closed after them, so no Recv with bytes follows Closed. Planted, Close posts Closed
   # as it queues the close, ahead of the reap that brings the bytes. One row a shape: the

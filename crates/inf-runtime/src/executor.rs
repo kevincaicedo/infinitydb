@@ -341,6 +341,15 @@ impl ExecutorLayout {
         Ok(TaskClass { index, future: TypeId::of::<Fac::Future>(), instance })
     }
 
+    /// The slot bytes of a class of the future `factory` makes, and the slots one chunk of its
+    /// slab holds: `chunk_slots_for` over the slot (ADR-0194 A1), 0 past 64 KiB, where `class`
+    /// refuses it. Read from the factory's type alone; nothing is registered.
+    #[must_use]
+    pub fn slot_shape<Args, Fac: TaskFactory<Args>>(factory: &Fac) -> (usize, usize) {
+        let _ = factory;
+        (CappedSlab::<TaskCell<Fac::Future>, u64, Retire>::SLOT_BYTES, chunk_of::<Fac::Future>())
+    }
+
     /// The executor of this layout's classes, built before its cell serves: each class slab by
     /// its builder's steps, one chunk or directory a step, then the header array.
     ///

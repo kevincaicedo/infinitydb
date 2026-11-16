@@ -187,3 +187,55 @@ pub(super) fn spawn_shadow<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     let _ = permit.poll_immediate(move || shadow_pump(shared, ns, read));
     true
 }
+
+#[cfg(test)]
+mod tests {
+    //! The shipped classes' layout (ADR-0194 A1): each class slab at its chunk.
+
+    use inf_foundation::bounded::CapCensus;
+    use inf_foundation::limits::chunk_slots_for;
+    use inf_log::fs::StdSegmentFs;
+
+    use super::*;
+    use crate::config::ConfigStore;
+
+    type O = NoopObserver;
+    type F = StdSegmentFs;
+
+    /// The node's layout at 4 and 16 cells and at one cell of `C` = 10,000: every class
+    /// registers, each at the chunk its slot's bytes take, `c(s)`. Each stride and chunk is
+    /// printed for the ticket.
+    #[test]
+    fn every_class_registers_at_its_chunk() {
+        let shapes = [
+            ("conn", ExecutorLayout::slot_shape(&pump::<O, F>)),
+            ("ns-apply", ExecutorLayout::slot_shape(&ns_apply_pump::<O, F>)),
+            ("owner-pub", ExecutorLayout::slot_shape(&owner_pub_pump::<O, F>)),
+            ("gated", ExecutorLayout::slot_shape(&gated_pump::<O, F>)),
+            ("compact", ExecutorLayout::slot_shape(&compact_pump::<O, F>)),
+            ("shadow", ExecutorLayout::slot_shape(&shadow_pump::<O, F>)),
+        ];
+        for (class, (stride, chunk)) in shapes {
+            assert_eq!(Some(chunk), chunk_slots_for(stride), "{class}: class-refused: c(s)");
+            println!("every_class_registers_at_its_chunk: {class}: {stride} B, c {chunk}");
+        }
+        let config = ConfigStore::default();
+        for cells in [4u16, 16, 1] {
+            let caps = crate::limits::plane_task_caps(config.boot_share(cells), cells)
+                .expect("the default caps");
+            let (census, _mark) = CapCensus::new(CellId(0));
+            let mut layout = ExecutorLayout::new(&census);
+            let tasks = PlaneTasks::register::<O, F>(&mut layout, &caps)
+                .unwrap_or_else(|error| panic!("{cells} cells: class-refused: {error}"));
+            let executor = layout
+                .build()
+                .unwrap_or_else(|error| panic!("{cells} cells: class-refused: {error}"));
+            assert_eq!(executor.class_tasks(tasks.conn), 0, "{cells} cells");
+            println!(
+                "every_class_registers_at_its_chunk: {cells} cells: conn {} slots, header array {} B",
+                caps.conn.entries_max(),
+                executor.header_array_bytes()
+            );
+        }
+    }
+}
