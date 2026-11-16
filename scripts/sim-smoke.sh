@@ -72,8 +72,18 @@ rows=(
   "m0-admission"
   # m0-capacity runs each close leg green on this tree on its own row, a leg named, never
   # drawn from the seed; every other leg is a pinned red in its source until it is green.
+  "m0-capacity --close-leg close --verify-determinism"
+  "m0-capacity --close-leg rearm --verify-determinism"
+  "m0-capacity --close-leg eof-with-data --verify-determinism"
   "m0-capacity --close-leg subscribe-reset --verify-determinism"
+  "m0-capacity --close-leg subscribe-fin --verify-determinism"
   "m0-capacity --close-leg registry-reset --verify-determinism"
+  "m0-capacity --close-leg registry-fin --verify-determinism"
+  "m0-capacity --close-leg quit-subscriber --verify-determinism"
+  "m0-capacity --close-leg stall --verify-determinism"
+  "m0-capacity --close-leg half-close --verify-determinism"
+  "m0-capacity --close-leg half-close-eof-with-data --verify-determinism"
+  "m0-capacity --close-leg half-close-reset --verify-determinism"
   "m0-capacity --close-leg deferred-quit --verify-determinism"
   "m0-capacity --close-leg small-credit --verify-determinism"
   "m0-capacity --close-leg gated-hold --verify-determinism"

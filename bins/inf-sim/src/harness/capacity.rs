@@ -132,21 +132,8 @@ impl CloseLeg {
     /// green leg leaves this table for its `scripts/sim-smoke.sh` row, where
     /// it runs with its twin; `tests/lanes.rs` holds every leg to one of the
     /// two.
-    pub const PINNED_RED: &'static [CloseLeg] = &[
-        CloseLeg::Tasks,
-        CloseLeg::Fan,
-        CloseLeg::Close,
-        CloseLeg::Rearm,
-        CloseLeg::EofWithData,
-        CloseLeg::SubscribeFin,
-        CloseLeg::RegistryFin,
-        CloseLeg::QuitSubscriber,
-        CloseLeg::Stall,
-        CloseLeg::HalfClose,
-        CloseLeg::HalfCloseEofWithData,
-        CloseLeg::HalfCloseReset,
-        CloseLeg::ProtocolOrder,
-    ];
+    pub const PINNED_RED: &'static [CloseLeg] =
+        &[CloseLeg::Tasks, CloseLeg::Fan, CloseLeg::ProtocolOrder];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -533,6 +520,14 @@ impl Rig {
                 ));
             }
         }
+    }
+
+    /// A close's drain counter of cell X, read beside the wire (`INFO
+    /// stats`' own lines): the leg's engagement and the ticket's reading.
+    fn drain_count(&mut self, name: &'static str, read: fn(&NodeInfo) -> u64) -> u64 {
+        let value = read(&self.nodes[X]);
+        self.read(name, value);
+        value
     }
 
     /// The connection slots `cell` holds now.
@@ -932,8 +927,10 @@ fn close_leg(seed: u64) -> Rig {
         ));
     }
     rig.expect_vacant(X, 1);
-    if !engaged {
-        let text = "VACUOUS closed-queue-unengaged: the held peer answered before the close";
+    let drained = rig.drain_count("closed_queue_commands", |n| n.closed_queue_commands.get());
+    if !engaged || drained < names.len() as u64 {
+        let text = "VACUOUS closed-queue-unengaged: the held peer answered before the close, or \
+                    the queue was not dequeued from a closed slot";
         rig.violate(text.to_string());
     }
     rig
@@ -1046,6 +1043,8 @@ fn subscribe_leg(seed: u64, form: Form) -> Rig {
         rig.judge_replies(client, 1, &owed, "the subscribing client");
     }
     rig.expect_vacant(X, 0);
+    let drained = rig.drain_count("closed_queue_commands", |n| n.closed_queue_commands.get());
+    let engaged = engaged && (form == Form::Fin || drained > names.len() as u64);
     if !engaged {
         let token = match form {
             Form::Reset => "closed-queue-unengaged",
@@ -1084,6 +1083,8 @@ fn registry_leg(seed: u64, form: Form) -> Rig {
             [DEL_NONE.to_vec(), b"+OK\r\n".to_vec(), b"+OK\r\n".to_vec(), subscribed(&channel)];
         rig.judge_replies(client, 2, &owed, "the registry client");
     }
+    let drained = rig.drain_count("closed_queue_commands", |n| n.closed_queue_commands.get());
+    let engaged = engaged && (form == Form::Fin || drained >= 3);
     if !engaged {
         let token = match form {
             Form::Reset => "registry-unengaged",
@@ -1159,7 +1160,9 @@ fn quit_subscriber_leg(seed: u64) -> Rig {
         rig.violate(format!("publish-count-over: {over} PUBLISHes counted more than one receiver"));
     }
     rig.settle();
-    let engaged = ok_at.is_some_and(|(_, at)| at > quit_sent);
+    let dropped =
+        rig.drain_count("flushing_deliveries_dropped", |n| n.flushing_deliveries_dropped.get());
+    let engaged = ok_at.is_some_and(|(_, at)| at > quit_sent) && dropped >= 1;
     if !engaged {
         let text = "VACUOUS quit-sub-unengaged: no PUBLISH between the QUIT and its +OK";
         rig.violate(text.to_string());
@@ -1239,8 +1242,11 @@ fn stall_leg(seed: u64) -> Rig {
     let net = rig.nets[X].borrow();
     let sent = net.sends_after_eof(rig.fd(b)) > 0 && net.sends_after_eof(rig.fd(e)) > 0;
     drop(net);
-    if !(eofs_in_sleep && sent) {
-        let text = "VACUOUS stall-close-unengaged: B's and E's ends were not read in the sleep";
+    let entries = rig.drain_count("closed_reader_entries", |n| n.closed_reader_entries.get());
+    let waits = rig.drain_count("reader_take_waits", |n| n.reader_take_waits.get());
+    if !(eofs_in_sleep && sent && entries >= 1 && waits >= 3) {
+        let text = "VACUOUS stall-close-unengaged: B's and E's ends were not read in the sleep, \
+                    or no held entry parsed past Closed and no run-out waited for a take";
         rig.violate(text.to_string());
     }
     rig
@@ -1336,8 +1342,11 @@ fn half_close_reset_leg(seed: u64) -> Rig {
     rig.settle();
     rig.expect_landed(reader, &names, "reset-drain-unrun", "the reset client");
     rig.expect_vacant(X, 1);
-    if rig.nets[X].borrow().reset_send_errors() == 0 {
-        rig.violate("VACUOUS reset-drain-unengaged: no Send met the reset".to_string());
+    let drained = rig.drain_count("closed_queue_commands", |n| n.closed_queue_commands.get());
+    if rig.nets[X].borrow().reset_send_errors() == 0 || drained == 0 {
+        let text = "VACUOUS reset-drain-unengaged: no Send met the reset, or no command was \
+                    dequeued from a closed slot";
+        rig.violate(text.to_string());
     }
     rig
 }
@@ -1502,76 +1511,6 @@ mod reds {
                 each leg takes one of the connection's gate units"]
     fn the_fan_leg_holds_a_window_per_connection() {
         pinned_red(CloseLeg::Fan);
-    }
-
-    #[test]
-    #[ignore = "Closed drops a reset connection's queue; red until a draining slot runs it"]
-    fn the_close_leg_runs_every_queued_command() {
-        pinned_red(CloseLeg::Close);
-    }
-
-    #[test]
-    #[ignore = "an end of stream closes the slot at once, so replies after it are lost; red \
-                until the end of stream moves the slot to a flush that answers them"]
-    fn the_rearm_leg_answers_every_reply() {
-        pinned_red(CloseLeg::Rearm);
-    }
-
-    #[test]
-    #[ignore = "bytes reaped beside their end of stream are released unparsed; red until the \
-                end of stream keeps the parser"]
-    fn the_eof_with_data_leg_runs_and_answers_its_set() {
-        pinned_red(CloseLeg::EofWithData);
-    }
-
-    #[test]
-    #[ignore = "an end of stream closes the slot at once, so replies after it are lost; red \
-                until the end of stream moves the slot to a flush that answers them"]
-    fn the_subscribe_leg_answers_its_fin() {
-        pinned_red(CloseLeg::SubscribeFin);
-    }
-
-    #[test]
-    #[ignore = "an end of stream closes the slot at once, so replies after it are lost; red \
-                until the end of stream moves the slot to a flush that answers them"]
-    fn the_registry_leg_answers_its_fin() {
-        pinned_red(CloseLeg::RegistryFin);
-    }
-
-    #[test]
-    #[ignore = "a marked subscriber is written deliveries after its QUIT; red until a flushing \
-                slot takes no delivery"]
-    fn the_quit_subscriber_leg_reads_nothing_after_its_ok() {
-        pinned_red(CloseLeg::QuitSubscriber);
-    }
-
-    #[test]
-    #[ignore = "a stalled cell releases at the vacant slot the bytes of connections closed \
-                during the stall; red until a slot keeps its parser past Closed"]
-    fn the_stall_leg_runs_what_each_client_sent() {
-        pinned_red(CloseLeg::Stall);
-    }
-
-    #[test]
-    #[ignore = "an end of stream closes the slot and Closed drops the queue behind a held \
-                reply, so what the client sent is neither run nor answered; red until a \
-                half-closed slot runs its queue and sends every reply after the end of stream"]
-    fn the_half_close_leg_answers_every_reply() {
-        pinned_red(CloseLeg::HalfClose);
-    }
-
-    #[test]
-    #[ignore = "an end of stream reaped with its bytes closes the slot first; red until the end \
-                of stream keeps the parser and answers what was read"]
-    fn the_half_close_leg_answers_a_shared_reap() {
-        pinned_red(CloseLeg::HalfCloseEofWithData);
-    }
-
-    #[test]
-    #[ignore = "an end of stream closes the slot and Closed drops the queue; red until the \
-                queue runs to its end after a reset"]
-    fn the_half_close_reset_leg_runs_its_queue() {
-        pinned_red(CloseLeg::HalfCloseReset);
     }
 
     #[test]
