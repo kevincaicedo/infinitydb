@@ -1601,11 +1601,23 @@ mod tests {
         }
     }
 
+    /// What the peer reads of cell 0's staged ops: each apply's key in
+    /// order, and how many of them are fan legs.
+    fn peer_reads(peer: &mut CellFabric) -> (Vec<FabricToken>, usize) {
+        let (mut keys, mut legs) = (Vec::new(), 0);
+        peer.drain(16, |_, op| {
+            let Op::Apply { token, args, .. } = op else { panic!("the peer read no apply") };
+            legs += usize::from(args.as_slice().first() == Some(&&b"INF.PUBFAN"[..]));
+            keys.push(token);
+        });
+        (keys, legs)
+    }
+
     /// The two arms an attempt stages by. A point op goes out on the
     /// general credit, which ends where the publish fan's one begins. A
-    /// fan leg takes that one on its first attempt, and a refused leg the
-    /// general path, in that attempt and in every retry: its second try
-    /// at the fan's credit would be a second refusal counted.
+    /// fan leg takes that one on its first attempt. A leg refused there,
+    /// with the general window spent, parks and tries the fan's credit no
+    /// more: a second try would be a second refusal counted.
     #[test]
     fn an_attempt_stages_by_its_arm() {
         let gate = gate();
@@ -1641,13 +1653,45 @@ mod tests {
             assert_eq!(refused.get(), 1, "try {tries}: a leg tries the fan's credit once");
         }
         fabric.borrow_mut().flush();
-        let (mut keys, mut legs_read) = (Vec::new(), 0);
-        peer.drain(16, |_, op| {
-            let Op::Apply { token, args, .. } = op else { panic!("the peer read no apply") };
-            legs_read += usize::from(args.as_slice().first() == Some(&&b"INF.PUBFAN"[..]));
-            keys.push(token);
-        });
+        let (keys, legs_read) = peer_reads(&mut peer);
         assert_eq!((keys.len(), legs_read), (4, 1), "three point ops and one leg");
+        each_key_names_its_holder(&gate, &keys);
+    }
+
+    /// A leg the fan refuses stages on the general path in the same
+    /// attempt (ADR-0192 D3), while the general window holds a credit for
+    /// it. After one point op and the fan's first leg, a second leg to the
+    /// same peer is refused the fan's credit, once, and goes out as a
+    /// general op: the peer reads two legs. That spends the window, and a
+    /// third leg parks, however often it tries.
+    #[test]
+    fn a_refused_leg_stages_on_the_general_path() {
+        let gate = gate();
+        let units = gate.borrow().units(8).expect("a task's units");
+        let (fabric, mut reserve, mut peer) = two_cells();
+        let refused = Cell::new(0);
+        let Attempt::Sent(first) = point(&gate, &fabric, &units) else {
+            panic!("a point op did not stage inside the general window")
+        };
+        let mut waits = vec![first];
+        let fan = PubFanArgv::new(b"chan", b"payload", None);
+        let mut legs = FanLegs::open(&mut reserve, &refused);
+        for (leg, refusals) in [("the fan's first leg", 0), ("a second leg to its peer", 1)] {
+            let mut stage = Staging::FanLeg { fan: &fan, cmd: 2, first: true, legs: &mut legs };
+            let staged = attempt(&gate, &fabric, &units, PEER, Hop::Recorded, Nanos(0), &mut stage);
+            let Attempt::Sent(wait) = staged else { panic!("{leg} did not stage") };
+            waits.push(wait);
+            assert_eq!(refused.get(), refusals, "{leg}: the legs the fan has refused");
+        }
+        let mut third = Staging::FanLeg { fan: &fan, cmd: 2, first: true, legs: &mut legs };
+        for tries in 1..=2 {
+            let parked = attempt(&gate, &fabric, &units, PEER, Hop::Recorded, Nanos(0), &mut third);
+            assert!(matches!(parked, Attempt::NoCredit), "try {tries} of a third leg staged");
+            assert_eq!(refused.get(), 2, "try {tries}: a leg tries the fan's credit once");
+        }
+        fabric.borrow_mut().flush();
+        let (keys, legs_read) = peer_reads(&mut peer);
+        assert_eq!((keys.len(), legs_read), (3, 2), "one point op and two legs");
         each_key_names_its_holder(&gate, &keys);
     }
 
