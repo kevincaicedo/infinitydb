@@ -592,26 +592,22 @@ impl<'u, V, C: Cleanup<V>> GatePermit<'_, 'u, V, C> {
     }
 
     /// Publishes the holder once the request was sent: the key is routable.
-    /// `gate` is the cell this permit's gate lives in.
-    pub fn register(self, gate: &'u RefCell<FabricGate<V, C>>) -> GateWait<'u, V, C> {
-        self.publish(gate, HolderState::Registered)
-    }
-
-    /// [`register`](Self::register) for a recorded hop sent at `sent`: its
-    /// holder keeps the send time, and the gate records the round trip at
-    /// the completion, whatever order the replies arrive in.
-    pub fn register_timed(
+    /// `gate` is the cell this permit's gate lives in. A recorded hop gives
+    /// the time it was sent at: its holder keeps it, and the gate records
+    /// the round trip at the completion, whatever order the replies arrive
+    /// in. One entry for both, so the holder's publish has one site.
+    pub fn register(
         self,
         gate: &'u RefCell<FabricGate<V, C>>,
-        sent: Nanos,
+        sent: Option<Nanos>,
     ) -> GateWait<'u, V, C> {
-        self.publish(gate, HolderState::RegisteredTimed(sent))
+        let state = match sent {
+            None => HolderState::Registered,
+            Some(sent) => HolderState::RegisteredTimed(sent),
+        };
+        self.publish(gate, state)
     }
 
-    // Forced into both entries: the permit then stays in its caller's
-    // registers from `reserve` to the holder's publish, where a call would
-    // pass it through memory.
-    #[inline(always)]
     fn publish(
         mut self,
         gate: &'u RefCell<FabricGate<V, C>>,
@@ -1454,7 +1450,7 @@ mod tests {
             panic!("a unit and a holder are free");
         };
         let key = permit.key();
-        (key, permit.register(gate))
+        (key, permit.register(gate, None))
     }
 
     /// The holder table: Registered or Waiting × the waiter dropped → Orphaned, then
@@ -1597,7 +1593,7 @@ mod tests {
                                 drop(permit);
                                 finished.push(key);
                             } else {
-                                waits.push((key, permit.register(&gate)));
+                                waits.push((key, permit.register(&gate, None)));
                                 model.insert(key, FabricModel::Awaiting);
                             }
                         }
@@ -1696,11 +1692,7 @@ mod tests {
                 panic!("a unit and a holder are free");
             };
             let key = permit.key();
-            let wait = match sent {
-                Some(sent) => permit.register_timed(&gate, Nanos(sent)),
-                None => permit.register(&gate),
-            };
-            (key, wait)
+            (key, permit.register(&gate, sent.map(Nanos)))
         };
         let (suspended_key, mut suspended) = send(Some(100));
         let (parked_key, mut parked) = send(Some(1_000));
@@ -1719,6 +1711,40 @@ mod tests {
         assert_eq!(Pin::new(&mut suspended).poll(&mut cx), Poll::Ready(1));
         assert_eq!(Pin::new(&mut parked).poll(&mut cx), Poll::Ready(2));
         assert_eq!(Pin::new(&mut plain).poll(&mut cx), Poll::Ready(3));
+    }
+
+    /// The registration's send time at its two ends: a hop sent at time 0,
+    /// where the simulator's clock starts, and one sent at the last instant
+    /// are recorded hops like any other, and only a send with no time is
+    /// not. A send time that reads as none at either end would lose a
+    /// sample without a trace.
+    #[test]
+    fn a_send_time_at_either_end_is_a_recorded_hop() {
+        let gate = fabric_gate(4);
+        let units = gate.borrow().units(3).expect("three units");
+        let send = |sent: Option<Nanos>| {
+            let mut borrowed = gate.borrow_mut();
+            let FabricAdmission::Granted(permit) = borrowed.reserve(&units) else {
+                panic!("a unit and a holder are free");
+            };
+            let key = permit.key();
+            (key, permit.register(&gate, sent))
+        };
+        let (first_key, _first) = send(Some(Nanos(0)));
+        let (last_key, _last) = send(Some(Nanos(u64::MAX)));
+        let (plain_key, _plain) = send(None);
+        for key in [first_key, plain_key] {
+            assert_eq!(FabricGate::complete(&gate, key, 1, Nanos(350)), Delivery::Delivered);
+        }
+        let (count, sum) = {
+            let gate = gate.borrow();
+            (gate.round_trips().count(), gate.round_trips().sum())
+        };
+        assert_eq!((count, sum), (1, 350), "time 0 is a send time: its hop took 350 ns");
+        assert_eq!(FabricGate::complete(&gate, last_key, 1, Nanos(350)), Delivery::Delivered);
+        let gate = gate.borrow();
+        assert_eq!(gate.round_trips().count(), 2, "the last instant is a send time too");
+        assert_eq!(gate.round_trips().sum(), 350, "a reply before its send took no time");
     }
 
     /// Counts the wakes a parked sender receives: the room's oracle reads

@@ -1227,10 +1227,11 @@ fn register_hop<'u>(
     hop: Hop,
     now: Nanos,
 ) -> GateWait<'u, OwnedOutcome> {
-    match hop {
-        Hop::Recorded => permit.register_timed(gate, now),
-        Hop::Unrecorded => permit.register(gate),
-    }
+    let sent = match hop {
+        Hop::Recorded => Some(now),
+        Hop::Unrecorded => None,
+    };
+    permit.register(gate, sent)
 }
 
 /// The hop an `Apply` of `argv` makes: `INF.PUB`'s reply waits for the
@@ -1264,10 +1265,10 @@ enum Attempt<'u> {
 /// permit, which returns the unit and the holder.
 ///
 /// Every send goes through this one function, out of line, its stage one
-/// indirect call an attempt: the gate's `reserve` and the permit's two
-/// entries then have this caller alone, so the permit stays in this frame
-/// from the reservation to the holder's publish. Generic over its stage,
-/// it would be a copy of the admission for each stage's closure.
+/// indirect call an attempt: the gate's `reserve` and the permit's
+/// `register` then have this caller alone, so the permit stays in this
+/// frame from the reservation to the holder's publish. Generic over its
+/// stage, it would be a copy of the admission for each stage's closure.
 #[inline(never)]
 fn attempt<'u>(
     gate: &'u RefCell<FabricGate<OwnedOutcome>>,

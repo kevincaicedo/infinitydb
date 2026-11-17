@@ -297,7 +297,7 @@ fn suspend_op(cell: &mut SuspendCell) -> bool {
         let mut gate = cell.gate.borrow_mut();
         let FabricAdmission::Granted(permit) = gate.reserve(cell.units) else { return false };
         let key = permit.key();
-        (key, permit.register(cell.gate))
+        (key, permit.register(cell.gate, None))
     };
     let sink = Rc::clone(&cell.sink);
     let TaskAdmission::Granted(permit) = cell.exec.reserve(cell.class) else { return false };
@@ -332,7 +332,7 @@ fn suspend_cell(holders: Cap) -> Result<SuspendCell, String> {
         let FabricAdmission::Granted(permit) = open.reserve(units) else {
             return Err("the row's gate refused a waiting holder".into());
         };
-        waiting.push(permit.register(gate));
+        waiting.push(permit.register(gate, None));
     }
     std::mem::forget(waiting);
     Ok(SuspendCell { exec, class, gate, units, sink: Rc::new(Cell::new(0)) })

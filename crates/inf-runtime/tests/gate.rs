@@ -41,7 +41,7 @@ fn every_value_reaches_its_own_wait_past_the_generation_field() {
                 panic!("round {round}: a unit and a holder are free for leg {leg}");
             };
             let key = permit.key();
-            ops.push((key, (round << 32) | leg, permit.register(&gate)));
+            ops.push((key, (round << 32) | leg, permit.register(&gate, None)));
         }
         // The peer answers in an order of its own, each op with its own key.
         let mut order: Vec<usize> = (0..ops.len()).collect();

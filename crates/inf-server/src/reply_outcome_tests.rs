@@ -980,7 +980,7 @@ fn gathered_in(cells: &Cells, answers: &[LegAnswer], order: &[usize]) -> (OwnedR
             panic!("a leg has a unit and a holder")
         };
         keys.push(permit.key());
-        waiters.push(permit.register(&gate));
+        waiters.push(permit.register(&gate, None));
     }
     let plan = remote_plan(answers.len());
     let gather = test_support::in_flight(shared, Protocol::Resp2, plan, small_limit(), waiters);

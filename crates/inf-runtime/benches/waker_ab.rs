@@ -319,7 +319,7 @@ fn step_suspend<L: Foreign>(cell: &mut SuspendCell, lane: &mut L) -> usize {
             panic!("the row's one wait is done");
         };
         let token = permit.key();
-        (token, permit.register(cell.gate))
+        (token, permit.register(cell.gate, None))
     };
     let sink = Rc::clone(&cell.sink);
     let completed =

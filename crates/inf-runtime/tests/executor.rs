@@ -35,7 +35,7 @@ async fn fabric_wait<V>(gate: Rc<RefCell<FabricGate<V>>>, key: Rc<Cell<u64>>) ->
             panic!("a gate of one free holder");
         };
         key.set(permit.key());
-        permit.register(&gate)
+        permit.register(&gate, None)
     };
     wait.await
 }
@@ -129,7 +129,7 @@ fn delivery_before_first_poll_keeps_the_fast_path() {
                 panic!("a gate of one free holder");
             };
             let key = permit.key();
-            let waiter = permit.register(&gate);
+            let waiter = permit.register(&gate, None);
             drop(open);
             // Reply lands before the waiter ever polls (same-iteration delivery).
             assert_eq!(

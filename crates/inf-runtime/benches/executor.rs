@@ -131,7 +131,7 @@ fn bench_suspend_resume(c: &mut Criterion) {
                     panic!("the bench's one wait is done");
                 };
                 let token = permit.key();
-                (token, permit.register(gate))
+                (token, permit.register(gate, None))
             };
             let sink = Rc::clone(&sink);
             let TaskAdmission::Granted(permit) = ex.reserve(class) else {
