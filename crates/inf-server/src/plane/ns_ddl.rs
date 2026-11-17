@@ -1208,6 +1208,51 @@ impl From<Result<(), SendError>> for Stage {
     }
 }
 
+/// What an attempt stages under the key the gate minted: the two shapes a
+/// send has (ADR-0177 D4). [`attempt`] stages by a match on it, in its own
+/// frame; handed in as a closure, the stage was one indirect call an
+/// attempt.
+enum Staging<'s, 'a, 'r, 'u> {
+    /// A point op on the general credit, stamped with the attempt's key:
+    /// the `Apply` of `send_apply` and `try_send_apply`, the `ApplyNs` of
+    /// `send_apply_ns`.
+    Point(&'s mut PointOp<'a>),
+    /// A publish fan leg (ADR-0192 D3): the fan's own credit on its first
+    /// attempt; a refused leg, and every retry, the general path.
+    FanLeg {
+        fan: &'s PubFanArgv<'a>,
+        cmd: u8,
+        /// Whether the leg has yet to try the fan's own credit.
+        first: bool,
+        legs: &'s mut FanLegs<'r, 'u>,
+    },
+}
+
+impl Staging<'_, '_, '_, '_> {
+    /// Stages toward `to`, into `fabric`'s outbound pack, under `token`,
+    /// the key of this attempt's holder.
+    fn stage(&mut self, fabric: &RefCell<PlaneFabric>, to: CellId, token: FabricToken) -> Stage {
+        match self {
+            Staging::Point(op) => {
+                op.stamp(token);
+                Stage::from(fabric.borrow_mut().stage_general(to, op))
+            }
+            Staging::FanLeg { fan, cmd, first, legs } => {
+                // The point op is the likely stage. Unhinted, the fabric's
+                // credit read is a called body in `attempt` on every send,
+                // eight instructions more an attempt than read in line.
+                core::hint::cold_path();
+                let Some(op) = fan.op(token, *cmd) else { return Stage::TooWide };
+                let mut fabric = fabric.borrow_mut();
+                if core::mem::take(first) && fabric.stage_fan_leg(legs, to, &op).is_ok() {
+                    return Stage::Sent;
+                }
+                Stage::from(fabric.stage_general(to, &op.into_general()))
+            }
+        }
+    }
+}
+
 /// Whether a send's round trip is a hop sample (the hop RTT gate): its
 /// holder keeps the send time, and the gate records the round trip at the
 /// completion, whatever order the replies arrive in.
@@ -1281,18 +1326,20 @@ enum Attempt<'u> {
 /// defect, stops the process here (ADR-0026 D3): the node goes down with
 /// the panic's own text and `SIGABRT`, before the cell thread's boundary.
 ///
-/// Every send goes through this one function, out of line, its stage one
-/// indirect call an attempt: the gate's `reserve` and the permit's
+/// Every send goes through this one function, out of line, and stages by
+/// a match on its [`Staging`]: the gate's `reserve` and the permit's
 /// `register` then have this caller alone, so the permit stays in this
 /// frame from the reservation to the holder's publish. Generic over its
-/// stage, it would be a copy of the admission for each stage's closure.
+/// stage, it would be a copy of the admission for each stage.
 #[inline(never)]
 fn attempt<'u>(
     gate: &'u RefCell<FabricGate<OwnedOutcome>>,
+    fabric: &RefCell<PlaneFabric>,
     units: &'u GateUnits,
+    to: CellId,
     hop: Hop,
     now: Nanos,
-    stage: &mut dyn FnMut(FabricToken) -> Stage,
+    stage: &mut Staging<'_, '_, '_, 'u>,
 ) -> Attempt<'u> {
     let mut borrowed = gate.borrow_mut();
     match borrowed.reserve(units) {
@@ -1303,7 +1350,7 @@ fn attempt<'u>(
             // every send, copied at each move from the reservation to the
             // holder's publish. Stopped here, an unwind names no value.
             let stops = StopOnUnwind;
-            let staged = stage(FabricToken(permit.key()));
+            let staged = stage.stage(fabric, to, FabricToken(permit.key()));
             core::mem::forget(stops);
             match staged {
                 Stage::Sent => Attempt::Sent(register_hop(permit, gate, hop, now)),
@@ -1326,12 +1373,13 @@ async fn send_op<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     to: CellId,
     proto: Protocol,
     hop: Hop,
-    mut stage: impl FnMut(FabricToken) -> Stage,
+    mut stage: Staging<'_, '_, '_, 'u>,
 ) -> Sent<'u> {
     loop {
         // The attempt's answer ends with this statement: held across a park
         // below, its wait's bytes would be the task's at every suspension.
-        let full = match attempt(&shared.gate, units, hop, shared.now.get(), &mut stage) {
+        let now = shared.now.get();
+        let full = match attempt(&shared.gate, &shared.fabric, units, to, hop, now, &mut stage) {
             Attempt::Sent(waiter) => return Ok(waiter),
             Attempt::TooWide => return Err(SendRefused::Reply(too_many_args_reply(proto))),
             Attempt::NoUnit => return Err(SendRefused::NoUnit),
@@ -1372,11 +1420,7 @@ pub(super) async fn send_apply_ns<
     };
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
     let mut op = PointOp::apply_ns(FabricToken(0), slot, cmd_byte(proto, 0), ns.0, args, program);
-    send_op(shared, units, to, proto, Hop::Unrecorded, |token| {
-        op.stamp(token);
-        Stage::from(shared.fabric.borrow_mut().stage_general(to, &op))
-    })
-    .await
+    send_op(shared, units, to, proto, Hop::Unrecorded, Staging::Point(&mut op)).await
 }
 
 /// Outcome of a synchronous [`try_send_apply`] first attempt (de-async
@@ -1412,11 +1456,9 @@ pub(super) fn try_send_apply<'u, O: PlaneObserver + 'static, F: SegmentFs + Clon
     };
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
     let mut op = PointOp::apply(FabricToken(0), slot, cmd_byte(proto, db), args, program);
-    let mut stage = |token| {
-        op.stamp(token);
-        Stage::from(shared.fabric.borrow_mut().stage_general(to, &op))
-    };
-    match attempt(&shared.gate, units, apply_hop(argv), shared.now.get(), &mut stage) {
+    let mut stage = Staging::Point(&mut op);
+    let (hop, now) = (apply_hop(argv), shared.now.get());
+    match attempt(&shared.gate, &shared.fabric, units, to, hop, now, &mut stage) {
         Attempt::Sent(waiter) => SendNow::Sent(waiter),
         Attempt::TooWide => SendNow::Refused(too_many_args_reply(proto)),
         Attempt::NoCredit | Attempt::NoUnit | Attempt::Full => SendNow::NoCredit,
@@ -1449,11 +1491,7 @@ pub(super) async fn send_apply<'u, O: PlaneObserver + 'static, F: SegmentFs + Cl
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
     let cmd = cmd_byte(proto, db);
     let mut op = PointOp::apply(FabricToken(0), slot, cmd, args, program);
-    send_op(shared, units, to, proto, apply_hop(argv), |token| {
-        op.stamp(token);
-        Stage::from(shared.fabric.borrow_mut().stage_general(to, &op))
-    })
-    .await
+    send_op(shared, units, to, proto, apply_hop(argv), Staging::Point(&mut op)).await
 }
 
 /// Stages one publish fan leg, `INF.PUBFAN channel payload` with the
@@ -1478,18 +1516,8 @@ pub(super) async fn send_fan_leg<'u, O: PlaneObserver + 'static, F: SegmentFs + 
 ) -> Result<(), SendRefused> {
     let fan = PubFanArgv::new(channel, payload, tag);
     let cmd = cmd_byte(Protocol::Resp2, 0);
-    let mut first = true;
-    let waiter = send_op(shared, units, to, Protocol::Resp2, Hop::Recorded, |token| {
-        let Some(op) = fan.op(token, cmd) else { return Stage::TooWide };
-        let mut fabric = shared.fabric.borrow_mut();
-        // The fan's own credit on the first attempt; a refused leg, and
-        // every retry, the general path.
-        if core::mem::take(&mut first) && fabric.stage_fan_leg(legs, to, &op).is_ok() {
-            return Stage::Sent;
-        }
-        Stage::from(fabric.stage_general(to, &op.into_general()))
-    })
-    .await?;
+    let stage = Staging::FanLeg { fan: &fan, cmd, first: true, legs };
+    let waiter = send_op(shared, units, to, Protocol::Resp2, Hop::Recorded, stage).await?;
     legs.push(waiter);
     Ok(())
 }
@@ -1520,41 +1548,215 @@ fn db_nibble(db: u16) -> u8 {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, reason = "test-only: a child test reads its role")]
 mod tests {
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+
+    use inf_fabric::{Mesh, MeshConfig};
+    use inf_foundation::bounded::CapFill;
+    use inf_store::StoreConfig;
+
     use super::*;
+
+    const HOLDERS: Cap = Cap::entries::<8>("test-gate-holders", CapFill::Serving);
+    const PEER: CellId = CellId(1);
+    /// Four credits a peer: three a general send may take, and the publish
+    /// fan's one (ADR-0192 D2).
+    const MESH: MeshConfig = MeshConfig { ring_capacity: 16, data_credits: 4 };
+
+    /// A gate of cell 0 with eight units.
+    fn gate() -> RefCell<FabricGate<OwnedOutcome>> {
+        let (census, _mark) = CapCensus::new(CellId(0));
+        let gate = FabricGate::<OwnedOutcome>::build(0, 8, Some(HOLDERS), &census);
+        RefCell::new(gate.expect("a test gate"))
+    }
+
+    /// Cell 0's fabric on a two-cell mesh, its fan reserve, and cell 1's
+    /// own handle, which reads what cell 0 staged.
+    fn two_cells() -> (RefCell<PlaneFabric>, FanReserve, CellFabric) {
+        let mut cells = Mesh::new(2, MESH);
+        let peer = cells.pop().expect("two cells");
+        let (fabric, reserve) = PlaneFabric::new(cells.pop().expect("two cells"));
+        (RefCell::new(fabric), reserve, peer)
+    }
+
+    /// One attempt at a point op toward the peer.
+    fn point<'u>(
+        gate: &'u RefCell<FabricGate<OwnedOutcome>>,
+        fabric: &RefCell<PlaneFabric>,
+        units: &'u GateUnits,
+    ) -> Attempt<'u> {
+        let slot = SlotRouter::slot_of(b"");
+        let mut op = PointOp::apply(FabricToken(0), slot, 2, ApplyArgs::EMPTY, true);
+        let mut stage = Staging::Point(&mut op);
+        attempt(gate, fabric, units, PEER, Hop::Unrecorded, Nanos(0), &mut stage)
+    }
+
+    /// Each op the peer reads was staged under a key of its own, the key
+    /// of a holder that still waits: completed by it, the gate delivers.
+    fn each_key_names_its_holder(gate: &RefCell<FabricGate<OwnedOutcome>>, keys: &[FabricToken]) {
+        for (at, key) in keys.iter().enumerate() {
+            assert!(!keys[..at].contains(key), "two ops under one key: {keys:?}");
+            let delivery = FabricGate::complete(gate, key.0, OwnedOutcome::Ok, Nanos(0));
+            assert_eq!(delivery, Delivery::Delivered, "op {at}'s key names no waiting holder");
+        }
+    }
+
+    /// The two arms an attempt stages by. A point op goes out on the
+    /// general credit, which ends where the publish fan's one begins. A
+    /// fan leg takes that one on its first attempt, and a refused leg the
+    /// general path, in that attempt and in every retry: its second try
+    /// at the fan's credit would be a second refusal counted.
+    #[test]
+    fn an_attempt_stages_by_its_arm() {
+        let gate = gate();
+        let units = gate.borrow().units(8).expect("a task's units");
+        let (fabric, mut reserve, mut peer) = two_cells();
+        let refused = Cell::new(0);
+        let mut waits = Vec::new();
+        for sent in 0..3 {
+            let Attempt::Sent(wait) = point(&gate, &fabric, &units) else {
+                panic!("point op {sent} did not stage inside the general window")
+            };
+            waits.push(wait);
+        }
+        let fourth = point(&gate, &fabric, &units);
+        assert!(matches!(fourth, Attempt::NoCredit), "a point op took the fan's credit");
+        let fan = PubFanArgv::new(b"chan", b"payload", None);
+        let mut legs = FanLegs::open(&mut reserve, &refused);
+        let mut leg = Staging::FanLeg { fan: &fan, cmd: 2, first: true, legs: &mut legs };
+        let Attempt::Sent(wait) =
+            attempt(&gate, &fabric, &units, PEER, Hop::Recorded, Nanos(0), &mut leg)
+        else {
+            panic!("a fan leg did not stage on the fan's own credit")
+        };
+        waits.push(wait);
+        assert_eq!(refused.get(), 0, "the leg's first attempt was refused");
+        // A second leg to the same peer is refused the fan's credit, and
+        // the general path has none left.
+        let mut again = Staging::FanLeg { fan: &fan, cmd: 2, first: true, legs: &mut legs };
+        for tries in 1..=2 {
+            let retried =
+                attempt(&gate, &fabric, &units, PEER, Hop::Recorded, Nanos(0), &mut again);
+            assert!(matches!(retried, Attempt::NoCredit), "try {tries} of a refused leg staged");
+            assert_eq!(refused.get(), 1, "try {tries}: a leg tries the fan's credit once");
+        }
+        fabric.borrow_mut().flush();
+        let (mut keys, mut legs_read) = (Vec::new(), 0);
+        peer.drain(16, |_, op| {
+            let Op::Apply { token, args, .. } = op else { panic!("the peer read no apply") };
+            legs_read += usize::from(args.as_slice().first() == Some(&&b"INF.PUBFAN"[..]));
+            keys.push(token);
+        });
+        assert_eq!((keys.len(), legs_read), (4, 1), "three point ops and one leg");
+        each_key_names_its_holder(&gate, &keys);
+    }
+
+    /// One plane of a two-cell node on [`MESH`].
+    fn plane(cell: u16, fabric: CellFabric) -> ServerPlane<NoopObserver> {
+        let (node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
+        let seed = KeyspaceSeed::Uncataloged { cfg: StoreConfig::default(), specs: Vec::new() };
+        let (plane, _serve_mark, _timer_set, _executor) = ServerPlane::new(
+            CellId(cell),
+            2,
+            -1,
+            seed,
+            fabric,
+            Rc::new(node),
+            admission,
+            NoopObserver,
+            false,
+        )
+        .expect("a test plane");
+        plane
+    }
+
+    /// The arm each of the four sends stages by. Inside the general
+    /// window each of the three point sends stages. At its end
+    /// `try_send_apply` answers `NoCredit` and `send_apply` and
+    /// `send_apply_ns` park on the peer's credit, the fan's one left free,
+    /// and `send_fan_leg` stages on it at its first poll. The peer reads
+    /// two applies, an apply-ns and the leg, each under its holder's key.
+    #[test]
+    fn each_send_stages_by_its_arm() {
+        let mut cells = Mesh::new(2, MESH).into_iter();
+        let origin = plane(0, cells.next().expect("cell 0"));
+        let peer = plane(1, cells.next().expect("cell 1"));
+        let shared = &origin.shared;
+        let units = shared.gate.borrow().units(8).expect("a task's units");
+        let mut cx = Context::from_waker(Waker::noop());
+        let (client, resp2, ns) = (ApplyOrigin::Client, Protocol::Resp2, NsId(16));
+        let set: [&[u8]; 3] = [b"SET", b"k", b"v"];
+        let first = try_send_apply(shared, &units, PEER, client, resp2, 0, &set);
+        assert!(matches!(first, SendNow::Sent(_)), "try_send_apply inside the window");
+        let second = pin!(send_apply(shared, &units, PEER, client, resp2, 0, &set)).poll(&mut cx);
+        assert!(matches!(second, Poll::Ready(Ok(_))), "send_apply inside the window");
+        let third =
+            pin!(send_apply_ns(shared, &units, PEER, client, resp2, ns, &set)).poll(&mut cx);
+        assert!(matches!(third, Poll::Ready(Ok(_))), "send_apply_ns inside the window");
+        let refused = try_send_apply(shared, &units, PEER, client, resp2, 0, &set);
+        assert!(matches!(refused, SendNow::NoCredit), "try_send_apply took the fan's credit");
+        let mut apply = pin!(send_apply(shared, &units, PEER, client, resp2, 0, &set));
+        assert!(apply.as_mut().poll(&mut cx).is_pending(), "send_apply took the fan's credit");
+        let mut apply_ns = pin!(send_apply_ns(shared, &units, PEER, client, resp2, ns, &set));
+        assert!(apply_ns.as_mut().poll(&mut cx).is_pending(), "send_apply_ns took it");
+        let mut reserve = shared.fan_reserve.take().expect("the cell's fan reserve");
+        let legs_refused = &shared.node.fabric_reserve_refused_cell;
+        let mut legs = FanLegs::open(&mut reserve, legs_refused);
+        let leg = pin!(send_fan_leg(shared, &units, &mut legs, PEER, b"chan", b"payload", None))
+            .poll(&mut cx);
+        assert!(matches!(leg, Poll::Ready(Ok(()))), "a fan leg waited for a general credit");
+        assert_eq!(legs_refused.get(), 0, "the leg was refused the fan's credit");
+        shared.fabric.borrow_mut().flush();
+        let (mut keys, mut read) = (Vec::new(), Vec::new());
+        peer.shared.fabric.borrow_mut().drain(16, |_, op| match op {
+            Op::Apply { token, args, .. } => {
+                let leg = args.as_slice().first() == Some(&&b"INF.PUBFAN"[..]);
+                read.push(if leg { "leg" } else { "apply" });
+                keys.push(token);
+            }
+            Op::ApplyNs { token, .. } => {
+                read.push("apply-ns");
+                keys.push(token);
+            }
+            _ => panic!("the peer read an op no send staged"),
+        });
+        assert_eq!(read, ["apply", "apply", "apply-ns", "leg"]);
+        each_key_names_its_holder(&shared.gate, &keys);
+        assert_eq!(shared.credit_waiters.wake_all(PEER), 2, "both parked sends wait on the peer");
+    }
 
     /// A stage that unwinds stops the process inside `attempt` (ADR-0026
     /// D3): no destructor of the attempt's frame runs, the permit's among
     /// them. The test runs its own binary on itself, the child making one
-    /// attempt whose stage panics with a planted message. The child is not
-    /// captured, since a captured test prints no panic text: the parent
-    /// reads the planted message on the child's stderr, that panic alone,
-    /// and the child killed by `SIGABRT`. A stage whose unwind passes
-    /// `attempt` fails the child's test instead, which exits 101; one whose
-    /// unwind reaches a destructor that panics also dies by `SIGABRT`, of
-    /// its second panic, which is why the panics are counted.
+    /// attempt at a point op while the fabric is borrowed, so the stage's
+    /// own borrow panics. The child is not captured, since a captured test
+    /// prints no panic text: the parent reads that panic on the child's
+    /// stderr, that panic alone, and the child killed by `SIGABRT`. A
+    /// stage whose unwind passes `attempt` fails the child's test instead,
+    /// which exits 101; one whose unwind reaches a destructor that panics
+    /// also dies by `SIGABRT`, of its second panic, which is why the
+    /// panics are counted.
     #[test]
     #[cfg(unix)]
     #[cfg_attr(miri, ignore = "the test spawns a process, which Miri does not")]
     fn a_stage_that_unwinds_stops_the_process() {
         use std::os::unix::process::ExitStatusExt;
 
-        use inf_foundation::bounded::{Cap, CapCensus, CapFill};
         const CHILD: &str = "INF_STAGE_UNWIND_CHILD";
         const NAME: &str = "plane::ns_ddl::tests::a_stage_that_unwinds_stops_the_process";
-        const PLANTED: &str = "planted: the stage unwinds";
+        /// What a `RefCell` prints of a borrow refused: the stage's panic.
+        const BORROWED: &str = "already borrowed";
         /// What the default hook prints once a panic, before its message.
         const PANIC_LINE: &str = "panicked at";
-        const HOLDERS: Cap = Cap::entries::<8>("test-gate-holders", CapFill::Serving);
         /// `SIGABRT`'s number on every supported host.
         const SIGABRT: i32 = 6;
         if std::env::var(CHILD).is_ok() {
-            let (census, _mark) = CapCensus::new(CellId(0));
-            let gate = FabricGate::<OwnedOutcome>::build(0, 1, Some(HOLDERS), &census);
-            let gate = RefCell::new(gate.expect("a test gate"));
+            let gate = gate();
             let units = gate.borrow().units(1).expect("a task's unit");
-            let mut stage = |_token: FabricToken| -> Stage { panic!("{PLANTED}") };
+            let (fabric, _reserve, _peer) = two_cells();
+            let _held = fabric.borrow_mut();
             // The attempt does not return: its stage's unwind stops the child.
-            drop(attempt(&gate, &units, Hop::Unrecorded, Nanos(0), &mut stage));
+            drop(point(&gate, &fabric, &units));
             return;
         }
         let exe = std::env::current_exe().expect("the test binary's path");
@@ -1564,7 +1766,7 @@ mod tests {
             .output()
             .expect("the child test runs");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains(PLANTED), "the child printed no planted panic: {stderr}");
+        assert!(stderr.contains(BORROWED), "the child's stage did not panic: {stderr}");
         assert_eq!(
             stderr.matches(PANIC_LINE).count(),
             1,
