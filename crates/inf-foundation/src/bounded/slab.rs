@@ -408,6 +408,38 @@ impl<T, G: Generation, P, const CHUNK_SLOTS: usize> CappedSlab<T, G, P, CHUNK_SL
     pub const SLOT_BYTES: usize = mem::size_of::<Slot<T, G>>();
 }
 
+/// The take transition (ADR-0194 D1's take row), written once and compiled as
+/// two bodies: `take`, which most takers call, and `take_inlined`, in a
+/// delivered poll's own frame. A macro and not a function: a `take` that
+/// only called `take_inlined` is folded by the compiler into each of its
+/// callers, and every taker then holds the whole body.
+macro_rules! take_transition {
+    ($slab:ident, $id:ident) => {{
+        let foreign = $slab.foreign(&$id);
+        let lent = named(
+            foreign,
+            // Inlined always: a body of its own where two steps of one slab
+            // take, the walk would be inline where one poll does, and a
+            // bench would not be placed as the server is (ADR-0205 A2.1).
+            #[inline(always)]
+            || $slab.store.slot_chain_mut($id.index).map(|(slot, chain)| Vacate(slot, chain)),
+            $id.generation,
+        );
+        match lent {
+            Named::Live((value, slot, chain)) => {
+                let left =
+                    Self::vacated(slot, chain, $id, &mut $slab.counts.live, &$slab.counts.row);
+                if left != Vacated::Written {
+                    $slab.vacated_off_path($id, left);
+                }
+                Taken::Value(value)
+            }
+            Named::Stale => Taken::Stale,
+            Named::Vacant => Taken::Vacant,
+        }
+    }};
+}
+
 impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     CappedSlab<T, G, P, CHUNK_SLOTS>
 {
@@ -554,26 +586,21 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     /// slab serves one slot fewer, reported to the row before any `Full` at
     /// the new count. An `Assembly` slab reports the removal (its fill byte,
     /// tested once). A stale or foreign handle changes nothing. `release`'s
-    /// body with the value moved out first.
+    /// body with the value moved out first. The one called body of the
+    /// transition: every taker calls it but a delivered poll.
     #[inline]
     pub fn take(&mut self, id: SlotId<G>) -> Taken<T> {
-        let foreign = self.foreign(&id);
-        let lent = named(
-            foreign,
-            || self.store.slot_chain_mut(id.index).map(|(slot, chain)| Vacate(slot, chain)),
-            id.generation,
-        );
-        match lent {
-            Named::Live((value, slot, chain)) => {
-                let left = Self::vacated(slot, chain, id, &mut self.counts.live, &self.counts.row);
-                if left != Vacated::Written {
-                    self.vacated_off_path(id, left);
-                }
-                Taken::Value(value)
-            }
-            Named::Stale => Taken::Stale,
-            Named::Vacant => Taken::Vacant,
-        }
+        take_transition!(self, id)
+    }
+
+    /// [`take`](Self::take) in its caller's frame (ADR-0194 D1's take row,
+    /// a second entry to it): for the poll that takes a delivered value and
+    /// reads it at once. Called, a take returns its occupant through memory
+    /// and the caller copies it out again; in the caller's frame it does not.
+    /// Each site pays the body's text, so no other taker enters here.
+    #[inline(always)]
+    pub fn take_inlined(&mut self, id: SlotId<G>) -> Taken<T> {
+        take_transition!(self, id)
     }
 
     /// `take` with nothing returned (ADR-0194 D1's second note): the same
@@ -1294,6 +1321,39 @@ mod tests {
         assert_eq!(core::mem::size_of::<CappedSlab<[u8; 200], u64, WrapWithProof>>(), 64);
         assert_eq!(core::mem::size_of::<SlotId<u32>>(), 12);
         assert_eq!(core::mem::size_of::<SlotId<u64>>(), 16);
+    }
+
+    /// `take_inlined` is `take`'s transition entered in the caller's frame
+    /// (ADR-0194 D1): by either entry the occupant returns, the slab holds
+    /// one fewer, the handle is stale, a second take of it changes nothing,
+    /// and the slot's next occupant is one generation on.
+    #[test]
+    fn take_inlined_is_takes_transition() {
+        type Twin = CappedSlab<u64, u32, WrapWithProof>;
+        type Entry = fn(&mut Twin, SlotId<u32>) -> Taken<u64>;
+        let entries: [(&str, Entry); 2] =
+            [("take", Twin::take), ("take_inlined", Twin::take_inlined)];
+        for (entry, take) in entries {
+            let (census, _mark) = census();
+            let cap = Cap::entries::<1>("twin", CapFill::Serving);
+            let (mut slab, _) = built::<u64, u32, WrapWithProof>(cap, &census);
+            let SlabReserved::Slot(slot) = slab.reserve() else { panic!("{entry}: a free slot") };
+            let id = slot.publish(7);
+            assert!(matches!(take(&mut slab, id), Taken::Value(7)), "{entry}: the occupant");
+            assert_eq!(slab.len(), 0, "{entry}: one fewer");
+            assert!(matches!(slab.get(id), Lookup::Stale), "{entry}: the handle is stale");
+            assert!(matches!(take(&mut slab, id), Taken::Stale), "{entry}: a second take");
+            assert_eq!(slab.len(), 0, "{entry}: a stale take changes nothing");
+            let SlabReserved::Slot(slot) = slab.reserve() else {
+                panic!("{entry}: the slot again")
+            };
+            let next = slot.publish(8);
+            assert_eq!(
+                (next.index, next.generation),
+                (id.index, id.generation + 1),
+                "{entry}: the slot's next occupant, one generation on"
+            );
+        }
     }
 
     #[test]

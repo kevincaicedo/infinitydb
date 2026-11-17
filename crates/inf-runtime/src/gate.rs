@@ -275,10 +275,27 @@ impl<V> FabricHolders<V> {
     fn take(&mut self, slot: SlotId<u32>) -> Taken<Holder<V>> {
         let taken = self.slab.take(slot);
         #[cfg(feature = "fault-points")]
+        self.count_wrapped(&taken, slot);
+        taken
+    }
+
+    /// [`take`](Self::take) for the delivered poll, in its frame: the
+    /// slab's take with its body there (`CappedSlab::take_inlined`), and the
+    /// same count.
+    #[inline(always)]
+    fn take_inlined(&mut self, slot: SlotId<u32>) -> Taken<Holder<V>> {
+        let taken = self.slab.take_inlined(slot);
+        #[cfg(feature = "fault-points")]
+        self.count_wrapped(&taken, slot);
+        taken
+    }
+
+    /// Counts a take of an occupant whose generation passed the key's field.
+    #[cfg(feature = "fault-points")]
+    fn count_wrapped(&mut self, taken: &Taken<Holder<V>>, slot: SlotId<u32>) {
         if matches!(taken, Taken::Value(_)) && slot.generation() >= 1 << GATE_KEY_GENERATION_BITS {
             self.wrapped_takes += 1;
         }
-        taken
     }
 }
 
@@ -740,7 +757,7 @@ impl<V, C: Cleanup<V>> Future for GateWait<'_, V, C> {
             }
         }
         let Taken::Value(Holder { state: HolderState::Delivered(value), .. }) =
-            fabric.take(this.slot)
+            fabric.take_inlined(this.slot)
         else {
             polled_after_completion()
         };
@@ -1106,7 +1123,7 @@ impl<K: GateKey, V, C: Cleanup<V>> Future for KeyedWait<K, V, C> {
             // the delivery.
             core::mem::replace(&mut holder.state, HolderState::Orphaned)
         } else {
-            let Taken::Value(Holder { state, .. }) = core.holders.take(this.slot) else {
+            let Taken::Value(Holder { state, .. }) = core.holders.take_inlined(this.slot) else {
                 polled_after_completion()
             };
             state
