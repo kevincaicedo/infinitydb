@@ -608,6 +608,10 @@ impl<'u, V, C: Cleanup<V>> GatePermit<'_, 'u, V, C> {
         self.publish(gate, HolderState::RegisteredTimed(sent))
     }
 
+    // Forced into both entries: the permit then stays in its caller's
+    // registers from `reserve` to the holder's publish, where a call would
+    // pass it through memory.
+    #[inline(always)]
     fn publish(
         mut self,
         gate: &'u RefCell<FabricGate<V, C>>,

@@ -1240,14 +1240,58 @@ fn apply_hop(argv: &[&[u8]]) -> Hop {
     if argv.first().copied() == Some(&b"INF.PUB"[..]) { Hop::Unrecorded } else { Hop::Recorded }
 }
 
-/// The one send (ADR-0177 D4): a holder and one of the task's `units`
-/// reserved, the request staged under the key the gate minted, then the
-/// holder registered (`stage` only stages into the outbound pack — the peer
-/// cannot observe the op until FABRIC-OUT publishes it, after this
-/// synchronous step — so no reply precedes the registration). A refused
-/// stage drops the permit, which returns the unit and the holder, and parks
-/// for a returned credit before it reserves again: a parked send holds
-/// nothing of the gate. A full gate (derived never) parks on its room.
+/// What one attempt at a send did.
+enum Attempt<'u> {
+    /// Staged, and its holder registered: the reply's wait.
+    Sent(GateWait<'u, OwnedOutcome>),
+    /// No credit toward the peer: the permit dropped, and the send parks
+    /// for a returned credit.
+    NoCredit,
+    /// The argv exceeds the codec's argument cap.
+    TooWide,
+    /// The task has every unit out.
+    NoUnit,
+    /// Every holder is taken (derived never): the send parks on the room.
+    Full,
+}
+
+/// One attempt at a send, the gate's whole admission in one synchronous
+/// step (ADR-0177 D4): a holder and one of the task's `units` reserved,
+/// the request staged under the key the gate minted, then the holder
+/// registered. `stage` only stages into the outbound pack, and the peer
+/// cannot observe the op until FABRIC-OUT publishes it, after this step,
+/// so no reply precedes the registration. A refused stage drops the
+/// permit, which returns the unit and the holder.
+///
+/// Every send goes through this one function, out of line, its stage one
+/// indirect call an attempt: the gate's `reserve` and the permit's two
+/// entries then have this caller alone, so the permit stays in this frame
+/// from the reservation to the holder's publish. Generic over its stage,
+/// it would be a copy of the admission for each stage's closure.
+#[inline(never)]
+fn attempt<'u>(
+    gate: &'u RefCell<FabricGate<OwnedOutcome>>,
+    units: &'u GateUnits,
+    hop: Hop,
+    now: Nanos,
+    stage: &mut dyn FnMut(FabricToken) -> Stage,
+) -> Attempt<'u> {
+    let mut borrowed = gate.borrow_mut();
+    match borrowed.reserve(units) {
+        FabricAdmission::Granted(permit) => match stage(FabricToken(permit.key())) {
+            Stage::Sent => Attempt::Sent(register_hop(permit, gate, hop, now)),
+            Stage::NoCredit => Attempt::NoCredit,
+            Stage::TooWide => Attempt::TooWide,
+        },
+        FabricAdmission::NoUnit => Attempt::NoUnit,
+        FabricAdmission::Full => Attempt::Full,
+    }
+}
+
+/// The one send (ADR-0177 D4): [`attempt`] until it stages. A refused stage
+/// parks for a returned credit before it reserves again: a parked send
+/// holds nothing of the gate. A full gate (derived never) parks on its
+/// room.
 async fn send_op<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &'u Rc<Shared<O, F>>,
     units: &'u GateUnits,
@@ -1257,19 +1301,14 @@ async fn send_op<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     mut stage: impl FnMut(FabricToken) -> Stage,
 ) -> Sent<'u> {
     loop {
-        let full = {
-            let mut gate = shared.gate.borrow_mut();
-            match gate.reserve(units) {
-                FabricAdmission::Granted(permit) => match stage(FabricToken(permit.key())) {
-                    Stage::Sent => {
-                        return Ok(register_hop(permit, &shared.gate, hop, shared.now.get()));
-                    }
-                    Stage::NoCredit => false,
-                    Stage::TooWide => return Err(SendRefused::Reply(too_many_args_reply(proto))),
-                },
-                FabricAdmission::NoUnit => return Err(SendRefused::NoUnit),
-                FabricAdmission::Full => true,
-            }
+        // The attempt's answer ends with this statement: held across a park
+        // below, its wait's bytes would be the task's at every suspension.
+        let full = match attempt(&shared.gate, units, hop, shared.now.get(), &mut stage) {
+            Attempt::Sent(waiter) => return Ok(waiter),
+            Attempt::TooWide => return Err(SendRefused::Reply(too_many_args_reply(proto))),
+            Attempt::NoUnit => return Err(SendRefused::NoUnit),
+            Attempt::NoCredit => false,
+            Attempt::Full => true,
         };
         if full {
             let room = shared.gate.borrow().room();
@@ -1325,11 +1364,10 @@ pub(super) enum SendNow<'u> {
     NoCredit,
 }
 
-/// Synchronous first-attempt [`send_apply`]: the holder's reservation, its
-/// key and the stage in one step, the waiter registered only after a
-/// successful stage (safe for the same reason as [`send_op`]'s). A general
-/// send: refused while it would take the publish fan's reserved credit, it
-/// answers [`SendNow::NoCredit`].
+/// Synchronous first-attempt [`send_apply`]: one [`attempt`], the waiter
+/// registered only after a successful stage. A general send: refused while
+/// it would take the publish fan's reserved credit, it answers
+/// [`SendNow::NoCredit`].
 #[allow(clippy::too_many_arguments)] // the send funnel's one context
 pub(super) fn try_send_apply<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &'u Rc<Shared<O, F>>,
@@ -1345,20 +1383,16 @@ pub(super) fn try_send_apply<'u, O: PlaneObserver + 'static, F: SegmentFs + Clon
         return SendNow::Refused(too_many_args_reply(proto));
     };
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
-    let cmd = cmd_byte(proto, db);
-    let mut gate = shared.gate.borrow_mut();
-    let permit = match gate.reserve(units) {
-        FabricAdmission::Granted(permit) => permit,
-        FabricAdmission::NoUnit | FabricAdmission::Full => return SendNow::NoCredit,
+    let mut op = PointOp::apply(FabricToken(0), slot, cmd_byte(proto, db), args, program);
+    let mut stage = |token| {
+        op.stamp(token);
+        Stage::from(shared.fabric.borrow_mut().stage_general(to, &op))
     };
-    let token = FabricToken(permit.key());
-    let op = PointOp::apply(token, slot, cmd, args, program);
-    if shared.fabric.borrow_mut().stage_general(to, &op).is_err() {
-        return SendNow::NoCredit;
+    match attempt(&shared.gate, units, apply_hop(argv), shared.now.get(), &mut stage) {
+        Attempt::Sent(waiter) => SendNow::Sent(waiter),
+        Attempt::TooWide => SendNow::Refused(too_many_args_reply(proto)),
+        Attempt::NoCredit | Attempt::NoUnit | Attempt::Full => SendNow::NoCredit,
     }
-    let waiter = register_hop(permit, &shared.gate, apply_hop(argv), shared.now.get());
-    drop(gate);
-    SendNow::Sent(waiter)
 }
 
 /// Ship `argv` to `to` as an `Apply` and return the reply waiter, waiting
