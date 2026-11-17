@@ -1717,6 +1717,133 @@ mod tests {
         assert_eq!(Pin::new(&mut plain).poll(&mut cx), Poll::Ready(3));
     }
 
+    /// Counts the wakes a parked sender receives: the room's oracle reads
+    /// this waker, never the list's own state.
+    #[derive(Default)]
+    struct WakeCount(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for WakeCount {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A sender parked on a gate's room, polled once so its waker is stored.
+    struct ParkedSender {
+        room: ListWait<()>,
+        wakes: std::sync::Arc<WakeCount>,
+    }
+
+    impl ParkedSender {
+        fn park(gate: &RefCell<FabricGate<u64>>) -> ParkedSender {
+            let wakes = std::sync::Arc::new(WakeCount::default());
+            let mut sender = ParkedSender { room: gate.borrow().room(), wakes };
+            assert_eq!(sender.woken(), (0, false), "engagement: the sender parks");
+            sender
+        }
+
+        /// The wakes received so far, and whether the room's wait is ready.
+        fn woken(&mut self) -> (usize, bool) {
+            let wakes = self.wakes.0.load(std::sync::atomic::Ordering::Relaxed);
+            let waker = Waker::from(std::sync::Arc::clone(&self.wakes));
+            let mut cx = Context::from_waker(&waker);
+            (wakes, Pin::new(&mut self.room).poll(&mut cx).is_ready())
+        }
+    }
+
+    /// The room's test gate: 8 holders, `taken` of them registered waits
+    /// under `units`, in reserve order with their keys.
+    fn taken_holders<'u>(
+        gate: &'u RefCell<FabricGate<u64>>,
+        units: &'u GateUnits,
+        taken: usize,
+    ) -> Vec<(u64, GateWait<'u, u64>)> {
+        let waits: Vec<_> = (0..taken).map(|_| fabric_wait(gate, units)).collect();
+        assert_eq!(gate.borrow().holders(), taken, "engagement: the holders taken");
+        waits
+    }
+
+    /// A sender parked on a full gate's room is woken once by the delivered
+    /// poll that frees a holder, and not by the completion that parks the
+    /// value there: the holder stays until its waiter takes it (ADR-0177
+    /// D4). Without the poll's wake the sender waits on a gate with room.
+    #[test]
+    fn a_delivered_poll_wakes_the_room_and_its_parked_value_does_not() {
+        let gate = fabric_gate(8);
+        let units = gate.borrow().units(8).expect("every unit");
+        let mut waits = taken_holders(&gate, &units, 8);
+        let mut sender = ParkedSender::park(&gate);
+        let (key, mut wait) = waits.pop().expect("eight waits");
+        assert_eq!(FabricGate::complete(&gate, key, 5, Nanos(1)), Delivery::Delivered);
+        assert_eq!(gate.borrow().holders(), 8, "engagement: the value parks in its holder");
+        assert_eq!(sender.woken(), (0, false), "a parked value frees no holder");
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(5));
+        assert_eq!(gate.borrow().holders(), 7, "engagement: the poll frees the holder");
+        assert_eq!(sender.woken(), (1, true), "room-wake-lost: the delivered poll");
+    }
+
+    /// A sender parked on a full gate's room is woken once by an orphaned
+    /// holder's one completion, which frees it, and not by the drop that
+    /// orphaned it: the slot waits for its request's completion (ADR-0177
+    /// D4).
+    #[test]
+    fn an_orphans_completion_wakes_the_room_and_its_drop_does_not() {
+        let gate = fabric_gate(8);
+        let units = gate.borrow().units(8).expect("every unit");
+        let mut waits = taken_holders(&gate, &units, 8);
+        let mut sender = ParkedSender::park(&gate);
+        let (key, wait) = waits.pop().expect("eight waits");
+        drop(wait);
+        assert_eq!(gate.borrow().holders(), 8, "engagement: the orphan keeps its slot");
+        assert_eq!(sender.woken(), (0, false), "an orphaned holder frees nothing");
+        assert_eq!(FabricGate::complete(&gate, key, 5, Nanos(1)), Delivery::Orphan);
+        assert_eq!(gate.borrow().holders(), 7, "engagement: the completion frees the orphan");
+        assert_eq!(sender.woken(), (1, true), "room-wake-lost: the orphan's completion");
+    }
+
+    /// A sender parked on a full gate's room is woken once by the drop of a
+    /// wait whose value had arrived: that drop frees the holder at once.
+    #[test]
+    fn a_dropped_wait_that_held_its_value_wakes_the_room() {
+        let gate = fabric_gate(8);
+        let units = gate.borrow().units(8).expect("every unit");
+        let mut waits = taken_holders(&gate, &units, 8);
+        let mut sender = ParkedSender::park(&gate);
+        let (key, wait) = waits.pop().expect("eight waits");
+        assert_eq!(FabricGate::complete(&gate, key, 5, Nanos(1)), Delivery::Delivered);
+        assert_eq!(sender.woken(), (0, false), "a parked value frees no holder");
+        drop(wait);
+        assert_eq!(gate.borrow().holders(), 7, "engagement: the drop frees the holder");
+        assert_eq!(sender.woken(), (1, true), "room-wake-lost: the delivered wait's drop");
+    }
+
+    /// A sender parked on a gate's room is woken once by the drop of a permit
+    /// that took the last holder and never registered: its slot returns at
+    /// the drop. The sender parks first, since a permit lives only inside
+    /// its owner's borrow of the gate.
+    #[test]
+    fn a_dropped_unregistered_permit_wakes_the_room() {
+        let gate = fabric_gate(8);
+        let units = gate.borrow().units(8).expect("every unit");
+        let _waits = taken_holders(&gate, &units, 7);
+        let mut sender = ParkedSender::park(&gate);
+        {
+            let mut borrowed = gate.borrow_mut();
+            let FabricAdmission::Granted(permit) = borrowed.reserve(&units) else {
+                panic!("the last holder and unit are free");
+            };
+            assert_eq!(units.free(), 0, "engagement: the permit holds the last unit");
+            drop(permit);
+        }
+        assert_eq!(gate.borrow().holders(), 7, "engagement: the permit's slot returns");
+        assert_eq!(sender.woken(), (1, true), "room-wake-lost: the unregistered permit's drop");
+    }
+
     /// A keyed gate of `cap` on a census of its own.
     fn keyed_gate<V>(cap: Cap) -> KeyedGate<u64, V> {
         let (census, _mark) = CapCensus::new(inf_foundation::CellId(0));
