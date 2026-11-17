@@ -387,23 +387,32 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
             return FabricAdmission::NoUnit;
         }
         let FabricGate { holders, high, full, room, .. } = self;
-        let reservation =
-            match holders.as_mut().map(|holders| (holders.slab.reserve(), &holders.word)) {
-                Some((SlabReserved::Slot(slot), word)) => (slot.named(), word),
-                Some((SlabReserved::Full | SlabReserved::Exhausted, _)) | None => {
-                    units.give();
-                    *full += 1;
-                    return FabricAdmission::Full;
-                }
-            };
-        let (reservation, word) = reservation;
-        let Some(fields) = word.encode(reservation.id()) else {
+        let Some(fabric) = holders.as_mut() else {
+            units.give();
+            *full += 1;
+            return FabricAdmission::Full;
+        };
+        let reservation = match fabric.slab.reserve() {
+            SlabReserved::Slot(slot) => slot.named(),
+            SlabReserved::Full | SlabReserved::Exhausted => {
+                units.give();
+                *full += 1;
+                return FabricAdmission::Full;
+            }
+        };
+        let Some(fields) = fabric.word.encode(reservation.id()) else {
+            // No key was minted, so nothing names the slot: forgotten, the
+            // reservation leaves it free at its generation, as an unnamed
+            // one's drop does. Dropped here instead, its drop would be a
+            // call from this arm that takes the reservation's address, and
+            // the reservation would then live in memory on the granting
+            // path too.
+            core::mem::forget(reservation);
             unreachable!("the gate's adapter is built from its own slab")
         };
         FabricAdmission::Granted(GatePermit {
-            reservation: Some(reservation),
-            room,
-            units,
+            reservation,
+            unit: HeldUnit { units, room },
             key: *high | fields,
             _cleanup: PhantomData,
         })
@@ -576,13 +585,50 @@ impl<V, C: Cleanup<V>> core::fmt::Debug for FabricGate<V, C> {
 /// One reserved holder, named before its publish, and one unit, under the
 /// gate's key for it. Held only inside its owner's borrow of the gate: it
 /// cannot cross an `await` (ADR-0144 A2's list).
+///
+/// Two owned parts and no `Drop` of its own. A permit that never registers
+/// (the send was refused) drops them in their order: the named reservation
+/// advances its slot's generation, so the key names no later occupant
+/// (ADR-0194 A2), and only then does the unit return and the room wake, on
+/// a gate whose holder is already free.
 pub struct GatePermit<'g, 'u, V, C: Cleanup<V> = DropValue> {
-    /// The holder's slot until the permit registers or drops.
-    reservation: Option<NamedReservation<'g, Holder<V>, u32>>,
-    room: &'g WaitList<()>,
-    units: &'u GateUnits,
+    /// The holder's slot until the permit registers or drops. First: the
+    /// holder is free before the unit's drop wakes the room.
+    reservation: NamedReservation<'g, Holder<V>, u32>,
+    unit: HeldUnit<'g, 'u>,
     key: u64,
     _cleanup: PhantomData<fn(V) -> C>,
+}
+
+/// A permit's unit, and the room its holder's return wakes. Dropped with a
+/// permit that never registered, it returns the unit and wakes one sender;
+/// a permit that registers hands the unit to its wait instead.
+struct HeldUnit<'g, 'u> {
+    units: &'u GateUnits,
+    room: &'g WaitList<()>,
+}
+
+impl<'u> HeldUnit<'_, 'u> {
+    /// The unit passes to the wait: nothing returns and no sender wakes.
+    fn kept(self) -> &'u GateUnits {
+        let units = self.units;
+        // The wait holds the unit from here and returns it at its own end:
+        // this part's drop, which would return it now and wake a sender on
+        // a gate with no holder freed, must not run.
+        core::mem::forget(self);
+        units
+    }
+}
+
+impl Drop for HeldUnit<'_, '_> {
+    // Inlined always: as a call, this drop takes the address of a part of
+    // the permit wherever the permit may be dropped, and the whole permit
+    // then lives in memory from `reserve` to the holder's publish.
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.units.give();
+        self.room.wake_one(());
+    }
 }
 
 impl<'u, V, C: Cleanup<V>> GatePermit<'_, 'u, V, C> {
@@ -609,28 +655,13 @@ impl<'u, V, C: Cleanup<V>> GatePermit<'_, 'u, V, C> {
     }
 
     fn publish(
-        mut self,
+        self,
         gate: &'u RefCell<FabricGate<V, C>>,
         state: HolderState<V>,
     ) -> GateWait<'u, V, C> {
-        let Some(reservation) = self.reservation.take() else {
-            unreachable!("a permit registers once, consuming itself")
-        };
+        let GatePermit { reservation, unit, .. } = self;
         let slot = reservation.publish(Holder { state, held: false });
-        GateWait { gate, units: self.units, slot, done: false }
-    }
-}
-
-impl<V, C: Cleanup<V>> Drop for GatePermit<'_, '_, V, C> {
-    fn drop(&mut self) {
-        // Never registered (the send was refused): the named reservation's
-        // drop advances its slot's generation, so the key names no later
-        // occupant, and the holder and the unit return.
-        if let Some(reservation) = self.reservation.take() {
-            drop(reservation);
-            self.units.give();
-            self.room.wake_one(());
-        }
+        GateWait { gate, units: unit.kept(), slot, done: false }
     }
 }
 
@@ -1854,24 +1885,40 @@ mod tests {
 
     /// A sender parked on a gate's room is woken once by the drop of a permit
     /// that took the last holder and never registered: its slot returns at
-    /// the drop. The sender parks first, since a permit lives only inside
-    /// its owner's borrow of the gate.
+    /// the drop, free at its next generation, and its unit with it (ADR-0194
+    /// A2, ADR-0177 D4). The sender parks first, since a permit lives only
+    /// inside its owner's borrow of the gate. The next permit reads the
+    /// slot: the same index, one generation on, under the returned unit.
     #[test]
     fn a_dropped_unregistered_permit_wakes_the_room() {
+        const INDEX: u64 = (1 << GATE_KEY_INDEX_BITS) - 1;
         let gate = fabric_gate(8);
         let units = gate.borrow().units(8).expect("every unit");
         let _waits = taken_holders(&gate, &units, 7);
         let mut sender = ParkedSender::park(&gate);
-        {
+        let dropped = {
             let mut borrowed = gate.borrow_mut();
             let FabricAdmission::Granted(permit) = borrowed.reserve(&units) else {
                 panic!("the last holder and unit are free");
             };
             assert_eq!(units.free(), 0, "engagement: the permit holds the last unit");
+            let key = permit.key();
             drop(permit);
-        }
+            key
+        };
         assert_eq!(gate.borrow().holders(), 7, "engagement: the permit's slot returns");
+        assert_eq!(units.free(), 1, "the dropped permit's unit returns");
         assert_eq!(sender.woken(), (1, true), "room-wake-lost: the unregistered permit's drop");
+        let mut borrowed = gate.borrow_mut();
+        let FabricAdmission::Granted(next) = borrowed.reserve(&units) else {
+            panic!("the returned holder and unit are free");
+        };
+        assert_eq!(next.key() & INDEX, dropped & INDEX, "engagement: the dropped permit's slot");
+        assert_eq!(
+            next.key() - dropped,
+            1 << GATE_KEY_INDEX_BITS,
+            "the dropped permit left its slot free at the next generation"
+        );
     }
 
     /// A keyed gate of `cap` on a census of its own.

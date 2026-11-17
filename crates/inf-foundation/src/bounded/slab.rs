@@ -827,11 +827,18 @@ impl<T, G: Generation> NamedReservation<'_, T, G> {
     /// refuse: the slot was free and the reservation held it.
     #[inline]
     pub fn publish(mut self, value: T) -> SlotId<G> {
-        let Some(reservation) = self.reservation.take() else {
+        let reservation = self.reservation.take();
+        let named = self.id;
+        // What is left has nothing to advance, so its drop would do nothing.
+        // Forgotten before any step that can unwind, it is named by no
+        // unwind path either: such a path would hand its address to the
+        // drop, and the reservation would live in its caller's memory.
+        core::mem::forget(self);
+        let Some(reservation) = reservation else {
             unreachable!("a named reservation holds its slot until it publishes or drops")
         };
         let id = reservation.publish(value);
-        debug_assert_eq!(id, self.id, "a named reservation publishes the handle it named");
+        debug_assert_eq!(id, named, "a named reservation publishes the handle it named");
         id
     }
 }

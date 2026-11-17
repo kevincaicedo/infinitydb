@@ -80,7 +80,7 @@ check:
     cargo nextest run --no-fail-fast -p inf-doc -p inf-store --features doc-intern-keys
     cargo test --doc -p inf-doc -p inf-store --features doc-intern-keys
     # The fabric key past its generation field: `--workspace` leaves inf-runtime's
-    # `fault-points` off, so its one test runs here (ADR-0194 A2).
+    # `fault-points` off, so its tests run here (ADR-0194 A2).
     cargo nextest run --no-fail-fast -p inf-runtime --features fault-points --test gate
     # The near-wrap leg's control, under `cfg(all(test, feature = "dst"))`: the workspace's
     # build carries `dst` through crash-matrix's dev edge to inf-sim, so the workspace's nextest
