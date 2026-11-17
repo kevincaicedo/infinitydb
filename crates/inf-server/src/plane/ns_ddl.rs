@@ -1527,9 +1527,11 @@ mod tests {
     /// them. The test runs its own binary on itself, the child making one
     /// attempt whose stage panics with a planted message. The child is not
     /// captured, since a captured test prints no panic text: the parent
-    /// reads the planted message on the child's stderr, and the child
-    /// killed by `SIGABRT`. A stage whose unwind passes `attempt` fails the
-    /// child's test instead, which exits 101.
+    /// reads the planted message on the child's stderr, that panic alone,
+    /// and the child killed by `SIGABRT`. A stage whose unwind passes
+    /// `attempt` fails the child's test instead, which exits 101; one whose
+    /// unwind reaches a destructor that panics also dies by `SIGABRT`, of
+    /// its second panic, which is why the panics are counted.
     #[test]
     #[cfg(unix)]
     #[cfg_attr(miri, ignore = "the test spawns a process, which Miri does not")]
@@ -1540,6 +1542,8 @@ mod tests {
         const CHILD: &str = "INF_STAGE_UNWIND_CHILD";
         const NAME: &str = "plane::ns_ddl::tests::a_stage_that_unwinds_stops_the_process";
         const PLANTED: &str = "planted: the stage unwinds";
+        /// What the default hook prints once a panic, before its message.
+        const PANIC_LINE: &str = "panicked at";
         const HOLDERS: Cap = Cap::entries::<8>("test-gate-holders", CapFill::Serving);
         /// `SIGABRT`'s number on every supported host.
         const SIGABRT: i32 = 6;
@@ -1561,6 +1565,11 @@ mod tests {
             .expect("the child test runs");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains(PLANTED), "the child printed no planted panic: {stderr}");
+        assert_eq!(
+            stderr.matches(PANIC_LINE).count(),
+            1,
+            "the child panicked again after its stage, in a destructor its unwind ran: {stderr}"
+        );
         assert_eq!(
             output.status.signal(),
             Some(SIGABRT),
