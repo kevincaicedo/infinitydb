@@ -304,7 +304,7 @@ fn step_holder_cycle_named(slab: &mut HolderSlab, key: u64) -> u64 {
     let named = slot.named();
     let named_id = named.id();
     let id = named.publish([key; 7]);
-    match slab.take(id) {
+    match slab.take_inlined(id) {
         Taken::Value(value) => u64::from(value[6] == key && id == named_id),
         Taken::Stale | Taken::Vacant => panic!("the slot just published"),
     }
@@ -325,7 +325,7 @@ fn step_holder_word(slab: &mut HolderSlab, adapter: &HolderKey, bits: &u64) -> u
 fn step_holder_cycle(slab: &mut HolderSlab, key: u64) -> u64 {
     let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
     let id = slot.publish([key; 7]);
-    match slab.take(id) {
+    match slab.take_inlined(id) {
         Taken::Value(value) => u64::from(value[6] == key),
         Taken::Stale | Taken::Vacant => panic!("the slot just published"),
     }
