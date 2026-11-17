@@ -1234,6 +1234,21 @@ fn register_hop<'u>(
     permit.register(gate, sent)
 }
 
+/// Armed across a call that must not unwind, and forgotten once the call
+/// returned: dropped by an unwind, it stops the process where it stands. A
+/// cell's panic ends the node (ADR-0026 D3); this ends it before any
+/// destructor of the frame that armed it runs.
+struct StopOnUnwind;
+
+impl Drop for StopOnUnwind {
+    // Inlined always: as a call, the unwind path could return from it and
+    // go on into the destructors of what its frame holds.
+    #[inline(always)]
+    fn drop(&mut self) {
+        std::process::abort();
+    }
+}
+
 /// The hop an `Apply` of `argv` makes: `INF.PUB`'s reply waits for the
 /// owner's fan acks, so its round trip is no hop sample; the fan legs
 /// (`INF.PUBFAN`) sample pub/sub instead.
@@ -1262,7 +1277,9 @@ enum Attempt<'u> {
 /// registered. `stage` only stages into the outbound pack, and the peer
 /// cannot observe the op until FABRIC-OUT publishes it, after this step,
 /// so no reply precedes the registration. A refused stage drops the
-/// permit, which returns the unit and the holder.
+/// permit, which returns the unit and the holder. A stage that unwinds, a
+/// defect, stops the process here (ADR-0026 D3): the node goes down with
+/// the panic's own text and `SIGABRT`, before the cell thread's boundary.
 ///
 /// Every send goes through this one function, out of line, its stage one
 /// indirect call an attempt: the gate's `reserve` and the permit's
@@ -1279,11 +1296,21 @@ fn attempt<'u>(
 ) -> Attempt<'u> {
     let mut borrowed = gate.borrow_mut();
     match borrowed.reserve(units) {
-        FabricAdmission::Granted(permit) => match stage(FabricToken(permit.key())) {
-            Stage::Sent => Attempt::Sent(register_hop(permit, gate, hop, now)),
-            Stage::NoCredit => Attempt::NoCredit,
-            Stage::TooWide => Attempt::TooWide,
-        },
+        FabricAdmission::Granted(permit) => {
+            // The permit is live across the stage's call. Were that call
+            // allowed to unwind, its unwind path would drop the permit by
+            // its address, and the permit would then live in memory on
+            // every send, copied at each move from the reservation to the
+            // holder's publish. Stopped here, an unwind names no value.
+            let stops = StopOnUnwind;
+            let staged = stage(FabricToken(permit.key()));
+            core::mem::forget(stops);
+            match staged {
+                Stage::Sent => Attempt::Sent(register_hop(permit, gate, hop, now)),
+                Stage::NoCredit => Attempt::NoCredit,
+                Stage::TooWide => Attempt::TooWide,
+            }
+        }
         FabricAdmission::NoUnit => Attempt::NoUnit,
         FabricAdmission::Full => Attempt::Full,
     }
@@ -1488,4 +1515,57 @@ const _: () = assert!(crate::config::DATABASES <= 16, "db rides 4 bits of the Ap
 fn db_nibble(db: u16) -> u8 {
     debug_assert!(db < crate::config::DATABASES);
     (db & 0xF) as u8
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: a child test reads its role")]
+mod tests {
+    use super::*;
+
+    /// A stage that unwinds stops the process inside `attempt` (ADR-0026
+    /// D3): no destructor of the attempt's frame runs, the permit's among
+    /// them. The test runs its own binary on itself, the child making one
+    /// attempt whose stage panics with a planted message. The child is not
+    /// captured, since a captured test prints no panic text: the parent
+    /// reads the planted message on the child's stderr, and the child
+    /// killed by `SIGABRT`. A stage whose unwind passes `attempt` fails the
+    /// child's test instead, which exits 101.
+    #[test]
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore = "the test spawns a process, which Miri does not")]
+    fn a_stage_that_unwinds_stops_the_process() {
+        use std::os::unix::process::ExitStatusExt;
+
+        use inf_foundation::bounded::{Cap, CapCensus, CapFill};
+        const CHILD: &str = "INF_STAGE_UNWIND_CHILD";
+        const NAME: &str = "plane::ns_ddl::tests::a_stage_that_unwinds_stops_the_process";
+        const PLANTED: &str = "planted: the stage unwinds";
+        const HOLDERS: Cap = Cap::entries::<8>("test-gate-holders", CapFill::Serving);
+        /// `SIGABRT`'s number on every supported host.
+        const SIGABRT: i32 = 6;
+        if std::env::var(CHILD).is_ok() {
+            let (census, _mark) = CapCensus::new(CellId(0));
+            let gate = FabricGate::<OwnedOutcome>::build(0, 1, Some(HOLDERS), &census);
+            let gate = RefCell::new(gate.expect("a test gate"));
+            let units = gate.borrow().units(1).expect("a task's unit");
+            let mut stage = |_token: FabricToken| -> Stage { panic!("{PLANTED}") };
+            // The attempt does not return: its stage's unwind stops the child.
+            drop(attempt(&gate, &units, Hop::Unrecorded, Nanos(0), &mut stage));
+            return;
+        }
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "stage")
+            .output()
+            .expect("the child test runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(PLANTED), "the child printed no planted panic: {stderr}");
+        assert_eq!(
+            output.status.signal(),
+            Some(SIGABRT),
+            "the stage's child exited {:?}, not by SIGABRT",
+            output.status
+        );
+    }
 }
