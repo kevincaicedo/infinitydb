@@ -237,12 +237,15 @@ pub enum SlabReserved<'a, T, G, P> {
 /// and cannot allocate or refuse; dropping it leaves the slot free with its
 /// generation. It borrows the slab, so it cannot cross an `await` or a
 /// reactor iteration: a resumed step reserves again.
+///
+/// It holds no value (ADR-0194 D1) and names its slab's row and counts by
+/// their one address: a step that holds a reservation across a call keeps
+/// each of its words through that call, so a pointer a fact would be a
+/// store and a load a fact.
 #[must_use = "a reservation publishes a value or is dropped; it carries none"]
 pub struct SlotReservation<'a, T, G, P> {
     slot: FreeSlot<'a, T, G>,
-    live: &'a mut u32,
-    high_water: &'a mut u32,
-    row: &'a CapRowHandle,
+    counts: &'a mut SlabCounts,
     instance: SlabInstance,
     policy: PhantomData<P>,
 }
@@ -341,15 +344,23 @@ pub struct SlotWord<G, P, const INDEX_BITS: u32, const GENERATION_BITS: u32> {
     layout: PhantomData<(G, P)>,
 }
 
-/// A live capped slab: its census row handle with the fill byte first, its
-/// live count and high water, then its store, 64 bytes in all, so a take's
-/// loads (the fill byte, the counts, the instance, the free head and the
-/// root) lie in one line when the slab starts on one.
+/// A slab's census row handle, the fill byte first, then its live count and
+/// its high water: what a publish and a take count and report by. One part
+/// of the slab, so a reservation borrows the three by one pointer beside
+/// its borrow of the store. 24 bytes.
 #[repr(C)]
-pub struct CappedSlab<T, G, P, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
+struct SlabCounts {
     row: CapRowHandle,
     live: u32,
     high_water: u32,
+}
+
+/// A live capped slab: its row and counts, then its store, 64 bytes in all,
+/// so a take's loads (the fill byte, the counts, the instance, the free head
+/// and the root) lie in one line when the slab starts on one.
+#[repr(C)]
+pub struct CappedSlab<T, G, P, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
+    counts: SlabCounts,
     store: SlotStore<T, G, CHUNK_SLOTS>,
     policy: PhantomData<P>,
 }
@@ -429,13 +440,13 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     #[must_use]
     #[inline]
     pub fn len(&self) -> u32 {
-        self.live
+        self.counts.live
     }
 
     #[must_use]
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.live == 0
+        self.counts.live == 0
     }
 
     /// The slots that can still serve: the cap, less the slots retired.
@@ -448,7 +459,7 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     /// slab's; an `Assembly` slab reports its every publish instead).
     #[must_use]
     pub fn high_water(&self) -> u32 {
-        self.high_water
+        self.counts.high_water
     }
 
     /// This slab's identity, stamped in every handle it mints.
@@ -472,24 +483,19 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
             };
         }
         let (instance, capacity) = (self.store.instance(), self.store.capacity_now());
-        let CappedSlab { row, live, high_water, store, .. } = self;
+        let CappedSlab { counts, store, .. } = self;
         match store.reserve() {
-            Some(slot) => SlabReserved::Slot(SlotReservation {
-                slot,
-                live,
-                high_water,
-                row,
-                instance,
-                policy: PhantomData,
-            }),
+            Some(slot) => {
+                SlabReserved::Slot(SlotReservation { slot, counts, instance, policy: PhantomData })
+            }
             // The chain holds `capacity_now - live` slots, so this arm is
             // never reached by a correct build.
             None => {
                 debug_assert!(
-                    *live >= capacity,
+                    counts.live >= capacity,
                     "the free chain is empty with live below capacity_now"
                 );
-                row.report_full();
+                counts.row.report_full();
                 SlabReserved::Full
             }
         }
@@ -559,7 +565,7 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
         );
         match lent {
             Named::Live((value, slot, chain)) => {
-                let left = Self::vacated(slot, chain, id, &mut self.live, &self.row);
+                let left = Self::vacated(slot, chain, id, &mut self.counts.live, &self.counts.row);
                 if left != Vacated::Written {
                     self.vacated_off_path(id, left);
                 }
@@ -600,7 +606,8 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
             );
             match lent {
                 Named::Live((slot, chain)) => {
-                    let left = Self::vacated(slot, chain, id, &mut self.live, &self.row);
+                    let left =
+                        Self::vacated(slot, chain, id, &mut self.counts.live, &self.counts.row);
                     if left != Vacated::Written {
                         self.vacated_off_path(id, left);
                     }
@@ -658,13 +665,13 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
         let capacity = self.store.capacity_now();
         #[cfg(inf_canary_cap_minus_one)]
         {
-            let serving = self.row.fill() == CapFill::Serving;
+            let serving = self.counts.row.fill() == CapFill::Serving;
             let short = capacity.checked_sub(1).unwrap_or_default();
-            self.live < if serving { short } else { capacity }
+            self.counts.live < if serving { short } else { capacity }
         }
         #[cfg(not(inf_canary_cap_minus_one))]
         {
-            self.live < capacity
+            self.counts.live < capacity
         }
     }
 
@@ -672,7 +679,7 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     #[cold]
     #[inline(never)]
     fn full(&mut self) -> SlabReserved<'_, T, G, P> {
-        self.row.report_full();
+        self.counts.row.report_full();
         SlabReserved::Full
     }
 
@@ -724,18 +731,18 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     fn vacated_off_path(&mut self, id: SlotId<G>, left: Vacated) {
         let mut left = left;
         if left == Vacated::Assembling {
-            self.row.report_removal(self.live);
+            self.counts.row.report_removal(self.counts.live);
             let found = self.store.slot_chain_mut(id.index);
             debug_assert!(found.is_some(), "a vacated slot is in its store");
             let Some((slot, chain)) = found else { return };
             left = Self::advanced(slot, chain, id);
         }
         if left == Vacated::Retiring {
-            let CappedSlab { row, store, .. } = self;
+            let CappedSlab { counts, store, .. } = self;
             let found = store.slot_chain_mut(id.index);
             debug_assert!(found.is_some(), "a vacated slot is in its store");
             let Some((slot, chain)) = found else { return };
-            Self::retired(slot, chain, row);
+            Self::retired(slot, chain, &counts.row);
         }
     }
 
@@ -766,18 +773,19 @@ impl<'a, T, G: Generation, P> SlotReservation<'a, T, G, P> {
     #[must_use = "the handle is the slot's one name"]
     #[inline(always)]
     pub fn publish_mut(self, value: T) -> (SlotId<G>, &'a mut T) {
-        let (index, generation, occupant) = self.slot.occupy_mut(value);
-        let live = live_published(*self.live);
-        *self.live = live;
+        let SlotReservation { slot, counts, instance, .. } = self;
+        let (index, generation, occupant) = slot.occupy_mut(value);
+        let live = live_published(counts.live);
+        counts.live = live;
         // An `Assembly` slab keeps its own high water at 0, so this one
         // compare reports its every publish and the row keeps its live count.
-        if live > *self.high_water {
-            if self.row.fill() == CapFill::Serving {
-                *self.high_water = live;
+        if live > counts.high_water {
+            if counts.row.fill() == CapFill::Serving {
+                counts.high_water = live;
             }
-            self.row.report_publish(live);
+            counts.row.report_publish(live);
         }
-        (SlotId { index, generation, instance: self.instance }, occupant)
+        (SlotId { index, generation, instance }, occupant)
     }
 }
 
@@ -882,7 +890,7 @@ impl<G: Generation, P: GenerationPolicy, const INDEX_BITS: u32, const GENERATION
         slab: &CappedSlab<T, G, P, CHUNK_SLOTS>,
     ) -> Result<Self, CapError> {
         let () = Self::FITS;
-        let slots = slab.row.entries_max();
+        let slots = slab.counts.row.entries_max();
         // Every index below `slots` fits the field unless `slots > 2^INDEX_BITS`.
         if 1u64.checked_shl(INDEX_BITS).is_some_and(|span| u64::from(slots) > span) {
             return Err(CapError::Layout);
@@ -967,9 +975,7 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
         match self.store.build_step_from(generation) {
             Ok(BuildStep::More) => Built::More(self),
             Ok(BuildStep::Done) => Built::Live(CappedSlab {
-                row: self.row,
-                live: 0,
-                high_water: 0,
+                counts: SlabCounts { row: self.row, live: 0, high_water: 0 },
                 store: self.store,
                 policy: PhantomData,
             }),
@@ -1282,11 +1288,23 @@ mod tests {
     #[test]
     fn the_headers_fit_one_line() {
         assert_eq!(core::mem::size_of::<CapRowHandle>(), 16);
+        assert_eq!(core::mem::size_of::<SlabCounts>(), 24);
         assert_eq!(core::mem::size_of::<SlotStore<u64, u32>>(), 40);
         assert_eq!(core::mem::size_of::<CappedSlab<u64, u32, Retire>>(), 64);
         assert_eq!(core::mem::size_of::<CappedSlab<[u8; 200], u64, WrapWithProof>>(), 64);
         assert_eq!(core::mem::size_of::<SlotId<u32>>(), 12);
         assert_eq!(core::mem::size_of::<SlotId<u64>>(), 16);
+    }
+
+    #[test]
+    fn a_reservation_names_its_slabs_row_and_counts_by_one_pointer() {
+        // The free slot with the head it moves (32 bytes at either
+        // generation's width), one pointer to the row and counts, and the
+        // instance: 48 bytes. A pointer each for the row, the live count
+        // and the high water makes it 64, each word of them kept through
+        // any call a step makes while it holds the reservation.
+        assert_eq!(core::mem::size_of::<SlotReservation<'_, u64, u32, WrapWithProof>>(), 48);
+        assert_eq!(core::mem::size_of::<SlotReservation<'_, [u8; 200], u64, Retire>>(), 48);
     }
 
     #[test]
