@@ -491,7 +491,7 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
             // The waiter was dropped: this is its request's one completion.
             HolderState::Orphaned => {
                 let _freed = fabric.take(id);
-                room.wake_one(());
+                wake_room(room);
                 return (Delivery::Orphan, None, Some(value));
             }
         }
@@ -561,6 +561,28 @@ fn build_holders<V>(
     }
 }
 
+/// A holder was freed: one sender parked on the room is woken, if any is
+/// queued (ADR-0177 D4). Every end that frees a holder takes this one step.
+/// A room has a sender only after its gate was full (derived never), so the
+/// step reads the room first: the wake is a call that takes the list's
+/// queues, to find no one on an idle room.
+// Inlined at each end, so the read is all an idle room costs. As a body of
+// its own the step is the one caller of the list's wake: the compiler folds
+// the whole wake into it, and a second copy into a room wait's drop.
+#[inline]
+fn wake_room(room: &WaitList<()>) {
+    if !room.is_idle() {
+        room.wake_one(());
+    }
+}
+
+/// Runs `step` as a call of its own, for a caller whose body must stay
+/// small.
+#[inline(never)]
+fn out_of_line(step: impl FnOnce()) {
+    step();
+}
+
 /// A dropped wait's holder: orphaned until its request's one completion
 /// frees it, or freed now with the value that completion parked. Returns
 /// the waker it stored and that value, both dropped outside the gate's
@@ -576,7 +598,7 @@ fn orphan<V>(
     // so its request's late completion finds the slot at its next generation.
     if cfg!(inf_canary_gate_frees_on_drop) {
         let _freed = fabric.take(slot);
-        room.wake_one(());
+        wake_room(room);
         return match prior {
             HolderState::Delivered(value) => (None, Some(value)),
             HolderState::Waiting(waker, _) => (Some(waker), None),
@@ -586,7 +608,7 @@ fn orphan<V>(
     match prior {
         HolderState::Delivered(value) => {
             let _freed = fabric.take(slot);
-            room.wake_one(());
+            wake_room(room);
             (None, Some(value))
         }
         HolderState::Waiting(waker, _) => (Some(waker), None),
@@ -645,7 +667,12 @@ impl Drop for HeldUnit<'_, '_> {
     #[inline(always)]
     fn drop(&mut self) {
         self.units.give();
-        self.room.wake_one(());
+        // One call, as the wake it replaces was: with the step's read in
+        // this body the compiler stops inlining the permit's drop at its
+        // cold ends, calls it there with the permit's address, and the
+        // permit lives in memory again.
+        let room = self.room;
+        out_of_line(move || wake_room(room));
     }
 }
 
@@ -717,7 +744,7 @@ impl<V, C: Cleanup<V>> Future for GateWait<'_, V, C> {
         else {
             polled_after_completion()
         };
-        room.wake_one(());
+        wake_room(room);
         drop(gate);
         this.done = true;
         this.units.give();
@@ -1192,6 +1219,15 @@ impl<K: Eq + Hash + Copy> WaitList<K> {
             }
         }
         woken
+    }
+
+    /// Whether the list holds no entry on any key, live or cancelled:
+    /// `wake_one` would then find no one and change nothing, so a caller
+    /// whose wake almost always meets an empty list reads this and skips the
+    /// call. One read of the queues under a shared borrow. A cancelled entry
+    /// counts: the wake that clears it must still run.
+    fn is_idle(&self) -> bool {
+        self.queues.borrow().is_empty()
     }
 
     /// Whether any live waiter is queued, on any key: the emptiness test,
@@ -1826,6 +1862,49 @@ mod tests {
             let mut cx = Context::from_waker(&waker);
             (wakes, Pin::new(&mut self.room).poll(&mut cx).is_ready())
         }
+    }
+
+    /// An idle list holds no entry, live or cancelled: the read a gated wake
+    /// rests on. A queued waiter ends it, and so does the entry a dropped
+    /// waiter leaves behind: were that entry idle, the wake that clears it
+    /// would never run. A wake that takes the last entry makes the list idle
+    /// again.
+    #[test]
+    fn a_list_is_idle_only_with_no_entry_live_or_cancelled() {
+        let list = WaitList::<u64>::new();
+        assert!(list.is_idle(), "a new list");
+        let left = list.wait(7);
+        assert!(!list.is_idle(), "a queued waiter");
+        drop(left);
+        assert_eq!(list.waiting(), 0, "engagement: the waiter cancelled in place");
+        assert!(!list.is_idle(), "a cancelled entry is the list's until a wake clears it");
+        assert!(!list.wake_one(7), "engagement: no live waiter to wake");
+        assert!(list.is_idle(), "the wake cleared the cancelled entry");
+        let _woken = list.wait(7);
+        assert!(list.wake_one(7), "engagement: the waiter is woken");
+        assert!(list.is_idle(), "the woken waiter left its queue");
+    }
+
+    /// The gate's one wake step (ADR-0177 D4). On an idle room it wakes no
+    /// one and the room stays idle. With senders parked it wakes the
+    /// longest-parked one, once, and no other. A sender that left is cleared
+    /// by the next step, which wakes no one.
+    #[test]
+    fn the_room_step_wakes_one_parked_sender_and_no_one_on_an_idle_room() {
+        let gate = fabric_gate(1);
+        let room = gate.borrow().room.clone();
+        wake_room(&room);
+        assert!(room.is_idle(), "an idle room stays idle");
+        let mut first = ParkedSender::park(&gate);
+        let mut second = ParkedSender::park(&gate);
+        wake_room(&room);
+        assert_eq!(first.woken(), (1, true), "room-wake-lost: the step, a sender parked");
+        assert_eq!(second.woken(), (0, false), "one sender a step");
+        drop(second);
+        assert!(!room.is_idle(), "engagement: the sender that left is still queued");
+        wake_room(&room);
+        assert!(room.is_idle(), "the step cleared the sender that left");
+        assert_eq!(first.wakes.0.load(std::sync::atomic::Ordering::Relaxed), 1, "and woke no one");
     }
 
     /// The room's test gate: 8 holders, `taken` of them registered waits
