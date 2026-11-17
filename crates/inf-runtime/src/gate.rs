@@ -20,6 +20,7 @@ use core::cell::{Cell, RefCell, RefMut};
 use core::future::Future;
 use core::hash::Hash;
 use core::marker::PhantomData;
+use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 #[allow(clippy::disallowed_types, reason = "container: E")]
@@ -75,24 +76,57 @@ pub enum Delivery {
     Orphan,
 }
 
+/// A recorded hop's send time, or none, in one word: the nanoseconds plus
+/// one, so the word's zero is no send time. The two states that await a
+/// value carry it, so a recorded hop has no state of its own: with a twin
+/// of each awaiting state, every poll and completion would tell six states
+/// apart for these four.
+///
+/// The last instant has no stamp: a hop sent at `u64::MAX` ns is not
+/// sampled (derived never: the clock counts nanoseconds from its owner's
+/// origin).
+#[derive(Copy, Clone)]
+struct Sent(Option<NonZeroU64>);
+
+impl Sent {
+    /// No send time: an unrecorded hop's, and every keyed holder's.
+    const NONE: Sent = Sent(None);
+
+    /// The stamp of a hop sent at `sent`.
+    fn at(sent: Option<Nanos>) -> Sent {
+        Sent(sent.and_then(|sent| sent.0.checked_add(1)).and_then(NonZeroU64::new))
+    }
+
+    /// The send time the stamp holds.
+    fn time(self) -> Option<Nanos> {
+        self.0.map(|stamp| Nanos(stamp.get() - 1))
+    }
+}
+
 /// A holder's state (ADR-0177 D4). One holder implementation serves both
 /// gates: the fabric gate reaches it by the key it minted, a keyed gate by
 /// its caller's key.
+///
+/// `Delivered` is declared last by measurement. A slab drops the slot it
+/// writes over at each publish and take: an inline test of the slot's tag,
+/// and this enum's drop a call only for a live slot. Declared third, where
+/// the states' order would put it, the compiler folds this enum's drop
+/// into the slot's and calls that at each publish and take of a slab whose
+/// values have a drop of their own (the cold gate's). Declared last, in
+/// any order of the other three, the test stays inline.
 enum HolderState<V> {
-    /// Registered; the waiter has not suspended yet.
-    Registered,
-    /// Registered for a recorded hop, its request sent at this time: the
-    /// round trip is recorded at the completion.
-    RegisteredTimed(Nanos),
-    /// The waiter suspended: wake this when the value arrives.
-    Waiting(Waker),
-    /// The waiter of a recorded hop suspended, its request sent at this time.
-    WaitingTimed(Waker, Nanos),
-    /// The value arrived before the waiter took it.
-    Delivered(V),
+    /// Registered; the waiter has not suspended yet. A recorded hop's
+    /// request was sent at the stamp's time: its round trip is recorded at
+    /// the completion.
+    Registered(Sent),
+    /// The waiter suspended: wake this when the value arrives. The stamp is
+    /// the one its registration held.
+    Waiting(Waker, Sent),
     /// The waiter is gone and the slot still has a claim on it: a fabric
     /// request not yet answered, or a keyed queue hold not yet released.
     Orphaned,
+    /// The value arrived before the waiter took it.
+    Delivered(V),
 }
 
 /// One holder: its state, and whether a queue's [`GateHold`] pins it.
@@ -103,7 +137,7 @@ struct Holder<V> {
 
 impl<V> Holder<V> {
     const fn registered(held: bool) -> Holder<V> {
-        Holder { state: HolderState::Registered, held }
+        Holder { state: HolderState::Registered(Sent::NONE), held }
     }
 }
 
@@ -114,18 +148,14 @@ fn polled_after_completion() -> ! {
 }
 
 /// The waiter's poll before its value: stores `waker` in a holder whose
-/// wait awaits it, keeping a recorded hop's send time; false for a holder
-/// that does not await.
+/// wait awaits it, keeping the send time's stamp; false for a holder that
+/// does not await.
 fn store_waker<V>(state: &mut HolderState<V>, waker: &Waker) -> bool {
     let sent = match state {
-        HolderState::Registered | HolderState::Waiting(_) => None,
-        HolderState::RegisteredTimed(sent) | HolderState::WaitingTimed(_, sent) => Some(*sent),
+        HolderState::Registered(sent) | HolderState::Waiting(_, sent) => *sent,
         HolderState::Delivered(_) | HolderState::Orphaned => return false,
     };
-    *state = match sent {
-        None => HolderState::Waiting(waker.clone()),
-        Some(sent) => HolderState::WaitingTimed(waker.clone(), sent),
-    };
+    *state = HolderState::Waiting(waker.clone(), sent);
     true
 }
 
@@ -452,10 +482,7 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
             }
         };
         match &holder.state {
-            HolderState::Registered
-            | HolderState::RegisteredTimed(_)
-            | HolderState::Waiting(_)
-            | HolderState::WaitingTimed(..) => {}
+            HolderState::Registered(_) | HolderState::Waiting(..) => {}
             // A second completion: the parked value stays the waiter's.
             HolderState::Delivered(_) => {
                 *stale += 1;
@@ -470,14 +497,11 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
         }
         let (waker, sent) =
             match core::mem::replace(&mut holder.state, HolderState::Delivered(value)) {
-                HolderState::Waiting(waker) => (Some(waker), None),
-                HolderState::WaitingTimed(waker, sent) => (Some(waker), Some(sent)),
-                HolderState::RegisteredTimed(sent) => (None, Some(sent)),
-                HolderState::Registered | HolderState::Delivered(_) | HolderState::Orphaned => {
-                    (None, None)
-                }
+                HolderState::Waiting(waker, sent) => (Some(waker), sent),
+                HolderState::Registered(sent) => (None, sent),
+                HolderState::Delivered(_) | HolderState::Orphaned => (None, Sent::NONE),
             };
-        if let Some(sent) = sent {
+        if let Some(sent) = sent.time() {
             round_trips.record(now.saturating_sub(sent).0);
         }
         (Delivery::Delivered, waker, None)
@@ -555,12 +579,8 @@ fn orphan<V>(
         room.wake_one(());
         return match prior {
             HolderState::Delivered(value) => (None, Some(value)),
-            HolderState::Waiting(waker) | HolderState::WaitingTimed(waker, _) => {
-                (Some(waker), None)
-            }
-            HolderState::Registered | HolderState::RegisteredTimed(_) | HolderState::Orphaned => {
-                (None, None)
-            }
+            HolderState::Waiting(waker, _) => (Some(waker), None),
+            HolderState::Registered(_) | HolderState::Orphaned => (None, None),
         };
     }
     match prior {
@@ -569,10 +589,8 @@ fn orphan<V>(
             room.wake_one(());
             (None, Some(value))
         }
-        HolderState::Waiting(waker) | HolderState::WaitingTimed(waker, _) => (Some(waker), None),
-        HolderState::Registered | HolderState::RegisteredTimed(_) | HolderState::Orphaned => {
-            (None, None)
-        }
+        HolderState::Waiting(waker, _) => (Some(waker), None),
+        HolderState::Registered(_) | HolderState::Orphaned => (None, None),
     }
 }
 
@@ -639,19 +657,15 @@ impl<'u, V, C: Cleanup<V>> GatePermit<'_, 'u, V, C> {
 
     /// Publishes the holder once the request was sent: the key is routable.
     /// `gate` is the cell this permit's gate lives in. A recorded hop gives
-    /// the time it was sent at: its holder keeps it, and the gate records
-    /// the round trip at the completion, whatever order the replies arrive
-    /// in. One entry for both, so the holder's publish has one site.
+    /// the time it was sent at: its holder keeps its stamp, and the gate
+    /// records the round trip at the completion, whatever order the replies
+    /// arrive in. One entry for both, so the holder's publish has one site.
     pub fn register(
         self,
         gate: &'u RefCell<FabricGate<V, C>>,
         sent: Option<Nanos>,
     ) -> GateWait<'u, V, C> {
-        let state = match sent {
-            None => HolderState::Registered,
-            Some(sent) => HolderState::RegisteredTimed(sent),
-        };
-        self.publish(gate, state)
+        self.publish(gate, HolderState::Registered(Sent::at(sent)))
     }
 
     fn publish(
@@ -694,11 +708,9 @@ impl<V, C: Cleanup<V>> Future for GateWait<'_, V, C> {
         }
         match &holder.state {
             HolderState::Delivered(_) => {}
-            HolderState::Registered
-            | HolderState::RegisteredTimed(_)
-            | HolderState::Waiting(_)
-            | HolderState::WaitingTimed(..)
-            | HolderState::Orphaned => polled_after_completion(),
+            HolderState::Registered(_) | HolderState::Waiting(..) | HolderState::Orphaned => {
+                polled_after_completion()
+            }
         }
         let Taken::Value(Holder { state: HolderState::Delivered(value), .. }) =
             fabric.take(this.slot)
@@ -862,7 +874,7 @@ impl<K: GateKey, V, C: Cleanup<V>> KeyedGate<K, V, C> {
         };
         let prior = core::mem::replace(&mut holder.state, HolderState::Delivered(value));
         drop(core);
-        if let HolderState::Waiting(waker) | HolderState::WaitingTimed(waker, _) = prior {
+        if let HolderState::Waiting(waker, _) = prior {
             waker.wake();
         }
         Delivery::Delivered
@@ -913,10 +925,7 @@ impl<K: GateKey, V, C: Cleanup<V>> KeyedGate<K, V, C> {
 /// Whether a holder's wait still awaits its value: registered or waiting.
 fn awaits<V>(state: &HolderState<V>) -> bool {
     match state {
-        HolderState::Registered
-        | HolderState::RegisteredTimed(_)
-        | HolderState::Waiting(_)
-        | HolderState::WaitingTimed(..) => true,
+        HolderState::Registered(_) | HolderState::Waiting(..) => true,
         HolderState::Delivered(_) | HolderState::Orphaned => false,
     }
 }
@@ -1061,11 +1070,9 @@ impl<K: GateKey, V, C: Cleanup<V>> Future for KeyedWait<K, V, C> {
         }
         match &holder.state {
             HolderState::Delivered(_) => {}
-            HolderState::Registered
-            | HolderState::RegisteredTimed(_)
-            | HolderState::Waiting(_)
-            | HolderState::WaitingTimed(..)
-            | HolderState::Orphaned => polled_after_completion(),
+            HolderState::Registered(_) | HolderState::Waiting(..) | HolderState::Orphaned => {
+                polled_after_completion()
+            }
         }
         let state = if holder.held {
             // The hold keeps the slot until its release; the route left at
@@ -1107,11 +1114,7 @@ impl<K: GateKey, V, C: Cleanup<V>> Drop for KeyedWait<K, V, C> {
         // The waker and a delivered value drop outside the gate's borrow.
         match prior {
             HolderState::Delivered(value) => C::orphan(value),
-            HolderState::Registered
-            | HolderState::RegisteredTimed(_)
-            | HolderState::Waiting(_)
-            | HolderState::WaitingTimed(..)
-            | HolderState::Orphaned => {}
+            HolderState::Registered(_) | HolderState::Waiting(..) | HolderState::Orphaned => {}
         }
     }
 }
@@ -1744,15 +1747,18 @@ mod tests {
         assert_eq!(Pin::new(&mut plain).poll(&mut cx), Poll::Ready(3));
     }
 
-    /// The registration's send time at its two ends: a hop sent at time 0,
-    /// where the simulator's clock starts, and one sent at the last instant
-    /// are recorded hops like any other, and only a send with no time is
-    /// not. A send time that reads as none at either end would lose a
-    /// sample without a trace.
+    /// The send time's stamp at its two ends, in each state that carries
+    /// it. A hop sent at time 0, where the simulator's clock starts, is
+    /// sampled, whether its waiter suspended first or not: a stamp that
+    /// read time 0 as no send time would lose those samples without a
+    /// trace. So is a hop sent at the last instant a stamp holds. A hop
+    /// sent at `u64::MAX` ns has no stamp and is not sampled, as a send
+    /// with no time is not.
     #[test]
-    fn a_send_time_at_either_end_is_a_recorded_hop() {
-        let gate = fabric_gate(4);
-        let units = gate.borrow().units(3).expect("three units");
+    fn a_send_at_time_zero_is_sampled_and_one_past_the_last_stamp_is_not() {
+        let gate = fabric_gate(5);
+        let units = gate.borrow().units(5).expect("five units");
+        let mut cx = Context::from_waker(Waker::noop());
         let send = |sent: Option<Nanos>| {
             let mut borrowed = gate.borrow_mut();
             let FabricAdmission::Granted(permit) = borrowed.reserve(&units) else {
@@ -1761,21 +1767,27 @@ mod tests {
             let key = permit.key();
             (key, permit.register(&gate, sent))
         };
-        let (first_key, _first) = send(Some(Nanos(0)));
-        let (last_key, _last) = send(Some(Nanos(u64::MAX)));
-        let (plain_key, _plain) = send(None);
-        for key in [first_key, plain_key] {
-            assert_eq!(FabricGate::complete(&gate, key, 1, Nanos(350)), Delivery::Delivered);
-        }
-        let (count, sum) = {
+        let trips = || {
             let gate = gate.borrow();
             (gate.round_trips().count(), gate.round_trips().sum())
         };
-        assert_eq!((count, sum), (1, 350), "time 0 is a send time: its hop took 350 ns");
-        assert_eq!(FabricGate::complete(&gate, last_key, 1, Nanos(350)), Delivery::Delivered);
-        let gate = gate.borrow();
-        assert_eq!(gate.round_trips().count(), 2, "the last instant is a send time too");
-        assert_eq!(gate.round_trips().sum(), 350, "a reply before its send took no time");
+        let (suspended_key, mut suspended) = send(Some(Nanos(0)));
+        let (parked_key, _parked) = send(Some(Nanos(0)));
+        let (last_key, _last) = send(Some(Nanos(u64::MAX - 1)));
+        let (past_key, _past) = send(Some(Nanos(u64::MAX)));
+        let (plain_key, _plain) = send(None);
+        assert!(Pin::new(&mut suspended).poll(&mut cx).is_pending(), "engagement: suspended");
+        assert_eq!(FabricGate::complete(&gate, suspended_key, 1, Nanos(350)), Delivery::Delivered);
+        assert_eq!(trips(), (1, 350), "time 0 is a send time in a waiting holder");
+        assert_eq!(FabricGate::complete(&gate, parked_key, 1, Nanos(350)), Delivery::Delivered);
+        assert_eq!(trips(), (2, 700), "time 0 is a send time in a registered holder");
+        let end = Nanos(u64::MAX);
+        assert_eq!(FabricGate::complete(&gate, last_key, 1, end), Delivery::Delivered);
+        assert_eq!(trips(), (3, 701), "the last stamp is a send time: its hop took 1 ns");
+        for key in [past_key, plain_key] {
+            assert_eq!(FabricGate::complete(&gate, key, 1, end), Delivery::Delivered);
+        }
+        assert_eq!(trips(), (3, 701), "no stamp holds u64::MAX ns, and no time is none");
     }
 
     /// Counts the wakes a parked sender receives: the room's oracle reads
