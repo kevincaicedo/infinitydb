@@ -593,11 +593,14 @@ where
             3 | 4 if !model.handles.is_empty() => {
                 let id = model.handles[pick % model.handles.len()];
                 let (index, generation) = (id.index(), id.generation());
+                // Either entry to the take (ADR-0194 D1): op 3 by `take`, op 4 by
+                // `take_inlined`, each held to the one model.
+                let taken = if byte & 7 == 3 { slab.take(id) } else { slab.take_inlined(id) };
                 let Some(expected) = model.live.remove(&(index, generation)) else {
-                    assert_eq!(slab.take(id), Taken::Stale, "a stale handle");
+                    assert_eq!(taken, Taken::Stale, "a stale handle");
                     continue;
                 };
-                assert_eq!(slab.take(id), Taken::Value(T::of(expected)));
+                assert_eq!(taken, Taken::Value(T::of(expected)));
                 model.next.insert(index, generation.successor());
             }
             5 => P::word(&mut slab, &mut model, value, peer),
