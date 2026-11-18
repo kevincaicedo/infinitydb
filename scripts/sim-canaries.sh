@@ -1273,6 +1273,9 @@ ordered_rows=(
   # The mark of a slot whose receive is disarmed pushes one RecvArm (ADR-0196 A1.3). Planted, it
   # pushes none.
   "inf_canary_mark_keeps_disarmed crate-test inf-server lib mark_rearms_a_disarmed_receive no-rearm-at-mark"
+  # A subscriber marked by `QUIT` whose stream is open still counts as a receiver, as Redis's
+  # does (ADR-0196 D4, A1.2). Planted, the open stream reads as uncounted.
+  "inf_canary_marked_slot_uncounted crate-test inf-server lib half_closed_subscriber_not_counted count-after-eof"
   # A named reservation dropped unpublished advances its slot's generation (ADR-0194 D1 with
   # A2), so the handle it named names no later occupant. Planted, the drop keeps the
   # generation, and the next named reservation of the slot names the same handle.

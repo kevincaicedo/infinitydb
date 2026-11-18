@@ -187,6 +187,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_maint_room_short)',
     'cfg(inf_canary_mark_applied_late)',
     'cfg(inf_canary_mark_keeps_disarmed)',
+    'cfg(inf_canary_marked_slot_uncounted)',
     'cfg(inf_canary_named_drop_keeps_generation)',
     'cfg(inf_canary_net_data_after_eof)',
     'cfg(inf_canary_ns_answer_before_swap)',

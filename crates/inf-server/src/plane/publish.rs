@@ -813,6 +813,11 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     return !matches!(stream, PeerStream::Ended { by: ClosedBy::Peer { .. } });
                     #[cfg(not(inf_canary_half_closed_counted))]
                     match stream {
+                        // Canary: a marked slot whose stream is open is not
+                        // counted.
+                        #[cfg(inf_canary_marked_slot_uncounted)]
+                        PeerStream::Open => false,
+                        #[cfg(not(inf_canary_marked_slot_uncounted))]
                         PeerStream::Open => true,
                         PeerStream::Ended { .. } => false,
                     }
