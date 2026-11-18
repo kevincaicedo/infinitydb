@@ -41,12 +41,12 @@
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::path::Path;
 
 use compat::harness::{
-    CaseOverride, Expect, candidate, infinityd, infinityd_at, oracle, parse_int_reply, read_frames,
-    run_matrix, spawn_infinityd_at,
+    CaseOverride, Expect, OracleGuard, candidate, infinityd, infinityd_at, oracle, parse_int_reply,
+    read_frames, run_matrix, spawn_infinityd_at,
 };
 use compat::matrix::MATRIX;
 use compat::resp::encode_command;
@@ -575,6 +575,54 @@ fn quit_closes_a_namespace_bound_connection_like_redis() {
             Err(e) => panic!("{who}: the server never closed the connection after QUIT ({e})"),
         }
     }
+}
+
+/// `QUIT` answers `+OK` once the replies before it are sent, then the server
+/// closes the connection, and nothing behind the `QUIT` runs, inline or
+/// queued (ADR-0123 A2 rule 3). Each shape is one write with ten `SET`s
+/// behind the `QUIT`, on a two-cell node and on Redis: `QUIT` alone and
+/// behind ten `SET`s on a connection bound by `INF.NS USE`, where every
+/// command rides the connection's queue; behind a `DEL` of keys both cells
+/// own, which queues it too; and inline, where the parse stops at it. Redis
+/// reads the same bytes on a plain connection. A `QUIT` that keeps the queue
+/// behind it lands the `SET`s and answers them.
+#[test]
+fn nothing_behind_a_quit_runs_like_redis() {
+    let Some((_node_guard, mut node)) = infinityd(2, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (_oracle_guard, oracle) = oracle();
+    let mut nb = Vec::new();
+    let create = ["INF.NS", "CREATE", "cache", "MODE", "memory"];
+    assert_eq!(cmd(&mut node, &mut nb, &create), b"+OK\r\n", "INF.NS CREATE");
+    let mut failures = Vec::new();
+    for shape in QuitShape::ALL {
+        let ns = shape.bound().then_some("cache");
+        let redis = quit_shape(&oracle, None, shape);
+        let ours = quit_shape(&node, ns, shape);
+        let behind = (redis.landed_behind, ours.landed_behind);
+        if redis.replies != ours.replies || redis.landed != ours.landed || behind != (0, 0) {
+            failures.push(format!(
+                "{shape:?}: redis {:?}, {} landed before the QUIT, {} behind it, {:?}; node {:?}, \
+                 {} landed before, {} behind, {:?}",
+                String::from_utf8_lossy(&redis.replies),
+                redis.landed,
+                redis.landed_behind,
+                redis.end,
+                String::from_utf8_lossy(&ours.replies),
+                ours.landed,
+                ours.landed_behind,
+                ours.end,
+            ));
+        }
+        for (who, reading) in [("redis", &redis), ("node", &ours)] {
+            if reading.end == End::Open {
+                failures.push(format!("{shape:?}: {who} never closed the connection"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "QUIT differs from Redis:\n{}", failures.join("\n"));
 }
 
 // ---- Batch 50 (review 2026-08-30): F-L15-03 / F-L15-05 / F-L15-10 ----------
@@ -1147,15 +1195,14 @@ fn timeout_teardown(server: &TcpStream, key: &str) {
     cmd(&mut fresh, &mut buf, &["DEL", key]);
 }
 
-/// Sets the receive buffer of `stream` to `bytes`.
-fn receive_buffer(stream: &TcpStream, bytes: libc::c_int) {
-    use std::os::fd::AsRawFd;
+/// Sets the receive buffer of `socket` to `bytes`.
+fn receive_buffer(socket: &impl std::os::fd::AsRawFd, bytes: libc::c_int) {
     let len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).expect("an int");
-    // SAFETY: `stream` owns an open socket for the call's whole duration, and
+    // SAFETY: `socket` owns an open socket for the call's whole duration, and
     // `bytes` is a live int that setsockopt only reads; no pointer outlives it.
     let status = unsafe {
         libc::setsockopt(
-            stream.as_raw_fd(),
+            socket.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
             std::ptr::from_ref(&bytes).cast(),
@@ -1311,4 +1358,817 @@ fn timeout_reaps_a_flushing_non_reader_like_redis() {
     let ours = non_reader(&mut node, "timeout:flushing", true);
     assert!(ours <= 3.0, "node closed the flushing non-reader {ours:.2} s after its request");
     assert!(idle(&node) > before, "node: the close was not the timeout's");
+}
+
+// ---- A close runs what its client sent (ADR-0123 A2; ADR-0196 and its A1) ----
+
+/// A read's hang bound: a stream a server still holds open past it was never
+/// closed. It ends the wait; it decides nothing a server sent.
+const CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How a read to the end of a stream ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// The server's FIN.
+    Fin,
+    /// The server's reset.
+    Reset,
+    /// Still open at [`CLOSE_DEADLINE`].
+    Open,
+}
+
+/// Every byte `stream` reads until the server closes it, and how it closed.
+fn read_until_closed(stream: &mut TcpStream) -> (Vec<u8>, End) {
+    use std::io::ErrorKind;
+    use std::time::{Duration, Instant};
+    stream.set_read_timeout(Some(Duration::from_millis(500))).expect("read timeout");
+    let begin = Instant::now();
+    let mut delivered = Vec::new();
+    let mut chunk = vec![0u8; 1 << 16];
+    while begin.elapsed() < CLOSE_DEADLINE {
+        match stream.read(&mut chunk) {
+            Ok(0) => return (delivered, End::Fin),
+            Ok(n) => delivered.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => return (delivered, End::Reset),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) => {}
+            Err(e) => panic!("a read failed after {} bytes: {e}", delivered.len()),
+        }
+    }
+    (delivered, End::Open)
+}
+
+/// One command's wire bytes.
+fn wire(argv: &[&str]) -> Vec<u8> {
+    let owned: Vec<String> = argv.iter().map(|part| (*part).to_string()).collect();
+    encode_command(&owned)
+}
+
+/// The names `prefix:0` to `prefix:{count - 1}`.
+fn names(prefix: &str, count: usize) -> Vec<String> {
+    (0..count).map(|n| format!("{prefix}:{n}")).collect()
+}
+
+/// A `SET` of every name, pipelined.
+fn sets(names: &[String]) -> Vec<u8> {
+    names.iter().flat_map(|name| wire(&["SET", name, "1"])).collect()
+}
+
+/// `n` `+OK` replies.
+fn oks(n: usize) -> Vec<u8> {
+    b"+OK\r\n".repeat(n)
+}
+
+/// How many of `names` exist, counted by `EXISTS` on a fresh connection,
+/// bound by `INF.NS USE` to `ns` first when given.
+fn existing(server: &TcpStream, ns: Option<&str>, names: &[String]) -> usize {
+    let mut reader = sibling(server);
+    let mut buf = Vec::new();
+    if let Some(ns) = ns {
+        assert_eq!(cmd(&mut reader, &mut buf, &["INF.NS", "USE", ns]), b"+OK\r\n", "USE {ns}");
+    }
+    // A named namespace refuses a multi-key command whose keys span cells, so
+    // a bound reader asks one key at a time.
+    let batch_len = if ns.is_some() { 1 } else { 500 };
+    let mut count = 0;
+    for batch in names.chunks(batch_len) {
+        let mut argv = vec!["EXISTS"];
+        argv.extend(batch.iter().map(String::as_str));
+        let reply = cmd(&mut reader, &mut buf, &argv);
+        let n = parse_int_reply(&reply).and_then(|n| usize::try_from(n).ok());
+        count += n.unwrap_or_else(|| panic!("EXISTS: {:?}", String::from_utf8_lossy(&reply)));
+    }
+    count
+}
+
+/// `stream`'s client id, as `CLIENT LIST` prints it.
+fn client_id(stream: &mut TcpStream) -> String {
+    let reply = cmd(stream, &mut Vec::new(), &["CLIENT", "ID"]);
+    let id = parse_int_reply(&reply).expect("CLIENT ID is an integer");
+    id.to_string()
+}
+
+/// Whether a fresh connection's `CLIENT LIST` holds client `id`'s row. A
+/// node's cell lists its own clients, so the node runs one cell.
+fn listed(server: &TcpStream, id: &str) -> bool {
+    let mut probe = sibling(server);
+    let list = cmd(&mut probe, &mut Vec::new(), &["CLIENT", "LIST"]);
+    String::from_utf8_lossy(&list).lines().any(|line| line.contains(&format!("id={id} ")))
+}
+
+/// A fresh connection to `server`'s address whose receive buffer is `bytes`
+/// from before its connect, as a client that holds a small buffer from its
+/// start: one shrunk after the connect leaves less free space than a segment,
+/// so a loopback sender stalls in zero-window probes. Elsewhere than Linux the
+/// descriptor is inheritable; the compatibility lanes run on Linux.
+fn sibling_with_receive_buffer(server: &TcpStream, bytes: libc::c_int) -> TcpStream {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let std::net::SocketAddr::V4(peer) = server.peer_addr().expect("peer addr") else {
+        panic!("both servers listen on IPv4 loopback");
+    };
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: socket(2) reads no memory of this process; its result is checked
+    // before use.
+    let fd = unsafe { libc::socket(libc::AF_INET, kind, 0) };
+    assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+    // SAFETY: `fd` is the open socket socket(2) just returned and nothing else
+    // holds it, so the `OwnedFd` is its one owner and closes it once.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    receive_buffer(&socket, bytes);
+    // SAFETY: every field of `sockaddr_in` is an integer or an array of them,
+    // so all zero bytes are a valid value; the fields read are set below.
+    let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    address.sin_family = libc::sa_family_t::try_from(libc::AF_INET).expect("AF_INET fits");
+    address.sin_port = peer.port().to_be();
+    address.sin_addr.s_addr = u32::from(*peer.ip()).to_be();
+    let len = libc::socklen_t::try_from(std::mem::size_of_val(&address)).expect("a small struct");
+    // SAFETY: `address` is a live, initialised `sockaddr_in` of `len` bytes that
+    // connect(2) only reads during the call, and `socket` is open throughout.
+    let status =
+        unsafe { libc::connect(socket.as_raw_fd(), std::ptr::from_ref(&address).cast(), len) };
+    assert_eq!(status, 0, "connect: {}", std::io::Error::last_os_error());
+    let stream = TcpStream::from(socket);
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("timeout");
+    stream
+}
+
+/// Polls `CLIENT LIST` until client `id`'s row is gone; false when it is
+/// still listed at [`CLOSE_DEADLINE`] (a hang bound: the close's own
+/// cleanup takes a few iterations).
+fn unlisted_in_time(server: &TcpStream, id: &str) -> bool {
+    use std::time::{Duration, Instant};
+    let begin = Instant::now();
+    while listed(server, id) {
+        if begin.elapsed() >= CLOSE_DEADLINE {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+/// Sends `signal` (`-STOP`, `-CONT`) to process `pid` with `kill(1)`.
+fn signal(pid: u32, signal: &str) {
+    let status = std::process::Command::new("kill").args([signal, &pid.to_string()]).status();
+    assert!(status.is_ok_and(|status| status.success()), "kill {signal} {pid}");
+}
+
+/// How a leg keeps a server from reading while its client writes, so the
+/// client's bytes and its FIN wait in the kernel and reach the server
+/// together once it reads again.
+#[derive(Clone, Copy, Debug)]
+enum HoldBy {
+    /// The server reads as it pleases.
+    Nothing,
+    /// The process is stopped (`SIGSTOP`) until the FIN is written.
+    Signal(u32),
+    /// The client writes 0.2 s into a second connection's `DEBUG SLEEP 1`:
+    /// Redis reads nothing while it sleeps, and a node's sleeping cell
+    /// parses nothing (so a node holds the leg on one cell).
+    Sleep,
+}
+
+/// A hold in force, released once the client's FIN is written.
+enum Hold {
+    Stopped(u32),
+    Asleep(TcpStream),
+}
+
+impl Hold {
+    fn begin(server: &TcpStream, by: HoldBy) -> Option<Hold> {
+        match by {
+            HoldBy::Nothing => None,
+            HoldBy::Signal(pid) => {
+                signal(pid, "-STOP");
+                Some(Hold::Stopped(pid))
+            }
+            HoldBy::Sleep => {
+                let mut sleeper = sibling(server);
+                sleeper.write_all(&wire(&["DEBUG", "SLEEP", "1"])).expect("DEBUG SLEEP");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Some(Hold::Asleep(sleeper))
+            }
+        }
+    }
+
+    fn release(self) {
+        match self {
+            Hold::Stopped(pid) => signal(pid, "-CONT"),
+            Hold::Asleep(mut sleeper) => {
+                let reply = read_frames(&mut sleeper, &mut Vec::new(), 1);
+                assert_eq!(reply, b"+OK\r\n", "DEBUG SLEEP's +OK");
+            }
+        }
+    }
+}
+
+/// How the oracle is held for the stopped shape: by its signal when this
+/// test spawned it, else by `DEBUG SLEEP`, under which Redis reads nothing
+/// either (a pinned oracle's process is not the test's), said on stdout.
+fn oracle_hold(guard: &OracleGuard) -> HoldBy {
+    match guard.pid() {
+        Some(pid) => HoldBy::Signal(pid),
+        None => {
+            println!("the pinned oracle is held by DEBUG SLEEP, not stopped by a signal");
+            HoldBy::Sleep
+        }
+    }
+}
+
+/// What one half-closed pipeline read: its replies, how its stream ended,
+/// and how many of its names a fresh client finds set.
+struct HalfClosed {
+    replies: Vec<u8>,
+    end: End,
+    landed: usize,
+}
+
+/// `count` pipelined `SET`s of `prefix`'s names, the client's FIN, then a
+/// read to the end, with the server held by `by` until the FIN is written.
+fn half_closed_pipeline(server: &TcpStream, by: HoldBy, prefix: &str, count: usize) -> HalfClosed {
+    let names = names(prefix, count);
+    let mut client = sibling(server);
+    let hold = Hold::begin(server, by);
+    client.write_all(&sets(&names)).expect("write");
+    client.shutdown(Shutdown::Write).expect("FIN");
+    if let Some(hold) = hold {
+        hold.release();
+    }
+    let (replies, end) = read_until_closed(&mut client);
+    HalfClosed { replies, end, landed: existing(server, None, &names) }
+}
+
+/// Redis's reading of a half-closed pipeline of `count` `SET`s, every
+/// shape (ADR-0196's HC1–HC3): `count` `+OK`, then the FIN, every name set.
+/// Each server is held to it, so the node reads what Redis reads.
+fn check_half_closed(label: &str, count: usize, reading: &HalfClosed, failures: &mut Vec<String>) {
+    let want = oks(count);
+    if reading.replies != want || reading.end != End::Fin || reading.landed != count {
+        failures.push(format!(
+            "{label}: {} reply bytes of {} for {count} SETs, then {:?} (owed Fin); {} of {count} \
+             names set",
+            reading.replies.len(),
+            want.len(),
+            reading.end,
+            reading.landed,
+        ));
+    }
+}
+
+/// A client that pipelines `SET`s and then ends its stream is answered for
+/// every one, then the server closes the stream, on both servers: the end of
+/// the stream marks the connection, and the commands read before it run and
+/// are answered (ADR-0196 A1). 100 and 5,000 `SET`s of keys both cells own,
+/// the server running, and the server stopped until the FIN is written, so
+/// the bytes and the FIN reach it at one read.
+#[test]
+fn a_half_closed_pipeline_is_answered_like_redis() {
+    let Some((node_guard, node)) = infinityd(2, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (oracle_guard, oracle) = oracle();
+    let held = [(oracle_hold(&oracle_guard), HoldBy::Signal(node_guard.pid()))];
+    let shapes = [(HoldBy::Nothing, HoldBy::Nothing)].into_iter().chain(held);
+    let mut failures = Vec::new();
+    for (redis_by, node_by) in shapes {
+        for count in [100, 5_000] {
+            let shape = if matches!(node_by, HoldBy::Nothing) { "running" } else { "stopped" };
+            let prefix = format!("half-close-{shape}-{count}");
+            let redis = half_closed_pipeline(&oracle, redis_by, &prefix, count);
+            check_half_closed(&format!("redis {prefix}"), count, &redis, &mut failures);
+            let ours = half_closed_pipeline(&node, node_by, &prefix, count);
+            check_half_closed(&format!("node {prefix}"), count, &ours, &mut failures);
+        }
+    }
+    assert!(failures.is_empty(), "a half-closed pipeline:\n{}", failures.join("\n"));
+}
+
+/// The same pipelines sent 0.2 s into another client's `DEBUG SLEEP 1`, the
+/// FIN written before the sleep ends: each server reads the bytes and the FIN
+/// only once it wakes, then runs and answers every `SET`. One cell, so the
+/// node's sleeping cell is the client's.
+#[test]
+fn a_half_closed_pipeline_sent_during_a_stall_is_answered_like_redis() {
+    let Some((_node_guard, node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (_oracle_guard, oracle) = oracle();
+    let mut failures = Vec::new();
+    for count in [100, 5_000] {
+        let prefix = format!("half-close-stall-{count}");
+        let redis = half_closed_pipeline(&oracle, HoldBy::Sleep, &prefix, count);
+        check_half_closed(&format!("redis {prefix}"), count, &redis, &mut failures);
+        let ours = half_closed_pipeline(&node, HoldBy::Sleep, &prefix, count);
+        check_half_closed(&format!("node {prefix}"), count, &ours, &mut failures);
+    }
+    assert!(failures.is_empty(), "a pipeline half-closed in a stall:\n{}", failures.join("\n"));
+}
+
+/// 1,500 `SET`s, `QUIT`, 2,000 `SET`s and the FIN in one write: both servers
+/// answer the 1,500 and the `QUIT`, run no `SET` behind it, and close. How
+/// the stream ends is declared, not compared (ADR-0196 D6.2): Redis resets
+/// it when it closes with the input behind the `QUIT` unread, and this server
+/// may end it with a FIN; both are printed.
+#[test]
+fn a_quit_inside_a_half_closed_pipeline_ends_it_like_redis() {
+    let Some((_node_guard, node)) = infinityd(2, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (_oracle_guard, oracle) = oracle();
+    let before = names("half-close-quit-before", 1_500);
+    let behind = names("half-close-quit-behind", 2_000);
+    let mut bytes = sets(&before);
+    bytes.extend(wire(&["QUIT"]));
+    bytes.extend(sets(&behind));
+    let mut failures = Vec::new();
+    for (who, server) in [("redis", &oracle), ("node", &node)] {
+        let mut client = sibling(server);
+        client.write_all(&bytes).expect("write");
+        client.shutdown(Shutdown::Write).expect("FIN");
+        let (replies, end) = read_until_closed(&mut client);
+        let landed = existing(server, None, &before);
+        let landed_behind = existing(server, None, &behind);
+        println!("{who}: a QUIT inside a half-closed pipeline, the stream ended by {end:?}");
+        if replies != oks(1_501) || end == End::Open || landed != 1_500 || landed_behind != 0 {
+            failures.push(format!(
+                "{who}: {} reply bytes of {} (1,500 SETs and the QUIT), then {end:?}; {landed} \
+                 of 1,500 names before the QUIT set, {landed_behind} behind it (owed 0)",
+                replies.len(),
+                oks(1_501).len(),
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "a QUIT inside a half-closed pipeline:\n{}", failures.join("\n"));
+}
+
+/// One `GET big` reply: the bulk header and the 1 MiB payload.
+const BIG_REPLY_BYTES: usize = "$1048576\r\n".len() + (1 << 20) + 2;
+
+/// The messages of the unread subscriber's fill, each of [`FILL_BYTES`].
+const FILL_MESSAGES: usize = 6_000;
+
+/// One fill message's payload: 6,000 of them stay under both servers'
+/// `pubsub` soft output limit of 8 MiB.
+const FILL_BYTES: usize = 1024;
+
+/// One fill message as a subscriber of `ch` reads it.
+fn fill_message() -> Vec<u8> {
+    let mut frame = format!("*3\r\n$7\r\nmessage\r\n$2\r\nch\r\n${FILL_BYTES}\r\n").into_bytes();
+    frame.extend(std::iter::repeat_n(b'f', FILL_BYTES));
+    frame.extend_from_slice(b"\r\n");
+    frame
+}
+
+/// A client's `SUBSCRIBE ch` confirmation.
+const SUBSCRIBED: &[u8] = b"*3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n";
+
+/// What a client the server still owed read once it ended its stream or
+/// sent `QUIT`.
+struct Owed {
+    /// What it read until the server closed, and how it closed.
+    bytes: Vec<u8>,
+    end: End,
+    /// Whether `CLIENT LIST` held its row 0.2 s after its last write.
+    listed_while_owed: bool,
+    /// Whether its row left `CLIENT LIST` within the hang bound after its
+    /// stream ended.
+    unlisted_after: bool,
+    /// For a subscriber, a `PUBLISH` to its channel 0.2 s after its last
+    /// write.
+    count: Option<Vec<u8>>,
+}
+
+/// Eight `GET`s of a 1 MiB value from a client whose receive buffer is
+/// 64 KiB, then a `QUIT` when `quit`, then its FIN, in one write; it reads
+/// nothing for 0.5 s, then reads to the end.
+fn slow_half_closed_reader(server: &TcpStream, quit: bool) -> Owed {
+    use std::time::Duration;
+    let mut setup = sibling(server);
+    let value = "b".repeat(1 << 20);
+    assert_eq!(cmd(&mut setup, &mut Vec::new(), &["SET", "big", &value]), b"+OK\r\n");
+    let mut client = sibling_with_receive_buffer(server, 64 * 1024);
+    let id = client_id(&mut client);
+    let mut bytes: Vec<u8> = (0..8).flat_map(|_| wire(&["GET", "big"])).collect();
+    if quit {
+        bytes.extend(wire(&["QUIT"]));
+    }
+    client.write_all(&bytes).expect("write");
+    client.shutdown(Shutdown::Write).expect("FIN");
+    std::thread::sleep(Duration::from_millis(200));
+    let listed_while_owed = listed(server, &id);
+    std::thread::sleep(Duration::from_millis(300));
+    let (bytes, end) = read_until_closed(&mut client);
+    let unlisted_after = unlisted_in_time(server, &id);
+    Owed { bytes, end, listed_while_owed, unlisted_after, count: None }
+}
+
+/// A subscriber of `ch` with a 4 KiB receive buffer reads nothing while
+/// 6,000 messages of 1 KiB are published to it, so the server holds most of
+/// them; it sends `QUIT` when `quit` and ends its stream when `fin`, each
+/// followed by 0.2 s; then a third client publishes `m` once, and the
+/// subscriber reads to the end.
+fn unread_subscriber(server: &TcpStream, quit: bool, fin: bool) -> Owed {
+    use std::time::Duration;
+    let mut subscriber = sibling_with_receive_buffer(server, 4096);
+    let id = client_id(&mut subscriber);
+    let mut sub_buf = Vec::new();
+    let confirmation = cmd(&mut subscriber, &mut sub_buf, &["SUBSCRIBE", "ch"]);
+    assert_eq!(confirmation, SUBSCRIBED, "the SUBSCRIBE confirmation");
+    let mut publisher = sibling(server);
+    let mut pub_buf = Vec::new();
+    let fill = "f".repeat(FILL_BYTES);
+    let burst: Vec<u8> = (0..100).flat_map(|_| wire(&["PUBLISH", "ch", &fill])).collect();
+    for _ in 0..FILL_MESSAGES / 100 {
+        publisher.write_all(&burst).expect("publish");
+        let counts = read_frames(&mut publisher, &mut pub_buf, 100);
+        assert_eq!(counts, b":1\r\n".repeat(100), "the fill's receiver counts");
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    if quit {
+        subscriber.write_all(&wire(&["QUIT"])).expect("QUIT");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if fin {
+        subscriber.shutdown(Shutdown::Write).expect("FIN");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let listed_while_owed = listed(server, &id);
+    let count = cmd(&mut publisher, &mut pub_buf, &["PUBLISH", "ch", "m"]);
+    let (bytes, end) = read_until_closed(&mut subscriber);
+    let unlisted_after = unlisted_in_time(server, &id);
+    sub_buf.extend(bytes);
+    Owed { bytes: sub_buf, end, listed_while_owed, unlisted_after, count: Some(count) }
+}
+
+/// Holds a reading of a client the server still owed once it ended its
+/// stream to ADR-0196 A1.6's declared shape: this server sends `full`, every
+/// byte it owed (D6.4), and lists the client while it owes it (D6.5); Redis
+/// drops at the end of stream what its socket had not taken, so it sends a
+/// prefix of `full`, and drops the row. Both close by a FIN and both unlist
+/// the client once its stream ended. Redis's byte count is printed.
+fn check_answered_in_full(label: &str, full: &[u8], redis: &Owed, ours: &Owed) -> Vec<String> {
+    println!("{label}: redis sent {} bytes of the {} owed", redis.bytes.len(), full.len());
+    let mut failures = Vec::new();
+    if ours.bytes != full || ours.end != End::Fin {
+        failures.push(format!(
+            "{label}: node sent {} bytes of {} (owed all), then {:?}",
+            ours.bytes.len(),
+            full.len(),
+            ours.end
+        ));
+    }
+    if !full.starts_with(&redis.bytes) || redis.end != End::Fin {
+        failures.push(format!(
+            "{label}: redis sent {} bytes, not a prefix of the {} owed, then {:?}",
+            redis.bytes.len(),
+            full.len(),
+            redis.end
+        ));
+    }
+    let rows = [ours.listed_while_owed, !redis.listed_while_owed];
+    if rows != [true, true] || !ours.unlisted_after || !redis.unlisted_after {
+        failures.push(format!(
+            "{label}: listed while owed: node {} (owed true), redis {} (owed false); unlisted \
+             after the end: node {}, redis {} (owed true)",
+            ours.listed_while_owed,
+            redis.listed_while_owed,
+            ours.unlisted_after,
+            redis.unlisted_after
+        ));
+    }
+    failures
+}
+
+/// A client the server still owes eight 1 MiB replies ends its stream, having
+/// read nothing for 0.5 s through a 64 KiB receive buffer: this server sends
+/// all 8,388,704 bytes, then closes, and lists the client until then; Redis
+/// drops what its socket had not taken, and the row, when it reads the FIN.
+/// With a `QUIT` before the FIN this server sends the `QUIT`'s `+OK` after
+/// the eight replies, and Redis drops it with them. Declared (ADR-0196 A1.6,
+/// D6.4 and D6.5); Redis's bytes are a prefix of this server's.
+#[test]
+fn a_half_closed_slow_reader_is_answered_in_full() {
+    let Some((_node_guard, node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (_oracle_guard, oracle) = oracle();
+    let mut failures = Vec::new();
+    for quit in [false, true] {
+        let mut full = slow_reply().repeat(8);
+        if quit {
+            full.extend_from_slice(b"+OK\r\n");
+        }
+        let label = if quit { "eight GETs, QUIT, FIN" } else { "eight GETs, FIN" };
+        let redis = slow_half_closed_reader(&oracle, quit);
+        let ours = slow_half_closed_reader(&node, quit);
+        failures.extend(check_answered_in_full(label, &full, &redis, &ours));
+    }
+    assert!(failures.is_empty(), "a half-closed slow reader:\n{}", failures.join("\n"));
+}
+
+/// One `GET big` reply's bytes.
+fn slow_reply() -> Vec<u8> {
+    let mut reply = b"$1048576\r\n".to_vec();
+    reply.extend(std::iter::repeat_n(b'b', 1 << 20));
+    reply.extend_from_slice(b"\r\n");
+    assert_eq!(reply.len(), BIG_REPLY_BYTES);
+    reply
+}
+
+/// A subscriber whose end of stream the server has read is no receiver,
+/// whether a `QUIT` marked it first or not: 0.2 s after its FIN a `PUBLISH`
+/// reads `:0` on both servers, and nothing published after the FIN reaches
+/// it (ADR-0196 A1.2). What it reads is declared (A1.6, D6.4 and D6.5): this
+/// server sends every message it held, then the `QUIT`'s `+OK` when one was
+/// sent, and lists the client until then; Redis drops at the FIN what its
+/// socket had not taken, and the row.
+#[test]
+fn a_subscriber_that_ends_its_stream_is_not_counted_like_redis() {
+    let Some((_node_guard, node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (_oracle_guard, oracle) = oracle();
+    let mut failures = Vec::new();
+    for quit in [false, true] {
+        let mut full = fill_message().repeat(FILL_MESSAGES);
+        if quit {
+            full.extend_from_slice(b"+OK\r\n");
+        }
+        let label =
+            if quit { "an unread subscriber, QUIT, FIN" } else { "an unread subscriber, FIN" };
+        let redis = unread_subscriber(&oracle, quit, true);
+        let ours = unread_subscriber(&node, quit, true);
+        for (who, reading) in [("redis", &redis), ("node", &ours)] {
+            if reading.count.as_deref() != Some(b":0\r\n") {
+                failures.push(format!(
+                    "{label}: {who}'s PUBLISH after the FIN read {:?} (owed :0)",
+                    reading.count.as_deref().map(String::from_utf8_lossy)
+                ));
+            }
+        }
+        failures.extend(check_answered_in_full(label, &full, &redis, &ours));
+    }
+    assert!(failures.is_empty(), "a subscriber that ends its stream:\n{}", failures.join("\n"));
+}
+
+/// A subscriber marked by `QUIT` whose stream is open still counts as a
+/// receiver, and is written nothing published after the mark: with 6,000
+/// messages held for it and its `QUIT` sent, a `PUBLISH` reads `:1` on both
+/// servers, and the subscriber then reads the 6,000, its `+OK` and the end,
+/// byte for byte the same (ADR-0196 D4, A1.2).
+#[test]
+fn a_marked_subscriber_counts_until_its_stream_ends_like_redis() {
+    let Some((_node_guard, node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (_oracle_guard, oracle) = oracle();
+    let mut full = fill_message().repeat(FILL_MESSAGES);
+    full.extend_from_slice(b"+OK\r\n");
+    let mut failures = Vec::new();
+    for (who, server) in [("redis", &oracle), ("node", &node)] {
+        let reading = unread_subscriber(server, true, false);
+        let count = reading.count.as_deref().map(String::from_utf8_lossy);
+        if count.as_deref() != Some(":1\r\n") || reading.bytes != full || reading.end != End::Fin {
+            failures.push(format!(
+                "{who}: the PUBLISH while marked read {count:?} (owed :1); the subscriber read {} \
+                 bytes of {} (6,000 messages and the +OK), then {:?}",
+                reading.bytes.len(),
+                full.len(),
+                reading.end
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "a marked subscriber:\n{}", failures.join("\n"));
+}
+
+/// One message to `ch` carrying `m`, as a subscriber reads it.
+const MESSAGE: &[u8] = b"*3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$1\r\nm\r\n";
+
+/// A subscriber of `ch` sends `QUIT` 0.3 s into another client's publishing
+/// to `ch` in bursts of 100, which goes on until the subscriber's stream
+/// ends. Its bytes until the server closed it, and how it closed.
+fn quitting_subscriber(server: &TcpStream) -> (Vec<u8>, End) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    let mut subscriber = sibling(server);
+    let mut sub_buf = Vec::new();
+    let confirmation = cmd(&mut subscriber, &mut sub_buf, &["SUBSCRIBE", "ch"]);
+    assert_eq!(confirmation, SUBSCRIBED, "the SUBSCRIBE confirmation");
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut publisher = sibling(server);
+    let publishing = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let burst: Vec<u8> = (0..100).flat_map(|_| wire(&["PUBLISH", "ch", "m"])).collect();
+            let mut buf = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                publisher.write_all(&burst).expect("publish");
+                read_frames(&mut publisher, &mut buf, 100);
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    subscriber.write_all(&wire(&["QUIT"])).expect("QUIT");
+    let (bytes, end) = read_until_closed(&mut subscriber);
+    stop.store(true, Ordering::Relaxed);
+    publishing.join().expect("the publisher ran to its stop");
+    sub_buf.extend(bytes);
+    (sub_buf, end)
+}
+
+/// A subscriber that sends `QUIT` while its channel is published to reads
+/// messages, its `+OK`, then no message, and the server ends its stream
+/// while the publishing goes on, on both servers: no published message is
+/// written after a `QUIT` (ADR-0196 D4). The messages read before the `+OK`
+/// are the leg's liveness: the publisher ran. The node runs one cell, where
+/// the publisher's commands and the subscriber's `QUIT` share the parse, so a
+/// delivery reaches the marked slot within its flush, and two, where the
+/// publisher may be the other cell's.
+#[test]
+fn a_subscriber_that_quits_is_sent_no_message_after_its_ok_like_redis() {
+    let Some((_one_guard, one_cell)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (_two_guard, two_cells) = infinityd(2, scratch_base()).expect("the node lane is on");
+    let (_oracle_guard, oracle) = oracle();
+    let mut failures = Vec::new();
+    let servers =
+        [("redis", &oracle), ("node, one cell", &one_cell), ("node, two cells", &two_cells)];
+    for (who, server) in servers {
+        let (bytes, end) = quitting_subscriber(server);
+        let mut at = 0;
+        while bytes[at..].starts_with(MESSAGE) {
+            at += MESSAGE.len();
+        }
+        let before = at / MESSAGE.len();
+        let after = bytes[at..].strip_prefix(b"+OK\r\n");
+        println!("{who}: {before} messages before the QUIT's +OK, then {end:?}");
+        if before == 0 || after != Some(&[][..]) || end == End::Open {
+            failures.push(format!(
+                "{who}: {before} messages before the +OK (owed at least 1), then {:?} (owed \
+                 the +OK and nothing after it), then {end:?} (owed the end)",
+                String::from_utf8_lossy(&bytes[at..bytes.len().min(at + 120)])
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "a subscriber that quits:\n{}", failures.join("\n"));
+}
+
+/// The shapes of the `QUIT` case: what shares the `QUIT`'s write.
+#[derive(Clone, Copy, Debug)]
+enum QuitShape {
+    /// `QUIT` alone, on a bound connection.
+    Alone,
+    /// Ten `SET`s, `QUIT`, ten `SET`s, on a bound connection.
+    BehindSets,
+    /// A `DEL` of 32 keys both cells own, `QUIT`, ten `SET`s.
+    BehindDel,
+    /// `QUIT`, then ten `SET`s: the parse stops at the `QUIT`.
+    Inline,
+}
+
+impl QuitShape {
+    const ALL: [QuitShape; 4] =
+        [QuitShape::Alone, QuitShape::BehindSets, QuitShape::BehindDel, QuitShape::Inline];
+
+    /// Whether the node's connection is bound by `INF.NS USE` first.
+    fn bound(self) -> bool {
+        matches!(self, QuitShape::Alone | QuitShape::BehindSets)
+    }
+}
+
+/// What one `QUIT` shape read.
+struct QuitReading {
+    replies: Vec<u8>,
+    end: End,
+    /// How many `SET`s before the `QUIT` landed, and how many behind it.
+    landed: usize,
+    landed_behind: usize,
+}
+
+/// `shape`'s write on a fresh connection, bound to `ns` when given, then a
+/// read to the end and a count of the `SET`s that landed.
+fn quit_shape(server: &TcpStream, ns: Option<&str>, shape: QuitShape) -> QuitReading {
+    let label = format!("quit-{shape:?}");
+    let before = names(&format!("{label}-before"), 10);
+    let behind = names(&format!("{label}-behind"), 10);
+    let (before, behind) = match shape {
+        QuitShape::Alone => (Vec::new(), Vec::new()),
+        QuitShape::BehindSets => (before, behind),
+        QuitShape::BehindDel | QuitShape::Inline => (Vec::new(), behind),
+    };
+    let mut client = sibling(server);
+    if let Some(ns) = ns {
+        assert_eq!(cmd(&mut client, &mut Vec::new(), &["INF.NS", "USE", ns]), b"+OK\r\n");
+    }
+    let mut bytes = sets(&before);
+    if let QuitShape::BehindDel = shape {
+        let keys = names(&format!("{label}-del"), 32);
+        let mut argv = vec!["DEL"];
+        argv.extend(keys.iter().map(String::as_str));
+        bytes.extend(wire(&argv));
+    }
+    bytes.extend(wire(&["QUIT"]));
+    bytes.extend(sets(&behind));
+    client.write_all(&bytes).expect("write");
+    let (replies, end) = read_until_closed(&mut client);
+    let landed = existing(server, ns, &before);
+    QuitReading { replies, end, landed, landed_behind: existing(server, ns, &behind) }
+}
+
+/// A frame whose bulk length is not a number: a protocol error.
+const BAD_FRAME: &[u8] = b"*1\r\n$x\r\n";
+
+/// The shapes of the protocol-error case: what precedes the bad frame in
+/// its one write.
+#[derive(Clone, Copy, Debug)]
+enum ErrorShape {
+    /// A `SET` of a key each cell owns (`foo` cell 1's, `bar` cell 0's), so
+    /// whichever cell holds the connection one reply is owed when the parse
+    /// meets the error.
+    OwedReply,
+    /// On the node a connection bound by `INF.NS USE`, where every command
+    /// rides its queue: ten `SET`s, the frame, ten `SET`s.
+    Queued,
+    /// The frame alone: nothing is owed.
+    Alone,
+}
+
+/// `shape`'s write on a fresh connection, bound to `ns` when given: its
+/// replies, how the stream ended, and the `SET`s before and behind the frame
+/// that landed.
+fn protocol_error_shape(server: &TcpStream, ns: Option<&str>, shape: ErrorShape) -> QuitReading {
+    let label = format!("protocol-{shape:?}");
+    let (before, behind) = match shape {
+        ErrorShape::OwedReply => (vec!["foo".to_string(), "bar".to_string()], Vec::new()),
+        ErrorShape::Queued => {
+            (names(&format!("{label}-before"), 10), names(&format!("{label}-behind"), 10))
+        }
+        ErrorShape::Alone => (Vec::new(), Vec::new()),
+    };
+    let mut client = sibling(server);
+    if let Some(ns) = ns {
+        assert_eq!(cmd(&mut client, &mut Vec::new(), &["INF.NS", "USE", ns]), b"+OK\r\n");
+    }
+    let mut bytes = sets(&before);
+    bytes.extend_from_slice(BAD_FRAME);
+    bytes.extend(sets(&behind));
+    client.write_all(&bytes).expect("write");
+    let (replies, end) = read_until_closed(&mut client);
+    let landed = existing(server, ns, &before);
+    QuitReading { replies, end, landed, landed_behind: existing(server, ns, &behind) }
+}
+
+/// A protocol error is answered after the replies of every command before it,
+/// then the server closes the connection, and nothing after the bad frame
+/// runs: one reply order for every reply the parse writes, at two cells, on
+/// both servers. Redis reads the bound shape's bytes on a plain connection.
+#[test]
+fn a_protocol_error_is_answered_after_the_replies_before_it_like_redis() {
+    let Some((_node_guard, mut node)) = infinityd(2, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");
+        return;
+    };
+    let (_oracle_guard, oracle) = oracle();
+    let create = ["INF.NS", "CREATE", "proto", "MODE", "memory"];
+    assert_eq!(cmd(&mut node, &mut Vec::new(), &create), b"+OK\r\n", "INF.NS CREATE");
+    let mut failures = Vec::new();
+    for shape in [ErrorShape::OwedReply, ErrorShape::Queued, ErrorShape::Alone] {
+        let ns = matches!(shape, ErrorShape::Queued).then_some("proto");
+        let redis = protocol_error_shape(&oracle, None, shape);
+        let ours = protocol_error_shape(&node, ns, shape);
+        let error_last = redis.replies.ends_with(b"-ERR Protocol error: invalid bulk length\r\n");
+        let same = redis.replies == ours.replies && redis.landed == ours.landed;
+        let behind = (redis.landed_behind, ours.landed_behind);
+        let ends = [redis.end, ours.end];
+        if !error_last || !same || behind != (0, 0) || ends.contains(&End::Open) {
+            failures.push(format!(
+                "{shape:?}: redis {:?}, {} landed before the frame, {} after, {:?}; node {:?}, {} \
+                 before, {} after, {:?}",
+                String::from_utf8_lossy(&redis.replies),
+                redis.landed,
+                redis.landed_behind,
+                redis.end,
+                String::from_utf8_lossy(&ours.replies),
+                ours.landed,
+                ours.landed_behind,
+                ours.end,
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "a protocol error differs from Redis:\n{}", failures.join("\n"));
 }

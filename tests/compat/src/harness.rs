@@ -295,8 +295,16 @@ static SHARED_ORACLE: Mutex<()> = Mutex::new(());
 /// Keeps an oracle to its test: a spawned server dies with the guard; the
 /// pinned server stays locked to this test until the guard drops.
 pub struct OracleGuard {
-    _process: Option<ProcessGuard>,
+    process: Option<ProcessGuard>,
     _shared: Option<MutexGuard<'static, ()>>,
+}
+
+impl OracleGuard {
+    /// The spawned oracle's pid; `None` for a pinned server, whose process
+    /// is not this test's to signal (CI runs it in a container).
+    pub fn pid(&self) -> Option<u32> {
+        self.process.as_ref().map(ProcessGuard::pid)
+    }
 }
 
 /// The redis oracle: `INF_COMPAT_ORACLE_ADDR` when pinned (CI), else a
@@ -331,7 +339,7 @@ pub fn oracle() -> (OracleGuard, TcpStream) {
             stream.write_all(b"*1\r\n$8\r\nFLUSHALL\r\n").expect("oracle write");
             let reply = read_frames(&mut stream, &mut Vec::new(), 1);
             assert_eq!(reply, b"+OK\r\n", "FLUSHALL on the pinned oracle failed");
-            (OracleGuard { _process: None, _shared: Some(shared) }, stream)
+            (OracleGuard { process: None, _shared: Some(shared) }, stream)
         }
         Err(std::env::VarError::NotPresent) => {
             let (guard, mut stream) = spawn_redis();
@@ -341,7 +349,7 @@ pub fn oracle() -> (OracleGuard, TcpStream) {
                 "redis-server on PATH is {version:?}; compat requires Redis {ORACLE_VERSION}; \
                  point INF_COMPAT_ORACLE_ADDR at that version"
             );
-            (OracleGuard { _process: Some(guard), _shared: None }, stream)
+            (OracleGuard { process: Some(guard), _shared: None }, stream)
         }
         Err(error) => panic!("invalid INF_COMPAT_ORACLE_ADDR: {error}"),
     }
