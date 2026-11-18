@@ -81,9 +81,9 @@ const SLOTS_2500: Cap = Cap::entries::<2_500>("executor-ab-2500", CapFill::Servi
 const SLOTS_10000: Cap = Cap::entries::<10_000>("executor-ab-10000", CapFill::Serving);
 
 /// P's planted instructions per op: each row's bound plus one, the planted red its rule must
-/// refuse. Each value is its row's `k` in the A/B's rows table (`rows.json`), which fixes the
-/// bound before any count of the row is read; this file copies `k` and sets no bound. The
-/// suspend rows' bounds differ by size, so each size has its own.
+/// refuse. Each row's bound is fixed before any count of the row is read, outside this file;
+/// each value copies that bound plus one and sets none of its own. The suspend rows' bounds
+/// differ by size, so each size has its own.
 const K_FAST_2500: u16 = 78;
 const K_DEFERRED_2500: u16 = 52;
 const K_FAST_10000: u16 = 89;
