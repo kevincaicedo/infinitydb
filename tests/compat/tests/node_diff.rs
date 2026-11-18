@@ -2429,9 +2429,9 @@ fn reset_while_held(server: &TcpStream, by: HoldBy, prefix: &str, count: usize) 
 /// socket (`ECONNRESET`) and frees the client, running nothing more of what
 /// its socket kept; this server runs every command its receive returned
 /// before the close, unanswered (ADR-0196 D1). Declared (ADR-0196 D6.3):
-/// Redis runs fewer than it was sent and at least one, this server at least
-/// as many as Redis; both counts are printed. One cell, where a cell's
-/// `CLIENT LIST` is the node's.
+/// Redis runs at least one, and this server more than Redis, of what its
+/// socket held past Redis's one read; both counts are printed. One cell,
+/// where a cell's `CLIENT LIST` is the node's.
 #[test]
 fn a_write_error_stops_redis_but_not_what_this_server_read() {
     let Some((node_guard, node)) = infinityd(1, scratch_base()) else {
@@ -2454,16 +2454,12 @@ fn a_write_error_stops_redis_but_not_what_this_server_read() {
             !redis.unlisted, !ours.unlisted
         ));
     }
-    if redis.landed == 0 || redis.landed >= count {
-        failures.push(format!(
-            "redis ran {} of {count} SETs (owed at least one, and fewer than all: D6.3 \
-             unobserved)",
-            redis.landed
-        ));
+    if redis.landed == 0 {
+        failures.push(format!("redis ran none of the {count} SETs (owed at least one)"));
     }
-    if ours.landed < redis.landed {
+    if ours.landed <= redis.landed {
         failures.push(format!(
-            "this server ran {} of the SETs it read, fewer than redis's {}",
+            "this server ran {} of the SETs it read, no more than redis's {} (D6.3 unobserved)",
             ours.landed, redis.landed
         ));
     }
