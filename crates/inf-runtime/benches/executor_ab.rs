@@ -81,15 +81,18 @@ const SLOTS_2500: Cap = Cap::entries::<2_500>("executor-ab-2500", CapFill::Servi
 const SLOTS_10000: Cap = Cap::entries::<10_000>("executor-ab-10000", CapFill::Serving);
 
 /// P's planted instructions per op: each row's bound plus one, the planted red its rule must
-/// refuse. The suspend rows' bound is 0; the keyed rows' is at most their ceiling, so their
-/// plant is the ceiling plus one.
+/// refuse. Each value is its row's `k` in the A/B's rows table (`rows.json`), which fixes the
+/// bound before any count of the row is read; this file copies `k` and sets no bound. The
+/// suspend rows' bounds differ by size, so each size has its own.
 const K_FAST_2500: u16 = 78;
 const K_DEFERRED_2500: u16 = 52;
 const K_FAST_10000: u16 = 89;
 const K_DEFERRED_10000: u16 = 62;
-const K_SUSPEND: u16 = 1;
-const K_KEYED_2496: u16 = 1_234;
-const K_KEYED_159744: u16 = 2_107;
+const K_SUSPEND_1024: u16 = 7;
+const K_SUSPEND_16384: u16 = 2;
+const K_SUSPEND_65536: u16 = 35;
+const K_KEYED_2496: u16 = 1_067;
+const K_KEYED_159744: u16 = 1_660;
 
 /// `NOPS` operand-free `nop`s: the count must read exactly `NOPS` more an op.
 #[inline(always)]
@@ -713,11 +716,17 @@ const VARIANTS: &[(&str, Drive)] = &[
         drive_deferred(SLOTS_10000, ops, step_deferred_planted::<K_DEFERRED_10000>)
     }),
     ("b-suspend-1024", |ops| drive_suspend(HOLDERS_1024, ops, step_suspend)),
-    ("p-suspend-1024", |ops| drive_suspend(HOLDERS_1024, ops, step_suspend_planted::<K_SUSPEND>)),
+    ("p-suspend-1024", |ops| {
+        drive_suspend(HOLDERS_1024, ops, step_suspend_planted::<K_SUSPEND_1024>)
+    }),
     ("b-suspend-16384", |ops| drive_suspend(HOLDERS_16384, ops, step_suspend)),
-    ("p-suspend-16384", |ops| drive_suspend(HOLDERS_16384, ops, step_suspend_planted::<K_SUSPEND>)),
+    ("p-suspend-16384", |ops| {
+        drive_suspend(HOLDERS_16384, ops, step_suspend_planted::<K_SUSPEND_16384>)
+    }),
     ("b-suspend-65536", |ops| drive_suspend(HOLDERS_65536, ops, step_suspend)),
-    ("p-suspend-65536", |ops| drive_suspend(HOLDERS_65536, ops, step_suspend_planted::<K_SUSPEND>)),
+    ("p-suspend-65536", |ops| {
+        drive_suspend(HOLDERS_65536, ops, step_suspend_planted::<K_SUSPEND_65536>)
+    }),
     ("b-keyed-2496", |ops| drive_keyed(ROUTES_2496, Probes::None, ops, step_keyed)),
     ("p-keyed-2496", |ops| {
         drive_keyed(ROUTES_2496, Probes::None, ops, step_keyed_planted::<K_KEYED_2496>)
