@@ -1007,6 +1007,37 @@ sentence as "typed error on every command").
 
 ## 6c. `inf-server` — node assembly (M0 E6/E7 substrate; implemented)
 
+> **Accepted 2026-10-29, built — ADR-0123 A2:** a connection slot is one
+> of four states, `Active`, `Flushing`, `Closing` and `Draining`; the
+> vacant slab entry is outside them. A close of the flush shape (`QUIT`, a
+> protocol error, the stop's mark) moves an `Active` slot to `Flushing`:
+> nothing read after the mark is parsed, the replies of the commands read
+> before it are sent, and the descriptor closes once they are. An
+> immediate close (`timeout`, `CLIENT KILL`, the output cap) closes the
+> slot at once. The queue runs to its end at every close but for the
+> commands behind a `QUIT`, inline or queued, which never run: at
+> `Closed` the queue, the connection's execution state and its pump move
+> into `Draining`, and the local registries drop the connection when the
+> pump reads its queue empty, after its last command. The output buffer
+> and the descriptor exist only in `Active` and `Flushing`, so no reply
+> byte reaches a closed socket; every writer into the output buffer (the
+> pump, the parse's replies, pub/sub delivery, a publisher's own frames)
+> answers from the slot's state.
+
+> **Accepted 2026-10-30, built — ADR-0196 and its A1:** the bytes a
+> connection read before its end of stream run in whatever state parses
+> them: the reader outlives `Closed`, in `Draining`, until it holds no
+> bytes, and `QUIT` or a protocol error ends it in every state. The
+> peer's end of stream is a mark of the flush shape that keeps the
+> reader, so the commands read before it run and are answered and the
+> descriptor closes once their replies are sent; only a receive or send
+> error is the peer gone, and then the commands run unanswered. After the
+> mark a slot takes only what the commands read before it owe: a
+> `Flushing` slot is written no published message, and it counts as a
+> receiver until the server reads its end of stream. Redis frees a client
+> when it reads its end of stream; the compatibility matrix's `QUIT` and
+> `CLIENT` rows state the differences (ADR-0196 D6, A1.6).
+
 ```rust
 /// One cell's complete data plane over any BackendDriver (uring in
 /// infinityd, kqueue dev tier, SimDriver in inf-sim). Conn slab keyed
