@@ -90,9 +90,23 @@ pub static DECLARED: &[Declared] = &[
         "QUIT",
         Status::Partial,
         "M1",
-        "replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus \
-             because closing tears down the shared oracle connection — covered by a unit test and \
-             the client-smoke suite",
+        "replies +OK once the replies before it are sent, then closes the connection; not in \
+             the byte-diff corpus, because closing tears down the shared oracle connection, and \
+             compared with Redis by the real-node lanes on connections of their own. Every \
+             command a connection read before its peer ended the stream runs, whatever the \
+             connection's state when it is parsed. While the peer can read, each is answered, and \
+             the connection closes once the replies are sent; Redis frees the client when it \
+             reads the end of the stream, dropping the replies its socket had not taken, a \
+             `QUIT`'s `+OK` among them, and its `CLIENT LIST` row, so this server sends more and \
+             lists the client longer. If the peer is gone (a reset or a failed write), the \
+             commands it sent run and are not answered. Nothing after a `QUIT`, inline or queued, \
+             runs. After a `QUIT`, a protocol error or the end of the stream no published message \
+             is written. A subscriber counts as a receiver until the server reads its end of \
+             stream or closes it, so one marked by `QUIT` counts while its stream is open, as \
+             Redis's does. After a `QUIT` with input behind it Redis may reset the connection, \
+             when it closes with that input unread; this server may end it with a FIN. After a \
+             write error this server runs the commands it had read; Redis may not (ADR-0196 D6, \
+             A1.6)",
     ),
     d("GET", Status::Full, "M0", ""),
     d(
@@ -346,7 +360,10 @@ pub static DECLARED: &[Declared] = &[
         "M1",
         "KILL supports the ID filter form; LIST/INFO report the tracked fields (id, name, age, \
              resp, db, sub, psub) — addr/fd are placeholders until peername capture, and \
-             idle/cmd/tot-*/buffer gauges are untracked zeros",
+             idle/cmd/tot-*/buffer gauges are untracked zeros; a client whose end of stream the \
+             server has read keeps its LIST row, its `connected_clients` count and its admission \
+             share until its replies are sent and its connection closes, where Redis drops them \
+             when it reads the end of the stream (ADR-0196 A1.6)",
     ),
     d(
         "LOLWUT",
