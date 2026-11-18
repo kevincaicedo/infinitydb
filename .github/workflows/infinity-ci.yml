@@ -391,10 +391,15 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
+      # On the host's network, so a client's socket is Redis's own: a published
+      # port puts docker-proxy between them, which reads Redis's output for a
+      # client that reads nothing, and the slow-reader cases would measure the
+      # proxy instead of Redis.
       - name: start pinned oracle (redis 8.0.5, debug commands on, no persistence)
         run: |
-          docker run -d --name oracle -p 6390:6379 redis:8.0.5 \
-            redis-server --save '' --appendonly no --enable-debug-command yes
+          docker run -d --name oracle --network host redis:8.0.5 \
+            redis-server --port 6390 --bind 127.0.0.1 --save '' --appendonly no \
+            --enable-debug-command yes
           for i in $(seq 1 100); do
             (echo PING | timeout 1 nc 127.0.0.1 6390 | grep -q PONG) && break || sleep 0.2
           done
