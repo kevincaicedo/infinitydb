@@ -1906,29 +1906,65 @@ struct Owed {
     count: Option<Vec<u8>>,
 }
 
+/// When a slow reader's FIN is written: with its `GET`s, so the server reads
+/// the requests and the end of stream together (ADR-0196's HC5), or once
+/// Redis holds the replies (HC8's and, with `QUIT`, HC10's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinAt {
+    WithTheGets,
+    OnceHeld,
+}
+
+/// Redis's peer for client `id` is the client's own socket, `own`: no reader
+/// sits between them to take Redis's output. The first row read decides; no
+/// row in the hang bound is a failure too.
+fn redis_peer_is_own(server: &TcpStream, id: &str, own: SocketAddr) -> Result<(), String> {
+    let mut row = None;
+    eventually(|| {
+        row = client_row(server, id);
+        row.is_some()
+    });
+    let own = own.to_string();
+    match row.as_deref().and_then(|row| row_field(row, "addr")) {
+        Some(addr) if addr == own => Ok(()),
+        _ => Err(format!(
+            "redis's peer for client {id} is not the client's socket {own}, so a reader sits \
+             between them: its row {row:?}"
+        )),
+    }
+}
+
 /// Eight `GET`s of a 1 MiB value from a client whose receive buffer is
-/// 64 KiB, then a `QUIT` when `quit`, in one write; once Redis holds the
-/// replies ([`redis_holds`]; the node is not polled), the client's FIN; then
-/// it reads to the end.
-fn slow_half_closed_reader(server: &TcpStream, side: Side, quit: bool) -> Owed {
+/// 64 KiB, then a `QUIT` when `quit`, in one write, and the client's FIN, at
+/// `fin`: with the `GET`s, Redis checked first for the client's own peer
+/// ([`redis_peer_is_own`]); or once Redis holds the replies
+/// ([`redis_holds`]). The node is not polled. Then it reads to the end.
+fn slow_half_closed_reader(server: &TcpStream, side: Side, fin: FinAt, quit: bool) -> Owed {
     let mut setup = sibling(server);
     let value = "b".repeat(1 << 20);
     assert_eq!(cmd(&mut setup, &mut Vec::new(), &["SET", "big", &value]), b"+OK\r\n");
     let mut client = sibling_with_receive_buffer(server, 64 * 1024);
     let id = client_id(&mut client);
+    let own = client.local_addr().expect("local addr");
     let mut bytes: Vec<u8> = (0..8).flat_map(|_| wire(&["GET", "big"])).collect();
     if quit {
         bytes.extend(wire(&["QUIT"]));
     }
-    let mut early = write_then_fin(&mut client, &bytes, false);
-    let own = client.local_addr().expect("local addr");
-    let engaged = match side {
-        Side::Redis => redis_holds(server, &id, own, quit),
-        Side::Node => Ok(()),
+    let (early, engaged) = match (fin, side) {
+        (FinAt::WithTheGets, Side::Redis) => {
+            let engaged = redis_peer_is_own(server, &id, own);
+            (write_then_fin(&mut client, &bytes, true), engaged)
+        }
+        (FinAt::WithTheGets, Side::Node) => (write_then_fin(&mut client, &bytes, true), Ok(())),
+        (FinAt::OnceHeld, _) => {
+            let early = write_then_fin(&mut client, &bytes, false);
+            let engaged = match side {
+                Side::Redis => redis_holds(server, &id, own, quit),
+                Side::Node => Ok(()),
+            };
+            (early.or_else(|| write_then_fin(&mut client, &[], true)), engaged)
+        }
     };
-    if early.is_none() {
-        early = write_then_fin(&mut client, &[], true);
-    }
     let listed_while_owed = listed_after_fin(server, side, &id);
     let (bytes, end) = read_on(&mut client, early);
     let unlisted_after = unlisted_in_time(server, &id);
@@ -2025,13 +2061,15 @@ fn check_answered_in_full(label: &str, full: &[u8], redis: &Owed, ours: &Owed) -
 }
 
 /// A client the server still owes eight 1 MiB replies ends its stream, having
-/// read nothing through a 64 KiB receive buffer while Redis held at least
-/// 1 MiB for it: this server sends all 8,388,704 bytes, then closes, and lists
-/// the client until then; Redis drops what its socket had not taken, and the
-/// row, when it reads the FIN. With a `QUIT` before the FIN this server sends
-/// the `QUIT`'s `+OK` after the eight replies, and Redis drops it with them.
-/// Declared (ADR-0196 A1.6, D6.4 and D6.5); Redis's bytes are a proper prefix
-/// of this server's.
+/// read nothing through a 64 KiB receive buffer: this server sends all
+/// 8,388,704 bytes, then closes, and lists the client until then; Redis drops
+/// what its socket had not taken, and the row, when it reads the FIN. Three
+/// legs: the FIN written with the `GET`s (ADR-0196's HC5: Redis reads the
+/// requests and the end of stream together), and written once Redis holds the
+/// replies, without and with a `QUIT` before it (HC8's and HC10's); with the
+/// `QUIT` this server sends its `+OK` after the eight replies, and Redis drops
+/// it with them. Declared (ADR-0196 A1.6, D6.4 and D6.5); Redis's bytes are a
+/// proper prefix of this server's, each leg's D6.4 evidence.
 #[test]
 fn a_half_closed_slow_reader_is_answered_in_full() {
     let Some((_node_guard, node)) = infinityd(1, scratch_base()) else {
@@ -2040,14 +2078,18 @@ fn a_half_closed_slow_reader_is_answered_in_full() {
     };
     let (_oracle_guard, oracle) = oracle();
     let mut failures = Vec::new();
-    for quit in [false, true] {
+    let legs = [
+        (FinAt::WithTheGets, false, "eight GETs and the FIN"),
+        (FinAt::OnceHeld, false, "eight GETs, FIN"),
+        (FinAt::OnceHeld, true, "eight GETs, QUIT, FIN"),
+    ];
+    for (fin, quit, label) in legs {
         let mut full = slow_reply().repeat(8);
         if quit {
             full.extend_from_slice(b"+OK\r\n");
         }
-        let label = if quit { "eight GETs, QUIT, FIN" } else { "eight GETs, FIN" };
-        let redis = slow_half_closed_reader(&oracle, Side::Redis, quit);
-        let ours = slow_half_closed_reader(&node, Side::Node, quit);
+        let redis = slow_half_closed_reader(&oracle, Side::Redis, fin, quit);
+        let ours = slow_half_closed_reader(&node, Side::Node, fin, quit);
         failures.extend(check_answered_in_full(label, &full, &redis, &ours));
     }
     assert!(failures.is_empty(), "a half-closed slow reader:\n{}", failures.join("\n"));
