@@ -1629,9 +1629,10 @@ ahead_pid=() ahead_began=() ahead_status=() ahead_waited=()
 # then sends SIGKILL at once); past 10 s it names the groups left. The poll
 # reads the process table (`ps`), a group alive while a process of it is
 # listed that is not a zombie, and `kill -0` only when the table cannot be
-# read: measured, a stop the lane entered from SIGINT saw `kill -0` reach a
-# group whose processes had all ended until the poll's 10 s bound, where the
-# table read finds it gone at the next tick. Only then is each job waited for,
+# read: a killed process whose reaper is slow to collect it (an orphan left to
+# the user's service manager, say) answers `kill -0` until it is reaped, where
+# the table lists it as a zombie, so the poll ends at its next tick, whatever
+# the reaper's pace. Only then is each job waited for,
 # so a leader that ignores SIGTERM never holds the poll. A job started but not
 # yet recorded when a signal came is in `jobs -p`.
 ahead_stop() {
