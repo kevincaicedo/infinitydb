@@ -2715,9 +2715,9 @@ mod tests {
             assert!(!polled(&mut wait), "engagement: queued");
             drop(wait);
         }
-        assert_eq!(list.waiting(), 0, "no dropped wait is a live waiter");
         assert_eq!(nodes.len(), 0, "wait-node-kept: a dropped wait's node is not the pool's");
         assert_eq!(nodes.full(), 0, "wait-node-kept: a first poll found the pool empty");
+        assert_eq!(list.waiting(), 0, "no dropped wait is a live waiter");
         let mut behind = list.wait(7);
         assert!(!polled(&mut behind), "engagement: a wait behind the woken ones");
         for _ in 0..WAITS {
