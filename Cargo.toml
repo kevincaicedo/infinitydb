@@ -353,5 +353,16 @@ lto = "thin"
 codegen-units = 1
 debug = "line-tables-only"
 
+# The simulator's own crate compiles in 16 units: at one, its two largest
+# units each compile on one core, about 94 s a cold build against 27 s at 16
+# or 32 and 29 s at 8, and the canary lane builds the simulator cold once a
+# planted cfg. Its runs, sim-smoke's 93 rows timed unpaired and with no
+# same-binary control: 155, 169 and 178 s at one unit (n 3); 166, 174, 190
+# and 203 s at 16 (n 4), the 174 and 203 s runs beside self-test runs on the
+# box. The cost is not told apart from that spread: 0 to 13 %. Its
+# dependencies keep the profile's one unit each.
+[profile.release.package.inf-sim]
+codegen-units = 16
+
 [profile.bench]
 inherits = "release"
