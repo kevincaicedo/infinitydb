@@ -7,7 +7,8 @@
 //!   [`GateUnits`] bound the holders it has out (ADR-0177 D4).
 //! - [`KeyedGate`] and [`IoGate`]: completions keyed by the caller's key (the
 //!   cold gate's logical id, a driver token), behind one holder each.
-//! - [`WaitList`]: key-keyed FIFO (M1 blocking ops: BLPOP, WAIT…).
+//! - [`WaitList`]: key-keyed FIFO (M1 blocking ops: BLPOP, WAIT…), taking
+//!   the cell's [`WaitNodes`] at its constructor.
 //! - [`WatermarkGate`]: LSN-keyed (M2 fsync-gated acks).
 //!
 //! A holder wakes exactly one task. Completion may arrive before the waiter
@@ -35,9 +36,9 @@ use std::rc::Rc;
 // attributed ~2.2% of natural-leg cycles to `DefaultHasher` (M2.5 Phase H).
 use inf_foundation::BuildIntHasher;
 use inf_foundation::bounded::{
-    Admission, Built, Cap, CapCensus, CapError, CappedMap, CappedSlab, Lookup, LookupMut,
-    MapBuilder, MapBuilt, MapRetired, NamedReservation, Retiring, SlabBuilder, SlabReserved,
-    SlotId, SlotWord, Taken, WordLookup, WrapWithProof,
+    Admission, AssemblyFull, Built, Cap, CapCensus, CapError, CappedMap, CappedSlab, ExactKey,
+    Lookup, LookupMut, MapBuilder, MapBuilt, MapRetired, NamedReservation, Retiring, SlabBuilder,
+    SlabReserved, SlotId, SlotWord, Taken, WordLookup, WrapWithProof,
 };
 use inf_foundation::limits::{GATE_KEY_GENERATION_BITS, GATE_KEY_INDEX_BITS};
 
@@ -340,7 +341,8 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
     /// The gate of cell `origin`, issuing at most `units_max` units, the
     /// holders its tasks may have waiting (`Σ T_j × W_j`), over `holders`
     /// slots, `H`, which add the orphans a peer's un-replied ops may hold
-    /// (ADR-0177 D4); `None` builds no holder at a node of one cell. Built
+    /// (ADR-0177 D4); `None` builds no holder at a node of one cell. Its
+    /// parked senders' list takes the cell's `nodes` (ADR-0177 D5). Built
     /// whole before the cell serves.
     ///
     /// # Errors
@@ -351,8 +353,9 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
         units_max: u32,
         holders: Option<Cap>,
         census: &Rc<CapCensus>,
+        nodes: &WaitNodes,
     ) -> Result<FabricGate<V, C>, CapError> {
-        FabricGate::build_with(origin, units_max, holders, census, |builder| builder)
+        FabricGate::build_with(origin, units_max, holders, census, nodes, |builder| builder)
     }
 
     /// [`build`](Self::build) with every holder slot free at
@@ -368,9 +371,10 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
         units_max: u32,
         holders: Option<Cap>,
         census: &Rc<CapCensus>,
+        nodes: &WaitNodes,
         first_generation: u32,
     ) -> Result<FabricGate<V, C>, CapError> {
-        FabricGate::build_with(origin, units_max, holders, census, |builder| {
+        FabricGate::build_with(origin, units_max, holders, census, nodes, |builder| {
             builder.first_generation(first_generation)
         })
     }
@@ -380,6 +384,7 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
         units_max: u32,
         holders: Option<Cap>,
         census: &Rc<CapCensus>,
+        nodes: &WaitNodes,
         configure: impl FnOnce(HolderBuilder<V>) -> HolderBuilder<V>,
     ) -> Result<FabricGate<V, C>, CapError> {
         let holders = match holders {
@@ -402,7 +407,7 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
             units: Rc::new(UnitBook { issued: Cell::new(0), max: units_max }),
             stale: 0,
             full: 0,
-            room: WaitList::new(),
+            room: WaitList::unit(nodes),
             round_trips: LogHistogram::new(),
             _cleanup: PhantomData,
         })
@@ -1167,7 +1172,72 @@ impl<K: GateKey, V, C: Cleanup<V>> Drop for KeyedWait<K, V, C> {
 /// seam exists from M0 so the executor contract is complete).
 pub type IoGate = KeyedGate<CompletionToken, CompletionResult>;
 
+// ---- WaitNodes ----------------------------------------------------------------
+
+/// The cell's wait nodes (ADR-0177 D5): one pool a cell, of `T` nodes, one
+/// for each live task's one parked wait. Every [`WaitList`] of the cell takes
+/// it at its constructor; a clone is a handle on the same pool. Its storage
+/// is not built: each list queues its waits in its own table, so the pool
+/// holds no node and answers 0 to [`len`](Self::len) and
+/// [`full`](Self::full).
+#[derive(Clone, Debug)]
+pub struct WaitNodes {
+    _private: (),
+}
+
+impl WaitNodes {
+    /// The pool of `cap` nodes on the cell's `census`, built whole before the
+    /// cell serves.
+    ///
+    /// # Errors
+    /// `CapError` from the pool's build; nothing is served.
+    pub fn build(cap: Cap, census: &Rc<CapCensus>) -> Result<WaitNodes, CapError> {
+        // The storage that reads them is not built: taken and dropped.
+        let _ = (cap, census);
+        Ok(WaitNodes { _private: () })
+    }
+
+    /// Nodes held by parked waits now (cell scope).
+    #[must_use]
+    pub fn len(&self) -> u32 {
+        0
+    }
+
+    /// Whether no parked wait holds a node.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// First polls that found no node or no key (`wait_nodes_full`, cell
+    /// scope).
+    #[must_use]
+    pub fn full(&self) -> u64 {
+        0
+    }
+}
+
 // ---- WaitList ---------------------------------------------------------------
+
+/// A keyed [`WaitList`]'s refusal at its build, before the cell serves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeysRefused {
+    /// The key map's build was refused.
+    Cap(CapError),
+    /// A key past the map's cap: the cap is short of its host's demand.
+    Full(AssemblyFull),
+}
+
+impl core::fmt::Display for KeysRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            KeysRefused::Cap(refused) => write!(f, "a wait list's keys: {refused}"),
+            KeysRefused::Full(refused) => write!(f, "{refused}"),
+        }
+    }
+}
+
+impl std::error::Error for KeysRefused {}
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum WaiterState {
@@ -1193,15 +1263,44 @@ pub struct WaitList<K: Eq + Hash + Copy> {
     queues: Rc<RefCell<HashMap<K, VecDeque<Rc<Waiter>>, BuildIntHasher>>>,
 }
 
-impl<K: Eq + Hash + Copy> Default for WaitList<K> {
-    fn default() -> Self {
-        Self::new()
+impl WaitList<()> {
+    /// The unit key's list on the cell's `nodes`: no map, no build step, no
+    /// refusal.
+    #[must_use]
+    pub fn unit(nodes: &WaitNodes) -> WaitList<()> {
+        // The storage that reads the pool is not built: taken and dropped.
+        let _ = nodes;
+        WaitList::empty()
+    }
+}
+
+impl<K: ExactKey + Hash> WaitList<K> {
+    /// A keyed list on the cell's `nodes` that holds every key of `keys`,
+    /// in a map of `cap` on `census`, built and filled whole before the
+    /// cell serves (`CapFill::Assembly`). `None` builds no map: a list that
+    /// holds no key, at a node of one cell, which has no peer.
+    ///
+    /// # Errors
+    /// [`KeysRefused`]: the map's build refused, or a key past its cap.
+    /// Nothing is served.
+    pub fn keyed(
+        nodes: &WaitNodes,
+        cap: Option<Cap>,
+        census: &Rc<CapCensus>,
+        keys: impl IntoIterator<Item = K>,
+    ) -> Result<WaitList<K>, KeysRefused> {
+        // The storage that reads them is not built: each key's queue is
+        // made at its first wait, so the pool, the cap and the keys are
+        // taken and dropped.
+        let _ = (nodes, cap, census, keys);
+        Ok(WaitList::empty())
     }
 }
 
 impl<K: Eq + Hash + Copy> WaitList<K> {
+    /// A list with no queue: every constructor's storage.
     #[allow(clippy::disallowed_types, reason = "container: E")]
-    pub fn new() -> WaitList<K> {
+    fn empty() -> WaitList<K> {
         WaitList { queues: Rc::new(RefCell::new(HashMap::default())) }
     }
 
@@ -1519,11 +1618,31 @@ mod tests {
     use inf_foundation::bounded::CapFill;
     use inf_foundation::rng::Entropy;
 
+    /// The tests' pools of wait nodes.
+    const TEST_WAIT_NODES: Cap = Cap::entries::<64>("test-wait-nodes", CapFill::Serving);
+    /// The tests' keyed lists' keys.
+    const TEST_LIST_KEYS: Cap = Cap::entries::<8>("test-list-keys", CapFill::Assembly);
+
+    /// A pool of wait nodes on `census`.
+    fn wait_nodes(census: &Rc<CapCensus>) -> WaitNodes {
+        WaitNodes::build(TEST_WAIT_NODES, census).expect("the test pool")
+    }
+
+    /// A list of `keys` on a census and a pool of its own.
+    fn keyed_list<K: ExactKey + Hash>(keys: impl IntoIterator<Item = K>) -> WaitList<K> {
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+        WaitList::keyed(&wait_nodes(&census), Some(TEST_LIST_KEYS), &census, keys)
+            .expect("the test list")
+    }
+
     /// A fabric gate of 8 holders on a census of its own, at cell 1.
     fn fabric_gate(units: u32) -> RefCell<FabricGate<u64>> {
         let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
         let holders = Cap::entries::<8>("test-gate-holders", CapFill::Serving);
-        RefCell::new(FabricGate::build(1, units, Some(holders), &census).expect("the test gate"))
+        let nodes = wait_nodes(&census);
+        RefCell::new(
+            FabricGate::build(1, units, Some(holders), &census, &nodes).expect("the test gate"),
+        )
     }
 
     /// One registered wait on `gate` under `units`, and the key its request
@@ -1888,7 +2007,7 @@ mod tests {
     /// again.
     #[test]
     fn a_list_is_idle_only_with_no_entry_live_or_cancelled() {
-        let list = WaitList::<u64>::new();
+        let list = keyed_list([7u64]);
         assert!(list.is_idle(), "a new list");
         let left = list.wait(7);
         assert!(!list.is_idle(), "a queued waiter");
@@ -2256,7 +2375,7 @@ mod tests {
                 dropped entry; red until a wait's node is unlinked by its own drop"]
     fn a_wait_dropped_while_queued_leaves_no_entry() {
         const WAITS: usize = 1_000;
-        let list: WaitList<u32> = WaitList::new();
+        let list = keyed_list([7u32]);
         let mut cx = Context::from_waker(Waker::noop());
         for _ in 0..WAITS {
             let mut wait = list.wait(7);

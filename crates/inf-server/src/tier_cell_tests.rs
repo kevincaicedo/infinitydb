@@ -25,7 +25,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         let receipts = inf_foundation::grants::ReceiptBoard::writer(&board, 0).expect("cell 0");
         let cursor = DirectoryCursor::default();
         let grants = CellGrants { directory, receipts, cursor, writer: Some(writer) };
-        TierCell::new(fs, cell, shard_dir, census, Some(grants))
+        let nodes = WaitNodes::build(crate::limits::TEST_WAIT_NODES, &census).expect("a test pool");
+        TierCell::new(fs, cell, shard_dir, census, nodes, Some(grants))
     }
 
     /// Grants `ns` the lowest Vacant directory position, as an accepted
@@ -1100,7 +1101,10 @@ fn a_stalled_writer_is_woken_at_a_visit_whose_plan_is_refused() {
     let mut cell = TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     cell.create_ns(NsId(16), &spec());
     let mut ks = sealed_backlog(2);
-    let parked = cell.nth(0).stall_waiters.wait(());
+    let mut parked = cell.nth(0).stall_waiters.wait(());
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let queued = std::pin::Pin::new(&mut parked).poll(&mut cx).is_pending();
+    assert!(queued, "engagement: the writer's wait is polled once, as its task polls it");
     assert!(cell.nth(0).stall_waiters.any_waiting(), "engagement: a writer is parked");
     inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
     let visited = cell.maintain_ns(

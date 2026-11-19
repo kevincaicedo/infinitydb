@@ -798,7 +798,7 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                         continue;
                     }
                     Popped::TakeWait => {
-                        shared.reader_waiters.wait(0).await;
+                        shared.reader_waiters.wait(()).await;
                         shared.reader_waiting.set(shared.reader_waiting.get() - 1);
                         continue;
                     }

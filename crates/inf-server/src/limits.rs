@@ -507,6 +507,75 @@ pub(crate) const fn plane_task_caps(
     Ok(PlaneTaskCaps { conn, peers, compact: COMPACT_TASKS, shadow: SHADOW_TASKS })
 }
 
+/// Wait nodes one cell holds at most (ADR-0177 D5): one for each live task's one parked wait, so
+/// the sum of the task classes' ceilings. Unit: nodes per cell.
+pub const WAIT_NODES_MAX: u32 = CONN_TASKS.entries_max()
+    + NS_APPLY_TASKS.entries_max()
+    + OWNER_PUB_TASKS.entries_max()
+    + GATED_TASKS.entries_max()
+    + COMPACT_TASKS.entries_max()
+    + SHADOW_TASKS.entries_max();
+
+/// The cell's pool of wait nodes (ADR-0177 D5): `T`, one node for each task slot of the cell's
+/// classes, which every wait list of the cell takes. The ceiling of the derived cap
+/// ([`wait_nodes`]), census name `wait-nodes`, filled while serving. Unit: nodes per cell.
+/// Owner: the plane, which builds the pool before the cell serves. Crossing: derived never, as
+/// a task holds at most one parked wait.
+pub const WAIT_NODES: Cap = Cap::entries::<WAIT_NODES_MAX>("wait-nodes", CapFill::Serving);
+
+/// The pool of a cell of `caps` (ADR-0177 D5): the sum of its classes' caps, each at most its
+/// ceiling, so the sum is at most [`WAIT_NODES_MAX`] and cannot overflow.
+///
+/// # Errors
+/// `CapError::Layout` when the sum passes [`WAIT_NODES_MAX`]; derived never.
+pub(crate) const fn wait_nodes(caps: &PlaneTaskCaps) -> Result<Cap, CapError> {
+    let mut nodes =
+        caps.conn.entries_max() + caps.compact.entries_max() + caps.shadow.entries_max();
+    if let Some(peers) = &caps.peers {
+        nodes += peers.ns_apply.entries_max()
+            + peers.owner_pub.entries_max()
+            + peers.gated.entries_max();
+    }
+    Cap::derived(&WAIT_NODES, nodes)
+}
+
+/// Keys one cell's credit wait list holds (ADR-0177 D5): one per peer, `cells − 1`, each held
+/// from the list's build, before the cell serves; a cell of a node of one cell holds none and
+/// builds no map. The ceiling of `cells − 1`, census name `credit-waiter-keys`, filled whole at
+/// assembly. Unit: keys per cell. Owner: the plane's credit list. Crossing: none while serving;
+/// a build past it ends the assembly with `credit-waiter-keys-full-at-assembly`.
+pub const CREDIT_WAITER_KEYS: Cap =
+    Cap::entries::<{ CELLS_MAX - 1 }>("credit-waiter-keys", CapFill::Assembly);
+
+/// Keys the DDL wait list holds (ADR-0177 D5): the one key its pumps wait on, held from the
+/// list's build. Census name `ddl-waiter-keys`, filled whole at assembly. Unit, owner and
+/// crossing: as [`CREDIT_WAITER_KEYS`], the plane's DDL list.
+pub const DDL_WAITER_KEYS: Cap = Cap::entries::<1>("ddl-waiter-keys", CapFill::Assembly);
+
+/// Keys the checkpoint wait list holds (ADR-0177 D5): the one key its pumps wait on, held from
+/// the list's build. Census name `ckpt-waiter-keys`, filled whole at assembly. Unit, owner and
+/// crossing: as [`CREDIT_WAITER_KEYS`], the plane's checkpoint list.
+pub const CKPT_WAITER_KEYS: Cap = Cap::entries::<1>("ckpt-waiter-keys", CapFill::Assembly);
+
+/// The credit list's keys of a node of `cells` cells: `cells − 1`, `None` at one cell.
+///
+/// # Errors
+/// `CapError::Layout` when the cells are 0 or above `CELLS_MAX`.
+pub(crate) const fn credit_waiter_keys(cells: u16) -> Result<Option<Cap>, CapError> {
+    match cells {
+        0 => Err(CapError::Layout),
+        1 => Ok(None),
+        cells => match Cap::derived(&CREDIT_WAITER_KEYS, cells as u32 - 1) {
+            Ok(cap) => Ok(Some(cap)),
+            Err(refused) => Err(refused),
+        },
+    }
+}
+
+/// A pool of wait nodes for a test's own gates and lists.
+#[cfg(test)]
+pub(crate) const TEST_WAIT_NODES: Cap = Cap::entries::<64>("test-wait-nodes", CapFill::Serving);
+
 /// Live holders one connection task may have on its cell's fabric gate
 /// (ADR-0177 D2, D4): its remote ops in flight. Replies that land out of
 /// order park in their holders until emitted, so this also bounds a

@@ -969,7 +969,9 @@ fn gathered_in(cells: &Cells, answers: &[LegAnswer], order: &[usize]) -> (OwnedR
     const HOLDERS: Cap =
         Cap::entries::<GATE_UNITS>("test-gate-holders", inf_foundation::bounded::CapFill::Serving);
     let (census, _mark) = inf_foundation::bounded::CapCensus::new(CellId(0));
-    let gate = FabricGate::<OwnedOutcome>::build(0, GATE_UNITS, Some(HOLDERS), &census);
+    let nodes = inf_runtime::WaitNodes::build(crate::limits::TEST_WAIT_NODES, &census)
+        .expect("a test pool");
+    let gate = FabricGate::<OwnedOutcome>::build(0, GATE_UNITS, Some(HOLDERS), &census, &nodes);
     let gate = RefCell::new(gate.expect("a test gate"));
     let units = gate.borrow().units(GATE_UNITS).expect("a task's units");
     let mut keys = Vec::with_capacity(answers.len());

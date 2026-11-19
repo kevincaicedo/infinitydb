@@ -31,8 +31,8 @@ use core::task::{Context, Poll, Waker};
 use std::rc::Rc;
 
 use inf_log::limits::EXTENT_SEAL_WINDOW_ENTRIES;
-use inf_runtime::WaitList;
 use inf_runtime::gate::ListWait;
+use inf_runtime::{WaitList, WaitNodes};
 
 /// The window's units, as the queue counts them.
 const ENTRIES: usize = EXTENT_SEAL_WINDOW_ENTRIES as usize;
@@ -112,13 +112,13 @@ pub(crate) struct ExtentWaiters {
 }
 
 impl ExtentWaiters {
-    /// An open window with nobody queued.
-    pub(crate) fn new() -> ExtentWaiters {
+    /// An open window with nobody queued, its list on the cell's `nodes`.
+    pub(crate) fn new(nodes: &WaitNodes) -> ExtentWaiters {
         let queue = Queue {
             open: Cell::new(true),
             parked: Cell::new(0),
             turns_out: Cell::new(0),
-            list: WaitList::new(),
+            list: WaitList::unit(nodes),
         };
         ExtentWaiters { queue: Rc::new(queue), parks: 0, turn_refused: 0 }
     }
@@ -329,13 +329,28 @@ mod tests {
         Pin::new(turn).poll(&mut cx).is_ready()
     }
 
+    /// An open window on a census and a pool of its own.
+    fn window() -> ExtentWaiters {
+        let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+        let nodes = WaitNodes::build(crate::limits::TEST_WAIT_NODES, &census).expect("a pool");
+        ExtentWaiters::new(&nodes)
+    }
+
+    /// A writer parked and its turn polled once, as the writer's task polls
+    /// the turn in the step that parks it: not yet woken.
+    fn parked(waiters: &mut ExtentWaiters) -> ExtentTurn {
+        let mut turn = waiters.park();
+        assert!(!poll_turn(&mut turn), "engagement: a parked turn is not woken");
+        turn
+    }
+
     /// A handout wakes `min(16 − len − w, q)` writers from the head and no
     /// more, whatever the number parked; the woken are turns out.
     #[test]
     fn a_handout_wakes_at_most_the_free_units_from_the_head() {
-        let mut waiters = ExtentWaiters::new();
+        let mut waiters = window();
         assert!(waiters.close(), "the window starts open");
-        let mut turns: Vec<ExtentTurn> = (0..40).map(|_| waiters.park()).collect();
+        let mut turns: Vec<ExtentTurn> = (0..40).map(|_| parked(&mut waiters)).collect();
         assert_eq!((waiters.parked(), waiters.parks()), (40, 40));
         waiters.hand_out(4);
         assert_eq!((waiters.parked(), waiters.turns_out()), (28, 12));
@@ -351,8 +366,8 @@ mod tests {
     /// while it is closed; an unlanded one leaves the queue in place.
     #[test]
     fn a_leaving_turn_settles_its_count_and_passes_its_unit_on() {
-        let mut waiters = ExtentWaiters::new();
-        let mut turns: Vec<ExtentTurn> = (0..3).map(|_| waiters.park()).collect();
+        let mut waiters = window();
+        let mut turns: Vec<ExtentTurn> = (0..3).map(|_| parked(&mut waiters)).collect();
         waiters.hand_out(15);
         assert_eq!((waiters.parked(), waiters.turns_out()), (2, 1));
         let first = turns.remove(0);
@@ -371,8 +386,8 @@ mod tests {
     /// A spent turn is the window's entry now: `w − 1`, nothing passed on.
     #[test]
     fn a_spent_turn_passes_nothing_on() {
-        let mut waiters = ExtentWaiters::new();
-        let mut turns: Vec<ExtentTurn> = (0..2).map(|_| waiters.park()).collect();
+        let mut waiters = window();
+        let mut turns: Vec<ExtentTurn> = (0..2).map(|_| parked(&mut waiters)).collect();
         waiters.hand_out(15);
         let mut first = turns.remove(0);
         assert!(poll_turn(&mut first));
@@ -386,8 +401,8 @@ mod tests {
     /// handout instead of resolving into the same full window.
     #[test]
     fn a_refused_turn_settles_its_count_and_wakes_no_one() {
-        let mut waiters = ExtentWaiters::new();
-        let mut turns: Vec<ExtentTurn> = (0..2).map(|_| waiters.park()).collect();
+        let mut waiters = window();
+        let mut turns: Vec<ExtentTurn> = (0..2).map(|_| parked(&mut waiters)).collect();
         waiters.hand_out(15);
         let mut refused = turns.remove(0);
         assert!(poll_turn(&mut refused), "the head's wake landed");

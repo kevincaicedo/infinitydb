@@ -22,6 +22,11 @@
 //!   wait held (`register_held`), 257 probes by `waiting(&hold)` (an admit's 255 and a drain
 //!   pass's two heads), and the drawn wait's `release` before its `complete`. Its P leg plants
 //!   a `get` a probe on a map of this bench's own, built at the row's routes.
+//! - `wait-wake`, `wait-wake-keys-15`: a wait list with one wait parked on its key, the unit key
+//!   or one of 15 keys: a second wait and its poll, `wake_one`, the parked wait's poll and drop,
+//!   the second parked in its place. The list takes a pool of a cell's wait nodes at 16 cells
+//!   (962), and the keyed list holds a cell's 15 peers there, its waits on the one four branches
+//!   deep.
 //!
 //! Each gate operation sits where the server places it. The fabric gate's `reserve` and
 //! `register` have one caller, `send_once`, with the request's stage an opaque call between
@@ -62,15 +67,16 @@ use std::task::{Context, Poll, Waker};
 
 use inf_foundation::CellId;
 use inf_foundation::bounded::{
-    Admission, Built, Cap, CapCensus, CapFill, CappedMap, CappedSlab, MapBuilt, SlabReserved,
-    SlotId, WrapWithProof,
+    Admission, Built, Cap, CapCensus, CapFill, CappedMap, CappedSlab, MapBuilt, ServeMark,
+    SlabReserved, SlotId, WrapWithProof,
 };
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::Nanos;
+use inf_runtime::gate::ListWait;
 use inf_runtime::{
     CellExecutor, Delivery, ExecutorLayout, FabricAdmission, FabricGate, GateHold, GateUnits,
     GateWait, KeyedAdmission, KeyedGate, KeyedWait, PollImmediate, TaskAdmission, TaskClass,
-    TaskFactory, TaskId, Woken, park,
+    TaskFactory, TaskId, WaitList, WaitNodes, Woken, park,
 };
 
 /// The pad that puts a row's slot in the `conn` class's chunk: a future of about 2,900 B.
@@ -83,7 +89,8 @@ const SLOTS_10000: Cap = Cap::entries::<10_000>("executor-ab-10000", CapFill::Se
 /// P's planted instructions per op: each row's bound plus one, the planted red its rule must
 /// refuse. Each row's bound is fixed before any count of the row is read, outside this file;
 /// each value copies that bound plus one and sets none of its own. The suspend rows' bounds
-/// differ by size, so each size has its own.
+/// differ by size, so each size has its own. The two list rows' bounds are not fixed yet: each
+/// holds 1 until its bound is, and no P leg of theirs is read before.
 const K_FAST_2500: u16 = 78;
 const K_DEFERRED_2500: u16 = 52;
 const K_FAST_10000: u16 = 89;
@@ -93,6 +100,8 @@ const K_SUSPEND_16384: u16 = 2;
 const K_SUSPEND_65536: u16 = 35;
 const K_KEYED_2496: u16 = 1_067;
 const K_KEYED_159744: u16 = 1_660;
+const K_WAIT_WAKE: u16 = 1;
+const K_WAIT_WAKE_KEYS_15: u16 = 1;
 
 /// `NOPS` operand-free `nop`s: the count must read exactly `NOPS` more an op.
 #[inline(always)]
@@ -261,10 +270,13 @@ fn drive_deferred(cap: Cap, ops: u64, step: fn(&mut DeferredCell) -> usize) -> R
 
 // ---- The slice's interface ----------------------------------------------------------------------
 
-/// The fabric gate of one origin over `holders` slots, every unit its holders bound issuable.
+/// The fabric gate of one origin over `holders` slots, every unit its holders bound issuable,
+/// its parked senders' list on a pool of a cell's wait nodes.
 fn fabric_gate(holders: Cap) -> Result<FabricGate<u64>, String> {
     let (census, _mark) = CapCensus::new(CellId(0));
-    FabricGate::build(0, holders.entries_max(), Some(holders), &census)
+    let nodes =
+        WaitNodes::build(WAIT_NODES_962, &census).map_err(|e| format!("the row's pool: {e}"))?;
+    FabricGate::build(0, holders.entries_max(), Some(holders), &census, &nodes)
         .map_err(|e| format!("the row's fabric gate: {e}"))
 }
 
@@ -687,6 +699,126 @@ fn drive_keyed(
     expect("planted probes that found their key", cell.planted_probes, planted)
 }
 
+// ---- The list rows -----------------------------------------------------------------------------
+
+/// The list rows' pool: a cell's wait nodes at 16 cells, one for each of its 962 tasks.
+const WAIT_NODES_962: Cap = Cap::entries::<962>("executor-ab-wait-nodes", CapFill::Serving);
+
+/// The keyed row's keys: a cell's 15 peers at 16 cells, every one held before the cell serves.
+const PEER_KEYS_15: Cap = Cap::entries::<15>("executor-ab-peer-keys", CapFill::Assembly);
+
+/// The key the keyed row waits on: four branches deep among the 15.
+const PEER_KEY: CellId = CellId(7);
+
+/// A list row's owner: the pool, the list, its one key and the wait parked on it throughout.
+/// Generic over the list and wait types themselves, so this file names no bound of the gate's.
+struct ListCell<L, W, K> {
+    nodes: WaitNodes,
+    list: L,
+    key: K,
+    parked: Option<W>,
+}
+
+type UnitListCell = ListCell<WaitList<()>, ListWait<()>, ()>;
+type KeyedListCell = ListCell<WaitList<CellId>, ListWait<CellId>, CellId>;
+
+/// The list rows' op, one body for each key type: a wait and its poll, `wake_one`, the parked
+/// wait's poll and drop, the new wait parked in its place. Answers whether each did as implied.
+macro_rules! wait_wake_op {
+    ($cell:expr) => {{
+        let cell = $cell;
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut wait = cell.list.wait(cell.key);
+        let pending = Pin::new(&mut wait).poll(&mut cx).is_pending();
+        let woken = cell.list.wake_one(cell.key);
+        match cell.parked.replace(wait) {
+            Some(mut parked) => {
+                let ready = Pin::new(&mut parked).poll(&mut cx).is_ready();
+                drop(parked);
+                pending && woken && ready
+            }
+            None => false,
+        }
+    }};
+}
+
+#[inline(never)]
+fn step_wait_wake(cell: &mut UnitListCell) -> bool {
+    wait_wake_op!(cell)
+}
+
+#[inline(never)]
+fn step_wait_wake_planted<const K: u16>(cell: &mut UnitListCell) -> bool {
+    plant::<K>();
+    wait_wake_op!(cell)
+}
+
+#[inline(never)]
+fn step_wait_wake_keys_15(cell: &mut KeyedListCell) -> bool {
+    wait_wake_op!(cell)
+}
+
+#[inline(never)]
+fn step_wait_wake_keys_15_planted<const K: u16>(cell: &mut KeyedListCell) -> bool {
+    plant::<K>();
+    wait_wake_op!(cell)
+}
+
+/// The list rows' pool on a census of its own, and the census's serve mark.
+fn list_pool() -> Result<(WaitNodes, Rc<CapCensus>, ServeMark), String> {
+    let (census, serve_mark) = CapCensus::new(CellId(0));
+    let nodes =
+        WaitNodes::build(WAIT_NODES_962, &census).map_err(|e| format!("the row's pool: {e}"))?;
+    Ok((nodes, census, serve_mark))
+}
+
+/// A list row's ops on `$cell`, then what they left: every op as implied, one wait parked, the
+/// pool's nodes back at their count before the loop, and no first poll that found no node.
+macro_rules! drive_list {
+    ($cell:expr, $ops:expr, $step:expr) => {{
+        let (mut cell, ops) = ($cell, $ops);
+        let start = cell.nodes.len();
+        let mut answered = 0u64;
+        for _ in 0..ops {
+            answered += u64::from($step(black_box(&mut cell)));
+        }
+        expect("list ops answered as implied", answered, ops)?;
+        if cell.list.waiting() != 1 {
+            return Err("engagement: one wait is not left parked after the loop".into());
+        }
+        expect("the pool's nodes after the loop", u64::from(cell.nodes.len()), u64::from(start))?;
+        expect("first polls that found no node", cell.nodes.full(), 0)
+    }};
+}
+
+/// The unit list's row: its list on the pool, its first wait parked, the cell serving.
+fn drive_unit_list(ops: u64, step: fn(&mut UnitListCell) -> bool) -> Result<(), String> {
+    let (nodes, _census, serve_mark) = list_pool()?;
+    let list = WaitList::unit(&nodes);
+    serve_mark.take();
+    let mut parked = list.wait(());
+    if !Pin::new(&mut parked).poll(&mut Context::from_waker(Waker::noop())).is_pending() {
+        return Err("engagement: the first wait did not park".into());
+    }
+    drive_list!(ListCell { nodes, list, key: (), parked: Some(parked) }, ops, step)
+}
+
+/// The keyed list's row: every peer key held before the cell serves, its first wait parked,
+/// and no key admitted while it serves.
+fn drive_keyed_list(ops: u64, step: fn(&mut KeyedListCell) -> bool) -> Result<(), String> {
+    let (nodes, census, serve_mark) = list_pool()?;
+    let peers = (1..=15).map(CellId);
+    let list = WaitList::keyed(&nodes, Some(PEER_KEYS_15), &census, peers)
+        .map_err(|e| format!("the row's keyed list: {e}"))?;
+    serve_mark.take();
+    let mut parked = list.wait(PEER_KEY);
+    if !Pin::new(&mut parked).poll(&mut Context::from_waker(Waker::noop())).is_pending() {
+        return Err("engagement: the first wait did not park".into());
+    }
+    drive_list!(ListCell { nodes, list, key: PEER_KEY, parked: Some(parked) }, ops, step)?;
+    expect("keys admitted while serving", u64::from(census.cap_assembly_violations()), 0)
+}
+
 // ---- The table and the driver ------------------------------------------------------------------
 
 /// What a leg left behind against what its ops imply; `Err` names the first mismatch.
@@ -742,6 +874,12 @@ const VARIANTS: &[(&str, Drive)] = &[
     ("b-keyed-full-159744", |ops| drive_keyed(ROUTES_159744, Probes::Holds, ops, step_keyed_full)),
     ("p-keyed-full-159744", |ops| {
         drive_keyed(ROUTES_159744, Probes::Planted, ops, step_keyed_full_planted)
+    }),
+    ("b-wait-wake", |ops| drive_unit_list(ops, step_wait_wake)),
+    ("p-wait-wake", |ops| drive_unit_list(ops, step_wait_wake_planted::<K_WAIT_WAKE>)),
+    ("b-wait-wake-keys-15", |ops| drive_keyed_list(ops, step_wait_wake_keys_15)),
+    ("p-wait-wake-keys-15", |ops| {
+        drive_keyed_list(ops, step_wait_wake_keys_15_planted::<K_WAIT_WAKE_KEYS_15>)
     }),
 ];
 

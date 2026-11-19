@@ -61,7 +61,7 @@ use inf_log::limits::{TIER_GROUP_BYTES_MAX, TIER_GROUP_OPS_MAX};
 use inf_log::{NsId, OpState, TierDrive, TierFileMeta, TierFlush, TierFlushConfig, TierFlushError};
 use inf_runtime::{
     ColdReadConfig, ColdReads, CompletionToken, IoOp, Issue, TierFileId, TokenClass, WaitList,
-    WriteBarrier,
+    WaitNodes, WriteBarrier,
 };
 use inf_store::{Keyspace, LogicalAddr, TierSpec, TieredTable};
 
@@ -463,6 +463,9 @@ pub(crate) struct TierCell<F: SegmentFs> {
     /// The cell's cap census: each namespace's reclaim marks register
     /// their row on it.
     census: Rc<CapCensus>,
+    /// The cell's wait nodes: each namespace's stall list takes them at its
+    /// install (ADR-0177 D5).
+    nodes: WaitNodes,
 }
 
 /// One grant position on this cell (ADR-0148 D3).
@@ -864,12 +867,13 @@ impl<F: SegmentFs> TierCell<F> {
 impl<F: SegmentFs + Clone> TierCell<F> {
     /// The cell's tiered plane with every position Vacant; `grants` is the
     /// node's directory and this cell's receipts, `None` on a cell with no
-    /// catalog writer.
+    /// catalog writer; `nodes` the cell's wait nodes.
     pub fn new(
         fs: F,
         cell: u32,
         shard_dir: PathBuf,
         census: Rc<CapCensus>,
+        nodes: WaitNodes,
         grants: Option<CellGrants>,
     ) -> TierCell<F> {
         TierCell {
@@ -890,6 +894,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             compact_paced: None,
             shadow_paced: None,
             census,
+            nodes,
         }
     }
 
@@ -984,7 +989,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             retired: Vec::new(),
             tail_stall_timeout_ms: spec.tail_stall_timeout_ms,
             io_mode: spec.tier_io_mode,
-            stall_waiters: WaitList::new(),
+            stall_waiters: WaitList::unit(&self.nodes),
             epoch_marks,
             compact_inflight: false,
             holds: Rc::new(()),
